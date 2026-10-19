@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     const src = init.environ_map.get("LND_BRONTIDE_SRC") orelse default_src;
     for ([_][]const u8{ "brontide/noise.go", "keychain/ecdh.go" }) |rel| {
-        const p = try std.fmt.allocPrint(arena, "{s}/{s}", .{ src, rel });
+        const p = try arena.print("{s}/{s}", .{ src, rel });
         cwd.access(io, p, .{}) catch {
             recipe(src);
             return 2;
@@ -167,13 +167,13 @@ pub fn main(init: std.process.Init) !u8 {
     try dir.writeFile(io, .{ .sub_path = "msg_64k.bin", .data = msg_64k });
 
     std.debug.print("bench-bolt8: building the brontide side (needs the Go module proxy) ...\n", .{});
-    const go_dir = try std.fmt.allocPrint(arena, "{s}/go", .{abs});
+    const go_dir = try arena.print("{s}/go", .{abs});
     const prep = try std.process.run(arena, io, .{ .argv = &.{ "bash", "modules/bolt8/tools/go_bench/prepare.sh", abs_src, go_dir } });
     if (prep.term != .exited or prep.term.exited != 0) {
         std.debug.print("bench-bolt8: prepare.sh failed:\n{s}\n", .{prep.stderr});
         return 1;
     }
-    const exe = try std.fmt.allocPrint(arena, "{s}/gobench", .{go_dir});
+    const exe = try arena.print("{s}/gobench", .{go_dir});
     std.debug.print("bench-bolt8: lnd brontide ({s}) ...\n", .{std.mem.trim(u8, prep.stderr, "\n")});
     const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs } });
     if (res.term != .exited or res.term.exited != 0) {

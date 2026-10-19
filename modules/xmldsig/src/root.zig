@@ -874,7 +874,7 @@ fn buildSignedRsaDoc(a: std.mem.Allocator, tamper_content: bool, tamper_sig: boo
 
     // Pass 1: compute the reference digest (canonicalize whole doc minus the
     // Signature, exclusive C14N).
-    const with_empty = try std.fmt.allocPrint(a, doc_template, .{ content, digest_placeholder, "" });
+    const with_empty = try a.print(doc_template, .{ content, digest_placeholder, "" });
     defer a.free(with_empty);
     var doc1 = try xml.parse(a, with_empty, .{});
     defer doc1.deinit();
@@ -887,7 +887,7 @@ fn buildSignedRsaDoc(a: std.mem.Allocator, tamper_content: bool, tamper_sig: boo
     const digest_b64 = std.base64.standard.Encoder.encode(&digest_b64_buf, &digest);
 
     // Pass 2: with the real digest in place, canonicalize SignedInfo and sign.
-    const with_digest = try std.fmt.allocPrint(a, doc_template, .{ content, digest_b64, "" });
+    const with_digest = try a.print(doc_template, .{ content, digest_b64, "" });
     defer a.free(with_digest);
     var doc2 = try xml.parse(a, with_digest, .{});
     defer doc2.deinit();
@@ -903,7 +903,7 @@ fn buildSignedRsaDoc(a: std.mem.Allocator, tamper_content: bool, tamper_sig: boo
     const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, sig_slice);
 
     const emit_content = if (tamper_content) "Hello EVIL" else content;
-    const final = try std.fmt.allocPrint(a, doc_template, .{ emit_content, digest_b64, sig_b64 });
+    const final = try a.print(doc_template, .{ emit_content, digest_b64, sig_b64 });
     return .{ .xml = final };
 }
 
@@ -953,7 +953,7 @@ fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
         "</ds:Signature>{s}</Root>";
 
     // Pass 1: digest the `<Target>` subtree.
-    const p1 = try std.fmt.allocPrint(a, tmpl, .{ "", "", "" });
+    const p1 = try a.print(tmpl, .{ "", "", "" });
     defer a.free(p1);
     var d1 = try xml.parse(a, p1, .{});
     defer d1.deinit();
@@ -966,7 +966,7 @@ fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
     const digest_b64 = std.base64.standard.Encoder.encode(&digest_b64_buf, &digest);
 
     // Pass 2: sign the real `<SignedInfo>`.
-    const p2 = try std.fmt.allocPrint(a, tmpl, .{ digest_b64, "", "" });
+    const p2 = try a.print(tmpl, .{ digest_b64, "", "" });
     defer a.free(p2);
     var d2 = try xml.parse(a, p2, .{});
     defer d2.deinit();
@@ -979,7 +979,7 @@ fn buildDupIdDoc(a: std.mem.Allocator, with_decoy: bool) ![]u8 {
     const sig_b64 = std.base64.standard.Encoder.encode(&sig_b64_buf, sig_slice);
 
     const decoy = if (with_decoy) "<Decoy AID=\"dup-1\">forged</Decoy>" else "";
-    return std.fmt.allocPrint(a, tmpl, .{ digest_b64, sig_b64, decoy });
+    return a.print(tmpl, .{ digest_b64, sig_b64, decoy });
 }
 
 /// First element with this local name anywhere in the subtree (namespace-blind).
@@ -1062,7 +1062,7 @@ const FreeScanner = struct {
         const self: *FreeScanner = @ptrCast(@alignCast(ctx));
         if (m.len >= self.needle.len) {
             self.frees_seen += 1;
-            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked = true;
+            if (std.mem.find(u8, m, self.needle) != null) self.leaked = true;
         }
         self.child.rawFree(m, a, ra);
     }
@@ -1093,7 +1093,7 @@ test "Z1: verify() scrubs the canonicalized plaintext before its arena goes back
     // (whose slices borrow from that buffer) — only from a C14N buffer inside
     // verify()'s own arena.
     const needle = "<Data>Hello World</Data></Envelope>";
-    try testing.expect(std.mem.indexOf(u8, sd.xml, needle) == null);
+    try testing.expect(std.mem.find(u8, sd.xml, needle) == null);
 
     var scan = FreeScanner{ .child = a, .needle = needle };
     const sa = scan.allocator();
@@ -1239,7 +1239,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
         "</ds:Signature>" ++
         "</Envelope>";
 
-    const with_empty = try std.fmt.allocPrint(a, doc_template, .{ "", "" });
+    const with_empty = try a.print(doc_template, .{ "", "" });
     defer a.free(with_empty);
     var doc1 = try xml.parse(a, with_empty, .{});
     defer doc1.deinit();
@@ -1251,7 +1251,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     var db64: [64]u8 = undefined;
     const digest_b64 = std.base64.standard.Encoder.encode(&db64, &digest);
 
-    const with_digest = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, "" });
+    const with_digest = try a.print(doc_template, .{ digest_b64, "" });
     defer a.free(with_digest);
     var doc2 = try xml.parse(a, with_digest, .{});
     defer doc2.deinit();
@@ -1264,7 +1264,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     var sb64: [128]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sb64, &rs);
 
-    const final = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, sig_b64 });
+    const final = try a.print(doc_template, .{ digest_b64, sig_b64 });
     defer a.free(final);
     var doc = try xml.parse(a, final, .{});
     defer doc.deinit();
@@ -1293,7 +1293,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     bad_rs[0] ^= 0x01;
     var bad_b64: [128]u8 = undefined;
     const bad_sig_b64 = std.base64.standard.Encoder.encode(&bad_b64, &bad_rs);
-    const flipped = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, bad_sig_b64 });
+    const flipped = try a.print(doc_template, .{ digest_b64, bad_sig_b64 });
     defer a.free(flipped);
     var doc_f = try xml.parse(a, flipped, .{});
     defer doc_f.deinit();
@@ -1313,7 +1313,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     @memcpy(&short_rs, rs[0..63]);
     var short_b64: [128]u8 = undefined;
     const short_sig_b64 = std.base64.standard.Encoder.encode(&short_b64, &short_rs);
-    const shortened = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, short_sig_b64 });
+    const shortened = try a.print(doc_template, .{ digest_b64, short_sig_b64 });
     defer a.free(shortened);
     var doc_s = try xml.parse(a, shortened, .{});
     defer doc_s.deinit();
@@ -1331,7 +1331,7 @@ test "verify: ECDSA-P256-SHA256 enveloped signature round-trips" {
     long_rs[64] = 0;
     var long_b64: [128]u8 = undefined;
     const long_sig_b64 = std.base64.standard.Encoder.encode(&long_b64, &long_rs);
-    const lengthened = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, long_sig_b64 });
+    const lengthened = try a.print(doc_template, .{ digest_b64, long_sig_b64 });
     defer a.free(lengthened);
     var doc_l = try xml.parse(a, lengthened, .{});
     defer doc_l.deinit();
@@ -1373,7 +1373,7 @@ test "verify: a prolog PI is not silently outside a URI=\"\" signature" {
         // `<?xml` as the XML declaration and refuses it as a malformed PI, so
         // the test would pass for the wrong reason. Any other target is a
         // genuine prolog PI and is exactly as injectable.
-        const injected = try std.fmt.allocPrint(a, "<?evil href=\"http://evil.example/x.xsl\"?>{s}", .{sd.xml});
+        const injected = try a.print("<?evil href=\"http://evil.example/x.xsl\"?>{s}", .{sd.xml});
         defer a.free(injected);
         var doc = try xml.parse(a, injected, .{});
         defer doc.deinit();
@@ -1732,7 +1732,7 @@ test "verify: KeyInfo X509Certificate is exposed but not trusted" {
         "</ds:Signature>" ++
         "</Envelope>";
 
-    const with_empty = try std.fmt.allocPrint(a, doc_template, .{ "", "" });
+    const with_empty = try a.print(doc_template, .{ "", "" });
     defer a.free(with_empty);
     var doc1 = try xml.parse(a, with_empty, .{});
     defer doc1.deinit();
@@ -1744,7 +1744,7 @@ test "verify: KeyInfo X509Certificate is exposed but not trusted" {
     var db64: [64]u8 = undefined;
     const digest_b64 = std.base64.standard.Encoder.encode(&db64, &digest);
 
-    const with_digest = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, "" });
+    const with_digest = try a.print(doc_template, .{ digest_b64, "" });
     defer a.free(with_digest);
     var doc2 = try xml.parse(a, with_digest, .{});
     defer doc2.deinit();
@@ -1756,7 +1756,7 @@ test "verify: KeyInfo X509Certificate is exposed but not trusted" {
     var sb64: [512]u8 = undefined;
     const sig_b64 = std.base64.standard.Encoder.encode(&sb64, sig_slice);
 
-    const final = try std.fmt.allocPrint(a, doc_template, .{ digest_b64, sig_b64 });
+    const final = try a.print(doc_template, .{ digest_b64, sig_b64 });
     defer a.free(final);
     var doc = try xml.parse(a, final, .{});
     defer doc.deinit();
@@ -2154,8 +2154,8 @@ fn fuzzVerifySignature(comptime S: type, smith: *S, gpa: std.mem.Allocator) anye
             if (!accepted) return error.GenuineSignatureRefused;
             FzMark.mark(.genuine_accepted);
         } else if (accepted) {
-            const sv_open = std.mem.indexOf(u8, base, "<ds:SignatureValue>").? + "<ds:SignatureValue>".len;
-            const sv_close = std.mem.indexOf(u8, base, "</ds:SignatureValue>").?;
+            const sv_open = std.mem.find(u8, base, "<ds:SignatureValue>").? + "<ds:SignatureValue>".len;
+            const sv_close = std.mem.find(u8, base, "</ds:SignatureValue>").?;
             const in_sig_value = diff_lo >= sv_open and diff_hi < sv_close;
             if (!in_sig_value and !onlyWhitespaceInsideTags(base, mutant)) return error.AlteredDocumentVerified;
             fz.fuzz_driver.hit("flipped_benign");
@@ -2170,9 +2170,9 @@ fn onlyWhitespaceInsideTags(base: []const u8, mutant: []const u8) bool {
     const ws = " \t\r\n";
     for (base, mutant, 0..) |b, m, i| {
         if (b == m) continue;
-        if (std.mem.indexOfScalar(u8, ws, b) == null or std.mem.indexOfScalar(u8, ws, m) == null) return false;
-        const lt = std.mem.lastIndexOfScalar(u8, base[0..i], '<') orelse return false;
-        if (std.mem.indexOfScalar(u8, base[lt..i], '>') != null) return false;
+        if (std.mem.findScalar(u8, ws, b) == null or std.mem.findScalar(u8, ws, m) == null) return false;
+        const lt = std.mem.findScalarLast(u8, base[0..i], '<') orelse return false;
+        if (std.mem.findScalar(u8, base[lt..i], '>') != null) return false;
     }
     return true;
 }
@@ -2331,7 +2331,7 @@ fn buildSignedRsaDocCustom(a: std.mem.Allocator, envelope_open: []const u8, tran
     defer sk.deinit();
     const Asm = struct {
         fn doc(al: std.mem.Allocator, env: []const u8, tr: []const u8, digest: []const u8, sig: []const u8) ![]u8 {
-            return std.fmt.allocPrint(al, "{s}<Data>custom</Data>" ++
+            return al.print("{s}<Data>custom</Data>" ++
                 "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>" ++
                 "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
                 "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
@@ -2396,7 +2396,7 @@ test "verify: an epilog PI, and a prolog comment under #WithComments, are outsid
     const a = testing.allocator;
     var sd = try buildSignedRsaDoc(a, false, false);
     defer sd.deinit(a);
-    const epi = try std.fmt.allocPrint(a, "{s}<?evil x?>", .{sd.xml});
+    const epi = try a.print("{s}<?evil x?>", .{sd.xml});
     defer a.free(epi);
     try testing.expectError(error.UriNotResolved, verifyRsaDoc(a, epi, "Signature"));
 
@@ -2405,7 +2405,7 @@ test "verify: an epilog PI, and a prolog comment under #WithComments, are outsid
     var ok = try verifyRsaDoc(a, wc, "Signature");
     defer ok.deinit(a);
     try testing.expect(ok.valid);
-    const with_comment = try std.fmt.allocPrint(a, "<!--outside-->{s}", .{wc});
+    const with_comment = try a.print("<!--outside-->{s}", .{wc});
     defer a.free(with_comment);
     try testing.expectError(error.UriNotResolved, verifyRsaDoc(a, with_comment, "Signature"));
 }

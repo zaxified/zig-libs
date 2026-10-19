@@ -457,7 +457,7 @@ test "run: a passing seed reports PASS and returns true" {
     var w: std.Io.Writer = .fixed(&buf);
     const ok = try run(testing.allocator, &.{ "--seed", "1" }, &w);
     try testing.expect(ok);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "PASS") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "PASS") != null);
 }
 
 test "run: a failing search (sabotage) reports FAIL without invoking shrink" {
@@ -465,7 +465,7 @@ test "run: a failing search (sabotage) reports FAIL without invoking shrink" {
     var w: std.Io.Writer = .fixed(&buf);
     const ok = try run(testing.allocator, &.{ "--search", "1", "12", "--sabotage", "--quiet" }, &w);
     try testing.expect(!ok);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "FAIL") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "FAIL") != null);
 }
 
 test "findFailingSeed: the sabotage self-test config reliably yields a failing run with a real trace" {

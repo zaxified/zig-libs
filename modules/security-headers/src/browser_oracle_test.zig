@@ -83,13 +83,13 @@ test "browser oracle: the middleware sets the header set Chrome judged" {
             .chunk = &chunk_buf,
         });
         const got = out.buffered();
-        const end = std.mem.indexOf(u8, got, "\r\n\r\n") orelse got.len;
+        const end = std.mem.find(u8, got, "\r\n\r\n") orelse got.len;
         var lines = std.mem.splitSequence(u8, got[0..end], "\r\n");
         _ = lines.next();
         var i: usize = 0;
         var same = true;
         while (lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             const name = line[0..colon];
             if (!managed(name)) continue;
             const value = std.mem.trim(u8, line[colon + 1 ..], " ");

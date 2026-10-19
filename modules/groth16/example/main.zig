@@ -186,7 +186,7 @@ pub fn main() !void {
     // substrings.
     for ([_][]const u8{ "\"7\"", "\"13\"" }) |secret| {
         for ([_][]const u8{ public_json, proof_json, vk_json }) |doc| {
-            if (std.mem.indexOf(u8, doc, secret) != null) {
+            if (std.mem.find(u8, doc, secret) != null) {
                 std.debug.print("a private wire {s} appears in a published file\n", .{secret});
                 return error.PrivateWireLeaked;
             }

@@ -686,10 +686,10 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     var reset_buf: [24]u8 = undefined;
     const retry_s = @max(1, ceilDivMsToS(decision.retry_after_ms));
     ctx.res.setStatus(429);
-    try ctx.res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{retry_s}) catch unreachable);
-    try ctx.res.setHeader("RateLimit-Limit", std.fmt.bufPrint(&limit_buf, "{d}", .{decision.limit}) catch unreachable);
+    try ctx.res.setHeader("Retry-After", std.mem.print(&retry_buf, "{d}", .{retry_s}) catch unreachable);
+    try ctx.res.setHeader("RateLimit-Limit", std.mem.print(&limit_buf, "{d}", .{decision.limit}) catch unreachable);
     try ctx.res.setHeader("RateLimit-Remaining", "0");
-    try ctx.res.setHeader("RateLimit-Reset", std.fmt.bufPrint(&reset_buf, "{d}", .{ceilDivMsToS(decision.reset_after_ms)}) catch unreachable);
+    try ctx.res.setHeader("RateLimit-Reset", std.mem.print(&reset_buf, "{d}", .{ceilDivMsToS(decision.reset_after_ms)}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Too Many Requests\n");
 }
@@ -730,7 +730,7 @@ pub fn clientKey(req: *const http.Server.Request, peer_buf: *[peer_key_len_max]u
         if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) xff = h.value;
     }
     if (xff) |v| {
-        const start = if (std.mem.lastIndexOfScalar(u8, v, ',')) |i| i + 1 else 0;
+        const start = if (std.mem.findScalarLast(u8, v, ',')) |i| i + 1 else 0;
         const ip = std.mem.trim(u8, v[start..], " \t");
         if (ip.len != 0) return ip;
     }
@@ -1169,7 +1169,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn hCount(ctx: *router.Ctx) anyerror!void {
@@ -1386,10 +1386,10 @@ noinline fn denyFromDeadFrame(res: *http.Server.ResponseWriter) !void {
     var limit_buf: [24]u8 = undefined;
     var reset_buf: [24]u8 = undefined;
     res.setStatus(429);
-    try res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{1}) catch unreachable);
-    try res.setHeader("RateLimit-Limit", std.fmt.bufPrint(&limit_buf, "{d}", .{2}) catch unreachable);
+    try res.setHeader("Retry-After", std.mem.print(&retry_buf, "{d}", .{1}) catch unreachable);
+    try res.setHeader("RateLimit-Limit", std.mem.print(&limit_buf, "{d}", .{2}) catch unreachable);
     try res.setHeader("RateLimit-Remaining", "0");
-    try res.setHeader("RateLimit-Reset", std.fmt.bufPrint(&reset_buf, "{d}", .{2}) catch unreachable);
+    try res.setHeader("RateLimit-Reset", std.mem.print(&reset_buf, "{d}", .{2}) catch unreachable);
 }
 
 /// Reuse the frame `denyFromDeadFrame` just left, the way the next call down
@@ -1429,7 +1429,7 @@ test "middleware: 429 Retry-After/RateLimit-* values survive the caller's dead f
     try expectHeaderLine(got, "RateLimit-Remaining: 0");
     try expectHeaderLine(got, "RateLimit-Reset: 2");
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
+    try testing.expect(std.mem.find(u8, got, "#") == null);
 }
 
 test "middleware: key extraction — XFF forms, X-Real-IP, fallback key" {
@@ -1575,7 +1575,7 @@ test "integration: limited route over loopback — 200s, 429 + Retry-After, key 
     var client = http.Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/limited", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/limited", .{port});
 
     // What Caddy would forward for one client: spoofable leftmost entries
     // vary, the trusted rightmost entry stays 1.2.3.4 → one bucket.

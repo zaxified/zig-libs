@@ -164,7 +164,7 @@ const HostPort = struct { ip: netaddr.Ip, port: u16 };
 /// to the address half only — the port is a plain number in both byte orders
 /// (see `hexWord`).
 fn parseHostPort(s: []const u8, producer: std.builtin.Endian) ?HostPort {
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const colon = std.mem.findScalar(u8, s, ':') orelse return null;
     const ip = parseSocketAddr(s[0..colon], producer) orelse return null;
     const port = std.fmt.parseInt(u16, s[colon + 1 ..], 16) catch return null;
     return .{ .ip = ip, .port = port };
@@ -172,7 +172,7 @@ fn parseHostPort(s: []const u8, producer: std.builtin.Endian) ?HostPort {
 
 /// Split and decode the fused `tx_queue:rx_queue` column (`%08X:%08X`).
 fn parseQueues(s: []const u8) ?struct { tx: u32, rx: u32 } {
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return null;
+    const colon = std.mem.findScalar(u8, s, ':') orelse return null;
     const tx = std.fmt.parseInt(u32, s[0..colon], 16) catch return null;
     const rx = std.fmt.parseInt(u32, s[colon + 1 ..], 16) catch return null;
     return .{ .tx = tx, .rx = rx };

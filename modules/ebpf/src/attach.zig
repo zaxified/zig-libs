@@ -352,7 +352,7 @@ pub fn attachKprobeOpts(
         @compileError("ebpf.attachKprobe is Linux-only (perf_event_open + BPF)");
 
     if (symbol.len == 0) return error.InvalidSymbol;
-    if (std.mem.indexOfScalar(u8, symbol, 0) != null) return error.InvalidSymbol;
+    if (std.mem.findScalar(u8, symbol, 0) != null) return error.InvalidSymbol;
 
     const pmu_type = try kprobePmuType();
     const retprobe_bit = kprobeRetprobeBit();
@@ -679,7 +679,7 @@ pub fn attachUprobeOpts(
         @compileError("ebpf.attachUprobe is Linux-only (perf_event_open + BPF)");
 
     if (binary_path.len == 0) return error.InvalidPath;
-    if (std.mem.indexOfScalar(u8, binary_path, 0) != null) return error.InvalidPath;
+    if (std.mem.findScalar(u8, binary_path, 0) != null) return error.InvalidPath;
     if (opts.offset == null and symbol.len == 0) return error.NoProbeSite;
 
     const offset: u64 = if (opts.offset) |o| o else blk: {
@@ -798,7 +798,7 @@ pub fn parseConfigShift(raw: []const u8, default: u6) u6 {
     const prefix = "config:";
     if (!std.mem.startsWith(u8, text, prefix)) return default;
     const rest = text[prefix.len..];
-    const end = std.mem.indexOfScalar(u8, rest, '-') orelse rest.len;
+    const end = std.mem.findScalar(u8, rest, '-') orelse rest.len;
     return std.fmt.parseInt(u6, rest[0..end], 10) catch default;
 }
 
@@ -906,7 +906,7 @@ pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachErro
     var saw_root = false;
     for (tracefs_roots) |root| {
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintSentinel(
+        const path = std.mem.printSentinel(
             &path_buf,
             "{s}/events/{s}/{s}/id",
             .{ root, category, name },
@@ -923,7 +923,7 @@ pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachErro
     // problem) from "that tracepoint does not exist" (a caller problem).
     for (tracefs_roots) |root| {
         var path_buf: [512]u8 = undefined;
-        const probe = std.fmt.bufPrintSentinel(&path_buf, "{s}/events", .{root}, 0) catch continue;
+        const probe = std.mem.printSentinel(&path_buf, "{s}/events", .{root}, 0) catch continue;
         const rc = linux.open(probe.ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0);
         if (linux.errno(rc) == .SUCCESS) {
             _ = linux.close(@intCast(rc));
@@ -938,8 +938,8 @@ pub fn tracepointId(category: []const u8, name: []const u8) TracepointAttachErro
 /// refused rather than sanitized.
 fn validateTracepointComponent(s: []const u8) TracepointAttachError!void {
     if (s.len == 0 or s.len > 128) return error.InvalidName;
-    if (std.mem.indexOfScalar(u8, s, 0) != null) return error.InvalidName;
-    if (std.mem.indexOfScalar(u8, s, '/') != null) return error.InvalidName;
+    if (std.mem.findScalar(u8, s, 0) != null) return error.InvalidName;
+    if (std.mem.findScalar(u8, s, '/') != null) return error.InvalidName;
     if (std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return error.InvalidName;
     for (s) |c| {
         const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
@@ -1018,7 +1018,7 @@ pub fn attachRawTracepoint(
         @compileError("ebpf.attachRawTracepoint is Linux-only (bpf() raw syscall)");
 
     if (name.len == 0 or name.len > 128) return error.InvalidName;
-    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
+    if (std.mem.findScalar(u8, name, 0) != null) return error.InvalidName;
 
     const name_z = gpa.dupeSentinel(u8, name, 0) catch return error.OutOfMemory;
     defer gpa.free(name_z);
@@ -2379,7 +2379,7 @@ test "LIVE: cgroup attach prefers a BPF link and reports which path it took" {
     }
 
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-auto-{d}", .{linux.getpid()}, 0);
+    const dir = try std.mem.printSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-auto-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {
@@ -2431,7 +2431,7 @@ test "LIVE: cgroup attach + detach in a throwaway cgroup" {
 
     // A private child cgroup so nothing system-wide is touched even briefly.
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-{d}", .{linux.getpid()}, 0);
+    const dir = try std.mem.printSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {

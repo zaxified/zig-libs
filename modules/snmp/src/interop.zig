@@ -833,7 +833,7 @@ test "live: SNMPv3 GET + walk against a real agent" {
         return error.SkipZigTest;
     };
 
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 

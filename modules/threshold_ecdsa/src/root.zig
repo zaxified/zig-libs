@@ -3341,7 +3341,7 @@ test "KeyShare.fromBytesAlloc rejects a message seed that is not the one behind 
     allocator.free(back.public_keys.entries);
     // The seed of party 1 is 32 x 0x01 (`test_message_seeds`); the announced
     // keys are derived from it. Change the seed in the encoding only.
-    const at = std.mem.indexOf(u8, bytes, &test_message_seeds[0]) orelse return error.TestFixtureSeedNotFound;
+    const at = std.mem.find(u8, bytes, &test_message_seeds[0]) orelse return error.TestFixtureSeedNotFound;
     const bad = try allocator.dupe(u8, bytes);
     defer allocator.free(bad);
     bad[at] ^= 0x01;

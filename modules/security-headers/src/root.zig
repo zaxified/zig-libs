@@ -609,7 +609,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn expectNoHeader(got: []const u8, comptime name: []const u8) !void {
@@ -869,8 +869,8 @@ test "end-to-end anchor: a config sized to exactly fill http's real header budge
     try rw.end();
     const got = out.buffered();
     try expectHeaderLine(got, "X-Content-Type-Options: nosniff");
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Security-Policy: ") != null);
-    try testing.expect(std.mem.indexOf(u8, got, &csp_buf) != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Security-Policy: ") != null);
+    try testing.expect(std.mem.find(u8, got, &csp_buf) != null);
 
     // One byte over: `init` refuses it before a real writer is ever
     // involved.
@@ -965,7 +965,7 @@ test "Server: configured value replaces the server's automatic header" {
         var buf: [2048]u8 = undefined;
         const got = runWireNamed(&r, wire("/t"), &buf, "real-server/1.0");
         try expectHeaderLine(got, "Server: webserver");
-        try testing.expect(std.mem.indexOf(u8, got, "real-server") == null);
+        try testing.expect(std.mem.find(u8, got, "real-server") == null);
     }
 }
 
@@ -1061,7 +1061,7 @@ test "applyStatic: handler's later setHeader still wins" {
     try rw.end();
     const got = out.buffered();
     try expectHeaderLine(got, "X-Frame-Options: SAMEORIGIN");
-    try testing.expect(std.mem.indexOf(u8, got, "DENY") == null);
+    try testing.expect(std.mem.find(u8, got, "DENY") == null);
 }
 
 test "staticHeaders: the applyStatic set reaches http.Server's own error answers" {
@@ -1091,8 +1091,8 @@ test "staticHeaders: the applyStatic set reaches http.Server's own error answers
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 "));
     for (hs) |h| {
         var line_buf: [512]u8 = undefined;
-        const line = try std.fmt.bufPrint(&line_buf, "\r\n{s}: {s}\r\n", .{ h.name, h.value });
-        try testing.expect(std.mem.indexOf(u8, got, line) != null);
+        const line = try std.mem.print(&line_buf, "\r\n{s}: {s}\r\n", .{ h.name, h.value });
+        try testing.expect(std.mem.find(u8, got, line) != null);
     }
 }
 
@@ -1133,7 +1133,7 @@ test "legacy defaults: helmet 8.3.0 values, each knob alone disables its header,
         try testing.expectEqual(@as(usize, 4), blk: {
             var n: usize = 0;
             for ([_][]const u8{ "Origin-Agent-Cluster:", "X-DNS-Prefetch-Control:", "X-Download-Options:", "X-Permitted-Cross-Domain-Policies:", "X-XSS-Protection:" }) |nm| {
-                if (std.mem.indexOf(u8, w.buffered(), nm) != null) n += 1;
+                if (std.mem.find(u8, w.buffered(), nm) != null) n += 1;
             }
             break :blk n;
         });
@@ -1220,15 +1220,15 @@ test "applyCspNonce: fresh nonce per response, rendered into script-src/style-sr
     for (&nonces) |*slot| {
         var buf: [4096]u8 = undefined;
         const got = runWire(&r, wire("/n"), &buf);
-        const body = got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+        const body = got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
         try testing.expectEqual(@as(usize, csp.Nonce.text_len), body.len);
         @memcpy(slot, body);
-        const want = try std.fmt.allocPrint(testing.allocator, "Content-Security-Policy: default-src 'self';base-uri 'self';" ++
+        const want = try testing.allocator.print("Content-Security-Policy: default-src 'self';base-uri 'self';" ++
             "font-src 'self' https: data:;form-action 'self';frame-ancestors 'self';img-src 'self' data:;" ++
             "object-src 'none';script-src 'self' 'nonce-{s}';script-src-attr 'none';" ++
             "style-src 'self' https: 'unsafe-inline' 'nonce-{s}';upgrade-insecure-requests", .{ body, body });
         defer testing.allocator.free(want);
-        try testing.expect(std.mem.indexOf(u8, got, want) != null);
+        try testing.expect(std.mem.find(u8, got, want) != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Content-Security-Policy:"));
     }
     try testing.expect(!std.mem.eql(u8, &nonces[0], &nonces[1]));
@@ -1287,7 +1287,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
     var url_buf: [64]u8 = undefined;
 
     { // the full default set on a normal 200
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -1305,7 +1305,7 @@ test "integration: a 200 over loopback carries the headers; handler override win
     }
 
     { // a handler that sets its own X-Frame-Options wins over the default
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/framed", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/framed", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -1373,7 +1373,7 @@ test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our d
 
     var buf: [2048]u8 = undefined;
     const got = runWire(&r, wire("/t"), &buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Strict-Transport-Security: max-age=31536000") != null);
+    try testing.expect(std.mem.find(u8, got, "Strict-Transport-Security: max-age=31536000") != null);
 }
 
 test "external anchor: OWASP Secure Headers Project's own example lines match our defaults byte-exact" {
@@ -1476,12 +1476,12 @@ test "the init-time budget sum counts exactly the bytes apply puts on the wire" 
     try sh.apply(&rw);
     try rw.end();
     const head = out.buffered();
-    var it = std.mem.splitSequence(u8, head[0..std.mem.indexOf(u8, head, "\r\n\r\n").?], "\r\n");
+    var it = std.mem.splitSequence(u8, head[0..std.mem.find(u8, head, "\r\n\r\n").?], "\r\n");
     _ = it.next(); // status line
     var wire_bytes: usize = 0;
     var lines: usize = 0;
     while (it.next()) |line| {
-        const colon = std.mem.indexOf(u8, line, ": ").?;
+        const colon = std.mem.find(u8, line, ": ").?;
         const name = line[0..colon];
         if (std.mem.eql(u8, name, "Connection") or std.mem.eql(u8, name, "Content-Length")) continue;
         wire_bytes += name.len + line.len - colon - 2;

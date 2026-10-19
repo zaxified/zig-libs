@@ -127,7 +127,7 @@ fn parseOrigin(s: []const u8) ?Parsed {
     for (s) |b| if (b < 0x20 or b == 0x7f) return null;
     var rest = s;
     var fragment: []const u8 = "";
-    if (std.mem.indexOfScalar(u8, rest, '#')) |i| {
+    if (std.mem.findScalar(u8, rest, '#')) |i| {
         fragment = rest[i + 1 ..];
         rest = rest[0..i];
     }
@@ -143,22 +143,22 @@ fn parseOrigin(s: []const u8) ?Parsed {
         }
     } else if (rest.len != 0 and rest[0] == ':') return null; // missing protocol scheme
     var query: []const u8 = "";
-    if (std.mem.indexOfScalar(u8, rest, '?')) |i| {
+    if (std.mem.findScalar(u8, rest, '?')) |i| {
         query = rest[i + 1 ..];
         rest = rest[0..i];
     }
     var host: []const u8 = "";
     if ((scheme.len != 0 or !std.mem.startsWith(u8, rest, "///")) and std.mem.startsWith(u8, rest, "//")) {
-        const auth_end = std.mem.indexOfScalarPos(u8, rest, 2, '/') orelse rest.len;
+        const auth_end = std.mem.findScalarPos(u8, rest, 2, '/') orelse rest.len;
         var auth = rest[2..auth_end];
         rest = rest[auth_end..];
-        if (std.mem.lastIndexOfScalar(u8, auth, '@')) |at| auth = auth[at + 1 ..];
+        if (std.mem.findScalarLast(u8, auth, '@')) |at| auth = auth[at + 1 ..];
         host = auth;
     } else if (scheme.len == 0) {
         // A relative reference whose first segment holds a colon is an
         // error in Go ("first path segment in URL cannot contain colon").
-        const seg_end = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-        if (std.mem.indexOfScalar(u8, rest[0..seg_end], ':') != null) return null;
+        const seg_end = std.mem.findScalar(u8, rest, '/') orelse rest.len;
+        if (std.mem.findScalar(u8, rest[0..seg_end], ':') != null) return null;
     }
     return .{
         .scheme = scheme,
@@ -175,9 +175,9 @@ fn parseOrigin(s: []const u8) ?Parsed {
 fn decodeHost(host: []const u8, buf: *[max_host]u8) ?[]const u8 {
     if (host.len > max_host) return null;
     if (host[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        const close = std.mem.findScalar(u8, host, ']') orelse return null;
         if (!validPort(host[close + 1 ..])) return null;
-    } else if (std.mem.lastIndexOfScalar(u8, host, ':')) |colon| {
+    } else if (std.mem.findScalarLast(u8, host, ':')) |colon| {
         if (!validPort(host[colon..])) return null;
     }
     var n: usize = 0;
@@ -211,7 +211,7 @@ fn validPort(p: []const u8) bool {
 /// The ASCII bytes Go leaves unescaped in a host.
 fn hostByte(b: u8) bool {
     if (std.ascii.isAlphanumeric(b)) return true;
-    return std.mem.indexOfScalar(u8, "-_.~!$&'()*+,;=:[]<>\"", b) != null;
+    return std.mem.findScalar(u8, "-_.~!$&'()*+,;=:[]<>\"", b) != null;
 }
 
 const testing = std.testing;

@@ -412,7 +412,7 @@ fn infoWithKey(gpa: std.mem.Allocator, pk_hex: []const u8) ![]u8 {
     _ = try std.fmt.hexToBytes(tmp.pubkey_bytes[0 .. pk_hex.len / 2], pk_hex);
     @memcpy(tmp.beacon_id_buf[0..8], "quicknet");
     const hash = computeChainHash(&tmp);
-    return std.fmt.allocPrint(gpa, "{{\"public_key\":\"{s}\",\"period\":3,\"genesis_time\":1692803367,\"hash\":\"{s}\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\",\"metadata\":{{\"beaconID\":\"quicknet\"}}}}", .{ pk_hex, std.fmt.bytesToHex(hash, .lower) });
+    return gpa.print("{{\"public_key\":\"{s}\",\"period\":3,\"genesis_time\":1692803367,\"hash\":\"{s}\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\",\"metadata\":{{\"beaconID\":\"quicknet\"}}}}", .{ pk_hex, std.fmt.bytesToHex(hash, .lower) });
 }
 
 test "parseInfo: an on-curve public key OUTSIDE G2 → PublicKeyNotInSubgroup (audit F14)" {
@@ -611,7 +611,7 @@ fn chainedInfoWithKey(gpa: std.mem.Allocator, pk_hex: []const u8) ![]u8 {
     };
     _ = try std.fmt.hexToBytes(tmp.pubkey_bytes[0 .. pk_hex.len / 2], pk_hex);
     const hash = computeChainHash(&tmp);
-    return std.fmt.allocPrint(gpa, "{{\"public_key\":\"{s}\",\"period\":30,\"genesis_time\":1595431050,\"hash\":\"{s}\",\"groupHash\":\"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a\",\"schemeID\":\"pedersen-bls-chained\",\"metadata\":{{\"beaconID\":\"default\"}}}}", .{ pk_hex, std.fmt.bytesToHex(hash, .lower) });
+    return gpa.print("{{\"public_key\":\"{s}\",\"period\":30,\"genesis_time\":1595431050,\"hash\":\"{s}\",\"groupHash\":\"176f93498eac9ca337150b46d21dd58673ea4e3581185f869672e59fa4cb390a\",\"schemeID\":\"pedersen-bls-chained\",\"metadata\":{{\"beaconID\":\"default\"}}}}", .{ pk_hex, std.fmt.bytesToHex(hash, .lower) });
 }
 
 test "parseInfo: chained key KeyValidate — off-subgroup, identity and wrong length refused" {

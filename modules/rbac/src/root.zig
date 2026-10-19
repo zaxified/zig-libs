@@ -869,7 +869,7 @@ test "rbac: inherited grant through hierarchy permits" {
 
     const d = e.check("bob", "read", "doc");
     try testing.expectEqual(Result.permit, d.result);
-    try testing.expect(std.mem.indexOf(u8, d.reason, "hierarchy") != null);
+    try testing.expect(std.mem.find(u8, d.reason, "hierarchy") != null);
 }
 
 test "rbac: inherited grant sibling — without hierarchy edge denies" {
@@ -1202,7 +1202,7 @@ test "rbac: churn — assign/unassign and friends 10k times keep memory bounded"
     const Round = struct {
         fn run(eng: *rbac.Engine, i: usize) !void {
             var buf: [24]u8 = undefined;
-            const user = std.fmt.bufPrint(&buf, "user-{d}", .{i}) catch unreachable;
+            const user = std.mem.print(&buf, "user-{d}", .{i}) catch unreachable;
             try eng.assignRole("u", "keep"); // the same pair over and over
             try eng.assignRole("u", "keep"); // duplicate assign must not allocate
             _ = try eng.unassignRole("u", "keep");

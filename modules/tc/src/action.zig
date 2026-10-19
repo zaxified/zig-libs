@@ -1819,7 +1819,7 @@ test "an unknown gact probability type from the wire is carried, not a panic" {
     } }};
     try appendActionList(gpa, &list, 7, &acts, ratespec.golden_psched);
     const probe = (GactProb{ .ptype = .netrand, .pval = 4, .paction = .ok }).encode();
-    const at = std.mem.indexOf(u8, list.items, &probe).?;
+    const at = std.mem.find(u8, list.items, &probe).?;
     std.mem.writeInt(u16, list.items[at..][0..2], 0x7777, native_endian);
 
     var outer: codec.AttrIterator = .{ .buf = list.items };

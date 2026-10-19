@@ -58,7 +58,7 @@ fn hOrder(ctx: *router.Ctx) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx.state.?));
     app.calls += 1;
     var body_buf: [32]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "order-{d}", .{app.calls}) catch unreachable;
+    const body = std.mem.print(&body_buf, "order-{d}", .{app.calls}) catch unreachable;
     try app.store.respond(ctx, 201, "application/json", body);
 }
 
@@ -104,14 +104,14 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -274,8 +274,8 @@ pub fn main() !void {
         while (i < 64) : (i += 1) {
             var buf: [2048]u8 = undefined;
             var key_buf: [16]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "bulk-{d}", .{i}) catch unreachable;
-            const req = try std.fmt.allocPrint(gpa, "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: {s}\r\nConnection: close\r\n\r\n", .{key});
+            const key = std.mem.print(&key_buf, "bulk-{d}", .{i}) catch unreachable;
+            const req = try gpa.print("POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: {s}\r\nConnection: close\r\n\r\n", .{key});
             defer gpa.free(req);
             const resp = runWire(&r, req, &buf);
             must(std.mem.startsWith(u8, resp, "HTTP/1.1 201"), @src());

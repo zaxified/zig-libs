@@ -55,7 +55,7 @@ const Ctx = struct {
 };
 
 fn sizeIndex(n: usize) usize {
-    return std.mem.indexOfScalar(usize, &sizes, n).?;
+    return std.mem.findScalar(usize, &sizes, n).?;
 }
 
 fn once(x: *Ctx) usize {
@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (sizes, 0..) |n, i| {
         ctx.msgs[i] = try arena.alloc(u8, n);
         r.bytes(ctx.msgs[i]);
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "msg{d}.bin", .{n}), .data = ctx.msgs[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("msg{d}.bin", .{n}), .data = ctx.msgs[i] });
         ctx.cts[i] = try arena.alloc(u8, n);
         Aead.encryptInto(ctx.cts[i], &ctx.tags[i], ctx.msgs[i], &ctx.ad, ctx.nonce, &ctx.key);
     }
@@ -120,10 +120,10 @@ pub fn main(init: std.process.Init) !u8 {
     for ([_]bool{ false, true }) |decrypt| for (sizes) |n| {
         const op = if (decrypt) "dec" else "enc";
         try ws.append(arena, .{
-            .name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ op, n }),
+            .name = try arena.print("{s}_{d}", .{ op, n }),
             .op = .{ .decrypt = decrypt, .size = n },
-            .ref = try std.fmt.allocPrint(arena, "ossl.{s}_{d}", .{ op, n }),
-            .alt = try std.fmt.allocPrint(arena, "sodium.{s}_{d}", .{ op, n }),
+            .ref = try arena.print("ossl.{s}_{d}", .{ op, n }),
+            .alt = try arena.print("sodium.{s}_{d}", .{ op, n }),
         });
     };
 

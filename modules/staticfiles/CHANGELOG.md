@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (root.zig, go_oracle_test.zig). No behaviour change.
 - **2026-10-17** — Directory-listing names are escaped by `http.writeHtmlEscaped` instead of a local copy. **Output change:** `"` in a file name is now `&#34;` (was `&quot;`), as in Go's `FileServer` listing; both are the same character to a browser.
 - **2026-10-11** — Added (scope core → parity; survey 2026-09-30 backlog): `Options.fallback` (SPA / `try_files`: an extension-less GET/HEAD miss whose `Accept` lists `text/html` answers with that file, 200, `Vary: Accept`; the fallback goes through every ordinary rule, a missing one leaves the 404); `Options.precompressed` for the path-based `Handler` (`name.br`/`.zst`/`.gz` negotiated per request like `Snapshot`, `Content-Encoding`, the original `Content-Type`, a per-coding `ETag`, `Range` over the encoded bytes, `Vary: Accept-Encoding` on every file answer while on); 26 more MIME types (nginx `mime.types` common web types: webmanifest, mov, flac, jsonld, opus, ics, epub, glb/gltf, …). Defaults unchanged. Multi-range stays refused.

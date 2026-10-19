@@ -106,8 +106,8 @@ const testing = std.testing;
 
 fn pemToDer(pem: []const u8, out: []u8) ![]const u8 {
     const begin = "-----BEGIN CERTIFICATE-----";
-    const a = (std.mem.indexOf(u8, pem, begin) orelse return error.NoPem) + begin.len;
-    const b = std.mem.indexOfPos(u8, pem, a, "-----END CERTIFICATE-----") orelse return error.NoPem;
+    const a = (std.mem.find(u8, pem, begin) orelse return error.NoPem) + begin.len;
+    const b = std.mem.findPos(u8, pem, a, "-----END CERTIFICATE-----") orelse return error.NoPem;
     return out[0..try std.base64.standard.decoderWithIgnore(" \t\r\n").decode(out, pem[a..b])];
 }
 

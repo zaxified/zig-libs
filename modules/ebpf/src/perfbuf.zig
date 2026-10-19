@@ -638,7 +638,7 @@ pub fn countCpuList(text: []const u8) OpenError!u32 {
     var n: u32 = 0;
     var it = std.mem.tokenizeAny(u8, text, ", \t\r\n");
     while (it.next()) |part| {
-        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+        if (std.mem.findScalar(u8, part, '-')) |dash| {
             const lo = std.fmt.parseInt(u32, part[0..dash], 10) catch return error.CpuEnumerationFailed;
             const hi = std.fmt.parseInt(u32, part[dash + 1 ..], 10) catch return error.CpuEnumerationFailed;
             if (hi < lo or hi - lo > 4095) return error.CpuEnumerationFailed;
@@ -660,7 +660,7 @@ pub fn parseCpuList(gpa: std.mem.Allocator, text: []const u8) OpenError![]u32 {
 
     var it = std.mem.tokenizeAny(u8, text, ", \t\r\n");
     while (it.next()) |part| {
-        if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+        if (std.mem.findScalar(u8, part, '-')) |dash| {
             const lo = std.fmt.parseInt(u32, part[0..dash], 10) catch return error.CpuEnumerationFailed;
             const hi = std.fmt.parseInt(u32, part[dash + 1 ..], 10) catch return error.CpuEnumerationFailed;
             if (hi < lo or hi - lo > 4095) return error.CpuEnumerationFailed;
@@ -1087,7 +1087,7 @@ test "fake perf ring: consume() honors max_records and the stop action" {
     defer ring.deinit();
     for (0..8) |i| {
         var buf: [8]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "rec-{d}", .{i});
+        const s = try std.mem.print(&buf, "rec-{d}", .{i});
         ring.appendSample(s);
     }
 

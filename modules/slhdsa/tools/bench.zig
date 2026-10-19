@@ -126,8 +126,8 @@ pub fn main(init: std.process.Init) !u8 {
         var skb: [S.secret_key_length]u8 = undefined;
         c.sk.toBytes(&skb);
         try S.sign(&c.sig, &ctx.msg, &c.sk, "", null);
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "sk_{s}.bin", .{set_names[i]}), .data = &skb });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "sig_{s}.bin", .{set_names[i]}), .data = &c.sig });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("sk_{s}.bin", .{set_names[i]}), .data = &skb });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("sig_{s}.bin", .{set_names[i]}), .data = &c.sig });
     }
 
     const so = init.environ_map.get("LIBCRYPTO_SO") orelse default_so;
@@ -135,8 +135,8 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Interop before timing: OpenSSL accepts ours and signs identically.
     inline for (Sets, 0..) |S, i| {
-        try bench.foreignOnce(arena, io, bench_name, exe, abs, try std.fmt.allocPrint(arena, "interop/{s}", .{set_names[i]}));
-        const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "ossl_sig_{s}.bin", .{set_names[i]}), arena, .limited(1 << 20));
+        try bench.foreignOnce(arena, io, bench_name, exe, abs, try arena.print("interop/{s}", .{set_names[i]}));
+        const theirs = try dir.readFileAlloc(io, try arena.print("ossl_sig_{s}.bin", .{set_names[i]}), arena, .limited(1 << 20));
         if (!std.mem.eql(u8, theirs, &ctx.cases[i].sig)) {
             std.debug.print("{s}: FAILED -- OpenSSL's deterministic {s} signature differs from ours\n", .{ bench_name, set_names[i] });
             return 1;
@@ -146,7 +146,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ws: std.ArrayList(Work) = .empty;
     for (set_names, 0..) |sn, i| inline for (.{ Kind.sign, Kind.verify, Kind.keygen }) |k| {
-        const name = try std.fmt.allocPrint(arena, "{s}/{s}", .{ sn, @tagName(k) });
+        const name = try arena.print("{s}/{s}", .{ sn, @tagName(k) });
         try ws.append(arena, .{ .name = name, .op = .{ .kind = k, .set = i }, .ref = name });
     };
 

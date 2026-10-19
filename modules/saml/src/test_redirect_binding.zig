@@ -65,9 +65,9 @@ test "buildSignedRedirectQuery -> verifyRedirectSignature round-trips (CONSTRUCT
     defer alloc.free(query);
 
     try testing.expect(std.mem.startsWith(u8, query, "SAMLRequest="));
-    try testing.expect(std.mem.indexOf(u8, query, "&RelayState=") != null);
-    try testing.expect(std.mem.indexOf(u8, query, "&SigAlg=") != null);
-    try testing.expect(std.mem.indexOf(u8, query, "&Signature=") != null);
+    try testing.expect(std.mem.find(u8, query, "&RelayState=") != null);
+    try testing.expect(std.mem.find(u8, query, "&SigAlg=") != null);
+    try testing.expect(std.mem.find(u8, query, "&Signature=") != null);
 
     // Parse the (already-URL-encoded) query string apart ourselves to feed
     // verifyRedirectSignature the URL-DECODED values it expects — none of our
@@ -370,7 +370,7 @@ fn splitQuery(alloc: std.mem.Allocator, query: []const u8) !QueryParts {
     var parts: QueryParts = .{};
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |kv| {
-        const eq = std.mem.indexOfScalar(u8, kv, '=').?;
+        const eq = std.mem.findScalar(u8, kv, '=').?;
         const key = kv[0..eq];
         const val = try percentDecode(alloc, kv[eq + 1 ..]);
         if (std.mem.eql(u8, key, "SAMLRequest")) {

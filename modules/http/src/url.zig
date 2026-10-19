@@ -102,11 +102,11 @@ pub const QueryIterator = struct {
 
     pub fn next(it: *QueryIterator) ?RawPair {
         while (it.rest.len != 0) {
-            const amp = std.mem.indexOfScalar(u8, it.rest, '&') orelse it.rest.len;
+            const amp = std.mem.findScalar(u8, it.rest, '&') orelse it.rest.len;
             const pair = it.rest[0..amp];
             it.rest = it.rest[@min(amp + 1, it.rest.len)..];
             if (pair.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, pair, '=');
+            const eq = std.mem.findScalar(u8, pair, '=');
             return .{
                 .key = pair[0 .. eq orelse pair.len],
                 .value = if (eq) |e| pair[e + 1 ..] else "",

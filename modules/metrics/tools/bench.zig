@@ -163,7 +163,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     const gg = try sr.gauge("app_in_flight", "Requests in flight.", &.{});
     gg.set(3);
     for (0..6) |i| {
-        const room = try std.fmt.allocPrint(arena, "room{d}", .{i});
+        const room = try arena.print("room{d}", .{i});
         const t = try sr.gauge("app_temp_celsius", "Room temperature.", &.{.{ .name = "room", .value = room }});
         t.set(@as(f64, @floatFromInt(i)) * 0.5);
     }
@@ -172,7 +172,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         for (0..100) |k| h.observe(obsValue(mi * 100 + k));
     }
     for (0..8) |oi| {
-        const opn = try std.fmt.allocPrint(arena, "op{d}", .{oi});
+        const opn = try arena.print("op{d}", .{oi});
         const h = try sr.histogram("app_op_seconds", "Operation latency.", &.{.{ .name = "op", .value = opn }}, &metrics.default_buckets);
         for (0..100) |k| h.observe(obsValue(oi * 100 + k + 7));
     }
@@ -237,7 +237,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

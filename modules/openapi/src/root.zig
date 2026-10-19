@@ -881,7 +881,7 @@ fn writeOperation(
                 seen_count += 1;
             }
             var code_buf: [5]u8 = undefined;
-            const code = std.fmt.bufPrint(&code_buf, "{d}", .{resp.status}) catch unreachable;
+            const code = std.mem.print(&code_buf, "{d}", .{resp.status}) catch unreachable;
             try jw.objectField(code);
             try jw.beginObject();
             try jw.objectField("description");
@@ -1281,7 +1281,7 @@ fn etagOf(json: []const u8) [18]u8 {
     const h = std.hash.Wyhash.hash(etag_seed, json);
     var buf: [18]u8 = undefined;
     buf[0] = '"';
-    _ = std.fmt.bufPrint(buf[1..17], "{x:0>16}", .{h}) catch unreachable;
+    _ = std.mem.print(buf[1..17], "{x:0>16}", .{h}) catch unreachable;
     buf[17] = '"';
     return buf;
 }
@@ -1692,9 +1692,9 @@ const TemplateIterator = struct {
             switch (t.path[t.i]) {
                 '}' => return error.InvalidPathKey,
                 '{' => {
-                    const end = std.mem.indexOfScalarPos(u8, t.path, t.i + 1, '}') orelse return error.InvalidPathKey;
+                    const end = std.mem.findScalarPos(u8, t.path, t.i + 1, '}') orelse return error.InvalidPathKey;
                     const name = t.path[t.i + 1 .. end];
-                    if (name.len == 0 or std.mem.indexOfScalar(u8, name, '{') != null) return error.InvalidPathKey;
+                    if (name.len == 0 or std.mem.findScalar(u8, name, '{') != null) return error.InvalidPathKey;
                     t.i = end + 1;
                     return name;
                 },
@@ -2515,11 +2515,11 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 test "endpoint: serves the spec, 405 on other methods, passthrough elsewhere" {
@@ -2587,7 +2587,7 @@ test "endpoint: the spec is built once and cached, not regenerated per request (
     // registered yet, so it must be absent.
     const first = runWire(&r, wire("GET", "/openapi.json"), &buf);
     try expectStatus(first, "200");
-    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "/late") == null);
+    try testing.expect(std.mem.find(u8, bodyOf(first), "/late") == null);
 
     // Register a route AFTER the cache was populated. A per-request
     // generator (the old behavior) would pick this up on the very next
@@ -2595,7 +2595,7 @@ test "endpoint: the spec is built once and cached, not regenerated per request (
     try r.get("/late", hHello);
     const second = runWire(&r, wire("GET", "/openapi.json"), &buf);
     try expectStatus(second, "200");
-    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "/late") == null);
+    try testing.expect(std.mem.find(u8, bodyOf(second), "/late") == null);
 }
 
 fn clkNs(comptime which: std.os.linux.clockid_t) u64 {
@@ -2614,7 +2614,7 @@ fn addBenchRoutes(r: *router.Router, n: usize, poison_last: bool) !void {
     var name_buf: [64]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const p = try std.fmt.bufPrint(&name_buf, "/api/v1/resource{d}/:id", .{i});
+        const p = try std.mem.print(&name_buf, "/api/v1/resource{d}/:id", .{i});
         const last = (i == n - 1);
         try r.addDoc(.get, p, hOk, .{
             .summary = "Fetch one",
@@ -2782,7 +2782,7 @@ fn benchBuildNs(gpa: Allocator, n: usize) !u64 {
     var name_buf: [64]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const p = try std.fmt.bufPrint(&name_buf, "/api/v1/resource{d}/:id", .{i});
+        const p = try std.mem.print(&name_buf, "/api/v1/resource{d}/:id", .{i});
         try r.addDoc(.get, p, hOk, .{ .summary = "s", .responses = &.{.{ .status = 200, .description = "OK" }} });
     }
     const w0 = monoNs();
@@ -2910,13 +2910,13 @@ test "endpoint: ETag is served, and a matching If-None-Match gets 304 with no bo
     const first = runWire(&r, wire("GET", "/openapi.json"), &buf);
     try expectStatus(first, "200");
     const etag_prefix = "\r\nETag: ";
-    const at = std.mem.indexOf(u8, first, etag_prefix).?;
+    const at = std.mem.find(u8, first, etag_prefix).?;
     const rest = first[at + etag_prefix.len ..];
-    const etag = rest[0..std.mem.indexOf(u8, rest, "\r\n").?];
+    const etag = rest[0..std.mem.find(u8, rest, "\r\n").?];
 
     var buf2: [16384]u8 = undefined;
     var req_buf: [256]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET /openapi.json HTTP/1.1\r\nHost: t\r\nConnection: close\r\nIf-None-Match: {s}\r\n\r\n", .{etag});
+    const req = try std.mem.print(&req_buf, "GET /openapi.json HTTP/1.1\r\nHost: t\r\nConnection: close\r\nIf-None-Match: {s}\r\n\r\n", .{etag});
     const second = runWire(&r, req, &buf2);
     try expectStatus(second, "304");
     try testing.expectEqualStrings("", bodyOf(second));
@@ -2992,12 +2992,12 @@ test "endpoint: self-contained docs page (no external assets)" {
     const body = bodyOf(got);
     try testing.expect(std.mem.startsWith(u8, body, "<!doctype html>"));
     // The page fetches the endpoint's spec path...
-    try testing.expect(std.mem.indexOf(u8, body, "fetch(\"/openapi.json\")") != null);
+    try testing.expect(std.mem.find(u8, body, "fetch(\"/openapi.json\")") != null);
     // ...and pulls nothing external: no URLs, no src=/href= at all.
-    try testing.expect(std.mem.indexOf(u8, body, "http://") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "https://") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "src=") == null);
-    try testing.expect(std.mem.indexOf(u8, body, "href=") == null);
+    try testing.expect(std.mem.find(u8, body, "http://") == null);
+    try testing.expect(std.mem.find(u8, body, "https://") == null);
+    try testing.expect(std.mem.find(u8, body, "src=") == null);
+    try testing.expect(std.mem.find(u8, body, "href=") == null);
 }
 
 // ── tests: in-process integration (http.Server + http.Client) ───────────────
@@ -3045,7 +3045,7 @@ test "integration: GET /openapi.json over a real socket returns the documented r
     var url_buf: [64]u8 = undefined;
 
     { // the spec endpoint
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/openapi.json", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/openapi.json", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -3064,7 +3064,7 @@ test "integration: GET /openapi.json over a real socket returns the documented r
         try testing.expect(post_users.get("responses").?.object.get("201") != null);
     }
     { // documented routes still dispatch normally alongside the endpoint
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);

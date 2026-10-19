@@ -272,7 +272,7 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
             cont = null;
             continue;
         }
-        if (std.mem.indexOfScalar(u8, opts.comment_chars, content[0]) != null) {
+        if (std.mem.findScalar(u8, opts.comment_chars, content[0]) != null) {
             cont = null;
             continue;
         }
@@ -294,7 +294,7 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
             continue;
         }
 
-        const sep = std.mem.indexOfAny(u8, content, opts.separators) orelse {
+        const sep = std.mem.findAny(u8, content, opts.separators) orelse {
             if (!opts.strict) {
                 try skipped.append(a, line_no);
                 continue;
@@ -356,28 +356,28 @@ pub fn parseDiag(gpa: Allocator, text: []const u8, opts: Options, info: *ErrorIn
 /// which is how both references treat `[a` or `[a=b`.
 fn headerName(content: []const u8, opts: Options) ?[]const u8 {
     if (content[0] != '[') return null;
-    const close = std.mem.lastIndexOfScalar(u8, content, ']') orelse return null;
+    const close = std.mem.findScalarLast(u8, content, ']') orelse return null;
     if (close < 2) return null; // `[]`: no name
     const name = content[1..close];
     if (!opts.header_trailing_text) {
         if (close != content.len - 1) return null;
-        if (std.mem.indexOfAny(u8, name, "[]") != null) return null;
+        if (std.mem.findAny(u8, name, "[]") != null) return null;
     }
     return name;
 }
 
 /// `name` or `name[locale]`: see `Options.locale_keys`.
 fn isLocaleKey(key: []const u8) bool {
-    const open = std.mem.indexOfScalar(u8, key, '[') orelse
-        return std.mem.indexOfScalar(u8, key, ']') == null;
+    const open = std.mem.findScalar(u8, key, '[') orelse
+        return std.mem.findScalar(u8, key, ']') == null;
     if (open == 0 or key[key.len - 1] != ']') return false;
-    return std.mem.indexOfAny(u8, key[open + 1 .. key.len - 1], "[] \t") == null;
+    return std.mem.findAny(u8, key[open + 1 .. key.len - 1], "[] \t") == null;
 }
 
 fn cutInlineComment(value: []const u8, comment_chars: []const u8) []const u8 {
     var i: usize = 1;
     while (i < value.len) : (i += 1) {
-        if (std.mem.indexOfScalar(u8, comment_chars, value[i]) != null and
+        if (std.mem.findScalar(u8, comment_chars, value[i]) != null and
             (value[i - 1] == ' ' or value[i - 1] == '\t'))
             return std.mem.trimEnd(u8, value[0..i], " \t");
     }
@@ -491,7 +491,7 @@ test "a desktop entry: localized keys, trailing whitespace kept, escapes on requ
     // Brackets in a key only as a `[locale]` suffix (GKeyFile).
     for ([_][]const u8{ "a[b", "a]b", "a[b]c", "[b]", "a[b][c]", "a[b c]" }) |k| {
         var line_buf: [32]u8 = undefined;
-        const t = try std.fmt.bufPrint(&line_buf, "[g]\n{s}=v\n", .{k});
+        const t = try std.mem.print(&line_buf, "[g]\n{s}=v\n", .{k});
         try testing.expectError(error.InvalidKey, parse(testing.allocator, t, .desktop));
     }
     var ok = try parse(testing.allocator, "[g]\na[]=v\n", .desktop);
@@ -607,7 +607,7 @@ test "unquote: double quotes take escapes, single quotes none, anything else as 
 test "locale keys: a blank, `[` or `]` inside the locale is an InvalidKey, each on its own" {
     for ([_][]const u8{ "a[b\tc]", "a[b c]", "a[b[c]", "a[b]c]" }) |k| {
         var line_buf: [32]u8 = undefined;
-        const t = try std.fmt.bufPrint(&line_buf, "[g]\n{s}=v\n", .{k});
+        const t = try std.mem.print(&line_buf, "[g]\n{s}=v\n", .{k});
         try testing.expectError(error.InvalidKey, parse(testing.allocator, t, .desktop));
     }
     // lenient: the same lines are skipped, not fatal
@@ -660,19 +660,19 @@ test "unescapeDesktop: every escape of the specification, and the first bad one"
 test "getBool: every word of both lists, any case, and what is neither" {
     for ([_][]const u8{ "1", "yes", "true", "on", "YES", "True", "ON" }) |v| {
         var buf: [32]u8 = undefined;
-        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        var doc = try parse(testing.allocator, try std.mem.print(&buf, "[a]\nk={s}\n", .{v}), .{});
         defer doc.deinit();
         try testing.expectEqual(@as(?bool, true), try doc.getBool("a", "k"));
     }
     for ([_][]const u8{ "0", "no", "false", "off", "NO", "False", "OFF" }) |v| {
         var buf: [32]u8 = undefined;
-        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        var doc = try parse(testing.allocator, try std.mem.print(&buf, "[a]\nk={s}\n", .{v}), .{});
         defer doc.deinit();
         try testing.expectEqual(@as(?bool, false), try doc.getBool("a", "k"));
     }
     for ([_][]const u8{ "2", "", "y", "yess", "tru", "t", "of" }) |v| {
         var buf: [32]u8 = undefined;
-        var doc = try parse(testing.allocator, try std.fmt.bufPrint(&buf, "[a]\nk={s}\n", .{v}), .{});
+        var doc = try parse(testing.allocator, try std.mem.print(&buf, "[a]\nk={s}\n", .{v}), .{});
         defer doc.deinit();
         try testing.expectError(error.NotABool, doc.getBool("a", "k"));
     }

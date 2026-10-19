@@ -234,7 +234,7 @@ pub const signed = struct {
         if (out.len < total) return error.NoSpaceLeft;
         // issued "|" value, built in place after the tag, then signed.
         std.mem.copyBackwards(u8, out[total - value.len .. total], value);
-        const digits = std.fmt.bufPrint(out[tag_b64_len..], "{d}|", .{issued_s}) catch unreachable;
+        const digits = std.mem.print(out[tag_b64_len..], "{d}|", .{issued_s}) catch unreachable;
         std.debug.assert(digits.len == total - value.len - tag_b64_len);
         return burn.run(burn.mac_burn, []const u8, signMode, .{ key, name, out[tag_b64_len..total], out[0..total], Mode.timed });
     }
@@ -251,7 +251,7 @@ pub const signed = struct {
         // ctgrind before parsing the (authenticated, public) issue time.
         std.valgrind.memcheck.makeMemDefined(std.mem.asBytes(&verdict));
         const payload = verdict orelse return null;
-        const bar = std.mem.indexOfScalar(u8, payload, '|') orelse return null;
+        const bar = std.mem.findScalar(u8, payload, '|') orelse return null;
         const issued = parseIssued(payload[0..bar]) orelse return null;
         if (!fresh(issued, now_s, max_age_s)) return null;
         return payload[bar + 1 ..];
@@ -263,7 +263,7 @@ const timed_domain = "timed1\x00";
 
 fn decimalLen(v: i64) usize {
     var buf: [24]u8 = undefined;
-    return (std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable).len;
+    return (std.mem.print(&buf, "{d}", .{v}) catch unreachable).len;
 }
 
 /// The decimal `signTimed` wrote: an optional '-', 1..19 digits, nothing else.

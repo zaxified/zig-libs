@@ -259,7 +259,7 @@ fn fuzzDerive(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         buf[at] = if (old == 'z') 'y' else old + 1;
         var bad: bip32.ParsedKey = undefined;
         if (bip32.parseExtended(buf[0..text.len], network, &bad)) |_| {
-            if (std.mem.indexOfScalar(u8, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", buf[at]) != null) return error.ChangedTextAccepted;
+            if (std.mem.findScalar(u8, "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", buf[at]) != null) return error.ChangedTextAccepted;
         } else |_| {}
         buf[at] = old;
         DeriveMark.mark(.flipped_refused);

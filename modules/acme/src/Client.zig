@@ -111,7 +111,7 @@ pub const DnsPublisher = struct {
 /// §8.4). For a wildcard order the authorization's identifier is already the
 /// base name, so this is never given a `*.`.
 pub fn dns01RecordName(buf: *[dns01_max_name_len]u8, domain: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{s}{s}", .{ dns01_label, domain }) catch unreachable; // domain <= 253
+    return std.mem.print(buf, "{s}{s}", .{ dns01_label, domain }) catch unreachable; // domain <= 253
 }
 
 pub const dns01_label = "_acme-challenge.";
@@ -645,7 +645,7 @@ pub fn renewalInfo(c: *Client, cert_der: []const u8) Error!RenewalInfo {
         },
     };
     defer c.gpa.free(cert_id);
-    const url = try std.fmt.allocPrint(c.gpa, "{s}/{s}", .{ std.mem.trimEnd(u8, base, "/"), cert_id });
+    const url = try c.gpa.print("{s}/{s}", .{ std.mem.trimEnd(u8, base, "/"), cert_id });
     defer c.gpa.free(url);
 
     var res = c.http_client.request(.get, url, .{}) catch |err| return mapHttpError(err);
@@ -715,7 +715,7 @@ fn formatRfc3339(buf: *[rfc3339_len]u8, epoch: u64) []const u8 {
     const yd = es.getEpochDay().calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         yd.year,              md.month.numeric(),      @as(u8, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch unreachable; // exactly rfc3339_len
@@ -1134,7 +1134,7 @@ pub fn downloadChain(c: *Client, order: *const Order, preferred_chain: ?[]const 
 /// not parse is no match.
 fn topIssuerIs(a: Allocator, chain_pem: []const u8, cn: []const u8) Error!bool {
     const begin = "-----BEGIN CERTIFICATE-----";
-    const last = std.mem.lastIndexOf(u8, chain_pem, begin) orelse return false;
+    const last = std.mem.findLast(u8, chain_pem, begin) orelse return false;
     const der_bytes = x509.pemDecode(a, "CERTIFICATE", chain_pem[last..]) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return false,
@@ -1957,10 +1957,10 @@ fn alternateLinks(a: Allocator, head: anytype) Allocator.Error![]const []const u
     while (it.next()) |h| {
         if (!std.ascii.eqlIgnoreCase(h.name, "link")) continue;
         var rest = h.value;
-        while (std.mem.indexOfScalar(u8, rest, '<')) |lt| {
-            const gt = std.mem.indexOfScalarPos(u8, rest, lt, '>') orelse break;
+        while (std.mem.findScalar(u8, rest, '<')) |lt| {
+            const gt = std.mem.findScalarPos(u8, rest, lt, '>') orelse break;
             const target = rest[lt + 1 .. gt];
-            const params_end = std.mem.indexOfScalarPos(u8, rest, gt, ',') orelse rest.len;
+            const params_end = std.mem.findScalarPos(u8, rest, gt, ',') orelse rest.len;
             if (isAlternateRel(rest[gt + 1 .. params_end])) try out.append(a, try a.dupe(u8, target));
             rest = rest[params_end..];
         }
@@ -1974,7 +1974,7 @@ fn isAlternateRel(params: []const u8) bool {
     var it = std.mem.tokenizeScalar(u8, params, ';');
     while (it.next()) |raw| {
         const param = std.mem.trim(u8, raw, " \t");
-        const eq = std.mem.indexOfScalar(u8, param, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, param, '=') orelse continue;
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, param[0..eq], " \t"), "rel")) continue;
         const value = std.mem.trim(u8, std.mem.trim(u8, param[eq + 1 ..], " \t"), "\"");
         var rels = std.mem.tokenizeScalar(u8, value, ' ');
@@ -2105,7 +2105,7 @@ pub const Responder = struct {
 
         const token = path[path_prefix.len..];
         var buf: [jws.max_key_authorization_len]u8 = undefined;
-        const key_auth = if (std.mem.indexOfScalar(u8, token, '/') == null)
+        const key_auth = if (std.mem.findScalar(u8, token, '/') == null)
             r.lookup(token, &buf)
         else
             null; // nested paths are never tokens
@@ -2241,8 +2241,8 @@ test "defaults: staging directory, ToS agreement on" {
     const options: Options = .{};
     try testing.expectEqualStrings(letsencrypt_staging, options.directory_url);
     try testing.expect(options.terms_of_service_agreed);
-    try testing.expect(std.mem.indexOf(u8, letsencrypt_staging, "staging") != null);
-    try testing.expect(std.mem.indexOf(u8, letsencrypt_production, "staging") == null);
+    try testing.expect(std.mem.find(u8, letsencrypt_staging, "staging") != null);
+    try testing.expect(std.mem.find(u8, letsencrypt_production, "staging") == null);
 }
 
 test "status + problem + retry-after parsing" {
@@ -2732,7 +2732,7 @@ test "Responder middleware: serves tokens, 404s unknowns, passes the rest throug
     // Known token → 200 + octet-stream + exact key authorization.
     const hit = runWire(&r, wire("GET", "/.well-known/acme-challenge/the-token"), &buf);
     try testing.expect(std.mem.startsWith(u8, hit, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, hit, "\r\nContent-Type: application/octet-stream\r\n") != null);
+    try testing.expect(std.mem.find(u8, hit, "\r\nContent-Type: application/octet-stream\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, hit, "\r\n\r\nthe-token.THUMBPRINT"));
 
     // HEAD frames like GET, no body.
@@ -2753,7 +2753,7 @@ test "Responder middleware: serves tokens, 404s unknowns, passes the rest throug
     // POST to the prefix is not the responder's business → app 404 (no routes).
     const post = runWire(&r, wire("POST", "/.well-known/acme-challenge/the-token"), &buf);
     try testing.expect(std.mem.startsWith(u8, post, "HTTP/1.1 404"));
-    try testing.expect(std.mem.indexOf(u8, post, "unknown ACME challenge token") == null);
+    try testing.expect(std.mem.find(u8, post, "unknown ACME challenge token") == null);
 }
 
 // ── tests (mock-ACME integration — full RFC 8555 round on loopback) ─────────
@@ -2868,20 +2868,20 @@ const MockCa = struct {
 
     fn setUrls(m: *MockCa, ca_port: u16, challenge_port: u16) !void {
         const gpa = m.gpa;
-        m.dir_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/dir", .{ca_port});
-        m.new_nonce_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/new-nonce", .{ca_port});
-        m.new_account_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/new-acct", .{ca_port});
-        m.new_order_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/new-order", .{ca_port});
-        m.account_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/acct/1", .{ca_port});
-        m.order_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/order/1", .{ca_port});
-        m.authz_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/authz/1", .{ca_port});
-        m.challenge_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/chall/1", .{ca_port});
-        m.finalize_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/finalize/1", .{ca_port});
-        m.cert_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/cert/1", .{ca_port});
-        m.challenge_base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{challenge_port});
-        m.key_change_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/key-change", .{ca_port});
-        m.revoke_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/revoke", .{ca_port});
-        m.ari_url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/ari", .{ca_port});
+        m.dir_url = try gpa.print("http://127.0.0.1:{d}/dir", .{ca_port});
+        m.new_nonce_url = try gpa.print("http://127.0.0.1:{d}/new-nonce", .{ca_port});
+        m.new_account_url = try gpa.print("http://127.0.0.1:{d}/new-acct", .{ca_port});
+        m.new_order_url = try gpa.print("http://127.0.0.1:{d}/new-order", .{ca_port});
+        m.account_url = try gpa.print("http://127.0.0.1:{d}/acct/1", .{ca_port});
+        m.order_url = try gpa.print("http://127.0.0.1:{d}/order/1", .{ca_port});
+        m.authz_url = try gpa.print("http://127.0.0.1:{d}/authz/1", .{ca_port});
+        m.challenge_url = try gpa.print("http://127.0.0.1:{d}/chall/1", .{ca_port});
+        m.finalize_url = try gpa.print("http://127.0.0.1:{d}/finalize/1", .{ca_port});
+        m.cert_url = try gpa.print("http://127.0.0.1:{d}/cert/1", .{ca_port});
+        m.challenge_base = try gpa.print("http://127.0.0.1:{d}", .{challenge_port});
+        m.key_change_url = try gpa.print("http://127.0.0.1:{d}/key-change", .{ca_port});
+        m.revoke_url = try gpa.print("http://127.0.0.1:{d}/revoke", .{ca_port});
+        m.ari_url = try gpa.print("http://127.0.0.1:{d}/ari", .{ca_port});
     }
 
     fn deinitUrls(m: *MockCa) void {
@@ -2928,7 +2928,7 @@ const MockCa = struct {
         const id = m.nonces_issued;
         std.debug.assert(id < max_nonces); // the flow uses ~a dozen
         m.nonces_issued += 1;
-        const text = std.fmt.bufPrint(&m.nonce_store[id], "nonce-{d}", .{id}) catch unreachable;
+        const text = std.mem.print(&m.nonce_store[id], "nonce-{d}", .{id}) catch unreachable;
         return text;
     }
 
@@ -3249,7 +3249,7 @@ fn mcAuthz(ctx: *router.Ctx) anyerror!void {
     m.lock.unlock();
     if (gone) {
         var gbuf: [256]u8 = undefined;
-        const body = try std.fmt.bufPrint(&gbuf,
+        const body = try std.mem.print(&gbuf,
             \\{{"status":"deactivated","identifier":{{"type":"dns","value":"{s}"}},"challenges":[]}}
         , .{m.order_domain});
         return m.respondJson(ctx, 200, body);
@@ -3312,7 +3312,7 @@ fn mcChallenge(ctx: *router.Ctx) anyerror!void {
     defer fetcher.deinit();
 
     var url_buf: [128]u8 = undefined;
-    const ka_url = std.fmt.bufPrint(&url_buf, "{s}{s}{s}", .{
+    const ka_url = std.mem.print(&url_buf, "{s}{s}{s}", .{
         m.challenge_base, Responder.path_prefix, MockCa.token,
     }) catch unreachable;
     const got = fetcher.getAlloc(m.gpa, ka_url, 4096) catch {
@@ -3328,7 +3328,7 @@ fn mcChallenge(ctx: *router.Ctx) anyerror!void {
         return mcRejected(ctx);
     }
 
-    const bogus_url = std.fmt.bufPrint(&url_buf, "{s}{s}not-a-token", .{
+    const bogus_url = std.mem.print(&url_buf, "{s}{s}not-a-token", .{
         m.challenge_base, Responder.path_prefix,
     }) catch unreachable;
     var bogus = fetcher.request(.get, bogus_url, .{}) catch {
@@ -3522,7 +3522,7 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
     if (m.alt_chain) {
         // An unrelated relation first: only `rel="alternate"` is a chain.
         var buf: [256]u8 = undefined;
-        const link = try std.fmt.bufPrint(&buf, "<{s}>;rel=\"index\", <{s}/alt>;rel=\"alternate\"", .{
+        const link = try std.mem.print(&buf, "<{s}>;rel=\"index\", <{s}/alt>;rel=\"alternate\"", .{
             m.dir_url, m.cert_url,
         });
         try ctx.res.setHeader("Link", link);
@@ -3535,7 +3535,7 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
 fn mcCertAlt(ctx: *router.Ctx) anyerror!void {
     const m = MockCa.of(ctx);
     var alt_buf: [128]u8 = undefined;
-    const alt_url = try std.fmt.bufPrint(&alt_buf, "{s}/alt", .{m.cert_url});
+    const alt_url = try std.mem.print(&alt_buf, "{s}/alt", .{m.cert_url});
     var v = m.readVerified(ctx, alt_url, .kid) catch return mcRejected(ctx);
     defer v.deinit();
     lockSpin(&m.lock);
@@ -3613,7 +3613,7 @@ fn mcKeyChange(ctx: *router.Ctx) anyerror!void {
     const want = jws.canonicalJwk(&want_buf, m.account_key.?);
     var got_buf: [jws.max_canonical_jwk_len]u8 = undefined;
     const old = payload.value.oldKey;
-    const got = std.fmt.bufPrint(&got_buf, "{{\"crv\":\"{s}\",\"kty\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ old.crv, old.kty, old.x, old.y }) catch "";
+    const got = std.mem.print(&got_buf, "{{\"crv\":\"{s}\",\"kty\":\"{s}\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ old.crv, old.kty, old.x, old.y }) catch "";
     if (!std.mem.eql(u8, want, got)) m.fail("oldKey is not the current account key");
     const key_in_use = if (inner.jwk_key) |k| k.eql(m.account_key.?) else false;
     if (key_in_use) {
@@ -3779,7 +3779,7 @@ test "integration: full issuance against a mock ACME CA (dogfood, JWS-verified)"
     defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
     var dir_url_buf: [64]u8 = undefined;
-    const dir_url = try std.fmt.bufPrint(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{
+    const dir_url = try std.mem.print(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{
         ca_server.boundAddress().getPort(),
     });
     var client = Client.init(io, testing.allocator, &transport, &account_key, .{
@@ -4134,7 +4134,7 @@ test "EAB: the JWS bytes against an independent HMAC-SHA256 (std) over the RFC 8
     try testing.expectError(error.BadSignature, jws.verifyEab(testing.allocator, out, "another key entirely"));
     const bent = try testing.allocator.dupe(u8, out);
     defer testing.allocator.free(bent);
-    const at = std.mem.indexOf(u8, bent, "\"payload\":\"").? + 11;
+    const at = std.mem.find(u8, bent, "\"payload\":\"").? + 11;
     bent[at] = if (bent[at] == 'A') 'B' else 'A';
     try testing.expectError(error.BadSignature, jws.verifyEab(testing.allocator, bent, key));
 }
@@ -4366,7 +4366,7 @@ test "new-order payload: the optional replaces member (RFC 9773 §5)" {
     defer plain.deinit();
     var js2: std.json.Stringify = .{ .writer = &plain.writer, .options = .{} };
     try writeOrderPayload(&js2, &.{"example.org"}, .{});
-    try testing.expect(std.mem.indexOf(u8, plain.written(), "replaces") == null);
+    try testing.expect(std.mem.find(u8, plain.written(), "replaces") == null);
 }
 
 test "integration: ES384 account key and ES384 certificate key through the whole flow, with replaces" {
@@ -4394,7 +4394,7 @@ test "integration: ES384 account key and ES384 certificate key through the whole
     defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
 
     var dir_url_buf: [64]u8 = undefined;
-    const dir_url = try std.fmt.bufPrint(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{ca_server.boundAddress().getPort()});
+    const dir_url = try std.mem.print(&dir_url_buf, "http://127.0.0.1:{d}/dir", .{ca_server.boundAddress().getPort()});
     var client = Client.init(io, testing.allocator, &transport, &account_key, .{
         .directory_url = dir_url,
         .cert_key_alg = .es384,
@@ -4548,7 +4548,7 @@ test "W1: a 503 is resent; rateLimited is error.RateLimited with retryAfter, not
     const before = lab.mock.nonces_issued;
     try testing.expectError(error.RateLimited, c.obtain(&.{MockCa.domain}));
     try testing.expectEqual(@as(?u64, 3600), c.retryAfter());
-    try testing.expect(std.mem.indexOf(u8, c.lastProblem().?, "rateLimited") != null);
+    try testing.expect(std.mem.find(u8, c.lastProblem().?, "rateLimited") != null);
     try testing.expectEqual(before + 1, lab.mock.nonces_issued); // one refusal, no resend
     try lab.expectClean();
 }
@@ -5122,7 +5122,7 @@ test "AcmeIssuer: a rate-limited CA is IssueError.RateLimited with its Retry-Aft
     lab.mock.rate_limit = true;
     try testing.expectError(error.RateLimited, iss.issue(iss.ctx, testing.allocator, &req, &diag));
     try testing.expectEqual(@as(?u64, 3600), diag.retry_after_s);
-    try testing.expect(std.mem.indexOf(u8, diag.problem(), "rateLimited") != null);
+    try testing.expect(std.mem.find(u8, diag.problem(), "rateLimited") != null);
 }
 
 // ── mutation follow-up (2026-10-18): the mock CA's knobs for the rest ───────
@@ -5302,7 +5302,7 @@ test "renewalInfo: a trailing slash of the directory's URL is not doubled; a non
 
     lab.mock.ari_status = 500;
     try testing.expectError(error.AcmeProblem, c.renewalInfoPem(rfc9773_cert_pem));
-    try testing.expect(std.mem.indexOf(u8, c.lastProblem().?, "ari down") != null);
+    try testing.expect(std.mem.find(u8, c.lastProblem().?, "ari down") != null);
 }
 
 test "AcmeIssuer: a CA that refuses `replaces` gets the order once more without it" {

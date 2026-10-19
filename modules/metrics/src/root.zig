@@ -1262,7 +1262,7 @@ pub const Registry = struct {
         if (kind == .histogram) {
             var buf: [256]u8 = undefined;
             for (suffixes) |suf| {
-                const derived = std.fmt.bufPrint(&buf, "{s}{s}", .{ name, suf }) catch continue;
+                const derived = std.mem.print(&buf, "{s}{s}", .{ name, suf }) catch continue;
                 if (r.family_index.contains(derived)) return error.NameCollision;
             }
         }
@@ -1375,7 +1375,7 @@ pub const Registry = struct {
         }
         defer {
             lockSpin(&r.lock);
-            const i = std.mem.indexOfScalar(u64, r.scrapes.items, ticket).?;
+            const i = std.mem.findScalar(u64, r.scrapes.items, ticket).?;
             _ = r.scrapes.swapRemove(i);
             r.reapLocked();
             r.lock.unlock();
@@ -1599,7 +1599,7 @@ pub const ProcessCollector = struct {
             const name = if (namespace.len == 0)
                 b[0]
             else
-                std.fmt.bufPrint(buf, "{s}_{s}", .{ namespace, b[0] }) catch return error.InvalidName;
+                std.mem.print(buf, "{s}_{s}", .{ namespace, b[0] }) catch return error.InvalidName;
             d.* = .{ .name = name, .help = b[1], .kind = b[2] };
         }
         return r.registerCollector(&descs, .{ .ctx = pc, .collect = collect });
@@ -1956,7 +1956,7 @@ fn writeOpenMetricsFloat(w: *std.Io.Writer, v: f64) std.Io.Writer.Error!void {
     var buf: [64]u8 = undefined;
     const g = goShortestG(&buf, v);
     try w.writeAll(g);
-    if (std.mem.indexOfAny(u8, g, ".e") == null) try w.writeAll(".0");
+    if (std.mem.findAny(u8, g, ".e") == null) try w.writeAll(".0");
 }
 
 /// Go `strconv.FormatFloat(v, 'g', -1, 64)` for a finite, non-zero `v`:
@@ -1968,8 +1968,8 @@ fn goShortestG(buf: []u8, v: f64) []const u8 {
     // Shortest digits and exponent from Zig's scientific rendering
     // ("d.ddde[-]X").
     var sci_buf: [64]u8 = undefined;
-    const sci = std.fmt.bufPrint(&sci_buf, "{e}", .{v}) catch unreachable;
-    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const sci = std.mem.print(&sci_buf, "{e}", .{v}) catch unreachable;
+    const e_at = std.mem.findScalar(u8, sci, 'e').?;
     const exp = std.fmt.parseInt(i32, sci[e_at + 1 ..], 10) catch unreachable;
     const neg = sci[0] == '-';
     const mant = sci[@intFromBool(neg)..e_at];
@@ -2081,7 +2081,7 @@ fn endpointRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror
                     ctx.res.setStatus(503);
                     try ctx.res.setHeader("Content-Type", "text/plain; charset=utf-8");
                     var msg_buf: [96]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&msg_buf, "Limit of concurrent requests reached ({d}), try again later.\n", .{max}) catch unreachable;
+                    const msg = std.mem.print(&msg_buf, "Limit of concurrent requests reached ({d}), try again later.\n", .{max}) catch unreachable;
                     try ctx.res.writeAll(msg);
                     return;
                 }
@@ -2295,7 +2295,7 @@ pub const RequestMetrics = struct {
         var code_buf: [3]u8 = undefined;
         const code: []const u8 = switch (m.options.status) {
             .class => classLabel(ci),
-            .code => std.fmt.bufPrint(&code_buf, "{d}", .{status}) catch classLabel(ci),
+            .code => std.mem.print(&code_buf, "{d}", .{status}) catch classLabel(ci),
         };
         const c = try m.registry.counter(m.options.counter_name, m.options.counter_help, &.{
             .{ .name = "method", .value = @tagName(method) },
@@ -2593,8 +2593,8 @@ test "registration copies its inputs (stack temporaries are safe)" {
     {
         var name_buf: [16]u8 = undefined;
         var val_buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "tmp_{d}_total", .{1});
-        const val = try std.fmt.bufPrint(&val_buf, "v{d}", .{7});
+        const name = try std.mem.print(&name_buf, "tmp_{d}_total", .{1});
+        const val = try std.mem.print(&val_buf, "v{d}", .{7});
         c1 = try reg.counter(name, "Tmp.", &.{.{ .name = "k", .value = val }});
         name_buf = @splat(0xAA); // scribble the caller's memory
         val_buf = @splat(0xAA);
@@ -2670,7 +2670,7 @@ fn validateExpositionText(text: []const u8) ExpositionError!void {
 }
 
 fn validateHelpOrTypeLine(rest: []const u8, comptime kind: enum { help, type }) ExpositionError!void {
-    const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+    const sp = std.mem.findScalar(u8, rest, ' ') orelse rest.len;
     if (!validMetricName(rest[0..sp])) return error.InvalidMetricName;
     if (kind == .help) return; // anything after the name is free HELP text
     const type_str = if (sp < rest.len) rest[sp + 1 ..] else "";
@@ -3083,7 +3083,7 @@ test "stress: concurrent get-or-register converges on one series per label set" 
                 c.inc();
                 // ...and each thread also its own labeled series.
                 var buf: [8]u8 = undefined;
-                const v = std.fmt.bufPrint(&buf, "{d}", .{id}) catch return;
+                const v = std.mem.print(&buf, "{d}", .{id}) catch return;
                 const own = r.counter("per_thread_total", "P.", &.{.{ .name = "t", .value = v }}) catch return;
                 own.inc();
             }
@@ -3097,7 +3097,7 @@ test "stress: concurrent get-or-register converges on one series per label set" 
     try testing.expectEqual(n_threads * iters, c.value());
     for (0..n_threads) |id| {
         var buf: [8]u8 = undefined;
-        const v = try std.fmt.bufPrint(&buf, "{d}", .{id});
+        const v = try std.mem.print(&buf, "{d}", .{id});
         const own = try reg.counter("per_thread_total", "P.", &.{.{ .name = "t", .value = v }});
         try testing.expectEqual(iters, own.value());
     }
@@ -3139,20 +3139,20 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 fn expectBodyLine(got: []const u8, comptime line: []const u8) !void {
     const body = bodyOf(got);
-    const found = std.mem.indexOf(u8, body, line ++ "\n") != null;
+    const found = std.mem.find(u8, body, line ++ "\n") != null;
     if (!found) std.debug.print("missing \"{s}\" in exposition:\n{s}\n", .{ line, body });
     try testing.expect(found);
     // A full line match: preceded by start-of-body or a newline.
-    const idx = std.mem.indexOf(u8, body, line ++ "\n").?;
+    const idx = std.mem.find(u8, body, line ++ "\n").?;
     try testing.expect(idx == 0 or body[idx - 1] == '\n');
 }
 
@@ -3287,7 +3287,7 @@ test "middleware: counts by method + status class, times with the injected clock
     // scrape itself was not counted (the whole http_requests_total family
     // sums to 7, not 8).
     try expectBodyLine(got, "http_requests_in_flight 0");
-    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "/metrics") == null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "/metrics") == null);
 }
 
 // F12/R3 in the module's audit: the safe DEFAULT order (`RequestMetrics`
@@ -3748,7 +3748,7 @@ test "middleware: request/response size histograms are off by default and unchan
     var buf: [8192]u8 = undefined;
     _ = runWire(&r, wire("GET", "/ok"), &buf);
     const got = runWire(&r, wire("GET", "/metrics"), &buf);
-    try testing.expect(std.mem.indexOf(u8, got, "size_bytes") == null);
+    try testing.expect(std.mem.find(u8, got, "size_bytes") == null);
 }
 
 test "middleware: request/response size histograms (opt-in, per method)" {
@@ -3836,7 +3836,7 @@ test "integration: request middleware + /metrics endpoint over loopback" {
         .{ .method = .get, .target = "/boom", .expect = 500 },
     };
     for (shots) |shot| {
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, shot.target });
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}{s}", .{ port, shot.target });
         var res = try client.request(shot.method, url, .{ .follow_redirects = false });
         defer res.deinit();
         try testing.expectEqual(shot.expect, res.status);
@@ -3845,7 +3845,7 @@ test "integration: request middleware + /metrics endpoint over loopback" {
     }
 
     // Scrape and assert the whole picture.
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/metrics", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/metrics", .{port});
     var res = try client.request(.get, url, .{});
     defer res.deinit();
     try testing.expectEqual(200, res.status);
@@ -3869,14 +3869,14 @@ test "integration: request middleware + /metrics endpoint over loopback" {
     };
     for (expected_lines) |line| {
         var pattern_buf: [128]u8 = undefined;
-        const pattern = try std.fmt.bufPrint(&pattern_buf, "{s}\n", .{line});
-        if (std.mem.indexOf(u8, body, pattern) == null) {
+        const pattern = try std.mem.print(&pattern_buf, "{s}\n", .{line});
+        if (std.mem.find(u8, body, pattern) == null) {
             std.debug.print("missing \"{s}\" in exposition:\n{s}\n", .{ line, body });
             try testing.expect(false);
         }
     }
     // The sum is real time, not a fake clock: positive and plausible.
-    try testing.expect(std.mem.indexOf(u8, body, "http_request_duration_seconds_sum{method=\"get\"} ") != null);
+    try testing.expect(std.mem.find(u8, body, "http_request_duration_seconds_sum{method=\"get\"} ") != null);
     // TYPE lines once per family.
     try testing.expectEqual(1, std.mem.count(u8, body, "# TYPE http_requests_total counter"));
     try testing.expectEqual(1, std.mem.count(u8, body, "# TYPE http_request_duration_seconds histogram"));
@@ -4141,14 +4141,14 @@ test "overlapping scrapes do not keep removed series parked forever (review L5)"
     reg.scrape_seq = 1;
     for (0..50) |i| {
         var key: [8]u8 = undefined;
-        const k = std.fmt.bufPrint(&key, "k{d}", .{i}) catch unreachable;
+        const k = std.mem.print(&key, "k{d}", .{i}) catch unreachable;
         _ = try v.with(&.{k});
         try testing.expect(v.delete(&.{k})); // parked behind `running`
         // The next scrape starts before the previous one ends.
         const next = reg.scrape_seq;
         reg.scrape_seq += 1;
         try reg.scrapes.append(testing.allocator, next);
-        _ = reg.scrapes.swapRemove(std.mem.indexOfScalar(u64, reg.scrapes.items, running).?);
+        _ = reg.scrapes.swapRemove(std.mem.findScalar(u64, reg.scrapes.items, running).?);
         reg.reapLocked();
         running = next;
         // Only the removal made while `next` was not yet running survives
@@ -4439,8 +4439,8 @@ test "collector: emits its described families once per scrape, in place" {
     // Unregistering one of its families drops just that family.
     try testing.expect(reg.unregister("proc_lat"));
     const out = try scrapeInto(&reg, &buf);
-    try testing.expect(std.mem.indexOf(u8, out, "proc_lat") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "proc_cpu_seconds_total{mode=\"user\"} 1.5") != null);
+    try testing.expect(std.mem.find(u8, out, "proc_lat") == null);
+    try testing.expect(std.mem.find(u8, out, "proc_cpu_seconds_total{mode=\"user\"} 1.5") != null);
 }
 
 test "collector: a failing or misbehaving collector fails the scrape" {
@@ -4514,7 +4514,7 @@ test "Endpoint: open_metrics negotiates, default stays text" {
             try testing.expect(std.mem.endsWith(u8, got, "# EOF\n"));
         } else {
             try expectHeaderLine(got, "Content-Type: " ++ content_type);
-            try testing.expect(std.mem.indexOf(u8, got, "# EOF") == null);
+            try testing.expect(std.mem.find(u8, got, "# EOF") == null);
         }
     }
 }
@@ -4623,7 +4623,7 @@ test "ProcessCollector: client_golang's process_* families for this process" {
     };
     var at: usize = 0;
     for (want) |w| {
-        const i = std.mem.indexOfPos(u8, out, at, w) orelse {
+        const i = std.mem.findPos(u8, out, at, w) orelse {
             std.debug.print("missing or out of order: {s}\n---\n{s}\n", .{ w, out });
             return error.TestUnexpectedResult;
         };
@@ -4637,7 +4637,7 @@ test "ProcessCollector: client_golang's process_* families for this process" {
     try lw.writeAll("\nprocess_max_fds ");
     if (lim.cur == std.posix.RLIM.INFINITY) try writeFloat(&lw, @floatFromInt(std.math.maxInt(u64))) else try writeFloat(&lw, @floatFromInt(lim.cur));
     try lw.writeByte('\n');
-    try testing.expect(std.mem.indexOf(u8, out, lw.buffered()) != null);
+    try testing.expect(std.mem.find(u8, out, lw.buffered()) != null);
 
     // Namespace prefix.
     var reg2 = Registry.init(testing.allocator);
@@ -4645,7 +4645,7 @@ test "ProcessCollector: client_golang's process_* families for this process" {
     var pc2: ProcessCollector = .{ .gpa = testing.allocator, .io = testing.io };
     try pc2.register(&reg2, "app");
     const out2 = try scrapeInto(&reg2, &buf);
-    try testing.expect(std.mem.indexOf(u8, out2, "\napp_process_open_fds ") != null);
+    try testing.expect(std.mem.find(u8, out2, "\napp_process_open_fds ") != null);
     // Its names are taken now.
     try testing.expectError(error.AlreadyRegistered, pc2.register(&reg2, "app"));
 }
@@ -4694,8 +4694,8 @@ test "exemplars: OpenMetrics lines byte-identical to client_golang; text format 
     try reg.writeOpenMetrics(&w);
     try testing.expectEqualStrings(golden_go_exemplars, w.buffered());
     const text = try scrapeInto(&reg, &buf);
-    try testing.expect(std.mem.indexOf(u8, text, "#  {") == null);
-    try testing.expect(std.mem.indexOf(u8, text, "span") == null);
+    try testing.expect(std.mem.find(u8, text, "#  {") == null);
+    try testing.expect(std.mem.find(u8, text, "span") == null);
 }
 
 test "exemplars: the last one per sample wins; no timestamp is allowed" {
@@ -4707,7 +4707,7 @@ test "exemplars: the last one per sample wins; no timestamp is allowed" {
     var buf: [512]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try reg.writeOpenMetrics(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "y_total 2.0 # {t=\"2\"} 1.0\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "y_total 2.0 # {t=\"2\"} 1.0\n") != null);
 }
 
 test "exemplars: invalid labels are refused and change nothing" {
@@ -4751,7 +4751,7 @@ test "exemplars: concurrent writers and scrapers stay well-formed" {
                 // every exemplar is one of the three whole label blocks
                 var it = std.mem.splitScalar(u8, out, '\n');
                 while (it.next()) |line| {
-                    const at = std.mem.indexOf(u8, line, " # ") orelse continue;
+                    const at = std.mem.find(u8, line, " # ") orelse continue;
                     const rest = line[at + 3 ..];
                     std.debug.assert(std.mem.startsWith(u8, rest, "{trace_id=\"a\"} ") or
                         std.mem.startsWith(u8, rest, "{trace_id=\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"} ") or
@@ -4827,8 +4827,8 @@ test "exemplars: an observation equal to a bound carries its exemplar in that bu
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try reg.writeOpenMetrics(&w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "eq_seconds_bucket{le=\"1.0\"} 1 # {s=\"x\"} 1.0\n") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "eq_seconds_bucket{le=\"5.0\"} 1\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "eq_seconds_bucket{le=\"1.0\"} 1 # {s=\"x\"} 1.0\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "eq_seconds_bucket{le=\"5.0\"} 1\n") != null);
 }
 
 test "buckets: fillExponentialBucketsRange accepts min == max, refuses a descending range" {
@@ -4955,7 +4955,7 @@ test "collector: Sink refuses desc == len, non-finite or equal bounds, malformed
     try testing.expectEqualStrings("", w2.buffered());
     // A quantile of exactly 1 is allowed.
     try sink2.summary(0, &.{}, &.{.{ .quantile = 1, .epsilon = 0 }}, &.{3}, 3, 1);
-    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "cs{quantile=\"1\"} 3\n") != null);
+    try testing.expect(std.mem.find(u8, w2.buffered(), "cs{quantile=\"1\"} 3\n") != null);
 }
 
 test "Format.negotiate: equal weights prefer the concrete type; a foreign range never matches" {
@@ -4991,8 +4991,8 @@ test "ProcessCollector: without a boot time there is no start-time sample" {
     pc.btime = 0;
     var buf: [8192]u8 = undefined;
     const out = try scrapeInto(&reg, &buf);
-    try testing.expect(std.mem.indexOf(u8, out, "process_start_time_seconds") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "process_open_fds ") != null);
+    try testing.expect(std.mem.find(u8, out, "process_start_time_seconds") == null);
+    try testing.expect(std.mem.find(u8, out, "process_open_fds ") != null);
 }
 
 test "Vec: delete with a wrong number of values never matches (the tuple comparison is length-safe)" {
@@ -5001,7 +5001,7 @@ test "Vec: delete with a wrong number of values never matches (the tuple compari
     const v = try reg.counterVec("wl_total", "h", &.{ "a", "b" });
     for (0..8) |i| {
         var k: [8]u8 = undefined;
-        const key = std.fmt.bufPrint(&k, "s{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&k, "s{d}", .{i}) catch unreachable;
         _ = try v.with(&.{ key, "x" });
     }
     // The map compares a 7-bit fingerprint before the tuples, so over many
@@ -5009,7 +5009,7 @@ test "Vec: delete with a wrong number of values never matches (the tuple compari
     var removed: usize = 0;
     for (0..20000) |i| {
         var k: [16]u8 = undefined;
-        const key = std.fmt.bufPrint(&k, "q{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&k, "q{d}", .{i}) catch unreachable;
         if (v.delete(&.{key})) removed += 1;
     }
     try testing.expectEqual(@as(usize, 0), removed);

@@ -251,7 +251,7 @@ pub const KeyPair = struct {
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "meta.model_after names RFC 7748 / X448" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "7748") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "7748") != null);
 }
 
 test "a24 == (156326 - 2) / 4 == 39081 (RFC 7748 §5)" {

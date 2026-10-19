@@ -172,7 +172,7 @@ pub fn goBuild(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, env
     try env.put("GOTOOLCHAIN", opts.toolchain);
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{opts.abs});
+    const exe = try arena.print("{s}/go_bench", .{opts.abs});
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const res = std.process.run(arena, io, .{
         .argv = &.{ opts.exe, "build", "-o", exe, "." },
@@ -272,7 +272,7 @@ pub const Summary = struct {
 /// none = all).
 pub fn selected(name: []const u8, filters: []const [:0]const u8) bool {
     if (filters.len == 0) return true;
-    for (filters) |f| if (std.mem.indexOf(u8, name, f) != null) return true;
+    for (filters) |f| if (std.mem.find(u8, name, f) != null) return true;
     return false;
 }
 
@@ -336,7 +336,7 @@ pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, compt
 /// -march=native` against `libs` (shared objects named by path, so no
 /// headers are needed), into `<abs>/foreign_bench`.
 pub fn buildForeign(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, cc: []const []const u8, abs: []const u8, src: []const u8, libs: []const []const u8) ![]const u8 {
-    const exe = try std.fmt.allocPrint(arena, "{s}/foreign_bench", .{abs});
+    const exe = try arena.print("{s}/foreign_bench", .{abs});
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, cc);
     try argv.appendSlice(arena, &.{ "-O3", "-march=native", src });

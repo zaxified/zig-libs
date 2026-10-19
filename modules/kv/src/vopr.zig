@@ -314,7 +314,7 @@ pub const Event = struct {
 /// Key for index 0..key_count-1: "" (empty key) or "k01".."k12".
 fn keyName(buf: *[3]u8, idx: usize) []const u8 {
     if (idx == 0) return "";
-    return std.fmt.bufPrint(buf, "k{d:0>2}", .{idx}) catch unreachable;
+    return std.mem.print(buf, "k{d:0>2}", .{idx}) catch unreachable;
 }
 
 const Vopr = struct {

@@ -51,7 +51,7 @@ fn baseConfig(now: i64, idp_key: @import("xmldsig").VerifyKey) saml.Config {
 /// Mint a signed Response whose Subject uses `subject_inner` (a NameID or an
 /// EncryptedID) and whose AttributeStatement is `attr_statement`.
 fn mintResponse(alloc: std.mem.Allocator, subject_inner: []const u8, attr_statement: []const u8) !sign.Signed {
-    const after_issuer = try std.fmt.allocPrint(alloc, "<saml:Subject>{s}{s}</saml:Subject>{s}{s}", .{ subject_inner, subject_confirmation, conditions, attr_statement });
+    const after_issuer = try alloc.print("<saml:Subject>{s}{s}</saml:Subject>{s}{s}", .{ subject_inner, subject_confirmation, conditions, attr_statement });
     defer alloc.free(after_issuer);
     var signed = try sign.signAssertion(alloc, 0xEDA7, fx.idp_entity_id, "_encid01", "2024-06-01T12:00:00Z", after_issuer);
     errdefer signed.deinit(alloc);
@@ -212,7 +212,7 @@ test "EncryptedID enclosure is authenticated: tampering the ciphertext breaks th
 
     // Corrupt one CipherValue char inside the (now signed) document. Target the
     // CONTENT CipherValue (the last one), well past its opening tag.
-    const last = std.mem.lastIndexOf(u8, signed.xml, "<xenc:CipherValue>").? + "<xenc:CipherValue>".len + 4;
+    const last = std.mem.findLast(u8, signed.xml, "<xenc:CipherValue>").? + "<xenc:CipherValue>".len + 4;
     signed.xml[last] = if (signed.xml[last] == 'A') 'B' else 'A';
 
     var cfg = baseConfig(fx.t_valid, signed.key);

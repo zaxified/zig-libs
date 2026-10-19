@@ -136,13 +136,13 @@ pub const CharClass = struct {
 
         // Hard invariant: an argv element cannot carry a NUL — execve would see
         // a truncated C string. Reject regardless of `reject_control`.
-        if (std.mem.indexOfScalar(u8, s, 0) != null) return .nul_byte;
+        if (std.mem.findScalar(u8, s, 0) != null) return .nul_byte;
 
         // Flag-injection guard (handles both `-x` and `--x`).
         if (self.reject_leading_dash and s.len > 0 and s[0] == '-') return .leading_dash;
 
         for (self.reject_substrings) |sub| {
-            if (sub.len != 0 and std.mem.indexOf(u8, s, sub) != null) return .forbidden_substring;
+            if (sub.len != 0 and std.mem.find(u8, s, sub) != null) return .forbidden_substring;
         }
 
         if (s.len > 0) {
@@ -158,7 +158,7 @@ pub const CharClass = struct {
         for (s) |c| {
             if (self.reject_control and (c < 0x20 or c == 0x7f)) return .control_byte;
             const allowed = (self.allow_alnum and isAlnum(c)) or
-                std.mem.indexOfScalar(u8, self.extra, c) != null;
+                std.mem.findScalar(u8, self.extra, c) != null;
             if (!allowed) return .bad_byte;
         }
         return null;
@@ -204,7 +204,7 @@ pub fn isSafeIdentifier(s: []const u8) bool {
 pub fn isSafePath(s: []const u8) bool {
     if (s.len == 0 or s.len > 4096) return false;
     if (s[0] != '/') return false; // absolute only (also rules out a leading '-')
-    if (std.mem.indexOf(u8, s, "..") != null) return false; // gap fix: no traversal
+    if (std.mem.find(u8, s, "..") != null) return false; // gap fix: no traversal
     for (s) |c| if (c < 0x20 or c == 0x7f) return false; // control + NUL (0x00 < 0x20)
     return true;
 }
@@ -558,7 +558,7 @@ fn scanToken(tok: []const u8, holes: []const Hole, forbid_holes: bool) ParseErro
                 i += 2;
                 continue;
             }
-            const close = std.mem.indexOfScalarPos(u8, tok, i, '}') orelse return error.UnbalancedBrace;
+            const close = std.mem.findScalarPos(u8, tok, i, '}') orelse return error.UnbalancedBrace;
             if (forbid_holes) return error.HoleInArgv0;
             const name = tok[i + 1 .. close];
             if (holeIndex(holes, name) == null) return error.UnknownHole;
@@ -590,7 +590,7 @@ fn renderToken(arena: std.mem.Allocator, tok: []const u8, holes: []const Hole, v
                 i += 2;
                 continue;
             }
-            const close = std.mem.indexOfScalarPos(u8, tok, i, '}').?;
+            const close = std.mem.findScalarPos(u8, tok, i, '}').?;
             const idx = holeIndex(holes, tok[i + 1 .. close]).?;
             try out.appendSlice(arena, values[idx]);
             i = close + 1;

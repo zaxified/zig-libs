@@ -874,7 +874,7 @@ pub const Server = struct {
     /// wire and the model is the only thing that can say what it means.
     fn sourceResolve(ctx: *anyopaque, ds_reference: []const u8) ?usize {
         const self: *Server = @ptrCast(@alignCast(ctx));
-        const slash = std.mem.indexOfScalar(u8, ds_reference, '/') orelse return null;
+        const slash = std.mem.findScalar(u8, ds_reference, '/') orelse return null;
         const ld = ds_reference[0..slash];
         const item = ds_reference[slash + 1 ..];
         for (self.model.data_sets, 0..) |ds, i| {
@@ -907,7 +907,7 @@ pub const Server = struct {
         const idx = ds.members[member];
         if (idx >= self.model.variables.len) return null;
         const v = self.model.variables[idx];
-        return std.fmt.bufPrint(out, "{s}/{s}", .{ v.domain, v.item }) catch null;
+        return std.mem.print(out, "{s}/{s}", .{ v.domain, v.item }) catch null;
     }
 
     fn indexOfVariable(self: *const Server, v: *const Variable) ?usize {
@@ -1267,7 +1267,7 @@ pub const Server = struct {
         var ref_buf: [acsi.max_reference_len]u8 = undefined;
         const ref = p.sboReference(&ref_buf) catch return;
         var item_buf: [acsi.max_reference_len]u8 = undefined;
-        const item = std.fmt.bufPrint(&item_buf, "{s}$Oper", .{p.item}) catch return;
+        const item = std.mem.print(&item_buf, "{s}$Oper", .{p.item}) catch return;
         const num = ctl_num orelse p.ctl_num;
 
         // The echoed Oper value. A real IED echoes the command it executed;
@@ -2902,7 +2902,7 @@ const WideFixture = struct {
             try mmsdata.Emit.octetString(&w, &body);
             const d = w.done();
             std.mem.copyForwards(u8, self.payload[i][0..d.len], d);
-            const item = try std.fmt.bufPrint(&self.names[i], "GGIO1$ST$M{d:0>2}$stVal", .{i});
+            const item = try std.mem.print(&self.names[i], "GGIO1$ST$M{d:0>2}$stVal", .{i});
             self.vars[i] = .{
                 .domain = domain,
                 .item = item,

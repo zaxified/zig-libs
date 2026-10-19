@@ -143,16 +143,16 @@ pub fn main(init: std.process.Init) !u8 {
     }, .tokens = undefined };
     for (algs, 0..) |a, i| {
         ctx.tokens[i] = try jwt.encodeJson(arena, claims_json, ctx.signing[i], .{});
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "zig_{s}.jwt", .{a}), .data = ctx.tokens[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("zig_{s}.jwt", .{a}), .data = ctx.tokens[i] });
     }
 
     // Build the Go side in a copy of tools/go_bench.
     for ([_][]const u8{ "go.mod", "go.sum", "main.go" }) |f| {
-        const src = try cwd.readFileAlloc(io, try std.fmt.allocPrint(arena, "modules/jwt/tools/go_bench/{s}", .{f}), arena, .limited(1 << 20));
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "go/{s}", .{f}), .data = src });
+        const src = try cwd.readFileAlloc(io, try arena.print("modules/jwt/tools/go_bench/{s}", .{f}), arena, .limited(1 << 20));
+        try dir.writeFile(io, .{ .sub_path = try arena.print("go/{s}", .{f}), .data = src });
     }
-    const exe = try std.fmt.allocPrint(arena, "{s}/foreign_bench", .{abs});
-    const go_dir = try std.fmt.allocPrint(arena, "{s}/go", .{abs});
+    const exe = try arena.print("{s}/foreign_bench", .{abs});
+    const go_dir = try arena.print("{s}/go", .{abs});
     std.debug.print("bench-jwt: building the Go side ...\n", .{});
     const gb = try std.process.run(arena, io, .{ .argv = &.{ "env", "GOPROXY=off", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local", "GOWORK=off", "go", "-C", go_dir, "build", "-o", exe, "." } });
     if (gb.term != .exited or gb.term.exited != 0) {
@@ -163,7 +163,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Interop before timing: Go accepted ours inside `interop`; now we accept Go's.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     for (algs, 0..) |a, i| {
-        const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "go_{s}.jwt", .{a}), arena, .limited(1 << 16));
+        const theirs = try dir.readFileAlloc(io, try arena.print("go_{s}.jwt", .{a}), arena, .limited(1 << 16));
         var parsed = jwt.parseAndVerify(arena, theirs, ctx.signing[i].verificationKey(), opts) catch |e| {
             std.debug.print("bench-jwt: FAILED -- golang-jwt's {s} token is rejected here: {s}\n", .{ a, @errorName(e) });
             return 1;
@@ -175,9 +175,9 @@ pub fn main(init: std.process.Init) !u8 {
     for (algs, 0..) |a, i| for ([_]bool{ false, true }) |verify| {
         const op = if (verify) "verify" else "sign";
         try ws.append(arena, .{
-            .name = try std.fmt.allocPrint(arena, "{s}_{s}", .{ a, op }),
+            .name = try arena.print("{s}_{s}", .{ a, op }),
             .op = .{ .alg = i, .verify = verify },
-            .ref = try std.fmt.allocPrint(arena, "go.{s}_{s}", .{ a, op }),
+            .ref = try arena.print("go.{s}_{s}", .{ a, op }),
         });
     };
 

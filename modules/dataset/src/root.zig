@@ -918,7 +918,7 @@ pub fn formatIsoTimestamp(buf: *[max_iso_timestamp_len]u8, us: i64) []const u8 {
     }) catch unreachable;
     if (frac != 0) {
         var fb: [6]u8 = undefined;
-        _ = std.fmt.bufPrint(&fb, "{d:0>6}", .{frac}) catch unreachable;
+        _ = std.mem.print(&fb, "{d:0>6}", .{frac}) catch unreachable;
         var end: usize = fb.len;
         while (fb[end - 1] == '0') end -= 1;
         w.writeByte('.') catch unreachable;

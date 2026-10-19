@@ -186,13 +186,13 @@ pub const Store = struct {
     }
 
     fn kindDir(self: Store, buf: []u8, kind: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ self.base, kind });
+        return std.mem.print(buf, "{s}/{s}", .{ self.base, kind });
     }
 
     /// `<base>/<kind>/<key>` written into `buf`. Validates both segments.
     fn recordPath(self: Store, buf: []u8, kind: []const u8, key: []const u8) ![]const u8 {
         if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
-        return std.fmt.bufPrint(buf, "{s}/{s}/{s}", .{ self.base, kind, key });
+        return std.mem.print(buf, "{s}/{s}/{s}", .{ self.base, kind, key });
     }
 
     /// `.{key}{suffix}` written into `buf` — the hidden sidecar filename
@@ -200,7 +200,7 @@ pub const Store = struct {
     /// dot means it can never collide with a real key (`segmentSafe` forbids
     /// leading dots) and is already skipped by `list`'s hidden-file filter.
     fn sidecarName(buf: []u8, key: []const u8, comptime suffix: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, ".{s}" ++ suffix, .{key});
+        return std.mem.print(buf, ".{s}" ++ suffix, .{key});
     }
 
     /// `<base>/<kind>/.<key>{suffix}` written into `buf`. `kind`/`key` are
@@ -210,7 +210,7 @@ pub const Store = struct {
         const dir = try self.kindDir(&dbuf, kind);
         var nbuf: [160]u8 = undefined;
         const name = try sidecarName(&nbuf, key, suffix);
-        return std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name });
+        return std.mem.print(buf, "{s}/{s}", .{ dir, name });
     }
 
     // ── raw bytes layer (atomic, opaque) ────────────────────────────────────
@@ -235,7 +235,7 @@ pub const Store = struct {
         var uniq_buf: [48]u8 = undefined; // "{pid}-{u64}" fits well inside 48
         const uniq = nextUniq(&uniq_buf);
         var tbuf: [896]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tbuf, "{s}/.{s}-{s}.part", .{ dir, name, uniq });
+        const tmp = try std.mem.print(&tbuf, "{s}/.{s}-{s}.part", .{ dir, name, uniq });
         const cwd = std.Io.Dir.cwd();
 
         // `writeFile` + `rename` alone is NOT crash safety, only tear
@@ -266,7 +266,7 @@ pub const Store = struct {
         }
 
         var pbuf: [896]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, name });
+        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, name });
         cwd.rename(tmp, cwd, path, self.io) catch |e| {
             cwd.deleteFile(self.io, tmp) catch {};
             return e;
@@ -506,7 +506,7 @@ pub const Store = struct {
         var nbuf: [160]u8 = undefined;
         const name = try sidecarName(&nbuf, key, ".expiry");
         var vbuf: [24]u8 = undefined;
-        const text = try std.fmt.bufPrint(&vbuf, "{d}", .{deadline_ns});
+        const text = try std.mem.print(&vbuf, "{d}", .{deadline_ns});
         try self.writeFileAtomicIn(dir, name, text);
     }
 
@@ -594,7 +594,7 @@ pub const Store = struct {
         var nbuf: [160]u8 = undefined;
         const name = try sidecarName(&nbuf, key, ".lock");
         var pbuf: [900]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, name });
+        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, name });
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .lock = .exclusive });
         return .{ .file = file, .io = self.io };
     }
@@ -699,7 +699,7 @@ fn nextUniq(buf: []u8) []const u8 {
 /// of the documented last-write-wins.
 fn nextUniqFor(pid: linux.pid_t, buf: []u8) []const u8 {
     const n = ingest_counter.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrint(buf, "{d}-{d}", .{ pid, n }) catch unreachable; // fits in 40
+    return std.mem.print(buf, "{d}-{d}", .{ pid, n }) catch unreachable; // fits in 40
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -710,7 +710,7 @@ const t = std.testing;
 /// keeps `tmp` alive and cleans it up.
 fn testStore(tmp: *std.testing.TmpDir, base_buf: []u8) !Store {
     const io = std.testing.io;
-    const base = try std.fmt.bufPrint(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     return Store.init(io, base);
 }
 
@@ -796,9 +796,9 @@ test "atomicity-by-construction: a stray .part temp is invisible to list/get" {
     // simulate a torn/abandoned ingest: write a hidden temp directly into the
     // kind dir, exactly like an in-flight `putBytes` that never reached rename.
     var pbuf: [768]u8 = undefined;
-    const kind_dir = try std.fmt.bufPrint(&pbuf, "{s}/devices", .{store.base});
+    const kind_dir = try std.mem.print(&pbuf, "{s}/devices", .{store.base});
     var tbuf: [800]u8 = undefined;
-    const stray = try std.fmt.bufPrint(&tbuf, "{s}/.dev-2-crashed.part", .{kind_dir});
+    const stray = try std.mem.print(&tbuf, "{s}/.dev-2-crashed.part", .{kind_dir});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stray, .data = "half-written garbage" });
 
     // the stray temp's name is not even a valid key (leading dot) — rejected,
@@ -980,7 +980,7 @@ test "edges pinned by the 2026-10-04 mutation run" {
     var dbuf: [640]u8 = undefined;
     const kdir = try store.kindDir(&dbuf, "s");
     var sbuf: [700]u8 = undefined;
-    try std.Io.Dir.cwd().createDir(std.testing.io, try std.fmt.bufPrint(&sbuf, "{s}/sub", .{kdir}), .default_dir);
+    try std.Io.Dir.cwd().createDir(std.testing.io, try std.mem.print(&sbuf, "{s}/sub", .{kdir}), .default_dir);
     const keys = try store.list(gpa, "s");
     defer {
         for (keys) |k| gpa.free(k);
@@ -1419,7 +1419,7 @@ test "F2 mutation control: the pre-fix shape (counter only, no pid) DOES collide
     const oldNextUniq = struct {
         fn f(buf: []u8, counter: *std.atomic.Value(u64)) []const u8 {
             const n = counter.fetchAdd(1, .monotonic);
-            return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable;
+            return std.mem.print(buf, "{d}", .{n}) catch unreachable;
         }
     }.f;
     var counter: std.atomic.Value(u64) = .init(0);
@@ -1452,7 +1452,7 @@ test "F3: sweep does not lockKey (or leave a .lock file behind for) a key that w
     var buf: [16]u8 = undefined;
     var idx: u32 = 0;
     while (idx < 20) : (idx += 1) {
-        const key = try std.fmt.bufPrint(&buf, "k{d}", .{idx});
+        const key = try std.mem.print(&buf, "k{d}", .{idx});
         try store.putBytes("nottl", key, "x");
     }
 
@@ -1464,7 +1464,7 @@ test "F3: sweep does not lockKey (or leave a .lock file behind for) a key that w
     // that reaped 0 still left 500 `.lock` files (1000 total) before the
     // fix. Here: 20 records in, 20 files out — GREEN means no `.lock` grew.
     var dbuf: [640]u8 = undefined;
-    const dir_path = try std.fmt.bufPrint(&dbuf, "{s}/nottl", .{store.base});
+    const dir_path = try std.mem.print(&dbuf, "{s}/nottl", .{store.base});
     var dir = try std.Io.Dir.cwd().openDir(store.io, dir_path, .{ .iterate = true });
     defer dir.close(store.io);
     var total: usize = 0;
@@ -1530,7 +1530,7 @@ test "F5: putManyBytes syncs the directory once per batch, not once per record �
     var entries: [n]Store.Entry = undefined;
     for (0..n) |i| {
         entries[i] = .{
-            .key = std.fmt.bufPrint(&keybuf[i], "k{d}", .{i}) catch unreachable,
+            .key = std.mem.print(&keybuf[i], "k{d}", .{i}) catch unreachable,
             .bytes = "batched",
         };
     }
@@ -1574,7 +1574,7 @@ test "F6: a corrupt .expiry sidecar is treated as no-TTL, not propagated as a re
     };
     var buf: [16]u8 = undefined;
     for (shapes, 0..) |shape, i| {
-        const key = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const key = try std.mem.print(&buf, "k{d}", .{i});
         try store.putBytes("sessions", key, "still readable");
         var pbuf: [900]u8 = undefined;
         const sidecar_path = try store.sidecarPath(&pbuf, "sessions", key, ".expiry");

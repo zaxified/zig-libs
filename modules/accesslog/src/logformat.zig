@@ -149,7 +149,7 @@ pub const LogFormat = struct {
                     break :blk .{ .kind = .status };
                 },
                 '{' => blk: {
-                    const close = std.mem.indexOfScalarPos(u8, template, i, '}') orelse
+                    const close = std.mem.findScalarPos(u8, template, i, '}') orelse
                         return error.UnterminatedDirective;
                     const name = template[i..close];
                     if (close + 1 >= template.len) return error.UnterminatedDirective;
@@ -220,11 +220,11 @@ pub const LogFormat = struct {
             .user_agent => try writeOpt(w, entry.user_agent),
             .method => try root.writeClfEscaped(w, entry.method),
             .path => {
-                const q = std.mem.indexOfScalar(u8, entry.target, '?') orelse entry.target.len;
+                const q = std.mem.findScalar(u8, entry.target, '?') orelse entry.target.len;
                 try root.writeClfEscaped(w, entry.target[0..q]);
             },
             .query => {
-                const q = std.mem.indexOfScalar(u8, entry.target, '?') orelse entry.target.len;
+                const q = std.mem.findScalar(u8, entry.target, '?') orelse entry.target.len;
                 try root.writeClfEscaped(w, entry.target[q..]);
             },
             .protocol => try root.writeClfEscaped(w, entry.protocol),

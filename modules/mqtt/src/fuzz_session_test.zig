@@ -131,8 +131,8 @@ fn fuzzAcl(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
             if (r.topic.len > 0 and (p < @intFromPtr(text.ptr) or p + r.topic.len > @intFromPtr(text.ptr) + text.len))
                 return error.RuleOutsideText;
         }
-        const denies_all = std.mem.indexOf(u8, text, "topic deny #\n") != null and
-            std.mem.indexOf(u8, text[0..(std.mem.indexOf(u8, text, "topic deny #\n").?)], "user ") == null;
+        const denies_all = std.mem.find(u8, text, "topic deny #\n") != null and
+            std.mem.find(u8, text[0..(std.mem.find(u8, text, "topic deny #\n").?)], "user ") == null;
         for (0..8) |_| {
             const op: mqtt.broker.Operation = if (k.byte() & 1 == 0) .publish else .subscribe;
             const anonymous = k.byte() & 1 == 0;

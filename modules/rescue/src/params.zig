@@ -87,7 +87,7 @@ pub fn roundConstants(comptime inst: Instance) [2 * inst.m * num_rounds]gl.Fe {
     const bytes_per_int = 9; // ceil(64/8) + 1
 
     var seed_buf: [64]u8 = undefined;
-    const seed = std.fmt.bufPrint(
+    const seed = std.mem.print(
         &seed_buf,
         "RPO({d},{d},{d},{d})",
         .{ gl.P, inst.m, inst.capacity, inst.security },

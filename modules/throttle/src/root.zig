@@ -313,7 +313,7 @@ fn shed(t: *Throttle, ctx: *router.Ctx) anyerror!void {
     var retry_buf: [24]u8 = undefined;
     const retry_s = @max(1, std.math.divCeil(u64, t.options.retry_after_ms, std.time.ms_per_s) catch unreachable);
     ctx.res.setStatus(503);
-    try ctx.res.setHeader("Retry-After", std.fmt.bufPrint(&retry_buf, "{d}", .{retry_s}) catch unreachable);
+    try ctx.res.setHeader("Retry-After", std.mem.print(&retry_buf, "{d}", .{retry_s}) catch unreachable);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Service Unavailable\n");
 }
@@ -665,7 +665,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn hCount(ctx: *router.Ctx) anyerror!void {
@@ -815,7 +815,7 @@ test "shed: the Retry-After value outlives the frame it was formatted in" {
     const got = out.buffered();
     try expectStatus(got, "503");
     try expectHeaderLine(got, "Retry-After: 1");
-    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
+    try testing.expect(std.mem.find(u8, got, "#") == null);
     th.release(); // balance the manual tryAcquire above
 }
 
@@ -980,7 +980,7 @@ fn blockWorker(io: std.Io, port: u16, status_out: *std.atomic.Value(u16)) void {
     var client = http.Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/block", .{port}) catch unreachable;
+    const url = std.mem.print(&url_buf, "http://127.0.0.1:{d}/block", .{port}) catch unreachable;
     var res = client.request(.get, url, .{}) catch {
         status_out.store(999, .seq_cst);
         return;
@@ -1046,7 +1046,7 @@ test "integration: N slots occupied → 503 + Retry-After; a freed slot serves a
     var url_buf: [64]u8 = undefined;
 
     { // request N+1 → shed: 503 with a usable Retry-After, nothing queued
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/ping", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/ping", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(503, res.status);
@@ -1066,7 +1066,7 @@ test "integration: N slots occupied → 503 + Retry-After; a freed slot serves a
     }
 
     { // a fresh request now succeeds in the freed slot
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/ping", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/ping", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(200, res.status);
@@ -1242,9 +1242,9 @@ test "middleware: Retry-After is ceil(ms / 1000) with a floor of 1 second" {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r, wire("/t"), &buf);
         try expectStatus(got, "503");
-        const needle = try std.fmt.allocPrint(testing.allocator, "\r\n{s}\r\n", .{cs.line});
+        const needle = try testing.allocator.print("\r\n{s}\r\n", .{cs.line});
         defer testing.allocator.free(needle);
-        try testing.expect(std.mem.indexOf(u8, got, needle) != null);
+        try testing.expect(std.mem.find(u8, got, needle) != null);
         th.release();
         r.deinit();
         th.deinit();

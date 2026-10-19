@@ -163,7 +163,7 @@ fn checkNcName(s: []const u8) Error!void {
 }
 
 fn checkQName(s: []const u8) Error!void {
-    if (std.mem.indexOfScalar(u8, s, ':')) |c| {
+    if (std.mem.findScalar(u8, s, ':')) |c| {
         try checkNcName(s[0..c]);
         try checkNcName(s[c + 1 ..]);
     } else try checkNcName(s);
@@ -218,7 +218,7 @@ fn writeCData(w: *Io.Writer, s: []const u8) Error!void {
     try checkChars(s);
     var rest = s;
     try w.writeAll("<![CDATA[");
-    while (std.mem.indexOf(u8, rest, "]]>")) |at| {
+    while (std.mem.find(u8, rest, "]]>")) |at| {
         // "]]" ends this section, ">" starts the next: same characters.
         try w.writeAll(rest[0 .. at + 2]);
         try w.writeAll("]]><![CDATA[");
@@ -230,7 +230,7 @@ fn writeCData(w: *Io.Writer, s: []const u8) Error!void {
 
 fn writeComment(w: *Io.Writer, s: []const u8) Error!void {
     try checkChars(s);
-    if (std.mem.indexOf(u8, s, "--") != null or std.mem.endsWith(u8, s, "-")) return error.InvalidComment;
+    if (std.mem.find(u8, s, "--") != null or std.mem.endsWith(u8, s, "-")) return error.InvalidComment;
     try w.writeAll("<!--");
     try w.writeAll(s);
     try w.writeAll("-->");
@@ -240,7 +240,7 @@ fn writePi(w: *Io.Writer, target: []const u8, data: []const u8) Error!void {
     checkNcName(target) catch return error.InvalidPi;
     if (std.ascii.eqlIgnoreCase(target, "xml")) return error.InvalidPi;
     try checkChars(data);
-    if (std.mem.indexOf(u8, data, "?>") != null) return error.InvalidPi;
+    if (std.mem.find(u8, data, "?>") != null) return error.InvalidPi;
     try w.writeAll("<?");
     try w.writeAll(target);
     if (data.len != 0) {

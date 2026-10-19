@@ -374,8 +374,8 @@ fn rsaSignNeedles(n: *Needles, sk: *const rsa.SecretKey, s: *const [256]u8) !voi
 fn containerNeedles(n: *Needles, text: []const u8) !void {
     const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
     const end = "-----END OPENSSH PRIVATE KEY-----";
-    const bi = std.mem.indexOf(u8, text, begin).? + begin.len;
-    const ei = std.mem.indexOfPos(u8, text, bi, end).?;
+    const bi = std.mem.find(u8, text, begin).? + begin.len;
+    const ei = std.mem.findPos(u8, text, bi, end).?;
     var b64: [4096]u8 = undefined;
     var m: usize = 0;
     for (text[bi..ei]) |c| {

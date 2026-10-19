@@ -49,7 +49,7 @@ test "STACKPROBE: no HMAC key or Ed25519 secret residue after any entry point" {
     var slack_sig: [root.slack.signature_len]u8 = undefined;
     _ = try root.slack.sign(&slack_sig, secret, ts, body);
     var tsb: [20]u8 = undefined;
-    const ts_text = try std.fmt.bufPrint(&tsb, "{d}", .{ts});
+    const ts_text = try std.mem.print(&tsb, "{d}", .{ts});
 
     _ = try P.run("computeHex", root.computeHex, .{ secret, body }, k, .{});
     _ = try P.run("sign", root.sign, .{ secret, body, &out }, k, .{});

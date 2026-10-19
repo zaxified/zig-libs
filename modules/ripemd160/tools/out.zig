@@ -12,7 +12,7 @@ var n: usize = 0;
 
 pub fn print(comptime fmt: []const u8, args: anytype) void {
     if (n > buf.len - 4096) flush();
-    const s = std.fmt.bufPrint(buf[n..], fmt, args) catch unreachable;
+    const s = std.mem.print(buf[n..], fmt, args) catch unreachable;
     n += s.len;
 }
 

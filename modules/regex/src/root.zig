@@ -636,7 +636,7 @@ pub const Prefilter = struct {
     /// The first position at or after `pos` whose byte may start a match.
     fn next(pf: *const Prefilter, input: []const u8, pos: usize) ?usize {
         if (pf.lit_len >= 2) return findLiteral(input, pos, pf.lit[0..pf.lit_len]);
-        if (pf.single) |c| return std.mem.indexOfScalarPos(u8, input, pos, c);
+        if (pf.single) |c| return std.mem.findScalarPos(u8, input, pos, c);
         const set = pf.first.?;
         var i = pos;
         while (i < input.len) : (i += 1) {
@@ -649,7 +649,7 @@ pub const Prefilter = struct {
 
 /// The first occurrence of `lit` (two bytes or more) at or after `pos`:
 /// 32 positions at a time, those whose first AND last byte match are checked
-/// in full ("packed pair"; `std.mem.indexOfPos` compares byte by byte for a
+/// in full ("packed pair"; `std.mem.findPos` compares byte by byte for a
 /// short needle).
 fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
     const V = @Vector(32, u8);
@@ -1752,7 +1752,7 @@ test "the backtracker's window: an exploration that reaches its very end is hand
     var src: [80]u8 = undefined;
     var found = false;
     for (1..60) |k| {
-        const p = try std.fmt.bufPrint(&src, "a[ab]*{s}", .{(strRepeat("c", 60))[0..k]});
+        const p = try std.mem.print(&src, "a[ab]*{s}", .{(strRepeat("c", 60))[0..k]});
         var re = try Regex.compile(gpa, p);
         defer re.deinit(gpa);
         const n = re.insts.len;
@@ -2002,7 +2002,7 @@ test "prefilter: anchoring and first bytes worked out from the program" {
     try expectFind("^a", "ba", null);
 }
 
-test "findLiteral agrees with std.mem.indexOfPos" {
+test "findLiteral agrees with std.mem.findPos" {
     var prng: std.Random.DefaultPrng = .init(0x6c6974);
     const rng = prng.random();
     var hay: [300]u8 = undefined;
@@ -2013,7 +2013,7 @@ test "findLiteral agrees with std.mem.indexOfPos" {
         const nl = 2 + rng.uintLessThan(usize, needle.len - 1);
         for (needle[0..nl]) |*c| c.* = "abAB"[rng.uintLessThan(usize, 4)];
         const pos = rng.uintLessThan(usize, hl + 1);
-        try testing.expectEqual(std.mem.indexOfPos(u8, hay[0..hl], pos, needle[0..nl]), findLiteral(hay[0..hl], pos, needle[0..nl]));
+        try testing.expectEqual(std.mem.findPos(u8, hay[0..hl], pos, needle[0..nl]), findLiteral(hay[0..hl], pos, needle[0..nl]));
     }
 }
 

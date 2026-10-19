@@ -55,7 +55,7 @@ const Outcome = struct { rounds: u32, saw_instruction: bool, out: ?[]u8 };
 
 fn runCase(gpa: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, port: u16, token: []const u8) !Outcome {
     var pbuf: [8]u8 = undefined;
-    const port_s = try std.fmt.bufPrint(&pbuf, "{d}", .{port});
+    const port_s = try std.mem.print(&pbuf, "{d}", .{port});
     var child = std.process.spawn(io, .{
         .argv = &.{ "go", "-C", tool, "run", ".", port_s },
         .stdout = .pipe,

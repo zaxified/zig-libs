@@ -130,7 +130,7 @@ pub fn write(buf: []u8, p: Params) Error![]u8 {
     }
     // key_share is TLS 1.3's (RFC 8446 §4.2.8): absent from a TLS 1.2-only
     // hello, an empty list when 1.3 is offered without shares.
-    if (mem.indexOfScalar(tls.ProtocolVersion, p.versions, .tls_1_3) != null) {
+    if (mem.findScalar(tls.ProtocolVersion, p.versions, .tls_1_3) != null) {
         const e = try w.ext(@backingInt(tls.ExtensionType.key_share));
         const list = try w.hole(2);
         for (p.shares) |s| {

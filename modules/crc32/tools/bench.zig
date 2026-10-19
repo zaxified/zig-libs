@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !u8 {
     try env.put("GOFLAGS", "-mod=readonly");
 
     std.debug.print("bench-crc32: building the zlib side ...\n", .{});
-    const exe = try std.fmt.allocPrint(arena, "{s}/zlib_bench", .{abs});
+    const exe = try arena.print("{s}/zlib_bench", .{abs});
     const cc = try std.process.run(arena, io, .{
         .argv = &.{ "zig", "cc", "-O3", "-march=native", "modules/crc32/tools/c_bench/zlib_bench.c", "-lz", "-o", exe },
         .environ_map = &env,

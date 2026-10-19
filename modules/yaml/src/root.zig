@@ -185,7 +185,7 @@ test "invalid UTF-8 and control bytes that libyaml refuses are refused (A1 F11)"
 test "an escaped UTF-16 surrogate pair is one astral character; a surrogate alone is still refused (A1 F7)" {
     const pair = try dumpEvents(testing.allocator, "k: \"\\uD83D\\uDE00\"\n");
     defer testing.allocator.free(pair);
-    try testing.expect(std.mem.indexOf(u8, pair, "=VAL \"\u{1F600}\n") != null);
+    try testing.expect(std.mem.find(u8, pair, "=VAL \"\u{1F600}\n") != null);
     // Positive control: the 32-bit spelling of the same character agrees.
     const wide = try dumpEvents(testing.allocator, "k: \"\\U0001F600\"\n");
     defer testing.allocator.free(wide);

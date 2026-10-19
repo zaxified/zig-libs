@@ -104,7 +104,7 @@ test "EXTERNAL anchor: the multi-namespace assertion really does discriminate th
     // The source document is NOT in canonical attribute order (xmlsec1 signed it
     // as written); what matters is that both foreign namespaces and the
     // unprefixed attribute are all on the signed element.
-    try testing.expect(std.mem.indexOf(u8, multi_ns_signed_response, "xmlns:x=\"urn:x:aa\"") != null);
-    try testing.expect(std.mem.indexOf(u8, multi_ns_signed_response, "xmlns:y=\"urn:x:bb\"") != null);
-    try testing.expect(std.mem.indexOf(u8, multi_ns_signed_response, " zz=\"unprefixed-z\" x:mm=\"in-x\" y:aa=\"in-y\"") != null);
+    try testing.expect(std.mem.find(u8, multi_ns_signed_response, "xmlns:x=\"urn:x:aa\"") != null);
+    try testing.expect(std.mem.find(u8, multi_ns_signed_response, "xmlns:y=\"urn:x:bb\"") != null);
+    try testing.expect(std.mem.find(u8, multi_ns_signed_response, " zz=\"unprefixed-z\" x:mm=\"in-x\" y:aa=\"in-y\"") != null);
 }

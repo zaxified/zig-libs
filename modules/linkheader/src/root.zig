@@ -269,7 +269,7 @@ pub const Iterator = struct {
             }
             self.i += 1; // consume '<'
             const uri_start = self.i;
-            const gt = std.mem.indexOfScalarPos(u8, self.s, self.i, '>') orelse {
+            const gt = std.mem.findScalarPos(u8, self.s, self.i, '>') orelse {
                 self.i = self.s.len; // unterminated '<' — give up
                 return null;
             };
@@ -517,8 +517,8 @@ const ExtParts = struct { charset: []const u8, language: []const u8, chars: []co
 /// and the language `ALPHA`/`DIGIT`/`-` only (the Language-Tag alphabet; its
 /// finer structure is not checked). `chars` is not checked here.
 fn splitExt(raw: []const u8) ?ExtParts {
-    const q1 = std.mem.indexOfScalar(u8, raw, '\'') orelse return null;
-    const q2 = std.mem.indexOfScalarPos(u8, raw, q1 + 1, '\'') orelse return null;
+    const q1 = std.mem.findScalar(u8, raw, '\'') orelse return null;
+    const q2 = std.mem.findScalarPos(u8, raw, q1 + 1, '\'') orelse return null;
     const charset = raw[0..q1];
     const language = raw[q1 + 1 .. q2];
     if (charset.len == 0) return null;
@@ -1478,7 +1478,7 @@ fn sweepParse(seeds: u64, reach: *SweepReach) !void {
                 if (!within(h, p.name) or !within(h, p.value)) return error.NotBorrowed;
                 if (p.quoted) {
                     reach.quoted += 1;
-                    if (std.mem.indexOfScalar(u8, p.value, '\\') != null) reach.escapes += 1;
+                    if (std.mem.findScalar(u8, p.value, '\\') != null) reach.escapes += 1;
                     var ub: [400]u8 = undefined;
                     const u = try unquote(&ub, p.value);
                     if (u.len > p.value.len) return error.UnquoteGrew;

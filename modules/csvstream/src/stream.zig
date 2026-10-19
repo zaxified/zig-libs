@@ -33,7 +33,7 @@ pub const default_chunk_size: usize = 10 * 1024 * 1024;
 /// memory: an unbalanced quote can no longer hide every newline and force the
 /// buffer to grow without limit.
 fn findLastBoundary(bytes: []const u8) ?usize {
-    return std.mem.lastIndexOfScalar(u8, bytes, '\n');
+    return std.mem.findScalarLast(u8, bytes, '\n');
 }
 
 /// Streaming file reader that yields chunks ending on record boundaries. Owns a

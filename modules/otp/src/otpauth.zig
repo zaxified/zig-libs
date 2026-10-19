@@ -203,10 +203,10 @@ pub fn parse(uri: []const u8, buf: []u8) ParseError!KeyUri {
     if (uri.len > max_uri_len) return error.UriTooLong;
     const scheme = "otpauth://";
     if (!hasPrefixIgnoreCase(uri, scheme)) return error.InvalidUri;
-    if (std.mem.indexOfScalar(u8, uri, '#') != null) return error.InvalidUri;
+    if (std.mem.findScalar(u8, uri, '#') != null) return error.InvalidUri;
     const after = uri[scheme.len..];
 
-    const slash = std.mem.indexOfScalar(u8, after, '/') orelse return error.InvalidUri;
+    const slash = std.mem.findScalar(u8, after, '/') orelse return error.InvalidUri;
     const type_text = after[0..slash];
     const kind: Kind = if (std.ascii.eqlIgnoreCase(type_text, "totp"))
         .totp
@@ -216,7 +216,7 @@ pub fn parse(uri: []const u8, buf: []u8) ParseError!KeyUri {
         return error.UnknownType;
 
     const tail = after[slash + 1 ..];
-    const q = std.mem.indexOfScalar(u8, tail, '?');
+    const q = std.mem.findScalar(u8, tail, '?');
     const label_raw = if (q) |i| tail[0..i] else tail;
     const query = if (q) |i| tail[i + 1 ..] else "";
 
@@ -263,7 +263,7 @@ pub fn parse(uri: []const u8, buf: []u8) ParseError!KeyUri {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
         if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=');
+        const eq = std.mem.findScalar(u8, pair, '=');
         const name = if (eq) |i| pair[0..i] else pair;
         const value = if (eq) |i| pair[i + 1 ..] else "";
 
@@ -282,7 +282,7 @@ pub fn parse(uri: []const u8, buf: []u8) ParseError!KeyUri {
                 .bad_escape => return error.InvalidIssuer,
                 .overflow => return error.BufferTooSmall,
             };
-            if (!validText(d) or std.mem.indexOfScalar(u8, d, ':') != null) return error.InvalidIssuer;
+            if (!validText(d) or std.mem.findScalar(u8, d, ':') != null) return error.InvalidIssuer;
             param_issuer = d;
         } else if (std.mem.eql(u8, name, "algorithm")) {
             if (algorithm != null) return error.DuplicateParameter;
@@ -371,9 +371,9 @@ pub fn format(w: *std.Io.Writer, k: KeyUri) FormatError!void {
 }
 
 fn formatBody(w: *std.Io.Writer, k: KeyUri) FormatError!void {
-    if (!validText(k.account) or std.mem.indexOfScalar(u8, k.account, ':') != null) return error.InvalidLabel;
+    if (!validText(k.account) or std.mem.findScalar(u8, k.account, ':') != null) return error.InvalidLabel;
     if (k.issuer) |iss| {
-        if (!validText(iss) or std.mem.indexOfScalar(u8, iss, ':') != null) return error.InvalidIssuer;
+        if (!validText(iss) or std.mem.findScalar(u8, iss, ':') != null) return error.InvalidIssuer;
     }
     if (k.account[0] == ' ') return error.InvalidLabel;
     if (k.secret.len == 0) return error.InvalidSecret;
@@ -469,7 +469,7 @@ test "Google label grammar: literal or encoded colon, spaces after it" {
     };
     for (cases) |c| {
         var uri: [200]u8 = undefined;
-        const text = try std.fmt.bufPrint(&uri, "otpauth://totp/{s}?{s}", .{ c.label, s[1..] });
+        const text = try std.mem.print(&uri, "otpauth://totp/{s}?{s}", .{ c.label, s[1..] });
         const k = try parse(text, &buf);
         try testing.expectEqualStrings(c.account, k.account);
         if (c.issuer) |i| try testing.expectEqualStrings(i, k.issuer.?) else try testing.expect(k.issuer == null);

@@ -979,7 +979,7 @@ test "golden OpenSSL: a byName ResponderID that names nobody in the chain is unt
     // is nothing to fall back to and verification must refuse.
     var mutated = openssl_byname_response_der;
     const name_marker = "zig-libs OCSP test CA";
-    const at = std.mem.indexOf(u8, &mutated, name_marker).?;
+    const at = std.mem.find(u8, &mutated, name_marker).?;
     mutated[at] ^= 0x20;
 
     const parsed = try ocsp.parseResponse(&mutated);

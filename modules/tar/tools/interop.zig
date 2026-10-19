@@ -106,7 +106,7 @@ fn writeArchives(io: std.Io, gpa: std.mem.Allocator, comptime dir: []const u8) !
         for (c.items) |it| try w.writeEntry(it.entry, it.content);
         try w.finish();
         var name_buf: [256]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{s}/{s}.{t}.tar", .{ dir, c.id, c.mode });
+        const name = try std.mem.print(&name_buf, "{s}/{s}.{t}.tar", .{ dir, c.id, c.mode });
         try cwd.writeFile(io, .{ .sub_path = name, .data = out.written() });
     }
     // packTarGz: the gzip framing around the default (GNU-mode) writer.
@@ -127,17 +127,17 @@ fn checkGoReadsWhatWeWrote(fresh: []const u8) bool {
     for (write_cases) |c| {
         var id_buf: [64]u8 = undefined;
         const id_line = (if (c.tgz)
-            std.fmt.bufPrint(&id_buf, ".id = \"{s}.tgz\"", .{c.id})
+            std.mem.print(&id_buf, ".id = \"{s}.tgz\"", .{c.id})
         else
-            std.fmt.bufPrint(&id_buf, ".id = \"{s}.{t}\"", .{ c.id, c.mode })) catch unreachable;
-        const at = std.mem.indexOf(u8, fresh, id_line) orelse {
+            std.mem.print(&id_buf, ".id = \"{s}.{t}\"", .{ c.id, c.mode })) catch unreachable;
+        const at = std.mem.find(u8, fresh, id_line) orelse {
             std.debug.print("go oracle: case {s} missing from the fresh vectors\n", .{id_line});
             ok = false;
             continue;
         };
-        const end = std.mem.indexOfPos(u8, fresh, at, "\n    },\n") orelse fresh.len;
+        const end = std.mem.findPos(u8, fresh, at, "\n    },\n") orelse fresh.len;
         const body = fresh[at..end];
-        if (std.mem.indexOf(u8, body, ".err = null") == null) {
+        if (std.mem.find(u8, body, ".err = null") == null) {
             std.debug.print("go oracle: Go refused our {s}.{t} archive\n", .{ c.id, c.mode });
             ok = false;
         }
@@ -150,9 +150,9 @@ fn checkGoReadsWhatWeWrote(fresh: []const u8) bool {
             var name_buf: [1024]u8 = undefined;
             var name: std.Io.Writer = .fixed(&name_buf);
             zigStr(&name, e.path) catch unreachable;
-            const name_at = std.mem.indexOf(u8, body, name.buffered());
+            const name_at = std.mem.find(u8, body, name.buffered());
             // One entry per line: the fields must be on the name's own line.
-            const found = if (name_at) |n| std.mem.indexOf(u8, std.mem.sliceTo(body[n..], '\n'), want.buffered()) != null else false;
+            const found = if (name_at) |n| std.mem.find(u8, std.mem.sliceTo(body[n..], '\n'), want.buffered()) != null else false;
             if (!found) {
                 std.debug.print("go oracle: {s}.{t}: Go did not read \"{s}\" as written ({s})\n", .{ c.id, c.mode, e.path, want.buffered() });
                 ok = false;

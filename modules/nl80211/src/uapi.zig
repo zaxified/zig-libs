@@ -551,7 +551,7 @@ pub fn formatMac(mac: Mac) [17]u8 {
     var out: [17]u8 = undefined;
     for (mac, 0..) |b, i| {
         if (i != 0) out[i * 3 - 1] = ':';
-        _ = std.fmt.bufPrint(out[i * 3 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+        _ = std.mem.print(out[i * 3 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
     }
     return out;
 }

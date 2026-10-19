@@ -86,7 +86,7 @@ fn selfDemo(io: std.Io, gpa: Allocator) !u8 {
         const blob = try gpa.alloc(u8, f.len);
         defer gpa.free(blob);
         @memset(blob, 'x');
-        const full = try std.fmt.allocPrint(gpa, base ++ "/{s}", .{f.path});
+        const full = try gpa.print(base ++ "/{s}", .{f.path});
         defer gpa.free(full);
         try cwd.writeFile(io, .{ .sub_path = full, .data = blob });
         apparent_total += f.len;

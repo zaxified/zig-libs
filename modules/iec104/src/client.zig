@@ -578,7 +578,7 @@ test "live: STARTDT + general interrogation against a real outstation" {
     const ca_text = envVar("IEC104_TEST_CA") orelse "47";
     const common_address = std.fmt.parseInt(u16, ca_text, 10) catch return error.SkipZigTest;
 
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 
@@ -790,7 +790,7 @@ test "live: drive send_seq/recv_seq through the 15-bit wrap against a real outst
         if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 wrap capture (set IEC104_TEST_WRAP=host:port)\n", .{});
         return error.SkipZigTest;
     };
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 

@@ -14,7 +14,7 @@ const root = @import("root.zig");
 
 test "count (opt-in via ZIGLIBS_COUNT)" {
     const spec = std.testing.environ.getPosix("ZIGLIBS_COUNT") orelse return error.SkipZigTest;
-    const eq = std.mem.indexOfScalar(u8, spec, '=') orelse return error.BadCountSpec;
+    const eq = std.mem.findScalar(u8, spec, '=') orelse return error.BadCountSpec;
     const case = spec[0..eq];
     const rounds = try std.fmt.parseInt(u32, spec[eq + 1 ..], 10);
 

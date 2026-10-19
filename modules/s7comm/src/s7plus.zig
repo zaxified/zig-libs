@@ -283,7 +283,7 @@ test "decode rejects malformed frames" {
     // F7(d): a trailer whose PROTOCOL id is right (0x72) but whose PDU-TYPE
     // octet disagrees with the header's (header says `.data` = 0x02, trailer
     // says `.data_fw3` = 0x03). The audit's mutation dropped exactly this
-    // half of the trailer check (`trailer[1] != @intFromEnum(pt)`) and the
+    // half of the trailer check (`trailer[1] != @backingInt(pt)`) and the
     // suite stayed green, because every existing bad-trailer case also broke
     // `trailer[0]`.
     const mistyped_trailer = [_]u8{ 0x72, 0x02, 0x00, 0x02, 0xAA, 0xBB, 0x72, 0x03, 0x00, 0x00 };

@@ -33,7 +33,7 @@ const Option = root.Option;
 pub fn anonymousName(buf: *[24]u8, counter: usize, section_type: []const u8) []const u8 {
     var h: u32 = 5381;
     for (section_type) |c| h = h *% 33 +% c;
-    return std.fmt.bufPrint(buf, "cfg{x:0>2}{x:0>4}", .{ counter, h & 0xffff }) catch unreachable;
+    return std.mem.print(buf, "cfg{x:0>2}{x:0>4}", .{ counter, h & 0xffff }) catch unreachable;
 }
 
 pub const EditError = error{
@@ -121,7 +121,7 @@ pub const Editor = struct {
     pub fn find(self: *const Editor, ref: []const u8) ?usize {
         if (ref.len > 0 and ref[0] == '@') {
             if (ref[ref.len - 1] != ']') return null;
-            const lb = std.mem.indexOfScalar(u8, ref, '[') orelse return null;
+            const lb = std.mem.findScalar(u8, ref, '[') orelse return null;
             const ty = ref[1..lb];
             var idx = std.fmt.parseInt(i64, ref[lb + 1 .. ref.len - 1], 10) catch return null;
             var count: i64 = 0;
@@ -492,7 +492,7 @@ fn parseRecord(a: Allocator, s: []const u8, pos: *usize, line: *usize) error{ Ba
         return null;
     }
     var op: u8 = 0;
-    if (std.mem.indexOfScalar(u8, "+-@^|~", s[i]) != null) {
+    if (std.mem.findScalar(u8, "+-@^|~", s[i]) != null) {
         op = s[i];
         i += 1;
     }
@@ -517,7 +517,7 @@ fn parseRecord(a: Allocator, s: []const u8, pos: *usize, line: *usize) error{ Ba
             switch (s[i]) {
                 '\'' => {
                     i += 1;
-                    const close = std.mem.indexOfScalarPos(u8, s, i, '\'') orelse return error.BadDelta;
+                    const close = std.mem.findScalarPos(u8, s, i, '\'') orelse return error.BadDelta;
                     line.* += std.mem.count(u8, s[i..close], "\n");
                     try v.appendSlice(a, s[i..close]);
                     i = close + 1;
@@ -554,14 +554,14 @@ const Scenario = struct { name: []const u8, pkg: []const u8, config: []const u8,
 
 fn nextScenario(rest: *[]const u8) ?Scenario {
     const head = "### scenario ";
-    const at = std.mem.indexOf(u8, rest.*, head) orelse return null;
+    const at = std.mem.find(u8, rest.*, head) orelse return null;
     var s = rest.*[at + head.len ..];
-    const eol = std.mem.indexOfScalar(u8, s, '\n').?;
+    const eol = std.mem.findScalar(u8, s, '\n').?;
     var words = std.mem.tokenizeScalar(u8, s[0..eol], ' ');
     const name = words.next().?;
     const pkg = words.next().?;
     s = s[eol + 1 ..];
-    const end = std.mem.indexOf(u8, s, "### end\n").?;
+    const end = std.mem.find(u8, s, "### end\n").?;
     const body = s[0..end];
     rest.* = s[end + "### end\n".len ..];
     return .{
@@ -570,13 +570,13 @@ fn nextScenario(rest: *[]const u8) ?Scenario {
         .config = between(body, "--- config\n", "--- delta\n"),
         .delta = between(body, "--- delta\n", "--- show -X\n"),
         .show_x = between(body, "--- show -X\n", "--- show\n"),
-        .show = body[std.mem.indexOf(u8, body, "--- show\n").? + "--- show\n".len ..],
+        .show = body[std.mem.find(u8, body, "--- show\n").? + "--- show\n".len ..],
     };
 }
 
 fn between(body: []const u8, a: []const u8, b: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, body, a).? + a.len;
-    const j = std.mem.indexOfPos(u8, body, i, b).?;
+    const i = std.mem.find(u8, body, a).? + a.len;
+    const j = std.mem.findPos(u8, body, i, b).?;
     return body[i..j];
 }
 

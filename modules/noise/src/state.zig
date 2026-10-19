@@ -704,7 +704,7 @@ pub fn Suite(comptime DH: type, comptime Cipher: type, comptime Hash: type) type
                 const suffix = name_suffix;
                 var name_buf: [128]u8 = undefined;
                 std.debug.assert(pattern.name.len + 6 + suffix.len <= name_buf.len);
-                const protocol_name = std.fmt.bufPrint(
+                const protocol_name = std.mem.print(
                     &name_buf,
                     "Noise_{s}" ++ suffix,
                     .{pattern.name},

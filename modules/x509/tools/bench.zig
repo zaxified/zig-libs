@@ -84,7 +84,7 @@ pub fn main(init: std.process.Init) !u8 {
     try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
+    const exe = try arena.print("{s}/go_bench", .{abs});
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     try runOk(arena, io, &env, &.{ "go", "build", "-o", exe, "." }, go_dir);
     try runOk(arena, io, &env, &.{ exe, abs, "gen" }, null);
@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
     const now_txt = try dir.readFileAlloc(io, "now.txt", arena, .limited(64));
     ctx.now = try std.fmt.parseInt(i64, std.mem.trim(u8, now_txt, " \n"), 10);
     for (kinds, 0..) |k, i| for ([_][]const u8{ "leaf", "inter", "root" }, 0..) |n, j| {
-        ctx.certs[i][j] = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}_{s}.der", .{ k, n }), arena, .limited(1 << 16));
+        ctx.certs[i][j] = try dir.readFileAlloc(io, try arena.print("{s}_{s}.der", .{ k, n }), arena, .limited(1 << 16));
     };
 
     // Sanity before timing: verifies with the right host, refuses a wrong one.
@@ -115,7 +115,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ws: std.ArrayList(Work) = .empty;
     for (kinds, 0..) |k, i| {
-        const name = try std.fmt.allocPrint(arena, "verify_{s}", .{k});
+        const name = try arena.print("verify_{s}", .{k});
         try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name });
     }
 

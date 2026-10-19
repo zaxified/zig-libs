@@ -160,7 +160,7 @@ pub fn main(init: std.process.Init) !u8 {
     // AES-256-CBC-CTS: the differential oracle for encryptCts (decryptCts is
     // checked to invert each).
     for ([_]aescbc.CtsVariant{ .cs1, .cs2, .cs3 }) |v| for ([_]usize{ 16, 17, 31, 32, 47, 48, 1000, 1024 }) |n| {
-        const name = try std.fmt.allocPrint(arena, "ossl_cts_{s}_{d}.bin", .{ switch (v) {
+        const name = try arena.print("ossl_cts_{s}_{d}.bin", .{ switch (v) {
             .cs1 => "CS1",
             .cs2 => "CS2",
             .cs3 => "CS3",
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !u8 {
     var ws: std.ArrayList(Work) = .empty;
     inline for (@typeInfo(Op).@"enum".field_names, @typeInfo(Op).@"enum".field_values) |f_name, f_value| {
         const op: Op = @fromBackingInt(@intCast(f_value));
-        if (std.mem.indexOfScalar(Op, &openssl_only, op) != null)
+        if (std.mem.findScalar(Op, &openssl_only, op) != null)
             try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .ref_exe = 1 })
         else
             try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .alt = f_name, .ref_exe = 0, .alt_exe = 1 });
@@ -216,7 +216,7 @@ fn buildGo(arena: std.mem.Allocator, io: std.Io, environ: anytype, abs: []const 
     try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
+    const exe = try arena.print("{s}/go_bench", .{abs});
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const build = std.process.run(arena, io, .{
         .argv = &.{ "go", "build", "-o", exe, "." },

@@ -517,8 +517,8 @@ test "MessageRequest: tool_use + tool_result round-trip blocks serialize flat" {
     };
     const json = try stringifyAlloc(testing.allocator, req);
     defer testing.allocator.free(json);
-    try testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{\"city\":\"Paris\"}") != null);
-    try testing.expect(std.mem.indexOf(u8, json, "\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"72F sunny\"") != null);
+    try testing.expect(std.mem.find(u8, json, "\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{\"city\":\"Paris\"}") != null);
+    try testing.expect(std.mem.find(u8, json, "\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"72F sunny\"") != null);
 }
 
 // ── image / document blocks, the `system` array form, count_tokens ─────────
@@ -867,16 +867,16 @@ test "system: string only, blocks only, both (string first, uncached), empty blo
     for (cases) |c| {
         const json = try stringifyAlloc(testing.allocator, c.req);
         defer testing.allocator.free(json);
-        try testing.expect(std.mem.indexOf(u8, json, c.want) != null);
+        try testing.expect(std.mem.find(u8, json, c.want) != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\"system\""));
         // Placement unchanged: right after messages.
-        try testing.expect(std.mem.indexOf(u8, json, "]}],\"system\":") != null);
+        try testing.expect(std.mem.find(u8, json, "]}],\"system\":") != null);
     }
     // Neither set, or only an empty array: no `system` key at all.
     for ([_]?[]const SystemBlock{ null, &.{} }) |blocks| {
         const json = try stringifyAlloc(testing.allocator, .{ .max_tokens = 1, .messages = msgs, .system_blocks = blocks });
         defer testing.allocator.free(json);
-        try testing.expect(std.mem.indexOf(u8, json, "system") == null);
+        try testing.expect(std.mem.find(u8, json, "system") == null);
     }
 }
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-09-15** — **BEHAVIOURAL: `GcOptions.stale_after_ns` default raised 10 min → 24 h**
   (round-2 decision Q8: safe default + switch for the exception, applied to the 2026-09-11
   finding below). The sweep's only liveness signal is mtime, so any default is a guess about

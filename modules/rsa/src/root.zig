@@ -2247,7 +2247,7 @@ fn verifyPssDigestMont(mp: *const MontParams, e: u32, comptime Hash: type, compt
 
     // step 10: DB = PS (zeros) || 0x01 || salt.
     const sl: usize = salt_len orelse blk: {
-        const sep = std.mem.indexOfNone(u8, db, &.{0}) orelse break :blk 0; // all zero: the 0x01 check fails
+        const sep = std.mem.findNone(u8, db, &.{0}) orelse break :blk 0; // all zero: the 0x01 check fails
         break :blk db.len - sep - 1;
     };
     const ps_len = em_len - h_len - sl - 2;
@@ -2771,22 +2771,22 @@ fn pemDecodeBody(text: []const u8) PemError!PemBlock {
     const begin_marker = "-----BEGIN ";
     const dashes = "-----";
 
-    const bi = std.mem.indexOf(u8, text, begin_marker) orelse return error.MissingPemBlock;
+    const bi = std.mem.find(u8, text, begin_marker) orelse return error.MissingPemBlock;
     const label_start = bi + begin_marker.len;
-    const label_end = std.mem.indexOfPos(u8, text, label_start, dashes) orelse return error.InvalidPem;
+    const label_end = std.mem.findPos(u8, text, label_start, dashes) orelse return error.InvalidPem;
     const label = text[label_start..label_end];
     if (label.len > max_pem_label_len) return error.InvalidPem;
 
     const body_start = label_end + dashes.len;
     var end_marker_buf: [max_end_marker_len]u8 = undefined;
-    const end_marker = std.fmt.bufPrint(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
+    const end_marker = std.mem.print(&end_marker_buf, "-----END {s}-----", .{label}) catch unreachable;
     // The END line starts at the first '-' after the body: base64 has none, so
     // this scan's compare is false on every key character and it stops at the
-    // body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
     // indexes its skip table by, and skips by an amount that depends on, the
     // key's characters (acme ctgrind 2026-10-18). The first block of the label
     // is used, as documented.
-    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
     if (!std.mem.startsWith(u8, text[ei..], end_marker)) return error.InvalidPem;
     const body = text[body_start..ei];
 
@@ -4191,15 +4191,15 @@ test "doc: both OAEP encrypt entry points state the CSPRNG requirement" {
     const decl = "pub fn " ++ "encryptOaep";
     const needle = "MUST be " ++ "cryptographically";
 
-    const at0 = std.mem.indexOf(u8, src, decl).?;
-    const at1 = std.mem.indexOfPos(u8, src, at0 + decl.len, decl).?;
-    try testing.expect(std.mem.indexOfPos(u8, src, at1 + decl.len, decl) == null); // exactly two
+    const at0 = std.mem.find(u8, src, decl).?;
+    const at1 = std.mem.findPos(u8, src, at0 + decl.len, decl).?;
+    try testing.expect(std.mem.findPos(u8, src, at1 + decl.len, decl) == null); // exactly two
 
     // The requirement must sit in the doc block immediately BEFORE each
     // declaration. The second window starts at the END of the first
     // declaration, so `encryptOaep`'s own doc cannot satisfy `encryptOaepH`.
-    try testing.expect(std.mem.indexOf(u8, src[at0 -| 1600..at0], needle) != null);
-    try testing.expect(std.mem.indexOf(u8, src[at0 + decl.len .. at1], needle) != null);
+    try testing.expect(std.mem.find(u8, src[at0 -| 1600..at0], needle) != null);
+    try testing.expect(std.mem.find(u8, src[at0 + decl.len .. at1], needle) != null);
 }
 
 // Regression for the montint-rewire CRIT: a sub-max key driven through the
@@ -5349,7 +5349,7 @@ test "PBES2: an iteration count over max_pbkdf2_iterations is refused before any
     var buf: [max_encrypted_pkcs8_der_len]u8 = undefined;
     // 0x010000 iterations, then the INTEGER patched to 0x110000 (> 2^20).
     const der = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 0x010000 }, &buf);
-    const at = std.mem.indexOf(u8, der, &.{ 0x02, 0x03, 0x01, 0x00, 0x00 }).?;
+    const at = std.mem.find(u8, der, &.{ 0x02, 0x03, 0x01, 0x00, 0x00 }).?;
     der[at + 2] = 0x11;
     try testing.expectError(error.KdfIterationsTooLarge, fromPkcs8Encrypted(&test_sk_out, der, "pw"));
 }
@@ -5636,7 +5636,7 @@ test "PBES2 writer: the option limits are inclusive (2^20 iterations, 64 salt oc
     const d256 = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .iterations = 1 }, &buf);
     try testing.expectEqual(Pbes2Prf.hmac_sha256, (try pbes2Params(d256)).prf);
     const d1 = try sk.toPkcs8Encrypted("pw", prng.random(), .{ .prf = .hmac_sha1, .iterations = 1 }, &buf);
-    try testing.expect(std.mem.indexOf(u8, d1, &marshal.oid_hmac_arc) == null);
+    try testing.expect(std.mem.find(u8, d1, &marshal.oid_hmac_arc) == null);
     try testing.expectEqual(Pbes2Prf.hmac_sha1, (try pbes2Params(d1)).prf);
 }
 
@@ -5687,19 +5687,19 @@ test "PEM: two blocks of one label load the first; a '-' inside the body is no E
     var buf: [max_public_pem_len]u8 = undefined;
     const other = try pk3.toPem(.spki, &buf);
     var two: [2 * max_public_pem_len]u8 = undefined;
-    const text = try std.fmt.bufPrint(&two, "{s}{s}", .{ k1, other });
+    const text = try std.mem.print(&two, "{s}{s}", .{ k1, other });
     try testing.expect(first.equal(&try PublicKey.fromPem(text)));
     try testing.expect(!first.equal(&pk3));
     // The reverse order loads the other key.
-    const text2 = try std.fmt.bufPrint(&two, "{s}{s}", .{ other, k1 });
+    const text2 = try std.mem.print(&two, "{s}{s}", .{ other, k1 });
     try testing.expect(pk3.equal(&try PublicKey.fromPem(text2)));
     // A '-' that does not start the END line ends the body there: invalid.
     var junk: [max_public_pem_len + 16]u8 = undefined;
-    const body_end = std.mem.indexOf(u8, k1, "-----END").?;
-    const bad = try std.fmt.bufPrint(&junk, "{s}-{s}", .{ k1[0..body_end], k1[body_end..] });
+    const body_end = std.mem.find(u8, k1, "-----END").?;
+    const bad = try std.mem.print(&junk, "{s}-{s}", .{ k1[0..body_end], k1[body_end..] });
     try testing.expectError(error.InvalidPem, PublicKey.fromPem(bad));
     // END line of another label: invalid.
-    const wrong = try std.fmt.bufPrint(&junk, "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END RSA PUBLIC KEY-----\n", .{});
+    const wrong = try std.mem.print(&junk, "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END RSA PUBLIC KEY-----\n", .{});
     try testing.expectError(error.InvalidPem, PublicKey.fromPem(wrong));
 }
 
@@ -5990,12 +5990,12 @@ test "PublicKey.fromDer rejects a wrong leading tag (never panics)" {
 
 test "PublicKey.fromDer/fromPkcs8 reject a wrong AlgorithmIdentifier OID" {
     var corrupt = kat2048_der.pub_spki;
-    const idx = std.mem.indexOf(u8, &corrupt, &oid_rsa_encryption).?;
+    const idx = std.mem.find(u8, &corrupt, &oid_rsa_encryption).?;
     corrupt[idx] ^= 0xff;
     try testing.expectError(error.InvalidDer, PublicKey.fromDer(&corrupt));
 
     var corrupt8 = kat2048_der.priv_pkcs8;
-    const idx8 = std.mem.indexOf(u8, &corrupt8, &oid_rsa_encryption).?;
+    const idx8 = std.mem.find(u8, &corrupt8, &oid_rsa_encryption).?;
     corrupt8[idx8] ^= 0xff;
     try testing.expectError(error.InvalidDer, fromPkcs8(&test_sk_out, &corrupt8));
 }
@@ -6128,16 +6128,16 @@ test "selfSignedCert: basicConstraints reflects is_ca (CA vs leaf)" {
     const ca_true_seq = [_]u8{ 0x30, 0x03, 0x01, 0x01, 0xff }; // SEQUENCE { BOOLEAN TRUE }
     const ca_empty_seq = [_]u8{ 0x30, 0x00 }; // SEQUENCE {} (cA DEFAULT FALSE)
 
-    try testing.expect(std.mem.indexOf(u8, ca_der, &ca_true_seq) != null);
-    try testing.expect(std.mem.indexOf(u8, leaf_der, &ca_true_seq) == null);
-    try testing.expect(std.mem.indexOf(u8, leaf_der, &ca_empty_seq) != null);
+    try testing.expect(std.mem.find(u8, ca_der, &ca_true_seq) != null);
+    try testing.expect(std.mem.find(u8, leaf_der, &ca_true_seq) == null);
+    try testing.expect(std.mem.find(u8, leaf_der, &ca_empty_seq) != null);
 
     // keyUsage differs too: CA sets keyCertSign+cRLSign (content byte 0x86,
     // 1 unused bit), leaf sets only digitalSignature (0x80, 7 unused bits).
     const ku_ca = [_]u8{ 0x03, 0x02, 0x01, 0x86 };
     const ku_leaf = [_]u8{ 0x03, 0x02, 0x07, 0x80 };
-    try testing.expect(std.mem.indexOf(u8, ca_der, &ku_ca) != null);
-    try testing.expect(std.mem.indexOf(u8, leaf_der, &ku_leaf) != null);
+    try testing.expect(std.mem.find(u8, ca_der, &ku_ca) != null);
+    try testing.expect(std.mem.find(u8, leaf_der, &ku_leaf) != null);
 
     // Both are still valid, verifiable certificates regardless of is_ca.
     inline for (.{ ca_der, leaf_der }) |der_bytes| {
@@ -6168,7 +6168,7 @@ test "selfSignedCert: subjectAltName (dNSName + URI) round-trips through std's v
 
     // The URI SAN is present in the raw subjectAltName bytes too (std has no
     // dedicated URI accessor, so check the extnValue bytes directly).
-    try testing.expect(std.mem.indexOf(u8, parsed.subjectAltName(), "urn:zig-libs:rsa:test") != null);
+    try testing.expect(std.mem.find(u8, parsed.subjectAltName(), "urn:zig-libs:rsa:test") != null);
 }
 
 test "selfSignedCert: rejects invalid CertOptions (empty CN, malformed UTCTime)" {

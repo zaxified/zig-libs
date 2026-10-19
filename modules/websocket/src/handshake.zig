@@ -320,7 +320,7 @@ fn originAllowed(head: h1.RequestHead, allowed: []const []const u8) bool {
         // anything else with no "://" has no authority to extract and is
         // rejected.
         const host = head.header("host") orelse return false;
-        const sep = std.mem.indexOf(u8, origin, "://") orelse return false;
+        const sep = std.mem.find(u8, origin, "://") orelse return false;
         const authority = origin[sep + 3 ..];
         return authority.len != 0 and std.ascii.eqlIgnoreCase(authority, host);
     }
@@ -610,9 +610,9 @@ test "acceptHandshake: RFC 1.3 example request" {
     var out: std.Io.Writer = .fixed(&out_buf);
     try writeResponse(&out, accept);
     const resp = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, resp, "101 Switching Protocols") != null);
-    try testing.expect(std.mem.indexOf(u8, resp, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
-    try testing.expect(std.mem.indexOf(u8, resp, "Sec-WebSocket-Protocol: chat") != null);
+    try testing.expect(std.mem.find(u8, resp, "101 Switching Protocols") != null);
+    try testing.expect(std.mem.find(u8, resp, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") != null);
+    try testing.expect(std.mem.find(u8, resp, "Sec-WebSocket-Protocol: chat") != null);
 }
 
 test "acceptHandshake: rejects a duplicated Sec-WebSocket-Key" {
@@ -800,8 +800,8 @@ test "client round trip: generateKey + writeRequest + verifyResponse" {
     var req_out: std.Io.Writer = .fixed(&req_buf);
     try writeRequest(&req_out, .{ .host = "example.com", .target = "/ws", .key = &key, .protocols = &.{"chat"} });
     const req = req_out.buffered();
-    try testing.expect(std.mem.indexOf(u8, req, "GET /ws HTTP/1.1") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "Sec-WebSocket-Protocol: chat") != null);
+    try testing.expect(std.mem.find(u8, req, "GET /ws HTTP/1.1") != null);
+    try testing.expect(std.mem.find(u8, req, "Sec-WebSocket-Protocol: chat") != null);
 
     // Server side computes the accept for the same key.
     const accept_key = computeAcceptKey(&key);
@@ -843,7 +843,7 @@ test "verifyResponse: rejects an unoffered subprotocol" {
 test "verifyResponse: rejects a Sec-WebSocket-Extensions the client never offered" {
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = computeAcceptKey(key);
-    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{accept});
+    const resp = try testing.allocator.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{accept});
     defer testing.allocator.free(resp);
     const head = try h1.ResponseHead.parse(resp);
     try testing.expectError(error.UnexpectedExtension, verifyResponse(head, key, &.{}));
@@ -868,7 +868,7 @@ test "verifyResponse: positive control, no Sec-WebSocket-Extensions header is fi
 test "verifyResponse: rejects duplicate Sec-WebSocket-Accept" {
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = computeAcceptKey(key);
-    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n", .{accept});
+    const resp = try testing.allocator.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n", .{accept});
     defer testing.allocator.free(resp);
     const head = try h1.ResponseHead.parse(resp);
     try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{}));
@@ -877,7 +877,7 @@ test "verifyResponse: rejects duplicate Sec-WebSocket-Accept" {
 test "verifyResponse: rejects duplicate Upgrade" {
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = computeAcceptKey(key);
-    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
+    const resp = try testing.allocator.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
     defer testing.allocator.free(resp);
     const head = try h1.ResponseHead.parse(resp);
     try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{}));
@@ -886,7 +886,7 @@ test "verifyResponse: rejects duplicate Upgrade" {
 test "verifyResponse: rejects duplicate Sec-WebSocket-Protocol" {
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = computeAcceptKey(key);
-    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n", .{accept});
+    const resp = try testing.allocator.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n", .{accept});
     defer testing.allocator.free(resp);
     const head = try h1.ResponseHead.parse(resp);
     try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{ "chat", "superchat" }));
@@ -965,10 +965,10 @@ test "writeRequest: positive control, ordinary fields still write correctly" {
         .extra_headers = &.{.{ .name = "Origin", .value = "https://example.com" }},
     });
     const req = w.buffered();
-    try testing.expect(std.mem.indexOf(u8, req, "GET /chat?x=1 HTTP/1.1\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "Host: example.com:8080\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "Sec-WebSocket-Protocol: chat, superchat\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "Origin: https://example.com\r\n") != null);
+    try testing.expect(std.mem.find(u8, req, "GET /chat?x=1 HTTP/1.1\r\n") != null);
+    try testing.expect(std.mem.find(u8, req, "Host: example.com:8080\r\n") != null);
+    try testing.expect(std.mem.find(u8, req, "Sec-WebSocket-Protocol: chat, superchat\r\n") != null);
+    try testing.expect(std.mem.find(u8, req, "Origin: https://example.com\r\n") != null);
 }
 
 // ── fuzz: verifyResponse off the wire, client role, never panics ───────────
@@ -1391,9 +1391,9 @@ test "subprotocols match exactly on the client: a differently-cased answer fails
     const key = "dGhlIHNhbXBsZSBub25jZQ==";
     const accept = computeAcceptKey(key);
     var buf: [256]u8 = undefined;
-    const resp = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: Chat\r\n\r\n", .{&accept});
+    const resp = try std.mem.print(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: Chat\r\n\r\n", .{&accept});
     try testing.expectError(error.UnexpectedSubprotocol, verifyResponse(try h1.ResponseHead.parse(resp), key, &.{"chat"}));
-    const ok = try std.fmt.bufPrint(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\n\r\n", .{&accept});
+    const ok = try std.mem.print(&buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\n\r\n", .{&accept});
     try testing.expectEqualStrings("chat", (try verifyResponse(try h1.ResponseHead.parse(ok), key, &.{"chat"})).protocol.?);
 }
 
@@ -1426,7 +1426,7 @@ test "deflate handshake: server accepts a browser offer only when enabled, and s
     );
     out.end = 0;
     try writeResponse(&out, off);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Extensions") == null);
+    try testing.expect(std.mem.find(u8, out.buffered(), "Extensions") == null);
 
     // Offers spread over two header lines; the first is declined.
     const two = try h1.RequestHead.parse(deflateRequest(
@@ -1444,7 +1444,7 @@ test "deflate handshake: client offer and response verification" {
     var req_buf: [512]u8 = undefined;
     var req: std.Io.Writer = .fixed(&req_buf);
     try writeRequest(&req, .{ .host = "h", .key = key, .permessage_deflate = true });
-    try testing.expect(std.mem.indexOf(u8, req.buffered(), "\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n") != null);
+    try testing.expect(std.mem.find(u8, req.buffered(), "\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n") != null);
 
     // Our own server's acceptance.
     var resp_buf: [512]u8 = undefined;
@@ -1462,7 +1462,7 @@ test "deflate handshake: client offer and response verification" {
     try testing.expectEqual(@as(?deflate.Params, null), (try verifyResponseWith(plain, key, .{ .permessage_deflate = true })).deflate);
 
     // A server that kept context takeover for itself: refused.
-    const bad = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{computeAcceptKey(key)});
+    const bad = try testing.allocator.print("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{computeAcceptKey(key)});
     defer testing.allocator.free(bad);
     try testing.expectError(error.UnexpectedExtension, verifyResponseWith(try h1.ResponseHead.parse(bad), key, .{ .permessage_deflate = true }));
 }

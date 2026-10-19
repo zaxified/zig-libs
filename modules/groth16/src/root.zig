@@ -140,6 +140,6 @@ test {
 }
 
 test "meta names the Groth16 construction and the bn254 dep" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Groth16") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Groth16") != null);
     try std.testing.expectEqualStrings("bn254", meta.deps[0]);
 }

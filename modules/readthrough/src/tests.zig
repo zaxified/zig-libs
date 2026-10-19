@@ -236,7 +236,7 @@ test "concurrent mixed keys: no lock-up, no leak, every key resolves" {
             while (i < 500) : (i += 1) {
                 s = s *% 6364136223846793005 +% 1442695040888963407;
                 const id = s % 40; // 40 shared keys → heavy coalescing + eviction
-                const key = std.fmt.bufPrint(&buf, "key{d}", .{id}) catch unreachable;
+                const key = std.mem.print(&buf, "key{d}", .{id}) catch unreachable;
                 const res = self.cache.get(key) catch return;
                 defer self.cache.free(res);
                 switch (res) {

@@ -661,7 +661,7 @@ test "LIVE: create, inspect, update and detach a real cgroup link" {
     }
 
     var path_buf: [64]u8 = undefined;
-    const dir = try std.fmt.bufPrintSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-link-{d}", .{linux.getpid()}, 0);
+    const dir = try std.mem.printSentinel(&path_buf, "/sys/fs/cgroup/zig-libs-ebpf-link-{d}", .{linux.getpid()}, 0);
     switch (linux.errno(linux.mkdir(dir.ptr, 0o755))) {
         .SUCCESS => {},
         else => {

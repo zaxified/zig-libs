@@ -375,8 +375,8 @@ test "EXTERNAL anchor: the multi-namespace fixture really does discriminate the 
     // What the (local, URI) key would have produced instead.
     const by_local_then_uri = "ID=\"obj-multi-ns\" b:aa=\"in-b\" a:mm=\"in-a\" zz=\"unprefixed-z\"";
     try testing.expect(!std.mem.eql(u8, by_uri_then_local, by_local_then_uri));
-    try testing.expect(std.mem.indexOf(u8, canon, by_uri_then_local) != null);
-    try testing.expect(std.mem.indexOf(u8, canon, by_local_then_uri) == null);
+    try testing.expect(std.mem.find(u8, canon, by_uri_then_local) != null);
+    try testing.expect(std.mem.find(u8, canon, by_local_then_uri) == null);
 }
 
 test "EXTERNAL anchor: fixture count canary — 6 genuinely external xmlsec1/signxml-signed documents" {

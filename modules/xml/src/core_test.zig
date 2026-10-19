@@ -322,11 +322,11 @@ test "entities: references to EMPTY text still spend the budget (no free fan-out
     n = head.len;
     const levels = "zyxwvut";
     for (1..levels.len) |i| {
-        n += (try std.fmt.bufPrint(buf[n..], "<!ENTITY {c} \"", .{levels[i]})).len;
-        for (0..10) |_| n += (try std.fmt.bufPrint(buf[n..], "&{c};", .{levels[i - 1]})).len;
-        n += (try std.fmt.bufPrint(buf[n..], "\">", .{})).len;
+        n += (try std.mem.print(buf[n..], "<!ENTITY {c} \"", .{levels[i]})).len;
+        for (0..10) |_| n += (try std.mem.print(buf[n..], "&{c};", .{levels[i - 1]})).len;
+        n += (try std.mem.print(buf[n..], "\">", .{})).len;
     }
-    n += (try std.fmt.bufPrint(buf[n..], "]><r>&t;</r>", .{})).len;
+    n += (try std.mem.print(buf[n..], "]><r>&t;</r>", .{})).len;
     try testing.expectError(error.EntityLimit, xml.parse(testing.allocator, buf[0..n], .{ .doctype = .internal_entities }));
     // Two levels (10 + 100 + 1 references, all empty) pass.
     const small = "<!DOCTYPE r [<!ENTITY z \"\"><!ENTITY y \"&z;&z;\">]><r>&y;</r>";

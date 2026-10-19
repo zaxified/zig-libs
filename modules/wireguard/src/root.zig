@@ -2012,7 +2012,7 @@ fn keyHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!void
     var flipped = text;
     const at = rnd.uintLessThan(usize, flipped.len);
     const abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    flipped[at] = abc[(std.mem.indexOfScalar(u8, abc, flipped[at]) orelse 0) +% 1 + rnd.uintLessThan(usize, 62) & 63];
+    flipped[at] = abc[(std.mem.findScalar(u8, abc, flipped[at]) orelse 0) +% 1 + rnd.uintLessThan(usize, 62) & 63];
     if (keyFromBase64(&flipped)) |k| {
         if (std.mem.eql(u8, &k, &key) and !std.mem.eql(u8, &flipped, &text)) return error.ForgedKeyAccepted;
     } else |_| {}

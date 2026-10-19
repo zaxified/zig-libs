@@ -25,7 +25,7 @@ const Span = root.Span;
 /// nothing; a `$` that starts no variable is written as it is.
 pub fn expand(re: *const Regex, w: *Writer, template: []const u8, input: []const u8, groups: []const ?Span) Writer.Error!void {
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, template, i, '$')) |d| {
+    while (std.mem.findScalarPos(u8, template, i, '$')) |d| {
         try w.writeAll(template[i..d]);
         if (d + 1 < template.len and template[d + 1] == '$') {
             try w.writeByte('$');
@@ -202,7 +202,7 @@ pub const SplitIterator = struct {
 pub fn quoteMeta(w: *Writer, text: []const u8) Writer.Error!void {
     var last: usize = 0;
     for (text, 0..) |c, i| {
-        if (std.mem.indexOfScalar(u8, "\\.+*?()|[]{}^$", c) == null) continue;
+        if (std.mem.findScalar(u8, "\\.+*?()|[]{}^$", c) == null) continue;
         try w.writeAll(text[last..i]);
         try w.writeByte('\\');
         last = i;

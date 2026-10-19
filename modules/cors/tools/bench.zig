@@ -114,18 +114,18 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         for (0..n_req) |i| {
             const o = listed[i % listed.len];
             const wire = if (std.mem.eql(u8, name, "preflight"))
-                try std.fmt.allocPrint(arena, "OPTIONS / HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: authorization, content-type\r\nConnection: close\r\n\r\n", .{o})
+                try arena.print("OPTIONS / HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nAccess-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: authorization, content-type\r\nConnection: close\r\n\r\n", .{o})
             else if (std.mem.eql(u8, name, "disallowed"))
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nOrigin: https://evil{d}.example\r\nConnection: close\r\n\r\n", .{i})
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nOrigin: https://evil{d}.example\r\nConnection: close\r\n\r\n", .{i})
             else if (std.mem.eql(u8, name, "wildcard"))
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nOrigin: https://t{d}.tenant.example\r\nConnection: close\r\n\r\n", .{i})
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nOrigin: https://t{d}.tenant.example\r\nConnection: close\r\n\r\n", .{i})
             else // plain and actual: the same bytes, a GET from a listed origin
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nConnection: close\r\n\r\n", .{o});
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nConnection: close\r\n\r\n", .{o});
             d.wires[wi][i] = wire;
             if (i != 0) try all.writer.writeByte(0);
             try all.writer.writeAll(wire);
         }
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = all.written() });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.wire", .{name}), .data = all.written() });
     }
     return d;
 }
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

@@ -340,7 +340,7 @@ test "a GOOSE subscriber configured from SCL accepts the publisher SCL describes
     try testing.expectEqualStrings("TESTIEDGenericIO/LLN0$GO$gcbEvents", gocb_ref);
     // The control block really is in the resolved name space.
     var item_buf: [128]u8 = undefined;
-    try testing.expect(model.has(domain, try std.fmt.bufPrint(&item_buf, "{s}$GO${s}", .{ ln_name, gcb.name })));
+    try testing.expect(model.has(domain, try std.mem.print(&item_buf, "{s}$GO${s}", .{ ln_name, gcb.name })));
 
     // The data set it publishes, and the members it will carry.
     var ds: ?scl.DataSet = null;
@@ -427,7 +427,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 const Endpoint = struct { host: []const u8, port: u16 };
 
 fn splitEndpoint(endpoint: []const u8) ?Endpoint {
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return null;
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return null;
     return .{ .host = endpoint[0..colon], .port = port };
 }
@@ -482,17 +482,17 @@ test "live: our client against a real IEC 61850 server" {
 
     // 4. Read a measurement and a status point.
     var ref_buf: [128]u8 = undefined;
-    const mag_ref = try std.fmt.bufPrint(&ref_buf, "{s}/GGIO1.AnIn1.mag.f", .{ld});
+    const mag_ref = try std.mem.print(&ref_buf, "{s}/GGIO1.AnIn1.mag.f", .{ld});
     const mag = try c.readObject(mag_ref, .MX);
     const mag_value = try mag.asFloat();
 
     var ref_buf2: [128]u8 = undefined;
-    const ind_ref = try std.fmt.bufPrint(&ref_buf2, "{s}/GGIO1.Ind1.stVal", .{ld});
+    const ind_ref = try std.mem.print(&ref_buf2, "{s}/GGIO1.Ind1.stVal", .{ld});
     _ = try (try c.readObject(ind_ref, .ST)).boolean();
 
     // 5. Write a description string and read it back.
     var ref_buf3: [128]u8 = undefined;
-    const vendor_ref = try std.fmt.bufPrint(&ref_buf3, "{s}/GGIO1.NamPlt.vendor", .{ld});
+    const vendor_ref = try std.mem.print(&ref_buf3, "{s}/GGIO1.NamPlt.vendor", .{ld});
     var vbuf: [64]u8 = undefined;
     var vw = ber.Writer.init(&vbuf);
     try Emit.visibleString(&vw, "zig-libs");
@@ -509,12 +509,12 @@ test "live: our client against a real IEC 61850 server" {
     // 6. A variable that does not exist must come back as a per-object failure,
     //    not as a fatal error.
     var ref_buf4: [128]u8 = undefined;
-    const bogus = try std.fmt.bufPrint(&ref_buf4, "{s}/GGIO1.NoSuchThing.stVal", .{ld});
+    const bogus = try std.mem.print(&ref_buf4, "{s}/GGIO1.NoSuchThing.stVal", .{ld});
     try testing.expectError(error.AccessFailed, c.readObject(bogus, .ST));
 
     // 7. Read a whole data set in one request.
     var ds_ref: [128]u8 = undefined;
-    const ds = try std.fmt.bufPrint(&ds_ref, "{s}/LLN0$Events", .{ld});
+    const ds = try std.mem.print(&ds_ref, "{s}/LLN0$Events", .{ld});
     var ds_values: usize = 0;
     if (c.readDataSet(ds)) |it_const| {
         var it = it_const;
@@ -524,7 +524,7 @@ test "live: our client against a real IEC 61850 server" {
     // 8. The unbuffered report control block: read it, enable it, ask for a
     //    general interrogation, and receive the report the IED pushes.
     var rcb_ref: [128]u8 = undefined;
-    const rcb_name = try std.fmt.bufPrint(&rcb_ref, "{s}/LLN0.EventsRCB01", .{ld});
+    const rcb_name = try std.mem.print(&rcb_ref, "{s}/LLN0.EventsRCB01", .{ld});
     live_reports = 0;
     live_report_entries = 0;
     var dummy: u8 = 0;
@@ -614,7 +614,7 @@ test "live: our client operating a real IED through every control model" {
     var terminations: usize = 0;
     for (objects, 0..) |obj, i| {
         var ref_buf: [128]u8 = undefined;
-        const ref = try std.fmt.bufPrint(&ref_buf, "{s}/GGIO1.{s}", .{ ld, obj });
+        const ref = try std.mem.print(&ref_buf, "{s}/GGIO1.{s}", .{ ld, obj });
         models[i] = try c.readCtlModel(ref);
         const sbo_timeout = (try c.readSboTimeout(ref)) orelse 2000;
 
@@ -639,7 +639,7 @@ test "live: our client operating a real IED through every control model" {
 
         // And the status point really moved.
         var st_buf: [128]u8 = undefined;
-        const st = try std.fmt.bufPrint(&st_buf, "{s}/GGIO1.{s}.stVal", .{ ld, obj });
+        const st = try std.mem.print(&st_buf, "{s}/GGIO1.{s}.stVal", .{ ld, obj });
         try testing.expect(try (try c.readObject(st, .ST)).boolean());
     }
 
@@ -647,7 +647,7 @@ test "live: our client operating a real IED through every control model" {
     // selecting it. A real IED answers with a `LastApplError` naming
     // `Object-not-selected`, which is the field this module exists to surface.
     var bad_buf: [128]u8 = undefined;
-    const bad_ref = try std.fmt.bufPrint(&bad_buf, "{s}/GGIO1.SPCSO4", .{ld});
+    const bad_ref = try std.mem.print(&bad_buf, "{s}/GGIO1.SPCSO4", .{ld});
     var refused_cause: ?control.AddCause = null;
     live_last_cause = null;
     c.operateObject(bad_ref, .{
@@ -1454,7 +1454,7 @@ test "live: a real IEC 61850 client reassembling a segmented report from our ser
         std.mem.copyForwards(u8, storage[i][0..d.len], d);
         vars[i] = .{
             .domain = ld,
-            .item = try std.fmt.bufPrint(&names[i], "GGIO1$ST$Ind{d}$stVal", .{i + 1}),
+            .item = try std.mem.print(&names[i], "GGIO1$ST$Ind{d}$stVal", .{i + 1}),
             .storage = &storage[i],
             .len = d.len,
             .writable = true,

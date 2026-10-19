@@ -185,7 +185,7 @@ const Lexer = struct {
             plus_before = true;
             p += 1;
         }
-        const end = std.mem.indexOfPos(u8, self.src, p, "#}") orelse return self.fail("unclosed comment");
+        const end = std.mem.findPos(u8, self.src, p, "#}") orelse return self.fail("unclosed comment");
         var body_end = end;
         var strip_after = false;
         var plus_after = false;
@@ -295,7 +295,7 @@ const Lexer = struct {
     ) Error!void {
         var scan = self.pos;
         while (true) {
-            const open = std.mem.indexOfPos(u8, self.src, scan, "{%") orelse
+            const open = std.mem.findPos(u8, self.src, scan, "{%") orelse
                 return self.fail("unclosed {% raw %}");
             var q = open + 2;
             var strip_before = false;
@@ -547,7 +547,7 @@ const Lexer = struct {
 };
 
 fn stripUnderscores(arena: std.mem.Allocator, s: []const u8) Error![]const u8 {
-    if (std.mem.indexOfScalar(u8, s, '_') == null) return s;
+    if (std.mem.findScalar(u8, s, '_') == null) return s;
     var out: std.ArrayList(u8) = .empty;
     for (s) |c| if (c != '_') try out.append(arena, c);
     return out.items;

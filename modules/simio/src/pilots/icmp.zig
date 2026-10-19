@@ -74,7 +74,7 @@ fn monitor(io: Io, gpa: std.mem.Allocator, st: *State) !void {
     var ids: [n_targets]icmp.TargetId = undefined;
     for (st.targets, &ids) |ip, *id| {
         var buf: [16]u8 = undefined;
-        id.* = try p.addTarget(try std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }));
+        id.* = try p.addTarget(try std.mem.print(&buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }));
     }
     try p.run();
     for (ids, &st.stats) |id, *s| s.* = p.stats(id);

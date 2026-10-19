@@ -339,7 +339,7 @@ fn collectEmbeds(b: *Build, src: [:0]const u8) ![]const u8 {
             t1.tag == .l_paren and t2.tag == .string_literal)
         {
             const lit = src[t2.loc.start + 1 .. t2.loc.end - 1];
-            if (std.mem.indexOfAny(u8, lit, ",\t\n\\") == null) {
+            if (std.mem.findAny(u8, lit, ",\t\n\\") == null) {
                 if (out.items.len != 0) try out.append(b.allocator, ',');
                 try out.appendSlice(b.allocator, lit);
             }
@@ -638,7 +638,7 @@ fn exampleTriggers(b: *Build, io: std.Io, name: []const u8) !struct {
             } else continue;
             pub_fns += 1;
             if (std.mem.startsWith(u8, rest, "init")) has_init = true;
-            const paren = std.mem.indexOfScalar(u8, rest, '(') orelse continue;
+            const paren = std.mem.findScalar(u8, rest, '(') orelse continue;
             const args = std.mem.trimStart(u8, rest[paren + 1 ..], " \t");
             if (std.mem.startsWith(u8, args, "self")) self_methods += 1;
         }
@@ -664,14 +664,14 @@ const lib_sections = [_]struct { lib: []const u8, heading: []const u8 }{
 /// `lib` name, or null if the row is under a heading that is not a library
 /// (the Portability table, say) or under none at all.
 fn readmeLibOf(readme: []const u8, name: []const u8, b: *Build) ?[]const u8 {
-    const at = std.mem.indexOf(u8, readme, catalogRowNeedle(b, name)) orelse return null;
+    const at = std.mem.find(u8, readme, catalogRowNeedle(b, name)) orelse return null;
     // The nearest library heading ABOVE the row wins, compared by position so
     // that the order of `lib_sections` cannot shadow the order in the file.
     var best: ?[]const u8 = null;
     var best_pos: usize = 0;
     for (lib_sections) |ls| {
         var from: usize = 0;
-        while (std.mem.indexOfPos(u8, readme, from, ls.heading)) |h| : (from = h + 1) {
+        while (std.mem.findPos(u8, readme, from, ls.heading)) |h| : (from = h + 1) {
             const line_start = h == 0 or readme[h - 1] == '\n';
             if (line_start and h < at and h >= best_pos) {
                 best_pos = h;
@@ -1019,8 +1019,8 @@ const CatalogStep = struct {
 /// Handles `\"` inside the literal; returns the UNESCAPED text, since that is
 /// what belongs in Markdown.
 fn metaStringField(src: []const u8, field: []const u8) ?[]const u8 {
-    const meta_at = std.mem.indexOf(u8, src, "pub const meta = .{") orelse return null;
-    const at = std.mem.indexOfPos(u8, src, meta_at, field) orelse return null;
+    const meta_at = std.mem.find(u8, src, "pub const meta = .{") orelse return null;
+    const at = std.mem.findPos(u8, src, meta_at, field) orelse return null;
     var i = at + field.len;
     if (i >= src.len or src[i] != '"') return null;
     i += 1;
@@ -1111,9 +1111,9 @@ fn checkPackagePaths(step: *Step, options: MakeOptions) anyerror!void {
     const b = step.owner;
     const io = b.graph.io;
     const zon = try b.build_root.handle.readFileAlloc(io, "build.zig.zon", b.allocator, .limited(64 * 1024));
-    const paths_at = std.mem.indexOf(u8, zon, ".paths = .{") orelse
+    const paths_at = std.mem.find(u8, zon, ".paths = .{") orelse
         return step.fail("check-package: build.zig.zon has no `.paths` block", .{});
-    const paths_end = std.mem.indexOfPos(u8, zon, paths_at, "},") orelse zon.len;
+    const paths_end = std.mem.findPos(u8, zon, paths_at, "},") orelse zon.len;
     const paths = zon[paths_at..paths_end];
 
     var failed = false;
@@ -1123,7 +1123,7 @@ fn checkPackagePaths(step: *Step, options: MakeOptions) anyerror!void {
             failed = true;
             continue;
         };
-        if (std.mem.indexOf(u8, paths, b.fmt("\"{s}\"", .{needed})) == null) {
+        if (std.mem.find(u8, paths, b.fmt("\"{s}\"", .{needed})) == null) {
             std.log.err(
                 "check-package: build.zig.zon's `.paths` does not list \"{s}\" -- it exists in the repo but is not part of the package, so no consumer who fetches this ever receives it",
                 .{needed},
@@ -1158,7 +1158,7 @@ fn checkScriptsDoc(step: *Step, options: MakeOptions) anyerror!void {
     while (try it.next(io)) |e| {
         if (std.mem.eql(u8, e.name, "README.md") or std.mem.eql(u8, e.name, "__pycache__")) continue;
         const needle = if (e.kind == .directory) b.fmt("`{s}/`", .{e.name}) else b.fmt("`{s}`", .{e.name});
-        if (std.mem.indexOf(u8, readme, needle) == null) {
+        if (std.mem.find(u8, readme, needle) == null) {
             std.log.err(
                 "scripts/{s} is not mentioned in scripts/README.md — add a row for it (the README is the only map of the harness, and an undocumented tool is one nobody knows to run)",
                 .{e.name},
@@ -1178,7 +1178,7 @@ fn checkScriptsDoc(step: *Step, options: MakeOptions) anyerror!void {
             // Python's bytecode cache: gitignored, appears wherever a check ran.
             if (std.mem.eql(u8, e.name, "__pycache__")) continue;
             const needle = if (e.kind == .directory) b.fmt("`{s}/`", .{e.name}) else b.fmt("`{s}`", .{e.name});
-            if (std.mem.indexOf(u8, readme, needle) == null) {
+            if (std.mem.find(u8, readme, needle) == null) {
                 std.log.err("scripts/{s}/{s} is not mentioned in scripts/README.md — add a row for it", .{ sub, e.name });
                 failed = true;
             }
@@ -1206,10 +1206,10 @@ const LibsTableStep = struct {
             std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });
             return step.fail("{s}: cannot read README.md", .{verb});
         };
-        const content_start = (std.mem.indexOf(u8, readme, libs_table_begin_marker) orelse {
+        const content_start = (std.mem.find(u8, readme, libs_table_begin_marker) orelse {
             return step.fail("{s}: begin marker missing from README.md", .{verb});
         }) + libs_table_begin_marker.len;
-        const end_idx = std.mem.indexOfPos(u8, readme, content_start, libs_table_end_marker) orelse {
+        const end_idx = std.mem.findPos(u8, readme, content_start, libs_table_end_marker) orelse {
             return step.fail("{s}: end marker missing from README.md", .{verb});
         };
         const updated = std.mem.concat(b.allocator, u8, &.{ readme[0..content_start], "\n", body, readme[end_idx..] }) catch @panic("OOM");
@@ -1251,7 +1251,7 @@ fn checkCatalog(step: *Step, options: MakeOptions) anyerror!void {
             root_ok = false;
         };
 
-        if (std.mem.indexOf(u8, readme, catalogRowNeedle(b, m.name)) == null) {
+        if (std.mem.find(u8, readme, catalogRowNeedle(b, m.name)) == null) {
             std.log.err(
                 "module '{s}' has no README catalog row — the first cell must be" ++
                     " exactly `[`{s}`](modules/{s}/README.md)`, so the table's own" ++
@@ -1306,9 +1306,9 @@ fn checkCatalog(step: *Step, options: MakeOptions) anyerror!void {
     // same edit to the generated sentence turned `check-portable-table` red.
     // The most-read number in the file was the one number nothing guarded.
     const status_needle = "**Status:** ";
-    if (std.mem.indexOf(u8, readme, status_needle)) |at| {
+    if (std.mem.find(u8, readme, status_needle)) |at| {
         const rest = readme[at + status_needle.len ..];
-        const end = std.mem.indexOfNone(u8, rest, "0123456789") orelse rest.len;
+        const end = std.mem.findNone(u8, rest, "0123456789") orelse rest.len;
         if (std.fmt.parseInt(usize, rest[0..end], 10)) |claimed| {
             if (claimed != module_list.len) {
                 std.log.err(
@@ -1487,14 +1487,14 @@ fn checkChangelog(step: *Step, options: MakeOptions) anyerror!void {
     const tail = "/CHANGELOG.md)";
     const head = "](modules/";
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, root, i, tail)) |end| {
+    while (std.mem.findPos(u8, root, i, tail)) |end| {
         i = end + tail.len;
         const before = root[0..end];
-        const p = std.mem.lastIndexOf(u8, before, head) orelse continue;
+        const p = std.mem.findLast(u8, before, head) orelse continue;
         const name = before[p + head.len ..];
         // A clean module name only. Anything else means this `/CHANGELOG.md)`
         // did not belong to the `](modules/…` we walked back to.
-        if (name.len == 0 or std.mem.indexOfAny(u8, name, "/()`[] \t\n") != null) continue;
+        if (name.len == 0 or std.mem.findAny(u8, name, "/()`[] \t\n") != null) continue;
         if (!fileExists(b, io, b.fmt("modules/{s}/CHANGELOG.md", .{name}))) {
             std.log.err(
                 "root CHANGELOG.md links `modules/{s}/CHANGELOG.md`, which does not exist",
@@ -1563,9 +1563,9 @@ fn checkChangelog(step: *Step, options: MakeOptions) anyerror!void {
 /// per-module index that was deleted), and any minimum length — a byte count
 /// is a proxy for the two facts above, and a worse one.
 fn checkChangelogShape(name: []const u8, path: []const u8, text: []const u8, failed: *bool) void {
-    const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const nl = std.mem.findScalar(u8, text, '\n') orelse text.len;
     const title = text[0..nl];
-    if (!std.mem.startsWith(u8, title, "# ") or std.mem.indexOf(u8, title, name) == null) {
+    if (!std.mem.startsWith(u8, title, "# ") or std.mem.find(u8, title, name) == null) {
         std.log.err(
             "{s}:1: this is not a changelog — its first line must be a `# ` title naming the " ++
                 "module, as in `# {s} — changelog`, and it reads `{s}`. An empty or " ++
@@ -1676,7 +1676,7 @@ fn checkEntryDates(name: []const u8, path: []const u8, text: []const u8, failed:
     // file's title and its pointer back to the root CHANGELOG.md, not entries.
     var body_start: usize = 0;
     if (!std.mem.startsWith(u8, text, "## ")) {
-        body_start = (std.mem.indexOf(u8, text, "\n## ") orelse return) + 1;
+        body_start = (std.mem.find(u8, text, "\n## ") orelse return) + 1;
     }
 
     var line_no = std.mem.count(u8, text[0..body_start], "\n") + 1;
@@ -1742,9 +1742,9 @@ fn entryDate(rest: []const u8) ?[]const u8 {
 /// heading up to the next `## `. Null if there is no such heading.
 fn unreleasedSection(text: []const u8) ?[]const u8 {
     const heading = "## Unreleased";
-    const start = std.mem.indexOf(u8, text, heading) orelse return null;
+    const start = std.mem.find(u8, text, heading) orelse return null;
     const rest = text[start + heading.len ..];
-    const end = std.mem.indexOf(u8, rest, "\n## ") orelse rest.len;
+    const end = std.mem.find(u8, rest, "\n## ") orelse rest.len;
     return rest[0..end];
 }
 
@@ -1884,7 +1884,7 @@ fn scanSpdx(b: *Build, io: std.Io, dir_path: []const u8, depth: u8, failed: *boo
                 // a cheap gate becomes one people switch off.
                 var head: [512]u8 = undefined;
                 const n = file.readPositionalAll(io, &head, 0) catch continue;
-                if (std.mem.indexOf(u8, head[0..n], "SPDX-License-Identifier") != null) continue;
+                if (std.mem.find(u8, head[0..n], "SPDX-License-Identifier") != null) continue;
                 std.log.err(
                     "{s} has no `SPDX-License-Identifier` in its first {d} bytes. Every shipped " ++
                         "source file in this collection declares its licence on line 1 — an " ++
@@ -1968,7 +1968,7 @@ fn checkNoticeLinksIn(
     failed: *bool,
 ) void {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "NOTICE")) |hit| {
+    while (std.mem.findPos(u8, src, i, "NOTICE")) |hit| {
         i = hit + "NOTICE".len;
         var start = hit;
         while (start >= 3 and std.mem.eql(u8, src[start - 3 .. start], "../")) start -= 3;
@@ -1992,7 +1992,7 @@ fn checkNoticeLinksIn(
                 escaped = true;
                 break;
             }
-            const slash = std.mem.lastIndexOfScalar(u8, base, '/') orelse {
+            const slash = std.mem.findScalarLast(u8, base, '/') orelse {
                 base = "";
                 continue;
             };
@@ -2028,8 +2028,8 @@ fn checkProvenance(b: *Build, io: std.Io, failed: *bool) !void {
             // What is NOT accepted is the word appearing incidentally, e.g.
             // "fixture provenance" or "see kat_vectors.zig for provenance" --
             // that names where provenance lives without stating it.
-            if (std.mem.indexOf(u8, mod_readme, "Provenance:") == null and
-                std.mem.indexOf(u8, mod_readme, "## Provenance") == null)
+            if (std.mem.find(u8, mod_readme, "Provenance:") == null and
+                std.mem.find(u8, mod_readme, "## Provenance") == null)
             {
                 std.log.err(
                     "modules/{s}/README.md has no `Provenance:` line — say whether it is clean-room " ++
@@ -2175,7 +2175,7 @@ fn checkProvenance(b: *Build, io: std.Io, failed: *bool) !void {
         const mod_notice = b.build_root.handle.readFileAlloc(io, notice_path, b.allocator, .limited(4 * 1024 * 1024)) catch continue;
         checkModuleCitations(mod_notice, notice_path, failed);
 
-        const first_line = mod_notice[0 .. std.mem.indexOfScalar(u8, mod_notice, '\n') orelse mod_notice.len];
+        const first_line = mod_notice[0 .. std.mem.findScalar(u8, mod_notice, '\n') orelse mod_notice.len];
         const attribution = b.fmt("{s} — third-party attribution", .{m.name});
         const provenance = b.fmt("{s} — provenance note", .{m.name});
         const is_attribution = std.mem.eql(u8, std.mem.trim(u8, first_line, " \r"), attribution);
@@ -2222,15 +2222,15 @@ fn checkProvenance(b: *Build, io: std.Io, failed: *bool) !void {
 /// skipped -- root §0 and CONVENTIONS both do that.
 fn checkModuleCitations(text: []const u8, source_path: []const u8, failed: *bool) void {
     var scan: usize = 0;
-    while (std.mem.indexOfPos(u8, text, scan, "`modules/")) |open| {
+    while (std.mem.findPos(u8, text, scan, "`modules/")) |open| {
         const after = open + "`modules/".len;
-        const close = std.mem.indexOfScalarPos(u8, text, after, '`') orelse break;
+        const close = std.mem.findScalarPos(u8, text, after, '`') orelse break;
         scan = close + 1;
         const cited = text[after..close];
-        const name_end = std.mem.indexOfAny(u8, cited, "/ ") orelse cited.len;
+        const name_end = std.mem.findAny(u8, cited, "/ ") orelse cited.len;
         const name = cited[0..name_end];
         if (name.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, name, '<') != null) continue;
+        if (std.mem.findScalar(u8, name, '<') != null) continue;
         const known = for (module_list) |m| {
             if (std.mem.eql(u8, m.name, name)) break true;
         } else false;
@@ -2451,7 +2451,7 @@ fn moduleAnchorGrade(b: *Build, io: std.Io, name: []const u8) ?AnchorGrade {
         return null;
     };
 
-    const first = std.mem.indexOf(u8, src, needle) orelse {
+    const first = std.mem.find(u8, src, needle) orelse {
         std.log.err(
             "module '{s}': {s} states no anchor grade -- add a line `{s}<A|B|C|D> · oracle " ++
                 "<EXTERNAL|REDERIVED|MIXED|SELF|n/a>` saying where its expected values get their " ++
@@ -2460,7 +2460,7 @@ fn moduleAnchorGrade(b: *Build, io: std.Io, name: []const u8) ?AnchorGrade {
         );
         return null;
     };
-    if (std.mem.indexOfPos(u8, src, first + needle.len, needle) != null) {
+    if (std.mem.findPos(u8, src, first + needle.len, needle) != null) {
         std.log.err(
             "module '{s}': {s} states an anchor grade twice -- two copies of one fact is how the " ++
                 "repository-level tables this replaced went stale",
@@ -2470,10 +2470,10 @@ fn moduleAnchorGrade(b: *Build, io: std.Io, name: []const u8) ?AnchorGrade {
     }
 
     const rest = src[first + needle.len ..];
-    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
     const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
     const sep = " · oracle ";
-    const sep_at = std.mem.indexOf(u8, line, sep) orelse {
+    const sep_at = std.mem.find(u8, line, sep) orelse {
         std.log.err(
             "module '{s}': anchor grade line in {s} is malformed -- expected `class <X> · oracle <Y>`, got `{s}`",
             .{ name, path, line },
@@ -2581,7 +2581,7 @@ const maturity_grade_prefix = "**Grade:** ";
 /// card line is how the repository-level tables this repo retired went stale.
 fn maturityLine(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8) ?[]const u8 {
     const needle = "\n" ++ prefix;
-    const at = std.mem.indexOf(u8, src, needle) orelse {
+    const at = std.mem.find(u8, src, needle) orelse {
         std.log.err("module '{s}': {s} has no `{s}` line in its `## Maturity` card (see modules/_template/SPEC.md)", .{ name, path, prefix });
         return null;
     };
@@ -2592,7 +2592,7 @@ fn maturityLine(name: []const u8, path: []const u8, src: []const u8, comptime pr
 /// Errors (a doubled line) are reported through `bad`.
 fn maturityLineOpt(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8, bad: *bool) ?[]const u8 {
     const needle = "\n" ++ prefix;
-    const at = std.mem.indexOf(u8, src, needle) orelse return null;
+    const at = std.mem.find(u8, src, needle) orelse return null;
     return maturityLineAt(name, path, src, prefix, at) orelse {
         bad.* = true;
         return null;
@@ -2601,12 +2601,12 @@ fn maturityLineOpt(name: []const u8, path: []const u8, src: []const u8, comptime
 
 fn maturityLineAt(name: []const u8, path: []const u8, src: []const u8, comptime prefix: []const u8, at: usize) ?[]const u8 {
     const needle = "\n" ++ prefix;
-    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+    if (std.mem.findPos(u8, src, at + needle.len, needle) != null) {
         std.log.err("module '{s}': {s} states `{s}` twice", .{ name, path, prefix });
         return null;
     }
     const rest = src[at + needle.len ..];
-    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
     return std.mem.trim(u8, rest[0..end], " \t\r");
 }
 
@@ -2634,7 +2634,7 @@ fn parseDay(v: []const u8) ?i64 {
 
 /// The date right after `marker` in `s` (e.g. `(measured 2026-10-07)`), in days.
 fn dayAfter(s: []const u8, comptime marker: []const u8) ?i64 {
-    const at = std.mem.indexOf(u8, s, marker) orelse return null;
+    const at = std.mem.find(u8, s, marker) orelse return null;
     const rest = s[at + marker.len ..];
     if (rest.len < 10) return null;
     return parseDay(rest[0..10]);
@@ -2709,9 +2709,9 @@ fn parseHardening(v: []const u8) ?Hardening {
 /// end, because the card records the WORST workload, never an average that
 /// hides a loss.
 fn parseRatio(s: []const u8) ?f64 {
-    const end = std.mem.indexOf(u8, s, "×") orelse return null;
+    const end = std.mem.find(u8, s, "×") orelse return null;
     var num = std.mem.trim(u8, s[0..end], " ");
-    if (std.mem.indexOf(u8, num, "–")) |dash| num = num[dash + "–".len ..];
+    if (std.mem.find(u8, num, "–")) |dash| num = num[dash + "–".len ..];
     return std.fmt.parseFloat(f64, num) catch null;
 }
 
@@ -2728,7 +2728,7 @@ fn parsePerf(name: []const u8, path: []const u8, line: []const u8) ?Perf {
         return null;
     };
     var fastest: ?f64 = null;
-    if (std.mem.indexOf(u8, line, " · fastest ")) |at| {
+    if (std.mem.find(u8, line, " · fastest ")) |at| {
         const rest = line[at + " · fastest ".len ..];
         if (std.mem.startsWith(u8, rest, "ref")) {
             fastest = ref;
@@ -2752,7 +2752,7 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
         std.log.err("module '{s}': cannot read {s} for its maturity card", .{ name, path });
         return null;
     };
-    if (std.mem.indexOf(u8, src, maturity_heading) == null) {
+    if (std.mem.find(u8, src, maturity_heading) == null) {
         std.log.err("module '{s}': {s} has no `## Maturity` card (see modules/_template/SPEC.md)", .{ name, path });
         return null;
     }
@@ -2773,7 +2773,7 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
                 };
                 // The verdict is only as good as the list it was measured
                 // against; a reader must be able to see who "the competition" was.
-                if (std.mem.indexOf(u8, src, "\n## Compared with\n") == null) {
+                if (std.mem.find(u8, src, "\n## Compared with\n") == null) {
                     std.log.err("module '{s}': {s} has a surveyed `**Scope:**` but no `## Compared with` section naming what it was surveyed against", .{ name, path });
                     return null;
                 }
@@ -2833,7 +2833,7 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
     }
     const review = parseAuditMark(review_part["review ".len..]);
     const mutation_rest = mutation_part["mutation ".len..];
-    const mutation_v = mutation_rest[0 .. std.mem.indexOfScalar(u8, mutation_rest, ' ') orelse mutation_rest.len];
+    const mutation_v = mutation_rest[0 .. std.mem.findScalar(u8, mutation_rest, ' ') orelse mutation_rest.len];
     const mutation = parseAuditMark(mutation_v);
     var mutation_score: ?MutationScore = null;
     const score_text = std.mem.trim(u8, mutation_rest[mutation_v.len..], " ");
@@ -2841,8 +2841,8 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
         // `(39/42, 3 eq)` or `(11/11)`
         if (score_text[0] != '(' or score_text[score_text.len - 1] != ')') break :score;
         const inner = score_text[1 .. score_text.len - 1];
-        const slash = std.mem.indexOfScalar(u8, inner, '/') orelse break :score;
-        const comma = std.mem.indexOf(u8, inner, ", ");
+        const slash = std.mem.findScalar(u8, inner, '/') orelse break :score;
+        const comma = std.mem.find(u8, inner, ", ");
         const killed = std.fmt.parseInt(u32, inner[0..slash], 10) catch break :score;
         const total = std.fmt.parseInt(u32, inner[slash + 1 .. comma orelse inner.len], 10) catch break :score;
         var eq: u32 = 0;
@@ -2869,7 +2869,7 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
 
     const hard_line = maturityLine(name, path, src, "**Hardening:** ") orelse return null;
     const hard_usage = "expected `fuzz <YYYY-MM-DD [(…)]|?|none|n/a — why> · ct <YYYY-MM-DD [(…)]|?|none|n/a — why>`";
-    const ct_at = std.mem.indexOf(u8, hard_line, " · ct ");
+    const ct_at = std.mem.find(u8, hard_line, " · ct ");
     if (!std.mem.startsWith(u8, hard_line, "fuzz ") or ct_at == null) {
         std.log.err("module '{s}': {s} `**Hardening:** {s}` -- {s}", .{ name, path, hard_line, hard_usage });
         return null;
@@ -3038,7 +3038,7 @@ fn maturityGrade(b: *Build, m: Maturity, today: i64) ?MaturityGrade {
         };
     } else {
         const oracle = m.anchor.oracle;
-        const word_end = std.mem.indexOfAny(u8, oracle, " \t(") orelse oracle.len;
+        const word_end = std.mem.findAny(u8, oracle, " \t(") orelse oracle.len;
         const word = oracle[0..word_end];
         axes[1] = if (std.mem.eql(u8, word, "EXTERNAL"))
             (if (m.live_oracle)
@@ -3157,8 +3157,8 @@ fn maturityGrade(b: *Build, m: Maturity, today: i64) ?MaturityGrade {
 /// `m.src` with its `**Grade:**` line replaced by `line`.
 fn withGradeLine(b: *Build, src: []const u8, line: []const u8) []const u8 {
     const needle = "\n" ++ maturity_grade_prefix;
-    const at = std.mem.indexOf(u8, src, needle).? + 1;
-    const end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+    const at = std.mem.find(u8, src, needle).? + 1;
+    const end = std.mem.findScalarPos(u8, src, at, '\n') orelse src.len;
     return std.mem.concat(b.allocator, u8, &.{ src[0..at], line, src[end..] }) catch @panic("OOM");
 }
 
@@ -3205,7 +3205,7 @@ fn checkAnchors(b: *Build, io: std.Io, failed: *bool) !void {
             failed.* = true;
             continue;
         };
-        if (std.mem.indexOfScalar(u8, "ABCD", grade.class) == null) {
+        if (std.mem.findScalar(u8, "ABCD", grade.class) == null) {
             std.log.err(
                 "module '{s}': anchor class '{c}' is not one of A/B/C/D ({s})",
                 .{ m.name, grade.class, grade.path },
@@ -3320,7 +3320,7 @@ fn copyleftSelfDeclaration(src: []const u8) ?[]const u8 {
     var scan: usize = 0;
     while (std.ascii.findIgnoreCasePos(src, scan, spdx)) |at| {
         const rest = src[at..];
-        const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
         const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
         scan = at + line_end;
         if (containsAnyIgnoreCase(line, &copyleft_ids)) return line;
@@ -3442,13 +3442,13 @@ fn scanShippedForCopyleft(b: *Build, io: std.Io, dir_path: []const u8, depth: u8
 /// required for the same reason `moduleFuzzExemption`'s evidence is: a bare
 /// verdict is not a judgement.
 fn checkCopyleftDeclaration(name: []const u8, path: []const u8, notice: []const u8, failed: *bool) void {
-    const first_line = notice[0 .. std.mem.indexOfScalar(u8, notice, '\n') orelse notice.len];
-    if (std.mem.indexOf(u8, first_line, "third-party attribution") == null) return;
+    const first_line = notice[0 .. std.mem.findScalar(u8, notice, '\n') orelse notice.len];
+    if (std.mem.find(u8, first_line, "third-party attribution") == null) return;
     if (!containsAnyIgnoreCase(notice, &copyleft_ids) and
         std.ascii.findIgnoreCase(notice, "copyleft") == null) return;
 
     const needle = "**Copyleft:** ";
-    const at = std.mem.indexOf(u8, notice, needle) orelse {
+    const at = std.mem.find(u8, notice, needle) orelse {
         std.log.err(
             "{s} is a third-party attribution file and names a copyleft licence, but does not say " ++
                 "what the relationship is. Add one line: `**Copyleft:** NONE-SHIPPED — <why nothing " ++
@@ -3458,16 +3458,16 @@ fn checkCopyleftDeclaration(name: []const u8, path: []const u8, notice: []const 
         failed.* = true;
         return;
     };
-    if (std.mem.indexOfPos(u8, notice, at + needle.len, needle) != null) {
+    if (std.mem.findPos(u8, notice, at + needle.len, needle) != null) {
         std.log.err("module '{s}': {s} states a copyleft relationship twice", .{ name, path });
         failed.* = true;
         return;
     }
 
     const rest = notice[at + needle.len ..];
-    const line = std.mem.trim(u8, rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len], " \t\r");
+    const line = std.mem.trim(u8, rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len], " \t\r");
     const dash = " — ";
-    const cut = std.mem.indexOf(u8, line, dash) orelse {
+    const cut = std.mem.find(u8, line, dash) orelse {
         std.log.err(
             "{s}: `{s}{s}` states a verdict with no argument — the line must read " ++
                 "`**Copyleft:** <RELATION> — <argument>`",
@@ -3660,7 +3660,7 @@ const StringLiteralIterator = struct {
     i: usize = 0,
 
     fn skipLine(self: *StringLiteralIterator) void {
-        self.i = std.mem.indexOfScalarPos(u8, self.src, self.i, '\n') orelse self.src.len;
+        self.i = std.mem.findScalarPos(u8, self.src, self.i, '\n') orelse self.src.len;
     }
 
     fn next(self: *StringLiteralIterator) ?[]const u8 {
@@ -3773,12 +3773,12 @@ fn purityFinding(src: []const u8) ?PurityFinding {
     // walks nearly byte by byte -- and the build runner is compiled in Debug,
     // where that is not optimised away. `execv` covers every exec marker here
     // and costs what the long needle costs.
-    if (std.mem.indexOf(u8, src, "process.") == null and
-        std.mem.indexOf(u8, src, "execv") == null) return null;
+    if (std.mem.find(u8, src, "process.") == null and
+        std.mem.find(u8, src, "execv") == null) return null;
 
     var spawns = false;
     for (process_spawn_markers) |marker| {
-        if (std.mem.indexOf(u8, src, marker) != null) {
+        if (std.mem.find(u8, src, marker) != null) {
             spawns = true;
             break;
         }
@@ -3787,7 +3787,7 @@ fn purityFinding(src: []const u8) ?PurityFinding {
 
     var it: StringLiteralIterator = .{ .src = src };
     while (it.next()) |lit| {
-        const base = if (std.mem.lastIndexOfScalar(u8, lit, '/')) |s| lit[s + 1 ..] else lit;
+        const base = if (std.mem.findScalarLast(u8, lit, '/')) |s| lit[s + 1 ..] else lit;
         if (containsName(&foreign_toolchains, base)) {
             return .{ .kind = .toolchain, .evidence = lit };
         }
@@ -3795,9 +3795,9 @@ fn purityFinding(src: []const u8) ?PurityFinding {
 
     const needle = "@embedFile(\"";
     var scan: usize = 0;
-    while (std.mem.indexOfPos(u8, src, scan, needle)) |at| {
+    while (std.mem.findPos(u8, src, scan, needle)) |at| {
         const rest = src[at + needle.len ..];
-        const end = std.mem.indexOfScalar(u8, rest, '"') orelse break;
+        const end = std.mem.findScalar(u8, rest, '"') orelse break;
         const path = rest[0..end];
         scan = at + needle.len + end;
         for (foreign_source_exts) |ext| {
@@ -3848,20 +3848,20 @@ fn modulePurityDebt(b: *Build, io: std.Io, name: []const u8, failed: *bool) ?Pur
     const needle = "**Foreign toolchain:** ";
     var path = b.fmt("modules/{s}/SPEC.md", .{name});
     var src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch "";
-    if (std.mem.indexOf(u8, src, needle) == null) {
+    if (std.mem.find(u8, src, needle) == null) {
         path = b.fmt("modules/{s}/README.md", .{name});
         src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch return null;
     }
 
-    const at = std.mem.indexOf(u8, src, needle) orelse return null;
-    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+    const at = std.mem.find(u8, src, needle) orelse return null;
+    if (std.mem.findPos(u8, src, at + needle.len, needle) != null) {
         std.log.err("module '{s}': {s} states a foreign-toolchain debt twice", .{ name, path });
         failed.* = true;
         return null;
     }
 
     const rest = src[at + needle.len ..];
-    const line = std.mem.trim(u8, rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len], " \t\r");
+    const line = std.mem.trim(u8, rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len], " \t\r");
 
     const relation = "MIGRATION-OWED via ";
     if (!std.mem.startsWith(u8, line, relation)) {
@@ -3876,7 +3876,7 @@ fn modulePurityDebt(b: *Build, io: std.Io, name: []const u8, failed: *bool) ?Pur
     }
     const after = line[relation.len..];
     const dash = " — ";
-    const cut = std.mem.indexOf(u8, after, dash) orelse {
+    const cut = std.mem.find(u8, after, dash) orelse {
         std.log.err(
             "{s}: `{s}{s}` states a debt with no argument — the line must read " ++
                 "`{s}MIGRATION-OWED via `<path>` — <argument>`, and a bare verdict is not a judgement",
@@ -4091,27 +4091,27 @@ fn moduleFuzzExemption(b: *Build, io: std.Io, name: []const u8, failed: *bool) ?
     };
     const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(4 * 1024 * 1024)) catch return null;
 
-    const at = std.mem.indexOf(u8, src, needle) orelse return null;
-    if (std.mem.indexOfPos(u8, src, at + needle.len, needle) != null) {
+    const at = std.mem.find(u8, src, needle) orelse return null;
+    if (std.mem.findPos(u8, src, at + needle.len, needle) != null) {
         std.log.err("module '{s}': {s} states a fuzz exemption twice", .{ name, path });
         failed.* = true;
         return null;
     }
 
     const rest = src[at + needle.len ..];
-    const line_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    const line_end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
     const line = std.mem.trim(u8, rest[0..line_end], " \t\r");
 
     var reason = line;
     var sibling: []const u8 = "";
     const via = " via ";
-    if (std.mem.indexOf(u8, line, via)) |v| {
+    if (std.mem.find(u8, line, via)) |v| {
         reason = std.mem.trim(u8, line[0..v], " \t");
         sibling = std.mem.trim(u8, line[v + via.len ..], " \t`");
     }
 
     const after = rest[line_end..];
-    const stop = std.mem.indexOf(u8, after, "\n## ") orelse after.len;
+    const stop = std.mem.find(u8, after, "\n## ") orelse after.len;
     return .{
         .reason = reason,
         .sibling = sibling,
@@ -4293,13 +4293,13 @@ fn parsePortableBaseline(
         line_no += 1;
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-        const tab1 = std.mem.indexOfScalar(u8, line, '\t') orelse {
+        const tab1 = std.mem.findScalar(u8, line, '\t') orelse {
             std.log.err("{s}:{d}: expected `<module>\\t<target>\\t<reason>`, no tab found: {s}", .{ portable_baseline_path, line_no, line });
             failed.* = true;
             continue;
         };
         const after1 = line[tab1 + 1 ..];
-        const tab2 = std.mem.indexOfScalar(u8, after1, '\t') orelse {
+        const tab2 = std.mem.findScalar(u8, after1, '\t') orelse {
             std.log.err(
                 "{s}:{d}: expected `<module>\\t<target>\\t<reason>`, only one tab found: {s}",
                 .{ portable_baseline_path, line_no, line },
@@ -4378,12 +4378,12 @@ fn parsePortableBaseline(
 /// itself.
 fn findModuleErrorBlock(b: *Build, text: []const u8, module: []const u8, target: PortableTarget) ?[]const u8 {
     const marker = b.fmt("--name portable-{s}-{s} ", .{ module, target.label() });
-    const marker_idx = std.mem.indexOf(u8, text, marker) orelse return null;
-    const start: usize = if (std.mem.lastIndexOf(u8, text[0..marker_idx], "failed command:")) |prev|
-        (std.mem.indexOfScalarPos(u8, text, prev, '\n') orelse prev) + 1
+    const marker_idx = std.mem.find(u8, text, marker) orelse return null;
+    const start: usize = if (std.mem.findLast(u8, text[0..marker_idx], "failed command:")) |prev|
+        (std.mem.findScalarPos(u8, text, prev, '\n') orelse prev) + 1
     else
         0;
-    const end = std.mem.indexOfScalarPos(u8, text, marker_idx, '\n') orelse text.len;
+    const end = std.mem.findScalarPos(u8, text, marker_idx, '\n') orelse text.len;
     if (start >= end) return null;
     return text[start..end];
 }
@@ -4539,7 +4539,7 @@ const PortableBaselineStep = struct {
             const prefix = "portable-";
             if (!std.mem.startsWith(u8, raw_line, prefix)) continue;
             const rest = raw_line[prefix.len..];
-            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+            const sp = std.mem.findScalar(u8, rest, ' ') orelse continue;
             const tail = rest[0..sp];
             const pair = parsePortableStepTail(tail) orelse continue;
             const suffix = std.mem.trim(u8, rest[sp + 1 ..], " \r");
@@ -4715,11 +4715,11 @@ const PortableTableStep = struct {
             return step.fail("{s}: cannot read {s}", .{ verb, readme_path });
         };
 
-        const content_start = (std.mem.indexOf(u8, readme, portable_table_begin_marker) orelse {
+        const content_start = (std.mem.find(u8, readme, portable_table_begin_marker) orelse {
             std.log.err("{s}: {s} has no `{s}` marker", .{ verb, readme_path, portable_table_begin_marker });
             return step.fail("{s}: begin marker missing from {s}", .{ verb, readme_path });
         }) + portable_table_begin_marker.len;
-        const end_idx = std.mem.indexOfPos(u8, readme, content_start, portable_table_end_marker) orelse {
+        const end_idx = std.mem.findPos(u8, readme, content_start, portable_table_end_marker) orelse {
             std.log.err("{s}: {s} has a begin marker but no matching `{s}` after it", .{ verb, readme_path, portable_table_end_marker });
             return step.fail("{s}: end marker missing from {s}", .{ verb, readme_path });
         };
@@ -4999,7 +4999,7 @@ fn isTopLevelTestDecl(line: []const u8) bool {
 /// The text after `global-alloc-ok:` on a line, trimmed. Empty when the
 /// marker is not present.
 fn globalAllocMarkerReason(line: []const u8) []const u8 {
-    const at = std.mem.indexOf(u8, line, global_alloc_marker) orelse return "";
+    const at = std.mem.find(u8, line, global_alloc_marker) orelse return "";
     return std.mem.trim(u8, line[at + global_alloc_marker.len ..], " \t\r");
 }
 
@@ -5051,7 +5051,7 @@ fn checkGlobalAlloc(step: *Step, options: MakeOptions) anyerror!void {
 
                 var matched: ?[]const u8 = null;
                 for (global_alloc_needles) |needle| {
-                    if (std.mem.indexOf(u8, line, needle) != null) {
+                    if (std.mem.find(u8, line, needle) != null) {
                         matched = needle;
                         break;
                     }
@@ -5241,7 +5241,7 @@ fn countFuzzCalls(src: []const u8) usize {
     const needle = ".fuzz(";
     var n: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+    while (std.mem.findPos(u8, src, i, needle)) |at| {
         i = at + 1;
         if (at == 0) continue;
         const before = src[at - 1];
@@ -5273,10 +5273,10 @@ fn countFuzzCalls(src: []const u8) usize {
 /// obligate a module.
 fn fileHasByteAcceptingPubFn(src: []const u8) bool {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "pub fn ")) |at| {
+    while (std.mem.findPos(u8, src, i, "pub fn ")) |at| {
         i = at + 7;
         if (isInsideLineComment(src, at)) continue;
-        const open = std.mem.indexOfScalarPos(u8, src, i, '(') orelse break;
+        const open = std.mem.findScalarPos(u8, src, i, '(') orelse break;
         // Anything but an identifier between `pub fn ` and `(` means this is
         // not a plain function header.
         var depth: usize = 1;
@@ -5289,8 +5289,8 @@ fn fileHasByteAcceptingPubFn(src: []const u8) bool {
             }
         }
         const params = src[open + 1 .. if (j > 0) j - 1 else 0];
-        if (std.mem.indexOf(u8, params, "[]const u8") != null or
-            std.mem.indexOf(u8, params, "Reader") != null) return true;
+        if (std.mem.find(u8, params, "[]const u8") != null or
+            std.mem.find(u8, params, "Reader") != null) return true;
         i = j;
     }
     return false;
@@ -5299,7 +5299,7 @@ fn fileHasByteAcceptingPubFn(src: []const u8) bool {
 /// Is byte `at` preceded on its own line by a `//` that is not inside a string
 /// literal? Cheap, and only ever consulted for a `pub fn ` occurrence.
 fn isInsideLineComment(src: []const u8, at: usize) bool {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, src[0..at], '\n')) |nl| nl + 1 else 0;
     var in_str = false;
     var k = line_start;
     while (k + 1 < at) : (k += 1) {
@@ -5317,16 +5317,16 @@ fn isInsideLineComment(src: []const u8, at: usize) bool {
 /// at least one line of text), or to the next `## ` heading. Null if the README
 /// has no marker at all -- that case is already reported separately.
 fn provenanceStatement(readme: []const u8) ?[]const u8 {
-    const start = std.mem.indexOf(u8, readme, "Provenance:") orelse
-        std.mem.indexOf(u8, readme, "## Provenance") orelse return null;
+    const start = std.mem.find(u8, readme, "Provenance:") orelse
+        std.mem.find(u8, readme, "## Provenance") orelse return null;
     const rest = readme[start..];
     // A `## Provenance` SECTION runs to the next heading; an inline
     // `Provenance:` line runs to the end of its paragraph.
     if (std.mem.startsWith(u8, rest, "## ")) {
-        const next = std.mem.indexOfPos(u8, rest, 3, "\n## ") orelse return rest;
+        const next = std.mem.findPos(u8, rest, 3, "\n## ") orelse return rest;
         return rest[0..next];
     }
-    const para_end = std.mem.indexOf(u8, rest, "\n\n") orelse return rest;
+    const para_end = std.mem.find(u8, rest, "\n\n") orelse return rest;
     return rest[0..para_end];
 }
 
@@ -5403,13 +5403,13 @@ fn fileExists(b: *Build, io: std.Io, path: []const u8) bool {
 /// so the exemptions cannot quietly outlive their reason either.
 fn checkNonGoals(readme: []const u8, b: *Build, failed: *bool) void {
     const heading = "## Non-goals";
-    const start = std.mem.indexOf(u8, readme, heading) orelse {
+    const start = std.mem.find(u8, readme, heading) orelse {
         std.log.err("README has no \"{s}\" section for the non-goals gate to check", .{heading});
         failed.* = true;
         return;
     };
     const body_start = start + heading.len;
-    const end = if (std.mem.indexOf(u8, readme[body_start..], "\n## ")) |i|
+    const end = if (std.mem.find(u8, readme[body_start..], "\n## ")) |i|
         body_start + i
     else
         readme.len;
@@ -5472,18 +5472,18 @@ fn mentionsName(haystack: []const u8, name: []const u8) bool {
 /// inside the marker cannot stand in for a mention in the prose.
 fn lineWithoutMarker(line: []const u8, b: *Build) []const u8 {
     const marker = "<!-- non-goal-ok:";
-    const idx = std.mem.indexOf(u8, line, marker) orelse return line;
+    const idx = std.mem.find(u8, line, marker) orelse return line;
     const tail = line[idx..];
-    const close = std.mem.indexOf(u8, tail, "-->") orelse return line[0..idx];
+    const close = std.mem.find(u8, tail, "-->") orelse return line[0..idx];
     return std.mem.concat(b.allocator, u8, &.{ line[0..idx], tail[close + 3 ..] }) catch @panic("OOM");
 }
 
 /// The names listed in a line's `<!-- non-goal-ok: a, b -->` marker, or empty.
 fn nonGoalExemptions(line: []const u8, b: *Build) []const []const u8 {
     const marker = "<!-- non-goal-ok:";
-    const idx = std.mem.indexOf(u8, line, marker) orelse return &.{};
+    const idx = std.mem.find(u8, line, marker) orelse return &.{};
     const after = line[idx + marker.len ..];
-    const close = std.mem.indexOf(u8, after, "-->") orelse after.len;
+    const close = std.mem.find(u8, after, "-->") orelse after.len;
 
     var out: std.ArrayList([]const u8) = .empty;
     var toks = std.mem.splitScalar(u8, after[0..close], ',');
@@ -5496,9 +5496,9 @@ fn nonGoalExemptions(line: []const u8, b: *Build) []const []const u8 {
 
 fn nonGoalExempt(line: []const u8, name: []const u8) bool {
     const marker = "<!-- non-goal-ok:";
-    const idx = std.mem.indexOf(u8, line, marker) orelse return false;
+    const idx = std.mem.find(u8, line, marker) orelse return false;
     const after = line[idx + marker.len ..];
-    const close = std.mem.indexOf(u8, after, "-->") orelse after.len;
+    const close = std.mem.find(u8, after, "-->") orelse after.len;
     var toks = std.mem.splitScalar(u8, after[0..close], ',');
     while (toks.next()) |tok| {
         if (std.mem.eql(u8, std.mem.trim(u8, tok, " \t"), name)) return true;
@@ -5524,12 +5524,12 @@ fn catalogRowNeedle(b: *Build, name: []const u8) []const u8 {
 }
 
 fn readmeDepsCell(readme: []const u8, name: []const u8, b: *Build) ?[]const []const u8 {
-    const start = std.mem.indexOf(u8, readme, catalogRowNeedle(b, name)) orelse return null;
-    const line_end = std.mem.indexOfScalarPos(u8, readme, start, '\n') orelse readme.len;
+    const start = std.mem.find(u8, readme, catalogRowNeedle(b, name)) orelse return null;
+    const line_end = std.mem.findScalarPos(u8, readme, start, '\n') orelse readme.len;
     const line = std.mem.trimEnd(u8, readme[start..line_end], " \t\r");
     if (!std.mem.endsWith(u8, line, "|")) return null;
     const body = line[0 .. line.len - 1];
-    const last_pipe = std.mem.lastIndexOfScalar(u8, body, '|') orelse return null;
+    const last_pipe = std.mem.findScalarLast(u8, body, '|') orelse return null;
     const cell = std.mem.trim(u8, body[last_pipe + 1 ..], " \t");
     if (cell.len == 0 or std.mem.eql(u8, cell, "—") or std.mem.eql(u8, cell, "-")) {
         return &.{};
@@ -5556,7 +5556,7 @@ fn readmeDepsCell(readme: []const u8, name: []const u8, b: *Build) ?[]const []co
 /// sibling-module-name strings, with any `std.*` usage noted in a trailing
 /// `//` comment rather than inside the tuple itself (see CONVENTIONS.md and
 /// most modules for the pattern) -- a narrow, well-known shape to locate
-/// with `mem.indexOf` + quote-scanning, unlike a general `@import` scan
+/// with `std.mem.find` + quote-scanning, unlike a general `@import` scan
 /// (see the authoritative-source note above `check-catalog`'s definition
 /// in `build()`, and CONVENTIONS.md, for why that stays out of the gate).
 /// `zig build gen-meta-deps` — render every module's `meta.deps` from
@@ -5584,12 +5584,12 @@ fn genMetaDeps(step: *Step, options: MakeOptions) anyerror!void {
         const path = b.fmt("modules/{s}/src/root.zig", .{m.name});
         const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(2 * 1024 * 1024)) catch continue;
 
-        const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse continue;
-        const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
-        const deps_idx = std.mem.indexOfPos(u8, src, meta_idx, ".deps = .{") orelse continue;
+        const meta_idx = std.mem.find(u8, src, "pub const meta") orelse continue;
+        const meta_end = std.mem.findPos(u8, src, meta_idx, "\n};") orelse src.len;
+        const deps_idx = std.mem.findPos(u8, src, meta_idx, ".deps = .{") orelse continue;
         if (deps_idx > meta_end) continue;
-        const open = std.mem.indexOfScalarPos(u8, src, deps_idx, '{').?;
-        const close = std.mem.indexOfScalarPos(u8, src, open, '}').?;
+        const open = std.mem.findScalarPos(u8, src, deps_idx, '{').?;
+        const close = std.mem.findScalarPos(u8, src, open, '}').?;
 
         // Spacing follows `zig fmt`, which the repo gates: a one-element tuple
         // is `.{"http"}` and a longer one is `.{ "a", "b" }`. Getting this wrong
@@ -5620,8 +5620,8 @@ fn genMetaDeps(step: *Step, options: MakeOptions) anyerror!void {
 }
 
 fn metaDepsFromRoot(src: []const u8, b: *Build) ?[]const []const u8 {
-    const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse return null;
-    const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
+    const meta_idx = std.mem.find(u8, src, "pub const meta") orelse return null;
+    const meta_end = std.mem.findPos(u8, src, meta_idx, "\n};") orelse src.len;
     const block = src[meta_idx..meta_end];
 
     // Match the compound literal ".deps = .{", not bare ".deps" -- a
@@ -5629,15 +5629,15 @@ fn metaDepsFromRoot(src: []const u8, b: *Build) ?[]const []const u8 {
     // `` `meta.deps = .{}` `` as a design-rationale aside) ahead of the
     // real field, and a bare-".deps" search would land on that prose
     // instead. The compound literal only ever matches the real field.
-    const deps_idx = std.mem.indexOf(u8, block, ".deps = .{") orelse return null;
-    const open = std.mem.indexOfScalarPos(u8, block, deps_idx, '{') orelse return null;
-    const close = std.mem.indexOfScalarPos(u8, block, open, '}') orelse return null;
+    const deps_idx = std.mem.find(u8, block, ".deps = .{") orelse return null;
+    const open = std.mem.findScalarPos(u8, block, deps_idx, '{') orelse return null;
+    const close = std.mem.findScalarPos(u8, block, open, '}') orelse return null;
     const inner = block[open + 1 .. close];
 
     var out: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, inner, i, '"')) |q1| {
-        const q2 = std.mem.indexOfScalarPos(u8, inner, q1 + 1, '"') orelse break;
+    while (std.mem.findScalarPos(u8, inner, i, '"')) |q1| {
+        const q2 = std.mem.findScalarPos(u8, inner, q1 + 1, '"') orelse break;
         out.append(b.allocator, inner[q1 + 1 .. q2]) catch @panic("OOM");
         i = q2 + 1;
     }

@@ -554,7 +554,7 @@ pub fn writeSignatureFile(
 pub fn formatKeyId(key_number: [key_number_length]u8) [16]u8 {
     const v = std.mem.readInt(u64, &key_number, .little);
     var out: [16]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "{X:0>16}", .{v}) catch unreachable;
+    _ = std.mem.print(&out, "{X:0>16}", .{v}) catch unreachable;
     return out;
 }
 
@@ -1863,7 +1863,7 @@ test "parseSignatureFile: trusted-comment prefix and printability, CRLF line end
 
     // Line 3 must start with "trusted comment: " (the reference refuses the
     // file otherwise).
-    const tc = std.mem.indexOf(u8, real, "\n" ++ trusted_comment_prefix).? + 1; // not the "untrusted …" one
+    const tc = std.mem.find(u8, real, "\n" ++ trusted_comment_prefix).? + 1; // not the "untrusted …" one
     @memcpy(buf[0..real.len], real);
     buf[tc] = 'T';
     try std.testing.expectError(error.MissingTrustedCommentPrefix, parseSignatureFile(buf[0..real.len]));
@@ -1877,8 +1877,8 @@ test "parseSignatureFile: trusted-comment prefix and printability, CRLF line end
     // Line 2 is the base64 of the 74-octet struct: 100 characters ending in
     // ONE '=' (RFC 4648 §4). With the final group made `xA==` it has the right length but encodes 73 octets — not the
     // struct, so not a signature line.
-    const l2 = std.mem.indexOfScalar(u8, real, '\n').? + 1;
-    const l2_end = std.mem.indexOfScalarPos(u8, real, l2, '\n').?;
+    const l2 = std.mem.findScalar(u8, real, '\n').? + 1;
+    const l2_end = std.mem.findScalarPos(u8, real, l2, '\n').?;
     try std.testing.expectEqual(@as(usize, 100), l2_end - l2);
     try std.testing.expectEqual(@as(u8, '='), real[l2_end - 1]);
     @memcpy(buf[0..real.len], real);
@@ -1895,7 +1895,7 @@ test "parsePublicKeyFile / parseSecretKeyFile: comment prefix and every algorith
     const pk = try parsePublicKeyFile(kat.unencrypted_public_key_file);
     const pk_b64 = PublicKeyCodec.encode(pk.key.toBytes());
     var buf: [512]u8 = undefined;
-    const no_prefix = try std.fmt.bufPrint(&buf, "untrusted remark: x\n{s}\n", .{pk_b64});
+    const no_prefix = try std.mem.print(&buf, "untrusted remark: x\n{s}\n", .{pk_b64});
     try std.testing.expectError(error.MissingUntrustedCommentPrefix, parsePublicKeyFile(no_prefix));
 
     var sk: ParsedSecretKey = undefined;

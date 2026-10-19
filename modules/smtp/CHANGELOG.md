@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-17** — The private `src/b64ct.zig` is gone: AUTH PLAIN/LOGIN encode the credential with the new `b64ct` module (`standard.encode`), byte-identical output. No API change.
 - **2026-10-10** — tests: deterministic fuzz driver `SMTP_FUZZ` (`client.zig`, plumbing in `src/fuzz_test.zig`). `smtp-client`: the `Client` against the scripted `FakeServer` over four conversations (plain; STARTTLS + AUTH with `tls = .required`; STARTTLS stripped by the peer; opportunistic without TLS and credentials), one server reply damaged / dropped / re-coded / replaced by garbage / doubled, delivered in random-sized pieces. Undamaged: the message arrives dot-unstuffed, a stripped STARTTLS and plaintext AUTH are refused. Whatever the server says: a typed error or a finished transaction, and neither the AUTH command, the credentials nor (TLS required) MAIL FROM ever reach the wire before the TLS upgrade, or at all if it never came. 200,000-run verdict clean. No code change.

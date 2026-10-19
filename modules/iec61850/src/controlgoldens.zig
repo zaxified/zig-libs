@@ -388,11 +388,11 @@ test "the table still covers every control model and both terminations" {
     var last_appl_errors: usize = 0;
     var third_party: usize = 0;
     for (table) |g| {
-        if (std.mem.indexOf(u8, g.name, "req/Oper/") != null) models += 1;
-        if (std.mem.indexOf(u8, g.name, "SBO") != null and
+        if (std.mem.find(u8, g.name, "req/Oper/") != null) models += 1;
+        if (std.mem.find(u8, g.name, "SBO") != null and
             std.mem.startsWith(u8, g.name, "req/")) selects += 1;
-        if (std.mem.indexOf(u8, g.name, "CommandTermination") != null) terminations += 1;
-        if (std.mem.indexOf(u8, g.name, "LastApplError") != null) last_appl_errors += 1;
+        if (std.mem.find(u8, g.name, "CommandTermination") != null) terminations += 1;
+        if (std.mem.find(u8, g.name, "LastApplError") != null) last_appl_errors += 1;
         if (g.source == .third_party) third_party += 1;
     }
     // direct/normal, sbo/normal, sbo/enhanced (direct/enhanced is pinned by its

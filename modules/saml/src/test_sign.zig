@@ -77,7 +77,7 @@ pub fn signAssertionWithoutIssuer(
 
 /// `<ds:SignedInfo>`'s body common to every mint helper in this file: one
 /// enveloped-signature + exclusive-C14N reference at `#{id}`, digest slot
-/// left as `{s}` for the caller's `std.fmt.allocPrint`.
+/// left as `{s}` for the caller's `Allocator.print`.
 const signed_info_inner =
     "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
     "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
@@ -99,12 +99,12 @@ fn signAssertionMaybeIssuer(
     // The whole `<ds:Signature>` is omitted when the reference digest is taken,
     // so the placeholder never affects it.
     const issuer_xml = if (issuer) |iss|
-        try std.fmt.allocPrint(alloc, "<saml:Issuer>{s}</saml:Issuer>", .{iss})
+        try alloc.print("<saml:Issuer>{s}</saml:Issuer>", .{iss})
     else
         try alloc.dupe(u8, "");
     defer alloc.free(issuer_xml);
 
-    const assembled = try std.fmt.allocPrint(alloc, "<saml:Assertion xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" IssueInstant=\"{s}\">" ++
+    const assembled = try alloc.print("<saml:Assertion xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" IssueInstant=\"{s}\">" ++
         "{s}" ++
         "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++ signed_info_inner ++ "</ds:SignedInfo>" ++
         "<ds:SignatureValue></ds:SignatureValue></ds:Signature>" ++
@@ -134,7 +134,7 @@ pub fn signResponse(
     issuer: []const u8,
     assertion_xml: []const u8,
 ) !Signed {
-    const assembled = try std.fmt.allocPrint(alloc, "<samlp:Response xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
+    const assembled = try alloc.print("<samlp:Response xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
         "IssueInstant=\"{s}\" Destination=\"{s}\" InResponseTo=\"{s}\">" ++
         "<saml:Issuer>{s}</saml:Issuer>" ++
         "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++ signed_info_inner ++ "</ds:SignedInfo>" ++
@@ -194,7 +194,7 @@ fn signAssembled(alloc: std.mem.Allocator, seed: u64, assembled: []const u8) !Si
 
     // Splice the SignatureValue in.
     const empty_sv = "<ds:SignatureValue></ds:SignatureValue>";
-    const filled_sv = try std.fmt.allocPrint(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
+    const filled_sv = try alloc.print("<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
     defer alloc.free(filled_sv);
     const final = try std.mem.replaceOwned(u8, alloc, with_digest, empty_sv, filled_sv);
 
@@ -257,7 +257,7 @@ test "test_sign: minted assertion verifies + extracts through consumeResponseXml
 /// Response itself is unsigned; the assertion carries the signature (the module's
 /// default `.either` policy accepts an assertion-level signature).
 pub fn wrapInResponse(alloc: std.mem.Allocator, assertion_xml: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
+    return alloc.print("<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
         "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_resp_minted\" Version=\"2.0\" " ++
         "IssueInstant=\"2024-06-01T12:00:00Z\" Destination=\"https://sp.example.org/acs\" " ++
         "InResponseTo=\"req-9988776655\"><saml:Issuer>https://idp.example.org/saml</saml:Issuer>" ++

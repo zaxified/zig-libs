@@ -46,9 +46,9 @@ pub const Handle = struct {
     /// `devlink` CLI behavior, not just self-consistency — see `SPEC.md`
     /// §2.1's "anchored against the real CLI" table.
     pub fn parse(s: []const u8) error{InvalidHandle}!Handle {
-        const slash = std.mem.indexOfScalar(u8, s, '/') orelse return error.InvalidHandle;
+        const slash = std.mem.findScalar(u8, s, '/') orelse return error.InvalidHandle;
         const h: Handle = .{ .bus = s[0..slash], .dev = s[slash + 1 ..] };
-        if (std.mem.indexOfScalar(u8, h.dev, '/') != null) return error.InvalidHandle;
+        if (std.mem.findScalar(u8, h.dev, '/') != null) return error.InvalidHandle;
         h.validate() catch return error.InvalidHandle;
         return h;
     }
@@ -58,8 +58,8 @@ pub const Handle = struct {
     pub fn validate(h: Handle) error{InvalidRequest}!void {
         if (h.bus.len == 0 or h.bus.len > uapi.bus_name_max) return error.InvalidRequest;
         if (h.dev.len == 0 or h.dev.len > uapi.dev_name_max) return error.InvalidRequest;
-        if (std.mem.indexOfScalar(u8, h.bus, 0) != null) return error.InvalidRequest;
-        if (std.mem.indexOfScalar(u8, h.dev, 0) != null) return error.InvalidRequest;
+        if (std.mem.findScalar(u8, h.bus, 0) != null) return error.InvalidRequest;
+        if (std.mem.findScalar(u8, h.dev, 0) != null) return error.InvalidRequest;
     }
 
     pub fn eql(a: Handle, b: Handle) bool {
@@ -76,7 +76,7 @@ pub const PortHandle = struct {
     /// borrow `s`. Anchored against the real CLI — see `Handle.parse`'s doc
     /// comment and `SPEC.md` §2.1.
     pub fn parse(s: []const u8) error{InvalidHandle}!PortHandle {
-        const last = std.mem.lastIndexOfScalar(u8, s, '/') orelse return error.InvalidHandle;
+        const last = std.mem.findScalarLast(u8, s, '/') orelse return error.InvalidHandle;
         const h = try Handle.parse(s[0..last]);
         const idx = std.fmt.parseInt(u32, s[last + 1 ..], 10) catch return error.InvalidHandle;
         return .{ .handle = h, .index = idx };
@@ -276,7 +276,7 @@ test "Owned formats as the CLI's bus/dev" {
     defer list.deinit(gpa);
     try append(gpa, &list, .pci("0000:65:00.0"));
     const o = try parse(list.items);
-    const s = try std.fmt.allocPrint(gpa, "{f}", .{o});
+    const s = try gpa.print("{f}", .{o});
     defer gpa.free(s);
     try testing.expectEqualStrings("pci/0000:65:00.0", s);
 }

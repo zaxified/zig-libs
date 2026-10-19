@@ -82,7 +82,7 @@ fn run(comptime fam: Family, text: []const u8) !void {
             }
             c.acceptable += 1;
             if (fam == .pkcs1v15 and std.mem.eql(u8, flags, "MissingNull")) break :blk .reject;
-            if (fam == .oaep and std.mem.indexOf(u8, flags, "SmallIntegerCiphertext") != null) break :blk .accept;
+            if (fam == .oaep and std.mem.find(u8, flags, "SmallIntegerCiphertext") != null) break :blk .accept;
             return fail(fam, tc, "unmapped acceptable flags {s}", .{flags});
         };
         const got_ok = switch (fam) {

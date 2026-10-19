@@ -110,7 +110,7 @@ pub fn consumeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     var n: usize = genuine.len;
 
     const mode = script.ranged(0, 3);
-    const assertion_at = std.mem.indexOf(u8, genuine, "<saml:Assertion").?;
+    const assertion_at = std.mem.find(u8, genuine, "<saml:Assertion").?;
     switch (mode) {
         0 => {},
         1, 2 => {

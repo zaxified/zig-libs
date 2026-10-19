@@ -116,7 +116,7 @@ fn checkApplyHeaderBytesExhausted() !void {
     var exhausted = false;
     var i: usize = 0;
     while (i < 30) : (i += 1) {
-        const name = std.fmt.bufPrint(&name_buf, "X-Filler-{d}", .{i}) catch break;
+        const name = std.mem.print(&name_buf, "X-Filler-{d}", .{i}) catch break;
         rw.setHeader(name, filler_value) catch |err| switch (err) {
             error.HeaderBytesExhausted => {
                 exhausted = true;
@@ -174,14 +174,14 @@ fn runCurl(io: std.Io, argv: []const []const u8, out_buf: []u8) ![]const u8 {
 }
 
 fn headerPresent(headers: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, headers, needle) != null;
+    return std.mem.find(u8, headers, needle) != null;
 }
 
 /// Extract one header's value from a raw `curl -D-` dump ("Name: value\r\n").
 fn headerValue(headers: []const u8, comptime name: []const u8) ?[]const u8 {
     const needle = "\r\n" ++ name ++ ": ";
-    const start = (std.mem.indexOf(u8, headers, needle) orelse return null) + needle.len;
-    const end = std.mem.indexOfPos(u8, headers, start, "\r\n") orelse return null;
+    const start = (std.mem.find(u8, headers, needle) orelse return null) + needle.len;
+    const end = std.mem.findPos(u8, headers, start, "\r\n") orelse return null;
     return headers[start..end];
 }
 
@@ -267,7 +267,7 @@ fn runFullConfigChecks(io: std.Io, gpa: std.mem.Allocator) !void {
     }
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/api", .{port});
     var curl_buf: [4096]u8 = undefined;
     const out = try runCurl(io, &.{ "curl", "-sS", "-D-", "-o", "/dev/null", url }, &curl_buf);
 
@@ -324,7 +324,7 @@ fn runAllDisabledConfigCheck(io: std.Io, gpa: std.mem.Allocator) !void {
     }
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/api", .{port});
     var curl_buf: [2048]u8 = undefined;
     const out = try runCurl(io, &.{ "curl", "-sS", "-D-", "-o", "/dev/null", url }, &curl_buf);
 

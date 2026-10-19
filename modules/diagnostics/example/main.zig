@@ -74,7 +74,7 @@ pub fn main() !void {
             // real caller wants OOM handled by name here rather than folded
             // into a generic error return, since it means "stop validating
             // and surface a degraded result" rather than "this field is bad".
-            const msg = std.fmt.allocPrint(arena, "unknown key '{s}'", .{f.key}) catch |err| switch (err) {
+            const msg = arena.print("unknown key '{s}'", .{f.key}) catch |err| switch (err) {
                 error.OutOfMemory => {
                     std.debug.print("out of memory formatting a diagnostic message\n", .{});
                     return err;
@@ -90,7 +90,7 @@ pub fn main() !void {
                 .severity = .warning,
                 .code = "config.unknown_key",
                 .message = msg,
-                .suggest = if (closestKnownKey(f.key)) |k| try std.fmt.allocPrint(arena, "did you mean '{s}'?", .{k}) else null,
+                .suggest = if (closestKnownKey(f.key)) |k| try arena.print("did you mean '{s}'?", .{k}) else null,
             });
             continue;
         }
@@ -121,8 +121,8 @@ pub fn main() !void {
     try diag.render(&out, .{});
     try diag.render(&out, .{ .style = .snippet, .sources = &.{.{ .file = config_name, .text = config_text }} });
     std.debug.print("{s}", .{out.buffered()});
-    must(std.mem.indexOf(u8, out.buffered(), "export.json5:3:3: warning[config.unknown_key]: unknown key 'file_patern_in'") != null, @src());
-    must(std.mem.indexOf(u8, out.buffered(), "3 |   file_patern_in: '*.csv',\n  |   ^^^^^^^^^^^^^^\n") != null, @src());
+    must(std.mem.find(u8, out.buffered(), "export.json5:3:3: warning[config.unknown_key]: unknown key 'file_patern_in'") != null, @src());
+    must(std.mem.find(u8, out.buffered(), "3 |   file_patern_in: '*.csv',\n  |   ^^^^^^^^^^^^^^\n") != null, @src());
 
     // The pre-save guard: only `.@"error"` blocks a save.
     if (diag.countBySeverity(.@"error") > 0) {

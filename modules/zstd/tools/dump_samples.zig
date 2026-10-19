@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         defer g.deinit(gpa);
         const bytes = try samples.serialize(gpa, g);
         defer gpa.free(bytes);
-        const name = try std.fmt.allocPrint(gpa, "{s}.bin", .{set.name});
+        const name = try gpa.print("{s}.bin", .{set.name});
         defer gpa.free(name);
         try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
     }

@@ -1307,7 +1307,7 @@ pub fn build(b: *std.Build) void {
             \\fn isStd(comptime T: type) bool {{
             \\    comptime {{
             \\        const name = @typeName(T);
-            \\        const first = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse return false];
+            \\        const first = name[0 .. std.mem.findScalar(u8, name, '.') orelse return false];
             \\        return @hasDecl(std, first) and !@hasDecl(published, first);
             \\    }}
             \\}}
@@ -2088,34 +2088,34 @@ fn parseMetaTargets(b: *std.Build, io: std.Io, name: []const u8) ParsedTargets {
 /// (`scripts/gates/`), so the steps `build()` creates and the tables the gates
 /// render are derived by one parser.
 pub fn parseMetaTargetsSrc(gpa: std.mem.Allocator, src: []const u8) ParsedTargets {
-    const meta_idx = std.mem.indexOf(u8, src, "pub const meta") orelse
+    const meta_idx = std.mem.find(u8, src, "pub const meta") orelse
         return .{ .err = "has no `pub const meta` block" };
-    const meta_end = std.mem.indexOfPos(u8, src, meta_idx, "\n};") orelse src.len;
+    const meta_end = std.mem.findPos(u8, src, meta_idx, "\n};") orelse src.len;
     const block = src[meta_idx..meta_end];
 
     // Match the compound literal, not bare `.targets` -- a doc comment can
     // say `` `meta.targets = .{.wasm32}` `` in prose ahead of the real field
     // (`metaDepsFromRoot` has the identical guard for `.deps`, for the same
     // reason: a bare-word search would land on the prose instead).
-    const targets_idx = std.mem.indexOf(u8, block, ".targets = .{") orelse
+    const targets_idx = std.mem.find(u8, block, ".targets = .{") orelse
         return .{ .err = "`meta` block has no `.targets = .{...}` field" };
-    const open = std.mem.indexOfScalarPos(u8, block, targets_idx, '{').?;
-    const close = std.mem.indexOfScalarPos(u8, block, open, '}') orelse
+    const open = std.mem.findScalarPos(u8, block, targets_idx, '{').?;
+    const close = std.mem.findScalarPos(u8, block, open, '}') orelse
         return .{ .err = "`.targets` list has no closing `}`" };
     const inner = block[open + 1 .. close];
 
     var out: std.ArrayList(PortableTarget) = .empty;
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, inner, i, '.')) |dot| {
+    while (std.mem.findScalarPos(u8, inner, i, '.')) |dot| {
         var j = dot + 1;
         while (j < inner.len and (std.ascii.isAlphanumeric(inner[j]) or inner[j] == '_')) j += 1;
         const tok = inner[dot + 1 .. j];
         i = j;
         if (tok.len == 0) continue;
         const t = std.meta.stringToEnum(PortableTarget, tok) orelse
-            return .{ .err = std.fmt.allocPrint(gpa, "meta.targets names unknown target `.{s}`", .{tok}) catch @panic("OOM") };
+            return .{ .err = gpa.print("meta.targets names unknown target `.{s}`", .{tok}) catch @panic("OOM") };
         for (out.items) |seen| if (seen == t)
-            return .{ .err = std.fmt.allocPrint(gpa, "meta.targets lists `.{s}` twice", .{tok}) catch @panic("OOM") };
+            return .{ .err = gpa.print("meta.targets lists `.{s}` twice", .{tok}) catch @panic("OOM") };
         out.append(gpa, t) catch @panic("OOM");
     }
     if (out.items.len == 0) return .{ .err = "meta.targets is empty" };

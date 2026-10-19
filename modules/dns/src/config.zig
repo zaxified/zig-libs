@@ -109,7 +109,7 @@ fn atoi(text: []const u8) u32 {
 /// Parse an IP literal, tolerating a `%zone` suffix (dropped — routing scope
 /// is out of scope here).
 fn parseIpMaybeZone(text: []const u8) ?netaddr.Ip {
-    const bare = text[0 .. std.mem.indexOfScalar(u8, text, '%') orelse text.len];
+    const bare = text[0 .. std.mem.findScalar(u8, text, '%') orelse text.len];
     return netaddr.parseIp(bare);
 }
 
@@ -122,7 +122,7 @@ pub fn hostsNameForIp(content: []const u8, ip: netaddr.Ip, out: []u8) ?[]const u
     const want = ip.unmap();
     var lines = std.mem.tokenizeAny(u8, content, "\r\n");
     while (lines.next()) |whole_line| {
-        const line = whole_line[0 .. std.mem.indexOfScalar(u8, whole_line, '#') orelse whole_line.len];
+        const line = whole_line[0 .. std.mem.findScalar(u8, whole_line, '#') orelse whole_line.len];
         var words = std.mem.tokenizeAny(u8, line, " \t");
         const ip_text = words.next() orelse continue;
         const entry_ip = parseIpMaybeZone(ip_text) orelse continue;
@@ -145,7 +145,7 @@ pub fn hostsIpsForName(content: []const u8, name: []const u8, out: []netaddr.Ip)
     var n: usize = 0;
     var lines = std.mem.tokenizeAny(u8, content, "\r\n");
     while (lines.next()) |whole_line| {
-        const line = whole_line[0 .. std.mem.indexOfScalar(u8, whole_line, '#') orelse whole_line.len];
+        const line = whole_line[0 .. std.mem.findScalar(u8, whole_line, '#') orelse whole_line.len];
         var words = std.mem.tokenizeAny(u8, line, " \t");
         const ip_text = words.next() orelse continue;
         const entry_ip = parseIpMaybeZone(ip_text) orelse continue;

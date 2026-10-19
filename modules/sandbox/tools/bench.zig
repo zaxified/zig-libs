@@ -95,7 +95,7 @@ pub fn main(init: std.process.Init) !u8 {
     try dir.writeFile(io, .{ .sub_path = "ours.bpf", .data = std.mem.sliceAsBytes(prog) });
 
     const lib_dir = init.environ_map.get("LIBSECCOMP_DIR") orelse default_lib_dir;
-    const libseccomp = try std.fmt.allocPrint(arena, "{s}/libseccomp.so.2", .{lib_dir});
+    const libseccomp = try arena.print("{s}/libseccomp.so.2", .{lib_dir});
     const exe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, "modules/sandbox/tools/c_bench/foreign_bench.c", &.{libseccomp});
 
     var buf: [4096]u8 = undefined;
@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Unfiltered baseline for context (not part of any ratio).
     for (probes) |p| {
         var banner: []const u8 = undefined;
-        const name = try std.fmt.allocPrint(arena, "sys_{s}@none", .{p});
+        const name = try arena.print("sys_{s}@none", .{p});
         const row = try bench.foreign(arena, io, bench_name, exe, abs, name, &banner);
         try w.print("unfiltered {s}: {d:.0} ns per 100 syscalls\n", .{ p, row.ns });
     }
@@ -120,11 +120,11 @@ pub fn main(init: std.process.Init) !u8 {
     try ws.append(arena, .{ .name = "build", .op = .{}, .ref = "build" });
     for (probes) |p| {
         try ws.append(arena, .{
-            .name = try std.fmt.allocPrint(arena, "sys_{s}", .{p}),
+            .name = try arena.print("sys_{s}", .{p}),
             .op = .{},
-            .ref = try std.fmt.allocPrint(arena, "sys_{s}@ref", .{p}),
-            .alt = try std.fmt.allocPrint(arena, "sys_{s}@tree", .{p}),
-            .ours_foreign = try std.fmt.allocPrint(arena, "sys_{s}@ours", .{p}),
+            .ref = try arena.print("sys_{s}@ref", .{p}),
+            .alt = try arena.print("sys_{s}@tree", .{p}),
+            .ours_foreign = try arena.print("sys_{s}@ours", .{p}),
         });
     }
 

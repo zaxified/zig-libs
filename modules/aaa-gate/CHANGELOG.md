@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the mechanical codemod.
 - **2026-10-18** — tests: mutation audit of the echo-parity code (121/129, 8 equivalent). New: the Basic user/password boundary, the exact challenge for every mode and realm, TAB trimming, blanks around key-source values, blank `X-Real-IP`/XFF fall-through, IPv6 peer keys and the v4-mapped boundary, "a configured scheme keeps the plane closed" for every conjunct of `.any`/`.either`, the audit status of a handler error after the head was sent, and `ctx.data` restoration.
 - **2026-10-18** — `cookieValue` is now `cookies.find` (new dep `cookies`; the private copy is gone). Differences: a `;` inside a quoted value no longer ends it (`sid="x;y"` → `x;y`), and a pair without `=` reads as an empty value instead of null — an empty value already counted as an absent key source, so no gate verdict changes. ctgrind counts unchanged (2/2/2), digests re-pinned.

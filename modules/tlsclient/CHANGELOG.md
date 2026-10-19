@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std's unchecked DER reader (`Certificate.parse`) re-read against the 0.17.0 std (unchanged); 0.16-only measurements are labelled as such.
 
 - **2026-10-18** — FIX (std bugs, remote, authenticated peer; panic in safe builds, UB in ReleaseFast): malformed post-handshake messages now end the read with an alert error instead of panicking. A KeyUpdate whose body is not exactly one octet is `TlsDecodeError` (decode_error; checked before the traffic key and `read_seq` are switched; std 0.17 added the same check), a KeyUpdate on a TLS 1.2 connection is `TlsUnexpectedMessage` (it read the inactive `tls_1_3` union field), and an empty or shorter-than-4-octet handshake fragment is `TlsDecodeError` (std indexed past the record). Regression tests in `src/fuzz_test.zig`, each with a documented negative control.

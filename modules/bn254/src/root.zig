@@ -126,8 +126,8 @@ test {
 }
 
 test "meta.model_after names BN254/alt-bn128" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BN254") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "EIP-196/197") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BN254") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "EIP-196/197") != null);
 }
 
 test "field tower encoded widths compose correctly" {

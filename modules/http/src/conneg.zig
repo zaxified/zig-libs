@@ -180,12 +180,12 @@ pub fn parse(header: []const u8, out: []MediaRange) []MediaRange {
 pub fn parseElement(elem: []const u8) ?MediaRange {
     // Split media-range vs params at the first ';' (media types never quote
     // before the first ';', so a plain scalar scan is fine here).
-    const semi = std.mem.indexOfScalar(u8, elem, ';');
+    const semi = std.mem.findScalar(u8, elem, ';');
     const range = std.mem.trim(u8, if (semi) |i| elem[0..i] else elem, " \t");
     const tail = if (semi) |i| elem[i + 1 ..] else "";
 
     // Parse "type/subtype".
-    const slash = std.mem.indexOfScalar(u8, range, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, range, '/') orelse return null;
     const type_ = std.mem.trim(u8, range[0..slash], " \t");
     const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
     if (type_.len == 0 or subtype_.len == 0) return null;
@@ -203,7 +203,7 @@ pub fn parseElement(elem: []const u8) ?MediaRange {
     while (pos < tail.len) {
         const seg_end = if (body.indexOfUnquoted(tail[pos..], ';')) |i| pos + i else tail.len;
         const seg = tail[pos..seg_end];
-        const eq = std.mem.indexOfScalar(u8, seg, '=') orelse seg.len;
+        const eq = std.mem.findScalar(u8, seg, '=') orelse seg.len;
         const name = std.mem.trim(u8, seg[0..eq], " \t");
         if (std.ascii.eqlIgnoreCase(name, "q")) {
             const value = if (eq < seg.len) seg[eq + 1 ..] else "";
@@ -375,9 +375,9 @@ const TypePair = struct { type: []const u8, subtype: []const u8, params: []const
 /// Split an offered media type `type/subtype[;params]` (OWS-trimmed, both
 /// parts non-empty). Returns null for a malformed offer (no `/`, empty half).
 fn splitType(mt: []const u8) ?TypePair {
-    const semi = std.mem.indexOfScalar(u8, mt, ';');
+    const semi = std.mem.findScalar(u8, mt, ';');
     const range = std.mem.trim(u8, if (semi) |i| mt[0..i] else mt, " \t");
-    const slash = std.mem.indexOfScalar(u8, range, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, range, '/') orelse return null;
     const type_ = std.mem.trim(u8, range[0..slash], " \t");
     const subtype_ = std.mem.trim(u8, range[slash + 1 ..], " \t");
     if (type_.len == 0 or subtype_.len == 0) return null;
@@ -441,7 +441,7 @@ pub const TokenList = struct {
             // elements).
             self.rest = std.mem.trimStart(u8, self.rest, " \t,");
             if (self.rest.len == 0) return null;
-            const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
+            const end = std.mem.findScalar(u8, self.rest, ',') orelse self.rest.len;
             const elem = std.mem.trim(u8, self.rest[0..end], " \t");
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else "";
             countHeaderElement();
@@ -460,7 +460,7 @@ pub fn tokenList(header: []const u8) TokenList {
 /// `*`) into a `WeightedToken`, or null if malformed.
 pub fn parseTokenElement(elem: []const u8) ?WeightedToken {
     // Split token vs params at the first ';'.
-    const semi = std.mem.indexOfScalar(u8, elem, ';');
+    const semi = std.mem.findScalar(u8, elem, ';');
     const token = std.mem.trim(u8, if (semi) |i| elem[0..i] else elem, " \t");
     const tail = if (semi) |i| elem[i + 1 ..] else "";
     if (token.len == 0) return null;
@@ -470,9 +470,9 @@ pub fn parseTokenElement(elem: []const u8) ?WeightedToken {
     var weight: u16 = q_default;
     var pos: usize = 0;
     while (pos < tail.len) {
-        const seg_end = std.mem.indexOfScalarPos(u8, tail, pos, ';') orelse tail.len;
+        const seg_end = std.mem.findScalarPos(u8, tail, pos, ';') orelse tail.len;
         const seg = tail[pos..seg_end];
-        const eq = std.mem.indexOfScalar(u8, seg, '=') orelse seg.len;
+        const eq = std.mem.findScalar(u8, seg, '=') orelse seg.len;
         const name = std.mem.trim(u8, seg[0..eq], " \t");
         if (std.ascii.eqlIgnoreCase(name, "q")) {
             const value = if (eq < seg.len) seg[eq + 1 ..] else "";
@@ -1425,7 +1425,7 @@ fn g7Header(gpa: std.mem.Allocator, comptime fmt: []const u8) !std.ArrayList(u8)
     for (0..g7_ranges) |i| {
         if (i != 0) try buf.append(gpa, ',');
         var elem_buf: [32]u8 = undefined;
-        const elem = std.fmt.bufPrint(&elem_buf, fmt, .{ i, 100 + (i % 900) }) catch unreachable;
+        const elem = std.mem.print(&elem_buf, fmt, .{ i, 100 + (i % 900) }) catch unreachable;
         try buf.appendSlice(gpa, elem);
     }
     return buf;

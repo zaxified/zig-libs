@@ -372,7 +372,7 @@ test "noASDU disagreeing with seqASDU is refused" {
     const f = try decodeFrame(bytes);
     var pdu: [512]u8 = undefined;
     @memcpy(pdu[0..f.pdu.len], f.pdu);
-    const idx = std.mem.indexOf(u8, pdu[0..f.pdu.len], &[_]u8{ 0x80, 0x01, 0x02 }).?;
+    const idx = std.mem.find(u8, pdu[0..f.pdu.len], &[_]u8{ 0x80, 0x01, 0x02 }).?;
     pdu[idx + 2] = 3;
     try testing.expectError(error.EntryCountMismatch, SavPdu.decode(pdu[0..f.pdu.len]));
 }

@@ -262,7 +262,7 @@ pub const Bridge = struct {
     // secret-api-ok: `config` (with the remote password) is stored by reference -- its slices point at caller storage; no secret bytes are copied or derived here.
     pub fn init(b: *Bridge, local: *Broker, config: Config, buffers: Buffers, remote: client_mod.Transport) Error!void {
         for (config.rules) |r| {
-            if (std.mem.indexOfAny(u8, r.local_prefix, "+#") != null or std.mem.indexOfAny(u8, r.remote_prefix, "+#") != null) return error.InvalidRule;
+            if (std.mem.findAny(u8, r.local_prefix, "+#") != null or std.mem.findAny(u8, r.remote_prefix, "+#") != null) return error.InvalidRule;
             topic_rules.validateFilter(r.pattern) catch return error.InvalidRule;
             if (r.local_prefix.len + r.pattern.len > topic_buf_len or r.remote_prefix.len + r.pattern.len > topic_buf_len) return error.InvalidRule;
             if (r.direction == .both and config.version == .v3_1_1 and std.mem.eql(u8, r.local_prefix, r.remote_prefix)) return error.LoopProneRule;

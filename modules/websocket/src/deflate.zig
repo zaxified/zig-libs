@@ -95,7 +95,7 @@ pub const ExtensionIterator = struct {
             const elem = std.mem.trim(u8, it.s[start..@min(j, it.s.len)], " \t");
             if (elem.len == 0) continue; // `a, , b`: empty list elements are allowed (RFC 9110 §5.6.1)
             if (in_quotes) return error.Malformed;
-            const semi = std.mem.indexOfScalar(u8, elem, ';') orelse elem.len;
+            const semi = std.mem.findScalar(u8, elem, ';') orelse elem.len;
             const name = std.mem.trimEnd(u8, elem[0..semi], " \t");
             if (!http.h1.isToken(name)) return error.Malformed;
             const e: Extension = .{ .name = name, .rest = elem[semi..] };

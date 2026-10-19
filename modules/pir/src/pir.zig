@@ -2185,7 +2185,7 @@ test "SELF: keyword retrieval — a hit returns the record; a miss is the SAME c
         var buf: [16]u8 = undefined;
         var t: usize = 0;
         const kw = while (t < 1000) : (t += 1) {
-            const cand = std.fmt.bufPrint(&buf, "far-{d}", .{t}) catch unreachable;
+            const cand = std.mem.print(&buf, "far-{d}", .{t}) catch unreachable;
             if (P.keywordIndex(cand) >= 100) break cand;
         } else unreachable;
         const seeds = detSeeds(9200);
@@ -2218,11 +2218,11 @@ test "SELF: colliding keywords — the occupant comes back for BOTH; the loser g
     var kw_b: []const u8 = undefined;
     var t: usize = 0;
     const idx = outer: while (t < 100) : (t += 1) {
-        const cand = std.fmt.bufPrint(&buf_b, "kw-{d}", .{t}) catch unreachable;
+        const cand = std.mem.print(&buf_b, "kw-{d}", .{t}) catch unreachable;
         const ix = P.keywordIndex(cand);
         if (first[ix]) |prev| {
             kw_b = cand;
-            kw_a = std.fmt.bufPrint(&buf_a, "kw-{d}", .{prev}) catch unreachable;
+            kw_a = std.mem.print(&buf_a, "kw-{d}", .{prev}) catch unreachable;
             break :outer ix;
         }
         first[ix] = t;

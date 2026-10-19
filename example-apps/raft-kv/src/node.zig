@@ -102,7 +102,7 @@ const Node = struct {
         for (peers) |*p| p.* = .{};
 
         for (opts.peers, 0..) |p, i| {
-            const colon = std.mem.lastIndexOfScalar(u8, p, ':') orelse return error.BadPeerAddress;
+            const colon = std.mem.findScalarLast(u8, p, ':') orelse return error.BadPeerAddress;
             const port = std.fmt.parseInt(u16, p[colon + 1 ..], 10) catch return error.BadPeerAddress;
             addrs[i] = std.Io.net.IpAddress.parse(p[0..colon], port) catch return error.BadPeerAddress;
         }
@@ -210,7 +210,7 @@ const Node = struct {
             for (rd.messages) |m| {
                 const need = 5 + m.encodedLen();
                 const buf = self.gpa.alloc(u8, need) catch |err| self.fatal("encode", err);
-                buf[0] = @intFromEnum(wire.Kind.rpc);
+                buf[0] = @backingInt(wire.Kind.rpc);
                 std.mem.writeInt(u32, buf[1..5], m.from, .little);
                 _ = m.encode(buf[5..]);
                 out.append(self.gpa, .{ .to = m.to, .bytes = buf }) catch |err| self.fatal("queue", err);
@@ -400,7 +400,7 @@ const Node = struct {
         const frame = wire.readFrame(&r.interface, frame_buf) catch return;
         if (frame.len < 1) return;
 
-        if (frame[0] == @intFromEnum(wire.Kind.rpc)) {
+        if (frame[0] == @backingInt(wire.Kind.rpc)) {
             if (frame.len < 5) return;
             const from = std.mem.readInt(u32, frame[1..5], .little);
             var out: std.ArrayList(Out) = .empty;
@@ -419,7 +419,7 @@ const Node = struct {
     fn reply(self: *Node, w: *std.Io.Writer, kind: wire.Resp, body: []const u8) !void {
         const out = try self.gpa.alloc(u8, 1 + body.len);
         defer self.gpa.free(out);
-        out[0] = @intFromEnum(kind);
+        out[0] = @backingInt(kind);
         @memcpy(out[1..], body);
         try wire.writeFrame(w, out);
     }

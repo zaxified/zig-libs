@@ -372,14 +372,14 @@ fn pemDecodeOpensshBlock(text: []const u8, out: []u8) HostKey.FromOpenSSHError![
     const begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
     const end = "-----END OPENSSH PRIVATE KEY-----";
     // The text before the body is public (a fixed header line).
-    const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
+    const bi = std.mem.find(u8, text, begin) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
     // The END line starts at the first '-' after the body: base64 has none,
     // so this scan's compare is false on every key character and it stops at
-    // the body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // the body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
     // indexes its skip table by, and skips by an amount that depends on, the
     // key's characters (as rsa's and acme's PEM decoders, 2026-10-18).
-    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
     if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
 
     // Decoded straight from the text into `out` (the caller wipes it), with
@@ -523,9 +523,9 @@ test "parseEd25519Body: a seed that does not derive the container's public key i
     var kp: Ed25519.KeyPair = undefined;
     try t.expectError(error.InvalidPrivateKey, parseEd25519Body(&kp, w.buffered(), ""));
     // The consistent container (seed A, public A) still loads.
-    const off = std.mem.indexOf(u8, w.buffered(), &pub_b).?;
+    const off = std.mem.find(u8, w.buffered(), &pub_b).?;
     @memcpy(bin[off..][0..32], &kp_a.public_key.toBytes());
-    const off2 = std.mem.indexOfPos(u8, w.buffered(), off + 32, &pub_b).?;
+    const off2 = std.mem.findPos(u8, w.buffered(), off + 32, &pub_b).?;
     @memcpy(bin[off2..][0..32], &kp_a.public_key.toBytes());
     try parseEd25519Body(&kp, w.buffered(), "");
     try t.expectEqualSlices(u8, &kp_a.public_key.toBytes(), &kp.public_key.toBytes());
@@ -1348,7 +1348,7 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     defer gpa.free(v_c);
     try t.v_c.set(v_c);
     var vsbuf: [255]u8 = undefined;
-    try t.v_s.set(std.fmt.bufPrint(&vsbuf, "SSH-2.0-{s}", .{config.server_software}) catch
+    try t.v_s.set(std.mem.print(&vsbuf, "SSH-2.0-{s}", .{config.server_software}) catch
         return error.VersionExchangeFailed);
 
     // 2-6. The initial key exchange.
@@ -1917,11 +1917,11 @@ test "pemDecodeOpensshBlock: a body made of the END line's letters decodes; END 
 test "HostKey.fromOpenSSH: END-line letters in the body load; truncated or garbled END refused; the first block is used" {
     const t = std.testing;
     const end_line = "-----END OPENSSH PRIVATE KEY-----";
-    const ei = std.mem.indexOf(u8, fixture_ed25519_key, end_line).?;
+    const ei = std.mem.find(u8, fixture_ed25519_key, end_line).?;
     const body_part = fixture_ed25519_key[0..ei]; // BEGIN line + body
     // The fixture's body carries letters of the END line (BMH skipped by
     // them); D and P do not occur in it, the decoder test above covers them.
-    for ("ENOSHRIVATKY") |c| try t.expect(std.mem.indexOfScalar(u8, body_part["-----BEGIN".len..], c) != null);
+    for ("ENOSHRIVATKY") |c| try t.expect(std.mem.findScalar(u8, body_part["-----BEGIN".len..], c) != null);
 
     var hk: HostKey = undefined;
     try HostKey.fromOpenSSH(&hk, fixture_ed25519_key, null);
@@ -1985,8 +1985,7 @@ test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {
     var b64buf: [512]u8 = undefined;
     const enc = std.base64.standard.Encoder;
     const body = enc.encode(&b64buf, w.buffered());
-    const text = try std.fmt.allocPrint(
-        t.allocator,
+    const text = try t.allocator.print(
         "-----BEGIN OPENSSH PRIVATE KEY-----\n{s}\n-----END OPENSSH PRIVATE KEY-----\n",
         .{body},
     );
@@ -2181,7 +2180,7 @@ const SelfTestClient = struct {
         // Encrypted s2c probe back from the server.
         const pkt = try t.recvPacket(&pbuf);
         if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
-        if (std.mem.indexOf(u8, pkt.payload, "probe-s2c") == null) return error.ProtocolError;
+        if (std.mem.find(u8, pkt.payload, "probe-s2c") == null) return error.ProtocolError;
 
         self.session_id = t.session_id;
     }
@@ -2222,7 +2221,7 @@ fn selfConsistencyWith(host_key: *const HostKey, client_algs: transport.Algorith
     var pbuf: [8192]u8 = undefined;
     const pkt = try t.recvPacket(&pbuf);
     try std.testing.expectEqual(@backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST), msgType(pkt));
-    try std.testing.expect(std.mem.indexOf(u8, pkt.payload, "probe-c2s") != null);
+    try std.testing.expect(std.mem.find(u8, pkt.payload, "probe-c2s") != null);
 
     // ...and ours on the client's.
     var mb: [64]u8 = undefined;
@@ -2613,7 +2612,7 @@ const GuessingClient = struct {
         var pbuf: [1024]u8 = undefined;
         const pkt = try t.recvPacket(&pbuf);
         if (msgType(pkt) != @backingInt(messages.MessageType.SSH_MSG_GLOBAL_REQUEST)) return error.ProtocolError;
-        self.got_probe = std.mem.indexOf(u8, pkt.payload, "after-guess") != null;
+        self.got_probe = std.mem.find(u8, pkt.payload, "after-guess") != null;
     }
 };
 
@@ -2795,7 +2794,7 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
     var rnd: [8]u8 = undefined;
     testFillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_srv_test_{s}", .{&hex});
+    const dir_path = try gpa.print("/tmp/zig_ssh_srv_test_{s}", .{&hex});
     defer gpa.free(dir_path);
     var work = cwd.createDirPathOpen(io, dir_path, .{}) catch return error.SkipZigTest;
     defer {
@@ -2804,7 +2803,7 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
     }
 
     // Generate an ephemeral unencrypted host key with the real ssh-keygen.
-    const hk_path = try std.fmt.allocPrint(gpa, "{s}/hk", .{dir_path});
+    const hk_path = try gpa.print("{s}/hk", .{dir_path});
     defer gpa.free(hk_path);
     {
         var child = std.process.spawn(io, .{
@@ -2837,15 +2836,15 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
 
     // Spawn the real ssh client. PreferredAuthentications=none + BatchMode
     // make it send exactly one "none" userauth attempt after the handshake.
-    const port_str = try std.fmt.allocPrint(gpa, "{d}", .{port});
+    const port_str = try gpa.print("{d}", .{port});
     defer gpa.free(port_str);
-    const ciphers_opt = try std.fmt.allocPrint(gpa, "Ciphers={s}", .{cipher_name});
+    const ciphers_opt = try gpa.print("Ciphers={s}", .{cipher_name});
     defer gpa.free(ciphers_opt);
-    const hka_opt = try std.fmt.allocPrint(gpa, "HostKeyAlgorithms={s}", .{hostkey_algo});
+    const hka_opt = try gpa.print("HostKeyAlgorithms={s}", .{hostkey_algo});
     defer gpa.free(hka_opt);
-    const kex_opt = try std.fmt.allocPrint(gpa, "KexAlgorithms={s}", .{kex_name});
+    const kex_opt = try gpa.print("KexAlgorithms={s}", .{kex_name});
     defer gpa.free(kex_opt);
-    const macs_opt = try std.fmt.allocPrint(gpa, "MACs={s}", .{mac_name});
+    const macs_opt = try gpa.print("MACs={s}", .{mac_name});
     defer gpa.free(macs_opt);
     var ssh_child = std.process.spawn(io, .{
         .argv = &.{

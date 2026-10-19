@@ -80,7 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
     try dir.writeFile(io, .{ .sub_path = "msg64k.bin", .data = m64k });
 
     const so = init.environ_map.get("SODIUM_SO") orelse default_so;
-    const exe = try std.fmt.allocPrint(arena, "{s}/sodium_bench", .{abs});
+    const exe = try arena.print("{s}/sodium_bench", .{abs});
     std.debug.print("bench-sealedbox: building the libsodium side against {s} ...\n", .{so});
     const cc = try std.process.run(arena, io, .{ .argv = &.{ "zig", "cc", "-O3", "-march=native", "modules/sealedbox/tools/c_bench/sodium_bench.c", so, "-o", exe } });
     if (cc.term != .exited or cc.term.exited != 0) {

@@ -1494,7 +1494,7 @@ test "serveUserauth: a received plaintext password does not survive in the freed
     try t.expectEqualStrings("alice", res.user());
     try t.expectEqual(AuthMethod.password, res.method);
 
-    try t.expectEqual(@as(?usize, null), std.mem.indexOf(u8, backing, secret));
+    try t.expectEqual(@as(?usize, null), std.mem.find(u8, backing, secret));
 }
 
 test "an ed25519 userauth signature verifies only against its own session id" {

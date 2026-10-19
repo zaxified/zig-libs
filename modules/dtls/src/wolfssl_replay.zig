@@ -104,14 +104,14 @@ const recorded_cases_floor = 14;
 // documents it in its own header; this is the reader.
 
 fn opName(line: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+    const end = std.mem.findScalar(u8, line, ' ') orelse line.len;
     return line[0..end];
 }
 
 /// The rest of the line after the op name, untrimmed of inner spaces — for the
 /// two ops whose argument is prose (`case`, `why`).
 fn opRest(line: []const u8) []const u8 {
-    const sp = std.mem.indexOfScalar(u8, line, ' ') orelse return "";
+    const sp = std.mem.findScalar(u8, line, ' ') orelse return "";
     return std.mem.trim(u8, line[sp + 1 ..], " ");
 }
 
@@ -121,7 +121,7 @@ fn arg(line: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     _ = it.next(); // the op
     while (it.next()) |tok| {
-        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, tok, '=') orelse continue;
         if (std.mem.eql(u8, tok[0..eq], key)) return tok[eq + 1 ..];
     }
     // A key whose value is empty produces a token that ends at '='; the loop
@@ -467,7 +467,7 @@ test "wolfSSL transcript: the header names the release, the date and the command
     // stale. Checked here rather than trusted, because the header is written
     // by a tool that only runs where wolfSSL is installed.
     const head = transcript[0..@min(transcript.len, 4096)];
-    try testing.expect(std.mem.indexOf(u8, head, "wolfSSL:") != null);
-    try testing.expect(std.mem.indexOf(u8, head, "captured:") != null);
-    try testing.expect(std.mem.indexOf(u8, head, "zig build interop-dtls -- --capture") != null);
+    try testing.expect(std.mem.find(u8, head, "wolfSSL:") != null);
+    try testing.expect(std.mem.find(u8, head, "captured:") != null);
+    try testing.expect(std.mem.find(u8, head, "zig build interop-dtls -- --capture") != null);
 }

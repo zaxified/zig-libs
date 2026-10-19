@@ -58,7 +58,7 @@ fn buildImage(a: std.mem.Allocator, script: []const u8) ![]u8 {
     const cols = try ar.alloc(ds.Column, ncol);
     for (cols, 0..) |*col, i| {
         col.* = .{
-            .name = try std.fmt.allocPrint(ar, "c{d}", .{i}),
+            .name = try ar.print("c{d}", .{i}),
             .type = @fromBackingInt(@intCast(c.ranged(0, 6))),
         };
     }

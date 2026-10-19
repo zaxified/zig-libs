@@ -218,7 +218,7 @@ pub const Addr = union(echo.Family) {
     /// interface name ("%eth0"), resolved via ioctl(SIOCGIFINDEX) like
     /// getaddrinfo does.
     pub fn parse(text: []const u8) ParseError!Addr {
-        if (std.mem.indexOfScalar(u8, text, '%')) |percent| {
+        if (std.mem.findScalar(u8, text, '%')) |percent| {
             const scope_text = text[percent + 1 ..];
             const scope = std.fmt.parseInt(u32, scope_text, 10) catch
                 ifNameToIndex(scope_text) orelse return error.InvalidAddress;

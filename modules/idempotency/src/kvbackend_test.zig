@@ -120,7 +120,7 @@ test "KvBackend: an unreadable record fails closed (409), never a second run" {
     store.record("k", digest_a, 200, "", "RECORDED-BODY");
     store.finish("k", null);
     // Rot one byte of the recorded body on the media: kv's read CRC check fails.
-    const at = std.mem.indexOf(u8, sim.fileContent("idem.kv").?, "RECORDED-BODY").?;
+    const at = std.mem.find(u8, sim.fileContent("idem.kv").?, "RECORDED-BODY").?;
     sim.flipByte("idem.kv", at);
     try testing.expect((try store.begin("k", digest_a, null, testing.allocator)) == .in_flight);
     try testing.expectEqual(@as(u64, 1), kb.read_errors);
@@ -217,7 +217,7 @@ test "Backend seam through the middleware: lookup, then put before release; repl
     var b2: [1024]u8 = undefined;
     const second = serve(&r, req, &b2);
     try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 201"));
-    try testing.expect(std.mem.indexOf(u8, second, "Idempotent-Replayed: true") != null);
+    try testing.expect(std.mem.find(u8, second, "Idempotent-Replayed: true") != null);
     try testing.expect(std.mem.endsWith(u8, second, "charged"));
     try testing.expectEqual(@as(u32, 1), app.calls);
     try testing.expectEqualStrings("LPRL", lb.log.items);

@@ -110,7 +110,7 @@ test "formatIpExpanded" {
 
 test "{f} formatting of Ip, Prefix, ZonedIp, AddrPort, IpRange" {
     var buf: [256]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{f} {f} {f} {f} {f}", .{
+    const s = try std.mem.print(&buf, "{f} {f} {f} {f} {f}", .{
         ip("2001:db8::1"),
         pfx("10.0.0.0/8"),
         na.parseIpZoned("fe80::1%eth0").?,

@@ -57,7 +57,7 @@ pub const Op = enum(u8) { set = 0, del = 1 };
 /// op(1) | klen(u16) | key | value(rest)
 pub fn encodeOp(gpa: std.mem.Allocator, op: Op, key: []const u8, value: []const u8) ![]u8 {
     const blob = try gpa.alloc(u8, 3 + key.len + value.len);
-    blob[0] = @intFromEnum(op);
+    blob[0] = @backingInt(op);
     std.mem.writeInt(u16, blob[1..3], @intCast(key.len), .little);
     @memcpy(blob[3..][0..key.len], key);
     @memcpy(blob[3 + key.len ..], value);
@@ -90,7 +90,7 @@ pub fn readFrame(r: *std.Io.Reader, buf: []u8) ![]u8 {
 /// kind(1) | klen(u16) | key | value(rest) — value empty for get/del/dump.
 pub fn encodeClient(gpa: std.mem.Allocator, kind: Kind, key: []const u8, value: []const u8) ![]u8 {
     const out = try gpa.alloc(u8, 3 + key.len + value.len);
-    out[0] = @intFromEnum(kind);
+    out[0] = @backingInt(kind);
     std.mem.writeInt(u16, out[1..3], @intCast(key.len), .little);
     @memcpy(out[3..][0..key.len], key);
     @memcpy(out[3 + key.len ..], value);

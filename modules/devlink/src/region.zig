@@ -93,7 +93,7 @@ pub const Region = struct {
     }
 
     pub fn hasSnapshot(r: *const Region, id: u32) bool {
-        return std.mem.indexOfScalar(u32, r.snapshots(), id) != null;
+        return std.mem.findScalar(u32, r.snapshots(), id) != null;
     }
 
     /// Can another snapshot be taken, or is the driver's slot budget full?
@@ -263,7 +263,7 @@ pub const Assembler = struct {
 
 fn appendRegionName(gpa: std.mem.Allocator, list: *std.ArrayList(u8), n: []const u8) BuildError!void {
     if (n.len == 0 or n.len > uapi.name_max) return error.InvalidRequest;
-    if (std.mem.indexOfScalar(u8, n, 0) != null) return error.InvalidRequest;
+    if (std.mem.findScalar(u8, n, 0) != null) return error.InvalidRequest;
     codec.appendAttrString(gpa, list, uapi.ATTR.REGION_NAME, n) catch |e| switch (e) {
         error.AttrTooLong => return error.InvalidRequest,
         error.OutOfMemory => return error.OutOfMemory,

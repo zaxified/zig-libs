@@ -1114,7 +1114,7 @@ test "enip adapter: trouble sets the Identity status word and refuses CIP with 0
     var li: [24]u8 = @splat(0);
     std.mem.writeInt(u16, li[0..2], @backingInt(enip.Command.list_identity), .little);
     const ident_reply = (try n.deliver(&li, &out, 0)).?;
-    try testing.expect(std.mem.indexOfScalar(
+    try testing.expect(std.mem.findScalar(
         u8,
         ident_reply,
         @intCast(identity_status_major_fault & 0xFF),
@@ -1227,7 +1227,7 @@ test "bacnet adapter: trouble moves Reliability, StatusFlags and Out_Of_Service"
     // A ComplexACK whose property value is application-tagged Enumerated(7):
     // tag 9, length 1, value 7.
     try testing.expectEqual(@as(u8, 0x81), rp[0]);
-    try testing.expect(std.mem.indexOf(
+    try testing.expect(std.mem.find(
         u8,
         rp,
         &.{ 0x91, @as(u8, @intCast(reliability_unreliable_other)) },

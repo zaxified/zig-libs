@@ -221,7 +221,7 @@ pub const Framer = struct {
     fn nextEom(self: *Framer) FramerError!?[]const u8 {
         const buf = self.pending.items[self.cursor..];
         if (buf.len != 0) self.in_message = true;
-        if (std.mem.indexOf(u8, buf, eom_delimiter)) |idx| {
+        if (std.mem.find(u8, buf, eom_delimiter)) |idx| {
             if (self.msg.items.len + idx > self.limits.max_message) return error.MessageTooLarge;
             try self.msg.appendSlice(self.gpa, buf[0..idx]);
             self.cursor += idx + eom_delimiter.len;
@@ -336,7 +336,7 @@ pub const Framer = struct {
 pub fn writeMessage(w: *std.Io.Writer, dialect: Dialect, payload: []const u8) (WriteError || std.Io.Writer.Error)!void {
     switch (dialect) {
         .end_of_message => {
-            if (std.mem.indexOf(u8, payload, eom_delimiter) != null) return error.DelimiterInPayload;
+            if (std.mem.find(u8, payload, eom_delimiter) != null) return error.DelimiterInPayload;
             try w.writeAll(payload);
             // The RFC's examples put `]]>]]>` on a line of its own, so a LF is
             // added when the payload does not already end with one. Nothing is

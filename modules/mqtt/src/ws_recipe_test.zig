@@ -104,14 +104,14 @@ test "recipe: MQTT 5.0 over WebSocket — handshake with subprotocol mqtt, then 
     var req_w: std.Io.Writer = .fixed(&req_buf);
     try ws_hs.writeRequest(&req_w, .{ .host = "broker.local", .target = "/mqtt", .key = &key, .protocols = &.{"mqtt"} });
     const req_bytes = req_w.buffered();
-    const req_head = try h1.RequestHead.parse(req_bytes[0 .. std.mem.indexOf(u8, req_bytes, "\r\n\r\n").? + 2]);
+    const req_head = try h1.RequestHead.parse(req_bytes[0 .. std.mem.find(u8, req_bytes, "\r\n\r\n").? + 2]);
     const accepted = try ws_hs.acceptHandshake(req_head, .{ .protocols = &.{"mqtt"}, .origins = &.{"*"} });
     try testing.expectEqualStrings("mqtt", accepted.protocol.?);
     var resp_buf: [512]u8 = undefined;
     var resp_w: std.Io.Writer = .fixed(&resp_buf);
     try ws_hs.writeResponse(&resp_w, accepted);
     const resp_bytes = resp_w.buffered();
-    const resp_head = try h1.ResponseHead.parse(resp_bytes[0 .. std.mem.indexOf(u8, resp_bytes, "\r\n\r\n").? + 2]);
+    const resp_head = try h1.ResponseHead.parse(resp_bytes[0 .. std.mem.find(u8, resp_bytes, "\r\n\r\n").? + 2]);
     const verified = try ws_hs.verifyResponse(resp_head, &key, &.{"mqtt"});
     try testing.expectEqualStrings("mqtt", verified.protocol.?);
 

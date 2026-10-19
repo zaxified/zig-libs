@@ -191,13 +191,13 @@ pub fn main(init: std.process.Init) !u8 {
     ctx.inputs[2] = try cwd.readFileAlloc(io, "modules/brotli/src/testdata/alice29.txt", arena, .limited(1 << 22));
     ctx.inputs[3] = try brotli.interop_corpus.fontLike(arena, 200_000, 0xf0f7);
     for (payload_names, 0..) |n, i|
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.bin", .{n}), .data = ctx.inputs[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.bin", .{n}), .data = ctx.inputs[i] });
 
     const lib_dir = init.environ_map.get("LIBBROTLI_DIR") orelse default_lib_dir;
     const libs = [_][]const u8{
-        try std.fmt.allocPrint(arena, "{s}/libbrotlienc.so.1", .{lib_dir}),
-        try std.fmt.allocPrint(arena, "{s}/libbrotlidec.so.1", .{lib_dir}),
-        try std.fmt.allocPrint(arena, "{s}/libbrotlicommon.so.1", .{lib_dir}),
+        try arena.print("{s}/libbrotlienc.so.1", .{lib_dir}),
+        try arena.print("{s}/libbrotlidec.so.1", .{lib_dir}),
+        try arena.print("{s}/libbrotlicommon.so.1", .{lib_dir}),
     };
     const exe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, "modules/brotli/tools/c_bench/foreign_bench.c", &libs);
 
@@ -215,7 +215,7 @@ pub fn main(init: std.process.Init) !u8 {
     const efforts = comptime std.enums.values(brotli.Effort);
     var our_sizes: [n_efforts][payload_names.len]usize = undefined;
     for (payload_names, 0..) |n, i| {
-        const rb = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}.ref.br", .{n}), arena, .limited(1 << 24));
+        const rb = try dir.readFileAlloc(io, try arena.print("{s}.ref.br", .{n}), arena, .limited(1 << 24));
         ctx.ref_br[i] = rb;
         ctx.dec_buf[i] = try arena.alloc(u8, ctx.inputs[i].len + 1);
         const back = try brotli.decompress(arena, rb, .{});
@@ -249,13 +249,13 @@ pub fn main(init: std.process.Init) !u8 {
     var ws: std.ArrayList(Work) = .empty;
     for (payload_names, 0..) |n, i| {
         for (efforts) |effort| {
-            const name = try std.fmt.allocPrint(arena, "c_{s}_{s}", .{ @tagName(effort), n });
-            const ref = try std.fmt.allocPrint(arena, "c{d}_{s}", .{ effort.quality(), n });
+            const name = try arena.print("c_{s}_{s}", .{ @tagName(effort), n });
+            const ref = try arena.print("c{d}_{s}", .{ effort.quality(), n });
             try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = effort, .payload = i }, .ref = ref });
         }
-        const name = try std.fmt.allocPrint(arena, "d_{s}", .{n});
+        const name = try arena.print("d_{s}", .{n});
         try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .q6, .payload = i }, .ref = name });
-        const aname = try std.fmt.allocPrint(arena, "d_{s}_alloc", .{n});
+        const aname = try arena.print("d_{s}_alloc", .{n});
         try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .q6, .payload = i, .alloc = true }, .ref = name, .info = true });
     }
 

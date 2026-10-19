@@ -411,7 +411,7 @@ const Deriver = struct {
         var v: TestValue = .{ .id_len = @intCast(sub.len) };
         @memcpy(v.id_buf[0..sub.len], sub);
         if (parsed.claims.claimStr("scope")) |s| {
-            if (std.mem.indexOf(u8, s, "read") != null) v.scopes |= 1;
+            if (std.mem.find(u8, s, "read") != null) v.scopes |= 1;
         }
         return v;
     }
@@ -440,7 +440,7 @@ fn mint(claims_json: []const u8) ![]u8 {
 }
 
 fn mintSub(buf: []u8, i: usize, exp: i64) ![]u8 {
-    const json = try std.fmt.bufPrint(buf, "{{\"iss\":\"{s}\",\"aud\":\"api://a\",\"sub\":\"user-{d}\",\"exp\":{d}}}", .{ issuer, i, exp });
+    const json = try std.mem.print(buf, "{{\"iss\":\"{s}\",\"aud\":\"api://a\",\"sub\":\"user-{d}\",\"exp\":{d}}}", .{ issuer, i, exp });
     return mint(json);
 }
 
@@ -811,7 +811,7 @@ test "VerifiedCache: ES256 end to end -- the hit returns what the verify derived
     _ = enc.encode(&x, sec1[1..33]);
     _ = enc.encode(&y, sec1[33..65]);
     var json_buf: [256]u8 = undefined;
-    const json = try std.fmt.bufPrint(&json_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"e\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ &x, &y });
+    const json = try std.mem.print(&json_buf, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"kid\":\"e\",\"x\":\"{s}\",\"y\":\"{s}\"}}]}}", .{ &x, &y });
     var set = try root.parseJwksSource(testing.allocator, json, .network);
     defer set.deinit();
     const token = try root.encodeJson(testing.allocator,

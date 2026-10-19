@@ -464,7 +464,7 @@ pub const SpanScanner = struct {
     /// The opening quote was stray: the record is the physical line it
     /// starts on, as `.end_record` mode reads it.
     fn lazyFallback(bytes: []const u8, start: usize, at_eof: bool) Scan {
-        if (std.mem.indexOfScalarPos(u8, bytes, start, '\n')) |nl|
+        if (std.mem.findScalarPos(u8, bytes, start, '\n')) |nl|
             return .{ .record = .{ .end = nl, .next = nl + 1, .spanned = false, .unbalanced = true } };
         if (!at_eof) return .incomplete;
         return .{ .record = .{ .end = bytes.len, .next = bytes.len, .spanned = false, .unbalanced = true } };

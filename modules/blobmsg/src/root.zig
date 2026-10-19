@@ -824,7 +824,7 @@ fn mockInvoke(ctx: *MockCtx, fd: i32, gpa: std.mem.Allocator, msg: Msg) !bool {
 }
 
 fn mockSocketPath(buf: []u8, tag: []const u8) ![:0]const u8 {
-    return std.fmt.bufPrintSentinel(buf, "/tmp/zl-blobmsg-{d}-{s}.sock", .{ linux.getpid(), tag }, 0);
+    return std.mem.printSentinel(buf, "/tmp/zl-blobmsg-{d}-{s}.sock", .{ linux.getpid(), tag }, 0);
 }
 
 fn sleepMs(ms: u64) void {

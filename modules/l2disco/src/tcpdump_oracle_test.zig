@@ -28,7 +28,7 @@ const rec = @import("testdata/tcpdump_facts.zig");
 const Facts = std.ArrayList([]const u8);
 
 fn add(a: std.mem.Allocator, out: *Facts, comptime fmt: []const u8, args: anytype) !void {
-    try out.append(a, try std.fmt.allocPrint(a, fmt, args));
+    try out.append(a, try a.print(fmt, args));
 }
 
 fn ipText(a: std.mem.Allocator, ip: netaddr.Ip) ![]const u8 {
@@ -37,7 +37,7 @@ fn ipText(a: std.mem.Allocator, ip: netaddr.Ip) ![]const u8 {
 }
 
 fn macText(a: std.mem.Allocator, m: [6]u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ m[0], m[1], m[2], m[3], m[4], m[5] });
+    return a.print("{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}", .{ m[0], m[1], m[2], m[3], m[4], m[5] });
 }
 
 /// How tcpdump prints an ID: a MAC as colon hex, a network address as the
@@ -102,7 +102,7 @@ fn cdpFacts(a: std.mem.Allocator, frame: []const u8) !Facts {
 }
 
 fn dotted(a: std.mem.Allocator, q: [4]u8) ![]const u8 {
-    return std.fmt.allocPrint(a, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] });
+    return a.print("{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] });
 }
 
 fn ipList(a: std.mem.Allocator, l: dhcp.Ip4List) ![]const u8 {

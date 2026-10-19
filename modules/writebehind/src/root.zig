@@ -1061,13 +1061,13 @@ test "basic: put is readable from cache immediately; after flush the sink is con
     var buf: [24]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const k = try std.mem.print(&buf, "k{d}", .{i});
         try c.put(k, "v");
     }
     // Immediately readable from the cache (before any flush).
     i = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const k = try std.mem.print(&buf, "k{d}", .{i});
         try testing.expectEqualStrings("v", (try c.get(k)).?);
     }
     try testing.expectEqual(@as(usize, n), c.pendingCount());
@@ -1080,7 +1080,7 @@ test "basic: put is readable from cache immediately; after flush the sink is con
     try testing.expectEqual(@as(usize, n), rig.sink.count());
     i = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        const k = try std.mem.print(&buf, "k{d}", .{i});
         try testing.expectEqualStrings("v", rig.sink.peek(k).?);
         try testing.expect(!c.cache.isDirty(k));
     }
@@ -1158,7 +1158,7 @@ test "crash recovery: drop the coordinator+cache without flushing; recover repla
         var c = try rig.open(4);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const k = try std.fmt.bufPrint(&buf, "key{d}", .{i});
+            const k = try std.mem.print(&buf, "key{d}", .{i});
             try c.put(k, "payload");
         }
         c.deinitNoFlush(); // crash: no flush, WAL records remain durable
@@ -1175,7 +1175,7 @@ test "crash recovery: drop the coordinator+cache without flushing; recover repla
     try testing.expectEqual(@as(usize, n), rig.sink.count());
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "key{d}", .{i});
+        const k = try std.mem.print(&buf, "key{d}", .{i});
         try testing.expectEqualStrings("payload", rig.sink.peek(k).?);
     }
 
@@ -1489,7 +1489,7 @@ test "concurrency: many keys flush via the pool; drain-loop reaches a clean stat
     var buf: [24]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "item-{d}", .{i});
+        const k = try std.mem.print(&buf, "item-{d}", .{i});
         try c.put(k, "x");
         if (i % 64 == 0) c.drain(); // interleave flush passes with writes
     }
@@ -1535,7 +1535,7 @@ test "kvtree reference sink: put → flush lands in a real durable kvtree, survi
         });
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const k = try std.fmt.bufPrint(&buf, "row{d}", .{i});
+            const k = try std.mem.print(&buf, "row{d}", .{i});
             try c.put(k, "durable");
         }
         c.deinitNoFlush();
@@ -1565,7 +1565,7 @@ test "kvtree reference sink: put → flush lands in a real durable kvtree, survi
     // Every acked write is now in the durable kvtree sink.
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        const k = try std.fmt.bufPrint(&buf, "row{d}", .{i});
+        const k = try std.mem.print(&buf, "row{d}", .{i});
         const got = try sink_db2.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expect(got != null);

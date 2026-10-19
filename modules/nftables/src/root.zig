@@ -1482,7 +1482,7 @@ fn runNftCheck(gpa: std.mem.Allocator, json: []const u8) !NftCheck {
 }
 
 fn netlinkPermissionDenied(stderr: []const u8) bool {
-    return std.mem.indexOf(u8, stderr, "Operation not permitted") != null;
+    return std.mem.find(u8, stderr, "Operation not permitted") != null;
 }
 
 test "nft -c accepts a generated ruleset (skipped when nft is unavailable)" {

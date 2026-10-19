@@ -24,7 +24,7 @@ fn shoutTool(_: ?*anyopaque, call: *mcp.ToolCall) bool {
 }
 
 fn bodyOf(response: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, response, "\r\n\r\n") orelse return "";
     return response[i + 4 ..];
 }
 
@@ -127,5 +127,5 @@ pub fn main() !void {
     });
     const call_body = bodyOf(out2.buffered());
     std.debug.print("tools/call response body: {s}\n", .{call_body});
-    if (std.mem.indexOf(u8, call_body, "\"HELLO\"") == null) return error.ToolCallResultMissingUppercasedText;
+    if (std.mem.find(u8, call_body, "\"HELLO\"") == null) return error.ToolCallResultMissingUppercasedText;
 }

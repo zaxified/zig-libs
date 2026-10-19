@@ -134,8 +134,8 @@ pub const BodyStructure = union(enum) {
 
     pub fn mediaType(bs: BodyStructure, buf: []u8) ![]const u8 {
         return switch (bs) {
-            .single => |s| std.fmt.bufPrint(buf, "{s}/{s}", .{ s.type, s.subtype }),
-            .multi => |m| std.fmt.bufPrint(buf, "multipart/{s}", .{m.subtype}),
+            .single => |s| std.mem.print(buf, "{s}/{s}", .{ s.type, s.subtype }),
+            .multi => |m| std.mem.print(buf, "multipart/{s}", .{m.subtype}),
         };
     }
 };
@@ -343,7 +343,7 @@ pub const Parser = struct {
                 try flags.append(d.gpa, nm);
             } else {
                 defer d.gpa.free(nm);
-                const joined = std.fmt.allocPrint(d.gpa, "\\{s}", .{nm}) catch
+                const joined = d.gpa.print("\\{s}", .{nm}) catch
                     return error.OutOfMemory;
                 try flags.append(d.gpa, joined);
             }
@@ -1051,7 +1051,7 @@ test "encode: a seq_set cannot smuggle a second command onto the wire" {
 /// no coverage.
 fn fields(comptime n: usize, in: []const u8) [n][]const u8 {
     var out: [n][]const u8 = @splat(in[0..0]);
-    if (std.mem.indexOfScalar(u8, in, 0) != null) {
+    if (std.mem.findScalar(u8, in, 0) != null) {
         var it = std.mem.splitScalar(u8, in, 0);
         var i: usize = 0;
         while (it.next()) |part| : (i += 1) {
@@ -1162,9 +1162,9 @@ fn fuzzEncode(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         const line = w.buffered();
         std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
         const body = line[0 .. line.len - 2];
-        std.debug.assert(std.mem.indexOfScalar(u8, body, '\r') == null);
-        std.debug.assert(std.mem.indexOfScalar(u8, body, '\n') == null);
-        std.debug.assert(std.mem.indexOfScalar(u8, body, 0) == null);
+        std.debug.assert(std.mem.findScalar(u8, body, '\r') == null);
+        std.debug.assert(std.mem.findScalar(u8, body, '\n') == null);
+        std.debug.assert(std.mem.findScalar(u8, body, 0) == null);
     } else |_| {
         FetchMark.mark(.refused);
         // A refusal must also be a clean refusal: nothing half-written.

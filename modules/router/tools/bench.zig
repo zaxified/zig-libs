@@ -197,7 +197,7 @@ pub fn main(init: std.process.Init) !u8 {
     r.trailing_slash = .strict;
     for (routes) |rt| try r.add(rt.m, rt.p, ok);
     var wires: Wires = undefined;
-    for (requests, 0..) |q, i| wires[i] = try std.fmt.allocPrint(arena, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ q.m.token(), q.p });
+    for (requests, 0..) |q, i| wires[i] = try arena.print("{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ q.m.token(), q.p });
 
     const lookup = timeIt(io, .{}, lookupAll);
     const serve = timeIt(io, .{ &r, &wires }, serveAll);

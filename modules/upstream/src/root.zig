@@ -923,7 +923,7 @@ fn pointHash(id: []const u8, j: usize) u64 {
     var h = std.hash.XxHash64.init(0);
     h.update(id);
     var buf: [21]u8 = undefined;
-    h.update(std.fmt.bufPrint(&buf, "-{d}", .{j}) catch unreachable);
+    h.update(std.mem.print(&buf, "-{d}", .{j}) catch unreachable);
     return h.final();
 }
 
@@ -1606,7 +1606,7 @@ test "drain: skipped by every strategy, in-flight work finishes, undrain restore
         pool.drain(b);
         for (0..30) |i| {
             var kb: [8]u8 = undefined;
-            const u = pool.pickByKey(std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable).?;
+            const u = pool.pickByKey(std.mem.print(&kb, "k{d}", .{i}) catch unreachable).?;
             try testing.expect(u != b);
             pool.report(u, true, null);
         }
@@ -1667,7 +1667,7 @@ test "ring_hash: owners match the Python xxhash oracle, and removal moves only t
     const want = [_][]const u8{ "m2", "m0", "m3", "m1", "m0", "m4", "m1", "m2" };
     for (want, 1..) |w, k| {
         var kb: [16]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "user-{d}", .{k}) catch unreachable;
+        const key = std.mem.print(&kb, "user-{d}", .{k}) catch unreachable;
         try testing.expectEqualStrings(w, pool.ringOwner(key).?.id);
         const u = pool.pickByKey(key).?;
         try testing.expectEqualStrings(w, u.id);
@@ -1677,7 +1677,7 @@ test "ring_hash: owners match the Python xxhash oracle, and removal moves only t
     const want2 = [_][]const u8{ "m0", "m0", "m3", "m1", "m0", "m4", "m1", "m1" };
     for (want2, 1..) |w, k| {
         var kb: [16]u8 = undefined;
-        try testing.expectEqualStrings(w, pool.ringOwner(std.fmt.bufPrint(&kb, "user-{d}", .{k}) catch unreachable).?.id);
+        try testing.expectEqualStrings(w, pool.ringOwner(std.mem.print(&kb, "user-{d}", .{k}) catch unreachable).?.id);
     }
 }
 
@@ -1687,18 +1687,18 @@ test "ring_hash: minimal disruption over 5000 keys, both ways" {
     const ids = [_][]const u8{ "m0", "m1", "m2", "m3", "m4" };
     for (ids, 0..) |id, i| {
         var ab: [16]u8 = undefined;
-        _ = try pool.add(.{ .id = id, .address = std.fmt.bufPrint(&ab, "10.0.2.{d}:80", .{i}) catch unreachable });
+        _ = try pool.add(.{ .id = id, .address = std.mem.print(&ab, "10.0.2.{d}:80", .{i}) catch unreachable });
     }
     var before: [5000][]const u8 = undefined;
     for (&before, 0..) |*b, k| {
         var kb: [16]u8 = undefined;
-        b.* = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+        b.* = pool.ringOwner(std.mem.print(&kb, "k{d}", .{k}) catch unreachable).?.id;
     }
     try testing.expect(try pool.remove("m3"));
     var moved: usize = 0;
     for (before, 0..) |b, k| {
         var kb: [16]u8 = undefined;
-        const now = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+        const now = pool.ringOwner(std.mem.print(&kb, "k{d}", .{k}) catch unreachable).?.id;
         if (std.mem.eql(u8, b, "m3")) {
             try testing.expect(!std.mem.eql(u8, now, "m3"));
             moved += 1;
@@ -1710,7 +1710,7 @@ test "ring_hash: minimal disruption over 5000 keys, both ways" {
     var gained: usize = 0;
     for (0..5000) |k| {
         var kb: [16]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable;
+        const key = std.mem.print(&kb, "k{d}", .{k}) catch unreachable;
         const now = pool.ringOwner(key).?.id;
         const prev = if (std.mem.eql(u8, before[k], "m3")) null else before[k];
         if (std.mem.eql(u8, now, "m5")) gained += 1 else if (prev) |p| try testing.expectEqualStrings(p, now);
@@ -1729,7 +1729,7 @@ test "ring_hash: weights 1:2:3 split 30000 keys exactly as the Python oracle doe
     var counts = [_]usize{ 0, 0, 0 };
     for (0..30000) |k| {
         var kb: [16]u8 = undefined;
-        const id = pool.ringOwner(std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable).?.id;
+        const id = pool.ringOwner(std.mem.print(&kb, "k{d}", .{k}) catch unreachable).?.id;
         counts[id[1] - '1'] += 1;
     }
     try testing.expectEqual([_]usize{ 4539, 9666, 15795 }, counts);
@@ -1745,7 +1745,7 @@ test "ring_hash: a down owner's keys walk to the next member; everyone else's st
     var b_keys: usize = 0;
     for (0..2000) |k| {
         var kb: [16]u8 = undefined;
-        const key = std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable;
+        const key = std.mem.print(&kb, "k{d}", .{k}) catch unreachable;
         const owner = pool.ringOwner(key).?;
         const got = pool.pickByKey(key).?;
         defer pool.report(got, true, null);
@@ -1853,7 +1853,7 @@ test "sweep: membership churn keeps every invariant under every strategy" {
                 },
                 4, 5, 6 => {
                     var kb: [8]u8 = undefined;
-                    const key = std.fmt.bufPrint(&kb, "{d}", .{r.int(u16)}) catch unreachable;
+                    const key = std.mem.print(&kb, "{d}", .{r.int(u16)}) catch unreachable;
                     const got = if (r.boolean()) pool.pick() else pool.pickByKey(key);
                     if (got) |u| {
                         reach.picks += 1;
@@ -2018,7 +2018,7 @@ test "ring_hash: a key equal to a point lands on that point's member (lower boun
     for ([_][]const u8{ "a", "b", "c" }) |id| {
         for (0..20) |j| {
             var kb: [16]u8 = undefined;
-            const key = std.fmt.bufPrint(&kb, "{s}-{d}", .{ id, j }) catch unreachable;
+            const key = std.mem.print(&kb, "{s}-{d}", .{ id, j }) catch unreachable;
             try testing.expectEqualStrings(id, pool.ringOwner(key).?.id);
         }
     }

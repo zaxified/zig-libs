@@ -224,7 +224,7 @@ test "replay grpcio: server-streaming — many replies on one stream, then trail
     while (try s.receive()) |*r| {
         defer @constCast(r).deinit();
         var name_buf: [32]u8 = undefined;
-        const want = try std.fmt.bufPrint(&name_buf, "tick-{d}", .{seen});
+        const want = try std.mem.print(&name_buf, "tick-{d}", .{seen});
         try testing.expectEqualStrings(want, r.value.text);
         try testing.expectEqual(seen, r.value.index);
         seen += 1;
@@ -267,7 +267,7 @@ test "replay grpcio: bidirectional — send and receive interleaved on one strea
         var r = (try s.receive()).?;
         defer r.deinit();
         var buf: [32]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "re:{s}", .{w}), r.value.text);
+        try testing.expectEqualStrings(try std.mem.print(&buf, "re:{s}", .{w}), r.value.text);
         try testing.expectEqual(@as(i32, @intCast(i)), r.value.index);
     }
     try s.closeSend();
@@ -581,7 +581,7 @@ const M = server.Methods(EchoRequest, EchoReply);
 
 fn srvUnary(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     return .{
-        .text = try std.fmt.allocPrint(c.arena, "echo:{s}", .{req.text}),
+        .text = try c.arena.print("echo:{s}", .{req.text}),
         .index = req.count,
         .blob = req.blob,
     };
@@ -591,7 +591,7 @@ fn srvServerStream(s: *M.Stream, req: EchoRequest) anyerror!void {
     var i: i32 = 0;
     while (i < req.count) : (i += 1) {
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "{s}-{d}", .{ req.text, i }),
+            .text = try s.call.arena.print("{s}-{d}", .{ req.text, i }),
             .index = i,
         });
     }
@@ -613,7 +613,7 @@ fn srvBidi(s: *M.Stream) anyerror!void {
     while (try s.receive()) |*r| {
         defer @constCast(r).deinit();
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "re:{s}", .{r.value.text}),
+            .text = try s.call.arena.print("re:{s}", .{r.value.text}),
             .index = i,
         });
         i += 1;
@@ -782,7 +782,7 @@ const Reverse = struct {
     fn reported(rv: *const Reverse, key: []const u8) ![]const u8 {
         var it = std.mem.splitScalar(u8, rv.report, '\n');
         while (it.next()) |line| {
-            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            const tab = std.mem.findScalar(u8, line, '\t') orelse continue;
             if (std.mem.eql(u8, line[0..tab], key)) return line[tab + 1 ..];
         }
         std.debug.print("\nthe reference client's report has no `{s}`\n", .{key});
@@ -796,7 +796,7 @@ const Reverse = struct {
 
     fn expectReportedInt(rv: *const Reverse, key: []const u8, got: anytype) !void {
         var buf: [32]u8 = undefined;
-        try rv.expectReported(key, try std.fmt.bufPrint(&buf, "{d}", .{got}));
+        try rv.expectReported(key, try std.mem.print(&buf, "{d}", .{got}));
     }
 
     /// grpcio names statuses in SCREAMING_SNAKE (`PERMISSION_DENIED`); our
@@ -964,7 +964,7 @@ fn replayReverse(gpa: Allocator) !Reverse {
     try resp_conn.recv(response_bytes, &wire, &events);
     for (events.items) |*ev| switch (ev.*) {
         .headers => |*hd| {
-            const idx = std.mem.indexOfScalar(u31, ids.items, hd.stream_id) orelse {
+            const idx = std.mem.findScalar(u31, ids.items, hd.stream_id) orelse {
                 hd.headers.deinit(gpa);
                 continue;
             };
@@ -978,7 +978,7 @@ fn replayReverse(gpa: Allocator) !Reverse {
             } else hd.headers.deinit(gpa);
         },
         .data => |d| {
-            const idx = std.mem.indexOfScalar(u31, ids.items, d.stream_id) orelse continue;
+            const idx = std.mem.findScalar(u31, ids.items, d.stream_id) orelse continue;
             const c = &rv.streams.items[idx];
             try c.body.appendSlice(gpa, d.data);
             c.data_frames += 1;
@@ -1011,7 +1011,7 @@ test "replay grpcio AS CLIENT: our server answers all four call shapes the way t
         try rv.expectReported("unary.text", d.value.text);
         try rv.expectReportedInt("unary.index", d.value.index);
         var hex_buf: [64]u8 = undefined;
-        try rv.expectReported("unary.blob", try std.fmt.bufPrint(&hex_buf, "{x}", .{d.value.blob}));
+        try rv.expectReported("unary.blob", try std.mem.print(&hex_buf, "{x}", .{d.value.blob}));
         try rv.expectReportedStatus("unary.code", c);
         // HEADERS, DATA, then a real trailer section — three frames, not one.
         try testing.expect(!c.isTrailersOnly());
@@ -1172,7 +1172,7 @@ test "replay grpcio AS CLIENT: metadata, deadlines and a many-frame reply" {
         // Our server decoded grpcio's OWN base64 `-bin` header to get this.
         try rv.expectReported("meta.body_text", d.value.text);
         var hex_buf: [64]u8 = undefined;
-        try rv.expectReported("meta.body_blob", try std.fmt.bufPrint(&hex_buf, "{x}", .{d.value.blob}));
+        try rv.expectReported("meta.body_blob", try std.mem.print(&hex_buf, "{x}", .{d.value.blob}));
 
         try rv.expectReported("meta.initial_ascii", c.header("x-echo").?);
         try rv.expectReported("meta.trailing_ascii", c.trailer("x-tail").?);
@@ -1189,12 +1189,12 @@ test "replay grpcio AS CLIENT: metadata, deadlines and a many-frame reply" {
         const ib_len = try dec.calcSizeForSlice(ib);
         try dec.decode(bin_buf[0..ib_len], ib);
         try testing.expectEqualSlices(u8, &raw, bin_buf[0..ib_len]);
-        try rv.expectReported("meta.initial_bin", try std.fmt.bufPrint(&hex_buf, "{x}", .{bin_buf[0..ib_len]}));
+        try rv.expectReported("meta.initial_bin", try std.mem.print(&hex_buf, "{x}", .{bin_buf[0..ib_len]}));
 
         const tb = c.trailer("x-tail-bin").?;
         const tb_len = try dec.calcSizeForSlice(tb);
         try dec.decode(bin_buf[0..tb_len], tb);
-        try rv.expectReported("meta.trailing_bin", try std.fmt.bufPrint(&hex_buf, "{x}", .{bin_buf[0..tb_len]}));
+        try rv.expectReported("meta.trailing_bin", try std.mem.print(&hex_buf, "{x}", .{bin_buf[0..tb_len]}));
     }
 
     // ── grpc-timeout, as the reference rendered it ──
@@ -1221,7 +1221,7 @@ test "replay grpcio AS CLIENT: metadata, deadlines and a many-frame reply" {
         const raw = d.value.text;
         try testing.expect(raw.len >= 2);
         try testing.expect(switch (raw[raw.len - 1]) {
-            'H', 'M', 'S', 'm', 'u', 'n' => std.mem.indexOfNone(u8, raw[0 .. raw.len - 1], "0123456789") == null,
+            'H', 'M', 'S', 'm', 'u', 'n' => std.mem.findNone(u8, raw[0 .. raw.len - 1], "0123456789") == null,
             else => false,
         });
 
@@ -1266,8 +1266,8 @@ test "the capture's provenance is recorded" {
     // machine with no grpcio. These four lines are what a reader needs.
     try testing.expect(std.mem.startsWith(u8, capture.reference, "Python grpcio "));
     try testing.expectEqual(@as(usize, 10), capture.captured_on.len);
-    try testing.expect(std.mem.indexOf(u8, capture.command, "--capture") != null);
-    try testing.expect(std.mem.indexOf(u8, capture.reverse_service, "echo.Echo") != null);
+    try testing.expect(std.mem.find(u8, capture.command, "--capture") != null);
+    try testing.expect(std.mem.find(u8, capture.reverse_service, "echo.Echo") != null);
     // Every forward case the tests above look up must exist.
     for ([_][]const u8{
         "unary",         "server_stream",    "client_stream",

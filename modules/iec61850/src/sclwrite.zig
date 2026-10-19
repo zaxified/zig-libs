@@ -642,19 +642,19 @@ const Writer = struct {
 
     fn attrUint(self: *Writer, name: []const u8, value: u64) Error!void {
         var tmp: [24]u8 = undefined;
-        try self.attr(name, std.fmt.bufPrint(&tmp, "{d}", .{value}) catch unreachable);
+        try self.attr(name, std.mem.print(&tmp, "{d}", .{value}) catch unreachable);
     }
 
     fn attrInt(self: *Writer, name: []const u8, value: i64) Error!void {
         var tmp: [24]u8 = undefined;
-        try self.attr(name, std.fmt.bufPrint(&tmp, "{d}", .{value}) catch unreachable);
+        try self.attr(name, std.mem.print(&tmp, "{d}", .{value}) catch unreachable);
     }
 
     fn textElement(self: *Writer, name: []const u8, value: u64) Error!void {
         try self.open(name);
         try self.closeInline();
         var tmp: [24]u8 = undefined;
-        try self.text(std.fmt.bufPrint(&tmp, "{d}", .{value}) catch unreachable);
+        try self.text(std.mem.print(&tmp, "{d}", .{value}) catch unreachable);
         try self.rawEnd(name);
     }
 
@@ -744,10 +744,10 @@ test "the emission is well-formed, namespaced SCL that our own parser accepts" {
     try testing.expect(std.mem.startsWith(u8, out, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<SCL xmlns="));
     // The sample declares edition 1, and the emission keeps it — an edition is
     // not a formatting choice.
-    try testing.expect(std.mem.indexOf(u8, out, scl.ns_2003) != null);
+    try testing.expect(std.mem.find(u8, out, scl.ns_2003) != null);
     try testing.expect(std.mem.endsWith(u8, out, "</SCL>\n"));
     // No DOCTYPE — the sibling parser refuses one, and so should every other.
-    try testing.expect(std.mem.indexOf(u8, out, "<!DOCTYPE") == null);
+    try testing.expect(std.mem.find(u8, out, "<!DOCTYPE") == null);
 
     // Every piece of the model is there by name.
     for ([_][]const u8{
@@ -761,7 +761,7 @@ test "the emission is well-formed, namespaced SCL that our own parser accepts" {
         "<DAI",                  "<Val>",           "<DataTypeTemplates>",
         "<LNodeType",            "<DOType",         "<DAType",
     }) |needle| {
-        if (std.mem.indexOf(u8, out, needle) == null) {
+        if (std.mem.find(u8, out, needle) == null) {
             std.debug.print("missing from the emitted SCL: {s}\n", .{needle});
             return error.TestExpectedEqual;
         }
@@ -817,7 +817,7 @@ test "a document with a Substation section is refused rather than silently trimm
     // …and the caller can say "yes, I know".
     const out = try emitParsed(testing.allocator, &doc, .{ .allow_lossy = true });
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Substation") == null);
+    try testing.expect(std.mem.find(u8, out, "Substation") == null);
 }
 
 test "a cyclic type graph is refused before anything is written" {
@@ -847,7 +847,7 @@ test "a cyclic type graph is refused before anything is written" {
     // lists — which is what makes the refusal a policy and not a crash guard.
     const out = try emit(testing.allocator, .{ .templates = templates }, .{ .check_types = false });
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "<DAType id=\"Vector\"") != null);
+    try testing.expect(std.mem.find(u8, out, "<DAType id=\"Vector\"") != null);
 }
 
 test "markup in a name or a value is escaped, and a control character is refused" {
@@ -860,8 +860,8 @@ test "markup in a name or a value is escaped, and a control character is refused
 
     const out = try emit(testing.allocator, .{ .header = .{ .id = "H" }, .ieds = &ieds }, .{});
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "&lt;script&gt;&amp;&quot;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "a &lt; b &amp; c &gt; d \"q\"") != null);
+    try testing.expect(std.mem.find(u8, out, "&lt;script&gt;&amp;&quot;") != null);
+    try testing.expect(std.mem.find(u8, out, "a &lt; b &amp; c &gt; d \"q\"") != null);
     // And it re-parses to the original strings.
     var back = try scl.parse(testing.allocator, out, .{});
     defer back.deinit();
@@ -967,12 +967,12 @@ test "a Log element survives the round trip and is emitted after the DOIs" {
 
     const out = try emitParsed(testing.allocator, &a, .{});
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "<Log name=\"GeneralLog\"/>") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "<Log name=\"SecondLog\" desc=\"the other one\"/>") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "<Log/>") != null);
+    try testing.expect(std.mem.find(u8, out, "<Log name=\"GeneralLog\"/>") != null);
+    try testing.expect(std.mem.find(u8, out, "<Log name=\"SecondLog\" desc=\"the other one\"/>") != null);
+    try testing.expect(std.mem.find(u8, out, "<Log/>") != null);
     // …after the DOIs, which is where `tAnyLN` sequences it.
-    const log_at = std.mem.indexOf(u8, out, "<Log ").?;
-    const lcb_at = std.mem.indexOf(u8, out, "<LogControl ").?;
+    const log_at = std.mem.find(u8, out, "<Log ").?;
+    const lcb_at = std.mem.find(u8, out, "<LogControl ").?;
     try testing.expect(lcb_at < log_at);
 
     var b = try scl.parse(testing.allocator, out, .{});

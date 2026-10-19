@@ -79,7 +79,7 @@ test "SHA-256 over both derived constant tables, pinned from an outside port" {
         var out: [32]u8 = undefined;
         h.final(&out);
         var hex: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&hex, "{x}", .{&out}) catch unreachable;
+        _ = std.mem.print(&hex, "{x}", .{&out}) catch unreachable;
         try std.testing.expectEqualStrings(c[1], &hex);
     }
 }

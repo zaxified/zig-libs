@@ -110,7 +110,7 @@ fn matchDnsNameRaw(presented: []const u8, host: []const u8, raw: []const u8) boo
     if (presented.len >= 2 and presented[0] == '*' and presented[1] == '.') {
         // Wildcard: the host's first label is any one non-empty label; the
         // rest must match label for label.
-        const dot = std.mem.indexOfScalar(u8, host, '.') orelse return false;
+        const dot = std.mem.findScalar(u8, host, '.') orelse return false;
         if (dot == 0) return false;
         return std.ascii.eqlIgnoreCase(host[dot..], presented[1..]);
     }

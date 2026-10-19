@@ -718,8 +718,8 @@ pub fn scopeKey(
 ) ?[]const u8 {
     const who = principal orelse "*";
     return switch (scope) {
-        .key_only => std.fmt.bufPrint(buf, "{s} {s}", .{ who, client_key }) catch null,
-        .target => std.fmt.bufPrint(buf, "{s} {s} {s} {s}", .{
+        .key_only => std.mem.print(buf, "{s} {s}", .{ who, client_key }) catch null,
+        .target => std.mem.print(buf, "{s} {s} {s} {s}", .{
             who, method, path, client_key,
         }) catch null,
     };
@@ -735,7 +735,7 @@ pub const principal_hex_len = 32;
 pub fn principalTag(principal: []const u8, out: *[principal_hex_len]u8) []const u8 {
     var d: [digest_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(principal, &d, .{});
-    return std.fmt.bufPrint(out, "{x}", .{d[0 .. principal_hex_len / 2]}) catch unreachable;
+    return std.mem.print(out, "{x}", .{d[0 .. principal_hex_len / 2]}) catch unreachable;
 }
 
 fn badRequest(ctx: *router.Ctx) anyerror!void {
@@ -809,7 +809,7 @@ fn hOrder(ctx: *router.Ctx) anyerror!void {
     const app: *App = @ptrCast(@alignCast(ctx.state.?));
     app.calls += 1;
     var body_buf: [32]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "order-{d}", .{app.calls}) catch unreachable;
+    const body = std.mem.print(&body_buf, "order-{d}", .{app.calls}) catch unreachable;
     try app.store.respond(ctx, 201, "application/json", body);
 }
 
@@ -834,14 +834,14 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -1398,7 +1398,7 @@ fn fzHandler(ctx: *router.Ctx) anyerror!void {
     const seen = try ctx.req.reader().allocRemaining(testing.allocator, .limited(4096));
     defer testing.allocator.free(seen);
     var buf: [128]u8 = undefined;
-    const body = std.fmt.bufPrint(&buf, "n{d}:{s}", .{ n, seen }) catch unreachable;
+    const body = std.mem.print(&buf, "n{d}:{s}", .{ n, seen }) catch unreachable;
     const status: u16 = 200 + @as(u16, @intCast(n % 3));
     const ct: ?[]const u8 = if (n % 3 == 0) null else if (n % 2 == 0) "text/plain" else "application/json";
     if (std.mem.eql(u8, ctx.req.path, "/raw")) {
@@ -1672,7 +1672,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                 model_calls += 1;
                 const n = model_calls;
                 var want_buf: [128]u8 = undefined;
-                const want_body = std.fmt.bufPrint(&want_buf, "n{d}:{s}", .{ n, op.body }) catch unreachable;
+                const want_body = std.mem.print(&want_buf, "n{d}:{s}", .{ n, op.body }) catch unreachable;
                 const want_status: u16 = 200 + @as(u16, @intCast(n % 3));
                 try testing.expectEqual(want_status, status);
                 try testing.expectEqualStrings(want_body, body);
@@ -1755,9 +1755,9 @@ test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on rand
         var wl: usize = 0;
         const wstr = if (who) |s| s else "*";
         const piece = if (sc == .target)
-            std.fmt.bufPrint(&want_buf, "{s} {s} {s} {s}", .{ wstr, names[mi], path, key[0..@min(klen, 100)] }) catch unreachable
+            std.mem.print(&want_buf, "{s} {s} {s} {s}", .{ wstr, names[mi], path, key[0..@min(klen, 100)] }) catch unreachable
         else
-            std.fmt.bufPrint(&want_buf, "{s} {s}", .{ wstr, key[0..@min(klen, 100)] }) catch unreachable;
+            std.mem.print(&want_buf, "{s} {s}", .{ wstr, key[0..@min(klen, 100)] }) catch unreachable;
         wl = piece.len;
         // Output buffer sized around the wanted length so both outcomes occur.
         var out_buf: [512]u8 = undefined;

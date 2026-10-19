@@ -256,10 +256,10 @@ fn progress(w: *std.Io.Writer, mark: []const u8, name: []const u8, src_size: usi
     w.writeAll("-") catch {};
     name17(w, name);
     w.writeAll(" :") catch {};
-    disp.right(w, std.fmt.bufPrint(&b, "{d}", .{src_size}) catch unreachable, 10) catch {};
+    disp.right(w, std.mem.print(&b, "{d}", .{src_size}) catch unreachable, 10) catch {};
     w.writeAll(" ->") catch {};
     if (c_size) |cs| {
-        disp.right(w, std.fmt.bufPrint(&b, "{d}", .{cs}) catch unreachable, 10) catch {};
+        disp.right(w, std.mem.print(&b, "{d}", .{cs}) catch unreachable, 10) catch {};
         const digits: u8 = 1 + @as(u8, @intFromBool(ratio < 100)) + @as(u8, @intFromBool(ratio < 10));
         w.writeAll(" (x") catch {};
         disp.fixed(w, ratio, 5, digits) catch {};
@@ -399,8 +399,8 @@ fn benchMem(env: fio.Env, src_in: []const u8, file_sizes: []const usize, level: 
     if (disp.level == 1) {
         var b: [24]u8 = undefined;
         out.writeAll("-") catch {};
-        disp.left(out, std.fmt.bufPrint(&b, "{d}", .{level}) catch unreachable, 3) catch {};
-        disp.right(out, std.fmt.bufPrint(&b, "{d}", .{c_size}) catch unreachable, 11) catch {};
+        disp.left(out, std.mem.print(&b, "{d}", .{level}) catch unreachable, 3) catch {};
+        disp.right(out, std.mem.print(&b, "{d}", .{c_size}) catch unreachable, 11) catch {};
         out.writeAll(" (") catch {};
         disp.fixed(out, ratio, 5, 3) catch {};
         out.writeAll(") ") catch {};
@@ -413,7 +413,7 @@ fn benchMem(env: fio.Env, src_in: []const u8, file_sizes: []const usize, level: 
     }
     if (disp.level >= 2) {
         var b: [16]u8 = undefined;
-        disp.right(out, std.fmt.bufPrint(&b, "{d}", .{level}) catch unreachable, 2) catch {};
+        disp.right(out, std.mem.print(&b, "{d}", .{level}) catch unreachable, 2) catch {};
         out.writeAll("#\n") catch {};
     }
     out.flush() catch {};
@@ -422,7 +422,7 @@ fn benchMem(env: fio.Env, src_in: []const u8, file_sizes: []const usize, level: 
 
 /// `BMK_benchCLevels`.
 fn benchLevels(env: fio.Env, src: []const u8, file_sizes: []const usize, start: i32, end: i32, cp: fio.CParams, dict: ?[]const u8, display_name: []const u8, params: *const Params) u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, display_name, '/')) |i| display_name[i + 1 ..] else display_name;
+    const base = if (std.mem.findScalarLast(u8, display_name, '/')) |i| display_name[i + 1 ..] else display_name;
     if (end > zstd.max_level) {
         disp.at(1, "Invalid Compression Level \n", .{});
         return 15;
@@ -497,7 +497,7 @@ pub fn benchFiles(env: fio.Env, names: []const []const u8, dict_name: ?[]const u
         sizes[i] = data.len;
     }
     var mf: [20]u8 = undefined;
-    const display_name = if (names.len > 1) std.fmt.bufPrint(&mf, " {d} files", .{names.len}) catch unreachable else names[0];
+    const display_name = if (names.len > 1) std.mem.print(&mf, " {d} files", .{names.len}) catch unreachable else names[0];
     return benchLevels(env, buf.items, sizes, start, end, cp, dict, display_name, params);
 }
 
@@ -514,7 +514,7 @@ pub fn syntheticTest(env: fio.Env, compressibility: ?f64, start: i32, end: i32, 
     var name: []const u8 = "Lorem ipsum";
     if (compressibility) |c| {
         synthetic.datagen(src, c, 0);
-        name = std.fmt.bufPrint(&name_buf, "Synthetic {d}%", .{@as(u32, @intFromFloat(c * 100))}) catch unreachable;
+        name = std.mem.print(&name_buf, "Synthetic {d}%", .{@as(u32, @intFromFloat(c * 100))}) catch unreachable;
     } else synthetic.lorem(src, 0);
     return benchLevels(env, src, &.{size}, start, end, cp, null, name, params);
 }

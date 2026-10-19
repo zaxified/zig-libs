@@ -997,14 +997,14 @@ const testing = std.testing;
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, i, needle)) |at| : (i = at + needle.len) n += 1;
+    while (std.mem.findPos(u8, haystack, i, needle)) |at| : (i = at + needle.len) n += 1;
     return n;
 }
 
 test "the client holds no second copy of the request frame" {
     const src = @embedFile("client.zig");
     const banner = "\n// ── tests ──";
-    const code = src[0 .. std.mem.indexOf(u8, src, banner) orelse return error.TestBannerMoved];
+    const code = src[0 .. std.mem.find(u8, src, banner) orelse return error.TestBannerMoved];
 
     // The three calls that spell an ethtool request frame. `header.beginRequest`
     // and `header.finishRequest` are the only place they belong.
@@ -1387,7 +1387,7 @@ test "corpus: every notification seed reaches both parsers, and the counts are p
 test "every path that collects a reply also binds it to the requested device" {
     const src = @embedFile("client.zig");
     const banner = "\n// ── tests ──";
-    const code = src[0 .. std.mem.indexOf(u8, src, banner) orelse return error.TestBannerMoved];
+    const code = src[0 .. std.mem.find(u8, src, banner) orelse return error.TestBannerMoved];
     try testing.expectEqual(
         countOccurrences(code, "cl.collect(seq)"),
         countOccurrences(code, "cl.checkReplyEcho("),

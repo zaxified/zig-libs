@@ -1212,7 +1212,7 @@ pub const PathGuardError = error{ PathTooLong, PathForbidden };
 /// and `pathHasDotSegments` says whether it has anything to do.
 pub fn checkOriginPath(path: []const u8) PathGuardError!void {
     if (path.len > max_normalized_path) return error.PathTooLong;
-    if (std.mem.indexOfScalar(u8, path, 0) != null or
+    if (std.mem.findScalar(u8, path, 0) != null or
         std.ascii.findIgnoreCase(path, "%00") != null)
         return error.PathForbidden;
 }
@@ -1221,7 +1221,7 @@ pub fn checkOriginPath(path: []const u8) PathGuardError!void {
 /// it that does needs a "/." to fire, and a path without one comes back byte
 /// for byte at the same length — so a caller may skip the copy.
 pub fn pathHasDotSegments(path: []const u8) bool {
-    return std.mem.indexOf(u8, path, "/.") != null;
+    return std.mem.find(u8, path, "/.") != null;
 }
 
 /// Copy `path` into `buf` (which must hold `path.len` bytes) and collapse
@@ -2161,7 +2161,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // Request-line bound (Go checks its URI length the same way, after the
     // line is in memory — the head buffer already bounds the read itself).
     if (opts.max_request_line_bytes) |max| {
-        const eol = std.mem.indexOfScalar(u8, block, '\n') orelse block.len;
+        const eol = std.mem.findScalar(u8, block, '\n') orelse block.len;
         if (std.mem.trimEnd(u8, block[0..eol], "\r").len > max)
             return respondError(opts, out, date, 414);
     }
@@ -2216,14 +2216,14 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         if (!h1.isValidHost(target)) return respondError(opts, out, date, 400);
         target = "";
     } else if (target[0] != '/' and !std.mem.eql(u8, target, "*")) {
-        const scheme_end = std.mem.indexOf(u8, target, "://") orelse return respondError(opts, out, date, 400);
+        const scheme_end = std.mem.find(u8, target, "://") orelse return respondError(opts, out, date, 400);
         const scheme = target[0..scheme_end];
         if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https"))
             return respondError(opts, out, date, 400);
         const rest = target[scheme_end + 3 ..];
         // The authority ends at the first '/' or '?'; a target with neither
         // ("http://host") names an empty path, which is "/" (§3.2.2).
-        const end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+        const end = std.mem.findAny(u8, rest, "/?") orelse rest.len;
         if (end == 0 or !h1.isValidHost(rest[0..end])) return respondError(opts, out, date, 400);
         // §3.3: the target's authority is authoritative and Host is ignored.
         // Ignoring alone would still leave `Request.header("host")` reading
@@ -2246,7 +2246,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     if (std.mem.eql(u8, target, "*") and method != .options) return respondError(opts, out, date, 400);
     var path: []const u8 = target;
     var query: []const u8 = query_of_empty_path;
-    if (std.mem.indexOfScalar(u8, target, '?')) |i| {
+    if (std.mem.findScalar(u8, target, '?')) |i| {
         path = target[0..i];
         query = target[i + 1 ..];
     }
@@ -2685,7 +2685,7 @@ pub const Request = struct {
     /// decoded `user:password` (the header's length suffices); null when the
     /// header is absent, another scheme, malformed, or longer than `out`.
     /// Compare the password in constant time (`std.crypto.timing_safe.eql`
-    /// over equal-length digests), never with `mem.eql`.
+    /// over equal-length digests), never with `std.mem.eql`.
     pub fn basicAuth(req: *const Request, out: []u8) ?BasicCredentials {
         return helpers.basicAuth(req.header("authorization") orelse return null, out);
     }
@@ -3962,7 +3962,7 @@ pub const ResponseWriter = struct {
         if (!rw.upgradable or rw.field_sink != null or rw.http1_0 or rw.head_request)
             return error.Unsupported;
         // RFC 9110 §7.8: protocol-name ["/" protocol-version], both tokens.
-        const slash = std.mem.indexOfScalar(u8, protocol, '/');
+        const slash = std.mem.findScalar(u8, protocol, '/');
         const name = protocol[0 .. slash orelse protocol.len];
         if (!h1.isToken(name)) return error.InvalidHeader;
         if (slash) |i| if (!h1.isToken(protocol[i + 1 ..])) return error.InvalidHeader;
@@ -4930,7 +4930,7 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.writeAll("only5"); // deliberately under-delivers
     } else if (std.mem.eql(u8, req.path, "/identbig")) {
         var len_buf: [8]u8 = undefined;
-        try rw.setHeader("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{big_body.len}));
+        try rw.setHeader("Content-Length", try std.mem.print(&len_buf, "{d}", .{big_body.len}));
         try rw.writeAll(big_body);
     } else if (std.mem.eql(u8, req.path, "/overrun")) {
         try rw.setHeader("Content-Length", "5");
@@ -4956,7 +4956,7 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         // Declared Content-Length on a compressible body.
         try rw.setHeader("Content-Type", "application/json");
         var len_buf: [8]u8 = undefined;
-        try rw.setHeader("Content-Length", try std.fmt.bufPrint(&len_buf, "{d}", .{json_body.len}));
+        try rw.setHeader("Content-Length", try std.mem.print(&len_buf, "{d}", .{json_body.len}));
         try rw.writeAll(json_body);
     } else if (std.mem.eql(u8, req.path, "/bin")) {
         // Big but not a compressible type.
@@ -4970,7 +4970,7 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         // test does not also have to account for chunked framing.
         rw.setStatus(206);
         var cr_buf: [32]u8 = undefined;
-        try rw.setHeader("Content-Range", try std.fmt.bufPrint(&cr_buf, "bytes 0-{d}/{d}", .{ small_json.len - 1, small_json.len }));
+        try rw.setHeader("Content-Range", try std.mem.print(&cr_buf, "bytes 0-{d}/{d}", .{ small_json.len - 1, small_json.len }));
         try rw.setHeader("Content-Type", "application/json");
         try rw.setHeader("ETag", "\"strong-tag\"");
         try rw.writeAll(small_json);
@@ -5000,7 +5000,7 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
             total += n;
         }
         var buf: [32]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
+        try rw.writeAll(try std.mem.print(&buf, "drained {d}", .{total}));
     } else if (std.mem.eql(u8, req.path, "/trailers")) {
         // Drain the body to end-of-stream (trailers arrive after the last
         // chunk), then echo a captured trailer field.
@@ -5013,7 +5013,7 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         }
         const cs = req.trailer("X-Checksum") orelse "none";
         var buf: [96]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&buf, "trailer={s}", .{cs}));
+        try rw.writeAll(try std.mem.print(&buf, "trailer={s}", .{cs}));
     } else if (std.mem.eql(u8, req.path, "/outtrailers")) {
         // Response trailers on a body that FITS the response buffer: the
         // declaration alone must force chunked framing (an exact
@@ -5258,13 +5258,13 @@ test "serveStream: keep-alive serves two requests from one buffer" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "\r\n\r\nhello"));
     // Only the second response announces the close.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Connection: close\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close").? > std.mem.indexOf(u8, got, "hello").?);
+    try testing.expect(std.mem.find(u8, got, "Connection: close").? > std.mem.find(u8, got, "hello").?);
 }
 
 test "serveStream: Content-Length request body reaches the handler" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\nhello", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length: 5\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length: 5\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
 }
 
@@ -5272,7 +5272,7 @@ test "serveStream: chunked request body is decoded for the handler" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length: 9\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length: 9\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nWikipedia"));
 }
 
@@ -5300,10 +5300,10 @@ test "serveStream: Expect: 100-continue is lazy -- a handler that never reads se
     // may parse: the second request must not be served.
     const got = runStream(&hits, "POST /hello HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+    try testing.expect(std.mem.find(u8, got, "100 Continue") == null);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
     // The client is told the connection ends here.
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
     try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
 }
 
@@ -5311,14 +5311,14 @@ test "serveStream: Expect: 100-continue -- no 100 after the final head, if the h
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "POST /answer-then-read HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+    try testing.expect(std.mem.find(u8, got, "100 Continue") == null);
 }
 
 test "serveStream: Expect: 100-continue on a request with no body -- nothing to invite, the connection keeps alive" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+    try testing.expect(std.mem.find(u8, got, "100 Continue") == null);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
 }
 
@@ -5422,7 +5422,7 @@ test "serveStream: protocol rejections (505, 400s, 431)" {
     // "*" is for OPTIONS alone (§3.2.4).
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET * HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 400 Bad Request\r\n"));
     // A 1.0 client gets no 100 Continue (RFC 9110 §10.1.1).
-    try testing.expect(std.mem.indexOf(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
+    try testing.expect(std.mem.find(u8, runStream(null, "POST /echo HTTP/1.0\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\nhi", &out_buf), "100 Continue") == null);
     const long_head = "GET / HTTP/1.1\r\nHost: t\r\nX-Big: " ++ (strRepeat("a", 2000)) ++ "\r\n\r\n";
     try testing.expect(std.mem.startsWith(u8, runStream(null, long_head, &out_buf), "HTTP/1.1 431 Request Header Fields Too Large\r\n"));
 }
@@ -5434,9 +5434,9 @@ test "serveStream: handler error → clean 500, keep-alive survives" {
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
     // The partial body and headers staged before the error were dropped.
-    try testing.expect(std.mem.indexOf(u8, got, "partial") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "X-Dropped") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "Internal Server Error\n") != null);
+    try testing.expect(std.mem.find(u8, got, "partial") == null);
+    try testing.expect(std.mem.find(u8, got, "X-Dropped") == null);
+    try testing.expect(std.mem.find(u8, got, "Internal Server Error\n") != null);
     // The connection stayed usable for the next request.
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
@@ -5463,25 +5463,25 @@ test "serveStream: error_headers go on the server's own 4xx/5xx answers, not on 
     // The 500 that replaces a failed handler's response.
     const failed = runStreamWith(.{ .error_headers = &extra }, null, "GET /fail HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, failed, "HTTP/1.1 500 Internal Server Error\r\n"));
-    try testing.expect(std.mem.indexOf(u8, failed, "\r\nX-Content-Type-Options: nosniff\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, failed, "\r\nContent-Security-Policy: default-src 'none'\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, failed, "text/html") == null);
-    try testing.expect(std.mem.indexOf(u8, failed, "Injected") == null);
+    try testing.expect(std.mem.find(u8, failed, "\r\nX-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(std.mem.find(u8, failed, "\r\nContent-Security-Policy: default-src 'none'\r\n") != null);
+    try testing.expect(std.mem.find(u8, failed, "text/html") == null);
+    try testing.expect(std.mem.find(u8, failed, "Injected") == null);
     // A handler's own response is the handler's (and its middleware's).
     const ok = runStreamWith(.{ .error_headers = &extra }, null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, ok, "nosniff") == null);
+    try testing.expect(std.mem.find(u8, ok, "nosniff") == null);
 }
 
 test "serveStream: error_headers cap counts usable entries only" {
     var extra: [40]http.Header = undefined;
     var names: [40][8]u8 = undefined;
     extra[0] = .{ .name = "Server", .value = "x" }; // skipped, not counted
-    for (extra[1..], names[1..], 1..) |*h, *nb, i| h.* = .{ .name = std.fmt.bufPrint(nb, "X-H{d}", .{i}) catch unreachable, .value = "1" };
+    for (extra[1..], names[1..], 1..) |*h, *nb, i| h.* = .{ .name = std.mem.print(nb, "X-H{d}", .{i}) catch unreachable, .value = "1" };
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .error_headers = &extra }, null, "GET / HTTP/1.1\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-H32: 1\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "\r\nX-H33: 1\r\n") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "Server: x") == null);
+    try testing.expect(std.mem.find(u8, got, "\r\nX-H32: 1\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\nX-H33: 1\r\n") == null);
+    try testing.expect(std.mem.find(u8, got, "Server: x") == null);
 }
 
 test "serveStream: explicit Content-Length responses" {
@@ -5490,8 +5490,8 @@ test "serveStream: explicit Content-Length responses" {
     try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /declared HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "Content-Length: 5\r\n\r\n12345"));
     // Declared and streamed past the buffer (identity framing, no chunking).
     const ident = runStream(null, "GET /identbig HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, ident, "Content-Length: 87\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, ident, "Transfer-Encoding") == null);
+    try testing.expect(std.mem.find(u8, ident, "Content-Length: 87\r\n") != null);
+    try testing.expect(std.mem.find(u8, ident, "Transfer-Encoding") == null);
     try testing.expect(std.mem.endsWith(u8, ident, "\r\n\r\n" ++ big_body));
 }
 
@@ -5517,9 +5517,9 @@ test "serveStream: HTTP/1.0 gets identity-until-close instead of chunked" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "GET /big HTTP/1.0\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "Transfer-Encoding") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Transfer-Encoding") == null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length") == null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\n" ++ big_body));
 }
 
@@ -5529,34 +5529,34 @@ test "serveStream: HTTP/1.0 keep-alive persists with a known length, closes with
     const kept = runStream(null, "GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, kept, "HTTP/1.1 200 OK\r\n"));
-    const first_end = std.mem.indexOf(u8, kept, "\r\n\r\n").?;
-    try testing.expect(std.mem.indexOf(u8, kept[0..first_end], "Connection: keep-alive\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, kept[0..first_end], "Content-Length: ") != null);
+    const first_end = std.mem.find(u8, kept, "\r\n\r\n").?;
+    try testing.expect(std.mem.find(u8, kept[0..first_end], "Connection: keep-alive\r\n") != null);
+    try testing.expect(std.mem.find(u8, kept[0..first_end], "Content-Length: ") != null);
     // Opted in, but the body outgrows the buffer with no declared length: an
     // HTTP/1.0 body can only end at the close, so the connection closes.
     var out_buf2: [8192]u8 = undefined;
     const closed = runStream(null, "GET /big HTTP/1.0\r\nConnection: keep-alive\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf2);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, closed, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, closed, "Connection: close\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, closed, "keep-alive") == null);
+    try testing.expect(std.mem.find(u8, closed, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, closed, "keep-alive") == null);
     // Not opted in: closes as before, and `close` beats `keep-alive`.
     for ([_][]const u8{ "", "Connection: keep-alive, close\r\n" }) |conn| {
         var out_buf3: [8192]u8 = undefined;
         var wire_buf: [256]u8 = undefined;
-        const wire = try std.fmt.bufPrint(&wire_buf, "GET /hello HTTP/1.0\r\n{s}\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .{conn});
+        const wire = try std.mem.print(&wire_buf, "GET /hello HTTP/1.0\r\n{s}\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", .{conn});
         const once = runStream(null, wire, &out_buf3);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, once, "HTTP/1.1 200 OK\r\n"));
-        try testing.expect(std.mem.indexOf(u8, once, "Connection: close\r\n") != null);
+        try testing.expect(std.mem.find(u8, once, "Connection: close\r\n") != null);
     }
 }
 
 test "addHeader repeats, delHeader removes every line, getHeader reads the first; managed names never repeat" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "GET /hdrs HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Vary: Accept\r\nvary: Origin\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "X-Gone") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "X-First: Accept\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Vary: Accept\r\nvary: Origin\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "X-Gone") == null);
+    try testing.expect(std.mem.find(u8, got, "X-First: Accept\r\n") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "Content-Length: 2\r\n"));
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nok"));
 }
@@ -5596,8 +5596,8 @@ test "delHeader: Content-Length forgets the declared length, Trailer withdraws t
     try testing.expectError(error.TrailerNotDeclared, rw.setTrailer("X-Sum", "1"));
     try rw.writeAll("abc");
     try rw.end();
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Content-Length: 3\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, out.buffered(), "Trailer") == null);
+    try testing.expect(std.mem.find(u8, out.buffered(), "Content-Length: 3\r\n") != null);
+    try testing.expect(std.mem.find(u8, out.buffered(), "Trailer") == null);
 }
 
 test "BodyLimit: under, exactly at and over the cap; a declared length over it never invites the body" {
@@ -5605,23 +5605,23 @@ test "BodyLimit: under, exactly at and over the cap; a declared length over it n
     // Under and exactly at the cap: echoed, the connection stays open.
     for ([_][]const u8{ "1234567", "12345678" }) |b| {
         var wire_buf: [256]u8 = undefined;
-        const wire = try std.fmt.bufPrint(&wire_buf, "POST /limit8 HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ b.len, b });
+        const wire = try std.mem.print(&wire_buf, "POST /limit8 HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n{s}GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ b.len, b });
         const got = runStream(null, wire, &out_buf);
         try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK"));
-        try testing.expect(std.mem.indexOf(u8, got, b) != null);
+        try testing.expect(std.mem.find(u8, got, b) != null);
     }
     // Chunked over the cap: the handler's 413, then the connection closes.
     const chunked = runStream(null, "POST /limit8 HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "5\r\n12345\r\n5\r\n67890\r\n0\r\n\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, chunked, "HTTP/1.1 413 "));
-    try testing.expect(std.mem.indexOf(u8, chunked, "Connection: close\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, chunked, "12345") == null); // nothing past the cap echoed
+    try testing.expect(std.mem.find(u8, chunked, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, chunked, "12345") == null); // nothing past the cap echoed
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, chunked, "HTTP/1.1 "));
     // Declared over the cap with Expect: 100-continue: refused, never invited.
     var out_buf2: [4096]u8 = undefined;
     const declared = runStream(null, "POST /limit8 HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\nExpect: 100-continue\r\n\r\n", &out_buf2);
     try testing.expect(std.mem.startsWith(u8, declared, "HTTP/1.1 413 "));
-    try testing.expect(std.mem.indexOf(u8, declared, "100 Continue") == null);
+    try testing.expect(std.mem.find(u8, declared, "100 Continue") == null);
 }
 
 test "Request.basicAuth and headerAll through serveStream" {
@@ -5631,7 +5631,7 @@ test "Request.basicAuth and headerAll through serveStream" {
     var out_buf2: [4096]u8 = undefined;
     const no = runStream(null, "GET /whoami HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer x\r\nConnection: close\r\n\r\n", &out_buf2);
     try testing.expect(std.mem.startsWith(u8, no, "HTTP/1.1 401 "));
-    try testing.expect(std.mem.indexOf(u8, no, "X-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(std.mem.find(u8, no, "X-Content-Type-Options: nosniff\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, no, "who?\n"));
     var out_buf3: [4096]u8 = undefined;
     const vals = runStream(null, "GET /vals HTTP/1.1\r\nHost: t\r\nX-V: a\r\nX-Other: z\r\nx-v: b, c\r\nConnection: close\r\n\r\n", &out_buf3);
@@ -5761,17 +5761,17 @@ test "ResponseWriter: setHeaderStatic hits the same table limit as setHeader" {
 noinline fn setFromDeadFrame(rw: *ResponseWriter) !void {
     var scratch: [128]u8 = undefined;
     @memset(&scratch, 'v');
-    const name = try std.fmt.bufPrint(scratch[0..16], "X-Doomed-{d}", .{7});
+    const name = try std.mem.print(scratch[0..16], "X-Doomed-{d}", .{7});
     try rw.setHeader(name, scratch[16..64]);
 
     var cookie_buf: [64]u8 = undefined;
-    try rw.addSetCookie(try std.fmt.bufPrint(&cookie_buf, "sid={d}; Path=/", .{4242}));
+    try rw.addSetCookie(try std.mem.print(&cookie_buf, "sid={d}; Path=/", .{4242}));
 
     var tname_buf: [32]u8 = undefined;
     var tval_buf: [32]u8 = undefined;
-    const tname = try std.fmt.bufPrint(&tname_buf, "X-Rows-{d}", .{2});
+    const tname = try std.mem.print(&tname_buf, "X-Rows-{d}", .{2});
     try rw.declareTrailers(&.{tname});
-    try rw.setTrailer(tname, try std.fmt.bufPrint(&tval_buf, "{d}", .{987654}));
+    try rw.setTrailer(tname, try std.mem.print(&tval_buf, "{d}", .{987654}));
 }
 
 /// Reuse the frame `setFromDeadFrame` just left, the way the next call down
@@ -5806,12 +5806,12 @@ test "ResponseWriter: header, cookie and trailer bytes survive the caller's dead
     // Header name AND value, the cookie, and the trailer — every byte that
     // went through the copy store, read back off the wire after its source
     // was overwritten.
-    try testing.expect(std.mem.indexOf(u8, wire, "X-Doomed-7: " ++ strRepeat("v", 48) ++ "\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid=4242; Path=/\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Trailer: X-Rows-2\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "X-Rows-2: 987654\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "X-Doomed-7: " ++ strRepeat("v", 48) ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: sid=4242; Path=/\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Trailer: X-Rows-2\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "X-Rows-2: 987654\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+    try testing.expect(std.mem.find(u8, wire, "#") == null);
 }
 
 /// Spend the copy store down to exactly `leave` free bytes, in one header, so
@@ -5890,9 +5890,9 @@ test "declareTrailers: a REJECTED declaration does not widen the setTrailer allo
     try rw.writeAll("body");
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "X-T") == null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Content-Length: 4\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Transfer-Encoding: chunked") == null);
+    try testing.expect(std.mem.find(u8, wire, "X-T") == null);
+    try testing.expect(std.mem.find(u8, wire, "Content-Length: 4\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Transfer-Encoding: chunked") == null);
 }
 
 test "declareTrailers: a REJECTED declaration does not poison the advert of a later one" {
@@ -5926,8 +5926,8 @@ test "declareTrailers: a REJECTED declaration does not poison the advert of a la
     try rw.writeAll("body");
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "Trailer: X-A, X-C\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "X-01234567890123456") == null);
+    try testing.expect(std.mem.find(u8, wire, "Trailer: X-A, X-C\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "X-01234567890123456") == null);
 }
 
 test "header_copy_bytes: pinned by value, in both directions" {
@@ -6041,8 +6041,8 @@ test "ResponseWriter: header CR/LF/NUL + invalid name rejected (response-splitti
     try rw.writeAll("body");
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie") == null);
-    try testing.expect(std.mem.indexOf(u8, wire, "pwned") == null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie") == null);
+    try testing.expect(std.mem.find(u8, wire, "pwned") == null);
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
         "X-Ok: clean\r\n" ++
         "Content-Length: 4\r\n" ++
@@ -6065,9 +6065,9 @@ test "ResponseWriter: addSetCookie emits multiple Set-Cookie lines (Task 2)" {
     try rw.end();
     const wire = out.buffered();
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, wire, "Set-Cookie: "));
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid=abc; HttpOnly\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: theme=dark; Path=/\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "Content-Type: text/plain\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: sid=abc; HttpOnly\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: theme=dark; Path=/\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Content-Type: text/plain\r\n") != null);
     // setHeader for a non-cookie header still replaces (semantics unchanged).
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "Content-Type: "));
 }
@@ -6088,7 +6088,7 @@ test "ResponseWriter: addSetCookie validates the value + head-sent guard (Task 2
     try rw.addSetCookie("ok=1");
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "pwned") == null);
+    try testing.expect(std.mem.find(u8, wire, "pwned") == null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, wire, "Set-Cookie: "));
     // Once the head is on the wire it is too late.
     try testing.expectError(error.HeadersSent, rw.addSetCookie("late=1"));
@@ -6190,7 +6190,7 @@ test "serveStream: chunked body exactly at max_body_bytes passes; unread overrun
         (strRepeat(chunk, 16)) ++ "0\r\n\r\n" ++
         "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
     const got = runStreamWith(.{ .max_body_bytes = 1024 }, &hits, exact, &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "drained 1024") != null);
+    try testing.expect(std.mem.find(u8, got, "drained 1024") != null);
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic)); // keep-alive survived
 
     // A handler that ignores an over-cap body still responds, but the
@@ -6211,15 +6211,15 @@ test "serveStream: peer address and request index reach the handler" {
 
     // Socket-free without a peer: null surfaces, the index still counts.
     const bare = runStream(null, wire_bytes, &out_buf);
-    try testing.expect(std.mem.indexOf(u8, bare, "none #0") != null);
-    try testing.expect(std.mem.indexOf(u8, bare, "none #1") != null);
+    try testing.expect(std.mem.find(u8, bare, "none #0") != null);
+    try testing.expect(std.mem.find(u8, bare, "none #1") != null);
 
     // With `StreamOptions.peer` the handler sees the address on every
     // request of the connection.
     const peer = net.IpAddress.parseIp4("192.0.2.7", 4242) catch unreachable;
     const with_peer = runStreamWith(.{ .peer = peer }, null, wire_bytes, &out_buf);
-    try testing.expect(std.mem.indexOf(u8, with_peer, "192.0.2.7:4242 #0") != null);
-    try testing.expect(std.mem.indexOf(u8, with_peer, "192.0.2.7:4242 #1") != null);
+    try testing.expect(std.mem.find(u8, with_peer, "192.0.2.7:4242 #0") != null);
+    try testing.expect(std.mem.find(u8, with_peer, "192.0.2.7:4242 #1") != null);
 }
 
 const StateLog = struct {
@@ -6250,7 +6250,7 @@ test "serveStream: Content-Length + Transfer-Encoding together → 400 (CL.TE sm
     // Both framings present → rejected before the handler, connection closes.
     const got = runStream(&hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
     // Header order reversed is rejected identically.
     const got2 = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n0\r\n\r\n", &out_buf);
@@ -6274,7 +6274,7 @@ test "serveStream: request path normalized + traversal-clamped before routing" {
     try testing.expect(std.mem.endsWith(u8, runStream(null, "GET /../hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf), "\r\n\r\nhello"));
     // Query survives normalization of the path half.
     const q = runStream(null, "GET /a/../hello?x=1 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, q, "X-Query: x=1\r\n") != null);
+    try testing.expect(std.mem.find(u8, q, "X-Query: x=1\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, q, "\r\n\r\nhello"));
     // Already-normal routes are byte-for-byte unaffected (404 path).
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET /nope HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf), "HTTP/1.1 404 Not Found\r\n"));
@@ -6354,7 +6354,7 @@ test "serveStream: per-connection request cap closes the connection" {
     hits = .init(0);
     const all = runStreamWith(.{ .max_requests_per_conn = 0 }, &hits, three, &out_buf);
     try testing.expectEqual(@as(u32, 3), hits.load(.monotonic));
-    try testing.expect(std.mem.indexOf(u8, all, "Connection: close") == null);
+    try testing.expect(std.mem.find(u8, all, "Connection: close") == null);
 }
 
 // ── tests (offline — Phase 2.2 gzip response compression) ───────────────────
@@ -6466,29 +6466,29 @@ test "serveStream gzip: no Accept-Encoding → identity, Vary still set" {
 test "serveStream gzip: q=0 refusal and HTTP/1.0 stay identity" {
     var out_buf: [4096]u8 = undefined;
     const refused = runStreamWith(.{ .compression = gz_on }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip;q=0\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, refused, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, refused, "Content-Encoding") == null);
     try testing.expect(std.mem.endsWith(u8, refused, small_json));
 
     // HTTP/1.0 cannot take chunked framing → never compressed (nginx
     // `gzip_http_version 1.1` behavior).
     var out_buf2: [4096]u8 = undefined;
     const old = runStreamWith(.{ .compression = gz_on }, null, "GET /jsonbig HTTP/1.0\r\nAccept-Encoding: gzip\r\n\r\n", &out_buf2);
-    try testing.expect(std.mem.indexOf(u8, old, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, old, "Content-Encoding") == null);
     try testing.expect(std.mem.endsWith(u8, old, json_body));
 }
 
 test "serveStream gzip: below min_size stays identity" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .compression = .{ .min_size = 1024 } }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "Vary: Accept-Encoding\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, got, "Vary: Accept-Encoding\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, small_json));
 }
 
 test "serveStream gzip: content-type outside the allowlist stays identity" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .compression = gz_on }, null, "GET /bin HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, got, "Content-Encoding") == null);
     // Big identity body → a *plain* chunked stream; decode and compare.
     var r: Reader = .fixed(got);
     var head_buf: [1024]u8 = undefined;
@@ -6513,22 +6513,22 @@ test "serveStream gzip: pre-encoded response is never re-compressed" {
 test "serveStream gzip: HEAD and 204 are never compressed (Vary still set)" {
     var out_buf: [4096]u8 = undefined;
     const head_res = runStreamWith(.{ .compression = gz_on }, null, "HEAD /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, head_res, "Content-Encoding") == null);
-    try testing.expect(std.mem.indexOf(u8, head_res, "Vary: Accept-Encoding\r\n") != null);
+    try testing.expect(std.mem.find(u8, head_res, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, head_res, "Vary: Accept-Encoding\r\n") != null);
     // HEAD mirrors the identity variant's length.
-    try testing.expect(std.mem.indexOf(u8, head_res, "Content-Length: 32\r\n") != null);
+    try testing.expect(std.mem.find(u8, head_res, "Content-Length: 32\r\n") != null);
 
     var out_buf2: [4096]u8 = undefined;
     const nocontent = runStreamWith(.{ .compression = gz_on }, null, "GET /nocontent HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf2);
     try testing.expect(std.mem.startsWith(u8, nocontent, "HTTP/1.1 204 No Content\r\n"));
-    try testing.expect(std.mem.indexOf(u8, nocontent, "Content-Encoding") == null);
-    try testing.expect(std.mem.indexOf(u8, nocontent, "Vary: Accept-Encoding\r\n") != null);
+    try testing.expect(std.mem.find(u8, nocontent, "Content-Encoding") == null);
+    try testing.expect(std.mem.find(u8, nocontent, "Vary: Accept-Encoding\r\n") != null);
 }
 
 test "serveStream gzip: declared Content-Length is dropped when compressing" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .compression = gz_on }, null, "GET /declgz HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length") == null);
     try expectGzipResponse(got, json_body);
 }
 
@@ -6540,7 +6540,7 @@ test "serveStream gzip: keep-alive survives a compressed response" {
     try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     // The compressed chunked stream terminated cleanly right before the
     // second (identity) response.
-    try testing.expect(std.mem.indexOf(u8, got, "0\r\n\r\nHTTP/1.1 200 OK\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "0\r\n\r\nHTTP/1.1 200 OK\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "hello"));
 }
 
@@ -6595,13 +6595,13 @@ test "serveStream: response trailers land AFTER the terminating chunk (RFC 9112 
         "X-Rows: 3\r\n" ++
         "\r\n", got);
     // No Content-Length anywhere: declaring trailers commits to chunked.
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length") == null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length") == null);
 }
 
 test "serveStream: trailers on a streamed body arrive after the last chunk" {
     var out_buf: [4096]u8 = undefined;
     const got = runStream(null, "GET /outtrailers-stream HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Trailer: X-Checksum\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Trailer: X-Checksum\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "0\r\nX-Checksum: deadbeef\r\n\r\n"));
     // The body really did stream (multiple chunks), so the head was on the
     // wire well before `setTrailer` ran.
@@ -6621,7 +6621,7 @@ test "ResponseWriter.bodyBytesSent: chunked and until-close count body octets, n
         try rw.end();
         try testing.expect(rw.body == .chunked);
         try testing.expectEqual(@as(?u64, 100), rw.bodyBytesSent());
-        try testing.expect(std.mem.indexOf(u8, out.buffered(), "\r\n0\r\n\r\n") != null);
+        try testing.expect(std.mem.find(u8, out.buffered(), "\r\n0\r\n\r\n") != null);
     }
     {
         var out_buf: [512]u8 = undefined;
@@ -6768,8 +6768,8 @@ test "ResponseWriter: an undeclared trailer is refused (the Trailer advert is th
     try testing.expectError(error.InvalidHeader, rw.setTrailer("X-Checksum", "a\r\nX-Evil: 1"));
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "X-Evil") == null);
-    try testing.expect(std.mem.indexOf(u8, wire, "X-Other") == null);
+    try testing.expect(std.mem.find(u8, wire, "X-Evil") == null);
+    try testing.expect(std.mem.find(u8, wire, "X-Other") == null);
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
         "Trailer: X-Checksum, X-Rows\r\n" ++
         "Transfer-Encoding: chunked\r\n" ++
@@ -6853,8 +6853,8 @@ test "ResponseWriter: a gzip-compressed body still carries its trailers" {
         "GET /outtrailers HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
         &out_buf,
     );
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding: gzip\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "Trailer: X-Checksum, X-Rows\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Encoding: gzip\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Trailer: X-Checksum, X-Rows\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "0\r\nX-Checksum: deadbeef\r\nX-Rows: 3\r\n\r\n"));
 }
 
@@ -7062,10 +7062,10 @@ test "serveStream EncoderProvider: a response the gate refuses never touches the
         var t: TestProvider = .{};
         var out_buf: [8192]u8 = undefined;
         var req_buf: [256]u8 = undefined;
-        const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", .{path});
+        const req = try std.mem.print(&req_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", .{path});
         const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, req, &out_buf);
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 "));
-        try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+        try testing.expect(std.mem.find(u8, got, "Content-Encoding") == null);
         try testing.expectEqual(@as(u32, 0), t.acquired);
     }
 }
@@ -7099,7 +7099,7 @@ test "serveStream EncoderProvider: none free falls back to gzip, or to identity;
         var t: TestProvider = .{};
         var out_buf: [8192]u8 = undefined;
         const got = runStreamWith(.{ .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", &out_buf);
-        try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+        try testing.expect(std.mem.find(u8, got, "Content-Encoding") == null);
         try testing.expectEqual(@as(u32, 0), t.acquired);
     }
 }
@@ -7198,7 +7198,7 @@ fn gzipAlloc(plain: []const u8) ![]u8 {
 /// Build a `POST /echo` request whose body is `compressed` under the given
 /// `Content-Encoding` (caller frees).
 fn gzipRequest(content_encoding: []const u8, compressed: []const u8) ![]u8 {
-    return std.fmt.allocPrint(testing.allocator, "POST /echo HTTP/1.1\r\nHost: t\r\n" ++
+    return testing.allocator.print("POST /echo HTTP/1.1\r\nHost: t\r\n" ++
         "Content-Encoding: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{
         content_encoding, compressed.len, compressed,
     });
@@ -7217,8 +7217,8 @@ test "serveStream: gzip request body is decompressed for the handler" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, wire, &out_buf);
     var lenbuf: [32]u8 = undefined;
-    const cl = try std.fmt.bufPrint(&lenbuf, "Content-Length: {d}\r\n", .{plain.len});
-    try testing.expect(std.mem.indexOf(u8, got, cl) != null);
+    const cl = try std.mem.print(&lenbuf, "Content-Length: {d}\r\n", .{plain.len});
+    try testing.expect(std.mem.find(u8, got, cl) != null);
     try testing.expect(std.mem.endsWith(u8, got, plain));
     // The x-gzip alias decodes identically.
     const wire2 = try gzipRequest("x-gzip", compressed);
@@ -7239,7 +7239,7 @@ test "serveStream: gzip request body over the decompressed cap → 413 (zip-bomb
     // before the head is sent.
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 16 }, null, wire, &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413 Content Too Large\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
 }
 
 test "serveStream: a gzip request body cut short is refused, not a std flate panic" {
@@ -7278,9 +7278,9 @@ test "serveStream: a gzip request body cut short is refused, not a std flate pan
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 "));
         var body: [plain.len]u8 = undefined;
         var have: usize = 0;
-        var rest = got[(std.mem.indexOf(u8, got, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4 ..];
+        var rest = got[(std.mem.find(u8, got, "\r\n\r\n") orelse return error.TestUnexpectedResult) + 4 ..];
         while (true) {
-            const eol = std.mem.indexOf(u8, rest, "\r\n") orelse return error.TestUnexpectedResult;
+            const eol = std.mem.find(u8, rest, "\r\n") orelse return error.TestUnexpectedResult;
             const size = try std.fmt.parseInt(usize, rest[0..eol], 16);
             if (size == 0) break;
             if (have + size > body.len) return error.TestUnexpectedResult;
@@ -7295,7 +7295,7 @@ test "serveStream: a gzip request body cut short is refused, not a std flate pan
 test "serveStream: identity request body unchanged while gzip decoding is enabled" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, null, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", &out_buf);
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Length: 5\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Length: 5\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
 }
 
@@ -7354,8 +7354,8 @@ test "serveStream: verify_inbound_trailer on — a valid member round-trips, pla
         .verify_inbound_trailer = true,
     }, null, wire, &out_buf);
     var lenbuf: [32]u8 = undefined;
-    const cl = try std.fmt.bufPrint(&lenbuf, "Content-Length: {d}\r\n", .{plain.len});
-    try testing.expect(std.mem.indexOf(u8, got, cl) != null);
+    const cl = try std.mem.print(&lenbuf, "Content-Length: {d}\r\n", .{plain.len});
+    try testing.expect(std.mem.find(u8, got, cl) != null);
     try testing.expect(std.mem.endsWith(u8, got, plain));
 }
 
@@ -7375,7 +7375,7 @@ test "serveStream: verify_inbound_trailer on — a flipped CRC bit is refused" {
     // No dedicated status for this — same generic 500 any other undecodable
     // body already gets (the handler's read failed before it sent anything).
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close\r\n") != null);
 }
 
 test "serveStream: verify_inbound_trailer on — ISIZE off by one is refused" {
@@ -7486,7 +7486,7 @@ test "integration: Phase-1 client drives the server over loopback" {
     var url_buf: [64]u8 = undefined;
 
     { // GET with a query string
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello?x=1", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello?x=1", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -7500,7 +7500,7 @@ test "integration: Phase-1 client drives the server over loopback" {
     }
 
     { // POST with a body → echoed back
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/echo", .{port});
         var res = try client.request(.post, url, .{ .body = "ping pong data" });
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -7510,7 +7510,7 @@ test "integration: Phase-1 client drives the server over loopback" {
     }
 
     { // Client reuse: server streams chunked, client decodes it
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/big", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/big", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -7557,7 +7557,7 @@ test "integration: multicore accept engine (SO_REUSEPORT) serves across N listen
     // every one must be served regardless of which listener accepted it.
     const requests = 24;
     for (0..requests) |_| {
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -7646,10 +7646,10 @@ test "integration: Server.Options defaults emit Server and Date on the wire" {
     const head = try h1.readHead(&sr.interface, &head_buf);
 
     // Byte-level: the literal default `Server` line is on the wire …
-    try testing.expect(std.mem.indexOf(u8, head, "\r\nServer: zig-libs-http/0.1\r\n") != null);
+    try testing.expect(std.mem.find(u8, head, "\r\nServer: zig-libs-http/0.1\r\n") != null);
     // … and so is a `Date:` line (value is real wall-clock, so only the
     // literal field name + colon-space is asserted, not the timestamp).
-    try testing.expect(std.mem.indexOf(u8, head, "\r\nDate: ") != null);
+    try testing.expect(std.mem.find(u8, head, "\r\nDate: ") != null);
 }
 
 test "integration: Server.Options suppression agrees byte-for-byte with StreamOptions suppression" {
@@ -7929,7 +7929,7 @@ test "integration: shutdownGraceful closes an idle keep-alive connection, lets a
     var b_out: Writer = .fixed(&b_buf);
     _ = b_r.interface.streamRemaining(&b_out) catch {};
     try testing.expect(std.mem.startsWith(u8, b_out.buffered(), "HTTP/1.1 200 "));
-    try testing.expect(std.mem.indexOf(u8, b_out.buffered(), "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, b_out.buffered(), "Connection: close\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, b_out.buffered(), "done"));
     try testing.expectError(error.EndOfStream, a_r.interface.take(1));
 }
@@ -7983,7 +7983,7 @@ test "integration: setKeepAlivesEnabled(false) answers Connection: close and ser
     const got = timedExchange(io, &server, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\nGET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &buf) catch |err|
         return testkit.loopbackSkip("loopback exchange failed ({t})", .{err});
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got.got, "HTTP/1.1 200 "));
-    try testing.expect(std.mem.indexOf(u8, got.got, "Connection: close\r\n") != null);
+    try testing.expect(std.mem.find(u8, got.got, "Connection: close\r\n") != null);
 }
 
 test "integration: shutdownGraceful sends an idle h2c connection GOAWAY (NO_ERROR) before closing it" {
@@ -8365,7 +8365,7 @@ test "integration: negotiated gzip compression over loopback" {
     var url_buf: [64]u8 = undefined;
 
     { // Accept-Encoding: gzip → compressed; decompresses to the exact JSON.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
         var res = try client.request(.get, url, .{
             .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
         });
@@ -8389,7 +8389,7 @@ test "integration: negotiated gzip compression over loopback" {
 
     { // No gzip opt-in (client default = identity) → plain body, no
         // Content-Encoding, but Vary still marks the negotiation point.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/jsonbig", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -8401,7 +8401,7 @@ test "integration: negotiated gzip compression over loopback" {
     }
 
     { // Tiny body under min_size → identity even though gzip was accepted.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.get, url, .{
             .headers = &.{.{ .name = "Accept-Encoding", .value = "gzip" }},
         });
@@ -8784,7 +8784,7 @@ test "buffers_provider: nothing to lend is 503 and a closed connection, not a dr
         "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
 
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "hello"));
-    try testing.expect(std.mem.indexOf(u8, got, "503") != null);
+    try testing.expect(std.mem.find(u8, got, "503") != null);
     // The one that was lent came back; the one that was refused was never
     // handed out, so it must not be released either.
     try testing.expectEqual(@as(usize, 1), cp.releases);
@@ -8852,8 +8852,8 @@ test "serveStep: one turn of the loop, wait owned by the caller" {
     var capped = opts;
     capped.max_requests_per_conn = 1;
     try testing.expectEqual(ConnDisposition.close, serveStep(capped, &in2, &out2, bufs, 0));
-    try testing.expect(std.mem.indexOf(u8, out2.buffered(), "connection: close") != null or
-        std.mem.indexOf(u8, out2.buffered(), "Connection: close") != null);
+    try testing.expect(std.mem.find(u8, out2.buffered(), "connection: close") != null or
+        std.mem.find(u8, out2.buffered(), "Connection: close") != null);
 }
 
 test "buffers_provider: nothing is borrowed while the connection waits" {
@@ -9080,7 +9080,7 @@ test "integration: an h2c session ends in FIN, not RST, while the peer is still 
         return err;
     };
     // The server's GOAWAY made it across.
-    try testing.expect(std.mem.indexOf(u8, got.items, &[_]u8{ 0, 0, 8, 7, 0 }) != null);
+    try testing.expect(std.mem.find(u8, got.items, &[_]u8{ 0, 0, 8, 7, 0 }) != null);
 }
 
 test "integration: a connection dropped before serving still reports .new/.closed" {
@@ -9244,8 +9244,8 @@ test "upgrade: a client that asked to close still gets a 101 without Connection:
     const got, _ = runUpgrade(&probe, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf, &residue);
     try probe.result.?;
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 101 Switching Protocols\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "Connection: close") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "Upgrade: foo/2\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Connection: close") == null);
+    try testing.expect(std.mem.find(u8, got, "Upgrade: foo/2\r\n") != null);
 }
 
 test "upgrade: refused where a 101 cannot be right, and the handler still answers" {
@@ -9264,7 +9264,7 @@ test "upgrade: refused where a 101 cannot be right, and the handler still answer
         var residue: []const u8 = undefined;
         const got, _ = runUpgrade(&probe, wire, &out_buf, &residue);
         try testing.expectError(error.Unsupported, probe.result.?);
-        try testing.expect(std.mem.indexOf(u8, got, "101") == null);
+        try testing.expect(std.mem.find(u8, got, "101") == null);
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
     }
 }
@@ -9378,7 +9378,7 @@ test "tunnel: a 2xx to CONNECT without framing, then the connection is the tunne
         var out_buf: [512]u8 = undefined;
         var wire_buf: [128]u8 = undefined;
         // The client may send tunnel bytes right behind its request.
-        const wire = try std.fmt.bufPrint(&wire_buf, "CONNECT x:443 {s}\r\nConnection: close\r\n\r\nping", .{version});
+        const wire = try std.mem.print(&wire_buf, "CONNECT x:443 {s}\r\nConnection: close\r\n\r\nping", .{version});
         const got, const d = runTunnel(&probe, wire, &out_buf);
         try probe.result.?;
         try testing.expect(probe.handed_over);

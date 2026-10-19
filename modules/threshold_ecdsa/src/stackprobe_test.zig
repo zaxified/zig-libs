@@ -161,9 +161,9 @@ const Needles = struct {
         var le: [32]u8 = undefined;
         for (be, 0..) |b, i| le[31 - i] = b;
         const a = self.arena.allocator();
-        self.add(std.fmt.allocPrint(a, "{s} BE", .{name}) catch @panic("probe OOM"), &be);
-        self.add(std.fmt.allocPrint(a, "{s} LE", .{name}) catch @panic("probe OOM"), a.dupe(u8, &le) catch @panic("probe OOM"));
-        self.add(std.fmt.allocPrint(a, "{s} mem", .{name}) catch @panic("probe OOM"), a.dupe(u8, std.mem.asBytes(&s)) catch @panic("probe OOM"));
+        self.add(a.print("{s} BE", .{name}) catch @panic("probe OOM"), &be);
+        self.add(a.print("{s} LE", .{name}) catch @panic("probe OOM"), a.dupe(u8, &le) catch @panic("probe OOM"));
+        self.add(a.print("{s} mem", .{name}) catch @panic("probe OOM"), a.dupe(u8, std.mem.asBytes(&s)) catch @panic("probe OOM"));
     }
 
     fn addRaw(self: *Needles, name: []const u8, bytes: []const u8) void {
@@ -367,7 +367,7 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         cur_i = i;
         region_lo = stackHere() - PAD - WINDOW;
         measure(callInit);
-        total += analyse(try std.fmt.bufPrint(&label_buf, "init party {d}", .{i}), &n).copies;
+        total += analyse(try std.mem.print(&label_buf, "init party {d}", .{i}), &n).copies;
     }
     defer for (&parties) |*p| p.deinit();
 
@@ -395,7 +395,7 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
             defer n.deinit();
             n.addParty(&parties[i]);
             n.addRng();
-            total += analyse(try std.fmt.bufPrint(&label_buf, "round {d} party {d}", .{ round, i }), &n).copies;
+            total += analyse(try std.mem.print(&label_buf, "round {d} party {d}", .{ round, i }), &n).copies;
         }
         for (&inboxes) |*b| b.clearRetainingCapacity();
         for (0..t) |from| {
@@ -420,7 +420,7 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         measure(callFinish);
         n.addScalar("presig k_i", presigs[i].k);
         n.addScalar("presig sigma_i", presigs[i].sigma);
-        total += analyse(try std.fmt.bufPrint(&label_buf, "finish party {d}", .{i}), &n).copies;
+        total += analyse(try std.mem.print(&label_buf, "finish party {d}", .{i}), &n).copies;
     }
     // The codec (party 0) and the pool (party 1): encoding consumes the
     // presignature, so its secrets are taken as needles before the call and
@@ -457,7 +457,7 @@ test "STACKPROBE: no secret on the dead stack after presign rounds, finish and s
         cur_i = i;
         region_lo = stackHere() - PAD - WINDOW;
         measure(callSignShare);
-        total += analyse(try std.fmt.bufPrint(&label_buf, "signShare party {d}", .{i}), &n).copies;
+        total += analyse(try std.mem.print(&label_buf, "signShare party {d}", .{i}), &n).copies;
     }
     for (held_rounds) |r| for (r) |o| if (o) |b| b.deinit(allocator);
     for (outs) |o| if (o) |b| b.deinit(allocator);
@@ -1008,7 +1008,7 @@ test "STACKPROBE: no secret on the dead stack after the abort opening rounds and
             cur_i = i;
             region_lo = stackHere() - PAD - WINDOW;
             measure(step[1]);
-            total += analyse(try std.fmt.bufPrint(&label_buf, "{s} party {d}", .{ step[0], i }), &n).copies;
+            total += analyse(try std.mem.print(&label_buf, "{s} party {d}", .{ step[0], i }), &n).copies;
         }
         try routeBroadcasts(allocator, &abort_outs, &held);
     }

@@ -617,7 +617,7 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
     var i: usize = 0;
     while (i < 50) : (i += 1) {
         const parent = dirs.items[rnd.uintLessThan(usize, dirs.items.len)];
-        const p = try std.fmt.allocPrint(gpa, "{s}/d{d}", .{ parent, i });
+        const p = try gpa.print("{s}/d{d}", .{ parent, i });
         errdefer gpa.free(p);
         try d.createDirPath(io, p);
         try dirs.append(gpa, p);
@@ -640,10 +640,10 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
     i = 0;
     while (i < 100) : (i += 1) {
         var buf: [64]u8 = undefined;
-        const sub = try std.fmt.bufPrint(&buf, "wide/w{d}", .{i});
+        const sub = try std.mem.print(&buf, "wide/w{d}", .{i});
         try d.createDirPath(io, sub);
         var fbuf: [96]u8 = undefined;
-        const f = try std.fmt.bufPrint(&fbuf, "{s}/f.bin", .{sub});
+        const f = try std.mem.print(&fbuf, "{s}/f.bin", .{sub});
         try d.writeFile(io, .{ .sub_path = f, .data = strRepeat("w", 300) });
     }
 
@@ -656,7 +656,7 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
     i = 0;
     while (i < 120) : (i += 1) {
         const parent = dirs.items[rnd.uintLessThan(usize, dirs.items.len)];
-        const p = try std.fmt.allocPrint(gpa, "{s}/f{d}", .{ parent, i });
+        const p = try gpa.print("{s}/f{d}", .{ parent, i });
         errdefer gpa.free(p);
         const len = rnd.uintLessThan(usize, 9000);
         const data = try gpa.alloc(u8, len);
@@ -672,14 +672,14 @@ fn buildTree(gpa: Allocator, io: std.Io, d: std.Io.Dir, seed: u64, cross_links: 
             dirs.items[rnd.uintLessThan(usize, dirs.items.len)]
         else
             std.fs.path.dirname(src).?;
-        const dst = try std.fmt.allocPrint(gpa, "{s}/link{d}", .{ dst_dir, i });
+        const dst = try gpa.print("{s}/link{d}", .{ dst_dir, i });
         defer gpa.free(dst);
         try d.hardLink(src, d, dst, io, .{});
     }
     i = 0;
     while (i < 10) : (i += 1) {
         const parent = dirs.items[rnd.uintLessThan(usize, dirs.items.len)];
-        const p = try std.fmt.allocPrint(gpa, "{s}/sym{d}", .{ parent, i });
+        const p = try gpa.print("{s}/sym{d}", .{ parent, i });
         defer gpa.free(p);
         try d.symLink(io, "..", p, .{}); // a cycle if it were ever followed
     }

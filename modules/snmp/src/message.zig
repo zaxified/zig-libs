@@ -941,7 +941,7 @@ test "Report-PDU [8] encodes and decodes as a BasicPdu (RFC 3416 §3)" {
         .varbinds = &vbs,
     });
     // Context-constructed tag [8] = 0xa8.
-    try testing.expect(std.mem.indexOfScalar(u8, wire, 0xa8) != null);
+    try testing.expect(std.mem.findScalar(u8, wire, 0xa8) != null);
 
     const msg = try decode(wire);
     const pdu = msg.pdu.report;

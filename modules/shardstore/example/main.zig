@@ -36,8 +36,8 @@ pub fn main() !void {
     var kbuf: [32]u8 = undefined;
     var vbuf: [32]u8 = undefined;
     for (0..40) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "session-{d}", .{n});
-        const v = try std.fmt.bufPrint(&vbuf, "user-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "session-{d}", .{n});
+        const v = try std.mem.print(&vbuf, "user-{d}", .{n});
         try store.put(k, v);
     }
     const sample_key = "session-7";

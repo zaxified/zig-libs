@@ -81,7 +81,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     var d: Data = undefined;
     var fk: std.Io.Writer.Allocating = .init(arena);
     for (0..n_keys) |i| {
-        d.keys[i] = try std.fmt.allocPrint(arena, "10.{d}.{d}.{d}", .{ i >> 8, i & 255, (i *% 7) & 255 });
+        d.keys[i] = try arena.print("10.{d}.{d}.{d}", .{ i >> 8, i & 255, (i *% 7) & 255 });
         try fk.writer.print("{s}\n", .{d.keys[i]});
     }
     var fs: std.Io.Writer.Allocating = .init(arena);
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

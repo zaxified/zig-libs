@@ -481,11 +481,11 @@ pub const Connection = struct {
     }
 
     fn hasInbound(c: *const Connection, id: u16) bool {
-        return std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) != null;
+        return std.mem.findScalar(u16, c.inbound_qos2[0..c.inbound_len], id) != null;
     }
 
     fn removeInbound(c: *Connection, id: u16) bool {
-        const i = std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) orelse return false;
+        const i = std.mem.findScalar(u16, c.inbound_qos2[0..c.inbound_len], id) orelse return false;
         c.inbound_len -= 1;
         c.inbound_qos2[i] = c.inbound_qos2[c.inbound_len];
         return true;
@@ -750,9 +750,9 @@ fn splitShared(f: []const u8) error{Invalid}!?[]const u8 {
     const prefix = "$share/";
     if (!std.mem.startsWith(u8, f, prefix)) return null;
     const rest = f[prefix.len..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.Invalid;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return error.Invalid;
     const name = rest[0..slash];
-    if (name.len == 0 or std.mem.indexOfAny(u8, name, "+#") != null) return error.Invalid;
+    if (name.len == 0 or std.mem.findAny(u8, name, "+#") != null) return error.Invalid;
     const inner = rest[slash + 1 ..];
     topic.validateFilter(inner) catch return error.Invalid;
     return inner;
@@ -970,7 +970,7 @@ const Index = struct {
             try appendAll(alloc, out, &node.subs, max, capped);
             return;
         };
-        const slash = std.mem.indexOfScalar(u8, cur, '/');
+        const slash = std.mem.findScalar(u8, cur, '/');
         const head = cur[0 .. slash orelse cur.len];
         const tail: ?[]const u8 = if (slash) |s| cur[s + 1 ..] else null;
 
@@ -2194,7 +2194,7 @@ pub const Broker = struct {
     }
 
     fn dropShared(b: *Broker, g: *Shared) void {
-        if (std.mem.indexOfScalar(*Shared, b.shared.items, g)) |i| _ = b.shared.swapRemove(i);
+        if (std.mem.findScalar(*Shared, b.shared.items, g)) |i| _ = b.shared.swapRemove(i);
         g.members.deinit(b.allocator);
         b.allocator.free(g.full);
         b.allocator.destroy(g);
@@ -2273,7 +2273,7 @@ pub const Broker = struct {
             // and starts queueing (spec 3.1.2.4).
             b.dropSubscriptions(conn);
             b.park(conn);
-            if (std.mem.indexOfScalar(*Connection, b.connections.items, conn)) |i| {
+            if (std.mem.findScalar(*Connection, b.connections.items, conn)) |i| {
                 _ = b.connections.swapRemove(i);
             }
             conn.state = .disconnected;
@@ -2612,7 +2612,7 @@ pub const Broker = struct {
         if (b.fanout(.{ .topic = sys_version_topic, .payload = sys_version, .retain = true }, .at_most_once, now)) |_| n += 1 else |_| {}
         for (sys_topics, values) |name, v| {
             var buf: [24]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "{d}", .{v}) catch continue;
+            const text = std.mem.print(&buf, "{d}", .{v}) catch continue;
             if (b.fanout(.{ .topic = name, .payload = text, .retain = true }, .at_most_once, now)) |_| n += 1 else |_| {}
         }
         return n;
@@ -2967,7 +2967,7 @@ pub const Broker = struct {
         } else if (c.client_id.len == 0) {
             var idbuf: [max_client_id]u8 = undefined;
             b.mutex.lock();
-            const gen = std.fmt.bufPrint(&idbuf, "auto-{d}", .{b.next_auto_id}) catch unreachable;
+            const gen = std.mem.print(&idbuf, "auto-{d}", .{b.next_auto_id}) catch unreachable;
             b.next_auto_id += 1;
             b.mutex.unlock();
             conn.setClientId(gen) catch unreachable;
@@ -3487,7 +3487,7 @@ pub const Broker = struct {
     /// Drop a session from the registry and the index; it is freed when its
     /// last reference goes. Caller holds `mutex`.
     fn discardSession(b: *Broker, x: *Session) void {
-        if (std.mem.indexOfScalar(*Session, b.sessions.items, x)) |i| _ = b.sessions.swapRemove(i);
+        if (std.mem.findScalar(*Session, b.sessions.items, x)) |i| _ = b.sessions.swapRemove(i);
         for (x.subs.items) |f| {
             b.indexRemove(f, .{ .session = x });
             b.allocator.free(f);
@@ -4176,7 +4176,7 @@ pub const Broker = struct {
         const x = conn.session orelse return conn.hasInbound(id);
         x.lock.lock();
         defer x.lock.unlock();
-        return std.mem.indexOfScalar(u16, x.inbound_qos2.items, id) != null;
+        return std.mem.findScalar(u16, x.inbound_qos2.items, id) != null;
     }
 
     fn inboundRoom(b: *Broker, conn: *Connection) bool {
@@ -4210,7 +4210,7 @@ pub const Broker = struct {
         var known = false;
         if (conn.session) |x| {
             x.lock.lock();
-            if (std.mem.indexOfScalar(u16, x.inbound_qos2.items, id)) |i| {
+            if (std.mem.findScalar(u16, x.inbound_qos2.items, id)) |i| {
                 _ = x.inbound_qos2.swapRemove(i);
                 known = true;
             }
@@ -4352,7 +4352,7 @@ pub const Broker = struct {
                 span[0] = ids.items.len;
                 for (matches.items) |ref| {
                     if (ref.sub_id != 0 and ref.owner.eql(o.owner) and
-                        std.mem.indexOfScalar(u32, ids.items[span[0]..], ref.sub_id) == null)
+                        std.mem.findScalar(u32, ids.items[span[0]..], ref.sub_id) == null)
                     {
                         try ids.append(b.allocator, ref.sub_id);
                     }
@@ -5275,7 +5275,7 @@ test "one SUBSCRIBE walks the retained store ONCE, not once per duplicate filter
     @memset(&payload, 'x');
     for (0..retained_count) |i| {
         var tbuf: [32]u8 = undefined;
-        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        const t = try std.mem.print(&tbuf, "zl/{d}", .{i});
         var pbuf: [256]u8 = undefined;
         try b.feed(pub_conn, try packet.encodePublish(&pbuf, .{
             .topic = t,
@@ -5324,7 +5324,7 @@ test "the retained walk is bounded even for a single filter (re-audit F1)" {
     _ = try b.process(pub_conn, 1);
     for (0..100) |i| {
         var tbuf: [32]u8 = undefined;
-        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        const t = try std.mem.print(&tbuf, "zl/{d}", .{i});
         var pbuf: [128]u8 = undefined;
         try b.feed(pub_conn, try packet.encodePublish(&pbuf, .{
             .topic = t,
@@ -5356,7 +5356,7 @@ test "the retained walk is bounded even for a single filter (re-audit F1)" {
     _ = try b2.process(p2, 1);
     for (0..20) |i| {
         var tbuf: [32]u8 = undefined;
-        const t = try std.fmt.bufPrint(&tbuf, "zl/{d}", .{i});
+        const t = try std.mem.print(&tbuf, "zl/{d}", .{i});
         var pbuf: [128]u8 = undefined;
         try b2.feed(p2, try packet.encodePublish(&pbuf, .{
             .topic = t,
@@ -6454,7 +6454,7 @@ test "fan-out envelope: one PUBLISH is bounded at max_fanout_matches" {
     for (&tts, 0..) |*tt, i| {
         tt.* = TestTransport{};
         var idbuf: [8]u8 = undefined;
-        const id = try std.fmt.bufPrint(&idbuf, "S{d}", .{i});
+        const id = try std.mem.print(&idbuf, "S{d}", .{i});
         const c = try connectClient(&b, tt, id, 60, 0);
         try feedSubscribe(&b, c, 1, &.{.{ .filter = "hot/#", .qos = .at_most_once }});
         _ = (try tt.next()).?; // SUBACK
@@ -6855,7 +6855,7 @@ const StressClient = struct {
         var wbuf: [24]u8 = undefined;
         const v5 = c.version == .v5;
         const will: ?packet.Will = if (v5) if (c.will_id) |w| .{
-            .topic = std.fmt.bufPrint(&wbuf, "will/{d}", .{w}) catch unreachable,
+            .topic = std.mem.print(&wbuf, "will/{d}", .{w}) catch unreachable,
             .message = "gone",
             .properties = .{ .will_delay_interval = 1 },
         } else null else null;
@@ -6993,7 +6993,7 @@ fn stressWatchdog(ctl: *StressCtl) void {
 /// per-worker private branch that churns.
 fn stressSubscribe(c: *StressClient, id: usize) !void {
     var pbuf: [24]u8 = undefined;
-    const priv = try std.fmt.bufPrint(&pbuf, "w/{d}/#", .{id});
+    const priv = try std.mem.print(&pbuf, "w/{d}/#", .{id});
     if (c.version == .v5) {
         // 5.0: QoS 2, a Subscription Identifier on every copy, and a Shared
         // Subscription racing its members' connects, take-overs and closes.
@@ -7024,9 +7024,9 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
         // just-closed session.
         var idbuf: [32]u8 = undefined;
         const client_id = if (role == 2)
-            std.fmt.bufPrint(&idbuf, "shared-{d}", .{id % 4}) catch unreachable
+            std.mem.print(&idbuf, "shared-{d}", .{id % 4}) catch unreachable
         else
-            std.fmt.bufPrint(&idbuf, "w-{d}", .{id}) catch unreachable;
+            std.mem.print(&idbuf, "w-{d}", .{id}) catch unreachable;
 
         var c = StressClient.dial(ctl.io, ctl.addr) catch {
             _ = ctl.connect_failures.fetchAdd(1, .monotonic);
@@ -7059,13 +7059,13 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
                     stressSubscribe(&c, id) catch break :blk;
                     for (0..24) |k| {
                         var tbuf: [24]u8 = undefined;
-                        const hot = std.fmt.bufPrint(&tbuf, "hot/{d}", .{k % 4}) catch unreachable;
+                        const hot = std.mem.print(&tbuf, "hot/{d}", .{k % 4}) catch unreachable;
                         pid +%= 1;
                         if (pid == 0) pid = 1;
                         const q: QoS = if (k % 2 == 0) .at_most_once else if (c.version == .v5 and k % 3 == 1) .exactly_once else .at_least_once;
                         c.sendPublish(.{ .topic = hot, .payload = "payload-xyz", .qos = q, .packet_id = pid }) catch break :blk;
                         var wbuf: [24]u8 = undefined;
-                        const priv = std.fmt.bufPrint(&wbuf, "w/{d}/x", .{id}) catch unreachable;
+                        const priv = std.mem.print(&wbuf, "w/{d}/x", .{id}) catch unreachable;
                         c.sendPublish(.{ .topic = priv, .payload = "p", .qos = .at_most_once }) catch break :blk;
                         if (k % 6 == 0) _ = c.pump(ctl, 0);
                         if (k % 8 == 7) {
@@ -7101,7 +7101,7 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
                     stressSubscribe(&c, id) catch break :blk;
                     for (0..16) |k| {
                         var fbuf: [24]u8 = undefined;
-                        const f = std.fmt.bufPrint(&fbuf, "churn/{d}/#", .{k % 3}) catch unreachable;
+                        const f = std.mem.print(&fbuf, "churn/{d}/#", .{k % 3}) catch unreachable;
                         c.sendSubscribe(@intCast(10 + k), &.{.{ .filter = f, .qos = .at_least_once }}) catch break :blk;
                         if (k % 3 == 0) c.sendPublish(.{ .topic = "hot/0", .payload = "s", .qos = .at_most_once }) catch break :blk;
                         c.sendUnsubscribe(@intCast(200 + k), &.{f}) catch break :blk;
@@ -9427,7 +9427,7 @@ test "$SYS: dropped counts a persistent session's queue overflow; publishSys ign
 // ── wave 2: clean-session queue, persistence seam ───────────────────────────
 
 fn fmtNum(buf: []u8, i: usize) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}", .{i}) catch unreachable;
+    return std.mem.print(buf, "{d}", .{i}) catch unreachable;
 }
 
 test "clean session: a QoS 1 subscriber slower than the publisher still gets every message, in order" {

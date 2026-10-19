@@ -291,7 +291,7 @@ pub fn fuzzRegistration(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
             break;
         };
     }
-    const auth_start = std.mem.lastIndexOf(u8, c.attestation_object, "authData").? + "authData".len;
+    const auth_start = std.mem.findLast(u8, c.attestation_object, "authData").? + "authData".len;
     const strict = which == .attestation and c.signs_auth_data and (c.self_attested or first > auth_start);
     const result = webauthn.verifyRegistration(a, att, client_data, .{
         .rp_id = vectors.rp_id,

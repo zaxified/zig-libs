@@ -402,7 +402,7 @@ fn mutate(cur: *Cursor, arena: Allocator, doc: []const u8) ![]const u8 {
             2 => try buf.insert(arena, at, cur.byte()),
             3 => {
                 const s = swaps[cur.ranged(0, swaps.len - 1)];
-                if (std.mem.indexOf(u8, buf.items, s.from)) |p| {
+                if (std.mem.find(u8, buf.items, s.from)) |p| {
                     var next: std.ArrayList(u8) = .empty;
                     try next.appendSlice(arena, buf.items[0..p]);
                     try next.appendSlice(arena, s.to);

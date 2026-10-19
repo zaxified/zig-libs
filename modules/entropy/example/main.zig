@@ -120,7 +120,7 @@ pub fn main() !void {
 
     // The panic message itself is public API worth pinning: it must name
     // its cause so whoever reads the crash knows what to check.
-    must(std.mem.indexOf(u8, entropy.unavailable_message, "EntropyUnavailable") != null, @src());
-    must(std.mem.indexOf(u8, entropy.unavailable_message, "getrandom(2)") != null, @src());
+    must(std.mem.find(u8, entropy.unavailable_message, "EntropyUnavailable") != null, @src());
+    must(std.mem.find(u8, entropy.unavailable_message, "getrandom(2)") != null, @src());
     std.debug.print("unavailable_message: names its cause\n", .{});
 }

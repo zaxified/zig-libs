@@ -153,10 +153,10 @@ pub fn main(init: std.process.Init) !u8 {
         ab[0] &= 0x7f; // below the modulus
         bb[0] &= 0x7f;
         eb[0] |= 0x80; // full-width exponent
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "m{d}.bin", .{bits}), .data = &mb });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "a{d}.bin", .{bits}), .data = &ab });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "b{d}.bin", .{bits}), .data = &bb });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "e{d}.bin", .{bits}), .data = &eb });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("m{d}.bin", .{bits}), .data = &mb });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("a{d}.bin", .{bits}), .data = &ab });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("b{d}.bin", .{bits}), .data = &bb });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("e{d}.bin", .{bits}), .data = &eb });
         ctx.cases[i] = try @TypeOf(ctx.cases[i]).init(&mb, &ab, &bb, &eb);
         // powMont takes an exponent of exactly L limbs (not required < m)
         ctx.cases[i].e = std.mem.zeroes(@TypeOf(ctx.cases[i]).M.Elem);
@@ -170,7 +170,7 @@ pub fn main(init: std.process.Init) !u8 {
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     inline for (sizes, 0..) |bits, i| {
         inline for (.{ .{ "mul", Kind.mul }, .{ "exp", Kind.exp }, .{ "exp", Kind.dynexp }, .{ "pub", Kind.pub_exp } }) |t| {
-            const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "ossl_{s}_{d}.bin", .{ t[0], bits }), arena, .limited(1 << 16));
+            const theirs = try dir.readFileAlloc(io, try arena.print("ossl_{s}_{d}.bin", .{ t[0], bits }), arena, .limited(1 << 16));
             _ = ctx.cases[i].run(t[1]);
             if (!std.mem.eql(u8, theirs, &ctx.cases[i].out)) {
                 std.debug.print("{s}: FAILED -- OpenSSL's {s} at {d} bits differs from ours ({s})\n", .{ bench_name, t[0], bits, @tagName(t[1]) });
@@ -189,9 +189,9 @@ pub fn main(init: std.process.Init) !u8 {
         };
         for (spec) |s| if (s.on) {
             try ws.append(arena, .{
-                .name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ s.p, bits }),
+                .name = try arena.print("{s}_{d}", .{ s.p, bits }),
                 .op = .{ .kind = s.k, .size = bits },
-                .ref = try std.fmt.allocPrint(arena, "{s}_{d}", .{ s.r, bits }),
+                .ref = try arena.print("{s}_{d}", .{ s.r, bits }),
             });
         };
     }

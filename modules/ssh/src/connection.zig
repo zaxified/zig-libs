@@ -892,7 +892,7 @@ pub const Connection = struct {
     /// is a zombie (an abandoned open that is confirmed now gets our CLOSE;
     /// the peer's CLOSE retires the id), a protocol violation otherwise.
     fn zombieMessage(self: *Connection, mt: messages.MessageType, recipient: u32, c: *Cursor) ChannelError!void {
-        const i = std.mem.indexOfScalar(u32, self.zombies.items, recipient) orelse return error.ChannelClosed;
+        const i = std.mem.findScalar(u32, self.zombies.items, recipient) orelse return error.ChannelClosed;
         switch (mt) {
             .SSH_MSG_CHANNEL_OPEN_CONFIRMATION => {
                 var ch: ChannelState = .{ .local_id = recipient, .local_window = 0, .local_window_initial = 0, .local_max_packet = 0 };
@@ -2429,7 +2429,7 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     var rnd: [8]u8 = undefined;
     testFillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_exec_{s}", .{&hex});
+    const dir_path = try gpa.print("/tmp/zig_ssh_exec_{s}", .{&hex});
     defer gpa.free(dir_path);
     var work = cwd.createDirPathOpen(io, dir_path, .{}) catch return error.SkipZigTest;
     defer {
@@ -2440,9 +2440,9 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     // Host key + client key, both from the real ssh-keygen. The HOST key stays
     // ed25519 in every case: `PubkeyAcceptedAlgorithms` below constrains the
     // USER key, and mixing the two would make a failure ambiguous.
-    const hk_path = try std.fmt.allocPrint(gpa, "{s}/hk", .{dir_path});
+    const hk_path = try gpa.print("{s}/hk", .{dir_path});
     defer gpa.free(hk_path);
-    const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
+    const ck_path = try gpa.print("{s}/ck", .{dir_path});
     defer gpa.free(ck_path);
     for ([_][]const u8{ hk_path, ck_path }, [_][]const u8{ "ed25519", client_key_type }) |p, kt| {
         var child = std.process.spawn(io, .{
@@ -2457,11 +2457,11 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     }
 
     // authorized_keys = the client key's public half.
-    const ck_pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
+    const ck_pub_path = try gpa.print("{s}.pub", .{ck_path});
     defer gpa.free(ck_pub_path);
     const ck_pub = cwd.readFileAlloc(io, ck_pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
     defer gpa.free(ck_pub);
-    const ak_path = try std.fmt.allocPrint(gpa, "{s}/authorized_keys", .{dir_path});
+    const ak_path = try gpa.print("{s}/authorized_keys", .{dir_path});
     defer gpa.free(ak_path);
     writeFile(io, ak_path, ck_pub) catch return error.SkipZigTest;
 
@@ -2474,9 +2474,9 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     var portbuf: [2]u8 = undefined;
     testFillRandom(&portbuf);
     const port: u16 = 20000 + (std.mem.readInt(u16, &portbuf, .big) % 20000);
-    const port_opt = try std.fmt.allocPrint(gpa, "Port={d}", .{port});
+    const port_opt = try gpa.print("Port={d}", .{port});
     defer gpa.free(port_opt);
-    const ak_opt = try std.fmt.allocPrint(gpa, "AuthorizedKeysFile={s}", .{ak_path});
+    const ak_opt = try gpa.print("AuthorizedKeysFile={s}", .{ak_path});
     defer gpa.free(ak_opt);
     // `PubkeyAcceptedAlgorithms` is what `sshd` advertises in `server-sig-algs`
     // AND what it enforces, so it is a real oracle rather than a hint. Passing
@@ -2484,7 +2484,7 @@ fn liveOurClientExec(client_key_type: []const u8, sshd_pubkey_algorithms: []cons
     const alg_opt = if (sshd_pubkey_algorithms.len == 0)
         try gpa.dupe(u8, "PubkeyAuthentication=yes")
     else
-        try std.fmt.allocPrint(gpa, "PubkeyAcceptedAlgorithms={s}", .{sshd_pubkey_algorithms});
+        try gpa.print("PubkeyAcceptedAlgorithms={s}", .{sshd_pubkey_algorithms});
     defer gpa.free(alg_opt);
 
     var sshd = std.process.spawn(io, .{
@@ -2618,7 +2618,7 @@ fn liveSshClientExec(user_key_type: []const u8) !void {
     var rnd: [8]u8 = undefined;
     testFillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_srvexec_{s}", .{&hex});
+    const dir_path = try gpa.print("/tmp/zig_ssh_srvexec_{s}", .{&hex});
     defer gpa.free(dir_path);
     var work = cwd.createDirPathOpen(io, dir_path, .{}) catch return error.SkipZigTest;
     defer {
@@ -2627,7 +2627,7 @@ fn liveSshClientExec(user_key_type: []const u8) !void {
     }
 
     // The client key the real `ssh` will authenticate with.
-    const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
+    const ck_path = try gpa.print("{s}/ck", .{dir_path});
     defer gpa.free(ck_path);
     {
         var child = std.process.spawn(io, .{
@@ -2643,7 +2643,7 @@ fn liveSshClientExec(user_key_type: []const u8) !void {
     // Authorize exactly that key: parse its wire blob out of the .pub line.
     var live_authorized: LiveAuthorized = .{};
     {
-        const pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
+        const pub_path = try gpa.print("{s}.pub", .{ck_path});
         defer gpa.free(pub_path);
         const text = cwd.readFileAlloc(io, pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
         defer gpa.free(text);
@@ -2661,14 +2661,14 @@ fn liveSshClientExec(user_key_type: []const u8) !void {
     var listener = try testListenLoopback(io, &port);
     defer listener.deinit(io);
 
-    const port_str = try std.fmt.allocPrint(gpa, "{d}", .{port});
+    const port_str = try gpa.print("{d}", .{port});
     defer gpa.free(port_str);
-    const out_path = try std.fmt.allocPrint(gpa, "{s}/out", .{dir_path});
+    const out_path = try gpa.print("{s}/out", .{dir_path});
     defer gpa.free(out_path);
 
     // Run the real client through `sh` so its stdout lands in a file we can
     // check (and its stdin is /dev/null, so it sends CHANNEL_EOF promptly).
-    const cmdline = try std.fmt.allocPrint(gpa,
+    const cmdline = try gpa.print(
         \\/usr/bin/ssh -p {s} -F /dev/null -i {s} -o IdentitiesOnly=yes \
         \\ -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
         \\ -o GlobalKnownHostsFile=/dev/null -o PreferredAuthentications=publickey \

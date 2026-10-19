@@ -571,7 +571,7 @@ test "an allData count contradicting the entries is refused" {
     const bytes = unhex(captured_frame_hex, &buf);
     const f = try Frame.decode(bytes);
     // `8a 01 03` is numDatSetEntries; claim four entries where three are sent.
-    const idx = std.mem.indexOf(u8, f.pdu, &[_]u8{ 0x8A, 0x01, 0x03 }).?;
+    const idx = std.mem.find(u8, f.pdu, &[_]u8{ 0x8A, 0x01, 0x03 }).?;
     var pdu: [512]u8 = undefined;
     @memcpy(pdu[0..f.pdu.len], f.pdu);
     pdu[idx + 2] = 4;
@@ -658,7 +658,7 @@ test "a UtcTime with an impossible accuracy is refused inside a GOOSE PDU" {
     const f = try Frame.decode(bytes);
     var pdu: [512]u8 = undefined;
     @memcpy(pdu[0..f.pdu.len], f.pdu);
-    const idx = std.mem.indexOf(u8, pdu[0..f.pdu.len], &[_]u8{ 0x84, 0x08 }).?;
+    const idx = std.mem.find(u8, pdu[0..f.pdu.len], &[_]u8{ 0x84, 0x08 }).?;
     pdu[idx + 2 + 7] = 27; // a reserved TimeAccuracy value
     try testing.expectError(error.BadTime, Pdu.decode(pdu[0..f.pdu.len]));
 }
@@ -714,7 +714,7 @@ test "a BER BOOLEAN of any nonzero octet is TRUE and re-encodes as 0x01" {
     var tmp: [256]u8 = undefined;
     const raw = tmp[0..encoded.len];
     @memcpy(raw, encoded);
-    const at = std.mem.indexOf(u8, raw, &[_]u8{ 0x89, 0x01, 0x01 }).?;
+    const at = std.mem.find(u8, raw, &[_]u8{ 0x89, 0x01, 0x01 }).?;
     raw[at + 2] = 0x8F;
     const d = try Pdu.decode(raw);
     try testing.expect(d.nds_com);

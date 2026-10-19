@@ -149,7 +149,7 @@ pub const Message = struct {
     /// (the stack slot hasn't been reused yet); one more call in between is
     /// enough to read back poisoned/garbage bytes instead of the command.
     pub fn commandName(self: *const Message) []const u8 {
-        const end = std.mem.indexOfScalar(u8, &self.command, 0) orelse self.command.len;
+        const end = std.mem.findScalar(u8, &self.command, 0) orelse self.command.len;
         return self.command[0..end];
     }
 };
@@ -370,7 +370,7 @@ test "F2 regression: commandName's slice survives an intervening call (not a dan
     // `testing.expectEqualStrings("version", decoded.message.commandName())`
     // above) can pass by accident, because nothing has reused that stack
     // slot yet. This test forces a call in between obtaining the slice and
-    // reading its bytes -- e.g. `std.fmt.bufPrint`, the same shape
+    // reading its bytes -- e.g. `std.mem.print`, the same shape
     // `example/main.zig`'s `std.debug.print` call actually tripped over,
     // where the intervening call clobbered the freed frame with Zig's
     // undefined-memory poison (0xaa) before the bytes were ever read.
@@ -381,7 +381,7 @@ test "F2 regression: commandName's slice survives an intervening call (not a dan
     const name = decoded.message.commandName();
 
     var buf: [64]u8 = undefined;
-    const formatted = try std.fmt.bufPrint(&buf, "cmd={s}", .{name});
+    const formatted = try std.mem.print(&buf, "cmd={s}", .{name});
     try testing.expectEqualStrings("cmd=version", formatted);
 }
 

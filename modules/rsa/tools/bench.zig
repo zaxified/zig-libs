@@ -64,7 +64,7 @@ const Ctx = struct {
 };
 
 fn once(x: *Ctx) usize {
-    const k = &x.keys[std.mem.indexOfScalar(usize, &sizes, x.op.size).?];
+    const k = &x.keys[std.mem.findScalar(usize, &sizes, x.op.size).?];
     switch (x.op.kind) {
         .sign => return (rsa.signPkcs1v15(k.sk, Sha256, &x.msg, &x.out) catch unreachable).len,
         .signbl => return (rsa.signPkcs1v15Blinded(k.sk, Sha256, .{ .csprng = x.rng }, &x.msg, &x.out) catch unreachable).len,
@@ -107,21 +107,21 @@ pub fn main(init: std.process.Init) !u8 {
 
     for (sizes, 0..) |bits, i| {
         const k = &ctx.keys[i];
-        const sk_der = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "sk_{d}.der", .{bits}), arena, .limited(1 << 16));
-        const pk_der = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "pk_{d}.der", .{bits}), arena, .limited(1 << 16));
+        const sk_der = try dir.readFileAlloc(io, try arena.print("sk_{d}.der", .{bits}), arena, .limited(1 << 16));
+        const pk_der = try dir.readFileAlloc(io, try arena.print("pk_{d}.der", .{bits}), arena, .limited(1 << 16));
         k.sk = try arena.create(rsa.SecretKey);
         try rsa.SecretKey.fromDer(k.sk, sk_der);
         k.pk = try rsa.PublicKey.fromDer(pk_der);
         k.sig = try arena.dupe(u8, try rsa.signPkcs1v15(k.sk, Sha256, &ctx.msg, &ctx.out));
         k.ct = try arena.dupe(u8, try rsa.encryptOaep(k.pk, Sha256, ctx.rng, &ctx.msg, "", &ctx.out));
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "ct_{d}.bin", .{bits}), .data = k.ct });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("ct_{d}.bin", .{bits}), .data = k.ct });
     }
 
     // Interop before timing: OpenSSL decrypts our OAEP ciphertexts (checked in
     // `interop`); its PKCS#1 v1.5 signatures must equal ours byte for byte.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     for (sizes, 0..) |bits, i| {
-        const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "sig_{d}.bin", .{bits}), arena, .limited(4096));
+        const theirs = try dir.readFileAlloc(io, try arena.print("sig_{d}.bin", .{bits}), arena, .limited(4096));
         if (!std.mem.eql(u8, theirs, ctx.keys[i].sig)) {
             std.debug.print("bench-rsa: FAILED -- OpenSSL's {d}-bit signature differs from ours\n", .{bits});
             return 1;
@@ -136,9 +136,9 @@ pub fn main(init: std.process.Init) !u8 {
             .dec, .decbl, .decca => "dec",
         };
         try ws.append(arena, .{
-            .name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ @tagName(kind), bits }),
+            .name = try arena.print("{s}_{d}", .{ @tagName(kind), bits }),
             .op = .{ .kind = kind, .size = bits },
-            .ref = try std.fmt.allocPrint(arena, "ossl.{s}_{d}", .{ theirs, bits }),
+            .ref = try arena.print("ossl.{s}_{d}", .{ theirs, bits }),
         });
     };
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-17** — **NO CONSUMER-VISIBLE CHANGE:** `rsa_burn` 64 → 256 KiB (probe window 512 KiB): at CI's `-Dcpu` the ReleaseFast stack probe found `encryptUserTokenSecret` reaching 186 KB, residue past the old burn (rsa's 8192-bit capacity).
 

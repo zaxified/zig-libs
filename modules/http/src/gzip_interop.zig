@@ -168,7 +168,7 @@ fn checkRoute(
     r: Route,
 ) !void {
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}{s}", .{ base, r.path });
+    const url = try std.mem.print(&url_buf, "{s}{s}", .{ base, r.path });
     const expected = try expectedBody(r.kind, gpa);
     defer gpa.free(expected);
 

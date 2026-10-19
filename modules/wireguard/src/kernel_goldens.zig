@@ -332,7 +332,7 @@ test "count canary: kernel/tool-anchored golden tests" {
     // "wireguard.kernel_goldens.test.kernel golden: …".
     var found: usize = 0;
     for (@import("builtin").test_functions) |t| {
-        if (std.mem.indexOf(u8, t.name, "kernel golden: ") != null) found += 1;
+        if (std.mem.find(u8, t.name, "kernel golden: ") != null) found += 1;
     }
     try testing.expectEqual(@as(usize, 3), found);
     // Positive control: the search string really matches something, so a typo

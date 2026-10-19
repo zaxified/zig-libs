@@ -1482,7 +1482,7 @@ test {
 }
 
 test "meta.model_after names RFC 9591 and the secp256k1 ciphersuite" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "RFC 9591") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "RFC 9591") != null);
     try std.testing.expectEqualStrings("bip340", meta.deps[0]);
 }
 

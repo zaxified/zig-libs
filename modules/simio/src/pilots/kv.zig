@@ -52,7 +52,7 @@ fn keyOf(k: usize, buf: *[2]u8) []const u8 {
 /// A 64-byte value that names its version and can be told from garbage.
 fn valueOf(ver: u32, buf: *[64]u8) []const u8 {
     @memset(buf, 'a' + @as(u8, @intCast(ver % 26)));
-    _ = std.fmt.bufPrint(buf[0..8], "v{d:0>7}", .{ver}) catch unreachable;
+    _ = std.mem.print(buf[0..8], "v{d:0>7}", .{ver}) catch unreachable;
     return buf;
 }
 
@@ -251,7 +251,7 @@ test "pilot kv: under bit rot nothing is served that was never written" {
 fn sharedWriter(io: Io, db: *kv.Db, prefix: u8, done: *u32) Io.Cancelable!void {
     for (0..50) |i| {
         var key: [8]u8 = undefined;
-        const k = std.fmt.bufPrint(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
+        const k = std.mem.print(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
         var vb: [64]u8 = undefined;
         db.put(k, valueOf(@intCast(i + 1), &vb)) catch return;
         try io.sleep(.fromMilliseconds(1), .awake);

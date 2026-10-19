@@ -84,7 +84,7 @@ fn baseConfig(key: @import("xmldsig").VerifyKey) saml.Config {
 /// `idp_entity_id` enforcement, so omitting it skipped every issuer check in
 /// the request.
 fn wrapInResponseWithoutIssuer(alloc: std.mem.Allocator, assertion_xml: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "<samlp:Response " ++ samlp_decl ++ " " ++ saml_decl ++ " " ++
+    return alloc.print("<samlp:Response " ++ samlp_decl ++ " " ++ saml_decl ++ " " ++
         "ID=\"_resp_no_issuer\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\" " ++
         "Destination=\"https://sp.example.org/acs\" InResponseTo=\"req-9988776655\">" ++
         "<samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>" ++
@@ -107,7 +107,7 @@ test "TEETH (P-05/P-06): assertion with NO <Issuer>, in a Response with no <Issu
 
     const resp = try wrapInResponseWithoutIssuer(alloc, signed.xml);
     defer alloc.free(resp);
-    try testing.expect(std.mem.indexOf(u8, resp, "saml:Issuer") == null); // genuinely absent everywhere
+    try testing.expect(std.mem.find(u8, resp, "saml:Issuer") == null); // genuinely absent everywhere
 
     try testing.expectError(
         error.IssuerMissing,

@@ -199,7 +199,7 @@ test {
 }
 
 test "meta.model_after names Wesolowski" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Wesolowski") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Wesolowski") != null);
 }
 
 test "meta.deps is {\"montint\"} (the big-integer core; see root.zig's meta.deps note)" {

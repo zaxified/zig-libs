@@ -760,7 +760,7 @@ fn typeTag(ty: message.Type) []const u8 {
 fn typeTagBuf(buf: []u8, ty: message.Type) []const u8 {
     const known = typeTag(ty);
     if (!std.mem.eql(u8, known, "TYPE?")) return known;
-    return std.fmt.bufPrint(buf, "TYPE{d}", .{@backingInt(ty)}) catch "TYPE?";
+    return std.mem.print(buf, "TYPE{d}", .{@backingInt(ty)}) catch "TYPE?";
 }
 
 /// `message.Header.opcode` is a non-exhaustive `enum(u4)`; `@tagName`
@@ -771,7 +771,7 @@ fn opcodeTag(buf: []u8, op: message.Opcode) []const u8 {
         .query => "QUERY",
         .iquery => "IQUERY",
         .status => "STATUS",
-        else => std.fmt.bufPrint(buf, "OPCODE{d}", .{@backingInt(op)}) catch "OPCODE?",
+        else => std.mem.print(buf, "OPCODE{d}", .{@backingInt(op)}) catch "OPCODE?",
     };
 }
 
@@ -792,7 +792,7 @@ fn rcodeTag(buf: []u8, rc: message.Rcode) []const u8 {
         .not_auth => "NOTAUTH",
         .not_zone => "NOTZONE",
         .bad_vers => "BADVERS",
-        else => std.fmt.bufPrint(buf, "RCODE{d}", .{@backingInt(rc)}) catch "RCODE?",
+        else => std.mem.print(buf, "RCODE{d}", .{@backingInt(rc)}) catch "RCODE?",
     };
 }
 

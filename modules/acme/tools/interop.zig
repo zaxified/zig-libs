@@ -104,7 +104,7 @@ const Mgmt = struct {
 
     fn post(m: Mgmt, path: []const u8, body: []const u8) bool {
         var url_buf: [128]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:8055{s}", .{path}) catch return false;
+        const url = std.mem.print(&url_buf, "http://127.0.0.1:8055{s}", .{path}) catch return false;
         var res = m.http_client.request(.post, url, .{ .body = body }) catch return false;
         defer res.deinit();
         return res.status == 200;
@@ -113,7 +113,7 @@ const Mgmt = struct {
     fn present(ctx: ?*anyopaque, name: []const u8, value: []const u8) bool {
         const m: *Mgmt = @ptrCast(@alignCast(ctx.?));
         var buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrint(&buf, "{{\"host\":\"{s}.\",\"value\":\"{s}\"}}", .{ name, value }) catch return false;
+        const body = std.mem.print(&buf, "{{\"host\":\"{s}.\",\"value\":\"{s}\"}}", .{ name, value }) catch return false;
         return m.post("/set-txt", body);
     }
 
@@ -121,7 +121,7 @@ const Mgmt = struct {
         _ = value;
         const m: *Mgmt = @ptrCast(@alignCast(ctx.?));
         var buf: [512]u8 = undefined;
-        const body = std.fmt.bufPrint(&buf, "{{\"host\":\"{s}.\"}}", .{name}) catch return;
+        const body = std.mem.print(&buf, "{{\"host\":\"{s}.\"}}", .{name}) catch return;
         _ = m.post("/clear-txt", body);
     }
 };
@@ -149,9 +149,9 @@ fn verifyChain(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, 
     }
     const begin = "-----BEGIN CERTIFICATE-----";
     var rest = chain;
-    while (std.mem.indexOf(u8, rest, begin)) |at| {
+    while (std.mem.find(u8, rest, begin)) |at| {
         const end_marker = "-----END CERTIFICATE-----";
-        const end = (std.mem.indexOfPos(u8, rest, at, end_marker) orelse return error.BadPem) + end_marker.len;
+        const end = (std.mem.findPos(u8, rest, at, end_marker) orelse return error.BadPem) + end_marker.len;
         try ders.append(gpa, try acme.x509.pemDecode(gpa, "CERTIFICATE", rest[at..end]));
         rest = rest[end..];
     }
@@ -175,7 +175,7 @@ fn verifyChain(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, 
                 tlv[0] = 0x87;
                 tlv[1] = @intCast(want.len);
                 @memcpy(tlv[2..][0..want.len], want);
-                if (std.mem.indexOf(u8, der, tlv[0 .. 2 + want.len]) == null) return error.NoIpSan;
+                if (std.mem.find(u8, der, tlv[0 .. 2 + want.len]) == null) return error.NoIpSan;
             } else try subject.verifyHostName(d);
         };
     }
@@ -183,7 +183,7 @@ fn verifyChain(gpa: std.mem.Allocator, chain: []const u8, root_pem: []const u8, 
 
 fn mark(http_client: *http.Client, name: []const u8) !void {
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://localhost:14001/__scenario/{s}", .{name});
+    const url = try std.mem.print(&url_buf, "https://localhost:14001/__scenario/{s}", .{name});
     var res = try http_client.request(.get, url, .{});
     res.deinit();
 }
@@ -448,7 +448,7 @@ fn managerScenario(gpa: std.mem.Allocator, io: std.Io, transport: *http.Client, 
     var failures: usize = 0;
     // A fresh storage directory per run (the scratch dir is .zig-cache).
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir_path = try std.fmt.bufPrint(&dir_buf, "{s}/manager-{d}", .{ scratch, std.Io.Clock.real.now(io).toSeconds() });
+    const dir_path = try std.mem.print(&dir_buf, "{s}/manager-{d}", .{ scratch, std.Io.Clock.real.now(io).toSeconds() });
     try std.Io.Dir.cwd().createDir(io, dir_path, @fromBackingInt(@intCast(0o700)));
     var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
     defer dir.close(io);
@@ -589,13 +589,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     // Trust only the throwaway CA pebble.sh made for the proxy and Pebble.
     var ca: http.Client.CaBundle = .{ .scanned = true };
     defer ca.deinit(gpa);
-    try ca.bundle.addCertsFromFilePathAbsolute(gpa, io, now_ts, try std.fmt.bufPrint(&path_buf, "{s}/ca.pem", .{scratch}));
+    try ca.bundle.addCertsFromFilePathAbsolute(gpa, io, now_ts, try std.mem.print(&path_buf, "{s}/ca.pem", .{scratch}));
     var transport = http.Client.init(io, gpa, .{ .shared_ca = &ca });
     defer transport.deinit();
 
-    const root_pem = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&path_buf, "{s}/pebble-root.pem", .{scratch}), gpa, .limited(1 << 16));
+    const root_pem = try std.Io.Dir.cwd().readFileAlloc(io, try std.mem.print(&path_buf, "{s}/pebble-root.pem", .{scratch}), gpa, .limited(1 << 16));
     defer gpa.free(root_pem);
-    const alt_root_pem = try std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&path_buf, "{s}/pebble-root-1.pem", .{scratch}), gpa, .limited(1 << 16));
+    const alt_root_pem = try std.Io.Dir.cwd().readFileAlloc(io, try std.mem.print(&path_buf, "{s}/pebble-root-1.pem", .{scratch}), gpa, .limited(1 << 16));
     defer gpa.free(alt_root_pem);
     const eab_key = try acme.jws.base64UrlDecodeAlloc(gpa, eab_key_b64);
     defer {

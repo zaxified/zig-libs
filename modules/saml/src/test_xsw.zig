@@ -25,8 +25,8 @@ const asrt_close = "</saml:Assertion>";
 /// Return the inclusive substring of `hay` from `open` through the first `close`
 /// after it.
 fn block(hay: []const u8, open: []const u8, close: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, hay, open).?;
-    const j = std.mem.indexOfPos(u8, hay, i, close).? + close.len;
+    const i = std.mem.find(u8, hay, open).?;
+    const j = std.mem.findPos(u8, hay, i, close).? + close.len;
     return hay[i..j];
 }
 
@@ -108,7 +108,7 @@ test "XSW: classic wrap — evil consumed assertion carries a signature pointing
 
     // The evil, consumed assertion (different ID) carries a COPY of the legit
     // signature (which references #assertion_id) as a direct child.
-    const evil = try std.fmt.allocPrint(alloc, "<saml:Assertion ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
+    const evil = try alloc.print("<saml:Assertion ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
         "<saml:Issuer>https://idp.example.org/saml</saml:Issuer>{s}{s}<wrapper>{s}</wrapper></saml:Assertion>", .{ legit_sig, evil_subject_and_conditions, legit_nosig });
     defer alloc.free(evil);
 
@@ -129,7 +129,7 @@ test "XSW: moved signature — a Response-level signature referencing the assert
     // Response-level signature must cover the Response element, not a child.
     const without = try std.mem.replaceOwned(u8, alloc, fx.signed_response, legit_sig, "");
     defer alloc.free(without);
-    const replacement = try std.fmt.allocPrint(alloc, "{s}<samlp:Status>", .{legit_sig});
+    const replacement = try alloc.print("{s}<samlp:Status>", .{legit_sig});
     defer alloc.free(replacement);
     const moved = try std.mem.replaceOwned(u8, alloc, without, "<samlp:Status>", replacement);
     defer alloc.free(moved);

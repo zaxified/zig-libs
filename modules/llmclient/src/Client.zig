@@ -161,7 +161,7 @@ const messages_path = "/v1/messages";
 const count_tokens_path = "/v1/messages/count_tokens";
 
 fn endpointUrl(base_url: []const u8, path: []const u8, buf: []u8) error{BaseUrlTooLong}![]const u8 {
-    return std.fmt.bufPrint(buf, "{s}{s}", .{ base_url, path }) catch return error.BaseUrlTooLong;
+    return std.mem.print(buf, "{s}{s}", .{ base_url, path }) catch return error.BaseUrlTooLong;
 }
 
 fn messagesUrl(base_url: []const u8, buf: []u8) error{BaseUrlTooLong}![]const u8 {
@@ -738,7 +738,7 @@ test "Client.create: a canceled body read surfaces error.Canceled, not error.Htt
     defer http_client.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const base_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{port});
+    const base_url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}", .{port});
 
     var c: Client = .init(&http_client, "sk-test-key");
     c.base_url = base_url;
@@ -792,7 +792,7 @@ test "EventIterator.next: a canceled body read surfaces error.Canceled, not erro
     defer http_client.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const base_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{port});
+    const base_url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}", .{port});
 
     var c: Client = .init(&http_client, "sk-test-key");
     c.base_url = base_url;
@@ -892,7 +892,7 @@ const FakePeer = struct {
             p.last_beta_count = 0;
             var lines = std.mem.splitSequence(u8, req.header_block, "\r\n");
             while (lines.next()) |line| {
-                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                const colon = std.mem.findScalar(u8, line, ':') orelse continue;
                 if (!std.ascii.eqlIgnoreCase(line[0..colon], "anthropic-beta")) continue;
                 p.last_beta_count += 1;
                 const v = std.mem.trim(u8, line[colon + 1 ..], " \t");
@@ -1000,7 +1000,7 @@ const Loopback = struct {
 
     fn client(self: *Loopback) !Client {
         const port = self.listener.socket.address.getPort();
-        const base_url = try std.fmt.bufPrint(&self.url_buf, "http://127.0.0.1:{d}", .{port});
+        const base_url = try std.mem.print(&self.url_buf, "http://127.0.0.1:{d}", .{port});
         var c: Client = .init(&self.http_client, "sk-ant-api03-TEST-CANARY");
         c.base_url = base_url;
         return c;
@@ -1219,15 +1219,15 @@ test "Client.create / Client.stream: stream is forced on the wire regardless of 
     wrong_stream_true.stream = true;
     var parsed = try c.create(testing.allocator, wrong_stream_true);
     defer parsed.deinit();
-    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") != null);
-    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") == null);
+    try testing.expect(std.mem.find(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") != null);
+    try testing.expect(std.mem.find(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") == null);
 
     var wrong_stream_false = canned_request;
     wrong_stream_false.stream = false;
     var it = try c.stream(testing.allocator, wrong_stream_false);
     defer it.deinit();
-    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") == null);
+    try testing.expect(std.mem.find(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") != null);
+    try testing.expect(std.mem.find(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") == null);
 }
 
 test "EventIterator.next: a LineTooLong is a real error (HttpFailed), never a silent end of stream (A1 F14)" {

@@ -63,7 +63,7 @@ pub fn main() !void {
 
     const got2 = runWire(&r, request("GET", "/api/users/7"), &buf);
     std.debug.print("GET /api/users/7    -> {s}\n", .{got2});
-    std.debug.print("  has X-Api-Version: {}\n", .{std.mem.indexOf(u8, got2, "X-Api-Version: v1") != null});
+    std.debug.print("  has X-Api-Version: {}\n", .{std.mem.find(u8, got2, "X-Api-Version: v1") != null});
 
     const got3 = runWire(&r, request("GET", "/static/css/app.css"), &buf);
     std.debug.print("GET /static/css/... -> {s}\n", .{got3});

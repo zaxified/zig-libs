@@ -770,8 +770,8 @@ test "KAT: a key whose base64 uses BOTH `+` and `/` — the two alphabet slots n
         0x8e, 0x14, 0xef, 0xa3, 0xa0, 0x2e, 0xe8, 0xef,
     };
     const expected = "SEcI/OEPUwHw0AJ+h9+ew6n8m2q5mtaAjhTvo6Au6O8=";
-    try std.testing.expect(std.mem.indexOfScalar(u8, expected, '+') != null);
-    try std.testing.expect(std.mem.indexOfScalar(u8, expected, '/') != null);
+    try std.testing.expect(std.mem.findScalar(u8, expected, '+') != null);
+    try std.testing.expect(std.mem.findScalar(u8, expected, '/') != null);
 
     // Public path — still `std.base64`, and the path M13 mutated.
     const pub_b64 = encodePublicKeyBase64(key);
@@ -959,7 +959,7 @@ test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte"
     }
     for (0..256) |c| {
         const got = ctB64Index(@intCast(c));
-        if (std.mem.indexOfScalar(u8, alphabet, @intCast(c))) |idx| {
+        if (std.mem.findScalar(u8, alphabet, @intCast(c))) |idx| {
             try std.testing.expectEqual(@as(u16, @intCast(idx)), got);
         } else {
             // ⛔ The invalid marker must be OUTSIDE the 0..63 range a valid

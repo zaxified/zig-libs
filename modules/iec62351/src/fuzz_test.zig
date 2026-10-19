@@ -371,7 +371,7 @@ pub fn fuzzAcse(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         n = damage(src, &dmg, pdu);
     } else n = src.slice(&dmg);
     const changed = n != pdu.len or !std.mem.eql(u8, dmg[0..n], pdu);
-    const token_at = std.mem.indexOf(u8, pdu, token).?;
+    const token_at = std.mem.find(u8, pdu, token).?;
     const in_token = blk: {
         if (n < pdu.len) break :blk true;
         for (dmg[0..n], pdu, 0..) |a, b, i| if (a != b and i >= token_at and i < token_at + token.len) break :blk true;

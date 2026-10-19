@@ -52,13 +52,13 @@ fn buildText(comptime S: type, src: *S, buf: []u8) []const u8 {
             1 => {
                 append(buf, &len, t);
                 var nb: [8]u8 = undefined;
-                append(buf, &len, std.fmt.bufPrint(&nb, "/{d}", .{src.valueRangeAtMost(u8, 0, 130)}) catch unreachable);
+                append(buf, &len, std.mem.print(&nb, "/{d}", .{src.valueRangeAtMost(u8, 0, 130)}) catch unreachable);
             },
             2 => {
                 append(buf, &len, "[");
                 append(buf, &len, t);
                 var nb: [8]u8 = undefined;
-                append(buf, &len, std.fmt.bufPrint(&nb, "]:{d}", .{src.value(u16)}) catch unreachable);
+                append(buf, &len, std.mem.print(&nb, "]:{d}", .{src.value(u16)}) catch unreachable);
             },
             else => {
                 append(buf, &len, t);
@@ -83,8 +83,8 @@ fn buildText(comptime S: type, src: *S, buf: []u8) []const u8 {
             4 => "/",
             5 => "[",
             6 => "]",
-            7 => std.fmt.bufPrint(&nb, "{d}", .{src.valueRangeAtMost(u16, 0, 300)}) catch unreachable,
-            8 => std.fmt.bufPrint(&nb, "{x}", .{src.valueRangeAtMost(u32, 0, 0x1ffff)}) catch unreachable,
+            7 => std.mem.print(&nb, "{d}", .{src.valueRangeAtMost(u16, 0, 300)}) catch unreachable,
+            8 => std.mem.print(&nb, "{x}", .{src.valueRangeAtMost(u32, 0, 0x1ffff)}) catch unreachable,
             9 => "ffff",
             10 => blk: {
                 const k = src.valueRangeAtMost(u8, 1, 3);

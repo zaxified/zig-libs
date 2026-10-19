@@ -239,10 +239,10 @@ pub fn parseServerRef(text: []const u8) ?Referral {
     var s = std.mem.trim(u8, text, " \t\r");
     if (std.ascii.startsWithIgnoreCase(s, "whois://")) {
         s = s["whois://".len..];
-    } else if (std.mem.indexOf(u8, s, "://") != null) {
+    } else if (std.mem.find(u8, s, "://") != null) {
         return null; // rwhois://, http://, … — not RFC 3912
     }
-    if (std.mem.indexOfScalar(u8, s, '/')) |i| s = s[0..i]; // trailing "/" or path
+    if (std.mem.findScalar(u8, s, '/')) |i| s = s[0..i]; // trailing "/" or path
 
     // Audit F10: an IPv6 literal has colons OF ITS OWN, so "split on the
     // first `:`" (below) mistakes part of the address for a port
@@ -257,7 +257,7 @@ pub fn parseServerRef(text: []const u8) ?Referral {
         // `[host]` or `[host]:port` — the ONLY unambiguous way to combine
         // an IPv6 literal with a port, so a `:` after the `]` is always a
         // port separator here, never part of the address.
-        const close = std.mem.indexOfScalar(u8, s, ']') orelse return null;
+        const close = std.mem.findScalar(u8, s, ']') orelse return null;
         host = s[1..close];
         is_v6 = true;
         const rest = s[close + 1 ..];
@@ -276,7 +276,7 @@ pub fn parseServerRef(text: []const u8) ?Referral {
         is_v6 = true;
     } else {
         host = s;
-        if (std.mem.indexOfScalar(u8, s, ':')) |i| {
+        if (std.mem.findScalar(u8, s, ':')) |i| {
             host = s[0..i];
             port = std.fmt.parseInt(u16, s[i + 1 ..], 10) catch return null;
             if (port == 0) return null;
@@ -409,7 +409,7 @@ fn parseInetAton(raw: []const u8) NumericHost {
     // leaves an empty part, which is invalid below.
     const host = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
     if (host.len == 0 or !std.ascii.isDigit(host[0])) return .not_numeric;
-    if (std.mem.indexOfNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
+    if (std.mem.findNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
     var it0 = std.mem.splitScalar(u8, host, '.');
     while (it0.next()) |part| {
         if (part.len == 0) return .invalid;
@@ -1354,7 +1354,7 @@ test "Chain.append refuses past capacity, on its own (audit F8)" {
     var chain: Chain = .{};
     var name_buf: [Chain.capacity][4]u8 = undefined;
     for (0..Chain.capacity) |i| {
-        const h = std.fmt.bufPrint(&name_buf[i], "h{d}", .{i}) catch unreachable;
+        const h = std.mem.print(&name_buf[i], "h{d}", .{i}) catch unreachable;
         try testing.expect(chain.append(h));
     }
     try testing.expectEqual(@as(usize, Chain.capacity), chain.count);

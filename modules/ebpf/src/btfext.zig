@@ -533,7 +533,7 @@ pub fn parseFieldSpec(local: *const Btf, root_type_id: u32, access: []const u8) 
 /// Strip a CO-RE **flavor** suffix: `task_struct___v58` names the same target
 /// type as `task_struct`. Everything from the first `___` on is dropped.
 pub fn stripFlavor(name: []const u8) []const u8 {
-    const at = std.mem.indexOf(u8, name, "___") orelse return name;
+    const at = std.mem.find(u8, name, "___") orelse return name;
     return name[0..at];
 }
 
@@ -1409,7 +1409,7 @@ test "real clang object: .BTF + .BTF.ext parse and agree with the compiler" {
         try testing.expectEqual(@as(u32, 8), s.count);
         const li = s.lineInfo(0);
         try testing.expectEqualStrings("/tmp/zlbtf/core.c", local.str(li.file_name_off).?);
-        try testing.expect(std.mem.indexOf(u8, local.str(li.line_off).?, "t->pid") != null);
+        try testing.expect(std.mem.find(u8, local.str(li.line_off).?, "t->pid") != null);
         try testing.expectEqual(@as(u22, 20), li.line()); // the `return` line of the fixture source
     }
     // core_relo: four FIELD_BYTE_OFFSET records, exactly as clang emitted.

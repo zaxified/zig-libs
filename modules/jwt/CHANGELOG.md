@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `cache.zig` reflection over `Options`/`Value` uses `field_names`/`field_types` (struct `.fields` is gone); the `ReadCueIo` test seam counts `Operation.net_read` through `vtable.operate` (`netRead` slot is gone).
 - **2026-10-18** — **Constant time:** `parseJwks` key material (`oct` `k` and every other base64url member, RSA/EC private components included) decodes with `b64ct.url_safe_no_pad` instead of `std.base64` (new dep). Same acceptance and `InvalidBase64` errors.
 - **2026-10-14** — follows rsa's 8192-bit cap: RS*/PS* keys up to 8192 bits are accepted (was 4096; golang-jwt has no upper bound below Go's). Test boundary moved to `rsa.max_modulus_len + 1`.

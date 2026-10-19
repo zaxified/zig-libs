@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
     ws[6].input = C.encodeWrapped(pem, pem_bin, 64, .lf);
     for (ws) |w| try dir.writeFile(io, .{ .sub_path = w.file, .data = w.input });
 
-    const exe = try std.fmt.allocPrint(arena, "{s}/sodium_bench", .{abs});
+    const exe = try arena.print("{s}/sodium_bench", .{abs});
     std.debug.print("bench-b64ct: building the libsodium side from {s} ...\n", .{codecs});
     const cc = try std.process.run(arena, io, .{ .argv = &.{ "zig", "cc", "-O3", "-march=native", "-Imodules/b64ct/tools/sodium_shim", "modules/b64ct/tools/c_bench/sodium_bench.c", codecs, "-o", exe } });
     if (cc.term != .exited or cc.term.exited != 0) {
@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (round == 0) {
             // Interop before believing any number: same output, byte for byte.
             for (ws) |w| {
-                const file = try std.fmt.allocPrint(arena, "{s}.out", .{w.name});
+                const file = try arena.print("{s}.out", .{w.name});
                 const theirs = try dir.readFileAlloc(io, file, arena, .limited(1 << 20));
                 const n = runOnce(w, out);
                 if (!std.mem.eql(u8, out[0..n], theirs)) {

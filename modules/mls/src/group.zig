@@ -3147,7 +3147,7 @@ pub fn Group(comptime S: type) type {
             if (isLowOrderHpkeKey(S, leaf.encryption_key)) return error.LeafNodeInvalid;
             if (!self.policy.check_leaf_extensions_supported) return;
             for (leaf.extensions) |ext| {
-                if (std.mem.indexOfScalar(u16, leaf.capabilities.extensions, ext.extension_type) == null)
+                if (std.mem.findScalar(u16, leaf.capabilities.extensions, ext.extension_type) == null)
                     return error.LeafNodeInvalid;
             }
         }
@@ -6854,7 +6854,7 @@ const SecretScan = struct {
         self.live.deinit(testing.allocator);
     }
     fn holds(self: *const SecretScan, buf: []const u8) bool {
-        return self.needle.len > 0 and std.mem.indexOf(u8, buf, self.needle) != null;
+        return self.needle.len > 0 and std.mem.find(u8, buf, self.needle) != null;
     }
     fn liveHoldingNeedle(self: *const SecretScan) usize {
         var n: usize = 0;

@@ -89,7 +89,7 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
             error.ReadFailed => return error.ReadFailed,
             error.EndOfStream => return error.EndOfStream,
         };
-        const nl = std.mem.indexOfScalar(u8, avail, '\n');
+        const nl = std.mem.findScalar(u8, avail, '\n');
         const take = if (nl) |i| i + 1 else avail.len;
         const before_nl: ?u8 = if (nl) |i| (if (i > 0) avail[i - 1] else prev) else null;
         raw_len += take;
@@ -163,9 +163,9 @@ pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
 /// is refused (§5.2 lets a server choose, and refusing is the smuggling-safe
 /// choice).
 pub fn unfoldObsFold(block: []u8) void {
-    const first_eol = std.mem.indexOf(u8, block, "\r\n") orelse return;
+    const first_eol = std.mem.find(u8, block, "\r\n") orelse return;
     var i = first_eol + 2;
-    while (std.mem.indexOfPos(u8, block, i, "\r\n")) |at| : (i = at + 2) {
+    while (std.mem.findPos(u8, block, i, "\r\n")) |at| : (i = at + 2) {
         if (at + 2 < block.len and (block[at + 2] == ' ' or block[at + 2] == '\t')) {
             block[at] = ' ';
             block[at + 1] = ' ';
@@ -353,7 +353,7 @@ pub const HeaderIterator = struct {
         while (it.lines.next()) |raw| {
             const line = trimLineEnd(raw);
             if (line.len == 0) continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             return .{
                 .name = line[0..colon],
                 .value = std.mem.trim(u8, line[colon + 1 ..], " \t"),
@@ -580,8 +580,8 @@ pub const RequestHead = struct {
         const request_line = try stripCrlf(lines.next() orelse return error.MalformedHead);
 
         // "METHOD SP request-target SP HTTP/1.x"
-        const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.MalformedHead;
-        const sp2 = std.mem.lastIndexOfScalar(u8, request_line, ' ').?;
+        const sp1 = std.mem.findScalar(u8, request_line, ' ') orelse return error.MalformedHead;
+        const sp2 = std.mem.findScalarLast(u8, request_line, ' ').?;
         if (sp2 <= sp1) return error.MalformedHead; // fewer than two spaces
         const method = request_line[0..sp1];
         const target = request_line[sp1 + 1 .. sp2];
@@ -1369,7 +1369,7 @@ test "ResponseHead.parse: framing headers" {
         "Transfer-Encoding: identity\r\n",
     }) |fields| {
         var buf: [256]u8 = undefined;
-        const head = try ResponseHead.parse(try std.fmt.bufPrint(&buf, "HTTP/1.1 200 OK\r\n{s}", .{fields}));
+        const head = try ResponseHead.parse(try std.mem.print(&buf, "HTTP/1.1 200 OK\r\n{s}", .{fields}));
         try testing.expect(head.has_transfer_encoding and !head.chunked);
     }
 
@@ -1518,7 +1518,7 @@ test "RequestHead.parse: Transfer-Encoding must be exactly the single 'chunked' 
         "Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
     }) |fields| {
         var buf: [256]u8 = undefined;
-        const block = try std.fmt.bufPrint(&buf, "POST /u HTTP/1.1\r\nHost: h\r\n{s}", .{fields});
+        const block = try std.mem.print(&buf, "POST /u HTTP/1.1\r\nHost: h\r\n{s}", .{fields});
         const split = try RequestHead.parse(block);
         try testing.expect(split.has_transfer_encoding);
         try testing.expect(!split.chunked);
@@ -2186,7 +2186,7 @@ test "RequestHead: a head packed with minimal headers is bounded by bytes, not b
     var i: usize = 0;
     while (head.items.len < 16 * 1024 - 32) : (i += 1) {
         var line_buf: [32]u8 = undefined;
-        try head.appendSlice(allocator, try std.fmt.bufPrint(&line_buf, "h{d}: v\r\n", .{i}));
+        try head.appendSlice(allocator, try std.mem.print(&line_buf, "h{d}: v\r\n", .{i}));
     }
     // The header we look for is LAST, so the scan cannot short-circuit early.
     try head.appendSlice(allocator, "x-needle: found\r\n");

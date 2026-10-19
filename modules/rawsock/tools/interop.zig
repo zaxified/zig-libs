@@ -43,7 +43,7 @@ fn ifindex(gpa: std.mem.Allocator, io: std.Io, name: []const u8) !i32 {
     const r = try std.process.run(gpa, io, .{ .argv = &.{ "ip", "-o", "link", "show", name } });
     defer gpa.free(r.stdout);
     defer gpa.free(r.stderr);
-    const colon = std.mem.indexOfScalar(u8, r.stdout, ':') orelse return error.NoSuchInterface;
+    const colon = std.mem.findScalar(u8, r.stdout, ':') orelse return error.NoSuchInterface;
     return std.fmt.parseInt(i32, r.stdout[0..colon], 10);
 }
 

@@ -148,8 +148,8 @@ fn parseSvg(svg: []const u8, quiet: u8, size: u16, out: *Matrix) !void {
     out.* = .{ .size = size };
     for (0..size) |y| for (0..size) |x| out.setDark(@intCast(x), @intCast(y), false);
 
-    const d_start = (std.mem.indexOf(u8, svg, " d=\"") orelse return error.NoPath) + 4;
-    const d = svg[d_start .. d_start + (std.mem.indexOfScalar(u8, svg[d_start..], '"') orelse
+    const d_start = (std.mem.find(u8, svg, " d=\"") orelse return error.NoPath) + 4;
+    const d = svg[d_start .. d_start + (std.mem.findScalar(u8, svg[d_start..], '"') orelse
         return error.UnterminatedPath)];
 
     var i: usize = 0;
@@ -166,7 +166,7 @@ fn parseSvg(svg: []const u8, quiet: u8, size: u16, out: *Matrix) !void {
         // The rest of the run is a fixed shape; check it rather than skip it,
         // or a rendering one module tall in the wrong direction reads as fine.
         var tail_buf: [16]u8 = undefined;
-        const tail = try std.fmt.bufPrint(&tail_buf, "v1h-{d}z", .{run});
+        const tail = try std.mem.print(&tail_buf, "v1h-{d}z", .{run});
         if (!std.mem.startsWith(u8, d[i..], tail)) return error.BadRun;
         i += tail.len;
 
@@ -221,10 +221,10 @@ test "SVG geometry: viewBox is in modules, width is in pixels" {
     const svg = aw.written();
 
     // 21 + 2*4 = 29 modules, 290 pixels.
-    try testing.expect(std.mem.indexOf(u8, svg, "width=\"290\" height=\"290\"") != null);
-    try testing.expect(std.mem.indexOf(u8, svg, "viewBox=\"0 0 29 29\"") != null);
+    try testing.expect(std.mem.find(u8, svg, "width=\"290\" height=\"290\"") != null);
+    try testing.expect(std.mem.find(u8, svg, "viewBox=\"0 0 29 29\"") != null);
     // A finder pattern's outer row is seven modules starting at the quiet zone.
-    try testing.expect(std.mem.indexOf(u8, svg, "M4 4h7v1h-7z") != null);
+    try testing.expect(std.mem.find(u8, svg, "M4 4h7v1h-7z") != null);
 }
 
 test "caller strings are escaped, so a title cannot become markup" {
@@ -239,13 +239,13 @@ test "caller strings are escaped, so a title cannot become markup" {
     });
     const svg = aw.written();
 
-    try testing.expect(std.mem.indexOf(u8, svg, "<script>") == null);
-    try testing.expect(std.mem.indexOf(u8, svg, "&lt;script&gt;") != null);
-    try testing.expect(std.mem.indexOf(u8, svg, "onload=\"x") == null);
-    try testing.expect(std.mem.indexOf(u8, svg, "&quot; onload=&quot;x") != null);
+    try testing.expect(std.mem.find(u8, svg, "<script>") == null);
+    try testing.expect(std.mem.find(u8, svg, "&lt;script&gt;") != null);
+    try testing.expect(std.mem.find(u8, svg, "onload=\"x") == null);
+    try testing.expect(std.mem.find(u8, svg, "&quot; onload=&quot;x") != null);
     // Exactly one attribute-opening quote pair per attribute is what makes the
     // document well-formed; the title element must close where we closed it.
-    try testing.expect(std.mem.indexOf(u8, svg, "</title>\n") != null);
+    try testing.expect(std.mem.find(u8, svg, "</title>\n") != null);
 }
 
 test "background is omitted when light is null" {
@@ -255,7 +255,7 @@ test "background is omitted when light is null" {
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try writeSvg(&aw.writer, &m, .{ .light = null });
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "<rect") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "<rect") == null);
 }
 
 test "a fixed buffer that is too small fails rather than truncates" {

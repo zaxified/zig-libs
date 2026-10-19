@@ -393,17 +393,17 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var copy: [btcaddr.max_address_len]u8 = undefined;
     @memcpy(copy[0..addr.len], addr.slice());
     const at = src.index(addr.len);
-    const bech = std.mem.indexOfScalar(u8, addr.slice(), '1') != null and
+    const bech = std.mem.findScalar(u8, addr.slice(), '1') != null and
         (std.ascii.startsWithIgnoreCase(addr.slice(), "bc1") or std.ascii.startsWithIgnoreCase(addr.slice(), "tb1") or std.ascii.startsWithIgnoreCase(addr.slice(), "bcrt1"));
     if (bech) {
         // Past the separator only (an hrp edit is a different, refused address
         // anyway, but the invariant checked here is the checksum's).
-        const sep = std.mem.lastIndexOfScalar(u8, addr.slice(), '1').?;
+        const sep = std.mem.findScalarLast(u8, addr.slice(), '1').?;
         const j = sep + 1 + src.index(addr.len - sep - 1);
         const cs = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-        copy[j] = cs[(std.mem.indexOfScalar(u8, cs, copy[j]).? + 1) % cs.len];
+        copy[j] = cs[(std.mem.findScalar(u8, cs, copy[j]).? + 1) % cs.len];
     } else {
-        copy[at] = alphabet[(std.mem.indexOfScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
+        copy[at] = alphabet[(std.mem.findScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
     }
     if (btcaddr.toScriptPubKeyFor(copy[0..addr.len], net)) |_| return error.FlippedAddressAccepted else |_| {}
     RoundMark.mark(.flipped_refused);
@@ -422,7 +422,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var wcopy: [btcaddr.max_wif_len]u8 = undefined;
     @memcpy(wcopy[0..wif.len], wif);
     const wj = src.index(wif.len);
-    wcopy[wj] = alphabet[(std.mem.indexOfScalar(u8, alphabet, wcopy[wj]).? + 1) % alphabet.len];
+    wcopy[wj] = alphabet[(std.mem.findScalar(u8, alphabet, wcopy[wj]).? + 1) % alphabet.len];
     var w2: btcaddr.Wif = undefined;
     if (btcaddr.wifDecode(&w2, wcopy[0..wif.len])) |_| {
         w2.wipe();

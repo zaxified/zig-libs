@@ -249,7 +249,7 @@ pub const TraceState = struct {
         while (it.next()) |raw| {
             const m = std.mem.trim(u8, raw, " \t");
             if (m.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, m, '=') orelse return error.BadMember;
+            const eq = std.mem.findScalar(u8, m, '=') orelse return error.BadMember;
             const key = m[0..eq];
             const value = m[eq + 1 ..];
             if (!isValidKey(key) or !isValidValue(value)) return error.BadMember;
@@ -660,14 +660,14 @@ pub fn runWire(r: *router.Router, bytes: []const u8, out_buf_wire: []u8) []const
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
 pub fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -846,7 +846,7 @@ test "tracestate: invalid values (empty, too long, control char) are dropped, no
         var req_buf: [4096]u8 = undefined;
         const too_long = "k1=" ++ strRepeat("a", 254) ++ ",k2=" ++ strRepeat("b", 252); // 513
         comptime std.debug.assert(too_long.len == max_state_len + 1);
-        const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+        const req = try std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
             "Connection: close\r\n\r\n", .{too_long});
         var buf: [2048]u8 = undefined;
@@ -878,7 +878,7 @@ test "tracestate: invalid values (empty, too long, control char) are dropped, no
         var req_buf: [4096]u8 = undefined;
         const at_boundary = "k1=" ++ strRepeat("a", 253) ++ ",k2=" ++ strRepeat("b", 252);
         comptime std.debug.assert(at_boundary.len == max_state_len);
-        const req = try std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+        const req = try std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "traceparent: " ++ sample ++ "\r\ntracestate: {s}\r\n" ++
             "Connection: close\r\n\r\n", .{at_boundary});
         var buf: [2048]u8 = undefined;
@@ -985,7 +985,7 @@ test "TraceState: normalizes, dedupes, put moves left, delete, 32-member cap" {
     var full: TraceState = .{};
     var keys: [max_members][4]u8 = undefined;
     for (&keys, 0..) |*k, i| {
-        _ = std.fmt.bufPrint(k, "k{d:0>3}", .{i}) catch unreachable;
+        _ = std.mem.print(k, "k{d:0>3}", .{i}) catch unreachable;
         try full.put(k, "v");
     }
     try testing.expectEqual(@as(usize, max_members), full.members().len);
@@ -1028,7 +1028,7 @@ test "TraceState.write truncates whole members: over 128 characters first, then 
 
 /// Test `StateEntry`: "<span-id hex>" so the test can see the hop it got.
 fn spanValue(_: ?*anyopaque, hop: TraceParent, buf: *[max_value_len]u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{x}", .{&hop.parent_id}) catch unreachable;
+    return std.mem.print(buf, "{x}", .{&hop.parent_id}) catch unreachable;
 }
 fn badValue(_: ?*anyopaque, _: TraceParent, _: *[max_value_len]u8) ?[]const u8 {
     return "bad,value";
@@ -1048,7 +1048,7 @@ test "state_entry: our member goes first, replaces our old one, starts a new tra
     const tp = try TraceParent.parse(headerValue(got, "traceparent").?);
     var want: [64]u8 = undefined;
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&want, "zl={x},rojo=1,congo=2", .{&tp.parent_id}),
+        try std.mem.print(&want, "zl={x},rojo=1,congo=2", .{&tp.parent_id}),
         headerValue(got, "tracestate").?,
     );
 
@@ -1057,7 +1057,7 @@ test "state_entry: our member goes first, replaces our old one, starts a new tra
     got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\ntracestate: rojo=1\r\nConnection: close\r\n\r\n", &buf);
     const tp2 = try TraceParent.parse(headerValue(got, "traceparent").?);
     try testing.expectEqualStrings(
-        try std.fmt.bufPrint(&want, "zl={x}", .{&tp2.parent_id}),
+        try std.mem.print(&want, "zl={x}", .{&tp2.parent_id}),
         headerValue(got, "tracestate").?,
     );
 
@@ -1117,8 +1117,8 @@ const model_key_rest = model_key_first ++ "_-*/@";
 
 fn modelKeyOk(k: []const u8) bool {
     if (k.len < 1 or k.len > 256) return false;
-    if (std.mem.indexOfScalar(u8, model_key_first, k[0]) == null) return false;
-    for (k) |c| if (std.mem.indexOfScalar(u8, model_key_rest, c) == null) return false;
+    if (std.mem.findScalar(u8, model_key_first, k[0]) == null) return false;
+    for (k) |c| if (std.mem.findScalar(u8, model_key_rest, c) == null) return false;
     return true;
 }
 
@@ -1166,7 +1166,7 @@ test "model-fuzz: TraceState.parse matches the grammar model; write/parse round-
             // its own key storage: `keys_seen` keeps slices of it.
             const kb = &key_store[i];
             const key = if (clean and rnd.uintLessThan(u8, 5) != 0)
-                std.fmt.bufPrint(kb, "{s}{d}", .{ k, i }) catch unreachable
+                std.mem.print(kb, "{s}{d}", .{ k, i }) catch unreachable
             else
                 k;
             w.print("{s}={s}", .{ key, v }) catch unreachable;
@@ -1290,9 +1290,9 @@ test "TraceContext echo: traceparent header survives the caller's dead frame" {
 
     // The traceparent header, read back off the wire after every byte of its
     // source was overwritten.
-    try testing.expect(std.mem.indexOf(u8, wire, "traceparent: " ++ sample ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "traceparent: " ++ sample ++ "\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+    try testing.expect(std.mem.find(u8, wire, "#") == null);
 }
 
 // See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.

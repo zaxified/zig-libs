@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. std `X25519.KeyPair.generateDeterministic` / `recoverPublicKey` no longer return errors: dropped the `catch return error.KexFailed` / `try` at the call sites (transport.zig, server.zig, stackprobe_test.zig); enum/struct reflection moved to `field_names` / `field_values` (keys.zig `fromName`, transport.zig `isRecognized`, connection.zig test).
 - **2026-10-18** — **Build option `ssh-gex-max-bits`** (4096..8192, default 8192; `-Dprofile=small` 4096): the largest DH group-exchange prime the client asks for and accepts; a larger server group fails the kex with `error.KexFailed`. `GexMod` follows the cap, so with rsa's cap no 8192-bit montint slot is left. Size probe (`tools/sizeprobe.zig`, ReleaseSmall, ADX/BMI2) 184 720 → 115 160 B with the cap alone, 29 440 B under `.small`. Default unchanged; ctgrind digests re-pinned (counts unchanged).
 - **2026-10-18** — **Fixed:** an Ed25519 OpenSSH host key whose seed does not derive its public key is refused in every build mode. In ReleaseFast/ReleaseSmall the seed was never checked (std 0.16 `KeyPair.fromSecretKey` re-derives the public key only under runtime safety), so such a container loaded and signed with a key its advertised public key does not verify. Now derived with `generateDeterministic(seed)` and compared.

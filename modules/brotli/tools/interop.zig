@@ -121,7 +121,7 @@ const Ref = struct {
     }
 
     fn path(self: *Ref, name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.scratch, name });
+        return self.gpa.print("{s}/{s}", .{ self.scratch, name });
     }
 
     fn read(self: *Ref, name: []const u8) ![]u8 {
@@ -155,8 +155,8 @@ const Ref = struct {
         defer self.gpa.free(out);
         var qbuf: [8]u8 = undefined;
         var wbuf: [8]u8 = undefined;
-        const q = std.fmt.bufPrint(&qbuf, "{d}", .{quality}) catch unreachable;
-        const w = std.fmt.bufPrint(&wbuf, "{d}", .{lgwin}) catch unreachable;
+        const q = std.mem.print(&qbuf, "{d}", .{quality}) catch unreachable;
+        const w = std.mem.print(&wbuf, "{d}", .{lgwin}) catch unreachable;
         try self.call(&.{ "python3", self.driver, "compress", q, w, in, out }, false);
         return self.read(out_bin);
     }
@@ -177,7 +177,7 @@ const Shared = struct {
         const exe = try ref.path("shared_oracle");
         errdefer gpa.free(exe);
         var libs: [3][]u8 = undefined;
-        for (&libs, [_][]const u8{ "enc", "dec", "common" }) |*l, n| l.* = try std.fmt.allocPrint(gpa, "{s}/libbrotli{s}.so.1", .{ lib_dir, n });
+        for (&libs, [_][]const u8{ "enc", "dec", "common" }) |*l, n| l.* = try gpa.print("{s}/libbrotli{s}.so.1", .{ lib_dir, n });
         defer for (libs) |l| gpa.free(l);
         const r = try std.process.run(gpa, ref.io, .{ .argv = &.{ "zig", "cc", "-O2", src, libs[0], libs[1], libs[2], "-o", exe } });
         defer gpa.free(r.stdout);
@@ -205,11 +205,11 @@ const Shared = struct {
             for (owned.items) |o| gpa.free(o);
             owned.deinit(gpa);
         }
-        const inc = try std.fmt.allocPrint(gpa, "-I{s}/c/include", .{checkout});
+        const inc = try gpa.print("-I{s}/c/include", .{checkout});
         try owned.append(gpa, inc);
         try argv.appendSlice(gpa, &.{ "zig", "cc", "-O2", "-DBROTLI_EXPERIMENTAL", inc, Shared.src, "-lm", "-o", exe });
         for ([_][]const u8{ "common", "dec", "enc" }) |part| {
-            const dir_path = try std.fmt.allocPrint(gpa, "{s}/c/{s}", .{ checkout, part });
+            const dir_path = try gpa.print("{s}/c/{s}", .{ checkout, part });
             defer gpa.free(dir_path);
             var dir = std.Io.Dir.cwd().openDir(ref.io, dir_path, .{ .iterate = true }) catch {
                 std.debug.print("--brotli-src {s}: no {s}\n", .{ checkout, dir_path });
@@ -219,7 +219,7 @@ const Shared = struct {
             var it = dir.iterate();
             while (try it.next(ref.io)) |e| {
                 if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".c")) continue;
-                const f = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_path, e.name });
+                const f = try gpa.print("{s}/{s}", .{ dir_path, e.name });
                 try owned.append(gpa, f);
                 try argv.append(gpa, f);
             }
@@ -254,7 +254,7 @@ const Shared = struct {
         defer gpa.free(out);
         var qb: [4]u8 = undefined;
         var wb: [4]u8 = undefined;
-        try sh.ref.call(&.{ sh.exe, "enc", std.fmt.bufPrint(&qb, "{d}", .{quality}) catch unreachable, std.fmt.bufPrint(&wb, "{d}", .{lgwin}) catch unreachable, if (large) "1" else "0", d, in, out }, false);
+        try sh.ref.call(&.{ sh.exe, "enc", std.mem.print(&qb, "{d}", .{quality}) catch unreachable, std.mem.print(&wb, "{d}", .{lgwin}) catch unreachable, if (large) "1" else "0", d, in, out }, false);
         return sh.ref.read(Ref.out_bin);
     }
 
@@ -263,14 +263,14 @@ const Shared = struct {
         const gpa = sh.ref.gpa;
         const d = try sh.file("dict.bin", dict);
         defer gpa.free(d);
-        const sd = try std.fmt.allocPrint(gpa, "s:{s}", .{d});
+        const sd = try gpa.print("s:{s}", .{d});
         defer gpa.free(sd);
         const in = try sh.file(Ref.in_bin, plain);
         defer gpa.free(in);
         const out = try sh.file(Ref.out_bin, null);
         defer gpa.free(out);
         var qb: [4]u8 = undefined;
-        try sh.ref.call(&.{ sh.exe, "enc", std.fmt.bufPrint(&qb, "{d}", .{quality}) catch unreachable, "22", "0", sd, in, out }, false);
+        try sh.ref.call(&.{ sh.exe, "enc", std.mem.print(&qb, "{d}", .{quality}) catch unreachable, "22", "0", sd, in, out }, false);
         return sh.ref.read(Ref.out_bin);
     }
 
@@ -373,7 +373,7 @@ fn checkEncoderDirection(ref: *Ref) !void {
 fn checkDecoderDirection(ref: *Ref) !void {
     const gpa = ref.gpa;
     for (corpus.ref_streams) |r| {
-        const in_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ testdata, r.input });
+        const in_path = try gpa.print("{s}/{s}", .{ testdata, r.input });
         defer gpa.free(in_path);
         const plain = try std.Io.Dir.cwd().readFileAlloc(ref.io, in_path, gpa, .unlimited);
         defer gpa.free(plain);
@@ -397,7 +397,7 @@ fn checkDecoderDirection(ref: *Ref) !void {
         // for the same input, so a difference here is news, not a failure: the
         // check that matters is the one above, and it just passed on freshly
         // produced bytes.
-        const fx_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ref_dir, r.file });
+        const fx_path = try gpa.print("{s}/{s}", .{ ref_dir, r.file });
         defer gpa.free(fx_path);
         if (std.Io.Dir.cwd().readFileAlloc(ref.io, fx_path, gpa, .unlimited)) |committed| {
             defer gpa.free(committed);
@@ -442,7 +442,7 @@ fn checkDictDecoderDirection(sh: *Shared) !void {
             if (try ourDecoders(gpa, dict, stream, plain)) |why| {
                 bad("dict {s} q{d}: we did not decode the library's stream ({s})", .{ c.name, q, why });
             } else ok();
-            const fx = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ref_dir, comptime corpus.dictRefFile(c, q) });
+            const fx = try gpa.print("{s}/{s}", .{ ref_dir, comptime corpus.dictRefFile(c, q) });
             defer gpa.free(fx);
             if (std.Io.Dir.cwd().readFileAlloc(sh.ref.io, fx, gpa, .unlimited)) |committed| {
                 defer gpa.free(committed);
@@ -686,7 +686,7 @@ fn captureRefStreams(ref: *Ref) !void {
     try std.Io.Dir.cwd().createDirPath(ref.io, ref_dir);
     var total: usize = 0;
     for (corpus.ref_streams) |r| {
-        const in_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ testdata, r.input });
+        const in_path = try gpa.print("{s}/{s}", .{ testdata, r.input });
         defer gpa.free(in_path);
         const plain = try std.Io.Dir.cwd().readFileAlloc(ref.io, in_path, gpa, .unlimited);
         defer gpa.free(plain);
@@ -694,7 +694,7 @@ fn captureRefStreams(ref: *Ref) !void {
         const stream = try ref.compress(plain, r.quality, r.lgwin);
         defer gpa.free(stream);
 
-        const out_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ ref_dir, r.file });
+        const out_path = try gpa.print("{s}/{s}", .{ ref_dir, r.file });
         defer gpa.free(out_path);
         try std.Io.Dir.cwd().writeFile(ref.io, .{ .sub_path = out_path, .data = stream });
         total += stream.len;

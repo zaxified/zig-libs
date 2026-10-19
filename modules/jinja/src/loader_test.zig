@@ -169,7 +169,7 @@ test "a template cannot escape the root through a name taken from the context" {
         error.LoaderFailed,
         env.renderAlloc(gpa, "{% include theme %}", ctx, &diag),
     );
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "refused") != null);
+    try testing.expect(std.mem.find(u8, diag.message(), "refused") != null);
 
     var diag2: jinja.Diagnostic = .{};
     try testing.expectError(
@@ -315,10 +315,10 @@ test "an include of many distinct templates (no recursion) hits the total-load c
     defer src.deinit(gpa);
 
     for (0..n) |i| {
-        const name = try std.fmt.allocPrint(gpa, "t{d}", .{i});
+        const name = try gpa.print("t{d}", .{i});
         try owned_names.append(gpa, name);
         try entries.append(gpa, .{ .name = name, .source = "x" });
-        const tag = try std.fmt.allocPrint(gpa, "{{% include '{s}' %}}", .{name});
+        const tag = try gpa.print("{{% include '{s}' %}}", .{name});
         defer gpa.free(tag);
         try src.appendSlice(gpa, tag);
     }
@@ -351,7 +351,7 @@ test "the caps are configurable and the error names the limit" {
         error.TooDeep,
         env.renderAlloc(gpa, "{% include 'a' %}", .{ .map = .{ .pairs = &.{} } }, &diag),
     );
-    try testing.expect(std.mem.indexOf(u8, diag.message(), "4") != null);
+    try testing.expect(std.mem.find(u8, diag.message(), "4") != null);
 }
 
 test "a legitimate deep chain still renders — the cap is not just 'no nesting'" {

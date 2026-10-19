@@ -47,7 +47,7 @@ fn httpGet(gpa: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
 pub fn infoDoc(gpa: std.mem.Allocator, io: std.Io, file_path: ?[]const u8, base: []const u8) ![]u8 {
     if (file_path) |p|
         return std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(max_doc_bytes));
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}/info", .{ base, quicknet_hash_hex });
+    const url = try gpa.print("{s}/{s}/info", .{ base, quicknet_hash_hex });
     defer gpa.free(url);
     return httpGet(gpa, io, url);
 }
@@ -57,7 +57,7 @@ pub fn infoDoc(gpa: std.mem.Allocator, io: std.Io, file_path: ?[]const u8, base:
 pub fn roundDoc(gpa: std.mem.Allocator, io: std.Io, file_path: ?[]const u8, base: []const u8, round: u64) ![]u8 {
     if (file_path) |p|
         return std.Io.Dir.cwd().readFileAlloc(io, p, gpa, .limited(max_doc_bytes));
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}/public/{d}", .{ base, quicknet_hash_hex, round });
+    const url = try gpa.print("{s}/{s}/public/{d}", .{ base, quicknet_hash_hex, round });
     defer gpa.free(url);
     return httpGet(gpa, io, url);
 }
@@ -124,7 +124,7 @@ pub fn formatUtc(buf: []u8, unix: i64) []const u8 {
     if (unix > max_printable_unix) return "after year 9999 (malformed capsule)";
     const p = datefmt.unixToParts(unix);
     // Now in 1..9999 by the guard above, so the cast cannot trap.
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2} UTC", .{
         @as(u32, @intCast(p.year)), p.month, p.day, p.hour, p.minute, p.second,
     }) catch unreachable;
 }

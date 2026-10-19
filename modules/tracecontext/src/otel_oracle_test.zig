@@ -102,7 +102,7 @@ test "otel oracle: the middleware continues, restarts and carries state as OpenT
         const resp_tp = root.headerValue(got, "traceparent") orelse "";
         const parsed = root.TraceParent.parse(resp_tp) catch null;
         var hexbuf: [32]u8 = undefined;
-        const resp_trace: []const u8 = if (parsed) |p| std.fmt.bufPrint(&hexbuf, "{x}", .{&p.trace_id}) catch unreachable else "";
+        const resp_trace: []const u8 = if (parsed) |p| std.mem.print(&hexbuf, "{x}", .{&p.trace_id}) catch unreachable else "";
         if (parsed == null) {
             why_bad = "no valid traceparent on the response";
         } else if (parsed.?.flags & ~root.flag_sampled != 0) {
@@ -115,7 +115,7 @@ test "otel oracle: the middleware continues, restarts and carries state as OpenT
             } else continued += 1;
         } else {
             var reused = false;
-            for (c.headers) |h| if (mem.indexOf(u8, h.value, resp_trace) != null) {
+            for (c.headers) |h| if (mem.find(u8, h.value, resp_trace) != null) {
                 reused = true;
             };
             if (reused) why_bad = "otel restarts the trace, we continued it" else restarted += 1;

@@ -116,7 +116,7 @@ fn waitEnter(io: std.Io) void {
 }
 
 fn lastNameFromPath(path: []const u8) []const u8 {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return path;
+    const slash = std.mem.findScalarLast(u8, path, '/') orelse return path;
     return path[slash + 1 ..];
 }
 

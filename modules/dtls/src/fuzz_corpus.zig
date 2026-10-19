@@ -79,7 +79,7 @@ pub const DatagramIterator = struct {
         while (true) {
             if (self.toks) |*t| {
                 while (t.next()) |tok| {
-                    const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
+                    const eq = std.mem.findScalar(u8, tok, '=') orelse continue;
                     const key = tok[0..eq];
                     const wanted = if (std.mem.eql(u8, key, "in"))
                         self.want_in
@@ -102,7 +102,7 @@ pub const DatagramIterator = struct {
             const raw = self.lines.next() orelse return null;
             const line = std.mem.trim(u8, raw, " \r\t");
             if (line.len == 0 or line[0] == '#') continue;
-            const op = line[0 .. std.mem.indexOfScalar(u8, line, ' ') orelse line.len];
+            const op = line[0 .. std.mem.findScalar(u8, line, ' ') orelse line.len];
             self.want_in = std.mem.eql(u8, op, "flight") or std.mem.eql(u8, op, "recv");
             self.want_out = std.mem.eql(u8, op, "flight") or std.mem.eql(u8, op, "start") or
                 std.mem.eql(u8, op, "send");

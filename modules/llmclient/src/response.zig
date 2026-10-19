@@ -935,7 +935,7 @@ fn fuzzParseMessage(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     const tin = src.value(u32);
     const tout = src.value(u32);
     var jb: [512]u8 = undefined;
-    const doc = try std.fmt.bufPrint(&jb, "{{\"id\":\"{s}\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d}}}}}", .{ id, text, tin, tout });
+    const doc = try std.mem.print(&jb, "{{\"id\":\"{s}\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"stop_reason\":\"end_turn\",\"usage\":{{\"input_tokens\":{d},\"output_tokens\":{d}}}}}", .{ id, text, tin, tout });
     const m = parseMessage(arena.allocator(), doc) catch return error.GenuineMessageRefused;
     if (!std.mem.eql(u8, m.id, id) or m.usage.input_tokens != tin or m.usage.output_tokens != tout) return error.GenuineMessageChanged;
     if (m.content.len != 1 or m.content[0] != .text or !std.mem.eql(u8, m.content[0].text.text, text)) return error.GenuineMessageChanged;
@@ -975,7 +975,7 @@ fn fuzzParseStreamEvent(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     const text = drawWord(S, src, &tb);
     const index = src.value(u32);
     var jb: [256]u8 = undefined;
-    const doc = try std.fmt.bufPrint(&jb, "{{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}", .{ index, text });
+    const doc = try std.mem.print(&jb, "{{\"type\":\"content_block_delta\",\"index\":{d},\"delta\":{{\"type\":\"text_delta\",\"text\":\"{s}\"}}}}", .{ index, text });
     const ev = parseStreamEvent(arena.allocator(), doc) catch return error.GenuineEventRefused;
     if (ev != .content_block_delta or ev.content_block_delta.index != index or ev.content_block_delta.delta != .text_delta or
         !std.mem.eql(u8, ev.content_block_delta.delta.text_delta.text, text)) return error.GenuineEventChanged;
@@ -1003,7 +1003,7 @@ fn fuzzParseTokenCount(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
     // `u64Field` refuses by design ("not a count this client can use").
     const n: u64 = src.value(u64) & std.math.maxInt(i64);
     var jb: [64]u8 = undefined;
-    const doc = try std.fmt.bufPrint(&jb, "{{ \"input_tokens\": {d} }}", .{n});
+    const doc = try std.mem.print(&jb, "{{ \"input_tokens\": {d} }}", .{n});
     const tc = parseTokenCount(arena.allocator(), doc) catch return error.GenuineCountRefused;
     if (tc.input_tokens != n) return error.GenuineCountChanged;
     TokMark.mark(.genuine);

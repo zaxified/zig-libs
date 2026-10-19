@@ -543,7 +543,7 @@ test "search prunes on canMatch and stops feeding bytes on willAlwaysMatch (budg
     var kbuf: [16]u8 = undefined;
     for (0..2000) |i| {
         // Half the keys start with "k0", half with "x".
-        const k = try std.fmt.bufPrint(&kbuf, "{s}{d:0>6}", .{ if (i % 2 == 0) "k0" else "x", i });
+        const k = try std.mem.print(&kbuf, "{s}{d:0>6}", .{ if (i % 2 == 0) "k0" else "x", i });
         try b.insert(k, @intCast(i));
     }
     for ([_]FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
@@ -795,7 +795,7 @@ test "large key set crosses the u16 offset boundary (node region > 64 KiB)" {
     // child offsets exceed what a u16 could hold; the u32 offsets must still
     // resolve. (This index uses a single u32 offset width, no tiers.)
     while (i < 5000) : (i += 1) {
-        const k = try std.fmt.bufPrint(&kbuf, "addr-{d:0>7}", .{i});
+        const k = try std.mem.print(&kbuf, "addr-{d:0>7}", .{i});
         try b.insert(k, i);
     }
     const buf = try b.freezeWith(testing.allocator, .v1);

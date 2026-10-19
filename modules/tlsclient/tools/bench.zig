@@ -117,7 +117,7 @@ pub fn main(init: std.process.Init) !u8 {
     try env.put("GOTOOLCHAIN", "local");
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
+    const exe = try arena.print("{s}/go_bench", .{abs});
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const build = std.process.run(arena, io, .{
         .argv = &.{ "go", "build", "-o", exe, "." },
@@ -155,10 +155,10 @@ pub fn main(init: std.process.Init) !u8 {
     ctx.* = .{ .io = io, .ports = undefined, .bundles = undefined };
     const now = std.Io.Clock.real.now(io);
     for (kinds, 0..) |k, i| {
-        const port_txt = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "port_{s}.txt", .{k}), arena, .limited(16));
+        const port_txt = try dir.readFileAlloc(io, try arena.print("port_{s}.txt", .{k}), arena, .limited(16));
         ctx.ports[i] = try std.fmt.parseInt(u16, std.mem.trim(u8, port_txt, " \n"), 10);
         ctx.bundles[i] = .empty;
-        try ctx.bundles[i].addCertsFromFilePath(arena, io, now, dir, try std.fmt.allocPrint(arena, "root_{s}.pem", .{k}));
+        try ctx.bundles[i].addCertsFromFilePath(arena, io, now, dir, try arena.print("root_{s}.pem", .{k}));
     }
 
     // Sanity before timing: the right name works, a wrong one is refused.
@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ws: std.ArrayList(Work) = .empty;
     for (kinds, 0..) |k, i| {
-        const name = try std.fmt.allocPrint(arena, "handshake_{s}", .{k});
+        const name = try arena.print("handshake_{s}", .{k});
         try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name });
     }
 

@@ -888,8 +888,8 @@ fn dohExchange(r: *Resolver, packet: []const u8) Error![]u8 {
             const Encoder = std.base64.url_safe_no_pad.Encoder;
             var b64_buf: [Encoder.calcSize(message.max_query_len)]u8 = undefined;
             const dns_param = Encoder.encode(&b64_buf, packet);
-            const sep: u8 = if (std.mem.indexOfScalar(u8, url, '?') != null) '&' else '?';
-            const full = std.fmt.allocPrint(r.gpa, "{s}{c}dns={s}", .{ url, sep, dns_param }) catch
+            const sep: u8 = if (std.mem.findScalar(u8, url, '?') != null) '&' else '?';
+            const full = r.gpa.print("{s}{c}dns={s}", .{ url, sep, dns_param }) catch
                 return error.OutOfMemory;
             defer r.gpa.free(full);
             break :blk client.request(.get, full, .{
@@ -992,7 +992,7 @@ fn jsonQueryUrl(gpa: std.mem.Allocator, url: []const u8, name: []const u8, ty: m
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.appendSlice(gpa, url);
-    try out.append(gpa, if (std.mem.indexOfScalar(u8, url, '?') != null) '&' else '?');
+    try out.append(gpa, if (std.mem.findScalar(u8, url, '?') != null) '&' else '?');
     try out.appendSlice(gpa, "name=");
     for (name) |b| {
         if (std.ascii.isAlphanumeric(b) or b == '-' or b == '.' or b == '_' or b == '~') {
@@ -1350,7 +1350,7 @@ test "query: Options left at default honors resolv.conf's tightened timeout/atte
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [256]u8 = undefined;
-    const conf_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    const conf_path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
     try std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = conf_path,
         .data = "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n",
@@ -1755,7 +1755,7 @@ test "query: every retry carries a fresh transaction id" {
 /// A resolv.conf in a test tmp dir carrying `search s1.test s2.test`; the
 /// path is written into `path_buf`.
 fn searchConf(io: std.Io, tmp: *const std.testing.TmpDir, path_buf: []u8) ![]const u8 {
-    const conf_path = try std.fmt.bufPrint(path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    const conf_path = try std.mem.print(path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = conf_path, .data = "search s1.test s2.test\n" });
     return conf_path;
 }
@@ -1865,7 +1865,7 @@ test "DoH: a non-200 status is DohFailed on both the wire and the JSON path, nev
     };
     defer stub.server.socket.close(io);
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/dns-query", .{stub.server.socket.address.getPort()});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/dns-query", .{stub.server.socket.address.getPort()});
     var r = Resolver.init(io, testing.allocator, .{ .doh_url = url, .timeout_ms = 5000, .use_hosts = false, .use_search = false });
     defer r.deinit();
     var fut = try io.concurrent(Http503.run, .{&stub});
@@ -2245,7 +2245,7 @@ test "query: the servers asked per rcode are the ones glibc asked (SERVFAIL, NOT
         try testing.expectEqual(fx.tried.len, log.slice().len);
         for (fx.tried, log.slice()) |want, n| {
             var buf: [16]u8 = undefined;
-            const got = try std.fmt.bufPrint(&buf, "127.0.0.{d}", .{n});
+            const got = try std.mem.print(&buf, "127.0.0.{d}", .{n});
             testing.expectEqualStrings(want, got) catch |e| {
                 std.debug.print("rcode {d}: glibc asked {s}, ours {s}\n", .{ fx.rcode, want, got });
                 return e;

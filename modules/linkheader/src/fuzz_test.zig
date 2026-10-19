@@ -114,7 +114,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         };
         if (src.value(bool)) {
             links[i].title = fill(src, &titles[i], src.index(titles[i].len + 1), val_set);
-            if (std.mem.indexOfScalar(u8, links[i].title.?, '\\') != null or std.mem.indexOfScalar(u8, links[i].title.?, '"') != null)
+            if (std.mem.findScalar(u8, links[i].title.?, '\\') != null or std.mem.findScalar(u8, links[i].title.?, '"') != null)
                 RoundMark.mark(.quoted_escape);
         }
         if (src.value(bool)) links[i].type = fill(src, &types[i], src.index(types[i].len + 1), val_set);
@@ -187,7 +187,7 @@ fn fuzzHelpers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     _ = lh.unquote(&out, in) catch {};
     HelperMark.mark(.unquoted);
     // `base|ref` split at the first '|' (else a fixed base).
-    const bar = std.mem.indexOfScalar(u8, in, '|');
+    const bar = std.mem.findScalar(u8, in, '|');
     const base = if (bar) |b| in[0..b] else "http://a/b/c/d;p?q";
     const ref = if (bar) |b| in[b + 1 ..] else in;
     var rout: [1024]u8 = undefined;

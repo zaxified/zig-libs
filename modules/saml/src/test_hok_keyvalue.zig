@@ -58,7 +58,7 @@ fn baseConfig(idp_key: @import("xmldsig").VerifyKey) saml.Config {
 
 /// Mint a signed Response whose Subject carries `confirmation`.
 fn mintResponse(alloc: std.mem.Allocator, confirmation: []const u8) !sign.Signed {
-    const after_issuer = try std.fmt.allocPrint(alloc, "<saml:Subject>{s}{s}</saml:Subject>{s}", .{ nameid, confirmation, conditions });
+    const after_issuer = try alloc.print("<saml:Subject>{s}{s}</saml:Subject>{s}", .{ nameid, confirmation, conditions });
     defer alloc.free(after_issuer);
     var signed = try sign.signAssertion(alloc, 0x4B37E4, fx.idp_entity_id, "_hokkv01", "2024-06-01T12:00:00Z", after_issuer);
     errdefer signed.deinit(alloc);
@@ -81,7 +81,7 @@ fn rsaKeyValueConfirmation(alloc: std.mem.Allocator, pk: rsa.PublicKey) ![]u8 {
     const exp_b64 = try b64(alloc, stripLeadingZeros(&e_buf));
     defer alloc.free(exp_b64);
 
-    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
+    return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\"><ds:KeyValue><ds:RSAKeyValue>" ++
         "<ds:Modulus>{s}</ds:Modulus><ds:Exponent>{s}</ds:Exponent>" ++
         "</ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>" ++
@@ -107,7 +107,7 @@ fn rsaKeyValueConfirmationWithScdAttrs(alloc: std.mem.Allocator, pk: rsa.PublicK
     const exp_b64 = try b64(alloc, stripLeadingZeros(&e_buf));
     defer alloc.free(exp_b64);
 
-    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData {s}>" ++
+    return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData {s}>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\"><ds:KeyValue><ds:RSAKeyValue>" ++
         "<ds:Modulus>{s}</ds:Modulus><ds:Exponent>{s}</ds:Exponent>" ++
         "</ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>" ++
@@ -118,7 +118,7 @@ fn rsaKeyValueConfirmationWithScdAttrs(alloc: std.mem.Allocator, pk: rsa.PublicK
 fn ecKeyValueConfirmation(alloc: std.mem.Allocator, sec1: []const u8) ![]u8 {
     const pt_b64 = try b64(alloc, sec1);
     defer alloc.free(pt_b64);
-    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
+    return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\" xmlns:dsig11=\"{s}\"><ds:KeyValue><dsig11:ECKeyValue>" ++
         "<dsig11:NamedCurve URI=\"{s}\"/><dsig11:PublicKey>{s}</dsig11:PublicKey>" ++
         "</dsig11:ECKeyValue></ds:KeyValue></ds:KeyInfo>" ++
@@ -129,7 +129,7 @@ fn ecKeyValueConfirmation(alloc: std.mem.Allocator, sec1: []const u8) ![]u8 {
 fn x509Confirmation(alloc: std.mem.Allocator, cert_der: []const u8) ![]u8 {
     const cert_b64 = try b64(alloc, cert_der);
     defer alloc.free(cert_b64);
-    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
+    return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\"><ds:X509Data>" ++
         "<ds:X509Certificate>{s}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>" ++
         "</saml:SubjectConfirmationData></saml:SubjectConfirmation>", .{ hok_method, ds_ns_decl, cert_b64 });
@@ -263,7 +263,7 @@ test "HoK KeyValue: ECKeyValue with wrong NamedCurve -> HolderOfKeyMismatch" {
     const pt_b64 = try b64(alloc, &presented_point);
     defer alloc.free(pt_b64);
     // A non-P-256 NamedCurve must not match even with identical point bytes.
-    const conf = try std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
+    const conf = try alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\" xmlns:dsig11=\"{s}\"><ds:KeyValue><dsig11:ECKeyValue>" ++
         "<dsig11:NamedCurve URI=\"urn:oid:1.3.132.0.34\"/><dsig11:PublicKey>{s}</dsig11:PublicKey>" ++
         "</dsig11:ECKeyValue></ds:KeyValue></ds:KeyInfo>" ++

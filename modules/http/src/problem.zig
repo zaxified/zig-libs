@@ -265,7 +265,7 @@ test "invalid UTF-8 in a standard member becomes U+FFFD per maximal subpart" {
     for (cases) |c| {
         const out = try render(&buf, .{ .type = "t", .instance = c.in }, .{});
         var want_buf: [128]u8 = undefined;
-        const want = try std.fmt.bufPrint(&want_buf, "{{\"type\":\"t\",\"instance\":\"{s}\"}}", .{c.want});
+        const want = try std.mem.print(&want_buf, "{{\"type\":\"t\",\"instance\":\"{s}\"}}", .{c.want});
         try testing.expectEqualStrings(want, out);
         try testing.expect(std.unicode.utf8ValidateSlice(out));
     }

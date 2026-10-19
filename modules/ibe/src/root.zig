@@ -132,8 +132,8 @@ test {
 }
 
 test "meta.model_after names Boneh-Franklin CRYPTO 2001" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Boneh") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "CRYPTO 2001") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Boneh") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "CRYPTO 2001") != null);
 }
 
 test "meta.deps is exactly {bls12_381, entropy}" {

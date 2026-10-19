@@ -366,7 +366,7 @@ test "mnemonicToEntropy rejects a tampered checksum word (positive control)" {
 
     // Flip the last word (carries the checksum bits) to a different, still
     // wordlist-valid word.
-    const last_space = std.mem.lastIndexOfScalar(u8, mnemonic, ' ').?;
+    const last_space = std.mem.findScalarLast(u8, mnemonic, ' ').?;
     var tampered_buf: [max_mnemonic_len]u8 = undefined;
     @memcpy(tampered_buf[0 .. last_space + 1], mnemonic[0 .. last_space + 1]);
     const replacement = if (std.mem.eql(u8, mnemonic[last_space + 1 ..], "abandon")) "ability" else "abandon";

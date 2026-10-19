@@ -118,8 +118,8 @@ fn int(toks: []const []const u8, i: usize) i64 {
 /// `ppid` is missing; any later field that is missing or not a number reads 0.
 /// Pure and allocation-free.
 pub fn parsePidStat(line: []const u8) ?PidStat {
-    const lp = std.mem.indexOfScalar(u8, line, '(') orelse return null;
-    const rp = std.mem.lastIndexOfScalar(u8, line, ')') orelse return null;
+    const lp = std.mem.findScalar(u8, line, '(') orelse return null;
+    const rp = std.mem.findScalarLast(u8, line, ')') orelse return null;
     if (rp <= lp) return null;
     const pid = std.fmt.parseInt(u32, std.mem.trim(u8, line[0..lp], " \t\n"), 10) catch return null;
 

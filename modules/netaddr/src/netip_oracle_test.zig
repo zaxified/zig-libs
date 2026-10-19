@@ -39,14 +39,14 @@ fn range(text: []const u8) na.IpRange {
 
 /// "from-to" as written, valid or not (a range pair may be malformed).
 fn rawRange(text: []const u8) na.IpRange {
-    const dash = std.mem.indexOfScalar(u8, text, '-').?;
+    const dash = std.mem.findScalar(u8, text, '-').?;
     return .{ .from = zoned(text[0..dash]).ip, .to = zoned(text[dash + 1 ..]).ip };
 }
 
 /// Text of `ip` with `zone` appended the way Go prints a zoned address.
 fn withZone(buf: []u8, ip_text: []const u8, zone: na.Zone) []const u8 {
     if (zone.isNone()) return ip_text;
-    return std.fmt.bufPrint(buf, "{s}%{s}", .{ ip_text, zone.slice() }) catch unreachable;
+    return std.mem.print(buf, "{s}%{s}", .{ ip_text, zone.slice() }) catch unreachable;
 }
 
 test "netip oracle: ParseAddr, String, StringExpanded, predicates, Next/Prev" {
@@ -60,7 +60,7 @@ test "netip oracle: ParseAddr, String, StringExpanded, predicates, Next/Prev" {
         }
         const z = got orelse {
             // Go takes any zone length; ours is capped.
-            const pct = std.mem.indexOfScalar(u8, c.text, '%').?;
+            const pct = std.mem.findScalar(u8, c.text, '%').?;
             try testing.expect(c.text.len - pct - 1 > na.max_zone_len);
             long_zone += 1;
             continue;
@@ -116,7 +116,7 @@ test "netip oracle: ParseAddrPort, String, Compare" {
         }
         const ap = got orelse {
             // Go's port parser takes leading zeros; this module's does not.
-            const colon = std.mem.lastIndexOfScalar(u8, c.text, ':').?;
+            const colon = std.mem.findScalarLast(u8, c.text, ':').?;
             const port = c.text[colon + 1 ..];
             try testing.expect(port.len > 1 and port[0] == '0');
             leading_zero += 1;

@@ -262,13 +262,13 @@ pub fn render(
         // are already `writeRawHeader`'s job; angle brackets are not.
         try checkNoAngleBrackets(id);
         var line: [256]u8 = undefined;
-        const v = std.fmt.bufPrint(&line, "<{s}>", .{id}) catch return error.LineTooLong;
+        const v = std.mem.print(&line, "<{s}>", .{id}) catch return error.LineTooLong;
         mime.writeRawHeader(w, "Message-ID", v, opts.mime) catch |e| return wrap(e);
     }
     if (msg.in_reply_to) |r| {
         try checkNoAngleBrackets(r);
         var line: [256]u8 = undefined;
-        const v = std.fmt.bufPrint(&line, "<{s}>", .{r}) catch return error.LineTooLong;
+        const v = std.mem.print(&line, "<{s}>", .{r}) catch return error.LineTooLong;
         mime.writeRawHeader(w, "In-Reply-To", v, opts.mime) catch |e| return wrap(e);
     }
     if (msg.references.len != 0) {
@@ -277,7 +277,7 @@ pub fn render(
         for (msg.references) |r| {
             try checkNoAngleBrackets(r);
             var line: [256]u8 = undefined;
-            const v = std.fmt.bufPrint(&line, "<{s}>", .{r}) catch return error.LineTooLong;
+            const v = std.mem.print(&line, "<{s}>", .{r}) catch return error.LineTooLong;
             for (v) |c| if (c == '\r' or c == '\n' or c == 0) return error.ControlCharacterInHeader;
             f.token(v) catch |e| return wrap(e);
         }
@@ -328,8 +328,8 @@ fn generateMessageId(buf: []u8, random: std.Random, domain: []const u8) ![]const
     var raw: [16]u8 = undefined;
     random.bytes(&raw);
     var hex: [32]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{&raw}) catch unreachable;
-    return std.fmt.bufPrint(buf, "{s}@{s}", .{ hex, domain });
+    _ = std.mem.print(&hex, "{x}", .{&raw}) catch unreachable;
+    return std.mem.print(buf, "{s}@{s}", .{ hex, domain });
 }
 
 // ── parts ──────────────────────────────────────────────────────────────────
@@ -393,7 +393,7 @@ fn renderText(gpa: std.mem.Allocator, t: Text, opts: RenderOptions) RenderError!
     errdefer hw.deinit();
     {
         var line: [512]u8 = undefined;
-        const ct = std.fmt.bufPrint(&line, "text/{s}; charset=\"{s}\"", .{ t.subtype, t.charset }) catch return error.LineTooLong;
+        const ct = std.mem.print(&line, "text/{s}; charset=\"{s}\"", .{ t.subtype, t.charset }) catch return error.LineTooLong;
         mime.writeRawHeader(&hw.writer, "Content-Type", ct, opts.mime) catch |e| return wrap(e);
     }
     mime.writeRawHeader(&hw.writer, "Content-Transfer-Encoding", enc.text(), opts.mime) catch |e| return wrap(e);
@@ -441,7 +441,7 @@ fn renderAttachment(gpa: std.mem.Allocator, a: Attachment, opts: RenderOptions) 
     if (a.content_id) |cid| {
         try checkNoAngleBrackets(cid);
         var line: [256]u8 = undefined;
-        const v = std.fmt.bufPrint(&line, "<{s}>", .{cid}) catch return error.LineTooLong;
+        const v = std.mem.print(&line, "<{s}>", .{cid}) catch return error.LineTooLong;
         for (v) |c| if (c == '\r' or c == '\n' or c == 0) return error.ControlCharacterInHeader;
         mime.writeRawHeader(&hw.writer, "Content-ID", v, opts.mime) catch |e| return wrap(e);
     }
@@ -462,7 +462,7 @@ fn renderAttachment(gpa: std.mem.Allocator, a: Attachment, opts: RenderOptions) 
 /// encoded-word inside a parameter is common in the wild and illegal, so it is
 /// not produced here.
 fn writeFilenameParam(w: *std.Io.Writer, name: []const u8, value: []const u8) std.Io.Writer.Error!void {
-    if (mime.isAscii(value) and std.mem.indexOfAny(u8, value, "\"\\;") == null) {
+    if (mime.isAscii(value) and std.mem.findAny(u8, value, "\"\\;") == null) {
         try w.print("; {s}=\"{s}\"", .{ name, value });
         return;
     }
@@ -505,8 +505,8 @@ fn renderMultipart(
             const cand = drawBoundary(&boundary_buf, random, opts) catch return error.BoundaryCollision;
             var clash = false;
             for (kids.items) |k| {
-                if (std.mem.indexOf(u8, k.headers, cand) != null or
-                    std.mem.indexOf(u8, k.content, cand) != null)
+                if (std.mem.find(u8, k.headers, cand) != null or
+                    std.mem.find(u8, k.content, cand) != null)
                 {
                     clash = true;
                     break;
@@ -521,7 +521,7 @@ fn renderMultipart(
     errdefer hw.deinit();
     {
         var line: [256]u8 = undefined;
-        const ct = std.fmt.bufPrint(&line, "multipart/{s}; boundary=\"{s}\"", .{ m.subtype.text(), boundary }) catch return error.LineTooLong;
+        const ct = std.mem.print(&line, "multipart/{s}; boundary=\"{s}\"", .{ m.subtype.text(), boundary }) catch return error.LineTooLong;
         mime.writeRawHeader(&hw.writer, "Content-Type", ct, opts.mime) catch |e| return wrap(e);
     }
 
@@ -609,7 +609,7 @@ test "the canonical body: a line that is exactly a period survives composition" 
     const dm = @import("data.zig");
     const wire = try dm.stuffAlloc(gpa, out, .{});
     defer gpa.free(wire);
-    try testing.expect(std.mem.indexOf(u8, wire, "\r\n..\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "\r\n..\r\n") != null);
     const back = try dm.unstuffAlloc(gpa, wire, .{});
     defer gpa.free(back);
     try testing.expectEqualStrings(out, back);
@@ -627,9 +627,9 @@ test "non-ASCII text picks quoted-printable and non-ASCII headers are encoded" {
         .body = .{ .text = .{ .body = "Příliš žluťoučký kůň úpěl ďábelské ódy.\r\n" } },
     }, prng.random(), .{});
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Content-Transfer-Encoding: quoted-printable") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Subject: =?utf-8?") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "=C5=BElu=C5=A5ou=C4=8Dk=C3=BD") != null);
+    try testing.expect(std.mem.find(u8, out, "Content-Transfer-Encoding: quoted-printable") != null);
+    try testing.expect(std.mem.find(u8, out, "Subject: =?utf-8?") != null);
+    try testing.expect(std.mem.find(u8, out, "=C5=BElu=C5=A5ou=C4=8Dk=C3=BD") != null);
     // No raw high byte may remain anywhere in the document.
     for (out) |c| try testing.expect(c < 0x80);
     try mime.checkLineLengths(out, 998);
@@ -655,15 +655,15 @@ test "multipart/mixed with an attachment, and the boundary is not in any part" {
     }, prng.random(), .{});
     defer gpa.free(out);
 
-    const b_start = std.mem.indexOf(u8, out, "boundary=\"").? + 10;
-    const b_end = std.mem.indexOfScalarPos(u8, out, b_start, '"').?;
+    const b_start = std.mem.find(u8, out, "boundary=\"").? + 10;
+    const b_end = std.mem.findScalarPos(u8, out, b_start, '"').?;
     const boundary = out[b_start..b_end];
     try testing.expect(std.mem.startsWith(u8, boundary, "=_zigsmtp_"));
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, boundary) - 1 + 1 - 1); // opener + 2 delimiters + closer counted below
     // Exactly: the Content-Type parameter, two "--b" delimiters and one "--b--".
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, out, boundary));
-    try testing.expect(std.mem.indexOf(u8, out, "Content-Disposition: attachment; filename=\"notes.txt\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "Content-Transfer-Encoding: base64") != null);
+    try testing.expect(std.mem.find(u8, out, "Content-Disposition: attachment; filename=\"notes.txt\"") != null);
+    try testing.expect(std.mem.find(u8, out, "Content-Transfer-Encoding: base64") != null);
     try testing.expect(std.mem.endsWith(u8, out, "--\r\n"));
     try mime.checkLineLengths(out, 998);
 }
@@ -684,12 +684,12 @@ test "a boundary that collides with a part's content is redrawn" {
         } } },
     }, prng.random(), .{});
     defer gpa.free(first);
-    const s = std.mem.indexOf(u8, first, "boundary=\"").? + 10;
-    const e = std.mem.indexOfScalarPos(u8, first, s, '"').?;
+    const s = std.mem.find(u8, first, "boundary=\"").? + 10;
+    const e = std.mem.findScalarPos(u8, first, s, '"').?;
     const drawn = try gpa.dupe(u8, first[s..e]);
     defer gpa.free(drawn);
 
-    const poisoned = try std.fmt.allocPrint(gpa, "a body that quotes --{s} verbatim\r\n", .{drawn});
+    const poisoned = try gpa.print("a body that quotes --{s} verbatim\r\n", .{drawn});
     defer gpa.free(poisoned);
 
     var prng2 = fixedRandom(7);
@@ -704,11 +704,11 @@ test "a boundary that collides with a part's content is redrawn" {
     }, prng2.random(), .{});
     defer gpa.free(second);
 
-    const s2 = std.mem.indexOf(u8, second, "boundary=\"").? + 10;
-    const e2 = std.mem.indexOfScalarPos(u8, second, s2, '"').?;
+    const s2 = std.mem.find(u8, second, "boundary=\"").? + 10;
+    const e2 = std.mem.findScalarPos(u8, second, s2, '"').?;
     try testing.expect(!std.mem.eql(u8, drawn, second[s2..e2]));
     // The quoted text is still there, and the real delimiters use the new one.
-    try testing.expect(std.mem.indexOf(u8, second, drawn) != null);
+    try testing.expect(std.mem.find(u8, second, drawn) != null);
 }
 
 test "boundary redraw gives up rather than emitting a broken message" {
@@ -745,14 +745,14 @@ test "multipart/alternative nests inside multipart/mixed" {
         } } },
     }, prng.random(), .{});
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "multipart/mixed;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "multipart/alternative;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "text/html;") != null);
+    try testing.expect(std.mem.find(u8, out, "multipart/mixed;") != null);
+    try testing.expect(std.mem.find(u8, out, "multipart/alternative;") != null);
+    try testing.expect(std.mem.find(u8, out, "text/html;") != null);
     // The two boundaries differ.
-    const first_b = out[std.mem.indexOf(u8, out, "boundary=\"").? + 10 ..];
-    const b1 = first_b[0..std.mem.indexOfScalar(u8, first_b, '"').?];
-    const rest = first_b[std.mem.indexOf(u8, first_b, "boundary=\"").? + 10 ..];
-    const b2 = rest[0..std.mem.indexOfScalar(u8, rest, '"').?];
+    const first_b = out[std.mem.find(u8, out, "boundary=\"").? + 10 ..];
+    const b1 = first_b[0..std.mem.findScalar(u8, first_b, '"').?];
+    const rest = first_b[std.mem.find(u8, first_b, "boundary=\"").? + 10 ..];
+    const b2 = rest[0..std.mem.findScalar(u8, rest, '"').?];
     try testing.expect(!std.mem.eql(u8, b1, b2));
     try mime.checkLineLengths(out, 998);
 }
@@ -942,7 +942,7 @@ test "a verbatim header keeps its bytes; raw still folds; injection and long lin
         .body = .{ .text = .{ .body = "hi\r\n" } },
     }, prng.random(), .{});
     defer gpa.free(doc);
-    try testing.expect(std.mem.indexOf(u8, doc, "\r\nDKIM-Signature:" ++ sig ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, doc, "\r\nDKIM-Signature:" ++ sig ++ "\r\n") != null);
 
     // Positive control: the same value as `raw` is folded and its whitespace collapsed.
     var prng2 = fixedRandom(1);
@@ -954,7 +954,7 @@ test "a verbatim header keeps its bytes; raw still folds; injection and long lin
         .body = .{ .text = .{ .body = "hi\r\n" } },
     }, prng2.random(), .{});
     defer gpa.free(folded);
-    try testing.expect(std.mem.indexOf(u8, folded, "v=1;  c=") == null);
+    try testing.expect(std.mem.find(u8, folded, "v=1;  c=") == null);
 
     const bad = [_][]const u8{
         "v=1\r\nBcc: victim@example.net", // CRLF not followed by WSP: injection
@@ -996,11 +996,11 @@ test "Bcc never reaches the message unless the caller asks" {
     };
     const out = try render(gpa, m, prng.random(), .{});
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "secret@example.org") == null);
+    try testing.expect(std.mem.find(u8, out, "secret@example.org") == null);
 
     const with = try render(gpa, m, prng.random(), .{ .include_bcc = true });
     defer gpa.free(with);
-    try testing.expect(std.mem.indexOf(u8, with, "Bcc: secret@example.org") != null);
+    try testing.expect(std.mem.find(u8, with, "Bcc: secret@example.org") != null);
 }
 
 test "a non-ASCII filename uses RFC 2231, not an illegal encoded word" {
@@ -1013,8 +1013,8 @@ test "a non-ASCII filename uses RFC 2231, not an illegal encoded word" {
         .body = .{ .attachment = .{ .filename = "účtenka.pdf", .content_type = "application/pdf", .data = "%PDF-1.4\n" } },
     }, prng.random(), .{});
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "filename*=UTF-8''%C3%BA%C4%8Dtenka.pdf") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "=?utf-8?") == null);
+    try testing.expect(std.mem.find(u8, out, "filename*=UTF-8''%C3%BA%C4%8Dtenka.pdf") != null);
+    try testing.expect(std.mem.find(u8, out, "=?utf-8?") == null);
 }
 
 test "a generated Message-ID is random, well-formed and deterministic per seed" {
@@ -1036,7 +1036,7 @@ test "a generated Message-ID is random, well-formed and deterministic per seed" 
     defer gpa.free(c);
     try testing.expectEqualStrings(a, b);
     try testing.expect(!std.mem.eql(u8, a, c));
-    try testing.expect(std.mem.indexOf(u8, a, "@client.example.org>") != null);
+    try testing.expect(std.mem.find(u8, a, "@client.example.org>") != null);
 }
 
 test "a very long line in a 7bit-looking body forces an encoding that fits" {
@@ -1049,7 +1049,7 @@ test "a very long line in a 7bit-looking body forces an encoding that fits" {
         .body = .{ .text = .{ .body = strRepeat("A", 5000) ++ "\r\n" } },
     }, prng.random(), .{});
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "Content-Transfer-Encoding: quoted-printable") != null);
+    try testing.expect(std.mem.find(u8, out, "Content-Transfer-Encoding: quoted-printable") != null);
     try mime.checkLineLengths(out, 998);
 }
 
@@ -1139,8 +1139,8 @@ fn fuzzRender(_: void, smith: *std.testing.Smith) !void {
     defer gpa.free(out);
     try mime.checkLineLengths(out, 998);
     // The boundary must not appear inside the parts it delimits: count it.
-    const s = std.mem.indexOf(u8, out, "boundary=\"").? + 10;
-    const e = std.mem.indexOfScalarPos(u8, out, s, '"').?;
+    const s = std.mem.find(u8, out, "boundary=\"").? + 10;
+    const e = std.mem.findScalarPos(u8, out, s, '"').?;
     const boundary = out[s..e];
     std.debug.assert(std.mem.count(u8, out, boundary) == 4);
 }
@@ -1191,8 +1191,8 @@ test "corpus: every render seed reaches the renderer, and the counts are pinned"
         if (render(gpa, m, prng.random(), .{})) |out| {
             defer gpa.free(out);
             rendered += 1;
-            const bs = std.mem.indexOf(u8, out, "boundary=\"").? + 10;
-            const be = std.mem.indexOfScalarPos(u8, out, bs, '"').?;
+            const bs = std.mem.find(u8, out, "boundary=\"").? + 10;
+            const be = std.mem.findScalarPos(u8, out, bs, '"').?;
             if (!boundaries.contains(out[bs..be])) {
                 const owned = try gpa.dupe(u8, out[bs..be]);
                 errdefer gpa.free(owned);

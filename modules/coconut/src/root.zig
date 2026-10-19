@@ -147,5 +147,5 @@ test {
 }
 
 test "meta.model_after names Coconut" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Coconut") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Coconut") != null);
 }

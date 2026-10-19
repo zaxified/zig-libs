@@ -278,7 +278,7 @@ const mime_table = std.StaticStringMap([]const u8).initComptime(.{
 /// dot — or an unknown extension — gets `default`. The extension match is
 /// case-insensitive (`.PNG` → image/png).
 pub fn mimeType(name: []const u8, overrides: []const MimeOverride, default: []const u8) []const u8 {
-    const dot = mem.lastIndexOfScalar(u8, name, '.') orelse return default;
+    const dot = mem.findScalarLast(u8, name, '.') orelse return default;
     const ext = name[dot + 1 ..];
     if (ext.len == 0 or ext.len > 16) return default;
     var buf: [16]u8 = undefined;
@@ -461,7 +461,7 @@ fn openWithinRootAs(root: Dir, io: Io, rel: []const u8, opts: Options, want_dir:
 
     // Walk every parent component as a directory, relative to the previous
     // handle; keep only the deepest (closing the rest). `root` is never closed.
-    const last_slash = mem.lastIndexOfScalar(u8, rel, '/');
+    const last_slash = mem.findScalarLast(u8, rel, '/');
     const dir_part: []const u8 = if (last_slash) |s| rel[0..s] else "";
     const leaf: []const u8 = if (last_slash) |s| rel[s + 1 ..] else rel;
 
@@ -817,7 +817,7 @@ pub const Handler = struct {
         const leaf: []const u8 = if (via_directory) opened.mimeName() else "";
         var avail = [codings.len]bool{ pc.br, pc.zstd, pc.gzip };
         while (pickCoding(ae, avail)) |c| {
-            const path = std.fmt.bufPrint(&path_buf, "{s}{s}{s}{s}", .{ rel, sep, leaf, codings[c].suffix }) catch return null;
+            const path = std.mem.print(&path_buf, "{s}{s}{s}{s}", .{ rel, sep, leaf, codings[c].suffix }) catch return null;
             if (openWithinRoot(h.root, h.io, path, h.options)) |o| {
                 return .{ .opened = o, .coding = c };
             } else |_| avail[c] = false;
@@ -1038,7 +1038,7 @@ pub const Handler = struct {
             return openIndexOrListing(h.root, h.root, h.io, h.options, false);
         }
 
-        const last_slash = mem.lastIndexOfScalar(u8, rel, '/');
+        const last_slash = mem.findScalarLast(u8, rel, '/');
         const dir_part: []const u8 = if (last_slash) |s| rel[0..s] else "";
         const leaf: []const u8 = if (last_slash) |s| rel[s + 1 ..] else rel;
 
@@ -1168,9 +1168,9 @@ const etag_max = 2 + 2 + 1 + 2 * 16;
 fn buildETag(buf: *[etag_max]u8, size: u64, mtime_s: i64, weak: bool) []const u8 {
     const m: u64 = if (mtime_s < 0) 0 else @intCast(mtime_s);
     return if (weak)
-        std.fmt.bufPrint(buf, "W/\"{x}-{x}\"", .{ size, m }) catch unreachable
+        std.mem.print(buf, "W/\"{x}-{x}\"", .{ size, m }) catch unreachable
     else
-        std.fmt.bufPrint(buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
+        std.mem.print(buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
 }
 
 /// Content-Length is both consumed immediately by `setHeader` (parsed into an
@@ -1180,7 +1180,7 @@ fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
     // 20 digits is the widest decimal u64; same reasoning as `etag_max`, same
     // `catch unreachable` consequence for getting it wrong.
     var clen_buf: [20]u8 = undefined;
-    const s = std.fmt.bufPrint(&clen_buf, "{d}", .{n}) catch unreachable;
+    const s = std.mem.print(&clen_buf, "{d}", .{n}) catch unreachable;
     // `setHeader` intercepts `Content-Length` by name, parses it into
     // `declared_len` and returns before it ever reaches the copy store
     // (`http/src/Server.zig:1703-1711`), so `HeaderBytesExhausted` and
@@ -1216,9 +1216,9 @@ fn sendStatus(rw: *http.Server.ResponseWriter, status: u16) Writer.Error!void {
 fn redirectTrailingSlash(req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
     var buf: [max_path_bytes + 1 + max_path_bytes]u8 = undefined;
     const location = (if (req.query.len != 0)
-        std.fmt.bufPrint(&buf, "{s}/?{s}", .{ req.path, req.query })
+        std.mem.print(&buf, "{s}/?{s}", .{ req.path, req.query })
     else
-        std.fmt.bufPrint(&buf, "{s}/", .{req.path})) catch return failUnsafeResponse(rw);
+        std.mem.print(&buf, "{s}/", .{req.path})) catch return failUnsafeResponse(rw);
     rw.setStatus(301);
     rw.setHeader("Location", location) catch return failUnsafeResponse(rw);
     setContentLength(rw, 0);
@@ -1296,9 +1296,9 @@ fn pickCoding(ae: []const u8, avail: [codings.len]bool) ?usize {
 fn buildVariantETag(buf: *[etag_max + 5]u8, size: u64, mtime_s: i64, weak: bool, token: []const u8) []const u8 {
     const m: u64 = if (mtime_s < 0) 0 else @intCast(mtime_s);
     return (if (weak)
-        std.fmt.bufPrint(buf, "W/\"{x}-{x}-{s}\"", .{ size, m, token })
+        std.mem.print(buf, "W/\"{x}-{x}-{s}\"", .{ size, m, token })
     else
-        std.fmt.bufPrint(buf, "\"{x}-{x}-{s}\"", .{ size, m, token })) catch unreachable;
+        std.mem.print(buf, "\"{x}-{x}-{s}\"", .{ size, m, token })) catch unreachable;
 }
 
 /// Is `req` one the SPA fallback answers (`Options.fallback`)? Its last path
@@ -1308,8 +1308,8 @@ fn buildVariantETag(buf: *[etag_max + 5]u8, size: u64, mtime_s: i64, weak: bool,
 fn wantsFallback(req: *const http.Server.Request, allow_dotfiles: bool) bool {
     var buf: [max_path_bytes]u8 = undefined;
     const rel = sanitizePath(req.path, &buf, .{ .allow_dotfiles = allow_dotfiles }) catch return false;
-    const leaf = rel[(mem.lastIndexOfScalar(u8, rel, '/') orelse 0)..];
-    if (mem.indexOfScalar(u8, leaf, '.') != null) return false;
+    const leaf = rel[(mem.findScalarLast(u8, rel, '/') orelse 0)..];
+    if (mem.findScalar(u8, leaf, '.') != null) return false;
     const accept = req.header("accept") orelse return false;
     return std.ascii.findIgnoreCase(accept, "text/html") != null;
 }
@@ -1583,7 +1583,7 @@ pub const Snapshot = struct {
         }
         const digest = h.finalResult();
         out[0] = '"';
-        _ = std.fmt.bufPrint(out[1 .. tag_len - 1], "{x}", .{digest[0..16]}) catch unreachable;
+        _ = std.mem.print(out[1 .. tag_len - 1], "{x}", .{digest[0..16]}) catch unreachable;
         out[tag_len - 1] = '"';
     }
 
@@ -2193,7 +2193,7 @@ fn runRequest(handler: *Handler, wire: []const u8, out_buf: []u8) []const u8 {
 
 fn get(handler: *Handler, path: []const u8, out_buf: []u8) []const u8 {
     var wire_buf: [512]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
     return runRequest(handler, wire, out_buf);
 }
 
@@ -2233,7 +2233,7 @@ fn budgetEatingHandler(req: *http.Server.Request, rw: *http.Server.ResponseWrite
 
 fn getUnderBudgetPressure(handler: *Handler, path: []const u8, out_buf: []u8) []const u8 {
     var wire_buf: [512]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [4096]u8 = undefined;
@@ -2281,7 +2281,7 @@ fn tablePressureHandler(req: *http.Server.Request, rw: *http.Server.ResponseWrit
         // byte, so the copy store stays nearly untouched: what runs out here
         // is slots, not bytes.
         for (0..64) |i| {
-            const n = std.fmt.bufPrint(&name_buf, "X-Fill{d}", .{i}) catch unreachable;
+            const n = std.mem.print(&name_buf, "X-Fill{d}", .{i}) catch unreachable;
             rw.setHeader(n, "1") catch |e| {
                 test_fill_error = e;
                 break;
@@ -2325,8 +2325,8 @@ test "serve: a 304 whose ETag cannot be written is not sent as a 304" {
     var out: [8192]u8 = undefined;
     const ok = runVia(tablePressureHandler, &h, wire, &out);
     try testing.expectEqual(@as(u16, 304), statusOf(ok));
-    try testing.expect(mem.indexOf(u8, ok, "ETag: W/\"") != null); // weak by default, A1 F5
-    try testing.expect(mem.indexOf(u8, ok, "hello world") == null);
+    try testing.expect(mem.find(u8, ok, "ETag: W/\"") != null); // weak by default, A1 F5
+    try testing.expect(mem.find(u8, ok, "hello world") == null);
 
     // Now with the header table spent and `Content-Type` already in it, so
     // that the `Content-Type` escalation cannot stand in for this one.
@@ -2348,15 +2348,15 @@ test "serve: a 304 whose ETag cannot be written is not sent as a 304" {
     // The defect this pins: `conditional.apply` stages 304 before it writes
     // the `ETag`, so swallowing its error used to put a `304 Not Modified`
     // on the wire with `Content-Length: 11` and no validator at all.
-    try testing.expect(mem.indexOf(u8, resp, "ETag:") == null);
+    try testing.expect(mem.find(u8, resp, "ETag:") == null);
     if (statusOf(resp) == 304) return error.IncompleteNotModifiedWasSent;
 
     // What goes out instead: the full representation, which RFC 9110 §15.4.5
     // always permits in place of a 304 — self-consistent framing, a body the
     // client can use, and `Content-Type` still on it.
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
-    try testing.expect(mem.indexOf(u8, resp, "Content-Length: 11\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Length: 11\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
@@ -2370,7 +2370,7 @@ test "serve: a Content-Type that cannot be set answers 500, never a sniffable bo
     // pressure — 200 with the label on it.
     const ok = get(&h, "/hello.txt", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(ok));
-    try testing.expect(mem.indexOf(u8, ok, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+    try testing.expect(mem.find(u8, ok, "Content-Type: text/plain; charset=utf-8\r\n") != null);
 
     // Now with the copy store spent. `Content-Type` cannot be written, so the
     // body must NOT go out: an unlabelled `text/plain` file is MIME-sniffed
@@ -2381,16 +2381,16 @@ test "serve: a Content-Type that cannot be set answers 500, never a sniffable bo
     const resp = getUnderBudgetPressure(&h, "/hello.txt", &out2);
     try testing.expectEqual(@as(u16, 500), statusOf(resp));
     // The whole half-composed representation is discarded, not just relabelled.
-    try testing.expect(mem.indexOf(u8, resp, "Content-Type:") == null);
+    try testing.expect(mem.find(u8, resp, "Content-Type:") == null);
     // `X-Pad:` with the colon, as it goes on the wire. This is the ONLY
     // assertion here that distinguishes `failUnsafeResponse` from a bare
     // `sendStatus(rw, 500)`: everything else above is equally true of a 500
     // composed on top of the upstream middleware's headers. Until 2026-08-13
     // the needle was `X-Pad-`, which the writer can never emit, so dropping
     // the `rw.reset()` left this test green.
-    try testing.expect(mem.indexOf(u8, resp, "X-Pad:") == null);
+    try testing.expect(mem.find(u8, resp, "X-Pad:") == null);
     // And above all: not one byte of the file.
-    try testing.expect(mem.indexOf(u8, resp, "hello world") == null);
+    try testing.expect(mem.find(u8, resp, "hello world") == null);
 }
 
 test "serve: a configured Cache-Control that cannot be set answers 500, not a quietly cacheable 200" {
@@ -2420,14 +2420,14 @@ test "serve: a configured Cache-Control that cannot be set answers 500, not a qu
     // Escalated: an operator asked for a specific storage policy and it could
     // not be applied, so the file is not served under the wrong one.
     try testing.expectEqual(@as(u16, 500), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "hello world") == null);
+    try testing.expect(mem.find(u8, resp, "hello world") == null);
     // The discriminating assertion: Content-Type had room. Without the
     // escalation this response is a 200 carrying the body and the right
     // Content-Type, silently missing only its Cache-Control.
-    try testing.expect(mem.indexOf(u8, resp, cc) == null);
+    try testing.expect(mem.find(u8, resp, cc) == null);
     // Same `reset()` pin as the Content-Type test, on the second escalation
     // site: the half-composed representation goes, upstream padding included.
-    try testing.expect(mem.indexOf(u8, resp, "X-Pad:") == null);
+    try testing.expect(mem.find(u8, resp, "X-Pad:") == null);
 }
 
 test "serveDirectory: a listing that cannot be labelled text/html answers 500, never a sniffable index" {
@@ -2443,8 +2443,8 @@ test "serveDirectory: a listing that cannot be labelled text/html answers 500, n
     var out: [8192]u8 = undefined;
     const ok = runVia(tablePressureHandler, &h, wire, &out);
     try testing.expectEqual(@as(u16, 200), statusOf(ok));
-    try testing.expect(mem.indexOf(u8, ok, "Content-Type: text/html; charset=utf-8\r\n") != null);
-    try testing.expect(mem.indexOf(u8, ok, "<li>dir/</li>") != null);
+    try testing.expect(mem.find(u8, ok, "Content-Type: text/html; charset=utf-8\r\n") != null);
+    try testing.expect(mem.find(u8, ok, "<li>dir/</li>") != null);
 
     // With the header table spent — and, unlike the 304 test above, WITHOUT
     // an upstream `Content-Type`, so this handler's own call needs a slot and
@@ -2462,11 +2462,11 @@ test "serveDirectory: a listing that cannot be labelled text/html answers 500, n
     // suppresses is HTML built out of attacker-influenced file names: served
     // unlabelled, a browser sniffs it and the listing becomes stored XSS.
     try testing.expectEqual(@as(u16, 500), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "<!DOCTYPE html>") == null);
-    try testing.expect(mem.indexOf(u8, resp, "<li>") == null);
+    try testing.expect(mem.find(u8, resp, "<!DOCTYPE html>") == null);
+    try testing.expect(mem.find(u8, resp, "<li>") == null);
     // `reset()` again: the fill headers are gone, so this is a discarded
     // response and not a 500 stapled onto a half-composed one.
-    try testing.expect(mem.indexOf(u8, resp, "X-Fill0:") == null);
+    try testing.expect(mem.find(u8, resp, "X-Fill0:") == null);
 }
 
 test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
@@ -2476,15 +2476,15 @@ test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
     var out: [4096]u8 = undefined;
     const resp = get(&h, "/hello.txt", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
     // Weak by default since A1 F5 (round-2 Q8) — see the dedicated F5 tests
     // for why; this test is just checking an ETag is present at all.
-    try testing.expect(mem.indexOf(u8, resp, "ETag: W/\"") != null);
-    try testing.expect(mem.indexOf(u8, resp, "Last-Modified: ") != null);
-    try testing.expect(mem.indexOf(u8, resp, "Accept-Ranges: bytes\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "ETag: W/\"") != null);
+    try testing.expect(mem.find(u8, resp, "Last-Modified: ") != null);
+    try testing.expect(mem.find(u8, resp, "Accept-Ranges: bytes\r\n") != null);
     // A1 F18: nosniff alongside the correct Content-Type — defense in
     // depth, not a substitute for it.
-    try testing.expect(mem.indexOf(u8, resp, "X-Content-Type-Options: nosniff\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "X-Content-Type-Options: nosniff\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
@@ -2571,7 +2571,7 @@ test "serve: directory request serves index.html" {
 
     const bare = get(&h, "/sub", &out);
     try testing.expectEqual(@as(u16, 301), statusOf(bare));
-    try testing.expect(mem.indexOf(u8, bare, "Location: /sub/\r\n") != null);
+    try testing.expect(mem.find(u8, bare, "Location: /sub/\r\n") != null);
 }
 
 test "serve: a directory URL missing its trailing slash redirects to the canonical one (A1 F17)" {
@@ -2585,13 +2585,13 @@ test "serve: a directory URL missing its trailing slash redirects to the canonic
     var h = Handler.init(testing.io, fx.root, .{});
     const bare = get(&h, "/sub/dir", &out);
     try testing.expectEqual(@as(u16, 301), statusOf(bare));
-    try testing.expect(mem.indexOf(u8, bare, "Location: /sub/dir/\r\n") != null);
-    try testing.expect(mem.indexOf(u8, bare, "nested") == null); // no body served yet
+    try testing.expect(mem.find(u8, bare, "Location: /sub/dir/\r\n") != null);
+    try testing.expect(mem.find(u8, bare, "nested") == null); // no body served yet
 
     // Query string survives the redirect.
     const with_query = get(&h, "/sub/dir?x=1", &out);
     try testing.expectEqual(@as(u16, 301), statusOf(with_query));
-    try testing.expect(mem.indexOf(u8, with_query, "Location: /sub/dir/?x=1\r\n") != null);
+    try testing.expect(mem.find(u8, with_query, "Location: /sub/dir/?x=1\r\n") != null);
 
     // The canonical form reaches the SAME outcome the bare form would have
     // reached anyway (403: no index, listing off) — this is a redirect to
@@ -2608,7 +2608,7 @@ test "serve: a directory URL missing its trailing slash redirects to the canonic
     var out_off: [4096]u8 = undefined;
     const bare_off = get(&h_off, "/sub/dir", &out_off);
     try testing.expectEqual(@as(u16, 403), statusOf(bare_off));
-    try testing.expect(mem.indexOf(u8, bare_off, "Location:") == null);
+    try testing.expect(mem.find(u8, bare_off, "Location:") == null);
     try testing.expectEqualStrings(slash, bare_off); // same content, no redirect either way
 
     // A plain FILE (never a directory route) is never redirected, whatever
@@ -2634,7 +2634,7 @@ test "serve: HEAD returns headers, no body" {
     var out: [4096]u8 = undefined;
     const resp = runRequest(&h, "HEAD /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Length: 11\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Length: 11\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "\r\n\r\n")); // no body after headers
 }
 
@@ -2646,7 +2646,7 @@ test "serve: 404 on a missing file, 405 on POST" {
     try testing.expectEqual(@as(u16, 404), statusOf(get(&h, "/nope.txt", &out)));
     const resp = runRequest(&h, "POST /hello.txt HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 405), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Allow: GET, HEAD\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Allow: GET, HEAD\r\n") != null);
 }
 
 test "serve: dotfile refused by default, served when opted in" {
@@ -2738,7 +2738,7 @@ test "serve: a directory-listing request opens its target directory once, not tw
     // not F17's redirect — a bare "/sub/dir" would redirect first.
     const resp = get(&h, "/sub/dir/", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "<li>file.txt</li>") != null);
+    try testing.expect(mem.find(u8, resp, "<li>file.txt</li>") != null);
     try testing.expectEqual(@as(usize, 1), test_f11_leaf_dir_opens);
 }
 
@@ -2764,7 +2764,7 @@ test "serve: TRAVERSAL TEETH — every vector refused, secret never read" {
         const resp = get(&h, a, &out);
         const st = statusOf(resp);
         try testing.expect(st >= 400 and st < 500); // refused
-        try testing.expect(mem.indexOf(u8, resp, "TOP SECRET") == null); // never leaked
+        try testing.expect(mem.find(u8, resp, "TOP SECRET") == null); // never leaked
     }
     // Positive control alongside the attacks: a legit file still serves.
     try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out)));
@@ -2787,7 +2787,7 @@ test "serve: symlink escaping root refused (no-follow), the target is real" {
     var out: [4096]u8 = undefined;
     const resp = get(&h, "/escape", &out);
     try testing.expect(statusOf(resp) >= 400);
-    try testing.expect(mem.indexOf(u8, resp, "TOP SECRET") == null);
+    try testing.expect(mem.find(u8, resp, "TOP SECRET") == null);
 }
 
 test "serve: follow_symlinks=true serves an in-root symlink but still refuses an escaping one" {
@@ -2805,7 +2805,7 @@ test "serve: follow_symlinks=true serves an in-root symlink but still refuses an
     // though symlinks are now followed.
     const escaped = get(&h, "/escape", &out);
     try testing.expect(statusOf(escaped) >= 400);
-    try testing.expect(mem.indexOf(u8, escaped, "TOP SECRET") == null);
+    try testing.expect(mem.find(u8, escaped, "TOP SECRET") == null);
 }
 
 test "serve: follow_symlinks containment reaches directory & index routes, not just leaf files (A1 F1, F4)" {
@@ -2826,7 +2826,7 @@ test "serve: follow_symlinks containment reaches directory & index routes, not j
             // leaking existence and contradicting the documented policy.
             try testing.expectEqual(@as(u16, 403), statusOf(resp));
             try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
-            try testing.expect(mem.indexOf(u8, resp, "LEAK") == null);
+            try testing.expect(mem.find(u8, resp, "LEAK") == null);
         }
         const r_symidx = get(&h, "/symidx/", &out);
         try testing.expect(statusOf(r_symidx) >= 400 and statusOf(r_symidx) < 500);
@@ -2841,27 +2841,27 @@ test "serve: follow_symlinks containment reaches directory & index routes, not j
         // (1) directory component is a symlink out; target has an index.
         const r1 = get(&h, "/linkdir/", &out);
         try testing.expect(statusOf(r1) >= 400 and statusOf(r1) < 500);
-        try testing.expect(mem.indexOf(u8, r1, "OUTSIDE-INDEX-LEAK") == null);
+        try testing.expect(mem.find(u8, r1, "OUTSIDE-INDEX-LEAK") == null);
 
         // (2) same directory, requesting the leaf directly — this path was
         // already safe before the fix (the leaf-file check always ran); kept
         // here as a positive-safety control alongside (1).
         const r2 = get(&h, "/linkdir/loot.txt", &out);
         try testing.expect(statusOf(r2) >= 400 and statusOf(r2) < 500);
-        try testing.expect(mem.indexOf(u8, r2, "LOOT-LEAK") == null);
+        try testing.expect(mem.find(u8, r2, "LOOT-LEAK") == null);
 
         // (3) directory component is a symlink out; target has NO index —
         // the directory-LISTING route.
         const r3 = get(&h, "/linklist/", &out);
         try testing.expect(statusOf(r3) >= 400 and statusOf(r3) < 500);
-        try testing.expect(mem.indexOf(u8, r3, "LISTING-LEAK") == null);
-        try testing.expect(mem.indexOf(u8, r3, "marker.txt") == null);
+        try testing.expect(mem.find(u8, r3, "LISTING-LEAK") == null);
+        try testing.expect(mem.find(u8, r3, "marker.txt") == null);
 
         // (4) the directory is genuinely inside root, but ITS index is a
         // symlink pointing out.
         const r4 = get(&h, "/symidx/", &out);
         try testing.expect(statusOf(r4) >= 400 and statusOf(r4) < 500);
-        try testing.expect(mem.indexOf(u8, r4, "TOP SECRET") == null);
+        try testing.expect(mem.find(u8, r4, "TOP SECRET") == null);
 
         // Positive control: a legitimate in-root symlink still serves.
         const ok = get(&h, "/inside_link", &out);
@@ -2889,7 +2889,7 @@ test "serve: root's own index behind a symlink is still verified for containment
     var h_follow = Handler.init(io, root, .{ .follow_symlinks = true });
     const r_follow = get(&h_follow, "/", &out);
     try testing.expect(statusOf(r_follow) >= 400 and statusOf(r_follow) < 500);
-    try testing.expect(mem.indexOf(u8, r_follow, "ROOT-INDEX-LEAK") == null);
+    try testing.expect(mem.find(u8, r_follow, "ROOT-INDEX-LEAK") == null);
 }
 
 test "serve: verifyContained rejects a sibling whose name is a string-prefix of root (A1 F7, sibling guard)" {
@@ -2909,7 +2909,7 @@ test "serve: verifyContained rejects a sibling whose name is a string-prefix of 
     var h = Handler.init(io, root, .{ .follow_symlinks = true });
     const resp = get(&h, "/escape2", &out);
     try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
-    try testing.expect(mem.indexOf(u8, resp, "SIBLING-LEAK") == null);
+    try testing.expect(mem.find(u8, resp, "SIBLING-LEAK") == null);
 }
 
 test "serve: verifyContained's prefix check covers the FULL root path, not just its first byte (A1 F7, prefix strength)" {
@@ -2930,7 +2930,7 @@ test "serve: verifyContained's prefix check covers the FULL root path, not just 
     var h = Handler.init(io, root, .{ .follow_symlinks = true });
     const resp = get(&h, "/escape3", &out);
     try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
-    try testing.expect(mem.indexOf(u8, resp, "DECOY-LEAK") == null);
+    try testing.expect(mem.find(u8, resp, "DECOY-LEAK") == null);
 }
 
 test "serve: 304 on matching If-None-Match / If-Modified-Since" {
@@ -2946,12 +2946,12 @@ test "serve: 304 on matching If-None-Match / If-Modified-Since" {
 
     var wire: [512]u8 = undefined;
     var out2: [4096]u8 = undefined;
-    const inm = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: {s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
+    const inm = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-None-Match: {s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
     const r_inm = runRequest(&h, inm, &out2);
     try testing.expectEqual(@as(u16, 304), statusOf(r_inm));
-    try testing.expect(mem.indexOf(u8, r_inm, "TOP SECRET") == null);
+    try testing.expect(mem.find(u8, r_inm, "TOP SECRET") == null);
 
-    const ims = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-Modified-Since: {s}\r\nConnection: close\r\n\r\n", .{lm}) catch unreachable;
+    const ims = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nIf-Modified-Since: {s}\r\nConnection: close\r\n\r\n", .{lm}) catch unreachable;
     try testing.expectEqual(@as(u16, 304), statusOf(runRequest(&h, ims, &out2)));
 }
 
@@ -2966,7 +2966,7 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     var h = Handler.init(testing.io, fx.root, .{});
     var wire_buf: [1024]u8 = undefined;
     const too_long_name = strRepeat("A", 300); // NAME_MAX is 255 on Linux
-    const wire = std.fmt.bufPrint(&wire_buf, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
     var out: [1024]u8 = undefined;
     const resp = runRequest(&h, wire, &out);
     try testing.expectEqual(@as(u16, 404), statusOf(resp));
@@ -2976,7 +2976,7 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     // a special case for "too long" alone.
     var wire_buf2: [1024]u8 = undefined;
     const ok_len_name = strRepeat("B", 254);
-    const wire2 = std.fmt.bufPrint(&wire_buf2, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ok_len_name}) catch unreachable;
+    const wire2 = std.mem.print(&wire_buf2, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ok_len_name}) catch unreachable;
     const resp2 = runRequest(&h, wire2, &out);
     try testing.expectEqual(@as(u16, 404), statusOf(resp2));
 
@@ -2984,7 +2984,7 @@ test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
     // used to go on to a no-follow statFile, which zig 0.16 panics on in
     // Debug for ENAMETOOLONG (Go net/http oracle, 2026-10-05).
     var wire_buf3: [1024]u8 = undefined;
-    const wire3 = std.fmt.bufPrint(&wire_buf3, "GET /sub/{s}/x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
+    const wire3 = std.mem.print(&wire_buf3, "GET /sub/{s}/x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
     try testing.expectEqual(@as(u16, 404), statusOf(runRequest(&h, wire3, &out)));
 }
 
@@ -3020,13 +3020,13 @@ test "serve: 206 + Content-Range on a range, 416 on unsatisfiable" {
     // "hello world" is 11 bytes; bytes 0-4 → "hello".
     const r206 = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(r206));
-    try testing.expect(mem.indexOf(u8, r206, "Content-Range: bytes 0-4/11\r\n") != null);
-    try testing.expect(mem.indexOf(u8, r206, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.find(u8, r206, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.find(u8, r206, "Content-Length: 5\r\n") != null);
     try testing.expect(mem.endsWith(u8, r206, "hello"));
 
     const r416 = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 416), statusOf(r416));
-    try testing.expect(mem.indexOf(u8, r416, "Content-Range: bytes */11\r\n") != null);
+    try testing.expect(mem.find(u8, r416, "Content-Range: bytes */11\r\n") != null);
 }
 
 test "serve: a 206 range response is never gzip-compressed, even with Accept-Encoding (A1 http/staticfiles F6)" {
@@ -3039,9 +3039,9 @@ test "serve: a 206 range response is never gzip-compressed, even with Accept-Enc
     // Before the `http`-side fix, this exact combination answered 206 with
     // `Content-Encoding: gzip` and a `Content-Range` describing offsets
     // into the IDENTITY body while the bytes on the wire were compressed.
-    try testing.expect(mem.indexOf(u8, r206, "Content-Encoding") == null);
-    try testing.expect(mem.indexOf(u8, r206, "Content-Range: bytes 0-4/11\r\n") != null);
-    try testing.expect(mem.indexOf(u8, r206, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.find(u8, r206, "Content-Encoding") == null);
+    try testing.expect(mem.find(u8, r206, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.find(u8, r206, "Content-Length: 5\r\n") != null);
     try testing.expect(mem.endsWith(u8, r206, "hello"));
 
     // Positive control: the SAME file, same negotiation, no Range -> 200
@@ -3049,7 +3049,7 @@ test "serve: a 206 range response is never gzip-compressed, even with Accept-Enc
     // `hello.txt` somehow being ineligible).
     const identity_ok = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(identity_ok));
-    try testing.expect(mem.indexOf(u8, identity_ok, "Content-Encoding: gzip\r\n") != null);
+    try testing.expect(mem.find(u8, identity_ok, "Content-Encoding: gzip\r\n") != null);
 }
 
 test "serve: ETag reaches the wire weak when the response is actually gzip-compressed (A1 http/staticfiles F6)" {
@@ -3064,9 +3064,9 @@ test "serve: ETag reaches the wire weak when the response is actually gzip-compr
 
     const plain = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(plain));
-    try testing.expect(mem.indexOf(u8, plain, "Content-Encoding") == null);
+    try testing.expect(mem.find(u8, plain, "Content-Encoding") == null);
     const strong_needle = "ETag: \"";
-    const strong_at = mem.indexOf(u8, plain, strong_needle).?;
+    const strong_at = mem.find(u8, plain, strong_needle).?;
     // Every strong ETag `buildETag` emits starts right after `ETag: `, with
     // no `W/` — confirms the baseline before comparing the gzipped case.
     try testing.expectEqualStrings("ETag: \"", plain[strong_at .. strong_at + strong_needle.len]);
@@ -3074,13 +3074,13 @@ test "serve: ETag reaches the wire weak when the response is actually gzip-compr
     var out2: [4096]u8 = undefined;
     const gzipped = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out2);
     try testing.expectEqual(@as(u16, 200), statusOf(gzipped));
-    try testing.expect(mem.indexOf(u8, gzipped, "Content-Encoding: gzip\r\n") != null);
-    try testing.expect(mem.indexOf(u8, gzipped, "ETag: W/\"") != null);
+    try testing.expect(mem.find(u8, gzipped, "Content-Encoding: gzip\r\n") != null);
+    try testing.expect(mem.find(u8, gzipped, "ETag: W/\"") != null);
     // Same underlying tag value on both, only the wire strength differs.
-    const plain_tag_end = mem.indexOf(u8, plain[strong_at..], "\r\n").? + strong_at;
+    const plain_tag_end = mem.find(u8, plain[strong_at..], "\r\n").? + strong_at;
     const plain_tag = plain[strong_at + "ETag: ".len .. plain_tag_end];
-    const gzip_tag_at = mem.indexOf(u8, gzipped, "ETag: W/").? + "ETag: W/".len;
-    const gzip_tag_end = mem.indexOf(u8, gzipped[gzip_tag_at..], "\r\n").? + gzip_tag_at;
+    const gzip_tag_at = mem.find(u8, gzipped, "ETag: W/").? + "ETag: W/".len;
+    const gzip_tag_end = mem.find(u8, gzipped[gzip_tag_at..], "\r\n").? + gzip_tag_at;
     try testing.expectEqualStrings(plain_tag, gzipped[gzip_tag_at..gzip_tag_end]);
 }
 
@@ -3092,7 +3092,7 @@ test "serve: multi-range request falls back to a full 200, not a 206/416" {
     // Two disjoint ranges — RFC 7233 permits ignoring Range entirely here.
     const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-2,4-6\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Range:") == null);
+    try testing.expect(mem.find(u8, resp, "Content-Range:") == null);
     try testing.expect(mem.endsWith(u8, resp, "hello world")); // full body, not a slice
 }
 
@@ -3113,19 +3113,19 @@ test "serve: directory listing (opt-in) escapes names, off = 403" {
     const resp = get(&h_on, "/list/", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
     // The raw "<b>" must not appear; the escaped form must.
-    try testing.expect(mem.indexOf(u8, resp, "a<b>.txt") == null);
-    try testing.expect(mem.indexOf(u8, resp, "a&lt;b&gt;.txt") != null);
+    try testing.expect(mem.find(u8, resp, "a<b>.txt") == null);
+    try testing.expect(mem.find(u8, resp, "a&lt;b&gt;.txt") != null);
     // A1 F12: dotfiles must not appear in the listing by default — the
     // listing route has its own dotfile-skip (root.zig, `serveDirectory`),
     // separate from `sanitizePath`'s, and nothing exercised it.
-    try testing.expect(mem.indexOf(u8, resp, ".env") == null);
+    try testing.expect(mem.find(u8, resp, ".env") == null);
 
     // Opting into `serve_dotfiles` must show it — the skip is a policy
     // default, not a hardcoded omission.
     var h_dot = Handler.init(io, fx.root, .{ .directory_listing = true, .serve_dotfiles = true });
     const resp_dot = get(&h_dot, "/list/", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp_dot));
-    try testing.expect(mem.indexOf(u8, resp_dot, ".env") != null);
+    try testing.expect(mem.find(u8, resp_dot, ".env") != null);
 }
 
 test "resolveFile standalone: opens within root, refuses escape" {
@@ -3175,9 +3175,9 @@ test "Opened.mimeName is backed by Opened's own storage, not a caller's scratch 
 /// Pull a header value (up to CRLF) out of a raw response, for the conditional
 /// tests. `prefix` includes the "Name: " part.
 fn extractHeader(resp: []const u8, prefix: []const u8) ?[]const u8 {
-    const i = mem.indexOf(u8, resp, prefix) orelse return null;
+    const i = mem.find(u8, resp, prefix) orelse return null;
     const start = i + prefix.len;
-    const end = mem.indexOfScalarPos(u8, resp, start, '\r') orelse return null;
+    const end = mem.findScalarPos(u8, resp, start, '\r') orelse return null;
     return resp[start..end];
 }
 
@@ -3297,29 +3297,29 @@ test "interop (starlette oracle): single/open-ended/suffix ranges agree on Conte
     // 206, Content-Range: bytes 0-4/11, Content-Length: 5, body "hello".
     const single = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(single));
-    try testing.expect(mem.indexOf(u8, single, "Content-Range: bytes 0-4/11\r\n") != null);
-    try testing.expect(mem.indexOf(u8, single, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.find(u8, single, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.find(u8, single, "Content-Length: 5\r\n") != null);
     try testing.expect(mem.endsWith(u8, single, "hello"));
 
     // Captured "4": Range: bytes=6- (open-ended) → 206, Content-Range:
     // bytes 6-10/11, body "world".
     const open = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=6-\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(open));
-    try testing.expect(mem.indexOf(u8, open, "Content-Range: bytes 6-10/11\r\n") != null);
+    try testing.expect(mem.find(u8, open, "Content-Range: bytes 6-10/11\r\n") != null);
     try testing.expect(mem.endsWith(u8, open, "world"));
 
     // Captured "5": Range: bytes=-5 (last 5 bytes) → identical result to
     // "6-" on an 11-byte file (both resolve to bytes 6-10).
     const suffix = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=-5\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(suffix));
-    try testing.expect(mem.indexOf(u8, suffix, "Content-Range: bytes 6-10/11\r\n") != null);
+    try testing.expect(mem.find(u8, suffix, "Content-Range: bytes 6-10/11\r\n") != null);
     try testing.expect(mem.endsWith(u8, suffix, "world"));
 
     // Captured "7": Range: bytes=0-100 (end past EOF) → clamps to the
     // actual length, 206, Content-Range: bytes 0-10/11, full body.
     const clamped = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-100\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(clamped));
-    try testing.expect(mem.indexOf(u8, clamped, "Content-Range: bytes 0-10/11\r\n") != null);
+    try testing.expect(mem.find(u8, clamped, "Content-Range: bytes 0-10/11\r\n") != null);
     try testing.expect(mem.endsWith(u8, clamped, "hello world"));
 }
 
@@ -3334,8 +3334,8 @@ test "interop (starlette oracle): HEAD + Range still answers 206 with the range'
     var out: [4096]u8 = undefined;
     const resp = runRequest(&h, "HEAD /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 206), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Range: bytes 0-4/11\r\n") != null);
-    try testing.expect(mem.indexOf(u8, resp, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.find(u8, resp, "Content-Length: 5\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "\r\n\r\n")); // no body after headers
 }
 
@@ -3354,7 +3354,7 @@ test "interop (starlette oracle) DIVERGES: If-None-Match: * gets 304 from us (RF
     // Captured: starlette's StaticFiles answered 200 here (a real
     // conformance gap in starlette, not adopted).
     try testing.expectEqual(@as(u16, 304), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "TOP SECRET") == null);
+    try testing.expect(mem.find(u8, resp, "TOP SECRET") == null);
 }
 
 test "interop (starlette oracle) DIVERGES: a Range with an unrecognized unit is ignored (RFC 7233 MUST) -> 200, not starlette's 400 (ledger #2)" {
@@ -3369,7 +3369,7 @@ test "interop (starlette oracle) DIVERGES: a Range with an unrecognized unit is 
     // Content-Range.
     const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: lines=0-4\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
-    try testing.expect(mem.indexOf(u8, resp, "Content-Range:") == null);
+    try testing.expect(mem.find(u8, resp, "Content-Range:") == null);
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
@@ -3396,7 +3396,7 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
     const stale = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
         "If-Range: \"not-a-real-etag\"\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(stale));
-    try testing.expect(mem.indexOf(u8, stale, "Content-Range:") == null);
+    try testing.expect(mem.find(u8, stale, "Content-Range:") == null);
     try testing.expect(mem.endsWith(u8, stale, "hello world"));
 
     // The current validators, read off a plain response, must let the range
@@ -3406,7 +3406,7 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
     const lm = extractHeader(first, "Last-Modified: ") orelse return error.NoLastModified;
 
     for ([_][]const u8{ etag, lm }) |validator| {
-        const req = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        const req = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
             "If-Range: {s}\r\nConnection: close\r\n\r\n", .{validator}) catch unreachable;
         var buf: [4096]u8 = undefined;
         const resp = runRequest(&h, req, &buf);
@@ -3416,7 +3416,7 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
 
     // A weak entity-tag is not a strong validator: §13.1.5 says ignore the
     // Range even though the tag's value is the current one.
-    const weak = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+    const weak = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
         "If-Range: W/{s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
     var wbuf: [4096]u8 = undefined;
     const weak_resp = runRequest(&h, weak, &wbuf);
@@ -3447,7 +3447,7 @@ test "serve: with the DEFAULT weak ETag, If-Range never authorizes a range — n
     const etag = extractHeader(first, "ETag: ") orelse return error.NoETag;
     try testing.expect(mem.startsWith(u8, etag, "W/\""));
 
-    const req = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+    const req = std.mem.print(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
         "If-Range: {s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
     var buf: [4096]u8 = undefined;
     const resp = runRequest(&h, req, &buf);
@@ -3474,7 +3474,7 @@ test "buildETag / setContentLength: the widest possible values still fit" {
     try std.testing.expect(widest_weak.len <= etag_max);
 
     var clen_buf: [20]u8 = undefined;
-    const n = try std.fmt.bufPrint(&clen_buf, "{d}", .{@as(u64, std.math.maxInt(u64))});
+    const n = try std.mem.print(&clen_buf, "{d}", .{@as(u64, std.math.maxInt(u64))});
     try std.testing.expectEqualStrings("18446744073709551615", n);
 }
 
@@ -3514,21 +3514,21 @@ fn runSnapshot(ctx: *const SnapshotCtx, wire: []const u8, out_buf: []u8) []const
 
 fn snapGet(ctx: *const SnapshotCtx, path: []const u8, extra: []const u8, out_buf: []u8) []const u8 {
     var wire_buf: [1024]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ path, extra }) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ path, extra }) catch unreachable;
     return runSnapshot(ctx, wire, out_buf);
 }
 
 fn bodyOf(resp: []const u8) []const u8 {
-    const at = mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+    const at = mem.find(u8, resp, "\r\n\r\n") orelse return "";
     return resp[at + 4 ..];
 }
 
 fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
-    const end = mem.indexOf(u8, resp, "\r\n\r\n") orelse return null;
+    const end = mem.find(u8, resp, "\r\n\r\n") orelse return null;
     var lines = mem.splitSequence(u8, resp[0..end], "\r\n");
     _ = lines.next();
     while (lines.next()) |line| {
-        const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return mem.trim(u8, line[colon + 1 ..], " ");
     }
     return null;
@@ -3570,7 +3570,7 @@ test "Snapshot: every path answers as Handler does, except a symlink is absent r
         const a = get(&h, c.path, &a_buf);
         const b = snapGet(&ctx, c.path, "", &b_buf);
         errdefer std.debug.print("{s}: Handler {d}, Snapshot {d}\n", .{ c.path, statusOf(a), statusOf(b) });
-        try testing.expect(mem.indexOf(u8, b, "SECRET") == null and mem.indexOf(u8, b, "LEAK") == null);
+        try testing.expect(mem.find(u8, b, "SECRET") == null and mem.find(u8, b, "LEAK") == null);
         if (c.symlink) {
             try testing.expectEqual(@as(u16, 403), statusOf(a));
             try testing.expectEqual(c.snap, statusOf(b));
@@ -3627,7 +3627,7 @@ test "Snapshot: precompressed siblings -- the client's preference over identity,
     const plain_js = snapGet(&ctx, "/app.js", "", &b0);
     try testing.expect(!mem.eql(u8, headerOf(gz, "etag").?, headerOf(plain_js, "etag").?));
     var inm_buf: [256]u8 = undefined;
-    const inm = try std.fmt.bufPrint(&inm_buf, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
+    const inm = try std.mem.print(&inm_buf, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
     var b2: [4096]u8 = undefined;
     try testing.expectEqual(@as(u16, 304), statusOf(snapGet(&ctx, "/app.js", inm, &b2)));
     var b3: [4096]u8 = undefined;
@@ -3787,7 +3787,7 @@ test "Snapshot fingerprint: a strong content tag -- same bytes, same tag; If-Ran
 
     // A strong tag authorizes If-Range: the range is served, not the whole.
     var extra: [256]u8 = undefined;
-    const hdrs = try std.fmt.bufPrint(&extra, "Range: bytes=0-3\r\nIf-Range: {s}\r\n", .{ta});
+    const hdrs = try std.mem.print(&extra, "Range: bytes=0-3\r\nIf-Range: {s}\r\n", .{ta});
     var br: [4096]u8 = undefined;
     const part = snapGet(&ctx, "/a.txt", hdrs, &br);
     try testing.expectEqual(@as(u16, 206), statusOf(part));
@@ -3806,7 +3806,7 @@ const LiveCtx = struct {
 fn liveGet(live: *Live, path: []const u8, out_buf: []u8) []const u8 {
     var ctx: LiveCtx = .{ .live = live };
     var wire_buf: [512]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [4096]u8 = undefined;
@@ -4240,7 +4240,7 @@ fn runPlain(handler: *Handler, wire: []const u8, out_buf: []u8) []const u8 {
 /// One request with a method and extra header lines (each ending `\r\n`).
 fn sendReq(handler: *Handler, method: []const u8, path: []const u8, extra: []const u8, out_buf: []u8) []const u8 {
     var wire_buf: [1024]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ method, path, extra }) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ method, path, extra }) catch unreachable;
     return runPlain(handler, wire, out_buf);
 }
 
@@ -4297,7 +4297,7 @@ test "fallback: an unknown extension-less path under an HTML Accept serves the f
 
     // Conditional and range rules are the file's own.
     var inm: [128]u8 = undefined;
-    const cond = try std.fmt.bufPrint(&inm, html_accept ++ "If-None-Match: {s}\r\n", .{tag});
+    const cond = try std.mem.print(&inm, html_accept ++ "If-None-Match: {s}\r\n", .{tag});
     var b2: [4096]u8 = undefined;
     try testing.expectEqual(@as(u16, 304), statusOf(sendReq(&h, "GET", "/app/route", cond, &b2)));
     var b3: [4096]u8 = undefined;
@@ -4355,7 +4355,7 @@ test "fallback: never for an extension, another method, another Accept, a refuse
         const r = sendReq(&hb, "GET", "/app/route", html_accept, &bb);
         errdefer std.debug.print("fallback {s}: {s}\n", .{ fb, r });
         try testing.expectEqual(@as(u16, 404), statusOf(r));
-        try testing.expect(mem.indexOf(u8, r, "SECRET") == null and mem.indexOf(u8, r, "TOP") == null);
+        try testing.expect(mem.find(u8, r, "SECRET") == null and mem.find(u8, r, "TOP") == null);
     }
     // The dotfile is served when dotfiles are (the rule, not a blanket refusal).
     var h_dot = Handler.init(testing.io, f.root, .{ .fallback = ".env", .serve_dotfiles = true });
@@ -4468,13 +4468,13 @@ test "Handler precompressed: a validator per encoding, Range over the encoded by
     // Revalidating the variant's tag with that encoding is a 304; the
     // identity tag does not match the variant.
     var inm: [256]u8 = undefined;
-    const ok = try std.fmt.bufPrint(&inm, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
+    const ok = try std.mem.print(&inm, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
     var b3: [4096]u8 = undefined;
     const nm = sendReq(&h, "GET", "/app.js", ok, &b3);
     try testing.expectEqual(@as(u16, 304), statusOf(nm));
     try testing.expectEqualStrings("Accept-Encoding", headerOf(nm, "vary").?);
     var inm2: [256]u8 = undefined;
-    const stale = try std.fmt.bufPrint(&inm2, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(ident, "etag").?});
+    const stale = try std.mem.print(&inm2, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(ident, "etag").?});
     var b4: [4096]u8 = undefined;
     try testing.expectEqual(@as(u16, 200), statusOf(sendReq(&h, "GET", "/app.js", stale, &b4)));
 
@@ -4537,13 +4537,13 @@ test "Handler precompressed: off by default, per-coding switches, and a sibling 
     try testing.expectEqual(@as(u16, 200), statusOf(evil));
     try testing.expectEqualStrings("body{}", bodyOf(evil));
     try testing.expect(headerOf(evil, "content-encoding") == null);
-    try testing.expect(mem.indexOf(u8, evil, "SECRET") == null);
+    try testing.expect(mem.find(u8, evil, "SECRET") == null);
     // Same with symlinks followed: containment refuses it.
     var h_follow = Handler.init(testing.io, root, .{ .precompressed = .{}, .follow_symlinks = true });
     var b4: [4096]u8 = undefined;
     const evil2 = sendReq(&h_follow, "GET", "/evil.css", "Accept-Encoding: br\r\n", &b4);
     try testing.expectEqualStrings("body{}", bodyOf(evil2));
-    try testing.expect(mem.indexOf(u8, evil2, "SECRET") == null);
+    try testing.expect(mem.find(u8, evil2, "SECRET") == null);
 }
 
 test "fallback + precompressed: the fallback's sibling is negotiated, and Vary names both headers" {

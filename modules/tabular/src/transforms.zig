@@ -551,7 +551,7 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         const ck = try keyString(a, r, &.{cki});
         if (!row_keys.contains(rk)) try row_keys.put(a, rk, r[rki]);
         try col_keys.put(a, ck, {});
-        const ckey = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ rk, ck });
+        const ckey = try a.print("{s}\x1f{s}", .{ rk, ck });
         const cop = try cells.getOrPut(a, ckey);
         if (!cop.found_existing) cop.value_ptr.* = .forFunc(spec.agg);
         try cop.value_ptr.observe(a, r[vi], r[vi], 1);
@@ -580,7 +580,7 @@ pub fn pivot(a: std.mem.Allocator, d: Dataset, spec: PivotSpec) Error!Dataset {
         nr[0] = kv.value_ptr.*;
         const rk = kv.key_ptr.*;
         for (col_list, 0..) |ck, ci| {
-            const ckey = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ rk, ck });
+            const ckey = try a.print("{s}\x1f{s}", .{ rk, ck });
             nr[1 + ci] = if (cells.get(ckey)) |acc| acc.result(spec.agg, spec.q) else .null;
         }
         rows[ri] = nr;
@@ -740,9 +740,9 @@ fn bucketLabel(a: std.mem.Allocator, date: ds.Date, freq: Freq) Error![]const u8
     // ('+2024'). Real dates are positive; clamp defensively.
     const y: u32 = if (date.y < 0) 0 else @intCast(date.y);
     return switch (freq) {
-        .day => std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y, date.m, date.d }),
-        .month => std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}", .{ y, date.m }),
-        .year => std.fmt.allocPrint(a, "{d:0>4}", .{y}),
+        .day => a.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y, date.m, date.d }),
+        .month => a.print("{d:0>4}-{d:0>2}", .{ y, date.m }),
+        .year => a.print("{d:0>4}", .{y}),
     };
 }
 
@@ -1019,10 +1019,10 @@ pub const FormatSpec = struct {
 pub fn format(a: std.mem.Allocator, value: f64, spec: FormatSpec) Error![]const u8 {
     const p: usize = spec.decimals; // runtime precision via named "{[n]d:.[p]}"
     return switch (spec.kind) {
-        .num => std.fmt.allocPrint(a, "{[n]d:.[p]}", .{ .n = value, .p = p }),
-        .money => std.fmt.allocPrint(a, "{[s]s}{[n]d:.[p]}", .{ .s = spec.symbol, .n = value, .p = p }),
-        .pct => std.fmt.allocPrint(a, "{[n]d:.[p]}%", .{ .n = value * 100, .p = p }),
-        .signed => std.fmt.allocPrint(a, "{[s]s}{[n]d:.[p]}", .{ .s = if (value >= 0) "+" else "", .n = value, .p = p }),
+        .num => a.print("{[n]d:.[p]}", .{ .n = value, .p = p }),
+        .money => a.print("{[s]s}{[n]d:.[p]}", .{ .s = spec.symbol, .n = value, .p = p }),
+        .pct => a.print("{[n]d:.[p]}%", .{ .n = value * 100, .p = p }),
+        .signed => a.print("{[s]s}{[n]d:.[p]}", .{ .s = if (value >= 0) "+" else "", .n = value, .p = p }),
         .compact => blk: {
             const av = @abs(value);
             const suffix: []const u8, const div: f64 = if (av >= 1e9)
@@ -1033,7 +1033,7 @@ pub fn format(a: std.mem.Allocator, value: f64, spec: FormatSpec) Error![]const 
                 .{ "K", 1e3 }
             else
                 .{ "", 1 };
-            break :blk std.fmt.allocPrint(a, "{[n]d:.[p]}{[s]s}", .{ .n = value / div, .p = p, .s = suffix });
+            break :blk a.print("{[n]d:.[p]}{[s]s}", .{ .n = value / div, .p = p, .s = suffix });
         },
     };
 }

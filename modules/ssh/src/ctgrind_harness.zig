@@ -31,9 +31,9 @@
 //!   ReleaseFast build measured here). Witness: the loaded seed.
 //! * `pemstd` — the POSITIVE CONTROL for `pem`: the same tainted text through
 //!   the decoder `pemDecodeOpensshBlock` used until 2026-10-18
-//!   (`std.mem.indexOfPos` = Boyer-Moore-Horspool for the END line,
+//!   (`std.mem.findPos` = Boyer-Moore-Horspool for the END line,
 //!   `std.base64.standard.Decoder`; its whitespace branch is left out, see
-//!   `pem`). Its row must stay non-zero in std's `mem.zig`/`base64.zig`.
+//!   `pem`). Its row must stay non-zero in the `std.mem` and `std.base64` sources.
 //!
 //! `K` is printed as `ctgrind_result=` (the witness and the output pin). The
 //! one in-file context `dh` keeps is `stripLeadingZeros` on `K`: an SSH mpint
@@ -175,8 +175,8 @@ fn pem(control: bool, t: Taint) !void {
     var hk: root.server.HostKey = undefined;
     try root.server.HostKey.fromOpenSSH(&hk, text, null);
     const public = hk.ed25519.public_key.toBytes();
-    const body_start = (std.mem.indexOf(u8, text, pem_begin) orelse return error.NoPem) + pem_begin.len;
-    const body_end = std.mem.indexOfPos(u8, text, body_start, pem_end) orelse return error.NoPem;
+    const body_start = (std.mem.find(u8, text, pem_begin) orelse return error.NoPem) + pem_begin.len;
+    const body_end = std.mem.findPos(u8, text, body_start, pem_end) orelse return error.NoPem;
     var b64: [4096]u8 = undefined;
     var n: usize = 0;
     for (text[body_start..body_end]) |c| {
@@ -187,7 +187,7 @@ fn pem(control: bool, t: Taint) !void {
     var bin: [3072]u8 = undefined;
     const bin_len = try std.base64.standard.Decoder.calcSizeForSlice(b64[0..n]);
     try std.base64.standard.Decoder.decode(bin[0..bin_len], b64[0..n]);
-    const seed_off = (std.mem.lastIndexOf(u8, bin[0..bin_len], &public) orelse return error.NoSeed) - 32;
+    const seed_off = (std.mem.findLast(u8, bin[0..bin_len], &public) orelse return error.NoSeed) - 32;
 
     // Base64 characters [first, last) carry ONLY the seed's bits. The (at
     // most two) edge characters that share bits with the private string's
@@ -218,7 +218,7 @@ fn pem(control: bool, t: Taint) !void {
     // whitespace is public by the alphabet, and the branch would land in this
     // file, which no pattern may name.
     if (t == .yes) std.valgrind.memcheck.makeMemUndefined(b64[first..last]);
-    const ei = std.mem.indexOfPos(u8, text, body_start, pem_end) orelse return error.NoPem;
+    const ei = std.mem.findPos(u8, text, body_start, pem_end) orelse return error.NoPem;
     if (ei != body_end) return error.NoPem;
     var out2: [3072]u8 = undefined;
     const dec = std.base64.standard.Decoder;

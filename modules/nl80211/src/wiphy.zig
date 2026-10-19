@@ -149,7 +149,7 @@ pub const Wiphy = struct {
     }
 
     pub fn supportsCipher(w: *const Wiphy, suite: u32) bool {
-        return std.mem.indexOfScalar(u32, w.ciphers, suite) != null;
+        return std.mem.findScalar(u32, w.ciphers, suite) != null;
     }
 
     /// Is `cmd` in `NL80211_ATTR_SUPPORTED_COMMANDS`?
@@ -160,7 +160,7 @@ pub const Wiphy = struct {
     /// `TRIGGER_SCAN` (the development machine's does not; `goldens.zig` pins
     /// that). Infer scan capability from `max_num_scan_ssids` instead.
     pub fn supportsCommand(w: *const Wiphy, cmd: u8) bool {
-        return std.mem.indexOfScalar(u32, w.commands, cmd) != null;
+        return std.mem.findScalar(u32, w.commands, cmd) != null;
     }
 
     /// The band whose `index` equals `n`, or null.

@@ -241,7 +241,7 @@ pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
     n_offs += 1;
     for (cands.at[0..cands.len]) |t| {
         const o = offsetAt(zone, t).off;
-        if (std.mem.indexOfScalar(i32, offs[0..n_offs], o) == null) {
+        if (std.mem.findScalar(i32, offs[0..n_offs], o) == null) {
             offs[n_offs] = o;
             n_offs += 1;
         }
@@ -249,7 +249,7 @@ pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
     for (offs[0..n_offs]) |o| {
         const u = local -| @as(i64, o);
         if (offsetAt(zone, u).off != o) continue;
-        if (std.mem.indexOfScalar(i64, found[0..n], u) == null) {
+        if (std.mem.findScalar(i64, found[0..n], u) == null) {
             found[n] = u;
             n += 1;
         }
@@ -465,7 +465,7 @@ const tz_release = "2026a";
 
 test "tz_release matches tz_data.zig's own header" {
     const src = @embedFile("tz_data.zig");
-    try testing.expect(std.mem.indexOf(u8, src, "IANA tzdata " ++ tz_release ++ " ") != null);
+    try testing.expect(std.mem.find(u8, src, "IANA tzdata " ++ tz_release ++ " ") != null);
 }
 
 test "localToUtc: Prague spring gap and autumn fold under every policy" {

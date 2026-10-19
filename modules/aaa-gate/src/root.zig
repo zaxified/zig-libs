@@ -780,7 +780,7 @@ pub const Gate = struct {
     }
 
     fn addBasicUserBody(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
-        std.debug.assert(std.mem.indexOfScalar(u8, user, ':') == null and password.len != 0);
+        std.debug.assert(std.mem.findScalar(u8, user, ':') == null and password.len != 0);
         const fp = basicFingerprint(user, password);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -940,14 +940,14 @@ fn buildChallenge(gpa: Allocator, mode: AuthMode, realm: ?[]const u8) Allocator.
     const basic_realm = realm orelse default_basic_realm;
     return switch (mode) {
         .bearer, .api_key, .either => if (realm) |r|
-            std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\"", .{r})
+            gpa.print("Bearer realm=\"{s}\"", .{r})
         else
             gpa.dupe(u8, "Bearer"),
-        .basic => std.fmt.allocPrint(gpa, "Basic realm=\"{s}\"", .{basic_realm}),
+        .basic => gpa.print("Basic realm=\"{s}\"", .{basic_realm}),
         .any => if (realm) |r|
-            std.fmt.allocPrint(gpa, "Bearer realm=\"{s}\", Basic realm=\"{s}\"", .{ r, r })
+            gpa.print("Bearer realm=\"{s}\", Basic realm=\"{s}\"", .{ r, r })
         else
-            std.fmt.allocPrint(gpa, "Bearer, Basic realm=\"{s}\"", .{basic_realm}),
+            gpa.print("Bearer, Basic realm=\"{s}\"", .{basic_realm}),
     };
 }
 
@@ -1201,7 +1201,7 @@ pub fn basicCredentialsOf(authorization: []const u8, out: []u8) ?BasicCredential
     const enc = std.mem.trim(u8, value[6..], " \t");
     if (enc.len == 0) return null;
     const dec = b64ct.standard.decode(out, enc) catch return null;
-    const colon = std.mem.indexOfScalar(u8, dec, ':') orelse {
+    const colon = std.mem.findScalar(u8, dec, ':') orelse {
         std.crypto.secureZero(u8, dec);
         return null;
     };
@@ -1218,7 +1218,7 @@ pub fn basicCredentialsOf(authorization: []const u8, out: []u8) ?BasicCredential
 pub fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
         if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
     }
     return null;
@@ -1246,7 +1246,7 @@ fn clientKey(req: *const http.Server.Request, buf: *[client_key_len_max]u8) []co
 /// request type; never panics on any byte sequence.
 pub fn clientKeyFrom(last_xff: ?[]const u8, x_real_ip: ?[]const u8, peer: ?std.Io.net.IpAddress, buf: *[client_key_len_max]u8) []const u8 {
     if (last_xff) |v| {
-        const start = if (std.mem.lastIndexOfScalar(u8, v, ',')) |i| i + 1 else 0;
+        const start = if (std.mem.findScalarLast(u8, v, ',')) |i| i + 1 else 0;
         const ip = std.mem.trim(u8, v[start..], " \t");
         if (ip.len != 0) return clampKey(ip, buf);
     }
@@ -1297,7 +1297,7 @@ fn formatPeerIp(peer: std.Io.net.IpAddress, buf: *[client_key_len_max]u8) []cons
 }
 
 fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch unreachable;
+    return std.mem.print(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch unreachable;
 }
 
 // ── the middleware ──────────────────────────────────────────────────────────
@@ -1922,11 +1922,11 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 /// Audit sink recording entries (copies — entry slices are
@@ -2725,7 +2725,7 @@ test "integration: protected route over loopback — 401 / valid Bearer 200 with
     var client = http.Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/secret", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/secret", .{port});
 
     { // no token → 401 with the challenge, handler untouched
         var res = try client.request(.get, url, .{});
@@ -2817,7 +2817,7 @@ fn fuzzRequest(header_block: []const u8, query: []const u8, body: *http.Server.R
 /// The offset of the header-block/query split inside a drawn buffer: the first
 /// US (0x1F), or the whole buffer when there is none.
 fn fuzzSplitAt(bytes: []const u8) usize {
-    return std.mem.indexOfScalar(u8, bytes, 0x1F) orelse bytes.len;
+    return std.mem.findScalar(u8, bytes, 0x1F) orelse bytes.len;
 }
 
 /// `testkit.fuzz.seed`, aliased so the corpora below read as the header blocks
@@ -3685,7 +3685,7 @@ fn fuzzBasicCredentials(comptime S: type, smith: *S, gpa: std.mem.Allocator) any
         return;
     };
     // The user never holds the separator; both halves live inside `out`.
-    try testing.expect(std.mem.indexOfScalar(u8, c.user, ':') == null);
+    try testing.expect(std.mem.findScalar(u8, c.user, ':') == null);
     try testing.expect(@intFromPtr(c.password.ptr) + c.password.len <= @intFromPtr(&out) + out.len);
     // The decision half must also be total on whatever came out.
     var g = try Gate.init(gpa, .{ .auth_mode = .basic, .basic_users = &.{.{ .user = "alice", .password = "s3cret" }} });

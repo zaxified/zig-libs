@@ -306,7 +306,7 @@ pub const HttpReq = struct {
     fn call(p: *HttpReq, action: []const u8, rec: *const Record) !u16 {
         const body = switch (p.options.mode) {
             .default => blk: {
-                const fqdn = try std.fmt.allocPrint(p.gpa, "{s}.", .{zone.trimDot(rec.fqdn)});
+                const fqdn = try p.gpa.print("{s}.", .{zone.trimDot(rec.fqdn)});
                 defer p.gpa.free(fqdn);
                 break :blk try std.json.Stringify.valueAlloc(p.gpa, .{ .fqdn = fqdn, .value = rec.value }, .{});
             },
@@ -334,10 +334,10 @@ pub const HttpReq = struct {
 /// cannot be represented (RFC 7617 §2) and is refused, as are credentials
 /// over 379 bytes.
 fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{InvalidCredentials}![]const u8 {
-    if (std.mem.indexOfScalar(u8, user, ':') != null) return error.InvalidCredentials;
+    if (std.mem.findScalar(u8, user, ':') != null) return error.InvalidCredentials;
     var plain: [380]u8 = undefined;
     defer std.crypto.secureZero(u8, &plain);
-    const joined = std.fmt.bufPrint(&plain, "{s}:{s}", .{ user, password }) catch return error.InvalidCredentials;
+    const joined = std.mem.print(&plain, "{s}:{s}", .{ user, password }) catch return error.InvalidCredentials;
     // b64ct, not std.base64: the password is secret, and std indexes its
     // encode table by each secret sextet (cache side channel).
     const enc = b64ct.standard;
@@ -350,8 +350,8 @@ fn basicAuth(buf: *[512]u8, user: []const u8, password: []const u8) error{Invali
 /// `endpoint` + "/" + `segment`, the segment inserted before any query or
 /// fragment (lego joins with `URL.JoinPath`, which keeps them).
 fn joinPath(gpa: std.mem.Allocator, endpoint: []const u8, segment: []const u8) error{OutOfMemory}![]u8 {
-    const cut = std.mem.indexOfAny(u8, endpoint, "?#") orelse endpoint.len;
-    return std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ std.mem.trimEnd(u8, endpoint[0..cut], "/"), segment, endpoint[cut..] });
+    const cut = std.mem.findAny(u8, endpoint, "?#") orelse endpoint.len;
+    return gpa.print("{s}/{s}{s}", .{ std.mem.trimEnd(u8, endpoint[0..cut], "/"), segment, endpoint[cut..] });
 }
 
 /// POST a JSON body; return the status (the body is drained and dropped).
@@ -438,7 +438,7 @@ pub const Exec = struct {
 
     fn run(p: *Exec, action: []const u8, rec: *const Record) !bool {
         var fqdn_buf: [zone.max_name_len + 1]u8 = undefined;
-        const fqdn = try std.fmt.bufPrint(&fqdn_buf, "{s}.", .{zone.trimDot(rec.fqdn)});
+        const fqdn = try std.mem.print(&fqdn_buf, "{s}.", .{zone.trimDot(rec.fqdn)});
         const default_argv = [_][]const u8{ p.options.program, action, fqdn, rec.value };
         const raw_argv = [_][]const u8{ p.options.program, action, "--", rec.domain, rec.token, rec.key_authorization };
         const argv: []const []const u8 = switch (p.options.mode) {

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `waitpid` status is `i32` (converted with `@bitCast` at the `reapBounded` boundary); enum `field_names`/`field_values` in a test.
 - **2026-10-14** — Replay reads each data file through a 64 KiB window (one `pread` per window instead of three or more per record): `open` of a 100 000-key store 1.78× → 0.27× rosedb. New comparative benchmark `zig build bench-kv` against github.com/rosedblabs/rosedb/v2 v2.4.0 (`tools/bench.zig`, `tools/go_bench`): ref 0.27–1.01×. Scope now parity with Bitcask → **grade 2**. Found in passing: rosedb v2.4.0's `Options.Sync = true` does not fsync a `Put`.
 

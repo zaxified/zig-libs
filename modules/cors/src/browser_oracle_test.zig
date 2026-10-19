@@ -102,14 +102,14 @@ test "browser oracle: the middleware answers what Chrome judged" {
     for (vectors.cases) |c| for (c.exchanges) |e| {
         exchanges += 1;
         const got = serveOne(&routers[c.config], e.request, &buf);
-        const end = std.mem.indexOf(u8, got, "\r\n\r\n") orelse got.len;
+        const end = std.mem.find(u8, got, "\r\n\r\n") orelse got.len;
         var lines = std.mem.splitSequence(u8, got[0..end], "\r\n");
         const status_line = lines.next() orelse "";
         const status = if (status_line.len >= 12) std.fmt.parseInt(u16, status_line[9..12], 10) catch 0 else 0;
         var i: usize = 0;
         var same = status == e.status;
         while (lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             const name = line[0..colon];
             const value = std.mem.trim(u8, line[colon + 1 ..], " ");
             const cors_field = std.ascii.startsWithIgnoreCase(name, "access-control-") or std.ascii.eqlIgnoreCase(name, "vary");

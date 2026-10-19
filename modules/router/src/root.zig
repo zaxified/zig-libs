@@ -926,7 +926,7 @@ pub const Router = struct {
             total_segments += 1;
             var seg = cur;
             var next: ?[]const u8 = null;
-            if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+            if (std.mem.findScalar(u8, cur, '/')) |i| {
                 seg = cur[0..i];
                 next = cur[i + 1 ..];
             }
@@ -1185,14 +1185,14 @@ fn prefixCovers(prefix: []const u8, path: []const u8) ?usize {
     while (pre) |pc| {
         var ps = pc;
         pre = null;
-        if (std.mem.indexOfScalar(u8, pc, '/')) |i| {
+        if (std.mem.findScalar(u8, pc, '/')) |i| {
             ps = pc[0..i];
             pre = pc[i + 1 ..];
         }
         const cur = rest orelse return null;
         var seg = cur;
         rest = null;
-        if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+        if (std.mem.findScalar(u8, cur, '/')) |i| {
             seg = cur[0..i];
             rest = cur[i + 1 ..];
         }
@@ -1393,11 +1393,11 @@ fn normalizeHost(raw: []const u8) []const u8 {
     if (h.len != 0 and h[0] == '[') {
         // `[v6]` or `[v6]:port`; anything else after `]` stays, and matches no
         // mapping (`map` refuses it).
-        const i = std.mem.indexOfScalar(u8, h, ']') orelse return h;
+        const i = std.mem.findScalar(u8, h, ']') orelse return h;
         if (i + 1 == h.len or isPort(h[i + 1 ..])) return h[0 .. i + 1];
         return h;
     }
-    if (std.mem.lastIndexOfScalar(u8, h, ':')) |i| {
+    if (std.mem.findScalarLast(u8, h, ':')) |i| {
         // Only a numeric port is cut; `a.example.com:xyz` stays whole and
         // matches nothing.
         if (!isPort(h[i..])) return h;
@@ -1615,7 +1615,7 @@ fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
                 total_segments += 1;
                 var seg = cur;
                 var next: ?[]const u8 = null;
-                if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+                if (std.mem.findScalar(u8, cur, '/')) |i| {
                     seg = cur[0..i];
                     next = cur[i + 1 ..];
                 }
@@ -1703,7 +1703,7 @@ pub fn validatePattern(pattern: []const u8) AddError!void {
     while (rest) |cur| {
         var seg = cur;
         var next: ?[]const u8 = null;
-        if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+        if (std.mem.findScalar(u8, cur, '/')) |i| {
             seg = cur[0..i];
             next = cur[i + 1 ..];
         }
@@ -1756,7 +1756,7 @@ pub const PatternCaptures = struct {
             const cur = pc.rest orelse return null;
             var seg = cur;
             pc.rest = null;
-            if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+            if (std.mem.findScalar(u8, cur, '/')) |i| {
                 seg = cur[0..i];
                 pc.rest = cur[i + 1 ..];
             }
@@ -1795,8 +1795,8 @@ fn classifySegment(seg: []const u8) AddError!SegKind {
         if (!validCaptureName(name)) return error.InvalidPattern;
         return if (seg[0] == '*') .{ .wildcard = name } else .{ .param = name };
     }
-    if (std.mem.indexOfAny(u8, seg, "{}") == null) {
-        if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
+    if (std.mem.findAny(u8, seg, "{}") == null) {
+        if (std.mem.findAny(u8, seg, ":*") != null) return error.InvalidPattern;
         return .static;
     }
     var i: usize = 0;
@@ -1853,12 +1853,12 @@ fn closeBrace(text: []const u8, open: usize) ?usize {
 
 /// `name` or `name:regexp` (the text between a capture's braces).
 fn splitCapture(inner: []const u8) struct { name: []const u8, constraint: ?[]const u8 } {
-    if (std.mem.indexOfScalar(u8, inner, ':')) |c| return .{ .name = inner[0..c], .constraint = inner[c + 1 ..] };
+    if (std.mem.findScalar(u8, inner, ':')) |c| return .{ .name = inner[0..c], .constraint = inner[c + 1 ..] };
     return .{ .name = inner, .constraint = null };
 }
 
 fn validCaptureName(name: []const u8) bool {
-    return name.len != 0 and std.mem.indexOfAny(u8, name, "/:*{}") == null;
+    return name.len != 0 and std.mem.findAny(u8, name, "/:*{}") == null;
 }
 
 /// The captures of a validated pattern segment, left to right.
@@ -1878,7 +1878,7 @@ const CaptureIter = struct {
 
     fn next(it: *CaptureIter) ?Capture {
         // Literal text holds no braces, so the next `{` opens a capture.
-        const open = std.mem.indexOfScalarPos(u8, it.text, it.i, '{') orelse return null;
+        const open = std.mem.findScalarPos(u8, it.text, it.i, '{') orelse return null;
         const close = closeBrace(it.text, open).?;
         it.i = close + 1;
         const c = splitCapture(it.text[open + 1 .. close]);
@@ -1915,7 +1915,7 @@ fn matchSegPattern(text: []const u8, regexes: []const ?regex.Regex, seg: []const
             // Last capture: the literal is the segment's suffix.
             if (!std.mem.endsWith(u8, seg, lit) or seg.len - lit.len < si) return false;
             break :blk seg.len - lit.len;
-        } else std.mem.indexOfPos(u8, seg, @min(si + 1, seg.len), lit) orelse return false;
+        } else std.mem.findPos(u8, seg, @min(si + 1, seg.len), lit) orelse return false;
         if (value_end <= si) return false; // never empty
         if (regexes[ci]) |*re| if (!constraintHolds(re, seg[si..value_end])) return false;
         params.push(c.name, seg[si..value_end]);
@@ -1968,7 +1968,7 @@ fn patternSlot(comptime E: type, edges: []const E, text: []const u8) usize {
 }
 
 fn patternRank(text: []const u8) [3]usize {
-    const lead = std.mem.indexOfScalar(u8, text, '{') orelse text.len;
+    const lead = std.mem.findScalar(u8, text, '{') orelse text.len;
     var literal: usize = text.len;
     var constrained: usize = 0;
     var it: CaptureIter = .{ .text = text };
@@ -2026,7 +2026,7 @@ fn comptimeConstraints(comptime text: []const u8) []const ?regex.Regex {
 /// rewrite ran. `req.target` is preserved raw by `http.Server` specifically
 /// so a private copy could be normalized without losing this.
 pub fn rawPath(target: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];
+    if (std.mem.findScalar(u8, target, '?')) |i| return target[0..i];
     return target;
 }
 
@@ -2266,7 +2266,7 @@ fn matchIn(
     };
     var seg = r;
     var next: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, r, '/')) |i| {
+    if (std.mem.findScalar(u8, r, '/')) |i| {
         seg = r[0..i];
         next = r[i + 1 ..];
     }
@@ -2349,11 +2349,11 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 // Test handlers.
@@ -2734,7 +2734,7 @@ test "trailing slash: the redirect's Location outlives the frame it was built in
     const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
     var body_scratch: [64]u8 = undefined;
     var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
-    const q = std.mem.indexOfScalar(u8, head.target, '?');
+    const q = std.mem.findScalar(u8, head.target, '?');
     var req: http.Server.Request = .{
         .method = .get,
         .target = head.target,
@@ -2758,7 +2758,7 @@ test "trailing slash: the redirect's Location outlives the frame it was built in
     const got = out.buffered();
     try expectStatus(got, "301");
     try expectHeaderLine(got, "Location: /users/42?x=1");
-    try testing.expect(std.mem.indexOf(u8, got, "#") == null);
+    try testing.expect(std.mem.find(u8, got, "#") == null);
 }
 
 test "trailing slash: strict policy and distinct slash routes" {
@@ -3419,9 +3419,9 @@ test "addDoc/add copy their inputs (stack temporaries are safe)" {
         var pat_buf: [16]u8 = undefined;
         var sum_buf: [16]u8 = undefined;
         var tag_buf: [8]u8 = undefined;
-        const pat = try std.fmt.bufPrint(&pat_buf, "/v{d}/users", .{1});
-        const sum = try std.fmt.bufPrint(&sum_buf, "Sum {d}", .{7});
-        const tag = try std.fmt.bufPrint(&tag_buf, "t{d}", .{9});
+        const pat = try std.mem.print(&pat_buf, "/v{d}/users", .{1});
+        const sum = try std.mem.print(&sum_buf, "Sum {d}", .{7});
+        const tag = try std.mem.print(&tag_buf, "t{d}", .{9});
         try r.addDoc(.get, pat, hHello, .{ .summary = sum, .tags = &.{tag} });
         pat_buf = @splat(0xAA); // scribble the caller's memory
         sum_buf = @splat(0xAA);
@@ -3484,7 +3484,7 @@ test "keep-alive: one connection dispatches to two different routes" {
     const got = runWire(&r, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n" ++
         "GET /users/9 HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n\r\nhello") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n\r\nhello") != null);
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nuser=9"));
 }
 
@@ -3523,7 +3523,7 @@ test "integration: router behind http.Server, driven by http.Client" {
     var url_buf: [64]u8 = undefined;
 
     { // static route + middleware header
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -3534,7 +3534,7 @@ test "integration: router behind http.Server, driven by http.Client" {
     }
 
     { // path param extraction
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/users/42", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/users/42", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -3544,7 +3544,7 @@ test "integration: router behind http.Server, driven by http.Client" {
     }
 
     { // 404 — middleware header still applied (chain wraps not_found)
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/nope", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/nope", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 404), res.status);
@@ -3552,7 +3552,7 @@ test "integration: router behind http.Server, driven by http.Client" {
     }
 
     { // 405 with Allow
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
         var res = try client.request(.post, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 405), res.status);

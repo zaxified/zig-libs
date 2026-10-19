@@ -88,7 +88,7 @@ pub fn findZone(r: *dns.Resolver, fqdn: []const u8, out: *[max_name_len]u8) Erro
                 if (rec.class == .in and rec.data == .soa and eqlName(rec.name, cand)) return copyName(out, cand);
             }
         }
-        const dot = std.mem.indexOfScalar(u8, cand, '.') orelse break;
+        const dot = std.mem.findScalar(u8, cand, '.') orelse break;
         cand = cand[dot + 1 ..];
     }
     return error.ZoneNotFound;

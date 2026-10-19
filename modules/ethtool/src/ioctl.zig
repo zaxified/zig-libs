@@ -154,7 +154,7 @@ pub const DriverInfo = struct {
 };
 
 fn trim(field: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, field, 0) orelse field.len;
+    const end = std.mem.findScalar(u8, field, 0) orelse field.len;
     return field[0..end];
 }
 
@@ -317,7 +317,7 @@ pub fn assembleStats(
     var i: usize = 0;
     while (i < n) : (i += 1) {
         // Every name field must hold a NUL; an unterminated one was cut off.
-        if (std.mem.indexOfScalar(u8, names_src[i * gstring_len ..][0..gstring_len], 0) == null)
+        if (std.mem.findScalar(u8, names_src[i * gstring_len ..][0..gstring_len], 0) == null)
             return error.BadReply;
     }
 
@@ -509,7 +509,7 @@ fn parseStats(gpa: std.mem.Allocator, text: []const u8) !Parsed {
     _ = it.next(); // "NIC statistics:"
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        const colon = std.mem.lastIndexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalarLast(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " ");
         const v = std.fmt.parseInt(u64, std.mem.trim(u8, line[colon + 1 ..], " "), 10) catch continue;
         try p.names.append(gpa, name);

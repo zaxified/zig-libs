@@ -290,7 +290,7 @@ test "live: DEVLINK_CMD_GET dump (an empty result is the normal answer)" {
         try testing.expect(d.handle.dev().len > 0);
         // And the handle round-trips through the CLI's textual form.
         var buf: [128]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "{f}", .{d.handle});
+        const s = try std.mem.print(&buf, "{f}", .{d.handle});
         const parsed = try Handle.parse(s);
         try testing.expect(d.handle.eql(parsed));
     }

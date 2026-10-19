@@ -105,7 +105,7 @@ pub fn fuzzHandshake(comptime S2: type, src: *S2, gpa: std.mem.Allocator) anyerr
 
     var ini: S.HandshakeState = .{};
     var rsp: S.HandshakeState = .{};
-    const has_psk = std.mem.indexOf(u8, pattern.name, "psk") != null;
+    const has_psk = std.mem.find(u8, pattern.name, "psk") != null;
     const psks: []const [32]u8 = if (has_psk) &psk else &.{};
     try ini.init(pattern, true, "fuzz", &.{ .s = &ini_kp, .rs = rsp_kp.public_key, .psks = psks });
     try rsp.init(pattern, false, "fuzz", &.{ .s = &rsp_kp, .rs = ini_kp.public_key, .psks = psks });

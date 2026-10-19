@@ -111,7 +111,7 @@ pub fn decodeAlloc(gpa: Allocator, src: []const u8) DecodeError![]u8 {
 fn decodeRun(gpa: Allocator, out: *std.ArrayList(u8), run: []const u8) DecodeError!void {
     // Padding is not part of the encoding. Rejecting it explicitly says so;
     // the decoder would reject '=' as an out-of-alphabet byte anyway.
-    if (std.mem.indexOfScalar(u8, run, '=') != null) return error.InvalidUtf7;
+    if (std.mem.findScalar(u8, run, '=') != null) return error.InvalidUtf7;
 
     const n = b64_decoder.calcSizeForSlice(run) catch return error.InvalidUtf7;
     // UTF-16BE, so an odd byte count cannot be a sequence of code units.
@@ -245,7 +245,7 @@ test "tier 1: the ',' alphabet is what distinguishes this from RFC 2152 UTF-7" {
     const got = try encodeAlloc(gpa, "\u{53f0}\u{5317}");
     defer gpa.free(got);
     try testing.expectEqualStrings("&U,BTFw-", got);
-    try testing.expect(std.mem.indexOfScalar(u8, got, '/') == null);
+    try testing.expect(std.mem.findScalar(u8, got, '/') == null);
 }
 
 test "tier 2 (go-imap table): accepted forms" {

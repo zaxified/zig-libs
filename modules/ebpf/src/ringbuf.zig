@@ -1030,7 +1030,7 @@ test "fake ring: consume() honors max_records and the stop action" {
     defer ring.deinit();
     for (0..8) |i| {
         var buf: [8]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "rec-{d}", .{i});
+        const s = try std.mem.print(&buf, "rec-{d}", .{i});
         ring.append(s, 0);
     }
 

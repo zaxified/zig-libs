@@ -47,7 +47,7 @@ pub const PublicSuffixList = struct {
         while (lines.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
-            var rule = line[0 .. std.mem.indexOfAny(u8, line, " \t") orelse line.len];
+            var rule = line[0 .. std.mem.findAny(u8, line, " \t") orelse line.len];
             var kind: Kinds = .{ .normal = true };
             if (rule[0] == '!') {
                 rule = rule[1..];
@@ -88,10 +88,10 @@ pub const PublicSuffixList = struct {
         while (true) {
             const s = host[start..];
             if (list.kinds(s).exception) {
-                const dot = std.mem.indexOfScalar(u8, s, '.') orelse return s;
+                const dot = std.mem.findScalar(u8, s, '.') orelse return s;
                 return s[dot + 1 ..];
             }
-            start = (std.mem.indexOfScalarPos(u8, host, start, '.') orelse break) + 1;
+            start = (std.mem.findScalarPos(u8, host, start, '.') orelse break) + 1;
         }
         // Otherwise the longest match: scanning from the whole host down,
         // the first suffix that a normal rule names, or whose parent a
@@ -104,13 +104,13 @@ pub const PublicSuffixList = struct {
             // reading. The real list names those bases anyway.
             const k = list.kinds(s);
             if (k.normal or k.wildcard) return s;
-            if (std.mem.indexOfScalar(u8, s, '.')) |dot| {
+            if (std.mem.findScalar(u8, s, '.')) |dot| {
                 if (list.kinds(s[dot + 1 ..]).wildcard) return s;
             }
-            start = (std.mem.indexOfScalarPos(u8, host, start, '.') orelse break) + 1;
+            start = (std.mem.findScalarPos(u8, host, start, '.') orelse break) + 1;
         }
         // The implicit `*` rule.
-        return host[if (std.mem.lastIndexOfScalar(u8, host, '.')) |d| d + 1 else 0..];
+        return host[if (std.mem.findScalarLast(u8, host, '.')) |d| d + 1 else 0..];
     }
 
     /// Whether `host` is itself a public suffix.
@@ -124,7 +124,7 @@ pub const PublicSuffixList = struct {
         const ps = list.publicSuffix(host);
         if (ps.len == host.len) return null;
         const head = host[0 .. host.len - ps.len - 1];
-        return host[if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| d + 1 else 0..];
+        return host[if (std.mem.findScalarLast(u8, head, '.')) |d| d + 1 else 0..];
     }
 };
 

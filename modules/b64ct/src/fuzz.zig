@@ -179,7 +179,7 @@ fn oneMode(comptime C: type, comptime S: anytype, mode: u8, body: []const u8, cu
             var filtered: [512]u8 = undefined;
             var k: usize = 0;
             for (t) |c| {
-                if (std.mem.indexOfScalar(u8, root.pem_whitespace, c) != null) continue;
+                if (std.mem.findScalar(u8, root.pem_whitespace, c) != null) continue;
                 filtered[k] = c;
                 k += 1;
             }
@@ -209,9 +209,9 @@ fn oneMode(comptime C: type, comptime S: anytype, mode: u8, body: []const u8, cu
                 // It stopped on a character that cannot continue the prefix:
                 // never an ignored one, and an alphabet one only after the
                 // padding closed the data.
-                try testing.expect(std.mem.indexOfScalar(u8, root.pem_whitespace, c) == null);
-                if (std.mem.indexOfScalar(u8, t[0..r.consumed], '=') == null)
-                    try testing.expect(std.mem.indexOfScalar(u8, &S.Encoder.alphabet_chars, c) == null);
+                try testing.expect(std.mem.findScalar(u8, root.pem_whitespace, c) == null);
+                if (std.mem.findScalar(u8, t[0..r.consumed], '=') == null)
+                    try testing.expect(std.mem.findScalar(u8, &S.Encoder.alphabet_chars, c) == null);
             }
         },
         // encode / encodeWrapped against std.

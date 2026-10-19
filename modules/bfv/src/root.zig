@@ -138,6 +138,6 @@ test {
 }
 
 test "meta.model_after names BFV + Fan-Vercauteren" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BFV") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Fan-Vercauteren") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BFV") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Fan-Vercauteren") != null);
 }

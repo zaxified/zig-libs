@@ -65,7 +65,7 @@ fn statusOf(got: []const u8) u16 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
@@ -163,7 +163,7 @@ pub fn main() !void {
         const down = runWire(&r2, wire("GET", "/readyz"), &buf);
         must(statusOf(down) == 503, @src());
         must(std.mem.eql(u8, bodyOf(down), "not ready\n"), @src());
-        must(std.mem.indexOf(u8, down, "database") == null, @src());
+        must(std.mem.find(u8, down, "database") == null, @src());
         db_ready.store(true, .release);
         std.debug.print("detail=false: 503 preserved, dependency name withheld\n", .{});
     }
@@ -177,7 +177,7 @@ pub fn main() !void {
         var names: [40][8]u8 = undefined;
         for (&many, 0..) |*c, i| {
             names[i] = undefined;
-            const name = std.fmt.bufPrint(&names[i], "dep{d:0>3}", .{i}) catch unreachable;
+            const name = std.mem.print(&names[i], "dep{d:0>3}", .{i}) catch unreachable;
             c.* = .{ .name = name, .checkFn = failAlways };
         }
         var h3 = health.Health{ .checks = &many };
@@ -190,8 +190,8 @@ pub fn main() !void {
         must(statusOf(down) == 503, @src());
         const body = bodyOf(down);
         must(std.mem.endsWith(u8, body, "not ready: ...\n"), @src()); // truncation marker
-        must(std.mem.indexOf(u8, body, "dep000") != null, @src()); // earliest failures survive
-        must(std.mem.indexOf(u8, body, "dep039") == null, @src()); // the last one did not fit
+        must(std.mem.find(u8, body, "dep000") != null, @src()); // earliest failures survive
+        must(std.mem.find(u8, body, "dep039") == null, @src()); // the last one did not fit
         std.debug.print("capacity: {d} simultaneous failures truncated the 512-byte detail body ({d} bytes)\n", .{ many.len, body.len });
     }
 

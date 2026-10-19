@@ -746,7 +746,7 @@ test "golden (real reply): the kernel's own op table agrees with uapi.zig" {
         uapi.CMD.HEALTH_REPORTER_GET, uapi.CMD.HEALTH_REPORTER_RECOVER,
     };
     for (sent) |c| {
-        try testing.expect(std.mem.indexOfScalar(u32, ids[0..n], c) != null);
+        try testing.expect(std.mem.findScalar(u32, ids[0..n], c) != null);
     }
 }
 

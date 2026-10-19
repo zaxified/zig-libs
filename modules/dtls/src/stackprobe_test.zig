@@ -739,7 +739,7 @@ fn reference(cfg_c: dtls.Config, cfg_s: dtls.Config) !void {
 
 fn onWire(chunk: []const u8) bool {
     for ([_]Step{ .s_hello, .c_flight2, .s_fin }) |st| {
-        if (std.mem.indexOf(u8, stepIn(st), chunk) != null) return true;
+        if (std.mem.find(u8, stepIn(st), chunk) != null) return true;
     }
     return false;
 }

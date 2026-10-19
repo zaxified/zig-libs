@@ -191,7 +191,7 @@ test "cacophony vectors: 87 protocols byte-exact, every pattern of the catalog" 
                 (proto.pattern.name.len == p.name.len or std.ascii.isLower(proto.pattern.name[p.name.len])))
                 seen[i] = true;
         }
-        if (std.mem.indexOf(u8, proto.pattern.name, "psk") != null) psk_runs += 1;
+        if (std.mem.find(u8, proto.pattern.name, "psk") != null) psk_runs += 1;
     }
     // Every catalog pattern is anchored by at least one vector.
     for (seen, patterns.catalog) |s, p| testing.expect(s) catch |e| {
@@ -332,8 +332,8 @@ test "sweep: whatever init accepts runs to an agreed handshake" {
         // Random key availability, consistent between the two sides.
         const give_is = r.boolean();
         const give_rs = r.boolean();
-        const pre_e_i = std.mem.indexOfScalar(Token, p.pre_message_initiator, .e) != null;
-        const pre_e_r = std.mem.indexOfScalar(Token, p.pre_message_responder, .e) != null;
+        const pre_e_i = std.mem.findScalar(Token, p.pre_message_initiator, .e) != null;
+        const pre_e_r = std.mem.findScalar(Token, p.pre_message_responder, .e) != null;
         var ini = mk(S0, p, true, "x", .{
             .s = if (give_is) i_s else null,
             .e = if (pre_e_i) i_e else null,
@@ -460,7 +460,7 @@ test "sweep: random protocol names parse or refuse, never panic" {
             // Half start from a well-formed name and get damaged below.
             const base = patterns.catalog[r.uintLessThan(usize, patterns.catalog.len)];
             const mods = [_][]const u8{ "", "psk0", "psk1", "psk2", "psk0+psk2", "fallback" };
-            const w = std.fmt.bufPrint(&buf, "Noise_{s}{s}_25519_ChaChaPoly_SHA256", .{ base.name, mods[r.uintLessThan(usize, mods.len)] }) catch unreachable;
+            const w = std.mem.print(&buf, "Noise_{s}{s}_25519_ChaChaPoly_SHA256", .{ base.name, mods[r.uintLessThan(usize, mods.len)] }) catch unreachable;
             n = w.len;
             if (r.boolean()) {
                 const at = r.uintLessThan(usize, n);

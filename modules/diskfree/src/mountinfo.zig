@@ -135,7 +135,7 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !MountinfoEntry {
     const parent_id = try std.fmt.parseInt(u32, toks.next() orelse return error.Malformed, 10);
 
     const maj_min = toks.next() orelse return error.Malformed;
-    const colon = std.mem.indexOfScalar(u8, maj_min, ':') orelse return error.Malformed;
+    const colon = std.mem.findScalar(u8, maj_min, ':') orelse return error.Malformed;
     const dev_major = try std.fmt.parseInt(u32, maj_min[0..colon], 10);
     const dev_minor = try std.fmt.parseInt(u32, maj_min[colon + 1 ..], 10);
 
@@ -279,7 +279,7 @@ test "parseMountinfo: optional fields captured, and absent when the row has none
     var found_shared = false;
     var found_none = false;
     for (entries) |e| {
-        if (std.mem.indexOf(u8, e.optional_fields, "shared:") != null) found_shared = true;
+        if (std.mem.find(u8, e.optional_fields, "shared:") != null) found_shared = true;
         if (e.optional_fields.len == 0) found_none = true;
     }
     try testing.expect(found_shared);

@@ -1360,7 +1360,7 @@ test "probeMany over many targets: all returned, order stable, concurrency bound
     var host_bufs: [n][16]u8 = undefined;
 
     for (0..n) |i| {
-        const host = std.fmt.bufPrint(&host_bufs[i], "h{d}", .{i}) catch unreachable;
+        const host = std.mem.print(&host_bufs[i], "h{d}", .{i}) catch unreachable;
         // even → up with distinct rtt, odd → timeout
         const outcome: ConnectOutcome = if (i % 2 == 0)
             .{ .status = .up, .rtt_ns = @as(u64, i + 1) * ms }
@@ -1445,7 +1445,7 @@ test "live: probe a self-bound TCP listener → up" {
     const port = bound.ip4.port;
 
     var host_buf: [24]u8 = undefined;
-    const spec = std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port}) catch
+    const spec = std.mem.print(&host_buf, "127.0.0.1:{d}", .{port}) catch
         return error.SkipZigTest;
     const target = Target.parse(spec) catch return error.SkipZigTest;
 
@@ -1526,7 +1526,7 @@ test "probeMany honors the ceiling end to end, not just in the arithmetic" {
     var scripts: [n]FakeConnector.Script = undefined;
     var host_bufs: [n][16]u8 = undefined;
     for (0..n) |i| {
-        const host = std.fmt.bufPrint(&host_bufs[i], "c{d}", .{i}) catch unreachable;
+        const host = std.mem.print(&host_bufs[i], "c{d}", .{i}) catch unreachable;
         scripts[i] = .{ .host = host, .outcomes = outcomes_slot(i, .{ .status = .up, .rtt_ns = 1 }) };
         targets[i] = .{ .host = host, .port = 80 };
     }
@@ -1670,7 +1670,7 @@ const BlackHole = struct {
     }
 
     fn target(self: *const BlackHole, buf: []u8) !Target {
-        return Target.parse(try std.fmt.bufPrint(buf, "127.0.0.1:{d}", .{self.port}));
+        return Target.parse(try std.mem.print(buf, "127.0.0.1:{d}", .{self.port}));
     }
 };
 
@@ -1724,7 +1724,7 @@ const LiveRace = struct {
         var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{}); // global-alloc-ok: abandoned test-only thread, never joined, never deinit'd (see doc comment above)
         var lc: LiveConnector = .{ .io = threaded.io() };
         var buf: [24]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{self.port}) catch return;
+        const text = std.mem.print(&buf, "127.0.0.1:{d}", .{self.port}) catch return;
         const t = Target.parse(text) catch return;
         _ = lc.connector().connect(t, 200 * std.time.ns_per_ms);
         self.done.store(true, .release);
@@ -1837,7 +1837,7 @@ test "PosixConnector: a budget already spent before the connect is a timeout, an
     _ = tl.close(ln.fd);
     var pc: PosixConnector = .{ .resolve = .literal_only };
     var buf: [24]u8 = undefined;
-    const tgt = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const tgt = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
     try testing.expectEqual(Status.timeout, pc.connector().connect(tgt, 1).status);
 }
 
@@ -1848,7 +1848,7 @@ test "live: a closed loopback port is refused fast, and is never reported as a t
 
     var pc: PosixConnector = .{ .resolve = .literal_only };
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     // A five-second budget it must not spend: `refused` is the fast definitive
     // negative. It arrives through `poll` as POLLOUT|POLLERR|POLLHUP with
@@ -1871,7 +1871,7 @@ test "live: a listening loopback port is up, with a measured rtt" {
 
     var pc: PosixConnector = .{ .resolve = .literal_only };
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
     const out = pc.connector().connect(t, 5 * std.time.ns_per_s);
     try testing.expectEqual(Status.up, out.status);
     try testing.expect(out.rtt_ns != null);
@@ -1920,8 +1920,8 @@ test "live: attempts do not leak a descriptor, on any outcome" {
     var b1: [24]u8 = undefined;
     var b2: [24]u8 = undefined;
     var b3: [24]u8 = undefined;
-    const t_up = try Target.parse(try std.fmt.bufPrint(&b1, "127.0.0.1:{d}", .{up.port}));
-    const t_refused = try Target.parse(try std.fmt.bufPrint(&b2, "127.0.0.1:{d}", .{closed.port}));
+    const t_up = try Target.parse(try std.mem.print(&b1, "127.0.0.1:{d}", .{up.port}));
+    const t_refused = try Target.parse(try std.mem.print(&b2, "127.0.0.1:{d}", .{closed.port}));
     const t_hole = try hole.target(&b3);
 
     // One of each first, so any one-off allocation of a descriptor by the
@@ -1954,7 +1954,7 @@ test "live: IPv6 loopback works end to end through [v6]:port" {
 
     var pc: PosixConnector = .{ .resolve = .literal_only };
     var buf: [32]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "[::1]:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "[::1]:{d}", .{ln.port}));
     try testing.expectEqualStrings("::1", t.host); // brackets stripped by Target.parse
     const out = pc.connector().connect(t, 5 * std.time.ns_per_s);
     try testing.expectEqual(Status.up, out.status);
@@ -1988,7 +1988,7 @@ test "live: the documented DNS boundary — a literal never reaches a resolver" 
     const ln = try listenLoopback(false, 8);
     _ = tl.close(ln.fd);
     var buf: [24]u8 = undefined;
-    const lit = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const lit = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
     try testing.expectEqual(Status.refused, loose.connector().connect(lit, 200 * ms).status);
 }
 
@@ -2040,7 +2040,7 @@ test "system resolution tries every address, not just the first" {
     defer _ = std.os.linux.close(ln.fd);
 
     var buf: [40]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "localhost:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "localhost:{d}", .{ln.port}));
     var pc: PosixConnector = .{ .resolve = .system, .io = io };
     const out = pc.connector().connect(t, 3 * std.time.ns_per_s);
     try testing.expectEqual(Status.up, out.status);
@@ -2396,7 +2396,7 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
         var scripts: [12]FakeConnector.Script = undefined;
         var targets: [12]Target = undefined;
         for (0..n_targets) |t| {
-            const host = std.fmt.bufPrint(&hosts[t], "h{d}", .{t}) catch unreachable;
+            const host = std.mem.print(&hosts[t], "h{d}", .{t}) catch unreachable;
             const mode = rnd.uintLessThan(u8, 6); // per-target bias: some all-down, some all-canceled
             for (0..eff) |i| {
                 const pick: u8 = switch (mode) {
@@ -2616,7 +2616,7 @@ test "live: ip_protocol restricts IP literals — an excluded family is an error
     const ln = try listenLoopback(false, 8);
     defer _ = tl.close(ln.fd);
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     var pc: PosixConnector = .{ .resolve = .literal_only, .ip_protocol = .ip6 };
     const out = pc.connector().connect(t, 2 * std.time.ns_per_s);
@@ -2639,7 +2639,7 @@ test "live: source binds the local address — the peer sees 127.0.0.2" {
     const ln = try listenLoopback(false, 8);
     defer _ = tl.close(ln.fd);
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v4 = .{ 127, 0, 0, 2 } } };
     const out = pc.connector().connect(t, 2 * std.time.ns_per_s);
@@ -2658,7 +2658,7 @@ test "live: a source of the wrong family or not on this host is an error Result,
     const ln = try listenLoopback(false, 8);
     defer _ = tl.close(ln.fd);
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     // v6 source, v4 target: the family check fires before any syscall.
     var pc: PosixConnector = .{ .resolve = .literal_only, .source = .{ .v6 = @as([15]u8, @splat(0)) ++ [_]u8{1} } };
@@ -2677,7 +2677,7 @@ test "live: device — lo works, an unknown or malformed name is an error Result
     const ln = try listenLoopback(false, 8);
     defer _ = tl.close(ln.fd);
     var buf: [24]u8 = undefined;
-    const t = try Target.parse(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{ln.port}));
+    const t = try Target.parse(try std.mem.print(&buf, "127.0.0.1:{d}", .{ln.port}));
 
     var pc: PosixConnector = .{ .resolve = .literal_only, .device = "lo" };
     const lo = pc.connector().connect(t, 2 * std.time.ns_per_s);

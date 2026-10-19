@@ -370,7 +370,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 const Endpoint = struct { host: []const u8, port: u16 };
 
 fn splitEndpoint(endpoint: []const u8) ?Endpoint {
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return null;
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return null;
     return .{ .host = endpoint[0..colon], .port = port };
 }

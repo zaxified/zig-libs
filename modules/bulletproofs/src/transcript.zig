@@ -298,7 +298,7 @@ test "challengeScalar: 300 draws carry real entropy (audit B3: Fiat-Shamir trunc
     var challenges: [300][32]u8 = undefined;
     for (&challenges, 0..) |*c, i| {
         var label_buf: [8]u8 = undefined;
-        const label = std.fmt.bufPrint(&label_buf, "c{d}", .{i}) catch unreachable;
+        const label = std.mem.print(&label_buf, "c{d}", .{i}) catch unreachable;
         c.* = t.challengeScalar(label);
     }
 

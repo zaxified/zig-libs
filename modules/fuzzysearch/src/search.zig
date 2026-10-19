@@ -445,7 +445,7 @@ test "search: top-N truncation when more matches than result slots" {
     var kbuf: [16]u8 = undefined;
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>4}", .{i});
+        const key = try std.mem.print(&kbuf, "key{d:0>4}", .{i});
         try b.insert(key, i);
     }
     const buf = try b.freeze(testing.allocator);
@@ -466,7 +466,7 @@ test "search: budget exhaustion reported as truncated" {
     var kbuf: [16]u8 = undefined;
     var i: u32 = 0;
     while (i < 500) : (i += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "n{d:0>6}", .{i});
+        const key = try std.mem.print(&kbuf, "n{d:0>6}", .{i});
         try b.insert(key, i);
     }
     const buf = try b.freeze(testing.allocator);
@@ -571,7 +571,7 @@ test "search: pruning keeps k=0 work to the query's own path" {
         var pairs: [500]trie.Pair = undefined;
         var names: [500][7]u8 = undefined;
         for (0..500) |i| {
-            _ = std.fmt.bufPrint(&names[i], "n{d:0>6}", .{i}) catch unreachable;
+            _ = std.mem.print(&names[i], "n{d:0>6}", .{i}) catch unreachable;
             pairs[i] = .{ .key = &names[i], .value = @intCast(i) };
         }
         const buf = try trie.freezeFromPairsWith(testing.allocator, testing.allocator, &pairs, fmt);

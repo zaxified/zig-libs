@@ -82,7 +82,7 @@ pub fn parseHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
         n += 1;
         std.mem.doNotOptimizeAway(c.name);
         std.mem.doNotOptimizeAway(c.value);
-        if (std.mem.indexOfScalar(u8, c.value, ';') != null) mark(.quoted_value);
+        if (std.mem.findScalar(u8, c.value, ';') != null) mark(.quoted_value);
     }
     mark(if (n == 0) .empty else .parsed);
 }

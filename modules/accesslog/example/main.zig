@@ -66,7 +66,7 @@ fn looksLikeCombined(line: []const u8) bool {
     s = s[0 .. s.len - 1];
 
     // %h — host token, no spaces.
-    const sp1 = std.mem.indexOfScalar(u8, s, ' ') orelse return false;
+    const sp1 = std.mem.findScalar(u8, s, ' ') orelse return false;
     if (sp1 == 0) return false;
     s = s[sp1 + 1 ..];
 
@@ -75,7 +75,7 @@ fn looksLikeCombined(line: []const u8) bool {
     s = s["- - [".len..];
 
     // %t — up to the closing bracket.
-    const close = std.mem.indexOfScalar(u8, s, ']') orelse return false;
+    const close = std.mem.findScalar(u8, s, ']') orelse return false;
     if (close == 0) return false;
     s = s[close + 1 ..];
     if (!std.mem.startsWith(u8, s, " \"")) return false;
@@ -84,18 +84,18 @@ fn looksLikeCombined(line: []const u8) bool {
     // "%r" — quoted request line, closed by an UNESCAPED quote (a `\"`
     // inside it was backslash-escaped by the module, so a bare scan for the
     // next `"` finds the real closing one).
-    const req_end = std.mem.indexOfScalar(u8, s, '"') orelse return false;
+    const req_end = std.mem.findScalar(u8, s, '"') orelse return false;
     s = s[req_end + 1 ..];
     if (!std.mem.startsWith(u8, s, " ")) return false;
     s = s[1..];
 
     // %>s — status: one or more digits.
-    const sp2 = std.mem.indexOfScalar(u8, s, ' ') orelse return false;
+    const sp2 = std.mem.findScalar(u8, s, ' ') orelse return false;
     if (sp2 == 0 or !allDigits(s[0..sp2])) return false;
     s = s[sp2 + 1 ..];
 
     // %b — digits or a literal "-".
-    const sp3 = std.mem.indexOfScalar(u8, s, ' ') orelse return false;
+    const sp3 = std.mem.findScalar(u8, s, ' ') orelse return false;
     if (sp3 == 0) return false;
     if (!std.mem.eql(u8, s[0..sp3], "-") and !allDigits(s[0..sp3])) return false;
     s = s[sp3 + 1 ..];
@@ -103,7 +103,7 @@ fn looksLikeCombined(line: []const u8) bool {
     // "%{Referer}i" then "%{User-Agent}i" — both quoted, both required.
     if (!std.mem.startsWith(u8, s, "\"")) return false;
     s = s[1..];
-    const ref_end = std.mem.indexOfScalar(u8, s, '"') orelse return false;
+    const ref_end = std.mem.findScalar(u8, s, '"') orelse return false;
     s = s[ref_end + 1 ..];
     if (!std.mem.startsWith(u8, s, " \"")) return false;
     s = s[2..];
@@ -141,7 +141,7 @@ pub fn main() !void {
     const evil_line = evil_w.buffered();
 
     if (std.mem.count(u8, evil_line, "\n") != 1) return error.LineForged;
-    if (std.mem.indexOfScalar(u8, evil_line, '\r') != null) return error.RawCrInLine;
+    if (std.mem.findScalar(u8, evil_line, '\r') != null) return error.RawCrInLine;
     if (!looksLikeCombined(evil_line)) return error.NotCombinedShaped;
     std.debug.print("crafted User-Agent (quote+CRLF+forged-line attempt) stayed one CLF-shaped record\n", .{});
 

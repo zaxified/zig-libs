@@ -559,7 +559,7 @@ test "ML-DSA: a tampered tbsCertificate is rejected, not ignored" {
     // test passes even with the `verify` call deleted — verified by mutation.
     // Editing the signed bytes instead can only be caught by verification.
     var tampered: [mldsa.leaf65.len]u8 = mldsa.leaf65.*;
-    const cn = std.mem.indexOf(u8, &tampered, "leaf.example.org").?;
+    const cn = std.mem.find(u8, &tampered, "leaf.example.org").?;
     tampered[cn] = 'x'; // same length, so the DER stays structurally valid
 
     const chain = [_]chain_mod.CertDer{ &tampered, mldsa.inter65 };
@@ -707,7 +707,7 @@ test "SLH-DSA: every self-signed fixture reports the parameter set its OID names
 
 test "SLH-DSA: a tampered tbsCertificate is rejected, not ignored" {
     var tampered: [slh.leaf_sha2.len]u8 = slh.leaf_sha2.*;
-    const cn = std.mem.indexOf(u8, &tampered, "leaf.example.org").?;
+    const cn = std.mem.find(u8, &tampered, "leaf.example.org").?;
     tampered[cn] = 'x';
 
     const chain = [_]chain_mod.CertDer{ &tampered, slh.inter_sha2 };
@@ -795,7 +795,7 @@ test "PQ single-link helpers chain the issuer's name, like their std counterpart
     var forged: [mldsa.inter44.len]u8 = mldsa.inter44.*;
     const needle = "Test Inter ML-DSA-44";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, &forged, needle));
-    forged[std.mem.indexOf(u8, &forged, needle).?] = 'X';
+    forged[std.mem.find(u8, &forged, needle).?] = 'X';
     try testing.expectError(
         error.CertificateIssuerMismatch,
         chain_mod.verifyMlDsaLink(mldsa.leaf44, &forged, now_valid_mldsa),
@@ -807,7 +807,7 @@ test "PQ single-link helpers chain the issuer's name, like their std counterpart
     var forged_slh: [slh.inter_sha2.len]u8 = slh.inter_sha2.*;
     const needle_slh = "Test Inter SLH-DSA";
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, &forged_slh, needle_slh));
-    forged_slh[std.mem.indexOf(u8, &forged_slh, needle_slh).?] = 'X';
+    forged_slh[std.mem.find(u8, &forged_slh, needle_slh).?] = 'X';
     try testing.expectError(
         error.CertificateIssuerMismatch,
         chain_mod.verifySlhDsaLink(slh.leaf_sha2, &forged_slh, now_valid_mldsa),
@@ -838,7 +838,7 @@ fn renameAlgorithm(gpa: std.mem.Allocator, cert: []const u8, from: []const u8, t
     errdefer gpa.free(out);
     var replaced: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, out, i, from)) |at| {
+    while (std.mem.findPos(u8, out, i, from)) |at| {
         @memcpy(out[at..][0..to.len], to);
         i = at + to.len;
         replaced += 1;

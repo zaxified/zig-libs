@@ -76,7 +76,7 @@ test "P-384: delegated P-384 responder (cert signed ecdsa-with-SHA384), revoked 
 test "P-384: a changed signed byte or signature byte is SignatureInvalid, not accepted" {
     // One digit of producedAt/thisUpdate ("20260930…") inside tbsResponseData.
     var tampered: [direct384.len]u8 = direct384.*;
-    const at = std.mem.indexOf(u8, &tampered, "20260930").?;
+    const at = std.mem.find(u8, &tampered, "20260930").?;
     tampered[at + 7] = '1'; // …30 → …31: still a valid GeneralizedTime
     try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(&tampered), ca, leaf1, .{ .now_unix = now }));
     // A byte of r inside the response's signature BIT STRING. (Not the file's
@@ -87,7 +87,7 @@ test "P-384: a changed signed byte or signature byte is SignatureInvalid, not ac
     // the BIT STRING follows: 03 67 00 | 30 64 | 02 30 <r…>.
     var bad_sig: [direct384.len]u8 = direct384.*;
     const alg = [_]u8{ 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03 };
-    const sig_at = std.mem.indexOf(u8, &bad_sig, &alg).? + alg.len;
+    const sig_at = std.mem.find(u8, &bad_sig, &alg).? + alg.len;
     try testing.expectEqual(@as(u8, 0x03), bad_sig[sig_at]); // BIT STRING
     bad_sig[sig_at + 3 + 2 + 2 + 5] ^= 0x01; // 6th octet of r
     try testing.expectError(error.SignatureInvalid, ocsp.verify(try ocsp.parseResponse(&bad_sig), ca, leaf1, .{ .now_unix = now }));

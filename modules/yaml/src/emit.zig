@@ -325,8 +325,8 @@ fn writeFloat(w: *Io.Writer, x: f64) Error!void {
     const a = @abs(x);
     // Shortest round-trip digits and exponent from `{e}`: x = 0.d0d1... * 10^n.
     var sbuf: [64]u8 = undefined;
-    const sci = std.fmt.bufPrint(&sbuf, "{e}", .{a}) catch unreachable;
-    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const sci = std.mem.print(&sbuf, "{e}", .{a}) catch unreachable;
+    const e_at = std.mem.findScalar(u8, sci, 'e').?;
     var digits_buf: [32]u8 = undefined;
     var k: usize = 0;
     for (sci[0..e_at]) |c| if (c != '.') {

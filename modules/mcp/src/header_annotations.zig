@@ -46,7 +46,7 @@ pub const max_chain = 32;
 /// annotation is not parsed at all; a schema that is not JSON is not judged
 /// here (`tools/list` already reports it).
 pub fn validate(gpa: std.mem.Allocator, input_schema: []const u8) Error!void {
-    if (std.mem.indexOf(u8, input_schema, "x-mcp-header") == null) return;
+    if (std.mem.find(u8, input_schema, "x-mcp-header") == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -110,7 +110,7 @@ fn isPrimitive(t: []const u8) bool {
 fn isToken(s: []const u8) bool {
     if (s.len == 0) return false;
     for (s) |c| {
-        const ok = std.ascii.isAlphanumeric(c) or std.mem.indexOfScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
+        const ok = std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
         if (!ok) return false;
     }
     return true;

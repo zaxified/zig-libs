@@ -975,7 +975,7 @@ test "leaf split halves entries and reports a correct separator" {
     var i: usize = 0;
     while (!b.overflows()) : (i += 1) {
         // The builder borrows its keys, so each one needs its own bytes.
-        try b.put(try std.fmt.allocPrint(a, "k{d:0>5}", .{i}), &big);
+        try b.put(try a.print("k{d:0>5}", .{i}), &big);
     }
     const before = b.entries.items.len;
     const sp = try b.split();
@@ -1103,7 +1103,7 @@ test "leaf split cuts where the bytes balance, not at the entry midpoint" {
     var b = LeafBuilder.init(a);
     const big: [3000]u8 = @splat('b');
     try b.put("a", &big);
-    for (0..10) |i| try b.put(try std.fmt.allocPrint(a, "k{d}", .{i}), "small");
+    for (0..10) |i| try b.put(try a.print("k{d}", .{i}), "small");
     const sp = try b.split();
     // The big entry alone is the heavier half; a count midpoint would have
     // put four small ones next to it.

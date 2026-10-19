@@ -311,10 +311,10 @@ test "Sink: synchronized writes never interleave across threads" {
     while (it.next()) |line| {
         count += 1;
         try testing.expect(line.len > 2 and line[0] == '{' and line[line.len - 1] == '}');
-        const ok = std.mem.indexOf(u8, line, "\"status\":200,") != null or
-            std.mem.indexOf(u8, line, "\"status\":201,") != null or
-            std.mem.indexOf(u8, line, "\"status\":202,") != null or
-            std.mem.indexOf(u8, line, "\"status\":203,") != null;
+        const ok = std.mem.find(u8, line, "\"status\":200,") != null or
+            std.mem.find(u8, line, "\"status\":201,") != null or
+            std.mem.find(u8, line, "\"status\":202,") != null or
+            std.mem.find(u8, line, "\"status\":203,") != null;
         try testing.expect(ok);
     }
     try testing.expectEqual(@as(usize, n_threads * 100), count);
@@ -356,7 +356,7 @@ test "F15/M32: Sink.log actually takes its lock when synchronized" {
     access.lock.unlock();
     t.join();
     try testing.expect(done.load(.seq_cst));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "/m32") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "/m32") != null);
 }
 
 // ── F4 bench (opt-in): Sink under concurrency into a real file ────────
@@ -543,7 +543,7 @@ fn f4AssertIdle(a: *Sink) !void {
 /// 37th line is longer than a whole batch (the owner path); the rest vary in
 /// length so batch boundaries fall at every offset.
 fn f4Path(buf: []u8, id: usize, seq: usize) []const u8 {
-    const head = std.fmt.bufPrint(buf, "/t{d}/s{d}/", .{ id, seq }) catch unreachable;
+    const head = std.mem.print(buf, "/t{d}/s{d}/", .{ id, seq }) catch unreachable;
     const pad: usize = if (seq % 37 == 5) Sink.pending_capacity + 300 else (id * 31 + seq * 7) % 180;
     @memset(buf[head.len..][0..pad], 'a' + @as(u8, @intCast((id + seq) % 26)));
     return buf[0 .. head.len + pad];

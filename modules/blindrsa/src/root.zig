@@ -855,7 +855,7 @@ test {
 }
 
 test "meta names RFC 9474 and the sibling rsa dep" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "9474") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "9474") != null);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
 }
 

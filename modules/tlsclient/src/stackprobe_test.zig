@@ -575,8 +575,8 @@ fn derFromPem(comptime pem: []const u8) []const u8 {
     const S = struct {
         const der = blk: {
             @setEvalBranchQuota(1_000_000);
-            const begin = std.mem.indexOf(u8, pem, "-----\n").? + 6;
-            const end = std.mem.indexOf(u8, pem, "\n-----END").?;
+            const begin = std.mem.find(u8, pem, "-----\n").? + 6;
+            const end = std.mem.find(u8, pem, "\n-----END").?;
             var clean: [end - begin]u8 = undefined;
             var len: usize = 0;
             for (pem[begin..end]) |ch| if (ch != '\n') {
@@ -807,7 +807,7 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comp
     th.update(in_buf[tls.record_header_len..in_len]); // ServerHello
     const hello_hash = th.peek();
     const sched = scheduleNeedles(Hash, key_len, &n, shared, &hello_hash);
-    try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &sched.s_ts)) != null);
+    try std.testing.expect(std.mem.find(u8, log_writer.buffered(), &hex(Hash.digest_length, &sched.s_ts)) != null);
 
     if (full) {
         // Reach: the whole flight is accepted and the client logs the
@@ -819,7 +819,7 @@ fn kexCase(comptime group: tls.NamedGroup, comptime suite: tls.CipherSuite, comp
         callInit();
         use_key_log = false;
         try std.testing.expectEqual(@as(?anyerror, null), init_err);
-        try std.testing.expect(std.mem.indexOf(u8, log_writer.buffered(), &hex(Hash.digest_length, &c_ap)) != null);
+        try std.testing.expect(std.mem.find(u8, log_writer.buffered(), &hex(Hash.digest_length, &c_ap)) != null);
     }
 
     n.sort();

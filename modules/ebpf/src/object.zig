@@ -806,7 +806,7 @@ fn parseImage(
 }
 
 fn cstrSlice(d: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, d, 0) orelse d.len;
+    const end = std.mem.findScalar(u8, d, 0) orelse d.len;
     return d[0..end];
 }
 
@@ -2132,7 +2132,7 @@ fn buildSyntheticLegacyMapsImage(a: std.mem.Allocator, count: usize) !elfsym.Ima
     var buf: [16]u8 = undefined;
     for (0..count) |idx| {
         name_offs[idx] = @intCast(strtab.items.len);
-        const name = std.fmt.bufPrint(&buf, "m{d}", .{idx}) catch unreachable;
+        const name = std.mem.print(&buf, "m{d}", .{idx}) catch unreachable;
         try strtab.appendSlice(a, name);
         try strtab.append(a, 0);
     }

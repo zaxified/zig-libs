@@ -845,7 +845,7 @@ test "SELF: verified keyword lookup — a hit verifies; an UNPOPULATED slot reje
         var buf: [16]u8 = undefined;
         var t: usize = 0;
         const far_kw = while (t < 1000) : (t += 1) {
-            const cand = std.fmt.bufPrint(&buf, "far-{d}", .{t}) catch unreachable;
+            const cand = std.mem.print(&buf, "far-{d}", .{t}) catch unreachable;
             if (W.Value.keywordIndex(cand) >= 100) break cand;
         } else unreachable;
         var q: W.Query = undefined;

@@ -421,7 +421,7 @@ test "inbound pickle round trip mid-ratchet: decrypts and refusals continue iden
     var msgs: [6]@import("message.zig").Message = undefined;
     for (&msgs, 0..) |*m, i| {
         var buf: [16]u8 = undefined;
-        m.* = try out.encrypt(a, try std.fmt.bufPrint(&buf, "msg {d}", .{i}));
+        m.* = try out.encrypt(a, try std.mem.print(&buf, "msg {d}", .{i}));
     }
     defer for (&msgs) |*m| m.deinit(a);
 

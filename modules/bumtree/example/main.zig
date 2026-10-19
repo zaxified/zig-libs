@@ -139,7 +139,7 @@ pub fn main() !void {
 
         // Pruning: node 6 is a member-less leaf and must NEVER be a
         // replication target, regardless of which way node 3's tie resolved.
-        for (0..7) |i| must(std.mem.indexOfScalar(NodeId, bt.replicateTo(@intCast(i)), 6) == null, @src());
+        for (0..7) |i| must(std.mem.findScalar(NodeId, bt.replicateTo(@intCast(i)), 6) == null, @src());
 
         // The tie: node 3's parent is 1 or 2 (both legitimate), and it is
         // stable across an independent rebuild of the same graph — not a
@@ -197,7 +197,7 @@ pub fn main() !void {
         defer bt.deinit();
 
         must(bt.isMember(6), @src());
-        must(std.mem.indexOfScalar(NodeId, bt.replicateTo(1), 6) != null, @src()); // now present
+        must(std.mem.findScalar(NodeId, bt.replicateTo(1), 6) != null, @src()); // now present
         const visits = try floodViaTree(gpa, &bt);
         defer gpa.free(visits);
         must(visits[6] == 1, @src()); // and actually reached

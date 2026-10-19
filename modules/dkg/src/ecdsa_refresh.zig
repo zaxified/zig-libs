@@ -684,7 +684,7 @@ fn refresh(allocator: std.mem.Allocator, random: std.Random, old: []const tecdsa
         // Every receiver used the same dealers: all, or all but `excluded`.
         const used = p.receiver.usedDealers().?;
         try testing.expectEqual(@as(usize, if (excluded == null) 3 else 2), used.len);
-        if (excluded) |x| try testing.expect(std.mem.indexOfScalar(u32, used, x) == null);
+        if (excluded) |x| try testing.expect(std.mem.findScalar(u32, used, x) == null);
     }
     var out: [3]tecdsa.KeyShare = undefined;
     for (&parties, &out) |*p, *s| try testing.expect(p.takeKeyShare(s));

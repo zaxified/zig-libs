@@ -127,7 +127,7 @@ pub fn unescapeQuoted(v: []u8) []u8 {
 
 /// RFC 2045 §5.1 tspecials.
 fn isTspecial(c: u8) bool {
-    return std.mem.indexOfScalar(u8, "()<>@,;:\\\"/[]?=", c) != null;
+    return std.mem.findScalar(u8, "()<>@,;:\\\"/[]?=", c) != null;
 }
 
 /// RFC 2045 §5.1 token octet: visible ASCII that is not a tspecial.
@@ -168,7 +168,7 @@ pub const MediaTypeCheck = struct {
 /// duplicate check linear (Go has no cap; no sender comes close).
 pub fn checkMediaType(header: []const u8) MediaTypeCheck {
     const ws = &std.ascii.whitespace;
-    const semi = std.mem.indexOfScalar(u8, header, ';') orelse header.len;
+    const semi = std.mem.findScalar(u8, header, ';') orelse header.len;
     const mt = std.mem.trim(u8, header[0..semi], ws);
     if (!validMediaType(mt)) return .{ .media_type = "", .clean = false };
     const bad_param: MediaTypeCheck = .{ .media_type = mt, .clean = false };
@@ -284,7 +284,7 @@ pub const ParamIterator = struct {
             const end = indexOfUnquoted(it.rest, ';') orelse it.rest.len;
             const seg = it.rest[0..end];
             it.rest = it.rest[end..];
-            const eq = std.mem.indexOfScalar(u8, seg, '=') orelse {
+            const eq = std.mem.findScalar(u8, seg, '=') orelse {
                 // Valueless parameter (rare) — return with an empty value.
                 const name = std.mem.trim(u8, seg, " \t");
                 if (name.len == 0) continue;
@@ -339,11 +339,11 @@ pub const UrlEncodedIterator = struct {
     pub fn next(it: *UrlEncodedIterator) ?FormPair {
         while (true) {
             if (it.rest.len == 0) return null;
-            const amp = std.mem.indexOfScalar(u8, it.rest, '&') orelse it.rest.len;
+            const amp = std.mem.findScalar(u8, it.rest, '&') orelse it.rest.len;
             var field = it.rest[0..amp];
             it.rest = if (amp < it.rest.len) it.rest[amp + 1 ..] else it.rest[it.rest.len..];
             if (field.len == 0) continue; // skip empty pairs ("a=1&&b=2")
-            const eq = std.mem.indexOfScalar(u8, field, '=');
+            const eq = std.mem.findScalar(u8, field, '=');
             if (eq) |e| {
                 const name = decodeInPlace(field[0..e]);
                 const value = decodeInPlace(field[e + 1 ..]);

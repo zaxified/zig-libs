@@ -121,7 +121,7 @@ pub const Acl = struct {
             line_out.* = lineno;
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
-            const kw_end = std.mem.indexOfAny(u8, line, " \t") orelse line.len;
+            const kw_end = std.mem.findAny(u8, line, " \t") orelse line.len;
             const kw = line[0..kw_end];
             const rest = std.mem.trim(u8, line[kw_end..], " \t");
             if (std.mem.eql(u8, kw, "user")) {
@@ -131,7 +131,7 @@ pub const Acl = struct {
                 if (rest.len == 0) return error.MissingArgument;
                 var access: Access = .readwrite;
                 var topic = rest;
-                const w_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+                const w_end = std.mem.findAny(u8, rest, " \t") orelse rest.len;
                 if (w_end < rest.len) if (std.meta.stringToEnum(Access, rest[0..w_end])) |a| {
                     access = a;
                     topic = std.mem.trim(u8, rest[w_end..], " \t");
@@ -190,28 +190,28 @@ pub fn authorize(ctx: ?*anyopaque, req: broker.AclRequest) bool {
 }
 
 fn plainName(s: []const u8) bool {
-    return s.len > 0 and std.mem.indexOfAny(u8, s, "/+#") == null;
+    return s.len > 0 and std.mem.findAny(u8, s, "/+#") == null;
 }
 
 /// Does this pattern use a substitution whose value (present, but empty or
 /// holding `/ + #`) cannot be put into a topic safely?
 fn patternRefused(r: Rule, req: broker.AclRequest) bool {
-    if (std.mem.indexOf(u8, r.topic, "%u") != null) {
+    if (std.mem.find(u8, r.topic, "%u") != null) {
         if (req.username) |u| if (!plainName(u)) return true;
     }
-    if (std.mem.indexOf(u8, r.topic, "%c") != null and !plainName(req.client_id)) return true;
+    if (std.mem.find(u8, r.topic, "%c") != null and !plainName(req.client_id)) return true;
     return false;
 }
 
 fn ruleMatches(r: Rule, req: broker.AclRequest, overlap: bool) bool {
     if (r.scope != .pattern) return if (overlap) overlaps(r.topic, req.topic, null) else covers(r.topic, req.topic, null);
     var subst = Subst{ .username = "", .client_id = "" };
-    if (std.mem.indexOf(u8, r.topic, "%u") != null) {
+    if (std.mem.find(u8, r.topic, "%u") != null) {
         const u = req.username orelse return false;
         if (!plainName(u)) return false;
         subst.username = u;
     }
-    if (std.mem.indexOf(u8, r.topic, "%c") != null) {
+    if (std.mem.find(u8, r.topic, "%c") != null) {
         if (!plainName(req.client_id)) return false;
         subst.client_id = req.client_id;
     }
@@ -361,7 +361,7 @@ fn formatHashBody(out: []u8, password: []const u8, salt: []const u8, iterations:
     var hash_b64: [b64ct.standard.encodedLen(hash_len)]u8 = undefined;
     const s = b64ct.standard.encode(&salt_b64, salt);
     const h = b64ct.standard.encode(&hash_b64, &dk);
-    return std.fmt.bufPrint(out, "$7${d}${s}${s}", .{ iterations, s, h });
+    return std.mem.print(out, "$7${d}${s}${s}", .{ iterations, s, h });
 }
 
 pub const Passwords = struct {
@@ -383,7 +383,7 @@ pub const Passwords = struct {
         while (lines.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0) continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidEntry;
+            const colon = std.mem.findScalar(u8, line, ':') orelse return error.InvalidEntry;
             if (colon == 0) return error.InvalidEntry;
             const hash = line[colon + 1 ..];
             if (parseHash(hash) == null) return error.InvalidEntry;
@@ -600,7 +600,7 @@ test "acl: an access word alone is a topic name; too many rules; CRLF" {
 fn makeLine(out: []u8, user: []const u8, password: []const u8, salt: []const u8, iterations: u32) ![]u8 {
     var h: [200]u8 = undefined;
     const hash = try formatHash(&h, password, salt, iterations);
-    return std.fmt.bufPrint(out, "{s}:{s}\n", .{ user, hash });
+    return std.mem.print(out, "{s}:{s}\n", .{ user, hash });
 }
 
 test "passwords: ok, wrong, unknown user, no password, anonymous" {
@@ -701,7 +701,7 @@ test "passwords: the stored format and file errors" {
     try testing.expect(derive(&dk, "password", "salt", 1));
     const want = "867f70cf1ade02cff3752599a3a53dc4af34c7a669815ae5d513554e1c8cf252c02d470a285a0501bad999bfe943c08f050235d7d68b1da55e63f73b60a57fce";
     var hex: [128]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{&dk}) catch unreachable;
+    _ = std.mem.print(&hex, "{x}", .{&dk}) catch unreachable;
     try testing.expectEqualStrings(want, &hex);
 
     var e: [2]Entry = undefined;
@@ -711,7 +711,7 @@ test "passwords: the stored format and file errors" {
     try testing.expectError(error.InvalidEntry, Passwords.parse("alice:$7$0$MDEyMzQ1Njc4OWFi$x\n", &e));
     try testing.expectError(error.InvalidEntry, Passwords.parse("alice:$7$99999999$MDEyMzQ1Njc4OWFi$x\n", &e));
     var line: [512]u8 = undefined;
-    const ok = try std.fmt.bufPrint(&line, "a:{s}\nb:{s}\nc:{s}\n", .{ hash, hash, hash });
+    const ok = try std.mem.print(&line, "a:{s}\nb:{s}\nc:{s}\n", .{ hash, hash, hash });
     try testing.expectError(error.TooManyEntries, Passwords.parse(ok, &e));
     try testing.expectError(error.InvalidParameters, formatHash(&h, "pw", "", 101));
 }
@@ -842,7 +842,7 @@ test "review M4: an unknown user is charged the table's iteration count; a signe
     var h: [200]u8 = undefined;
     const slow = try formatHash(&h, "pw", "0123456789ab", 7);
     var text: [300]u8 = undefined;
-    const line = try std.fmt.bufPrint(&text, "u:{s}\n", .{slow});
+    const line = try std.mem.print(&text, "u:{s}\n", .{slow});
     var e: [2]Entry = undefined;
     const pw = try Passwords.parse(line, &e);
     try testing.expectEqual(@as(u32, 7), pw.dummyIterations());
@@ -851,6 +851,6 @@ test "review M4: an unknown user is charged the table's iteration count; a signe
     try testing.expect(!pw.verify("nobody", "pw"));
     // "+7" parsed as 7 before
     var signed_buf: [300]u8 = undefined;
-    const signed = try std.fmt.bufPrint(&signed_buf, "u:$7$+7${s}\n", .{slow["$7$7$".len..]});
+    const signed = try std.mem.print(&signed_buf, "u:$7$+7${s}\n", .{slow["$7$7$".len..]});
     try testing.expectError(error.InvalidEntry, Passwords.parse(signed, &e));
 }

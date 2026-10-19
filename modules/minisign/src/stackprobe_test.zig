@@ -568,7 +568,7 @@ test "STACKPROBE: no key, nonce, key-stream or password residue after minisign k
             ed25519KeyNeedles(&n, kp);
             // The base64 body of the key file (second line).
             const body = cur_text[0..cur_text_len];
-            const nl = std.mem.indexOfScalar(u8, body, '\n').?;
+            const nl = std.mem.findScalar(u8, body, '\n').?;
             n.addImage("file b64", std.mem.trimEnd(u8, body[nl + 1 ..], "\n"));
             n.sort();
             bad += try runProbe("parseSecretKeyFile", callParse, &n, false);

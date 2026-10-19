@@ -394,7 +394,7 @@ pub const Cache = struct {
         /// write-TTL deadline and the idle deadline) — the ordering key of the
         /// expiry heap. Meaningful only while `exp_idx != not_queued`.
         deadline: i64 = 0,
-        /// Links in `Cache.lru[@intFromEnum(region)]`, meaningful
+        /// Links in `Cache.lru[@backingInt(region)]`, meaningful
         /// only while `queued`. Not queued while the entry is deliberately out
         /// of the index (borrowed — see `pins` — or doomed).
         prev: ?*Node = null,
@@ -1932,7 +1932,7 @@ test "an update-only workload never grows past max_bytes (replace runs maintenan
     for (rounds) |vlen| {
         var i: usize = 0;
         while (i < 32) : (i += 1) {
-            const key = std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable;
+            const key = std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable;
             now += 1;
             c.put(key, val[0..vlen], now, 0, 0);
             // The bound, checked after every single write — not just at the end.
@@ -2025,14 +2025,14 @@ test "miss churn sheds the index's tombstones: the map is rebuilt, every live ke
     defer c.deinit();
     var k: [16]u8 = undefined;
     for (0..4096) |i| {
-        c.put(std.fmt.bufPrint(&k, "key{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+        c.put(std.mem.print(&k, "key{d}", .{i}) catch unreachable, "v", 0, 0, 0);
     }
     try testing.expect(c.stats.rehashes >= 1);
     try testing.expect(c.stats.rehashes <= 4096 / 32);
     // The rebuild kept the live set intact: the newest keys are resident.
     var live: usize = 0;
     for (4096 - 8..4096) |i| {
-        if (c.get(std.fmt.bufPrint(&k, "key{d}", .{i}) catch unreachable, 0, 0)) |v| {
+        if (c.get(std.mem.print(&k, "key{d}", .{i}) catch unreachable, 0, 0)) |v| {
             try testing.expectEqualStrings("v", v);
             live += 1;
         }
@@ -2055,7 +2055,7 @@ test "borrow: a pinned entry is never chosen as an eviction victim" {
 
     for (0..64) |i| {
         var k: [8]u8 = undefined;
-        c.put(std.fmt.bufPrint(&k, "cold{d}", .{i}) catch unreachable, "BBBB", 0, 0, 0);
+        c.put(std.mem.print(&k, "cold{d}", .{i}) catch unreachable, "BBBB", 0, 0, 0);
     }
     // Still resident, still its own bytes.
     try testing.expectEqualStrings("AAAA", c.get("hot", 0, 0).?);
@@ -3387,7 +3387,7 @@ test "sketch: CMS never underestimates under collision load" {
     var kbuf: [16]u8 = undefined;
     var k: usize = 0;
     while (k < 40) : (k += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "other{d}", .{k}) catch unreachable;
+        const key = std.mem.print(&kbuf, "other{d}", .{k}) catch unreachable;
         s.record(key);
     }
     try testing.expect(s.estimate("hot") >= 7);
@@ -3446,28 +3446,28 @@ test "scan resistance: a burst of one-hit keys does not evict the hot set" {
     // Establish a hot set of 20 keys with 10 hits each.
     var i: usize = 0;
     while (i < 20) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "hot{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "hot{d}", .{i}) catch unreachable;
         c.put(key, "hotval", 0, 0, 0);
     }
     var round: usize = 0;
     while (round < 10) : (round += 1) {
         i = 0;
         while (i < 20) : (i += 1) {
-            const key = std.fmt.bufPrint(&kbuf, "hot{d}", .{i}) catch unreachable;
+            const key = std.mem.print(&kbuf, "hot{d}", .{i}) catch unreachable;
             try testing.expect(c.get(key, 1, 0) != null);
         }
     }
     // Scan burst: 150 distinct keys, each seen exactly once (get-miss + put).
     i = 0;
     while (i < 150) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "scan{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "scan{d}", .{i}) catch unreachable;
         try testing.expect(c.get(key, 2, 0) == null);
         c.put(key, "scanval", 2, 0, 0);
     }
     // Every hot key must have survived the scan.
     i = 0;
     while (i < 20) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "hot{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "hot{d}", .{i}) catch unreachable;
         try testing.expect(c.get(key, 3, 0) != null);
     }
     try testing.expect(c.stats.rejections > 0); // the gate actually did the work
@@ -3565,7 +3565,7 @@ test "hit-ratio benchmark: W-TinyLFU beats plain LRU on a skewed trace" {
         const id: u64 = @intFromFloat(u * u * u * @as(f64, @floatFromInt(universe)));
 
         // W-TinyLFU cache under test
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{id}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{id}) catch unreachable;
         if (c.get(key, 0, 0) == null) c.put(key, "v", 0, 0, 0);
 
         // LRU baseline
@@ -3666,16 +3666,16 @@ test "region sizes: the window is ~1% and the protected segment 80% of the main 
     defer c.deinit();
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
-    while (i < 10) : (i += 1) c.put(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+    while (i < 10) : (i += 1) c.put(std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
     try testing.expectEqual(@as(usize, 3), c.window_count); // 300 / 100
     try testing.expectEqual(@as(usize, 7), c.probation_count);
 
     var d = testCache(1 << 20, 100);
     defer d.deinit();
     i = 0;
-    while (i < 100) : (i += 1) d.put(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+    while (i < 100) : (i += 1) d.put(std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable, "v", 0, 0, 0);
     i = 0;
-    while (i < 100) : (i += 1) _ = d.get(std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable, 1, 0);
+    while (i < 100) : (i += 1) _ = d.get(std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable, 1, 0);
     // window 1, main 99, protected cap 99 * 4 / 5 = 79; the rest demoted to probation.
     try testing.expectEqual(@as(usize, 1), d.window_count);
     try testing.expectEqual(@as(usize, 79), d.protected_count);
@@ -3826,7 +3826,7 @@ test "random put/get/remove/replace sequences keep every region queue and the ex
     while (step < 4000) : (step += 1) {
         state = state *% 6364136223846793005 +% 1442695040888963407;
         const r = state >> 33;
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{r % 48}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{r % 48}) catch unreachable;
         now += @intCast(r % 7);
         switch ((r >> 8) % 5) {
             0, 1 => c.put(key, "v", now, if ((r >> 12) % 3 == 0) 0 else @as(i64, @intCast(20 + (r >> 14) % 400)), 0),
@@ -3968,7 +3968,7 @@ test "idle ttl: random put/get/remove sequences agree with a naive model of writ
         const r = state >> 33;
         now += @intCast(r % 6);
         const ki: usize = @intCast((r >> 5) % nkeys);
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{ki}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{ki}) catch unreachable;
         const m = &model[ki];
         switch ((r >> 12) % 5) {
             0, 1 => {
@@ -4074,7 +4074,7 @@ test "adaptive_window off (the default): the window stays ~1 % and the climber n
     defer c.deinit();
     var kbuf: [16]u8 = undefined;
     for (0..20_000) |i| {
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{(i * 7919) % 900}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{(i * 7919) % 900}) catch unreachable;
         if (c.get(key, 0, 0) == null) c.put(key, "v", 0, 0, 0);
     }
     try testing.expectEqual(@as(u64, 0), c.climbs);
@@ -4113,7 +4113,7 @@ test "adaptive window: random get/put/remove keep every structural invariant whi
         state = state *% 6364136223846793005 +% 1442695040888963407;
         const r = state >> 33;
         now += @intCast(r % 3);
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{(r >> 4) % 300}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{(r >> 4) % 300}) catch unreachable;
         switch ((r >> 20) % 10) {
             0, 1 => c.put(key, "v", now, if ((r >> 24) % 4 == 0) 150 else 0, 0),
             2 => _ = c.remove(key),
@@ -4185,7 +4185,7 @@ fn replayTrace(kind: TraceKind, adaptive: bool) !TraceResult {
                 break :blk lo;
             },
         };
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{id}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{id}) catch unreachable;
         if (c.get(key, 0, 0) != null) {
             hits += 1;
             if (i >= ops / 2) late_hits += 1;

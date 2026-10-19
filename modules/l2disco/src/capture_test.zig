@@ -377,7 +377,7 @@ test "real capture: Ubuntu/lldpd LLDPDU decodes — chassis, port, caps, dual mg
     const o3 = (try org.next()).?; // the MUD-URL TLV, OUI 00:00:5e (IANA)
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0x5e }, &o3.oui);
     try testing.expectEqual(@as(?lldp.OrgValue, null), o3.decode()); // unmodelled OUI entirely
-    try testing.expect(std.mem.indexOf(u8, o3.info, "https://imright.mud.example.com") != null);
+    try testing.expect(std.mem.find(u8, o3.info, "https://imright.mud.example.com") != null);
 
     try testing.expectEqual(@as(?lldp.OrgSpecific, null), try org.next());
 }

@@ -95,7 +95,7 @@ pub const Iterator = struct {
             // Split on the FIRST `=`; no `=` → valueless cookie.
             var name: []const u8 = undefined;
             var value: []const u8 = undefined;
-            if (std.mem.indexOfScalar(u8, segment, '=')) |eq| {
+            if (std.mem.findScalar(u8, segment, '=')) |eq| {
                 name = std.mem.trim(u8, segment[0..eq], ows);
                 value = std.mem.trim(u8, segment[eq + 1 ..], ows);
             } else {
@@ -764,7 +764,7 @@ test "get + set over serveStream" {
     // get() read the "session" cookie out of the multi-cookie header.
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nabc"));
     // set() emitted the Set-Cookie with attributes.
-    try testing.expect(std.mem.indexOf(u8, got, "Set-Cookie: session=s3; Path=/; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "Set-Cookie: session=s3; Path=/; Secure; HttpOnly; SameSite=Lax\r\n") != null);
 }
 
 /// The handler half of the dead-frame test below: build a cookie name and
@@ -780,8 +780,8 @@ noinline fn setFromDeadFrame(res: *http.Server.ResponseWriter) !void {
     var name_buf: [32]u8 = undefined;
     var value_buf: [32]u8 = undefined;
     try set(res, .{
-        .name = try std.fmt.bufPrint(&name_buf, "sid{d}", .{9}),
-        .value = try std.fmt.bufPrint(&value_buf, "{d}", .{4242}),
+        .name = try std.mem.print(&name_buf, "sid{d}", .{9}),
+        .value = try std.mem.print(&value_buf, "{d}", .{4242}),
         .path = "/",
         .http_only = true,
     });
@@ -821,9 +821,9 @@ test "set: the cookie outlives the frame it was formatted in" {
     const wire = out.buffered();
 
     // Read back off the wire after every byte of its source was overwritten.
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: sid9=4242; Path=/; HttpOnly\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: sid9=4242; Path=/; HttpOnly\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+    try testing.expect(std.mem.find(u8, wire, "#") == null);
 }
 
 test "set: two cookies in one response are two Set-Cookie lines" {
@@ -840,8 +840,8 @@ test "set: two cookies in one response are two Set-Cookie lines" {
     try set(&rw, .{ .name = "csrf", .value = "2", .path = "/" });
     try rw.end();
     const wire = out.buffered();
-    const first = std.mem.indexOf(u8, wire, "Set-Cookie: sid=1; Path=/; HttpOnly\r\n") orelse return error.TestExpectedSid;
-    const second = std.mem.indexOf(u8, wire, "Set-Cookie: csrf=2; Path=/\r\n") orelse return error.TestExpectedCsrf;
+    const first = std.mem.find(u8, wire, "Set-Cookie: sid=1; Path=/; HttpOnly\r\n") orelse return error.TestExpectedSid;
+    const second = std.mem.find(u8, wire, "Set-Cookie: csrf=2; Path=/\r\n") orelse return error.TestExpectedCsrf;
     try testing.expect(first < second); // call order
 }
 
@@ -881,8 +881,8 @@ test "set: an over-long cookie is refused, not truncated" {
     try set(&rw, .{ .name = "n", .value = "v" });
     try rw.end();
     const wire = out.buffered();
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: n=v\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, wire, "x") == null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: n=v\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "x") == null);
 
     // The other refusal a caller can meet is the writer's own copy budget,
     // shared by every header of the response: a cookie that fits the buffer
@@ -996,7 +996,7 @@ test "corpus: every cookie seed reaches the scanner, and the segments yielded ar
         var it = parse(buf[0..len]);
         while (it.next()) |c| {
             yielded += 1;
-            if (std.mem.indexOfScalar(u8, c.value, ';') != null) quoted += 1;
+            if (std.mem.findScalar(u8, c.value, ';') != null) quoted += 1;
         }
     }
     // Measured 2026-09-07. Before: 1 round, 0 non-empty, 0 cookies yielded,

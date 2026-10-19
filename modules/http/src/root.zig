@@ -310,22 +310,22 @@ pub const Url = struct {
             rest = text["https://".len..];
         } else return error.UnsupportedScheme;
 
-        const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+        const authority_end = std.mem.findAny(u8, rest, "/?#") orelse rest.len;
         const authority = rest[0..authority_end];
         if (authority.len == 0) return error.BadUrl;
-        if (std.mem.indexOfScalar(u8, authority, '@') != null) return error.BadUrl; // userinfo unsupported
+        if (std.mem.findScalar(u8, authority, '@') != null) return error.BadUrl; // userinfo unsupported
 
         var host: []const u8 = undefined;
         var port: ?u16 = null;
         if (authority[0] == '[') {
-            const close = std.mem.indexOfScalar(u8, authority, ']') orelse return error.BadUrl;
+            const close = std.mem.findScalar(u8, authority, ']') orelse return error.BadUrl;
             host = authority[1..close];
             if (netaddr.parseIp6(host) == null) return error.BadUrl;
             if (close + 1 < authority.len) {
                 if (authority[close + 1] != ':') return error.BadUrl;
                 port = parsePort(authority[close + 2 ..]) orelse return error.BadUrl;
             }
-        } else if (std.mem.indexOfScalar(u8, authority, ':') != null) {
+        } else if (std.mem.findScalar(u8, authority, ':') != null) {
             const hp = netaddr.parseHostPort(authority) orelse return error.BadUrl;
             host = hp.host;
             port = hp.port;
@@ -335,10 +335,10 @@ pub const Url = struct {
         if (host.len == 0) return error.BadUrl;
 
         var target = rest[authority_end..];
-        if (std.mem.indexOfScalar(u8, target, '#')) |i| target = target[0..i];
+        if (std.mem.findScalar(u8, target, '#')) |i| target = target[0..i];
         var path: []const u8 = target;
         var query: []const u8 = "";
-        if (std.mem.indexOfScalar(u8, target, '?')) |i| {
+        if (std.mem.findScalar(u8, target, '?')) |i| {
             path = target[0..i];
             query = target[i + 1 ..];
         }
@@ -435,8 +435,8 @@ pub fn resolveLocation(base: Url, location: []const u8, out: []u8) ResolveError!
     }
 
     // Relative path: merge with the base path's directory, then clean.
-    const loc_path_end = std.mem.indexOfAny(u8, location, "?#") orelse location.len;
-    const dir_len = if (std.mem.lastIndexOfScalar(u8, base.path, '/')) |i| i + 1 else 0;
+    const loc_path_end = std.mem.findAny(u8, location, "?#") orelse location.len;
+    const dir_len = if (std.mem.findScalarLast(u8, base.path, '/')) |i| i + 1 else 0;
     var merged: [max_merged_path]u8 = undefined;
     const total = dir_len + loc_path_end;
     if (total > merged.len) return error.RedirectTooLong;

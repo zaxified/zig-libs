@@ -220,7 +220,7 @@ fn dump(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !u
         std.debug.print("raft-kv: {s}: {t}\n", .{ addr.?, err });
         return failure_exit;
     };
-    if (resp.len < 14 or resp[0] != @intFromEnum(wire.Resp.dump)) {
+    if (resp.len < 14 or resp[0] != @backingInt(wire.Resp.dump)) {
         std.debug.print("raft-kv: malformed dump reply\n", .{});
         return failure_exit;
     }
@@ -288,7 +288,7 @@ fn status(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
             try out.print("node {d}  {s}  DOWN ({t})\n", .{ i, addr, err });
             continue;
         };
-        if (resp.len < 14 or resp[0] != @intFromEnum(wire.Resp.dump)) {
+        if (resp.len < 14 or resp[0] != @backingInt(wire.Resp.dump)) {
             try out.print("node {d}  {s}  malformed reply\n", .{ i, addr });
             continue;
         }
@@ -312,7 +312,7 @@ fn status(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
 
 fn exchangeAddr(gpa: std.mem.Allocator, io: std.Io, addr_text: []const u8, frame: []const u8, resp_buf: []u8) ![]u8 {
     _ = gpa;
-    const colon = std.mem.lastIndexOfScalar(u8, addr_text, ':') orelse return error.BadAddress;
+    const colon = std.mem.findScalarLast(u8, addr_text, ':') orelse return error.BadAddress;
     const port = std.fmt.parseInt(u16, addr_text[colon + 1 ..], 10) catch return error.BadAddress;
     const addr = std.Io.net.IpAddress.parse(addr_text[0..colon], port) catch return error.BadAddress;
     var stream = try addr.connect(io, .{ .mode = .stream });

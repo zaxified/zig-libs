@@ -52,7 +52,7 @@ pub const Kind = enum(u8) {
 
     fn from(byte: u8) ?Kind {
         return switch (byte) {
-            1...9 => @enumFromInt(byte),
+            1...9 => @fromBackingInt(@intCast(byte)),
             else => null,
         };
     }
@@ -94,7 +94,7 @@ fn takeField(rest: *[]const u8) Error![]const u8 {
 pub fn encodeAlloc(gpa: std.mem.Allocator, frame: Frame) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    try list.append(gpa, @intFromEnum(frame.kind));
+    try list.append(gpa, @backingInt(frame.kind));
     try putField(&list, gpa, frame.name);
     try putField(&list, gpa, frame.group);
     try putField(&list, gpa, frame.msg);

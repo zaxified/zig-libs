@@ -95,7 +95,7 @@ fn globMatch(pattern: []const u8, name: []const u8) bool {
 /// `|1|salt|hash` against `name`: HMAC-SHA1 keyed with the salt.
 fn hashedMatch(entry: []const u8, name: []const u8) bool {
     const rest = entry["|1|".len..];
-    const bar = std.mem.indexOfScalar(u8, rest, '|') orelse return false;
+    const bar = std.mem.findScalar(u8, rest, '|') orelse return false;
     var salt: [64]u8 = undefined;
     var want: [HmacSha1.mac_length]u8 = undefined;
     const s_len = b64.Decoder.calcSizeForSlice(rest[0..bar]) catch return false;
@@ -134,7 +134,7 @@ pub fn parseLine(line_in: []const u8, blob_buf: []u8) LineError!Entry {
     if (line.len == 0 or line[0] == '#') return error.InvalidLine;
     var marker: Marker = .none;
     if (line[0] == '@') {
-        const end = std.mem.indexOfAny(u8, line, " \t") orelse return error.InvalidLine;
+        const end = std.mem.findAny(u8, line, " \t") orelse return error.InvalidLine;
         const word = line[0..end];
         marker = if (std.mem.eql(u8, word, "@revoked"))
             .revoked
@@ -144,7 +144,7 @@ pub fn parseLine(line_in: []const u8, blob_buf: []u8) LineError!Entry {
             return error.InvalidLine;
         line = std.mem.trimStart(u8, line[end..], " \t");
     }
-    const end = std.mem.indexOfAny(u8, line, " \t") orelse return error.InvalidLine;
+    const end = std.mem.findAny(u8, line, " \t") orelse return error.InvalidLine;
     // `keys.parseAuthorizedKeyLine` would also accept an options field here;
     // the rest of a known_hosts line is exactly `keytype base64 [comment]`.
     const fields = std.mem.trimStart(u8, line[end..], " \t");
@@ -167,7 +167,7 @@ pub const Iterator = struct {
 
     pub fn next(self: *Iterator, blob_buf: []u8) ?Entry {
         while (self.rest.len != 0) {
-            const end = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+            const end = std.mem.findScalar(u8, self.rest, '\n') orelse self.rest.len;
             const line = self.rest[0..end];
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else self.rest[self.rest.len..];
             self.line_number += 1;

@@ -239,7 +239,7 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     defer client.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const hello_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello?name=selfdemo", .{port}) catch unreachable;
+    const hello_url = std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello?name=selfdemo", .{port}) catch unreachable;
 
     // ── request 1: GET /hello — the positive path, every field asserted ────
     var res = client.request(.get, hello_url, .{}) catch |err| {
@@ -260,12 +260,12 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     defer gpa.free(body);
     res.deinit();
     if (!std.mem.startsWith(u8, body, "hello, GET /hello?name=selfdemo\n")) @panic("http-demo self-demo: /hello body prefix mismatch");
-    if (std.mem.indexOf(u8, body, "query:      name=selfdemo\n") == null) {
+    if (std.mem.find(u8, body, "query:      name=selfdemo\n") == null) {
         @panic("http-demo self-demo: /hello did not echo the query string");
     }
     // `Client.Options.user_agent` reached the wire. Asserted on BOTH protocols
     // (leg 3 repeats it over h2c) because it once reached only one of them.
-    if (std.mem.indexOf(u8, body, selfdemo_ua_line) == null) {
+    if (std.mem.find(u8, body, selfdemo_ua_line) == null) {
         @panic("http-demo self-demo: /hello did not see the client's User-Agent over h1");
     }
 
@@ -279,7 +279,7 @@ fn runSelfDemo(gpa: Allocator, io: std.Io) !u8 {
     // same host:port), and the server closing it is what makes `--once`'s
     // "one connection served" true and ends the accept loop below. ────────
     var trunc_url_buf: [64]u8 = undefined;
-    const trunc_url = std.fmt.bufPrint(&trunc_url_buf, "http://127.0.0.1:{d}/truncate", .{port}) catch unreachable;
+    const trunc_url = std.mem.print(&trunc_url_buf, "http://127.0.0.1:{d}/truncate", .{port}) catch unreachable;
     var res2 = client.request(.get, trunc_url, .{}) catch |err| {
         std.debug.print("http-demo self-demo: opening /truncate failed: {t}\n", .{err});
         return local_failure_exit;
@@ -376,10 +376,10 @@ fn runSelfDemoH2c(gpa: Allocator, client: *http.Client, port: u16) u8 {
     if (res_a.status != 200 or res_b.status != 200) @panic("http-demo self-demo: h2c /hello did not answer 200");
     // Each response carries its OWN query back — collected in reverse, so a
     // demux that mixed the two would land here.
-    if (std.mem.indexOf(u8, res_a.body, "query:      name=h2c-a\n") == null) {
+    if (std.mem.find(u8, res_a.body, "query:      name=h2c-a\n") == null) {
         @panic("http-demo self-demo: h2c stream a came back with the wrong body");
     }
-    if (std.mem.indexOf(u8, res_b.body, "query:      name=h2c-b\n") == null) {
+    if (std.mem.find(u8, res_b.body, "query:      name=h2c-b\n") == null) {
         @panic("http-demo self-demo: h2c stream b came back with the wrong body");
     }
     // Header names arrive lowercase over h2 (RFC 9113 §8.2.1) and `header` is
@@ -391,7 +391,7 @@ fn runSelfDemoH2c(gpa: Allocator, client: *http.Client, port: u16) u8 {
     // The client-wide `Options.user_agent` on the OTHER protocol. This is the
     // assertion the ⚠ MODULE GAP note in `runClientH2c` used to describe as
     // unmet: it printed `user-agent: null` here while h1 printed the option.
-    if (std.mem.indexOf(u8, res_a.body, selfdemo_ua_line) == null) {
+    if (std.mem.find(u8, res_a.body, selfdemo_ua_line) == null) {
         @panic("http-demo self-demo: the client's User-Agent did not reach the h2c request");
     }
     return 0;
@@ -413,7 +413,7 @@ fn runSelfDemoCancel(io: std.Io, client: *http.Client, port: u16) u8 {
     const cancel_after_ms = 120;
 
     var url_buf: [96]u8 = undefined;
-    const slow_url = std.fmt.bufPrint(
+    const slow_url = std.mem.print(
         &url_buf,
         "http://127.0.0.1:{d}/slow?ms={d}&n={d}",
         .{ port, slow_gap_ms, slow_chunks },
@@ -683,7 +683,7 @@ fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!v
     rw.setStatus(404);
     try rw.setHeader("Content-Type", "text/plain");
     var buf: [256]u8 = undefined;
-    try rw.writeAll(try std.fmt.bufPrint(&buf,
+    try rw.writeAll(try std.mem.print(&buf,
         \\404 no such route: {s}
         \\try / for the list
         \\
@@ -707,7 +707,7 @@ fn serveIndex(state: *ServerState, rw: *http.Server.ResponseWriter) !void {
         \\
     );
     var buf: [256]u8 = undefined;
-    try rw.writeAll(try std.fmt.bufPrint(&buf,
+    try rw.writeAll(try std.mem.print(&buf,
         \\
         \\This listener speaks: HTTP/1.1{s}.
         \\It does not speak https — see the startup banner for why that is the
@@ -752,10 +752,10 @@ fn serveHeaders(req: *http.Server.Request, rw: *http.Server.ResponseWriter) !voi
         // peer typed them over h1. Printing them verbatim is the point — it
         // is the one place the protocol difference is honestly visible, and
         // it is why `Request.header` is case-insensitive.
-        try rw.writeAll(try std.fmt.bufPrint(&buf, "{s}: {s}\n", .{ entry.name, entry.value }));
+        try rw.writeAll(try std.mem.print(&buf, "{s}: {s}\n", .{ entry.name, entry.value }));
     }
     var tail: [64]u8 = undefined;
-    try rw.writeAll(try std.fmt.bufPrint(&tail, "\n{d} header field(s)\n", .{n}));
+    try rw.writeAll(try std.mem.print(&tail, "\n{d} header field(s)\n", .{n}));
 }
 
 fn serveEcho(req: *http.Server.Request, rw: *http.Server.ResponseWriter) !void {
@@ -813,7 +813,7 @@ fn serveSlow(state: *ServerState, req: *http.Server.Request, rw: *http.Server.Re
     while (i < chunks) : (i += 1) {
         try state.io.sleep(.fromMilliseconds(gap_ms), .awake);
         var buf: [64]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&buf, "chunk {d}/{d}\n", .{ i + 1, chunks }));
+        try rw.writeAll(try std.mem.print(&buf, "chunk {d}/{d}\n", .{ i + 1, chunks }));
         try rw.flush();
     }
 }
@@ -850,7 +850,7 @@ fn serveTruncate(rw: *http.Server.ResponseWriter) !void {
 fn queryInt(query: []const u8, name: []const u8) ?u64 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
         if (!std.mem.eql(u8, pair[0..eq], name)) continue;
         return std.fmt.parseInt(u64, pair[eq + 1 ..], 10) catch null;
     }
@@ -958,7 +958,7 @@ fn parseClientArgs(gpa: Allocator, args: *std.process.Args.Iterator) !ClientOpti
             if (!method_given) opts.method = .post;
         } else if (std.mem.eql(u8, arg, "-H")) {
             const text = try nextValue(args, "-H");
-            const colon = std.mem.indexOfScalar(u8, text, ':') orelse {
+            const colon = std.mem.findScalar(u8, text, ':') orelse {
                 std.debug.print("http-demo: -H wants \"Name: value\", got '{s}'\n", .{text});
                 return error.BadUsage;
             };
@@ -1249,7 +1249,7 @@ fn runClientH2c(gpa: Allocator, client: *http.Client, url: http.Url, opts: *cons
     const target = if (url.query.len == 0)
         url.path
     else
-        try std.fmt.bufPrint(&target_buf, "{s}?{s}", .{ url.path, url.query });
+        try std.mem.print(&target_buf, "{s}?{s}", .{ url.path, url.query });
 
     // The multiplexing is the point, so every stream is OPENED before any is
     // collected. One connection, `--repeat` requests in flight at once,

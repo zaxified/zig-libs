@@ -128,7 +128,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         .padding = if (eo.pad) .forbidden else .required,
         .case = .insensitive,
     };
-    if (if (eo.pad) std.mem.indexOfScalar(u8, text, '=') != null else text.len % 8 != 0) {
+    if (if (eo.pad) std.mem.findScalar(u8, text, '=') != null else text.len % 8 != 0) {
         if (b32.decode(&out, text, wrong)) |_| return error.WrongPaddingModeAccepted else |_| {}
     }
 
@@ -140,7 +140,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     @memcpy(copy[0..text.len], text);
     const syms: []const u8 = if (eo.alphabet == .std) "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567" else "0123456789ABCDEFGHIJKLMNOPQRSTUV";
     const at = src.index(data_len);
-    const cur = std.mem.indexOfScalar(u8, syms, std.ascii.toUpper(text[at])).?;
+    const cur = std.mem.findScalar(u8, syms, std.ascii.toUpper(text[at])).?;
     const next = syms[(cur + 1 + src.index(syms.len - 1)) % syms.len];
     copy[at] = if (eo.lowercase) std.ascii.toLower(next) else next;
     if (b32.decode(&out, copy[0..text.len], dopts)) |k| {

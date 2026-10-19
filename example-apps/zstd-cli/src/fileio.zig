@@ -410,7 +410,7 @@ fn requireConfirmation(env: Env, prompt: []const u8, abort_msg: []const u8, lett
     var one: [1]u8 = undefined;
     const n = File.stdin().readStreaming(env.io, &.{&one}) catch 0;
     var abort = true;
-    if (n == 1 and std.mem.indexOfScalar(u8, letters, one[0]) != null) abort = false;
+    if (n == 1 and std.mem.findScalar(u8, letters, one[0]) != null) abort = false;
     if (abort) disp.always("{s} \n", .{abort_msg});
     // flush the rest of the line
     var ch = one[0];
@@ -470,12 +470,12 @@ fn adjustParamsForPatchFrom(prefs: *Prefs, cp: *CParams, dict_size: u64, max_src
         disp.at(1, "Max window log exceeded by file (compression ratio will suffer)\n", .{});
     cp.window_log = @max(L.window_log_min, @min(L.window_log_max, file_window_log));
     // `ZSTD_cycleLog`
-    const cycle_log = d.chain_log - @intFromBool(@intFromEnum(d.strategy) >= @intFromEnum(zstd.Strategy.btlazy2));
+    const cycle_log = d.chain_log - @intFromBool(@backingInt(d.strategy) >= @backingInt(zstd.Strategy.btlazy2));
     if (file_window_log > cycle_log) {
         if (!prefs.ldm) disp.at(2, "long mode automatically triggered\n", .{});
         prefs.ldm = true;
     }
-    if (@intFromEnum(d.strategy) >= @intFromEnum(zstd.Strategy.btopt)) {
+    if (@backingInt(d.strategy) >= @backingInt(zstd.Strategy.btopt)) {
         disp.at(4, "[Optimal parser notes] Consider the following to improve patch size at the cost of speed:\n", .{});
         disp.at(4, "- Set a larger targetLength (e.g. --zstd=targetLength=4096)\n", .{});
         disp.at(4, "- Set a larger chainLog (e.g. --zstd=chainLog={d})\n", .{L.chain_log_max});
@@ -657,7 +657,7 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
             // speed is faster than consumption rate
             if (old_ipos == in.pos) adapt.input_blocked += 1;
             if (to_flush_now == 0) adapt.flush_waiting = true;
-            disp.at(6, "ZSTD_compress_generic(end:{d}) => input pos({d})<=({d})size ; output generated {d} bytes \n", .{ @intFromEnum(directive), in.pos, in.src.len, out.pos });
+            disp.at(6, "ZSTD_compress_generic(end:{d}) => input pos({d})<=({d})size ; output generated {d} bytes \n", .{ @backingInt(directive), in.pos, in.src.len, out.pos });
             if (out.pos != 0) {
                 if (dst) |d| d.write(ress.out_buf[0..out.pos]);
                 compressed += out.pos;
@@ -922,7 +922,7 @@ const compressed_extensions = [_][]const u8{
 
 /// `UTIL_isCompressedFile`: the extension after the last dot.
 fn isCompressedFile(name: []const u8) bool {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return false;
     for (compressed_extensions) |ext| if (std.mem.eql(u8, name[dot..], ext)) return true;
     return false;
 }
@@ -1041,7 +1041,7 @@ pub fn compressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []con
         if (disp.shouldSummary() and disp.level >= 1) {
             const w = disp.err();
             var nb: [16]u8 = undefined;
-            disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.nb_files_processed}) catch unreachable, 3) catch {};
+            disp.right(w, std.mem.print(&nb, "{d}", .{ctx.nb_files_processed}) catch unreachable, 3) catch {};
             if (ctx.total_in == 0) {
                 w.writeAll(" files compressed : (") catch {};
             } else {
@@ -1073,7 +1073,7 @@ fn compressedName(gpa: std.mem.Allocator, src_name: []const u8, out_dir: ?[]cons
 /// directory, the source name as it is (last).
 fn fromOutDir(src_name: []const u8, out_dir: ?[]const u8) [3][]const u8 {
     const d = out_dir orelse return .{ "", "", src_name };
-    const base = if (std.mem.lastIndexOfScalar(u8, src_name, '/')) |i| src_name[i + 1 ..] else src_name;
+    const base = if (std.mem.findScalarLast(u8, src_name, '/')) |i| src_name[i + 1 ..] else src_name;
     return .{ d, if (d[d.len - 1] == '/') "" else "/", base };
 }
 
@@ -1085,7 +1085,7 @@ fn checkFilenameCollisions(gpa: std.mem.Allocator, names: []const []const u8) vo
         return;
     };
     defer gpa.free(sorted);
-    for (names, sorted) |n, *s| s.* = if (std.mem.lastIndexOfScalar(u8, n, '/')) |i| n[i + 1 ..] else n;
+    for (names, sorted) |n, *s| s.* = if (std.mem.findScalarLast(u8, n, '/')) |i| n[i + 1 ..] else n;
     std.mem.sort([]const u8, sorted, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -1192,9 +1192,9 @@ fn showDecompressProgress(io: Io, ctx: *const Ctx, name20: []const u8, h: disp.H
     if (ctx.nb_files_total > 1) {
         w.writeAll("\rDecompress: ") catch {};
         var nb: [24]u8 = undefined;
-        disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.curr_file_idx + 1}) catch unreachable, 2) catch {};
+        disp.right(w, std.mem.print(&nb, "{d}", .{ctx.curr_file_idx + 1}) catch unreachable, 2) catch {};
         w.writeAll("/") catch {};
-        disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.nb_files_total}) catch unreachable, 2) catch {};
+        disp.right(w, std.mem.print(&nb, "{d}", .{ctx.nb_files_total}) catch unreachable, 2) catch {};
         w.print(" files. Current: {s} : ", .{name20}) catch {};
         disp.fixed(w, h.value, 0, h.precision) catch {};
         w.print("{s}...    ", .{h.suffix}) catch {};
@@ -1323,7 +1323,7 @@ const suffix_list_str = ".zst/.tzst";
 /// `FIO_determineDstName`: null when the suffix is unknown.
 fn dstName(gpa: std.mem.Allocator, src_name: []const u8, out_dir: ?[]const u8) ?[]const u8 {
     if (isStdin(src_name)) return stdoutmark;
-    const dot = std.mem.lastIndexOfScalar(u8, src_name, '.') orelse {
+    const dot = std.mem.findScalarLast(u8, src_name, '.') orelse {
         disp.at(1, "zstd: {s}: unknown suffix ({s} expected). Can't derive the output file name. Specify it with -o dstFileName. Ignoring.\n", .{ src_name, suffix_list_str });
         return null;
     };
@@ -1394,7 +1394,7 @@ pub fn decompressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []c
             const w = disp.err();
             var nb: [24]u8 = undefined;
             w.print("{d} files decompressed : ", .{ctx.nb_files_processed}) catch {};
-            disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.total_out}) catch unreachable, 6) catch {};
+            disp.right(w, std.mem.print(&nb, "{d}", .{ctx.total_out}) catch unreachable, 6) catch {};
             w.writeAll(" bytes total \n") catch {};
             disp.flush();
         }

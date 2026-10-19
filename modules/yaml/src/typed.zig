@@ -295,7 +295,7 @@ fn from(comptime T: type, arena: Allocator, x: T) Allocator.Error!Value {
     switch (@typeInfo(T)) {
         .bool => return .{ .bool = x },
         .void, .null => return .null,
-        .int => return .{ .int = std.math.cast(i64, x) orelse return .{ .string = try std.fmt.allocPrint(arena, "{d}", .{x}) } },
+        .int => return .{ .int = std.math.cast(i64, x) orelse return .{ .string = try arena.print("{d}", .{x}) } },
         .comptime_int => return .{ .int = x },
         .float => return .{ .float = @floatCast(x) },
         .comptime_float => return .{ .float = x },

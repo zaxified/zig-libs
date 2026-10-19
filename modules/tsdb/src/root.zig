@@ -1649,9 +1649,9 @@ test "findSeries: filters by name and by a label subset, leaving unrelated serie
             try got.append(gpa, e.id);
         }
         try testing.expectEqual(@as(usize, 2), got.items.len);
-        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_a) != null);
-        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_a1) != null);
-        try testing.expect(std.mem.indexOfScalar(SeriesId, got.items, cpu_b) == null);
+        try testing.expect(std.mem.findScalar(SeriesId, got.items, cpu_a) != null);
+        try testing.expect(std.mem.findScalar(SeriesId, got.items, cpu_a1) != null);
+        try testing.expect(std.mem.findScalar(SeriesId, got.items, cpu_b) == null);
     }
 
     // Name + a fully specific label set: exactly one match.
@@ -1907,7 +1907,7 @@ fn seedGrid(fx: *Fixture, series_count: usize, per_series: usize) ![]SeriesId {
     var batch: std.ArrayList(Sample) = .empty;
     defer batch.deinit(fx.gpa);
     for (ids, 0..) |*id, i| {
-        const nm = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+        const nm = try std.mem.print(&name_buf, "s{d}", .{i});
         id.* = try fx.db.seriesId(nm, &.{});
         batch.clearRetainingCapacity();
         for (0..per_series) |t|
@@ -2486,7 +2486,7 @@ test "F5: sweepChunk's delete scratch is retained across chunks, not alloc/free 
     var batch: std.ArrayList(Sample) = .empty;
     defer batch.deinit(gpa);
     for (0..3) |i| {
-        const nm = try std.fmt.bufPrint(&name_buf, "s{d}", .{i});
+        const nm = try std.mem.print(&name_buf, "s{d}", .{i});
         const id = try db.seriesId(nm, &.{});
         batch.clearRetainingCapacity();
         for (0..30) |t| try batch.append(gpa, .{ .ts = @intCast(t), .value = @floatFromInt(t) });

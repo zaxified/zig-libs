@@ -171,7 +171,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         if (b.services.len != n_svc) return error.ServiceCountMismatch;
         for (0..n_svc) |i| {
             var dom: [32]u8 = undefined;
-            const d = try std.fmt.bufPrint(&dom, "www.t{d}x", .{i});
+            const d = try std.mem.print(&dom, "www.t{d}x", .{i});
             const urls = b.lookupDomain(d) orelse return error.TldNotResolved;
             if (urls.len != url_counts[i]) return error.UrlCountMismatch;
         }
@@ -196,7 +196,7 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
                 i += 2;
             } else {
                 // A literal octet must be unreserved or ':'.
-                if (!(std.ascii.isAlphanumeric(url[i]) or std.mem.indexOfScalar(u8, "-._~:", url[i]) != null)) return error.ReservedOctetUnencoded;
+                if (!(std.ascii.isAlphanumeric(url[i]) or std.mem.findScalar(u8, "-._~:", url[i]) != null)) return error.ReservedOctetUnencoded;
                 dec[n] = url[i];
             }
             n += 1;
@@ -282,7 +282,7 @@ fn fuzzDestination(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     } else |_| {}
     // And plaintext http is refused under the default policy, whatever the host.
     var hb: [200]u8 = undefined;
-    const http_url = try std.fmt.bufPrint(&hb, "http{s}", .{url[5..]});
+    const http_url = try std.mem.print(&hb, "http{s}", .{url[5..]});
     if (rdap.checkDestination(http_url, .{})) |_| return error.PlaintextAccepted else |_| DestMark.mark(.plain_http);
 }
 
@@ -360,7 +360,7 @@ const AtonMark = Marker(enum { private, public, invalid });
 /// denotes (any radix, any part count), and numeric-shaped invalid forms.
 fn blocked(host: []const u8) bool {
     var ub: [128]u8 = undefined;
-    const url = std.fmt.bufPrint(&ub, "https://{s}/rdap/x", .{host}) catch return true;
+    const url = std.mem.print(&ub, "https://{s}/rdap/x", .{host}) catch return true;
     rdap.checkDestination(url, .{}) catch return true;
     return false;
 }

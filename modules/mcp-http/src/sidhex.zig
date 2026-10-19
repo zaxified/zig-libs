@@ -30,7 +30,7 @@ test "encode matches std's {x} for varied bytes" {
         var ours: [32]u8 = undefined;
         encode(&ours, &raw);
         var theirs: [32]u8 = undefined;
-        _ = try std.fmt.bufPrint(&theirs, "{x}", .{&raw});
+        _ = try std.mem.print(&theirs, "{x}", .{&raw});
         try std.testing.expectEqualStrings(&theirs, &ours);
     }
 }

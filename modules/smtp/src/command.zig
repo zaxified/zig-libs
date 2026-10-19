@@ -188,8 +188,8 @@ pub fn addressLiteral(buf: []u8, ip: netaddr.Ip) error{NoSpaceLeft}![]const u8 {
     var tmp: [netaddr.max_ip_text_len]u8 = undefined;
     const text = netaddr.formatIp(ip, &tmp);
     return switch (ip) {
-        .v4 => std.fmt.bufPrint(buf, "[{s}]", .{text}),
-        .v6 => std.fmt.bufPrint(buf, "[IPv6:{s}]", .{text}),
+        .v4 => std.mem.print(buf, "[{s}]", .{text}),
+        .v6 => std.mem.print(buf, "[IPv6:{s}]", .{text}),
     } catch error.NoSpaceLeft;
 }
 
@@ -204,7 +204,7 @@ pub fn validateMailbox(addr: []const u8, limits: Limits, allow_utf8: bool) Comma
 
     // The last '@' separates local-part from domain: a quoted local part may
     // legally contain '@'.
-    const at = std.mem.lastIndexOfScalar(u8, addr, '@') orelse return error.InvalidAddress;
+    const at = std.mem.findScalarLast(u8, addr, '@') orelse return error.InvalidAddress;
     const local = addr[0..at];
     const domain = addr[at + 1 ..];
     if (local.len == 0 or domain.len == 0) return error.InvalidAddress;
@@ -234,7 +234,7 @@ const Builder = struct {
 
     fn print(self: *Builder, comptime fmt: []const u8, args: anytype) CommandError!void {
         const rest = self.buf[self.len..];
-        const out = std.fmt.bufPrint(rest, fmt, args) catch return error.CommandTooLong;
+        const out = std.mem.print(rest, fmt, args) catch return error.CommandTooLong;
         self.len += out.len;
     }
 
@@ -580,7 +580,7 @@ fn fuzzCommands(_: void, smith: *std.testing.Smith) !void {
     inline for (.{ ehlo, helo }) |f| {
         if (f(&buf, arg, .{})) |line| {
             std.debug.assert(std.mem.endsWith(u8, line, "\r\n"));
-            std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\n') == null);
+            std.debug.assert(std.mem.findScalar(u8, line[0 .. line.len - 2], '\n') == null);
         } else |_| {}
     }
     // ⚠ `smtputf8` used to be one more draw off the same Smith, taken AFTER the
@@ -591,15 +591,15 @@ fn fuzzCommands(_: void, smith: *std.testing.Smith) !void {
     // `data` harnesses already handle `allow_bare_lf`.
     for ([_]bool{ false, true }) |utf8| {
         if (mail(&buf, arg, .{ .smtputf8 = utf8 }, .{})) |line| {
-            std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
+            std.debug.assert(std.mem.findScalar(u8, line[0 .. line.len - 2], '\r') == null);
         } else |_| {}
         if (rcpt(&buf, arg, .{}, .{}, utf8)) |line| {
-            std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\r') == null);
+            std.debug.assert(std.mem.findScalar(u8, line[0 .. line.len - 2], '\r') == null);
             std.debug.assert(line.len <= 512);
         } else |_| {}
     }
     if (auth(&buf, "PLAIN", arg, .{})) |line| {
-        std.debug.assert(std.mem.indexOfScalar(u8, line[0 .. line.len - 2], '\n') == null);
+        std.debug.assert(std.mem.findScalar(u8, line[0 .. line.len - 2], '\n') == null);
     } else |_| {}
 }
 

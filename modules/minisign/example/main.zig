@@ -350,11 +350,11 @@ fn nextValue(args: *std.process.Args.Iterator, flag: []const u8) ![]const u8 {
 /// certainly wrong.
 fn defaultSeckeyPath(gpa: Allocator, home: ?[:0]const u8) ![]u8 {
     const h = home orelse return gpa.dupe(u8, ".minisign/minisign.key");
-    return std.fmt.allocPrint(gpa, "{s}/.minisign/minisign.key", .{h});
+    return gpa.print("{s}/.minisign/minisign.key", .{h});
 }
 
 fn defaultSigPath(gpa: Allocator, message_path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}.minisig", .{message_path});
+    return gpa.print("{s}.minisig", .{message_path});
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,7 +477,7 @@ fn timestampSec() i64 {
 
 fn defaultTrustedComment(gpa: Allocator, message_path: []const u8, algorithm: minisign.Algorithm) ![]u8 {
     const base = std.Io.Dir.path.basename(message_path);
-    return std.fmt.allocPrint(gpa, "timestamp:{d}\tfile:{s}\t{s}", .{
+    return gpa.print("timestamp:{d}\tfile:{s}\t{s}", .{
         timestampSec(),
         base,
         if (algorithm == .prehashed) "hashed" else "legacy",
@@ -545,7 +545,7 @@ fn runGenerate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
         defer aw.deinit();
         var comment_buf: [64]u8 = undefined;
         const key_id = minisign.formatKeyId(kp.key_number);
-        const comment = try std.fmt.bufPrint(&comment_buf, "{s}{s}", .{ minisign.public_key_comment_prefix, key_id });
+        const comment = try std.mem.print(&comment_buf, "{s}{s}", .{ minisign.public_key_comment_prefix, key_id });
         try minisign.writePublicKeyFile(&aw.writer, comment, kp.publicKey());
         writeWholeFile(io, opts.pubkey_path, aw.written(), !opts.force) catch |err| switch (err) {
             error.PathAlreadyExists => {
@@ -586,7 +586,7 @@ fn runRecreate(gpa: Allocator, io: std.Io, opts: Options) !u8 {
     defer aw.deinit();
     var comment_buf: [64]u8 = undefined;
     const key_id = minisign.formatKeyId(kp.key_number);
-    const comment = try std.fmt.bufPrint(&comment_buf, "{s}{s}", .{ minisign.public_key_comment_prefix, key_id });
+    const comment = try std.mem.print(&comment_buf, "{s}{s}", .{ minisign.public_key_comment_prefix, key_id });
     try minisign.writePublicKeyFile(&aw.writer, comment, kp.publicKey());
     try writeWholeFile(io, opts.pubkey_path, aw.written(), false);
 

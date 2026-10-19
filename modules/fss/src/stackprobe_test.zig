@@ -50,9 +50,9 @@ fn setup() void {
     seed(&s1, "fss probe seed 1");
     for (0..3) |j| {
         var l: [16]u8 = undefined;
-        _ = std.fmt.bufPrint(&l, "fss probe m0 {d}", .{j}) catch unreachable;
+        _ = std.mem.print(&l, "fss probe m0 {d}", .{j}) catch unreachable;
         seed(&ms0[j], &l);
-        _ = std.fmt.bufPrint(&l, "fss probe m1 {d}", .{j}) catch unreachable;
+        _ = std.mem.print(&l, "fss probe m1 {d}", .{j}) catch unreachable;
         seed(&ms1[j], &l);
     }
     var k: [2]D.Key = undefined;

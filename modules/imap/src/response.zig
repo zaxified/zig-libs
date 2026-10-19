@@ -370,7 +370,7 @@ pub const Reader = struct {
         const name = try d.expectAtom();
         if (!system) return name;
         defer d.gpa.free(name);
-        return std.fmt.allocPrint(d.gpa, "\\{s}", .{name}) catch error.OutOfMemory;
+        return d.gpa.print("\\{s}", .{name}) catch error.OutOfMemory;
     }
 };
 

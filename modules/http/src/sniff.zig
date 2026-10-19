@@ -31,7 +31,7 @@ pub const text_plain = "text/plain; charset=utf-8";
 /// Never fails; a match on a prefix is a guess, not validation of the format.
 pub fn detectContentType(data: []const u8) []const u8 {
     const d = data[0..@min(data.len, sniff_len)];
-    const first_non_ws = std.mem.indexOfNone(u8, d, ws) orelse d.len;
+    const first_non_ws = std.mem.findNone(u8, d, ws) orelse d.len;
     for (signatures) |sig| {
         if (sig.matches(d, first_non_ws)) return sig.content_type;
     }

@@ -172,7 +172,7 @@ pub fn main() !void {
     // (1) A mistyped last word of a real mnemonic — the checksum word — is
     // still a wordlist entry, so only the checksum math catches it.
     {
-        const last_space = std.mem.lastIndexOfScalar(u8, phrase, ' ').?;
+        const last_space = std.mem.findScalarLast(u8, phrase, ' ').?;
         var tampered_buf: [bip32.mnemonic.max_mnemonic_len]u8 = undefined;
         @memcpy(tampered_buf[0 .. last_space + 1], phrase[0 .. last_space + 1]);
         const replacement = if (std.mem.eql(u8, phrase[last_space + 1 ..], "canvas")) "canyon" else "canvas";
@@ -192,7 +192,7 @@ pub fn main() !void {
     {
         var tampered_buf: [bip32.mnemonic.max_mnemonic_len]u8 = undefined;
         const n = phrase.len;
-        const first_space = std.mem.indexOfScalar(u8, phrase, ' ').?;
+        const first_space = std.mem.findScalar(u8, phrase, ' ').?;
         const replacement = "notaword";
         @memcpy(tampered_buf[0..replacement.len], replacement);
         @memcpy(tampered_buf[replacement.len..][0 .. n - first_space], phrase[first_space..]);

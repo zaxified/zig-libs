@@ -76,8 +76,8 @@ fn digestOf(P: anytype) Digests {
     hm.final(&md);
 
     var out: Digests = undefined;
-    _ = std.fmt.bufPrint(&out.c, "{x}", .{&cd}) catch unreachable;
-    _ = std.fmt.bufPrint(&out.m, "{x}", .{&md}) catch unreachable;
+    _ = std.mem.print(&out.c, "{x}", .{&cd}) catch unreachable;
+    _ = std.mem.print(&out.m, "{x}", .{&md}) catch unreachable;
     return out;
 }
 

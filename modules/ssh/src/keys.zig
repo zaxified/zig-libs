@@ -284,10 +284,10 @@ const KeyFields = struct { key: PublicKey, comment: []const u8 };
 
 /// `keytype base64[ comment]` with `line` already trimmed.
 fn parseKeyFields(line: []const u8, blob_buf: []u8) LineError!KeyFields {
-    const type_end = std.mem.indexOfAny(u8, line, " \t") orelse return error.InvalidLine;
+    const type_end = std.mem.findAny(u8, line, " \t") orelse return error.InvalidLine;
     const type_name = line[0..type_end];
     const rest = std.mem.trimStart(u8, line[type_end..], " \t");
-    const b64_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    const b64_end = std.mem.findAny(u8, rest, " \t") orelse rest.len;
     const text = rest[0..b64_end];
     const n = b64.Decoder.calcSizeForSlice(text) catch return error.InvalidLine;
     if (n > blob_buf.len) return error.NoSpaceLeft;
@@ -317,7 +317,7 @@ pub const AuthorizedKeysIterator = struct {
     /// the following call overwrites.
     pub fn next(self: *AuthorizedKeysIterator, blob_buf: []u8) ?AuthorizedKey {
         while (self.rest.len != 0) {
-            const end = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+            const end = std.mem.findScalar(u8, self.rest, '\n') orelse self.rest.len;
             const line = self.rest[0..end];
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else self.rest[self.rest.len..];
             self.line_number += 1;

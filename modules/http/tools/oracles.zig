@@ -55,7 +55,7 @@ fn optStr(w: *Writer, s: ?[]const u8) !void {
 const Ran = struct { code: u8, out: []u8 };
 
 fn run(io: std.Io, arena: std.mem.Allocator, env: *const std.process.Environ.Map, argv: []const []const u8, cwd: []const u8) !Ran {
-    const out_path = try std.fmt.allocPrint(arena, "{s}/stdout.txt", .{cwd});
+    const out_path = try arena.print("{s}/stdout.txt", .{cwd});
     {
         const out = try std.Io.Dir.cwd().createFile(io, out_path, .{});
         defer out.close(io);
@@ -81,8 +81,8 @@ fn run(io: std.Io, arena: std.mem.Allocator, env: *const std.process.Environ.Map
 
 /// Compare the fresh vectors with the committed file, or replace it.
 fn settle(io: std.Io, arena: std.mem.Allocator, name: []const u8, fresh: []const u8, write: bool) !bool {
-    const committed = try std.fmt.allocPrint(arena, "modules/http/src/{s}", .{name});
-    const tmp = try std.fmt.allocPrint(arena, "{s}/{s}", .{ scratch, name });
+    const committed = try arena.print("modules/http/src/{s}", .{name});
+    const tmp = try arena.print("{s}/{s}", .{ scratch, name });
     // Written already in `zig fmt`'s layout (one item per line, no
     // alignment), so the committed file passes the pre-commit fmt check.
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = fresh });
@@ -231,7 +231,7 @@ pub fn problemPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator
     while (pl.next()) |line| {
         if (!std.mem.startsWith(u8, line, "PHRASE ")) continue;
         const rest = line["PHRASE ".len..];
-        const sp = std.mem.indexOfScalar(u8, rest, ' ').?;
+        const sp = std.mem.findScalar(u8, rest, ' ').?;
         try w.print("    .{{ .status = {s}, .phrase = ", .{rest[0..sp]});
         try zigStr(w, rest[sp + 1 ..]);
         try w.writeAll(" },\n");
@@ -374,7 +374,7 @@ pub fn ssePhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, en
     const dir = scratch ++ "/sse";
     try std.Io.Dir.cwd().createDirPath(io, dir);
     const home = env.get("HOME") orelse return error.NoHome;
-    const python = try std.fmt.allocPrint(arena, "{s}/.local/share/zig-libs/oracle-venvs/http/bin/python", .{home});
+    const python = try arena.print("{s}/.local/share/zig-libs/oracle-venvs/http/bin/python", .{home});
 
     var server = Server.init(io, gpa, .{ .handler = sseHandler });
     defer server.deinit();
@@ -384,7 +384,7 @@ pub fn ssePhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, en
         server.shutdown();
         thread.join();
     }
-    const url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/events", .{server.boundAddress().getPort()});
+    const url = try arena.print("http://127.0.0.1:{d}/events", .{server.boundAddress().getPort()});
     const fetched = try run(io, arena, env, &.{ "curl", "-sS", "--max-time", "20", "-o", "stream.bin", url }, dir);
     if (fetched.code != 0) return error.CurlFailed;
     const stream = try std.Io.Dir.cwd().readFileAlloc(io, dir ++ "/stream.bin", arena, .limited(4 << 20));
@@ -396,7 +396,7 @@ pub fn ssePhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, en
         return false;
     }
     // Teeth: one event terminator removed (events 0 and 1 merge) must fail.
-    const cut = std.mem.indexOf(u8, stream, "hello\n\n").? + "hello\n".len;
+    const cut = std.mem.find(u8, stream, "hello\n\n").? + "hello\n".len;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/stream.bin", .data = try std.mem.concat(arena, u8, &.{ stream[0..cut], stream[cut + 1 ..] }) });
     const broken = try run(io, arena, env, &.{ python, "-c", sse_parser }, dir);
     if (broken.code != 0 or try sseCompare(arena, broken.out, true) == 0) {

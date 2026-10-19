@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
         defer aw.deinit();
         try xml.writeDocument(gpa, &aw.writer, &doc);
         var name_buf: [4096]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{s}/{d}.xml", .{ out_dir, n });
+        const name = try std.mem.print(&name_buf, "{s}/{d}.xml", .{ out_dir, n });
         try cwd.writeFile(io, .{ .sub_path = name, .data = aw.written() });
     }
 }

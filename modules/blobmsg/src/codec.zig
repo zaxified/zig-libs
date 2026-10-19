@@ -295,7 +295,7 @@ pub fn parseField(a: Attr) Error!Field {
     // embedded NUL inside a namelen-honest field silently truncates the
     // name a C reader sees. Match that instead of exposing the bytes past
     // it as part of this module's `name` (F3: "two readers, two keys").
-    const name = raw_name[0..(std.mem.indexOfScalar(u8, raw_name, 0) orelse raw_name.len)];
+    const name = raw_name[0..(std.mem.findScalar(u8, raw_name, 0) orelse raw_name.len)];
     const payload = a.data[hdrlen..];
 
     const value: Value = switch (a.id) {
@@ -310,7 +310,7 @@ pub fn parseField(a: Attr) Error!Field {
             // Same C-string truncation as the name above: blobmsg_get_string()
             // stops at the first NUL, so an embedded one splits what this
             // module and a C reader see as the value (F9, embedded NUL).
-            const cut = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
+            const cut = std.mem.findScalar(u8, raw, 0) orelse raw.len;
             break :blk .{ .string = raw[0..cut] };
         },
         BM.INT8 => blk: {

@@ -594,7 +594,7 @@ test "fill ABORTS when entropy is unavailable -- it does not return, and does no
     // ReleaseFast, no promise at all.
     const printed = msg[0..msg_len];
     const needle = unavailable_message[0..@min(unavailable_message.len, 40)];
-    if (std.mem.indexOf(u8, printed, needle) == null) {
+    if (std.mem.find(u8, printed, needle) == null) {
         std.debug.print(
             "\nfill() aborted, but not with `unavailable_message`. It printed:\n{s}\n",
             .{printed},
@@ -691,7 +691,7 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
 
     const printed = msg[0..msg_len];
     const needle = canceled_contract_violation_message[0..@min(canceled_contract_violation_message.len, 40)];
-    if (std.mem.indexOf(u8, printed, needle) == null) {
+    if (std.mem.find(u8, printed, needle) == null) {
         std.debug.print(
             "\nfill() aborted, but not with `canceled_contract_violation_message`. It printed:\n{s}\n",
             .{printed},
@@ -701,7 +701,7 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
     // And the message must NOT blame EntropyUnavailable -- that would be
     // exactly the lie F3 found: a real syscall failure that never happened,
     // reported as the cause of a cancellation-contract violation.
-    if (std.mem.indexOf(u8, printed, "EntropyUnavailable") != null) {
+    if (std.mem.find(u8, printed, "EntropyUnavailable") != null) {
         std.debug.print(
             "\nfill() blamed EntropyUnavailable for an error.Canceled contract violation:\n{s}\n",
             .{printed},
@@ -781,7 +781,7 @@ test "fill ABORTS with its own message, before calling it, on an Io whose cancel
             return error.TestUnexpectedResult;
         }
         const needle = unsupported_io_message[0..@min(unsupported_io_message.len, 40)];
-        if (std.mem.indexOf(u8, printed, needle) == null) {
+        if (std.mem.find(u8, printed, needle) == null) {
             std.debug.print("\nfill() aborted, but not with `unsupported_io_message`. It printed:\n{s}\n", .{printed});
             return error.TestUnexpectedResult;
         }
@@ -966,13 +966,13 @@ test "SecureSource writes a large buffer completely, in one draw" {
 // user-visible bug -- a wrong cause printed on a real abort -- not just a
 // stale comment.
 test "the abort messages each name their own cause, and only their own" {
-    try testing.expect(std.mem.indexOf(u8, unavailable_message, "EntropyUnavailable") != null);
-    try testing.expect(std.mem.indexOf(u8, unavailable_message, "getrandom(2)") != null);
-    try testing.expect(std.mem.indexOf(u8, unavailable_message, "Canceled") == null);
+    try testing.expect(std.mem.find(u8, unavailable_message, "EntropyUnavailable") != null);
+    try testing.expect(std.mem.find(u8, unavailable_message, "getrandom(2)") != null);
+    try testing.expect(std.mem.find(u8, unavailable_message, "Canceled") == null);
 
-    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "Canceled") != null);
-    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "swapCancelProtection") != null);
-    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "EntropyUnavailable") == null);
+    try testing.expect(std.mem.find(u8, canceled_contract_violation_message, "Canceled") != null);
+    try testing.expect(std.mem.find(u8, canceled_contract_violation_message, "swapCancelProtection") != null);
+    try testing.expect(std.mem.find(u8, canceled_contract_violation_message, "EntropyUnavailable") == null);
 }
 
 // Output invariants, on every route `fill` can take. The coverage tests above

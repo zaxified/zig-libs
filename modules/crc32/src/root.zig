@@ -127,7 +127,7 @@ pub fn hashWith(b: Backend, bytes: []const u8) ?u32 {
 
 // ── dispatch ────────────────────────────────────────────────────────────────
 
-/// 0 = not yet detected, else `@intFromEnum(Backend) + 1`. Detection is
+/// 0 = not yet detected, else `@backingInt(Backend) + 1`. Detection is
 /// idempotent, so two threads racing to fill it store the same value.
 var detected: std.atomic.Value(u8) = .init(0);
 
@@ -625,7 +625,7 @@ test "run-time detection agrees with the kernel's CPU flags" {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (!std.mem.startsWith(u8, line, key)) continue;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         var has = false;
         var toks = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
         while (toks.next()) |t| {

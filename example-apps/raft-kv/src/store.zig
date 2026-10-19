@@ -74,7 +74,7 @@ pub const Store = struct {
         const rec = try gpa.alloc(u8, 9 + entry.data.len);
         defer gpa.free(rec);
         std.mem.writeInt(u64, rec[0..8], entry.term, .little);
-        rec[8] = @intFromEnum(entry.kind);
+        rec[8] = @backingInt(entry.kind);
         @memcpy(rec[9..], entry.data);
         try self.db.put(entryKey(entry.index, &kbuf), rec);
     }

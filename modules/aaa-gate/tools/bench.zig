@@ -129,7 +129,7 @@ const Pre = struct {
         p.in = .fixed(wire);
         p.head = try http.h1.RequestHead.parse(try http.h1.readHead(&p.in, &p.head_buf));
         p.body = .init(&p.head, &p.in, &p.body_scratch);
-        const q = std.mem.indexOfScalar(u8, p.head.target, '?');
+        const q = std.mem.findScalar(u8, p.head.target, '?');
         p.req = .{
             .method = .get,
             .target = p.head.target,
@@ -172,29 +172,29 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         for (0..n_req) |i| {
             const valid = keys[i % keys.len];
             const wire = if (std.mem.eql(u8, name, "bearer_ok"))
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{valid})
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {s}\r\nConnection: close\r\n\r\n", .{valid})
             else if (std.mem.eql(u8, name, "bearer_denied"))
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer tok-wrong-{d:0>16}\r\nConnection: close\r\n\r\n", .{i})
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer tok-wrong-{d:0>16}\r\nConnection: close\r\n\r\n", .{i})
             else if (std.mem.eql(u8, name, "api_key_header_ok"))
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nX-Api-Key: {s}\r\nConnection: close\r\n\r\n", .{valid})
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nX-Api-Key: {s}\r\nConnection: close\r\n\r\n", .{valid})
             else if (std.mem.eql(u8, name, "api_key_query_ok"))
-                try std.fmt.allocPrint(arena, "GET /?api_key={s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{valid})
+                try arena.print("GET /?api_key={s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{valid})
             else if (std.mem.startsWith(u8, name, "basic_")) blk: {
                 const pw = if (std.mem.eql(u8, name, "basic_ok")) valid else "wrong-password-000000000";
-                const cred = try std.fmt.allocPrint(arena, "user-{d}:{s}", .{ i % keys.len, pw });
+                const cred = try arena.print("user-{d}:{s}", .{ i % keys.len, pw });
                 const enc = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(cred.len));
                 _ = std.base64.standard.Encoder.encode(enc, cred);
-                break :blk try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Basic {s}\r\nConnection: close\r\n\r\n", .{enc});
+                break :blk try arena.print("GET / HTTP/1.1\r\nHost: t\r\nAuthorization: Basic {s}\r\nConnection: close\r\n\r\n", .{enc});
             } else // no_credential
-                try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nConnection: close\r\n\r\n", .{});
+                try arena.print("GET / HTTP/1.1\r\nHost: t\r\nAccept: */*\r\nConnection: close\r\n\r\n", .{});
             try d.pre[wi][i].build(wire);
             if (i != 0) try all.writer.writeByte(0);
             try all.writer.writeAll(wire);
         }
         const bytes = all.written();
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = bytes });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}_plain.wire", .{name}), .data = bytes });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}_raw.wire", .{name}), .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.wire", .{name}), .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}_plain.wire", .{name}), .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}_raw.wire", .{name}), .data = bytes });
     }
     return d;
 }
@@ -236,16 +236,16 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
-        const plain_name = try std.fmt.allocPrint(arena, "{s}_plain", .{name});
+        const plain_name = try arena.print("{s}_plain", .{name});
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
         var ours_p: bench.Side = .{};
         var go_p: bench.Side = .{};
         var go_raw: bench.Side = .{};
-        const raw_name = try std.fmt.allocPrint(arena, "{s}_raw", .{name});
+        const raw_name = try arena.print("{s}_raw", .{name});
         for (0..rounds) |_| {
             go_p.add(try bench.foreign(arena, io, bench_name, exe, abs, plain_name, null));
             ours_p.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi, true }, true));

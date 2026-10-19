@@ -301,15 +301,15 @@ test "the client's upgrade request offers exactly one BACnet/SC subprotocol" {
     );
     const request = req_w.buffered();
     try testing.expect(std.mem.startsWith(u8, request, "GET / HTTP/1.1\r\n"));
-    try testing.expect(std.mem.indexOf(u8, request, "Host: hub.example:47808\r\n") != null);
-    try testing.expect(std.mem.indexOf(
+    try testing.expect(std.mem.find(u8, request, "Host: hub.example:47808\r\n") != null);
+    try testing.expect(std.mem.find(
         u8,
         request,
         "Sec-WebSocket-Protocol: hub.bsc.bacnet.org\r\n",
     ) != null);
     // Offering both names would let a hub answer with the direct-connection
     // subprotocol for what the caller asked to be a hub connection.
-    try testing.expect(std.mem.indexOf(u8, request, sc.subprotocol_direct) == null);
+    try testing.expect(std.mem.find(u8, request, sc.subprotocol_direct) == null);
 
     var dir_buf: [512]u8 = undefined;
     var dir_w = std.Io.Writer.fixed(&dir_buf);
@@ -317,7 +317,7 @@ test "the client's upgrade request offers exactly one BACnet/SC subprotocol" {
         &dir_w,
         clientRequest(.direct, "node.example", "/bacnet", &key),
     );
-    try testing.expect(std.mem.indexOf(
+    try testing.expect(std.mem.find(
         u8,
         dir_w.buffered(),
         "Sec-WebSocket-Protocol: dc.bsc.bacnet.org\r\n",

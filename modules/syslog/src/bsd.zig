@@ -198,12 +198,12 @@ test "RFC 3164 line: hostname/tag/pid strip non-printable/non-alnum bytes so an 
     try t.expectEqualStrings("<13>cron-job-x[1-2]: ok", out);
     // No raw control byte anywhere before MSG: a receiver that frames on
     // '\n' cannot see this one line as two (RFC 3164 §4.1.3 record forgery).
-    try t.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+    try t.expect(std.mem.findScalar(u8, out, '\n') == null);
     // TAG keeps only alnum bytes (RFC 3164 §5.3) — a space or the ':'
     // delimiter itself does not survive, so it can't shift where a
     // receiver believes CONTENT begins.
-    try t.expect(std.mem.indexOf(u8, out, "cron") != null);
-    try t.expect(std.mem.indexOf(u8, out, "job:x") == null);
+    try t.expect(std.mem.find(u8, out, "cron") != null);
+    try t.expect(std.mem.find(u8, out, "job:x") == null);
 }
 
 test "RFC 3164 line: MSG is passed through raw (deliberate — matches the RFC 5424 encoder and the external rsyslogd anchor)" {
@@ -216,7 +216,7 @@ test "RFC 3164 line: MSG is passed through raw (deliberate — matches the RFC 5
     };
     var buf: [128]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
-    try t.expect(std.mem.indexOf(u8, out, "line one\nline two") != null);
+    try t.expect(std.mem.find(u8, out, "line one\nline two") != null);
 }
 
 test "TAG longer than 32 bytes is truncated" {
@@ -229,8 +229,8 @@ test "TAG longer than 32 bytes is truncated" {
     };
     var buf: [128]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
-    try t.expect(std.mem.indexOf(u8, out, (strRepeat("t", max_tag)) ++ ": x") != null);
-    try t.expect(std.mem.indexOf(u8, out, strRepeat("t", max_tag + 1)) == null);
+    try t.expect(std.mem.find(u8, out, (strRepeat("t", max_tag)) ++ ": x") != null);
+    try t.expect(std.mem.find(u8, out, strRepeat("t", max_tag + 1)) == null);
 }
 
 test "HOSTNAME: sent only when it is one; else omitted (glibc's shape)" {

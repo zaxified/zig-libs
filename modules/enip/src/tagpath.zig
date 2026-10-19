@@ -133,7 +133,7 @@ pub fn parse(text: []const u8, storage: []Component) ParseError!TagPath {
         // A `Program:Name` component keeps its colon, so the split on '.'
         // must not treat the colon as anything special — but the *name*
         // validation must run on the part after it.
-        const dot = std.mem.indexOfScalar(u8, rest, '.');
+        const dot = std.mem.findScalar(u8, rest, '.');
         const piece = if (dot) |d| rest[0..d] else rest;
         if (piece.len == 0) return error.EmptyComponent;
         if (n >= storage.len) return error.BufferTooSmall;
@@ -151,8 +151,8 @@ pub fn parse(text: []const u8, storage: []Component) ParseError!TagPath {
 
 fn parseComponent(piece: []const u8, first: bool, program_scoped: *bool) ParseError!Component {
     var name_end = piece.len;
-    if (std.mem.indexOfScalar(u8, piece, '[')) |br| name_end = br;
-    if (std.mem.indexOfScalar(u8, piece, ']')) |cb| {
+    if (std.mem.findScalar(u8, piece, '[')) |br| name_end = br;
+    if (std.mem.findScalar(u8, piece, ']')) |cb| {
         if (name_end == piece.len or cb < name_end) return error.UnbalancedBracket;
     }
     const name = piece[0..name_end];
@@ -174,7 +174,7 @@ fn parseComponent(piece: []const u8, first: bool, program_scoped: *bool) ParseEr
     if (name_end == piece.len) return c;
 
     // Indices.
-    const close = std.mem.lastIndexOfScalar(u8, piece, ']') orelse return error.UnbalancedBracket;
+    const close = std.mem.findScalarLast(u8, piece, ']') orelse return error.UnbalancedBracket;
     if (close != piece.len - 1) return error.TrailingCharacters;
     const inner = piece[name_end + 1 .. close];
     if (inner.len == 0) return error.BadIndex;

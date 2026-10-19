@@ -355,7 +355,7 @@ pub const Cors = struct {
         };
         if (options.max_age_s) |s| {
             // The buffer is sized for the largest u32.
-            c.max_age_len = (std.fmt.bufPrint(&c.max_age_buf, "{d}", .{s}) catch unreachable).len;
+            c.max_age_len = (std.mem.print(&c.max_age_buf, "{d}", .{s}) catch unreachable).len;
         }
         return c;
     }
@@ -779,7 +779,7 @@ fn validateStatic(comptime o: StaticOptions) void {
 /// at least two host labels after it, an optional all-digit port, nothing
 /// else (no path, userinfo, query, second `*`).
 fn validSubdomainPattern(p: []const u8) bool {
-    const sep = std.mem.indexOf(u8, p, "://") orelse return false;
+    const sep = std.mem.find(u8, p, "://") orelse return false;
     if (sep == 0) return false;
     for (p[0..sep]) |ch| {
         if (!(std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '-' or ch == '.')) return false;
@@ -788,7 +788,7 @@ fn validSubdomainPattern(p: []const u8) bool {
     if (rest.len < 4 or rest[0] != '*' or rest[1] != '.') return false;
     const authority = rest[2..];
     var host = authority;
-    if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+    if (std.mem.findScalar(u8, authority, ':')) |colon| {
         host = authority[0..colon];
         const port = authority[colon + 1 ..];
         if (port.len == 0 or port.len > 5) return false;
@@ -822,7 +822,7 @@ fn validLabel(label: []const u8) bool {
 /// rs/cors (utils.go:12-16) accepts ANY bytes for the `*` and lowercases both
 /// sides; ours is stricter on the first and byte-exact on the second.
 fn matchSubdomain(pattern: []const u8, origin: []const u8) bool {
-    const star = std.mem.indexOfScalar(u8, pattern, '*') orelse return false;
+    const star = std.mem.findScalar(u8, pattern, '*') orelse return false;
     const prefix = pattern[0..star];
     const suffix = pattern[star + 1 ..];
     if (origin.len <= prefix.len + suffix.len) return false;
@@ -896,7 +896,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn expectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 fn expectNoHeader(got: []const u8, comptime name: []const u8) !void {
@@ -1243,7 +1243,7 @@ test "actual: a handler's own Vary CLOBBERS Vary: Origin — pinned, and the saf
         // …but its Vary does not: exactly one Vary header, and Origin is not in it.
         try expectHeaderLine(got, "Vary: Accept-Encoding");
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "\r\nVary: "));
-        try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, got, "\r\nVary: Origin\r\n"));
+        try testing.expectEqual(@as(?usize, null), std.mem.find(u8, got, "\r\nVary: Origin\r\n"));
     }
     { // the shape the README tells such a handler to use instead
         var r = router.Router.init(testing.allocator);
@@ -1699,7 +1699,7 @@ test "integration: preflight 204 (handler not invoked), allowed GET gets Allow-O
     var client = http.Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/hello", .{port});
 
     { // preflight OPTIONS → 204 + the CORS headers, handler never invoked
         var res = try client.request(.options, url, .{ .headers = &.{
@@ -2015,7 +2015,7 @@ test "router-free: applyPreflight + applyActual carry the whole policy" {
         try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, HEAD, POST");
         try expectHeaderLine(got, "Access-Control-Max-Age: 600");
         try expectHeaderLine(got, "Vary: " ++ preflight_vary);
-        try testing.expect(std.mem.indexOf(u8, got, "ok") == null);
+        try testing.expect(std.mem.find(u8, got, "ok") == null);
     }
     { // failing preflight (foreign origin): headerless 204, Vary still on
         const got = runWireBare(&c, wire("OPTIONS", "/t", "Origin: https://evil.example\r\nAccess-Control-Request-Method: POST\r\n"), &buf);
@@ -2272,7 +2272,7 @@ test "static posture: preflight is always a full 204 grant; ACRH reflected" {
     // posture's blanket "no Vary" does not extend to it — a shared cache would
     // otherwise replay one client's allowed-header set to the next.
     try expectHeaderLine(got, "Vary: Access-Control-Request-Headers");
-    try testing.expect(std.mem.indexOf(u8, got, "ok") == null);
+    try testing.expect(std.mem.find(u8, got, "ok") == null);
 }
 
 test "static posture: a bare OPTIONS is not a preflight and routes normally" {

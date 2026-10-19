@@ -390,7 +390,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
         // 2. The frame the module replays must be the frame that travelled.
         var name_buf: [64]u8 = undefined;
-        const path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ testdata_dir, case.fileName(&name_buf) });
+        const path = try gpa.print("{s}/{s}", .{ testdata_dir, case.fileName(&name_buf) });
         if (capture) {
             root.writeFile(io, .{ .sub_path = path, .data = out.frame }) catch |e| {
                 std.debug.print("{s}: cannot write {s}: {t}\n", .{ case.name, path, e });

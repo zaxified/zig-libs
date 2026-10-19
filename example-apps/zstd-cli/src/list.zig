@@ -118,9 +118,9 @@ fn getFileInfo(env: fio.Env, info: *FileInfo, name: []const u8) InfoError {
 
 fn row(w: *std.Io.Writer, frames: i32, skips: i32, compressed: u64, decompressed: ?u64, ratio: f64, check: []const u8, name: []const u8, files: ?u32) void {
     var b: [24]u8 = undefined;
-    disp.right(w, std.fmt.bufPrint(&b, "{d}", .{frames}) catch unreachable, 6) catch {};
+    disp.right(w, std.mem.print(&b, "{d}", .{frames}) catch unreachable, 6) catch {};
     w.writeAll("  ") catch {};
-    disp.right(w, std.fmt.bufPrint(&b, "{d}", .{skips}) catch unreachable, 5) catch {};
+    disp.right(w, std.mem.print(&b, "{d}", .{skips}) catch unreachable, 5) catch {};
     w.writeAll("  ") catch {};
     const hc = disp.hrs(compressed);
     disp.fixed(w, hc.value, 6, hc.precision) catch {};

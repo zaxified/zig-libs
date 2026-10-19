@@ -716,7 +716,7 @@ pub const Bootstrap = struct {
     /// IPv4/IPv6 bootstrap: longest-prefix CIDR match. `addr_text` may be a
     /// bare address or a CIDR (its network address is matched).
     pub fn lookupIp(b: *const Bootstrap, addr_text: []const u8) ?[]const []const u8 {
-        const bare = if (std.mem.indexOfScalar(u8, addr_text, '/')) |i|
+        const bare = if (std.mem.findScalar(u8, addr_text, '/')) |i|
             addr_text[0..i]
         else
             addr_text;
@@ -738,7 +738,7 @@ pub const Bootstrap = struct {
         for (b.services) |s| for (s.keys) |k| {
             var lo_text = k;
             var hi_text = k;
-            if (std.mem.indexOfScalar(u8, k, '-')) |i| {
+            if (std.mem.findScalar(u8, k, '-')) |i| {
                 lo_text = k[0..i];
                 hi_text = k[i + 1 ..];
             }
@@ -820,7 +820,7 @@ fn domainSuffixMatch(domain: []const u8, key: []const u8) bool {
 /// return the prefix length; null on mismatch (including family mismatch)
 /// or a malformed CIDR.
 fn cidrMatch(ip: netaddr.Ip, cidr: []const u8) ?i16 {
-    const slash = std.mem.indexOfScalar(u8, cidr, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, cidr, '/') orelse return null;
     const net_ip = netaddr.parseIp(cidr[0..slash]) orelse return null;
     const plen = std.fmt.parseInt(u8, cidr[slash + 1 ..], 10) catch return null;
     switch (net_ip) {
@@ -1074,7 +1074,7 @@ fn parseInetAton(raw: []const u8) NumericHost {
     // leaves an empty part, which is invalid below.
     const host = if (raw.len > 0 and raw[raw.len - 1] == '.') raw[0 .. raw.len - 1] else raw;
     if (host.len == 0 or !std.ascii.isDigit(host[0])) return .not_numeric;
-    if (std.mem.indexOfNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
+    if (std.mem.findNone(u8, host, "0123456789abcdefABCDEFxX.") != null) return .not_numeric;
     var it0 = std.mem.splitScalar(u8, host, '.');
     while (it0.next()) |part| {
         if (part.len == 0) return .invalid;
@@ -1663,7 +1663,7 @@ test "parse: entities nested past max_entity_depth are dropped, not an error (to
     }
     try testing.expectEqual(@as(usize, max_entity_depth), hops);
     var name_buf: [8]u8 = undefined;
-    const expected = try std.fmt.bufPrint(&name_buf, "L{d}", .{max_entity_depth});
+    const expected = try std.mem.print(&name_buf, "L{d}", .{max_entity_depth});
     try testing.expectEqualStrings(expected, cur.handle.?);
 }
 
@@ -2434,7 +2434,7 @@ test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not err
     var hf: HttpFetcher = .{ .client = &http_client };
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
     var body_buf: [256]u8 = undefined;
 
     var fut = try io.concurrent(fetchOnce, .{ hf.fetcher(), url, &body_buf });
@@ -2496,7 +2496,7 @@ test "HttpFetcher: every redirect Location is gated, and the chain is bounded (r
     // The server points every request straight back at itself: a redirect
     // graph with no exit, which is exactly what a bound has to survive.
     var loc_buf: [160]u8 = undefined;
-    const response = try std.fmt.bufPrint(
+    const response = try std.mem.print(
         &loc_buf,
         "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/next\r\nContent-Length: 0\r\n\r\n",
         .{port},
@@ -2508,7 +2508,7 @@ test "HttpFetcher: every redirect Location is gated, and the chain is bounded (r
     defer http_client.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/rdap/domain/x", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/rdap/domain/x", .{port});
     var body_buf: [512]u8 = undefined;
 
     // (a) The policy a caller uses to reach a plaintext loopback server on

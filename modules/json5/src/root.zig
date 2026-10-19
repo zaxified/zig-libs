@@ -304,7 +304,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         const colon = findKeyColon(input, j);
                         const err_line = lines.at(input, key_start);
                         err_counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, err_counter });
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, err_counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         if (colon >= input.len or input[colon] != ':') {
@@ -314,7 +314,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                             // slice past the buffer; mirrors preprocessAnnotated's has_colon guard.
                             const skip_end = skipValue(input, j);
                             const after = trimForMessage(input[key_start..skip_end]);
-                            const msg = try std.fmt.allocPrint(alloc, "{s} --> missing colon after key at line {d}", .{
+                            const msg = try alloc.print("{s} --> missing colon after key at line {d}", .{
                                 after, err_line,
                             });
                             defer alloc.free(msg);
@@ -330,7 +330,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                             // 200 KB "compact" message (F10). All three now go
                             // through `trimForMessage`.
                             const raw_val = trimForMessage(input[vs..val_end]);
-                            const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key at line {d}", .{
+                            const msg = try alloc.print("{s}: '{s}' --> malformed key at line {d}", .{
                                 raw_key, raw_val, err_line,
                             });
                             defer alloc.free(msg);
@@ -353,10 +353,10 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         const val_end = skipValue(input, skip_from);
                         const raw = trimForMessage(input[bad_start..val_end]);
                         err_counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, err_counter });
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, err_counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
-                        const msg = try std.fmt.allocPrint(alloc, "'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
+                        const msg = try alloc.print("'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
                         defer alloc.free(msg);
                         try appendJsonStr(&out, alloc, msg);
                         i = val_end;
@@ -546,11 +546,11 @@ fn appendHexAsDecimal(alloc: std.mem.Allocator, out: *std.ArrayList(u8), digits:
         }
     }
     var buf: [9]u8 = undefined;
-    try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d}", .{limbs[n - 1]}) catch unreachable);
+    try out.appendSlice(alloc, std.mem.print(&buf, "{d}", .{limbs[n - 1]}) catch unreachable);
     var k = n - 1;
     while (k > 0) {
         k -= 1;
-        try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "{d:0>9}", .{limbs[k]}) catch unreachable);
+        try out.appendSlice(alloc, std.mem.print(&buf, "{d:0>9}", .{limbs[k]}) catch unreachable);
     }
 }
 
@@ -755,7 +755,7 @@ fn skipJson5WsAndComments(input: []const u8, from: usize) usize {
             j += 2;
             while (j < input.len and lineTerminatorLen(input, j) == 0) j += 1;
         } else if (input[j + 1] == '*') {
-            const end = std.mem.indexOfPos(u8, input, j + 2, "*/") orelse return j;
+            const end = std.mem.findPos(u8, input, j + 2, "*/") orelse return j;
             j = end + 2;
         } else break;
         j = skipJson5Ws(input, j);
@@ -794,7 +794,7 @@ fn appendStringByte(out: *std.ArrayList(u8), alloc: std.mem.Allocator, b: u8) !v
         0x0C => try out.appendSlice(alloc, "\\f"),
         else => {
             var buf: [6]u8 = undefined;
-            try out.appendSlice(alloc, std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{b}) catch unreachable);
+            try out.appendSlice(alloc, std.mem.print(&buf, "\\u{x:0>4}", .{b}) catch unreachable);
         },
     }
 }
@@ -876,7 +876,7 @@ fn trimForMessage(raw: []const u8) []const u8 {
 fn diagnosticPrefix(alloc: std.mem.Allocator, input: []const u8, comptime base: []const u8) ![]u8 {
     var extra: usize = 0;
     var at: usize = 0;
-    while (std.mem.indexOfPos(u8, input, at, base)) |found| : (at = found + 1) {
+    while (std.mem.findPos(u8, input, at, base)) |found| : (at = found + 1) {
         var k: usize = found + base.len;
         while (k < input.len and input[k] == '_') : (k += 1) {}
         // One more underscore than the longest run that already follows the
@@ -938,7 +938,7 @@ fn literalDiagnostic(
     message: []const u8,
     hint: []const u8,
 ) Diagnostic {
-    const line_start = if (std.mem.lastIndexOfScalar(u8, input[0..start], '\n')) |nl| nl + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, input[0..start], '\n')) |nl| nl + 1 else 0;
     return .{
         .line = lines.at(input, start),
         .col = start - line_start + 1,
@@ -1109,7 +1109,7 @@ fn flushValueErrs(
     for (errs.items) |msg| {
         try out.appendSlice(alloc, ", ");
         counter.* += 1;
-        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter.* });
+        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, counter.* });
         defer alloc.free(head);
         try out.appendSlice(alloc, head);
         try appendJsonStr(out, alloc, msg);
@@ -1197,7 +1197,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     }
                     try out.append(alloc, '"');
                     closed = true;
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
+                    const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
                     try pending_value_errs.append(alloc, msg);
                     i = skipValue(input, i);
                     break;
@@ -1237,7 +1237,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 // by the first corpus that ever reached this harness).
                 if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
-                const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
+                const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                 try pending_value_errs.append(alloc, msg);
             }
             continue;
@@ -1266,7 +1266,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     }
                     try out.append(alloc, '"');
                     closed = true;
-                    const msg = try std.fmt.allocPrint(alloc, "unterminated string at line {d}", .{lines.at(input, str_start)});
+                    const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
                     try pending_value_errs.append(alloc, msg);
                     i = skipValue(input, i);
                     break;
@@ -1306,7 +1306,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 // by the first corpus that ever reached this harness).
                 if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
-                const msg = try std.fmt.allocPrint(alloc, "unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
+                const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
                 try pending_value_errs.append(alloc, msg);
             }
             continue;
@@ -1430,7 +1430,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                         const has_colon = colon < input.len and input[colon] == ':';
                         const err_line = lines.at(input, key_start);
                         counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         if (!has_colon) {
@@ -1439,7 +1439,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             const skip_end = skipValue(input, j);
                             const after_full = std.mem.trim(u8, input[j..skip_end], " \t\r\n");
                             const after = trimForMessage(after_full);
-                            const msg = try std.fmt.allocPrint(alloc, "{s} {s} --> missing colon after key at line {d}", .{
+                            const msg = try alloc.print("{s} {s} --> missing colon after key at line {d}", .{
                                 input[key_start..i], after, err_line,
                             });
                             defer alloc.free(msg);
@@ -1452,7 +1452,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             const val_end = skipValue(input, vs);
                             const raw_val = trimForMessage(input[vs..val_end]);
                             const ws_kind = whitespaceKind(input[i..colon]);
-                            const msg = try std.fmt.allocPrint(alloc, "{s}: '{s}' --> malformed key ({s} in key) at line {d}", .{
+                            const msg = try alloc.print("{s}: '{s}' --> malformed key ({s} in key) at line {d}", .{
                                 raw_key, raw_val, ws_kind, err_line,
                             });
                             defer alloc.free(msg);
@@ -1507,10 +1507,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                         try flushValueErrs(&out, alloc, &pending_value_errs, &counter, prefix);
                         if (needsLeadingComma(out.items)) try out.appendSlice(alloc, ", ");
                         const err_line = lines.at(input, start);
-                        const msg = try std.fmt.allocPrint(alloc, "missing comma before '{s}' at line {d}", .{ ident, err_line });
+                        const msg = try alloc.print("missing comma before '{s}' at line {d}", .{ ident, err_line });
                         defer alloc.free(msg);
                         counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         try appendJsonStr(&out, alloc, msg);
@@ -1559,7 +1559,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             try out.appendSlice(alloc, ident);
                             try out.append(alloc, '"');
                             const err_line = lines.at(input, start);
-                            const msg = try std.fmt.allocPrint(alloc, "'{s}' --> invalid literal in value position at line {d}", .{
+                            const msg = try alloc.print("'{s}' --> invalid literal in value position at line {d}", .{
                                 ident, err_line,
                             });
                             try pending_value_errs.append(alloc, msg);
@@ -1583,10 +1583,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                         const val_end = skipValue(input, skip_from);
                         const raw = trimForMessage(input[bad_start..val_end]);
                         counter += 1;
-                        const head = try std.fmt.allocPrint(alloc, "\"{s}{d}\": ", .{ prefix, counter });
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
-                        const msg = try std.fmt.allocPrint(alloc, "'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
+                        const msg = try alloc.print("'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
                         defer alloc.free(msg);
                         try appendJsonStr(&out, alloc, msg);
                         i = val_end;
@@ -1788,7 +1788,7 @@ test "annotated: newline inside unquoted key" {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
     defer parsed.deinit();
     const err = parsed.value.object.get("$err_1") orelse return error.Missing;
-    try std.testing.expect(std.mem.indexOf(u8, err.string, "newline in key") != null);
+    try std.testing.expect(std.mem.find(u8, err.string, "newline in key") != null);
 }
 
 test "annotated: error message reports the correct line number (mutation guard)" {
@@ -1803,7 +1803,7 @@ test "annotated: error message reports the correct line number (mutation guard)"
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
     defer parsed.deinit();
     const err = parsed.value.object.get("$err_1") orelse return error.Missing;
-    try std.testing.expect(std.mem.indexOf(u8, err.string, "at line 3") != null);
+    try std.testing.expect(std.mem.find(u8, err.string, "at line 3") != null);
 }
 
 test "annotated: tab inside a malformed key is labeled 'tab', not 'newline' (mutation guard)" {
@@ -1818,7 +1818,7 @@ test "annotated: tab inside a malformed key is labeled 'tab', not 'newline' (mut
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
     defer parsed.deinit();
     const err = parsed.value.object.get("$err_1") orelse return error.Missing;
-    try std.testing.expect(std.mem.indexOf(u8, err.string, "tab in key") != null);
+    try std.testing.expect(std.mem.find(u8, err.string, "tab in key") != null);
 }
 
 test "annotated: missing colon after key" {
@@ -1829,7 +1829,7 @@ test "annotated: missing colon after key" {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, r.out, .{});
     defer parsed.deinit();
     const err = parsed.value.object.get("$err_1") orelse return error.Missing;
-    try std.testing.expect(std.mem.indexOf(u8, err.string, "missing colon") != null);
+    try std.testing.expect(std.mem.find(u8, err.string, "missing colon") != null);
     // Subsequent key still parsed — recovery resumes at next ',' / '}'.
     try std.testing.expect(parsed.value.object.get("b") != null);
 }
@@ -1849,7 +1849,7 @@ test "annotated: unterminated string with newline" {
     var it = parsed.value.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, "$err_")) {
-            if (std.mem.indexOf(u8, kv.value_ptr.string, "unterminated string") != null) {
+            if (std.mem.find(u8, kv.value_ptr.string, "unterminated string") != null) {
                 found_unterm = true;
             }
         }
@@ -1871,7 +1871,7 @@ test "annotated: unterminated string at EOF" {
     var it = parsed.value.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, "$err_")) {
-            if (std.mem.indexOf(u8, kv.value_ptr.string, "unterminated string") != null) {
+            if (std.mem.find(u8, kv.value_ptr.string, "unterminated string") != null) {
                 found = true;
                 break;
             }
@@ -1895,7 +1895,7 @@ test "annotated: invalid literal in value position" {
     var it = parsed.value.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, "$err_")) {
-            if (std.mem.indexOf(u8, kv.value_ptr.string, "invalid literal") != null) {
+            if (std.mem.find(u8, kv.value_ptr.string, "invalid literal") != null) {
                 found = true;
             }
         }
@@ -1917,7 +1917,7 @@ test "annotated: missing comma between object entries" {
     var it = parsed.value.object.iterator();
     while (it.next()) |kv| {
         if (std.mem.startsWith(u8, kv.key_ptr.*, "$err_")) {
-            if (std.mem.indexOf(u8, kv.value_ptr.string, "missing comma") != null) {
+            if (std.mem.find(u8, kv.value_ptr.string, "missing comma") != null) {
                 found = true;
             }
         }
@@ -1950,7 +1950,7 @@ test "preprocess: unquoted key with no colon before EOF does not slice OOB (audi
     // safely (emitting an $err_trace entry) instead of crashing.
     const out = try preprocess(alloc, "{a b");
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace") != null);
+    try std.testing.expect(std.mem.find(u8, out, "$err_trace") != null);
     // ⭐ And the output has to PARSE. This assertion is the one the test was
     // missing: the recovery entry above was being emitted into a document with
     // no closing brace, so `std.json` could not read it and the diagnostic the
@@ -2075,7 +2075,7 @@ test "corpus: every seed reaches both entry points, and the rewriting they do is
         if (!std.mem.eql(u8, plain, buf[0..len])) rewritten += 1;
         const r = preprocessAnnotated(alloc, buf[0..len]) catch continue;
         defer alloc.free(r.out);
-        if (std.mem.indexOf(u8, r.out, "$err") != null) with_diagnostic += 1;
+        if (std.mem.find(u8, r.out, "$err") != null) with_diagnostic += 1;
         // The harness's own oracle, run over the corpus: the two entry points
         // must agree on whether the result is parseable JSON.
         try std.testing.expectEqual(jsonParses(alloc, plain), jsonParses(alloc, r.out));
@@ -2148,7 +2148,7 @@ test "annotated: an exponent is part of the number, not a bare identifier" {
             return error.AnnotatedEmittedInvalidJson;
         };
         parsed.deinit();
-        if (std.mem.indexOf(u8, r.out, "$err") != null) {
+        if (std.mem.find(u8, r.out, "$err") != null) {
             std.debug.print("\nannotated({s}) -> {s}\n", .{ src, r.out });
             return error.DiagnosedAValidNumber;
         }
@@ -2425,8 +2425,8 @@ test "error recovery: a huge malformed key yields a capped message" {
     const alloc = std.testing.allocator;
     const out = try preprocess(alloc, "{" ++ strRepeat("k", 200) ++ " x: 1}");
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, strRepeat("k", message_fragment_max + 1)) == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, strRepeat("k", message_fragment_max)) != null);
+    try std.testing.expect(std.mem.find(u8, out, strRepeat("k", message_fragment_max + 1)) == null);
+    try std.testing.expect(std.mem.find(u8, out, strRepeat("k", message_fragment_max)) != null);
 }
 
 test "numeric literals: every JSON5 form becomes a plain JSON number" {
@@ -2465,7 +2465,7 @@ test "numeric literals: a hex value of any length becomes its exact decimal inte
     try expectRewrite("[0xFFFFFFFFFFFFFFFF]", "[18446744073709551615]");
     try expectRewrite("[0x10000000000000000]", "[18446744073709551616]");
     var buf: [64]u8 = undefined;
-    const max128 = try std.fmt.bufPrint(&buf, "[{d}]", .{std.math.maxInt(u128)});
+    const max128 = try std.mem.print(&buf, "[{d}]", .{std.math.maxInt(u128)});
     try expectRewrite("[0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF]", max128);
 
     // The largest accepted literal — 256 significant digits, 2^1024 - 1 — is
@@ -2554,7 +2554,7 @@ test "numeric literals: a stray sign or word keeps its old handling" {
     try std.testing.expectEqualStrings("[-foo]", plain);
     const r = try preprocessAnnotated(alloc, "{a: -foo}");
     defer alloc.free(r.out);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "$err_1") != null);
+    try std.testing.expect(std.mem.find(u8, r.out, "$err_1") != null);
 }
 
 test "non-finite numbers: an error by default, with a line and a message" {
@@ -2570,8 +2570,8 @@ test "non-finite numbers: an error by default, with a line and a message" {
         try std.testing.expect(lit.len <= "+Infinity".len);
         try std.testing.expectEqual(diag.offset + 1, diag.col); // single line: col = offset + 1
         // The integrator's advice lives in `hint`, the end user's text in `message`.
-        try std.testing.expect(std.mem.indexOf(u8, diag.message, ".quoted") == null);
-        try std.testing.expect(std.mem.indexOf(u8, diag.hint, ".quoted") != null);
+        try std.testing.expect(std.mem.find(u8, diag.message, ".quoted") == null);
+        try std.testing.expect(std.mem.find(u8, diag.hint, ".quoted") != null);
         try std.testing.expectError(error.NonFiniteNumber, preprocess(alloc, src)); // no diagnostic asked for
     }
     var diag: Diagnostic = .{};
@@ -2593,7 +2593,7 @@ test "non-finite numbers: the annotated entry passes them through, so recovery n
     for (cases) |src| {
         const r = try preprocessAnnotated(alloc, src);
         defer alloc.free(r.out);
-        try std.testing.expect(std.mem.indexOf(u8, r.out, "$err") == null);
+        try std.testing.expect(std.mem.find(u8, r.out, "$err") == null);
         try std.testing.expect(!jsonParses(alloc, r.out));
     }
     try std.testing.expectEqual(@as(u32, 1), (try annotatedNextId(alloc, "[NaN]")));
@@ -2910,7 +2910,7 @@ test "unquoted keys: non-ASCII identifier characters and \\u escapes" {
     const alloc = std.testing.allocator;
     const out = try preprocess(alloc, "{\\u0020: 1}");
     defer alloc.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "$err_trace_") != null);
+    try std.testing.expect(std.mem.find(u8, out, "$err_trace_") != null);
 }
 
 test "unquoted keys: a comment between the key and its colon" {
@@ -2918,7 +2918,7 @@ test "unquoted keys: a comment between the key and its colon" {
     const alloc = std.testing.allocator;
     const r = try preprocessAnnotated(alloc, "{a /* c */: 1}");
     defer alloc.free(r.out);
-    try std.testing.expect(std.mem.indexOf(u8, r.out, "$err") == null);
+    try std.testing.expect(std.mem.find(u8, r.out, "$err") == null);
 }
 
 test "a truncated document is refused, not completed" {

@@ -374,8 +374,8 @@ fn renderNumericSite(
     var num_buf: [64]u8 = undefined;
     const num: []const u8 = switch (spelling) {
         .via_ctx => "nn",
-        .literal_float => try std.fmt.bufPrint(&num_buf, "{d}.0e{d}", .{ script.n, script.exp }),
-        .literal_int => try std.fmt.bufPrint(&num_buf, "{d}", .{script.n}),
+        .literal_float => try std.mem.print(&num_buf, "{d}.0e{d}", .{ script.n, script.exp }),
+        .literal_int => try std.mem.print(&num_buf, "{d}", .{script.n}),
     };
 
     const src = try std.mem.concat(gpa, u8, &.{ site.pre, num, site.post });
@@ -511,7 +511,7 @@ fn fuzzAutoescapeInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) 
     // every input, which is the point of having a table of them.
     var buf: [256]u8 = undefined;
     const evil = drawFrom(S, smith, &buf, &escape_seeds);
-    if (std.mem.indexOfAny(u8, evil, "<>") != null) EscMark.mark(.markup_in_datum);
+    if (std.mem.findAny(u8, evil, "<>") != null) EscMark.mark(.markup_in_datum);
 
     var env = try jinja.Environment.init(gpa, .{ .autoescape = true, .undefined_policy = .lenient });
     defer env.deinit();
@@ -536,7 +536,7 @@ fn fuzzAutoescapeInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) 
         defer gpa.free(out);
         EscMark.mark(.rendered);
 
-        if (std.mem.indexOfAny(u8, out, "<>")) |at| {
+        if (std.mem.findAny(u8, out, "<>")) |at| {
             std.debug.print(
                 "\nautoescape bypass: '{s}' with e={f} rendered '{f}' (live markup at byte {d})\n",
                 .{ src, std.ascii.hexEscape(evil, .lower), std.ascii.hexEscape(out, .lower), at },
@@ -599,7 +599,7 @@ fn fuzzXmlattrInvariant(comptime S: type, smith: *S, gpa: std.mem.Allocator) any
     // never once held a byte.
     var kbuf: [128]u8 = undefined;
     const kn = drawInput(S, smith, &kbuf, &xmlattr_seeds);
-    if (std.mem.indexOfAny(u8, kbuf[0..kn], " \t\n/>=\"") != null) XmlMark.mark(.key_with_space);
+    if (std.mem.findAny(u8, kbuf[0..kn], " \t\n/>=\"") != null) XmlMark.mark(.key_with_space);
     var vbuf: [128]u8 = undefined;
     const vn = smith.slice(&vbuf);
 
@@ -651,7 +651,7 @@ fn attrsWellFormed(out: []const u8) bool {
     while (rest.len != 0) {
         if (rest[0] != ' ') return false;
         rest = rest[1..];
-        const eq = std.mem.indexOfScalar(u8, rest, '=') orelse return false;
+        const eq = std.mem.findScalar(u8, rest, '=') orelse return false;
         for (rest[0..eq]) |c| switch (c) {
             ' ', '\t', '\n', '\r', 0x0b, 0x0c, '/', '>', '"' => return false,
             else => {},
@@ -659,7 +659,7 @@ fn attrsWellFormed(out: []const u8) bool {
         rest = rest[eq + 1 ..];
         if (rest.len == 0 or rest[0] != '"') return false;
         rest = rest[1..];
-        const close = std.mem.indexOfScalar(u8, rest, '"') orelse return false;
+        const close = std.mem.findScalar(u8, rest, '"') orelse return false;
         rest = rest[close + 1 ..];
     }
     return true;
@@ -968,7 +968,7 @@ test "corpus: every autoescape seed reaches every site, and the markup escaped i
             // The invariant itself, asserted here too: a `std.testing.fuzz`
             // body never runs without `--fuzz`, so without this the oracle
             // would only ever be checked by a sweep nobody is running.
-            try std.testing.expect(std.mem.indexOfAny(u8, out, "<>") == null);
+            try std.testing.expect(std.mem.findAny(u8, out, "<>") == null);
         }
     }
     // `escape_seeds` deliberately keeps the empty datum — the value the
@@ -1055,7 +1055,7 @@ fn fuzzArith(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var tbuf: [96]u8 = undefined;
     const syms = [_][]const u8{ "+", "-", "*", "//", "%", "<", "==" };
     const sym = syms[op];
-    const text = try std.fmt.bufPrint(&tbuf, "{{{{ ({d}) {s} ({d}) }}}}", .{ a, sym, b });
+    const text = try std.mem.print(&tbuf, "{{{{ ({d}) {s} ({d}) }}}}", .{ a, sym, b });
 
     var env = try jinja.Environment.init(gpa, .{ .undefined_policy = .strict });
     defer env.deinit();
@@ -1064,19 +1064,19 @@ fn fuzzArith(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 
     var want_buf: [32]u8 = undefined;
     const want: ?[]const u8 = switch (op) {
-        0 => try std.fmt.bufPrint(&want_buf, "{d}", .{a + b}),
-        1 => try std.fmt.bufPrint(&want_buf, "{d}", .{a - b}),
-        2 => try std.fmt.bufPrint(&want_buf, "{d}", .{a * b}),
+        0 => try std.mem.print(&want_buf, "{d}", .{a + b}),
+        1 => try std.mem.print(&want_buf, "{d}", .{a - b}),
+        2 => try std.mem.print(&want_buf, "{d}", .{a * b}),
         3 => if (b == 0) null else blk: {
             ArithMark.mark(.floor_division);
-            break :blk try std.fmt.bufPrint(&want_buf, "{d}", .{@divFloor(a, b)});
+            break :blk try std.mem.print(&want_buf, "{d}", .{@divFloor(a, b)});
         },
-        4 => if (b == 0) null else try std.fmt.bufPrint(&want_buf, "{d}", .{@mod(a, b)}),
+        4 => if (b == 0) null else try std.mem.print(&want_buf, "{d}", .{@mod(a, b)}),
         5 => blk: {
             ArithMark.mark(.comparison);
-            break :blk try std.fmt.bufPrint(&want_buf, "{s}", .{if (a < b) "True" else "False"});
+            break :blk try std.mem.print(&want_buf, "{s}", .{if (a < b) "True" else "False"});
         },
-        else => try std.fmt.bufPrint(&want_buf, "{s}", .{if (a == b) "True" else "False"}),
+        else => try std.mem.print(&want_buf, "{s}", .{if (a == b) "True" else "False"}),
     };
 
     const out = tmpl.render(gpa, .{ .map = .{ .pairs = &.{} } }, null) catch {

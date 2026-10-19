@@ -410,7 +410,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 // No `(?…)`: the `?` is a repetition with nothing before it.
             } else if (std.mem.startsWith(u8, b.src[b.pos..], "?P<") or std.mem.startsWith(u8, b.src[b.pos..], "?<")) {
                 b.pos += if (b.src[b.pos + 1] == 'P') 3 else 2;
-                const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '>') orelse return error.InvalidNamedCapture;
+                const end = std.mem.findScalarPos(u8, b.src, b.pos, '>') orelse return error.InvalidNamedCapture;
                 const n = b.src[b.pos..end];
                 if (n.len == 0) return error.InvalidNamedCapture;
                 for (n) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return error.InvalidNamedCapture;
@@ -508,7 +508,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             const c = b.peek();
             if (c >= 0x80) return error.InvalidEscape;
             // POSIX: none of the Perl and Unicode class escapes, assertions or `\Q`.
-            if (b.posix and std.mem.indexOfScalar(u8, "dDsSwWpPAzbBQ", c) != null) return error.InvalidEscape;
+            if (b.posix and std.mem.findScalar(u8, "dDsSwWpPAzbBQ", c) != null) return error.InvalidEscape;
             b.pos += 1;
             switch (c) {
                 'a' => return .{ .rune = 0x07 },
@@ -533,7 +533,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     if (b.eof()) return error.InvalidEscape;
                     if (b.peek() == '{') {
                         // Any number of hex digits (leading zeros too), at most U+10FFFF.
-                        const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidEscape;
+                        const end = std.mem.findScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidEscape;
                         const digits = b.src[b.pos + 1 .. end];
                         if (digits.len == 0) return error.InvalidEscape;
                         var v: u32 = 0;
@@ -568,7 +568,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     if (b.eof()) return error.InvalidUnicodeClass;
                     var name: []const u8 = undefined;
                     if (b.peek() == '{') {
-                        const end = std.mem.indexOfScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidUnicodeClass;
+                        const end = std.mem.findScalarPos(u8, b.src, b.pos, '}') orelse return error.InvalidUnicodeClass;
                         name = b.src[b.pos + 1 .. end];
                         b.pos = end + 1;
                     } else {
@@ -599,7 +599,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 },
                 'Q' => {
                     if (in_class) return error.InvalidEscape;
-                    const end = std.mem.indexOfPos(u8, b.src, b.pos, "\\E") orelse b.src.len;
+                    const end = std.mem.findPos(u8, b.src, b.pos, "\\E") orelse b.src.len;
                     const text = b.src[b.pos..end];
                     b.pos = @min(end + 2, b.src.len);
                     return .{ .quoted = text };
@@ -728,7 +728,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// `[:name:]` / `[:^name:]` at `pos`; false (nothing consumed) when the
         /// text is not one, so `[[:]` stays a literal `[` and `:`.
         fn posixClass(b: *Self, fold: bool) Error!bool {
-            const end = std.mem.indexOfPos(u8, b.src, b.pos + 2, ":]") orelse return false;
+            const end = std.mem.findPos(u8, b.src, b.pos + 2, ":]") orelse return false;
             var name = b.src[b.pos + 2 .. end];
             const negated = name.len != 0 and name[0] == '^';
             if (negated) name = name[1..];

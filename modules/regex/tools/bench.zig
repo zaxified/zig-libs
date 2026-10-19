@@ -219,11 +219,11 @@ pub fn main(init: std.process.Init) !u8 {
     // (no pattern here contains a tab). Literal strings get a file each.
     var list: std.Io.Writer.Allocating = .init(arena);
     for (workloads) |w| {
-        if (only) |o| if (std.mem.indexOf(u8, w.name, o) == null) continue;
+        if (only) |o| if (std.mem.find(u8, w.name, o) == null) continue;
         const file = switch (w.text) {
-            .file => |f| try std.fmt.allocPrint(arena, "{s}.txt", .{f}),
+            .file => |f| try arena.print("{s}.txt", .{f}),
             .literal => |l| blk: {
-                const f = try std.fmt.allocPrint(arena, "lit-{s}.txt", .{w.name});
+                const f = try arena.print("lit-{s}.txt", .{w.name});
                 try dir.writeFile(io, .{ .sub_path = f, .data = l });
                 break :blk f;
             },
@@ -273,7 +273,7 @@ pub fn main(init: std.process.Init) !u8 {
     var best: f64 = std.math.inf(f64);
     var mismatch = false;
     for (workloads) |wl| {
-        if (only) |o| if (std.mem.indexOf(u8, wl.name, o) == null) continue;
+        if (only) |o| if (std.mem.find(u8, wl.name, o) == null) continue;
         const s: []const u8 = switch (wl.text) {
             .file => |f| if (std.mem.eql(u8, f, "rnd")) texts.rnd else if (std.mem.eql(u8, f, "inv")) texts.inv else texts.cz,
             .literal => |l| l,

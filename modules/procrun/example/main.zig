@@ -47,7 +47,7 @@ pub fn main() !void {
         var out = try procrun.run(gpa, io, .{ .argv = &.{ "/bin/echo", "hello from procrun" } }, "");
         defer out.deinit(gpa);
         must(out.term == .exited and out.term.exited == 0, @src());
-        must(std.mem.indexOf(u8, out.stdout, "hello from procrun") != null, @src());
+        must(std.mem.find(u8, out.stdout, "hello from procrun") != null, @src());
         std.debug.print("echo: exited 0, captured {d} stdout bytes\n", .{out.stdout.len});
     }
 
@@ -141,8 +141,8 @@ pub fn main() !void {
         const term = h.wait();
         must(term == .exited and term.exited == 0, @src());
         must(sink.saw_exit and sink.exit_code == 0, @src());
-        must(std.mem.indexOf(u8, sink.out.items, "line1") != null, @src());
-        must(std.mem.indexOf(u8, sink.out.items, "line3") != null, @src());
+        must(std.mem.find(u8, sink.out.items, "line1") != null, @src());
+        must(std.mem.find(u8, sink.out.items, "line3") != null, @src());
         std.debug.print("spawnStreaming: {d} bytes streamed under 1-permit backpressure, on_exit fired\n", .{sink.out.items.len});
     }
 
@@ -181,7 +181,7 @@ pub fn main() !void {
         );
         defer out.deinit(gpa);
         must(out.term == .exited and out.term.exited == 0, @src());
-        must(std.mem.indexOf(u8, out.stdout, "safe-arg") != null, @src());
+        must(std.mem.find(u8, out.stdout, "safe-arg") != null, @src());
         std.debug.print("runValidated: safe args accepted and run\n", .{});
     }
 

@@ -61,7 +61,7 @@ const M = server.Methods(EchoRequest, EchoReply);
 
 fn unaryImpl(c: *server.Call, req: EchoRequest) anyerror!EchoReply {
     return .{
-        .text = try std.fmt.allocPrint(c.arena, "echo:{s}", .{req.text}),
+        .text = try c.arena.print("echo:{s}", .{req.text}),
         .index = req.count,
         .blob = req.blob,
     };
@@ -71,7 +71,7 @@ fn serverStreamImpl(s: *M.Stream, req: EchoRequest) anyerror!void {
     var i: i32 = 0;
     while (i < req.count) : (i += 1) {
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "{s}-{d}", .{ req.text, i }),
+            .text = try s.call.arena.print("{s}-{d}", .{ req.text, i }),
             .index = i,
         });
     }
@@ -96,7 +96,7 @@ fn bidiImpl(s: *M.Stream) anyerror!void {
     while (try s.receive()) |*r| {
         defer @constCast(r).deinit();
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "re:{s}", .{r.value.text}),
+            .text = try s.call.arena.print("re:{s}", .{r.value.text}),
             .index = i,
         });
         i += 1;
@@ -550,7 +550,7 @@ test "server: server-streaming sends N messages, then one trailer section" {
         defer d.deinit();
         var name: [16]u8 = undefined;
         try testing.expectEqualStrings(
-            try std.fmt.bufPrint(&name, "tick-{d}", .{i}),
+            try std.mem.print(&name, "tick-{d}", .{i}),
             d.value.text,
         );
     }
@@ -662,7 +662,7 @@ test "server: an error before any message is a Trailers-Only response" {
     // The message is percent-encoded per the ABNF: the raw bytes above are
     // not legal in a field value.
     const raw = r.header("grpc-message").?;
-    try testing.expect(std.mem.indexOfScalar(u8, raw, '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, raw, '\n') == null);
     var dec: [128]u8 = undefined;
     try testing.expectEqualStrings(detail, status_mod.decodeMessage(raw, &dec));
 }

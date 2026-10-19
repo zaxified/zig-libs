@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std's unchecked DER reader (`Certificate.parse`) re-read against the 0.17.0 std (unchanged); 0.16-only measurements are labelled as such.
 
 - **2026-10-09** — tests: deterministic fuzz driver `XMLDSIG_FUZZ` over the existing `verify` harness, which now also checks that the genuine signed document is accepted and one with 1-3 octets flipped refused. The mode-4 oracle (genuine accepted, any flipped octet refused) exempts only changes inside the SignatureValue text and whitespace-for-whitespace inside a tag, which C14N normalizes (the 200k verdict met one at seed 33152: a space before an attribute became a tab, and the signature rightly held).

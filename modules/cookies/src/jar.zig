@@ -60,9 +60,9 @@ pub const SetCookie = struct {
     /// value over 4096 bytes). Unknown and malformed attributes are skipped;
     /// the last of each kind wins.
     pub fn parse(field: []const u8) ?SetCookie {
-        const nv_end = std.mem.indexOfScalar(u8, field, ';') orelse field.len;
+        const nv_end = std.mem.findScalar(u8, field, ';') orelse field.len;
         const nv = field[0..nv_end];
-        const eq = std.mem.indexOfScalar(u8, nv, '=') orelse return null;
+        const eq = std.mem.findScalar(u8, nv, '=') orelse return null;
         var sc: SetCookie = .{
             .name = std.mem.trim(u8, nv[0..eq], wsp),
             .value = std.mem.trim(u8, nv[eq + 1 ..], wsp),
@@ -74,7 +74,7 @@ pub const SetCookie = struct {
         var attrs = std.mem.splitScalar(u8, field[nv_end..], ';');
         _ = attrs.next(); // the (empty) part before the first `;`
         while (attrs.next()) |av| {
-            const a_eq = std.mem.indexOfScalar(u8, av, '=');
+            const a_eq = std.mem.findScalar(u8, av, '=');
             const name = std.mem.trim(u8, av[0 .. a_eq orelse av.len], wsp);
             const value = if (a_eq) |e| std.mem.trim(u8, av[e + 1 ..], wsp) else "";
             if (value.len > max_attribute_bytes) continue;
@@ -472,7 +472,7 @@ fn lowerInto(buf: *[256]u8, s: []const u8) ?[]const u8 {
 }
 
 fn isIp(host: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, host, ':') != null) return true;
+    if (std.mem.findScalar(u8, host, ':') != null) return true;
     var dots: usize = 0;
     for (host) |c| {
         if (c == '.') dots += 1 else if (!std.ascii.isDigit(c)) return false;
@@ -498,7 +498,7 @@ fn pathMatch(req: []const u8, cookie: []const u8) bool {
 /// `/` -- or `/`.
 fn defaultPath(uri_path: []const u8) []const u8 {
     if (uri_path.len == 0 or uri_path[0] != '/') return "/";
-    const last = std.mem.lastIndexOfScalar(u8, uri_path, '/').?;
+    const last = std.mem.findScalarLast(u8, uri_path, '/').?;
     return if (last == 0) "/" else uri_path[0..last];
 }
 

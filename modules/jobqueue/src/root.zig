@@ -117,7 +117,7 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 // ── public value types ───────────────────────────────────────────────────────
 
 /// Distinct durable job identifier (the monotonic counter value). Opaque —
-/// use `@intFromEnum` only for logging.
+/// use `@backingInt` only for logging.
 pub const JobId = enum(u64) { _ };
 
 /// Dispatch priority. Higher enum value = dispatched first; ties break FIFO
@@ -302,7 +302,7 @@ const Job = struct {
 const meta_key = "m/next_id";
 
 fn jobKey(buf: *[24]u8, id: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "j/{d}", .{id}) catch unreachable;
+    return std.mem.print(buf, "j/{d}", .{id}) catch unreachable;
 }
 
 fn addNs(wall: i64, ns: u64) i64 {
@@ -1877,7 +1877,7 @@ test "sweep: random operations and crashes agree with a model" {
                 0, 1, 2 => {
                     const key: ?u8 = if (r.boolean()) r.uintLessThan(u8, 6) else null;
                     var kb: [4]u8 = undefined;
-                    const ks = if (key) |k| std.fmt.bufPrint(&kb, "k{d}", .{k}) catch unreachable else "";
+                    const ks = if (key) |k| std.mem.print(&kb, "k{d}", .{k}) catch unreachable else "";
                     var held_key = false;
                     if (key) |k| {
                         var it = model.valueIterator();

@@ -255,14 +255,14 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
 /// written, or `error.NoSpaceLeft` if `buf` is too small.
 pub fn roundPath(buf: []u8, chain_hash_hex: []const u8, round: u64) PathError![]const u8 {
     try checkChainHashHex(chain_hash_hex);
-    return std.fmt.bufPrint(buf, "/{s}/public/{d}", .{ chain_hash_hex, round }) catch
+    return std.mem.print(buf, "/{s}/public/{d}", .{ chain_hash_hex, round }) catch
         return error.NoSpaceLeft;
 }
 
 /// The path for the LATEST round: `/<chain_hash>/public/latest`.
 pub fn latestPath(buf: []u8, chain_hash_hex: []const u8) PathError![]const u8 {
     try checkChainHashHex(chain_hash_hex);
-    return std.fmt.bufPrint(buf, "/{s}/public/latest", .{chain_hash_hex}) catch
+    return std.mem.print(buf, "/{s}/public/latest", .{chain_hash_hex}) catch
         return error.NoSpaceLeft;
 }
 
@@ -339,8 +339,7 @@ test "parseRound: an on-curve signature OUTSIDE G1 → SignatureNotInSubgroup (W
     try testing.expect(g1.Jacobian.fromAffine(pt).isOnCurve());
     try testing.expect(!g1.Jacobian.fromAffine(pt).subgroupCheck());
 
-    const doc = try std.fmt.allocPrint(
-        testing.allocator,
+    const doc = try testing.allocator.print(
         "{{\"round\":1000,\"signature\":\"{s}\"}}",
         .{std.fmt.bytesToHex(comp, .lower)},
     );
@@ -446,8 +445,7 @@ fn nonSubgroupG2Compressed() ![g2.compressed_bytes]u8 {
 
 test "parseRound: an on-curve G2 signature OUTSIDE the subgroup → SignatureNotInSubgroup" {
     const comp = try nonSubgroupG2Compressed();
-    const doc = try std.fmt.allocPrint(
-        testing.allocator,
+    const doc = try testing.allocator.print(
         "{{\"round\":2,\"signature\":\"{s}\"}}",
         .{std.fmt.bytesToHex(comp, .lower)},
     );

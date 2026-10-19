@@ -363,7 +363,7 @@ test {
 }
 
 test "meta.model_after names BIP341" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BIP341") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BIP341") != null);
 }
 
 test "TweakedPublicKey.encoded_length" {

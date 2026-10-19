@@ -859,7 +859,7 @@ fn upgradeRequested(req: *Server.Request, rw: *const Server.ResponseWriter) ?[]c
     if (!rw.upgradable or rw.upgrade_in == null or req.control == null) return null;
     if (!connectionLists(req.head.iterate(), "upgrade")) return null;
     const protocol = req.header("upgrade") orelse return null;
-    const slash = std.mem.indexOfScalar(u8, protocol, '/');
+    const slash = std.mem.findScalar(u8, protocol, '/');
     if (!h1.isToken(protocol[0 .. slash orelse protocol.len])) return null;
     if (slash) |i| if (!h1.isToken(protocol[i + 1 ..])) return null;
     return protocol;
@@ -1012,7 +1012,7 @@ fn buildVia(buf: []u8, existing: ?[]const u8, pseudonym: []const u8) error{Overf
 /// brackets (RFC 9113 §8.3.1 / §3.3, same authority shape as h1's Host).
 fn buildAuthority(buf: []u8, backend: Backend) error{Overflow}![]const u8 {
     var w: std.Io.Writer = .fixed(buf);
-    if (std.mem.indexOfScalar(u8, backend.host, ':') != null) {
+    if (std.mem.findScalar(u8, backend.host, ':') != null) {
         w.print("[{s}]", .{backend.host}) catch return error.Overflow;
     } else {
         w.writeAll(backend.host) catch return error.Overflow;
@@ -1031,7 +1031,7 @@ fn buildUrl(buf: []u8, backend: Backend, path: []const u8, query: []const u8) er
     };
     w.print("{s}://", .{scheme}) catch return error.Overflow;
     // IPv6 literals need brackets in the authority.
-    if (std.mem.indexOfScalar(u8, backend.host, ':') != null) {
+    if (std.mem.findScalar(u8, backend.host, ':') != null) {
         w.print("[{s}]", .{backend.host}) catch return error.Overflow;
     } else {
         w.writeAll(backend.host) catch return error.Overflow;
@@ -1221,7 +1221,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     var url_buf: [64]u8 = undefined;
 
     { // Forwarding + header injection + hop-by-hop stripping.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reflect", .{proxy_port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/reflect", .{proxy_port});
         var res = try client.request(.get, url, .{
             .headers = &.{
                 .{ .name = "X-Keep", .value = "kept" }, // end-to-end → forwarded
@@ -1238,11 +1238,11 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         // Forwarding headers the origin saw:
         try testing.expectEqualStrings("127.0.0.1", res.header("x-saw-xff").?);
         try testing.expectEqualStrings("http", res.header("x-saw-proto").?);
-        try testing.expect(std.mem.indexOf(u8, res.header("x-saw-via").?, "1.1 zig-libs") != null);
+        try testing.expect(std.mem.find(u8, res.header("x-saw-via").?, "1.1 zig-libs") != null);
         try testing.expectEqualStrings("kept", res.header("x-saw-keep").?);
         // Host rewritten to the backend authority (default rewrite_host).
         var host_buf: [32]u8 = undefined;
-        const want_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{origin_port});
+        const want_host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{origin_port});
         try testing.expectEqualStrings(want_host, res.header("x-saw-reqhost").?);
         // Hop-by-hop request headers were stripped before the origin.
         try testing.expectEqualStrings("none", res.header("x-saw-upgrade").?);
@@ -1251,11 +1251,11 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         // by the proxy and never reached the client.
         try testing.expectEqual(@as(?[]const u8, null), res.header("keep-alive"));
         // The proxy injected a response-side Via too.
-        try testing.expect(std.mem.indexOf(u8, res.header("via").?, "1.1 zig-libs") != null);
+        try testing.expect(std.mem.find(u8, res.header("via").?, "1.1 zig-libs") != null);
     }
 
     { // Streaming request + response body (large, outgrows every buffer).
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
         const payload = strRepeat("STREAM", 20_000); // 120 KB
         var res = try client.request(.post, url, .{ .body = payload });
         defer res.deinit();
@@ -1266,7 +1266,7 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
     }
 
     { // An extension method is relayed as its token, body and all (Go).
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
         for ([_]?[]const u8{ "<propfind/>", null }) |payload| {
             var res = try client.request(.other, url, .{ .method_token = "PROPFIND", .body = payload });
             defer res.deinit();
@@ -1311,11 +1311,11 @@ test "integration: reverse proxy forwards, injects headers, strips hop-by-hop, 5
         defer dead_proxy.shutdown();
         const dp = dead_proxy.boundAddress().getPort();
 
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/anything", .{dp});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/anything", .{dp});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 502), res.status);
-        try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
+        try testing.expect(std.mem.find(u8, res.header("via").?, "zig-libs") != null);
     }
 }
 
@@ -1462,7 +1462,7 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{proxy_port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{proxy_port});
 
     const over_bytes = Relayed.get(&client, url);
     const over_count = Relayed.get(&client, url);
@@ -1472,13 +1472,13 @@ test "integration: a backend header set the proxy cannot relay answers 502, not 
     // behind the client's back. The old `catch {}` produced a 200 that looked
     // perfectly normal and was missing `X-Fat-005` onward.
     try testing.expectEqual(@as(u16, 502), over_bytes.status);
-    try testing.expect(std.mem.indexOf(u8, over_bytes.body(), "could not be relayed") != null);
+    try testing.expect(std.mem.find(u8, over_bytes.body(), "could not be relayed") != null);
     // Not even the fields that DID fit before the budget ran out ride along
     // on the 502 — `reset` drops the half-relayed set.
     try testing.expectEqual(@as(?usize, null), over_bytes.fat_first);
     try testing.expectEqual(@as(?usize, null), over_bytes.fat_last);
     // …and the hop that failed names itself.
-    try testing.expect(std.mem.indexOf(u8, over_bytes.via(), "zig-libs") != null);
+    try testing.expect(std.mem.find(u8, over_bytes.via(), "zig-libs") != null);
 
     // Same answer when it is the field count rather than the byte budget.
     try testing.expectEqual(@as(u16, 502), over_count.status);
@@ -1547,7 +1547,7 @@ fn readStreamed(client: *Client, url: []const u8, origin: *StreamingOrigin, out:
     const r = res.reader();
     while (true) {
         _ = r.stream(&w, .unlimited) catch break;
-        if (std.mem.indexOf(u8, w.buffered(), "data: one\n\n") != null) origin.got_first.store(true, .release);
+        if (std.mem.find(u8, w.buffered(), "data: one\n\n") != null) origin.got_first.store(true, .release);
     }
     return w.buffered();
 }
@@ -1585,7 +1585,7 @@ test "integration: a streaming response (SSE, or no declared length) is flushed 
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{proxy.boundAddress().getPort()});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{proxy.boundAddress().getPort()});
     var bufs: [2][64]u8 = undefined;
     const sse = readStreamed(&client, url, &origin, &bufs[0]);
     const ndjson = readStreamed(&client, url, &origin, &bufs[1]);
@@ -1696,7 +1696,7 @@ test "integration: an upgrade passes through — 101 relayed, bytes both ways, i
         try testing.expect(h1.tokenListContains(parsed.header("connection").?, "upgrade"));
         try testing.expectEqualStrings("1", parsed.header("x-up").?); // end-to-end field relayed
         try testing.expectEqual(@as(?[]const u8, null), parsed.header("keep-alive")); // hop-by-hop dropped
-        try testing.expect(std.mem.indexOf(u8, parsed.header("via").?, "zig-libs") != null);
+        try testing.expect(std.mem.find(u8, parsed.header("via").?, "zig-libs") != null);
         var got: [5]u8 = undefined;
         try sr.interface.readSliceAll(&got);
         try testing.expectEqualStrings("hello", &got);
@@ -1714,7 +1714,7 @@ test "integration: an upgrade passes through — 101 relayed, bytes both ways, i
         var client = Client.init(io, testing.allocator, .{});
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/mismatch", .{proxy.boundAddress().getPort()});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/mismatch", .{proxy.boundAddress().getPort()});
         var res = try client.request(.get, url, .{ .headers = &.{
             .{ .name = "Connection", .value = "Upgrade" },
             .{ .name = "Upgrade", .value = "echo" },
@@ -1739,7 +1739,7 @@ const H2Worker = struct {
         var client = Client.init(w.io, testing.allocator, .{});
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reflect", .{w.port}) catch return;
+        const url = std.mem.print(&url_buf, "http://127.0.0.1:{d}/reflect", .{w.port}) catch return;
         var res = client.request(.get, url, .{}) catch return;
         defer res.deinit();
         if (res.status != 200) return;
@@ -1792,7 +1792,7 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
     var url_buf: [64]u8 = undefined;
 
     { // GET /reflect: forwarding headers injected, hop-by-hop stripped — over h2.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/reflect", .{proxy_port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/reflect", .{proxy_port});
         var res = try client.request(.get, url, .{
             .headers = &.{
                 .{ .name = "X-Keep", .value = "kept" }, // end-to-end → forwarded
@@ -1807,17 +1807,17 @@ test "integration: reverse proxy forwards over h2c to an HTTP/2 backend (multipl
         // Forwarding headers the h2 backend saw:
         try testing.expectEqualStrings("127.0.0.1", res.header("x-saw-xff").?);
         try testing.expectEqualStrings("http", res.header("x-saw-proto").?);
-        try testing.expect(std.mem.indexOf(u8, res.header("x-saw-via").?, "1.1 zig-libs") != null);
+        try testing.expect(std.mem.find(u8, res.header("x-saw-via").?, "1.1 zig-libs") != null);
         try testing.expectEqualStrings("kept", res.header("x-saw-keep").?);
         // Hop-by-hop request header stripped before the backend.
         try testing.expectEqualStrings("none", res.header("x-saw-proxyauth").?);
         // Response-side Via injected; backend's hop-by-hop Keep-Alive stripped.
-        try testing.expect(std.mem.indexOf(u8, res.header("via").?, "1.1 zig-libs") != null);
+        try testing.expect(std.mem.find(u8, res.header("via").?, "1.1 zig-libs") != null);
         try testing.expectEqual(@as(?[]const u8, null), res.header("keep-alive"));
     }
 
     { // POST /echo, large body → exercises h2 send-side flow control.
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/echo", .{proxy_port});
         const payload = strRepeat("H2PROXY", 20_000); // ~140 KB, past the 64 KiB window
         var res = try client.request(.post, url, .{ .body = payload });
         defer res.deinit();
@@ -1863,7 +1863,7 @@ fn fatH2OriginHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror
     @memset(&value, 'v');
     var name_buf: [16]u8 = undefined;
     for (0..count) |i| {
-        const name = try std.fmt.bufPrint(&name_buf, "X-Fat-{d:0>3}", .{i});
+        const name = try std.mem.print(&name_buf, "X-Fat-{d:0>3}", .{i});
         try rw.setHeader(name, value[0..value_len]);
     }
     try rw.writeAll("ok");
@@ -1909,10 +1909,10 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     // 32 fields is exactly what the backend's own table holds; the proxy needs
     // those 32 plus `Via` (plus the backend's now-ordinary `Date`/`Server`),
     // so `max_response_headers` is overrun no matter how those two are handled.
-    const over_url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/fat/32/4", .{proxy_port});
+    const over_url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/fat/32/4", .{proxy_port});
     const over_count = Relayed.get(&client, over_url);
     var url_buf2: [64]u8 = undefined;
-    const fits_url = try std.fmt.bufPrint(&url_buf2, "http://127.0.0.1:{d}/fat/8/100", .{proxy_port});
+    const fits_url = try std.mem.print(&url_buf2, "http://127.0.0.1:{d}/fat/8/100", .{proxy_port});
     const fits = Relayed.get(&client, fits_url);
 
     // The h1 arm of this claim is pinned by the `FatHeaderOrigin` test above.
@@ -1920,11 +1920,11 @@ test "integration: an h2 backend header set the proxy cannot relay answers 502, 
     // (`forwardH2`) with its own relay loop and its own `relayFailed` calls
     // (`:347`, `:350`, `:351`) — code-identical in shape is not evidence.
     try testing.expectEqual(@as(u16, 502), over_count.status);
-    try testing.expect(std.mem.indexOf(u8, over_count.body(), "could not be relayed") != null);
+    try testing.expect(std.mem.find(u8, over_count.body(), "could not be relayed") != null);
     // `reset` ran on the h2 path too: not even the fields that fit ride along.
     try testing.expectEqual(@as(?usize, null), over_count.fat_first);
     try testing.expectEqual(@as(?usize, null), over_count.fat_last);
-    try testing.expect(std.mem.indexOf(u8, over_count.via(), "zig-libs") != null);
+    try testing.expect(std.mem.find(u8, over_count.via(), "zig-libs") != null);
 
     // Control: a fat-but-relayable h2 answer goes through whole, so the 502 is
     // the limit talking and not the h2 scaffold failing for its own reasons.
@@ -1964,7 +1964,7 @@ const RawBackend = struct {
                 @memcpy(b.buf[b.len..][0..take], avail[0..take]);
                 b.len += take;
                 sr.interface.toss(take);
-                if (std.mem.indexOf(u8, b.buf[start..b.len], "\r\n\r\n") != null) break;
+                if (std.mem.find(u8, b.buf[start..b.len], "\r\n\r\n") != null) break;
             }
             sw.interface.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok") catch {};
             sw.interface.flush() catch {};
@@ -2130,9 +2130,9 @@ test "integration: an h2c :path/:authority carrying CR/LF or SP never becomes a 
     try testing.expect(std.mem.startsWith(u8, seen, "GET /front HTTP/1.1\r\n"));
     // One request line on the backend's wire, and none of the injected bytes.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, seen, "HTTP/1.1\r\n"));
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "GET /admin"));
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "X-Path-Injected"));
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, seen, "X-Authority-Injected"));
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, seen, "GET /admin"));
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, seen, "X-Path-Injected"));
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, seen, "X-Authority-Injected"));
 }
 
 test "integration: h2c backend unreachable → 502 Bad Gateway" {
@@ -2162,11 +2162,11 @@ test "integration: h2c backend unreachable → 502 Bad Gateway" {
     var client = Client.init(io, gpa, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{proxy_port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/x", .{proxy_port});
     var res = try client.request(.get, url, .{});
     defer res.deinit();
     try testing.expectEqual(@as(u16, 502), res.status);
-    try testing.expect(std.mem.indexOf(u8, res.header("via").?, "zig-libs") != null);
+    try testing.expect(std.mem.find(u8, res.header("via").?, "zig-libs") != null);
 }
 
 // ── fuzz: a backend response head through the relay ─────────────────────────
@@ -2222,7 +2222,7 @@ fn fuzzRelay(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var lines: [512]u8 = undefined;
     const len: usize = fz.drawInput(S, src, &lines, &relay_seeds);
     var raw: [600]u8 = undefined;
-    const block = std.fmt.bufPrint(&raw, "HTTP/1.1 200 OK\r\n{s}\r\n\r\n", .{lines[0..len]}) catch unreachable;
+    const block = std.mem.print(&raw, "HTTP/1.1 200 OK\r\n{s}\r\n\r\n", .{lines[0..len]}) catch unreachable;
     const head = h1.ResponseHead.parse(block) catch return RelayMark.mark(.rejected);
 
     var out_buf: [2048]u8 = undefined;

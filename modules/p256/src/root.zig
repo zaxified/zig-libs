@@ -118,6 +118,6 @@ test {
 }
 
 test "meta.model_after names nistz256 and the std oracle" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "nistz256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "P256") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "nistz256") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "P256") != null);
 }

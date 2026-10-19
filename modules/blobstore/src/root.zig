@@ -292,10 +292,10 @@ pub const Store = struct {
 
     fn casDir(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
         try requireCasHex(hex);
-        var n = (try std.fmt.bufPrint(buf, "{s}/cas", .{self.base})).len;
+        var n = (try std.mem.print(buf, "{s}/cas", .{self.base})).len;
         var i: u8 = 0;
         while (i < self.fanout) : (i += 1) {
-            const seg = try std.fmt.bufPrint(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
+            const seg = try std.mem.print(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
             n += seg.len;
         }
         return buf[0..n];
@@ -305,14 +305,14 @@ pub const Store = struct {
     /// sha256; the fan-out prefix repeats per `self.fanout`).
     pub fn casPath(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
         const dir = try self.casDir(buf, hex);
-        const rest = try std.fmt.bufPrint(buf[dir.len..], "/{s}", .{hex});
+        const rest = try std.mem.print(buf[dir.len..], "/{s}", .{hex});
         return buf[0 .. dir.len + rest.len];
     }
 
     /// `<base>/cas/<hh...>/<hex>.rc` — the refcount sidecar for a blob.
     fn casRefPath(self: Store, buf: []u8, hex: []const u8) ![]const u8 {
         const dir = try self.casDir(buf, hex);
-        const rest = try std.fmt.bufPrint(buf[dir.len..], "/{s}.rc", .{hex});
+        const rest = try std.mem.print(buf[dir.len..], "/{s}.rc", .{hex});
         return buf[0 .. dir.len + rest.len];
     }
 
@@ -322,18 +322,18 @@ pub const Store = struct {
     /// directory (see `init`'s doc comment).
     fn ensureCasTopDir(self: Store) !void {
         var buf: [512]u8 = undefined;
-        try ensureDir(self.io, try std.fmt.bufPrint(&buf, "{s}/cas", .{self.base}));
+        try ensureDir(self.io, try std.mem.print(&buf, "{s}/cas", .{self.base}));
     }
 
     /// Create every fan-out directory level for `hex` if missing (including
     /// `<base>/cas` itself, lazily).
     fn ensureCasDir(self: Store, hex: []const u8) !void {
         var buf: [640]u8 = undefined;
-        var n = (try std.fmt.bufPrint(&buf, "{s}/cas", .{self.base})).len;
+        var n = (try std.mem.print(&buf, "{s}/cas", .{self.base})).len;
         try ensureDir(self.io, buf[0..n]);
         var i: u8 = 0;
         while (i < self.fanout) : (i += 1) {
-            const seg = try std.fmt.bufPrint(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
+            const seg = try std.mem.print(buf[n..], "/{s}", .{hex[2 * i .. 2 * i + 2]});
             n += seg.len;
             try ensureDir(self.io, buf[0..n]);
         }
@@ -384,11 +384,11 @@ pub const Store = struct {
         const path = try self.casRefPath(&pbuf, hex);
         var tbuf: [800]u8 = undefined;
         const dir = try self.casDir(&tbuf, hex);
-        const tmp = try std.fmt.bufPrint(tbuf[dir.len..], "/.{s}.rc.tmp", .{hex});
+        const tmp = try std.mem.print(tbuf[dir.len..], "/.{s}.rc.tmp", .{hex});
         const tmp_path = tbuf[0 .. dir.len + tmp.len];
 
         var vbuf: [24]u8 = undefined;
-        const s = try std.fmt.bufPrint(&vbuf, "{d}", .{count});
+        const s = try std.mem.print(&vbuf, "{d}", .{count});
         const cwd = std.Io.Dir.cwd();
         try cwd.writeFile(self.io, .{ .sub_path = tmp_path, .data = s });
         errdefer cwd.deleteFile(self.io, tmp_path) catch {};
@@ -452,7 +452,7 @@ pub const Store = struct {
     /// into while hashing it (the content hash is unknown until the stream ends).
     pub fn casCreateTemp(self: Store, uniq: []const u8, tmp_buf: []u8) !Temp {
         try self.ensureCasTopDir();
-        const tmp = try std.fmt.bufPrint(tmp_buf, "{s}/cas/.ingest-{s}.part", .{ self.base, uniq });
+        const tmp = try std.mem.print(tmp_buf, "{s}/cas/.ingest-{s}.part", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
@@ -608,13 +608,13 @@ pub const Store = struct {
     // like the CAS layer, but keyed by a caller-chosen name instead of a hash.
 
     fn nsDir(self: Store, buf: []u8, ns: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/raw/{s}", .{ self.base, ns });
+        return std.mem.print(buf, "{s}/raw/{s}", .{ self.base, ns });
     }
 
     /// `<base>/raw/<ns>/<key>` written into `buf`. Validates `ns`+`key`.
     pub fn blobPath(self: Store, buf: []u8, ns: []const u8, key: []const u8) ![]const u8 {
         if (!segmentSafe(ns) or !segmentSafe(key)) return error.InvalidName;
-        return std.fmt.bufPrint(buf, "{s}/raw/{s}/{s}", .{ self.base, ns, key });
+        return std.mem.print(buf, "{s}/raw/{s}/{s}", .{ self.base, ns, key });
     }
 
     /// Open a raw blob for reading (caller closes), or null if it does not exist.
@@ -635,11 +635,11 @@ pub const Store = struct {
         // Lazy: `<base>/raw` itself is created here, on first raw-layer
         // write, not at `Store.init` time — see `init`'s doc comment.
         var rbuf: [512]u8 = undefined;
-        try ensureDir(self.io, try std.fmt.bufPrint(&rbuf, "{s}/raw", .{self.base}));
+        try ensureDir(self.io, try std.mem.print(&rbuf, "{s}/raw", .{self.base}));
         var dbuf: [640]u8 = undefined;
         const dir = try self.nsDir(&dbuf, ns);
         try ensureDir(self.io, dir);
-        const tmp = try std.fmt.bufPrint(tmp_buf, "{s}/.{s}.part", .{ dir, key });
+        const tmp = try std.mem.print(tmp_buf, "{s}/.{s}.part", .{ dir, key });
         const file = try std.Io.Dir.cwd().createFile(self.io, tmp, .{ .truncate = true });
         return .{ .file = file, .tmp = tmp };
     }
@@ -695,7 +695,7 @@ pub const Store = struct {
     // an arbitrary namespace/key — not restricted to JSON.
 
     fn namedDir(self: Store, buf: []u8, ns: []const u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/named/{s}", .{ self.base, ns });
+        return std.mem.print(buf, "{s}/named/{s}", .{ self.base, ns });
     }
 
     /// Write (overwrite) a named record. Validates `ns`+`key`. Atomic: the bytes
@@ -706,16 +706,16 @@ pub const Store = struct {
         // Lazy: `<base>/named` itself is created here, on first named-record
         // write, not at `Store.init` time — see `init`'s doc comment.
         var nbuf: [512]u8 = undefined;
-        try ensureDir(self.io, try std.fmt.bufPrint(&nbuf, "{s}/named", .{self.base}));
+        try ensureDir(self.io, try std.mem.print(&nbuf, "{s}/named", .{self.base}));
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         try ensureDir(self.io, dir);
         var uniq_buf: [40]u8 = undefined;
         const uniq = nextUniq(&uniq_buf);
         var tbuf: [820]u8 = undefined;
-        const tmp = try std.fmt.bufPrint(&tbuf, "{s}/.{s}.part", .{ dir, uniq });
+        const tmp = try std.mem.print(&tbuf, "{s}/.{s}.part", .{ dir, uniq });
         var pbuf: [768]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, key });
+        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         const cwd = std.Io.Dir.cwd();
         try cwd.writeFile(self.io, .{ .sub_path = tmp, .data = bytes });
         errdefer cwd.deleteFile(self.io, tmp) catch {};
@@ -728,7 +728,7 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.namedDir(&dbuf, ns);
         var pbuf: [768]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, key });
+        const path = try std.mem.print(&pbuf, "{s}/{s}", .{ dir, key });
         return std.Io.Dir.cwd().readFileAlloc(self.io, path, arena, .limited(64 * 1024 * 1024)) catch |e| switch (e) {
             error.FileNotFound => return null,
             else => return e,
@@ -772,7 +772,7 @@ pub const Store = struct {
         // re-checks the inode too — this refuses the in-module route outright.
         if (std.mem.eql(u8, uniq, ingest_lock_name)) return error.InvalidName;
         try self.ensureTmpTopDir();
-        const path = try std.fmt.bufPrint(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
+        const path = try std.mem.print(path_buf, "{s}/tmp/{s}", .{ self.base, uniq });
         const file = try std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = true });
         return .{ .file = file, .path = path };
     }
@@ -798,7 +798,7 @@ pub const Store = struct {
     /// of which locks) never creates it.
     fn ensureTmpTopDir(self: Store) !void {
         var buf: [512]u8 = undefined;
-        try ensureDir(self.io, try std.fmt.bufPrint(&buf, "{s}/tmp", .{self.base}));
+        try ensureDir(self.io, try std.mem.print(&buf, "{s}/tmp", .{self.base}));
     }
 
     /// Open (creating if needed) and exclusively lock `tmp/.ingest.lock`,
@@ -806,7 +806,7 @@ pub const Store = struct {
     fn lockIngest(self: Store) !std.Io.File {
         try self.ensureTmpTopDir();
         var buf: [768]u8 = undefined;
-        const path = try std.fmt.bufPrint(&buf, "{s}/tmp/{s}", .{ self.base, ingest_lock_name });
+        const path = try std.mem.print(&buf, "{s}/tmp/{s}", .{ self.base, ingest_lock_name });
         const cwd = std.Io.Dir.cwd();
 
         // An advisory lock is held on an INODE; the mutual exclusion it buys
@@ -944,7 +944,7 @@ pub const Store = struct {
         for (keep) |*d| keep_set.putAssumeCapacity(d.slice(), {});
 
         var dbuf: [768]u8 = undefined;
-        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        const casdir = try std.mem.print(&dbuf, "{s}/cas", .{self.base});
         try self.gcWalk(casdir, self.fanout, &keep_set, &stats);
         return stats;
     }
@@ -988,7 +988,7 @@ pub const Store = struct {
     /// explicitly, instead.
     pub fn hasAnyRcSidecar(self: Store) !bool {
         var dbuf: [768]u8 = undefined;
-        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        const casdir = try std.mem.print(&dbuf, "{s}/cas", .{self.base});
         return self.anyRcSidecarUnder(casdir, self.fanout);
     }
 
@@ -1015,7 +1015,7 @@ pub const Store = struct {
             if (depth_remaining > 0) {
                 if (entry.kind != .directory) continue;
                 var pbuf: [768]u8 = undefined;
-                const sub = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
+                const sub = try std.mem.print(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
                 if (try self.anyRcSidecarUnder(sub, depth_remaining - 1)) return true;
                 continue;
             }
@@ -1045,7 +1045,7 @@ pub const Store = struct {
             if (depth_remaining > 0) {
                 if (entry.kind != .directory) continue;
                 var pbuf: [768]u8 = undefined;
-                const sub = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
+                const sub = try std.mem.print(&pbuf, "{s}/{s}", .{ dir_path, entry.name });
                 try self.gcWalk(sub, depth_remaining - 1, keep_set, stats);
                 continue;
             }
@@ -1064,7 +1064,7 @@ pub const Store = struct {
             const size = if (dir.statFile(self.io, hex, .{}) catch null) |st| st.size else 0;
             dir.deleteFile(self.io, hex) catch continue;
             var rcbuf: [80]u8 = undefined;
-            if (std.fmt.bufPrint(&rcbuf, "{s}.rc", .{hex})) |rc_name| {
+            if (std.mem.print(&rcbuf, "{s}.rc", .{hex})) |rc_name| {
                 dir.deleteFile(self.io, rc_name) catch {};
             } else |_| {}
             stats.blobs_removed += 1;
@@ -1086,7 +1086,7 @@ pub const Store = struct {
     /// collectible.
     fn readRcInDir(self: Store, dir: std.Io.Dir, hex: []const u8) ?u64 {
         var rcbuf: [80]u8 = undefined;
-        const rc_name = std.fmt.bufPrint(&rcbuf, "{s}.rc", .{hex}) catch return null;
+        const rc_name = std.mem.print(&rcbuf, "{s}.rc", .{hex}) catch return null;
         var vbuf: [32]u8 = undefined;
         const data = dir.readFile(self.io, rc_name, &vbuf) catch return null;
         if (data.len == vbuf.len) return null; // oversized/corrupt sidecar, not a truncated guess
@@ -1099,7 +1099,7 @@ pub const Store = struct {
     /// of `self.fanout` (see `casCreateTemp`), so this needs no recursion.
     fn reapStaleIngestTemps(self: Store, stale_after_ns: u64) !u64 {
         var dbuf: [768]u8 = undefined;
-        const casdir = try std.fmt.bufPrint(&dbuf, "{s}/cas", .{self.base});
+        const casdir = try std.mem.print(&dbuf, "{s}/cas", .{self.base});
         var dir = std.Io.Dir.cwd().openDir(self.io, casdir, .{ .iterate = true }) catch |e| switch (e) {
             error.FileNotFound => return 0,
             else => return e,
@@ -1146,7 +1146,7 @@ fn nextUniq(buf: []u8) []const u8 {
     const n = ingest_counter.fetchAdd(1, .monotonic);
     // PID + process-local counter: makes the temp name unique across
     // processes too (not just within one), not only within a process.
-    return std.fmt.bufPrint(buf, "{d}-{d}", .{ linux.getpid(), n }) catch unreachable; // fits in 40
+    return std.mem.print(buf, "{d}-{d}", .{ linux.getpid(), n }) catch unreachable; // fits in 40
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -1157,7 +1157,7 @@ const t = std.testing;
 /// `.zig-cache/tmp/<sub>` base path; caller keeps `tmp` alive and cleans it up.
 fn testStore(tmp: *std.testing.TmpDir, base_buf: []u8) !Store {
     const io = std.testing.io;
-    const base = try std.fmt.bufPrint(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     return Store.init(io, base);
 }
 
@@ -1235,7 +1235,7 @@ test "put: identical content dedups to one on-disk blob" {
     // exactly one blob file in the fan-out dir cas/<hh>/ (plus its `.rc`
     // refcount sidecar, bumped to 2 by the second, deduped put).
     var fbuf: [300]u8 = undefined;
-    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d1.hex[0..2] });
+    const fan = try std.mem.print(&fbuf, "{s}/cas/{s}", .{ store.base, d1.hex[0..2] });
     var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
     defer dir.close(io);
     var count: usize = 0;
@@ -1251,7 +1251,7 @@ test "put: identical content dedups to one on-disk blob" {
 
     // no leftover ingest temps in cas/
     var cbuf: [300]u8 = undefined;
-    const casdir = try std.fmt.bufPrint(&cbuf, "{s}/cas", .{store.base});
+    const casdir = try std.mem.print(&cbuf, "{s}/cas", .{store.base});
     var cd = try std.Io.Dir.cwd().openDir(io, casdir, .{ .iterate = true });
     defer cd.close(io);
     var temps: usize = 0;
@@ -1328,7 +1328,7 @@ test "crash safety: an abandoned temp never becomes a live blob" {
     try t.expect(try store.verify(live));
     // and nothing leaked into the fan-out as a live object other than `live`
     var fbuf: [300]u8 = undefined;
-    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, live.hex[0..2] });
+    const fan = try std.mem.print(&fbuf, "{s}/cas/{s}", .{ store.base, live.hex[0..2] });
     {
         var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
         defer dir.close(io);
@@ -1697,7 +1697,7 @@ test "configurable fan-out: round-trips at fanout=1 (default), 2, and 3" {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         var base_buf: [256]u8 = undefined;
-        const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+        const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
         const store = try Store.initOptions(std.testing.io, base, .{ .fanout = fanout });
         try t.expectEqual(@as(u8, fanout), store.fanout);
 
@@ -1708,12 +1708,12 @@ test "configurable fan-out: round-trips at fanout=1 (default), 2, and 3" {
         var pbuf: [768]u8 = undefined;
         const path = try store.casPath(&pbuf, &d.hex);
         var want_buf: [768]u8 = undefined;
-        var w: usize = (try std.fmt.bufPrint(&want_buf, "{s}/cas", .{base})).len;
+        var w: usize = (try std.mem.print(&want_buf, "{s}/cas", .{base})).len;
         var i: u8 = 0;
         while (i < fanout) : (i += 1) {
-            w += (try std.fmt.bufPrint(want_buf[w..], "/{s}", .{d.hex[2 * i .. 2 * i + 2]})).len;
+            w += (try std.mem.print(want_buf[w..], "/{s}", .{d.hex[2 * i .. 2 * i + 2]})).len;
         }
-        w += (try std.fmt.bufPrint(want_buf[w..], "/{s}", .{&d.hex})).len;
+        w += (try std.mem.print(want_buf[w..], "/{s}", .{&d.hex})).len;
         try t.expectEqualStrings(want_buf[0..w], path);
 
         // and reads back byte-identical regardless of nesting depth.
@@ -1733,7 +1733,7 @@ test "Store.init still opens a store written at the default (fanout=1) layout" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
 
     // a store created the plain way (no Options) ...
     const store = try Store.init(std.testing.io, base);
@@ -1746,7 +1746,7 @@ test "Store.init still opens a store written at the default (fanout=1) layout" {
     try t.expect(reopened.has(d));
     var buf: [768]u8 = undefined;
     const path = try reopened.casPath(&buf, &d.hex);
-    try t.expect(std.mem.indexOf(u8, path, d.hex[0..2]) != null);
+    try t.expect(std.mem.find(u8, path, d.hex[0..2]) != null);
 }
 
 test "cross-process ingest lock: repeated put/delete/gc from one writer never deadlocks" {
@@ -1779,7 +1779,7 @@ test "Options.refcount = false: casCommit is rename-only — one file, no sideca
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     const store = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
     const io = std.testing.io;
     const gpa = std.testing.allocator;
@@ -1788,7 +1788,7 @@ test "Options.refcount = false: casCommit is rename-only — one file, no sideca
 
     // exactly ONE file in the fan-out dir: the blob itself, no `<hex>.rc`.
     var fbuf: [300]u8 = undefined;
-    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
+    const fan = try std.mem.print(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
     var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
     defer dir.close(io);
     var names: std.ArrayList([]const u8) = .empty;
@@ -1826,7 +1826,7 @@ test "Options default (no Options passed): casCommit still writes a sidecar — 
     const d = try store.putBytes("historical behaviour must not change");
 
     var fbuf: [300]u8 = undefined;
-    const fan = try std.fmt.bufPrint(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
+    const fan = try std.mem.print(&fbuf, "{s}/cas/{s}", .{ store.base, d.hex[0..2] });
     var dir = try std.Io.Dir.cwd().openDir(io, fan, .{ .iterate = true });
     defer dir.close(io);
     var blob_count: usize = 0;
@@ -1845,7 +1845,7 @@ test "Options.refcount = false: gc's CAS sweep is a documented no-op; casDelete 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     const store = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
     const gpa = std.testing.allocator;
 
@@ -1890,7 +1890,7 @@ test "hasOrphanedRcSidecars: catches the Options.refcount toggle footgun documen
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
 
     // Phase 1: a store run with refcount = true (the default), then a blob
     // deleted down to a zero-refcount .rc sidecar that gc has not yet swept.
@@ -1916,7 +1916,7 @@ test "lazy layer creation: a store that never touches a layer never creates its 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     const io = std.testing.io;
 
     // right after Store.init: base exists, but none of the four layer
@@ -1924,7 +1924,7 @@ test "lazy layer creation: a store that never touches a layer never creates its 
     const store = try Store.init(io, base);
     var pbuf: [512]u8 = undefined;
     inline for (.{ "cas", "raw", "named", "tmp" }) |layer| {
-        const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ base, layer });
+        const p = try std.mem.print(&pbuf, "{s}/{s}", .{ base, layer });
         try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p, .{}));
     }
 
@@ -1936,11 +1936,11 @@ test "lazy layer creation: a store that never touches a layer never creates its 
     try store.commit("dev1", "backup.bin", w.tmp);
 
     // `raw/` now exists ...
-    const raw_p = try std.fmt.bufPrint(&pbuf, "{s}/raw", .{base});
+    const raw_p = try std.mem.print(&pbuf, "{s}/raw", .{base});
     try std.Io.Dir.cwd().access(io, raw_p, .{});
     // ... but `cas/`, `named/` and `tmp/` still do not: nothing touched them.
     inline for (.{ "cas", "named", "tmp" }) |layer| {
-        const p = try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ base, layer });
+        const p = try std.mem.print(&pbuf, "{s}/{s}", .{ base, layer });
         try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, p, .{}));
     }
 
@@ -1994,7 +1994,7 @@ test "SECURITY: a sidecar-less blob keeps every reference when a second referrer
     const gpa = std.testing.allocator;
 
     // Phase 1: a store that writes no sidecars — exactly a pre-refcount store.
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
     const legacy = try Store.initOptions(std.testing.io, base, .{ .refcount = false });
     const d = try legacy.putBytes("content two manifests both reference");
     try t.expect(legacy.has(d));
@@ -2146,7 +2146,7 @@ test "Options.fanout bounds are enforced, not merely documented" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buf: [256]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
+    const base = try std.mem.print(&base_buf, ".zig-cache/tmp/{s}/store", .{&tmp.sub_path});
 
     try t.expectError(error.InvalidFanout, Store.initOptions(std.testing.io, base, .{ .fanout = 0 }));
     // 33 levels would slice `hex[64..66]` out of a 64-character digest.
@@ -2169,7 +2169,7 @@ test "casRefWrite leaves no temp behind, and a stale one is never taken for a bl
     var dbuf: [800]u8 = undefined;
     const dir_path = try store.casDir(&dbuf, &d.hex);
     var tbuf: [900]u8 = undefined;
-    const stale = try std.fmt.bufPrint(&tbuf, "{s}/.{s}.rc.tmp", .{ dir_path, d.hex });
+    const stale = try std.mem.print(&tbuf, "{s}/.{s}.rc.tmp", .{ dir_path, d.hex });
 
     // Nothing left over from the write that just happened.
     try t.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(store.io, stale, .{}));

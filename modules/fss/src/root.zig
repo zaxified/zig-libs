@@ -109,6 +109,6 @@ test {
 }
 
 test "meta.model_after names the BGI DPF construction" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "DPF") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Boyle") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "DPF") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Boyle") != null);
 }

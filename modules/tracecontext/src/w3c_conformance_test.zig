@@ -60,7 +60,7 @@ fn buildRequest(buf: []u8, headers: []const vectors_mod.Header) []const u8 {
 fn expectOrderedContains(hay: []const u8, needles: []const []const u8) !void {
     var from: usize = 0;
     for (needles) |n| {
-        const idx = std.mem.indexOfPos(u8, hay, from, n) orelse {
+        const idx = std.mem.findPos(u8, hay, from, n) orelse {
             std.debug.print("expected '{s}' at or after offset {d} in '{s}'\n", .{ n, from, hay });
             return error.SubstringNotFoundInOrder;
         };
@@ -103,7 +103,7 @@ fn runVector(v: Vector) !void {
                 try expectOrderedContains(hay, needles);
             } else {
                 for (needles) |n| {
-                    if (std.mem.indexOf(u8, hay, n) == null) {
+                    if (std.mem.find(u8, hay, n) == null) {
                         std.debug.print("expected '{s}' in tracestate '{s}'\n", .{ n, hay });
                         return error.SubstringNotFound;
                     }

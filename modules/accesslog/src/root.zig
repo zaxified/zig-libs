@@ -620,12 +620,12 @@ pub fn writeClfUser(w: *std.Io.Writer, user: ?[]const u8) std.Io.Writer.Error!vo
 pub fn hostOnly(addr: []const u8) []const u8 {
     if (addr.len != 0 and addr[0] == '[') {
         // `[::1]:8080` / `[::1]` → `::1`
-        if (std.mem.indexOfScalar(u8, addr, ']')) |close| return addr[1..close];
+        if (std.mem.findScalar(u8, addr, ']')) |close| return addr[1..close];
         return addr;
     }
     // A bare IPv6 literal has several colons and no port — leave it alone.
     if (std.mem.count(u8, addr, ":") > 1) return addr;
-    if (std.mem.lastIndexOfScalar(u8, addr, ':')) |colon| return addr[0..colon];
+    if (std.mem.findScalarLast(u8, addr, ':')) |colon| return addr[0..colon];
     return addr;
 }
 
@@ -753,8 +753,8 @@ test "logfmt: a value holding DEL (0x7F) is quoted and the byte hex-escaped" {
     var e = sampleEntry();
     e.method = "GE\x7fT";
     try writeLogfmt(e, &w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), " method=\"GE\\u007fT\" ") != null);
-    try testing.expect(std.mem.indexOfScalar(u8, w.buffered(), 0x7f) == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), " method=\"GE\\u007fT\" ") != null);
+    try testing.expect(std.mem.findScalar(u8, w.buffered(), 0x7f) == null);
 }
 
 fn sampleEntry() Entry {
@@ -824,7 +824,7 @@ test "writeCombined: null timestamp fallback prints raw ns inside the brackets" 
     var entry = sampleEntry();
     entry.time_formatted = null;
     try writeCombined(entry, &w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "[1734000000000000000]") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "[1734000000000000000]") != null);
 }
 
 test "combined: response_bytes of exactly 0 prints the digit '0', not the '-' absent-marker" {
@@ -834,7 +834,7 @@ test "combined: response_bytes of exactly 0 prints the digit '0', not the '-' ab
     entry.response_bytes = 0;
     try writeCombined(entry, &w);
     const out = w.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "\" 200 0 \"") != null);
+    try testing.expect(std.mem.find(u8, out, "\" 200 0 \"") != null);
 }
 
 test "write: enum dispatch matches the dedicated per-format functions" {
@@ -899,7 +899,7 @@ test "user: %u in Combined, a user key in JSON Lines and logfmt" {
     var lbuf: [512]u8 = undefined;
     var lw: std.Io.Writer = .fixed(&lbuf);
     try writeLogfmt(entry, &lw);
-    try testing.expect(std.mem.indexOf(u8, lw.buffered(), " remote_addr=192.0.2.1:54321 user=svc-billing method=GET ") != null);
+    try testing.expect(std.mem.find(u8, lw.buffered(), " remote_addr=192.0.2.1:54321 user=svc-billing method=GET ") != null);
 
     var cbuf: [512]u8 = undefined;
     var cw: std.Io.Writer = .fixed(&cbuf);
@@ -918,11 +918,11 @@ test "user: null writes what the formats wrote before the field existed" {
     var jbuf: [512]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&jbuf);
     try writeJsonLines(entry, &jw);
-    try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"user\"") == null);
+    try testing.expect(std.mem.find(u8, jw.buffered(), "\"user\"") == null);
     var lbuf: [512]u8 = undefined;
     var lw: std.Io.Writer = .fixed(&lbuf);
     try writeLogfmt(entry, &lw);
-    try testing.expect(std.mem.indexOf(u8, lw.buffered(), " user=") == null);
+    try testing.expect(std.mem.find(u8, lw.buffered(), " user=") == null);
     var cbuf: [512]u8 = undefined;
     var cw: std.Io.Writer = .fixed(&cbuf);
     try writeCombined(entry, &cw);
@@ -942,7 +942,7 @@ test "user: a crafted user cannot add a field or a line to a Combined record" {
     _ = it.next(); // %h
     try testing.expectEqualStrings("-", it.next().?); // %l
     const u = it.next().?;
-    try testing.expect(std.mem.indexOfAny(u8, u, " \r\n\"[]") == null);
+    try testing.expect(std.mem.findAny(u8, u, " \r\n\"[]") == null);
     try testing.expect(std.mem.startsWith(u8, it.next().?, "[22/Jul/2026"));
 
     // And the JSON record carries it back byte for byte.
@@ -979,7 +979,7 @@ test "JSON: injection payload stays one record, round-trips byte-exact through s
     // legitimately allowed to pass through unescaped; it cannot break the
     // string or the line either way.)
     for ([_]u8{ 0x00, 0x01, 0x0D, 0x1F }) |b| {
-        try testing.expect(std.mem.indexOfScalar(u8, out, b) == null);
+        try testing.expect(std.mem.findScalar(u8, out, b) == null);
     }
 
     // Structural validity + exact field round-trip via std.json.
@@ -998,7 +998,7 @@ test "JSON: benign field passes through unchanged (positive control)" {
     var entry = sampleEntry();
     entry.user_agent = "Mozilla/5.0 (X11; Linux x86_64)";
     try writeJsonLines(entry, &w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"user_agent\":\"Mozilla/5.0 (X11; Linux x86_64)\"") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "\"user_agent\":\"Mozilla/5.0 (X11; Linux x86_64)\"") != null);
 }
 
 test "logfmt: injection payload is quoted+escaped, one record, no fake pair, no raw control bytes" {
@@ -1011,15 +1011,15 @@ test "logfmt: injection payload is quoted+escaped, one record, no fake pair, no 
     const out = w.buffered();
 
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
-    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, out, '\r') == null);
     for ([_]u8{ 0x01, 0x1F, 0x7F }) |b| {
-        try testing.expect(std.mem.indexOfScalar(u8, out, b) == null);
+        try testing.expect(std.mem.findScalar(u8, out, b) == null);
     }
     // The embedded quote is backslash-escaped (`\"`, not a bare `"`), so it
     // can never close the quoted value early and let `{fake}=1` or
     // `status=200` read as a sibling top-level key=value pair.
-    try testing.expect(std.mem.indexOf(u8, out, "user_agent=\"evil\\\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "referer=\"evil\\\"") != null);
+    try testing.expect(std.mem.find(u8, out, "user_agent=\"evil\\\"") != null);
+    try testing.expect(std.mem.find(u8, out, "referer=\"evil\\\"") != null);
 }
 
 test "logfmt: benign field is unquoted verbatim (positive control)" {
@@ -1028,7 +1028,7 @@ test "logfmt: benign field is unquoted verbatim (positive control)" {
     var entry = sampleEntry();
     entry.user_agent = "curl/8.0";
     try writeLogfmt(entry, &w);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), " user_agent=curl/8.0 ") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), " user_agent=curl/8.0 ") != null);
 }
 
 test "logfmt: a value containing only '=' is quoted (no ambiguous bare key=value split)" {
@@ -1067,9 +1067,9 @@ test "combined: injection payload cannot forge a second line or break the quoted
     const out = w.buffered();
 
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
-    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, out, '\r') == null);
     for ([_]u8{ 0x01, 0x1F, 0x7F }) |b| {
-        try testing.expect(std.mem.indexOfScalar(u8, out, b) == null);
+        try testing.expect(std.mem.findScalar(u8, out, b) == null);
     }
     // The line still ends with the real closing `"\n` for user-agent, i.e.
     // it is still exactly the shape %h ... "referer" "user-agent"\n — the
@@ -1082,8 +1082,8 @@ test "combined: benign fields render verbatim (positive control)" {
     var w: std.Io.Writer = .fixed(&buf);
     try writeCombined(sampleEntry(), &w);
     const out = w.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "\"https://example.org/\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "\"curl/8.0\"") != null);
+    try testing.expect(std.mem.find(u8, out, "\"https://example.org/\"") != null);
+    try testing.expect(std.mem.find(u8, out, "\"curl/8.0\"") != null);
     try testing.expect(std.mem.startsWith(u8, out, "192.0.2.1 - - ["));
 }
 
@@ -1215,7 +1215,7 @@ test "entryFromRequest output feeds straight into writeCombined without extra gl
     // port — but Combined's `%h` slot gets the host alone.
     try testing.expectEqualStrings("203.0.113.5:443", entry.remote_addr.?);
     try testing.expect(std.mem.startsWith(u8, w.buffered(), "203.0.113.5 - - "));
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\"GET /health HTTP/1.1\" 200") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "\"GET /health HTTP/1.1\" 200") != null);
 }
 
 test "entryFromRequest: 204 response streamed through .discard maps response_bytes to 0, not null" {
@@ -1325,7 +1325,7 @@ test "Combined: external anchor — CRLF injection stays one line" {
 
     // Exactly one final newline, no carriage returns, no raw LF bytes
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
-    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, out, '\r') == null);
 
     // Ends with the real closing quote-newline
     try testing.expect(std.mem.endsWith(u8, out, "\"\n"));
@@ -1441,7 +1441,7 @@ test "JSON Lines: round-trips through std.json — CRLF stays escaped" {
 
     // Exactly one line (no raw control bytes)
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
-    try testing.expect(std.mem.indexOfScalar(u8, out, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, out, '\r') == null);
 
     // Parse back through std.json to verify round-trip matches original payload
     const without_nl = out[0 .. out.len - 1];
@@ -1471,10 +1471,10 @@ test "JSON Lines: round-trips through std.json — null byte escapes" {
     const out = w.buffered();
 
     // No raw null bytes on wire
-    try testing.expect(std.mem.indexOfScalar(u8, out, 0x00) == null);
+    try testing.expect(std.mem.findScalar(u8, out, 0x00) == null);
 
     // Verify null bytes are escaped as \\u0000
-    try testing.expect(std.mem.indexOf(u8, out, "\\u0000") != null);
+    try testing.expect(std.mem.find(u8, out, "\\u0000") != null);
 
     // Must round-trip exactly
     const without_nl = out[0 .. out.len - 1];
@@ -1691,7 +1691,7 @@ fn fuzzExtra(buf: *[3]Field, e: Entry) []const Field {
 fn expectOneLine(out: []const u8) !void {
     try testing.expect(out.len > 0);
     try testing.expectEqual(@as(u8, '\n'), out[out.len - 1]);
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, out[0 .. out.len - 1], '\n'));
+    try testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, out[0 .. out.len - 1], '\n'));
 }
 
 test "fuzz corpus: the written inputs really reach the fields that matter" {
@@ -1873,7 +1873,7 @@ fn expectFieldPolicy(in: []const u8, got: []const u8) !void {
         mark(.exact_roundtrip);
     } else {
         mark(.replacement);
-        try testing.expect(std.mem.indexOf(u8, got, replacement) != null);
+        try testing.expect(std.mem.find(u8, got, replacement) != null);
         try testing.expect(got.len <= in.len * replacement.len);
     }
 }
@@ -1975,7 +1975,7 @@ fn jsonUserAgentBody(out: []u8, field: []const u8) ![]const u8 {
     try writeJsonLines(entry, &w);
     const line = w.buffered();
     const key = "\"user_agent\":\"";
-    const start = std.mem.indexOf(u8, line, key).? + key.len;
+    const start = std.mem.find(u8, line, key).? + key.len;
     // Scan to the CLOSING quote, not the first one: `\"` is inside the value.
     var end = start;
     while (line[end] != '"') : (end += 1) {
@@ -2133,7 +2133,7 @@ test "JSON: sanitization does not weaken any escape — the C0 controls, quote a
             0x0A => "\\n",
             0x0C => "\\f",
             0x0D => "\\r",
-            else => try std.fmt.bufPrint(&want_buf, "\\u{x:0>4}", .{b}),
+            else => try std.mem.print(&want_buf, "\\u{x:0>4}", .{b}),
         };
         try testing.expectEqualStrings(want, got);
     }
@@ -2244,7 +2244,7 @@ test "JSON: the byte-exact round trip still holds for every valid-UTF-8 field" {
         try testing.expectEqualStrings(payload, parsed.value.object.get(k).?.string);
     }
     // …and no replacement character was invented along the way.
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, out, replacement));
+    try testing.expectEqual(@as(?usize, null), std.mem.find(u8, out, replacement));
 }
 
 test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, deliberately" {
@@ -2260,18 +2260,18 @@ test "logfmt/Combined pass ill-formed bytes through — byte-oriented formats, d
 
     var lw: std.Io.Writer = .fixed(&buf);
     try writeLogfmt(entry, &lw);
-    try testing.expect(std.mem.indexOfScalar(u8, lw.buffered(), 0xFF) != null);
+    try testing.expect(std.mem.findScalar(u8, lw.buffered(), 0xFF) != null);
 
     var cbuf: [1024]u8 = undefined;
     var cw: std.Io.Writer = .fixed(&cbuf);
     try writeCombined(entry, &cw);
-    try testing.expect(std.mem.indexOfScalar(u8, cw.buffered(), 0xFF) != null);
+    try testing.expect(std.mem.findScalar(u8, cw.buffered(), 0xFF) != null);
 
     // …while the same entry's JSON Lines record carries no such byte.
     var jbuf: [1024]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&jbuf);
     try writeJsonLines(entry, &jw);
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, jw.buffered(), 0xFF));
+    try testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, jw.buffered(), 0xFF));
 }
 
 test {
@@ -2387,7 +2387,7 @@ test "extra: a key cannot forge, shadow or duplicate a field -- it is skipped" {
     var jb3: [4096]u8 = undefined;
     var lb3: [4096]u8 = undefined;
     const ok = try renderBoth(e, &jb3, &lb3);
-    try testing.expect(std.mem.indexOf(u8, ok.json, "\"" ++ strRepeat("k", 64) ++ "\":\"v\"") != null);
+    try testing.expect(std.mem.find(u8, ok.json, "\"" ++ strRepeat("k", 64) ++ "\":\"v\"") != null);
     // A repeated key: the first wins, the second is skipped (also case-folded).
     e.extra = &.{ .{ .key = "dup", .value = "first" }, .{ .key = "DUP", .value = "second" }, .{ .key = "dup", .value = "third" } };
     const dup = try renderBoth(e, &jb3, &lb3);
@@ -2407,7 +2407,7 @@ test "extra: values get the same escaping as the fixed fields (the adversarial c
     defer parsed.deinit();
     const obj = parsed.value.object;
     try testing.expectEqualStrings(evil_payload, obj.get("a").?.string); // byte-exact for valid UTF-8
-    try testing.expect(std.mem.indexOf(u8, obj.get("b").?.string, replacement) != null); // ill-formed -> U+FFFD
+    try testing.expect(std.mem.find(u8, obj.get("b").?.string, replacement) != null); // ill-formed -> U+FFFD
 }
 
 test "extra: a value cannot split a logfmt pair or start a second record" {

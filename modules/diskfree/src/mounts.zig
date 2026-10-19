@@ -233,7 +233,7 @@ pub fn readVirtualFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, lim
     if (truncated) {
         // Keep whole lines only. Without this the caller sees a truncated
         // value as a complete one — see the second warning above.
-        const keep = if (std.mem.lastIndexOfScalar(u8, list.items, '\n')) |nl| nl + 1 else 0;
+        const keep = if (std.mem.findScalarLast(u8, list.items, '\n')) |nl| nl + 1 else 0;
         list.shrinkRetainingCapacity(keep);
     }
     return list.toOwnedSlice(gpa) catch {
@@ -294,7 +294,7 @@ test "unescapeOctal: an escape above \\377 is passed through, never wrapped" {
     const out = try unescapeOctal(testing.allocator, "/mnt/\\400\\777x");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("/mnt/\\400\\777x", out);
-    try testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, out, 0));
+    try testing.expectEqual(@as(?usize, null), std.mem.findScalar(u8, out, 0));
 }
 
 test "unescapeOctal: \\377 is the largest escape that still decodes" {
@@ -443,7 +443,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 
     // 100 rows of 10 bytes each.
     var payload: [1000]u8 = undefined;
-    for (0..100) |i| _ = std.fmt.bufPrint(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    for (0..100) |i| _ = std.mem.print(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
     {
         var f = try tmp.dir.createFile(io, "big.txt", .{});
         defer f.close(io);
@@ -454,7 +454,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     }
 
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
 
     // Under the limit: the whole file, unchanged.
     const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse

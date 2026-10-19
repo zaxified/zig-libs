@@ -220,7 +220,7 @@ pub fn optionsFromUri(uri: []const u8, out: []Option, scratch: []u8) UriError![]
     var scratch_used: usize = 0;
 
     // 2. Authority: up to the next '/', '?', or end.
-    const authority_end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+    const authority_end = std.mem.findAny(u8, rest, "/?") orelse rest.len;
     const authority = rest[0..authority_end];
     rest = rest[authority_end..];
 
@@ -228,14 +228,14 @@ pub fn optionsFromUri(uri: []const u8, out: []Option, scratch: []u8) UriError![]
     var port_str: []const u8 = &.{};
     if (authority.len > 0 and authority[0] == '[') {
         // Bracketed IPv6 literal: strip the brackets.
-        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return error.BadUri;
+        const close = std.mem.findScalar(u8, authority, ']') orelse return error.BadUri;
         host = authority[1..close];
         const after = authority[close + 1 ..];
         if (after.len > 0) {
             if (after[0] != ':') return error.BadUri;
             port_str = after[1..];
         }
-    } else if (std.mem.indexOfScalar(u8, authority, ':')) |colon| {
+    } else if (std.mem.findScalar(u8, authority, ':')) |colon| {
         host = authority[0..colon];
         port_str = authority[colon + 1 ..];
     } else {
@@ -281,7 +281,7 @@ pub fn optionsFromUri(uri: []const u8, out: []Option, scratch: []u8) UriError![]
     }
 
     // 3. Path: non-empty '/'-separated segments up to '?'.
-    const query_start = std.mem.indexOfScalar(u8, rest, '?');
+    const query_start = std.mem.findScalar(u8, rest, '?');
     const path = if (query_start) |q| rest[0..q] else rest;
     var seg_it = std.mem.splitScalar(u8, path, '/');
     while (seg_it.next()) |seg| {
@@ -310,7 +310,7 @@ pub fn optionsFromUri(uri: []const u8, out: []Option, scratch: []u8) UriError![]
 /// Percent-decode `src` into the unused tail of `scratch` (advancing
 /// `scratch_used`), or borrow `src` verbatim when it has no escapes.
 fn decodeInto(src: []const u8, scratch: []u8, scratch_used: *usize) UriError![]const u8 {
-    if (std.mem.indexOfScalar(u8, src, '%') == null) return src;
+    if (std.mem.findScalar(u8, src, '%') == null) return src;
     if (scratch.len - scratch_used.* < src.len) return error.ScratchTooSmall;
     const window = scratch[scratch_used.* .. scratch_used.* + src.len];
     const decoded = std.Uri.percentDecodeBackwards(window, src);
@@ -654,7 +654,7 @@ test "uriFromOptions: a hostile Uri-Host is percent-encoded, never emitted verba
     var out: [128]u8 = undefined;
     const len = try uriFromOptions(&opts, false, "", &out);
     const uri = out[0..len];
-    try testing.expect(std.mem.indexOfScalar(u8, uri, '@') == null);
+    try testing.expect(std.mem.findScalar(u8, uri, '@') == null);
     try testing.expectEqualStrings("coap://evil.com%2F%40attacker.com/", uri);
 
     // CR/LF and other controls are likewise escaped, not emitted raw.
@@ -662,8 +662,8 @@ test "uriFromOptions: a hostile Uri-Host is percent-encoded, never emitted verba
         .{ .number = number.uri_host, .value = "host\r\nSet-Cookie: x" },
     };
     const len2 = try uriFromOptions(&opts2, false, "", &out);
-    try testing.expect(std.mem.indexOfScalar(u8, out[0..len2], '\r') == null);
-    try testing.expect(std.mem.indexOfScalar(u8, out[0..len2], '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, out[0..len2], '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, out[0..len2], '\n') == null);
 }
 
 test "uriFromOptions: BufferTooSmall" {

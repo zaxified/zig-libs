@@ -452,7 +452,7 @@ test "SMTP smuggling: only CRLF.CRLF terminates the data" {
         defer gpa.free(smuggle);
         try testing.expect(!try t.feed(smuggle));
         try testing.expect(try t.feed(".\r\n"));
-        try testing.expect(std.mem.indexOf(u8, t.bytes(), "MAIL FROM:<evil@x.test>\r\n") != null);
+        try testing.expect(std.mem.find(u8, t.bytes(), "MAIL FROM:<evil@x.test>\r\n") != null);
     }
 }
 

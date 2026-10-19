@@ -127,10 +127,10 @@ fn fuzzRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     const ql = src.index(q.len + 1);
     for (q[0..ql]) |*c| c.* = " abcxyz019.-:/\r\n"[src.index(17)];
     var out: [64]u8 = undefined;
-    const has_crlf = std.mem.indexOfAny(u8, q[0..ql], "\r\n") != null;
+    const has_crlf = std.mem.findAny(u8, q[0..ql], "\r\n") != null;
     if (whois.formatQuery(&out, q[0..ql])) |f| {
         if (has_crlf) return error.QueryInjectionAccepted;
-        if (!std.mem.endsWith(u8, f, "\r\n") or std.mem.indexOfAny(u8, f[0 .. f.len - 2], "\r\n") != null) return error.QueryNotOneLine;
+        if (!std.mem.endsWith(u8, f, "\r\n") or std.mem.findAny(u8, f[0 .. f.len - 2], "\r\n") != null) return error.QueryNotOneLine;
         RoundMark.mark(.query_ok);
     } else |_| {
         if (!has_crlf) return error.CleanQueryRefused;

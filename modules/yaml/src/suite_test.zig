@@ -130,7 +130,7 @@ fn parseLedger(gpa: std.mem.Allocator) ![]Entry {
 }
 
 fn hasFile(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, name: []const u8, leaf: []const u8) !bool {
-    const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ name, leaf });
+    const p = try gpa.print("{s}/{s}", .{ name, leaf });
     defer gpa.free(p);
     dir.access(io, p, .{}) catch return false;
     return true;
@@ -158,7 +158,7 @@ fn collectCases(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, out: *std.
         while (try sit.next(io)) |se| {
             if (se.kind != .directory) continue;
             if (try hasFile(gpa, io, sub, se.name, "in.yaml"))
-                try out.append(gpa, try std.fmt.allocPrint(gpa, "{s}/{s}", .{ e.name, se.name }));
+                try out.append(gpa, try gpa.print("{s}/{s}", .{ e.name, se.name }));
         }
     }
 }
@@ -190,7 +190,7 @@ fn openSuite(gpa: std.mem.Allocator, io: std.Io) !?std.Io.Dir {
 }
 
 fn readCaseFile(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, id: []const u8, name: []const u8) ![]u8 {
-    const p = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ id, name });
+    const p = try gpa.print("{s}/{s}", .{ id, name });
     defer gpa.free(p);
     return root.readFileAlloc(io, p, gpa, .limited(1 << 20));
 }
@@ -274,7 +274,7 @@ const Cmp = struct {
 
     fn note(self: *Cmp, comptime fmt: []const u8, args: anytype) !void {
         var buf: [256]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch "…";
+        const s = std.mem.print(&buf, fmt, args) catch "…";
         self.detail.clearRetainingCapacity();
         try self.detail.appendSlice(self.gpa, s);
     }
@@ -282,7 +282,7 @@ const Cmp = struct {
     fn push(self: *Cmp, comptime fmt: []const u8, args: anytype) !usize {
         const mark = self.path.items.len;
         var buf: [128]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch "…";
+        const s = std.mem.print(&buf, fmt, args) catch "…";
         try self.path.appendSlice(self.gpa, s);
         return mark;
     }

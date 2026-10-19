@@ -214,7 +214,7 @@ test "golden: a third-party CLIENT produces the same AUTH PLAIN octets" {
     var buf: [64]u8 = undefined;
     const ours = try auth.plainResponse(&buf, "", "tester", "s3cret");
     try testing.expectEqualStrings("AHRlc3RlcgBzM2NyZXQ=", ours);
-    try testing.expect(std.mem.indexOf(u8, live_client, "AUTH PLAIN AHRlc3RlcgBzM2NyZXQ=\r\n") != null);
+    try testing.expect(std.mem.find(u8, live_client, "AUTH PLAIN AHRlc3RlcgBzM2NyZXQ=\r\n") != null);
 }
 
 test "golden: the message inside the capture is what we compose today" {
@@ -226,7 +226,7 @@ test "golden: the message inside the capture is what we compose today" {
     // Pull the DATA payload back out of the client capture and un-stuff it: it
     // must be exactly the document we render.
     const marker = "DATA\r\n";
-    const start = std.mem.indexOf(u8, live_client, marker).? + marker.len;
+    const start = std.mem.find(u8, live_client, marker).? + marker.len;
     var u: data.Unstuffer = .init(gpa, .{});
     defer u.deinit();
     // Byte at a time, so the un-stuffer decides where the stream ends — the
@@ -240,7 +240,7 @@ test "golden: the message inside the capture is what we compose today" {
 
     // ...and the wire really carried the doubled period that the un-stuffed
     // document contains as a single one.
-    try testing.expect(std.mem.indexOf(u8, live_client, "\r\n..\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, doc, "\r\n.\r\n") != null);
+    try testing.expect(std.mem.find(u8, live_client, "\r\n..\r\n") != null);
+    try testing.expect(std.mem.find(u8, doc, "\r\n.\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, live_client, "\r\n.\r\nQUIT\r\n"));
 }

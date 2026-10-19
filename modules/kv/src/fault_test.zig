@@ -298,8 +298,8 @@ test "fault-injection sweep: expiring puts, the v1→v2 upgrade and expiry-dropp
         // gone from it, not merely hidden.
         const file = sim.fileContent(db_name).?;
         try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, file[4..8], .little));
-        try testing.expect(std.mem.indexOf(u8, file, "stale") == null);
-        try testing.expect(std.mem.indexOf(u8, file, "dies") == null);
+        try testing.expect(std.mem.find(u8, file, "stale") == null);
+        try testing.expect(std.mem.find(u8, file, "dies") == null);
     }
     try testing.expect(total >= 40);
 

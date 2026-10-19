@@ -67,7 +67,7 @@ fn skip(comptime msg: []const u8, args: anytype) error{SkipZigTest} {
 fn pymapPath(gpa: std.mem.Allocator, io: std.Io) ![]u8 {
     if (envVar("IMAP_PYMAP")) |p| return gpa.dupe(u8, p);
     const home = envVar("HOME") orelse return skip("no $HOME and no $IMAP_PYMAP", .{});
-    const path = try std.fmt.allocPrint(gpa, "{s}/.cache/zig-libs-imap/bin/pymap", .{home});
+    const path = try gpa.print("{s}/.cache/zig-libs-imap/bin/pymap", .{home});
     errdefer gpa.free(path);
     std.Io.Dir.cwd().access(io, path, .{}) catch {
         return skip(
@@ -89,7 +89,7 @@ test "LIVE pymap interop: greet -> login -> select -> fetch -> search -> idle ->
     defer gpa.free(exe);
 
     var port_buf: [8]u8 = undefined;
-    const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{port}) catch unreachable;
+    const port_str = std.mem.print(&port_buf, "{d}", .{port}) catch unreachable;
 
     var child = std.process.spawn(io, .{
         .argv = &.{

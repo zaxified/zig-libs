@@ -61,7 +61,7 @@ pub fn parseMailboxList(d: *wire.Decoder) Error!Entry {
             try d.expect('\\');
             const name = try d.expectAtom();
             defer d.gpa.free(name);
-            const with_slash = std.fmt.allocPrint(d.gpa, "\\{s}", .{name}) catch
+            const with_slash = d.gpa.print("\\{s}", .{name}) catch
                 return error.OutOfMemory;
             try flags.append(d.gpa, with_slash);
         }
@@ -285,7 +285,7 @@ test "LIST reply: multiple flags, and a UTF-7-encoded mailbox name decodes" {
     // the decoder.
     const encoded = try utf7.encodeAlloc(gpa, "Отправленные");
     defer gpa.free(encoded);
-    const line = try std.fmt.allocPrint(gpa, " (\\HasChildren \\Marked) \"/\" {s}\r\n", .{encoded});
+    const line = try gpa.print(" (\\HasChildren \\Marked) \"/\" {s}\r\n", .{encoded});
     defer gpa.free(line);
 
     var r = std.Io.Reader.fixed(line);

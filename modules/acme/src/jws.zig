@@ -403,7 +403,7 @@ pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
         const parts = RsaParts.of(&pk.rs256, &n_buf, &e_buf);
         var nb: [base64UrlLen(rsa.max_modulus_len)]u8 = undefined;
         var eb: [base64UrlLen(4)]u8 = undefined;
-        return std.fmt.bufPrint(
+        return std.mem.print(
             buf,
             "{{\"e\":\"{s}\",\"kty\":\"RSA\",\"n\":\"{s}\"}}",
             .{ b64.Encoder.encode(&eb, parts.e), b64.Encoder.encode(&nb, parts.n) },
@@ -416,7 +416,7 @@ pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
     var yb: [88]u8 = undefined;
     const x = b64.Encoder.encode(&xb, sec1[1 .. 1 + n]);
     const y = b64.Encoder.encode(&yb, sec1[1 + n .. 1 + 2 * n]);
-    return std.fmt.bufPrint(
+    return std.mem.print(
         buf,
         "{{\"crv\":\"{s}\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}",
         .{ pk.alg().crv(), x, y },
@@ -482,7 +482,7 @@ pub fn keyAuthorization(
 ) KeyAuthorizationError![]const u8 {
     if (!isValidToken(token)) return error.InvalidToken;
     const tp = thumbprintBase64(public_key);
-    return std.fmt.bufPrint(buf, "{s}.{s}", .{ token, tp }) catch unreachable; // bounded by max_token_len
+    return std.mem.print(buf, "{s}.{s}", .{ token, tp }) catch unreachable; // bounded by max_token_len
 }
 
 // ── RFC 8737 §3 TLS-ALPN-01 acmeIdentifier ──────────────────────────────────
@@ -722,8 +722,7 @@ pub fn signEab(
     std.crypto.secureZero(u8, &mac);
     burn.stack(burn.key_burn);
 
-    return std.fmt.allocPrint(
-        gpa,
+    return gpa.print(
         "{{\"protected\":\"{s}\",\"payload\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ protected_b64, payload_b64, mac_b64 },
     );
@@ -1099,7 +1098,7 @@ test "base64url: RFC 4648 behavior, no padding, url-safe alphabet" {
     // Round-trip through the alloc variants.
     const enc = try base64UrlEncodeAlloc(testing.allocator, "any carnal pleasure");
     defer testing.allocator.free(enc);
-    try testing.expect(std.mem.indexOfScalar(u8, enc, '=') == null);
+    try testing.expect(std.mem.findScalar(u8, enc, '=') == null);
     const dec = try base64UrlDecodeAlloc(testing.allocator, enc);
     defer testing.allocator.free(dec);
     try testing.expectEqualStrings("any carnal pleasure", dec);
@@ -1321,7 +1320,7 @@ test "verifyFlattened: malformed and tampered inputs never verify" {
     // Tamper with the payload field (swap a base64 char).
     const tampered = try testing.allocator.dupe(u8, jws_json);
     defer testing.allocator.free(tampered);
-    const pay_at = std.mem.indexOf(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
+    const pay_at = std.mem.find(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
     tampered[pay_at] = if (tampered[pay_at] == 'A') 'B' else 'A';
     try testing.expectError(error.BadSignature, verifyFlattened(testing.allocator, tampered, kp.public_key));
 
@@ -1343,7 +1342,7 @@ fn craftJws(a: std.mem.Allocator, kp: *const KeyPair, protected: []const u8, sig
     const sig = try kp.sign(input, null);
     const raw = try std.mem.concat(a, u8, &.{ &sig.toBytes(), sig_extra });
     const s64 = try base64UrlEncodeAlloc(a, raw);
-    return std.fmt.allocPrint(a, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+    return a.print("{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
 }
 
 test "verifyFlattened refuses a validly signed JWS whose header breaks RFC 8555 §6.2 / RFC 7518" {
@@ -1360,29 +1359,29 @@ test "verifyFlattened refuses a validly signed JWS whose header breaks RFC 8555 
     var jwk_buf: [256]u8 = undefined;
     const jwk = canonicalJwk(&jwk_buf, kp.public_key);
 
-    const ok = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    const ok = try craftJws(a, kp, try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
     var v = try verifyFlattened(testing.allocator, ok, null); // control
     v.deinit();
 
-    const bad_alg = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES384\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    const bad_alg = try craftJws(a, kp, try a.print("{{\"alg\":\"ES384\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
     try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, bad_alg, null));
-    const both = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"kid\":\"acct\",\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
+    const both = try craftJws(a, kp, try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"kid\":\"acct\",\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "");
     try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, both, null));
     const rsa_kty = try std.mem.replaceOwned(u8, a, jwk, "\"kty\":\"EC\"", "\"kty\":\"RSA\"");
-    const wrong_kty = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{rsa_kty}), "");
+    const wrong_kty = try craftJws(a, kp, try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{rsa_kty}), "");
     try testing.expectError(error.UnsupportedJws, verifyFlattened(testing.allocator, wrong_kty, null));
     const short_x = "{\"alg\":\"ES256\",\"jwk\":{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"AAAA\",\"y\":\"" ++ rfc7515_y ++ "\"},\"nonce\":\"n\",\"url\":\"u\"}";
     try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, try craftJws(a, kp, short_x, ""), null));
     // A 65-byte "signature": the real 64 bytes plus one — not an ES256
     // signature (RFC 7518 §3.4: exactly R ‖ S, 64 octets).
-    const long_sig = try craftJws(a, kp, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "\x00");
+    const long_sig = try craftJws(a, kp, try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{jwk}), "\x00");
     try testing.expectError(error.MalformedJws, verifyFlattened(testing.allocator, long_sig, null));
 
     // An attacker's own key, embedded as jwk, against the account key.
     const attacker = seedKeyPair(9);
     var ajwk_buf: [256]u8 = undefined;
     const ajwk = canonicalJwk(&ajwk_buf, attacker.public_key);
-    const forged = try craftJws(a, attacker, try std.fmt.allocPrint(a, "{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ajwk}), "");
+    const forged = try craftJws(a, attacker, try a.print("{{\"alg\":\"ES256\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ajwk}), "");
     try testing.expectError(error.BadSignature, verifyFlattened(testing.allocator, forged, kp.public_key));
 }
 
@@ -1483,7 +1482,7 @@ test "ES384: sign -> verifyFlattenedAny (jwk and kid), 96-byte signature, alg ES
 fn craftJwsAlg(gpa: std.mem.Allocator, alg: []const u8, public_key: Es384.PublicKey, sig_len: usize) ![]u8 {
     var jwk_buf: [max_canonical_jwk_len]u8 = undefined;
     const jwk = canonicalJwk(&jwk_buf, public_key);
-    const protected = try std.fmt.allocPrint(gpa, "{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk });
+    const protected = try gpa.print("{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk });
     defer gpa.free(protected);
     const p64 = try base64UrlEncodeAlloc(gpa, protected);
     defer gpa.free(p64);
@@ -1492,7 +1491,7 @@ fn craftJwsAlg(gpa: std.mem.Allocator, alg: []const u8, public_key: Es384.Public
     @memset(zeros, 0);
     const s64 = try base64UrlEncodeAlloc(gpa, zeros);
     defer gpa.free(s64);
-    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+    return gpa.print("{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
 }
 
 test "generateAnyKeyPair: both curves draw entropy and sign" {
@@ -1630,7 +1629,7 @@ test "ES512: sign -> verifyFlattenedAny (jwk and kid), 132-byte signature, alg E
     // A tampered payload fails the signature.
     const tampered = try testing.allocator.dupe(u8, jws_json);
     defer testing.allocator.free(tampered);
-    const pay_at = std.mem.indexOf(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
+    const pay_at = std.mem.find(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
     tampered[pay_at] = if (tampered[pay_at] == 'A') 'B' else 'A';
     try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, tampered, null));
 }
@@ -1638,7 +1637,7 @@ test "ES512: sign -> verifyFlattenedAny (jwk and kid), 132-byte signature, alg E
 fn craftJwsAlgAny(gpa: std.mem.Allocator, alg: []const u8, public_key: AnyPublicKey, sig_len: usize) ![]u8 {
     var jwk_buf: [max_canonical_jwk_len]u8 = undefined;
     const jwk = canonicalJwk(&jwk_buf, public_key);
-    const protected = try std.fmt.allocPrint(gpa, "{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk });
+    const protected = try gpa.print("{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk });
     defer gpa.free(protected);
     const p64 = try base64UrlEncodeAlloc(gpa, protected);
     defer gpa.free(p64);
@@ -1647,7 +1646,7 @@ fn craftJwsAlgAny(gpa: std.mem.Allocator, alg: []const u8, public_key: AnyPublic
     @memset(zeros, 0);
     const s64 = try base64UrlEncodeAlloc(gpa, zeros);
     defer gpa.free(s64);
-    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+    return gpa.print("{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
 }
 
 // ── RS256 (2026-10-16) ──────────────────────────────────────────────────────
@@ -1799,7 +1798,7 @@ test "RS256: sign -> verifyFlattenedAny (jwk and kid); signature byte-identical 
     // A tampered payload fails the signature.
     const tampered = try testing.allocator.dupe(u8, jws_json);
     defer testing.allocator.free(tampered);
-    const pay_at = std.mem.indexOf(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
+    const pay_at = std.mem.find(u8, tampered, "\"payload\":\"").? + "\"payload\":\"".len;
     tampered[pay_at] = if (tampered[pay_at] == 'A') 'B' else 'A';
     try testing.expectError(error.BadSignature, verifyFlattenedAny(testing.allocator, tampered, null));
 }
@@ -1845,14 +1844,14 @@ test "RS256: malformed signatures and JWKs are refused at the right layer" {
     @memcpy(padded[1..], parts.n);
     const padded_b64 = try base64UrlEncodeAlloc(testing.allocator, &padded);
     defer testing.allocator.free(padded_b64);
-    const lead_n = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{padded_b64});
+    const lead_n = try testing.allocator.print("{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{padded_b64});
     defer testing.allocator.free(lead_n);
     const j1 = try craftJwsRaw(testing.allocator, "RS256", lead_n, 256);
     defer testing.allocator.free(j1);
     try testing.expectError(error.MalformedJws, verifyFlattenedAny(testing.allocator, j1, null));
     const n_b64 = try base64UrlEncodeAlloc(testing.allocator, parts.n);
     defer testing.allocator.free(n_b64);
-    const lead_e = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AAEAAQ\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{n_b64});
+    const lead_e = try testing.allocator.print("{{\"e\":\"AAEAAQ\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{n_b64});
     defer testing.allocator.free(lead_e);
     const j2 = try craftJwsRaw(testing.allocator, "RS256", lead_e, 256);
     defer testing.allocator.free(j2);
@@ -1863,7 +1862,7 @@ test "RS256: malformed signatures and JWKs are refused at the right layer" {
     small[127] = 0x01;
     const small_b64 = try base64UrlEncodeAlloc(testing.allocator, &small);
     defer testing.allocator.free(small_b64);
-    const small_jwk = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{small_b64});
+    const small_jwk = try testing.allocator.print("{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{small_b64});
     defer testing.allocator.free(small_jwk);
     const j3 = try craftJwsRaw(testing.allocator, "RS256", small_jwk, 128);
     defer testing.allocator.free(j3);
@@ -1873,7 +1872,7 @@ test "RS256: malformed signatures and JWKs are refused at the right layer" {
     big[1023] = 0x01;
     const big_b64 = try base64UrlEncodeAlloc(testing.allocator, &big);
     defer testing.allocator.free(big_b64);
-    const big_jwk = try std.fmt.allocPrint(testing.allocator, "{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{big_b64});
+    const big_jwk = try testing.allocator.print("{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{big_b64});
     defer testing.allocator.free(big_jwk);
     const j4 = try craftJwsRaw(testing.allocator, "RS256", big_jwk, 1024);
     defer testing.allocator.free(j4);
@@ -1882,7 +1881,7 @@ test "RS256: malformed signatures and JWKs are refused at the right layer" {
 
 /// A JWS with a caller-written JWK member and an all-zero signature.
 fn craftJwsRaw(gpa: std.mem.Allocator, alg: []const u8, jwk_json: []const u8, sig_len: usize) ![]u8 {
-    const protected = try std.fmt.allocPrint(gpa, "{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk_json });
+    const protected = try gpa.print("{{\"alg\":\"{s}\",\"jwk\":{s},\"nonce\":\"n\",\"url\":\"u\"}}", .{ alg, jwk_json });
     defer gpa.free(protected);
     const p64 = try base64UrlEncodeAlloc(gpa, protected);
     defer gpa.free(p64);
@@ -1891,7 +1890,7 @@ fn craftJwsRaw(gpa: std.mem.Allocator, alg: []const u8, jwk_json: []const u8, si
     @memset(zeros, 0);
     const s64 = try base64UrlEncodeAlloc(gpa, zeros);
     defer gpa.free(s64);
-    return std.fmt.allocPrint(gpa, "{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
+    return gpa.print("{{\"protected\":\"{s}\",\"payload\":\"\",\"signature\":\"{s}\"}}", .{ p64, s64 });
 }
 
 test "RS256: Alg and AnyPublicKey/AnyKeyPair bookkeeping" {

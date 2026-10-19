@@ -325,7 +325,7 @@ pub fn requestContentEncoding(content_encoding: ?[]const u8) RequestEncoding {
     const raw = content_encoding orelse return .identity;
     const value = std.mem.trim(u8, raw, " \t");
     if (value.len == 0) return .identity;
-    if (std.mem.indexOfScalar(u8, value, ',') != null) return .unsupported;
+    if (std.mem.findScalar(u8, value, ',') != null) return .unsupported;
     if (std.ascii.eqlIgnoreCase(value, "identity")) return .identity;
     if (std.ascii.eqlIgnoreCase(value, "gzip") or std.ascii.eqlIgnoreCase(value, "x-gzip"))
         return .gzip;
@@ -429,7 +429,7 @@ pub fn acceptsGzip(accept_encoding: ?[]const u8) bool {
     while (it.next()) |raw| {
         const entry = std.mem.trim(u8, raw, " \t");
         if (entry.len == 0) continue;
-        const semi = std.mem.indexOfScalar(u8, entry, ';') orelse entry.len;
+        const semi = std.mem.findScalar(u8, entry, ';') orelse entry.len;
         const coding = std.mem.trimEnd(u8, entry[0..semi], " \t");
         const ok = qvalueAccepts(entry[semi..]);
         if (std.ascii.eqlIgnoreCase(coding, "gzip") or
@@ -468,7 +468,7 @@ fn qvalueAccepts(params: []const u8) bool {
 /// '/' ("text/" matches every text subtype); a structured-syntax suffix
 /// starting with '+' ("+json" matches "application/problem+json").
 pub fn contentTypeCompressible(content_type: []const u8, allowlist: []const []const u8) bool {
-    const semi = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    const semi = std.mem.findScalar(u8, content_type, ';') orelse content_type.len;
     const ct = std.mem.trim(u8, content_type[0..semi], " \t");
     for (allowlist) |entry| {
         if (entry.len == 0) continue;

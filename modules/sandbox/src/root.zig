@@ -3053,13 +3053,13 @@ const LandlockFixture = struct {
         _ = landlockAbiVersion() catch return error.SkipZigTest; // pre-5.13 / disabled
         if (openReadonly(ll_forbidden_file) != .SUCCESS) return error.SkipZigTest; // no /etc/passwd
         const pid = linux.getpid();
-        f.dir = try std.fmt.bufPrintSentinel(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid}, 0);
-        f.file = try std.fmt.bufPrintSentinel(&f.file_buf, "{s}/ok.txt", .{f.dir}, 0);
-        f.out_dir = try std.fmt.bufPrintSentinel(&f.out_dir_buf, "/tmp/zig_sandbox_ll_{d}_outside", .{pid}, 0);
-        f.out_victim = try std.fmt.bufPrintSentinel(&f.out_victim_buf, "{s}/victim.txt", .{f.out_dir}, 0);
-        f.out_new = try std.fmt.bufPrintSentinel(&f.out_new_buf, "{s}/created.txt", .{f.out_dir}, 0);
-        f.out_sub = try std.fmt.bufPrintSentinel(&f.out_sub_buf, "{s}/newdir", .{f.out_dir}, 0);
-        f.in_new = try std.fmt.bufPrintSentinel(&f.in_new_buf, "{s}/written.txt", .{f.dir}, 0);
+        f.dir = try std.mem.printSentinel(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid}, 0);
+        f.file = try std.mem.printSentinel(&f.file_buf, "{s}/ok.txt", .{f.dir}, 0);
+        f.out_dir = try std.mem.printSentinel(&f.out_dir_buf, "/tmp/zig_sandbox_ll_{d}_outside", .{pid}, 0);
+        f.out_victim = try std.mem.printSentinel(&f.out_victim_buf, "{s}/victim.txt", .{f.out_dir}, 0);
+        f.out_new = try std.mem.printSentinel(&f.out_new_buf, "{s}/created.txt", .{f.out_dir}, 0);
+        f.out_sub = try std.mem.printSentinel(&f.out_sub_buf, "{s}/newdir", .{f.out_dir}, 0);
+        f.in_new = try std.mem.printSentinel(&f.in_new_buf, "{s}/written.txt", .{f.dir}, 0);
         _ = linux.mkdir(f.dir.ptr, 0o700); // ignore EEXIST from a prior run
         _ = linux.mkdir(f.out_dir.ptr, 0o700);
         for ([_][:0]const u8{ f.file, f.out_victim }) |p| {
@@ -3132,7 +3132,7 @@ test "landlock: initHandling(read_only) is the explicit, weaker form — access.
 test "landlock: allowPath refuses a symlink by name instead of granting its target (audit S10)" {
     _ = landlockAbiVersion() catch return error.SkipZigTest;
     var link_buf: [64]u8 = undefined;
-    const link_z = try std.fmt.bufPrintSentinel(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()}, 0);
+    const link_z = try std.mem.printSentinel(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()}, 0);
     _ = linux.unlink(link_z.ptr);
     if (linux.errno(linux.symlink("/", link_z.ptr)) != .SUCCESS) return error.SkipZigTest; // /tmp not writable
     defer _ = linux.unlink(link_z.ptr);
@@ -3397,7 +3397,7 @@ test "landlock scope (ABI 6): abstract UNIX socket — no connect to a listener 
     defer _ = linux.close(fd);
     g_ll_abstract = .{ .path = @splat(0) };
     // Abstract namespace: a leading NUL byte, no filesystem entry to clean up.
-    const name = try std.fmt.bufPrint(g_ll_abstract.path[1..], "zig_sandbox_scope_{d}", .{linux.getpid()});
+    const name = try std.mem.print(g_ll_abstract.path[1..], "zig_sandbox_scope_{d}", .{linux.getpid()});
     g_ll_abstract_len = @intCast(@offsetOf(linux.sockaddr.un, "path") + 1 + name.len);
     if (linux.errno(linux.bind(fd, @ptrCast(&g_ll_abstract), g_ll_abstract_len)) != .SUCCESS) return error.SkipZigTest;
     if (linux.errno(linux.listen(fd, 4)) != .SUCCESS) return error.SkipZigTest;

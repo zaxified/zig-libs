@@ -569,7 +569,7 @@ test "spawnDetached: the child does not inherit the parent's non-CLOEXEC fds" {
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     var cmd_buf: [64]u8 = undefined;
-    const cmd = try std.fmt.bufPrint(&cmd_buf, "[ -e /proc/self/fd/{d} ] && exit 1; exit 0", .{fds[1]});
+    const cmd = try std.mem.print(&cmd_buf, "[ -e /proc/self/fd/{d} ] && exit 1; exit 0", .{fds[1]});
     const r = try runToCompletion(&.{ "/bin/sh", "-c", cmd });
     try std.testing.expectEqual(@as(?u8, 0), r.exit_code);
 }

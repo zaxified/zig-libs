@@ -73,7 +73,7 @@ fn compressCaseOn(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Str
     };
     if (mc.schedule) |sch| {
         var buf: [256]u8 = undefined;
-        const s = try std.fmt.bufPrint(&buf, "nbWorkers={d},{s}", .{ workers, sch });
+        const s = try std.mem.print(&buf, "nbWorkers={d},{s}", .{ workers, sch });
         const r = try stream_test.runOn(gpa, strm, src, level, ck, s, d);
         return r.out;
     }

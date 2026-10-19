@@ -5321,7 +5321,7 @@ test "recv: the anti-replay window is exactly 64 records wide — 63 back is acc
     var recs: [65][]const u8 = undefined;
     for (&wires, 0..) |*w, i| {
         var msg: [8]u8 = undefined;
-        const m = std.fmt.bufPrint(&msg, "s{d}", .{i}) catch unreachable;
+        const m = std.mem.print(&msg, "s{d}", .{i}) catch unreachable;
         const r = try client.send(m, w);
         recs[i] = w[0..r.len];
     }
@@ -5649,7 +5649,7 @@ test "handshake: ClientHello2 reuses ClientHello1's random and echoes the cookie
     try testing.expectEqualSlices(u8, &ch1_random, &client.client_random);
     // The cookie has to come back verbatim, or the stateless server cannot
     // reconstruct the connection it refused to remember.
-    try testing.expect(std.mem.indexOf(u8, retry.out, cookie) != null);
+    try testing.expect(std.mem.find(u8, retry.out, cookie) != null);
     // And ClientHello2 must be a NEW message, not a retransmission of
     // ClientHello1 (RFC 9147 §5.2: retransmissions reuse `message_seq`).
     try testing.expectEqual(@as(u16, 2), client.message_seq);
@@ -7985,8 +7985,8 @@ test "doc: every entry point where randomness enters states the CSPRNG requireme
         "fn ecdheGenerate(",
     };
     for (decls) |decl| {
-        const at = std.mem.indexOf(u8, src, decl) orelse return error.DeclarationNotFound;
+        const at = std.mem.find(u8, src, decl) orelse return error.DeclarationNotFound;
         const window_start = at -| 6000;
-        try testing.expect(std.mem.indexOf(u8, src[window_start..at], needle) != null);
+        try testing.expect(std.mem.find(u8, src[window_start..at], needle) != null);
     }
 }

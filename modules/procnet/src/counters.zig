@@ -64,7 +64,7 @@ pub fn parseNetDev(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
     errdefer out.deinit(gpa);
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue; // headers have none
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue; // headers have none
         const nm = std.mem.trim(u8, line[0..colon], " \t");
         if (nm.len == 0 or nm.len > procnet.if_name_max) continue;
         var vals: [16]u64 = undefined;
@@ -278,7 +278,7 @@ pub fn parseMeminfo(text: []const u8) MemInfo {
     var m: MemInfo = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = line[0..colon];
         var it = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t\r");
         const v = parseU64(it.next() orelse continue) orelse continue;

@@ -730,7 +730,7 @@ test "decode: `.utf8` produces valid UTF-8, not the bytes it was handed (re-audi
         const got = try decodeToUtf8(testing.allocator, c, .utf8);
         defer testing.allocator.free(got);
         try testing.expect(std.unicode.utf8ValidateSlice(got));
-        try testing.expect(std.mem.indexOf(u8, got, replacement_char) != null);
+        try testing.expect(std.mem.find(u8, got, replacement_char) != null);
     }
     // Valid input is untouched, byte for byte.
     for ([_][]const u8{ "", "plain ascii", "p\u{159}\u{ed}li\u{161} \u{17e}lu\u{165}ou\u{10d}k\u{fd}", "\u{1F600}" }) |c| {

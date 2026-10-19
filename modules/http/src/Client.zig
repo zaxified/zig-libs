@@ -2198,12 +2198,12 @@ const h2glue = struct {
             var lines = std.mem.splitSequence(u8, aw.written(), "\r\n");
             // "METHOD target HTTP/1.1"
             const request_line = lines.next().?;
-            const sp = std.mem.indexOfScalar(u8, request_line, ' ').?;
+            const sp = std.mem.findScalar(u8, request_line, ' ').?;
             r.target = request_line[sp + 1 .. request_line.len - " HTTP/1.1".len];
             var fields: std.ArrayList(http.Header) = .empty;
             while (lines.next()) |line| {
                 if (line.len == 0) continue;
-                const colon = std.mem.indexOfScalar(u8, line, ':').?;
+                const colon = std.mem.findScalar(u8, line, ':').?;
                 const name = line[0..colon];
                 const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
                 if (std.ascii.eqlIgnoreCase(name, "host")) {
@@ -3448,8 +3448,8 @@ test "writeRequestHead: body plans, custom + managed headers" {
 
     w = .fixed(&buf);
     try writeRequestHead(&w, .put, url, &.{}, "a", .chunked, false, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Transfer-Encoding: chunked\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Content-Length") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Content-Length") == null);
 }
 
 test "writeRequestHead: Authorization stripped on cross-host redirect" {
@@ -3459,11 +3459,11 @@ test "writeRequestHead: Authorization stripped on cross-host redirect" {
 
     var w: std.Io.Writer = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization: Bearer secret") != null);
 
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization") == null);
 }
 
 test "crossOrigin: scheme, host and port must ALL match (CVE-2018-18074 class)" {
@@ -3495,15 +3495,15 @@ test "writeRequestHead: Authorization and Cookie both stripped on cross-origin r
     // Same-origin hop: both credential headers are forwarded.
     var w: std.Io.Writer = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization: Bearer secret") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie: session=abc123") != null);
 
     // Cross-origin hop: both are dropped (session-cookie / API-key leak
     // otherwise — Cookie is just as sensitive as Authorization here).
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie") == null);
 }
 
 test "writeRequestHead: a caller's Host and Proxy-Authorization do not survive a cross-origin hop either (A1 G3/G4)" {
@@ -3523,17 +3523,17 @@ test "writeRequestHead: a caller's Host and Proxy-Authorization do not survive a
     // the proxy credential is for the proxy in front of that origin.
     var w: std.Io.Writer = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, false, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Host: vhost.internal\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Proxy-Authorization: Basic SECRET\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Host: vhost.internal\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Proxy-Authorization: Basic SECRET\r\n") != null);
 
     // Cross-origin hop: the hop's own authority as Host, no proxy credential,
     // the innocent header still there.
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, url, &hdrs, "a", .none, true, true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Host: second.example:8081\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "vhost.internal") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Proxy-Authorization") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "X-Keep: kept\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Host: second.example:8081\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "vhost.internal") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Proxy-Authorization") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "X-Keep: kept\r\n") != null);
 }
 
 test "request(): same-host scheme downgrade and same-host port change both strip Authorization+Cookie" {
@@ -3552,24 +3552,24 @@ test "request(): same-host scheme downgrade and same-host port change both strip
     try testing.expect(crossOrigin(original, downgraded));
     var w: std.Io.Writer = .fixed(&buf);
     try writeRequestHead(&w, .get, downgraded, &hdrs, "a", .none, crossOrigin(original, downgraded), true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie") == null);
 
     // Same host+scheme, different port: must strip.
     const reported = try http.Url.parse("https://api.example:8443/v1");
     try testing.expect(crossOrigin(original, reported));
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, reported, &hdrs, "a", .none, crossOrigin(original, reported), true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization") == null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie") == null);
 
     // Truly same-origin hop (path-only change): both preserved.
     const same_origin = try http.Url.parse("https://api.example/v2");
     try testing.expect(!crossOrigin(original, same_origin));
     w = .fixed(&buf);
     try writeRequestHead(&w, .get, same_origin, &hdrs, "a", .none, crossOrigin(original, same_origin), true);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Authorization: Bearer secret") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie: session=abc123") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Authorization: Bearer secret") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie: session=abc123") != null);
 }
 
 test "redirect chain on fabricated responses" {
@@ -3845,7 +3845,7 @@ test "h2c dogfood: a client-wide `user_agent` reaches HTTP/2, and a per-request 
     }
     { // The same client over HTTP/1.1: identical answer, which is the point.
         var url_buf: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/ua", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/ua", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         const body = try res.readAllAlloc(gpa, 4096);
@@ -4208,7 +4208,7 @@ test "dialConn: TLS key material fails CLOSED when randomSecure has no entropy" 
     });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "https://127.0.0.1:{d}/", .{port});
 
     // Fail-closed: the documented contract of `Error.EntropyUnavailable`. The
     // alternative the code rejects is `io.random`, which "is seeded by
@@ -4317,7 +4317,7 @@ test "readAllAlloc: a canceled body read surfaces Canceled, not ReadFailed" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res = try client.request(.get, url, .{});
     defer res.deinit();
@@ -4357,7 +4357,7 @@ test "getToFile: a canceled body read surfaces Canceled, not ReadFailed" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(getToFileOnce, .{ &client, url, tmp.dir, "out.bin" });
     try io.sleep(.fromMilliseconds(200), .awake);
@@ -4451,7 +4451,7 @@ test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(putFileOnce, .{ &client, url, tmp.dir, "upload.bin" });
     // Cancel once the peer holds a request byte (see `SilentReadPeer.receiving`):
@@ -4572,7 +4572,7 @@ test "putFile + putFilePlain: a cancel inside the local file read surfaces Cance
         var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
         var fut = try real_io.concurrent(putFileVia(plain), .{ &client, url, tmp.dir, "upload.bin" });
         const reached = awaitPeerFlag(real_io, &Double.entered, cancel_peer_watchdog_ms);
@@ -4695,7 +4695,7 @@ test "getToFile: a cancel inside creating, writing or flushing the local file su
         var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
         var fut = try real_io.concurrent(getToFileOnce, .{ &client, url, tmp.dir, "out.bin" });
         const reached = awaitPeerFlag(real_io, &Double.entered, cancel_peer_watchdog_ms);
@@ -4757,7 +4757,7 @@ test "request: a canceled request-head write surfaces Canceled, not WriteFailed"
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false }, .total_timeout_ms = 0 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
     const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
 
     var fut = try io.concurrent(requestOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
@@ -4806,7 +4806,7 @@ test "requestStreaming: a canceled request-head write surfaces Canceled, not Wri
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
     const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
 
     var fut = try io.concurrent(requestStreamingOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
@@ -4968,7 +4968,7 @@ test "timeout: total_timeout_ms bounds a stalling peer (plain http)" {
     var client = Client.init(io, gpa, .{ .connect_timeout_ms = 0, .total_timeout_ms = 300 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
     try w.go(8000);
@@ -5002,7 +5002,7 @@ test "timeout: total_timeout_ms bounds a stalling peer during the TLS handshake"
     });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "https://127.0.0.1:{d}/", .{port});
 
     var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
     try w.go(8000);
@@ -5031,7 +5031,7 @@ test "timeout: total_timeout_ms bounds Upload.finish against a stalling peer" {
     var client = Client.init(io, gpa, .{ .connect_timeout_ms = 0, .total_timeout_ms = 300 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogUploadFinish };
     try w.go(8000);
@@ -5091,7 +5091,7 @@ test "timeout: connect_timeout_ms bounds a connect the peer never accepts" {
     var client = Client.init(io, gpa, .{ .connect_timeout_ms = 300, .total_timeout_ms = 0 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var w: Watchdog = .{ .io = io, .client = &client, .url = url, .call = watchdogGet };
     try w.go(8000);
@@ -5127,7 +5127,7 @@ test "timeout: an Io with no concurrency to give degrades to unbounded, not to b
     });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     const body = try client.getAlloc(testing.allocator, url, 1 << 16);
     defer testing.allocator.free(body);
@@ -5250,7 +5250,7 @@ test "requestPlain: a redirect to https:// fails closed instead of silently upgr
     var client = Client.init(io, gpa, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     try testing.expectError(error.UnsupportedScheme, client.requestPlain(.get, url, .{}));
     // The redirect hop itself dialed nothing new (this test's only dial is
@@ -5321,7 +5321,7 @@ test "request/requestPlain: redirect_filter gates the destination before any dia
     var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     // Refused: one dial (the request that got the 302), the target — port 1,
     // unbindable, so a dial would fail loudly — never attempted.
@@ -5407,7 +5407,7 @@ test "requestPlain: plaintext GET/POST loopback works and pools exactly like req
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.requestPlain(.get, url, .{});
     drainAndDeinit(&res1);
@@ -5454,7 +5454,7 @@ test "putFilePlain: streams a real file over a plaintext loopback PUT" {
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     const status = try client.putFilePlain(url, tmp.dir, "upload.bin", .{});
     try testing.expectEqual(@as(u16, 200), status);
@@ -5492,7 +5492,7 @@ test "requestPlain: pool: stale-conn retry whose redial ALSO fails does not doub
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.requestPlain(.get, url, .{});
     drainAndDeinit(&res1);
@@ -5537,7 +5537,7 @@ test "requestStreamingPlain: pool: stale-conn retry whose redial ALSO fails does
     var client = Client.init(io, testing.allocator, .{ .write_buffer_size = 8 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     // Populate the pool via an ordinary GET against the same origin
     // (`staleConnRstNoRedialOrigin` answers any request the same way).
@@ -5621,7 +5621,7 @@ test "pool: two sequential requests to the same origin reuse one connection" {
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.request(.get, url, .{});
     drainAndDeinit(&res1);
@@ -5652,7 +5652,7 @@ test "pool: requestStreaming also reuses pooled connections" {
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     {
         var up = try client.requestStreaming(.post, url, .{}, 5);
@@ -5703,8 +5703,8 @@ test "pool: distinct origins do not cross-pollinate" {
     defer client.deinit();
     var buf_a: [64]u8 = undefined;
     var buf_b: [64]u8 = undefined;
-    const url_a = try std.fmt.bufPrint(&buf_a, "http://127.0.0.1:{d}/", .{port_a});
-    const url_b = try std.fmt.bufPrint(&buf_b, "http://127.0.0.1:{d}/", .{port_b});
+    const url_a = try std.mem.print(&buf_a, "http://127.0.0.1:{d}/", .{port_a});
+    const url_b = try std.mem.print(&buf_b, "http://127.0.0.1:{d}/", .{port_b});
 
     var r1 = try client.request(.get, url_a, .{});
     drainAndDeinit(&r1);
@@ -5745,7 +5745,7 @@ test "pool: a Connection: close response is not pooled" {
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.request(.get, url, .{});
     try testing.expect(res1.head.connection_close);
@@ -5817,7 +5817,7 @@ test "pool: a stale reused connection (peer already closed it) is retried once t
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.request(.get, url, .{});
     drainAndDeinit(&res1);
@@ -5914,7 +5914,7 @@ test "pool: stale-conn retry whose redial ALSO fails does not double-free conn" 
     var client = Client.init(io, testing.allocator, .{});
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var res1 = try client.request(.get, url, .{});
     drainAndDeinit(&res1);
@@ -5957,7 +5957,7 @@ test "pool: requestStreaming's stale-conn retry whose redial ALSO fails does not
     var client = Client.init(io, testing.allocator, .{ .write_buffer_size = 8 });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     // Populate the pool via an ordinary GET against the same origin
     // (`staleConnRstNoRedialOrigin` answers any request the same way).
@@ -5988,7 +5988,7 @@ test "pool: max_idle_per_host and max_idle_total cap eviction (oldest first)" {
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
     var url_buf: [64]u8 = undefined;
-    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+    const url = try http.Url.parse(try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port}));
 
     // Per-host cap: releasing a 3rd idle connection for the same origin
     // evicts the oldest (lowest `idle_since_ms`) of the first two.
@@ -6032,7 +6032,7 @@ test "pool: idle_timeout_ms reaping via sweep" {
     defer listener.deinit(io);
     const port = listener.socket.address.getPort();
     var url_buf: [64]u8 = undefined;
-    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+    const url = try http.Url.parse(try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port}));
 
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .idle_timeout_ms = 100 } });
     defer client.deinit();
@@ -6064,7 +6064,7 @@ test "pool: concurrent acquire/release from many threads is leak-free and race-f
     defer client.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port}));
+    const url = try http.Url.parse(try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port}));
 
     const n_threads = 8;
     const iters = 200;
@@ -6249,7 +6249,7 @@ test "max_conns_per_host: N+1 concurrent requests, N connections (Go MaxConnsPer
     var client = Client.init(io, testing.allocator, .{ .pool = .{ .max_conns_per_host = 2 } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
 
     const Worker = struct {
         fn run(cl: *Client, u: []const u8, failures: *std.atomic.Value(u32)) void {
@@ -6282,7 +6282,7 @@ test "max_conns_per_host: a request waiting for a slot ends at total_timeout_ms"
     defer thread.join();
     defer server.shutdown();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
 
     // Bounded by cancelation (`runBounded`) and, inline, by the deadline
     // the wait itself carries.
@@ -6374,7 +6374,7 @@ test "inline_blocking: resolving and connecting a host name starts no task on th
     // "localhost" is a NAME (it goes through the resolver), and on most hosts
     // it resolves to ::1 first, where nothing listens: the one-at-a-time
     // fallback to 127.0.0.1 is exercised too.
-    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://localhost:{d}/", .{port}));
+    const url = try http.Url.parse(try std.mem.print(&url_buf, "http://localhost:{d}/", .{port}));
 
     var inline_client = Client.init(io, testing.allocator, .{ .inline_blocking = true });
     defer inline_client.deinit();
@@ -6458,7 +6458,7 @@ const ProxyPeer = struct {
 };
 
 fn proxyText(buf: []u8, comptime fmt: []const u8, port: u16) []const u8 {
-    return std.fmt.bufPrint(buf, fmt, .{port}) catch unreachable;
+    return std.mem.print(buf, fmt, .{port}) catch unreachable;
 }
 
 test "proxy: an http:// request goes to the proxy in absolute form, with the proxy's Basic credentials" {
@@ -6664,7 +6664,7 @@ test "cookie jar: a cookie set on a redirect rides the next hop, after the calle
         var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false }, .cookie_jar = echo.jar() });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/login", .{listener.socket.address.getPort()});
+        const url_text = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/login", .{listener.socket.address.getPort()});
         const opts: RequestOptions = .{ .headers = &.{.{ .name = "Cookie", .value = "mine=1" }} };
         {
             var res = if (plain) try client.requestPlain(.get, url_text, opts) else try client.request(.get, url_text, opts);
@@ -6677,8 +6677,8 @@ test "cookie jar: a cookie set on a redirect rides the next hop, after the calle
         try testing.expectEqualStrings("/login", echo.stored_from[0..echo.stored_from_len]);
         // Hop 1: only the caller's cookie (the jar was empty). Hop 2: one
         // Cookie field, the caller's first, the jar's appended.
-        try testing.expect(std.mem.indexOf(u8, peer.head(0), "Cookie: mine=1\r\n") != null);
-        try testing.expect(std.mem.indexOf(u8, peer.head(1), "Cookie: mine=1; sid=42\r\n") != null);
+        try testing.expect(std.mem.find(u8, peer.head(0), "Cookie: mine=1\r\n") != null);
+        try testing.expect(std.mem.find(u8, peer.head(1), "Cookie: mine=1; sid=42\r\n") != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, peer.head(1), "Cookie:"));
     }
 }
@@ -6689,12 +6689,12 @@ test "cookie jar: without a caller Cookie the jar writes its own field, and noth
     const url = try http.Url.parse("http://h.test/x");
     var w: std.Io.Writer = .fixed(&buf);
     try writeRequestHeadVia(&w, null, echo.jar(), .get, "", url, &.{}, "a", .none, false, true, false);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "Cookie") == null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "Cookie") == null);
     @memcpy(echo.value[0..3], "k=v");
     echo.len = 3;
     w = .fixed(&buf);
     try writeRequestHeadVia(&w, null, echo.jar(), .get, "", url, &.{}, "a", .none, false, true, false);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "\r\nCookie: k=v\r\n") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "\r\nCookie: k=v\r\n") != null);
 }
 
 // ── transparent gzip (`Options.decompress`) ───────────
@@ -6735,9 +6735,9 @@ const KeepAlivePeer = struct {
             const got = h1.readHead(&sr.interface, &head_buf) catch return;
             @memcpy(p.heads[n.*][0..got.len], got);
             p.head_lens[n.*] = got.len;
-            if (std.mem.indexOf(u8, got, "Content-Length: ")) |at| {
+            if (std.mem.find(u8, got, "Content-Length: ")) |at| {
                 const digits = got[at + "Content-Length: ".len ..];
-                const len = std.fmt.parseInt(usize, digits[0 .. std.mem.indexOfScalar(u8, digits, '\r') orelse return], 10) catch return;
+                const len = std.fmt.parseInt(usize, digits[0 .. std.mem.findScalar(u8, digits, '\r') orelse return], 10) catch return;
                 sr.interface.discardAll(len) catch return;
             }
             sw.interface.writeAll(answer) catch return;
@@ -6809,7 +6809,7 @@ const GzipLoopback = struct {
             return testkit.loopbackSkip("gzip test listen failed ({t})", .{err});
         errdefer g.listener.deinit(io);
         g.peer = .{ .io = io, .listener = &g.listener, .answers = answers };
-        g.url = try std.fmt.bufPrint(&g.url_buf, "http://127.0.0.1:{d}{s}", .{ g.listener.socket.address.getPort(), path });
+        g.url = try std.mem.print(&g.url_buf, "http://127.0.0.1:{d}{s}", .{ g.listener.socket.address.getPort(), path });
         g.thread = try std.Thread.spawn(.{}, KeepAlivePeer.run, .{&g.peer});
     }
 
@@ -6906,7 +6906,7 @@ test "gzip: decoded at levels 1/6/9, Content-Length and chunked framing, one poo
     // Every decoded body left the framing drained: no redial.
     try testing.expectEqual(@as(usize, 1), client.dialCount());
     try testing.expectEqual(@as(usize, 1), client.poolIdleCount());
-    try testing.expect(std.mem.indexOf(u8, lb.peer.head(0), "\r\nAccept-Encoding: gzip\r\n") != null);
+    try testing.expect(std.mem.find(u8, lb.peer.head(0), "\r\nAccept-Encoding: gzip\r\n") != null);
 }
 
 test "HTTP/1.1 trailers: read behind the head after the body, next response starts clean, overflow flagged" {
@@ -6996,7 +6996,7 @@ test "gzip: off by default — identity asked, a gzip body handed over as sent" 
     const body = try res.readAllAlloc(gpa, 1024);
     defer gpa.free(body);
     try testing.expectEqualSlices(u8, gz, body);
-    try testing.expect(std.mem.indexOf(u8, lb.peer.head(0), "\r\nAccept-Encoding: identity\r\n") != null);
+    try testing.expect(std.mem.find(u8, lb.peer.head(0), "\r\nAccept-Encoding: identity\r\n") != null);
 }
 
 test "gzip: a caller Accept-Encoding, a Range, HEAD, x-gzip — not asked or not decoded" {
@@ -7009,9 +7009,9 @@ test "gzip: a caller Accept-Encoding, a Range, HEAD, x-gzip — not asked or not
     defer gpa.free(gz);
     const answer = try gzipAnswer(gpa, gz, false);
     defer gpa.free(answer);
-    const xgzip = try std.fmt.allocPrint(gpa, "HTTP/1.1 200 OK\r\nContent-Encoding: x-gzip\r\nContent-Length: {d}\r\n\r\n{s}", .{ gz.len, gz });
+    const xgzip = try gpa.print("HTTP/1.1 200 OK\r\nContent-Encoding: x-gzip\r\nContent-Length: {d}\r\n\r\n{s}", .{ gz.len, gz });
     defer gpa.free(xgzip);
-    const head_answer = try std.fmt.allocPrint(gpa, "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n", .{gz.len});
+    const head_answer = try gpa.print("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {d}\r\n\r\n", .{gz.len});
     defer gpa.free(head_answer);
 
     var lb: GzipLoopback = undefined;
@@ -7036,7 +7036,7 @@ test "gzip: a caller Accept-Encoding, a Range, HEAD, x-gzip — not asked or not
         const body = try res.readAllAlloc(gpa, 1024);
         defer gpa.free(body);
         try testing.expectEqualSlices(u8, if (case.method == .head) "" else gz, body);
-        try testing.expect(std.mem.indexOf(u8, lb.peer.head(i), case.sent) != null);
+        try testing.expect(std.mem.find(u8, lb.peer.head(i), case.sent) != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, lb.peer.head(i), "ccept-")); // one Accept-Encoding
     }
 }
@@ -7254,7 +7254,7 @@ test "gzip: against this module's own Server with compression on" {
     defer thread.join();
     defer server.shutdown();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{server.boundAddress().getPort()});
 
     var plain_buf: [40_000]u8 = undefined;
     const plain = testPlain(&plain_buf);
@@ -7441,7 +7441,7 @@ const H2ClientLoopback = struct {
     }
 
     fn url(lb: *H2ClientLoopback, path: []const u8) []const u8 {
-        return std.fmt.bufPrint(&lb.url_buf, "http://127.0.0.1:{d}{s}", .{ lb.server.boundAddress().getPort(), path }) catch unreachable;
+        return std.mem.print(&lb.url_buf, "http://127.0.0.1:{d}{s}", .{ lb.server.boundAddress().getPort(), path }) catch unreachable;
     }
 
     fn finish(lb: *H2ClientLoopback) void {
@@ -7484,13 +7484,13 @@ test "http2: request over an h2 connection — proto, head, body, cookies, one p
         defer res.deinit();
         const body = try res.readAllAlloc(gpa, 4096);
         defer gpa.free(body);
-        try testing.expect(std.mem.indexOf(u8, body, "cookie=sid=h2; Path=/\n") != null);
-        try testing.expect(std.mem.indexOf(u8, body, "x-custom=v\n") != null);
-        try testing.expect(std.mem.indexOf(u8, body, "user-agent=zig-libs-http/0.1\n") != null);
-        try testing.expect(std.mem.indexOf(u8, body, "accept-encoding=identity\n") != null);
-        try testing.expect(std.mem.indexOf(u8, body, "connection") == null);
+        try testing.expect(std.mem.find(u8, body, "cookie=sid=h2; Path=/\n") != null);
+        try testing.expect(std.mem.find(u8, body, "x-custom=v\n") != null);
+        try testing.expect(std.mem.find(u8, body, "user-agent=zig-libs-http/0.1\n") != null);
+        try testing.expect(std.mem.find(u8, body, "accept-encoding=identity\n") != null);
+        try testing.expect(std.mem.find(u8, body, "connection") == null);
         // `:authority`, from the Host the h1 writer would have sent.
-        try testing.expect(std.mem.indexOf(u8, body, "host=127.0.0.1:") != null);
+        try testing.expect(std.mem.find(u8, body, "host=127.0.0.1:") != null);
     }
     { // In-memory body.
         var res = try client.request(.post, lb.url("/echo"), .{ .body = "posted over h2" });

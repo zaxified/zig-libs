@@ -85,7 +85,7 @@ fn writeArchives(io: std.Io, gpa: std.mem.Allocator, comptime dir: []const u8) !
         for (c.items) |it| try w.addEntry(it.name, it.data, it.opts);
         try w.finish();
         var name_buf: [256]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{s}/{s}.zip", .{ dir, c.id });
+        const name = try std.mem.print(&name_buf, "{s}/{s}.zip", .{ dir, c.id });
         try cwd.writeFile(io, .{ .sub_path = name, .data = out.written() });
     }
 }
@@ -96,15 +96,15 @@ fn checkGoReadsWhatWeWrote(arena: std.mem.Allocator, fresh: []const u8) !bool {
     var ok = true;
     for (write_cases) |c| {
         var id_buf: [64]u8 = undefined;
-        const id_line = std.fmt.bufPrint(&id_buf, ".id = \"{s}\"", .{c.id}) catch unreachable;
-        const at = std.mem.indexOf(u8, fresh, id_line) orelse {
+        const id_line = std.mem.print(&id_buf, ".id = \"{s}\"", .{c.id}) catch unreachable;
+        const at = std.mem.find(u8, fresh, id_line) orelse {
             std.debug.print("go oracle: case {s} missing from the fresh vectors\n", .{c.id});
             ok = false;
             continue;
         };
-        const end = std.mem.indexOfPos(u8, fresh, at, "\n    },\n") orelse fresh.len;
+        const end = std.mem.findPos(u8, fresh, at, "\n    },\n") orelse fresh.len;
         const body = fresh[at..end];
-        if (std.mem.indexOf(u8, body, ".err = null") == null) {
+        if (std.mem.find(u8, body, ".err = null") == null) {
             std.debug.print("go oracle: Go refused our {s} archive\n", .{c.id});
             ok = false;
         }
@@ -118,8 +118,8 @@ fn checkGoReadsWhatWeWrote(arena: std.mem.Allocator, fresh: []const u8) !bool {
             try w.writeAll(", .non_utf8 = false, ");
             try zigStr(w, ".content = ", it.data);
             try w.writeAll(", .open_err = null");
-            const line = if (std.mem.indexOf(u8, body, name.written())) |n| std.mem.sliceTo(body[n..], '\n') else "";
-            if (std.mem.indexOf(u8, line, want.written()) == null) {
+            const line = if (std.mem.find(u8, body, name.written())) |n| std.mem.sliceTo(body[n..], '\n') else "";
+            if (std.mem.find(u8, line, want.written()) == null) {
                 std.debug.print("go oracle: {s}: Go did not read \"{s}\" as written\n  want: {s}\n  got:  {s}\n", .{ c.id, it.name, want.written()[0..@min(want.written().len, 200)], line[0..@min(line.len, 300)] });
                 ok = false;
             }

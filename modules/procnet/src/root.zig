@@ -286,8 +286,8 @@ pub const ProcRef = union(enum) {
     /// if it does not fit (a 64-byte buffer holds every path this module uses).
     pub fn path(r: ProcRef, buf: []u8, rest: []const u8) ?[]const u8 {
         return switch (r) {
-            .self => std.fmt.bufPrint(buf, "/proc/self/{s}", .{rest}),
-            .pid => |p| std.fmt.bufPrint(buf, "/proc/{d}/{s}", .{ p, rest }),
+            .self => std.mem.print(buf, "/proc/self/{s}", .{rest}),
+            .pid => |p| std.mem.print(buf, "/proc/{d}/{s}", .{ p, rest }),
         } catch null;
     }
 };
@@ -347,7 +347,7 @@ fn secondsFromFloat(f: f64) u64 {
 
 /// The kB value following `key` (e.g. "MemTotal:") in `/proc/meminfo`, or 0.
 fn meminfoKb(text: []const u8, key: []const u8) u64 {
-    const idx = std.mem.indexOf(u8, text, key) orelse return 0;
+    const idx = std.mem.find(u8, text, key) orelse return 0;
     var it = std.mem.tokenizeAny(u8, text[idx + key.len ..], " \t");
     const tok = it.next() orelse return 0;
     return std.fmt.parseInt(u64, tok, 10) catch 0;
@@ -480,7 +480,7 @@ fn readThermalZones(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
         if (!std.mem.startsWith(u8, entry.name, "thermal_zone")) continue;
 
         var tpb: [80]u8 = undefined;
-        const temp_path = std.fmt.bufPrint(&tpb, "/sys/class/thermal/{s}/temp", .{entry.name}) catch continue;
+        const temp_path = std.mem.print(&tpb, "/sys/class/thermal/{s}/temp", .{entry.name}) catch continue;
         const temp_text = readVirtualFile(gpa, io, temp_path, 64) orelse continue;
         defer gpa.free(temp_text);
         const milli = std.fmt.parseInt(i64, std.mem.trim(u8, temp_text, " \t\r\n"), 10) catch continue;
@@ -489,7 +489,7 @@ fn readThermalZones(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
         z.zone_len = @intCast(copyClamped(&z.zone_buf, entry.name));
 
         var kpb: [80]u8 = undefined;
-        if (std.fmt.bufPrint(&kpb, "/sys/class/thermal/{s}/type", .{entry.name}) catch null) |kind_path| {
+        if (std.mem.print(&kpb, "/sys/class/thermal/{s}/type", .{entry.name}) catch null) |kind_path| {
             if (readVirtualFile(gpa, io, kind_path, 64)) |kind_text| {
                 defer gpa.free(kind_text);
                 z.kind_len = @intCast(copyClamped(&z.kind_buf, std.mem.trim(u8, kind_text, " \t\r\n")));
@@ -550,7 +550,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
 
     // 100 rows of 10 bytes each.
     var payload: [1000]u8 = undefined;
-    for (0..100) |i| _ = std.fmt.bufPrint(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
+    for (0..100) |i| _ = std.mem.print(payload[i * 10 ..][0..10], "row{d:0>6}\n", .{i}) catch unreachable;
     {
         var f = try tmp.dir.createFile(io, "big.txt", .{});
         defer f.close(io);
@@ -561,7 +561,7 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     }
 
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/big.txt", .{&tmp.sub_path});
 
     // Under the limit: the whole file, unchanged.
     const whole = readVirtualFile(testing.allocator, io, path, 4096) orelse

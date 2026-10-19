@@ -511,7 +511,7 @@ fn dataCapacityBits(version: u6, ecc: Ecc) usize {
 const alnum_charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
 
 fn alnumValue(c: u8) ?u8 {
-    return if (std.mem.indexOfScalar(u8, alnum_charset, c)) |i| @intCast(i) else null;
+    return if (std.mem.findScalar(u8, alnum_charset, c)) |i| @intCast(i) else null;
 }
 
 fn modeFits(mode: Mode, text: []const u8) bool {

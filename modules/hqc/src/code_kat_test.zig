@@ -173,7 +173,7 @@ test "gated: Code128 corrects up to RS.delta symbol errors (whole RM blocks flip
         var count: usize = 0;
         while (count < RS128.delta) {
             const pos = random.uintLessThan(usize, RS128.n1);
-            if (std.mem.indexOfScalar(usize, corrupted_positions[0..count], pos) != null) continue;
+            if (std.mem.findScalar(usize, corrupted_positions[0..count], pos) != null) continue;
             corrupted_positions[count] = pos;
             count += 1;
             for (cdw[pos * RM128.block_bytes ..][0..RM128.block_bytes]) |*b| b.* = ~b.*;
@@ -321,7 +321,7 @@ fn codeCorrectsDeltaBlockErrors(comptime C: type, seed: u64) !void {
         var count: usize = 0;
         while (count < delta) {
             const pos = random.uintLessThan(usize, C.RS.n1);
-            if (std.mem.indexOfScalar(usize, positions[0..count], pos) != null) continue;
+            if (std.mem.findScalar(usize, positions[0..count], pos) != null) continue;
             positions[count] = pos;
             count += 1;
             for (cdw[pos * block_bytes ..][0..block_bytes]) |*b| b.* = ~b.*;
@@ -350,7 +350,7 @@ fn rsCorrectsDeltaSymbolErrors(comptime RSt: type, seed: u64) !void {
         var count: usize = 0;
         while (count < delta) {
             const pos = random.uintLessThan(usize, RSt.n1);
-            if (std.mem.indexOfScalar(usize, positions[0..count], pos) != null) continue;
+            if (std.mem.findScalar(usize, positions[0..count], pos) != null) continue;
             positions[count] = pos;
             count += 1;
             var e: u8 = 0;

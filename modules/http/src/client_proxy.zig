@@ -90,14 +90,14 @@ pub const Endpoint = struct {
     pub fn parse(raw: []const u8) Proxy.Error!Endpoint {
         for (raw) |c| if (c <= ' ' or c >= 0x7f) return error.BadProxy;
         var rest = raw;
-        if (std.mem.indexOf(u8, raw, "://")) |sep| {
+        if (std.mem.find(u8, raw, "://")) |sep| {
             if (!std.ascii.eqlIgnoreCase(raw[0..sep], "http")) return error.BadProxy;
             rest = raw[sep + 3 ..];
         }
-        const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+        const authority = rest[0 .. std.mem.findAny(u8, rest, "/?#") orelse rest.len];
         var ep: Endpoint = .{ .host = undefined, .port = 80 };
         var hostport = authority;
-        if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| {
+        if (std.mem.findScalarLast(u8, authority, '@')) |at| {
             ep.userinfo = authority[0..at];
             hostport = authority[at + 1 ..];
             var scratch: [max_credentials]u8 = undefined;
@@ -106,7 +106,7 @@ pub const Endpoint = struct {
         }
         if (hostport.len == 0) return error.BadProxy;
         if (hostport[0] == '[') {
-            const close = std.mem.indexOfScalar(u8, hostport, ']') orelse return error.BadProxy;
+            const close = std.mem.findScalar(u8, hostport, ']') orelse return error.BadProxy;
             ep.host = hostport[1..close];
             if (netaddr.parseIp6(ep.host) == null) return error.BadProxy;
             const after = hostport[close + 1 ..];
@@ -114,8 +114,8 @@ pub const Endpoint = struct {
                 if (after[0] != ':') return error.BadProxy;
                 if (after.len > 1) ep.port = parsePort(after[1..]) orelse return error.BadProxy;
             }
-        } else if (std.mem.indexOfScalar(u8, hostport, ':')) |colon| {
-            if (std.mem.indexOfScalarPos(u8, hostport, colon + 1, ':') != null) return error.BadProxy;
+        } else if (std.mem.findScalar(u8, hostport, ':')) |colon| {
+            if (std.mem.findScalarPos(u8, hostport, colon + 1, ':') != null) return error.BadProxy;
             ep.host = hostport[0..colon];
             if (colon + 1 < hostport.len) ep.port = parsePort(hostport[colon + 1 ..]) orelse return error.BadProxy;
         } else {
@@ -134,7 +134,7 @@ pub const Endpoint = struct {
         defer std.crypto.secureZero(u8, &plain);
         const decoded = decodeCredentials(userinfo, plain[0..max_credentials]) catch unreachable; // checked by `parse`
         var n = decoded.len;
-        if (std.mem.indexOfScalar(u8, userinfo, ':') == null) {
+        if (std.mem.findScalar(u8, userinfo, ':') == null) {
             plain[n] = ':';
             n += 1;
         }
@@ -204,7 +204,7 @@ fn useProxy(no_proxy: []const u8, host: []const u8, port: u16) bool {
         if (entry.len == 0) continue;
         if (std.mem.eql(u8, entry, "*")) return false;
 
-        if (std.mem.indexOfScalar(u8, entry, '/') != null) {
+        if (std.mem.findScalar(u8, entry, '/') != null) {
             if (netaddr.parsePrefix(entry)) |prefix| {
                 if (ip) |a| if (prefix.contains(a)) return false;
                 continue;

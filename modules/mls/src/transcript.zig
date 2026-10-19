@@ -274,5 +274,5 @@ test "keyschedule's §8.1 GroupContext consumes exactly what §8.2 produces" {
     };
     const bytes = try gc.encodeAlloc(testing.allocator);
     defer testing.allocator.free(bytes);
-    try testing.expect(std.mem.indexOf(u8, bytes, &th.confirmed) != null);
+    try testing.expect(std.mem.find(u8, bytes, &th.confirmed) != null);
 }

@@ -485,7 +485,7 @@ test "live: a third-party controlling station drives our outstation" {
         if (verboseSkip()) std.debug.print("SKIPPED: live IEC 104 outstation (set IEC104_TEST_LISTEN=host:port)\n", .{});
         return error.SkipZigTest;
     };
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 

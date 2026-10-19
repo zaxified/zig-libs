@@ -206,7 +206,7 @@ pub fn decode(s: []const u8) DecodeError!Decoded {
 
     // The separator is the LAST '1' in the string (data-part charset never
     // contains '1', so any '1' left of the true separator belongs to the HRP).
-    const sep = std.mem.lastIndexOfScalar(u8, s, '1') orelse return error.NoSeparator;
+    const sep = std.mem.findScalarLast(u8, s, '1') orelse return error.NoSeparator;
     if (sep == 0) return error.EmptyHrp;
     if (sep > max_hrp_len) return error.HrpTooLong;
 
@@ -326,7 +326,7 @@ test "encode then decode round-trips (bech32m)" {
 
 test "encode uppercases nothing: HRP is always lowered in output" {
     const enc = try encode("BC", &.{}, .bech32);
-    try testing.expect(std.mem.indexOfAny(u8, enc.slice(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == null);
+    try testing.expect(std.mem.findAny(u8, enc.slice(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ") == null);
 }
 
 test "decode: empty HRP rejected" {

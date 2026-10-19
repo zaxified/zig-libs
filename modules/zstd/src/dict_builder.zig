@@ -2328,7 +2328,7 @@ test "parallel optimizers: candidates refused under contention are rerun, compar
         var last: std.ArrayList(u32) = .empty;
         defer last.deinit(testing.allocator);
         for (h.released.items, 0..) |k, i| {
-            if (std.mem.indexOfScalar(u32, h.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
+            if (std.mem.findScalar(u32, h.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
         }
         try testing.expectEqualSlices(u32, h1.released.items, last.items);
         try testing.expectEqual(@as(usize, 0), lim.live);
@@ -2479,7 +2479,7 @@ test "parallel optimizers: a refusal at any position is rerun from it, in grid o
         var last: std.ArrayList(u32) = .empty;
         defer last.deinit(testing.allocator);
         for (g.released.items, 0..) |k, i| {
-            if (std.mem.indexOfScalar(u32, g.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
+            if (std.mem.findScalar(u32, g.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
         }
         try testing.expectEqualSlices(u32, g1.released.items, last.items);
         try testing.expectEqual(@as(usize, 0), lim.live);

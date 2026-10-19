@@ -136,7 +136,7 @@ fn reversePtr(io: std.Io, gpa: std.mem.Allocator) !void {
     const names = try r.reverse(netaddr.parseIp("8.8.8.8").?);
     defer r.freeNames(names);
     if (names.len == 0) return error.NoPtrRecords;
-    if (std.mem.indexOf(u8, names[0], "dns.google") == null) return error.UnexpectedPtrName;
+    if (std.mem.find(u8, names[0], "dns.google") == null) return error.UnexpectedPtrName;
 }
 
 fn dohPost(io: std.Io, gpa: std.mem.Allocator) !void {

@@ -116,7 +116,7 @@ test {
 }
 
 test "meta.model_after names the pairing-friendly-curves draft" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "pairing-friendly-curves") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "pairing-friendly-curves") != null);
 }
 
 test "field tower encoded widths compose correctly" {

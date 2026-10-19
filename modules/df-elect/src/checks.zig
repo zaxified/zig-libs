@@ -463,8 +463,8 @@ fn linkUp(trace: []const netsim.FaultEvent, l: netsim.Link, time: Time) bool {
             else => continue,
         };
         if (healedBy(trace, p.id, e.time, time)) continue;
-        const a_in = std.mem.indexOfScalar(NodeId, p.cut, l.a) != null;
-        const b_in = std.mem.indexOfScalar(NodeId, p.cut, l.b) != null;
+        const a_in = std.mem.findScalar(NodeId, p.cut, l.a) != null;
+        const b_in = std.mem.findScalar(NodeId, p.cut, l.b) != null;
         if (a_in != b_in) return false;
     }
     return true;

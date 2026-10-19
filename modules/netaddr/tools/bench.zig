@@ -92,7 +92,7 @@ fn genInputs(gpa: std.mem.Allocator) !Inputs {
     for (in.v4_text) |*t| {
         var a: [4]u8 = undefined;
         r.bytes(&a);
-        t.* = try std.fmt.allocPrint(gpa, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] });
+        t.* = try gpa.print("{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] });
     }
     in.v6 = try gpa.alloc(netaddr.Ip, n_inputs);
     in.v6_text = try gpa.alloc([]const u8, n_inputs);

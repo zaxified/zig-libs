@@ -211,8 +211,8 @@ fn once(d: *const Data, l: ?*Live, w: usize) u64 {
 /// One timed row on a freshly loaded store (`map_baseline` needs none).
 fn oursRow(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, d: *const Data, w: usize) !bench.Row {
     if (w == 6) return bench.timeIt(io, .{ .fd = null }, once, .{ d, null, w }, true);
-    const file = try std.fmt.allocPrint(arena, "kv-{s}.db", .{names[w]});
-    const lock = try std.fmt.allocPrint(arena, "{s}.lock", .{file});
+    const file = try arena.print("kv-{s}.db", .{names[w]});
+    const lock = try arena.print("{s}.lock", .{file});
     dir.deleteFile(io, file) catch {};
     dir.deleteFile(io, lock) catch {};
     const fs = try arena.create(kv.FsStorage);
@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

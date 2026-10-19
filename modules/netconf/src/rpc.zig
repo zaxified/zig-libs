@@ -762,7 +762,7 @@ test "edit-config matches RFC 6241 §7.2" {
 
 test "edit-config carries default-operation / test-option / error-option and the operation attribute" {
     const gpa = testing.allocator;
-    const body = try std.fmt.allocPrint(gpa,
+    const body = try gpa.print(
         \\<top xmlns="http://example.com/schema/1.2/config">
         \\  <interface{s}>
         \\    <name>Ethernet0/0</name>
@@ -1043,7 +1043,7 @@ test "every builder emits well-formed XML with the right envelope" {
         try testing.expectEqualStrings(base_ns, doc.root.uri);
         const id = doc.root.attr("", "message-id").?;
         var buf: [24]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{i + 1}), id);
+        try testing.expectEqualStrings(try std.mem.print(&buf, "{d}", .{i + 1}), id);
     }
 }
 
@@ -1054,6 +1054,6 @@ test "escaping: a value can never forge the end-of-message delimiter" {
         .source = .{ .url = "file:///x]]>]]>y" },
     } });
     defer gpa.free(got);
-    try testing.expect(std.mem.indexOf(u8, got, "]]>]]>") == null);
-    try testing.expect(std.mem.indexOf(u8, got, "]]&gt;]]&gt;") != null);
+    try testing.expect(std.mem.find(u8, got, "]]>]]>") == null);
+    try testing.expect(std.mem.find(u8, got, "]]&gt;]]&gt;") != null);
 }

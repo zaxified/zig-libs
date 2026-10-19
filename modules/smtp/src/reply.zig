@@ -246,7 +246,7 @@ pub const Parser = struct {
     pub fn next(self: *Parser) ParseError!?Reply {
         while (true) {
             const buf = self.pending.items[self.cursor..];
-            const nl = std.mem.indexOfScalar(u8, buf, '\n') orelse {
+            const nl = std.mem.findScalar(u8, buf, '\n') orelse {
                 // No terminator yet. A CR at the very end may still become
                 // CRLF, so only bound the wait here.
                 if (buf.len > self.limits.max_line + 1) return error.ReplyLineTooLong;
@@ -261,7 +261,7 @@ pub const Parser = struct {
                 return error.BareLineFeed;
             }
             // A CR anywhere else in the line is a framing lie.
-            if (std.mem.indexOfScalar(u8, line, '\r') != null) return error.BareCarriageReturn;
+            if (std.mem.findScalar(u8, line, '\r') != null) return error.BareCarriageReturn;
 
             // `line` points into `pending`, so it must be consumed BEFORE the
             // buffer is compacted underneath it.
@@ -329,7 +329,7 @@ pub const Parser = struct {
 /// ordinary text (some servers really do start a message with "5.0" prose), so
 /// it is reported as "no enhanced code" rather than as an error.
 pub fn parseEnhanced(text: []const u8, code: u16) ?Enhanced {
-    const end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+    const end = std.mem.findScalar(u8, text, ' ') orelse text.len;
     const tok = text[0..end];
     var it = std.mem.splitScalar(u8, tok, '.');
     const a = it.next() orelse return null;

@@ -72,7 +72,7 @@ pub fn encryptedWrapper(
     const content_b64 = try b64(alloc, content);
     defer alloc.free(content_b64);
 
-    return std.fmt.allocPrint(alloc, "<saml:{s}><xenc:EncryptedData xmlns:xenc=\"{s}\" xmlns:ds=\"{s}\" " ++
+    return alloc.print("<saml:{s}><xenc:EncryptedData xmlns:xenc=\"{s}\" xmlns:ds=\"{s}\" " ++
         "Type=\"http://www.w3.org/2001/04/xmlenc#Element\">" ++
         "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/>" ++
         "<ds:KeyInfo><xenc:EncryptedKey>" ++
@@ -128,7 +128,7 @@ pub const FreeScanner = struct {
         const self: *FreeScanner = @ptrCast(@alignCast(ctx));
         if (m.len >= self.needle.len) {
             self.frees_seen += 1;
-            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked_plaintext = true;
+            if (std.mem.find(u8, m, self.needle) != null) self.leaked_plaintext = true;
         }
         self.child.rawFree(m, a, ra);
     }

@@ -471,7 +471,7 @@ pub const opt_len_max = 600_000;
 /// levels' concern). A case with `only_levels` is covered there alone.
 /// `tools/dump_corpus.zig` writes the covered set for the recipe.
 pub fn covered(case: Case, level: i32, checksum: bool) bool {
-    if (case.only_levels.len != 0) return !checksum and std.mem.indexOfScalar(i32, case.only_levels, level) != null;
+    if (case.only_levels.len != 0) return !checksum and std.mem.findScalar(i32, case.only_levels, level) != null;
     if (level < opt_level_min) return true;
     return !checksum and case.len <= opt_len_max;
 }
@@ -515,7 +515,7 @@ fn csv(r: *Rng, out: []u8) void {
     var line: [64]u8 = undefined;
     while (i < out.len) {
         t += 1 + r.below(10);
-        const s = std.fmt.bufPrint(&line, "{d},{d},{d}.{d}\n", .{ r.below(28), t, r.below(5000), r.below(1000) }) catch unreachable;
+        const s = std.mem.print(&line, "{d},{d},{d}.{d}\n", .{ r.below(28), t, r.below(5000), r.below(1000) }) catch unreachable;
         const n = @min(s.len, out.len - i);
         @memcpy(out[i..][0..n], s[0..n]);
         i += n;
@@ -4015,8 +4015,8 @@ pub fn cparamsSample(i: usize, buf: []u8) []const u8 {
     const dicts = [_]u64{ 0, 0, 0, 1, 100, 500, 1000, 8000, 32768, 100000, 1 << 20, 1 << 30, (1 << 30) + 1, 1 << 31, 1 << 40, std.math.maxInt(u64) - (1 << 17) + 1, std.math.maxInt(u64) - (1 << 10) + 1, std.math.maxInt(u64) };
     const q_levels = [_]i64{ -200000, -131073, -131072, -100, -5, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 100 };
     var r: Rng = .{ .s = @as(u64, i) *% 0x2545F4914F6CDD1D +% 0x5A };
-    if (r.below(4) == 0) return std.fmt.bufPrint(buf, "g {d} {d} {d}", .{ pick(&r, i64, &q_levels), pick(&r, u64, &sizes), pick(&r, u64, &dicts) }) catch unreachable;
-    return std.fmt.bufPrint(buf, "a {d} {d} {d} {d} {d} {d} {d} {d} {d}", .{
+    if (r.below(4) == 0) return std.mem.print(buf, "g {d} {d} {d}", .{ pick(&r, i64, &q_levels), pick(&r, u64, &sizes), pick(&r, u64, &dicts) }) catch unreachable;
+    return std.mem.print(buf, "a {d} {d} {d} {d} {d} {d} {d} {d} {d}", .{
         pick(&r, u64, &windows),  pick(&r, u64, &chains),      pick(&r, u64, &hashes),
         pick(&r, u64, &searches), pick(&r, u64, &min_matches), pick(&r, u64, &target_lengths),
         1 + r.below(9),           pick(&r, u64, &sizes),       pick(&r, u64, &dicts),

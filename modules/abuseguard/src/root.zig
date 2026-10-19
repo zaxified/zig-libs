@@ -1194,7 +1194,7 @@ fn strikeIp(g: *const Guard, req: *const http.Server.Request) ?netaddr.Ip {
                 if (std.ascii.eqlIgnoreCase(h.name, "x-forwarded-for")) xff = h.value;
             }
             if (xff) |v| {
-                const start = if (std.mem.lastIndexOfScalar(u8, v, ',')) |i| i + 1 else 0;
+                const start = if (std.mem.findScalarLast(u8, v, ',')) |i| i + 1 else 0;
                 if (netaddr.parseIp(std.mem.trim(u8, v[start..], " \t"))) |ip| return ip;
             }
             if (req.header("x-real-ip")) |v| {
@@ -2508,8 +2508,8 @@ test "persist: snapshot -> text -> parse -> restore into a fresh Guard" {
     var aw: Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try writeSnapshot(recs, &aw.writer);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "greylist 198.51.100.4/32 88500\n") != null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "ban 192.0.2.9/32\n") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "greylist 198.51.100.4/32 88500\n") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "ban 192.0.2.9/32\n") != null);
 
     var parsed: std.ArrayList(BanRecord) = .empty;
     defer parsed.deinit(testing.allocator);

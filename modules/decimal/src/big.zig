@@ -667,7 +667,7 @@ pub const BigDecimal = struct {
         // these cut-offs are safely outside the rounding window.
         if (adj > 310) return if (neg) -std.math.inf(f64) else std.math.inf(f64);
         if (adj < -326) return std.math.copysign(@as(f64, 0.0), if (neg) -1.0 else 1.0);
-        const text = try std.fmt.allocPrint(allocator, "{s}e{d}", .{ digits, self.exponent });
+        const text = try allocator.print("{s}e{d}", .{ digits, self.exponent });
         defer allocator.free(text);
         // Well-formed by construction: optional '-', decimal digits, 'e', integer.
         return std.fmt.parseFloat(f64, text) catch unreachable;

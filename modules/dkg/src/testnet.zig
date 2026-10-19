@@ -59,7 +59,7 @@ pub const TestNet = struct {
     }
 
     fn isCrashed(self: *const TestNet, id: u32) bool {
-        return std.mem.indexOfScalar(u32, self.crashed, id) != null;
+        return std.mem.findScalar(u32, self.crashed, id) != null;
     }
 
     fn deliverTo(self: *TestNet, from: u32, to: u32, bytes: []const u8) !void {

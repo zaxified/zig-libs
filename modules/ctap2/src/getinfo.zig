@@ -52,7 +52,7 @@ pub const ProtocolList = struct {
     }
 
     pub fn contains(self: *const ProtocolList, p: ctap2pin.Protocol) bool {
-        return std.mem.indexOfScalar(ctap2pin.Protocol, self.slice(), p) != null;
+        return std.mem.findScalar(ctap2pin.Protocol, self.slice(), p) != null;
     }
 
     fn add(self: *ProtocolList, p: ctap2pin.Protocol) void {

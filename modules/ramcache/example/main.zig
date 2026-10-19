@@ -19,7 +19,7 @@ const ramcache = @import("ramcache");
 /// Stands in for "recompute this from the slow path" — a DB row, a parsed
 /// config file, whatever `put` is saving the caller from redoing.
 fn expensiveLookup(gpa: std.mem.Allocator, id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "config-blob-for-{s}", .{id});
+    return gpa.print("config-blob-for-{s}", .{id});
 }
 
 pub fn main() !void {

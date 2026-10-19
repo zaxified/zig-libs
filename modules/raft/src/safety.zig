@@ -306,7 +306,7 @@ pub fn jointMajority(old_ids: []const NodeId, new_ids: []const NodeId, granted: 
 fn hasMajority(config: []const NodeId, granted: []const NodeId) bool {
     var count: usize = 0;
     for (config) |id| {
-        if (std.mem.indexOfScalar(NodeId, granted, id) != null) count += 1;
+        if (std.mem.findScalar(NodeId, granted, id) != null) count += 1;
     }
     return count >= config.len / 2 + 1;
 }

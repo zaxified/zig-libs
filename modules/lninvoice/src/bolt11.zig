@@ -144,7 +144,7 @@ fn formatAmount(msat: u64, buf: *[32]u8) []const u8 {
 
 fn fmtDigits(buf: *[32]u8, digits: u128, mult: ?u8) []const u8 {
     var tmp: [24]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{digits}) catch unreachable;
+    const s = std.mem.print(&tmp, "{d}", .{digits}) catch unreachable;
     @memcpy(buf[0..s.len], s);
     var n = s.len;
     if (mult) |mm| {
@@ -613,7 +613,7 @@ pub fn encode(allocator: Allocator, params: EncodeParams, sign_input: SignInput)
 fn encodeBody(allocator: Allocator, params: EncodeParams, sign_input: SignInput) ![]u8 {
     var amt_buf: [32]u8 = undefined;
     const amt_str: []const u8 = if (params.amount_msat) |m| formatAmount(m, &amt_buf) else "";
-    const hrp = try std.fmt.allocPrint(allocator, "ln{s}{s}", .{ networkPrefix(params.network), amt_str });
+    const hrp = try allocator.print("ln{s}{s}", .{ networkPrefix(params.network), amt_str });
     defer allocator.free(hrp);
 
     var data: std.ArrayList(u5) = .empty;
@@ -1038,7 +1038,7 @@ test "TEETH: the network prefix is not guessed — an unknown one is refused, no
     // Now re-checksum the same data part under two broken HRPs. `bech32_raw`
     // is this module's own encoder, so both strings are structurally valid
     // bech32 and the ONLY thing wrong is the human-readable part.
-    const sep = std.mem.lastIndexOfScalar(u8, testnet_str, '1').?;
+    const sep = std.mem.findScalarLast(u8, testnet_str, '1').?;
     const data_part = testnet_str[sep + 1 .. testnet_str.len - 6];
     for ([_]struct { hrp: []const u8, want: anyerror }{
         .{ .hrp = "xxtb1000n", .want = error.UnknownPrefix },
@@ -1047,7 +1047,7 @@ test "TEETH: the network prefix is not guessed — an unknown one is refused, no
         var quintets: std.ArrayList(u5) = .empty;
         defer quintets.deinit(allocator);
         for (data_part) |ch| {
-            const idx = std.mem.indexOfScalar(u8, bech32raw.charset, ch).?;
+            const idx = std.mem.findScalar(u8, bech32raw.charset, ch).?;
             try quintets.append(allocator, @intCast(idx));
         }
         const s2 = try bech32raw.encode(allocator, c.hrp, quintets.items);
@@ -1514,11 +1514,11 @@ fn fuzzSign(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     if (declare) SignMark.mark(.declared_node);
 
     // One replaced character after the separator.
-    const sep = std.mem.lastIndexOfScalar(u8, str, '1').?;
+    const sep = std.mem.findScalarLast(u8, str, '1').?;
     const copy = try gpa.dupe(u8, str);
     defer gpa.free(copy);
     const at = sep + 1 + src.index(str.len - sep - 1);
-    const cur = std.mem.indexOfScalar(u8, bech32raw.charset, copy[at]).?;
+    const cur = std.mem.findScalar(u8, bech32raw.charset, copy[at]).?;
     copy[at] = bech32raw.charset[(cur + 1 + src.index(bech32raw.charset.len - 1)) % bech32raw.charset.len];
     if (decode(gpa, copy)) |d| {
         var dd = d;

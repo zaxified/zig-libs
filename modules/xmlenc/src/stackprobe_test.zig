@@ -51,7 +51,7 @@ fn build(a: std.mem.Allocator) !void {
 
     const cek_b64 = try b64(a, wrapped);
     const content_b64 = try b64(a, &content);
-    const src = try std.fmt.allocPrint(a,
+    const src = try a.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" Type="{s}Element">
         \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
         \\  <ds:KeyInfo>
@@ -65,7 +65,7 @@ fn build(a: std.mem.Allocator) !void {
     , .{ xenc_ns, ds_ns, xenc_ns, xenc11_ns, xenc_ns, cek_b64, content_b64 });
     doc = try xml.parse(a, src, .{});
 
-    const wsrc = try std.fmt.allocPrint(a, "<saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">{s}</saml:EncryptedAssertion>", .{src});
+    const wsrc = try a.print("<saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">{s}</saml:EncryptedAssertion>", .{src});
     wrapper = try xml.parse(a, wsrc, .{});
 }
 

@@ -452,10 +452,10 @@ fn searchTable(
 /// True when the NUL-terminated string at `s` equals `want`, either exactly
 /// or up to a `@`/`@@` version suffix.
 fn nameMatches(s: []const u8, want: []const u8) bool {
-    const end = std.mem.indexOfScalar(u8, s, 0) orelse s.len;
+    const end = std.mem.findScalar(u8, s, 0) orelse s.len;
     const full = s[0..end];
     if (std.mem.eql(u8, full, want)) return true;
-    const at = std.mem.indexOfScalar(u8, full, '@') orelse return false;
+    const at = std.mem.findScalar(u8, full, '@') orelse return false;
     return std.mem.eql(u8, full[0..at], want);
 }
 
@@ -702,7 +702,7 @@ pub const SHF_EXECINSTR: u64 = 0x4;
 fn cstr(strings: []const u8, off: u32) []const u8 {
     if (off >= strings.len) return "";
     const s = strings[off..];
-    const end = std.mem.indexOfScalar(u8, s, 0) orelse s.len;
+    const end = std.mem.findScalar(u8, s, 0) orelse s.len;
     return s[0..end];
 }
 
@@ -1347,7 +1347,7 @@ test "the elfsym fuzz harness reaches the unbounded entry-index domain (reachabi
 /// Raw syscalls only — this module forbids libc, and `std.fs`'s 0.16 API
 /// needs an `Io` this module deliberately does not take.
 fn writeTempFile(gpa: std.mem.Allocator, tag: []const u8, bytes: []const u8) ![:0]u8 {
-    const path = try std.fmt.allocPrintSentinel(gpa, "/tmp/zig-libs-ebpf-{s}-{d}.bin", .{ tag, linux.getpid() }, 0);
+    const path = try gpa.printSentinel("/tmp/zig-libs-ebpf-{s}-{d}.bin", .{ tag, linux.getpid() }, 0);
     errdefer gpa.free(path);
     const rc = linux.open(path.ptr, .{
         .ACCMODE = .WRONLY,

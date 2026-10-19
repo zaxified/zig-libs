@@ -254,7 +254,7 @@ fn labelSpan(d: Diagnostic, l: Label) Span {
 
 fn digits(n: u32) usize {
     var buf: [10]u8 = undefined;
-    return (std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable).len;
+    return (std.mem.print(&buf, "{d}", .{n}) catch unreachable).len;
 }
 
 /// Write one finding as text. `line`/`col` are 1-based, `col` counted in
@@ -687,7 +687,7 @@ test "render snippet: without the source text, only the header, location and not
     var past = unknown_key;
     past.line = 40;
     const src: Source = .{ .file = "conf.json5", .text = "{}\n" };
-    try testing.expect(std.mem.indexOf(u8, try renderToString(&buf, past, .{ .style = .snippet, .sources = &.{src} }), " | ") == null);
+    try testing.expect(std.mem.find(u8, try renderToString(&buf, past, .{ .style = .snippet, .sources = &.{src} }), " | ") == null);
 }
 
 test "render snippet: carets align after tabs and multi-byte UTF-8, a span runs to the end of a multi-line range" {
@@ -742,9 +742,9 @@ test "render: control characters from the input never reach the terminal raw" {
         short,
     );
     const snip = try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = "\x1b]0;t\x07k: 1" }} });
-    try testing.expect(std.mem.indexOfScalar(u8, snip, 0x1b) == null);
-    try testing.expect(std.mem.indexOfScalar(u8, snip, 0x07) == null);
-    try testing.expect(std.mem.indexOf(u8, snip, "1 | ?]0;t?k: 1\n") != null);
+    try testing.expect(std.mem.findScalar(u8, snip, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, snip, 0x07) == null);
+    try testing.expect(std.mem.find(u8, snip, "1 | ?]0;t?k: 1\n") != null);
 }
 
 test "sortByPosition: file, line, col; unknowns last; stable for ties" {
@@ -929,7 +929,7 @@ test "colour: SGR only around our own parts, finding text still escaped; off is 
     var i: usize = 0;
     while (i < col.len) {
         if (col[i] == 0x1b) {
-            i = std.mem.indexOfScalarPos(u8, col, i, 'm').? + 1;
+            i = std.mem.findScalarPos(u8, col, i, 'm').? + 1;
             continue;
         }
         try stripped.append(testing.allocator, col[i]);
@@ -937,14 +937,14 @@ test "colour: SGR only around our own parts, finding text still escaped; off is 
     }
     try testing.expectEqualStrings(plain, stripped.items);
     try testing.expect(std.mem.startsWith(u8, col, "\x1b[1;31merror[json5.duplicate_key]\x1b[0m"));
-    try testing.expect(std.mem.indexOf(u8, col, "\x1b[1;34m-\x1b[0m first defined here") != null);
+    try testing.expect(std.mem.find(u8, col, "\x1b[1;34m-\x1b[0m first defined here") != null);
     // A finding carrying an escape sequence still cannot emit one.
     var hostile = dup;
     hostile.message = "\x1b[2J";
     const h = try renderAlloc(hostile, .{ .color = true });
     defer testing.allocator.free(h);
-    try testing.expect(std.mem.indexOf(u8, h, "\x1b[2J") == null);
-    try testing.expect(std.mem.indexOf(u8, h, "\\x1b[2J") != null);
+    try testing.expect(std.mem.find(u8, h, "\x1b[2J") == null);
+    try testing.expect(std.mem.find(u8, h, "\\x1b[2J") != null);
 }
 
 test "JSON: new fields appear when set and are omitted when not" {

@@ -1800,9 +1800,9 @@ test "Manager.save: the session id in the Set-Cookie survives writeCookie's dead
     // The id, read back off the wire after every byte of its source frame
     // was overwritten, plus the hardening attributes `writeCookie` always
     // sets on a live session cookie.
-    try testing.expect(std.mem.indexOf(u8, wire, "Set-Cookie: session=" ++ (strRepeat("deadbeef", 8)) ++ "; Path=/; Max-Age=10; Secure; HttpOnly; SameSite=Lax\r\n") != null);
+    try testing.expect(std.mem.find(u8, wire, "Set-Cookie: session=" ++ (strRepeat("deadbeef", 8)) ++ "; Path=/; Max-Age=10; Secure; HttpOnly; SameSite=Lax\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+    try testing.expect(std.mem.find(u8, wire, "#") == null);
 }
 
 test "__Host- prefixed cookie name: the OWASP hardening measure the config surface already supports" {
@@ -1842,10 +1842,10 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
 
     const sc = headerValue(wire, "Set-Cookie").?;
     try testing.expect(std.mem.startsWith(u8, sc, "__Host-session=" ++ (strRepeat("cafebabe", 8))));
-    try testing.expect(std.mem.indexOf(u8, sc, "Secure") != null);
-    try testing.expect(std.mem.indexOf(u8, sc, "Path=/") != null);
+    try testing.expect(std.mem.find(u8, sc, "Secure") != null);
+    try testing.expect(std.mem.find(u8, sc, "Path=/") != null);
     // The `__Host-` contract is void the moment a Domain attribute appears.
-    try testing.expect(std.mem.indexOf(u8, sc, "Domain=") == null);
+    try testing.expect(std.mem.find(u8, sc, "Domain=") == null);
 }
 
 // ── middleware tests (offline — through http.Server.serveStream) ─────────────
@@ -1928,7 +1928,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8, resp_body_buf: [
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -1936,14 +1936,14 @@ fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
 fn cookieId(set_cookie: []const u8) []const u8 {
-    const eq = std.mem.indexOfScalar(u8, set_cookie, '=').?;
+    const eq = std.mem.findScalar(u8, set_cookie, '=').?;
     const rest = set_cookie[eq + 1 ..];
-    const semi = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+    const semi = std.mem.findScalar(u8, rest, ';') orelse rest.len;
     return rest[0..semi];
 }
 
@@ -1964,13 +1964,13 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
     var rbody: [1024]u8 = undefined;
     const first = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out, &rbody);
     const sc = headerValue(first, "Set-Cookie").?;
-    try testing.expect(std.mem.indexOf(u8, sc, "HttpOnly") != null);
-    try testing.expect(std.mem.indexOf(u8, sc, "Secure") != null);
-    try testing.expect(std.mem.indexOf(u8, sc, "SameSite=Lax") != null);
+    try testing.expect(std.mem.find(u8, sc, "HttpOnly") != null);
+    try testing.expect(std.mem.find(u8, sc, "Secure") != null);
+    try testing.expect(std.mem.find(u8, sc, "SameSite=Lax") != null);
     // maxAgeSeconds(idle_timeout_ns) must be the exact idle window in
     // seconds (10s here) -- no prior test checked the numeric value, only
     // that "Max-Age=-1" appears on a *destroy* cookie.
-    try testing.expect(std.mem.indexOf(u8, sc, "Max-Age=10;") != null);
+    try testing.expect(std.mem.find(u8, sc, "Max-Age=10;") != null);
     const id = cookieId(sc);
     try testing.expectEqual(@as(usize, 64), id.len);
     try testing.expectEqualStrings(id, bodyOf(first)); // body echoed the cookie id
@@ -1978,7 +1978,7 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
     // Send the cookie back → the SAME session id (loaded, not a new one).
     var out2: [4096]u8 = undefined;
     var rbody2: [1024]u8 = undefined;
-    const reqline = std.fmt.allocPrint(testing.allocator, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    const reqline = testing.allocator.print("GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
     defer testing.allocator.free(reqline);
     const second = runWire(&r, reqline, &out2, &rbody2);
     try testing.expectEqualStrings(id, bodyOf(second));
@@ -1987,7 +1987,7 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
 fn getWithCookie(r: *router.Router, id: ?[]const u8, out: []u8, rbody: []u8) []const u8 {
     var req_buf: [256]u8 = undefined;
     const req = if (id) |sid|
-        std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable
+        std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable
     else
         "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
     return runWire(r, req, out, rbody);
@@ -2101,12 +2101,12 @@ test "middleware: revoke expires the cookie and evicts the session" {
 
     // Logout revokes it.
     app.action = .revoke;
-    const reqline = std.fmt.allocPrint(testing.allocator, "POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    const reqline = testing.allocator.print("POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
     defer testing.allocator.free(reqline);
     var out: [4096]u8 = undefined;
     var rbody: [1024]u8 = undefined;
     const got = runWire(&r, reqline, &out, &rbody);
-    try testing.expect(std.mem.indexOf(u8, headerValue(got, "Set-Cookie").?, "Max-Age=-1") != null);
+    try testing.expect(std.mem.find(u8, headerValue(got, "Set-Cookie").?, "Max-Age=-1") != null);
 
     // And the session is gone from the store.
     var l: Session = .{};
@@ -2140,7 +2140,7 @@ test "middleware: the trailing end-of-request save does not resurrect a session 
     defer testing.allocator.free(id);
 
     app.action = .revoke;
-    const reqline = std.fmt.allocPrint(testing.allocator, "POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    const reqline = testing.allocator.print("POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
     defer testing.allocator.free(reqline);
     var out: [4096]u8 = undefined;
     var rbody: [1024]u8 = undefined;
@@ -2180,7 +2180,7 @@ test "middleware: regenerate mid-request — old id dead, only the new id resolv
     defer testing.allocator.free(old_id);
 
     app.action = .regenerate;
-    const reqline = std.fmt.allocPrint(testing.allocator, "POST /login HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{old_id}) catch unreachable;
+    const reqline = testing.allocator.print("POST /login HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{old_id}) catch unreachable;
     defer testing.allocator.free(reqline);
     var out: [4096]u8 = undefined;
     var rbody: [1024]u8 = undefined;
@@ -2608,8 +2608,8 @@ test "middleware: allow_insecure_cookie really drops Secure from the Set-Cookie"
     var rbody: [1024]u8 = undefined;
     const got = getWithCookie(&r, null, &out, &rbody);
     const sc = headerValue(got, "Set-Cookie").?;
-    try testing.expect(std.mem.indexOf(u8, sc, "Secure") == null);
-    try testing.expect(std.mem.indexOf(u8, sc, "HttpOnly") != null);
+    try testing.expect(std.mem.find(u8, sc, "Secure") == null);
+    try testing.expect(std.mem.find(u8, sc, "HttpOnly") != null);
 }
 
 test "middleware: a new session whose handler only regenerates is persisted" {
@@ -3412,8 +3412,8 @@ test "middleware: persist_cookie = false gives a session cookie until the handle
 
     const first = getWithCookie(&r, null, &out, &rbody);
     const sc1 = headerValue(first, "Set-Cookie").?;
-    try testing.expect(std.mem.indexOf(u8, sc1, "Max-Age") == null);
-    try testing.expect(std.mem.indexOf(u8, sc1, "Expires") == null);
+    try testing.expect(std.mem.find(u8, sc1, "Max-Age") == null);
+    try testing.expect(std.mem.find(u8, sc1, "Expires") == null);
     var id_buf: [64]u8 = undefined;
     @memcpy(&id_buf, cookieId(sc1));
     const id: []const u8 = &id_buf;
@@ -3421,15 +3421,15 @@ test "middleware: persist_cookie = false gives a session cookie until the handle
     // Logging in with "remember me": from now on the cookie persists.
     app.action = .remember;
     const second = getWithCookie(&r, id, &out, &rbody);
-    try testing.expect(std.mem.indexOf(u8, headerValue(second, "Set-Cookie").?, "Max-Age=10;") != null);
+    try testing.expect(std.mem.find(u8, headerValue(second, "Set-Cookie").?, "Max-Age=10;") != null);
     app.action = .read_only;
     const third = getWithCookie(&r, id, &out, &rbody);
-    try testing.expect(std.mem.indexOf(u8, headerValue(third, "Set-Cookie").?, "Max-Age=10;") != null);
+    try testing.expect(std.mem.find(u8, headerValue(third, "Set-Cookie").?, "Max-Age=10;") != null);
 
     // A different visitor who did not tick the box still gets a session cookie.
     app.action = .put_uid;
     const other = getWithCookie(&r, null, &out, &rbody);
-    try testing.expect(std.mem.indexOf(u8, headerValue(other, "Set-Cookie").?, "Max-Age") == null);
+    try testing.expect(std.mem.find(u8, headerValue(other, "Set-Cookie").?, "Max-Age") == null);
 }
 
 test "middleware: putValue creates and persists a session; a flash message is read once" {
@@ -3619,7 +3619,7 @@ test "hash_id_in_store: through the middleware (cookie carries the real id; revo
     app.action = .read_only;
     try testing.expectEqualStrings(id, bodyOf(getWithCookie(&r, id, &out, &rbody))); // loaded, not re-minted
     app.action = .revoke;
-    try testing.expect(std.mem.indexOf(u8, headerValue(getWithCookie(&r, id, &out, &rbody), "Set-Cookie").?, "Max-Age=-1") != null);
+    try testing.expect(std.mem.find(u8, headerValue(getWithCookie(&r, id, &out, &rbody), "Set-Cookie").?, "Max-Age=-1") != null);
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
 }
@@ -3644,13 +3644,13 @@ test "hash_id_in_store: KvStore keys are prefix ++ SHA-256(id); iterate shows th
     try testing.expectEqual(@as(usize, 5), listing.keys.len);
     for (listing.keys) |k| {
         try testing.expectEqual(@as(usize, "session:".len + 32), k.len);
-        for (ids) |id| try testing.expect(std.mem.indexOf(u8, k, &id) == null);
+        for (ids) |id| try testing.expect(std.mem.find(u8, k, &id) == null);
     }
     var kb: [96]u8 = undefined;
-    const raw_key = try std.fmt.bufPrint(&kb, "session:{s}", .{&ids[0]});
+    const raw_key = try std.mem.print(&kb, "session:{s}", .{&ids[0]});
     try testing.expect(!env.db.exists(raw_key));
     const h = sha256Of(&ids[0]);
-    const hashed_key = try std.fmt.bufPrint(&kb, "session:{s}", .{&h});
+    const hashed_key = try std.mem.print(&kb, "session:{s}", .{&h});
     try testing.expect(env.db.exists(hashed_key));
 
     // The callback's s.id() is the store key: 32 bytes, equal to SHA-256 of one of the cookie ids.

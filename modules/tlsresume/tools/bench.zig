@@ -128,8 +128,8 @@ pub fn main(init: std.process.Init) !u8 {
         r.bytes(ctx.pts[i]);
         const sealed = try ctx.ring.seal(ctx.pts[i], ctx.nonce, ctx.out);
         ctx.blobs[i] = try arena.dupe(u8, sealed);
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "pt{d}.bin", .{n}), .data = ctx.pts[i] });
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "blob{d}.bin", .{n}), .data = ctx.blobs[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("pt{d}.bin", .{n}), .data = ctx.pts[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("blob{d}.bin", .{n}), .data = ctx.blobs[i] });
     }
 
     const so = init.environ_map.get("LIBCRYPTO_SO") orelse default_so;
@@ -138,7 +138,7 @@ pub fn main(init: std.process.Init) !u8 {
     // Interop before timing.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     for (lens, 0..) |n, i| {
-        const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "ossl_seal_{d}.bin", .{n}), arena, .limited(1 << 16));
+        const theirs = try dir.readFileAlloc(io, try arena.print("ossl_seal_{d}.bin", .{n}), arena, .limited(1 << 16));
         if (!std.mem.eql(u8, theirs, ctx.blobs[i])) {
             std.debug.print("{s}: FAILED -- OpenSSL's sealed {d}-byte ticket differs from ours\n", .{ bench_name, n });
             return 1;
@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ws: std.ArrayList(Work) = .empty;
     for (lens, 0..) |n, i| inline for (.{ Kind.seal, Kind.open }) |k| {
-        const name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ @tagName(k), n });
+        const name = try arena.print("{s}_{d}", .{ @tagName(k), n });
         try ws.append(arena, .{ .name = name, .op = .{ .kind = k, .len_index = i }, .ref = name });
     };
     try ws.append(arena, .{ .name = "binder", .op = .{ .kind = .binder, .len_index = 0 }, .ref = "binder" });

@@ -193,7 +193,7 @@ pub fn generateInto(buf: *[generated_len]u8) []const u8 {
     // same nanosecond in ~2.6% of concurrent samples, and every thread's
     // counter started at 1.
     const seq = next_seq.fetchAdd(1, .monotonic);
-    const printed = std.fmt.bufPrint(buf, "{x:0>16}{x:0>16}", .{ processPrefix(), seq }) catch unreachable; // exactly 32 chars fit
+    const printed = std.mem.print(buf, "{x:0>16}{x:0>16}", .{ processPrefix(), seq }) catch unreachable; // exactly 32 chars fit
     return printed;
 }
 
@@ -336,7 +336,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
@@ -344,7 +344,7 @@ fn bodyOf(got: []const u8) []const u8 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -436,14 +436,14 @@ test "adopt length boundary: exactly max_adopt_len is adopted, one over is regen
     // Exactly max_adopt_len ('a' * 200): must be adopted verbatim.
     {
         const val: [max_adopt_len]u8 = @splat('a');
-        const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
+        const req = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
         const got = runWire(&r, req, &resp_buf);
         try testing.expectEqualStrings(&val, headerValue(got, "X-Request-Id").?);
     }
     // One byte over max_adopt_len: rejected, a fresh generated ID is used instead.
     {
         const val: [max_adopt_len + 1]u8 = @splat('a');
-        const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
+        const req = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{val}) catch unreachable;
         const got = runWire(&r, req, &resp_buf);
         const hdr = headerValue(got, "X-Request-Id").?;
         try testing.expectEqual(@as(usize, generated_len), hdr.len);
@@ -518,7 +518,7 @@ const PrefixGen = struct {
         const self: *PrefixGen = @ptrCast(@alignCast(context.?));
         self.n += 1;
         const b = self.bad orelse
-            return std.fmt.bufPrint(buf, "{s}-{d}", .{ self.prefix, self.n }) catch unreachable;
+            return std.mem.print(buf, "{s}-{d}", .{ self.prefix, self.n }) catch unreachable;
         if (!self.copy) return b;
         @memcpy(buf[0..b.len], b);
         return buf[0..b.len];
@@ -575,7 +575,7 @@ test "generator: a result breaking the contract falls back to the built-in id" {
         try testing.expectEqual(@as(u32, 1), gen.n);
         try testing.expect(modelIsGenerated(hdr));
         try testing.expectEqualStrings(hdr, bodyOf(got));
-        try testing.expect(std.mem.indexOf(u8, got, "X-Evil") == null);
+        try testing.expect(std.mem.find(u8, got, "X-Evil") == null);
     }
 }
 
@@ -592,7 +592,7 @@ fn modelAdoptable(v: []const u8) bool {
     if (v.len > 200) return false;
     var i: usize = 0;
     while (i < v.len) : (i += 1) {
-        if (std.mem.indexOfScalar(u8, model_allowed, v[i]) == null) return false;
+        if (std.mem.findScalar(u8, model_allowed, v[i]) == null) return false;
     }
     return true;
 }
@@ -707,9 +707,9 @@ test "model-fuzz: middleware adopt-or-generate vs. model over random options and
 
         var req_buf: [1024]u8 = undefined;
         const req = if (present)
-            std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n{s}: {s}\r\nConnection: close\r\n\r\n", .{ spelling, val }) catch unreachable
+            std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\n{s}: {s}\r\nConnection: close\r\n\r\n", .{ spelling, val }) catch unreachable
         else
-            std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{}) catch unreachable;
+            std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{}) catch unreachable;
 
         var ri = RequestId{ .options = .{ .header_name = name, .trust_incoming = trust, .echo = echo } };
         var r = router.Router.init(testing.allocator);

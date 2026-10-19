@@ -137,7 +137,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         var a4: [4]u8 = undefined;
         for (&a4) |*x| x.* = src.value(u8);
         var t: [64]u8 = undefined;
-        const s4 = try std.fmt.bufPrint(&t, "{d}.{d}.{d}.{d}", .{ a4[0], a4[1], a4[2], a4[3] });
+        const s4 = try std.mem.print(&t, "{d}.{d}.{d}.{d}", .{ a4[0], a4[1], a4[2], a4[3] });
         const p4 = names.parseIp4(s4) orelse return error.Ip4RoundTrip;
         if (!std.mem.eql(u8, &p4, &a4)) return error.Ip4RoundTrip;
         Mark.mark(.ip4_parsed);
@@ -158,7 +158,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         };
         if (!std.mem.eql(u8, &q6, &a6)) return error.Ip6RoundTrip;
         Mark.mark(.ip6_parsed);
-        if (std.mem.indexOf(u8, short, "::") != null) Mark.mark(.ip6_compressed);
+        if (std.mem.find(u8, short, "::") != null) Mark.mark(.ip6_compressed);
 
         // Random text: whatever parses must print back to the same bytes.
         const n = src.valueRangeAtMost(u8, 0, 24);
@@ -169,7 +169,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             if (!std.mem.eql(u8, &again, &r6)) return error.Ip6RoundTrip;
         }
         if (names.parseIp4(b1[0..n])) |r4| {
-            const back = try std.fmt.bufPrint(&t2, "{d}.{d}.{d}.{d}", .{ r4[0], r4[1], r4[2], r4[3] });
+            const back = try std.mem.print(&t2, "{d}.{d}.{d}.{d}", .{ r4[0], r4[1], r4[2], r4[3] });
             if (!std.mem.eql(u8, back, b1[0..n])) return error.Ip4NotCanonical;
         }
     }

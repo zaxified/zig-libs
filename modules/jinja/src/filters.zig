@@ -490,7 +490,7 @@ fn fTruncate(ctx: *Ctx, input: Value, args: Args) Error!Value {
         // prefix is kept, not dropped. Emptying it silently truncated every
         // spaceless string to nothing: a URL, a hostname, an interface name,
         // base64 (W2 re-audit 2026-09-02, `jinja` F-C1).
-        if (std.mem.lastIndexOfScalar(u8, cut, ' ')) |sp| cut = cut[0..sp];
+        if (std.mem.findScalarLast(u8, cut, ' ')) |sp| cut = cut[0..sp];
     }
     return .{ .string = .{ .bytes = try std.mem.concat(ctx.arena, u8, &.{ cut, end }), .safe = markup } };
 }
@@ -528,7 +528,7 @@ fn fStriptags(ctx: *Ctx, input: Value, args: Args) Error!Value {
             // rest of the string — `'a<b'|striptags` answered `a` where the
             // reference answers `a<b`, silent data loss on ordinary text
             // (W2 re-audit 2026-09-02, `jinja` F-D2).
-            if (std.mem.indexOfScalarPos(u8, s, i, '>')) |close| {
+            if (std.mem.findScalarPos(u8, s, i, '>')) |close| {
                 i = close + 1;
                 continue;
             }
@@ -677,12 +677,12 @@ fn quoteIntoQs(ctx: *Ctx, out: *std.ArrayList(u8), s: []const u8, extra_safe: []
             continue;
         }
         const unreserved = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-' or c == '~' or
-            std.mem.indexOfScalar(u8, extra_safe, c) != null;
+            std.mem.findScalar(u8, extra_safe, c) != null;
         if (unreserved) {
             try out.append(ctx.arena, c);
         } else {
             var buf: [3]u8 = undefined;
-            const hex = std.fmt.bufPrint(&buf, "%{X:0>2}", .{c}) catch unreachable;
+            const hex = std.mem.print(&buf, "%{X:0>2}", .{c}) catch unreachable;
             try out.appendSlice(ctx.arena, hex);
         }
     }
@@ -938,7 +938,7 @@ fn roundHalfEven(x: f64, p: i32) f64 {
     };
 
     var buf: [64]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d}e{d}", .{ n, -p }) catch return x;
+    const text = std.mem.print(&buf, "{d}e{d}", .{ n, -p }) catch return x;
     const out = std.fmt.parseFloat(f64, text) catch return x;
     return if (neg) -out else out;
 }
@@ -1831,12 +1831,12 @@ fn stringMethod(ctx: *Ctx, s: value.Str, name: []const u8, args: Args) Error!Val
         if (p.len == 0) return error.BadArgument;
         var n: i64 = 0;
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, s.bytes, i, p)) |at| : (i = at + p.len) n += 1;
+        while (std.mem.findPos(u8, s.bytes, i, p)) |at| : (i = at + p.len) n += 1;
         return .{ .integer = n };
     }
     if (std.mem.eql(u8, name, "find")) {
         const p = try strArg(ctx, args, 0, "sub", "");
-        const at = std.mem.indexOf(u8, s.bytes, p) orelse return .{ .integer = -1 };
+        const at = std.mem.find(u8, s.bytes, p) orelse return .{ .integer = -1 };
         return .{ .integer = @intCast(at) };
     }
     // W2-A1/A2-jinja-F6: `str.split()`/`str.splitlines()` on a `Markup`

@@ -103,7 +103,7 @@ fn buildEncryptedData(
     wrapped_cek_b64: []const u8,
     content_b64: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(alloc,
+    return alloc.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}" Type="http://www.w3.org/2001/04/xmlenc#Element">
         \\  <xenc:EncryptionMethod Algorithm="{s}"/>
         \\  <ds:KeyInfo>
@@ -209,7 +209,7 @@ test "round-trip: xenc11 rsa-oaep (SHA256) + AES-256-GCM" {
     defer a.free(cek_b64);
     const content_b64 = try b64(a, content);
     defer a.free(content_b64);
-    const doc_src = try std.fmt.allocPrint(a,
+    const doc_src = try a.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
         \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
         \\  <ds:KeyInfo>
@@ -256,7 +256,7 @@ test "round-trip: xenc11 rsa-oaep, digest SHA-256 != MGF1-SHA1 (previously Unsup
     defer a.free(cek_b64);
     const content_b64 = try b64(a, content);
     defer a.free(content_b64);
-    const doc_src = try std.fmt.allocPrint(a,
+    const doc_src = try a.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
         \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
         \\  <ds:KeyInfo>
@@ -299,7 +299,7 @@ test "teeth: xenc11 rsa-oaep with a genuinely unrecognized MGF algorithm -> Unsu
     // mgf1sha384/mgf1sha512; this module only implements mgf1sha1/mgf1sha256
     // (sha384/512 would need new comptime hash arms), so an unrecognized MGF
     // URI must still be refused, confirming the allow-list gate still works.
-    const doc_src = try std.fmt.allocPrint(a,
+    const doc_src = try a.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" xmlns:x11="{s}">
         \\  <xenc:EncryptionMethod Algorithm="{s}aes256-gcm"/>
         \\  <ds:KeyInfo>
@@ -334,7 +334,7 @@ test "round-trip via EncryptedAssertion wrapper convenience" {
     defer a.free(content_b64);
     const ed = try buildEncryptedData(a, xenc11_ns ++ "aes256-gcm", xenc_ns ++ "rsa-oaep-mgf1p", cek_b64, content_b64);
     defer a.free(ed);
-    const wrapper = try std.fmt.allocPrint(a, "<saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">{s}</saml:EncryptedAssertion>", .{ed});
+    const wrapper = try a.print("<saml:EncryptedAssertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">{s}</saml:EncryptedAssertion>", .{ed});
     defer a.free(wrapper);
     var doc = try xml.parse(a, wrapper, .{});
     defer doc.deinit();
@@ -490,7 +490,7 @@ test "TEETH (F5): a second CipherData or CipherValue is refused, as xmlsec1 refu
     var kp = try makeKey();
     defer kp.secret_key.deinit();
 
-    const dup_cipher_data = try std.fmt.allocPrint(testing.allocator,
+    const dup_cipher_data = try testing.allocator.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
         \\  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
         \\  <ds:KeyInfo><xenc:EncryptedKey>
@@ -503,7 +503,7 @@ test "TEETH (F5): a second CipherData or CipherValue is refused, as xmlsec1 refu
     , .{ xenc_ns, ds_ns });
     defer testing.allocator.free(dup_cipher_data);
 
-    const dup_cipher_value = try std.fmt.allocPrint(testing.allocator,
+    const dup_cipher_value = try testing.allocator.print(
         \\<xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}">
         \\  <xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes256-cbc"/>
         \\  <ds:KeyInfo><xenc:EncryptedKey>
@@ -1417,7 +1417,7 @@ const FreeScanner = struct {
         const self: *FreeScanner = @ptrCast(@alignCast(ctx));
         if (m.len >= self.needle.len) {
             self.frees_seen += 1;
-            if (std.mem.indexOf(u8, m, self.needle) != null) self.leaked_plaintext = true;
+            if (std.mem.find(u8, m, self.needle) != null) self.leaked_plaintext = true;
         }
         self.child.rawFree(m, a, ra);
     }

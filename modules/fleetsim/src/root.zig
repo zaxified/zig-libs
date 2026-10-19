@@ -1137,7 +1137,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 const Endpoint = struct { host: []const u8, port: u16 };
 
 fn splitEndpoint(s: []const u8) ?Endpoint {
-    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, s, ':') orelse return null;
     const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return null;
     return .{ .host = s[0..colon], .port = port };
 }
@@ -1885,7 +1885,7 @@ test "live: a real OPC UA client drives a simulated server, and sees BadDeviceFa
     // The endpoint URL a client is told to reconnect to must be the one it
     // dialled, or it will chase an address nothing is listening on.
     var url_buf: [128]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "opc.tcp://{s}:{d}", .{ ep.host, ep.port });
+    const url = try std.mem.print(&url_buf, "opc.tcp://{s}:{d}", .{ ep.host, ep.port });
 
     var fx: OpcuaFixture = undefined;
     try fx.init(testing.allocator, url);
@@ -2035,7 +2035,7 @@ test "live: two real masters, two nodes, one binding thread" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const endpoint = envVar("FLEETSIM_MULTI_LISTEN") orelse
         return liveGate("live fleetsim multi-peer", "FLEETSIM_MULTI_LISTEN");
-    const comma = std.mem.indexOfScalar(u8, endpoint, ',') orelse return error.SkipZigTest;
+    const comma = std.mem.findScalar(u8, endpoint, ',') orelse return error.SkipZigTest;
     const ep_a = splitEndpoint(endpoint[0..comma]) orelse return error.SkipZigTest;
     const port_b = std.fmt.parseInt(u16, endpoint[comma + 1 ..], 10) catch return error.SkipZigTest;
 

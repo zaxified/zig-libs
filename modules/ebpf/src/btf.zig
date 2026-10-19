@@ -483,7 +483,7 @@ pub const Btf = struct {
         const rel = name_off - self.start_str_off;
         if (rel >= self.strings.len) return null;
         const tail = self.strings[rel..];
-        const end = std.mem.indexOfScalar(u8, tail, 0) orelse return null;
+        const end = std.mem.findScalar(u8, tail, 0) orelse return null;
         return tail[0..end];
     }
 
@@ -990,12 +990,12 @@ pub fn loadKernel(gpa: std.mem.Allocator) LoadError!Btf {
 /// must outlive the result.
 pub fn loadModule(gpa: std.mem.Allocator, module: []const u8, base: *const Btf) LoadError!Btf {
     if (module.len == 0 or module.len > 96) return error.InvalidModuleName;
-    if (std.mem.indexOfScalar(u8, module, '/') != null) return error.InvalidModuleName;
-    if (std.mem.indexOfScalar(u8, module, 0) != null) return error.InvalidModuleName;
+    if (std.mem.findScalar(u8, module, '/') != null) return error.InvalidModuleName;
+    if (std.mem.findScalar(u8, module, 0) != null) return error.InvalidModuleName;
     if (std.mem.eql(u8, module, ".") or std.mem.eql(u8, module, "..")) return error.InvalidModuleName;
 
     var buf: [160]u8 = undefined;
-    const path = std.fmt.bufPrint(&buf, sysfs_btf_dir ++ "/{s}", .{module}) catch return error.InvalidModuleName;
+    const path = std.mem.print(&buf, sysfs_btf_dir ++ "/{s}", .{module}) catch return error.InvalidModuleName;
     return loadFile(gpa, path, base);
 }
 
@@ -2356,7 +2356,7 @@ test "real kernel BTF: a module's split BTF resolves only with vmlinux as its ba
         // Parsing the same blob WITHOUT the base must be refused, not
         // silently mis-resolved.
         var path_buf: [160]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_buf, sysfs_btf_dir ++ "/{s}", .{name});
+        const path = try std.mem.print(&path_buf, sysfs_btf_dir ++ "/{s}", .{name});
         var pz: [176]u8 = undefined;
         @memcpy(pz[0..path.len], path);
         pz[path.len] = 0;

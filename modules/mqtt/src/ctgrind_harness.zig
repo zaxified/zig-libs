@@ -74,7 +74,7 @@ fn packets(password: []const u8, auth_data: []const u8) [3]struct { packet.Versi
 /// before tainting, from the untainted wire image: where a credential sits is
 /// public (it follows from public lengths).
 fn taintWithin(wire: []u8, secret: []const u8) void {
-    const at = std.mem.indexOf(u8, wire, secret) orelse @panic("credential not in wire image");
+    const at = std.mem.find(u8, wire, secret) orelse @panic("credential not in wire image");
     std.valgrind.memcheck.makeMemUndefined(wire[at..][0..secret.len]);
 }
 

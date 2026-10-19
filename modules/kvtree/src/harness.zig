@@ -242,7 +242,7 @@ fn copyEntries(src: []const Obs, out: Allocator) ![]Obs {
 const key_space = 16;
 
 fn randKey(prng: *Prng, buf: *[8]u8) []const u8 {
-    return std.fmt.bufPrint(buf, "k{d:0>3}", .{prng.below(key_space)}) catch unreachable;
+    return std.mem.print(buf, "k{d:0>3}", .{prng.below(key_space)}) catch unreachable;
 }
 
 /// Drive `Store` and the reference `Model` in lockstep across a randomized
@@ -286,7 +286,7 @@ pub fn runProperty(comptime Store: type, gpa: Allocator, seed: u64) !void {
                 const key = try sa.dupe(u8, randKey(&prng, &kb));
                 if (prng.chance(3, 4)) {
                     var vb: [8]u8 = undefined;
-                    const val = try sa.dupe(u8, std.fmt.bufPrint(&vb, "v{d}", .{prng.next() % 1000}) catch unreachable);
+                    const val = try sa.dupe(u8, std.mem.print(&vb, "v{d}", .{prng.next() % 1000}) catch unreachable);
                     try changes.append(sa, .{ .put = .{ .key = key, .val = val } });
                 } else {
                     try changes.append(sa, .{ .del = key });
@@ -466,14 +466,14 @@ test "real Db: snapshot isolation + serializability under a commit schedule (gat
     var j: usize = 0;
     while (j < 700) : (j += 1) {
         var kb: [16]u8 = undefined;
-        const key = try std.fmt.bufPrint(&kb, "big{d:0>4}", .{j});
+        const key = try std.mem.print(&kb, "big{d:0>4}", .{j});
         try db.put(key, &big);
         try ref.put(key, &big);
     }
     var t: usize = 0;
     while (t < 150) : (t += 1) {
         var kb: [16]u8 = undefined;
-        const key = try std.fmt.bufPrint(&kb, "big{d:0>4}", .{prng.below(700)});
+        const key = try std.mem.print(&kb, "big{d:0>4}", .{prng.below(700)});
         if (prng.chance(1, 2)) {
             try db.put(key, "shrunk");
             try ref.put(key, "shrunk");
@@ -545,7 +545,7 @@ test "real Db: crash at a commit that merges underfull nodes recovers to one sid
                     defer db.close();
                     var txn = try db.begin();
                     for (0..n) |id| {
-                        const key = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                        const key = try a.print("key{d:0>5}", .{id});
                         try txn.put(key, &val);
                         try before.put(key, &val);
                         if (id % 6 == 0) try after.put(key, &val);
@@ -559,7 +559,7 @@ test "real Db: crash at a commit that merges underfull nodes recovers to one sid
                     defer db.close();
                     var txn = db.begin() catch break :attempt;
                     for (0..n) |id| if (id % 6 != 0)
-                        try txn.del(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}));
+                        try txn.del(try a.print("key{d:0>5}", .{id}));
                     txn.commit() catch break :attempt;
                     progressed = true;
                 }
@@ -603,7 +603,7 @@ test "real Db: crash at a commit that gives the file's tail back recovers to one
                 var db = try kvtree.Db.open(gpa, sim.storage(), "sh.kvt", .{});
                 defer db.close();
                 var txn = try db.begin();
-                for (0..900) |id| try txn.put(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}), &val);
+                for (0..900) |id| try txn.put(try a.print("key{d:0>5}", .{id}), &val);
                 try txn.commit();
                 const peak = db.meta_rec.high_water;
                 defer if (settle == 3) {
@@ -613,9 +613,9 @@ test "real Db: crash at a commit that gives the file's tail back recovers to one
                     testing.expect(sim.fileContent("sh.kvt").?.len < peak * kvtree.page_size) catch @panic("file not truncated");
                 };
                 var del = try db.begin();
-                for (20..900) |id| try del.del(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}));
+                for (20..900) |id| try del.del(try a.print("key{d:0>5}", .{id}));
                 try del.commit();
-                for (0..20) |id| try before.put(try std.fmt.allocPrint(a, "key{d:0>5}", .{id}), &val);
+                for (0..20) |id| try before.put(try a.print("key{d:0>5}", .{id}), &val);
                 for (0..settle) |_| try db.put("key00000", &val);
             }
             var after = try before.clone(a);
@@ -672,7 +672,7 @@ test "real Db: a crash anywhere in copyTo leaves the destination as it was or th
                 defer db.close();
                 var txn = try db.begin();
                 for (0..300) |id| {
-                    const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                    const k = try a.print("key{d:0>5}", .{id});
                     const v: []const u8 = if (id % 50 == 0) &big else &val;
                     try txn.put(k, v);
                     try old.put(k, v);
@@ -682,7 +682,7 @@ test "real Db: a crash anywhere in copyTo leaves the destination as it was or th
                 new = try old.clone(a);
                 var t2 = try db.begin();
                 for (0..300) |id| if (id % 2 == 1) { // the overflow values stay
-                    const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                    const k = try a.print("key{d:0>5}", .{id});
                     try t2.del(k);
                     new.del(k);
                 };
@@ -765,7 +765,7 @@ test "real Db: crash at a commit that deletes, creates and fills nested buckets 
                     const old = try txn.createBucket("old");
                     const in = try old.createBucket("in");
                     for (0..200) |id| {
-                        const k = try std.fmt.allocPrint(a, "key{d:0>5}", .{id});
+                        const k = try a.print("key{d:0>5}", .{id});
                         try old.put(k, if (id % 40 == 0) &big else "old-value");
                         try in.put(k, "in-value");
                         try txn.put(k, "root-value");
@@ -791,7 +791,7 @@ test "real Db: crash at a commit that deletes, creates and fills nested buckets 
                     const n = nb.createBucket("n") catch break :attempt;
                     _ = nb.nextSequence() catch break :attempt;
                     for (0..150) |id| {
-                        const k = try std.fmt.allocPrint(a, "new{d:0>5}", .{id});
+                        const k = try a.print("new{d:0>5}", .{id});
                         nb.put(k, if (id % 50 == 0) &big else "new-value") catch break :attempt;
                         n.put(k, "n-value") catch break :attempt;
                     }
@@ -849,21 +849,21 @@ fn flattenAll(snap: *kvtree.Snapshot, out: Allocator) ![]const Obs {
             continue;
         }
         const b = (try snap.bucket(e.key)).?;
-        try flattenBucket(&m, b, try std.fmt.allocPrint(out, "/{s}/", .{e.key}), out);
+        try flattenBucket(&m, b, try out.print("/{s}/", .{e.key}), out);
     }
     return m.entries();
 }
 
 fn flattenBucket(m: *Model, b: kvtree.ReadBucket, prefix: []const u8, out: Allocator) !void {
-    try m.put(prefix, try std.fmt.allocPrint(out, "{d}", .{b.sequence()}));
+    try m.put(prefix, try out.print("{d}", .{b.sequence()}));
     var cur = try b.cursor();
     defer cur.deinit();
     try cur.first();
     while (try cur.next()) |e| {
         if (e.bucket) {
             const sub = (try b.bucket(e.key)).?;
-            try flattenBucket(m, sub, try std.fmt.allocPrint(out, "{s}{s}/", .{ prefix, e.key }), out);
-        } else try m.put(try std.fmt.allocPrint(out, "{s}{s}", .{ prefix, e.key }), try out.dupe(u8, e.val));
+            try flattenBucket(m, sub, try out.print("{s}{s}/", .{ prefix, e.key }), out);
+        } else try m.put(try out.print("{s}{s}", .{ prefix, e.key }), try out.dupe(u8, e.val));
     }
 }
 
@@ -919,7 +919,7 @@ fn crashSweep(comptime val_len: usize, comptime overwrite: bool) !void {
                 var keybufs: [3][12]u8 = undefined;
                 var keys: [3][]const u8 = undefined;
                 for (&keybufs, &keys, 0..) |*kb, *key, k|
-                    key.* = try std.fmt.bufPrint(kb, "r{d}i{d:0>2}-{d}", .{ round, crash_at, k });
+                    key.* = try std.mem.print(kb, "r{d}i{d:0>2}-{d}", .{ round, crash_at, k });
 
                 // `reorder_seed` is `u64` and its splitmix64-style mixing
                 // constant is genuinely a 64-bit magic number — do the

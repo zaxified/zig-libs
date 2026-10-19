@@ -63,14 +63,14 @@ fn statusOf(got: []const u8) u16 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -149,7 +149,7 @@ pub fn main() !void {
         for (malformed) |bad| {
             var req_buf: [1024]u8 = undefined;
             var resp_buf: [1024]u8 = undefined;
-            const req = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{bad}) catch unreachable;
+            const req = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{bad}) catch unreachable;
             const got = runWire(&r, req, &resp_buf);
             const hdr = headerValue(got, "X-Request-Id").?;
             must(hdr.len == requestid.generated_len, @src()); // regenerated, not adopted
@@ -166,12 +166,12 @@ pub fn main() !void {
         var resp_buf: [1024]u8 = undefined;
 
         const at_cap: [requestid.max_adopt_len]u8 = @splat('a');
-        const req1 = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{at_cap}) catch unreachable;
+        const req1 = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{at_cap}) catch unreachable;
         const got1 = runWire(&r, req1, &resp_buf);
         must(std.mem.eql(u8, headerValue(got1, "X-Request-Id").?, &at_cap), @src());
 
         const over_cap: [requestid.max_adopt_len + 1]u8 = @splat('a');
-        const req2 = std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{over_cap}) catch unreachable;
+        const req2 = std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: {s}\r\nConnection: close\r\n\r\n", .{over_cap}) catch unreachable;
         const got2 = runWire(&r, req2, &resp_buf);
         const hdr2 = headerValue(got2, "X-Request-Id").?;
         must(hdr2.len == requestid.generated_len, @src()); // over the cap: regenerated

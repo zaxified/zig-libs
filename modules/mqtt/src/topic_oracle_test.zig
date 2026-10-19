@@ -59,7 +59,7 @@ test "topic oracle: matches agrees with Mosquitto's delivery on every valid pair
         for (vectors.filters, 0..) |f, i| {
             if (!f.valid) continue;
             pairs += 1;
-            const delivered = std.mem.indexOfScalar(u16, m.filters, @intCast(i)) != null;
+            const delivered = std.mem.findScalar(u16, m.filters, @intCast(i)) != null;
             if (topic.matches(f.s, m.name) != delivered) {
                 std.debug.print("topic oracle: \"{f}\" on \"{f}\": ours {}, mosquitto delivered {}\n", .{ std.zig.fmtString(f.s), std.zig.fmtString(m.name), !delivered, delivered });
                 failed += 1;

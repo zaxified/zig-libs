@@ -385,7 +385,7 @@ pub const Package = struct {
     pub fn resolveSection(self: *const Package, ref: []const u8) ?*const Section {
         if (ref.len > 0 and ref[0] == '@') {
             if (ref[ref.len - 1] != ']') return null;
-            const lb = std.mem.indexOfScalar(u8, ref, '[') orelse return null;
+            const lb = std.mem.findScalar(u8, ref, '[') orelse return null;
             const index = std.fmt.parseInt(i64, ref[lb + 1 .. ref.len - 1], 10) catch return null;
             return self.nth(ref[1..lb], index);
         }
@@ -1807,8 +1807,8 @@ test "isBareSafe boundary: a key containing a quote character must not be writte
     const text = try serialize(gpa, &pkg);
     defer gpa.free(text);
     // Written quoted (`"a'b"`), never as a bare `a'b` token.
-    try testing.expect(std.mem.indexOf(u8, text, "\"a'b\"") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\ta'b ") == null);
+    try testing.expect(std.mem.find(u8, text, "\"a'b\"") != null);
+    try testing.expect(std.mem.find(u8, text, "\ta'b ") == null);
     try testing.expectError(error.InvalidName, parse(gpa, text));
 }
 
@@ -1823,9 +1823,9 @@ test "isBareSafe boundary: a key containing a comment or word separator is quote
         const pkg: Package = .{ .sections = &secs };
         const text = try serialize(gpa, &pkg);
         defer gpa.free(text);
-        const quoted = try std.fmt.allocPrint(gpa, "\toption '{s}' ", .{key});
+        const quoted = try gpa.print("\toption '{s}' ", .{key});
         defer gpa.free(quoted);
-        try testing.expect(std.mem.indexOf(u8, text, quoted) != null);
+        try testing.expect(std.mem.find(u8, text, quoted) != null);
     }
 }
 
@@ -1894,7 +1894,7 @@ test "addOption is not quadratic in distinct keys per section" {
         try input.appendSlice(gpa, "config t\n");
         var buf: [32]u8 = undefined;
         for (0..n) |k| {
-            const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+            const key = try std.mem.print(&buf, "k{d}", .{k});
             try input.appendSlice(gpa, "\toption ");
             try input.appendSlice(gpa, key);
             try input.appendSlice(gpa, " v\n");
@@ -2028,7 +2028,7 @@ test "total item cap: boundary is exact, one section many options" {
     defer below.deinit(gpa);
     try below.appendSlice(gpa, "config t\n");
     for (0..n_below) |k| {
-        const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+        const key = try std.mem.print(&buf, "k{d}", .{k});
         try below.appendSlice(gpa, "\toption ");
         try below.appendSlice(gpa, key);
         try below.appendSlice(gpa, " v\n");
@@ -2041,7 +2041,7 @@ test "total item cap: boundary is exact, one section many options" {
     defer over.deinit(gpa);
     try over.appendSlice(gpa, "config t\n");
     for (0..n_over) |k| {
-        const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+        const key = try std.mem.print(&buf, "k{d}", .{k});
         try over.appendSlice(gpa, "\toption ");
         try over.appendSlice(gpa, key);
         try over.appendSlice(gpa, " v\n");
@@ -2622,8 +2622,8 @@ test "real uci capture: parse(raw file) matches the real `uci show` structure â€
     // Confirm the real `@type[N]` addressing convention this capture
     // demonstrates is exactly the file-order-per-type index `iterate`
     // reflects (0 then 1, for the two `rule` sections above).
-    try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[0]=rule\n") != null);
-    try testing.expect(std.mem.indexOf(u8, captured_testcfg_show, "testcfg.@rule[1]=rule\n") != null);
+    try testing.expect(std.mem.find(u8, captured_testcfg_show, "testcfg.@rule[0]=rule\n") != null);
+    try testing.expect(std.mem.find(u8, captured_testcfg_show, "testcfg.@rule[1]=rule\n") != null);
 }
 
 test "Package.sectionByName: pkg.<name> addressing by name alone, across types (real uci capture)" {

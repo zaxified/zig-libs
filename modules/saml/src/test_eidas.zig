@@ -49,7 +49,7 @@ fn baseConfig(idp_key: @import("xmldsig").VerifyKey) saml.Config {
 /// Mint a signed Response: Subject(nameid+confirmation) + conditions + optional
 /// AuthnStatement body (raw XML, e.g. an AuthnContext).
 fn mint(alloc: std.mem.Allocator, confirmation: []const u8, conditions_xml: []const u8, authn_xml: []const u8) !sign.Signed {
-    const after_issuer = try std.fmt.allocPrint(alloc, "<saml:Subject>{s}{s}</saml:Subject>{s}{s}", .{ nameid, confirmation, conditions_xml, authn_xml });
+    const after_issuer = try alloc.print("<saml:Subject>{s}{s}</saml:Subject>{s}{s}", .{ nameid, confirmation, conditions_xml, authn_xml });
     defer alloc.free(after_issuer);
     var signed = try sign.signAssertion(alloc, 0xE1DA5, fx.idp_entity_id, "_eidas01", "2024-06-01T12:00:00Z", after_issuer);
     errdefer signed.deinit(alloc);

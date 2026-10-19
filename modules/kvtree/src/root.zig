@@ -201,7 +201,7 @@ pub const Db = struct {
     /// creates nothing. It sees the newest commit as of `open`, which no
     /// writer can move while it holds the lock.
     pub fn open(gpa: Allocator, store: kv.Storage, path: []const u8, options: Options) OpenError!Db {
-        const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+        const lock_path = try gpa.print("{s}.lock", .{path});
         errdefer gpa.free(lock_path);
 
         var lock_file: ?kv.Storage.Handle = null;
@@ -997,7 +997,7 @@ pub const Snapshot = struct {
 /// next to `path` and renamed into place.
 fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyError!void {
     if (dest.ctx == db.pager.store.ctx and std.mem.eql(u8, path, db.path)) return error.SamePath;
-    const tmp_path = try std.fmt.allocPrint(db.gpa, "{s}.copy", .{path});
+    const tmp_path = try db.gpa.print("{s}.copy", .{path});
     defer db.gpa.free(tmp_path);
     const h = try dest.open(tmp_path, .create_truncate);
     var renamed = false;
@@ -1633,7 +1633,7 @@ test "steady state: overwriting a fixed key set stops growing the file (the free
     // where a commit's frees can satisfy the next commit's allocations.
     var i: usize = 0;
     while (i < keys * 8) : (i += 1) {
-        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i % keys});
+        const key = try std.mem.print(&key_buf, "k{d:0>4}", .{i % keys});
         try db.put(key, val);
     }
     const warm = db.meta_rec.high_water;
@@ -1641,7 +1641,7 @@ test "steady state: overwriting a fixed key set stops growing the file (the free
     // Then a long run of the same thing. A leak of even ONE page per commit
     // would show as +200 here; the old code leaked at least that.
     while (i < keys * 8 + 200) : (i += 1) {
-        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i % keys});
+        const key = try std.mem.print(&key_buf, "k{d:0>4}", .{i % keys});
         try db.put(key, val);
     }
     try testing.expectEqual(warm, db.meta_rec.high_water);
@@ -1650,7 +1650,7 @@ test "steady state: overwriting a fixed key set stops growing the file (the free
     // that quietly stopped writing.
     var k: usize = 0;
     while (k < keys) : (k += 1) {
-        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{k});
+        const key = try std.mem.print(&key_buf, "k{d:0>4}", .{k});
         const got = try db.get(testing.allocator, key);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expect(got != null);
@@ -1738,7 +1738,7 @@ test "a live Db.cursor keeps its pages: commits during a scan cannot recycle the
 
     var i: usize = 0;
     while (i < keys) : (i += 1) {
-        const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{i});
+        const key = try std.mem.print(&key_buf, "k{d:0>4}", .{i});
         try db.put(key, val);
     }
 
@@ -1760,7 +1760,7 @@ test "a live Db.cursor keeps its pages: commits during a scan cannot recycle the
         if (seen == 5) {
             var j: usize = 0;
             while (j < keys * 3) : (j += 1) {
-                const key = try std.fmt.bufPrint(&key_buf, "k{d:0>4}", .{j % keys});
+                const key = try std.mem.print(&key_buf, "k{d:0>4}", .{j % keys});
                 try db.put(key, val);
             }
         }
@@ -2191,12 +2191,12 @@ test "one transaction, many changes per key: the last change of each key wins" {
     var vb: [4000][8]u8 = undefined;
     for (0..4000) |i| {
         const id = r.uintLessThan(usize, keys);
-        const k = std.fmt.bufPrint(&kb[id], "k{d:0>2}", .{id}) catch unreachable;
+        const k = std.mem.print(&kb[id], "k{d:0>2}", .{id}) catch unreachable;
         if (r.uintLessThan(u8, 4) == 0) {
             try txn.del(k);
             model[id] = null;
         } else {
-            try txn.put(k, std.fmt.bufPrint(&vb[i], "{d:0>8}", .{i}) catch unreachable);
+            try txn.put(k, std.mem.print(&vb[i], "{d:0>8}", .{i}) catch unreachable);
             model[id] = @intCast(i);
         }
     }
@@ -2206,11 +2206,11 @@ test "one transaction, many changes per key: the last change of each key wins" {
     defer snap.release();
     for (0..keys) |id| {
         var k: [4]u8 = undefined;
-        const got = try snap.get(testing.allocator, std.fmt.bufPrint(&k, "k{d:0>2}", .{id}) catch unreachable);
+        const got = try snap.get(testing.allocator, std.mem.print(&k, "k{d:0>2}", .{id}) catch unreachable);
         defer if (got) |g| testing.allocator.free(g);
         if (model[id]) |want| {
             var w: [8]u8 = undefined;
-            try testing.expectEqualStrings(std.fmt.bufPrint(&w, "{d:0>8}", .{want}) catch unreachable, got.?);
+            try testing.expectEqualStrings(std.mem.print(&w, "{d:0>8}", .{want}) catch unreachable, got.?);
         } else try testing.expect(got == null);
     }
 }
@@ -2248,7 +2248,7 @@ test "deletes that empty leaves, branches and the whole tree agree with a model,
             const Put = struct {
                 fn put(t: *Txn, al: Allocator, m: *Model, id: usize, ver: u32) !void {
                     const kb = try al.create([long_key_len]u8);
-                    try t.put(longKey(kb, id), try std.fmt.allocPrint(al, "v{d:0>15}", .{ver}));
+                    try t.put(longKey(kb, id), try al.print("v{d:0>15}", .{ver}));
                     m[id] = ver;
                 }
                 fn del(t: *Txn, al: Allocator, m: *Model, id: usize) !void {
@@ -2317,7 +2317,7 @@ fn expectMatchesModel(cursor_in: Cursor, model: []const ?u32) !void {
         const id: usize = @intCast(std.mem.readInt(u64, e.key[0..8], .big));
         while (next_id < id) : (next_id += 1) try testing.expect(model[next_id] == null);
         var vb: [16]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&vb, "v{d:0>15}", .{model[id].?}), e.val);
+        try testing.expectEqualStrings(try std.mem.print(&vb, "v{d:0>15}", .{model[id].?}), e.val);
         next_id = id + 1;
     }
     while (next_id < model.len) : (next_id += 1) try testing.expect(model[next_id] == null);
@@ -2386,7 +2386,7 @@ test "overflow values: every size round-trips through get, cursor and a reopen; 
         try db.put("small", "x");
         try testing.expectEqual(format.format_v2, db.meta_rec.version);
         var txn = try db.begin();
-        for (vals, 0..) |v, i| try txn.put(try std.fmt.allocPrint(a, "k{d}", .{i}), v);
+        for (vals, 0..) |v, i| try txn.put(try a.print("k{d}", .{i}), v);
         try txn.commit();
         try testing.expectEqual(format.format_v3, db.meta_rec.version);
         _ = try checkTreeShape(&db);
@@ -2396,7 +2396,7 @@ test "overflow values: every size round-trips through get, cursor and a reopen; 
     defer db.close();
     try testing.expectEqual(format.format_v3, db.meta_rec.version);
     for (vals, 0..) |v, i| {
-        const got = (try db.get(testing.allocator, try std.fmt.allocPrint(a, "k{d}", .{i}))).?;
+        const got = (try db.get(testing.allocator, try a.print("k{d}", .{i}))).?;
         defer testing.allocator.free(got);
         try testing.expectEqualSlices(u8, v, got);
     }
@@ -3135,7 +3135,7 @@ test "copyTo at every size from empty to three branch levels: no underfull node,
         defer db.close();
         if (n > 0) {
             var txn = try db.begin();
-            for (0..n) |id| try txn.put(fatKey(&kb, id), std.fmt.bufPrint(&vb, "{d}", .{id}) catch unreachable);
+            for (0..n) |id| try txn.put(fatKey(&kb, id), std.mem.print(&vb, "{d}", .{id}) catch unreachable);
             try txn.commit();
         }
         try db.copyTo(sim.storage(), "c.kvt");
@@ -3369,7 +3369,7 @@ test "buckets: deleting one frees every page of it, and a snapshot taken before 
         const a = try txn.createBucket("a");
         const x = try a.createBucket("x");
         for (0..2000) |i| {
-            const k = try std.fmt.bufPrint(&kb, "key{d:0>6}", .{i});
+            const k = try std.mem.print(&kb, "key{d:0>6}", .{i});
             try a.put(k, if (i % 100 == 0) &big else "value-0123456789");
             if (i % 4 == 0) try x.put(k, "nested");
         }
@@ -3386,12 +3386,12 @@ test "buckets: deleting one frees every page of it, and a snapshot taken before 
         try txn.commit();
     }
     // A few more commits: they may recycle only what the snapshot cannot reach.
-    for (0..5) |i| try db.put(try std.fmt.bufPrint(&kb, "more{d}", .{i}), &big);
+    for (0..5) |i| try db.put(try std.mem.print(&kb, "more{d}", .{i}), &big);
     const after = try checkTreeShape(&db);
     try testing.expectEqual(@as(usize, 0), after.buckets);
     const oa = (try old.bucket("a")).?;
     for (0..2000) |i| {
-        const k = try std.fmt.bufPrint(&kb, "key{d:0>6}", .{i});
+        const k = try std.mem.print(&kb, "key{d:0>6}", .{i});
         const got = (try oa.get(testing.allocator, k)).?;
         defer testing.allocator.free(got);
         try testing.expectEqual(@as(usize, if (i % 100 == 0) big.len else 16), got.len);
@@ -3400,7 +3400,7 @@ test "buckets: deleting one frees every page of it, and a snapshot taken before 
     old.release();
     // With the snapshot gone, the bucket's pages are reused: the file stops growing.
     const hw = db.meta_rec.high_water;
-    for (0..5) |i| try db.put(try std.fmt.bufPrint(&kb, "again{d}", .{i}), &big);
+    for (0..5) |i| try db.put(try std.mem.print(&kb, "again{d}", .{i}), &big);
     try testing.expectEqual(hw, db.meta_rec.high_water);
     _ = try checkTreeShape(&db);
 }
@@ -3416,13 +3416,13 @@ test "buckets: copyTo carries them, nested and with overflow values, compactly" 
     var kb: [16]u8 = undefined;
     {
         var txn = try db.begin();
-        for (0..300) |i| try txn.put(try std.fmt.bufPrint(&kb, "r{d:0>5}", .{i}), "root-value");
+        for (0..300) |i| try txn.put(try std.mem.print(&kb, "r{d:0>5}", .{i}), "root-value");
         const a = try txn.createBucket("m-bucket");
         _ = try a.nextSequence();
         const x = try a.createBucket("x");
         _ = try txn.createBucket("empty");
         for (0..700) |i| {
-            const k = try std.fmt.bufPrint(&kb, "k{d:0>5}", .{i});
+            const k = try std.mem.print(&kb, "k{d:0>5}", .{i});
             try a.put(k, if (i % 50 == 0) &big else "in-a");
             try x.put(k, "in-x");
         }
@@ -3536,8 +3536,8 @@ test "buckets: random transactions over two levels of buckets agree with a neste
             const depth = r.uintLessThan(u8, 3);
             const n1 = names[r.uintLessThan(usize, names.len)];
             const n2 = inner[r.uintLessThan(usize, inner.len)];
-            const key = try std.fmt.bufPrint(&kb, "k{d:0>2}", .{r.uintLessThan(u8, 40)});
-            const val: []const u8 = if (r.uintLessThan(u8, 20) == 0) &big else try std.fmt.allocPrint(a, "v{d}", .{r.int(u16)});
+            const key = try std.mem.print(&kb, "k{d:0>2}", .{r.uintLessThan(u8, 40)});
+            const val: []const u8 = if (r.uintLessThan(u8, 20) == 0) &big else try a.print("v{d}", .{r.int(u16)});
             const op = r.uintLessThan(u8, 10);
             if (depth == 0) {
                 if (op < 6) {

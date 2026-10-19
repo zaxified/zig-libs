@@ -148,7 +148,7 @@ pub fn fuzzGolden(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     // The hex form of the same golden decides the same way.
     const ehex = try gpa.alloc(u8, 2 * expected.len);
     defer gpa.free(ehex);
-    for (expected, 0..) |b, i| _ = std.fmt.bufPrint(ehex[2 * i ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+    for (expected, 0..) |b, i| _ = std.mem.print(ehex[2 * i ..][0..2], "{x:0>2}", .{b}) catch unreachable;
     if (equal) try golden.hexVerdict(ehex, actual) else try testing.expectError(error.TestExpectedEqual, golden.hexVerdict(ehex, actual));
 
     // render, against a string built the obvious way, at the difference and

@@ -124,7 +124,7 @@ pub fn shape(a: std.mem.Allocator, bytes: []const u8, spec: ShapeSpec) Error!Dat
 const KeyRef = struct { key: []const u8, segs: ?[]const Seg };
 
 fn keyRef(a: std.mem.Allocator, key: []const u8) Error!KeyRef {
-    const is_path = std.mem.indexOfAny(u8, key, ".[") != null;
+    const is_path = std.mem.findAny(u8, key, ".[") != null;
     return .{ .key = key, .segs = if (is_path) try parsePath(a, key) else null };
 }
 
@@ -169,7 +169,7 @@ fn shapeXY(a: std.mem.Allocator, root: std.json.Value, items: []const std.json.V
         row[0] = if (xv) |v|
             try jsonToValue(a, v, .text)
         else
-            .{ .text = try std.fmt.allocPrint(a, "{d}", .{ri}) };
+            .{ .text = try a.print("{d}", .{ri}) };
         row[1] = if (yv) |v| try jsonToValue(a, v, .float) else .null;
         rows[ri] = row;
     }
@@ -311,7 +311,7 @@ fn isLegacyPath(path: []const u8) bool {
     for (path) |c| {
         if (c == '[' or c == '*' or c == '?') return false;
     }
-    if (std.mem.indexOf(u8, path, "..") != null) return false;
+    if (std.mem.find(u8, path, "..") != null) return false;
     return true;
 }
 
@@ -978,8 +978,8 @@ fn jsonToValue(a: std.mem.Allocator, jv: std.json.Value, want: ColumnType) Error
         .text, .date => switch (jv) {
             .string => |s| .{ .text = s }, // borrows arena-backed parse tree
             .number_string => |s| .{ .text = s },
-            .integer => |i| .{ .text = try std.fmt.allocPrint(a, "{d}", .{i}) },
-            .float => |f| .{ .text = try std.fmt.allocPrint(a, "{d}", .{f}) },
+            .integer => |i| .{ .text = try a.print("{d}", .{i}) },
+            .float => |f| .{ .text = try a.print("{d}", .{f}) },
             .bool => |b| .{ .text = if (b) "true" else "false" },
             else => .null,
         },
@@ -1423,7 +1423,7 @@ test "shape: the x column honours its declared .text type on every branch" {
         // happened to come from an object.
         const got = row[0].asText() orelse return error.XColumnNotText;
         var buf: [8]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "{d}", .{i}), got);
+        try testing.expectEqualStrings(try std.mem.print(&buf, "{d}", .{i}), got);
     }
 }
 
@@ -1775,7 +1775,7 @@ test "RFC 9535 Table 11: comparison semantics, Nothing included" {
         .{ "true > true", false },
     };
     for (table) |row| {
-        const path = try std.fmt.allocPrint(a, "$.one[?{s}]", .{row[0]});
+        const path = try a.print("$.one[?{s}]", .{row[0]});
         try expectNodes(a, doc, path, if (row[1]) "[0]" else "[]");
     }
     // Numbers compare by value across integer/float spellings; two integers
@@ -1826,7 +1826,7 @@ test "RFC 9535 §2.4: length / count / value functions" {
         .{ "value($.absent) == $.absent", true },
     };
     for (table) |row| {
-        const path = try std.fmt.allocPrint(a, "$.one[?{s}]", .{row[0]});
+        const path = try a.print("$.one[?{s}]", .{row[0]});
         try expectNodes(a, doc, path, if (row[1]) "[0]" else "[]");
     }
 }

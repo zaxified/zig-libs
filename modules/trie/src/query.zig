@@ -913,7 +913,7 @@ test "topN: budget exhaustion is reported as truncated" {
     var kbuf: [16]u8 = undefined;
     var i: u32 = 0;
     while (i < 500) : (i += 1) {
-        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>6}", .{i});
+        const k = try std.mem.print(&kbuf, "k{d:0>6}", .{i});
         try b.insert(k, i);
     }
     const buf = try b.freeze(testing.allocator);

@@ -219,7 +219,7 @@ fn guarded(methods: []const http.Method, m: http.Method) bool {
 fn queryValue(query: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, query, '&');
     while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, pair, '=') orelse continue;
         if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
     }
     return null;
@@ -314,10 +314,10 @@ test "Csrf.issue: the token Set-Cookie survives issue's dead frame" {
     var want: [token_hex_len]u8 = undefined;
     const expect_tok = c.token("sess-dead-frame", &want);
     var expect_line_buf: [256]u8 = undefined;
-    const expect_line = std.fmt.bufPrint(&expect_line_buf, "Set-Cookie: csrf_token={s}; Path=/; Secure; SameSite=Lax\r\n", .{expect_tok}) catch unreachable;
-    try testing.expect(std.mem.indexOf(u8, wire, expect_line) != null);
+    const expect_line = std.mem.print(&expect_line_buf, "Set-Cookie: csrf_token={s}; Path=/; Secure; SameSite=Lax\r\n", .{expect_tok}) catch unreachable;
+    try testing.expect(std.mem.find(u8, wire, expect_line) != null);
     // …and not one byte of the clobber pattern anywhere on it.
-    try testing.expect(std.mem.indexOf(u8, wire, "#") == null);
+    try testing.expect(std.mem.find(u8, wire, "#") == null);
 }
 
 test "different keys produce different (non-cross-verifying) tokens" {
@@ -360,7 +360,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -389,7 +389,7 @@ test "middleware: safe GET passes and issues a JS-readable token cookie" {
     const sc = headerValue(got, "Set-Cookie").?;
     try testing.expect(std.mem.startsWith(u8, sc, "csrf_token="));
     // JS must read it → NOT HttpOnly.
-    try testing.expect(std.mem.indexOf(u8, sc, "HttpOnly") == null);
+    try testing.expect(std.mem.find(u8, sc, "HttpOnly") == null);
     // The issued token verifies for that session.
     var buf: [token_hex_len]u8 = undefined;
     try testing.expect(c.verify("abc123", c.token("abc123", &buf)));
@@ -424,7 +424,7 @@ test "middleware: unsafe POST is 403 without a token, passes with the right one"
     // Compute the valid token, present it in the header → 200.
     var buf: [token_hex_len]u8 = undefined;
     const tok = c.token("sess1", &buf);
-    const req = std.fmt.allocPrint(testing.allocator, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok}) catch unreachable;
+    const req = testing.allocator.print("POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok}) catch unreachable;
     defer testing.allocator.free(req);
     var out2: [4096]u8 = undefined;
     const ok = runWire(&r, req, &out2);
@@ -441,7 +441,7 @@ test "middleware: a token from another session is rejected on POST (403)" {
     // Token minted for "other", presented on a request whose session is "mine".
     var buf: [token_hex_len]u8 = undefined;
     const tok_other = c.token("other", &buf);
-    const req = std.fmt.allocPrint(testing.allocator, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=mine\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok_other}) catch unreachable;
+    const req = testing.allocator.print("POST / HTTP/1.1\r\nHost: t\r\nCookie: session=mine\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok_other}) catch unreachable;
     defer testing.allocator.free(req);
     var out: [4096]u8 = undefined;
     try expectStatus(runWire(&r, req, &out), "403");
@@ -456,7 +456,7 @@ test "middleware: query-parameter fallback token is accepted" {
 
     var buf: [token_hex_len]u8 = undefined;
     const tok = c.token("qs", &buf);
-    const req = std.fmt.allocPrint(testing.allocator, "POST /submit?csrf_token={s} HTTP/1.1\r\nHost: t\r\nCookie: session=qs\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok}) catch unreachable;
+    const req = testing.allocator.print("POST /submit?csrf_token={s} HTTP/1.1\r\nHost: t\r\nCookie: session=qs\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok}) catch unreachable;
     defer testing.allocator.free(req);
     var out: [4096]u8 = undefined;
     try expectStatus(runWire(&r, req, &out), "200");
@@ -519,7 +519,7 @@ test "Csrf.check: false on missing cookie, false on wrong token, true on the rig
     const tok = c.token("sess1", &buf);
 
     // A valid-looking token but no session cookie at all -> false.
-    const req1 = try std.fmt.allocPrint(testing.allocator, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
+    const req1 = try testing.allocator.print("GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
     defer testing.allocator.free(req1);
     var out1: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, runWire(&r, req1, &out1), "false"));
@@ -530,7 +530,7 @@ test "Csrf.check: false on missing cookie, false on wrong token, true on the rig
     try testing.expect(std.mem.endsWith(u8, wrong_token, "false"));
 
     // Session cookie + the matching token -> true.
-    const req3 = try std.fmt.allocPrint(testing.allocator, "GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
+    const req3 = try testing.allocator.print("GET /c HTTP/1.1\r\nHost: t\r\nCookie: session=sess1\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok});
     defer testing.allocator.free(req3);
     var out3: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, runWire(&r, req3, &out3), "true"));
@@ -557,7 +557,7 @@ test "middleware and Csrf.check agree: a request the middleware lets through als
 
     var buf: [token_hex_len]u8 = undefined;
     const tok = c.token("sess-agree", &buf);
-    const req = try std.fmt.allocPrint(testing.allocator, "POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess-agree\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok});
+    const req = try testing.allocator.print("POST / HTTP/1.1\r\nHost: t\r\nCookie: session=sess-agree\r\nX-CSRF-Token: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{tok});
     defer testing.allocator.free(req);
     var out: [4096]u8 = undefined;
     const got = runWire(&r, req, &out);
@@ -596,7 +596,7 @@ test "verify: a non-hex character that decodes to the right nibble is still reje
     var buf: [token_hex_len]u8 = undefined;
     const at = while (true) : (key[0] +%= 1) {
         const tok = (Csrf{ .key = key }).token("sid", &buf);
-        if (std.mem.indexOfScalar(u8, tok, '0')) |i| break i;
+        if (std.mem.findScalar(u8, tok, '0')) |i| break i;
     };
     const c = Csrf{ .key = key };
     try testing.expect(c.verify("sid", &buf)); // control
@@ -651,7 +651,7 @@ test "Csrf.check: no session cookie is false even with the token an empty sessio
     r.state = @constCast(&c);
     try r.get("/c", hReportCheck);
     var req_buf: [512]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok_for_empty});
+    const req = try std.mem.print(&req_buf, "GET /c HTTP/1.1\r\nHost: t\r\nX-CSRF-Token: {s}\r\nConnection: close\r\n\r\n", .{tok_for_empty});
     var out: [4096]u8 = undefined;
     try testing.expect(std.mem.endsWith(u8, runWire(&r, req, &out), "false"));
 }

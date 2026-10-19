@@ -54,7 +54,7 @@ fn hokConfirmation(alloc: std.mem.Allocator, cert_der: []const u8, with_data_att
         " NotOnOrAfter=\"2024-06-01T12:05:00Z\" Recipient=\"https://sp.example.org/acs\" InResponseTo=\"req-9988776655\""
     else
         "";
-    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData{s}>" ++
+    return alloc.print("<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData{s}>" ++
         "<ds:KeyInfo xmlns:ds=\"{s}\"><ds:X509Data>" ++
         "<ds:X509Certificate>{s}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>" ++
         "</saml:SubjectConfirmationData></saml:SubjectConfirmation>", .{ hok_method, data_attrs, ds_ns_decl, cert_b64 });
@@ -73,7 +73,7 @@ fn baseConfig(idp_key: @import("xmldsig").VerifyKey) saml.Config {
 
 /// Mint a signed Response whose Subject carries `confirmation`.
 fn mintResponse(alloc: std.mem.Allocator, confirmation: []const u8) !sign.Signed {
-    const after_issuer = try std.fmt.allocPrint(alloc, "<saml:Subject>{s}{s}</saml:Subject>{s}", .{ nameid, confirmation, conditions });
+    const after_issuer = try alloc.print("<saml:Subject>{s}{s}</saml:Subject>{s}", .{ nameid, confirmation, conditions });
     defer alloc.free(after_issuer);
     var signed = try sign.signAssertion(alloc, 0x40C0DE, fx.idp_entity_id, "_hok01", "2024-06-01T12:00:00Z", after_issuer);
     errdefer signed.deinit(alloc);

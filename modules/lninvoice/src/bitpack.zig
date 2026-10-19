@@ -371,7 +371,7 @@ test "BOLT#11 `9` field: every data_length that occurs in the spec's own example
         errdefer std.debug.print("failing row: {s}\n", .{row.source});
 
         var quintets: [32]u5 = undefined;
-        for (row.data, 0..) |c, i| quintets[i] = @intCast(std.mem.indexOfScalar(u8, CHARSET, c).?);
+        for (row.data, 0..) |c, i| quintets[i] = @intCast(std.mem.findScalar(u8, CHARSET, c).?);
         const q = quintets[0..row.data.len];
 
         // `data_length` follows from the writer rule alone ("the minimum

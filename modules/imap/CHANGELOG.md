@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `dupeDeep` iterates `field_names`/`field_types` (0.17 `@typeInfo`).
 - **2026-10-10** — tests: deterministic fuzz driver `IMAP_FUZZ` over the existing harnesses (utf7 decode, command builders, SEARCH and FETCH encoders with CR/LF/NUL/quote bytes injected, response reader); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 38 of 40 killed, 2 equivalent; 8 tests added

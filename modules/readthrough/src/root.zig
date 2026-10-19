@@ -1274,7 +1274,7 @@ test "max_entries bounds the store" {
 
     var buf: [8]u8 = undefined;
     for (0..8) |i| {
-        const k = std.fmt.bufPrint(&buf, "key{d}", .{i}) catch unreachable;
+        const k = std.mem.print(&buf, "key{d}", .{i}) catch unreachable;
         try testing.expect((try c.get(k)) == .missing);
         try testing.expect(c.store.stats.entries <= 2);
     }

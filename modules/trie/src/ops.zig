@@ -353,8 +353,8 @@ test "the budget is shared by all inputs and reported" {
     const pa = try arena.alloc(builder.Pair, 300);
     const pb = try arena.alloc(builder.Pair, 300);
     for (0..300) |i| {
-        pa[i] = .{ .key = try std.fmt.allocPrint(arena, "k{d:0>5}", .{i * 2}), .value = @intCast(i) };
-        pb[i] = .{ .key = try std.fmt.allocPrint(arena, "k{d:0>5}", .{i * 2 + 1}), .value = @intCast(i) };
+        pa[i] = .{ .key = try arena.print("k{d:0>5}", .{i * 2}), .value = @intCast(i) };
+        pb[i] = .{ .key = try arena.print("k{d:0>5}", .{i * 2 + 1}), .value = @intCast(i) };
     }
     const ba = try buildSet(pa, .{ .v2 = .{} });
     defer testing.allocator.free(ba);

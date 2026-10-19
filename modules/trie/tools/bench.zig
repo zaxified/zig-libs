@@ -127,7 +127,7 @@ fn setup(arena: std.mem.Allocator) !Data {
         for (0..8) |j| try k.append(arena, 'a' + @as(u8, @intCast(((r >> @intCast(8 * j)) & 0xff) % 26)));
         try k.append(arena, '/');
         var nb: [8]u8 = undefined;
-        try k.appendSlice(arena, std.fmt.bufPrint(&nb, "{d}", .{rng.next() % 10_000}) catch unreachable);
+        try k.appendSlice(arena, std.mem.print(&nb, "{d}", .{rng.next() % 10_000}) catch unreachable);
         slot.* = k.items;
     }
     std.mem.sort([]const u8, raw, {}, lessThan);
@@ -280,7 +280,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: Side = .{};

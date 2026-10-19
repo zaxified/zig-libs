@@ -105,7 +105,7 @@ fn once(d: *const Data, w: usize) u64 {
     var buf: [4096]u8 = undefined;
     var disc: std.Io.Writer.Discarding = .init(&buf);
     const deflating = std.mem.endsWith(u8, names[w], "_deflate");
-    const opcode: frame.Opcode = if (std.mem.indexOf(u8, names[w], "binary") != null) .binary else .text;
+    const opcode: frame.Opcode = if (std.mem.find(u8, names[w], "binary") != null) .binary else .text;
     for (d.payloads[w]) |p| {
         if (deflating) {
             if (d.compressor.compressMessage(p, d.comp_out, 1)) |z| {
@@ -146,16 +146,16 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     var max_wire: usize = 0;
     for (names, 0..) |name, wi| {
         var msgs: std.ArrayList([]const u8) = .empty;
-        const n: usize, const len: usize = if (std.mem.indexOf(u8, name, "small") != null)
+        const n: usize, const len: usize = if (std.mem.find(u8, name, "small") != null)
             .{ 16, 64 }
-        else if (std.mem.indexOf(u8, name, "fragmented") != null)
+        else if (std.mem.find(u8, name, "fragmented") != null)
             .{ 4, 4096 }
-        else if (std.mem.indexOf(u8, name, "64k") != null)
+        else if (std.mem.find(u8, name, "64k") != null)
             .{ 4, 64 * 1024 }
         else
             .{ 16, 2048 };
         for (0..n) |_| {
-            const p = if (std.mem.indexOf(u8, name, "binary") != null) blk: {
+            const p = if (std.mem.find(u8, name, "binary") != null) blk: {
                 const b = try arena.alloc(u8, len);
                 for (b) |*x| x.* = 1 + r.uintLessThan(u8, 255); // no 0x00: the write files are \x00-separated
                 break :blk b;
@@ -166,12 +166,12 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         d.msgs[wi] = n;
         var all: std.Io.Writer.Allocating = .init(arena);
         if (isRead(wi)) {
-            const opcode: frame.Opcode = if (std.mem.indexOf(u8, name, "binary") != null) .binary else .text;
+            const opcode: frame.Opcode = if (std.mem.find(u8, name, "binary") != null) .binary else .text;
             for (msgs.items) |p| {
                 if (std.mem.endsWith(u8, name, "_deflate")) {
                     const z = d.compressor.compressMessage(p, d.comp_out, 1).?;
                     try frame.writeFrame(&all.writer, .{ .opcode = opcode, .payload = z, .mask_key = mask_key, .compressed = true });
-                } else if (std.mem.indexOf(u8, name, "fragmented") != null) {
+                } else if (std.mem.find(u8, name, "fragmented") != null) {
                     const q = p.len / 4;
                     for (0..4) |k| try frame.writeFrame(&all.writer, .{
                         .fin = k == 3,
@@ -183,7 +183,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
             }
             d.wires[wi] = all.written();
             max_wire = @max(max_wire, all.written().len);
-            try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.count", .{name}), .data = try std.fmt.allocPrint(arena, "{d}\n", .{n}) });
+            try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.count", .{name}), .data = try arena.print("{d}\n", .{n}) });
         } else {
             for (msgs.items, 0..) |p, i| {
                 if (i != 0) try all.writer.writeByte(0);
@@ -191,7 +191,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
             }
             d.wires[wi] = "";
         }
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = all.written() });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.wire", .{name}), .data = all.written() });
     }
     d.scratch = try arena.alloc(u8, max_wire);
     return d;
@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

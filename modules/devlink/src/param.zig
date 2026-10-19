@@ -308,7 +308,7 @@ pub fn appendGetByName(
 
 fn appendName(gpa: std.mem.Allocator, list: *std.ArrayList(u8), param_name: []const u8) BuildError!void {
     if (param_name.len == 0 or param_name.len > uapi.name_max) return error.InvalidRequest;
-    if (std.mem.indexOfScalar(u8, param_name, 0) != null) return error.InvalidRequest;
+    if (std.mem.findScalar(u8, param_name, 0) != null) return error.InvalidRequest;
     codec.appendAttrString(gpa, list, uapi.ATTR.PARAM_NAME, param_name) catch |e| switch (e) {
         error.AttrTooLong => return error.InvalidRequest,
         error.OutOfMemory => return error.OutOfMemory,

@@ -292,8 +292,8 @@ const Ref = struct {
             .io = io,
             .driver = driver,
             .scratch = scratch,
-            .in_path = try std.fmt.allocPrint(gpa, "{s}/in.txt", .{scratch}),
-            .out_path = try std.fmt.allocPrint(gpa, "{s}/out.txt", .{scratch}),
+            .in_path = try gpa.print("{s}/in.txt", .{scratch}),
+            .out_path = try gpa.print("{s}/out.txt", .{scratch}),
         };
     }
 

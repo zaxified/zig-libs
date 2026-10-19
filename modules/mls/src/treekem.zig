@@ -314,7 +314,7 @@ fn originalSiblingTreeHash(
         };
         var keep: usize = 0;
         for (p.unmerged_leaves) |ul| {
-            if (std.mem.indexOfScalar(u32, exclude, ul) == null) keep += 1;
+            if (std.mem.findScalar(u32, exclude, ul) == null) keep += 1;
         }
         if (keep == p.unmerged_leaves.len) continue;
         const filtered = try allocator.alloc(u32, keep);
@@ -324,7 +324,7 @@ fn originalSiblingTreeHash(
         };
         var w: usize = 0;
         for (p.unmerged_leaves) |ul| {
-            if (std.mem.indexOfScalar(u32, exclude, ul) == null) {
+            if (std.mem.findScalar(u32, exclude, ul) == null) {
                 filtered[w] = ul;
                 w += 1;
             }

@@ -879,7 +879,7 @@ test "keys land in every shard, not all in one" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 512) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "v", 0, 0, 0);
     }
     var idx: usize = 0;
@@ -901,7 +901,7 @@ test "aggregate occupancy reaches the requested cap when the keys spread evenly"
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 2000) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable;
         sc.put(key, "v", 0, 0, 0);
     }
     const st = sc.stats();
@@ -975,7 +975,7 @@ test "the shard seed: pinned base, distinct from the sketch's, freshly derived p
     var differ: usize = 0;
     var i: usize = 0;
     while (i < 256) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         if (a.shardIndex(key) != b.shardIndex(key)) differ += 1;
     }
     try testing.expect(differ > 128); // two independent seeds over 8 shards: ~7/8
@@ -989,7 +989,7 @@ test "the shard seed: pinned base, distinct from the sketch's, freshly derived p
     try testing.expectEqual(@as(u64, 0xDEADBEEF), x.seed);
     i = 0;
     while (i < 256) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         try testing.expectEqual(x.shardIndex(key), y.shardIndex(key));
     }
 }
@@ -1011,7 +1011,7 @@ test "a waiter on a held shard lock yields the CPU instead of spinning a core" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     const key = while (i < 10_000) : (i += 1) {
-        const k = std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable;
+        const k = std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable;
         if (sc.shardIndex(k) == 0) break k;
     } else {
         s.lock.unlock();
@@ -1049,7 +1049,7 @@ test "clear empties every shard" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 512) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "value", 0, 0, 0);
     }
     sc.clear();
@@ -1071,7 +1071,7 @@ test "stats sums every shard: aggregate equals the sum of the per-shard readings
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 300) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "vv", 0, 0, 0);
         var buf: [8]u8 = undefined;
         _ = sc.getBuf(key, 1, 0, &buf); // 300 hits
@@ -1106,7 +1106,7 @@ test "stats() aggregates EVERY Stats field, pinned included" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 64) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "vv", 0, 0, 0);
         var buf: [8]u8 = undefined;
         _ = sc.getBuf(key, 1, 0, &buf);
@@ -1208,7 +1208,7 @@ test "the per-shard ceiling and the aggregate cap hold on the REPLACE path, unde
     for (rounds) |vlen| {
         var i: usize = 0;
         while (i < 32) : (i += 1) {
-            const key = std.fmt.bufPrint(&kbuf, "s{d}", .{i}) catch unreachable;
+            const key = std.mem.print(&kbuf, "s{d}", .{i}) catch unreachable;
             now += 1;
             sc.put(key, val[0..vlen], now, 0, 0);
         }
@@ -1227,7 +1227,7 @@ test "dirty bit and markClean work through the shard, across many keys" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 64) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "v", 0, 0, 0);
         try testing.expect(sc.isDirty(key));
         try testing.expect(sc.markClean(key));
@@ -1283,7 +1283,7 @@ test "drainDirty sweeps dirty entries in every shard and skips clean ones" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 128) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "v", 0, 0, 0);
         if (i % 2 == 0) try testing.expect(sc.markClean(key)); // half are clean
     }
@@ -1292,7 +1292,7 @@ test "drainDirty sweeps dirty entries in every shard and skips clean ones" {
     try testing.expectEqual(@as(usize, 64), col.len);
     i = 0;
     while (i < 128) : (i += 1) {
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         try testing.expectEqual(i % 2 == 1, col.has(key));
     }
 }
@@ -1425,7 +1425,7 @@ test "on_evict fires per shard for eviction, replacement and clear" {
     var kbuf: [16]u8 = undefined;
     var i: usize = 0;
     while (i < 400) : (i += 1) { // force capacity eviction in every shard
-        const key = std.fmt.bufPrint(&kbuf, "key{d}", .{i}) catch unreachable;
+        const key = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
         sc.put(key, "v", 0, 0, 0);
     }
     try testing.expect(sink.evicted.load(.monotonic) > 0);
@@ -1476,7 +1476,7 @@ fn checkStressValue(v: []const u8, id: u16) bool {
 }
 
 fn stressKey(buf: *[16]u8, id: u16) []const u8 {
-    return std.fmt.bufPrint(buf, stress_key_prefix ++ "{d}", .{id}) catch unreachable;
+    return std.mem.print(buf, stress_key_prefix ++ "{d}", .{id}) catch unreachable;
 }
 
 const StressWorker = struct {
@@ -1799,9 +1799,9 @@ test "stats() sums admissions, rejections, expired and evictions too -- with non
         state = state *% 6364136223846793005 +% 1442695040888963407;
         const r = state >> 33;
         const key = if (r % 3 == 0)
-            std.fmt.bufPrint(&kbuf, "hot{d}", .{r % 4}) catch unreachable
+            std.mem.print(&kbuf, "hot{d}", .{r % 4}) catch unreachable
         else
-            std.fmt.bufPrint(&kbuf, "cold{d}", .{@rem(i, 97)}) catch unreachable;
+            std.mem.print(&kbuf, "cold{d}", .{@rem(i, 97)}) catch unreachable;
         const now = i * 10;
         sc.put(key, "vv", now, if (@rem(i, 7) == 0) 30 else 0, 0);
         var buf: [8]u8 = undefined;

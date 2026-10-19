@@ -436,7 +436,7 @@ test "non-printable bytes in a header field become '-'" {
     };
     var buf: [64]u8 = undefined;
     const out = try bufPrint(&msg, &buf);
-    try t.expect(std.mem.indexOf(u8, out, "a-b-c ") != null);
+    try t.expect(std.mem.find(u8, out, "a-b-c ") != null);
 }
 
 test "decompose rejects out-of-range timestamps instead of panicking" {

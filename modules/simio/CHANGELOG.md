@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC notes on `socketpair` and Unix datagram sockets re-checked against the 0.17.0 std (unchanged).
 
 - **2026-10-18** — Ported to Zig 0.17.0. Socket stream I/O moved into `vtable.operate` (`net_send`, `net_read`, `net_write`; 0.17 removed the `netSend`/`netRead`/`netWrite` slots) and `netClose` takes `[]const net.Socket`. **Consumer-visible:** a stream read that hits the simulated connection timeout now fails with `error.ConnectionTimedOut` (std's `NetRead.Error` has no `Timeout`; matches Linux ETIMEDOUT); connect and `receiveTimeout` still report `error.Timeout`.

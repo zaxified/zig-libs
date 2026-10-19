@@ -91,11 +91,11 @@ pub fn readFileList(env: Env, arena: std.mem.Allocator, name: []const u8) ?[]con
     var lines: Names = .empty;
     var rest = bytes;
     while (rest.len > 0) {
-        const nl = std.mem.indexOfScalar(u8, rest, '\n');
+        const nl = std.mem.findScalar(u8, rest, '\n');
         const end = nl orelse rest.len;
         // `strlen`: a line holding a NUL ends there
         const line = rest[0..end];
-        const cut = std.mem.indexOfScalar(u8, line, 0) orelse line.len;
+        const cut = std.mem.findScalar(u8, line, 0) orelse line.len;
         lines.append(arena, line[0..cut]) catch oom();
         rest = if (nl) |i| rest[i + 1 ..] else rest[rest.len..];
     }
@@ -108,7 +108,7 @@ pub fn readFileList(env: Env, arena: std.mem.Allocator, name: []const u8) ?[]con
 /// `pathnameHas2Dots`: a whole `..` path component.
 fn hasDotDot(path: []const u8) bool {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, path, i, "..")) |p| : (i = p + 1) {
+    while (std.mem.findPos(u8, path, i, "..")) |p| : (i = p + 1) {
         if ((p == 0 or path[p - 1] == '/') and (p + 2 == path.len or path[p + 2] == '/')) return true;
     }
     return false;
@@ -131,7 +131,7 @@ fn join2Dir(arena: std.mem.Allocator, dir1: []const u8, dir2: []const u8) []cons
 /// never runs, so `a/b/` gives `a/b`, as here.
 fn dirName(path: []const u8) []const u8 {
     if (path.len == 0) return path;
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return ".";
+    const slash = std.mem.findScalarLast(u8, path, '/') orelse return ".";
     return path[0..slash];
 }
 
@@ -179,7 +179,7 @@ fn mirrorSrcDirRecursive(env: Env, arena: std.mem.Allocator, src_dir: []const u8
     // `trimLeadingCurrentDir`: the walk starts after a leading `./`, the
     // names cut from `src_dir` keep it
     var i: usize = if (std.mem.startsWith(u8, src_dir, "./")) 2 else 0;
-    while (std.mem.indexOfScalarPos(u8, src_dir, i, '/')) |sp| : (i = sp + 1) {
+    while (std.mem.findScalarPos(u8, src_dir, i, '/')) |sp| : (i = sp + 1) {
         if (sp != i and !mirrorSrcDir(env, arena, src_dir[0..sp], out_dir)) return;
     }
     _ = mirrorSrcDir(env, arena, src_dir, out_dir);

@@ -68,7 +68,7 @@ test "present: the record the publisher gets, value as RFC 8555 §8.4 computes i
     // separate `jws.dns01TxtValue` path, not the solver's.
     const token = "evaGxfADs6pSRb2LAv9IZf17Dt3juxGJ-PCt92wr-oA";
     var ka_buf: [acme.jws.max_key_authorization_len]u8 = undefined;
-    const ka = try std.fmt.bufPrint(&ka_buf, "{s}.{s}", .{ token, "nP1qzpXGymHBrUEepNY9HCsQk7K8KhOypzEt62jcerQ" });
+    const ka = try std.mem.print(&ka_buf, "{s}.{s}", .{ token, "nP1qzpXGymHBrUEepNY9HCsQk7K8KhOypzEt62jcerQ" });
     try s.present("Example.org", token, ka);
 
     const rec = f.last.?;

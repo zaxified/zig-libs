@@ -295,7 +295,7 @@ pub fn init(io: std.Io, gpa: Allocator, options: Options) Manager {
     if (options.node_id) |id| {
         // A configuration error, not input: a truncated id could collide
         // with another node's and defeat the (re-entrant) issuance lock.
-        if (id.len == 0 or id.len > m.node_id_buf.len or !storage_mod.validKey(id) or std.mem.indexOfScalar(u8, id, '/') != null)
+        if (id.len == 0 or id.len > m.node_id_buf.len or !storage_mod.validKey(id) or std.mem.findScalar(u8, id, '/') != null)
             @panic("acme.Manager: Options.node_id must be 1..32 of [A-Za-z0-9._@+-]");
         @memcpy(m.node_id_buf[0..id.len], id);
         m.node_id_len = @intCast(id.len);
@@ -602,7 +602,7 @@ fn obtain(m: *Manager, e: *Entry, t: i64) void {
     if (m.adoptStored(e, t)) return;
 
     var lock_buf: [storage_mod.max_key_len]u8 = undefined;
-    const lock_name = std.fmt.bufPrint(&lock_buf, "issue/{s}", .{e.stem["certificates/".len..]}) catch unreachable;
+    const lock_name = std.mem.print(&lock_buf, "issue/{s}", .{e.stem["certificates/".len..]}) catch unreachable;
     const locked = m.options.storage.tryLock(lock_name, m.nodeId(), t, m.options.lock_lease_s) catch |err| {
         var d: Diagnostics = .{};
         d.note(@errorName(err));
@@ -656,7 +656,7 @@ const KeyBuf = struct {
 fn keyOf(m: *const Manager, e: *const Entry, ext: []const u8) KeyBuf {
     _ = m;
     var k: KeyBuf = .{};
-    k.len = (std.fmt.bufPrint(&k.buf, "{s}{s}", .{ e.stem, ext }) catch unreachable).len;
+    k.len = (std.mem.print(&k.buf, "{s}{s}", .{ e.stem, ext }) catch unreachable).len;
     return k;
 }
 
@@ -937,10 +937,10 @@ fn copyMaterial(gpa: Allocator, ct: Cert) error{OutOfMemory}!Material {
 /// Exact name, then `*.` + parent (one label only). Lock held.
 fn lookup(m: *Manager, name: []const u8) ?*Entry {
     if (m.by_name.get(name)) |e| return e;
-    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    const dot = std.mem.findScalar(u8, name, '.') orelse return null;
     var buf: [255]u8 = undefined;
     if (name.len - dot + 1 > buf.len) return null;
-    const wild = std.fmt.bufPrint(&buf, "*{s}", .{name[dot..]}) catch return null;
+    const wild = std.mem.print(&buf, "*{s}", .{name[dot..]}) catch return null;
     return m.by_name.get(wild);
 }
 
@@ -959,7 +959,7 @@ pub fn tlsAlpnMaterial(m: *Manager, gpa: Allocator, sni_in: []const u8) error{Ou
     // are hostnames too) costs a storage read.
     if (!x509.isValidDomain(sni)) return null;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return null;
+    const key = std.mem.print(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return null;
     const blob = m.options.storage.load(gpa, key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -1025,7 +1025,7 @@ fn httpRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!voi
         ctx.res.setStatus(400);
         return;
     };
-    const location = std.fmt.bufPrint(&loc_buf, "https://{s}{s}", .{ host, target }) catch {
+    const location = std.mem.print(&loc_buf, "https://{s}{s}", .{ host, target }) catch {
         ctx.res.setStatus(414);
         return;
     };
@@ -1035,10 +1035,10 @@ fn httpRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!voi
 
 fn hostOnly(h: []const u8) []const u8 {
     if (h.len > 0 and h[0] == '[') { // [v6]:port
-        const close = std.mem.indexOfScalar(u8, h, ']') orelse return "";
+        const close = std.mem.findScalar(u8, h, ']') orelse return "";
         return h[0 .. close + 1];
     }
-    const colon = std.mem.lastIndexOfScalar(u8, h, ':') orelse return h;
+    const colon = std.mem.findScalarLast(u8, h, ':') orelse return h;
     return h[0..colon];
 }
 
@@ -1059,7 +1059,7 @@ fn httpKeyAuthorization(m: *Manager, token: []const u8, buf: []u8) error{OutOfMe
     if (m.http_tokens.lookup(token, buf)) |ka| return ka;
     if (!m.options.distributed_challenges) return null;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/http-01/{s}", .{token}) catch return null;
+    const key = std.mem.print(&key_buf, "challenges/http-01/{s}", .{token}) catch return null;
     const v = m.options.storage.load(m.gpa, key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
@@ -1081,7 +1081,7 @@ fn presentHttp01(ctx: ?*anyopaque, req: *const Client.ChallengeRequest) Client.S
     try m.http_tokens.set(req.token, req.key_authorization);
     if (!m.options.distributed_challenges) return;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/http-01/{s}", .{req.token}) catch return error.SolverFailed;
+    const key = std.mem.print(&key_buf, "challenges/http-01/{s}", .{req.token}) catch return error.SolverFailed;
     m.options.storage.store(key, req.key_authorization) catch |err| {
         m.http_tokens.remove(req.token);
         return if (err == error.OutOfMemory) error.OutOfMemory else error.SolverFailed;
@@ -1093,7 +1093,7 @@ fn cleanupHttp01(ctx: ?*anyopaque, req: *const Client.ChallengeRequest) void {
     m.http_tokens.remove(req.token);
     if (!m.options.distributed_challenges) return;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/http-01/{s}", .{req.token}) catch return;
+    const key = std.mem.print(&key_buf, "challenges/http-01/{s}", .{req.token}) catch return;
     m.options.storage.delete(key) catch {};
 }
 
@@ -1114,7 +1114,7 @@ fn presentTlsAlpn01(ctx: ?*anyopaque, req: *const Client.ChallengeRequest) Clien
         m.gpa.free(blob);
     }
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return error.SolverFailed;
+    const key = std.mem.print(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return error.SolverFailed;
     m.options.storage.store(key, blob) catch |err|
         return if (err == error.OutOfMemory) error.OutOfMemory else error.SolverFailed;
 }
@@ -1126,7 +1126,7 @@ fn cleanupTlsAlpn01(ctx: ?*anyopaque, req: *const Client.ChallengeRequest) void 
     m.tls_alpn.remove(sni);
     if (!m.options.distributed_challenges) return;
     var key_buf: [storage_mod.max_key_len]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return;
+    const key = std.mem.print(&key_buf, "challenges/tls-alpn-01/{s}", .{sni}) catch return;
     m.options.storage.delete(key) catch {};
 }
 
@@ -1199,8 +1199,8 @@ fn splitPemChain(arena: Allocator, text: []const u8) CheckError![]const []const 
     var list: std.ArrayList([]const u8) = .empty;
     const end_marker = "-----END CERTIFICATE-----";
     var rest = text;
-    while (std.mem.indexOf(u8, rest, "-----BEGIN CERTIFICATE-----")) |begin| {
-        const end_rel = std.mem.indexOf(u8, rest[begin..], end_marker) orelse return error.MalformedChain;
+    while (std.mem.find(u8, rest, "-----BEGIN CERTIFICATE-----")) |begin| {
+        const end_rel = std.mem.find(u8, rest[begin..], end_marker) orelse return error.MalformedChain;
         const block = rest[begin .. begin + end_rel + end_marker.len];
         const der = x509.pemDecode(arena, "CERTIFICATE", block) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -1266,7 +1266,7 @@ fn rsaPublicEql(a: *const rsa.PublicKey, b: *const rsa.PublicKey) bool {
 
 /// The storage key of an issuer's account key: `accounts/<issuer>/account.key`.
 pub fn accountKeyPath(buf: *[storage_mod.max_key_len]u8, issuer_name: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "accounts/{s}/account.key", .{issuer_name}) catch buf[0..0];
+    return std.mem.print(buf, "accounts/{s}/account.key", .{issuer_name}) catch buf[0..0];
 }
 
 pub const AccountKeyError = error{ OutOfMemory, InvalidKey, StorageFailed, MalformedKey, UnsupportedKeyType };
@@ -1332,7 +1332,7 @@ fn loadAccountKey(out: *jws.AnyKeyPair, gpa: Allocator, store: Storage, path: []
 /// `acme-v02.api.letsencrypt.org-directory`.
 pub fn issuerName(buf: *[128]u8, directory_url: []const u8) []const u8 {
     var s = directory_url;
-    if (std.mem.indexOf(u8, s, "://")) |i| s = s[i + 3 ..];
+    if (std.mem.find(u8, s, "://")) |i| s = s[i + 3 ..];
     s = std.mem.trim(u8, s, "/");
     const n = @min(s.len, buf.len);
     for (s[0..n], buf[0..n]) |ch, *o| o.* = if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-') ch else '-';

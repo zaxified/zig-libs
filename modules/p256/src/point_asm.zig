@@ -73,7 +73,7 @@ fn rebase(comptime text: []const u8, comptime reg: []const u8, comptime off: usi
     const needle = "(%%" ++ reg ++ ")";
     comptime var out: []const u8 = "";
     comptime var i: usize = 0;
-    inline while (std.mem.indexOfPos(u8, text, i, needle)) |at| {
+    inline while (std.mem.findPos(u8, text, i, needle)) |at| {
         comptime var start = at;
         while (start > i and std.ascii.isDigit(text[start - 1])) start -= 1;
         const disp: usize = if (start == at) 0 else std.fmt.parseInt(usize, text[start..at], 10) catch unreachable;

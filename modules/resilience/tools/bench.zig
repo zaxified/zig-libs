@@ -178,7 +178,7 @@ fn buildGo(arena: std.mem.Allocator, io: std.Io, environ: anytype, abs: []const 
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
     try env.put("CGO_ENABLED", "0");
-    const exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
+    const exe = try arena.print("{s}/go_bench", .{abs});
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const build = std.process.run(arena, io, .{
         .argv = &.{ "go", "build", "-o", exe, "." },

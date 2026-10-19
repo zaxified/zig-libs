@@ -68,7 +68,7 @@ pub fn parseCanonicalHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) 
         for (labels, 0..) |*l, i| {
             const v = try ar.alloc(u8, c.ranged(0, 6));
             for (v) |*b| b.* = c.byte();
-            l.* = .{ .name = try std.fmt.allocPrint(ar, "l{d}", .{i}), .value = v };
+            l.* = .{ .name = try ar.print("l{d}", .{i}), .value = v };
         }
         var out: std.ArrayList(u8) = .empty;
         try codec.canonicalize(ar, &out, name, labels);

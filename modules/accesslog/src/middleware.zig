@@ -177,7 +177,7 @@ fn tenantExtra(ctx: *const router.Ctx, out: *[Logger.max_extra]root.Field) []con
 }
 
 fn fmtTime(ns: i64, buf: []u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "T{d}", .{ns}) catch null;
+    return std.mem.print(buf, "T{d}", .{ns}) catch null;
 }
 
 const get_req = "GET /items/7?x=1 HTTP/1.1\r\nHost: t\r\nUser-Agent: probe\r\nX-Req: r-1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -240,7 +240,7 @@ test "Logger: a handler error is re-raised to the server (500) and logged as 500
     var buf: [1024]u8 = undefined;
     const got = runWire(&r, get_req, &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500"));
-    try testing.expect(std.mem.indexOf(u8, sw.buffered(), " status=500 ") != null);
+    try testing.expect(std.mem.find(u8, sw.buffered(), " status=500 ") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sw.buffered(), "\n"));
 }
 
@@ -257,7 +257,7 @@ test "Logger: a clock that runs backwards logs latency as absent, not a wrapped 
 
     var buf: [1024]u8 = undefined;
     _ = runWire(&r, get_req, &buf);
-    try testing.expect(std.mem.indexOf(u8, sw.buffered(), "latency_ns") == null);
+    try testing.expect(std.mem.find(u8, sw.buffered(), "latency_ns") == null);
     try testing.expect(std.mem.startsWith(u8, sw.buffered(), "ts=100 "));
 }
 
@@ -295,7 +295,7 @@ test "Logger: keep decides per request after the chain -- a skipped request writ
     _ = runWire(&r, "GET /fail HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
     const text = sw.buffered();
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, text, "\n"));
-    try testing.expect(std.mem.indexOf(u8, text, "\"GET /down HTTP/1.1\" 503") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "\"GET /fail HTTP/1.1\" 500") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "/ok") == null);
+    try testing.expect(std.mem.find(u8, text, "\"GET /down HTTP/1.1\" 503") != null);
+    try testing.expect(std.mem.find(u8, text, "\"GET /fail HTTP/1.1\" 500") != null);
+    try testing.expect(std.mem.find(u8, text, "/ok") == null);
 }

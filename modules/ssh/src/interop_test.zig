@@ -74,7 +74,7 @@ fn makeWorkDir(gpa: std.mem.Allocator, io: std.Io, tag: []const u8) ![]u8 {
     var rnd: [8]u8 = undefined;
     fillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_{s}_{s}", .{ tag, &hex });
+    const dir_path = try gpa.print("/tmp/zig_ssh_{s}_{s}", .{ tag, &hex });
     errdefer gpa.free(dir_path);
     var d = std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{}) catch return error.SkipZigTest;
     d.close(io);
@@ -128,18 +128,18 @@ pub const Sshd = struct {
             cwd.deleteTree(io, dir_path) catch {};
             gpa.free(dir_path);
         }
-        const hk_path = try std.fmt.allocPrint(gpa, "{s}/hk", .{dir_path});
+        const hk_path = try gpa.print("{s}/hk", .{dir_path});
         defer gpa.free(hk_path);
-        const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
+        const ck_path = try gpa.print("{s}/ck", .{dir_path});
         defer gpa.free(ck_path);
         try keygen(io, opts.host_key_type, hk_path);
         try keygen(io, opts.client_key_type, ck_path);
 
-        const ck_pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
+        const ck_pub_path = try gpa.print("{s}.pub", .{ck_path});
         defer gpa.free(ck_pub_path);
         const ck_pub = cwd.readFileAlloc(io, ck_pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
         defer gpa.free(ck_pub);
-        const ak_path = try std.fmt.allocPrint(gpa, "{s}/authorized_keys", .{dir_path});
+        const ak_path = try gpa.print("{s}/authorized_keys", .{dir_path});
         defer gpa.free(ak_path);
         writeFile(io, ak_path, ck_pub) catch return error.SkipZigTest;
 
@@ -159,11 +159,11 @@ pub const Sshd = struct {
             for (owned.items) |o| gpa.free(o);
             owned.deinit(gpa);
         }
-        const port_opt = try std.fmt.allocPrint(gpa, "Port={d}", .{port});
+        const port_opt = try gpa.print("Port={d}", .{port});
         try owned.append(gpa, port_opt);
-        const ak_opt = try std.fmt.allocPrint(gpa, "AuthorizedKeysFile={s}", .{ak_path});
+        const ak_opt = try gpa.print("AuthorizedKeysFile={s}", .{ak_path});
         try owned.append(gpa, ak_opt);
-        const log_path = try std.fmt.allocPrint(gpa, "{s}/sshd.log", .{dir_path});
+        const log_path = try gpa.print("{s}/sshd.log", .{dir_path});
         try owned.append(gpa, log_path);
         try argv.appendSlice(gpa, &.{ sshd_path, "-D", "-E", log_path, "-f", "/dev/null", "-h", hk_path });
         const base = [_][]const u8{
@@ -221,7 +221,7 @@ pub const Sshd = struct {
     /// The tail of `sshd`'s own log — for a failure message only (a passing
     /// test must write nothing to stderr).
     pub fn dumpLog(self: *Sshd) void {
-        const p = std.fmt.allocPrint(self.gpa, "{s}/sshd.log", .{self.dir_path}) catch return;
+        const p = self.gpa.print("{s}/sshd.log", .{self.dir_path}) catch return;
         defer self.gpa.free(p);
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(1 << 20)) catch return;
         defer self.gpa.free(text);
@@ -289,14 +289,14 @@ pub const SshClient = struct {
             cwd.deleteTree(io, dir_path) catch {};
             gpa.free(dir_path);
         }
-        const ck_path = try std.fmt.allocPrint(gpa, "{s}/ck", .{dir_path});
+        const ck_path = try gpa.print("{s}/ck", .{dir_path});
         defer gpa.free(ck_path);
         try keygen(io, opts.user_key_type, ck_path);
 
         var blob: [1024]u8 = undefined;
         var blob_len: usize = 0;
         {
-            const pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{ck_path});
+            const pub_path = try gpa.print("{s}.pub", .{ck_path});
             defer gpa.free(pub_path);
             const text = cwd.readFileAlloc(io, pub_path, gpa, .limited(4096)) catch return error.SkipZigTest;
             defer gpa.free(text);
@@ -314,11 +314,11 @@ pub const SshClient = struct {
         var listener = try listenLoopback(io, &port);
         errdefer listener.deinit(io);
 
-        const out_path = try std.fmt.allocPrint(gpa, "{s}/out", .{dir_path});
+        const out_path = try gpa.print("{s}/out", .{dir_path});
         errdefer gpa.free(out_path);
         var auth_buf: [512]u8 = undefined;
         const auth_opts = if (opts.askpass_script) |script| blk: {
-            const ap = try std.fmt.allocPrint(gpa, "{s}/askpass", .{dir_path});
+            const ap = try gpa.print("{s}/askpass", .{dir_path});
             defer gpa.free(ap);
             var f = try cwd.createFile(io, ap, .{ .permissions = @fromBackingInt(@intCast(0o755)) });
             defer f.close(io);
@@ -326,20 +326,20 @@ pub const SshClient = struct {
             var fw = f.writer(io, &fbuf);
             try fw.interface.print("#!/bin/sh\n{s}\n", .{script});
             try fw.interface.flush();
-            break :blk try std.fmt.bufPrint(&auth_buf, "env SSH_ASKPASS={s} SSH_ASKPASS_REQUIRE=force", .{ap});
+            break :blk try std.mem.print(&auth_buf, "env SSH_ASKPASS={s} SSH_ASKPASS_REQUIRE=force", .{ap});
         } else "";
         const methods = if (opts.askpass_script != null)
             "-o PreferredAuthentications=keyboard-interactive -o BatchMode=no -o NumberOfPasswordPrompts=1"
         else
             "-o PreferredAuthentications=publickey -o BatchMode=yes";
-        const ssh_cmd = try std.fmt.allocPrint(gpa, "{s} /usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes" ++
+        const ssh_cmd = try gpa.print("{s} /usr/bin/ssh -p {d} -F /dev/null -i {s} -o IdentitiesOnly=yes" ++
             " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null" ++
             " {s} -o ConnectTimeout=10 {s}", .{ auth_opts, port, ck_path, methods, opts.ssh_args });
         defer gpa.free(ssh_cmd);
         const cmdline = if (opts.script) |script|
-            try std.fmt.allocPrint(gpa, "SSH='{s}'; H=alice@127.0.0.1; OUT={s}; exec 2>{s}.err; {s}", .{ ssh_cmd, out_path, out_path, script })
+            try gpa.print("SSH='{s}'; H=alice@127.0.0.1; OUT={s}; exec 2>{s}.err; {s}", .{ ssh_cmd, out_path, out_path, script })
         else
-            try std.fmt.allocPrint(gpa, "{s} alice@127.0.0.1 {s} < {s} > {s} 2>{s}.err; echo $? >> {s}", .{ ssh_cmd, opts.remote, opts.stdin_from, out_path, out_path, out_path });
+            try gpa.print("{s} alice@127.0.0.1 {s} < {s} > {s} 2>{s}.err; echo $? >> {s}", .{ ssh_cmd, opts.remote, opts.stdin_from, out_path, out_path, out_path });
         defer gpa.free(cmdline);
 
         var child = std.process.spawn(io, .{
@@ -412,7 +412,7 @@ pub const SshClient = struct {
 
     /// The client's own stderr — for a failure message only.
     pub fn dumpErr(self: *SshClient) void {
-        const p = std.fmt.allocPrint(self.gpa, "{s}.err", .{self.out_path}) catch return;
+        const p = self.gpa.print("{s}.err", .{self.out_path}) catch return;
         defer self.gpa.free(p);
         const text = std.Io.Dir.cwd().readFileAlloc(self.io, p, self.gpa, .limited(1 << 20)) catch return;
         defer self.gpa.free(text);
@@ -763,9 +763,9 @@ test "live: pty-req + window-change against sshd — the command runs on a termi
     try s.exec("/bin/sh -c 'echo \"T=$TERM\"; stty size; tty; exit 3'");
     try s.drain();
     const out = s.stdout.items;
-    try std.testing.expect(std.mem.indexOf(u8, out, "T=vt100") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "43 132") != null); // rows cols, after the resize
-    try std.testing.expect(std.mem.indexOf(u8, out, "/dev/pts/") != null);
+    try std.testing.expect(std.mem.find(u8, out, "T=vt100") != null);
+    try std.testing.expect(std.mem.find(u8, out, "43 132") != null); // rows cols, after the resize
+    try std.testing.expect(std.mem.find(u8, out, "/dev/pts/") != null);
     try std.testing.expectEqual(@as(?u32, 3), s.exitStatus());
 }
 
@@ -786,7 +786,7 @@ test "live: shell against sshd — the login shell reads its commands from the c
     try s.writeData("echo shell-ok\nexit 3\n");
     try s.sendEof();
     try s.drain();
-    try std.testing.expect(std.mem.indexOf(u8, s.stdout.items, "shell-ok") != null);
+    try std.testing.expect(std.mem.find(u8, s.stdout.items, "shell-ok") != null);
     try std.testing.expectEqual(@as(?u32, 3), s.exitStatus());
 }
 
@@ -824,7 +824,7 @@ test "live: signal TERM reaches the remote command, which reports exit-signal" {
     // overtook the fork (failed once, 2026-10-10, sleep then ran its 30 s).
     // Before the `exec`, TERM ends the shell, which reports TERM just the same.
     try s.exec("echo ready; exec sleep 30");
-    while (std.mem.indexOf(u8, s.stdout.items, "ready") == null) _ = try s.pumpOnce();
+    while (std.mem.find(u8, s.stdout.items, "ready") == null) _ = try s.pumpOnce();
     try s.signal("TERM");
     try s.drain();
     try std.testing.expect(s.exit_signal != null);
@@ -1009,9 +1009,9 @@ test "live: our server serves several channels of one ssh connection (ControlMas
     };
     const out = try fx.finish();
     defer gpa.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=first") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=second") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=third") != null);
+    try std.testing.expect(std.mem.find(u8, out, "kind=exec cmd=first") != null);
+    try std.testing.expect(std.mem.find(u8, out, "kind=exec cmd=second") != null);
+    try std.testing.expect(std.mem.find(u8, out, "kind=exec cmd=third") != null);
     try std.testing.expect(std.mem.endsWith(u8, out, "0\n"));
 }
 
@@ -1043,11 +1043,11 @@ test "live: our server — ssh -tt gets a pty, SetEnv passes AcceptEnv-style nam
     }
     const out = try fx.finish();
     defer gpa.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "kind=exec cmd=echo hi") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, " pty=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, " env:ZIGTEST_ONE=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "OTHER") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "kind=shell cmd= ch=0 stdin=typed into the shell") != null);
+    try std.testing.expect(std.mem.find(u8, out, "kind=exec cmd=echo hi") != null);
+    try std.testing.expect(std.mem.find(u8, out, " pty=") != null);
+    try std.testing.expect(std.mem.find(u8, out, " env:ZIGTEST_ONE=1") != null);
+    try std.testing.expect(std.mem.find(u8, out, "OTHER") == null);
+    try std.testing.expect(std.mem.find(u8, out, "kind=shell cmd= ch=0 stdin=typed into the shell") != null);
 }
 
 test "envAccepted: exact names and trailing-* prefixes only" {

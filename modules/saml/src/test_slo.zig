@@ -51,12 +51,12 @@ test "buildLogoutRequest: well-formed, parses back, carries the fields" {
     });
     defer alloc.free(req);
 
-    try testing.expect(std.mem.indexOf(u8, req, "samlp:LogoutRequest") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "ID=\"_lr001\"") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "alice@example.org") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "sess-1") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "sess-2") != null);
-    try testing.expect(std.mem.indexOf(u8, req, "ds:Signature") == null); // unsigned
+    try testing.expect(std.mem.find(u8, req, "samlp:LogoutRequest") != null);
+    try testing.expect(std.mem.find(u8, req, "ID=\"_lr001\"") != null);
+    try testing.expect(std.mem.find(u8, req, "alice@example.org") != null);
+    try testing.expect(std.mem.find(u8, req, "sess-1") != null);
+    try testing.expect(std.mem.find(u8, req, "sess-2") != null);
+    try testing.expect(std.mem.find(u8, req, "ds:Signature") == null); // unsigned
 
     var doc = try @import("xml").parse(alloc, req, .{ .id_attr_names = &.{"ID"} });
     defer doc.deinit();
@@ -88,7 +88,7 @@ test "LogoutRequest: signed build -> POST-field consume round-trips (CONSTRUCTED
         .sign_with = .{ .rsa = &kp.secret_key },
     });
     defer alloc.free(req);
-    try testing.expect(std.mem.indexOf(u8, req, "ds:Signature") != null);
+    try testing.expect(std.mem.find(u8, req, "ds:Signature") != null);
 
     // Round-trip through the POST-field entry point (base64 wrapper).
     const enc_b64 = std.base64.standard.Encoder;
@@ -178,7 +178,7 @@ test "LogoutRequest: unsigned bytes rejected under .embedded, accepted under .re
         // sign_with left null: genuinely unsigned bytes.
     });
     defer alloc.free(req);
-    try testing.expect(std.mem.indexOf(u8, req, "ds:Signature") == null);
+    try testing.expect(std.mem.find(u8, req, "ds:Signature") == null);
 
     try testing.expectError(
         error.SignatureMissing,
@@ -205,7 +205,7 @@ test "LogoutRequest: flipped SignatureValue -> SignatureInvalid (distinct from S
     // Flip one base64 char inside <ds:SignatureValue>...</ds:SignatureValue>,
     // well past the opening tag, leaving XML structure and the digest intact.
     const tag = "<ds:SignatureValue>";
-    const at = std.mem.indexOf(u8, req, tag).? + tag.len + 4;
+    const at = std.mem.find(u8, req, tag).? + tag.len + 4;
     const mutable = try alloc.dupe(u8, req);
     defer alloc.free(mutable);
     mutable[at] = if (mutable[at] == 'A') 'B' else 'A';
@@ -233,8 +233,8 @@ test "LogoutRequest XSW: signature moved to the top level, referencing a buried 
     });
     defer alloc.free(orig);
 
-    const sig_start = std.mem.indexOf(u8, orig, "<ds:Signature").?;
-    const sig_end = std.mem.indexOf(u8, orig, "</ds:Signature>").? + "</ds:Signature>".len;
+    const sig_start = std.mem.find(u8, orig, "<ds:Signature").?;
+    const sig_end = std.mem.find(u8, orig, "</ds:Signature>").? + "</ds:Signature>".len;
     const sig_block = orig[sig_start..sig_end];
 
     var orig_no_sig: std.ArrayList(u8) = .empty;
@@ -247,7 +247,7 @@ test "LogoutRequest XSW: signature moved to the top level, referencing a buried 
     // as its direct child (satisfying `.embedded`'s structural search), and
     // the original buried as a decoy nested element carrying the id the
     // Reference resolves to.
-    const attack = try std.fmt.allocPrint(alloc, "<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
+    const attack = try alloc.print("<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
         "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"outerEvilID\" Version=\"2.0\" " ++
         "IssueInstant=\"{s}\"><saml:Issuer>{s}</saml:Issuer>{s}" ++
         "<saml:NameID>attacker-controlled-alias</saml:NameID>" ++
@@ -265,7 +265,7 @@ test "LogoutRequest XSW: signature moved to the top level, referencing a buried 
 //    Assertion/EncryptedID path uses; not independently re-proven here) ─────
 
 fn buildRequestWithEncryptedId(alloc: std.mem.Allocator, enc_id_xml: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
+    return alloc.print("<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
         "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_lr_encid\" Version=\"2.0\" " ++
         "IssueInstant=\"{s}\"><saml:Issuer>{s}</saml:Issuer>{s}</samlp:LogoutRequest>", .{ issue_instant, idp_entity_id, enc_id_xml });
 }
@@ -340,8 +340,8 @@ test "buildLogoutResponse: well-formed, parses back, defaults to Success" {
         .in_response_to = "_lr_signed_01",
     });
     defer alloc.free(resp);
-    try testing.expect(std.mem.indexOf(u8, resp, "samlp:LogoutResponse") != null);
-    try testing.expect(std.mem.indexOf(u8, resp, "urn:oasis:names:tc:SAML:2.0:status:Success") != null);
+    try testing.expect(std.mem.find(u8, resp, "samlp:LogoutResponse") != null);
+    try testing.expect(std.mem.find(u8, resp, "urn:oasis:names:tc:SAML:2.0:status:Success") != null);
 }
 
 test "LogoutResponse: signed build -> POST-field consume round-trips (CONSTRUCTED, self-signed)" {

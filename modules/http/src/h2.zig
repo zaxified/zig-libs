@@ -980,7 +980,7 @@ pub const Connection = struct {
     }
 
     fn wasResetByUs(c: *const Connection, id: u31) bool {
-        return id != 0 and std.mem.indexOfScalar(u31, &c.reset_by_us, id) != null;
+        return id != 0 and std.mem.findScalar(u31, &c.reset_by_us, id) != null;
     }
 
     /// Give back the connection-window credit of DATA we received and

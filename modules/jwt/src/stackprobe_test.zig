@@ -520,7 +520,7 @@ const Split = struct { input: []const u8, sig: []const u8 };
 
 /// `header.payload` and the decoded signature of a compact token.
 fn splitToken(tok: []const u8, sig_buf: []u8) !Split {
-    const dot = std.mem.lastIndexOfScalar(u8, tok, '.').?;
+    const dot = std.mem.findScalarLast(u8, tok, '.').?;
     const dec = std.base64.url_safe_no_pad.Decoder;
     const len = try dec.calcSizeForSlice(tok[dot + 1 ..]);
     try dec.decode(sig_buf[0..len], tok[dot + 1 ..]);

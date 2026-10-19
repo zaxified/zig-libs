@@ -92,7 +92,7 @@ fn ipv4TieGlibcReorders(w: vectors.World, in: []const u8, want: []const u8, ours
 fn inversionsArePairDivergences(w: vectors.World, in: []const u8, want: []const u8, ours: []const u8) bool {
     if (in.len < 3) return false;
     for (want, 0..) |x, a| for (want[a + 1 ..]) |y| {
-        if (std.mem.indexOfScalar(u8, ours, x).? < std.mem.indexOfScalar(u8, ours, y).?) continue;
+        if (std.mem.findScalar(u8, ours, x).? < std.mem.findScalar(u8, ours, y).?) continue;
         var pair_explained = false;
         for ([2][2]u8{ .{ x, y }, .{ y, x } }) |pin| {
             var got: [2]u8 = undefined;
@@ -228,7 +228,7 @@ test "rfc6724 oracle: IPv6 source as the kernel chooses it" {
         for (set.answers) |a| {
             cases += 1;
             const got = netaddr.selectSource(cands[0..set.cands.len], ip(a.dst));
-            if (got != null and std.mem.indexOfScalar(u8, a.ok, @intCast(got.?)) != null) continue;
+            if (got != null and std.mem.findScalar(u8, a.ok, @intCast(got.?)) != null) continue;
             bad += 1;
             if (bad <= 40) std.debug.print("set {d} dst {s}: kernel picks {s}, we pick {?d}\n", .{
                 si, a.dst, set.cands[a.ok[0]], got,

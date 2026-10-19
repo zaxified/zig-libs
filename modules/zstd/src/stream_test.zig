@@ -176,7 +176,7 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
     defer reused.deinit();
     var frames: u32 = 0;
     for (corpus.stream_cases) |sc| {
-        const dec = if (std.mem.indexOf(u8, sc.schedule, "format=1") != null) &dec_magicless else &dec_zstd1;
+        const dec = if (std.mem.find(u8, sc.schedule, "format=1") != null) &dec_magicless else &dec_zstd1;
         const case = findCase(sc.case);
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);
@@ -207,17 +207,17 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
             }
             // The extDict path leaves no mark in the output; that it ran
             // is checked here.
-            if (std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.ext_dict_blocks == 0) {
+            if (std.mem.findScalar(i32, sc.ext_dict, level) != null and r.ext_dict_blocks == 0) {
                 std.debug.print("NO EXTDICT BLOCK {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
                 mismatches += 1;
             }
             // ... and, with LDM on by hand (token l), by LDM too.
-            if (std.mem.startsWith(u8, sc.schedule, "l,") and std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.ldm_ext_dict_chunks == 0) {
+            if (std.mem.startsWith(u8, sc.schedule, "l,") and std.mem.findScalar(i32, sc.ext_dict, level) != null and r.ldm_ext_dict_chunks == 0) {
                 std.debug.print("NO LDM EXTDICT CHUNK {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
                 mismatches += 1;
             }
             // Likewise a correction for index overflow (token x).
-            if (std.mem.startsWith(u8, sc.schedule, "x,") and sc.corrects and std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.overflow_corrections == 0) {
+            if (std.mem.startsWith(u8, sc.schedule, "x,") and sc.corrects and std.mem.findScalar(i32, sc.ext_dict, level) != null and r.overflow_corrections == 0) {
                 std.debug.print("NO CORRECTION {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
                 mismatches += 1;
             }
@@ -307,11 +307,11 @@ test "after its end a stream goes on with a new frame of unknown size, as libzst
         const first_len = out.items.len;
         try feedFrame(gpa, &s, b, &out);
         try feedFrame(gpa, &s, a, &out);
-        const want_a = try run(gpa, a, level, true, try std.fmt.bufPrint(&sched_buf[0], "p{d},c{d},c*,e0", .{ a.len, a.len / 2 }));
+        const want_a = try run(gpa, a, level, true, try std.mem.print(&sched_buf[0], "p{d},c{d},c*,e0", .{ a.len, a.len / 2 }));
         defer gpa.free(want_a.out);
-        const want_b = try run(gpa, b, level, true, try std.fmt.bufPrint(&sched_buf[1], "c{d},c*,e0", .{b.len / 2}));
+        const want_b = try run(gpa, b, level, true, try std.mem.print(&sched_buf[1], "c{d},c*,e0", .{b.len / 2}));
         defer gpa.free(want_b.out);
-        const want_a2 = try run(gpa, a, level, true, try std.fmt.bufPrint(&sched_buf[2], "c{d},c*,e0", .{a.len / 2}));
+        const want_a2 = try run(gpa, a, level, true, try std.mem.print(&sched_buf[2], "c{d},c*,e0", .{a.len / 2}));
         defer gpa.free(want_a2.out);
         try std.testing.expectEqualSlices(u8, want_a.out, out.items[0..first_len]);
         try std.testing.expectEqualSlices(u8, want_b.out, out.items[first_len..][0..want_b.out.len]);
@@ -339,7 +339,7 @@ test "reset abandons a frame and starts over with new options" {
     defer out.deinit(gpa);
     try feedFrame(gpa, &s, src, &out);
     var sched_buf: [1][64]u8 = undefined;
-    const want = try run(gpa, src, 3, false, try std.fmt.bufPrint(&sched_buf[0], "p{d},c{d},c*,e0", .{ src.len, src.len / 2 }));
+    const want = try run(gpa, src, 3, false, try std.mem.print(&sched_buf[0], "p{d},c{d},c*,e0", .{ src.len, src.len / 2 }));
     defer gpa.free(want.out);
     try std.testing.expectEqualSlices(u8, want.out, out.items);
 }
@@ -507,10 +507,10 @@ test "stable output: one byte less than the least room libzstd succeeds in is re
     for (corpus.stream_cases) |sc| {
         if (!std.mem.startsWith(u8, sc.schedule, "stableOutBuffer=1,o")) continue;
         const rest = sc.schedule["stableOutBuffer=1,o".len..];
-        const room = try std.fmt.parseInt(usize, rest[0..std.mem.indexOfScalar(u8, rest, ',').?], 10);
+        const room = try std.fmt.parseInt(usize, rest[0..std.mem.findScalar(u8, rest, ',').?], 10);
         var short: std.ArrayList(u8) = .empty;
         defer short.deinit(gpa);
-        try short.print(gpa, "stableOutBuffer=1,o{d}{s}", .{ room - 1, rest[std.mem.indexOfScalar(u8, rest, ',').?..] });
+        try short.print(gpa, "stableOutBuffer=1,o{d}{s}", .{ room - 1, rest[std.mem.findScalar(u8, rest, ',').?..] });
         const src = try gpa.alloc(u8, findCase(sc.case).len);
         defer gpa.free(src);
         corpus.generate(findCase(sc.case), src);
@@ -526,7 +526,7 @@ test "stable output: one byte less than the least room libzstd succeeds in is re
             .{ "mix-300000-9", "c*,e0", 84494 },
         };
         for (no_checksum) |nc| {
-            if (!std.mem.eql(u8, sc.case, nc[0]) or !std.mem.endsWith(u8, sc.schedule, nc[1]) or std.mem.indexOf(u8, sc.schedule, "Size") != null) continue;
+            if (!std.mem.eql(u8, sc.case, nc[0]) or !std.mem.endsWith(u8, sc.schedule, nc[1]) or std.mem.find(u8, sc.schedule, "Size") != null) continue;
             if (std.mem.eql(u8, sc.case, "csv-600000") and sc.levels[0] != 1) continue;
             var at: std.ArrayList(u8) = .empty;
             defer at.deinit(gpa);
@@ -553,7 +553,7 @@ test "stable output: every room below the least libzstd succeeds in is refused (
     corpus.generate(c, src);
     var buf: [64]u8 = undefined;
     for (84494 - 32..84494) |room| {
-        const sched = try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,e0", .{room});
+        const sched = try std.mem.print(&buf, "stableOutBuffer=1,o{d},c*,e0", .{room});
         try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 19, true, sched));
     }
 }
@@ -627,10 +627,10 @@ test "stable output: the epilogue's empty last block and checksum ask their own 
         const ample = try run(gpa, src, 3, cr[0], "stableOutBuffer=1,c*,f0,e0");
         defer gpa.free(ample.out);
         var buf: [64]u8 = undefined;
-        const exact = try run(gpa, src, 3, cr[0], try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1]}));
+        const exact = try run(gpa, src, 3, cr[0], try std.mem.print(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1]}));
         defer gpa.free(exact.out);
         try std.testing.expectEqualSlices(u8, ample.out, exact.out);
-        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, cr[0], try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1] - 1})));
+        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, cr[0], try std.mem.print(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1] - 1})));
     }
 }
 

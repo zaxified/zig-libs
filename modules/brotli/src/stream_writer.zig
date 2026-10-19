@@ -552,8 +552,8 @@ test "metadata: carried in the stream, skipped by the decoder" {
     try sw.finish();
     try expectRoundTrip(src, out.written());
     // Every metadata byte is in the stream as written.
-    try testing.expect(std.mem.indexOf(u8, out.written(), "before anything") != null);
-    try testing.expect(std.mem.indexOf(u8, out.written(), big) != null);
+    try testing.expect(std.mem.find(u8, out.written(), "before anything") != null);
+    try testing.expect(std.mem.find(u8, out.written(), big) != null);
 }
 
 test "a history past 16 MiB: the slots lose their tags, a copy from before is still found" {

@@ -69,12 +69,12 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
     var tsv: std.Io.Writer.Allocating = .init(arena);
     const w = &tsv.writer;
     for (&d.entries, 0..) |*e, i| {
-        const rid = try std.fmt.allocPrint(arena, "{x:0>16}{x:0>16}", .{ r.int(u64), r.int(u64) });
+        const rid = try arena.print("{x:0>16}{x:0>16}", .{ r.int(u64), r.int(u64) });
         e.* = .{
             .timestamp_ns = 1_760_000_000_000_000_000 + @as(i64, @intCast(i)) * 1_234_567,
-            .remote_addr = try std.fmt.allocPrint(arena, "203.0.113.{d}", .{r.intRangeAtMost(u8, 1, 254)}),
+            .remote_addr = try arena.print("203.0.113.{d}", .{r.intRangeAtMost(u8, 1, 254)}),
             .method = methods[r.uintLessThan(usize, methods.len)],
-            .target = try std.fmt.allocPrint(arena, "/api/v1/items/{d}?expand=owner&fields=id,name", .{r.uintLessThan(u32, 100000)}),
+            .target = try arena.print("/api/v1/items/{d}?expand=owner&fields=id,name", .{r.uintLessThan(u32, 100000)}),
             .protocol = "HTTP/1.1",
             .status = statuses[r.uintLessThan(usize, statuses.len)],
             .request_bytes = r.uintLessThan(u64, 4096),
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

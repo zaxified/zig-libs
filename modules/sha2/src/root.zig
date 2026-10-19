@@ -508,8 +508,8 @@ fn unhex(comptime n: usize, hex: []const u8) [n]u8 {
 
 /// Every backend this build can run, for the Word size of `H`.
 fn backendAvailableAnyWord(comptime b: Backend) bool {
-    return std.mem.indexOfScalar(Backend, backendsFor(u32), b) != null or
-        std.mem.indexOfScalar(Backend, backendsFor(u64), b) != null;
+    return std.mem.findScalar(Backend, backendsFor(u32), b) != null or
+        std.mem.findScalar(Backend, backendsFor(u64), b) != null;
 }
 
 fn backendsFor(comptime Word: type) []const Backend {

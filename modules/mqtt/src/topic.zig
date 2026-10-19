@@ -31,7 +31,7 @@ fn wellFormed(s: []const u8) bool {
 /// UTF-8, no U+0000, and no `+` / `#` wildcard characters (spec 4.7.1-1).
 pub fn validateName(name: []const u8) NameError!void {
     if (!wellFormed(name)) return error.InvalidTopicName;
-    if (std.mem.indexOfAny(u8, name, "+#") != null) return error.InvalidTopicName;
+    if (std.mem.findAny(u8, name, "+#") != null) return error.InvalidTopicName;
 }
 
 /// Validate a topic *filter* (as used in SUBSCRIBE / UNSUBSCRIBE):
@@ -48,7 +48,7 @@ pub fn validateFilter(filter: []const u8) FilterError!void {
             continue;
         }
         if (std.mem.eql(u8, level, "+")) continue;
-        if (std.mem.indexOfAny(u8, level, "+#") != null) return error.InvalidTopicFilter;
+        if (std.mem.findAny(u8, level, "+#") != null) return error.InvalidTopicFilter;
     }
 }
 

@@ -529,12 +529,12 @@ const Builder = struct {
         // own doc said the cap "bounds worst-case aggregation work"; it
         // bounded `dedupeFrom`.
         if (b.full()) return;
-        try b.append(path, code, try std.fmt.allocPrint(b.a(), fmt, args));
+        try b.append(path, code, try b.a().print(fmt, args));
     }
 
     fn fieldPath(b: *Builder, prefix: []const u8, field: []const u8) Allocator.Error![]const u8 {
         if (prefix.len == 0) return field; // borrows the schema's string
-        return std.fmt.allocPrint(b.a(), "{s}.{s}", .{ prefix, field });
+        return b.a().print("{s}.{s}", .{ prefix, field });
     }
 
     fn indexPath(b: *Builder, prefix: []const u8, i: usize) Allocator.Error![]const u8 {
@@ -544,7 +544,7 @@ const Builder = struct {
         // 1015 KiB body. The empty path is safe here because a full builder
         // appends nothing that could carry it.
         if (b.full()) return "";
-        return std.fmt.allocPrint(b.a(), "{s}[{d}]", .{ prefix, i });
+        return b.a().print("{s}[{d}]", .{ prefix, i });
     }
 
     fn finish(b: *Builder) Report {
@@ -1285,7 +1285,7 @@ fn inCharset(s: []const u8, set: []const u8) bool {
     const view = std.unicode.Utf8View.init(s) catch return false;
     var it = view.iterator();
     while (it.nextCodepointSlice()) |cp| {
-        if (std.mem.indexOf(u8, set, cp) == null) return false;
+        if (std.mem.find(u8, set, cp) == null) return false;
     }
     return true;
 }
@@ -1398,8 +1398,8 @@ fn formatMessage(format: Format) []const u8 {
 /// No quoted-string locals, no address literals, no full RFC 5322.
 fn isEmail(s: []const u8) bool {
     if (s.len < 3 or s.len > 254) return false;
-    const at = std.mem.indexOfScalar(u8, s, '@') orelse return false;
-    if (std.mem.indexOfScalarPos(u8, s, at + 1, '@') != null) return false;
+    const at = std.mem.findScalar(u8, s, '@') orelse return false;
+    if (std.mem.findScalarPos(u8, s, at + 1, '@') != null) return false;
     const local = s[0..at];
     const domain = s[at + 1 ..];
     if (local.len == 0 or local.len > 64) return false;
@@ -1415,13 +1415,13 @@ fn isEmail(s: []const u8) bool {
         }
     }
     // Deliverable addresses need a dotted FQDN, not a bare label.
-    return isHostname(domain) and std.mem.indexOfScalar(u8, domain, '.') != null;
+    return isHostname(domain) and std.mem.findScalar(u8, domain, '.') != null;
 }
 
 /// RFC 5321 atext: the characters allowed in an unquoted local-part atom.
 fn isAtext(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or
-        std.mem.indexOfScalar(u8, "!#$%&'*+-/=?^_`{|}~", c) != null;
+        std.mem.findScalar(u8, "!#$%&'*+-/=?^_`{|}~", c) != null;
 }
 
 /// RFC 3986 structural check: every byte a valid URI character, `%XX`
@@ -1447,19 +1447,19 @@ fn isUri(s: []const u8, require_scheme: bool) bool {
         }
     }
     if (!require_scheme) return true;
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    const colon = std.mem.findScalar(u8, s, ':') orelse return false;
     if (colon == 0 or !std.ascii.isAlphabetic(s[0])) return false;
     for (s[1..colon]) |c| {
         if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return false;
     }
     // The first ':' must be the scheme separator, not path/query/fragment.
-    return std.mem.indexOfAny(u8, s[0..colon], "/?#") == null;
+    return std.mem.findAny(u8, s[0..colon], "/?#") == null;
 }
 
 /// unreserved / gen-delims / sub-delims ('%' and '#' are handled above).
 fn isUriChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or
-        std.mem.indexOfScalar(u8, "-._~:/?[]@!$&'()*+,;=", c) != null;
+        std.mem.findScalar(u8, "-._~:/?[]@!$&'()*+,;=", c) != null;
 }
 
 /// The canonical 8-4-4-4-12 hex shape, case-insensitive. Shape only: the
@@ -1575,7 +1575,7 @@ fn isDuration(s: []const u8) bool {
         while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
         if (i == start or i == body.len) return false; // need digits + unit
         const units: []const u8 = if (in_time) "HMS" else "YMD";
-        const pos = std.mem.indexOfScalar(u8, units, body[i]) orelse return false;
+        const pos = std.mem.findScalar(u8, units, body[i]) orelse return false;
         if (next) |want| {
             if (pos != want) return false; // gap or repeat: not the immediate next unit
         }
@@ -1674,26 +1674,26 @@ fn isUuidRfc4122(s: []const u8) bool {
 /// non-empty host, then the rest of an RFC 3986 URI.
 fn isHttpUrl(s: []const u8, https_only: bool) bool {
     if (!isUri(s, true)) return false;
-    const colon = std.mem.indexOfScalar(u8, s, ':') orelse return false;
+    const colon = std.mem.findScalar(u8, s, ':') orelse return false;
     const scheme = s[0..colon];
     const is_https = std.ascii.eqlIgnoreCase(scheme, "https");
     if (!is_https and (https_only or !std.ascii.eqlIgnoreCase(scheme, "http"))) return false;
     const rest = s[colon + 1 ..];
     if (!std.mem.startsWith(u8, rest, "//")) return false;
     const after = rest[2..];
-    const end = std.mem.indexOfAny(u8, after, "/?#") orelse after.len;
+    const end = std.mem.findAny(u8, after, "/?#") orelse after.len;
     var authority = after[0..end];
-    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (std.mem.findScalarLast(u8, authority, '@')) |at| authority = authority[at + 1 ..];
     var host = authority;
     if (authority.len != 0 and authority[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, authority, ']') orelse return false;
+        const close = std.mem.findScalar(u8, authority, ']') orelse return false;
         const ip = netaddr.parseIp(authority[1..close]) orelse return false;
         if (ip != .v6) return false;
         const tail = authority[close + 1 ..];
         if (tail.len != 0 and (tail[0] != ':' or !allDigitsOrEmpty(tail[1..]))) return false;
         return true;
     }
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |c| {
+    if (std.mem.findScalarLast(u8, authority, ':')) |c| {
         if (!allDigitsOrEmpty(authority[c + 1 ..])) return false;
         host = authority[0..c];
     }
@@ -1721,7 +1721,7 @@ fn isBase64(s: []const u8, comptime extra: []const u8, padded: bool) bool {
         while (pad < 2 and body.len > 0 and body[body.len - 1] == '=') : (pad += 1) body = body[0 .. body.len - 1];
     } else if (s.len % 4 == 1) return false;
     for (body) |c| {
-        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, extra, c) == null) return false;
+        if (!std.ascii.isAlphanumeric(c) and std.mem.findScalar(u8, extra, c) == null) return false;
     }
     return true;
 }
@@ -1761,7 +1761,7 @@ fn allOfClass(s: []const u8, class: ByteClass) bool {
 fn isNumeric(s: []const u8) bool {
     var rest = s;
     if (rest.len != 0 and (rest[0] == '-' or rest[0] == '+')) rest = rest[1..];
-    const dot = std.mem.indexOfScalar(u8, rest, '.');
+    const dot = std.mem.findScalar(u8, rest, '.');
     const int_part = if (dot) |d| rest[0..d] else rest;
     if (!allDigits(int_part)) return false;
     if (dot) |d| return allDigits(rest[d + 1 ..]);
@@ -1806,8 +1806,8 @@ fn isBase64UrlRun(s: []const u8, allow_empty: bool) bool {
 
 /// `A.B.C` with A, B non-empty and C possibly empty, all base64url bytes.
 fn isJwt(s: []const u8) bool {
-    const d1 = std.mem.indexOfScalar(u8, s, '.') orelse return false;
-    const d2 = std.mem.indexOfScalarPos(u8, s, d1 + 1, '.') orelse return false;
+    const d1 = std.mem.findScalar(u8, s, '.') orelse return false;
+    const d2 = std.mem.findScalarPos(u8, s, d1 + 1, '.') orelse return false;
     return isBase64UrlRun(s[0..d1], false) and isBase64UrlRun(s[d1 + 1 .. d2], false) and
         isBase64UrlRun(s[d2 + 1 ..], true);
 }
@@ -1828,7 +1828,7 @@ fn isSemver(s: []const u8) bool {
         }
     }
     var build: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, rest, '+')) |plus| {
+    if (std.mem.findScalar(u8, rest, '+')) |plus| {
         build = rest[plus + 1 ..];
         rest = rest[0..plus];
     }
@@ -2071,14 +2071,14 @@ const QueryIter = struct {
     fn next(it: *QueryIter) ?RawPair {
         while (it.rest) |r| {
             var seg = r;
-            if (std.mem.indexOfScalar(u8, r, '&')) |i| {
+            if (std.mem.findScalar(u8, r, '&')) |i| {
                 seg = r[0..i];
                 it.rest = r[i + 1 ..];
             } else {
                 it.rest = null;
             }
             if (seg.len == 0) continue;
-            if (std.mem.indexOfScalar(u8, seg, '=')) |eq|
+            if (std.mem.findScalar(u8, seg, '=')) |eq|
                 return .{ .name = seg[0..eq], .value = seg[eq + 1 ..] };
             return .{ .name = seg, .value = "" };
         }
@@ -2124,7 +2124,7 @@ fn componentEql(raw: []const u8, name: []const u8) bool {
 /// truncated escape passes through literally (lenient, like most parsers).
 /// Returns the input slice unchanged when nothing needs decoding.
 fn decodeComponent(a: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    if (std.mem.indexOfAny(u8, s, "%+") == null) return s;
+    if (std.mem.findAny(u8, s, "%+") == null) return s;
     const out = try a.alloc(u8, s.len);
     var n: usize = 0;
     var i: usize = 0;
@@ -2960,13 +2960,13 @@ const Walker = struct {
         const r = if (node.parent) |p| blk: {
             const prefix = try w.path(p);
             break :blk if (node.is_index)
-                try std.fmt.allocPrint(w.b.a(), "{s}[{d}]", .{ prefix, node.index })
+                try w.b.a().print("{s}[{d}]", .{ prefix, node.index })
             else if (prefix.len == 0)
                 node.field
             else
-                try std.fmt.allocPrint(w.b.a(), "{s}.{s}", .{ prefix, node.field });
+                try w.b.a().print("{s}.{s}", .{ prefix, node.field });
         } else if (node.is_index)
-            try std.fmt.allocPrint(w.b.a(), "[{d}]", .{node.index})
+            try w.b.a().print("[{d}]", .{node.index})
         else
             node.field;
         node.rendered = r;
@@ -3871,7 +3871,7 @@ fn writeRegex(s: *std.json.Stringify, lead: []const u8, text: []const u8, tail: 
             fits = false;
             break;
         }
-        if (std.mem.indexOfScalar(u8, special, c) != null) {
+        if (std.mem.findScalar(u8, special, c) != null) {
             buf[n] = '\\';
             n += 1;
         }
@@ -4452,7 +4452,7 @@ test "pattern: a caller-supplied matcher (regex stand-in) → string_pattern_mis
     try testing.expectEqual(@as(usize, 2), bad.errors.len);
     try expectError(&bad, "id", "string_pattern_mismatch");
     try expectError(&bad, "key", "string_pattern_mismatch");
-    try testing.expect(std.mem.indexOf(u8, bad.errors[0].message, "^[0-9A-F]+$") != null);
+    try testing.expect(std.mem.find(u8, bad.errors[0].message, "^[0-9A-F]+$") != null);
 
     // A non-string never reaches the matcher (the kind check reports it).
     var wrong = try validateJson(testing.allocator, "{\"id\":5,\"key\":\"sk_\"}", &schema);
@@ -4463,8 +4463,8 @@ test "pattern: a caller-supplied matcher (regex stand-in) → string_pattern_mis
     var aw: std.Io.Writer.Allocating = .init(testing.allocator);
     defer aw.deinit();
     try writeJsonSchema(&schema, &aw.writer);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"pattern\":\"^[0-9A-F]+$\"") != null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"pattern\":\"^sk_\"") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"pattern\":\"^[0-9A-F]+$\"") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"pattern\":\"^sk_\"") != null);
 }
 
 test "pattern: literal / prefix / suffix / charset → string_pattern_mismatch" {
@@ -5526,7 +5526,7 @@ const StreamUser = struct {
     big: i64 = 0,
 
     fn noSpaces(_: ?*anyopaque, v: Value) bool {
-        return v != .string or std.mem.indexOfScalar(u8, v.string, ' ') == null;
+        return v != .string or std.mem.findScalar(u8, v.string, ' ') == null;
     }
     fn fewerThanThree(_: ?*anyopaque, v: Value) bool {
         return v != .array or v.array.items.len < 3;
@@ -5906,7 +5906,7 @@ test "writeProblem: RFC 9457 body carrying the aggregated errors" {
     var plain: std.Io.Writer = .fixed(&plain_buf);
     try r.writeJson(&plain);
     const list = plain.buffered()["{\"errors\":".len .. plain.buffered().len - 1];
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), list) != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), list) != null);
 }
 
 // ── tests: the typed style ──────────────────────────────────────────────────
@@ -6151,7 +6151,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 /// Shared per-test probe, reachable from handlers via ctx.state.
@@ -6230,12 +6230,12 @@ test "Body middleware: malformed / empty body → 400 json_invalid, no panic" {
     var buf: [2048]u8 = undefined;
     const garbled = runWire(&r, postWire("/things", "{\"name\":"), &buf);
     try expectStatus(garbled, "400");
-    try testing.expect(std.mem.indexOf(u8, garbled, "\"code\":\"json_invalid\"") != null);
+    try testing.expect(std.mem.find(u8, garbled, "\"code\":\"json_invalid\"") != null);
     try testing.expect(!probe.invoked);
 
     const empty = runWire(&r, postWire("/things", ""), &buf);
     try expectStatus(empty, "400");
-    try testing.expect(std.mem.indexOf(u8, empty, "\"code\":\"json_invalid\"") != null);
+    try testing.expect(std.mem.find(u8, empty, "\"code\":\"json_invalid\"") != null);
     try testing.expect(!probe.invoked);
 }
 
@@ -6253,7 +6253,7 @@ test "Body middleware: over-limit body → 413" {
         \\{"name":"gizmo","qty":5}
     ), &buf);
     try expectStatus(got, "413");
-    try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_large\"") != null);
+    try testing.expect(std.mem.find(u8, got, "\"code\":\"too_large\"") != null);
     try testing.expect(!probe.invoked);
 }
 
@@ -6295,7 +6295,7 @@ test "Body middleware: structurally over-limit body → 400 too_deep, handler NO
         \\{"a":{"b":{"c":{"d":1}}}}
     ), &buf);
     try expectStatus(got, "400");
-    try testing.expect(std.mem.indexOf(u8, got, "\"code\":\"too_deep\"") != null);
+    try testing.expect(std.mem.find(u8, got, "\"code\":\"too_deep\"") != null);
     try testing.expect(!probe.invoked);
 }
 
@@ -6368,7 +6368,7 @@ test "TypedBody middleware: valid POST → handler gets *const T; invalid → 40
         \\{"name":"gear","qty":"many"}
     ), &buf);
     try expectStatus(bad, "400");
-    try testing.expect(std.mem.indexOf(u8, bad, "\"path\":\"qty\",\"code\":\"int_type\"") != null);
+    try testing.expect(std.mem.find(u8, bad, "\"path\":\"qty\",\"code\":\"int_type\"") != null);
     try testing.expect(!probe.invoked);
 }
 
@@ -6396,12 +6396,12 @@ test "Query middleware: bad param → 400; good → handler + decoded queryValue
     var buf: [2048]u8 = undefined;
     const bad = runWire(&r, getWire("/search?q=ab&limit=999"), &buf);
     try expectStatus(bad, "400");
-    try testing.expect(std.mem.indexOf(u8, bad, "\"path\":\"limit\",\"code\":\"less_than_equal\"") != null);
+    try testing.expect(std.mem.find(u8, bad, "\"path\":\"limit\",\"code\":\"less_than_equal\"") != null);
     try testing.expect(!probe.invoked);
 
     const missing = runWire(&r, getWire("/search"), &buf);
     try expectStatus(missing, "400");
-    try testing.expect(std.mem.indexOf(u8, missing, "\"path\":\"q\",\"code\":\"missing\"") != null);
+    try testing.expect(std.mem.find(u8, missing, "\"path\":\"q\",\"code\":\"missing\"") != null);
 
     // '+' decodes to a space in the value the handler sees.
     const good = runWire(&r, getWire("/search?q=zig+libs&limit=5"), &buf);
@@ -6432,7 +6432,7 @@ test "PathParams middleware: bad path param → 400; good → handler runs" {
     var buf: [2048]u8 = undefined;
     const bad = runWire(&r, getWire("/users/abc"), &buf);
     try expectStatus(bad, "400");
-    try testing.expect(std.mem.indexOf(u8, bad, "\"path\":\"id\",\"code\":\"int_parsing\"") != null);
+    try testing.expect(std.mem.find(u8, bad, "\"path\":\"id\",\"code\":\"int_parsing\"") != null);
     try testing.expect(!probe.invoked);
 
     const good = runWire(&r, getWire("/users/42"), &buf);
@@ -6476,7 +6476,7 @@ test "stacked Query + Body middleware: both getters work via the slot chain" {
         \\{"name":"n","qty":2}
     ), &buf);
     try expectStatus(bad, "400");
-    try testing.expect(std.mem.indexOf(u8, bad, "string_too_short") != null);
+    try testing.expect(std.mem.find(u8, bad, "string_too_short") != null);
     try testing.expect(!probe.invoked);
 }
 
@@ -6536,7 +6536,7 @@ test "integration: 400 on invalid body/query over a real socket; valid body reac
     const json_hdr = [_]http.Header{.{ .name = "Content-Type", .value = "application/json" }};
 
     { // invalid body → 400 with the field-error JSON; handler not invoked
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/things/create", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/things/create", .{port});
         var res = try client.request(.post, url, .{
             .body =
             \\{"name":"gear","qty":"lots"}
@@ -6555,7 +6555,7 @@ test "integration: 400 on invalid body/query over a real socket; valid body reac
     }
 
     { // valid body → handler runs and sees the decoded struct
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/things/create", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/things/create", .{port});
         var res = try client.request(.post, url, .{
             .body =
             \\{"name":"gear","qty":7,"color":"green"}
@@ -6572,18 +6572,18 @@ test "integration: 400 on invalid body/query over a real socket; valid body reac
 
     { // bad query param → 400; handler not invoked
         probe = .{};
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/search/run?q=zig&limit=0", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/search/run?q=zig&limit=0", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 400), res.status);
         const body = try res.readAllAlloc(testing.allocator, 4096);
         defer testing.allocator.free(body);
-        try testing.expect(std.mem.indexOf(u8, body, "\"path\":\"limit\",\"code\":\"greater_than_equal\"") != null);
+        try testing.expect(std.mem.find(u8, body, "\"path\":\"limit\",\"code\":\"greater_than_equal\"") != null);
         try testing.expect(!probe.invoked);
     }
 
     { // good query → 200 through the middleware
-        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/search/run?q=zig&limit=10", .{port});
+        const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/search/run?q=zig&limit=10", .{port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
@@ -7087,7 +7087,7 @@ test "the Limits defaults are the security control, so each one is pinned" {
         for (0..1001) |i| {
             if (i != 0) try body.append(gpa, ',');
             var key_buf: [32]u8 = undefined;
-            const key = try std.fmt.bufPrint(&key_buf, "\"k{d}\":0", .{i});
+            const key = try std.mem.print(&key_buf, "\"k{d}\":0", .{i});
             try body.appendSlice(gpa, key);
         }
         try body.append(gpa, '}');
@@ -7944,7 +7944,7 @@ fn crossHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     try expectSchemaAgrees(body, &cross_schema);
     // The same object as every element of a root array.
     var wrapped: [2 * json_buf_len + 4]u8 = undefined;
-    if (std.fmt.bufPrint(&wrapped, "[{s},{s}]", .{ body, body })) |arr| {
+    if (std.mem.print(&wrapped, "[{s},{s}]", .{ body, body })) |arr| {
         var tree = try validateJsonRoot(testing.allocator, arr, &cross_array_root, .{});
         defer tree.deinit();
         var stream = try validateJsonRootStreaming(testing.allocator, arr, &cross_array_root, .{});

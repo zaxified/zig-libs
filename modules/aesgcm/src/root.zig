@@ -476,7 +476,7 @@ const x86_asm = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c
     (builtin.zig_backend != .stage2_x86_64 or
         (builtin.cpu.has(.x86, .aes) and builtin.cpu.has(.x86, .pclmul) and builtin.cpu.has(.x86, .ssse3)));
 
-/// 0 = not yet detected, else `@intFromEnum(Backend) + 1`. Detection is
+/// 0 = not yet detected, else `@backingInt(Backend) + 1`. Detection is
 /// idempotent, so two threads racing to fill it store the same value.
 var detected: std.atomic.Value(u8) = .init(0);
 
@@ -1717,7 +1717,7 @@ test "wipe zeroes the whole context" {
     for (all_backends) |b| {
         var ctx = Aes256Gcm.initWith(b, @splat(0x42)) orelse continue;
         const bytes = mem.asBytes(&ctx);
-        try testing.expect(mem.indexOfNone(u8, bytes, &.{0}) != null); // not vacuous
+        try testing.expect(mem.findNone(u8, bytes, &.{0}) != null); // not vacuous
         ctx.wipe();
         for (bytes) |x| try testing.expectEqual(@as(u8, 0), x);
     }

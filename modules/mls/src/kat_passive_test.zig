@@ -178,7 +178,7 @@ fn runEntry(
         const commit_msg = try hexDecode(sa, epoch.get("commit").?.string);
 
         var label_buf: [64]u8 = undefined;
-        const label = try std.fmt.bufPrint(&label_buf, "epoch index {d}", .{epoch_index});
+        const label = try std.mem.print(&label_buf, "epoch index {d}", .{epoch_index});
 
         g.processCommit(.{
             .commit_msg = commit_msg,

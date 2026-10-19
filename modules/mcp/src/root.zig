@@ -1567,23 +1567,23 @@ const HostPort = struct {
 /// opens it navigates to `http://evil.example/@localhost/`. Agreeing with the
 /// parser that acts on the answer matters more here than agreeing with the RFC.
 fn splitAuthority(after_scheme: []const u8) ?HostPort {
-    const end = std.mem.indexOfAny(u8, after_scheme, "/?#\\") orelse after_scheme.len;
+    const end = std.mem.findAny(u8, after_scheme, "/?#\\") orelse after_scheme.len;
     var authority = after_scheme[0..end];
-    if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| authority = authority[at + 1 ..];
+    if (std.mem.findScalarLast(u8, authority, '@')) |at| authority = authority[at + 1 ..];
 
     var host = authority;
     var port: []const u8 = "";
     const bracketed = host.len != 0 and host[0] == '[';
     if (bracketed) {
         // IPv6 literal: the host ends at ']' and only ":port" may follow it.
-        const close = std.mem.indexOfScalar(u8, host, ']') orelse return null;
+        const close = std.mem.findScalar(u8, host, ']') orelse return null;
         const after = host[close + 1 ..];
         host = host[0 .. close + 1];
         if (after.len != 0) {
             if (after[0] != ':') return null;
             port = after[1..];
         }
-    } else if (std.mem.indexOfScalar(u8, host, ':')) |colon| {
+    } else if (std.mem.findScalar(u8, host, ':')) |colon| {
         port = host[colon + 1 ..];
         host = host[0..colon];
     }
@@ -1595,7 +1595,7 @@ fn splitAuthority(after_scheme: []const u8) ?HostPort {
     }
     // A bracket in a *registered-name* host is malformed (a bracketed literal
     // was consumed above and keeps exactly its own two).
-    if (!bracketed and std.mem.indexOfAny(u8, host, "[]") != null) return null;
+    if (!bracketed and std.mem.findAny(u8, host, "[]") != null) return null;
     return .{ .host = host, .port = port };
 }
 
@@ -2276,7 +2276,7 @@ pub const ToolCall = struct {
 
     /// Append formatted text to the result (same OOM policy as `write`).
     pub fn print(self: *ToolCall, comptime fmt: []const u8, args: anytype) void {
-        const text = std.fmt.allocPrint(self.arena, fmt, args) catch return;
+        const text = self.arena.print(fmt, args) catch return;
         self.out.appendSlice(self.arena, text) catch {};
     }
 
@@ -2490,7 +2490,7 @@ pub const PromptRequest = struct {
 
     /// Append one formatted text message (same OOM policy as `message`).
     pub fn printMessage(self: *PromptRequest, role: RoleAlias, comptime fmt: []const u8, fmt_args: anytype) void {
-        const rendered = std.fmt.allocPrint(self.arena, fmt, fmt_args) catch return;
+        const rendered = self.arena.print(fmt, fmt_args) catch return;
         self.message(role, rendered);
     }
 };
@@ -4143,8 +4143,7 @@ test "jsonrpc: encode all standard error codes" {
         var buf: [256]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         try writeErrorLine(&w, .{ .integer = 3 }, c.code, c.msg);
-        const expected = try std.fmt.allocPrint(
-            testing.allocator,
+        const expected = try testing.allocator.print(
             "{{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}\n",
             .{ c.code, c.msg },
         );
@@ -4691,7 +4690,7 @@ fn fileTemplateReader(ctx: ?*anyopaque, req: *ResourceRequest) bool {
     if (!std.mem.startsWith(u8, req.uri, prefix)) return false;
     const name = req.uri[prefix.len..];
     if (name.len == 0) return false;
-    const body = std.fmt.allocPrint(req.arena, "contents of {s}", .{name}) catch return false;
+    const body = req.arena.print("contents of {s}", .{name}) catch return false;
     req.text(req.uri, "text/plain", body);
     return true;
 }
@@ -5272,8 +5271,7 @@ test "initialize: an over-long clientInfo field is truncated, not rejected" {
     try testing.expect(s.max_client_info_field_len < 300); // the test assumes the default cap
 
     const long_name = strRepeat("a", 300);
-    const msg = try std.fmt.allocPrint(
-        testing.allocator,
+    const msg = try testing.allocator.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"{s}\",\"version\":\"{s}\",\"title\":\"{s}\"}}}}}}",
         .{ long_name, long_name, long_name },
     );
@@ -5436,8 +5434,7 @@ fn serverWithCaps(caps_json: []const u8) !Server {
     errdefer s.deinit();
     var sink: std.Io.Writer.Allocating = .init(testing.allocator);
     defer sink.deinit();
-    const msg = try std.fmt.allocPrint(
-        testing.allocator,
+    const msg = try testing.allocator.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{s}}}}}",
         .{caps_json},
     );
@@ -5453,8 +5450,7 @@ fn serverWithCaps(caps_json: []const u8) !Server {
 fn handshakePeer(s: *Server, peer: u64, caps_json: []const u8) !void {
     var sink: std.Io.Writer.Allocating = .init(testing.allocator);
     defer sink.deinit();
-    const msg = try std.fmt.allocPrint(
-        testing.allocator,
+    const msg = try testing.allocator.print(
         "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{s}}}}}",
         .{caps_json},
     );
@@ -6233,10 +6229,10 @@ test "capability gate: one peer's initialize does not move another peer's gate (
     } };
     aw.clearRetainingCapacity();
     _ = try s.sendElicitationRequest(&aw.writer, form_req, .{ .peer = 2 });
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"mode\":\"form\"") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"mode\":\"form\"") != null);
     aw.clearRetainingCapacity();
     _ = try s.sendElicitationRequest(&aw.writer, form_req, .{ .peer = 4 });
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"mode\"") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"mode\"") == null);
 
     // And the lifecycle flag.
     try testing.expect(!s.clientInitialized(1));
@@ -6320,7 +6316,7 @@ test "max_peers bounds the state a transport that never forgets can accumulate" 
     try s.handleMessageFrom(
         \\{"jsonrpc":"2.0","id":9,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{}}}}
     , &aw.writer, 4);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"error\"") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"error\"") != null);
     try testing.expectEqual(@as(usize, 3), s.peers.items.len);
     try testing.expect(!s.clientCapabilities(4).sampling);
 
@@ -6508,7 +6504,7 @@ test "correlation: error wins over result in an answer carrying both; a code out
             .max_tokens = 10,
         }, .{ .on_response = &Collector.on, .ctx = &col });
         aw.clearRetainingCapacity();
-        const line = try std.fmt.allocPrint(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{d},{s}}}", .{ id, c.body });
+        const line = try testing.allocator.print("{{\"jsonrpc\":\"2.0\",\"id\":{d},{s}}}", .{ id, c.body });
         defer testing.allocator.free(line);
         try s.handleMessage(line, &aw.writer);
         try testing.expectEqualStrings("", aw.written());
@@ -6898,8 +6894,8 @@ test "server capabilities do not advertise sampling/elicitation (they are the CL
     try s.handleMessage(
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{},"elicitation":{}}}}
     , &aw.writer);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"sampling\"") == null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"elicitation\"") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"sampling\"") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"elicitation\"") == null);
 }
 
 // ── spec-literal anchors: the rest of the surface ───────────────────────────
@@ -7380,7 +7376,7 @@ fn handleOne(comptime S: type, src: *S, gpa: std.mem.Allocator, mutated: bool) a
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     s.handleMessage(buf[0..len], &aw.writer) catch return;
-    if (std.mem.indexOf(u8, aw.written(), "\"error\":") != null) fuzz_mark(.error_reply) else fuzz_mark(.ok_reply);
+    if (std.mem.find(u8, aw.written(), "\"error\":") != null) fuzz_mark(.error_reply) else fuzz_mark(.ok_reply);
     // The peer arm of the same entry point: `handleMessageFrom` with a
     // non-zero peer, which `handleMessage` does not reach.
     s.handleMessageFrom(buf[0..len], &aw.writer, 7) catch return;
@@ -7410,7 +7406,7 @@ test "corpus: every JSON-RPC seed reaches the dispatcher, and the replies are pi
         s.handleMessage(buf[0..len], &aw.writer) catch continue;
         const out = aw.written();
         reply_octets += out.len;
-        if (std.mem.indexOf(u8, out, "\"error\":") != null) errors += 1;
+        if (std.mem.find(u8, out, "\"error\":") != null) errors += 1;
     }
     // Measured 2026-09-07. Before: 1 round, `handleMessage("")`, one -32700.
     try testing.expectEqual(message_seeds.len - 1, nonempty); // the deliberate empty seed
@@ -7574,7 +7570,7 @@ fn fuzzJsonValue(c: *kit.Cursor, w: *std.Io.Writer, depth: u8) std.Io.Writer.Err
                 } else {
                     const m = c.ranged(0, 12);
                     var kbuf: [32]u8 = undefined;
-                    var key_len: usize = (std.fmt.bufPrint(&kbuf, "k{d}", .{i}) catch unreachable).len;
+                    var key_len: usize = (std.mem.print(&kbuf, "k{d}", .{i}) catch unreachable).len;
                     for (0..m) |_| {
                         kbuf[key_len] = fuzz_key_alphabet[c.byte() % fuzz_key_alphabet.len];
                         key_len += 1;
@@ -7845,7 +7841,7 @@ fn expectSpecResponse(s: *Server, request: []const u8, expected: []const u8, dro
     try s.handleMessage(request, &aw.writer);
     const line = aw.written();
     try testing.expect(line.len != 0 and line[line.len - 1] == '\n');
-    try testing.expect(std.mem.indexOfScalar(u8, line[0 .. line.len - 1], '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, line[0 .. line.len - 1], '\n') == null);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -8002,7 +7998,7 @@ test "2026-07-28 anchor: server/discover (schema example + discover.mdx example)
     // speaks, stateless first.
     const line = try replyTo(&s, spec_discover_request);
     defer testing.allocator.free(line);
-    try testing.expect(std.mem.indexOf(u8, line,
+    try testing.expect(std.mem.find(u8, line,
         \\"supportedVersions":["2026-07-28","2025-11-25","2025-06-18"]
     ) != null);
 }
@@ -8554,7 +8550,7 @@ test "2026-07-28: capabilities come from the request's _meta, never from (or int
     // the pending table.
     try testing.expectError(error.StatelessRequest, probe.send_result.?);
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "elicitation/create") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "elicitation/create") == null);
     // The session's gate did not move.
     try testing.expect(!s.clientCapabilities(0).elicitation);
     try testing.expectEqual(@as(usize, 1), s.peers.items.len);
@@ -8588,13 +8584,13 @@ test "2026-07-28: non-object structuredContent only for a modern call to a tool 
     for (cases) |c| {
         var buf: [512]u8 = undefined;
         const msg = if (c.modern)
-            try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s}}}}}}}", .{ c.tool, modern_meta_open })
+            try std.mem.print(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s}}}}}}}", .{ c.tool, modern_meta_open })
         else
-            try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\"}}}}", .{c.tool});
+            try std.mem.print(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\"}}}}", .{c.tool});
         const line = try replyTo(&s, msg);
         defer testing.allocator.free(line);
-        try testing.expectEqual(c.structured, std.mem.indexOf(u8, line, "\"structuredContent\":[1,2]") != null);
-        try testing.expect(c.structured or std.mem.indexOf(u8, line, "structuredContent") == null);
+        try testing.expectEqual(c.structured, std.mem.find(u8, line, "\"structuredContent\":[1,2]") != null);
+        try testing.expect(c.structured or std.mem.find(u8, line, "structuredContent") == null);
     }
 }
 
@@ -8810,8 +8806,8 @@ test "2026-07-28 MRTR anchor: a tool asks for the spec's InputRequests, then com
     const second = try replyTo(&s, retry);
     defer testing.allocator.free(second);
     try testing.expectEqual(@as(u32, 2), probe.rounds);
-    try testing.expect(std.mem.indexOf(u8, second, "\"resultType\":\"complete\"") != null);
-    try testing.expect(std.mem.indexOf(u8, second, "\"text\":\"octocat|The capital of France is Paris.|eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0\"") != null);
+    try testing.expect(std.mem.find(u8, second, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.find(u8, second, "\"text\":\"octocat|The capital of France is Paris.|eyJsb2NhdGlvbiI6Ik5ldyBZb3JrIn0\"") != null);
     // Nothing was ever pending on the server between the rounds.
     try testing.expectEqual(@as(usize, 0), s.pendingCount());
 }
@@ -8867,8 +8863,8 @@ test "2026-07-28 MRTR: asks are gated by the request's declared capabilities; th
     defer testing.allocator.free(r1);
     try testing.expectEqual(@as(?InputError, error.ElicitationNotSupported), o.err);
     try testing.expect(!o.required);
-    try testing.expect(std.mem.indexOf(u8, r1, "\"resultType\":\"complete\"") != null);
-    try testing.expect(std.mem.indexOf(u8, r1, "\"text\":\"plain\"") != null);
+    try testing.expect(std.mem.find(u8, r1, "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.find(u8, r1, "\"text\":\"plain\"") != null);
 
     // Session path: a stray inputResponses/requestState is not read, and
     // asking is refused.
@@ -8879,8 +8875,8 @@ test "2026-07-28 MRTR: asks are gated by the request's declared capabilities; th
     defer testing.allocator.free(r2);
     try testing.expectEqual(@as(?InputError, error.SessionRequest), o.err);
     try testing.expect(!o.responses_seen);
-    try testing.expect(std.mem.indexOf(u8, r2, "input_required") == null);
-    try testing.expect(std.mem.indexOf(u8, r2, "\"text\":\"plain\"") != null);
+    try testing.expect(std.mem.find(u8, r2, "input_required") == null);
+    try testing.expect(std.mem.find(u8, r2, "\"text\":\"plain\"") != null);
 
     // Declared: asked.
     o = .{};
@@ -8888,8 +8884,8 @@ test "2026-07-28 MRTR: asks are gated by the request's declared capabilities; th
     defer testing.allocator.free(r3);
     try testing.expectEqual(@as(?InputError, null), o.err);
     try testing.expect(o.required);
-    try testing.expect(std.mem.indexOf(u8, r3, "\"resultType\":\"input_required\"") != null);
-    try testing.expect(std.mem.indexOf(u8, r3, "plain") == null);
+    try testing.expect(std.mem.find(u8, r3, "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.find(u8, r3, "plain") == null);
 }
 
 test "2026-07-28 MRTR: a malformed inputResponses or requestState is -32602" {
@@ -8905,16 +8901,16 @@ test "2026-07-28 MRTR: a malformed inputResponses or requestState is -32602" {
     };
     for (cases) |c| {
         var buf: [512]u8 = undefined;
-        const msg = try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"g\",{s}{s}}}}}", .{ mrtr_meta, c.extra });
+        const msg = try std.mem.print(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"g\",{s}{s}}}}}", .{ mrtr_meta, c.extra });
         const line = try replyTo(&s, msg);
         defer testing.allocator.free(line);
-        try testing.expect(std.mem.indexOf(u8, line, "\"code\":-32602") != null);
-        try testing.expect(std.mem.indexOf(u8, line, c.msg) != null);
+        try testing.expect(std.mem.find(u8, line, "\"code\":-32602") != null);
+        try testing.expect(std.mem.find(u8, line, c.msg) != null);
     }
     // null means absent, as elsewhere in this module.
     const ok = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"g\"," ++ mrtr_meta ++ ",\"inputResponses\":null,\"requestState\":null}}");
     defer testing.allocator.free(ok);
-    try testing.expect(std.mem.indexOf(u8, ok, "input_required") != null);
+    try testing.expect(std.mem.find(u8, ok, "input_required") != null);
 }
 
 fn keyRulesHandler(ctx: ?*anyopaque, call: *ToolCall) bool {
@@ -8941,7 +8937,7 @@ test "2026-07-28 MRTR: keys are non-empty and unique, the state non-empty, the p
     try testing.expectEqual(@as(?InputError, error.NoMessages), errs[3]);
     // Only the one accepted request went out, once.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, line, "sampling/createMessage"));
-    try testing.expect(std.mem.indexOf(u8, line, "requestState") == null);
+    try testing.expect(std.mem.find(u8, line, "requestState") == null);
 }
 
 fn askingTemplate(ctx: ?*anyopaque, req: *ResourceRequest) bool {
@@ -8965,21 +8961,21 @@ test "2026-07-28 MRTR: resources/read and prompts/get; a declining template's as
 
     const r = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/read\",\"params\":{\"uri\":\"a://1\"," ++ mrtr_meta ++ "}}");
     defer testing.allocator.free(r);
-    try testing.expect(std.mem.indexOf(u8, r, "\"resultType\":\"input_required\"") != null);
-    try testing.expect(std.mem.indexOf(u8, r, "\"yes\":") != null);
-    try testing.expect(std.mem.indexOf(u8, r, "\"no\":") == null);
+    try testing.expect(std.mem.find(u8, r, "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.find(u8, r, "\"yes\":") != null);
+    try testing.expect(std.mem.find(u8, r, "\"no\":") == null);
     // Not a cacheable answer: no ttlMs/cacheScope on an InputRequiredResult.
-    try testing.expect(std.mem.indexOf(u8, r, "ttlMs") == null);
+    try testing.expect(std.mem.find(u8, r, "ttlMs") == null);
 
     const p = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"," ++ mrtr_meta ++ "}}");
     defer testing.allocator.free(p);
-    try testing.expect(std.mem.indexOf(u8, p, "\"resultType\":\"input_required\",\"requestState\":\"s1\"") != null);
+    try testing.expect(std.mem.find(u8, p, "\"resultType\":\"input_required\",\"requestState\":\"s1\"") != null);
 
     // Session path: the same prompt's setState is refused, so its `false`
     // stands and the get fails as before.
     const legacy = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}");
     defer testing.allocator.free(legacy);
-    try testing.expect(std.mem.indexOf(u8, legacy, "\"code\":-32603") != null);
+    try testing.expect(std.mem.find(u8, legacy, "\"code\":-32603") != null);
 }
 
 test "StateSeal: round trip; tampering, rebinding, expiry and garbage are refused" {
@@ -9072,7 +9068,7 @@ test "2026-07-28 MRTR: sealState/openState bind the state to the round's method 
 
     const retry = struct {
         fn line(a: std.mem.Allocator, tool: []const u8, tok: []const u8) ![]u8 {
-            return std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s},\"requestState\":\"{s}\"}}}}", .{ tool, mrtr_meta, tok });
+            return a.print("{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"{s}\",{s},\"requestState\":\"{s}\"}}}}", .{ tool, mrtr_meta, tok });
         }
     }.line;
 
@@ -9096,7 +9092,7 @@ test "2026-07-28 MRTR: sealState/openState bind the state to the round's method 
     defer testing.allocator.free(ok);
     try testing.expectEqual(@as(?StateSeal.OpenError, null), p.open_err);
     try testing.expectEqualStrings("cart=42", p.opened.?);
-    try testing.expect(std.mem.indexOf(u8, ok, "\"text\":\"done\"") != null);
+    try testing.expect(std.mem.find(u8, ok, "\"text\":\"done\"") != null);
 }
 
 // ── subscriptions/listen (2026-07-28) ───────────────────────────────────────
@@ -9190,8 +9186,8 @@ test "subscriptions/listen: integer ids echo as integers; a non-object filter is
 
     const legacy = try replyTo(&s, "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"subscriptions/listen\",\"params\":{}}");
     defer testing.allocator.free(legacy);
-    try testing.expect(std.mem.indexOf(u8, legacy, "\"code\":-32602") != null);
-    try testing.expect(std.mem.indexOf(u8, legacy, "acknowledged") == null);
+    try testing.expect(std.mem.find(u8, legacy, "\"code\":-32602") != null);
+    try testing.expect(std.mem.find(u8, legacy, "acknowledged") == null);
 }
 
 // ── deterministic fuzz driver (2026-10-09) ───────────────────────────────────

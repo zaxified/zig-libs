@@ -170,7 +170,7 @@ pub fn sameCapability(a: []const u8, b: []const u8) bool {
 }
 
 fn baseOf(uri: []const u8) []const u8 {
-    const q = std.mem.indexOfScalar(u8, uri, '?') orelse return uri;
+    const q = std.mem.findScalar(u8, uri, '?') orelse return uri;
     return uri[0..q];
 }
 
@@ -484,10 +484,10 @@ test "F5 regression: writeHello escapes a capability URI's XML metacharacters" {
     const hostile = [_][]const u8{"urn:example:cap?a=1&b=<2>"};
     try writeHello(&aw.writer, &hostile, null);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "a=1&amp;b=&lt;2&gt;") != null);
+    try testing.expect(std.mem.find(u8, out, "a=1&amp;b=&lt;2&gt;") != null);
     // And it must not contain the raw, unescaped metacharacters inside the
     // capability element (would make the XML ill-formed).
-    try testing.expect(std.mem.indexOf(u8, out, "a=1&b=<2>") == null);
+    try testing.expect(std.mem.find(u8, out, "a=1&b=<2>") == null);
 }
 
 test "writeHello round-trips through parseHello" {

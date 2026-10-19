@@ -143,7 +143,7 @@ pub fn append(
             // rejects an empty name; catching both here turns a would-be
             // EINVAL round-trip into a local error.
             if (n.len == 0 or n.len >= uapi.ifnamesize) return error.InvalidRequest;
-            if (std.mem.indexOfScalar(u8, n, 0) != null) return error.InvalidRequest;
+            if (std.mem.findScalar(u8, n, 0) != null) return error.InvalidRequest;
             codec.appendAttrString(gpa, list, uapi.HEADER.DEV_NAME, n) catch |e| switch (e) {
                 error.AttrTooLong => return error.InvalidRequest,
                 error.OutOfMemory => return error.OutOfMemory,

@@ -106,9 +106,9 @@ test "buildArtifactResolveSoap: unsigned, well-formed SOAP structure" {
     var doc = try xml.parse(alloc, soap_xml, .{ .id_attr_names = &.{"ID"} });
     defer doc.deinit();
     try testing.expect(std.mem.eql(u8, doc.root.uri, soap_ns) and std.mem.eql(u8, doc.root.local, "Envelope"));
-    try testing.expect(std.mem.indexOf(u8, soap_xml, "samlp:ArtifactResolve") != null);
-    try testing.expect(std.mem.indexOf(u8, soap_xml, artifact_b64) != null);
-    try testing.expect(std.mem.indexOf(u8, soap_xml, "ds:Signature") == null);
+    try testing.expect(std.mem.find(u8, soap_xml, "samlp:ArtifactResolve") != null);
+    try testing.expect(std.mem.find(u8, soap_xml, artifact_b64) != null);
+    try testing.expect(std.mem.find(u8, soap_xml, "ds:Signature") == null);
 }
 
 test "buildArtifactResolveSoap: signed output verifies through xmldsig.verify directly (independent verifier)" {
@@ -156,7 +156,7 @@ fn signArtifactResponse(alloc: std.mem.Allocator, seed: u64, id: []const u8, in_
     try rsa.generate(&kp, prng.random(), 1024, 65537);
     const digest_placeholder = "__TEST_DIGEST_PLACEHOLDER__";
 
-    const assembled = try std.fmt.allocPrint(alloc, "<samlp:ArtifactResponse xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
+    const assembled = try alloc.print("<samlp:ArtifactResponse xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
         "IssueInstant=\"2024-06-01T12:00:00Z\" InResponseTo=\"{s}\">" ++
         "<saml:Issuer>{s}</saml:Issuer>" ++
         "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
@@ -202,12 +202,12 @@ fn signArtifactResponse(alloc: std.mem.Allocator, seed: u64, id: []const u8, in_
     defer alloc.free(sig_b64);
 
     const empty_sv = "<ds:SignatureValue></ds:SignatureValue>";
-    const filled_sv = try std.fmt.allocPrint(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
+    const filled_sv = try alloc.print("<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
     defer alloc.free(filled_sv);
     const signed = try std.mem.replaceOwned(u8, alloc, with_digest, empty_sv, filled_sv);
     defer alloc.free(signed);
 
-    const soap_xml = try std.fmt.allocPrint(alloc, "<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}</soap:Body></soap:Envelope>", .{ soap_ns, signed });
+    const soap_xml = try alloc.print("<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}</soap:Body></soap:Envelope>", .{ soap_ns, signed });
     return .{ .xml = soap_xml, .key = kp.public_key };
 }
 
@@ -248,8 +248,8 @@ test "consumeArtifactResponseSoap: missing signature -> SignatureMissing" {
     const fake = try signArtifactResponse(alloc, 0xA47_0003, "_arresp02", "_ar003", "urn:oasis:names:tc:SAML:2.0:status:Success", enclosed_response);
     defer alloc.free(fake.xml);
 
-    const sig_start = std.mem.indexOf(u8, fake.xml, "<ds:Signature").?;
-    const sig_end = std.mem.indexOf(u8, fake.xml, "</ds:Signature>").? + "</ds:Signature>".len;
+    const sig_start = std.mem.find(u8, fake.xml, "<ds:Signature").?;
+    const sig_end = std.mem.find(u8, fake.xml, "</ds:Signature>").? + "</ds:Signature>".len;
     const stripped = try std.mem.concat(alloc, u8, &.{ fake.xml[0..sig_start], fake.xml[sig_end..] });
     defer alloc.free(stripped);
 
@@ -265,7 +265,7 @@ test "consumeArtifactResponseSoap: flipped SignatureValue -> SignatureInvalid (d
     defer alloc.free(fake.xml);
 
     const tag = "<ds:SignatureValue>";
-    const at = std.mem.indexOf(u8, fake.xml, tag).? + tag.len + 4;
+    const at = std.mem.find(u8, fake.xml, tag).? + tag.len + 4;
     fake.xml[at] = if (fake.xml[at] == 'A') 'B' else 'A';
 
     try testing.expectError(
@@ -321,14 +321,14 @@ test "M27 teeth: ArtifactResponse XSW -- valid signature pointing at a SIBLING i
     // body `signArtifactResponse` built.
     const ar_open = "<samlp:ArtifactResponse";
     const ar_close = "</samlp:ArtifactResponse>";
-    const ar_start = std.mem.indexOf(u8, fake.xml, ar_open).?;
-    const ar_end = std.mem.indexOfPos(u8, fake.xml, ar_start, ar_close).? + ar_close.len;
+    const ar_start = std.mem.find(u8, fake.xml, ar_open).?;
+    const ar_end = std.mem.findPos(u8, fake.xml, ar_start, ar_close).? + ar_close.len;
     const legit_block = fake.xml[ar_start..ar_end];
 
     const sig_open = "<ds:Signature";
     const sig_close = "</ds:Signature>";
-    const sig_start = std.mem.indexOfPos(u8, fake.xml, ar_start, sig_open).?;
-    const sig_end = std.mem.indexOfPos(u8, fake.xml, sig_start, sig_close).? + sig_close.len;
+    const sig_start = std.mem.findPos(u8, fake.xml, ar_start, sig_open).?;
+    const sig_end = std.mem.findPos(u8, fake.xml, sig_start, sig_close).? + sig_close.len;
     const sig_block = fake.xml[sig_start..sig_end];
 
     // The enveloped-signature transform removes only the specific `Signature`
@@ -355,8 +355,7 @@ test "M27 teeth: ArtifactResponse XSW -- valid signature pointing at a SIBLING i
         "IssueInstant=\"2024-06-01T12:00:00Z\"><saml:Issuer>https://evil.example.org/saml</saml:Issuer>" ++
         "<samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>" ++
         "</samlp:Response>";
-    const decoy = try std.fmt.allocPrint(
-        alloc,
+    const decoy = try alloc.print(
         "<samlp:ArtifactResponse xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"_decoy_wrap\" Version=\"2.0\" " ++
             "IssueInstant=\"2024-06-01T12:00:00Z\" InResponseTo=\"_ar_f27\"><saml:Issuer>{s}</saml:Issuer>{s}" ++
             "<samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>{s}</samlp:ArtifactResponse>",
@@ -364,8 +363,7 @@ test "M27 teeth: ArtifactResponse XSW -- valid signature pointing at a SIBLING i
     );
     defer alloc.free(decoy);
 
-    const wrapped = try std.fmt.allocPrint(
-        alloc,
+    const wrapped = try alloc.print(
         "<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}{s}</soap:Body></soap:Envelope>",
         .{ soap_ns, decoy, legit_nosig },
     );
@@ -401,7 +399,7 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
     const digest_placeholder = "__INNER_DIGEST__";
     // The inner Response's OWN signature: enveloped + INCLUSIVE (not
     // exclusive) C14N transform over itself.
-    const inner_template = try std.fmt.allocPrint(alloc, "<samlp:Response xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
+    const inner_template = try alloc.print("<samlp:Response xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
         "IssueInstant=\"2024-06-01T12:00:00Z\">" ++
         "<saml:Issuer>{s}</saml:Issuer>" ++
         "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
@@ -425,7 +423,7 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
     // that element is extracted as a standalone root.
     const wrap = "<wrap:Outer xmlns:wrap=\"urn:test:outer\" xmlns:extra=\"urn:test:extra\">{s}</wrap:Outer>";
 
-    const wrapped_for_digest = try std.fmt.allocPrint(alloc, wrap, .{inner_template});
+    const wrapped_for_digest = try alloc.print(wrap, .{inner_template});
     defer alloc.free(wrapped_for_digest);
     var doc1 = try xml.parse(alloc, wrapped_for_digest, .{ .id_attr_names = &.{"ID"} });
     defer doc1.deinit();
@@ -440,7 +438,7 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
 
     const inner_with_digest = try std.mem.replaceOwned(u8, alloc, inner_template, digest_placeholder, digest_b64);
     defer alloc.free(inner_with_digest);
-    const wrapped_with_digest = try std.fmt.allocPrint(alloc, wrap, .{inner_with_digest});
+    const wrapped_with_digest = try alloc.print(wrap, .{inner_with_digest});
     defer alloc.free(wrapped_with_digest);
     var doc2 = try xml.parse(alloc, wrapped_with_digest, .{ .id_attr_names = &.{"ID"} });
     defer doc2.deinit();
@@ -455,11 +453,11 @@ test "F12: exclusive-C14N extraction breaks an inner signature that used INCLUSI
     defer alloc.free(sig_b64);
 
     const empty_sv = "<ds:SignatureValue></ds:SignatureValue>";
-    const filled_sv = try std.fmt.allocPrint(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
+    const filled_sv = try alloc.print("<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
     defer alloc.free(filled_sv);
     const inner_signed = try std.mem.replaceOwned(u8, alloc, inner_with_digest, empty_sv, filled_sv);
     defer alloc.free(inner_signed);
-    const wrapped_signed = try std.fmt.allocPrint(alloc, wrap, .{inner_signed});
+    const wrapped_signed = try alloc.print(wrap, .{inner_signed});
     defer alloc.free(wrapped_signed);
 
     // Sanity: the inner signature IS valid in its original nested context --

@@ -141,8 +141,8 @@ test {
 }
 
 test "meta.model_after names drand/tlock and drand/kyber" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "drand/tlock") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "drand/kyber") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "drand/tlock") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "drand/kyber") != null);
 }
 
 test "meta.deps is exactly {bls12_381, entropy, chachapoly}" {

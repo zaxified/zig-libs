@@ -313,7 +313,7 @@ fn reference(gpa: std.mem.Allocator, cfgs: []const CertCfg, opts: policy.Options
                 for (0..before) |k| {
                     const node = t.items[k];
                     if (!node.alive or node.depth != i - 1) continue;
-                    if (std.mem.indexOfScalar(u8, node.expected.items, p) == null) continue;
+                    if (std.mem.findScalar(u8, node.expected.items, p) == null) continue;
                     matched = true;
                     try child(a, &t, @intCast(k), p, &.{p});
                 }
@@ -324,7 +324,7 @@ fn reference(gpa: std.mem.Allocator, cfgs: []const CertCfg, opts: policy.Options
                 };
             }
             // (d)(2)
-            const has_any = std.mem.indexOfScalar(u8, c.policies[0..c.n_policies], 0) != null;
+            const has_any = std.mem.findScalar(u8, c.policies[0..c.n_policies], 0) != null;
             if (has_any and (inhibit > 0 or (i < n and c.self_issued))) {
                 const after_d1 = t.items.len;
                 for (0..before) |k| {
@@ -366,7 +366,7 @@ fn reference(gpa: std.mem.Allocator, cfgs: []const CertCfg, opts: policy.Options
             const id = m[0];
             if (mapping > 0) {
                 var mapped: std.ArrayList(u8) = .empty;
-                for (c.mappings[0..c.n_mappings]) |mm| if (mm[0] == id and std.mem.indexOfScalar(u8, mapped.items, mm[1]) == null) try mapped.append(a, mm[1]);
+                for (c.mappings[0..c.n_mappings]) |mm| if (mm[0] == id and std.mem.findScalar(u8, mapped.items, mm[1]) == null) try mapped.append(a, mm[1]);
                 var found = false;
                 for (t.items) |*node| if (node.alive and node.depth == i and node.policy == id) {
                     node.expected = try mapped.clone(a);

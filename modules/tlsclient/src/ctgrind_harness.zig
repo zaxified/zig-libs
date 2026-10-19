@@ -146,8 +146,8 @@ fn derFromPem(comptime pem: []const u8) []const u8 {
     const S = struct {
         const der = blk: {
             @setEvalBranchQuota(1_000_000);
-            const begin = std.mem.indexOf(u8, pem, "-----\n").? + 6;
-            const end = std.mem.indexOf(u8, pem, "\n-----END").?;
+            const begin = std.mem.find(u8, pem, "-----\n").? + 6;
+            const end = std.mem.find(u8, pem, "\n-----END").?;
             var clean: [end - begin]u8 = undefined;
             var len: usize = 0;
             for (pem[begin..end]) |ch| if (ch != '\n') {

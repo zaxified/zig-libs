@@ -121,7 +121,7 @@ pub const gif = "GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff,\x00
 /// the replay serves the same paths with the same content types.
 fn hAny(ctx: *router.Ctx) anyerror!void {
     const path = ctx.req.path;
-    const name = path[(std.mem.lastIndexOfScalar(u8, path, '/') orelse 0) + 1 ..];
+    const name = path[(std.mem.findScalarLast(u8, path, '/') orelse 0) + 1 ..];
     if (std.mem.eql(u8, name, "page")) {
         try ctx.res.setHeader("Content-Type", "text/html; charset=utf-8");
         try ctx.res.writeAll(page);
@@ -228,7 +228,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "bun", "modules/security-headers/tools/browser_oracle.js", "--server", self });
     if (check) try argv.append(arena, "--check");
-    const home_bun = if (env.get("HOME")) |h| try std.fmt.allocPrint(arena, "{s}/.bun/bin/bun", .{h}) else "bun";
+    const home_bun = if (env.get("HOME")) |h| try arena.print("{s}/.bun/bin/bun", .{h}) else "bun";
     var child = std.process.spawn(io, .{ .argv = argv.items, .environ_map = &env, .stdin = .close }) catch retry: {
         argv.items[0] = home_bun;
         break :retry std.process.spawn(io, .{ .argv = argv.items, .environ_map = &env, .stdin = .close }) catch |e| {

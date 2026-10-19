@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: the TSan 'no-op' note is labelled as a 0.16 self-hosted-backend measurement (TSan needs `-fllvm`).
 
 - **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `Properties.isEmpty`, a packet test and `tools/bench.zig` reflect with `field_names`/`field_types`/`field_values`; the session fuzz `reach` loop gives every seed its own `SafeAllocator` (0.17 `testing.allocator` never reuses memory; same as testkit's driver).

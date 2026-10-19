@@ -447,7 +447,7 @@ fn eccName(e: qr.Ecc) []const u8 {
 /// The report line, and the reason `Options`' fields are nullable: it says of
 /// each of the three choices whether the module made it or the caller did.
 fn describe(buf: []u8, m: *const qr.Matrix, opts: Options) ![]const u8 {
-    return std.fmt.bufPrint(buf, "version {d} ({d}x{d} modules), level {s}, mask {d} -- version {s}, mask {s}, mode {s}", .{
+    return std.mem.print(buf, "version {d} ({d}x{d} modules), level {s}, mask {d} -- version {s}, mask {s}, mode {s}", .{
         m.version,
         m.size,
         m.size,
@@ -561,8 +561,8 @@ fn runSequence(gpa: Allocator, io: std.Io, opts: Options, room: usize) !u8 {
 /// `out.png` + symbol 2 of 3 -> `out-2of3.png`. Inserted before the extension
 /// so the file still opens in whatever is registered for `.png`.
 fn numberedPath(gpa: Allocator, path: []const u8, index: usize, total: usize) ![]u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse path.len;
-    return std.fmt.allocPrint(gpa, "{s}-{d}of{d}{s}", .{ path[0..dot], index, total, path[dot..] });
+    const dot = std.mem.findScalarLast(u8, path, '.') orelse path.len;
+    return gpa.print("{s}-{d}of{d}{s}", .{ path[0..dot], index, total, path[dot..] });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

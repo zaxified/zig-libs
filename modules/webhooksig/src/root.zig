@@ -400,7 +400,7 @@ pub const max_signatures = 16;
 pub const max_ed25519_signatures = 4;
 
 fn writeDecimal(buf: *[20]u8, v: u64) []const u8 {
-    return std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
+    return std.mem.print(buf, "{d}", .{v}) catch unreachable;
 }
 
 // ── Standard Webhooks ───────────────────────────────────────────────────────
@@ -521,7 +521,7 @@ pub const standard = struct {
     fn signEd25519Body(out: []u8, scratch: []u8, key_pair: *const Ed25519.KeyPair, msg_id: []const u8, timestamp: u64, payload: []const u8) (SignError || error{SigningFailed})![]const u8 {
         if (out.len < v1a_len) return error.OutputTooSmall;
         var tb: [20]u8 = undefined;
-        const content = std.fmt.bufPrint(scratch, "{s}.{s}.{s}", .{ msg_id, writeDecimal(&tb, timestamp), payload }) catch return error.OutputTooSmall;
+        const content = std.mem.print(scratch, "{s}.{s}.{s}", .{ msg_id, writeDecimal(&tb, timestamp), payload }) catch return error.OutputTooSmall;
         const sig = (key_pair.sign(content, null) catch return error.SigningFailed).toBytes();
         @memcpy(out[0..4], "v1a,");
         _ = std.base64.standard.Encoder.encode(out[4..v1a_len], &sig);
@@ -564,7 +564,7 @@ pub const standard = struct {
         while (it.next()) |entry| {
             seen += 1;
             if (seen > max_signatures) return error.InvalidHeader;
-            const comma = std.mem.indexOfScalar(u8, entry, ',') orelse continue;
+            const comma = std.mem.findScalar(u8, entry, ',') orelse continue;
             const version = entry[0..comma];
             const value = entry[comma + 1 ..];
             if (std.mem.eql(u8, version, "v1")) {
@@ -1193,7 +1193,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const sig = signFormat(f, secret, body, &sig_buf) catch return error.SignFailed;
     if (!verifyFormat(f, secret, body, sig)) return error.GenuineSignatureRefused;
     var padded_buf: [170]u8 = undefined;
-    const padded = std.fmt.bufPrint(&padded_buf, " \t{s} ", .{sig}) catch unreachable;
+    const padded = std.mem.print(&padded_buf, " \t{s} ", .{sig}) catch unreachable;
     if (!verifyFormat(f, secret, body, padded)) return error.PaddedSignatureRefused;
     VerifyMark.mark(.genuine_accepted);
 
@@ -1201,12 +1201,12 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // variant of itself). Base64: the next alphabet character, at a position
     // whose six bits all count (the last data character carries unused bits).
     const mac_text = sig[f.prefix.len..];
-    const data_chars = if (f.encoding == .hex) mac_text.len else std.mem.indexOfScalar(u8, mac_text, '=') orelse mac_text.len;
+    const data_chars = if (f.encoding == .hex) mac_text.len else std.mem.findScalar(u8, mac_text, '=') orelse mac_text.len;
     const pos = f.prefix.len + knobs.ranged(0, @intCast(data_chars - 2));
     var flipped: [160]u8 = undefined;
     @memcpy(flipped[0..sig.len], sig);
     const alphabet = if (f.encoding == .hex) "0123456789abcdef" else "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    flipped[pos] = alphabet[(std.mem.indexOfScalar(u8, alphabet, sig[pos]).? + 1) % alphabet.len];
+    flipped[pos] = alphabet[(std.mem.findScalar(u8, alphabet, sig[pos]).? + 1) % alphabet.len];
     if (verifyFormat(f, secret, body, flipped[0..sig.len])) return error.FlippedMacAccepted;
     if (f.prefix.len != 0) {
         @memcpy(flipped[0..sig.len], sig);
@@ -1415,7 +1415,7 @@ fn expectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn bodyOfResp(got: []const u8) []const u8 {
-    return got[std.mem.indexOf(u8, got, "\r\n\r\n").? + 4 ..];
+    return got[std.mem.find(u8, got, "\r\n\r\n").? + 4 ..];
 }
 
 /// Handler that echoes the verified body it received via `bodyOf` — a
@@ -1467,7 +1467,7 @@ test "middleware: missing header, tampered body and wrong secret each → 401" {
     // Missing signature header.
     const miss = runWire(&r, buildReq(&reqbuf, null, null, body), &respbuf);
     try expectStatus(miss, "401");
-    try testing.expect(std.mem.indexOf(u8, miss, "\r\nWWW-Authenticate: Signature\r\n") != null);
+    try testing.expect(std.mem.find(u8, miss, "\r\nWWW-Authenticate: Signature\r\n") != null);
 
     // Correct signature but the delivered body was altered in flight.
     var rb2: [512]u8 = undefined;
@@ -1915,7 +1915,7 @@ test "sweep: hostile headers never panic; sign/verify is exact under every schem
         // The fragment list carries the one genuine v1 signature; an accepted
         // header must contain it whole.
         if (sw) |_| {
-            if (std.mem.indexOf(u8, sigs, sw_v1) == null) return error.ForgedAccepted;
+            if (std.mem.find(u8, sigs, sw_v1) == null) return error.ForgedAccepted;
         } else |_| {}
         tally(&reach, sw);
         const st = stripe.verify(&.{"s"}, sigs, sw_payload, now, 300);

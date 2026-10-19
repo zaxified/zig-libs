@@ -1522,11 +1522,11 @@ test "the client assembles no request headers of its own" {
     // Everything from the test section down is scaffolding that builds fake
     // *replies*; the invariant is about the request path above it.
     const marker = "// \u{2500}\u{2500} tests \u{2500}";
-    const code = src[0 .. std.mem.indexOf(u8, src, marker) orelse src.len];
-    try testing.expect(std.mem.indexOf(u8, code, "appendHeader") == null);
-    try testing.expect(std.mem.indexOf(u8, code, "finishHeader") == null);
+    const code = src[0 .. std.mem.find(u8, src, marker) orelse src.len];
+    try testing.expect(std.mem.find(u8, code, "appendHeader") == null);
+    try testing.expect(std.mem.find(u8, code, "finishHeader") == null);
     // And every command method reaches the wire through the one seam.
-    try testing.expect(std.mem.indexOf(u8, code, "sendBuiltOver") != null);
+    try testing.expect(std.mem.find(u8, code, "sendBuiltOver") != null);
 }
 
 test "newSnapshot's reply correlation: a snapshot id is only taken from the region that was asked for" {

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `EnumSet`-style `IntegerBitSet.initEmpty()` -> `.empty`; `http.Method` enum iteration via `field_values`. No behaviour change.
 - **2026-10-12** — `http.Method` grew `.connect`, `.trace`, `.other` (http R9): routes for the first
   two work like any; a route for `.other` serves every extension method (the handler reads

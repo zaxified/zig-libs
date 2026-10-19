@@ -93,5 +93,5 @@ test {
 }
 
 test "meta.model_after names the OpenSSL Montgomery technique" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "MULX") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "MULX") != null);
 }

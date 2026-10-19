@@ -61,7 +61,7 @@ fn splitHrp(s: []const u8) SplitError!Split {
     if (saw_lower and saw_upper) return error.MixedCase;
 
     // The separator is the LAST '1' (data-part charset never contains '1').
-    const sep = std.mem.lastIndexOfScalar(u8, s, '1') orelse return error.NoSeparator;
+    const sep = std.mem.findScalarLast(u8, s, '1') orelse return error.NoSeparator;
     if (sep == 0) return error.EmptyHrp;
     for (s[0..sep]) |c| {
         if (c < 33 or c > 126) return error.HrpCharOutOfRange;
@@ -427,7 +427,7 @@ test "stripContinuation: official BOLT#12 vectors -- only the FIRST of two adjac
     // First '+' consumed as the marker, second appended literally: a `+`
     // survives in the output (unlike the fully-stripped, valid form), so
     // this still is not the string `decodeNoChecksum` would accept.
-    try testing.expect(std.mem.indexOfScalar(u8, stripped, '+') != null);
+    try testing.expect(std.mem.findScalar(u8, stripped, '+') != null);
     try testing.expectEqualStrings("ln+o1pqps7sjqpgtyzm3qv4uxzmtsd3jjqer9wd3hy6tsw35k7msjzfpy7nz5yqcnygrfdej82um5wf5k2uckyypwa3eyt44h6txtxquqh7lz5djge4afgfjn7k4rgrkuag0jsd5xvxg", stripped);
 }
 
@@ -520,7 +520,7 @@ const StringCorpus = struct {
         k += 1;
         for (text) |c| {
             const alphabet = charset ++ "1";
-            if (std.mem.indexOfScalar(u8, alphabet, c)) |idx| {
+            if (std.mem.findScalar(u8, alphabet, c)) |idx| {
                 script[k] = 0x01; // form: draw from the charset
                 script[k + 1] = @intCast(idx);
             } else {
@@ -690,12 +690,12 @@ fn fuzzRoundtrip(comptime S: type, src: *S, allocator: Allocator) anyerror!void 
     RoundtripMark.mark(.upper_roundtrip);
 
     // One replaced symbol after the separator.
-    const sep = std.mem.lastIndexOfScalar(u8, text, '1').?;
+    const sep = std.mem.findScalarLast(u8, text, '1').?;
     var bent: [256]u8 = undefined;
     @memcpy(bent[0..text.len], text);
     const at = sep + 1 + src.index(text.len - sep - 1);
     const alphabet = charset;
-    const cur = std.mem.indexOfScalar(u8, alphabet, bent[at]).?;
+    const cur = std.mem.findScalar(u8, alphabet, bent[at]).?;
     bent[at] = alphabet[(cur + 1 + src.index(alphabet.len - 1)) % alphabet.len];
     if (decode(allocator, bent[0..text.len])) |d| {
         var dd = d;

@@ -215,7 +215,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const ref_dump = try check(gpa, input, opts, intact and opts.max_depth == 256);
     defer if (ref_dump) |d| gpa.free(d);
     if (ref_dump != null and opts.doctype == .internal_entities and
-        (std.mem.indexOf(u8, input, "&e;") != null or std.mem.indexOf(u8, input, "&f;") != null))
+        (std.mem.find(u8, input, "&e;") != null or std.mem.find(u8, input, "&f;") != null))
         hit("entity-expanded");
     // The same document in another encoding reads to the same infoset.
     if (intact and enc != .utf8) {

@@ -143,7 +143,7 @@ pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
         if (first) {
             first = false;
             if (std.mem.startsWith(u8, std.mem.trimStart(u8, line, " "), "Num")) {
-                has_inode = std.mem.indexOf(u8, line, "Inode") != null;
+                has_inode = std.mem.find(u8, line, "Inode") != null;
                 continue;
             }
         }
@@ -274,7 +274,7 @@ test "live: readUnix sees a listener this process binds" {
     // An abstract-namespace listener: no file to clean up.
     var name_buf: [64]u8 = undefined;
     const pid: u32 = @intCast(std.os.linux.getpid());
-    const addr_path = std.fmt.bufPrint(&name_buf, "\x00procnet-unix-test-{d}", .{pid}) catch unreachable;
+    const addr_path = std.mem.print(&name_buf, "\x00procnet-unix-test-{d}", .{pid}) catch unreachable;
     const addr = std.Io.net.UnixAddress.init(addr_path) catch return error.SkipZigTest;
     var server = addr.listen(io, .{}) catch return error.SkipZigTest;
     defer server.deinit(io);
@@ -285,7 +285,7 @@ test "live: readUnix sees a listener this process binds" {
     try testing.expect(!t.truncated);
 
     var want_buf: [64]u8 = undefined;
-    const want = std.fmt.bufPrint(&want_buf, "@procnet-unix-test-{d}", .{pid}) catch unreachable;
+    const want = std.mem.print(&want_buf, "@procnet-unix-test-{d}", .{pid}) catch unreachable;
     var found = false;
     for (t.entries) |e| {
         // std's bind appends a NUL to the name, which the kernel prints as a

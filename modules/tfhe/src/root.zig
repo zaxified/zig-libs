@@ -99,6 +99,6 @@ test {
 }
 
 test "meta.model_after names TFHE + FHEW" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "TFHE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "FHEW") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "TFHE") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "FHEW") != null);
 }

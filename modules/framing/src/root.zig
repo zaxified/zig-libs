@@ -651,8 +651,8 @@ test "envelope round-trip (enum-payload variant)" {
 
     const bytes = try TestCodec.encodeAlloc(msg, gpa);
     defer gpa.free(bytes);
-    try t.expect(std.mem.indexOf(u8, bytes, "\"ping\"") != null);
-    try t.expect(std.mem.indexOf(u8, bytes, "\"running\"") != null);
+    try t.expect(std.mem.find(u8, bytes, "\"ping\"") != null);
+    try t.expect(std.mem.find(u8, bytes, "\"running\"") != null);
 
     const parsed = try TestCodec.parse(gpa, bytes);
     defer parsed.deinit();

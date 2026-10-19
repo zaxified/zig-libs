@@ -134,9 +134,9 @@ fn keygen(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) 
     defer std.crypto.secureZero(u8, &kp.dk);
     std.crypto.secureZero(u8, &seed);
 
-    const pk_path = try std.fmt.allocPrint(gpa, "{s}.pk", .{stem});
+    const pk_path = try gpa.print("{s}.pk", .{stem});
     defer gpa.free(pk_path);
-    const sk_path = try std.fmt.allocPrint(gpa, "{s}.sk", .{stem});
+    const sk_path = try gpa.print("{s}.sk", .{stem});
     defer gpa.free(sk_path);
 
     // Never clobber an existing keypair. Overwriting a `.sk` is irreversible
@@ -492,7 +492,7 @@ fn capsuleInfo(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     const now = beacon.wallNow();
     var when_buf: [40]u8 = undefined;
     var hash_hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hash_hex, "{x}", .{&cap.chain_hash}) catch unreachable;
+    _ = std.mem.print(&hash_hex, "{x}", .{&cap.chain_hash}) catch unreachable;
 
     std.debug.print("capsule:  {s}\n", .{in_file});
     std.debug.print("chain:    {s}\n", .{hash_hex});
@@ -598,7 +598,7 @@ const PartialFile = struct {
     committed: bool = false,
 
     fn create(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?PartialFile {
-        const tmp = std.fmt.allocPrint(gpa, "{s}.partial", .{path}) catch {
+        const tmp = gpa.print("{s}.partial", .{path}) catch {
             std.debug.print("timecapsule: out of memory\n", .{});
             return null;
         };
@@ -696,7 +696,7 @@ fn writeWholeFile(io: std.Io, path: []const u8, bytes: []const u8, secret: bool)
     var file = try std.Io.Dir.cwd().createFile(io, path, .{
         .truncate = true,
         // 0600 at creation — never a window where the secret key is readable.
-        .permissions = if (secret) @enumFromInt(0o600) else .default_file,
+        .permissions = if (secret) @fromBackingInt(@intCast(0o600)) else .default_file,
     });
     defer file.close(io);
     var buf: [4096]u8 = undefined;

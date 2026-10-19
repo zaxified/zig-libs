@@ -107,10 +107,10 @@ pub fn main() !void {
     while (session <= 2) : (session += 1) {
         var label_buf: [64]u8 = undefined;
 
-        const alice_label = std.fmt.bufPrint(&label_buf, "decaf448 example alice sk session {d}", .{session}) catch unreachable;
+        const alice_label = std.mem.print(&label_buf, "decaf448 example alice sk session {d}", .{session}) catch unreachable;
         const alice_sk = scalarFromLabel(alice_label);
         var bob_label_buf: [64]u8 = undefined;
-        const bob_label = std.fmt.bufPrint(&bob_label_buf, "decaf448 example bob sk session {d}", .{session}) catch unreachable;
+        const bob_label = std.mem.print(&bob_label_buf, "decaf448 example bob sk session {d}", .{session}) catch unreachable;
         const bob_sk = scalarFromLabel(bob_label);
 
         const alice_pub = Element.scalarMul(G, &alice_sk);

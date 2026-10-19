@@ -162,7 +162,7 @@ test "external: genesis block decodes byte-exact against the wiki's published ra
     try testing.expectEqual(@as(i32, 1), blk.header.version);
     try testing.expectEqual(@as(usize, 1), blk.txns.len);
     try testing.expectEqual(@as(i64, 50 * 100_000_000), blk.txns[0].vout[0].value);
-    try testing.expect(std.mem.indexOf(u8, blk.txns[0].vin[0].script_sig, "The Times 03/Jan/2009") != null);
+    try testing.expect(std.mem.find(u8, blk.txns[0].vin[0].script_sig, "The Times 03/Jan/2009") != null);
 
     const reser = try serializeBlock(allocator, blk);
     defer allocator.free(reser);

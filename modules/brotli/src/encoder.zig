@@ -3738,7 +3738,7 @@ fn moveToFront(map: []const u8, out: []u8) void {
     var order: [256]u8 = undefined;
     for (&order, 0..) |*o, i| o.* = @intCast(i);
     for (map, out) |v, *r| {
-        const idx: u8 = @intCast(std.mem.indexOfScalar(u8, &order, v).?);
+        const idx: u8 = @intCast(std.mem.findScalar(u8, &order, v).?);
         r.* = idx;
         var j: usize = idx;
         while (j > 0) : (j -= 1) order[j] = order[j - 1];
@@ -7220,7 +7220,7 @@ test "max: a dictionary word that would decode to other bytes is refused (block 
     // "timedownlifeleftback…"): identity at max_distance + 2.
     const env: BlockEnv = .{ .max_backward = (1 << 16) - 16 };
     const n = 4;
-    const idx = std.mem.indexOf(u8, dictionary.data[dictionary.offsets_by_length[n]..][0 .. n << 10], "time").? / n;
+    const idx = std.mem.find(u8, dictionary.data[dictionary.offsets_by_length[n]..][0 .. n << 10], "time").? / n;
     const pos = 100;
     const good: Cmd = .{ .insert_len = 0, .copy_len = n, .dist = @intCast(pos + 1 + idx), .out_len = n };
     try checkWord(good, pos, env, "time");

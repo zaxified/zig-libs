@@ -2255,7 +2255,7 @@ fn signProtocolMessage(
         .rsa => |s| s,
     };
 
-    const assembled = try std.fmt.allocPrint(alloc, "{s}{s}<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
+    const assembled = try alloc.print("{s}{s}<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++
         "<ds:CanonicalizationMethod Algorithm=\"{s}\"/>" ++
         "<ds:SignatureMethod Algorithm=\"{s}\"/>" ++
         "<ds:Reference URI=\"#{s}\"><ds:Transforms>" ++
@@ -2324,7 +2324,7 @@ fn signProtocolMessage(
     defer alloc.free(sig_b64);
 
     const empty_sv = "<ds:SignatureValue></ds:SignatureValue>";
-    const filled_sv = try std.fmt.allocPrint(alloc, "<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
+    const filled_sv = try alloc.print("<ds:SignatureValue>{s}</ds:SignatureValue>", .{sig_b64});
     defer alloc.free(filled_sv);
     return std.mem.replaceOwned(u8, alloc, with_digest, empty_sv, filled_sv);
 }
@@ -3019,7 +3019,7 @@ pub fn buildLogoutRequest(alloc: std.mem.Allocator, opts: LogoutRequestOptions) 
     if (opts.sign_with) |key| {
         return signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:LogoutRequest>", opts.id, key);
     }
-    return std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:LogoutRequest>", .{ root_open, issuer_xml, rest_xml });
+    return alloc.print("{s}{s}{s}</samlp:LogoutRequest>", .{ root_open, issuer_xml, rest_xml });
 }
 
 // ── LogoutResponse: build + sign ─────────────────────────────────────────────
@@ -3094,7 +3094,7 @@ pub fn buildLogoutResponse(alloc: std.mem.Allocator, opts: LogoutResponseOptions
     if (opts.sign_with) |key| {
         return signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:LogoutResponse>", opts.id, key);
     }
-    return std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:LogoutResponse>", .{ root_open, issuer_xml, rest_xml });
+    return alloc.print("{s}{s}{s}</samlp:LogoutResponse>", .{ root_open, issuer_xml, rest_xml });
 }
 
 // ── LogoutRequest: parse + verify (incoming, IdP-initiated) ─────────────────
@@ -3590,10 +3590,10 @@ pub fn buildArtifactResolveSoap(alloc: std.mem.Allocator, opts: ArtifactResolveO
     const inner = if (opts.sign_with) |key|
         try signProtocolMessage(alloc, root_open, issuer_xml, rest_xml, "</samlp:ArtifactResolve>", opts.id, key)
     else
-        try std.fmt.allocPrint(alloc, "{s}{s}{s}</samlp:ArtifactResolve>", .{ root_open, issuer_xml, rest_xml });
+        try alloc.print("{s}{s}{s}</samlp:ArtifactResolve>", .{ root_open, issuer_xml, rest_xml });
     defer alloc.free(inner);
 
-    return std.fmt.allocPrint(alloc, "<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}</soap:Body></soap:Envelope>", .{ soap_ns, inner });
+    return alloc.print("<soap:Envelope xmlns:soap=\"{s}\"><soap:Body>{s}</soap:Body></soap:Envelope>", .{ soap_ns, inner });
 }
 
 pub const ArtifactResponseConfig = struct {
@@ -4535,7 +4535,7 @@ test "TEETH: every untrusted parse in this file goes through an options helper" 
 
     var i: usize = 0;
     var checked: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+    while (std.mem.findPos(u8, src, i, needle)) |at| {
         i = at + needle.len;
         const tail = src[at..@min(src.len, at + 96)];
         var skip = false;
@@ -4544,8 +4544,8 @@ test "TEETH: every untrusted parse in this file goes through an options helper" 
         }
         if (skip) continue;
         checked += 1;
-        const ok = std.mem.indexOf(u8, tail, "untrustedXmlOptions()") != null or
-            std.mem.indexOf(u8, tail, "untrustedMetadataXmlOptions()") != null;
+        const ok = std.mem.find(u8, tail, "untrustedXmlOptions()") != null or
+            std.mem.find(u8, tail, "untrustedMetadataXmlOptions()") != null;
         if (!ok) {
             std.debug.print("an untrusted xml.parse does not use an options helper:\n  {s}\n", .{tail});
             return error.UntrustedParseWithoutBudget;

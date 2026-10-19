@@ -360,7 +360,7 @@ const FakeServer = struct {
                 } else return;
                 continue;
             }
-            const nl = std.mem.indexOf(u8, rest, "\r\n") orelse return;
+            const nl = std.mem.find(u8, rest, "\r\n") orelse return;
             const line = rest[0..nl];
             rest = rest[nl + 2 ..];
             try self.pushNextReply();
@@ -404,7 +404,7 @@ test "a whole conversation over the fake server, and the received message matche
     try testing.expectEqual(@as(usize, 1), srv.messages.items.len);
     try testing.expectEqualStrings(body, srv.messages.items[0]);
     // ...and the wire really did carry the doubled period.
-    try testing.expect(std.mem.indexOf(u8, srv.received.items, "before\r\n..\r\nafter") != null);
+    try testing.expect(std.mem.find(u8, srv.received.items, "before\r\n..\r\nafter") != null);
 }
 
 test "the same conversation with a one-byte-at-a-time transport" {
@@ -460,7 +460,7 @@ test "sendMessage composes and delivers, and returns the exact octets sent" {
 
     try testing.expectEqual(@as(usize, 1), srv.messages.items.len);
     try testing.expectEqualStrings(doc, srv.messages.items[0]);
-    try testing.expect(std.mem.indexOf(u8, doc, "\r\n.\r\n") != null);
+    try testing.expect(std.mem.find(u8, doc, "\r\n.\r\n") != null);
 }
 
 test "STARTTLS: buffered plaintext across the handshake is refused" {
@@ -685,7 +685,7 @@ test "live interop: a full session against a real SMTP server" {
         );
         return error.SkipZigTest;
     };
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 
@@ -822,7 +822,7 @@ fn fuzzUpgrade(ctx: *anyopaque) TransportError!Transport {
 
 /// First index of `needle` in `hay`, or null.
 fn fuzzFind(hay: []const u8, needle: []const u8) ?usize {
-    return std.mem.indexOf(u8, hay, needle);
+    return std.mem.find(u8, hay, needle);
 }
 
 const ClientMark = fz.Marker(enum {
@@ -945,7 +945,7 @@ pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     if (conf != .plain) {
         const b64 = std.base64.standard.Encoder;
         var plain_blob: [64]u8 = undefined;
-        const blob = std.fmt.bufPrint(&plain_blob, "\x00{s}\x00{s}", .{ fuzz_user, fuzz_pass }) catch unreachable;
+        const blob = std.mem.print(&plain_blob, "\x00{s}\x00{s}", .{ fuzz_user, fuzz_pass }) catch unreachable;
         var e1: [128]u8 = undefined;
         var e2: [128]u8 = undefined;
         var e3: [128]u8 = undefined;

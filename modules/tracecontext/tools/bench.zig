@@ -71,7 +71,7 @@ fn sumBytes(s: []const u8) u64 {
 fn headerValue(resp: []const u8, comptime name: []const u8) ?[]const u8 {
     const at = std.ascii.findIgnoreCase(resp, "\r\n" ++ name ++ ":") orelse return null;
     const rest = resp[at + 2 + name.len + 1 ..];
-    const end = std.mem.indexOf(u8, rest, "\r\n") orelse rest.len;
+    const end = std.mem.find(u8, rest, "\r\n") orelse rest.len;
     return std.mem.trim(u8, rest[0..end], " ");
 }
 
@@ -126,15 +126,15 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
             tid[0] |= 1;
             sid[0] |= 1;
             const wire = switch (wi) {
-                1 => try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: 00-{x}-{x}-01\r\nConnection: close\r\n\r\n", .{ tid, sid }),
-                2 => try std.fmt.allocPrint(arena, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: 00-{x}-{x}-01\r\ntracestate: congo=t61rcWkgMzE,rojo=00f067aa0ba902b7\r\nConnection: close\r\n\r\n", .{ tid, sid }),
+                1 => try arena.print("GET / HTTP/1.1\r\nHost: t\r\ntraceparent: 00-{x}-{x}-01\r\nConnection: close\r\n\r\n", .{ tid, sid }),
+                2 => try arena.print("GET / HTTP/1.1\r\nHost: t\r\ntraceparent: 00-{x}-{x}-01\r\ntracestate: congo=t61rcWkgMzE,rojo=00f067aa0ba902b7\r\nConnection: close\r\n\r\n", .{ tid, sid }),
                 else => try arena.dupe(u8, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"),
             };
             d.wires[wi][i] = wire;
             if (i != 0) try all.writer.writeByte(0);
             try all.writer.writeAll(wire);
         }
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = all.written() });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.wire", .{name}), .data = all.written() });
     }
     return d;
 }
@@ -168,7 +168,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

@@ -102,7 +102,7 @@ const RoundMark = enum { genuine_accepted, flipped_refused, bech32m, long };
 
 /// A different char of `alphabet` at `s[at]`.
 fn flip(s: []u8, at: usize, alphabet: []const u8) void {
-    const i = std.mem.indexOfScalar(u8, alphabet, s[at]).?;
+    const i = std.mem.findScalar(u8, alphabet, s[at]).?;
     s[at] = alphabet[(i + 1) % alphabet.len];
 }
 
@@ -136,7 +136,7 @@ fn fuzzBech32Roundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
 
     var copy: [bech32.max_len]u8 = undefined;
     @memcpy(copy[0..s.len], s.slice());
-    const sep = std.mem.lastIndexOfScalar(u8, s.slice(), '1').?;
+    const sep = std.mem.findScalarLast(u8, s.slice(), '1').?;
     const at = sep + 1 + src.index(s.len - sep - 1);
     flip(copy[0..s.len], at, bech32.charset);
     if (bech32.decode(copy[0..s.len])) |_| return error.FlippedAccepted else |_| {}
@@ -208,7 +208,7 @@ fn fuzzSegwitRoundtrip(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerr
     if (segwit.decodeSegwit(if (hrp[0] == 'b') "tb" else "bc", s.slice())) |_| return error.WrongHrpAccepted else |_| {}
     var copy: [bech32.max_len]u8 = undefined;
     @memcpy(copy[0..s.len], s.slice());
-    const sep = std.mem.lastIndexOfScalar(u8, s.slice(), '1').?;
+    const sep = std.mem.findScalarLast(u8, s.slice(), '1').?;
     flip(copy[0..s.len], sep + 1 + src.index(s.len - sep - 1), bech32.charset);
     if (segwit.decodeSegwit(hrp, copy[0..s.len])) |_| return error.FlippedAccepted else |_| {}
     SegMark.mark(.flipped_refused);

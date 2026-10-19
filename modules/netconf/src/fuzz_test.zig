@@ -94,7 +94,7 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     const w = &aw.writer;
     var kind: Kind = .hello;
     var id_buf: [24]u8 = undefined;
-    const id = std.fmt.bufPrint(&id_buf, "{d}", .{src.value(u32)}) catch unreachable;
+    const id = std.mem.print(&id_buf, "{d}", .{src.value(u32)}) catch unreachable;
     var raw_mode = false;
     var tmp: [3000]u8 = undefined;
     if (S == fuzz_driver.Rng) {

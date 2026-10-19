@@ -51,7 +51,7 @@ pub const Build = struct {
     };
 
     pub fn fmt(b: *Build, comptime format: []const u8, args: anytype) []u8 {
-        return std.fmt.allocPrint(b.allocator, format, args) catch @panic("OOM");
+        return b.allocator.print(format, args) catch @panic("OOM");
     }
 
     pub fn dupe(b: *Build, bytes: []const u8) []u8 {

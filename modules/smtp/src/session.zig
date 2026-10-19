@@ -1105,7 +1105,7 @@ test "AUTH PLAIN over TLS, with the RFC 4954 initial response" {
     try testing.expect(s.authenticated);
     var expected: [128]u8 = undefined;
     const ir = try auth_mod.plainResponse(&expected, "", "user@example.com", "s3cret");
-    const want = try std.fmt.allocPrint(gpa, "EHLO c.example.org\r\nSTARTTLS\r\nEHLO c.example.org\r\nAUTH PLAIN {s}\r\n", .{ir});
+    const want = try gpa.print("EHLO c.example.org\r\nSTARTTLS\r\nEHLO c.example.org\r\nAUTH PLAIN {s}\r\n", .{ir});
     defer gpa.free(want);
     try testing.expectEqualStrings(want, sc.sent.items);
 }
@@ -1143,7 +1143,7 @@ test "AUTH is refused on a plaintext link unless the caller opts in" {
     try testing.expectError(error.PlaintextAuthRefused, sc.run(&s));
     try testing.expectEqual(State.closed, s.state);
     // The password never reached the wire.
-    try testing.expect(std.mem.indexOf(u8, sc.sent.items, "AUTH") == null);
+    try testing.expect(std.mem.find(u8, sc.sent.items, "AUTH") == null);
 }
 
 test "the command buffer's spare capacity holds no AUTH line once AUTH succeeds (A1 F14)" {
@@ -1160,7 +1160,7 @@ test "the command buffer's spare capacity holds no AUTH line once AUTH succeeds 
         defer control.deinit(gpa);
         try control.appendSlice(gpa, "AUTH PLAIN control\r\n");
         control.clearRetainingCapacity();
-        if (std.mem.indexOf(u8, control.allocatedSlice(), "AUTH") == null) return error.SkipZigTest;
+        if (std.mem.find(u8, control.allocatedSlice(), "AUTH") == null) return error.SkipZigTest;
     }
 
     var s: Session = .init(gpa, .{
@@ -1181,12 +1181,12 @@ test "the command buffer's spare capacity holds no AUTH line once AUTH succeeds 
     var ir_buf: [128]u8 = undefined;
     const ir = try auth_mod.plainResponse(&ir_buf, "", "user@example.com", "s3cret-F14");
     // Control: the credentials did go through this buffer.
-    try testing.expect(std.mem.indexOf(u8, sc.sent.items, ir) != null);
+    try testing.expect(std.mem.find(u8, sc.sent.items, ir) != null);
     try testing.expectEqual(@as(usize, 0), s.out.items.len);
     const spare = s.out.allocatedSlice();
     try testing.expect(spare.len >= ir.len);
-    try testing.expect(std.mem.indexOf(u8, spare, ir) == null);
-    try testing.expect(std.mem.indexOf(u8, spare, "AUTH") == null);
+    try testing.expect(std.mem.find(u8, spare, ir) == null);
+    try testing.expect(std.mem.find(u8, spare, "AUTH") == null);
 }
 
 // ── F5: credential zeroization, verified on the artifact ────────────────────

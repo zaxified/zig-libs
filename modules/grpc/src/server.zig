@@ -639,7 +639,7 @@ pub const Call = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) status_mod.StatusError {
-        const msg = std.fmt.allocPrint(c.arena, fmt, args) catch "";
+        const msg = c.arena.print(fmt, args) catch "";
         return c.fail(s, msg);
     }
 
@@ -712,7 +712,7 @@ pub const Call = struct {
     /// successful or not, leaves this module.
     fn finish(c: *Call) void {
         if (c.write_failed) return; // the stream is gone; nothing can be said
-        const code = std.fmt.allocPrint(c.arena, "{d}", .{@backingInt(c.status)}) catch return;
+        const code = c.arena.print("{d}", .{@backingInt(c.status)}) catch return;
         const message: ?[]const u8 = if (c.status_message.len == 0) null else blk: {
             const buf = c.arena.alloc(u8, status_mod.encodedMessageLen(c.status_message)) catch
                 break :blk null;
@@ -888,7 +888,7 @@ pub fn grpcContentType(ct: []const u8) ?[]const u8 {
     return switch (ct[base.len]) {
         // `+subtype` runs until a parameter starts.
         '+' => blk: {
-            const end = std.mem.indexOfAny(u8, ct, "; ") orelse ct.len;
+            const end = std.mem.findAny(u8, ct, "; ") orelse ct.len;
             break :blk ct[0..end];
         },
         ';', ' ' => ct[0..base.len],
@@ -905,12 +905,12 @@ pub const PathSplit = struct { service: []const u8, method: []const u8 };
 pub fn splitPath(path: []const u8) ?PathSplit {
     if (path.len < 2 or path[0] != '/') return null;
     const rest = path[1..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, rest, '/') orelse return null;
     const service = rest[0..slash];
     const method = rest[slash + 1 ..];
     if (service.len == 0 or method.len == 0) return null;
     // A name containing another separator is not a name.
-    if (std.mem.indexOfScalar(u8, method, '/') != null) return null;
+    if (std.mem.findScalar(u8, method, '/') != null) return null;
     return .{ .service = service, .method = method };
 }
 

@@ -146,7 +146,7 @@ test {
 }
 
 test "meta.model_after names the bbs-signatures draft" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "bbs-signatures-12") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "bbs-signatures-12") != null);
 }
 
 test "meta.deps is exactly {bls12_381, entropy}" {

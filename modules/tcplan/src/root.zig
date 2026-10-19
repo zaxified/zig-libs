@@ -311,7 +311,7 @@ test "oracle: dual-stack circuit with HTB knobs is byte-identical to iproute2's 
             try maskHtbRateTables(want);
             try maskHtbRateTables(got);
         }
-        if (std.mem.indexOfDiff(u8, want, got)) |at| {
+        if (std.mem.findDiff(u8, want, got)) |at| {
             std.debug.print("op {d}: first diff at byte {d} (want len {d}, got len {d})\n", .{ n, at, want.len, got.len });
             return error.TestExpectedEqual;
         }

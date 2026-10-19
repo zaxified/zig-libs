@@ -985,12 +985,12 @@ test "buildGetUrl: percent-encodes reserved base64 characters" {
     const b64_segment = url[prefix.len..];
     // No raw base64 special characters leak into the path segment — every
     // '+'/'/'/'=' must have been percent-encoded away.
-    try testing.expect(std.mem.indexOfScalar(u8, b64_segment, '+') == null);
-    try testing.expect(std.mem.indexOfScalar(u8, b64_segment, '/') == null);
-    try testing.expect(std.mem.indexOfScalar(u8, b64_segment, '=') == null);
-    try testing.expect(std.mem.indexOf(u8, b64_segment, "%2B") != null or
-        std.mem.indexOf(u8, b64_segment, "%2F") != null or
-        std.mem.indexOf(u8, b64_segment, "%3D") != null);
+    try testing.expect(std.mem.findScalar(u8, b64_segment, '+') == null);
+    try testing.expect(std.mem.findScalar(u8, b64_segment, '/') == null);
+    try testing.expect(std.mem.findScalar(u8, b64_segment, '=') == null);
+    try testing.expect(std.mem.find(u8, b64_segment, "%2B") != null or
+        std.mem.find(u8, b64_segment, "%2F") != null or
+        std.mem.find(u8, b64_segment, "%3D") != null);
 }
 
 // ── tests (cancellation) ─────────────────────────────────────────────────────
@@ -1115,7 +1115,7 @@ const RedirectTestPeer = struct {
         var sw = s.writer(p.io, &wbuf);
         if (p.redirect_to_port) |port| {
             var hbuf: [160]u8 = undefined;
-            const head = std.fmt.bufPrint(
+            const head = std.mem.print(
                 &hbuf,
                 "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/\r\nContent-Length: 0\r\n\r\n",
                 .{port},
@@ -1162,7 +1162,7 @@ test "httpFetch does NOT follow a responder's redirect (the responder does not c
     const transport = httpTransport(&client);
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{responder_port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{responder_port});
     const resp = transport.fetch(testing.allocator, .{ .url = url, .max_response_bytes = 4096 }) catch |e| {
         // Wake the peers before failing, or the joins below hang.
         wakePort(io, internal_port);
@@ -1223,7 +1223,7 @@ test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error
     const transport = httpTransport(&client);
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
     // Cancel once the client is inside read #1, the head read (`ReadCueIo`):
@@ -1257,7 +1257,7 @@ test "httpFetch: a canceled body wait surfaces error.Canceled, not error.Transpo
     const transport = httpTransport(&client);
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
     // Cancel once the client is inside read #2, the body read (`ReadCueIo`).
@@ -1296,7 +1296,7 @@ test "httpFetch: body_timeout_ms self-terminates against a responder that sends 
     const transport = httpTransport(&client);
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     const t0 = std.Io.Clock.Timestamp.now(io, .awake);
     const result = transport.fetch(testing.allocator, .{ .url = url, .max_response_bytes = 1024, .body_timeout_ms = 200 });
@@ -1332,7 +1332,7 @@ test "httpFetch: body_timeout_ms does not fire on a responder that answers promp
     const transport = httpTransport(&client);
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     // Same 200 ms deadline as the RED-baseline test above, against a peer
     // that answers immediately: the bound must not cost a real, prompt

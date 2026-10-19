@@ -131,7 +131,7 @@ fn statusOf(got: []const u8) u16 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -151,7 +151,7 @@ fn reqOrders(buf: []u8, auth: ?[]const u8, xff: ?[]const u8) []const u8 {
 }
 
 fn reqHealthz(buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "GET /healthz HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{}) catch unreachable;
+    return std.mem.print(buf, "GET /healthz HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{}) catch unreachable;
 }
 
 pub fn main() !void {
@@ -337,7 +337,7 @@ pub fn main() !void {
         var i: usize = 0;
         while (i < 16) : (i += 1) {
             var key_buf: [16]u8 = undefined;
-            const key = std.fmt.bufPrint(&key_buf, "192.0.2.{d}", .{i}) catch unreachable;
+            const key = std.mem.print(&key_buf, "192.0.2.{d}", .{i}) catch unreachable;
             _ = runWire(&r, reqOrders(buf[1024..], null, key), buf[0..1024]);
             must(g.throttleKeyCount() <= 4, @src());
         }

@@ -669,7 +669,7 @@ fn peerDescription(stream: *std.Io.net.Stream, buf: *[64]u8) []const u8 {
     if (sa.family != std.posix.AF.INET) return "a non-IPv4 peer";
     const in: *const std.posix.sockaddr.in = @ptrCast(@alignCast(&sa));
     const octets: [4]u8 = std.mem.toBytes(in.addr); // memory (network) order on every target
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d} port {d}", .{
+    return std.mem.print(buf, "{d}.{d}.{d}.{d} port {d}", .{
         octets[0], octets[1], octets[2], octets[3], std.mem.bigToNative(u16, in.port),
     }) catch "a peer with an unprintable address";
 }
@@ -906,7 +906,7 @@ fn parseAuthorizedKeyLine(raw: []const u8) ?AuthorizedKeyEntry {
 
     var marker: @FieldType(AuthorizedKeyEntry, "marker") = .none;
     if (rest[0] == '@') {
-        const end = std.mem.indexOfAny(u8, rest, " \t") orelse return null;
+        const end = std.mem.findAny(u8, rest, " \t") orelse return null;
         const word = rest[0..end];
         if (std.mem.eql(u8, word, "@revoked")) {
             marker = .revoked;
@@ -926,11 +926,11 @@ fn parseAuthorizedKeyLine(raw: []const u8) ?AuthorizedKeyEntry {
         rest = std.mem.trimStart(u8, rest[first_end..], " \t");
     }
 
-    const type_end = std.mem.indexOfAny(u8, rest, " \t") orelse return null;
+    const type_end = std.mem.findAny(u8, rest, " \t") orelse return null;
     const key_type = rest[0..type_end];
     rest = std.mem.trimStart(u8, rest[type_end..], " \t");
     if (rest.len == 0) return null;
-    const b64_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    const b64_end = std.mem.findAny(u8, rest, " \t") orelse rest.len;
 
     return .{
         .marker = marker,
@@ -1178,7 +1178,7 @@ const Commands = struct {
             // makes the create fail instead of following the link. Confidence
             // is still the caller's problem (umask, and a secret on stdin
             // wants `memfd_create`/`O_TMPFILE`), but integrity is covered.
-            const p = std.fmt.bufPrint(&stdin_path_buf, "/tmp/ssh-demo-stdin-{d}-{d}", .{
+            const p = std.mem.print(&stdin_path_buf, "/tmp/ssh-demo-stdin-{d}-{d}", .{
                 std.os.linux.getpid(), self.runs,
             }) catch unreachable;
             // Clear a stale file first. A previous incarnation holding this pid
@@ -1581,12 +1581,12 @@ fn defaultPath(gpa: Allocator, home: ?[]const u8, suffix: []const u8) ![]u8 {
     // No `$HOME` (a daemon, a container): keep the relative name rather than
     // inventing an absolute path that is certainly wrong.
     const h = home orelse return gpa.dupe(u8, suffix);
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ h, suffix });
+    return gpa.print("{s}/{s}", .{ h, suffix });
 }
 
 fn hostPattern(gpa: Allocator, host: []const u8, port: u16) ![]u8 {
     if (port == 22) return gpa.dupe(u8, host);
-    return std.fmt.allocPrint(gpa, "[{s}]:{d}", .{ host, port });
+    return gpa.print("[{s}]:{d}", .{ host, port });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1920,7 +1920,7 @@ fn matchHostField(field: []const u8, pattern: []const u8) bool {
 
 fn matchHashedHost(entry: []const u8, pattern: []const u8) bool {
     const body = entry["|1|".len..];
-    const bar = std.mem.indexOfScalar(u8, body, '|') orelse return false;
+    const bar = std.mem.findScalar(u8, body, '|') orelse return false;
     const salt_b64 = body[0..bar];
     const hash_b64 = body[bar + 1 ..];
 

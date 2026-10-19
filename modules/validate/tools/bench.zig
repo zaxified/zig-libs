@@ -162,7 +162,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
             if (i != 0) try all.writer.writeByte(0);
             try all.writer.writeAll(body);
         }
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.json", .{shape}), .data = all.written() });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.json", .{shape}), .data = all.written() });
     }
     return d;
 }
@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         const info = wi % 2 == 0; // the decode_* twins

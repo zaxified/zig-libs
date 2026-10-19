@@ -742,7 +742,7 @@ test "HTTP-01: solver + middleware; redirect fallback; another node answers from
     try testing.expect(std.mem.startsWith(u8, miss, "HTTP/1.1 404"));
     const redirect = runWire(&r, "GET /x?y=1 HTTP/1.1\r\nHost: a.example:80\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, redirect, "HTTP/1.1 302"));
-    try testing.expect(std.mem.indexOf(u8, redirect, "\r\nLocation: https://a.example/x?y=1\r\n") != null);
+    try testing.expect(std.mem.find(u8, redirect, "\r\nLocation: https://a.example/x?y=1\r\n") != null);
     const post = runWire(&r, "POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, post, "HTTP/1.1 400"));
     const bad_host = runWire(&r, "GET / HTTP/1.1\r\nHost: a.example\"x\r\nConnection: close\r\n\r\n", &buf);
@@ -1358,7 +1358,7 @@ test "names: 100 per certificate, IP literals, storage stems for wildcards and I
 
     var bufs: [101][16]u8 = undefined;
     var names: [101][]const u8 = undefined;
-    for (&names, &bufs, 0..) |*n, *b, i| n.* = std.fmt.bufPrint(b, "n{d}.example", .{i}) catch unreachable;
+    for (&names, &bufs, 0..) |*n, *b, i| n.* = std.mem.print(b, "n{d}.example", .{i}) catch unreachable;
     try testing.expectError(error.InvalidName, m.manage(names[0..101]));
     // The wildcard certificate comes first: the single scripted certificate goes to the first entry.
     try m.manage(&.{ "*.w.example", "w.example" });
@@ -1424,13 +1424,13 @@ test "HTTP-01 edges: HEAD, a 256-character token, host validation, redirect targ
     const brk = runWire(&r, "GET / HTTP/1.1\r\nHost: [a/b]:80\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, brk, "HTTP/1.1 400"));
     const v6 = runWire(&r, "GET /p HTTP/1.1\r\nHost: [::1]:80\r\nConnection: close\r\n\r\n", &buf);
-    try testing.expect(std.mem.indexOf(u8, v6, "\r\nLocation: https://[::1]/p\r\n") != null);
+    try testing.expect(std.mem.find(u8, v6, "\r\nLocation: https://[::1]/p\r\n") != null);
     const colons = runWire(&r, "GET / HTTP/1.1\r\nHost: a.example:1:2\r\nConnection: close\r\n\r\n", &buf);
-    try testing.expect(std.mem.indexOf(u8, colons, "\r\nLocation: https://a.example:1/\r\n") != null);
+    try testing.expect(std.mem.find(u8, colons, "\r\nLocation: https://a.example:1/\r\n") != null);
     // 0x21 is the first byte a redirect target may carry
     const bang = runWire(&r, "GET /!x HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
     try testing.expect(std.mem.startsWith(u8, bang, "HTTP/1.1 302"));
-    try testing.expect(std.mem.indexOf(u8, bang, "\r\nLocation: https://a.example/!x\r\n") != null);
+    try testing.expect(std.mem.find(u8, bang, "\r\nLocation: https://a.example/!x\r\n") != null);
 }
 
 test "HTTP-01 distributed: a stored key authorization exactly as long as the buffer is served" {

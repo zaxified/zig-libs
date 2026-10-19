@@ -74,6 +74,6 @@ test {
 }
 
 test "meta names both RFC 7748 and RFC 8032" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "7748") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "8032") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "7748") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "8032") != null);
 }

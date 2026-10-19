@@ -135,7 +135,7 @@ pub const SortedBuilder = struct {
                 },
                 .gt => {},
             }
-            common = std.mem.indexOfDiff(u8, key, self.last.items) orelse key.len;
+            common = std.mem.findDiff(u8, key, self.last.items) orelse key.len;
             var d = self.last.items.len;
             while (d > common) : (d -= 1) try self.close(d);
         }

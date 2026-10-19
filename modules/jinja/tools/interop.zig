@@ -139,9 +139,9 @@ fn runReference(
     scratch: []const u8,
 ) ![]u8 {
     try std.Io.Dir.cwd().createDirPath(io, scratch);
-    const in_path = try std.fmt.allocPrint(gpa, "{s}/corpus.json", .{scratch});
+    const in_path = try gpa.print("{s}/corpus.json", .{scratch});
     defer gpa.free(in_path);
-    const out_path = try std.fmt.allocPrint(gpa, "{s}/out.json", .{scratch});
+    const out_path = try gpa.print("{s}/out.json", .{scratch});
     defer gpa.free(out_path);
 
     const corpus_json = try corpus.toJson(gpa);

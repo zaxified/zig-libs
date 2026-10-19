@@ -90,7 +90,7 @@ const sources_avx = [_][]const u8{ "src/x86_64/common/hqc.c", "src/x86_64/common
 /// Builds the C side for one (variant, lane), runs it and stores its timing rows
 /// under `<tag>_<workload>`.
 fn buildAndRun(arena: std.mem.Allocator, io: std.Io, src: []const u8, abs: []const u8, v: u8, lane: Lane, tag: []const u8, rows: *std.StringHashMapUnmanaged(Row)) !void {
-    const exe = try std.fmt.allocPrint(arena, "{s}/hqc_bench_{s}", .{ abs, tag });
+    const exe = try arena.print("{s}/hqc_bench_{s}", .{ abs, tag });
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ "zig", "cc", "-std=c99", "-O3", "-funroll-loops", "-w" });
     if (lane.avx) {
@@ -105,15 +105,15 @@ fn buildAndRun(arena: std.mem.Allocator, io: std.Io, src: []const u8, abs: []con
     for (var_dirs) |d| {
         if (d.len == 0) continue;
         const rel = try std.mem.replaceOwned(u8, arena, d, "{d}", &.{'0' + v});
-        try argv.append(arena, try std.fmt.allocPrint(arena, "-I{s}/{s}", .{ src, rel }));
+        try argv.append(arena, try arena.print("-I{s}/{s}", .{ src, rel }));
     }
     try argv.append(arena, "modules/hqc/tools/c_bench/hqc_bench.c");
-    for (sources_common) |s| try argv.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ src, s }));
-    for (if (lane.avx) &sources_avx else &sources_ref) |s| try argv.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ src, s }));
+    for (sources_common) |s| try argv.append(arena, try arena.print("{s}/{s}", .{ src, s }));
+    for (if (lane.avx) &sources_avx else &sources_ref) |s| try argv.append(arena, try arena.print("{s}/{s}", .{ src, s }));
     // Variant-specific sources (only the avx lane has any: reed_solomon.c, gf2x.c).
     if (lane.avx) {
-        try argv.append(arena, try std.fmt.allocPrint(arena, "{s}/src/x86_64/avx256/hqc-{d}/reed_solomon.c", .{ src, v }));
-        try argv.append(arena, try std.fmt.allocPrint(arena, "{s}/src/x86_64/common/hqc-{d}/gf2x.c", .{ src, v }));
+        try argv.append(arena, try arena.print("{s}/src/x86_64/avx256/hqc-{d}/reed_solomon.c", .{ src, v }));
+        try argv.append(arena, try arena.print("{s}/src/x86_64/common/hqc-{d}/gf2x.c", .{ src, v }));
     }
     try argv.appendSlice(arena, &.{ "-o", exe });
     const cc = try std.process.run(arena, io, .{ .argv = argv.items });
@@ -132,7 +132,7 @@ fn buildAndRun(arena: std.mem.Allocator, io: std.Io, src: []const u8, abs: []con
         const name = f.next() orelse continue;
         const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
         const count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
-        try rows.put(arena, try std.fmt.allocPrint(arena, "{s}_{s}", .{ tag, name }), .{ .ns = ns, .count = count });
+        try rows.put(arena, try arena.print("{s}_{s}", .{ tag, name }), .{ .ns = ns, .count = count });
     }
 }
 

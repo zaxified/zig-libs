@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !u8 {
     try dir.writeFile(io, .{ .sub_path = "msg1m.bin", .data = m1m });
 
     const so = init.environ_map.get("CRYPTO_SO") orelse default_so;
-    const exe = try std.fmt.allocPrint(arena, "{s}/openssl_bench", .{abs});
+    const exe = try arena.print("{s}/openssl_bench", .{abs});
     std.debug.print("bench-ripemd160: building the OpenSSL side against {s} ...\n", .{so});
     const cc = try std.process.run(arena, io, .{ .argv = &.{ "zig", "cc", "-O3", "-march=native", "modules/ripemd160/tools/c_bench/openssl_bench.c", so, "-o", exe } });
     if (cc.term != .exited or cc.term.exited != 0) {
@@ -118,9 +118,9 @@ pub fn main(init: std.process.Init) !u8 {
         try rows.put(arena, name, .{ .ns = ns, .count = count });
     }
 
-    const btc_exe = try std.fmt.allocPrint(arena, "{s}/bitcoin_bench", .{abs});
-    const btc_inc = try std.fmt.allocPrint(arena, "-I{s}", .{btc_abs});
-    const btc_cpp = try std.fmt.allocPrint(arena, "{s}/ripemd160.cpp", .{btc_abs});
+    const btc_exe = try arena.print("{s}/bitcoin_bench", .{abs});
+    const btc_inc = try arena.print("-I{s}", .{btc_abs});
+    const btc_cpp = try arena.print("{s}/ripemd160.cpp", .{btc_abs});
     std.debug.print("bench-ripemd160: building the Bitcoin Core side from {s} ...\n", .{btc_src});
     const cxx = try std.process.run(arena, io, .{ .argv = &.{ "zig", "c++", "-O3", "-march=native", "-std=c++20", btc_inc, "modules/ripemd160/tools/c_bench/bitcoin_bench.cpp", btc_cpp, "-o", btc_exe } });
     if (cxx.term != .exited or cxx.term.exited != 0) {
@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     // Interop before timing: the digests must be equal.
     for (ws) |x| {
-        const file = try std.fmt.allocPrint(arena, "{s}.digest", .{x.name});
+        const file = try arena.print("{s}.digest", .{x.name});
         const theirs = try dir.readFileAlloc(io, file, arena, .limited(64));
         var ours: [ripemd160.Ripemd160.digest_length]u8 = undefined;
         ripemd160.Ripemd160.hash(x.msg, &ours, .{});
@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("bench-ripemd160: FAILED -- {s}: the digest differs from OpenSSL's\n", .{x.name});
             return 1;
         }
-        const bfile = try std.fmt.allocPrint(arena, "btc_{s}.digest", .{x.name});
+        const bfile = try arena.print("btc_{s}.digest", .{x.name});
         const btheirs = try dir.readFileAlloc(io, bfile, arena, .limited(64));
         if (!std.mem.eql(u8, &ours, btheirs)) {
             std.debug.print("bench-ripemd160: FAILED -- {s}: the digest differs from Bitcoin Core's\n", .{x.name});

@@ -187,7 +187,7 @@ test "route extras: an entry for an excluded route is not an error and not emitt
         .route_extras = &.{.{ .method = .get, .pattern = "/hidden", .security = &.{} }},
     });
     defer testing.allocator.free(json);
-    try testing.expect(std.mem.indexOf(u8, json, "hidden") == null);
+    try testing.expect(std.mem.find(u8, json, "hidden") == null);
 }
 
 test "negative: dangling $ref is error.DanglingRef" {

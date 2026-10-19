@@ -53,7 +53,7 @@ const recipe =
 /// differs.
 pub fn codecsPath(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) !?[]const u8 {
     const dir = env.get("SODIUM_CODECS_SRC") orelse default_codecs_src;
-    const path = try std.fmt.allocPrint(arena, "{s}/codecs.c", .{dir});
+    const path = try arena.print("{s}/codecs.c", .{dir});
     const src = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20)) catch {
         std.debug.print(recipe, .{dir});
         return null;
@@ -78,18 +78,18 @@ fn Ours(comptime C: type) type {
         fn run(arena: std.mem.Allocator, op: u8, ignore: ?[]const u8, input: []const u8) ![]const u8 {
             var out: [4096]u8 = undefined;
             switch (op) {
-                'E' => return std.fmt.allocPrint(arena, "ok {s} 0", .{hexOrDash(arena, C.encode(&out, input))}),
+                'E' => return arena.print("ok {s} 0", .{hexOrDash(arena, C.encode(&out, input))}),
                 'D' => {
                     const r = if (ignore) |ig|
                         C.decodeIgnoring(&out, input, withNul(arena, ig))
                     else
                         C.decode(&out, input);
                     const d = r catch return "err";
-                    return std.fmt.allocPrint(arena, "ok {s} {d}", .{ hexOrDash(arena, d), input.len });
+                    return arena.print("ok {s} {d}", .{ hexOrDash(arena, d), input.len });
                 },
                 'P' => {
                     const r = C.decodePrefix(&out, input, if (ignore) |ig| withNul(arena, ig) else "") catch return "err";
-                    return std.fmt.allocPrint(arena, "ok {s} {d}", .{ hexOrDash(arena, r.data), r.consumed });
+                    return arena.print("ok {s} {d}", .{ hexOrDash(arena, r.data), r.consumed });
                 },
                 else => unreachable,
             }
@@ -103,7 +103,7 @@ fn withNul(arena: std.mem.Allocator, ig: []const u8) []const u8 {
 
 fn hexOrDash(arena: std.mem.Allocator, b: []const u8) []const u8 {
     if (b.len == 0) return "-";
-    return std.fmt.allocPrint(arena, "{x}", .{b}) catch @panic("OOM");
+    return arena.print("{x}", .{b}) catch @panic("OOM");
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
 
     const codecs = try codecsPath(arena, io, init.environ_map) orelse return 2;
-    const exe = try std.fmt.allocPrint(arena, "{s}/sodium_oracle", .{abs});
+    const exe = try arena.print("{s}/sodium_oracle", .{abs});
     const cc = try std.process.run(arena, io, .{ .argv = &.{ "zig", "cc", "-O2", "-Imodules/b64ct/tools/sodium_shim", "-DSODIUM_CODECS_VERSION=\"" ++ codecs_version ++ "\"", "modules/b64ct/tools/sodium_oracle.c", codecs, "-o", exe } });
     if (cc.term != .exited or cc.term.exited != 0) {
         std.debug.print("interop-b64ct: zig cc failed:\n{s}\n", .{cc.stderr});
@@ -190,11 +190,11 @@ pub fn main(init: std.process.Init) !u8 {
             2 => try Ours(b64ct.url_safe).run(arena, op, ignore, input),
             else => try Ours(b64ct.url_safe_no_pad).run(arena, op, ignore, input),
         };
-        labels[i] = try std.fmt.allocPrint(arena, "{c} variant={d} ignore={s} input={s}", .{ op, sodium, if (ignore) |ig| hexOrDash(arena, ig) else "NULL", hexOrDash(arena, input) });
+        labels[i] = try arena.print("{c} variant={d} ignore={s} input={s}", .{ op, sodium, if (ignore) |ig| hexOrDash(arena, ig) else "NULL", hexOrDash(arena, input) });
     }
 
-    const cases_path = try std.fmt.allocPrint(arena, "{s}/cases.txt", .{abs});
-    const verdicts_path = try std.fmt.allocPrint(arena, "{s}/verdicts.txt", .{abs});
+    const cases_path = try arena.print("{s}/cases.txt", .{abs});
+    const verdicts_path = try arena.print("{s}/verdicts.txt", .{abs});
     try cwd.writeFile(io, .{ .sub_path = cases_path, .data = cases.written() });
     const res = try std.process.run(arena, io, .{ .argv = &.{ exe, cases_path, verdicts_path } });
     if (res.term != .exited or res.term.exited != 0) {

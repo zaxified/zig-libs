@@ -339,7 +339,7 @@ fn readMultipart(arena: Allocator, src: Source, limits: Limits, post: *std.Array
 fn baseName(path: []const u8) []const u8 {
     const trimmed = std.mem.trimEnd(u8, path, "/");
     if (trimmed.len == 0) return "/";
-    const slash = std.mem.lastIndexOfScalar(u8, trimmed, '/') orelse return trimmed;
+    const slash = std.mem.findScalarLast(u8, trimmed, '/') orelse return trimmed;
     return trimmed[slash + 1 ..];
 }
 
@@ -600,7 +600,7 @@ fn fuzzForm(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     if (len == 0) return Mark.mark(.refused);
     const sel = buf[0];
     const rest = buf[1..len];
-    const split = std.mem.indexOfScalar(u8, rest, 0) orelse rest.len;
+    const split = std.mem.findScalar(u8, rest, 0) orelse rest.len;
     const query = rest[0..split];
     const body_bytes = rest[@min(split + 1, rest.len)..];
 

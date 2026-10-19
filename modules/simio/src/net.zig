@@ -326,7 +326,7 @@ pub const Net = struct {
     }
 
     fn inCut(cut: []const u32, h: u32) bool {
-        return std.mem.indexOfScalar(u32, cut, h) != null;
+        return std.mem.findScalar(u32, cut, h) != null;
     }
 
     fn partitioned(n: *const Net, u: u32, v: u32) bool {
@@ -986,7 +986,7 @@ pub const Net = struct {
     }
 
     fn unixKey(buf: []u8, h: *const Host, path: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{d}/{s}", .{ h.id, path }) catch unreachable;
+        return std.mem.print(buf, "{d}/{s}", .{ h.id, path }) catch unreachable;
     }
 
     pub fn listenUnix(n: *Net, h: *Host, address: *const net.UnixAddress, options: net.UnixAddress.ListenOptions) net.UnixAddress.ListenError!Handle {
@@ -1291,7 +1291,7 @@ pub const Net = struct {
                 // Once per socket, however many operations name it: a wake
                 // takes one registration off.
                 .net_receive => |op| if (h.handles.get(op.socket_handle)) |s| {
-                    if (std.mem.indexOfScalar(*Fiber, s.waiters.items, me) == null) try s.waiters.append(n.sim.gpa, me);
+                    if (std.mem.findScalar(*Fiber, s.waiters.items, me) == null) try s.waiters.append(n.sim.gpa, me);
                 },
                 else => {},
             }

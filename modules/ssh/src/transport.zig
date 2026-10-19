@@ -3077,7 +3077,7 @@ pub const Transport = struct {
         defer gpa.free(v_s);
         try t.v_s.set(v_s);
         var vcbuf: [255]u8 = undefined;
-        try t.v_c.set(std.fmt.bufPrint(&vcbuf, "SSH-2.0-{s}", .{software_version}) catch return error.VersionExchangeFailed);
+        try t.v_c.set(std.mem.print(&vcbuf, "SSH-2.0-{s}", .{software_version}) catch return error.VersionExchangeFailed);
 
         try clientKexRound(t, gpa, .initial, policy, null, null);
         t.finishKex();
@@ -4620,7 +4620,7 @@ test "Entropy.io: the KEXINIT cookie, the padding and the ephemeral key come fro
     tr.entropy = entropy;
     if (tr.clientHandshake(std.testing.allocator, unreachable_policy)) |_| return error.TestUnexpectedResult else |_| {}
     const written = w.buffered();
-    const pkt = written[std.mem.indexOf(u8, written, "\r\n").? + 2 ..];
+    const pkt = written[std.mem.find(u8, written, "\r\n").? + 2 ..];
     const pkt_len = std.mem.readInt(u32, pkt[0..4], .big);
     const padlen = pkt[4];
     const payload = pkt[5 .. 4 + pkt_len - padlen];
@@ -4637,7 +4637,7 @@ test "Entropy.io: the KEXINIT cookie, the padding and the ephemeral key come fro
         return error.TestUnexpectedResult
     else |_| {}
     const kp = X25519.KeyPair.generateDeterministic(@splat(0x5a));
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), &kp.public_key) != null);
+    try std.testing.expect(std.mem.find(u8, w.buffered(), &kp.public_key) != null);
 }
 
 /// A policy that refuses everything, and records what it was shown so the
@@ -5189,7 +5189,7 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
     var rnd: [8]u8 = undefined;
     fillRandom(&rnd);
     const hex = std.fmt.bytesToHex(&rnd, .lower);
-    const dir_path = try std.fmt.allocPrint(gpa, "/tmp/zig_ssh_test_{s}", .{&hex});
+    const dir_path = try gpa.print("/tmp/zig_ssh_test_{s}", .{&hex});
     defer gpa.free(dir_path);
     var work = cwd.createDirPathOpen(io, dir_path, .{}) catch return error.SkipZigTest;
     defer {
@@ -5197,7 +5197,7 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
         cwd.deleteTree(io, dir_path) catch {};
     }
 
-    const hk_path = try std.fmt.allocPrint(gpa, "{s}/hk", .{dir_path});
+    const hk_path = try gpa.print("{s}/hk", .{dir_path});
     defer gpa.free(hk_path);
 
     // Generate an ephemeral ed25519 host key.
@@ -5214,7 +5214,7 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
         }
     }
 
-    const pub_path = try std.fmt.allocPrint(gpa, "{s}.pub", .{hk_path});
+    const pub_path = try gpa.print("{s}.pub", .{hk_path});
     defer gpa.free(pub_path);
     var pin: HostKeyCapture = .{};
     pin.expected_ed25519 = readEd25519PubFromKeyFile(gpa, io, pub_path) catch return error.SkipZigTest;
@@ -5223,13 +5223,13 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
     var portbuf: [2]u8 = undefined;
     fillRandom(&portbuf);
     const port: u16 = 20000 + (std.mem.readInt(u16, &portbuf, .big) % 20000);
-    const port_opt = try std.fmt.allocPrint(gpa, "Port={d}", .{port});
+    const port_opt = try gpa.print("Port={d}", .{port});
     defer gpa.free(port_opt);
-    const ciphers_opt = try std.fmt.allocPrint(gpa, "Ciphers={s}", .{cipher_name});
+    const ciphers_opt = try gpa.print("Ciphers={s}", .{cipher_name});
     defer gpa.free(ciphers_opt);
-    const kex_opt = try std.fmt.allocPrint(gpa, "KexAlgorithms={s}", .{kex_name});
+    const kex_opt = try gpa.print("KexAlgorithms={s}", .{kex_name});
     defer gpa.free(kex_opt);
-    const macs_opt = try std.fmt.allocPrint(gpa, "MACs={s}", .{mac_name});
+    const macs_opt = try gpa.print("MACs={s}", .{mac_name});
     defer gpa.free(macs_opt);
 
     // Start sshd (foreground master; all config via -o, no config file).

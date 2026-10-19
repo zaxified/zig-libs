@@ -128,7 +128,7 @@ fn runCurl(io: std.Io, argv: []const []const u8, out_buf: []u8) ![]const u8 {
 }
 
 fn headerPresent(headers: []const u8, needle: []const u8) bool {
-    return std.mem.indexOf(u8, headers, needle) != null;
+    return std.mem.find(u8, headers, needle) != null;
 }
 
 fn runLiveChecks(io: std.Io, gpa: std.mem.Allocator) !void {
@@ -165,7 +165,7 @@ fn runLiveChecks(io: std.Io, gpa: std.mem.Allocator) !void {
     }
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/api", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/api", .{port});
     var curl_buf: [2048]u8 = undefined;
 
     // ── simple request, allowed origin: ACAO echoed + Vary: Origin ────────

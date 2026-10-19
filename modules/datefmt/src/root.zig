@@ -1180,7 +1180,7 @@ pub fn formatIsoDate(alloc: std.mem.Allocator, parts: DateParts) ![]const u8 {
     // ReleaseSmall) as InvalidDate rather than emit garbage.
     if (parts.year < 0) return error.InvalidDate;
     const y_u: u32 = @intCast(parts.year);
-    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}", .{ y_u, parts.month, parts.day });
+    return alloc.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ y_u, parts.month, parts.day });
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,7 +1930,7 @@ pub fn firstInvalidFormatChar(fmt: []const u8) ?usize {
     var pos: usize = 0;
     while (pos < fmt.len) {
         if (fmt[pos] == '[') {
-            const end = std.mem.indexOfScalarPos(u8, fmt, pos + 1, ']') orelse return null;
+            const end = std.mem.findScalarPos(u8, fmt, pos + 1, ']') orelse return null;
             pos = end + 1;
             continue;
         }
@@ -2076,7 +2076,7 @@ fn tokenizeByTableScan(fmt: []const u8) ParseError!Layout {
     while (pos < fmt.len) {
         if (out.n >= MAX_TOKENS) return ParseError.TooManyTokens;
         if (fmt[pos] == '[') {
-            const end = std.mem.indexOfScalarPos(u8, fmt, pos + 1, ']') orelse fmt.len;
+            const end = std.mem.findScalarPos(u8, fmt, pos + 1, ']') orelse fmt.len;
             if (end > pos + 1) {
                 const content = fmt[pos + 1 .. end];
                 out.toks[out.n] = if (std.mem.eql(u8, content, "*")) .wildcard else .{ .literal = content };
@@ -2156,7 +2156,7 @@ test "putDec: same text as print {d:0>N}" {
         for (values) |v| {
             const len = putDec(&buf, 0, v, width);
             var want: [32]u8 = undefined;
-            const exp = try std.fmt.bufPrint(&want, "{d:0>" ++ std.fmt.comptimePrint("{d}", .{width}) ++ "}", .{v});
+            const exp = try std.mem.print(&want, "{d:0>" ++ std.fmt.comptimePrint("{d}", .{width}) ++ "}", .{v});
             try testing.expectEqualStrings(exp, buf[0..len]);
         }
     }

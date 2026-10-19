@@ -381,7 +381,7 @@ test "Message base64 round-trip" {
     const b64 = try msg.toBase64(testing.allocator);
     defer testing.allocator.free(b64);
     // Unpadded standard alphabet: no '=', no '-'/'_'.
-    try testing.expect(std.mem.indexOfScalar(u8, b64, '=') == null);
+    try testing.expect(std.mem.findScalar(u8, b64, '=') == null);
 
     var decoded = try Message.fromBase64(testing.allocator, b64);
     defer decoded.deinit(testing.allocator);

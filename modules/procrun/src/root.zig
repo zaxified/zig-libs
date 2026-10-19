@@ -710,7 +710,7 @@ const RlimitWrap = struct {
 /// `error.FileNotFound` (the documented behaviour); with `rlimit` and no
 /// fix, the decoy binary ran.
 fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) !?[]u8 {
-    if (std.mem.indexOfScalar(u8, argv0, '/') != null) return null;
+    if (std.mem.findScalar(u8, argv0, '/') != null) return null;
 
     var parent_env = std.process.Environ.Map.init(gpa);
     defer parent_env.deinit();
@@ -720,7 +720,7 @@ fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) 
     var it = std.mem.tokenizeScalar(u8, path_var, ':');
     while (it.next()) |dir| {
         var buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
-        const candidate = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, argv0 }, 0) catch continue;
+        const candidate = std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, argv0 }, 0) catch continue;
         const rc = std.os.linux.access(candidate, std.posix.X_OK);
         if (std.posix.errno(rc) != .SUCCESS) continue;
         return try gpa.dupe(u8, candidate);
@@ -833,7 +833,7 @@ fn loadParentEnv(gpa: std.mem.Allocator, io: std.Io, map: *std.process.Environ.M
             var it = std.mem.splitScalar(u8, data.items, 0);
             while (it.next()) |entry| {
                 if (entry.len == 0) continue;
-                const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+                const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
                 if (eq == 0) continue;
                 try map.put(entry[0..eq], entry[eq + 1 ..]);
             }
@@ -1772,7 +1772,7 @@ const LineFramer = struct {
 
     fn feed(f: *LineFramer, chunk: []const u8, sink: anytype) void {
         var rest = chunk;
-        while (std.mem.indexOfScalar(u8, rest, '\n')) |i| {
+        while (std.mem.findScalar(u8, rest, '\n')) |i| {
             f.append(rest[0..i]);
             f.emit(sink);
             rest = rest[i + 1 ..];
@@ -2673,7 +2673,7 @@ test "run: merge env actually INHERITS the parent's variables" {
     defer overlay.deinit();
     try overlay.put("PROCRUN_TEST_OVERLAY", "x"); // deliberately NOT the probe
 
-    const cmd = try std.fmt.allocPrint(testing.allocator, "printf %s \"${s}\"", .{probe.name});
+    const cmd = try testing.allocator.print("printf %s \"${s}\"", .{probe.name});
     defer testing.allocator.free(cmd);
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -2702,7 +2702,7 @@ test "run: merge env actually INHERITS the parent's variables" {
 /// test flaky against reaper-thread timing).
 fn procStatState(pid: std.posix.pid_t) ?u8 {
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "/proc/{d}/stat", .{pid}, 0) catch return null;
 
     // Deliberately raw syscalls with a manual `errno` switch (not
     // `Io.Dir`/`Io.File`, and not even the higher-level `std.posix.openatZ`/
@@ -2780,7 +2780,7 @@ test "Spec.new_process_group + Handle.killGroup: reaps a grandchild, not just th
     var grandchild_pid: std.posix.pid_t = 0;
     var waited_ns: u64 = 0;
     while (waited_ns < 2 * std.time.ns_per_s) : (waited_ns += 10 * std.time.ns_per_ms) {
-        if (std.mem.indexOfScalar(u8, sink.buf.items, '\n')) |nl| {
+        if (std.mem.findScalar(u8, sink.buf.items, '\n')) |nl| {
             const digits = std.mem.trim(u8, sink.buf.items[0..nl], " \t\r\n");
             if (digits.len > 0) {
                 if (std.fmt.parseInt(std.posix.pid_t, digits, 10) catch null) |p| {
@@ -2855,7 +2855,7 @@ test "RlimitSpec.file_size_bytes: a write past the cap fails and the file stops 
     defer tmp.cleanup();
     var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir_abs_len = try tmp.dir.realPath(io, &path_buf);
-    const of_arg = try std.fmt.allocPrint(testing.allocator, "of={s}/fsize_target", .{path_buf[0..dir_abs_len]});
+    const of_arg = try testing.allocator.print("of={s}/fsize_target", .{path_buf[0..dir_abs_len]});
     defer testing.allocator.free(of_arg);
 
     // 200 blocks of 4096 bytes each, capped to 512 bytes (1 block). The

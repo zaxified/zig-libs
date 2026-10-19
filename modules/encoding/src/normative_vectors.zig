@@ -50,13 +50,13 @@ pub fn identifierMatches(r: ParseResult) bool {
     h.update("[");
     for (r.table, 0..) |cp, i| {
         if (i != 0) h.update(", ");
-        h.update(std.fmt.bufPrint(&buf, "{d}", .{cp}) catch unreachable);
+        h.update(std.mem.print(&buf, "{d}", .{cp}) catch unreachable);
     }
     h.update("]");
     var digest: [32]u8 = undefined;
     h.final(&digest);
     var hex: [64]u8 = undefined;
-    _ = std.fmt.bufPrint(&hex, "{x}", .{&digest}) catch unreachable;
+    _ = std.mem.print(&hex, "{x}", .{&digest}) catch unreachable;
     return std.mem.eql(u8, &hex, &want);
 }
 

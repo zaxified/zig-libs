@@ -144,11 +144,11 @@ test "oracle vectors: captured payloads are well-formed JSON and internally cons
     }
     // The literal marker string this capture threaded through the real echo
     // tool call must appear in both the request and the response.
-    try t.expect(std.mem.indexOf(u8, echo_call_request, "hello-mcp-http-oracle") != null);
-    try t.expect(std.mem.indexOf(u8, echo_call_response_json, "hello-mcp-http-oracle") != null);
+    try t.expect(std.mem.find(u8, echo_call_request, "hello-mcp-http-oracle") != null);
+    try t.expect(std.mem.find(u8, echo_call_response_json, "hello-mcp-http-oracle") != null);
     // protocolVersion echoed by the reference server matches what the real
     // client asked for.
-    try t.expect(std.mem.indexOf(u8, init_request, "2025-11-25") != null);
-    try t.expect(std.mem.indexOf(u8, init_response_json, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try t.expect(std.mem.find(u8, init_request, "2025-11-25") != null);
+    try t.expect(std.mem.find(u8, init_response_json, "\"protocolVersion\":\"2025-11-25\"") != null);
     try t.expectEqual(@as(usize, 32), session_id.len);
 }

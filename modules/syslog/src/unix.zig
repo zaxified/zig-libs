@@ -262,7 +262,7 @@ pub const journal = struct {
         var n: usize = 0;
         for (fields, 0..) |f, i| {
             const h = &header[i];
-            const has_newline = std.mem.indexOfScalar(u8, f.value, '\n') != null;
+            const has_newline = std.mem.findScalar(u8, f.value, '\n') != null;
             var header_len: usize = undefined;
             if (has_newline) {
                 @memcpy(h[0..f.name.len], f.name);
@@ -431,7 +431,7 @@ test "a socket path must leave room for the NUL; sendMessage counts its own fiel
 }
 
 fn testSocketPath(tmp: *std.testing.TmpDir, buf: []u8, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
+    return std.mem.print(buf, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
 }
 
 test "UnixEmitter: RFC 5424 message arrives byte-exact over a real unix socket" {

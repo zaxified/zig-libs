@@ -79,7 +79,7 @@ pub fn main() !void {
         var round: usize = 0;
         while (round < 12) : (round += 1) {
             var buf: [16]u8 = undefined;
-            const text = std.fmt.bufPrint(&buf, "10.0.0.{d}", .{round + 1}) catch unreachable;
+            const text = std.mem.print(&buf, "10.0.0.{d}", .{round + 1}) catch unreachable;
             const client = ip(text);
             must(g.admit(client) == .admitted, @src());
             must(g.admit(client) == .admitted, @src());

@@ -107,7 +107,7 @@ test "emit: a shared node is written once, anchored, and aliased after" {
     defer a.free(text);
     // Linear, not 2^20: every level is written once and aliased once more.
     try testing.expect(text.len < 2 * src.items.len + 400);
-    try testing.expect(std.mem.indexOf(u8, text, "*a") != null);
+    try testing.expect(std.mem.find(u8, text, "*a") != null);
     const back = try yaml.composeAllLeaky(arena.allocator(), text, .{});
     try testing.expect(yaml.valueEql(docs[0], back[0]));
     // writeAll: a stream of two documents.
@@ -172,7 +172,7 @@ test "typed: a config document onto a struct" {
     defer p3.deinit();
     try testing.expectEqualStrings("localhost", p3.value.target.tcp.host);
     try testing.expectEqual(@as(u32, 250), p3.value.max_conn);
-    try testing.expect(std.mem.indexOf(u8, text, "max-connections: 250\n") != null);
+    try testing.expect(std.mem.find(u8, text, "max-connections: 250\n") != null);
 }
 
 test "typed: every refusal, each derived from the type and the document" {
@@ -293,7 +293,7 @@ test "emit: an aliased KEY keeps a space before ':' (an alias name may contain '
     const docs = try yaml.composeAllLeaky(arena.allocator(), src, .{});
     const text = try yaml.stringify(a, docs[0]);
     defer a.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "*a1 :") != null);
+    try testing.expect(std.mem.find(u8, text, "*a1 :") != null);
     const back = try yaml.composeAllLeaky(arena.allocator(), text, .{});
     try testing.expect(yaml.valueEql(docs[0], back[0]));
 }

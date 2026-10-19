@@ -420,7 +420,7 @@ fn wire(comptime target: []const u8) []const u8 {
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
@@ -487,7 +487,7 @@ test "readiness detail: lines that exactly fill the budget are all kept; one mor
         try r.use(h.middleware());
         const got = runWireWide(&r, wire("/readyz"), &buf);
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 503"));
-        try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+        try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
         try testing.expectEqualStrings("not ready: " ++ n200 ++ "\nnot ready: " ++ n288 ++ "\n", bodyOf(got));
     }
     {
@@ -511,7 +511,7 @@ test "liveness: always 200, on the configured path only" {
     const live = runWire(&r, wire("/healthz"), &buf);
     try testing.expect(std.mem.startsWith(u8, live, "HTTP/1.1 200"));
     try testing.expectEqualStrings("OK\n", bodyOf(live));
-    try testing.expect(std.mem.indexOf(u8, live, "Cache-Control: no-store") != null);
+    try testing.expect(std.mem.find(u8, live, "Cache-Control: no-store") != null);
 
     // A non-probe path flows through to the app handler.
     const app = runWire(&r, wire("/"), &buf);
@@ -614,7 +614,7 @@ test "readiness: detail=false keeps the status but not the dependency names" {
     const down = runWire(&r, wire("/readyz"), &buf);
     try testing.expect(std.mem.startsWith(u8, down, "HTTP/1.1 503")); // unchanged
     try testing.expectEqualStrings("not ready\n", bodyOf(down));
-    try testing.expect(std.mem.indexOf(u8, down, "database") == null);
+    try testing.expect(std.mem.find(u8, down, "database") == null);
 
     ready_flag = true;
     const ok = runWire(&r, wire("/readyz"), &buf);
@@ -634,7 +634,7 @@ test "startup probe: 503 until the app's flag is set, then 200; null disables it
     const before = runWire(&r, wire("/startupz"), &buf);
     try testing.expect(std.mem.startsWith(u8, before, "HTTP/1.1 503"));
     try testing.expectEqualStrings("not started\n", bodyOf(before));
-    try testing.expect(std.mem.indexOf(u8, before, "Cache-Control: no-store") != null);
+    try testing.expect(std.mem.find(u8, before, "Cache-Control: no-store") != null);
 
     // Readiness and liveness are independent of the latch.
     try testing.expect(std.mem.startsWith(u8, runWire(&r, wire("/readyz"), &buf), "HTTP/1.1 200"));
@@ -681,8 +681,8 @@ test "json body: byte goldens for up, down, detail off, liveness and startup" {
     ready_flag = true;
     const up = runWire(&r, wire("/readyz"), &buf);
     try testing.expect(std.mem.startsWith(u8, up, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, up, "Content-Type: application/json; charset=utf-8\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, up, "Cache-Control: no-store") != null);
+    try testing.expect(std.mem.find(u8, up, "Content-Type: application/json; charset=utf-8\r\n") != null);
+    try testing.expect(std.mem.find(u8, up, "Cache-Control: no-store") != null);
     try testing.expectEqualStrings("{\"status\":\"up\",\"details\":{\"database\":{\"status\":\"up\"},\"cache\":{\"status\":\"up\"}}}", bodyOf(up));
 
     ready_flag = false;
@@ -695,11 +695,11 @@ test "json body: byte goldens for up, down, detail off, liveness and startup" {
     const quiet = runWire(&r, wire("/readyz"), &buf);
     try testing.expect(std.mem.startsWith(u8, quiet, "HTTP/1.1 503"));
     try testing.expectEqualStrings("{\"status\":\"down\"}", bodyOf(quiet));
-    try testing.expect(std.mem.indexOf(u8, quiet, "database") == null);
+    try testing.expect(std.mem.find(u8, quiet, "database") == null);
     h.detail = true;
 
     const live = runWire(&r, wire("/healthz"), &buf);
-    try testing.expect(std.mem.indexOf(u8, live, "application/json; charset=utf-8") != null);
+    try testing.expect(std.mem.find(u8, live, "application/json; charset=utf-8") != null);
     try testing.expectEqualStrings("{\"status\":\"up\"}", bodyOf(live));
 
     const s503 = runWire(&r, wire("/startupz"), &buf);
@@ -847,7 +847,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
         const path = path_pool[rnd.uintLessThan(usize, path_pool.len)];
         const method = methods[rnd.uintLessThan(usize, methods.len)];
         var req_buf: [256]u8 = undefined;
-        const req = std.fmt.bufPrint(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path }) catch unreachable;
+        const req = std.mem.print(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path }) catch unreachable;
         var out: [16384]u8 = undefined;
         const got = runWireWide(&r, req, &out);
         const body = bodyOf(got);
@@ -864,14 +864,14 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
             if (is_head) reach_head += 1;
             if (custom) reach_custom_paths += 1;
             try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+            try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
             if (!is_head) try testing.expectEqualStrings(if (json) "{\"status\":\"up\"}" else "OK\n", body);
-            if (json) try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json; charset=utf-8") != null);
+            if (json) try testing.expect(std.mem.find(u8, got, "Content-Type: application/json; charset=utf-8") != null);
             for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 0), s.calls);
         } else if (is_get_head and on_startup) {
             if (started) reach_startup_up += 1 else reach_startup_down += 1;
             try testing.expect(std.mem.startsWith(u8, got, if (started) "HTTP/1.1 200" else "HTTP/1.1 503"));
-            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+            try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
             if (!is_head) {
                 const want: []const u8 = if (json)
                     (if (started) "{\"status\":\"up\"}" else "{\"status\":\"down\"}")
@@ -900,13 +900,13 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
                 } else {
                     if (skipped_earlier) reach_skip_then_fit += 1;
                     used += line;
-                    wl += (std.fmt.bufPrint(want_body[wl..], "not ready: {s}\n", .{name}) catch unreachable).len;
+                    wl += (std.mem.print(want_body[wl..], "not ready: {s}\n", .{name}) catch unreachable).len;
                 }
             }
             if (json) {
                 reach_json_ready += 1;
                 try testing.expect(std.mem.startsWith(u8, got, if (any_fail) "HTTP/1.1 503" else "HTTP/1.1 200"));
-                try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json; charset=utf-8") != null);
+                try testing.expect(std.mem.find(u8, got, "Content-Type: application/json; charset=utf-8") != null);
                 if (!is_head) {
                     // Independent oracle: build the document with a plain
                     // byte switch (only the bytes the name alphabet holds).
@@ -948,7 +948,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
                     if (used == 512) reach_exact_fill += 1;
                     if (trunc) {
                         reach_marker += 1;
-                        wl += (std.fmt.bufPrint(want_body[wl..], "not ready: ...\n", .{}) catch unreachable).len;
+                        wl += (std.mem.print(want_body[wl..], "not ready: ...\n", .{}) catch unreachable).len;
                     }
                     if (!is_head) try testing.expectEqualStrings(want_body[0..wl], body);
                 } else {
@@ -956,7 +956,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
                     if (!is_head) try testing.expectEqualStrings("not ready\n", body);
                 }
             }
-            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") != null);
+            try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
             for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 1), s.calls);
         } else {
             reach_passthrough += 1;
@@ -966,7 +966,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
                 try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
                 try testing.expectEqualStrings("app", body);
             }
-            try testing.expect(std.mem.indexOf(u8, got, "Cache-Control: no-store") == null);
+            try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") == null);
             for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 0), s.calls);
         }
 

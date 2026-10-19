@@ -648,7 +648,7 @@ fn serveConnection(gpa: std.mem.Allocator, io: std.Io, opts: ServerOptions, stre
             // attacker-controlled, so RFC 3207 §4.2 makes the client throw it
             // away and ask again. Only the second list may unlock a password.
             var reply: [512]u8 = undefined;
-            const body = std.fmt.bufPrint(&reply, "250-mail.example.com Hello\r\n" ++
+            const body = std.mem.print(&reply, "250-mail.example.com Hello\r\n" ++
                 "250-PIPELINING\r\n" ++
                 "250-SIZE 10240000\r\n" ++
                 "250-8BITMIME\r\n" ++
@@ -714,9 +714,9 @@ fn serveConnection(gpa: std.mem.Allocator, io: std.Io, opts: ServerOptions, stre
                 say(w, "503 5.5.1 MAIL first\r\n");
                 continue;
             }
-            if (std.mem.indexOf(u8, cmd, opts.reject) != null) {
+            if (std.mem.find(u8, cmd, opts.reject) != null) {
                 var reply: [256]u8 = undefined;
-                const body = std.fmt.bufPrint(&reply, "550 5.1.1 <{s}>: unknown user\r\n", .{opts.reject}) catch continue;
+                const body = std.mem.print(&reply, "550 5.1.1 <{s}>: unknown user\r\n", .{opts.reject}) catch continue;
                 say(w, body);
                 continue;
             }
@@ -773,14 +773,14 @@ fn receiveBody(gpa: std.mem.Allocator, r: *std.Io.Reader, w: *std.Io.Writer) voi
 
     const body = un.bytes();
     std.debug.print("   -> body accepted: {d} bytes, {d} lines\n", .{ body.len, std.mem.count(u8, body, "\r\n") });
-    if (std.mem.indexOf(u8, body, "boundary=")) |i| {
+    if (std.mem.find(u8, body, "boundary=")) |i| {
         const rest = body[i..];
-        const end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+        const end = std.mem.findAny(u8, rest, "\r\n") orelse rest.len;
         std.debug.print("      {s}\n", .{rest[0..end]});
     }
-    if (std.mem.indexOf(u8, body, "filename=")) |i| {
+    if (std.mem.find(u8, body, "filename=")) |i| {
         const rest = body[i..];
-        const end = std.mem.indexOfAny(u8, rest, "\r\n") orelse rest.len;
+        const end = std.mem.findAny(u8, rest, "\r\n") orelse rest.len;
         std.debug.print("      {s}\n", .{rest[0..end]});
     }
     say(w, "250 2.0.0 Ok: queued as 3F2A9\r\n");

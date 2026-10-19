@@ -503,7 +503,7 @@ pub const RequestPreview = struct {
     /// `:path` up to the '?' ("" when absent).
     pub fn path(p: RequestPreview) []const u8 {
         const target = p.get(":path") orelse return "";
-        const i = std.mem.indexOfScalar(u8, target, '?') orelse return target;
+        const i = std.mem.findScalar(u8, target, '?') orelse return target;
         return target[0..i];
     }
 };
@@ -1794,7 +1794,7 @@ const Session = struct {
             return s.respondError(id, 400);
         var path: []const u8 = target;
         var query: []const u8 = "";
-        if (std.mem.indexOfScalar(u8, target, '?')) |i| {
+        if (std.mem.findScalar(u8, target, '?')) |i| {
             path = target[0..i];
             query = target[i + 1 ..];
         }
@@ -2117,9 +2117,9 @@ const Session = struct {
         var status_buf: [8]u8 = undefined;
         var len_buf: [8]u8 = undefined;
         var body_buf: [64]u8 = undefined;
-        const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch unreachable;
-        const body_text = std.fmt.bufPrint(&body_buf, "{s}\n", .{reason}) catch unreachable;
-        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body_text.len}) catch unreachable;
+        const status_str = std.mem.print(&status_buf, "{d}", .{status}) catch unreachable;
+        const body_text = std.mem.print(&body_buf, "{s}\n", .{reason}) catch unreachable;
+        const len_str = std.mem.print(&len_buf, "{d}", .{body_text.len}) catch unreachable;
         // h1 parity (`Server.writeErrorResponse`): `date` and `server` on the
         // codec's own answers too. RFC 9110 §6.6.1 wants `Date` on a 4xx from
         // a server with a clock, and these are the answers no handler ever
@@ -2324,10 +2324,10 @@ const Framer = struct {
         const f: *Framer = @ptrCast(@alignCast(ctx));
         if (f.dead) return error.WriteFailed;
         f.chunked = chunked;
-        f.fields.items[0].value = std.fmt.bufPrint(&f.status_buf, "{d}", .{status}) catch
+        f.fields.items[0].value = std.mem.print(&f.status_buf, "{d}", .{status}) catch
             return f.die(.close);
         if (content_length) |n| {
-            const text = std.fmt.bufPrint(&f.clen_buf, "{d}", .{n}) catch
+            const text = std.mem.print(&f.clen_buf, "{d}", .{n}) catch
                 return f.die(.close);
             f.fields.append(f.arena, .{ .name = "content-length", .value = text }) catch
                 return f.die(.close);
@@ -2399,7 +2399,7 @@ const Framer = struct {
     fn feedChunked(f: *Framer, bytes: []const u8) Writer.Error![]const u8 {
         switch (f.cstate) {
             .size, .trailer => {
-                const nl = std.mem.indexOfScalar(u8, bytes, '\n') orelse {
+                const nl = std.mem.findScalar(u8, bytes, '\n') orelse {
                     try f.appendLine(bytes);
                     return "";
                 };
@@ -2409,7 +2409,7 @@ const Framer = struct {
                 defer f.line.clearRetainingCapacity();
                 if (f.cstate == .size) {
                     if (line.len == 0) return rest; // tolerate a stray CRLF
-                    const end = std.mem.indexOfScalar(u8, line, ';') orelse line.len;
+                    const end = std.mem.findScalar(u8, line, ';') orelse line.len;
                     const n = std.fmt.parseInt(usize, line[0..end], 16) catch
                         return f.die(.close);
                     if (n == 0) {
@@ -2421,7 +2421,7 @@ const Framer = struct {
                 } else if (line.len == 0) {
                     f.cstate = .done; // blank line: end of the trailer section
                 } else {
-                    const colon = std.mem.indexOfScalar(u8, line, ':') orelse
+                    const colon = std.mem.findScalar(u8, line, ':') orelse
                         return f.die(.close);
                     // The names were already vetted by `ResponseWriter`'s
                     // trailer filter (RFC 9110 §6.5.1 + the `Trailer`
@@ -2925,7 +2925,7 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
             total += n;
         }
         var buf: [32]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&buf, "drained {d}", .{total}));
+        try rw.writeAll(try std.mem.print(&buf, "drained {d}", .{total}));
     } else if (std.mem.eql(u8, req.path, "/outtrailers")) {
         try rw.setHeader("Content-Type", "text/plain");
         try rw.declareTrailers(&.{ "X-Checksum", "X-Rows" });
@@ -2988,7 +2988,7 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
             else => return error.BodyReadFailed,
         };
         var out: [48]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&out, "took {d}", .{n}));
+        try rw.writeAll(try std.mem.print(&out, "took {d}", .{n}));
     } else if (std.mem.eql(u8, req.path, "/stream-ignore")) {
         // Never touches the body at all.
         try rw.writeAll("ignored");
@@ -3011,7 +3011,7 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
             reads += 1;
         }
         var out: [96]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(
+        try rw.writeAll(try std.mem.print(
             &out,
             "streamed {d} in {d} reads trailer={s}",
             .{ total, reads, req.trailer("X-Checksum") orelse "none" },
@@ -5623,7 +5623,7 @@ test "h2c integration: a streaming upload past the initial window, read as it la
     const body = peer.resp(sid).body.items;
     try testing.expect(std.mem.startsWith(u8, body, "streamed 200000 in "));
     const reads_at = "streamed 200000 in ".len;
-    const reads_end = std.mem.indexOfScalarPos(u8, body, reads_at, ' ').?;
+    const reads_end = std.mem.findScalarPos(u8, body, reads_at, ' ').?;
     const reads = try std.fmt.parseInt(u32, body[reads_at..reads_end], 10);
     try testing.expect(reads > 1);
 }
@@ -6309,7 +6309,7 @@ const HpackProbe = struct {
         try awaitCount(p.io, &p.arrived, table_streams);
         var name_buf: [32]u8 = undefined;
         var val_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "x-table-{c}", .{n});
+        const name = try std.mem.print(&name_buf, "x-table-{c}", .{n});
         @memset(&val_buf, n);
         const val: []const u8 = &val_buf;
         try rw.setHeader(name, val);
@@ -6350,7 +6350,7 @@ test "dispatcher: concurrent responses keep the HPACK dynamic table coherent" {
         var name_buf: [32]u8 = undefined;
         var val_buf: [64]u8 = undefined;
         const ch: u8 = @intCast('a' + i);
-        const name = try std.fmt.bufPrint(&name_buf, "x-table-{c}", .{ch});
+        const name = try std.mem.print(&name_buf, "x-table-{c}", .{ch});
         @memset(&val_buf, ch);
         const val: []const u8 = &val_buf;
         try testing.expectEqualStrings(val, c.header(name) orelse return error.HeaderLost);
@@ -6918,7 +6918,7 @@ const ScrubWatch = struct {
     }
     fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
         const w: *ScrubWatch = @ptrCast(@alignCast(ctx));
-        if (std.mem.indexOf(u8, m, w.marker) != null) w.dirty_frees += 1;
+        if (std.mem.find(u8, m, w.marker) != null) w.dirty_frees += 1;
         w.inner.rawFree(m, a, ra);
     }
 };

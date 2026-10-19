@@ -197,7 +197,7 @@ test "parseLeafPublicKey: structurally-intact DER with an unrecognized curve OID
     // deliberately, rather than inherited from std's enum coverage.
     var corrupted = kat.server_cert_der;
     const p256_curve_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
-    const idx = std.mem.indexOf(u8, &corrupted, &p256_curve_oid).?;
+    const idx = std.mem.find(u8, &corrupted, &p256_curve_oid).?;
     corrupted[idx + p256_curve_oid.len - 1] ^= 0x01; // flip the OID's last byte -> unrecognized curve
     try testing.expectError(error.UnsupportedPublicKeyAlgorithm, parseLeafPublicKey(&corrupted));
 }
@@ -321,7 +321,7 @@ const CertCorpus = struct {
         // `UnsupportedPublicKeyAlgorithm`, not `MalformedCertificate`.
         var corrupted = kat.server_cert_der;
         const p256_curve_oid = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
-        if (std.mem.indexOf(u8, &corrupted, &p256_curve_oid)) |idx| {
+        if (std.mem.find(u8, &corrupted, &p256_curve_oid)) |idx| {
             corrupted[idx + p256_curve_oid.len - 1] ^= 0x01;
             self.store.push(&corrupted, null);
         }

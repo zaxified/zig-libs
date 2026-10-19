@@ -104,7 +104,7 @@ pub const Rng = struct {
                 switch (t.mode) {
                     .record => {
                         const v = self.r.enumValue(T);
-                        t.put(std.mem.indexOfScalar(T, all, v).?);
+                        t.put(std.mem.findScalar(T, all, v).?);
                         break :v v;
                     },
                     .replay => break :v all[@intCast(t.get() % all.len)],
@@ -387,7 +387,7 @@ fn armWatchdog(name: []const u8, limit_ms: u64) !void {
 }
 
 fn env(buf: []u8, prefix: []const u8, suffix: []const u8) ?[]const u8 {
-    const key = std.fmt.bufPrint(buf, "{s}{s}", .{ prefix, suffix }) catch return null;
+    const key = std.mem.print(buf, "{s}{s}", .{ prefix, suffix }) catch return null;
     return std.testing.environ.getPosix(key);
 }
 
@@ -428,7 +428,7 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
 /// Whether a harness named `name` runs under `<PREFIX>_ONLY=only`.
 pub fn selected(name: []const u8, only: ?[]const u8) bool {
     const o = only orelse return true;
-    return std.mem.indexOf(u8, name, o) != null;
+    return std.mem.find(u8, name, o) != null;
 }
 
 /// `<PREFIX>=<runs>[,<first seed>]` for a harness of `scale`: how many seeds
@@ -827,7 +827,7 @@ test "SeedFile: the file holds exactly `<name> <seed>\\n`, also across a digit" 
         sf.set(seed);
         const n = try f.readPositional(testing.io, &.{&buf}, 0);
         var want: [64]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "h {d}\n", .{seed}), buf[0..n]);
+        try testing.expectEqualStrings(try std.mem.print(&want, "h {d}\n", .{seed}), buf[0..n]);
     }
 }
 

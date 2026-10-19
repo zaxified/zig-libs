@@ -502,9 +502,9 @@ pub const ParsedToken = struct {
 pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
     // Split into exactly three segments (an unsecured JWT's third segment
     // is legitimately empty, so only header/payload must be non-empty).
-    const dot1 = std.mem.indexOfScalar(u8, token, '.') orelse return error.MalformedToken;
-    const dot2 = std.mem.indexOfScalarPos(u8, token, dot1 + 1, '.') orelse return error.MalformedToken;
-    if (std.mem.indexOfScalarPos(u8, token, dot2 + 1, '.') != null) return error.MalformedToken;
+    const dot1 = std.mem.findScalar(u8, token, '.') orelse return error.MalformedToken;
+    const dot2 = std.mem.findScalarPos(u8, token, dot1 + 1, '.') orelse return error.MalformedToken;
+    if (std.mem.findScalarPos(u8, token, dot2 + 1, '.') != null) return error.MalformedToken;
     const header_b64 = token[0..dot1];
     const payload_b64 = token[dot1 + 1 .. dot2];
     const signature_b64 = token[dot2 + 1 ..];
@@ -1711,7 +1711,7 @@ pub fn discoverWith(
     if (want_issuer.len == 0) return error.DiscoveryFailed;
     try checkKeySourceUrl(issuer, opts);
     var url_buf: [max_url_len]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "{s}" ++ well_known_path, .{want_issuer}) catch
+    const url = std.mem.print(&url_buf, "{s}" ++ well_known_path, .{want_issuer}) catch
         return error.DiscoveryFailed;
 
     const body_buf = try gpa.alloc(u8, max_response_bytes);
@@ -2235,7 +2235,7 @@ pub const ScopeIter = struct {
     pub fn next(it: *ScopeIter) ?[]const u8 {
         while (it.rest.len > 0 and it.rest[0] == ' ') it.rest = it.rest[1..];
         if (it.rest.len == 0) return null;
-        const end = std.mem.indexOfScalar(u8, it.rest, ' ') orelse it.rest.len;
+        const end = std.mem.findScalar(u8, it.rest, ' ') orelse it.rest.len;
         const tok = it.rest[0..end];
         it.rest = it.rest[end..];
         return tok;
@@ -3069,7 +3069,7 @@ pub fn buildAuthorizationUrl(
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     try buf.appendSlice(gpa, authorization_endpoint);
-    try buf.append(gpa, if (std.mem.indexOfScalar(u8, authorization_endpoint, '?') == null) '?' else '&');
+    try buf.append(gpa, if (std.mem.findScalar(u8, authorization_endpoint, '?') == null) '?' else '&');
 
     var first = true;
     try appendUrlEncodedField(gpa, &buf, &first, "response_type", "code");
@@ -3735,7 +3735,7 @@ test "RFC 7519 example: header, claims, custom claim, signing input, signature" 
     try testing.expect(parsed.claims.claim("nope") == null);
 
     // Signing input = the token up to (excluding) the last dot.
-    const last_dot = std.mem.lastIndexOfScalar(u8, rfc7519_example_token, '.').?;
+    const last_dot = std.mem.findScalarLast(u8, rfc7519_example_token, '.').?;
     try testing.expectEqualStrings(rfc7519_example_token[0..last_dot], parsed.signing_input);
 
     // HS256 signature is 32 raw bytes; base64url round-trips to the segment.
@@ -4543,7 +4543,7 @@ test "verify: RFC 7515 A.1 HS256 known-answer token" {
     var tampered_buf: [256]u8 = undefined;
     const tampered = tampered_buf[0..rfc7519_example_token.len];
     @memcpy(tampered, rfc7519_example_token);
-    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
+    const last_dot = std.mem.findScalarLast(u8, tampered, '.').?;
     tampered[last_dot + 5] = if (tampered[last_dot + 5] == 'A') 'B' else 'A';
     var p_tampered = try parse(testing.allocator, tampered);
     defer p_tampered.deinit();
@@ -5304,7 +5304,7 @@ test "verify: RFC 7515 A.2 RS256 known-answer token" {
     var tampered_buf: [1024]u8 = undefined;
     const tampered = tampered_buf[0..rfc7515_a2_token.len];
     @memcpy(tampered, rfc7515_a2_token);
-    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
+    const last_dot = std.mem.findScalarLast(u8, tampered, '.').?;
     tampered[last_dot + 20] = if (tampered[last_dot + 20] == 'A') 'B' else 'A';
     var p_tampered = try parse(testing.allocator, tampered);
     defer p_tampered.deinit();
@@ -5579,7 +5579,7 @@ fn testJwksJson(buf: []u8) ![]const u8 {
     const ed = try testEd25519KeyPair();
     const ed_pub = ed.public_key.toBytes();
     const ed_s = enc.encode(&ed_b64, &ed_pub);
-    return std.fmt.bufPrint(buf,
+    return std.mem.print(buf,
         \\{{"keys":[
         \\ {{"kty":"oct","kid":"hs","k":"{s}"}},
         \\ {{"kty":"EC","kid":"es","use":"sig","crv":"P-256","x":"{s}","y":"{s}"}},
@@ -6526,7 +6526,7 @@ test "Provider by issuer: discovery + injected issuer end-to-end" {
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"ed","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&x_b64, &pub_bytes)});
 
@@ -6589,10 +6589,10 @@ test "Provider: key rotation refreshes once, rate limit stops a bogus-kid flood,
     var v1_buf: [256]u8 = undefined;
     var v2_buf: [256]u8 = undefined;
     // v1: only kid "old". v2 (after rotation): only kid "new".
-    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+    const jwks_v1 = try std.mem.print(&v1_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&old_b64, &pub_old)});
-    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+    const jwks_v2 = try std.mem.print(&v2_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&new_b64, &pub_new)});
 
@@ -6689,10 +6689,10 @@ test "Provider: a clock stepped back does not freeze the TTL re-fetch or the rot
     var new_b64: [43]u8 = undefined;
     var v1_buf: [256]u8 = undefined;
     var v2_buf: [256]u8 = undefined;
-    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+    const jwks_v1 = try std.mem.print(&v1_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&old_b64, &pub_old)});
-    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+    const jwks_v2 = try std.mem.print(&v2_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&new_b64, &pub_new)});
 
@@ -6773,10 +6773,10 @@ test "Provider: with an interval clock a wall step forward does not expire the T
     var new_b64: [43]u8 = undefined;
     var v1_buf: [256]u8 = undefined;
     var v2_buf: [256]u8 = undefined;
-    const jwks_v1 = try std.fmt.bufPrint(&v1_buf,
+    const jwks_v1 = try std.mem.print(&v1_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"old","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&old_b64, &pub_old)});
-    const jwks_v2 = try std.fmt.bufPrint(&v2_buf,
+    const jwks_v2 = try std.mem.print(&v2_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"new","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&new_b64, &pub_new)});
 
@@ -7048,7 +7048,7 @@ test "HttpFetcher.fetchFn: a canceled body read surfaces error.Canceled, not err
     var hf: HttpFetcher = .{ .client = &http_client };
 
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
     var body_buf: [256]u8 = undefined;
 
     var fut = try io.concurrent(fetchOnce, .{ hf.fetcher(), url, &body_buf });
@@ -7119,9 +7119,9 @@ fn resRunWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 
 fn resWire(buf: []u8, method: []const u8, target: []const u8, auth: ?[]const u8) []const u8 {
     if (auth) |a| {
-        return std.fmt.bufPrint(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nAuthorization: {s}\r\nConnection: close\r\n\r\n", .{ method, target, a }) catch unreachable;
+        return std.mem.print(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nAuthorization: {s}\r\nConnection: close\r\n\r\n", .{ method, target, a }) catch unreachable;
     }
-    return std.fmt.bufPrint(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, target }) catch unreachable;
+    return std.mem.print(buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, target }) catch unreachable;
 }
 
 fn resExpectStatus(got: []const u8, comptime status: []const u8) !void {
@@ -7129,7 +7129,7 @@ fn resExpectStatus(got: []const u8, comptime status: []const u8) !void {
 }
 
 fn resExpectHeaderLine(got: []const u8, comptime line: []const u8) !void {
-    try testing.expect(std.mem.indexOf(u8, got, "\r\n" ++ line ++ "\r\n") != null);
+    try testing.expect(std.mem.find(u8, got, "\r\n" ++ line ++ "\r\n") != null);
 }
 
 var res_test_hits: u32 = 0;
@@ -7181,7 +7181,7 @@ test "ResourceServer: valid token → 200 + identity; missing/invalid/expired/in
     var tok_buf: [1024]u8 = undefined;
     const good = mintRs256(&tok_buf, good_claims);
     var bearer_buf: [1100]u8 = undefined;
-    const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
+    const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
 
     var req_buf: [1400]u8 = undefined;
     var out_buf: [1024]u8 = undefined;
@@ -7257,7 +7257,7 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
         const expired = mintRs256(&tok_buf,
             \\{"aud":"api://svc","sub":"alice","exp":500,"scope":"admin"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
         const req = resWire(&req_buf, "GET", "/data", bearer);
         const got = resRunWire(&r, req, &out_buf);
         try resExpectStatus(got, "401");
@@ -7269,7 +7269,7 @@ test "ResourceServer: expired and insufficient-scope tokens, and the scope chall
         const narrow = mintRs256(&tok_buf,
             \\{"aud":"api://svc","sub":"alice","exp":2000,"scope":"read"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
         const req = resWire(&req_buf, "GET", "/data", bearer);
         const got = resRunWire(&r, req, &out_buf);
         try resExpectStatus(got, "403");
@@ -7435,7 +7435,7 @@ fn readModuleDoc(gpa: std.mem.Allocator, name: []const u8) ![]u8 {
     var path_buf: [128]u8 = undefined;
     const candidates = [_][]const u8{ "modules/jwt/", "", "../" };
     for (candidates) |prefix| {
-        const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ prefix, name }) catch unreachable;
+        const path = std.mem.print(&path_buf, "{s}{s}", .{ prefix, name }) catch unreachable;
         return cwd.readFileAlloc(io, path, gpa, .limited(1 << 20)) catch continue;
     }
     return error.ModuleDocNotFound;
@@ -7454,14 +7454,14 @@ test "docs track the code: no std-only-crypto claim, `p256` listed everywhere de
     // `pub const meta` is the canonical dep list — SPEC.md's Status line must
     // agree with it, name for name.
     inline for (meta.deps) |d| {
-        try testing.expect(std.mem.indexOf(u8, spec_md, "`" ++ d ++ "`") != null);
-        try testing.expect(std.mem.indexOf(u8, readme_md, d) != null);
+        try testing.expect(std.mem.find(u8, spec_md, "`" ++ d ++ "`") != null);
+        try testing.expect(std.mem.find(u8, readme_md, d) != null);
     }
-    try testing.expect(std.mem.indexOf(u8, spec_md, "deps `http`, `router`, `p256`") != null);
+    try testing.expect(std.mem.find(u8, spec_md, "deps `http`, `router`, `p256`") != null);
 
     // Neither document may claim the crypto is std-only any more.
-    try testing.expect(std.mem.indexOf(u8, spec_md, "std-only") == null);
-    try testing.expect(std.mem.indexOf(u8, readme_md, "std-only") == null);
+    try testing.expect(std.mem.find(u8, spec_md, "std-only") == null);
+    try testing.expect(std.mem.find(u8, readme_md, "std-only") == null);
 }
 
 test "writeBearerChallenge: RFC 6750 §3 header-value formatting" {
@@ -7516,9 +7516,9 @@ test "writeBearerChallenge: RFC 6750 §3 header-value formatting" {
             // No element after the first may look like a new challenge, i.e.
             // it must be exactly one auth-param: `name="…"`, no interior SP
             // outside the quoted value.
-            const eq = std.mem.indexOfScalar(u8, part, '=') orelse return error.TestUnexpectedResult;
+            const eq = std.mem.findScalar(u8, part, '=') orelse return error.TestUnexpectedResult;
             try testing.expect(eq > 0);
-            try testing.expect(std.mem.indexOfScalar(u8, part[0..eq], ' ') == null);
+            try testing.expect(std.mem.findScalar(u8, part[0..eq], ' ') == null);
             try testing.expectEqual(@as(u8, '"'), part[eq + 1]);
             try testing.expectEqual(@as(u8, '"'), part[part.len - 1]);
             params += 1;
@@ -7561,10 +7561,10 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const good = mintRs256(&tok_buf,
             \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"read write"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{good}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "200");
-        try testing.expect(std.mem.indexOf(u8, got, "alice") != null);
+        try testing.expect(std.mem.find(u8, got, "alice") != null);
     }
     // No credential → 401, bare realm challenge (no error=).
     {
@@ -7583,7 +7583,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const expired = mintRs256(&tok_buf,
             \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":500,"scope":"read"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{expired}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "401");
     }
@@ -7592,7 +7592,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const narrow = mintRs256(&tok_buf,
             \\{"iss":"https://issuer.example","aud":"api://svc","sub":"alice","exp":2000,"scope":"write"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{narrow}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "403");
         try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"insufficient_scope\", scope=\"read\"");
@@ -7602,7 +7602,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         const none_tok = mintNoneToken(&tok_buf,
             \\{"iss":"https://issuer.example","aud":"api://svc","sub":"mallory","exp":2000,"scope":"read"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{none_tok}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{none_tok}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "401");
         try resExpectHeaderLine(got, "WWW-Authenticate: Bearer realm=\"svc\", error=\"invalid_token\"");
@@ -7616,7 +7616,7 @@ test "Guard.authenticate: valid → context; missing/garbage/expired/insufficien
         ,
             \\{"iss":"https://issuer.example","aud":"api://svc","sub":"m","exp":2000,"scope":"read"}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{confused}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{confused}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf);
         try resExpectStatus(got, "401");
     }
@@ -7664,7 +7664,7 @@ test "Guard over a static JwkSet: same policy, no fetcher; init refuses a bad ke
     };
     inline for (cases) |c| {
         const tok = mintRs256(&tok_buf, c.claims);
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
         try resExpectStatus(resRunWire(&r, resWire(&req_buf, "GET", "/data", bearer), &out_buf), c.status);
     }
     // Nothing was fetched: the stub had no script and was never asked.
@@ -7704,7 +7704,7 @@ test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array
             const tok = mintRs256(&tok_buf,
                 \\{"aud":"api://svc","sub":"a","exp":2000}
             );
-            const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+            const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
             const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
             try resExpectStatus(got, "401"); // no typ → invalid_token
         }
@@ -7714,7 +7714,7 @@ test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array
             ,
                 \\{"aud":"api://svc","sub":"a","exp":2000}
             );
-            const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+            const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
             const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
             try resExpectStatus(got, "200");
         }
@@ -7739,7 +7739,7 @@ test "Guard: RFC 9068 at+jwt typ enforcement (on/off) and end-to-end `scp` array
         const tok = mintRs256(&tok_buf,
             \\{"aud":"api://svc","sub":"a","exp":2000,"scp":["read","write"]}
         );
-        const bearer = std.fmt.bufPrint(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
+        const bearer = std.mem.print(&bearer_buf, "Bearer {s}", .{tok}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "GET", "/d", bearer), &out_buf);
         try resExpectStatus(got, "200");
     }
@@ -7928,7 +7928,7 @@ test "buildAuthorizationUrl: endpoint already carrying a query string joins with
     defer gpa.free(url);
     try testing.expect(std.mem.startsWith(u8, url, "https://issuer.example/authorize?tenant=acme&response_type=code"));
     try testing.expect(std.mem.endsWith(u8, url, "code_challenge_method=plain"));
-    try testing.expect(std.mem.indexOf(u8, url, "scope=openid") != null); // default AuthorizationRequest.scope
+    try testing.expect(std.mem.find(u8, url, "scope=openid") != null); // default AuthorizationRequest.scope
 }
 
 test "buildTokenRequest: application/x-www-form-urlencoded body, public and confidential client" {
@@ -8078,14 +8078,14 @@ fn fuzzSignVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     // the signature covers, so even their last, padding-bit character counts;
     // in the signature segment the last character is skipped, its low bits
     // being unused).
-    const last_dot = std.mem.lastIndexOfScalar(u8, token, '.').?;
+    const last_dot = std.mem.findScalarLast(u8, token, '.').?;
     const limit = token.len - 1;
     const copy = try gpa.dupe(u8, token);
     defer gpa.free(copy);
     const at = knobs.ranged(0, @intCast(limit - 1));
     if (copy[at] != '.') {
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        copy[at] = alphabet[(std.mem.indexOfScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
+        copy[at] = alphabet[(std.mem.findScalar(u8, alphabet, copy[at]).? + 1) % alphabet.len];
         if (parseAndVerify(gpa, copy, verify_key, opts)) |p| {
             var pp = p;
             pp.deinit();
@@ -8726,7 +8726,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&x_b64, &pub_bytes)});
 
@@ -8777,7 +8777,7 @@ test "acceptIdTokenJwks: resolves by kid against a local JWKS, enforces nonce" {
     var k_b64: [64]u8 = undefined;
     const k_s = std.base64.url_safe_no_pad.Encoder.encode(&k_b64, id_token_secret);
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"oct","kid":"idp-1","k":"{s}"}}]}}
     , .{k_s});
     var jwks = try parseJwks(gpa, set);
@@ -8820,7 +8820,7 @@ test "acceptIdTokenProvider: turnkey ID Token acceptance through the cached Prov
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&x_b64, &pub_bytes)});
 
@@ -9075,7 +9075,7 @@ test "JWKS: key material one byte too long is invalid_key, never truncated" {
     const x_s = std.base64.url_safe_no_pad.Encoder.encode(&x_b64, &a3_x);
     var p256_prefix: [128]u8 = undefined;
     try expectJwkInvalidKey(
-        try std.fmt.bufPrint(&p256_prefix, "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{s}\",\"y\":\"", .{x_s}),
+        try std.mem.print(&p256_prefix, "{{\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"{s}\",\"y\":\"", .{x_s}),
         &a3_y,
         "\"}",
     );
@@ -9091,7 +9091,7 @@ test "JWKS: key material one byte too long is invalid_key, never truncated" {
     try expectJwkInvalidKey(
         "{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"",
         &long_x,
-        try std.fmt.bufPrint(&p384_suffix, "\",\"y\":\"{s}\"}}", .{y384_s}),
+        try std.mem.print(&p384_suffix, "\",\"y\":\"{s}\"}}", .{y384_s}),
     );
 
     const ed = try testEd25519KeyPair();
@@ -9121,7 +9121,7 @@ test "Provider by issuer: iss is checked against the DISCOVERED issuer, not the 
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"ed","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&x_b64, &pub_bytes)});
     var stub: ScriptFetcher = .{ .script = &.{
@@ -9183,7 +9183,7 @@ test "ResourceServer: protect=.mutations gates DELETE; only `Bearer SP token` is
         try resExpectStatus(got, "401");
     }
     for ([_][]const u8{ "Digest ", "BearerX" }) |scheme| {
-        const auth = std.fmt.bufPrint(&auth_buf, "{s}{s}", .{ scheme, good }) catch unreachable;
+        const auth = std.mem.print(&auth_buf, "{s}{s}", .{ scheme, good }) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "DELETE", "/data", auth), &out_buf);
         try resExpectStatus(got, "401");
         try resExpectHeaderLine(got, "WWW-Authenticate: Bearer");
@@ -9191,7 +9191,7 @@ test "ResourceServer: protect=.mutations gates DELETE; only `Bearer SP token` is
     try testing.expectEqual(@as(u32, 0), res_test_hits);
     // Positive control: the same token as a proper credential is admitted.
     {
-        const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{good}) catch unreachable;
+        const auth = std.mem.print(&auth_buf, "Bearer {s}", .{good}) catch unreachable;
         const got = resRunWire(&r, resWire(&req_buf, "DELETE", "/data", auth), &out_buf);
         try resExpectStatus(got, "200");
         try testing.expectEqual(@as(u32, 1), res_test_hits);
@@ -9282,7 +9282,7 @@ test "SECURITY: acceptIdTokenProvider rejects an ID Token audienced at ANOTHER c
     const pub_bytes = kp.public_key.toBytes();
     var x_b64: [43]u8 = undefined;
     var set_buf: [256]u8 = undefined;
-    const set = try std.fmt.bufPrint(&set_buf,
+    const set = try std.mem.print(&set_buf,
         \\{{"keys":[{{"kty":"OKP","kid":"op-key","crv":"Ed25519","x":"{s}"}}]}}
     , .{enc.encode(&x_b64, &pub_bytes)});
     var stub: ScriptFetcher = .{ .script = &.{
@@ -9404,7 +9404,7 @@ test "JWKS: an RFC 7515 A.4 P-521 JWK resolves to an ES512 key; wrong coordinate
     var short_b64: [88]u8 = undefined;
     const short_s = std.base64.url_safe_no_pad.Encoder.encode(&short_b64, x[1..]);
     var head: [256]u8 = undefined;
-    const bad = try std.fmt.bufPrint(&head, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-521\",\"kid\":\"s\",\"x\":\"{s}\",\"y\":\"" ++ rfc7515_a4_y_b64 ++ "\"}}]}}", .{short_s});
+    const bad = try std.mem.print(&head, "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-521\",\"kid\":\"s\",\"x\":\"{s}\",\"y\":\"" ++ rfc7515_a4_y_b64 ++ "\"}}]}}", .{short_s});
     var bad_jwks = try parseJwks(testing.allocator, bad);
     defer bad_jwks.deinit();
     try testing.expectEqual(@as(usize, 0), bad_jwks.keys.len);

@@ -120,7 +120,7 @@ pub fn hashWith(b: Backend, bytes: []const u8) ?u32 {
 
 // ── dispatch ────────────────────────────────────────────────────────────────
 
-/// 0 = not yet detected, else `@intFromEnum(Backend) + 1`. Detection is
+/// 0 = not yet detected, else `@backingInt(Backend) + 1`. Detection is
 /// idempotent, so two threads racing to fill it store the same value.
 var detected: std.atomic.Value(u8) = .init(0);
 

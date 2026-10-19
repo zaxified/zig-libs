@@ -219,7 +219,7 @@ fn fuzzVerify(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             },
             6, 7, 8 => {
                 const user = alphabet[pick(S, src, 0, alphabet.len - 1)];
-                const joined = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ user, cred });
+                const joined = try gpa.print("{s}:{s}", .{ user, cred });
                 try owned.append(gpa, joined);
                 const pw = joined[user.len + 1 ..];
                 if (op == 6) {
@@ -403,7 +403,7 @@ fn fuzzThrottle(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         const key: u8 = 'a' + @as(u8, @intCast(pick(S, src, 0, 5)));
         const authed = pick(S, src, 0, 5) == 0;
         var req_buf: [160]u8 = undefined;
-        const req = try std.fmt.bufPrint(&req_buf, "GET /x HTTP/1.1\r\nHost: t\r\nX-K: {c}\r\n{s}Connection: close\r\n\r\n", .{
+        const req = try std.mem.print(&req_buf, "GET /x HTTP/1.1\r\nHost: t\r\nX-K: {c}\r\n{s}Connection: close\r\n\r\n", .{
             key, if (authed) "Authorization: Bearer good\r\n" else "",
         });
         const calls_before = hook.calls;

@@ -156,7 +156,7 @@ fn checkValue(name: Name, v: []const u8) Error!void {
     const q_last = v[v.len - 1] == '\'';
     if (q_first or q_last) {
         if (v.len < 2 or !q_first or !q_last) return error.MalformedQuote;
-        if (std.mem.indexOfScalar(u8, v[1 .. v.len - 1], '\'') != null) return error.MalformedQuote;
+        if (std.mem.findScalar(u8, v[1 .. v.len - 1], '\'') != null) return error.MalformedQuote;
         return;
     }
     for (keywords) |k| if (std.ascii.eqlIgnoreCase(k, v)) return error.UnquotedKeyword;

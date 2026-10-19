@@ -129,7 +129,7 @@ fn echoMethod(
         },
         else => return services.status.bad_invalid_argument,
     };
-    const echoed = try std.fmt.allocPrint(allocator, "{s} (echoed by zig-libs)", .{text});
+    const echoed = try allocator.print("{s} (echoed by zig-libs)", .{text});
     try outputs.append(allocator, .{ .scalar = .{ .string = echoed } });
     return services.status.good;
 }
@@ -273,7 +273,7 @@ const written_answer: i32 = 31337;
 // reader.
 
 fn opName(line: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+    const end = std.mem.findScalar(u8, line, ' ') orelse line.len;
     return line[0..end];
 }
 
@@ -281,7 +281,7 @@ fn arg(line: []const u8, key: []const u8) ?[]const u8 {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     _ = it.next(); // the op
     while (it.next()) |tok| {
-        const eq = std.mem.indexOfScalar(u8, tok, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, tok, '=') orelse continue;
         if (std.mem.eql(u8, tok[0..eq], key)) return tok[eq + 1 ..];
     }
     return null;
@@ -418,7 +418,7 @@ const Replay = struct {
             const digest = self.fx.?.certSha256();
             var got: [64]u8 = undefined;
             for (digest, 0..) |b, i| {
-                _ = std.fmt.bufPrint(got[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
+                _ = std.mem.print(got[i * 2 ..][0..2], "{x:0>2}", .{b}) catch unreachable;
             }
             if (!std.mem.eql(u8, want, &got)) {
                 return self.fail(
@@ -519,7 +519,7 @@ fn firstDifference(want: []const u8, got: []const u8) []const u8 {
     var i: usize = 0;
     while (i < n and want[i] == got[i]) i += 1;
     if (i == n and want.len == got.len) return "";
-    return std.fmt.bufPrint(&diff_buf, " (first {d} bytes agree)", .{i}) catch "";
+    return std.mem.print(&diff_buf, " (first {d} bytes agree)", .{i}) catch "";
 }
 
 // ── the tests ──────────────────────────────────────────────────────────────
@@ -725,8 +725,8 @@ test "asyncua transcript: the header names the peer, the date and the command th
     // Checked here rather than trusted, because the header is written by a tool
     // that only runs where asyncua is installed.
     const head = transcript[0..@min(transcript.len, 4096)];
-    try testing.expect(std.mem.indexOf(u8, head, "asyncua=") != null);
-    try testing.expect(std.mem.indexOf(u8, head, "python=") != null);
-    try testing.expect(std.mem.indexOf(u8, head, "captured:") != null);
-    try testing.expect(std.mem.indexOf(u8, head, "zig build interop-opcua -- --capture") != null);
+    try testing.expect(std.mem.find(u8, head, "asyncua=") != null);
+    try testing.expect(std.mem.find(u8, head, "python=") != null);
+    try testing.expect(std.mem.find(u8, head, "captured:") != null);
+    try testing.expect(std.mem.find(u8, head, "zig build interop-opcua -- --capture") != null);
 }

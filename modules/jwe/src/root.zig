@@ -1099,7 +1099,7 @@ test "ECDH-ES direct rejects a non-empty encrypted_key segment" {
     const h = it.next().?;
     _ = it.next().?; // empty encrypted_key
     const rest = it.rest();
-    const forged = try std.fmt.allocPrint(std.testing.allocator, "{s}.AAAAAAAAAAA.{s}", .{ h, rest });
+    const forged = try std.testing.allocator.print("{s}.AAAAAAAAAAA.{s}", .{ h, rest });
     defer std.testing.allocator.free(forged);
 
     // `MalformedToken`, not `InvalidKey`: this is a structural property of the
@@ -1523,7 +1523,7 @@ test "TEETH: RFC 7516 s11.5 — one error value for every encrypted-key failure"
     const rest = it.rest();
 
     // Case A — format/padding: the Encrypted Key is not a valid AES-KW blob.
-    const junk = try std.fmt.allocPrint(gpa, "{s}.{s}.{s}", .{ h, "AAAAAAAAAAAAAAAAAAAAAAA", rest });
+    const junk = try gpa.print("{s}.{s}.{s}", .{ h, "AAAAAAAAAAAAAAAAAAAAAAA", rest });
     defer gpa.free(junk);
     // Case B — length: a VALID wrap, of a message that is not the CEK length.
     // Built by wrapping a 24-byte key under the same KEK.
@@ -1531,7 +1531,7 @@ test "TEETH: RFC 7516 s11.5 — one error value for every encrypted-key failure"
     _ = try alg.aeskw.wrap(&kek, &@as([24]u8, @splat(0x11)), &wrapped24);
     var wrapped_b64: [64]u8 = undefined;
     const enc_len = std.base64.url_safe_no_pad.Encoder.encode(&wrapped_b64, &wrapped24).len;
-    const wrong_len = try std.fmt.allocPrint(gpa, "{s}.{s}.{s}", .{ h, wrapped_b64[0..enc_len], rest });
+    const wrong_len = try gpa.print("{s}.{s}.{s}", .{ h, wrapped_b64[0..enc_len], rest });
     defer gpa.free(wrong_len);
     // Case C — the encrypted key is fine; the CONTENT fails to authenticate.
     // Same real EK, one character changed inside the ciphertext segment — to
@@ -1649,7 +1649,7 @@ fn rewriteP2c(gpa: std.mem.Allocator, token: []const u8, p2c: u32) ![]u8 {
 
     // The encoder writes `"p2c":<digits>`; swap the digits.
     const key = "\"p2c\":";
-    const at = std.mem.indexOf(u8, json, key).?;
+    const at = std.mem.find(u8, json, key).?;
     var end = at + key.len;
     while (end < json.len and json[end] >= '0' and json[end] <= '9') end += 1;
 
@@ -1664,7 +1664,7 @@ fn rewriteP2c(gpa: std.mem.Allocator, token: []const u8, p2c: u32) ![]u8 {
     defer gpa.free(new_h);
     _ = b64.Encoder.encode(new_h, rebuilt.items);
 
-    return std.fmt.allocPrint(gpa, "{s}.{s}", .{ new_h, rest });
+    return gpa.print("{s}.{s}", .{ new_h, rest });
 }
 
 // ── mutation run 2026-10-05 ─────────────────────────────────────────────────
@@ -1710,7 +1710,7 @@ test "dir refuses a non-empty encrypted_key segment (RFC 7516 §5.2 step 10)" {
     var it = std.mem.splitScalar(u8, token, '.');
     const h = it.next().?;
     try std.testing.expectEqual(@as(usize, 0), it.next().?.len);
-    const forged = try std.fmt.allocPrint(std.testing.allocator, "{s}.AAAAAAAAAAA.{s}", .{ h, it.rest() });
+    const forged = try std.testing.allocator.print("{s}.AAAAAAAAAAA.{s}", .{ h, it.rest() });
     defer std.testing.allocator.free(forged);
     try std.testing.expectError(error.MalformedToken, decryptCompact(std.testing.allocator, .{ .symmetric = &key }, forged, .{}));
 }
@@ -1768,7 +1768,7 @@ test "header size limits: the b64 header at max + 1, a member at max_member_len 
         @memset(raw, 0x11);
         const enc_iv = try a.alloc(u8, test_b64.Encoder.calcSize(n));
         _ = test_b64.Encoder.encode(enc_iv, raw);
-        const json = try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\"}}", .{enc_iv});
+        const json = try a.print("{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\"}}", .{enc_iv});
         const r = header.parse(a, json);
         if (n > header.max_member_len) {
             try std.testing.expectError(error.InvalidHeaderField, r);
@@ -1801,7 +1801,7 @@ test "content tags must be exactly the enc's length: one octet more is refused, 
         const k = key[0..e.cekLen().?];
         const token = try encryptCompact(std.testing.allocator, .dir, e, .{ .symmetric = k }, "tag length", "", seededForTest(), .{});
         defer std.testing.allocator.free(token);
-        const dot = std.mem.lastIndexOfScalar(u8, token, '.').?;
+        const dot = std.mem.findScalarLast(u8, token, '.').?;
         var tag_buf: [17]u8 = undefined;
         try test_b64.Decoder.decode(tag_buf[0..16], token[dot + 1 ..]);
         tag_buf[16] = 0;
@@ -1844,14 +1844,14 @@ test "unwrapCek: wrapped CEKs of the wrong length and GCMKW iv/tag of the wrong 
     var ivb: [32]u8 = undefined;
     var tb: [32]u8 = undefined;
     const tag17 = tag ++ [_]u8{0};
-    const long_iv = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, &iv13), test_b64.Encoder.encode(&tb, &tag) }));
+    const long_iv = try header.parse(a, try a.print("{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, &iv13), test_b64.Encoder.encode(&tb, &tag) }));
     try std.testing.expectError(error.InvalidKey, unwrapCek(long_iv, .{ .symmetric = &kek }, &ct16, &cek, 16, .{}));
-    const long_tag = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag17) }));
+    const long_tag = try header.parse(a, try a.print("{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag17) }));
     try std.testing.expectError(error.InvalidKey, unwrapCek(long_tag, .{ .symmetric = &kek }, &ct16, &cek, 16, .{}));
 
     var ct8: [8]u8 = undefined;
     _ = try alg.gcmkwWrap(&kek, iv13[0..12].*, &(@as([8]u8, @splat(0x5a))), &ct8, &tag);
-    const short = try header.parse(a, try std.fmt.allocPrint(a, "{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag) }));
+    const short = try header.parse(a, try a.print("{{\"alg\":\"A128GCMKW\",\"enc\":\"A128GCM\",\"iv\":\"{s}\",\"tag\":\"{s}\"}}", .{ test_b64.Encoder.encode(&ivb, iv13[0..12]), test_b64.Encoder.encode(&tb, &tag) }));
     try std.testing.expectError(error.InvalidKey, unwrapCek(short, .{ .symmetric = &kek }, &ct8, &cek, 16, .{}));
 }
 
@@ -1873,12 +1873,12 @@ test "PBES2: p2c above max_p2c is WorkFactorTooHigh, p2s under 8 octets is Inval
     var ek: [24]u8 = undefined;
     _ = try aeskw.wrap(kek, &(@as([16]u8, @splat(0x5a))), &ek);
 
-    const at_max = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 10 }));
+    const at_max = try header.parse(a, try a.print(fmt, .{ p2s8, 10 }));
     try unwrapCek(at_max, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 });
     try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5a))), &cek);
-    const over = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s8, 11 }));
+    const over = try header.parse(a, try a.print(fmt, .{ p2s8, 11 }));
     try std.testing.expectError(error.WorkFactorTooHigh, unwrapCek(over, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 }));
-    const short_salt = try header.parse(a, try std.fmt.allocPrint(a, fmt, .{ p2s7, 10 }));
+    const short_salt = try header.parse(a, try a.print(fmt, .{ p2s7, 10 }));
     try std.testing.expectError(error.InvalidKey, unwrapCek(short_salt, .{ .password = password }, &ek, &cek, 16, .{ .max_p2c = 10 }));
 }
 

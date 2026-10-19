@@ -752,7 +752,7 @@ test "an unregister session request is a bare header and gets no reply" {
     try testing.expect(msg.session_handle != 0);
     // Nothing in the table answers it, which is the protocol's own rule.
     for (table) |g| {
-        if (g.dir == .from_target and std.mem.indexOf(u8, g.name, "unregister") != null) {
+        if (g.dir == .from_target and std.mem.find(u8, g.name, "unregister") != null) {
             return error.UnexpectedReply;
         }
     }
@@ -959,8 +959,8 @@ test "no golden carries a real device identity" {
     var buf: [max_frame_len]u8 = undefined;
     for (table) |g| {
         const wire = try bytesOf(g, &buf);
-        try testing.expect(std.mem.indexOf(u8, wire, "LOGIX") == null);
-        try testing.expect(std.mem.indexOf(u8, wire, "1756") == null);
+        try testing.expect(std.mem.find(u8, wire, "LOGIX") == null);
+        try testing.expect(std.mem.find(u8, wire, "1756") == null);
     }
 }
 

@@ -197,9 +197,9 @@ test "negative: wrong key id is rejected before signature math" {
 
 test "negative: truncated signature file (missing lines / cut mid-base64)" {
     const full = kat.prehashed_signature_file;
-    const nl1 = std.mem.indexOfScalar(u8, full, '\n').?;
-    const nl2 = std.mem.indexOfScalarPos(u8, full, nl1 + 1, '\n').?;
-    const nl3 = std.mem.indexOfScalarPos(u8, full, nl2 + 1, '\n').?;
+    const nl1 = std.mem.findScalar(u8, full, '\n').?;
+    const nl2 = std.mem.findScalarPos(u8, full, nl1 + 1, '\n').?;
+    const nl3 = std.mem.findScalarPos(u8, full, nl2 + 1, '\n').?;
 
     // Cut right after the untrusted-comment line's own newline: the b64
     // signature "line" the iterator sees is an empty trailing segment, not
@@ -229,6 +229,6 @@ test "negative: truncated / empty public key and secret key files" {
     var sk: m.ParsedSecretKey = undefined;
     try std.testing.expectError(error.MissingUntrustedCommentPrefix, m.parseSecretKeyFile(&sk, ""));
 
-    const pub_line1_end = std.mem.indexOfScalar(u8, kat.unencrypted_public_key_file, '\n').? + 1;
+    const pub_line1_end = std.mem.findScalar(u8, kat.unencrypted_public_key_file, '\n').? + 1;
     try std.testing.expectError(error.WrongLength, m.parsePublicKeyFile(kat.unencrypted_public_key_file[0..pub_line1_end]));
 }

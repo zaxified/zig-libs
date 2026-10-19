@@ -40,7 +40,7 @@ const diskusage = @import("diskusage");
 
 fn emit(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    const s = std.mem.print(&buf, fmt, args) catch return;
     _ = linux.write(1, s.ptr, s.len);
 }
 

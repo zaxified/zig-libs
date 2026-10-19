@@ -221,10 +221,10 @@ fn put(out: []u8, at: usize, s: []const u8) Error!usize {
 pub fn parseAcsi(s: []const u8, fc: ?FunctionalConstraint) Error!ObjectReference {
     if (s.len == 0) return error.EmptyComponent;
     if (s.len > max_reference_len) return error.ReferenceTooLong;
-    if (std.mem.indexOfScalar(u8, s, '$') != null) return error.UnexpectedSeparator;
-    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return error.MissingLogicalDevice;
+    if (std.mem.findScalar(u8, s, '$') != null) return error.UnexpectedSeparator;
+    const slash = std.mem.findScalar(u8, s, '/') orelse return error.MissingLogicalDevice;
     if (slash == 0 or slash + 1 >= s.len) return error.EmptyComponent;
-    if (std.mem.indexOfScalarPos(u8, s, slash + 1, '/') != null) return error.UnexpectedSeparator;
+    if (std.mem.findScalarPos(u8, s, slash + 1, '/') != null) return error.UnexpectedSeparator;
 
     var ref = ObjectReference{ .ld = s[0..slash], .ln = undefined, .fc = fc };
     var it = std.mem.splitScalar(u8, s[slash + 1 ..], '.');
@@ -244,7 +244,7 @@ pub fn parseAcsi(s: []const u8, fc: ?FunctionalConstraint) Error!ObjectReference
 pub fn parseMms(
     s: []const u8,
 ) Error!ObjectReference {
-    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return error.MissingLogicalDevice;
+    const slash = std.mem.findScalar(u8, s, '/') orelse return error.MissingLogicalDevice;
     if (slash == 0 or slash + 1 >= s.len) return error.EmptyComponent;
     return parseMmsParts(s[0..slash], s[slash + 1 ..]);
 }
@@ -255,8 +255,8 @@ pub fn parseMms(
 pub fn parseMmsParts(domain: []const u8, item: []const u8) Error!ObjectReference {
     if (domain.len == 0 or item.len == 0) return error.EmptyComponent;
     if (domain.len + item.len + 1 > max_reference_len) return error.ReferenceTooLong;
-    if (std.mem.indexOfScalar(u8, item, '.') != null) return error.UnexpectedSeparator;
-    if (std.mem.indexOfScalar(u8, item, '/') != null) return error.UnexpectedSeparator;
+    if (std.mem.findScalar(u8, item, '.') != null) return error.UnexpectedSeparator;
+    if (std.mem.findScalar(u8, item, '/') != null) return error.UnexpectedSeparator;
 
     var ref = ObjectReference{ .ld = domain, .ln = undefined };
     var it = std.mem.splitScalar(u8, item, '$');

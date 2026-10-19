@@ -1178,7 +1178,7 @@ test "VMAC: the two reserved values, and random avoids both" {
 
 test "VMAC formats as colon-separated hex" {
     var buf: [32]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{f}", .{Vmac{ .octets = .{ 1, 0x0a, 0xff, 0, 0x10, 0x2b } }});
+    const s = try std.mem.print(&buf, "{f}", .{Vmac{ .octets = .{ 1, 0x0a, 0xff, 0, 0x10, 0x2b } }});
     try testing.expectEqualStrings("01:0a:ff:00:10:2b", s);
 }
 
@@ -1188,7 +1188,7 @@ test "UUID: parse, format and round trip" {
     try testing.expectEqual(@as(u8, 0x00), u.octets[0]);
     try testing.expectEqual(@as(u8, 0xff), u.octets[15]);
     var buf: [40]u8 = undefined;
-    try testing.expectEqualStrings(text, try std.fmt.bufPrint(&buf, "{f}", .{u}));
+    try testing.expectEqualStrings(text, try std.mem.print(&buf, "{f}", .{u}));
 
     try testing.expectEqual(@as(?Uuid, null), Uuid.parse("too short"));
     try testing.expectEqual(@as(?Uuid, null), Uuid.parse("00112233x4455-6677-8899-aabbccddeeff"));

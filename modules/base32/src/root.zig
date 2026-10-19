@@ -506,7 +506,7 @@ test "injective: flipping any spare bit of a canonical text is rejected" {
         if (spare == 0) continue;
         // Flip the lowest spare bit in the final symbol.
         const last = &text[text.len - 1];
-        const v = std.mem.indexOfScalar(u8, Alphabet.std.symbols(), last.*).?;
+        const v = std.mem.findScalar(u8, Alphabet.std.symbols(), last.*).?;
         last.* = Alphabet.std.symbols()[v ^ 1];
         try testing.expectError(error.NonCanonical, decode(&out, text, .{ .padding = .forbidden }));
     }

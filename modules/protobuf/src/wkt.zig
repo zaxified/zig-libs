@@ -136,7 +136,7 @@ pub const Any = struct {
 
     /// The full type name: what follows the last `/` of `type_url`.
     pub fn typeName(self: Any) []const u8 {
-        const at = std.mem.lastIndexOfScalar(u8, self.type_url, '/') orelse return self.type_url;
+        const at = std.mem.findScalarLast(u8, self.type_url, '/') orelse return self.type_url;
         return self.type_url[at + 1 ..];
     }
 

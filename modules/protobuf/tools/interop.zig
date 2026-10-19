@@ -97,7 +97,7 @@ const Ref = struct {
     }
 
     fn path(self: *Ref, name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.scratch, name });
+        return self.gpa.print("{s}/{s}", .{ self.scratch, name });
     }
 
     fn read(self: *Ref, name: []const u8) ![]u8 {
@@ -264,8 +264,8 @@ fn liveCheck(ref: *Ref) !void {
         const dump_canonical = try ref.refDump("packed", canonical);
         defer gpa.free(dump_canonical);
         expectText("flipped packing reads the same as canonical", dump_canonical, dump_flipped);
-        if (std.mem.indexOf(u8, dump_flipped, "nums=[1,2,150]") == null or
-            std.mem.indexOf(u8, dump_flipped, "unpacked=[1,2,150]") == null)
+        if (std.mem.find(u8, dump_flipped, "nums=[1,2,150]") == null or
+            std.mem.find(u8, dump_flipped, "unpacked=[1,2,150]") == null)
             bad("flipped packing: the reference did not read 1,2,150 back", .{});
     }
 

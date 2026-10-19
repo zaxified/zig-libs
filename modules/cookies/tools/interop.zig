@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0 or std.mem.startsWith(u8, line, "//")) continue;
-        var rule = line[0 .. std.mem.indexOfAny(u8, line, " \t") orelse line.len];
+        var rule = line[0 .. std.mem.findAny(u8, line, " \t") orelse line.len];
         if (rule[0] == '!') rule = rule[1..];
         if (std.mem.startsWith(u8, rule, "*.")) rule = rule[2..];
         const name = cookies.psl.toAscii(arena, rule) catch continue;

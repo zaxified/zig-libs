@@ -129,7 +129,7 @@ fn checkCgroup(text: []const u8, gpa: std.mem.Allocator) anyerror!bool {
     defer l.deinit(gpa);
     for (l.entries) |e| {
         try testing.expect(inside(text, e.controllers) and inside(text, e.path));
-        try testing.expect(std.mem.indexOfScalar(u8, e.controllers, ':') == null);
+        try testing.expect(std.mem.findScalar(u8, e.controllers, ':') == null);
         var it = e.controllerIterator();
         while (it.next()) |_| {}
     }

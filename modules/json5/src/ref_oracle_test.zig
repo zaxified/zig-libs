@@ -40,7 +40,7 @@ const divergences = [_]Divergence{};
 /// change the value silently.
 fn holdsLoneSurrogate(canon_text: []const u8) bool {
     var i: usize = 0;
-    while (mem.indexOfScalarPos(u8, canon_text, i, 's')) |at| {
+    while (mem.findScalarPos(u8, canon_text, i, 's')) |at| {
         var j = at + 1;
         var prev_high = false;
         while (j + 4 <= canon_text.len and canon_text[j] != ';') : (j += 4) {
@@ -149,7 +149,7 @@ fn ours(gpa: mem.Allocator, src: []const u8) !Ours {
         .parse_numbers = false,
     }) catch return .refused;
     defer parsed.deinit();
-    if (mem.indexOf(u8, out, "$err_trace_") != null) return .recovered;
+    if (mem.find(u8, out, "$err_trace_") != null) return .recovered;
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     try canon(gpa, &aw.writer, parsed.value);
@@ -216,7 +216,7 @@ test "ref oracle: preprocess + std.json read every document as the reference JSO
 /// The first `line N` an `$err` message of `out` names.
 fn firstReportedLine(out: []const u8) ?u32 {
     var i: usize = 0;
-    while (mem.indexOfPos(u8, out, i, "line ")) |at| {
+    while (mem.findPos(u8, out, i, "line ")) |at| {
         var j = at + 5;
         while (j < out.len and std.ascii.isDigit(out[j])) j += 1;
         if (j > at + 5) return std.fmt.parseInt(u32, out[at + 5 .. j], 10) catch null;

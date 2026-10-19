@@ -2401,10 +2401,10 @@ fn flushThrough(w: *std.Io.Writer) std.Io.Writer.Error!void {
 fn dumpSecureCapture(io: std.Io, tag: []const u8, c2s: []const u8, s2c: []const u8) void {
     const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
     var path_buf: [256]u8 = undefined;
-    if (std.fmt.bufPrint(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
+    if (std.mem.print(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c2s }) catch {};
     } else |_| {}
-    if (std.fmt.bufPrint(&path_buf, "{s}/{s}-s2c.bin", .{ dir_path, tag })) |path| {
+    if (std.mem.print(&path_buf, "{s}/{s}-s2c.bin", .{ dir_path, tag })) |path| {
         std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = s2c }) catch {};
     } else |_| {}
 }
@@ -2419,7 +2419,7 @@ fn dumpSecureCapture(io: std.Io, tag: []const u8, c2s: []const u8, s2c: []const 
 fn dumpSecureKeys(io: std.Io, tag: []const u8, keys: security.ChannelKeys) void {
     const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
     var path_buf: [256]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}-keys.bin", .{ dir_path, tag }) catch return;
+    const path = std.mem.print(&path_buf, "{s}/{s}-keys.bin", .{ dir_path, tag }) catch return;
     var blob: [32 + 32 + 16 + 32 + 32 + 16]u8 = undefined;
     var w: std.Io.Writer = .fixed(&blob);
     w.writeAll(&keys.client_signing_key) catch return;

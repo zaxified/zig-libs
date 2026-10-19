@@ -741,7 +741,7 @@ pub fn verifyPh(sig: Signature, msg: []const u8, ctx: []const u8, pubkey: Public
 // ── tests ────────────────────────────────────────────────────────────────
 
 test "meta.model_after names RFC 8032 / Ed448" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "8032") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "8032") != null);
 }
 
 test "Signature.encoded_length == 114 (57 + 57, RFC 8032 §5.2)" {

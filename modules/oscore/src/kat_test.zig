@@ -941,7 +941,7 @@ test "F15: unprotected_message/protected_message stop being dead KAT fields" {
         // all in the original message, so its own payload marker +
         // payload is byte-identical to `plaintext`'s — a full-body
         // check, not just the Code byte.
-        if (std.mem.indexOfScalar(u8, plaintext, 0xFF)) |marker| {
+        if (std.mem.findScalar(u8, plaintext, 0xFF)) |marker| {
             const tail = plaintext[marker..]; // 0xFF ++ payload
             try std.testing.expect(std.mem.endsWith(u8, unprotected, tail));
         }

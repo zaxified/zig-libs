@@ -92,7 +92,7 @@ fn writeAll(buf: []const u8) !void {
 
 fn die(comptime fmt: []const u8, args: anytype) noreturn {
     var b: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&b, "zig: FATAL " ++ fmt ++ "\n", args) catch "zig: FATAL\n";
+    const s = std.mem.print(&b, "zig: FATAL " ++ fmt ++ "\n", args) catch "zig: FATAL\n";
     _ = rawWrite(2, s) catch {};
     linux.exit_group(4);
     unreachable;
@@ -100,7 +100,7 @@ fn die(comptime fmt: []const u8, args: anytype) noreturn {
 
 fn note(comptime fmt: []const u8, args: anytype) void {
     var b: [512]u8 = undefined;
-    const s = std.fmt.bufPrint(&b, "zig: " ++ fmt ++ "\n", args) catch return;
+    const s = std.mem.print(&b, "zig: " ++ fmt ++ "\n", args) catch return;
     _ = rawWrite(2, s) catch {};
 }
 

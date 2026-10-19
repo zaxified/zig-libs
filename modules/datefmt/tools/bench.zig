@@ -138,7 +138,7 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         d.imf[i] = try datefmt.format(arena, p, imf_fmt);
         d.rfc[i] = try datefmt.format(arena, p, rfc_fmt);
         const base = try datefmt.format(arena, p, "YYYY-MM-DD[T]hh:mm:ss");
-        d.rfcns[i] = try std.fmt.allocPrint(arena, "{s}.{d:0>9}+02:00", .{ base, r.uintLessThan(u32, 1_000_000_000) });
+        d.rfcns[i] = try arena.print("{s}.{d:0>9}+02:00", .{ base, r.uintLessThan(u32, 1_000_000_000) });
         try f_unix.writer.print("{d}\n", .{d.unix[i]});
         try f_imf.writer.print("{s}\n", .{d.imf[i]});
         try f_rfc.writer.print("{s}\n", .{d.rfc[i]});
@@ -180,7 +180,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

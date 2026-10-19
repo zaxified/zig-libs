@@ -186,7 +186,7 @@ pub fn reasonAllowed(ctx: ReasonContext, code: u8) bool {
         .disconnect => &disconnect_reasons,
         .auth => &auth_reasons,
     };
-    return std.mem.indexOfScalar(u8, set, code) != null;
+    return std.mem.findScalar(u8, set, code) != null;
 }
 
 /// The 5.0 reason code a 3.1.1 CONNACK return code corresponds to.
@@ -578,7 +578,7 @@ fn decodeBlock(block: []const u8, ctx: PropertyContext) DecodeError!Properties {
             .message_expiry_interval => p.message_expiry_interval = e.int,
             .content_type => p.content_type = e.a,
             .response_topic => {
-                if (std.mem.indexOfAny(u8, e.a, "+#") != null) return error.ProtocolViolation; // 3.3.2-14
+                if (std.mem.findAny(u8, e.a, "+#") != null) return error.ProtocolViolation; // 3.3.2-14
                 p.response_topic = e.a;
             },
             .correlation_data => p.correlation_data = e.a,
@@ -676,7 +676,7 @@ fn writePropertyEntries(cur: *Cursor, p: Properties, ctx: PropertyContext) Encod
         try cur.utf8String(v);
     }
     if (p.response_topic) |v| {
-        if (std.mem.indexOfAny(u8, v, "+#") != null) return error.InvalidProperty;
+        if (std.mem.findAny(u8, v, "+#") != null) return error.InvalidProperty;
         try W.head(cur, ctx, .response_topic);
         try cur.utf8String(v);
     }
@@ -1069,7 +1069,7 @@ pub fn decodeRemainingLength(bytes: []const u8) DecodeError!?RemainingLength {
 /// MQTT UTF-8 string rules (spec 1.5.3): well-formed UTF-8 (which excludes
 /// surrogate code points) and no U+0000.
 pub fn wellFormedString(s: []const u8) bool {
-    if (std.mem.indexOfScalar(u8, s, 0) != null) return false;
+    if (std.mem.findScalar(u8, s, 0) != null) return false;
     return std.unicode.utf8ValidateSlice(s);
 }
 
@@ -1764,7 +1764,7 @@ fn decodePublish(r: *BodyReader, flags: u4, v5: bool) DecodeError!Publish {
     if (dup and qos == .at_most_once) return error.MalformedPacket; // spec 3.3.1-2
 
     const topic = try r.utf8String();
-    if (std.mem.indexOfAny(u8, topic, "+#") != null) return error.ProtocolViolation; // spec 3.3.2-2
+    if (std.mem.findAny(u8, topic, "+#") != null) return error.ProtocolViolation; // spec 3.3.2-2
 
     const packet_id = if (qos != .at_most_once) try nonzeroId(try r.u16be()) else 0;
     const props: Properties = if (v5) try decodeProperties(r, .publish) else .{};

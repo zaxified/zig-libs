@@ -133,7 +133,7 @@ fn program(io: Io, dir: Dir, report: *Report) !void {
         var buf: [300]u8 = undefined;
         for (0..10) |i| {
             var req: [32]u8 = undefined;
-            const body = std.fmt.bufPrint(&req, "request {d}", .{i * 7}) catch unreachable;
+            const body = std.mem.print(&req, "request {d}", .{i * 7}) catch unreachable;
             try cli.send(io, &srv.address, body);
             const msg = try cli.receive(io, &buf);
             hash.update(msg.data);
@@ -163,7 +163,7 @@ fn program(io: Io, dir: Dir, report: *Report) !void {
         var rnd: [8]u8 = undefined;
         io.random(&rnd);
         var pb: [32]u8 = undefined;
-        const path = std.fmt.bufPrint(&pb, "\x00simio-oracle-{x}", .{std.mem.readInt(u64, &rnd, .little)}) catch unreachable;
+        const path = std.mem.print(&pb, "\x00simio-oracle-{x}", .{std.mem.readInt(u64, &rnd, .little)}) catch unreachable;
         const ua = try net.UnixAddress.init(path);
         var l = try ua.listen(io, .{});
         defer l.deinit(io);

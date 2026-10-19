@@ -57,7 +57,7 @@ fn httpsGet(io: std.Io, gpa: std.mem.Allocator) !void {
     const body = try client.getAlloc(gpa, "https://example.com/", 1 << 20);
     defer gpa.free(body);
     if (body.len == 0) return error.EmptyBody;
-    if (std.mem.indexOf(u8, body, "Example") == null) return error.UnexpectedBody;
+    if (std.mem.find(u8, body, "Example") == null) return error.UnexpectedBody;
 }
 
 fn redirect(io: std.Io, gpa: std.mem.Allocator) !void {

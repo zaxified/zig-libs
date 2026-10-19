@@ -425,8 +425,8 @@ pub fn floatTo(writer: *std.Io.Writer, f: f64) Error!void {
 
     var buf: [64]u8 = undefined;
     // Zig's `{e}` is shortest-round-trip scientific: `[-]D[.DDDD]e[-]E`.
-    const sci = std.fmt.bufPrint(&buf, "{e}", .{f}) catch return error.OutOfRange;
-    const e_at = std.mem.indexOfScalar(u8, sci, 'e').?;
+    const sci = std.mem.print(&buf, "{e}", .{f}) catch return error.OutOfRange;
+    const e_at = std.mem.findScalar(u8, sci, 'e').?;
     var mant = sci[0..e_at];
     const exp = std.fmt.parseInt(i32, sci[e_at + 1 ..], 10) catch return error.OutOfRange;
 
@@ -817,7 +817,7 @@ pub fn contains(haystack: Value, needle: Value) Error!bool {
     return switch (haystack) {
         .string => |s| blk: {
             if (needle != .string) return error.TypeMismatch;
-            break :blk std.mem.indexOf(u8, s.bytes, needle.string.bytes) != null;
+            break :blk std.mem.find(u8, s.bytes, needle.string.bytes) != null;
         },
         .list, .tuple => |l| blk: {
             for (l) |e| if (valueEql(e, needle)) break :blk true;

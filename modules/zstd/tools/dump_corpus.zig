@@ -99,14 +99,14 @@ pub fn main(init: std.process.Init) !void {
     defer for (trained_bytes) |b| if (b) |x| gpa.free(x);
     for (corpus.train_sets, 0..) |ts, k| {
         trained_names[k] = ts.name;
-        const file = try std.fmt.allocPrint(gpa, "{s}.zdict", .{ts.name});
+        const file = try gpa.print("{s}.zdict", .{ts.name});
         defer gpa.free(file);
         trained_bytes[k] = testdata.readFileAlloc(io, file, gpa, .limited(1 << 20)) catch |e| switch (e) {
             error.FileNotFound => null,
             else => return e,
         };
         // the samples it is trained on
-        const sub = try std.fmt.allocPrint(gpa, "train-{s}", .{ts.name});
+        const sub = try gpa.print("train-{s}", .{ts.name});
         defer gpa.free(sub);
         dir.createDir(io, sub, .default_dir) catch |e| switch (e) {
             error.PathAlreadyExists => {},
@@ -119,7 +119,7 @@ pub fn main(init: std.process.Init) !void {
             const buf = try gpa.alloc(u8, len);
             defer gpa.free(buf);
             corpus.generate(c, buf);
-            const name = try std.fmt.allocPrint(gpa, "{s}/{d:0>4}", .{ sub, i });
+            const name = try gpa.print("{s}/{d:0>4}", .{ sub, i });
             defer gpa.free(name);
             try dir.writeFile(io, .{ .sub_path = name, .data = buf });
         }
@@ -129,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
         const buf = try gpa.alloc(u8, corpus.dictLen(d, &trained));
         defer gpa.free(buf);
         const n = corpus.buildDict(d, &trained, buf);
-        const name = try std.fmt.allocPrint(gpa, "dict-{s}", .{d.name});
+        const name = try gpa.print("dict-{s}", .{d.name});
         defer gpa.free(name);
         try dir.writeFile(io, .{ .sub_path = name, .data = buf[0..n] });
     }
@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
         const buf = try gpa.alloc(u8, dc.input.len);
         defer gpa.free(buf);
         corpus.generate(dc.input, buf);
-        const name = try std.fmt.allocPrint(gpa, "dict-in-{s}", .{dc.name});
+        const name = try gpa.print("dict-in-{s}", .{dc.name});
         defer gpa.free(name);
         try dir.writeFile(io, .{ .sub_path = name, .data = buf });
         for (dc.levels) |level| for (dc.checksums) |ck| {
@@ -155,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
         const buf = try gpa.alloc(u8, mc.input.len);
         defer gpa.free(buf);
         corpus.generate(mc.input, buf);
-        const name = try std.fmt.allocPrint(gpa, "mt-in-{s}", .{mc.name});
+        const name = try gpa.print("mt-in-{s}", .{mc.name});
         defer gpa.free(name);
         try dir.writeFile(io, .{ .sub_path = name, .data = buf });
         for (mc.levels) |level| for (mc.checksums) |ck| {
@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
         defer gpa.free(src);
         corpus.generate(findCase(sc.input), src);
         const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit") or sc.gen.list.len != 0;
-        const seq_name = try std.fmt.allocPrint(gpa, "seq-{s}.seq", .{sc.name});
+        const seq_name = try gpa.print("seq-{s}.seq", .{sc.name});
         defer gpa.free(seq_name);
         if (reads) {
             const seqs = try gpa.alloc(corpus.seqgen.Seq, corpus.seqgen.bound(src.len));
@@ -185,10 +185,10 @@ pub fn main(init: std.process.Init) !void {
             const n = corpus.seqgen.generate(src, sc.gen, table, seqs);
             try dir.writeFile(io, .{ .sub_path = seq_name, .data = std.mem.sliceAsBytes(seqs[0..n]) });
         }
-        const dict_name = try std.fmt.allocPrint(gpa, "seq-dict-{s}", .{sc.name});
+        const dict_name = try gpa.print("seq-dict-{s}", .{sc.name});
         defer gpa.free(dict_name);
         if (sc.dict) |d| if (d.trained) |tn| {
-            const file = try std.fmt.allocPrint(gpa, "{s}.zdict", .{tn});
+            const file = try gpa.print("{s}.zdict", .{tn});
             defer gpa.free(file);
             const bytes = try testdata.readFileAlloc(io, file, gpa, .limited(1 << 20));
             defer gpa.free(bytes);
@@ -218,7 +218,7 @@ pub fn main(init: std.process.Init) !void {
             const buf = try gpa.alloc(u8, g.len);
             defer gpa.free(buf);
             corpus.generate(g, buf);
-            in_name = try std.fmt.bufPrint(&own, "room-in-{s}", .{rc.name});
+            in_name = try std.mem.print(&own, "room-in-{s}", .{rc.name});
             try dir.writeFile(io, .{ .sub_path = in_name, .data = buf });
         } else _ = findCase(rc.input);
         try room_manifest.print(gpa, "{s} {s} {d} {d} {s} {s} {t}\n", .{ rc.name, in_name, rc.level, @intFromBool(rc.checksum), rc.params, rc.dict orelse "-", rc.path });

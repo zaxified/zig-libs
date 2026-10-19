@@ -60,7 +60,7 @@ test "STACKPROBE: saml consume entry points leave no SP key or decrypted-identit
     const lkey = &[_][]const u8{std.mem.asBytes(&logout_key.secret_key)};
     const name_id = "<saml:NameID xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">alice@example.org</saml:NameID>";
     const enc_id = try encutil.encryptedWrapper(alloc, logout_key.public_key, "EncryptedID", name_id);
-    const req = try std.fmt.allocPrint(alloc, "<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
+    const req = try alloc.print("<samlp:LogoutRequest xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" " ++
         "xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"_lr_probe\" Version=\"2.0\" " ++
         "IssueInstant=\"2024-06-01T12:00:00Z\"><saml:Issuer>{s}</saml:Issuer>{s}</samlp:LogoutRequest>", .{ fx.idp_entity_id, enc_id });
     const lcfg: saml.LogoutRequestConfig = .{

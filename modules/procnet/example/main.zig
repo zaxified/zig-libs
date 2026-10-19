@@ -249,7 +249,7 @@ fn runSockets(gpa: Allocator, io: std.Io, opts: Options) !u8 {
 
         if (opts.show_extended) {
             var ex_buf: [40]u8 = undefined;
-            const ex = std.fmt.bufPrint(&ex_buf, "uid:{d} ino:{d}", .{ s.uid, s.inode }) catch "uid:? ino:?";
+            const ex = std.mem.print(&ex_buf, "uid:{d} ino:{d}", .{ s.uid, s.inode }) catch "uid:? ino:?";
             try out.print(" {s:<20}", .{ex});
         }
 
@@ -347,9 +347,9 @@ fn formatEndpoint(buf: []u8, ip: netaddr.Ip, port: u16, wildcard_port: bool) []c
     const open = if (bracket) "[" else "";
     const close = if (bracket) "]" else "";
     if (wildcard_port and port == 0) {
-        return std.fmt.bufPrint(buf, "{s}{s}{s}:*", .{ open, ip_text, close }) catch "?";
+        return std.mem.print(buf, "{s}{s}{s}:*", .{ open, ip_text, close }) catch "?";
     }
-    return std.fmt.bufPrint(buf, "{s}{s}{s}:{d}", .{ open, ip_text, close, port }) catch "?";
+    return std.mem.print(buf, "{s}{s}{s}:{d}", .{ open, ip_text, close, port }) catch "?";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1293,7 +1293,7 @@ test "Archive.init: hostile central-directory header (filename_len 0xFFFF) is re
     // on a hostile header. Corrupt the central-directory header's filename_len to
     // 0xFFFF; our pre-validation must reject it as a bad directory, never overflow.
     const cd_sig = std.zip.central_file_header_sig;
-    const cd_start = std.mem.indexOf(u8, zip, &cd_sig).?;
+    const cd_start = std.mem.find(u8, zip, &cd_sig).?;
     // filename_len sits at offset 28 within CentralDirectoryFileHeader.
     std.mem.writeInt(u16, zip[cd_start + 28 ..][0..2], 0xFFFF, .little);
 
@@ -1411,7 +1411,7 @@ test "EntryReader: CRC-32 mismatch on a tampered member is caught, not delivered
         defer a.free(zip);
 
         const cd_sig = std.zip.central_file_header_sig;
-        const cd_start = std.mem.indexOf(u8, zip, &cd_sig).?;
+        const cd_start = std.mem.find(u8, zip, &cd_sig).?;
         // crc32 sits at offset 16 within CentralDirectoryFileHeader (after
         // signature(4)+version_made_by(2)+version_needed(2)+flags(2)+
         // compression_method(2)+mtime(2)+mdate(2) = 16), same struct this
@@ -1854,7 +1854,7 @@ test "ArchiveWriter: classic-format 32-bit overflow guards fail closed (ZipWrite
 
 /// Offset of the (first) central-directory header in `zip`.
 fn cdStart(zip: []const u8) usize {
-    return std.mem.indexOf(u8, zip, &std.zip.central_file_header_sig).?;
+    return std.mem.find(u8, zip, &std.zip.central_file_header_sig).?;
 }
 
 /// `Archive.init` over `zip`, returning the archive or the init error.

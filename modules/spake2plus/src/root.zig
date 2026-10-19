@@ -1245,8 +1245,8 @@ test {
 }
 
 test "meta.model_after names RFC 9383 / SPAKE2+ (not RFC 9382 / plain SPAKE2)" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "9383") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "9382") == null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "9383") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "9382") == null);
 }
 
 test "share_length/scalar_length/hash_length match this ciphersuite's wire sizes" {
@@ -1564,11 +1564,11 @@ test "CT discipline: no secret multiply may use a variable-time routine" {
     };
     for (vartime) |needle| {
         var at: usize = 0;
-        while (std.mem.indexOfPos(u8, src, at, needle)) |hit| {
+        while (std.mem.findPos(u8, src, at, needle)) |hit| {
             // A mention inside a doc/line comment is the claim itself; a
             // call is code. Find the start of the hit's line and reject it
             // only when that line is not a comment.
-            const line_start = if (std.mem.lastIndexOfScalar(u8, src[0..hit], '\n')) |nl| nl + 1 else 0;
+            const line_start = if (std.mem.findScalarLast(u8, src[0..hit], '\n')) |nl| nl + 1 else 0;
             const line = std.mem.trimStart(u8, src[line_start..hit], " ");
             if (!std.mem.startsWith(u8, line, "//")) {
                 std.debug.print(

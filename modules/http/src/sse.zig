@@ -76,10 +76,10 @@ pub fn writeEvent(w: *Writer, ev: Event) SendError!void {
     // Validate the single-line fields before writing anything, so a bad
     // event never leaves a half-written frame on the wire.
     if (ev.event) |name| {
-        if (std.mem.indexOfAny(u8, name, "\r\n") != null) return error.InvalidField;
+        if (std.mem.findAny(u8, name, "\r\n") != null) return error.InvalidField;
     }
     if (ev.id) |id| {
-        if (std.mem.indexOfAny(u8, id, "\r\n\x00") != null) return error.InvalidField;
+        if (std.mem.findAny(u8, id, "\r\n\x00") != null) return error.InvalidField;
     }
 
     if (ev.event) |name| {
@@ -100,7 +100,7 @@ pub fn writeEvent(w: *Writer, ev: Event) SendError!void {
     // with a newline, and exactly one "data:\n" for empty data.
     var rest = ev.data;
     while (true) {
-        if (std.mem.indexOfAny(u8, rest, "\r\n")) |i| {
+        if (std.mem.findAny(u8, rest, "\r\n")) |i| {
             try writeDataLine(w, rest[0..i]);
             var next = i + 1;
             if (rest[i] == '\r' and next < rest.len and rest[next] == '\n') next += 1;
@@ -126,7 +126,7 @@ fn writeDataLine(w: *Writer, line: []const u8) Writer.Error!void {
 /// client event. `text` must not contain CR or LF. No flush; the
 /// transport-agnostic half of `EventStream.comment`.
 pub fn writeComment(w: *Writer, text: []const u8) SendError!void {
-    if (std.mem.indexOfAny(u8, text, "\r\n") != null) return error.InvalidField;
+    if (std.mem.findAny(u8, text, "\r\n") != null) return error.InvalidField;
     try w.writeAll(": ");
     try w.writeAll(text);
     try w.writeAll("\n\n");
@@ -203,11 +203,11 @@ fn runSse(handler: Server.Handler, out_buf: []u8) []const u8 {
 /// flushes, so events arrive as separate chunks; this recovers the clean
 /// event bytes to assert on.
 fn dechunk(raw: []const u8, out: []u8) []const u8 {
-    const body_start = (std.mem.indexOf(u8, raw, "\r\n\r\n") orelse @panic("no head/body split")) + 4;
+    const body_start = (std.mem.find(u8, raw, "\r\n\r\n") orelse @panic("no head/body split")) + 4;
     var rest = raw[body_start..];
     var w: std.Io.Writer = .fixed(out);
     while (true) {
-        const nl = std.mem.indexOf(u8, rest, "\r\n") orelse @panic("missing chunk-size line");
+        const nl = std.mem.find(u8, rest, "\r\n") orelse @panic("missing chunk-size line");
         const size = std.fmt.parseInt(usize, rest[0..nl], 16) catch @panic("bad chunk size");
         if (size == 0) break;
         w.writeAll(rest[nl + 2 ..][0..size]) catch @panic("dechunk buffer too small");
@@ -235,10 +235,10 @@ test "sse: headers and event wire bytes over serveStream" {
 
     // Streaming head: SSE content type, no caching, chunked framing.
     try testing.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 200 OK\r\n"));
-    try testing.expect(std.mem.indexOf(u8, raw, "Content-Type: text/event-stream\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, raw, "Cache-Control: no-store\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, raw, "X-Accel-Buffering: no\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, raw, "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.find(u8, raw, "Content-Type: text/event-stream\r\n") != null);
+    try testing.expect(std.mem.find(u8, raw, "Cache-Control: no-store\r\n") != null);
+    try testing.expect(std.mem.find(u8, raw, "X-Accel-Buffering: no\r\n") != null);
+    try testing.expect(std.mem.find(u8, raw, "Transfer-Encoding: chunked\r\n") != null);
 
     var body_buf: [1024]u8 = undefined;
     try testing.expectEqualStrings("data: hello\n\n" ++
@@ -310,7 +310,7 @@ fn clientDispatchedDataLen(wire: []const u8) ?usize {
     while (lines.next()) |raw_line| {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         if (line.len == 0) break; // blank line: end of this event's fields
-        const colon = std.mem.indexOfScalar(u8, line, ':');
+        const colon = std.mem.findScalar(u8, line, ':');
         const field = if (colon) |i| line[0..i] else line;
         var value = if (colon) |i| line[i + 1 ..] else "";
         if (value.len > 0 and value[0] == ' ') value = value[1..];

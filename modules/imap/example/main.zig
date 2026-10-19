@@ -667,7 +667,7 @@ fn serveConnection(io: std.Io, opts: ServerOptions, stream: *std.Io.net.Stream) 
     var tls = false;
 
     var greet_buf: [256]u8 = undefined;
-    say(w, std.fmt.bufPrint(&greet_buf, "* OK [CAPABILITY {s}] Service Ready\r\n", .{capabilityList(opts, tls)}) catch return);
+    say(w, std.mem.print(&greet_buf, "* OK [CAPABILITY {s}] Service Ready\r\n", .{capabilityList(opts, tls)}) catch return);
 
     while (true) {
         const line = r.takeDelimiterInclusive('\n') catch |err| switch (err) {
@@ -696,14 +696,14 @@ fn serveConnection(io: std.Io, opts: ServerOptions, stream: *std.Io.net.Stream) 
         // A synchronising literal is the one exchange an offline transcript
         // cannot cover, and this prop does not implement it. Say so rather
         // than hanging: an unanswered `{n}` is a deadlock, not a slow server.
-        if (std.mem.endsWith(u8, text, "}") and std.mem.lastIndexOfScalar(u8, text, '{') != null) {
+        if (std.mem.endsWith(u8, text, "}") and std.mem.findScalarLast(u8, text, '{') != null) {
             reply(w, tag, "BAD This prop server does not accept literals\r\n");
             continue;
         }
 
         if (eq(cmd, "CAPABILITY")) {
             var buf: [256]u8 = undefined;
-            say(w, std.fmt.bufPrint(&buf, "* CAPABILITY {s}\r\n", .{capabilityList(opts, tls)}) catch continue);
+            say(w, std.mem.print(&buf, "* CAPABILITY {s}\r\n", .{capabilityList(opts, tls)}) catch continue);
             reply(w, tag, "OK CAPABILITY completed\r\n");
         } else if (eq(cmd, "NOOP")) {
             reply(w, tag, "OK NOOP completed\r\n");
@@ -727,7 +727,7 @@ fn serveConnection(io: std.Io, opts: ServerOptions, stream: *std.Io.net.Stream) 
                 // a real attacker on the path sends one segment.
                 std.debug.print("   -> INJECTING a line across the TLS boundary, in the same write\n", .{});
                 var buf: [256]u8 = undefined;
-                say(w, std.fmt.bufPrint(&buf, "{s} OK Begin TLS negotiation now\r\n" ++
+                say(w, std.mem.print(&buf, "{s} OK Begin TLS negotiation now\r\n" ++
                     "* OK [ALERT] Injected, and a client that reads this is broken\r\n", .{tag}) catch continue);
             } else {
                 reply(w, tag, "OK Begin TLS negotiation now\r\n");
@@ -747,7 +747,7 @@ fn serveConnection(io: std.Io, opts: ServerOptions, stream: *std.Io.net.Stream) 
             }
             state = .authenticated;
             var buf: [256]u8 = undefined;
-            say(w, std.fmt.bufPrint(&buf, "{s} OK [CAPABILITY {s}] LOGIN completed\r\n", .{ tag, capabilityList(opts, tls) }) catch continue);
+            say(w, std.mem.print(&buf, "{s} OK [CAPABILITY {s}] LOGIN completed\r\n", .{ tag, capabilityList(opts, tls) }) catch continue);
         } else if (eq(cmd, "SELECT") or eq(cmd, "EXAMINE")) {
             if (state == .not_authenticated) {
                 reply(w, tag, "BAD Not authenticated\r\n");
@@ -800,7 +800,7 @@ fn capabilityList(opts: ServerOptions, tls: bool) []const u8 {
 
 fn reply(w: *std.Io.Writer, tag: []const u8, tail: []const u8) void {
     var buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{s} {s}", .{ tag, tail }) catch return;
+    const line = std.mem.print(&buf, "{s} {s}", .{ tag, tail }) catch return;
     say(w, line);
 }
 

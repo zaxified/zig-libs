@@ -498,8 +498,7 @@ test "W2-32: the full public path refuses the forged round-1000 document" {
     // passes as well — exactly the document the audit got accepted.
     var digest: [32]u8 = undefined;
     Sha256.hash(&mal_bytes, &digest, .{});
-    const forged = try std.fmt.allocPrint(
-        testing.allocator,
+    const forged = try testing.allocator.print(
         "{{\"round\":1000,\"randomness\":\"{s}\",\"signature\":\"{s}\"}}",
         .{ std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(mal_bytes, .lower) },
     );
@@ -723,8 +722,7 @@ test "chained: sig + G2 cofactor torsion is refused at parse and by both verify 
     // …the parser refuses the forged document (randomness recomputed)…
     var digest: [32]u8 = undefined;
     Sha256.hash(&mal_bytes, &digest, .{});
-    const forged = try std.fmt.allocPrint(
-        testing.allocator,
+    const forged = try testing.allocator.print(
         "{{\"round\":1000000,\"randomness\":\"{s}\",\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}",
         .{ std.fmt.bytesToHex(digest, .lower), std.fmt.bytesToHex(mal_bytes, .lower), std.fmt.bytesToHex(rnd.previous_signature.?.bytes, .lower) },
     );
@@ -1065,7 +1063,7 @@ fn checkFixture(c: Choices) !void {
     const round_no: u64 = if (c.wrong_round) genuine_round + 1 + @as(u64, c.scheme_idx) * 7919 else genuine_round;
 
     var info_buf: [768]u8 = undefined;
-    const info_json = try std.fmt.bufPrint(
+    const info_json = try std.mem.print(
         &info_buf,
         "{{\"public_key\":\"{s}\",\"period\":3,\"genesis_time\":1692803367," ++
             "\"hash\":\"{s}\",\"groupHash\":\"{s}\",\"schemeID\":\"{s}\"," ++
@@ -1074,9 +1072,9 @@ fn checkFixture(c: Choices) !void {
     );
     var round_buf: [512]u8 = undefined;
     const round_json = if (c.with_randomness)
-        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig })
+        try std.mem.print(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig })
     else
-        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\"}}", .{ round_no, &sig });
+        try std.mem.print(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\"}}", .{ round_no, &sig });
 
     // The key, hash and groupHash are all inputs to the chain hash, so any
     // alteration of them must fail the parse. The scheme label is not
@@ -1205,7 +1203,7 @@ fn checkChainedFixture(c: Choices) !void {
     const round_no: u64 = if (c.wrong_round) chained_round + 1 + @as(u64, c.scheme_idx) * 7919 else chained_round;
 
     var info_buf: [768]u8 = undefined;
-    const info_json = try std.fmt.bufPrint(
+    const info_json = try std.mem.print(
         &info_buf,
         "{{\"public_key\":\"{s}\",\"period\":30,\"genesis_time\":1595431050," ++
             "\"hash\":\"{s}\",\"groupHash\":\"{s}\",\"schemeID\":\"{s}\"," ++
@@ -1214,9 +1212,9 @@ fn checkChainedFixture(c: Choices) !void {
     );
     var round_buf: [768]u8 = undefined;
     const round_json = if (c.with_randomness)
-        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig, &prev })
+        try std.mem.print(&round_buf, "{{\"round\":{d},\"randomness\":\"{s}\",\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &rand_hex, &sig, &prev })
     else
-        try std.fmt.bufPrint(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &sig, &prev });
+        try std.mem.print(&round_buf, "{{\"round\":{d},\"signature\":\"{s}\",\"previous_signature\":\"{s}\"}}", .{ round_no, &sig, &prev });
 
     const info_damaged = pk_damaged or hash_damaged or ghash_damaged or c.scheme_idx == 1;
     const info = chaininfo.parseInfo(testing.allocator, info_json) catch |e| {

@@ -66,8 +66,8 @@ pub fn classify(arena: std.mem.Allocator, headers: Headers, body: []const u8, se
     // decodes those, so a substring test alone could be walked around), and
     // no header claiming a modern revision. Such a body cannot be modern, and
     // needs no second full parse on top of the one `mcp` does.
-    if (std.mem.indexOfScalar(u8, body, '\\') == null and
-        std.mem.indexOf(u8, body, mcp.meta_key.protocol_version) == null and
+    if (std.mem.findScalar(u8, body, '\\') == null and
+        std.mem.find(u8, body, mcp.meta_key.protocol_version) == null and
         !headerClaimsModern(headers)) return .legacy;
 
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch |err| switch (err) {
@@ -250,7 +250,7 @@ fn walkProperties(arena: std.mem.Allocator, schema: std.json.Value, path: *std.A
 /// booleans as `true`/`false`. Returns the mismatch line, or null.
 fn checkParamHeaders(arena: std.mem.Allocator, headers: Headers, input_schema: []const u8, args: ?std.json.Value, id: ?std.json.Value) error{OutOfMemory}!?[]const u8 {
     for (try paramHeaders(arena, input_schema)) |ph| {
-        const hname = try std.fmt.allocPrint(arena, "Mcp-Param-{s}", .{ph.name});
+        const hname = try arena.print("Mcp-Param-{s}", .{ph.name});
         const body_v = valueAt(args, ph.path);
         const n = headers.count(hname);
         if (n > 1) return try mismatchLineFmt(arena, id, "duplicated header {s}", .{hname});
@@ -315,7 +315,7 @@ fn mismatch(arena: std.mem.Allocator, id: ?std.json.Value, comptime why: []const
 }
 
 fn mismatchLine(arena: std.mem.Allocator, id: ?std.json.Value, why: []const u8) error{OutOfMemory}![]const u8 {
-    const msg = try std.fmt.allocPrint(arena, "Header mismatch: {s}", .{why});
+    const msg = try arena.print("Header mismatch: {s}", .{why});
     var aw: std.Io.Writer.Allocating = .init(arena);
     writeErrorLine(&aw.writer, id, msg) catch return error.OutOfMemory;
     return aw.written();
@@ -330,7 +330,7 @@ fn writeErrorLine(w: *std.Io.Writer, id: ?std.json.Value, msg: []const u8) std.I
 }
 
 fn mismatchLineFmt(arena: std.mem.Allocator, id: ?std.json.Value, comptime fmt: []const u8, args: anytype) error{OutOfMemory}![]const u8 {
-    return mismatchLine(arena, id, try std.fmt.allocPrint(arena, fmt, args));
+    return mismatchLine(arena, id, try arena.print(fmt, args));
 }
 
 /// The HTTP status of a modern request's final JSON-RPC line
@@ -464,11 +464,11 @@ fn classifyWith(a: std.mem.Allocator, pairs: []const [2][]const u8, body: []cons
 fn expectMismatch(v: Verdict, fragment: []const u8) !void {
     switch (v) {
         .mismatch => |line| {
-            if (std.mem.indexOf(u8, line, fragment) == null) {
+            if (std.mem.find(u8, line, fragment) == null) {
                 std.debug.print("\nmismatch line: {s}\nwanted: {s}\n", .{ line, fragment });
                 return error.TestExpectedEqual;
             }
-            try testing.expect(std.mem.indexOf(u8, line, "\"code\":-32020") != null);
+            try testing.expect(std.mem.find(u8, line, "\"code\":-32020") != null);
         },
         else => return error.TestExpectedEqual,
     }
@@ -568,7 +568,7 @@ test "Base64 sentinel values decode before comparing (the spec's encoding table)
     ;
     var enc_buf: [64]u8 = undefined;
     const enc = std.base64.standard.Encoder.encode(&enc_buf, "file:///ü.txt");
-    const sentinel = try std.fmt.allocPrint(a, "=?base64?{s}?=", .{enc});
+    const sentinel = try a.print("=?base64?{s}?=", .{enc});
     try testing.expectEqual(Verdict.modern, try classifyWith(a, &.{
         .{ "MCP-Protocol-Version", "2026-07-28" },
         .{ "Mcp-Method", "resources/read" },
@@ -618,7 +618,7 @@ test "x-mcp-header: only properties chains count; nested, integer and boolean va
         var pairs: std.ArrayList([2][]const u8) = .empty;
         try pairs.appendSlice(a, &base);
         try pairs.appendSlice(a, c.extra);
-        const body = try std.fmt.allocPrint(a, "{s}{s}}}}}", .{ head, c.args });
+        const body = try a.print("{s}{s}}}}}", .{ head, c.args });
         const v = try classifyWith(a, pairs.items, body);
         testing.expectEqual(c.ok, v == .modern) catch |e| {
             std.debug.print("case {d}: {any}\n", .{ i, v });

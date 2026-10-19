@@ -287,8 +287,8 @@ fn derFromPem(comptime pem: []const u8) []const u8 {
     // Fixtures hold one certificate each; decode its base64 body.
     const b64 = comptime blk: {
         @setEvalBranchQuota(100_000);
-        const begin = std.mem.indexOf(u8, pem, "-----\n").? + 6;
-        const end = std.mem.indexOf(u8, pem, "\n-----END").?;
+        const begin = std.mem.find(u8, pem, "-----\n").? + 6;
+        const end = std.mem.find(u8, pem, "\n-----END").?;
         var clean: [end - begin]u8 = undefined;
         var n: usize = 0;
         for (pem[begin..end]) |ch| if (ch != '\n') {
@@ -515,8 +515,8 @@ test "HelloRetryRequest (offline): a cookie is echoed, a selected group gets the
         const ch1_len = 5 + @as(usize, std.mem.readInt(u16, r.written[3..5], .big));
         const ch2 = r.written[ch1_len..];
         try testing.expectEqualSlices(u8, "\x16\x03\x03", ch2[0..3]); // 0x0303 after an HRR (RFC 8446 §5.1)
-        try testing.expect(std.mem.indexOf(u8, ch2, "\x00\x2c\x00\x07\x00\x05c00k!") != null);
-        try testing.expect(std.mem.indexOf(u8, r.written[0..ch1_len], "c00k!") == null);
+        try testing.expect(std.mem.find(u8, ch2, "\x00\x2c\x00\x07\x00\x05c00k!") != null);
+        try testing.expect(std.mem.find(u8, r.written[0..ch1_len], "c00k!") == null);
         try testing.expectEqual(ch1_len + 11, ch2.len);
     }
     {
@@ -525,9 +525,9 @@ test "HelloRetryRequest (offline): a cookie is echoed, a selected group gets the
         try testing.expectEqual(error.TlsConnectionTruncated, r.err);
         const ch1_len = 5 + @as(usize, std.mem.readInt(u16, r.written[3..5], .big));
         const ch2 = r.written[ch1_len..];
-        const ks = std.mem.indexOf(u8, ch2, "\x00\x33\x00\x47\x00\x45\x00\x17\x00\x41\x04").?; // 65-byte SEC1
+        const ks = std.mem.find(u8, ch2, "\x00\x33\x00\x47\x00\x45\x00\x17\x00\x41\x04").?; // 65-byte SEC1
         _ = ks;
-        try testing.expect(std.mem.indexOf(u8, ch2, "\x11\xec\x04\xc0") == null); // no hybrid share any more
+        try testing.expect(std.mem.find(u8, ch2, "\x11\xec\x04\xc0") == null); // no hybrid share any more
     }
 }
 
@@ -665,7 +665,7 @@ test "interop: TLS 1.2 SCTs from ServerHello (s_server -serverinfo)" {
     var b64: [std.base64.standard.Encoder.calcSize(body.len)]u8 = undefined;
     _ = std.base64.standard.Encoder.encode(&b64, body);
     var pem_buf: [256]u8 = undefined;
-    const pem = try std.fmt.bufPrint(&pem_buf, "-----BEGIN SERVERINFO FOR signed_certificate_timestamp-----\n{s}\n-----END SERVERINFO FOR signed_certificate_timestamp-----\n", .{b64});
+    const pem = try std.mem.print(&pem_buf, "-----BEGIN SERVERINFO FOR signed_certificate_timestamp-----\n{s}\n-----END SERVERINFO FOR signed_certificate_timestamp-----\n", .{b64});
     try tmp.dir.writeFile(io, .{ .sub_path = "sct.pem", .data = pem });
     var bundle = try rootBundle(io, tmp.dir);
     defer bundle.deinit(testing.allocator);
@@ -859,8 +859,8 @@ test "interop: TLS 1.2 client certificates -- P-256 and P-384 verified by openss
 
 /// The first PEM block's DER, decoded at run time into `out`.
 fn pemToDer(pem: []const u8, out: []u8) ![]const u8 {
-    const begin = (std.mem.indexOf(u8, pem, "-----\n") orelse return error.BadPem) + 6;
-    const end = std.mem.indexOfPos(u8, pem, begin, "\n-----END") orelse return error.BadPem;
+    const begin = (std.mem.find(u8, pem, "-----\n") orelse return error.BadPem) + 6;
+    const end = std.mem.findPos(u8, pem, begin, "\n-----END") orelse return error.BadPem;
     var clean: [8192]u8 = undefined;
     var n: usize = 0;
     for (pem[begin..end]) |ch| if (ch != '\n' and ch != '\r') {
@@ -915,7 +915,7 @@ const Picker = struct {
         p.cas = info.certificate_authorities.len;
         const ca_der = derFromPem(@embedFile("testdata/client-ca.pem"));
         for (info.certificate_authorities) |dn| {
-            if (std.mem.indexOf(u8, ca_der, dn) != null) p.ca_matches = true;
+            if (std.mem.find(u8, ca_der, dn) != null) p.ca_matches = true;
         }
         return if (p.ca_matches) p.auth else null;
     }
@@ -1036,9 +1036,9 @@ test "interop: an IP host -- no SNI, matched against iPAddress SANs; a CN-only c
     // Offline: the hello for an IP host carries no server_name extension.
     var a: [4096]u8 = undefined;
     const h = try clientHelloWith(&a, .{ .host = "192.0.2.1" });
-    try testing.expect(std.mem.indexOf(u8, h, "192.0.2.1") == null);
+    try testing.expect(std.mem.find(u8, h, "192.0.2.1") == null);
     const named = try clientHelloWith(&a, .{});
-    try testing.expect(std.mem.indexOf(u8, named, "good.example.test") != null);
+    try testing.expect(std.mem.find(u8, named, "good.example.test") != null);
 }
 
 // ── offline: the ClientHello, the ALPN answer, the CertificateRequest ──────
@@ -1129,7 +1129,7 @@ test "std profile: with std's groups and shares the ClientHello is std's, plus t
     const ins = cs + 2 + n_std;
     try testing.expectEqualSlices(u8, theirs[ins..], ours[ins + 6 ..]);
     const ecdsa = [_]u16{ 0xC02B, 0xC02C, 0xCCA9 };
-    for (0..3) |i| try testing.expect(std.mem.indexOfScalar(u16, &ecdsa, std.mem.readInt(u16, ours[ins + 2 * i ..][0..2], .big)) != null);
+    for (0..3) |i| try testing.expect(std.mem.findScalar(u16, &ecdsa, std.mem.readInt(u16, ours[ins + 2 * i ..][0..2], .big)) != null);
     // ... and the three length fields in front of it grown by 6.
     try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 6, std.mem.readInt(u16, ours[3..5], .big));
     try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 6, std.mem.readInt(u24, ours[6..9], .big));
@@ -1149,9 +1149,9 @@ test "default options: Go's shape -- five groups listed, shares for X25519MLKEM7
     try testing.expectEqual(std_shape.len - (65 + 4) - (97 + 4) + 2 + 9 + 4 + 4 + 5, go.len);
     try testing.expect(std.mem.endsWith(u8, go, "\x00\x05\x00\x05\x01\x00\x00\x00\x00" ++ "\x00\x12\x00\x00" ++ "\x00\x17\x00\x00" ++ "\xff\x01\x00\x01\x00"));
     const groups = "\x00\x0a\x00\x0c\x00\x0a\x11\xec\x00\x1d\x00\x17\x00\x18\x00\x19";
-    try testing.expect(std.mem.indexOf(u8, go, groups) != null);
+    try testing.expect(std.mem.find(u8, go, groups) != null);
     // key_share: X25519MLKEM768 (1184 + 32) then X25519 (32).
-    const ks_at = std.mem.indexOf(u8, go, "\x00\x33").?;
+    const ks_at = std.mem.find(u8, go, "\x00\x33").?;
     try testing.expectEqual(@as(u16, 4 + 1216 + 4 + 32), std.mem.readInt(u16, go[ks_at + 4 ..][0..2], .big));
     try testing.expectEqualSlices(u8, "\x11\xec\x04\xc0", go[ks_at + 6 ..][0..4]);
     try testing.expectEqualSlices(u8, "\x00\x1d\x00\x20", go[ks_at + 6 + 4 + 1216 ..][0..4]);
@@ -1167,11 +1167,11 @@ test "options: versions and groups are checked before anything is sent" {
     try testing.expectError(error.GroupsInvalid, clientHelloWith(&a, .{ .groups = &.{.x25519}, .key_share_groups = &.{.secp256r1} }));
     // TLS 1.3 only: supported_versions lists 1.3 alone.
     const h = try clientHelloWith(&a, .{ .min_version = .tls_1_3 });
-    try testing.expect(std.mem.indexOf(u8, h, "\x00\x2b\x00\x03\x02\x03\x04") != null);
+    try testing.expect(std.mem.find(u8, h, "\x00\x2b\x00\x03\x02\x03\x04") != null);
     // TLS 1.2 only: no key_share at all.
     const h2 = try clientHelloWith(&a, .{ .max_version = .tls_1_2 });
-    try testing.expect(std.mem.indexOf(u8, h2, "\x00\x2b\x00\x03\x02\x03\x03") != null);
-    try testing.expect(std.mem.indexOf(u8, h2, "\x00\x33\x00") == null);
+    try testing.expect(std.mem.find(u8, h2, "\x00\x2b\x00\x03\x02\x03\x03") != null);
+    try testing.expect(std.mem.find(u8, h2, "\x00\x33\x00") == null);
 }
 
 test "ALPN offer: std's ClientHello plus the RFC 7301 extension, lengths grown by its size" {

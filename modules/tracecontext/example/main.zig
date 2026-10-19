@@ -64,7 +64,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -99,7 +99,7 @@ pub fn main() !void {
     std.debug.print("trace-id kept, span-id freshly minted for this hop: OK\n", .{});
 
     // The handler's current() view matches the header actually sent on the wire.
-    const body_start = std.mem.indexOf(u8, got, "\r\n\r\n").? + 4;
+    const body_start = std.mem.find(u8, got, "\r\n\r\n").? + 4;
     if (!std.mem.eql(u8, got[body_start..], out_header)) return error.CurrentMismatch;
     std.debug.print("current() agrees with the response header: OK\n", .{});
 

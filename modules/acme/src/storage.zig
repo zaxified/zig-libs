@@ -193,7 +193,7 @@ pub const DirStorage = struct {
     /// Create every parent directory of `key`, `0700`.
     fn makeParents(d: *DirStorage, key: []const u8) Error!void {
         var at: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, key, at, '/')) |slash| : (at = slash + 1) {
+        while (std.mem.findScalarPos(u8, key, at, '/')) |slash| : (at = slash + 1) {
             d.dir.createDir(d.io, key[0..slash], dir_permissions) catch |err| switch (err) {
                 error.PathAlreadyExists => {},
                 else => return error.StorageFailed,
@@ -228,7 +228,7 @@ pub const DirStorage = struct {
     const max_lock_path = lock_dir.len + max_key_len + ".lock".len;
 
     fn lockPath(buf: *[max_lock_path]u8, name: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}{s}.lock", .{ lock_dir, name }) catch unreachable; // name <= max_key_len
+        return std.mem.print(buf, "{s}{s}.lock", .{ lock_dir, name }) catch unreachable; // name <= max_key_len
     }
 
     /// Write `value` to `path` whole, fsynced, linked in only if `path` is
@@ -273,7 +273,7 @@ pub const DirStorage = struct {
         var path_buf: [max_lock_path]u8 = undefined;
         const path = lockPath(&path_buf, name);
         var buf: [96]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{s}\n{d}\n", .{ owner, now +| lease_s }) catch unreachable; // owner <= 64
+        const text = std.mem.print(&buf, "{s}\n{d}\n", .{ owner, now +| lease_s }) catch unreachable; // owner <= 64
         const g = try d.guard();
         defer if (g) |f| f.close(d.io);
         var read_buf: [96]u8 = undefined;
@@ -634,7 +634,7 @@ test "DirStorage: a stale lock is taken over by exactly one of racing nodes" {
 
         fn run(n: *@This()) void {
             while (!n.go.load(.acquire)) std.atomic.spinLoopHint();
-            const owner = std.fmt.bufPrint(&n.name, "node-{x}", .{@intFromPtr(n) & 0xffff}) catch unreachable;
+            const owner = std.mem.print(&n.name, "node-{x}", .{@intFromPtr(n) & 0xffff}) catch unreachable;
             n.won = n.d.storage().tryLock("issue/race", owner, 2000, 60) catch {
                 n.failed = true;
                 return;

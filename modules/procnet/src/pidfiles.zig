@@ -188,7 +188,7 @@ pub fn parsePidIo(text: []const u8) PidIo {
     var out: PidIo = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " \t");
         const v = firstUint(line[colon + 1 ..]);
         const dst: *u64 = if (std.mem.eql(u8, key, "rchar")) &out.rchar else if (std.mem.eql(u8, key, "wchar")) &out.wchar else if (std.mem.eql(u8, key, "syscr")) &out.syscr else if (std.mem.eql(u8, key, "syscw")) &out.syscw else if (std.mem.eql(u8, key, "read_bytes")) &out.read_bytes else if (std.mem.eql(u8, key, "write_bytes")) &out.write_bytes else if (std.mem.eql(u8, key, "cancelled_write_bytes")) &out.cancelled_write_bytes else continue;
@@ -353,7 +353,7 @@ fn parseCpuList(s: *PidStatus, v: []const u8) void {
         if (part.len == 0) continue;
         var first: u64 = undefined;
         var last: u64 = undefined;
-        if (std.mem.indexOfScalar(u8, part, '-')) |d| {
+        if (std.mem.findScalar(u8, part, '-')) |d| {
             first = std.fmt.parseInt(u64, part[0..d], 10) catch continue;
             last = std.fmt.parseInt(u64, part[d + 1 ..], 10) catch continue;
         } else {
@@ -375,7 +375,7 @@ pub fn parsePidStatus(text: []const u8) PidStatus {
     var s: PidStatus = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.meta.stringToEnum(StatusKey, std.mem.trim(u8, line[0..colon], " \t")) orelse continue;
         const v = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
         switch (key) {
@@ -446,7 +446,7 @@ pub const ArgIterator = struct {
 
     pub fn next(it: *ArgIterator) ?[]const u8 {
         const r = it.rest orelse return null;
-        if (std.mem.indexOfScalar(u8, r, 0)) |i| {
+        if (std.mem.findScalar(u8, r, 0)) |i| {
             it.rest = r[i + 1 ..];
             // The final NUL terminates the last argument; it does not start a new one.
             if (it.rest.?.len == 0) it.rest = null;
@@ -529,8 +529,8 @@ pub fn parseCgroups(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
-        const c1 = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        const c2 = std.mem.indexOfScalarPos(u8, line, c1 + 1, ':') orelse continue;
+        const c1 = std.mem.findScalar(u8, line, ':') orelse continue;
+        const c2 = std.mem.findScalarPos(u8, line, c1 + 1, ':') orelse continue;
         const id = std.fmt.parseInt(u32, line[0..c1], 10) catch continue;
         try out.append(gpa, .{
             .hierarchy_id = id,

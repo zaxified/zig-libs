@@ -84,8 +84,8 @@ fn matchesCommitted(arena: std.mem.Allocator, io: std.Io, fresh: []const u8) !bo
     std.debug.print("interop-uci: capture differs from {s} at byte {d} (line {d}", .{ transcript_path, at, line });
     if (in_case) std.debug.print(", case index {d}", .{case});
     std.debug.print(")\n", .{});
-    const end_c = std.mem.indexOfScalarPos(u8, committed, at, '\n') orelse committed.len;
-    const end_f = std.mem.indexOfScalarPos(u8, fresh, at, '\n') orelse fresh.len;
+    const end_c = std.mem.findScalarPos(u8, committed, at, '\n') orelse committed.len;
+    const end_f = std.mem.findScalarPos(u8, fresh, at, '\n') orelse fresh.len;
     std.debug.print("  committed: {s}\n  fresh    : {s}\n", .{ committed[line_start..end_c], fresh[line_start..end_f] });
     return false;
 }
@@ -161,7 +161,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             } else |e| {
                 // A value libuci itself would not write back (SerializeError):
                 // recorded, and the replay requires the same refusal.
-                theirs_ser = try std.fmt.allocPrint(arena, "SERIALIZE-ERROR {t}", .{e});
+                theirs_ser = try arena.print("SERIALIZE-ERROR {t}", .{e});
             }
         } else |_| {}
         try out.appendSlice(gpa, "    .{ .input = ");

@@ -4623,11 +4623,11 @@ fn enterNetns() bool {
         // is already granted by the unshare itself.
         writeProcFile("/proc/self/setgroups", "deny");
         var buf: [64]u8 = undefined;
-        if (std.fmt.bufPrint(&buf, "0 {d} 1", .{uid})) |m| {
+        if (std.mem.print(&buf, "0 {d} 1", .{uid})) |m| {
             writeProcFile("/proc/self/uid_map", m);
         } else |_| {}
         var gbuf: [64]u8 = undefined;
-        if (std.fmt.bufPrint(&gbuf, "0 {d} 1", .{gid})) |m| {
+        if (std.mem.print(&gbuf, "0 {d} 1", .{gid})) |m| {
             writeProcFile("/proc/self/gid_map", m);
         } else |_| {}
         return true;
@@ -4993,7 +4993,7 @@ const NetnsPreexisting = struct {
     }
 
     fn holds(self: *const NetnsPreexisting, index: u32) bool {
-        return std.mem.indexOfScalar(u32, self.idx[0..self.len], index) != null;
+        return std.mem.findScalar(u32, self.idx[0..self.len], index) != null;
     }
 };
 

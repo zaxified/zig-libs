@@ -198,12 +198,12 @@ pub fn parseMailbox(s: []const u8) ?Mailbox {
         while (i < s.len and s[i] != '@') : (i += 1) {
             const b = s[i];
             if (b <= 0x20 or b >= 0x7f) return null;
-            if (std.mem.indexOfScalar(u8, "\"(),:;<>[\\]", b) != null) return null;
+            if (std.mem.findScalar(u8, "\"(),:;<>[\\]", b) != null) return null;
         }
         if (i == 0 or i >= s.len) return null;
     }
     const domain = s[i + 1 ..];
-    if (std.mem.indexOfScalar(u8, domain, '@') != null) return null;
+    if (std.mem.findScalar(u8, domain, '@') != null) return null;
     return .{ .local = s[0..i], .domain = domain };
 }
 
@@ -245,7 +245,7 @@ pub fn localEql(a: []const u8, b: []const u8) bool {
 pub fn matchRfc822(name: []const u8, constraint: []const u8) Match {
     const mb = parseMailbox(name) orelse return .unsupported;
     if (!validDomain(mb.domain)) return .unsupported;
-    if (std.mem.indexOfScalar(u8, constraint, '@') != null) {
+    if (std.mem.findScalar(u8, constraint, '@') != null) {
         const c = parseMailbox(constraint) orelse return .unsupported;
         if (!validDomain(c.domain)) return .unsupported;
         return fromBool(localEql(mb.local, c.local) and std.ascii.eqlIgnoreCase(mb.domain, c.domain));
@@ -259,7 +259,7 @@ pub fn matchRfc822(name: []const u8, constraint: []const u8) Match {
 /// (`[…]` or dotted IPv4) — a URI constraint is a domain rule and cannot
 /// place an address (RFC 5280 §4.2.1.10 asks for a fully qualified domain).
 pub fn uriHost(uri: []const u8) ?[]const u8 {
-    const colon = std.mem.indexOfScalar(u8, uri, ':') orelse return null;
+    const colon = std.mem.findScalar(u8, uri, ':') orelse return null;
     if (colon == 0) return null;
     for (uri[0..colon], 0..) |b, i| {
         const ok = std.ascii.isAlphabetic(b) or (i > 0 and (std.ascii.isDigit(b) or b == '+' or b == '-' or b == '.'));
@@ -268,16 +268,16 @@ pub fn uriHost(uri: []const u8) ?[]const u8 {
     const rest = uri[colon + 1 ..];
     if (!std.mem.startsWith(u8, rest, "//")) return null;
     const auth_all = rest[2..];
-    const auth_end = std.mem.indexOfAny(u8, auth_all, "/?#") orelse auth_all.len;
+    const auth_end = std.mem.findAny(u8, auth_all, "/?#") orelse auth_all.len;
     var host = auth_all[0..auth_end];
-    if (std.mem.lastIndexOfScalar(u8, host, '@')) |at| host = host[at + 1 ..];
+    if (std.mem.findScalarLast(u8, host, '@')) |at| host = host[at + 1 ..];
     if (host.len != 0 and host[0] == '[') return null;
-    if (std.mem.lastIndexOfScalar(u8, host, ':')) |c| {
+    if (std.mem.findScalarLast(u8, host, ':')) |c| {
         for (host[c + 1 ..]) |b| if (!std.ascii.isDigit(b)) return null;
         host = host[0..c];
     }
     if (host.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, host, '%') != null) return null;
+    if (std.mem.findScalar(u8, host, '%') != null) return null;
     if (parseIp4(host) != null) return null;
     return host;
 }

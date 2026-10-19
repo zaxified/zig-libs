@@ -45,7 +45,7 @@ test "RFC 4226 Appendix D: formatted codes" {
     var buf: [8]u8 = undefined;
     for (kat.rfc4226_vectors) |v| {
         var want_buf: [8]u8 = undefined;
-        const want = try std.fmt.bufPrint(&want_buf, "{d:0>6}", .{v.hotp6});
+        const want = try std.mem.print(&want_buf, "{d:0>6}", .{v.hotp6});
         try std.testing.expectEqualStrings(
             want,
             try otp.hotpFmt(.sha1, kat.rfc4226_secret, v.count, 6, &buf),

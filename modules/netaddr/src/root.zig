@@ -510,7 +510,7 @@ pub const max_ip_expanded_text_len = 39;
 /// groups, `2001:0db8:0000:0000:0000:0000:0000:0001`.
 pub fn formatIpExpanded(ip: Ip, buf: *[max_ip_expanded_text_len]u8) []const u8 {
     switch (ip) {
-        .v4 => |q| return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] }) catch unreachable,
+        .v4 => |q| return std.mem.print(buf, "{d}.{d}.{d}.{d}", .{ q[0], q[1], q[2], q[3] }) catch unreachable,
         .v6 => |b| {
             const hex = "0123456789abcdef";
             var w: usize = 0;
@@ -611,7 +611,7 @@ pub const ZonedIp = struct {
 /// non-empty; a zone on an IPv4 literal is refused. Null on malformed input
 /// or a zone longer than `max_zone_len`.
 pub fn parseIpZoned(text: []const u8) ?ZonedIp {
-    const pct = std.mem.indexOfScalar(u8, text, '%') orelse
+    const pct = std.mem.findScalar(u8, text, '%') orelse
         return .{ .ip = parseIp(text) orelse return null };
     const zone_text = text[pct + 1 ..];
     if (zone_text.len == 0) return null;
@@ -661,7 +661,7 @@ pub const AddrPort = struct {
             .ip6 => |x| blk: {
                 var ap: AddrPort = .{ .ip = .{ .v6 = x.bytes }, .port = x.port };
                 if (!x.interface.isNone()) {
-                    const s = std.fmt.bufPrint(&ap.zone.buf, "{d}", .{x.interface.index}) catch unreachable; // ≤ 10 digits
+                    const s = std.mem.print(&ap.zone.buf, "{d}", .{x.interface.index}) catch unreachable; // ≤ 10 digits
                     ap.zone.len = @intCast(s.len);
                 }
                 break :blk ap;
@@ -700,7 +700,7 @@ pub const AddrPort = struct {
 /// The port follows this module's `parsePort` (decimal, no leading zero) —
 /// Go also takes `080`. Null on malformed input.
 pub fn parseAddrPort(text: []const u8) ?AddrPort {
-    const colon = std.mem.lastIndexOfScalar(u8, text, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, text, ':') orelse return null;
     const port = parsePort(text[colon + 1 ..]) orelse return null;
     const host = text[0..colon];
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') {
@@ -727,7 +727,7 @@ pub fn formatAddrPort(ap: AddrPort, buf: *[max_addr_port_text_len]u8) []const u8
         buf[w] = ']';
         w += 1;
     }
-    w += (std.fmt.bufPrint(buf[w..], ":{d}", .{ap.port}) catch unreachable).len;
+    w += (std.mem.print(buf[w..], ":{d}", .{ap.port}) catch unreachable).len;
     return buf[0..w];
 }
 
@@ -742,15 +742,15 @@ pub const HostPort = struct { host: []const u8, port: u16 };
 pub fn parseHostPort(text: []const u8) ?HostPort {
     if (text.len == 0) return null;
     if (text[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, text, ']') orelse return null;
+        const close = std.mem.findScalar(u8, text, ']') orelse return null;
         const host = text[1..close];
         if (host.len == 0) return null;
         if (close + 2 >= text.len or text[close + 1] != ':') return null;
         const port = parsePort(text[close + 2 ..]) orelse return null;
         return .{ .host = host, .port = port };
     }
-    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
-    if (std.mem.indexOfScalarPos(u8, text, colon + 1, ':') != null) return null;
+    const colon = std.mem.findScalar(u8, text, ':') orelse return null;
+    if (std.mem.findScalarPos(u8, text, colon + 1, ':') != null) return null;
     if (colon == 0) return null;
     const port = parsePort(text[colon + 1 ..]) orelse return null;
     return .{ .host = text[0..colon], .port = port };
@@ -1020,7 +1020,7 @@ pub const Prefix = struct {
 /// must be decimal without leading zeros and at most 32 for v4 / 128 for v6.
 /// Returns null on malformed input; never panics.
 pub fn parsePrefix(text: []const u8) ?Prefix {
-    const slash = std.mem.indexOfScalar(u8, text, '/') orelse return null;
+    const slash = std.mem.findScalar(u8, text, '/') orelse return null;
     const addr = parseIp(text[0..slash]) orelse return null;
     const bits_text = text[slash + 1 ..];
     if (bits_text.len == 0 or bits_text.len > 3) return null;
@@ -1050,7 +1050,7 @@ pub fn parsePrefix(text: []const u8) ?Prefix {
 pub fn formatPrefix(p: Prefix, buf: *[max_prefix_text_len]u8) []const u8 {
     const ip_text = formatIp(p.addr, buf[0..max_ip_text_len]);
     const bits = @min(p.bits, p.width());
-    const bits_text = std.fmt.bufPrint(buf[ip_text.len..], "/{d}", .{bits}) catch unreachable;
+    const bits_text = std.mem.print(buf[ip_text.len..], "/{d}", .{bits}) catch unreachable;
     return buf[0 .. ip_text.len + bits_text.len];
 }
 
@@ -1059,7 +1059,7 @@ pub fn formatPrefix(p: Prefix, buf: *[max_prefix_text_len]u8) []const u8 {
 /// `192.0.2.1` — the address as written, host bits kept. A bare address
 /// may carry a zone (`parseIpZoned`); a prefix may not (`parsePrefix`).
 pub fn parsePrefixOrAddr(text: []const u8) ?ZonedIp {
-    if (std.mem.indexOfScalar(u8, text, '/') != null) return .{ .ip = (parsePrefix(text) orelse return null).addr };
+    if (std.mem.findScalar(u8, text, '/') != null) return .{ .ip = (parsePrefix(text) orelse return null).addr };
     return parseIpZoned(text);
 }
 
@@ -1125,7 +1125,7 @@ pub const IpRange = struct {
 /// `-`, no spaces, same family, `from <= to`. As in netipx a zone on either
 /// end is accepted and dropped — a range is zone-less. Null otherwise.
 pub fn parseIpRange(text: []const u8) ?IpRange {
-    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return null;
+    const dash = std.mem.findScalar(u8, text, '-') orelse return null;
     const from = parseIpZoned(text[0..dash]) orelse return null;
     const to = parseIpZoned(text[dash + 1 ..]) orelse return null;
     const r: IpRange = .{ .from = from.ip, .to = to.ip };

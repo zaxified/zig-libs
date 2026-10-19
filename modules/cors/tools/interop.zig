@@ -252,7 +252,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (check) try argv.append(arena, "--check");
     // `bun` on PATH, else where its installer puts it (a PATH set up by a
     // login shell is not always the one a build step inherits).
-    const home_bun = if (env.get("HOME")) |h| try std.fmt.allocPrint(arena, "{s}/.bun/bin/bun", .{h}) else "bun";
+    const home_bun = if (env.get("HOME")) |h| try arena.print("{s}/.bun/bin/bun", .{h}) else "bun";
     var child = std.process.spawn(io, .{
         .argv = argv.items,
         .environ_map = &env,

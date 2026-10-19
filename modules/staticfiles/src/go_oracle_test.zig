@@ -163,11 +163,11 @@ const Response = struct {
 fn parseResponse(raw: []const u8, body_buf: []u8) !Response {
     if (raw.len < 12) return error.ShortResponse;
     var r: Response = .{ .status = try std.fmt.parseInt(u16, raw[9..12], 10) };
-    const end = mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.NoHeadEnd;
+    const end = mem.find(u8, raw, "\r\n\r\n") orelse return error.NoHeadEnd;
     var lines = mem.splitSequence(u8, raw[0..end], "\r\n");
     _ = lines.next();
     while (lines.next()) |line| {
-        const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = mem.findScalar(u8, line, ':') orelse continue;
         const name = line[0..colon];
         const value = mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(name, "Location")) r.location = value;
@@ -183,9 +183,9 @@ fn parseResponse(raw: []const u8, body_buf: []u8) !Response {
     var n: usize = 0;
     var p: usize = 0;
     while (true) {
-        const eol = mem.indexOfPos(u8, rest, p, "\r\n") orelse return error.BadChunk;
+        const eol = mem.findPos(u8, rest, p, "\r\n") orelse return error.BadChunk;
         const size_text = rest[p..eol];
-        const semi = mem.indexOfScalar(u8, size_text, ';') orelse size_text.len;
+        const semi = mem.findScalar(u8, size_text, ';') orelse size_text.len;
         const size = try std.fmt.parseInt(usize, size_text[0..semi], 16);
         p = eol + 2;
         if (size == 0) break;
@@ -201,8 +201,8 @@ fn parseResponse(raw: []const u8, body_buf: []u8) !Response {
 /// enough for the absolute-path and dot-relative forms both sides use.
 fn resolve(buf: []u8, req_path: []const u8, loc: []const u8) []const u8 {
     if (loc.len > 0 and loc[0] == '/') return loc;
-    const q = mem.indexOfAny(u8, req_path, "?#") orelse req_path.len;
-    const dir_end = (mem.lastIndexOfScalar(u8, req_path[0..q], '/') orelse 0) + 1;
+    const q = mem.findAny(u8, req_path, "?#") orelse req_path.len;
+    const dir_end = (mem.findScalarLast(u8, req_path[0..q], '/') orelse 0) + 1;
     var w: std.Io.Writer = .fixed(buf);
     w.writeAll(req_path[0..dir_end]) catch unreachable;
     const rel = if (mem.startsWith(u8, loc, "./")) loc[2..] else loc;

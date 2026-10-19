@@ -1333,7 +1333,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 const Endpoint = struct { host: []const u8, port: u16 };
 
 fn splitEndpoint(endpoint: []const u8) ?Endpoint {
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return null;
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return null;
     return .{ .host = endpoint[0..colon], .port = port };
 }
@@ -1395,7 +1395,7 @@ test "live: our client against a real EtherNet/IP target" {
     var value: [2]u8 = undefined;
     std.mem.writeInt(i16, &value, -1234, .little);
     var write_path: [64]u8 = undefined;
-    const elem5 = try std.fmt.bufPrint(&write_path, "{s}[5]", .{tag});
+    const elem5 = try std.mem.print(&write_path, "{s}[5]", .{tag});
     try c.writeTag(elem5, .int, 1, &value);
     const back = try c.readTag(elem5, 1);
     try testing.expectEqual(DataType.int, back.type);
@@ -1403,7 +1403,7 @@ test "live: our client against a real EtherNet/IP target" {
 
     // An array read, so the element-count path runs against a real target.
     var array_path: [64]u8 = undefined;
-    const elem0 = try std.fmt.bufPrint(&array_path, "{s}[0]", .{tag});
+    const elem0 = try std.mem.print(&array_path, "{s}[0]", .{tag});
     const four = try c.readTag(elem0, 4);
     try testing.expectEqual(@as(?usize, 4), four.elementCount());
 
@@ -1415,7 +1415,7 @@ test "live: our client against a real EtherNet/IP target" {
 
     // A Multiple Service Packet batching two real tags.
     var dint_path: [64]u8 = undefined;
-    const dint0 = try std.fmt.bufPrint(&dint_path, "{s}[0]", .{dint_tag});
+    const dint0 = try std.mem.print(&dint_path, "{s}[0]", .{dint_tag});
     const names = [_][]const u8{ elem0, dint0 };
     var results: [2]?TagData = undefined;
     const got = try c.readTags(&names, &results);
@@ -1482,7 +1482,7 @@ test "live: a Class 3 connection against a real target" {
     const conn = try c.forwardOpen(.{ .size = 500, .connection_serial = 0x4242 });
     var req_buf: [128]u8 = undefined;
     var path: [64]u8 = undefined;
-    const elem0 = try std.fmt.bufPrint(&path, "{s}[0]", .{tag});
+    const elem0 = try std.mem.print(&path, "{s}[0]", .{tag});
     const read = try client.encodeReadTag(elem0, 2, &req_buf);
     var exchanges: usize = 0;
     for (0..3) |_| {

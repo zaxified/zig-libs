@@ -930,7 +930,7 @@ test "hello exchange stays end-of-message against a :base:1.0-only peer" {
     var r = try h.client.getConfig(.running, .none);
     defer r.deinit();
     const data = try r.expectData();
-    try testing.expect(std.mem.indexOf(u8, data, "<name>root</name>") != null);
+    try testing.expect(std.mem.find(u8, data, "<name>root</name>") != null);
 }
 
 test "no common base version is a typed error, not a guess" {
@@ -1345,7 +1345,7 @@ fn liveRoundTrip(advertise: []const []const u8, want: framing.Dialect) !void {
     const user = envVar("NETCONF_TEST_USER") orelse return error.SkipZigTest;
     const password = envVar("NETCONF_TEST_PASSWORD") orelse return error.SkipZigTest;
 
-    const colon = std.mem.lastIndexOfScalar(u8, endpoint, ':') orelse return error.SkipZigTest;
+    const colon = std.mem.findScalarLast(u8, endpoint, ':') orelse return error.SkipZigTest;
     const host = endpoint[0..colon];
     const port = std.fmt.parseInt(u16, endpoint[colon + 1 ..], 10) catch return error.SkipZigTest;
 
@@ -1592,7 +1592,7 @@ pub fn fuzzClient(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         switch (op) {
             .get_config => if (!tap.changed) {
                 const data = r.expectData() catch return error.GenuineGetConfigFailed;
-                if (std.mem.indexOf(u8, data, "<name>root</name>") == null) return error.GenuineDataWrong;
+                if (std.mem.find(u8, data, "<name>root</name>") == null) return error.GenuineDataWrong;
             },
             .lock => if (!tap.changed) {
                 if (!r.hasErrors()) return error.GenuineLockWasNotRefused;

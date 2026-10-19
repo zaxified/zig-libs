@@ -236,7 +236,7 @@ const LineReader = struct {
     fn next(self: *LineReader) ?[]const u8 {
         const limit = @min(self.bytes.len, max_header_bytes);
         if (self.pos >= limit) return null;
-        const nl = std.mem.indexOfScalarPos(u8, self.bytes[0..limit], self.pos, '\n') orelse return null;
+        const nl = std.mem.findScalarPos(u8, self.bytes[0..limit], self.pos, '\n') orelse return null;
         self.line_start = self.pos;
         self.pos = nl + 1;
         return self.bytes[self.line_start..nl];
@@ -680,7 +680,7 @@ pub fn dearmor(out: []u8, armored: []const u8) ArmorError![]u8 {
         const line = if (std.mem.endsWith(u8, raw, "\r")) raw[0 .. raw.len - 1] else raw;
         const is_last = it.peek() == null;
         if (line.len == 0 or line.len > columns) return error.MalformedArmor;
-        if (!is_last and (line.len != columns or std.mem.indexOfScalar(u8, line, '=') != null)) return error.MalformedArmor;
+        if (!is_last and (line.len != columns or std.mem.findScalar(u8, line, '=') != null)) return error.MalformedArmor;
         const n = b64_pad.Decoder.calcSizeForSlice(line) catch return error.MalformedArmor;
         if (out.len - o < n) return error.NoSpaceLeft;
         b64_pad.Decoder.decode(out[o..][0..n], line) catch return error.MalformedArmor;

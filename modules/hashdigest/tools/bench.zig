@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (sizes, 0..) |n, i| {
         msgs[i] = try arena.alloc(u8, n);
         prng.random().bytes(msgs[i]);
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "msg{d}.bin", .{n}), .data = msgs[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("msg{d}.bin", .{n}), .data = msgs[i] });
     }
 
     const so_c = init.environ_map.get("LIBCRYPTO_SO") orelse default_crypto;
@@ -84,11 +84,11 @@ pub fn main(init: std.process.Init) !u8 {
     // The Go side, built in a copy of tools/go_bench.
     try cwd.createDirPath(io, work_dir ++ "/go");
     for ([_][]const u8{ "go.mod", "go.sum", "main.go" }) |f| {
-        const src = try cwd.readFileAlloc(io, try std.fmt.allocPrint(arena, "modules/hashdigest/tools/go_bench/{s}", .{f}), arena, .limited(1 << 20));
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "go/{s}", .{f}), .data = src });
+        const src = try cwd.readFileAlloc(io, try arena.print("modules/hashdigest/tools/go_bench/{s}", .{f}), arena, .limited(1 << 20));
+        try dir.writeFile(io, .{ .sub_path = try arena.print("go/{s}", .{f}), .data = src });
     }
-    const go_exe = try std.fmt.allocPrint(arena, "{s}/go_bench", .{abs});
-    const go_dir = try std.fmt.allocPrint(arena, "{s}/go", .{abs});
+    const go_exe = try arena.print("{s}/go_bench", .{abs});
+    const go_dir = try arena.print("{s}/go", .{abs});
     std.debug.print("bench-hashdigest: building the Go side ...\n", .{});
     const gb = try std.process.run(arena, io, .{ .argv = &.{ "env", "GOPROXY=off", "GOFLAGS=-mod=mod", "GOTOOLCHAIN=local", "GOWORK=off", "go", "-C", go_dir, "build", "-o", go_exe, "." } });
     if (gb.term != .exited or gb.term.exited != 0) {
@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
     try bench.foreignOnce(arena, io, bench_name, go_exe, abs, "interop");
     for (algos) |a| for ([_][]const u8{ "", "go_" }) |prefix| {
-        const theirs = try dir.readFileAlloc(io, try std.fmt.allocPrint(arena, "{s}{s}.hex", .{ prefix, @tagName(a) }), arena, .limited(4096));
+        const theirs = try dir.readFileAlloc(io, try arena.print("{s}{s}.hex", .{ prefix, @tagName(a) }), arena, .limited(4096));
         const ours = try hashdigest.hex(a, msgs[1], &ctx.out);
         if (!std.mem.eql(u8, theirs, ours)) {
             std.debug.print("bench-hashdigest: FAILED -- {s}{s} differs from ours\n", .{ prefix, @tagName(a) });
@@ -113,11 +113,11 @@ pub fn main(init: std.process.Init) !u8 {
     for (algos) |a| for (sizes, 0..) |n, i| {
         const impl = if (a == .blake2b256) "sodium" else "ossl";
         try ws.append(arena, .{
-            .name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ @tagName(a), n }),
+            .name = try arena.print("{s}_{d}", .{ @tagName(a), n }),
             .op = .{ .algo = a, .msg = msgs[i] },
-            .ref = try std.fmt.allocPrint(arena, "go.{s}_{d}", .{ @tagName(a), n }),
+            .ref = try arena.print("go.{s}_{d}", .{ @tagName(a), n }),
             .ref_exe = 1,
-            .alt = try std.fmt.allocPrint(arena, "{s}.{s}_{d}", .{ impl, @tagName(a), n }),
+            .alt = try arena.print("{s}.{s}_{d}", .{ impl, @tagName(a), n }),
         });
     };
 

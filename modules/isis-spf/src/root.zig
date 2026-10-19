@@ -1828,7 +1828,7 @@ test "the two-way-check toggle is not a field of the public Options struct" {
     // Guard against the same gap under a different name.
     const info = @typeInfo(Options).@"struct";
     inline for (info.field_names) |name| {
-        try testing.expect(std.mem.indexOf(u8, name, "two_way") == null);
+        try testing.expect(std.mem.find(u8, name, "two_way") == null);
     }
 }
 

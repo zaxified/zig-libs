@@ -91,7 +91,7 @@ fn trailerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!voi
             reads += 1;
         }
         var out: [64]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&out, "streamed {d} in {d} reads", .{ total, reads }));
+        try rw.writeAll(try std.mem.print(&out, "streamed {d} in {d} reads", .{ total, reads }));
     } else if (std.mem.eql(u8, req.path, "/stream-early")) {
         // Answers from the first 8 octets of a large upload and never reads
         // the rest — the RFC 9113 §8.1 "complete response before the request
@@ -103,7 +103,7 @@ fn trailerHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!voi
             else => return error.BodyReadFailed,
         };
         var out: [32]u8 = undefined;
-        try rw.writeAll(try std.fmt.bufPrint(&out, "took {d}", .{n}));
+        try rw.writeAll(try std.mem.print(&out, "took {d}", .{n}));
     } else if (std.mem.eql(u8, req.path, "/stream-download")) {
         // The incremental RESPONSE body: 64 flushed chunks, 256 KiB in all,
         // none of which is ever held in memory as a whole. Ends without a
@@ -190,7 +190,7 @@ fn curlHasHttp2(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) !bool {
     _ = try child.wait(io);
     const text = try dir.readFileAlloc(io, "version.txt", gpa, .limited(64 * 1024));
     defer gpa.free(text);
-    return std.mem.indexOf(u8, text, "HTTP2") != null;
+    return std.mem.find(u8, text, "HTTP2") != null;
 }
 
 /// A server on a loopback port, plus the URL prefix to reach it.
@@ -240,7 +240,7 @@ const HeaderDump = struct {
 fn splitHeaderDump(text: []const u8) !HeaderDump {
     // curl separates the head from anything that follows with the blank
     // line it received; find the first one.
-    const sep = std.mem.indexOf(u8, text, "\r\n\r\n") orelse return error.NoHeadTerminator;
+    const sep = std.mem.find(u8, text, "\r\n\r\n") orelse return error.NoHeadTerminator;
     return .{ .head = text[0 .. sep + 2], .after_head = text[sep + 4 ..] };
 }
 
@@ -261,7 +261,7 @@ test "LIVE curl: HTTP/1.1 response trailers are accepted and surfaced" {
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/outtrailers", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/outtrailers", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{"--http1.1"}, url);
 
     const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(256 * 1024));
@@ -285,18 +285,18 @@ test "LIVE curl: HTTP/1.1 response trailers are accepted and surfaced" {
     defer gpa.free(dump);
     const split = try splitHeaderDump(dump);
     // The advert rode in the head (RFC 9110 §6.6.2)…
-    try testing.expect(std.mem.indexOf(u8, split.head, "Trailer: X-Checksum, X-Rows\r\n") != null);
+    try testing.expect(std.mem.find(u8, split.head, "Trailer: X-Checksum, X-Rows\r\n") != null);
     // …and curl delivered the trailer fields to its header callback only
     // AFTER the head was complete. This is what distinguishes "curl parsed
     // a trailer section" from "our bytes happened to contain those
     // strings": had we emitted them as ordinary head fields, they would be
     // on the other side of this split.
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "X-Checksum: deadbeef") != null);
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "X-Rows: 3") != null);
-    try testing.expect(std.mem.indexOf(u8, split.head, "X-Checksum: deadbeef") == null);
+    try testing.expect(std.mem.find(u8, split.after_head, "X-Checksum: deadbeef") != null);
+    try testing.expect(std.mem.find(u8, split.after_head, "X-Rows: 3") != null);
+    try testing.expect(std.mem.find(u8, split.head, "X-Checksum: deadbeef") == null);
     // Framing sanity: chunked, and no Content-Length anywhere.
-    try testing.expect(std.mem.indexOf(u8, split.head, "Transfer-Encoding: chunked\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "Content-Length") == null);
+    try testing.expect(std.mem.find(u8, split.head, "Transfer-Encoding: chunked\r\n") != null);
+    try testing.expect(std.mem.find(u8, dump, "Content-Length") == null);
 }
 
 test "LIVE curl: HTTP/1.1 trailers survive a multi-chunk streamed body" {
@@ -314,7 +314,7 @@ test "LIVE curl: HTTP/1.1 trailers survive a multi-chunk streamed body" {
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/outtrailers-stream", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/outtrailers-stream", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{"--http1.1"}, url);
     if (code != 0) {
         const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(256 * 1024));
@@ -329,8 +329,8 @@ test "LIVE curl: HTTP/1.1 trailers survive a multi-chunk streamed body" {
     const dump = try tmp.dir.readFileAlloc(io, "head.txt", gpa, .limited(64 * 1024));
     defer gpa.free(dump);
     const split = try splitHeaderDump(dump);
-    try testing.expect(std.mem.indexOf(u8, split.head, "Trailer: X-Checksum\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "X-Checksum: deadbeef") != null);
+    try testing.expect(std.mem.find(u8, split.head, "Trailer: X-Checksum\r\n") != null);
+    try testing.expect(std.mem.find(u8, split.after_head, "X-Checksum: deadbeef") != null);
 }
 
 // ── HTTP/2 ──────────────────────────────────────────────────────────────────
@@ -357,7 +357,7 @@ test "LIVE curl: HTTP/2 response trailers are accepted by nghttp2 and surfaced" 
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/outtrailers", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/outtrailers", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{"--http2-prior-knowledge"}, url);
 
     const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(256 * 1024));
@@ -378,16 +378,16 @@ test "LIVE curl: HTTP/2 response trailers are accepted by nghttp2 and surfaced" 
     const dump = try tmp.dir.readFileAlloc(io, "head.txt", gpa, .limited(64 * 1024));
     defer gpa.free(dump);
     const split = try splitHeaderDump(dump);
-    try testing.expect(std.mem.indexOf(u8, split.head, "HTTP/2 200") != null);
-    try testing.expect(std.mem.indexOf(u8, split.head, "trailer: X-Checksum, X-Rows\r\n") != null);
+    try testing.expect(std.mem.find(u8, split.head, "HTTP/2 200") != null);
+    try testing.expect(std.mem.find(u8, split.head, "trailer: X-Checksum, X-Rows\r\n") != null);
     // Same parse-level observation as on h1: the trailer HEADERS frame
     // reached curl's header callback after the response head, i.e. it was
     // decoded as a trailer section rather than as more response headers.
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "x-checksum: deadbeef") != null);
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "x-rows: 3") != null);
-    try testing.expect(std.mem.indexOf(u8, split.head, "x-checksum: deadbeef") == null);
+    try testing.expect(std.mem.find(u8, split.after_head, "x-checksum: deadbeef") != null);
+    try testing.expect(std.mem.find(u8, split.after_head, "x-rows: 3") != null);
+    try testing.expect(std.mem.find(u8, split.head, "x-checksum: deadbeef") == null);
     // h1 framing must not have leaked into h2 (§8.2.2).
-    try testing.expect(std.mem.indexOf(u8, dump, "chunked") == null);
+    try testing.expect(std.mem.find(u8, dump, "chunked") == null);
 }
 
 // ── HTTP/2 streaming, both directions ───────────────────────────────────────
@@ -423,7 +423,7 @@ test "LIVE curl: HTTP/2 streaming upload past the initial window, consumed incre
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-upload", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/stream-upload", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{ "--http2-prior-knowledge", "-T", "upload.bin" }, url);
     if (code != 0) {
         const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(1 << 20));
@@ -474,7 +474,7 @@ test "LIVE curl: HTTP/2 a complete response before the upload finished (§8.1)" 
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-early", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/stream-early", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{ "--http2-prior-knowledge", "-T", "upload.bin" }, url);
     const body = try tmp.dir.readFileAlloc(io, "body.txt", gpa, .limited(4096));
     defer gpa.free(body);
@@ -508,7 +508,7 @@ test "LIVE curl: HTTP/2 a 256 KiB streamed response, ending on an empty DATA fra
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/stream-download", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/stream-download", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{"--http2-prior-knowledge"}, url);
     if (code != 0) {
         const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(1 << 20));
@@ -529,9 +529,9 @@ test "LIVE curl: HTTP/2 a 256 KiB streamed response, ending on an empty DATA fra
     defer gpa.free(dump);
     // No Content-Length: the length was never known, which is the whole
     // point — and no h1 framing leaked across (§8.2.2).
-    try testing.expect(std.mem.indexOf(u8, dump, "HTTP/2 200") != null);
-    try testing.expect(std.mem.indexOf(u8, dump, "content-length") == null);
-    try testing.expect(std.mem.indexOf(u8, dump, "chunked") == null);
+    try testing.expect(std.mem.find(u8, dump, "HTTP/2 200") != null);
+    try testing.expect(std.mem.find(u8, dump, "content-length") == null);
+    try testing.expect(std.mem.find(u8, dump, "chunked") == null);
 }
 
 test "LIVE curl: HTTP/2 trailers survive a multi-DATA-frame streamed body" {
@@ -550,7 +550,7 @@ test "LIVE curl: HTTP/2 trailers survive a multi-DATA-frame streamed body" {
     defer live.stop();
 
     var url_buf: [96]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "{s}/outtrailers-stream", .{live.url()});
+    const url = try std.mem.print(&url_buf, "{s}/outtrailers-stream", .{live.url()});
     const code = try runCurl(io, tmp.dir, &.{"--http2-prior-knowledge"}, url);
     if (code != 0) {
         const trace = try tmp.dir.readFileAlloc(io, "trace.txt", gpa, .limited(256 * 1024));
@@ -565,7 +565,7 @@ test "LIVE curl: HTTP/2 trailers survive a multi-DATA-frame streamed body" {
     const dump = try tmp.dir.readFileAlloc(io, "head.txt", gpa, .limited(64 * 1024));
     defer gpa.free(dump);
     const split = try splitHeaderDump(dump);
-    try testing.expect(std.mem.indexOf(u8, split.after_head, "x-checksum: deadbeef") != null);
+    try testing.expect(std.mem.find(u8, split.after_head, "x-checksum: deadbeef") != null);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

@@ -482,7 +482,7 @@ const Parser = struct {
             if (eql(kind, "net")) {
                 _ = try p.lex.next();
                 const w = try p.expectWord();
-                const slash = std.mem.indexOfScalar(u8, w, '/') orelse return error.Syntax;
+                const slash = std.mem.findScalar(u8, w, '/') orelse return error.Syntax;
                 const addr = parseIpv4(w[0..slash]) orelse return error.Syntax;
                 const plen = std.fmt.parseInt(u8, w[slash + 1 ..], 10) catch return error.Syntax;
                 if (plen > 32) return error.Syntax;

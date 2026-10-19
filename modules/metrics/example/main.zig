@@ -92,13 +92,13 @@ pub fn main() !void {
     std.debug.print("\n--- Prometheus exposition ---\n{s}", .{exposition});
     // The rendered text must carry the same numbers just asserted above, not
     // just plausible-looking ones.
-    if (std.mem.indexOf(u8, exposition, "orders_total{outcome=\"accepted\"} 4") == null) {
+    if (std.mem.find(u8, exposition, "orders_total{outcome=\"accepted\"} 4") == null) {
         return error.ExpositionMissingAcceptedCount;
     }
-    if (std.mem.indexOf(u8, exposition, "orders_total{outcome=\"rejected\"} 1") == null) {
+    if (std.mem.find(u8, exposition, "orders_total{outcome=\"rejected\"} 1") == null) {
         return error.ExpositionMissingRejectedCount;
     }
-    if (std.mem.indexOf(u8, exposition, "order_queue_depth 0") == null) {
+    if (std.mem.find(u8, exposition, "order_queue_depth 0") == null) {
         return error.ExpositionMissingQueueDepth;
     }
 }

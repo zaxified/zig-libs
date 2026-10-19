@@ -427,14 +427,14 @@ test "STACKPROBE: no key or nonce residue on the dead stack after acme signing a
         {
             callJwsSign();
             const js = out_sink;
-            const p0 = std.mem.indexOf(u8, js, "\"protected\":\"").? + 13;
-            const p1 = std.mem.indexOfPos(u8, js, p0, "\"").?;
-            const q0 = std.mem.indexOfPos(u8, js, p1, "\"payload\":\"").? + 11;
-            const q1 = std.mem.indexOfPos(u8, js, q0, "\"").?;
-            const s0 = std.mem.indexOfPos(u8, js, q1, "\"signature\":\"").? + 13;
-            const s1 = std.mem.indexOfPos(u8, js, s0, "\"").?;
+            const p0 = std.mem.find(u8, js, "\"protected\":\"").? + 13;
+            const p1 = std.mem.findPos(u8, js, p0, "\"").?;
+            const q0 = std.mem.findPos(u8, js, p1, "\"payload\":\"").? + 11;
+            const q1 = std.mem.findPos(u8, js, q0, "\"").?;
+            const s0 = std.mem.findPos(u8, js, q1, "\"signature\":\"").? + 13;
+            const s1 = std.mem.findPos(u8, js, s0, "\"").?;
             var input: [1024]u8 = undefined;
-            const signed = try std.fmt.bufPrint(&input, "{s}.{s}", .{ js[p0..p1], js[q0..q1] });
+            const signed = try std.mem.print(&input, "{s}.{s}", .{ js[p0..p1], js[q0..q1] });
             var sig: [64]u8 = undefined;
             try std.base64.url_safe_no_pad.Decoder.decode(&sig, js[s0..s1]);
             var n: Needles = .{};

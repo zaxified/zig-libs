@@ -188,8 +188,8 @@ test {
 }
 
 test "meta.model_after names Bulletproofs + Ristretto255" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Bulletproofs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "Ristretto255") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Bulletproofs") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "Ristretto255") != null);
 }
 
 test "meta.deps is exactly ct25519 (the constant-time secret-scalar ladder)" {

@@ -231,8 +231,8 @@ const pem_end = "-----END OPENSSH PRIVATE KEY-----\n";
 
 /// The fixture's decoded openssh-key-v1 container.
 fn deArmour(text: []const u8, out: []u8) []u8 {
-    const body_start = std.mem.indexOf(u8, text, "-----\n").? + "-----\n".len;
-    const body_end = std.mem.indexOf(u8, text, "-----END").?;
+    const body_start = std.mem.find(u8, text, "-----\n").? + "-----\n".len;
+    const body_end = std.mem.find(u8, text, "-----END").?;
     var b64: [8192]u8 = undefined;
     var n: usize = 0;
     for (text[body_start..body_end]) |c| {
@@ -368,7 +368,7 @@ test "HostKey.fromOpenSSH: an RSA container whose public e disagrees with the se
     var bin_buf: [8192]u8 = undefined;
     const bin = deArmour(vectors.rsa_key, &bin_buf);
     const e_wire = [_]u8{ 0, 0, 0, 3, 0x01, 0x00, 0x01 };
-    const at = std.mem.indexOf(u8, bin, "ssh-rsa").? + "ssh-rsa".len;
+    const at = std.mem.find(u8, bin, "ssh-rsa").? + "ssh-rsa".len;
     try testing.expectEqualSlices(u8, &e_wire, bin[at..][0..e_wire.len]);
     bin[at + 5] = 0x81;
     var text_buf: [8192]u8 = undefined;

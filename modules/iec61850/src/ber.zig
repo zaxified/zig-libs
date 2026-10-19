@@ -555,10 +555,10 @@ pub const Oid = struct {
             if (first) {
                 const a: u64 = @min(acc / 40, 2);
                 const c: u64 = acc - a * 40;
-                w += (std.fmt.bufPrint(out[w..], "{d}.{d}", .{ a, c }) catch return error.BufferTooSmall).len;
+                w += (std.mem.print(out[w..], "{d}.{d}", .{ a, c }) catch return error.BufferTooSmall).len;
                 first = false;
             } else {
-                w += (std.fmt.bufPrint(out[w..], ".{d}", .{acc}) catch return error.BufferTooSmall).len;
+                w += (std.mem.print(out[w..], ".{d}", .{acc}) catch return error.BufferTooSmall).len;
             }
             acc = 0;
         }

@@ -711,7 +711,7 @@ fn handleGet(t: *const Transport, ctx: *router.Ctx) anyerror!void {
     }
     for (batch.items) |e| {
         var idbuf: [24]u8 = undefined;
-        const idstr = std.fmt.bufPrint(&idbuf, "{d}", .{e.id}) catch unreachable;
+        const idstr = std.mem.print(&idbuf, "{d}", .{e.id}) catch unreachable;
         try es.send(.{ .id = idstr, .data = e.data });
     }
     // Everything queued has now been written, so the session has nothing left
@@ -1057,7 +1057,7 @@ const SseAdapter = struct {
 
     /// Emit every complete (newline-terminated) line currently buffered.
     fn emitComplete(self: *SseAdapter) std.Io.Writer.Error!void {
-        while (std.mem.indexOfScalar(u8, self.pending.items, '\n')) |nl| {
+        while (std.mem.findScalar(u8, self.pending.items, '\n')) |nl| {
             try self.emitLine(self.pending.items[0..nl]);
             const rest = self.pending.items.len - (nl + 1);
             std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[nl + 1 ..]);
@@ -1224,7 +1224,7 @@ fn postAccept(comptime accept: []const u8, comptime json: []const u8) []const u8
 }
 
 fn bodyOf(got: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, got, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, got, "\r\n\r\n") orelse return "";
     return got[i + 4 ..];
 }
 
@@ -1232,7 +1232,7 @@ fn bodyOf(got: []const u8) []const u8 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -1247,20 +1247,20 @@ const list_body =
 ;
 
 fn postWithSession(buf: []u8, sid: []const u8, json: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+    return std.mem.print(buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
         "Content-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ sid, json.len, json }) catch unreachable;
 }
 
 fn getWithSession(buf: []u8, sid: []const u8, last_event_id: ?[]const u8) []const u8 {
     if (last_event_id) |lei| {
-        return std.fmt.bufPrint(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
+        return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\n" ++
             "Last-Event-ID: {s}\r\nConnection: close\r\n\r\n", .{ sid, lei }) catch unreachable;
     }
-    return std.fmt.bufPrint(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
+    return std.mem.print(buf, "GET /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
 }
 
 fn deleteWithSession(buf: []u8, sid: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
+    return std.mem.print(buf, "DELETE /mcp HTTP/1.1\r\nHost: t\r\nMcp-Session-Id: {s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable;
 }
 
 fn hApp(ctx: *router.Ctx) anyerror!void {
@@ -1314,12 +1314,12 @@ test "POST initialize → 200 application/json with a result" {
         \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: application/json") != null);
     const b = bodyOf(got);
-    try testing.expect(std.mem.indexOf(u8, b, "\"jsonrpc\":\"2.0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"id\":1") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"result\"") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"serverInfo\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"jsonrpc\":\"2.0\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"id\":1") != null);
+    try testing.expect(std.mem.find(u8, b, "\"result\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"serverInfo\"") != null);
 }
 
 test "POST tools/list → the registered tool; tools/call → its result" {
@@ -1337,14 +1337,14 @@ test "POST tools/list → the registered tool; tools/call → its result" {
         \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, list, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(list), "\"echo\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(list), "\"echo\"") != null);
 
     var buf2: [4096]u8 = undefined;
     const call = runWire(&r, post("/mcp",
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{}}}
     ), &buf2);
     try testing.expect(std.mem.startsWith(u8, call, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(call), "\\\"ok\\\":true") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(call), "\\\"ok\\\":true") != null);
 }
 
 test "POST a notification → 202 Accepted, no body" {
@@ -1383,7 +1383,7 @@ test "non-/mcp path passes through; GET /mcp → 405" {
     var buf2: [2048]u8 = undefined;
     const get = runWire(&r, "GET /mcp HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf2);
     try testing.expect(std.mem.startsWith(u8, get, "HTTP/1.1 405"));
-    try testing.expect(std.mem.indexOf(u8, get, "Allow: POST") != null);
+    try testing.expect(std.mem.find(u8, get, "Allow: POST") != null);
 }
 
 test "Origin allowlist: match → 200, mismatch → 403, absent → allowed" {
@@ -1433,12 +1433,12 @@ test "SSE-on-POST: Accept text/event-stream → response delivered as an SSE dat
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "Transfer-Encoding: chunked") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.find(u8, got, "Transfer-Encoding: chunked") != null);
     // The JSON-RPC response is framed as one SSE data event (whole event in one
     // chunk, so the substrings are contiguous).
-    try testing.expect(std.mem.indexOf(u8, got, "data: {\"jsonrpc\"") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "\"echo\"") != null);
+    try testing.expect(std.mem.find(u8, got, "data: {\"jsonrpc\"") != null);
+    try testing.expect(std.mem.find(u8, got, "\"echo\"") != null);
 }
 
 test "SSE-on-POST: tool progress notifications stream live, then the result" {
@@ -1459,7 +1459,7 @@ test "SSE-on-POST: tool progress notifications stream live, then the result" {
     // Two progress notifications + the final result = 3 data events.
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "notifications/progress"));
     try testing.expect(std.mem.count(u8, got, "data: ") >= 3);
-    try testing.expect(std.mem.indexOf(u8, got, "\\\"done\\\":true") != null);
+    try testing.expect(std.mem.find(u8, got, "\\\"done\\\":true") != null);
 }
 
 test "SSE-on-POST: a notification with SSE Accept → 202, no stream started" {
@@ -1477,7 +1477,7 @@ test "SSE-on-POST: a notification with SSE Accept → 202, no stream started" {
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 202"));
-    try testing.expect(std.mem.indexOf(u8, got, "text/event-stream") == null);
+    try testing.expect(std.mem.find(u8, got, "text/event-stream") == null);
 }
 
 test "stream=.off forces application/json even when the client accepts SSE" {
@@ -1495,8 +1495,8 @@ test "stream=.off forces application/json even when the client accepts SSE" {
         \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: application/json") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "text/event-stream") == null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: application/json") != null);
+    try testing.expect(std.mem.find(u8, got, "text/event-stream") == null);
 }
 
 test "sessions: initialize assigns Mcp-Session-Id; missing/unknown → 404; DELETE tears down" {
@@ -1583,7 +1583,7 @@ test "sessions: tearing a session down also drops its server-side handshake stat
     // table would be full and this `initialize` would come back an error.
     const third = runWire(&r, postWithSession(&rbuf, "", init_body), &out);
     try testing.expect(std.mem.startsWith(u8, third, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, third, "\"error\"") == null);
+    try testing.expect(std.mem.find(u8, third, "\"error\"") == null);
     try testing.expectEqual(@as(usize, 2), server.peers.items.len);
 }
 
@@ -1616,22 +1616,22 @@ test "sessions: GET streams pushed events as SSE; Last-Event-ID replays only new
     // GET with no Last-Event-ID → both events, id-tagged, as SSE.
     const got = runWire(&r, getWithSession(&rbuf, sid, null), &out);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "id: 1") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":1}") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "id: 2") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":2}") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.find(u8, got, "id: 1") != null);
+    try testing.expect(std.mem.find(u8, got, "data: {\"n\":1}") != null);
+    try testing.expect(std.mem.find(u8, got, "id: 2") != null);
+    try testing.expect(std.mem.find(u8, got, "data: {\"n\":2}") != null);
 
     // GET with Last-Event-ID: 1 → only event 2 (resumable replay).
     const got2 = runWire(&r, getWithSession(&rbuf, sid, "1"), &out);
-    try testing.expect(std.mem.indexOf(u8, got2, "id: 2") != null);
-    try testing.expect(std.mem.indexOf(u8, got2, "data: {\"n\":1}") == null);
+    try testing.expect(std.mem.find(u8, got2, "id: 2") != null);
+    try testing.expect(std.mem.find(u8, got2, "data: {\"n\":1}") == null);
 
     // GET past the last id → nothing queued: a heartbeat comment, still 200.
     const got3 = runWire(&r, getWithSession(&rbuf, sid, "2"), &out);
     try testing.expect(std.mem.startsWith(u8, got3, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got3, ": keep-alive") != null);
-    try testing.expect(std.mem.indexOf(u8, got3, "data:") == null);
+    try testing.expect(std.mem.find(u8, got3, ": keep-alive") != null);
+    try testing.expect(std.mem.find(u8, got3, "data:") == null);
 }
 
 test "sessions: GET/DELETE with an unknown session → 404" {
@@ -1821,7 +1821,7 @@ test "stateless: a third party's response POST must not resolve another client's
     const a_call = runWire(&r, postAccept("text/event-stream",
         \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ask_a"}}
     ), &out_a);
-    try testing.expect(std.mem.indexOf(u8, a_call, "sampling/createMessage") != null);
+    try testing.expect(std.mem.find(u8, a_call, "sampling/createMessage") != null);
 
     // Bystander C does the same: id 2 outstanding, nothing to do with A.
     var out_c: [8192]u8 = undefined;
@@ -2041,9 +2041,9 @@ test "sessions: a response POSTed on another session cannot resolve the request"
 
     // The request itself was delivered to A's GET stream, not B's.
     const a_stream = runWire(&r, getWithSession(&rbuf, sid_a, null), &out);
-    try testing.expect(std.mem.indexOf(u8, a_stream, "sampling/createMessage") != null);
+    try testing.expect(std.mem.find(u8, a_stream, "sampling/createMessage") != null);
     const b_stream = runWire(&r, getWithSession(&rbuf, sid_b, null), &out);
-    try testing.expect(std.mem.indexOf(u8, b_stream, "sampling/createMessage") == null);
+    try testing.expect(std.mem.find(u8, b_stream, "sampling/createMessage") == null);
 }
 
 test "application/json mode: a tool's outbound request never lands in the body" {
@@ -2081,13 +2081,13 @@ test "application/json mode: a tool's outbound request never lands in the body" 
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     const b = bodyOf(got);
     // Exactly the tool result, and nothing of the elicitation request.
-    try testing.expect(std.mem.indexOf(u8, b, "elicitation/create") == null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"id\":5") != null);
+    try testing.expect(std.mem.find(u8, b, "elicitation/create") == null);
+    try testing.expect(std.mem.find(u8, b, "\"id\":5") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, b, "\"jsonrpc\""));
 
     // The elicitation request went to the session's GET stream instead.
     const stream = runWire(&r, getWithSession(&rbuf, sid, null), &out);
-    try testing.expect(std.mem.indexOf(u8, stream, "elicitation/create") != null);
+    try testing.expect(std.mem.find(u8, stream, "elicitation/create") != null);
 }
 
 test "SSE mode: a tool's outbound request streams as its own event before the result" {
@@ -2114,8 +2114,8 @@ test "SSE mode: a tool's outbound request streams as its own event before the re
         \\{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"ask"}}
     ), &out2);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    const req_at = std.mem.indexOf(u8, got, "elicitation/create") orelse return error.NoRequestEvent;
-    const res_at = std.mem.indexOf(u8, got, "\"id\":6") orelse return error.NoResult;
+    const req_at = std.mem.find(u8, got, "elicitation/create") orelse return error.NoRequestEvent;
+    const res_at = std.mem.find(u8, got, "\"id\":6") orelse return error.NoResult;
     try testing.expect(req_at < res_at); // request precedes the tool result
     try testing.expect(std.mem.count(u8, got, "data: ") >= 2);
 }
@@ -2170,7 +2170,7 @@ test "GET: a malformed Last-Event-ID header replays the whole buffer, not nothin
 
     const got = runWire(&r, getWithSession(&rbuf, sid, "not-a-number"), &out);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "data: {\"n\":1}") != null);
+    try testing.expect(std.mem.find(u8, got, "data: {\"n\":1}") != null);
 }
 
 test "Sessions.create: refuses new sessions past max_sessions (audit MED)" {
@@ -2221,16 +2221,16 @@ test "oracle: the real python-mcp client's initialize request negotiates the rea
     // The real client's own Accept header, byte-exact — see oracle_vectors.zig.
     const got = runWire(&r, postAccept("application/json, text/event-stream", oracle.init_request), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: text/event-stream") != null);
     try testing.expect(headerValue(got, "Mcp-Session-Id") != null);
     const b = bodyOf(got);
-    try testing.expect(std.mem.indexOf(u8, b, "\"jsonrpc\":\"2.0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"id\":1") != null);
+    try testing.expect(std.mem.find(u8, b, "\"jsonrpc\":\"2.0\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"id\":1") != null);
     // The exact protocolVersion string the real reference SDK negotiated for
     // this exact request (both request and response frozen from the same
     // live capture, so this is not a value we invented).
-    try testing.expect(std.mem.indexOf(u8, oracle.init_response_json, "\"protocolVersion\":\"2025-11-25\"") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try testing.expect(std.mem.find(u8, oracle.init_response_json, "\"protocolVersion\":\"2025-11-25\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"protocolVersion\":\"2025-11-25\"") != null);
 }
 
 test "oracle: notifications/initialized (real client bytes) -> 202, matching the real server" {
@@ -2265,12 +2265,12 @@ test "oracle: tools/list (real client bytes) lists this module's tools" {
     const got = runWire(&r, postAccept("application/json, text/event-stream", oracle.tools_list_request), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     const b = bodyOf(got);
-    try testing.expect(std.mem.indexOf(u8, b, "\"echo\"") != null);
-    try testing.expect(std.mem.indexOf(u8, b, "\"work\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"echo\"") != null);
+    try testing.expect(std.mem.find(u8, b, "\"work\"") != null);
     // Same two tool names the real reference server reported for this
     // module's own tools/list request (frozen from the live capture).
-    try testing.expect(std.mem.indexOf(u8, oracle.tools_list_response_json, "\"echo\"") != null);
-    try testing.expect(std.mem.indexOf(u8, oracle.tools_list_response_json, "\"work\"") != null);
+    try testing.expect(std.mem.find(u8, oracle.tools_list_response_json, "\"echo\"") != null);
+    try testing.expect(std.mem.find(u8, oracle.tools_list_response_json, "\"work\"") != null);
 }
 
 test "oracle: tools/call \"echo\" (real client bytes) reproduces the real argument" {
@@ -2311,8 +2311,8 @@ test "oracle: tools/call \"echo\" (real client bytes) reproduces the real argume
     // caller supplied the whole `{"result":...}` object as the text) — a
     // real, benign convention difference between the two layers, not a bug.
     // The marker value is still present in both, which is what we assert.
-    try testing.expect(std.mem.indexOf(u8, b, "hello-mcp-http-oracle") != null);
-    try testing.expect(std.mem.indexOf(u8, oracle.echo_call_response_json, "hello-mcp-http-oracle") != null);
+    try testing.expect(std.mem.find(u8, b, "hello-mcp-http-oracle") != null);
+    try testing.expect(std.mem.find(u8, oracle.echo_call_response_json, "hello-mcp-http-oracle") != null);
 }
 
 test "oracle: tools/call \"work\" (real client bytes) reproduces the real progress frames byte-exact" {
@@ -2330,21 +2330,21 @@ test "oracle: tools/call \"work\" (real client bytes) reproduces the real progre
     // bare JSON number), byte-exact.
     const got = runWire(&r, postAccept("text/event-stream", oracle.work_call_request), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, got, "Content-Type: text/event-stream") != null);
+    try testing.expect(std.mem.find(u8, got, "Content-Type: text/event-stream") != null);
 
     // Byte-exact: this module's own notifications/progress field order
     // matches the real reference server's, so the captured lines are
     // asserted as literal substrings of THIS module's own SSE output.
-    try testing.expect(std.mem.indexOf(u8, got, oracle.progress_1_json) != null);
-    try testing.expect(std.mem.indexOf(u8, got, oracle.progress_2_json) != null);
+    try testing.expect(std.mem.find(u8, got, oracle.progress_1_json) != null);
+    try testing.expect(std.mem.find(u8, got, oracle.progress_2_json) != null);
     try testing.expect(std.mem.count(u8, got, "data: ") >= 3); // 2 progress + 1 result
 
     // Final result: structural comparison, same convention note as the echo
     // test above (content.text differs by framework convention; compare
     // structuredContent, which was deliberately written to match).
-    const last_data = std.mem.lastIndexOf(u8, got, "data: ") orelse return error.NoResultEvent;
+    const last_data = std.mem.findLast(u8, got, "data: ") orelse return error.NoResultEvent;
     const after = got[last_data + "data: ".len ..];
-    const line_end = std.mem.indexOfAny(u8, after, "\r\n") orelse after.len;
+    const line_end = std.mem.findAny(u8, after, "\r\n") orelse after.len;
     const result_line = after[0..line_end];
     var ours = try std.json.parseFromSlice(std.json.Value, gpa, result_line, .{});
     defer ours.deinit();
@@ -2660,7 +2660,7 @@ test "close() actually ends the session it marks" {
     var out2: [8192]u8 = undefined;
     const drained = runWire(&r, getWithSession(&rbuf, sid, null), &out2);
     try testing.expect(std.mem.startsWith(u8, drained, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, drained, "data: a") != null);
+    try testing.expect(std.mem.find(u8, drained, "data: a") != null);
 
     var out3: [8192]u8 = undefined;
     const after = runWire(&r, getWithSession(&rbuf, sid, null), &out3);
@@ -2706,8 +2706,8 @@ test "2026-07-28: a modern tools/call is served statelessly — even with sessio
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
     try testing.expect(headerValue(got, "mcp-session-id") == null);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"resultType\":\"complete\"") != null);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"id\":1") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "\"id\":1") != null);
     // Nothing was recorded against any peer.
     try testing.expectEqual(@as(usize, 0), server.peers.items.len);
 }
@@ -2734,7 +2734,7 @@ test "2026-07-28: header problems are 400 HeaderMismatch before the server runs"
         const got = runWire(&r, req, &buf);
         try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
         try testing.expectEqualStrings("application/json", headerValue(got, "content-type").?);
-        try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"code\":-32020") != null);
+        try testing.expect(std.mem.find(u8, bodyOf(got), "\"code\":-32020") != null);
     }
 }
 
@@ -2752,7 +2752,7 @@ test "2026-07-28: an unsupported revision is 400, an unknown method 404, an ordi
         \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2099-01-01","io.modelcontextprotocol/clientCapabilities":{}}}}
     ), &buf);
     try testing.expect(std.mem.startsWith(u8, future, "HTTP/1.1 400"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(future), "\"code\":-32022") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(future), "\"code\":-32022") != null);
 
     // `ping` was removed in 2026-07-28: -32601, and the transport says 404 —
     // also when the client accepts SSE (a lone response is never a stream).
@@ -2760,12 +2760,12 @@ test "2026-07-28: an unsupported revision is 400, an unknown method 404, an ordi
     const ping = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: ping\r\n", "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\",\"params\":{" ++ modern_meta ++ "}}"), &buf2);
     try testing.expect(std.mem.startsWith(u8, ping, "HTTP/1.1 404"));
     try testing.expectEqualStrings("application/json", headerValue(ping, "content-type").?);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(ping), "\"code\":-32601") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(ping), "\"code\":-32601") != null);
 
     var buf3: [8192]u8 = undefined;
     const unknown_tool = runWire(&r, postHeaders("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: nope\r\n", "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"nope\"," ++ modern_meta ++ "}}"), &buf3);
     try testing.expect(std.mem.startsWith(u8, unknown_tool, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(unknown_tool), "\"code\":-32602") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(unknown_tool), "\"code\":-32602") != null);
 }
 
 test "2026-07-28 SSE: progress streams live then the result; a lone result stays application/json" {
@@ -2783,7 +2783,7 @@ test "2026-07-28 SSE: progress streams live then the result; a lone result stays
     try testing.expectEqualStrings("text/event-stream", headerValue(got, "content-type").?);
     try testing.expectEqualStrings("no", headerValue(got, "x-accel-buffering").?);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "notifications/progress"));
-    try testing.expect(std.mem.indexOf(u8, got, "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.find(u8, got, "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"resultType\":\"complete\"") != null);
 
     var buf2: [8192]u8 = undefined;
     const lone = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\n" ++ modern_call_headers, modern_call_body), &buf2);
@@ -2805,8 +2805,8 @@ test "2026-07-28 SSE: subscriptions/listen is the acknowledgment then the gracef
     const got = runWire(&r, postHeaders("Accept: application/json, text/event-stream\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: subscriptions/listen\r\n", "{\"jsonrpc\":\"2.0\",\"id\":\"listen-1\",\"method\":\"subscriptions/listen\",\"params\":{" ++ modern_meta ++ ",\"notifications\":{\"toolsListChanged\":true}}}"), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
     try testing.expectEqualStrings("text/event-stream", headerValue(got, "content-type").?);
-    const ack = std.mem.indexOf(u8, got, "notifications/subscriptions/acknowledged").?;
-    const done = std.mem.indexOf(u8, got, "\"id\":\"listen-1\",\"result\"").?;
+    const ack = std.mem.find(u8, got, "notifications/subscriptions/acknowledged").?;
+    const done = std.mem.find(u8, got, "\"id\":\"listen-1\",\"result\"").?;
     try testing.expect(ack < done);
 }
 
@@ -2839,14 +2839,14 @@ test "2026-07-28: a multi round-trip tool over HTTP — InputRequiredResult, the
     var buf: [8192]u8 = undefined;
     const first = runWire(&r, postHeaders(hdrs, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"deploy\"," ++ meta_elicit ++ "}}"), &buf);
     try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "\"resultType\":\"input_required\"") != null);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(first), "\"branch\":{\"method\":\"elicitation/create\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(first), "\"resultType\":\"input_required\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(first), "\"branch\":{\"method\":\"elicitation/create\"") != null);
 
     var buf2: [8192]u8 = undefined;
     const second = runWire(&r, postHeaders(hdrs, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"deploy\"," ++ meta_elicit ++
         ",\"inputResponses\":{\"branch\":{\"action\":\"accept\",\"content\":{\"branch\":\"main\"}}}}}"), &buf2);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "deploying main") != null);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(second), "\"resultType\":\"complete\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(second), "deploying main") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(second), "\"resultType\":\"complete\"") != null);
 }
 
 test "2026-07-28: Mcp-Param headers are checked against the tool's x-mcp-header schema over HTTP" {
@@ -2875,7 +2875,7 @@ test "2026-07-28: Mcp-Param headers are checked against the tool's x-mcp-header 
     var buf2: [8192]u8 = undefined;
     const missing = runWire(&r, postHeaders(base, body), &buf2);
     try testing.expect(std.mem.startsWith(u8, missing, "HTTP/1.1 400"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(missing), "Mcp-Param-Region") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(missing), "Mcp-Param-Region") != null);
 }
 
 test "the session era is untouched: an initialize-era POST under a session-revision header keeps its old reply" {
@@ -2889,8 +2889,8 @@ test "the session era is untouched: an initialize-era POST under a session-revis
     var buf: [8192]u8 = undefined;
     const got = runWire(&r, postHeaders("MCP-Protocol-Version: 2025-11-25\r\n", list_body), &buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
-    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "resultType") == null);
-    try testing.expect(std.mem.indexOf(u8, bodyOf(got), "\"name\":\"echo\"") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "resultType") == null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "\"name\":\"echo\"") != null);
 }
 
 // ── deterministic fuzz driver (MCP_HTTP_FUZZ, added 2026-10-10) ─────────────
@@ -2991,12 +2991,12 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
     switch (kind) {
         .list => {
             const got = runWire(&r, postWithSession(&req_buf, sid_a, list_body), &out);
-            if (statusOf(got) != 200 or std.mem.indexOf(u8, bodyOf(got), "echo") == null) return error.ListFailed;
+            if (statusOf(got) != 200 or std.mem.find(u8, bodyOf(got), "echo") == null) return error.ListFailed;
             WireMark.mark(.list_ok);
         },
         .call => {
             const got = runWire(&r, postWithSession(&req_buf, sid_b, call_body), &out);
-            if (statusOf(got) != 200 or std.mem.indexOf(u8, got, "\"ok\":true") == null) return error.CallFailed;
+            if (statusOf(got) != 200 or std.mem.find(u8, got, "\"ok\":true") == null) return error.CallFailed;
             WireMark.mark(.call_ok);
         },
         .note => {
@@ -3006,10 +3006,10 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         },
         .get => {
             const got = runWire(&r, getWithSession(&req_buf, sid_a, null), &out);
-            if (statusOf(got) != 200 or std.mem.indexOf(u8, got, "data: {\"n\":1}") == null) return error.StreamFailed;
+            if (statusOf(got) != 200 or std.mem.find(u8, got, "data: {\"n\":1}") == null) return error.StreamFailed;
             // The other session does not see session A's event.
             const other = runWire(&r, getWithSession(&req_buf, sid_b, null), &out);
-            if (std.mem.indexOf(u8, other, "{\"n\":1}") != null) return error.EventLeakedAcrossSessions;
+            if (std.mem.find(u8, other, "{\"n\":1}") != null) return error.EventLeakedAcrossSessions;
             WireMark.mark(.get_stream);
         },
         .delete => {
@@ -3024,7 +3024,7 @@ pub fn fuzzWire(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         .origin => {
             const bad = [_][]const u8{ "https://evil.example", "https://ok.example.evil", "null", "" };
             const o = bad[src.index(bad.len)];
-            const got = runWire(&r, std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ o, sid_a, list_body.len, list_body }) catch unreachable, &out);
+            const got = runWire(&r, std.mem.print(&req_buf, "POST /mcp HTTP/1.1\r\nHost: t\r\nOrigin: {s}\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ o, sid_a, list_body.len, list_body }) catch unreachable, &out);
             if (statusOf(got) != 403) return error.ForeignOriginAccepted;
             WireMark.mark(.origin_refused);
         },

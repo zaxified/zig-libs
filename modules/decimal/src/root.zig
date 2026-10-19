@@ -914,7 +914,7 @@ test "zero, neg, abs edges" {
 
 test "std.fmt {f} integration" {
     var buf: [64]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, "{f}", .{dec("-12.75")});
+    const s = try std.mem.print(&buf, "{f}", .{dec("-12.75")});
     try testing.expectEqualStrings("-12.75", s);
 }
 
@@ -1531,7 +1531,7 @@ test "float bridge: toFloat(fromFloatShortest(x)) == x for typed decimals with <
         const digits = rand.intRangeAtMost(u64, 0, 999_999_999_999_999);
         const k = rand.intRangeAtMost(u32, 0, 12);
         var buf: [40]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buf, "{d}e-{d}", .{ digits, k });
+        const text = try std.mem.print(&buf, "{d}e-{d}", .{ digits, k });
         const x = try std.fmt.parseFloat(f64, text);
         const d = try Decimal.fromFloatShortest(x, 12, .half_even);
         try expectBits(x, d.toFloat());

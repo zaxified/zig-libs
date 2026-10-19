@@ -253,7 +253,7 @@ fn stripDot(name: []const u8) []const u8 {
 
 /// The parent name (drop the first label). Root ("") has no parent → "".
 fn parentOf(name: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
+    if (std.mem.findScalar(u8, name, '.')) |dot| return name[dot + 1 ..];
     return name[name.len..]; // single label → root
 }
 

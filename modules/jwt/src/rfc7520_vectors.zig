@@ -42,7 +42,7 @@ const Parts = struct { signing_input: []const u8, sig: []u8 };
 
 /// Split a compact JWS and decode its signature into `sig_buf`.
 fn split(jws: []const u8, sig_buf: []u8) !Parts {
-    const last = std.mem.lastIndexOfScalar(u8, jws, '.').?;
+    const last = std.mem.findScalarLast(u8, jws, '.').?;
     const sig_b64 = jws[last + 1 ..];
     const len = try b64.Decoder.calcSizeForSlice(sig_b64);
     try b64.Decoder.decode(sig_buf[0..len], sig_b64);

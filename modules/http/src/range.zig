@@ -144,7 +144,7 @@ pub const Iterator = struct {
         // Slice the next element up to the next ',' (none occurs inside a
         // byte-range-spec) and advance past it.
         var tok: []const u8 = undefined;
-        if (std.mem.indexOfScalar(u8, self.rest, ',')) |comma| {
+        if (std.mem.findScalar(u8, self.rest, ',')) |comma| {
             tok = self.rest[0..comma];
             self.rest = self.rest[comma + 1 ..];
         } else {
@@ -161,7 +161,7 @@ pub const Iterator = struct {
 /// returns `error.InvalidUnit` otherwise. Does not yet parse any spec.
 pub fn iterator(raw: []const u8) Error!Iterator {
     const trimmed = std.mem.trim(u8, raw, " \t");
-    const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse return error.InvalidUnit;
+    const eq = std.mem.findScalar(u8, trimmed, '=') orelse return error.InvalidUnit;
     const unit = std.mem.trim(u8, trimmed[0..eq], " \t");
     if (!std.ascii.eqlIgnoreCase(unit, "bytes")) return error.InvalidUnit;
     return .{ .rest = trimmed[eq + 1 ..] };
@@ -171,7 +171,7 @@ pub fn iterator(raw: []const u8) Error!Iterator {
 /// (`0-499`, `9500-`, or `-500`). Exposed for tests; `Iterator.next` calls it.
 pub fn parseSpec(tok: []const u8) Error!ByteRangeSpec {
     // Positions are DIGIT only (no sign), so the first '-' is the separator.
-    const dash = std.mem.indexOfScalar(u8, tok, '-') orelse return error.InvalidRange;
+    const dash = std.mem.findScalar(u8, tok, '-') orelse return error.InvalidRange;
     const before = tok[0..dash];
     const after = tok[dash + 1 ..];
 
@@ -1311,8 +1311,8 @@ test "apply: golden 206 multipart/byteranges for two ranges" {
         "--SEP\r\nContent-Type: text/plain\r\nContent-Range: bytes 7-9/10\r\n\r\nHIJ\r\n" ++
         "--SEP--\r\n";
     var lenbuf: [8]u8 = undefined;
-    const clen = try std.fmt.bufPrint(&lenbuf, "{d}", .{body.len});
-    const expected = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 206 Partial Content\r\n" ++
+    const clen = try std.mem.print(&lenbuf, "{d}", .{body.len});
+    const expected = try testing.allocator.print("HTTP/1.1 206 Partial Content\r\n" ++
         "Accept-Ranges: bytes\r\n" ++
         "Content-Type: multipart/byteranges; boundary=SEP\r\n" ++
         "Server: test\r\n" ++

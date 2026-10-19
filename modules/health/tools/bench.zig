@@ -100,7 +100,7 @@ fn once(d: *const Data, w: usize) u64 {
         });
         const resp = out.buffered();
         sum += std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
-        const body_at = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse continue;
+        const body_at = std.mem.find(u8, resp, "\r\n\r\n") orelse continue;
         if (std.mem.startsWith(u8, resp[body_at + 4 ..], "{\"status\":\"")) sum += 1;
     }
     return sum;
@@ -118,12 +118,12 @@ fn setup(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !Data {
         d.routers[wi] = r;
         var all: std.Io.Writer.Allocating = .init(arena);
         for (0..n_req) |i| {
-            const wire = try std.fmt.allocPrint(arena, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{targets[wi]});
+            const wire = try arena.print("GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{targets[wi]});
             d.wires[wi][i] = wire;
             if (i != 0) try all.writer.writeByte(0);
             try all.writer.writeAll(wire);
         }
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.wire", .{name}), .data = all.written() });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.wire", .{name}), .data = all.written() });
     }
     return d;
 }
@@ -157,7 +157,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

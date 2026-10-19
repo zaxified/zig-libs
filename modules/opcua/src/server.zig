@@ -5477,7 +5477,7 @@ test "chunking: a multi-chunk response is emitted as C…F and a multi-chunk req
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
         var name_buf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "sensor{d}", .{i});
+        const name = try std.mem.print(&name_buf, "sensor{d}", .{i});
         try rig.store.addVariable(.{
             .node_id = .{ .numeric = .{ .namespace = 1, .id = 2000 + i } },
             .parent_id = rig.device_id,
@@ -7195,7 +7195,7 @@ test "secure: encrypted UserNameIdentityToken over a SecurityPolicy#None channel
             prng.random(),
             &out,
         );
-        try testing.expect(std.mem.indexOf(u8, token.body, test_users[0].password) == null);
+        try testing.expect(std.mem.find(u8, token.body, test_users[0].password) == null);
         try rig.activateSession(token);
         try testing.expect(rig.srv.sessions.items[0].activated);
     }

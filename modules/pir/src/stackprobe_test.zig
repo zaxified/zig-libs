@@ -46,9 +46,9 @@ fn setup() void {
     for (&s, labels) |*d, l| seed(d, l);
     for (0..3) |j| {
         var l: [16]u8 = undefined;
-        _ = std.fmt.bufPrint(&l, "pir probe m0 {d}", .{j}) catch unreachable;
+        _ = std.mem.print(&l, "pir probe m0 {d}", .{j}) catch unreachable;
         seed(&ms0[j], &l);
-        _ = std.fmt.bufPrint(&l, "pir probe m1 {d}", .{j}) catch unreachable;
+        _ = std.mem.print(&l, "pir probe m1 {d}", .{j}) catch unreachable;
         seed(&ms1[j], &l);
     }
     seed(&mac_rand, "pir probe mac");

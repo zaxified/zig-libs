@@ -249,7 +249,7 @@ fn measure(gpa: std.mem.Allocator, addr: net.IpAddress, row: Row) !f64 {
             defer for (subs[0..opened]) |*s| s.raw.close();
             for (subs, 0..) |*s, i| {
                 var id_buf: [32]u8 = undefined;
-                s.* = .{ .raw = try Raw.open(gpa, addr, try std.fmt.bufPrint(&id_buf, "bench-fan-{d}", .{i})), .want = count };
+                s.* = .{ .raw = try Raw.open(gpa, addr, try std.mem.print(&id_buf, "bench-fan-{d}", .{i})), .want = count };
                 opened += 1;
                 try s.raw.subscribe("bench/fan", .at_most_once);
             }
@@ -282,7 +282,7 @@ fn measure(gpa: std.mem.Allocator, addr: net.IpAddress, row: Row) !f64 {
             var topics: [n_pubs][16]u8 = undefined;
             for (pubs, 0..) |*p, i| {
                 var id_buf: [32]u8 = undefined;
-                p.* = .{ .raw = try Raw.open(gpa, addr, try std.fmt.bufPrint(&id_buf, "bench-in-{d}", .{i})), .topic = try std.fmt.bufPrint(&topics[i], "bench/in/{d}", .{i}), .count = per };
+                p.* = .{ .raw = try Raw.open(gpa, addr, try std.mem.print(&id_buf, "bench-in-{d}", .{i})), .topic = try std.mem.print(&topics[i], "bench/in/{d}", .{i}), .count = per };
                 opened += 1;
             }
             const sth = try std.Thread.spawn(.{}, Sub.run, .{&sub});
@@ -366,7 +366,7 @@ fn startMosquitto(arena: std.mem.Allocator) !struct { addr: net.IpAddress, versi
     // happens to this program.
     // A config file only for `set_tcp_nodelay` (ours sets it as well); the
     // listener and anonymous access are what `-p` alone would give.
-    const cmd = try std.fmt.allocPrint(arena, "cp /usr/sbin/mosquitto /tmp/mosquitto && printf 'listener {d} 127.0.0.1\nallow_anonymous true\nset_tcp_nodelay true\nmax_queued_messages 0\n' > /tmp/m.conf && exec timeout 1800 /tmp/mosquitto -c /tmp/m.conf", .{port});
+    const cmd = try arena.print("cp /usr/sbin/mosquitto /tmp/mosquitto && printf 'listener {d} 127.0.0.1\nallow_anonymous true\nset_tcp_nodelay true\nmax_queued_messages 0\n' > /tmp/m.conf && exec timeout 1800 /tmp/mosquitto -c /tmp/m.conf", .{port});
     const r = try std.process.run(arena, io_g, .{ .argv = &.{ "podman", "run", "-d", "--rm", "--network", "host", image, "sh", "-c", cmd } });
     if (r.term != .exited or r.term.exited != 0) {
         std.debug.print("bench-mqtt: podman run failed (is {s} pulled?):\n{s}\n", .{ image, r.stderr });
@@ -430,7 +430,7 @@ pub fn main(init: std.process.Init) !u8 {
         const f = .{ .name = f_name };
         const row: Row = @fromBackingInt(@intCast(f_value));
         var hit = filters.len == 0;
-        for (filters) |x| hit = hit or std.mem.indexOf(u8, f.name, x) != null;
+        for (filters) |x| hit = hit or std.mem.find(u8, f.name, x) != null;
         if (hit) {
             var o_best: f64 = std.math.inf(f64);
             var o_worst: f64 = 0;

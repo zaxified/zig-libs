@@ -41,7 +41,7 @@ pub const Mismatch = union(enum) {
 pub fn diff(expected: []const u8, actual: []const u8) ?Mismatch {
     if (expected.len != actual.len)
         return .{ .length = .{ .expected = expected.len, .actual = actual.len } };
-    const at = std.mem.indexOfDiff(u8, expected, actual) orelse return null;
+    const at = std.mem.findDiff(u8, expected, actual) orelse return null;
     return .{ .byte = at };
 }
 

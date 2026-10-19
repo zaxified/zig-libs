@@ -227,8 +227,8 @@ const Mosquitto = struct {
         // fail, and every container left behind is unkillable without root.
         const port = try freePort(io);
         var port_buf: [8]u8 = undefined;
-        const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
-        const cmd = try std.fmt.allocPrint(gpa, "cp /usr/sbin/mosquitto /tmp/mosquitto && exec /tmp/mosquitto -p {s}", .{port_str});
+        const port_str = try std.mem.print(&port_buf, "{d}", .{port});
+        const cmd = try gpa.print("cp /usr/sbin/mosquitto /tmp/mosquitto && exec /tmp/mosquitto -p {s}", .{port_str});
         defer gpa.free(cmd);
         // The pull is its own step: on a fresh runner `podman run` would pull
         // first, silently, inside a call whose stdout is the container id.
@@ -628,7 +628,7 @@ fn pahoVsBroker(gpa: std.mem.Allocator, io: std.Io, out: *std.ArrayList(u8)) !vo
     var serving = try io.concurrent(Recorder.serve, .{ &rec, &listener });
 
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
     std.debug.print("interop-mqtt: paho-mqtt vs our Broker on port {d}\n", .{port});
     step(6);
     const r = try std.process.run(gpa, io, .{ .argv = &.{ python, paho_script, "127.0.0.1", port_str }, .timeout = peer_timeout });
@@ -787,9 +787,9 @@ fn tlsVsMosquitto(gpa: std.mem.Allocator, io: std.Io) !void {
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(io, tls_dir, gpa);
     defer gpa.free(abs);
     const port = try Mosquitto.freePort(io);
-    const cmd = try std.fmt.allocPrint(gpa, "cp /usr/sbin/mosquitto /tmp/mosquitto && printf 'listener {d} 127.0.0.1\\nallow_anonymous true\\ncertfile /certs/srv.pem\\nkeyfile /certs/srv.key\\n' > /tmp/m.conf && exec timeout 300 /tmp/mosquitto -c /tmp/m.conf", .{port});
+    const cmd = try gpa.print("cp /usr/sbin/mosquitto /tmp/mosquitto && printf 'listener {d} 127.0.0.1\\nallow_anonymous true\\ncertfile /certs/srv.pem\\nkeyfile /certs/srv.key\\n' > /tmp/m.conf && exec timeout 300 /tmp/mosquitto -c /tmp/m.conf", .{port});
     defer gpa.free(cmd);
-    const vol = try std.fmt.allocPrint(gpa, "{s}:/certs:ro", .{abs});
+    const vol = try gpa.print("{s}:/certs:ro", .{abs});
     defer gpa.free(vol);
     step(3);
     const raw_id = try run(gpa, io, &.{ "podman", "run", "-d", "--rm", "--network", "host", "-v", vol, image, "sh", "-c", cmd });

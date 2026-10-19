@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
+
 - **2026-10-04** — **mvp → core** (reference: libxml2 2.15 / libexpat 2.8).
   - **New: input encodings** UTF-16 LE/BE (BOM or Appendix F detection), ISO-8859-1, US-ASCII,
     transcoded to UTF-8 up front (`Document.source_encoding`, `SourceEncoding`,

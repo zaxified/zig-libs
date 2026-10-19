@@ -629,7 +629,7 @@ test "zkey: a verifying-key G2 point outside the subgroup is refused at parse" {
     for (targets) |target| {
         const buf = try testing.allocator.dupe(u8, t1_zkey);
         defer testing.allocator.free(buf);
-        const at = std.mem.indexOf(u8, buf, &target) orelse return error.TestPointNotFound;
+        const at = std.mem.find(u8, buf, &target) orelse return error.TestPointNotFound;
         buf[at..][0..bin.g2_bytes].* = bad_enc;
         try testing.expectError(error.NotInSubgroup, zkey.parse(testing.allocator, buf));
     }

@@ -89,14 +89,14 @@ pub fn main() !void {
     var owners: [100][]const u8 = undefined;
     for (&owners, 0..) |*o, i| {
         var kb: [16]u8 = undefined;
-        o.* = ring.ringOwner(try std.fmt.bufPrint(&kb, "session-{d}", .{i})).?.id;
+        o.* = ring.ringOwner(try std.mem.print(&kb, "session-{d}", .{i})).?.id;
     }
     const held = ring.pickByKey("session-7").?; // a call in flight
     _ = try ring.remove("cache-2"); // removed while serving
     var moved: usize = 0;
     for (owners, 0..) |o, i| {
         var kb: [16]u8 = undefined;
-        const now = ring.ringOwner(try std.fmt.bufPrint(&kb, "session-{d}", .{i})).?.id;
+        const now = ring.ringOwner(try std.mem.print(&kb, "session-{d}", .{i})).?.id;
         if (!std.mem.eql(u8, o, now)) {
             if (!std.mem.eql(u8, o, "cache-2")) return error.UnrelatedKeyMoved;
             moved += 1;

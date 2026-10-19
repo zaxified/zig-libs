@@ -129,7 +129,7 @@ fn echoMethod(
         },
         else => return services.status.bad_invalid_argument,
     };
-    const echoed = try std.fmt.allocPrint(allocator, "{s} (echoed by zig-libs)", .{text});
+    const echoed = try allocator.print("{s} (echoed by zig-libs)", .{text});
     try outputs.append(allocator, .{ .scalar = .{ .string = echoed } });
     return services.status.good;
 }
@@ -291,7 +291,7 @@ fn utcDate(buf: []u8) []const u8 {
     const secs: u64 = @intCast(ts.sec);
     const day = (std.time.epoch.EpochSeconds{ .secs = secs }).getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
         day.year, md.month.numeric(), md.day_index + 1,
     }) catch "unknown";
 }
@@ -718,7 +718,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     // Read from its own path, never embedded: the whole point of the
     // separation is that no foreign source is compiled into anything.
-    const script_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ repo_root, driver_path });
+    const script_path = try gpa.print("{s}/{s}", .{ repo_root, driver_path });
     root.access(io, driver_path, .{}) catch {
         std.debug.print(
             "cannot find {s} under \"{s}\" -- run this from the repository root\n" ++
@@ -784,7 +784,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const logs = peer.stdout;
     var failed = false;
     for (expectations) |needle| {
-        if (std.mem.indexOf(u8, logs, needle) == null) {
+        if (std.mem.find(u8, logs, needle) == null) {
             std.debug.print("driver output missing \"{s}\"\n", .{needle});
             failed = true;
         }

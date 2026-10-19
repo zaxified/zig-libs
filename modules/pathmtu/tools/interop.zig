@@ -99,7 +99,7 @@ fn probeMode(gpa: std.mem.Allocator, io: std.Io, dest_text: []const u8, iface: [
 fn afterLine(text: []const u8, n: usize) []const u8 {
     var rest = text;
     for (0..n) |_| {
-        const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse return "";
+        const nl = std.mem.findScalar(u8, rest, '\n') orelse return "";
         rest = rest[nl + 1 ..];
     }
     return rest;

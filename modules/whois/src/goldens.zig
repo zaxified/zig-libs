@@ -229,7 +229,7 @@ test "golden: real IANA `com` reply — referral extraction" {
 test "golden: real Verisign `example.com` reply — key fields, CRLF intact" {
     // Confirms the capture really is CRLF (distinct from iana_com_reply's
     // bare \n above) and that fieldValue's "\r" trim handles it.
-    try testing.expect(std.mem.indexOf(u8, verisign_example_com_reply, "\r\n") != null);
+    try testing.expect(std.mem.find(u8, verisign_example_com_reply, "\r\n") != null);
 
     try testing.expectEqualStrings(
         "2336799_DOMAIN_COM-VRSN",

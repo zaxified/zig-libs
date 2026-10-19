@@ -2853,7 +2853,7 @@ test "TEETH: the luma length check is computed in u64, because wasm32 is a decla
     // A source-reading test must not contain its own needle.
     const src = @embedFile("root.zig");
     const needle = "if (@as(u64, img.luma.len)" ++ " < " ++ "@as(u64, img.stride)" ++ " * " ++ "@as(u64, img.height))";
-    if (std.mem.indexOf(u8, src, needle) == null) {
+    if (std.mem.find(u8, src, needle) == null) {
         std.debug.print(
             "scan's luma length check is no longer computed in u64; on wasm32 it can wrap\n",
             .{},

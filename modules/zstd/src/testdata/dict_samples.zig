@@ -91,7 +91,7 @@ fn json(r: *Rng, out: []u8) void {
     var i: usize = 0;
     var line: [256]u8 = undefined;
     while (i < out.len) {
-        const s = std.fmt.bufPrint(&line, "{{\"id\":{d},\"name\":\"{s}\",\"tags\":[\"{s}\",\"{s}\"],\"ts\":{d},\"ok\":{s}}}\n", .{
+        const s = std.mem.print(&line, "{{\"id\":{d},\"name\":\"{s}\",\"tags\":[\"{s}\",\"{s}\"],\"ts\":{d},\"ok\":{s}}}\n", .{
             r.below(100000),
             names[@as(usize, @intCast(r.below(names.len)))],
             tags[@as(usize, @intCast(r.below(tags.len)))],

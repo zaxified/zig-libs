@@ -112,7 +112,7 @@ fn serve(row: *Row, wire: []const u8, out_buf: []u8) []const u8 {
 fn tally(resp: []const u8) u64 {
     var sum: u64 = std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
     if (std.ascii.findIgnoreCase(resp, "\r\nset-cookie:") != null) sum += 1;
-    if (std.mem.indexOf(u8, resp, "\r\n\r\n")) |i| sum += resp.len - (i + 4);
+    if (std.mem.find(u8, resp, "\r\n\r\n")) |i| sum += resp.len - (i + 4);
     return sum;
 }
 
@@ -120,7 +120,7 @@ fn tally(resp: []const u8) u64 {
 fn cookieOf(resp: []const u8) []const u8 {
     const at = std.ascii.findIgnoreCase(resp, "set-cookie: session=") orelse return "";
     const rest = resp[at + "set-cookie: session=".len ..];
-    return rest[0 .. std.mem.indexOfScalar(u8, rest, ';') orelse rest.len];
+    return rest[0 .. std.mem.findScalar(u8, rest, ';') orelse rest.len];
 }
 
 const no_cookie = "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
@@ -135,7 +135,7 @@ fn once(d: *const Data, w: usize) u64 {
         for (0..n_req / 2) |_| {
             const created = serve(row, row.wires[0], &out_buf);
             sum += tally(created);
-            const req = std.fmt.bufPrint(&req_buf, with_cookie, .{ "/logout", cookieOf(created) }) catch unreachable;
+            const req = std.mem.print(&req_buf, with_cookie, .{ "/logout", cookieOf(created) }) catch unreachable;
             sum += tally(serve(row, req, &out_buf));
         }
         return sum;
@@ -165,17 +165,17 @@ fn setupRow(arena: std.mem.Allocator, io: std.Io, wi: usize) !*Row {
     var out_buf: [1024]u8 = undefined;
     switch (wi) {
         0 => for (&row.wires) |*wire| {
-            wire.* = try std.fmt.allocPrint(arena, no_cookie, .{"/"});
+            wire.* = try arena.print(no_cookie, .{"/"});
         },
         1, destroy_row => for (&row.wires) |*wire| {
-            wire.* = try std.fmt.allocPrint(arena, no_cookie, .{"/new"});
+            wire.* = try arena.print(no_cookie, .{"/new"});
         },
         else => for (&row.wires) |*wire| {
             // A session per slot, made through the real middleware.
-            const made = serve(row, try std.fmt.allocPrint(arena, no_cookie, .{"/new"}), &out_buf);
+            const made = serve(row, try arena.print(no_cookie, .{"/new"}), &out_buf);
             const id = cookieOf(made);
             if (id.len == 0) return error.NoSessionCookie;
-            wire.* = try std.fmt.allocPrint(arena, with_cookie, .{ if (wi == 2) "/read" else "/write", id });
+            wire.* = try arena.print(with_cookie, .{ if (wi == 2) "/read" else "/write", id });
         },
     }
     return row;
@@ -209,7 +209,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

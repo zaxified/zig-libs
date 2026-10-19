@@ -108,7 +108,7 @@ const Data = struct {
 
 fn keyTable(arena: std.mem.Allocator, prefix: []const u8, n: usize) ![]const []const u8 {
     const out = try arena.alloc([]const u8, n);
-    for (out, 0..) |*slot, i| slot.* = try std.fmt.allocPrint(arena, "{s}{d}", .{ prefix, i });
+    for (out, 0..) |*slot, i| slot.* = try arena.print("{s}{d}", .{ prefix, i });
     return out;
 }
 
@@ -311,7 +311,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: bench.Side = .{};

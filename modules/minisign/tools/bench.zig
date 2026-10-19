@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
     const p = struct {
         fn path(a: std.mem.Allocator, base: []const u8, name: []const u8) []const u8 {
-            return std.fmt.allocPrint(a, "{s}/{s}", .{ base, name }) catch @panic("OOM");
+            return a.print("{s}/{s}", .{ base, name }) catch @panic("OOM");
         }
     }.path;
 

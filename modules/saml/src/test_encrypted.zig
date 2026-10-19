@@ -44,8 +44,8 @@ const asrt_open_selfcontained =
 // ── generic test helpers ─────────────────────────────────────────────────────
 
 fn block(hay: []const u8, open: []const u8, close: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, hay, open).?;
-    const j = std.mem.indexOfPos(u8, hay, i, close).? + close.len;
+    const i = std.mem.find(u8, hay, open).?;
+    const j = std.mem.findPos(u8, hay, i, close).? + close.len;
     return hay[i..j];
 }
 
@@ -107,7 +107,7 @@ fn encryptedAssertionXml(alloc: std.mem.Allocator, pk: rsa.PublicKey, plaintext:
     const content_b64 = try b64(alloc, content);
     defer alloc.free(content_b64);
 
-    return std.fmt.allocPrint(alloc,
+    return alloc.print(
         \\<saml:EncryptedAssertion xmlns:saml="{s}"><xenc:EncryptedData xmlns:xenc="{s}" xmlns:ds="{s}" Type="http://www.w3.org/2001/04/xmlenc#Element"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/><ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="{s}rsa-oaep-mgf1p"/><xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue>{s}</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>
     , .{ saml_ns, xenc_ns, ds_ns, xenc_ns, cek_b64, content_b64 });
 }
@@ -192,7 +192,7 @@ test "Z1: the decrypted assertion body does not survive in any block consumeResp
     // of the plaintext — `saml`'s own decrypt buffer, or the canonical form
     // `xmldsig.verify` builds from it while checking the IdP signature.
     const needle = ">alice@example.org</saml:NameID>";
-    try testing.expect(std.mem.indexOf(u8, enc_resp, needle) == null);
+    try testing.expect(std.mem.find(u8, enc_resp, needle) == null);
 
     var scan = encutil.FreeScanner{ .child = alloc, .needle = needle };
     const sa = scan.allocator();
@@ -284,7 +284,7 @@ test "teeth: a cleartext AND an encrypted assertion together -> MultipleAssertio
     const enc_xml = try encryptedAssertionXml(alloc, kp.public_key, plaintext);
     defer alloc.free(enc_xml);
     // Keep the cleartext assertion and ALSO inject an encrypted one.
-    const injected = try std.fmt.allocPrint(alloc, "</samlp:Status>{s}", .{enc_xml});
+    const injected = try alloc.print("</samlp:Status>{s}", .{enc_xml});
     defer alloc.free(injected);
     const resp = try std.mem.replaceOwned(u8, alloc, fx.signed_response, "</samlp:Status>", injected);
     defer alloc.free(resp);
@@ -304,7 +304,7 @@ test "teeth: two encrypted assertions -> MultipleAssertions" {
     const one = try responseWithEncrypted(alloc, enc_xml);
     defer alloc.free(one);
     // Inject a second encrypted assertion just after the first.
-    const doubled = try std.fmt.allocPrint(alloc, "{s}{s}", .{ enc_xml, enc_xml });
+    const doubled = try alloc.print("{s}{s}", .{ enc_xml, enc_xml });
     defer alloc.free(doubled);
     const two = try std.mem.replaceOwned(u8, alloc, one, enc_xml, doubled);
     defer alloc.free(two);
@@ -330,7 +330,7 @@ test "teeth: classic wrap INSIDE the decrypted assertion -> SignatureWrappingDet
     const legit_nosig = try std.mem.replaceOwned(u8, alloc, selfc, legit_sig, "");
     defer alloc.free(legit_nosig);
 
-    const evil = try std.fmt.allocPrint(alloc, "<saml:Assertion xmlns:saml=\"{s}\" ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
+    const evil = try alloc.print("<saml:Assertion xmlns:saml=\"{s}\" ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
         "<saml:Issuer>https://idp.example.org/saml</saml:Issuer>{s}" ++
         "<saml:Subject><saml:NameID Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">attacker@evil.example</saml:NameID>" ++
         "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">" ++

@@ -331,7 +331,7 @@ test "the sequence-level API is byte-identical to libzstd 1.5.7, errors included
                         };
                         try std.testing.expectEqual(src.len, try rebuild(s, src, back));
                         try std.testing.expectEqualSlices(u8, src, back);
-                    } else if (!std.mem.eql(u8, sc.cmd, "merge") and sc.gen.damage == .none and sc.gen.list.len == 0 and std.mem.indexOf(u8, sc.params, "format=1") == null and
+                    } else if (!std.mem.eql(u8, sc.cmd, "merge") and sc.gen.damage == .none and sc.gen.list.len == 0 and std.mem.find(u8, sc.params, "format=1") == null and
                         sc.dict == null and !std.mem.eql(u8, sc.name, "cseq-nodelim-explicit-list") and !std.mem.eql(u8, sc.cmd, "prod:1024"))
                     {
                         const back = try gpa.alloc(u8, src.len + 1);

@@ -419,14 +419,14 @@ pub const Reader = struct {
 
         var rest: []const u8 = buf;
         while (rest.len > 0) {
-            const sp = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadHeader;
+            const sp = std.mem.findScalar(u8, rest, ' ') orelse return error.BadHeader;
             if (sp == 0) return error.BadHeader;
             for (rest[0..sp]) |c| if (!std.ascii.isDigit(c)) return error.BadHeader;
             const len = std.fmt.parseInt(usize, rest[0..sp], 10) catch return error.BadHeader;
             if (len <= sp + 1 or len > rest.len or rest[len - 1] != '\n') return error.BadHeader;
             const kv = rest[sp + 1 .. len - 1];
             rest = rest[len..];
-            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return error.BadHeader;
+            const eq = std.mem.findScalar(u8, kv, '=') orelse return error.BadHeader;
             const key = kv[0..eq];
             const value = kv[eq + 1 ..];
             if (std.mem.eql(u8, key, "path")) {
@@ -454,7 +454,7 @@ pub const Reader = struct {
         // An embedded NUL would silently cut the name where `Entry.path` is
         // materialized (`sliceTo(0)`), so the entry would be reported under a
         // different name than the archive states.
-        if (std.mem.indexOfScalar(u8, value, 0) != null) return error.BadHeader;
+        if (std.mem.findScalar(u8, value, 0) != null) return error.BadHeader;
         if (value.len > max_name_len) return error.BadHeader;
         if (slot.*) |old| self.gpa.free(old);
         slot.* = null;
@@ -501,7 +501,7 @@ fn parsePaxTime(value: []const u8) error{BadHeader}!?PaxTime {
     if (value.len == 0) return null;
     const neg = value[0] == '-';
     const rest = if (neg) value[1..] else value;
-    const dot = std.mem.indexOfScalar(u8, rest, '.');
+    const dot = std.mem.findScalar(u8, rest, '.');
     const int_part = if (dot) |d| rest[0..d] else rest;
     const frac_part = if (dot) |d| rest[d + 1 ..] else "";
     // "1." (an empty fraction) is 1 s: GNU tar 1.35 and Go both read it so.
@@ -743,8 +743,8 @@ pub const Writer = struct {
         // record with no header behind it) in the stream.
         if (e.mode > max_octal_8) return error.FieldOutOfRange;
         if (e.mtime_nsec > max_nsec) return error.FieldOutOfRange;
-        if (std.mem.indexOfScalar(u8, e.path, 0) != null) return error.FieldOutOfRange;
-        if ((e.kind == .symlink or e.kind == .hardlink) and std.mem.indexOfScalar(u8, e.link_target, 0) != null)
+        if (std.mem.findScalar(u8, e.path, 0) != null) return error.FieldOutOfRange;
+        if ((e.kind == .symlink or e.kind == .hardlink) and std.mem.findScalar(u8, e.link_target, 0) != null)
             return error.FieldOutOfRange;
         if (self.options.long_names == .pax) return writePaxHeader(w, &block, e, typeflag);
         if (e.uid > max_octal_8) return error.FieldOutOfRange;
@@ -816,7 +816,7 @@ fn formatPaxTime(buf: *[32]u8, sec: i64, nsec: u32) []const u8 {
     w.print("{s}{d}", .{ if (neg) "-" else "", whole }) catch unreachable;
     if (frac != 0) {
         var digits: [9]u8 = undefined;
-        _ = std.fmt.bufPrint(&digits, "{d:0>9}", .{frac}) catch unreachable;
+        _ = std.mem.print(&digits, "{d:0>9}", .{frac}) catch unreachable;
         w.print(".{s}", .{std.mem.trimEnd(u8, &digits, "0")}) catch unreachable;
     }
     return w.buffered();
@@ -848,7 +848,7 @@ fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag:
     var recs: [6]PaxRec = undefined;
     var n: usize = 0;
     if (e.gid > max_octal_8) {
-        recs[n] = .{ .key = "gid", .value = std.fmt.bufPrint(&gid_buf, "{d}", .{e.gid}) catch unreachable };
+        recs[n] = .{ .key = "gid", .value = std.mem.print(&gid_buf, "{d}", .{e.gid}) catch unreachable };
         n += 1;
     }
     if (link.len > 100) {
@@ -864,11 +864,11 @@ fn writePaxHeader(w: *std.Io.Writer, block: *[block_size]u8, e: Entry, typeflag:
         n += 1;
     }
     if (size > max_octal_12) {
-        recs[n] = .{ .key = "size", .value = std.fmt.bufPrint(&size_buf, "{d}", .{size}) catch unreachable };
+        recs[n] = .{ .key = "size", .value = std.mem.print(&size_buf, "{d}", .{size}) catch unreachable };
         n += 1;
     }
     if (e.uid > max_octal_8) {
-        recs[n] = .{ .key = "uid", .value = std.fmt.bufPrint(&uid_buf, "{d}", .{e.uid}) catch unreachable };
+        recs[n] = .{ .key = "uid", .value = std.mem.print(&uid_buf, "{d}", .{e.uid}) catch unreachable };
         n += 1;
     }
 
@@ -1122,7 +1122,7 @@ pub fn packDirToPath(io: std.Io, gpa: Allocator, roots: []const []const u8, out_
 fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, stats: *PackStats) PackDirError!void {
     const linux = std.os.linux;
     var pathz: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = std.fmt.bufPrintSentinel(&pathz, "{s}", .{fs_path}, 0) catch return error.PathTooLong;
+    const pz = std.mem.printSentinel(&pathz, "{s}", .{fs_path}, 0) catch return error.PathTooLong;
 
     var stx: linux.Statx = undefined;
     if (linux.errno(linux.statx(linux.AT.FDCWD, pz, linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx)) != .SUCCESS)
@@ -1141,8 +1141,8 @@ fn emitPath(io: std.Io, tw: Writer, fs_path: []const u8, tar_name: []const u8, s
         while (it.next(io) catch null) |entry| {
             var cfs: [std.fs.max_path_bytes]u8 = undefined;
             var ctar: [std.fs.max_path_bytes]u8 = undefined;
-            const child_fs = std.fmt.bufPrint(&cfs, "{s}/{s}", .{ fs_path, entry.name }) catch continue;
-            const child_tar = std.fmt.bufPrint(&ctar, "{s}/{s}", .{ tar_name, entry.name }) catch continue;
+            const child_fs = std.mem.print(&cfs, "{s}/{s}", .{ fs_path, entry.name }) catch continue;
+            const child_tar = std.mem.print(&ctar, "{s}/{s}", .{ tar_name, entry.name }) catch continue;
             try emitPath(io, tw, child_fs, child_tar, stats);
         }
     } else if (ifmt == linux.S.IFLNK) {
@@ -1695,7 +1695,7 @@ fn paxRecord(buf: []u8, key: []const u8, value: []const u8) []const u8 {
     const body = key.len + 1 + value.len + 1; // key=value\n
     var len: usize = body + 2; // one digit + the space
     while (std.fmt.count("{d}", .{len}) + 1 + body != len) len += 1;
-    return std.fmt.bufPrint(buf, "{d} {s}={s}\n", .{ len, key, value }) catch unreachable;
+    return std.mem.print(buf, "{d} {s}={s}\n", .{ len, key, value }) catch unreachable;
 }
 
 /// An archive of one pax 'x' header carrying `payload`, then `entry_block`
@@ -2277,7 +2277,7 @@ test "packDir: statx numeric attrs survive the round-trip (Linux)" {
     var rootbuf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_len = try tmp.dir.realPath(io, &rootbuf);
     var root: [std.fs.max_path_bytes]u8 = undefined;
-    const root_path = try std.fmt.bufPrint(&root, "{s}/tree", .{rootbuf[0..tmp_len]});
+    const root_path = try std.mem.print(&root, "{s}/tree", .{rootbuf[0..tmp_len]});
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
     defer aw.deinit();
@@ -2337,10 +2337,10 @@ test "packDirToPath: round-trips through the reader, same stats as packDir" {
     var rootbuf: [std.fs.max_path_bytes]u8 = undefined;
     const tmp_len = try tmp.dir.realPath(io, &rootbuf);
     var root: [std.fs.max_path_bytes]u8 = undefined;
-    const root_path = try std.fmt.bufPrint(&root, "{s}/tree", .{rootbuf[0..tmp_len]});
+    const root_path = try std.mem.print(&root, "{s}/tree", .{rootbuf[0..tmp_len]});
 
     var outbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const out_path = try std.fmt.bufPrint(&outbuf, "{s}/out.tar.gz", .{rootbuf[0..tmp_len]});
+    const out_path = try std.mem.print(&outbuf, "{s}/out.tar.gz", .{rootbuf[0..tmp_len]});
 
     const stats = try packDirToPath(io, gpa, &.{root_path}, out_path);
     try testing.expectEqual(@as(usize, 1), stats.files);
@@ -2528,7 +2528,7 @@ fn recomputeChecksum(block: []u8) void {
     @memset(block[148..156], ' ');
     var sum: u32 = 0;
     for (block[0..block_size]) |b| sum += b;
-    _ = std.fmt.bufPrint(block[148..], "{o:0>6}\x00 ", .{sum}) catch unreachable;
+    _ = std.mem.print(block[148..], "{o:0>6}\x00 ", .{sum}) catch unreachable;
 }
 
 test "fuzz: Reader.next/read never panic on an arbitrary archive" {
@@ -2760,11 +2760,11 @@ test "GNU tar extracts + lists our archive (external cross-check)" {
         const res = (try systemTar(gpa, io, tmp.dir, &.{ "tar", "--numeric-owner", "-tvf", "ours.tar" })).?;
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, "hello.txt") != null);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, "1234/4321") != null);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, " 12 ") != null); // hello.txt size
-        try testing.expect(std.mem.indexOf(u8, res.stdout, long_path) != null);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, "sub/link -> ../hello.txt") != null);
+        try testing.expect(std.mem.find(u8, res.stdout, "hello.txt") != null);
+        try testing.expect(std.mem.find(u8, res.stdout, "1234/4321") != null);
+        try testing.expect(std.mem.find(u8, res.stdout, " 12 ") != null); // hello.txt size
+        try testing.expect(std.mem.find(u8, res.stdout, long_path) != null);
+        try testing.expect(std.mem.find(u8, res.stdout, "sub/link -> ../hello.txt") != null);
     }
 
     // `tar xf` extracts the right bytes.
@@ -2849,9 +2849,9 @@ test "GNU tar lists + extracts our pax-mode archive (external cross-check of the
         const res = (try systemTar(gpa, io, tmp.dir, &.{ "tar", "--numeric-owner", "--full-time", "-tvvf", "ours-pax.tar" })).?;
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, "5000000/6000000") != null);
-        try testing.expect(std.mem.indexOf(u8, res.stdout, ":07.5 " ++ long_path) != null); // the .5 s survived
-        try testing.expect(std.mem.indexOf(u8, res.stdout, "link -> " ++ long_target) != null);
+        try testing.expect(std.mem.find(u8, res.stdout, "5000000/6000000") != null);
+        try testing.expect(std.mem.find(u8, res.stdout, ":07.5 " ++ long_path) != null); // the .5 s survived
+        try testing.expect(std.mem.find(u8, res.stdout, "link -> " ++ long_target) != null);
     }
     {
         try tmp.dir.createDirPath(io, "out");
@@ -3041,7 +3041,7 @@ test "checksum: all 8 field bytes count as spaces, and a signed sum is accepted"
     @memset(block[148..156], ' ');
     var sum: u64 = 0;
     for (block) |b| sum += b;
-    _ = try std.fmt.bufPrint(block[148..156], "{o:0>7}\x00", .{sum});
+    _ = try std.mem.print(block[148..156], "{o:0>7}\x00", .{sum});
     @memcpy(abuf[0..block_size], &block);
     try testing.expectEqual(@as(?ReadError, null), try firstReadError(&abuf));
 
@@ -3049,7 +3049,7 @@ test "checksum: all 8 field bytes count as spaces, and a signed sum is accepted"
     @memset(block[148..156], ' ');
     var signed: i64 = 0;
     for (block) |b| signed += @as(i8, @bitCast(b));
-    _ = try std.fmt.bufPrint(block[148..156], "{o:0>6}\x00 ", .{@as(u64, @intCast(signed))});
+    _ = try std.mem.print(block[148..156], "{o:0>6}\x00 ", .{@as(u64, @intCast(signed))});
     @memcpy(abuf[0..block_size], &block);
     try testing.expectEqual(@as(?ReadError, null), try firstReadError(&abuf));
 }
@@ -3096,7 +3096,7 @@ test "writer: 8 GiB - 1 is still octal; 8 GiB needs base-256, and a pax 'size' r
     try Writer.initOptions(&w, .{ .long_names = .pax }).writeHeader(.{ .path = "f", .size = 0o100000000000 });
     const out = w.buffered();
     try testing.expectEqual(@as(u8, 'x'), out[156]);
-    try testing.expect(std.mem.indexOf(u8, out[block_size .. 2 * block_size], "size=8589934592\n") != null);
+    try testing.expect(std.mem.find(u8, out[block_size .. 2 * block_size], "size=8589934592\n") != null);
     try testing.expectEqual(@as(u8, 0x80), out[2 * block_size + 124]); // base-256 in the entry's own field
 }
 

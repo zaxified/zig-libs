@@ -507,7 +507,7 @@ pub const Party = struct {
         std.mem.sort(u32, sorted, {}, std.sort.asc(u32));
         for (sorted[1..], 0..) |s, i| if (s == sorted[i]) return error.InvalidParameters;
         if (sorted[0] == 0) return error.InvalidParameters;
-        const me = std.mem.indexOfScalar(u32, sorted, share.index) orelse return error.InvalidParameters;
+        const me = std.mem.findScalar(u32, sorted, share.index) orelse return error.InvalidParameters;
         for (sorted) |idx| {
             var count: usize = 0;
             for (share.public_keys.entries) |e| count += @intFromBool(e.index == idx);
@@ -713,7 +713,7 @@ pub const Party = struct {
             const h = peekHeader(msg) catch continue;
             // A bus that hands a party its own broadcast back is not a fault.
             if (h.from == self.myIndex()) continue;
-            const pos = std.mem.indexOfScalar(u32, self.signers, h.from) orelse continue;
+            const pos = std.mem.findScalar(u32, self.signers, h.from) orelse continue;
             if (msg.len < header_length + signature_length) continue;
             const body = msg[header_length .. msg.len - signature_length];
             var att: Attestation = .{ .body_hash = undefined, .signature = msg[msg.len - signature_length ..][0..signature_length].* };
@@ -956,7 +956,7 @@ pub const Party = struct {
         for (inbox) |raw| {
             const h = peekHeader(raw) catch unreachable;
             if (h.from == self.myIndex() or h.to == null) continue;
-            const pos = std.mem.indexOfScalar(u32, self.signers, h.from).?;
+            const pos = std.mem.findScalar(u32, self.signers, h.from).?;
             if (self.open[pos].round2 == null) self.open[pos].round2 = try self.allocator.dupe(u8, raw);
         }
         const me = &self.peers[self.me];
@@ -1685,7 +1685,7 @@ pub const PresignaturePublic = struct {
             // As in `Party.collect`: only a share its sender signed for this
             // session is evidence against it; noise is dropped (review F3).
             const h = peekHeader(msg) catch continue;
-            const pos = std.mem.indexOfScalar(u32, self.signers, h.from) orelse continue;
+            const pos = std.mem.findScalar(u32, self.signers, h.from) orelse continue;
             if (msg.len < header_length + signature_length) continue;
             const body = msg[header_length .. msg.len - signature_length];
             var att: Attestation = .{ .body_hash = undefined, .signature = msg[msg.len - signature_length ..][0..signature_length].* };
@@ -1874,7 +1874,7 @@ pub const Presignature = struct {
             off += 4;
             if (sg.* == 0 or (i > 0 and sg.* <= signers[i - 1])) return error.InvalidEncoding;
         }
-        const pos = std.mem.indexOfScalar(u32, signers, index) orelse return error.InvalidEncoding;
+        const pos = std.mem.findScalar(u32, signers, index) orelse return error.InvalidEncoding;
         const r_point = Element.fromBytes(bytes[off..][0..Ne].*) catch return error.InvalidEncoding;
         off += Ne;
         const r = decodeScalar(bytes[off..][0..Ns].*) orelse return error.InvalidEncoding;
@@ -2647,7 +2647,7 @@ fn expectNoMaskInOpenings(parties: []Party, openings: []const Outbox) !void {
             try testing.expect(beta >> (8 * zkproofs.beta_prime_bytes) == 0); // the rebuild is right
             std.mem.writeInt(u4096, &wide, beta, .big);
             const enc = wide[wide.len - zkproofs.beta_prime_bytes ..];
-            for (openings) |o| try testing.expect(std.mem.indexOf(u8, o.messages[0].bytes, enc) == null);
+            for (openings) |o| try testing.expect(std.mem.find(u8, o.messages[0].bytes, enc) == null);
         }
     }
 }

@@ -123,7 +123,7 @@ test {
 }
 
 test "meta.model_after names BOLT#4" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BOLT#4") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BOLT#4") != null);
 }
 
 test "meta.deps is {\"k256\"} (curve group; byte-exact to std)" {

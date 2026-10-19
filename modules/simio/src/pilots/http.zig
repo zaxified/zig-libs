@@ -117,7 +117,7 @@ fn serveConnInner(io: Io, stream: net.Stream, srv: *Server) !void {
 // ── the client ─────────────────────────────────────────────────────────────
 
 fn url(buf: []u8, ip: [4]u8, path: []const u8) []const u8 {
-    return std.fmt.bufPrint(buf, "http://{d}.{d}.{d}.{d}{s}", .{ ip[0], ip[1], ip[2], ip[3], path }) catch unreachable;
+    return std.mem.print(buf, "http://{d}.{d}.{d}.{d}{s}", .{ ip[0], ip[1], ip[2], ip[3], path }) catch unreachable;
 }
 
 fn get(c: *http.Client, gpa: std.mem.Allocator, ip: [4]u8, path: []const u8) ![]u8 {
@@ -163,7 +163,7 @@ fn fetcher(io: Io, gpa: std.mem.Allocator, f: *Fetcher) !void {
 fn fetchOne(io: Io, client: *http.Client, gpa: std.mem.Allocator, f: *Fetcher) !void {
     _ = io;
     var pb: [16]u8 = undefined;
-    const path = std.fmt.bufPrint(&pb, "/data/{d}", .{f.next}) catch unreachable;
+    const path = std.mem.print(&pb, "/data/{d}", .{f.next}) catch unreachable;
     const body = try get(client, gpa, f.server_ip, path);
     defer gpa.free(body);
     if (!bodyOk(f.next, body)) f.wrong = true;

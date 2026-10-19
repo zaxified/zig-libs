@@ -50,7 +50,7 @@ const Ctx = struct {
 };
 
 fn sizeIndex(n: usize) usize {
-    return std.mem.indexOfScalar(usize, &sizes, n).?;
+    return std.mem.findScalar(usize, &sizes, n).?;
 }
 
 fn once(x: *Ctx) usize {
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (sizes, 0..) |n, i| {
         ctx.msgs[i] = try arena.alloc(u8, n);
         r.bytes(ctx.msgs[i]);
-        try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "msg{d}.bin", .{n}), .data = ctx.msgs[i] });
+        try dir.writeFile(io, .{ .sub_path = try arena.print("msg{d}.bin", .{n}), .data = ctx.msgs[i] });
         for (0..2) |b| ctx.cts[b][i] = try arena.alloc(u8, n);
         ctx.c128.encrypt(ctx.cts[0][i], &ctx.tags[0][i], ctx.msgs[i], &ctx.ad, ctx.nonce);
         ctx.c256.encrypt(ctx.cts[1][i], &ctx.tags[1][i], ctx.msgs[i], &ctx.ad, ctx.nonce);
@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ws: std.ArrayList(Work) = .empty;
     for ([_]u16{ 128, 256 }) |bits| for ([_]bool{ false, true }) |decrypt| for (sizes) |n| {
-        const name = try std.fmt.allocPrint(arena, "aes{d}_{s}_{d}", .{ bits, if (decrypt) "dec" else "enc", n });
+        const name = try arena.print("aes{d}_{s}_{d}", .{ bits, if (decrypt) "dec" else "enc", n });
         try ws.append(arena, .{ .name = name, .op = .{ .bits = bits, .decrypt = decrypt, .size = n }, .ref = name });
     };
 

@@ -159,7 +159,7 @@ pub fn headerTextNeedsEncoding(s: []const u8) bool {
         if (c >= 0x80 or c < 32 or c == 127) return true;
     }
     // A literal "=?" would be read back as the start of an encoded word.
-    return std.mem.indexOf(u8, s, "=?") != null;
+    return std.mem.find(u8, s, "=?") != null;
 }
 
 /// Length of one UTF-8 sequence starting at `s[0]`; 1 for anything invalid, so
@@ -384,17 +384,17 @@ pub fn writeAddress(f: *Folder, a: Address, trailing: []const u8, opts: Options)
             if (!any) {
                 // A name of only whitespace behaves as no name at all.
                 var buf: [512]u8 = undefined;
-                const angle = std.fmt.bufPrint(&buf, "<{s}>{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
+                const angle = std.mem.print(&buf, "<{s}>{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
                 try f.token(angle);
                 return;
             }
         }
         var buf: [512]u8 = undefined;
-        const angle = std.fmt.bufPrint(&buf, "<{s}>{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
+        const angle = std.mem.print(&buf, "<{s}>{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
         try f.token(angle);
     } else {
         var buf: [512]u8 = undefined;
-        const bare = std.fmt.bufPrint(&buf, "{s}{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
+        const bare = std.mem.print(&buf, "{s}{s}", .{ a.addr, trailing }) catch return error.LineTooLong;
         try f.token(bare);
     }
 }
@@ -696,7 +696,7 @@ test "a fold_at too small for the encoded-word overhead is a clean error, not an
     // A fold_at with just enough room still works.
     const out = try renderHeader(gpa, writeUnstructured, .{ "Subject", "žluťoučký kůň", Options{ .fold_at = 20 } });
     defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "=?utf-8?") != null);
+    try testing.expect(std.mem.find(u8, out, "=?utf-8?") != null);
 }
 
 test "RFC 2047: non-ASCII subjects become encoded words under 76 octets" {
@@ -739,11 +739,11 @@ test "RFC 2047: B and Q are both produced and both decode" {
     // Mostly-ASCII text prefers Q...
     const q = try renderHeader(gpa, writeUnstructured, .{ "Subject", "Hello wörld", Options{} });
     defer gpa.free(q);
-    try testing.expect(std.mem.indexOf(u8, q, "?Q?") != null);
+    try testing.expect(std.mem.find(u8, q, "?Q?") != null);
     // ...text that is almost all non-ASCII prefers B.
     const b = try renderHeader(gpa, writeUnstructured, .{ "Subject", "ěščřžýáíé", Options{} });
     defer gpa.free(b);
-    try testing.expect(std.mem.indexOf(u8, b, "?B?") != null);
+    try testing.expect(std.mem.find(u8, b, "?B?") != null);
 
     for ([_][]const u8{ q, b }) |out| {
         var joined: std.ArrayList(u8) = .empty;
@@ -754,7 +754,7 @@ test "RFC 2047: B and Q are both produced and both decode" {
         }
         try testing.expect(joined.items.len != 0);
     }
-    try testing.expect(std.mem.indexOf(u8, q, "w=C3=B6rld") != null);
+    try testing.expect(std.mem.find(u8, q, "w=C3=B6rld") != null);
 }
 
 test "a literal '=?' in an ASCII subject is encoded so it is not read back as a word" {
@@ -775,8 +775,8 @@ fn decodeEncodedWord(gpa: std.mem.Allocator, word: []const u8, out: *std.ArrayLi
     try testing.expect(std.mem.startsWith(u8, word, "=?"));
     try testing.expect(std.mem.endsWith(u8, word, "?="));
     const inner = word[2 .. word.len - 2];
-    const q1 = std.mem.indexOfScalar(u8, inner, '?').?;
-    const q2 = std.mem.indexOfScalarPos(u8, inner, q1 + 1, '?').?;
+    const q1 = std.mem.findScalar(u8, inner, '?').?;
+    const q2 = std.mem.findScalarPos(u8, inner, q1 + 1, '?').?;
     const enc = inner[q1 + 1 .. q2];
     const payload = inner[q2 + 1 ..];
     if (enc[0] == 'B' or enc[0] == 'b') {
@@ -838,8 +838,8 @@ test "address headers: display names plain, quoted and encoded" {
     {
         const out = try renderHeader(gpa, writeAddressList, .{ "To", &[_]Address{.{ .name = "Bůh", .addr = "b@example.net" }}, Options{} });
         defer gpa.free(out);
-        try testing.expect(std.mem.indexOf(u8, out, "=?utf-8?") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "<b@example.net>") != null);
+        try testing.expect(std.mem.find(u8, out, "=?utf-8?") != null);
+        try testing.expect(std.mem.find(u8, out, "<b@example.net>") != null);
     }
     {
         // A name containing a quote is escaped, not dropped.
@@ -863,8 +863,8 @@ test "a long address list folds between addresses and keeps every comma" {
     var it = std.mem.splitSequence(u8, out[0 .. out.len - 2], "\r\n");
     while (it.next()) |l| try testing.expect(l.len <= 78);
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, out, ","));
-    try testing.expect(std.mem.indexOf(u8, out, "<four@example.com>") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "four@example.com") != null);
+    try testing.expect(std.mem.find(u8, out, "<four@example.com>") == null);
+    try testing.expect(std.mem.find(u8, out, "four@example.com") != null);
 }
 
 test "quoted-printable: the RFC 2045 §6.7 rules" {
@@ -1057,7 +1057,7 @@ test "corpus: every header seed reaches the renderers, and the counts are pinned
         if (renderHeader(gpa, writeUnstructured, .{ "Subject", value, Options{} })) |out| {
             defer gpa.free(out);
             rendered += 1;
-            if (std.mem.indexOf(u8, out, "=?utf-8?") != null) encoded_words += 1;
+            if (std.mem.find(u8, out, "=?utf-8?") != null) encoded_words += 1;
         } else |_| {}
     }
     try testing.expectEqual(header_seeds.len, nonempty);

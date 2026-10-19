@@ -639,9 +639,9 @@ fn detectEncoding(input: []const u8) ParseError!SourceEncoding {
 /// `s`, by a plain ASCII scan bounded to the declaration — or null.
 fn declaredEncoding(s: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, s, "<?xml") or s.len < 6 or !isWs(s[5])) return null;
-    const end = std.mem.indexOf(u8, s[0..@min(s.len, 512)], "?>") orelse return null;
+    const end = std.mem.find(u8, s[0..@min(s.len, 512)], "?>") orelse return null;
     const decl = s[0..end];
-    const at = std.mem.indexOf(u8, decl, "encoding") orelse return null;
+    const at = std.mem.find(u8, decl, "encoding") orelse return null;
     var i = at + "encoding".len;
     while (i < decl.len and isWs(decl[i])) i += 1;
     if (i >= decl.len or decl[i] != '=') return null;
@@ -649,7 +649,7 @@ fn declaredEncoding(s: []const u8) ?[]const u8 {
     while (i < decl.len and isWs(decl[i])) i += 1;
     if (i >= decl.len or (decl[i] != '"' and decl[i] != '\'')) return null;
     const q = decl[i];
-    const close = std.mem.indexOfScalarPos(u8, decl, i + 1, q) orelse return null;
+    const close = std.mem.findScalarPos(u8, decl, i + 1, q) orelse return null;
     return decl[i + 1 .. close];
 }
 
@@ -1095,14 +1095,14 @@ const Parser = struct {
             try self.requireWs();
         }
         const name = try self.parseNameRaw();
-        if (std.mem.indexOfScalar(u8, name, ':') != null) return error.NamespaceError;
+        if (std.mem.findScalar(u8, name, ':') != null) return error.NamespaceError;
         try self.requireWs();
         const q = self.peek() orelse return error.UnexpectedEof;
         var value: ?[]const u8 = null;
         if (q == '"' or q == '\'') {
             self.i += 1;
             const start = self.i;
-            const close = std.mem.indexOfScalarPos(u8, self.src, start, q) orelse return error.UnexpectedEof;
+            const close = std.mem.findScalarPos(u8, self.src, start, q) orelse return error.UnexpectedEof;
             const raw = self.src[start..close];
             self.i = close + 1;
             if (!parameter) value = try self.entityValue(raw);
@@ -1145,7 +1145,7 @@ const Parser = struct {
             const c = lit[k];
             if (c == '%') return error.UnsupportedEntity;
             if (c == '&') {
-                const semi = std.mem.indexOfScalarPos(u8, lit, k + 1, ';') orelse return error.UndefinedEntity;
+                const semi = std.mem.findScalarPos(u8, lit, k + 1, ';') orelse return error.UndefinedEntity;
                 const ref = lit[k + 1 .. semi];
                 if (ref.len == 0) return error.UndefinedEntity;
                 if (ref[0] == '#') {
@@ -1183,7 +1183,7 @@ const Parser = struct {
             const c = text[k];
             if (c == '<') return if (in_attr) error.UnexpectedChar else error.UnsupportedEntity;
             if (c == '&') {
-                const semi = std.mem.indexOfScalarPos(u8, text, k + 1, ';') orelse return error.UndefinedEntity;
+                const semi = std.mem.findScalarPos(u8, text, k + 1, ';') orelse return error.UndefinedEntity;
                 const ref = text[k + 1 .. semi];
                 if (ref.len == 0) return error.UndefinedEntity;
                 if (ref[0] == '#') {
@@ -1243,7 +1243,7 @@ const Parser = struct {
         // This module always applies namespace
         // processing, so this NSC is enforced unconditionally (xmlconf
         // rmt-ns10-042, errata NE08).
-        if (std.mem.indexOfScalar(u8, target, ':') != null) return error.NamespaceError;
+        if (std.mem.findScalar(u8, target, ':') != null) return error.NamespaceError;
         var data: []const u8 = "";
         if (!self.starts("?>")) {
             try self.requireWs();
@@ -1335,7 +1335,7 @@ const Parser = struct {
 
     fn decodeReferenceIn(self: *Parser, out: *std.ArrayList(u8), in_attr: bool) ParseError!void {
         std.debug.assert(self.src[self.i] == '&');
-        const semi = std.mem.indexOfScalarPos(u8, self.src, self.i + 1, ';') orelse return error.UndefinedEntity;
+        const semi = std.mem.findScalarPos(u8, self.src, self.i + 1, ';') orelse return error.UndefinedEntity;
         const name = self.src[self.i + 1 .. semi];
         if (name.len == 0) return error.UndefinedEntity;
         if (name[0] != '#' and predefinedEntity(name) == null and self.opts.doctype == .internal_entities) {
@@ -1631,11 +1631,11 @@ const Parser = struct {
         const raw = try self.parseNameRaw();
         // Split on a single colon (QName). Zero or one colon allowed; both
         // parts must be non-empty when a colon is present.
-        if (std.mem.indexOfScalar(u8, raw, ':')) |ci| {
+        if (std.mem.findScalar(u8, raw, ':')) |ci| {
             const prefix = raw[0..ci];
             const local = raw[ci + 1 ..];
             if (prefix.len == 0 or local.len == 0) return error.InvalidName;
-            if (std.mem.indexOfScalar(u8, local, ':') != null) return error.InvalidName;
+            if (std.mem.findScalar(u8, local, ':') != null) return error.InvalidName;
             return .{ .prefix = prefix, .local = local };
         }
         return .{ .prefix = "", .local = raw };
@@ -1737,7 +1737,7 @@ const Parser = struct {
     /// Allocates only when the body actually contains a `\r`, so the common
     /// case (none) still returns the original slice unchanged.
     fn normalizeLineEndings(a: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
-        if (std.mem.indexOfScalar(u8, s, '\r') == null) return s;
+        if (std.mem.findScalar(u8, s, '\r') == null) return s;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
         var idx: usize = 0;
@@ -2230,7 +2230,7 @@ test "wf: a reserved PI target is reserved in every ASCII case, not just lowerca
     const gpa = testing.allocator;
     for ([_][]const u8{ "xml", "xmL", "xMl", "xML", "Xml", "XmL", "XMl", "XML" }) |t| {
         var src_buf: [32]u8 = undefined;
-        const src = try std.fmt.bufPrint(&src_buf, "<a><?{s} d?></a>", .{t});
+        const src = try std.mem.print(&src_buf, "<a><?{s} d?></a>", .{t});
         try testing.expectError(error.MalformedPI, parse(gpa, src, .{}));
     }
     var doc = try parse(gpa, "<a><?xmlfoo d?></a>", .{}); // NOT reserved: not equal to "xml"
@@ -2848,11 +2848,11 @@ test "complexity: Element.resolveNs is O(1) in depth and in declaration count" {
         var name: [32]u8 = undefined;
         var total: usize = 0;
         for (0..k) |i| {
-            const pfx = try std.fmt.bufPrint(&name, "p{d}", .{i});
+            const pfx = try std.mem.print(&name, "p{d}", .{i});
             var probes: usize = 0;
             const uri = doc.root.resolveNsCounted(pfx, &probes) orelse return error.TestUnexpectedResult;
             var want: [32]u8 = undefined;
-            try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "urn:x{d}", .{i}), uri);
+            try testing.expectEqualStrings(try std.mem.print(&want, "urn:x{d}", .{i}), uri);
             total += probes;
         }
         try testing.expect(total <= 6 * k);

@@ -145,7 +145,7 @@ pub const Capabilities = struct {
 };
 
 fn firstToken(s: []const u8) []const u8 {
-    const end = std.mem.indexOfAny(u8, s, " \t") orelse s.len;
+    const end = std.mem.findAny(u8, s, " \t") orelse s.len;
     return s[0..end];
 }
 

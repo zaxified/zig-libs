@@ -56,8 +56,8 @@ pub fn parseProcStat(line: []const u8) ?ProcessEntry {
 /// `page_size` below 1 KiB counts as 1 KiB (`rss_kb` is a whole-kB figure).
 pub fn parseProcStatWithPage(line: []const u8, page_size: usize) ?ProcessEntry {
     const kb_per_page: u64 = @max(page_size / 1024, 1);
-    const lp = std.mem.indexOfScalar(u8, line, '(') orelse return null;
-    const rp = std.mem.lastIndexOfScalar(u8, line, ')') orelse return null;
+    const lp = std.mem.findScalar(u8, line, '(') orelse return null;
+    const rp = std.mem.findScalarLast(u8, line, ')') orelse return null;
     if (rp <= lp) return null;
 
     const pid_s = std.mem.trim(u8, line[0..lp], " \t\n");
@@ -108,7 +108,7 @@ pub fn listProcesses(gpa: std.mem.Allocator, io: std.Io, max: usize) std.mem.All
         _ = std.fmt.parseInt(u32, entry.name, 10) catch continue; // numeric dirs = pids
 
         var pb: [64]u8 = undefined;
-        const path = std.fmt.bufPrint(&pb, "/proc/{s}/stat", .{entry.name}) catch continue;
+        const path = std.mem.print(&pb, "/proc/{s}/stat", .{entry.name}) catch continue;
         const text = procnet.readVirtualFile(gpa, io, path, 4096) orelse continue;
         defer gpa.free(text);
         const pe = parseProcStat(text) orelse continue;
@@ -299,7 +299,7 @@ pub fn indexSocketOwners(
         }
 
         var fd_path_buf: [64]u8 = undefined;
-        const fd_path = std.fmt.bufPrint(&fd_path_buf, "/proc/{d}/fd", .{pid}) catch continue;
+        const fd_path = std.mem.print(&fd_path_buf, "/proc/{d}/fd", .{pid}) catch continue;
         var fd_dir = std.Io.Dir.cwd().openDir(io, fd_path, .{ .iterate = true }) catch |err| {
             switch (err) {
                 // The two refusals `/proc/<pid>/fd` actually produces for a
@@ -351,7 +351,7 @@ pub fn indexSocketOwners(
             if (!name_read) {
                 name_read = true;
                 var sp_buf: [64]u8 = undefined;
-                if (std.fmt.bufPrint(&sp_buf, "/proc/{d}/stat", .{pid}) catch null) |sp| {
+                if (std.mem.print(&sp_buf, "/proc/{d}/stat", .{pid}) catch null) |sp| {
                     if (procnet.readVirtualFile(gpa, io, sp, 4096)) |text| {
                         defer gpa.free(text);
                         if (parseProcStat(text)) |pe| name_len = @intCast(procnet.copyClamped(&name_buf, pe.name()));

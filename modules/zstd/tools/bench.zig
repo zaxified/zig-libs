@@ -45,9 +45,9 @@ const ops = [_]Op{
 fn selected(filters: []const [:0]const u8, file: []const u8, op: Op) bool {
     if (filters.len == 0) return true;
     var buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrint(&buf, "{s}.{s}", .{ file, op.tag }) catch return true;
+    const name = std.mem.print(&buf, "{s}.{s}", .{ file, op.tag }) catch return true;
     for (filters) |f| {
-        const hit = if (std.mem.indexOfScalar(u8, f, '.') != null) std.mem.eql(u8, name, f) else std.mem.indexOf(u8, name, f) != null;
+        const hit = if (std.mem.findScalar(u8, f, '.') != null) std.mem.eql(u8, name, f) else std.mem.find(u8, name, f) != null;
         if (hit) return true;
     }
     return false;
@@ -140,7 +140,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer dir.close(io);
 
     const so = init.environ_map.get("LIBZSTD_SO") orelse default_so;
-    const exe = try std.fmt.allocPrint(arena, "{s}/libzstd_bench", .{abs});
+    const exe = try arena.print("{s}/libzstd_bench", .{abs});
     std.debug.print("bench-zstd: building the libzstd side against {s} ...\n", .{so});
     const cc = try std.process.run(arena, io, .{ .argv = &.{ "zig", "cc", "-O3", "-march=native", "modules/zstd/tools/c_bench/libzstd_bench.c", so, "-o", exe } });
     if (cc.term != .exited or cc.term.exited != 0) {
@@ -165,18 +165,18 @@ pub fn main(init: std.process.Init) !u8 {
     var metric_cycles = true;
     var reference: []const u8 = "";
     for (files) |fname| {
-        const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ corpus_abs, fname });
+        const path = try arena.print("{s}/{s}", .{ corpus_abs, fname });
         const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 30));
         defer gpa.free(src);
         const out = try gpa.alloc(u8, zstd.compressBound(src.len));
         defer gpa.free(out);
         for (ops) |op| {
             if (!selected(filters, fname, op)) continue;
-            const name = try std.fmt.allocPrint(arena, "{s}.{s}", .{ fname, op.tag });
+            const name = try arena.print("{s}.{s}", .{ fname, op.tag });
             const frame_buf = try gpa.alloc(u8, zstd.compressBound(src.len));
             defer gpa.free(frame_buf);
             const flen = try c.compress(frame_buf, src, .{ .level = op.level });
-            const line = try std.fmt.allocPrint(arena, "{s}\t{s}\t{d}\t{s}\n", .{ name, if (op.decompress) "d" else "c", op.level, path });
+            const line = try arena.print("{s}\t{s}\t{d}\t{s}\n", .{ name, if (op.decompress) "d" else "c", op.level, path });
             try dir.writeFile(io, .{ .sub_path = "workloads.tsv", .data = line });
             // The two sides alternate, `rounds` times, each keeping its best:
             // timed one after the other they would see different loads of a

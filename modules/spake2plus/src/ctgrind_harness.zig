@@ -141,10 +141,10 @@ fn passwordBytes(label: []const u8) [80]u8 {
     var out: [80]u8 = undefined;
     var wide: [64]u8 = undefined;
     var buf: [96]u8 = undefined;
-    const msg0 = std.fmt.bufPrint(&buf, "ctgrind-spake2plus-harness-v1-{s}-block0", .{label}) catch unreachable;
+    const msg0 = std.mem.print(&buf, "ctgrind-spake2plus-harness-v1-{s}-block0", .{label}) catch unreachable;
     std.crypto.hash.sha2.Sha512.hash(msg0, &wide, .{});
     @memcpy(out[0..64], &wide);
-    const msg1 = std.fmt.bufPrint(&buf, "ctgrind-spake2plus-harness-v1-{s}-block1", .{label}) catch unreachable;
+    const msg1 = std.mem.print(&buf, "ctgrind-spake2plus-harness-v1-{s}-block1", .{label}) catch unreachable;
     std.crypto.hash.sha2.Sha512.hash(msg1, &wide, .{});
     @memcpy(out[64..80], wide[0..16]);
     return out;

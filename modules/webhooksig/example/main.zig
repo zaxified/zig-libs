@@ -127,7 +127,7 @@ pub fn main() !void {
     var req_buf3: [512]u8 = undefined;
     const got_missing = runWire(&r, buildReq(&req_buf3, null, body), &resp_buf);
     if (!std.mem.eql(u8, statusOf(got_missing), "401")) return error.ExpectedRejected;
-    if (std.mem.indexOf(u8, got_missing, "WWW-Authenticate: Signature") == null) return error.MissingChallenge;
+    if (std.mem.find(u8, got_missing, "WWW-Authenticate: Signature") == null) return error.MissingChallenge;
     std.debug.print("missing signature header over the wire: 401 with WWW-Authenticate\n", .{});
 
     // ── Standard Webhooks (the Svix scheme), against its reference vector ──

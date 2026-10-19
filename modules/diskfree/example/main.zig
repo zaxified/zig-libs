@@ -278,7 +278,7 @@ fn formatUsePercent(buf: *[5]u8, used_1k: u64, avail_1k: u64) []const u8 {
     const denom = used_1k + avail_1k;
     if (denom == 0) return "    -";
     const pct = (used_1k * 100 + denom - 1) / denom; // ceiling division
-    return std.fmt.bufPrint(buf, "{d:>3}%", .{pct}) catch "?";
+    return std.mem.print(buf, "{d:>3}%", .{pct}) catch "?";
 }
 
 fn trackMargin(u: diskfree.Usage, device: []const u8, mount_point: []const u8, max_margin_1k: *u64, row_buf: []u8, row_len: *usize) void {
@@ -288,7 +288,7 @@ fn trackMargin(u: diskfree.Usage, device: []const u8, mount_point: []const u8, m
     const margin = free_1k - avail_1k;
     if (margin <= max_margin_1k.*) return;
     max_margin_1k.* = margin;
-    const s = std.fmt.bufPrint(row_buf, "{s} ({s})", .{ mount_point, device }) catch {
+    const s = std.mem.print(row_buf, "{s} ({s})", .{ mount_point, device }) catch {
         row_len.* = 0;
         return;
     };
@@ -405,7 +405,7 @@ fn runMountinfo(gpa: Allocator, io: std.Io) !u8 {
     var with_propagation: usize = 0;
     for (mnts) |m| {
         var mm_buf: [16]u8 = undefined;
-        const mm = std.fmt.bufPrint(&mm_buf, "{d}:{d}", .{ m.dev_major, m.dev_minor }) catch "?";
+        const mm = std.mem.print(&mm_buf, "{d}:{d}", .{ m.dev_major, m.dev_minor }) catch "?";
         const prop = if (m.optional_fields.len > 0) m.optional_fields else "(none)";
         if (m.optional_fields.len > 0) with_propagation += 1;
         try out.print("{d:>5} {d:>6} {s:>8} {s:<28} {s:<10} {s}\n", .{ m.mount_id, m.parent_id, mm, m.mount_point, m.fs_type, prop });

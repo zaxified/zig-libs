@@ -950,7 +950,7 @@ pub const Client = struct {
     }
 
     fn hasInbound(c: *const Client, id: u16) bool {
-        return std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) != null;
+        return std.mem.findScalar(u16, c.inbound_qos2[0..c.inbound_len], id) != null;
     }
 
     fn addInbound(c: *Client, id: u16) Error!void {
@@ -960,7 +960,7 @@ pub const Client = struct {
     }
 
     fn removeInbound(c: *Client, id: u16) bool {
-        const i = std.mem.indexOfScalar(u16, c.inbound_qos2[0..c.inbound_len], id) orelse return false;
+        const i = std.mem.findScalar(u16, c.inbound_qos2[0..c.inbound_len], id) orelse return false;
         c.inbound_len -= 1;
         c.inbound_qos2[i] = c.inbound_qos2[c.inbound_len];
         return true;

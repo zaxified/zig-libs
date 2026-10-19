@@ -76,7 +76,7 @@ test "oracle: records as Python's csv and Go's encoding/csv read them" {
     for (vectors.reads) |c| {
         const read = try readAll(arena, c.text, true);
         const ours = read.records;
-        if (mem.indexOfScalar(u8, c.text, '\n') == null) {
+        if (mem.findScalar(u8, c.text, '\n') == null) {
             const lazy = (try readAll(arena, c.text, false)).records;
             if (!eqlRecords(lazy, ours)) {
                 bad += 1;

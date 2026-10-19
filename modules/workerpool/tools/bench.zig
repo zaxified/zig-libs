@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
-            for (filters) |f| hit = hit or std.mem.indexOf(u8, name, f) != null;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
         var ours: Side = .{};
@@ -241,7 +241,7 @@ pub fn main(init: std.process.Init) !u8 {
 
 /// Build the C side once, so the timed runs do not pay for it.
 fn ccBuild(arena: std.mem.Allocator, io: std.Io, abs: []const u8) ![]const u8 {
-    const exe = try std.fmt.allocPrint(arena, "{s}/thpool_bench", .{abs});
+    const exe = try arena.print("{s}/thpool_bench", .{abs});
     std.debug.print("{s}: building the C side ...\n", .{bench_name});
     const res = std.process.run(arena, io, .{
         .argv = &.{ "zig", "cc", "-O2", "-DDISABLE_PRINT", "-pthread", c_dir ++ "/main.c", c_dir ++ "/thpool/thpool.c", "-o", exe },

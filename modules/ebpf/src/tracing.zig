@@ -170,8 +170,8 @@ pub const ResolveError = error{
 /// rules are testable without any BTF at all.
 pub fn targetName(kind: TargetKind, name: []const u8, buf: []u8) ResolveError![]const u8 {
     if (name.len == 0) return error.InvalidName;
-    if (std.mem.indexOfScalar(u8, name, 0) != null) return error.InvalidName;
-    if (std.mem.indexOfScalar(u8, name, '/') != null) return error.InvalidName;
+    if (std.mem.findScalar(u8, name, 0) != null) return error.InvalidName;
+    if (std.mem.findScalar(u8, name, '/') != null) return error.InvalidName;
     const p = kind.prefix();
     if (p.len + name.len > max_name_len) return error.InvalidName;
     if (p.len + name.len > buf.len) return error.InvalidName;
@@ -496,7 +496,7 @@ pub fn loadProgram(
 
     var license_buf: [64]u8 = undefined;
     if (opts.license.len >= license_buf.len) return error.InvalidArgumentLocal;
-    if (std.mem.indexOfScalar(u8, opts.license, 0) != null) return error.InvalidArgumentLocal;
+    if (std.mem.findScalar(u8, opts.license, 0) != null) return error.InvalidArgumentLocal;
     @memcpy(license_buf[0..opts.license.len], opts.license);
     license_buf[opts.license.len] = 0;
 

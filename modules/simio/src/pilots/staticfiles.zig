@@ -76,7 +76,7 @@ fn clientMain(io: Io, gpa: std.mem.Allocator, probes: []Probe) !void {
     defer c.deinit();
     for (probes) |*p| {
         var ub: [128]u8 = undefined;
-        const url = try std.fmt.bufPrint(&ub, "http://files{s}", .{p.path});
+        const url = try std.mem.print(&ub, "http://files{s}", .{p.path});
         var res = try c.request(.get, url, .{});
         defer res.deinit();
         p.status = res.status;
@@ -127,7 +127,7 @@ fn probeSet() [7]Probe {
 
 fn expectNoSecret(probes: []const Probe) !void {
     for (probes) |p| {
-        if (std.mem.indexOf(u8, p.bodySlice(), secret) != null) return error.SecretLeaked;
+        if (std.mem.find(u8, p.bodySlice(), secret) != null) return error.SecretLeaked;
     }
 }
 

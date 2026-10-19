@@ -1082,7 +1082,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                             }
                             if (hrr_selected) |g| {
                                 // A group we offered, holding no share yet.
-                                if (mem.indexOfScalar(tls.NamedGroup, options.groups, g) == null) return error.TlsIllegalParameter;
+                                if (mem.findScalar(tls.NamedGroup, options.groups, g) == null) return error.TlsIllegalParameter;
                                 for (hello_params.shares) |sh| if (sh.group == g) return error.TlsIllegalParameter;
                             } else if (hrr_cookie == null) return error.TlsIllegalParameter; // "would not result in any change"
                             try initHandshakeCipher(&handshake_cipher, cipher_suite_tag);
@@ -1453,7 +1453,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         // zig-libs tlsclient: one of our groups (and not the
                         // TLS 1.3-only hybrid); its key pair is made now.
                         if (named_group == .x25519_ml_kem768 or
-                            mem.indexOfScalar(tls.NamedGroup, options.groups, named_group) == null) return error.TlsIllegalParameter;
+                            mem.findScalar(tls.NamedGroup, options.groups, named_group) == null) return error.TlsIllegalParameter;
                         key_share.ensure(named_group) catch return error.InsufficientEntropy;
                         try key_share.exchange(named_group, server_pub_key);
                         handshake_state = .server_hello_done;
@@ -1825,11 +1825,11 @@ fn checkGroups(groups: []const tls.NamedGroup, shares: []const tls.NamedGroup) e
     if (groups.len == 0 or groups.len > supported_groups.len) return error.GroupsInvalid;
     for (groups, 0..) |g, i| {
         if (!groupSupported(g)) return error.GroupsInvalid;
-        if (mem.indexOfScalar(tls.NamedGroup, groups[0..i], g) != null) return error.GroupsInvalid;
+        if (mem.findScalar(tls.NamedGroup, groups[0..i], g) != null) return error.GroupsInvalid;
     }
     for (shares, 0..) |g, i| {
-        if (mem.indexOfScalar(tls.NamedGroup, groups, g) == null) return error.GroupsInvalid;
-        if (mem.indexOfScalar(tls.NamedGroup, shares[0..i], g) != null) return error.GroupsInvalid;
+        if (mem.findScalar(tls.NamedGroup, groups, g) == null) return error.GroupsInvalid;
+        if (mem.findScalar(tls.NamedGroup, shares[0..i], g) != null) return error.GroupsInvalid;
     }
 }
 
@@ -1848,7 +1848,7 @@ fn offeredVersions(buf: *[2]tls.ProtocolVersion, min: tls.ProtocolVersion, max: 
 }
 
 fn versionOffered(versions: []const tls.ProtocolVersion, v: tls.ProtocolVersion) bool {
-    return mem.indexOfScalar(tls.ProtocolVersion, versions, v) != null;
+    return mem.findScalar(tls.ProtocolVersion, versions, v) != null;
 }
 
 /// One handshake record holding `msg`. RFC 8446 §5.1: legacy_record_version
@@ -2847,7 +2847,7 @@ pub const default_key_share_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .x255
 pub const std_groups = [_]tls.NamedGroup{ .x25519_ml_kem768, .secp256r1, .secp384r1, .x25519 };
 
 fn groupSupported(g: tls.NamedGroup) bool {
-    return mem.indexOfScalar(tls.NamedGroup, &supported_groups, g) != null;
+    return mem.findScalar(tls.NamedGroup, &supported_groups, g) != null;
 }
 
 const KeyShare = struct {

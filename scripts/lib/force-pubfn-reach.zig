@@ -160,7 +160,7 @@ fn declaredHere(comptime Parent: type, comptime Child: type) bool {
         name[parent.len] == '.') return true;
 
     // Otherwise: does the first path segment name one of this module's files?
-    const head = name[0 .. std.mem.indexOfAny(u8, name, ".(") orelse name.len];
+    const head = name[0 .. std.mem.findAny(u8, name, ".(") orelse name.len];
     // `root` is the one segment that is ambiguous by construction: every
     // module's root file is called `root`, so a sibling zig-libs module
     // re-exported whole is indistinguishable from ours by name. Ours is the

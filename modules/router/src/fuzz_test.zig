@@ -166,7 +166,7 @@ fn reconstruct(a: std.mem.Allocator, pattern: []const u8, caps: []const [2][]con
         if (c == '{') {
             const close = closeOf(pattern, i);
             const inner = pattern[i + 1 .. close];
-            const name = inner[0 .. std.mem.indexOfScalar(u8, inner, ':') orelse inner.len];
+            const name = inner[0 .. std.mem.findScalar(u8, inner, ':') orelse inner.len];
             try out.appendSlice(a, try capValue(caps, name));
             i = close;
         } else if ((c == ':' or c == '*') and (i == 0 or pattern[i - 1] == '/')) {
@@ -187,7 +187,7 @@ fn capValue(caps: []const [2][]const u8, name: []const u8) ![]const u8 {
 
 /// Whether `name` is the pattern's trailing wildcard (`*` or `*name`).
 fn isWildcardName(pattern: []const u8, name: []const u8) bool {
-    const slash = std.mem.lastIndexOfScalar(u8, pattern, '/') orelse return false;
+    const slash = std.mem.findScalarLast(u8, pattern, '/') orelse return false;
     const last = pattern[slash + 1 ..];
     if (last.len == 0 or last[0] != '*') return false;
     return if (last.len == 1) std.mem.eql(u8, name, "*") else std.mem.eql(u8, last[1..], name);
@@ -196,11 +196,11 @@ fn isWildcardName(pattern: []const u8, name: []const u8) bool {
 /// Every constraint of `pattern` holds for its capture.
 fn checkConstraints(a: std.mem.Allocator, pattern: []const u8, caps: []const [2][]const u8) !void {
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, pattern, i, '{')) |open| {
+    while (std.mem.findScalarPos(u8, pattern, i, '{')) |open| {
         const close = closeOf(pattern, open);
         const inner = pattern[open + 1 .. close];
         i = close + 1;
-        const colon = std.mem.indexOfScalar(u8, inner, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, inner, ':') orelse continue;
         hit(.constrained);
         var re = try regex.Regex.compile(a, inner[colon + 1 ..]);
         defer re.deinit(a);
@@ -212,7 +212,7 @@ const Response = struct { status: u16, body: []const u8, allow: ?[]const u8, loc
 
 fn serve(r: *router.Router, method: []const u8, path: []const u8, out_buf: []u8) !Response {
     var req_buf: [600]u8 = undefined;
-    const wire = try std.fmt.bufPrint(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path });
+    const wire = try std.mem.print(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path });
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -227,7 +227,7 @@ fn serve(r: *router.Router, method: []const u8, path: []const u8, out_buf: []u8)
     });
     const resp = out.buffered();
     if (resp.len < 12) return error.NoResponse;
-    const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return error.NoResponse;
+    const head_end = std.mem.find(u8, resp, "\r\n\r\n") orelse return error.NoResponse;
     return .{
         .status = try std.fmt.parseInt(u16, resp[9..12], 10),
         .body = resp[head_end + 4 ..],
@@ -237,9 +237,9 @@ fn serve(r: *router.Router, method: []const u8, path: []const u8, out_buf: []u8)
 }
 
 fn headerValue(head: []const u8, comptime name: []const u8) ?[]const u8 {
-    const i = std.mem.indexOf(u8, head, "\r\n" ++ name ++ ": ") orelse return null;
+    const i = std.mem.find(u8, head, "\r\n" ++ name ++ ": ") orelse return null;
     const start = i + name.len + 4;
-    const end = std.mem.indexOfPos(u8, head, start, "\r\n") orelse head.len;
+    const end = std.mem.findPos(u8, head, start, "\r\n") orelse head.len;
     return head[start..end];
 }
 

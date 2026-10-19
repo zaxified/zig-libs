@@ -134,12 +134,12 @@ pub fn main(init: std.process.Init) !u8 {
     try dir.writeFile(io, .{ .sub_path = "sig.zig.bin", .data = &sig_bytes });
 
     // Build the C side: our harness plus libsecp256k1's three translation units.
-    const exe = try std.fmt.allocPrint(arena, "{s}/secp_bench", .{abs});
-    const inc_api = try std.fmt.allocPrint(arena, "-I{s}/include", .{src_abs});
-    const inc_src = try std.fmt.allocPrint(arena, "-I{s}/src", .{src_abs});
-    const u_main = try std.fmt.allocPrint(arena, "{s}/src/secp256k1.c", .{src_abs});
-    const u_ecmult = try std.fmt.allocPrint(arena, "{s}/src/precomputed_ecmult.c", .{src_abs});
-    const u_gen = try std.fmt.allocPrint(arena, "{s}/src/precomputed_ecmult_gen.c", .{src_abs});
+    const exe = try arena.print("{s}/secp_bench", .{abs});
+    const inc_api = try arena.print("-I{s}/include", .{src_abs});
+    const inc_src = try arena.print("-I{s}/src", .{src_abs});
+    const u_main = try arena.print("{s}/src/secp256k1.c", .{src_abs});
+    const u_ecmult = try arena.print("{s}/src/precomputed_ecmult.c", .{src_abs});
+    const u_gen = try arena.print("{s}/src/precomputed_ecmult_gen.c", .{src_abs});
     std.debug.print("bench-bip340: building the libsecp256k1 side from {s} (zig cc -O3, takes a while) ...\n", .{src});
     const cc = try std.process.run(arena, io, .{ .argv = &.{
         "zig",                          "cc",                          "-O3",

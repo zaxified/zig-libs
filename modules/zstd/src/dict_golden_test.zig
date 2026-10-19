@@ -257,12 +257,12 @@ test "the trainers' messages follow the notification level, as libzstd's" {
         switch (level) {
             0 => try std.testing.expectEqualStrings("", out),
             // only the small-corpus warning is at level 1
-            1 => try std.testing.expect(std.mem.indexOf(u8, out, "Training on") == null),
+            1 => try std.testing.expect(std.mem.find(u8, out, "Training on") == null),
             else => {
                 try std.testing.expect(std.mem.startsWith(u8, out, "Training on 200 samples of total size "));
                 var end: [64]u8 = undefined;
-                try std.testing.expect(std.mem.endsWith(u8, out, try std.fmt.bufPrint(&end, "statistics ... \nConstructed dictionary of size {d}\n", .{n})));
-                try std.testing.expect(std.mem.indexOf(u8, out, "Building dictionary\nBreaking content into ") != null);
+                try std.testing.expect(std.mem.endsWith(u8, out, try std.mem.print(&end, "statistics ... \nConstructed dictionary of size {d}\n", .{n})));
+                try std.testing.expect(std.mem.find(u8, out, "Building dictionary\nBreaking content into ") != null);
             },
         }
     }
@@ -273,5 +273,5 @@ test "the trainers' messages follow the notification level, as libzstd's" {
     const out = w.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "Trying 5 different sets of parameters\n"));
     try std.testing.expect(std.mem.endsWith(u8, out, db.Notify.clear79));
-    try std.testing.expect(std.mem.indexOf(u8, out, "statistics") == null);
+    try std.testing.expect(std.mem.find(u8, out, "statistics") == null);
 }

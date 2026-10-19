@@ -97,7 +97,7 @@ fn compare(a: std.mem.Allocator, c: vectors.Case, why: *std.Io.Writer) !void {
     if (c.err) |e| return why.print("ours: decoded; go: \"{s}\"", .{e});
 
     const h = m.header;
-    const hdr = try std.fmt.allocPrint(a, "id={d} qr={d} op={d} aa={d} tc={d} rd={d} ra={d} rcode={d}", .{
+    const hdr = try a.print("id={d} qr={d} op={d} aa={d} tc={d} rd={d} ra={d} rcode={d}", .{
         h.id,                                @intFromBool(h.response),  @backingInt(h.opcode),
         @intFromBool(h.authoritative),       @intFromBool(h.truncated), @intFromBool(h.recursion_desired),
         @intFromBool(h.recursion_available), h.rcode,
@@ -106,7 +106,7 @@ fn compare(a: std.mem.Allocator, c: vectors.Case, why: *std.Io.Writer) !void {
 
     if (m.questions.len != c.questions.len) return why.print("questions: ours {d}, go {d}", .{ m.questions.len, c.questions.len });
     for (m.questions, c.questions, 0..) |q, want, i| {
-        const got = try std.fmt.allocPrint(a, "{s} {d} {d}", .{ q.name, @backingInt(q.ty), @backingInt(q.class) });
+        const got = try a.print("{s} {d} {d}", .{ q.name, @backingInt(q.ty), @backingInt(q.class) });
         if (!std.mem.eql(u8, got, want)) return why.print("question {d}: ours \"{s}\", go \"{s}\"", .{ i, got, want });
     }
     const sections = [_]struct { name: []const u8, ours: []const msg.Record, go: []const []const u8 }{

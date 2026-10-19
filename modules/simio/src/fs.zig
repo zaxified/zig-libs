@@ -824,7 +824,7 @@ pub const Fs = struct {
         var cur = n;
         while (cur != fs.root) {
             const p = cur.parent orelse break;
-            const idx = std.mem.indexOfScalar(*Node, p.entries.values(), cur) orelse break;
+            const idx = std.mem.findScalar(*Node, p.entries.values(), cur) orelse break;
             if (depth == names.len) return error.NameTooLong;
             names[depth] = p.entries.keys()[idx];
             depth += 1;
@@ -936,7 +936,7 @@ pub const Fs = struct {
         if (n.kind == .dir) return fs.realPath(.{ .handle = file.handle }, null, out);
         for (fs.nodes.items) |d| {
             if (d.kind != .dir) continue;
-            const idx = std.mem.indexOfScalar(*Node, d.entries.values(), n) orelse continue;
+            const idx = std.mem.findScalar(*Node, d.entries.values(), n) orelse continue;
             const name = d.entries.keys()[idx];
             const handle = fs.newHandle(.{ .node = d, .read = true, .write = false }) catch return error.SystemResources;
             defer _ = fs.open.remove(handle);

@@ -558,7 +558,7 @@ fn peerDescription(stream: *std.Io.net.Stream, buf: *[64]u8) []const u8 {
     // Memory order is network order; zig 0.17's `@bitCast` to `[4]u8` would
     // be little-endian-logical and reverse the octets on big-endian.
     const octets = std.mem.toBytes(in.addr);
-    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d} port {d}", .{
+    return std.mem.print(buf, "{d}.{d}.{d}.{d} port {d}", .{
         octets[0], octets[1], octets[2], octets[3], std.mem.bigToNative(u16, in.port),
     }) catch "a peer with an unprintable address";
 }

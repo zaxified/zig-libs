@@ -46,7 +46,7 @@ const Got = struct { status: u16, body: []const u8, allow: []const u8 };
 
 fn ask(r: *router.Router, method: []const u8, path: []const u8, out_buf: []u8) !Got {
     var req_buf: [512]u8 = undefined;
-    const wire = try std.fmt.bufPrint(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path });
+    const wire = try std.mem.print(&req_buf, "{s} {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ method, path });
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -61,11 +61,11 @@ fn ask(r: *router.Router, method: []const u8, path: []const u8, out_buf: []u8) !
     });
     const resp = out.buffered();
     const status = try std.fmt.parseInt(u16, resp[9..12], 10);
-    const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n").?;
+    const head_end = std.mem.find(u8, resp, "\r\n\r\n").?;
     var allow: []const u8 = "";
-    if (std.mem.indexOf(u8, resp[0..head_end], "\r\nAllow: ")) |i| {
+    if (std.mem.find(u8, resp[0..head_end], "\r\nAllow: ")) |i| {
         const start = i + "\r\nAllow: ".len;
-        allow = resp[start..std.mem.indexOfPos(u8, resp, start, "\r\n").?];
+        allow = resp[start..std.mem.findPos(u8, resp, start, "\r\n").?];
     }
     return .{ .status = status, .body = resp[head_end + 4 ..], .allow = allow };
 }
@@ -92,7 +92,7 @@ fn agrees(c: v.Case, got: Got) bool {
     const want = chiBody(c, &want_buf);
     if (std.mem.eql(u8, got.body, want)) return true;
     // `/users/` registered, chi says `/users`.
-    const pat_end = std.mem.indexOfScalar(u8, got.body, 0) orelse got.body.len;
+    const pat_end = std.mem.findScalar(u8, got.body, 0) orelse got.body.len;
     const ours_pat = got.body[0..pat_end];
     return ours_pat.len == c.pattern.len + 1 and ours_pat[ours_pat.len - 1] == '/' and
         std.mem.startsWith(u8, ours_pat, c.pattern) and
@@ -130,7 +130,7 @@ test "chi oracle: every generated request answers as go-chi/chi does" {
             ] += 1;
             // chi lists one node's methods; ours is the union over every
             // candidate, so it holds chi's.
-            for (c.allow) |m| if (std.mem.indexOf(u8, got.allow, m) == null) {
+            for (c.allow) |m| if (std.mem.find(u8, got.allow, m) == null) {
                 bad += 1;
                 std.debug.print("table {d}: {s} {s}: chi's Allow has {s}, ours is \"{s}\"\n", .{ ti, c.method, c.path, m, got.allow });
             };

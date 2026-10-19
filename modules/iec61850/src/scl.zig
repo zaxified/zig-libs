@@ -329,7 +329,7 @@ pub const Fcda = struct {
             if (c.len == 0) continue;
             w += try put(out, w, "$");
             w += try put(out, w, stripIndex(c));
-            if (std.mem.indexOfScalar(u8, c, '(') != null) return out[0..w];
+            if (std.mem.findScalar(u8, c, '(') != null) return out[0..w];
         }
         if (self.da_name.len > 0) {
             var da = std.mem.splitScalar(u8, self.da_name, '.');
@@ -340,7 +340,7 @@ pub const Fcda = struct {
                 // `phsAHar(9).cVal` names a *component of an array element*,
                 // which MMS reaches by alternate access below the array
                 // variable. The name stops at the array.
-                if (std.mem.indexOfScalar(u8, c, '(') != null) return out[0..w];
+                if (std.mem.findScalar(u8, c, '(') != null) return out[0..w];
             }
         }
         return out[0..w];
@@ -349,7 +349,7 @@ pub const Fcda = struct {
 
 /// Strips an SCL array index: `phsAHar(7)` → `phsAHar`.
 fn stripIndex(component: []const u8) []const u8 {
-    const paren = std.mem.indexOfScalar(u8, component, '(') orelse return component;
+    const paren = std.mem.findScalar(u8, component, '(') orelse return component;
     return component[0..paren];
 }
 
@@ -783,9 +783,9 @@ pub const Model = struct {
     pub fn ctlModel(self: *const Model, domain: []const u8, item_prefix: []const u8) ?control.CtlModel {
         var buf: [acsi.max_reference_len]u8 = undefined;
         // `GGIO1$CO$SPCSO4` → `GGIO1$CF$SPCSO4$ctlModel`.
-        const dollar = std.mem.indexOfScalar(u8, item_prefix, '$') orelse return null;
-        const rest = std.mem.indexOfScalarPos(u8, item_prefix, dollar + 1, '$') orelse return null;
-        const name = std.fmt.bufPrint(&buf, "{s}$CF{s}$ctlModel", .{
+        const dollar = std.mem.findScalar(u8, item_prefix, '$') orelse return null;
+        const rest = std.mem.findScalarPos(u8, item_prefix, dollar + 1, '$') orelse return null;
+        const name = std.mem.print(&buf, "{s}$CF{s}$ctlModel", .{
             item_prefix[0..dollar],
             item_prefix[rest..],
         }) catch return null;
@@ -1130,7 +1130,7 @@ const Parser = struct {
             const path = if (prefix.len == 0)
                 name
             else
-                try std.fmt.allocPrint(self.a, "{s}.{s}", .{ prefix, name });
+                try self.a.print("{s}.{s}", .{ prefix, name });
             if (std.mem.eql(u8, c.local, "SDI")) {
                 try self.collectDais(c, path, out);
             } else if (std.mem.eql(u8, c.local, "DAI")) {
@@ -1505,7 +1505,7 @@ fn resolveRcbs(ctx: *ResolveCtx, node: Ln, fc_name: []const u8, fc: Fc) Error!vo
             // `<RptEnabled max="2"/>` → `…RCB01`, `…RCB02`. An unindexed control
             // block keeps its bare name.
             const inst_name = if (rcb.indexed)
-                std.fmt.bufPrint(&inst_buf, "{s}{d:0>2}", .{ rcb.name, i }) catch
+                std.mem.print(&inst_buf, "{s}{d:0>2}", .{ rcb.name, i }) catch
                     return error.NameTooLong
             else
                 rcb.name;
@@ -2034,7 +2034,7 @@ test "report and GOOSE control blocks become names a client can enable" {
     try testing.expect(m.has(d, "LLN0$RP$EventsRCB02"));
     for (default_urcb_attributes) |attr| {
         var buf: [128]u8 = undefined;
-        const name = try std.fmt.bufPrint(&buf, "LLN0$RP$EventsRCB01${s}", .{attr});
+        const name = try std.mem.print(&buf, "LLN0$RP$EventsRCB01${s}", .{attr});
         try testing.expect(m.has(d, name));
     }
     // The three a client writes to enable reporting.
@@ -2384,8 +2384,7 @@ fn fuzzFragment(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    const rendered = try std.fmt.allocPrint(
-        gpa,
+    const rendered = try gpa.print(
         "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
             "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"{s}\" inst=\"1\"/></LDevice>" ++
             "</Server></AccessPoint></IED><DataTypeTemplates>" ++
@@ -2457,8 +2456,7 @@ test "corpus: every SCL seed reaches the parser, and the accepted counts are pin
             };
         }
         const id = frag[0..n];
-        const rendered = try std.fmt.allocPrint(
-            testing.allocator,
+        const rendered = try testing.allocator.print(
             "<SCL xmlns=\"http://www.iec.ch/61850/2003/SCL\"><IED name=\"I\"><AccessPoint name=\"A\"><Server>" ++
                 "<LDevice inst=\"LD\"><LN lnClass=\"GGIO\" lnType=\"{s}\" inst=\"1\"/></LDevice>" ++
                 "</Server></AccessPoint></IED><DataTypeTemplates>" ++

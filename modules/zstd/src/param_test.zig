@@ -19,7 +19,7 @@ const goldens = @import("testdata/param_goldens.zig");
 /// 1 enable, 2 disable) to `adv`, or `srcSizeHint` to `hint`. False when
 /// the token is not a parameter.
 pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
-    const eq = std.mem.indexOfScalar(u8, tok, '=') orelse return false;
+    const eq = std.mem.findScalar(u8, tok, '=') orelse return false;
     const name = tok[0..eq];
     const v = try std.fmt.parseInt(u32, tok[eq + 1 ..], 10);
     const Eq = struct {
@@ -461,7 +461,7 @@ test "adjustCParams and getCParams answer as ZSTD_adjustCParams and ZSTD_getCPar
             std.debug.print("{s}: {any}, libzstd {any}\n", .{ q, a, want.first[i] });
             return error.TestUnexpectedResult;
         }
-        h.update(try std.fmt.bufPrint(&text, "{d} {d} {d} {d} {d} {d} {d}\n", .{ a[0], a[1], a[2], a[3], a[4], a[5], a[6] }));
+        h.update(try std.mem.print(&text, "{d} {d} {d} {d} {d} {d} {d}\n", .{ a[0], a[1], a[2], a[3], a[4], a[5], a[6] }));
     }
     try std.testing.expectEqualStrings(want.sha256, &std.fmt.bytesToHex(h.finalResult(), .lower));
 }

@@ -200,7 +200,7 @@ pub const Reply = struct {
     pub fn expectMessageId(self: *const Reply, expected: u64) CheckError!void {
         const got = self.message_id orelse return error.MessageIdMismatch;
         var buf: [24]u8 = undefined;
-        const want = std.fmt.bufPrint(&buf, "{d}", .{expected}) catch unreachable;
+        const want = std.mem.print(&buf, "{d}", .{expected}) catch unreachable;
         if (!std.mem.eql(u8, got, want)) return error.MessageIdMismatch;
     }
 
@@ -421,17 +421,17 @@ pub fn classify(source: []const u8) MessageKind {
         while (i < source.len and (source[i] == ' ' or source[i] == '\t' or source[i] == '\r' or source[i] == '\n')) i += 1;
         if (i >= source.len or source[i] != '<') return .unknown;
         if (std.mem.startsWith(u8, source[i..], "<?")) {
-            const end = std.mem.indexOfPos(u8, source, i, "?>") orelse return .unknown;
+            const end = std.mem.findPos(u8, source, i, "?>") orelse return .unknown;
             i = end + 2;
             continue;
         }
         if (std.mem.startsWith(u8, source[i..], "<!--")) {
-            const end = std.mem.indexOfPos(u8, source, i, "-->") orelse return .unknown;
+            const end = std.mem.findPos(u8, source, i, "-->") orelse return .unknown;
             i = end + 3;
             continue;
         }
         if (std.mem.startsWith(u8, source[i..], "<!")) {
-            const end = std.mem.indexOfScalarPos(u8, source, i, '>') orelse return .unknown;
+            const end = std.mem.findScalarPos(u8, source, i, '>') orelse return .unknown;
             i = end + 1;
             continue;
         }
@@ -440,7 +440,7 @@ pub fn classify(source: []const u8) MessageKind {
         while (j < source.len and source[j] != ' ' and source[j] != '\t' and source[j] != '\r' and
             source[j] != '\n' and source[j] != '>' and source[j] != '/') j += 1;
         var name = source[i + 1 .. j];
-        if (std.mem.indexOfScalar(u8, name, ':')) |c| name = name[c + 1 ..];
+        if (std.mem.findScalar(u8, name, ':')) |c| name = name[c + 1 ..];
         if (std.mem.eql(u8, name, "hello")) return .hello;
         if (std.mem.eql(u8, name, "rpc-reply")) return .rpc_reply;
         if (std.mem.eql(u8, name, "rpc")) return .rpc;
@@ -517,7 +517,7 @@ test "parseReply: RFC 6241 §7.1 data reply (verbatim)" {
     const data = try r.expectData();
     try testing.expect(std.mem.startsWith(u8, data, "<data>"));
     try testing.expect(std.mem.endsWith(u8, data, "</data>"));
-    try testing.expect(std.mem.indexOf(u8, data, "<full-name>Charlie Root</full-name>") != null);
+    try testing.expect(std.mem.find(u8, data, "<full-name>Charlie Root</full-name>") != null);
 
     // The parsed element keeps full namespace context...
     const de = r.data_element.?;
@@ -551,7 +551,7 @@ test "parseReply: RFC 6241 §7.5 lock-denied error (verbatim), every field retai
     try testing.expectEqualStrings("Lock failed, lock is already held", e.message.?);
     try testing.expectEqual(@as(?u32, 454), e.info_session_id);
     try testing.expect(std.mem.startsWith(u8, e.info.?, "<error-info>"));
-    try testing.expect(std.mem.indexOf(u8, e.info.?, "<session-id>454</session-id>") != null);
+    try testing.expect(std.mem.find(u8, e.info.?, "<session-id>454</session-id>") != null);
 
     // The typed error is raised, the detail is still there.
     try testing.expectError(error.RpcError, r.expectOk());
@@ -831,7 +831,7 @@ test "parseReply: N18 -- expectMessageId is strict decimal-string comparison, by
     const cases = [_][]const u8{ "01", " 1", "+1", "1\n" };
     for (cases) |id| {
         var buf: [256]u8 = undefined;
-        const src = try std.fmt.bufPrint(&buf, "<rpc-reply message-id=\"{s}\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>", .{id});
+        const src = try std.mem.print(&buf, "<rpc-reply message-id=\"{s}\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>", .{id});
         var r = try parseReply(gpa, src);
         defer r.deinit();
         try testing.expectError(error.MessageIdMismatch, r.expectMessageId(1));
@@ -861,7 +861,7 @@ test "parseNotification: RFC 5277 §2.2.1 shape" {
     defer n.deinit();
     try testing.expectEqualStrings("2007-07-08T00:01:00Z", n.event_time);
     try testing.expect(std.mem.startsWith(u8, n.event.?, "<event xmlns="));
-    try testing.expect(std.mem.indexOf(u8, n.event.?, "<severity>major</severity>") != null);
+    try testing.expect(std.mem.find(u8, n.event.?, "<severity>major</severity>") != null);
 
     try testing.expectError(error.NotANotification, parseNotification(gpa, "<notification/>"));
     try testing.expectError(error.NotANotification, parseNotification(
@@ -916,8 +916,8 @@ test "external anchor: parseReply on a real get-config reply from the `netconf` 
     try testing.expect(!r.hasErrors());
 
     const data = try r.expectData();
-    try testing.expect(std.mem.indexOf(u8, data, "<probe:name>oracle-probe</probe:name>") != null);
-    try testing.expect(std.mem.indexOf(u8, data, "<probe:value>42</probe:value>") != null);
+    try testing.expect(std.mem.find(u8, data, "<probe:name>oracle-probe</probe:name>") != null);
+    try testing.expect(std.mem.find(u8, data, "<probe:value>42</probe:value>") != null);
 
     // The parsed tree keeps the `probe:` namespace binding the raw span
     // cannot see standalone (the same caveat `rfc_7_1_reply`'s test proves).

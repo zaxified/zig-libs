@@ -948,7 +948,7 @@ test "N6: a digest that agrees with the real one in only its first byte does not
     var forged: ?[]const u8 = null;
     var n: u32 = 0;
     while (n < 100_000) : (n += 1) {
-        const candidate = std.fmt.bufPrint(&buf, "N6-search-candidate-{d}", .{n}) catch unreachable;
+        const candidate = std.mem.print(&buf, "N6-search-candidate-{d}", .{n}) catch unreachable;
         var d: [Sha256.digest_length]u8 = undefined;
         Sha256.hash(candidate, &d, .{});
         if (d[0] == expected_digest[0]) {
@@ -1026,7 +1026,7 @@ test "signed token: tampering with any covered field breaks the signature" {
     // Flip a byte of the identity...
     var tampered: [512]u8 = undefined;
     @memcpy(tampered[0..token.len], token);
-    const idx = std.mem.indexOf(u8, tampered[0..token.len], "ied-7").?;
+    const idx = std.mem.find(u8, tampered[0..token.len], "ied-7").?;
     tampered[idx] = 'X';
     try testing.expectError(error.SignatureInvalid, verifyToken(
         tampered[0..token.len],
@@ -1037,7 +1037,7 @@ test "signed token: tampering with any covered field breaks the signature" {
 
     // ...and the time.
     @memcpy(tampered[0..token.len], token);
-    const time_idx = std.mem.indexOf(u8, tampered[0..token.len], &.{ token_tag.time, 0x08 }).?;
+    const time_idx = std.mem.find(u8, tampered[0..token.len], &.{ token_tag.time, 0x08 }).?;
     tampered[time_idx + 9] ^= 0x01;
     try testing.expectError(error.SignatureInvalid, verifyToken(
         tampered[0..token.len],

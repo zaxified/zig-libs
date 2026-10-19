@@ -385,7 +385,7 @@ const Fixtures = struct {
 
     fn read(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, name: []const u8) ![]u8 {
         var buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ certs_dir, name }) catch unreachable;
+        const path = std.mem.print(&buf, "{s}/{s}", .{ certs_dir, name }) catch unreachable;
         return root.readFileAlloc(io, path, gpa, .limited(64 * 1024)) catch |err| {
             std.debug.print("cannot read {s}: {t}\n", .{ path, err });
             return error.MissingFixture;
@@ -713,9 +713,9 @@ fn runClientFlow(
 ) !void {
     const port = try freeLoopbackPort(io);
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
     var mtu_buf: [8]u8 = undefined;
-    const mtu_str = try std.fmt.bufPrint(&mtu_buf, "{d}", .{case.mtu});
+    const mtu_str = try std.mem.print(&mtu_buf, "{d}", .{case.mtu});
 
     var child = try std.process.spawn(io, .{
         .argv = if (case.cert_mode)
@@ -851,7 +851,7 @@ fn runClientFlow(
         const found = while (lines < 4) : (lines += 1) {
             const line = peerLine(&stdout_reader.interface) catch break false;
             if (std.mem.startsWith(u8, line, "PEERCERT ")) {
-                if (std.mem.indexOf(u8, line, want) == null) {
+                if (std.mem.find(u8, line, want) == null) {
                     std.debug.print("  peer saw \"{s}\", which does not name {s}\n", .{ line, want });
                     return error.WrongPeerCertificate;
                 }
@@ -918,7 +918,7 @@ fn runServerFlow(
     defer sock.close(io);
 
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{sock.address.getPort()});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{sock.address.getPort()});
 
     var child = try std.process.spawn(io, .{
         .argv = &.{ "./wolfssl_peer", case.peer_mode, port_str },
@@ -965,7 +965,7 @@ fn runServerFlow(
             // every capture and the replay has to read it from the transcript
             // rather than reconstruct it.
             const binding = if (cookie_mode)
-                try std.fmt.bufPrint(&binding_buf, "{f}", .{incoming.from})
+                try std.mem.print(&binding_buf, "{f}", .{incoming.from})
             else
                 null;
             conn = try Connection.serverInit(serverConfig(case, fx, binding));
@@ -1048,7 +1048,7 @@ fn utcDate(buf: []u8) []const u8 {
     const epoch_day = std.time.epoch.EpochSeconds{ .secs = secs };
     const day = epoch_day.getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{
         day.year,
         md.month.numeric(),
         md.day_index + 1,

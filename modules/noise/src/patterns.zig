@@ -172,8 +172,8 @@ pub const Storage = struct {
         }
         for (base.message_patterns, 0..) |mp, m| {
             var len: usize = 0;
-            const front = m == 0 and std.mem.indexOfScalar(u8, positions, 0) != null;
-            const back = std.mem.indexOfScalar(u8, positions, @intCast(m + 1)) != null;
+            const front = m == 0 and std.mem.findScalar(u8, positions, 0) != null;
+            const back = std.mem.findScalar(u8, positions, @intCast(m + 1)) != null;
             if (mp.len + @intFromBool(front) + @intFromBool(back) > max_tokens) return error.InvalidModifier;
             if (front) {
                 self.tokens[m][len] = .psk;

@@ -1109,7 +1109,7 @@ test {
 }
 
 test "meta.model_after names BIP327 and the sibling bip340 dep" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BIP327") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BIP327") != null);
     try std.testing.expectEqualStrings("bip340", meta.deps[0]);
 }
 

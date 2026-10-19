@@ -115,7 +115,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, port: u16) !u8 {
     // 1. One signed add per algorithm.
     for (&keys.keys) |*key| {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "{s}.example.org", .{key.algorithm.name()});
+        const name = try std.mem.print(&name_buf, "{s}.example.org", .{key.algorithm.name()});
         var b = try update.Builder.init(&buf, "example.org");
         try b.add(name, .txt, 60, try update.txtRdata(&rd, key.algorithm.name()));
         c.expect(&b, key, .no_error, name);

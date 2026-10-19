@@ -804,12 +804,12 @@ pub fn pemDecode(gpa: Allocator, label: []const u8, text: []const u8) PemDecodeE
     if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
     var end_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
-    const end = std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
+    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
+    const end = std.mem.print(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
 
-    const bi = std.mem.indexOf(u8, text, begin) orelse return error.MissingPemBlock;
+    const bi = std.mem.find(u8, text, begin) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
-    const ei = std.mem.indexOfPos(u8, text, body_start, end) orelse return error.InvalidPem;
+    const ei = std.mem.findPos(u8, text, body_start, end) orelse return error.InvalidPem;
     const body = text[body_start..ei];
 
     const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
@@ -856,18 +856,18 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
     if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
     var end_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
-    const end = std.fmt.bufPrint(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
+    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
+    const end = std.mem.print(&end_buf, "-----END {s}-----", .{label}) catch unreachable;
 
     const bi = pemBlockStart(text, label) orelse return error.MissingPemBlock;
     const body_start = bi + begin.len;
     // The END line starts at the first '-' after the body: base64 has none,
     // so this scan's compare is false on every key character and it stops at
-    // the body's (public) length. Not std.mem.indexOfPos: Boyer-Moore-Horspool
+    // the body's (public) length. Not std.mem.findPos: Boyer-Moore-Horspool
     // indexes its skip table by, and skips by an amount that depends on, the
-    // key's base64 characters (ctgrind 2026-10-18, mem.zig findPos). The
+    // key's base64 characters (ctgrind 2026-10-18, std.mem findPos). The
     // first block of the label is used.
-    const ei = std.mem.indexOfScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
+    const ei = std.mem.findScalarPos(u8, text, body_start, '-') orelse return error.InvalidPem;
     if (!std.mem.startsWith(u8, text[ei..], end)) return error.InvalidPem;
     const body = text[body_start..ei];
 
@@ -882,7 +882,7 @@ fn pemDecodeSecret(label: []const u8, text: []const u8, out: []u8) PemDecodeErro
 /// Where the first `-----BEGIN <label>-----` block of `text` starts, or null.
 /// Safe over text that also holds SECRET blocks of other labels (a key file
 /// searched for a label it does not have, a key stored before its chain):
-/// a plain `std.mem.indexOf` for the header is Boyer-Moore-Horspool, which
+/// a plain `std.mem.find` for the header is Boyer-Moore-Horspool, which
 /// would run over every body before the match — or over all of them when the
 /// label is absent — indexing its skip table by the key's base64 characters
 /// (2026-10-18). This walks the blocks instead: the searches for
@@ -894,13 +894,13 @@ pub fn pemBlockStart(text: []const u8, label: []const u8) ?usize {
     const begin = "-----BEGIN ";
     const dashes = "-----";
     var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, text, pos, begin)) |bi| {
+    while (std.mem.findPos(u8, text, pos, begin)) |bi| {
         const label_start = bi + begin.len;
         const after = text[label_start..];
         if (std.mem.startsWith(u8, after, label) and std.mem.startsWith(u8, after[label.len..], dashes)) return bi;
         // Skip this block: past its header line, then to its END line.
-        const line_end = std.mem.indexOfScalarPos(u8, text, label_start, '\n') orelse return null;
-        pos = std.mem.indexOfScalarPos(u8, text, line_end, '-') orelse return null;
+        const line_end = std.mem.findScalarPos(u8, text, label_start, '\n') orelse return null;
+        pos = std.mem.findScalarPos(u8, text, line_end, '-') orelse return null;
     }
     return null;
 }
@@ -910,7 +910,7 @@ pub fn pemBlockStart(text: []const u8, label: []const u8) ?usize {
 pub fn pemBlockCount(label: []const u8, text: []const u8) error{LabelTooLong}!usize {
     if (label.len > max_pem_label_len) return error.LabelTooLong;
     var begin_buf: [max_pem_label_len + 16]u8 = undefined;
-    const begin = std.fmt.bufPrint(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
+    const begin = std.mem.print(&begin_buf, "-----BEGIN {s}-----", .{label}) catch unreachable;
     return std.mem.count(u8, text, begin);
 }
 
@@ -1310,7 +1310,7 @@ test "CSR: any tampered byte breaks the signature (or the structure)" {
     defer testing.allocator.free(der_bytes);
 
     // Flip one byte inside the SAN name (deep in certificationRequestInfo).
-    const at = std.mem.indexOf(u8, der_bytes, "tamper").?;
+    const at = std.mem.find(u8, der_bytes, "tamper").?;
     const mutated = try testing.allocator.dupe(u8, der_bytes);
     defer testing.allocator.free(mutated);
     mutated[at] ^= 0x01;
@@ -1410,12 +1410,12 @@ test "TLS-ALPN-01 cert: RFC 8737 extension encoding + SAN + self-signature" {
         "\x01\x01\xff" ++ // critical BOOLEAN TRUE
         "\x04\x22\x04\x20" ++ // OCTET STRING(len 34) { OCTET STRING(len 32) ... }
         acme_id;
-    try testing.expect(std.mem.indexOf(u8, der_bytes, acme_ext) != null);
+    try testing.expect(std.mem.find(u8, der_bytes, acme_ext) != null);
 
     // subjectAltName dNSName = the domain ([2] IMPLICIT IA5String).
-    try testing.expect(std.mem.indexOf(u8, der_bytes, "\x82\x0b" ++ "example.org") != null);
+    try testing.expect(std.mem.find(u8, der_bytes, "\x82\x0b" ++ "example.org") != null);
     // The SAN extension is marked critical (empty subject).
-    try testing.expect(std.mem.indexOf(u8, der_bytes, "\x06\x03\x55\x1d\x11\x01\x01\xff") != null);
+    try testing.expect(std.mem.find(u8, der_bytes, "\x06\x03\x55\x1d\x11\x01\x01\xff") != null);
 
     // Self-signed: the signature verifies over the TBSCertificate.
     try verifySelfSigned(der_bytes);
@@ -1453,15 +1453,15 @@ test "TLS-ALPN-01 cert: tlsAlpnCert convenience generates a usable key + cert" {
 
     // The certificate self-verifies and carries the identifier + SAN.
     try verifySelfSigned(cert.cert_der);
-    try testing.expect(std.mem.indexOf(u8, cert.cert_der, "\x04\x22\x04\x20" ++ &acme_id) != null);
-    try testing.expect(std.mem.indexOf(u8, cert.cert_der, "\x82\x0b" ++ "example.com") != null);
+    try testing.expect(std.mem.find(u8, cert.cert_der, "\x04\x22\x04\x20" ++ &acme_id) != null);
+    try testing.expect(std.mem.find(u8, cert.cert_der, "\x82\x0b" ++ "example.com") != null);
 
     // The emitted key PEM parses back and matches the cert's SPKI point.
     var kp: Es256.KeyPair = undefined;
     try ecPrivateKeyFromPem(&kp, testing.allocator, cert.key_pem);
     defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
     const point = kp.public_key.toUncompressedSec1();
-    try testing.expect(std.mem.indexOf(u8, cert.cert_der, &point) != null);
+    try testing.expect(std.mem.find(u8, cert.cert_der, &point) != null);
 }
 
 // openssl-built fixture for the `id-pe-acmeIdentifier` extension (RFC 8737
@@ -1526,7 +1526,7 @@ test "TLS-ALPN-01 extension: openssl builds + re-parses the same bytes we do" {
 
     const oracle_der = try pemDecode(testing.allocator, "CERTIFICATE", test_tls_alpn_openssl_cert_pem);
     defer testing.allocator.free(oracle_der);
-    try testing.expect(std.mem.indexOf(u8, oracle_der, acme_ext_oracle) != null);
+    try testing.expect(std.mem.find(u8, oracle_der, acme_ext_oracle) != null);
     // The oracle certificate is itself a well-formed, self-signed P-256 cert
     // (extra confidence the fixture is real, not truncated/garbled).
     try verifySelfSigned(oracle_der);
@@ -1545,7 +1545,7 @@ test "TLS-ALPN-01 extension: openssl builds + re-parses the same bytes we do" {
         tls_alpn_not_after,
     );
     defer testing.allocator.free(ours_der);
-    try testing.expect(std.mem.indexOf(u8, ours_der, acme_ext_oracle) != null);
+    try testing.expect(std.mem.find(u8, ours_der, acme_ext_oracle) != null);
 }
 
 test "PEM: encode/decode round-trip, wrapping, labels, garbage" {
@@ -1626,7 +1626,7 @@ test "EC private key PEM: round-trip ours, parse openssl's" {
     const der_bytes = try pemDecode(testing.allocator, "EC PRIVATE KEY", openssl_key);
     defer testing.allocator.free(der_bytes);
     const derived = parsed.public_key.toUncompressedSec1();
-    try testing.expect(std.mem.indexOf(u8, der_bytes, &derived) != null);
+    try testing.expect(std.mem.find(u8, der_bytes, &derived) != null);
 
     var scratch: Es256.KeyPair = undefined;
     try testing.expectError(error.MissingPemBlock, ecPrivateKeyFromPem(&scratch, testing.allocator, "no pem here"));
@@ -1752,7 +1752,7 @@ const CsrCorpus = struct {
         // stand in for this -- it has to be a real CSR to get that far.
         var tampered: [1024]u8 = undefined;
         @memcpy(tampered[0..one.len], one);
-        const at = std.mem.indexOf(u8, tampered[0..one.len], "example").?;
+        const at = std.mem.find(u8, tampered[0..one.len], "example").?;
         tampered[at] ^= 0x01;
         self.entries[csr_reject_seeds.len + 2] =
             testkit.fuzz.seedInto(&self.tampered_store, tampered[0..one.len]);
@@ -1957,7 +1957,7 @@ test "parseCsr: trailing bytes, a foreign version or algorithm, and a nonzero un
     };
     for (cases) |c| {
         @memcpy(buf[0..good.len], good);
-        const at = (if (c.last) std.mem.lastIndexOf(u8, good, c.pattern) else std.mem.indexOf(u8, good, c.pattern)).? + c.delta;
+        const at = (if (c.last) std.mem.findLast(u8, good, c.pattern) else std.mem.find(u8, good, c.pattern)).? + c.delta;
         buf[at] ^= 1;
         try testing.expectError(error.UnsupportedCsr, parseCsr(testing.allocator, buf[0..good.len]));
     }
@@ -2060,7 +2060,7 @@ test "ecPrivateKeyFromPem: version must be 1 and the private octets at most 32" 
     defer testing.allocator.free(pem);
     const der_bytes = try pemDecode(testing.allocator, "EC PRIVATE KEY", pem);
     defer testing.allocator.free(der_bytes);
-    const v_at = std.mem.indexOf(u8, der_bytes, "\x02\x01\x01").? + 2;
+    const v_at = std.mem.find(u8, der_bytes, "\x02\x01\x01").? + 2;
     der_bytes[v_at] = 2;
     const pem_v2 = try pemEncode(testing.allocator, "EC PRIVATE KEY", der_bytes);
     defer testing.allocator.free(pem_v2);
@@ -2186,8 +2186,8 @@ test "ES384 CSR: openssl's CSR verifies, ours round-trips, and the P-256-only pa
     const kp = testKeyPair384(46);
     const der_bytes = try csrDer(testing.allocator, kp, &.{ "example.org", "www.example.org" });
     defer testing.allocator.free(der_bytes);
-    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha384) != null);
-    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha256) == null);
+    try testing.expect(std.mem.find(u8, der_bytes, oid_ecdsa_sha384) != null);
+    try testing.expect(std.mem.find(u8, der_bytes, oid_ecdsa_sha256) == null);
     var back = try parseCsrAny(testing.allocator, der_bytes);
     defer back.deinit();
     try testing.expectEqual(@as(usize, 2), back.sans.len);
@@ -2202,7 +2202,7 @@ test "ES384 CSR: openssl's CSR verifies, ours round-trips, and the P-256-only pa
     // A signature algorithm that disagrees with the key's curve is refused by name.
     const mismatched = try testing.allocator.dupe(u8, der_bytes);
     defer testing.allocator.free(mismatched);
-    const at = std.mem.lastIndexOf(u8, mismatched, oid_ecdsa_sha384).? + oid_ecdsa_sha384.len - 1;
+    const at = std.mem.findLast(u8, mismatched, oid_ecdsa_sha384).? + oid_ecdsa_sha384.len - 1;
     mismatched[at] = 0x02; // ecdsa-with-SHA256
     try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, mismatched));
 }
@@ -2217,7 +2217,7 @@ test "ES384 TLS-ALPN-01 validation certificate: independent parser reads it, car
     const parsed = try cert.parse();
     try testing.expectEqual(std.crypto.Certificate.NamedCurve.secp384r1, parsed.pub_key_algo.X9_62_id_ecPublicKey);
     try testing.expectEqual(std.crypto.Certificate.Algorithm.ecdsa_with_SHA384, parsed.signature_algorithm);
-    try testing.expect(std.mem.indexOf(u8, cert_der, oid_p384) != null);
+    try testing.expect(std.mem.find(u8, cert_der, oid_p384) != null);
     // The self-signature verifies over the TBSCertificate with the P-384 key.
     const tbs = try expectElem(cert_der, (try expectElem(cert_der, 0, 0x30)).start, 0x30);
     const cert_elem = try expectElem(cert_der, 0, 0x30);
@@ -2286,7 +2286,7 @@ test "PKCS#8 and SEC1 PEM: openssl's P-384 and P-256 keys load, ours reproduce o
     // Damage: a PKCS#8 whose inner key is a different curve than its AlgorithmIdentifier says.
     const der_bytes = try pemDecode(testing.allocator, "PRIVATE KEY", openssl_p384_pkcs8);
     defer testing.allocator.free(der_bytes);
-    const curve_at = std.mem.indexOf(u8, der_bytes, oid_p384).? + oid_p384.len - 1;
+    const curve_at = std.mem.find(u8, der_bytes, oid_p384).? + oid_p384.len - 1;
     der_bytes[curve_at] = 0x21; // secp224r1 — not supported
     const bad_pem = try pemEncode(testing.allocator, "PRIVATE KEY", der_bytes);
     defer testing.allocator.free(bad_pem);
@@ -2370,8 +2370,8 @@ test "ES512 CSR: openssl's CSR verifies, ours round-trips, and the P-256-only pa
     const kp = testKeyPair521(46);
     const der_bytes = try csrDer(testing.allocator, kp, &.{ "example.org", "www.example.org" });
     defer testing.allocator.free(der_bytes);
-    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha512) != null);
-    try testing.expect(std.mem.indexOf(u8, der_bytes, oid_ecdsa_sha256) == null);
+    try testing.expect(std.mem.find(u8, der_bytes, oid_ecdsa_sha512) != null);
+    try testing.expect(std.mem.find(u8, der_bytes, oid_ecdsa_sha256) == null);
     var back = try parseCsrAny(testing.allocator, der_bytes);
     defer back.deinit();
     try testing.expectEqual(@as(usize, 2), back.sans.len);
@@ -2386,7 +2386,7 @@ test "ES512 CSR: openssl's CSR verifies, ours round-trips, and the P-256-only pa
     // A signature algorithm that disagrees with the key's curve is refused by name.
     const mismatched = try testing.allocator.dupe(u8, der_bytes);
     defer testing.allocator.free(mismatched);
-    const at = std.mem.lastIndexOf(u8, mismatched, oid_ecdsa_sha512).? + oid_ecdsa_sha512.len - 1;
+    const at = std.mem.findLast(u8, mismatched, oid_ecdsa_sha512).? + oid_ecdsa_sha512.len - 1;
     mismatched[at] = 0x02; // ecdsa-with-SHA256
     try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, mismatched));
 }
@@ -2401,7 +2401,7 @@ test "ES512 TLS-ALPN-01 validation certificate: independent parser reads it, car
     const parsed = try cert.parse();
     try testing.expectEqual(std.crypto.Certificate.NamedCurve.secp521r1, parsed.pub_key_algo.X9_62_id_ecPublicKey);
     try testing.expectEqual(std.crypto.Certificate.Algorithm.ecdsa_with_SHA512, parsed.signature_algorithm);
-    try testing.expect(std.mem.indexOf(u8, cert_der, oid_p521) != null);
+    try testing.expect(std.mem.find(u8, cert_der, oid_p521) != null);
     // The self-signature verifies over the TBSCertificate with the P-521 key.
     const tbs = try expectElem(cert_der, (try expectElem(cert_der, 0, 0x30)).start, 0x30);
     const cert_elem = try expectElem(cert_der, 0, 0x30);
@@ -2466,7 +2466,7 @@ test "PKCS#8 and SEC1 PEM: openssl's P-521 key loads, ours reproduce openssl's b
     // Damage: a PKCS#8 whose curve OID names an unsupported curve (secp224r1).
     const der_bytes = try pemDecode(testing.allocator, "PRIVATE KEY", openssl_p521_pkcs8);
     defer testing.allocator.free(der_bytes);
-    const curve_at = std.mem.indexOf(u8, der_bytes, oid_p521).? + oid_p521.len - 1;
+    const curve_at = std.mem.find(u8, der_bytes, oid_p521).? + oid_p521.len - 1;
     der_bytes[curve_at] = 0x21;
     const bad_pem = try pemEncode(testing.allocator, "PRIVATE KEY", der_bytes);
     defer testing.allocator.free(bad_pem);
@@ -2511,7 +2511,7 @@ test "csrDerWith: must-staple encodes as openssl writes it; duplicates refused" 
     // exactly this Extension: OID 1.3.6.1.5.5.7.1.24, no critical flag,
     // OCTET STRING { SEQUENCE { INTEGER 5 } }.
     const openssl_ext = "\x30\x11\x06\x08\x2b\x06\x01\x05\x05\x07\x01\x18\x04\x05\x30\x03\x02\x01\x05";
-    try testing.expect(std.mem.indexOf(u8, der_bytes, openssl_ext) != null);
+    try testing.expect(std.mem.find(u8, der_bytes, openssl_ext) != null);
     var parsed = try parseCsrAny(testing.allocator, der_bytes);
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 1), parsed.sans.len);
@@ -2520,7 +2520,7 @@ test "csrDerWith: must-staple encodes as openssl writes it; duplicates refused" 
     const critical: Extension = .{ .oid = must_staple.oid, .critical = true, .value = must_staple.value };
     const crit_der = try csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{critical});
     defer testing.allocator.free(crit_der);
-    try testing.expect(std.mem.indexOf(u8, crit_der, "\x2b\x06\x01\x05\x05\x07\x01\x18\x01\x01\xff\x04\x05") != null);
+    try testing.expect(std.mem.find(u8, crit_der, "\x2b\x06\x01\x05\x05\x07\x01\x18\x01\x01\xff\x04\x05") != null);
 
     try testing.expectError(error.DuplicateExtension, csrDerWith(testing.allocator, kp, &.{"a.example"}, &.{ must_staple, must_staple }));
     const san_again: Extension = .{ .oid = oid_subject_alt_name, .value = "\x30\x00" };
@@ -2744,8 +2744,8 @@ test "RSA CSR: byte-identical to openssl's, parses back, SANs and signature veri
     try testing.expectError(error.UnsupportedCsr, parseCsr(testing.allocator, oracle));
 
     // Structure the CA sees: SPKI rsaEncryption + NULL, signatureAlgorithm sha256WithRSAEncryption + NULL.
-    try testing.expect(std.mem.indexOf(u8, ours, "\x30\x0d\x06\x09" ++ oid_rsa_encryption ++ "\x05\x00\x03") != null);
-    try testing.expect(std.mem.indexOf(u8, ours, "\x30\x0d\x06\x09" ++ oid_sha256_with_rsa ++ "\x05\x00\x03") != null);
+    try testing.expect(std.mem.find(u8, ours, "\x30\x0d\x06\x09" ++ oid_rsa_encryption ++ "\x05\x00\x03") != null);
+    try testing.expect(std.mem.find(u8, ours, "\x30\x0d\x06\x09" ++ oid_sha256_with_rsa ++ "\x05\x00\x03") != null);
 }
 
 test "RSA CSR: tampering, truncation and other RSA signature algorithms are refused" {
@@ -2753,7 +2753,7 @@ test "RSA CSR: tampering, truncation and other RSA signature algorithms are refu
     const der_bytes = try csrDer(testing.allocator, kp, &.{"tamper.example"});
     defer testing.allocator.free(der_bytes);
 
-    const at = std.mem.indexOf(u8, der_bytes, "tamper").?;
+    const at = std.mem.find(u8, der_bytes, "tamper").?;
     const mutated = try testing.allocator.dupe(u8, der_bytes);
     defer testing.allocator.free(mutated);
     mutated[at] ^= 0x01;
@@ -2764,7 +2764,7 @@ test "RSA CSR: tampering, truncation and other RSA signature algorithms are refu
     mutated[mutated.len - 1] ^= 0x01;
 
     // sha384WithRSAEncryption (…01 01 0c) is a real RSA signature OID this module does not verify.
-    const sig_oid_at = std.mem.lastIndexOf(u8, mutated, oid_sha256_with_rsa).?;
+    const sig_oid_at = std.mem.findLast(u8, mutated, oid_sha256_with_rsa).?;
     mutated[sig_oid_at + oid_sha256_with_rsa.len - 1] = 0x0c;
     try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, mutated));
 
@@ -2866,7 +2866,7 @@ test "IP SANs (RFC 8738): csrDer writes openssl's GeneralNames; both CSRs parse 
         "\x01\x82\x09a.example";
     const ours = try csrDer(testing.allocator, testKeyPair(42), &.{ "192.0.2.1", "2001:db8::1", "a.example" });
     defer testing.allocator.free(ours);
-    try testing.expect(std.mem.indexOf(u8, ours, openssl_names) != null);
+    try testing.expect(std.mem.find(u8, ours, openssl_names) != null);
 
     var csr: [openssl_ip_csr_hex.len / 2]u8 = undefined;
     _ = try std.fmt.hexToBytes(&csr, openssl_ip_csr_hex);
@@ -2881,7 +2881,7 @@ test "IP SANs (RFC 8738): csrDer writes openssl's GeneralNames; both CSRs parse 
     }
     // A 5-octet iPAddress is malformed.
     var bad = csr;
-    const at = std.mem.indexOf(u8, &bad, "\x87\x04").?;
+    const at = std.mem.find(u8, &bad, "\x87\x04").?;
     bad[at + 1] = 5;
     try testing.expectError(error.MalformedCsr, parseCsrAny(testing.allocator, &bad));
 }
@@ -2897,7 +2897,7 @@ test "pemDecode: an END line before the BEGIN line is not the end of the block" 
     const gpa = testing.allocator;
     const pem = try pemEncode(gpa, "CERTIFICATE", "abc-der");
     defer gpa.free(pem);
-    const text = try std.fmt.allocPrint(gpa, "-----END CERTIFICATE-----\n{s}", .{pem});
+    const text = try gpa.print("-----END CERTIFICATE-----\n{s}", .{pem});
     defer gpa.free(text);
     const der_bytes = try pemDecode(gpa, "CERTIFICATE", text);
     defer gpa.free(der_bytes);
@@ -2930,7 +2930,7 @@ test "PKCS#8 PEM: a version other than 0 or 1, or another key algorithm, is Malf
 
     const bad_alg = try gpa.dupe(u8, good);
     defer gpa.free(bad_alg);
-    const at = std.mem.indexOf(u8, bad_alg, oid_ec_public_key).?;
+    const at = std.mem.find(u8, bad_alg, oid_ec_public_key).?;
     bad_alg[at + oid_ec_public_key.len - 1] ^= 1;
     const bad_alg_pem = try pemEncode(gpa, "PRIVATE KEY", bad_alg);
     defer gpa.free(bad_alg_pem);
@@ -2956,7 +2956,7 @@ test "pemBlockCount counts every block; PKCS#8 version 1 is accepted" {
     const gpa = testing.allocator;
     const pem = try pkcs8PrivateKeyToPem(gpa, testKeyPair(7));
     defer gpa.free(pem);
-    const two = try std.fmt.allocPrint(gpa, "{s}{s}", .{ pem, pem });
+    const two = try gpa.print("{s}{s}", .{ pem, pem });
     defer gpa.free(two);
     try testing.expectEqual(@as(usize, 2), try pemBlockCount("PRIVATE KEY", two));
 

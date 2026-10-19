@@ -325,7 +325,7 @@ const TagList = struct {
             const weak = std.mem.startsWith(u8, s, "W/");
             if (weak) i = 2;
             if (i < s.len and s[i] == '"') {
-                if (std.mem.indexOfScalarPos(u8, s, i + 1, '"')) |close| {
+                if (std.mem.findScalarPos(u8, s, i + 1, '"')) |close| {
                     elem = .{ .tag = .{ .value = s[i .. close + 1], .weak = weak } };
                     i = close + 1;
                 }
@@ -338,7 +338,7 @@ const TagList = struct {
             it.rest = s[i..];
             return elem;
         }
-        it.rest = s[(std.mem.indexOfScalarPos(u8, s, i, ',') orelse s.len)..];
+        it.rest = s[(std.mem.findScalarPos(u8, s, i, ',') orelse s.len)..];
         return .malformed;
     }
 };
@@ -352,7 +352,7 @@ const TagList = struct {
 pub fn parseHttpDate(s: []const u8) ?i64 {
     // Dispatch: IMF-fixdate has its comma right after the 3-letter day name;
     // RFC 850 after the full day name; asctime has no comma at all.
-    if (std.mem.indexOfScalar(u8, s, ',')) |comma| {
+    if (std.mem.findScalar(u8, s, ',')) |comma| {
         if (comma == 3) return parseImfFixdate(s);
         return parseRfc850(s, comma);
     }

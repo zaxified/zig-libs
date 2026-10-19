@@ -126,8 +126,8 @@ pub fn main(init: std.process.Init) !u8 {
     const abs = try cwd.realPathFileAlloc(io, work_dir, arena);
 
     const src = "modules/fastmem/tools/c_bench/memset_bench.c";
-    const musl_exe = try std.fmt.allocPrint(arena, "{s}/memset_musl", .{abs});
-    const glibc_exe = try std.fmt.allocPrint(arena, "{s}/memset_glibc", .{abs});
+    const musl_exe = try arena.print("{s}/memset_musl", .{abs});
+    const glibc_exe = try arena.print("{s}/memset_glibc", .{abs});
     std.debug.print("bench-fastmem: building the musl and glibc sides ...\n", .{});
     build(arena, io, &.{ "musl-gcc", "-O2", "-static", "-fno-builtin", src, "-o", musl_exe }) catch return 1;
     build(arena, io, &.{ "zig", "cc", "-O2", "-fno-builtin", src, "-o", glibc_exe }) catch return 1;
@@ -148,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
     var mismatch = false;
     for (sizes, snames) |len, sn| {
         for ([_]bool{ false, true }) |mis| {
-            const name = try std.fmt.allocPrint(arena, "set_{s}_{s}", .{ sn, if (mis) "u" else "a" });
+            const name = try arena.print("set_{s}_{s}", .{ sn, if (mis) "u" else "a" });
             const mis_off: usize = misalign;
             const off: usize = 64 + if (mis) mis_off else 0;
             @memcpy(canvas, pristine);

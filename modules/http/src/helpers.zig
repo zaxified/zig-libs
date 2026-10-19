@@ -80,18 +80,18 @@ fn isRelativePath(s: []const u8) bool {
     }
     // `//host`: an authority (Go: not for `///`, and an empty host is no host).
     if (std.mem.startsWith(u8, s, "//") and !std.mem.startsWith(u8, s, "///") and s.len > 2) {
-        const host_end = std.mem.indexOfAny(u8, s[2..], "/?#") orelse s.len - 2;
+        const host_end = std.mem.findAny(u8, s[2..], "/?#") orelse s.len - 2;
         if (host_end != 0) return false;
     }
-    const path_end = std.mem.indexOfAny(u8, s, "?#") orelse s.len;
+    const path_end = std.mem.findAny(u8, s, "?#") orelse s.len;
     // "first path segment in URL cannot contain colon".
     if (s.len == 0 or s[0] != '/') {
-        const seg_end = std.mem.indexOfScalar(u8, s[0..path_end], '/') orelse path_end;
-        if (std.mem.indexOfScalar(u8, s[0..seg_end], ':') != null) return false;
+        const seg_end = std.mem.findScalar(u8, s[0..path_end], '/') orelse path_end;
+        if (std.mem.findScalar(u8, s[0..seg_end], ':') != null) return false;
     }
     // Invalid percent-escapes in the path or the fragment fail the parse.
     if (!validEscapes(s[0..path_end])) return false;
-    if (std.mem.indexOfScalar(u8, s, '#')) |h| if (!validEscapes(s[h + 1 ..])) return false;
+    if (std.mem.findScalar(u8, s, '#')) |h| if (!validEscapes(s[h + 1 ..])) return false;
     return true;
 }
 
@@ -114,7 +114,7 @@ fn resolvePath(req_path: []const u8, location: []const u8, out: []u8, scratch: [
     if (location.len == 0 or location[0] != '/') {
         const old = if (req_path.len == 0) "/" else req_path;
         // `*` (OPTIONS) has no directory; Go's path.Split gives "" there.
-        const dir = if (std.mem.lastIndexOfScalar(u8, old, '/')) |i| old[0 .. i + 1] else "";
+        const dir = if (std.mem.findScalarLast(u8, old, '/')) |i| old[0 .. i + 1] else "";
         if (dir.len > scratch.len) return error.LocationTooLong;
         @memcpy(scratch[0..dir.len], dir);
         n = dir.len;
@@ -124,7 +124,7 @@ fn resolvePath(req_path: []const u8, location: []const u8, out: []u8, scratch: [
     @memcpy(scratch[n..][0..location.len], location);
     n += location.len;
 
-    const q = std.mem.indexOfScalar(u8, scratch[0..n], '?') orelse n;
+    const q = std.mem.findScalar(u8, scratch[0..n], '?') orelse n;
     const path = scratch[0..q];
     const tail = scratch[q..n];
     const trailing = path.len > 0 and path[path.len - 1] == '/';
@@ -230,7 +230,7 @@ pub fn basicAuth(value: []const u8, out: []u8) ?BasicCredentials {
     const n = b64ct.decodedLen(enc) catch return null;
     if (n > out.len) return null;
     _ = b64ct.decode(out[0..n], enc) catch return null;
-    const colon = std.mem.indexOfScalar(u8, out[0..n], ':') orelse return null;
+    const colon = std.mem.findScalar(u8, out[0..n], ':') orelse return null;
     return .{ .user = out[0..colon], .password = out[colon + 1 .. n] };
 }
 
@@ -240,7 +240,7 @@ pub fn basicAuth(value: []const u8, out: []u8) ?BasicCredentials {
 /// would split there.
 // secret-api-ok: the password is the caller's slice and leaves in `out` as the header's base64 by design; the plain copy staged in `out` is overwritten by that encoding, and no intermediate is held on the stack
 pub fn basicAuthHeader(out: []u8, user: []const u8, password: []const u8) error{ NoSpaceLeft, InvalidUser }![]const u8 {
-    if (std.mem.indexOfScalar(u8, user, ':') != null) return error.InvalidUser;
+    if (std.mem.findScalar(u8, user, ':') != null) return error.InvalidUser;
     const plain_len = user.len + 1 + password.len;
     const total = "Basic ".len + b64ct.encodedLen(plain_len);
     if (total > out.len) return error.NoSpaceLeft;
@@ -344,7 +344,7 @@ fn fuzzHelpers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
         HelperMark.mark(.auth_ok);
         // Both halves are the decoded bytes around the first colon.
         try testing.expect(c.user.len + 1 + c.password.len <= out.len);
-        try testing.expect(std.mem.indexOfScalar(u8, c.user, ':') == null);
+        try testing.expect(std.mem.findScalar(u8, c.user, ':') == null);
         // What a client builds from them is accepted back as the same pair.
         var hdr: [512]u8 = undefined;
         const v = try basicAuthHeader(&hdr, c.user, c.password);
@@ -364,9 +364,9 @@ fn fuzzHelpers(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
         if (loc.href.len > 0 and loc.href[0] == '/' and !std.mem.startsWith(u8, loc.href, "//") and
             isRelativePath(in))
         {
-            const p = loc.href[0 .. std.mem.indexOfScalar(u8, loc.href, '?') orelse loc.href.len];
-            try testing.expect(std.mem.indexOf(u8, p, "//") == null);
-            try testing.expect(std.mem.indexOf(u8, p, "/./") == null and std.mem.indexOf(u8, p, "/../") == null);
+            const p = loc.href[0 .. std.mem.findScalar(u8, loc.href, '?') orelse loc.href.len];
+            try testing.expect(std.mem.find(u8, p, "//") == null);
+            try testing.expect(std.mem.find(u8, p, "/./") == null and std.mem.find(u8, p, "/../") == null);
         }
     } else |_| HelperMark.mark(.redirect_refused);
 }

@@ -293,7 +293,7 @@ fn runLiveExchange(gpa: std.mem.Allocator) !void {
     }
 
     var port_buf: [8]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
 
     var child = std.process.spawn(io, .{
         .argv = &.{ "python3", "-c", python_script, port_str },
@@ -317,7 +317,7 @@ fn runLiveExchange(gpa: std.mem.Allocator) !void {
             else => return err,
         };
         std.debug.print("{s}", .{line});
-        if (std.mem.indexOf(u8, line, "PYTHON_OK") != null) saw_ok = true;
+        if (std.mem.find(u8, line, "PYTHON_OK") != null) saw_ok = true;
     }
 
     const term = try child.wait(io);

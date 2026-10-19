@@ -62,9 +62,9 @@ pub const ConntrackResult = struct {
 /// occurrences from the reply tuple are ignored), or null if absent.
 /// e.g. `kvField(line, "dst=")` → `"93.184.216.34"`.
 fn kvField(line: []const u8, key: []const u8) ?[]const u8 {
-    const i = std.mem.indexOf(u8, line, key) orelse return null;
+    const i = std.mem.find(u8, line, key) orelse return null;
     const rest = line[i + key.len ..];
-    const end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    const end = std.mem.findAny(u8, rest, " \t") orelse rest.len;
     return rest[0..end];
 }
 

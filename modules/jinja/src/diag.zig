@@ -19,7 +19,7 @@ pub const Diagnostic = struct {
 
     pub fn set(self: *Diagnostic, line: usize, comptime fmt: []const u8, args: anytype) void {
         self.line = line;
-        const s = std.fmt.bufPrint(&self.buf, fmt, args) catch blk: {
+        const s = std.mem.print(&self.buf, fmt, args) catch blk: {
             // Truncation is fine; losing the diagnostic entirely is not.
             break :blk self.buf[0..self.buf.len];
         };

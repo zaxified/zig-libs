@@ -62,8 +62,8 @@ pub fn main() !void {
     // garbled string.
     const tampered = try gpa.dupe(u8, token);
     defer gpa.free(tampered);
-    const last_dot = std.mem.lastIndexOfScalar(u8, tampered, '.').?;
-    const third_dot = std.mem.lastIndexOfScalar(u8, tampered[0..last_dot], '.').?;
+    const last_dot = std.mem.findScalarLast(u8, tampered, '.').?;
+    const third_dot = std.mem.findScalarLast(u8, tampered[0..last_dot], '.').?;
     tampered[third_dot + 5] = if (tampered[third_dot + 5] == 'A') 'B' else 'A';
     if (jwe.decryptCompact(gpa, .{ .symmetric = &shared_key }, tampered, .{})) |leaked| {
         gpa.free(leaked);

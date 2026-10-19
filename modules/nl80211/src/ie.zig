@@ -212,7 +212,7 @@ pub const SuiteList = struct {
     }
 
     pub fn contains(s: *const SuiteList, suite: u32) bool {
-        return std.mem.indexOfScalar(u32, s.slice(), suite) != null;
+        return std.mem.findScalar(u32, s.slice(), suite) != null;
     }
 };
 

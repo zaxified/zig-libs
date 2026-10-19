@@ -176,10 +176,10 @@ test "EntryReader decodes xl/sharedStrings.xml from the real fixture: exact byte
 
     // The shared-strings table for the source CSV (name,qty / widget,3 /
     // gadget,7) must literally contain these four values as XML text.
-    try testing.expect(std.mem.indexOf(u8, out.items, "<t xml:space=\"preserve\">name</t>") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "<t xml:space=\"preserve\">qty</t>") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "<t xml:space=\"preserve\">widget</t>") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "<t xml:space=\"preserve\">gadget</t>") != null);
+    try testing.expect(std.mem.find(u8, out.items, "<t xml:space=\"preserve\">name</t>") != null);
+    try testing.expect(std.mem.find(u8, out.items, "<t xml:space=\"preserve\">qty</t>") != null);
+    try testing.expect(std.mem.find(u8, out.items, "<t xml:space=\"preserve\">widget</t>") != null);
+    try testing.expect(std.mem.find(u8, out.items, "<t xml:space=\"preserve\">gadget</t>") != null);
 }
 
 test "EntryReader decodes xl/worksheets/sheet1.xml from the real fixture: exact size + independently-captured CRC-32" {
@@ -207,7 +207,7 @@ test "EntryReader decodes xl/worksheets/sheet1.xml from the real fixture: exact 
 
     try testing.expectEqual(@as(usize, 2798), out.items.len);
     try testing.expectEqual(@as(u32, 0x85dd2fb9), std.hash.Crc32.hash(out.items));
-    try testing.expect(std.mem.indexOf(u8, out.items, "<worksheet") != null);
-    try testing.expect(std.mem.indexOf(u8, out.items, "dimension ref=\"A1:B3\"") != null);
+    try testing.expect(std.mem.find(u8, out.items, "<worksheet") != null);
+    try testing.expect(std.mem.find(u8, out.items, "dimension ref=\"A1:B3\"") != null);
     try testing.expect(!er.crcMismatch());
 }

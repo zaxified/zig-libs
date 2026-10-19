@@ -151,16 +151,16 @@ pub fn main(init: std.process.Init) !u8 {
     var states: [sizes.len * variants.len]*State = undefined;
     var si: usize = 0;
     for (sizes) |bits| {
-        const key_file = try std.fmt.allocPrint(arena, "key{d}.der", .{bits});
-        const pub_file = try std.fmt.allocPrint(arena, "pub{d}.der", .{bits});
+        const key_file = try arena.print("key{d}.der", .{bits});
+        const pub_file = try arena.print("pub{d}.der", .{bits});
         const sk = try arena.create(rsa.SecretKey);
         try rsa.SecretKey.fromDer(sk, try dir.readFileAlloc(io, key_file, arena, .limited(1 << 14)));
         const pk = try rsa.PublicKey.fromDer(try dir.readFileAlloc(io, pub_file, arena, .limited(1 << 14)));
         for (variants) |va| {
-            const tag = try std.fmt.allocPrint(arena, "{d}_{s}", .{ bits, va.name });
+            const tag = try arena.print("{d}_{s}", .{ bits, va.name });
             const rd = struct {
                 fn f(d: std.Io.Dir, i: std.Io, a: std.mem.Allocator, t: []const u8, ext: []const u8) ![]u8 {
-                    return d.readFileAlloc(i, try std.fmt.allocPrint(a, "{s}.{s}", .{ t, ext }), a, .limited(1 << 14));
+                    return d.readFileAlloc(i, try a.print("{s}.{s}", .{ t, ext }), a, .limited(1 << 14));
                 }
             }.f;
             const go_prepared = try rd(dir, io, arena, tag, "prepared");
@@ -192,7 +192,7 @@ pub fn main(init: std.process.Init) !u8 {
             // (a) ours signs what CIRCL blinded; CIRCL finalizes it in the next phase.
             const ours_bs = try blindrsa.blindSign(sk, pk, s.csprng.random(), go_blinded, &s.out);
             if (!std.mem.eql(u8, ours_bs, go_blindsig)) return fail("{s}: our blind signature differs from CIRCL's for the same blinded message", .{tag});
-            try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.ours_blindsig", .{tag}), .data = ours_bs });
+            try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.ours_blindsig", .{tag}), .data = ours_bs });
 
             // (b) ours verifies CIRCL's final signature.
             blindrsa.verify(pk, Sha384, go_prepared, go_sig, va.salt_len) catch return fail("{s}: we reject the signature CIRCL finalized", .{tag});
@@ -206,8 +206,8 @@ pub fn main(init: std.process.Init) !u8 {
             @memcpy(s.blind_sig[0..k], bsig);
             const sig = try blindrsa.finalize(pk, Sha384, s.blind_sig[0..k], &s.ctx, &s.out);
             @memcpy(s.sig[0..k], sig);
-            try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.ours_prepared", .{tag}), .data = s.prepared });
-            try dir.writeFile(io, .{ .sub_path = try std.fmt.allocPrint(arena, "{s}.ours_sig", .{tag}), .data = sig });
+            try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.ours_prepared", .{tag}), .data = s.prepared });
+            try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.ours_sig", .{tag}), .data = sig });
 
             // (d) Deterministic variant: same prepared message, so the same signature.
             if (!va.randomized and !std.mem.eql(u8, sig, go_sig)) return fail("{s}: the Deterministic signature differs from CIRCL's", .{tag});
@@ -258,7 +258,7 @@ pub fn main(init: std.process.Init) !u8 {
                     .finalize => timeIt(io, s, State.doFinalize),
                     .verify => timeIt(io, s, State.doVerify),
                 };
-                const name = try std.fmt.allocPrint(arena, "{d}_{s}_{s}", .{ bits, va.name, wl });
+                const name = try arena.print("{d}_{s}_{s}", .{ bits, va.name, wl });
                 const t = grows.get(name) orelse return error.MissingRow;
                 const ratio = ours.ns / t.ns;
                 worst = @max(worst, ratio);

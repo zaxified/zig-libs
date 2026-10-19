@@ -157,7 +157,7 @@ pub const Timeout = struct {
     /// Render into `out` (`out.len >= max_len`).
     pub fn write(t: Timeout, out: []u8) []const u8 {
         std.debug.assert(t.value <= max_value);
-        const digits = std.fmt.bufPrint(out, "{d}", .{t.value}) catch unreachable;
+        const digits = std.mem.print(out, "{d}", .{t.value}) catch unreachable;
         out[digits.len] = @backingInt(t.unit);
         return out[0 .. digits.len + 1];
     }
@@ -201,7 +201,7 @@ pub const CallOptions = struct {
 /// separator are the whole of the gRPC path grammar — nothing is escaped,
 /// because a service or method name containing `/` is not a name.
 pub fn methodPath(out: []u8, service: []const u8, method: []const u8) error{NoSpaceLeft}![]const u8 {
-    return std.fmt.bufPrint(out, "/{s}/{s}", .{ service, method });
+    return std.mem.print(out, "/{s}/{s}", .{ service, method });
 }
 
 /// A gRPC channel: policy plus the HTTP/2 session every call runs on. The
@@ -243,7 +243,7 @@ pub const Channel = struct {
         try fields.append(arena, .{ .name = "te", .value = "trailers" });
         try fields.append(arena, .{
             .name = "content-type",
-            .value = try std.fmt.allocPrint(arena, "application/grpc+{s}", .{ch.options.content_subtype}),
+            .value = try arena.print("application/grpc+{s}", .{ch.options.content_subtype}),
         });
         if (ch.options.user_agent) |ua| try fields.append(arena, .{ .name = "user-agent", .value = ua });
         if (opts.timeout) |t| {

@@ -177,7 +177,7 @@ test "SubscriptionSet.resubscribe: chunks of 32, options and order kept" {
     try testing.expectEqual(@as(usize, 0), wire.n);
     var name: [8]u8 = undefined;
     for (0..70) |i| {
-        const f = try std.fmt.bufPrint(&name, "t/{d}", .{i});
+        const f = try std.mem.print(&name, "t/{d}", .{i});
         try s.add(.{ .filter = f, .qos = if (i == 40) .exactly_once else .at_least_once });
     }
     try testing.expectEqual(@as(usize, 3), try s.resubscribe(&c, 2));
@@ -188,7 +188,7 @@ test "SubscriptionSet.resubscribe: chunks of 32, options and order kept" {
         var it = sub.iterator();
         var in_packet: usize = 0;
         while (it.next()) |f| : (in_packet += 1) {
-            const want = try std.fmt.bufPrint(&name, "t/{d}", .{seen});
+            const want = try std.mem.print(&name, "t/{d}", .{seen});
             try testing.expectEqualStrings(want, f.filter);
             try testing.expectEqual(if (seen == 40) packet.QoS.exactly_once else packet.QoS.at_least_once, f.qos);
             seen += 1;

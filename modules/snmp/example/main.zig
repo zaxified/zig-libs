@@ -859,10 +859,10 @@ fn pollFailed(what: []const u8, err: anyerror) bool {
 
 fn describeAddr(addr: std.Io.net.IpAddress, buf: []u8) []const u8 {
     return switch (addr) {
-        .ip4 => |a| std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{
+        .ip4 => |a| std.mem.print(buf, "{d}.{d}.{d}.{d}:{d}", .{
             a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3], a.port,
         }) catch "an unprintable address",
-        .ip6 => |a| std.fmt.bufPrint(buf, "[ipv6]:{d}", .{a.port}) catch "an unprintable address",
+        .ip6 => |a| std.mem.print(buf, "[ipv6]:{d}", .{a.port}) catch "an unprintable address",
     };
 }
 

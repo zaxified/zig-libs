@@ -1974,7 +1974,7 @@ const WideSource = struct {
     fn referenceFn(ctx: *anyopaque, _: usize, member: usize, out: []u8) ?[]const u8 {
         const self: *WideSource = @ptrCast(@alignCast(ctx));
         if (member >= self.members) return null;
-        return std.fmt.bufPrint(out, "TESTLD/GGIO1$ST$M{d}$stVal", .{member}) catch null;
+        return std.mem.print(out, "TESTLD/GGIO1$ST$M{d}$stVal", .{member}) catch null;
     }
     fn resolveFn(ctx: *anyopaque, ds_reference: []const u8) ?usize {
         const self: *WideSource = @ptrCast(@alignCast(ctx));

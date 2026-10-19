@@ -64,7 +64,7 @@ fn runRequest(handler: *staticfiles.Handler, wire: []const u8, out_buf: []u8) []
 
 fn getWithHeader(handler: *staticfiles.Handler, path: []const u8, extra: []const u8, out_buf: []u8) []const u8 {
     var wire_buf: [512]u8 = undefined;
-    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ path, extra }) catch unreachable;
+    const wire = std.mem.print(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ path, extra }) catch unreachable;
     return runRequest(handler, wire, out_buf);
 }
 
@@ -76,7 +76,7 @@ fn statusOf(resp: []const u8) u16 {
 fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, got, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name))
             return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
@@ -84,7 +84,7 @@ fn headerValue(got: []const u8, name: []const u8) ?[]const u8 {
 }
 
 fn bodyOf(resp: []const u8) []const u8 {
-    const i = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+    const i = std.mem.find(u8, resp, "\r\n\r\n") orelse return "";
     return resp[i + 4 ..];
 }
 
@@ -118,7 +118,7 @@ pub fn main() !void {
 
     // ── RFC 9110 §14: a satisfiable byte range → 206 + exact Content-Range ─
     var range_hdr_buf: [64]u8 = undefined;
-    const range_hdr = std.fmt.bufPrint(&range_hdr_buf, "Range: bytes=0-4\r\n", .{}) catch unreachable;
+    const range_hdr = std.mem.print(&range_hdr_buf, "Range: bytes=0-4\r\n", .{}) catch unreachable;
     var buf2: [1024]u8 = undefined;
     const resp2 = getWithHeader(&handler, "/hello.txt", range_hdr, &buf2);
     if (statusOf(resp2) != 206) return error.ExpectedPartial;
@@ -131,7 +131,7 @@ pub fn main() !void {
 
     // ── RFC 9110 §14.1.2: an unsatisfiable range → 416 + `bytes */<len>` ───
     var bad_range_buf: [64]u8 = undefined;
-    const bad_range_hdr = std.fmt.bufPrint(&bad_range_buf, "Range: bytes=100-200\r\n", .{}) catch unreachable;
+    const bad_range_hdr = std.mem.print(&bad_range_buf, "Range: bytes=100-200\r\n", .{}) catch unreachable;
     var buf3: [1024]u8 = undefined;
     const resp3 = getWithHeader(&handler, "/hello.txt", bad_range_hdr, &buf3);
     if (statusOf(resp3) != 416) return error.ExpectedRangeNotSatisfiable;
@@ -142,7 +142,7 @@ pub fn main() !void {
     // ── RFC 9110 §13.1.2: If-None-Match with the resource's real ETag → 304,
     // no body ───────────────────────────────────────────────────────────
     var inm_buf: [96]u8 = undefined;
-    const inm_hdr = std.fmt.bufPrint(&inm_buf, "If-None-Match: {s}\r\n", .{etag}) catch unreachable;
+    const inm_hdr = std.mem.print(&inm_buf, "If-None-Match: {s}\r\n", .{etag}) catch unreachable;
     var buf4: [1024]u8 = undefined;
     const resp4 = getWithHeader(&handler, "/hello.txt", inm_hdr, &buf4);
     if (statusOf(resp4) != 304) return error.ExpectedNotModified;

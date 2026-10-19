@@ -154,9 +154,9 @@ const Needles = struct {
         var le: [32]u8 = undefined;
         for (be, 0..) |b, i| le[31 - i] = b;
         const a = self.arena.allocator();
-        self.add(std.fmt.allocPrint(a, "{s} BE", .{name}) catch @panic("probe OOM"), &be);
-        self.add(std.fmt.allocPrint(a, "{s} LE", .{name}) catch @panic("probe OOM"), a.dupe(u8, &le) catch @panic("probe OOM"));
-        self.add(std.fmt.allocPrint(a, "{s} mem", .{name}) catch @panic("probe OOM"), a.dupe(u8, std.mem.asBytes(&s)) catch @panic("probe OOM"));
+        self.add(a.print("{s} BE", .{name}) catch @panic("probe OOM"), &be);
+        self.add(a.print("{s} LE", .{name}) catch @panic("probe OOM"), a.dupe(u8, &le) catch @panic("probe OOM"));
+        self.add(a.print("{s} mem", .{name}) catch @panic("probe OOM"), a.dupe(u8, std.mem.asBytes(&s)) catch @panic("probe OOM"));
     }
 
     fn addRaw(self: *Needles, name: []const u8, bytes: []const u8) void {
@@ -311,7 +311,7 @@ test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
     defer for (parties[0..built]) |*p| p.deinit();
     for (0..n_parties) |i| {
         cur_party = i;
-        total += probeParty(try std.fmt.bufPrint(&label_buf, "init party {d}", .{i + 1}), callInit);
+        total += probeParty(try std.mem.print(&label_buf, "init party {d}", .{i + 1}), callInit);
         built += 1;
     }
 
@@ -332,7 +332,7 @@ test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
 
     for (0..n_parties) |i| {
         cur_party = i;
-        total += probeParty(try std.fmt.bufPrint(&label_buf, "start party {d}", .{i + 1}), callStart);
+        total += probeParty(try std.mem.print(&label_buf, "start party {d}", .{i + 1}), callStart);
     }
     var round: usize = 0;
     while (round < 6) : (round += 1) {
@@ -354,21 +354,21 @@ test "STACKPROBE: no secret on the dead stack after any GJKR participant call" {
                 cur_party = to;
                 cur_from = @intCast(from + 1);
                 cur_bytes = m.bytes;
-                total += probeParty(try std.fmt.bufPrint(&label_buf, "handle round {d} {d}->{d}", .{ round, from + 1, to + 1 }), callHandle);
+                total += probeParty(try std.mem.print(&label_buf, "handle round {d} {d}->{d}", .{ round, from + 1, to + 1 }), callHandle);
             }
         };
         for (&parties, 0..) |*p, i| switch (p.phase()) {
             .done, .aborted => {},
             else => {
                 cur_party = i;
-                total += probeParty(try std.fmt.bufPrint(&label_buf, "advance round {d} party {d}", .{ round, i + 1 }), callAdvance);
+                total += probeParty(try std.mem.print(&label_buf, "advance round {d} party {d}", .{ round, i + 1 }), callAdvance);
             },
         };
     }
     for (&parties) |*p| try std.testing.expectEqual(dkg.Phase.done, p.phase());
     for (0..n_parties) |i| {
         cur_party = i;
-        total += probeParty(try std.fmt.bufPrint(&label_buf, "output party {d}", .{i + 1}), callOutput);
+        total += probeParty(try std.mem.print(&label_buf, "output party {d}", .{i + 1}), callOutput);
         out_share.deinit();
     }
 
@@ -503,7 +503,7 @@ fn deliverReshare(allocator: std.mem.Allocator, total: *usize, from_dealers: boo
                 }
                 probe_sender = .{ .dealer = d.id() };
                 cur_bytes = m.bytes;
-                total.* += Driver(reshare.ReshareReceiver).probe(.handle, r, try std.fmt.bufPrint(label_buf, "receiver {d} handle from dealer {d}", .{ r.id(), d.id() }), fillReshare);
+                total.* += Driver(reshare.ReshareReceiver).probe(.handle, r, try std.mem.print(label_buf, "receiver {d} handle from dealer {d}", .{ r.id(), d.id() }), fillReshare);
             };
         }
     } else {
@@ -514,12 +514,12 @@ fn deliverReshare(allocator: std.mem.Allocator, total: *usize, from_dealers: boo
                 for (&receivers) |*q| if (q.id() != r.id()) {
                     probe_sender = .{ .receiver = r.id() };
                     cur_bytes = m.bytes;
-                    total.* += Driver(reshare.ReshareReceiver).probe(.handle, q, try std.fmt.bufPrint(label_buf, "receiver {d} handle from receiver {d}", .{ q.id(), r.id() }), fillReshare);
+                    total.* += Driver(reshare.ReshareReceiver).probe(.handle, q, try std.mem.print(label_buf, "receiver {d} handle from receiver {d}", .{ q.id(), r.id() }), fillReshare);
                 };
                 for (&dealers) |*d| {
                     probe_from = r.id();
                     cur_bytes = m.bytes;
-                    total.* += Driver(reshare.ReshareDealer).probe(.handle, d, try std.fmt.bufPrint(label_buf, "dealer {d} handle from receiver {d}", .{ d.id(), r.id() }), fillReshare);
+                    total.* += Driver(reshare.ReshareDealer).probe(.handle, d, try std.mem.print(label_buf, "dealer {d} handle from receiver {d}", .{ d.id(), r.id() }), fillReshare);
                 }
             }
         }
@@ -561,21 +561,21 @@ test "STACKPROBE: no secret on the dead stack after any reshare dealer or receiv
         n.add("RNG stream (this call)", recorder.log.items[start_at..]);
         rng_base = start_at;
         defer rng_base = 0;
-        total += analyse(try std.fmt.bufPrint(&label_buf, "ReshareDealer.init {d}", .{i + 1}), &n).copies;
+        total += analyse(try std.mem.print(&label_buf, "ReshareDealer.init {d}", .{i + 1}), &n).copies;
     }
     defer for (&dealers) |*d| d.deinit();
     for (&receivers, 1..) |*r, id| r.* = try reshare.ReshareReceiver.init(allocator, reshare_cfg, @intCast(id));
     defer for (&receivers) |*r| r.deinit();
 
     // Rig.run's sequence, every call probed.
-    for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.start, d, try std.fmt.bufPrint(&label_buf, "dealer {d} start", .{d.id()}), fillReshare);
+    for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.start, d, try std.mem.print(&label_buf, "dealer {d} start", .{d.id()}), fillReshare);
     try deliverReshare(allocator, &total, true, &label_buf);
-    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.fmt.bufPrint(&label_buf, "receiver {d} advance (shares)", .{r.id()}), fillReshare);
+    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.mem.print(&label_buf, "receiver {d} advance (shares)", .{r.id()}), fillReshare);
     try deliverReshare(allocator, &total, false, &label_buf);
-    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.fmt.bufPrint(&label_buf, "receiver {d} advance (complaints)", .{r.id()}), fillReshare);
-    for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.advance, d, try std.fmt.bufPrint(&label_buf, "dealer {d} advance", .{d.id()}), fillReshare);
+    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.mem.print(&label_buf, "receiver {d} advance (complaints)", .{r.id()}), fillReshare);
+    for (&dealers) |*d| total += Driver(reshare.ReshareDealer).probe(.advance, d, try std.mem.print(&label_buf, "dealer {d} advance", .{d.id()}), fillReshare);
     try deliverReshare(allocator, &total, true, &label_buf);
-    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.fmt.bufPrint(&label_buf, "receiver {d} advance (defenses)", .{r.id()}), fillReshare);
+    for (&receivers) |*r| total += Driver(reshare.ReshareReceiver).probe(.advance, r, try std.mem.print(&label_buf, "receiver {d} advance (defenses)", .{r.id()}), fillReshare);
     for (&receivers) |*r| try std.testing.expect(r.output() != null);
 
     if (verbose or total != 0) std.debug.print("TOTAL residue copies (reshare): {d}\n", .{total});
@@ -671,7 +671,7 @@ fn probePlain(label: []const u8, comptime call: fn () void, comptime fill: fn (*
 fn runProbed(comptime P: type, allocator: std.mem.Allocator, group: []P, name: []const u8, comptime fill: fn (*Needles) void) !usize {
     var total: usize = 0;
     var label_buf: [80]u8 = undefined;
-    for (group, 1..) |*p, i| total += Driver(P).probe(.start, p, try std.fmt.bufPrint(&label_buf, "{s} {d} start", .{ name, i }), fill);
+    for (group, 1..) |*p, i| total += Driver(P).probe(.start, p, try std.mem.print(&label_buf, "{s} {d} start", .{ name, i }), fill);
     var rounds: usize = 0;
     while (true) : (rounds += 1) {
         try std.testing.expect(rounds < 16);
@@ -686,11 +686,11 @@ fn runProbed(comptime P: type, allocator: std.mem.Allocator, group: []P, name: [
                 }
                 probe_from = @intCast(from);
                 cur_bytes = m.bytes;
-                total += Driver(P).probe(.handle, dst, try std.fmt.bufPrint(&label_buf, "{s} {d} handle round {d} from {d}", .{ name, to, rounds, from }), fill);
+                total += Driver(P).probe(.handle, dst, try std.mem.print(&label_buf, "{s} {d} handle round {d} from {d}", .{ name, to, rounds, from }), fill);
             };
         }
         if (std.mem.eql(u8, @tagName(group[0].phase()), "done")) break;
-        for (group, 1..) |*p, i| total += Driver(P).probe(.advance, p, try std.fmt.bufPrint(&label_buf, "{s} {d} advance round {d}", .{ name, i, rounds }), fill);
+        for (group, 1..) |*p, i| total += Driver(P).probe(.advance, p, try std.mem.print(&label_buf, "{s} {d} advance round {d}", .{ name, i, rounds }), fill);
     }
     return total;
 }
@@ -713,13 +713,13 @@ test "STACKPROBE: no secret on the dead stack after any ECDSA keygen or refresh 
     var label_buf: [80]u8 = undefined;
     for (0..3) |i| {
         cur_party = i;
-        total += probePlain(try std.fmt.bufPrint(&label_buf, "EcdsaKeygen.init {d}", .{i + 1}), callKeygenInit, fillKeygen);
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaKeygen.init {d}", .{i + 1}), callKeygenInit, fillKeygen);
     }
     defer for (&kparties) |*p| p.deinit();
     total += try runProbed(ecdsa_keygen.EcdsaKeygen, allocator, &kparties, "keygen", fillKeygen);
     for (0..3) |i| {
         cur_party = i;
-        total += probePlain(try std.fmt.bufPrint(&label_buf, "EcdsaKeygen.takeKeyShare {d}", .{i + 1}), callKeygenTake, fillTaken);
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaKeygen.takeKeyShare {d}", .{i + 1}), callKeygenTake, fillTaken);
     }
     defer for (&kshares) |*s| {
         s.paillier_secret.deinit();
@@ -728,13 +728,13 @@ test "STACKPROBE: no secret on the dead stack after any ECDSA keygen or refresh 
 
     for (0..3) |i| {
         cur_party = i;
-        total += probePlain(try std.fmt.bufPrint(&label_buf, "EcdsaRefresh.init {d}", .{i + 1}), callRefreshInit, fillRefresh);
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaRefresh.init {d}", .{i + 1}), callRefreshInit, fillRefresh);
     }
     defer for (&rparties) |*p| p.deinit();
     total += try runProbed(ecdsa_refresh.EcdsaRefresh, allocator, &rparties, "refresh", fillRefresh);
     for (0..3) |i| {
         cur_party = i;
-        total += probePlain(try std.fmt.bufPrint(&label_buf, "EcdsaRefresh.takeKeyShare {d}", .{i + 1}), callRefreshTake, fillRefresh);
+        total += probePlain(try std.mem.print(&label_buf, "EcdsaRefresh.takeKeyShare {d}", .{i + 1}), callRefreshTake, fillRefresh);
     }
     defer for (&rshares) |*s| {
         s.paillier_secret.deinit();

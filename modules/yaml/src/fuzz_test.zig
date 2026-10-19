@@ -180,7 +180,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     };
     if (yaml.composeAllLeaky(aa, input, opts)) |docs| {
         hit("damaged-composed");
-        if (opts.merge_keys and std.mem.indexOf(u8, input, "<<") != null) hit("merge");
+        if (opts.merge_keys and std.mem.find(u8, input, "<<") != null) hit("merge");
         for (docs) |d| {
             const t2 = try yaml.stringify(gpa, d);
             defer gpa.free(t2);

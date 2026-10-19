@@ -487,6 +487,6 @@ test "Emitter aborts with its own message on overflow, in every build mode (F8)"
             return error.TestUnexpectedResult;
         }
         const needle = size_mismatch_message[0..40];
-        try testing.expect(std.mem.indexOf(u8, msg[0..msg_len], needle) != null);
+        try testing.expect(std.mem.find(u8, msg[0..msg_len], needle) != null);
     }
 }

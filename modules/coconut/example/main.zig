@@ -138,7 +138,7 @@ pub fn main() !void {
     var nonce: [16]u8 = undefined;
     try io.randomSecure(&nonce);
     var context_buf: [64]u8 = undefined;
-    const context = try std.fmt.bufPrint(&context_buf, "gate:north-7/{x}", .{nonce});
+    const context = try std.mem.print(&context_buf, "gate:north-7/{x}", .{nonce});
 
     const proof = try coconut.proveCredential(gpa, io, parameters, gate_vk, pass, &attributes, &disclosed, context);
     defer proof.deinit(gpa);
@@ -186,7 +186,7 @@ pub fn main() !void {
     //    nonce, the proof answers the old one, the challenge does not close.
     try io.randomSecure(&nonce);
     var next_buf: [64]u8 = undefined;
-    const next_context = try std.fmt.bufPrint(&next_buf, "gate:north-7/{x}", .{nonce});
+    const next_context = try std.mem.print(&next_buf, "gate:north-7/{x}", .{nonce});
     if (try coconut.verifyCredential(gpa, parameters, gate_vk, proof, &disclosed, &disclosed_values, next_context)) {
         return error.ReplayAccepted;
     }

@@ -102,7 +102,7 @@ fn setLength(rw: *Server.ResponseWriter, buf: *[20]u8, n: u64) Server.ResponseWr
     // A body the handler marked as encoded is not `content`'s length (Go
     // leaves the length out then too).
     if (rw.getHeader("Content-Encoding") != null) return;
-    try rw.setHeader("Content-Length", std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable);
+    try rw.setHeader("Content-Length", std.mem.print(buf, "{d}", .{n}) catch unreachable);
 }
 
 const boundary_len = 32;
@@ -119,8 +119,8 @@ fn boundary(content: []const u8, etag: ?[]const u8, buf: *[boundary_len]u8) []co
         if (etag) |e| h.update(e);
         const a = h.final();
         const b = std.hash.Wyhash.hash(a, content);
-        _ = std.fmt.bufPrint(buf, "{x:0>16}{x:0>16}", .{ a, b }) catch unreachable;
-        if (std.mem.indexOf(u8, content, buf) == null) return buf;
+        _ = std.mem.print(buf, "{x:0>16}{x:0>16}", .{ a, b }) catch unreachable;
+        if (std.mem.find(u8, content, buf) == null) return buf;
     }
 }
 
@@ -163,7 +163,7 @@ test "serveContent: 200 with sniffed type, length, Last-Modified and Accept-Rang
         "\r\nETag: \"v1\"\r\n",
         "\r\nAccept-Ranges: bytes\r\n",
         "\r\nContent-Length: 22\r\n",
-    }) |line| try testing.expect(std.mem.indexOf(u8, resp, line) != null);
+    }) |line| try testing.expect(std.mem.find(u8, resp, line) != null);
     try testing.expect(std.mem.endsWith(u8, resp, "\r\n\r\n<html><p>hi</p></html>"));
 }
 
@@ -172,15 +172,15 @@ test "serveContent: HEAD has the GET head and no body; 304 drops the metadata" {
     Fixture.opts = .{ .etag = "\"v1\"", .last_modified = 784111777, .content_type = "text/plain" };
     var out: [1024]u8 = undefined;
     const head = try run("HEAD /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
-    try testing.expect(std.mem.indexOf(u8, head, "\r\nContent-Length: 10\r\n") != null);
+    try testing.expect(std.mem.find(u8, head, "\r\nContent-Length: 10\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, head, "\r\n\r\n"));
 
     var out2: [1024]u8 = undefined;
     const nm = try run("GET /x HTTP/1.1\r\nHost: t\r\nIf-None-Match: \"v1\"\r\nConnection: close\r\n\r\n", &out2);
     try testing.expect(std.mem.startsWith(u8, nm, "HTTP/1.1 304 "));
-    try testing.expect(std.mem.indexOf(u8, nm, "\r\nETag: \"v1\"\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, nm, "Content-Type") == null);
-    try testing.expect(std.mem.indexOf(u8, nm, "Last-Modified") == null);
+    try testing.expect(std.mem.find(u8, nm, "\r\nETag: \"v1\"\r\n") != null);
+    try testing.expect(std.mem.find(u8, nm, "Content-Type") == null);
+    try testing.expect(std.mem.find(u8, nm, "Last-Modified") == null);
 }
 
 test "serveContent: one range, several ranges, an unsatisfiable range, an oversized set" {
@@ -189,7 +189,7 @@ test "serveContent: one range, several ranges, an unsatisfiable range, an oversi
     var out: [2048]u8 = undefined;
     const one = try run("GET /x HTTP/1.1\r\nHost: t\r\nRange: bytes=10-14\r\nConnection: close\r\n\r\n", &out);
     try testing.expect(std.mem.startsWith(u8, one, "HTTP/1.1 206 "));
-    try testing.expect(std.mem.indexOf(u8, one, "\r\nContent-Range: bytes 10-14/100\r\n") != null);
+    try testing.expect(std.mem.find(u8, one, "\r\nContent-Range: bytes 10-14/100\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, one, "\r\n\r\n01234"));
 
     var out2: [2048]u8 = undefined;
@@ -198,12 +198,12 @@ test "serveContent: one range, several ranges, an unsatisfiable range, an oversi
     const ct = responseHeader(many, "Content-Type").?;
     try testing.expect(std.mem.startsWith(u8, ct, "multipart/byteranges; boundary="));
     const b = ct["multipart/byteranges; boundary=".len..];
-    const body = many[std.mem.indexOf(u8, many, "\r\n\r\n").? + 4 ..];
+    const body = many[std.mem.find(u8, many, "\r\n\r\n").? + 4 ..];
     try testing.expectEqual(try std.fmt.parseInt(usize, responseHeader(many, "Content-Length").?, 10), body.len);
-    try testing.expect(std.mem.indexOf(u8, body, "Content-Range: bytes 0-1/100\r\n\r\n01\r\n") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "Content-Range: bytes 98-99/100\r\n\r\n89\r\n") != null);
+    try testing.expect(std.mem.find(u8, body, "Content-Range: bytes 0-1/100\r\n\r\n01\r\n") != null);
+    try testing.expect(std.mem.find(u8, body, "Content-Range: bytes 98-99/100\r\n\r\n89\r\n") != null);
     var close_buf: [64]u8 = undefined;
-    try testing.expect(std.mem.endsWith(u8, body, try std.fmt.bufPrint(&close_buf, "--{s}--\r\n", .{b})));
+    try testing.expect(std.mem.endsWith(u8, body, try std.mem.print(&close_buf, "--{s}--\r\n", .{b})));
 
     var out3: [2048]u8 = undefined;
     const none = try run("GET /x HTTP/1.1\r\nHost: t\r\nRange: bytes=200-\r\nConnection: close\r\n\r\n", &out3);
@@ -221,16 +221,16 @@ test "serveContent: the boundary is deterministic and absent from the content" {
     const content = strRepeat("--0123456789abcdef--", 8);
     const b = boundary(content, "\"v1\"", &buf);
     try testing.expectEqualStrings(b, boundary(content, "\"v1\"", &again));
-    try testing.expect(std.mem.indexOf(u8, content, b) == null);
+    try testing.expect(std.mem.find(u8, content, b) == null);
     try testing.expect(!std.mem.eql(u8, b, boundary(content, "\"v2\"", &again)));
 }
 
 fn responseHeader(resp: []const u8, name: []const u8) ?[]const u8 {
-    const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len;
+    const head_end = std.mem.find(u8, resp, "\r\n\r\n") orelse resp.len;
     var lines = std.mem.splitSequence(u8, resp[0..head_end], "\r\n");
     _ = lines.next();
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
     return null;

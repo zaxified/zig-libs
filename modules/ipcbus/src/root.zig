@@ -478,7 +478,7 @@ test "Bus: list into an undersized buffer is truncated, never overflows" {
 var path_counter: u32 = 0;
 fn testSocketPath(buf: []u8) [:0]u8 {
     path_counter += 1;
-    return std.fmt.bufPrintSentinel(buf, "/tmp/ipcbus-t-{d}-{d}.sock", .{ linux.getpid(), path_counter }, 0) catch unreachable;
+    return std.mem.printSentinel(buf, "/tmp/ipcbus-t-{d}-{d}.sock", .{ linux.getpid(), path_counter }, 0) catch unreachable;
 }
 
 // A trivial echo: the reply is a copy of the request. Domain-free stand-in for

@@ -57,7 +57,7 @@ fn envVar(name: []const u8) ?[]const u8 {
 }
 
 fn address(spec: []const u8) ?std.Io.net.IpAddress {
-    const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse return null;
+    const colon = std.mem.findScalarLast(u8, spec, ':') orelse return null;
     const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch return null;
     var octets: [4]u8 = undefined;
     var it = std.mem.splitScalar(u8, spec[0..colon], '.');
@@ -82,14 +82,14 @@ fn skip(comptime what: []const u8, comptime which: []const u8) void {
 // and check the accept key. They are test scaffolding, not a parser.
 
 fn headEnd(buf: []const u8) ?usize {
-    return if (std.mem.indexOf(u8, buf, "\r\n\r\n")) |i| i + 4 else null;
+    return if (std.mem.find(u8, buf, "\r\n\r\n")) |i| i + 4 else null;
 }
 
 fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, head, "\r\n");
     _ = lines.next(); // start line
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) continue;
         return std.mem.trim(u8, line[colon + 1 ..], " \t");
     }
@@ -238,7 +238,7 @@ test "live BACnet/SC: our node connects to a hub and exchanges NPDUs" {
     // ── the opening handshake ──────────────────────────────────────────────
     const key = websocket.handshake.generateKey(rand);
     var host_buf: [64]u8 = undefined;
-    const host = try std.fmt.bufPrint(&host_buf, "{s}", .{spec});
+    const host = try std.mem.print(&host_buf, "{s}", .{spec});
     var req: [512]u8 = undefined;
     var rw = std.Io.Writer.fixed(&req);
     try websocket.handshake.writeRequest(&rw, sc_ws.clientRequest(.hub, host, "/", &key));
@@ -369,7 +369,7 @@ test "live BACnet/SC: our hub admits a third-party node" {
     try testing.expect(std.mem.startsWith(u8, head, "GET "));
     const key = headerValue(head, "sec-websocket-key") orelse return error.NoKeyHeader;
     const offered = headerValue(head, "sec-websocket-protocol") orelse return error.NoSubprotocol;
-    try testing.expect(std.mem.indexOf(u8, offered, sc.subprotocol_hub) != null);
+    try testing.expect(std.mem.find(u8, offered, sc.subprotocol_hub) != null);
 
     const accept_key = websocket.handshake.computeAcceptKey(key);
     var res: [256]u8 = undefined;

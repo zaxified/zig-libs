@@ -446,12 +446,12 @@ test "replay: the transcript records which reference produced it" {
     // Provenance is part of the artifact, not of a comment that can drift from
     // it: which driver, which sympy, when, and by which command.
     for ([_][]const u8{ "# reference : ", "# python    : ", "# sympy     : ", "# captured  : ", "# command   : " }) |key| {
-        const at = std.mem.indexOf(u8, transcript, key) orelse {
+        const at = std.mem.find(u8, transcript, key) orelse {
             std.debug.print("\ntranscript header is missing '{s}'\n", .{key});
             return error.MissingProvenance;
         };
         const rest = transcript[at + key.len ..];
-        const end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+        const end = std.mem.findScalar(u8, rest, '\n') orelse rest.len;
         try testing.expect(std.mem.trim(u8, rest[0..end], " \r").len > 0);
     }
 }

@@ -319,16 +319,16 @@ test "AuthnRequest: new options parse back; an empty class_refs list omits Reque
     o.requested_authn_context = .{ .class_refs = &.{} };
     const out2 = try saml.buildAuthnRequest(alloc, o);
     defer alloc.free(out2);
-    try testing.expect(std.mem.indexOf(u8, out2, "RequestedAuthnContext") == null);
-    try testing.expect(std.mem.indexOf(u8, out2, "ForceAuthn") == null);
-    try testing.expect(std.mem.indexOf(u8, out2, "IsPassive") == null);
-    try testing.expect(std.mem.indexOf(u8, out2, "AttributeConsumingServiceIndex") == null);
+    try testing.expect(std.mem.find(u8, out2, "RequestedAuthnContext") == null);
+    try testing.expect(std.mem.find(u8, out2, "ForceAuthn") == null);
+    try testing.expect(std.mem.find(u8, out2, "IsPassive") == null);
+    try testing.expect(std.mem.find(u8, out2, "AttributeConsumingServiceIndex") == null);
 
     // u16 upper bound renders as five digits.
     o.attribute_consuming_service_index = 65535;
     const out3 = try saml.buildAuthnRequest(alloc, o);
     defer alloc.free(out3);
-    try testing.expect(std.mem.indexOf(u8, out3, "AttributeConsumingServiceIndex=\"65535\"") != null);
+    try testing.expect(std.mem.find(u8, out3, "AttributeConsumingServiceIndex=\"65535\"") != null);
 }
 
 // ── refusals: each typed, nothing emitted ───────────────────────────────────

@@ -112,14 +112,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     var ca: http.Client.CaBundle = .{ .scanned = true };
     defer ca.deinit(gpa);
-    try ca.bundle.addCertsFromFilePathAbsolute(gpa, io, std.Io.Clock.real.now(io), try std.fmt.bufPrint(&path_buf, "{s}/ca.pem", .{scratch}));
+    try ca.bundle.addCertsFromFilePathAbsolute(gpa, io, std.Io.Clock.real.now(io), try std.mem.print(&path_buf, "{s}/ca.pem", .{scratch}));
     var transport = http.Client.init(io, gpa, .{ .shared_ca = &ca });
     defer transport.deinit();
 
     var url_buf: [64]u8 = undefined;
-    const api = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{http_port});
+    const api = try std.mem.print(&url_buf, "http://127.0.0.1:{d}", .{http_port});
     var raw_buf: [64]u8 = undefined;
-    const raw_api = try std.fmt.bufPrint(&raw_buf, "http://127.0.0.1:{d}/raw", .{http_port});
+    const raw_api = try std.mem.print(&raw_buf, "http://127.0.0.1:{d}/raw", .{http_port});
 
     // acme-dns: register, then delegate the challenge name to the account.
     var reg = try acmedns.AcmeDns.register(io, gpa, api, .{}, &.{});
@@ -223,7 +223,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         }
     }
     if (exec.stderr_len != 0) std.debug.print("exec stderr: {s}\n", .{exec.lastStderr()});
-    check(std.mem.indexOf(u8, rfc2136_bad.note, "BADSIG") != null, "wrong secret is reported as BADSIG: \"{s}\"", .{rfc2136_bad.note});
+    check(std.mem.find(u8, rfc2136_bad.note, "BADSIG") != null, "wrong secret is reported as BADSIG: \"{s}\"", .{rfc2136_bad.note});
 
     std.debug.print("acmedns interop: {d} failure(s)\n", .{failures});
     return if (failures == 0) 0 else 1;

@@ -315,7 +315,7 @@ fn interpreter(io: std.Io, buf: []u8) []const u8 {
         if (p.len != 0) return p;
     }
     if (getEnv("HOME")) |home| {
-        const path = std.fmt.bufPrint(buf, "{s}/.cache/zig-libs-grpc/bin/python", .{home}) catch return "python3";
+        const path = std.mem.print(buf, "{s}/.cache/zig-libs-grpc/bin/python", .{home}) catch return "python3";
         std.Io.Dir.cwd().access(io, path, .{}) catch return "python3";
         return path;
     }
@@ -397,7 +397,7 @@ const Session = struct {
         s.wd = .{};
 
         var script_buf: [1024]u8 = undefined;
-        const script = try std.fmt.bufPrint(&script_buf, "{s}/reference_server.py", .{cfg.tools_dir});
+        const script = try std.mem.print(&script_buf, "{s}/reference_server.py", .{cfg.tools_dir});
         std.Io.Dir.cwd().access(io, script, .{}) catch
             peerMissing("cannot find `{s}` — set $GRPC_TOOLS_DIR", .{script});
 
@@ -502,7 +502,7 @@ fn forward(cfg: Config) !void {
         while (try st.receive()) |*r| {
             defer @constCast(r).deinit();
             var name_buf: [32]u8 = undefined;
-            const want = try std.fmt.bufPrint(&name_buf, "tick-{d}", .{seen});
+            const want = try std.mem.print(&name_buf, "tick-{d}", .{seen});
             expectStr("server_stream", "text", r.value.text, want);
             expectInt("server_stream", "index", r.value.index, seen);
             seen += 1;
@@ -546,7 +546,7 @@ fn forward(cfg: Config) !void {
             var r = (try st.receive()).?;
             defer r.deinit();
             var buf: [32]u8 = undefined;
-            expectStr("bidi", "text", r.value.text, try std.fmt.bufPrint(&buf, "re:{s}", .{w}));
+            expectStr("bidi", "text", r.value.text, try std.mem.print(&buf, "re:{s}", .{w}));
             expectInt("bidi", "index", r.value.index, @as(i32, @intCast(i)));
         }
         try st.closeSend();
@@ -785,7 +785,7 @@ fn forward(cfg: Config) !void {
 /// only the producer of the bytes has swapped sides.
 fn srvUnary(c: *grpc.ServerCall, req: EchoRequest) anyerror!EchoReply {
     return .{
-        .text = try std.fmt.allocPrint(c.arena, "echo:{s}", .{req.text}),
+        .text = try c.arena.print("echo:{s}", .{req.text}),
         .index = req.count,
         .blob = req.blob,
     };
@@ -797,7 +797,7 @@ fn srvServerStream(s: *M.Stream, req: EchoRequest) anyerror!void {
     var i: i32 = 0;
     while (i < req.count) : (i += 1) {
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "{s}-{d}", .{ req.text, i }),
+            .text = try s.call.arena.print("{s}-{d}", .{ req.text, i }),
             .index = i,
         });
     }
@@ -819,7 +819,7 @@ fn srvBidi(s: *M.Stream) anyerror!void {
     while (try s.receive()) |*r| {
         defer @constCast(r).deinit();
         try s.send(.{
-            .text = try std.fmt.allocPrint(s.call.arena, "re:{s}", .{r.value.text}),
+            .text = try s.call.arena.print("re:{s}", .{r.value.text}),
             .index = i,
         });
         i += 1;
@@ -919,7 +919,7 @@ const Report = struct {
     fn get(r: Report, key: []const u8) ?[]const u8 {
         var it = std.mem.splitScalar(u8, r.text, '\n');
         while (it.next()) |line| {
-            const tab = std.mem.indexOfScalar(u8, line, '\t') orelse continue;
+            const tab = std.mem.findScalar(u8, line, '\t') orelse continue;
             if (std.mem.eql(u8, line[0..tab], key)) return line[tab + 1 ..];
         }
         return null;
@@ -957,7 +957,7 @@ const Report = struct {
             return;
         };
         const valid = got.len >= 2 and switch (got[got.len - 1]) {
-            'H', 'M', 'S', 'm', 'u', 'n' => std.mem.indexOfNone(u8, got[0 .. got.len - 1], "0123456789") == null,
+            'H', 'M', 'S', 'm', 'u', 'n' => std.mem.findNone(u8, got[0 .. got.len - 1], "0123456789") == null,
             else => false,
         };
         if (!valid) {
@@ -1024,7 +1024,7 @@ fn reverse(cfg: Config) !void {
     const io = cfg.io;
 
     var script_buf: [1024]u8 = undefined;
-    const script = try std.fmt.bufPrint(&script_buf, "{s}/reference_client.py", .{cfg.tools_dir});
+    const script = try std.mem.print(&script_buf, "{s}/reference_client.py", .{cfg.tools_dir});
     std.Io.Dir.cwd().access(io, script, .{}) catch
         peerMissing("cannot find `{s}` — set $GRPC_TOOLS_DIR", .{script});
 
@@ -1050,7 +1050,7 @@ fn reverse(cfg: Config) !void {
     const th = try std.Thread.spawn(.{}, serveOnce, .{ctx});
 
     var port_buf: [16]u8 = undefined;
-    const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_str = try std.mem.print(&port_buf, "{d}", .{port});
 
     var child = std.process.spawn(io, .{
         .argv = &.{ python, script, port_str },
@@ -1181,7 +1181,7 @@ fn today(io: std.Io, buf: []u8) []const u8 {
     const year: u16 = @intCast(if (m <= 2) y + 1 else y);
     const month: u8 = @intCast(m);
     const day: u8 = @intCast(d);
-    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day }) catch "unknown";
+    return std.mem.print(buf, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day }) catch "unknown";
 }
 
 const manifest_prologue =
@@ -1314,7 +1314,7 @@ fn writeManifest(cfg: Config, version: []const u8, date: []const u8) !void {
     );
 
     var path_buf: [1024]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/grpcio_capture.zig", .{cfg.testdata_dir});
+    const path = try std.mem.print(&path_buf, "{s}/grpcio_capture.zig", .{cfg.testdata_dir});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items });
     note("wrote {s} ({d} bytes)", .{ path, buf.items.len });
 }
@@ -1322,13 +1322,13 @@ fn writeManifest(cfg: Config, version: []const u8, date: []const u8) !void {
 fn writeCaptures(cfg: Config) !void {
     const io = cfg.io;
     var dir_buf: [1024]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dir_buf, "{s}/grpcio", .{cfg.testdata_dir});
+    const dir = try std.mem.print(&dir_buf, "{s}/grpcio", .{cfg.testdata_dir});
     try std.Io.Dir.cwd().createDirPath(io, dir);
 
     for (captures.items) |c| {
         var path_buf: [1024]u8 = undefined;
         const ext = if (std.mem.eql(u8, c.name, "reverse_report")) "txt" else "bin";
-        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.{s}", .{ dir, c.name, ext });
+        const path = try std.mem.print(&path_buf, "{s}/{s}.{s}", .{ dir, c.name, ext });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c.bytes });
         note("  {s}  {d} bytes", .{ path, c.bytes.len });
     }

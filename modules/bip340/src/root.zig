@@ -772,7 +772,7 @@ test {
 }
 
 test "meta.model_after names BIP340 and std's Secp256k1" {
-    try std.testing.expect(std.mem.indexOf(u8, meta.model_after, "BIP340") != null);
+    try std.testing.expect(std.mem.find(u8, meta.model_after, "BIP340") != null);
 }
 
 test "XOnlyPublicKey encoded_length and Signature encoded_length" {

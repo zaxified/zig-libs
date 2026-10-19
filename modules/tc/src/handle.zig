@@ -139,7 +139,7 @@ pub const Handle = struct {
         if (std.mem.eql(u8, s, "ingress")) return ingress;
         if (std.mem.eql(u8, s, "clsact")) return clsact;
 
-        const colon = std.mem.indexOfScalar(u8, s, ':');
+        const colon = std.mem.findScalar(u8, s, ':');
         const maj_str = if (colon) |c| s[0..c] else s;
         const min_str = if (colon) |c| s[c + 1 ..] else "";
         const maj = try parseHalf(maj_str);
@@ -227,7 +227,7 @@ test "format round-trips parse (identical spelling)" {
     const cases = [_][]const u8{ "1:10", "1:", ":10", "abcd:1234", "root", "0:" };
     for (cases) |c| {
         const h = try Handle.parse(c);
-        const s = try std.fmt.bufPrint(&buf, "{f}", .{h});
+        const s = try std.mem.print(&buf, "{f}", .{h});
         try testing.expectEqualStrings(c, s);
         try testing.expectEqual(h.raw, (try Handle.parse(s)).raw);
     }
@@ -240,7 +240,7 @@ test "format round-trips parse (different spelling, same value) for ingress/unsp
     const cases = [_][]const u8{ "ingress", "clsact", "none" };
     for (cases) |c| {
         const h = try Handle.parse(c);
-        const s = try std.fmt.bufPrint(&buf, "{f}", .{h});
+        const s = try std.mem.print(&buf, "{f}", .{h});
         try testing.expectEqual(h.raw, (try Handle.parse(s)).raw);
     }
 }
@@ -257,13 +257,13 @@ test "format matches a real `tc` binary on the three cases where it used to dive
     // audit's F2 finding (`tc.md`).
     var buf: [32]u8 = undefined;
 
-    try testing.expectEqualStrings("ffff:fff1", try std.fmt.bufPrint(&buf, "{f}", .{Handle.ingress}));
-    try testing.expectEqualStrings("ffff:fff1", try std.fmt.bufPrint(&buf, "{f}", .{Handle.clsact}));
-    try testing.expectEqualStrings("0:", try std.fmt.bufPrint(&buf, "{f}", .{Handle.unspec}));
+    try testing.expectEqualStrings("ffff:fff1", try std.mem.print(&buf, "{f}", .{Handle.ingress}));
+    try testing.expectEqualStrings("ffff:fff1", try std.mem.print(&buf, "{f}", .{Handle.clsact}));
+    try testing.expectEqualStrings("0:", try std.mem.print(&buf, "{f}", .{Handle.unspec}));
     // The major-0 case: matches iproute2's `print_tc_classid`'s explicit
     // `:%x` branch (not directly re-captured live, but a stable read of the
     // reference implementation's source shape — see the file header).
-    try testing.expectEqualStrings(":10", try std.fmt.bufPrint(&buf, "{f}", .{Handle.init(0, 0x10)}));
+    try testing.expectEqualStrings(":10", try std.mem.print(&buf, "{f}", .{Handle.init(0, 0x10)}));
 }
 
 test "TC_H_MAKE composes a filter's tcm_info (prio + protocol)" {

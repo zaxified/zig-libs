@@ -198,7 +198,7 @@ test "field by field: connect_request" {
     var text: [40]u8 = undefined;
     try testing.expectEqualStrings(
         "00112233-4455-6677-8899-aabbccddeeff",
-        try std.fmt.bufPrint(&text, "{f}", .{c.uuid}),
+        try std.mem.print(&text, "{f}", .{c.uuid}),
     );
     try testing.expectEqual(@as(u16, 1400), c.max_bvlc_length);
     try testing.expectEqual(@as(u16, 1300), c.max_npdu_length);

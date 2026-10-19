@@ -78,7 +78,7 @@ test "M28 teeth: a genuinely Response-level signature that fails to verify is re
     // structurally a well-formed, single-reference, correctly-pointed
     // signature -- xmldsig's RSA check is what now fails.
     const marker = "<ds:SignatureValue>";
-    const at = std.mem.indexOf(u8, signed.xml, marker).? + marker.len + 4;
+    const at = std.mem.find(u8, signed.xml, marker).? + marker.len + 4;
     signed.xml[at] = if (signed.xml[at] == 'A') 'B' else 'A';
 
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, signed.xml, cfg(signed.key, fx.t_valid)));

@@ -50,11 +50,11 @@ pub fn codecHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     const len = src.slice(&buf);
     const input = buf[0..len];
     if (len != 0) mark(.nonempty);
-    if (std.mem.indexOfAny(u8, input, &[_]u8{ 0x80, 0xC3, 0xFF }) != null) mark(.high_bytes);
+    if (std.mem.findAny(u8, input, &[_]u8{ 0x80, 0xC3, 0xFF }) != null) mark(.high_bytes);
     for (encodings) |enc| {
         const decoded = try encoding.decodeToUtf8(gpa, input, enc);
         defer gpa.free(decoded);
-        if (enc == .utf8 and std.mem.indexOf(u8, decoded, "\xEF\xBF\xBD") != null) mark(.replacement);
+        if (enc == .utf8 and std.mem.find(u8, decoded, "\xEF\xBF\xBD") != null) mark(.replacement);
         const encoded = try encoding.encodeFromUtf8(gpa, input, enc);
         defer gpa.free(encoded);
     }

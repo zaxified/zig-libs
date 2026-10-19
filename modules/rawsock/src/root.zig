@@ -139,7 +139,7 @@ pub const hwaddr_text_len = 17;
 const hex_lower_digits = "0123456789abcdef";
 
 /// Format a 6-byte MAC as lowercase colon-separated hex into `buf`. A hand
-/// rolled hex table, not `std.fmt.bufPrint` — measured 4.4x slower than
+/// rolled hex table, not `std.mem.print` — measured 4.4x slower than
 /// `parseHwaddr`, this function's own inverse (63 ns vs. 13 ns/call,
 /// ReleaseFast), for output this fixed-shape (`std.fmt`'s general format
 /// string parsing buys nothing here). Byte-for-byte identical output,
@@ -838,7 +838,7 @@ pub fn ifaceName(fd: i32, ifindex: i32, out: *[16]u8) IfaceError![]const u8 {
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFNAME, @intFromPtr(&req))) != .SUCCESS)
         return error.NoSuchInterface;
     @memcpy(out, &req.name);
-    const end = std.mem.indexOfScalar(u8, out, 0) orelse out.len;
+    const end = std.mem.findScalar(u8, out, 0) orelse out.len;
     return out[0..end];
 }
 
@@ -2078,7 +2078,7 @@ test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + 
         };
         const eth = EthHeader.parse(frame.bytes) orelse continue;
         if (eth.ethertype != test_ethertype) continue;
-        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], payload) != null) {
+        if (std.mem.find(u8, frame.bytes[eth_hdr_len..], payload) != null) {
             try testing.expectEqual(lo, frame.ifindex);
             return; // observed our own frame — success
         }
@@ -2142,7 +2142,7 @@ test "F12: loopback capability is proven independently of open()'s bind and send
         var i: usize = 0;
         while (i < 8) : (i += 1) {
             const frame = probe.recv(&pbuf) catch break;
-            if (std.mem.indexOf(u8, frame.bytes, probe_marker) != null) {
+            if (std.mem.find(u8, frame.bytes, probe_marker) != null) {
                 env_ok = true;
                 break;
             }
@@ -2177,7 +2177,7 @@ test "F12: loopback capability is proven independently of open()'s bind and send
         };
         const eth = EthHeader.parse(frame.bytes) orelse continue;
         if (eth.ethertype != test_ethertype) continue;
-        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], marker) != null) {
+        if (std.mem.find(u8, frame.bytes[eth_hdr_len..], marker) != null) {
             found = true;
             break;
         }
@@ -2228,7 +2228,7 @@ test "F12: send() writes the requested destination MAC into the outgoing frame (
         };
         const eth = EthHeader.parse(frame.bytes) orelse continue;
         if (eth.ethertype != test_ethertype) continue;
-        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], marker) != null) {
+        if (std.mem.find(u8, frame.bytes[eth_hdr_len..], marker) != null) {
             try testing.expectEqual(dst, eth.dst);
             return;
         }
@@ -2313,7 +2313,7 @@ test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPack
             };
             const eth = EthHeader.parse(frame.bytes) orelse continue;
             if (eth.ethertype != test_ethertype) continue;
-            if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], "f10-before-bind") != null) {
+            if (std.mem.find(u8, frame.bytes[eth_hdr_len..], "f10-before-bind") != null) {
                 leaked_before_bind = true;
                 break;
             }
@@ -2338,7 +2338,7 @@ test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPack
         };
         const eth = EthHeader.parse(frame.bytes) orelse continue;
         if (eth.ethertype != test_ethertype) continue;
-        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], "f10-after-bind") != null) {
+        if (std.mem.find(u8, frame.bytes[eth_hdr_len..], "f10-after-bind") != null) {
             seen_after_bind = true;
             break;
         }
@@ -2401,8 +2401,8 @@ test "F4: setFilter after open() leaks a frame queued in the window; Options.fil
                 error.WouldBlock, error.Interrupted => break,
                 else => return e,
             };
-            if (std.mem.indexOf(u8, f.bytes, reject_marker) != null) saw_leak = true;
-            if (std.mem.indexOf(u8, f.bytes, control_marker) != null) saw_control = true;
+            if (std.mem.find(u8, f.bytes, reject_marker) != null) saw_leak = true;
+            if (std.mem.find(u8, f.bytes, control_marker) != null) saw_control = true;
         }
         if (!saw_leak) return error.SkipZigTest; // env didn't reproduce the window this run
         // The point of F4: a frame the filter WOULD reject got through
@@ -2451,7 +2451,7 @@ test "F4: setFilter after open() leaks a frame queued in the window; Options.fil
             // through every time this environment could reproduce the
             // window at all. With the filter attached at open() time, it
             // must never show up here.
-            try testing.expect(std.mem.indexOf(u8, f.bytes, new_api_marker) == null);
+            try testing.expect(std.mem.find(u8, f.bytes, new_api_marker) == null);
         }
     }
 }
@@ -2520,7 +2520,7 @@ test "F3 fix: an 802.1Q tag is stripped from bytes (skb_vlan_untag) before this 
             error.WouldBlock, error.Interrupted => return error.SkipZigTest,
             else => return e,
         };
-        if (std.mem.indexOf(u8, f.bytes, marker) == null) continue;
+        if (std.mem.find(u8, f.bytes, marker) == null) continue;
         // BEFORE F3's doc fix this was undocumented; this is the first
         // test that pins it as BEHAVIOR: the tag is gone from `bytes` (4
         // bytes shorter than what was sent) and the ethertype the module
@@ -2835,7 +2835,7 @@ test "live: a compiled filter attached at open passes only what it names (needs 
         seen += 1;
         // Everything that got through is the matching frame, and the
         // in-kernel verdict agrees with the userspace interpreter's.
-        try testing.expect(std.mem.indexOf(u8, f.bytes, "rawsock-filter-yes") != null);
+        try testing.expect(std.mem.find(u8, f.bytes, "rawsock-filter-yes") != null);
         try testing.expect(filter.run(prog, f.bytes) != 0);
     }
     if (seen == 0) return error.SkipZigTest;

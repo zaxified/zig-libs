@@ -260,9 +260,9 @@ fn deliverToDevLog(io: std.Io, bytes: []const u8) !void {
 /// Find `"key":"value"` in one `journalctl -o json` line and return `value`.
 fn jsonField(line: []const u8, comptime key: []const u8) ?[]const u8 {
     const needle = "\"" ++ key ++ "\":\"";
-    const idx = std.mem.indexOf(u8, line, needle) orelse return null;
+    const idx = std.mem.find(u8, line, needle) orelse return null;
     const start = idx + needle.len;
-    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
+    const end = std.mem.findScalarPos(u8, line, start, '"') orelse return null;
     return line[start..end];
 }
 
@@ -298,7 +298,7 @@ fn queryJournaldForMarker(io: std.Io, marker: []const u8, expected_severity: u8,
                 error.StreamTooLong => break,
                 else => return err,
             };
-            if (std.mem.indexOf(u8, line, marker) != null) {
+            if (std.mem.find(u8, line, marker) != null) {
                 match_len = @min(line.len, match_line_buf.len);
                 @memcpy(match_line_buf[0..match_len], line[0..match_len]);
                 break;
@@ -338,15 +338,15 @@ fn checkJournald(io: std.Io) !void {
 
     const now = syslog.nowTimestamp();
     var marker_buf: [40]u8 = undefined;
-    const marker = try std.fmt.bufPrint(&marker_buf, "ZLW{d}-{d}", .{ std.os.linux.getpid(), now.unix_ms });
+    const marker = try std.mem.print(&marker_buf, "ZLW{d}-{d}", .{ std.os.linux.getpid(), now.unix_ms });
     var marker_a_buf: [42]u8 = undefined;
-    const marker_a = try std.fmt.bufPrint(&marker_a_buf, "{s}A", .{marker});
+    const marker_a = try std.mem.print(&marker_a_buf, "{s}A", .{marker});
     var marker_b_buf: [42]u8 = undefined;
-    const marker_b = try std.fmt.bufPrint(&marker_b_buf, "{s}B", .{marker});
+    const marker_b = try std.mem.print(&marker_b_buf, "{s}B", .{marker});
 
     // RFC 5424, with structured data.
     var text5424_buf: [96]u8 = undefined;
-    const text5424 = try std.fmt.bufPrint(&text5424_buf, "probe {s} quotes \" backslash \\ end", .{marker_a});
+    const text5424 = try std.mem.print(&text5424_buf, "probe {s} quotes \" backslash \\ end", .{marker_a});
     const msg5424 = syslog.Message{
         .facility = .local3,
         .severity = .warning,
@@ -367,7 +367,7 @@ fn checkJournald(io: std.Io) !void {
 
     // RFC 3164 (BSD) legacy line.
     var text3164_buf: [64]u8 = undefined;
-    const text3164 = try std.fmt.bufPrint(&text3164_buf, "probe {s}", .{marker_b});
+    const text3164 = try std.mem.print(&text3164_buf, "probe {s}", .{marker_b});
     const msgbsd = syslog.bsd.Message{
         .facility = .local5,
         .severity = .err,

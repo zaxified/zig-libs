@@ -58,7 +58,7 @@ fn handler(req: *http.Server.Request, res: *http.Server.ResponseWriter) anyerror
             break :blk null;
         };
         r.served += 1;
-        if (std.mem.indexOf(u8, transcript.exchanges[i].body, "badNonce") != null) r.bad_nonces += 1;
+        if (std.mem.find(u8, transcript.exchanges[i].body, "badNonce") != null) r.bad_nonces += 1;
         break :blk i;
     };
     const e = transcript.exchanges[
@@ -108,9 +108,9 @@ fn replayScenario(name: []const u8, domains: []const []const u8, challenge: acme
     defer server.deinit();
     server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     var base_buf: [64]u8 = undefined;
-    replay.base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
+    replay.base = try std.mem.print(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
     var dir_buf: [80]u8 = undefined;
-    const dir_url = try std.fmt.bufPrint(&dir_buf, "{s}/dir", .{replay.base});
+    const dir_url = try std.mem.print(&dir_buf, "{s}/dir", .{replay.base});
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
@@ -158,7 +158,7 @@ fn replayScenario(name: []const u8, domains: []const []const u8, challenge: acme
 fn recordedBody(scenario: []const u8, needle: []const u8) ![]const u8 {
     for (transcript.exchanges) |e| {
         if (std.mem.eql(u8, e.scenario, scenario) and e.status == 200 and
-            std.mem.indexOf(u8, e.path, needle) != null) return e.body;
+            std.mem.find(u8, e.path, needle) != null) return e.body;
     }
     return error.NotRecorded;
 }
@@ -177,9 +177,9 @@ fn replayLifecycle() !void {
     defer server.deinit();
     server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     var base_buf: [64]u8 = undefined;
-    replay.base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
+    replay.base = try std.mem.print(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
     var dir_buf: [80]u8 = undefined;
-    const dir_url = try std.fmt.bufPrint(&dir_buf, "{s}/dir", .{replay.base});
+    const dir_url = try std.mem.print(&dir_buf, "{s}/dir", .{replay.base});
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();
@@ -229,7 +229,7 @@ fn replayLifecycle() !void {
 
     // The alternate chain, asked for by the CN atop Pebble's recorded alternate.
     const alt_pem = try recordedBody("lifecycle", "/alternate/");
-    const top = std.mem.lastIndexOf(u8, alt_pem, "-----BEGIN CERTIFICATE-----").?;
+    const top = std.mem.findLast(u8, alt_pem, "-----BEGIN CERTIFICATE-----").?;
     const top_der = try acme.x509.pemDecode(gpa, "CERTIFICATE", alt_pem[top..]);
     defer gpa.free(top_der);
     var alt = try client.obtainWith(names, .{ .preferred_chain = acme.x509.issuerCommonName(top_der).? });
@@ -275,9 +275,9 @@ fn replaySteps() !void {
     defer server.deinit();
     server.bind() catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
     var base_buf: [64]u8 = undefined;
-    replay.base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
+    replay.base = try std.mem.print(&base_buf, "http://127.0.0.1:{d}", .{server.boundAddress().getPort()});
     var dir_buf: [80]u8 = undefined;
-    const dir_url = try std.fmt.bufPrint(&dir_buf, "{s}/dir", .{replay.base});
+    const dir_url = try std.mem.print(&dir_buf, "{s}/dir", .{replay.base});
     const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
     defer thread.join();
     defer server.shutdown();

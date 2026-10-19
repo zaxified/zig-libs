@@ -104,7 +104,7 @@ fn echoMethod(
         },
         else => return services.status.bad_invalid_argument,
     };
-    const echoed = try std.fmt.allocPrint(allocator, "{s} (echoed by zig-libs)", .{text});
+    const echoed = try allocator.print("{s} (echoed by zig-libs)", .{text});
     try outputs.append(allocator, .{ .scalar = .{ .string = echoed } });
     return services.status.good;
 }
@@ -555,10 +555,10 @@ const Driver = struct {
     fn dumpCapture(d: *Driver, tag: []const u8) void {
         const dir_path = testkit.getEnv("OPCUA_CAPTURE_DIR") orelse return;
         var path_buf: [256]u8 = undefined;
-        if (std.fmt.bufPrint(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
+        if (std.mem.print(&path_buf, "{s}/{s}-c2s.bin", .{ dir_path, tag })) |path| {
             std.Io.Dir.cwd().writeFile(d.io, .{ .sub_path = path, .data = d.capture_c2s.items }) catch {};
         } else |_| {}
-        if (std.fmt.bufPrint(&path_buf, "{s}/{s}-s2c.bin", .{ dir_path, tag })) |path| {
+        if (std.mem.print(&path_buf, "{s}/{s}-s2c.bin", .{ dir_path, tag })) |path| {
             std.Io.Dir.cwd().writeFile(d.io, .{ .sub_path = path, .data = d.capture_s2c.items }) catch {};
         } else |_| {}
     }
@@ -616,7 +616,7 @@ fn runPodman(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) !Podm
 /// Spawn one of the image's client examples against this server, detached.
 fn startClient(gpa: std.mem.Allocator, io: std.Io, name: []const u8, example: []const u8) !PodmanResult {
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "/opt/open62541/build/bin/examples/{s}", .{example});
+    const path = try std.mem.print(&path_buf, "/opt/open62541/build/bin/examples/{s}", .{example});
     // Deliberately no `--rm`: a client that exits quickly would take its
     // container (and therefore `podman logs`, this test's assertion source)
     // with it. The container is removed by `stopContainer` instead.
@@ -689,7 +689,7 @@ const LogMarkerPeer = struct {
         defer res.deinit(self.gpa);
         var seen: usize = 0;
         var rest = res.stdout;
-        while (std.mem.indexOf(u8, rest, self.marker)) |i| {
+        while (std.mem.find(u8, rest, self.marker)) |i| {
             seen += 1;
             if (seen >= self.min_count) return true;
             rest = rest[i + self.marker.len ..];
@@ -805,7 +805,7 @@ test "LIVE open62541 -> our server: tutorial_client_firststeps connects, reads i
     // The example prints `date is: DD-MM-YYYY` after reading
     // Server_ServerStatus_CurrentTime over a full HEL / OPN / GetEndpoints /
     // CreateSession / ActivateSession / Read sequence.
-    if (std.mem.indexOf(u8, live.logs, "date is:") == null) {
+    if (std.mem.find(u8, live.logs, "date is:") == null) {
         std.debug.print("\ntutorial_client_firststeps output was:\n{s}\n", .{live.logs});
         return error.TestUnexpectedResult;
     }
@@ -836,7 +836,7 @@ test "LIVE open62541 -> our server: client_subscription_loop receives DataChange
     var changes: usize = 0;
     var it = std.mem.splitScalar(u8, live.logs, '\n');
     while (it.next()) |line| {
-        if (std.mem.indexOf(u8, line, "currentTime has changed") != null) changes += 1;
+        if (std.mem.find(u8, line, "currentTime has changed") != null) changes += 1;
     }
     if (changes == 0) {
         std.debug.print("\nclient_subscription_loop output was:\n{s}\n", .{live.logs});
@@ -867,7 +867,7 @@ test "LIVE open62541 -> our server: the `client` example browses, reads, writes,
         "Method call was successful", // Call of (1, 62541)
     };
     for (expectations) |needle| {
-        if (std.mem.indexOf(u8, logs, needle) == null) {
+        if (std.mem.find(u8, logs, needle) == null) {
             std.debug.print("\n`client` output missing \"{s}\":\n{s}\n", .{ needle, logs });
             return error.TestUnexpectedResult;
         }
@@ -1886,7 +1886,7 @@ fn makeO62ClientPki(gpa: std.mem.Allocator, io: std.Io) bool {
 fn removeO62ClientPki(io: std.Io) void {
     for ([_][]const u8{ "openssl.cnf", "key.pem", "cert.pem", "client_cert.der", "client_key.der" }) |name| {
         var buf: [256]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ o62_pki_dir, name }) catch continue;
+        const path = std.mem.print(&buf, "{s}/{s}", .{ o62_pki_dir, name }) catch continue;
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
     }
     std.Io.Dir.cwd().deleteDir(io, o62_pki_dir) catch {};
@@ -1981,7 +1981,7 @@ test "LIVE open62541 client_encryption -> our server: picks the Basic256Sha256 S
         "SecurityMode SignAndEncrypt",
     };
     for (expectations) |needle| {
-        if (std.mem.indexOf(u8, text, needle) == null) {
+        if (std.mem.find(u8, text, needle) == null) {
             std.debug.print("\nclient_encryption output missing \"{s}\":\n{s}\n", .{ needle, text });
             return error.TestUnexpectedResult;
         }

@@ -234,7 +234,7 @@ pub const Store = struct {
 
         while (opened < options.n_shards) : (opened += 1) {
             var buf: [512]u8 = undefined;
-            const path = std.fmt.bufPrint(
+            const path = std.mem.print(
                 &buf,
                 "{s}-{d:0>5}{s}",
                 .{ options.name_prefix, opened, options.name_suffix },
@@ -283,7 +283,7 @@ pub const Store = struct {
     /// for N of them that each have to.
     fn acquireLock(store: Storage, options: Options) InitError!Storage.Handle {
         var buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}.lock", .{options.name_prefix}) catch
+        const path = std.mem.print(&buf, "{s}.lock", .{options.name_prefix}) catch
             return error.ShardNameTooLong;
 
         const h = try store.open(path, .open_or_create);
@@ -299,7 +299,7 @@ pub const Store = struct {
     /// `acquireLock` write or lock anything.
     fn validateShardNameFits(options: Options) InitError!void {
         var buf: [512]u8 = undefined;
-        _ = std.fmt.bufPrint(
+        _ = std.mem.print(
             &buf,
             "{s}-{d:0>5}{s}",
             .{ options.name_prefix, options.n_shards - 1, options.name_suffix },
@@ -312,7 +312,7 @@ pub const Store = struct {
     /// handle table and the manifest must not spend one of its slots.
     fn checkManifest(store: Storage, options: Options) InitError!void {
         var buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}.manifest", .{options.name_prefix}) catch
+        const path = std.mem.print(&buf, "{s}.manifest", .{options.name_prefix}) catch
             return error.ShardNameTooLong;
 
         const h = try store.open(path, .open_or_create);
@@ -792,7 +792,7 @@ test "routing is deterministic and stable across store instances" {
     var buf: [32]u8 = undefined;
     var want: [200]usize = undefined;
     for (&want, 0..) |*w, n| {
-        const k = try std.fmt.bufPrint(&buf, "k-{d}", .{n});
+        const k = try std.mem.print(&buf, "k-{d}", .{n});
         w.* = s1.shardFor(k);
     }
     s1.deinit();
@@ -801,7 +801,7 @@ test "routing is deterministic and stable across store instances" {
     var s2 = try Store.init(testing.allocator, sim.storage(), .{ .n_shards = 8 });
     defer s2.deinit();
     for (want, 0..) |w, n| {
-        const k = try std.fmt.bufPrint(&buf, "k-{d}", .{n});
+        const k = try std.mem.print(&buf, "k-{d}", .{n});
         try testing.expectEqual(w, s2.shardFor(k));
         try testing.expect(s2.shardFor(k) < 8);
     }
@@ -818,7 +818,7 @@ test "keys distribute across shards (histogram sanity — hits >1 shard, all sha
     var hist = @as([n_shards]usize, @splat(0));
     var buf: [32]u8 = undefined;
     for (0..2000) |n| {
-        const k = try std.fmt.bufPrint(&buf, "user:{d}", .{n});
+        const k = try std.mem.print(&buf, "user:{d}", .{n});
         hist[store.shardFor(k)] += 1;
     }
     // Every shard should get a healthy share (expected ~250 each); assert none
@@ -842,14 +842,14 @@ test "round-trip: put→get across shards, delete, values survive reads on other
     var vbuf: [32]u8 = undefined;
     // Write a spread of keys (they fan out across all 4 shards).
     for (0..400) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "key-{d}", .{n});
-        const v = try std.fmt.bufPrint(&vbuf, "val-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "key-{d}", .{n});
+        const v = try std.mem.print(&vbuf, "val-{d}", .{n});
         try store.put(k, v);
     }
     // Read every one back through the router.
     for (0..400) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "key-{d}", .{n});
-        const want = try std.fmt.bufPrint(&vbuf, "val-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "key-{d}", .{n});
+        const want = try std.mem.print(&vbuf, "val-{d}", .{n});
         const got = try store.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expect(got != null);
@@ -858,18 +858,18 @@ test "round-trip: put→get across shards, delete, values survive reads on other
     // Delete half; the surviving half (which spans other shards) is untouched.
     for (0..400) |n| {
         if (n % 2 == 0) {
-            const k = try std.fmt.bufPrint(&kbuf, "key-{d}", .{n});
+            const k = try std.mem.print(&kbuf, "key-{d}", .{n});
             try store.delete(k);
         }
     }
     for (0..400) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "key-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "key-{d}", .{n});
         const got = try store.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         if (n % 2 == 0) {
             try testing.expect(got == null);
         } else {
-            const want = try std.fmt.bufPrint(&vbuf, "val-{d}", .{n});
+            const want = try std.mem.print(&vbuf, "val-{d}", .{n});
             try testing.expectEqualStrings(want, got.?);
         }
     }
@@ -1049,7 +1049,7 @@ test "multi-core write parallelism: three writers provably inside the backend at
     // needs one write per thread and the oracle needs every key checked.
     const total_keys = 400;
     for (0..total_keys) |n| {
-        const k = try std.fmt.allocPrint(a, "item-{d}", .{n});
+        const k = try a.print("item-{d}", .{n});
         try buckets[store.shardFor(k)].append(a, k);
     }
     // A thread with no keys would never reach the barrier and would time it out
@@ -1065,7 +1065,7 @@ test "multi-core write parallelism: three writers provably inside the backend at
         fn run(w: *@This()) void {
             var vbuf: [48]u8 = undefined;
             for (w.keys) |k| {
-                const v = std.fmt.bufPrint(&vbuf, "V{d}:{s}", .{ w.round, k }) catch {
+                const v = std.mem.print(&vbuf, "V{d}:{s}", .{ w.round, k }) catch {
                     w.err = error.Format;
                     return;
                 };
@@ -1102,8 +1102,8 @@ test "multi-core write parallelism: three writers provably inside the backend at
     var vbuf: [48]u8 = undefined;
     for (0..total_keys) |n| {
         var kbuf: [32]u8 = undefined;
-        const k = try std.fmt.bufPrint(&kbuf, "item-{d}", .{n});
-        const want = try std.fmt.bufPrint(&vbuf, "V{d}:{s}", .{ rounds - 1, k });
+        const k = try std.mem.print(&kbuf, "item-{d}", .{n});
+        const want = try std.mem.print(&vbuf, "V{d}:{s}", .{ rounds - 1, k });
         const got = try store.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expect(got != null);
@@ -1202,8 +1202,8 @@ test "persistence: data survives reopening the shards (FsStorage over a tmp dir)
         var kbuf: [32]u8 = undefined;
         var vbuf: [32]u8 = undefined;
         for (0..300) |n| {
-            const k = try std.fmt.bufPrint(&kbuf, "persist-{d}", .{n});
-            const v = try std.fmt.bufPrint(&vbuf, "durable-{d}", .{n});
+            const k = try std.mem.print(&kbuf, "persist-{d}", .{n});
+            const v = try std.mem.print(&vbuf, "durable-{d}", .{n});
             try store.put(k, v);
         }
     }
@@ -1216,8 +1216,8 @@ test "persistence: data survives reopening the shards (FsStorage over a tmp dir)
     var kbuf: [32]u8 = undefined;
     var vbuf: [32]u8 = undefined;
     for (0..300) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "persist-{d}", .{n});
-        const want = try std.fmt.bufPrint(&vbuf, "durable-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "persist-{d}", .{n});
+        const want = try std.mem.print(&vbuf, "durable-{d}", .{n});
         const got = try store2.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expect(got != null);
@@ -1246,7 +1246,7 @@ test "reopen with a different n_shards FAILS instead of silently reading empty" 
         defer store.deinit();
         var kbuf: [32]u8 = undefined;
         for (0..200) |n| {
-            const k = try std.fmt.bufPrint(&kbuf, "reshard-{d}", .{n});
+            const k = try std.mem.print(&kbuf, "reshard-{d}", .{n});
             try store.put(k, "v");
         }
     }
@@ -1269,7 +1269,7 @@ test "reopen with a different n_shards FAILS instead of silently reading empty" 
     defer ok.deinit();
     var kbuf: [32]u8 = undefined;
     for (0..200) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "reshard-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "reshard-{d}", .{n});
         const got = try ok.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expectEqualStrings("v", got.?);
@@ -1314,12 +1314,12 @@ test "non-power-of-two shard count uses modulo routing and round-trips" {
 
     var kbuf: [32]u8 = undefined;
     for (0..100) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "m-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "m-{d}", .{n});
         try testing.expect(store.shardFor(k) < 5);
         try store.put(k, "x");
     }
     for (0..100) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "m-{d}", .{n});
+        const k = try std.mem.print(&kbuf, "m-{d}", .{n});
         const got = try store.get(testing.allocator, k);
         defer if (got) |g| testing.allocator.free(g);
         try testing.expectEqualStrings("x", got.?);
@@ -1557,7 +1557,7 @@ test "scan: random keys across N shards come out in global order, both direction
             // includes prefixes of one another.
             const klen = r.intRangeAtMost(usize, 1, kbuf.len);
             r.bytes(kbuf[0..klen]);
-            const v = try std.fmt.bufPrint(&vbuf, "v{d}", .{n});
+            const v = try std.mem.print(&vbuf, "v{d}", .{n});
             try store.put(kbuf[0..klen], v);
             try model.put(gpa, kbuf[0..klen], v);
         }
@@ -1589,7 +1589,7 @@ test "scan: range bound edges — inclusive, exclusive, unbounded, present and a
     var kbuf: [8]u8 = undefined;
     var n: usize = 10;
     while (n < 100) : (n += 2) {
-        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>3}", .{n});
+        const k = try std.mem.print(&kbuf, "k{d:0>3}", .{n});
         try store.put(k, k);
         try model.put(gpa, k, k);
     }
@@ -1716,7 +1716,7 @@ test "scan: limit — zero, one, partial, exact, beyond, with bounds and reverse
 
     var kbuf: [8]u8 = undefined;
     for (0..60) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>3}", .{n});
+        const k = try std.mem.print(&kbuf, "k{d:0>3}", .{n});
         try store.put(k, k);
         try model.put(gpa, k, k);
     }
@@ -1819,7 +1819,7 @@ test "scan consistency: a scan sees the store as of scan(); later commits are in
 
     var kbuf: [8]u8 = undefined;
     for (0..200) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n * 2});
+        const k = try std.mem.print(&kbuf, "k{d:0>4}", .{n * 2});
         try store.put(k, "old");
         try model.put(gpa, k, "old");
     }
@@ -1844,7 +1844,7 @@ test "scan consistency: a scan sees the store as of scan(); later commits are in
             overwritten += 1;
             try store.delete(model.keys.items[seen + 6]);
             deleted += 1;
-            const fresh = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{seen * 2 + 9});
+            const fresh = try std.mem.print(&kbuf, "k{d:0>4}", .{seen * 2 + 9});
             try store.put(fresh, "new");
             inserted += 1;
         }
@@ -1917,7 +1917,7 @@ test "scan: every allocation failure is reported, sticky, and leak-free" {
     var kbuf: [8]u8 = undefined;
     const big = @as([5000]u8, @splat('v'));
     for (0..300) |n| {
-        const k = try std.fmt.bufPrint(&kbuf, "k{d:0>4}", .{n});
+        const k = try std.mem.print(&kbuf, "k{d:0>4}", .{n});
         try store.put(k, if (n % 50 == 0) &big else k);
     }
 

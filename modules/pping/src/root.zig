@@ -245,9 +245,9 @@ pub const Observation = struct {
 /// directions I was constructed with".
 pub const Estimator = struct {
     cfg: Config,
-    /// Indexed by `@intFromEnum(Direction)`. `tables[@intFromEnum(d)]`
+    /// Indexed by `@backingInt(Direction)`. `tables[@backingInt(d)]`
     /// holds the TSvals seen going direction `d`; a TSecr seen going `d`
-    /// is matched against `tables[@intFromEnum(d.opposite())]`.
+    /// is matched against `tables[@backingInt(d.opposite())]`.
     tables: [2]TsTable,
     /// Total `RttSample`s this estimator has emitted since `init`/`reset`.
     samples_emitted: u64 = 0,

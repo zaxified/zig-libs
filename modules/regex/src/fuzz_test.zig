@@ -14,7 +14,7 @@
 //!     first span is `find`'s, no empty span right after the previous one,
 //!     no span splitting a code point, and it ends;
 //!   - a literal-only pattern (no metacharacter drawn) matches exactly where
-//!     `std.mem.indexOf` finds it — a reference that shares no code;
+//!     `std.mem.find` finds it — a reference that shares no code;
 //!   - the two engines agree: the backtracker (short texts) and the Pike VM
 //!     (`pike_only`) give the same match and groups;
 //!   - the reader front end agrees with the slice one (one byte per read);
@@ -274,7 +274,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 
     if (g.literal_only and !posix) {
         hit(.literal);
-        const want = std.mem.indexOf(u8, input, pattern);
+        const want = std.mem.find(u8, input, pattern);
         if ((want != null) != any) return error.LiteralReferenceDisagrees;
         if (want) |w| if (found.?.start != w or found.?.end != w + pattern.len) return error.LiteralReferenceSpan;
     }

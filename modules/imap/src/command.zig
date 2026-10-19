@@ -156,7 +156,7 @@ pub const Tagger = struct {
 
     pub fn next(t: *Tagger, gpa: Allocator) Error![]u8 {
         t.n += 1;
-        return std.fmt.allocPrint(gpa, "T{d}", .{t.n}) catch error.OutOfMemory;
+        return gpa.print("T{d}", .{t.n}) catch error.OutOfMemory;
     }
 };
 
@@ -198,7 +198,7 @@ pub const Encoder = struct {
 
     pub fn number(e: *Encoder, v: u32) Error!void {
         var buf: [10]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch unreachable;
+        const s = std.mem.print(&buf, "{d}", .{v}) catch unreachable;
         return e.raw(s);
     }
 
@@ -822,9 +822,9 @@ fn fuzzBuilders(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
             if (!framedAsOneCommand(s.written())) return error.NotOneCommand;
             // No literal is possible here, so the stronger form must hold too.
             const body = s.written()[0 .. s.written().len - 2];
-            if (std.mem.indexOfScalar(u8, body, '\r') != null) return error.CarriageReturnInCommand;
-            if (std.mem.indexOfScalar(u8, body, '\n') != null) return error.LineFeedInCommand;
-            if (std.mem.indexOfScalar(u8, body, 0) != null) return error.NulInCommand;
+            if (std.mem.findScalar(u8, body, '\r') != null) return error.CarriageReturnInCommand;
+            if (std.mem.findScalar(u8, body, '\n') != null) return error.LineFeedInCommand;
+            if (std.mem.findScalar(u8, body, 0) != null) return error.NulInCommand;
         } else |_| CommandMark.mark(.refused);
     }
 
@@ -857,9 +857,9 @@ fn fuzzBuilders(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
         if (@field(Encoder, which)(&e, fl)) |_| {
             CommandMark.mark(.ok);
             const out = s.written();
-            if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInArgument;
-            if (std.mem.indexOfScalar(u8, out, '\n') != null) return error.LineFeedInArgument;
-            if (std.mem.indexOfScalar(u8, out, 0) != null) return error.NulInArgument;
+            if (std.mem.findScalar(u8, out, '\r') != null) return error.CarriageReturnInArgument;
+            if (std.mem.findScalar(u8, out, '\n') != null) return error.LineFeedInArgument;
+            if (std.mem.findScalar(u8, out, 0) != null) return error.NulInArgument;
         } else |_| CommandMark.mark(.refused);
     }
     {
@@ -873,9 +873,9 @@ fn fuzzBuilders(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void
             CommandMark.mark(.ok);
             const out = s.written();
             if (out.len < 2 or out[0] != '"' or out[out.len - 1] != '"') return error.NotQuoted;
-            if (std.mem.indexOfScalar(u8, out, '\r') != null) return error.CarriageReturnInQuoted;
-            if (std.mem.indexOfScalar(u8, out, '\n') != null) return error.LineFeedInQuoted;
-            if (std.mem.indexOfScalar(u8, out, 0) != null) return error.NulInQuoted;
+            if (std.mem.findScalar(u8, out, '\r') != null) return error.CarriageReturnInQuoted;
+            if (std.mem.findScalar(u8, out, '\n') != null) return error.LineFeedInQuoted;
+            if (std.mem.findScalar(u8, out, 0) != null) return error.NulInQuoted;
             var k: usize = 1;
             while (k < out.len - 1) : (k += 1) {
                 if (out[k] == '\\') {

@@ -1243,7 +1243,7 @@ test "Builder: the new options reproduce the tcpdump-checked bytes" {
     const built = try b.finish(.{});
     // The options region of the captured message up to (excluding) option 119.
     const opts = ack_with_options[header_len + 4 ..];
-    const end119 = std.mem.indexOf(u8, opts, &.{ 119, 24 }).?;
+    const end119 = std.mem.find(u8, opts, &.{ 119, 24 }).?;
     try testing.expectEqualSlices(u8, opts[0..end119], built[header_len + 4 ..][0..end119]);
 
     var b2 = try Builder.init(&buf, .{ .op = .boot_reply, .xid = 1 });
@@ -1255,7 +1255,7 @@ test "Builder: the new options reproduce the tcpdump-checked bytes" {
     });
     try b2.addDomainSearch(&.{ "eng.example.com", "corp.example.com" });
     const m = try Message.parse(try b2.finish(.{}));
-    const at121 = std.mem.indexOf(u8, opts, &.{ 121, 19 }).?;
+    const at121 = std.mem.find(u8, opts, &.{ 121, 19 }).?;
     try testing.expectEqualSlices(u8, opts[at121 + 2 ..][0..19], m.classless_static_routes.?);
     var di = m.domainSearch().?;
     var name: [DomainSearchIterator.max_name_len]u8 = undefined;

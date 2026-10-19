@@ -356,7 +356,7 @@ fn writeTape(path: []const u8, tape: []const u64) !void {
     defer _ = linux.close(fd);
     var line: [24]u8 = undefined;
     for (tape) |v| {
-        const txt = std.fmt.bufPrint(&line, "{d}\n", .{v}) catch unreachable;
+        const txt = std.mem.print(&line, "{d}\n", .{v}) catch unreachable;
         var off: usize = 0;
         while (off < txt.len) {
             const n = linux.write(fd, txt[off..].ptr, txt.len - off);

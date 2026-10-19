@@ -194,7 +194,7 @@ pub fn main() !void {
             };
             const feth = rawsock.EthHeader.parse(frame.bytes) orelse continue;
             if (feth.ethertype != test_ethertype) continue;
-            if (std.mem.indexOf(u8, frame.bytes[rawsock.eth_hdr_len..], payload) != null) seen = true;
+            if (std.mem.find(u8, frame.bytes[rawsock.eth_hdr_len..], payload) != null) seen = true;
         }
         std.debug.print(
             "CAP_NET_RAW IS available: real AF_PACKET capture+inject on lo ran, saw own frame back={}\n",

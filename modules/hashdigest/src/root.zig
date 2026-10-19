@@ -374,7 +374,7 @@ test "sha256File: temp file matches in-memory hash and byte count" {
     try tmp.dir.writeFile(io, .{ .sub_path = "hashme.bin", .data = data });
 
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/hashme.bin", .{&tmp.sub_path});
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hashme.bin", .{&tmp.sub_path});
 
     var file_hex: [hex_len]u8 = undefined;
     const n = sha256File(io, path, &file_hex) orelse return error.TestUnexpectedResult;
@@ -582,7 +582,7 @@ test "hashFile: temp file matches in-memory digest (blake3), count correct" {
     try tmp.dir.writeFile(io, .{ .sub_path = "hashme3.bin", .data = data });
 
     var path_buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/hashme3.bin", .{&tmp.sub_path});
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/hashme3.bin", .{&tmp.sub_path});
 
     var file_hex: [max_hex_len]u8 = undefined;
     const n = (try hashFile(.blake3, io, path, &file_hex)) orelse return error.TestUnexpectedResult;

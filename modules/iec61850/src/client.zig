@@ -329,7 +329,7 @@ pub const Client = struct {
 
     /// Reads a whole data set (named variable list) in one request.
     pub fn readDataSet(self: *Client, reference: []const u8) Error!mms.AccessResultIterator {
-        const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return error.MissingLogicalDevice;
+        const slash = std.mem.findScalar(u8, reference, '/') orelse return error.MissingLogicalDevice;
         const name = mms.ObjectName{ .domain_specific = .{
             .domain = reference[0..slash],
             .item = reference[slash + 1 ..],
@@ -568,7 +568,7 @@ pub const Client = struct {
     }
 
     fn journalName(reference: []const u8) Error!mms.ObjectName {
-        const slash = std.mem.indexOfScalar(u8, reference, '/') orelse return error.BadReference;
+        const slash = std.mem.findScalar(u8, reference, '/') orelse return error.BadReference;
         return .{ .domain_specific = .{
             .domain = reference[0..slash],
             .item = reference[slash + 1 ..],

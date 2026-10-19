@@ -102,13 +102,13 @@ test "rollover: XSW classic wrap is still detected whichever key verifies" {
     const alloc = testing.allocator;
     const sig_open = "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">";
     const asrt_open = "<saml:Assertion ID=";
-    const si = std.mem.indexOf(u8, fx.signed_response, sig_open).?;
-    const legit_sig = fx.signed_response[si .. std.mem.indexOfPos(u8, fx.signed_response, si, "</ds:Signature>").? + "</ds:Signature>".len];
-    const ai = std.mem.indexOf(u8, fx.signed_response, asrt_open).?;
-    const legit_asrt = fx.signed_response[ai .. std.mem.indexOfPos(u8, fx.signed_response, ai, "</saml:Assertion>").? + "</saml:Assertion>".len];
+    const si = std.mem.find(u8, fx.signed_response, sig_open).?;
+    const legit_sig = fx.signed_response[si .. std.mem.findPos(u8, fx.signed_response, si, "</ds:Signature>").? + "</ds:Signature>".len];
+    const ai = std.mem.find(u8, fx.signed_response, asrt_open).?;
+    const legit_asrt = fx.signed_response[ai .. std.mem.findPos(u8, fx.signed_response, ai, "</saml:Assertion>").? + "</saml:Assertion>".len];
     const legit_nosig = try std.mem.replaceOwned(u8, alloc, legit_asrt, legit_sig, "");
     defer alloc.free(legit_nosig);
-    const evil = try std.fmt.allocPrint(alloc, "<saml:Assertion ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
+    const evil = try alloc.print("<saml:Assertion ID=\"_evilwrap\" Version=\"2.0\" IssueInstant=\"2024-06-01T12:00:00Z\">" ++
         "<saml:Issuer>https://idp.example.org/saml</saml:Issuer>{s}" ++
         "<saml:Subject><saml:NameID>attacker@evil.example</saml:NameID>" ++
         "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">" ++
@@ -127,8 +127,8 @@ test "rollover: XSW classic wrap is still detected whichever key verifies" {
 test "rollover: an unsigned response is SignatureMissing regardless of the key set" {
     const alloc = testing.allocator;
     const sig_open = "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">";
-    const si = std.mem.indexOf(u8, fx.signed_response, sig_open).?;
-    const legit_sig = fx.signed_response[si .. std.mem.indexOfPos(u8, fx.signed_response, si, "</ds:Signature>").? + "</ds:Signature>".len];
+    const si = std.mem.find(u8, fx.signed_response, sig_open).?;
+    const legit_sig = fx.signed_response[si .. std.mem.findPos(u8, fx.signed_response, si, "</ds:Signature>").? + "</ds:Signature>".len];
     const unsigned = try std.mem.replaceOwned(u8, alloc, fx.signed_response, legit_sig, "");
     defer alloc.free(unsigned);
     const old = try otherRsaKey(0x5011_0008);

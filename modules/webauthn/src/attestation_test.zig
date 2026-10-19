@@ -1017,8 +1017,7 @@ fn runRegistrationScript(a: std.mem.Allocator, bytes: []const u8) !RegistrationO
             const enc = std.base64.url_safe_no_pad.Encoder;
             const chal_b64 = try a.alloc(u8, enc.calcSize(chal_len));
             _ = enc.encode(chal_b64, chal_raw[0..chal_len]);
-            break :blk try std.fmt.allocPrint(
-                a,
+            break :blk try a.print(
                 "{{\"type\":\"{s}\",\"challenge\":\"{s}\",\"origin\":\"{s}\",\"crossOrigin\":false}}",
                 .{
                     fuzz_types[s.byte() % fuzz_types.len],

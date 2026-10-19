@@ -137,7 +137,7 @@ pub const ReshareConfig = struct {
         if (self.old_verifying_shares.len != self.old.n) return error.InvalidConfig;
         for (self.dealers, 0..) |d, i| {
             if (d < 1 or d > self.old.n) return error.InvalidConfig;
-            if (std.mem.indexOfScalar(u32, self.dealers[0..i], d) != null) return error.InvalidConfig;
+            if (std.mem.findScalar(u32, self.dealers[0..i], d) != null) return error.InvalidConfig;
         }
     }
 };
@@ -284,7 +284,7 @@ pub const ReshareDealer = struct {
         const c = Complaint.fromBytes(bytes[1..][0..Complaint.encoded_length].*);
         if (c.complainant != from) return error.SenderMismatch;
         if (c.accused != self.me) return; // about another dealer: not ours to answer
-        if (std.mem.indexOfScalar(u32, self.complainers.items, from) != null) return error.DuplicateMessage;
+        if (std.mem.findScalar(u32, self.complainers.items, from) != null) return error.DuplicateMessage;
         try self.complainers.append(self.arena.allocator(), from);
     }
 
@@ -457,7 +457,7 @@ pub const ReshareReceiver = struct {
     }
 
     fn dealerPos(self: *const ReshareReceiver, old_id: u32) ?usize {
-        return std.mem.indexOfScalar(u32, self.rc.dealers, old_id);
+        return std.mem.findScalar(u32, self.rc.dealers, old_id);
     }
 
     fn readId(body: []const u8, at: usize) u32 {

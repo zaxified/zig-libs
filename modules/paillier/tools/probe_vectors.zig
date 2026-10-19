@@ -49,7 +49,7 @@ fn hex(fe: paillier.Fe) []const u8 {
     var i: usize = 0;
     while (i + 1 < b.len and b[i] == 0) i += 1;
     const src = b[i..];
-    const s = std.fmt.bufPrint(&out_buf, "{x}", .{src}) catch unreachable;
+    const s = std.mem.print(&out_buf, "{x}", .{src}) catch unreachable;
     // bufPrint reuses one buffer, so callers must consume before the next call
     return s;
 }

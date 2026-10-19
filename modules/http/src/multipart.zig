@@ -107,7 +107,7 @@ pub const Part = struct {
 fn findHeader(headers_raw: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitSequence(u8, headers_raw, "\r\n");
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
         return std.mem.trim(u8, line[colon + 1 ..], " \t");
     }
@@ -209,7 +209,7 @@ pub const Iterator = struct {
         const hdr: struct { raw: []u8, body_off: usize } = blk: {
             if (std.mem.startsWith(u8, it.rest, "\r\n"))
                 break :blk .{ .raw = it.rest[0..0], .body_off = 2 };
-            const end = std.mem.indexOf(u8, it.rest, "\r\n\r\n") orelse
+            const end = std.mem.find(u8, it.rest, "\r\n\r\n") orelse
                 return error.MalformedBody;
             break :blk .{ .raw = it.rest[0..end], .body_off = end + 4 };
         };
@@ -245,7 +245,7 @@ fn wellFormedHeaders(raw: []const u8) bool {
     if (raw.len == 0) return true;
     var lines = std.mem.splitSequence(u8, raw, "\r\n");
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return false;
+        const colon = std.mem.findScalar(u8, line, ':') orelse return false;
         if (colon == 0) return false;
         for (line[0..colon]) |c| if (!h1.isTchar(c)) return false;
     }
@@ -255,7 +255,7 @@ fn wellFormedHeaders(raw: []const u8) bool {
 /// Index in `hay` of the first full delimiter `"\r\n--" ++ boundary`, or null.
 fn indexOfDelimiter(hay: []const u8, boundary: []const u8) ?usize {
     var from: usize = 0;
-    while (std.mem.indexOfPos(u8, hay, from, "\r\n--")) |p| : (from = p + 1) {
+    while (std.mem.findPos(u8, hay, from, "\r\n--")) |p| : (from = p + 1) {
         if (std.mem.startsWith(u8, hay[p + 4 ..], boundary)) return p;
     }
     return null;

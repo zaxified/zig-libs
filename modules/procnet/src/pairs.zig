@@ -73,7 +73,7 @@ pub const PairTable = struct {
 pub const read_limit: usize = 1 << 20;
 
 fn sectionOf(line: []const u8) ?[]const u8 {
-    const c = std.mem.indexOfScalar(u8, line, ':') orelse return null;
+    const c = std.mem.findScalar(u8, line, ':') orelse return null;
     if (c == 0) return null;
     return line[0..c];
 }

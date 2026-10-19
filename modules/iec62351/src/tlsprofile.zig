@@ -816,7 +816,7 @@ test "wrong key usage: a real certificate patched to drop digitalSignature fails
     // in place is the honest way to get a certificate with the wrong usage
     // without inventing a second certificate builder.
     const oid = [_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x0f };
-    const at = std.mem.indexOf(u8, der, &oid).?;
+    const at = std.mem.find(u8, der, &oid).?;
     // ... 06 03 55 1d 0f 01 01 ff 04 04 03 02 <unused> <bits>
     const bits_at = at + oid.len + 3 + 2 + 2 + 1;
     try testing.expectEqual(@as(u8, 0x80), der[bits_at]);

@@ -148,9 +148,9 @@ pub fn gatesHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
             const mid = origin[8 .. n - 12];
             try testing.expectEqualStrings(origin, granted);
             try testing.expect(mid.len != 0);
-            for (mid) |ch| try testing.expect(std.mem.indexOfScalar(u8, "@/:", ch) == null);
+            for (mid) |ch| try testing.expect(std.mem.findScalar(u8, "@/:", ch) == null);
             try testing.expect(mid[0] != '.' and mid[mid.len - 1] != '.');
-            try testing.expect(std.mem.indexOf(u8, mid, "..") == null);
+            try testing.expect(std.mem.find(u8, mid, "..") == null);
         } else mark(.pattern_refused);
     }
 }

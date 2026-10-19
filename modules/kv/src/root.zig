@@ -1219,11 +1219,11 @@ pub const Db = struct {
             .last_sync_ms = if (options.sync == .interval_ms) options.sync_clock.now() else 0,
         };
         errdefer gpa.free(self.path);
-        self.tmp_path = try std.fmt.allocPrint(gpa, "{s}.compact", .{path});
+        self.tmp_path = try gpa.print("{s}.compact", .{path});
         errdefer gpa.free(self.tmp_path);
-        self.manifest_tmp = try std.fmt.allocPrint(gpa, "{s}.manifest", .{path});
+        self.manifest_tmp = try gpa.print("{s}.manifest", .{path});
         errdefer gpa.free(self.manifest_tmp);
-        self.lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+        self.lock_path = try gpa.print("{s}.lock", .{path});
         errdefer gpa.free(self.lock_path);
 
         // Cross-process exclusion, before anything else touches the store.
@@ -1394,7 +1394,7 @@ pub const Db = struct {
     /// Name of data file `id` (or of its hint), caller frees.
     fn fileName(self: *Db, id: u32, comptime ext: []const u8) Allocator.Error![]u8 {
         if (id == legacy_id) return self.gpa.dupe(u8, self.path);
-        return std.fmt.allocPrint(self.gpa, "{s}.{d}." ++ ext, .{ self.path, id });
+        return self.gpa.print("{s}.{d}." ++ ext, .{ self.path, id });
     }
 
     /// `<path>` is missing but `<path>.0.data` exists: a migration crashed
@@ -1593,7 +1593,7 @@ pub const Db = struct {
             defer self.rw.unlock();
             for (self.files.items) |df| {
                 self.releaseLocked(df);
-                if (std.mem.indexOfScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
+                if (std.mem.findScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
             }
             self.files.deinit(self.gpa);
             self.freeKeydir();
@@ -2092,7 +2092,7 @@ pub const Db = struct {
                 if (kv.value_ptr.expires() and !kv.value_ptr.liveAt(now)) continue;
                 try items.ensureUnusedCapacity(gpa, 1);
                 items.appendAssumeCapacity(.{ .key = try gpa.dupe(u8, kv.key_ptr.*), .e = kv.value_ptr.* });
-                if (std.mem.indexOfScalar(*DataFile, pinned.items, kv.value_ptr.file) == null)
+                if (std.mem.findScalar(*DataFile, pinned.items, kv.value_ptr.file) == null)
                     pinned.appendAssumeCapacity(kv.value_ptr.file);
             }
             // Pinned under the shared lock: no merge can swap a file out
@@ -2196,7 +2196,7 @@ pub const Db = struct {
             var it = self.keydir.valueIterator();
             while (it.next()) |e| {
                 if (e.liveAt(now)) continue;
-                const i = std.mem.indexOfScalar(*DataFile, self.files.items, e.file).?;
+                const i = std.mem.findScalar(*DataFile, self.files.items, e.file).?;
                 const len = e.recLen();
                 out[i].live_keys -= 1;
                 out[i].live_bytes -= len;
@@ -2275,7 +2275,7 @@ pub const Db = struct {
             defer self.rw.unlockShared();
             if (!self.multi) return;
             for (self.files.items[0 .. self.files.items.len - 1], 0..) |df, pos| {
-                if (std.mem.indexOfScalar(u32, ids, df.id) != null) {
+                if (std.mem.findScalar(u32, ids, df.id) != null) {
                     try sel.append(self.gpa, df);
                     try sel_pos.append(self.gpa, pos);
                 } else if (first_unmerged == std.math.maxInt(usize)) {
@@ -2384,7 +2384,7 @@ pub const Db = struct {
         for (self.files.items) |df| {
             if (df == last_sel) {
                 try new_files.appendSlice(self.gpa, outs.items);
-            } else if (std.mem.indexOfScalar(*DataFile, sel.items, df) == null) {
+            } else if (std.mem.findScalar(*DataFile, sel.items, df) == null) {
                 try new_files.append(self.gpa, df);
             }
         }
@@ -2553,7 +2553,7 @@ pub const Db = struct {
         // The old file's name now belongs to the new one; only the handle
         // and the struct go (at once, or at its iterators' last unpin).
         self.releaseLocked(act);
-        if (std.mem.indexOfScalar(*DataFile, self.retired.items, act) == null) self.gpa.destroy(act);
+        if (std.mem.findScalar(*DataFile, self.retired.items, act) == null) self.gpa.destroy(act);
         // Removal leaves the other entries in place (no rehash), so the
         // pointers above stayed valid; drop the expired ones only now.
         for (expired.items) |k| {
@@ -2746,10 +2746,10 @@ pub const Db = struct {
         for (old) |df| {
             const gone = if (self.deleteDataFile(df.id)) |_| true else |_| false;
             if (gone) {
-                const at = std.mem.indexOfScalar(u32, self.obsolete.items, df.id).?;
+                const at = std.mem.findScalar(u32, self.obsolete.items, df.id).?;
                 _ = self.obsolete.orderedRemove(at);
             }
-            if (std.mem.indexOfScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
+            if (std.mem.findScalar(*DataFile, self.retired.items, df) == null) self.gpa.destroy(df);
         }
     }
 
@@ -2759,14 +2759,14 @@ pub const Db = struct {
         if (df.pins.fetchSub(1, .acq_rel) != 1) return;
         self.lock.acquire();
         defer self.lock.release();
-        const at = std.mem.indexOfScalar(*DataFile, self.retired.items, df) orelse return;
+        const at = std.mem.findScalar(*DataFile, self.retired.items, df) orelse return;
         _ = self.retired.swapRemove(at);
         self.store.close(df.handle);
         self.gpa.destroy(df);
     }
 
     fn dropPending(self: *Db, id: u32) void {
-        if (std.mem.indexOfScalar(u32, self.pending.items, id)) |at| _ = self.pending.swapRemove(at);
+        if (std.mem.findScalar(u32, self.pending.items, id)) |at| _ = self.pending.swapRemove(at);
     }
 
     /// Create the next merge output (header written, not yet synced) under
@@ -3266,7 +3266,7 @@ test "expiry: open and compact drop expired keys from memory and file" {
         try testing.expectEqual(@as(usize, 1), db.expiring);
         try testing.expectEqual(@as(u64, recordLenExp(true, 5, 10)), db.deadBytes());
         try db.compact();
-        try testing.expect(std.mem.indexOf(u8, sim.fileContent("db").?, "SHORTVALUE") == null);
+        try testing.expect(std.mem.find(u8, sim.fileContent("db").?, "SHORTVALUE") == null);
         try testing.expectEqual(@as(u64, 0), db.deadBytes());
 
         mc.now_ms = 9_000; // "long" expires while open; compact drops it
@@ -3275,8 +3275,8 @@ test "expiry: open and compact drop expired keys from memory and file" {
         try testing.expect(!db.keydir.contains("long"));
         try testing.expectEqual(@as(usize, 0), db.expiring);
         const file = sim.fileContent("db").?;
-        try testing.expect(std.mem.indexOf(u8, file, "LONGVALUE") == null);
-        try testing.expect(std.mem.indexOf(u8, file, "PLAINVALUE") != null);
+        try testing.expect(std.mem.find(u8, file, "LONGVALUE") == null);
+        try testing.expect(std.mem.find(u8, file, "PLAINVALUE") != null);
         try expectGet(&db, "plain", "PLAINVALUE");
     }
 }
@@ -3540,7 +3540,7 @@ test "multi-file: compact merges into new files and deletes the old ones" {
     defer db.close();
     for (0..12) |i| {
         var k: [4]u8 = undefined;
-        try db.put(try std.fmt.bufPrint(&k, "k{d}", .{i % 4}), "value-of-twenty-bytes");
+        try db.put(try std.mem.print(&k, "k{d}", .{i % 4}), "value-of-twenty-bytes");
     }
     try testing.expect(db.deadBytes() > 0);
     const old_ids = try testing.allocator.alloc(u32, db.files.items.len);
@@ -3550,13 +3550,13 @@ test "multi-file: compact merges into new files and deletes the old ones" {
     try testing.expectEqual(@as(u64, 0), db.deadBytes());
     for (old_ids) |id| {
         var name: [16]u8 = undefined;
-        try testing.expect(sim.fileContent(try std.fmt.bufPrint(&name, "db.{d}.data", .{id})) == null);
+        try testing.expect(sim.fileContent(try std.mem.print(&name, "db.{d}.data", .{id})) == null);
         for (db.files.items) |df| try testing.expect(df.id != id);
     }
     try testing.expectEqual(@as(usize, 0), db.obsolete.items.len);
     for (0..4) |i| {
         var k: [4]u8 = undefined;
-        try expectGet(&db, try std.fmt.bufPrint(&k, "k{d}", .{i}), "value-of-twenty-bytes");
+        try expectGet(&db, try std.mem.print(&k, "k{d}", .{i}), "value-of-twenty-bytes");
     }
     // Writes go on into the merge's last file, and survive a reopen.
     try db.put("after", "merge");
@@ -3640,7 +3640,7 @@ test "multi-file: a data file past next_file_id is a crashed creation, deleted o
         next = db.next_file_id;
     }
     var name: [16]u8 = undefined;
-    const stray = try std.fmt.bufPrint(&name, "db.{d}.data", .{next});
+    const stray = try std.mem.print(&name, "db.{d}.data", .{next});
     try sim.installFile(stray, "ZKVL\x02\x00\x00\x00garbage");
     var db = try Db.open(testing.allocator, sim.storage(), "db", options);
     defer db.close();
@@ -3665,7 +3665,7 @@ test "merge: mergePlan picks fragmented sealed files; merge rewrites only those"
     try db.put("b", v30);
     for (0..4) |i| {
         var k: [8]u8 = undefined;
-        try db.put(try std.fmt.bufPrint(&k, "keep-{d}", .{i}), v30);
+        try db.put(try std.mem.print(&k, "keep-{d}", .{i}), v30);
     }
     const t: Db.MergeThresholds = .{ .trigger_fragmentation = 50, .threshold_fragmentation = 50, .small_file = 0 };
     const stats = try db.fileStats(testing.allocator);
@@ -3783,7 +3783,7 @@ test "hints: open applies a merge output's hint without reading its values" {
         defer db.close();
         for (0..6) |i| {
             var k: [4]u8 = undefined;
-            try db.put(try std.fmt.bufPrint(&k, "k{d}", .{i}), v30);
+            try db.put(try std.mem.print(&k, "k{d}", .{i}), v30);
         }
         try db.compact(); // outputs: two records each, the last one active
         try testing.expect(db.files.items.len >= 3);
@@ -3792,15 +3792,15 @@ test "hints: open applies a merge output's hint without reading its values" {
     }
     var hb: [16]u8 = undefined;
     var db_b: [16]u8 = undefined;
-    const hint_name = try std.fmt.bufPrint(&hb, "db.{d}.hint", .{first_id});
-    const data_name = try std.fmt.bufPrint(&db_b, "db.{d}.data", .{first_id});
+    const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{first_id});
+    const data_name = try std.mem.print(&db_b, "db.{d}.data", .{first_id});
     try testing.expect(sim.fileContent(hint_name) != null);
 
     // Rot inside a value of the first (sealed) output: replaying it would
     // refuse the store; with its hint, open never reads the value — and the
     // read-time CRC check still refuses to serve it.
     const data = sim.fileContent(data_name).?;
-    const val_at = std.mem.indexOf(u8, data, v30).?;
+    const val_at = std.mem.find(u8, data, v30).?;
     sim.flipByte(data_name, val_at + 3);
     {
         var db = try Db.open(testing.allocator, sim.storage(), "db", options);
@@ -3815,7 +3815,7 @@ test "hints: open applies a merge output's hint without reading its values" {
     // structure intact: open replays the data file instead.
     const good_hint = try testing.allocator.dupe(u8, sim.fileContent(hint_name).?);
     defer testing.allocator.free(good_hint);
-    const key_at = std.mem.indexOf(u8, good_hint, "k").?;
+    const key_at = std.mem.find(u8, good_hint, "k").?;
     sim.flipByte(hint_name, key_at);
     {
         var db = try Db.open(testing.allocator, sim.storage(), "db", options);
@@ -4317,7 +4317,7 @@ test "replay: rot inside a record larger than the read window cuts the log there
         try db.put("big", big);
         try db.put("after", "2");
     }
-    const at = std.mem.indexOf(u8, sim.fileContent("db").?, big[150 * 1024 ..][0..64]).?;
+    const at = std.mem.find(u8, sim.fileContent("db").?, big[150 * 1024 ..][0..64]).?;
     sim.flipByte("db", at); // past the first window's worth of the value
     var db = try Db.open(testing.allocator, sim.storage(), "db", .{});
     defer db.close();
@@ -4619,11 +4619,11 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
             var val: [32]u8 = undefined;
             for (0..400) |i| {
                 var kb: [4]u8 = undefined;
-                const k = std.fmt.bufPrint(&kb, "k{d}", .{i % 16}) catch unreachable;
+                const k = std.mem.print(&kb, "k{d}", .{i % 16}) catch unreachable;
                 if (i % 7 == 3) {
                     d.delete(k) catch unreachable;
                 } else {
-                    const v = std.fmt.bufPrint(&val, "{s}={d}", .{ k, i }) catch unreachable;
+                    const v = std.mem.print(&val, "{s}={d}", .{ k, i }) catch unreachable;
                     d.put(k, v) catch unreachable;
                 }
                 if (i % 50 == 49) d.compact() catch unreachable;
@@ -4638,7 +4638,7 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
             while (!stop.load(.acquire)) {
                 for (0..16) |i| {
                     var kb: [4]u8 = undefined;
-                    const k = std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable;
+                    const k = std.mem.print(&kb, "k{d}", .{i}) catch unreachable;
                     r.reads += 1;
                     const v = (d.getBuf(&buf, k) catch {
                         r.bad += 1;
@@ -4699,7 +4699,7 @@ test "concurrency: readers alongside puts, deletes and compactions (real filesys
                 f.refreshes += 1;
                 for (0..16) |i| {
                     var kb: [4]u8 = undefined;
-                    const k = std.fmt.bufPrint(&kb, "k{d}", .{i}) catch unreachable;
+                    const k = std.mem.print(&kb, "k{d}", .{i}) catch unreachable;
                     const v = (r.getBuf(&buf, k) catch {
                         f.bad += 1;
                         continue;
@@ -4744,7 +4744,7 @@ test "FsStorage hands its Io to the Db, whose lock then waits through it" {
         fn run(d: *Db, prefix: u8) void {
             for (0..40) |i| {
                 var key: [8]u8 = undefined;
-                const k = std.fmt.bufPrint(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
+                const k = std.mem.print(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
                 d.put(k, "v") catch unreachable;
             }
         }
@@ -4769,7 +4769,7 @@ test "concurrent puts from two threads (coarse lock smoke test)" {
             var i: usize = 0;
             while (i < 50) : (i += 1) {
                 var key: [8]u8 = undefined;
-                const k = std.fmt.bufPrint(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
+                const k = std.mem.print(&key, "{c}-{d}", .{ prefix, i }) catch unreachable;
                 d.put(k, "v") catch unreachable;
             }
         }
@@ -4854,7 +4854,7 @@ test "FsStorage: the default handle table holds more than one store's worth of f
     var handles: [8]Storage.Handle = undefined;
     for (&handles, 0..) |*h, i| {
         var name_buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "shard{d}.bin", .{i});
+        const name = try std.mem.print(&name_buf, "shard{d}.bin", .{i});
         h.* = try st.open(name, .open_or_create);
     }
     for (handles) |h| st.close(h);
@@ -4877,7 +4877,7 @@ test "FsStorage: the default handle table is exactly 64, not merely at least 8" 
     var handles: [64]Storage.Handle = undefined;
     for (&handles, 0..) |*h, i| {
         var name_buf: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "h{d}.bin", .{i});
+        const name = try std.mem.print(&name_buf, "h{d}.bin", .{i});
         h.* = try st.open(name, .open_or_create);
     }
     // The 65th handle is refused: the table is 64 wide, not 65 or unbounded.

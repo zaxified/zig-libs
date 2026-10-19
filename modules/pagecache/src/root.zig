@@ -825,7 +825,7 @@ fn runWorkload(db: *kvtree.Db, seed: u64, ops: usize, key_space: u64, val_len: u
     var i: usize = 0;
     while (i < ops) : (i += 1) {
         const id = rng.below(key_space);
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
         if (rng.below(10) < 7) {
             // Fill the value with id-derived bytes of the requested length.
             for (scratch[0..val_len], 0..) |*b, j| b.* = @truncate(id +% j);
@@ -873,7 +873,7 @@ test "transparency: kvtree over PageCache(Sim) == kvtree over raw Sim (identical
     var kbuf: [32]u8 = undefined;
     var id: u64 = 0;
     while (id < 200) : (id += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
         const a = try raw_db.get(gpa, key);
         defer if (a) |v| gpa.free(v);
         const b = try cached_db.get(gpa, key);
@@ -933,7 +933,7 @@ test "bounding: working set >> budget stays within the budget, evicts, and still
     var found: usize = 0;
     var id: u64 = 0;
     while (id < 400) : (id += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
         const got = try db.get(gpa, key);
         defer if (got) |v| gpa.free(v);
         if (got) |v| {
@@ -1011,14 +1011,14 @@ test "in-place meta-page overwrite works through the cache (allow_overwrite path
     var i: usize = 0;
     var kbuf: [16]u8 = undefined;
     while (i < 50) : (i += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+        const key = try std.mem.print(&kbuf, "k{d}", .{i});
         try db.put(key, "v");
     }
     // Read the newest committed state back — a stale cached meta page would
     // point at an old root and lose recent keys.
     i = 0;
     while (i < 50) : (i += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+        const key = try std.mem.print(&kbuf, "k{d}", .{i});
         const got = try db.get(gpa, key);
         defer if (got) |v| gpa.free(v);
         try testing.expectEqualStrings("v", got.?);
@@ -1614,7 +1614,7 @@ test "F3: kvtree's read descent really takes the borrow seam, and still reads id
     var kbuf: [32]u8 = undefined;
     var id: u64 = 0;
     while (id < 150) : (id += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
         const a = try raw_db.get(gpa, key);
         defer if (a) |v| gpa.free(v);
         const b = try db.get(gpa, key);
@@ -1996,8 +1996,8 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
     {
         var txn = try db.begin();
         for (0..n) |i| {
-            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
-            try txn.put(key, try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}));
+            const key = try std.mem.print(&kbuf, "key{d:0>5}", .{i});
+            try txn.put(key, try std.mem.print(&vbuf, "old-{d}", .{i}));
         }
         try txn.commit();
     }
@@ -2015,9 +2015,9 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
                 r.next += 37;
                 var kb: [32]u8 = undefined;
                 var wb: [48]u8 = undefined;
-                const key = try std.fmt.bufPrint(&kb, "key{d:0>5}", .{i});
+                const key = try std.mem.print(&kb, "key{d:0>5}", .{i});
                 const ver = if (i % 2 == 0) r.even else "old";
-                const want = try std.fmt.bufPrint(&wb, "{s}-{d}", .{ ver, i });
+                const want = try std.mem.print(&wb, "{s}-{d}", .{ ver, i });
                 var got = (try r.db.getRef(key)) orelse return error.KeyMissing;
                 defer got.release();
                 if (!std.mem.eql(u8, got.bytes, want)) return error.SawAnUncommittedOrCorruptValue;
@@ -2032,8 +2032,8 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
         const ver = if (round == 0) "new" else "newer";
         for (0..n) |i| {
             if (i % 2 == 1) continue; // half the keys, so base pages are shared
-            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
-            try txn.put(key, try std.fmt.bufPrint(&vbuf, "{s}-{d}", .{ ver, i }));
+            const key = try std.mem.print(&kbuf, "key{d:0>5}", .{i});
+            try txn.put(key, try std.mem.print(&vbuf, "{s}-{d}", .{ ver, i }));
         }
         ys.hook = Reader.run;
         ys.hook_ctx = &reader;
@@ -2048,10 +2048,10 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
 
         // And after it, the new version.
         for (0..n) |i| {
-            const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+            const key = try std.mem.print(&kbuf, "key{d:0>5}", .{i});
             var got = (try db.getRef(key)).?;
             defer got.release();
-            const want = if (i % 2 == 1) try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}) else try std.fmt.bufPrint(&vbuf, "{s}-{d}", .{ ver, i });
+            const want = if (i % 2 == 1) try std.mem.print(&vbuf, "old-{d}", .{i}) else try std.mem.print(&vbuf, "{s}-{d}", .{ ver, i });
             try testing.expectEqualSlices(u8, want, got.bytes);
         }
     }
@@ -2068,7 +2068,7 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
             var kb: [32]u8 = undefined;
             for (0..n) |i| {
                 if (i % 3 != 0) continue;
-                try txn.put(try std.fmt.bufPrint(&kb, "key{d:0>5}", .{i}), "third");
+                try txn.put(try std.mem.print(&kb, "key{d:0>5}", .{i}), "third");
             }
             try txn.commit();
         }
@@ -2086,10 +2086,10 @@ test "fiber-reentrant: kvtree reads the committed version at every point a commi
     }
     try testing.expect(ys.hook_err == null);
     for (0..n) |i| {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{i});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{i});
         var got = (try db.getRef(key)).?;
         defer got.release();
-        const want = if (i % 3 == 0) "third" else if (i % 2 == 1) try std.fmt.bufPrint(&vbuf, "old-{d}", .{i}) else try std.fmt.bufPrint(&vbuf, "newer-{d}", .{i});
+        const want = if (i % 3 == 0) "third" else if (i % 2 == 1) try std.mem.print(&vbuf, "old-{d}", .{i}) else try std.mem.print(&vbuf, "newer-{d}", .{i});
         try testing.expectEqualSlices(u8, want, got.bytes);
     }
     try testing.expectEqual(@as(usize, 0), pc.cache.stats.pinned);
@@ -2225,15 +2225,15 @@ test "W3: kvtree getRef lends the value in place -- same bytes as get, held stab
     var vbuf: [48]u8 = undefined;
     var id: u64 = 0;
     while (id < 400) : (id += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
-        const val = try std.fmt.bufPrint(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
+        const val = try std.mem.print(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
         try db.put(key, val);
     }
 
     const hits_before = pc.stats().ref_hits;
     id = 0;
     while (id < 400) : (id += 13) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
         const copied = (try db.get(gpa, key)).?;
         defer gpa.free(copied);
         var lent = (try db.getRef(key)).?;
@@ -2272,8 +2272,8 @@ test "W3: kvtree Txn.getRef -- buffered changes shadow the tree, tree values are
     var vbuf: [48]u8 = undefined;
     var id: u64 = 0;
     while (id < 400) : (id += 1) {
-        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
-        const val = try std.fmt.bufPrint(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
+        const key = try std.mem.print(&kbuf, "key{d:0>5}", .{id});
+        const val = try std.mem.print(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
         try db.put(key, val);
     }
 

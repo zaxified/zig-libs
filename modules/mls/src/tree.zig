@@ -1262,7 +1262,7 @@ const LeafCorpus = struct {
         // The source octet sits after both keys, the credential and the
         // capabilities; found by search rather than by arithmetic so this does
         // not silently move when a field above it grows.
-        const src_at = std.mem.indexOf(u8, kp, &[_]u8{@backingInt(LeafNodeSource.key_package)}) orelse
+        const src_at = std.mem.find(u8, kp, &[_]u8{@backingInt(LeafNodeSource.key_package)}) orelse
             return error.SourceOctetNotFound;
         confused[src_at] = @backingInt(LeafNodeSource.commit);
         self.entries[3] = testkit.fuzz.seedInto(&self.stores[3], confused[0..kp.len]);

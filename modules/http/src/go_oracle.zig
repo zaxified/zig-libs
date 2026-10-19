@@ -98,7 +98,7 @@ fn replayH1(wire: []const u8, out_buf: []u8) H1Outcome {
 /// handler's body is "ok", so a status-line pattern cannot come from a body.
 fn firstReject(resp: []const u8) u16 {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, resp, i, "HTTP/1.")) |at| : (i = at + 1) {
+    while (std.mem.findPos(u8, resp, i, "HTTP/1.")) |at| : (i = at + 1) {
         if (at + 12 > resp.len) break;
         if (resp[at + 8] != ' ') continue;
         const code = std.fmt.parseInt(u16, resp[at + 9 .. at + 12], 10) catch continue;
@@ -204,7 +204,7 @@ const ServeOutcome = struct { status: u16, content_range: []const u8, parts: []c
 fn replayServe(c: *const vectors.ServeCase, wire_buf: []u8, out_buf: []u8) !ServeOutcome {
     serve_case = c;
     serve_n = 0;
-    const wire = try std.fmt.bufPrint(wire_buf, "{s} /r HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ c.method, c.headers });
+    const wire = try std.mem.print(wire_buf, "{s} /r HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ c.method, c.headers });
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -223,11 +223,11 @@ fn replayServe(c: *const vectors.ServeCase, wire_buf: []u8, out_buf: []u8) !Serv
 }
 
 fn responseHeader(resp: []const u8, name: []const u8) ?[]const u8 {
-    const head_end = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len;
+    const head_end = std.mem.find(u8, resp, "\r\n\r\n") orelse resp.len;
     var lines = std.mem.splitSequence(u8, resp[0..head_end], "\r\n");
     _ = lines.next();
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
     }
     return null;
@@ -318,7 +318,7 @@ const serve_content_agrees = [_][]const u8{"range-30"};
 
 fn replayServeContent(c: *const vectors.ServeCase, wire_buf: []u8, out_buf: []u8, parts_buf: []range.ResolvedRange) !ServeOutcome {
     serve_case = c;
-    const wire = try std.fmt.bufPrint(wire_buf, "{s} /r HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ c.method, c.headers });
+    const wire = try std.mem.print(wire_buf, "{s} /r HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ c.method, c.headers });
     var in: std.Io.Reader = .fixed(wire);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -337,12 +337,12 @@ fn replayServeContent(c: *const vectors.ServeCase, wire_buf: []u8, out_buf: []u8
     var n: usize = 0;
     const ct = responseHeader(resp, "Content-Type") orelse "";
     if (std.mem.startsWith(u8, ct, "multipart/byteranges") and c.method[0] != 'H') {
-        const body = resp[(std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len) + 4 ..];
+        const body = resp[(std.mem.find(u8, resp, "\r\n\r\n") orelse resp.len) + 4 ..];
         var rest = body;
-        while (std.mem.indexOf(u8, rest, "\r\nContent-Range: bytes ")) |i| {
+        while (std.mem.find(u8, rest, "\r\nContent-Range: bytes ")) |i| {
             rest = rest[i + "\r\nContent-Range: bytes ".len ..];
-            const dash = std.mem.indexOfScalar(u8, rest, '-').?;
-            const slash = std.mem.indexOfScalar(u8, rest, '/').?;
+            const dash = std.mem.findScalar(u8, rest, '-').?;
+            const slash = std.mem.findScalar(u8, rest, '/').?;
             parts_buf[n] = .{
                 .start = try std.fmt.parseInt(u64, rest[0..dash], 10),
                 .end = try std.fmt.parseInt(u64, rest[dash + 1 .. slash], 10),
@@ -651,7 +651,7 @@ fn ourClient(io: std.Io, gpa: std.mem.Allocator, c: vectors.ClientCase) !ClientO
     var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
-    const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+    const url_text = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
     const method: http_root.Method = if (std.mem.eql(u8, c.method, "HEAD")) .head else .get;
     var res = client.requestPlain(method, url_text, .{ .follow_redirects = false }) catch
         return .{ .status = 0, .body = null };
@@ -728,7 +728,7 @@ const AePeer = struct {
         while (true) {
             const line = sr.interface.takeDelimiterInclusive('\n') catch return;
             if (std.mem.eql(u8, line, "\r\n")) break;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             if (!std.ascii.eqlIgnoreCase(line[0..colon], "accept-encoding")) continue;
             const v = std.mem.trim(u8, line[colon + 1 ..], " \t\r\n");
             p.ae_len = @min(v.len, p.ae_buf.len);
@@ -773,11 +773,11 @@ fn ourGzipClient(io: std.Io, gpa: std.mem.Allocator, c: vectors.GzipCase) !GzipO
         var client = Client.init(io, gpa, .{ .pool = .{ .enabled = false }, .decompress = .gzip(std.math.maxInt(u64)) });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        const url_text = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
         const method: http_root.Method = if (std.mem.eql(u8, c.method, "HEAD")) .head else .get;
         var hdr: [1]http_root.Header = undefined;
         var headers: []const http_root.Header = &.{};
-        if (std.mem.indexOf(u8, c.header, ": ")) |at| {
+        if (std.mem.find(u8, c.header, ": ")) |at| {
             hdr[0] = .{ .name = c.header[0..at], .value = c.header[at + 2 ..] };
             headers = &hdr;
         }
@@ -949,7 +949,7 @@ fn ourMaxConns(io: std.Io, gpa: std.mem.Allocator, c: vectors.MaxConnsCase) !Max
         } });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
-        const url_text = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
+        const url_text = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{listener.socket.address.getPort()});
         const Worker = struct {
             fn run(cl: *Client, u: []const u8, f: *std.atomic.Value(u32)) void {
                 var res = cl.requestPlain(.get, u, .{}) catch {
@@ -1002,7 +1002,7 @@ fn ourProxy(c: vectors.ProxyCase, buf: []u8) ![]const u8 {
     var env = std.process.Environ.Map.init(testing.allocator);
     defer env.deinit();
     for (c.env) |line| {
-        const eq = std.mem.indexOfScalar(u8, line, '=').?;
+        const eq = std.mem.findScalar(u8, line, '=').?;
         try env.put(line[0..eq], line[eq + 1 ..]);
     }
     const target = try http_root.Url.parse(c.target);
@@ -1012,11 +1012,11 @@ fn ourProxy(c: vectors.ProxyCase, buf: []u8) ![]const u8 {
     var pass: []const u8 = "-";
     var cred: [1024]u8 = undefined;
     if (e.userinfo) |ui| {
-        const colon = std.mem.indexOfScalar(u8, ui, ':');
+        const colon = std.mem.findScalar(u8, ui, ':');
         user = try percentDecode(ui[0 .. colon orelse ui.len], cred[0..512]);
         if (colon) |at| pass = try percentDecode(ui[at + 1 ..], cred[512..]);
     }
-    return std.fmt.bufPrint(buf, "proxy http {s} {d} {s} {s}", .{ e.host, e.port, user, pass });
+    return std.mem.print(buf, "proxy http {s} {d} {s} {s}", .{ e.host, e.port, user, pass });
 }
 
 fn percentDecode(in: []const u8, out: []u8) ![]const u8 {
@@ -1123,7 +1123,7 @@ fn readMessage(r: *std.Io.Reader, head: []u8, body_out: []u8) !struct { head: us
     } else if (headerValue(h, "transfer-encoding")) |v| if (std.ascii.eqlIgnoreCase(v, "chunked")) {
         while (true) {
             const size_line = try r.takeDelimiterInclusive('\n');
-            const size_text = std.mem.trim(u8, size_line[0 .. std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len], " \t\r\n");
+            const size_text = std.mem.trim(u8, size_line[0 .. std.mem.findScalar(u8, size_line, ';') orelse size_line.len], " \t\r\n");
             const n = try std.fmt.parseInt(usize, size_text, 16);
             if (n == 0) {
                 while (!std.mem.eql(u8, try r.takeDelimiterInclusive('\n'), "\r\n")) {}
@@ -1141,7 +1141,7 @@ fn headerValue(head: []const u8, name: []const u8) ?[]const u8 {
     var it = std.mem.splitSequence(u8, head, "\r\n");
     _ = it.next();
     while (it.next()) |l| {
-        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, l, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(l[0..colon], name)) return std.mem.trim(u8, l[colon + 1 ..], " \t");
     }
     return null;
@@ -1159,7 +1159,7 @@ fn normHead(head: []const u8, ignore: []const []const u8, text: []u8, out: [][]c
     var n: usize = 0;
     var used: usize = 0;
     lines: while (it.next()) |l| {
-        const colon = std.mem.indexOfScalar(u8, l, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, l, ':') orelse continue;
         for (ignore) |ig| if (std.ascii.eqlIgnoreCase(l[0..colon], ig)) continue :lines;
         var w: std.Io.Writer = .fixed(text[used..]);
         try w.print("{s}: {s}", .{ l[0..colon], std.mem.trim(u8, l[colon + 1 ..], " \t") });
@@ -1171,8 +1171,8 @@ fn normHead(head: []const u8, ignore: []const []const u8, text: []u8, out: [][]c
     }
     const byName = struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
-            const an = a[0..std.mem.indexOfScalar(u8, a, ':').?];
-            const bn = b[0..std.mem.indexOfScalar(u8, b, ':').?];
+            const an = a[0..std.mem.findScalar(u8, a, ':').?];
+            const bn = b[0..std.mem.findScalar(u8, b, ':').?];
             return std.mem.order(u8, an, bn) == .lt;
         }
     };
@@ -1260,7 +1260,7 @@ test "go oracle rproxy: the proxy passes on what Go's ReverseProxy passes on, or
         var t2: [4096]u8 = undefined;
         var l2: [64][]const u8 = undefined;
         const down = try normHead(down_head[0..msg.head], &down_ignore, &t2, &l2);
-        const up_line = if (std.mem.lastIndexOf(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
+        const up_line = if (std.mem.findLast(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
         const status = std.fmt.parseInt(u16, down.first[9..12], 10) catch 0;
 
         const up_ok = std.mem.eql(u8, up_line, c.up_line) and sameLines(up.lines, c.up) and
@@ -1302,7 +1302,7 @@ const Written = struct {
     body: []const u8,
 
     fn of(wire: []const u8) Written {
-        const end = std.mem.indexOf(u8, wire, "\r\n\r\n").?;
+        const end = std.mem.find(u8, wire, "\r\n\r\n").?;
         return .{
             .status = std.fmt.parseInt(u16, wire[9..12], 10) catch 0,
             .head = wire[0 .. end + 2],
@@ -1314,7 +1314,7 @@ const Written = struct {
         var lines = std.mem.splitSequence(u8, w.head, "\r\n");
         _ = lines.next(); // status line
         while (lines.next()) |line| {
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const colon = std.mem.findScalar(u8, line, ':') orelse continue;
             if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
         }
         return null;
@@ -1330,7 +1330,7 @@ fn helperRequest(method: []const u8, target: []const u8) Server.Request {
     return .{
         .method = Server.methodFromToken(method).?,
         .target = target,
-        .path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len],
+        .path = target[0 .. std.mem.findScalar(u8, target, '?') orelse target.len],
         .query = "",
         .head = undefined,
         .body = undefined,
@@ -1401,7 +1401,7 @@ test "go oracle helpers: writeError/notFound answer as http.Error/NotFound" {
         for (c.headers) |h| try testing.expectEqualStrings(h[1], w.header(h[0]) orelse return error.TestMissingHeader);
         try testing.expectEqual(c.headers.len + 1, w.headerCount());
         var cl_buf: [20]u8 = undefined;
-        try testing.expectEqualStrings(try std.fmt.bufPrint(&cl_buf, "{d}", .{c.body.len}), w.header("content-length").?);
+        try testing.expectEqualStrings(try std.mem.print(&cl_buf, "{d}", .{c.body.len}), w.header("content-length").?);
     }
 }
 
@@ -1676,7 +1676,7 @@ test "go oracle rproxy_hooks: Rewrite/ModifyResponse/ErrorHandler edit what Go's
     const front_addr = try net.IpAddress.parse("127.0.0.1", front.boundAddress().getPort());
 
     var host_buf: [32]u8 = undefined;
-    const backend_host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{backend_port});
+    const backend_host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{backend_port});
     var bad: usize = 0;
     for (vectors.rproxy_hooks) |c| {
         rh_profile = c.profile;
@@ -1719,7 +1719,7 @@ test "go oracle rproxy_hooks: Rewrite/ModifyResponse/ErrorHandler edit what Go's
             const len = backend.head_len - n * (backend_host.len - "backend".len);
             const ignore_rw = [_][]const u8{ "connection", "content-length", "transfer-encoding", "via", "user-agent" };
             const up = try normHead(raw[0..len], if (rewriting) &ignore_rw else &up_ignore, &t1, &l1);
-            up_line = if (std.mem.lastIndexOf(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
+            up_line = if (std.mem.findLast(u8, up.first, " HTTP/")) |i| up.first[0..i] else up.first;
             up_lines = up.lines;
         }
         var go_up_buf: [64][]const u8 = undefined;
@@ -1812,7 +1812,7 @@ test "go oracle crossorigin: check answers as Go's CrossOriginProtection.Check, 
     var bad: usize = 0;
     for (vectors.crossorigin) |c| {
         var wire_buf: [1024]u8 = undefined;
-        const wire = try std.fmt.bufPrint(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: 0\r\nConnection: close\r\n\r\n", .{ c.method, c.path, c.host, c.headers });
+        const wire = try std.mem.print(&wire_buf, "{s} {s} HTTP/1.1\r\nHost: {s}\r\n{s}Content-Length: 0\r\nConnection: close\r\n\r\n", .{ c.method, c.path, c.host, c.headers });
         var in: std.Io.Reader = .fixed(wire);
         var out_buf: [2048]u8 = undefined;
         var out: std.Io.Writer = .fixed(&out_buf);
@@ -1871,7 +1871,7 @@ test "go oracle crossorigin: the default denial is Go's" {
     const resp = out.buffered();
     try testing.expectEqual(@as(u16, want.status), try std.fmt.parseInt(u16, resp[9..12], 10));
     try testing.expectEqualStrings(want.content_type, responseHeader(resp, "Content-Type").?);
-    try testing.expectEqualStrings(want.body, resp[std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4 ..]);
+    try testing.expectEqualStrings(want.body, resp[std.mem.find(u8, resp, "\r\n\r\n").? + 4 ..]);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

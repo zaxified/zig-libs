@@ -161,7 +161,7 @@ pub const Parser = struct {
                 saw_line = true;
                 if (line[0] == ':') continue; // comment line, ignored
 
-                const colon = std.mem.indexOfScalar(u8, line, ':');
+                const colon = std.mem.findScalar(u8, line, ':');
                 const field = if (colon) |c| line[0..c] else line;
                 var val: []const u8 = if (colon) |c| line[c + 1 ..] else "";
                 if (val.len != 0 and val[0] == ' ') val = val[1..];
@@ -180,7 +180,7 @@ pub const Parser = struct {
                     // A `\0` anywhere in the value invalidates the whole
                     // `id:` line per spec; keep the previously-set id (or
                     // none) instead.
-                    if (std.mem.indexOfScalar(u8, val, 0) == null) {
+                    if (std.mem.findScalar(u8, val, 0) == null) {
                         p.id_buf.clearRetainingCapacity();
                         try p.id_buf.appendSlice(p.gpa, val);
                     }
@@ -424,7 +424,7 @@ fn fuzzParserNext(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
             break;
         };
         SseMark.mark(.dispatched);
-        if (std.mem.indexOfScalar(u8, got.data, '\n') != null) SseMark.mark(.multi_line);
+        if (std.mem.findScalar(u8, got.data, '\n') != null) SseMark.mark(.multi_line);
         if (got.event != null) SseMark.mark(.with_event);
         if (got.id != null) SseMark.mark(.with_id);
         if (got.retry != null) SseMark.mark(.with_retry);
@@ -544,7 +544,7 @@ fn fuzzSseStream(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     StreamMark.mark(.genuine_stream);
     if (crlf) StreamMark.mark(.crlf);
     if (std.mem.startsWith(u8, wire.items, "\xEF\xBB\xBF")) StreamMark.mark(.bom);
-    for (want[0..n]) |w| if (std.mem.indexOfScalar(u8, w.data, '\n') != null) {
+    for (want[0..n]) |w| if (std.mem.findScalar(u8, w.data, '\n') != null) {
         StreamMark.mark(.multi_line);
         break;
     };

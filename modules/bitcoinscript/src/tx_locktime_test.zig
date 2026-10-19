@@ -161,12 +161,12 @@ test "the locktime corpus really does straddle the BIP65/BIP112 boundaries" {
     var negative_operand = false;
     for (vectors_mod.vectors) |v| {
         for (v.prevouts) |p| {
-            if (std.mem.indexOf(u8, p.script_asm, "499999999") != null) below_lt_threshold = true;
-            if (std.mem.indexOf(u8, p.script_asm, "500000000 ") != null) at_lt_threshold = true;
-            if (std.mem.indexOf(u8, p.script_asm, "500000001") != null) above_lt_threshold = true;
-            if (std.mem.indexOf(u8, p.script_asm, "4194304") != null) at_csv_type_flag = true;
-            if (std.mem.indexOf(u8, p.script_asm, "4194303") != null) below_csv_type_flag = true;
-            if (std.mem.indexOf(u8, p.script_asm, "-1 CHECK") != null) negative_operand = true;
+            if (std.mem.find(u8, p.script_asm, "499999999") != null) below_lt_threshold = true;
+            if (std.mem.find(u8, p.script_asm, "500000000 ") != null) at_lt_threshold = true;
+            if (std.mem.find(u8, p.script_asm, "500000001") != null) above_lt_threshold = true;
+            if (std.mem.find(u8, p.script_asm, "4194304") != null) at_csv_type_flag = true;
+            if (std.mem.find(u8, p.script_asm, "4194303") != null) below_csv_type_flag = true;
+            if (std.mem.find(u8, p.script_asm, "-1 CHECK") != null) negative_operand = true;
         }
     }
     try testing.expect(below_lt_threshold);

@@ -98,7 +98,7 @@ const Verdict = struct { tests: usize = 0, failed: std.ArrayList([]const u8) = .
 /// Run h2spec against `port`; read its JUnit report back.
 fn runH2spec(io: std.Io, gpa: std.mem.Allocator, h2spec: []const u8, port: u16, only: ?[]const u8, report_path: []const u8, arena: std.mem.Allocator) !Verdict {
     var port_buf: [8]u8 = undefined;
-    const port_s = try std.fmt.bufPrint(&port_buf, "{d}", .{port});
+    const port_s = try std.mem.print(&port_buf, "{d}", .{port});
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ h2spec, "-h", "127.0.0.1", "-p", port_s, "-o", "2", "-j", report_path });
@@ -120,9 +120,9 @@ fn runH2spec(io: std.Io, gpa: std.mem.Allocator, h2spec: []const u8, port: u16, 
     _ = it.next();
     while (it.next()) |case| {
         v.tests += 1;
-        const end = std.mem.indexOf(u8, case, "</testcase>") orelse case.len;
-        if (std.mem.indexOf(u8, case[0..end], "<failure") == null) continue;
-        try v.failed.append(arena, try std.fmt.allocPrint(arena, "{s} {s}", .{ attr(case, "package"), attr(case, "classname") }));
+        const end = std.mem.find(u8, case, "</testcase>") orelse case.len;
+        if (std.mem.find(u8, case[0..end], "<failure") == null) continue;
+        try v.failed.append(arena, try arena.print("{s} {s}", .{ attr(case, "package"), attr(case, "classname") }));
     }
     if (v.tests == 0) return error.EmptyReport;
     return v;
@@ -130,10 +130,10 @@ fn runH2spec(io: std.Io, gpa: std.mem.Allocator, h2spec: []const u8, port: u16, 
 
 fn attr(tag: []const u8, name: []const u8) []const u8 {
     var key_buf: [32]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "{s}=\"", .{name}) catch return "?";
-    const at = std.mem.indexOf(u8, tag, key) orelse return "?";
+    const key = std.mem.print(&key_buf, "{s}=\"", .{name}) catch return "?";
+    const at = std.mem.find(u8, tag, key) orelse return "?";
     const rest = tag[at + key.len ..];
-    return rest[0 .. std.mem.indexOfScalar(u8, rest, '"') orelse rest.len];
+    return rest[0 .. std.mem.findScalar(u8, rest, '"') orelse rest.len];
 }
 
 /// The one case a shared h1/h2c port cannot pass by design: h2spec's
@@ -345,7 +345,7 @@ fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: 
     const go = try fetch(&client, arena, h2_port, "/go", &.{}, .http2, &ok);
     ok = sameFields("h2", ours, go, "proto: HTTP/2.0") and ok;
     {
-        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/trailers", .{h2_port});
+        const url = try arena.print("https://127.0.0.1:{s}/trailers", .{h2_port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         const body = try res.readAllAlloc(arena, 1 << 16);
@@ -353,7 +353,7 @@ fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: 
             std.mem.eql(u8, res.trailer("X-Checksum") orelse "", "c0ffee")) and ok;
     }
     {
-        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/gz", .{h2_port});
+        const url = try arena.print("https://127.0.0.1:{s}/gz", .{h2_port});
         var res = try client.request(.get, url, .{});
         defer res.deinit();
         const body = try res.readAllAlloc(arena, 1 << 16);
@@ -362,7 +362,7 @@ fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: 
     const redirected = try fetch(&client, arena, h2_port, "/redirect", &.{}, .http2, &ok);
     ok = check("h2 redirect", std.mem.startsWith(u8, redirected, "proto: HTTP/2.0\n")) and ok;
     {
-        const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}/echo", .{h2_port});
+        const url = try arena.print("https://127.0.0.1:{s}/echo", .{h2_port});
         var up = try client.requestStreaming(.post, url, .{}, null);
         for (0..64) |_| try up.writer().writeAll(strRepeat("0123456789abcdef", 64));
         var res = try up.finish();
@@ -388,7 +388,7 @@ fn alpnPhase(io: std.Io, gpa: std.mem.Allocator, arena: std.mem.Allocator, env: 
 }
 
 fn fetch(client: *Client, arena: std.mem.Allocator, port: []const u8, path: []const u8, headers: []const http.Header, want: Client.Proto, ok: *bool) ![]const u8 {
-    const url = try std.fmt.allocPrint(arena, "https://127.0.0.1:{s}{s}", .{ port, path });
+    const url = try arena.print("https://127.0.0.1:{s}{s}", .{ port, path });
     var res = try client.request(.get, url, .{ .headers = headers });
     defer res.deinit();
     const body = try res.readAllAlloc(arena, 1 << 16);

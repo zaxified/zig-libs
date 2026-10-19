@@ -103,5 +103,5 @@ pub fn sprinkle(comptime S: type, src: *S, in: []u8) void {
 
 /// True when `in` holds an octet that could split a command line.
 pub fn hostile(in: []const u8) bool {
-    return std.mem.indexOfAny(u8, in, "\r\n\x00") != null;
+    return std.mem.findAny(u8, in, "\r\n\x00") != null;
 }

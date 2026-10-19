@@ -83,7 +83,7 @@ pub const fingerprint_xor: u32 = 0x5354554E;
 // ── message class & method ───────────────────────────────────────────────────
 
 /// The two-bit message class (RFC 8489 §5). The numeric values are the on-wire
-/// C1..C0 bits, so `@intFromEnum` feeds `encodeType` directly.
+/// C1..C0 bits, so `@backingInt` feeds `encodeType` directly.
 pub const Class = enum(u2) {
     request = 0b00,
     indication = 0b01,
@@ -391,8 +391,8 @@ pub fn bindingResponse(request: Message, from: AddressPort, out: []u8, opts: Res
     var it = request.attributes();
     while (it.next()) |a| {
         if (a.type >= 0x8000 or stunUnderstands(a.type)) continue;
-        if (std.mem.indexOfScalar(u16, opts.known_attributes, a.type) != null) continue;
-        if (std.mem.indexOfScalar(u16, unknown[0..n_unknown], a.type) != null) continue;
+        if (std.mem.findScalar(u16, opts.known_attributes, a.type) != null) continue;
+        if (std.mem.findScalar(u16, unknown[0..n_unknown], a.type) != null) continue;
         if (n_unknown < unknown.len) {
             unknown[n_unknown] = a.type;
             n_unknown += 1;
@@ -473,7 +473,7 @@ pub const UriError = error{InvalidUri};
 /// Default ports: 3478 for stun/turn, 5349 for stuns/turns (RFC 8489 §6.2.2,
 /// §6.2.3 — the TLS port). No userinfo, path or fragment is allowed.
 pub fn parseUri(text: []const u8) UriError!Uri {
-    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return error.InvalidUri;
+    const colon = std.mem.findScalar(u8, text, ':') orelse return error.InvalidUri;
     const scheme_text = text[0..colon];
     const scheme: Uri.Scheme = inline for (@typeInfo(Uri.Scheme).@"enum".field_names, @typeInfo(Uri.Scheme).@"enum".field_values) |f_name, f_value| {
         if (std.ascii.eqlIgnoreCase(scheme_text, f_name)) break @fromBackingInt(@intCast(f_value));
@@ -484,7 +484,7 @@ pub fn parseUri(text: []const u8) UriError!Uri {
         .host = undefined,
         .port = if (scheme == .stuns or scheme == .turns) 5349 else 3478,
     };
-    if (std.mem.indexOfScalar(u8, rest, '?')) |q| {
+    if (std.mem.findScalar(u8, rest, '?')) |q| {
         if (scheme == .stun or scheme == .stuns) return error.InvalidUri; // RFC 7064 has no query
         const query_part = rest[q + 1 ..];
         const prefix = "transport=";
@@ -496,13 +496,13 @@ pub fn parseUri(text: []const u8) UriError!Uri {
     if (rest.len == 0) return error.InvalidUri;
     var host_end: usize = undefined;
     if (rest[0] == '[') {
-        const close = std.mem.indexOfScalar(u8, rest, ']') orelse return error.InvalidUri;
+        const close = std.mem.findScalar(u8, rest, ']') orelse return error.InvalidUri;
         out.host = rest[1..close];
         if (out.host.len == 0) return error.InvalidUri;
         for (out.host) |c| if (!(std.ascii.isHex(c) or c == ':' or c == '.')) return error.InvalidUri;
         host_end = close + 1;
     } else {
-        host_end = std.mem.indexOfScalar(u8, rest, ':') orelse rest.len;
+        host_end = std.mem.findScalar(u8, rest, ':') orelse rest.len;
         out.host = rest[0..host_end];
         if (out.host.len == 0) return error.InvalidUri;
         // RFC 3986 reg-name / IPv4address: unreserved, pct-encoded,

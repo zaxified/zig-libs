@@ -135,7 +135,7 @@ pub fn parse(attr_bytes: []const u8) codec.Error!Reporter {
 
 fn appendReporterName(gpa: std.mem.Allocator, list: *std.ArrayList(u8), n: []const u8) BuildError!void {
     if (n.len == 0 or n.len > uapi.name_max) return error.InvalidRequest;
-    if (std.mem.indexOfScalar(u8, n, 0) != null) return error.InvalidRequest;
+    if (std.mem.findScalar(u8, n, 0) != null) return error.InvalidRequest;
     codec.appendAttrString(gpa, list, uapi.ATTR.HEALTH_REPORTER_NAME, n) catch |e| switch (e) {
         error.AttrTooLong => return error.InvalidRequest,
         error.OutOfMemory => return error.OutOfMemory,

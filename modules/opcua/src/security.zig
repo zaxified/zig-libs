@@ -1776,7 +1776,7 @@ test "user identity token secret: encrypt -> decrypt, replayed nonce and wrong k
     defer testing.allocator.free(blob);
     // Whole RSA blocks, and nothing recognisable of the password in them.
     try testing.expectEqual(@as(usize, 0), blob.len % 64);
-    try testing.expect(std.mem.indexOf(u8, blob, password) == null);
+    try testing.expect(std.mem.find(u8, blob, password) == null);
 
     const recovered = try decryptUserTokenSecret(testing.allocator, blob, &server_kp.secret_key, server_nonce);
     defer testing.allocator.free(recovered);
@@ -1833,7 +1833,7 @@ test "certificateValidity: notBefore/notAfter come back out of a certificate we 
     try testing.expectError(error.InvalidCertificate, certificateValidity("not a certificate"));
 }
 
-test "constantTimeEql: agrees with mem.eql on every short case" {
+test "constantTimeEql: agrees with std.mem.eql on every short case" {
     try testing.expect(constantTimeEql("", ""));
     try testing.expect(constantTimeEql("abc", "abc"));
     try testing.expect(!constantTimeEql("abc", "abd"));

@@ -320,7 +320,7 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
     if (percent) exp -= 2;
     if (exp != 0) {
         var eb: [24]u8 = undefined;
-        const es = std.fmt.bufPrint(&eb, "e{d}", .{exp}) catch return null;
+        const es = std.mem.print(&eb, "e{d}", .{exp}) catch return null;
         for (es) |c| if (!put(&buf, &n, c)) return null;
     }
     return Decimal.parse(buf[0..n]) catch null;
