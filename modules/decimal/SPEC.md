@@ -261,6 +261,37 @@ scientific-notation output.
   only at these entry points. Design, out-of-range choice (`±inf`) and the exact boundary of the
   no-float guarantee: *Design & invariants*, "Float bridge".
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  15 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/big.zig:476:55` | `i64 -> u32` | @intCast | div | D unreachable (bounded below 2^(N-1)) | decimal scale shift, small exponent range (check exponent bound) |
+  | `src/big.zig:485:59` | `i64 -> u32` | @intCast | div | D unreachable (bounded below 2^(N-1)) | decimal scale shift, small |
+  | `src/big.zig:832:24` | `i64 -> u32` | @intCast | sqrt | D unreachable (bounded below 2^(N-1)) | exponent difference, small |
+  | `src/big.zig:1129:12` | `i64 -> u32` | @intCast | alignShift | D unreachable (bounded below 2^(N-1)) | exponent difference, small |
+  | `src/root.zig:193:27` | `i64 -> u32` | @intCast | round | D unreachable (bounded below 2^(N-1)) | comment: 1..(12+\|n\|) |
+  | `src/root.zig:219:66` | `i64 -> u32` | @intCast | rescale | D unreachable (bounded below 2^(N-1)) | capped by max_pow10 before the cast |
+  | `src/root.zig:264:45` | `i64 -> u32` | @intCast | divRound | D unreachable (bounded below 2^(N-1)) | pow10 table index |
+  | `src/root.zig:269:55` | `i64 -> u32` | @intCast | divRound | D unreachable (bounded below 2^(N-1)) | pow10 table index |
+  | `src/root.zig:281:38` | `i64 -> u32` | @intCast | divRound | D unreachable (bounded below 2^(N-1)) | pow10 table index |
+  | `src/root.zig:422:36` | `i32 -> u8` | @intCast | fromFloat | D unreachable (bounded below 2^(N-1)) | shift < 2^7 (comment: fits i256) |
+  | `src/root.zig:451:49` | `i64 -> u32` | @intCast | fromFloatShortest | D unreachable (bounded below 2^(N-1)) | pow10 index < 39 |
+  | `src/root.zig:456:49` | `i64 -> u32` | @intCast | fromFloatShortest | D unreachable (bounded below 2^(N-1)) | pow10 index |
+  | `src/root.zig:565:56` | `i64 -> u32` | @intCast | parse | D unreachable (bounded below 2^(N-1)) | pow10 index |
+  | `src/root.zig:573:77` | `i64 -> u32` | @intCast | parse | D unreachable (bounded below 2^(N-1)) | drop <= 60 |
+  | `src/root.zig:1619:29` | `i32 -> u6` | std math.ldexp.ldexp | test.float bridge: huge magnitudes are Overflow, tiny-but-not-negligible ones still round | T test/tools only | test; std ldexp internal (see std-sites) |
+
+  Std sites pulled in by this module:
+  - `std/math/ldexp.zig:36:65` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp subnormal shift i32 -> u6: shifts 32..63 reachable; reached via std.math.pow and friends.
+  - `std/math/ldexp.zig:40:52` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp normalisation shift -> u6: 32..52 reachable.
+  - `std/math/ldexp.zig:52:47` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp underflow shift -> u6: 32..53 reachable.
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · any · util · reentrant` · deps: none (std only) — canonical source is `pub const meta` in
 src/root.zig.

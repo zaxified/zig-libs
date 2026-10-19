@@ -175,6 +175,17 @@ None recorded before the 2026-09-30 survey.
 - ~~**Server-side expiry for signed/private values**~~ (2026-10-12) — DONE the same day (owner left the call to the session): `signed.signTimed`/`verifyTimed`, `private.sealTimed`/`sealTimedNonce`/`openTimed`; the issue time is inside the MAC / ciphertext, in a domain of its own (`"timed1" 0x00` before the name), so timed and untimed values never stand in for each other. Our format, not cookie-rs's.
 - ~~**Client-side `CookieJar`**~~ — **DONE 2026-10-05** (`Jar` + `PublicSuffixList`, the list supplied by the caller; no list = host-only cookies). Was: (survey 2026-09-30) — Go `cookiejar`, cookie-rs `CookieJar`; Domain/Path matching needs the public-suffix list, a data dependency to decide. Effort: medium-large. Fits §2: only with a bundled PSL.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · any · codec · threadsafe` + deps: `http` (the `get`/`set` helpers only; parser + builder are
 std-only), `aesgcm` (`private` values) — canonical source is `pub const meta` in src/root.zig.

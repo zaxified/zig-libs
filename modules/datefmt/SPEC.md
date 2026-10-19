@@ -135,6 +135,22 @@ past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKEN
 - ~~**ISO week number and week-year**~~ **DONE 2026-09-30** *(survey 2026-09-30)*: `isoWeek(parts) -> {year, week}` and `YYYY-Www-D` parse/format tokens. Why: reporting and scheduling code in Europe keys on ISO weeks; chrono and Go `time.ISOWeek` have it (the latter *(inferred)*). Effort: small (Hinnant-style arithmetic on the existing core). Fits §2.
 - ~~**Canned RFC 3339 and RFC 2822/1123 helpers**~~ **DONE 2026-10-11** *(survey 2026-09-30)*: `bufRfc3339`/`formatRfc3339` (0..9 fraction digits, `Z` or `±hh:mm` from `off_min`), `parseRfc3339` (offset required, kept in `off_min`), `bufImfFixdate`/`formatImfFixdate`/`parseImfFixdate` (RFC 9110 HTTP date, weekday checked). The `buf*` forms take a fixed-size array and never allocate -- what qap `access.zig` and `http` `Server.zig` hand-roll today (candidates to switch). Not done: general RFC 2822 (numeric zones, comments, obsolete forms).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  5 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:147:12` | `i64 -> u32` | @intCast | isoWeekday | D unreachable (bounded below 2^(N-1)) | weekday 1..7 |
+  | `src/root.zig:164:23` | `i64 -> u32` | @intCast | isoWeek | D unreachable (bounded below 2^(N-1)) | ISO week <= 53 |
+  | `src/root.zig:197:22` | `i64 -> u32` | @intCast | unixToParts | D unreachable (bounded below 2^(N-1)) | seconds of day < 86400 |
+  | `src/root.zig:220:20` | `i64 -> u32` | @intCast | unixNsToParts | D unreachable (bounded below 2^(N-1)) | ns < 1e9 < 2^31 |
+  | `src/root.zig:977:34` | `i64 -> u32` | @intCast | render | D unreachable (bounded below 2^(N-1)) | UTC offset minutes, small |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · any · util · reentrant` · deps: none — canonical source is `pub const meta` in
 src/root.zig.

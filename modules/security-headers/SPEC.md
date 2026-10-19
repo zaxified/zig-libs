@@ -146,6 +146,18 @@ enabled; rerun: 26 killed. No defect found.
 - **Reporting-Endpoints / Report-To** *(survey 2026-10-17)* — helmet 8.3.0 has none either; reachable
   via `extra`. Rejected for parity.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `gap · any · util · reentrant` + deps: `router`, `http` — canonical source is `pub const meta` in

@@ -238,6 +238,17 @@ asserts every declared test actually runs.) Run: `zig build test-mcp-http`.
 - (survey 2026-09-30) **`subscriptions/listen` long-lived SSE response** — the only push channel in 2026-07-28 (list-changed, resource updates). The io-less handler cannot park a connection today (see *GET is drain-and-close*); needs a held-open response API in `http`. Effort: large; depends on `http`. Fits §2.
 - ~~(survey 2026-09-30) **`X-Accel-Buffering: no` on SSE responses**~~ — already sent: `http.sse.EventStream.start` sets it on every stream (the survey searched this module only). Pinned by the 2026-07-28 SSE test.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `gap · any · server · reentrant (session store: Lock seam)` + deps: `router`, `http`, `mcp` —

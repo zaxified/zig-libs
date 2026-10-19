@@ -228,6 +228,21 @@ Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items
   the reference json5 (JS) produces. Never `null` — that silently loses the value. Why: json5-rs's README lists them among the basic features and the upstream corpus tests them; a config with `timeout: .5` fails today with an opaque `std.json` error. Effort: small–medium (the scanner already walks values to skip strings). Fits CONVENTIONS §2. Supersedes the SPEC list above for these items.
 - **DONE 2026-09-30 — String line continuations and JSON5 whitespace** *(survey 2026-09-30)*: backslash-newline inside strings, form feed/vertical tab/Unicode spaces/BOM between tokens. Why: the remaining corpus fixtures; hand-wrapped long strings in configs use the former. Effort: small. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:2824:51` | `i128 -> u64` | std json.static.sliceToInt | test.std.json reads the rewritten output of a combined document into a typed struct | T test/tools only | test |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `extract · any · codec · reentrant` + deps: none (std only) — canonical source is `pub const meta`

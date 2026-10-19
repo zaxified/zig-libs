@@ -343,6 +343,22 @@ Go source) and reused here.
 - **Live re-check of the chained fixtures** *(2026-10-06)* — `tools/fetch_chained.py live` was not run (api.drand.sh blocked from the committing session); the fixtures come from two published packages. Extending `tools/go/main.go` to the chained scheme would add the Go differential. Effort: small.
 - **`bls-unchained-on-g1`** *(survey 2026-09-30)* — deprecated non-conformant DST; only for retro-compatibility. Effort: small; fits §2; low priority.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/chaininfo.zig:253:45` | `i128 -> u8` | std json.static.sliceToInt | parseInfo | C reachable only in extreme/far cases | std.json []const u8 field (numeric-array path), float-formatted only; data only |
+  | `src/round.zig:185:45` | `i128 -> u8` | std json.static.sliceToInt | parseRound | C reachable only in extreme/far cases | std.json []const u8 field, float-formatted only; data only |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL

@@ -484,6 +484,18 @@ Named as scope decisions, not omissions.
 - **A resume record for `sweepToBudget`** — §5a; would make an interrupted budget sweep linear.
 - ~~**`range` pays for blocks a store never had**~~ ✅ DONE 2026-10-17 *(ttydesk repin A/B)*: measured 25.3 → 34.6 ms task-clock (1.37×) on a never-compacted `history.kvt` because every `range` seeked a second cursor into the block keyspace. The proposed fix — a flag found once at `init` — was rejected: a second `Db` over the same tree compacting would leave it stale and `range` would silently skip blocks. Done instead: `Db.no_blocks_at` remembers the kvtree version (`Snapshot.txn_id`) at which the store held no block, so a `range` at that same version opens no block cursor; any commit re-checks (one seek per version), and once blocks are seen (`blocks_seen`) `range` behaves as before. Test: a second `Db` compacting is seen at once (a version-blind mutant fails it).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/chunk.zig:720:41` | `i64 -> u63` | @max/@min refinement | genBlock | D unreachable (bounded below 2^(N-1)) | step jitter, small |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Anchoring
 
 **Anchor grade:** class C · oracle n/a

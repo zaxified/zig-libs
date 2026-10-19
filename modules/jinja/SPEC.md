@@ -659,3 +659,29 @@ makes these bound tests rather than "it errored eventually" tests.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** golden.json — 351 input-to-output pairs captured from real Python Jinja2 3.1.6 by `tools/interop.zig`, replayed hermetically by `src/reference_replay_test.zig`; the live peer runs as `zig build interop-jinja`
+
+## Backlog / deferred
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  8 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/engine_test.zig:132:79` | `i64 -> u6` | @intCast | f | T test/tools only | test |
+  | `src/filters.zig:761:74` | `i64 -> u8` | @intCast | fInt | D unreachable (bounded below 2^(N-1)) | base 2..36 |
+  | `src/filters.zig:959:44` | `i32 -> u7` | @intCast | scaledRoundHalfEven | A reachable from external input | template number exponent e < 127 -> u7: 64..126 reachable; shlExact overflow check follows |
+  | `src/fuzz_test.zig:395:25` | `i32 -> u6` | std math.ldexp.ldexp | renderNumericSite | T test/tools only | test; ldexp internal |
+  | `src/render.zig:1143:30` | `i128 -> u64` | @intCast | globalRange | D unreachable (bounded below 2^(N-1)) | count <= max_items (checked above) |
+  | `src/render.zig:1339:5` | `i64 -> u63` | @max/@min refinement | clampIndex | D unreachable (bounded below 2^(N-1)) | slice index, << 2^62 |
+  | `src/value.zig:575:91` | `i32 -> u6` | std math.ldexp.ldexp | binary | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/value.zig:625:40` | `i32 -> u6` | std math.ldexp.ldexp | intPow | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+
+  Std sites pulled in by this module:
+  - `std/math/ldexp.zig:36:65` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp subnormal shift i32 -> u6: shifts 32..63 reachable; reached via std.math.pow and friends.
+  - `std/math/ldexp.zig:40:52` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp normalisation shift -> u6: 32..52 reachable.
+  - `std/math/ldexp.zig:52:47` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp underflow shift -> u6: 32..53 reachable.
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

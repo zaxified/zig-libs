@@ -718,3 +718,15 @@ src/root.zig.
 - (survey 2026-09-30) **Logix Template Object (0x6C) + UDT member decoding**: the first thing a pycomm3 user hits (structures read as named members); also lets the adapter advertise struct tags; medium, fits §2. (Already listed as deferred; this survey ranks it top.)
 - (survey 2026-09-30) **Implicit I/O connection engine (Class 1, UDP 2222)**: OpENer/EIPScanner users need cyclic I/O; large (cyclic scheduler, clock injected), fits §2 if kept clock-agnostic.
 - (survey 2026-09-30) **Standard objects on the adapter (TCP/IP Interface 0xF5, Ethernet Link 0xF6, Assembly)**: scanners/commissioning tools read them; small each, fits §2.
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/transport.zig:132:83` | `i96 -> u95` | @max/@min refinement | waitReadable | D unreachable (bounded below 2^(N-1)) | ns left, << 2^94 |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

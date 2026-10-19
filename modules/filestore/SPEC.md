@@ -173,6 +173,22 @@ matching `list`'s per-kind scoping); mandatory (non-advisory) locking; encryptio
 - **Optional read cache** *(survey 2026-09-30)*: diskv keeps a capped in-memory cache; here every
   `getBytes` is a syscall sequence. `ramcache` composes over it, so low priority. Effort S–M.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:639:48` | `i128 -> u32 (+1 more)` | std json.static.sliceToInt | get | C reachable only in extreme/far cases | std.json u8/u32 fields of caller's T: poison only for float-formatted numbers in the upper half; consumer compares on fields possible |
+  | `src/root.zig:654:55` | `i128 -> u32 (+1 more)` | std json.static.sliceToInt | listTyped | C reachable only in extreme/far cases | std.json u8/u32 fields of caller's T (as :639) |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · posix · util · reentrant` · deps: none — canonical source is `pub const meta` in
 src/root.zig.

@@ -409,6 +409,21 @@ tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
 - (survey 2026-09-30) **Multiple symbols per image** — quirc, rqrr and ZXing return every code found; here only the best triple is sampled (already listed above under *Multiple symbols per frame*). Effort: medium (API returns a slice, scratch stays bounded). Fits §2.
 - (survey 2026-09-30) **Steeper tilt / curved surfaces** — ZXing-class readers read codes at much sharper angles (40° in the differential); here 25–30° about the vertical axis in the differential and 10–25° in the in-repo sweep (already listed above as *A mesh instead of one global map*). Effort: large. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  4 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `example/main.zig:801:39` | `i32 -> u8` | @intCast | paeth | B reachable in normal computation | example: Paeth predictor pixel byte 0..255 -> u8: 128..255 reachable (PNG decode) |
+  | `example/main.zig:802:26` | `i32 -> u8` | @intCast | paeth | B reachable in normal computation | example: as :801 |
+  | `example/main.zig:803:12` | `i32 -> u8` | @intCast | paeth | B reachable in normal computation | example: as :801 |
+  | `src/root.zig:1402:41` | `i32 -> u31` | @max/@min refinement | findAlignment | D unreachable (bounded below 2^(N-1)) | reach in modules, small |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `build · any · codec · reentrant` + deps: `qr` — canonical source is

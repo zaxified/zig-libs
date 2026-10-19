@@ -534,3 +534,24 @@ typical grpc-go/tonic user hits in ordinary use.
 - **(survey 2026-09-30) Interceptors / middleware hooks** (auth, logging, metrics on client and server) — a grpc-go/tonic staple; absent, every caller wraps calls by hand. Effort: medium (needs an API decision). Fits §2: yes.
 - **(survey 2026-09-30) Default server concurrency** — a connection's streams run sequentially unless the application installs the `h2_server` dispatcher; a slow handler blocks the connection. Effort: small–medium (wire a pool option into `grpc.Server`). Fits §2: yes.
 - **(survey 2026-09-30) Retries/hedging, name resolution and load balancing, keepalive, `grpc-status-details-bin`, gRPC-Web** — client-architecture features; medium to large each. Fit §2: yes, but they need a channel that owns its connections.
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  7 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/reference_replay.zig:642:42` | `i32 -> u31` | @max/@min refinement | srvBig | A reachable from external input | wire i32 count -> u31 via @max(0,·): 2^30..2^31-1 reachable; alloc size follows (reference server) |
+  | `src/server_test.zig:176:42` | `i32 -> u31` | @max/@min refinement | bigImpl | T test/tools only | test; wire count, as reference_replay:642 |
+  | `src/server_test.zig:189:42` | `i32 -> u31` | @max/@min refinement | fatMetaImpl | T test/tools only | test; as above |
+  | `tools/interop.zig:851:42` | `i32 -> u31` | @max/@min refinement | srvBig | T test/tools only | tools; as reference_replay:642 |
+  | `tools/interop.zig:1181:23` | `i64 -> u16` | @intCast | today | T test/tools only | tools; year/month/day small |
+  | `tools/interop.zig:1182:23` | `i64 -> u8` | @intCast | today | T test/tools only | tools; month small |
+  | `tools/interop.zig:1183:21` | `i64 -> u8` | @intCast | today | T test/tools only | tools; day small |
+
+  Std sites pulled in by this module:
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

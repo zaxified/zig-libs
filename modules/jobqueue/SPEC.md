@@ -174,6 +174,23 @@ TTL on unique keys (no consumer asked; ack/cancel release them).
 - (survey 2026-09-30) **Durable, cross-process leases** — multiple worker processes need a shared queue; a lease is in-memory, single-process (listed above). Effort: large (needs a cross-process lock in `kv`). Fits §2.
 - (survey 2026-09-30) **Worker runtime (concurrency, graceful shutdown, handler dispatch by job type)** — Sidekiq/Asynq ship it; here the caller writes the loop (`workerpool` exists as a sibling). Effort: medium, likely a separate module composing `jobqueue` + `workerpool`. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:917:42` | `i32 -> u6` | std math.ldexp.ldexp | computeBackoff | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+
+  Std sites pulled in by this module:
+  - `std/math/ldexp.zig:36:65` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp subnormal shift i32 -> u6: shifts 32..63 reachable; reached via std.math.pow and friends.
+  - `std/math/ldexp.zig:40:52` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp normalisation shift -> u6: 32..52 reachable.
+  - `std/math/ldexp.zig:52:47` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp underflow shift -> u6: 32..53 reachable.
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `gap · posix · both · single_owner` + deps: `kv` — canonical source is `pub const meta` in

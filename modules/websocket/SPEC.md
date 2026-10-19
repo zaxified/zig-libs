@@ -484,6 +484,17 @@ The RED comes from the foreign corpus and from nothing else.
 - ~~**permessage-deflate (RFC 7692)**~~ **DONE 2026-10-11** (no-context-takeover mode; see Design) *(survey 2026-09-30)* — coder/websocket, gorilla and websocket.zig offer it, and browsers offer it on every handshake, so text-heavy JSON feeds shrink several-fold when it works. Without it a client that *requires* it fails; ones that merely offer it fall back. Effort: medium-large (extension negotiation incl. `client_no_context_takeover`/window bits, RSV1 handling, a bounded inflate with a decompression-bomb cap; `http.gzip`/std flate as the engine). Fits §2 (std flate is pure Zig). Security-sensitive, needs its own audit pass (already noted in this SPEC).
 - ~~**Socket-driven `Conn` helper (read loop + auto pong + close handshake)**~~ **DONE 2026-10-11** (`conn.Conn`) *(survey 2026-09-30)* — a typical user of gorilla/coder expects `ReadMessage`/`WriteMessage` and automatic replies to ping and close; here it is about 50 lines the caller writes from `parseFrame`/`Connection.receive`/`pongFor`. Effort: small-medium as a thin layer over `std.Io.Reader`/`Writer`, kept optional so the codec stays transport-agnostic. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL

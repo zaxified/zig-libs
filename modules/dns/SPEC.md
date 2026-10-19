@@ -186,6 +186,21 @@ JSON path.
 - **0x20 query-name case randomization** (survey 2026-09-30): c-ares does it as spoofing mitigation on top of the id/port entropy; here the reply check is case-insensitive only. Effort: small (encode random case, compare case-sensitively when enabled). Fits §2.
 - **Optional answer cache honoring TTL** (survey 2026-09-30): hickory and c-ares (inferred) offer one; Go's stub does not, so this is nice-to-have. Effort: medium. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/update.zig:250:32` | `i96 -> u64` | @intCast | nowSeconds | D unreachable (bounded below 2^(N-1)) | seconds from ns, < 2^63 |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps: `netaddr`,
 `http`, `std.json`, `std.Io.net` — canonical source is `pub const meta` in src/root.zig.

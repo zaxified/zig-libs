@@ -717,6 +717,26 @@ pending a native std TLS server.
   page stays resident while the connection idles. A real win needs storage whose page is touched
   anyway (e.g. bump-allocating from a buffer the request already dirtied); none is obvious.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  5 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/Server.zig:1458:61` | `i96 -> u95` | @max/@min refinement | nowNs | D unreachable (bounded below 2^(N-1)) | now ns, << 2^94 |
+  | `src/Server.zig:4810:32` | `i64 -> u63` | std math.clamp | formatHttpDate | D unreachable (bounded below 2^(N-1)) | clamp to max_secs (check max_secs < 2^62) |
+  | `src/h2_client.zig:552:29` | `i64 -> u63` | @max/@min refinement | sendSome | D unreachable (bounded below 2^(N-1)) | flow-control window <= 2^31-1 |
+  | `src/hpack.zig:485:38` | `i16 -> u8` | @intCast | huffmanDecodeAppend | B reachable in normal computation | Huffman-decoded symbol 0..255 -> u8: 128..255 reachable from wire (header bytes); data path, appended to output |
+  | `src/hpack.zig:491:38` | `i16 -> u8` | @intCast | huffmanDecodeAppend | B reachable in normal computation | as :485 |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `datefmt`, `tlsclient`, `crc32` (+ `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.

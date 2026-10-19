@@ -195,6 +195,26 @@ over a `Registry`); `Endpoint` is the shipped replacement. No push-gateway/remot
 - **`fastest`** — a VictoriaMetrics/metrics side in the bench (P1 needs it).
 - **Process collector differential** — run client_golang's process collector and ours on the same pid and compare (today: shape test + RLIMIT cross-check).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:545:32` | `i32 -> u6` | std math.ldexp.ldexp | fillExponentialBucketsRange | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:547:33` | `i32 -> u6` | std math.ldexp.ldexp | fillExponentialBucketsRange | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+  - `std/math/ldexp.zig:36:65` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp subnormal shift i32 -> u6: shifts 32..63 reachable; reached via std.math.pow and friends.
+  - `std/math/ldexp.zig:40:52` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp normalisation shift -> u6: 32..52 reachable.
+  - `std/math/ldexp.zig:52:47` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp underflow shift -> u6: 32..53 reachable.
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · posix · util · threadsafe` + deps: `router`, `http`, `procnet` — canonical source is `pub const meta`
 in src/root.zig.

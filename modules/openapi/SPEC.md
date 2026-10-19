@@ -194,6 +194,18 @@ explicitly out of scope, not planned. Richer path-parameter typing beyond `strin
 - ~~**Move `route_extras` onto `RouteDoc`**~~ (2026-10-12) — REJECTED the same day (owner left the call to the session): `router` would grow OpenAPI-only concepts (security requirements, examples, header/cookie parameter schemas) and a deep copy of them, for every router user, while `Info.route_extras` gives the same document and keeps `router` independent of the spec format. Revisit only if a second consumer of `RouteDoc` needs the same fields.
 - **OpenAPI 3.2** (survey 2026-09-30) — the Specification repo's latest release is 3.2.1 (2026-09-10); we emit 3.1.0, which remains valid and widely supported. Watch only.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · any · util · threadsafe` + deps: `router`, `http` (+ `std.json`) — canonical source is
 `pub const meta` in src/root.zig.

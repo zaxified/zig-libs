@@ -376,6 +376,24 @@ claim that used to justify it.
 - (survey 2026-09-30) **Kanji mode** — 13 bits per Japanese character versus 24 in UTF-8 bytes; matters to Japanese-text users, the original QR audience. Needs a Shift-JIS table (a `charset`-style sibling or embedded JIS X 0208 table). Effort: medium. Fits §2 if the table is generated/embedded; README argues it is deliberately not scheduled.
 - (survey 2026-09-30) **Micro QR (M1–M4)** — small labels; libqrencode (experimental) and qrcode-rust have it. Effort: medium (separate symbol geometry, masks, format info). Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  7 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:703:23` | `i32 -> u16` | @intCast | drawFinder | D unreachable (bounded below 2^(N-1)) | module coordinates < 177 |
+  | `src/root.zig:703:36` | `i32 -> u16` | @intCast | drawFinder | D unreachable (bounded below 2^(N-1)) | module coordinates < 177 |
+  | `src/root.zig:704:44` | `i32 -> u16` | @intCast | drawFinder | D unreachable (bounded below 2^(N-1)) | module coordinates < 177 |
+  | `src/root.zig:704:57` | `i32 -> u16` | @intCast | drawFinder | D unreachable (bounded below 2^(N-1)) | module coordinates < 177 |
+  | `src/root.zig:739:36` | `i32 -> u16` | @intCast | drawFunctionPatterns | D unreachable (bounded below 2^(N-1)) | coordinates < 177 |
+  | `src/root.zig:740:36` | `i32 -> u16` | @intCast | drawFunctionPatterns | D unreachable (bounded below 2^(N-1)) | coordinates < 177 |
+  | `src/root.zig:794:32` | `i32 -> u16` | @intCast | next | D unreachable (bounded below 2^(N-1)) | coordinates < 177 |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 
 `build · any · codec · reentrant` + deps: none — canonical source is

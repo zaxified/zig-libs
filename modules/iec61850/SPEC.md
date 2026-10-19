@@ -1066,3 +1066,21 @@ and passing when no peer is present).
 - (survey 2026-09-30) **Server-side MMS file services** (FileDirectory/Open/Read/Close over a caller-supplied file store): libiec61850 offers them and COMTRADE fault-record retrieval needs them; the codec exists, the server responder does not; medium, fits §2 (caller supplies the file store).
 - (survey 2026-09-30) **R-GOOSE / R-SMV (IEC 61850-90-5, UDP)**: libiec61850's R-Session; growing use in wide-area protection; medium, fits §2.
 - (survey 2026-09-30) **SCL Substation section, Services, Inputs/ExtRef parsing**: engineering tools notice the model round-trip loss (8 of 44 files); medium, fits §2. Already listed as not implemented.
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  7 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/ber.zig:388:12` | `i128 -> u63 (+3 more)` | @intCast | decodeUint | A reachable from external input | decodeUint(T): wire INTEGER after explicit range check -> uN, upper half reachable; same shape as the fixed snmp sites; callers compare/enum-convert |
+  | `src/client.zig:628:16` | `i64 -> u32` | @intCast | readSboTimeout | A reachable from external input | wire sboTimeout -> u32 after @min(maxInt(u32)): 2^31..2^32-1 reachable |
+  | `src/control.zig:84:55` | `i64 -> u8` | @intCast | fromInt | D unreachable (bounded below 2^(N-1)) | 0..4 |
+  | `src/control.zig:155:55` | `i64 -> u8` | @intCast | fromInt | D unreachable (bounded below 2^(N-1)) | 0..8 |
+  | `src/control.zig:307:23` | `i64 -> u8` | @intCast | decode | A reachable from external input | wire ctlNum 0..255 -> u8: 128..255 reachable (range check just above) |
+  | `src/control.zig:444:24` | `i64 -> u8` | @intCast | decode | A reachable from external input | ctlNum -> u8, as :307 |
+  | `src/settinggroups.zig:362:69` | `i16 -> u15` | @max/@min refinement | emitAttribute | A reachable from external input | resv_tms i16 -> u15 via @max(0,·): 16384..32767 reachable |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

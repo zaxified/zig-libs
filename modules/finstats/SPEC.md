@@ -162,6 +162,33 @@ free `periods_per_year` knob; confidence intervals/standard errors on the statis
   returns 0 for an empty slice; `pow(1, ppy/0 = +inf) = 1` gives the same 0).
 - Annualization presets and confidence intervals are already listed above (Remaining, deferred).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  11 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:321:36` | `i32 -> u6` | std math.ldexp.ldexp | npv | S std ldexp via std.math.pow | std.math.pow -> ldexp internal shift (see std-sites) |
+  | `src/root.zig:329:24` | `i32 -> u6` | std math.ldexp.ldexp | annualize | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:416:5` | `i64 -> u63` | @max/@min refinement | annualizeNode | D unreachable (bounded below 2^(N-1)) | day span, small |
+  | `src/root.zig:656:9` | `i64 -> u63` | @max/@min refinement | riskMetrics | D unreachable (bounded below 2^(N-1)) | day span, small |
+  | `src/root.zig:657:34` | `i32 -> u6` | std math.ldexp.ldexp | riskMetrics | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:750:30` | `i32 -> u6` | std math.ldexp.ldexp | monteCarlo | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:1065:43` | `i32 -> u6` | std math.ldexp.ldexp | dnpv | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:1192:29` | `i32 -> u6` | std math.ldexp.ldexp | skewness | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:1496:24` | `i32 -> u6` | std math.ldexp.ldexp | cagrOf | S std ldexp via std.math.pow | std.math.pow -> ldexp internal |
+  | `src/root.zig:2110:31` | `i32 -> u6` | std math.ldexp.ldexp | test.xirrPrecise: the same window, against an independent oracle \E2\80\94 the Newton path's missing half | T test/tools only | test; ldexp internal |
+  | `src/root.zig:2120:37` | `i32 -> u6` | std math.ldexp.ldexp | test.xirrPrecise: the same window, against an independent oracle \E2\80\94 the Newton path's missing half | T test/tools only | test; ldexp internal |
+
+  Std sites pulled in by this module:
+  - `std/math/ldexp.zig:36:65` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp subnormal shift i32 -> u6: shifts 32..63 reachable; reached via std.math.pow and friends.
+  - `std/math/ldexp.zig:40:52` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp normalisation shift -> u6: 32..52 reachable.
+  - `std/math/ldexp.zig:52:47` (i32 -> u6, @intCast, in `ldexp`), reach B reachable in normal computation: ldexp underflow shift -> u6: 32..53 reachable.
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · any · util · reentrant` · deps: `dataset` — canonical source is `pub const meta` in
 src/root.zig.

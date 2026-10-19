@@ -42,6 +42,13 @@ directory.
   byte-array↔vector bitcasts in chachapoly/poly1305, aesgcm and sealedbox (speed back to 0.16); tlsclient
   now rejects malformed post-handshake messages (KeyUpdate length, short handshake fragment, KeyUpdate
   on TLS 1.2) instead of panicking.
+  **Known issue (Zig 0.17.0 compiler, upstream #37131):** a cast from a signed integer to a narrower
+  unsigned one (`@intCast`, `std.math.cast`, `@max(0, x)` result narrowing, `std.json` into unsigned fields)
+  is emitted as LLVM `trunc nsw`, so values in the upper half of the destination range are poison and
+  ReleaseSafe/ReleaseFast may drop checks that depend on them (Debug is unaffected). Fixed where it broke a
+  check (snmp anti-replay range, jwe PBES2 `p2c`, zipstream mtime, falcon); the remaining 192 sites in 57
+  modules (+12 in std) are listed in each module's SPEC backlog with a reachability class and will be
+  revisited with Zig 0.17.1.
 - **Module grades v2 (2026-10-07) — every module re-graded, most one step lower.** The scale
   is now scope-led: 1 ahead of the competition (parity plus a dated, measured lead; a speed
   lead must beat the fastest implementation in the field, not just the reference), 2 parity,

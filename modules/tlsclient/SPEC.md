@@ -340,3 +340,15 @@ so the transcript would have to be kept, not only hashed); RSA client keys
 - **ALPN offer + selected-protocol accessor** (survey 2026-09-30) -- done 2026-10-04.
 - **Client certificates (mTLS)** (survey 2026-09-30) -- TLS 1.3 done 2026-10-04.
 - **Session-ticket resumption on the client** (survey 2026-09-30). `new_session_ticket` is dropped, so every connection pays a full handshake. Effort: medium. Fits §2. Deferred (above).
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/Client.zig:727:159` | `i64 -> u32` | @intCast | initBody | C reachable only in extreme/far cases | ticket age ms -> u32: >= 2^31 ms (24.8 days) only; tickets live <= 7 days |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

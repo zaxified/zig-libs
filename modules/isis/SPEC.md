@@ -264,6 +264,19 @@ Missing-and-it-matters items from the 2026-09-30 competitive survey (existing de
 - **Non-default ID length in typed bodies (ISO 10589 ID Length 1–8)** (survey 2026-09-30). Why: interop with the rare non-6 deployment; the deferred list above points here. Effort: ~2 days, touches every fixed-offset read. Fits §2: yes. Priority low.
 - **MT TLVs #222 / #235 / #237** (survey 2026-09-30). Why: multi-topology IS-IS (RFC 5120) in FRR/holo; the MT-ID is already parsed in #143/#144. Effort: ~2 days. Fits §2: yes. Priority low.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/checksum.zig:98:22` | `i32 -> u16` | @intCast | compute | D unreachable (bounded below 2^(N-1)) | x, y are 1..255 bytes -> u16 < 2^15 |
+  | `src/checksum.zig:98:52` | `i32 -> u16` | @intCast | compute | D unreachable (bounded below 2^(N-1)) | x, y are 1..255 bytes -> u16 < 2^15 |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle MIXED

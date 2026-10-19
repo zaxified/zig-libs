@@ -541,6 +541,24 @@ fallback).
 - **Client: automatic outbound Topic Aliases** (2026-10-01): outbound aliases are the caller's per publish. An opt-in LRU (as paho offers) would save bytes on repetitive topics. Effort: small.
 - **`$SYS` broker statistics topics** (survey 2026-09-30): Mosquitto exposes them and monitoring setups rely on them *(inferred)*. Effort: small (counters exist: `subscriptionCount`, `queueDrops`). Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  7 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/broker.zig:1862:70` | `i64 -> u63` | @max/@min refinement | exportMessage | D unreachable (bounded below 2^(N-1)) | ms deltas, << 2^62 |
+  | `src/broker.zig:1885:74` | `i64 -> u63` | @max/@min refinement | retainedMessages | D unreachable (bounded below 2^(N-1)) | ms deltas |
+  | `src/broker.zig:1886:45` | `i64 -> u63` | @max/@min refinement | retainedMessages | D unreachable (bounded below 2^(N-1)) | ms deltas |
+  | `src/broker.zig:2594:54` | `i64 -> u63` | @max/@min refinement | publishSys | D unreachable (bounded below 2^(N-1)) | ms deltas |
+  | `src/broker.zig:4721:12` | `i64 -> u32` | @intCast | secondsLeft | A reachable from external input | Message Expiry (wire, up to 2^32-1 s) -> u32: 2^31..2^32-1 reachable; clamp upper bound maxInt(u32) |
+  | `src/broker.zig:6947:62` | `i64 -> u63` | @max/@min refinement | waitFor | D unreachable (bounded below 2^(N-1)) | ms to deadline, small |
+  | `src/broker.zig:7131:96` | `i64 -> u63` | @max/@min refinement | stressProbe | C reachable only in extreme/far cases | liveness dt ms -> u63 refinement, << 2^62 (the u32 narrowing the snmp report flagged is via @min of u63, not signed) |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · any (codec+client pure; TcpTransport uses std.Io.net) · client+codec · single-owner` + deps:
 none (std only) — canonical source is `pub const meta` in src/root.zig.

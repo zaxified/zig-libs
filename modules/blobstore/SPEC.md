@@ -201,6 +201,18 @@ by design, `meta.platform = .posix`).
 - Content-defined chunking and encryption (restic) are deliberately not asked of this module:
   it stores the blob it is given (Threat model section: no encryption, no access control).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/root.zig:1117:40` | `i96 -> u64` | @intCast | reapStaleIngestTemps | C reachable only in extreme/far cases | age ns >= 2^63 (292 years) only; compare follows |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · posix · util · reentrant` + deps: `hashdigest` (SHA-256) — canonical source is
 `pub const meta` in src/root.zig.

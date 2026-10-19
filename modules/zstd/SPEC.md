@@ -3768,6 +3768,32 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   without a file (lorem ipsum / `-P#` synthetic data) followed with Z26's
   stage 2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  15 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/dbits.zig:187:42` | `i32 -> u5` | @intCast | readNCount | D unreachable (bounded below 2^(N-1)) | nb_bits <= 15 (FSE table log) |
+  | `src/dbits.zig:188:41` | `i32 -> u5` | @intCast | readNCount | D unreachable (bounded below 2^(N-1)) | nb_bits <= 15 |
+  | `src/dbits.zig:203:54` | `i32 -> u5` | @intCast | readNCount | B reachable in normal computation | bit_count &= 31 -> u5: 16..31 reachable; FSE header decode (wire) |
+  | `src/dbits.zig:223:50` | `i32 -> u5` | @intCast | readNCount | B reachable in normal computation | as :203 |
+  | `src/dbits.zig:250:44` | `i32 -> u5` | @intCast | readNCount | D unreachable (bounded below 2^(N-1)) | nb_bits-1 <= 14 |
+  | `src/dbits.zig:262:50` | `i32 -> u5` | @intCast | readNCount | B reachable in normal computation | as :203 |
+  | `src/fse.zig:439:34` | `i64 -> u32` | @intCast | encode | D unreachable (bounded below 2^(N-1)) | nb_bits_out <= 16 |
+  | `src/huf.zig:169:34` | `i32 -> u16` | @intCast | buildTree | D unreachable (bounded below 2^(N-1)) | node index < 512 |
+  | `src/huf.zig:170:38` | `i32 -> u16` | @intCast | buildTree | D unreachable (bounded below 2^(N-1)) | node index < 512 |
+  | `src/huf.zig:194:35` | `i32 -> u16` | @intCast | buildTree | D unreachable (bounded below 2^(N-1)) | node index < 512 |
+  | `src/huf.zig:195:35` | `i32 -> u16` | @intCast | buildTree | D unreachable (bounded below 2^(N-1)) | node index < 512 |
+  | `src/huf_dec.zig:539:38` | `i32 -> u5` | @intCast | readDTableX2 | D unreachable (bounded below 2^(N-1)) | weight + rescale <= 12 |
+  | `src/lazy.zig:445:63` | `i64 -> u32` | @intCast | fillHashCache | C reachable only in extreme/far cases | index distance >= 2^31 only (window log 31 + long inputs) |
+  | `src/match.zig:329:83` | `i128 -> u32` | @intCast | updateWindow | C reachable only in extreme/far cases | input index >= 2^31 only (inputs > 2 GiB) |
+  | `src/seekable_test.zig:414:52` | `i64 -> u32` | @intCast | test.a seek table whose frame sizes disagree with the frames is refused, never looped on | T test/tools only | test |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Open
 
 - Dictionaries (Z2c mutation sweep, widened per the coordinator's request:

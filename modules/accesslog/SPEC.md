@@ -315,6 +315,23 @@ not something this formatter can detect).
 - ~~**User-defined format string**~~ *(survey 2026-09-30)* — DONE 2026-10-11: `LogFormat` (`logformat.zig`), runtime `parse` / `comptimeParse` of an Apache 2.4 template: `%h %l %u %t %r %s %>s %b %B %D %T %m %U %q %H %%`, `%{Referer}i`, `%{User-Agent}i`, `%{key}x`; typed parse errors; `%{Name}o` and other request headers are rejected at parse because `Entry` carries neither. Every untrusted value goes through the Combined escaper; a template with a control byte in its literal text is rejected.
 - **`%{Name}i` for any request header** — `LogFormat` knows only `Referer` / `User-Agent`, because `Entry` carries no other header. Today: `Logger.extra_fn` copies the header into an extra field and the template prints it with `%{key}x`. Ideal: an optional header lookup passed to `LogFormat.write` (or a bounded `Entry.headers`). Effort: small-medium. Fits §2.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/sink.zig:609:55` | `i128 -> u64` | std json.static.sliceToInt | test.Sink F4: threads x lines into a real file -- every line whole, exactly once, in per-thread order | D unreachable (bounded below 2^(N-1)) | test JSON decode; u64 field via float-formatted number only, values < 2^63 |
+  | `tools/interop.zig:120:53` | `i128 -> u16` | std json.static.sliceToInt | main | C reachable only in extreme/far cases | tools: JSON u16 field, poison only for float-formatted 32768..65535 |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Design & invariants
 
 - Every `write*` function takes `entry: Entry` by value and a `*std.Io.Writer` — no allocation,

@@ -329,6 +329,30 @@ ACME v2 (RFC 8555) replay/downgrade paths all confirmed correct. A manual stagin
 - Deliberately not: a CLI and certbot's `live/`/`archive/` layout, web-server plugins, hook directories (the manager's events callback will cover them), ZeroSSL's non-ACME HTTP API, Ed25519 certificate keys (no public CA issues them), device-attest-01.
 - ~~**A run against a real staging CA in CI or a scheduled job**~~ — Pebble DONE 2026-10-06 (see Anchoring; by hand through `tools/pebble.sh`, replayed in the lane). Still open: a scheduled run against Let's Encrypt STAGING itself (Boulder, a public name, port 80), out of scope for a loopback lane.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  9 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/Client.zig:3687:46` | `i128 -> u8` | std json.static.sliceToInt | jwsHasKid | C reachable only in extreme/far cases | std.json []const u8 field (numeric-array path) poisons 128..255 only if written as floats; data only, no compare |
+  | `src/Manager.zig:568:36` | `i64 -> u63` | std math.clamp | run | D unreachable (bounded below 2^(N-1)) | clamp(next-now, 0, 3600): < 3600 |
+  | `src/Manager.zig:774:33` | `i64 -> u63` | @max/@min refinement | ratioRenewAt | D unreachable (bounded below 2^(N-1)) | cert lifetime seconds, << 2^62 |
+  | `src/Manager.zig:791:29` | `i64 -> u63` | @max/@min refinement | failed | D unreachable (bounded below 2^(N-1)) | backoff seconds, << 2^62 |
+  | `src/Manager.zig:841:71` | `i64 -> u63` | @max/@min refinement | pollAri | D unreachable (bounded below 2^(N-1)) | cert lifetime seconds, << 2^62 |
+  | `src/Manager.zig:845:10` | `i64 -> u63` | @max/@min refinement | pollAri | D unreachable (bounded below 2^(N-1)) | poll seconds, << 2^62 |
+  | `src/jws.zig:769:46` | `i128 -> u8` | std json.static.sliceToInt | verifyEab | C reachable only in extreme/far cases | std.json []const u8 field, float-formatted array elements only; data only |
+  | `src/jws.zig:789:46` | `i128 -> u8` | std json.static.sliceToInt | verifyEab | C reachable only in extreme/far cases | std.json []const u8 field, float-formatted array elements only; data only |
+  | `src/jws.zig:923:46` | `i128 -> u8` | std json.static.sliceToInt | verifyFlattenedAny | C reachable only in extreme/far cases | std.json []const u8 field, float-formatted array elements only; data only |
+
+  Std sites pulled in by this module:
+  - `std/json/static.zig:784:19` (i128 -> u64 (+3 more), @intCast, in `sliceToInt`), reach C reachable only in extreme/far cases: float-formatted JSON number (e.g. 200.0) -> caller uN: upper half poison; plain integers take fmt.parseInt (unaffected).
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · any · client · threadsafe` + deps `http`, `router`, `p256`, `p384`, `p521`, `rsa`, `netaddr`, `entropy`, `std.crypto` (sha2, hmac, `Certificate`),
 `std.json` — canonical source is `pub const meta` in src/root.zig.

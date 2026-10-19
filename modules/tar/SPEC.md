@@ -145,6 +145,23 @@ and the 8 GiB octal/base-256/pax-`size` boundary.
 Beyond the documented out-of-scope list (pax 'g' and records beyond
 `path`/`linkpath`/`size`/`uid`/`gid`/`mtime`, sparse files, per-file compression, encryption/signing, special files).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  6 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/go_oracle.zig:141:17` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle (Go vectors), small values |
+  | `src/go_oracle.zig:142:16` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle |
+  | `src/go_oracle.zig:143:16` | `i64 -> u32` | @intCast | goEntry | T test/tools only | test oracle |
+  | `src/root.zig:545:25` | `i128 -> u32` | std.math.cast | numField | A reachable from external input | header uid/gid/mode (wire, octal or base-256) -> u32: 2^31..2^32-1 reachable (uid 4294967294 is common); math.cast after the range check |
+  | `src/root.zig:624:25` | `i128 -> u64` | std.math.cast | sizeField | A reachable from external input | header size (base-256, up to 88 bits) -> u64: 2^63..2^64-1 reachable from a crafted header; size checks downstream |
+  | `src/root.zig:930:26` | `i64 -> u63` | @max/@min refinement | emitHeader | C reachable only in extreme/far cases | writer mtime >= 2^62 s only |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `extract · any (packDir: linux) · both (reader+writer) · reentrant` + deps: none (std only —
 `std.compress.flate` for gzip) — canonical source is `pub const meta` in src/root.zig.

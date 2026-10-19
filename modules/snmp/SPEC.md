@@ -257,6 +257,18 @@ const-time/alg-confusion (see Threat model above) is done — clean, 2026-07-10.
 - **Trap / Inform / SNMPv2-Trap sending, and v3 notifications** *(survey 2026-09-30)*. gosnmp `SendTrap`, net-snmp `snmptrap`; needed by anyone writing an agent, a test harness or a relay. The codecs for the PDUs already exist. Effort: small (v1/v2c), medium (v3, needs the engine-ID/boots ownership of the sender). Fits §2.
 - **AES-192/256 privacy (Cisco / draft-blumenthal variants)** *(survey 2026-09-30)*. snmp2 has them, net-snmp too *(inferred)*; some network gear mandates it. Effort: small (std AES) but the key-extension algorithm differs by vendor. Fits §2; already listed above as deferred.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/v3client.zig:1010:74` | `i64 -> u63` | @max/@min refinement | frame | D unreachable (bounded below 2^(N-1)) | test helper FakeAgent: time+skew small (u63 refinement) |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · any · codec+client · single_owner` + deps: none (std only) — canonical source is
 `pub const meta` in src/root.zig.

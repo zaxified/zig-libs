@@ -109,6 +109,17 @@ README, not implemented.
 - **(survey 2026-09-30) Partitioned or priority limits** (e.g. reserve slots for health checks or a paying tier; Netflix ships partitioned limiters *(inferred)*) — today one shared budget, so a flood of low-value requests can starve important ones. Effort: small–medium. Fits §2: yes.
 - Weighted acquires and FIFO fairness are refused by the SPEC's own design note (barging, no per-waiter queue memory).
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  No own sites in this module; only std sites pulled in (below).
+
+  Std sites pulled in by this module:
+  - `std/math.zig:536:5` (i64 -> u63 (+1 more), @max/@min refinement, in `clamp`), reach D unreachable (bounded below 2^(N-1)): clamp(lower=0 comptime) refinement; reach depends on caller bounds (all observed callers small).
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Status
 `gap · posix · util · threadsafe` + deps: `router`, `http` — canonical source is `pub const meta` in
 src/root.zig.

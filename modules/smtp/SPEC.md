@@ -435,3 +435,20 @@ Survey findings; `## Deferred` above remains the prose list of what is not done.
 - **DSN parameters `RET`/`ENVID`/`NOTIFY`/`ORCPT` (RFC 3461)** *(survey 2026-09-30)*. Delivery receipts are a normal request from a mail-sending application. Effort: small (MAIL/RCPT parameters; capability already parsed). Fits §2.
 - **BDAT/CHUNKING (RFC 3030)** *(survey 2026-09-30)*. Removes dot-stuffing and enables BINARYMIME; rare on the public Internet. Effort: small-medium. Fits §2.
 - **DKIM signing (RFC 6376)** *(survey 2026-09-30)*. Bulk senders need it; mail-send bundles it *(inferred)*. Effort: medium, best as its own module (SPEC "Deferred" already says so). Fits §2 (RSA/Ed25519 exist in the repo).
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  6 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/mime.zig:455:18` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | date fields small |
+  | `src/mime.zig:456:16` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | date fields small |
+  | `src/mime.zig:457:17` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | hour |
+  | `src/mime.zig:458:19` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | minute |
+  | `src/mime.zig:459:19` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | second |
+  | `src/mime.zig:460:20` | `i64 -> u8` | @intCast | civilFromUnix | D unreachable (bounded below 2^(N-1)) | weekday |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md

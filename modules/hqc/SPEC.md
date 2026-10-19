@@ -656,6 +656,18 @@ value, not a crash, and different from the real shared secret).
   build never gets CLMUL. Same Zig limitation as `zstd`'s Z22. Small once Zig allows
   it; pure Zig.
 
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/reedmuller.zig:298:20` | `i32 -> u8` | @intCast | decodeSymbol | B reachable in normal computation | peak_pos \| 128*sign -> u8: 128..255 reachable (~half of all decoded bytes); RM decode output byte |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
 ## Anchoring
 
 **Anchor grade:** class B · oracle EXTERNAL

@@ -410,3 +410,15 @@ remain fully implemented at consensus level (flag off); the flag only makes them
 - **Script builder + disassembler (`toAsm`) as public API** (survey 2026-09-30) — btcd has `ScriptBuilder`/`DisasmString`; here `asmparser.assemble` exists but is test-only and there is no inverse. Effort S. Fits §2.
 - **Template classification / destination extraction (Solver, IsStandard, ExtractDestination)** (survey 2026-09-30) — needed to tell a wallet what an output pays to; btcd `standard.go`, Core `solver.cpp`. Effort M. Fits §2. Partly covered since: `btcaddr.classify` / `btcaddr.toScriptPubKey` recognise the standard output templates and extract the payload; Solver-style standardness is still absent.
 - **Pin the full `script_tests.json` and `script_assets_test.json`** (survey 2026-09-30) — 297 of ~1100 non-witness rows are a sample by design; from the BIP342 corpus (`script_assets_test.json`) only the 5-transaction slice in `consensus_kat_vectors.zig` is pinned. Effort M (vendoring size). Fits §2.
+
+- **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
+
+  1 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):
+
+  | site | source → dest | shape | function | reach | risk note |
+  |---|---|---|---|---|---|
+  | `src/asmparser.zig:73:35` | `i64 -> u8` | @intCast | appendNumberPush | D unreachable (bounded below 2^(N-1)) | 0x50+n, n 1..16 -> < 128 |
+
+  Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
+
+  Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
