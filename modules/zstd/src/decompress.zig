@@ -343,14 +343,17 @@ pub fn findFrameCompressedSizeAdvanced(src: []const u8, format: Format) Error!us
 }
 
 /// `ZSTD_decompressBound`: an upper bound of the decompressed size of all
-/// frames in `src` — exact where the headers record content sizes.
+/// frames in `src` — exact where the headers record content sizes. A sum
+/// past 2^64 - 1 (forged content sizes) saturates there; libzstd's wraps to
+/// a small, wrong bound, and a plain `+=` here was an integer-overflow panic
+/// reachable from input (through `decompressAlloc` too).
 pub fn decompressBound(src_in: []const u8) Error!u64 {
     var src = src_in;
     var bound: u64 = 0;
     while (src.len > 0) {
         const info = try findFrameSizeInfo(src, .zstd1);
         src = src[info.compressed_size..];
-        bound += info.decompressed_bound;
+        bound +|= info.decompressed_bound;
     }
     return bound;
 }

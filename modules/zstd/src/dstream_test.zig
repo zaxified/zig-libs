@@ -395,6 +395,22 @@ test "the window limit counts a single-segment frame's content size" {
     }
 }
 
+test "a window of 2^64 - 1 under an unlimited max_window_size is refused, not an overflow" {
+    // Single segment, 8-byte content size 2^64 - 1: the window is the content
+    // size. With `max_window_size` = maxInt(u64) the window check passes and
+    // the ring's size (window + two blocks + 64) used to overflow -- a panic
+    // from one 17-byte header (audit O2-2). Now: too large for a usize.
+    var out: [16]u8 = undefined;
+    const f = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0xe0 } ++ @as([8]u8, @splat(0xff)) ++ [_]u8{ 0x01, 0x00, 0x00 };
+    var s = try zstd.DecompressStream.init(gpa, .{ .max_window_size = std.math.maxInt(u64) });
+    defer s.deinit();
+    var o: zstd.OutBuffer = .{ .dst = &out };
+    var in: zstd.InBuffer = .{ .src = &f };
+    try std.testing.expectError(error.FrameParameterWindowTooLarge, s.decompressStream(&o, &in));
+    try std.testing.expectError(error.FrameParameterWindowTooLarge, zstd.estimateDecompressStreamSizeFromFrame(&f, .{ .max_window_size = std.math.maxInt(u64) }));
+    try std.testing.expectError(error.FrameParameterWindowTooLarge, zstd.estimateDecompressStreamSize(std.math.maxInt(u64), .{}));
+}
+
 test "a two-byte checksummed frame fed one byte at a time" {
     // block maximum 2: the 4-byte checksum still fits the input buffer
     const z = try zstd.compressAlloc(gpa, "ab", .{ .level = 3, .checksum = true });

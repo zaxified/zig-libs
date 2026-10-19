@@ -113,9 +113,16 @@ const BufferSizes = struct {
 /// `ZSTD_decodingBufferSize_internal`.
 fn decodingBufferSize(window_size: u64, content_size: ?u64, block_size_max: usize) Error!usize {
     const block_size: u64 = @min(@min(window_size, dec.block_size_max), block_size_max);
-    const needed_rb = window_size + block_size * 2 + 32 * 2;
+    // Saturating: a single-segment frame's window is its content size, up to
+    // 2^64 - 1, which `max_window_size` (a u64) may let through; libzstd's
+    // sum wraps there, a plain `+` here was an overflow panic (audit O2-2).
+    const needed_rb = window_size +| (block_size * 2 + 32 * 2);
     const needed = @min(content_size orelse std.math.maxInt(u64), needed_rb);
-    return std.math.cast(usize, needed) orelse error.FrameParameterWindowTooLarge;
+    // The input buffer (one block) and the decoder's tables are added to it
+    // (`estimateSize`, the stream's allocation): all of it must fit a usize.
+    const rest = dec.block_size_max + dec.estimateDCtxSize();
+    if (needed > std.math.maxInt(usize) - rest) return error.FrameParameterWindowTooLarge;
+    return @intCast(needed);
 }
 
 /// `ZSTD_estimateDStreamSize`: the memory a `DecompressStream` with
@@ -401,7 +408,7 @@ pub const DecompressStream = struct {
                         const needed_in = needed.in;
                         const needed_out = needed.out;
                         // ZSTD_DCtx_updateOversizedDuration
-                        if (s.in_buff_size + s.out_buff_size >= (needed_in + needed_out) * workspace_too_large_factor)
+                        if (s.in_buff_size + s.out_buff_size >= (needed_in + needed_out) *| workspace_too_large_factor)
                             s.oversized_duration += 1
                         else
                             s.oversized_duration = 0;

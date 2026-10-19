@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** two integer-overflow panics reachable from a frame header (audit O2):
+  `decompressBound` summed forged content sizes with a plain `+` (two frames, one claiming 2^64 - 1
+  bytes and one of unknown size, also through `decompressAlloc`) -- the bound now saturates at
+  2^64 - 1 (libzstd's wraps to a wrong, small bound); and the stream's ring size (window + two blocks +
+  64) overflowed for a single-segment frame whose content size, its window, is near 2^64 once
+  `max_window_size` lets it through (e.g. `maxInt(u64)` for "no limit") -- now
+  `error.FrameParameterWindowTooLarge` from `DecompressStream`, `estimateDecompressStreamSize` and
+  `estimateDecompressStreamSizeFromFrame`. No change below those sizes.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: 'no per-function target features' and codegen notes labelled as 0.16 measurements, not re-checked on 0.17; std CRC/memset facts updated for 0.17.0.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.

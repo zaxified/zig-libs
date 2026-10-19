@@ -120,6 +120,21 @@ test "a streamed frame of unknown size decodes through the bound" {
     try std.testing.expect(try zstd.decompressBound(z) >= text.len);
 }
 
+test "forged content sizes past 2^64 saturate the bound, never overflow it" {
+    // Frame A claims 2^64 - 1 bytes (8-byte content size, empty last raw
+    // block); frame B records no size, so its bound is one block of its
+    // 1 KB window. The sum used to be an integer-overflow panic in
+    // `decompressBound`, reached by `decompressAlloc` (A's size alone is
+    // known, B's is not, so the headers give no total) -- audit O2-1.
+    const a = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0xc0, 0x00 } ++ @as([8]u8, @splat(0xff)) ++ [_]u8{ 0x01, 0x00, 0x00 };
+    const b = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x01, 0x00, 0x00 };
+    const src = a ++ b;
+    try std.testing.expectEqual(@as(?u64, null), try zstd.findDecompressedSize(&src));
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), try zstd.decompressBound(&src));
+    // capped by `max_size`, then refused: A decodes to 0 bytes, not 2^64 - 1
+    try std.testing.expectError(error.CorruptionDetected, zstd.decompressAlloc(gpa, &src, 100));
+}
+
 test "content checksum: a wrong one is refused unless ignored" {
     const z = try zstd.compressAlloc(gpa, strRepeat("checksummed content ", 20), .{ .checksum = true });
     defer gpa.free(z);
