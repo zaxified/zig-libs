@@ -208,9 +208,10 @@ pub const readIpv6Routes = counters.readIpv6Routes;
 /// returned slice (`gpa.free`).
 ///
 /// ⚠ `limit` TRUNCATES; it does not reject. A file longer than `limit` comes
-/// back as its first `limit` bytes, with the last line likely cut mid-row —
-/// which every parser here then skips as malformed, so the caller gets a
-/// short table rather than nothing.
+/// back as its first `limit` bytes, with the last line likely cut mid-row.
+/// A parser does NOT always reject such a row (a cut inside the last numeric
+/// field is still a number), so readers of line-oriented tables use
+/// `readVirtualLines`, which drops the incomplete last line.
 ///
 /// That is a deliberate repair of the opposite behaviour: this used to be
 /// `allocRemaining(...) catch null`, and `allocRemaining` returns
@@ -250,6 +251,46 @@ pub fn readVirtualFileReporting(
     path: []const u8,
     limit: usize,
 ) ?VirtualFile {
+    return readImpl(gpa, io, path, limit, false);
+}
+
+/// Length of the longest prefix of `bytes` that ends on a line boundary: up
+/// to and including the last `\n`, or 0 when there is none.
+pub fn wholeLinesLen(bytes: []const u8) usize {
+    return if (std.mem.findScalarLast(u8, bytes, '\n')) |i| i + 1 else 0;
+}
+
+/// `readVirtualFileReporting` for a LINE-ORIENTED table (`/proc/net/tcp`,
+/// `route`, `arp`, `nf_conntrack`, …): when `limit` cuts the file, the
+/// incomplete last line is dropped (`bytes` ends at a `\n`; `truncated` is
+/// still true), because a row cut inside a field is not always rejected by
+/// its parser — a socket row cut inside the inode digits is a valid row
+/// with the wrong inode, a route cut inside `Metric` has the wrong metric,
+/// an ARP row cut inside the device name has another interface. Not for
+/// files whose records are not newline-terminated lines (`cmdline`).
+pub fn readVirtualLinesReporting(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    limit: usize,
+) ?VirtualFile {
+    return readImpl(gpa, io, path, limit, true);
+}
+
+/// `readVirtualLinesReporting` without the truncation flag, as
+/// `readVirtualFile` is to `readVirtualFileReporting`.
+pub fn readVirtualLines(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ?[]u8 {
+    const r = readVirtualLinesReporting(gpa, io, path, limit) orelse return null;
+    return r.bytes;
+}
+
+fn readImpl(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    limit: usize,
+    whole_lines: bool,
+) ?VirtualFile {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
     var buf: [4096]u8 = undefined;
@@ -266,6 +307,7 @@ pub fn readVirtualFileReporting(
             return null;
         },
     };
+    if (truncated and whole_lines) list.shrinkRetainingCapacity(wholeLinesLen(list.items));
     const bytes = list.toOwnedSlice(gpa) catch {
         list.deinit(gpa);
         return null;
@@ -576,6 +618,55 @@ test "readVirtualFile: a file past `limit` truncates to the prefix, it does not 
     defer testing.allocator.free(cut);
     try testing.expectEqual(@as(usize, 250), cut.len);
     try testing.expectEqualStrings(payload[0..250], cut);
+}
+
+test "wholeLinesLen: up to and including the last newline" {
+    try testing.expectEqual(@as(usize, 0), wholeLinesLen(""));
+    try testing.expectEqual(@as(usize, 0), wholeLinesLen("no newline"));
+    try testing.expectEqual(@as(usize, 3), wholeLinesLen("ab\nc"));
+    try testing.expectEqual(@as(usize, 5), wholeLinesLen("ab\nc\n"));
+    try testing.expectEqual(@as(usize, 6), wholeLinesLen("ab\ncd\n"));
+}
+
+test "readVirtualLines: a limit cutting a row drops the row, readVirtualFile keeps the fragment (audit S9)" {
+    // A socket row cut inside its inode digits, a route cut inside Metric, an
+    // ARP row cut inside the device name are still valid-looking rows: the
+    // table readers must not be handed the fragment.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const text = "head\nrow-one 12345\nrow-two 67890\n";
+    {
+        var f = try tmp.dir.createFile(io, "t.txt", .{});
+        defer f.close(io);
+        var wbuf: [256]u8 = undefined;
+        var w = f.writer(io, &wbuf);
+        try w.interface.writeAll(text);
+        try w.interface.flush();
+    }
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.print(&path_buf, ".zig-cache/tmp/{s}/t.txt", .{&tmp.sub_path});
+
+    // The cut falls inside "row-two 67890": the whole-line read ends after
+    // "row-one 12345\n"; the plain read ends mid-row.
+    const cut_at = "head\nrow-one 12345\nrow-two 678".len;
+    const plain = readVirtualFileReporting(testing.allocator, io, path, cut_at) orelse return error.ReadFailed;
+    defer testing.allocator.free(plain.bytes);
+    try testing.expect(plain.truncated);
+    try testing.expectEqualStrings("head\nrow-one 12345\nrow-two 678", plain.bytes);
+
+    const lines = readVirtualLinesReporting(testing.allocator, io, path, cut_at) orelse return error.ReadFailed;
+    defer testing.allocator.free(lines.bytes);
+    try testing.expect(lines.truncated);
+    try testing.expectEqualStrings("head\nrow-one 12345\n", lines.bytes);
+
+    // Under the limit nothing is dropped and the flag stays false.
+    const whole = readVirtualLinesReporting(testing.allocator, io, path, 4096) orelse return error.ReadFailed;
+    defer testing.allocator.free(whole.bytes);
+    try testing.expect(!whole.truncated);
+    try testing.expectEqualStrings(text, whole.bytes);
 }
 
 test "copyClamped truncates instead of overflowing" {

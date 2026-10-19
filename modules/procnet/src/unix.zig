@@ -129,6 +129,14 @@ fn parseRow(line: []const u8, has_inode: bool) ?UnixEntry {
     return e;
 }
 
+/// ⚠ NOT A TRUST BOUNDARY. The `Path` column is a name a local user chose, and
+/// the kernel prints it raw: a pathname socket may contain `\n`, so an
+/// unprivileged user can bind `"x\n0000000000000000: 00000002 00000000
+/// 00010000 0001 01 12345 /run/forged"` and the rest of that name parses as a
+/// further, well-formed row (any inode, any path). The text cannot tell the
+/// two apart; where the table feeds a decision about who owns or listens on a
+/// socket, ask the kernel through `NETLINK_SOCK_DIAG` instead.
+///
 /// Parse `/proc/net/unix`. The header decides whether rows carry an `Inode`
 /// column (kernels before 2.6 did not; then `inode` is 0). A row that is not
 /// the documented shape is skipped. Caller frees the slice.
@@ -157,7 +165,7 @@ pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
 /// Read and parse the live `/proc/net/unix` (the caller's network namespace —
 /// unix sockets are per network namespace too). Empty when absent.
 pub fn readUnix(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!UnixTable {
-    const f = procnet.readVirtualFileReporting(gpa, io, "/proc/net/unix", read_limit) orelse
+    const f = procnet.readVirtualLinesReporting(gpa, io, "/proc/net/unix", read_limit) orelse
         return .{ .entries = try gpa.alloc(UnixEntry, 0), .truncated = false };
     defer gpa.free(f.bytes);
     return .{ .entries = try parseUnix(gpa, f.bytes), .truncated = f.truncated };

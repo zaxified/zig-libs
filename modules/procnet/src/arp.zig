@@ -83,7 +83,7 @@ pub fn parseArp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Erro
 /// an empty slice (no ARP module, or first boot with an empty cache), not an
 /// error.
 pub fn readArp(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]ArpEntry {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/net/arp", 256 * 1024) orelse return &.{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/net/arp", 256 * 1024) orelse return &.{};
     defer gpa.free(text);
     return parseArp(gpa, text);
 }

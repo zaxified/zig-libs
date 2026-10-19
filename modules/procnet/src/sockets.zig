@@ -287,8 +287,9 @@ pub fn parseUdpWithEndian(
 /// Named rather than inline because the number is a policy, and a visible
 /// one: a row runs about 150 bytes, so this is roughly 3 500 sockets per
 /// table. Past it the read TRUNCATES (see `procnet.readVirtualFile`) — the
-/// listing is short by the tail, the last partial row is dropped as
-/// malformed, and nothing errors. A host that routinely holds more sockets
+/// listing is short by the tail, the incomplete last row is dropped
+/// (`procnet.readVirtualLines`), and nothing errors (`SocketTable.truncated`
+/// says so). A host that routinely holds more sockets
 /// than this wants a caller-side read with its own limit, which the public
 /// `readVirtualFile` + `parseTcp`/`parseUdp` split already allows.
 pub const socket_table_read_limit = 512 * 1024;
@@ -330,7 +331,7 @@ pub fn readSockets(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!S
         .{ .path = "/proc/net/udp", .proto = .udp },
         .{ .path = "/proc/net/udp6", .proto = .udp },
     }) |spec| {
-        const read = procnet.readVirtualFileReporting(gpa, io, spec.path, socket_table_read_limit) orelse continue;
+        const read = procnet.readVirtualLinesReporting(gpa, io, spec.path, socket_table_read_limit) orelse continue;
         const text = read.bytes;
         defer gpa.free(text);
         if (read.truncated) truncated = true;

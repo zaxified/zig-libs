@@ -282,6 +282,8 @@ with the WRONG producer order does not yield the address, so the fixture cannot
 pass for the wrong reason.
 
 ## Backlog / deferred
+- **`/proc/net/unix` can be forged by a local user** *(audit 2026-10-19, `procnet-S9-3`)* — `src/unix.zig` `parseUnix`: a pathname socket name may contain `\n`, so `bind("x\n<well-formed row>")` makes the kernel print a second, attacker-written row (any inode, flags, path). Not fixable in a text parser (a forged row is indistinguishable); documented at `parseUnix`. A consumer deciding who listens on what should use `NETLINK_SOCK_DIAG` (`ss` does), which is a different module's job (`netlink`).
+- **`readArp`/`readRoutes`/`readIpv6Routes`/`readNetDev`/`readDiskstats` truncate silently** *(audit 2026-10-19)* — the cap (256 KiB arp/route ≈ 3 000 rows) is documented, but unlike `readSockets`/`readConntrack`/`readUnix` the result carries no `truncated` flag; adding one changes the return types (BREAKING), so it waits for an owner decision.
 **2026-10-17 — done, prometheus/procfs parity pass:** `/proc/net/unix`, `/proc/<pid>/status`, `/proc/net/{snmp,netstat}` (and the per-pid twins), plus full `/proc/<pid>/stat`, `limits`, `io`, `cmdline`, `cgroup`, fd count, `ProcRef` (`.self`/pid) and the runtime page size. The entries below that name them are history. Still open: mutation run 2026-10-18 (60/62, 2 eq) and the 8×200k fuzz driver run on the new files, no bench vs procfs.
 
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row

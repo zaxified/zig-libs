@@ -151,7 +151,7 @@ pub fn parseRoutesWithEndian(
 /// Read + parse the live `/proc/net/route`. A missing/unreadable file
 /// yields an empty slice, not an error.
 pub fn readRoutes(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]RouteEntry {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/net/route", 256 * 1024) orelse return &.{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/net/route", 256 * 1024) orelse return &.{};
     defer gpa.free(text);
     // The producer of a live read IS the running kernel, so the native order
     // is not merely the default here — it is the only right answer.

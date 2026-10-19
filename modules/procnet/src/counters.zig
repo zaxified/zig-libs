@@ -102,7 +102,7 @@ pub fn parseNetDev(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
 
 /// Read + parse the live `/proc/net/dev` (missing file → empty slice).
 pub fn readNetDev(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]NetDevEntry {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/net/dev", 1 << 20) orelse return &.{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/net/dev", 1 << 20) orelse return &.{};
     defer gpa.free(text);
     return parseNetDev(gpa, text);
 }
@@ -209,7 +209,7 @@ pub fn parseStat(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
 
 /// Read + parse the live `/proc/stat` (missing file → all zero).
 pub fn readStat(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!Stat {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/stat", 1 << 20) orelse return .{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/stat", 1 << 20) orelse return .{};
     defer gpa.free(text);
     return parseStat(gpa, text);
 }
@@ -291,7 +291,7 @@ pub fn parseMeminfo(text: []const u8) MemInfo {
 
 /// Read + parse the live `/proc/meminfo` (missing file → every field null).
 pub fn readMeminfo(gpa: std.mem.Allocator, io: std.Io) MemInfo {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/meminfo", 64 * 1024) orelse return .{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/meminfo", 64 * 1024) orelse return .{};
     defer gpa.free(text);
     return parseMeminfo(text);
 }
@@ -376,7 +376,7 @@ pub fn parseDiskstats(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocato
 
 /// Read + parse the live `/proc/diskstats` (missing file → empty slice).
 pub fn readDiskstats(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]DiskStat {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/diskstats", 1 << 20) orelse return &.{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/diskstats", 1 << 20) orelse return &.{};
     defer gpa.free(text);
     return parseDiskstats(gpa, text);
 }
@@ -408,6 +408,11 @@ pub const Ipv6RouteEntry = struct {
 
 fn parseHex128(tok: []const u8) ?[16]u8 {
     if (tok.len != 32) return null;
+    // Length is not a charset: `parseInt` takes a leading `+`/`-` and `_`
+    // separators, so a two-character pair like `+f` would decode to a byte the
+    // text does not spell (the same hole `parseHexU32` and the IPv4 decoders
+    // already close).
+    for (tok) |c| if (!std.ascii.isHex(c)) return null;
     var out: [16]u8 = undefined;
     for (&out, 0..) |*b, i| b.* = std.fmt.parseInt(u8, tok[2 * i .. 2 * i + 2], 16) catch return null;
     return out;
@@ -463,7 +468,7 @@ pub fn parseIpv6Routes(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocat
 
 /// Read + parse the live `/proc/net/ipv6_route` (no IPv6 → empty slice).
 pub fn readIpv6Routes(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]Ipv6RouteEntry {
-    const text = procnet.readVirtualFile(gpa, io, "/proc/net/ipv6_route", 4 << 20) orelse return &.{};
+    const text = procnet.readVirtualLines(gpa, io, "/proc/net/ipv6_route", 4 << 20) orelse return &.{};
     defer gpa.free(text);
     return parseIpv6Routes(gpa, text);
 }
@@ -732,6 +737,21 @@ test "parseIpv6Routes: rows not of the exact widths are skipped" {
     defer testing.allocator.free(rs);
     try testing.expectEqual(@as(usize, 1), rs.len);
     try testing.expectEqual(@as(u32, 1), rs[0].metric);
+}
+
+test "parseIpv6Routes: a sign or separator in an address pair is not a hex digit (audit S9)" {
+    // `parseInt(u8, "+f", 16)` is 15 and `"-0"` is 0: a 32-character token
+    // that is not 32 hex digits used to decode to an address the text does not
+    // spell. The prefix/metric fields were already charset-checked.
+    const z = "00000000000000000000000000000000";
+    const bad = "+f" ++ z[2..];
+    const tail = " 00 " ++ z ++ " 00 " ++ z ++ " 00000001 00000000 00000000 00000001 eth0\n";
+    const rs = try parseIpv6Routes(testing.allocator, bad ++ tail);
+    defer testing.allocator.free(rs);
+    try testing.expectEqual(@as(usize, 0), rs.len);
+    const ok = try parseIpv6Routes(testing.allocator, z ++ tail);
+    defer testing.allocator.free(ok);
+    try testing.expectEqual(@as(usize, 1), ok.len);
 }
 
 // ── hostile input: every parser on every damaged sample ─────────────────────

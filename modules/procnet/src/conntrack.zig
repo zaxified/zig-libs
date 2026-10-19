@@ -128,7 +128,7 @@ pub fn parseConntrack(gpa: std.mem.Allocator, text: []const u8, max: usize) std.
 /// missing/unreadable file (module not loaded) yields an empty result, not
 /// an error.
 pub fn readConntrack(gpa: std.mem.Allocator, io: std.Io, max: usize) std.mem.Allocator.Error!ConntrackResult {
-    const r = procnet.readVirtualFileReporting(gpa, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024) orelse
+    const r = procnet.readVirtualLinesReporting(gpa, io, "/proc/net/nf_conntrack", 4 * 1024 * 1024) orelse
         return .{ .flows = &.{}, .total = 0 };
     defer gpa.free(r.bytes);
     var out = try parseConntrack(gpa, r.bytes, max);
