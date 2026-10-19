@@ -125,7 +125,7 @@ pub fn match(tag: Tag, name: []const u8, base: []const u8) Match {
         .dNSName => matchDns(name, base),
         .rfc822Name => matchRfc822(name, base),
         .uniformResourceIdentifier => matchUri(name, base),
-        .directoryName => fromBool(matchDirectory(name, base)),
+        .directoryName => fromBool(matchDirectory(rdnSequence(name), rdnSequence(base))),
         .iPAddress => matchIp(name, base),
         else => .unsupported,
     };
@@ -303,6 +303,21 @@ pub fn matchIp(addr: []const u8, constraint: []const u8) Match {
         if ((a & m) != (n & m)) return .outside;
     }
     return .inside;
+}
+
+/// The RDNSequence of a directoryName value. A constraint base and a SAN
+/// entry carry the whole `Name` (`[4] EXPLICIT Name`: a SEQUENCE element),
+/// a certificate's subject is passed as its content (the RDN SETs) — so a
+/// value that is exactly one SEQUENCE element is unwrapped, anything else
+/// (already an RDN list: RDNs are SETs, never SEQUENCEs) is returned as is.
+/// Until 2026-10-19 the two shapes were compared as they came: a real
+/// excluded directoryName never matched a subject (bypass) and a permitted
+/// one never admitted it.
+fn rdnSequence(v: []const u8) []const u8 {
+    if (v.len < 2 or v[0] != 0x30) return v;
+    const e = extensions.parseElement(v, 0) catch return v;
+    if (e.slice.end != v.len) return v;
+    return v[e.slice.start..e.slice.end];
 }
 
 /// directoryName: the constraint's RDNSequence must be an element-wise

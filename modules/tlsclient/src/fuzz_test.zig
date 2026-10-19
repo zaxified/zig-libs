@@ -710,6 +710,78 @@ test "a KeyUpdate on a TLS 1.2 connection is an unexpected_message, not a read o
     try testing.expectEqual(@as(u64, 1), sink.read_seq);
 }
 
+var big_in: [2 * Client.min_buffer_len]u8 = undefined;
+var big_inner: [1 << 14 | 1]u8 = undefined;
+var big_rec: [(1 << 14 | 1) + 16]u8 = undefined;
+
+test "a full record with the caller's plaintext still buffered is record_overflow, not a write past read_buffer (audit 2026-10-19)" {
+    // `readIndirect` decrypts a record in place after the plaintext the caller
+    // has not consumed yet. std asserted room for the whole ciphertext there:
+    // a `peek` of more than one record's worth, on a `min_buffer_len` read
+    // buffer, met by a legal 2^14-octet record panicked in safe builds and
+    // wrote past the buffer in ReleaseFast. Negative control (fix reverted):
+    // the assert in `rebase` fires on the peek below.
+    try ensureTemplates();
+    const hs_end = tm.f13_records[6];
+    @memcpy(big_in[0..hs_end], tm.f13[0..hs_end]);
+    var w = Writer.fixed(big_in[hs_end..]);
+    var rec_store: [12]usize = undefined;
+    var nrec: usize = 0;
+    cur_records = &rec_store;
+    cur_nrecords = &nrec;
+    defer {
+        cur_records = &tm.f13_records;
+        cur_nrecords = &tm.f13_nrecords;
+    }
+    // Record 0: 300 octets the caller keeps buffered.
+    const small: [300]u8 = @splat('a');
+    putEncrypted(&w, tm.akey, tm.aiv, 0, .application_data, &small);
+    // Record 1: a legal full record, 2^14 octets of data + the content type.
+    @memset(big_inner[0 .. 1 << 14], 'b');
+    big_inner[1 << 14] = @backingInt(tls.ContentType.application_data);
+    var header: [5]u8 = .{ @backingInt(tls.ContentType.application_data), 3, 3, 0, 0 };
+    std.mem.writeInt(u16, header[3..5], big_rec.len, .big);
+    var nonce = tm.aiv;
+    nonce[11] ^= 1; // sequence 1
+    Aead.encrypt(big_rec[0..big_inner.len], big_rec[big_inner.len..][0..16], &big_inner, &header, nonce, tm.akey);
+    putRecord(&w, .application_data, &big_rec);
+
+    var reader = Reader.fixed(big_in[0 .. hs_end + w.end]);
+    var dw: Writer.Discarding = .init(&out_buf);
+    try Client.initInto(&sink, &reader, &dw.writer, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .write_buffer = &write_buf,
+        .read_buffer = &read_buf,
+        .entropy = &tm.entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+    });
+    // Room after 300 buffered octets: min_buffer_len - 300 < 2^14 + 1.
+    comptime std.debug.assert(Client.min_buffer_len - small.len < big_inner.len);
+    try testing.expectError(error.ReadFailed, sink.reader.peek(small.len + 1));
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsRecordOverflow), sink.read_err);
+    // Control: the same stream read without holding the first record back
+    // delivers every octet (the full record itself is accepted).
+    var reader2 = Reader.fixed(big_in[0 .. hs_end + w.end]);
+    try Client.initInto(&sink, &reader2, &dw.writer, .{
+        .host = .no_verification,
+        .ca = .no_verification,
+        .write_buffer = &write_buf,
+        .read_buffer = &read_buf,
+        .entropy = &tm.entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+        .allow_truncation_attacks = true,
+    });
+    var got: usize = 0;
+    while (sink.reader.peekGreedy(1)) |b| {
+        got += b.len;
+        sink.reader.toss(b.len);
+    } else |e| {
+        try testing.expectEqual(error.EndOfStream, e);
+    }
+    try testing.expectEqual(small.len + (1 << 14), got);
+}
+
 /// One TLS 1.3 record over the raw inner plaintext `inner` (content type and
 /// padding included by the caller).
 fn putEncryptedRaw(w: *Writer, key: [16]u8, iv: [12]u8, seq: u64, inner: []const u8) void {

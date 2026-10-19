@@ -295,6 +295,12 @@ rerun: 37 killed. No defect found.
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
+- **`select.selectPsk` opens tickets with `ring.open`, not `openAt`** *(audit 2026-10-19, O4)*: the
+  7-day key lifetime of `RotationPolicy` is enforced only if the caller calls `expire` on time; a
+  caller that rotates but never expires keeps accepting tickets sealed under retired keys. Proposed:
+  a `now_s` + `RotationPolicy` path through `selectPsk` (or a documented requirement + test that
+  `expire` runs before each selection). API-visible → owner call.
+
 - **Live interop for `selectPsk` against OpenSSL/BoringSSL clients** *(survey 2026-09-30)*: the SPEC's verification item 2 was never done; only RFC 8448 traces prove the binder/PSK/selection chain, and a consumer would have to be the first to find a disagreement. Effort: medium (a minimal loopback engine or a test that drives `openssl s_client -sess_in` through the module). Fits §2 for the module, but needs the test engine (qap's fork) — may belong in the consumer.
 - ~~**Time-driven STEK rotation policy** *(survey 2026-09-30)*~~ — DONE 2026-10-13: `stek.RotationPolicy` (24 h / 7 d, the Go defaults), `StekRing.needsRotation`/`maybeRotate`/`expire`/`openAt`; no clock or RNG inside (caller passes `now_s` and key bytes).
 - ~~**TLS 1.2 session tickets (RFC 5077)** *(survey 2026-09-30)*~~ — DONE 2026-10-13: `ticket12.zig` (NewSessionTicket12 codec, SessionTicket extension classifier); sealing is the unchanged `StekRing` blob.

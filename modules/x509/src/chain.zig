@@ -460,6 +460,29 @@ pub fn buildPath(
     trust_anchors: []const CertDer,
     opts: Options,
 ) VerifyChainError![]PathEntry {
+    var checks: u32 = 0;
+    return buildPathCounted(gpa, chain, trust_anchors, opts, &checks);
+}
+
+/// The most link signatures one `buildPath` call verifies (Go's
+/// `maxChainSignatureChecks`, crypto/x509/verify.go). The search backtracks
+/// over every same-subject candidate, so without a bound a peer-supplied
+/// chain of n intermediates sharing one DN and one key (self-made, nothing
+/// trusted needed) costs about e·n! verifications — leaf + 8 such CAs, about
+/// 10^5 per handshake. Past the bound the candidate fails with
+/// `ChainTooLong` (`NoTrustedPath` where several candidates failed). A real
+/// chain needs one check per link plus one per rejected cross-sign.
+const max_signature_checks: u32 = 100;
+
+/// `buildPath` with the running signature-check count in `checks` (read by
+/// the tests).
+fn buildPathCounted(
+    gpa: std.mem.Allocator,
+    chain: []const CertDer,
+    trust_anchors: []const CertDer,
+    opts: Options,
+    checks: *u32,
+) VerifyChainError![]PathEntry {
     if (chain.len == 0) return error.EmptyChain;
     // The chain is the peer's: nothing in it reaches std's parser (which
     // `verifyLink` and `verifyChain` call) or this module's walks before
@@ -485,7 +508,7 @@ pub fn buildPath(
 
     try path.append(gpa, .{ .der = chain[0], .anchor_index = null });
     const leaf_shape = try parseShape(.{ .buffer = chain[0], .index = 0 });
-    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, chain[0], leaf_shape, used_chain, 0, &path);
+    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, chain[0], leaf_shape, used_chain, 0, &path, checks);
 
     return try path.toOwnedSlice(gpa);
 }
@@ -511,6 +534,7 @@ fn findIssuerAndVerify(
     used_chain: []bool,
     depth: u32,
     path: *std.ArrayList(PathEntry),
+    checks: *u32,
 ) VerifyChainError!void {
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(gpa);
@@ -542,11 +566,11 @@ fn findIssuerAndVerify(
     if (candidates.items.len == 0) return error.NoTrustedPath;
 
     if (candidates.items.len == 1) {
-        return acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path);
+        return acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path, checks);
     }
 
     for (candidates.items) |cand| {
-        if (acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, cand, used_chain, depth, path)) {
+        if (acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, cand, used_chain, depth, path, checks)) {
             return;
         } else |_| {}
     }
@@ -569,7 +593,11 @@ fn acceptCandidate(
     used_chain: []bool,
     depth: u32,
     path: *std.ArrayList(PathEntry),
+    checks: *u32,
 ) VerifyChainError!void {
+    // Bounded work on a peer-supplied chain (`max_signature_checks`).
+    if (checks.* >= max_signature_checks) return error.ChainTooLong;
+    checks.* += 1;
     try verifyLink(cur_der, cand.der, opts.now_sec, opts.allow_sha1_signatures);
     // A v1 certificate cannot carry basicConstraints; as a trust anchor it is
     // the caller's configuration, and Go and OpenSSL both trust one (probe
@@ -601,7 +629,7 @@ fn acceptCandidate(
     if (next_depth > opts.max_intermediates) return error.ChainTooLong;
 
     const next_shape = try parseShape(.{ .buffer = cand.der, .index = 0 });
-    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, cand.der, next_shape, used_chain, next_depth, path);
+    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, cand.der, next_shape, used_chain, next_depth, path, checks);
 }
 
 /// One certificate's revocation verdict under `rev` (rules on `Revocation`):
@@ -1455,16 +1483,22 @@ fn checkOneName(
         if (names.match(tag, value, entry.value) != .outside) return error.NameConstraintViolated;
     }
 
-    var saw_type = false;
-    var matched = false;
-    var it_perm: SubtreeSetIterator = .init(permitted);
-    while (try it_perm.next()) |entry| {
-        if (entry.tag != tag) continue;
-        try charge(budget);
-        saw_type = true;
-        if (names.match(tag, value, entry.value) == .inside) matched = true;
+    // Permitted subtrees INTERSECT down the path (RFC 5280 §6.1.4 (g)(1)):
+    // every CA's own set that restricts this type must admit the name. Until
+    // 2026-10-19 the blobs were walked as one union, so a constrained CA could
+    // widen its own constraint by issuing a sub-CA that permits more.
+    for (permitted) |blob| {
+        var saw_type = false;
+        var matched = false;
+        var it_perm = extensions.subtreeIterator(blob);
+        while (try it_perm.next()) |entry| {
+            if (entry.tag != tag) continue;
+            try charge(budget);
+            saw_type = true;
+            if (names.match(tag, value, entry.value) == .inside) matched = true;
+        }
+        if (saw_type and !matched) return error.NameConstraintViolated;
     }
-    if (saw_type and !matched) return error.NameConstraintViolated;
 }
 
 fn charge(budget: *u64) error{TooManyConstraints}!void {
@@ -1854,6 +1888,100 @@ test "corpus: the parsePssParams seeds reach the parser, counts pinned" {
     try testing.expectEqual(pss_seeds.len - 1, nonempty); // all but seed("")
     try testing.expectEqual(@as(usize, 4), accepted);
     try testing.expectEqual(@as(usize, 3), n_salts);
+}
+
+// ── signature-check budget (audit 2026-10-19) ───────────────────────────────
+
+const Ed25519 = std.crypto.sign.Ed25519;
+
+/// DER length octets for `n < 256`.
+fn budgetDerLen(w: *std.Io.Writer, n: usize) !void {
+    if (n < 0x80) return w.writeByte(@intCast(n));
+    try w.writeAll(&.{ 0x81, @intCast(n) });
+}
+
+/// A minimal v3 Ed25519 certificate: CN `subject` with key `subject_pk`,
+/// issued and signed by CN `issuer` / `signer`; `ca` adds a critical
+/// basicConstraints cA=TRUE. Valid 2020-01-01 .. 2049-12-31.
+fn budgetCert(buf: []u8, serial: u8, subject: u8, issuer: u8, ca: bool, subject_pk: [32]u8, signer: Ed25519.KeyPair) ![]const u8 {
+    const alg = [_]u8{ 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70 };
+    const validity = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "200101000000Z".* ++ [_]u8{ 0x17, 0x0d } ++ "491231235959Z".*;
+    const bc_ext = [_]u8{ 0xa3, 0x13, 0x30, 0x11, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13, 0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff };
+    var body_buf: [200]u8 = undefined;
+    var b: std.Io.Writer = .fixed(&body_buf);
+    try b.writeAll(&.{ 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x01, serial });
+    try b.writeAll(&alg);
+    try b.writeAll(&.{ 0x30, 0x0c, 0x31, 0x0a, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x01, issuer });
+    try b.writeAll(&validity);
+    try b.writeAll(&.{ 0x30, 0x0c, 0x31, 0x0a, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x01, subject });
+    try b.writeAll(&([_]u8{ 0x30, 0x2a } ++ alg ++ [_]u8{ 0x03, 0x21, 0x00 }));
+    try b.writeAll(&subject_pk);
+    if (ca) try b.writeAll(&bc_ext);
+    var tbs_buf: [208]u8 = undefined;
+    var t: std.Io.Writer = .fixed(&tbs_buf);
+    try t.writeByte(0x30);
+    try budgetDerLen(&t, b.buffered().len);
+    try t.writeAll(b.buffered());
+    const sig = try signer.sign(t.buffered(), null);
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeByte(0x30);
+    try budgetDerLen(&w, t.buffered().len + alg.len + 3 + 64);
+    try w.writeAll(t.buffered());
+    try w.writeAll(&alg);
+    try w.writeAll(&.{ 0x03, 0x41, 0x00 });
+    try w.writeAll(&sig.toBytes());
+    return w.buffered();
+}
+
+test "buildPath: same-DN, same-key intermediates are refused after a bounded number of signature checks (Go maxChainSignatureChecks)" {
+    // A peer-made chain: leaf "L" issued by "X", six CAs all subject = issuer
+    // = "X" under one key, no AKI/SKI. Every link verifies, so the search
+    // backtracked over every ordering: 6 + 30 + 120 + 360 + 720 + 720 = 1956
+    // signature checks for one call (leaf + 8 such CAs: ~10^5). Negative
+    // control (budget check removed): `checks` is 1956 and the test fails.
+    const k = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const kr = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var bufs: [8][256]u8 = undefined;
+    var chain: [7]CertDer = undefined;
+    chain[0] = try budgetCert(&bufs[0], 1, 'L', 'X', false, k.public_key.toBytes(), k);
+    for (1..7) |i| chain[i] = try budgetCert(&bufs[i], @intCast(i + 1), 'X', 'X', true, k.public_key.toBytes(), k);
+    const root = try budgetCert(&bufs[7], 9, 'R', 'R', true, kr.public_key.toBytes(), kr);
+    const opts: Options = .{ .now_sec = 1_800_000_000 };
+
+    var checks: u32 = 0;
+    const r = buildPathCounted(std.testing.allocator, &chain, &.{root}, opts, &checks);
+    if (r) |p| {
+        std.testing.allocator.free(p);
+        return error.TestUnexpectedResult;
+    } else |e| try std.testing.expect(e == error.ChainTooLong or e == error.NoTrustedPath);
+    try std.testing.expect(checks <= max_signature_checks);
+    try std.testing.expect(checks > 6); // the search did run
+    if (verifyChain(std.testing.allocator, &chain, &.{root}, opts)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+test "buildPath: a chain that needs backtracking past a failing same-DN candidate still verifies within the budget" {
+    // "X" twice in the chain: the first under a key that did not sign the
+    // leaf (its link fails), the second the real issuer; both issued by root
+    // "R". One rejected candidate, then leaf -> X -> R.
+    const k = try Ed25519.KeyPair.generateDeterministic(@splat(1));
+    const k_other = try Ed25519.KeyPair.generateDeterministic(@splat(3));
+    const kr = try Ed25519.KeyPair.generateDeterministic(@splat(2));
+    var bufs: [4][256]u8 = undefined;
+    const leaf = try budgetCert(&bufs[0], 1, 'L', 'X', false, k.public_key.toBytes(), k);
+    const x_bad = try budgetCert(&bufs[1], 2, 'X', 'R', true, k_other.public_key.toBytes(), kr);
+    const x_good = try budgetCert(&bufs[2], 3, 'X', 'R', true, k.public_key.toBytes(), kr);
+    const root = try budgetCert(&bufs[3], 4, 'R', 'R', true, kr.public_key.toBytes(), kr);
+    const chain = [_]CertDer{ leaf, x_bad, x_good };
+    const opts: Options = .{ .now_sec = 1_800_000_000 };
+
+    var checks: u32 = 0;
+    const path = try buildPathCounted(std.testing.allocator, &chain, &.{root}, opts, &checks);
+    defer std.testing.allocator.free(path);
+    try std.testing.expectEqual(@as(usize, 3), path.len);
+    try std.testing.expectEqual(x_good.ptr, path[1].der.ptr);
+    try std.testing.expectEqual(@as(u32, 3), checks); // x_bad, x_good, root
+    const v = try verifyChain(std.testing.allocator, &chain, &.{root}, opts);
+    try std.testing.expectEqual(@as(usize, 0), v.trust_anchor_index);
 }
 
 test {

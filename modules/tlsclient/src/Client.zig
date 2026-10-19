@@ -2671,7 +2671,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                     const operand: V = pad ++ mem.toBytes(big(c.read_seq));
                     break :nonce @as(V, pv.server_iv) ^ operand;
                 };
-                rebase(r, ciphertext.len);
+                if (!rebase(r, ciphertext.len)) return failRead(c, error.TlsRecordOverflow);
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_key) catch
                     return failRead(c, error.TlsBadRecordMac);
@@ -2703,7 +2703,7 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                 };
                 const ciphertext = input.take(message_len) catch unreachable; // already peeked
                 const auth_tag = (input.takeArray(P.mac_length) catch unreachable).*; // already peeked
-                rebase(r, ciphertext.len);
+                if (!rebase(r, ciphertext.len)) return failRead(c, error.TlsRecordOverflow);
                 const cleartext = r.buffer[r.end..][0..ciphertext.len];
                 P.AEAD.decrypt(cleartext, ciphertext, auth_tag, ad, nonce, pv.server_write_key) catch
                     return failRead(c, error.TlsBadRecordMac);
@@ -2806,13 +2806,20 @@ fn readIndirect(c: *Client) Reader.Error!usize {
     }
 }
 
-fn rebase(r: *Reader, capacity: usize) void {
-    if (r.buffer.len - r.end >= capacity) return;
+/// Room for `capacity` octets after the plaintext the caller still has
+/// buffered. zig-libs tlsclient: false when there is none, and the caller
+/// fails the read (record_overflow). std asserted it: a `peek`/`fill` of
+/// more than is buffered, with over `min_buffer_len - capacity` octets still
+/// buffered, met by a full-size record, panicked in safe builds and wrote
+/// the plaintext past `read_buffer` in ReleaseFast (audit 2026-10-19).
+fn rebase(r: *Reader, capacity: usize) bool {
+    if (r.buffer.len - r.end >= capacity) return true;
     const data = r.buffer[r.seek..r.end];
+    if (r.buffer.len - data.len < capacity) return false;
     @memmove(r.buffer[0..data.len], data);
     r.seek = 0;
     r.end = data.len;
-    assert(r.buffer.len - r.end >= capacity);
+    return true;
 }
 
 fn failRead(c: *Client, err: ReadError) error{ReadFailed} {

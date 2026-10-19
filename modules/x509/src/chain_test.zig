@@ -242,6 +242,44 @@ test "checkNameConstraints: a type with no matching rule (otherName) still fails
     try chain_mod.checkNameConstraints(&none, &excluded, "dn", &dns);
 }
 
+test "checkNameConstraints: permitted subtrees of successive CAs intersect, a sub-CA cannot widen its issuer's (audit 2026-10-19)" {
+    // RFC 5280 §6.1.4 (g)(1): permitted_subtrees := intersection. An upper CA
+    // permits only example.org; the sub-CA it issued permits evil.com. A leaf
+    // for www.evil.com is outside the intersection. Negative control (the
+    // union walk this replaced): the leaf matched the sub-CA's entry and
+    // passed — a name-constraints bypass for any constrained CA.
+    const upper = dnsSubtree("example.org");
+    const lower = dnsSubtree("evil.com");
+    const permitted = [_][]const u8{ &upper, &lower };
+    const excluded = [_][]const u8{};
+    const evil = generalNamesWithDns("www.evil.com");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &evil));
+    const ours = generalNamesWithDns("www.example.org");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &ours));
+    // Nested constraints that agree: example.org above, a.example.org below.
+    const narrower = dnsSubtree("a.example.org");
+    const nested = [_][]const u8{ &upper, &narrower };
+    const in_both = generalNamesWithDns("www.a.example.org");
+    try chain_mod.checkNameConstraints(&nested, &excluded, "dn", &in_both);
+    const only_upper = generalNamesWithDns("www.b.example.org");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&nested, &excluded, "dn", &only_upper));
+    // Within ONE CA's set the entries are still alternatives (a union).
+    const two_in_one = upper ++ lower;
+    const one_ca = [_][]const u8{&two_in_one};
+    try chain_mod.checkNameConstraints(&one_ca, &excluded, "dn", &evil);
+    try chain_mod.checkNameConstraints(&one_ca, &excluded, "dn", &ours);
+    // A CA whose set does not restrict this type leaves it alone.
+    const mail = rfc822Blob("example.org");
+    const mixed = [_][]const u8{ &upper, &mail };
+    try chain_mod.checkNameConstraints(&mixed, &excluded, "dn", &ours);
+    // Per type: dNSName-only sets on both CAs do not restrict an iPAddress SAN.
+    const ip_san = [_]u8{ 0x30, 0x06, 0x87, 0x04, 192, 0, 2, 1 };
+    try chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &ip_san);
+    // Two nested CAs that both permit example.org admit www.example.org.
+    const same = [_][]const u8{ &upper, &upper };
+    try chain_mod.checkNameConstraints(&same, &excluded, "dn", &ours);
+}
+
 test "checkNameConstraints: dNSName label-suffix match, default-deny once a permitted set exists" {
     const subtree = dnsSubtree("example.org");
     const permitted = [_][]const u8{&subtree};
@@ -374,6 +412,43 @@ test "checkNameConstraints: directoryName RDN-sequence prefix containment" {
     // constraints too, independent of any SAN.
     try chain_mod.checkNameConstraints(&permitted, &excluded, &name_prefixed, "");
     try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, &name_unrelated, ""));
+}
+
+test "checkNameConstraints: a real directoryName constraint ([4] EXPLICIT Name) is matched against the subject's RDNs (audit 2026-10-19)" {
+    // Real encodings: the constraint base and a SAN entry hold the whole Name
+    // (a SEQUENCE), the subject is passed as its RDN content. Negative control
+    // (shapes compared as given, the code before the fix): the excluded
+    // O=Org did not exclude O=Org,CN=leaf (bypass), and the permitted O=Org
+    // refused it.
+    const rdn_org = [_]u8{ 0x31, 0x0c, 0x30, 0x0a, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x03, 'O', 'r', 'g' };
+    const rdn_evil = [_]u8{ 0x31, 0x0d, 0x30, 0x0b, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x04, 'E', 'v', 'i', 'l' };
+    const rdn_cn = [_]u8{ 0x31, 0x0d, 0x30, 0x0b, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x04, 'l', 'e', 'a', 'f' };
+    const name_org = [_]u8{ 0x30, rdn_org.len } ++ rdn_org;
+    const gn_org = [_]u8{ 0xa4, name_org.len } ++ name_org;
+    const subtree_org = [_]u8{ 0x30, gn_org.len } ++ gn_org;
+    const set = [_][]const u8{&subtree_org};
+    const none = [_][]const u8{};
+    const subj_org = rdn_org ++ rdn_cn;
+    const subj_evil = rdn_evil ++ rdn_cn;
+
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &set, &subj_org, ""));
+    try chain_mod.checkNameConstraints(&none, &set, &subj_evil, "");
+    try chain_mod.checkNameConstraints(&set, &none, &subj_org, "");
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&set, &none, &subj_evil, ""));
+
+    // A directoryName SAN entry is a whole Name too.
+    const name_evil = [_]u8{ 0x30, subj_evil.len } ++ subj_evil;
+    const gn_evil = [_]u8{ 0xa4, name_evil.len } ++ name_evil;
+    const san_evil = [_]u8{ 0x30, gn_evil.len } ++ gn_evil;
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&set, &none, &subj_org, &san_evil));
+    try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &[_][]const u8{&([_]u8{ 0x30, 0x13, 0xa4, 0x11, 0x30, 0x0f } ++ rdn_evil)}, &subj_org, &san_evil));
+    const name_org_cn = [_]u8{ 0x30, subj_org.len } ++ subj_org;
+    const gn_org_cn = [_]u8{ 0xa4, name_org_cn.len } ++ name_org_cn;
+    const san_org = [_]u8{ 0x30, gn_org_cn.len } ++ gn_org_cn;
+    try chain_mod.checkNameConstraints(&set, &none, &subj_org, &san_org);
+    // An empty Name as the base admits every name.
+    const empty_base = [_]u8{ 0x30, 0x04, 0xa4, 0x02, 0x30, 0x00 };
+    try chain_mod.checkNameConstraints(&[_][]const u8{&empty_base}, &none, &subj_evil, "");
 }
 
 // ── checkExtendedKeyUsage ──────────────────────────────────────────────────

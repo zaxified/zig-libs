@@ -130,9 +130,14 @@ decision requires, per RFC 5280 — and `verifyChain` implements all of it:
   `checkPathLength`.
 - Name-constraint matching (§6.1.4 (g), §4.2.1.10) — `names.zig`, one rule
   per `GeneralName` type (dNSName/rfc822Name/URI host by the shared domain
-  rule, directoryName RDN prefix, iPAddress CIDR) applied to the accumulated
+  rule, directoryName RDN prefix — both sides as RDN sequences, a `[4] Name`
+  unwrapped, since 2026-10-19 —, iPAddress CIDR) applied to the accumulated
   permitted/excluded subtrees from every CA in the path, under a comparison
-  budget — `checkNameConstraints`.
+  budget — `checkNameConstraints`. Excluded subtrees are a union; permitted
+  subtrees INTERSECT (§6.1.4 (g)(1), as Go): each CA's permitted set that
+  restricts a name's type must admit it, its own entries being alternatives
+  (until 2026-10-19 all CAs' permitted entries were one union — a sub-CA could
+  widen its issuer's constraint).
 - Extended-key-usage consistency/chaining and the leaf's required-purpose
   check — `checkExtendedKeyUsage`.
 - Hostname matching — `hostname.zig` (RFC 9525, Go `VerifyHostname`): SAN
@@ -430,7 +435,15 @@ Attacker-controlled cost: N SAN entries × M accumulated subtrees is capped by
 `Options.max_constraint_comparisons` (250 000, `TooManyConstraints`), the
 policy graph by `policy.Options.max_graph_edges` (100 000,
 `PolicyGraphTooLarge`); the duplicate-extension scan is quadratic in the
-extension count of one certificate (≤ 64 KiB).
+extension count of one certificate (≤ 64 KiB). Path building verifies at most
+100 link signatures per `verifyChain`/`verifyChainPath` call
+(`chain.max_signature_checks`, private; Go's `maxChainSignatureChecks`):
+the depth-first search backtracks over every same-subject candidate, and a
+peer-made chain of n CAs sharing one DN and one key (no AKI/SKI, nothing
+trusted needed) cost about e·n! verifications before the bound (leaf + 8:
+~10^5 per call). Past it the candidate fails with `ChainTooLong`
+(`NoTrustedPath` when several candidates failed). Real chains need one check
+per link plus one per rejected same-DN candidate (audit 2026-10-19).
 
 ## Status
 
