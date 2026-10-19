@@ -590,7 +590,7 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
+- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; still the stateless call per record — a cached context would need per-epoch key storage behind the generic `Protection(Aead)` shared with ChaCha20 (deferred until a consumer measures DTLS throughput).
 
 - **DTLS 1.2 (RFC 6347) client/server** (survey 2026-09-30). Every mbedtls-, OpenSSL- and most wolfSSL-based peer, WebRTC, LwM2M and most CoAP gear speak 1.2; pion/dtls and wolfSSL both offer it. A user with any such peer cannot connect. Effort: large (separate handshake, cookie exchange, CBC/GCM/CCM record layer, EMS). Fits §2.
 - **KeyUpdate (send and receive) and the 48-bit sequence rekey** (survey 2026-09-30). A peer that sends KeyUpdate makes the connection unusable here (`ReceivedPostHandshakeMessage`), and the sender stops at the 2^48 ceiling. Effort: medium. Fits §2.

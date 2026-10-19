@@ -2879,7 +2879,7 @@ fn liveOpensshClientMac(keygen_type: []const u8, hostkey_algo: []const u8, kex_n
         switch (c) {
             .chacha20_poly1305 => try std.testing.expectEqualStrings("chacha20-poly1305@openssh.com", cipher_name),
             .aes_ctr_hmac => try std.testing.expect(std.mem.endsWith(u8, cipher_name, "-ctr")),
-            .aes_gcm => |st| switch (st.key_bits) {
+            .aes_gcm => |st| switch (st.ctx) {
                 .aes256 => try std.testing.expectEqualStrings("aes256-gcm@openssh.com", cipher_name),
                 .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
             },

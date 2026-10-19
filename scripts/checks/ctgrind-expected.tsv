@@ -221,7 +221,7 @@ oscore	ReleaseFast	unprotect	1	1	23ccaa2a4630981c	ed85db89e3d7e9fd
 # reaches the exchange hash whatever the code does. `ffpow`: POSITIVE CONTROL,
 # the same K through the std.crypto.ff pow dhPowModPrime used until this date
 # — its window select compiles to a jump in ReleaseFast. It must stay >= 1.
-ssh	ReleaseFast	dh	1	4	593337fa7307a994	95639ff37028e502
+ssh	ReleaseFast	dh	1	4	d04a5a3c14cd0c4e	95639ff37028e502
 # Zig 0.17.0 (2026-10-18): ffpow 3 -> 17, still the positive control (>=1). 0.17 std ff pow's
 # table select is now `cmov(ct.eql(k, i+1))` (ff.zig:968/975 -> :359) and compiles to a jump per
 # table entry (16) instead of 2 `eql` jumps: std ff pow leaks the secret exponent's window values
@@ -242,8 +242,8 @@ ssh	ReleaseFast	ffpow	1	>=1	NO-OWN-SRC	95639ff37028e502
 # montint's DynModint (the server-chosen prime; group14 and group16 primes
 # here) — 0 contexts in dyn/montint/limbs; the 2 in-file are stripLeadingZeros
 # on e and K (RFC 4251 §5 mpint length, as `dh`).
-ssh	ReleaseFast	gex	1	2	593337fa7307a994	2d8d321e6c103efe
-ssh	ReleaseFast	ecdh	1	22	593337fa7307a994	8683e4aaf784b64c
+ssh	ReleaseFast	gex	1	2	d04a5a3c14cd0c4e	2d8d321e6c103efe
+ssh	ReleaseFast	ecdh	1	22	d04a5a3c14cd0c4e	8683e4aaf784b64c
 # ssh pem / pemstd (2026-10-18): HostKey.fromOpenSSH on the ed25519 fixture with the base64
 # characters carrying only seed bits tainted (44 - 2 edge characters; the edges share bits with
 # the private string's 0x40 length and the public-key copy, and tainting them made every later
@@ -260,7 +260,7 @@ ssh	ReleaseFast	ecdh	1	22	593337fa7307a994	8683e4aaf784b64c
 # replaced decoder (std.mem.indexOfPos = Boyer-Moore-Horspool + std.base64 table decode): 18 in
 # mem.zig/base64.zig on the first and second measurement. It must stay >= 1; no witness, since a
 # value loaded through a tainted table index reads as defined to memcheck.
-ssh	ReleaseFast	pem	1	3	249271f737b4accb	2ba7559fa99a2188
+ssh	ReleaseFast	pem	1	3	a16494e8822aac93	2ba7559fa99a2188
 ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
 # Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero

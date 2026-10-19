@@ -363,7 +363,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 ## Backlog / deferred
 
-- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
+- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; per-direction cached `aesgcm` context since the same day (no per-packet key expansion).
 
 - ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
   — **fixed 2026-10-18**: `parseEd25519Body` derives the pair with `Ed25519.KeyPair.generateDeterministic(seed)`

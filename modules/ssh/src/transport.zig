@@ -773,17 +773,17 @@ fn ctrXor(st: *const AesCtrHmacState, counter: *[16]u8, data: []u8) void {
 /// `aes256-gcm@openssh.com` / `aes128-gcm@openssh.com` (RFC 5647) per-
 /// direction state.
 ///
-/// `key`/`key_bits` carry up to a 256-bit AES-GCM key (`key_bits` says how
-/// many of `key`'s leading bytes are the real aes128-gcm key vs the full
-/// aes256-gcm key). `fixed_iv` is the 4-byte fixed part of the RFC 5647 §7.1
+/// `ctx` is the `aesgcm` context for the direction's key (aes128-gcm or
+/// aes256-gcm), built once at NEWKEYS: it caches the AES key schedule and
+/// the GHASH key powers, so a packet pays neither (1.2–1.9x the stateless
+/// call below 1 KiB, `aesgcm` README). `fixed_iv` is the 4-byte fixed part of the RFC 5647 §7.1
 /// 12-byte GCM nonce (`fixed_iv || 8-byte invocation_counter`); the
 /// `invocation_counter` increments once per packet, and unlike
 /// `chacha20_poly1305`/`aes_ctr_hmac` it is NOT the SSH sequence
 /// number (RFC 5647 keeps them as two separate 64-bit/32-bit counters that
 /// happen to increment in lockstep).
 pub const AesGcmState = struct {
-    key: [32]u8,
-    key_bits: enum { aes128, aes256 },
+    ctx: union(enum) { aes128: Aes128Gcm.Context, aes256: Aes256Gcm.Context },
     fixed_iv: [4]u8,
     invocation_counter: u64,
     /// See `Chacha20Poly1305State.sequence_number`.
@@ -1012,10 +1012,8 @@ fn readPacketBody(r: *std.Io.Reader, cipher: *CipherState, buf: []u8) TransportE
             @memcpy(nonce[0..4], &st.fixed_iv);
             std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
             const ct = buf[4 .. 4 + pkt_len];
-            switch (st.key_bits) {
-                .aes256 => Aes256Gcm.decrypt(ct, ct, tag, buf[0..4], nonce, st.key) catch
-                    return error.MacVerificationFailed,
-                .aes128 => Aes128Gcm.decrypt(ct, ct, tag, buf[0..4], nonce, st.key[0..16].*) catch
+            switch (st.ctx) {
+                inline else => |*ctx| ctx.decrypt(ct, ct, tag, buf[0..4], nonce) catch
                     return error.MacVerificationFailed,
             }
             st.invocation_counter +%= 1;
@@ -1134,9 +1132,8 @@ fn writePacketBody(w: *std.Io.Writer, cipher: *CipherState, entropy: Entropy, pa
             std.mem.writeInt(u64, nonce[4..12], st.invocation_counter, .big);
             var tag: [16]u8 = undefined;
             const pt = buf[4 .. 4 + pkt_len];
-            switch (st.key_bits) {
-                .aes256 => Aes256Gcm.encrypt(pt, &tag, pt, buf[0..4], nonce, st.key),
-                .aes128 => Aes128Gcm.encrypt(pt, &tag, pt, buf[0..4], nonce, st.key[0..16].*),
+            switch (st.ctx) {
+                inline else => |*ctx| ctx.encrypt(pt, &tag, pt, buf[0..4], nonce),
             }
             @memcpy(buf[4 + pkt_len .. 4 + pkt_len + 16], &tag);
             try w.writeAll(buf[0..total]);
@@ -2786,8 +2783,10 @@ fn buildCipher(name: []const u8, mac_name: ?[]const u8, dir: Direction, kr: *con
         const is256 = std.mem.eql(u8, name, "aes256-gcm@openssh.com");
         deriveKey(key[0..if (is256) @as(usize, 32) else 16], if (dir == .c2s) 'C' else 'D', k_enc, h, sid, hl);
         return .{ .aes_gcm = .{
-            .key = key,
-            .key_bits = if (is256) .aes256 else .aes128,
+            .ctx = if (is256)
+                .{ .aes256 = Aes256Gcm.init(key) }
+            else
+                .{ .aes128 = Aes128Gcm.init(key[0..16].*) },
             .fixed_iv = iv12[0..4].*,
             .invocation_counter = std.mem.readInt(u64, iv12[4..12], .big),
             .sequence_number = seq,
@@ -4904,8 +4903,8 @@ test "packet codec round-trip: aes256-gcm@openssh (counter increments per packet
     const t = std.testing;
     const key = @as([32]u8, @splat(0x11));
     const fixed_iv = [_]u8{ 0x22, 0x33, 0x44, 0x55 };
-    var wc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes256, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
-    var rc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes256, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
+    var wc: CipherState = .{ .aes_gcm = .{ .ctx = .{ .aes256 = Aes256Gcm.init(key) }, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
+    var rc: CipherState = .{ .aes_gcm = .{ .ctx = .{ .aes256 = Aes256Gcm.init(key) }, .fixed_iv = fixed_iv, .invocation_counter = 5, .sequence_number = 3 } };
 
     var out: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
@@ -4935,13 +4934,13 @@ test "packet codec round-trip: aes128-gcm@openssh + GCM tag detects tampering" {
     var key = @as([32]u8, @splat(0));
     for (key[0..16], 0..) |*b, i| b.* = @intCast(i + 1);
     const fixed_iv = [_]u8{ 1, 2, 3, 4 };
-    var wc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var wc: CipherState = .{ .aes_gcm = .{ .ctx = .{ .aes128 = Aes128Gcm.init(key[0..16].*) }, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
     var out: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&out);
     try writePacket(&w, &wc, .os, "aes128-gcm authenticated payload");
     const wire = w.buffered();
 
-    var rc: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var rc: CipherState = .{ .aes_gcm = .{ .ctx = .{ .aes128 = Aes128Gcm.init(key[0..16].*) }, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
     var r: std.Io.Reader = .fixed(wire);
     var rbuf: [256]u8 = undefined;
     const p = try readPacket(&r, &rc, &rbuf);
@@ -4951,7 +4950,7 @@ test "packet codec round-trip: aes128-gcm@openssh + GCM tag detects tampering" {
     var tampered: [256]u8 = undefined;
     @memcpy(tampered[0..wire.len], wire);
     tampered[8] ^= 0x01;
-    var rc2: CipherState = .{ .aes_gcm = .{ .key = key, .key_bits = .aes128, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
+    var rc2: CipherState = .{ .aes_gcm = .{ .ctx = .{ .aes128 = Aes128Gcm.init(key[0..16].*) }, .fixed_iv = fixed_iv, .invocation_counter = 0, .sequence_number = 0 } };
     var r2: std.Io.Reader = .fixed(tampered[0..wire.len]);
     var rbuf2: [256]u8 = undefined;
     try t.expectError(error.MacVerificationFailed, readPacket(&r2, &rc2, &rbuf2));
@@ -5295,7 +5294,7 @@ fn liveInteropMac(kex_name: []const u8, cipher_name: []const u8, mac_name: []con
     switch (transport.read_cipher) {
         .chacha20_poly1305 => try std.testing.expect(std.mem.eql(u8, cipher_name, "chacha20-poly1305@openssh.com")),
         .aes_ctr_hmac => try std.testing.expect(std.mem.endsWith(u8, cipher_name, "-ctr")),
-        .aes_gcm => |st| switch (st.key_bits) {
+        .aes_gcm => |st| switch (st.ctx) {
             .aes256 => try std.testing.expectEqualStrings("aes256-gcm@openssh.com", cipher_name),
             .aes128 => try std.testing.expectEqualStrings("aes128-gcm@openssh.com", cipher_name),
         },

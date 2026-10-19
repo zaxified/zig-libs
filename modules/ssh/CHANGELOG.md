@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — `transport.AesGcmState` holds a cached `aesgcm` context (`ctx`: AES key schedule + GHASH key powers, built once at NEWKEYS) instead of the raw `key`/`key_bits`: a packet no longer re-expands the key (the `aesgcm` README measures the context at 1.2–1.9x the stateless call below 1 KiB, equal at 16 KiB). Same bytes on the wire. Code that read `AesGcmState.key`/`.key_bits` switches on `.ctx` (`.aes128`/`.aes256`) instead.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** transport.zig per-packet AES-GCM now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
