@@ -208,6 +208,8 @@ two tests added (a list origin must match the whole serialization — a prefix m
 preflight grant); rerun: 36 killed. No defect found.
 
 ## Backlog / deferred
+- **`Vary: Origin` missing on actual responses without an allowed Origin** (audit 2026-10-19, low) — `applyActual` (`src/root.zig`, the `orelse return` after the `Origin` lookup and the `allowOriginValue` gate) sets `Vary: Origin` only when it also emits `Access-Control-Allow-Origin`. With `.list`/`.patterns`/`.predicate` origins, a response to a request with no or a disallowed `Origin` carries neither, so a shared cache may store it and serve it to an allowed cross-origin page, where the browser then blocks it (availability, not disclosure). Fix: always add `Vary: Origin` for non-`.any` policies; the Chrome-oracle replay pins the current bytes, so it needs the goldens regenerated and a consumer ruling.
+
 
 - ~~**Origin patterns with a subdomain wildcard**~~ DONE 2026-10-11 — `Origins.patterns` (see "Origin patterns, private network, pass-through").
 - ~~**`Access-Control-Allow-Private-Network`**~~ DONE 2026-10-11 — `allow_private_network`.

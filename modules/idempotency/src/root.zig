@@ -636,8 +636,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         std.crypto.secureZero(u8, body_bytes);
         idem.store.alloc().free(body_bytes);
     }
-    var digest: [digest_len]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(body_bytes, &digest, .{});
+    const digest = fingerprint(body_bytes, ctx.req.query);
 
     // We just drained the body ourselves — re-expose the buffered bytes to
     // the handler transparently via the `decoded` override seam (the same
@@ -683,6 +682,27 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // run the chain, then release it so a later retry can proceed.
     defer idem.store.finish(scoped, ctx.req);
     return next.run(ctx);
+}
+
+/// The request fingerprint recorded with a response and compared on a
+/// same-key request: SHA-256 of the body, and -- only when the request has a
+/// query string -- of `SHA-256(body) ++ 0x01 ++ query` (fixed-width first
+/// part, so no two (body, query) pairs share an input). The scoped key holds
+/// the path but not the query, so without this `POST /pay?to=alice` and
+/// `POST /pay?to=mallory` with one key and one (empty) body replayed the
+/// first answer for the second: the second request never ran, and the client
+/// was told it had. A request without a query keeps the plain body digest,
+/// so records stored before this stay valid.
+fn fingerprint(body: []const u8, query: []const u8) [digest_len]u8 {
+    var digest: [digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+    if (query.len == 0) return digest;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&digest);
+    h.update(&.{0x01});
+    h.update(query);
+    h.final(&digest);
+    return digest;
 }
 
 fn methodGuarded(methods: []const http.Method, m: http.Method) bool {
@@ -1271,6 +1291,38 @@ test "same key and target with a different body answers 422, not a replay" {
     const replay = runWire(&r, with_body, &b3);
     try testing.expectEqualStrings("order-1", bodyOf(replay));
     try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+test "same key and path with a different query answers 422, not a replay (audit 2026-10-19)" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    const alice = reqKey("POST", "/orders?to=alice", "q1");
+    const mallory = reqKey("POST", "/orders?to=mallory", "q1");
+
+    var b1: [2048]u8 = undefined;
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, alice, &b1)));
+    // Same key, same path, same (empty) body, other query: a different
+    // request. It must not be handed the first answer, and must not run.
+    var b2: [2048]u8 = undefined;
+    const second = runWire(&r, mallory, &b2);
+    try testing.expect(std.mem.startsWith(u8, second, "HTTP/1.1 422"));
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    // The identical request still replays.
+    var b3: [2048]u8 = undefined;
+    const replay = runWire(&r, alice, &b3);
+    try testing.expectEqualStrings("order-1", bodyOf(replay));
     try testing.expectEqual(@as(u32, 1), app.calls);
 }
 

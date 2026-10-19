@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** the request fingerprint now covers the query string. The scoped key holds the path only, so `POST /pay?to=alice` and `POST /pay?to=mallory` with one `Idempotency-Key` and an empty body were the same request to the store: the second was handed the first's recorded answer and never ran. It now answers 422 like any other fingerprint mismatch. A request without a query keeps the plain SHA-256 body digest (records stored earlier stay valid). Test `same key and path with a different query answers 422`.
 - **2026-10-18** — Ported to Zig 0.17.0. `max_body_bytes` boundary: the body probe no longer reads `max_body_bytes + 1` (0.16 `allocRemaining` failed at its limit; 0.17 accepts exactly the limit), so exactly the cap is fingerprinted and one byte over is 413 as documented (existing boundary test passes); `maxInt` cap maps to `.unlimited` (`+1` would overflow). Model-fuzz reach check uses `field_names`.
 - **2026-10-12** — **Breaking (source):** `scopeKey` takes the method name (`[]const u8`,
   `Request.methodName()`) instead of `http.Method`: since http R9 every extension method is
