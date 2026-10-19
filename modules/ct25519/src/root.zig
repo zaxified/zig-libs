@@ -93,6 +93,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const burn = @import("burn.zig");
+const entropy = @import("entropy");
 
 /// Re-exported so callers can name the types without a second std path.
 pub const Edwards25519 = std.crypto.ecc.Edwards25519;
@@ -110,10 +111,10 @@ pub const meta = .{
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
-    .role = .util, // pure computation — no I/O, no allocation, no RNG
+    .role = .util, // pure computation — no I/O, no allocation; RNG only in `X25519.KeyPair.generate` (fail-closed via `entropy`)
     .concurrency = .reentrant, // no globals; all types are plain values
     .model_after = "std.crypto.ecc.Edwards25519's own pcMul16 4-bit-window constant-time ladder (std/crypto/25519/edwards25519.zig), with the trailing rejectIdentity removed so the neutral element is a value and the function carries no error union; the ladder itself is the classic fixed-window scalar multiplication of RFC 8032 / Curve25519 implementations",
-    .deps = .{},
+    .deps = .{"entropy"}, // entropy: the fail-closed seed draw of `X25519.KeyPair.generate`
 };
 
 /// `pc[i] = i*p` for `i` in `0..15`, `pc[0]` the neutral element — std's
@@ -452,7 +453,12 @@ pub const X25519 = struct {
             var random_seed: [seed_length]u8 = undefined;
             defer std.crypto.secureZero(u8, &random_seed);
             while (true) {
-                io.random(&random_seed);
+                // Fail-closed (CONVENTIONS.md §2.2): `io.random` silently
+                // degrades to a guessable seed when the kernel has no entropy,
+                // and this seed IS the private key (an ECDHE share under qap's
+                // TLS shim). `generate` mirrors std's infallible shape, so the
+                // draw aborts instead of returning an error (audit 2026-10-19).
+                entropy.fill(io, &random_seed);
                 generateDeterministicInto(out, &random_seed) catch {
                     @branchHint(.unlikely);
                     continue;

@@ -356,7 +356,7 @@ pub const module_list = [_]Module{
     .{ .name = "frost", .libs = &.{"crypto"}, .deps = &.{ "bip340", "k256" }, .test_deps = &.{"testkit"} },
     .{ .name = "oscore", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "spake2plus", .libs = &.{"crypto"}, .deps = &.{"p256"}, .test_deps = &.{"testkit"} },
-    .{ .name = "ct25519", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
+    .{ .name = "ct25519", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .test_deps = &.{"testkit"} },
     .{ .name = "voprf", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
     .{ .name = "opaque", .libs = &.{"crypto"}, .deps = &.{ "voprf", "ct25519" }, .test_deps = &.{"testkit"} },
     .{ .name = "bulletproofs", .libs = &.{"crypto"}, .deps = &.{"ct25519"}, .test_deps = &.{"testkit"} },
