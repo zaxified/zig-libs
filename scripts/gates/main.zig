@@ -14,6 +14,18 @@
 //! `std.Build.Step` the 0.16 make functions used (`gates.zig`), so they moved
 //! without a rewrite: `step.owner` is a `Build` whose `build_root` is the cwd,
 //! and `step.fail` logs the message and returns `error.MakeFailed`.
+//!
+//! Known gaps (review of the 0.17 gate rewrite, 2026-10-18; all LOW, open):
+//! - `check-uapi` / `check-dark-tests` warn and exit 0 when `python3` / `bash`
+//!   is missing (as on 0.16). CI does not assert the runner has them, so a
+//!   slimmer image would be a false green; a "require" env flag would close it.
+//! - `declared_dirs` and `gateTool(b)` in `build.zig` are file-level globals,
+//!   deduped by relative path: a consumer graph that instantiates zig-libs from
+//!   TWO package roots (live `.path` dependencies only; fetched packages are
+//!   immutable) declares the second root's directories never and reuses the
+//!   first root's gate exe.
+//! - Comments in `gates.zig` still describe the 0.16 `build()` pass numbers and
+//!   `b.step` behaviour; behaviour is unaffected.
 
 const std = @import("std");
 const gates = @import("gates.zig");

@@ -356,6 +356,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Backlog / deferred
 
+- **Own `x = 0` + sign-bit check is redundant on Zig 0.17** (migration review 2026-10-19): 0.17 std `Edwards25519.fromBytes` already rejects that encoding (`edwards25519.zig:46`), so the KAT control at `kat_test.zig` (~381) passes with the module's own line (`ecvrf.zig:368`) deleted — an equivalent mutant on 0.17. The check stays (cheap, documents RFC 8032 §5.1.3, and the CT notes above rely on it); a mutation run should count that mutant as equivalent, not as a missing test.
 - **ECVRF-EDWARDS25519-SHA512-ELL2** (RFC 9381, suite 0x04) *(survey 2026-09-30)*: the suite without try-and-increment's data-dependent loop over alpha (TAI is not suitable for secret input, as ProtonMail's README also notes). SPEC "Out of scope" says std's `Edwards25519.fromUniform`/`elligator2` make this "comparatively low-effort". Effort: small. Fits §2.
 - **ECVRF-P256-SHA256-TAI and -SSWU** (RFC 9381, suites 0x01/0x02) *(survey 2026-09-30)*: the P-256/secp256k1-family peers above (witnet, vechain) are built around them; SPEC "Out of scope": needs P-256 and SEC1 point compression. std has `ecc.P256` with SEC1 (de)compression; sibling `p256` exists. Effort: medium. Fits §2.
 

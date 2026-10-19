@@ -130,6 +130,7 @@ for the full socket path).
 
 ## Backlog / deferred
 
+- **Big-endian: the two seed-corpus tests fail on s390x** (BE sweep 2026-10-18, same on Zig 0.16 and 0.17; re-run 2026-10-19 `-Dtarget=s390x-linux -fqemu -Doptimize=ReleaseSafe`): `corpus: the hwaddr seeds drive both shapes…` expected 7, found 0; `corpus: the ARP seeds…` expected 4, found 0. Test-only: the seeds are `std.testing.Smith` streams written on a little-endian host, so their length/choice words read differently on BE and no seed reaches the accepting arms. The parsers themselves are not involved. Fix: pin the counts per endianness, or encode the seeds through the Smith writer at comptime.
 - **2026-10-04:** survey items (1) pcap savefiles — **done** inside this module (`rawsock.pcap`;
   a separate `pcapfile` module would need a root `build.zig` entry, and the codec is ~150 lines
   that every capture user wants next to the socket), (2) the expression compiler — **done for the
