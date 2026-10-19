@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** Docs (security claim): the *Constant-time contract* said the
+  software backend has "exactly std's `Aes128`/`Aes256` posture, no worse" and that neither std
+  nor this module has a bitsliced AES; the 2026-10-18 entry below said this was re-checked on
+  0.17.0. It is false on Zig 0.17: std's soft `Aes128`/`Aes256` contexts are bitsliced when
+  `side_channels_mitigations != .none`, this module's rounds still use the masked table
+  lookups, so on targets without hardware AES (0.17 also requires AVX on x86-64) AES-192 is
+  weaker than std's siblings. SPEC/README corrected (affected targets listed); the bitsliced
+  backend is a *Backlog / deferred* entry. No code change.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).
 
 - **2026-10-11** — Performance P3 → P2 (grade 3 → 2): comparative bench `tools/bench.zig`

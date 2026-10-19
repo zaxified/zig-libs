@@ -31,8 +31,10 @@ README.
 
 **Where we are ahead:** the only Zig AES-192, std-shaped so std's generic modes take it unchanged;
 ctgrind-checked on AES-NI; works around two std software-backend defects (present in 0.16 and 0.17.0) (*Algorithm*).
-**Where we are behind:** no constant-time software backend — RustCrypto has a bitsliced one, Go
-and std do not (deliberately not done here, see *What is deliberately not done*).
+**Where we are behind:** no constant-time software backend — RustCrypto has a bitsliced one,
+and so does std 0.17 for its own `Aes128`/`Aes256` contexts (`std/crypto/aes/bitsliced.zig`,
+private to std), so on a target without hardware AES this module is weaker than std's two
+siblings (*Constant-time contract*; plan in *Backlog / deferred*).
 
 ## What this module is, and what it is not
 
@@ -97,15 +99,26 @@ Secret: the key (hence every round key) and the data blocks.
   script's pinned CPU): rows `enc` and `dec` in `ctgrind-expected.tsv`, **0 in-file**; all
   contexts are the harness's printed results (witness). ARMv8 is not measured under valgrind
   here (no arm64 host); the claim there rests on the code being std's `aese`/`aesd` sequences.
-- **Software backend** (`has_hardware_support == false`): exactly std's `Aes128`/`Aes256`
-  posture, no worse. std's tables are read with cache-line-granular masking
-  (`std.options.side_channels_mitigations`, default `.medium`), which is a mitigation, not
-  constant time: memcheck sees the secret-indexed loads. Measured 2026-10-10,
-  `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh --stacks aes192` (not a pinned row — the
-  script pins one CPU for all modules): `enc` 356 in-file, `dec` 349 in-file, **every one a
-  "Use of uninitialised value" (a load address) at `soft.zig:127-134, 838-840, 878-880`**,
-  zero conditional jumps. A consumer that needs constant time on a CPU without AES
-  instructions needs a bitsliced AES, which neither std nor this module provides.
+- **Software backend** (`has_hardware_support == false`): **WEAKER than std's
+  `Aes128`/`Aes256` on Zig 0.17** (audit 2026-10-19, O5-1). Every round of this module runs
+  on std's soft `Block.encrypt`/`decrypt`/`*Last`, i.e. 32-bit T-table / S-box lookups read
+  with cache-line-granular masking (`std.options.side_channels_mitigations`, default
+  `.medium`) — a mitigation, not constant time: memcheck sees the secret-indexed loads.
+  Measured 2026-10-10 on 0.16, `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh --stacks aes192`
+  (not a pinned row — the script pins one CPU for all modules): `enc` 356 in-file, `dec` 349
+  in-file, every one a "Use of uninitialised value" (a load address) in std's `soft.zig`
+  table/S-box lookups, zero conditional jumps. std 0.17's own soft contexts no longer take
+  that path: `AesEncryptCtx`/`AesDecryptCtx` `encrypt`/`decrypt`/`*Wide` run
+  `std/crypto/aes/bitsliced.zig` ("no data-dependent memory access") whenever
+  `side_channels_mitigations != .none`, so an AES-128/256 data path is constant time there
+  and this module's AES-192 data path is not. Only the key expansion is still level: std's
+  soft `expandKey` uses the same masked `sbox_lookup` this module reaches through
+  `subWord`. Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`): x86-64
+  without AES-NI **or without AVX** (0.17 requires both — e.g. Atom/Goldmont/Tremont-class
+  router and NAS CPUs that have AES-NI but no AVX, and any `-Dcpu=baseline` /
+  `x86_64` / `x86_64_v2` build), arm64 without the Crypto Extensions (e.g. Cortex-A72 as in
+  a Raspberry Pi 4), and every other architecture. The plan to close the gap is in
+  *Backlog / deferred*.
 
 ## Limits and refusals
 
@@ -159,12 +172,36 @@ words; with a 512-byte burn and `u32` words it is 0.74–0.81×. Grade: worst ro
 
 ## What is deliberately not done
 
-- **An own software AES** (bitsliced or otherwise): not now. The point of the module is to add
-  only what std lacks; a constant-time software path is a std gap for all three key sizes,
-  not an AES-192 one.
+- **An own software AES** written here: not done. The reasoning that it was "a std gap for
+  all three key sizes, not an AES-192 one" no longer holds on Zig 0.17 (std's
+  `Aes128`/`Aes256` soft contexts are bitsliced); the fix is to reuse std's bitsliced core,
+  not to write a new one — see *Backlog / deferred*.
 - **aeskeygenassist-based expansion on AES-NI:** not done. The generic expansion is the same
   code on every backend and runs once per key; with word-wide XORs it is already 0.74–0.81×
   OpenSSL's EVP key setup (*Performance*), so a second, x86-only path buys nothing a user sees.
+
+## Backlog / deferred
+
+- **Constant-time software backend: AES-192 on std 0.17's bitsliced core** *(audit
+  2026-10-19, O5-1; owner decision pending)*. What: on `has_hardware_support == false` the
+  rounds (`Aes192EncryptCtx.encrypt`/`xor`/`encryptWide`/`xorWide`,
+  `Aes192DecryptCtx.decrypt`/`decryptWide`, `src/root.zig` — the `Block.encrypt`/`decrypt`
+  loops) use std's masked table lookups, while std 0.17's `Aes128`/`Aes256` soft contexts
+  use `std/crypto/aes/bitsliced.zig` when `side_channels_mitigations != .none`. Impact: a
+  cache-timing side channel on key and data for every AES-192 user on the targets listed in
+  *Constant-time contract* — consumers `aesgcm` (`Aes192Gcm` generic backend), `aeskw`
+  (A192KW), `rsa` (PBES2 `aes192-cbc` encrypted PKCS#8, via `aescbc`), `ssh` (`aes192-ctr`),
+  and through them `jwe`/`xmlenc`. Proposed fix: vendor std's `bitsliced.zig` (MIT, std's
+  licence; NOTICE entry; it is not `pub` from `std.crypto.core.aes`) into `src/`, keep the
+  existing key expansion, and on the soft backend when protected pack the 13 round keys
+  once at `init` (`Wide.packKeys`, a `packed_keys` field as std's contexts have) and run
+  `Wide.encrypt(12, …)` / `Wide.decrypt(12, …)` over `bitsliced.width`-block batches for
+  `encrypt`/`decrypt`/`*Wide`/`xor*` (std's `bitslicedOperation` shape; check whether the
+  decrypt side wants the forward keys, as std's `initFromEnc` copies them). Evidence to add:
+  the existing FIPS-197 / CAVP / SP 800-38A KATs and the fuzz model on `-Dcpu=x86_64` (soft
+  backend), a pinned ctgrind row for the soft backend (`CTGRIND_CPU=x86_64`, 0 in-file on
+  the data path), stack probe re-measured (`packed_keys` is key material: `wipe` must clear
+  it). Coordinator runs ctgrind; this is a CT restructure, not done inside the audit.
 
 ## Open
 

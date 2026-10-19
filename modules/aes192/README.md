@@ -88,8 +88,12 @@ A context holds the round keys — the key, in effect. It is never written after
 context may be shared by threads; call `wipe` when the key is retired (nothing else clears it).
 
 Without hardware AES (`has_hardware_support == false`) the rounds are std's table-based
-software path with cache-line masking, exactly as for std's `Aes128`/`Aes256`: not constant
-time against a co-located cache attacker. See `SPEC.md`, *Constant-time contract*.
+software path with cache-line masking: not constant time against a co-located cache attacker.
+⚠ On Zig 0.17 this is **weaker than std's own `Aes128`/`Aes256`**, whose software contexts are
+bitsliced (constant time) unless `side_channels_mitigations == .none`. 0.17 falls back to
+software on x86-64 without AES-NI *or without AVX* (Atom-class router CPUs, `-Dcpu=baseline`),
+arm64 without the Crypto Extensions (e.g. Cortex-A72), and every other architecture. See
+`SPEC.md`, *Constant-time contract* and *Backlog / deferred*.
 
 ## Tests
 
