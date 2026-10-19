@@ -93,8 +93,10 @@ F3 verdict (`m^e = c`?), which the op returns as `error.FaultDetected` (the comp
 `try` that propagates it; one since 2026-10-14) — and `noncrt` 2 → 0. A blinded op adds one
 more: the blinding redraw verdict (`r⁻¹` checked mod the secret p, q, folded into one branch),
 false only for `r ≡ 0 mod p or q`. Since 2026-10-18 that is measured, not inferred: target
-`crtbl` (`.csprng`) = 2 (F3 + redraw), `crtcache` (two `.cached` ops on one cache) = 3 (F3 from
-each call site + the first op's redraw; the squaring update adds none).
+`crtbl` (`.csprng`) = 2 (F3 + redraw), `crtcache` (two `.cached` ops on one cache) = 4 (F3 from
+each call site + the first op's redraw + since 2026-10-20 the cache's key-match branch, which
+folds in the secret first prime `p`; it reveals only whether the key object lists the same prime
+first — the squaring update adds none).
 **Key derivation (2026-10-03)** is montint limb arithmetic too, constant-time in `p`, `q`:
 `n` a limb product, `λ = montint.nt.lcm(p−1, q−1)`, `d = e⁻¹ mod λ`, `dP = e⁻¹ mod (p−1)`,
 `dQ = e⁻¹ mod (q−1)` by `DynModint.inverseOfModulus` (inverses modulo even secrets; `dP` IS

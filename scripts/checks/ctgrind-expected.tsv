@@ -273,7 +273,7 @@ ssh	ReleaseFast	pemstd	1	>=1	NO-OWN-SRC	2ba7559fa99a2188
 # "one witness context, zero in-file", never as "one expected context in
 # ct25519's own code" — that reading would describe the fragile
 # single-context pin this module deliberately does not have.
-ct25519	ReleaseFast	ct25519	1	0	a4b50ee28d66371d	4e5e08fafcda58f8
+ct25519	ReleaseFast	ct25519	1	0	1eba51e6c570187a	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 # ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
@@ -286,10 +286,10 @@ ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 #               the same point as the `ct25519` row, so its output pin equals
 #               that row's.
 #   msm         `mulMultiRistretto` over 9 terms (B9).
-ct25519	ReleaseFast	comb	1	0	a4b50ee28d66371d	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladderbase	1	0	a4b50ee28d66371d	60c9dcf57e8f3e1f
-ct25519	ReleaseFast	ladder	1	0	a4b50ee28d66371d	4e5e08fafcda58f8
-ct25519	ReleaseFast	msm	1	0	a4b50ee28d66371d	09aa32de83cec03a
+ct25519	ReleaseFast	comb	1	0	1eba51e6c570187a	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladderbase	1	0	1eba51e6c570187a	60c9dcf57e8f3e1f
+ct25519	ReleaseFast	ladder	1	0	1eba51e6c570187a	4e5e08fafcda58f8
+ct25519	ReleaseFast	msm	1	0	1eba51e6c570187a	09aa32de83cec03a
 # x25519 (added 2026-09-28, pinned 2026-09-29 with P6): `X25519.recoverPublicKey`
 # (comb + Edwards->Montgomery map) and then `X25519.scalarmult` of the same
 # tainted key against RFC 7748 §6.1 Bob's public key -- the shared-secret
@@ -299,7 +299,7 @@ ct25519	ReleaseFast	msm	1	0	a4b50ee28d66371d	09aa32de83cec03a
 # shape is declassified (a function of the public point only, SPEC.md § P6);
 # positive controls in SPEC.md § P6: without the declassify 1 in-file at that
 # line, a branching cswap 1 in-file at the swap (native and -mcpu=x86_64_v3).
-ct25519	ReleaseFast	x25519	1	0	a4b50ee28d66371d	8af2fe8213b778aa
+ct25519	ReleaseFast	x25519	1	0	1eba51e6c570187a	8af2fe8213b778aa
 decaf448	ReleaseFast	scalarmul	1	0	3f804876c85b9670	77a1bd1038ca1053
 # ecvrf prove 3 -> 0 (4db1e627): the three contexts were try-and-increment
 # branches on H, which is derived from the PUBLIC key. The harness now
@@ -483,15 +483,20 @@ p256	ReleaseFast	sign	1	<=12	dedec99b1fbbb20e	af4baed5c5134f3f
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	5c299ae5200f8909	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	5c299ae5200f8909	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	2a8013f8d4927d7d	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	2a8013f8d4927d7d	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
 # twice on one cache (3 = the F3 verdict from each of the harness's two call
 # sites + the draw verdict of the first op; the squaring update adds none).
-rsa	ReleaseFast	crtbl	1	2	5c299ae5200f8909	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	3	5c299ae5200f8909	d4057b00f9df7b56
+# crtcache 3 -> 4 (2026-10-20, audit O3-1): the cache also keys on the first CRT
+# prime `p` (secret, compared branch-free); the one key-match branch
+# `if (self.serves(sk))` in `BlindingCache.next` (root.zig:1128) is now tainted
+# on the second op, where `n`/`e` already match. Stacks re-read: the other three
+# are the documented ones (root.zig:1200 draw, 1290 F3 twice).
+rsa	ReleaseFast	crtbl	1	2	2a8013f8d4927d7d	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	2a8013f8d4927d7d	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -503,7 +508,7 @@ rsa	ReleaseFast	crtcache	1	3	5c299ae5200f8909	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	5c299ae5200f8909	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	2a8013f8d4927d7d	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).
@@ -1321,7 +1326,7 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-tlsclient	ReleaseFast	kex	1	17	00e7b022c93ae216	18dc5af726922286
+tlsclient	ReleaseFast	kex	1	17	7d5ad51b7304d4bd	18dc5af726922286
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1334,7 +1339,7 @@ tlsclient	ReleaseFast	kex	1	17	00e7b022c93ae216	18dc5af726922286
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	7301060810a63060	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	18801e923ae8944b	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1664,7 +1669,7 @@ acme	ReleaseFast	anykey	1	5	14edc86939d21047	7dff1d27c302259e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	04f41b2a1a542d25	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	915ffb9eabea9e1c	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -1681,7 +1686,7 @@ jwt	ReleaseFast	hmac	1	0	04f41b2a1a542d25	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	04f41b2a1a542d25	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	915ffb9eabea9e1c	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -1691,7 +1696,7 @@ jwt	ReleaseFast	ec	1	9	04f41b2a1a542d25	6c14c21a4454880c
 # blinding verdict (root.zig:906 makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	04f41b2a1a542d25	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	915ffb9eabea9e1c	f2bee89c3c58cdaf
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
