@@ -6277,6 +6277,23 @@ test "Body middleware: max_body_bytes boundary - exactly the cap passes, one byt
     try expectStatus(over, "413");
 }
 
+test "Body middleware: max_body_bytes = maxInt(usize) means no cap" {
+    // `.limited(maxInt(usize))` is `.unlimited` in std.Io.Limit; pinned so a
+    // std change to that mapping shows up here.
+    var probe: Probe = .{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &probe;
+    const body_mw: Body = .{ .gpa = testing.allocator, .schema = &thing_schema, .max_body_bytes = std.math.maxInt(usize) };
+    try r.use(body_mw.middleware());
+    try r.post("/things", hEchoBody);
+
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, postWire("/things", "{\"name\":\"gizmo\",\"qty\":5}"), &buf);
+    try testing.expect(!std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+    try testing.expect(probe.invoked);
+}
+
 test "Body middleware: structurally over-limit body → 400 too_deep, handler NOT invoked" {
     var probe: Probe = .{};
     var r = router.Router.init(testing.allocator);

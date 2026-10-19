@@ -1089,7 +1089,12 @@ pub const Retry = struct {
             .proportional => blk: {
                 std.debug.assert(r.jitter_factor >= 0 and r.jitter_factor <= 1);
                 const df: f64 = @floatFromInt(d);
-                const spread: u64 = @intFromFloat(df * r.jitter_factor);
+                // Saturating float -> int: with `max_delay_ms` near maxInt(u64)
+                // (a "no cap" spelling) and `jitter_factor = 1`, `df * factor`
+                // rounds to 2^64, which `@intFromFloat` cannot hold (a panic in
+                // safe builds, UB in ReleaseFast). NaN and negatives give 0.
+                const sp_f = df * r.jitter_factor;
+                const spread: u64 = if (sp_f >= 0x1p64) std.math.maxInt(u64) else if (sp_f > 0) @intFromFloat(sp_f) else 0;
                 const lo = d - @min(d, spread);
                 break :blk @min(r.max_delay_ms, lo +| upTo(x, 2 *| spread));
             },
@@ -2439,6 +2444,21 @@ test "Retry.nextDelayFrom: the same bits give the same delay as nextDelay throug
         const plain = r.nextDelayFrom(@intCast(k), null);
         try testing.expect(d >= plain - plain / 2 and d <= @min(r.max_delay_ms, plain + plain / 2));
     }
+}
+
+test "Retry.nextDelayFrom: proportional jitter with an uncapped (maxInt) ceiling and factor 1 does not overflow the float conversion" {
+    // 2026-10-19 audit: `df * jitter_factor` rounded to 2^64 and `@intFromFloat`
+    // panicked (UB in ReleaseFast). Runtime values, so nothing is folded.
+    var max_delay: u64 = std.math.maxInt(u64);
+    var factor: f64 = 1.0;
+    std.mem.doNotOptimizeAway(&max_delay);
+    std.mem.doNotOptimizeAway(&factor);
+    const r: Retry = .{ .base_delay_ms = 1, .max_delay_ms = max_delay, .jitter = .proportional, .jitter_factor = factor };
+    // attempt 70: the factor-2 schedule is long past overflow, d == max_delay_ms.
+    try testing.expectEqual(max_delay, r.nextDelayFrom(70, 0xFFFF_FFFF_FFFF_FFFF));
+    try testing.expectEqual(@as(u64, 0), r.nextDelayFrom(70, 0));
+    const mid = r.nextDelayFrom(70, 1 << 63);
+    try testing.expect(mid >= max_delay / 2 - 1 and mid <= max_delay / 2 + 1);
 }
 
 test {
