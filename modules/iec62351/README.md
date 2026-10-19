@@ -26,8 +26,8 @@ dependency).
 
 Provenance: clean-room from public descriptions of IEC 62351-3/-4/-6, whose
 text is paywalled — `SPEC.md` states field by field what is grounded and what
-is modelled. Primitives come from `std.crypto` (HMAC-SHA-256, AES-GCM/GMAC,
-ECDSA P-256), the sibling `rsa` module (RSASSA-PSS) and the sibling `x509`
+is modelled. Primitives come from `std.crypto` (HMAC-SHA-256, ECDSA P-256), the
+sibling `aesgcm` module (AES-GCM/GMAC), the sibling `rsa` module (RSASSA-PSS) and the sibling `x509`
 module (certificate extensions). Three captured GOOSE frames used as test fixtures are attributed in this module's [`NOTICE`](NOTICE).
 
 | | |

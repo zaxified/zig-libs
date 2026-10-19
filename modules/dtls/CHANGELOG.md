@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the AES-128-GCM record protection now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC CCM statement corrected for 0.17.0 (std exports only the 13-byte-nonce presets; its generic `AesCcm` is not `pub`); DER-reader note re-checked.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `X25519.KeyPair.generateDeterministic`/`recoverPublicKey` no longer return errors: the `catch return error.KeyExchangeFailed` arms (and their secret wipe, now unreachable) are gone; `EnumSet.initEmpty()` -> `.empty`; the `Entropy` union test reads `field_names`/`field_types`.

@@ -60,7 +60,7 @@ search trail and reasoning.
   `entropy` (key generation). Also `std` directly: `std.crypto.dh.X25519`, `std.crypto.ecc.P384` (`P384Kem`'s
   group), `std.crypto.kdf.hkdf.HkdfSha256`/
   `.HkdfSha512`/`.Hkdf` (HKDF-SHA384's `Hkdf(std.crypto.auth.hmac.sha2.
-  HmacSha384)`, no named alias in `std`), `std.crypto.aead.aes_gcm`.
+  HmacSha384)`, no named alias in `std`), `aesgcm` (AES-GCM AEADs).
 
 ## Import
 
@@ -116,7 +116,7 @@ regardless of KEM.
 The single-shot flow (§6.1):
 
 ```zig
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm;
 var ct_buf: [pt.len + Aes128Gcm.tag_length]u8 = undefined;
 const sealed = try hpke.sealBase(hpke.X25519Kem, Aes128Gcm, 32, pkR, io, info, aad, pt, &ct_buf);
 // send sealed.enc || ct_buf to the receiver holding skR

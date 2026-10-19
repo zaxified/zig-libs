@@ -64,6 +64,7 @@
 const std = @import("std");
 const pskmod = @import("psk.zig");
 const burn = @import("burn.zig");
+const aesgcm = @import("aesgcm");
 
 // Dead-stack shape (CONVENTIONS §2.1.1): secrets in by `*const`, secret
 // results out through `out` (first parameter after the comptime types),
@@ -193,7 +194,7 @@ pub fn EarlyDataContext(comptime Hkdf: type, comptime key_len: usize) type {
 
 const testing = std.testing;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = aesgcm.Aes128Gcm;
 
 fn hexTo(comptime n: usize, s: []const u8) [n]u8 {
     var out: [n]u8 = undefined;
@@ -318,7 +319,7 @@ test "SHA-384 / key_len 32 suite: chain runs at the 48-byte digest length and is
     const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
     const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(HmacSha384);
     const Sha384 = std.crypto.hash.sha2.Sha384;
-    const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const Aes256Gcm = aesgcm.Aes256Gcm;
 
     const psk = @as([48]u8, @splat(0x5A));
     var ch_hash: [48]u8 = undefined;

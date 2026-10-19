@@ -43,6 +43,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 const suite = @import("suite.zig");
 const dhkem = @import("dhkem.zig");
 const burn = @import("burn.zig");
@@ -167,7 +168,8 @@ pub fn incrementSeq(seq: *u64) SeqError!void {
 }
 
 /// RFC 9180 §5.1: an HPKE encryption context, parameterized on the AEAD
-/// (`Aead` — `std.crypto.aead.aes_gcm.Aes128Gcm`/`Aes256Gcm` or
+/// (`Aead` — `aesgcm.Aes128Gcm`/`Aes256Gcm` (or the std types of the same
+/// name, accepted identically) or
 /// `std.crypto.aead.chacha_poly.ChaCha20Poly1305`) and the KDF's digest
 /// width `Nh` (`std.crypto.kdf.hkdf.Hkdf(Hmac).prk_length` — 32 for every
 /// suite this module targets, HKDF-SHA256).
@@ -375,13 +377,13 @@ fn keyScheduleBody(
 
 // ── single-shot base-mode convenience wrappers (RFC 9180 §6.1) ──────────
 
-/// The registered `AeadId` for a `std.crypto` AEAD type — needed by the
+/// The registered `AeadId` for an `aesgcm` / `std.crypto` AEAD type — needed by the
 /// single-shot wrappers below to assemble the outer `suite_id` (§7.2.1)
 /// from their comptime type parameters alone. A compile error (not a
 /// runtime fallback) for an AEAD RFC 9180 doesn't register.
 fn aeadIdOf(comptime Aead: type) u16 {
-    if (Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @backingInt(suite.AeadId.aes128gcm);
-    if (Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @backingInt(suite.AeadId.aes256gcm);
+    if (Aead == aesgcm.Aes128Gcm or Aead == std.crypto.aead.aes_gcm.Aes128Gcm) return @backingInt(suite.AeadId.aes128gcm);
+    if (Aead == aesgcm.Aes256Gcm or Aead == std.crypto.aead.aes_gcm.Aes256Gcm) return @backingInt(suite.AeadId.aes256gcm);
     // BOTH ChaCha20-Poly1305 implementations map to the SAME registered id
     // 0x0003. The `chachapoly` sibling is byte-exact to std's (differentially
     // anchored there over every block-boundary edge length), so which one a
@@ -1055,7 +1057,7 @@ test "incrementSeq: overflow guard fails closed at maxInt(u64), never wraps" {
 const test_psk = @as([32]u8, @splat(0xab));
 
 test "keySchedule: VerifyPSKInputs rejects every inconsistent mode/psk combination" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
@@ -1083,7 +1085,7 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fa
     // this module rejects it rather than deriving a key schedule from it.
     // Not part of the RFC's VerifyPSKInputs pseudocode — see
     // KeyScheduleError.PskTooShort's doc comment and SPEC.md.
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
@@ -1110,7 +1112,7 @@ test "keySchedule: RFC 9180 §5.1.2 PSK floor — a psk shorter than 32 bytes fa
 }
 
 test "Context.seal/.open: round trip, seq advances, tampered ct rejected WITHOUT advancing seq" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = @as([32]u8, @splat(0x42));
     var sender: Context(Aes128Gcm, 32) = undefined;
@@ -1147,7 +1149,7 @@ test "Context.seal/.open: wrong-length out buffer fails closed with error.Invali
     // `-Doptimize=ReleaseFast`, so it only proves the fix if it passes in
     // BOTH (an assert-based version would pass in Debug and silently
     // misbehave in ReleaseFast).
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = @as([32]u8, @splat(0x42));
     var sender: Context(Aes128Gcm, 32) = undefined;
@@ -1181,7 +1183,7 @@ test "Context.seal/.open: wrong-length out buffer fails closed with error.Invali
 }
 
 test "Context.seal/.open: fail closed at seq == maxInt(u64) BEFORE producing/consuming a ciphertext" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
     const ss = @as([32]u8, @splat(0x42));
     var ctx: Context(Aes128Gcm, 32) = undefined;
@@ -1194,8 +1196,26 @@ test "Context.seal/.open: fail closed at seq == maxInt(u64) BEFORE producing/con
     try testing.expectEqual(std.math.maxInt(u64), ctx.seq); // unchanged
 }
 
+test "aeadIdOf: std AES-GCM types still identify, and a std-typed seal/open works" {
+    const StdA128 = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const StdA256 = std.crypto.aead.aes_gcm.Aes256Gcm;
+    try testing.expectEqual(aeadIdOf(aesgcm.Aes128Gcm), aeadIdOf(StdA128));
+    try testing.expectEqual(aeadIdOf(aesgcm.Aes256Gcm), aeadIdOf(StdA256));
+    const ss = @as([32]u8, @splat(0x42));
+    const suite_id = suite.suiteId(0x0020, 0x0001, 0x0001);
+    var a: Context(StdA128, 32) = undefined;
+    var b: Context(aesgcm.Aes128Gcm, 32) = undefined;
+    try keySchedule(StdA128, 32, &a, .base, &suite_id, &ss, "i", "", "");
+    try keySchedule(aesgcm.Aes128Gcm, 32, &b, .base, &suite_id, &ss, "i", "", "");
+    var c1: [3 + 16]u8 = undefined;
+    var c2: [3 + 16]u8 = undefined;
+    try a.seal("aad", "abc", &c1);
+    try b.seal("aad", "abc", &c2);
+    try testing.expectEqualSlices(u8, &c1, &c2);
+}
+
 test "sealBase -> openBase: end-to-end round trip on fresh random keys (X25519 + AES-128-GCM)" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1243,7 +1263,7 @@ test "sealPsk/sealAuth/sealAuthPsk -> matching open: round trip on fresh random 
     // (a round trip alone cannot catch a misreading both sides share).
     // What this test adds is the negative half: each authenticator actually
     // has to match for the open to succeed.
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const Kem = dhkem.X25519Kem;
 
     var threaded = std.Io.Threaded.init(testing.allocator, .{});

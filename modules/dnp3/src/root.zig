@@ -88,7 +88,7 @@ pub const meta = .{
     // `Outstation`/`Session` hold session state and are single-owner.
     .concurrency = .reentrant,
     .model_after = "IEEE 1815-2012 (DNP3); structure ref opendnp3 (Apache-2.0) -- behavioral only, no source copied",
-    .deps = .{"aeskw"}, // sa.zig's Secure Authentication (g120) AES-Key-Wrap
+    .deps = .{ "aeskw", "aesgcm" }, // aesgcm: sa.zig's AES-GMAC (std AES-GCM is 2.6x slower on Zig 0.17, #36256); sa.zig's Secure Authentication (g120) AES-Key-Wrap
 };
 
 /// The Data Link Layer (§9): frame codec + CRC-16.

@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 const suite = @import("suite.zig");
 const dhkem = @import("dhkem.zig");
 const schedule = @import("schedule.zig");
@@ -816,7 +817,7 @@ test "A.1.1: DHKEM(X25519).deriveKeyPair reproduces skEm/pkEm from ikmE and skRm
 }
 
 test "A.1.1: schedule.keySchedule(.base, shared_secret, info) matches key/base_nonce/exporter_secret" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
     var ctx: schedule.Context(Aes128Gcm, 32) = undefined;
     try schedule.keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
@@ -827,7 +828,7 @@ test "A.1.1: schedule.keySchedule(.base, shared_secret, info) matches key/base_n
 }
 
 test "A.1.1.1: Context.seal/.open reproduce all 6 published (pt,aad)->ct tuples (seq 0/1/2 sequential; 4/255 via direct seq set)" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
     var sender: schedule.Context(Aes128Gcm, 32) = undefined;
     try schedule.keySchedule(Aes128Gcm, 32, &sender, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
@@ -855,7 +856,7 @@ test "A.1.1.1: Context.seal/.open reproduce all 6 published (pt,aad)->ct tuples 
 }
 
 test "A.1.1.2: Context.exportSecret reproduces all 3 exported values (thin wrapper over the already-verified labeledExpand)" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(a1.kem_id, a1.kdf_id, a1.aead_id);
     var ctx: schedule.Context(Aes128Gcm, 32) = undefined;
     try schedule.keySchedule(Aes128Gcm, 32, &ctx, .base, &suite_id, &a1.shared_secret, &a1.info, "", "");
@@ -868,7 +869,7 @@ test "A.1.1.2: Context.exportSecret reproduces all 3 exported values (thin wrapp
 }
 
 test "A.1: sealBaseDeterministic/openBase reproduce enc + the first ciphertext end-to-end in one call" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const eph = dhkem.X25519Kem.KeyPair{ .secret_key = a1.skEm, .public_key = a1.pkEm };
     const first = a1.encryptions[0];
 
@@ -924,7 +925,7 @@ fn a2Vector(comptime ChaCha20Poly1305: type) !void {
 }
 
 test "A.3: P-256 + AES-128-GCM — Encap/Decap + KeySchedule + seq-0 Seal, byte-exact" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
 
     const eph = dhkem.P256Kem.KeyPair{ .secret_key = a3.skEm, .public_key = a3.pkEm };
     var got: dhkem.P256Kem.Encapped = undefined;
@@ -1006,7 +1007,7 @@ test "A.4: key_schedule_context/secret, byte-exact via real LabeledExtract with 
 }
 
 test "A.4: schedule.keySchedule(.base, shared_secret, info, Nh=64) matches key/base_nonce/exporter_secret" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
     // Nh=64 is the whole point of this test: schedule.keySchedule must
     // dispatch to HKDF-SHA512 (schedule.KdfOf(64)) here, not silently keep
@@ -1022,7 +1023,7 @@ test "A.4: schedule.keySchedule(.base, shared_secret, info, Nh=64) matches key/b
 }
 
 test "A.4: Context(Aead,64).seal/.open reproduce all 6 published tuples (seq 0/1/2/4/255/256)" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const suite_id = suite.suiteId(a4.kem_id, a4.kdf_id, a4.aead_id);
     var sender: schedule.Context(Aes128Gcm, 64) = undefined;
     try schedule.keySchedule(Aes128Gcm, 64, &sender, .base, &suite_id, &a4.shared_secret, &a4.info, "", "");
@@ -1049,7 +1050,7 @@ test "A.4: sealBaseDeterministic/openBase (Nh=64) reproduce enc + the first ciph
     // directly — proves suiteIdOf(Kem, Aead, Nh=64) (the sealBase/openBase
     // internal suite_id assembly) picks kdf_id=hkdf_sha512, matching the
     // suite_id used above, not the hkdf_sha256 default.
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const eph = dhkem.P256Kem.KeyPair{ .secret_key = a4.skEm, .public_key = a4.pkEm };
     const first = a4.encryptions[0];
 
@@ -1180,30 +1181,30 @@ fn driveVector(comptime V: type, comptime Kem: type, comptime Aead: type) !void 
 }
 
 test "A.1.2 (mode_psk): X25519 + AES-128-GCM, full vector end-to-end, byte-exact" {
-    try driveVector(a1_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a1_psk, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.1.3 (mode_auth): X25519 + AES-128-GCM, full vector end-to-end, byte-exact" {
-    try driveVector(a1_auth, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a1_auth, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.1.4 (mode_auth_psk): X25519 + AES-128-GCM, full vector end-to-end, byte-exact" {
-    try driveVector(a1_auth_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a1_auth_psk, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.3.2 (mode_psk): P-256 + AES-128-GCM, full vector end-to-end, byte-exact" {
-    try driveVector(a3_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a3_psk, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.3.3 (mode_auth): P-256 + AES-128-GCM, full vector end-to-end, byte-exact" {
     // Also the FIRST external anchor for `P256Kem.deriveKeyPair` (A.3.3
     // publishes ikmE/ikmR/ikmS; A.3.1's base header does not) and for the
     // P-256 AuthEncap/AuthDecap `dh || dh2` fold.
-    try driveVector(a3_auth, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a3_auth, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.3.4 (mode_auth_psk): P-256 + AES-128-GCM, full vector end-to-end, byte-exact" {
-    try driveVector(a3_auth_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveVector(a3_auth_psk, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "non-base vectors disagree pairwise: mode byte / psk / sender key each change the outputs" {
@@ -1324,31 +1325,31 @@ fn driveSetupVector(comptime V: type, comptime Kem: type, comptime Aead: type) !
 }
 
 test "setupBaseS/setupBaseR (A.1.1): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
-    try driveSetupVector(a1, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a1, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupPskS/setupPskR (A.1.2): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
-    try driveSetupVector(a1_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a1_psk, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupAuthS/setupAuthR (A.1.3): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
-    try driveSetupVector(a1_auth, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a1_auth, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupAuthPskS/setupAuthPskR (A.1.4): Context fields + all 3 exports byte-exact through the new §5.1 entry points" {
-    try driveSetupVector(a1_auth_psk, dhkem.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a1_auth_psk, dhkem.X25519Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupPskS/setupPskR (A.3.2): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
-    try driveSetupVector(a3_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a3_psk, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupAuthS/setupAuthR (A.3.3): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
-    try driveSetupVector(a3_auth, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a3_auth, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "setupAuthPskS/setupAuthPskR (A.3.4): P-256 + AES-128-GCM, Context fields + exports byte-exact through the new entry points" {
-    try driveSetupVector(a3_auth_psk, dhkem.P256Kem, std.crypto.aead.aes_gcm.Aes128Gcm);
+    try driveSetupVector(a3_auth_psk, dhkem.P256Kem, aesgcm.Aes128Gcm);
 }
 
 test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers reproduce enc + the first ciphertext" {
@@ -1357,7 +1358,7 @@ test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers r
     // that passed `.base` where it meant `.psk`, or dropped `psk_id`, would
     // still round-trip against its own `open*` counterpart. Only the RFC's
     // published `enc`/`ct` catch it.
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const Kem = dhkem.X25519Kem;
 
     // mode_psk (A.1.2)
@@ -1406,7 +1407,7 @@ test "A.1.2/A.1.3/A.1.4: the single-shot sealPsk/sealAuth/sealAuthPsk wrappers r
 }
 
 test "A.3.2/A.3.3/A.3.4: the same single-shot wrappers over the P-256 KEM (Npk=65) reproduce enc + the first ciphertext" {
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aes128Gcm = aesgcm.Aes128Gcm;
     const Kem = dhkem.P256Kem;
 
     {
@@ -1459,7 +1460,7 @@ test "setupBaseS/setupPskS/setupAuthS/setupAuthPskS: real std.Io random-ephemera
     const io = threaded.io();
 
     const Kem = dhkem.X25519Kem;
-    const Aead = std.crypto.aead.aes_gcm.Aes128Gcm;
+    const Aead = aesgcm.Aes128Gcm;
     const info = "hpke setup*S io-path smoke test";
     const psk = @as([32]u8, @splat(0x42));
     const psk_id = "psk-id";

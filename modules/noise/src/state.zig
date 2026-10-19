@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 const patterns = @import("patterns.zig");
 const Token = @import("token.zig").Token;
 
@@ -38,7 +39,7 @@ fn cipherName(comptime T: type) []const u8 {
     if (@hasDecl(T, "noise_name")) return T.noise_name;
     if (T == chachapoly.ChaCha20Poly1305) return "ChaChaPoly";
     if (T == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return "ChaChaPoly";
-    if (T == std.crypto.aead.aes_gcm.Aes256Gcm) return "AESGCM";
+    if (T == aesgcm.Aes256Gcm or T == std.crypto.aead.aes_gcm.Aes256Gcm) return "AESGCM";
     @compileError("noise: no spec §8 protocol name for AEAD type " ++ @typeName(T) ++ " (declare `pub const noise_name`)");
 }
 
@@ -86,7 +87,7 @@ pub const stack_bytes = struct {
         if (@hasDecl(T, "noise_stack_bytes")) return T.noise_stack_bytes;
         if (T == chachapoly.ChaCha20Poly1305) return 0;
         if (T == std.crypto.aead.chacha_poly.ChaCha20Poly1305) return 1024;
-        if (T == std.crypto.aead.aes_gcm.Aes256Gcm) return 2048;
+        if (T == aesgcm.Aes256Gcm or T == std.crypto.aead.aes_gcm.Aes256Gcm) return 2048;
         return unknown_cipher_stack;
     }
 
@@ -105,7 +106,7 @@ const burn = @import("burn.zig");
 /// Bind a Noise cipher suite: `DH` (spec §4.1, e.g. `std.crypto.dh.X25519`),
 /// `Cipher` (spec §4.2 AEAD, e.g.
 /// `std.crypto.aead.chacha_poly.ChaCha20Poly1305` or
-/// `std.crypto.aead.aes_gcm.Aes256Gcm`), `Hash` (spec §4.3, e.g.
+/// `aesgcm.Aes256Gcm`), `Hash` (spec §4.3, e.g.
 /// `std.crypto.hash.sha2.Sha256`, `.Sha512`, `std.crypto.hash.blake2.
 /// Blake2s256`, `.Blake2b512`). Returns a namespace holding `CipherState`/
 /// `SymmetricState`/`HandshakeState` (spec §5) parameterized on that
@@ -978,10 +979,18 @@ test "Suite: HASHLEN tracks the bound Hash, not a fixed constant" {
 }
 
 test "Suite: alternate AEAD (Aes256Gcm) reserved and selectable" {
-    const S = Suite(std.crypto.dh.X25519, std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
-    try testing.expectEqual(std.crypto.aead.aes_gcm.Aes256Gcm, S.AeadCipher);
+    const S = Suite(std.crypto.dh.X25519, aesgcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
+    try testing.expectEqual(aesgcm.Aes256Gcm, S.AeadCipher);
     const cs: S.CipherState = .{};
     try testing.expectEqual(@as(u64, 0), cs.n);
+}
+
+test "Suite: std's Aes256Gcm is still identified (same name, same stack bound as aesgcm's)" {
+    const Std = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const S = Suite(std.crypto.dh.X25519, Std, std.crypto.hash.sha2.Sha256);
+    try testing.expectEqual(Std, S.AeadCipher);
+    try testing.expectEqualStrings(cipherName(aesgcm.Aes256Gcm), cipherName(Std));
+    try testing.expectEqual(stack_bytes.cipher(aesgcm.Aes256Gcm), stack_bytes.cipher(Std));
 }
 
 test "Suite: HandshakeState defaults to the NN pattern until initialize() is called" {

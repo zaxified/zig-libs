@@ -82,6 +82,7 @@
 
 const std = @import("std");
 const hpke = @import("hpke");
+const aesgcm = @import("aesgcm");
 const codec = @import("codec.zig");
 const suite = @import("suite.zig");
 const crypto = @import("crypto.zig");
@@ -475,9 +476,9 @@ pub const label_external_init = "MLS 1.0 external init secret";
 /// silently derived. See `SPEC.md`'s Backlog: the clean fix is upstream in
 /// `hpke`, which this batch was scoped out of.
 fn hpkeSuiteId(comptime S: type) [10]u8 {
-    const aead_id: u16 = if (S.Aead == std.crypto.aead.aes_gcm.Aes128Gcm)
+    const aead_id: u16 = if (S.Aead == aesgcm.Aes128Gcm or S.Aead == std.crypto.aead.aes_gcm.Aes128Gcm)
         @backingInt(hpke.AeadId.aes128gcm)
-    else if (S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
+    else if (S.Aead == aesgcm.Aes256Gcm or S.Aead == std.crypto.aead.aes_gcm.Aes256Gcm)
         @backingInt(hpke.AeadId.aes256gcm)
     else if (S.Aead == std.crypto.aead.chacha_poly.ChaCha20Poly1305)
         @backingInt(hpke.AeadId.chacha20poly1305)
@@ -1133,6 +1134,18 @@ test "§8.3: hpkeSuiteId reproduces RFC 9180 §7.2.1's suite_id for suite 0x0001
     // kdf_id(0x0001, HKDF-SHA256) || aead_id(0x0001, AES-128-GCM).
     const want = [_]u8{ 'H', 'P', 'K', 'E', 0x00, 0x20, 0x00, 0x01, 0x00, 0x01 };
     try testing.expectEqualSlices(u8, &want, &hpkeSuiteId(TestSuite));
+}
+
+test "§8.3: hpkeSuiteId also identifies a suite built on std's AES-128-GCM type" {
+    const StdSuite = suite.CipherSuite(
+        TestSuite.Kem,
+        std.crypto.aead.aes_gcm.Aes128Gcm,
+        TestSuite.Hkdf,
+        TestSuite.Hash,
+        TestSuite.Sig,
+        TestSuite.id,
+    );
+    try testing.expectEqualSlices(u8, &hpkeSuiteId(TestSuite), &hpkeSuiteId(StdSuite));
 }
 
 test "§8.3: sender and receiver derive the same init_secret, and it is bound to both inputs" {

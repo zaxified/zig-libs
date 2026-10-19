@@ -32,12 +32,13 @@
 
 const std = @import("std");
 const burn = @import("burn.zig");
+const aesgcm = @import("aesgcm");
 
 /// The AEAD this ring seals tickets under (RFC 8446 §4.6.1 leaves the ticket
 /// format to the server; AES-256-GCM is this module's fixed choice per the
 /// scope in SPEC.md). Exposed so callers can read `key_length`/`nonce_length`
 /// / `tag_length` without hardcoding them twice.
-pub const Aead = std.crypto.aead.aes_gcm.Aes256Gcm;
+pub const Aead = aesgcm.Aes256Gcm;
 
 pub const key_length = Aead.key_length; // 32
 pub const nonce_length = Aead.nonce_length; // 12

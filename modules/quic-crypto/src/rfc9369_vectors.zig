@@ -17,10 +17,11 @@ const keyschedule = @import("keyschedule.zig");
 const protection = @import("protection.zig");
 const headerprot = @import("headerprot.zig");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 
 const testing = std.testing;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = aesgcm.Aes128Gcm;
 const P128 = protection.Protection(Aes128Gcm);
 const PChaCha = protection.Protection(chachapoly.ChaCha20Poly1305);
 

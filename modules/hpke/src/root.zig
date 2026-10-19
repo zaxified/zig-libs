@@ -54,7 +54,7 @@
 //! `std.crypto.ecc.P384` (`P384Kem`'s group — no local perf module for
 //! P-384, see `dhkem.zig`), `std.crypto.kdf.hkdf.HkdfSha256`/`.HkdfSha512`/`.Hkdf` — the key-schedule
 //! KDF is `Nh`-dispatched across all three RFC 9180 widths, `schedule.
-//! KdfOf` — `std.crypto.aead.aes_gcm.{Aes128Gcm, Aes256Gcm}`,
+//! KdfOf` — `aesgcm.{Aes128Gcm, Aes256Gcm}`,
 //! `std.crypto.aead.chacha_poly.ChaCha20Poly1305`).
 
 const std = @import("std");
@@ -86,8 +86,9 @@ pub const keySchedule = schedule.keySchedule;
 /// map to the same registered `aead_id` — the choice cannot reach the wire.
 /// The RFC 9180 A.2 vectors are run under both (`kat_rfc9180.zig`).
 ///
-/// The AES-GCM suites have no sibling implementation and come from std;
-/// reach them as `std.crypto.aead.aes_gcm.Aes128Gcm` / `.Aes256Gcm`.
+/// The AES-GCM suites come from the `aesgcm` module; reach them as
+/// `aesgcm.Aes128Gcm` / `.Aes256Gcm` (std's types of the same name are
+/// accepted identically).
 pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
 // RFC 9180 §5.1's `Setup*S`/`Setup*R` pairs, one per mode — the
@@ -152,7 +153,9 @@ pub const meta = .{
     // wire byte depends on either.
     // entropy: the `random(Nsk)` in each KEM's `generateKeyPair`, i.e. the
     // ephemeral key behind every `sealBase`/`sealPsk`/`sealAuth`/`encap`.
-    .deps = .{ "p256", "chachapoly", "entropy", "p521" },
+    // aesgcm: the AES-GCM AEADs (`aead_id` 0x0001/0x0002); std's are 2.6x
+    // slower on Zig 0.17 (#36256). Same bytes on the wire.
+    .deps = .{ "p256", "chachapoly", "entropy", "p521", "aesgcm" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -172,8 +175,8 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is exactly {p256, chachapoly, entropy, p521} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group; else std only)" {
-    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
+test "meta.deps is exactly {p256, chachapoly, entropy, p521, aesgcm} (the P-256 group + the ChaCha AEAD + the fail-closed key draw + the P-521 group; else std only)" {
+    try std.testing.expectEqual(@as(usize, 5), meta.deps.len);
     try std.testing.expectEqualStrings("p256", meta.deps[0]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[1]);
     // `entropy` is the `random(Nsk)` in RFC 9180 §4's `GenerateKeyPair() =
@@ -183,6 +186,7 @@ test "meta.deps is exactly {p256, chachapoly, entropy, p521} (the P-256 group + 
     try std.testing.expectEqualStrings("entropy", meta.deps[2]);
     // std has no P-521: DHKEM(P-521, HKDF-SHA512) runs on the `p521` module.
     try std.testing.expectEqualStrings("p521", meta.deps[3]);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[4]);
 }
 
 test "the ChaCha AEAD swap is inert: chachapoly and std agree on every RFC 9180 Nk/Nn/Nt" {

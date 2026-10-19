@@ -41,7 +41,8 @@
 //! - `std.crypto.kdf.hkdf.HkdfSha256` — `.extract(salt, ikm)` for the §5.2
 //!   Initial `HKDF-Extract`; `.prk_length` = 32 (the digest length feeding
 //!   `"quic ku"` and the initial secrets).
-//! - `std.crypto.aead.aes_gcm.Aes128Gcm` / `Aes256Gcm` and
+//! - `aesgcm.Aes128Gcm` / `Aes256Gcm` (zig-libs; Initial packets and the Retry
+//!   integrity tag use `Aes128Gcm`) and
 //!   `std.crypto.aead.chacha_poly.ChaCha20Poly1305` — the three QUIC v1
 //!   AEADs (§5.3), all 12-byte nonce / 16-byte tag. `.encrypt`/`.decrypt`
 //!   with std's constant-time tag compare back `protection.Protection`.
@@ -100,8 +101,8 @@ pub const HeaderForm = headerprot.HeaderForm;
 /// implementation a consumer binds is a throughput decision, not a taste one.
 ///
 /// `Protection` is and stays generic over the AEAD (that is how the two
-/// AES-GCM suites are reached, `std.crypto.aead.aes_gcm.Aes128Gcm` /
-/// `.Aes256Gcm`), so std's ChaCha type remains bindable and is used as the
+/// AES-GCM suites are reached, `aesgcm.Aes128Gcm` / `.Aes256Gcm`; std's
+/// `aes_gcm` types bind identically), so std's ChaCha type remains bindable and is used as the
 /// differential oracle in `protection.zig`'s tests.
 pub const ChaCha20Poly1305 = chachapoly.ChaCha20Poly1305;
 
@@ -128,7 +129,9 @@ pub const meta = .{
     // chachapoly only: the §5.3 ChaCha20-Poly1305 AEAD (byte-exact to std,
     // SIMD). Deliberately does NOT import dtls (see SPEC.md) — the shared
     // nonce construction is re-expressed, not shared.
-    .deps = .{"chachapoly"},
+    // aesgcm: the §5.3 AES-128/256-GCM AEADs (Initial + TLS_AES_*_GCM suites;
+    // std's are 2.6x slower on Zig 0.17, #36256) — the tests/examples bind it.
+    .deps = .{ "chachapoly", "aesgcm" },
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -148,9 +151,10 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is exactly {chachapoly} — quic-crypto still does not import dtls" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {chachapoly, aesgcm} — quic-crypto still does not import dtls" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[0]);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
 }
 
 test "the AEAD swap is inert: chachapoly matches std on every RFC 9001 §5.3 width" {

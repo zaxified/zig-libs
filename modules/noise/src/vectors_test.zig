@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 const patterns = @import("patterns.zig");
 const state = @import("state.zig");
 
@@ -26,7 +27,7 @@ const X25519 = std.crypto.dh.X25519;
 const sha2 = std.crypto.hash.sha2;
 const blake2 = std.crypto.hash.blake2;
 const StdChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes256Gcm = aesgcm.Aes256Gcm;
 
 const vectors_json = @embedFile("testdata/cacophony-subset.json");
 

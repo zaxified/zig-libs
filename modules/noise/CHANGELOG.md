@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — AES-GCM (`AESGCM` cipher, spec §4.2) now comes from the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (new dep; Zig 0.17 #36256). `Suite` still accepts std's `Aes256Gcm` identically; vectors and the stack probe run on `aesgcm`. Same bytes on the wire.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. tests/generic sites: `S.KeyPair.generateDeterministic` is wrapped as `@as(anyerror!KeyPair, ...)` because std's X25519 version is now infallible while other suites' DH types still return an error union; `patterns.zig` test uses `decl_names`. Examples/tools ported to Zig 0.17.0 (example `generateDeterministic` wrapped as `anyerror!` (std X25519 is infallible now)).

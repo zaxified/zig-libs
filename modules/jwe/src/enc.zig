@@ -4,8 +4,8 @@
 //! parameter's algorithm family, i.e. what actually protects the plaintext
 //! (as opposed to `alg.zig`, which protects the CEK).
 //!
-//! REAL: `A128GCM`/`A256GCM` — direct `std.crypto.aead.aes_gcm` calls;
-//! `A192GCM` — the `aesgcm` module's `Aes192Gcm` (Zig 0.16's std has no
+//! REAL: `A128GCM`/`A256GCM` — the `aesgcm` module's `Aes128Gcm`/`Aes256Gcm`;
+//! `A192GCM` — its `Aes192Gcm` (Zig 0.16's std has no
 //! AES-192 at all; `aesgcm` runs it over the `aes192` block cipher), since
 //! 2026-10-10.
 //!
@@ -19,7 +19,6 @@
 
 const std = @import("std");
 const burn = @import("burn.zig");
-const aead = std.crypto.aead.aes_gcm;
 const aescbc = @import("aescbc");
 const aes192 = @import("aes192");
 const aesgcm = @import("aesgcm");
@@ -113,8 +112,8 @@ noinline fn decryptUnburned(
     return cbc_hmac.decrypt(enc, cek, iv, aad, ciphertext, tag, plaintext_out);
 }
 
-/// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — `std.crypto.aead.aes_gcm`
-/// for 128/256, `aesgcm.Aes192Gcm` for 192 (std has none).
+/// `A128GCM`/`A192GCM`/`A256GCM` (RFC 7518 §5.3) — the `aesgcm` module's
+/// `Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm` (std has no AES-192 and is slow on 0.17).
 const gcm = struct {
     // secret-api-ok: `gcm` is private to this file and reached only through `encrypt` / `decrypt` above, which run it under `burn.content_burn`
     pub fn encrypt(
@@ -132,11 +131,11 @@ const gcm = struct {
         switch (enc) {
             .A128GCM => {
                 if (key.len != 16) return error.BufferTooSmall;
-                aead.Aes128Gcm.encrypt(ct, tag, plaintext, aad, iv[0..12].*, key[0..16].*);
+                aesgcm.Aes128Gcm.encrypt(ct, tag, plaintext, aad, iv[0..12].*, key[0..16].*);
             },
             .A256GCM => {
                 if (key.len != 32) return error.BufferTooSmall;
-                aead.Aes256Gcm.encrypt(ct, tag, plaintext, aad, iv[0..12].*, key[0..32].*);
+                aesgcm.Aes256Gcm.encrypt(ct, tag, plaintext, aad, iv[0..12].*, key[0..32].*);
             },
             .A192GCM => {
                 if (key.len != 24) return error.BufferTooSmall;
@@ -163,11 +162,11 @@ const gcm = struct {
         switch (enc) {
             .A128GCM => {
                 if (key.len != 16) return error.BufferTooSmall;
-                aead.Aes128Gcm.decrypt(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..16].*) catch return error.AuthenticationFailed;
+                aesgcm.Aes128Gcm.decrypt(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..16].*) catch return error.AuthenticationFailed;
             },
             .A256GCM => {
                 if (key.len != 32) return error.BufferTooSmall;
-                aead.Aes256Gcm.decrypt(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..32].*) catch return error.AuthenticationFailed;
+                aesgcm.Aes256Gcm.decrypt(pt, ciphertext, tag_arr, aad, iv[0..12].*, key[0..32].*) catch return error.AuthenticationFailed;
             },
             .A192GCM => {
                 if (key.len != 24) return error.BufferTooSmall;

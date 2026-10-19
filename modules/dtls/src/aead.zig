@@ -8,8 +8,8 @@
 //! **Cipher-suite coverage.** `Protection(comptime Aead)` is generic over
 //! any std AEAD with the standard `encrypt`/`decrypt` signature. It is wired
 //! and validated for the two 12-byte-nonce TLS 1.3 suites std ships that are
-//! byte-checkable against OpenSSL: `aes_gcm.Aes128Gcm` /
-//! `aes_gcm.Aes256Gcm` and `chacha_poly.ChaCha20Poly1305`.
+//! byte-checkable against OpenSSL: `aesgcm.Aes128Gcm` /
+//! `aesgcm.Aes256Gcm` and `chacha_poly.ChaCha20Poly1305`.
 //!
 //! **AES-CCM caveat (honest).** DTLS/TLS 1.3 mandate a 12-byte AEAD nonce.
 //! Zig 0.16 std's CCM PRESETS (`aes_ccm.Aes128Ccm8`, etc.) are all fixed at
@@ -226,7 +226,7 @@ pub fn decryptSequenceNumberChaCha20(
 
 const testing = std.testing;
 const chachapoly = @import("chachapoly");
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 
 fn hexTo(comptime n: usize, s: []const u8) [n]u8 {

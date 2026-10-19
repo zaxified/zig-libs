@@ -10,13 +10,14 @@
 
 const std = @import("std");
 const sp = @import("testkit").stackprobe;
+const aesgcm = @import("aesgcm");
 const initial = @import("initial.zig");
 const keyschedule = @import("keyschedule.zig");
 const headerprot = @import("headerprot.zig");
 const protection = @import("protection.zig");
 
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
-const Gcm = protection.Protection(std.crypto.aead.aes_gcm.Aes128Gcm);
+const Gcm = protection.Protection(aesgcm.Aes128Gcm);
 const Chacha = protection.Protection(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
 const Keys16 = keyschedule.PacketKeys(16);
 const Keys32 = keyschedule.PacketKeys(32);

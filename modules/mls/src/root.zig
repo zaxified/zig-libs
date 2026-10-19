@@ -390,7 +390,7 @@ pub const meta = .{
     // `suite.CipherSuite(...)` is a comptime type, not an instance).
     .concurrency = .reentrant,
     .model_after = "RFC 9420 (Messaging Layer Security); treemath.zig ports Appendix C's own published Python reference verbatim",
-    .deps = .{"hpke"},
+    .deps = .{ "hpke", "aesgcm" }, // aesgcm: the suite 0x0001 message AEAD (AES-128-GCM)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -430,9 +430,10 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is exactly {\"hpke\"}" {
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+test "meta.deps is exactly {\"hpke\", \"aesgcm\"}" {
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("hpke", meta.deps[0]);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
 }
 
 test "meta.role is .util (no owned transport/socket in Part 1)" {

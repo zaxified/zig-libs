@@ -66,7 +66,7 @@ var k: quic.PacketKeys(16) = undefined;
 quic.derivePacketKeys(HkdfSha256, 16, &k, &secrets.client_initial_secret); // k = .{ key, iv, hp }
 
 // §5.3 AEAD packet protection (AES-128-GCM shown).
-const P = quic.Protection(std.crypto.aead.aes_gcm.Aes128Gcm);
+const P = quic.Protection(@import("aesgcm").Aes128Gcm);
 var out: [2048]u8 = undefined;
 const n = try P.seal(&k.key, k.iv, packet_number, header_bytes, payload, &out);
 // receiver: const m = try P.open(&k.key, k.iv, pn, header_bytes, ciphertext, &buf);

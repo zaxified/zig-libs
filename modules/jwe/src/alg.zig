@@ -7,8 +7,8 @@
 //!   - `dirCek`          — `dir` (§4.5): the CEK IS the shared key.
 //!   - `rsaOaepWrap`/`rsaOaepUnwrap` — RSA-OAEP / RSA-OAEP-256 (§4.3), a thin
 //!     wire over the `rsa` module's `encryptOaep`/`decryptOaep`.
-//!   - `gcmkwWrap`/`gcmkwUnwrap` — AxxxGCMKW (§4.7), `std.crypto.aead.aes_gcm`
-//!     for 128/256 and `aesgcm.Aes192Gcm` for A192GCMKW (std has no AES-192).
+//!   - `gcmkwWrap`/`gcmkwUnwrap` — AxxxGCMKW (§4.7), the `aesgcm` module's
+//!     `Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm`.
 //!   - `pbes2DeriveKek`  — the PBES2 (§4.8) KDF: `std.crypto.pwhash.pbkdf2`
 //!     over `Alg || 0x00 || p2s`; the KEK it produces feeds `aeskw`.
 //!   - `aeskw` (re-export) — RFC 3394 AES Key Wrap: AxxxKW (§4.4) directly,
@@ -23,7 +23,6 @@ const std = @import("std");
 pub const Entropy = @import("entropy.zig").Entropy;
 const rsa = @import("rsa");
 const burn = @import("burn.zig");
-const aead = std.crypto.aead.aes_gcm;
 const aesgcm = @import("aesgcm");
 
 pub const aeskw = @import("aeskw");
@@ -93,15 +92,15 @@ pub fn rsaOaepUnwrap(sk: *const rsa.SecretKey, hash: OaepHash, encrypted_key: []
 /// AxxxGCMKW wrap (RFC 7518 §4.7): AES-GCM-encrypt `cek` under `kek` with a
 /// caller-supplied random 96-bit `iv` and no AAD (§4.7.1 — the header
 /// carries `iv`/`tag` as its own params, produced/consumed by the caller of
-/// this function). 16/32-byte KEKs on `std.crypto.aead.aes_gcm`, 24-byte on
-/// `aesgcm.Aes192Gcm`, as `enc.gcm`.
+/// this function). 16/24/32-byte KEKs on
+/// `aesgcm.Aes128Gcm`/`Aes192Gcm`/`Aes256Gcm`, as `enc.gcm`.
 pub fn gcmkwWrap(kek: []const u8, iv: [12]u8, cek: []const u8, ct_out: []u8, tag_out: *[16]u8) Error![]u8 {
     if (ct_out.len < cek.len) return error.BufferTooSmall;
     const ct = ct_out[0..cek.len];
     switch (kek.len) {
-        16 => aead.Aes128Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..16].*),
+        16 => aesgcm.Aes128Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..16].*),
         24 => aesgcm.Aes192Gcm.encryptInto(ct, tag_out, cek, "", iv, kek[0..24]),
-        32 => aead.Aes256Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..32].*),
+        32 => aesgcm.Aes256Gcm.encrypt(ct, tag_out, cek, "", iv, kek[0..32].*),
         else => return error.UnsupportedKeyLength,
     }
     return ct;
@@ -112,9 +111,9 @@ pub fn gcmkwUnwrap(kek: []const u8, iv: [12]u8, tag: [16]u8, encrypted_key: []co
     if (out.len < encrypted_key.len) return error.BufferTooSmall;
     const pt = out[0..encrypted_key.len];
     switch (kek.len) {
-        16 => aead.Aes128Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..16].*) catch return error.UnwrapFailed,
+        16 => aesgcm.Aes128Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..16].*) catch return error.UnwrapFailed,
         24 => aesgcm.Aes192Gcm.decryptInto(pt, encrypted_key, tag, "", iv, kek[0..24]) catch return error.UnwrapFailed,
-        32 => aead.Aes256Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..32].*) catch return error.UnwrapFailed,
+        32 => aesgcm.Aes256Gcm.decrypt(pt, encrypted_key, tag, "", iv, kek[0..32].*) catch return error.UnwrapFailed,
         else => return error.UnsupportedKeyLength,
     }
     return pt;

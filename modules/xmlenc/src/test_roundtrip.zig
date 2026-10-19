@@ -19,8 +19,8 @@ const testing = std.testing;
 const aes = std.crypto.core.aes;
 const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes256Gcm = @import("aesgcm").Aes256Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm;
 const Aes192 = @import("aes192").Aes192;
 const Aes192Gcm = @import("aesgcm").Aes192Gcm;
 

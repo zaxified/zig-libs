@@ -92,7 +92,7 @@ pub const meta = .{
     // no shared/global state at all.
     .concurrency = .single_owner,
     .model_after = "RFC 8446 §4.2.11/§4.2.11.1/§4.2.11.2/§4.6.1/§7.1/§8 (TLS 1.3 session resumption + PSK binder + anti-replay); design ref ianic/tls.zig transcript.zig/handshake_client.zig (client-side label/wire shapes studied, no source copied)",
-    .deps = .{}, // std only
+    .deps = .{"aesgcm"}, // aesgcm: the AES-256-GCM ticket AEAD (stek.zig) + the early-data test vectors; else std only
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -112,8 +112,9 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is empty (std only, no sibling-module dependencies)" {
-    try std.testing.expectEqual(@as(usize, 0), meta.deps.len);
+test "meta.deps is exactly {aesgcm} (the ticket AEAD; else std only)" {
+    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[0]);
 }
 
 test "meta.role is .server (client-side resumption already exists elsewhere)" {

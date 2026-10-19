@@ -69,7 +69,7 @@ Recorded in `src/root.zig`'s module doc. Summary of the exact std paths:
   re-implements `HkdfLabel`. Forking the prefix here would silently produce
   keys no QUIC peer accepts.
 - `std.crypto.kdf.hkdf.HkdfSha256` — `.extract` (§5.2), `.prk_length` = 32.
-- `std.crypto.aead.aes_gcm.Aes128Gcm` / `Aes256Gcm`,
+- `aesgcm.Aes128Gcm` / `Aes256Gcm` (zig-libs; std's `aes_gcm` types are interchangeable),
   `std.crypto.aead.chacha_poly.ChaCha20Poly1305` — the three QUIC v1 AEADs
   (12-byte nonce, 16-byte tag); `TLS_AES_128_CCM_8_SHA256` is excluded from
   QUIC by §5.3, so there is no 12-vs-13-byte-nonce CCM problem here (contrast
@@ -251,7 +251,7 @@ test had a packet that did not fit). **Equivalent:** `verifyRetryTag` refusing a
 
 ## Backlog / deferred
 
-- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `protection.zig` (packet protection, every QUIC packet) and `retry.zig`. zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
+- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 - **Retry integrity tag (RFC 9001 §5.8)** — DONE 2026-09-30 (survey 2026-09-30): `retry.computeRetryTag` / `verifyRetryTag`, anchored on RFC 9001 A.4 and RFC 9369 A.4.
 - **QUIC v2 (RFC 9369): salt, HKDF labels (`quicv2 key` …), Retry key** — DONE 2026-09-30 (survey 2026-09-30): `Version` + `*For` derivations + Retry key/nonce + packet-type codes, anchored on RFC 9369 A.1–A.5.

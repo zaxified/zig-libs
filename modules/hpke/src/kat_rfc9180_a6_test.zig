@@ -9,13 +9,14 @@
 
 const std = @import("std");
 const testing = std.testing;
+const aesgcm = @import("aesgcm");
 const suite = @import("suite.zig");
 const dhkem = @import("dhkem.zig");
 const schedule = @import("schedule.zig");
 const a6 = @import("kat_rfc9180_a6.zig");
 
 const HkdfSha512 = std.crypto.kdf.hkdf.HkdfSha512;
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes256Gcm = aesgcm.Aes256Gcm;
 const Kem = dhkem.P521Kem;
 
 fn drive(comptime V: type) !void {

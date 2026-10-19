@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** GOOSE/SV GMAC now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `EnumSet.initEmpty()` -> `.empty` in `tlsprofile.zig`.

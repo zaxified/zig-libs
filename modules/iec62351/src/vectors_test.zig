@@ -163,7 +163,7 @@ test "standard: AES-GCM test cases 1 and 13 (the GMAC primitive)" {
     // plaintext and empty AAD.
     {
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([16]u8, @splat(0)));
+        @import("aesgcm").Aes128Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([16]u8, @splat(0)));
         try testing.expectEqualSlices(u8, &.{
             0x58, 0xe2, 0xfc, 0xce, 0xfa, 0x7e, 0x30, 0x61,
             0x36, 0x7f, 0x1d, 0x57, 0xa4, 0xe7, 0x45, 0x5a,
@@ -172,7 +172,7 @@ test "standard: AES-GCM test cases 1 and 13 (the GMAC primitive)" {
     // Test case 13: the same, with AES-256.
     {
         var tag: [16]u8 = undefined;
-        std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([32]u8, @splat(0)));
+        @import("aesgcm").Aes256Gcm.encrypt(&.{}, &tag, &.{}, &.{}, @as([12]u8, @splat(0)), @as([32]u8, @splat(0)));
         try testing.expectEqualSlices(u8, &.{
             0x53, 0x0f, 0x8a, 0xfb, 0xc7, 0x45, 0x36, 0xb9,
             0xa9, 0x63, 0xb4, 0xf1, 0xc4, 0xcb, 0x73, 0x8b,

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** AES-128/256-GCM decryption now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-10** — AES-192: `aes192-cbc`, `aes192-gcm` and `kw-aes192` are accepted, over the new `aes192` block cipher (through `aescbc`), `aesgcm.Aes192Gcm` and `aeskw`'s 24-byte KEK arm; new deps `aes192`, `aesgcm`. The test that pinned AES-192 as `UnsupportedAlgorithm` is now a round trip of both content modes under kw-aes192 and rsa-oaep; the fuzz harness's algorithm lists gain `aes192-gcm` and `kw-aes192` (appended, so existing seeds keep their meaning).
 - **2026-10-09** — tests: deterministic fuzz driver `XMLENC_FUZZ` over the existing `decryptData` harness, which now also checks that a genuine encrypted document decrypts to the exact plaintext and an AES-GCM one with 1-3 octets flipped fails (or yields the same plaintext).
 - **2026-10-09** — **BREAKING:** `decryptData`, `decryptAssertion` and `decryptDataToDocument` take

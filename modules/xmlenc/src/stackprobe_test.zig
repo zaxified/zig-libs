@@ -43,7 +43,7 @@ fn build(a: std.mem.Allocator) !void {
     var content: [12 + assertion.len + 16]u8 = undefined;
     @memcpy(content[0..12], &iv);
     var tag: [16]u8 = undefined;
-    std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(content[12..][0..assertion.len], &tag, assertion, "", iv, cek);
+    @import("aesgcm").Aes256Gcm.encrypt(content[12..][0..assertion.len], &tag, assertion, "", iv, cek);
     @memcpy(content[12 + assertion.len ..], &tag);
 
     var wrapped_buf: [128]u8 = undefined;

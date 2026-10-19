@@ -99,8 +99,8 @@ const burn = @import("burn.zig");
 const ber = @import("ber.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 /// p256's burned wrapper, not std's: std's signer leaves the private key and
 /// the nonce on the dead stack after every signature (measured 2026-10-08,
 /// `stackprobe_test.zig`).

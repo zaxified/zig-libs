@@ -33,11 +33,11 @@ below. AES-192 (every `A192*`) runs on the `aes192` block cipher and
 |---|---|
 | `dir` (key management) | **REAL** |
 | `RSA-OAEP` / `RSA-OAEP-256` (key management) | **REAL** (wraps `rsa`'s OAEP; RFC 7516 A.1 KAT) |
-| `A128GCMKW` / `A256GCMKW` (key management) | **REAL** (`std.crypto.aead.aes_gcm`) |
+| `A128GCMKW` / `A256GCMKW` (key management) | **REAL** (`aesgcm`) |
 | `A128KW` / `A256KW` (key management) | **REAL** (RFC 3394 AES Key Wrap; §4.1 + RFC 7516 A.3 KATs) |
 | `PBES2-HS256+A128KW` / `PBES2-HS512+A256KW` | **REAL** (PBKDF2 KDF feeding the AES Key Wrap above) |
 | `ECDH-ES` / `ECDH-ES+A128KW` / `ECDH-ES+A256KW` (key management) | **REAL** (ephemeral-static ECDH on P-256 or X25519 + Concat KDF; RFC 7518 Appendix C KAT) |
-| `A128GCM` / `A256GCM` (content encryption) | **REAL** (`std.crypto.aead.aes_gcm`) |
+| `A128GCM` / `A256GCM` (content encryption) | **REAL** (`aesgcm`) |
 | `A128CBC-HS256` / `A256CBC-HS512` (content encryption) | **REAL** (AES-CBC + HMAC encrypt-then-MAC; RFC 7518 B.1/B.3 KATs) |
 | `A192GCM` / `A192GCMKW` / `A192KW` / `A192CBC-HS384` / `PBES2-HS384+A192KW` / `ECDH-ES+A192KW` | **REAL** since 2026-10-10 (AES-192 from the `aes192` module, GCM from `aesgcm`; RFC 7518 B.2, RFC 3394 §4.2/§4.4 and McGrew–Viega 7–10 KATs, full-token round trips — RFC 7520 has no AES-192 examples) |
 

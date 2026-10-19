@@ -3872,7 +3872,7 @@ pub const Connection = struct {
 
 const chachapoly = @import("chachapoly");
 
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 // The `chacha20_poly1305_sha256` suite is RFC 8439's plain ChaCha20-Poly1305
 // (NOT XChaCha), so the SIMD `chachapoly` sibling applies here — see
 // `aead.zig`'s differential test for the byte-identity proof against std,

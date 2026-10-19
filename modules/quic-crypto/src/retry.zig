@@ -19,10 +19,11 @@
 
 const std = @import("std");
 const version = @import("version.zig");
+const aesgcm = @import("aesgcm");
 
 pub const Version = version.Version;
 
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = aesgcm.Aes128Gcm;
 
 /// The Retry Integrity Tag is 128 bits (RFC 9001 §5.8).
 pub const tag_length = Aes128Gcm.tag_length;

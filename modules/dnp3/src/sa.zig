@@ -103,8 +103,8 @@ pub const mac = struct {
     const hmac = std.crypto.auth.hmac;
     const HmacSha1 = hmac.HmacSha1;
     const HmacSha256 = hmac.sha2.HmacSha256;
-    const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-    const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+    const Aes128Gcm = @import("aesgcm").Aes128Gcm; // zig-libs aesgcm (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 
     /// Largest MAC any registry algorithm produces (16, HMAC-SHA-256/16).
     pub const max_len = 16;

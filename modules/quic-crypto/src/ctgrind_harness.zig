@@ -35,6 +35,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const q = @import("root.zig");
+const aesgcm = @import("aesgcm");
 
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Target = enum { aes, chacha };
@@ -114,7 +115,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (taint == .yes) std.valgrind.memcheck.makeMemUndefined(&raw);
     const secret = reloadVolatile(32, &raw);
     switch (target) {
-        .aes => try run(16, std.crypto.aead.aes_gcm.Aes128Gcm, maskAes, &secret),
+        .aes => try run(16, aesgcm.Aes128Gcm, maskAes, &secret),
         .chacha => try run(32, std.crypto.aead.chacha_poly.ChaCha20Poly1305, maskChaCha, &secret),
     }
 }

@@ -18,6 +18,7 @@
 const std = @import("std");
 const testing = std.testing;
 const testkit = @import("testkit");
+const aesgcm = @import("aesgcm");
 pub const fuzz_driver = testkit.fuzz.driver;
 
 /// One harness input into `buf`; returns its length. Under `Smith` (`--fuzz`,
@@ -109,7 +110,7 @@ fn sealOpenHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
     switch (src.valueRangeAtMost(u8, 0, 2)) {
         0 => {
             SealMark.mark(.x25519);
-            try sealOpenOne(root.X25519Kem, std.crypto.aead.aes_gcm.Aes128Gcm, 32, &ikm, info, aad, pt, src.value(bool));
+            try sealOpenOne(root.X25519Kem, aesgcm.Aes128Gcm, 32, &ikm, info, aad, pt, src.value(bool));
         },
         1 => {
             SealMark.mark(.p256);
@@ -117,7 +118,7 @@ fn sealOpenHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!v
         },
         else => {
             SealMark.mark(.p384);
-            try sealOpenOne(root.P384Kem, std.crypto.aead.aes_gcm.Aes256Gcm, 48, &ikm, info, aad, pt, src.value(bool));
+            try sealOpenOne(root.P384Kem, aesgcm.Aes256Gcm, 48, &ikm, info, aad, pt, src.value(bool));
         },
     }
 }

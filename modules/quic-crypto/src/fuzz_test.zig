@@ -25,6 +25,7 @@
 const std = @import("std");
 const testing = std.testing;
 const testkit = @import("testkit");
+const aesgcm = @import("aesgcm");
 const root = @import("root.zig");
 const headerprot = @import("headerprot.zig");
 const retry = @import("retry.zig");
@@ -296,8 +297,8 @@ fn markChacha() void {
 pub fn fuzzProtection(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     _ = gpa;
     switch (src.index(3)) {
-        0 => try protectionCase(std.crypto.aead.aes_gcm.Aes128Gcm, markAes128, S, src),
-        1 => try protectionCase(std.crypto.aead.aes_gcm.Aes256Gcm, markAes256, S, src),
+        0 => try protectionCase(aesgcm.Aes128Gcm, markAes128, S, src),
+        1 => try protectionCase(aesgcm.Aes256Gcm, markAes256, S, src),
         else => try protectionCase(root.ChaCha20Poly1305, markChacha, S, src),
     }
 }
@@ -355,7 +356,7 @@ pub fn fuzzInitialRetry(comptime S: type, src: *S, gpa: std.mem.Allocator) anyer
     const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
     var keys: root.PacketKeys(16) = undefined;
     root.derivePacketKeysFor(ver, Hkdf, 16, &keys, &s.client_initial_secret);
-    const P = Protection(std.crypto.aead.aes_gcm.Aes128Gcm);
+    const P = Protection(aesgcm.Aes128Gcm);
     var header: [24]u8 = undefined;
     var payload: [64]u8 = undefined;
     const hl = src.index(header.len + 1);

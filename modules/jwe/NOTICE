@@ -31,7 +31,7 @@ style (compact-serialization parsing shape, arena-per-call ownership,
 `fromString`-into-`.unknown` enum mapping) — again this repo's own work, no
 third-party source involved.
 
-`std.crypto.aead.aes_gcm`, `std.crypto.pwhash.pbkdf2`,
+`std.crypto.pwhash.pbkdf2`,
 `std.crypto.auth.hmac`, `std.json`, and `std.base64` are used via their
 public std APIs (MIT, part of Zig itself). The `rsa` module (this repo's
 own, RFC 8017 clean-room — see its own NOTICE/SPEC) supplies the RSA-OAEP

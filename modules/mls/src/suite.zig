@@ -28,6 +28,7 @@
 
 const std = @import("std");
 const hpke = @import("hpke");
+const aesgcm = @import("aesgcm");
 
 /// RFC 9420 §17.1's registry — every suite name IANA has assigned a
 /// `CipherSuite` value to. Only `mls_128_dhkemx25519_aes128gcm_sha256_ed25519`
@@ -124,13 +125,13 @@ pub fn CipherSuite(
 }
 
 /// RFC 9420 §16.1's mandatory-to-implement suite — the ONLY suite this
-/// Part instantiates. `hpke.X25519Kem` + `std.crypto.aead.aes_gcm
+/// Part instantiates. `hpke.X25519Kem` + `aesgcm
 /// .Aes128Gcm` + `std.crypto.kdf.hkdf.HkdfSha256` + `std.crypto.hash.sha2
 /// .Sha256` + `std.crypto.sign.Ed25519` reproduce `0x0001`'s five
 /// algorithms exactly (see this file's module doc comment).
 pub const Mls128X25519Aes128GcmSha256Ed25519 = CipherSuite(
     hpke.X25519Kem,
-    std.crypto.aead.aes_gcm.Aes128Gcm,
+    aesgcm.Aes128Gcm,
     std.crypto.kdf.hkdf.HkdfSha256,
     std.crypto.hash.sha2.Sha256,
     std.crypto.sign.Ed25519,

@@ -33,7 +33,7 @@ label prefix, whereas DTLS 1.3 (RFC 9147 §5.9) requires `"dtls13"`, so the
 with a parameterized prefix. No source was copied from
 `std.crypto.tls.Client`'s private handshake state machine.
 
-The AEAD primitives (`std.crypto.aead.aes_gcm`, `chacha_poly`), the
+The AEAD primitives (`chacha_poly`; AES-GCM comes from the `aesgcm` sibling), the
 single-block AES-ECB (`std.crypto.core.aes`), the ChaCha20 block keystream
 (`std.crypto.stream.chacha`), HKDF/HMAC, and SHA-256/384 are used via their
 public std APIs (MIT, part of Zig). Verification used RFC 8448 "Example

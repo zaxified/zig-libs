@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** transport.zig per-packet AES-GCM now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — Ported to Zig 0.17.0. std `X25519.KeyPair.generateDeterministic` / `recoverPublicKey` no longer return errors: dropped the `catch return error.KexFailed` / `try` at the call sites (transport.zig, server.zig, stackprobe_test.zig); enum/struct reflection moved to `field_names` / `field_values` (keys.zig `fromName`, transport.zig `isRecognized`, connection.zig test).

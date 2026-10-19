@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Secure Authentication AES-GMAC now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-10** — tests: deterministic fuzz driver `DNP3_FUZZ` (`outstation.zig`, `src/fuzz_test.zig`). `dnp3-fragment` / `dnp3-session`: the existing structured hostile-field generator (boundary ranges, command objects, narrow variations) now generic over its source of choices, into `Outstation.handle` (also damaged genuine class reads and a reply buffer too small) and, wrapped in data-link frames to our / a neighbour's / broadcast addresses with damaged CRCs, into `Session.feedFrame`; the response series terminates and everything emitted decodes. `dnp3-sa`: a wrapped session-key pair unwraps and a flipped octet, another update key or a truncation does not; a reply MAC verifies and a flipped MAC, challenge, ASDU, key or short MAC does not; the g120 objects round-trip and never panic on damage. 200,000-run verdicts clean. No code change.

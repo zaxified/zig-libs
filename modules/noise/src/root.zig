@@ -48,7 +48,9 @@ pub const meta = .{
     // AEAD is not the bottleneck for a `CipherState` carrying bulk transport
     // records. `Suite` stays generic — std's AEAD is still bindable, and the
     // official noise-c vectors are run under BOTH (see state.zig).
-    .deps = .{"chachapoly"},
+    // aesgcm: the spec §4.2 `AESGCM` cipher (std's is 2.6x slower on Zig 0.17,
+    // #36256); std's `Aes256Gcm` is still accepted by `Suite`.
+    .deps = .{ "chachapoly", "aesgcm" },
 };
 
 pub const token = @import("token.zig");
@@ -75,7 +77,7 @@ pub const Suite = state.Suite;
 // reserved (all reachable via `Suite(...)` directly) for whichever
 // crypto-implementation pass needs them:
 //
-//   pub const Aes256GcmSuite = Suite(std.crypto.dh.X25519, std.crypto.aead.aes_gcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
+//   pub const Aes256GcmSuite = Suite(std.crypto.dh.X25519, aesgcm.Aes256Gcm, std.crypto.hash.sha2.Sha256);
 //   pub const Sha512Suite    = Suite(std.crypto.dh.X25519, ChaCha20Poly1305, std.crypto.hash.sha2.Sha512);
 //   pub const Blake2sSuite   = Suite(std.crypto.dh.X25519, ChaCha20Poly1305, std.crypto.hash.blake2.Blake2s256);
 //   pub const Blake2bSuite   = Suite(std.crypto.dh.X25519, ChaCha20Poly1305, std.crypto.hash.blake2.Blake2b512);
@@ -115,13 +117,14 @@ test {
     _ = @import("stackprobe_test.zig");
 }
 
-test "meta.deps is exactly {chachapoly} (the AEAD; NOT wireguard)" {
+test "meta.deps is exactly {chachapoly, aesgcm} (the AEADs; NOT wireguard)" {
     // The point of the assertion has always been that `noise` does not depend
     // on `wireguard` (they are the framework and one hard-wired instantiation
     // of it, not layers). `chachapoly` is the one permitted edge: the spec
     // §4.2 AEAD implementation.
-    try std.testing.expectEqual(@as(usize, 1), meta.deps.len);
+    try std.testing.expectEqual(@as(usize, 2), meta.deps.len);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[0]);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
 }
 
 test "DefaultSuite binds the chachapoly sibling, and the spec §8 name is unchanged by that" {

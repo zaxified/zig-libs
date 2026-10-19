@@ -36,8 +36,8 @@ const Sha1 = std.crypto.hash.Sha1;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Aes256 = std.crypto.core.aes.Aes256;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes128Gcm = @import("aesgcm").Aes128Gcm;
+const Aes256Gcm = @import("aesgcm").Aes256Gcm;
 /// AES-192: std 0.16 has none; the `aes192` block cipher and `aesgcm`'s GCM.
 const Aes192 = @import("aes192").Aes192;
 const Aes192Gcm = @import("aesgcm").Aes192Gcm;
@@ -55,7 +55,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "W3C XML Encryption 1.1 (xmlenc-core-1), decryption side; RFC 8017 / RFC 3394 / NIST SP800-38A/D",
-    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, // aes192/aesgcm: the AES-192 block cipher and AES-192-GCM (std 0.16 has neither)
+    .deps = .{ "xml", "rsa", "aescbc", "aeskw", "aes192", "aesgcm" }, // aes192: the AES-192 block cipher (std 0.16 has none); aesgcm: all AES-GCM sizes (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── namespace URIs ──────────────────────────────────────────────────────────

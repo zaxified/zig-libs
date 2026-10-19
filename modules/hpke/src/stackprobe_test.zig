@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const hpke = @import("root.zig");
 const suite = @import("suite.zig");
 const P256 = @import("p256").P256;
+const aesgcm = @import("aesgcm");
 const P384 = std.crypto.ecc.P384;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -34,7 +35,7 @@ const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384
 const X = hpke.X25519Kem;
 const P = hpke.P256Kem;
 const Q = hpke.P384Kem;
-const Aes = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes = aesgcm.Aes128Gcm;
 const Cc = hpke.ChaCha20Poly1305;
 const AesCtx = hpke.Context(Aes, 32);
 

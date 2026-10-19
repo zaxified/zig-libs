@@ -76,7 +76,7 @@ placement).
   over" — a classic JOSE interop footgun sidestepped by construction.
 - **AES-192 comes from sibling modules, not std** (since 2026-10-10). Zig
   0.16's `std.crypto.core.aes` ships only `Aes128`/`Aes256` and
-  `std.crypto.aead.aes_gcm` no `Aes192Gcm`. `A192CBC-HS384`'s CBC half runs
+  `std.crypto.aead.aes_gcm` no `Aes192Gcm` (all GCM sizes now run on `aesgcm`). `A192CBC-HS384`'s CBC half runs
   on `aes192.Aes192` through `aescbc`; `A192GCM` and `A192GCMKW` on
   `aesgcm.Aes192Gcm`; `A192KW`, `PBES2-HS384+A192KW` and `ECDH-ES+A192KW`
   through `aeskw`'s 24-byte KEK arm. 128/256 stay on std. Anchors: RFC 7518
@@ -268,7 +268,7 @@ First pass: 18 survivors. **One defect (fixed), 15 test gaps, 3 equivalent.**
 
 ## Backlog / deferred
 
-- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `enc.zig` / `alg.zig` (check which paths still use std rather than the `aesgcm` dep). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
+- 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
 - **(survey 2026-09-30) ECDH-ES on P-384 / P-521** — `ecdhes.Curve` is `p256`/`x25519` only (`rg 'pub const Curve' -A3 src/ecdhes.zig`); go-jose and panva/jose accept the NIST curves and IdPs commonly publish P-384 keys. Effort: medium (needs a P-384 primitive; `std.crypto.ecc.P384` exists in Zig 0.16 *(inferred, not checked)*). Fits §2: yes.
 - **(survey 2026-09-30) JWE JSON serialization (flattened/general) and multiple recipients** — go-jose and panva/jose both ship it; deliberately out of scope for v1 (see *Design & invariants*), listed because it is an API addition, not a framing change. Effort: medium. Fits §2: yes.

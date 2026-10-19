@@ -468,9 +468,10 @@ test "STACKPROBE noise (wave 9): no key, DH or HKDF residue on the dead stack af
 // same step/shim frames) and the body may not reach more than `burn_slack`
 // below its end — the entry point's own frame sits between the two.
 
+const aesgcm = @import("aesgcm");
 const state = @import("state.zig");
 const burn_mod = @import("burn.zig");
-const Aes256Gcm = std.crypto.aead.aes_gcm.Aes256Gcm;
+const Aes256Gcm = aesgcm.Aes256Gcm;
 const StdChaCha = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
 const sha2 = std.crypto.hash.sha2;
 const blake2 = std.crypto.hash.blake2;

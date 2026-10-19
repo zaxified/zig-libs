@@ -280,7 +280,7 @@
 //!   TLS-prefixed keys that no DTLS peer accepts.
 //! - Cipher-suite→AEAD binding: `aead.zig`'s `Protection(comptime Aead)`
 //!   mirrors std TLS's generic per-suite shape, instantiated in
-//!   `Connection.zig`'s suite dispatch for `Aes128Gcm` (std) and
+//!   `Connection.zig`'s suite dispatch for `Aes128Gcm` (the `aesgcm` sibling) and
 //!   `ChaCha20Poly1305` (the `chachapoly` sibling, RFC 8439's plain
 //!   ChaCha20-Poly1305 — the `chacha20_poly1305_sha256` suite is not
 //!   XChaCha, so the sibling applies; std's ChaCha20-Poly1305 stays
@@ -385,7 +385,7 @@ pub const meta = .{
     // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509", "chachapoly" },
+    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm" }, // aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -414,11 +414,12 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 suite; the PSK flight engine itself needs no sibling modules)" {
-    try std.testing.expectEqual(@as(usize, 3), meta.deps.len);
+test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites; the PSK flight engine itself needs no sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
     try std.testing.expectEqualStrings("x509", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
+    try std.testing.expectEqualStrings("aesgcm", meta.deps[3]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {

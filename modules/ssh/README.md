@@ -67,7 +67,7 @@ no skips.
   ecdh-sha2-nistp521); `aes192` (`aes192-ctr`); `b64ct` (constant-time base64 of
   the host-key PEM).
 - **Crypto:** Zig `std.crypto` — X25519 + ML-KEM-768 (KEX), Ed25519/P-256/P-384
-  (signatures), ChaCha20-Poly1305 / AES-CTR / AES-GCM (ciphers), SHA-2 /
+  (signatures), ChaCha20-Poly1305 / AES-CTR (ciphers; AES-GCM via the `aesgcm` module), SHA-2 /
   HMAC-SHA2-256.
 
 ## Provenance

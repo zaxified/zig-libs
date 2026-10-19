@@ -26,6 +26,7 @@
 const std = @import("std");
 const burn = @import("burn.zig");
 const chachapoly = @import("chachapoly");
+const aesgcm = @import("aesgcm");
 
 pub const ProtectionError = error{
     /// AEAD tag verification failed on `open` — return this, never panic.
@@ -37,9 +38,9 @@ pub const ProtectionError = error{
 };
 
 /// Binds one AEAD type to RFC 9001 §5.3's packet-protection operations.
-/// Instantiate with `std.crypto.aead.aes_gcm.Aes128Gcm` (Initial + the
-/// TLS_AES_128_GCM_SHA256 suite), `aes_gcm.Aes256Gcm`, or
-/// `chacha_poly.ChaCha20Poly1305`. All QUIC v1 AEADs have a 12-byte nonce
+/// Instantiate with `aesgcm.Aes128Gcm` (Initial + the
+/// TLS_AES_128_GCM_SHA256 suite), `aesgcm.Aes256Gcm` (std's `aes_gcm`
+/// types work too), or `chacha_poly.ChaCha20Poly1305`. All QUIC v1 AEADs have a 12-byte nonce
 /// and 16-byte tag.
 pub fn Protection(comptime Aead: type) type {
     return struct {
@@ -162,7 +163,7 @@ pub fn Protection(comptime Aead: type) type {
 // each sanity test below reproduces the RFC's protected ciphertext exactly.
 
 const testing = std.testing;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
+const Aes128Gcm = aesgcm.Aes128Gcm;
 // The `Protection(...)` API tests below instantiate the SIMD `chachapoly`
 // sibling — the AEAD this module recommends for the QUIC ChaCha suite, and
 // the one a data-plane consumer will actually bind.
@@ -319,6 +320,13 @@ test "Protection.seal: App. A.3 server Initial byte-exact" {
     var out5: [rfc_a5_ct.len]u8 = undefined;
     const n5 = try Protection(ChaCha20Poly1305).seal(&rfc_a5_key, rfc_a5_iv, rfc_a5_pn, &rfc_a5_header, &rfc_a5_plain, &out5);
     try testing.expectEqualSlices(u8, &rfc_a5_ct, out5[0..n5]);
+}
+
+test "Protection(std Aes128Gcm) still binds and agrees with aesgcm on the App. A.3 packet" {
+    const Std = std.crypto.aead.aes_gcm.Aes128Gcm;
+    var back: [rfc_server_payload.len]u8 = undefined;
+    const n = try Protection(Std).open(&rfc_server_key, rfc_server_iv, rfc_server_pn, &rfc_server_header, &rfc_server_ct, &back);
+    try testing.expectEqualSlices(u8, &rfc_server_payload, back[0..n]);
 }
 
 test "Protection.open: App. A.3 round-trip + tamper->DecryptionFailed" {

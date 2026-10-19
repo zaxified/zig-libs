@@ -95,7 +95,7 @@ fn snKeyWrap(o: *[16]u8, ts: *const [32]u8) void {
     keyschedule.deriveSequenceNumberKey(Hkdf, 16, o, ts);
 }
 
-const Gcm = aead.Protection(std.crypto.aead.aes_gcm.Aes128Gcm);
+const Gcm = aead.Protection(@import("aesgcm").Aes128Gcm);
 const Chacha = aead.Protection(std.crypto.aead.chacha_poly.ChaCha20Poly1305);
 
 fn gcmSeal(k: *const [16]u8, n: [12]u8, p: []const u8, o: []u8) !usize {
