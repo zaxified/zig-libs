@@ -1058,9 +1058,9 @@ pub const Blinding = union(enum) {
 /// Use: `var cache = BlindingCache.init(csprng); defer cache.deinit();` then
 /// pass `.{ .cached = &cache }` to any `…Blinded` entry point. One cache per
 /// thread: it is mutated by every op and has no lock. A cache follows the
-/// key it last served (its modulus and public exponent, both public); handed
-/// a different key, it draws a fresh pair for that one, so sharing a cache
-/// between keys is correct, only slower.
+/// key it last served (its modulus and public exponent, and which prime it
+/// lists first); handed a different key, it draws a fresh pair for that one,
+/// so sharing a cache between keys is correct, only slower.
 ///
 /// **It holds key material.** `r^e mod p` and `r⁻¹ mod p` together give `p`
 /// (`gcd(r^e·(r⁻¹)^e − 1 mod n, n)`), so the cache needs the care of the
@@ -1086,25 +1086,41 @@ pub const BlindingCache = struct {
     n: MontElem,
     n_limbs: usize,
     e: u32,
+    /// The first CRT prime of that key (`sk.p_mont.m`; SECRET, wiped by
+    /// `deinit`). `n` and `e` do not identify the pair: `SecretKey` keeps
+    /// `p` and `q` in the order it was given, and the pair is reduced mod
+    /// `p` and mod `q` separately, so a key with the same `n`, `e` and the
+    /// primes swapped (`fromPrimes(q, p, e)`, a PKCS#1 file written the
+    /// other way round) needs a pair of its own.
+    p: MontElem,
     pair: BlindingPair,
 
     /// `rng` MUST be cryptographically secure (see `Blinding.csprng`).
     pub fn init(rng: std.Random) BlindingCache {
-        return .{ .rng = rng, .left = 0, .n = undefined, .n_limbs = 0, .e = 0, .pair = undefined };
+        return .{ .rng = rng, .left = 0, .n = undefined, .n_limbs = 0, .e = 0, .p = MontParams.zero, .pair = undefined };
     }
 
     /// Wipe the pair (key material, see above); the cache stays usable and
     /// draws afresh on its next op.
     pub fn deinit(self: *BlindingCache) void {
         std.crypto.secureZero(u8, std.mem.asBytes(&self.pair));
+        std.crypto.secureZero(u64, &self.p);
         self.left = 0;
         self.n_limbs = 0;
     }
 
     fn serves(self: *const BlindingCache, sk: *const SecretKey) bool {
         const L = sk.n_mont.L;
-        return self.left != 0 and self.n_limbs == L and self.e == sk.publicExponent() and
+        const same_public = self.left != 0 and self.n_limbs == L and self.e == sk.publicExponent() and
             std.mem.eql(u64, self.n[0..L], sk.n_mont.m[0..L]); // public values
+        // `p` is secret: compared without a branch of its own and folded into
+        // the one verdict below. With `n` and `e` already equal, that verdict
+        // says only whether this key object lists the same prime first as
+        // the one the pair was drawn for — nothing about the primes' values.
+        var diff: u64 = 0;
+        for (self.p, sk.p_mont.m) |a, b| diff |= a ^ b;
+        const same_p: u1 = @intFromBool(diff == 0);
+        return (@intFromBool(same_public) & same_p) == 1;
     }
 
     /// The pair for this op: the cached one squared, or a fresh draw.
@@ -1121,6 +1137,7 @@ pub const BlindingCache = struct {
             @memcpy(self.n[0..L], sk.n_mont.m[0..L]);
             self.n_limbs = L;
             self.e = sk.publicExponent();
+            self.p = sk.p_mont.m;
             self.left = refresh_every;
         }
         self.left -= 1;
@@ -4107,6 +4124,34 @@ test "Blinding.cached: another exponent on the same modulus, or another modulus 
         try testing.expectEqualSlices(u8, plain[0..k], got[0..k]);
         try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&before), std.mem.asBytes(&prng)));
     }
+}
+
+// Audit 2026-10-19 (O3-1): `SecretKey` keeps `p`, `q` in the order given, so
+// `fromPrimes(p, q)` and `fromPrimes(q, p)` are the same public key with the
+// CRT halves swapped. Until the cache compared `p` too, the second key was
+// "served" the first one's pair (reduced mod the other prime) and every op
+// failed the F3 check with `error.FaultDetected` until the 32-op refresh.
+test "Blinding.cached: the same key with p and q swapped draws its own pair" {
+    var sk_pq: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk_pq, &kat2048.p, &kat2048.q, &kat2048.e);
+    var sk_qp: SecretKey = undefined;
+    try SecretKey.fromPrimes(&sk_qp, &kat2048.q, &kat2048.p, &kat2048.e);
+    try testing.expect(MontParams.eql(&sk_pq.n_mont.m, &sk_qp.n_mont.m));
+
+    var prng = std.Random.DefaultPrng.init(0xb11d_cace_0005);
+    var cache = BlindingCache.init(prng.random());
+    defer cache.deinit();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    for (0..6) |i| {
+        // pq, qp, qp, pq, pq, qp: every switch and every repeat.
+        const sk: *const SecretKey = if ((i + 1) % 4 < 2) &sk_pq else &sk_qp;
+        var sig: [max_modulus_len]u8 = undefined;
+        const got = try signPkcs1v15Blinded(sk, Sha256, .{ .cached = &cache }, kat2048.msg, &sig);
+        try testing.expectEqualSlices(u8, &kat2048.sig_sha256, got);
+    }
+    try testing.expect(MontParams.eql(&cache.p, &sk_qp.p_mont.m));
+    cache.deinit();
+    try testing.expect(std.mem.allEqual(u64, &cache.p, 0));
 }
 
 test "the blinded twins reach drawBlindingPair from the PUBLIC API, and produce identical output (audit R1)" {
