@@ -181,6 +181,8 @@ NOT covered, honestly:
 
 ## Backlog / deferred
 
+- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `state.zig` (`CipherState`, every transport message). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
+
 **2026-10-04:** the catalog, PSK modifiers with name parsing, and pluggable DH naming are **done**.
 Still deferred: the `fallback` modifier (Noise Pipes, §10.2 — a role switch mid-session; snow omits
 it too, no consumer), X448 by default (std has none and this module depends only on `chachapoly`;

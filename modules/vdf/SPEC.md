@@ -371,6 +371,8 @@ rather than papered over.
 
 ## Backlog / deferred
 
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `wide int`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `streamingQuotientPow`. Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 The class-group variant and Pietrzak's proof are the two biggest gaps against the
 competition; both are already refused above under *Non-goals / follow-ups* with a
 reason, so they are not repeated here as backlog. What is left:

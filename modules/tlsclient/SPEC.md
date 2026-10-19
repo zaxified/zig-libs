@@ -273,6 +273,8 @@ test goes red when `p384`'s verify is skipped (2026-10-13).
 
 ## Backlog / deferred
 
+- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `Client.zig` (std's TLS record layer: every AES-GCM record). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
+
 - **Build option: algorithm set** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). Every cipher suite, group and client-auth signer is linked
   (`p384`/`p521` imported unconditionally at src/Client.zig:16-17, TLS 1.2 suites, AEGIS, client certificates, `tlsresume`). A
   `.small` "modern web" set could drop P-521, TLS 1.2 CBC-free leftovers, AEGIS and client auth — a peer that insists on a dropped

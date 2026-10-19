@@ -715,6 +715,8 @@ ordinary stream.
 
 ## Backlog / deferred
 
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `copy16` (per match copy in the decoder). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 - **Build option: encoder quality cap** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). The 122,784-byte RFC 7932 dictionary (src/dictionary.zig:13) is
   needed by the DECODER, so it is not a knob. The encoder carries six effort pipelines (q0..q11, zopfli at the top, src/encoder.zig).
   `.small` → cap quality (e.g. ≤ 9), refusing a higher one with an error. First verify that a decoder-only consumer does not already

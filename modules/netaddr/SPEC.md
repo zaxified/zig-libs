@@ -86,6 +86,8 @@ bitmap model) and replayed against Go (`src/netip_oracle_test.zig`). One Linux-o
 live test exercises `systemSource` against loopback. Run: `zig build test-netaddr`.
 
 ## Backlog / deferred
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `ipFromInt`, `ipToInt` (per IPv6 address). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 Out of scope by design (see above): resolving zone names, OS-state-dependent
 RFC 6724 rules. Consumed downstream by `http`/`dns`/`icmp`/`probe`/`procnet` as the shared address
 substrate.

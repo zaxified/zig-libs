@@ -142,6 +142,8 @@ a refusal list for the grammar's edges, a 20 000-sample format→parse round tri
 numpy prints them, `Date.fromOrdinal` against a day-by-day calendar walk, `cast`/`toJson`/wire.
 
 ## Backlog / deferred
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `i128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `i128v`, `putI128` (per i128 value). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 From README "Deferred (backlog, not implemented here)":
 - **True columnar storage** (typed per-column arrays, SIMD-friendly layout) — a different
   representation entirely; big perf-engineering investment with no current high-throughput product

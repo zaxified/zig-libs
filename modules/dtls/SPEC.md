@@ -590,6 +590,8 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 ## Backlog / deferred
 
+- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `aead.zig` / `Connection.zig` (record protection). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
+
 - **DTLS 1.2 (RFC 6347) client/server** (survey 2026-09-30). Every mbedtls-, OpenSSL- and most wolfSSL-based peer, WebRTC, LwM2M and most CoAP gear speak 1.2; pion/dtls and wolfSSL both offer it. A user with any such peer cannot connect. Effort: large (separate handshake, cookie exchange, CBC/GCM/CCM record layer, EMS). Fits §2.
 - **KeyUpdate (send and receive) and the 48-bit sequence rekey** (survey 2026-09-30). A peer that sends KeyUpdate makes the connection unusable here (`ReceivedPostHandshakeMessage`), and the sender stops at the 2^48 ceiling. Effort: medium. Fits §2.
 - **CCM / CCM_8 suites and AES-256-GCM** (survey 2026-09-30). RFC 7925's constrained-device profile, this module's stated CoAP audience, mandates CCM_8. Blocked on a 12-byte-nonce CCM (std 0.17 exports only the 13-byte presets; its generic `AesCcm` is private, `aes_ccm.zig:36`); needs an own CCM. Effort: medium. Fits §2.

@@ -345,6 +345,8 @@ paper/spec is not a copyrightable work; no third-party source was ported).
 
 ## Backlog / deferred
 
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `reduceWide` (per polynomial coefficient). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 - **2026-10-19 — Zig 0.17.0 miscompile #37131 (signed → narrower unsigned cast emits `trunc nsw`; upper-half values are poison in ReleaseSafe/ReleaseFast)**
 
   2 open site(s) in this module (reach classes A..D/S/T are an inventory judgement, not proof):

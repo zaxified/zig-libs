@@ -556,6 +556,8 @@ PRG was kept.
 
 ## Backlog / deferred
 
+- **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `convert` (per DPF tree node), `fromBytesBody`, `serializeCwBody`. Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
+
 - **Dead stack: `alpha`/`beta` by value** *(2026-10-09, dead-stack sweep)*: the secret point and value enter `genWithSeeds` as plain integers, so `burn.run`'s argument tuple keeps a copy in the entry frame above the burn (8 + up to 8·L bytes). Seeds/keys are already by pointer and burned. A `*const` form is cheap but changes every call; deferred until a consumer cares.
 - **Distributed comparison function (DCF) and interval functions** *(survey 2026-09-30)*: the module doc names `dcf.zig` as the reason it is called `fss` and not `dpf`. Google's tree has `dcf/`, libfss offers comparison; private analytics (thresholds, histograms), secure ReLU/comparison in MPC ML, and range queries need it. Medium (BCGIKRS21, one bit of extra state per level, reuses `prg` and `group`); fits §2.
 - **Incremental / hierarchical DPF (IDPF)** *(survey 2026-09-30)*: the headline feature of the reference library; private heavy hitters (Poplar, the VDAF `Poplar1` in DAP) is the main deployed use of DPFs. `evalFull` already walks prefixes internally but there is no per-level output/CW. Medium; fits §2.

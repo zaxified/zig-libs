@@ -1913,3 +1913,7 @@ fire by deleting one `errdefer` each.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** mlswg/mls-implementations official interop KAT (tree-operations.json etc.)
+
+## Backlog / deferred
+
+- **Zig 0.17: std AES-GCM is 2.6x slower — move to zig-libs `aesgcm`** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers `writeInt(u128, …)` in `std.crypto.core.modes.ctr` and the `u128` casts in std GHASH to per-byte loops (codeberg ziglang/zig #36256): `aead.aes_gcm.Aes128Gcm` 0.40 G → 1.02 G cycles, `onetimeauth.Ghash` 2.4x, on 16 KiB messages. This module uses std's AES-GCM at `suite.zig` / `keyschedule.zig` (message AEAD). zig-libs `aesgcm` (AES-NI stitched kernel, std-shaped API) is unaffected (A/B 0.93–1.00). Fix: switch to `aesgcm` (new dep; check-testonly/licence unaffected), or wait for 0.17.1 if #37183 lands. Measure the module's bulk path before and after.
