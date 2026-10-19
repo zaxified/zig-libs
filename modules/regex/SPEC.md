@@ -171,7 +171,9 @@ bounded too: nested counted repetitions multiply to at most 1000 (Go's rule — 
 nothing, so the instruction capacity alone would not stop `((a{0}){1000}){1000}…`). The parser and
 compiler recurse once per nesting level, bounded by `max_depth` (250) — a deeply nested pattern
 is refused, not a stack overflow; the deepest accepted one compiles on a 512 KiB thread stack in a
-Debug build (tested).
+Debug build (tested). POSIX stacked repetitions (`a**`, `a{2}{3}`), which add a tree level without
+group depth, are budgeted separately: at most `max_stacked` (64) per pattern, the next one is
+`error.NestingDepth` (audit 2026-10-19).
 
 ## Verification
 

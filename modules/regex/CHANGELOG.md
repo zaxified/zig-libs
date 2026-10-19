@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** (audit S1) POSIX syntax allows a repetition of a repetition
+  (`a**`, `a{2}{3}`), and such a chain adds neither instructions nor group depth, so nothing
+  bounded it but the node table: `a{1}{1}{1}…` (~2000 times, 6 KB of pattern) made the
+  recursive compiler overflow a 512 KiB thread stack — a crash from a pattern, not an error.
+  `Builder` now budgets stacked repetitions per pattern (`max_stacked` = 64) and refuses the
+  rest with `error.NestingDepth`. Perl syntax (which refuses `a**`) is unchanged.
+
 - **2026-10-19** — FIX (wrong answers, no memory-safety impact): after a prefilter skip both
   NFA engines reused the closure's visited marks from the position where the last threads died,
   so an assertion that had failed there (`\b`, `^`, `$`) was never walked at the new position.

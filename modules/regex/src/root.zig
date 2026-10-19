@@ -2043,6 +2043,31 @@ test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {
     try testing.expectEqual(@as(?anyerror, error.NestingDepth), out[1]);
 }
 
+test "POSIX stacked repetitions (a{1}{1}…, a**…, a??…) compile or are refused on a 512 KiB thread stack" {
+    // POSIX lets a repetition repeat a repetition, and such a chain adds no
+    // group depth: the tree is as deep as the node table allows, and the
+    // recursive compiler follows it.
+    const Run = struct {
+        fn go(out: *[3]?anyerror) void {
+            const counted = "a" ++ strRepeat("{1}", 2000);
+            const star = "a" ++ strRepeat("*", 2000);
+            const quest = "a" ++ strRepeat("?", 2000);
+            var b = std.heap.page_allocator.create(Builder) catch unreachable;
+            defer std.heap.page_allocator.destroy(b);
+            out[0] = if (b.compileSyntax(counted, .posix)) |_| null else |e| e;
+            out[1] = if (b.compileSyntax(star, .posix)) |_| null else |e| e;
+            out[2] = if (b.compileSyntax(quest, .posix)) |_| null else |e| e;
+        }
+    };
+    var out: [3]?anyerror = .{ null, null, null };
+    const t = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, Run.go, .{&out});
+    t.join();
+    for (out) |e| try testing.expectEqual(@as(?anyerror, error.NestingDepth), e);
+    // A few stacked repetitions stay valid.
+    var ok = try Regex.compilePosix(testing.allocator, "a" ++ strRepeat("{1}", 60));
+    ok.deinit(testing.allocator);
+}
+
 test "nested counted repetitions multiply, as Go limits them — no compile-time blow-up" {
     try testing.expectError(error.InvalidRepeatSize, Regex.compile(testing.allocator, "(?:(?:(?:a{0}){1000}){1000}){1000}"));
     try testing.expectError(error.InvalidRepeatSize, Regex.compile(testing.allocator, "(?:a{2}|b{600}){2}"));

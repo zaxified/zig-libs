@@ -29,6 +29,8 @@ pub const max_repeat = 1000;
 /// Debug build (a compile of untrusted patterns runs on whatever thread the
 /// caller has), and no real pattern nests this far.
 pub const max_depth = 250;
+/// Repetitions of a repetition (POSIX `a**`, `a{2}{3}`) in one pattern.
+pub const max_stacked = 64;
 
 pub const Error = error{
     /// A `\` escape this grammar does not define (`\8`, `\y`, a backreference).
@@ -168,6 +170,10 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         src: []const u8 = "",
         pos: usize = 0,
         posix: bool = false,
+        /// Repetitions applied to an operand that already was one (POSIX only:
+        /// `a**`, `a{2}{3}`) in this pattern. Each adds a level to the tree
+        /// without adding group depth, so they are budgeted (`max_stacked`).
+        stacked: u16 = 0,
 
         pub fn compile(b: *Self, pattern: []const u8) Error!void {
             return b.compileSyntax(pattern, .perl);
@@ -182,6 +188,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             b.ngroups = 1;
             b.pos = 0;
             b.posix = syntax == .posix;
+            b.stacked = 0;
             b.names[0] = "";
             if (!std.unicode.utf8ValidateSlice(pattern)) return error.InvalidUtf8;
             b.src = pattern;
@@ -260,6 +267,14 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     if (operand == none) return error.MissingRepeatArgument;
                     if (repeated and !b.posix) return error.InvalidNestedRepeat;
                     if (depth + 1 > max_depth) return error.NestingDepth;
+                    if (repeated) {
+                        // Only POSIX gets here. A chain `a{1}{1}{1}…` adds no
+                        // instructions (nor group depth), yet the recursive
+                        // compiler would follow ~2000 levels of it and overflow
+                        // a small thread stack.
+                        if (b.stacked == max_stacked) return error.NestingDepth;
+                        b.stacked += 1;
+                    }
                     // Wrap the operand in place: it keeps its link in the list.
                     const inner = try b.node(b.nodes[operand]);
                     b.nodes[inner].next = none;
