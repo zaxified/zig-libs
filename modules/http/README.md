@@ -33,7 +33,7 @@ behavior. The full spec list and the design-reference record are in
    `activeConnections()`, 431/414/413 size limits, stall + whole-request +
    write timeouts (details below). **Phase 2.2 (DONE) added negotiated
    gzip response compression** (`Options.compression`, off by default —
-   see "Response compression"). Still plain HTTP only: a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls; until then TLS is the caller's (`serveStream` + ALPN) or a reverse proxy's.
+   see "Response compression"). Still plain HTTP only: a native TLS-terminating server is planned on a new zig-libs module `tlsserver` (our own TLS 1.3 server); until then TLS is the caller's (`serveStream` + ALPN) or a reverse proxy's.
 3. **DONE — HTTP/2** (`hpack` RFC 7541 + `h2` RFC 9113 framing/state
    machine/flow control): opt-in cleartext h2c on the server
    (`Options.enable_h2c`, prior knowledge), a multiplexing client
@@ -449,7 +449,7 @@ HEADERS frame is materialized into it once the body ends.
   the body, and the response then closes the connection. Absolute-
   form request targets are rejected (origin-form + `*` only).
 - **No TLS in the server yet** — terminate TLS in front (Caddy/any proxy,
-  or your own TLS layer over `serveByAlpn` / `serveStream`); a native TLS-terminating server is planned right after the zig-libs maturity goal, on our fork of ianic/tls.
+  or your own TLS layer over `serveByAlpn` / `serveStream`); a native TLS-terminating server is planned on a new zig-libs module `tlsserver` (our own TLS 1.3 server).
 
 ## Multicore accept engine (SO_REUSEPORT thread-per-core)
 

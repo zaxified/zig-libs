@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Docs: the planned native TLS-terminating server now comes from a new zig-libs module `tlsserver` (our own TLS 1.3 server, owner 2026-10-19), not from qap's ianic/tls fork.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (Server.zig, gzip_interop.zig); `problem.write` and `Method.fromToken` iterate `field_names`/`field_values`; `gzip.initCompress`'s layout tripwire reads `@typeInfo(flate.Compress).@"struct".field_names` (std's field list is unchanged in 0.17); two chunked-body tests make their `chunk` constant `comptime`. SILENT: `Reader.allocRemaining(.limited(n))` now accepts exactly `n` bytes (0.16 failed at `n`), so `form.readBody` passes `cap` instead of `cap +| 1` (same accepted sizes as before); `Response.readAllAlloc` and the h2 proxy body cap now accept exactly `max_len` bytes, as their docs say (was one less).

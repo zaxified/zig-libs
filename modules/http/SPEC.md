@@ -242,8 +242,8 @@ Hardened for direct internet exposure (no reverse proxy required):
   `redirect_filter` has no destination gate** (loopback, link-local, RFC 1918 — the SSRF class)
   and owes its own. `llmclient` chose the other option and follows no redirect at all.
 - Response bodies of 304/204/1xx are suppressed (framing correctness).
-- **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, ianic/std
-  server later), HTTP/3 (QUIC), auth (`aaa-gate`/`jwt`), rate limiting (`ratelimit`), path-traversal
+- **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, the planned
+  `tlsserver` module later; see Backlog), HTTP/3 (QUIC), auth (`aaa-gate`/`jwt`), rate limiting (`ratelimit`), path-traversal
   normalization beyond what `router` does.
 
 ## Verification
@@ -697,7 +697,7 @@ pending a native std TLS server.
   connecting a host name starts no task on the Io` (an `Io` whose vtable counts every task start:
   0 with the option, >0 without; 4 before the fix).
 
-- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-11):** not an S2 blocker (the BYO-TLS seam is the design); scheduled right after the zig-libs maturity goal closes, built on our fork of ianic/tls (qap's TLS fork) and optimized for it.
+- **Native TLS-terminating server** *(survey 2026-09-30)* — Go, dusty and zzz serve HTTPS directly; here TLS is the caller's (`serveStream` + ALPN). A user without a fronting proxy or qap-style TLS layer cannot deploy the server alone. Effort: large (needs a pure-Zig TLS server, `std.crypto.tls` has only the client; qap's TLS fork is the candidate source). Fits CONVENTIONS §2 (pure Zig) once a TLS server exists. **PLANNED (owner, 2026-10-19; replaces the 2026-10-11 plan):** not an S2 blocker (the BYO-TLS seam is the design). The server comes from a new zig-libs module `tlsserver` -- our own TLS 1.3 server built from the TLS 1.3 parts `dtls`, `tlsclient` and `tlsresume` already have, with qap's ianic/tls fork as a differential oracle and as a source of ported pieces (MIT, with NOTICE). Work starts after qap's move to Zig 0.17; this module then gets a TLS listener over `serveStream` + ALPN.
 - ~~**Client cookie jar**~~ — DONE 2026-10-05 (`Client.Options.cookie_jar`, consulted on every request and redirect hop; the implementation is the sibling `cookies.Jar` with a public-suffix list). This line said "exists in neither" until the 2026-10-11 survey caught it.
 - **HTTP/3 (QUIC)** *(survey 2026-09-30)* — Go's stdlib has none either, hyper needs separate crates; listed only so the gap is on record. Effort: very large; pure Zig possible but no consumer. Not a priority.
 - **`ResponseWriter.header_buf` as a 4 KiB inline hole** *(qap R4, 2026-09-30)* — the writer is
