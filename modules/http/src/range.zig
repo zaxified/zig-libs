@@ -365,7 +365,7 @@ pub fn applyBounded(
     const ranges = resolve(specs, total, out);
     if (max_bytes) |cap| {
         var sum: u64 = 0;
-        for (ranges) |r| sum += r.len();
+        for (ranges) |r| sum +|= r.len(); // saturating: 16 ranges of a >2^60-byte total must not wrap
         if (sum > cap) return .{ .outcome = .no_range, .ranges = &.{} };
     }
     // Local, not thread-local: setHeader copies the bytes into its own
@@ -1099,6 +1099,29 @@ test "applyBounded G6: sum of resolved ranges over max_bytes falls back to the w
         "Content-Length: 10\r\n" ++
         "\r\n" ++
         "0123456789", got);
+}
+
+fn rangeHandlerHugeTotal(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var out: [4]ResolvedRange = undefined;
+    const applied = try applyBounded(req, rw, std.math.maxInt(u64), &out, 1 << 20);
+    try rw.writeAll(if (applied.outcome == .no_range) "WHOLE" else "RANGED");
+}
+
+test "applyBounded: byte sum of ranges over a 2^64-1 total saturates instead of overflowing" {
+    var in: std.Io.Reader = .fixed("GET / HTTP/1.1\r\nHost: t\r\nRange: bytes=0-,0-\r\nConnection: close\r\n\r\n");
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [64]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    Server.serveStream(.{ .handler = rangeHandlerHugeTotal, .server_name = "test" }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    try testing.expect(std.mem.endsWith(u8, out.buffered(), "WHOLE"));
 }
 
 test "applyBounded G6: sum within max_bytes negotiates normally" {

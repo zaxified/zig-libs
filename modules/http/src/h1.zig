@@ -788,6 +788,15 @@ pub const ChunkedReader = struct {
 
     fn streamFn(r: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
         const c: *ChunkedReader = @alignCast(@fieldParentPtr("reader", r));
+        // A failure is final. `fail` leaves `state` where the bad line was
+        // found, and `std.Io.Reader` latches nothing, so without this a
+        // second read -- the server's post-response drain after a handler
+        // `try`-propagated the error into a 500 -- resumed parsing right
+        // after the refused line: `40 \r\n0\r\n\r\nGET /x ...` failed at
+        // `40 `, then decoded `0` as the last chunk and served the bytes
+        // behind it as a pipelined request that a front end reading `40 `
+        // as a 64-octet chunk never saw (audit 2026-10-19, O1-1).
+        if (c.fail_reason != null) return error.ReadFailed;
         while (true) {
             switch (c.state) {
                 .done => return error.EndOfStream,
@@ -868,6 +877,15 @@ pub const ChunkedReader = struct {
                     // one.
                     c.trailer_bytes_seen += line.raw_len;
                     if (c.trailer_bytes_seen > c.max_trailer_bytes) return c.fail(.trailer_too_large);
+                    // A trailer field line is `field-line CRLF` (RFC 9112
+                    // §7.1.2) like a head line, and `readHead` refuses a bare
+                    // LF there. Accepted here, `0\r\nX\n\r\n` ended the body at
+                    // the `\r\n` after `X\n`, where a CRLF-only parser is still
+                    // inside the trailer section and reads what follows as
+                    // more trailer lines -- a request-smuggling desync (audit
+                    // 2026-10-19, O1-2). The blank terminator is never bare
+                    // (`blank` wants exactly `\r\n`), so this only sees fields.
+                    if (line.bare_lf) return c.fail(.malformed_chunk);
                     if (line.blank) {
                         c.state = .done;
                     } else if (c.trailer_buf.len != 0) {
@@ -1660,7 +1678,10 @@ test "ChunkedReader: bare LF anywhere in chunk framing is rejected, not silently
     const cases = [_]struct { wire: []const u8, reason: ChunkedReader.FailReason }{
         .{ .wire = "5\nhello\r\n0\r\n\r\n", .reason = .malformed_chunk }, // bare LF ends the chunk-size line
         .{ .wire = "5\r\nhello\n0\r\n\r\n", .reason = .malformed_chunk }, // bare LF as the post-chunk-data terminator
-        .{ .wire = "5\r\nhello\r\n0\r\n\n", .reason = .truncated_body }, // bare LF offered as the trailer terminator: not recognized, decoder wants a real one
+        // bare LF offered as the trailer terminator: refused on the spot as a
+        // bare-LF trailer line (O1-2; it used to be read on as a trailer
+        // line, then `truncated_body` once the wire ran out)
+        .{ .wire = "5\r\nhello\r\n0\r\n\n", .reason = .malformed_chunk },
     };
     for (cases) |case| {
         var src: Reader = .fixed(case.wire);
@@ -1673,6 +1694,47 @@ test "ChunkedReader: bare LF anywhere in chunk framing is rejected, not silently
     }
     // All-CRLF control still decodes.
     try expectChunkedDecode("5\r\nhello\r\n0\r\n\r\n", "hello");
+}
+
+test "ChunkedReader: a trailer field line ended by a bare LF is refused (O1-2)" {
+    // `X\n` then `\r\n`: read leniently the body ends at that `\r\n`, while a
+    // CRLF-only parser is still in the trailer section.
+    const wires = [_][]const u8{
+        "3\r\nabc\r\n0\r\nX: y\n\r\n",
+        "3\r\nabc\r\n0\r\nX\n\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n",
+    };
+    for (wires) |wire| {
+        for ([_]bool{ false, true }) |capture| {
+            var src: Reader = .fixed(wire);
+            var cbuf: [64]u8 = undefined;
+            var tbuf: [128]u8 = undefined;
+            const tb: []u8 = if (capture) &tbuf else tbuf[0..0];
+            var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, tb);
+            var out: [64]u8 = undefined;
+            var w: Writer = .fixed(&out);
+            try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+            try testing.expectEqual(ChunkedReader.FailReason.malformed_chunk, cr.fail_reason.?);
+        }
+    }
+    // A CRLF trailer still decodes.
+    try expectChunkedDecode("3\r\nabc\r\n0\r\nX: y\r\n\r\n", "abc");
+}
+
+test "ChunkedReader: a failure is final, a later read does not resume behind the refused line (O1-1)" {
+    // `40 ` is refused (whitespace after the size). A second read used to
+    // carry on with the next line, decode `0` as the last chunk and leave the
+    // reader positioned on a request a front end saw as chunk data.
+    const rest = "0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: t\r\n\r\n";
+    var src: Reader = .fixed("40 \r\n" ++ rest);
+    var cbuf: [64]u8 = undefined;
+    var cr: ChunkedReader = .init(&src, &cbuf);
+    var out: [64]u8 = undefined;
+    var w: Writer = .fixed(&out);
+    try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+    try testing.expectEqual(ChunkedReader.FailReason.malformed_chunk, cr.fail_reason.?);
+    try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+    try testing.expectError(error.ReadFailed, cr.reader.discard(.limited(16)));
+    try testing.expectEqualStrings(rest, src.buffered()); // nothing more consumed
 }
 
 test "ChunkedReader: chunk-size at exactly the 16 hex-digit cap still decodes (F9 boundary)" {

@@ -39,6 +39,7 @@ pub fn redirectLocation(req_path: []const u8, location: []const u8, buf: *[redir
     else
         location;
     if (std.mem.startsWith(u8, resolved, "/\\")) return error.InvalidLocation;
+    if (hidesAuthority(resolved)) return error.InvalidLocation;
     // `resolved` is the caller's string or lives in `lower`; the escaped form
     // goes to `upper`, which the join no longer needs.
     var w: usize = 0;
@@ -56,6 +57,26 @@ pub fn redirectLocation(req_path: []const u8, location: []const u8, buf: *[redir
         }
     }
     return .{ .header = upper[0..w], .href = resolved };
+}
+
+/// A browser's URL parser drops leading C0 controls and spaces and every tab,
+/// CR and LF, so `/<TAB>/evil.example` (which Go's `url.Parse` rejects, and
+/// which therefore passes through unchanged) is read as `//evil.example`.
+/// True when the location, once stripped that way, starts with two slashes
+/// (either kind) although it does not literally start `//` — the open-redirect
+/// shape `/\` is refused for, reached through an invisible byte.
+fn hidesAuthority(loc: []const u8) bool {
+    if (std.mem.startsWith(u8, loc, "//")) return false; // written out: the caller meant it
+    var first: u8 = 0;
+    var seen: usize = 0;
+    for (loc) |c| {
+        if (seen == 0 and c <= 0x20) continue; // leading C0 / space
+        if (c == '\t' or c == '\r' or c == '\n') continue;
+        if (c != '/' and c != '\\') return false;
+        seen += 1;
+        if (seen == 1) first = c else return first == '/' or first == '\\';
+    }
+    return false;
 }
 
 /// Longest location `redirectLocation` handles, joined or escaped; the
@@ -289,6 +310,13 @@ test "redirectLocation: the open-redirect `/\\` form is refused, a long location
     var buf: [redirect_buf_len]u8 = undefined;
     try testing.expectError(error.InvalidLocation, redirectLocation("/a", "/\\evil.example", &buf));
     try testing.expectError(error.InvalidLocation, redirectLocation("/a", "\\evil.example", &buf));
+    // A browser strips tab/CR/LF and leading controls: these read as `//evil`.
+    try testing.expectError(error.InvalidLocation, redirectLocation("/a", "/\t/evil.example", &buf));
+    try testing.expectError(error.InvalidLocation, redirectLocation("/a", "/\r\n\\evil.example", &buf));
+    try testing.expectError(error.InvalidLocation, redirectLocation("/a", "\x01//evil.example", &buf));
+    try testing.expectError(error.InvalidLocation, redirectLocation("/a", "\t/\t/evil.example", &buf));
+    // Written out, `//host` stays the caller's explicit choice (as Go).
+    try testing.expectEqualStrings("//ok.example/x", (try redirectLocation("/a", "//ok.example/x", &buf)).header);
     try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ strRepeat("x", max_location), &buf));
     // Non-ASCII triples in the header: a location that fits joined but not escaped.
     try testing.expectError(error.LocationTooLong, redirectLocation("/a", "/" ++ strRepeat("\xc4", max_location / 2), &buf));

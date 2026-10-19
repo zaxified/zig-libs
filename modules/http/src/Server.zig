@@ -2306,7 +2306,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // when enabled; anything else non-identity — and `gzip` while decoding
     // is off — answers 415 before the handler (and before 100-continue
     // invites the body onto the wire).
-    const req_encoding = gzip.requestContentEncoding(head.header("content-encoding"));
+    const req_encoding = requestEncodingOf(&head);
     const decode_gzip = req_encoding == .gzip and
         opts.max_decompressed_request_bytes != 0 and bufs.gunzip != null;
     if (req_encoding == .unsupported or (req_encoding == .gzip and !decode_gzip))
@@ -2458,6 +2458,26 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         if (drained > max_unread_body_drain) return .close;
     }
     return .keep_alive;
+}
+
+/// The request's content coding, every `Content-Encoding` line read. Two
+/// lines are one coding list (RFC 9110 §5.3) -- `identity` + `br` is "the
+/// body is br-coded" -- so a second line is `.unsupported` (415), as on h2
+/// (`h2_server.serveJob` counts the fields). Reading only the first line let
+/// `identity` + `br` reach the handler as opaque coded bytes, and `gzip` +
+/// `gzip` reach it still once gzipped (audit 2026-10-19, O1-3). Out of line:
+/// the serving frame is budgeted (`frame_probe`), and the walk runs only for
+/// a request that carries the field at all.
+noinline fn requestEncodingOf(head: *const h1.RequestHead) gzip.RequestEncoding {
+    const first = head.header("content-encoding") orelse return .identity;
+    var lines: usize = 0;
+    var it = head.iterate();
+    while (it.next()) |e| {
+        if (!std.ascii.eqlIgnoreCase(e.name, "content-encoding")) continue;
+        lines += 1;
+        if (lines > 1) return .unsupported;
+    }
+    return gzip.requestContentEncoding(first);
 }
 
 fn respondError(opts: StreamOptions, out: *Writer, date: ?[]const u8, status: u16) ConnDisposition {
@@ -2820,9 +2840,16 @@ pub const BodyLimit = struct {
         if (l.remaining == 0) {
             // At the cap: the end of the body is fine, one octet more is not.
             // `discard` rather than `peek`, which needs a buffer the body
-            // reader may not have; the connection closes either way.
-            _ = inner.discard(.limited(1)) catch |e| return e;
-            return l.trip();
+            // reader may not have; the connection closes either way. A
+            // discard of 0 is no answer yet (a reader may fill its own
+            // buffer and report nothing, as `GunzipBody` does when the
+            // decoder makes no output): ask again, as `RequestBody.Capped`
+            // does, rather than refuse a body that ends exactly at the cap
+            // (audit 2026-10-19, O1-4).
+            while (true) {
+                const n = inner.discard(.limited(1)) catch |e| return e;
+                if (n != 0) return l.trip();
+            }
         }
         const n = try inner.stream(w, limit.min(.limited64(l.remaining)));
         l.remaining -= n;
@@ -4867,6 +4894,33 @@ const small_json = "{\"k\":\"" ++ (strRepeat("v", 24)) ++ "\"}";
 /// min_size and every offline serving buffer, so it always streams.
 const json_body = "{\"data\":[" ++ (strRepeat("\"abcdefgh\",", 160)) ++ "\"end\"]}";
 
+/// A body reader that makes no progress once (returns 0, as a decoder that
+/// filled only its own buffer does), then ends.
+const StallThenEnd = struct {
+    stalled: bool = false,
+    reader: Reader,
+
+    fn init() StallThenEnd {
+        return .{ .reader = .{ .vtable = &.{ .stream = streamFn }, .buffer = &.{}, .seek = 0, .end = 0 } };
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        const s: *StallThenEnd = @alignCast(@fieldParentPtr("reader", r));
+        if (s.stalled) return error.EndOfStream;
+        s.stalled = true;
+        return 0;
+    }
+};
+
+test "BodyLimit: a body ending exactly at the cap passes though the reader first reports no progress (O1-4)" {
+    var out_buf: [1024]u8 = undefined;
+    const got = runStream(null, "GET /limit0-stall HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "fits"));
+}
+
 fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     bumpHits(req);
     if (std.mem.eql(u8, req.path, "/method") or (req.method == .connect and req.path.len == 0)) {
@@ -4886,6 +4940,20 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
             else => return e,
         };
         try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/limit0-stall")) {
+        // O1-4: a body that ends exactly at the cap, read through a reader
+        // that reports no progress once before it ends.
+        var stall: StallThenEnd = .init();
+        req.decoded = &stall.reader;
+        var limit: BodyLimit = undefined;
+        const r = limit.init(req, rw, 0);
+        var buf: [8]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        _ = r.streamRemaining(&w) catch |e| switch (e) {
+            error.ReadFailed => return if (limit.exceeded) rw.writeError(413, "too large") else e,
+            else => return e,
+        };
+        try rw.writeAll("fits");
     } else if (std.mem.eql(u8, req.path, "/hdrs")) {
         try rw.addHeader("Vary", "Accept");
         try rw.addHeader("vary", "Origin");
@@ -5397,6 +5465,31 @@ test "serveStream: a bare LF cannot stand in for the head-terminating CRLF and s
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
+}
+
+test "serveStream: a chunked body the decoder refused is not resumed by the drain, no request rides behind it (O1-1, O1-2)" {
+    // `/echo` `try`s its body read, so a refused chunk makes it fail and the
+    // loop answers 500 -- and then drained the body for keep-alive. The drain
+    // resumed the decoder behind the refused line (`40 `), decoded the `0`
+    // a front end saw as chunk data, and served `/hello` behind it. The
+    // second wire ends its trailer section on a bare LF line, which a
+    // CRLF-only front end reads as still inside the trailers.
+    const smuggled = "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n";
+    const wires = [_][]const u8{
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n40 \r\n0\r\n\r\n" ++ smuggled,
+        "POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX\n\r\n" ++ smuggled,
+    };
+    for (wires) |wire| {
+        for ([_]?u64{ null, 1024 }) |cap| { // plain chunked and `Capped`
+            var hits: Hits = .init(0);
+            var out_buf: [4096]u8 = undefined;
+            const got = runStreamWith(.{ .max_body_bytes = cap }, &hits, wire, &out_buf);
+            try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500 Internal Server Error\r\n"));
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
+            try testing.expect(std.mem.find(u8, got, "hello") == null);
+            try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
+        }
+    }
 }
 
 test "serveStream: protocol rejections (505, 400s, 431)" {
@@ -7313,6 +7406,27 @@ test "serveStream: unsupported / disabled Content-Encoding → 415" {
     const list = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, &hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip, br\r\nContent-Length: 3\r\n\r\nabc", &out_buf);
     try testing.expect(std.mem.startsWith(u8, list, "HTTP/1.1 415 Unsupported Media Type\r\n"));
     try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
+}
+
+test "serveStream: the same coding list over two Content-Encoding lines → 415, as on h2 (O1-3)" {
+    // RFC 9110 §5.3: two field lines are one list. Only the first line used
+    // to be read, so `identity` + `br` handed the handler br-coded bytes and
+    // `gzip` + `gzip` handed it a body still gzipped once.
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    const wires = [_][]const u8{
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: identity\r\nContent-Encoding: br\r\nContent-Length: 3\r\n\r\nabc",
+        "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: gzip\r\ncontent-encoding: gzip\r\nContent-Length: 3\r\n\r\nabc",
+    };
+    for (wires) |wire| {
+        const got = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, &hits, wire, &out_buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 415 Unsupported Media Type\r\n"));
+    }
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic)); // handler never ran
+    // One line of each still decides as before.
+    const one = runStreamWith(.{ .max_decompressed_request_bytes = 1 << 20 }, &hits, "POST /echo HTTP/1.1\r\nHost: t\r\nContent-Encoding: identity\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, one, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, one, "abc"));
 }
 
 // ── tests (offline — inbound trailer verification, backlog 2026-09-28) ─────
