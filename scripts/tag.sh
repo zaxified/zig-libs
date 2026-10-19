@@ -231,3 +231,4 @@ New modules, campaigns that touched everything, defect classes closed, APIs that
 moved. Any number here is a claim: count it, do not estimate it. >>>"
 
 echo "tag.sh: created '$tag'. Not pushed — that is the owner's call."
+echo "tag.sh: fill in WHAT CHANGED first (git tag -a -f $tag); scripts/hooks/pre-push refuses the placeholder."

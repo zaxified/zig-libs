@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Refuse to push a release tag whose message still holds tag.sh's placeholder.
+#
+# scripts/tag.sh writes "WHAT CHANGED SINCE <prev>: <<< fill this in before
+# pushing ... >>>" into the annotated tag's message; the owner fills it in with
+# `git tag -a -f <tag>` while the tag is still local. Once pushed, the message
+# is permanent (tag 2026-10-19 went out with the placeholder; the Release text
+# had to carry the section instead). Enabled by core.hooksPath=scripts/hooks.
+set -euo pipefail
+
+bad=0
+while read -r local_ref local_sha _remote_ref _remote_sha; do
+    [[ "$local_ref" == refs/tags/* ]] || continue
+    [[ "$local_sha" =~ ^0+$ ]] && continue   # deleting a remote tag
+    [[ "$(git cat-file -t "$local_sha")" == tag ]] || continue
+    if git cat-file -p "$local_sha" | grep -qF '<<< fill this in'; then
+        echo "pre-push: ${local_ref#refs/tags/}: the tag message still holds tag.sh's \"WHAT CHANGED\" placeholder." >&2
+        echo "          Fill it in first: git tag -a -f ${local_ref#refs/tags/} <commit> (keep the rest of the message)." >&2
+        bad=1
+    fi
+done
+exit "$bad"
