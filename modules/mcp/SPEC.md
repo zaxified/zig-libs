@@ -419,6 +419,14 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 `URLElicitationRequiredError` (-32042) is exposed as a code but not as a helper that builds its
 `data.elicitations` payload.
 
+- **Requested (bxp, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
+  one** (`src/root.zig` `strArg`: null for both). A handler can only answer "missing 'config'" to
+  `"config": 5`; bxp works around it by inspecting `call.args` itself (`bxp-mcp/src/tools.zig`
+  `wrongType`/`reqStr`, marked `zig-libs request: mcp`). Proposed: `ToolCall.strArgChecked(key)`
+  returning `union(enum) { absent, value: []const u8, wrong_type }` (same on `PromptRequest`), and
+  optionally `requireStr(key)` writing "'<key>' must be a string" / "missing '<key>'" via `fail`.
+  JSON-Schema validators and other MCP SDKs report type errors apart from missing properties.
+
 **Survey 2026-09-30 — missing and it matters** (all fit CONVENTIONS §2: pure Zig, std only):
 
 - **Spec revision 2026-07-28 — M1–M4 DONE 2026-09-30** (dual-era dispatch, `server/discover`, `resultType`,
