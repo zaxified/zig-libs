@@ -1,6 +1,6 @@
-# std.Thread - Threading and Concurrency API Reference (0.16)
+# std.Thread - Threading and Concurrency API Reference (0.17.0; "0.16" marks what changed in 0.16)
 
-Thread spawning and synchronization in Zig 0.16.
+Thread spawning and synchronization in Zig 0.17.0.
 
 ## Critical: Sync Primitives Removed From std.Thread (0.16)
 
@@ -436,6 +436,7 @@ fn parallelMap(
     comptime mapFn: fn (T) U,
 ) ![]U {
     const results = try allocator.alloc(U, items.len);
+    errdefer allocator.free(results);
     var group: std.Io.Group = .init;
 
     for (items, 0..) |item, i| {

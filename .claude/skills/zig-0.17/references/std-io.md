@@ -442,6 +442,48 @@ var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{}); // was De
 defer _ = gpa.deinit();
 ```
 
+### Wrapping an `Io` (test doubles, custom backends)
+
+A wrapper copies a base `std.Io.VTable` and replaces some entries. If the replacements are
+found by *name* (every `pub` declaration of an `Overrides` struct that matches a vtable field),
+an entry that std folds away or renames in a new release stops matching, the code still
+compiles, and the override is never installed: in 0.17 `netRead`/`netWrite`/`netSend` became
+cases of `operate`, and a wrapper overriding them by name sent every socket read and write to
+the base backend without an error. Refuse an unmatched name at compile time:
+
+```zig
+const std = @import("std");
+
+fn buildVtable(comptime base: *const std.Io.VTable, comptime Overrides: type) std.Io.VTable {
+    var vt = base.*;
+    inline for (@typeInfo(Overrides).@"struct".decl_names) |name| {
+        if (!@hasField(std.Io.VTable, name))
+            @compileError("Overrides." ++ name ++ " names no std.Io.VTable entry");
+        @field(vt, name) = @field(Overrides, name);
+    }
+    return vt;
+}
+
+const Wrap = struct {
+    pub fn operate(userdata: ?*anyopaque, op: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+        // switch (op) { .net_read => ..., else => {} }, then forward
+        return std.Io.failing.vtable.operate(userdata, op);
+    }
+    // pub fn netRead(...) would stop the build: no such entry in 0.17
+};
+
+test "an override of a real entry is installed" {
+    const vt = comptime buildVtable(std.Io.failing.vtable, Wrap);
+    try std.testing.expect(vt.operate == &Wrap.operate);
+}
+```
+`decl_names` lists only `pub` declarations on 0.17.0 (a non-`pub` function in `Overrides` is absent
+from it, probed), so a non-`pub` override is skipped silently: the guard never sees it and the
+entry is not installed. Make every override `pub`.
+Check the guard once with a stray declaration (negative control): the build must stop with the
+`@compileError`. Probed on 0.17.0 (both the installed override and the stray `netRead`
+failing the build).
+
 > The `std.Io` APIs are young and changed between 0.15, 0.16 and 0.17 — pin the toolchain
 > (`build.zig.zon` `minimum_zig_version`). Grep the actual std for current shapes:
 > `<lib_dir>/std/{Io.zig,Io/Dir.zig,process.zig,start.zig}` (`zig env` prints `lib_dir`; std ships with

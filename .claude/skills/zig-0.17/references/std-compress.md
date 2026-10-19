@@ -42,14 +42,17 @@ const flate = std.compress.flate;
 
 // Decompress gzip data
 var input: std.Io.Reader = .fixed(compressed_data);
-var output: std.Io.Writer.Allocating = .init(allocator);
-defer output.deinit();
 
 var decompress: flate.Decompress = .init(&input, .gzip, &.{});
-_ = try decompress.reader.streamRemaining(&output.writer);
-
-const decompressed = output.written();
+// Cap the output: a few KB of input can expand to GBs. Past the cap the call fails
+// with error.StreamTooLong (a corrupt stream gives error.ReadFailed)
+const decompressed = try decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+defer allocator.free(decompressed);
 ```
+
+**Untrusted input:** always cap the output as above. `streamRemaining` into an `Allocating`
+writer or a file has no limit, so a decompression bomb (a few KB in, GBs out) exhausts memory
+or disk.
 
 ### With History Buffer
 
@@ -125,14 +128,25 @@ Zstandard (zstd) decompression. High compression ratio with fast decompression.
 const zstd = std.compress.zstd;
 
 var input: std.Io.Reader = .fixed(compressed_data);
-var output: std.Io.Writer.Allocating = .init(allocator);
-defer output.deinit();
 
-var decompress: zstd.Decompress = .init(&input, &.{}, .{});
-_ = try decompress.reader.streamRemaining(&output.writer);
-
-const decompressed = output.written();
+// The decompressor needs its own buffer (window + one block, about 8.1 MiB), see below.
+const window = try allocator.alloc(u8, zstd.default_window_len + zstd.block_size_max);
+defer allocator.free(window);
+var decompress: zstd.Decompress = .init(&input, window, .{});
+// Cap the output: a few KB of input can expand to GBs. Past the cap the call fails with
+// error.StreamTooLong (a corrupt stream gives error.ReadFailed)
+const decompressed = try decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+defer allocator.free(decompressed);
 ```
+
+**Never use the empty-buffer form (`.init(&input, &.{}, .{})`) on hostile input.** On 0.17.0
+the decompressor checks the limit against a compressed block's *compressed* size
+(`compress/zstd/Decompress.zig:300`) while the block expands to up to 128 KiB, so `stream`
+returns more than `limit` and `Reader.stream` asserts on it (`Io/Reader.zig:177`). Probe: with
+the empty buffer and a cap of 1000 bytes, `allocRemaining` panicked (`reached unreachable code`)
+in Debug and ReleaseSafe, and past the cap it can fail with `StreamTooLong` or `ReadFailed`
+depending on where the cap falls and how the attacker laid out the blocks. With its own buffer
+every cap from 1000 bytes to the exact size gave `StreamTooLong` and the exact size succeeded.
 
 ### With Custom Window Size
 
@@ -271,13 +285,10 @@ fn decompressGzip(allocator: Allocator, compressed: []const u8) ![]u8 {
     const flate = std.compress.flate;
 
     var input: std.Io.Reader = .fixed(compressed);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
 
     var decompress: flate.Decompress = .init(&input, .gzip, &.{});
-    _ = try decompress.reader.streamRemaining(&output.writer);
-
-    return output.toOwnedSlice();
+    // Cap the output (error.StreamTooLong past it; a corrupt stream gives error.ReadFailed)
+    return decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
 }
 ```
 
@@ -288,13 +299,10 @@ fn decompressZlib(allocator: Allocator, compressed: []const u8) ![]u8 {
     const flate = std.compress.flate;
 
     var input: std.Io.Reader = .fixed(compressed);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
 
     var decompress: flate.Decompress = .init(&input, .zlib, &.{});
-    _ = try decompress.reader.streamRemaining(&output.writer);
-
-    return output.toOwnedSlice();
+    // Cap the output (error.StreamTooLong past it; a corrupt stream gives error.ReadFailed)
+    return decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
 }
 ```
 
@@ -305,13 +313,13 @@ fn decompressZstd(allocator: Allocator, compressed: []const u8) ![]u8 {
     const zstd = std.compress.zstd;
 
     var input: std.Io.Reader = .fixed(compressed);
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    errdefer output.deinit();
 
-    var decompress: zstd.Decompress = .init(&input, &.{}, .{});
-    _ = try decompress.reader.streamRemaining(&output.writer);
-
-    return output.toOwnedSlice();
+    // Own buffer, not `&.{}`: with an empty buffer std 0.17.0 can overshoot the limit and panic
+    const window = try allocator.alloc(u8, zstd.default_window_len + zstd.block_size_max);
+    defer allocator.free(window);
+    var decompress: zstd.Decompress = .init(&input, window, .{});
+    // Cap the output (error.StreamTooLong past it; a corrupt stream gives error.ReadFailed)
+    return decompress.reader.allocRemaining(allocator, .limited(256 * 1024 * 1024));
 }
 ```
 
@@ -338,8 +346,21 @@ fn decompressToFile(
     var output_buf: [4096]u8 = undefined;
     var output_writer = output_file.writer(io, &output_buf);
 
-    var decompress: flate.Decompress = .init(&input_reader.interface, container, &.{});
-    _ = try decompress.reader.streamRemaining(&output_writer.interface);
+    // A decompressor that writes to a file needs its own window: with `&.{}` the destination
+    // writer would have to hold the history, and a 4 KiB file buffer panics on a big stream.
+    var window: [flate.max_window_len]u8 = undefined;
+    var decompress: flate.Decompress = .init(&input_reader.interface, container, &window);
+    // Cap the output: stream() moves at most `limit` bytes per call; one byte more than the cap
+    // tells "too large" from "exactly max_output".
+    const max_output: u64 = 1024 * 1024 * 1024;
+    var total: u64 = 0;
+    while (true) {
+        total += decompress.reader.stream(&output_writer.interface, .limited64(max_output + 1 - total)) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| return e,
+        };
+        if (total > max_output) return error.OutputTooLarge; // delete the partial output file
+    }
     try output_writer.interface.flush();
 }
 ```

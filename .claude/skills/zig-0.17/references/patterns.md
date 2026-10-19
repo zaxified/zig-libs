@@ -63,8 +63,9 @@ Comprehensive patterns for writing idiomatic Zig code. This reference contains b
 
 #### Allocator Setup
 ```zig
-// Safe allocator (development - detects leaks, use-after-free; never reuses memory)
-// In main(init: std.process.Init) prefer init.gpa. Production: std.heap.smp_allocator.
+// Safe allocator (development - detects leaks, use-after-free; a bucket returns to the backing only when all its allocations are freed)
+// In main(init: std.process.Init) prefer init.gpa. std.heap.smp_allocator is the ReleaseFast
+// candidate, but soak-test its RSS first (it grew +5.4 MB/min in one project, SKILL.md "Naming Changes").
 // Note: DebugAllocator was renamed to SafeAllocator in 0.17
 var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
 defer _ = gpa.deinit();
@@ -139,6 +140,8 @@ try stdout.flush();
 ### HTTP Client
 
 See [std-http.md](std-http.md) for full documentation including server, WebSocket, and compression.
+Over https, std TLS does not verify that an issuer is a CA (a holder of any trusted leaf can
+impersonate any host): see "TLS Configuration" there before relying on it.
 
 ```zig
 // Quick fetch (simple requests)

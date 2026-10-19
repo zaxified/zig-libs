@@ -79,7 +79,8 @@ while (try it.next()) |file| {
         try it.streamRemaining(file, &file_writer.interface);
         try file_writer.interface.flush();
 
-        // Option 2: Stream to allocated buffer
+        // Option 2: Stream to allocated buffer. file.size comes from the archive: cap it first
+        if (file.size > 64 * 1024 * 1024) return error.FileTooLarge;
         var content: std.Io.Writer.Allocating = .init(allocator);
         defer content.deinit();
         try it.streamRemaining(file, &content.writer);
@@ -233,7 +234,9 @@ var src_buf: [4096]u8 = undefined;
 var src_reader = src_file.reader(io, &src_buf);
 const stat = try src_file.stat(io);
 // Stat.mtime is `Io.Timestamp` (nanoseconds); writeFile wants POSIX seconds.
-const mtime_secs: u64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
+// i96 -> u96 -> u64, each step range-checked (signed -> narrower unsigned @intCast: #37131)
+const secs = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
+const mtime_secs: u64 = std.math.cast(u64, std.math.cast(u96, secs) orelse 0) orelse 0;
 
 try w.writeFile("data.txt", &src_reader, mtime_secs);
 
@@ -425,7 +428,8 @@ fn createTarFromDir(io: std.Io, allocator: Allocator, source_dir: std.Io.Dir, ro
                 var buf: [4096]u8 = undefined;
                 var file_reader = file.reader(io, &buf);
                 const stat = try file.stat(io);
-                const mtime_secs: u64 = @intCast(@divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s));
+                const secs = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
+                const mtime_secs: u64 = std.math.cast(u64, std.math.cast(u96, secs) orelse 0) orelse 0; // #37131
                 try w.writeFile(entry.path, &file_reader, mtime_secs);
             },
             .sym_link => {
@@ -457,10 +461,12 @@ fn extractFile(tar_data: []const u8, target_name: []const u8, allocator: Allocat
 
     while (try it.next()) |file| {
         if (file.kind == .file and std.mem.eql(u8, file.name, target_name)) {
+            // file.size comes from the archive: cap it before allocating
+            if (file.size > 64 * 1024 * 1024) return error.FileTooLarge;
             var content: std.Io.Writer.Allocating = .init(allocator);
             errdefer content.deinit();
             try it.streamRemaining(file, &content.writer);
-            return content.toOwnedSlice();
+            return try content.toOwnedSlice();
         }
     }
     return null;

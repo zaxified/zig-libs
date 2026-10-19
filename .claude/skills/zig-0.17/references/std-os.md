@@ -1,4 +1,4 @@
-# std.os - OS-Specific APIs Reference (0.16)
+# std.os - OS-Specific APIs Reference (0.17.0; the 0.16 changes below still hold)
 
 Thin wrappers around OS-specific APIs. `std.os` itself shrank a lot in 0.16 — it is now just a namespace of six platform submodules, nothing else at its own top level. Converts errno-style error codes to Zig errors, provides slice-accepting APIs alongside null-terminated ones, and offers cross-platform abstractions for POSIX systems (via `std.posix`).
 

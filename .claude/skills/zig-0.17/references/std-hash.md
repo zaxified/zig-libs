@@ -397,12 +397,13 @@ const h64_seeded = cityhash.CityHash64.hashWithSeed("data", 12345);
 
 ### SipHash
 
-Cryptographically strong for hash table protection:
+A keyed PRF for hash table protection (hash flooding). The protection is only as good as the
+key's secrecy: draw the key from `try io.randomSecure(&key)` (std-random.md), never ship a constant.
 
 ```zig
 const std = @import("std");
 
-// Requires 128-bit key
+// Requires 128-bit key. All-zero here only to keep the example short: use a random key.
 const key: [16]u8 = @splat(0);
 
 // One-shot: toInt(msg, &key) (there is no `.hash(key, data)`)
@@ -474,6 +475,7 @@ fn bloomHashes(data: []const u8, out: []u64) void {
 
 ```zig
 fn consistentHash(key: []const u8, num_buckets: u32) u32 {
+    if (num_buckets == 0) return 0; // otherwise b stays -1 below
     const hash = std.hash.XxHash64.hash(0, key);
     // Jump consistent hash
     var b: i64 = -1;
@@ -485,7 +487,10 @@ fn consistentHash(key: []const u8, num_buckets: u32) u32 {
         j = @intFromFloat(@as(f64, @floatFromInt(b + 1)) *
             (@as(f64, 1 << 31) / @as(f64, @floatFromInt((h >> 33) + 1))));
     }
-    return @intCast(b);
+    // b is never negative here (num_buckets > 0): go through the same-width unsigned type (signed -> narrower
+    // unsigned @intCast is miscompiled in optimized builds, #37131, see zig-gotchas.md)
+    const ub: u64 = @intCast(b);
+    return @intCast(ub);
 }
 ```
 

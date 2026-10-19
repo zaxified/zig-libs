@@ -93,7 +93,7 @@ try testing.expectFmt("hello world", "{s} {s}", .{"hello", "world"});
 
 ## Testing Allocator
 
-`std.testing.allocator` is a `std.heap.SafeAllocator` (0.17; `DebugAllocator` before) that detects memory leaks, double frees and use-after-free. **Only available in test builds.** The test runner creates a fresh one for every test. It never reuses memory, so a test that allocates and frees in a loop grows in RSS with its total allocation; writes after free are checked in every optimize mode; allocation stack traces are recorded only in Debug; and since 0.17 a leak fails the test in every optimize mode, ReleaseFast included.
+`std.testing.allocator` is a `std.heap.SafeAllocator` (0.17; `DebugAllocator` before) that detects memory leaks, double frees and use-after-free. **Only available in test builds.** The test runner creates a fresh one for every test. It hands large allocations and emptied 8 KiB buckets back to `page_allocator`, so an alloc/free loop stays flat (probe on 0.17.0: 2 000 000 x 64 B, RSS 700 -> 708 KiB in ReleaseSafe), but slots inside a bucket are never reused, so long-lived small allocations mixed with short-lived ones pin buckets; writes after free are checked in every optimize mode; allocation stack traces are recorded only in Debug; and since 0.17 a leak fails the test in every optimize mode, ReleaseFast included.
 
 ```zig
 test "with allocator" {

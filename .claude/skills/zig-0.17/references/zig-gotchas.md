@@ -27,6 +27,71 @@ b.graph.poisonCache(); // configuration now reruns on every zig build
 `b.findProgram` poisons the cache itself; `b.findProgramLazy` does not. One stale run can be
 forced with `zig build --cache-poison=poisoned`.
 
+### Signed to narrower unsigned `@intCast` / `std.math.cast` is poison in optimized builds (#37131)
+Open compiler issue #37131 (a fix PR was open and unmerged on 2026-10-18), present in 0.17.0 (0.16 emitted a plain `trunc`). The frontend lowers a cast from a
+**signed** integer to a **narrower unsigned** one to LLVM `trunc nsw`; for an unsigned
+destination it should be `nuw`. `nsw` claims the value fits as a *signed* number, so every
+value in `[2^(N-1), 2^N)` is poison and LLVM may fold away whatever depends on it. Debug does
+not show it. It does not depend on the target (a migration saw it on x86_64 and aarch64) and the cast is
+fully defined by the language when the value was checked to fit first.
+
+```zig
+// WRONG (0.17): the range check below is folded away in ReleaseSafe/ReleaseFast
+noinline fn f(eb: i64) u32 {
+    if (eb < 0 or eb > 0xFFFF_FFFF) return 1;
+    const v: u32 = @intCast(eb);      // std.math.cast(u32, eb) emits the same `trunc nsw`
+    if (v > 0x7FFF_FFFF) return 2;    // eb = 0xFFFF_FFFF: Debug 2, ReleaseSafe/ReleaseFast 0
+    return 0;
+}
+// RIGHT: the narrowing is unsigned to unsigned (`trunc nuw`)
+noinline fn g(eb: i64) u32 {
+    if (eb < 0 or eb > 0xFFFF_FFFF) return 1;
+    const w: u64 = @intCast(eb);
+    const v: u32 = @intCast(w);       // or @truncate(@as(u64, @bitCast(eb))) after the check
+    if (v > 0x7FFF_FFFF) return 2;
+    return 0;
+}
+```
+Probe on 0.17.0 (`f` and `g` called with `0xFFFF_FFFF` passed through
+`std.mem.doNotOptimizeAway(&y)`): Debug passes; ReleaseSafe and ReleaseFast fail for `f`
+(`expected 2, found 0`); `g`, the `@truncate` form and `std.math.cast(u32, w)` via a `u64` pass in
+all three modes. `f` with `std.math.cast(u32, eb) orelse return 3` in its place passed in this
+shape: the IR is `trunc nsw` all the same, whether a body fails is the layout dependence
+described below. A `std.math.cast` body that did fail: an SNMP-style
+`std.math.cast(u32, eb) orelse return error.X; if (v > maxInt(i32)) return error.InvalidValue`
+after a DER integer decode, ReleaseSafe/ReleaseFast `expected error.InvalidValue, found
+4294967295`. A plain `var x: i64 = 0xFFFF_FFFF; _ = &x;` argument to `f` did not fail either;
+as an `export fn` the optimized IR shows the `> 0x7FFF_FFFF` branch folded away.
+
+**The range check belongs in every spelling.** `@intCast` of a negative signed value to the
+same-width unsigned type is illegal behaviour (panic in safe builds, a wrong value in
+ReleaseFast), so `const w: u64 = @intCast(x)` is only right after `x < 0` was excluded. The
+spelling that carries its own check, run in Debug, ReleaseSafe and ReleaseFast:
+```zig
+const w = std.math.cast(u64, x) orelse return error.OutOfRange; // negative -> error
+const v = std.math.cast(u32, w) orelse return error.OutOfRange; // too large -> error
+```
+
+Flags per cast shape in the pre-optimization IR (re-run on 0.17.0 with `--verbose-llvm-ir` in
+ReleaseFast and with Debug `-femit-llvm-ir`, same classification; 0.16.0: a plain `trunc`
+everywhere): `i64 -> u32`, `i32 -> u16`, `i16 -> u8`, `isize -> u8`:
+`trunc nsw` (wrong); `i64 -> i32`: `nsw` (right); `u64 -> u32`, `usize -> u8`, `u64 -> i32`:
+`nuw` (right); `i64 -> u64`: no trunc; `i64 -> u64 -> u32` as two `@intCast`s: `nuw`.
+
+Whether it bites depends on layout: the poison is always there, but LLVM exploits it only in
+some shapes (one suite passed with the narrowing in a `noinline` helper and failed
+with the same body in an `inline fn`). A test that does not fail is no evidence
+that a site is fine, and no test can force LLVM to exploit the poison: pin the boundary
+values, and prefer the unsigned-to-unsigned spelling at every site. Shapes that lower to the
+same cast and were found in a 57-module codebase: `@intCast`, `std.math.cast`,
+`std.math.clamp`, `@max(0, x)` / `@min` whose result type is narrowed, `std.json` into unsigned
+fields from a `Value` (`parseFromValue`) or from a float-formatted number such as `4e9`
+(`json/static.zig`; plain integer text goes through `std.fmt.parseInt` and is fine), and `std.math.pow` through `ldexp`
+(`math/ldexp.zig`). A tree-wide detector scans pre-optimization IR (Debug with
+`-femit-llvm-ir` is enough: the classification does not depend on the mode) for a `trunc nsw`
+whose source is bounded below by `icmp sge x, 0`; an unsigned destination with an `nsw` trunc is
+this bug. Remove the workarounds once a release fixes it, and name the issue in their comment.
+
 ### `zig build` lost flags scripts use
 Measured ("unrecognized argument"): `--global-cache-dir` (use `ZIG_GLOBAL_CACHE_DIR`),
 `--zig-lib-dir` (now `--zig-lib=`, first argument only), `--build-runner`, `--verbose-llvm-bc`.
@@ -53,14 +118,17 @@ and `-OReleaseSafe` still work — keep the old spellings in scripts that must a
 - **`std.mem.containsAtLeastScalar(T, list, element, minimum)`** swapped its last two
   parameters. With `u8`/`usize`-compatible integers an old call still compiles and answers a
   different question.
-- **`std.testing.allocator` never reuses memory** (a fresh `SafeAllocator` per test).
-  Use-after-free turns into a segfault or a panic much more often — good — but a test that
-  allocates and frees in a long loop grows its RSS with the total it allocated, not its peak.
-  Writes after free are checked in every mode; allocation stack traces exist only in Debug.
-  A fuzz or property loop that runs thousands of seeds inside one test should create one
+- **`std.testing.allocator` is a fresh `SafeAllocator` per test that hands memory back.** It
+  returns a large allocation and every emptied 8 KiB bucket to `page_allocator`, so a long
+  alloc/free loop stays flat (probe on 0.17.0, 2 000 000 x 64 B in one test: RSS 700 -> 708 KiB
+  in ReleaseSafe). Slots inside a bucket are never reused, so long-lived small allocations
+  mixed with short-lived ones pin whole buckets (same probe, 1 in 64 kept: 195 KiB live, RSS
+  748 -> 14988 KiB). Use-after-free turns into a segfault or a panic much more often (good);
+  writes after free are checked in every mode; allocation stack traces exist only in Debug.
+  A fuzz or property loop that runs thousands of seeds inside one test can still create one
   `std.heap.SafeAllocator` per seed (`.init(gpa, .{ .stack_trace_frames = 0 })`, `deinit()` returns
-  the leak count, `deinitLog(false)` is the silent form) — with `testing.allocator` the RSS
-  grows with every seed and a memory-capped job looks like a hang or flaky kill. Because
+  the leak count, `deinitLog(false)` is the silent form) for per-seed leak attribution and to
+  drop pinned buckets between seeds. Because
   `SafeAllocator` can resize in place, `FailingAllocator` `fail_index` values pinned in 0.16
   tests may no longer be reached: take them from `alloc_index` of a clean run.
 - **`Reader.allocRemaining(gpa, .limited(n))` accepts exactly `n` bytes** (0.16 failed at `n`;
@@ -72,6 +140,10 @@ and `-OReleaseSafe` still work — keep the old spellings in scripts that must a
   (`allocRemaining` maps `.unlimited` through unchanged and adds the 1 itself, `Io/Reader.zig`
   `allocRemaining`), so a call site that wrote `cap +| 1` or special-cased `maxInt` to avoid the
   overflow should pass `.limited(cap)` and map an "unbounded" cap to `.unlimited`.
+- **`std.json.parseFromSlice(std.json.Value, ...)` needs a little more memory in Debug.** A 35-byte
+  object document took 2052 bytes from a `FixedBufferAllocator` on 0.16.0 and 2228 on 0.17.0
+  (Debug, same probe file; ReleaseFast: 2048 bytes on both; a migration test with a 4 KiB arena for a 47-byte document ran out of
+  memory). Size fixed buffers and arenas for `std.json` with a margin, not to the byte.
 - **A struct returned by value must not hold a slice into its own array field.** This is
   undefined in every version; 0.17 exposed it in a migration (the copy happens, so `.val = self.buf[0..k]` points at the
   callee's dead frame) (found as a panic in a websocket parameter iterator). Store an offset and
@@ -84,7 +156,7 @@ and `-OReleaseSafe` still work — keep the old spellings in scripts that must a
   108 s and 115 s, Zig 0.17.0, x86_64 Linux, 8-core machine; once per toolchain and global cache). A fresh CI runner pays it on every job unless
   the global cache (`~/.cache/zig`) is cached; a CI script that gives every lane its own
   `ZIG_GLOBAL_CACHE_DIR` pays it once per lane. On a developer machine the cache usually already
-  has the maker from another 0.17 project (a first build of a small project, zig-fping ~4.3k
+  has the maker from another 0.17 project (a first build of a small project, ~4.3k
   lines, took 5.7 s in total; maker already in the global cache, Zig 0.17.0, x86_64 Linux, 8-core machine).
 - **Custom build steps (`makeFn`) no longer exist** — see SKILL.md "Build system" for the
   host-tool + Run-step replacement.
@@ -434,11 +506,33 @@ which LLVM 22 unswitches into jumps (16 valgrind contexts in one ctgrind positiv
 harness, ReleaseFast, 0.17.0; 0.16's `cmov(ct.eql)` select also compiled to jumps, but its context count for the same harness was not recorded).
 The 0.17.x length fix below does not make the window select constant-time.
 
-### `Certificate.verify` does not check that the issuer is a CA
+### std TLS does not check that an issuer is a CA: `std.http.Client` over https is open to a man in the middle
 
-Still true in 0.17.0: `std.crypto.Certificate.Parsed.verify` checks name chaining, validity
-dates and the signature, but not basicConstraints, so a leaf certificate can sign another
-certificate. Code that builds its own chain check must reject an issuer without `CA:TRUE`.
+Still true in 0.17.0, and it **also hits code that never builds its own chain check**.
+`std.crypto.Certificate.Parsed.verify` (`crypto/Certificate.zig:259-308`) checks the issuer
+name, the validity dates and the signature, and nothing else: basicConstraints, keyUsage and
+pathLen are recognised by OID but never read or enforced (`basic_constraints` is only an enum tag,
+`Certificate.zig:124,145,149`). `std.crypto.tls.Client` uses exactly this check for every hop
+(`crypto/tls/Client.zig:651` `prev_cert.verify(subject, now_sec)` between the certificates the
+server sends, `:667` `ca.bundle.verify(subject, now_sec)` for the trust anchor, via
+`Certificate/Bundle.zig:32-43`), and `std.http.Client` builds on it. So anyone who holds a
+certificate that a trusted CA issued to them, for any host name, can use it to sign a
+certificate for a different host and present the pair as the chain: the client accepts it.
+That is an impersonation by an active network attacker; it is read from the source, and the release review reproduced it on a loopback
+server (a CA:FALSE leaf signing a certificate for another name was accepted). Consequences:
+
+- Do not rely on `std.crypto.tls.Client` or `std.http.Client` over https alone when the
+  server's authenticity matters (credentials, updates, payments, remote commands).
+- Pin the server's certificate (a trust bundle that holds only that certificate, see
+  std-http.md "TLS Configuration", compiled and run on 0.17.0 against a loopback
+  `openssl s_server`), or use a TLS library that validates the whole chain. A dependency is
+  the user's decision: ask the user before adding one. The pin works only for a self-signed
+  server certificate that is its own anchor; a CA-issued leaf alone is refused, putting the
+  intermediate or root CA into the bundle brings the impersonation back, and
+  `client.now = null` on a pinned client drops the pin.
+- Code that builds its own chain check must reject an issuer without `CA:TRUE`.
+- Separate defects of the same client: see the `readIndirect` entry below (do not use the
+  client against untrusted servers).
 
 ### `std.crypto` leaves key schedules on the stack
 
@@ -541,6 +635,17 @@ test "the carry-less multiply path" {
 The same applies to every other gate on such a path: the dispatcher, `available()`-style
 queries and test helpers all test the comptime condition before the run-time one.
 
+### One global package cache shared by 0.16 and 0.17
+
+Seen once, cause not isolated: after 0.17 had fetched an archive (an SQLite amalgamation zip)
+into the shared global cache, a *fresh* 0.16 checkout (a new git worktree, empty `zig-pkg/`)
+failed with `hash mismatch: manifest declares ... but the fetched package has ...`, and its
+`zig-pkg/<hash>/` kept the archive's top-level directory unstripped. Existing 0.16 checkouts
+with a filled `zig-pkg/` were unaffected, and copying the 0.16-unpacked package directory in
+fixed it. While both toolchains are in use, pass a separate `ZIG_GLOBAL_CACHE_DIR=... zig build` per
+toolchain (SKILL.md recommends the shared cache otherwise: that applies when only one toolchain
+fetches), or ask the user before changing their environment.
+
 ### Fixed in 0.17.0
 
 - Deleting `.zig-cache/o` no longer wedges `zig build`: the configurer reruns.
@@ -578,6 +683,9 @@ queries and test helpers all test the comptime condition before the run-time one
   `key_update` message on a TLS 1.2 connection reads `p.tls_1_3`, the inactive union field. The
   KeyUpdate body-length check (`handshake.len != 1`) is present. If you embed this client for
   untrusted servers, patch a copy (length guard before `cleartext[ct_i]`, reject `key_update` unless TLS 1.3), or do not use it against untrusted servers. A reader in front does not help: both paths act on the decrypted record.
+- **`std.crypto.tls.Client` rejects an all-zero inner plaintext in the encrypted handshake**
+  with `error.TlsDecodeError` (`Client.zig:381`, `trimmed_len == 0`; the 0.16 client had no such
+  check). A test that pins client error names against a fake server sees the new name.
 - **`std.crypto.Certificate.der.Tag.sequence_of` is gone**; the tag is `set` (`= 17`,
   `crypto/Certificate.zig` `Tag`). `rsa.PKCS1v1_5Signature.verify` / `rsa.PSSSignature.verify`
   take `sig: *const [modulus_len]u8` (0.16: `[modulus_len]u8` by value): pass `&sig` (`Certificate.zig` `verify`).
@@ -589,7 +697,7 @@ queries and test helpers all test the comptime condition before the run-time one
 
 Taken from the 0.17.x branch commit log and the project's issue list. **Per the commit
 message, not reproduced here** unless a row says otherwise; each row names the commit.
-Check which point release you have; the last row is an open pull request, not a branch fix.
+Check which point release you have; the last two rows are open, not branch fixes.
 
 | Commit | Symptom (as the message states it) |
 |---|---|
@@ -605,3 +713,4 @@ Check which point release you have; the last row is an open pull request, not a 
 | `7c793c2` | `checkAllAllocationFailures` / `NondeterministicMemoryUsage` (see std-testing.md for a workaround that was compiled and run) |
 | `12caf4e` | `powWithEncodedExponent` length leak (see above) |
 | `Io.Event.waitTimeout` spurious wakeups (#36912) | open pull request, not merged anywhere |
+| #37131 | issue open, fix PR open and unmerged when the inventory was taken (2026-10-18): signed to narrower unsigned `@intCast` is `trunc nsw` (reproduced here, see above) |

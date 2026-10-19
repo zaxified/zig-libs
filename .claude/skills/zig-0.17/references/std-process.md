@@ -1,6 +1,6 @@
 # std.process - Process Management API Reference
 
-Process spawning, environment variables, argument parsing, and system utilities in Zig 0.16.
+Process spawning, environment variables, argument parsing, and system utilities in Zig 0.17.0 (the 0.16 restructuring below is unchanged in 0.17.0 unless a section says otherwise).
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -63,11 +63,16 @@ pre-built), take `std.process.Init.Minimal` instead — it has just `.args` and
 
 ## Spawning Child Processes
 
-Every child-process operation needs an `Io` instance. Create one once (typically in
-`main`) and thread it through — the same pattern the networking APIs use:
+Every child-process operation needs an `Io` instance. In an executable use `init.io` from
+`main` and thread it through — the same pattern the networking APIs use. **A hand-built
+`Io.Threaded` must be given `.environ`: with a bare `.init(gpa, .{})` the child starts with an
+EMPTY environment** (probe on 0.17.0: `/usr/bin/env` printed 108 lines through `init.io` and 0
+lines through a bare `.init(gpa, .{})`). When you build your own `Io.Threaded` (e.g. to put it on
+another allocator), pass `.environ = init.minimal.environ` (and `.argv0`, see SKILL.md "Naming
+Changes"); without access to `init` (a library test harness) children get an empty environment:
 
 ```zig
-var threaded = std.Io.Threaded.init(gpa, .{});
+var threaded = std.Io.Threaded.init(gpa, .{ .environ = init.minimal.environ });
 defer threaded.deinit();
 const io = threaded.io();   // io: std.Io
 ```

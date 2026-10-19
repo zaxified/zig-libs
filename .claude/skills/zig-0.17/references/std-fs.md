@@ -2,7 +2,7 @@
 
 File system operations in Zig 0.17 (same shape as 0.16). Covers files, directories, iteration, atomic writes, and paths.
 
-**0.16 change:** almost everything that used to live under `std.fs` moved to `std.Io.Dir` / `std.Io.File`, and nearly every method now takes an `io: Io` argument (obtained from an `Io` implementation, e.g. `var threaded: std.Io.Threaded = .init(gpa, .{}); const io = threaded.io();`), because the actual read/write/open syscalls go through it. Only `std.Io.Dir.path` (pure path-string manipulation, no I/O) is unchanged.
+**0.16 change:** almost everything that used to live under `std.fs` moved to `std.Io.Dir` / `std.Io.File`, and nearly every method now takes an `io: Io` argument (obtained from an `Io` implementation, e.g. `var threaded: std.Io.Threaded = .init(gpa, .{}); const io = threaded.io();`; in an executable use `init.io` from `main`, since a bare `.init(gpa, .{})` starts child processes with an empty environment unless `.environ = init.minimal.environ` is passed), because the actual read/write/open syscalls go through it. Only `std.Io.Dir.path` (pure path-string manipulation, no I/O) is unchanged.
 
 ## Table of Contents
 - [Module Structure](#module-structure)

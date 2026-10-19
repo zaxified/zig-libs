@@ -293,7 +293,7 @@ const relative = "../g";
 @memcpy(aux_buf[0..relative.len], relative);
 
 const resolved = try std.Uri.resolveInPlace(base, relative.len, &aux_slice);
-// resolved.path.percent_encoded == "/a/g"
+// resolved.path.percent_encoded == "/b/g"  (RFC 3986: http://a/b/c/d;p?q + ../g = http://a/b/g)
 ```
 
 ### Resolution Examples (RFC 3986)

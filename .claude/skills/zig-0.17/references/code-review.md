@@ -77,6 +77,11 @@ These are **objective errors** that will cause compilation failures or guarantee
 - `Reader.allocRemaining(gpa, .limited(n))` accepts exactly `n` bytes (0.16 failed at `n`); a
   workaround such as `cap +| 1` now over-reads by one.
 - `@bitCast` of `@Vector(n, bool)` to an integer: lane i is bit i on every target.
+- `@intCast` / `std.math.cast` / `std.math.clamp` from a signed integer to a narrower *unsigned*
+  one (`i64` to `u32`): miscompiled in optimized builds (#37131), so a range check that depends
+  on the result can vanish, and Debug tests still pass. `std.math.cast` is not a fix for this
+  shape. Require the range-checked two-step spelling (`std.math.cast(u64, x) orelse ...` then
+  `std.math.cast(u32, w) orelse ...`), see zig-gotchas.md.
 - A struct returned by value holding a slice into its own array field: dangles (undefined in
   every version; 0.17 exposed it).
 - A hot `[N]u8` <-> wider-lane vector or >= 16-byte integer `@bitCast` (not `[4]u8`<->`u32` / `[8]u8`<->`u64`, a single load) compiles to a byte loop (correct but
@@ -333,6 +338,10 @@ fn convert(big: u64) u8 {
     return @intCast(big);
 }
 ```
+
+The examples above start from an unsigned value. From a *signed* value to a narrower unsigned
+type `std.math.cast` / `@intCast` is miscompiled in optimized builds in 0.17.0 (#37131): check
+`x >= 0` and cast to the same-width unsigned type first (zig-gotchas.md).
 
 ```zig
 // WRONG - .? without null proof
@@ -1559,7 +1568,7 @@ This pattern is common for context types passed to hash maps and other generic c
 
 | Pattern | Risk | Quick Check |
 |---------|------|-------------|
-| `@intCast(val)` | Runtime panic | Missing `std.math.cast` or bounds check |
+| `@intCast(val)` | Runtime panic | Missing `std.math.cast` or bounds check; signed to narrower unsigned: #37131 |
 | `.?` unwrap | Runtime panic | Not guarded by `if` or `orelse` |
 | `catch unreachable` | Runtime panic | On allocator calls |
 | `return &local` | Dangling pointer | Returning address of stack variable |

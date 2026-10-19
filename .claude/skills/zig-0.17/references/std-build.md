@@ -520,6 +520,17 @@ const include_path = zlib.path("include");
 exe.root_module.addIncludePath(include_path);
 ```
 
+A fetched archive that holds a single top-level directory is unpacked with that directory
+stripped (`Maker/Fetch.zig` takes the package root from the unpack result, not the temporary
+directory), so the path is `dep.path("sqlite3.h")`, not
+`dep.path("sqlite-amalgamation-3490200/sqlite3.h")` as unpacking the archive by hand suggests
+(a migration build failed with `FileNotFound` on the long form). A dependency that is only a
+source archive needs no build script of its own: declare it in `build.zig.zon` with its
+`.url`/`.hash`, then compile it yourself in the consumer, e.g.
+`lib.root_module.addCSourceFile(.{ .file = dep.path("sqlite3.c"), .flags = &.{"-std=c99"} })` and
+`b.addTranslateC(...)` on the header (the shape one project used instead of a wrapper package that
+did not configure on 0.17; not re-run for this reference).
+
 ### Lazy Dependencies
 Lazy dependencies are only fetched when actually used, avoiding unnecessary downloads for platform-specific or optional dependencies.
 

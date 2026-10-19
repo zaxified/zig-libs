@@ -35,6 +35,9 @@ Convert between integer types. Runtime safety check if value doesn't fit.
 const big: u64 = 100;
 const small: u8 = @intCast(big);  // OK if value fits
 ```
+From a signed to a narrower *unsigned* type (`i64` to `u32`) `@intCast` and `std.math.cast` are
+miscompiled in optimized builds in 0.17.0 (#37131): cast to the same-width unsigned type first,
+each step range-checked, see zig-gotchas.md.
 
 ### @floatCast
 ```zig
@@ -754,8 +757,12 @@ pub fn build(b: *std.Build) void {
 // src/main.zig
 const c = @import("c");
 ```
-`b.addTranslateC` still exists but is deprecated in favor of the package. More options:
-https://codeberg.org/ziglang/translate-c#options
+`b.addTranslateC(.{ .root_source_file = b.path("src/c.h"), .target = target, .optimize = optimize })`
+still exists (the toolchain ships the translator; `.createModule()` gives the module). The
+release notes call it deprecated in favor of the package, but the 0.17.0 std source carries no
+deprecation marker. The built-in step needs no dependency and no network; the package has more
+options: https://codeberg.org/ziglang/translate-c#options (SKILL.md, "Removed syntax and
+builtins", has the details and what was and was not run).
 
 ### @extern
 ```zig

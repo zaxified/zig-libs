@@ -1,6 +1,6 @@
 # std.zip - ZIP Archive API Reference
 
-ZIP archive reading and extraction in Zig 0.15.x. Supports ZIP and ZIP64 formats with store and deflate compression.
+ZIP archive reading and extraction in Zig 0.17.0. Supports ZIP and ZIP64 formats with store and deflate compression.
 
 ## Table of Contents
 - [Module Structure](#module-structure)
@@ -83,6 +83,8 @@ var iter = try std.zip.Iterator.init(&file_reader);
 var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 while (try iter.next()) |entry| {
     // Read filename from archive
+    // filename_len comes from the archive (up to 65535): bounds-check it against the buffer
+    if (entry.filename_len > filename_buf.len) return error.ZipInsufficientBuffer;
     try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
     const filename = filename_buf[0..entry.filename_len];
     try file_reader.interface.readSliceAll(filename);
@@ -136,10 +138,8 @@ var iter = try std.zip.Iterator.init(&file_reader);
 
 var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 while (try iter.next()) |entry| {
-    // Read filename first
-    try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-    const filename = filename_buf[0..entry.filename_len];
-    try file_reader.interface.readSliceAll(filename);
+    // getFilename bounds-checks the archive's filename_len and rejects backslashes and `..`
+    const filename = try entry.getFilename(&file_reader, &filename_buf, .{});
 
     // Only extract .zig files
     if (std.mem.endsWith(u8, filename, ".zig")) {
@@ -269,6 +269,8 @@ fn listZip(io: std.Io, zip_path: []const u8) !void {
     var file_count: u64 = 0;
 
     while (try iter.next()) |entry| {
+        // filename_len comes from the archive (up to 65535): bounds-check it against the buffer
+        if (entry.filename_len > filename_buf.len) return error.ZipInsufficientBuffer;
         try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
         const filename = filename_buf[0..entry.filename_len];
         try file_reader.interface.readSliceAll(filename);
@@ -305,9 +307,8 @@ fn extractFile(
 
     var filename_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (try iter.next()) |entry| {
-        try file_reader.seekTo(entry.header_zip_offset + @sizeOf(std.zip.CentralDirectoryFileHeader));
-        const filename = filename_buf[0..entry.filename_len];
-        try file_reader.interface.readSliceAll(filename);
+        // getFilename bounds-checks the archive's filename_len and rejects backslashes and `..`
+        const filename = try entry.getFilename(file_reader, &filename_buf, .{});
 
         if (std.mem.eql(u8, filename, target_name)) {
             try entry.extract(file_reader, .{}, &filename_buf, dest);
