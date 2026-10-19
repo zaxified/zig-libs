@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** test `delete/with racing concurrent scrapes` gives each churn thread its own family. Two threads deleting and incrementing the SAME series broke `delete`'s documented contract (a pointer from `with` must not be used after its series is deleted) — a write after free in the test itself, first caught by Zig 0.17's SafeAllocator (CI 39187640489, ReleaseFast). The library code is unchanged; the delete-vs-scrape race the test exists for is still exercised (2 churners incl. `reset`, 2 scrapers).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/interop.zig`: `dupeZ` -> `dupeSentinel`, `Ast.parse` takes `.{ .mode = .zig }`.

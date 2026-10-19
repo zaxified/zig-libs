@@ -1532,8 +1532,8 @@ timelock_envelope	ReleaseFast	env	1	8	58d6d84ce8471213	eb40a7f3ed6eaa0a
 # privacy round trip, OPEN FINDING: des.zig is table-driven (S-box and
 # permutation lookups indexed by key- and data-dependent values) -> 256.
 # Not fixed: SNMPv3 DES is legacy; replacing it is the owner's decision.
-snmp	ReleaseFast	kdf	1	0	6c8a62e4e7a7070a	b7a78ad081fdb5eb
-snmp	ReleaseFast	auth	1	0	6c8a62e4e7a7070a	42cc3493cbe134d7
+snmp	ReleaseFast	kdf	1	0	5ecc1ebad6db55f5	b7a78ad081fdb5eb
+snmp	ReleaseFast	auth	1	0	5ecc1ebad6db55f5	42cc3493cbe134d7
 snmp	ReleaseFast	aes	1	0	e28290dd21cc2804	aeff07ae5b6a7083
 snmp	ReleaseFast	des	1	256	74cdcb4742558a04	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)

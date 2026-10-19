@@ -4164,7 +4164,12 @@ test "delete/with racing concurrent scrapes stays consistent (no UAF, no leak)" 
     if (builtin.single_threaded) return error.SkipZigTest;
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
-    const v = try reg.counterVec("race_total", "h", &.{"k"});
+    // One family per churn thread: `delete`'s contract forbids using a
+    // pointer from `with` after its series is deleted, so two threads
+    // deleting and incrementing the SAME series race each other, not the
+    // scrapes (SafeAllocator, Zig 0.17: write after free in CI 39187640489).
+    const v0 = try reg.counterVec("race_a_total", "h", &.{"k"});
+    const v1 = try reg.counterVec("race_b_total", "h", &.{"k"});
     const keys = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
     var stop = std.atomic.Value(bool).init(false);
     const Churn = struct {
@@ -4188,8 +4193,8 @@ test "delete/with racing concurrent scrapes stays consistent (no UAF, no leak)" 
         }
     };
     var ts: [4]std.Thread = undefined;
-    ts[0] = try std.Thread.spawn(.{}, Churn.run, .{ v, &stop });
-    ts[1] = try std.Thread.spawn(.{}, Churn.run, .{ v, &stop });
+    ts[0] = try std.Thread.spawn(.{}, Churn.run, .{ v0, &stop });
+    ts[1] = try std.Thread.spawn(.{}, Churn.run, .{ v1, &stop });
     ts[2] = try std.Thread.spawn(.{}, Scrape.run, .{ &reg, &stop });
     ts[3] = try std.Thread.spawn(.{}, Scrape.run, .{ &reg, &stop });
     sleepMs(200);
