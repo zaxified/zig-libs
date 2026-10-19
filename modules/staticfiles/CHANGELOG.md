@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** `Snapshot` with `fingerprint = false` tagged a precompressed variant with its bare size+mtime tag, so a `.br`/`.gz` sibling equal to the identity file in size and mtime shared its validator and a conditional request could answer 304 across codings; the variant's tag now carries the coding token, as `Handler`'s always did. (Default `fingerprint = true` was unaffected: content hashes differ.)
+
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (root.zig, go_oracle_test.zig). No behaviour change.

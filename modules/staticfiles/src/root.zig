@@ -1628,7 +1628,14 @@ pub const Snapshot = struct {
                 var o = s.files.items[vid];
                 o.setMimeName(s.files.items[id].mimeName());
                 rw.setHeader("Content-Encoding", codings[c].token) catch return failUnsafeResponse(rw);
-                return h.sendFileTagged(req, rw, &o, s.tagOf(vid));
+                // Without a content tag the variant's own size+mtime tag must
+                // still carry the coding, as `Handler` does: a variant that
+                // happens to match the identity file in size and mtime would
+                // otherwise share its validator and answer 304 across codings.
+                var vtag_buf: [etag_max + 5]u8 = undefined;
+                const vtag = s.tagOf(vid) orelse
+                    buildVariantETag(&vtag_buf, o.stat.size, o.stat.mtime.toSeconds(), !s.options.serve.strong_etag, codings[c].token);
+                return h.sendFileTagged(req, rw, &o, vtag);
             }
         }
         var o = s.files.items[id];
@@ -3653,6 +3660,26 @@ test "Snapshot: precompressed siblings -- the client's preference over identity,
     const off = snapGet(&ctx_off, "/app.js", "Accept-Encoding: gzip, br\r\n", &b6);
     try testing.expectEqualStrings("console.log(1)", bodyOf(off));
     try testing.expect(headerOf(off, "vary") == null);
+}
+
+test "Snapshot: without content tags a variant's validator still differs from the identity file's, even at equal size and mtime" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    // Same length, written back to back: size+mtime tags would be equal.
+    try root.writeFile(io, .{ .sub_path = "app.js", .data = "console.log(1)" });
+    try root.writeFile(io, .{ .sub_path = "app.js.gz", .data = "GZ-BYTES-14LEN" });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{ .fingerprint = false });
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+    var b0: [4096]u8 = undefined;
+    const plain = snapGet(&ctx, "/app.js", "", &b0);
+    var b1: [4096]u8 = undefined;
+    const gz = snapGet(&ctx, "/app.js", "Accept-Encoding: gzip\r\n", &b1);
+    try testing.expectEqualStrings("gzip", headerOf(gz, "content-encoding").?);
+    try testing.expect(!mem.eql(u8, headerOf(gz, "etag").?, headerOf(plain, "etag").?));
 }
 
 test "Snapshot: what exists at open is what is served; mounted, a redirect keeps the mount" {
