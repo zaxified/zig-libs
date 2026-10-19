@@ -25,6 +25,13 @@
 //!   no panic, every `process` ends in a value or an error, the broker tears
 //!   both connections down and `deinit` frees everything (`testing.allocator`
 //!   reports a leak as a failure).
+//! - `mqtt-broker-multi` — three connection slots sharing three client ids,
+//!   3.1.1 and 5.0, persistent sessions (resume, take-over, Session Expiry),
+//!   delayed Wills, the retained store and session queues under small caps, a
+//!   publish tap that refuses, and transports (subscribers' too) that start
+//!   failing mid-exchange, with broker ticks between the packets. Invariants:
+//!   no panic, the session / queue / retained caps hold, and `deinit` frees
+//!   everything.
 
 const std = @import("std");
 const testing = std.testing;
@@ -337,4 +344,271 @@ fn fuzzSession(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
     }
     // The slow subscriber's queue (cap 1..8) overflowed: it was queueing.
     if (broker.queueDrops() > 0) SessMark.mark(.queued_for_slow_subscriber);
+}
+
+// ── many connections, persistent sessions, transports that fail ─────────
+
+const MultiMark = Marker(enum {
+    connected_v3,
+    connected_v5,
+    session_resumed,
+    /// A second connection took a client id from a live one.
+    took_over,
+    /// A connection ended because a write to it failed.
+    write_failed,
+    /// A message was queued for a persistent session with no connection.
+    queued_offline,
+    delayed_will_published,
+    retained_stored,
+});
+
+/// A tap that refuses, consumes or accepts by the payload length.
+fn multiTap(_: ?*anyopaque, _: []const u8, payload: []const u8, _: packet.QoS, _: bool) mqtt.PublishVerdict {
+    return switch (payload.len) {
+        6 => .refuse,
+        5 => .consume,
+        else => .accept,
+    };
+}
+
+const multi_ids = [_][]const u8{ "ca", "cb", "cc" };
+const multi_topics = [_][]const u8{ "a/b", "a/c", "w/x", "$SYS/x", "t" };
+const multi_filters = [_][]const u8{ "#", "a/+", "a/b", "w/#", "$share/g/a/+", "$SYS/#", "+/b", "t" };
+
+const MultiSlot = struct {
+    sink: Sink = .{},
+    conn: ?*mqtt.Connection = null,
+    v5: bool = false,
+};
+
+fn multiSmith(_: void, s: *testing.Smith) !void {
+    return fuzzMulti(testing.Smith, s, testing.allocator);
+}
+test "fuzz: broker with three clients sharing ids, persistent sessions, Wills and transports that fail" {
+    try testing.fuzz({}, multiSmith, .{});
+}
+test "fuzz driver: MQTT_FUZZ (multi)" {
+    try fuzz_driver.run(fuzzMulti, .{ .prefix = "MQTT_FUZZ", .name = "mqtt-broker-multi" });
+}
+test "fuzz harness: multi, 400 seeds, reaches every outcome" {
+    try MultiMark.reach(fuzzMulti, "mqtt-broker-multi", 400);
+}
+
+/// The CML lesson behind this harness: `mqtt-broker-session` drives ONE
+/// client, 5.0 only, and its failing transport is the publisher's — so the
+/// teardown of a SUBSCRIBER whose write fails, a persistent session that
+/// outlives a connection and is resumed or taken over, delayed Wills and 3.1.1
+/// (what a small IoT gateway speaks) were not under it. Three slots share
+/// three client ids; every step connects, speaks, drops or ticks the broker.
+/// Invariants: nothing panics, the caps hold (sessions, queue, retained
+/// bytes), and `deinit` frees everything (the allocator reports a leak or a
+/// double free).
+fn fuzzMulti(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var raw: [512]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    var k: Cursor = .{ .bytes = raw[0..n] };
+
+    const max_sessions = k.ranged(1, 3);
+    const max_queued = k.ranged(1, 3);
+    var broker: mqtt.Broker = .init(gpa, .{
+        .max_packet_size = 1024,
+        .max_sessions = max_sessions,
+        .max_queued_messages = max_queued,
+        .max_queued_bytes = 4096,
+        .max_retained = k.ranged(1, 3),
+        .max_retained_store_bytes = 256,
+        .maximum_qos = if (k.byte() & 3 == 0) .at_least_once else .exactly_once,
+        .session_expiry_ms = if (k.byte() & 1 == 0) 0 else 3000,
+        .retain_expiry_interval_ms = if (k.byte() & 1 == 0) 0 else 2000,
+        .queue_qos0_messages = k.byte() & 1 == 0,
+        .tap_wills = k.byte() & 1 == 0,
+        .onPublishFn = if (k.byte() & 1 == 0) multiTap else null,
+        .sys_interval_ms = 1000,
+        .topic_alias_maximum = 2,
+    });
+    defer broker.deinit();
+
+    var slots: [3]MultiSlot = @splat(.{});
+    defer for (&slots) |*s| if (s.conn) |c| broker.remove(c);
+
+    var buf: [512]u8 = undefined;
+    var now: i64 = 0;
+    // Half the inputs start from a 5.0 client with a kept session and a Will
+    // Delay that vanishes: the delayed Will is rare to reach by chance.
+    if (k.byte() & 1 == 0) {
+        const slot = &slots[0];
+        slot.v5 = true;
+        const c = try broker.accept(slot.sink.transport());
+        slot.conn = c;
+        const bytes = try packet.encodeConnect(&buf, .{
+            .client_id = multi_ids[k.ranged(0, multi_ids.len - 1)],
+            .version = .v5,
+            .clean_session = false,
+            .will = .{ .topic = "w/x", .message = "gone", .properties = .{ .will_delay_interval = 1 } },
+            .properties = .{ .session_expiry_interval = 0xFFFF_FFFF },
+        });
+        try multiStep(&broker, slot, bytes, now);
+        if (slot.conn != null) {
+            broker.remove(slot.conn.?);
+            slot.conn = null;
+            if (k.byte() & 1 == 0) {
+                if (broker.publishDueWills(now + 1500) > 0) MultiMark.mark(.delayed_will_published);
+            }
+        }
+    }
+
+    const steps = k.ranged(1, 40);
+    for (0..steps) |_| {
+        now += k.ranged(0, 1500);
+        const slot = &slots[k.ranged(0, slots.len - 1)];
+        const action = k.ranged(0, 19);
+
+        // Broker-level ticks, with or without a connection in the slot.
+        switch (action) {
+            16 => {
+                _ = broker.expireSessions(now + k.ranged(0, 5000));
+                continue;
+            },
+            17 => {
+                if (broker.publishDueWills(now + k.ranged(0, 4000)) > 0) MultiMark.mark(.delayed_will_published);
+                _ = broker.publishSys(now);
+                continue;
+            },
+            18 => {
+                broker.publish(multi_topics[k.ranged(0, 2)], "srv", @fromBackingInt(@intCast(k.ranged(0, 1))), k.byte() & 1 == 0) catch {};
+                var arena: std.heap.ArenaAllocator = .init(gpa);
+                defer arena.deinit();
+                _ = try broker.sessionStatesWith(arena.allocator(), .{ .messages = true, .now = now });
+                _ = try broker.retainedMessages(arena.allocator(), now);
+                continue;
+            },
+            else => {},
+        }
+
+        const conn = slot.conn orelse {
+            // Connect: a client id from a pool the other slots share.
+            slot.v5 = k.byte() & 1 == 0;
+            slot.sink = .{ .fail_after = if (k.ranged(0, 3) == 0) k.ranged(0, 300) else null };
+            const c = broker.accept(slot.sink.transport()) catch continue;
+            slot.conn = c;
+            const will_on = k.ranged(0, 1) == 0;
+            const sei: ?u32 = switch (k.ranged(0, 3)) {
+                0 => null,
+                1 => 4,
+                else => 0xFFFF_FFFF,
+            };
+            const will_delay: ?u32 = switch (k.ranged(0, 3)) {
+                0 => null,
+                1 => 1,
+                else => 3,
+            };
+            const bytes = packet.encodeConnect(&buf, .{
+                .client_id = multi_ids[k.ranged(0, multi_ids.len - 1)],
+                .version = if (slot.v5) .v5 else .v3_1_1,
+                .clean_session = k.byte() & 1 == 0,
+                .keep_alive_s = @intCast(k.ranged(0, 10)),
+                .will = if (will_on) .{
+                    .topic = multi_topics[k.ranged(0, 2)],
+                    .message = "gone",
+                    .qos = @fromBackingInt(@intCast(k.ranged(0, 1))),
+                    .retain = k.byte() & 1 == 0,
+                    .properties = if (slot.v5) .{ .will_delay_interval = will_delay, .message_expiry_interval = if (k.byte() & 1 == 0) 2 else null } else .{},
+                } else null,
+                .properties = if (slot.v5) .{ .session_expiry_interval = sei } else .{},
+            }) catch continue;
+            try multiStep(&broker, slot, bytes, now);
+            if (slot.conn) |cc| if (cc.state == .connected) {
+                if (slot.v5) MultiMark.mark(.connected_v5) else MultiMark.mark(.connected_v3);
+                if (broker.sessionQueued(cc.clientId()) != null) MultiMark.mark(.session_resumed);
+                // A connection the take-over superseded: its owner thread
+                // would see the closed socket and reap it.
+                for (&slots) |*o| if (o != slot) if (o.conn) |oc| if (oc.state == .disconnected) {
+                    MultiMark.mark(.took_over);
+                    broker.remove(oc);
+                    o.conn = null;
+                };
+            };
+            continue;
+        };
+
+        const v: packet.Version = if (slot.v5) .v5 else .v3_1_1;
+        const id: u16 = @intCast(k.ranged(1, 4));
+        const bytes: []const u8 = switch (action) {
+            0, 1, 2, 3 => blk: {
+                const qos: packet.QoS = @fromBackingInt(@intCast(k.ranged(0, 2)));
+                const len = k.ranged(0, 7);
+                break :blk packet.encodePacket(&buf, v, .{ .publish = .{
+                    .topic = multi_topics[k.ranged(0, multi_topics.len - 1)],
+                    .payload = "12345678"[0..len],
+                    .qos = qos,
+                    .retain = k.byte() & 1 == 0,
+                    .dup = qos != .at_most_once and k.byte() & 3 == 0,
+                    .packet_id = if (qos == .at_most_once) 0 else id,
+                } }) catch continue;
+            },
+            4, 5 => packet.encodePacket(&buf, v, .{ .subscribe = .{ .packet_id = id, .filters = &.{.{
+                .filter = multi_filters[k.ranged(0, multi_filters.len - 1)],
+                .qos = @fromBackingInt(@intCast(k.ranged(0, 2))),
+                .no_local = slot.v5 and k.byte() & 3 == 0,
+                .retain_as_published = slot.v5 and k.byte() & 1 == 0,
+                .retain_handling = if (slot.v5) @fromBackingInt(@intCast(k.ranged(0, 2))) else .send_on_subscribe,
+            }} } }) catch continue,
+            6 => packet.encodePacket(&buf, v, .{ .unsubscribe = .{ .packet_id = id, .filters = &.{multi_filters[k.ranged(0, multi_filters.len - 1)]} } }) catch continue,
+            7 => packet.encodePacket(&buf, v, .{ .puback = .{ .packet_id = id } }) catch continue,
+            8 => packet.encodePacket(&buf, v, .{ .pubrec = .{ .packet_id = id } }) catch continue,
+            9 => packet.encodePacket(&buf, v, .{ .pubrel = .{ .packet_id = id } }) catch continue,
+            10 => packet.encodePacket(&buf, v, .{ .pubcomp = .{ .packet_id = id } }) catch continue,
+            11 => packet.encodePingreq(&buf) catch continue,
+            12 => packet.encodePacket(&buf, v, .{ .disconnect = .{} }) catch continue,
+            13 => {
+                // The peer vanishes without a DISCONNECT.
+                broker.remove(conn);
+                slot.conn = null;
+                continue;
+            },
+            14 => {
+                if (broker.keepAliveExpired(conn, now + k.ranged(0, 20_000))) {
+                    broker.remove(conn);
+                    slot.conn = null;
+                }
+                continue;
+            },
+            else => buf[0..k.ranged(1, 8)], // raw bytes (15, 19)
+        };
+        try multiStep(&broker, slot, bytes, now);
+    }
+
+    if (broker.retainedBytes() > 0) MultiMark.mark(.retained_stored);
+    for (multi_ids) |cid| if (broker.sessionQueued(cid)) |q| if (q > 0) {
+        MultiMark.mark(.queued_offline);
+        break;
+    };
+
+    // The caps held, whatever happened.
+    if (broker.sessionCount() > max_sessions) return error.SessionCapExceeded;
+    if (broker.retainedBytes() > 256) return error.RetainedCapExceeded;
+    for (multi_ids) |cid| if (broker.sessionQueued(cid)) |q| if (q > max_queued) return error.QueueCapExceeded;
+}
+
+/// Feed `bytes` to the slot's connection and let the broker process them; a
+/// connection it closes, or fails, is removed as a server loop would.
+fn multiStep(broker: *mqtt.Broker, slot: *MultiSlot, bytes: []const u8, now: i64) !void {
+    const conn = slot.conn.?;
+    var gone = false;
+    broker.feed(conn, bytes) catch {
+        gone = true;
+    };
+    if (!gone) {
+        const disp = broker.process(conn, now) catch |e| blk: {
+            if (e == error.TransportFailed) MultiMark.mark(.write_failed);
+            break :blk mqtt.broker.Disposition.close;
+        };
+        gone = disp == .close;
+    }
+    // A write that failed on the way marks the connection disconnected.
+    if (conn.state == .disconnected) gone = true;
+    if (gone) {
+        broker.remove(conn);
+        slot.conn = null;
+    }
 }
