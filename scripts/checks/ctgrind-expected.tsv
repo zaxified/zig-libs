@@ -419,13 +419,13 @@ k256	ReleaseFast	field	1	0	b1745f6995d37402	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	34bd8f5525f75da6	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	34bd8f5525f75da6	2ac21fe395f35487
-k256	ReleaseFast	sign	1	11	2162738aa21a739f	bb06c2ed85209b8d
+k256	ReleaseFast	mul	1	1	60952216c864a994	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	60952216c864a994	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	37bce8fb680f473b	bb06c2ed85209b8d
 # Zig 0.17.0 (2026-10-18): ecdsa 11 -> 10 (decrease). One of signInner's five own contexts
 # (ecdsa_recover.zig) is gone in the LLVM 22 build; every other context has the same shape (the
 # harness frame now prints as `ctgrind_harness.main`). Normalised --stacks diff vs B0.
-k256	ReleaseFast	ecdsa	1	10	81ebf2920808f62d	8ff4812d21149442
+k256	ReleaseFast	ecdsa	1	10	9f24c2c22313da6e	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -1179,8 +1179,8 @@ opaque	ReleaseFast	serverke2	1	2	3ca3303e4347557d	4ef279b842b3cb55
 # checkEncodeSecret/checkDecodeSecret, parseExtendedBody declassifies the
 # public header and checks the scalar with a CT `scalarInRange`. master and
 # derive run none of that: same counts (2 / 25), same contexts, digest only.
-bip32	ReleaseFast	master	1	2	76043262dfb7665b	7e14466ed98567fa
-bip32	ReleaseFast	derive	1	25	76043262dfb7665b	8b410bdbd3955f08
+bip32	ReleaseFast	master	1	2	59f566ed0682b243	7e14466ed98567fa
+bip32	ReleaseFast	derive	1	25	59f566ed0682b243	8b410bdbd3955f08
 bip32	ReleaseFast	seed	1	0	4e16b43c5b05b3aa	9e74b23db4ad7bdc
 bip32	ReleaseFast	mnemonic	1	3	4e16b43c5b05b3aa	d42db8cf9cdc2200
 # bip32 xprv, new 2026-10-18: the master scalar tainted through serializePriv
@@ -1193,7 +1193,7 @@ bip32	ReleaseFast	mnemonic	1	3	4e16b43c5b05b3aa	d42db8cf9cdc2200
 # through the whole round trip). The source digest covers bip32.zig only
 # (base58.zig lives in modules/bech32): re-run `--check bip32` after a
 # bech32 edit.
-bip32	ReleaseFast	xprv	1	0	76043262dfb7665b	446d9a369af15cee
+bip32	ReleaseFast	xprv	1	0	59f566ed0682b243	446d9a369af15cee
 # btcaddr wif, new 2026-10-18: the private key tainted through wifEncode and
 # back through wifDecode (PATTERN base58.zig|root.zig). 0 in-file, witness 2.
 # Negative control the same day: btcaddr's old early-exit range check

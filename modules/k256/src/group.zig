@@ -417,7 +417,7 @@ pub const Secp256k1 = struct {
     /// is `comb_t` point additions with NO doublings, because each window's
     /// table already carries the `2^(w·i)` factor. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`. See the comb section below for the CT-gather contract.
-    pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+    pub inline fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         // Zig 0.17 (2026-10-19): a `[32]u8` argument to a non-inline Zig-CC
         // function is no longer passed in four GPRs (0.16) but by reference to
         // a copy the CALLER makes in its own frame. With `combMulBase` inlined
@@ -426,6 +426,9 @@ pub const Secp256k1 = struct {
         // (`stackprobe_test.zig`, ReleaseFast, BE needle at 111 B; bip32
         // `neuter` the same). So the scalar goes down by pointer to a local
         // this function owns and zeroes; the burn still covers everything below.
+        // `inline` (2026-10-19): in ReleaseSmall nothing inlined this, so the
+        // by-value `s_` was the CALLER's copy, above the burn (BE=5 at 127 B,
+        // also on 0.16). Inlined, `s` below is that copy, and it is zeroed.
         var s = s_;
         defer std.crypto.secureZero(u8, &s);
         const result = combMulBaseInner(&s, endian);

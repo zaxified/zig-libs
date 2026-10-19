@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** `tools/probe.zig` compiles again (its `Cardinality` switch had no `.oneof` arm since oneof landed 2026-10-04); a oneof member in a probe schema is a compile error with a reason, since `oracle.py` builds none.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. Schema derivation iterates fields through `schema.fieldRecs` (0.17 struct-of-arrays `@typeInfo`); `FieldAttributes`/enum `mode` spellings; `wait4` status cast. `pb_fields` is still honoured when `pub` (probed with `@hasDecl`, pub-only in 0.17).

@@ -201,8 +201,10 @@ pub const CkdError = error{
 };
 
 /// Derive the compressed SEC1 pubkey `k·G` for a private scalar `k`.
-fn pubkeyFromPriv(priv: [32]u8) std.crypto.errors.IdentityElementError![33]u8 {
-    const point = try Secp256k1.combMulBase(priv, .big);
+/// By pointer: in ReleaseSmall (`pubkeyFromPriv` not inlined) a by-value key
+/// was a copy in the caller's frame, above every burn (`neuter`, 2026-10-19).
+fn pubkeyFromPriv(priv: *const [32]u8) std.crypto.errors.IdentityElementError![33]u8 {
+    const point = try Secp256k1.combMulBase(priv.*, .big);
     return point.toCompressedSec1();
 }
 
@@ -248,7 +250,7 @@ noinline fn ckdPrivBody(parent: *const ExtendedPrivKey, known_pub: ?[33]u8, inde
     // Computed once and reused for both the non-hardened HMAC input and the
     // parent fingerprint below — `pubkeyFromPriv` is a scalar EC multiply,
     // not free, and the parent scalar does not change within this call.
-    const parent_pub = known_pub orelse (pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey);
+    const parent_pub = known_pub orelse (pubkeyFromPriv(&parent.privkey) catch return error.InvalidChildKey);
     const hardened = index >= hardened_offset;
 
     var data: [37]u8 = undefined;
@@ -345,7 +347,7 @@ pub fn neuter(priv: *const ExtendedPrivKey) std.crypto.errors.IdentityElementErr
         .parent_fingerprint = priv.parent_fingerprint,
         .child_number = priv.child_number,
         .chain_code = priv.chain_code,
-        .pubkey = try pubkeyFromPriv(priv.privkey),
+        .pubkey = try pubkeyFromPriv(&priv.privkey),
     };
 }
 

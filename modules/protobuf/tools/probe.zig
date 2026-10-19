@@ -166,6 +166,10 @@ fn dumpMessage(comptime T: type, value: T, w: *std.ArrayList(u8), gpa: std.mem.A
         first = false;
         try w.appendSlice(gpa, info.name);
         try w.append(gpa, '=');
+        // oracle.py builds only proto3 `optional`'s synthetic oneofs, which
+        // are `.optional` here; a real oneof would need its own dump shape.
+        if (comptime info.card == .oneof)
+            @compileError("probe: " ++ @typeName(T) ++ "." ++ info.name ++ " is a oneof member; oracle.py has no oneof to diff it against");
         const f = @field(value, info.name);
         switch (info.card) {
             .singular => try dumpValue(info.kind, info.Elem, f, w, gpa),
@@ -185,6 +189,7 @@ fn dumpMessage(comptime T: type, value: T, w: *std.ArrayList(u8), gpa: std.mem.A
                 }
                 try w.append(gpa, ']');
             },
+            .oneof => comptime unreachable,
         }
     }
 }

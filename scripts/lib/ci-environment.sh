@@ -193,6 +193,14 @@ sudo apt-get install "${APT_QUIET[@]}" build-essential libwolfssl-dev >/dev/null
     && echo "cc + wolfssl: OK" || echo "cc + wolfssl: install failed"
 command -v cc >/dev/null 2>&1 && echo "cc: $(cc --version | head -1)" || echo "cc: MISSING"
 [[ -e /usr/include/wolfssl/ssl.h ]] && echo "wolfssl headers: OK" || echo "wolfssl headers: MISSING"
+# The capability report in test.sh probes the websocket example's judge on
+# every lane that wants `websocket`, the interop one included; without this it
+# printed "1 MISSING PEER(S) THAT FAIL THE RUN" there (run 39169575780). Same
+# pin as the `tests` role above — keep the two in step.
+sudo pip3 install --break-system-packages -q --root-user-action=ignore \
+    "websockets==15.0.1" >/dev/null 2>&1 || true
+python3 -c 'import websockets; print("websockets:", websockets.__version__)' 2>/dev/null \
+    || echo "websockets: MISSING"
 echo "::endgroup::"
 
 echo "::group::interop: python oracles"

@@ -143,7 +143,7 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 /// The key by pointer (BREAKING 2026-10-08): by value, the caller's frame kept
 /// a copy of it (`stackprobe_test.zig`, direct-region engine).
 pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
-    const result = signInner(privkey, hash32, Secp256k1.combMulBase);
+    const result = signInner(privkey, hash32, combMulBaseCommit);
     burnSignStack();
     return result;
 }
@@ -154,6 +154,12 @@ pub fn sign(privkey: *const [32]u8, hash32: [32]u8) SignError!Signature {
 /// probability ~2^-128. Production passes `Secp256k1.combMulBase`, and only
 /// production calls `sign`.
 const CommitFn = fn ([32]u8, std.builtin.Endian) IdentityElementError!Secp256k1;
+
+/// `Secp256k1.combMulBase` as a `CommitFn` value: it is an `inline fn`, which
+/// has no runtime address. Called from `signInner`, so inside the burn.
+fn combMulBaseCommit(k: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+    return Secp256k1.combMulBase(k, endian);
+}
 
 /// How much stack below `sign`'s frame is zeroed after every signature.
 ///
