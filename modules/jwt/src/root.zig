@@ -1582,6 +1582,7 @@ pub const HttpFetcher = struct {
         const f: *HttpFetcher = @ptrCast(@alignCast(ctx));
         var res = f.client.request(.get, url, .{
             .headers = &.{.{ .name = "Accept", .value = "application/json" }},
+            .redirect_filter = .{ .allow = refuseSchemeDowngrade },
         }) catch |err| return mapFetchError(err);
         defer res.deinit();
 
@@ -1599,6 +1600,16 @@ pub const HttpFetcher = struct {
         return .{ .status = res.status, .body_len = n };
     }
 };
+
+/// `http.Client` redirect gate for key-source fetches: an `https://` URL that
+/// answers with a redirect to `http://` is refused. `checkKeySourceUrl` only
+/// judges the URL the caller configured; without this a redirect would walk
+/// the fetch onto a plain-HTTP hop whose body anyone on the path can replace
+/// (and so mint any token the verifier accepts). Plain-HTTP-to-anything and
+/// https-to-https hops are unchanged; the first dial (`from == to`) is allowed.
+fn refuseSchemeDowngrade(_: ?*anyopaque, from: http.Url, to: http.Url) bool {
+    return !(from.scheme == .https and to.scheme == .http);
+}
 
 /// Widen an `http.Client.Error` to `FetchError`, the one place this module
 /// touches the network. `error.Canceled` is the only variant worth telling
@@ -9421,4 +9432,15 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk rep_final;
     };
     return &rep_result;
+}
+
+test "SECURITY: the HttpFetcher redirect gate refuses an https -> http downgrade" {
+    const https_a: http.Url = .{ .scheme = .https, .host = "idp.example", .port = 443, .path = "/jwks", .query = "" };
+    const http_b: http.Url = .{ .scheme = .http, .host = "idp.example", .port = 80, .path = "/jwks", .query = "" };
+    const https_c: http.Url = .{ .scheme = .https, .host = "cdn.example", .port = 443, .path = "/jwks", .query = "" };
+    try testing.expect(!refuseSchemeDowngrade(null, https_a, http_b));
+    try testing.expect(refuseSchemeDowngrade(null, https_a, https_c));
+    try testing.expect(refuseSchemeDowngrade(null, https_a, https_a)); // the first dial
+    try testing.expect(refuseSchemeDowngrade(null, http_b, http_b)); // allow_plain_http setups
+    try testing.expect(refuseSchemeDowngrade(null, http_b, https_a)); // an upgrade
 }

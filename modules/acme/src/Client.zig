@@ -1927,10 +1927,13 @@ fn postSigned(c: *Client, a: Allocator, url: []const u8, payload: []const u8, mo
         // request (RFC 9110 §15.6.4), so a resend cannot double an action.
         // A short `Retry-After` is honoured; a long one is the caller's call.
         if (res.status == 503 and unavailable_left > 0) {
+            // Saturating: the header is the CA's, `secs` can be any u64 (a
+            // plain `*` panicked in safe builds); the shift is clamped for
+            // the same reason (`max_unavailable_retries` is a u8).
             const wait_ms: u64 = if (c.retryAfterHeader(res.header("retry-after"))) |secs|
-                secs * 1000
+                secs *| 1000
             else
-                @as(u64, 1000) << @intCast(c.options.max_unavailable_retries - unavailable_left);
+                @as(u64, 1000) << @intCast(@min(c.options.max_unavailable_retries - unavailable_left, 20));
             if (wait_ms <= max_unavailable_wait_ms) {
                 unavailable_left -= 1;
                 a.free(body);
@@ -5172,6 +5175,14 @@ test "503: Retry-After is read as seconds; a wait of exactly 30 s is honoured, 3
     try testing.expectError(error.AcmeProblem, c.newOrder(&.{MockCa.domain}, .{}));
     try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
     try testing.expectEqual(@as(?u64, 31), c.retryAfter());
+
+    // A delay that overflows u64 once converted to milliseconds is over the
+    // cap as well (it used to panic on `secs * 1000` in safe builds).
+    lab.mock.unavailable_retry_after = "99999999999999999";
+    lab.mock.unavailable_left = 1;
+    try testing.expectError(error.AcmeProblem, c.newOrder(&.{MockCa.domain}, .{}));
+    try testing.expectEqual(@as(u8, 0), lab.mock.unavailable_left);
+    try testing.expectEqual(@as(?u64, 99999999999999999), c.retryAfter());
 
     // Exactly 30 s is within the cap: the client waits (we do not wait it
     // out: the call is cancelled while it sleeps).

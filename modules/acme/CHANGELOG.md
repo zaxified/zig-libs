@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-19** — **Fix:** a 503 whose `Retry-After` is a huge number of seconds (any u64) overflowed `secs * 1000` in `Client.postSigned` (panic in safe builds); now saturating, and the no-header doubling shift is clamped. Test: the 503 `Retry-After` test gains a `99999999999999999` case (crashed without the fix). Also a test pinning `DirStorage.load` at exactly `max_value_len` bytes.
+
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — Ported to Zig 0.17.0. Non-mechanical: `manager_test.zig` fixes the codemod's `@splat` element type (`[16]FakeIssuer.Step`). The mock CA's `allocRemaining(.limited(64 KiB))` request-body cap (test-only) now accepts exactly 64 KiB (0.17 semantics), no test depends on the boundary.

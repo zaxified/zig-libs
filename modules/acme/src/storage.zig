@@ -183,6 +183,8 @@ pub const DirStorage = struct {
 
     fn dirLoad(ptr: *anyopaque, gpa: Allocator, key: []const u8) Error![]u8 {
         const d = of(ptr);
+        // `readFileAlloc` refuses a file of `limit` bytes or more (checked on 0.17),
+        // so +1 makes `max_value_len` -- the largest value `store` accepts -- loadable.
         return d.dir.readFileAlloc(d.io, key, gpa, .limited(max_value_len + 1)) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.FileNotFound => error.NotFound,
@@ -713,4 +715,23 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk rep_final;
     };
     return &rep_result;
+}
+
+test "DirStorage: load accepts exactly max_value_len bytes and refuses one more (0.17 limit semantics pinned)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var d = DirStorage.init(io, tmp.dir);
+    const s = d.storage();
+
+    const big = try testing.allocator.alloc(u8, max_value_len + 1);
+    defer testing.allocator.free(big);
+    @memset(big, 'v');
+    try tmp.dir.writeFile(io, .{ .sub_path = "at-limit", .data = big[0..max_value_len] });
+    try tmp.dir.writeFile(io, .{ .sub_path = "over-limit", .data = big });
+    const ok = try s.load(testing.allocator, "at-limit");
+    testing.allocator.free(ok);
+    try testing.expectError(error.StorageFailed, s.load(testing.allocator, "over-limit"));
 }
