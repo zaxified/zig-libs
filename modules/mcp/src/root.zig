@@ -270,6 +270,7 @@ pub const OriginatedMethod = enum {
     @"sampling/createMessage",
     @"elicitation/create",
     @"notifications/subscriptions/acknowledged",
+    @"notifications/elicitation/complete",
 
     pub fn wire(self: OriginatedMethod) []const u8 {
         return @tagName(self);
@@ -301,6 +302,7 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "notifications/progress", .anchor = .literal_example, .reason = "" },
     .{ .method = "sampling/createMessage", .anchor = .literal_example, .reason = "" },
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/elicitation/complete", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Also: this module only ever SENDS notifications/cancelled (giving up on its own outbound sampling/elicitation request); it has no dispatch branch for a client cancelling an in-progress tools/call (an unknown id-less notification is silently dropped, which the spec explicitly permits)" },
 };
 
@@ -2180,6 +2182,173 @@ pub const StateSeal = struct {
 
 // ── tool registration ───────────────────────────────────────────────────────
 
+/// What `ToolCall.arg` found for one argument: nothing (absent or JSON
+/// `null`), a value of the requested type, or a value of another JSON type —
+/// the case a handler reports as "'x' must be a string", not "missing 'x'".
+pub fn Arg(comptime T: type) type {
+    return union(enum) {
+        absent,
+        value: T,
+        wrong_type,
+    };
+}
+
+/// A JSON-RPC error a handler answers with instead of its result — the
+/// protocol-level failure TS's `ProtocolError` and Python's `MCPError` carry,
+/// as opposed to a tool's `isError:true` result (a failure the model reads).
+/// `data_json` is JSON text spliced in as `error.data` ("" = no `data`); text
+/// that is not one JSON value turns the answer into -32603 rather than a line
+/// no client can parse. Set it with `fail*` on the request; it wins over both
+/// the normal result and any `input.ask` of the same round.
+pub const ProtocolError = struct {
+    code: i32,
+    message: []const u8,
+    data_json: []const u8 = "",
+    /// When set, `data_json` is the value of this one member of `data` rather
+    /// than `data` itself (`missingClientCapability` uses it).
+    wrap_data: []const u8 = "",
+
+    /// `URLElicitationRequiredError` (-32042, spec 2025-11-25 client/
+    /// elicitation.mdx): the request cannot proceed until each listed URL-mode
+    /// elicitation completes; the client may retry after
+    /// `notifications/elicitation/complete` (`Server.sendElicitationComplete`).
+    /// Session path only — 2026-07-28 removed it (MRTR's `input.ask` replaces
+    /// it), so a stateless call is refused with `error.StatelessRequest`. Each
+    /// entry is checked as `requestElicitation` checks a `.url` one (the
+    /// client's `elicitation.url` capability, an `elicitation_id`, a safe URL),
+    /// and the list may not be empty (the spec's MUST).
+    pub fn urlElicitationRequired(
+        arena: std.mem.Allocator,
+        caps: ClientCapabilities,
+        modern: bool,
+        message: []const u8,
+        elicitations: []const ElicitationRequest.Url,
+    ) SendError!ProtocolError {
+        if (modern) return error.StatelessRequest;
+        if (elicitations.len == 0) return error.NoMessages;
+        for (elicitations) |u| try checkElicitationRequest(arena, caps, .{ .url = u });
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        jw.beginObject() catch return error.OutOfMemory;
+        jw.objectField("elicitations") catch return error.OutOfMemory;
+        jw.beginArray() catch return error.OutOfMemory;
+        for (elicitations) |u| writeUrlElicitation(&jw, u) catch return error.OutOfMemory;
+        jw.endArray() catch return error.OutOfMemory;
+        jw.endObject() catch return error.OutOfMemory;
+        return .{ .code = error_code.url_elicitation_required, .message = message, .data_json = aw.written() };
+    }
+
+    /// `MissingRequiredClientCapabilityError` (-32021, spec 2026-07-28): the
+    /// request needs client capabilities its `_meta` did not declare.
+    /// `required_json` is the `ClientCapabilities` object the server needs,
+    /// e.g. `{"elicitation":{}}`.
+    pub fn missingClientCapability(message: []const u8, required_json: []const u8) ProtocolError {
+        return .{ .code = error_code.missing_required_client_capability, .message = message, .data_json = required_json, .wrap_data = "requiredCapabilities" };
+    }
+};
+
+fn writeUrlElicitation(jw: *std.json.Stringify, u: ElicitationRequest.Url) std.Io.Writer.Error!void {
+    try jw.beginObject();
+    try jw.objectField("mode");
+    try jw.write("url");
+    try jw.objectField("elicitationId");
+    try jw.write(u.elicitation_id);
+    try jw.objectField("url");
+    try jw.write(u.url);
+    try jw.objectField("message");
+    try jw.write(u.message);
+    try jw.endObject();
+}
+
+/// Answer `id` with a handler's `ProtocolError`.
+fn sendProtocolError(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, pe: ProtocolError) Error!void {
+    if (pe.data_json.len == 0) return sendError(arena, out, id, pe.code, pe.message);
+    if (!isSingleJsonValue(arena, pe.data_json)) {
+        return sendError(arena, out, id, error_code.internal_error, "Handler error data is not JSON");
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    buildProtocolErrorLine(&aw.writer, id, pe) catch return error.OutOfMemory;
+    try flushLine(out, aw.written());
+}
+
+fn buildProtocolErrorLine(w: *std.Io.Writer, id: ?std.json.Value, pe: ProtocolError) std.Io.Writer.Error!void {
+    try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+    try writeId(w, id);
+    try w.print(",\"error\":{{\"code\":{d},\"message\":", .{pe.code});
+    try std.json.Stringify.encodeJsonString(pe.message, .{}, w);
+    try w.writeAll(",\"data\":");
+    if (pe.wrap_data.len != 0) {
+        try w.writeByte('{');
+        try std.json.Stringify.encodeJsonString(pe.wrap_data, .{}, w);
+        try w.writeByte(':');
+    }
+    try writeStrippingNewlines(w, pe.data_json);
+    if (pe.wrap_data.len != 0) try w.writeByte('}');
+    try w.writeAll("}}\n");
+}
+
+fn requestCaps(server: ?*Server, peer: u64, modern: ?*const ModernRequest) ClientCapabilities {
+    if (modern) |r| return r.capabilities;
+    const s = server orelse return .{};
+    return s.clientCapabilities(peer);
+}
+
+/// The `params._meta` object of a request (`.null` when absent or not an
+/// object), and the progress reporter its `progressToken` opts into.
+fn requestMeta(params: std.json.ObjectMap) std.json.Value {
+    const m = params.get("_meta") orelse return .null;
+    return if (m == .object) m else .null;
+}
+
+fn progressFrom(arena: std.mem.Allocator, out: *std.Io.Writer, req_meta: std.json.Value) ?Progress {
+    // MCP progress: a `params._meta.progressToken` opts the request into
+    // server→client `notifications/progress`. Serialize the token verbatim
+    // (string or number) so the reporter can echo it on every notification.
+    if (req_meta != .object) return null;
+    const token = req_meta.object.get("progressToken") orelse return null;
+    if (token != .string and token != .integer) return null;
+    const token_json = std.json.Stringify.valueAlloc(arena, token, .{}) catch return null;
+    return Progress{ .out = out, .token_json = token_json };
+}
+
+fn argTypeName(comptime T: type) []const u8 {
+    return switch (T) {
+        []const u8 => "a string",
+        i64 => "an integer",
+        f64 => "a number",
+        bool => "a boolean",
+        else => @compileError("mcp: arg type must be []const u8, i64, f64 or bool, not " ++ @typeName(T)),
+    };
+}
+
+fn lookupArg(comptime T: type, args: std.json.Value, key: []const u8) Arg(T) {
+    _ = argTypeName(T);
+    if (args != .object) return .absent;
+    const v = args.object.get(key) orelse return .absent;
+    if (v == .null) return .absent;
+    switch (T) {
+        []const u8 => if (v == .string) return .{ .value = v.string },
+        bool => if (v == .bool) return .{ .value = v.bool },
+        i64 => switch (v) {
+            .integer => |i| return .{ .value = i },
+            // `5.0` is an integer to JSON Schema; the bounds are the f64s
+            // nearest to i64's range that are inside it.
+            .float => |f| if (@floor(f) == f and f >= -9.223372036854775808e18 and f < 9.223372036854775808e18)
+                return .{ .value = @intFromFloat(f) },
+            else => {},
+        },
+        f64 => switch (v) {
+            .integer => |i| return .{ .value = @floatFromInt(i) },
+            .float => |f| return .{ .value = f },
+            // std.json keeps an integer too long for i64 as its digits.
+            .number_string => |s| return .{ .value = std.fmt.parseFloat(f64, s) catch return .wrong_type },
+            else => {},
+        },
+        else => unreachable,
+    }
+    return .wrong_type;
+}
+
 /// Everything a tool handler gets for one `tools/call`: the per-request arena
 /// (freed after the response is written — allocate freely, never store), the
 /// parsed `arguments` object (`.null` when the client sent none), the
@@ -2214,6 +2383,31 @@ pub const ToolCall = struct {
     /// the reply into an `InputRequiredResult`; the text written to `out` and
     /// the handler's return value are then discarded.
     input: InputRound = .{},
+    /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error
+    /// instead of a tool result.
+    protocol_error: ?ProtocolError = null,
+    /// The request's raw `params._meta` object (`.null` when absent).
+    meta: std.json.Value = .null,
+
+    /// Answer this call with a JSON-RPC error rather than a tool result (a
+    /// protocol failure, not a tool failure the model should read). Returns
+    /// `true` so a handler can `return call.failWith(...)`.
+    pub fn failWith(self: *ToolCall, pe: ProtocolError) bool {
+        self.protocol_error = pe;
+        return true;
+    }
+
+    /// `failWith(.{ .code = code, .message = message, .data_json = data_json })`.
+    pub fn failProtocol(self: *ToolCall, code: i32, msg: []const u8, data_json: []const u8) bool {
+        return self.failWith(.{ .code = code, .message = msg, .data_json = data_json });
+    }
+
+    /// Answer with `URLElicitationRequiredError` (-32042) listing
+    /// `elicitations` — see `ProtocolError.urlElicitationRequired`, checked
+    /// against this call's client capabilities and era.
+    pub fn urlElicitationRequired(self: *ToolCall, msg: []const u8, elicitations: []const ElicitationRequest.Url) SendError!bool {
+        return self.failWith(try ProtocolError.urlElicitationRequired(self.arena, self.clientCapabilities(), self.modern != null, msg, elicitations));
+    }
 
     /// Ask the client's LLM for a completion, from inside a tool call.
     ///
@@ -2289,6 +2483,43 @@ pub const ToolCall = struct {
             .string => |s| s,
             else => null,
         };
+    }
+
+    /// Look up argument `key` as a `T` — `[]const u8`, `i64`, `f64` or
+    /// `bool` — telling an absent argument apart from one of the wrong JSON
+    /// type, which `strArg` folds together. A JSON `null` is absent (the spec's
+    /// optional arguments are commonly sent as null). `i64` takes an integral
+    /// number in range (`5.0` too, as JSON Schema's `integer` does); `f64`
+    /// takes any number.
+    // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
+    pub fn arg(self: *const ToolCall, comptime T: type, key: []const u8) Arg(T) {
+        return lookupArg(T, self.args, key);
+    }
+
+    /// `arg([]const u8, key)` (kept for symmetry with `strArg`).
+    // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
+    pub fn strArgChecked(self: *const ToolCall, key: []const u8) Arg([]const u8) {
+        return lookupArg([]const u8, self.args, key);
+    }
+
+    /// A required argument of type `T`, or null after writing the tool
+    /// failure — "missing '<key>'" or "'<key>' must be <a string|an integer|
+    /// a number|a boolean>" — so a handler reads
+    /// `const cfg = call.require([]const u8, "config") orelse return true;`.
+    // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
+    pub fn require(self: *ToolCall, comptime T: type, key: []const u8) ?T {
+        switch (lookupArg(T, self.args, key)) {
+            .value => |v| return v,
+            .absent => self.print("error: missing '{s}'", .{key}),
+            .wrong_type => self.print("error: '{s}' must be {s}", .{ key, argTypeName(T) }),
+        }
+        return null;
+    }
+
+    /// `require([]const u8, key)`.
+    // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
+    pub fn requireStr(self: *ToolCall, key: []const u8) ?[]const u8 {
+        return self.require([]const u8, key);
     }
 
     /// Write a tool-failure message and return `true` (the handler's isError
@@ -2371,6 +2602,18 @@ pub const ResourceRequest = struct {
     /// its contents; any other handler that asked gets an
     /// `InputRequiredResult`, whatever it returned.
     input: InputRound = .{},
+    /// Request context (filled by the dispatcher; the same as `ToolCall`'s):
+    /// the progress reporter (null unless the client sent a progressToken),
+    /// the server and peer the request came from, the stateless request's
+    /// `_meta` declarations (null on the session path) and the request's raw
+    /// `params._meta` (`.null` when absent).
+    progress: ?Progress = null,
+    server: ?*Server = null,
+    peer: u64 = 0,
+    modern: ?*const ModernRequest = null,
+    meta: std.json.Value = .null,
+    /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
+    protocol_error: ?ProtocolError = null,
 
     const ContentItem = struct {
         uri: []const u8,
@@ -2394,6 +2637,49 @@ pub const ResourceRequest = struct {
         const buf = self.arena.alloc(u8, enc.calcSize(bytes.len)) catch return;
         const encoded = enc.encode(buf, bytes);
         self.contents.append(self.arena, .{ .uri = uri, .mime_type = mime_type, .data = encoded, .is_blob = true }) catch {};
+    }
+
+    /// What the client declared (see `ToolCall.clientCapabilities`).
+    pub fn clientCapabilities(self: *const ResourceRequest) ClientCapabilities {
+        return requestCaps(self.server, self.peer, self.modern);
+    }
+
+    /// What the client self-identified as (see `ToolCall.clientInfo`).
+    pub fn clientInfo(self: *const ResourceRequest) ?ClientInfo {
+        if (self.modern) |r| return r.client;
+        const s = self.server orelse return null;
+        return s.clientInfo(self.peer);
+    }
+
+    /// The protocol revision this request is served under.
+    pub fn protocolVersion(self: *const ResourceRequest) []const u8 {
+        if (self.modern) |r| return r.version;
+        const s = self.server orelse return protocol_version;
+        return s.negotiatedVersion(self.peer);
+    }
+
+    /// Emit one `notifications/progress` — a no-op without a progressToken.
+    pub fn reportProgress(self: *const ResourceRequest, progress: u64, total: u64, msg: []const u8) void {
+        if (self.progress) |p| p.report(progress, total, msg);
+    }
+
+    /// Answer with a JSON-RPC error instead of the result (see
+    /// `ProtocolError`); returns `true`, which a resource handler's caller
+    /// reads as "mine" — no further template is tried.
+    pub fn failWith(self: *ResourceRequest, pe: ProtocolError) bool {
+        self.protocol_error = pe;
+        return true;
+    }
+
+    /// `failWith(.{ .code = code, .message = message, .data_json = data_json })`.
+    pub fn failProtocol(self: *ResourceRequest, code: i32, msg: []const u8, data_json: []const u8) bool {
+        return self.failWith(.{ .code = code, .message = msg, .data_json = data_json });
+    }
+
+    /// Answer with `URLElicitationRequiredError` (-32042); see
+    /// `ProtocolError.urlElicitationRequired`.
+    pub fn urlElicitationRequired(self: *ResourceRequest, msg: []const u8, elicitations: []const ElicitationRequest.Url) SendError!bool {
+        return self.failWith(try ProtocolError.urlElicitationRequired(self.arena, self.clientCapabilities(), self.modern != null, msg, elicitations));
     }
 };
 
@@ -2462,6 +2748,18 @@ pub const PromptRequest = struct {
     /// Asking anything turns the reply into an `InputRequiredResult`, whatever
     /// the handler returns.
     input: InputRound = .{},
+    /// Request context (filled by the dispatcher; the same as `ToolCall`'s):
+    /// the progress reporter (null unless the client sent a progressToken),
+    /// the server and peer the request came from, the stateless request's
+    /// `_meta` declarations (null on the session path) and the request's raw
+    /// `params._meta` (`.null` when absent).
+    progress: ?Progress = null,
+    server: ?*Server = null,
+    peer: u64 = 0,
+    modern: ?*const ModernRequest = null,
+    meta: std.json.Value = .null,
+    /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
+    protocol_error: ?ProtocolError = null,
 
     /// MCP prompt message roles — the same `Role` the sampling surface uses
     /// (aliased so both spell it the way the spec does).
@@ -2482,6 +2780,13 @@ pub const PromptRequest = struct {
         };
     }
 
+    /// `strArg` that tells an absent argument from a non-string one (prompt
+    /// arguments are strings on the wire, so there is no other `T`).
+    // secret-api-ok: `key` is a JSON object key (an argument name), not a secret
+    pub fn strArgChecked(self: *const PromptRequest, key: []const u8) Arg([]const u8) {
+        return lookupArg([]const u8, self.args, key);
+    }
+
     /// Append one text message to the rendered prompt (OOM swallowed — same
     /// policy as `ToolCall.write`).
     pub fn message(self: *PromptRequest, role: RoleAlias, msg_text: []const u8) void {
@@ -2492,6 +2797,49 @@ pub const PromptRequest = struct {
     pub fn printMessage(self: *PromptRequest, role: RoleAlias, comptime fmt: []const u8, fmt_args: anytype) void {
         const rendered = self.arena.print(fmt, fmt_args) catch return;
         self.message(role, rendered);
+    }
+
+    /// What the client declared (see `ToolCall.clientCapabilities`).
+    pub fn clientCapabilities(self: *const PromptRequest) ClientCapabilities {
+        return requestCaps(self.server, self.peer, self.modern);
+    }
+
+    /// What the client self-identified as (see `ToolCall.clientInfo`).
+    pub fn clientInfo(self: *const PromptRequest) ?ClientInfo {
+        if (self.modern) |r| return r.client;
+        const s = self.server orelse return null;
+        return s.clientInfo(self.peer);
+    }
+
+    /// The protocol revision this request is served under.
+    pub fn protocolVersion(self: *const PromptRequest) []const u8 {
+        if (self.modern) |r| return r.version;
+        const s = self.server orelse return protocol_version;
+        return s.negotiatedVersion(self.peer);
+    }
+
+    /// Emit one `notifications/progress` — a no-op without a progressToken.
+    pub fn reportProgress(self: *const PromptRequest, progress: u64, total: u64, msg: []const u8) void {
+        if (self.progress) |p| p.report(progress, total, msg);
+    }
+
+    /// Answer with a JSON-RPC error instead of the result (see
+    /// `ProtocolError`); returns `true`, which a resource handler's caller
+    /// reads as "mine" — no further template is tried.
+    pub fn failWith(self: *PromptRequest, pe: ProtocolError) bool {
+        self.protocol_error = pe;
+        return true;
+    }
+
+    /// `failWith(.{ .code = code, .message = message, .data_json = data_json })`.
+    pub fn failProtocol(self: *PromptRequest, code: i32, msg: []const u8, data_json: []const u8) bool {
+        return self.failWith(.{ .code = code, .message = msg, .data_json = data_json });
+    }
+
+    /// Answer with `URLElicitationRequiredError` (-32042); see
+    /// `ProtocolError.urlElicitationRequired`.
+    pub fn urlElicitationRequired(self: *PromptRequest, msg: []const u8, elicitations: []const ElicitationRequest.Url) SendError!bool {
+        return self.failWith(try ProtocolError.urlElicitationRequired(self.arena, self.clientCapabilities(), self.modern != null, msg, elicitations));
     }
 };
 
@@ -2835,6 +3183,25 @@ pub const Server = struct {
         try flushLine(out, aw.written());
     }
 
+    /// Tell `peer` that the out-of-band interaction of a URL-mode elicitation
+    /// it started has completed (`notifications/elicitation/complete`, spec
+    /// 2025-11-25 client/elicitation.mdx), so it may retry a request that got
+    /// `URLElicitationRequiredError`. The spec's MUST "only to the client that
+    /// initiated the elicitation" is why `peer` is required; a peer that did
+    /// not declare `elicitation.url` is refused, as `sendElicitationRequest`
+    /// refuses it. Session path only: 2026-07-28 has no such notification.
+    pub fn sendElicitationComplete(self: *Server, out: *std.Io.Writer, peer: u64, elicitation_id: []const u8) SendError!void {
+        if (!self.clientCapabilities(peer).elicitation_url) return error.ElicitationUrlNotSupported;
+        if (elicitation_id.len == 0) return error.MissingElicitationId;
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"elicitationId\":", .{OriginatedMethod.@"notifications/elicitation/complete".wire()}) catch return error.OutOfMemory;
+        std.json.Stringify.encodeJsonString(elicitation_id, .{}, w) catch return error.OutOfMemory;
+        w.writeAll("}}\n") catch return error.OutOfMemory;
+        try flushLine(out, aw.written());
+    }
+
     /// How many server→client requests are still awaiting an answer.
     pub fn pendingCount(self: *const Server) usize {
         return self.pending.items.len;
@@ -3149,10 +3516,10 @@ pub const Server = struct {
             .ping => try sendResultRaw(arena, out, id, "{}"),
             .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer, modern),
             .@"resources/list" => try self.handleResourcesList(arena, out, id, modern != null),
-            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), modern),
+            .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), peer, modern),
             .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id, modern != null),
             .@"prompts/list" => try self.handlePromptsList(arena, out, id, modern != null),
-            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), modern),
+            .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), peer, modern),
         }
     }
 
@@ -3376,18 +3743,8 @@ pub const Server = struct {
 
         const args: std.json.Value = params.object.get("arguments") orelse .null;
 
-        // MCP progress: a `params._meta.progressToken` opts the call into
-        // server→client `notifications/progress`. Serialize the token
-        // verbatim (string or number) so the reporter can echo it on every
-        // notification.
-        const prog: ?Progress = blk: {
-            const meta_v = params.object.get("_meta") orelse break :blk null;
-            if (meta_v != .object) break :blk null;
-            const token = meta_v.object.get("progressToken") orelse break :blk null;
-            if (token != .string and token != .integer) break :blk null;
-            const token_json = std.json.Stringify.valueAlloc(arena, token, .{}) catch break :blk null;
-            break :blk Progress{ .out = out, .token_json = token_json };
-        };
+        const req_meta = requestMeta(params.object);
+        const prog = progressFrom(arena, out, req_meta);
 
         const round = InputRound.fromParams(arena, modern, "tools/call", tool.name, params.object) catch |err| {
             return sendInputParamsError(arena, out, id, err);
@@ -3404,8 +3761,10 @@ pub const Server = struct {
             .peer = peer,
             .modern = modern,
             .input = round,
+            .meta = req_meta,
         };
         const is_error = tool.handler(tool.ctx, &call);
+        if (call.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (call.input.inputRequired()) return self.sendInputRequired(arena, out, id, &call.input);
         try sendToolResult(arena, out, id, tool_buf.items, .{
             .allow_structured = tool.allow_structured,
@@ -3488,7 +3847,7 @@ pub const Server = struct {
     /// the contents the handler filled. Unresolvable uri => -32002 on the
     /// session path; -32602 with `data.uri` on a 2026-07-28 request, which
     /// forbids -32002 (server/resources.mdx "Error Handling").
-    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern_req: ?*const ModernRequest) Error!void {
+    fn handleResourcesRead(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, modern_req: ?*const ModernRequest) Error!void {
         const modern = modern_req != null;
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
@@ -3507,12 +3866,23 @@ pub const Server = struct {
             return sendInputParamsError(arena, out, id, err);
         };
 
-        var req = ResourceRequest{ .arena = arena, .uri = uri_v.string, .cache = self.read_cache, .input = round };
+        const req_meta = requestMeta(params.object);
+        var req = ResourceRequest{
+            .arena = arena,
+            .uri = uri_v.string,
+            .cache = self.read_cache,
+            .input = round,
+            .progress = progressFrom(arena, out, req_meta),
+            .server = self,
+            .peer = peer,
+            .modern = modern_req,
+            .meta = req_meta,
+        };
         const found = blk: {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
             for (self.resource_templates.items) |*t| {
                 const handler = t.handler orelse continue;
-                if (handler(t.ctx, &req)) break :blk true;
+                if (handler(t.ctx, &req) or req.protocol_error != null) break :blk true;
                 // A declining template may have written partial contents, a
                 // caching hint or an input request before bailing — discard
                 // them before trying the next one.
@@ -3522,6 +3892,7 @@ pub const Server = struct {
             }
             break :blk false;
         };
+        if (req.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (req.input.inputRequired()) return self.sendInputRequired(arena, out, id, &req.input);
         if (!found) {
             if (modern) return sendErrorWithData(arena, out, id, error_code.invalid_params, "Resource not found", .{ .uri = req.uri });
@@ -3584,7 +3955,7 @@ pub const Server = struct {
     /// `prompts/get`: validate params + the declared required arguments
     /// (-32602 on any miss, so a handler never sees an incomplete required
     /// set), dispatch to the handler, send the rendered messages.
-    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, modern_req: ?*const ModernRequest) Error!void {
+    fn handlePromptsGet(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, modern_req: ?*const ModernRequest) Error!void {
         const modern = modern_req != null;
         const params = params_opt orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Missing params");
@@ -3624,8 +3995,19 @@ pub const Server = struct {
             return sendInputParamsError(arena, out, id, err);
         };
 
-        var req = PromptRequest{ .arena = arena, .args = args, .input = round };
+        const req_meta = requestMeta(params.object);
+        var req = PromptRequest{
+            .arena = arena,
+            .args = args,
+            .input = round,
+            .progress = progressFrom(arena, out, req_meta),
+            .server = self,
+            .peer = peer,
+            .modern = modern_req,
+            .meta = req_meta,
+        };
         const ok = prompt.handler(prompt.ctx, &req);
+        if (req.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (req.input.inputRequired()) return self.sendInputRequired(arena, out, id, &req.input);
         if (!ok) {
             return sendError(arena, out, id, error_code.internal_error, "Prompt failed");
@@ -4382,6 +4764,63 @@ test "tools/call: handler failure -> isError:true (missing required arg)" {
         \\
     );
     try testing.expectEqual(@as(u32, 1), app.calls); // handler was reached
+}
+
+test "ToolCall.arg: absent, null, wrong type and each value type apart (bxp request 2026-10-19)" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"s":"x","n":null,"i":5,"f":2.5,"fi":5.0,"b":true,"big":123456789012345678901234567890,"huge":1e300}
+    , .{});
+    defer parsed.deinit();
+    const a = parsed.value;
+    try testing.expectEqualStrings("x", lookupArg([]const u8, a, "s").value);
+    try testing.expect(lookupArg([]const u8, a, "nope") == .absent);
+    try testing.expect(lookupArg([]const u8, a, "n") == .absent);
+    try testing.expect(lookupArg([]const u8, a, "i") == .wrong_type);
+    try testing.expectEqual(@as(i64, 5), lookupArg(i64, a, "i").value);
+    try testing.expectEqual(@as(i64, 5), lookupArg(i64, a, "fi").value);
+    try testing.expect(lookupArg(i64, a, "f") == .wrong_type);
+    try testing.expect(lookupArg(i64, a, "s") == .wrong_type);
+    try testing.expect(lookupArg(i64, a, "huge") == .wrong_type);
+    try testing.expect(lookupArg(i64, a, "big") == .wrong_type);
+    try testing.expectEqual(@as(f64, 2.5), lookupArg(f64, a, "f").value);
+    try testing.expectEqual(@as(f64, 5), lookupArg(f64, a, "i").value);
+    try testing.expectEqual(@as(f64, 1.2345678901234568e29), lookupArg(f64, a, "big").value);
+    try testing.expect(lookupArg(f64, a, "b") == .wrong_type);
+    try testing.expect(lookupArg(bool, a, "b").value);
+    try testing.expect(lookupArg(bool, a, "i") == .wrong_type);
+    // Not an object: everything is absent, never wrong_type.
+    try testing.expect(lookupArg([]const u8, .null, "s") == .absent);
+}
+
+fn requireTool(_: ?*anyopaque, call: *ToolCall) bool {
+    const path = call.requireStr("path") orelse return true;
+    const depth = call.require(i64, "depth") orelse return true;
+    call.print("{s}:{d}", .{ path, depth });
+    return false;
+}
+
+test "ToolCall.require: 'missing' and 'must be' are told apart on the wire" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "req", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = requireTool });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"req","arguments":{"path":5}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"error: 'path' must be a string"}],"isError":true}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"req","arguments":{"path":"/a"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"error: missing 'depth'"}],"isError":true}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"req","arguments":{"path":"/a","depth":2.0}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"/a:2"}],"isError":false}}
+        \\
+    );
 }
 
 test "tools/call: NDJSON tool stays text-only (allow_structured=false)" {
@@ -5666,6 +6105,175 @@ test "elicitation: url request line is byte-identical to the spec's example" {
         \\{"jsonrpc":"2.0","id":1,"method":"elicitation/create","params":{"mode":"url","elicitationId":"550e8400-e29b-41d4-a716-446655440000","url":"https://mcp.example.com/ui/set_api_key","message":"Please provide your API key to continue."}}
         \\
     , aw.written());
+}
+
+test "elicitation: notifications/elicitation/complete is byte-identical to the spec's example" {
+    var s = try serverWithCaps("{\"elicitation\":{\"url\":{}}}");
+    defer s.deinit();
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.sendElicitationComplete(&aw.writer, 0, "550e8400-e29b-41d4-a716-446655440000");
+    // Verbatim from the MCP 2025-11-25 elicitation page ("Completion Notifications
+    // for URL Mode Elicitation"), compacted.
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"notifications/elicitation/complete","params":{"elicitationId":"550e8400-e29b-41d4-a716-446655440000"}}
+        \\
+    , aw.written());
+    // Only to a client that can have started one, and never without an id.
+    try testing.expectError(error.MissingElicitationId, s.sendElicitationComplete(&aw.writer, 0, ""));
+    try testing.expectError(error.ElicitationUrlNotSupported, s.sendElicitationComplete(&aw.writer, 7, "x"));
+    var form_only = try serverWithCaps("{\"elicitation\":{}}");
+    defer form_only.deinit();
+    try testing.expectError(error.ElicitationUrlNotSupported, form_only.sendElicitationComplete(&aw.writer, 0, "x"));
+}
+
+const spec_url_elicitation = [_]ElicitationRequest.Url{.{
+    .message = "Authorization is required to access your Example Co files.",
+    .url = "https://mcp.example.com/connect?elicitationId=550e8400-e29b-41d4-a716-446655440000",
+    .elicitation_id = "550e8400-e29b-41d4-a716-446655440000",
+}};
+
+fn urlRequiredTool(_: ?*anyopaque, call: *ToolCall) bool {
+    return call.urlElicitationRequired("This request requires more information.", &spec_url_elicitation) catch call.fail("refused");
+}
+
+test "URLElicitationRequiredError: a tool's -32042 is byte-identical to the spec's example" {
+    var s = try serverWithCaps("{\"elicitation\":{\"url\":{}}}");
+    defer s.deinit();
+    try s.addTool(.{ .name = "files", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = urlRequiredTool });
+    // MCP 2025-11-25 client/elicitation.mdx "URL Elicitation Required Error",
+    // compacted, its `// URL_ELICITATION_REQUIRED` comment dropped.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"files","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32042,"message":"This request requires more information.","data":{"elicitations":[{"mode":"url","elicitationId":"550e8400-e29b-41d4-a716-446655440000","url":"https://mcp.example.com/connect?elicitationId=550e8400-e29b-41d4-a716-446655440000","message":"Authorization is required to access your Example Co files."}]}}}
+        \\
+    );
+    // A client without `elicitation.url` gets no -32042 (it could not act on
+    // one): the builder refuses, and this tool falls back to a tool failure.
+    var form_only = try serverWithCaps("{\"elicitation\":{}}");
+    defer form_only.deinit();
+    try form_only.addTool(.{ .name = "files", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = urlRequiredTool });
+    try expectResponse(&form_only,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"files","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"error: refused"}],"isError":true}}
+        \\
+    );
+}
+
+test "URLElicitationRequiredError: the builder's refusals" {
+    const url_caps: ClientCapabilities = .{ .elicitation = true, .elicitation_url = true };
+    try testing.expectError(error.StatelessRequest, ProtocolError.urlElicitationRequired(testing.allocator, url_caps, true, "m", &spec_url_elicitation));
+    try testing.expectError(error.NoMessages, ProtocolError.urlElicitationRequired(testing.allocator, url_caps, false, "m", &.{}));
+    try testing.expectError(error.ElicitationNotSupported, ProtocolError.urlElicitationRequired(testing.allocator, .{}, false, "m", &spec_url_elicitation));
+    const bad = [_]ElicitationRequest.Url{.{ .message = "m", .url = "javascript:alert(1)", .elicitation_id = "1" }};
+    try testing.expectError(error.InvalidUrl, ProtocolError.urlElicitationRequired(testing.allocator, url_caps, false, "m", &bad));
+    const no_id = [_]ElicitationRequest.Url{.{ .message = "m", .url = "https://x.example/", .elicitation_id = "" }};
+    try testing.expectError(error.MissingElicitationId, ProtocolError.urlElicitationRequired(testing.allocator, url_caps, false, "m", &no_id));
+}
+
+fn needsElicitationTool(_: ?*anyopaque, call: *ToolCall) bool {
+    if (call.clientCapabilities().elicitation) return call.fail("unexpected");
+    return call.failWith(ProtocolError.missingClientCapability("Server requires the elicitation capability for this request", "{\"elicitation\":{}}"));
+}
+
+test "MissingRequiredClientCapabilityError: value-equal to the 2026-07-28 schema example" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "ask", .description = "d", .input_schema = "{\"type\":\"object\"}", .handler = needsElicitationTool });
+    // schema/2026-07-28/examples/MissingRequiredClientCapabilityError/
+    // missing-elicitation-capability.json, compacted (same member order).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ask","arguments":{},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32021,"message":"Server requires the elicitation capability for this request","data":{"requiredCapabilities":{"elicitation":{}}}}}
+        \\
+    );
+}
+
+fn protoErrResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    if (std.mem.eql(u8, req.uri, "x://bad-data")) return req.failProtocol(-32000, "custom", "{not json");
+    if (std.mem.eql(u8, req.uri, "x://gone")) return req.failProtocol(-32000, "gone for good", "{\"uri\":\"x://gone\"}");
+    return false;
+}
+
+fn protoErrPrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.message(.user, "never sent");
+    return req.failProtocol(error_code.invalid_params, "unknown dialect", "");
+}
+
+test "ProtocolError: resource templates and prompts answer the handler's own error" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "x://{name}", .name = "x", .handler = protoErrResource });
+    try s.addPrompt(.{ .name = "p", .handler = protoErrPrompt });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"x://gone"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"gone for good","data":{"uri":"x://gone"}}}
+        \\
+    );
+    // Data that is not JSON never reaches the wire as such.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"x://bad-data"}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"Handler error data is not JSON"}}
+        \\
+    );
+    // A template that only declines still means "not found".
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"x://other"}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Resource not found"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"prompts/get","params":{"name":"p"}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"unknown dialect"}}
+        \\
+    );
+}
+
+fn contextPrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.reportProgress(1, 2, "rendering");
+    const who = if (req.clientInfo()) |c| c.name else "?";
+    req.printMessage(.user, "{s} {s} {}", .{ who, req.protocolVersion(), req.clientCapabilities().elicitation });
+    return true;
+}
+
+fn contextResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    req.reportProgress(1, 1, "");
+    const tag = if (req.meta == .object) "meta" else "none";
+    req.text(req.uri, "", tag);
+    return true;
+}
+
+test "request context: prompt and resource handlers see progress, client and version" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addPrompt(.{ .name = "ctx", .handler = contextPrompt });
+    try s.addResource(.{ .uri = "x://r", .name = "r", .handler = contextResource });
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"cli","version":"1"}}}
+    , &sink.writer);
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"ctx","_meta":{"progressToken":"t1"}}}
+    ,
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"t1","progress":1,"total":2,"message":"rendering"}}
+        \\{"jsonrpc":"2.0","id":1,"result":{"messages":[{"role":"user","content":{"type":"text","text":"cli 2025-11-25 true"}}]}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"x://r","_meta":{"progressToken":7}}}
+    ,
+        \\{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":7,"progress":1,"total":1,"message":""}}
+        \\{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"x://r","text":"meta"}]}}
+        \\
+    );
 }
 
 test "elicitation: a 2025-06-18 peer gets no `mode` field (that revision has none)" {
@@ -6972,7 +7580,7 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
             },
         }
     }
-    try testing.expectEqual(@as(usize, 8), literal);
+    try testing.expectEqual(@as(usize, 9), literal);
     try testing.expectEqual(@as(usize, 6), partial);
     try testing.expectEqual(@as(usize, 3), no_example);
 }

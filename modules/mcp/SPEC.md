@@ -246,7 +246,7 @@ client/host roles, roots, subscriptions and list-change notifications, paginatio
 the HTTP/SSE session transport (the sibling `mcp-http` module). Also out of scope within the
 sampling/elicitation surface: sampling-with-tools (`tools`/`toolChoice` and the tool-use/tool-result
 message shapes — `SamplingResult.parse` refuses an array content block rather than half-decoding
-it), `includeContext`, `metadata`, and emitting `notifications/elicitation/complete`.
+it), `includeContext` and `metadata` (`notifications/elicitation/complete` is emitted since 2026-10-20: `Server.sendElicitationComplete`).
 
 **Sampling's trust asymmetry.** The server picks the prompt; the client owns the model access, the
 credential and the bill. The spec expects a human in the loop client-side, but a server MUST NOT
@@ -412,6 +412,34 @@ tell); a NaN model priority. No defect. Run: `zig build test-mcp`.
 
 ## Backlog / deferred
 
+**S2 plan — survey 2026-10-20** (goal: scope `core` → `parity` with the official SDKs' server side;
+TypeScript SDK v2.3.1 docs, Python SDK v2.3.0 source (MIT); the owner allowed reading the TS/Go/Rust
+SDK source too on 2026-10-20 — mid MIT→Apache-2.0, both permissive). Ranked; decisions are the
+coordinator's under the rule "parity with the reference, or safer":
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | Tool-result content blocks: `image`, `audio`, `resource_link`, embedded `resource`, several per result, block `annotations`; prompt messages with the same blocks | M | do — additive, text stays the default |
+| R2 | Handler-chosen protocol errors (`code`, `message`, `data`) for tools/resources/prompts; `URLElicitationRequiredError` (-32042) and `MissingRequiredClientCapability` (-32021) builders | S | **DONE 2026-10-20** |
+| R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
+| R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | do |
+| R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | do — `serve` stays serial; a concurrent stdio loop is opt-in |
+| R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (bxp request) | S | **DONE 2026-10-20** |
+| R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | do — needs a schema validator; none exists in zig-libs |
+| R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | do |
+| R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | do — generic hook; Apps/Skills helpers later |
+| R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | do |
+| R11 | `completion/complete` for prompt arguments and template variables | M | do |
+| R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | do — both SDKs ship it |
+| R13 | `notifications/elicitation/complete` (session era) | S | **DONE 2026-10-20** |
+| R14 | RFC 6570 resource-template matching with extracted variables | M | do |
+| — | Logging (`logging/setLevel`, `notifications/message`, per-request `logLevel` in `_meta`) | S | do — deprecated (SEP-2577) but both SDKs ship it inside the 12-month window |
+
+Deliberately not doing: the tasks extension (no SDK has it in core; TS v2 removed task interception),
+sampling-with-tools and `includeContext` (sampling deprecated, SEP-2577/2596), roots, legacy HTTP+SSE,
+JSON-RPC batching, full JSON Schema 2020-12. Framework ergonomics (middleware, OpenTelemetry, lifespan)
+and OAuth belong to `mcp-http`/`aaa-gate`, not the core.
+
 None recorded beyond the explicit out-of-scope list above (client/host roles, roots, subscriptions,
 pagination, sampling-with-tools, `notifications/elicitation/complete`). Worth revisiting if a
 consumer needs it: sampling-with-tools is the largest remaining piece (a multi-turn tool loop with
@@ -419,13 +447,15 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 `URLElicitationRequiredError` (-32042) is exposed as a code but not as a helper that builds its
 `data.elicitations` payload.
 
-- **Requested (bxp, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
+- ~~**Requested (bxp, 2026-10-19): `ToolCall.strArg` cannot tell a missing argument from a wrong-typed
   one** (`src/root.zig` `strArg`: null for both). A handler can only answer "missing 'config'" to
   `"config": 5`; bxp works around it by inspecting `call.args` itself (`bxp-mcp/src/tools.zig`
   `wrongType`/`reqStr`, marked `zig-libs request: mcp`). Proposed: `ToolCall.strArgChecked(key)`
   returning `union(enum) { absent, value: []const u8, wrong_type }` (same on `PromptRequest`), and
   optionally `requireStr(key)` writing "'<key>' must be a string" / "missing '<key>'" via `fail`.
-  JSON-Schema validators and other MCP SDKs report type errors apart from missing properties.
+  JSON-Schema validators and other MCP SDKs report type errors apart from missing properties.~~
+  **DONE 2026-10-20** (R6): `ToolCall.arg(T, key)` / `require(T, key)` / `strArgChecked`;
+  bxp can drop `wrongType`/`reqStr` after its repin.
 
 **Survey 2026-09-30 — missing and it matters** (all fit CONVENTIONS §2: pure Zig, std only):
 

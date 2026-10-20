@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 work, first batch (survey R-list in SPEC Backlog). **Additive, no wire change for
+  existing servers.**
+  - `ToolCall.arg(T, key)` → `Arg(T)` (`absent` / `value` / `wrong_type`) for `[]const u8`, `i64`, `f64`,
+    `bool`; `require(T, key)`/`requireStr` write "missing 'k'" or "'k' must be …" (bxp request 10-19);
+    `PromptRequest.strArgChecked`.
+  - `ProtocolError` + `failWith`/`failProtocol` on tools, resources and prompts: a handler answers with
+    its own JSON-RPC error (`code`, `message`, `data`) instead of a result; it wins over `input.ask`.
+    Builders `ProtocolError.urlElicitationRequired` (-32042, session path, checked like a URL-mode
+    elicitation) and `missingClientCapability` (-32021); `ToolCall.urlElicitationRequired`.
+  - `Server.sendElicitationComplete` (`notifications/elicitation/complete`, byte-identical to the spec).
+  - `PromptRequest`/`ResourceRequest` carry the request context `ToolCall` had: progress,
+    `clientCapabilities`/`clientInfo`/`protocolVersion`, `meta` (`params._meta`); `ToolCall.meta` too.
 - **2026-10-18** — Ported to Zig 0.17.0. Tests: `comptime std.meta.fieldNames(..)` (now returns a slice), enum `field_names`/`field_values`.
 - **2026-10-09** — docs: ct axis recorded as n/a: no auth token, key or crypto; `looksLikeSecretField` checks schema field names only (code review).
 - **2026-10-09** — tests: deterministic fuzz driver `MCP_FUZZ` over the existing harnesses (`handleMessage` on arbitrary and on damaged corpus lines, client responses).
