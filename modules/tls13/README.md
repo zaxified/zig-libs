@@ -8,7 +8,7 @@ The TLS 1.3 handshake building blocks shared by the collection's TLS-family engi
   including the resumption, exporter and KeyUpdate steps;
 - `certverify`: the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify for
   ECDSA P-256/P-384, Ed25519 and RSA-PSS (`rsa_pss_rsae_sha256/384/512`);
-- `kex`: the (EC)DHE key exchange for x25519, secp256r1 and the X25519MLKEM768 hybrid — a
+- `kex`: the (EC)DHE key exchange for x25519, secp256r1, secp384r1 and the X25519MLKEM768 hybrid — a
   client's share, the server's one-step answer, the client's shared secret.
 
 Pure functions over caller bytes: no I/O, no allocation, no key storage, no

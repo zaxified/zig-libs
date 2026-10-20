@@ -74,13 +74,14 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 ### Key exchange (`kex.zig`, RFC 8446 §4.2.8 / §7.4, draft-ietf-tls-ecdhe-mlkem)
 
 - Groups by `NamedGroup` code point: `x25519_group` 0x001d, `secp256r1_group` 0x0017,
-  `x25519_mlkem768_group` 0x11ec. `expectedShareLen(group)`: the exact CLIENT-form share length
-  (32 / 65 / 1216; 0 = not computed here).
-- `generate(group, random, *KeyPair)`: x25519 (clamped scalar), secp256r1 (rejection-sampled
+  `secp384r1_group` 0x0018, `x25519_mlkem768_group` 0x11ec. `expectedShareLen(group)`: the exact
+  CLIENT-form share length (32 / 65 / 97 / 1216; 0 = not computed here). `scalarLen(group)`: the
+  prefix of `KeyPair.secret` the group uses (32 / 32 / 48 / 96; 0 = not computed here).
+- `generate(group, random, *KeyPair)`: x25519 (clamped scalar), secp256r1/secp384r1 (rejection-sampled
   scalar in [1, n-1], share `0x04 ‖ X ‖ Y`), hybrid (ML-KEM-768 keygen seed + X25519 scalar,
   share `encapsulation key ‖ X25519 public`, ML-KEM first).
 - `sharedSecret(group, secret, peer_share, *SharedSecret)` on the side holding a private key:
-  X25519 output; for P-256 the shared point's X coordinate only (RFC 8446 §7.4.2); for the
+  X25519 output; for P-256/P-384 the shared point's X coordinate only (RFC 8446 §7.4.2); for the
   hybrid `ss_MLKEM ‖ ss_X25519` (64 bytes, no combiner), from the 1120-byte server form
   `ciphertext ‖ X25519 public`.
 - `serverExchange(group, client_share, random, *ServerExchange)`: the server's answer in one
@@ -130,8 +131,8 @@ steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_b
 `ed25519_burn` 40 KiB, `rsa_burn` 8 KiB above `rsa`'s own); secret keys are borrowed by pointer
 in every `SecretKey` variant. Probed by `dtls`'s `stackprobe_test.zig`/`stackprobe2_test.zig`
 (ReleaseFast), through the `keyschedule` shim and the `certverify` re-export. `kex`'s entry
-points burn per group (`kex_x25519_burn` 96 KiB, `kex_p256_burn` 112 KiB, `kex_hybrid_burn`
-160 KiB, ~1.6–2× the unburned ReleaseFast depth, deepest 58 / 64 / 78 KiB) and are probed by
+points burn per group (`kex_x25519_burn` 96 KiB, `kex_p256_burn` and `kex_p384_burn` 112 KiB,
+`kex_hybrid_burn` 160 KiB, ~1.6–2× the unburned ReleaseFast depth, deepest 58 / 64 / 67 / 78 KiB) and are probed by
 this module's own `stackprobe_test.zig` (residue below the burn, secrets as needles). Cost: one
 burn per exchange, ~2–3 µs of stack zeroing at ~50 B/ns.
 
@@ -174,8 +175,8 @@ and the handshake fails at Finished.
   tests. In addition `dtls`'s wolfSSL 5.9.1 replay (14 flows, certificate mode included) runs
   these signatures against a foreign implementation's transcript.
 
-- **kex:** x25519 against RFC 8448 §3's ephemeral keys and shared secret; secp256r1 against
-  Python `cryptography` 46.0.5 / OpenSSL 3.5.5 ECDH (both sides, X-coordinate output); the
+- **kex:** x25519 against RFC 8448 §3's ephemeral keys and shared secret; secp256r1 and
+  secp384r1 against Python `cryptography` 46.0.5 / OpenSSL 3.5.5 ECDH (both sides, X-coordinate output); the
   hybrid's two halves each pinned against the primitive it must equal (direct decapsulation,
   direct scalarmult). In addition `dtls`'s wolfSSL 5.9.1 replay runs all three groups against a
   foreign implementation (x25519 5 flows, P-256 2, X25519MLKEM768 3).

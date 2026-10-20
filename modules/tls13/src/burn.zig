@@ -68,6 +68,8 @@ pub const rsa_burn = 8 * 1024;
 pub const kex_x25519_burn = 96 * 1024;
 /// secp256r1 (std P-256): 24.0 / 64.1 / 36.8 KiB.
 pub const kex_p256_burn = 112 * 1024;
+/// secp384r1 (std P-384): 27.4 / 66.5 / 39.8 KiB.
+pub const kex_p384_burn = 112 * 1024;
 /// X25519MLKEM768 (ML-KEM-768 keygen / encaps / decaps plus X25519):
 /// 61.4 / 60.9 / 77.6 KiB.
 pub const kex_hybrid_burn = 160 * 1024;
