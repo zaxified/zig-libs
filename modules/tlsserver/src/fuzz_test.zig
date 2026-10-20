@@ -1185,6 +1185,7 @@ const rsa = @import("rsa");
 const SrvMark = Marker(enum {
     openssl_case,
     go_case,
+    retry_case,
     genuine_chunked,
     genuine_bytewise,
     truncated_waits,
@@ -1197,6 +1198,7 @@ const SrvMark = Marker(enum {
     finished_forged_refused,
     finished_repadded,
     plain_alert,
+    plain_alert_after_retry,
     sealed_alert,
     closed_after_error,
 });
@@ -1316,14 +1318,25 @@ fn checkFailure(server: *server_mod.Server, run: *SrvRun, err: server_mod.Error,
         if (added.len != 0) return error.AlertAfterClose;
         return;
     };
-    // The alert is the last record out: in plaintext if it is all the
-    // server ever sent, else sealed (2 octets + inner type + tag) after the
-    // flight — which may have gone out in this same `feed`.
+    // The alert is the last record out: in plaintext while the server has
+    // sent nothing protected (nothing at all, or a HelloRetryRequest and
+    // its CCS), else sealed (2 octets + inner type + tag) after the flight
+    // — which may have gone out in this same `feed`.
     const all = run.out.items;
-    if (all.len == 7) {
+    var starts_buf: [64]usize = undefined;
+    const starts = recordStarts(all, &starts_buf);
+    const any_sealed = for (starts) |s| {
+        if (all[s] == 23) break true;
+    } else false;
+    if (!any_sealed) {
         const level: u8 = if (d == .close_notify) 1 else 2;
         const want = [7]u8{ 21, 3, 3, 0, 2, level, @backingInt(d) };
-        if (!std.mem.eql(u8, all, &want)) return error.WrongPlainAlert;
+        if (all.len < 7 or !std.mem.eql(u8, all[all.len - 7 ..], &want)) return error.WrongPlainAlert;
+        // Before the alert: nothing, or exactly HelloRetryRequest + CCS.
+        if (all.len != 7) {
+            if (starts.len != 3 or all[0] != 22 or all[starts[1]] != 20) return error.WrongPlainAlert;
+            SrvMark.mark(.plain_alert_after_retry);
+        }
         SrvMark.mark(.plain_alert);
         return;
     }
@@ -1355,6 +1368,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (v.cert != .rsa2048 or src.valueRangeAtMost(u8, 0, 9) == 0) break;
     }
     if (std.mem.startsWith(u8, v.name, "go-")) SrvMark.mark(.go_case) else SrvMark.mark(.openssl_case);
+    if (std.mem.indexOf(u8, v.name, "hrr") != null) SrvMark.mark(.retry_case);
     const ck = &fk.cks[@backingInt(v.cert)];
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);

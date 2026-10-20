@@ -72,7 +72,12 @@ NoSupportedVersions
 PackedEncryptedHandshake-TLS13
 PartialClientFinishedWithClientHello
 PartialClientFinishedWithClientHello-NoCCS
+PartialClientFinishedWithSecondClientHello
+PartialClientFinishedWithSecondClientHello-NoCCS
+PartialSecondClientHelloAfterFirst
 RSA-PSS-Large
+SecondClientHelloMissingKeyShare-TLS13
+SecondClientHelloWrongCurve-TLS13
 Server-FullSessionID-TLS13
 Server-JDK11-NoWorkaround-0
 Server-JDK11-NoWorkaround-1
@@ -84,6 +89,7 @@ Server-JDK11-NoWorkaround-5
 Server-JDK11-NoWorkaround-6
 Server-JDK11-NoWorkaround-7
 Server-JDK11-NoWorkaround-8
+Server-JDK11-NoWorkaround-9
 Server-ShortSessionID-TLS13
 Server-SignDefault-ECDSA_P256_SHA256-TLS13
 Server-SignDefault-ECDSA_P384_SHA384-TLS13
@@ -103,7 +109,11 @@ ServerAuth-SignatureType-TLS13
 ServerPaddingServer-NoServerSupport
 ServerPaddingServer-NotRequested
 SkipChangeCipherSpec-Server-TLS13
+SkipEarlyData-HRR-FatalAlert-TLS13
+SkipEarlyData-HRR-Interleaved-TLS13
+SkipEarlyData-HRR-TooMuchData-TLS13
 SkipEarlyData-Interleaved-TLS13
+SkipEarlyData-OmitEarlyDataExtension-HelloRetryRequest-TLS13
 SkipEarlyData-OmitEarlyDataExtension-TLS13
 SkipEarlyData-TLS13
 SkipEarlyData-TooMuchData-TLS13

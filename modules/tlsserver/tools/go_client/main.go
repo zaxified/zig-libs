@@ -101,6 +101,7 @@ func main() {
 	fmt.Printf("group: %s\n", cs.CurveID)
 	fmt.Printf("alpn: %s\n", cs.NegotiatedProtocol)
 	fmt.Printf("peer_certs: %d\n", len(cs.PeerCertificates))
+	fmt.Printf("hrr: %v\n", cs.HelloRetryRequest)
 
 	if _, err := conn.Write([]byte("ping\n")); err != nil {
 		fail("write: %v", err)

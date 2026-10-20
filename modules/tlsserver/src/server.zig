@@ -22,18 +22,24 @@
 //! - **cipher suite** the client's first that the server enables;
 //! - **group** the client's first `supported_groups` entry the server
 //!   enables (no `supported_groups` or no `key_share` at all is
-//!   `missing_extension`, RFC 8446 §9.2), and the client must have sent a
-//!   share for it — the
-//!   HelloRetryRequest that would ask for one comes with M2, so for now it
-//!   is `handshake_failure`;
+//!   `missing_extension`, RFC 8446 §9.2); without a share for it the
+//!   server sends a HelloRetryRequest naming it (no cookie, RFC 8446
+//!   §4.1.4);
+//! - **second ClientHello** (after a HelloRetryRequest) must carry a share
+//!   for the group asked for, still offer the suite named, the same SNI and
+//!   no `early_data` (`illegal_parameter` otherwise; rustls re-chooses suite
+//!   and group, RFC 8446 §4.1.4/§4.2.8 bind them); the transcript starts
+//!   with `message_hash` (RFC 8446 §4.4.1). A ClientHello that triggers the
+//!   retry must end its record flight (`unexpected_message`);
 //! - **ALPN** the server's first protocol the client offers; none in
 //!   common while the server has some is `no_application_protocol`;
-//! - a compatibility `change_cipher_spec` follows the ServerHello; the
+//! - a compatibility `change_cipher_spec` follows the first ServerHello
+//!   or HelloRetryRequest (one per connection, as rustls); the
 //!   EncryptedExtensions acknowledge a DNS-name SNI with an empty
 //!   `server_name` and carry the ALPN choice; an OCSP response is stapled
 //!   to the leaf if the client asked for one.
 //!
-//! Not yet (later milestones): HelloRetryRequest, PSK resumption and
+//! Not yet (later milestones): PSK resumption and
 //! NewSessionTicket, client certificates, KeyUpdate. A pre_shared_key offer
 //! is ignored (full handshake); early data is never accepted and is skipped
 //! (`inbound.Inbound.skip_early`).
@@ -141,7 +147,8 @@ pub fn alertFor(err: Error) ?alert.Description {
 /// An output buffer that holds the first flight for `ck`: ServerHello
 /// (with the largest share), CCS, EncryptedExtensions (ALPN), the chain
 /// with an OCSP staple, CertificateVerify, Finished, each record's
-/// overhead, plus one alert.
+/// overhead, plus one alert — and a HelloRetryRequest with its CCS, should
+/// the caller not drain the output between the two ClientHellos.
 pub fn minOutputLen(ck: *const CertifiedKey) usize {
     var chain: usize = 3;
     for (ck.chain) |c| chain += 3 + c.len + 2;
@@ -149,7 +156,8 @@ pub fn minOutputLen(ck: *const CertifiedKey) usize {
     const sig = for (certverify.candidateSchemes(ck.key)) |s| {
         break certverify.maxSignatureLen(s);
     } else 0;
-    const flight = (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.hybrid_server_share_len + 6) + // ServerHello
+    const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
+    const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.hybrid_server_share_len + 6) + // ServerHello
         6 + // CCS
         (4 + 2 + 4 + 2 + 1 + 255 + 4) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
@@ -174,7 +182,7 @@ pub const Result = struct {
     consumed: usize,
 };
 
-const State = enum { client_hello, client_finished, connected, failed };
+const State = enum { client_hello, client_hello_retry, client_finished, connected, failed };
 
 const Transcript = union(enum) {
     sha256: tls13.transcript.Transcript(Sha256),
@@ -360,7 +368,7 @@ pub const Server = struct {
     fn onHandshake(self: *Server, m: inbound.HandshakeMessage) Error!bool {
         const t: messages.HandshakeType = @fromBackingInt(m.msg_type);
         switch (self.state) {
-            .client_hello => {
+            .client_hello, .client_hello_retry => {
                 if (t != .client_hello) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientHello, .{ self, m });
                 return false;
@@ -378,6 +386,7 @@ pub const Server = struct {
 
     fn onClientHello(self: *Server, m: inbound.HandshakeMessage) Error!void {
         const cfg = self.config;
+        const retried = self.state == .client_hello_retry;
         const ch = hello.parseClientHello(m.body) catch |err| return switch (err) {
             error.DecodeError => error.DecodeError,
             error.IllegalParameter => error.IllegalParameter,
@@ -389,6 +398,8 @@ pub const Server = struct {
             .ip_address => {},
             .invalid => return error.IllegalParameter,
         };
+        // rustls `ServerNameDifferedOnRetry`.
+        if (retried and !optEql(sni, self.serverName())) return error.IllegalParameter;
         // The version first: a TLS 1.2 (or older) client gets
         // `protocol_version` whatever else its hello lacks (rustls order).
         const versions = ch.supportedVersions() orelse return error.ProtocolVersion;
@@ -404,15 +415,26 @@ pub const Server = struct {
         } else return error.HandshakeFailure;
 
         var cs = ch.cipherSuites();
-        const suite: record.CipherSuite = while (cs.next()) |c| {
+        var suite: record.CipherSuite = while (cs.next()) |c| {
             const cand: record.CipherSuite = @fromBackingInt(c);
             if (cand.hashLen() != null and std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) break cand;
         } else return error.HandshakeFailure;
+        // RFC 8446 §4.1.4: the ServerHello repeats the HelloRetryRequest's
+        // suite, so the second hello must still offer it (stricter than
+        // rustls, which re-chooses and compares only the hash: a client
+        // would abort on the change anyway).
+        if (retried) {
+            if (!ch.cipherSuites().contains(@backingInt(self.suite))) return error.IllegalParameter;
+            suite = self.suite;
+        }
         // RFC 8446 §9.2: supported_groups and key_share come together.
         var gs = ch.supportedGroups() orelse return error.MissingExtension;
-        const group: u16 = while (gs.next()) |g| {
+        var group: u16 = while (gs.next()) |g| {
             if (std.mem.indexOfScalar(u16, cfg.groups, g) != null) break g;
         } else return error.HandshakeFailure;
+        // RFC 8446 §4.2.8: the second hello's share is for the group asked
+        // for, whatever its supported_groups now prefer (rustls re-chooses).
+        if (retried) group = self.group;
 
         if (ch.legacy_compression_methods.len != 1) return error.IllegalParameter;
         var shares = ch.keyShares() orelse return error.MissingExtension;
@@ -423,8 +445,13 @@ pub const Server = struct {
             seen.set(e.group);
             if (e.group == group) share = e.key_exchange;
         }
-        // M2: a HelloRetryRequest for `group`.
-        const client_share = share orelse return error.HandshakeFailure;
+        // RFC 8446 §4.2.10: no early data after a HelloRetryRequest.
+        if (retried and ch.early_data) return error.IllegalParameter;
+        const client_share = share orelse {
+            // rustls `RefusedToFollowHelloRetryRequest`.
+            if (retried) return error.IllegalParameter;
+            return self.helloRetry(m.raw, &ch, suite, group, sni);
+        };
         if (ch.pre_shared_key != null and ch.psk_key_exchange_modes == null) return error.MissingExtension;
 
         if (ch.alpn()) |theirs| {
@@ -438,10 +465,7 @@ pub const Server = struct {
             }
             if (self.alpn == null and cfg.alpn_protocols.len != 0) return error.NoApplicationProtocol;
         }
-        if (sni) |n| {
-            @memcpy(self.sni_buf[0..n.len], n);
-            self.sni_len = @intCast(n.len);
-        }
+        self.setServerName(sni);
 
         var ex: kex.ServerExchange = undefined;
         defer std.crypto.secureZero(u8, &ex.shared.bytes);
@@ -453,22 +477,79 @@ pub const Server = struct {
             error.MissingKeyShare => if (kex.expectedShareLen(group) != 0) error.IllegalParameter else error.InternalError,
         };
 
+        if (!retried) self.startTranscript(suite);
         self.suite = suite;
         self.has_suite = true;
         self.group = group;
         switch (suite) {
-            .aes_256_gcm_sha384 => {
-                self.transcript = .{ .sha384 = .{} };
-                try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex);
-            },
-            else => {
-                self.transcript = .{ .sha256 = .{} };
-                try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex);
-            },
+            .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried),
+            else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried),
         }
-        // Early data the client may have sent under a PSK we did not take.
-        if (ch.early_data) self.inbound.skip_early = record.max_plaintext_len;
+        // Early data the client may have sent under a PSK we did not take
+        // (never after a retry: refused above).
+        self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
         self.state = .client_finished;
+    }
+
+    fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+        if (a == null or b == null) return a == null and b == null;
+        return std.mem.eql(u8, a.?, b.?);
+    }
+
+    fn setServerName(self: *Server, sni: ?[]const u8) void {
+        if (sni) |n| {
+            @memcpy(self.sni_buf[0..n.len], n);
+            self.sni_len = @intCast(n.len);
+        } else self.sni_len = null;
+    }
+
+    fn startTranscript(self: *Server, suite: record.CipherSuite) void {
+        self.transcript = switch (suite) {
+            .aes_256_gcm_sha384 => .{ .sha384 = .{} },
+            else => .{ .sha256 = .{} },
+        };
+    }
+
+    /// RFC 8446 §4.1.4: ask for a share of `group`. The transcript becomes
+    /// `message_hash(Hash(ClientHello1)) ‖ HelloRetryRequest` (§4.4.1).
+    fn helloRetry(
+        self: *Server,
+        client_hello_raw: []const u8,
+        ch: *const hello.ClientHello,
+        suite: record.CipherSuite,
+        group: u16,
+        sni: ?[]const u8,
+    ) Error!void {
+        // rustls `check_aligned_handshake`: nothing of the next flight may
+        // ride with the first ClientHello.
+        if (!self.inbound.joiner.isEmpty()) return error.UnexpectedMessage;
+        self.startTranscript(suite);
+        self.suite = suite;
+        self.has_suite = true;
+        self.group = group;
+        self.setServerName(sni);
+        switch (suite) {
+            .aes_256_gcm_sha384 => try self.sendRetry(S384, client_hello_raw, ch),
+            else => try self.sendRetry(S256, client_hello_raw, ch),
+        }
+        try self.out.write(.change_cipher_spec, &.{1});
+        // One compatibility CCS per ClientHello (rustls).
+        self.inbound.ccs_left += 1;
+        // RFC 8446 §4.2.10: the client's early data is skipped up to the
+        // budget (rustls: 16 KiB when the server takes none).
+        self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
+        self.state = .client_hello_retry;
+    }
+
+    fn sendRetry(self: *Server, comptime H: type, client_hello_raw: []const u8, ch: *const hello.ClientHello) Error!void {
+        const t = H.transcript(&self.transcript);
+        t.append(client_hello_raw[0], client_hello_raw[4..]);
+        t.resetToMessageHash(t.currentHash());
+        try self.send(H, try encoded(messages.helloRetryRequest(self.out.slot(), .{
+            .legacy_session_id_echo = ch.legacy_session_id,
+            .cipher_suite = @backingInt(self.suite),
+            .selected_group = self.group,
+        })));
     }
 
     /// Frame the message just encoded at the start of the output slot and
@@ -494,6 +575,8 @@ pub const Server = struct {
         scheme: certverify.SignatureScheme,
         group: u16,
         ex: *const kex.ServerExchange,
+        /// The compatibility CCS, unless it followed a HelloRetryRequest.
+        ccs: bool,
     ) Error!void {
         const cfg = self.config;
         const t = H.transcript(&self.transcript);
@@ -507,7 +590,7 @@ pub const Server = struct {
             .cipher_suite = @backingInt(self.suite),
             .key_share = .{ .group = group, .key_exchange = ex.public[0..ex.public_len] },
         })));
-        try self.out.write(.change_cipher_spec, &.{1});
+        if (ccs) try self.out.write(.change_cipher_spec, &.{1});
 
         // RFC 8446 §7.1, no PSK.
         const L = H.len;
@@ -617,13 +700,16 @@ const Hello = struct {
     sig_algs: ?[]const u16 = &.{0x0403},
     suites: []const u16 = &.{0x1301},
     groups: ?[]const u16 = &.{0x001d},
-    /// Key shares (group, key); a real x25519 key is filled in for 0x001d
-    /// entries with an empty key.
+    /// Key shares (group, key); a real key is filled in for 0x001d and
+    /// 0x0017 entries with an empty key.
     shares: ?[]const struct { u16, []const u8 } = &.{.{ 0x001d, "" }},
     compression: []const u8 = &.{0},
     sni: ?[]const u8 = null,
     alpn: ?[]const []const u8 = null,
     psk_without_modes: bool = false,
+    early_data: bool = false,
+    /// Octets of a next handshake message in the same record.
+    trailing: []const u8 = "",
 };
 
 fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
@@ -680,10 +766,15 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         for (shares) |sh| {
             var key: []const u8 = sh[1];
             var x: [32]u8 = undefined;
+            var p: [65]u8 = undefined;
             if (sh[0] == 0x001d and key.len == 0) {
                 const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(7));
                 x = kp.public_key;
                 key = &x;
+            } else if (sh[0] == 0x0017 and key.len == 0) {
+                const kp = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generateDeterministic(@splat(7)) catch unreachable;
+                p = kp.public_key.toUncompressedSec1();
+                key = &p;
             }
             try W.u16be(&body, gpa, sh[0]);
             try W.u16be(&body, gpa, key.len);
@@ -718,11 +809,13 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
         try W.ext(&e, gpa, 41, &psk);
     }
+    if (h.early_data) try W.ext(&e, gpa, 42, "");
     try W.u16be(&b, gpa, e.items.len);
     try b.appendSlice(gpa, e.items);
     const body_len = b.items.len - 9;
     std.mem.writeInt(u24, b.items[6..9], @intCast(body_len), .big);
-    std.mem.writeInt(u16, b.items[3..5], @intCast(body_len + 4), .big);
+    try b.appendSlice(gpa, h.trailing);
+    std.mem.writeInt(u16, b.items[3..5], @intCast(b.items.len - 5), .big);
     return b.toOwnedSlice(gpa);
 }
 
@@ -802,8 +895,6 @@ test "refusals and their alerts" {
     // The version is checked before anything else the hello lacks.
     try expectRefusal(.{ .versions = null, .sig_algs = null, .groups = null }, error.ProtocolVersion, .protocol_version);
     try expectRefusal(.{ .groups = &.{ 0x0019, 0x0100 } }, error.HandshakeFailure, .handshake_failure);
-    // A group in common but no share for it (HelloRetryRequest: M2).
-    try expectRefusal(.{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x001d, "" }} }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .shares = null }, error.MissingExtension, .missing_extension);
     // Malformed or forbidden.
     try expectRefusal(.{ .shares = &.{ .{ 0x001d, "" }, .{ 0x001d, "" } } }, error.IllegalParameter, .illegal_parameter);
@@ -960,4 +1051,135 @@ test "after a refusal every secret is wiped; the suite is unknown if it was not 
         for (sec) |b| try testing.expectEqual(@as(u8, 0), b);
     try testing.expect(!s2.out.protected and !s2.inbound.protected);
     try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, s2.cipherSuite().?);
+}
+
+/// Feed `first` (which must get a HelloRetryRequest) and then `second` to a
+/// fresh server; `between` goes between them. Returns the second feed's
+/// outcome and the server's output.
+const RetryOutcome = struct { err: ?Error, out: [4096]u8, out_len: usize };
+
+fn retry(first: Hello, between: []const u8, second: Hello) !RetryOutcome {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const r1 = try buildRecord(testing.allocator, first);
+    defer testing.allocator.free(r1);
+    const r = try s.feed(r1);
+    try testing.expect(r.event == .need_more);
+    try testing.expectEqual(State.client_hello_retry, s.state);
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(testing.allocator);
+    try stream.appendSlice(testing.allocator, between);
+    const r2 = try buildRecord(testing.allocator, second);
+    defer testing.allocator.free(r2);
+    try stream.appendSlice(testing.allocator, r2);
+    var res: RetryOutcome = .{ .err = null, .out = undefined, .out_len = 0 };
+    if (s.feed(stream.items)) |f| {
+        try testing.expect(f.event == .need_more);
+        try testing.expectEqual(stream.items.len, f.consumed);
+        try testing.expectEqual(State.client_finished, s.state);
+    } else |err| res.err = err;
+    const p = s.pendingOutput();
+    res.out_len = @min(p.len, res.out.len);
+    @memcpy(res.out[0..res.out_len], p[0..res.out_len]);
+    return res;
+}
+
+const p256_only: Hello = .{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x0017, "" }} };
+const x25519_share_first: Hello = .{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x001d, "" }} };
+
+test "HelloRetryRequest: for the first common group, then one first flight without a second CCS" {
+    const r = try retry(x25519_share_first, "", p256_only);
+    try testing.expect(r.err == null);
+    const p = r.out[0..r.out_len];
+    // HRR: a ServerHello with the special random, selected_group P-256.
+    try testing.expectEqual(@as(u8, 22), p[0]);
+    try testing.expectEqual(@as(u8, 2), p[5]);
+    try testing.expectEqualSlices(u8, &messages.hello_retry_request_random, p[11..43]);
+    const hrr_len = std.mem.readInt(u16, p[3..5], .big);
+    const hrr = p[5..][0..hrr_len];
+    try testing.expect(std.mem.indexOf(u8, hrr, &.{ 0, 51, 0, 2, 0, 0x17 }) != null);
+    // The CCS, the real ServerHello, then protected records only.
+    var at: usize = 5 + hrr_len;
+    try testing.expectEqualSlices(u8, &.{ 20, 3, 3, 0, 1, 1 }, p[at..][0..6]);
+    at += 6;
+    try testing.expectEqual(@as(u8, 22), p[at]);
+    try testing.expect(!std.mem.eql(u8, p[at + 11 ..][0..32], &messages.hello_retry_request_random));
+    at += 5 + std.mem.readInt(u16, p[at + 3 ..][0..2], .big);
+    try testing.expectEqual(@as(u8, 23), p[at]);
+}
+
+test "HelloRetryRequest: early data of the first hello is skipped, plaintext and within the budget" {
+    var first = x25519_share_first;
+    first.early_data = true;
+    const early = [_]u8{ 23, 3, 3, 0, 4, 1, 2, 3, 4 };
+    const r = try retry(first, &(early ++ early), p256_only);
+    try testing.expect(r.err == null);
+}
+
+test "HelloRetryRequest: second-hello refusals (rustls)" {
+    const Case = struct { second: Hello, err: Error };
+    var early = p256_only;
+    early.early_data = true;
+    var sni = p256_only;
+    sni.sni = "other.example";
+    var sha384 = p256_only;
+    sha384.suites = &.{0x1302};
+    const cases = [_]Case{
+        // Still no share for the group asked for.
+        .{ .second = x25519_share_first, .err = error.IllegalParameter },
+        .{ .second = early, .err = error.IllegalParameter },
+        .{ .second = sni, .err = error.IllegalParameter },
+        // The transcript hash would change.
+        .{ .second = sha384, .err = error.IllegalParameter },
+    };
+    for (cases) |c| {
+        const r = try retry(x25519_share_first, "", c.second);
+        try testing.expectEqual(c.err, r.err.?);
+        // The alert goes out in the clear (no keys yet).
+        try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, @backingInt(alertFor(c.err).?) }, r.out[r.out_len - 7 .. r.out_len]);
+    }
+    // The suite and group the HelloRetryRequest named are kept, even where
+    // rustls would re-choose: another suite with the same hash, or a share
+    // for the client's new first group.
+    var chacha = p256_only;
+    chacha.suites = &.{0x1303};
+    try testing.expectEqual(error.IllegalParameter, (try retry(x25519_share_first, "", chacha)).err.?);
+    var regrouped = x25519_share_first;
+    regrouped.groups = &.{ 0x001d, 0x0017 };
+    try testing.expectEqual(error.IllegalParameter, (try retry(x25519_share_first, "", regrouped)).err.?);
+    // Reordered suites: the ServerHello still says 0x1301.
+    var reordered = p256_only;
+    reordered.suites = &.{ 0x1303, 0x1301 };
+    const r = try retry(x25519_share_first, "", reordered);
+    try testing.expect(r.err == null);
+    const sh = 5 + std.mem.readInt(u16, r.out[3..5], .big) + 6;
+    try testing.expectEqualSlices(u8, &.{ 0x13, 0x01 }, r.out[sh + 5 + 4 + 2 + 32 + 1 ..][0..2]);
+}
+
+test "minOutputLen holds a HelloRetryRequest and the first flight undrained" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const ck = testKey();
+    const cfg: Config = .{ .certificate = .{ .fixed = ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    const out = try testing.allocator.alloc(u8, minOutputLen(ck));
+    defer testing.allocator.free(out);
+    var s: Server = .init(&cfg, &joiner, out);
+    defer s.deinit();
+    const r1 = try buildRecord(testing.allocator, x25519_share_first);
+    defer testing.allocator.free(r1);
+    _ = try s.feed(r1);
+    const r2 = try buildRecord(testing.allocator, p256_only);
+    defer testing.allocator.free(r2);
+    _ = try s.feed(r2);
+    try testing.expectEqual(State.client_finished, s.state);
+}
+
+test "HelloRetryRequest: a first hello sharing its record with the next message is unexpected" {
+    var first = x25519_share_first;
+    first.trailing = &.{ 1, 0, 0 };
+    try expectRefusal(first, error.UnexpectedMessage, .unexpected_message);
 }

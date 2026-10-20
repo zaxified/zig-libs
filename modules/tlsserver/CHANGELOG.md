@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — HelloRetryRequest (M2 step 1). **BEHAVIOURAL:** a client without a share for
+  the chosen group gets a HelloRetryRequest naming it (was `handshake_failure`); the second
+  ClientHello must keep the HelloRetryRequest's suite and group (stricter than rustls, which
+  re-chooses), the same SNI and no `early_data`, else `illegal_parameter`; the transcript restarts with `message_hash`, and early
+  data announced by the first ClientHello is skipped in the clear (up to 2^14 octets of
+  ciphertext). `minOutputLen` now also holds the HelloRetryRequest. Interop: two OpenSSL and two
+  Go HelloRetryRequest sessions (captured, replayed), six `tlsclient` ones; BoGo 140 pass / 0
+  fail (was 130; one rustls-parity divergence disabled with its reason); fuzz `tlsserver-server`
+  60,000 and `tlsserver-inbound` 1.2M runs clean.
 - **2026-10-20** — The BoGo shim (`tools/bogo_shim.zig`, `zig build interop-tlsserver -- --bogo`):
   BoringSSL's runner at 784fcafc, reviewed in full and pinned by `tools/bogo/MANIFEST`, 130 tests
   pass, none fail (`tools/bogo/passing.txt` ratchets them). **BEHAVIOURAL**, from its first run:

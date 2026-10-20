@@ -2,12 +2,12 @@
 
 A TLS 1.3 server (RFC 8446) for the collection: a buffer-driven (sans-I/O) core with a blocking
 wrapper on top, built on the `tls13` handshake building blocks and the `aesgcm` / `chachapoly`
-AEADs. **Under construction (milestone M1):** a full (EC)DHE handshake with a certificate —
+AEADs. **Under construction (milestone M2):** a full (EC)DHE handshake with a certificate —
 TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
 X25519, secp256r1, secp384r1; ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; SNI
-certificate selection; ALPN — then application data and close_notify, sans-I/O (`Server`) or
+certificate selection; ALPN; HelloRetryRequest for a group the client sent no share for — then application data and close_notify, sans-I/O (`Server`) or
 blocking (`Connection`), with the certificate and key loaded from PEM (`keys`). No
-HelloRetryRequest, resumption, client certificates or KeyUpdate yet (`SPEC.md`, *Backlog*).
+resumption, client certificates or KeyUpdate yet (`SPEC.md`, *Backlog*).
 
 - **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
   server; qap runs a fork of a third-party one, which this module is meant to replace.
@@ -52,7 +52,7 @@ zeroed; the engine answers it with the matching alert.
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 130 pass); handshakes against Zig std's
+(`-- --bogo`, 140 pass); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
 the `tlsserver-record`, `-inbound`, `-hello`, `-keys` and `-server` harnesses (`SPEC.md` § Fuzzing). Dead

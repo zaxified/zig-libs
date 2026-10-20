@@ -206,8 +206,9 @@ pub const Inbound = struct {
     /// close_notify are accepted, compatibility CCS no longer is.
     app_data_ok: bool = false,
     closed: bool = false,
-    /// One compatibility CCS per ClientHello the engine can accept: set to
-    /// `max_compat_ccs` once HelloRetryRequest exists (M2).
+    /// One compatibility CCS per ClientHello the engine accepts: the engine
+    /// adds one when it sends a HelloRetryRequest (at most
+    /// `max_compat_ccs`).
     ccs_left: u8 = 1,
     warnings: u8 = 0,
     /// The description of the alert behind `error.PeerAborted`.
@@ -215,7 +216,9 @@ pub const Inbound = struct {
     /// Rejected 0-RTT: protected records that fail to open are dropped
     /// while their ciphertext fits this budget, until one opens (RFC 8446
     /// §4.2.10, trial decryption; rustls drops up to 16 KiB when no early
-    /// data was ever offered). Set by the engine with the receive key.
+    /// data was ever offered). Set by the engine with the receive key —
+    /// or, after a HelloRetryRequest, before any: then `application_data`
+    /// records are dropped unopened until the second ClientHello.
     skip_early: usize = 0,
 
     pub fn init(joiner_buf: []u8) Inbound {
@@ -270,7 +273,9 @@ pub const Inbound = struct {
         }
         if (h.legacy_version & 0xff00 != 0x0300) return error.DecodeError;
         if (h.length == 0 and h.content_type != .application_data) return error.DecodeError;
-        const limit: usize = if (self.protected and h.content_type == .application_data)
+        // Early data skipped after a HelloRetryRequest is ciphertext too,
+        // though no receive key is installed yet.
+        const limit: usize = if (h.content_type == .application_data and (self.protected or self.skip_early != 0))
             record.max_ciphertext_len
         else
             record.max_plaintext_len;
@@ -307,9 +312,20 @@ pub const Inbound = struct {
                     try self.notInterleaved();
                     return try self.onAlert(body);
                 },
-                // Plaintext application data: never (no 0-RTT, and after
-                // the handshake every record is protected).
-                .application_data => return error.UnexpectedMessage,
+                // Plaintext application data: only early data the client
+                // sent with a ClientHello answered by a HelloRetryRequest
+                // (no receive key yet), within `skip_early`. Otherwise
+                // never (no 0-RTT; after the handshake every record is
+                // protected).
+                .application_data => {
+                    // An empty record costs one octet: none are free.
+                    const cost = @max(h.length, 1);
+                    if (self.skip_early >= cost and self.joiner.isEmpty()) {
+                        self.skip_early -= cost;
+                        return null;
+                    }
+                    return error.UnexpectedMessage;
+                },
                 else => unreachable, // checkHeader
             }
         }
@@ -723,6 +739,43 @@ test "rejected early data: records that fail to open are skipped within the budg
     var in3: Inbound = .init(&joiner_storage);
     try in3.installRx(.aes_128_gcm_sha256, &hs_secret);
     try testing.expectError(error.BadRecordMac, in3.next(s.bytes()));
+}
+
+test "after a HelloRetryRequest: plaintext early data is skipped within the budget, before any key" {
+    var s: Stream = .{};
+    s.plain(.application_data, &(@as([30]u8, @splat(0x99))));
+    s.plain(.application_data, &(@as([30]u8, @splat(0x98))));
+    const ch2 = hsMsg(1, "second hello");
+    s.plain(.handshake, &ch2);
+
+    var in: Inbound = .init(&joiner_storage);
+    in.handshake_seen = true;
+    in.skip_early = 60;
+    const r = try in.next(s.bytes());
+    try expectHandshake(r, 1, "second hello");
+    try testing.expectEqual(@as(usize, 0), in.skip_early);
+    // Over the budget, or without one: unexpected_message.
+    var in2: Inbound = .init(&joiner_storage);
+    in2.skip_early = 59;
+    try testing.expectError(error.UnexpectedMessage, in2.next(s.bytes()));
+    var in3: Inbound = .init(&joiner_storage);
+    try testing.expectError(error.UnexpectedMessage, in3.next(s.bytes()));
+    // Empty records are not free: each costs one octet of the budget.
+    var empties: Stream = .{};
+    for (0..3) |_| empties.plain(.application_data, "");
+    var in6: Inbound = .init(&joiner_storage);
+    in6.skip_early = 2;
+    try testing.expectError(error.UnexpectedMessage, in6.next(empties.bytes()));
+    // Early data is ciphertext: a record up to 2^14 + 256 is skippable,
+    // one past the budget unexpected (not record_overflow).
+    var big: [record.header_len + record.max_plaintext_len + 1]u8 = @splat(0x77);
+    big[0..5].* = .{ 23, 3, 3, 0x40, 0x01 };
+    var in4: Inbound = .init(&joiner_storage);
+    in4.skip_early = record.max_plaintext_len;
+    try testing.expectError(error.UnexpectedMessage, in4.next(&big));
+    var in5: Inbound = .init(&joiner_storage);
+    in5.skip_early = record.max_plaintext_len + 1;
+    try testing.expectEqual(Event.need_more, (try in5.next(&big)).event);
 }
 
 test "joiner: reset zeroes what compaction left behind" {

@@ -7,7 +7,7 @@
 //! handshake with a certificate (TLS_AES_128_GCM_SHA256,
 //! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
 //! X25519, secp256r1, secp384r1), then application data — no
-//! HelloRetryRequest, resumption, client certificates or KeyUpdate yet —
+//! resumption, client certificates or KeyUpdate yet —
 //! `Connection`, the blocking wrapper, and `keys`, the PEM loader. Interoperates with OpenSSL 3.5's s_client.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
@@ -17,7 +17,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1) and a PEM certificate/key loader, no HelloRetryRequest, resumption or client certificates yet",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1) HelloRetryRequest and a PEM certificate/key loader, no resumption or client certificates yet",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},

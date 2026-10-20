@@ -321,3 +321,25 @@ test "tlsclient ↔ Server: the client's first group with a share; ALPN" {
     try testing.expectEqualStrings("h2", o.alpn.?);
     try testing.expectEqualStrings("h2", info.alpn_protocol.?);
 }
+
+test "tlsclient ↔ Server: HelloRetryRequest for a group the client has no share for, every suite" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    // tlsclient's default shares are X25519MLKEM768 and X25519; a server
+    // with neither asks for its group on the second ClientHello. The suite
+    // decides the hash of `message_hash` (RFC 8446 §4.4.1).
+    for ([_]u16{ tls13.kex.secp256r1_group, tls13.kex.secp384r1_group }) |g| {
+        for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+            var storage: [16 * 1024]u8 = undefined;
+            var info: ZlClient.ConnectionInfo = .init(&storage);
+            const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .groups = &.{g} }, .{ .info = &info });
+            defer testing.allocator.free(o.echoed);
+            try testing.expect(info.hello_retry_request);
+            try testing.expectEqual(g, o.group);
+            try testing.expectEqual(g, @backingInt(info.negotiated_group.?));
+            try testing.expectEqual(suite, o.suite);
+            try testing.expectEqualStrings("hello there", o.echoed);
+        }
+    }
+}

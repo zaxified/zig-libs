@@ -75,6 +75,8 @@ const cases = [_]Case{
     .{ .name = "rsa2048-pss", .why = "an RSA certificate signed with RSA-PSS", .cert = .rsa2048, .seed = 6, .expect = &.{ "Signature type: rsa_pss_rsae_sha256", "Verification: OK" } },
     .{ .name = "alpn-h2", .why = "ALPN: the server's choice among the client's offers", .seed = 7, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .brief = false, .expect = &.{"ALPN protocol: h2"} },
     .{ .name = "no-sni", .why = "a client that sends no server_name", .seed = 8, .args = &.{"-noservername"}, .expect = &.{"Verification: OK"} },
+    .{ .name = "hrr-p256", .why = "HelloRetryRequest: s_client's lone X25519 share, a server with only secp256r1 (SHA-384 transcript)", .seed = 11, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-groups", "X25519:P-256" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Peer Temp Key: ECDH, prime256v1", "Verification: OK" } },
+    .{ .name = "hrr-p384-aes128", .why = "HelloRetryRequest for secp384r1 under TLS_AES_128_GCM_SHA256", .seed = 12, .groups = &.{tlsserver.server.default_groups[3]}, .args = &.{ "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "X25519:P-384" }, .expect = &.{ "Ciphersuite: TLS_AES_128_GCM_SHA256", "Peer Temp Key: ECDH, secp384r1" } },
     // Go: its suite order (AES-128 first on AES hardware) is not
     // configurable in TLS 1.3, so the server's list picks the suite.
     .{ .name = "go-default", .client = .go, .why = "Go's defaults: X25519MLKEM768, its first suite", .seed = 21, .expect = &.{ "version: TLS 1.3", "suite: TLS_AES_128_GCM_SHA256", "group: X25519MLKEM768", "peer_certs: 1" } },
@@ -87,6 +89,8 @@ const cases = [_]Case{
     .{ .name = "go-alpn-h2", .client = .go, .why = "ALPN: the server's choice among Go's offers", .seed = 28, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .expect = &.{"alpn: h2"} },
     .{ .name = "go-no-sni", .client = .go, .why = "Go without server_name (verified by hand)", .seed = 29, .args = &.{"-nosni"}, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-no-hybrid", .client = .go, .why = "a server without X25519MLKEM768: Go's X25519 share, no retry", .seed = 30, .groups = &.{ tlsserver.server.default_groups[1], tlsserver.server.default_groups[2] }, .expect = &.{"group: X25519\n"} },
+    .{ .name = "go-hrr-p256", .client = .go, .why = "HelloRetryRequest: Go's X25519MLKEM768 + X25519 shares, a server with only secp256r1", .seed = 31, .groups = &.{tlsserver.server.default_groups[2]}, .expect = &.{ "group: CurveP256", "hrr: true" } },
+    .{ .name = "go-hrr-p384-aes256", .client = .go, .why = "HelloRetryRequest for secp384r1 under TLS_AES_256_GCM_SHA384", .seed = 32, .suites = &.{.aes_256_gcm_sha384}, .groups = &.{tlsserver.server.default_groups[3]}, .expect = &.{ "group: CurveP384", "suite: TLS_AES_256_GCM_SHA384", "hrr: true" } },
 };
 
 var child_env: ?*const std.process.Environ.Map = null;

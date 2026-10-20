@@ -32,9 +32,9 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 130 tests with none failing (`tools/bogo/passing.txt`; everything
-else is unimplemented or disabled with a reason). HelloRetryRequest, resumption, client
-certificates and KeyUpdate are still to come (milestone M2, *Backlog*).
+BoringSSL's BoGo suite passes 140 tests with none failing (`tools/bogo/passing.txt`; everything
+else is unimplemented or disabled with a reason). HelloRetryRequest works (M2 step 1);
+resumption, client certificates and KeyUpdate are still to come (milestone M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -52,8 +52,8 @@ OpenSSL 3.5's `s_client` (ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; a
 suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI), with Go's
 crypto/tls client (the same, Go's own defaults), with `tlsclient` and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
-certificate chain and private key from PEM. It is not yet a server to deploy:
-no HelloRetryRequest (a client that sent no share for the chosen group is refused), no
+certificate chain and private key from PEM. A client that sent no share for the chosen group
+gets a HelloRetryRequest. It is not yet a server to deploy: no
 resumption, no client certificates, no KeyUpdate — a client's KeyUpdate is answered with
 `unexpected_message`, and after `max_records_per_key` (2^23) records the server closes instead
 of rekeying.
@@ -101,7 +101,7 @@ client's first `supported_groups` entry the server enables — every one of thes
 is `handshake_failure`; compression other than exactly null is `illegal_parameter`; no
 `key_share` is `handshake_failure`, two shares of one group or a share that does not exchange
 (`kex`: wrong length, low order) `illegal_parameter`, no share for the chosen group
-`handshake_failure` (M2: HelloRetryRequest); `pre_shared_key` without `psk_key_exchange_modes` is
+gets a HelloRetryRequest (below); `pre_shared_key` without `psk_key_exchange_modes` is
 `missing_extension` (otherwise the offer is ignored: full handshake); ALPN is the server's first
 protocol the client offers (`no_application_protocol` when the server has some and none match).
 The server then sends ServerHello (plaintext), a compatibility CCS, and under its handshake key
@@ -113,6 +113,19 @@ data flows. Early data is never accepted; records the client sent under a 0-RTT 
 (up to 2^14 octets). Every refusal queues its alert in `pendingOutput` (sealed once the server
 sends protected) and leaves the connection dead (`error.Closed` afterwards); every key and secret
 is wiped at that moment. `close` queues close_notify and keeps reading.
+
+**HelloRetryRequest** (RFC 8446 §4.1.4, rustls 0.23 rules): when the client sent no share for
+the chosen group, the server fixes the suite, answers with a HelloRetryRequest naming the group
+(no cookie) and a compatibility CCS, and restarts the transcript as
+`message_hash(Hash(ClientHello1)) ‖ HelloRetryRequest` with the suite's hash (§4.4.1). The first
+ClientHello must end its record flight (`unexpected_message`). The second must carry a share for
+that group, the same SNI, still offer that suite, and no `early_data` — otherwise
+`illegal_parameter`. Stricter than rustls, which re-chooses suite and group on the second hello
+and compares only the hash: RFC 8446 §4.1.4/§4.2.8 bind both to the HelloRetryRequest
+(independent review 2026-10-20, MEDIUM ×2); the ServerHello that follows has no second CCS.
+Early data the first ClientHello announced is skipped in the clear up to 2^14 octets of
+ciphertext, an empty record counting one octet (more: `unexpected_message`, as rustls). One compatibility CCS per ClientHello is
+accepted (two in all).
 
 **The blocking wrapper** (`connection.Connection`): the server over a `std.Io.Reader` /
 `Writer`. Records are decrypted in place in the reader's own buffer (it must hold a whole
@@ -263,23 +276,27 @@ The receive side's refusals are the table under *Wire format*. Record protection
   re-opens every record with Python `cryptography` (OpenSSL) before writing
   `src/record_kat_vectors.zig`.
 - **External (foreign implementation):** OpenSSL 3.5.5 `s_client` over loopback TCP
-  (`tools/interop.zig`, `zig build interop-tlsserver`): ten sessions — P-256 under OpenSSL's
+  (`tools/interop.zig`, `zig build interop-tlsserver`): twelve sessions — P-256 under OpenSSL's
   defaults (TLS_AES_256_GCM_SHA384, X25519MLKEM768), TLS_AES_128_GCM_SHA256 over X25519,
   TLS_CHACHA20_POLY1305_SHA256 over secp256r1, P-256 under SHA-384 over X25519, P-256 over
   secp384r1, a P-384 certificate (`ecdsa_secp384r1_sha384`) over secp384r1, an Ed25519 and
-  an RSA-PSS certificate, ALPN `h2` chosen from `http/1.1,h2`, no SNI — each verified by
+  an RSA-PSS certificate, ALPN `h2` chosen from `http/1.1,h2`, no SNI, and two
+  HelloRetryRequests (s_client's lone X25519 share against a server with only secp256r1 under
+  SHA-384, only secp384r1 under TLS_AES_128_GCM_SHA256) — each verified by
   s_client against the test certificate and `localhost`, with ping/pong and close_notify.
   `--capture` records every octet both ways into `src/interop_vectors.zig`;
   `src/interop_replay_test.zig` drives a server with the same seed through `Connection` over
   OpenSSL's recorded octets and requires the recorded answer byte for byte (and refuses the
   recording with one octet flipped), in every test lane.
 - **External (foreign implementation):** Go 1.26.8 crypto/tls client (`tools/go_client/main.go`,
-  built by the same tool with `GOTOOLCHAIN=local`), ten more sessions in the same tool and the
+  built by the same tool with `GOTOOLCHAIN=local`), twelve more sessions in the same tool and the
   same capture: Go's defaults (X25519MLKEM768, TLS_AES_128_GCM_SHA256), TLS_AES_256_GCM_SHA384
   and TLS_CHACHA20_POLY1305_SHA256 (the server enabling only that suite: Go's TLS 1.3 suite
   order cannot be configured), secp256r1 and secp384r1 as Go's only group, a P-384, an Ed25519
   and an RSA-PSS certificate, ALPN `h2`, no SNI (verified by hand in `VerifyConnection`), and a
-  server without the hybrid taking Go's X25519 share without a retry. The Go client verifies the
+  server without the hybrid taking Go's X25519 share without a retry, and two HelloRetryRequests
+  (Go's two default shares against a server with only secp256r1, or only secp384r1 under
+  TLS_AES_256_GCM_SHA384; Go's `ConnectionState.HelloRetryRequest` printed). The Go client verifies the
   chain with `x509.Certificate.Verify`, prints the negotiated version, suite, group (`CurveID`)
   and ALPN — anchored on the end of the line, so `X25519` does not match `X25519MLKEM768`
   (negative control 2026-10-20: the no-hybrid case against a server with the hybrid fails) —
@@ -297,7 +314,8 @@ The receive side's refusals are the table under *Wire format*. Record protection
   as the lone key share × every suite (12 handshakes); tlsclient's two default shares against a
   server without the hybrid (X25519 taken, no retry) with ALPN `h2` — the client's
   `ConnectionInfo` (suite, group, ALPN, peer chain) checked against the server's
-  `cipherSuite`/`negotiatedGroup`/`alpnProtocol`.
+  `cipherSuite`/`negotiatedGroup`/`alpnProtocol`; and a HelloRetryRequest for secp256r1 and
+  secp384r1 under each suite (6 handshakes, the client's `hello_retry_request` set).
 - **External (foreign implementation):** `keys` on private keys in every PEM form the OpenSSL
   3.5.5 command line writes — `ecparam -genkey` (an `EC PARAMETERS` block, then SEC1), `ec`,
   `genpkey` (PKCS#8: P-256, P-384, Ed25519, RSA), `pkcs8 -topk8`, `rsa -traditional` (PKCS#1) —
@@ -330,7 +348,11 @@ The receive side's refusals are the table under *Wire format*. Record protection
   full: it spawns only the shim, listens on loopback only, writes only its temp test keys
   (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
   refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20: **130 pass, 0 fail**; 6,047 exit 89 (unimplemented: client tests, DTLS,
+  Result 2026-10-20 (M1): **130 pass, 0 fail**; with HelloRetryRequest (M2 step 1) **140 pass,
+  0 fail** — the eight HRR globs re-enabled, one rustls-parity divergence disabled
+  (`SkipEarlyData-SecondClientHelloEarlyData`: early_data in the second ClientHello is
+  `illegal_parameter` here and in rustls, `bad_record_mac` in BoringSSL; rustls maps it with a
+  `TestLocalErrorMap` runner 784fcafc lacks). M1 run: 6,047 exit 89 (unimplemented: client tests, DTLS,
   QUIC, resumption, client certificates, OCSP, BoringSSL-only features — the shim logs the flag
   of each); 3,676 disabled in `tools/bogo/config.json`, each glob with its reason (TLS ≤ 1.2;
   HelloRetryRequest and KeyUpdate, M2; extensions the server ignores; one rustls-parity
@@ -451,7 +473,7 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 - **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
   Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
-- **BoGo next:** the HRR- and KeyUpdate-disabled tests come back with M2; the rustls parity
+- **BoGo next:** the KeyUpdate-disabled tests come back with M2; the rustls parity
   gate (our pass set ⊇ rustls's for TLS 1.3 server tests) needs rustls's `bogo/config.json`
   at a pinned tag next to ours.
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
@@ -459,7 +481,7 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   `x509/SPEC.md` § Backlog).
 - **M2:** KeyUpdate both ways (until then a client's KeyUpdate kills the connection and the
   server stops at `max_records_per_key`, independent review 2026-10-20, MEDIUM).
-- **M2:** HRR, KeyUpdate, NewSessionTicket and resumption through `tlsresume`, mTLS through
+- **M2:** ~~HRR~~ (step 1, 2026-10-20), KeyUpdate, NewSessionTicket and resumption through `tlsresume`, mTLS through
   `x509.verifyChain`, OCSP stapling. **M3:** qap's seams and performance (`p256`, `ct25519`).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 
