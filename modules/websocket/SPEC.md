@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, WEBSOCKET_FUZZ; the deflate harnesses `extensions`, `inflate`, `deflate-connection` added) · ct n/a — framing; mask key not secret (keyword review, 2026-10-07)
 
-**Performance:** ref 0.04–0.88× coder/websocket v1.8.15 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.04–0.88× coder/websocket v1.8.15 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -472,6 +472,10 @@ previous self-authored close-code tests reproduces the module's state before thi
 `zig build test-websocket` then reports 62/63 passing — every self-authored test green — with the
 **only** failure being `close_code_1012: all three peers accepted but we rejected with close 1002`.
 The RED comes from the foreign corpus and from nothing else.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-websocket`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 4.4 %): ref 0.04–0.88×, against 0.04–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 

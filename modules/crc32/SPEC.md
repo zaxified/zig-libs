@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.07–0.17× zlib 1.3.1 crc32_z · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.07–0.17× zlib 1.3.1 crc32_z · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -184,6 +184,8 @@ Real survivors, now killed:
   `/proc/cpuinfo`; skips where unreadable).
 
 ## Speed
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-crc32`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.07–0.17×, against 0.07–0.17× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 See README. The folding kernel reaches ~10× std from 1 KiB up; below
 `pclmul_min` its fixed cost (the two reduction multiplies) loses to the

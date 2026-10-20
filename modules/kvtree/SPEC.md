@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, KVTREE_FUZZ) · ct n/a — B-tree store (keyword review, 2026-10-07)
 
-**Performance:** ref 0.83–1.02× go.etcd.io/bbolt v1.5.0 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.83–1.04× go.etcd.io/bbolt v1.5.0 · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — random op sequences and cursor walks compared to a model (gap model); recover fuzz
 
@@ -414,6 +414,10 @@ modes, with and without an older copy at the destination, plus a crash right
 after it returns. Mutation run (30 schemata mutants over the cursor, the loader
 and the rename sequence): 29 killed; the survivor was dead code (a "union fits
 one page" branch), removed.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-kvtree`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 51.5 %): ref 0.83–1.04×, against 0.83–1.02× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred (mechanical, orthogonal to the Fable core)
 

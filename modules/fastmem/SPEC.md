@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07)
 
-**Performance:** ref 0.40–1.05× musl 1.2.5 memset · fastest 0.69–1.62× glibc 2.43 memset (measured 2026-10-10)
+**Performance:** ref 0.34–1.03× musl 1.2.5 memset · fastest 0.67–1.50× glibc 2.43 memset (measured 2026-10-20)
 
 **Evidence:** model — exhaustive length 0..300 x offset 0..63 compared to the expected written range
 
@@ -143,6 +143,8 @@ binary-wide `memset` runs before the test runner has an environment).
   KiB at a time.
 
 ## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-fastmem`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 9.6 %): ref 0.34–1.03×, fastest 0.67–1.50×, against 0.40–1.05× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
 
 Measured 2026-10-10 with `zig build bench-fastmem` (`tools/bench.zig` driving
 `tools/c_bench/memset_bench.c`), ReleaseFast, `fastmem.set` against musl 1.2.5

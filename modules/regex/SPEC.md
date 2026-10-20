@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean x2 (REGEX_FUZZ)) · ct n/a — regex engine (keyword review, 2026-10-07)
 
-**Performance:** ref 0.02–0.91× Go regexp go1.26 · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.03–0.85× Go regexp go1.26 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -252,6 +252,10 @@ verdict. **MEDIUM (fixed)** — 1000 nested groups overflowed a 512 KiB thread s
 `\x{000000041}`, `from` past the input. *Fuzz:* `src/fuzz_test.zig` (grammar-drawn patterns, a
 share damaged byte-wise; the entry points agree, spans well-formed, a literal-only pattern
 matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-regex`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.03–0.85×, against 0.02–0.91× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 

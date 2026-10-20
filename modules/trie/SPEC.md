@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-04 (seeded sweep 2x300000 clean (in-test)) · ct n/a — trie index (keyword review, 2026-10-07)
 
-**Performance:** ref 0.18–0.89× BurntSushi/fst 0.4.7 · fastest ? (measured 2026-10-13)
+**Performance:** ref 0.17–0.92× BurntSushi/fst 0.4.7 · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — real trie vs naive oracle over random key sets, positive control, loader fuzz
 
@@ -37,6 +37,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** the only frozen, zero-copy, self-describing (magic, version, CRC) trie in Zig found; **top-N by stored score with a node budget** (`max_visited`) and an `after` cursor for the next page, which none of the above offers; a proven never-panic/never-loop loader over untrusted buffers (corrupt-buffer fuzz, seeded v2 sweep, bounded iterators). **On par since 2026-10-04:** range iteration (fst's `range`), common-prefix and longest-prefix search (marisa/darts), reverse lookup key ↔ rank (marisa, via optional per-edge counts), a streaming build from sorted input to any writer (fst's build model). **On par since 2026-10-13:** automaton search over the index with the fst built-ins (`Str`, `Subsequence`, `AlwaysMatch`, `StartsWith`, `Union`, `Intersection`, `Complement`) or any caller type that satisfies the `automaton` interface; union / intersection / difference / symmetric difference over up to 64 indexes with the contributing values per key. **Where we are behind** (re-checked 2026-10-13): nothing a fst user notices beyond two consciously rejected items — no suffix minimization (version 2's path compression brought the RÚIAN address index from 140 to 24.6 B/key, still several times marisa's ~5 B/key; rejected, see Design decision A and Deliberately deferred) and `u32` values only (fst stores `u64`; rejected, below). Regular expressions and Levenshtein distance are not built-in automata: Levenshtein is the sibling `fuzzysearch` module, which already walks this index with its own Levenshtein automaton (`fuzzysearch/src/search.zig`); the `regex` module exposes no byte-stepping DFA state to plug in, so a regex automaton has to wait for one (any type with the five `automaton` functions is searched as is).
 
 ## Performance (2026-10-13)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-trie`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 5.1 %): ref 0.17–0.92×, against 0.18–0.89× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
 
 `zig build bench-trie` (`tools/bench.zig` against `tools/rust_bench`, fst 0.4.7, LTO), 1 000 000
 keys, 3 rounds, ratio ours/fst by wall time: build 0.30, lookup hit 0.89, lookup miss 0.88, prefix

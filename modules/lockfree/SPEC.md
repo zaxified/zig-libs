@@ -9,7 +9,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — concurrent queues (keyword review, 2026-10-07)
 
-**Performance:** ref 0.51–1.06× crossbeam 0.8 (queue 0.3.14, deque 0.8.8, epoch 0.9.21) · fastest ? (measured 2026-10-14)
+**Performance:** ref 0.50–1.05× crossbeam 0.8 (queue 0.3.14, deque 0.8.8, epoch 0.9.21) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — seed-driven interleaving harness compared to RefQueue reference oracle, with clean/teeth controls
 
@@ -1054,6 +1054,8 @@ hardware (§7 item (a)); with the static codegen cert (§7) and this formal cert
 rather than the only line of evidence.
 
 ## 8. Performance against crossbeam (2026-10-14)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-lockfree`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 85.7 %): ref 0.50–1.05×, against 0.51–1.06× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 `zig build bench-lockfree` (`tools/bench.zig` against `tools/rust_bench`: crossbeam-queue
 0.3.14, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, LTO; the crates were read in full

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07)
 
-**Performance:** ref 0.16–0.95× prometheus/procfs v0.21.1 · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.16–0.89× prometheus/procfs v0.21.1 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -282,6 +282,10 @@ been right; it is now evidence instead of an argument, in
 `testdata/tcp6-mips-be.txt`, and the test also asserts that reading those bytes
 with the WRONG producer order does not yield the address, so the fixture cannot
 pass for the wrong reason.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-procnet`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 16.9 %): ref 0.16–0.89×, against 0.16–0.95× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 - **`/proc/net/unix` can be forged by a local user** *(audit 2026-10-19, `procnet-S9-3`)* — `src/unix.zig` `parseUnix`: a pathname socket name may contain `\n`, so `bind("x\n<well-formed row>")` makes the kernel print a second, attacker-written row (any inode, flags, path). Not fixable in a text parser (a forged row is indistinguishable); documented at `parseUnix`. A consumer deciding who listens on what should use `NETLINK_SOCK_DIAG` (`ss` does), which is a different module's job (`netlink`).

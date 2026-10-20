@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — date formatting (keyword review, 2026-10-07)
 
-**Performance:** ref 0.06–0.91× Go 1.26.0 time · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.06–0.91× Go 1.26.8 time · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — exhaustive brute-force inverse of isoWeek over 1900..2100 plus Hinnant civil-date arithmetic
 
@@ -125,6 +125,10 @@ passing the range check as negative); `parseIsoDate`, documented "strict canonic
 `day <= 31` only, so `2023-02-30` was accepted. 22 survivors were test gaps and got tests
 (token edges from `date_tokens`, literals, wildcards, 12 h noon/midnight, `nthWeekdayOfMonth`
 past the month end, `parseIsoDate` length, xsd separator/zone/digits, `MAX_TOKENS`).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-datefmt`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 4.8 %): ref 0.06–0.91×, against 0.06–0.91× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 

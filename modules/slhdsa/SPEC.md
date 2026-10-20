@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind; `prf` 9 in-file since Zig 0.17.0, 2026-10-18, was 8: `xmssPkFromSig`'s auth-path direction test on `idx_leaf` at one more unrolled address -- the index is fixed by R, which the signature publishes)
 
-**Performance:** ref 0.59–0.88× OpenSSL 3.5.5 SLH-DSA (sign/verify/keygen, 6 sets; not liboqs, which is foreign) · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.57–0.89× OpenSSL 3.5.5 SLH-DSA (sign/verify/keygen, 6 sets; not liboqs, which is foreign) · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -166,6 +166,10 @@ both sides, the pure-mode prefix octet and the context length in it, the context
 verify message, `addrnd`, both `idx_tree` masks, the randomizer `R` in `H_msg`, and the final
 root comparison. The arithmetic core (WOTS+, XMSS, FORS, hypertree, address layout) is pinned
 byte-exact by the FIPS 205 / ACVP vectors and was not re-mutated here.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-slhdsa`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 3.5 %): ref 0.57–0.89×, against 0.59–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 

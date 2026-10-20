@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07)
 
-**Performance:** ref 0.24–1.07× maypok86/otter v2.3.0 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.25–1.05× maypok86/otter v2.3.0 · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — fuzz of operation sequences and random sequences checking heap/structural invariants (invariant checker, no independent model)
 
@@ -352,6 +352,10 @@ checks every heap's order and back-pointers after each step, non-zero `Sharded.s
 the copy-window probe test (no race test involved). Finding fixed in the same run (behavioural):
 `Sharded.stats()` did not add `Stats.rehashes` (always 0); the reflective stats test now makes
 every field, `rehashes` included, non-zero.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ramcache`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 42.5 %): ref 0.25–1.05×, against 0.24–1.07× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures;
 
 ## Backlog / deferred
 
