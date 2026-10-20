@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — LSP 3.17 both ways (S2 R3) and a `hint` severity (S2 R8, owner OK).
+  `writeLsp`/`writeLspArray` (range, severity 1..4, code, codeDescription, source, tags,
+  relatedInformation from labels; `LspOptions.uri_prefix`), `fromLsp`; `lspCharacter`/`byteColumn` convert
+  1-based byte columns to 0-based utf8/utf16/utf32 characters and back. New `Tag`, `Diagnostic.tags`.
+  **Source-breaking:** `Severity` gains `hint` — an exhaustive `switch` needs an arm (bxp at repin).
+  `expr_off`/`expr_len` doc corrected: renderers ignore them.
 - **2026-10-20** — **Snippet layout = codespan-reporting 0.13.1's rich ASCII style** (S2 R1/R2; ported,
   Apache-2.0, NOTICE): several labels on one line share the quoted line, sorted; multi-line spans get
   start/end markers, overlapping ones included; gaps become `.` break rows; tabs expand (`tab_width`,

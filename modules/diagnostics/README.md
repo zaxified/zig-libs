@@ -1,7 +1,7 @@
 # diagnostics
 
 LSP-style structured validation-finding collector — `error` / `warning` /
-`info` findings with a dot-separated tree path, optional 1-based source
+`info` / `hint` findings with a dot-separated tree path, optional 1-based source
 line/col (+ end position), an optional in-expression byte offset/length for
 token highlighting, a machine-readable code, a message, and an optional
 did-you-mean suggestion.
@@ -129,3 +129,38 @@ try diag.render(w, .{ .style = .snippet, .sources = &src, .tab_width = 4 });
 continuation line); `Label.primary` draws a label as a second primary span.
 No allocation: at most 64 spans and 16 multi-line spans per file are drawn,
 the rest is listed as `--> location: message` lines.
+
+### LSP 3.17 (`hint`, `writeLsp`, `fromLsp`)
+
+`Severity` has LSP's four levels (`hint` renders like `info`, under its own
+word). `PositionEncoding` (`utf8` / `utf16` / `utf32`) says how LSP counts a
+`character`; `lspCharacter(line_text, byte_col_1based, enc)` and
+`byteColumn(line_text, character, enc)` convert between that and our 1-based
+byte column (bytes that are not valid UTF-8 count one unit each).
+
+```zig
+const srcs = [_]diagnostics.Source{.{ .file = "/w/a.txt", .text = text }};
+// one LSP Diagnostic object, or the `diagnostics` array of publishDiagnostics:
+try diagnostics.writeLsp(w, d, &srcs, .utf16, .{ .source = "mytool" });
+try diagnostics.writeLspArray(w, diag.items.items, &srcs, .utf16, .{ .source = "mytool" });
+
+// back (arena-allocated); `file` is the document the diagnostics are for:
+const d2 = try diagnostics.fromLsp(arena, json_value, "/w/a.txt", &srcs, .utf16, .{});
+```
+
+`range` comes from `line`/`col`/`end_line`/`end_col`: no end is a zero-width
+range (a point; editors widen it to the word), a line without a column is the
+whole line, an end line without an end column ends at that line's end. The
+quoted line comes from `sources`; without it `character` is `col - 1` (UTF-8
+semantics, whatever the encoding). `code` is always a string, `code_url` is
+`codeDescription.href`, `tags: []const Tag` (`unnecessary`, `deprecated`) is
+`tags`, and `labels` are `relatedInformation` (the location's `uri` is
+`LspOptions.uri_prefix` plus the percent-encoded file name; default
+`file://`). Not written: `path`, `suggest`, `notes`, `fix`, `expr_*`, `data`.
+`fromLsp` reads the same members back (a missing `severity` is `error`; `source`
+and `data` are dropped) and returns `error.InvalidDiagnostic` for a missing
+`range`/`message` or a wrongly typed member.
+
+`expr_off`/`expr_len` are data for the consumer (an offset into the
+expression's own text, not into a source line): no renderer draws them and
+`writeLsp` does not convert them.

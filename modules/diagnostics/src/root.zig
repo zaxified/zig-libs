@@ -2,7 +2,7 @@
 //! diagnostics — LSP-style structured validation-finding collector.
 //!
 //! A `Diagnostics` collector accumulates `Diagnostic` findings (error /
-//! warning / info) emitted while validating a config / json5 / expression
+//! warning / info / hint) emitted while validating a config / json5 / expression
 //! tree, each carrying a dot-separated tree path, optional 1-based source
 //! line/col (and end position), an optional in-expression byte offset/length
 //! for token highlighting, a machine-readable code, a human message, and an
@@ -33,8 +33,14 @@ pub const meta = .{
     .deps = .{},
 };
 
-/// Finding severity.
-pub const Severity = enum { @"error", warning, info };
+/// Finding severity. The four levels of LSP's `DiagnosticSeverity`
+/// (`hint` is 4: the least important, "could be better" findings).
+/// `hint` renders like `info` (the same colour), under its own word.
+pub const Severity = enum { @"error", warning, info, hint };
+
+/// LSP's `DiagnosticTag`: extra rendering hints for an editor. They are written
+/// by `writeLsp`; the text renderers ignore them.
+pub const Tag = enum { unnecessary, deprecated };
 
 /// One validation finding. `path` is dot-separated and points at a node in
 /// the validated tree (not necessarily the raw source). Source position
@@ -52,7 +58,9 @@ pub const Diagnostic = struct {
     end_col: ?u32 = null,
     /// Byte offset inside an expression string for expr-internal findings.
     /// Useful for token highlighting in a GUI's expression panel. Null for
-    /// non-expr diagnostics.
+    /// non-expr diagnostics. Data for the consumer only: the offset is into the
+    /// expression's own text, not into the source lines, so neither the text
+    /// renderers nor `writeLsp` draw or convert it.
     expr_off: ?u32 = null,
     expr_len: ?u32 = null,
     severity: Severity,
@@ -79,6 +87,8 @@ pub const Diagnostic = struct {
     code_url: ?[]const u8 = null,
     /// A machine-applicable edit (LSP quick-fix `TextEdit`).
     fix: ?Fix = null,
+    /// LSP `DiagnosticTag`s (`writeLsp` only).
+    tags: ?[]const Tag = null,
 };
 
 /// A secondary span. Positions as in `Diagnostic` (1-based, `col` in bytes,
@@ -260,7 +270,7 @@ const Sgr = struct {
         return switch (s) {
             .@"error" => "\x1b[1;31m",
             .warning => "\x1b[1;33m",
-            .info => "\x1b[1;36m",
+            .info, .hint => "\x1b[1;36m",
         };
     }
     fn blue(self: Sgr) []const u8 {
@@ -1108,13 +1118,405 @@ fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
 
 /// Serialize findings as a JSON array of objects whose keys are
 /// `Diagnostic`'s field names; absent (null) fields are omitted and
-/// `severity` is a string (`"error"`, `"warning"`, `"info"`). Positions stay
-/// as they are here, 1-based -- a caller emitting LSP converts to its
-/// 0-based `range`.
+/// `severity` is a string (`"error"`, `"warning"`, `"info"`, `"hint"`). Positions
+/// stay as they are here, 1-based; `writeLsp` emits the LSP form.
 pub fn writeJsonSlice(w: *std.Io.Writer, items: []const Diagnostic) std.Io.Writer.Error!void {
     std.json.Stringify.value(items, .{ .emit_null_optional_fields = false }, w) catch |e| switch (e) {
         error.WriteFailed => return error.WriteFailed,
     };
+}
+
+// ── LSP 3.17 ─────────────────────────────────────────────────────────────────
+
+/// How LSP counts the `character` of a `Position` (the negotiated
+/// `PositionEncodingKind`): `utf8` bytes, `utf16` code units (an astral
+/// character such as U+1F600 is 2), `utf32` code points. LSP's default, and
+/// what every client supports, is `utf16`.
+pub const PositionEncoding = enum { utf8, utf16, utf32 };
+
+/// One decoded character of a line: its byte length and its size in `enc` units.
+const CharUnits = struct { len: usize, units: u32 };
+
+/// The character at byte `i` of `text`. A byte that does not start a valid
+/// UTF-8 sequence (stray continuation byte, truncated, overlong or surrogate
+/// encoding) is a character of its own, one unit in every encoding.
+fn charUnits(text: []const u8, i: usize, enc: PositionEncoding) CharUnits {
+    const b = text[i];
+    if (b < 0x80) return .{ .len = 1, .units = 1 };
+    const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .len = 1, .units = 1 };
+    if (i + n > text.len) return .{ .len = 1, .units = 1 };
+    const cp = std.unicode.utf8Decode(text[i..][0..n]) catch return .{ .len = 1, .units = 1 };
+    return .{ .len = n, .units = switch (enc) {
+        .utf8 => @intCast(n),
+        .utf16 => if (cp >= 0x10000) 2 else 1,
+        .utf32 => 1,
+    } };
+}
+
+fn satU32(x: usize) u32 {
+    return std.math.cast(u32, x) orelse std.math.maxInt(u32);
+}
+
+/// LSP's 0-based `character` for the 1-based byte column `byte_col_1based` of
+/// `line_text` (the line without its line break). A column past the end of the
+/// line is the line's length (LSP clamps the same way); a column inside a
+/// multi-byte character counts as that character's start. Bytes that are not
+/// valid UTF-8 count one unit each in every encoding. Column 0 is column 1.
+pub fn lspCharacter(line_text: []const u8, byte_col_1based: u32, enc: PositionEncoding) u32 {
+    const off = @min(@as(usize, byte_col_1based) -| 1, line_text.len);
+    if (enc == .utf8) return satU32(off);
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < off) {
+        const c = charUnits(line_text, i, enc);
+        if (i + c.len > off) break;
+        i += c.len;
+        units += c.units;
+    }
+    return satU32(units);
+}
+
+/// The inverse: the 1-based byte column of LSP `character` on `line_text`.
+/// A `character` past the end of the line is the column just after the last
+/// byte (LSP: "defaults back to the line length"). Null when it falls inside a
+/// character: between the two halves of a UTF-16 surrogate pair. Bytes that
+/// are not valid UTF-8 count as in `lspCharacter`.
+pub fn byteColumn(line_text: []const u8, character: u32, enc: PositionEncoding) ?u32 {
+    if (enc == .utf8) return satU32(@min(@as(usize, character), line_text.len) + 1);
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < line_text.len) {
+        if (units == character) break;
+        const c = charUnits(line_text, i, enc);
+        if (units + c.units > character) return null;
+        units += c.units;
+        i += c.len;
+    }
+    return satU32(i + 1);
+}
+
+pub const LspOptions = struct {
+    /// LSP `Diagnostic.source`, "the source of this diagnostic" (the tool).
+    /// Omitted when null.
+    source: ?[]const u8 = null,
+    /// Written before a `file` name to make a `DocumentUri`
+    /// (`relatedInformation[].location.uri`). The file name is
+    /// percent-encoded (everything but `A-Za-z0-9-._~/:@`), so an absolute path
+    /// gives `file:///the/path` with the default, and a `file` that already is
+    /// a URI passes through unchanged with an empty prefix. `fromLsp` strips
+    /// the prefix and decodes the same way.
+    uri_prefix: []const u8 = "file://",
+};
+
+const LspPos = struct { line: u32, character: u32 };
+const LspRange = struct { start: LspPos, end: LspPos };
+
+fn lspPosIn(text: ?[]const u8, line: u32, col: u32, enc: PositionEncoding) LspPos {
+    return .{
+        .line = line -| 1,
+        .character = if (text) |t| lspCharacter(t, col, enc) else col -| 1,
+    };
+}
+
+/// The LSP range of `span`. The source lines come from `sources` (found as
+/// for rendering); without them `character` is `col - 1`, i.e. UTF-8 bytes
+/// whatever `enc` says. Rules:
+///   - no `line`: `0:0-0:0` (LSP requires a range);
+///   - `line` but no `col`: the whole line (start of line to its end; without
+///     the text a zero-width range at its start);
+///   - `col` and no end: zero-width at `col`. A point, not "one character": we
+///     do not know the width of what the finding is about, editors expand an
+///     empty range to the word under it, and a one-character guess could
+///     cover a line break or half of a UTF-16 pair;
+///   - `end_col` without `end_line`: same line; `end_line` without `end_col`:
+///     the end of that line;
+///   - an end before the start is clamped to the start.
+fn lspRangeOf(span: Span, sources: []const Source, enc: PositionEncoding) LspRange {
+    const line = span.line orelse return .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } };
+    const src = findSource(span, sources);
+    const text: ?[]const u8 = if (src) |s| lineIn(s, line) else null;
+    const start = lspPosIn(text, line, span.col orelse 1, enc);
+    var end = start;
+    if (span.col == null) {
+        if (text) |t| end.character = lspCharacter(t, satU32(t.len + 1), enc);
+    } else if (span.end_line != null or span.end_col != null) {
+        const el = span.end_line orelse line;
+        const etext: ?[]const u8 = if (el == line) text else if (src) |s| lineIn(s, el) else null;
+        if (span.end_col) |ec| {
+            end = lspPosIn(etext, el, ec, enc);
+        } else {
+            end = .{ .line = el -| 1, .character = if (etext) |t| lspCharacter(t, satU32(t.len + 1), enc) else 0 };
+        }
+    }
+    if (end.line < start.line or (end.line == start.line and end.character < start.character)) end = start;
+    return .{ .start = start, .end = end };
+}
+
+fn severityNumber(s: Severity) u8 {
+    return switch (s) {
+        .@"error" => 1,
+        .warning => 2,
+        .info => 3,
+        .hint => 4,
+    };
+}
+
+fn tagNumber(t: Tag) u8 {
+    return switch (t) {
+        .unnecessary => 1,
+        .deprecated => 2,
+    };
+}
+
+fn isUriSafe(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '-', '.', '_', '~', '/', ':', '@' => true,
+        else => false,
+    };
+}
+
+/// A JSON string value: `uri_prefix` and the percent-encoded `file`.
+fn writeUri(s: *std.json.Stringify, file: ?[]const u8, opts: LspOptions) std.Io.Writer.Error!void {
+    const w = s.writer;
+    try s.beginWriteRaw();
+    defer s.endWriteRaw();
+    try w.writeByte('"');
+    try std.json.Stringify.encodeJsonStringChars(opts.uri_prefix, .{}, w);
+    if (file) |f| for (f) |c| {
+        if (isUriSafe(c)) try w.writeByte(c) else try w.print("%{X:0>2}", .{c});
+    };
+    try w.writeByte('"');
+}
+
+fn writeLspValue(s: *std.json.Stringify, d: Diagnostic, sources: []const Source, enc: PositionEncoding, opts: LspOptions) std.Io.Writer.Error!void {
+    try s.beginObject();
+    try s.objectField("range");
+    try s.write(lspRangeOf(primarySpan(d), sources, enc));
+    try s.objectField("severity");
+    try s.write(severityNumber(d.severity));
+    if (d.code.len > 0) {
+        try s.objectField("code");
+        try s.write(d.code);
+    }
+    if (d.code_url) |u| {
+        try s.objectField("codeDescription");
+        try s.beginObject();
+        try s.objectField("href");
+        try s.write(u);
+        try s.endObject();
+    }
+    if (opts.source) |src| {
+        try s.objectField("source");
+        try s.write(src);
+    }
+    try s.objectField("message");
+    try s.write(d.message);
+    if (d.tags) |tags| if (tags.len > 0) {
+        try s.objectField("tags");
+        try s.beginArray();
+        for (tags) |t| try s.write(tagNumber(t));
+        try s.endArray();
+    };
+    if (d.labels) |labels| if (labels.len > 0) {
+        try s.objectField("relatedInformation");
+        try s.beginArray();
+        for (labels) |l| {
+            const span = labelSpan(d, l);
+            try s.beginObject();
+            try s.objectField("location");
+            try s.beginObject();
+            try s.objectField("uri");
+            try writeUri(s, span.file, opts);
+            try s.objectField("range");
+            try s.write(lspRangeOf(span, sources, enc));
+            try s.endObject();
+            try s.objectField("message");
+            try s.write(l.message);
+            try s.endObject();
+        }
+        try s.endArray();
+    };
+    try s.endObject();
+}
+
+/// Write `d` as one LSP 3.17 `Diagnostic` JSON object (compact):
+/// `range` (see `lspRangeOf` rules above, `character` in `enc`), `severity`
+/// (1..4), `code` (always a string; omitted when empty), `codeDescription.href`
+/// from `code_url`, `source` from `opts.source`, `message` (verbatim, JSON
+/// escaped: this is data, not terminal text), `tags`, and `relatedInformation`
+/// from `labels` (`location.uri` from the label's file or the diagnostic's,
+/// see `LspOptions.uri_prefix`). Not written: `path`, `suggest`, `notes`,
+/// `fix`, `span_message`, `expr_*` (no LSP field; a fix is a code action, not
+/// part of a diagnostic) and `data`.
+pub fn writeLsp(w: *std.Io.Writer, d: Diagnostic, sources: []const Source, enc: PositionEncoding, opts: LspOptions) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try writeLspValue(&s, d, sources, enc, opts);
+}
+
+/// `writeLsp` for each of `items`, as a JSON array: the `diagnostics` of a
+/// `textDocument/publishDiagnostics` notification.
+pub fn writeLspArray(w: *std.Io.Writer, items: []const Diagnostic, sources: []const Source, enc: PositionEncoding, opts: LspOptions) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try s.beginArray();
+    for (items) |d| try writeLspValue(&s, d, sources, enc, opts);
+    try s.endArray();
+}
+
+pub const FromLspError = error{ OutOfMemory, InvalidDiagnostic };
+
+fn jsonField(obj: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const v = obj.get(key) orelse return null;
+    return if (v == .null) null else v;
+}
+
+fn jsonU32(v: ?std.json.Value) FromLspError!u32 {
+    const x = v orelse return error.InvalidDiagnostic;
+    if (x != .integer) return error.InvalidDiagnostic;
+    return std.math.cast(u32, x.integer) orelse error.InvalidDiagnostic;
+}
+
+fn lspPosFrom(v: ?std.json.Value) FromLspError!LspPos {
+    const p = v orelse return error.InvalidDiagnostic;
+    if (p != .object) return error.InvalidDiagnostic;
+    return .{ .line = try jsonU32(p.object.get("line")), .character = try jsonU32(p.object.get("character")) };
+}
+
+/// The 1-based byte column of `p` on its line (`line_text` null: unknown, so
+/// `character + 1`). A position between the halves of a surrogate pair is
+/// taken to be at the pair's start.
+fn colFrom(line_text: ?[]const u8, p: LspPos, enc: PositionEncoding) u32 {
+    const t = line_text orelse return p.character +| 1;
+    return byteColumn(t, p.character, enc) orelse
+        byteColumn(t, p.character -| 1, enc) orelse p.character +| 1;
+}
+
+const FromRange = struct { line: u32, col: u32, end_line: ?u32, end_col: ?u32 };
+
+fn rangeFrom(v: ?std.json.Value, file: ?[]const u8, sources: []const Source, enc: PositionEncoding) FromLspError!FromRange {
+    const r = v orelse return error.InvalidDiagnostic;
+    if (r != .object) return error.InvalidDiagnostic;
+    const a = try lspPosFrom(r.object.get("start"));
+    const b = try lspPosFrom(r.object.get("end"));
+    const line = std.math.add(u32, a.line, 1) catch return error.InvalidDiagnostic;
+    const eline = std.math.add(u32, b.line, 1) catch return error.InvalidDiagnostic;
+    const src = findSource(.{ .file = file, .line = line, .col = null, .end_line = null, .end_col = null }, sources);
+    const atext: ?[]const u8 = if (src) |s| lineIn(s, line) else null;
+    const col = colFrom(atext, a, enc);
+    // A zero-width range is a point: no end (as `writeLsp` writes it).
+    if (a.line == b.line and a.character == b.character) return .{ .line = line, .col = col, .end_line = null, .end_col = null };
+    const btext: ?[]const u8 = if (eline == line) atext else if (src) |s| lineIn(s, eline) else null;
+    return .{ .line = line, .col = col, .end_line = eline, .end_col = colFrom(btext, b, enc) };
+}
+
+/// The inverse of `writeUri`: `uri` without `prefix`, percent-decoded; the
+/// whole decoded `uri` when it does not start with the prefix.
+fn fileFromUri(arena: std.mem.Allocator, uri: []const u8, prefix: []const u8) std.mem.Allocator.Error![]const u8 {
+    const rest = if (std.mem.startsWith(u8, uri, prefix)) uri[prefix.len..] else uri;
+    const out = try arena.alloc(u8, rest.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < rest.len) : (n += 1) {
+        if (rest[i] == '%' and i + 2 < rest.len) {
+            if (std.fmt.parseInt(u8, rest[i + 1 ..][0..2], 16)) |b| {
+                out[n] = b;
+                i += 3;
+                continue;
+            } else |_| {}
+        }
+        out[n] = rest[i];
+        i += 1;
+    }
+    return out[0..n];
+}
+
+/// Read one LSP `Diagnostic` (a parsed JSON value) back. `file` is the document
+/// the diagnostic was published for (`PublishDiagnosticsParams.uri`, turned
+/// into a name by the caller), `sources` the texts to turn `character` back
+/// into a byte column with `enc` (a line that is not there: `character + 1`).
+/// Everything is allocated in `arena`, including the strings.
+///   - `range` -> `line`/`col`/`end_line`/`end_col` (a zero-width range has no
+///     end); `message` and `range` are required, else `error.InvalidDiagnostic`;
+///   - `severity` 1..4 (absent or unknown: `error`, as most clients read it);
+///   - `code` string or integer -> string; `codeDescription.href` -> `code_url`;
+///   - `tags` 1/2 -> `tags` (others dropped);
+///   - `relatedInformation` -> `labels`, `location.uri` -> `Label.file` via
+///     `opts.uri_prefix` (null when it is `file` itself);
+///   - dropped: `source` (a `Diagnostic` has none; it is the producing tool),
+///     `data`. `path` is empty.
+pub fn fromLsp(arena: std.mem.Allocator, v: std.json.Value, file: ?[]const u8, sources: []const Source, enc: PositionEncoding, opts: LspOptions) FromLspError!Diagnostic {
+    if (v != .object) return error.InvalidDiagnostic;
+    const o = v.object;
+    const msg = jsonField(o, "message") orelse return error.InvalidDiagnostic;
+    if (msg != .string) return error.InvalidDiagnostic;
+    const r = try rangeFrom(o.get("range"), file, sources, enc);
+    var d: Diagnostic = .{
+        .path = "",
+        .file = file,
+        .line = r.line,
+        .col = r.col,
+        .end_line = r.end_line,
+        .end_col = r.end_col,
+        .severity = .@"error",
+        .code = "",
+        .message = try arena.dupe(u8, msg.string),
+    };
+    if (jsonField(o, "severity")) |sv| if (sv == .integer) {
+        d.severity = switch (sv.integer) {
+            2 => .warning,
+            3 => .info,
+            4 => .hint,
+            else => .@"error",
+        };
+    };
+    if (jsonField(o, "code")) |c| switch (c) {
+        .string => |t| d.code = try arena.dupe(u8, t),
+        .integer => |n| d.code = try std.fmt.allocPrint(arena, "{d}", .{n}),
+        else => return error.InvalidDiagnostic,
+    };
+    if (jsonField(o, "codeDescription")) |cd| {
+        if (cd != .object) return error.InvalidDiagnostic;
+        const href = jsonField(cd.object, "href") orelse return error.InvalidDiagnostic;
+        if (href != .string) return error.InvalidDiagnostic;
+        d.code_url = try arena.dupe(u8, href.string);
+    }
+    if (jsonField(o, "tags")) |tv| {
+        if (tv != .array) return error.InvalidDiagnostic;
+        var tags: std.ArrayList(Tag) = .empty;
+        for (tv.array.items) |t| {
+            if (t != .integer) return error.InvalidDiagnostic;
+            switch (t.integer) {
+                1 => try tags.append(arena, .unnecessary),
+                2 => try tags.append(arena, .deprecated),
+                else => {},
+            }
+        }
+        if (tags.items.len > 0) d.tags = tags.items;
+    }
+    if (jsonField(o, "relatedInformation")) |ri| {
+        if (ri != .array) return error.InvalidDiagnostic;
+        const labels = try arena.alloc(Label, ri.array.items.len);
+        for (ri.array.items, labels) |item, *out| {
+            if (item != .object) return error.InvalidDiagnostic;
+            const loc = jsonField(item.object, "location") orelse return error.InvalidDiagnostic;
+            if (loc != .object) return error.InvalidDiagnostic;
+            const uri = jsonField(loc.object, "uri") orelse return error.InvalidDiagnostic;
+            const m = jsonField(item.object, "message") orelse return error.InvalidDiagnostic;
+            if (uri != .string or m != .string) return error.InvalidDiagnostic;
+            const lfile = try fileFromUri(arena, uri.string, opts.uri_prefix);
+            const same = file != null and std.mem.eql(u8, lfile, file.?);
+            const lr = try rangeFrom(loc.object.get("range"), if (same) file else lfile, sources, enc);
+            out.* = .{
+                .file = if (same) null else lfile,
+                .line = lr.line,
+                .col = lr.col,
+                .end_line = lr.end_line,
+                .end_col = lr.end_col,
+                .message = try arena.dupe(u8, m.string),
+            };
+        }
+        if (labels.len > 0) d.labels = labels;
+    }
+    return d;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1610,4 +2012,5 @@ test "note kinds are named, and a hostile code URL is escaped in both styles" {
 
 test {
     _ = @import("codespan_test.zig");
+    _ = @import("lsp_test.zig");
 }
