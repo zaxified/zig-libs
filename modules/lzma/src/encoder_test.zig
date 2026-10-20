@@ -118,3 +118,26 @@ test "encoder: a long match crossing the dictionary and the window slide" {
     defer gpa2.free(back);
     try std.testing.expectEqualSlices(u8, data, back);
 }
+
+test "compressBound holds for incompressible input in every format; encoder refuses use after finish" {
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(7);
+    const data = try a.alloc(u8, 256 * 1024);
+    defer a.free(data);
+    prng.random().bytes(data);
+    const buf = try a.alloc(u8, lzma.compressBound(data.len));
+    defer a.free(buf);
+    const formats = [_]lzma.EncodeFormat{ .xz, .lzma_alone, .lzma1, .lzma2 };
+    for (formats) |f| {
+        const n = try lzma.compressInto(a, buf, data, f, .{ .lzma = lzma.preset(1, false) });
+        try std.testing.expect(n <= buf.len);
+    }
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var e = try lzma.Encoder.init(a, &out.writer, .xz, .{});
+    defer e.deinit();
+    try e.write("abc");
+    try e.finish();
+    try std.testing.expectError(error.AlreadyFinished, e.finish());
+    try std.testing.expectError(error.AlreadyFinished, e.write("x"));
+}

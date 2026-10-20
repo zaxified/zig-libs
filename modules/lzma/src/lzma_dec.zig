@@ -55,22 +55,70 @@ pub const Dict = struct {
         d.pos += 1;
     }
 
+    inline fn move(comptime T: type, buf: []u8, dst: usize, src: usize) void {
+        const sp: *align(1) const T = @ptrCast(buf[src..][0..@sizeOf(T)]);
+        const dp: *align(1) T = @ptrCast(buf[dst..][0..@sizeOf(T)]);
+        dp.* = sp.*;
+    }
+
     /// Append `n` bytes that are `dist + 1` back; `n <= buf.len - pos`.
     inline fn copyMatch(d: *Dict, dist: usize, n: usize) void {
+        if (n == 0) return;
         const len = d.buf.len;
-        var src = if (d.pos > dist) d.pos - dist - 1 else d.pos + len - dist - 1;
-        if (n >= 32 and src + n <= d.pos) {
-            @memcpy(d.buf[d.pos..][0..n], d.buf[src..][0..n]);
+        const pos = d.pos;
+        var src = if (pos > dist) pos - dist - 1 else pos + len - dist - 1;
+        d.pos = pos + n;
+        const buf = d.buf;
+        if (src + n <= len) {
+            if (src + n <= pos or src >= pos + n) {
+                // The areas are disjoint: a few overlapping fixed-size moves,
+                // all loads of a move before its stores, with no loop over the
+                // exact length (it mispredicts on every match).
+                const V = @Vector(16, u8);
+                if (n >= 16) {
+                    var i: usize = 0;
+                    while (i + 16 < n) : (i += 16) move(V, buf, pos + i, src + i);
+                    move(V, buf, pos + n - 16, src + n - 16);
+                } else if (n >= 8) {
+                    const a = std.mem.readInt(u64, buf[src..][0..8], .little);
+                    const b = std.mem.readInt(u64, buf[src + n - 8 ..][0..8], .little);
+                    std.mem.writeInt(u64, buf[pos..][0..8], a, .little);
+                    std.mem.writeInt(u64, buf[pos + n - 8 ..][0..8], b, .little);
+                } else if (n >= 4) {
+                    const a = std.mem.readInt(u32, buf[src..][0..4], .little);
+                    const b = std.mem.readInt(u32, buf[src + n - 4 ..][0..4], .little);
+                    std.mem.writeInt(u32, buf[pos..][0..4], a, .little);
+                    std.mem.writeInt(u32, buf[pos + n - 4 ..][0..4], b, .little);
+                } else {
+                    // 1..3 bytes: first, last and middle.
+                    const a = buf[src];
+                    const b = buf[src + n - 1];
+                    const m = buf[src + n / 2];
+                    buf[pos] = a;
+                    buf[pos + n - 1] = b;
+                    buf[pos + n / 2] = m;
+                }
+                return;
+            }
+            // Overlapping (a run or a short period): eight bytes at a time
+            // when a chunk cannot overlap itself, the tail byte by byte.
+            var i: usize = 0;
+            if (dist >= 7 or src > pos) {
+                while (i + 8 <= n) : (i += 8) {
+                    const v = std.mem.readInt(u64, buf[src + i ..][0..8], .little);
+                    std.mem.writeInt(u64, buf[pos + i ..][0..8], v, .little);
+                }
+            }
+            while (i < n) : (i += 1) buf[pos + i] = buf[src + i];
         } else {
-            var dst = d.pos;
-            const end = d.pos + n;
+            var dst = pos;
+            const end = pos + n;
             while (dst < end) : (dst += 1) {
-                d.buf[dst] = d.buf[src];
+                buf[dst] = buf[src];
                 src += 1;
                 if (src == len) src = 0;
             }
         }
-        d.pos += n;
     }
 };
 
@@ -78,11 +126,15 @@ pub const Dict = struct {
 const fast_need = 24;
 
 const FastSrc = struct {
-    b: []const u8,
-    i: usize = 0,
+    /// The next unread byte; `fast_need` bytes are readable per symbol (the
+    /// caller checks before each one).
+    p: [*]const u8,
+    inline fn peek(s: *const FastSrc) u8 {
+        return s.p[0];
+    }
     inline fn next(s: *FastSrc) error{}!u8 {
-        const v = s.b[s.i];
-        s.i += 1;
+        const v = s.p[0];
+        s.p += 1;
         return v;
     }
 };
@@ -159,6 +211,21 @@ pub const Lzma = struct {
         }
     }
 
+    /// `norm` without a branch for the in-memory source: the next byte is
+    /// read whether or not it is needed (the fast path has `fast_need` bytes
+    /// in hand). The refill is close to random in a literal, so the branch of
+    /// `norm` mispredicts there.
+    inline fn normSel(r: *Regs, src: anytype) !void {
+        if (comptime @hasDecl(@TypeOf(src.*), "peek")) {
+            const need = r.range < c.top_value;
+            const sh: u5 = if (need) 8 else 0;
+            const byte: u32 = if (need) src.peek() else 0;
+            r.range <<= sh;
+            r.code = (r.code << sh) | byte;
+            src.p += @intFromBool(need);
+        } else try norm(r, src);
+    }
+
     inline fn bit(r: *Regs, src: anytype, p: *u16) !u1 {
         try norm(r, src);
         const bound = (r.range >> c.prob_bits) * p.*;
@@ -176,17 +243,26 @@ pub const Lzma = struct {
     /// The same step without a branch on the decoded bit (the bits of a
     /// literal are close to random, so the branch is mispredicted a lot).
     inline fn bitSel(r: *Regs, src: anytype, p: *u16) !u1 {
-        try norm(r, src);
-        const pv: u32 = p.*;
+        return bitSelP(r, src, p, p.*);
+    }
+
+    /// `bitSel` with the probability already loaded (`pv == p.*`): a bit
+    /// tree loads both children of the next node before this bit is known,
+    /// so the load is off the chain range -> bound -> bit -> next index.
+    inline fn bitSelP(r: *Regs, src: anytype, p: *u16, pv: u32) !u1 {
+        try normSel(r, src);
         const bound = (r.range >> c.prob_bits) * pv;
-        const one: u32 = @intFromBool(r.code >= bound);
-        const mask: u32 = 0 -% one; // all ones when the bit is 1
-        const range_one = r.range -% bound;
-        const code_one = r.code -% bound;
-        r.range = if (one != 0) range_one else bound;
-        r.code = if (one != 0) code_one else r.code;
-        p.* = @intCast(pv + (((2048 - pv) >> c.move_bits) & ~mask) -% ((pv >> c.move_bits) & mask));
-        return @intCast(one);
+        // The borrow of code - bound is the 0 bit; it also gives the new code.
+        const sb = @subWithOverflow(r.code, bound);
+        const zero = sb[1] != 0;
+        r.range = if (zero) bound else r.range -% bound;
+        r.code = if (zero) r.code else sb[0];
+        // A 1 bit: pv -= pv >> 5. A 0 bit: pv += (2048 - pv) >> 5, which is
+        // pv -= (pv + 31 - 2048) >> 5 with an arithmetic shift; modulo 2^32
+        // the logical shift gives the same low 16 bits. One select, no branch.
+        const t: u32 = if (zero) pv +% c.move_offset else pv;
+        p.* = @truncate(pv -% (t >> c.move_bits));
+        return @intFromBool(!zero);
     }
 
     inline fn direct(r: *Regs, src: anytype, n: u32) !u32 {
@@ -195,17 +271,27 @@ pub const Lzma = struct {
         while (k > 0) : (k -= 1) {
             try norm(r, src);
             r.range >>= 1;
-            if (r.code >= r.range) {
-                r.code -= r.range;
-                v = (v << 1) | 1;
-            } else v <<= 1;
+            // code < 2 * range here, so the difference is a 31-bit value
+            // whose sign bit tells the decoded bit (a cmov pair, as in
+            // liblzma's assembly).
+            const d = r.code -% r.range;
+            const one = @as(i32, @bitCast(d)) >= 0;
+            r.code = if (one) d else r.code;
+            v = if (one) (v << 1) + 1 else v << 1;
         }
         return v;
     }
 
     inline fn tree(r: *Regs, src: anytype, probs: []u16, comptime bits: u5) !u32 {
         var m: u32 = 1;
-        inline for (0..bits) |_| m = (m << 1) | try bitSel(r, src, &probs[m]);
+        var pv: u32 = probs[1];
+        inline for (0..bits) |k| {
+            const n0: u32 = if (k + 1 < bits) probs[2 * m] else 0;
+            const n1: u32 = if (k + 1 < bits) probs[2 * m + 1] else 0;
+            const b = try bitSelP(r, src, &probs[m], pv);
+            m = (m << 1) | b;
+            pv = if (b == 1) n1 else n0;
+        }
         return m - (1 << bits);
     }
 
@@ -229,7 +315,15 @@ pub const Lzma = struct {
             const probs = l.probs.literal[sub * 3 ..][0..c.literal_coder_size];
             var sym: u32 = 1;
             if (c.isLiteralState(st)) {
-                inline for (0..8) |_| sym = (sym << 1) | try bitSel(r, src, &probs[sym]);
+                var pv: u32 = probs[1];
+                inline for (0..8) |k| {
+                    // Both children of the next node, loaded before this bit is known.
+                    const n0: u32 = if (k < 7) probs[2 * sym] else 0;
+                    const n1: u32 = if (k < 7) probs[2 * sym + 1] else 0;
+                    const b = try bitSelP(r, src, &probs[sym], pv);
+                    sym = (sym << 1) | b;
+                    pv = if (b == 1) n1 else n0;
+                }
             } else {
                 var match: u32 = @as(u32, dict.at(r.rep[0])) << 1;
                 var offset: u32 = 0x100;
@@ -269,7 +363,7 @@ pub const Lzma = struct {
                     var m: u32 = 1;
                     var i: u5 = 0;
                     while (i < limit) : (i += 1) {
-                        const b = try bit(r, src, &l.probs.pos_special[base + m - 1]);
+                        const b = try bitSel(r, src, &l.probs.pos_special[base + m - 1]);
                         m = (m << 1) | b;
                         rep0 += @as(u32, b) << i;
                     }
@@ -279,7 +373,7 @@ pub const Lzma = struct {
                     var m: u32 = 1;
                     var i: u5 = 0;
                     while (i < c.align_bits) : (i += 1) {
-                        const b = try bit(r, src, &l.probs.pos_align[m]);
+                        const b = try bitSel(r, src, &l.probs.pos_align[m]);
                         m = (m << 1) | b;
                         rep0 += @as(u32, b) << i;
                     }
@@ -354,12 +448,14 @@ pub const Lzma = struct {
                 const avail: usize = @intCast(@min(buffered.len, budget.*));
                 if (avail >= fast_need) {
                     // Local copies of the registers and the ring cursor.
-                    var fs: FastSrc = .{ .b = buffered[0..avail] };
+                    const base = buffered.ptr;
+                    const stop = base + (avail - fast_need);
+                    var fs: FastSrc = .{ .p = base };
                     var regs = l.r;
                     var dl = dict.*;
                     var result: ?Run = null;
                     var failed = false;
-                    while (dl.pos < target and fs.i + fast_need <= avail) {
+                    while (dl.pos < target and @intFromPtr(fs.p) <= @intFromPtr(stop)) {
                         const res = l.symbol(&regs, &dl, &fs, target, eopm_ok) catch {
                             failed = true;
                             break;
@@ -373,8 +469,9 @@ pub const Lzma = struct {
                     l.r = regs;
                     dict.* = dl;
                     if (failed) return error.CorruptData;
-                    in.toss(fs.i);
-                    budget.* -= fs.i;
+                    const used = @intFromPtr(fs.p) - @intFromPtr(base);
+                    in.toss(used);
+                    budget.* -= used;
                     if (result) |res| return res;
                     continue;
                 }

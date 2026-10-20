@@ -178,8 +178,9 @@ pub const Decoder = struct {
         d.* = undefined;
     }
 
-    /// Up to `dest.len` decompressed bytes; 0 at the end of the stream. After
-    /// an error the decoder stays failed.
+    /// Up to `dest.len` decompressed bytes; 0 at the end of the stream (and,
+    /// trivially, for an empty `dest` — pass a non-empty one). After an error
+    /// the decoder stays failed.
     pub fn read(d: *Decoder, dest: []u8) Error!usize {
         if (d.failed) |e| return e;
         if (dest.len == 0) return 0;
@@ -219,7 +220,6 @@ pub const Decoder = struct {
     /// (Re)allocate the ring for a dictionary of `dict_size` bytes when the
     /// stream can produce at most `known` bytes.
     fn setupDict(d: *Decoder, dict_size: u32, known: ?u64) Error!void {
-        if (dict_size > d.opts.max_dict) return error.DictTooLarge;
         var size: u64 = @max(dict_size, 4096);
         size = (size + 15) & ~@as(u64, 15);
         var cap: u64 = std.math.maxInt(u64);
@@ -228,6 +228,9 @@ pub const Decoder = struct {
         // A ring that can wrap is a multiple of 16; one that cannot is only
         // as large as the output.
         if (cap < size) size = @max(cap, 1);
+        // The cap is on what is allocated: a 1 KB entry written with a 1.5 GiB
+        // dictionary needs a 1 KB ring (liblzma accepts it too).
+        if (size > d.opts.max_dict) return error.DictTooLarge;
         const n: usize = std.math.cast(usize, size) orelse return error.OutOfMemory;
         if (d.dict.buf.len != n) {
             if (d.dict.buf.len != 0) d.gpa.free(d.dict.buf);
@@ -238,6 +241,10 @@ pub const Decoder = struct {
     }
 
     fn startLzma1(d: *Decoder, f: Format.Lzma1) Error!void {
+        // `Lzma1Props` is a public struct: props built by hand bypass
+        // `fromBytes`'s check, and an lc/lp/pb out of range would index past
+        // the literal tables.
+        if (@as(u16, f.props.lc) + f.props.lp > 4 or f.props.pb > 4) return error.BadHeader;
         const p = c.Lclppb{ .lc = f.props.lc, .lp = f.props.lp, .pb = f.props.pb };
         try d.setupDict(f.props.dict_size, f.uncompressed_size);
         d.lz.reset(p);

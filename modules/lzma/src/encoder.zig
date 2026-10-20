@@ -68,7 +68,12 @@ pub const Options = struct {
     check: Check = .crc64,
 };
 
-pub const WriteError = Writer.Error || error{OutOfMemory};
+pub const WriteError = Writer.Error || error{
+    OutOfMemory,
+    /// `write` or `finish` after `finish` (a second `finish` would emit a
+    /// second index and footer).
+    AlreadyFinished,
+};
 pub const InitError = error{ OutOfMemory, InvalidOptions };
 
 const lzma2_header_max = 6;
@@ -358,7 +363,7 @@ pub const Encoder = struct {
     /// Compress `data`. Output reaches the writer as the coder produces it.
     pub fn write(e: *Encoder, data: []const u8) WriteError!void {
         const st = e.st;
-        std.debug.assert(!st.finished);
+        if (st.finished) return error.AlreadyFinished;
         if (data.len == 0) return;
         if (st.format == .xz and !st.block_open) {
             try st.out.writeAll(&blockHeader(st.o.dict_size));
@@ -373,7 +378,7 @@ pub const Encoder = struct {
     /// End the stream (it does not flush the writer).
     pub fn finish(e: *Encoder) WriteError!void {
         const st = e.st;
-        std.debug.assert(!st.finished);
+        if (st.finished) return error.AlreadyFinished;
         st.finished = true;
         if (st.format == .xz and !st.block_open) {
             return writeIndexAndFooter(st, null);
@@ -463,8 +468,12 @@ pub fn compress(gpa: std.mem.Allocator, input: []const u8, format: Format, opts:
 }
 
 /// A bound on the compressed size of `n` input bytes (any format, any options).
+/// Raw LZMA1 and `.lzma` have no stored mode: incompressible input grows by
+/// ~1.4 % (measured on random bytes, liblzma's encoder and ours being
+/// byte-identical), so the bound allows 1/32; `.xz`/LZMA2 fall back to stored
+/// chunks and stay far below it.
 pub fn compressBound(n: usize) usize {
-    return n + n / 1024 + 1024;
+    return n +| n / 32 +| 1024;
 }
 
 /// `compress` into the caller's buffer; `error.OutputTooLarge` when it does

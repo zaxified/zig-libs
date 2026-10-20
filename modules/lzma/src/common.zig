@@ -8,6 +8,9 @@ const std = @import("std");
 pub const prob_bits = 11;
 pub const prob_init: u16 = 1 << (prob_bits - 1);
 pub const move_bits = 5;
+/// `(1 << move_bits) - 1 - (1 << prob_bits)` modulo 2^32: added to a
+/// probability before the shift of a 0 bit update (see the decoder).
+pub const move_offset: u32 = @as(u32, (1 << move_bits) - 1) -% (1 << prob_bits);
 pub const top_value: u32 = 1 << 24;
 
 pub const states = 12;

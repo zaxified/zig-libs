@@ -136,3 +136,14 @@ test "xz: every check type is verified" {
         try std.testing.expectError(error.CheckMismatch, lz.decompress(gpa, bad, .xz, .{}));
     }
 }
+
+test "hand-built Lzma1Props out of range are refused, not used as table sizes" {
+    const a = std.testing.allocator;
+    const bad = [_]lz.Lzma1Props{
+        .{ .lc = 8, .lp = 4, .pb = 2, .dict_size = 1 << 16 },
+        .{ .lc = 3, .lp = 0, .pb = 200, .dict_size = 1 << 16 },
+    };
+    for (bad) |p| {
+        try std.testing.expectError(error.BadHeader, lz.decompress(a, "\x00\x00\x00\x00\x00", .{ .lzma1 = .{ .props = p, .uncompressed_size = 0, .allow_eopm = true } }, .{}));
+    }
+}
