@@ -51,7 +51,7 @@ const burn = @import("burn.zig");
 const handshake = @import("handshake.zig");
 const flight = @import("flight.zig");
 const engine = @import("engine.zig");
-const certverify = @import("certverify.zig");
+const certverify = @import("tls13").certverify;
 const certauth = @import("certauth.zig");
 
 const X25519 = std.crypto.dh.X25519;

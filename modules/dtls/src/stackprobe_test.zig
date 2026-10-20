@@ -31,8 +31,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const rsa = @import("rsa");
-const certverify = @import("certverify.zig");
-const kat = @import("certverify_kat_vectors.zig");
+const certverify = @import("tls13").certverify;
+const kat = @import("tls13").certverify_kat_vectors;
 
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;

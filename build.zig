@@ -336,7 +336,7 @@ pub const module_list = [_]Module{
     .{ .name = "hqc", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
-    .{ .name = "tls13", .libs = &.{"crypto"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
+    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },

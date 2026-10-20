@@ -1510,7 +1510,7 @@ test "HandshakeType: RFC 8446 §4 wire code points for the cert-mode types" {
 
 const fuzz_corpus = @import("fuzz_corpus.zig");
 const cert_kat = @import("certauth_kat_vectors.zig");
-const sig_kat = @import("certverify_kat_vectors.zig");
+const sig_kat = @import("tls13").certverify_kat_vectors;
 
 /// One size for every corpus in this file. The largest is the ClientHello one
 /// (13 recorded bodies, 6965 octets between them); `dropped` is pinned at zero

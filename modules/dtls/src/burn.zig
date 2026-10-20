@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Dead-stack burn for the CertificateVerify signers (`certverify.sign`: ECDSA
-//! P-256/P-384 and Ed25519 through std, RSA-PSS through `rsa`) and for every
+//! Dead-stack burn for every
 //! secret-touching public entry point of `Connection.zig` (`startHandshake`,
 //! `handleFlight`, `installApplicationKeys`, `send`, `recv`: the ECDHE scalars
 //! and ML-KEM seeds, the shared secrets, the key schedule, the record keys).
@@ -34,21 +33,6 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     stack(n);
     return r;
 }
-
-/// ECDSA through std's `Ecdsa(P256, Sha256)` / `Ecdsa(P384, Sha384)`:
-/// `signEcdsaP256` dirtied 38.6 KiB, `signEcdsaP384` 34.1 KiB in ReleaseFast
-/// (2026-10-08). One size for both.
-pub const ecdsa_burn = 48 * 1024;
-
-/// `signEd25519` (std `Ed25519.KeyPair.generateDeterministic` + `sign`)
-/// dirtied 33.8 KiB in ReleaseFast (2026-10-08).
-pub const ed25519_burn = 40 * 1024;
-
-/// `signRsaPss`: the frames above `rsa.signPss` (key by pointer, no copy) are
-/// well under 1 KiB and `rsa` burns its own 200 KiB below them; before the
-/// pointer API the by-value key copies reached 26.9 KiB deep (2026-10-08).
-/// 8 KiB is a margin, not a measured depth.
-pub const rsa_burn = 8 * 1024;
 
 // `Connection` entry points. Depths are the dirty stack of the unburned body in
 // ReleaseFast, from the full-handshake probe (2026-10-09); each burn is ~2x

@@ -2,7 +2,7 @@
 
 //! Known-answer vectors for `certverify.zig`'s RFC 8446 §4.4.3 CertificateVerify
 //! signature construction. Every vector fixes a key + a `Side` + a (fake, fixed
-//! -- NOT a real DTLS handshake transcript) "transcript hash" byte string, so
+//! -- NOT a real handshake transcript) "transcript hash" byte string, so
 //! the exact `buildSignedContent` output and the exact signature over it are
 //! both pinned. See each section's comment for exact provenance -- this file
 //! is deliberately honest about which vectors are externally cross-checked

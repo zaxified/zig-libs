@@ -1,18 +1,16 @@
 // SPDX-License-Identifier: MIT
 
-//! dtls.certverify -- TLS/DTLS 1.3 CertificateVerify signature construction
+//! tls13.certverify -- TLS/DTLS 1.3 CertificateVerify signature construction
 //! (RFC 8446 §4.4.3), reused VERBATIM by DTLS 1.3 (RFC 9147 does not
 //! redefine it -- only the record/handshake HEADERS differ between TLS and
-//! DTLS, never this message's signature construction).
+//! DTLS, never this message's signature construction). Moved from `dtls`
+//! on 2026-10-20 (earlier history under `modules/dtls/src/certverify.zig`);
+//! `dtls` re-exports it as `dtls.certverify`.
 //!
-//! This file is a self-contained, ADDITIVE module: it does not touch, call
-//! into, or get called by the PSK flight engine (`Connection.zig`,
-//! `messages.zig`, `keyschedule.zig`, `engine.zig`) or the handshake state
-//! machine. It takes a caller-supplied transcript hash and typed key as
-//! input and produces/verifies a CertificateVerify signature -- wiring this
-//! into an actual certificate-auth handshake flow (which this module's PSK
-//! engine does not have, see `root.zig`'s module doc comment) is future work
-//! for whoever builds that flow, not this file's job.
+//! Self-contained: it takes a caller-supplied transcript hash and typed key
+//! and produces/verifies a CertificateVerify signature. Choosing the scheme,
+//! hashing the transcript and framing the message are the engine's job
+//! (`dtls`'s `Connection.zig` today, `tlsserver` next).
 //!
 //! ## What is implemented here
 //! - `SignatureScheme`: the RFC 8446 §4.2.3 code points this file supports.
@@ -145,11 +143,9 @@ pub const BuildContentError = error{
 ///
 /// where `context_string` is `server_context_string` or
 /// `client_context_string` depending on `side`, and `transcript_hash` is the
-/// caller-computed running handshake-transcript hash (this module never
-/// computes it -- that is the handshake state machine's job, per this
-/// module's "purely additive, standalone" scope; see `root.zig`'s
-/// `keyschedule.zig` for this scaffold's transcript-hashing machinery,
-/// unused directly by this file). Writes into `out` and returns the written
+/// caller-computed running handshake-transcript hash (this file never
+/// computes it -- that is the handshake state machine's job). Writes into
+/// `out` and returns the written
 /// subslice (exactly `signed_content_prefix_len + context_string.len + 1 +
 /// transcript_hash.len` bytes).
 ///
@@ -203,7 +199,7 @@ pub const SecretKey = union(enum) {
 
 /// The `SignatureScheme`(s) `secret_key`'s key FAMILY can actually produce a
 /// signature under, most-preferred first — the fact a negotiator (see
-/// `Connection.zig`'s `selectSignatureScheme`) needs to intersect against a
+/// `dtls`'s `Connection.zig` `selectSignatureScheme`) needs to intersect against a
 /// peer's advertised `signature_algorithms` list. An RSA key is hash-agnostic
 /// (RFC 8446 §4.2.3: the same key works under any `rsa_pss_rsae_sha*`
 /// scheme, differing only in which hash the PSS padding uses), so it has

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** `certverify` (CertificateVerify sign/verify)
+  and its KAT vectors moved to the `tls13` module; `dtls.certverify` re-exports it, so the API
+  and the types are the same. Its 29 tests now run in `test-tls13`; the stack probe of
+  `certverify.sign` stays here. ctgrind counts unchanged (hs 119, app 14).
+
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** the key schedule moved to the new `tls13`
   module (shared with the planned `tlsserver`); `src/keyschedule.zig` is now a shim that binds
   `tls13.keyschedule.dtls13` to the same names, so `dtls.keyschedule` and `Connection` are

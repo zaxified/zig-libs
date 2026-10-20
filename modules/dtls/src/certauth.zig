@@ -57,7 +57,7 @@
 const std = @import("std");
 const rsa = @import("rsa");
 const x509 = @import("x509");
-const certverify = @import("certverify.zig");
+const certverify = @import("tls13").certverify;
 
 const Certificate = std.crypto.Certificate;
 

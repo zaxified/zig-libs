@@ -74,7 +74,7 @@ const cert_kat = @import("certauth_kat_vectors.zig");
 
 // `certverify.SecretKey` borrows its key: container-level storage, refilled on
 // each call (the configs built from it outlive the building function's frame).
-const certverify = @import("certverify.zig");
+const certverify = @import("tls13").certverify;
 var client_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var server_ecdsa_sk: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 

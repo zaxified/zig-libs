@@ -1,0 +1,249 @@
+// SPDX-License-Identifier: MIT
+
+//! Deterministic fuzz driver for tls13 (added 2026-10-20): `TLS13_FUZZ=<runs>[,<first seed>]`
+//! (testkit's driver). Harness name:
+//! `tls13-certverify`: `certverify.verify` is the module's one entry point fed
+//! peer bytes (the CertificateVerify signature). For each KAT key (ECDSA
+//! P-256/P-384, Ed25519, RSA-PSS SHA-256) the genuine signature is accepted;
+//! a damaged signature (random octets, and the DER length/INTEGER headers aimed
+//! at), a flipped transcript-hash bit and the other side's context string are
+//! refused with `InvalidSignature`; a key of the wrong family is `KeyMismatch`;
+//! an arbitrary scheme code point with an arbitrary transcript-hash length and
+//! signature bytes never panics and is accepted only when it is the genuine
+//! triple. A share of runs signs a fresh transcript hash (ECDSA, Ed25519;
+//! deterministic and with noise) and verifies it back.
+
+const std = @import("std");
+const testing = std.testing;
+const testkit = @import("testkit");
+const fuzz_driver = testkit.fuzz.driver;
+const ScriptSource = testkit.fuzz.ScriptSource;
+
+const cv = @import("certverify.zig");
+const kat = @import("certverify_kat_vectors.zig");
+const Ecdsa = std.crypto.sign.ecdsa;
+const Ed25519 = std.crypto.sign.Ed25519;
+
+/// Reach counters for one harness's labels (copied from `aeskw`'s fuzz_test).
+/// `mark` also feeds the driver's `REACH` report; `reach` runs `seeds` seeds
+/// in the ordinary test binary and fails with `error.HarnessDoesNotReach` if
+/// a label never fired.
+fn Marker(comptime Label: type) type {
+    return struct {
+        var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
+
+        fn mark(comptime l: Label) void {
+            counts[@backingInt(l)] += 1;
+            fuzz_driver.hit(@tagName(l));
+        }
+
+        fn reach(comptime harness: anytype, comptime name: []const u8, seeds: usize) !void {
+            counts = @splat(0);
+            for (0..seeds) |seed| {
+                var prng = std.Random.DefaultPrng.init(seed);
+                var rng: fuzz_driver.Rng = .{ .r = prng.random() };
+                harness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+                    std.debug.print(name ++ " seed {d}: {t}\n", .{ seed, err });
+                    return err;
+                };
+            }
+            for (counts, 0..) |n, i| if (n == 0) {
+                std.debug.print("reach: " ++ name ++ " label {t} never hit in {d} seeds\n", .{ @as(Label, @fromBackingInt(@intCast(i))), seeds });
+                return error.HarnessDoesNotReach;
+            };
+        }
+    };
+}
+
+const Mark = Marker(enum {
+    genuine_p256,
+    genuine_p384,
+    genuine_ed25519,
+    genuine_rsa,
+    damaged_refused,
+    damaged_header,
+    damaged_resized,
+    hash_flip_refused,
+    side_refused,
+    family_refused,
+    wild_refused,
+    wild_known_scheme,
+    fresh_ecdsa,
+    fresh_ed25519,
+});
+
+/// One KAT key with its genuine (scheme, side, transcript hash, signature).
+const Case = struct {
+    scheme: cv.SignatureScheme,
+    pk: cv.PublicKey,
+    /// A public key of another family, for the `KeyMismatch` check.
+    other: cv.PublicKey,
+    side: cv.Side,
+    th: []const u8,
+    sig: []const u8,
+    der: bool,
+};
+
+fn pickCase(which: u8) !Case {
+    const ed_pk = try Ed25519.PublicKey.fromBytes(kat.ed25519_client.public_key_bytes);
+    const p256_pk = try kat.ecdsa_p256_server.publicKey();
+    return switch (which) {
+        0 => .{ .scheme = .ecdsa_secp256r1_sha256, .pk = .{ .ecdsa_p256 = p256_pk }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.ecdsa_p256_server.transcript_hash, .sig = &kat.ecdsa_p256_server.signature_der, .der = true },
+        1 => .{ .scheme = .ecdsa_secp384r1_sha384, .pk = .{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() }, .other = .{ .ecdsa_p256 = p256_pk }, .side = .server, .th = &kat.ecdsa_p384_server.transcript_hash, .sig = &kat.ecdsa_p384_server.signature_der, .der = true },
+        2 => .{ .scheme = .ed25519, .pk = .{ .ed25519 = ed_pk }, .other = .{ .ecdsa_p256 = p256_pk }, .side = .client, .th = &kat.ed25519_client.transcript_hash, .sig = &kat.ed25519_client.signature, .der = false },
+        else => .{ .scheme = .rsa_pss_rsae_sha256, .pk = .{ .rsa = try kat.rsa_pss_sha256_server.publicKey() }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.rsa_pss_sha256_server.transcript_hash, .sig = &kat.rsa_pss_sha256_server.signature, .der = false },
+    };
+}
+
+fn otherSide(side: cv.Side) cv.Side {
+    return if (side == .server) .client else .server;
+}
+
+fn expectInvalid(r: cv.VerifyError!void) !void {
+    if (r) |_| return error.ForgedSignatureAccepted else |e| {
+        if (e != error.InvalidSignature) return error.WrongRefusalKind;
+    }
+}
+
+const max_sig = 512; // the KAT RSA key is 2048-bit; room for growth by damage
+
+fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const which = src.valueRangeAtMost(u8, 0, 3);
+    const c = try pickCase(which);
+
+    try cv.verify(c.scheme, c.pk, c.side, c.th, c.sig);
+    switch (which) {
+        0 => Mark.mark(.genuine_p256),
+        1 => Mark.mark(.genuine_p384),
+        2 => Mark.mark(.genuine_ed25519),
+        else => Mark.mark(.genuine_rsa),
+    }
+
+    // A damaged signature: accepted only if the damage left it identical.
+    {
+        var buf: [max_sig]u8 = undefined;
+        var n = c.sig.len;
+        @memcpy(buf[0..n], c.sig);
+        for (0..src.valueRangeAtMost(u8, 1, 3)) |_| buf[src.index(n)] = src.value(u8);
+        if (c.der and src.value(bool)) {
+            // Aim at the structure: SEQUENCE length, r's INTEGER header and
+            // length, s's INTEGER header and length.
+            const r_len: usize = c.sig[3];
+            const spots = [_]usize{ 1, 2, 3, 4 + r_len, 5 + r_len };
+            const at = spots[src.index(spots.len)];
+            buf[at] = switch (src.valueRangeAtMost(u8, 0, 2)) {
+                0 => buf[at] +% 1,
+                1 => buf[at] -% 1,
+                else => src.value(u8),
+            };
+            Mark.mark(.damaged_header);
+        }
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+            // Truncate or extend with arbitrary bytes.
+            const new_n = src.valueRangeAtMost(u16, 0, @intCast(@min(max_sig, c.sig.len + 8)));
+            if (new_n > n) src.bytes(buf[n..new_n]);
+            n = new_n;
+            Mark.mark(.damaged_resized);
+        }
+        if (cv.verify(c.scheme, c.pk, c.side, c.th, buf[0..n])) |_| {
+            if (!std.mem.eql(u8, buf[0..n], c.sig)) return error.DamagedSignatureAccepted;
+        } else |e| {
+            if (e != error.InvalidSignature) return error.WrongRefusalKind;
+            Mark.mark(.damaged_refused);
+        }
+    }
+
+    // The genuine signature over another transcript hash or the other side.
+    {
+        var th: [64]u8 = undefined;
+        @memcpy(th[0..c.th.len], c.th);
+        th[src.index(c.th.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+        try expectInvalid(cv.verify(c.scheme, c.pk, c.side, th[0..c.th.len], c.sig));
+        Mark.mark(.hash_flip_refused);
+        try expectInvalid(cv.verify(c.scheme, c.pk, otherSide(c.side), c.th, c.sig));
+        Mark.mark(.side_refused);
+    }
+
+    // A key of another family.
+    if (cv.verify(c.scheme, c.other, c.side, c.th, c.sig)) |_| return error.WrongFamilyAccepted else |e| {
+        if (e != error.KeyMismatch) return error.WrongRefusalKind;
+        Mark.mark(.family_refused);
+    }
+
+    // Arbitrary scheme code point, transcript-hash length and signature
+    // bytes: an error or the genuine triple, never a panic.
+    {
+        const scheme: cv.SignatureScheme = if (src.value(bool))
+            @fromBackingInt(src.value(u16))
+        else blk: {
+            const known = [_]cv.SignatureScheme{ .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512, .ed25519 };
+            Mark.mark(.wild_known_scheme);
+            break :blk known[src.index(known.len)];
+        };
+        var th: [80]u8 = undefined;
+        const th_len = src.valueRangeAtMost(u16, 0, th.len);
+        src.bytes(th[0..th_len]);
+        var sig: [max_sig]u8 = undefined;
+        const sig_len = src.valueRangeAtMost(u16, 0, 300);
+        src.bytes(sig[0..sig_len]);
+        if (cv.verify(scheme, c.pk, c.side, th[0..th_len], sig[0..sig_len])) |_| {
+            return error.ArbitrarySignatureAccepted;
+        } else |_| Mark.mark(.wild_refused);
+    }
+
+    // Fresh signatures over an arbitrary transcript hash (one run in four:
+    // signing is the slow part). RSA is left out: its signer is ~1 ms and the
+    // PSS round trip is pinned by the unit tests.
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+        var sig_buf: [cv.maxSignatureLen(.ecdsa_secp384r1_sha384)]u8 = undefined;
+        var noise_prng = std.Random.DefaultPrng.init(src.value(u64));
+        const random: ?std.Random = if (src.value(bool)) noise_prng.random() else null;
+        switch (src.valueRangeAtMost(u8, 0, 2)) {
+            0 => {
+                var th: [32]u8 = undefined;
+                src.bytes(&th);
+                const sk = try kat.ecdsa_p256_server.secretKey();
+                const sig = try cv.sign(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &sk }, .server, &th, random, &sig_buf);
+                try cv.verify(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = try kat.ecdsa_p256_server.publicKey() }, .server, &th, sig);
+                Mark.mark(.fresh_ecdsa);
+            },
+            1 => {
+                var th: [48]u8 = undefined;
+                src.bytes(&th);
+                const sk = try kat.ecdsa_p384_server.secretKey();
+                const sig = try cv.sign(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &sk }, .server, &th, random, &sig_buf);
+                try cv.verify(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() }, .server, &th, sig);
+                Mark.mark(.fresh_ecdsa);
+            },
+            else => {
+                // Ed25519 signs the content itself, so any hash length the
+                // limit allows is fine.
+                var th: [64]u8 = undefined;
+                const th_len = src.valueRangeAtMost(u16, 0, th.len);
+                src.bytes(th[0..th_len]);
+                const sk = try Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes);
+                const sig = try cv.sign(.ed25519, .{ .ed25519 = &sk }, .client, th[0..th_len], random, &sig_buf);
+                const pk = try Ed25519.PublicKey.fromBytes(kat.ed25519_client.public_key_bytes);
+                try cv.verify(.ed25519, .{ .ed25519 = pk }, .client, th[0..th_len], sig);
+                try expectInvalid(cv.verify(.ed25519, .{ .ed25519 = pk }, .server, th[0..th_len], sig));
+                Mark.mark(.fresh_ed25519);
+            },
+        }
+    }
+}
+
+fn fuzzVerifySmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [1024]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzVerify(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tls13 certverify, genuine accepted / damaged refused" {
+    try testing.fuzz({}, fuzzVerifySmith, .{});
+}
+test "fuzz driver: TLS13_FUZZ (certverify)" {
+    try fuzz_driver.run(fuzzVerify, .{ .prefix = "TLS13_FUZZ", .name = "tls13-certverify" });
+}
+test "fuzz harness: certverify, 200 seeds, reaches every outcome" {
+    try Mark.reach(fuzzVerify, "tls13-certverify", 200);
+}

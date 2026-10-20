@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 
 //! Dead-stack burn for the secret-touching public entry points of the TLS 1.3
-//! building blocks (`keyschedule`). Each body runs one frame down (`run`, a
+//! building blocks (`keyschedule`, `certverify.sign`). Each body runs one frame down (`run`, a
 //! `never_inline` call), then the bytes that body dirtied at that depth are
 //! zeroed. The body is a separate frame on purpose: inlined into the entry
 //! point, the burn would land above the body's locals. Copied from
 //! `dtls/src/burn.zig` (`stack` and `run` identical in every module); dtls's
-//! stack probes measure these entry points through its `keyschedule` shim.
+//! stack probes measure these entry points through its `keyschedule` shim and
+//! its `certverify` re-export.
 
 /// Zero `n` bytes of stack below the caller.
 pub noinline fn stack(comptime n: usize) void {
@@ -37,3 +38,21 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 /// handful of 32..48-byte locals, one-shot per handshake step. Generous
 /// margin, not a measured depth (the value dtls used since 2026-10-08).
 pub const ks_burn = 8 * 1024;
+
+// `certverify.sign` signers, moved with the file from `dtls/src/burn.zig`
+// (2026-10-20); depths measured there, by dtls's `stackprobe_test.zig`.
+
+/// ECDSA through std's `Ecdsa(P256, Sha256)` / `Ecdsa(P384, Sha384)`:
+/// `signEcdsaP256` dirtied 38.6 KiB, `signEcdsaP384` 34.1 KiB in ReleaseFast
+/// (2026-10-08). One size for both.
+pub const ecdsa_burn = 48 * 1024;
+
+/// `signEd25519` (std `Ed25519.KeyPair.generateDeterministic` + `sign`)
+/// dirtied 33.8 KiB in ReleaseFast (2026-10-08).
+pub const ed25519_burn = 40 * 1024;
+
+/// `signRsaPss`: the frames above `rsa.signPss` (key by pointer, no copy) are
+/// well under 1 KiB and `rsa` burns its own 200 KiB below them; before the
+/// pointer API the by-value key copies reached 26.9 KiB deep (2026-10-08).
+/// 8 KiB is a margin, not a measured depth.
+pub const rsa_burn = 8 * 1024;

@@ -335,7 +335,9 @@ pub const connection = @import("Connection.zig");
 /// sign/verify over a caller-supplied transcript hash + typed key -- no
 /// wire framing, no X.509 DER handling. Wired into the actual handshake by
 /// `connection`/`certauth` (see the "Certificate mode" section below).
-pub const certverify = @import("certverify.zig");
+/// Lives in `tls13` since 2026-10-20 (shared with `tlsserver`); re-exported
+/// here under the old name.
+pub const certverify = @import("tls13").certverify;
 
 /// The bridge between raw X.509 DER bytes (as carried in a `Certificate`
 /// wire message) and `certverify`'s typed `PublicKey`, plus a minimal
@@ -374,7 +376,8 @@ pub const meta = .{
     // `ssh` module's Transport reasoning).
     .concurrency = .single_owner,
     .model_after = "RFC 9147 (DTLS 1.3, PSK mode + PSK-less cert-only ephemeral-X25519 mode) + RFC 8446 (TLS 1.3 shared key schedule/handshake message shapes; RFC 9147 §5.8/§5.9 reuse these with the \"dtls13\" label prefix); RFC 8446 §4.2.7/§4.2.8 (supported_groups/key_share) + RFC 7748 (X25519); RFC 8446 §4.4.3 (CertificateVerify, in `certverify.zig`)",
-    // `rsa`: `certverify.zig`'s RSASSA-PSS dispatch (rsa_pss_rsae_sha{256,384,512}).
+    // `rsa`: `certauth.zig`'s RSA SPKI parsing (`certverify`, whose RSASSA-PSS
+    // dispatch needed it here before, lives in `tls13` since 2026-10-20).
     // `x509`: `certauth.zig`'s certificate-DER parsing, routed through
     // `x509.spkiOf`/`x509.safe.safeCertificate` instead of
     // `std.crypto.Certificate.parse` (see certauth.zig's doc comment).
@@ -385,7 +388,7 @@ pub const meta = .{
     // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, // tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20); aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, // tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20) and certverify; aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -393,9 +396,8 @@ pub const meta = .{
 // A bare `pub const x = @import("x.zig")` re-export does NOT pull `x`'s
 // tests into the test binary on its own — every submodule must be named
 // here too. All submodules below now carry real `test` blocks
-// (`keyschedule`/`aead` included, with KATs). `certverify` included -- its
-// `test` block carries buildSignedContent unit tests, dispatch reject-path
-// tests, and byte-exact sign/verify + tamper KATs, all passing.
+// (`keyschedule`/`aead` included, with KATs). `certverify`'s own tests
+// moved with it to `tls13` (2026-10-20).
 test {
     _ = record;
     _ = handshake;
@@ -405,7 +407,6 @@ test {
     _ = aead;
     _ = engine;
     _ = connection;
-    _ = certverify;
     _ = certauth;
     _ = @import("wolfssl_replay.zig");
     _ = @import("fuzz_corpus.zig");
@@ -414,7 +415,7 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"tls13\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites + the shared key schedule; the PSK flight engine itself needs no other sibling modules)" {
+test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"tls13\"} (certauth.zig's RSA SPKI + cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites + the shared key schedule and certverify; the PSK flight engine itself needs no other sibling modules)" {
     try std.testing.expectEqual(@as(usize, 5), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
     try std.testing.expectEqualStrings("x509", meta.deps[1]);
