@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-15 (360,000 runs clean, ~25% decoded reach; input and exact output against a guard page) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.39–1.07× google/brotli 1.2.0 (C, one-shot) · fastest ? (measured 2026-10-16)
+**Performance:** ref 0.38–1.09× google/brotli 1.2.0 (C, one-shot) · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -712,6 +712,10 @@ ordinary stream.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** tools/interop.zig round-trips streams through real google/brotli via Python ext; the suite replays its captured verdicts
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-brotli`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.38–1.10× under load (load average ~4, largest spread 16.8 %), the worst row `c_q0_html` at 1.101 with a quiet 0.6 %/0.8 % spread; repeated alone on a quieter host (load 0.8, `BENCH_ROUNDS=7`): `c_q0_html` 1.092, `c_q0_text` 1.064. Card: 0.38–1.09× (was 0.39–1.07× on Zig 0.16.0). `.q0` on small HTML is the row closest to the P2 bound (1.10): a cause to look at before it crosses.
 
 ## Backlog / deferred
 
