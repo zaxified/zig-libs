@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Push notifications (S2 R12) and the S2 close-out. **Opt-in; with `Server.push`
+  false (the default) every answer is as before.**
+  - `push = true`: `listChanged`/`subscribe` advertised; `resources/subscribe`/`unsubscribe` (session);
+    a 2026-07-28 `subscriptions/listen` is acknowledged with its filter and held open until
+    `endSubscriptions` (graceful close) or the client's `notifications/cancelled`.
+    `notifyListChanged(sink, kind)` / `notifyResourceUpdated(sink, uri)` push through a `PushSink`
+    (peer → open writer). `removeTool`/`removeResource`/`removeResourceTemplate`/`removePrompt`.
+    Pinned to the spec's list_changed / subscribe / updated / listen examples. New `DispatchMethod`
+    and `OriginatedMethod` tags.
+  - Card: **grade 3 → 2** (scope core → parity after the 2026-10-20 survey; performance measured:
+    0.03–0.46× the official Go SDK v1.8.0, `zig build bench-mcp`, new `tools/bench.zig` + `tools/go_bench`).
 - **2026-10-20** — Cancellation of a running tool (S2 R5). An inbound `notifications/cancelled` marks the
   matching running `tools/call` of the same peer; `ToolCall.cancelled()` tells the handler, and a
   cancelled call gets no response (cancellation.mdx). `Server.cancelInflight(peer, id)` does the same

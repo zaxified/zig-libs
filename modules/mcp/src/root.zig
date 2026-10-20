@@ -244,6 +244,8 @@ pub const DispatchMethod = enum {
     @"server/discover",
     @"subscriptions/listen",
     @"completion/complete",
+    @"resources/subscribe",
+    @"resources/unsubscribe",
 
     /// Whether a 2026-07-28 (stateless) request may call it. The handshake
     /// pair and `ping` were removed in that revision, so a modern request for
@@ -252,7 +254,8 @@ pub const DispatchMethod = enum {
     /// answered statelessly *and* anchored, or neither.
     pub fn servedStatelessly(self: DispatchMethod) bool {
         return switch (self) {
-            .initialize, .@"notifications/initialized", .ping => false,
+            // 2026-07-28 replaced resources/subscribe with subscriptions/listen.
+            .initialize, .@"notifications/initialized", .ping, .@"resources/subscribe", .@"resources/unsubscribe" => false,
             .@"tools/list",
             .@"tools/call",
             .@"resources/list",
@@ -279,6 +282,10 @@ pub const OriginatedMethod = enum {
     @"elicitation/create",
     @"notifications/subscriptions/acknowledged",
     @"notifications/elicitation/complete",
+    @"notifications/tools/list_changed",
+    @"notifications/prompts/list_changed",
+    @"notifications/resources/list_changed",
+    @"notifications/resources/updated",
 
     pub fn wire(self: OriginatedMethod) []const u8 {
         return @tagName(self);
@@ -312,6 +319,12 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/elicitation/complete", .anchor = .literal_example, .reason = "" },
     .{ .method = "completion/complete", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/subscribe", .anchor = .literal_example, .reason = "" },
+    .{ .method = "resources/unsubscribe", .anchor = .no_example, .reason = "resources.mdx shows no unsubscribe example; the request is the subscribe one with the other method name (UnsubscribeRequest in the schema), answered {}" },
+    .{ .method = "notifications/tools/list_changed", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/prompts/list_changed", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/resources/list_changed", .anchor = .literal_example, .reason = "" },
+    .{ .method = "notifications/resources/updated", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Inbound (since 2026-10-20): a client's notifications/cancelled marks its running tools/call (ToolCall.cancelled) and suppresses the response; one for a finished or unknown request is ignored, as the spec allows" },
 };
 
@@ -3246,6 +3259,51 @@ pub const CompletionRequest = struct {
     }
 };
 
+/// Which catalog changed, for `Server.notifyListChanged`.
+pub const ListChange = enum { tools, prompts, resources };
+
+/// Where push notifications go: the transport's writer for `peer`, or null
+/// when that peer has no open channel now (it is then skipped). On stdio
+/// that is stdout for peer 0; under `mcp-http` the peer's open stream.
+/// Writes happen inside the `notify*` call, so call them under the same
+/// lock as `handleMessage` (one `Server` = one owner).
+pub const PushSink = struct {
+    ctx: ?*anyopaque = null,
+    writerFor: *const fn (ctx: ?*anyopaque, peer: u64) ?*std.Io.Writer,
+};
+
+/// Subscriptions one peer may hold, each kind (resources/subscribe uris;
+/// open subscriptions/listen streams) — a client that never unsubscribes
+/// must not grow the tables without bound.
+pub const max_subscriptions_per_peer = 1024;
+
+const SessionSub = struct { peer: u64, uri: []u8 };
+
+/// One open 2026-07-28 `subscriptions/listen`: its id (the subscription id)
+/// and the filter the server agreed to honour. Memory on `Server.gpa`.
+const Listen = struct {
+    peer: u64,
+    id_json: []u8,
+    tools: bool,
+    prompts: bool,
+    resources: bool,
+    uris: [][]u8,
+
+    fn free(self: Listen, gpa: std.mem.Allocator) void {
+        for (self.uris) |u| gpa.free(u);
+        gpa.free(self.uris);
+        gpa.free(self.id_json);
+    }
+
+    fn wants(self: Listen, change: ListChange) bool {
+        return switch (change) {
+            .tools => self.tools,
+            .prompts => self.prompts,
+            .resources => self.resources,
+        };
+    }
+};
+
 /// The most values one completion answer carries (completion.mdx).
 pub const max_completion_values = 100;
 
@@ -3423,6 +3481,16 @@ pub const Server = struct {
     /// transport delivers a cancel while a handler holds that one.
     inflight: std.ArrayList(Inflight) = .empty,
     inflight_lock: std.atomic.Mutex = .unlocked,
+    /// Change notifications (R12): when true the server advertises
+    /// `listChanged` on tools/prompts/resources and `resources.subscribe`,
+    /// answers `resources/subscribe`/`unsubscribe`, and holds a 2026-07-28
+    /// `subscriptions/listen` open with the filter honoured; the application
+    /// then calls `notifyListChanged`/`notifyResourceUpdated` when its catalog
+    /// or a resource changes. False (the default): none of that is offered,
+    /// `listen` acknowledges nothing and closes at once, as before.
+    push: bool = false,
+    session_subs: std.ArrayList(SessionSub) = .empty,
+    listens: std.ArrayList(Listen) = .empty,
     custom_notifications: std.ArrayList(Method) = .empty,
     /// `capabilities.extensions` / `.experimental` (JSON object text, ""
     /// = none), set through `setCapabilityExtras`.
@@ -3450,6 +3518,10 @@ pub const Server = struct {
         self.template_parsed.deinit(self.gpa);
         self.custom_methods.deinit(self.gpa);
         self.inflight.deinit(self.gpa);
+        for (self.session_subs.items) |sub| self.gpa.free(sub.uri);
+        self.session_subs.deinit(self.gpa);
+        for (self.listens.items) |l| l.free(self.gpa);
+        self.listens.deinit(self.gpa);
         self.custom_notifications.deinit(self.gpa);
         for (self.tool_checks.items) |c| c.deinit(self.gpa);
         self.tool_checks.deinit(self.gpa);
@@ -3505,6 +3577,7 @@ pub const Server = struct {
     /// does not accumulate them. Dropped pending entries are *not* handed to
     /// their `on_response` handler — the peer is gone, there is no answer.
     pub fn forgetPeer(self: *Server, peer: u64) void {
+        self.dropPeerSubscriptions(peer);
         var i: usize = self.pending.items.len;
         while (i > 0) {
             i -= 1;
@@ -4227,7 +4300,7 @@ pub const Server = struct {
                 if (params != .object) return;
                 const rid = params.object.get("requestId") orelse return;
                 if (rid != .string and rid != .integer) return;
-                _ = self.cancelInflight(peer, rid);
+                if (!self.cancelInflight(peer, rid)) _ = self.cancelListen(peer, rid);
                 return;
             }
             if (dm == null) if (findCustom(self.custom_notifications.items, method)) |cm| {
@@ -4290,7 +4363,7 @@ pub const Server = struct {
             // Stateless-only, like `server/discover`.
             .@"subscriptions/listen" => {
                 if (modern == null) return sendError(arena, out, id, error_code.invalid_params, "Missing " ++ meta_key.protocol_version);
-                try self.handleListen(arena, out, id.?, obj.get("params"));
+                try self.handleListen(arena, out, id.?, obj.get("params"), peer);
             },
             .@"tools/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .tools),
             // Session-only: 2026-07-28 removed it (changelog "Major changes"
@@ -4303,6 +4376,8 @@ pub const Server = struct {
             .@"prompts/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .prompts),
             .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), peer, modern),
             .@"completion/complete" => try self.handleComplete(arena, out, id, obj.get("params"), peer, modern),
+            .@"resources/subscribe" => try self.handleSubscribe(arena, out, id, obj.get("params"), peer, true),
+            .@"resources/unsubscribe" => try self.handleSubscribe(arena, out, id, obj.get("params"), peer, false),
         }
     }
 
@@ -4336,17 +4411,261 @@ pub const Server = struct {
     ///
     /// The filter itself must be an object when present (-32602 otherwise);
     /// its members are not interpreted, since none can be honoured.
-    fn handleListen(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: std.json.Value, params_opt: ?std.json.Value) Error!void {
+    fn handleListen(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: std.json.Value, params_opt: ?std.json.Value, peer: u64) Error!void {
+        var filter: ?std.json.ObjectMap = null;
         if (params_opt) |params| {
             if (params == .object) {
                 if (present(params.object.get("notifications"))) |f| {
                     if (f != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid notifications filter");
+                    filter = f.object;
                 }
             }
         }
+        if (!self.push) {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            buildListenLines(&aw.writer, id, &self.info) catch return error.OutOfMemory;
+            return flushLine(out, aw.written());
+        }
+        // Held open: acknowledge what is honoured (all of it — every type is
+        // emitted when the application calls `notify*`), register, and answer
+        // the request only when the server ends it (`endSubscriptions`). A
+        // client ends it with notifications/cancelled; that gets no response.
+        var l: Listen = .{ .peer = peer, .id_json = &.{}, .tools = false, .prompts = false, .resources = false, .uris = &.{} };
+        var uris: std.ArrayList([]const u8) = .empty;
+        if (filter) |f| {
+            l.tools = flagTrue(f, "toolsListChanged");
+            l.prompts = flagTrue(f, "promptsListChanged");
+            l.resources = flagTrue(f, "resourcesListChanged");
+            if (present(f.get("resourceSubscriptions"))) |rs| {
+                if (rs != .array) return sendError(arena, out, id, error_code.invalid_params, "Invalid resourceSubscriptions");
+                for (rs.array.items) |u| {
+                    if (u != .string) return sendError(arena, out, id, error_code.invalid_params, "Invalid resourceSubscriptions");
+                    try uris.append(arena, u.string);
+                }
+            }
+        }
+        if (uris.items.len > max_subscriptions_per_peer or self.countListens(peer) >= max_subscriptions_per_peer)
+            return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
+        const id_json = std.json.Stringify.valueAlloc(self.gpa, id, .{}) catch return error.OutOfMemory;
+        l.id_json = id_json;
+        l.uris = self.gpa.alloc([]u8, uris.items.len) catch {
+            self.gpa.free(id_json);
+            return error.OutOfMemory;
+        };
+        var copied: usize = 0;
+        errdefer {
+            for (l.uris[0..copied]) |u| self.gpa.free(u);
+            self.gpa.free(l.uris);
+            self.gpa.free(id_json);
+        }
+        for (uris.items) |u| {
+            l.uris[copied] = try self.gpa.dupe(u8, u);
+            copied += 1;
+        }
+        try self.listens.append(self.gpa, l);
         var aw: std.Io.Writer.Allocating = .init(arena);
-        buildListenLines(&aw.writer, id, &self.info) catch return error.OutOfMemory;
+        buildListenAck(&aw.writer, l) catch return error.OutOfMemory;
         try flushLine(out, aw.written());
+    }
+
+    fn countListens(self: *const Server, peer: u64) usize {
+        var n: usize = 0;
+        for (self.listens.items) |l| n += @intFromBool(l.peer == peer);
+        return n;
+    }
+
+    fn writePushFlag(self: *const Server, jw: *std.json.Stringify, name: []const u8) std.Io.Writer.Error!void {
+        if (!self.push) return;
+        try jw.objectField(name);
+        try jw.write(true);
+    }
+
+    /// `resources/subscribe` / `unsubscribe` (session path): record or drop
+    /// `uri` for this peer; `notifyResourceUpdated` then reaches it. Any uri
+    /// is accepted — a resource may exist only behind a template — and a
+    /// repeat subscribe is a no-op. Without `push` the method is -32601.
+    fn handleSubscribe(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, subscribe: bool) Error!void {
+        if (!self.push) return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+        const params = params_opt orelse return sendError(arena, out, id, error_code.invalid_params, "Missing params");
+        if (params != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid params");
+        const uri = params.object.get("uri") orelse return sendError(arena, out, id, error_code.invalid_params, "Missing uri");
+        if (uri != .string) return sendError(arena, out, id, error_code.invalid_params, "Invalid uri");
+        var count: usize = 0;
+        for (self.session_subs.items, 0..) |sub, i| {
+            if (sub.peer != peer) continue;
+            if (std.mem.eql(u8, sub.uri, uri.string)) {
+                if (!subscribe) {
+                    self.gpa.free(sub.uri);
+                    _ = self.session_subs.swapRemove(i);
+                }
+                return sendResultRaw(arena, out, id, "{}");
+            }
+            count += 1;
+        }
+        if (subscribe) {
+            if (count >= max_subscriptions_per_peer) return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
+            const dup = try self.gpa.dupe(u8, uri.string);
+            errdefer self.gpa.free(dup);
+            try self.session_subs.append(self.gpa, .{ .peer = peer, .uri = dup });
+        }
+        try sendResultRaw(arena, out, id, "{}");
+    }
+
+    /// Drop the open `subscriptions/listen` of `peer` whose id is
+    /// `request_id` (the client cancelled it). Whether one was found.
+    fn cancelListen(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        var buf: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        std.json.Stringify.value(request_id, .{}, &w) catch return false;
+        for (self.listens.items, 0..) |l, i| {
+            if (l.peer == peer and std.mem.eql(u8, l.id_json, w.buffered())) {
+                l.free(self.gpa);
+                _ = self.listens.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn dropPeerSubscriptions(self: *Server, peer: u64) void {
+        var i: usize = self.session_subs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.session_subs.items[i].peer == peer) {
+                self.gpa.free(self.session_subs.items[i].uri);
+                _ = self.session_subs.swapRemove(i);
+            }
+        }
+        i = self.listens.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.listens.items[i].peer == peer) {
+                self.listens.items[i].free(self.gpa);
+                _ = self.listens.swapRemove(i);
+            }
+        }
+    }
+
+    /// Tell every interested peer that a catalog changed: a handshaken
+    /// session peer gets `notifications/<kind>/list_changed`, an open
+    /// `subscriptions/listen` that asked for it gets the same with its
+    /// subscription id. A no-op without `push`. Returns how many messages
+    /// were written; a peer whose sink is null or whose write fails is
+    /// skipped (its transport will see the failure itself).
+    pub fn notifyListChanged(self: *Server, sink: PushSink, change: ListChange) usize {
+        if (!self.push) return 0;
+        const method = switch (change) {
+            .tools => OriginatedMethod.@"notifications/tools/list_changed",
+            .prompts => OriginatedMethod.@"notifications/prompts/list_changed",
+            .resources => OriginatedMethod.@"notifications/resources/list_changed",
+        }.wire();
+        var sent: usize = 0;
+        for (self.peers.items) |p| {
+            if (!p.initialized) continue;
+            const w = sink.writerFor(sink.ctx, p.peer) orelse continue;
+            w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\"}}\n", .{method}) catch continue;
+            w.flush() catch continue;
+            sent += 1;
+        }
+        for (self.listens.items) |l| {
+            if (!l.wants(change)) continue;
+            const w = sink.writerFor(sink.ctx, l.peer) orelse continue;
+            writeStreamNotification(w, method, l.id_json, null) catch continue;
+            sent += 1;
+        }
+        return sent;
+    }
+
+    /// Tell every peer subscribed to `uri` (`resources/subscribe`, or a
+    /// listen's `resourceSubscriptions`) that it changed. Same rules as
+    /// `notifyListChanged`.
+    pub fn notifyResourceUpdated(self: *Server, sink: PushSink, uri: []const u8) usize {
+        if (!self.push) return 0;
+        const method = OriginatedMethod.@"notifications/resources/updated".wire();
+        var sent: usize = 0;
+        for (self.session_subs.items) |sub| {
+            if (!std.mem.eql(u8, sub.uri, uri)) continue;
+            const w = sink.writerFor(sink.ctx, sub.peer) orelse continue;
+            w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"uri\":", .{method}) catch continue;
+            std.json.Stringify.encodeJsonString(uri, .{}, w) catch continue;
+            w.writeAll("}}\n") catch continue;
+            w.flush() catch continue;
+            sent += 1;
+        }
+        for (self.listens.items) |l| {
+            const hit = for (l.uris) |u| {
+                if (std.mem.eql(u8, u, uri)) break true;
+            } else false;
+            if (!hit) continue;
+            const w = sink.writerFor(sink.ctx, l.peer) orelse continue;
+            writeStreamNotification(w, method, l.id_json, uri) catch continue;
+            sent += 1;
+        }
+        return sent;
+    }
+
+    /// End every open `subscriptions/listen` of `peer` gracefully: the
+    /// completion result each request was waiting for (subscriptions.mdx
+    /// "Graceful Closure"), e.g. at shutdown. Returns how many were ended.
+    pub fn endSubscriptions(self: *Server, out: *std.Io.Writer, peer: u64) Error!usize {
+        var n: usize = 0;
+        var i: usize = self.listens.items.len;
+        while (i > 0) {
+            i -= 1;
+            const l = self.listens.items[i];
+            if (l.peer != peer) continue;
+            _ = self.listens.swapRemove(i);
+            defer l.free(self.gpa);
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            buildListenClose(&aw.writer, l.id_json, &self.info) catch return error.OutOfMemory;
+            try flushLine(out, aw.written());
+            n += 1;
+        }
+        return n;
+    }
+
+    /// Remove a tool from the catalog (dynamic servers; follow with
+    /// `notifyListChanged(.., .tools)`). Whether it was registered.
+    pub fn removeTool(self: *Server, name: []const u8) bool {
+        const i = self.findTool(name) orelse return false;
+        _ = self.tools.orderedRemove(i);
+        self.tool_checks.orderedRemove(i).deinit(self.gpa);
+        return true;
+    }
+
+    /// Remove a static resource (`notifyListChanged(.., .resources)` after).
+    pub fn removeResource(self: *Server, uri: []const u8) bool {
+        for (self.resources.items, 0..) |r, i| {
+            if (std.mem.eql(u8, r.uri, uri)) {
+                _ = self.resources.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove a resource template by its `uri_template`.
+    pub fn removeResourceTemplate(self: *Server, uri_template_text: []const u8) bool {
+        for (self.resource_templates.items, 0..) |rt, i| {
+            if (std.mem.eql(u8, rt.uri_template, uri_template_text)) {
+                _ = self.resource_templates.orderedRemove(i);
+                _ = self.template_parsed.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove a prompt (`notifyListChanged(.., .prompts)` after).
+    pub fn removePrompt(self: *Server, name: []const u8) bool {
+        for (self.prompts.items, 0..) |pr, i| {
+            if (std.mem.eql(u8, pr.name, name)) {
+                _ = self.prompts.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     fn buildDiscoverResult(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
@@ -4357,15 +4676,19 @@ pub const Server = struct {
         try jw.beginObject();
         try jw.objectField("tools");
         try jw.beginObject();
+        try self.writePushFlag(jw, "listChanged");
         try jw.endObject();
         if (self.resources.items.len != 0 or self.resource_templates.items.len != 0) {
             try jw.objectField("resources");
             try jw.beginObject();
+            try self.writePushFlag(jw, "subscribe");
+            try self.writePushFlag(jw, "listChanged");
             try jw.endObject();
         }
         if (self.prompts.items.len != 0) {
             try jw.objectField("prompts");
             try jw.beginObject();
+            try self.writePushFlag(jw, "listChanged");
             try jw.endObject();
         }
         if (self.offersCompletions()) {
@@ -4433,7 +4756,7 @@ pub const Server = struct {
         try jw.objectField("tools");
         try jw.beginObject();
         try jw.objectField("listChanged");
-        try jw.write(false);
+        try jw.write(self.push);
         try jw.endObject();
         // Spec (basic/lifecycle.mdx capability table + the ServerCapabilities
         // schema doc comments): `resources`/`prompts` are "present if the
@@ -4446,16 +4769,16 @@ pub const Server = struct {
             try jw.objectField("resources");
             try jw.beginObject();
             try jw.objectField("subscribe");
-            try jw.write(false);
+            try jw.write(self.push);
             try jw.objectField("listChanged");
-            try jw.write(false);
+            try jw.write(self.push);
             try jw.endObject();
         }
         if (self.prompts.items.len != 0) {
             try jw.objectField("prompts");
             try jw.beginObject();
             try jw.objectField("listChanged");
-            try jw.write(false);
+            try jw.write(self.push);
             try jw.endObject();
         }
         if (self.offersCompletions()) {
@@ -4890,6 +5213,64 @@ pub const Server = struct {
 /// The two lines of a `subscriptions/listen` answer (see `Server.handleListen`):
 /// the acknowledgment with an empty filter, then the completion result, both
 /// carrying the request's id as `subscriptionId`.
+fn flagTrue(obj: std.json.ObjectMap, key: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+/// The acknowledgment of a held-open listen, echoing the honoured filter.
+fn buildListenAck(w: *std.Io.Writer, l: Listen) std.Io.Writer.Error!void {
+    try w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{", .{OriginatedMethod.@"notifications/subscriptions/acknowledged".wire()});
+    try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
+    try w.print(":{s}}},\"notifications\":", .{l.id_json});
+    var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try jw.beginObject();
+    if (l.tools) {
+        try jw.objectField("toolsListChanged");
+        try jw.write(true);
+    }
+    if (l.prompts) {
+        try jw.objectField("promptsListChanged");
+        try jw.write(true);
+    }
+    if (l.resources) {
+        try jw.objectField("resourcesListChanged");
+        try jw.write(true);
+    }
+    if (l.uris.len != 0) {
+        try jw.objectField("resourceSubscriptions");
+        try jw.write(l.uris);
+    }
+    try jw.endObject();
+    try w.writeAll("}}\n");
+}
+
+/// One notification on a listen stream: `_meta.subscriptionId` first, then
+/// `uri` for a resource update.
+fn writeStreamNotification(w: *std.Io.Writer, method: []const u8, id_json: []const u8, uri: ?[]const u8) std.Io.Writer.Error!void {
+    try w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{", .{method});
+    try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
+    try w.print(":{s}}}", .{id_json});
+    if (uri) |u| {
+        try w.writeAll(",\"uri\":");
+        try std.json.Stringify.encodeJsonString(u, .{}, w);
+    }
+    try w.writeAll("}}\n");
+    try w.flush();
+}
+
+/// The graceful-close result of a listen (subscriptions.mdx).
+fn buildListenClose(w: *std.Io.Writer, id_json: []const u8, info: *const Info) std.Io.Writer.Error!void {
+    try w.print("{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"resultType\":\"complete\",\"_meta\":{{", .{id_json});
+    try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
+    try w.print(":{s},", .{id_json});
+    try std.json.Stringify.encodeJsonString(meta_key.server_info, .{}, w);
+    try w.writeByte(':');
+    var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+    try writeImplementation(&jw, info);
+    try w.writeAll("}}}\n");
+}
+
 fn buildListenLines(w: *std.Io.Writer, id: std.json.Value, info: *const Info) std.Io.Writer.Error!void {
     try w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{", .{OriginatedMethod.@"notifications/subscriptions/acknowledged".wire()});
     try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
@@ -6063,6 +6444,136 @@ test "cancellation: Server.cancelInflight from another thread stops a running to
     , "");
     th.join();
     try testing.expect(!s.cancelInflight(0, .{ .string = "job-1" })); // gone once finished
+}
+
+const TestSink = struct {
+    aw: std.Io.Writer.Allocating,
+
+    fn writerFor(ctx: ?*anyopaque, peer: u64) ?*std.Io.Writer {
+        const self: *TestSink = @ptrCast(@alignCast(ctx.?));
+        return if (peer == 0) &self.aw.writer else null;
+    }
+
+    fn sink(self: *TestSink) PushSink {
+        return .{ .ctx = self, .writerFor = writerFor };
+    }
+};
+
+test "push: session list_changed + resources/subscribe, byte-identical to the spec's examples" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResource(.{ .uri = "file:///project/src/main.rs", .name = "main.rs", .handler = contextResource });
+    var ts: TestSink = .{ .aw = .init(testing.allocator) };
+    defer ts.aw.deinit();
+    // Off by default: no subscribe method, nothing pushed.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"resources/subscribe","params":{"uri":"file:///project/src/main.rs"}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    );
+    s.push = true;
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true}},"serverInfo":{"name":"t","title":"t","version":"0"}}}
+        \\
+    );
+    // Not yet initialized: list_changed waits for notifications/initialized.
+    try testing.expectEqual(@as(usize, 0), s.notifyListChanged(ts.sink(), .tools));
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    , "");
+    // resources.mdx "Subscriptions" request verbatim.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"resources/subscribe","params":{"uri":"file:///project/src/main.rs"}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"result":{}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 1), s.notifyListChanged(ts.sink(), .tools));
+    try testing.expectEqual(@as(usize, 1), s.notifyListChanged(ts.sink(), .prompts));
+    try testing.expectEqual(@as(usize, 1), s.notifyListChanged(ts.sink(), .resources));
+    try testing.expectEqual(@as(usize, 1), s.notifyResourceUpdated(ts.sink(), "file:///project/src/main.rs"));
+    try testing.expectEqual(@as(usize, 0), s.notifyResourceUpdated(ts.sink(), "file:///other"));
+    // tools.mdx / prompts.mdx / resources.mdx examples, compacted.
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}
+        \\{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}
+        \\{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}
+        \\{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file:///project/src/main.rs"}}
+        \\
+    , ts.aw.written());
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"resources/unsubscribe","params":{"uri":"file:///project/src/main.rs"}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"result":{}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 0), s.notifyResourceUpdated(ts.sink(), "file:///project/src/main.rs"));
+    // Dynamic catalog: a removed tool disappears from the list.
+    try s.addTool(.{ .name = "gone", .description = "", .input_schema = "{}", .handler = pageTool });
+    try testing.expect(s.removeTool("gone"));
+    try testing.expect(!s.removeTool("gone"));
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":6,"method":"tools/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":6,"result":{"tools":[]}}
+        \\
+    );
+    // forgetPeer drops the peer's subscriptions.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":7,"method":"resources/subscribe","params":{"uri":"x://a"}}
+    ,
+        \\{"jsonrpc":"2.0","id":7,"result":{}}
+        \\
+    );
+    s.forgetPeer(0);
+    try testing.expectEqual(@as(usize, 0), s.session_subs.items.len);
+}
+
+test "push: a 2026-07-28 subscriptions/listen is held open, carries its id, ends on cancel or gracefully" {
+    var s = Server.init(testing.allocator, .{ .name = "srv", .version = "1" });
+    defer s.deinit();
+    s.push = true;
+    var ts: TestSink = .{ .aw = .init(testing.allocator) };
+    defer ts.aw.deinit();
+    // subscriptions.mdx "Opening a Stream" request verbatim (compacted): only
+    // the acknowledgment comes back, value-equal to the spec's.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ExampleClient","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"toolsListChanged":true,"resourceSubscriptions":["file:///project/config.json"]}}}
+    ,
+        \\{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":1},"notifications":{"toolsListChanged":true,"resourceSubscriptions":["file:///project/config.json"]}}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 1), s.notifyResourceUpdated(ts.sink(), "file:///project/config.json"));
+    try testing.expectEqual(@as(usize, 1), s.notifyListChanged(ts.sink(), .tools));
+    try testing.expectEqual(@as(usize, 0), s.notifyListChanged(ts.sink(), .prompts)); // not asked for
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":1},"uri":"file:///project/config.json"}}
+        \\{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":1}}}
+        \\
+    , ts.aw.written());
+    // The client cancels: no response, nothing more on the stream.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}
+    , "");
+    try testing.expectEqual(@as(usize, 0), s.notifyListChanged(ts.sink(), .tools));
+    // A second listen ended by the server: the graceful-close result.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":"s2","method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"promptsListChanged":true}}}
+    ,
+        \\{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"s2"},"notifications":{"promptsListChanged":true}}}
+        \\
+    );
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try testing.expectEqual(@as(usize, 1), try s.endSubscriptions(&aw.writer, 0));
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":"s2","result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":"s2","io.modelcontextprotocol/serverInfo":{"name":"srv","version":"1"}}}}
+        \\
+    , aw.written());
+    try testing.expectEqual(@as(usize, 0), s.listens.items.len);
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {
@@ -9000,9 +9511,9 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
             },
         }
     }
-    try testing.expectEqual(@as(usize, 10), literal);
+    try testing.expectEqual(@as(usize, 15), literal);
     try testing.expectEqual(@as(usize, 6), partial);
-    try testing.expectEqual(@as(usize, 3), no_example);
+    try testing.expectEqual(@as(usize, 4), no_example);
 }
 
 test "initialize: decodes the spec's own request verbatim (lifecycle.mdx)" {

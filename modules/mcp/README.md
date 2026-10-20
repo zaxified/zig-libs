@@ -51,8 +51,8 @@ Session path:
 
 - `initialize` — **protocol-version negotiation** (echoes the client's
   requested revision when supported — `2025-11-25`, `2025-06-18` — else
-  answers with the latest) + server capabilities (`tools`, `listChanged:
-  false`) + `serverInfo` + optional `instructions`.
+  answers with the latest) + server capabilities (`tools`, `listChanged` = `Server.push`) +
+  `serverInfo` + optional `instructions`.
 - `notifications/initialized` — accepted; sets that peer's initialized flag
   (`server.clientInitialized(peer)`). Sent *with* an `id` it is a malformed
   request, not a notification, and is answered `-32600`.
@@ -78,8 +78,8 @@ Session path:
   each omitted entirely when their catalog is empty (no resource/template, or
   no prompt, registered) — per the spec, a capability key is "present if the
   server offers any", so an empty catalog must not claim one. (Resource
-  `subscribe` is not implemented — `subscribe:false` is advertised whenever
-  `resources` itself is.) It also **records what the client
+  `subscribe`/`listChanged` are advertised `true` exactly when `Server.push`
+  is set — see "Since 2026-10-20" below.) It also **records what the client
   advertised** in `server.clientCapabilities(peer)` — the gate on the two
   server→client requests below. Recorded **per peer**: `initialize` is a
   per-connection act, so one session's handshake never moves another's gate.
@@ -258,8 +258,37 @@ the accident, and the structural answer for a real credential is
 `.url` mode, where the value never transits the client at all.
 
 Not implemented: sampling-with-tools (`tools`/`toolChoice`), `includeContext`,
-`metadata`, and `notifications/elicitation/complete` (emit it yourself — it is
-one notification line).
+`metadata`. `notifications/elicitation/complete`: `Server.sendElicitationComplete`.
+
+### Since 2026-10-20 (parity with the official SDKs' server side)
+
+- **Arguments:** `call.arg(T, key)` → `absent` / `value` / `wrong_type`;
+  `call.require(T, key)` writes "missing 'k'" / "'k' must be …".
+- **Schemas enforced:** arguments are checked against `input_schema` and a
+  structured result against `output_schema` (`schema_check`, a JSON Schema
+  2020-12 subset); a failure is an `isError:true` result. Off:
+  `server.validate_tool_io = false`.
+- **Content blocks:** `call.add(.{ .image/.audio/.resource_link/.resource/.text })`,
+  `addImage`/`addAudio` (raw bytes); prompts: `req.messageContent(role, block)`.
+- **Protocol errors from handlers:** `failWith(ProtocolError)` / `failProtocol`
+  on tools, resources, prompts; `urlElicitationRequired` (-32042),
+  `ProtocolError.missingClientCapability` (-32021).
+- **Context everywhere:** prompt and resource handlers get progress,
+  `clientCapabilities`/`clientInfo`/`protocolVersion`, `meta`.
+- **Templates:** `req.vars` / `req.variable("id")` — RFC 6570 match of the uri
+  (`uri_template`).
+- **Completion:** `Prompt.completer` / `ResourceTemplate.completer`.
+- **Pagination:** `server.page_size = n` (0 = off).
+- **Metadata:** `meta_json` on definitions, resource `annotations`/`size`,
+  `Info.description`/`website_url`/`icons`.
+- **Cancellation:** `call.cancelled()`; `server.cancelInflight(peer, id)` is
+  thread-safe for transports.
+- **Push (opt-in `server.push = true`):** `resources/subscribe`, a held-open
+  `subscriptions/listen`, `notifyListChanged(sink, .tools)` /
+  `notifyResourceUpdated(sink, uri)` through a `PushSink`, `endSubscriptions`,
+  `removeTool`/`removeResource`/`removePrompt`/`removeResourceTemplate`.
+- **Extensions:** `addMethod` / `addNotification` for vendor methods;
+  `setCapabilityExtras(extensions_json, experimental_json)`.
 
 Tests: `zig build test-mcp` — JSON-RPC parse/encode incl. all standard error
 codes, version negotiation, golden `tools/list`/`initialize` JSON, ctx-pointer
