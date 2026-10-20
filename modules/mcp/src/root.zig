@@ -2332,6 +2332,10 @@ fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, t
     };
     if (v != .object and !modern) return "Output validation error: the tool declares an outputSchema but its output is not a JSON object";
     const f = (try schema.validate(arena, v)) orelse return null;
+    // Output too large to check within the step budget is the server's own
+    // result, not a client's attack: it passes unchecked rather than turning a
+    // correct tool into a failing one (review 2026-10-20 M4).
+    if (std.mem.eql(u8, f.keyword, "budget")) return null;
     return try arena.print("Output validation error: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
 }
 
@@ -3276,6 +3280,14 @@ pub const PushSink = struct {
 /// open subscriptions/listen streams) — a client that never unsubscribes
 /// must not grow the tables without bound.
 pub const max_subscriptions_per_peer = 1024;
+/// Longest uri a subscription may name.
+pub const max_subscription_uri_len = 8192;
+/// Uri bytes one `subscriptions/listen` filter may carry in all.
+pub const max_listen_uri_bytes = 256 * 1024;
+/// Open listens and session subscriptions over every peer — the per-peer caps
+/// do not bound a transport with many peers (review 2026-10-20 M5).
+pub const max_listens = 4096;
+pub const max_session_subscriptions = 65536;
 
 const SessionSub = struct { peer: u64, uri: []u8 };
 
@@ -4444,28 +4456,55 @@ pub const Server = struct {
                 }
             }
         }
-        if (uris.items.len > max_subscriptions_per_peer or self.countListens(peer) >= max_subscriptions_per_peer)
+        // The id is the subscription id every notification repeats; a bounded
+        // one keeps each notification line bounded.
+        const id_len = (std.json.Stringify.valueAlloc(arena, id, .{}) catch return error.OutOfMemory).len;
+        if (id_len > 128) return sendError(arena, out, id, error_code.invalid_params, "Request id too long for a subscription");
+        var uri_bytes: usize = 0;
+        for (uris.items) |u| {
+            if (u.len > max_subscription_uri_len) return sendError(arena, out, id, error_code.invalid_params, "Subscription uri too long");
+            uri_bytes += u.len;
+        }
+        if (uris.items.len > max_subscriptions_per_peer or uri_bytes > max_listen_uri_bytes or
+            self.countListens(peer) >= max_subscriptions_per_peer or self.listens.items.len >= max_listens)
             return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
-        const id_json = std.json.Stringify.valueAlloc(self.gpa, id, .{}) catch return error.OutOfMemory;
-        l.id_json = id_json;
-        l.uris = self.gpa.alloc([]u8, uris.items.len) catch {
-            self.gpa.free(id_json);
+        l = try self.ownListen(l, id, uris.items);
+        // The acknowledgment is built before the entry is registered and the
+        // entry dropped again if the write fails: nothing is left behind that
+        // the client was never told about, and nothing freed that the table
+        // still points to (review 2026-10-20 H1).
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        buildListenAck(&aw.writer, l) catch {
+            l.free(self.gpa);
             return error.OutOfMemory;
         };
+        self.listens.append(self.gpa, l) catch {
+            l.free(self.gpa);
+            return error.OutOfMemory;
+        };
+        flushLine(out, aw.written()) catch |e| {
+            const dropped = self.listens.pop().?;
+            dropped.free(self.gpa);
+            return e;
+        };
+    }
+
+    /// `l` with its id and uris copied onto `gpa` (all or nothing).
+    fn ownListen(self: *Server, l: Listen, id: std.json.Value, uris: []const []const u8) error{OutOfMemory}!Listen {
+        var owned = l;
+        owned.id_json = try std.json.Stringify.valueAlloc(self.gpa, id, .{});
+        errdefer self.gpa.free(owned.id_json);
+        owned.uris = try self.gpa.alloc([]u8, uris.len);
         var copied: usize = 0;
         errdefer {
-            for (l.uris[0..copied]) |u| self.gpa.free(u);
-            self.gpa.free(l.uris);
-            self.gpa.free(id_json);
+            for (owned.uris[0..copied]) |u| self.gpa.free(u);
+            self.gpa.free(owned.uris);
         }
-        for (uris.items) |u| {
-            l.uris[copied] = try self.gpa.dupe(u8, u);
+        for (uris) |u| {
+            owned.uris[copied] = try self.gpa.dupe(u8, u);
             copied += 1;
         }
-        try self.listens.append(self.gpa, l);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        buildListenAck(&aw.writer, l) catch return error.OutOfMemory;
-        try flushLine(out, aw.written());
+        return owned;
     }
 
     fn countListens(self: *const Server, peer: u64) usize {
@@ -4503,7 +4542,9 @@ pub const Server = struct {
             count += 1;
         }
         if (subscribe) {
-            if (count >= max_subscriptions_per_peer) return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
+            if (uri.string.len > max_subscription_uri_len) return sendError(arena, out, id, error_code.invalid_params, "Subscription uri too long");
+            if (count >= max_subscriptions_per_peer or self.session_subs.items.len >= max_session_subscriptions)
+                return sendError(arena, out, id, error_code.invalid_params, "Too many subscriptions");
             const dup = try self.gpa.dupe(u8, uri.string);
             errdefer self.gpa.free(dup);
             try self.session_subs.append(self.gpa, .{ .peer = peer, .uri = dup });
@@ -4586,10 +4627,14 @@ pub const Server = struct {
         for (self.session_subs.items) |sub| {
             if (!std.mem.eql(u8, sub.uri, uri)) continue;
             const w = sink.writerFor(sink.ctx, sub.peer) orelse continue;
-            w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"uri\":", .{method}) catch continue;
-            std.json.Stringify.encodeJsonString(uri, .{}, w) catch continue;
-            w.writeAll("}}\n") catch continue;
-            w.flush() catch continue;
+            // One write of the whole line: a failure midway must not leave a
+            // fragment that corrupts the next message (review 2026-10-20 L3).
+            var aw: std.Io.Writer.Allocating = .init(self.gpa);
+            defer aw.deinit();
+            aw.writer.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"uri\":", .{method}) catch continue;
+            std.json.Stringify.encodeJsonString(uri, .{}, &aw.writer) catch continue;
+            aw.writer.writeAll("}}\n") catch continue;
+            flushLine(w, aw.written()) catch continue;
             sent += 1;
         }
         for (self.listens.items) |l| {
@@ -4955,12 +5000,21 @@ pub const Server = struct {
         // longer than `cancelInflight`'s key buffer cannot be cancelled.
         const id_json: ?[]const u8 = if (id) |v| (std.json.Stringify.valueAlloc(arena, v, .{}) catch null) else null;
         const registered = if (id_json) |k| k.len <= 128 and self.registerInflight(peer, k, &call.cancel_flag) else false;
+        // What the answer needs from the registration, copied out: a handler
+        // may `addTool`/`removeTool` (a dynamic catalog), which moves or frees
+        // `tool` and `check` (review 2026-10-20 M3).
+        const tool_name = tool.name;
+        const allow_structured = tool.allow_structured;
+        const has_output_schema = tool.output_schema.len != 0;
         const is_error = tool.handler(tool.ctx, &call);
         if (registered) self.unregisterInflight(&call.cancel_flag);
         if (call.cancelled()) return; // cancellation.mdx: no response
         if (call.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (call.input.inputRequired()) return self.sendInputRequired(arena, out, id, &call.input);
-        if (!is_error and self.validate_tool_io and tool.allow_structured) if (check.output) |*schema| {
+        // Re-resolved after the handler; a tool that removed itself answers
+        // unchecked.
+        const out_check: ?*const schema_check.Schema = if (self.findTool(tool_name)) |i| (if (self.tool_checks.items[i].output) |*sc| sc else null) else null;
+        if (!is_error and self.validate_tool_io and allow_structured) if (out_check) |schema| {
             if (try outputFailure(arena, schema, tool_buf.items, modern != null)) |msg| {
                 return sendToolResult(arena, out, id, msg, .{
                     .allow_structured = false,
@@ -4970,10 +5024,10 @@ pub const Server = struct {
             }
         };
         try sendToolResult(arena, out, id, tool_buf.items, .{
-            .allow_structured = tool.allow_structured,
+            .allow_structured = allow_structured,
             .is_error = is_error,
             .blocks = call.blocks.items,
-            .any_structured_value = modern != null and tool.output_schema.len != 0,
+            .any_structured_value = modern != null and has_output_schema,
             .server_info = if (modern != null) &self.info else null,
         });
     }
@@ -5247,7 +5301,12 @@ fn buildListenAck(w: *std.Io.Writer, l: Listen) std.Io.Writer.Error!void {
 
 /// One notification on a listen stream: `_meta.subscriptionId` first, then
 /// `uri` for a resource update.
-fn writeStreamNotification(w: *std.Io.Writer, method: []const u8, id_json: []const u8, uri: ?[]const u8) std.Io.Writer.Error!void {
+fn writeStreamNotification(out: *std.Io.Writer, method: []const u8, id_json: []const u8, uri: ?[]const u8) std.Io.Writer.Error!void {
+    // Built whole, then written once (review 2026-10-20 L3); a uri is at most
+    // `max_subscription_uri_len` (escaping can grow it 6×, still bounded).
+    var buf: [6 * max_subscription_uri_len + 512]u8 = undefined;
+    var fw: std.Io.Writer = .fixed(&buf);
+    const w = &fw;
     try w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\",\"params\":{{\"_meta\":{{", .{method});
     try std.json.Stringify.encodeJsonString(meta_key.subscription_id, .{}, w);
     try w.print(":{s}}}", .{id_json});
@@ -5256,7 +5315,7 @@ fn writeStreamNotification(w: *std.Io.Writer, method: []const u8, id_json: []con
         try std.json.Stringify.encodeJsonString(u, .{}, w);
     }
     try w.writeAll("}}\n");
-    try w.flush();
+    try flushLine(out, w.buffered());
 }
 
 /// The graceful-close result of a listen (subscriptions.mdx).
@@ -6574,6 +6633,52 @@ test "push: a 2026-07-28 subscriptions/listen is held open, carries its id, ends
         \\
     , aw.written());
     try testing.expectEqual(@as(usize, 0), s.listens.items.len);
+}
+
+test "push: a listen whose acknowledgment cannot be written leaves nothing behind (review 2026-10-20 H1)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    var tiny: [8]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&tiny);
+    try testing.expectError(error.WriteFailed, s.handleMessage(
+        \\{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}},"notifications":{"toolsListChanged":true,"resourceSubscriptions":["a://x"]}}}
+    , &w));
+    try testing.expectEqual(@as(usize, 0), s.listens.items.len);
+    // Oversized filters and ids are refused before anything is kept.
+    var long_uri: [max_subscription_uri_len + 1]u8 = @splat('a');
+    const msg = try std.fmt.allocPrint(testing.allocator,
+        \\{{"jsonrpc":"2.0","id":2,"method":"subscriptions/listen","params":{{"_meta":{{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{{}}}},"notifications":{{"resourceSubscriptions":["{s}"]}}}}}}
+    , .{&long_uri});
+    defer testing.allocator.free(msg);
+    try expectResponse(&s, msg,
+        \\{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"Subscription uri too long"}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 0), s.listens.items.len);
+}
+
+fn selfRemovingTool(_: ?*anyopaque, call: *ToolCall) bool {
+    _ = call.server.removeTool("ephemeral");
+    // Grow the catalog too, so `tools` reallocates under the running call.
+    inline for (.{ "n1", "n2", "n3", "n4", "n5", "n6", "n7", "n8", "n9" }) |n| {
+        call.server.addTool(.{ .name = n, .description = "", .input_schema = "{}", .output_schema = "{\"type\":\"object\"}", .handler = pageTool }) catch {};
+    }
+    call.write("{\"done\":true}");
+    return false;
+}
+
+test "dynamic catalog: a tool that removes itself mid-call answers from copies (review 2026-10-20 M3)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "ephemeral", .description = "", .input_schema = "{}", .output_schema = "{\"type\":\"object\",\"required\":[\"done\"]}", .handler = selfRemovingTool });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ephemeral","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"done\":true}"}],"structuredContent":{"done":true},"isError":false}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 9), s.tools.items.len);
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {

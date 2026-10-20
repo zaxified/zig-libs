@@ -44,8 +44,10 @@
 //!   - numbers are compared as `i64` when both sides are, otherwise as `f64`; a
 //!     literal outside the `i64` range is an `f64` (`1e400` is infinite and
 //!     compares greater than everything);
-//!   - `multipleOf` on two integers is exact; otherwise `x / d` must be a finite
-//!     whole number (no tolerance);
+//!   - `multipleOf` on two integers is exact; otherwise `x / d` must be finite
+//!     and within a relative 1e-9 of a whole number (so `0.07` is a multiple of
+//!     `0.01`, which ajv and Python jsonschema refuse by default);
+//!   - `uniqueItems` charges one step per comparison, so it shares the budget;
 //!   - `then` / `else` without `if` are compiled and ignored (as in the spec);
 //!   - instance nesting deeper than `max_depth` is a `depth` failure, never a
 //!     stack overflow.
@@ -455,12 +457,19 @@ const Checker = struct {
         };
     }
 
-    fn apply(c: Checker, schema: std.json.Value, inst: std.json.Value, path: ?*const Path, depth: u32, refs: u32) error{OutOfMemory}!?Failure {
-        if (c.budget.left == 0) {
+    /// Charge `n` steps; the budget failure once it is spent.
+    fn spend(c: Checker, n: usize, path: ?*const Path) error{OutOfMemory}!?Failure {
+        if (c.budget.left < n) {
+            c.budget.left = 0;
             if (c.budget.pointer == null) c.budget.pointer = try pointerOf(c.arena, path);
             return Failure{ .pointer = c.budget.pointer.?, .keyword = "budget", .message = "schema check exceeded its step budget" };
         }
-        c.budget.left -= 1;
+        c.budget.left -= @intCast(n);
+        return null;
+    }
+
+    fn apply(c: Checker, schema: std.json.Value, inst: std.json.Value, path: ?*const Path, depth: u32, refs: u32) error{OutOfMemory}!?Failure {
+        if (try c.spend(1, path)) |f| return f;
         if (depth > max_depth) return c.fail(path, "depth", "nesting deeper than {d} levels", .{@as(u32, max_depth)});
         switch (schema) {
             .bool => |b| {
@@ -560,6 +569,9 @@ const Checker = struct {
         };
         if (o.get("uniqueItems")) |u| if (u == .bool and u.bool) {
             for (items, 0..) |a, i| {
+                // Pairwise is O(n²): every comparison is a step, so a hostile
+                // array of a million items ends in the budget, not a hang.
+                if (try c.spend(i, path)) |f| return f;
                 for (items[0..i]) |b| {
                     if (jsonEql(a, b)) {
                         const here: Path = .{ .parent = path, .seg = .{ .index = i } };
@@ -667,8 +679,15 @@ fn isMultiple(n: Num, d: Num) bool {
         if (d.int == 0) return false;
         return @rem(n.int, d.int) == 0;
     }
+    // A decimal divisor is not exact in binary (0.07 / 0.01 is
+    // 7.000000000000001), so the quotient counts as whole when it is within a
+    // relative 1e-9 of an integer — more lenient than ajv's and Python
+    // jsonschema's default (both refuse 0.07 for multipleOf 0.01), deliberately:
+    // a refusal here turns away a value the schema's author meant to allow.
     const q = numToF64(n) / numToF64(d);
-    return std.math.isFinite(q) and q == @floor(q);
+    if (!std.math.isFinite(q)) return false;
+    const r = @round(q);
+    return @abs(q - r) <= 1e-9 * @max(1.0, @abs(q));
 }
 
 /// `type`'s expected value for a message: the name, or the names joined by `|`.
@@ -897,6 +916,36 @@ test "multipleOf: exact for integers, finite quotient otherwise" {
     try testing.expect((try run(a, "{\"multipleOf\":3}", "9007199254740992")) != null);
     try testing.expect((try run(a, "{\"multipleOf\":0.5}", "4.5")) == null);
     try testing.expect((try run(a, "{\"multipleOf\":0.123456789}", "1e308")) != null);
+}
+
+test "multipleOf: a decimal divisor accepts what it means (review 2026-10-20 M2)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // 0.07 / 0.01 = 7.000000000000001 and 19.99 / 0.01 = 1998.9999999999998 in f64.
+    try testing.expect((try run(a, "{\"multipleOf\":0.01}", "0.07")) == null);
+    try testing.expect((try run(a, "{\"multipleOf\":0.01}", "19.99")) == null);
+    try testing.expect((try run(a, "{\"multipleOf\":0.05}", "1.15")) == null);
+    try testing.expect((try run(a, "{\"multipleOf\":0.01}", "0.075")) != null);
+}
+
+test "uniqueItems: a long array spends the budget instead of hanging (review 2026-10-20 M1)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.append(a, '[');
+    for (0..20000) |i| try text.print(a, "{s}{d}", .{ if (i == 0) "" else ",", i });
+    try text.append(a, ']');
+    const sv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"uniqueItems\":true}", .{});
+    const s = try Schema.compile(a, sv);
+    const iv = try std.json.parseFromSliceLeaky(std.json.Value, a, text.items, .{});
+    // 20000 items = 2e8 comparisons, far past the default budget of 1e6.
+    const f = (try s.validate(a, iv)).?;
+    try testing.expectEqualStrings("budget", f.keyword);
+    // A short one is checked in full.
+    const small = try std.json.parseFromSliceLeaky(std.json.Value, a, "[1,2,3,2]", .{});
+    try testing.expectEqualStrings("uniqueItems", (try s.validate(a, small)).?.keyword);
 }
 
 test "deeply nested instance is a failure, not a stack overflow" {

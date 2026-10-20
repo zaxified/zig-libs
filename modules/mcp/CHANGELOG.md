@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Fixes from an independent review of today's S2 work.
+  - **HIGH** (`push` only): a `subscriptions/listen` whose acknowledgment failed to write (client
+    gone) left a table entry whose memory the error path had already freed — use after free on the next
+    `notify*`, double free at `deinit`. The ack is now built before the entry is registered and the
+    entry dropped when the write fails.
+  - A tool handler that adds or removes tools (dynamic catalog) no longer reads its own moved/freed
+    registration after it returns; output validation re-resolves the tool.
+  - `schema_check`: `uniqueItems` charges one step per comparison (a 1M-item array ended in the budget,
+    not a hang); `multipleOf` with a decimal divisor accepts within a relative 1e-9 (`0.07` is a multiple
+    of `0.01`); output too large for the step budget passes unchecked instead of failing a correct tool.
+  - Caps: subscription uri ≤ `max_subscription_uri_len`, a listen's uris ≤ `max_listen_uri_bytes`,
+    `max_listens` / `max_session_subscriptions` over all peers, a listen's id ≤ 128 bytes; push
+    notifications are written as one whole line.
+  - ⚠ Reminder for consumers: argument validation is on by default — a lenient handler that accepted
+    `"limit":"10"` for an `integer` property now never sees the call (`validate_tool_io = false`).
 - **2026-10-20** — Push notifications (S2 R12) and the S2 close-out. **Opt-in; with `Server.push`
   false (the default) every answer is as before.**
   - `push = true`: `listChanged`/`subscribe` advertised; `resources/subscribe`/`unsubscribe` (session);
