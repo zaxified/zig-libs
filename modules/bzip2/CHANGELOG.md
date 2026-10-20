@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** mutation run (schemata, 94 mutants: 56 killed, 9 equivalent); the surviving decoder-validation and encoder-threshold mutants are open test gaps (SPEC Backlog).
 - **2026-10-20** — Independent review (no HIGH/MEDIUM): the decoder now stays failed after its first error
   (`Decoder.failed`; a retry used to re-enter the bit reader's EOF padding), `Encoder.finish`/`write` after
   `finish` return `error.AlreadyFinished` (was an assert, a second trailer in ReleaseFast), the code-length
