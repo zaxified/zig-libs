@@ -208,7 +208,7 @@ pub const BigDecimal = struct {
         }
         if (digits_seen == 0) return error.InvalidCharacter;
 
-        var exp: i64 = 0;
+        var exp_lit: i64 = 0;
         if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
             i += 1;
             var exp_neg = false;
@@ -230,17 +230,17 @@ pub const BigDecimal = struct {
                 // `1e0000000000000012` is 12, not a truncated read.
                 if (exp_sig > 0 or s[i] != '0') {
                     exp_sig += 1;
-                    if (exp_sig <= 15) exp = exp * 10 + @as(i64, s[i] - '0') else exp_too_long = true;
+                    if (exp_sig <= 15) exp_lit = exp_lit * 10 + @as(i64, s[i] - '0') else exp_too_long = true;
                 }
             }
             if (exp_digits == 0) return error.InvalidCharacter;
             // More than 15 significant digits is far past i32: out of range.
             if (exp_too_long) return error.Overflow;
-            if (exp_neg) exp = -exp;
+            if (exp_neg) exp_lit = -exp_lit;
         }
         if (i != s.len) return error.InvalidCharacter;
 
-        const exponent64: i64 = exp - frac_digits;
+        const exponent64: i64 = exp_lit - frac_digits;
         if (exponent64 > std.math.maxInt(i32) or exponent64 < std.math.minInt(i32)) {
             return error.Overflow;
         }
@@ -1150,6 +1150,290 @@ pub const BigDecimal = struct {
         return .{ .value = .{ .coeff = q, .exponent = @intCast(e) }, .inexact = !exact, .rounded = !exact or e > ideal };
     }
 
+    // -----------------------------------------------------------------
+    // Transcendental functions: exp, ln, log10 and real-exponent power,
+    // correctly rounded to `prec` significant digits in every RoundingMode.
+    // -----------------------------------------------------------------
+
+    /// Largest `prec` the transcendental functions accept. Their cost grows
+    /// roughly with the square of the working precision (a few hundred
+    /// milliseconds at the cap), so this is the bound that keeps a hostile
+    /// `prec` from becoming a hang; `error.PrecisionTooLarge` beyond it.
+    pub const max_transcendental_prec: u32 = 2000;
+
+    /// Largest working precision (digits) the Ziv loop may climb to while
+    /// deciding a rounding. It is far beyond anything a non-adversarial input
+    /// needs (each extra digit makes an undecided rounding ten times less
+    /// likely); hitting it is `error.PrecisionTooLarge`, never a wrong digit
+    /// and never an endless loop. An argument that is within 10^-6000 of a
+    /// rounding boundary (`ln(1 + 10^-5000)`) is the only way to reach it.
+    pub const max_work_digits: u32 = 6000;
+
+    /// `Overflow` = the result's exponent leaves `i32` (GDA's overflow and
+    /// underflow are one typed error here), or `|exponent| >= 1E+16` for `power`.
+    pub const TranscendentalError = Error || error{ InvalidPrecision, PrecisionTooLarge };
+    /// `NonPositiveOperand` = `a <= 0` (GDA: `ln(0)` is `-Infinity`, `ln(<0)` invalid).
+    pub const LnError = TranscendentalError || error{NonPositiveOperand};
+    /// `NegativeBase` = negative base with a non-integer exponent; `DivisionByZero`
+    /// = zero to a negative power; `ZeroToZero` = `0^0` (GDA invalid operation).
+    pub const PowerError = TranscendentalError || error{ NegativeBase, DivisionByZero, ZeroToZero };
+
+    /// `e^a` correctly rounded to `prec` significant digits under `mode`.
+    ///
+    /// Correctly rounded means: the digits returned are those of the true
+    /// real number `e^a` rounded once, in `mode`, to `prec` digits -- decided
+    /// by an interval (Ziv strategy): the value is computed with a rigorous
+    /// error bound at growing working precision until both ends of the
+    /// interval round to the same result. **This holds for all eight modes.**
+    /// Python's `decimal` only guarantees it for `half_even` (libmpdec rounds
+    /// `exp`/`ln`/`log10` half-even whatever the context says); here the mode
+    /// is honoured, and `half_even` agrees with Python digit for digit.
+    ///
+    /// `exp(0)` is exactly `1` (flags clear). Every other result is inexact
+    /// and has exactly `prec` digits. An argument with `|a| < 10^-(prec+2)` is
+    /// answered in constant time (`1 +- tiny`). `error.Overflow` when the result
+    /// exponent leaves `i32` (`|a|` beyond about 4.9e9).
+    ///
+    /// Method (ported in structure, not in code, from libmpdec's `_mpd_qexp`:
+    /// argument reduction plus Taylor series, with the correct-rounding loop
+    /// of `mpd_qexp`): `a = q*ln10 + r` with `|r| <= ln10/2`, `e^r` by its
+    /// Taylor series in fixed point, the factor `10^q` an exponent shift.
+    pub fn exp(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) TranscendentalError!Rounded {
+        try checkTrPrec(prec);
+        if (a.isZero()) return one_exact(allocator);
+        const adj = try a.adjusted(allocator);
+        if (adj >= 10) return error.Overflow;
+        const neg = !a.coeff.isPositive();
+        if (adj < -(@as(i64, prec) + 2)) {
+            // 1 +- tiny: any value strictly between 1 and the next/previous
+            // representable number rounds the same as 10^-(prec+2) away from 1.
+            const n: u32 = prec + 2;
+            var v = BigDecimal{ .coeff = try pow10(allocator, n), .exponent = -@as(i32, @intCast(n)) };
+            defer v.deinit();
+            if (neg) try v.coeff.addScalar(&v.coeff, -1) else try v.coeff.addScalar(&v.coeff, 1);
+            return roundedInexact(allocator, v, prec, mode);
+        }
+        var extra: u32 = 10;
+        while (true) : (extra = extra * 2) {
+            const wt: u32 = prec + extra + @as(u32, @intCast(@max(adj + 1, 0)));
+            if (wt > max_work_digits) return error.PrecisionTooLarge;
+            var t = try scaleToFixed(allocator, a, wt);
+            defer t.deinit();
+            var e = try expFixed(allocator, &t.v, t.err, wt);
+            defer e.deinit();
+            if (try decideInterval(allocator, &e.man, e.err, e.exp10, false, prec, mode)) |r| return r;
+        }
+    }
+
+    /// Natural logarithm of `a`, correctly rounded to `prec` significant digits
+    /// under `mode` (all eight modes; see `exp` for what that means and how it
+    /// differs from Python). `ln(1)` is exactly `0` (flags clear); every other
+    /// result is inexact with exactly `prec` digits. `error.NonPositiveOperand`
+    /// for `a <= 0`.
+    ///
+    /// Method (after libmpdec's `_mpd_qln` in structure): `a = m * 10^k`, `m`
+    /// scaled into `[0.7, 1.4)` by powers of two, `ln m = 2*atanh((m-1)/(m+1))`
+    /// summed as a series in fixed point, plus `k*ln10 - j*ln2` from the same
+    /// kind of series. A result near zero (`a` near 1) widens the working
+    /// precision until it has enough significant digits; an `a` within
+    /// `10^-max_work_digits` of 1 is `error.PrecisionTooLarge`.
+    pub fn ln(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) LnError!Rounded {
+        try checkTrPrec(prec);
+        if (a.isZero() or !a.coeff.isPositive()) return error.NonPositiveOperand;
+        if (try isExactlyOne(allocator, a)) return zero_exact(allocator);
+        var extra: u32 = 10;
+        var w: u32 = prec + extra;
+        while (true) {
+            if (w > max_work_digits) return error.PrecisionTooLarge;
+            var l = try lnFixed(allocator, a, w);
+            defer l.deinit();
+            const dg = try digitsOf(allocator, &l.v);
+            if (dg < prec + 6) {
+                // x is close to 1: too few significant digits yet.
+                w += (prec + 6 - dg) + 10;
+                continue;
+            }
+            if (try decideInterval(allocator, &l.v, l.err, -@as(i64, w), false, prec, mode)) |r| return r;
+            extra *= 2;
+            w = prec + extra;
+        }
+    }
+
+    /// Base-10 logarithm of `a`, correctly rounded to `prec` significant digits
+    /// under `mode`. An exact power of ten (`1E+3`, `0.01`, `1`) gives its
+    /// integer logarithm with exponent 0 and no inexactness (rounded to `prec`
+    /// digits only if the integer is longer); everything else is inexact with
+    /// exactly `prec` digits. `error.NonPositiveOperand` for `a <= 0`.
+    /// Computed as `ln(a) / ln10` in fixed point with a propagated error bound.
+    pub fn log10(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) LnError!Rounded {
+        try checkTrPrec(prec);
+        if (a.isZero() or !a.coeff.isPositive()) return error.NonPositiveOperand;
+        {
+            var n = try normalize(allocator, a);
+            defer n.deinit();
+            if (((n.coeff.toInt(u8)) catch 0) == 1) {
+                // coefficient 1: a = 10^exponent, the logarithm is the exponent.
+                var k = BigDecimal{ .coeff = try Managed.initSet(allocator, n.exponent), .exponent = 0 };
+                defer k.deinit();
+                return roundPrec(allocator, k, prec, mode);
+            }
+        }
+        var extra: u32 = 10;
+        var w: u32 = prec + extra;
+        while (true) {
+            if (w > max_work_digits) return error.PrecisionTooLarge;
+            var q = try log10Fixed(allocator, a, w);
+            defer q.deinit();
+            const dg = try digitsOf(allocator, &q.v);
+            if (dg < prec + 6) {
+                w += (prec + 6 - dg) + 10;
+                continue;
+            }
+            if (try decideInterval(allocator, &q.v, q.err, -@as(i64, w), false, prec, mode)) |r| return r;
+            extra *= 2;
+            w = prec + extra;
+        }
+    }
+
+    /// `base^exponent` for any decimal exponent, rounded to `prec` significant
+    /// digits under `mode` (GDA `power`; Python `Context.power`).
+    ///
+    /// * Integer-valued exponent that fits `i32` and whose exact power is
+    ///   within `max_result_digits`: the power is computed **exactly** (`pow`)
+    ///   and rounded once (a negative exponent divides `1` by the exact power
+    ///   with `divPrec`). Ideal exponents and flags are those of that exact
+    ///   result (`1.1^2` is `1.21`, flags clear). Negative bases are fine.
+    /// * Anything else (a fractional exponent, or an integer too large for
+    ///   that): `exp(exponent * ln(base))` evaluated with a rigorous error
+    ///   bound and the same Ziv loop as `exp`. The result is inexact with
+    ///   exactly `prec` digits -- even when the true value happens to be exact
+    ///   (`4^0.5` is `2.0000` at `prec` 5, flagged inexact), as in Python;
+    ///   such an exact value is detected (`x^(p/q)` tested exactly) so every
+    ///   mode, and a tie, still rounds it correctly. A negative base with an
+    ///   integer exponent too large for the exact path keeps the sign by parity.
+    /// * `exponent = 0` is `1` (flags clear), but `0^0` is `error.ZeroToZero`;
+    ///   `0^positive` is `0`; `0^negative` is `error.DivisionByZero`; a negative
+    ///   base with a non-integer exponent is `error.NegativeBase`.
+    ///
+    /// `error.Overflow` when the result exponent leaves `i32`, when the product
+    /// `exponent * ln(base)` exceeds about 4.9e9 in magnitude, or when
+    /// `|exponent| >= 1E+16`. Like `exp`, correct in all eight modes (Python:
+    /// `half_even` only; its integer powers are also not always correctly
+    /// rounded).
+    pub fn power(allocator: Allocator, base: BigDecimal, exponent: BigDecimal, prec: u32, mode: RoundingMode) PowerError!Rounded {
+        try checkTrPrec(prec);
+        if (exponent.isZero()) {
+            if (base.isZero()) return error.ZeroToZero;
+            return one_exact(allocator);
+        }
+        var yn = try normalize(allocator, exponent);
+        defer yn.deinit();
+        const y_neg = !yn.coeff.isPositive();
+        const y_int = yn.exponent >= 0;
+        if (base.isZero()) {
+            if (y_neg) return error.DivisionByZero;
+            return zero_exact(allocator);
+        }
+        const base_neg = !base.coeff.isPositive();
+        if (base_neg and !y_int) return error.NegativeBase;
+
+        var result_neg = false;
+        if (y_int) {
+            // Exact path: the exponent as an i32, within the digit budget.
+            if (try smallInt(allocator, yn)) |n| {
+                const mag: u64 = if (n < 0) @intCast(-@as(i64, n)) else @intCast(n);
+                const digits: u64 = try base.precision(allocator);
+                if (digits * mag <= max_result_digits) {
+                    var p = pow(allocator, base, @intCast(mag)) catch |e| switch (e) {
+                        error.ResultTooLarge, error.NegativeExponent => unreachable,
+                        else => |x| return x,
+                    };
+                    defer p.deinit();
+                    if (n > 0) return roundPrec(allocator, p, prec, mode);
+                    var one = try fromInt(allocator, 1);
+                    defer one.deinit();
+                    return divPrec(allocator, one, p, prec, mode) catch |e| switch (e) {
+                        error.InvalidPrecision => unreachable,
+                        else => |x| return x,
+                    };
+                }
+            }
+            // Too large for the exact path: real path, sign from parity.
+            if (base_neg) result_neg = yn.exponent == 0 and yn.coeff.isOdd();
+        }
+        var mag_base = try base.clone();
+        defer mag_base.deinit();
+        mag_base.absVal();
+        if (try isExactlyOne(allocator, mag_base)) {
+            if (!y_int) return paddedOne(allocator, prec);
+            var one = try one_exact(allocator);
+            if (result_neg) one.value.coeff.negate();
+            return one;
+        }
+
+        const adj_y = try yn.adjusted(allocator);
+        if (adj_y > 15) return error.Overflow;
+        // ceil(|y|), at least 1.
+        var abs_y: u128 = blk: {
+            var c = try yn.coeff.clone();
+            defer c.deinit();
+            c.abs();
+            if (yn.exponent >= 0) {
+                var sh = try scaleUp(allocator, &c, @intCast(yn.exponent));
+                defer sh.deinit();
+                break :blk sh.toInt(u128) catch return error.Overflow;
+            }
+            var d = try pow10(allocator, @intCast(@min(-@as(i64, yn.exponent), max_align_shift)));
+            defer d.deinit();
+            var qq = try Managed.init(allocator);
+            defer qq.deinit();
+            var rr = try Managed.init(allocator);
+            defer rr.deinit();
+            try qq.divTrunc(&rr, &c, &d);
+            break :blk (qq.toInt(u128) catch return error.Overflow) + 1;
+        };
+        if (abs_y == 0) abs_y = 1;
+        const dy: u32 = @as(u32, @intCast(@max(adj_y + 1, 0))) + 3;
+
+        var extra: u32 = 10;
+        while (true) : (extra = extra * 2) {
+            const wt: u32 = prec + extra;
+            const wl: u32 = wt + dy;
+            if (wl > max_work_digits) return error.PrecisionTooLarge;
+            var l = try lnFixed(allocator, mag_base, wl);
+            defer l.deinit();
+            // T = L * y at scale wt (L at scale wl, y = yc * 10^ye).
+            var tv = try Managed.init(allocator);
+            defer tv.deinit();
+            try tv.mul(&l.v, &yn.coeff);
+            const shift: i64 = @as(i64, yn.exponent) - @as(i64, dy);
+            if (shift >= 0) {
+                if (shift > max_align_shift) return error.Overflow;
+                var sh = try scaleUp(allocator, &tv, @intCast(shift));
+                tv.swap(&sh);
+                sh.deinit();
+            } else {
+                if (-shift > max_align_shift) return error.Overflow;
+                var d = try pow10(allocator, @intCast(-shift));
+                defer d.deinit();
+                var rr = try Managed.init(allocator);
+                defer rr.deinit();
+                var qq = try Managed.init(allocator);
+                defer qq.deinit();
+                try qq.divTrunc(&rr, &tv, &d);
+                tv.swap(&qq);
+            }
+            const scale_div: u128 = std.math.pow(u128, 10, dy);
+            const t_err: u128 = (l.err * abs_y + scale_div - 1) / scale_div + 2;
+            var e = try expFixed(allocator, &tv, t_err, wt);
+            defer e.deinit();
+            if (try decideInterval(allocator, &e.man, e.err, e.exp10, result_neg, prec, mode)) |r| return r;
+            if (!y_int and extra >= 20) {
+                if (try exactPowerCandidate(allocator, mag_base, yn, &e, prec, mode)) |r| return r;
+            }
+        }
+    }
+
     /// GDA `divide-integer` / Python `a // b`: the integer part of `a / b`,
     /// truncated toward zero, with exponent 0 (zero is `0`). Exact. Both
     /// operands are aligned to a common exponent first (`max_align_shift`
@@ -1524,6 +1808,482 @@ fn scaleUp(allocator: Allocator, coeff: *const Managed, shift: u32) BigDecimal.E
     errdefer r.deinit();
     try r.mul(coeff, &p);
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Transcendental-function support. Everything is integer fixed point:
+// a value is an integer `v` meaning v * 10^-w, carried with a conservative
+// absolute error bound `err` (in units of 10^-w) that every step adds to.
+// The final rounding is decided by rounding BOTH ends of [v-err, v+err]
+// (Ziv): if they agree the true value rounds the same; otherwise the caller
+// raises the working precision and tries again.
+// ---------------------------------------------------------------------------
+
+fn checkTrPrec(prec: u32) error{ InvalidPrecision, PrecisionTooLarge }!void {
+    if (prec == 0) return error.InvalidPrecision;
+    if (prec > BigDecimal.max_transcendental_prec) return error.PrecisionTooLarge;
+}
+
+fn digitsOf(allocator: Allocator, m: *const Managed) Allocator.Error!u32 {
+    return (BigDecimal{ .coeff = m.*, .exponent = 0 }).precision(allocator);
+}
+
+/// `round(a, prec, mode)` of a value with `error.InvalidPrecision` ruled out.
+fn roundPrec(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) BigDecimal.Error!BigDecimal.Rounded {
+    return BigDecimal.roundToPrecision(allocator, a, prec, mode) catch |e| switch (e) {
+        error.InvalidPrecision => unreachable,
+        else => |x| return x,
+    };
+}
+
+/// A result that is mathematically inexact: always flagged so, with `rounded`.
+fn roundedInexact(allocator: Allocator, v: BigDecimal, prec: u32, mode: RoundingMode) BigDecimal.Error!BigDecimal.Rounded {
+    var r = try roundPrec(allocator, v, prec, mode);
+    r.inexact = true;
+    r.rounded = true;
+    return r;
+}
+
+fn one_exact(allocator: Allocator) Allocator.Error!BigDecimal.Rounded {
+    return .{ .value = .{ .coeff = try Managed.initSet(allocator, 1), .exponent = 0 }, .inexact = false, .rounded = false };
+}
+
+fn zero_exact(allocator: Allocator) Allocator.Error!BigDecimal.Rounded {
+    return .{ .value = .{ .coeff = try Managed.init(allocator), .exponent = 0 }, .inexact = false, .rounded = false };
+}
+
+/// `1` written with `prec` digits (`1.0000`), flagged inexact+rounded: what
+/// Python returns for `1 ** 0.5`.
+fn paddedOne(allocator: Allocator, prec: u32) BigDecimal.Error!BigDecimal.Rounded {
+    var c = try pow10(allocator, prec - 1);
+    errdefer c.deinit();
+    return .{ .value = .{ .coeff = c, .exponent = -@as(i32, @intCast(prec - 1)) }, .inexact = true, .rounded = true };
+}
+
+fn isExactlyOne(allocator: Allocator, a: BigDecimal) BigDecimal.Error!bool {
+    var n = try BigDecimal.normalize(allocator, a);
+    defer n.deinit();
+    return n.exponent == 0 and (n.coeff.toInt(u8) catch 0) == 1;
+}
+
+/// The (already normalized, integer-valued) `y` as an `i32` if it fits.
+fn smallInt(allocator: Allocator, y: BigDecimal) BigDecimal.Error!?i32 {
+    if (y.exponent > 10) return null;
+    var c = try scaleUp(allocator, &y.coeff, @intCast(y.exponent));
+    defer c.deinit();
+    return c.toInt(i32) catch null;
+}
+
+const Fx = struct {
+    v: Managed,
+    err: u128,
+    fn deinit(self: *Fx) void {
+        self.v.deinit();
+    }
+};
+
+const ExpOut = struct {
+    /// value = man * 10^exp10, within `err` units of the last place of `man`.
+    man: Managed,
+    err: u128,
+    exp10: i64,
+    fn deinit(self: *ExpOut) void {
+        self.man.deinit();
+    }
+};
+
+/// out = trunc(a * b / den)
+fn mulDivTrunc(allocator: Allocator, out: *Managed, a: *const Managed, b: *const Managed, den: *const Managed) Allocator.Error!void {
+    var p = try Managed.init(allocator);
+    defer p.deinit();
+    try p.mul(a, b);
+    var r = try Managed.init(allocator);
+    defer r.deinit();
+    try out.divTrunc(&r, &p, den);
+}
+
+/// Σ z^(2k+1)/(2k+1) over k >= 0, for |z| <= 0.2 at scale `s` = 10^w, summed
+/// until the power underflows to zero. Per term the error is below 4 units
+/// (floor in the power and in the division, damped by z^2 <= 0.04); the tail
+/// after the last term is below 3 units; an error `z_err` in z moves the sum
+/// by at most 1.5 * z_err (derivative 1/(1-z^2)).
+fn atanhSeries(allocator: Allocator, z: *const Managed, s: *const Managed, z_err: u128) BigDecimal.Error!Fx {
+    var z2 = try Managed.init(allocator);
+    defer z2.deinit();
+    try mulDivTrunc(allocator, &z2, z, z, s);
+    var zp = try z.clone();
+    defer zp.deinit();
+    var sum = try Managed.init(allocator);
+    errdefer sum.deinit();
+    var term = try Managed.init(allocator);
+    defer term.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    var div = try Managed.init(allocator);
+    defer div.deinit();
+    var k: u64 = 0;
+    while (!zp.eqlZero()) : (k += 1) {
+        try div.set(2 * k + 1);
+        try term.divTrunc(&rem, &zp, &div);
+        try sum.add(&sum, &term);
+        try mulDivTrunc(allocator, &zp, &zp, &z2, s);
+    }
+    return .{ .v = sum, .err = 4 * @as(u128, k) + 10 + (3 * z_err + 1) / 2 };
+}
+
+const LnConsts = struct {
+    ln2: Fx,
+    ln10: Fx,
+    fn deinit(self: *LnConsts) void {
+        self.ln2.deinit();
+        self.ln10.deinit();
+    }
+};
+
+/// ln 2 = 2 atanh(1/3) and ln 10 = 3 ln 2 + 2 atanh(1/9) at scale `s` = 10^w.
+fn lnConsts(allocator: Allocator, s: *const Managed) BigDecimal.Error!LnConsts {
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    var d = try Managed.initSet(allocator, 3);
+    defer d.deinit();
+    var z = try Managed.init(allocator);
+    defer z.deinit();
+    try z.divTrunc(&rem, s, &d);
+    var l2 = try atanhSeries(allocator, &z, s, 1);
+    errdefer l2.deinit();
+    try l2.v.add(&l2.v, &l2.v);
+    l2.err *= 2;
+
+    try d.set(9);
+    try z.divTrunc(&rem, s, &d);
+    var s9 = try atanhSeries(allocator, &z, s, 1);
+    defer s9.deinit();
+    var l10 = try Managed.init(allocator);
+    errdefer l10.deinit();
+    try d.set(3);
+    try l10.mul(&l2.v, &d);
+    try l10.add(&l10, &s9.v);
+    try l10.add(&l10, &s9.v);
+    return .{ .ln2 = l2, .ln10 = .{ .v = l10, .err = 3 * l2.err + 2 * s9.err } };
+}
+
+fn digitsU64(n: u64) u32 {
+    var d: u32 = 1;
+    var x = n;
+    while (x >= 10) : (x /= 10) d += 1;
+    return d;
+}
+
+/// acc += k * v
+fn addScaled(allocator: Allocator, acc: *Managed, v: *const Managed, k: i64) Allocator.Error!void {
+    var kk = try Managed.initSet(allocator, k);
+    defer kk.deinit();
+    var t = try Managed.init(allocator);
+    defer t.deinit();
+    try t.mul(v, &kk);
+    try acc.add(acc, &t);
+}
+
+/// ln(a) for a > 0 at scale `w_out`, absolute error `err` units. Computed at
+/// a few more digits (room for the k*ln10 term) and truncated.
+fn lnFixed(allocator: Allocator, a: BigDecimal, w_out: u32) BigDecimal.Error!Fx {
+    const d: u32 = try a.precision(allocator);
+    // a = m * 10^a1 with m = coeff / 10^d in [0.1, 1)
+    const a1: i64 = @as(i64, a.exponent) + d;
+    const extra: u32 = digitsU64(@abs(a1)) + 4;
+    const w: u32 = w_out + extra;
+    var s = try pow10(allocator, w);
+    defer s.deinit();
+
+    // M = m * 10^w (exact when the coefficient has at most w digits).
+    var m = try Managed.init(allocator);
+    defer m.deinit();
+    var m_err: u128 = 0;
+    if (d <= w) {
+        var up = try scaleUp(allocator, &a.coeff, w - d);
+        m.swap(&up);
+        up.deinit();
+    } else {
+        var dd = try pow10(allocator, d - w);
+        defer dd.deinit();
+        var rem = try Managed.init(allocator);
+        defer rem.deinit();
+        try m.divTrunc(&rem, &a.coeff, &dd);
+        m_err = 1;
+    }
+    // Scale by 2^i so that m * 2^i lies in [0.707, 1.414).
+    var i: u6 = 0;
+    {
+        const thr = [_]u32{ 707, 354, 177 };
+        var m1000 = try Managed.init(allocator);
+        defer m1000.deinit();
+        var t = try Managed.initSet(allocator, 1000);
+        defer t.deinit();
+        try m1000.mul(&m, &t);
+        while (i < 3) : (i += 1) {
+            try t.set(thr[i]);
+            var st = try Managed.init(allocator);
+            defer st.deinit();
+            try st.mul(&s, &t);
+            if (m1000.order(st) != .lt) break;
+        }
+    }
+    try m.shiftLeft(&m, i);
+    const z_err: u128 = 1 + (m_err << i);
+
+    var num = try Managed.init(allocator);
+    defer num.deinit();
+    try num.sub(&m, &s);
+    var den = try Managed.init(allocator);
+    defer den.deinit();
+    try den.add(&m, &s);
+    var z = try Managed.init(allocator);
+    defer z.deinit();
+    try mulDivTrunc(allocator, &z, &num, &s, &den);
+
+    var series = try atanhSeries(allocator, &z, &s, z_err);
+    defer series.deinit();
+    var total = try Managed.init(allocator);
+    errdefer total.deinit();
+    try total.add(&series.v, &series.v);
+    var err: u128 = 2 * series.err;
+
+    if (i != 0 or a1 != 0) {
+        var c = try lnConsts(allocator, &s);
+        defer c.deinit();
+        if (i != 0) {
+            try addScaled(allocator, &total, &c.ln2.v, -@as(i64, i));
+            err += @as(u128, i) * c.ln2.err;
+        }
+        if (a1 != 0) {
+            try addScaled(allocator, &total, &c.ln10.v, a1);
+            err += @as(u128, @abs(a1)) * c.ln10.err;
+        }
+    }
+
+    // Back to scale w_out.
+    var tdiv = try pow10(allocator, extra);
+    defer tdiv.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    var out = try Managed.init(allocator);
+    errdefer out.deinit();
+    try out.divTrunc(&rem, &total, &tdiv);
+    total.deinit();
+    const div_u: u128 = std.math.pow(u128, 10, extra);
+    return .{ .v = out, .err = (err + div_u - 1) / div_u + 1 };
+}
+
+/// log10(a) = ln(a) / ln(10) at scale `w`.
+fn log10Fixed(allocator: Allocator, a: BigDecimal, w: u32) BigDecimal.Error!Fx {
+    var l = try lnFixed(allocator, a, w);
+    defer l.deinit();
+    var s = try pow10(allocator, w);
+    defer s.deinit();
+    var c = try lnConsts(allocator, &s);
+    defer c.deinit();
+    var q = try Managed.init(allocator);
+    errdefer q.deinit();
+    try mulDivTrunc(allocator, &q, &l.v, &s, &c.ln10.v);
+    // |q| in whole units, rounded up, scales the error of ln10.
+    var qa = try q.clone();
+    defer qa.deinit();
+    qa.abs();
+    var whole = try Managed.init(allocator);
+    defer whole.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    try whole.divTrunc(&rem, &qa, &s);
+    const qw: u128 = (whole.toInt(u64) catch std.math.maxInt(u64)) + 1;
+    return .{ .v = q, .err = (l.err + qw * c.ln10.err) / 2 + 3 };
+}
+
+/// The decimal `a` as a fixed-point integer at scale `w` (error 0 or 1).
+fn scaleToFixed(allocator: Allocator, a: BigDecimal, w: u32) BigDecimal.Error!Fx {
+    const shift: i64 = @as(i64, a.exponent) + w;
+    if (shift >= 0) {
+        if (shift > BigDecimal.max_align_shift) return error.Overflow;
+        return .{ .v = try scaleUp(allocator, &a.coeff, @intCast(shift)), .err = 0 };
+    }
+    if (-shift > BigDecimal.max_align_shift) {
+        // Far below the working precision: truncates to zero (error 1 unit).
+        return .{ .v = try Managed.init(allocator), .err = 1 };
+    }
+    var d = try pow10(allocator, @intCast(-shift));
+    defer d.deinit();
+    var q = try Managed.init(allocator);
+    errdefer q.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    try q.divTrunc(&rem, &a.coeff, &d);
+    return .{ .v = q, .err = 1 };
+}
+
+/// e^t for t = T * 10^-wt (error `t_err` units of 10^-wt). Reduces
+/// t = q ln10 + r, |r| <= ln10/2, sums the Taylor series of e^r at 12 more
+/// digits and returns mantissa * 10^(q - w2). `error.Overflow` when |t| is so
+/// large that the result exponent cannot fit `i32`.
+fn expFixed(allocator: Allocator, t: *const Managed, t_err: u128, wt: u32) BigDecimal.Error!ExpOut {
+    const w2: u32 = wt + 12;
+    {
+        const dg = try digitsOf(allocator, t);
+        if (!t.eqlZero() and dg > wt + 10) return error.Overflow; // |t| >= 1e10
+    }
+    var s = try pow10(allocator, w2);
+    defer s.deinit();
+    var t2 = try scaleUp(allocator, t, 12);
+    defer t2.deinit();
+    var c = try lnConsts(allocator, &s);
+    defer c.deinit();
+
+    // q = round(t2 / ln10)
+    var two_t = try Managed.init(allocator);
+    defer two_t.deinit();
+    try two_t.add(&t2, &t2);
+    try two_t.add(&two_t, &c.ln10.v);
+    var two_l = try Managed.init(allocator);
+    defer two_l.deinit();
+    try two_l.add(&c.ln10.v, &c.ln10.v);
+    var qm = try Managed.init(allocator);
+    defer qm.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    try qm.divFloor(&rem, &two_t, &two_l);
+    const q: i64 = qm.toInt(i64) catch return error.Overflow;
+
+    var r = try t2.clone();
+    defer r.deinit();
+    {
+        var qq = try Managed.initSet(allocator, q);
+        defer qq.deinit();
+        var prod = try Managed.init(allocator);
+        defer prod.deinit();
+        try prod.mul(&c.ln10.v, &qq);
+        try r.sub(&r, &prod);
+    }
+    const rho: u128 = t_err * std.math.pow(u128, 10, 12) + @as(u128, @abs(q)) * c.ln10.err;
+
+    var sum = try s.clone();
+    errdefer sum.deinit();
+    var term = try s.clone();
+    defer term.deinit();
+    var kk = try Managed.init(allocator);
+    defer kk.deinit();
+    var tq = try Managed.init(allocator);
+    defer tq.deinit();
+    var k: u64 = 1;
+    while (true) : (k += 1) {
+        try mulDivTrunc(allocator, &term, &term, &r, &s);
+        try kk.set(k);
+        try tq.divTrunc(&rem, &term, &kk);
+        term.swap(&tq);
+        if (term.eqlZero()) break;
+        try sum.add(&sum, &term);
+    }
+    const err: u128 = 2 * @as(u128, k) + 10 + (34 * rho + 9) / 10;
+    const exp10: i64 = q - @as(i64, w2);
+    const dg: i64 = try digitsOf(allocator, &sum);
+    if (exp10 < std.math.minInt(i32) or exp10 + dg > std.math.maxInt(i32) - 1) return error.Overflow;
+    return .{ .man = sum, .err = err, .exp10 = exp10 };
+}
+
+/// Round both ends of man +- err (times 10^exp10, negated when `neg`) to
+/// `prec` digits; the rounding is decided when they agree, else null.
+fn decideInterval(allocator: Allocator, man: *const Managed, err: u128, exp10: i64, neg: bool, prec: u32, mode: RoundingMode) BigDecimal.Error!?BigDecimal.Rounded {
+    if (exp10 < std.math.minInt(i32) or exp10 > std.math.maxInt(i32)) return error.Overflow;
+    var e = try Managed.initSet(allocator, err);
+    defer e.deinit();
+    var lo = try Managed.init(allocator);
+    defer lo.deinit();
+    var hi = try Managed.init(allocator);
+    defer hi.deinit();
+    try lo.sub(man, &e);
+    try hi.add(man, &e);
+    if (lo.eqlZero() or hi.eqlZero() or lo.isPositive() != hi.isPositive()) return null;
+    if (neg) {
+        lo.negate();
+        hi.negate();
+    }
+    const bl = BigDecimal{ .coeff = lo, .exponent = @intCast(exp10) };
+    const bh = BigDecimal{ .coeff = hi, .exponent = @intCast(exp10) };
+    if ((try bl.precision(allocator)) <= prec or (try bh.precision(allocator)) <= prec) return null;
+    var rl = try roundPrec(allocator, bl, prec, mode);
+    errdefer rl.deinit();
+    var rh = try roundPrec(allocator, bh, prec, mode);
+    defer rh.deinit();
+    if (rl.value.exponent != rh.value.exponent or rl.value.coeff.order(rh.value.coeff) != .eq) {
+        rl.deinit();
+        return null;
+    }
+    rl.inexact = true;
+    rl.rounded = true;
+    return rl;
+}
+
+/// When `base^y` (y = p/q, non-integer) is itself a decimal number, the
+/// Ziv interval straddles that number forever in the directed modes (and at a
+/// tie). Test the two candidates the interval points at -- the midpoint
+/// rounded to `prec` and to `prec + 1` digits -- for exactness by raising to
+/// the integer power q (candidate^q == base^p), and round the exact value.
+fn exactPowerCandidate(allocator: Allocator, base: BigDecimal, y: BigDecimal, e: *const ExpOut, prec: u32, mode: RoundingMode) BigDecimal.Error!?BigDecimal.Rounded {
+    if (y.exponent < -18 or e.exp10 < std.math.minInt(i32) or e.exp10 > std.math.maxInt(i32)) return null;
+    // y = coeff * 10^-k = p / q in lowest terms.
+    const k: u32 = @intCast(-y.exponent);
+    var ten_k = try pow10(allocator, k);
+    defer ten_k.deinit();
+    var g = try Managed.init(allocator);
+    defer g.deinit();
+    try g.gcd(&y.coeff, &ten_k);
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    var p = try Managed.init(allocator);
+    defer p.deinit();
+    try p.divTrunc(&rem, &y.coeff, &g);
+    var qd = try Managed.init(allocator);
+    defer qd.deinit();
+    try qd.divTrunc(&rem, &ten_k, &g);
+    const qn = qd.toInt(i32) catch return null;
+    const pneg = !p.isPositive();
+    var pa = try p.clone();
+    defer pa.deinit();
+    pa.abs();
+    const pn = pa.toInt(i32) catch return null;
+    const base_digits: u64 = try base.precision(allocator);
+    if (base_digits * @as(u64, @intCast(pn)) > BigDecimal.max_result_digits) return null;
+
+    const mid = BigDecimal{ .coeff = e.man, .exponent = @intCast(e.exp10) };
+    const widths = [_]u32{ prec, prec + 1 };
+    for (widths) |wd| {
+        var cand = try roundPrec(allocator, mid, wd, .half_even);
+        defer cand.deinit();
+        const cd: u64 = try cand.value.precision(allocator);
+        if (cd * @as(u64, @intCast(qn)) > BigDecimal.max_result_digits) continue;
+        var cq = BigDecimal.pow(allocator, cand.value, qn) catch continue;
+        defer cq.deinit();
+        var bp = BigDecimal.pow(allocator, base, pn) catch continue;
+        defer bp.deinit();
+        if (pneg) {
+            // cand^q * base^|p| == 1
+            var prod = try BigDecimal.mul(allocator, cq, bp);
+            defer prod.deinit();
+            var one = try BigDecimal.fromInt(allocator, 1);
+            defer one.deinit();
+            if (!(try BigDecimal.eql(allocator, prod, one))) continue;
+        } else if (!(try BigDecimal.eql(allocator, cq, bp))) continue;
+
+        // Exact value found: pad to `prec` digits or round the extra digit.
+        const have: u32 = try cand.value.precision(allocator);
+        if (have < prec) {
+            const pad = prec - have;
+            var c2 = try scaleUp(allocator, &cand.value.coeff, pad);
+            errdefer c2.deinit();
+            const ex: i64 = @as(i64, cand.value.exponent) - pad;
+            if (ex < std.math.minInt(i32)) return error.Overflow;
+            return .{ .value = .{ .coeff = c2, .exponent = @intCast(ex) }, .inexact = true, .rounded = true };
+        }
+        return try roundedInexact(allocator, cand.value, prec, mode);
+    }
+    return null;
 }
 
 /// `10^k` as an exact arbitrary-precision integer. `k` is bounded by every

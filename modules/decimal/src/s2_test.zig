@@ -182,6 +182,24 @@ fn runLine(op: []const u8, f: []const []const u8) !void {
         defer talloc.free(s);
         return testing.expectEqualStrings(f[3], s);
     }
+    if (std.mem.eql(u8, op, "b.exp") or std.mem.eql(u8, op, "b.ln") or std.mem.eql(u8, op, "b.log10")) {
+        // mode|x|prec|value|inexact|rounded
+        var x = try big(f[1]);
+        defer x.deinit();
+        const prec = try std.fmt.parseInt(u32, f[2], 10);
+        const m = mode_of(f[0]);
+        if (std.mem.eql(u8, op, "b.exp")) return expectRounded(f[3..], BigDecimal.exp(talloc, x, prec, m));
+        if (std.mem.eql(u8, op, "b.ln")) return expectRounded(f[3..], BigDecimal.ln(talloc, x, prec, m));
+        return expectRounded(f[3..], BigDecimal.log10(talloc, x, prec, m));
+    }
+    if (std.mem.eql(u8, op, "b.power")) {
+        // mode|base|exponent|prec|value|inexact|rounded
+        var a = try big(f[1]);
+        defer a.deinit();
+        var b = try big(f[2]);
+        defer b.deinit();
+        return expectRounded(f[4..], BigDecimal.power(talloc, a, b, try std.fmt.parseInt(u32, f[3], 10), mode_of(f[0])));
+    }
     return error.UnknownOp;
 }
 
@@ -189,6 +207,7 @@ test "oracle: S2 operations replay Python decimal (frozen s2_oracle.vec)" {
     var it = std.mem.splitScalar(u8, @embedFile("testdata/s2_oracle.vec"), '\n');
     var n: usize = 0;
     var line_no: usize = 0;
+    var failed: usize = 0;
     while (it.next()) |raw| {
         line_no += 1;
         const line = std.mem.trim(u8, raw, " \t\r");
@@ -199,12 +218,14 @@ test "oracle: S2 operations replay Python decimal (frozen s2_oracle.vec)" {
         var k: usize = 0;
         while (parts.next()) |p| : (k += 1) fields[k] = p;
         runLine(op, fields[0..k]) catch |err| {
-            std.debug.print("s2_oracle.vec line {d}: {s}\n", .{ line_no, line });
-            return err;
+            // Report up to 40 failing lines (one run shows the whole picture), then fail below.
+            failed += 1;
+            if (failed <= 40) std.debug.print("s2_oracle.vec line {d}: {s} -> {s}\n", .{ line_no, line, @errorName(err) });
         };
         n += 1;
     }
-    try testing.expectEqual(@as(usize, 14851), n); // the whole file, not a prefix
+    try testing.expectEqual(@as(usize, 0), failed);
+    try testing.expectEqual(@as(usize, 19843), n); // the whole file, not a prefix
 }
 
 // ---------------------------------------------------------------------------
@@ -521,4 +542,91 @@ test "BigDecimal.toStringFixed and {f}" {
     var zz = try big("0.00");
     defer zz.deinit();
     try testing.expectEqualStrings("0", try std.mem.print(&buf, "{f}", .{zz})); // same as toStringAlloc; toSci keeps the scale
+}
+
+test "BigDecimal.exp / ln / log10 / power: spot checks, flags, typed errors" {
+    // Python: Context(prec=28).exp(Decimal(1)) -> 2.718281828459045235360287471
+    var one = try big("1");
+    defer one.deinit();
+    var r = try BigDecimal.exp(talloc, one, 28, .half_even);
+    defer r.deinit();
+    try expectBig("2.718281828459045235360287471", r.value.clone());
+    try testing.expect(r.inexact and r.rounded);
+    // exact special cases: exp(0) = 1, ln(1) = 0, log10(1E+3) = 3, flags clear
+    var zero = try big("0.00");
+    defer zero.deinit();
+    var e0 = try BigDecimal.exp(talloc, zero, 9, .up);
+    defer e0.deinit();
+    try expectBig("1", e0.value.clone());
+    try testing.expect(!e0.inexact and !e0.rounded);
+    var l1 = try BigDecimal.ln(talloc, one, 9, .up);
+    defer l1.deinit();
+    try expectBig("0", l1.value.clone());
+    try testing.expect(!l1.inexact and !l1.rounded);
+    var k3 = try big("1E+3");
+    defer k3.deinit();
+    var g3 = try BigDecimal.log10(talloc, k3, 9, .down);
+    defer g3.deinit();
+    try expectBig("3", g3.value.clone());
+    try testing.expect(!g3.inexact);
+    // Python: ln(10) = 2.302585092994045684017991455, log10(2) = 0.3010299956639811952137388947
+    var ten = try big("10");
+    defer ten.deinit();
+    var two = try big("2");
+    defer two.deinit();
+    var ln10 = try BigDecimal.ln(talloc, ten, 28, .half_even);
+    defer ln10.deinit();
+    try expectBig("2.302585092994045684017991455", ln10.value.clone());
+    var lg2 = try BigDecimal.log10(talloc, two, 28, .half_even);
+    defer lg2.deinit();
+    try expectBig("0.3010299956639811952137388947", lg2.value.clone());
+    // the mode is honoured: ln(2) = 0.693147...; up/down differ in the last digit at 3 digits
+    var up = try BigDecimal.ln(talloc, two, 3, .up);
+    defer up.deinit();
+    try expectBig("0.694", up.value.clone());
+    var dn = try BigDecimal.ln(talloc, two, 3, .down);
+    defer dn.deinit();
+    try expectBig("0.693", dn.value.clone());
+    // power: 2^0.5 at 28 digits; (-2)^3 exact; 4^0.5 is 2.0000 flagged inexact (as Python)
+    var half = try big("0.5");
+    defer half.deinit();
+    var sq2 = try BigDecimal.power(talloc, two, half, 28, .half_even);
+    defer sq2.deinit();
+    try expectBig("1.414213562373095048801688724", sq2.value.clone());
+    var m2 = try big("-2");
+    defer m2.deinit();
+    var c3 = try big("3");
+    defer c3.deinit();
+    var cube = try BigDecimal.power(talloc, m2, c3, 28, .half_even);
+    defer cube.deinit();
+    try expectBig("-8", cube.value.clone());
+    try testing.expect(!cube.inexact);
+    var four = try big("4");
+    defer four.deinit();
+    var fr = try BigDecimal.power(talloc, four, half, 5, .up);
+    defer fr.deinit();
+    try expectBig("2.0000", fr.value.clone());
+    try testing.expect(fr.inexact and fr.rounded);
+    // typed errors
+    var neg = try big("-1");
+    defer neg.deinit();
+    var z = try big("0");
+    defer z.deinit();
+    try testing.expectError(error.NonPositiveOperand, BigDecimal.ln(talloc, z, 9, .half_even));
+    try testing.expectError(error.NonPositiveOperand, BigDecimal.ln(talloc, neg, 9, .half_even));
+    try testing.expectError(error.NonPositiveOperand, BigDecimal.log10(talloc, neg, 9, .half_even));
+    try testing.expectError(error.NegativeBase, BigDecimal.power(talloc, neg, half, 9, .half_even));
+    try testing.expectError(error.DivisionByZero, BigDecimal.power(talloc, z, neg, 9, .half_even));
+    try testing.expectError(error.ZeroToZero, BigDecimal.power(talloc, z, z, 9, .half_even));
+    try testing.expectError(error.InvalidPrecision, BigDecimal.exp(talloc, one, 0, .half_even));
+    try testing.expectError(error.PrecisionTooLarge, BigDecimal.exp(talloc, one, BigDecimal.max_transcendental_prec + 1, .half_even));
+    var huge = try big("1E+10");
+    defer huge.deinit();
+    try testing.expectError(error.Overflow, BigDecimal.exp(talloc, huge, 9, .half_even));
+    // an argument close to 1 needs a wider working precision, not a different answer: Python agrees
+    var near = try big("1.0000000000000000000000000000000000000000001"); // 1 + 1E-43
+    defer near.deinit();
+    var ln_near = try BigDecimal.ln(talloc, near, 20, .half_even);
+    defer ln_near.deinit();
+    try expectBig("1.0000000000000000000E-43", ln_near.value.clone()); // ln(1+d) = d - d^2/2 ...
 }

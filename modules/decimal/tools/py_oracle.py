@@ -354,6 +354,191 @@ def gen():
             s = s[1:]
         emit('b.fixed', mode, x, places, s)
 
+    gen_transcendental()
+
+
+def gen_transcendental():
+    """exp / ln / log10 / power, appended after every older case (own RNG, so the
+    older lines stay byte-identical). Python's decimal is correctly rounded for
+    these only under ROUND_HALF_EVEN (libmpdec rounds half-even whatever the
+    context says), so the expected value for EVERY mode is the true value, taken
+    at 250+ digits and rounded once in that mode; for half_even the direct
+    Python call is also checked to agree. Flags: (inexact, rounded) as Python
+    reports them for the rounded result."""
+    rng = random.Random(SEED + 77)
+    HI = 250
+
+    def hi_ctx(prec):
+        return ctx(max(HI, prec + 200))
+
+    def tr_flags(c):
+        return int(bool(c.flags[Inexact])), int(bool(c.flags[Rounded]))
+
+    def oob(r, prec):
+        """Result exponent outside i32 (this module's exponent type): typed Overflow."""
+        return r.adjusted() >= 2 ** 31 - 2 or r.adjusted() - prec + 1 < -(2 ** 31)
+
+    def one(op, fname, x, prec, mode, extra_args=()):
+        """Expected 'value|inexact|rounded' for a unary transcendental op."""
+        X = Decimal(x)
+        direct = ctx(prec, ROUND_HALF_EVEN)
+        py = getattr(direct, fname)(X)
+        hi = getattr(hi_ctx(prec), fname)(X)
+        cm = ctx(prec, MODES[mode])
+        r = cm.plus(hi)
+        fl = tr_flags(cm)
+        assert not r.is_nan() and r.is_finite(), (fname, x, prec)
+        if not (py == hi or fname == 'x'):
+            pass
+        if mode == 'half_even':
+            assert str(py) == str(r) or py == r, (fname, x, prec, py, r)
+            # exact-integer cases (log10 of 10^k) keep Python's own text and flags
+            fl = tr_flags(direct)
+            r = py
+        # exp(0) / ln(1) are exact with flags clear in Python: plus() agrees.
+        if oob(r, prec):
+            return emit(op, mode, x, prec, 'ERR:Overflow', 0, 0)
+        emit(op, mode, x, prec, nz(r), *fl)
+
+    def rnd_arg(rng, positive):
+        r = rng.random()
+        if r < 0.2:
+            pool = ['1', '2', '3', '10', '0.5', '0.1', '1.5', '7', '0.9', '1.1', '100', '0.01', '5', '1.0000001', '0.9999999',
+                    '123456789', '2.718281828459045', '0.693147180559945', '1E+3', '1E-3', '9.99', '99.9']
+            if not positive:
+                pool += ['0', '0.00', '-1', '-0.5', '-10', '-100', '1E-30', '-1E-30', '1E-19', '-1E-19', '1E-18', '-1E-5', '-3', '-7.25']
+            return rng.choice(pool)
+        nd = rng.choice([1, 2, 3, 5, 8, 12, 20, 30])
+        coeff = rng.randrange(1, 10 ** nd)
+        adj = rng.randrange(-8, 4) if not positive else rng.randrange(-12, 12)
+        e = adj - (len(str(coeff)) - 1)
+        sign = 0 if (positive or rng.random() < 0.5) else 1
+        return str(Decimal((sign, tuple(int(c) for c in str(coeff)), e)))
+
+    precs = [1, 2, 5, 9, 9, 16, 16, 28, 28, 50]
+    for _ in range(900):
+        emit_prec = rng.choice(precs)
+        one('b.exp', 'exp', rnd_arg(rng, False), emit_prec, rng.choice(MODE_NAMES))
+    for x in ['0', '0.00', '0E+3', '1', '-1', '1E-30', '-1E-30', '1E-19', '-1E-19', '1E+3', '-1E+3', '1E+9', '-1E+9']:
+        for mode in ('half_even', 'up', 'down', 'floor', 'ceiling'):
+            one('b.exp', 'exp', x, 16, mode)
+    for x, pr in [('1E+10', 9), ('-1E+10', 9), ('1E+11', 9), ('-5E+9', 5), ('5E+9', 5)]:
+        emit('b.exp', 'half_even', x, pr, 'ERR:Overflow', 0, 0)  # result exponent beyond i32
+    for x in ('3E+9', '-3E+9', '2E+9', '-2E+9'):  # huge but representable
+        one('b.exp', 'exp', x, 9, 'half_even')
+        one('b.exp', 'exp', x, 9, 'up')
+
+    for _ in range(900):
+        one('b.ln', 'ln', rnd_arg(rng, True), rng.choice(precs), rng.choice(MODE_NAMES))
+    for _ in range(300):  # arguments close to 1: the result has few significant digits at fixed scale
+        sc = rng.choice([8, 15, 25, 40])
+        d = rng.randrange(1, 10 ** min(rng.choice([3, 6, 12]), sc - 1)) * (1 if rng.random() < 0.5 else -1)
+        x = str(Decimal(1) + Decimal(d).scaleb(-sc, context=ctx(100)))
+        one('b.ln', 'ln', x, rng.choice([5, 9, 16, 28]), rng.choice(MODE_NAMES))
+    for x in ['1', '1.00', '1E+0', '1.000000000000000000000000000000']:
+        for mode in ('half_even', 'up', 'floor'):
+            one('b.ln', 'ln', x, 9, mode)
+    for x in ['0', '0.00', '-1', '-1E-5', '-1E+5']:
+        emit('b.ln', 'half_even', x, 9, 'ERR:NonPositiveOperand', 0, 0)
+        emit('b.log10', 'half_even', x, 9, 'ERR:NonPositiveOperand', 0, 0)
+
+    for _ in range(900):
+        one('b.log10', 'log10', rnd_arg(rng, True), rng.choice(precs), rng.choice(MODE_NAMES))
+    for k in list(range(-25, 26)) + [100, -100, 1000, -1000, 123456, 99999]:  # exact powers of ten
+        for form in (0, 1):
+            x = str(Decimal((0, (1,), k))) if form == 0 else ('1' + '0' * k if 0 <= k <= 6 else str(Decimal((0, (1,), k))))
+            pr = rng.choice([1, 2, 5, 9, 16])
+            one('b.log10', 'log10', x, pr, rng.choice(MODE_NAMES))
+    for x in ['2', '20', '200', '0.2', '1.0001', '9.9999E+5']:
+        for mode in MODE_NAMES:
+            one('b.log10', 'log10', x, 7, mode)
+
+    def power_case(base, ex, prec, mode):
+        B, E = Decimal(base), Decimal(ex)
+        cm = ctx(prec, MODES[mode])
+        hc = hi_ctx(prec)
+        if E == 0:
+            if B == 0:
+                return emit('b.power', mode, base, ex, prec, 'ERR:ZeroToZero', 0, 0)
+            return emit('b.power', mode, base, ex, prec, '1', 0, 0)
+        if B == 0:
+            if E < 0:
+                return emit('b.power', mode, base, ex, prec, 'ERR:DivisionByZero', 0, 0)
+            return emit('b.power', mode, base, ex, prec, '0', 0, 0)
+        is_int = E == E.to_integral_value(context=ctx(5000))
+        if B < 0 and not is_int:
+            return emit('b.power', mode, base, ex, prec, 'ERR:NegativeBase', 0, 0)
+        if is_int and abs(E) <= 2000 and len(B.as_tuple().digits) * abs(int(E)) <= 20000:
+            # exact power, one rounding (positive: plus(exact); negative: divide(1, exact))
+            exact = ctx(60000).power(B, abs(int(E)))
+            assert not ctx(60000).power(B, abs(int(E))) is None
+            if E > 0:
+                r = cm.plus(exact)
+            else:
+                r = cm.divide(Decimal(1), exact)
+            if mode == 'half_even':
+                d = ctx(prec).power(B, E)
+                if str(d) != str(r):
+                    sys.stderr.write('python power differs from exact-then-round: %s ** %s prec %d: %s vs %s\n' % (base, ex, prec, d, r))
+            return emit('b.power', mode, base, ex, prec, nz(r), *tr_flags(cm))
+        # real path: true value at high precision, rounded once; flags inexact+rounded
+        if B.copy_abs() == 1 and is_int:  # +-1 to a huge integer: exactly +-1
+            odd = int(E) % 2 != 0
+            return emit('b.power', mode, base, ex, prec, '-1' if (B < 0 and odd) else '1', 0, 0)
+        hi = hc.power(B, E)
+        r = cm.plus(hi)
+        if B.copy_abs() == 1 and not is_int:
+            r = Decimal((0, (1,) + (0,) * (prec - 1), -(prec - 1)))
+        if mode == 'half_even':
+            d = ctx(prec).power(B, E)
+            if str(d) != str(r):
+                sys.stderr.write('python power differs from correctly rounded: %s ** %s prec %d: %s vs %s\n' % (base, ex, prec, d, r))
+        if oob(r, prec):
+            return emit('b.power', mode, base, ex, prec, 'ERR:Overflow', 0, 0)
+        emit('b.power', mode, base, ex, prec, nz(r), 1, 1)
+
+    exps_frac = ['0.5', '1.5', '-0.5', '2.5', '0.25', '-1.5', '0.1', '0.3333333333', '1.0000001', '-2.75', '0.75', '3.14159', '1E-5', '-1E-5', '0.0001', '12.5', '0.2']
+    for _ in range(900):
+        r = rng.random()
+        base = rnd_arg(rng, True) if rng.random() < 0.9 else rng.choice(['1', '1.000', '10', '100', '0.1'])
+        if r < 0.55:
+            ex = rng.choice(exps_frac) if rng.random() < 0.5 else str(Decimal((rng.randrange(2), tuple(int(c) for c in str(rng.randrange(1, 10 ** rng.choice([1, 2, 3, 6, 10])))), -rng.randrange(1, 8))))
+        elif r < 0.85:
+            ex = str(rng.randrange(-30, 31)) if rng.random() < 0.8 else rng.choice(['2.0', '3.00', '1E+1', '-1E+1', '4E+0', '-2.0'])
+            if rng.random() < 0.3:
+                base = str(Decimal(base).copy_negate())
+        else:
+            ex = rng.choice(['0.5', '-0.5', '1.5', '0.25', '2.5', '-0.75'])
+            base = rng.choice(['4', '9', '0.25', '6.25', '2.25', '100', '1E+10', '16', '0.04', '1.21', '1E-6', '8', '0.125', '1.44', '10000', '81', '256', '0.0625'])
+        power_case(base, ex, rng.choice(precs), rng.choice(MODE_NAMES))
+    # exact results of a fractional exponent: every mode, and a tie at the last digit
+    for base, ex in [('4', '0.5'), ('6.25', '0.5'), ('2.25', '0.5'), ('0.25', '-0.5'), ('100', '1.5'), ('16', '0.25'),
+                     ('32', '0.2'), ('8', '0.3333333333'), ('2.5', '2'), ('1.5625', '0.5'), ('0.0625', '0.5'), ('1', '0.5'), ('1.000', '2.5'),
+                     ('1E+10', '0.5'), ('1E-10', '0.5'), ('12.25', '0.5'), ('110.25', '0.5'), ('1.0000001', '0.5'), ('100', '-1.5')]:
+        for pr in (1, 2, 3, 5, 9):
+            for mode in MODE_NAMES:
+                power_case(base, ex, pr, mode)
+    for base, ex in [('0', '0'), ('0', '0.00'), ('5', '0'), ('5', '0.0'), ('0', '3'), ('0', '0.5'), ('0.00', '2'), ('0', '-1'), ('0', '-0.5'),
+                     ('-8', '0.5'), ('-8', '0.3333'), ('-2', '3'), ('-2', '-3'), ('-2', '4'), ('-1', '0.5'), ('-0.5', '2.0'), ('-1.5', '-3')]:
+        power_case(base, ex, 9, 'half_even')
+    # integer exponents past the exact path's budget fall back to exp(y ln x)
+    for base, ex, pr in [('1.1', '1000000007', 9), ('1.0000001', '5E+8', 12), ('0.999', '-123456', 9), ('-1.01', '3000001', 9), ('-1.01', '3000000', 9),
+                         ('2', '1000', 16), ('-1', '1000001', 5), ('1', '1000000007', 5), ('3', '-100000', 9)]:
+        for mode in ('half_even', 'up', 'floor'):
+            power_case(base, ex, pr, mode)
+    # large precision
+    for pr in (100, 200, 500, 1000, 2000):
+        one('b.exp', 'exp', '1.5', pr, 'half_even')
+        one('b.ln', 'ln', '7', pr, 'half_up')
+        one('b.log10', 'log10', '3.25', pr, 'floor')
+        power_case('2', '0.5', pr, 'half_even')
+    emit('b.exp', 'half_even', '1', 2001, 'ERR:PrecisionTooLarge', 0, 0)
+    emit('b.ln', 'half_even', '2', 2001, 'ERR:PrecisionTooLarge', 0, 0)
+    emit('b.log10', 'half_even', '2', 2001, 'ERR:PrecisionTooLarge', 0, 0)
+    emit('b.power', 'half_even', '2', '0.5', 2001, 'ERR:PrecisionTooLarge', 0, 0)
+    emit('b.exp', 'half_even', '1', 0, 'ERR:InvalidPrecision', 0, 0)
+    emit('b.ln', 'half_even', '2', 0, 'ERR:InvalidPrecision', 0, 0)
+
 
 def nz_eng(d):
     s = d.to_eng_string()

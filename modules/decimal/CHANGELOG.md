@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `BigDecimal.exp`, `ln`, `log10`, `power` (S2 R7): correctly rounded in all eight modes
+  (Python's libmpdec rounds these half_even whatever the context), Ziv loop over integer fixed point with a
+  carried error bound; exact results detected (`log10` of a power of ten, `4^0.5`). Typed errors
+  (`NonPositiveOperand`, `NegativeBase`, `ZeroToZero`, `PrecisionTooLarge` past prec 2000 or 6000 working
+  digits, `Overflow`). Evidence: 4 992 more frozen Python cases (19 843 total); two exact-tie cases where
+  Python's `power` is wrong are frozen as the correct value.
 - **2026-10-20** — S2 batch (survey 2026-10-20). `RoundingMode.round_05up` (8th GDA mode; source-breaking
   for an exhaustive `switch` — none in consumers). `Decimal`: `rem`, `divideInteger`, `remainderNear`,
   `roundToMultiple` (bxp MROUND), `pow(gpa, i32)` (`PowError`, `0^0 = 1`), allocation-free correctly
