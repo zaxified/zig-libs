@@ -13,8 +13,9 @@ did-you-mean suggestion.
   state — safe if not shared). **Allocation:** owned by the caller-supplied
   allocator; no internal ownership beyond the `items` list.
 
-Provenance: original work of the zig-libs authors (MIT) — no third-party
-source copied.
+Provenance: original work of the zig-libs authors (MIT), except the snippet
+layout, ported from codespan-reporting 0.13.1 (Apache-2.0), and its vendored
+test snapshots — see NOTICE.
 
 ## API
 
@@ -81,20 +82,50 @@ try diag.render(w, .{ .style = .snippet, .sources = &src, .color = true }); // c
 
 ```
 error[json5.duplicate_key]: duplicate key 'a'
- --> c.json5:4:3
-  |
-4 |   a: 3,
-  |   ^
- ::: c.json5:2:3
+  --> c.json5:4:3
   |
 2 |   a: 1,
   |   - first defined here
-  = at: a
+3 |   b: 2,
+4 |   a: 3,
+  |   ^
+  |
   = note: the later value would silently win
+  = at: a
   = fix: replace c.json5:4:3..4:4 with "c"
   = see: https://example.invalid/json5/duplicate_key
+
 ```
 
 All four fields are optional and omitted from JSON when unset, so existing
 output is byte-identical. Colour wraps only this module's own text; anything
 taken from a finding is escaped the same way with colour on.
+
+### Snippet layout (codespan-reporting 0.13.1)
+
+The `snippet` style is the layout of codespan-reporting's "rich" style, ASCII
+charset (the layout code is ported from it, Apache-2.0; see `tools/codespan-goldens/README.md`
+for the version, the replayed upstream test cases and the known deviations):
+labels on one line share the quoted line with carets, a trailing message and
+hanging messages; a span over several lines is drawn with `/ |` and `\` markers
+in a gutter, long ones with a `.` where lines are left out.
+
+```zig
+// The message next to the primary span, a second primary, a multi-line span:
+try diag.append(.{
+    .path = "", .file = "f.fun", .line = 8, .col = 12, .end_line = 8, .end_col = 15,
+    .span_message = "expected `String`, found `Nat`",
+    .severity = .@"error", .code = "E0308", .message = "`case` clauses have incompatible types",
+    .labels = &.{
+        .{ .line = 4, .col = 15, .end_line = 8, .end_col = 15, .message = "`case` clauses have incompatible types" },
+        .{ .line = 3, .col = 17, .end_line = 3, .end_col = 23, .message = "expected type `String` found here" },
+    },
+    .notes = &.{.{ .kind = .plain, .message = "expected type `String`\n   found type `Nat`" }},
+});
+try diag.render(w, .{ .style = .snippet, .sources = &src, .tab_width = 4 });
+```
+
+`NoteKind.plain` is codespan's note (`= text`, a `\n` starts an aligned
+continuation line); `Label.primary` draws a label as a second primary span.
+No allocation: at most 64 spans and 16 multi-line spans per file are drawn,
+the rest is listed as `--> location: message` lines.

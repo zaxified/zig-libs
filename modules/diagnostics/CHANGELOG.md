@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **Snippet layout = codespan-reporting 0.13.1's rich ASCII style** (S2 R1/R2; ported,
+  Apache-2.0, NOTICE): several labels on one line share the quoted line, sorted; multi-line spans get
+  start/end markers, overlapping ones included; gaps become `.` break rows; tabs expand (`tab_width`,
+  default 4); `start_context_lines`/`end_context_lines`. Evidence: 13 of codespan's 16 snapshots
+  replayed byte-identically (3 listed deviations). **Behaviour change for `.snippet` output** (the
+  `short` style and the JSON output are unchanged): ` --> ` gains a leading space, a `|` border row and a
+  blank line end each diagnostic, a secondary label no longer gets its own `:::` block, notes precede
+  `= at:`. New, additive: `Diagnostic.span_message`, `Label.primary`, `NoteKind.plain` (source-breaking
+  only for an exhaustive switch over `NoteKind`), the three render options. Rendering stays
+  allocation-free (≤ 64 spans, ≤ 16 multi-line spans per file; the rest become location lines).
 - **2026-10-20** — `Source.line_starts` + `Source.indexLines(gpa, text)` (S2 R4): a caller-built line
   index makes each quoted line O(1) instead of a scan from the top of the file per label (N diagnostics
   over a large file were O(N·F)); without it the scan is memchr per line instead of a splitting

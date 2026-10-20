@@ -69,6 +69,9 @@ pub const Diagnostic = struct {
     /// `relatedInformation`). The diagnostic's own position is the primary
     /// span.
     labels: ?[]const Label = null,
+    /// The message printed next to the primary span (codespan's primary
+    /// label message); `message` is the header. `snippet` only.
+    span_message: ?[]const u8 = null,
     /// Extra `note:` / `help:` lines beyond `suggest` (rustc's notes).
     notes: ?[]const Note = null,
     /// Where the `code` is documented (miette's code URL, LSP's
@@ -88,9 +91,14 @@ pub const Label = struct {
     end_line: ?u32 = null,
     end_col: ?u32 = null,
     message: []const u8 = "",
+    /// Draw as a primary span (`^` under the source, the severity colour)
+    /// instead of a secondary one (`-`). Null is secondary.
+    primary: ?bool = null,
 };
 
-pub const NoteKind = enum { note, help };
+/// `plain` is codespan's note: the bullet and the text, no `note:` prefix,
+/// and a `\n` in the message starts an aligned continuation line.
+pub const NoteKind = enum { note, help, plain };
 
 pub const Note = struct {
     kind: NoteKind = .note,
@@ -190,9 +198,12 @@ pub const RenderStyle = enum {
     /// jump to `file:line:col`:
     /// `conf.json5:12:5: warning[config.unknown_key]: unknown key 'x' (at a.x); did you mean 'y'?`
     short,
-    /// rustc style: the header line, a `-->` location line, the source line
-    /// with carets under the span (when the source text is in
-    /// `RenderOptions.sources`), then the path and suggestion as notes.
+    /// codespan-reporting's "rich" style (ASCII): the header line, a `-->`
+    /// location line, the source lines with carets under the spans and the
+    /// labels' messages (several labels of one line share it; a span over
+    /// several lines is drawn with `/ |` markers), when the source text is in
+    /// `RenderOptions.sources`; then the notes, the path, the suggestion, and
+    /// an empty line. See "snippet layout" below for the bounds.
     snippet,
 };
 
@@ -233,6 +244,13 @@ pub const RenderOptions = struct {
     /// NO_COLOR. Only this module's own escape sequences are coloured — text
     /// from findings is escaped exactly as without colour.
     color: bool = false,
+    /// Columns of a tab in the quoted source (tabs are shown as spaces).
+    tab_width: u8 = 4,
+    /// Of a multi-line span: lines quoted after its first / before its last
+    /// line; the lines between are left out (codespan's `start_context_lines`
+    /// and `end_context_lines`).
+    start_context_lines: u32 = 3,
+    end_context_lines: u32 = 1,
 };
 
 const Sgr = struct {
@@ -285,8 +303,9 @@ fn digits(n: u32) usize {
 /// a tab in the source line), because findings usually quote the input being
 /// validated and are printed to a terminal: a key name carrying an escape
 /// sequence must not reach it raw, and a `short` finding must stay one line.
-/// Carets line up under the span for tabs and multi-byte UTF-8 (one column
-/// per code point); double-width characters are not accounted for.
+/// In `snippet` a tab is shown as spaces up to the next multiple of
+/// `tab_width` and carets line up for multi-byte UTF-8 (one column per code
+/// point); double-width and combining characters are not accounted for.
 pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.Writer.Error!void {
     const c: Sgr = .{ .on = opts.color };
     switch (opts.style) {
@@ -308,7 +327,7 @@ pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.W
                 try writeEscaped(w, l.message);
             };
             if (d.notes) |notes| for (notes) |n| {
-                try w.print("; {s}: ", .{@tagName(n.kind)});
+                if (n.kind == .plain) try w.writeAll("; ") else try w.print("; {s}: ", .{@tagName(n.kind)});
                 try writeEscaped(w, n.message);
             };
             if (d.fix) |f| {
@@ -321,39 +340,657 @@ pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.W
             }
             try w.writeByte('\n');
         },
-        .snippet => {
-            try writeHeader(w, d, c);
-            try w.writeByte('\n');
-            // One gutter width for every quoted line, so the bars align.
-            const primary = primarySpan(d);
-            var width: usize = 0;
-            if (sourceLine(primary, opts.sources) != null) width = digits(primary.line.?);
-            if (d.labels) |labels| for (labels) |l| {
-                if (sourceLine(labelSpan(d, l), opts.sources) != null) width = @max(width, digits(l.line));
-            };
-            try writeSpanBlock(w, primary, "-->", '^', c.sev(d.severity), "", width, opts.sources, c);
-            if (d.labels) |labels| for (labels) |l| {
-                try writeSpanBlock(w, labelSpan(d, l), ":::", '-', c.blue(), l.message, width, opts.sources, c);
-            };
-            if (d.path.len > 0) try writeNote(w, width, c, "at", d.path);
-            if (d.notes) |notes| for (notes) |n| try writeNote(w, width, c, @tagName(n.kind), n.message);
-            if (d.suggest) |s| try writeNote(w, width, c, "help", s);
-            if (d.fix) |f| {
-                try w.splatByteAll(' ', width);
-                try w.print(" {s}={s} {s}fix{s}: ", .{ c.blue(), c.reset(), c.bold(), c.reset() });
-                try writeFix(w, d, f);
-                try w.writeByte('\n');
-            }
-            if (d.code_url) |u| try writeNote(w, width, c, "see", u);
-        },
+        .snippet => try renderSnippet(w, d, opts, c),
     }
 }
 
-fn writeNote(w: *std.Io.Writer, width: usize, c: Sgr, kind: []const u8, text: []const u8) std.Io.Writer.Error!void {
-    try w.splatByteAll(' ', width);
-    try w.print(" {s}={s} {s}{s}{s}: ", .{ c.blue(), c.reset(), c.bold(), kind, c.reset() });
+// ── snippet layout ───────────────────────────────────────────────────────────
+//
+// ported from brendanzab/codespan codespan-reporting 0.13.1
+// (Apache-2.0, commit decb0a0727e45bf2f04dcd3e4b4deb9517349fdc):
+//   src/term/views.rs      RichDiagnostic::render -- which lines are shown, how
+//                          single-line labels are sorted, multi-line columns,
+//                          the locus, the gaps between shown lines
+//   src/term/renderer.rs   Renderer::render_snippet_{source,empty,break,note},
+//                          caret_pointers and the multi-line label pieces
+//   src/term/config.rs     Chars::ascii()
+//
+// Not ported: colour themes (we colour the module's own parts only), the
+// `before_label_lines`/`after_label_lines` context (backlog R10),
+// East-Asian wide / combining characters (backlog R5: every character is one
+// column, a tab is `tab_width` aligned).
+//
+// Memory: no allocation. Everything lives in fixed arrays on the stack:
+//   - at most `max_labels` (64) spans take part (the primary one and the first
+//     63 labels); further labels are listed as `--> location: message` lines
+//     after the snippets, in order, without a source quote;
+//   - at most `max_multi` (16) multi-line spans per file (gutter columns); a
+//     17th multi-line span of the same file is listed the same way.
+// A label that cannot be quoted (no matching source, line past its end) is a
+// location line too, as before.
+
+const max_labels = 64;
+const max_multi = 16;
+
+const LabKind = enum { snippet, loose, dropped };
+
+/// One span to draw. `sl`/`el` are 1-based lines, `sc`/`ec` byte offsets into
+/// those lines (0-based, `ec` exclusive).
+const Lab = struct {
+    kind: LabKind,
+    primary: bool,
+    group: u8 = 0,
+    msg: []const u8,
+    span: Span,
+    sl: u32 = 0,
+    sc: usize = 0,
+    el: u32 = 0,
+    ec: usize = 0,
+    mcol: u8 = 0,
+
+    fn isMulti(l: Lab) bool {
+        return l.el != l.sl;
+    }
+};
+
+const Group = struct { src: *const Source, nmulti: u8 = 0 };
+const Item = struct { is_group: bool, idx: u8 };
+
+const Resolved = struct { src: *const Source, sl: u32, sc: usize, el: u32, ec: usize };
+
+/// Where `span` lies in its source; null when there is nothing to quote.
+fn resolveSpan(span: Span, sources: []const Source) ?Resolved {
+    const line = span.line orelse return null;
+    const src = findSource(span, sources) orelse return null;
+    const text = lineIn(src, line) orelse return null;
+    const sc = @min(@as(usize, span.col orelse 1) -| 1, text.len);
+    var r: Resolved = .{ .src = src, .sl = line, .sc = sc, .el = line, .ec = sc + 1 };
+    if (span.end_line) |e| {
+        if (e == line) {
+            if (span.end_col) |x| r.ec = @min(@as(usize, x) -| 1, text.len);
+        } else if (e > line) {
+            // Past the last line of the source: underline to the end of the first.
+            if (lineIn(src, e)) |et| {
+                r.el = e;
+                r.ec = if (span.end_col) |x| @min(@as(usize, x) -| 1, et.len) else et.len;
+            } else r.ec = text.len;
+        }
+    }
+    return r;
+}
+
+const Single = struct { primary: bool, start: usize, end: usize, msg: []const u8 };
+
+const MultiKind = enum { top, left, bottom };
+const MultiEnt = struct { col: u8, primary: bool, kind: MultiKind, pos: usize, msg: []const u8 };
+
+const Chr = struct { idx: usize, len: usize, width: usize };
+
+/// UTF-8 characters of a line with the tab-aware display width
+/// (codespan's `char_metrics`); an invalid byte is one character.
+const CharIter = struct {
+    text: []const u8,
+    tab: usize,
+    i: usize = 0,
+    col: usize = 0,
+
+    fn next(self: *CharIter) ?Chr {
+        if (self.i >= self.text.len) return null;
+        const b = self.text[self.i];
+        var len: usize = 1;
+        if (b >= 0x80) blk: {
+            const n = std.unicode.utf8ByteSequenceLength(b) catch break :blk;
+            if (self.i + n > self.text.len) break :blk;
+            for (self.text[self.i + 1 .. self.i + n]) |cb| if (cb & 0xC0 != 0x80) break :blk;
+            len = n;
+        }
+        const width: usize = if (b == '\t') (if (self.tab == 0) 0 else self.tab - self.col % self.tab) else 1;
+        const r: Chr = .{ .idx = self.i, .len = len, .width = width };
+        self.i += len;
+        self.col += width;
+        return r;
+    }
+};
+
+fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) bool {
+    return @max(a0, b0) < @min(a1, b1);
+}
+
+fn leadingSpace(text: []const u8) usize {
+    var n: usize = 0;
+    while (n < text.len and (text[n] == ' ' or text[n] == '\t')) n += 1;
+    return n;
+}
+
+/// The primary style at `[a, b)` of the single-line labels, or null.
+fn styleAt(singles: []const Single, a: usize, b: usize) ?bool {
+    var r: ?bool = null;
+    for (singles) |s| {
+        if (!overlaps(s.start, s.end, a, b)) continue;
+        if (s.primary) return true;
+        r = false;
+    }
+    return r;
+}
+
+// ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/views.rs (RichDiagnostic::render, must_render)
+/// The first line >= `from` of group `g` that is shown: the line of a
+/// single-line span, the first and last line of a multi-line one, its
+/// `start_context_lines` after the first and `end_context_lines` before the
+/// last.
+fn nextShown(labs: []const Lab, g: usize, from: u32, o: RenderOptions) ?u32 {
+    var best: ?u32 = null;
+    for (labs) |l| {
+        if (l.kind != .snippet or l.group != g) continue;
+        considerLine(&best, from, l.sl, l.sl);
+        if (!l.isMulti()) continue;
+        considerLine(&best, from, l.el, l.el);
+        const a = l.sl + 1;
+        const b = l.el - 1;
+        considerLine(&best, from, a, @min(b, l.sl +| o.start_context_lines));
+        considerLine(&best, from, @max(a, l.el -| o.end_context_lines), b);
+    }
+    return best;
+}
+
+/// Lower `best` to the first line of `[a, b]` that is >= `from`.
+fn considerLine(best: *?u32, from: u32, a: u32, b: u32) void {
+    if (a > b or b < from) return;
+    const x = @max(a, from);
+    if (best.* == null or x < best.*.?) best.* = x;
+}
+
+const Layout = struct {
+    w: *std.Io.Writer,
+    c: Sgr,
+    sev: Severity,
+    pad: usize,
+    opts: RenderOptions,
+    nmulti: usize = 0,
+
+    const E = std.Io.Writer.Error;
+
+    fn mark(l: *const Layout, primary: bool) []const u8 {
+        return if (primary) l.c.sev(l.sev) else l.c.blue();
+    }
+
+    fn outerGutter(l: *Layout) E!void {
+        try l.w.splatByteAll(' ', l.pad + 1);
+    }
+
+    fn border(l: *Layout, ch: u8) E!void {
+        try l.w.print("{s}{c}{s}", .{ l.c.blue(), ch, l.c.reset() });
+    }
+
+    fn innerGutter(l: *Layout, multis: []const MultiEnt) E!void {
+        var mi: usize = 0;
+        for (0..l.nmulti) |col| {
+            if (mi < multis.len and multis[mi].col == col) {
+                const m = multis[mi];
+                if (m.kind == .top) try l.w.writeAll("  ") else try l.multiLeft(m.primary, null);
+                mi += 1;
+            } else try l.w.writeAll("  ");
+        }
+    }
+
+    /// ` |` of a multi-line span, with an underline continued to its left.
+    fn multiLeft(l: *Layout, primary: bool, underline: ?Underline) E!void {
+        if (underline) |u| {
+            try l.w.print("{s}-{s}", .{ l.mark(u.primary), l.c.reset() });
+        } else try l.w.writeByte(' ');
+        try l.w.print("{s}|{s}", .{ l.mark(primary), l.c.reset() });
+    }
+
+    fn multiCorner(l: *Layout, primary: bool, ch: u8) E!void {
+        try l.w.print(" {s}{c}{s}", .{ l.mark(primary), ch, l.c.reset() });
+    }
+
+    fn innerGutterColumn(l: *Layout, underline: ?Underline) E!void {
+        if (underline) |u| {
+            try l.w.print("{s}--{s}", .{ l.mark(u.primary), l.c.reset() });
+        } else try l.w.writeAll("  ");
+    }
+
+    /// `   |` and the inner gutter, no text.
+    fn gutterRow(l: *Layout, ch: u8, multis: []const MultiEnt) E!void {
+        try l.outerGutter();
+        try l.border(ch);
+        try l.innerGutter(multis);
+    }
+
+    fn emptyRow(l: *Layout) E!void {
+        try l.gutterRow('|', &.{});
+        try l.w.writeByte('\n');
+    }
+
+    fn writeSource(l: *Layout, text: []const u8) E!void {
+        var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+        while (it.next()) |ch| {
+            const b = text[ch.idx];
+            if (b == '\t') {
+                try l.w.splatByteAll(' ', ch.width);
+            } else if (b < 0x20 or b == 0x7f) {
+                try l.w.writeByte('?');
+            } else try l.w.writeAll(text[ch.idx..][0..ch.len]);
+        }
+    }
+
+    // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (caret_pointers)
+    /// The vertical lines under the carets that have a hanging message.
+    fn caretPointers(l: *Layout, text: []const u8, singles: []const Single, trailing: ?usize, max_start: usize, limit: usize) E!void {
+        var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+        while (it.next()) |ch| {
+            if (ch.idx >= limit) break;
+            var style: ?bool = null;
+            for (singles, 0..) |s, k| {
+                if (s.msg.len == 0 or trailing == k) continue;
+                if (s.start < ch.idx or s.start >= ch.idx + ch.len) continue;
+                if (s.primary) {
+                    style = true;
+                    break;
+                }
+                style = false;
+            }
+            var spaces = ch.width;
+            if (style) |p| {
+                try l.w.print("{s}|{s}", .{ l.mark(p), l.c.reset() });
+                spaces -|= 1;
+            }
+            if (ch.idx <= max_start) try l.w.splatByteAll(' ', spaces);
+        }
+    }
+
+    // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (render_snippet_source, multi-line parts)
+    fn sourceBlock(l: *Layout, number: u32, text: []const u8, singles: []const Single, multis: []const MultiEnt) E!void {
+        const w = l.w;
+        const lead = leadingSpace(text);
+        // The line.
+        try w.splatByteAll(' ', l.pad - digits(number));
+        try w.print("{s}{d}{s} ", .{ l.c.blue(), number, l.c.reset() });
+        try l.border('|');
+        {
+            var mi: usize = 0;
+            for (0..l.nmulti) |col| {
+                if (mi < multis.len and multis[mi].col == col) {
+                    const m = multis[mi];
+                    switch (m.kind) {
+                        .top => if (m.pos <= lead) try l.multiCorner(m.primary, '/') else try w.writeAll("  "),
+                        .left, .bottom => try l.multiLeft(m.primary, null),
+                    }
+                    mi += 1;
+                } else try w.writeAll("  ");
+            }
+        }
+        try w.writeByte(' ');
+        try l.writeSource(text);
+        try w.writeByte('\n');
+
+        if (singles.len > 0) try l.singleRows(text, singles, multis);
+
+        // The top and bottom of multi-line spans.
+        for (multis, 0..) |m, mk| {
+            if (m.kind == .left) continue;
+            if (m.kind == .top and m.pos <= lead) continue;
+            try l.outerGutter();
+            try l.border('|');
+            var underline: ?Underline = null;
+            var it: usize = 0;
+            for (0..l.nmulti) |col| {
+                if (it < multis.len and multis[it].col == col) {
+                    const e = multis[it];
+                    switch (e.kind) {
+                        .left => try l.multiLeft(e.primary, underline),
+                        .top => if (mk > it) {
+                            try l.multiLeft(e.primary, underline);
+                        } else if (mk == it) {
+                            underline = .{ .primary = e.primary, .top = true };
+                            try l.multiCorner(m.primary, '/');
+                        } else try l.innerGutterColumn(underline),
+                        .bottom => if (mk < it) {
+                            try l.multiLeft(e.primary, underline);
+                        } else if (mk == it) {
+                            underline = .{ .primary = e.primary, .top = false };
+                            try l.multiCorner(m.primary, '\\');
+                        } else try l.innerGutterColumn(underline),
+                    }
+                    it += 1;
+                } else try l.innerGutterColumn(underline);
+            }
+            // Finish the top or bottom caret.
+            const caret: u8 = if (m.primary) '^' else '\'';
+            try w.writeAll(l.mark(m.primary));
+            var ci: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+            while (ci.next()) |ch| {
+                if (m.kind == .top) {
+                    if (ch.idx >= m.pos + 1) break;
+                } else if (ch.idx >= m.pos) break;
+                try w.splatByteAll('-', ch.width);
+            }
+            try w.writeByte(caret);
+            try w.writeAll(l.c.reset());
+            if (m.kind == .bottom and m.msg.len > 0) {
+                try w.writeByte(' ');
+                try writeEscaped(w, m.msg);
+            }
+            try w.writeByte('\n');
+        }
+    }
+
+    // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (render_snippet_source, single-line labels)
+    /// Carets of the single-line labels, a trailing message, and the hanging
+    /// messages below.
+    fn singleRows(l: *Layout, text: []const u8, singles: []const Single, multis: []const MultiEnt) E!void {
+        const w = l.w;
+        var num_messages: usize = 0;
+        var max_start: usize = 0;
+        var max_end: usize = 0;
+        var trailing: ?usize = null;
+        for (singles, 0..) |s, i| {
+            if (s.msg.len > 0) num_messages += 1;
+            max_start = @max(max_start, s.start);
+            max_end = @max(max_end, s.end);
+            // A candidate for the trailing label: its message goes to the
+            // right of the carets.
+            if (s.end == max_end) trailing = if (s.msg.len == 0) null else i;
+        }
+        if (trailing) |t| {
+            for (singles, 0..) |s, i| {
+                if (i != t and overlaps(singles[t].start, singles[t].end, s.start, s.end)) {
+                    trailing = null;
+                    break;
+                }
+            }
+        }
+
+        // The carets.
+        try l.gutterRow('|', multis);
+        try w.writeByte(' ');
+        var prev: ?bool = null;
+        var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+        var placeholder = false;
+        while (true) {
+            // One extra column past the end, so a caret can sit at the end of
+            // the line.
+            const ch: Chr = it.next() orelse if (!placeholder) blk: {
+                placeholder = true;
+                break :blk Chr{ .idx = text.len, .len = 1, .width = 1 };
+            } else break;
+            const cur = styleAt(singles, ch.idx, ch.idx + ch.len);
+            if (prev != cur) {
+                if (cur) |p| try w.writeAll(l.mark(p)) else try w.writeAll(l.c.reset());
+            }
+            if (cur) |p| {
+                try w.splatByteAll(if (p) '^' else '-', ch.width);
+            } else if (ch.idx < max_end) try w.splatByteAll(' ', ch.width);
+            prev = cur;
+        }
+        if (prev != null) try w.writeAll(l.c.reset());
+        if (trailing) |t| {
+            try w.writeByte(' ');
+            try writeEscaped(w, singles[t].msg);
+        }
+        try w.writeByte('\n');
+
+        const hanging = num_messages - @as(usize, @intFromBool(trailing != null));
+        if (hanging == 0) return;
+        // The pointers, then each hanging message under its caret, the last
+        // label first.
+        try l.gutterRow('|', multis);
+        try w.writeByte(' ');
+        try l.caretPointers(text, singles, trailing, max_start, std.math.maxInt(usize));
+        try w.writeByte('\n');
+        var k = singles.len;
+        while (k > 0) {
+            k -= 1;
+            const s = singles[k];
+            if (s.msg.len == 0 or trailing == k) continue;
+            try l.gutterRow('|', multis);
+            try w.writeByte(' ');
+            try l.caretPointers(text, singles, trailing, max_start, s.start);
+            try writeEscaped(w, s.msg);
+            try w.writeByte('\n');
+        }
+    }
+
+    fn looseLine(l: *Layout, span: Span, msg: []const u8) E!void {
+        try l.outerGutter();
+        try l.w.print("{s}-->{s} ", .{ l.c.blue(), l.c.reset() });
+        _ = try writeLocation(l.w, span);
+        if (msg.len > 0) {
+            try l.w.writeAll(": ");
+            try writeEscaped(l.w, msg);
+        }
+        try l.w.writeByte('\n');
+    }
+
+    // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/views.rs (RichDiagnostic::render, single-line label sort)
+    /// One shown line of group `g`: its source, with its single-line labels
+    /// when `with_singles` (not for a line shown only to close a gap).
+    fn showLine(l: *Layout, labs: []const Lab, g: usize, src: *const Source, ln: u32, with_singles: bool) E!void {
+        const text = lineIn(src, ln) orelse return;
+        var singles: [max_labels]Single = undefined;
+        var ns: usize = 0;
+        if (with_singles) for (labs) |lab| {
+            if (lab.kind != .snippet or lab.group != g or lab.isMulti() or lab.sl != ln) continue;
+            const s: Single = .{ .primary = lab.primary, .start = lab.sc, .end = @max(lab.ec, lab.sc + 1), .msg = lab.msg };
+            // Sorted by the range they cover; equal ranges in the reverse of
+            // the order given (the renderer prints the hanging ones backwards).
+            var at: usize = 0;
+            while (at < ns and (singles[at].start < s.start or (singles[at].start == s.start and singles[at].end < s.end))) at += 1;
+            var j = ns;
+            while (j > at) : (j -= 1) singles[j] = singles[j - 1];
+            singles[at] = s;
+            ns += 1;
+        };
+        var multis: [max_multi]MultiEnt = undefined;
+        const nm = multisOf(labs, g, ln, &multis);
+        try l.sourceBlock(ln, text, singles[0..ns], multis[0..nm]);
+    }
+
+    fn breakRow(l: *Layout, multis: []const MultiEnt) E!void {
+        try l.gutterRow('.', multis);
+        try l.w.writeByte('\n');
+    }
+};
+
+const Underline = struct { primary: bool, top: bool };
+
+/// The multi-line spans of group `g` that touch line `ln`, by gutter column.
+fn multisOf(labs: []const Lab, g: usize, ln: u32, out: *[max_multi]MultiEnt) usize {
+    var n: usize = 0;
+    for (labs) |l| {
+        if (l.kind != .snippet or l.group != g or !l.isMulti()) continue;
+        if (ln < l.sl or ln > l.el) continue;
+        out[n] = if (ln == l.sl)
+            .{ .col = l.mcol, .primary = l.primary, .kind = .top, .pos = l.sc, .msg = "" }
+        else if (ln == l.el)
+            .{ .col = l.mcol, .primary = l.primary, .kind = .bottom, .pos = l.ec, .msg = l.msg }
+        else
+            .{ .col = l.mcol, .primary = l.primary, .kind = .left, .pos = 0, .msg = "" };
+        n += 1;
+    }
+    return n;
+}
+
+// ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/views.rs (RichDiagnostic::render: files, locus, gaps, border, notes)
+fn renderSnippet(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions, c: Sgr) std.Io.Writer.Error!void {
+    try writeHeader(w, d, c);
+    try w.writeByte('\n');
+
+    var labs: [max_labels]Lab = undefined;
+    var nl: usize = 0;
+    var groups: [max_labels]Group = undefined;
+    var ng: usize = 0;
+    var items: [max_labels]Item = undefined;
+    var ni: usize = 0;
+    var pad: usize = 0;
+    var overflow = false;
+    const extra_labels: []const Label = d.labels orelse &.{};
+    const nspans = 1 + extra_labels.len;
+
+    var i: usize = 0;
+    while (i < @min(nspans, max_labels)) : (i += 1) {
+        const primary = i == 0;
+        const span = if (primary) primarySpan(d) else labelSpan(d, extra_labels[i - 1]);
+        if (span.file == null and span.line == null) continue;
+        var lab: Lab = .{
+            .kind = .loose,
+            .primary = primary or (extra_labels[i -| 1].primary orelse false),
+            .msg = if (primary) (d.span_message orelse "") else extra_labels[i - 1].message,
+            .span = span,
+        };
+        if (resolveSpan(span, opts.sources)) |r| {
+            var gi: usize = 0;
+            while (gi < ng and groups[gi].src != r.src) gi += 1;
+            const known = gi < ng;
+            const nmulti: u8 = if (known) groups[gi].nmulti else 0;
+            if (r.sl != r.el and nmulti >= max_multi) {
+                lab.kind = .dropped;
+                overflow = true;
+            } else {
+                if (!known) {
+                    groups[gi] = .{ .src = r.src };
+                    ng += 1;
+                    items[ni] = .{ .is_group = true, .idx = @intCast(gi) };
+                    ni += 1;
+                }
+                lab.kind = .snippet;
+                lab.group = @intCast(gi);
+                lab.sl = r.sl;
+                lab.sc = r.sc;
+                lab.el = r.el;
+                lab.ec = r.ec;
+                if (r.sl != r.el) {
+                    lab.mcol = nmulti;
+                    groups[gi].nmulti += 1;
+                }
+                pad = @max(pad, @max(digits(r.sl), digits(r.el)));
+            }
+        }
+        if (lab.kind == .loose) {
+            items[ni] = .{ .is_group = false, .idx = @intCast(nl) };
+            ni += 1;
+        }
+        labs[nl] = lab;
+        nl += 1;
+    }
+    if (nspans > max_labels) overflow = true;
+
+    const notes: []const Note = d.notes orelse &.{};
+    const has_after = notes.len > 0 or d.path.len > 0 or d.suggest != null or d.fix != null or d.code_url != null or overflow;
+    var lay: Layout = .{ .w = w, .c = c, .sev = d.severity, .pad = pad, .opts = opts };
+
+    for (items[0..ni], 0..) |item, k| {
+        if (!item.is_group) {
+            const lab = labs[item.idx];
+            try lay.looseLine(lab.span, lab.msg);
+            continue;
+        }
+        const g: usize = item.idx;
+        lay.nmulti = groups[g].nmulti;
+        // The locus: the earliest primary span of the file (else the earliest).
+        var best: ?usize = null;
+        for (labs[0..nl], 0..) |l, j| {
+            if (l.kind != .snippet or l.group != g) continue;
+            const b = best orelse {
+                best = j;
+                continue;
+            };
+            const o = labs[b];
+            if ((!o.primary and l.primary) or (o.primary == l.primary and (o.sl > l.sl or (o.sl == l.sl and o.sc > l.sc)))) best = j;
+        }
+        try lay.outerGutter();
+        try w.print("{s}-->{s} ", .{ c.blue(), c.reset() });
+        _ = try writeLocation(w, labs[best.?].span);
+        try w.writeByte('\n');
+        try lay.emptyRow();
+
+        const src = groups[g].src;
+        var cur = nextShown(labs[0..nl], g, 0, opts);
+        while (cur) |ln| {
+            try lay.showLine(labs[0..nl], g, src, ln, true);
+            const nxt = nextShown(labs[0..nl], g, ln + 1, opts);
+            if (nxt) |n| switch (n - ln) {
+                1 => {},
+                // One line between: show it, with the multi-line marks only.
+                2 => try lay.showLine(labs[0..nl], g, src, ln + 1, false),
+                else => {
+                    var ms: [max_multi]MultiEnt = undefined;
+                    const nm = multisOf(labs[0..nl], g, n, &ms);
+                    try lay.breakRow(ms[0..nm]);
+                },
+            };
+            cur = nxt;
+        }
+        // The closing border -- not when nothing follows (it would only add
+        // an empty row above the final blank line).
+        if (k + 1 < ni or has_after) try lay.emptyRow();
+    }
+
+    // Spans that could not be drawn.
+    for (labs[0..nl]) |lab| if (lab.kind == .dropped) try lay.looseLine(lab.span, lab.msg);
+    if (nspans > max_labels) for (max_labels..nspans) |j| {
+        const l = extra_labels[j - 1];
+        try lay.looseLine(labelSpan(d, l), l.message);
+    };
+
+    for (notes) |n| switch (n.kind) {
+        .plain => try writePlainNote(&lay, n.message),
+        else => try writeNote(&lay, @tagName(n.kind), n.message),
+    };
+    if (d.path.len > 0) try writeNote(&lay, "at", d.path);
+    if (d.suggest) |s| try writeNote(&lay, "help", s);
+    if (d.fix) |f| {
+        try lay.outerGutter();
+        try w.print("{s}={s} {s}fix{s}: ", .{ c.blue(), c.reset(), c.bold(), c.reset() });
+        try writeFix(w, d, f);
+        try w.writeByte('\n');
+    }
+    if (d.code_url) |u| try writeNote(&lay, "see", u);
+    // codespan ends every diagnostic with an empty line.
+    try w.writeByte('\n');
+}
+
+/// `= kind: text` (our own notes: escaped, one line).
+fn writeNote(lay: *Layout, kind: []const u8, text: []const u8) std.Io.Writer.Error!void {
+    const w = lay.w;
+    const c = lay.c;
+    try lay.outerGutter();
+    try w.print("{s}={s} {s}{s}{s}: ", .{ c.blue(), c.reset(), c.bold(), kind, c.reset() });
     try writeEscaped(w, text);
     try w.writeByte('\n');
+}
+
+/// `= text` for a codespan-style note: one `=` and the text, the next lines
+/// aligned under it. Control characters other than a tab are escaped.
+/// ported from codespan-reporting 0.13.1 src/term/renderer.rs render_snippet_note
+/// (`str::lines()` semantics: a final newline ends the last line, `\r\n` too).
+fn writePlainNote(lay: *Layout, text: []const u8) std.Io.Writer.Error!void {
+    const w = lay.w;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        if (lines.peek() == null and raw.len == 0) break;
+        try lay.outerGutter();
+        if (first) {
+            try w.print("{s}={s}", .{ lay.c.blue(), lay.c.reset() });
+        } else try w.writeByte(' ');
+        first = false;
+        try w.writeByte(' ');
+        try writeEscapedTabs(w, std.mem.trimEnd(u8, raw, "\r"));
+        try w.writeByte('\n');
+    }
+}
+
+/// `writeEscaped` that lets a tab through (a note quoted from source).
+fn writeEscapedTabs(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    var parts = std.mem.splitScalar(u8, s, '\t');
+    var first = true;
+    while (parts.next()) |p| {
+        if (!first) try w.writeByte('\t');
+        first = false;
+        try writeEscaped(w, p);
+    }
 }
 
 /// `replace 3:5..3:9 with "x"` / `insert "x" at 3:5` (positions in the
@@ -377,48 +1014,6 @@ fn writeFix(w: *std.Io.Writer, d: Diagnostic, f: Fix) std.Io.Writer.Error!void {
         try writeEscaped(w, f.replacement);
         try w.writeByte('"');
     }
-}
-
-/// `--> location` (or `::: location` for a label), then the quoted line with
-/// `mark` characters under the span and the label message after them. A span
-/// with no quotable source line is just the location line (plus message).
-fn writeSpanBlock(
-    w: *std.Io.Writer,
-    span: Span,
-    arrow: []const u8,
-    mark: u8,
-    mark_color: []const u8,
-    message: []const u8,
-    width: usize,
-    sources: []const Source,
-    c: Sgr,
-) std.Io.Writer.Error!void {
-    if (span.file == null and span.line == null) return;
-    const quoted = sourceLine(span, sources);
-    try w.splatByteAll(' ', width);
-    try w.print("{s}{s}{s} ", .{ c.blue(), arrow, c.reset() });
-    _ = try writeLocation(w, span);
-    if (quoted == null and message.len > 0) {
-        try w.writeAll(": ");
-        try writeEscaped(w, message);
-    }
-    try w.writeByte('\n');
-    const text = quoted orelse return;
-    try w.splatByteAll(' ', width);
-    try w.print(" {s}|{s}\n", .{ c.blue(), c.reset() });
-    try w.print("{s}", .{c.blue()});
-    try w.splatByteAll(' ', width - digits(span.line.?));
-    try w.print("{d} |{s} ", .{ span.line.?, c.reset() });
-    try writeSourceLine(w, text);
-    try w.writeByte('\n');
-    try w.splatByteAll(' ', width);
-    try w.print(" {s}|{s} ", .{ c.blue(), c.reset() });
-    try writeCarets(w, span, text, mark, mark_color, c.reset());
-    if (message.len > 0) {
-        try w.writeByte(' ');
-        try writeEscaped(w, message);
-    }
-    try w.writeByte('\n');
 }
 
 /// `severity[code]: message`.
@@ -470,33 +1065,21 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     try w.writeAll(s[start..]);
 }
 
-/// The quoted source line keeps tabs (so the carets, which copy them, stay
-/// aligned) and shows every other control character as `?` -- one column,
-/// like the byte it replaces.
-fn writeSourceLine(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
-    var start: usize = 0;
-    for (text, 0..) |c, i| {
-        if (c == '\t' or (c >= 0x20 and c != 0x7f)) continue;
-        try w.writeAll(text[start..i]);
-        try w.writeByte('?');
-        start = i + 1;
+/// The source `d.file` names (or the only one, for a span with no file), or
+/// null when there is nothing to quote from.
+fn findSource(d: Span, sources: []const Source) ?*const Source {
+    if (d.file) |f| {
+        for (sources) |*s| if (std.mem.eql(u8, s.file, f)) return s;
+        return null;
     }
-    try w.writeAll(text[start..]);
+    if (sources.len == 1) return &sources[0];
+    return null;
 }
 
-/// The text of line `d.line` (without its line break) from the matching
-/// source, or null when there is nothing to quote.
-fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
-    const line = d.line orelse return null;
+/// The text of 1-based `line` of `s`, without its line break, or null past
+/// the end.
+fn lineIn(s: *const Source, line: u32) ?[]const u8 {
     if (line == 0) return null;
-    const s: Source = blk: {
-        if (d.file) |f| {
-            for (sources) |s| if (std.mem.eql(u8, s.file, f)) break :blk s;
-            return null;
-        }
-        if (sources.len == 1) break :blk sources[0];
-        return null;
-    };
     const src = s.text;
     var start: usize = 0;
     if (s.line_starts.len != 0) {
@@ -513,38 +1096,12 @@ fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
     return std.mem.trimEnd(u8, src[start..end], "\r");
 }
 
-/// Display columns of `bytes`: one per code point (UTF-8 continuation
-/// bytes take none).
-fn columns(bytes: []const u8) usize {
-    var n: usize = 0;
-    for (bytes) |b| {
-        if (b & 0xC0 != 0x80) n += 1;
-    }
-    return n;
-}
-
-fn writeCarets(w: *std.Io.Writer, d: Span, text: []const u8, mark: u8, on: []const u8, off: []const u8) std.Io.Writer.Error!void {
-    const col: usize = @min(@as(usize, d.col orelse 1) -| 1, text.len);
-    // Indent with the line's own bytes -- a tab where it had one, a space for
-    // every other column -- so the caret sits under the span on any tab width.
-    for (text[0..col]) |b| {
-        if (b == '\t') {
-            try w.writeByte('\t');
-        } else if (b & 0xC0 != 0x80) {
-            try w.writeByte(' ');
-        }
-    }
-    const end: usize = blk: {
-        const el = d.end_line orelse break :blk col + 1;
-        if (el > d.line.?) break :blk text.len;
-        if (el < d.line.?) break :blk col + 1;
-        const ec = d.end_col orelse break :blk col + 1;
-        break :blk @min(@as(usize, ec) -| 1, text.len);
-    };
-    const n = if (end > col) columns(text[col..@min(end, text.len)]) else 0;
-    try w.writeAll(on);
-    try w.splatByteAll(mark, @max(n, 1));
-    try w.writeAll(off);
+/// The text of line `d.line` (without its line break) from the matching
+/// source, or null when there is nothing to quote.
+fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
+    const line = d.line orelse return null;
+    const s = findSource(d, sources) orelse return null;
+    return lineIn(s, line);
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
@@ -692,12 +1249,14 @@ test "render snippet: source line with carets under the span" {
     const src: Source = .{ .file = "conf.json5", .text = "{\n  unknwn: 1,\n}\n" };
     try testing.expectEqualStrings(
         \\warning[config.unknown_key]: unknown key 'unknwn'
-        \\ --> conf.json5:2:3
+        \\  --> conf.json5:2:3
         \\  |
         \\2 |   unknwn: 1,
         \\  |   ^^^^^^
+        \\  |
         \\  = at: templates.x.unknwn
         \\  = help: did you mean 'unknown'?
+        \\
         \\
     , try renderToString(&buf, unknown_key, .{ .style = .snippet, .sources = &.{src} }));
 }
@@ -707,9 +1266,10 @@ test "render snippet: without the source text, only the header, location and not
     const other: Source = .{ .file = "other.json5", .text = "{\n  unknwn: 1,\n}\n" };
     try testing.expectEqualStrings(
         \\warning[config.unknown_key]: unknown key 'unknwn'
-        \\--> conf.json5:2:3
+        \\ --> conf.json5:2:3
         \\ = at: templates.x.unknwn
         \\ = help: did you mean 'unknown'?
+        \\
         \\
     , try renderToString(&buf, unknown_key, .{ .style = .snippet, .sources = &.{other} }));
     // A line past the end of the source quotes nothing either.
@@ -725,28 +1285,28 @@ test "render snippet: carets align after tabs and multi-byte UTF-8, a span runs 
     const src: Source = .{ .file = "f", .text = "\tn\xC3\xA9: xyz" };
     const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 7, .end_line = 1, .end_col = 10, .severity = .@"error", .code = "", .message = "bad" };
     try testing.expectEqualStrings(
-        "error: bad\n --> f:1:7\n  |\n1 | \tn\xC3\xA9: xyz\n  | \t    ^^^\n",
+        "error: bad\n  --> f:1:7\n  |\n1 |     n\xC3\xA9: xyz\n  |         ^^^\n\n",
         try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{src} }),
     );
     // A span ending on a later line underlines to the end of this one; a
     // finding with no end gets one caret; a col past the end clamps.
     var multi = d;
     multi.end_line = 3;
-    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, multi, .{ .style = .snippet, .sources = &.{src} }), "  | \t    ^^^\n"));
+    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, multi, .{ .style = .snippet, .sources = &.{src} }), "  |         ^^^\n\n"));
     var one = d;
     one.end_line = null;
     one.end_col = null;
-    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, one, .{ .style = .snippet, .sources = &.{src} }), "  | \t    ^\n"));
+    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, one, .{ .style = .snippet, .sources = &.{src} }), "  |         ^\n\n"));
     var far = one;
     far.col = 99;
-    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, far, .{ .style = .snippet, .sources = &.{src} }), "  | \t       ^\n"));
+    try testing.expect(std.mem.endsWith(u8, try renderToString(&buf, far, .{ .style = .snippet, .sources = &.{src} }), "  |            ^\n\n"));
 }
 
 test "render: a finding with no file uses the only source" {
     var buf: [512]u8 = undefined;
     const d: Diagnostic = .{ .path = "", .line = 1, .col = 1, .severity = .info, .code = "", .message = "m" };
     try testing.expectEqualStrings(
-        "info: m\n --> 1:1\n  |\n1 | abc\n  | ^\n",
+        "info: m\n  --> 1:1\n  |\n1 | abc\n  | ^\n\n",
         try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "whatever", .text = "abc\r\ndef" }} }),
     );
 }
@@ -882,27 +1442,31 @@ const dup: Diagnostic = .{
     .suggest = "rename one of them",
 };
 
-test "snippet: a secondary label is quoted under ::: with '-' marks, then notes, help, fix, see" {
-    // Layout derived by hand: both quoted lines are 1 digit, so the gutter is
-    // one column; the primary span 4:3..4:4 is one '^' under 'a' (two spaces
-    // in), the label 2:3..2:4 one '-' under the first 'a'.
+test "snippet: a secondary label shares the snippet; our notes follow codespan's, then help, fix, see" {
+    // Layout derived by hand from codespan's rules: all quoted line numbers
+    // are 1 digit, so the gutter is one column; the label 2:3..2:4 is one '-'
+    // under the first 'a' and has its message after it, line 3 is shown
+    // because only one line lies between the two, the primary span 4:3..4:4 is
+    // one '^'. A border row separates the snippet from the notes, an empty
+    // line ends the diagnostic.
     const got = try renderAlloc(dup, .{ .style = .snippet, .sources = &.{.{ .file = "c.json5", .text = dup_src }} });
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
         \\error[json5.duplicate_key]: duplicate key 'a'
-        \\ --> c.json5:4:3
-        \\  |
-        \\4 |   a: 3,
-        \\  |   ^
-        \\ ::: c.json5:2:3
+        \\  --> c.json5:4:3
         \\  |
         \\2 |   a: 1,
         \\  |   - first defined here
-        \\  = at: a
+        \\3 |   b: 2,
+        \\4 |   a: 3,
+        \\  |   ^
+        \\  |
         \\  = note: the later value would silently win
+        \\  = at: a
         \\  = help: rename one of them
         \\  = fix: replace c.json5:4:3..4:4 with "c"
         \\  = see: https://example.invalid/json5/duplicate_key
+        \\
         \\
     , got);
 }
@@ -918,7 +1482,7 @@ test "short: labels, notes, fix and URL stay on the one line" {
     );
 }
 
-test "snippet: gutter widens to the longest quoted line number; unquotable label is a location line" {
+test "snippet: gutter widens to the longest quoted line number; a gap is a break row; an unquotable label is a location line" {
     // Line 10 needs two gutter columns, so line 2's number is padded.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(testing.allocator);
@@ -941,15 +1505,16 @@ test "snippet: gutter widens to the longest quoted line number; unquotable label
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
         \\warning[x]: m
-        \\  --> f:2:1
+        \\   --> f:2:1
         \\   |
         \\ 2 | line2
         \\   | ^
-        \\  ::: f:10:1
-        \\   |
+        \\   .
         \\10 | line10
         \\   | ------ here
-        \\  ::: other:1: elsewhere
+        \\   |
+        \\   --> other:1: elsewhere
+        \\
         \\
     , got);
 }
@@ -1036,8 +1601,13 @@ test "note kinds are named, and a hostile code URL is escaped in both styles" {
         \\ = note: fyi
         \\ = see: https://x.invalid/\x1b]8;;evil\x07
         \\
+        \\
     , snip);
     const short = try renderAlloc(d, .{});
     defer testing.allocator.free(short);
     try testing.expectEqualStrings("warning[c]: m; help: try this; note: fyi; see https://x.invalid/\\x1b]8;;evil\\x07\n", short);
+}
+
+test {
+    _ = @import("codespan_test.zig");
 }
