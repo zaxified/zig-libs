@@ -746,10 +746,11 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     // themselves if the child must not inherit them. `pass_fds` goes
     // through std's `inherit_files`, which clears FD_CLOEXEC after the fork,
     // in the child only (race-free, same fd number).
-    var child = if (comptime vfork_spawn.supported)
-        try spawnVfork(gpa, io, spec, effective_argv, env_ptr, in_io, out_io, err_io)
-    else
-        try std.process.spawn(io, .{
+    var child = spawned: {
+        if (comptime vfork_spawn.supported) {
+            if (try spawnVfork(gpa, io, spec, effective_argv, env_ptr, in_io, out_io, err_io)) |c| break :spawned c;
+        }
+        break :spawned try std.process.spawn(io, .{
             .argv = effective_argv,
             .cwd = cwd,
             .environ_map = env_ptr,
@@ -767,6 +768,7 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
             // keep that promise rather than failing to build there.
             .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
         });
+    };
     // Ownership of the parent ends moves to the Child (std left these null,
     // it was given `.file`s).
     if (in_pipe.parent) |f| {
@@ -797,7 +799,7 @@ fn spawnVfork(
     in_io: std.process.SpawnOptions.StdIo,
     out_io: std.process.SpawnOptions.StdIo,
     err_io: std.process.SpawnOptions.StdIo,
-) !std.process.Child {
+) !?std.process.Child {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -805,7 +807,10 @@ fn spawnVfork(
     // argv[0] is searched on the PARENT's PATH (std's rule); the child's
     // environment is `env_ptr` or, for `.inherit`, the parent's.
     var parent: std.process.Environ.Map = .init(arena);
-    try loadParentEnv(arena, io, &parent);
+    // Without a readable /proc/self/environ (chroot, sandbox) the parent's
+    // environment is unknown here: std's spawn has it, so let std do this one
+    // rather than hand the child an empty environment (review 2026-10-20 M1).
+    if (!try readProcEnviron(arena, io, &parent)) return null;
     const search_path = parent.get("PATH") orelse std.Io.Threaded.default_PATH;
     const env_map: *const std.process.Environ.Map = env_ptr orelse &parent;
     var entries: std.ArrayList([]const u8) = .empty;
@@ -858,11 +863,13 @@ const PipeEnds = struct {
         const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
         const r: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
         const w: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-        // A captured stream gets a 1 MiB pipe (Linux, best effort: past
-        // /proc/sys/fs/pipe-max-size it just stays 64 KiB): fewer wakeups of
-        // the drainer and larger reads into the capture buffer.
+        // A captured stream gets a 256 KiB pipe (Linux, best effort): fewer
+        // wakeups of the drainer and larger reads into the capture buffer.
+        // Not 1 MiB: pipe pages count against the user's
+        // pipe-user-pages-soft (64 MiB by default), and past it the kernel
+        // shrinks EVERY new pipe of that user (review 2026-10-20 M2).
         if (builtin.os.tag == .linux and dir == .parent_reads)
-            _ = std.os.linux.fcntl(fds[0], std.os.linux.F.SETPIPE_SZ, 1 << 20);
+            _ = std.os.linux.fcntl(fds[0], std.os.linux.F.SETPIPE_SZ, 256 * 1024);
         return switch (dir) {
             .parent_reads => .{ .parent = r, .child = w },
             .parent_writes => .{ .parent = w, .child = r },
@@ -1031,25 +1038,33 @@ fn loadParentEnv(gpa: std.mem.Allocator, io: std.Io, map: *std.process.Environ.M
             // `readStreaming` loop (same primitive `drainLoop` above uses)
             // never consults the reported size — it just reads until the
             // kernel reports EOF (`n == 0`).
-            var file = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return;
-            defer file.close(io);
-            var data: std.ArrayList(u8) = .empty;
-            defer data.deinit(gpa);
-            var rbuf: [4096]u8 = undefined;
-            while (true) {
-                const n = file.readStreaming(io, &.{rbuf[0..]}) catch break;
-                if (n == 0) break;
-                try data.appendSlice(gpa, rbuf[0..n]);
-            }
-            var it = std.mem.splitScalar(u8, data.items, 0);
-            while (it.next()) |entry| {
-                if (entry.len == 0) continue;
-                const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
-                if (eq == 0) continue;
-                try map.put(entry[0..eq], entry[eq + 1 ..]);
-            }
+            _ = try readProcEnviron(gpa, io, map);
         },
     }
+}
+
+/// /proc/self/environ into `map` (POSIX); false when it cannot be read at all
+/// (then `map` is left as it was). It is the environment this process was
+/// exec'd with — Zig has no setenv, so for a pure-Zig program the live one.
+fn readProcEnviron(gpa: std.mem.Allocator, io: std.Io, map: *std.process.Environ.Map) !bool {
+    var file = std.Io.Dir.cwd().openFile(io, "/proc/self/environ", .{}) catch return false;
+    defer file.close(io);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+    var rbuf: [4096]u8 = undefined;
+    while (true) {
+        const n = file.readStreaming(io, &.{rbuf[0..]}) catch break;
+        if (n == 0) break;
+        try data.appendSlice(gpa, rbuf[0..n]);
+    }
+    var it = std.mem.splitScalar(u8, data.items, 0);
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
+        if (eq == 0) continue;
+        try map.put(entry[0..eq], entry[eq + 1 ..]);
+    }
+    return true;
 }
 
 // ── capped, deadlock-free stdio pumps ───────────────────────────────────────

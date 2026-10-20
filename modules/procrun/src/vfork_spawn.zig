@@ -140,7 +140,9 @@ const ChildArgs = struct {
 
 /// The kernel's `struct sigaction` for rt_sigaction on x86_64 and aarch64
 /// (handler, flags, restorer, mask) — used raw so the child can walk every
-/// signal number without std's typed wrapper.
+/// signal number without std's typed wrapper. Layout-agnostic in practice:
+/// only `handler` (offset 0) is read, the buffer is at least the kernel's
+/// size, and an all-zero struct means SIG_DFL with no flags.
 const KSigaction = extern struct {
     handler: usize,
     flags: c_ulong,
@@ -148,6 +150,9 @@ const KSigaction = extern struct {
     mask: u64,
 };
 
+/// The child uses well under 1 KiB of it (PATH candidates live in
+/// `path_buf`, not on the stack). There is no guard page — the review of
+/// 2026-10-20 measured the frames, so an overflow is not reachable.
 const child_stack_size = 64 * 1024;
 
 /// Spawn `opts.argv` and return the child's pid. On error no child is left
@@ -178,6 +183,10 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
             .NODEV => return error.NoDevice,
             .MFILE => return error.ProcessFdQuotaExceeded,
             .NFILE => return error.SystemFdQuotaExceeded,
+            .ACCES => return error.AccessDenied,
+            .PERM => return error.PermissionDenied,
+            .NOENT => return error.FileNotFound,
+            .NOMEM => return error.SystemResources,
             else => return error.Unexpected,
         }
         dev_null = try liftFd(dev_null);
@@ -202,7 +211,7 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
         .uid = opts.uid,
         .gid = opts.gid,
         .pgid = opts.pgid,
-        .old_mask = undefined,
+        .old_mask = linux.sigfillset(), // overwritten below; never garbage
     };
     for ([_]Stdio{ opts.stdin, opts.stdout, opts.stderr }, 0..) |s, i| switch (s) {
         .inherit => {},
@@ -210,7 +219,8 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
         .ignore => args.stdio_src[i] = dev_null,
         .fd => |fd| {
             if (fd < 3 and fd != @as(posix.fd_t, @intCast(i))) {
-                lifted[i] = try liftFd(try dupCloexec(fd));
+                // One syscall, no intermediate fd to leak on failure.
+                lifted[i] = try dupCloexecAbove(fd, 3);
                 args.stdio_src[i] = lifted[i];
             } else args.stdio_src[i] = fd;
         },
@@ -233,7 +243,10 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
 
     // Block every signal across the clone (restored in both processes).
     const all = linux.sigfillset();
-    _ = linux.sigprocmask(linux.SIG.SETMASK, &all, &args.old_mask);
+    if (linux.errno(linux.sigprocmask(linux.SIG.SETMASK, &all, &args.old_mask)) != .SUCCESS) {
+        closeFd(ep[1]);
+        return error.Unexpected;
+    }
     const rc = linux.clone(
         childMain,
         @intFromPtr(stack.ptr) + stack.len,
@@ -248,6 +261,7 @@ pub fn spawn(gpa: std.mem.Allocator, opts: Options) Error!posix.pid_t {
     const pid: posix.pid_t = switch (linux.errno(rc)) {
         .SUCCESS => @intCast(@as(isize, @bitCast(rc))),
         .AGAIN, .NOMEM => return error.SystemResources,
+        .NOSYS => return error.OperationUnsupported,
         else => return error.Unexpected,
     };
 
@@ -287,11 +301,12 @@ fn readAll(fd: posix.fd_t, buf: []u8) usize {
     return got;
 }
 
-fn dupCloexec(fd: posix.fd_t) Error!posix.fd_t {
-    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, 0);
+fn dupCloexecAbove(fd: posix.fd_t, min: posix.fd_t) Error!posix.fd_t {
+    const rc = linux.fcntl(fd, linux.F.DUPFD_CLOEXEC, @intCast(min));
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
         .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
         else => error.Unexpected,
     };
 }

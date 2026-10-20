@@ -61,6 +61,17 @@ const go_dir = "modules/procrun/tools/go_bench";
 const cargo_manifest = "modules/procrun/tools/rust_bench/Cargo.toml";
 const gpa = std.heap.smp_allocator;
 
+// Capture buffers come from a heap that KEEPS freed memory between ops, as
+// the Go and Rust sides' heaps do in their own timing loops: with
+// `smp_allocator` every 100 MiB capture got fresh pages back from the OS and
+// paid ~26 000 page faults per op (63 ms vs 28 ms retained) — an artefact of
+// the bench loop, not of procrun. std 0.17's ArenaAllocator is thread-safe over
+// a thread-safe child (the drainer threads allocate while the caller waits).
+var cap_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+fn capAlloc() std.mem.Allocator {
+    return cap_arena.allocator();
+}
+
 const big_bytes: usize = 100 << 20;
 const cat_bytes: usize = 32 << 20;
 const small_cap: usize = 1024;
@@ -99,7 +110,7 @@ fn fail(what: []const u8, e: anyerror) noreturn {
 fn bigProducer(io: std.Io, cap: usize) procrun.Output {
     var digits: [24]u8 = undefined;
     const count_arg = std.fmt.bufPrint(&digits, "{d}", .{big_bytes}) catch unreachable;
-    return procrun.run(gpa, io, .{
+    return procrun.run(capAlloc(), io, .{
         .argv = &.{ "/usr/bin/head", "-c", count_arg, "/dev/zero" },
         .stdin = .ignore,
         .stdout = .pipe,
@@ -118,18 +129,24 @@ fn once(x: *Ctx) usize {
         },
         .capture_100m => {
             var out = bigProducer(io, 128 << 20);
-            defer out.deinit(gpa);
+            defer {
+                out.deinit(capAlloc());
+                _ = cap_arena.reset(.retain_capacity);
+            }
             return out.stdout.len;
         },
         .cat_roundtrip => {
-            var out = procrun.run(gpa, io, .{
+            var out = procrun.run(capAlloc(), io, .{
                 .argv = &.{"/bin/cat"},
                 .stdin = .pipe,
                 .stdout = .pipe,
                 .stderr = .ignore,
                 .max_output_bytes = 64 << 20,
             }, x.cat_input) catch |e| fail("cat", e);
-            defer out.deinit(gpa);
+            defer {
+                out.deinit(capAlloc());
+                _ = cap_arena.reset(.retain_capacity);
+            }
             if (out.stdout.len != x.cat_input.len) std.debug.panic("{s}: cat returned {d} bytes", .{ bench_name, out.stdout.len });
             if (x.cat_sum == null) {
                 if (!std.mem.eql(u8, out.stdout, x.cat_input)) @panic("cat output differs");
@@ -141,7 +158,10 @@ fn once(x: *Ctx) usize {
         },
         .capture_small_cap => {
             var out = bigProducer(io, small_cap);
-            defer out.deinit(gpa);
+            defer {
+                out.deinit(capAlloc());
+                _ = cap_arena.reset(.retain_capacity);
+            }
             if (!out.truncated_stdout) @panic("expected a truncated capture");
             return out.stdout.len;
         },

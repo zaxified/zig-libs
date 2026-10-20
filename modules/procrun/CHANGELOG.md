@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Review fixes for the Linux spawner: `.inherit` falls back to std's spawn when
+  /proc/self/environ cannot be read (chroot/sandbox) instead of an empty child environment; capture pipes
+  256 KiB (1 MiB pipes count against the per-user pipe quota, past which the kernel shrinks every new pipe of
+  that user); no fd leak when lifting a low stdio fd fails; error mapping closer to std; the saved signal
+  mask is initialised and checked. Bench: 0.54–1.04× Go os/exec. Card: grade 3 → 2.
 - **2026-10-20** — **Linux spawns with `clone(CLONE_VM | CLONE_VFORK)`** (`src/vfork_spawn.zig`, structure ported
   from musl's posix_spawn — NOTICE) instead of std's `fork()`: a spawn no longer costs time proportional to
   this process's mapped memory (std: 0.65 ms at 0 MiB, 7.5 ms at 128 MiB, 31 ms at 512 MiB per `/bin/true`;
