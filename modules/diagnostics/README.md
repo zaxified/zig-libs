@@ -63,8 +63,8 @@ try diag.writeJson(w); // [{"path":…,"file":…,"line":3,…,"severity":"warni
 (`col` in bytes), `end_line`/`end_col` end the span exclusively, as in LSP.
 The renderer escapes control characters in everything it prints (a key name
 carrying an ANSI escape sequence reaches the terminal as `\x1b`), so a
-`short` finding is always one line. Carets line up across tabs and multi-byte
-UTF-8; double-width characters are not accounted for.
+`short` finding is always one line. Carets line up across tabs, multi-byte
+UTF-8 and display widths (see "Width, charset, terminal width" below).
 
 ### Labels, notes, fix-its, colour (2026-10-04)
 
@@ -104,7 +104,7 @@ taken from a finding is escaped the same way with colour on.
 ### Snippet layout (codespan-reporting 0.13.1)
 
 The `snippet` style is the layout of codespan-reporting's "rich" style, ASCII
-charset (the layout code is ported from it, Apache-2.0; see `tools/codespan-goldens/README.md`
+or box-drawing charset (the layout code is ported from it, Apache-2.0; see `tools/codespan-goldens/README.md`
 for the version, the replayed upstream test cases and the known deviations):
 labels on one line share the quoted line with carets, a trailing message and
 hanging messages; a span over several lines is drawn with `/ |` and `\` markers
@@ -129,6 +129,34 @@ try diag.render(w, .{ .style = .snippet, .sources = &src, .tab_width = 4 });
 continuation line); `Label.primary` draws a label as a second primary span.
 No allocation: at most 64 spans and 16 multi-line spans per file are drawn,
 the rest is listed as `--> location: message` lines.
+
+### Width, charset, terminal width, context lines
+
+```zig
+try diag.render(w, .{
+    .style = .snippet,
+    .sources = &src,
+    .chars = .unicode,        // ┌─ │ ╭ ╰ · instead of --> | / \ .
+    .term_width = 100,        // cut quoted lines wider than the terminal around the spans
+    .column = .char,          // the `-->` column counts characters, as codespan and rustc do
+    .before_label_lines = 1,  // context lines around every span
+    .after_label_lines = 1,
+});
+```
+
+Columns are display widths (`diagnostics.charWidth(cp)`, the tables of
+unicode-width 0.2.2): East Asian wide, fullwidth and emoji are two columns,
+combining marks, ZWJ and variation selectors none, ambiguous characters one.
+`Diagnostic.col` stays a byte column; `RenderOptions.column = .char` only
+changes what the `-->` line prints (the character column; `short` always prints
+the column as given). Lines end at `\n` (`\r\n` too); a lone `\r`, any
+control character (C0 and C1), U+2028/U+2029 and an invalid UTF-8 byte are
+shown as `?` so no terminal escape can come out of a quoted line, and a BOM is
+not written. With `term_width` the lines of a file are cut by one window chosen
+around its spans (the algorithm of annotate-snippets 0.12), `...` marks a cut
+end, and the carets keep their characters; labels may still run past the width.
+`before_label_lines` / `after_label_lines` are clamped to the source and, like
+in codespan, do not widen the line-number gutter.
 
 ### LSP 3.17 (`hint`, `writeLsp`, `fromLsp`)
 

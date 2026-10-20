@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Display width, line endings, terminal width, charsets, context (S2 R5/R6/R7/R9/R10).
+  `charWidth` from a table generated from unicode-width 0.2.2 (CJK/emoji 2, combining 0); carets and
+  columns use it. Lines end at `\n`/`\r\n` only; lone CR, U+2028/9, C0/C1/DEL and invalid UTF-8 render as
+  `?` — **a C1 control (e.g. U+009B, an escape in some terminals) was written raw before**; a BOM takes no
+  column. `RenderOptions.term_width` cuts long lines around the span like annotate-snippets 0.12;
+  `chars = .unicode` (codespan box drawing); `before_label_lines`/`after_label_lines`; `column = .char`
+  (codespan's character column; default stays `.byte`). All 16 codespan snapshots now byte-identical in
+  both charsets. Ports: annotate-snippets, unicode-width (MIT option) — NOTICE.
 - **2026-10-20** — LSP 3.17 both ways (S2 R3) and a `hint` severity (S2 R8, owner OK).
   `writeLsp`/`writeLspArray` (range, severity 1..4, code, codeDescription, source, tags,
   relatedInformation from labels; `LspOptions.uri_prefix`), `fromLsp`; `lspCharacter`/`byteColumn` convert

@@ -12,7 +12,7 @@
 
 **Performance:** not measured
 
-**Evidence:** model — codespan-reporting 0.13.1's own snapshots replayed (`src/codespan_test.zig`): 13 of 16 cases byte-identical, 3 listed deviations (R5 widths ×2, R10 context lines)
+**Evidence:** model — codespan-reporting 0.13.1's own snapshots replayed (`src/codespan_test.zig`): all 16 cases byte-identical in both charsets (ASCII and box drawing); the width table is the unicode-width 0.2.2 crate's, checked against it over all 1 112 064 code points
 
 **Known defects:** none recorded
 
@@ -123,12 +123,12 @@ also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), 
 | R2 | Multi-line spans with start/end markers (`/ \|`); non-overlapping first | S-M (L for overlaps) | **DONE 2026-10-20** — overlapping too (`multiline_overlapping` identical) |
 | R3 | LSP both ways: 0-based UTF-16 `character`, relatedInformation, codeDescription, tags, data, source, TextEdit; `fromLsp` | M | **DONE 2026-10-20** — `writeLsp`/`writeLspArray`/`fromLsp`, `lspCharacter`/`byteColumn` (utf8/16/32), `Tag` |
 | R4 | Line index instead of re-splitting the source per label (O(N·F) today, `sourceLine` root.zig:468) | S | **DONE 2026-10-20** — `Source.line_starts` + `Source.indexLines`; without it a memchr scan |
-| R5 | Display width: `tab_width`, East-Asian wide / combining / zero-width | M | do (small range table) |
-| R6 | Line endings: lone CR, U+2028/9, BOM | S | do |
-| R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | do |
+| R5 | Display width: `tab_width`, East-Asian wide / combining / zero-width | M | **DONE 2026-10-20** |
+| R6 | Line endings: lone CR, U+2028/9, BOM | S | **DONE 2026-10-20** |
+| R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | **DONE 2026-10-20** |
 | R8 | `hint` severity | S + repin | **DONE 2026-10-20** (owner OK) — source-breaking for an exhaustive switch |
-| R9 | Unicode box charset, codespan medium/short styles | S | do |
-| R10 | Context lines before/after | S | on request |
+| R9 | Unicode box charset, codespan medium/short styles | S | **DONE 2026-10-20** |
+| R10 | Context lines before/after | S | **DONE 2026-10-20** |
 | R11 | Diff-style suggestion rendering (annotate-snippets `Patch`) | M | later |
 | R13 | `expr_off`/`expr_len` documented but never rendered | S | **DONE** — doc corrected (they index the expression text, not a source line) |
 

@@ -8,9 +8,12 @@
 //! text: the upstream insta snapshots, ASCII charset, no colour, via
 //! `codespan_vectors.zig` (generated, see tools/codespan-goldens/README.md).
 //!
-//! Every case is either byte-identical (after the two normalisations below) or
-//! listed in `deviations` with the reason; a deviation case is still rendered
-//! (no crash, no leak, bounded) but not compared.
+//! Every case is replayed in both charsets (`rich_ascii_no_color` and
+//! `rich_no_color` snapshots) and is either byte-identical (after the two
+//! normalisations below) or listed in `deviations` with the reason; a deviation
+//! case is still rendered (no crash, no leak, bounded) but not compared. There
+//! are none at present. The `-->` column is rendered with `.column = .char`
+//! (codespan prints a character column).
 //!
 //! Normalisations (both applied to the expected text only):
 //!   - trailing newlines are ignored (insta trims them);
@@ -57,6 +60,8 @@ const Case = struct {
     diags: []const Cs,
     start_context_lines: u32 = 3,
     end_context_lines: u32 = 1,
+    before_label_lines: u32 = 0,
+    after_label_lines: u32 = 0,
 };
 
 /// 1-based line and byte column of a byte offset.
@@ -118,7 +123,7 @@ fn convert(arena: std.mem.Allocator, files: []const File, cs: Cs) !dg.Diagnostic
 }
 
 /// Our output for every diagnostic of the case, concatenated.
-fn renderCase(arena: std.mem.Allocator, c: Case) ![]u8 {
+fn renderCase(arena: std.mem.Allocator, c: Case, chars: dg.CharSet) ![]u8 {
     const sources = try arena.alloc(dg.Source, c.files.len);
     for (c.files, sources) |f, *s| s.* = .{ .file = f.name, .text = f.text };
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -129,6 +134,10 @@ fn renderCase(arena: std.mem.Allocator, c: Case) ![]u8 {
             .sources = sources,
             .start_context_lines = c.start_context_lines,
             .end_context_lines = c.end_context_lines,
+            .before_label_lines = c.before_label_lines,
+            .after_label_lines = c.after_label_lines,
+            .chars = chars,
+            .column = .char,
         });
     }
     return out.written();
@@ -161,8 +170,8 @@ fn normalise(arena: std.mem.Allocator, expected: []const u8) ![]u8 {
     return out.items;
 }
 
-fn expectedOf(name: []const u8) []const u8 {
-    for (vectors) |v| if (std.mem.eql(u8, v.name, name)) return v.expected;
+fn expectedOf(name: []const u8, chars: dg.CharSet) []const u8 {
+    for (vectors) |v| if (std.mem.eql(u8, v.name, name)) return if (chars == .ascii) v.ascii else v.box;
     @panic("no vector for case");
 }
 
@@ -574,6 +583,8 @@ const unicode_spans: Case = .{
 
 const surrounding_lines: Case = .{
     .name = "surrounding_lines",
+    .before_label_lines = 2,
+    .after_label_lines = 1,
     .files = &.{.{ .name = "surroundingLines.fun", .text =
     \\#[foo]
     \\fn main() {
@@ -602,38 +613,35 @@ const cases = [_]Case{
 };
 
 /// Case -> why it is not byte-identical. Kept in step with
-/// tools/codespan-goldens/README.md.
-const deviations = [_]struct { name: []const u8, why: []const u8 }{
-    .{ .name = "unicode", .why = "R5: no East-Asian wide / zero-width combining characters, every code point is one column" },
-    .{ .name = "unicode_spans", .why = "R5 (emoji are two columns upstream) and spans that start or end inside a code point" },
-    .{ .name = "surrounding_lines", .why = "R10: before_label_lines / after_label_lines context is not ported" },
-};
+/// tools/codespan-goldens/README.md. Empty: every case replays exactly, in
+/// both charsets.
+const deviations = [_]struct { name: []const u8, why: []const u8 }{};
 
 fn deviation(name: []const u8) ?[]const u8 {
     for (deviations) |d| if (std.mem.eql(u8, d.name, name)) return d.why;
     return null;
 }
 
-test "codespan-reporting 0.13.1 cases render byte-identically (deviations listed)" {
+test "codespan-reporting 0.13.1 cases render byte-identically, ASCII and box drawing (deviations listed)" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var failed: usize = 0;
     var compared: usize = 0;
-    for (cases) |c| {
-        const got = try renderCase(arena, c);
+    for ([_]dg.CharSet{ .ascii, .unicode }) |chars| for (cases) |c| {
+        const got = try renderCase(arena, c, chars);
         if (deviation(c.name) != null) continue;
         compared += 1;
-        const want = try normalise(arena, expectedOf(c.name));
+        const want = try normalise(arena, expectedOf(c.name, chars));
         const a = std.mem.trimEnd(u8, got, "\n");
         const b = std.mem.trimEnd(u8, want, "\n");
         if (!std.mem.eql(u8, a, b)) {
             failed += 1;
-            std.debug.print("\n=== {s}: expected\n{s}\n=== found\n{s}\n", .{ c.name, b, a });
+            std.debug.print("\n=== {s} ({s}): expected\n{s}\n=== found\n{s}\n", .{ c.name, @tagName(chars), b, a });
         }
-    }
+    };
     try std.testing.expectEqual(@as(usize, 0), failed);
-    try std.testing.expectEqual(cases.len - deviations.len, compared);
+    try std.testing.expectEqual(2 * (cases.len - deviations.len), compared);
 }
 
 // ── bounds, hostile text, random spans ───────────────────────────────────────
@@ -718,6 +726,8 @@ test "random spans: no crash, no raw escape, colour only adds SGR sequences, bou
         "\tx\xC3\xA9y\r\nline2\n\nline4 \x1b[2J\n",
         "abc\xFF\xC3\nz",
         "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n",
+        "\xEF\xBB\xBF\xE8\xB7\xAF\xE6\xBF\xAB\xF0\x9F\x90\x84e\xCC\x81\xE2\x80\xA8\xC2\x9B\rx\nsecond \xE8\xB7\xAF line\n\tthird\n",
+        "a long line of text that is wider than the narrow terminals below, to be cut around the spans, 0123456789\nshort\n",
     };
     const msgs = [_][]const u8{ "", "m", "msg\nx\x1b", "a longer message that hangs" };
     var labels: [90]dg.Label = undefined;
@@ -756,6 +766,11 @@ test "random spans: no crash, no raw escape, colour only adds SGR sequences, bou
             .tab_width = rnd.uintLessThan(u8, 9),
             .start_context_lines = rnd.uintLessThan(u32, 4),
             .end_context_lines = rnd.uintLessThan(u32, 4),
+            .before_label_lines = rnd.uintLessThan(u32, 3),
+            .after_label_lines = rnd.uintLessThan(u32, 3),
+            .chars = if (rnd.boolean()) .ascii else .unicode,
+            .term_width = if (rnd.boolean()) null else rnd.uintLessThan(u16, 70),
+            .column = if (rnd.boolean()) .byte else .char,
         };
         const plain = try render(std.testing.allocator, d, o);
         defer std.testing.allocator.free(plain);
@@ -764,6 +779,8 @@ test "random spans: no crash, no raw escape, colour only adds SGR sequences, bou
         const col = try render(std.testing.allocator, d, oc);
         defer std.testing.allocator.free(col);
         try std.testing.expect(std.mem.findScalar(u8, plain, 0x1b) == null);
+        // No C1 control (U+0080..U+009F, UTF-8 C2 80..C2 9F) reaches the terminal.
+        for (plain[0..plain.len -| 1], plain[1..]) |a, b| try std.testing.expect(!(a == 0xC2 and b >= 0x80 and b <= 0x9F));
         try std.testing.expect(std.mem.endsWith(u8, plain, "\n\n"));
         var stripped: std.ArrayList(u8) = .empty;
         defer stripped.deinit(std.testing.allocator);

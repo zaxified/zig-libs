@@ -16,6 +16,7 @@
 //! Provenance: original work of the zig-libs authors (MIT). See ../README.md.
 
 const std = @import("std");
+const width_table = @import("width_table.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -261,7 +262,30 @@ pub const RenderOptions = struct {
     /// and `end_context_lines`).
     start_context_lines: u32 = 3,
     end_context_lines: u32 = 1,
+    /// Lines quoted before / after every span, whatever the span's size
+    /// (codespan's `before_label_lines` and `after_label_lines`). They are
+    /// clamped to the source, and do not widen the line-number gutter.
+    before_label_lines: u32 = 0,
+    after_label_lines: u32 = 0,
+    /// The drawing characters: ASCII (`-->`, `|`, `/`) or Unicode box
+    /// drawing (`┌─`, `│`, `╭`, `╰`, `·`), codespan's `Chars::ascii()` and
+    /// `Chars::box_drawing()`.
+    chars: CharSet = .ascii,
+    /// Terminal width in columns. When set, a quoted line wider than what is
+    /// left of it after the gutter is cut around the spans, `...` marking the
+    /// cut ends and the carets staying under their characters (the
+    /// annotate-snippets algorithm). Null: lines are never cut.
+    term_width: ?u16 = null,
+    /// The unit of the column in the `-->` line of `snippet`, when its source
+    /// is known. `byte` prints the `col` given (a byte column); `char` prints
+    /// the column of the character, as codespan and rustc do: the number of
+    /// characters wholly before the byte, plus one (a leading BOM is not
+    /// counted). `short` always prints the column as given.
+    column: ColumnUnit = .byte,
 };
+
+pub const CharSet = enum { ascii, unicode };
+pub const ColumnUnit = enum { byte, char };
 
 const Sgr = struct {
     on: bool,
@@ -314,8 +338,11 @@ fn digits(n: u32) usize {
 /// validated and are printed to a terminal: a key name carrying an escape
 /// sequence must not reach it raw, and a `short` finding must stay one line.
 /// In `snippet` a tab is shown as spaces up to the next multiple of
-/// `tab_width` and carets line up for multi-byte UTF-8 (one column per code
-/// point); double-width and combining characters are not accounted for.
+/// `tab_width` and carets line up for multi-byte UTF-8 by display width
+/// (`charWidth`: East Asian wide and emoji are two columns, combining marks and
+/// zero-width characters none). Lines end at `\n` (a `\r` before it is part of
+/// the break); a lone `\r`, a C0/C1 control, U+2028/U+2029 and an invalid
+/// byte are shown as `?`; a U+FEFF is not written.
 pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.Writer.Error!void {
     const c: Sgr = .{ .on = opts.color };
     switch (opts.style) {
@@ -365,10 +392,13 @@ pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.W
 //                          caret_pointers and the multi-line label pieces
 //   src/term/config.rs     Chars::ascii()
 //
-// Not ported: colour themes (we colour the module's own parts only), the
-// `before_label_lines`/`after_label_lines` context (backlog R10),
-// East-Asian wide / combining characters (backlog R5: every character is one
-// column, a tab is `tab_width` aligned).
+// Also ported: `before_label_lines`/`after_label_lines`, `Chars::box_drawing()`,
+// and unicode-width's per-character widths (width_table.zig, generated); the
+// `term_width` cut is annotate-snippets 0.12.17's `Margin` (margin.rs) and the
+// placeholder of its `draw_line` (graphics.rs).
+//
+// Not ported: colour themes (we colour the module's own parts only), codespan's
+// `medium`/`short` display styles.
 //
 // Memory: no allocation. Everything lives in fixed arrays on the stack:
 //   - at most `max_labels` (64) spans take part (the primary one and the first
@@ -434,10 +464,48 @@ const Single = struct { primary: bool, start: usize, end: usize, msg: []const u8
 const MultiKind = enum { top, left, bottom };
 const MultiEnt = struct { col: u8, primary: bool, kind: MultiKind, pos: usize, msg: []const u8 };
 
-const Chr = struct { idx: usize, len: usize, width: usize };
+const Chr = struct { idx: usize, len: usize, width: usize, cp: u21, valid: bool };
+
+// ported from unicode-rs/unicode-width 0.2.2 src/tables.rs (MIT OR Apache-2.0)
+// via the generated width_table.zig: `UnicodeWidthChar::width`, ambiguous narrow.
+/// Display columns of a printable code point: 0 for combining marks, variation
+/// selectors, ZWJ and other zero-width characters, 2 for East Asian Wide /
+/// Fullwidth and emoji presentation, 1 otherwise. (Controls have no width in
+/// the crate; the renderer shows them as `?`, one column: see `cpWidth`.)
+pub fn charWidth(cp: u21) u2 {
+    if (cp < 0x7f) return if (cp >= 0x20) 1 else 0;
+    if (cp < 0xa0) return 0;
+    var lo: usize = 0;
+    var hi: usize = width_table.ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const r = width_table.ranges[mid];
+        if (cp < r.lo) {
+            hi = mid;
+        } else if (cp > r.hi) {
+            lo = mid + 1;
+        } else return r.w;
+    }
+    return 1;
+}
+
+/// Characters the quoted source shows as `?`: C0/C1 controls (a C1 control such
+/// as U+009B is a terminal escape in some terminals), DEL, and the line and
+/// paragraph separators U+2028/U+2029.
+fn isShownAsQuestion(cp: u21) bool {
+    return cp < 0x20 or (cp >= 0x7f and cp < 0xa0) or cp == 0x2028 or cp == 0x2029;
+}
+
+/// The columns a character takes in the quoted source (`?` for what
+/// `isShownAsQuestion`, nothing for U+FEFF, else `charWidth`).
+fn cpWidth(cp: u21) usize {
+    if (isShownAsQuestion(cp)) return 1;
+    return charWidth(cp);
+}
 
 /// UTF-8 characters of a line with the tab-aware display width
-/// (codespan's `char_metrics`); an invalid byte is one character.
+/// (codespan's `char_metrics`, widths from `charWidth`); an invalid byte is one
+/// character of one column, shown as `?`.
 const CharIter = struct {
     text: []const u8,
     tab: usize,
@@ -448,19 +516,47 @@ const CharIter = struct {
         if (self.i >= self.text.len) return null;
         const b = self.text[self.i];
         var len: usize = 1;
+        var cp: u21 = b;
+        var valid = b < 0x80;
         if (b >= 0x80) blk: {
             const n = std.unicode.utf8ByteSequenceLength(b) catch break :blk;
             if (self.i + n > self.text.len) break :blk;
-            for (self.text[self.i + 1 .. self.i + n]) |cb| if (cb & 0xC0 != 0x80) break :blk;
+            cp = std.unicode.utf8Decode(self.text[self.i..][0..n]) catch break :blk;
             len = n;
+            valid = true;
         }
-        const width: usize = if (b == '\t') (if (self.tab == 0) 0 else self.tab - self.col % self.tab) else 1;
-        const r: Chr = .{ .idx = self.i, .len = len, .width = width };
+        const width: usize = if (b == '\t')
+            (if (self.tab == 0) 0 else self.tab - self.col % self.tab)
+        else if (valid) cpWidth(cp) else 1;
+        const r: Chr = .{ .idx = self.i, .len = len, .width = width, .cp = cp, .valid = valid };
         self.i += len;
         self.col += width;
         return r;
     }
 };
+
+/// Display columns of `text` (tabs aligned from column 0).
+fn lineWidth(text: []const u8, tab: usize) usize {
+    var it: CharIter = .{ .text = text, .tab = tab };
+    while (it.next()) |_| {}
+    return it.col;
+}
+
+/// The 1-based character column of the 1-based byte column `byte_col`
+/// (codespan's `column_index`: the characters wholly before the byte, so a
+/// byte inside a character counts that character as not yet reached). A
+/// BOM opening line 1 is not a character.
+fn charColumn(text: []const u8, byte_col: u32, first_line: bool) u32 {
+    const off = @min(@as(usize, byte_col) -| 1, text.len);
+    var it: CharIter = .{ .text = text, .tab = 0 };
+    var n: u32 = 0;
+    while (it.next()) |ch| {
+        if (ch.idx + ch.len > off) break;
+        if (first_line and ch.idx == 0 and ch.cp == 0xFEFF and ch.valid) continue;
+        n += 1;
+    }
+    return n + 1;
+}
 
 fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) bool {
     return @max(a0, b0) < @min(a1, b1);
@@ -487,12 +583,17 @@ fn styleAt(singles: []const Single, a: usize, b: usize) ?bool {
 /// The first line >= `from` of group `g` that is shown: the line of a
 /// single-line span, the first and last line of a multi-line one, its
 /// `start_context_lines` after the first and `end_context_lines` before the
-/// last.
-fn nextShown(labs: []const Lab, g: usize, from: u32, o: RenderOptions) ?u32 {
+/// last, and `before_label_lines` / `after_label_lines` around every span.
+fn nextShown(labs: []const Lab, g: usize, src: *const Source, from: u32, o: RenderOptions) ?u32 {
     var best: ?u32 = null;
     for (labs) |l| {
         if (l.kind != .snippet or l.group != g) continue;
         considerLine(&best, from, l.sl, l.sl);
+        // The context lines around the span (`before_label_lines`,
+        // `after_label_lines`); a line past the end of the source is none.
+        considerLine(&best, from, @max(1, l.sl -| o.before_label_lines), l.sl -| 1);
+        const after_from = @max(l.el +| 1, from);
+        if (after_from <= l.el +| o.after_label_lines and lineIn(src, after_from) != null) considerLine(&best, from, l.el +| 1, l.el +| o.after_label_lines);
         if (!l.isMulti()) continue;
         considerLine(&best, from, l.el, l.el);
         const a = l.sl + 1;
@@ -510,13 +611,167 @@ fn considerLine(best: *?u32, from: u32, a: u32, b: u32) void {
     if (best.* == null or x < best.*.?) best.* = x;
 }
 
+// ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/config.rs (Chars::ascii, Chars::box_drawing)
+const Chars = struct {
+    snippet_start: []const u8,
+    border_left: []const u8,
+    border_break: []const u8,
+    multi_top_left: []const u8,
+    multi_top: []const u8,
+    multi_bottom_left: []const u8,
+    multi_bottom: []const u8,
+    multi_left: []const u8,
+    pointer_left: []const u8,
+};
+
+const ascii_chars: Chars = .{
+    .snippet_start = "-->",
+    .border_left = "|",
+    .border_break = ".",
+    .multi_top_left = "/",
+    .multi_top = "-",
+    .multi_bottom_left = "\\",
+    .multi_bottom = "-",
+    .multi_left = "|",
+    .pointer_left = "|",
+};
+
+const box_chars: Chars = .{
+    .snippet_start = "\u{250c}\u{2500}",
+    .border_left = "\u{2502}",
+    .border_break = "\u{b7}",
+    .multi_top_left = "\u{256d}",
+    .multi_top = "\u{2500}",
+    .multi_bottom_left = "\u{2570}",
+    .multi_bottom = "\u{2500}",
+    .multi_left = "\u{2502}",
+    .pointer_left = "\u{2502}",
+};
+
+// ported from rust-lang/annotate-snippets-rs 0.12.17 (MIT OR Apache-2.0) src/renderer/margin.rs
+/// Which columns of the quoted lines of one file are kept when they are wider
+/// than the terminal: one window for all of them, chosen around the spans.
+const Margin = struct {
+    /// The whitespace before the left-most span that can be consumed.
+    whitespace_left: usize,
+    /// The column where the left-most span begins / the right-most ends.
+    span_left: usize,
+    span_right: usize,
+    computed_left: usize = 0,
+    computed_right: usize = 0,
+    term_width: usize,
+    /// The end column of the right-most label, its text included.
+    label_right: usize,
+
+    const ellipsis_passing = 6;
+    const long_whitespace = 20;
+    const long_whitespace_padding = 4;
+
+    fn init(whitespace_left: usize, span_left: usize, span_right: usize, label_right: usize, term_width: usize, max_line_len: usize) Margin {
+        // Whitespace before the left-most span only: an annotation of
+        // whitespace is not trimmed away.
+        const ws = @min(whitespace_left, span_left);
+        // The 6 is room for the `...`.
+        var m: Margin = .{
+            .whitespace_left = ws -| ellipsis_passing,
+            .span_left = span_left -| ellipsis_passing,
+            .span_right = span_right + ellipsis_passing,
+            .term_width = term_width,
+            .label_right = label_right + ellipsis_passing,
+        };
+        m.compute(max_line_len);
+        return m;
+    }
+
+    fn compute(m: *Margin, max_line_len: usize) void {
+        // A lot of whitespace (> 20) is useless, trim it.
+        m.computed_left = if (m.whitespace_left > long_whitespace) m.whitespace_left - (long_whitespace - long_whitespace_padding) else 0;
+        m.computed_right = @max(max_line_len, m.computed_left);
+        if (m.computed_right - m.computed_left > m.term_width) {
+            if (m.label_right -| m.whitespace_left <= m.term_width and m.label_right >= m.whitespace_left) {
+                // Trimming whitespace is enough.
+                m.computed_left = m.whitespace_left;
+                m.computed_right = m.computed_left + m.term_width;
+            } else if (m.label_right -| m.span_left <= m.term_width) {
+                // The spans and labels fit.
+                const padding_left = (m.term_width - (m.label_right - m.span_left)) / 2;
+                m.computed_left = m.span_left -| padding_left;
+                m.computed_right = m.computed_left + m.term_width;
+            } else if (m.span_right -| m.span_left <= m.term_width) {
+                // The spans fit, with some padding.
+                const padding_left = (m.term_width - (m.span_right - m.span_left)) / 5 * 2;
+                m.computed_left = m.span_left -| padding_left;
+                m.computed_right = m.computed_left + m.term_width;
+            } else {
+                // Give up, but still do not show the whole line.
+                m.computed_left = m.span_left;
+                m.computed_right = m.span_right;
+            }
+        }
+    }
+
+    fn wasCutLeft(m: Margin) bool {
+        return m.computed_left > 0;
+    }
+
+    fn left(m: Margin, line_len: usize) usize {
+        return @min(m.computed_left, line_len);
+    }
+
+    fn right(m: Margin, line_len: usize) usize {
+        if (line_len -| m.computed_left <= m.term_width) return line_len;
+        return @min(line_len, m.computed_right);
+    }
+
+    /// The bytes of `text` this margin keeps, ported from `draw_line`
+    /// (the skipped columns are those before `left`, a wide character
+    /// straddling it is skipped whole).
+    fn window(m: Margin, text: []const u8, tab: usize) Window {
+        const line_len = lineWidth(text, tab);
+        const lft = m.left(line_len);
+        const rgt = m.right(line_len);
+        var w: Window = .{ .bs = text.len, .be = text.len, .cut_left = m.wasCutLeft(), .cut_right = line_len > rgt };
+        var it: CharIter = .{ .text = text, .tab = tab };
+        var skipped: usize = 0;
+        var taken: usize = 0;
+        var started = false;
+        while (it.next()) |ch| {
+            if (!started) {
+                if (skipped < lft) {
+                    skipped += ch.width;
+                    continue;
+                }
+                started = true;
+                w.bs = ch.idx;
+            }
+            taken += ch.width;
+            if (taken > rgt -| lft) {
+                w.be = ch.idx;
+                break;
+            }
+        }
+        return w;
+    }
+};
+
+/// The part of a quoted line that is drawn when `term_width` cuts it: bytes
+/// `[bs, be)`, and whether `...` replaces the first / last columns of it.
+const Window = struct {
+    bs: usize = 0,
+    be: usize = std.math.maxInt(usize),
+    cut_left: bool = false,
+    cut_right: bool = false,
+};
+
 const Layout = struct {
     w: *std.Io.Writer,
     c: Sgr,
     sev: Severity,
     pad: usize,
     opts: RenderOptions,
+    chars: *const Chars,
     nmulti: usize = 0,
+    margin: ?Margin = null,
 
     const E = std.Io.Writer.Error;
 
@@ -528,8 +783,12 @@ const Layout = struct {
         try l.w.splatByteAll(' ', l.pad + 1);
     }
 
-    fn border(l: *Layout, ch: u8) E!void {
-        try l.w.print("{s}{c}{s}", .{ l.c.blue(), ch, l.c.reset() });
+    fn border(l: *Layout, brk: bool) E!void {
+        try l.w.print("{s}{s}{s}", .{ l.c.blue(), if (brk) l.chars.border_break else l.chars.border_left, l.c.reset() });
+    }
+
+    fn repeat(l: *Layout, s: []const u8, n: usize) E!void {
+        try l.w.splatBytesAll(s, n);
     }
 
     fn innerGutter(l: *Layout, multis: []const MultiEnt) E!void {
@@ -546,51 +805,98 @@ const Layout = struct {
     /// ` |` of a multi-line span, with an underline continued to its left.
     fn multiLeft(l: *Layout, primary: bool, underline: ?Underline) E!void {
         if (underline) |u| {
-            try l.w.print("{s}-{s}", .{ l.mark(u.primary), l.c.reset() });
+            try l.w.print("{s}{s}{s}", .{ l.mark(u.primary), l.chars.multi_top, l.c.reset() });
         } else try l.w.writeByte(' ');
-        try l.w.print("{s}|{s}", .{ l.mark(primary), l.c.reset() });
+        try l.w.print("{s}{s}{s}", .{ l.mark(primary), l.chars.multi_left, l.c.reset() });
     }
 
-    fn multiCorner(l: *Layout, primary: bool, ch: u8) E!void {
-        try l.w.print(" {s}{c}{s}", .{ l.mark(primary), ch, l.c.reset() });
+    fn multiCorner(l: *Layout, primary: bool, corner: []const u8) E!void {
+        try l.w.print(" {s}{s}{s}", .{ l.mark(primary), corner, l.c.reset() });
     }
 
     fn innerGutterColumn(l: *Layout, underline: ?Underline) E!void {
         if (underline) |u| {
-            try l.w.print("{s}--{s}", .{ l.mark(u.primary), l.c.reset() });
+            try l.w.writeAll(l.mark(u.primary));
+            try l.repeat(if (u.top) l.chars.multi_top else l.chars.multi_bottom, 2);
+            try l.w.writeAll(l.c.reset());
         } else try l.w.writeAll("  ");
     }
 
-    /// `   |` and the inner gutter, no text.
-    fn gutterRow(l: *Layout, ch: u8, multis: []const MultiEnt) E!void {
+    /// `   |` (or `   .`) and the inner gutter, no text.
+    fn gutterRow(l: *Layout, brk: bool, multis: []const MultiEnt) E!void {
         try l.outerGutter();
-        try l.border(ch);
+        try l.border(brk);
         try l.innerGutter(multis);
     }
 
     fn emptyRow(l: *Layout) E!void {
-        try l.gutterRow('|', &.{});
+        try l.gutterRow(false, &.{});
         try l.w.writeByte('\n');
     }
 
-    fn writeSource(l: *Layout, text: []const u8) E!void {
+    /// The characters of `text` in the window; the ends cut by `term_width`
+    /// are `...`.
+    // ported from rust-lang/annotate-snippets-rs 0.12.17 src/renderer/graphics.rs (draw_line: the placeholder)
+    fn writeSource(l: *Layout, text: []const u8, win: Window) E!void {
+        // The first characters worth three columns, and the last ones, are
+        // replaced by `...`; the columns the first ones took beyond three
+        // stay blank so the carets keep their place.
+        var lend = win.bs;
+        if (win.cut_left) {
+            try l.w.writeAll("...");
+            var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+            var taken: usize = 0;
+            while (it.next()) |ch| {
+                if (ch.idx < win.bs) continue;
+                if (ch.idx >= win.be or (taken >= 3 and ch.width != 0)) break;
+                taken += ch.width;
+                lend = ch.idx + ch.len;
+            }
+            try l.w.splatByteAll(' ', taken -| 3);
+        }
+        var rstart = win.be;
+        if (win.cut_right) {
+            var total: usize = 0;
+            var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
+            while (it.next()) |ch| {
+                if (ch.idx >= lend and ch.idx < win.be) total += ch.width;
+            }
+            var before: usize = 0;
+            rstart = @min(win.be, text.len);
+            it = .{ .text = text, .tab = l.opts.tab_width };
+            while (it.next()) |ch| {
+                if (ch.idx < lend or ch.idx >= win.be) continue;
+                // The last character that still leaves three columns after it.
+                if (total - before >= 3 and total - before - ch.width < 3) {
+                    rstart = ch.idx;
+                    break;
+                }
+                before += ch.width;
+            }
+            if (total < 3) rstart = lend;
+        }
         var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
         while (it.next()) |ch| {
-            const b = text[ch.idx];
-            if (b == '\t') {
+            if (ch.idx < lend) continue;
+            if (ch.idx >= rstart) break;
+            if (text[ch.idx] == '\t') {
                 try l.w.splatByteAll(' ', ch.width);
-            } else if (b < 0x20 or b == 0x7f) {
+            } else if (!ch.valid or isShownAsQuestion(ch.cp)) {
                 try l.w.writeByte('?');
+            } else if (ch.cp == 0xFEFF) {
+                // Zero columns and invisible: not written.
             } else try l.w.writeAll(text[ch.idx..][0..ch.len]);
         }
+        if (win.cut_right) try l.w.writeAll("...");
     }
 
     // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (caret_pointers)
     /// The vertical lines under the carets that have a hanging message.
-    fn caretPointers(l: *Layout, text: []const u8, singles: []const Single, trailing: ?usize, max_start: usize, limit: usize) E!void {
+    fn caretPointers(l: *Layout, text: []const u8, singles: []const Single, trailing: ?usize, max_start: usize, limit: usize, win: Window) E!void {
         var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
         while (it.next()) |ch| {
-            if (ch.idx >= limit) break;
+            if (ch.idx >= limit or ch.idx >= win.be) break;
+            if (ch.idx < win.bs) continue;
             var style: ?bool = null;
             for (singles, 0..) |s, k| {
                 if (s.msg.len == 0 or trailing == k) continue;
@@ -603,7 +909,7 @@ const Layout = struct {
             }
             var spaces = ch.width;
             if (style) |p| {
-                try l.w.print("{s}|{s}", .{ l.mark(p), l.c.reset() });
+                try l.w.print("{s}{s}{s}", .{ l.mark(p), l.chars.pointer_left, l.c.reset() });
                 spaces -|= 1;
             }
             if (ch.idx <= max_start) try l.w.splatByteAll(' ', spaces);
@@ -611,20 +917,20 @@ const Layout = struct {
     }
 
     // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (render_snippet_source, multi-line parts)
-    fn sourceBlock(l: *Layout, number: u32, text: []const u8, singles: []const Single, multis: []const MultiEnt) E!void {
+    fn sourceBlock(l: *Layout, number: u32, text: []const u8, singles: []const Single, multis: []const MultiEnt, win: Window) E!void {
         const w = l.w;
         const lead = leadingSpace(text);
         // The line.
-        try w.splatByteAll(' ', l.pad - digits(number));
+        try w.splatByteAll(' ', l.pad -| digits(number));
         try w.print("{s}{d}{s} ", .{ l.c.blue(), number, l.c.reset() });
-        try l.border('|');
+        try l.border(false);
         {
             var mi: usize = 0;
             for (0..l.nmulti) |col| {
                 if (mi < multis.len and multis[mi].col == col) {
                     const m = multis[mi];
                     switch (m.kind) {
-                        .top => if (m.pos <= lead) try l.multiCorner(m.primary, '/') else try w.writeAll("  "),
+                        .top => if (m.pos <= lead) try l.multiCorner(m.primary, l.chars.multi_top_left) else try w.writeAll("  "),
                         .left, .bottom => try l.multiLeft(m.primary, null),
                     }
                     mi += 1;
@@ -632,17 +938,17 @@ const Layout = struct {
             }
         }
         try w.writeByte(' ');
-        try l.writeSource(text);
+        try l.writeSource(text, win);
         try w.writeByte('\n');
 
-        if (singles.len > 0) try l.singleRows(text, singles, multis);
+        if (singles.len > 0) try l.singleRows(text, singles, multis, win);
 
         // The top and bottom of multi-line spans.
         for (multis, 0..) |m, mk| {
             if (m.kind == .left) continue;
             if (m.kind == .top and m.pos <= lead) continue;
             try l.outerGutter();
-            try l.border('|');
+            try l.border(false);
             var underline: ?Underline = null;
             var it: usize = 0;
             for (0..l.nmulti) |col| {
@@ -654,13 +960,13 @@ const Layout = struct {
                             try l.multiLeft(e.primary, underline);
                         } else if (mk == it) {
                             underline = .{ .primary = e.primary, .top = true };
-                            try l.multiCorner(m.primary, '/');
+                            try l.multiCorner(m.primary, l.chars.multi_top_left);
                         } else try l.innerGutterColumn(underline),
                         .bottom => if (mk < it) {
                             try l.multiLeft(e.primary, underline);
                         } else if (mk == it) {
                             underline = .{ .primary = e.primary, .top = false };
-                            try l.multiCorner(m.primary, '\\');
+                            try l.multiCorner(m.primary, l.chars.multi_bottom_left);
                         } else try l.innerGutterColumn(underline),
                     }
                     it += 1;
@@ -674,7 +980,8 @@ const Layout = struct {
                 if (m.kind == .top) {
                     if (ch.idx >= m.pos + 1) break;
                 } else if (ch.idx >= m.pos) break;
-                try w.splatByteAll('-', ch.width);
+                if (ch.idx < win.bs) continue;
+                try l.repeat(if (m.kind == .top) l.chars.multi_top else l.chars.multi_bottom, ch.width);
             }
             try w.writeByte(caret);
             try w.writeAll(l.c.reset());
@@ -689,7 +996,7 @@ const Layout = struct {
     // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/renderer.rs (render_snippet_source, single-line labels)
     /// Carets of the single-line labels, a trailing message, and the hanging
     /// messages below.
-    fn singleRows(l: *Layout, text: []const u8, singles: []const Single, multis: []const MultiEnt) E!void {
+    fn singleRows(l: *Layout, text: []const u8, singles: []const Single, multis: []const MultiEnt, win: Window) E!void {
         const w = l.w;
         var num_messages: usize = 0;
         var max_start: usize = 0;
@@ -713,7 +1020,7 @@ const Layout = struct {
         }
 
         // The carets.
-        try l.gutterRow('|', multis);
+        try l.gutterRow(false, multis);
         try w.writeByte(' ');
         var prev: ?bool = null;
         var it: CharIter = .{ .text = text, .tab = l.opts.tab_width };
@@ -721,10 +1028,12 @@ const Layout = struct {
         while (true) {
             // One extra column past the end, so a caret can sit at the end of
             // the line.
-            const ch: Chr = it.next() orelse if (!placeholder) blk: {
+            const ch: Chr = it.next() orelse if (!placeholder and win.be >= text.len) blk: {
                 placeholder = true;
-                break :blk Chr{ .idx = text.len, .len = 1, .width = 1 };
+                break :blk Chr{ .idx = text.len, .len = 1, .width = 1, .cp = 0, .valid = true };
             } else break;
+            if (ch.idx >= win.be and ch.idx < text.len) break;
+            if (ch.idx < win.bs) continue;
             const cur = styleAt(singles, ch.idx, ch.idx + ch.len);
             if (prev != cur) {
                 if (cur) |p| try w.writeAll(l.mark(p)) else try w.writeAll(l.c.reset());
@@ -745,18 +1054,18 @@ const Layout = struct {
         if (hanging == 0) return;
         // The pointers, then each hanging message under its caret, the last
         // label first.
-        try l.gutterRow('|', multis);
+        try l.gutterRow(false, multis);
         try w.writeByte(' ');
-        try l.caretPointers(text, singles, trailing, max_start, std.math.maxInt(usize));
+        try l.caretPointers(text, singles, trailing, max_start, std.math.maxInt(usize), win);
         try w.writeByte('\n');
         var k = singles.len;
         while (k > 0) {
             k -= 1;
             const s = singles[k];
             if (s.msg.len == 0 or trailing == k) continue;
-            try l.gutterRow('|', multis);
+            try l.gutterRow(false, multis);
             try w.writeByte(' ');
-            try l.caretPointers(text, singles, trailing, max_start, s.start);
+            try l.caretPointers(text, singles, trailing, max_start, s.start, win);
             try writeEscaped(w, s.msg);
             try w.writeByte('\n');
         }
@@ -764,7 +1073,7 @@ const Layout = struct {
 
     fn looseLine(l: *Layout, span: Span, msg: []const u8) E!void {
         try l.outerGutter();
-        try l.w.print("{s}-->{s} ", .{ l.c.blue(), l.c.reset() });
+        try l.w.print("{s}{s}{s} ", .{ l.c.blue(), l.chars.snippet_start, l.c.reset() });
         _ = try writeLocation(l.w, span);
         if (msg.len > 0) {
             try l.w.writeAll(": ");
@@ -794,11 +1103,12 @@ const Layout = struct {
         };
         var multis: [max_multi]MultiEnt = undefined;
         const nm = multisOf(labs, g, ln, &multis);
-        try l.sourceBlock(ln, text, singles[0..ns], multis[0..nm]);
+        const win: Window = if (l.margin) |m| m.window(text, l.opts.tab_width) else .{};
+        try l.sourceBlock(ln, text, singles[0..ns], multis[0..nm], win);
     }
 
     fn breakRow(l: *Layout, multis: []const MultiEnt) E!void {
-        try l.gutterRow('.', multis);
+        try l.gutterRow(true, multis);
         try l.w.writeByte('\n');
     }
 };
@@ -820,6 +1130,60 @@ fn multisOf(labs: []const Lab, g: usize, ln: u32, out: *[max_multi]MultiEnt) usi
         n += 1;
     }
     return n;
+}
+
+/// The display column of byte `byte` of `text`: of the character holding it
+/// (`start`), or the end of the characters before it (`!start`, an exclusive end).
+fn colOf(text: []const u8, byte: usize, tab: usize, start: bool) usize {
+    var it: CharIter = .{ .text = text, .tab = tab };
+    while (true) {
+        const before = it.col;
+        const ch = it.next() orelse return it.col;
+        if (if (start) ch.idx + ch.len > byte else ch.idx >= byte) return before;
+    }
+}
+
+// ported from rust-lang/annotate-snippets-rs 0.12.17 src/renderer/graphics.rs (the Margin::new call in draw_snippet)
+/// The `term_width` window of group `g`: over all its shown lines, from the
+/// columns of the spans and of the labels' text.
+fn computeMargin(labs: []const Lab, g: usize, src: *const Source, o: RenderOptions, term_width: u16, code_offset: usize) Margin {
+    const tab: usize = o.tab_width;
+    var ws_left: usize = std.math.maxInt(usize);
+    var span_left: usize = std.math.maxInt(usize);
+    var span_right: usize = 0;
+    var label_right: usize = 0;
+    var max_line_len: usize = 0;
+    var cur = nextShown(labs, g, src, 0, o);
+    while (cur) |ln| : (cur = nextShown(labs, g, src, ln + 1, o)) {
+        const text = lineIn(src, ln) orelse continue;
+        max_line_len = @max(max_line_len, lineWidth(text, tab));
+        var lead: usize = 0;
+        while (lead < text.len and (text[lead] == ' ' or text[lead] == '\t')) lead += 1;
+        if (lead < text.len) {
+            var ws: usize = 0;
+            for (text[0..lead]) |b| ws += if (b == '\t') 4 else 1;
+            ws_left = @min(ws_left, ws);
+        }
+        for (labs) |l| {
+            if (l.kind != .snippet or l.group != g) continue;
+            if (l.sl != ln and l.el != ln) continue;
+            // The span's columns on this line.
+            const a = if (l.sl == ln) colOf(text, l.sc, tab, true) else 0;
+            const b = if (l.el == ln) colOf(text, if (l.sl == ln) @max(l.ec, l.sc + 1) else l.ec, tab, false) else a;
+            if (l.sl == l.el or l.el == ln) {
+                span_left = @min(span_left, @min(a, b));
+                span_right = @max(span_right, @max(a, b));
+                label_right = @max(label_right, b + (if (l.msg.len > 0) lineWidth(l.msg, 4) + 1 else 0));
+            } else {
+                span_left = @min(span_left, a);
+                span_right = @max(span_right, a);
+                label_right = @max(label_right, a);
+            }
+        }
+    }
+    if (ws_left == std.math.maxInt(usize)) ws_left = 0;
+    if (span_left == std.math.maxInt(usize)) span_left = 0;
+    return Margin.init(ws_left, span_left, span_right, label_right, @as(usize, term_width) -| code_offset, max_line_len);
 }
 
 // ported from brendanzab/codespan codespan-reporting 0.13.1 src/term/views.rs (RichDiagnostic::render: files, locus, gaps, border, notes)
@@ -888,7 +1252,7 @@ fn renderSnippet(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions, c: Sgr) 
 
     const notes: []const Note = d.notes orelse &.{};
     const has_after = notes.len > 0 or d.path.len > 0 or d.suggest != null or d.fix != null or d.code_url != null or overflow;
-    var lay: Layout = .{ .w = w, .c = c, .sev = d.severity, .pad = pad, .opts = opts };
+    var lay: Layout = .{ .w = w, .c = c, .sev = d.severity, .pad = pad, .opts = opts, .chars = if (opts.chars == .unicode) &box_chars else &ascii_chars };
 
     for (items[0..ni], 0..) |item, k| {
         if (!item.is_group) {
@@ -909,17 +1273,22 @@ fn renderSnippet(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions, c: Sgr) 
             const o = labs[b];
             if ((!o.primary and l.primary) or (o.primary == l.primary and (o.sl > l.sl or (o.sl == l.sl and o.sc > l.sc)))) best = j;
         }
+        const src = groups[g].src;
+        lay.margin = if (opts.term_width) |tw| computeMargin(labs[0..nl], g, src, opts, tw, pad + 3 + 2 * lay.nmulti) else null;
         try lay.outerGutter();
-        try w.print("{s}-->{s} ", .{ c.blue(), c.reset() });
-        _ = try writeLocation(w, labs[best.?].span);
+        try w.print("{s}{s}{s} ", .{ c.blue(), lay.chars.snippet_start, c.reset() });
+        var locus = labs[best.?].span;
+        if (opts.column == .char) if (locus.line) |ln| if (locus.col) |col| if (lineIn(src, ln)) |t| {
+            locus.col = charColumn(t, col, ln == 1);
+        };
+        _ = try writeLocation(w, locus);
         try w.writeByte('\n');
         try lay.emptyRow();
 
-        const src = groups[g].src;
-        var cur = nextShown(labs[0..nl], g, 0, opts);
+        var cur = nextShown(labs[0..nl], g, src, 0, opts);
         while (cur) |ln| {
             try lay.showLine(labs[0..nl], g, src, ln, true);
-            const nxt = nextShown(labs[0..nl], g, ln + 1, opts);
+            const nxt = nextShown(labs[0..nl], g, src, ln + 1, opts);
             if (nxt) |n| switch (n - ln) {
                 1 => {},
                 // One line between: show it, with the multi-line marks only.
@@ -2013,4 +2382,5 @@ test "note kinds are named, and a hostile code URL is escaped in both styles" {
 test {
     _ = @import("codespan_test.zig");
     _ = @import("lsp_test.zig");
+    _ = @import("render_test.zig");
 }
