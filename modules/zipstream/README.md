@@ -132,28 +132,51 @@ way in, so a zip-slip name (`../..`, absolute, drive-relative) is rejected at
   error) with `EntryReader.crcMismatch()` set, so tampered content is never
   delivered as if it were valid.
 
+## Since 2026-10-20 (S2)
+
+```zig
+// Any positional source: a file (`Archive.init`), memory, or your own.
+var ms: zipstream.MemorySource = .{ .bytes = bytes };
+try archive.initSource(gpa, ms.source(), .{ .list_directories = true, .legacy_names = .cp437 });
+
+// Each EntryReader has its own cursor: several open at once, from several
+// threads (pread). Encrypted entries and other methods:
+try er.open(&archive, entry, &window, .{ .password = "secret" }); // WinZip AES or ZipCrypto
+defer er.deinit(); // needed for methods beyond Store/Deflate (zstd)
+
+// Writing: streamed members (data descriptor), zip64, zstd, AES, comments.
+const w = try zw.beginEntry("big.xml", .{ .method = .zstd, .encryption = .{ .password = "p", .io = io } });
+try w.writeAll(chunk); // … as the data arrives
+try zw.endEntry();
+try zw.addDirectory("docs", .{});
+try zw.addSymlink("docs/latest", "v2.txt", .{});
+zw.comment = "built 2026-10-20";
+
+// Extraction with a zip-slip guard, a total-size cap and a symlink policy.
+try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_total = 1 << 32 });
+```
+
+- **zip64** read and write (automatic past 4 GiB / 65 534 entries;
+  `force_zip64`; `allow_zip64 = false` restores the classic-only refusal).
+- **Methods:** Store, Deflate, Zstandard (93, via `zstd`); any other through a
+  `Codec` (`Archive.Options.codecs`, `AddEntryOptions.codec`) — Go's
+  `RegisterDecompressor`.
+- **Encryption:** WinZip AES-128/192/256 read (AE-1/AE-2) and write (AE-2);
+  ZipCrypto read only (broken, never written). Checked against 7-Zip and
+  Info-ZIP (`tools/crypto_fixtures.sh`).
+- **Entries:** comments (entry and archive), raw extra field, directories
+  (`list_directories`), symlinks (`isSymlink`), Info-ZIP Unicode Path names,
+  optional CP437 decoding of legacy names.
+- **Speed:** CRC-32 via the hardware-backed `crc32` module; 0.31–1.07× Go
+  `archive/zip` (`zig build bench-zipstream`).
+
 ## Ceiling (documented, not a bug)
 
-- **zip64 reading is supported** (archives/entries over 4 GiB, or archives
-  with more than 65535 central-directory records): the zip64 end record and
-  locator and each entry's zip64 extra field are resolved by this module's
-  own central-directory walk.
-  **zip64 *writing* is not implemented** — `ArchiveWriter` emits classic
-  (non-zip64) archives only, and returns `Error.ZipWriteTooLarge` rather than
-  silently truncating a field that would overflow the 32/16-bit format.
-- **No encrypted entries** — listed (`Entry.encrypted`), refused when opened
-  (`error.ZipEncryptedEntry`); `ArchiveWriter` doesn't offer encryption either.
-- **Store + Deflate only** — the two methods ordinary zip tools and Excel
-  emit, for both reading and writing. An entry with any other method (bzip2,
-  LZMA, ...) is listed and refused when opened
-  (`error.UnsupportedCompressionMethod`); the rest of the archive stays readable.
-
-## Deferred (not built)
-
-- zip64 **writing** (reading is fully supported — see "Ceiling" above)
-- Encrypted entries (no consumer needs them; legacy ZipCrypto is
-  cryptographically broken and not worth adding even read-only)
-- Compression methods beyond Store/Deflate (bzip2, LZMA, ...)
+- bzip2 (12) and LZMA (14) / XZ (95) are not built in yet (owner 2026-10-20:
+  new modules `bzip2`, `lzma` will plug in as codecs); until then they are
+  listed and refused (`error.UnsupportedCompressionMethod`), or a consumer
+  registers its own `Codec`.
+- No in-place editing of an existing archive (append, delete, rename).
 
 ## Testing
 

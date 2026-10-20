@@ -19,8 +19,19 @@
 //!    requiring the identical bytes: a field Go misread would not reproduce
 //!    them.
 //!
-//! Directory entries (a name ending in '/') are left out of Go's list before
-//! comparing: this module skips them by design (module doc).
+//! Every table is compared with `list_directories = true`, so directory
+//! entries (a name ending in '/') are compared like the rest; the default
+//! (skipping them, module doc) is checked against the same list with them
+//! left out.
+//!
+//! The replay of `go_write` is exact: Go's view of each entry (kind from the
+//! directory/symlink/data-descriptor bits, comment, caller extra, zip64) is
+//! written again and the archive must come out byte for byte. The one thing
+//! it cannot take from Go's view is the caller's extra records: Go reports the
+//! whole central extra field, so the module's own records (`UT`, the zip64
+//! extra) are stripped from it -- by id, the first `UT` and every zip64 record
+//! -- and the rest is what is passed as `AddEntryOptions.extra`; a stripped
+//! record that was not ours would show as a byte difference.
 //!
 //! Go is an oracle, not an authority. Every place we answer differently is
 //! listed in `divergences` with the judgement; a case that diverges without
@@ -39,6 +50,13 @@ const Divergence = struct { id: []const u8, why: []const u8 };
 const divergences = [_]Divergence{
     .{ .id = "go_basic", .why = "Go's Writer left the DOS date 0 (no Modified given); see dos_zero_date" },
     .{ .id = "go_raw", .why = "CreateRaw leaves the DOS date 0 as well; see dos_zero_date" },
+    .{ .id = "go_create_plain", .why = "Create (no Modified) writes the DOS date 0 as well; see dos_zero_date" },
+    .{ .id = "go_extra", .why = "its second entry has no Modified: DOS date 0; see dos_zero_date" },
+    .{ .id = "go_zip64_raw", .why = "CreateRaw writes the header's DOS fields as given (zero), whatever Modified says; see dos_zero_date" },
+    .{ .id = "go_dirs_symlinks", .why = "its entry 'modedir' (no trailing '/', Mode() = ModeDir): Go calls an entry a directory by its mode, this module by the trailing '/' (APPNOTE 4.3.8, Python ZipInfo.is_dir); the attributes stay visible in Entry.external_attributes" },
+    .{ .id = "unix_dir_attr_file_name", .why = "Unix directory attributes on a name without '/': Go says directory, this module decides by the name (see go_dirs_symlinks); Entry.external_attributes keeps them" },
+    .{ .id = "dos_dir_attr", .why = "the MS-DOS directory attribute (0x10) on a name without '/': as unix_dir_attr_file_name" },
+    .{ .id = "dir_entry_with_content", .why = "a directory entry ('d/') that carries 6 bytes of data: Go refuses the whole archive; this module lists it (list_directories) and reads the bytes, never hiding a member" },
     .{ .id = "dos_zero_date", .why = "DOS date 0 is month 0, day 0: no date. Go normalises it to 1979-11-30, zipinfo prints 1980-00-00; Entry.mtime is null (documented)" },
     .{ .id = "dos_month13", .why = "an invalid DOS date: Go rolls it into the next year, zipinfo prints month 13; null here" },
     .{ .id = "dos_feb30", .why = "an invalid DOS date: Go rolls it into March; null here" },
@@ -69,12 +87,28 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
     defer file.close(io);
 
     var archive: zipstream.Archive = undefined;
-    archive.init(io, gpa, file) catch |err| {
+    archive.initOpts(io, gpa, file, .{ .list_directories = true }) catch |err| {
         if (c.err == null) return why.print("ours: Archive.init error.{t}; go: {d} entries", .{ err, c.entries.len });
         return;
     };
     defer archive.deinit();
     if (c.err) |e| return why.print("ours: {d} entries; go: \"{s}\"", .{ archive.entries.items.len, e });
+    if (!std.mem.eql(u8, archive.comment, c.comment)) return why.print("archive comment: ours \"{s}\", go \"{s}\"", .{ archive.comment, c.comment });
+
+    // The default skips directories: it is the same list without them.
+    {
+        var plain: zipstream.Archive = undefined;
+        try plain.initOpts(io, gpa, file, .{});
+        defer plain.deinit();
+        var k: usize = 0;
+        for (archive.entries.items) |*e| {
+            if (e.is_directory) continue;
+            if (k == plain.entries.items.len or !std.mem.eql(u8, plain.entries.items[k].name, e.name))
+                return why.print("default listing differs from list_directories minus directories at \"{s}\"", .{e.name});
+            k += 1;
+        }
+        if (k != plain.entries.items.len) return why.print("default listing has {d} entries, list_directories minus directories {d}", .{ plain.entries.items.len, k });
+    }
 
     var gi: usize = 0;
     var oi: usize = 0;
@@ -86,7 +120,6 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
         gi += 1;
         oi += 1;
     }) {
-        while (gi < c.entries.len and std.mem.endsWith(u8, c.entries[gi].name, "/")) gi += 1;
         const go_done = gi == c.entries.len;
         const ours_done = oi == archive.entries.items.len;
         if (go_done and ours_done) return;
@@ -101,6 +134,16 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
             return why.print("entry {d} sizes: ours {d}/{d}, go {d}/{d}", .{ oi, o.compressed_size, o.uncompressed_size, g.compressed_size, g.uncompressed_size });
         if (o.mtime != g.mtime) return why.print("entry {d} mtime: ours {?d}, go {?d}", .{ oi, o.mtime, g.mtime });
         if (o.mode != g.mode) return why.print("entry {d} mode: ours {?o}, go {?o}", .{ oi, o.mode, g.mode });
+        if (!std.mem.eql(u8, o.comment, g.comment)) return why.print("entry {d} comment: ours \"{s}\", go \"{s}\"", .{ oi, o.comment, g.comment });
+        if (!std.mem.eql(u8, o.extra, g.extra)) return why.print("entry {d} extra: ours {d} bytes, go {d} bytes (or differing)", .{ oi, o.extra.len, g.extra.len });
+        if (o.flags != g.flags) return why.print("entry {d} flags: ours {x}, go {x}", .{ oi, o.flags, g.flags });
+        if (o.version_made_by != g.creator) return why.print("entry {d} version made by: ours {x}, go {x}", .{ oi, o.version_made_by, g.creator });
+        if (o.external_attributes != g.ext_attr) return why.print("entry {d} external attributes: ours {x}, go {x}", .{ oi, o.external_attributes, g.ext_attr });
+        if (o.is_directory != g.is_dir) return why.print("entry {d} directory: ours {}, go {}", .{ oi, o.is_directory, g.is_dir });
+        if (o.isSymlink() != g.is_symlink) return why.print("entry {d} symlink: ours {}, go {}", .{ oi, o.isSymlink(), g.is_symlink });
+        // Go sets NonUTF8 only for a name that needs UTF-8 (or is invalid) without bit 11;
+        // for an ASCII name the question has no answer.
+        if (!isAscii(g.name) and o.name_is_utf8 == g.non_utf8) return why.print("entry {d} name encoding: ours utf8={}, go non_utf8={}", .{ oi, o.name_is_utf8, g.non_utf8 });
 
         content.clearRetainingCapacity();
         var er: zipstream.EntryReader = undefined;
@@ -122,6 +165,34 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
             if (!std.mem.eql(u8, content.items, g.content)) return why.print("entry {d} content: ours {d} bytes, go {d}", .{ oi, content.items.len, g.content.len });
         }
     }
+}
+
+fn isAscii(name: []const u8) bool {
+    for (name) |ch| if (ch >= 0x80) return false;
+    return true;
+}
+
+/// `extra` without the records this module writes itself: the first `UT`
+/// (0x5455) and every zip64 record (0x0001). Whether a zip64 record was there
+/// goes to `zip64`.
+fn callerExtra(arena: std.mem.Allocator, extra: []const u8, zip64: *bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var seen_ut = false;
+    var i: usize = 0;
+    while (i + 4 <= extra.len) {
+        const id = std.mem.readInt(u16, extra[i..][0..2], .little);
+        const len = std.mem.readInt(u16, extra[i + 2 ..][0..2], .little);
+        const end = i + 4 + len;
+        if (end > extra.len) break;
+        if (id == 0x0001) {
+            zip64.* = true;
+        } else if (id == 0x5455 and !seen_ut) {
+            seen_ut = true;
+        } else try out.appendSlice(arena, extra[i..end]);
+        i = end;
+    }
+    try out.appendSlice(arena, extra[i..]);
+    return out.items;
 }
 
 fn find(id: []const u8) ?Divergence {
@@ -177,6 +248,9 @@ test "go oracle: every divergence names a case that exists" {
 
 test "go oracle: our ArchiveWriter's archives are what Go reads back" {
     const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
     var failed: usize = 0;
     for (vectors.go_write) |c| {
         const want = try decode(gpa, c.archive);
@@ -190,6 +264,7 @@ test "go oracle: our ArchiveWriter's archives are what Go reads back" {
         defer out.deinit();
         var w = zipstream.ArchiveWriter.init(gpa, &out.writer);
         defer w.deinit();
+        w.comment = c.comment;
         for (c.entries) |g| {
             // A non-ASCII UTF-8 name must reach Go as UTF-8 (flag bit 11).
             if (g.non_utf8) {
@@ -200,11 +275,26 @@ test "go oracle: our ArchiveWriter's archives are what Go reads back" {
                 std.debug.print("go oracle: {s}: Go could not read {s}: {s}\n", .{ c.id, g.name, e });
                 failed += 1;
             }
-            try w.addEntry(g.name, g.content, .{
+            var zip64 = false;
+            const opts: zipstream.AddEntryOptions = .{
                 .method = if (g.method == 0) .store else .deflate,
                 .mtime = g.mtime,
                 .mode = g.mode,
-            });
+                .comment = g.comment,
+                .extra = try callerExtra(arena, g.extra, &zip64),
+                .force_zip64 = zip64,
+            };
+            if (g.is_dir) {
+                try w.addDirectory(g.name, opts);
+            } else if (g.is_symlink) {
+                try w.addSymlink(g.name, g.content, opts);
+            } else if (g.flags & 8 != 0) {
+                const sw = try w.beginEntry(g.name, opts);
+                try sw.writeAll(g.content);
+                try w.endEntry();
+            } else {
+                try w.addEntry(g.name, g.content, opts);
+            }
         }
         try w.finish();
         if (!std.mem.eql(u8, out.written(), want)) {

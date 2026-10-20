@@ -251,6 +251,63 @@ func goWritten() []readCase {
 		w.SetComment("archive comment")
 		put(w, &zip.FileHeader{Name: "c", Method: zip.Store, Comment: "entry comment", Modified: stamp}, "c")
 	})
+	// Streamed (data descriptor, bit 3): CreateHeader always streams a file;
+	// Create is CreateHeader with Deflate and no time.
+	add("streamed", func(w *zip.Writer) {
+		put(w, &zip.FileHeader{Name: "d-small", Method: zip.Deflate, Modified: stamp}, "streamed\n")
+		put(w, &zip.FileHeader{Name: "s-small", Method: zip.Store, Modified: stamp}, "streamed\n")
+		put(w, &zip.FileHeader{Name: "d-empty", Method: zip.Deflate, Modified: stamp}, "")
+		put(w, &zip.FileHeader{Name: "s-empty", Method: zip.Store, Modified: stamp}, "")
+		put(w, &zip.FileHeader{Name: "d-big", Method: zip.Deflate, Modified: stamp}, big)
+		put(w, &zip.FileHeader{Name: "s-big", Method: zip.Store, Modified: stamp}, big)
+	})
+	add("create_plain", func(w *zip.Writer) {
+		// w.Create: Deflate, no Modified (DOS date 0, see dos_zero_date).
+		f, _ := w.Create("plain.txt")
+		f.Write([]byte("created\n"))
+	})
+	add("comments", func(w *zip.Writer) {
+		w.SetComment("archive \xc4\x8d comment")
+		put(w, &zip.FileHeader{Name: "a", Method: zip.Deflate, Comment: "first", Modified: stamp}, "a")
+		put(w, &zip.FileHeader{Name: "b", Method: zip.Store, Comment: "", Modified: stamp}, "b")
+		put(w, &zip.FileHeader{Name: "d/", Method: zip.Store, Comment: "a directory", Modified: stamp}, "")
+		put(w, &zip.FileHeader{Name: "c", Method: zip.Store, Comment: strings.Repeat("long ", 200), Modified: stamp}, "c")
+	})
+	add("extra", func(w *zip.Writer) {
+		rec := le(uint16(0xcafe), uint16(4), []byte{1, 2, 3, 4})
+		put(w, &zip.FileHeader{Name: "x1", Method: zip.Store, Extra: rec, Modified: stamp}, "x")
+		put(w, &zip.FileHeader{Name: "x2", Method: zip.Deflate, Extra: append(append([]byte{}, rec...), le(uint16(0xbeef), uint16(0))...)}, "y")
+	})
+	add("dirs_symlinks", func(w *zip.Writer) {
+		d := &zip.FileHeader{Name: "dir/", Method: zip.Store, Modified: stamp}
+		d.SetMode(os.ModeDir | 0o755)
+		put(w, d, "")
+		put(w, &zip.FileHeader{Name: "dir/nested/", Method: zip.Store, Modified: stamp}, "")
+		f := &zip.FileHeader{Name: "dir/file", Method: zip.Deflate, Modified: stamp}
+		f.SetMode(0o640)
+		put(w, f, "in a directory\n")
+		l := &zip.FileHeader{Name: "dir/link", Method: zip.Store, Modified: stamp}
+		l.SetMode(os.ModeSymlink | 0o777)
+		put(w, l, "file")
+		// A directory by its mode only (no trailing slash) stays a file entry.
+		nd := &zip.FileHeader{Name: "modedir", Method: zip.Store, Modified: stamp}
+		nd.SetMode(os.ModeDir | 0o755)
+		put(w, nd, "")
+	})
+	// zip64 as Go writes it: sizes past 4 GiB declared through CreateRaw (the
+	// bytes are not there; both readers list the entries, neither can read the
+	// big ones), so the zip64 extra reads are anchored without a 4 GiB archive.
+	// (Go writes the zip64 END record only from 65535 entries, an archive too
+	// big for a vector table.)
+	add("zip64_raw", func(w *zip.Writer) {
+		const big64 = 5 << 30
+		f, _ := w.CreateRaw(&zip.FileHeader{Name: "huge", Method: zip.Store, Modified: stamp, CRC32: 0x12345678,
+			CompressedSize64: big64, UncompressedSize64: big64})
+		_ = f
+		g, _ := w.CreateRaw(&zip.FileHeader{Name: "after", Method: zip.Store, Modified: stamp, CRC32: crc32.ChecksumIEEE([]byte("after")),
+			CompressedSize64: 5, UncompressedSize64: 5})
+		g.Write([]byte("after"))
+	})
 	add("raw", func(w *zip.Writer) {
 		data := rawDeflate([]byte("raw deflate\n"))
 		f, _ := w.CreateRaw(&zip.FileHeader{Name: "raw", Method: zip.Deflate, Modified: stamp, CRC32: crc32.ChecksumIEEE([]byte("raw deflate\n")),
@@ -401,8 +458,9 @@ func zigEntry(f *zip.File) string {
 	if err != nil {
 		openErr = zigStr(err.Error())
 	}
-	return fmt.Sprintf(".{ .name = %s, .method = %d, .crc32 = 0x%08x, .compressed_size = %d, .uncompressed_size = %d, .mtime = %s, .mode = %s, .non_utf8 = %t, .content = %s, .open_err = %s }",
-		zigStr(f.Name), f.Method, f.CRC32, f.CompressedSize64, f.UncompressedSize64, mtime, mode, f.NonUTF8, zigStr(content), openErr)
+	return fmt.Sprintf(".{ .name = %s, .method = %d, .crc32 = 0x%08x, .compressed_size = %d, .uncompressed_size = %d, .mtime = %s, .mode = %s, .non_utf8 = %t, .content = %s, .open_err = %s, .comment = %s, .extra = %s, .flags = %d, .creator = %d, .ext_attr = %d, .is_dir = %t, .is_symlink = %t }",
+		zigStr(f.Name), f.Method, f.CRC32, f.CompressedSize64, f.UncompressedSize64, mtime, mode, f.NonUTF8, zigStr(content), openErr,
+		zigStr(f.Comment), zigStr(string(f.Extra)), f.Flags, f.CreatorVersion, f.ExternalAttrs, f.Mode().IsDir(), f.Mode()&os.ModeSymlink != 0)
 }
 
 func emitCases(b *bytes.Buffer, name, doc string, cases []readCase) {
@@ -410,6 +468,10 @@ func emitCases(b *bytes.Buffer, name, doc string, cases []readCase) {
 	for _, c := range cases {
 		r, err := zip.NewReader(bytes.NewReader(c.data), int64(len(c.data)))
 		e := "null"
+		comment := `""`
+		if r != nil {
+			comment = zigStr(r.Comment)
+		}
 		var entries []string
 		// ErrInsecurePath comes WITH a usable reader: Go only flags the names.
 		if err != nil && !errors.Is(err, zip.ErrInsecurePath) {
@@ -419,8 +481,8 @@ func emitCases(b *bytes.Buffer, name, doc string, cases []readCase) {
 				entries = append(entries, zigEntry(f))
 			}
 		}
-		fmt.Fprintf(b, "    .{\n        .id = %s,\n        .archive = %s,\n        .err = %s,\n        .entries = %s,\n    },\n",
-			zigStr(c.id), zigArchive(c.data), e, zigListIndented(entries))
+		fmt.Fprintf(b, "    .{\n        .id = %s,\n        .archive = %s,\n        .err = %s,\n        .comment = %s,\n        .entries = %s,\n    },\n",
+			zigStr(c.id), zigArchive(c.data), e, comment, zigListIndented(entries))
 	}
 	fmt.Fprintf(b, "};\n\n")
 }

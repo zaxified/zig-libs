@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 batch. Reader: any positional `Source` (`initSource`, `MemorySource`, `FileSource`),
+  independent entry cursors (concurrent/threaded reads), `Options.list_directories/codecs/legacy_names`,
+  `Entry.comment/extra/flags/version_made_by/external_attributes/name_is_utf8/is_directory/aes/isSymlink/method`,
+  Info-ZIP Unicode Path names, Zstandard, WinZip AES and ZipCrypto decryption (`EntryReader.open`,
+  `.password`, `authFailed`), `EntryReader.deinit` (needed for codec methods), `extractAll`. Writer:
+  zip64 (automatic, `force_zip64`, `allow_zip64`), streamed `beginEntry`/`endEntry` with a data
+  descriptor, `.zstd`/`.custom` (`Codec`), AES-encrypted entries, comments, caller extra, `addDirectory`,
+  `addSymlink`. **Behavioural:** the 65 535th entry now produces a zip64 archive instead of
+  `ZipWriteTooLarge` (unless `allow_zip64 = false`); bit 11 is also set for a UTF-8 comment. New deps:
+  `zstd`, `aes192`, `encoding`, `crc32`. Speed: hardware CRC-32, a whole-buffer refill in the source
+  reader (std's default read did one `pread` per small field: central directory 4.0× → 0.3× Go).
 - **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** the UT extra field's mtime (`std.math.cast(u32, i64)`) was poison for 2038..2106 (2^31..2^32-1) because zig 0.17.0 lowers that cast to `trunc nsw`. Now narrowed non-negative i64 → u64 → u32. Same output as the Debug build.
 - **2026-10-11** — **BEHAVIOURAL (fails where it delivered corrupted data):** a deflate entry whose
   stream ends inside a block at end of file aborted the process (std 0.16 `flate.Decompress` reaches

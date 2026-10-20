@@ -87,6 +87,17 @@ pub const Entry = struct {
     /// The content Go's File.Open yielded, or the error it stopped with.
     content: []const u8,
     open_err: ?[]const u8,
+    /// FileHeader.Comment, FileHeader.Extra (the central directory's, raw),
+    /// Flags, CreatorVersion ("version made by") and ExternalAttrs as read.
+    comment: []const u8,
+    extra: []const u8,
+    flags: u16,
+    creator: u16,
+    ext_attr: u32,
+    /// Mode().IsDir() / Mode()&ModeSymlink, as Go derives them (a trailing
+    /// '/', or the attribute bits of the creator host).
+    is_dir: bool,
+    is_symlink: bool,
 };
 
 /// An archive as runs of non-zero bytes: ` + "`len`" + ` bytes, zero except at each run.
@@ -98,6 +109,8 @@ pub const Case = struct {
     archive: Archive,
     /// zip.NewReader refused the archive (the text is Go's); entries empty.
     err: ?[]const u8,
+    /// zip.Reader.Comment: the archive comment, raw.
+    comment: []const u8,
     entries: []const Entry,
 };
 

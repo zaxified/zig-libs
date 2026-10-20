@@ -29,8 +29,12 @@ const scratch = ".zig-cache/interop-zipstream";
 const go_oracle_dir = "modules/zipstream/tools/go_oracle";
 const go_vectors = "modules/zipstream/src/go_oracle_vectors.zig";
 
-const Item = struct { name: []const u8, data: []const u8, opts: zipstream.AddEntryOptions };
-const WriteCase = struct { id: []const u8, items: []const Item };
+/// How an item is written: `addEntry` (file), `beginEntry`/`endEntry` with
+/// the data in one `writeAll` (stream; a data descriptor), `addDirectory`
+/// (`data` unused), `addSymlink` (`data` is the target).
+const Kind = enum { file, stream, dir, symlink };
+const Item = struct { name: []const u8, data: []const u8 = "", opts: zipstream.AddEntryOptions, kind: Kind = .file };
+const WriteCase = struct { id: []const u8, items: []const Item, comment: []const u8 = "" };
 
 const t0: i64 = 1_727_700_007;
 
@@ -68,7 +72,74 @@ const names = [_]Item{
     .{ .name = strRepeat("n", 300), .data = "l", .opts = .{ .method = .store, .mtime = t0 } },
 };
 
+const streamed = [_]Item{
+    .{ .name = "d-small", .data = "streamed\n", .opts = .{ .mtime = t0 }, .kind = .stream },
+    .{ .name = "s-small", .data = "streamed\n", .opts = .{ .method = .store, .mtime = t0 }, .kind = .stream },
+    .{ .name = "d-empty", .data = "", .opts = .{ .mtime = t0 }, .kind = .stream },
+    .{ .name = "s-empty", .data = "", .opts = .{ .method = .store, .mtime = t0 }, .kind = .stream },
+    .{ .name = "d-big", .data = big, .opts = .{ .mtime = t0 }, .kind = .stream },
+    .{ .name = "s-big", .data = big, .opts = .{ .method = .store, .mtime = t0 }, .kind = .stream },
+    .{ .name = "d-mode", .data = "m", .opts = .{ .mtime = t0, .mode = 0o640 }, .kind = .stream },
+    .{ .name = "after", .data = "a plain entry after streamed ones\n", .opts = .{ .mtime = t0 } },
+};
+
+const zip64 = [_]Item{
+    .{ .name = "buf-deflate", .data = "zip64 buffered\n", .opts = .{ .mtime = t0, .force_zip64 = true } },
+    .{ .name = "buf-store", .data = "zip64 buffered\n", .opts = .{ .method = .store, .mtime = t0, .force_zip64 = true } },
+    .{ .name = "buf-empty", .data = "", .opts = .{ .method = .store, .mtime = t0, .force_zip64 = true } },
+    .{ .name = "str-deflate", .data = big, .opts = .{ .mtime = t0, .force_zip64 = true }, .kind = .stream },
+    .{ .name = "str-store", .data = "zip64 streamed\n", .opts = .{ .method = .store, .mtime = t0, .force_zip64 = true }, .kind = .stream },
+    .{ .name = "str-empty", .data = "", .opts = .{ .mtime = t0, .force_zip64 = true }, .kind = .stream },
+    .{ .name = "dir/", .opts = .{ .mtime = t0, .force_zip64 = true }, .kind = .dir },
+    .{ .name = "link", .data = "buf-store", .opts = .{ .mtime = t0, .force_zip64 = true }, .kind = .symlink },
+    .{ .name = "plain", .data = "not forced\n", .opts = .{ .mtime = t0 } },
+};
+
+const comments = [_]Item{
+    .{ .name = "a", .data = "a", .opts = .{ .mtime = t0, .comment = "first" } },
+    .{ .name = "b", .data = "b", .opts = .{ .method = .store, .mtime = t0 } },
+    .{ .name = "c", .data = "c", .opts = .{ .method = .store, .mtime = t0, .comment = "comment" }, .kind = .stream },
+    .{ .name = "u", .data = "c", .opts = .{ .method = .store, .mtime = t0, .comment = "\xc4\x8d comment" } },
+    .{ .name = "d/", .opts = .{ .mtime = t0, .comment = "a directory" }, .kind = .dir },
+    .{ .name = "l", .data = "a", .opts = .{ .mtime = t0, .comment = "a link" }, .kind = .symlink },
+    .{ .name = "long", .data = "l", .opts = .{ .method = .store, .mtime = t0, .comment = strRepeat("long ", 200) } },
+};
+
+const rec_cafe = "\xfe\xca\x04\x00\x01\x02\x03\x04"; // id 0xcafe, 4 data bytes
+const rec_empty = "\xef\xbe\x00\x00"; // id 0xbeef, no data
+
+const extras = [_]Item{
+    .{ .name = "x-mtime", .data = "x", .opts = .{ .method = .store, .mtime = t0, .extra = rec_cafe } },
+    .{ .name = "x-nomtime", .data = "x", .opts = .{ .method = .store, .mtime = 0, .extra = rec_cafe ++ rec_empty } },
+    .{ .name = "x-stream", .data = "x", .opts = .{ .mtime = t0, .extra = rec_cafe }, .kind = .stream },
+    .{ .name = "x-zip64", .data = "x", .opts = .{ .mtime = t0, .extra = rec_cafe, .force_zip64 = true } },
+    .{ .name = "x-dir/", .opts = .{ .mtime = t0, .extra = rec_empty }, .kind = .dir },
+};
+
+const dirs_links = [_]Item{
+    .{ .name = "d", .opts = .{ .mtime = t0 }, .kind = .dir },
+    .{ .name = "d/e/", .opts = .{ .mtime = t0, .mode = 0o700 }, .kind = .dir },
+    .{ .name = "d/f", .data = "in d\n", .opts = .{ .mtime = t0 } },
+    .{ .name = "d/link", .data = "f", .opts = .{ .mtime = t0 }, .kind = .symlink },
+    .{ .name = "d/link-mode", .data = "../d/f", .opts = .{ .mtime = t0, .mode = 0o755 }, .kind = .symlink },
+    .{ .name = "d/empty-link", .data = "", .opts = .{ .mtime = t0 }, .kind = .symlink },
+    .{ .name = "setgid/", .opts = .{ .mtime = t0, .mode = 0o2775 }, .kind = .dir },
+};
+
+const unicode = [_]Item{
+    .{ .name = "\xc4\x8d/", .opts = .{ .mtime = t0 }, .kind = .dir },
+    .{ .name = "\xc4\x8d/\xc5\xbe.txt", .data = "z", .opts = .{ .mtime = t0 }, .kind = .stream },
+    .{ .name = "\xe2\x82\xac-link", .data = "\xc5\xbe.txt", .opts = .{ .mtime = t0 }, .kind = .symlink },
+    .{ .name = "\xf0\x9f\x98\x80", .data = "emoji", .opts = .{ .method = .store, .mtime = t0, .comment = "\xf0\x9f\x98\x80" } },
+};
+
 const write_cases = [_]WriteCase{
+    .{ .id = "streamed", .items = &streamed },
+    .{ .id = "zip64", .items = &zip64, .comment = "zip64 archive" },
+    .{ .id = "comments", .items = &comments, .comment = "archive comment \xc4\x8d" },
+    .{ .id = "extras", .items = &extras },
+    .{ .id = "dirs_links", .items = &dirs_links },
+    .{ .id = "unicode", .items = &unicode },
     .{ .id = "basic", .items = &basic },
     .{ .id = "modes", .items = &modes },
     .{ .id = "names", .items = &names },
@@ -82,7 +153,17 @@ fn writeArchives(io: std.Io, gpa: std.mem.Allocator, comptime dir: []const u8) !
         defer out.deinit();
         var w = zipstream.ArchiveWriter.init(gpa, &out.writer);
         defer w.deinit();
-        for (c.items) |it| try w.addEntry(it.name, it.data, it.opts);
+        w.comment = c.comment;
+        for (c.items) |it| switch (it.kind) {
+            .file => try w.addEntry(it.name, it.data, it.opts),
+            .stream => {
+                const sw = try w.beginEntry(it.name, it.opts);
+                try sw.writeAll(it.data);
+                try w.endEntry();
+            },
+            .dir => try w.addDirectory(it.name, it.opts),
+            .symlink => try w.addSymlink(it.name, it.data, it.opts),
+        };
         try w.finish();
         var name_buf: [256]u8 = undefined;
         const name = try std.mem.print(&name_buf, "{s}/{s}.zip", .{ dir, c.id });
@@ -90,8 +171,10 @@ fn writeArchives(io: std.Io, gpa: std.mem.Allocator, comptime dir: []const u8) !
     }
 }
 
-/// Each written entry must appear in Go's view with its name, mtime, mode
-/// and content, and Go must not have flagged a non-ASCII name as non-UTF-8.
+/// Each written entry must appear in Go's view with its name, mtime, mode,
+/// content, comment and type (directory, symlink), the data-descriptor and
+/// UTF-8 flag bits as written, and the archive comment; Go must not have
+/// flagged a non-ASCII name as non-UTF-8.
 fn checkGoReadsWhatWeWrote(arena: std.mem.Allocator, fresh: []const u8) !bool {
     var ok = true;
     for (write_cases) |c| {
@@ -108,18 +191,47 @@ fn checkGoReadsWhatWeWrote(arena: std.mem.Allocator, fresh: []const u8) !bool {
             std.debug.print("go oracle: Go refused our {s} archive\n", .{c.id});
             ok = false;
         }
+        var cmt: std.Io.Writer.Allocating = .init(arena);
+        try zigStr(&cmt.writer, ".comment = ", c.comment);
+        try cmt.writer.writeAll(",\n        .entries");
+        if (std.mem.find(u8, body, cmt.written()) == null) {
+            std.debug.print("go oracle: {s}: Go did not read the archive comment as written\n", .{c.id});
+            ok = false;
+        }
         for (c.items) |it| {
             var name: std.Io.Writer.Allocating = .init(arena);
-            try zigStr(&name.writer, ".name = ", it.name);
+            // addDirectory adds the trailing '/'.
+            const slash = it.kind == .dir and !std.mem.endsWith(u8, it.name, "/");
+            const full_name = if (slash) try std.mem.concat(arena, u8, &.{ it.name, "/" }) else it.name;
+            try zigStr(&name.writer, ".name = ", full_name);
             var want: std.Io.Writer.Allocating = .init(arena);
             const w = &want.writer;
             try w.print(".mtime = {d}, .mode = ", .{it.opts.mtime.?});
-            if (it.opts.mode) |m| try w.print("{d}", .{m}) else try w.writeAll("null");
+            const mode: ?u16 = it.opts.mode orelse switch (it.kind) {
+                .file, .stream => null,
+                .dir => 0o755,
+                .symlink => 0o777,
+            };
+            if (mode) |m| try w.print("{d}", .{m}) else try w.writeAll("null");
             try w.writeAll(", .non_utf8 = false, ");
-            try zigStr(w, ".content = ", it.data);
+            try zigStr(w, ".content = ", if (it.kind == .dir) "" else it.data);
             try w.writeAll(", .open_err = null");
+            try zigStr(w, ", .comment = ", it.opts.comment);
+            var non_ascii = false;
+            for ([_][]const u8{ it.name, it.opts.comment }) |str| {
+                for (str) |ch| non_ascii = non_ascii or ch >= 0x80;
+            }
+            const flags: u16 = (if (it.kind == .stream) @as(u16, 8) else 0) | (if (non_ascii) @as(u16, 1 << 11) else 0);
+            var tail: std.Io.Writer.Allocating = .init(arena);
+            try tail.writer.print(".flags = {d}, ", .{flags});
+            var kind_tail: std.Io.Writer.Allocating = .init(arena);
+            try kind_tail.writer.print(".is_dir = {s}, .is_symlink = {s} }}", .{ if (it.kind == .dir) "true" else "false", if (it.kind == .symlink) "true" else "false" });
+            var extra: std.Io.Writer.Allocating = .init(arena);
+            try zigStr(&extra.writer, "", it.opts.extra);
             const line = if (std.mem.find(u8, body, name.written())) |n| std.mem.sliceTo(body[n..], '\n') else "";
-            if (std.mem.find(u8, line, want.written()) == null) {
+            // The caller's extra records sit inside Go's whole extra field (after our UT).
+            const extra_ok = std.mem.find(u8, line, std.mem.trim(u8, extra.written(), "\"")) != null;
+            if (std.mem.find(u8, line, want.written()) == null or std.mem.find(u8, line, tail.written()) == null or std.mem.find(u8, line, kind_tail.written()) == null or !extra_ok) {
                 std.debug.print("go oracle: {s}: Go did not read \"{s}\" as written\n  want: {s}\n  got:  {s}\n", .{ c.id, it.name, want.written()[0..@min(want.written().len, 200)], line[0..@min(line.len, 300)] });
                 ok = false;
             }
