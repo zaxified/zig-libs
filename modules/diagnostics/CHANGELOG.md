@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `zig build bench-diagnostics` (`tools/bench.zig` + `tools/codespan_bench`, Rust, pinned
+  codespan-reporting 0.13.1 and annotate-snippets 0.12.17): 0.42–0.60× codespan. Info row: with `term_width`
+  on a 100 KB line we are ~3× annotate (our cut path still walks the whole line — a Backlog item). Card:
+  grade 3 → 2 (scope parity, P2).
 - **2026-10-20** — Display width, line endings, terminal width, charsets, context (S2 R5/R6/R7/R9/R10).
   `charWidth` from a table generated from unicode-width 0.2.2 (CJK/emoji 2, combining 0); carets and
   columns use it. Lines end at `\n`/`\r\n` only; lone CR, U+2028/9, C0/C1/DEL and invalid UTF-8 render as

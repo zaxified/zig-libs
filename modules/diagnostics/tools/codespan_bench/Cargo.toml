@@ -1,0 +1,19 @@
+[package]
+name = "codespan_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference side of `zig build bench-diagnostics` (modules/diagnostics/tools/bench.zig):
+# codespan-reporting 0.13.1 (Apache-2.0) and annotate-snippets 0.12.17 (MIT OR
+# Apache-2.0), pinned exactly.
+[dependencies]
+codespan-reporting = "=0.13.1"
+annotate-snippets = "=0.12.17"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]
