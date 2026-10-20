@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — bzip2 (method 12) built in: `bzip2_codec`, `WriteMethod.bzip2` (`codec_level` 1..9), read and write through the new `bzip2` module. New dep `bzip2`.
 - **2026-10-20** — S2 batch. Reader: any positional `Source` (`initSource`, `MemorySource`, `FileSource`),
   independent entry cursors (concurrent/threaded reads), `Options.list_directories/codecs/legacy_names`,
   `Entry.comment/extra/flags/version_made_by/external_attributes/name_is_utf8/is_directory/aes/isSymlink/method`,

@@ -42,6 +42,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const zstd = @import("zstd");
+const bzip2 = @import("bzip2");
 /// Hardware-backed CRC-32 (the sibling module; std's is table-driven, ~0.4 GB/s).
 const crc32 = @import("crc32");
 const encoding = @import("encoding");
@@ -69,7 +70,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "APPNOTE.TXT ZIP central-directory streaming reader",
-    .deps = .{ "zstd", "aes192", "encoding", "crc32" },
+    .deps = .{ "zstd", "bzip2", "aes192", "encoding", "crc32" },
 };
 
 /// Buffer the file reader uses for compressed bytes pulled from disk.
@@ -179,7 +180,52 @@ const ZstdCodec = struct {
     }
 };
 
-const builtin_codecs = [_]Codec{zstd_codec};
+/// bzip2 (method 12) through the sibling `bzip2` module (byte-identical to
+/// libbzip2). An entry is one stream: the decoder stops at its end.
+pub const bzip2_codec: Codec = .{
+    .method = 12,
+    .open_reader = Bzip2Codec.openReader,
+    .open_writer = Bzip2Codec.openWriter,
+};
+
+const Bzip2Codec = struct {
+    const R = struct { r: bzip2.DecompressReader, buf: [4096]u8 };
+    const W = struct { w: bzip2.StreamWriter, buf: [4096]u8 };
+
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader) anyerror!CodecReader {
+        const s = try gpa.create(R);
+        errdefer gpa.destroy(s);
+        s.r = try bzip2.DecompressReader.init(gpa, input, &s.buf, .{ .multi_stream = false });
+        return .{ .reader = &s.r.reader, .state = s, .close = closeReader };
+    }
+
+    fn closeReader(state: *anyopaque, gpa: Allocator) void {
+        const s: *R = @ptrCast(@alignCast(state));
+        s.r.deinit();
+        gpa.destroy(s);
+    }
+
+    fn openWriter(_: ?*anyopaque, gpa: Allocator, output: *std.Io.Writer, level: i32) anyerror!CodecWriter {
+        const s = try gpa.create(W);
+        errdefer gpa.destroy(s);
+        const lv: u4 = if (level <= 0) 9 else @intCast(@min(level, 9));
+        s.w = try bzip2.StreamWriter.init(gpa, output, &s.buf, .{ .level = lv });
+        return .{ .writer = &s.w.writer, .state = s, .finish = finishWriter, .close = closeWriter };
+    }
+
+    fn finishWriter(state: *anyopaque) anyerror!void {
+        const s: *W = @ptrCast(@alignCast(state));
+        try s.w.finish();
+    }
+
+    fn closeWriter(state: *anyopaque, gpa: Allocator) void {
+        const s: *W = @ptrCast(@alignCast(state));
+        s.w.deinit();
+        gpa.destroy(s);
+    }
+};
+
+const builtin_codecs = [_]Codec{ zstd_codec, bzip2_codec };
 
 /// One archive member. `name` is owned by the parent `Archive` (its name
 /// arena) and stays valid until `Archive.deinit`. Backslashes in the stored
@@ -1229,6 +1275,8 @@ pub const WriteMethod = enum {
     deflate,
     /// Zstandard (method 93), `AddEntryOptions.codec_level`.
     zstd,
+    /// bzip2 (method 12), `codec_level` 1..9 (0 = 9).
+    bzip2,
     /// `AddEntryOptions.codec`.
     custom,
 };
@@ -1295,6 +1343,7 @@ fn makeSalt(e: AddEntryOptions.Encryption, out: *[16]u8) ![]const u8 {
 fn writeCodec(options: AddEntryOptions) ?*const Codec {
     return switch (options.method) {
         .zstd => &zstd_codec,
+        .bzip2 => &bzip2_codec,
         .custom => options.codec orelse unreachable, // `.custom` needs `codec`
         else => null,
     };
@@ -1449,7 +1498,7 @@ pub const ArchiveWriter = struct {
         const real: std.zip.CompressionMethod = switch (method) {
             .store => .store,
             .deflate => .deflate,
-            .zstd, .custom => @fromBackingInt(@intCast(writeCodec(options).?.method)),
+            .zstd, .bzip2, .custom => @fromBackingInt(@intCast(writeCodec(options).?.method)),
         };
         const enc = options.encryption;
         return .{
@@ -1550,7 +1599,7 @@ pub const ArchiveWriter = struct {
                 try compress.finish();
                 break :blk deflated.writer.buffered();
             },
-            .zstd, .custom => blk: {
+            .zstd, .bzip2, .custom => blk: {
                 const codec = writeCodec(options).?;
                 try deflated.ensureTotalCapacityPrecise(@max(64, data.len / 2));
                 const cw = try codec.open_writer.?(codec.context, self.alloc, &deflated.writer, options.codec_level);
@@ -1673,7 +1722,7 @@ pub const ArchiveWriter = struct {
                 s.compress = try std.compress.flate.Compress.init(below, &s.window, .raw, options.level);
                 break :blk &s.compress.writer;
             },
-            .zstd, .custom => blk: {
+            .zstd, .bzip2, .custom => blk: {
                 const codec = writeCodec(options).?;
                 s.codec = try codec.open_writer.?(codec.context, self.alloc, below, options.codec_level);
                 break :blk s.codec.?.writer;
@@ -2768,14 +2817,14 @@ test "Archive.init: the central-directory pre-check is exact and owns its errors
         zip[cdStart(zip) + 3] = 0;
         try expectInitError(Error.ZipBadCentralDirectory, zip);
     }
-    // A method other than Store/Deflate is listed and refused when opened
-    // (APPNOTE 4.4.5 method 12 = BZIP2). It was refused at init until
+    // A method this module has no codec for is listed and refused when
+    // opened (PPMd, 98; until 2026-10-20 the test used bzip2, 12, now built in). It was refused at init until
     // 2026-10-05, which made every other member of such an archive
     // unreadable; unzip and Go list it and fail only that member.
     {
         const zip = try buildZip(a, &.{ .{ .name = "a.csv", .data = "x" }, .{ .name = "b.csv", .data = "y" } });
         defer a.free(zip);
-        std.mem.writeInt(u16, zip[cdStart(zip) + 10 ..][0..2], 12, .little);
+        std.mem.writeInt(u16, zip[cdStart(zip) + 10 ..][0..2], 98, .little); // PPMd: a method this module has no codec for
         var tmp = testing.tmpDir(.{});
         defer tmp.cleanup();
         var f = try openZip(&tmp, zip);

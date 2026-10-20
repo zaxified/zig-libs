@@ -149,6 +149,7 @@ fn compare(gpa: std.mem.Allocator, data: []const u8, c: vectors.Case, why: *std.
         var er: zipstream.EntryReader = undefined;
         const read_err: ?anyerror = blk: {
             er.init(&archive, o, window) catch |err| break :blk err;
+            defer er.deinit();
             const r = er.reader();
             var buf: [4096]u8 = undefined;
             while (true) {

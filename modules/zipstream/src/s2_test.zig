@@ -12,6 +12,7 @@ fn readAll(a: std.mem.Allocator, archive: *zs.Archive, e: *const zs.Entry) ![]u8
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var er: zs.EntryReader = undefined;
     try er.init(archive, e, &window);
+    defer er.deinit();
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
     _ = try er.reader().streamRemaining(&out.writer);
@@ -414,4 +415,44 @@ test "extractAll: files, directories, mode and mtime; zip slip and symlink polic
     var tmp4 = testing.tmpDir(.{});
     defer tmp4.cleanup();
     try testing.expectError(error.ZipExtractTooLarge, zs.extractAll(&archive, testing.io, tmp4.dir, .{ .max_total = 8 }));
+}
+
+test "bzip2 (method 12): Python zipfile's archive reads; ours round-trips, buffered and streamed" {
+    const a = testing.allocator;
+    var ms: zs.MemorySource = .{ .bytes = @embedFile("testdata/py_bzip2.zip") };
+    var py: zs.Archive = undefined;
+    try py.initSource(a, ms.source(), .{});
+    defer py.deinit();
+    var big: std.Io.Writer.Allocating = .init(a);
+    defer big.deinit();
+    for (0..300) |i| try big.writer.print("line {d}: Příliš žluťoučký kůň úpěl ďábelské ódy\n", .{i});
+    for ([_]struct { []const u8, []const u8 }{ .{ "big.txt", big.written() }, .{ "tiny.txt", "tiny\n" } }) |c| {
+        const e = py.find(c[0]).?;
+        try testing.expectEqual(@as(u16, 12), @backingInt(e.compression));
+        const got = try readAll(a, &py, e);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, c[1], got);
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    const d = try pattern(a, 300_000, 5);
+    defer a.free(d);
+    try zw.addEntry("b.xml", d, .{ .method = .bzip2, .codec_level = 1 });
+    const w = try zw.beginEntry("bs.xml", .{ .method = .bzip2 });
+    try w.writeAll(d);
+    try zw.endEntry();
+    try zw.finish();
+    var ms2: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms2.source(), .{});
+    defer archive.deinit();
+    for (archive.entries.items) |*e| {
+        try testing.expect(e.compressed_size < e.uncompressed_size / 2);
+        const got = try readAll(a, &archive, e);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, d, got);
+    }
 }
