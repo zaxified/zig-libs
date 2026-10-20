@@ -21,6 +21,7 @@ const vectors = @import("interop_vectors.zig");
 
 fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     var p256 = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(certs.p256_scalar);
+    var p384 = try std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(certs.p384_scalar);
     var ed = try std.crypto.sign.Ed25519.SecretKey.fromBytes(certs.ed25519_secret);
     const rsa_key = try gpa.create(rsa.SecretKey);
     defer gpa.destroy(rsa_key);
@@ -30,6 +31,10 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
         .p256 => blk: {
             chain[0] = &certs.p256_cert;
             break :blk .{ .chain = &chain, .key = .{ .ecdsa_p256 = &p256 } };
+        },
+        .p384 => blk: {
+            chain[0] = &certs.p384_cert;
+            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p384 = &p384 } };
         },
         .ed25519 => blk: {
             chain[0] = &certs.ed25519_cert;

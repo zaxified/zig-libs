@@ -37,7 +37,7 @@ const usage =
     \\
 ;
 
-pub const CertKind = enum { p256, ed25519, rsa2048 };
+pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
 
 const Case = struct {
     name: []const u8,
@@ -61,6 +61,8 @@ const cases = [_]Case{
     .{ .name = "p256-aes128", .why = "TLS_AES_128_GCM_SHA256 over X25519", .seed = 2, .args = &.{ "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "X25519" }, .expect = &.{ "Ciphersuite: TLS_AES_128_GCM_SHA256", "Peer Temp Key: X25519" } },
     .{ .name = "p256-chacha", .why = "TLS_CHACHA20_POLY1305_SHA256 over secp256r1", .seed = 3, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-groups", "P-256" }, .expect = &.{ "Ciphersuite: TLS_CHACHA20_POLY1305_SHA256", "Peer Temp Key: ECDH, prime256v1" } },
     .{ .name = "p256-aes256-x25519", .why = "a P-256 certificate under the SHA-384 suite (the transcript hash is not the scheme's)", .seed = 4, .args = &.{ "-ciphersuites", "TLS_AES_256_GCM_SHA384", "-groups", "X25519" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Signature type: ecdsa_secp256r1_sha256" } },
+    .{ .name = "p256-p384group", .why = "TLS_AES_256_GCM_SHA384 over secp384r1", .seed = 9, .args = &.{ "-groups", "P-384" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Peer Temp Key: ECDH, secp384r1" } },
+    .{ .name = "p384", .why = "an ECDSA P-384 certificate over secp384r1", .cert = .p384, .seed = 10, .args = &.{ "-groups", "P-384:X25519" }, .expect = &.{ "Signature type: ecdsa_secp384r1_sha384", "Peer Temp Key: ECDH, secp384r1", "Verification: OK" } },
     .{ .name = "ed25519", .why = "an Ed25519 certificate (std's client cannot check one)", .cert = .ed25519, .seed = 5, .expect = &.{ "Signature type: ed25519", "Verification: OK" } },
     .{ .name = "rsa2048-pss", .why = "an RSA certificate signed with RSA-PSS", .cert = .rsa2048, .seed = 6, .expect = &.{ "Signature type: rsa_pss_rsae_sha256", "Verification: OK" } },
     .{ .name = "alpn-h2", .why = "ALPN: the server's choice among the client's offers", .seed = 7, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .brief = false, .expect = &.{"ALPN protocol: h2"} },
@@ -71,6 +73,7 @@ var child_env: ?*const std.process.Environ.Map = null;
 
 const Keys = struct {
     p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey,
+    p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
     ed25519: std.crypto.sign.Ed25519.SecretKey,
     rsa2048: rsa.SecretKey,
 };
@@ -80,6 +83,10 @@ fn certifiedKey(keys: *const Keys, kind: CertKind, chain: *[1][]const u8) tlsser
         .p256 => blk: {
             chain[0] = &certs.p256_cert;
             break :blk .{ .chain = chain, .key = .{ .ecdsa_p256 = &keys.p256 } };
+        },
+        .p384 => blk: {
+            chain[0] = &certs.p384_cert;
+            break :blk .{ .chain = chain, .key = .{ .ecdsa_p384 = &keys.p384 } };
         },
         .ed25519 => blk: {
             chain[0] = &certs.ed25519_cert;
@@ -180,6 +187,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     defer argv.deinit(gpa);
     const ca_file: []const u8 = switch (c.cert) {
         .p256 => "p256.pem",
+        .p384 => "p384.pem",
         .ed25519 => "ed25519.pem",
         .rsa2048 => "rsa2048.pem",
     };
@@ -279,7 +287,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\//! configuration and seed, every octet the client sent, every octet the
         \\//! server sent. Replayed by `interop_replay_test.zig`. Do not edit by hand.
         \\
-        \\pub const CertKind = enum { p256, ed25519, rsa2048 };
+        \\pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
         \\
         \\pub const Case = struct {
         \\    name: []const u8,
@@ -383,11 +391,13 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var work = try root.openDir(io, ".zig-cache/tlsserver-interop", .{});
     defer work.close(io);
     try work.writeFile(io, .{ .sub_path = "p256.pem", .data = try pem(gpa, &certs.p256_cert) });
+    try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });
     try work.writeFile(io, .{ .sub_path = "ed25519.pem", .data = try pem(gpa, &certs.ed25519_cert) });
     try work.writeFile(io, .{ .sub_path = "rsa2048.pem", .data = try pem(gpa, &certs.rsa2048_cert) });
 
     var keys: Keys = undefined;
     keys.p256 = try .fromBytes(certs.p256_scalar);
+    keys.p384 = try .fromBytes(certs.p384_scalar);
     keys.ed25519 = try .fromBytes(certs.ed25519_secret);
     try rsa.SecretKey.fromDer(&keys.rsa2048, &certs.rsa2048_pkcs1);
 

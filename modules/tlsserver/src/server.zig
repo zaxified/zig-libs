@@ -93,7 +93,7 @@ pub const Config = struct {
 pub const max_records_per_key: u64 = 1 << 23;
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
-pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group };
+pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
 
 pub const Error = inbound.Error || error{
     HandshakeFailure,
@@ -779,7 +779,7 @@ test "refusals and their alerts" {
     try expectRefusal(.{ .sig_algs = &.{ 0x0807, 0x0804 } }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .suites = &.{ 0xc02f, 0x1304 } }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .groups = null }, error.HandshakeFailure, .handshake_failure);
-    try expectRefusal(.{ .groups = &.{ 0x0018, 0x0100 } }, error.HandshakeFailure, .handshake_failure);
+    try expectRefusal(.{ .groups = &.{ 0x0019, 0x0100 } }, error.HandshakeFailure, .handshake_failure);
     // A group in common but no share for it (HelloRetryRequest: M2).
     try expectRefusal(.{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x001d, "" }} }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .shares = null }, error.HandshakeFailure, .handshake_failure);

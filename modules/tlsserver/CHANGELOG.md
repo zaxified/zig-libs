@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — secp384r1 key exchange (through `tls13.kex`) and ECDSA P-384 certificates.
+  **BEHAVIOURAL:** `default_groups` gains secp384r1 (last), as qap's fork serves it. Interop with
+  OpenSSL `s_client` grows to ten sessions (P-256 over secp384r1, a P-384 certificate over
+  secp384r1), recaptured with freshly generated test certificates (`tools/test_certs.py` adds
+  P-384).
 - **2026-10-20** — `Connection`, the blocking wrapper over `std.Io.Reader`/`Writer` (in-place
   records in the reader's buffer). Interop with OpenSSL 3.5 `s_client` (`tools/interop.zig`:
   P-256, Ed25519 and RSA-PSS certificates, all suites, X25519MLKEM768/X25519/secp256r1, ALPN, no

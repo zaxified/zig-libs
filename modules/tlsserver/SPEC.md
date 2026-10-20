@@ -45,8 +45,8 @@ milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's Finished — then
 application data both ways and close_notify, over the record layer (header, in-place protection,
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
-OpenSSL 3.5's `s_client` (ECDSA P-256, Ed25519 and RSA-PSS certificates; all three suites;
-X25519MLKEM768, X25519, secp256r1; ALPN; with and without SNI) and with Zig std's client;
+OpenSSL 3.5's `s_client` (ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; all three
+suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI) and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair. It is not yet a server to deploy:
 no HelloRetryRequest (a client that sent no share for the chosen group is refused), no
 resumption, no client certificates, no KeyUpdate — a client's KeyUpdate is answered with
@@ -223,9 +223,10 @@ The receive side's refusals are the table under *Wire format*. Record protection
   re-opens every record with Python `cryptography` (OpenSSL) before writing
   `src/record_kat_vectors.zig`.
 - **External (foreign implementation):** OpenSSL 3.5.5 `s_client` over loopback TCP
-  (`tools/interop.zig`, `zig build interop-tlsserver`): eight sessions — P-256 under OpenSSL's
+  (`tools/interop.zig`, `zig build interop-tlsserver`): ten sessions — P-256 under OpenSSL's
   defaults (TLS_AES_256_GCM_SHA384, X25519MLKEM768), TLS_AES_128_GCM_SHA256 over X25519,
-  TLS_CHACHA20_POLY1305_SHA256 over secp256r1, P-256 under SHA-384 over X25519, an Ed25519 and
+  TLS_CHACHA20_POLY1305_SHA256 over secp256r1, P-256 under SHA-384 over X25519, P-256 over
+  secp384r1, a P-384 certificate (`ecdsa_secp384r1_sha384`) over secp384r1, an Ed25519 and
   an RSA-PSS certificate, ALPN `h2` chosen from `http/1.1,h2`, no SNI — each verified by
   s_client against the test certificate and `localhost`, with ping/pong and close_notify.
   `--capture` records every octet both ways into `src/interop_vectors.zig`;
