@@ -30,7 +30,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 |---|---|---|--:|---|---|
 | [whatwg/encoding](https://github.com/whatwg/encoding) (Encoding Standard) — **reference** (spec) | — | CC-BY-4.0 (`LICENSE`: "Creative Commons Attribution 4.0"; API says NOASSERTION) | 322 | pushed 2026-05-21 | Defines ~30 legacy encodings plus UTF-8/16, label resolution, BOM sniffing and error modes. This module implements five single-byte pages plus UTF-8 from its index tables. |
 | [hsivonen/encoding_rs](https://github.com/hsivonen/encoding_rs) | Rust | (Apache-2.0 OR MIT) AND BSD-3-Clause (`LICENSE-APACHE`, `LICENSE-MIT`, `LICENSE-WHATWG` present; API says NOASSERTION) | 468 | pushed 2026-09-24, no GitHub release | README verified: every Encoding Standard encoding, streaming and non-streaming decode/encode to UTF-8 and UTF-16, label resolution, used in Firefox. |
-| [golang/text](https://github.com/golang/text) `encoding/…` | Go | BSD-3-Clause | 809 | pushed 2026-09-18 | Charmap, Japanese, Korean, Chinese and Unicode sub-packages as `Encoder`/`Decoder` transformers *(inferred: README not read this run)*. |
+| [golang/text](https://github.com/golang/text) `encoding/…` | Go | BSD-3-Clause | 809 | pushed 2026-09-18 | Charmap, Japanese, Korean, Chinese and Unicode sub-packages as `Encoder`/`Decoder` transformers Re-surveyed 2026-10-20 (docs; BSD-3 verified, source not needed): `charmap` (ISO-8859-x, windows-125x, KOI8, IBM/CP437/850/852/866, Macintosh, EBCDIC), `japanese`, `korean`, `simplifiedchinese`, `traditionalchinese`, `unicode` (UTF-16, `utf32`), `htmlindex` (WHATWG labels), `encoding.ReplaceUnsupported` / `HTMLEscapeUnsupported`, `transform.Transformer` streaming. |
 | [lifthrasiir/rust-encoding](https://github.com/lifthrasiir/rust-encoding) | Rust | MIT | 289 | pushed 2024-03-31 | Older multi-encoding Rust crate, superseded in practice by encoding_rs *(inferred)*. |
 | GNU libiconv / glibc `iconv` | C | LGPL *(inferred; not read, not linked)* | — | — | The Unix default; hundreds of charsets, needs libc/C. |
 | Zig `std.unicode` | Zig | MIT | — | Zig 0.16.0 | UTF-8, UTF-16LE and WTF-8 conversion only (checked in `lib/std/unicode.zig`); no legacy code pages, no big-endian UTF-16. |
@@ -114,6 +114,51 @@ case to anchor for these five pages specifically. Run: `zig build test-encoding`
   validity fast path in `sanitizeUtf8` — the decoder returns the same bytes, only slower).
 
 ## Backlog / deferred
+
+### Scope parity gap list (S2 re-survey 2026-10-20)
+
+Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
+deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources read: WHATWG
+Encoding Standard (CC-BY-4.0, spec text), `hsivonen/encoding_rs` (cloned 2026-10-20; `LICENSE-MIT` +
+`LICENSE-APACHE` + `LICENSE-WHATWG`: (Apache-2.0 OR MIT) AND BSD-3-Clause — permissive; public API and
+source layout read), `golang/text` (BSD-3, docs), CPython `codecs` (PSF, docs; already the black-box oracle).
+GNU libiconv/glibc iconv: LGPL, not read. bxp column: bxp imports only `Encoding`, `encode`, `decode`
+(csv input/output encoding config, cell-by-cell transcoding in `pipeline.zig`); R items bxp would use are marked.
+
+| # | Feature | Who has it | Effort | Recommendation | bxp |
+|---|---|---|---|---|---|
+| R1 | The remaining WHATWG single-byte pages (windows-874, 1251, 1253-1258, KOI8-R, KOI8-U, ISO-8859-3..8, 10, 13, 14, 16, IBM866, macintosh, x-mac-cyrillic): 22 more of 28. Pages with holes (1253, 1255, 1257 ...) decode an undefined byte to U+FFFD per the Standard (our current "unmappable byte passes through" can not occur for the five pages, but will here, so this needs a defined policy) | all three (encoding_rs `single_byte.rs`/`data.rs`, x/text `charmap`, Python) | M (tables are data: vendor the WHATWG `index-*.txt`, generate via the existing `build(&overrides)` pattern, same 128-pair external anchor per page as now) | do, behind a comptime/build option (`pages` set) so a ReleaseSmall consumer does not carry unused tables, as the earlier "not now" note required | yes if the broker ever sends Cyrillic/Greek/Turkish; windows-1251 is the likely first |
+| R2 | CJK multi-byte: Shift_JIS, EUC-JP, ISO-2022-JP (stateful), EUC-KR, GBK/GB18030, Big5 | encoding_rs (all), x/text (all) | L (index tables ~100s of KiB; GB18030 ranges; ISO-2022-JP encoder state; Big5 HKSCS handling) | owner decision. Recommend do-later as an opt-in build flag `cjk`, last; the alternative is an explicit exclusion on the parity card: "CJK excluded: table size (> bxp's whole ReleaseSmall budget), no consumer; reopen on demand" | no |
+| R3 | Complete WHATWG label table ("get an encoding") incl. labels of encodings we do not have returning "known but unsupported" distinct from "unknown", and the `replacement` encoding (hz-gb-2312, iso-2022-kr, iso-2022-cn, iso-2022-cn-ext, utf-7 label: decodes to a single U+FFFD, a security measure) | encoding_rs `for_label`, x/text `htmlindex.Get` | S | do (the Go oracle already checks 80 labels; extend the table, keep the 21 listed divergences) | no |
+| R4 | Streaming decoder for the single-byte pages (`Decoder.Kind` has only UTF-8/16-LE/BE) | encoding_rs `Decoder` (all), x/text `Transformer` | S (stateless; chunking is trivial) | do (makes one streaming API for every `Encoding`) | yes (bxp reads files in chunks) |
+| R5 | Streaming encoder, incl. UTF-16 and pages (an incoming UTF-8 sequence split across chunks; `encodeUtf16` is whole-buffer only) | encoding_rs `Encoder`, x/text | S-M | do | yes (output side) |
+| R6 | Caller-buffer, allocation-free API with progress result (`decode_to_utf8(src, dst) -> (result, read, written)`, `max_utf8_buffer_length`, `max_buffer_length_from_utf8_if_no_unmappables`) | encoding_rs, x/text `Transformer.Transform(dst, src, atEOF)` | S-M | do; `bxp`'s `encodeOutCell` allocates per cell, so this is the most useful item for the consumer | yes |
+| R7 | Unmappable-character modes on encode: (a) HTML numeric character reference `&#NNNN;` (the Standard's own encoder error handling for HTML forms; encoding_rs `encode`), (b) fatal / report the offending code point (`encode_without_replacement`, Python `strict`), (c) ignore, (d) `\\uXXXX` / `\\N{}` (Python `backslashreplace`, `namereplace`) , today only `?` | encoding_rs, x/text (`ReplaceUnsupported`, `HTMLEscapeUnsupported`, custom `ErrorHandler`), Python | S (`EncodeErrors = .question_mark \| .html_ref \| .fatal \| .ignore`; skip `namereplace`, needs the Unicode name table) | do; fatal mode matters for a CSV export that must not silently lose a character | yes (silent `?` in exported data) |
+| R8 | Introspection: `Encoding.name()` (canonical WHATWG name), `output_encoding`, `is_ascii_compatible`, `is_single_byte`, `can_encode_everything` | encoding_rs | S | do | no |
+| R9 | `mem`-style helpers: `utf8ValidUpTo`, `isAscii`/`asciiValidUpTo`, Latin-1 to UTF-8/UTF-16 and back (`is_utf8_latin1`, `convert_latin1_to_utf8`, `convert_utf8_to_latin1_lossy`) | encoding_rs `mem` | S each | do-later (std has `isValidUtf8`; the Latin-1 fast converters are speed rows, see P bench) | maybe |
+| R10 | UTF-32 LE/BE | Python `utf-32`, x/text `utf32`; WHATWG and encoding_rs deliberately exclude it | S (same shape as UTF-16; the `Decoder` machine + BOM `FF FE 00 00`) | do-later (parity with Go/Python; not web-reachable, so lower priority than R1) | no |
+| R11 | `x-user-defined` (0x80..0xFF to U+F780..) | WHATWG, encoding_rs | S | do-later (legacy XHR; trivial once R1's table machinery exists) | no |
+| R12 | More code pages outside WHATWG: DOS/OEM (CP437, CP850, **CP852**, CP858 ...), Kamenicky, EBCDIC (CP037/500/1047) | Python (all), x/text charmap (437/850/852/855/858/860-866, 037/1047/1140), not WHATWG | M for the set (tables from unicode.org MAPPINGS or CPython as black-box oracle; same 128-pair anchoring) | do-later for CP852/CP437/CP850 (CP852 is Czech/Polish DOS, the owner's home market); EBCDIC and Kamenicky not-doing without a consumer | maybe (Czech legacy exports) |
+| R13 | Encoding detection / guessing (`chardetng`, Python `chardet`, ICU) | chardetng is a separate crate by the same author, not encoding_rs | M | do-later, limited form: "is this UTF-8, else which of our pages is most plausible" over the pages we have (also a bxp convenience when `csv_input_encoding` is unset). A full statistical detector: not-doing | maybe |
+| R14 | Unicode normalization (NFC/NFD), IDNA/punycode, UTF-7, base64/quoted-printable codecs, `utf-8-sig` as a named codec | x/text `unicode/norm`, `idna`; Python codecs | -- | not-doing: normalization and IDNA are other charters (a `unicodenorm` module if anyone asks); base64 has `b64ct`/`base32`; UTF-7 is rejected by WHATWG for security and maps to `replacement` (R3); the UTF-8 BOM is handled by `decode` | no |
+| R15 | Public custom single-byte table constructor (x/text `charmap.Charmap`, Python `charmap_build`) | x/text, Python | S (`build(&overrides)` already exists internally; expose it) | do-later | no |
+
+Already done: UTF-8/UTF-16 WHATWG decoder with chunking, fatal mode, BOM sniffing and removal, label
+parsing with a Go oracle, normative anchoring of every table entry (see Anchoring).
+
+**P bench proposal.** Reference and fastest are the same row: `encoding_rs` (Rust, SIMD-accelerated
+ASCII/Latin-1/UTF-8 paths; build a `rust_bench` crate under `tools/` with a path dependency on a pinned
+clone of `encoding_rs`, its only dependency is `cfg-if`, vendored via `cargo vendor` into `.zig-cache`).
+Secondary row: Go `golang.org/x/text` (the `go_oracle` directory already pins the module and its
+`go.sum`; add a `go_bench` beside it, `GOPROXY=off`). Pattern: `modules/tz/tools/go_bench`. Rows, all on
+the same generated 64 MiB inputs (seeded): (1) windows-1250 to UTF-8, 100 % ASCII; (2) the same with
+10 % high bytes (Czech text); (3) UTF-8 to windows-1250 with the same mix and (4) with 1 % unmappable
+characters (the `?` path); (5) UTF-8 decode with replacement: valid ASCII, valid mixed multilingual
+text, 5 % invalid bytes; (6) UTF-16LE to UTF-8 and back; (7) the streaming `Decoder` over 4 KiB chunks
+vs encoding_rs `Decoder`. Metric: GB/s, min of 5 runs, ReleaseFast, single thread; per-call overhead
+row on 20-byte cells (bxp's cell-by-cell use), which is where allocation (R6) shows.
+
+### Earlier entries (kept for the record)
 Per the 2026-07-09 extraction-scope note: broader/CJK coverage is explicitly out of scope, not
 planned — no further backlog item recorded. The module README's "Out of scope" section is the
 canonical statement of this boundary.

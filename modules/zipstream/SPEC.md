@@ -27,7 +27,7 @@ relevant to the gaps: `tar` (the other archive format), `zstd` (a candidate ZIP 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | [Go `archive/zip`](https://pkg.go.dev/archive/zip) — **reference** | Go (stdlib) | BSD-3-Clause | — | Go stdlib | Same built-in method set (Store + Deflate; custom codecs can be registered), zip64 in both directions, `Reader` over `io.ReaderAt` + size (docs read this run). Also entry modification time and mode, `Create`-style streaming writer *(data-descriptor behaviour inferred, not in the fetched summary)*. |
-| [zip-rs/zip2](https://github.com/zip-rs/zip2) (`zip` crate) | Rust | MIT | 354 | v8.6.0 (2026-04-25) | Broadest coverage (README table, read this run): reads and writes Store, Deflate, Bzip2, Zstandard, XZ, PPMd; reads Deflate64, LZMA, Implode/Shrink/Reduce; AES and ZipCrypto encryption; multi-disk unsupported. |
+| [zip-rs/zip2](https://github.com/zip-rs/zip2) (`zip` crate) | Rust | MIT (LICENSE read 2026-10-20) | 354 | v8.6.0 (2026-04-25) | Broadest coverage (README table and `ZipWriter`/`ZipArchive` API read, re-surveyed 2026-10-20): reads and writes Store, Deflate, Bzip2, Zstandard, XZ, PPMd; reads Deflate64, LZMA, Implode/Shrink/Reduce; AES and ZipCrypto encryption; multi-disk unsupported. |
 | [Majored/rs-async-zip](https://github.com/Majored/rs-async-zip) | Rust | MIT | 192 | pushed 2026-09-13 | Async reader and writer *(inferred from the name; README not read)*. |
 | [nih-at/libzip](https://github.com/nih-at/libzip) | C | BSD-3-Clause (LICENSE file: copyright header read; API: NOASSERTION) | 1.1k | v1.11.4 (2025-05-23) | The C reference library: read/write, zip64, encryption, many codecs via optional libs *(feature list inferred)*. |
 | Zig `std.zip` | Zig | MIT | — | Zig 0.16.0 | Provides the wire structs, the central-directory `Iterator` (zip64 aware) and extraction to a directory; this module builds on it. No writer *(not re-verified in 0.16.0 source this run: no zig lib dir was located)*. |
@@ -176,6 +176,66 @@ output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 /
 65 535 written entries with the 65 536th refused, and the writer masking type bits off `mode`.
 
 ## Backlog / deferred
+
+### Scope parity gap list (S2 re-survey 2026-10-20)
+
+Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
+deliberately excluded with a reason; speed rows go to Backlog, not a condition. Sources: Go
+`archive/zip` (BSD-3, stdlib docs), zip2 (MIT, cloned 2026-10-20: README support table, `write.rs` /
+`read/*.rs` API surface), Python `zipfile` (PSF, docs), libzip (BSD-3, docs/man pages), minizip-ng
+(zlib licence, README feature list; not cloned). Items marked *(inferred)* come from documentation
+recollection, not from a source read this run. bxp column: bxp uses only `Archive`, `Entry`,
+`EntryReader` (xlsx ingest and the parallel `zipPrePass`), read side, Store + Deflate; it opens one
+independent `Archive` per worker because the module is single-cursor.
+
+| # | Feature | Who has it | Effort | Recommendation | bxp |
+|---|---|---|---|---|---|
+| R1 | Reader over any random-access source, not only `std.Io.File`: in-memory slice, `ReaderAt` + size | Go `NewReader(ReaderAt, size)`, Python (file-like), zip2 (`Read + Seek`), libzip sources | S-M (a small `Source` vtable: `readAt(offset, buf)`; the File case stays the default) | do | yes (xlsx from memory, network buffers, tests without files) |
+| R2 | Several entries open at once / thread-safe positional reads (Go's `ReaderAt` design lets concurrent `Open`s share one `Reader`) | Go, libzip (via sources) *(inferred)* | M (follows from R1: `EntryReader` carries its own offset instead of the shared cursor; today bxp's `zipPrePass` re-opens the file once per worker) | do (with R1) | yes |
+| R3 | Zstandard (method 93) read + write | zip2, libzip, minizip-ng; Python 3.14 *(inferred)* | S-M glue over sibling `zstd` (adds a module dependency; streaming API check needed) | do | no |
+| R4 | zip64 **writing** (> 4 GiB, > 65535 entries; the zip64 extra in local + central header, EOCD64 + locator) | Go, zip2, Python (`allowZip64`, `force_zip64`), libzip, minizip-ng | M | do (needed together with R5, since an unknown size forces the zip64 decision up front) | no |
+| R5 | Streaming writes with data descriptors (general-purpose bit 3): the entry is written as the producer delivers bytes, sizes and CRC follow; `ArchiveWriter.beginEntry() -> *std.Io.Writer`, no buffered compressed copy | Go `Create`, Python `open(name, "w")`, zip2 `start_file` + `Write`, libzip (via sources), minizip-ng | M | do | no |
+| R6 | Archive comment and per-entry comment, read and write | Go `Comment`, Python `comment`, zip2 `set_comment`, libzip, minizip-ng | S | do | no |
+| R7 | Raw `extra` field exposed on read, caller-supplied extra on write (besides the `UT` record we add) | Go `FileHeader.Extra`, zip2 `extra_data`, Python `ZipInfo.extra`, libzip | S | do | no |
+| R8 | Directory entries: writer `addDirectory` (name with trailing `/`, mode 040755) and an option to LIST them (the reader skips them by design) | Go lists them and writes via a trailing-slash `Create`, zip2 `add_directory`, Python `mkdir` (3.11) | S | do (keep skip as the default, add `Archive.Options.list_directories`) | no |
+| R9 | Symlinks: `Entry.isSymlink()` on read (mode S_IFLNK), `addSymlink` on write | zip2 `add_symlink`, libzip, Go (`Mode()` carries `ModeSymlink`) | S | do-later (mode is already read and written; this is a helper and a test) | no |
+| R10 | Raw copy of an entry between archives without recompression, and raw read of the compressed bytes | Go `Copy`, `CreateRaw`, `OpenRaw`; zip2 `raw_copy_file`, `merge_archive`, `by_index_raw`; libzip | S-M | do-later | no |
+| R11 | Append to / modify an existing archive: append mode; delete, replace, rename entries | Python `"a"`, zip2 `new_append`, libzip (full editing), Go (`SetOffset` only) | M (append: rewrite central directory), L (in-place edit with compaction) | append: do-later; in-place edit/rename/delete: not-doing, reason: it is libzip's whole charter (a source abstraction + transactional update), the rebuild via R10 raw copy covers it | no |
+| R12 | Extract to a directory: zip-slip safe, restores mode and mtime, symlink policy | Python `extractall`, zip2 `extract`, Go (`fs.FS` + `os.CopyFS`), `std.zip.extract` | S-M (the zip-slip predicate exists; file creation goes through `std.Io.Dir`) | do (with an explicit symlink and total-size policy; it is where zip-slip actually bites) | no |
+| R13 | Directory tree as source: `addTree` / Go `Writer.AddFS` | Go, zip2 (`add_directory` + walk, `write_dir`) *(inferred)* | S | do-later | no |
+| R14 | Non-UTF-8 names: the Info-ZIP Unicode Path extra field (0x7075) and CP437 / caller-chosen legacy encoding for names without bit 11 | zip2 (decodes CP437 and 0x7075), Python (`metadata_encoding`, cp437 default), libzip, Go (flags `NonUTF8`, leaves bytes) | S (0x7075), S-M (CP437; table lives in sibling `encoding`, which lacks CP437: see `encoding` R12, cross-module dependency) | 0x7075: do; CP437: do-later after `encoding` R12 | no |
+| R15 | Compression methods: bzip2 (12) | zip2 (r+w), Python (r+w), libzip, minizip-ng | L: no `bzip2` module in zig-libs; decoder M, encoder L | do-later, as a NEW sibling module (`bzip2`) with zipstream glue; owner decision on whether any consumer justifies it | no |
+| R16 | LZMA (14) / XZ (95) | zip2 (LZMA read, XZ r+w), Python (LZMA r+w), libzip, minizip-ng | L: no `lzma` module in zig-libs | do-later, as a new sibling module, after R15; same owner decision | no |
+| R17 | Deflate64 (9) read; Implode/Shrink/Reduce (legacy PKZIP methods 1-6) read | Deflate64: zip2 (read), minizip-ng *(inferred)*; legacy methods: zip2 read, Info-ZIP unzip | M (Deflate64 needs its own inflater, `std.compress.flate` cannot do it) | Deflate64: do-later (real-world .NET / Windows Explorer output above 4 GiB); Implode/Shrink/Reduce: not-doing, reason: no producer since the 1990s | no |
+| R18 | PPMd (98) | zip2 (r+w) | L | not-doing: only zip2 has it, no real producer besides 7-Zip's option | no |
+| R19 | Custom codec registry: caller registers `(method id, decompressor, compressor)` | Go `RegisterDecompressor` / `RegisterCompressor`, zip2 (`CompressionMethod::Unsupported(id)` raw) | S (a method vtable on `Archive.Options`/`AddEntryOptions`) | do (cheapest route to R15-R18 without new dependencies: a consumer plugs its own codec) | no |
+| R20 | Encryption, read: ZipCrypto (legacy) and WinZip AES AE-1/AE-2 | ZipCrypto: Python, zip2, libzip, minizip-ng; AES: zip2, libzip, minizip-ng (not Python, not Go) | ZipCrypto decrypt S; AES M (needs PBKDF2-HMAC-SHA1 + AES-CTR + HMAC check; sibling `aes192` has CTR, `hashdigest`/`sha2` the hashes; verify that PBKDF2 exists in-tree before estimating) | ZipCrypto read: do-later (password option, legacy files in the wild, key stream is trivially weak but reading is harmless); AES read: do-later; ZipCrypto write: not-doing (broken cipher, the earlier decision stands) | no |
+| R21 | Encryption, write: WinZip AES | zip2, libzip, minizip-ng | M | do-later, after R20 | no |
+| R22 | Alignment of stored data (`zipalign` style, APK/OOXML tooling) and "first entry Store" (EPUB `mimetype`) | zip2 `start_file_aligned`, libzip *(inferred)* | S (extra-field padding on write) | do-later | no |
+| R23 | Archive-wide integrity check (`testzip`: decode everything, verify every CRC) and a ratio/overlap check on the central directory against zip-bomb quines | Python `testzip`; overlap checks: none of the surveyed libraries documents one *(inferred)*, which makes this a lead rather than parity | S (verify), M (overlap) | verify: do-later; overlap detection: do-later (our size cap already stops the 42.zip class, not a quine reading overlapping ranges) | no |
+| R24 | Multi-disk / spanned / split archives | minizip-ng, libzip (read only, partly) *(inferred)*; zip2, Go, Python do not | M | not-doing, reason: the leaders do not; disk numbers are already read as one concatenated archive | no |
+| R25 | Async reader/writer | rs-async-zip | -- | not-doing, reason: everything here is `std.Io`-based already (the reader takes an `Io`), concurrency is the caller's choice | no |
+| R26 | Use the sibling `crc32` module (hardware backends, `combine`) instead of std's CRC-32 in `CrcReader` and the writer | -- (internal; `crc32` module exists in-tree) | S (adds a dependency) | do-later, as a speed row (see P bench); `combine` also enables parallel CRC over chunks | speed only |
+
+Already done: Store + Deflate read/write, zip64 read, mtime/mode with all four extra encodings, UTF-8
+name flag on write, compression level on write (`AddEntryOptions.level`), prepended-stub tolerance, CRC
+check against the central directory, zip-slip gate on both sides, bomb cap, encrypted entries listed and refused.
+
+**P bench proposal.** Reference = Go `archive/zip` (pattern `modules/tz/tools/go_bench`; stdlib only,
+`GOPROXY=off`). Fastest-in-field rows = C: `libdeflate` (MIT; inflate/deflate, single-directory C source,
+compile with `cc -O3` from a pinned clone under `.zig-cache`) wrapped by a minimal ZIP reader in
+`c_bench/driver.c`, or `libzip` (BSD-3) with zlib-ng if the toolchain has it (pattern
+`modules/decimal/tools/mpdec_bench`); zip2 (Rust) optional behind a pinned clone. Rows, all on one
+generated archive set (seeded): (1) xlsx-shaped archive: 12 entries, one 200 MB sheet of repetitive XML
+at deflate level 6, stream-extract the large entry (inflate + CRC bound: the row bxp feels; shows
+`std.compress.flate` against libdeflate and Go); (2) the same entry Stored, 1 GiB (CRC bound; shows R26);
+(3) central-directory open: 100 k tiny entries, time to `Archive.init` + `find` (Go `NewReader`, zip2);
+(4) many small entries streamed one by one (per-entry setup cost); (5) writer: 256 MiB text into Deflate
+level 6 and Store, compression ratio reported next to MB/s (std's compressor is not zlib's, so ratio
+must be shown or the row misleads). Metric: MB/s of uncompressed data, min of 5, ReleaseFast, single
+thread; ratios on the `**Performance:**` line.
+
+### Earlier entries (kept for the record)
 
 - ~~**SUSPECTED: std 0.16 `flate.Decompress` panic reachable from a crafted archive**~~ **CONFIRMED and
   fixed 2026-10-11.** Any proper prefix of an ordinary deflate stream, decoded to the end of its input,
