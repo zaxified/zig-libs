@@ -139,9 +139,72 @@ fn search(comptime cpOf: fn (u16) u21, tab: []const u16, cp: u21) ?u16 {
     return null;
 }
 
+/// A two-level reverse map code point -> pointer for the BMP, built at
+/// comptime from a `*_enc` table (so it gives the very pointer the sorted
+/// search would): `idx[cp >> 7]` names a 128-entry page, page 0 is all holes.
+/// Code points above the BMP are not in it (`get` is null; the caller keeps
+/// the sorted search for them).
+fn Rev(comptime cpOf: fn (u16) u21, comptime tab: []const u16) type {
+    const pages = blk: {
+        @setEvalBranchQuota(4_000_000);
+        var seen: [512]bool = @splat(false);
+        var n: usize = 1;
+        for (tab) |ptr| {
+            const cp = cpOf(ptr);
+            if (cp < 0x10000 and !seen[cp >> 7]) {
+                seen[cp >> 7] = true;
+                n += 1;
+            }
+        }
+        break :blk n;
+    };
+    return struct {
+        const Built = struct { idx: [512]u16, pg: [pages][128]u16 };
+        const built: Built = blk: {
+            @setEvalBranchQuota(4_000_000);
+            var idx: [512]u16 = @splat(0);
+            var pg: [pages][128]u16 = @splat(@as([128]u16, @splat(none)));
+            var next: u16 = 1;
+            for (tab) |ptr| {
+                const cp = cpOf(ptr);
+                if (cp >= 0x10000) continue;
+                if (idx[cp >> 7] == 0) {
+                    idx[cp >> 7] = next;
+                    next += 1;
+                }
+                pg[idx[cp >> 7]][cp & 127] = ptr;
+            }
+            break :blk .{ .idx = idx, .pg = pg };
+        };
+
+        inline fn get(cp: u21) ?u16 {
+            const v = built.pg[built.idx[cp >> 7]][cp & 127];
+            return if (v == none) null else v;
+        }
+    };
+}
+
+const J8Rev = Rev(j8Of, &t.jis0208_enc);
+const EkRev = Rev(ekOf, &t.euckr_enc);
+const GbRev = Rev(gbOf, &t.gb_enc);
+const B5Rev = Rev(b5Of, &t.big5_enc);
+
 /// index jis0208 pointer for `cp` (the first one).
 fn j8Ptr(cp: u21) ?u16 {
+    if (cp < 0x10000) return J8Rev.get(cp);
     return search(j8Of, &t.jis0208_enc, cp);
+}
+fn ekPtr(cp: u21) ?u16 {
+    if (cp < 0x10000) return EkRev.get(cp);
+    return search(ekOf, &t.euckr_enc, cp);
+}
+fn gbPtr(cp: u21) ?u16 {
+    if (cp < 0x10000) return GbRev.get(cp);
+    return search(gbOf, &t.gb_enc, cp);
+}
+fn b5Ptr(cp: u21) ?u16 {
+    if (cp < 0x10000) return B5Rev.get(cp);
+    return search(b5Of, &t.big5_enc, cp);
 }
 
 /// "index Shift_JIS pointer": index jis0208 without pointers 8272..8835.
@@ -282,14 +345,31 @@ pub const Decoder = struct {
         var w: usize = 0;
         var replaced = false;
         while (true) {
-            if (self.qn == 0 and self.lead == 0 and self.enc != .iso_2022_jp) {
+            if (self.qn == 0) {
                 // Clean state: ASCII passes through (Shift_JIS' 0x5C and 0x7E
-                // included: the Standard maps them to themselves).
-                const ascii_run = core.asciiPrefix(src[r..]);
-                const n = @min(ascii_run, dst.len - w);
-                @memcpy(dst[w..][0..n], src[r..][0..n]);
-                r += n;
-                w += n;
+                // included: the Standard maps them to themselves), and the
+                // common whole characters are decoded inline; anything else
+                // (errors, cut sequences, four-byte forms, escapes) is left to
+                // the state machine below.
+                switch (self.enc) {
+                    .iso_2022_jp => {
+                        const f = self.fastIso(src, dst, r, w);
+                        r = f[0];
+                        w = f[1];
+                    },
+                    .euc_jp => if (self.lead == 0) {
+                        const ascii_run = core.asciiPrefix(src[r..]);
+                        const n = @min(ascii_run, dst.len - w);
+                        @memcpy(dst[w..][0..n], src[r..][0..n]);
+                        r += n;
+                        w += n;
+                    },
+                    inline .shift_jis, .euc_kr, .gb18030, .gbk, .big5 => |e| if (self.lead == 0) {
+                        const f = fastRun(e, src, dst, r, w);
+                        r = f[0];
+                        w = f[1];
+                    },
+                }
             }
             const have = self.qn > 0 or r < src.len;
             if (!have and !last) break;
@@ -351,6 +431,56 @@ pub const Decoder = struct {
                 .malformed => return error.Malformed,
             }
         }
+    }
+
+    /// The inline fast path of the ISO-2022-JP decoder, in the ASCII and
+    /// two-byte (jis0208 leading) states: plain bytes, whole characters and
+    /// the four escapes that switch state without an error. Anything else is
+    /// left to the state machine. Returns `{ r, w }`.
+    fn fastIso(self: *Decoder, src: []const u8, dst: []u8, r0: usize, w0: usize) [2]usize {
+        var st = self.iso_state;
+        if (st != .ascii and st != .leading) return .{ r0, w0 };
+        var out = self.iso_output;
+        var r = r0;
+        var w = w0;
+        while (r < src.len and w < dst.len) {
+            const b = src[r];
+            if (b == 0x1B) {
+                if (out or r + 3 > src.len) break;
+                const b1 = src[r + 1];
+                const b2 = src[r + 2];
+                var ns: IsoState = undefined;
+                if (b1 == 0x28 and b2 == 0x42) {
+                    ns = .ascii;
+                } else if (b1 == 0x24 and (b2 == 0x40 or b2 == 0x42)) {
+                    ns = .leading;
+                } else break;
+                st = ns;
+                self.iso_out = ns;
+                out = true;
+                r += 3;
+                continue;
+            }
+            if (st == .ascii) {
+                if (b >= 0x80 or b == 0x0E or b == 0x0F) break;
+                dst[w] = b;
+                w += 1;
+                r += 1;
+                out = false;
+            } else {
+                if (dst.len - w < decoder_headroom or r + 1 >= src.len) break;
+                const b2 = src[r + 1];
+                if (b < 0x21 or b > 0x7E or b2 < 0x21 or b2 > 0x7E) break;
+                const v = t.jis0208_dec[(@as(u32, b) - 0x21) * 94 + (b2 - 0x21)];
+                if (v == none) break;
+                w += put3(dst, w, v);
+                r += 2;
+                out = false;
+            }
+        }
+        self.iso_state = st;
+        self.iso_output = out;
+        return .{ r, w };
     }
 
     fn stepByte(self: *Decoder, b: u8) Step {
@@ -651,6 +781,106 @@ pub const Decoder = struct {
     }
 };
 
+/// Write `cp` (>= 0x80, a scalar value) as UTF-8 at `dst[w..]`; at least 4
+/// bytes of room. Returns the length.
+inline fn put3(dst: []u8, w: usize, cp: u21) usize {
+    if (cp < 0x800) {
+        dst[w] = @intCast(0xC0 | (cp >> 6));
+        dst[w + 1] = @intCast(0x80 | (cp & 0x3F));
+        return 2;
+    }
+    if (cp < 0x10000) {
+        dst[w] = @intCast(0xE0 | (cp >> 12));
+        dst[w + 1] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+        dst[w + 2] = @intCast(0x80 | (cp & 0x3F));
+        return 3;
+    }
+    dst[w] = @intCast(0xF0 | (cp >> 18));
+    dst[w + 1] = @intCast(0x80 | ((cp >> 12) & 0x3F));
+    dst[w + 2] = @intCast(0x80 | ((cp >> 6) & 0x3F));
+    dst[w + 3] = @intCast(0x80 | (cp & 0x3F));
+    return 4;
+}
+
+/// The code point of a well-formed two-byte character `lead trail` in the
+/// common form, or null for anything else (the state machine decides). Never
+/// a code point below 0x80.
+inline fn pairCp(comptime enc: Cjk, lead: u8, trail: u8) ?u21 {
+    switch (enc) {
+        .euc_kr => {
+            const l = lead -% 0x81;
+            const tr = trail -% 0x41;
+            if (l > 0x7D or tr > 0xBD) return null;
+            const ptr = @as(u32, l) * 190 + tr;
+            if (ptr >= t.euckr_dec.len) return null;
+            const v = t.euckr_dec[ptr];
+            return if (v == none) null else v;
+        },
+        .gb18030, .gbk => {
+            const l = lead -% 0x81;
+            const tt = trail -% 0x40; // 0x7F (tt == 0x3F) is no trail byte
+            if (l > 0x7D or tt > 0xBE or tt == 0x3F) return null;
+            const tr = tt - @intFromBool(tt > 0x3F);
+            const v = t.gb_dec[@as(u32, l) * 190 + tr];
+            return if (v == none) null else v;
+        },
+        .big5 => {
+            if (lead == 0x80 or lead == 0xFF or trail < 0x40 or trail == 0xFF) return null;
+            if (trail > 0x7E and trail < 0xA1) return null;
+            const offset: u32 = if (trail < 0x7F) 0x40 else 0x62;
+            return b5Cp((@as(u32, lead) - 0x81) * 157 + (trail - offset));
+        },
+        .shift_jis => {
+            if (lead == 0x80 or lead == 0xA0 or lead >= 0xFD or (lead >= 0xA1 and lead <= 0xDF)) return null;
+            if (trail < 0x40 or trail == 0x7F or trail > 0xFC) return null;
+            const lo: u32 = if (lead < 0xA0) 0x81 else 0xC1;
+            const offset: u32 = if (trail < 0x7F) 0x40 else 0x41;
+            const p = (@as(u32, lead) - lo) * 188 + trail - offset;
+            if (p >= 8836) return null; // EUDC and the unmapped tail
+            const v = t.jis0208_dec[p];
+            return if (v == none) null else v;
+        },
+        else => comptime unreachable,
+    }
+}
+
+/// The inline fast path of the two-byte decoders, from a clean state: ASCII
+/// and the common whole characters, until anything else (or the end of
+/// either buffer) stops it. Returns the new `{ r, w }`; the byte at `r` is
+/// then for the state machine.
+inline fn fastRun(comptime enc: Cjk, src: []const u8, dst: []u8, r0: usize, w0: usize) [2]usize {
+    var r = r0;
+    var w = w0;
+    while (r < src.len and w < dst.len) {
+        const b = src[r];
+        if (b < 0x80) {
+            dst[w] = b;
+            r += 1;
+            w += 1;
+            // A run of ASCII, eight bytes at a time.
+            while (r + 8 <= src.len and w + 8 <= dst.len) {
+                const x = std.mem.readInt(u64, src[r..][0..8], .little);
+                if (x & 0x8080808080808080 != 0) break;
+                std.mem.writeInt(u64, dst[w..][0..8], x, .little);
+                r += 8;
+                w += 8;
+            }
+            continue;
+        }
+        if (dst.len - w < decoder_headroom) break;
+        if (enc == .shift_jis and b >= 0xA1 and b <= 0xDF) {
+            w += put3(dst, w, 0xFF61 - 0xA1 + @as(u21, b));
+            r += 1;
+            continue;
+        }
+        if (r + 1 >= src.len) break;
+        const cp = pairCp(enc, b, src[r + 1]) orelse break;
+        w += put3(dst, w, cp);
+        r += 2;
+    }
+    return .{ r, w };
+}
+
 fn putCp(dst: []u8, cp: u21) usize {
     var buf: [4]u8 = undefined;
     const n = std.unicode.utf8Encode(cp, &buf) catch {
@@ -841,7 +1071,7 @@ pub const Encoder = struct {
             .iso_2022_jp => return self.putIso(cp, dst),
             .euc_kr => {
                 if (cp < 0x80) return ascii(cp, dst);
-                const ptr = search(ekOf, &t.euckr_enc, cp) orelse return unmap(cp);
+                const ptr = ekPtr(cp) orelse return unmap(cp);
                 dst[0] = @intCast(ptr / 190 + 0x81);
                 dst[1] = @intCast(ptr % 190 + 0x41);
                 return .{ .written = 2 };
@@ -849,7 +1079,7 @@ pub const Encoder = struct {
             .gb18030, .gbk => return putGb(cp, dst, self.enc == .gbk),
             .big5 => {
                 if (cp < 0x80) return ascii(cp, dst);
-                const ptr = search(b5Of, &t.big5_enc, cp) orelse return unmap(cp);
+                const ptr = b5Ptr(cp) orelse return unmap(cp);
                 dst[0] = @intCast(ptr / 157 + 0x81);
                 const trailing = ptr % 157;
                 dst[1] = @intCast(trailing + @as(u16, if (trailing < 0x3F) 0x40 else 0x62));
@@ -960,14 +1190,14 @@ fn putGb(cp: u21, dst: []u8, is_gbk: bool) Encoder.Put {
     // 0xA3 0xA0 decodes to U+3000, so U+E5E5 cannot round-trip.
     if (cp == 0xE5E5) return unmap(cp);
     if (is_gbk and cp == 0x20AC) return ascii(0x80, dst);
-    for (gb_side) |s| {
+    if (cp >= 0xE78D and cp <= 0xE864) for (gb_side) |s| {
         if (s.cp == cp) {
             dst[0] = s.b1;
             dst[1] = s.b2;
             return .{ .written = 2 };
         }
-    }
-    if (search(gbOf, &t.gb_enc, cp)) |ptr| {
+    };
+    if (gbPtr(cp)) |ptr| {
         dst[0] = @intCast(ptr / 190 + 0x81);
         const trailing = ptr % 190;
         dst[1] = @intCast(trailing + @as(u16, if (trailing < 0x3F) 0x40 else 0x41));
