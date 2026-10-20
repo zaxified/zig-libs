@@ -6,8 +6,8 @@
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-testkit` runs it (always
 //! ReleaseFast). No foreign side: the reference is what a hand-written verdict
-//! loop costs — `DefaultPrng.init(seed)`, an `Rng`, the harness, the same
-//! allocator — so the ratio is exactly what the driver adds (watchdog
+//! loop costs — `DefaultPrng.init(seed)`, an `Rng`, the harness, a
+//! `SafeAllocator` over the same backing allocator — so the ratio is exactly what the driver adds (watchdog
 //! timestamps, the seed file a runner always sets, reach bookkeeping).
 //!
 //! Workloads, each one batch of 10 000 seeds per op (one driver call: its
@@ -17,7 +17,8 @@
 //! the seed gains a digit): `hex` — a 160-byte slice
 //! decoded by `testkit.hex.into` (as cheap as the collection's harnesses
 //! get, so the driver's share is largest); `alloc` — the same plus two
-//! allocations through the driver's `DebugAllocator` (the common shape).
+//! allocations through the harness's `SafeAllocator` (the common shape; the
+//! driver renews its one per batch of seeds, 2026-10-20).
 //! `+seedfile` rows run the driver with a seed file, as `MOD_FUZZ_SEEDFILE`.
 //! Method: `testkit.bench.timeIt` on both sides, alternating for
 //! `BENCH_ROUNDS` (default 3) rounds, ratio by WALL time: the seed file's
@@ -63,10 +64,15 @@ const Ctx = struct {
 fn bare(comptime harness: anytype) fn (*Ctx) usize {
     return struct {
         fn f(x: *Ctx) usize {
+            // The allocator a hand-written 0.17 loop hands its harness: one
+            // leak-checking `SafeAllocator` for the run, as the driver's
+            // (renewed per batch of seeds there).
+            var sa: std.heap.SafeAllocator = .init(x.gpa, .{ .stack_trace_frames = 0 });
+            defer _ = sa.deinit();
             for (0..batch) |i| {
                 var prng = std.Random.DefaultPrng.init(x.first + i);
                 var rng: testkit.fuzz.Rng = .{ .r = prng.random() };
-                harness(testkit.fuzz.Rng, &rng, x.gpa) catch unreachable;
+                harness(testkit.fuzz.Rng, &rng, sa.allocator()) catch unreachable;
             }
             x.first += batch;
             return batch;

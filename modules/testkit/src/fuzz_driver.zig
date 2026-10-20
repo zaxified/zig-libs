@@ -614,6 +614,55 @@ fn runSeeds(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.me
 /// run it silent, since this repo fails a passing step that writes to stderr.
 /// Public for `tools/bench.zig`, which times it against a bare seed loop; a
 /// harness's test calls `run`.
+/// A fresh `SafeAllocator` after this many seeds, or once a batch's seeds
+/// have allocated this many bytes (it never reuses freed memory, so the
+/// bytes are what the batch holds).
+const seeds_per_batch = 1024;
+const bytes_per_batch = 64 << 20;
+
+/// One seed's view of the batch allocator: counts what is live, so a leak is
+/// pinned on the seed that made it. Atomic: a harness may allocate from
+/// threads it spawns.
+const SeedLedger = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    bytes: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(l: *SeedLedger) std.mem.Allocator {
+        return .{ .ptr = l, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const l: *SeedLedger = @ptrCast(@alignCast(ctx));
+        const p = l.child.rawAlloc(len, a, ra) orelse return null;
+        _ = l.live.fetchAdd(1, .monotonic);
+        _ = l.bytes.fetchAdd(len, .monotonic);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const l: *SeedLedger = @ptrCast(@alignCast(ctx));
+        if (!l.child.rawResize(memory, a, new_len, ra)) return false;
+        if (new_len > memory.len) _ = l.bytes.fetchAdd(new_len - memory.len, .monotonic);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const l: *SeedLedger = @ptrCast(@alignCast(ctx));
+        const p = l.child.rawRemap(memory, a, new_len, ra) orelse return null;
+        if (new_len > memory.len) _ = l.bytes.fetchAdd(new_len - memory.len, .monotonic);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const l: *SeedLedger = @ptrCast(@alignCast(ctx));
+        l.child.rawFree(memory, a, ra);
+        _ = l.live.fetchSub(1, .monotonic);
+    }
+};
+
 pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec, gpa: std.mem.Allocator, seed_fd: ?i32, report: bool) !void {
     // Count this run's arrivals only, not those of a test that ran the
     // harness before (a `testing.fuzz` smoke input, an in-suite loop).
@@ -625,20 +674,33 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
     defer if (seed_file) |*sf| sf.close();
     const t0 = nowNs();
     var last_report = t0;
+    // One allocator per BATCH of seeds (std/heap/SafeAllocator.zig:621 init,
+    // :653 deinit): the 0.17 `testing.allocator` never reuses memory, so a
+    // loop of thousands of seeds on one allocator only grows; a fresh one per
+    // batch bounds that. Not one per seed: its `threads: [128]Thread` made
+    // init + deinit ~1 µs, 4.2x a 0.3 µs harness (bench-testkit `hex`,
+    // 2026-10-20). A leak still fails the seed that made it, by number:
+    // `SeedLedger` counts that seed's live allocations.
+    var batch: ?std.heap.SafeAllocator = null;
+    defer if (batch) |*b| {
+        _ = b.deinitLog(false);
+    };
+    var batch_seeds: usize = 0;
+    var batch_bytes: usize = 0;
     var seed = first;
     while (seed < first + runs) : (seed += 1) {
         var prng = std.Random.DefaultPrng.init(seed);
         var rng: Rng = .{ .r = prng.random() };
         if (seed_file) |*sf| sf.set(seed);
+        if (batch == null) {
+            batch = .init(gpa, .{ .stack_trace_frames = 0 });
+            batch_seeds = 0;
+            batch_bytes = 0;
+        }
+        var ledger: SeedLedger = .{ .child = batch.?.allocator() };
         enter(seed);
-        // One allocator per seed (std/heap/SafeAllocator.zig:621 init, :653
-        // deinit): the 0.17 `testing.allocator` never reuses memory, so a
-        // loop of thousands of seeds on one allocator only grows. Leaks are
-        // checked at the end of each seed and fail it, with its number.
-        var seed_alloc: std.heap.SafeAllocator = .init(gpa, .{ .stack_trace_frames = 0 });
-        harness(Rng, &rng, seed_alloc.allocator()) catch |e| {
+        harness(Rng, &rng, ledger.allocator()) catch |e| {
             leave();
-            _ = seed_alloc.deinitLog(false);
             if (report) {
                 std.debug.print("FAIL {s} seed={d}: {t}\n", .{ opts.name, seed, e });
                 printShrinkHint(seed);
@@ -646,9 +708,19 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
             return e;
         };
         leave();
-        if (seed_alloc.deinitLog(report) != 0) {
-            if (report) std.debug.print("FAIL {s} seed={d}: memory leak\n", .{ opts.name, seed });
+        if (ledger.live.load(.monotonic) != 0) {
+            if (report) {
+                _ = batch.?.deinitLog(true);
+                batch = null;
+                std.debug.print("FAIL {s} seed={d}: memory leak\n", .{ opts.name, seed });
+            }
             return error.MemoryLeakDetected;
+        }
+        batch_seeds += 1;
+        batch_bytes +|= ledger.bytes.load(.monotonic);
+        if (batch_seeds == seeds_per_batch or batch_bytes >= bytes_per_batch) {
+            _ = batch.?.deinitLog(false); // every seed in it checked clean above
+            batch = null;
         }
         // The clock, for the progress line, every 1024 seeds only.
         if (report and (seed - first) % 1024 == 1023) {
@@ -809,6 +881,23 @@ test "runSeeds: a leak in one seed fails the run (per-seed SafeAllocator is not 
     try testing.expectError(error.MemoryLeakDetected, runSeedsReporting(leaker, "leak", .{ .runs = 6, .first = 0 }, testing.allocator, null, false));
     // The seed range that does not reach the leaking seed is green.
     try runSeedsReporting(leaker, "leak", .{ .runs = 3, .first = 0 }, testing.allocator, null, false);
+    // Past a batch boundary (the batch allocator is renewed every
+    // `seeds_per_batch` seeds; the ledger still pins the leak on its seed).
+    leak_at = seeds_per_batch + 36;
+    try testing.expectError(error.MemoryLeakDetected, runSeedsReporting(leaker, "leak", .{ .runs = 2 * seeds_per_batch + 2, .first = 0 }, testing.allocator, null, false));
+    try runSeedsReporting(leaker, "leak", .{ .runs = seeds_per_batch + 36, .first = 0 }, testing.allocator, null, false);
+}
+
+/// Grows and shrinks one buffer through `realloc` and frees it: the ledger's
+/// resize/remap paths must leave the seed clean.
+fn regrower(comptime S: type, src: *S, a: std.mem.Allocator) anyerror!void {
+    var buf = try a.alloc(u8, 1 + src.valueRangeAtMost(usize, 0, 64));
+    defer a.free(buf);
+    for (0..4) |_| buf = try a.realloc(buf, 1 + src.valueRangeAtMost(usize, 0, 9000));
+}
+
+test "runSeeds: realloc growth and shrink across batches is not a leak" {
+    try runSeedsReporting(regrower, "regrow", .{ .runs = 3 * seeds_per_batch, .first = 0 }, testing.allocator, null, false);
 }
 
 test "runSeeds: reach counters are collected and reset after the report" {

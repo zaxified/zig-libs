@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-17 (TESTKIT_FUZZ, clean: hex 2M, golden 1M, fault 1.6M, tape 240k runs; 5 planted mutants all killed) · ct n/a — test helpers (keyword review, 2026-10-07)
 
-**Performance:** ref 1.00–1.04× a bare seed loop over the same harness · fastest ref (measured 2026-10-17)
+**Performance:** ref 1.03–1.07× a bare seed loop over the same harness · fastest ref (measured 2026-10-20)
 
 **Evidence:** model-fuzz — `hex` against a from-scratch nibble decoder, golden `diff`/`render`/verdicts against a naive first-difference scan and a string-built rendering, the fault transports against their input, the choice tape against the PRNG it records (`src/fuzz_test.zig`); hex also against a strict RFC 4648 decoder over all 16276 short inputs (tools)
 
@@ -293,6 +293,10 @@ is required (root [`NOTICE`](../../NOTICE) §0). DATA: none. `src/golden.zig` is
 **What the tests actually contain.** in-process test-utility layer over std.testing, no wire/crypto
 
 **Reference-class check anyway:** `modules/testkit/tools/README.md` — even a class-C decision benefits from a second opinion; `hex.into`/`.alloc` match a from-scratch strict RFC 4648 decoder on all 16 276 exhaustive short inputs (0 diffs), and disagree with Python's own `bytes.fromhex` only on its whitespace leniency (255/16 276, all in the stricter direction).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-testkit`, `BENCH_ROUNDS=5`, wall time, largest spread 3.7 %): driver/bare 1.03 (`hex`), 1.04 (`hex+seedfile`), 1.07 (`alloc`, `alloc+seedfile`). The first 0.17 run read **4.24×** on `hex`: the 0.17 migration gave every seed its own `SafeAllocator`, whose init + deinit (`threads: [128]Thread`) cost ~1 µs, against a 0.3 µs harness. The driver now renews it per batch (1024 seeds or 64 MiB allocated) and pins a leak on its seed through a counting `SeedLedger`. The bare loop now also allocates through one `SafeAllocator` (it used the `DebugAllocator` directly, which on 0.17 cost 25 µs a seed for two allocations, so the `alloc` rows read 0.03× — not a comparison).
 
 ## Backlog / deferred
 
