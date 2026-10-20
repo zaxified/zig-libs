@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const kvtree = @import("kvtree");
+const regex = @import("regex");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -91,6 +92,14 @@ pub const Error = codec.CanonError ||
         /// construction; surfaced as an error so a regression stops instead of
         /// spinning forever.
         SweepStalled,
+        /// `aggregate`: non-positive step, or `out` shorter than `bucketCount`.
+        InvalidAggregate,
+        /// `Options.max_series` series are already registered and the name +
+        /// labels asked for are not one of them (`seriesId` only).
+        TooManySeries,
+        /// A `Matcher` with op `re`/`nre` carries a pattern the regex module
+        /// rejects.
+        InvalidRegex,
     };
 
 /// One sample of one series.
@@ -142,9 +151,31 @@ pub const Db = struct {
     /// Blocks were seen once: stop re-checking (a store that compacts keeps
     /// blocks; if a sweep removed them all, `range` only pays the seek).
     blocks_seen: bool = false,
+    opts: Options = .{},
+    /// Registered-series count for `Options.max_series`, valid only while the
+    /// tree is still at kvtree version `series_count_at` (another `Db` over
+    /// the same tree committing moves the version and forces a recount).
+    series_count: usize = 0,
+    series_count_at: ?u64 = null,
+
+    pub const Options = struct {
+        /// Cardinality limit: `seriesId` returns `error.TooManySeries` when it
+        /// would register series number `max_series + 1`. Series that exist
+        /// still resolve. Null = unlimited.
+        max_series: ?usize = null,
+        /// Bound on the in-memory name+labels -> id cache (entries). Once
+        /// full, further series are simply not cached (they resolve through
+        /// the tree); nothing is evicted. Worst-case memory is about
+        /// `max_cached_series` x (canonical key length + ~40 bytes).
+        max_cached_series: usize = 65536,
+    };
 
     pub fn init(gpa: Allocator, tree: *kvtree.Db) Db {
         return .{ .gpa = gpa, .tree = tree };
+    }
+
+    pub fn initOptions(gpa: Allocator, tree: *kvtree.Db, opts: Options) Db {
+        return .{ .gpa = gpa, .tree = tree, .opts = opts };
     }
 
     /// Frees the in-memory series-id cache and sweep scratch. Does not touch
@@ -164,6 +195,7 @@ pub const Db = struct {
     /// campaign's writebehind F3 finding is why that distinction matters).
     fn cacheSeriesId(self: *Db, idx_key: []const u8, id: SeriesId) void {
         if (self.series_cache.contains(idx_key)) return;
+        if (self.series_cache.count() >= self.opts.max_cached_series) return;
         const key_copy = self.gpa.dupe(u8, idx_key) catch return;
         self.series_cache.put(self.gpa, key_copy, id) catch self.gpa.free(key_copy);
     }
@@ -194,6 +226,9 @@ pub const Db = struct {
             return id;
         }
 
+        if (self.opts.max_series) |limit| {
+            if (try self.countSeries() >= limit) return error.TooManySeries;
+        }
         const id = try self.nextSeriesId();
         var id_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &id_bytes, id, .big);
@@ -209,8 +244,44 @@ pub const Db = struct {
             try txn.put(&codec.meta_key_next_series, &counter);
         }
         try txn.commit(); // consumes the txn on both outcomes
+        if (self.opts.max_series != null) self.noteSeriesAdded();
         self.cacheSeriesId(idx_key.items, id);
         return id;
+    }
+
+    /// Number of registered series: a reverse-index scan, redone only when
+    /// the tree's version is not the one the count was last known at.
+    fn countSeries(self: *Db) Error!usize {
+        var snap = try self.tree.snapshot();
+        defer snap.release();
+        if (self.series_count_at) |v| if (v == snap.txn_id) return self.series_count;
+        var cur = try snap.cursor();
+        defer cur.deinit();
+        try cur.seek(&[_]u8{codec.tag_series_rev});
+        var n: usize = 0;
+        while (try cur.next()) |e| {
+            if (e.key.len != 9 or e.key[0] != codec.tag_series_rev) break;
+            n += 1;
+        }
+        self.series_count = n;
+        self.series_count_at = snap.txn_id;
+        return n;
+    }
+
+    /// Called right after this `Db` committed one new series: if the count
+    /// was valid just before the commit it stays valid, re-stamped.
+    fn noteSeriesAdded(self: *Db) void {
+        const prev = self.series_count_at orelse return;
+        var snap = self.tree.snapshot() catch {
+            self.series_count_at = null;
+            return;
+        };
+        defer snap.release();
+        // single writer: our commit is exactly the one after `prev`
+        if (snap.txn_id == prev + 1) {
+            self.series_count += 1;
+            self.series_count_at = snap.txn_id;
+        } else self.series_count_at = null;
     }
 
     /// Resolve without creating. Null when the series has never been written.
@@ -444,6 +515,7 @@ pub const Db = struct {
                 }
             }
             try txn.commit();
+            self.series_count_at = null;
             res.chunks += 1;
             if (!more) return res;
         }
@@ -1059,6 +1131,237 @@ pub const Db = struct {
         return .{ .before = before, .after = after, .deleted = deleted, .done = after <= max_bytes };
     }
 
+    // ── maintenance ──────────────────────────────────────────────────────────
+
+    /// What `maintain` does; every step is optional.
+    pub const Policy = struct {
+        /// Pack samples older than `now - compact_after` into blocks
+        /// (`compact`). In the same unit as the timestamps. Null = no
+        /// compaction.
+        compact_after: ?Timestamp = null,
+        /// Keep samples newer than `now - retention`; older ones are swept.
+        /// Null = keep forever.
+        retention: ?Timestamp = null,
+        /// Keep live data within this many bytes (`sweepToBudget`). Null = no
+        /// budget.
+        max_bytes: ?u64 = null,
+        compact_options: CompactOptions = .{},
+        sweep_options: SweepOptions = .{},
+        budget_options: SweepToBudgetOptions = .{},
+    };
+
+    pub const MaintainResult = struct {
+        sweep: ?SweepResult = null,
+        compact: ?CompactResult = null,
+        budget: ?SweepToBudgetResult = null,
+    };
+
+    /// One call that does the periodic housekeeping: age retention, then
+    /// compaction, then the size budget. Run it from a timer (e.g. every few
+    /// minutes); nothing in this module runs by itself, and a store that is
+    /// never maintained keeps 25 bytes per sample and grows without bound.
+    ///
+    /// The order is deliberate: expired data is dropped before it is packed,
+    /// and the budget sees the compacted size. Each step keeps its own
+    /// guarantees (chunked transactions, resumable sweep); a step that hits
+    /// its `max_chunks` / `max_deletes` limit reports `done = false` and the
+    /// next call continues. `now` and the durations share the timestamps' unit;
+    /// subtraction saturates.
+    pub fn maintain(self: *Db, now: Timestamp, policy: Policy) Error!MaintainResult {
+        var res: MaintainResult = .{};
+        if (policy.retention) |keep| res.sweep = try self.sweep(now -| keep, policy.sweep_options);
+        if (policy.compact_after) |age| res.compact = try self.compact(now -| age, policy.compact_options);
+        if (policy.max_bytes) |cap| res.budget = try self.sweepToBudget(cap, policy.budget_options);
+        return res;
+    }
+
+    // ── label names / values ─────────────────────────────────────────────────
+
+    /// Every metric name that has a registered series, sorted, unique. The
+    /// slice and the strings are allocated on `arena`.
+    pub fn metricNames(self: *Db, arena: Allocator) Error![][]const u8 {
+        return self.collectStrings(arena, .metric, "");
+    }
+
+    /// Every label name used by any series, sorted, unique (the metric name
+    /// is not a label). Allocated on `arena`. One reverse-index scan.
+    pub fn labelNames(self: *Db, arena: Allocator) Error![][]const u8 {
+        return self.collectStrings(arena, .label_names, "");
+    }
+
+    /// Every value `name` takes across all series, sorted, unique. Allocated
+    /// on `arena`.
+    pub fn labelValues(self: *Db, arena: Allocator, name: []const u8) Error![][]const u8 {
+        return self.collectStrings(arena, .label_values, name);
+    }
+
+    fn collectStrings(self: *Db, arena: Allocator, what: enum { metric, label_names, label_values }, want: []const u8) Error![][]const u8 {
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(self.gpa);
+        var out: std.ArrayList([]const u8) = .empty;
+        var it = try self.seriesIterator();
+        defer it.deinit();
+        while (try it.next(self.gpa)) |e_val| {
+            var e = e_val;
+            defer e.deinit(self.gpa);
+            switch (what) {
+                .metric => try noteString(self.gpa, arena, &seen, &out, e.descriptor.name),
+                .label_names => for (e.descriptor.labels) |l| try noteString(self.gpa, arena, &seen, &out, l.name),
+                .label_values => for (e.descriptor.labels) |l| {
+                    if (std.mem.eql(u8, l.name, want)) try noteString(self.gpa, arena, &seen, &out, l.value);
+                },
+            }
+        }
+        std.mem.sort([]const u8, out.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return out.items;
+    }
+
+    // ── matchers ─────────────────────────────────────────────────────────────
+
+    /// Series of metric `name` whose labels satisfy EVERY matcher (see
+    /// `Matcher`). Scans only the series registered under `name` (the same
+    /// name-prefix range as `findSeries`); no index of its own. `matchers` is
+    /// borrowed and must outlive the iterator. `re`/`nre` patterns are
+    /// compiled once here (fully anchored, as in Prometheus: the whole value
+    /// must match) and freed by the iterator's `deinit`; a bad pattern is
+    /// `error.InvalidRegex`.
+    pub fn findSeriesMatching(self: *Db, name: []const u8, matchers: []const Matcher) Error!SeriesIterator {
+        const res = try self.gpa.alloc(?regex.Regex, matchers.len);
+        @memset(res, null);
+        errdefer {
+            for (res) |*r| if (r.*) |*x| x.deinit(self.gpa);
+            self.gpa.free(res);
+        }
+        for (matchers, res) |m, *r| {
+            if (m.op != .re and m.op != .nre) continue;
+            r.* = regex.Regex.compile(self.gpa, m.value) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidRegex,
+            };
+        }
+        var it = try self.findSeries(name, &.{});
+        it.mode.by_name.matchers = matchers;
+        it.regexes = res;
+        it.regex_gpa = self.gpa;
+        return it;
+    }
+
+    // ── range deletion ───────────────────────────────────────────────────────
+
+    /// Delete the samples of `series` with `from <= ts < to`, raw and
+    /// compacted, in ONE transaction (all or nothing across a crash). A block
+    /// that straddles the window is decoded, stripped of the window's samples
+    /// and re-encoded. Returns the number of samples removed (a timestamp
+    /// held both raw and in a block counts twice). The transaction holds the
+    /// affected keys and straddling blocks in memory: for a very large window
+    /// prefer `sweep` (by age) or several smaller calls.
+    pub fn deleteRange(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp) Error!usize {
+        if (from >= to) return 0;
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var keys: std.ArrayList([codec.point_key_len]u8) = .empty;
+        const Rewrite = struct { samples: []const Sample };
+        var rewrites: std.ArrayList(Rewrite) = .empty;
+        var removed: usize = 0;
+        {
+            var cur = try self.tree.cursor();
+            defer cur.deinit();
+            try cur.seek(&codec.pointKey(series, from));
+            while (try cur.next()) |e| {
+                const p = codec.decodePointKey(e.key) orelse break;
+                if (p.series != series or p.ts >= to) break;
+                try keys.append(a, e.key[0..codec.point_key_len].*);
+                removed += 1;
+            }
+            try cur.seek(&codec.blockKey(series, from));
+            while (try cur.next()) |e| {
+                const bk = codec.decodeBlockKey(e.key) orelse break;
+                if (bk.series != series) break;
+                const first = chunk.firstTs(e.val) catch return error.CorruptPoint;
+                if (first >= to) break;
+                var keep: std.ArrayList(Sample) = .empty;
+                var dropped: usize = 0;
+                var rd = chunk.Reader.init(e.val) catch return error.CorruptPoint;
+                while (rd.next() catch return error.CorruptPoint) |bs| {
+                    if (bs.ts >= from and bs.ts < to) {
+                        dropped += 1;
+                    } else try keep.append(a, .{ .ts = bs.ts, .value = bs.value });
+                }
+                if (dropped == 0) continue;
+                try keys.append(a, e.key[0..codec.point_key_len].*);
+                if (keep.items.len != 0) try rewrites.append(a, .{ .samples = keep.items });
+                removed += dropped;
+            }
+        }
+        if (removed == 0) return 0;
+        var txn = try self.tree.begin();
+        {
+            errdefer txn.rollback();
+            for (keys.items) |*k| try txn.del(k);
+            // Deleted first: a rewrite whose last piece keeps the old key re-puts it.
+            for (rewrites.items) |rw| _ = try putBlocks(&txn, series, rw.samples);
+        }
+        try txn.commit();
+        return removed;
+    }
+
+    // ── per-bucket aggregation ───────────────────────────────────────────────
+
+    pub const AggFn = enum { min, max, sum, count, last, avg };
+
+    /// Number of buckets `aggregate` fills for `[from, to)` at `step`.
+    pub fn bucketCount(from: Timestamp, to: Timestamp, step: Timestamp) usize {
+        if (step <= 0 or from >= to) return 0;
+        const span: i128 = @as(i128, to) - @as(i128, from);
+        const n = @divTrunc(span + step - 1, @as(i128, step));
+        return std.math.cast(usize, n) orelse std.math.maxInt(usize);
+    }
+
+    /// Reduce `[from, to)` of one series into fixed `step`-wide buckets with
+    /// `func`, streaming over `range` (nothing buffered). Bucket `i` covers
+    /// `[from + i*step, from + (i+1)*step)` clipped to `to`. `out` must hold
+    /// `bucketCount(from, to, step)` entries (else `error.InvalidAggregate`);
+    /// an empty bucket is null for every function (also `count`). NaN samples
+    /// are ignored by `min`/`max` unless a bucket holds only NaNs, and
+    /// propagate through `sum`/`avg`. Returns the number of buckets written.
+    pub fn aggregate(self: *Db, series: SeriesId, from: Timestamp, to: Timestamp, step: Timestamp, func: AggFn, out: []?f64) Error!usize {
+        if (step <= 0) return error.InvalidAggregate;
+        const n = bucketCount(from, to, step);
+        if (out.len < n) return error.InvalidAggregate;
+        @memset(out[0..n], null);
+        if (n == 0) return 0;
+        var r = try self.range(series, from, to);
+        defer r.deinit();
+        var cur_idx: usize = 0;
+        var acc: f64 = 0;
+        var cnt: usize = 0;
+        while (try r.next()) |s| {
+            const idx: usize = @intCast(@divTrunc(@as(i128, s.ts) - @as(i128, from), @as(i128, step)));
+            if (cnt != 0 and idx != cur_idx) {
+                out[cur_idx] = finishAgg(func, acc, cnt);
+                cnt = 0;
+            }
+            cur_idx = idx;
+            if (cnt == 0) {
+                acc = if (func == .count) 1 else s.value;
+            } else switch (func) {
+                .min => acc = @min(acc, s.value),
+                .max => acc = @max(acc, s.value),
+                .sum, .avg => acc += s.value,
+                .count => acc += 1,
+                .last => acc = s.value,
+            }
+            cnt += 1;
+        }
+        if (cnt != 0) out[cur_idx] = finishAgg(func, acc, cnt);
+        return n;
+    }
+
     /// One deletable entry for `sweepToBudget`: a raw point or a whole block.
     const Unit = struct {
         key: [codec.point_key_len]u8,
@@ -1102,6 +1405,52 @@ pub const Db = struct {
         };
     }
 };
+
+/// Add `str` to `out` (copied onto `arena`) unless `seen` has it.
+fn noteString(gpa: Allocator, arena: Allocator, seen: *std.StringHashMapUnmanaged(void), out: *std.ArrayList([]const u8), str: []const u8) Error!void {
+    if (seen.contains(str)) return;
+    const copy = try arena.dupe(u8, str);
+    try seen.put(gpa, copy, {});
+    try out.append(arena, copy);
+}
+
+fn finishAgg(func: Db.AggFn, acc: f64, cnt: usize) f64 {
+    return switch (func) {
+        .avg => acc / @as(f64, @floatFromInt(cnt)),
+        else => acc,
+    };
+}
+
+/// A label matcher for `Db.findSeriesMatching`, Prometheus semantics: a label
+/// the series does not have reads as the empty string, so `{name="x", op=.neq,
+/// value="y"}` matches a series without `x`, and `.eq` with value "" matches
+/// one too.
+pub const Matcher = struct {
+    name: []const u8,
+    value: []const u8,
+    op: Op = .eq,
+
+    pub const Op = enum { eq, neq, re, nre };
+};
+
+/// True iff `have` satisfies every matcher; `res[i]` is the compiled pattern
+/// of matcher `i` for re/nre.
+fn matchersMatch(have: []const Label, matchers: []const Matcher, res: []const ?regex.Regex) bool {
+    for (matchers, 0..) |m, i| {
+        var v: []const u8 = "";
+        for (have) |h| if (std.mem.eql(u8, h.name, m.name)) {
+            v = h.value;
+            break;
+        };
+        switch (m.op) {
+            .eq => if (!std.mem.eql(u8, v, m.value)) return false,
+            .neq => if (std.mem.eql(u8, v, m.value)) return false,
+            .re => if (!res[i].?.fullMatch(v)) return false,
+            .nre => if (res[i].?.fullMatch(v)) return false,
+        }
+    }
+    return true;
+}
 
 // ── blocks ───────────────────────────────────────────────────────────────────
 
@@ -1234,6 +1583,9 @@ pub const SeriesIterator = struct {
     snap: kvtree.Snapshot,
     cur: kvtree.Cursor,
     mode: Mode,
+    /// Compiled `Matcher` patterns (`findSeriesMatching`), owned.
+    regexes: []?regex.Regex = &.{},
+    regex_gpa: ?Allocator = null,
 
     const Mode = union(enum) {
         /// `Db.seriesIterator`: the whole reverse index, in id order.
@@ -1244,6 +1596,8 @@ pub const SeriesIterator = struct {
             prefix: [1 + 2 + codec.max_component_len]u8,
             prefix_len: usize,
             filter: []const Label,
+            /// Set by `findSeriesMatching`; empty otherwise.
+            matchers: []const Matcher = &.{},
         },
     };
 
@@ -1267,7 +1621,9 @@ pub const SeriesIterator = struct {
                     if (e.val.len != 8) return error.CorruptIndex;
                     const id = std.mem.readInt(u64, e.val[0..8], .big);
                     const entry = try self.decodeEntry(gpa, id, e.key[1..]);
-                    if (!labelsMatch(entry.descriptor.labels, m.filter)) {
+                    if (!labelsMatch(entry.descriptor.labels, m.filter) or
+                        !matchersMatch(entry.descriptor.labels, m.matchers, self.regexes))
+                    {
                         var mut = entry;
                         mut.deinit(gpa);
                         continue; // keep scanning within this name's range
@@ -1293,6 +1649,10 @@ pub const SeriesIterator = struct {
     }
 
     pub fn deinit(self: *SeriesIterator) void {
+        if (self.regex_gpa) |g| {
+            for (self.regexes) |*r| if (r.*) |*x| x.deinit(g);
+            g.free(self.regexes);
+        }
         self.cur.deinit();
         self.snap.release();
         self.* = undefined;
@@ -3386,4 +3746,364 @@ test "deleteSeries: deleting a LOWER id never touches a higher series, and chunk
     try testing.expectEqual(@as(usize, 100), kept.len);
     try testing.expectEqual(@as(usize, 50), try rawCount(&fx.db));
     try testing.expectEqual(@as(usize, 1), try checkBlockInvariants(&fx.db));
+}
+
+// ── S2 additions (2026-10-20): maintain, max_series, label listing, matchers,
+// deleteRange, aggregate ─────────────────────────────────────────────────────
+
+const all_lo = std.math.minInt(i64);
+const all_hi = std.math.maxInt(i64);
+
+fn expectSeries(gpa: Allocator, db: *Db, id: SeriesId, from: Timestamp, to: Timestamp, expect: []const Sample) !void {
+    const got = try collect(gpa, db, id, from, to);
+    defer gpa.free(got);
+    try testing.expectEqualSlices(Sample, expect, got);
+}
+
+test "maintain: retention, compaction and the size budget in one call; unset steps are skipped" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("m", &.{});
+    for (0..3000) |i| try fx.db.append(s, @intCast(i), @floatFromInt(i));
+
+    const none = try fx.db.maintain(3000, .{});
+    try testing.expect(none.sweep == null and none.compact == null and none.budget == null);
+    try testing.expectEqual(@as(usize, 3000), try rawCount(&fx.db));
+
+    // keep the last 1000 (cutoff 2000); pack everything older than 100 back.
+    const r = try fx.db.maintain(3000, .{ .retention = 1000, .compact_after = 100, .compact_options = .{ .min_run = 1 } });
+    try testing.expect(r.sweep.?.done and r.sweep.?.deleted == 2000);
+    try testing.expect(r.compact.?.done and r.compact.?.compacted == 900);
+    try testing.expect(r.budget == null);
+    try testing.expectEqual(@as(usize, 100), try rawCount(&fx.db));
+    const got = try collect(gpa, &fx.db, s, all_lo, all_hi);
+    defer gpa.free(got);
+    try testing.expectEqual(@as(usize, 1000), got.len);
+    try testing.expectEqual(@as(Timestamp, 2000), got[0].ts);
+    _ = try checkBlockInvariants(&fx.db);
+
+    // budget: shrink to well below the current size.
+    const live = try fx.db.liveSize();
+    const b = try fx.db.maintain(3000, .{ .max_bytes = live / 2 });
+    try testing.expect(b.budget.?.done and b.budget.?.after <= live / 2);
+    try testing.expect(b.sweep == null and b.compact == null);
+    // saturating subtraction: a huge duration does not overflow
+    _ = try fx.db.maintain(all_lo + 5, .{ .retention = all_hi, .compact_after = all_hi });
+}
+
+test "max_series: series N+1 is refused, existing ones resolve, count survives reopen, delete frees a slot" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    fx.db.opts.max_series = 2;
+    const a = try fx.db.seriesId("a", &.{});
+    const b = try fx.db.seriesId("b", &.{});
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("c", &.{}));
+    try testing.expectEqual(a, try fx.db.seriesId("a", &.{}));
+    try testing.expectEqual(b, try fx.db.seriesId("b", &.{}));
+    try testing.expect((try fx.db.lookupSeries("c", &.{})) == null);
+
+    // a fresh Db (empty cache, unknown count) over the same tree
+    try fx.reopen();
+    fx.db.opts.max_series = 2;
+    try testing.expectEqual(a, try fx.db.seriesId("a", &.{}));
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("c", &.{}));
+
+    // another Db over the same tree registering a series is noticed
+    var other = Db.init(gpa, fx.tree);
+    defer other.deinit();
+    _ = try fx.db.deleteSeries(b, .{});
+    _ = try other.seriesId("x", &.{});
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("c", &.{}));
+
+    // deleting frees a slot
+    _ = try fx.db.deleteSeries(a, .{});
+    _ = try fx.db.seriesId("c", &.{});
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("d", &.{}));
+}
+
+test "max_cached_series bounds the cache; uncached series still resolve" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    fx.db.opts.max_cached_series = 2;
+    var ids: [5]SeriesId = undefined;
+    const names = [_][]const u8{ "a", "b", "c", "d", "e" };
+    for (names, &ids) |n, *id| id.* = try fx.db.seriesId(n, &.{});
+    try testing.expectEqual(@as(u32, 2), fx.db.series_cache.count());
+    for (names, ids) |n, id| try testing.expectEqual(id, try fx.db.seriesId(n, &.{}));
+    try testing.expectEqual(@as(u32, 2), fx.db.series_cache.count());
+}
+
+fn expectStrings(expect: []const []const u8, got: []const []const u8) !void {
+    try testing.expectEqual(expect.len, got.len);
+    for (expect, got) |e, g| try testing.expectEqualStrings(e, g);
+}
+
+test "metricNames / labelNames / labelValues: sorted, unique, across all series" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try expectStrings(&.{}, try fx.db.labelNames(arena.allocator()));
+
+    _ = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "b" }, .{ .name = "core", .value = "0" } });
+    _ = try fx.db.seriesId("cpu", &.{ .{ .name = "host", .value = "a" }, .{ .name = "core", .value = "0" } });
+    _ = try fx.db.seriesId("mem", &.{.{ .name = "host", .value = "a" }});
+    _ = try fx.db.seriesId("mem", &.{ .{ .name = "host", .value = "c" }, .{ .name = "zone", .value = "z" } });
+
+    const al = arena.allocator();
+    try expectStrings(&.{ "cpu", "mem" }, try fx.db.metricNames(al));
+    try expectStrings(&.{ "core", "host", "zone" }, try fx.db.labelNames(al));
+    try expectStrings(&.{ "a", "b", "c" }, try fx.db.labelValues(al, "host"));
+    try expectStrings(&.{"0"}, try fx.db.labelValues(al, "core"));
+    try expectStrings(&.{}, try fx.db.labelValues(al, "nope"));
+}
+
+fn matchIds(gpa: Allocator, db: *Db, name: []const u8, ms: []const Matcher) ![]SeriesId {
+    var it = try db.findSeriesMatching(name, ms);
+    defer it.deinit();
+    var out: std.ArrayList(SeriesId) = .empty;
+    errdefer out.deinit(gpa);
+    while (try it.next(gpa)) |e_val| {
+        var e = e_val;
+        defer e.deinit(gpa);
+        try out.append(gpa, e.id);
+    }
+    std.mem.sort(SeriesId, out.items, {}, std.sort.asc(SeriesId)); // iteration is in key order
+    return out.toOwnedSlice(gpa);
+}
+
+test "findSeriesMatching: eq, neq (absent label reads as empty), re and nre are anchored, name-scoped" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("up", &.{ .{ .name = "job", .value = "web" }, .{ .name = "env", .value = "prod" } });
+    const b = try fx.db.seriesId("up", &.{ .{ .name = "job", .value = "web2" }, .{ .name = "env", .value = "dev" } });
+    const c = try fx.db.seriesId("up", &.{.{ .name = "job", .value = "db" }});
+    const other = try fx.db.seriesId("down", &.{.{ .name = "job", .value = "web" }});
+    _ = other;
+
+    const t = struct {
+        fn run(g: Allocator, db: *Db, ms: []const Matcher, expect: []const SeriesId) !void {
+            const got = try matchIds(g, db, "up", ms);
+            defer g.free(got);
+            try testing.expectEqualSlices(SeriesId, expect, got);
+        }
+    }.run;
+    try t(gpa, &fx.db, &.{}, &.{ a, b, c });
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web" }}, &.{a});
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web", .op = .neq }}, &.{ b, c });
+    try t(gpa, &fx.db, &.{.{ .name = "env", .value = "prod", .op = .neq }}, &.{ b, c }); // c has no env
+    try t(gpa, &fx.db, &.{.{ .name = "env", .value = "" }}, &.{c});
+    try t(gpa, &fx.db, &.{.{ .name = "env", .value = "", .op = .neq }}, &.{ a, b });
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web.*", .op = .re }}, &.{ a, b });
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web", .op = .re }}, &.{a}); // anchored
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web|db", .op = .re }}, &.{ a, c });
+    try t(gpa, &fx.db, &.{.{ .name = "job", .value = "web.*", .op = .nre }}, &.{c});
+    try t(gpa, &fx.db, &.{ .{ .name = "job", .value = "web.*", .op = .re }, .{ .name = "env", .value = "dev" } }, &.{b});
+    try t(gpa, &fx.db, &.{.{ .name = "env", .value = "pr.d|", .op = .re }}, &.{ a, c }); // empty alt matches absent
+    try testing.expectError(error.InvalidRegex, fx.db.findSeriesMatching("up", &.{.{ .name = "job", .value = "(", .op = .re }}));
+    const none = try matchIds(gpa, &fx.db, "never", &.{});
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "findSeriesMatching: no leak when the pattern list fails to compile midway" {
+    var fx = try Fixture.init(testing.allocator);
+    defer fx.deinit();
+    _ = try fx.db.seriesId("up", &.{});
+    try testing.expectError(error.InvalidRegex, fx.db.findSeriesMatching("up", &.{
+        .{ .name = "a", .value = "x+", .op = .re },
+        .{ .name = "b", .value = "[", .op = .nre },
+    }));
+}
+
+test "deleteRange: raw samples, whole blocks and straddling blocks; neighbours untouched" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("s", &.{});
+    const o = try fx.db.seriesId("o", &.{});
+    for (0..3000) |i| {
+        try fx.db.append(s, @intCast(i), @floatFromInt(i));
+        try fx.db.append(o, @intCast(i), 7);
+    }
+    _ = try fx.db.compact(2000, .{ .min_run = 1 }); // blocks below 2000, raw above
+    const before_o = try collect(gpa, &fx.db, o, all_lo, all_hi);
+    defer gpa.free(before_o);
+
+    try testing.expectEqual(@as(usize, 0), try fx.db.deleteRange(s, 10, 10));
+    try testing.expectEqual(@as(usize, 0), try fx.db.deleteRange(s, 5000, 6000));
+    // [500, 2500): straddles blocks on the left, spans whole blocks, and eats raw
+    try testing.expectEqual(@as(usize, 2000), try fx.db.deleteRange(s, 500, 2500));
+    var want: std.ArrayList(Sample) = .empty;
+    defer want.deinit(gpa);
+    for (0..3000) |i| if (i < 500 or i >= 2500) try want.append(gpa, .{ .ts = @intCast(i), .value = @floatFromInt(i) });
+    try expectSeries(gpa, &fx.db, s, all_lo, all_hi, want.items);
+    _ = try checkBlockInvariants(&fx.db);
+    const after_o = try collect(gpa, &fx.db, o, all_lo, all_hi);
+    defer gpa.free(after_o);
+    try testing.expectEqualSlices(Sample, before_o, after_o);
+
+    // a window strictly inside one block splits it into the two outer pieces
+    try testing.expectEqual(@as(usize, 3), try fx.db.deleteRange(s, 100, 103));
+    try expectSeries(gpa, &fx.db, s, 95, 110, &.{
+        .{ .ts = 95, .value = 95 },   .{ .ts = 96, .value = 96 },   .{ .ts = 97, .value = 97 },
+        .{ .ts = 98, .value = 98 },   .{ .ts = 99, .value = 99 },   .{ .ts = 103, .value = 103 },
+        .{ .ts = 104, .value = 104 }, .{ .ts = 105, .value = 105 }, .{ .ts = 106, .value = 106 },
+        .{ .ts = 107, .value = 107 }, .{ .ts = 108, .value = 108 }, .{ .ts = 109, .value = 109 },
+    });
+    _ = try checkBlockInvariants(&fx.db);
+    // idempotent: the window is already empty
+    try testing.expectEqual(@as(usize, 0), try fx.db.deleteRange(s, 100, 103));
+}
+
+test "deleteRange: raw overwrite shadowing a block sample goes too; a window between two blocks removes nothing" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("s", &.{});
+    for ([_]Timestamp{ 10, 11, 12, 100, 101, 102 }) |t| try fx.db.append(s, t, 1);
+    _ = try fx.db.compact(all_hi, .{ .min_run = 1 });
+    try fx.db.append(s, 11, 99); // raw shadow of a block sample
+    // blocks: a single one [10..102]; delete [11,12): raw + block copy
+    try testing.expectEqual(@as(usize, 2), try fx.db.deleteRange(s, 11, 12));
+    try expectSeries(gpa, &fx.db, s, all_lo, all_hi, &.{
+        .{ .ts = 10, .value = 1 }, .{ .ts = 12, .value = 1 }, .{ .ts = 100, .value = 1 }, .{ .ts = 101, .value = 1 }, .{ .ts = 102, .value = 1 },
+    });
+    // the gap 20..90 holds nothing
+    try testing.expectEqual(@as(usize, 0), try fx.db.deleteRange(s, 20, 90));
+    // whole remaining block
+    try testing.expectEqual(@as(usize, 5), try fx.db.deleteRange(s, all_lo, all_hi));
+    try expectSeries(gpa, &fx.db, s, all_lo, all_hi, &.{});
+    try testing.expectEqual(@as(u64, 0), try fx.db.liveSize());
+}
+
+test "deleteRange: model check against a map, random windows over a partly compacted series" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("s", &.{});
+    var prng = std.Random.DefaultPrng.init(0xd31e7e);
+    const rnd = prng.random();
+    var model = std.AutoHashMap(Timestamp, f64).init(gpa);
+    defer model.deinit();
+    for (0..60) |round| {
+        for (0..40) |_| {
+            const ts = rnd.intRangeAtMost(Timestamp, -200, 800);
+            const v: f64 = @floatFromInt(rnd.int(u16));
+            try fx.db.append(s, ts, v);
+            try model.put(ts, v);
+        }
+        if (round % 5 == 0) _ = try fx.db.compact(rnd.intRangeAtMost(Timestamp, 0, 800), .{ .min_run = 1 + rnd.uintLessThan(usize, 8) });
+        const a = rnd.intRangeAtMost(Timestamp, -250, 850);
+        const b = a + rnd.intRangeAtMost(Timestamp, 0, 150);
+        var expected: usize = 0;
+        var it = model.iterator();
+        var drop: std.ArrayList(Timestamp) = .empty;
+        defer drop.deinit(gpa);
+        while (it.next()) |kv| if (kv.key_ptr.* >= a and kv.key_ptr.* < b) {
+            expected += 1;
+            try drop.append(gpa, kv.key_ptr.*);
+        };
+        const got_n = try fx.db.deleteRange(s, a, b);
+        try testing.expect(got_n >= expected); // double counts shadowed block samples
+        for (drop.items) |k| _ = model.remove(k);
+
+        var klist: std.ArrayList(Timestamp) = .empty;
+        defer klist.deinit(gpa);
+        var kit = model.keyIterator();
+        while (kit.next()) |k| try klist.append(gpa, k.*);
+        const keys = klist.items;
+        std.mem.sort(Timestamp, keys, {}, std.sort.asc(Timestamp));
+        const got = try collect(gpa, &fx.db, s, all_lo, all_hi);
+        defer gpa.free(got);
+        try testing.expectEqual(keys.len, got.len);
+        for (keys, got) |k, g| {
+            try testing.expectEqual(k, g.ts);
+            try testing.expectEqual(model.get(k).?, g.value);
+        }
+        _ = try checkBlockInvariants(&fx.db);
+    }
+}
+
+test "deleteRange: a crash at any storage effect leaves the window fully deleted or fully intact" {
+    const gpa = testing.allocator;
+    const CrashMode = @FieldType(kvtree.SimStorage, "crash_mode");
+    const modes = [_]CrashMode{ .lose_unsynced, .torn_tail, .reorder_unsynced, .keep_unsynced };
+    for (modes) |mode| {
+        var crash_at: usize = 0;
+        var survived = false;
+        while (!survived) : (crash_at += 1) {
+            try testing.expect(crash_at < 400);
+            var fx = try Fixture.init(gpa);
+            defer fx.deinit();
+            fx.sim.crash_mode = mode;
+            fx.sim.reorder_seed = 0x51ce +% @as(u64, crash_at) *% 0x9e3779b97f4a7c15;
+            const ids = try seedGrid(&fx, 2, 300);
+            defer gpa.free(ids);
+            _ = try fx.db.compact(200, .{ .min_run = 1 });
+            const full = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, full);
+
+            fx.sim.ops_until_crash = crash_at;
+            if (fx.db.deleteRange(ids[0], 50, 250)) |_| survived = true else |_| {}
+            fx.sim.reboot();
+            try fx.reopen();
+
+            const now = try collectAll(gpa, &fx.db, ids);
+            defer freeAll(gpa, now);
+            try testing.expectEqualSlices(Sample, full[1], now[1]); // neighbour untouched
+            if (now[0].len == full[0].len) {
+                try testing.expectEqualSlices(Sample, full[0], now[0]);
+            } else {
+                for (now[0]) |sm| try testing.expect(sm.ts < 50 or sm.ts >= 250);
+            }
+            _ = try checkBlockInvariants(&fx.db);
+            if (survived) for (now[0]) |sm| try testing.expect(sm.ts < 50 or sm.ts >= 250);
+        }
+    }
+}
+
+test "aggregate: min, max, sum, count, last, avg per bucket; empty buckets are null; edge buckets are clipped" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const s = try fx.db.seriesId("s", &.{});
+    // buckets of 10 over [0, 35): 0-9, 10-19, 20-29, 30-34
+    try fx.db.appendMany(s, &.{
+        .{ .ts = 1, .value = 4 },  .{ .ts = 5, .value = -2 }, .{ .ts = 9, .value = 10 },
+        .{ .ts = 30, .value = 8 }, .{ .ts = 34, .value = 2 }, .{ .ts = 35, .value = 1000 },
+    });
+    try testing.expectEqual(@as(usize, 4), Db.bucketCount(0, 35, 10));
+    var out: [4]?f64 = undefined;
+    const Case = struct { f: Db.AggFn, e: [4]?f64 };
+    const cases = [_]Case{
+        .{ .f = .min, .e = .{ -2, null, null, 2 } },
+        .{ .f = .max, .e = .{ 10, null, null, 8 } },
+        .{ .f = .sum, .e = .{ 12, null, null, 10 } },
+        .{ .f = .count, .e = .{ 3, null, null, 2 } },
+        .{ .f = .last, .e = .{ 10, null, null, 2 } },
+        .{ .f = .avg, .e = .{ 4, null, null, 5 } },
+    };
+    for ([_]bool{ false, true }) |compacted| {
+        if (compacted) _ = try fx.db.compact(all_hi, .{ .min_run = 1 });
+        for (cases) |c| {
+            try testing.expectEqual(@as(usize, 4), try fx.db.aggregate(s, 0, 35, 10, c.f, &out));
+            for (c.e, out) |e, g| try testing.expectEqual(e, g);
+        }
+    }
+    try testing.expectError(error.InvalidAggregate, fx.db.aggregate(s, 0, 35, 0, .sum, &out));
+    try testing.expectError(error.InvalidAggregate, fx.db.aggregate(s, 0, 35, 10, .sum, out[0..3]));
+    try testing.expectEqual(@as(usize, 0), try fx.db.aggregate(s, 5, 5, 10, .sum, &out));
+    // negative `from` and a window not aligned to the data
+    var o2: [2]?f64 = undefined;
+    _ = try fx.db.aggregate(s, -5, 15, 10, .count, &o2);
+    try testing.expectEqual(@as(?f64, 1), o2[0]); // [-5, 5)
+    try testing.expectEqual(@as(?f64, 2), o2[1]); // [5, 15)
+    // extreme window must not overflow the bucket arithmetic
+    try testing.expectEqual(@as(usize, 3), Db.bucketCount(all_lo, all_hi, all_hi));
 }

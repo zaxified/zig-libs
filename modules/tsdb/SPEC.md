@@ -480,15 +480,15 @@ also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | `maintain(now, policy)` = compact + sweep + budget, and say consumers must run it | S | do |
-| R2 | Label matchers `!=`, `=~`, `!~` (scan-based first; the 0x04 postings partition only if series counts grow) | S→M | do (scan-based) |
-| R3 | `labelNames` / `labelValues` listing | S | do |
+| R1 | `maintain(now, policy)` = compact + sweep + budget, and say consumers must run it | S | **DONE 2026-10-20** |
+| R2 | Label matchers `!=`, `=~`, `!~` (scan-based first; the 0x04 postings partition only if series counts grow) | S→M | **DONE 2026-10-20** — `findSeriesMatching`, anchored regex via the `regex` module (new dep) |
+| R3 | `labelNames` / `labelValues` listing | S | **DONE 2026-10-20** (+ `metricNames`) |
 | R4 | WAL + in-memory head (Prometheus' durability model) | L | not doing — **owner 2026-10-20:** the speed reference for P is aidlx/tsink (Rust, MIT) with its WAL synced per append, the like-for-like durable mode; Prometheus stays the scope reference, its number informative |
-| R5 | Per-bucket min/max/sum/count/last read helper over `Range` | S | do (downsampling storage: nobody in the reference layer) |
-| R6 | Cardinality limit `Options.max_series` → `error.TooManySeries`, bounded series cache | S | do |
+| R5 | Per-bucket min/max/sum/count/last read helper over `Range` | S | **DONE 2026-10-20** — `aggregate` (+avg) |
+| R6 | Cardinality limit `Options.max_series` → `error.TooManySeries`, bounded series cache | S | **DONE 2026-10-20** — `Db.initOptions` |
 | R8 | Thread-safe `Db` (cache sync); readers already MVCC | M | document single-owner; later |
 | R11 | Consistent snapshot copy while writing | S-M | belongs to kvtree; document |
-| R13 | `deleteRange(series, from, to)` | S | do |
+| R13 | `deleteRange(series, from, to)` | S | **DONE 2026-10-20** — one transaction, crash-swept |
 | R14 | Coalesce small compacted blocks (sparse series: 25 → 20 B/sample only) | M | do |
 | — | WAL replay, exemplars, native histograms, PromQL, per-series retention, mmap | – | not doing (reasons in the survey; mmap is kvtree's) |
 

@@ -186,11 +186,62 @@ rewrites the one straddling the cutoff; `sweepToBudget` drops whole blocks,
 oldest first. Stores written before compaction existed need nothing: their
 samples are raw, and stay readable as they are until `compact` packs them.
 
+## Housekeeping: run `maintain` periodically
+
+Nothing in this module runs by itself. A store that is only appended to keeps
+25 bytes per sample and grows without bound, so the owner must call `maintain`
+from a timer (every few minutes is plenty):
+
+```zig
+_ = try db.maintain(now_ms, .{
+    .retention = 30 * std.time.ms_per_day, // sweep samples older than this
+    .compact_after = std.time.ms_per_hour, // pack samples older than this
+    .max_bytes = 256 << 20,                // then keep live data under this
+});
+```
+
+Each field is optional. The order is retention, compaction, budget; each step
+keeps its own chunking and crash guarantees and reports `done = false` when its
+`max_chunks`/`max_deletes` limit stopped it (the next call continues). Durations
+and `now` use the timestamps' unit.
+
+## Cardinality, label listing, matchers, range delete, buckets
+
+```zig
+var db = tsdb.Db.initOptions(gpa, &tree, .{ .max_series = 10_000 });
+// seriesId returns error.TooManySeries when it would register series 10_001;
+// series that exist still resolve. The name+labels -> id cache is bounded by
+// Options.max_cached_series (default 65536 entries, no eviction: once full,
+// later series simply resolve through the tree). A new error in `Error`:
+// an exhaustive `switch` over it needs the new prongs (TooManySeries,
+// InvalidRegex, InvalidAggregate).
+
+const names = try db.labelNames(arena);          // sorted, unique, on `arena`
+const hosts = try db.labelValues(arena, "host");
+const metrics = try db.metricNames(arena);
+
+// Prometheus matcher semantics: a missing label reads as "", regex is fully
+// anchored. Scans only the series registered under the metric name.
+var it = try db.findSeriesMatching("up", &.{
+    .{ .name = "job", .value = "web.*", .op = .re },
+    .{ .name = "env", .value = "dev", .op = .neq },
+});
+defer it.deinit();
+
+// Delete [from, to) of one series, raw and compacted, in ONE transaction;
+// straddling blocks are decoded, stripped and re-encoded.
+_ = try db.deleteRange(id, from, to);
+
+// Per-bucket reduction over the range iterator; empty buckets are null.
+var buf: [60]?f64 = undefined;
+const n = try db.aggregate(id, from, from + 60 * step, step, .avg, &buf);
+```
+
 ## Not built (deliberate, see `SPEC.md`)
 
-Downsampling/rollups, label matchers beyond exact/superset (`!=`, regex, a
-cross-metric lookup), per-series retention, any query language, and
-aggregation functions. These are scope decisions, not oversights; each is
+Downsampling/rollups, a cross-metric-name label lookup, per-series retention,
+and any query language (`aggregate` is a per-bucket read helper, not a
+query engine). These are scope decisions, not oversights; each is
 listed in `SPEC.md` with what it would take.
 
 ## Verify
