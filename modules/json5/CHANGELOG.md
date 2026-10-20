@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `parseFromSlice(T, gpa, json5_text, ParseOptions)` (S2 R2): preprocess +
+  `std.json.parseFromTokenSource` in one call, strings always copied (the intermediate JSON is freed).
+  On a `std.json` error `ParseOptions.diagnostic` gets the line/column/offset in the JSON5 **source**
+  (S2 R1) through the new `SourceMap` (`Options.source_map`, one point per emitted token; exact inside
+  verbatim text, the token start where the preprocessor rewrote it). bxp's and ttydesk's own
+  line/column computation can go after a repin. `Diagnostic` doc widened. Additive.
 - **2026-10-20** — `stringify` (S2 R3): a JSON5 writer — `writeValue` (a `std.json.Value`) and
   `write` (any Zig value, the `std.json.Stringify` type mapping), `Options{indent, quote: auto/double/
   single, unquoted_keys, trailing_commas}`. Quoting and layout ported from json5/json5 v2.2.3

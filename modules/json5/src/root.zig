@@ -42,8 +42,9 @@ pub const NonFinite = enum {
     quoted,
 };
 
-/// Where and why `preprocess` refused a document. Filled only on an error the
-/// module itself raises (`NonFiniteNumber`, `HexLiteralTooLarge`).
+/// Where and why a document was refused. `preprocess` fills it on an error
+/// the module itself raises (`NonFiniteNumber`, `HexLiteralTooLarge`);
+/// `parseFromSlice` also on every `std.json` error, mapped to the source.
 pub const Diagnostic = struct {
     /// 1-based source line of the offending literal (lines end at `\n`).
     line: usize = 0,
@@ -67,7 +68,113 @@ pub const Options = struct {
     /// Optional out-parameter for the error's line and message. Not used by
     /// `preprocessAnnotated`, which never fails on the input.
     diagnostic: ?*Diagnostic = null,
+    /// Optional out-parameter: filled with where each stretch of the output
+    /// came from, so an offset `std.json` reports in the output can be turned
+    /// back into a source position (`SourceMap.sourceOffset`). `parseFromSlice`
+    /// does this for you.
+    source_map: ?*SourceMap = null,
 };
+
+/// Output offset → source offset, recorded by `preprocessWithOptions` at the
+/// start of every token it emits (one point per change of the output length,
+/// so a run of skipped comments and whitespace costs one point). Owned by the
+/// caller: `deinit` with the allocator given to `preprocessWithOptions`.
+pub const SourceMap = struct {
+    points: std.ArrayList(Point) = .empty,
+
+    pub const Point = struct { out: usize, src: usize };
+
+    pub fn deinit(self: *SourceMap, alloc: std.mem.Allocator) void {
+        self.points.deinit(alloc);
+    }
+
+    fn record(self: *SourceMap, alloc: std.mem.Allocator, out: usize, src: usize) !void {
+        if (self.points.items.len != 0) {
+            const last = &self.points.items[self.points.items.len - 1];
+            // Nothing emitted since: the token about to emit at `out` is the
+            // one an error there belongs to.
+            if (last.out == out) {
+                last.src = src;
+                return;
+            }
+        }
+        try self.points.append(alloc, .{ .out = out, .src = src });
+    }
+
+    /// The source offset of output byte `out`: the token that emitted it, plus
+    /// how far into that token's output `out` lies — exact inside text copied
+    /// verbatim (most tokens), the token's start where the preprocessor
+    /// rewrote it (a quoted key, a converted number), never past the next
+    /// token's start.
+    pub fn sourceOffset(self: *const SourceMap, out: usize) usize {
+        const pts = self.points.items;
+        if (pts.len == 0) return out;
+        var lo: usize = 0;
+        var hi: usize = pts.len;
+        while (hi - lo > 1) {
+            const mid = (lo + hi) / 2;
+            if (pts[mid].out <= out) lo = mid else hi = mid;
+        }
+        const p = pts[lo];
+        if (out < p.out) return p.src;
+        const guess = p.src + (out - p.out);
+        if (lo + 1 < pts.len) return @min(guess, pts[lo + 1].src -| 1);
+        return guess;
+    }
+};
+
+/// How `parseFromSlice` reads the document: the JSON5 options (non-finite
+/// numbers) and the `std.json` ones (duplicate keys, unknown fields, depth
+/// via `max_value_len`), plus where to put a failure's position.
+pub const ParseOptions = struct {
+    json5: Options = .{},
+    json: std.json.ParseOptions = .{},
+    /// Filled on any failure — the preprocessor's own (as before) and, now,
+    /// `std.json`'s: line, col and offset in the JSON5 SOURCE, the error's name
+    /// as `message`.
+    diagnostic: ?*Diagnostic = null,
+};
+
+/// JSON5 text → `T` in one call: `preprocessWithOptions` then
+/// `std.json.parseFromTokenSource`, the preprocessed text freed before
+/// returning (the result never points into it: strings are always copied).
+/// On a `std.json` error, `opts.diagnostic` gets the position in the JSON5
+/// source — not in the intermediate JSON, which is what `std.json` alone
+/// would report.
+pub fn parseFromSlice(comptime T: type, alloc: std.mem.Allocator, input: []const u8, opts: ParseOptions) !std.json.Parsed(T) {
+    var map: SourceMap = .{};
+    defer map.deinit(alloc);
+    var o5 = opts.json5;
+    o5.diagnostic = opts.diagnostic;
+    if (opts.diagnostic != null) o5.source_map = &map;
+    const text = try preprocessWithOptions(alloc, input, o5);
+    defer alloc.free(text);
+
+    var scanner = std.json.Scanner.initCompleteInput(alloc, text);
+    defer scanner.deinit();
+    var diag: std.json.Diagnostics = .{};
+    scanner.enableDiagnostics(&diag);
+    var jo = opts.json;
+    jo.allocate = .alloc_always;
+    return std.json.parseFromTokenSource(T, alloc, &scanner, jo) catch |e| {
+        if (opts.diagnostic) |d| {
+            const off = @min(map.sourceOffset(@intCast(diag.getByteOffset())), input.len);
+            const lc = lineCol(input, off);
+            d.* = .{ .line = lc.line, .col = lc.col, .offset = off, .len = 0, .message = @errorName(e) };
+        }
+        return e;
+    };
+}
+
+fn lineCol(input: []const u8, off: usize) struct { line: usize, col: usize } {
+    var line: usize = 1;
+    var start: usize = 0;
+    for (input[0..off], 0..) |c, k| if (c == '\n') {
+        line += 1;
+        start = k + 1;
+    };
+    return .{ .line = line, .col = off - start + 1 };
+}
 
 /// Preprocess JSON5 source and return a new slice owned by alloc.
 /// Besides `error.OutOfMemory` it fails with `error.NonFiniteNumber`
@@ -95,6 +202,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
 
     while (i < input.len) {
         const c = input[i];
+        if (options.source_map) |sm| try sm.record(alloc, out.items.len, i);
 
         // ── double-quoted string — copy verbatim ────────────────────────────
         if (c == '"') {
@@ -2120,6 +2228,68 @@ const jsonParses = fz.jsonParses;
 
 // ── external anchor: json5/json5-tests corpus ───────────────────────────────
 // See json5_tests_test.zig / json5_tests_vectors.zig / NOTICE.
+test "parseFromSlice: a std.json error is reported at its JSON5 source position (S2 R1/R2)" {
+    const gpa = std.testing.allocator;
+    const Config = struct { name: []const u8, port: u16 };
+    const src =
+        \\{
+        \\  // the service
+        \\  name: 'web', /* inline */
+        \\  port: "eighty",
+        \\}
+    ;
+    var d: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidCharacter, parseFromSlice(Config, gpa, src, .{ .diagnostic = &d }));
+    try std.testing.expectEqual(@as(usize, 4), d.line);
+    // At the value `"eighty"` (cols 9-16): std.json reports the offset just
+    // past the token it could not convert, here col 17.
+    try std.testing.expect(d.col >= 9 and d.col <= 17);
+    try std.testing.expectEqualStrings("InvalidCharacter", d.message);
+
+    // A missing comma is std.json's syntax error, at the second key's line.
+    var d2: Diagnostic = .{};
+    const bad =
+        \\{
+        \\  a: 1,
+        \\  // two
+        \\  b: 2
+        \\  c: 3,
+        \\}
+    ;
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, bad, .{ .diagnostic = &d2 }));
+    try std.testing.expectEqual(@as(usize, 5), d2.line);
+    try std.testing.expectEqual(@as(usize, 3), d2.col);
+
+    // Success: the strings are copied, so they outlive the preprocessed text.
+    const ok = try parseFromSlice(Config, gpa, "{name: 'api', port: 0x50,}", .{});
+    defer ok.deinit();
+    try std.testing.expectEqualStrings("api", ok.value.name);
+    try std.testing.expectEqual(@as(u16, 80), ok.value.port);
+
+    // The preprocessor's own errors keep their diagnostic.
+    var d3: Diagnostic = .{};
+    try std.testing.expectError(error.NonFiniteNumber, parseFromSlice(f64, gpa, "\n  NaN", .{ .diagnostic = &d3 }));
+    try std.testing.expectEqual(@as(usize, 2), d3.line);
+    try std.testing.expectEqual(@as(usize, 3), d3.col);
+}
+
+test "SourceMap: verbatim stretches map exactly, rewritten ones to the token start" {
+    const gpa = std.testing.allocator;
+    var map: SourceMap = .{};
+    defer map.deinit(gpa);
+    const src = "{ /*c*/ key: 'v', \"long\": 12345 }";
+    const out = try preprocessWithOptions(gpa, src, .{ .source_map = &map });
+    defer gpa.free(out);
+    // Every output byte of `12345` maps onto the same byte of the source.
+    const o = std.mem.find(u8, out, "12345").?;
+    const s = std.mem.find(u8, src, "12345").?;
+    for (0..5) |k| try std.testing.expectEqual(s + k, map.sourceOffset(o + k));
+    // The quoted key the preprocessor wrote maps into the bare key.
+    const ok = std.mem.find(u8, out, "\"key\"").?;
+    const sk = std.mem.find(u8, src, "key").?;
+    try std.testing.expect(map.sourceOffset(ok) >= sk and map.sourceOffset(ok) < sk + 3);
+}
+
 test {
     _ = stringify;
     _ = @import("fuzz_test.zig");

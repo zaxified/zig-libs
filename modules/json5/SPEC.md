@@ -204,12 +204,12 @@ apostrophes and nesting (both entry points), and the 30-character cap on quoted 
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). bxp (`bxp-core/src/config.zig:2525`) and ttydesk (`json5span.zig`) both work around it | M | do (offset map, opt-in via Options) |
-| R2 | Typed one-call parse: `parseFromSlice(T, gpa, json5_text, opts)` keeping the preprocessed buffer alive | S | do |
-| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; ttydesk hand-emits | M | in progress (`src/stringify.zig`) |
+| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). bxp (`bxp-core/src/config.zig:2525`) and ttydesk (`json5span.zig`) both work around it | M | **DONE 2026-10-20** — `SourceMap` (opt-in `Options.source_map`), filled by `parseFromSlice` |
+| R2 | Typed one-call parse: `parseFromSlice(T, gpa, json5_text, opts)` keeping the preprocessed buffer alive | S | **DONE 2026-10-20** — `parseFromSlice(T, gpa, text, ParseOptions)` |
+| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; ttydesk hand-emits | M | **DONE 2026-10-20** — `stringify` |
 | R4 | Format-preserving span find/replace (ttydesk `json5span.zig`) | M | not parity (no reference has it) — owner call |
 | R5 | Strict Unicode ID_Start/ID_Continue for unquoted keys | M | not doing (accepting a superset is harmless) |
-| R6 | Duplicate-key policy | S | pass through std.json's option in R2 |
+| R6 | Duplicate-key policy | S | **DONE** — `ParseOptions.json.duplicate_field_behavior` (std's) |
 | R7 | Depth limit for hostile input | S | `Options.max_depth` with R2 |
 | R8–R10 | Reviver/replacer, streaming reader, comment-preserving round trip | – | not doing (std.json typed decoding replaces the first; nobody does the others) |
 
