@@ -444,6 +444,18 @@ pub const RequestOptions = struct {
     /// (a recorded default, see SPEC.md — credentials are stripped on a
     /// cross-origin redirect hop, destinations are not judged).
     redirect_filter: ?RedirectFilter = null,
+    /// Follow a redirect from an `https://` URL to an `http://` one. Off by
+    /// default (2026-10-20): such a hop ends the request with
+    /// `error.RedirectRefused` before anything is sent to the `http://`
+    /// target, because the rest of the exchange — the response body, and
+    /// the request (method, query, a replayed 307/308 body) — would cross
+    /// the network in clear and be replaceable by anyone on the path, after
+    /// the caller asked for TLS. Credentials are stripped on that hop either
+    /// way (`crossOrigin`), but the body is not protected by that. Go
+    /// `net/http`, curl `-L` and Python `requests` follow it by default;
+    /// this client is stricter on purpose, and `true` restores their
+    /// behavior. Judged on every hop, before `redirect_filter`.
+    allow_https_to_http_redirect: bool = false,
     /// The token sent for `Method.other` — an extension method such as
     /// "PURGE" or "PROPFIND" (Go: any `Request.Method`). Required with
     /// `.other`, refused (`InvalidHeader`) with any other method; it must
@@ -510,8 +522,10 @@ pub const Error = error{
     /// with another method), and `.connect` — tunnels are what
     /// `Options.proxy` builds, a caller cannot ask for one.
     InvalidHeader,
-    /// `RequestOptions.redirect_filter` said no to a redirect target; the
-    /// refused host was never dialed.
+    /// `RequestOptions.redirect_filter` said no to a redirect target, or a
+    /// redirect went from `https://` to `http://` without
+    /// `RequestOptions.allow_https_to_http_redirect`; the refused host was
+    /// never dialed.
     RedirectRefused,
     /// `Options.proxy` names a proxy this client cannot use: it does not
     /// parse, it is not `http://`, or it is an `http` proxy for an `http://`
@@ -728,9 +742,10 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
             // double-free, just gated on a malformed redirect target instead
             // of a failed redial.
             const next_url = http.Url.parse(resolved) catch return error.BadRedirect;
-            // The destination gate, before `conn.destroy()` for the same
+            // The destination gates, before `conn.destroy()` for the same
             // reason as the parse above, and before any dial: a refused
             // host receives nothing.
+            if (refusesSchemeDowngrade(options, url, next_url)) return error.RedirectRefused;
             if (options.redirect_filter) |f| {
                 if (!f.allow(f.ctx, url, next_url)) return error.RedirectRefused;
             }
@@ -749,6 +764,13 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
 
         return c.makeResponse(conn, current_method, head, ask_gzip);
     }
+}
+
+/// A redirect hop from `https://` to `http://` the caller did not allow
+/// (`RequestOptions.allow_https_to_http_redirect`). `requestPlain` never
+/// needs it: it refuses `https://` on every hop already.
+fn refusesSchemeDowngrade(options: RequestOptions, from: http.Url, to: http.Url) bool {
+    return from.scheme == .https and to.scheme == .http and !options.allow_https_to_http_redirect;
 }
 
 /// `request`'s plaintext-only twin: identical redirect/retry/pooling
@@ -3570,6 +3592,28 @@ test "request(): same-host scheme downgrade and same-host port change both strip
     try writeRequestHead(&w, .get, same_origin, &hdrs, "a", .none, crossOrigin(original, same_origin), true);
     try testing.expect(std.mem.find(u8, w.buffered(), "Authorization: Bearer secret") != null);
     try testing.expect(std.mem.find(u8, w.buffered(), "Cookie: session=abc123") != null);
+}
+
+test "request(): an https -> http redirect hop is refused unless allow_https_to_http_redirect" {
+    const https_a = try http.Url.parse("https://api.example/v1");
+    const https_b = try http.Url.parse("https://other.example/v2");
+    const http_same = try http.Url.parse("http://api.example/v1");
+    const http_other = try http.Url.parse("http://other.example/v2");
+    const strict: RequestOptions = .{};
+    const lax: RequestOptions = .{ .allow_https_to_http_redirect = true };
+    // The default refuses a downgrade, to the same host or another one.
+    try testing.expect(!strict.allow_https_to_http_redirect);
+    try testing.expect(refusesSchemeDowngrade(strict, https_a, http_same));
+    try testing.expect(refusesSchemeDowngrade(strict, https_a, http_other));
+    // Every other hop shape is untouched: https -> https, http -> http,
+    // http -> https (an upgrade).
+    try testing.expect(!refusesSchemeDowngrade(strict, https_a, https_b));
+    try testing.expect(!refusesSchemeDowngrade(strict, http_same, http_other));
+    try testing.expect(!refusesSchemeDowngrade(strict, http_same, https_a));
+    // Opted in: the downgrade is followed (credentials are still stripped,
+    // see the crossOrigin test above).
+    try testing.expect(!refusesSchemeDowngrade(lax, https_a, http_same));
+    try testing.expect(!refusesSchemeDowngrade(lax, https_a, http_other));
 }
 
 test "redirect chain on fabricated responses" {

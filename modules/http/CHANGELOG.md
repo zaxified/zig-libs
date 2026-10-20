@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **CONSUMER-VISIBLE (behavior change, security):** `Client.request` now
+  refuses a redirect hop from `https://` to `http://` with `error.RedirectRefused`, before the
+  `http://` target is dialed. New `RequestOptions.allow_https_to_http_redirect` (default
+  `false`) restores the old behavior (that of Go `net/http`, curl `-L`, Python `requests`).
+  Credentials were already stripped on that hop; the response body and a replayed 307/308
+  request body were not protected. `requestPlain` is unchanged (it refuses `https://` on every
+  hop). Audit 2026-10-19 S4, owner decision 2026-10-20.
+
 - **2026-10-19** — **Fix:** (audit S11) two low-severity fixes, each with a regression test. (1) `redirectLocation` / `ResponseWriter.redirect`: a location that a browser reads as `//host` after dropping leading C0 controls/spaces and tab/CR/LF (`/<TAB>/evil.example`, `<0x01>//evil.example`) passed through unchanged (Go's `url.Parse` rejects it, so it counted as "absolute"); it is now `error.InvalidLocation`, like `/\evil`. A literal `//host` is still passed (the caller's explicit choice). **BEHAVIOURAL:** those inputs were accepted before. (2) `range.applyBounded`: the byte-sum guard added with `+=`; 16 ranges over a total near 2^64 wrapped (ReleaseFast) or panicked (safe modes); it saturates now.
 
 - **2026-10-19** — **Fix:** (audit O1) four h1 defects, each with a regression test. (1) `h1.ChunkedReader`: a failure is now final -- every later read repeats `error.ReadFailed`. Before, the reader resumed parsing behind the refused line, so after a handler `try`-propagated a body error into the automatic 500 the post-response drain decoded on (`40 \r\n0\r\n\r\nGET /x …` served `/x` as a pipelined request a front end had read as chunk data): request smuggling, also through `proxy` (its body relay fails the same way). (2) `h1.ChunkedReader`: a trailer field line ended by a bare LF is `malformed_chunk` (the head reader already refused it); accepted, `0\r\nX\n\r\n` ended the body where a CRLF-only parser is still in the trailer section. (3) `Server` h1: two `Content-Encoding` lines are one coding list and answer 415, as h2 already did; only the first line was read, so `identity` + `br` reached the handler as opaque coded bytes and `gzip` + `gzip` still gzipped once. (4) `Server.BodyLimit`: a body ending exactly at the cap is no longer refused when the reader's probe first reports no progress (a discard of 0 is asked again, as `RequestBody.Capped` does). **BEHAVIOURAL:** (2) and (3) refuse requests that were accepted before.

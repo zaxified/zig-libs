@@ -241,6 +241,14 @@ Hardened for direct internet exposure (no reverse proxy required):
   consequence is that **a consumer that follows redirects across origins without setting
   `redirect_filter` has no destination gate** (loopback, link-local, RFC 1918 — the SSRF class)
   and owes its own. `llmclient` chose the other option and follows no redirect at all.
+- **Scheme downgrade on a redirect (client):** a hop from `https://` to `http://` is refused
+  by default (`RequestOptions.allow_https_to_http_redirect = false`, 2026-10-20, audit
+  2026-10-19 S4): `RedirectRefused` before the `http://` target is dialed. Stricter than Go
+  `net/http`, curl `-L` and Python `requests`, which follow it (requests strips
+  `Authorization`, as this client does on any origin change): stripping credentials does not
+  protect the body that would then travel in clear after the caller asked for TLS. No in-tree
+  consumer relied on the downgrade; `jwt` already refused it for key-source fetches with its
+  own `redirect_filter`.
 - Response bodies of 304/204/1xx are suppressed (framing correctness).
 - **Out of scope:** TLS termination (bring-your-own via the seam — reverse proxy today, the planned
   `tlsserver` module later; see Backlog), HTTP/3 (QUIC), auth (`aaa-gate`/`jwt`), rate limiting (`ratelimit`), path-traversal
