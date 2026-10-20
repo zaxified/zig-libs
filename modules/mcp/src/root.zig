@@ -312,7 +312,7 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/elicitation/complete", .anchor = .literal_example, .reason = "" },
     .{ .method = "completion/complete", .anchor = .literal_example, .reason = "" },
-    .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Also: this module only ever SENDS notifications/cancelled (giving up on its own outbound sampling/elicitation request); it has no dispatch branch for a client cancelling an in-progress tools/call (an unknown id-less notification is silently dropped, which the spec explicitly permits)" },
+    .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Inbound (since 2026-10-20): a client's notifications/cancelled marks its running tools/call (ToolCall.cancelled) and suppresses the response; one for a finished or unknown request is ignored, as the spec allows" },
 };
 
 /// The same "nothing silently filtered" index for the **stateless** path
@@ -2322,6 +2322,13 @@ fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, t
     return try arena.print("Output validation error: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
 }
 
+const Inflight = struct {
+    peer: u64,
+    /// The request id as compact JSON (`7`, `"abc"`), arena-owned by the call.
+    id_json: []const u8,
+    flag: *std.atomic.Value(bool),
+};
+
 /// What `ToolCall.arg` found for one argument: nothing (absent or JSON
 /// `null`), a value of the requested type, or a value of another JSON type —
 /// the case a handler reports as "'x' must be a string", not "missing 'x'".
@@ -2530,6 +2537,20 @@ pub const ToolCall = struct {
     meta: std.json.Value = .null,
     /// Content blocks after the text one (see `add`).
     blocks: std.ArrayList(Content) = .empty,
+    /// Set (from any thread) when the client cancels this call; see
+    /// `cancelled`.
+    cancel_flag: std.atomic.Value(bool) = .init(false),
+
+    /// Whether the client has cancelled this call (`notifications/cancelled`,
+    /// or the transport via `Server.cancelInflight`). A long tool polls it and
+    /// stops early; whatever it returns is then discarded — a cancelled
+    /// request gets no response (basic/utilities/cancellation.mdx). Only a
+    /// transport that reads while a handler runs can deliver the cancel in
+    /// time: `serve` reads one line at a time, so on stdio a cancel arrives
+    /// after the call has finished and is ignored, as the spec allows.
+    pub fn cancelled(self: *const ToolCall) bool {
+        return self.cancel_flag.load(.acquire);
+    }
 
     /// Append a content block to the result (image, audio, a resource link,
     /// an embedded resource, or a text block with annotations). The text
@@ -3397,6 +3418,11 @@ pub const Server = struct {
     template_parsed: std.ArrayList(?uri_template.Template) = .empty,
     catalog_arena: ?*std.heap.ArenaAllocator = null,
     custom_methods: std.ArrayList(Method) = .empty,
+    /// The `tools/call`s now running, so a cancel can find them. Guarded by
+    /// its own lock — not the caller's lock on the `Server` — because a
+    /// transport delivers a cancel while a handler holds that one.
+    inflight: std.ArrayList(Inflight) = .empty,
+    inflight_lock: std.atomic.Mutex = .unlocked,
     custom_notifications: std.ArrayList(Method) = .empty,
     /// `capabilities.extensions` / `.experimental` (JSON object text, ""
     /// = none), set through `setCapabilityExtras`.
@@ -3423,6 +3449,7 @@ pub const Server = struct {
         }
         self.template_parsed.deinit(self.gpa);
         self.custom_methods.deinit(self.gpa);
+        self.inflight.deinit(self.gpa);
         self.custom_notifications.deinit(self.gpa);
         for (self.tool_checks.items) |c| c.deinit(self.gpa);
         self.tool_checks.deinit(self.gpa);
@@ -3628,6 +3655,52 @@ pub const Server = struct {
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
         buildCompleteResult(&jw, &req, &self.info, modern != null) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
+    }
+
+    fn lockInflight(self: *Server) void {
+        while (!self.inflight_lock.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    /// Mark the running `tools/call` that `peer` sent with `request_id` as
+    /// cancelled (`ToolCall.cancelled`); a no-op when none is running — it
+    /// finished, or never existed, which the spec says to ignore. **Safe to
+    /// call from another thread while a handler runs** (it takes only the
+    /// in-flight lock): this is the seam a transport uses when it learns of a
+    /// cancel by other means, e.g. `mcp-http` when the client closes the
+    /// response stream of a 2026-07-28 request. Returns whether a call was
+    /// found.
+    pub fn cancelInflight(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        var buf: [128]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        std.json.Stringify.value(request_id, .{}, &w) catch return false;
+        const key = w.buffered();
+        self.lockInflight();
+        defer self.inflight_lock.unlock();
+        for (self.inflight.items) |e| {
+            if (e.peer == peer and std.mem.eql(u8, e.id_json, key)) {
+                e.flag.store(true, .release);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn registerInflight(self: *Server, peer: u64, id_json: []const u8, flag: *std.atomic.Value(bool)) bool {
+        self.lockInflight();
+        defer self.inflight_lock.unlock();
+        self.inflight.append(self.gpa, .{ .peer = peer, .id_json = id_json, .flag = flag }) catch return false;
+        return true;
+    }
+
+    fn unregisterInflight(self: *Server, flag: *std.atomic.Value(bool)) void {
+        self.lockInflight();
+        defer self.inflight_lock.unlock();
+        for (self.inflight.items, 0..) |e, i| {
+            if (e.flag == flag) {
+                _ = self.inflight.swapRemove(i);
+                return;
+            }
+        }
     }
 
     pub const MethodError = error{ OutOfMemory, DuplicateMethod, ReservedMethod };
@@ -4147,6 +4220,16 @@ pub const Server = struct {
         // Notification for a request-only method (or for one we do not know at
         // all): ignore, never respond — unless the application registered it.
         if (id == null) {
+            // The client gives up on one of its requests (cancellation.mdx).
+            // A malformed one has no one to be told, so it is just dropped.
+            if (std.mem.eql(u8, method, "notifications/cancelled")) {
+                const params = obj.get("params") orelse return;
+                if (params != .object) return;
+                const rid = params.object.get("requestId") orelse return;
+                if (rid != .string and rid != .integer) return;
+                _ = self.cancelInflight(peer, rid);
+                return;
+            }
             if (dm == null) if (findCustom(self.custom_notifications.items, method)) |cm| {
                 const modern_n: ?*const ModernRequest = switch (classifyRequest(obj.get("params"))) {
                     .modern => |*r| r,
@@ -4544,7 +4627,14 @@ pub const Server = struct {
             .input = round,
             .meta = req_meta,
         };
+        // Registered only while the handler runs: a cancel that arrives
+        // later finds nothing (the spec's "already completed" case). Ids
+        // longer than `cancelInflight`'s key buffer cannot be cancelled.
+        const id_json: ?[]const u8 = if (id) |v| (std.json.Stringify.valueAlloc(arena, v, .{}) catch null) else null;
+        const registered = if (id_json) |k| k.len <= 128 and self.registerInflight(peer, k, &call.cancel_flag) else false;
         const is_error = tool.handler(tool.ctx, &call);
+        if (registered) self.unregisterInflight(&call.cancel_flag);
+        if (call.cancelled()) return; // cancellation.mdx: no response
         if (call.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (call.input.inputRequired()) return self.sendInputRequired(arena, out, id, &call.input);
         if (!is_error and self.validate_tool_io and tool.allow_structured) if (check.output) |*schema| {
@@ -5905,6 +5995,74 @@ test "completion/complete: the spec's examples, both eras" {
         \\{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
     , &aw.writer);
     try testing.expect(std.mem.find(u8, aw.written(), "\"completions\":{}") != null);
+}
+
+fn selfCancellingTool(_: ?*anyopaque, call: *ToolCall) bool {
+    // Stands in for the transport: the cancel arrives while the handler runs.
+    const before = call.cancelled();
+    _ = call.server.handleMessage(
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"user"}}
+    , call.transport) catch {};
+    call.print("{} {}", .{ before, call.cancelled() });
+    return false;
+}
+
+const SlowState = struct {
+    started: std.atomic.Value(bool) = .init(false),
+};
+
+fn slowTool(ctx: ?*anyopaque, call: *ToolCall) bool {
+    const st: *SlowState = @ptrCast(@alignCast(ctx.?));
+    st.started.store(true, .release);
+    var spins: u64 = 0;
+    while (!call.cancelled()) : (spins += 1) {
+        if (spins > 2_000_000_000) return call.fail("never cancelled");
+        std.atomic.spinLoopHint();
+    }
+    call.write("stopped");
+    return false;
+}
+
+fn cancelFromThread(s: *Server, st: *SlowState) void {
+    while (!st.started.load(.acquire)) std.atomic.spinLoopHint();
+    _ = s.cancelInflight(0, .{ .string = "job-1" });
+}
+
+test "cancellation: a client's notifications/cancelled reaches the running tool, and no response is sent" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "self", .description = "", .input_schema = "{}", .handler = selfCancellingTool });
+    // Cancelled mid-call: the handler saw it flip, and nothing is answered.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"self","arguments":{}}}
+    , "");
+    // A cancel for another id (or for a finished call) changes nothing.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"self","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":8,"result":{"content":[{"type":"text","text":"false false"}],"isError":false}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}
+    , "");
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/cancelled","params":"x"}
+    , "");
+    try testing.expectEqual(@as(usize, 0), s.inflight.items.len);
+}
+
+test "cancellation: Server.cancelInflight from another thread stops a running tool" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var st: SlowState = .{};
+    try s.addTool(.{ .name = "slow", .description = "", .input_schema = "{}", .handler = slowTool, .ctx = &st });
+    const th = try std.Thread.spawn(.{}, cancelFromThread, .{ &s, &st });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":"job-1","method":"tools/call","params":{"name":"slow","arguments":{}}}
+    , "");
+    th.join();
+    try testing.expect(!s.cancelInflight(0, .{ .string = "job-1" })); // gone once finished
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {

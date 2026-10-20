@@ -423,7 +423,7 @@ coordinator's under the rule "parity with the reference, or safer":
 | R2 | Handler-chosen protocol errors (`code`, `message`, `data`) for tools/resources/prompts; `URLElicitationRequiredError` (-32042) and `MissingRequiredClientCapability` (-32021) builders | S | **DONE 2026-10-20** |
 | R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
 | R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | **DONE 2026-10-20** |
-| R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | do — `serve` stays serial; a concurrent stdio loop is opt-in |
+| R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | **DONE 2026-10-20** — `ToolCall.cancelled`, thread-safe `Server.cancelInflight`; `serve` stays serial (a stdio cancel lands after the call, ignored as the spec allows) |
 | R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (bxp request) | S | **DONE 2026-10-20** |
 | R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | **DONE 2026-10-20** — `schema_check.zig` (2020-12 subset, JSON-Schema-Test-Suite 625 cases) |
 | R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | **DONE 2026-10-20** |
@@ -433,7 +433,7 @@ coordinator's under the rule "parity with the reference, or safer":
 | R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | do — both SDKs ship it |
 | R13 | `notifications/elicitation/complete` (session era) | S | **DONE 2026-10-20** |
 | R14 | RFC 6570 resource-template matching with extracted variables | M | **DONE 2026-10-20** — `uri_template.zig` (matcher ported from the Python SDK) |
-| — | Logging (`logging/setLevel`, `notifications/message`, per-request `logLevel` in `_meta`) | S | do — deprecated (SEP-2577) but both SDKs ship it inside the 12-month window |
+| — | Logging (`logging/setLevel`, `notifications/message`, per-request `logLevel` in `_meta`) | S | **not doing** — 2026-07-28 logging.mdx: "New implementations SHOULD NOT adopt it" (SEP-2577); stderr / OpenTelemetry instead |
 
 Deliberately not doing: the tasks extension (no SDK has it in core; TS v2 removed task interception),
 sampling-with-tools and `includeContext` (sampling deprecated, SEP-2577/2596), roots, legacy HTTP+SSE,

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Cancellation of a running tool (S2 R5). An inbound `notifications/cancelled` marks the
+  matching running `tools/call` of the same peer; `ToolCall.cancelled()` tells the handler, and a
+  cancelled call gets no response (cancellation.mdx). `Server.cancelInflight(peer, id)` does the same
+  from another thread (it takes only its own lock) — the seam for a transport that sees the client go
+  away. `serve` stays serial, so on stdio a cancel arrives after the call and is ignored.
 - **2026-10-20** — `completion/complete` (S2 R11). `Prompt.completer` / `ResourceTemplate.completer`
   (`Completer`, `CompletionRequest.add`/`contextArg`, `total`, `has_more`); at most 100 values, more sets
   `hasMore`. The `completions` capability is advertised, and the method answered, only when a completer
