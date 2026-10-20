@@ -7,8 +7,8 @@
 //! handshake with a certificate (TLS_AES_128_GCM_SHA256,
 //! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
 //! X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and
-//! resumption, then application data with KeyUpdate both ways — no client
-//! certificates yet —
+//! resumption, client certificates (mTLS), then application data with
+//! KeyUpdate both ways —
 //! `Connection`, the blocking wrapper, and `keys`, the PEM loader. Interoperates with OpenSSL 3.5's s_client.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
@@ -18,7 +18,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and resumption, KeyUpdate and a PEM certificate/key loader, no client certificates yet",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and resumption, client certificates (mTLS), KeyUpdate and a PEM certificate/key loader",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},
@@ -57,6 +57,13 @@ pub const CertifiedKey = server.CertifiedKey;
 pub const Tickets = server.Tickets;
 pub const Ticketer = server.Ticketer;
 pub const StekTicketer = server.StekTicketer;
+pub const ClientAuth = server.ClientAuth;
+
+/// Client certificates: the Certificate / CertificateVerify decoders, the
+/// leaf's key, the `ClientCertVerifier` and its `x509` implementation.
+pub const clientauth = @import("clientauth.zig");
+pub const ClientCertVerifier = clientauth.ClientCertVerifier;
+pub const X509Verifier = clientauth.X509Verifier;
 
 /// The blocking wrapper over a `std.Io.Reader` / `Writer` pair.
 pub const connection = @import("connection.zig");
@@ -72,6 +79,12 @@ pub const CertKeyPair = keys.CertKeyPair;
 /// never serve anything real with them.
 pub const test_fixtures = @import("test_certs.zig");
 
+/// TEST client certificates (a client CA and leaves it issued, with their
+/// private keys) for client authentication in this module's interop program
+/// and consumers' own tests. The keys are public: never trust anything real
+/// with them.
+pub const test_client_fixtures = @import("client_certs.zig");
+
 test {
     _ = record;
     _ = alert;
@@ -80,6 +93,7 @@ test {
     _ = hello;
     _ = messages;
     _ = server;
+    _ = clientauth;
     _ = connection;
     _ = keys;
     _ = @import("handshake_test.zig");

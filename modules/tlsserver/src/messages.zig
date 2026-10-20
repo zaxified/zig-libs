@@ -2,8 +2,8 @@
 
 //! tlsserver.messages — the handshake messages a TLS 1.3 server writes
 //! (RFC 8446 §4): ServerHello, HelloRetryRequest, EncryptedExtensions,
-//! Certificate, CertificateVerify, Finished, each with its four-octet
-//! handshake header, into a caller's buffer.
+//! CertificateRequest, Certificate, CertificateVerify, Finished, each with
+//! its four-octet handshake header, into a caller's buffer.
 //!
 //! Every encoder returns the whole message (header ‖ body), the octets the
 //! transcript hashes and the record layer frames. Nothing is chosen here:
@@ -244,6 +244,47 @@ pub fn certificate(out: []u8, context: []const u8, entries: []const CertificateE
     return w.done(at);
 }
 
+pub const CertificateRequest = struct {
+    /// Empty during the handshake (RFC 8446 §4.3.2).
+    context: []const u8 = "",
+    /// The schemes the server accepts in the client's CertificateVerify
+    /// and on its chain (`signature_algorithms`), non-empty.
+    signature_algorithms: []const u16,
+    /// DER DistinguishedNames of the CAs the server trusts
+    /// (`certificate_authorities`, RFC 8446 §4.2.4); none: not sent.
+    authorities: []const []const u8 = &.{},
+};
+
+/// RFC 8446 §4.3.2: `signature_algorithms`, then `certificate_authorities`
+/// (RFC 8448 §6 sends the first alone).
+pub fn certificateRequest(out: []u8, cr: CertificateRequest) Error![]u8 {
+    if (cr.signature_algorithms.len == 0) return error.FieldTooLong; // `<2..2^16-2>`
+    var w: Writer = .{ .out = out };
+    const at = try w.message(.certificate_request);
+    try w.vec(u8, cr.context);
+    const exts = try w.open(u16);
+    try w.int(u16, 13);
+    const sa = try w.open(u16);
+    const list = try w.open(u16);
+    for (cr.signature_algorithms) |s| try w.int(u16, s);
+    try w.close(u16, list);
+    try w.close(u16, sa);
+    if (cr.authorities.len != 0) {
+        try w.int(u16, 47);
+        const ca = try w.open(u16);
+        const names = try w.open(u16);
+        // `opaque DistinguishedName<1..2^16-1>`
+        for (cr.authorities) |dn| {
+            if (dn.len == 0) return error.FieldTooLong;
+            try w.vec(u16, dn);
+        }
+        try w.close(u16, names);
+        try w.close(u16, ca);
+    }
+    try w.close(u16, exts);
+    return w.done(at);
+}
+
 /// RFC 8446 §4.4.3.
 pub fn certificateVerify(out: []u8, scheme: u16, signature: []const u8) Error![]u8 {
     var w: Writer = .{ .out = out };
@@ -358,6 +399,22 @@ test "RFC 8448 §3 Certificate, CertificateVerify, Finished" {
 
     const f = &kat.rfc8448_s3_server_finished;
     try testing.expectEqualSlices(u8, f, try finished(&out, f[4..]));
+}
+
+test "RFC 8448 §6 CertificateRequest; certificate_authorities" {
+    const cr = &kat.rfc8448_s6_certificate_request;
+    var out: [128]u8 = undefined;
+    // 0d | len3 | ctx 00 | exts len2 | 000d | len2 | list len2 (0x1e) | schemes
+    var schemes: [15]u16 = undefined;
+    for (&schemes, 0..) |*s, i| s.* = std.mem.readInt(u16, cr[13 + 2 * i ..][0..2], .big);
+    try testing.expectEqualSlices(u8, cr, try certificateRequest(&out, .{ .signature_algorithms = &schemes }));
+
+    const m = try certificateRequest(&out, .{ .signature_algorithms = &.{0x0403}, .authorities = &.{ "AB", "C" } });
+    const sa = "\x00\x0d\x00\x04\x00\x02\x04\x03";
+    const ca = "\x00\x2f\x00\x09\x00\x07" ++ "\x00\x02AB" ++ "\x00\x01C";
+    try testing.expectEqualSlices(u8, "\x0d\x00\x00\x18" ++ "\x00" ++ "\x00\x15" ++ sa ++ ca, m);
+    try testing.expectError(error.FieldTooLong, certificateRequest(&out, .{ .signature_algorithms = &.{} }));
+    try testing.expectError(error.FieldTooLong, certificateRequest(&out, .{ .signature_algorithms = &.{0x0403}, .authorities = &.{""} }));
 }
 
 test "ALPN extension body; a chain with an OCSP staple on the leaf" {

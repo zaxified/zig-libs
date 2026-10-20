@@ -33,6 +33,7 @@ const rsa = @import("rsa");
 const tlsresume = @import("tlsresume");
 const bogo_shim = @import("bogo_shim.zig");
 const certs = tlsserver.test_fixtures;
+const client_certs = tlsserver.test_client_fixtures;
 
 const Server = tlsserver.Server;
 const record = tlsserver.record;
@@ -44,6 +45,12 @@ const usage =
 ;
 
 pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
+
+/// The client's certificate (`tlsserver.test_client_fixtures`).
+pub const ClientCertKind = enum { none, p256, rsa2048, ed25519 };
+
+/// `Config.client_auth`: none, or the test client CA through `x509`.
+pub const ClientAuthMode = enum { off, mandatory, optional };
 
 const Peer = enum { openssl, go };
 
@@ -74,6 +81,10 @@ const Case = struct {
     tickets: bool = false,
     /// The server must have resumed a session.
     resumed: bool = false,
+    client_auth: ClientAuthMode = .off,
+    /// The certificate the client presents; the server must end up with it
+    /// as `peerCertificate` (from the ticket, on a resumption).
+    client_cert: ClientCertKind = .none,
 };
 
 /// The ticket key and clock of every `tickets` case (and of the replay).
@@ -101,6 +112,12 @@ const cases = [_]Case{
     .{ .name = "resume-hrr", .why = "resumption after a HelloRetryRequest (the binder over message_hash and the HRR)", .seed = 17, .tickets = true, .resumed = true, .brief = false, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess_in", "openssl.sess", "-groups", "X25519:P-256" }, .expect = &.{ "Reused, TLSv1.3", "Peer Temp Key: ECDH, prime256v1" } },
     .{ .name = "resume-aes128-new", .why = "tickets under TLS_AES_128_GCM_SHA256", .seed = 18, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     .{ .name = "resume-aes128", .why = "resumption under TLS_AES_128_GCM_SHA256", .seed = 19, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
+    .{ .name = "mtls-p256", .why = "a client certificate (ECDSA P-256) the server requires, verified by x509", .seed = 40, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"Verification: OK"} },
+    .{ .name = "mtls-rsa2048", .why = "an RSA client certificate: CertificateVerify in RSA-PSS (SHA-384 suite)", .seed = 41, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"Ciphersuite: TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "mtls-ed25519", .why = "an Ed25519 client certificate under TLS_CHACHA20_POLY1305_SHA256", .seed = 42, .client_auth = .mandatory, .client_cert = .ed25519, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256" }, .expect = &.{"Ciphersuite: TLS_CHACHA20_POLY1305_SHA256"} },
+    .{ .name = "mtls-optional-none", .why = "an optional client certificate, none sent (an empty Certificate)", .seed = 43, .client_auth = .optional, .expect = &.{"Verification: OK"} },
+    .{ .name = "mtls-resume-new", .why = "tickets after client authentication: they carry the client certificate", .seed = 44, .tickets = true, .brief = false, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess_out", "openssl-mtls.sess" }, .expect = &.{"New, TLSv1.3"} },
+    .{ .name = "mtls-resume", .why = "resumption with a mandatory client certificate: no CertificateRequest, the ticket's identity", .seed = 45, .tickets = true, .resumed = true, .brief = false, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess_in", "openssl-mtls.sess" }, .expect = &.{"Reused, TLSv1.3"} },
     // Go: its suite order (AES-128 first on AES hardware) is not
     // configurable in TLS 1.3, so the server's list picks the suite.
     .{ .name = "go-default", .client = .go, .why = "Go's defaults: X25519MLKEM768, its first suite", .seed = 21, .expect = &.{ "version: TLS 1.3", "suite: TLS_AES_128_GCM_SHA256", "group: X25519MLKEM768", "peer_certs: 1" } },
@@ -119,6 +136,11 @@ const cases = [_]Case{
     .{ .name = "go-resume-new", .client = .go, .why = "tickets: Go saves the session", .seed = 34, .tickets = true, .args = &.{ "-sess-out", "go.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
     .{ .name = "go-resume", .client = .go, .why = "resumption: Go offers the saved ticket", .seed = 35, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{"resumed: true"} },
     .{ .name = "go-resume-hrr", .client = .go, .why = "resumption after a HelloRetryRequest", .seed = 36, .tickets = true, .resumed = true, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{ "resumed: true", "hrr: true" } },
+    .{ .name = "go-mtls-p256", .client = .go, .why = "a client certificate (ECDSA P-256) the server requires", .seed = 50, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-mtls-rsa2048", .client = .go, .why = "an RSA client certificate (RSA-PSS CertificateVerify)", .seed = 51, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-mtls-ed25519", .client = .go, .why = "an Ed25519 client certificate", .seed = 52, .client_auth = .mandatory, .client_cert = .ed25519, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-mtls-resume-new", .client = .go, .why = "tickets after client authentication", .seed = 53, .tickets = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-out", "go-mtls.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
+    .{ .name = "go-mtls-resume", .client = .go, .why = "resumption with a mandatory client certificate: the ticket's identity", .seed = 54, .tickets = true, .resumed = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-in", "go-mtls.sess" }, .expect = &.{"resumed: true"} },
 };
 
 fn interopNow(_: ?*anyopaque) i64 {
@@ -156,9 +178,13 @@ fn certifiedKey(keys: *const Keys, kind: CertKind, chain: *[1][]const u8) tlsser
 }
 
 fn pem(gpa: std.mem.Allocator, der: []const u8) ![]u8 {
+    return pemLabel(gpa, "CERTIFICATE", der);
+}
+
+fn pemLabel(gpa: std.mem.Allocator, label: []const u8, der: []const u8) ![]u8 {
     const Enc = std.base64.standard.Encoder;
     var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(gpa, "-----BEGIN CERTIFICATE-----\n");
+    try out.print(gpa, "-----BEGIN {s}-----\n", .{label});
     var b64: [1024 * 2]u8 = undefined;
     const s = Enc.encode(&b64, der);
     var i: usize = 0;
@@ -166,7 +192,7 @@ fn pem(gpa: std.mem.Allocator, der: []const u8) ![]u8 {
         try out.appendSlice(gpa, s[i..@min(s.len, i + 64)]);
         try out.append(gpa, '\n');
     }
-    try out.appendSlice(gpa, "-----END CERTIFICATE-----\n");
+    try out.print(gpa, "-----END {s}-----\n", .{label});
     return out.toOwnedSlice(gpa);
 }
 
@@ -273,6 +299,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         },
         .go => try argv.appendSlice(gpa, &.{ "./go-client", "-addr", target, "-ca", ca_file, "-servername", "localhost" }),
     }
+    if (c.client_cert != .none) {
+        const files = clientCertFiles(c.client_cert);
+        try argv.appendSlice(gpa, &.{ "-cert", files[0], "-key", files[1] });
+    }
     try argv.appendSlice(gpa, c.args);
 
     var child = try std.process.spawn(io, .{
@@ -301,6 +331,8 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     ring.rotate(1, &interop_stek_key, @divFloor(interop_clock_ms, 1000));
     const stek: tlsserver.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
     const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = interopNow } };
+    const verifier: tlsserver.X509Verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
+    const client_auth: tlsserver.ClientAuth = .{ .verifier = verifier.verifier(), .mandatory = c.client_auth == .mandatory, .clock = .{ .now_ms = interopNow } };
     const cfg: tlsserver.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = c.suites,
@@ -308,10 +340,11 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .alpn_protocols = c.alpn,
         .random = csprng.random(),
         .tickets = if (c.tickets) &tickets else null,
+        .client_auth = if (c.client_auth != .off) &client_auth else null,
     };
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, tlsserver.server.minOutputLen(&ck) + 4096);
+    const out = try gpa.alloc(u8, tlsserver.server.minOutputLen(&cfg, &ck) + 4096);
     defer gpa.free(out);
     var server: Server = .init(&cfg, joiner, out);
     defer server.deinit();
@@ -356,6 +389,29 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     // serve's close_notify waited for the client's KeyUpdate.
     if (c.key_update and !server.write_closed) return error.NoClientKeyUpdate;
     if (server.isResumed() != c.resumed) return error.ResumptionMismatch;
+    const want_peer: ?[]const u8 = clientCertDer(c.client_cert);
+    const got_peer = server.peerCertificate();
+    if ((want_peer == null) != (got_peer == null) or
+        (want_peer != null and !std.mem.eql(u8, want_peer.?, got_peer.?))) return error.PeerCertificateMismatch;
+}
+
+/// The PEM files `main` writes for a client certificate kind.
+fn clientCertFiles(k: ClientCertKind) [2][]const u8 {
+    return switch (k) {
+        .none => unreachable,
+        .p256 => .{ "client-p256.pem", "client-p256.key" },
+        .rsa2048 => .{ "client-rsa2048.pem", "client-rsa2048.key" },
+        .ed25519 => .{ "client-ed25519.pem", "client-ed25519.key" },
+    };
+}
+
+pub fn clientCertDer(k: ClientCertKind) ?[]const u8 {
+    return switch (k) {
+        .none => null,
+        .p256 => &client_certs.p256_cert,
+        .rsa2048 => &client_certs.rsa2048_cert,
+        .ed25519 => &client_certs.ed25519_cert,
+    };
 }
 
 fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []const struct { Case, Recorded }) !void {
@@ -372,6 +428,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\//! server sent. Replayed by `interop_replay_test.zig`. Do not edit by hand.
         \\
         \\pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
+        \\pub const ClientCertKind = enum { none, p256, rsa2048, ed25519 };
+        \\pub const ClientAuthMode = enum { off, mandatory, optional };
         \\
     );
     try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n\n", .{ interop_stek_key[0], interop_clock_ms });
@@ -389,6 +447,10 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    tickets: bool = false,
         \\    /// The server resumed a session.
         \\    resumed: bool = false,
+        \\    /// Client certificates through the test client CA (`client_certs.zig`).
+        \\    client_auth: ClientAuthMode = .off,
+        \\    /// The server's `peerCertificate` at the end.
+        \\    client_cert: ClientCertKind = .none,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -409,6 +471,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.key_update) try w.writeAll("        .key_update = true,\n");
         if (c.tickets) try w.writeAll("        .tickets = true,\n");
         if (c.resumed) try w.writeAll("        .resumed = true,\n");
+        if (c.client_auth != .off) try w.print("        .client_auth = .{t},\n", .{c.client_auth});
+        if (c.client_cert != .none) try w.print("        .client_cert = .{t},\n", .{c.client_cert});
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");
@@ -739,6 +803,15 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });
     try work.writeFile(io, .{ .sub_path = "ed25519.pem", .data = try pem(gpa, &certs.ed25519_cert) });
     try work.writeFile(io, .{ .sub_path = "rsa2048.pem", .data = try pem(gpa, &certs.rsa2048_cert) });
+    for ([_]struct { ClientCertKind, []const u8, []const u8 }{
+        .{ .p256, &client_certs.p256_cert, &client_certs.p256_pkcs8 },
+        .{ .rsa2048, &client_certs.rsa2048_cert, &client_certs.rsa2048_pkcs8 },
+        .{ .ed25519, &client_certs.ed25519_cert, &client_certs.ed25519_pkcs8 },
+    }) |cc| {
+        const files = clientCertFiles(cc[0]);
+        try work.writeFile(io, .{ .sub_path = files[0], .data = try pem(gpa, cc[1]) });
+        try work.writeFile(io, .{ .sub_path = files[1], .data = try pemLabel(gpa, "PRIVATE KEY", cc[2]) });
+    }
 
     var keys: Keys = undefined;
     keys.p256 = try .fromBytes(certs.p256_scalar);

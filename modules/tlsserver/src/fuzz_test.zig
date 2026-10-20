@@ -11,8 +11,9 @@
 //! is refused, never accepted unless identical, never a panic; a refused
 //! record never advances the sequence number.
 //! `tlsserver-keys` (`keys.CertKeyPair.fromPem`), `tlsserver-server`
-//! (`Server` on recorded real clients) and `tlsserver-keyupdate` (KeyUpdate
-//! against a model client) are described at their sections.
+//! (`Server` on recorded real clients), `tlsserver-keyupdate` (KeyUpdate
+//! against a model client) and `tlsserver-clientauth` (the client
+//! Certificate / CertificateVerify decoders) are described at their sections.
 
 const std = @import("std");
 const testing = std.testing;
@@ -1185,6 +1186,8 @@ test "fuzz harness: keys, 400 seeds, reaches every outcome" {
 const server_mod = @import("server.zig");
 const interop = @import("interop_vectors.zig");
 const certs = @import("test_certs.zig");
+const client_certs = @import("client_certs.zig");
+const clientauth = @import("clientauth.zig");
 const rsa = @import("rsa");
 const tlsresume = @import("tlsresume");
 
@@ -1193,12 +1196,21 @@ const InteropTickets = struct {
     ring: tlsresume.stek.DefaultRing,
     stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing),
     tickets: server_mod.Tickets,
+    /// The recordings' client authentication (`tools/interop.zig`).
+    verifier: clientauth.X509Verifier,
+    client_auth: server_mod.ClientAuth,
 
-    fn init(t: *InteropTickets) void {
+    fn init(t: *InteropTickets, gpa: std.mem.Allocator, mode: interop.ClientAuthMode) void {
         t.ring = .init();
         t.ring.rotate(1, &interop.stek_key, @divFloor(interop.clock_ms, 1000));
         t.stek = .{ .ring = &t.ring };
         t.tickets = .{ .ticketer = t.stek.ticketer(), .clock = .{ .now_ms = clock } };
+        t.verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
+        t.client_auth = .{ .verifier = t.verifier.verifier(), .mandatory = mode == .mandatory, .clock = .{ .now_ms = clock } };
+    }
+
+    fn clientAuth(t: *const InteropTickets, mode: interop.ClientAuthMode) ?*const server_mod.ClientAuth {
+        return if (mode == .off) null else &t.client_auth;
     }
 
     fn clock(_: ?*anyopaque) i64 {
@@ -1225,6 +1237,9 @@ const SrvMark = Marker(enum {
     splice_refused,
     finished_forged_refused,
     finished_repadded,
+    client_auth_case,
+    client_flight_forged_refused,
+    client_flight_repadded,
     plain_alert,
     plain_alert_after_retry,
     sealed_alert,
@@ -1405,7 +1420,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
-    it.init();
+    it.init(gpa, v.client_auth);
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -1413,10 +1428,11 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
         .tickets = if (v.tickets) &it.tickets else null,
+        .client_auth = it.clientAuth(v.client_auth),
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
-    const outb = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
+    const outb = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
     defer gpa.free(outb);
     var server: server_mod.Server = .init(&cfg, joiner, outb);
     defer server.deinit();
@@ -1434,6 +1450,11 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     defer run.deinit(gpa);
     if (v.key_update) SrvMark.mark(.key_update_case);
     if (v.resumed) SrvMark.mark(.resumed_case);
+    // A full handshake with client authentication: the client's first
+    // sealed record holds its Certificate (Go: alone; OpenSSL: with the
+    // CertificateVerify and the Finished).
+    const client_flight = v.client_auth != .off and !v.resumed;
+    if (client_flight) SrvMark.mark(.client_auth_case);
     const mode = src.valueRangeAtMost(u8, 0, 13);
     const genuine_end = struct {
         fn f(r: *const SrvRun, want: []const u8) bool {
@@ -1497,11 +1518,14 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             }
         },
         10, 11 => {
-            // Up to the client's Finished, then that record resealed.
+            // Up to the client's first sealed record (its Finished, or with
+            // client authentication its Certificate, maybe more), then that
+            // record resealed.
             const fs = starts[finished_rec];
             const fe = if (finished_rec + 1 < starts.len) starts[finished_rec + 1] else stream.len;
             try driveServer(S, src, gpa, &server, stream[0..fs], false, &run);
-            if (run.failure != null or server.state != .client_finished) return error.PrefixDidNotReachFinished;
+            const at_state: @TypeOf(server.state) = if (client_flight) .client_certificate else .client_finished;
+            if (run.failure != null or server.state != at_state) return error.PrefixDidNotReachFinished;
             const suite = server.cipherSuite().?;
             var rx: record.Protection = undefined;
             try rx.init(suite, server.client_handshake_secret[0..suite.hashLen().?]);
@@ -1509,8 +1533,10 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             const sealed = try gpa.dupe(u8, stream[fs..fe]);
             defer gpa.free(sealed);
             const opened = try rx.open(sealed);
-            if (opened.content_type != .handshake or opened.content.len < 5 or opened.content.len > 4 + 48) return error.RecordingFinishedShape;
-            var msg_buf: [4 + 48]u8 = undefined;
+            const max: usize = if (client_flight) record.max_plaintext_len else 4 + 48;
+            if (opened.content_type != .handshake or opened.content.len < 5 or opened.content.len > max) return error.RecordingFinishedShape;
+            const msg_buf = try gpa.alloc(u8, record.max_plaintext_len);
+            defer gpa.free(msg_buf);
             var msg: []u8 = msg_buf[0..opened.content.len];
             @memcpy(msg, opened.content);
             const forged = mode == 10;
@@ -1518,9 +1544,13 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 0 => msg[4 + src.index(msg.len - 4)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7)),
                 1 => {
                     msg = msg[0 .. msg.len - 1];
-                    std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
+                    // One message: still well-formed, one octet short.
+                    if (std.mem.readInt(u24, msg[1..4], .big) == msg.len - 3)
+                        std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
                 },
-                else => msg[0] = if (src.value(bool)) 15 else 24, // certificate_verify, key_update
+                // certificate_verify, key_update; finished where the
+                // Certificate belongs.
+                else => msg[0] = if (client_flight) 20 else if (src.value(bool)) 15 else 24,
             };
             const pad: usize = src.valueRangeAtMost(u16, 0, 300);
             var tx: record.Protection = undefined;
@@ -1534,10 +1564,10 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             try driveServer(S, src, gpa, &server, rebuilt[0 .. rec.len + stream.len - fe], false, &run);
             if (forged) {
                 if (run.handshake_done or run.failure == null) return error.ForgedFinishedAccepted;
-                SrvMark.mark(.finished_forged_refused);
+                if (client_flight) SrvMark.mark(.client_flight_forged_refused) else SrvMark.mark(.finished_forged_refused);
             } else {
                 if (!genuine_end(&run, v.server)) return error.RepaddedFinishedDiffers;
-                SrvMark.mark(.finished_repadded);
+                if (client_flight) SrvMark.mark(.client_flight_repadded) else SrvMark.mark(.finished_repadded);
             }
         },
         12, 13 => {
@@ -1881,7 +1911,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
-    it.init();
+    it.init(gpa, v.client_auth);
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -1889,10 +1919,11 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
         .tickets = if (v.tickets) &it.tickets else null,
+        .client_auth = it.clientAuth(v.client_auth),
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
-    const outb = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
+    const outb = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
     defer gpa.free(outb);
     var server: server_mod.Server = .init(&cfg, joiner, outb);
     defer server.deinit();
@@ -1903,25 +1934,27 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     const fin = for (starts, 0..) |s, i| {
         if (v.client[s] == 23) break i;
     } else return error.NoFinishedInRecording;
-    const fin_end = if (fin + 1 < starts.len) starts[fin + 1] else v.client.len;
     var c: KuClient = .{ .server = &server, .suite = undefined, .gpa = gpa, .in = try gpa.alloc(u8, 4 * record.max_record_len) };
     defer c.deinit();
     {
-        @memcpy(c.in[0..fin_end], v.client[0..fin_end]);
+        @memcpy(c.in[0..v.client.len], v.client);
         var at: usize = 0;
         var end = starts[fin];
+        var next = fin;
         while (true) {
             const r = try server.feed(c.in[at..end]);
             at += r.consumed;
             if (r.event == .handshake_done) break;
             if (r.event != .need_more) return error.HandshakeDidNotComplete;
-            if (at != end or end == fin_end) return error.HandshakeDidNotComplete;
+            if (at != end or next == starts.len) return error.HandshakeDidNotComplete;
             // The first flight went out under the handshake keys; the
-            // client's Finished goes in alone.
+            // client's sealed records (Certificate, CertificateVerify,
+            // Finished) go in one at a time.
             server.discardOutput(server.pendingOutput().len);
-            end = fin_end;
+            next += 1;
+            end = if (next < starts.len) starts[next] else v.client.len;
         }
-        if (at != fin_end) return error.HandshakeLeftOctets;
+        if (at != end) return error.HandshakeLeftOctets;
     }
     c.suite = server.cipherSuite().?;
     if (c.suite == .aes_256_gcm_sha384) KuMark.mark(.sha384_suite);
@@ -2121,4 +2154,130 @@ test "fuzz driver: TLSSERVER_FUZZ (keyupdate)" {
 }
 test "fuzz harness: keyupdate, 400 seeds, reaches every outcome" {
     try KuMark.reach(fuzzKeyUpdate, "tlsserver-keyupdate", 400);
+}
+
+// ── tlsserver-clientauth ─────────────────────────────────────────────────
+//
+// `clientauth`'s decoders on a client Certificate message built from real
+// certificates (none to three, the test client CA's leaves and the CA
+// itself), whole or damaged (bit flips, an octet rewritten, truncation,
+// spliced octets), and on a CertificateVerify. Whole: it decodes to the
+// same chain, every leaf's key reads, the CA (keyCertSign only) is refused
+// for signing. Damaged: never a panic — every certificate it still decodes
+// to goes through `leafPublicKey` and `checkLeafKeyUsage` (std's DER walk
+// on an `x509.safe` copy).
+
+const CaMark = Marker(enum {
+    genuine,
+    empty_list,
+    usage_refused,
+    damaged_refused,
+    damaged_decoded,
+    damaged_leaf_key_ok,
+    damaged_leaf_key_refused,
+    damaged_usage_ok,
+    damaged_usage_refused,
+    verify_decoded,
+    verify_refused,
+});
+
+fn putU24(buf: []u8, at: usize, v: usize) void {
+    std.mem.writeInt(u24, buf[at..][0..3], @intCast(v), .big);
+}
+
+fn fuzzClientAuth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const pool = [_][]const u8{ &client_certs.p256_cert, &client_certs.rsa2048_cert, &client_certs.ed25519_cert, &client_certs.ca_cert, &client_certs.expired_cert, &certs.p384_cert };
+    var buf: [4 * 1024]u8 = undefined;
+    var picked: [3]usize = undefined;
+    const n = src.valueRangeAtMost(u8, 0, 3);
+    buf[0] = 0; // certificate_request_context
+    var at: usize = 4; // the list's u24 length at 1
+    for (picked[0..n]) |*p| {
+        p.* = src.index(pool.len);
+        const der = pool[p.*];
+        putU24(&buf, at, der.len);
+        @memcpy(buf[at + 3 ..][0..der.len], der);
+        at += 3 + der.len;
+        buf[at] = 0;
+        buf[at + 1] = 0; // no extensions
+        at += 2;
+    }
+    putU24(&buf, 1, at - 4);
+    var msg: []u8 = buf[0..at];
+
+    if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+        const c = try clientauth.parseCertificate(msg, "");
+        var it = c.certificates();
+        for (picked[0..n]) |p| if (!std.mem.eql(u8, it.next() orelse return error.ChainShort, pool[p])) return error.ChainDiffers;
+        if (it.next() != null) return error.ChainLong;
+        if (n == 0) {
+            if (!c.isEmpty()) return error.EmptyNotEmpty;
+            CaMark.mark(.empty_list);
+            return;
+        }
+        const leaf = pool[picked[0]];
+        _ = try clientauth.leafPublicKey(leaf);
+        if (picked[0] == 3) {
+            if (clientauth.checkLeafKeyUsage(leaf)) |_| return error.CaSigns else |e| if (e != error.UnsupportedCertificate) return e;
+            CaMark.mark(.usage_refused);
+        } else try clientauth.checkLeafKeyUsage(leaf);
+        CaMark.mark(.genuine);
+    } else {
+        var spliced: [4 * 1024 + 64]u8 = undefined;
+        switch (src.valueRangeAtMost(u8, 0, 4)) {
+            0, 1 => for (0..src.valueRangeAtMost(u8, 1, 4)) |_| {
+                msg[src.index(msg.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+            },
+            2 => msg[src.index(msg.len)] = src.value(u8),
+            3 => msg = msg[0..src.index(msg.len)],
+            else => {
+                const k = src.valueRangeAtMost(u8, 1, 64);
+                const pos = src.index(msg.len + 1);
+                @memcpy(spliced[0..pos], msg[0..pos]);
+                src.bytes(spliced[pos..][0..k]);
+                @memcpy(spliced[pos + k ..][0 .. msg.len - pos], msg[pos..]);
+                msg = spliced[0 .. msg.len + k];
+            },
+        }
+        const c = clientauth.parseCertificate(msg, "") catch {
+            CaMark.mark(.damaged_refused);
+            return;
+        };
+        CaMark.mark(.damaged_decoded);
+        var it = c.certificates();
+        while (it.next()) |der| {
+            if (clientauth.leafPublicKey(der)) |_| CaMark.mark(.damaged_leaf_key_ok) else |_| CaMark.mark(.damaged_leaf_key_refused);
+            if (clientauth.checkLeafKeyUsage(der)) |_| CaMark.mark(.damaged_usage_ok) else |_| CaMark.mark(.damaged_usage_refused);
+        }
+    }
+
+    // A CertificateVerify body, maybe damaged.
+    var cv: [4 + 600]u8 = undefined;
+    const sig_len = src.valueRangeAtMost(u16, 0, 600);
+    std.mem.writeInt(u16, cv[0..2], src.value(u16), .big);
+    std.mem.writeInt(u16, cv[2..4], sig_len, .big);
+    src.bytes(cv[4..][0..sig_len]);
+    var body: []u8 = cv[0 .. 4 + sig_len];
+    if (src.value(bool)) body = body[0..src.index(body.len)];
+    if (clientauth.parseCertificateVerify(body)) |v| {
+        if (v.signature.len != sig_len) return error.SignatureLength;
+        CaMark.mark(.verify_decoded);
+    } else |_| CaMark.mark(.verify_refused);
+}
+
+fn fuzzClientAuthSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [4096]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzClientAuth(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver clientauth, Certificate and CertificateVerify whole and damaged" {
+    try testing.fuzz({}, fuzzClientAuthSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (clientauth)" {
+    try fuzz_driver.run(fuzzClientAuth, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-clientauth" });
+}
+test "fuzz harness: clientauth, 400 seeds, reaches every outcome" {
+    try CaMark.reach(fuzzClientAuth, "tlsserver-clientauth", 400);
 }

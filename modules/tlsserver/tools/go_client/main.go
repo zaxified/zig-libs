@@ -8,13 +8,14 @@
 //	go build -o go-client tools/go_client/main.go
 //	go-client -addr 127.0.0.1:4433 -ca p256.pem -servername localhost \
 //	    [-groups X25519MLKEM768,X25519] [-alpn h2,http/1.1] [-nosni]
-//	    [-sess-out FILE] [-sess-in FILE]
+//	    [-sess-out FILE] [-sess-in FILE] [-cert FILE -key FILE]
 //
 // The report, one "key: value" per line on stdout, names what the
 // interop case expects: version, suite, group, alpn, peer_certs, hrr,
 // resumed, and (with -sess-out) saved. -sess-out writes the last session
 // ticket the server sent to FILE; -sess-in offers the one in FILE (Go's
 // ClientSessionState serialization, ResumptionState / NewResumptionState).
+// -cert and -key (PEM) are the client certificate for a server that asks.
 package main
 
 import (
@@ -104,6 +105,8 @@ func main() {
 	alpn := flag.String("alpn", "", "comma-separated ALPN offers")
 	sessOut := flag.String("sess-out", "", "write the server's last session ticket here")
 	sessIn := flag.String("sess-in", "", "offer the session ticket in this file")
+	certFile := flag.String("cert", "", "client certificate (PEM), with -key")
+	keyFile := flag.String("key", "", "the client certificate's private key (PEM)")
 	flag.Parse()
 
 	pem, err := os.ReadFile(*caFile)
@@ -134,6 +137,13 @@ func main() {
 			_, err := cs.PeerCertificates[0].Verify(opts)
 			return err
 		}
+	}
+	if *certFile != "" {
+		pair, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			fail("client certificate: %v", err)
+		}
+		cfg.Certificates = []tls.Certificate{pair}
 	}
 	if *groups != "" {
 		for _, g := range strings.Split(*groups, ",") {

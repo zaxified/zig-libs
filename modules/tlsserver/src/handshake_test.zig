@@ -121,6 +121,13 @@ const Outcome = struct {
     alpn: ?[]const u8,
     resumed: bool,
     echoed: []u8,
+    /// `Server.peerCertificate` (owned, like `echoed`).
+    peer: ?[]u8 = null,
+
+    fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
+        gpa.free(o.echoed);
+        if (o.peer) |p| gpa.free(p);
+    }
 };
 
 /// What `tlsclient` offers beyond std's defaults (ignored for std's client).
@@ -132,6 +139,8 @@ const ClientOffer = struct {
     info: ?*ZlClient.ConnectionInfo = null,
     session_cache: ?*ZlClient.SessionCache = null,
     corrupt_client_hello: bool = false,
+    client_auth: ?ZlClient.ClientAuth = null,
+    client_auth_select: ?ZlClient.ClientAuthSelect = null,
 };
 
 const ServerSide = struct {
@@ -139,6 +148,7 @@ const ServerSide = struct {
     groups: []const u16 = &server_mod.default_groups,
     alpn: []const []const u8 = &.{},
     tickets: ?*const server_mod.Tickets = null,
+    client_auth: ?*const server_mod.ClientAuth = null,
 };
 
 /// One handshake of client type `C` against the server, then a request, a
@@ -152,10 +162,11 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .alpn_protocols = srv.alpn,
         .random = prng.random(),
         .tickets = srv.tickets,
+        .client_auth = srv.client_auth,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 64 * 1024);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&config, ck) + 64 * 1024);
     defer gpa.free(out);
     var server: Server = .init(&config, joiner, out);
     defer server.deinit();
@@ -184,6 +195,8 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .alpn_protocols = offer.alpn,
         .connection_info = offer.info,
         .session_cache = offer.session_cache,
+        .client_auth = offer.client_auth,
+        .client_auth_select = offer.client_auth_select,
     }) else StdClient.init(&pipe.reader, &pipe.client_out, .{
         .host = .{ .explicit = "localhost" },
         .ca = .self_signed,
@@ -223,6 +236,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .alpn = server.alpnProtocol(),
         .resumed = server.isResumed(),
         .echoed = try gpa.dupe(u8, got[0..n]),
+        .peer = if (server.peerCertificate()) |p| try gpa.dupe(u8, p) else null,
     };
 }
 
@@ -372,7 +386,7 @@ test "tlsclient ↔ Server: KeyUpdate both ways, every suite" {
         const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .cipher_suites = &.{suite}, .random = prng.random() };
         const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
         defer gpa.free(joiner);
-        const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 64 * 1024);
+        const out = try gpa.alloc(u8, server_mod.minOutputLen(&config, &ck) + 64 * 1024);
         defer gpa.free(out);
         var server: Server = .init(&config, joiner, out);
         defer server.deinit();
@@ -550,7 +564,7 @@ test "Server: the NewSessionTickets after the client's Finished, one record, eac
     const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .cipher_suites = &.{.aes_256_gcm_sha384}, .random = prng.random(), .tickets = &tf.tickets };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 64 * 1024);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&config, &ck) + 64 * 1024);
     defer gpa.free(out);
     var server: Server = .init(&config, joiner, out);
     defer server.deinit();
@@ -613,4 +627,202 @@ test "Server: the NewSessionTickets after the client's Finished, one record, eac
         try testing.expect(!std.mem.eql(u8, tickets[i], tickets[j]));
         try testing.expect(age_adds[i] != age_adds[j]);
     };
+}
+
+// ── client certificates ──────────────────────────────────────────────────
+
+const client_certs = @import("client_certs.zig");
+const clientauth = @import("clientauth.zig");
+
+/// A client CA trusted through `x509`, at the test clock (2030).
+const ClientAuthFixture = struct {
+    verifier: clientauth.X509Verifier,
+    auth: server_mod.ClientAuth,
+
+    fn init(fx: *ClientAuthFixture, mandatory: bool) void {
+        fx.verifier = .{ .gpa = testing.allocator, .anchors = &.{&client_certs.ca_cert} };
+        fx.auth = .{ .verifier = fx.verifier.verifier(), .mandatory = mandatory, .clock = .{ .now_ms = clock2030 } };
+    }
+
+    fn clock2030(_: ?*anyopaque) i64 {
+        return 1_900_000_000_000;
+    }
+};
+
+const ClientKeys = struct {
+    p256: ZlClient.ClientAuth.PrivateKey,
+    ed25519: ZlClient.ClientAuth.PrivateKey,
+    rsa: ZlClient.ClientAuth.PrivateKey,
+    rsa_kp: rsa.KeyPair,
+    server_only: ZlClient.ClientAuth.PrivateKey,
+    expired: ZlClient.ClientAuth.PrivateKey,
+    stranger: ZlClient.ClientAuth.PrivateKey,
+
+    fn init(k: *ClientKeys) !void {
+        k.p256 = .{ .ecdsa_secp256r1_sha256 = client_certs.p256_scalar };
+        k.ed25519 = .{ .ed25519 = client_certs.ed25519_secret[0..32].* };
+        try rsa.SecretKey.fromDer(&k.rsa_kp.secret_key, &client_certs.rsa2048_pkcs1);
+        k.rsa = .{ .rsa = &k.rsa_kp };
+        k.server_only = .{ .ecdsa_secp256r1_sha256 = client_certs.server_only_scalar };
+        k.expired = .{ .ecdsa_secp256r1_sha256 = client_certs.expired_scalar };
+        k.stranger = .{ .ecdsa_secp256r1_sha256 = client_certs.stranger_scalar };
+    }
+};
+
+fn clientCert(der: []const u8, key: *const ZlClient.ClientAuth.PrivateKey, chain: *[1][]const u8) ZlClient.ClientAuth {
+    chain[0] = der;
+    return .{ .certificate_chain = chain, .key = key };
+}
+
+test "tlsclient ↔ Server: client certificates of every kind, verified by x509, every suite" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    const cases = [_]struct { []const u8, *const ZlClient.ClientAuth.PrivateKey }{
+        .{ &client_certs.p256_cert, &keys.p256 },
+        .{ &client_certs.ed25519_cert, &keys.ed25519 },
+        .{ &client_certs.rsa2048_cert, &keys.rsa },
+    };
+    for (cases) |c| for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        errdefer std.debug.print("suite {t}, client key {t}\n", .{ suite, c[1].* });
+        var chain: [1][]const u8 = undefined;
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .client_auth = &ca.auth }, .{ .client_auth = clientCert(c[0], c[1], &chain) });
+        defer o.deinit(testing.allocator);
+        try testing.expectEqualStrings("hello there", o.echoed);
+        try testing.expectEqualSlices(u8, c[0], o.peer.?);
+    };
+}
+
+/// `ClientAuthSelect` that sends no certificate, and records the request.
+const NoCert = struct {
+    authorities: usize = 0,
+    first_authority: [64]u8 = undefined,
+    first_len: usize = 0,
+    schemes: usize = 0,
+
+    fn select(ctx: ?*anyopaque, info: *const ZlClient.CertificateRequestInfo) ?ZlClient.ClientAuth {
+        const self: *NoCert = @ptrCast(@alignCast(ctx.?));
+        self.authorities = info.certificate_authorities.len;
+        self.schemes = info.signature_schemes.len;
+        if (info.certificate_authorities.len != 0) {
+            const a = info.certificate_authorities[0];
+            @memcpy(self.first_authority[0..a.len], a);
+            self.first_len = a.len;
+        }
+        return null;
+    }
+};
+
+test "tlsclient ↔ Server: no client certificate — certificate_required, or on unauthenticated" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    ca.auth.authorities = &.{&client_certs.ca_name};
+    var nc: NoCert = .{};
+    try testing.expectError(error.CertificateRequired, handshake(ZlClient, testing.allocator, &ck, .{ .client_auth = &ca.auth }, .{ .client_auth_select = .{ .context = &nc, .select = NoCert.select } }));
+    // The request named the CA and the default schemes.
+    try testing.expectEqual(@as(usize, 1), nc.authorities);
+    try testing.expectEqualSlices(u8, &client_certs.ca_name, nc.first_authority[0..nc.first_len]);
+    try testing.expectEqual(server_mod.default_client_auth_schemes.len, nc.schemes);
+
+    ca.auth.mandatory = false;
+    const o = try handshake(ZlClient, testing.allocator, &ck, .{ .client_auth = &ca.auth }, .{ .client_auth_select = .{ .context = &nc, .select = NoCert.select } });
+    defer o.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello there", o.echoed);
+    try testing.expectEqual(null, o.peer);
+}
+
+test "tlsclient ↔ Server: a client certificate the verifier refuses gets its alert" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(false);
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    const cases = [_]struct { []const u8, *const ZlClient.ClientAuth.PrivateKey, server_mod.Error }{
+        .{ &client_certs.server_only_cert, &keys.server_only, error.UnsupportedCertificate },
+        .{ &client_certs.expired_cert, &keys.expired, error.CertificateExpired },
+        .{ &client_certs.stranger_cert, &keys.stranger, error.UnknownCa },
+    };
+    for (cases) |c| {
+        var chain: [1][]const u8 = undefined;
+        try testing.expectError(c[2], handshake(ZlClient, testing.allocator, &ck, .{ .client_auth = &ca.auth }, .{ .client_auth = clientCert(c[0], c[1], &chain) }));
+    }
+    // A key that does not match the certificate: the CertificateVerify fails.
+    var chain: [1][]const u8 = undefined;
+    try testing.expectError(error.DecryptError, handshake(ZlClient, testing.allocator, &ck, .{ .client_auth = &ca.auth }, .{ .client_auth = clientCert(&client_certs.p256_cert, &keys.stranger, &chain) }));
+}
+
+test "tlsclient ↔ Server: a resumption keeps the client certificate; a mandatory one needs a ticket with it" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var keys: ClientKeys = undefined;
+    try keys.init();
+    var tf: TicketFixture = undefined;
+    tf.init();
+    for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384 }) |suite| {
+        errdefer std.debug.print("suite {t}\n", .{suite});
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const srv: ServerSide = .{ .suites = &.{suite}, .tickets = &tf.tickets, .client_auth = &ca.auth };
+        for (0..3) |round| {
+            var chain: [1][]const u8 = undefined;
+            const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache, .client_auth = clientCert(&client_certs.rsa2048_cert, &keys.rsa, &chain) });
+            defer o.deinit(testing.allocator);
+            try testing.expectEqual(round != 0, o.resumed);
+            try testing.expectEqualSlices(u8, &client_certs.rsa2048_cert, o.peer.?);
+        }
+    }
+
+    // Re-issued tickets do not extend the certificate: past the lifetime
+    // from the full handshake that proved it, a full handshake again
+    // (each resumption's own ticket is younger than the lifetime).
+    {
+        var tf2: TicketFixture = undefined;
+        tf2.init();
+        tf2.tickets.lifetime_s = 3600;
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const srv: ServerSide = .{ .tickets = &tf2.tickets, .client_auth = &ca.auth };
+        for ([_]bool{ false, true, true, false }) |want_resumed| {
+            var chain: [1][]const u8 = undefined;
+            const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache, .client_auth = clientCert(&client_certs.p256_cert, &keys.p256, &chain) });
+            defer o.deinit(testing.allocator);
+            try testing.expectEqual(want_resumed, o.resumed);
+            tf2.now_ms += 1500 * 1000;
+        }
+    }
+
+    // A ticket from an unauthenticated session (an optional certificate,
+    // none sent): resumed while the certificate stays optional, not once it
+    // is mandatory — that handshake asks for one.
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+    defer testing.allocator.free(entries);
+    var cache: ZlClient.SessionCache = .init(entries, null);
+    defer cache.deinit();
+    ca.auth.mandatory = false;
+    var nc: NoCert = .{};
+    const srv: ServerSide = .{ .tickets = &tf.tickets, .client_auth = &ca.auth };
+    const anon: ClientOffer = .{ .session_cache = &cache, .client_auth_select = .{ .context = &nc, .select = NoCert.select } };
+    const first = try handshake(ZlClient, testing.allocator, &ck, srv, anon);
+    first.deinit(testing.allocator);
+    const again = try handshake(ZlClient, testing.allocator, &ck, srv, anon);
+    defer again.deinit(testing.allocator);
+    try testing.expect(again.resumed and again.peer == null);
+    ca.auth.mandatory = true;
+    try testing.expectError(error.CertificateRequired, handshake(ZlClient, testing.allocator, &ck, srv, anon));
 }

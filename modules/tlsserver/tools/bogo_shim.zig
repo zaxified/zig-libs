@@ -28,6 +28,16 @@
 //!   ones only. The first must not resume; a later one must, unless
 //!   `-expect-session-miss`.
 //!
+//! - client certificates: `-require-any-client-certificate` (mandatory) and
+//!   `-verify-peer` (optional) with BoringSSL's shim verifier, which accepts
+//!   any chain unless `-verify-fail`; `-verify-prefs` are the
+//!   CertificateRequest's schemes, `-use-client-ca-list` its CA names
+//!   (hex DER, comma-separated; `<NULL>` / `<EMPTY>`: none);
+//!   `-expect-peer-cert-file` compares the leaf (a file with a chain is exit
+//!   89: the server keeps only the leaf); `-trust-cert` makes the verifier
+//!   `X509Verifier` over that file's certificates (clientAuth, the wall
+//!   clock), as BoringSSL's X.509 verification with `SSL_VERIFY_PEER`.
+//!
 //! Only server tests at TLS 1.3 run: a client test, a version range without
 //! TLS 1.3, or any feature the server lacks is exit 89.
 
@@ -67,6 +77,13 @@ const Options = struct {
     expect_curve_id: ?u16 = null,
     alpn: std.ArrayList([]const u8) = .empty,
     groups: std.ArrayList(u16) = .empty,
+    client_auth: enum { off, optional, mandatory } = .off,
+    verify_fail: bool = false,
+    verify_prefs: std.ArrayList(u16) = .empty,
+    ca_names: std.ArrayList([]const u8) = .empty,
+    expect_peer_signature_algorithm: ?u16 = null,
+    expect_peer_cert_file: ?[]const u8 = null,
+    trust_cert: ?[]const u8 = null,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -75,9 +92,13 @@ const Unimplemented = error{Unimplemented};
 /// spoken); `-async` (BoringSSL's own callbacks returning "retry"; the
 /// sans-I/O core has no such retries to exercise, so the protocol is the
 /// same); `-implicit-handshake` (`Connection.read` runs the handshake);
-/// `-expect-no-session-id` (no stateful session cache, so never an ID).
+/// `-expect-no-session-id` (no stateful session cache, so never an ID);
+/// `-expect-verify-result` (OpenSSL's verify result: a handshake that
+/// completed verified, or had nothing to verify); `-use-custom-verify-callback`
+/// (the shim's verifier is always a callback).
 const ignored_flags = [_][]const u8{
-    "-no-tls1", "-no-tls11", "-no-tls12", "-no-ssl3", "-async", "-implicit-handshake", "-expect-no-session-id",
+    "-no-tls1",              "-no-tls11",                   "-no-tls12", "-no-ssl3", "-async", "-implicit-handshake", "-expect-no-session-id",
+    "-expect-verify-result", "-use-custom-verify-callback",
 };
 
 /// The flag that made this run exit 89, for `run` to log.
@@ -187,6 +208,36 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.expect_curve_id = try std.fmt.parseInt(u16, try value(it, flag), 10);
         } else if (std.mem.eql(u8, flag, "-select-alpn")) {
             try o.alpn.append(gpa, try value(it, flag));
+        } else if (std.mem.eql(u8, flag, "-require-any-client-certificate")) {
+            o.client_auth = .mandatory;
+        } else if (std.mem.eql(u8, flag, "-verify-peer")) {
+            if (o.client_auth == .off) o.client_auth = .optional;
+        } else if (std.mem.eql(u8, flag, "-verify-fail")) {
+            o.verify_fail = true;
+        } else if (std.mem.eql(u8, flag, "-verify-prefs")) {
+            // 0xff01 is BoringSSL's internal RSA PKCS#1 MD5-SHA1 (TLS 1.0
+            // and 1.1), which it never names in a TLS 1.3 CertificateRequest.
+            const v = try std.fmt.parseInt(u16, try value(it, flag), 10);
+            if (v != 0xff01) try o.verify_prefs.append(gpa, v);
+        } else if (std.mem.eql(u8, flag, "-expect-peer-signature-algorithm")) {
+            o.expect_peer_signature_algorithm = try std.fmt.parseInt(u16, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-trust-cert")) {
+            // The runner passes its credential's root, "" for one without
+            // (the garbage certificate): no anchor, as BoringSSL's shim.
+            const v = try value(it, flag);
+            o.trust_cert = if (v.len == 0) null else v;
+        } else if (std.mem.eql(u8, flag, "-expect-peer-cert-file")) {
+            o.expect_peer_cert_file = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-use-client-ca-list")) {
+            const v = try value(it, flag);
+            if (!std.mem.eql(u8, v, "<NULL>") and !std.mem.eql(u8, v, "<EMPTY>")) {
+                var names = std.mem.splitScalar(u8, v, ',');
+                while (names.next()) |h| {
+                    const der = try gpa.alloc(u8, h.len / 2);
+                    _ = try std.fmt.hexToBytes(der, h);
+                    try o.ca_names.append(gpa, der);
+                }
+            }
         } else {
             for (ignored_flags) |f| {
                 if (std.mem.eql(u8, flag, f)) break;
@@ -226,8 +277,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
     serve(gpa, io, &o, &on_resume) catch |err| {
         // A credential the module cannot load (P-521, ML-DSA, …) is a
         // feature it lacks, not a failure.
-        if (err == error.UnsupportedKey) {
-            unimplemented("(credential key type)") catch {};
+        if (err == error.UnsupportedKey or err == error.Unimplemented) {
+            if (err == error.UnsupportedKey) unimplemented("(credential key type)") catch {};
             logUnimplemented(io, environ);
             return exit_unimplemented;
         }
@@ -249,6 +300,42 @@ var peer_alert: ?tlsserver.alert.Description = null;
 fn wallMs(ctx: ?*anyopaque) i64 {
     const io: *const std.Io = @ptrCast(@alignCast(ctx.?));
     return std.Io.Clock.real.now(io.*).toMilliseconds();
+}
+
+/// BoringSSL's shim verifier: any chain, unless `-verify-fail`.
+const ShimVerifier = struct {
+    fn accept(_: ?*const anyopaque, _: []const []const u8, _: i64) tlsserver.clientauth.VerifyError!void {}
+    fn refuse(_: ?*const anyopaque, _: []const []const u8, _: i64) tlsserver.clientauth.VerifyError!void {
+        return error.CertificateUnknown;
+    }
+};
+
+/// Every certificate of a PEM file (DER), in order.
+fn pemCertificates(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const []const u8 {
+    const text = try readFile(gpa, io, path);
+    const begin = "-----BEGIN CERTIFICATE-----";
+    const end = "-----END CERTIFICATE-----";
+    var out: std.ArrayList([]const u8) = .empty;
+    var at: usize = 0;
+    while (std.mem.findPos(u8, text, at, begin)) |a| {
+        const b = std.mem.findPos(u8, text, a, end) orelse return error.TruncatedPem;
+        var b64: std.ArrayList(u8) = .empty;
+        for (text[a + begin.len .. b]) |ch| if (!std.ascii.isWhitespace(ch)) try b64.append(gpa, ch);
+        const D = std.base64.standard.Decoder;
+        const der = try gpa.alloc(u8, try D.calcSizeForSlice(b64.items));
+        try D.decode(der, b64.items);
+        try out.append(gpa, der);
+        at = b + end.len;
+    }
+    if (out.items.len == 0) return error.NoCertificateInFile;
+    return out.items;
+}
+
+/// The leaf of a PEM file, if it holds exactly one certificate.
+fn singlePemCertificate(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const all = try pemCertificates(gpa, io, path);
+    if (all.len != 1) return unimplemented("-expect-peer-cert-file (a chain)");
+    return all[0];
 }
 
 fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume: *const Options) !void {
@@ -275,20 +362,38 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume:
 
     for (0..initial.resume_count + 1) |i| {
         const o = if (i == 0) initial else on_resume;
-        const resumed = try connection(gpa, io, &ck, &tickets, csprng.random(), o);
+        const resumed = try connection(gpa, io, &ck, &tickets, csprng.random(), o, &io_ctx);
         const want = i != 0 and !o.expect_session_miss;
         if (resumed != want) return if (resumed) error.UnexpectedSessionReuse else error.SessionNotReused;
     }
 }
 
 /// One connection; whether it resumed a session.
-fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: *const server_mod.Tickets, random: std.Random, o: *const Options) !bool {
+fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: *const server_mod.Tickets, random: std.Random, o: *const Options, io_ctx: *std.Io) !bool {
+    const want_peer: ?[]const u8 = if (o.expect_peer_cert_file) |f| try singlePemCertificate(gpa, io, f) else null;
+    const x509_verifier: tlsserver.X509Verifier = .{
+        .gpa = gpa,
+        .anchors = if (o.trust_cert) |f| try pemCertificates(gpa, io, f) else &.{},
+    };
+    const client_auth: server_mod.ClientAuth = .{
+        .verifier = if (o.verify_fail)
+            .{ .verify = ShimVerifier.refuse }
+        else if (o.trust_cert != null)
+            x509_verifier.verifier()
+        else
+            .{ .verify = ShimVerifier.accept },
+        .mandatory = o.client_auth == .mandatory,
+        .schemes = if (o.verify_prefs.items.len != 0) o.verify_prefs.items else &server_mod.default_client_auth_schemes,
+        .authorities = o.ca_names.items,
+        .clock = .{ .ctx = io_ctx, .now_ms = wallMs },
+    };
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .groups = if (o.groups.items.len != 0) o.groups.items else &server_mod.default_groups,
         .alpn_protocols = o.alpn.items,
         .random = random,
         .tickets = tickets,
+        .client_auth = if (o.client_auth != .off) &client_auth else null,
     };
 
     const addr: net.IpAddress = if (o.ipv6) .{ .ip6 = .loopback(o.port) } else .{ .ip4 = .loopback(o.port) };
@@ -305,18 +410,44 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
 
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
     defer gpa.free(out);
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
+    return converse(&c, o, want_peer) catch |err| {
+        // A lingering close: the alert is out; closing with the runner's
+        // unread records in the receive buffer would send a reset, which
+        // can beat the alert to the runner (its next write then fails with
+        // EPIPE instead of it reading the alert).
+        stream.shutdown(io, .send) catch {};
+        // Bounded in time too: a runner that never closes ends the drain
+        // after 2 s of silence.
+        const tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
+        std.posix.setsockopt(stream.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        var sink: [4096]u8 = undefined;
+        var drained: usize = 0;
+        while (drained < 1 << 20) {
+            const n = sr.interface.readSliceShort(&sink) catch break;
+            if (n == 0) break;
+            drained += n;
+        }
+        return err;
+    };
+}
 
+fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8) !bool {
     try c.handshake();
     if (o.expect_server_name) |want| {
         const got = c.server.serverName() orelse return error.ServerNameMissing;
         if (!std.mem.eql(u8, got, want)) return error.ServerNameMismatch;
     }
     if (o.expect_curve_id) |want| if (c.server.negotiatedGroup() != want) return error.CurveMismatch;
+    if (want_peer) |want| {
+        const got = c.server.peerCertificate() orelse return error.NoPeerCertificate;
+        if (!std.mem.eql(u8, got, want)) return error.PeerCertificateMismatch;
+    }
+    if (o.expect_peer_signature_algorithm) |want| if (c.server.peerSignatureScheme() != want) return error.PeerSignatureAlgorithmMismatch;
     if (o.key_update) try c.keyUpdate(.update_not_requested);
     if (o.shim_writes_first) try c.writeAll("hello");
     if (o.shim_shuts_down) {

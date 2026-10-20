@@ -7,8 +7,9 @@ TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X2
 X25519, secp256r1, secp384r1; ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; SNI
 certificate selection; ALPN; HelloRetryRequest for a group the client sent no share for — then application data and close_notify, sans-I/O (`Server`) or
 blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), KeyUpdate
-both ways, and session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`). No
-client certificates yet (`SPEC.md`, *Backlog*).
+both ways, session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`), and client
+certificates (`Config.client_auth`: a `ClientCertVerifier`, `X509Verifier` over `x509`;
+`Server.peerCertificate`). Not yet: OCSP-specific work (`SPEC.md`, *Backlog*).
 
 - **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
   server; qap runs a fork of a third-party one, which this module is meant to replace.
@@ -62,10 +63,11 @@ zeroed; the engine answers it with the matching alert.
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 166 pass); handshakes against Zig std's
+(`-- --bogo`, 274 pass); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
-the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server` and `-keyupdate` harnesses (`SPEC.md` § Fuzzing). Dead
+the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server`, `-keyupdate` and
+`-clientauth` harnesses (`SPEC.md` § Fuzzing). Dead
 stack: `src/stackprobe_test.zig` (ReleaseFast). Example: `zig build run-example-tlsserver`.
 
 Provenance: clean-room from RFC 8446 (a public standard), no third-party source ported or

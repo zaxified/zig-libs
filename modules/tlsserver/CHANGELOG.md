@@ -5,6 +5,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Client certificates (M2 step 4). New `Config.client_auth` (`ClientAuth`: a
+  `ClientCertVerifier`, `mandatory` (default), `schemes` (rustls's list), `authorities`, a
+  `Clock`), `clientauth` (Certificate / CertificateVerify decoders, `leafPublicKey`,
+  `checkLeafKeyUsage`, `X509Verifier` = `x509.verifyChain` with clientAuth),
+  `Server.peerCertificate` / `peerSignatureScheme`. A full handshake sends a CertificateRequest;
+  an empty Certificate is `certificate_required` when mandatory; the leaf must have a key the
+  server verifies and, with a keyUsage, `digitalSignature`; the verifier's refusal names its
+  alert; the CertificateVerify must use a requested TLS 1.3 scheme suiting the key
+  (`illegal_parameter`) and verify (`decrypt_error`). **BREAKING:** `minOutputLen(config, key)`
+  (was `minOutputLen(key)`): it now also sizes the CertificateRequest and the tickets.
+  **BEHAVIOURAL:** the ticket format is 2 (it carries the client's leaf and signature scheme;
+  format-1 tickets are not resumed); with a mandatory certificate a ticket without one is not
+  resumed (stricter than rustls); `burn.handshake_burn` is 32 KiB. KAT: RFC 8448 §6 (the client's
+  RSA Certificate, RSA-PSS CertificateVerify and Finished verified on the server's side; the
+  CertificateRequest byte-exact). Interop 46/46 (11 new mTLS sessions with OpenSSL and Go,
+  recaptured); BoGo 274 pass / 0 fail (was 166; the run found the missing keyUsage check);
+  fuzz: new harness `tlsserver-clientauth` (6M runs clean), `tlsserver-server` (client-flight
+  reseal, 240k clean) and `tlsserver-keyupdate` (80k clean) on the mTLS recordings; 17/17
+  planted mutants caught (two after new tests), 18/18 with the review fix. New test fixtures
+  `test_client_fixtures` (`tools/client_certs.py`). Independent review (Sonnet): no HIGH; MEDIUM
+  fixed — re-issued tickets kept a client certificate alive indefinitely; a ticket now carries
+  when the certificate was proved and is not resumed past the lifetime from then (stricter than
+  rustls). LOWs fixed: unknown revocation status → `certificate_unknown`, the shim's drain
+  bounded in time, a failed handshake clears `peerCertificate`.
 - **2026-10-20** — Session tickets and PSK resumption (M2 step 3). New `Config.tickets`
   (`Tickets`: a `Ticketer` — `StekTicketer` over a `tlsresume.StekRing` — a `Clock`, `count` 2,
   `lifetime_s` 12 h, capped at 7 days); `Server.isResumed`. After the client's Finished the

@@ -65,8 +65,29 @@
 //! same (rustls `refresh_traffic_keys`), or when the caller asks
 //! (`keyUpdate`).
 //!
-//! Not yet (later milestones): client certificates. Early data is never
-//! accepted and is skipped (`inbound.Inbound.skip_early`).
+//! With `Config.client_auth` set, a full handshake asks for a client
+//! certificate (RFC 8446 §4.3.2), as rustls:
+//!
+//! - **request** a CertificateRequest follows the EncryptedExtensions, with
+//!   an empty context, `ClientAuth.schemes` and the CA names given; none on
+//!   a resumption;
+//! - **chain** an empty one is `certificate_required` when the
+//!   certificate is mandatory, otherwise the client goes on unauthenticated;
+//!   a non-empty one's leaf must have a key the server verifies and, if it
+//!   has a `keyUsage`, `digitalSignature` (BoringSSL; `unsupported_certificate`),
+//!   then the chain goes to the `ClientCertVerifier` (its refusal is its
+//!   alert), then the CertificateVerify over the transcript through it must
+//!   use a scheme of `ClientAuth.schemes` that TLS 1.3 allows (no RSA PKCS#1
+//!   v1.5, RFC 8446 §4.4.3) and suits the leaf's key (`illegal_parameter`
+//!   otherwise) and verify (`decrypt_error`);
+//! - **identity** the leaf is `peerCertificate` once its CertificateVerify
+//!   verified; tickets carry it, so a resumption is as authenticated as
+//!   the handshake that issued the ticket (rustls keeps the whole chain;
+//!   here only the leaf is kept). With a mandatory certificate, a ticket
+//!   without one is not resumed (stricter than rustls, which resumes it).
+//!
+//! Early data is never accepted and is skipped
+//! (`inbound.Inbound.skip_early`).
 
 const std = @import("std");
 const tls13 = @import("tls13");
@@ -77,6 +98,7 @@ const outbound = @import("outbound.zig");
 const hello = @import("hello.zig");
 const messages = @import("messages.zig");
 const burn = @import("burn.zig");
+const clientauth = @import("clientauth.zig");
 const tlsresume = @import("tlsresume");
 
 const certverify = tls13.certverify;
@@ -122,7 +144,34 @@ pub const Config = struct {
     /// Session tickets and resumption with them; null: neither (a
     /// `pre_shared_key` offer gets a full handshake).
     tickets: ?*const Tickets = null,
+    /// Client certificates; null: none is asked for.
+    client_auth: ?*const ClientAuth = null,
 };
+
+/// Client authentication (RFC 8446 §4.3.2, §4.4.2; rustls
+/// `ClientCertVerifier`).
+pub const ClientAuth = struct {
+    verifier: clientauth.ClientCertVerifier,
+    /// A client without a certificate is refused (`certificate_required`);
+    /// false lets it on unauthenticated (rustls `allow_unauthenticated`).
+    mandatory: bool = true,
+    /// The CertificateRequest's `signature_algorithms`, most preferred
+    /// first: for the client's CertificateVerify and its chain. Must name
+    /// at least one TLS 1.3 CertificateVerify scheme (an empty list is
+    /// `InternalError` at the first handshake; RSA PKCS#1 v1.5 alone leaves
+    /// a client nothing to sign with).
+    schemes: []const u16 = &default_client_auth_schemes,
+    /// DER DistinguishedNames sent as `certificate_authorities` (rustls
+    /// `root_hint_subjects`); empty: not sent.
+    authorities: []const []const u8 = &.{},
+    /// The verifier's time.
+    clock: Clock,
+};
+
+/// rustls's (ring provider) `supported_verify_schemes`: ECDSA P-384 and
+/// P-256, Ed25519, RSA-PSS, then RSA PKCS#1 v1.5 — for certificates only,
+/// never a TLS 1.3 CertificateVerify.
+pub const default_client_auth_schemes = [_]u16{ 0x0503, 0x0403, 0x0807, 0x0806, 0x0805, 0x0804, 0x0601, 0x0501, 0x0401 };
 
 /// Session tickets (RFC 8446 §4.6.1).
 pub const Tickets = struct {
@@ -194,7 +243,7 @@ pub fn StekTicketer(comptime Ring: type) type {
 const max_ticket_plaintext = tlsresume.select.SessionState(48).wireLen(1) + TicketFields.max_len;
 
 /// The ticket blob a `Ticketer` may return (a `StekRing`'s adds 29 octets).
-const max_ticket_len = 1024;
+const max_ticket_len = max_ticket_plaintext + 128;
 
 /// PSK identities looked at in one ClientHello; later ones are ignored.
 const max_psk_identities = 32;
@@ -205,10 +254,17 @@ const max_psk_identities = 32;
 const TicketFields = struct {
     sni: ?[]const u8,
     alpn: ?[]const u8,
+    /// The client's certificate (DER leaf), if it authenticated, and the
+    /// scheme of its CertificateVerify (0 without one).
+    peer: ?[]const u8,
+    peer_scheme: u16 = 0,
+    /// When the client proved that certificate (the full handshake's time,
+    /// carried across resumptions), ms since the epoch.
+    peer_auth_ms: i64 = 0,
     suite: u16,
 
-    const format: u8 = 1;
-    const max_len = 1 + 1 + 255 + 1 + 255 + 2;
+    const format: u8 = 2;
+    const max_len = 1 + 1 + 255 + 1 + 255 + 2 + clientauth.max_leaf_len + 2 + 8 + 2;
 
     fn write(f: TicketFields, out: []u8) usize {
         var n: usize = 0;
@@ -220,13 +276,19 @@ const TicketFields = struct {
             @memcpy(out[n + 1 ..][0..b.len], b);
             n += 1 + b.len;
         }
-        std.mem.writeInt(u16, out[n..][0..2], f.suite, .big);
-        return n + 2;
+        const p = f.peer orelse "";
+        std.mem.writeInt(u16, out[n..][0..2], @intCast(p.len), .big);
+        @memcpy(out[n + 2 ..][0..p.len], p);
+        n += 2 + p.len;
+        std.mem.writeInt(u16, out[n..][0..2], f.peer_scheme, .big);
+        std.mem.writeInt(i64, out[n + 2 ..][0..8], f.peer_auth_ms, .big);
+        std.mem.writeInt(u16, out[n + 10 ..][0..2], f.suite, .big);
+        return n + 12;
     }
 
     /// Null for anything this server did not write (another format).
     fn parse(tail: []const u8) ?TicketFields {
-        if (tail.len < 5 or tail[0] != format) return null;
+        if (tail.len < 7 or tail[0] != format) return null;
         var at: usize = 1;
         var v: [2]?[]const u8 = undefined;
         for (&v) |*x| {
@@ -236,27 +298,58 @@ const TicketFields = struct {
             x.* = if (n == 0) null else tail[at + 1 ..][0..n];
             at += 1 + n;
         }
-        if (tail.len - at != 2) return null;
-        return .{ .sni = v[0], .alpn = v[1], .suite = std.mem.readInt(u16, tail[at..][0..2], .big) };
+        if (tail.len - at < 2) return null;
+        const n: usize = std.mem.readInt(u16, tail[at..][0..2], .big);
+        at += 2;
+        if (tail.len - at < n or n > clientauth.max_leaf_len) return null;
+        const peer: ?[]const u8 = if (n == 0) null else tail[at..][0..n];
+        at += n;
+        if (tail.len - at != 12) return null;
+        return .{
+            .sni = v[0],
+            .alpn = v[1],
+            .peer = peer,
+            .peer_scheme = std.mem.readInt(u16, tail[at..][0..2], .big),
+            .peer_auth_ms = std.mem.readInt(i64, tail[at + 2 ..][0..8], .big),
+            .suite = std.mem.readInt(u16, tail[at + 10 ..][0..2], .big),
+        };
     }
 };
 
 /// Which of this server's tickets a ClientHello may resume (rustls
 /// `can_resume`: the suite negotiated, the same SNI; younger than the
-/// configured lifetime).
+/// configured lifetime; with a mandatory client certificate, one the ticket
+/// carries). A client certificate is good for the lifetime from the full
+/// handshake that proved it, however many resumptions re-issued it
+/// (stricter than rustls, whose re-issued tickets keep a certificate alive
+/// indefinitely — past its expiry or revocation).
 const Resumable = struct {
     suite: u16,
     sni: ?[]const u8,
     lifetime_ms: i64,
+    now_ms: i64 = 0,
+    need_peer: bool = false,
+    /// Out: the client certificate of the last ticket accepted (the one
+    /// `selectPsk` took, if it took one), a slice of its scratch, and the
+    /// scheme it signed with.
+    peer: ?[]const u8 = null,
+    peer_scheme: u16 = 0,
+    peer_auth_ms: i64 = 0,
 
-    fn accepts(w: *const Resumable, tail: []const u8, age_ms: i64) bool {
+    fn accepts(w: *Resumable, tail: []const u8, age_ms: i64) bool {
         const f = TicketFields.parse(tail) orelse return false;
-        return f.suite == w.suite and Server.optEql(f.sni, w.sni) and age_ms <= w.lifetime_ms;
+        if (f.suite != w.suite or !Server.optEql(f.sni, w.sni) or age_ms > w.lifetime_ms) return false;
+        if (w.need_peer and f.peer == null) return false;
+        if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms - f.peer_auth_ms > w.lifetime_ms)) return false;
+        w.peer = f.peer;
+        w.peer_scheme = f.peer_scheme;
+        w.peer_auth_ms = f.peer_auth_ms;
+        return true;
     }
 
     /// `tlsresume.select.Filter.accept`.
     fn accept(ctx: ?*anyopaque, tail: []const u8, age_ms: i64) bool {
-        const w: *const Resumable = @ptrCast(@alignCast(ctx.?));
+        const w: *Resumable = @ptrCast(@alignCast(ctx.?));
         return w.accepts(tail, age_ms);
     }
 };
@@ -294,7 +387,11 @@ const psk_dhe_ke: u8 = 1;
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
 
-pub const Error = inbound.Error || error{
+pub const Error = inbound.Error || clientauth.VerifyError || error{
+    /// A mandatory client certificate was not sent.
+    CertificateRequired,
+    /// A client certificate entry with an extension.
+    UnsupportedExtension,
     HandshakeFailure,
     ProtocolVersion,
     MissingExtension,
@@ -330,17 +427,42 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.InternalError => .internal_error,
         error.OutputFull, error.Closed, error.NotConnected => null,
         error.TooManyKeyUpdates => .unexpected_message,
+        error.CertificateRequired => .certificate_required,
+        error.UnsupportedExtension => .unsupported_extension,
+        error.BadCertificate => .bad_certificate,
+        error.UnsupportedCertificate => .unsupported_certificate,
+        error.CertificateRevoked => .certificate_revoked,
+        error.CertificateExpired => .certificate_expired,
+        error.UnknownCa => .unknown_ca,
+        error.CertificateUnknown => .certificate_unknown,
         else => |e| inbound.alertFor(@errorCast(e)),
     };
 }
 
-/// An output buffer that holds the first flight for `ck`: ServerHello
-/// (with the largest share), CCS, EncryptedExtensions (ALPN), the chain
-/// with an OCSP staple, CertificateVerify, Finished, each record's
-/// overhead, plus one alert — and a HelloRetryRequest with its CCS, should
-/// the caller not drain the output between the two ClientHellos.
+/// An output buffer that holds the first flight for `ck` under `cfg`:
+/// ServerHello (with the largest share), CCS, EncryptedExtensions (ALPN), a
+/// CertificateRequest, the chain with an OCSP staple, CertificateVerify,
+/// Finished, each record's overhead, plus one alert — and a
+/// HelloRetryRequest with its CCS, should the caller not drain the output
+/// between the two ClientHellos. It also holds the NewSessionTickets after
+/// the client's Finished (with the longest client leaf they may carry).
 /// secret-api-ok: reads the chain's lengths and the key's tag (its signature schemes), never the key bytes.
-pub fn minOutputLen(ck: *const CertifiedKey) usize {
+pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
+    var request: usize = 0;
+    if (cfg.client_auth) |ca| {
+        request = 4 + 1 + 2 + 6 + 2 * ca.schemes.len + 6;
+        for (ca.authorities) |dn| request += 2 + dn.len;
+    }
+    var tickets: usize = 0;
+    if (cfg.tickets) |tk| {
+        const one = 4 + 4 + 4 + 1 + 1 + 2 + max_ticket_len + 2 + 4;
+        tickets = tk.count * one;
+        tickets += (tickets / record.max_plaintext_len + 1) * (record.header_len + 1 + record.tag_len);
+    }
+    return @max(firstFlightLen(ck) + request, tickets + outbound.alert_reserve + 64);
+}
+
+fn firstFlightLen(ck: *const CertifiedKey) usize {
     var chain: usize = 3;
     for (ck.chain) |c| chain += 3 + c.len + 2;
     if (ck.ocsp_response) |o| chain += 4 + 4 + o.len;
@@ -373,7 +495,7 @@ pub const Result = struct {
     consumed: usize,
 };
 
-const State = enum { client_hello, client_hello_retry, client_finished, connected, failed };
+const State = enum { client_hello, client_hello_retry, client_certificate, client_certificate_verify, client_finished, connected, failed };
 
 const Transcript = union(enum) {
     sha256: tls13.transcript.Transcript(Sha256),
@@ -430,6 +552,18 @@ pub const Server = struct {
     tickets_due: u8 = 0,
     /// The handshake resumed a session (a ticket's PSK was accepted).
     resumed: bool = false,
+    /// The client's certificate (DER leaf), `peer_len` octets: from its
+    /// Certificate, or from the ticket resumed.
+    peer_buf: [clientauth.max_leaf_len]u8 = undefined,
+    peer_len: u16 = 0,
+    /// The client proved it holds the key of `peer_buf` (its
+    /// CertificateVerify verified, or the ticket was issued after one).
+    peer_authenticated: bool = false,
+    /// The scheme of the client's CertificateVerify (0: none), from the
+    /// ticket on a resumption.
+    peer_scheme: u16 = 0,
+    /// When the client proved `peer_buf` (`TicketFields.peer_auth_ms`).
+    peer_auth_ms: i64 = 0,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -484,6 +618,21 @@ pub const Server = struct {
     /// sent).
     pub fn isResumed(self: *const Server) bool {
         return self.resumed;
+    }
+
+    /// The client's certificate (DER, the leaf of the chain the
+    /// `ClientCertVerifier` accepted), once the client proved it holds its
+    /// key; null without client authentication. On a resumption, the one
+    /// of the handshake that issued the ticket. Valid while `self` is.
+    pub fn peerCertificate(self: *const Server) ?[]const u8 {
+        return if (self.peer_authenticated) self.peer_buf[0..self.peer_len] else null;
+    }
+
+    /// The signature scheme of the client's CertificateVerify (null: no
+    /// client certificate). On a resumption, the one of the handshake that
+    /// issued the ticket (BoringSSL `SSL_get_peer_signature_algorithm`).
+    pub fn peerSignatureScheme(self: *const Server) ?u16 {
+        return if (self.peer_authenticated and self.peer_scheme != 0) self.peer_scheme else null;
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -620,6 +769,8 @@ pub const Server = struct {
                 self.out.write(.alert, &a.encode()) catch {};
             };
             self.state = .failed;
+            // A failed handshake reports no identity.
+            self.peer_authenticated = false;
             self.out.wipeKey();
             self.inbound.wipe();
             self.wipeHandshakeSecrets();
@@ -636,6 +787,17 @@ pub const Server = struct {
             .client_hello, .client_hello_retry => {
                 if (t != .client_hello) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientHello, .{ self, m });
+                return false;
+            },
+            // No secret is touched: the chain and the signature are public.
+            .client_certificate => {
+                if (t != .certificate) return error.UnexpectedMessage;
+                try self.onClientCertificate(m);
+                return false;
+            },
+            .client_certificate_verify => {
+                if (t != .certificate_verify) return error.UnexpectedMessage;
+                try self.onClientCertificateVerify(m);
                 return false;
             },
             .client_finished => {
@@ -767,6 +929,12 @@ pub const Server = struct {
             } else selected = null;
         }
         self.resumed = selected != null;
+        if (!self.resumed) {
+            self.peer_len = 0;
+            self.peer_scheme = 0;
+            self.peer_auth_ms = 0;
+        }
+        self.peer_authenticated = self.peer_len != 0;
 
         if (ch.alpn()) |theirs| {
             for (cfg.alpn_protocols) |ours| {
@@ -801,7 +969,7 @@ pub const Server = struct {
         // Early data the client may have sent under a PSK we did not take
         // (never after a retry: refused above).
         self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
-        self.state = .client_finished;
+        self.state = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
     }
 
     /// RFC 8446 §4.2.11 through `tlsresume.select.selectPsk`: the index of
@@ -837,21 +1005,33 @@ pub const Server = struct {
         var empty_hash: [L]u8 = undefined;
         H.Hash.hash("", &empty_hash, .{});
 
+        const now_ms = tk.clock.now_ms(tk.clock.ctx);
         var want: Resumable = .{
             .suite = @backingInt(suite),
             .sni = sni,
             .lifetime_ms = @as(i64, @min(tk.lifetime_s, max_ticket_lifetime_s)) * 1000,
+            .now_ms = now_ms,
+            .need_peer = if (self.config.client_auth) |ca| ca.mandatory else false,
         };
         const ring: TicketerRing = .{ .t = tk.ticketer };
         var scratch: [max_ticket_plaintext]u8 = undefined;
         defer std.crypto.secureZero(u8, &scratch);
         var sel: tlsresume.select.Selection(L) = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
-        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, tk.clock.now_ms(tk.clock.ctx), null, null, .{ .ctx = &want, .accept = Resumable.accept }, &scratch) catch |err| return switch (err) {
+        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, &scratch) catch |err| return switch (err) {
             error.NoAcceptableIdentity => null,
             error.BinderMismatch => error.DecryptError,
         };
         @memcpy(psk_out[0..L], &sel.psk);
+        // The ticket's client certificate (in `scratch`, which `selectPsk`
+        // last opened the taken ticket into). Kept even if the psk modes
+        // then refuse the resumption: `peer_authenticated` decides.
+        if (want.peer) |p| {
+            @memcpy(self.peer_buf[0..p.len], p);
+            self.peer_len = @intCast(p.len);
+            self.peer_scheme = want.peer_scheme;
+            self.peer_auth_ms = want.peer_auth_ms;
+        }
         return @intCast(sel.selected_index);
     }
 
@@ -997,6 +1177,11 @@ pub const Server = struct {
 
         // A resumption authenticates with the PSK (RFC 8446 §2.2).
         if (psk == null) {
+            if (cfg.client_auth) |ca| try self.send(H, try encoded(messages.certificateRequest(self.out.slot(), .{
+                .signature_algorithms = ca.schemes,
+                .authorities = ca.authorities,
+            })));
+
             // Certificate, the OCSP staple on the leaf if the client asked.
             var entries: [16]messages.CertificateEntry = undefined;
             if (ck.chain.len == 0 or ck.chain.len > entries.len) return error.InternalError;
@@ -1027,6 +1212,81 @@ pub const Server = struct {
         th = t.currentHash();
         ks.deriveApplicationTrafficSecrets(H.Hkdf, self.client_application_secret[0..L], self.server_application_secret[0..L], ms, &th);
         self.out.installTx(self.suite, self.server_application_secret[0..L]) catch return error.InternalError;
+    }
+
+    fn appendTranscript(self: *Server, m: inbound.HandshakeMessage) void {
+        switch (self.transcript) {
+            inline else => |*t| t.append(m.msg_type, m.body),
+        }
+    }
+
+    /// RFC 8446 §4.4.2.4: the client's chain, to the verifier. Its leaf is
+    /// kept for the CertificateVerify and `peerCertificate`.
+    fn onClientCertificate(self: *Server, m: inbound.HandshakeMessage) Error!void {
+        const ca = self.config.client_auth.?;
+        const c = clientauth.parseCertificate(m.body, "") catch |err| return switch (err) {
+            error.DecodeError => error.DecodeError,
+            error.IllegalParameter => error.IllegalParameter,
+            error.UnsupportedExtension => error.UnsupportedExtension,
+        };
+        if (c.isEmpty()) {
+            if (ca.mandatory) return error.CertificateRequired;
+            self.appendTranscript(m);
+            self.state = .client_finished;
+            return;
+        }
+        var chain: [clientauth.max_chain_len][]const u8 = undefined;
+        var n: usize = 0;
+        var it = c.certificates();
+        while (it.next()) |der| : (n += 1) {
+            if (n == chain.len) return error.BadCertificate;
+            chain[n] = der;
+        }
+        if (chain[0].len > clientauth.max_leaf_len) return error.BadCertificate;
+        // The leaf must be able to sign the CertificateVerify, whatever
+        // the verifier says (BoringSSL checks both here, before it).
+        _ = try clientauth.leafPublicKey(chain[0]);
+        try clientauth.checkLeafKeyUsage(chain[0]);
+        const now_s = @divFloor(ca.clock.now_ms(ca.clock.ctx), 1000);
+        try ca.verifier.verify(ca.verifier.ctx, chain[0..n], now_s);
+        @memcpy(self.peer_buf[0..chain[0].len], chain[0]);
+        self.peer_len = @intCast(chain[0].len);
+        self.appendTranscript(m);
+        self.state = .client_certificate_verify;
+    }
+
+    /// RFC 8446 §4.4.3: the client's signature over the transcript through
+    /// its Certificate, under a scheme the server asked for.
+    fn onClientCertificateVerify(self: *Server, m: inbound.HandshakeMessage) Error!void {
+        const ca = self.config.client_auth.?;
+        const cv = clientauth.parseCertificateVerify(m.body) catch return error.DecodeError;
+        // rustls `SignedHandshakeWithUnadvertisedSigScheme`.
+        if (std.mem.indexOfScalar(u16, ca.schemes, cv.scheme) == null) return error.IllegalParameter;
+        const key = try clientauth.leafPublicKey(self.peer_buf[0..self.peer_len]);
+        const scheme: certverify.SignatureScheme = @fromBackingInt(cv.scheme);
+        var th_buf: [48]u8 = undefined;
+        const th: []const u8 = switch (self.transcript) {
+            .sha256 => |*t| blk: {
+                th_buf[0..32].* = t.currentHash();
+                break :blk th_buf[0..32];
+            },
+            .sha384 => |*t| blk: {
+                th_buf = t.currentHash();
+                break :blk &th_buf;
+            },
+        };
+        certverify.verify(scheme, key, .client, th, cv.signature) catch |err| return switch (err) {
+            // RSA PKCS#1 v1.5 (offered for the chain only) and any scheme
+            // that does not suit the key.
+            error.UnsupportedScheme, error.KeyMismatch => error.IllegalParameter,
+            error.InvalidSignature => error.DecryptError,
+            else => error.InternalError,
+        };
+        self.peer_authenticated = true;
+        self.peer_scheme = cv.scheme;
+        if (self.config.tickets) |tk| self.peer_auth_ms = tk.clock.now_ms(tk.clock.ctx);
+        self.appendTranscript(m);
+        self.state = .client_finished;
     }
 
     fn onClientFinished(self: *Server, m: inbound.HandshakeMessage) Error!void {
@@ -1085,7 +1345,7 @@ pub const Server = struct {
         var plain: [max_ticket_plaintext]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain);
         var blob: [max_ticket_len]u8 = undefined;
-        const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .suite = @backingInt(self.suite) };
+        const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .peer = self.peerCertificate(), .peer_scheme = self.peerSignatureScheme() orelse 0, .peer_auth_ms = self.peer_auth_ms, .suite = @backingInt(self.suite) };
         const slot = self.out.slot();
         var used: usize = 0;
         for (0..self.tickets_due) |i| {
@@ -1605,7 +1865,7 @@ test "minOutputLen holds a HelloRetryRequest and the first flight undrained" {
     const ck = testKey();
     const cfg: Config = .{ .certificate = .{ .fixed = ck }, .random = prng.random() };
     var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
-    const out = try testing.allocator.alloc(u8, minOutputLen(ck));
+    const out = try testing.allocator.alloc(u8, minOutputLen(&cfg, ck));
     defer testing.allocator.free(out);
     var s: Server = .init(&cfg, &joiner, out);
     defer s.deinit();
@@ -1902,25 +2162,34 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     var buf: [TicketFields.max_len]u8 = undefined;
     const long_alpn: [255]u8 = @splat('a');
     const long_sni: [253]u8 = @splat('b');
+    const long_peer: [clientauth.max_leaf_len]u8 = @splat('c');
     for ([_]TicketFields{
-        .{ .sni = "example.com", .alpn = "h2", .suite = 0x1302 },
-        .{ .sni = null, .alpn = null, .suite = 0x1301 },
-        .{ .sni = &long_sni, .alpn = &long_alpn, .suite = 0x1303 },
+        .{ .sni = "example.com", .alpn = "h2", .peer = null, .suite = 0x1302 },
+        .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0804, .suite = 0x1301 },
+        .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .suite = 0x1303 },
     }) |f| {
         const n = f.write(&buf);
         const back = TicketFields.parse(buf[0..n]).?;
-        try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and f.suite == back.suite);
+        try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and
+            Server.optEql(f.peer, back.peer) and f.peer_scheme == back.peer_scheme and f.suite == back.suite);
         // Every truncation, an extra octet and another format are refused.
         for (0..n) |cut| try testing.expect(TicketFields.parse(buf[0..cut]) == null);
-        buf[n] = 0;
-        try testing.expect(TicketFields.parse(buf[0 .. n + 1]) == null);
+        if (n < buf.len) {
+            buf[n] = 0;
+            try testing.expect(TicketFields.parse(buf[0 .. n + 1]) == null);
+        }
         buf[0] ^= 1;
         try testing.expect(TicketFields.parse(buf[0..n]) == null);
     }
+    // A peer longer than the cap is not this server's (its octets there).
+    var over: [TicketFields.max_len + 1]u8 = undefined;
+    const too_long: [clientauth.max_leaf_len + 1]u8 = @splat('d');
+    const no = (TicketFields{ .sni = null, .alpn = null, .peer = &too_long, .suite = 0x1301 }).write(&over);
+    try testing.expect(TicketFields.parse(over[0..no]) == null);
 
-    const n = (TicketFields{ .sni = "example.com", .alpn = null, .suite = 0x1301 }).write(&buf);
+    const n = (TicketFields{ .sni = "example.com", .alpn = null, .peer = null, .suite = 0x1301 }).write(&buf);
     const tail = buf[0..n];
-    const want: Resumable = .{ .suite = 0x1301, .sni = "example.com", .lifetime_ms = 1000 };
+    var want: Resumable = .{ .suite = 0x1301, .sni = "example.com", .lifetime_ms = 1000 };
     try testing.expect(want.accepts(tail, 0));
     try testing.expect(want.accepts(tail, 1000));
     try testing.expect(!want.accepts(tail, 1001));
@@ -1932,9 +2201,29 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     try testing.expect(!other.accepts(tail, 0));
     other.sni = null;
     try testing.expect(!other.accepts(tail, 0));
-    const n2 = (TicketFields{ .sni = null, .alpn = null, .suite = 0x1301 }).write(&buf);
+    const n2 = (TicketFields{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 }).write(&buf);
     try testing.expect(other.accepts(buf[0..n2], 0));
     try testing.expect(!want.accepts(buf[0..n2], 0));
+
+    // A mandatory client certificate: only a ticket that carries one, which
+    // is handed out.
+    var need: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000, .need_peer = true };
+    try testing.expect(!need.accepts(buf[0..n2], 0));
+    try testing.expectEqual(null, need.peer);
+    const n3 = (TicketFields{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0807, .suite = 0x1301 }).write(&buf);
+    try testing.expect(need.accepts(buf[0..n3], 0));
+    try testing.expectEqualStrings("LEAF", need.peer.?);
+    try testing.expectEqual(@as(u16, 0x0807), need.peer_scheme);
+    // The certificate is good for the lifetime from its proof, whatever
+    // the ticket's own age (a re-issued ticket is young).
+    const n4 = (TicketFields{ .sni = null, .alpn = null, .peer = "LEAF", .peer_auth_ms = 5_000, .suite = 0x1301 }).write(&buf);
+    need.now_ms = 6_000;
+    try testing.expect(need.accepts(buf[0..n4], 0));
+    try testing.expectEqual(@as(i64, 5_000), need.peer_auth_ms);
+    need.now_ms = 6_001;
+    try testing.expect(!need.accepts(buf[0..n4], 0));
+    need.now_ms = 4_999; // proved in the future
+    try testing.expect(!need.accepts(buf[0..n4], 0));
 }
 
 test "tickets only for a client that offers psk_dhe_ke (rustls)" {
@@ -1976,4 +2265,103 @@ test "tickets only for a client that offers psk_dhe_ke (rustls)" {
     defer testing.allocator.free(rec);
     _ = try s.feed(rec);
     try testing.expectEqual(@as(u8, 0), s.tickets_due);
+}
+
+// ── client certificates (RFC 8448 §6) ────────────────────────────────────
+
+const AcceptAny = struct {
+    fn verify(_: ?*const anyopaque, chain: []const []const u8, _: i64) clientauth.VerifyError!void {
+        if (chain.len == 0) return error.BadCertificate;
+    }
+    fn clock(_: ?*anyopaque) i64 {
+        return 0;
+    }
+};
+
+fn handshakeMessage(raw: []const u8) inbound.HandshakeMessage {
+    return .{ .msg_type = raw[0], .body = raw[4..], .raw = raw };
+}
+
+/// A server white-box at the client's second flight of RFC 8448 §6: the
+/// transcript through the server's Finished.
+fn rfc8448S6Server(cfg: *const Config, joiner: []u8, out: []u8) Server {
+    const kat = @import("message_kat_vectors.zig");
+    var s: Server = .init(cfg, joiner, out);
+    s.suite = .aes_128_gcm_sha256;
+    s.has_suite = true;
+    s.startTranscript(.aes_128_gcm_sha256);
+    for ([_][]const u8{
+        &kat.rfc8448_s6,                     &kat.rfc8448_s6_server_hello, &kat.rfc8448_s6_encrypted_extensions,
+        &kat.rfc8448_s6_certificate_request, &kat.rfc8448_s6_certificate,  &kat.rfc8448_s6_certificate_verify,
+        &kat.rfc8448_s6_server_finished,
+    }) |m| s.transcript.sha256.append(m[0], m[4..]);
+    s.state = .client_certificate;
+    return s;
+}
+
+test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) verify" {
+    const kat = @import("message_kat_vectors.zig");
+    var prng = std.Random.DefaultPrng.init(1);
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock } };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    // The leaf: certificate_list at 4 + 1 + 3, its cert_data length first.
+    const cert_msg = &kat.rfc8448_s6_client_certificate;
+    const leaf = cert_msg[11..][0..std.mem.readInt(u24, cert_msg[8..11], .big)];
+    {
+        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        try testing.expect(!try s.onHandshake(handshakeMessage(cert_msg)));
+        try testing.expectEqual(null, s.peerCertificate()); // not before its CertificateVerify
+        try testing.expect(!try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_certificate_verify)));
+        try testing.expectEqual(State.client_finished, s.state);
+        try testing.expectEqualSlices(u8, leaf, s.peerCertificate().?);
+        // The client's Finished, over the transcript through its
+        // CertificateVerify, under the RFC's client handshake secret.
+        s.client_handshake_secret[0..32].* = kat.rfc8448_s6_client_handshake_secret;
+        try testing.expect(try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
+        try testing.expect(s.isConnected());
+    }
+    // One signature octet off: decrypt_error.
+    {
+        var cv = kat.rfc8448_s6_client_certificate_verify;
+        cv[cv.len - 1] ^= 1;
+        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        _ = try s.onHandshake(handshakeMessage(cert_msg));
+        try testing.expectError(error.DecryptError, s.onHandshake(handshakeMessage(&cv)));
+    }
+    // A scheme the server did not ask for, and RSA PKCS#1 v1.5 (asked for,
+    // for certificates only): illegal_parameter.
+    for ([_]struct { []const u16, u16 }{ .{ &.{0x0403}, 0x0804 }, .{ &.{ 0x0804, 0x0401 }, 0x0401 } }) |c| {
+        auth.schemes = c[0];
+        var cv = kat.rfc8448_s6_client_certificate_verify;
+        std.mem.writeInt(u16, cv[4..6], c[1], .big);
+        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        _ = try s.onHandshake(handshakeMessage(cert_msg));
+        try testing.expectError(error.IllegalParameter, s.onHandshake(handshakeMessage(&cv)));
+    }
+    auth.schemes = &default_client_auth_schemes;
+    // A leaf whose keyUsage does not allow signing (the client CA's:
+    // keyCertSign, cRLSign), whatever the verifier says.
+    {
+        const client_certs = @import("client_certs.zig");
+        const ca = &client_certs.ca_cert;
+        var msg: [4 + 1 + 3 + 3 + ca.len + 2]u8 = undefined;
+        msg[0] = 11;
+        std.mem.writeInt(u24, msg[1..4], msg.len - 4, .big);
+        msg[4] = 0;
+        std.mem.writeInt(u24, msg[5..8], 3 + ca.len + 2, .big);
+        std.mem.writeInt(u24, msg[8..11], ca.len, .big);
+        @memcpy(msg[11..][0..ca.len], ca);
+        msg[msg.len - 2] = 0;
+        msg[msg.len - 1] = 0;
+        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        try testing.expectError(error.UnsupportedCertificate, s.onHandshake(handshakeMessage(&msg)));
+        try testing.expectEqual(alert.Description.unsupported_certificate, alertFor(error.UnsupportedCertificate).?);
+    }
+    // Out of order: a Finished where the Certificate belongs.
+    {
+        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
+    }
 }

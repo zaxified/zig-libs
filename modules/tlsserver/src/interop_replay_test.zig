@@ -8,7 +8,9 @@
 //! for one back, in the `key_update` cases — close_notify, read to the
 //! client's close_notify), and must write exactly the octets OpenSSL
 //! accepted — its NewSessionTickets included, and, in the `resumed` cases,
-//! a resumption of the ticket a recorded earlier case issued. A change to anything the server puts on the wire — or to what
+//! a resumption of the ticket a recorded earlier case issued; with client
+//! authentication, the client certificate the server ends up with. A
+//! change to anything the server puts on the wire — or to what
 //! it accepts — fails here, in every test lane, with neither OpenSSL nor Go
 //! around.
 
@@ -21,6 +23,8 @@ const server_mod = @import("server.zig");
 const Connection = @import("connection.zig").Connection;
 const certs = @import("test_certs.zig");
 const vectors = @import("interop_vectors.zig");
+const clientauth = @import("clientauth.zig");
+const client_certs = @import("client_certs.zig");
 const tlsresume = @import("tlsresume");
 
 fn clock(_: ?*anyopaque) i64 {
@@ -60,6 +64,8 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     ring.rotate(1, &vectors.stek_key, @divFloor(vectors.clock_ms, 1000));
     const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
     const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = clock } };
+    const verifier: clientauth.X509Verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
+    const client_auth: server_mod.ClientAuth = .{ .verifier = verifier.verifier(), .mandatory = v.client_auth == .mandatory, .clock = .{ .now_ms = clock } };
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -67,6 +73,7 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
         .tickets = if (v.tickets) &tickets else null,
+        .client_auth = if (v.client_auth != .off) &client_auth else null,
     };
 
     // The reader holds the whole recording in a buffer big enough for a
@@ -80,7 +87,7 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     defer written.deinit();
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 4096);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &ck) + 4096);
     defer gpa.free(out);
 
     var c: Connection = .init(&cfg, &reader, &written.writer, joiner, out);
@@ -113,6 +120,13 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     };
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
     try testing.expectEqual(v.resumed, c.server.isResumed());
+    const want_peer: ?[]const u8 = switch (v.client_cert) {
+        .none => null,
+        .p256 => &client_certs.p256_cert,
+        .rsa2048 => &client_certs.rsa2048_cert,
+        .ed25519 => &client_certs.ed25519_cert,
+    };
+    if (want_peer) |p| try testing.expectEqualSlices(u8, p, c.server.peerCertificate().?) else try testing.expectEqual(null, c.server.peerCertificate());
 }
 
 test "OpenSSL and Go client sessions replay byte-exact through Connection" {

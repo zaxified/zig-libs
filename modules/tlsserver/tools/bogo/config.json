@@ -8,7 +8,15 @@
     "BadRSAClientKeyExchange-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "Basic-Server-ECDHE-ECDSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "Basic-Server-ECDHE-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Basic-Server-Ed25519-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Basic-Server-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "CertificateVerification*-Server-TLS1-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "CertificateVerification*-Server-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "CertificateVerification*-Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "CertificateVerificationFail-Server-TLS13-TLS-Sync*": "BoringSSL's legacy verify callback answers handshake_failure; tlsserver sends the verifier's alert (certificate_unknown), which the -CustomCallback variant of this test expects",
+    "ClientAuth-Enforced": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "ClientAuth-NoCertificate-Server-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "ClientAuth-Server-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "ClientHelloVersionTooHigh": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "ConflictingVersionNegotiation*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "CurveID-Resume-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
@@ -25,6 +33,7 @@
     "ExtensionTrailingData-TrustAnchors-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "FallbackSCSV": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "FragmentAcrossChangeCipherSpec-Server*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "GarbageCertificate-Server-TLS13": "rustls behaviour, kept: an unparsable client leaf is bad_certificate where BoringSSL sends decode_error; rustls 0.23.43 maps the local error with TestLocalErrorMap, which runner 784fcafc lacks",
     "MajorVersionTolerance": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "MinimumVersion-Server-TLS1-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "MinimumVersion-Server-TLS1-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -41,11 +50,13 @@
     "MinorVersionTolerance": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "NoCommonCurves": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "NoCommonSignatureAlgorithms-TLS12-Fallback": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoEd25519-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "NoEd25519-TLS11-ServerAuth-Sign": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "NoExtendedMasterSecret-TLS1-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "NoExtendedMasterSecret-TLS11-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "NoExtendedMasterSecret-TLS12-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "NoSupportedCurves": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Null-Client-CA-List": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "PAKE-Extension-Duplicate": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "PartialClientFinishedWithClientHello-TLS12-Resume": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "PartialClientKeyExchangeWithClientHello": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
@@ -70,21 +81,39 @@
     "Resume-Server-TLS13-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Resume-Server-TLS13-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Resume-Server-UnofferedCipher": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Server-InvalidSignature-ECDSA_P521_SHA512-TLS13": "a client key the server does not verify (P-521: tls13.certverify has no P-521; rustls with ring neither)",
+    "Server-InvalidSignature-ML-DSA-*-TLS13": "a client key the server does not verify (ML-DSA: not in tls13.certverify)",
+    "Server-InvalidSignature-RSA_PKCS1_SHA256_LEGACY-TLS13": "rsa_pkcs1_sha256_legacy (draft-ietf-tls-tls13-pkcs1) in a TLS 1.3 CertificateVerify: not implemented (rustls neither)",
+    "Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "Server-Verify-ECDSA_P521_SHA512-TLS13": "a client key the server does not verify (P-521: tls13.certverify has no P-521; rustls with ring neither)",
+    "Server-Verify-ML-DSA-*-TLS13": "a client key the server does not verify (ML-DSA: not in tls13.certverify)",
+    "Server-Verify-RSA_PKCS1_SHA256_LEGACY-TLS13": "rsa_pkcs1_sha256_legacy (draft-ietf-tls-tls13-pkcs1) in a TLS 1.3 CertificateVerify: not implemented (rustls neither)",
+    "Server-VerifyDefault-ECDSA_P521_SHA512-TLS13": "a client key the server does not verify (P-521: tls13.certverify has no P-521; rustls with ring neither)",
+    "Server-VerifyDefault-Ed25519-TLS13": "rustls behaviour, kept: Ed25519 is accepted by default (BoringSSL needs it enabled)",
+    "Server-VerifyDefault-ML-DSA-*-TLS13": "a client key the server does not verify (ML-DSA: not in tls13.certverify)",
+    "Server-VerifyDefault-RSA_PKCS1_SHA256_LEGACY-TLS13": "rsa_pkcs1_sha256_legacy (draft-ietf-tls-tls13-pkcs1) in a TLS 1.3 CertificateVerify: not implemented (rustls neither)",
     "ServerAuth-SHA1-Fallback-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "ServerAuth-SignatureType": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "ServerCertificateType-Server-RejectsDefaultOnly-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "ServerCipherFilter-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ServerSkipCertificateVerify": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "SessionTicketsDisabled-Server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "SkipChangeCipherSpec-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "SkipEarlyData-SecondClientHelloEarlyData-TLS13": "rustls behaviour, kept (RFC 8446 §4.2.10): early_data in the second ClientHello is illegal_parameter where BoringSSL answers bad_record_mac; rustls 0.23.43 maps the local error with TestLocalErrorMap, which runner 784fcafc lacks",
     "SupportTicketsWithSessionID": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "TLS-ECH-Server-ECHInner": "ECH server: not implemented (rustls: TLS-ECH-Server* NYI)",
     "TLS-ECH-Server-ECHInner-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "TLS1-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TLS11-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TLS12-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TrailingMessageData-CertificateVerify-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TrailingMessageData-ClientCertificate-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "TrailingMessageData-ClientFinished-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "TrailingMessageData-ClientKeyExchange-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "TrustAnchors-EmptyID-ClientHello": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "UnknownCipher": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "UnknownCurve": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Verify-ClientAuth-SignatureType": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "VersionNegotiation-Server-TLS13-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
     "VersionNegotiation-Server-TLS13-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
     "VersionNegotiation-Server-TLS13-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
@@ -94,6 +123,8 @@
     "VersionNegotiationExtension-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "VersionNegotiationExtension-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "VersionNegotiationExtension-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "WrongMessageType-CertificateVerify-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "WrongMessageType-ClientCertificate-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "WrongMessageType-ClientFinished-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "WrongMessageType-ClientKeyExchange-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope"
   },
@@ -195,6 +226,31 @@
     ],
     ":PRE_SHARED_KEY_MUST_BE_LAST:": [
       ":IllegalParameter:"
+    ],
+    ":PEER_DID_NOT_RETURN_A_CERTIFICATE:": [
+      ":CertificateRequired:"
+    ],
+    ":WRONG_SIGNATURE_TYPE:": [
+      ":IllegalParameter:"
+    ],
+    ":CERTIFICATE_VERIFY_FAILED:": [
+      ":CertificateUnknown:",
+      ":UnknownCa:",
+      ":BadCertificate:",
+      ":UnsupportedCertificate:",
+      ":CertificateExpired:"
+    ],
+    ":CANNOT_PARSE_LEAF_CERT:": [
+      ":BadCertificate:"
+    ],
+    ":BAD_SIGNATURE:": [
+      ":DecryptError:"
+    ],
+    ":KEY_USAGE_BIT_INCORRECT:": [
+      ":UnsupportedCertificate:"
+    ],
+    ":UNSUPPORTED_ALGORITHM:": [
+      ":UnsupportedCertificate:"
     ]
   }
 }

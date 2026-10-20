@@ -32,10 +32,10 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 166 tests with none failing (`tools/bogo/passing.txt`; everything
+BoringSSL's BoGo suite passes 274 tests with none failing (`tools/bogo/passing.txt`; everything
 else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
-both ways (step 2) and session tickets with resumption (step 3) work; client certificates and
-OCSP-specific work are still to come (milestone M2, *Backlog*).
+both ways (step 2), session tickets with resumption (step 3) and client certificates (step 4)
+work; OCSP-specific work is still to come (milestone M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -59,7 +59,10 @@ receive key over (and `update_requested` is answered once), the server rekeys on
 `max_records_per_key` (2^23 records, asking the client to rekey too) or when the application
 calls `keyUpdate`; at most `max_key_updates` (32) KeyUpdates may come between two
 application-data records (rustls, BoringSSL). With `Config.tickets` it issues NewSessionTickets
-and resumes them (below). It is not yet a server to deploy: no client certificates.
+and resumes them (below). With `Config.client_auth` it asks for a client certificate, verifies
+the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with clientAuth) and the
+client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. It
+is not yet the server qap runs (M3: qap's seams and performance).
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
 early data, kTLS, ECH and post-handshake client authentication (*What is deliberately not
@@ -125,8 +128,9 @@ Each ticket is a `Ticketer` blob (`StekTicketer`: `tlsresume`'s AES-256-GCM STEK
 as AAD, keys past the rotation policy's lifetime refused) over `tlsresume.select.SessionState`
 (resumption master secret over the transcript through the client's Finished, a one-octet nonce
 = the ticket's index, issue time, `ticket_age_add`) followed by this server's `TicketFields`:
-format 1, SNI, ALPN, suite — the suite last, read from the end, so a SHA-384 ticket opened with
-a SHA-256 prefix can never match the negotiated suite. `ticket_lifetime` is
+format 2, SNI, ALPN, the client's certificate (DER leaf, ≤ 4096 octets; empty without one) and
+the scheme it signed with, suite — the suite last, read from the end, so a SHA-384 ticket opened
+with a SHA-256 prefix can never match the negotiated suite. `ticket_lifetime` is
 `min(Tickets.lifetime_s, 7 days)` (12 h by default, rustls), and each ticket carries an empty
 GREASE extension (RFC 8701 §3.2, as BoringSSL). A ticket that cannot be sealed or has no room
 in the output is not sent, nor are the rest. On a ClientHello with `pre_shared_key` (the second
@@ -143,6 +147,37 @@ fresh (EC)DHE always runs), early secret from the PSK, EncryptedExtensions witho
 acknowledgement (RFC 6066 §3), no Certificate or CertificateVerify, Finished; `isResumed()`.
 Every buffer holding the resumption secret, the PSK or a ticket's plaintext is wiped before
 the step returns. Not yet: a stateful cache, early data, the ticket count request (RFC 9149).
+
+**Client certificates** (RFC 8446 §4.3.2, §4.4.2, §4.4.3; rustls 0.23 rules,
+`Config.client_auth`). A full handshake sends a CertificateRequest after the
+EncryptedExtensions: an empty context, `ClientAuth.schemes` as `signature_algorithms` (rustls's
+list by default: ECDSA P-384/P-256, Ed25519, RSA-PSS, then RSA PKCS#1 v1.5 for the chain only),
+the CA names of `ClientAuth.authorities` as `certificate_authorities` when there are any; a
+resumption sends none. The client's Certificate (`clientauth.parseCertificate`, checked whole):
+malformed is `decode_error`; another context `illegal_parameter`; an entry with any extension
+`unsupported_extension` (the request asks for none). Empty: `certificate_required` when
+`ClientAuth.mandatory` (the default), otherwise the client goes on unauthenticated (no
+CertificateVerify). Otherwise: at most 16 certificates and a leaf of at most 4096 octets
+(`bad_certificate` past either); the leaf's key must be one `certverify` verifies (RSA, ECDSA
+P-256/P-384, Ed25519) and its `keyUsage`, if present, must assert `digitalSignature`
+(`unsupported_certificate`; BoringSSL checks this in the TLS layer whatever the verifier says,
+read from an `x509.safe`-vetted copy); then the chain, leaf first, goes to
+`ClientCertVerifier.verify` with the `ClientAuth.clock` time, whose refusal names the alert
+(`bad_certificate`, `unsupported_certificate`, `certificate_revoked`, `certificate_expired`,
+`unknown_ca`, `access_denied`, `certificate_unknown`). `X509Verifier` is RFC 5280 path
+validation to the caller's anchors with the clientAuth extended key usage
+(`x509.verifyChain`, rustls `WebPkiClientVerifier`); the leaf's names are the application's
+business. The CertificateVerify over the transcript through the client's Certificate: a scheme
+the server did not ask for, RSA PKCS#1 v1.5 (RFC 8446 §4.4.3) or one that does not suit the
+leaf's key is `illegal_parameter`, a signature that does not verify `decrypt_error`. Then the
+client's Finished as before. `peerCertificate()` is the leaf once its CertificateVerify verified
+(never before), `peerSignatureScheme()` its scheme. Tickets carry both, so a resumption reports
+the identity of the handshake that issued its ticket (rustls keeps the whole chain; here only
+the leaf). With a mandatory certificate a ticket without one is not resumed (a full handshake
+asks for the certificate; rustls resumes it). A ticket also carries when the certificate was
+proved, carried across re-issued tickets: past the ticket lifetime from that full handshake the
+ticket is not resumed, however young it is — so an expired or revoked certificate does not live
+on through resumptions (rustls re-issues indefinitely). A failed handshake reports no identity.
 
 **HelloRetryRequest** (RFC 8446 §4.1.4, rustls 0.23 rules): when the client sent no share for
 the chosen group, the server fixes the suite, answers with a HelloRetryRequest naming the group
@@ -297,6 +332,10 @@ The receive side's refusals are the table under *Wire format*. Record protection
   engine's policy: `Server` rekeys at `max_records_per_key` (2^23), qap's bound.
 - The send side keeps `alert_reserve` (24 octets) of the output buffer for one alert, so a fatal
   alert or close_notify can be queued however full the application left it.
+- A client certificate chain: at most `clientauth.max_chain_len` (16) certificates, a leaf of at
+  most `clientauth.max_leaf_len` (4096) octets (`bad_certificate`), the whole message within the
+  joiner's cap (64 KiB by default, `decode_error`). `minOutputLen(config, key)` sizes the output
+  for the first flight with a CertificateRequest and for the tickets with the longest leaf.
 
 ## Anchoring
 
@@ -371,8 +410,28 @@ The receive side's refusals are the table under *Wire format*. Record protection
 - **External:** the server's messages of RFC 8448 — §3 ServerHello, EncryptedExtensions,
   Certificate, CertificateVerify, Finished; §4 ServerHello (with `pre_shared_key`) and
   EncryptedExtensions (with `early_data`); §5 HelloRetryRequest (with the cookie ClientHello2
-  echoes) and the secp256r1 ServerHello — rebuilt byte-exact from their fields by `messages`
-  (same tool, `src/message_kat_vectors.zig`).
+  echoes) and the secp256r1 ServerHello; §6 CertificateRequest — rebuilt byte-exact from their
+  fields by `messages` (same tool, `src/message_kat_vectors.zig`).
+
+- **External:** RFC 8448 §6 (client authentication) end to end on the server's side: a server
+  white-box at the client's second flight (the transcript through the RFC's server Finished)
+  takes the RFC's client Certificate (RSA), verifies its CertificateVerify (RSA-PSS) and, under
+  the RFC's client handshake traffic secret, its Finished — which covers the transcript through
+  the CertificateRequest, the client's Certificate and CertificateVerify. One signature octet off
+  is `decrypt_error`; the scheme not asked for, or RSA PKCS#1 v1.5, `illegal_parameter`.
+
+- **External (foreign implementations):** client certificates from OpenSSL 3.5's `s_client`
+  (`-cert`/`-key`: ECDSA P-256, RSA-2048 with RSA-PSS, Ed25519; an optional request answered
+  with none; tickets after client authentication and their resumption) and Go 1.26's crypto/tls
+  client (the same) against `X509Verifier` over a test client CA (`tools/client_certs.py`,
+  `client_certs.zig`) — 11 more interop sessions (46 in all), captured and replayed byte-exact;
+  the server must end with the presented leaf as `peerCertificate`, from the ticket on a
+  resumption. In process: `tlsclient` with each key kind under every suite, no certificate
+  (mandatory → `certificate_required`; optional → unauthenticated, the request's CA names and
+  schemes seen by the client), refusals by the verifier (serverAuth-only EKU →
+  `unsupported_certificate`, expired → `certificate_expired`, another CA → `unknown_ca`), a key
+  not matching the certificate (`decrypt_error`), resumption keeping the identity, and a ticket
+  without one refused under a mandatory certificate.
 
 - **External (foreign test suite):** BoringSSL's BoGo runner (`ssl/test/runner` at 784fcafc,
   2026-08-31 — the last commit before it required Go 1.27), with `tlsserver` as its shim
@@ -382,7 +441,21 @@ The receive side's refusals are the table under *Wire format*. Record protection
   full: it spawns only the shim, listens on loopback only, writes only its temp test keys
   (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
   refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20 (M1): **130 pass, 0 fail**; with KeyUpdate (M2 step 2) **142 pass, 0 fail**;
+  Result 2026-10-20 (M1): **130 pass, 0 fail**; with client certificates (M2 step 4: the
+  shim's `-require-any-client-certificate`, `-verify-peer`, `-verify-fail`, `-verify-prefs`,
+  `-trust-cert` → `X509Verifier`, `-use-client-ca-list`, `-expect-peer-signature-algorithm`,
+  `-expect-peer-cert-file` for a single certificate) **274 pass, 0 fail** — the per-algorithm
+  `Server-Verify-*`/`Server-InvalidSignature-*` tests (the scheme reported on resumption too),
+  key usage, CA lists, empty and refused certificates; the BoGo run found the missing
+  `keyUsage` check (a leaf limited to keyEncipherment or keyCertSign signed its
+  CertificateVerify), fixed with it. Disabled with reasons: TLS ≤ 1.2 tests the client-auth flags
+  used to hide, P-521 and ML-DSA client keys, `rsa_pkcs1_sha256_legacy`, Ed25519 accepted by
+  default (rustls), the legacy-callback `CertificateVerificationFail-Server-TLS13` variants
+  (BoringSSL answers `handshake_failure`, tlsserver the verifier's alert, as the CustomCallback
+  variant expects), `GarbageCertificate-Server-TLS13` (`bad_certificate`, as rustls, where
+  BoringSSL sends `decode_error`). Skipped: raw public keys (RFC 7250,
+  `ClientCertificateType-*`) and a peer chain to compare (`SendReceiveIntermediate-Server`: only
+  the leaf is kept); with KeyUpdate (M2 step 2) **142 pass, 0 fail**;
   with resumption (M2 step 3, the shim's `-resume-count` loop with `-on-initial-`/`-on-resume-`
   flags and `-expect-session-miss`) **166 pass, 0 fail** — binder errors, PSK modes, corrupt
   tickets, suite/SNI changes on resume; disabled: the TLS ≤ 1.2 resumption tests the
@@ -512,6 +585,32 @@ by application data, `update_requested` never answered, no rekey at the limit, n
 reserve (the harness's first run found that defect for real: a full output dropped the fatal
 alert), an invalid request octet taken as `update_not_requested`, a deferred reply dropped.
 
+Client certificates (2026-10-20). `tlsserver-server` and `tlsserver-keyupdate` replay the
+mTLS recordings with the recorded `client_auth` (`X509Verifier` over the test client CA): the
+keyupdate harness feeds the client's sealed records one at a time up to `handshake_done` (Go
+sends Certificate, CertificateVerify and Finished in records of their own, OpenSSL in one); the
+server harness's white-box reseal takes the client's first sealed record, which now holds its
+Certificate — damaged (a bit flipped anywhere in it, an octet short, a Finished where the
+Certificate belongs) it is refused and the handshake never completes; repadded it ends as
+recorded. Harness `tlsserver-clientauth`: a client Certificate message of zero to three real
+certificates (the test client CA's leaves, the CA itself, an expired one, a P-384 server
+certificate), whole — it decodes to the same chain, the leaf's key reads, the CA (keyCertSign
+only) is refused for signing — or damaged (bit flips, an octet rewritten, truncation, splices),
+when every certificate it still decodes to goes through `leafPublicKey` and `checkLeafKeyUsage`
+(std's DER walk on an `x509.safe` copy) without a panic; then a CertificateVerify body, maybe
+truncated. Verdicts 2026-10-20, ReleaseSafe, clean: `tlsserver-server` 4 × 60,000 (~1,150
+runs/s per job), `tlsserver-keyupdate` 4 × 20,000, `tlsserver-clientauth` 4 × 1,500,000 (~35,000
+runs/s per job). Eighteen planted mutants (schemata, one build, the whole test suite per
+mutant) caught: the certificate's proof age not checked on resumption, an empty certificate let through when mandatory, the verifier skipped, an
+unadvertised scheme or a bad signature accepted, the server's context string in the client's
+signed content, a ticket without a certificate resumed under a mandatory one, tickets without
+the certificate, `peerCertificate` before the CertificateVerify, a CertificateRequest on a
+resumption, the resumed identity lost, entry extensions or another context accepted, an empty
+`cert_data`, `digitalSignature` ignored, an expiry reported as `bad_certificate` — and two that
+survived the first pass, now caught by new tests: the server not calling the key-usage check
+(only `clientauth`'s own test covered it) and the ticket's leaf-length cap (the test's ticket
+was too short to get there).
+
 Independent read-only review of `keys` (Sonnet, 2026-10-20): no HIGH. MEDIUM fixed — an EC
 scalar ≥ the order loaded and failed only at the first signature (std's `fromBytes` does not
 range-check; test with d = n, n + 1, 0). LOWs fixed: legacy `Proc-Type` encrypted keys gave
@@ -545,8 +644,11 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).
-- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), ~~NewSessionTicket and resumption through `tlsresume`~~ (step 3, 2026-10-20), mTLS through
-  `x509.verifyChain`, OCSP stapling. **M3:** qap's seams and performance (`p256`, `ct25519`).
+- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), ~~NewSessionTicket and resumption through `tlsresume`~~ (step 3, 2026-10-20), ~~mTLS through
+  `x509.verifyChain`~~ (step 4, 2026-10-20), OCSP stapling.
+- **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
+  chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
+  client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** qap's seams and performance (`p256`, `ct25519`).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 
 ## Open
@@ -558,8 +660,19 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   holds only pointers in its own frames (HKDF and record setup burn their own) and is not yet
   in the stack probe.
 
-- `burn.handshake_burn` (16 KiB around each handshake step) is a margin, not a measured depth:
-  the stack probe does not drive the server yet.
+- Client-certificate review 2026-10-20 (Sonnet, read-only): no HIGH. MEDIUM fixed: re-issued
+  tickets kept a certificate alive indefinitely (now bounded by the lifetime from its proof).
+  LOWs fixed: an unknown revocation status is `certificate_unknown` (rustls); the shim's
+  lingering close is bounded in time; a failed handshake clears the identity; `ClientAuth.schemes`
+  precondition documented. Accepted: the leaf's key and keyUsage are checked before the verifier
+  (BoringSSL's order; rustls verifies first, so an untrusted unusable leaf gets
+  `unsupported_certificate` here, `unknown_ca` there); a chain signature that does not verify is
+  `bad_certificate` (rustls: `decrypt_error`); 4 KiB of `peer_buf` per `Server`.
+
+- `burn.handshake_burn` (32 KiB around each handshake step since client certificates: the ticket
+  plaintext and blob buffers hold a client leaf) is a margin, not a measured depth: the stack
+  probe does not drive the server yet. The client Certificate and CertificateVerify steps run
+  unburned: they touch no secret.
 - `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);
   a model client that builds ClientHellos from fields (as `tlsserver-hello` does) is not there.
 - Independent read-only review 2026-10-20 (Sonnet, of server/inbound/outbound): no HIGH; the
