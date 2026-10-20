@@ -1015,7 +1015,7 @@ fn verifyEs256Fast(public_key: EcdsaP256Sha256.PublicKey, parsed: *const ParsedT
 /// 7518 §3.3); anything else — wrong length, s ≥ n, bad padding, wrong hash
 /// OID, digest mismatch — is `BadSignature`.
 fn verifyRsaPkcs1(comptime Hash: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
-    const pk = try rsaKey(parsed, key);
+    const pk = try rsaKey(parsed, &key);
     pk.inner.verifyPkcs1v15(Hash, parsed.signing_input, parsed.signature) catch return error.BadSignature;
 }
 
@@ -1026,12 +1026,17 @@ fn verifyRsaPkcs1(comptime Hash: type, parsed: *const ParsedToken, key: Key) Ver
 /// default and so also accepts other salt lengths; this checks the RFC's,
 /// which every conforming signer (golang-jwt's included) produces.
 fn verifyRsaPss(comptime Hash: type, parsed: *const ParsedToken, key: Key) VerifyError!void {
-    const pk = try rsaKey(parsed, key);
+    const pk = try rsaKey(parsed, &key);
     pk.inner.verifyPss(Hash, parsed.signing_input, parsed.signature, Hash.digest_length) catch return error.BadSignature;
 }
 
-fn rsaKey(parsed: *const ParsedToken, key: Key) VerifyError!*const RsaPublicKey {
-    const pk = switch (key) {
+/// `key` by pointer: the result points into it. Taken by value, `|*k|` would
+/// point into this function's own parameter, dead once it returns — release
+/// builds then read the modulus from a reused stack frame and refused valid
+/// RS*/PS* tokens depending on code layout (bench-jwt interop, 2026-10-20;
+/// Debug passes the aggregate by reference and hid it).
+fn rsaKey(parsed: *const ParsedToken, key: *const Key) VerifyError!*const RsaPublicKey {
+    const pk = switch (key.*) {
         .rsa => |*k| k,
         else => return error.AlgKeyMismatch,
     };
