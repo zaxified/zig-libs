@@ -105,6 +105,10 @@ pub fn SessionState(comptime rms_len: usize) type {
     };
 }
 
+/// RFC 8446 §4.6.1: a server MUST NOT use a `ticket_lifetime` above 604800 s
+/// (7 days). `selectPsk` skips any session older than this.
+pub const max_ticket_lifetime_ms: i64 = 604_800 * 1000;
+
 pub const SelectError = error{
     /// No offered identity unsealed, passed freshness, and verified its
     /// binder. The engine should fall back to a full (non-resumed)
@@ -140,14 +144,18 @@ pub fn Selection(comptime rms_len: usize) type {
 /// For each `identities[i]` (in the order offered — RFC 8446 does not
 /// require trying them in any other order, though a server MAY prefer
 /// later/newer identities):
-///   1. `ring.open(identities[i].ticket, open_scratch)` — unseal the STEK
-///      ticket; skip (try the next identity) on any `stek.OpenError`
-///      (unknown/expired key, tampered ciphertext — never fatal, just not
-///      this server's live ticket).
+///   1. `ring.openAt(identities[i].ticket, now_ms / 1000, policy,
+///      open_scratch)` — unseal the STEK ticket; skip (try the next identity)
+///      on any `stek.OpenError` (unknown key, a key past `policy.lifetime_s`
+///      even if `expire` was never called, tampered ciphertext — never
+///      fatal, just not this server's live ticket).
 ///   2. `SessionState(Hkdf.prk_length).parse(...)` the opened plaintext.
 ///   3. `replay.deobfuscateAge` the client's reported age against the
 ///      session's `ticket_age_add`, then `replay.withinFreshnessWindow`
-///      against `now_ms - session.issued_at_ms`; skip on failure.
+///      against `now_ms - session.issued_at_ms`; skip on failure. A session
+///      older than `max_ticket_lifetime_ms` (7 days, RFC 8446 §4.6.1) or
+///      stamped in the future is skipped first. (`SessionState` carries no
+///      per-ticket lifetime field, so the 7-day cap is the only age limit.)
 ///   4. `psk.derivePsk(Hkdf, session.resumption_master_secret,
 ///      session.ticket_nonce, Hkdf.prk_length)`, then
 ///      `psk.verifyBinder(Hkdf, Hmac, psk.binderKey(Hkdf,
@@ -185,6 +193,7 @@ pub fn selectPsk(
     comptime Ring: type,
     out: *Selection(Hkdf.prk_length),
     ring: *const Ring,
+    policy: stek.RotationPolicy,
     identities: []const OfferedIdentity,
     binders: []const [Hmac.mac_length]u8,
     empty_transcript_hash: []const u8,
@@ -194,7 +203,7 @@ pub fn selectPsk(
     strike: ?*replay.StrikeRegister,
     open_scratch: []u8,
 ) SelectError!void {
-    const r = burn.run(burn.select_burn, SelectError!void, selectBody, .{ Hkdf, Hmac, Ring, out, ring, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch });
+    const r = burn.run(burn.select_burn, SelectError!void, selectBody, .{ Hkdf, Hmac, Ring, out, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch });
     r catch std.crypto.secureZero(u8, std.mem.asBytes(out));
     return r;
 }
@@ -205,6 +214,7 @@ fn selectBody(
     comptime Ring: type,
     out: *Selection(Hkdf.prk_length),
     ring: *const Ring,
+    policy: stek.RotationPolicy,
     identities: []const OfferedIdentity,
     binders: []const [Hmac.mac_length]u8,
     empty_transcript_hash: []const u8,
@@ -220,7 +230,7 @@ fn selectBody(
 
     for (identities, binders, 0..) |identity, binder, i| {
         // 1. Unseal — not this server's live ticket? Try the next one.
-        const plaintext = ring.open(identity.ticket, open_scratch) catch continue;
+        const plaintext = ring.openAt(identity.ticket, @divFloor(now_ms, 1000), policy, open_scratch) catch continue;
 
         // 2. Parse the canonical session-state prefix.
         const session = SessionState(Hkdf.prk_length).parse(plaintext) catch continue;
@@ -228,7 +238,11 @@ fn selectBody(
         // 3. Freshness (RFC 8446 §4.2.11.1): the client's reported age must
         // track the server's own elapsed-time measurement.
         const elapsed_ms = now_ms - session.issued_at_ms;
+        // The u32 bound is the `@intCast` below; the 7-day cap is RFC 8446
+        // §4.6.1 (`ticket_lifetime` MUST NOT exceed 604800 s), enforced here
+        // so a session that outlived every ticket lifetime never resumes.
         if (elapsed_ms < 0 or elapsed_ms > std.math.maxInt(u32)) continue;
+        if (elapsed_ms > max_ticket_lifetime_ms) continue;
         const reported_age_ms = replay.deobfuscateAge(identity.obfuscated_ticket_age, session.ticket_age_add);
         if (!replay.withinFreshnessWindow(reported_age_ms, @intCast(elapsed_ms), freshness_window_ms)) continue;
 
@@ -263,6 +277,7 @@ const testing = std.testing;
 /// By-value test wrapper over the `out`-pointer `selectPsk`.
 fn selectV(
     ring: *const stek.DefaultRing,
+    policy: stek.RotationPolicy,
     identities: []const OfferedIdentity,
     binders: []const [32]u8,
     empty_transcript_hash: []const u8,
@@ -273,7 +288,7 @@ fn selectV(
     open_scratch: []u8,
 ) SelectError!Selection(32) {
     var sel: Selection(32) = undefined;
-    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, ring, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch);
+    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch);
     return sel;
 }
 
@@ -615,7 +630,7 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     const window_ms: u32 = 10_000;
 
     // ── happy path: found at index 0, PSK restored byte-exact ──
-    const selection = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch);
+    const selection = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch);
     try testing.expectEqual(@as(usize, 0), selection.selected_index);
     var client_psk: [32]u8 = undefined;
     psk.derivePsk(HkdfSha256, 32, &client_psk, &rms, &ticket_nonce);
@@ -624,32 +639,32 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     try testing.expectEqualSlices(u8, &ticket_nonce, selection.session.ticket_nonce);
 
     // ── replay: the exact same offer again is rejected by the register ──
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch));
 
     // ── forged binder: rejected AND does not consume the single-use slot ──
     var strike2 = replay.StrikeRegister.init(testing.allocator, 8, 60_000);
     defer strike2.deinit();
     var bad_binder = binder;
     bad_binder[0] ^= 1;
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
     // The legitimate client still resumes: the forgery attempt above never
     // reached (and thus never marked) the strike register.
-    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch);
+    _ = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch);
 
     // ── tampered ticket: falls through, never a panic or false accept ──
     var tampered_buf: [160]u8 = undefined;
     @memcpy(tampered_buf[0..ticket.len], ticket);
     tampered_buf[stek.overhead - 1] ^= 1; // a ciphertext byte
     const tampered = OfferedIdentity{ .ticket = tampered_buf[0..ticket.len], .obfuscated_ticket_age = identity.obfuscated_ticket_age };
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{tampered}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{tampered}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch));
 
     // ── stale age: replayed obfuscated age drifts outside the window ──
     const late_ms: i64 = issued_at_ms + age_ms + 100_000; // 100 s later, same claimed age
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, late_ms, window_ms, null, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, late_ms, window_ms, null, &scratch));
 
     // ── no strike register (strike == null): multiple accepts are allowed ──
-    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
-    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
+    _ = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
+    _ = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, null, &scratch);
 }
 
 test "selectPsk: second offered identity wins when the first is not ours (selected_index echoes position)" {
@@ -683,7 +698,7 @@ test "selectPsk: second offered identity wins when the first is not ours (select
     const dummy_binder = @as([32]u8, @splat(0));
 
     var scratch: [128]u8 = undefined;
-    const selection = try selectV(&ring, &.{ foreign, ours }, &.{ dummy_binder, good_binder }, &empty_hash, &truncated_ch_hash, now_ms, 10_000, null, &scratch);
+    const selection = try selectV(&ring, .{}, &.{ foreign, ours }, &.{ dummy_binder, good_binder }, &empty_hash, &truncated_ch_hash, now_ms, 10_000, null, &scratch);
     try testing.expectEqual(@as(usize, 1), selection.selected_index);
     var client_psk: [32]u8 = undefined;
     psk.derivePsk(HkdfSha256, 32, &client_psk, &rms, &ticket_nonce);
@@ -713,11 +728,77 @@ test "selectPsk: a ticket from the future and a strike register that cannot allo
     const identity = OfferedIdentity{ .ticket = ticket, .obfuscated_ticket_age = replay.obfuscateAge(0, 7) };
     var scratch: [128]u8 = undefined;
 
-    _ = try selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, null, &scratch); // control
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms - 1, 1_000, null, &scratch));
+    _ = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, null, &scratch); // control
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms - 1, 1_000, null, &scratch));
 
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var strike = replay.StrikeRegister.init(failing.allocator(), 8, 60_000);
     defer strike.deinit();
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, &strike, &scratch));
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &ch_hash, issued_at_ms, 1_000, &strike, &scratch));
+}
+
+// ── audit 2026-10-19 O4: lifetimes enforced inside selectPsk ─────────────────
+
+/// Seals a session issued at `issued_at_ms` under a key installed at second 0
+/// and returns the ticket plus its matching binder (test helper for the two
+/// lifetime tests; the secrets are test constants).
+const LifetimeFixture = struct {
+    blob: [160]u8 = undefined,
+    ticket_len: usize = 0,
+    binder: [32]u8 = undefined,
+    empty_hash: [32]u8 = undefined,
+    ch_hash: [32]u8 = undefined,
+
+    const nonce = [_]u8{ 0, 1 };
+    const age_add: u32 = 0x0BAD_F00D;
+
+    fn build(self: *LifetimeFixture, ring: *stek.DefaultRing, issued_at_ms: i64) !void {
+        const rms = @as([32]u8, @splat(0x5A));
+        const state = SessionState(32){ .resumption_master_secret = rms, .ticket_nonce = &nonce, .issued_at_ms = issued_at_ms, .ticket_age_add = age_add };
+        var pt: [128]u8 = undefined;
+        self.ticket_len = (try ring.seal(try state.serialize(&pt), @as([stek.nonce_length]u8, @splat(0x03)), &self.blob)).len;
+        self.empty_hash = sha256Of("");
+        self.ch_hash = sha256Of("lifetime test ClientHello");
+        self.binder = clientBinder(&rms, &nonce, &self.empty_hash, &self.ch_hash);
+    }
+
+    fn select(self: *const LifetimeFixture, ring: *const stek.DefaultRing, policy: stek.RotationPolicy, now_ms: i64, age_ms: u32) SelectError!Selection(32) {
+        const id = OfferedIdentity{ .ticket = self.blob[0..self.ticket_len], .obfuscated_ticket_age = replay.obfuscateAge(age_ms, age_add) };
+        var scratch: [128]u8 = undefined;
+        return selectV(ring, policy, &.{id}, &.{self.binder}, &self.empty_hash, &self.ch_hash, now_ms, 10_000, null, &scratch);
+    }
+};
+
+test "selectPsk: a key past policy.lifetime_s that is still in the ring does not open tickets" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 100); // installed at second 100
+    const policy = stek.RotationPolicy{ .period_s = 50, .lifetime_s = 300 };
+    const issued_at_ms: i64 = 100_000;
+    var fx: LifetimeFixture = .{};
+    try fx.build(&ring, issued_at_ms);
+
+    // Key accepted while installed_at_s + lifetime_s (400) > now_s; no `expire` call anywhere.
+    const age_ms: u32 = 299_000;
+    _ = try fx.select(&ring, policy, 399_000 + 999, age_ms + 999); // now_s = 399
+    try testing.expectError(error.NoAcceptableIdentity, fx.select(&ring, policy, 400_000, 300_000)); // now_s = 400
+    try testing.expectError(error.NoAcceptableIdentity, fx.select(&ring, policy, 400_999, 300_999));
+    // The plain `open` still accepts it: the refusal comes from the policy.
+    var out: [128]u8 = undefined;
+    _ = try ring.open(fx.blob[0..fx.ticket_len], &out);
+}
+
+test "selectPsk: a session older than 7 days (RFC 8446 section 4.6.1) is skipped, exactly at the boundary" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    // Key lifetime well beyond 7 days so only the ticket-age cap can refuse.
+    const policy = stek.RotationPolicy{ .period_s = 24 * 3600, .lifetime_s = 30 * 24 * 3600 };
+    const issued_at_ms: i64 = 1_000_000;
+    var fx: LifetimeFixture = .{};
+    try fx.build(&ring, issued_at_ms);
+
+    const cap: i64 = max_ticket_lifetime_ms;
+    try testing.expectEqual(@as(i64, 604_800_000), cap);
+    const at_cap: u32 = @intCast(cap);
+    _ = try fx.select(&ring, policy, issued_at_ms + cap, at_cap); // exactly 7 days: accepted
+    try testing.expectError(error.NoAcceptableIdentity, fx.select(&ring, policy, issued_at_ms + cap + 1, at_cap + 1));
 }

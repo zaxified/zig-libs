@@ -196,8 +196,10 @@ to be, in the original implementation order:
    entries fail-closes on new identifiers (rejecting resumption only forces
    a full handshake — never evicts a live entry, which would re-open its
    replay window). See `replay.zig`'s module doc for the full policy.
-7. `select.zig: selectPsk` — composes all of the above (unseal → parse →
-   freshness → derive PSK → verify binder → strike register → first match
+7. `select.zig: selectPsk` — composes all of the above (unseal with
+   `openAt` under the caller's `RotationPolicy`, so a key past its lifetime
+   never opens a ticket even if `expire` was not called → parse → session
+   age cap of 7 days, RFC 8446 §4.6.1 → freshness → derive PSK → verify binder → strike register → first match
    wins). The binder is verified BEFORE the strike register is marked, so a
    forged binder can never consume a real ticket's single-use slot (no
    attacker-driven DoS of the legitimate client's resumption).
@@ -295,11 +297,7 @@ rerun: 37 killed. No defect found.
 
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet.
 
-- **`select.selectPsk` opens tickets with `ring.open`, not `openAt`** *(audit 2026-10-19, O4)*: the
-  7-day key lifetime of `RotationPolicy` is enforced only if the caller calls `expire` on time; a
-  caller that rotates but never expires keeps accepting tickets sealed under retired keys. Proposed:
-  a `now_s` + `RotationPolicy` path through `selectPsk` (or a documented requirement + test that
-  `expire` runs before each selection). API-visible → owner call.
+- ~~**`select.selectPsk` opens tickets with `ring.open`, not `openAt`** *(audit 2026-10-19, O4)*~~ — DONE 2026-10-20: `selectPsk` takes a `stek.RotationPolicy`, opens with `openAt`, and skips sessions older than 7 days (`select.max_ticket_lifetime_ms`).
 
 - **Live interop for `selectPsk` against OpenSSL/BoringSSL clients** *(survey 2026-09-30)*: the SPEC's verification item 2 was never done; only RFC 8448 traces prove the binder/PSK/selection chain, and a consumer would have to be the first to find a disagreement. Effort: medium (a minimal loopback engine or a test that drives `openssl s_client -sess_in` through the module). Fits §2 for the module, but needs the test engine (qap's fork) — may belong in the consumer.
 - ~~**Time-driven STEK rotation policy** *(survey 2026-09-30)*~~ — DONE 2026-10-13: `stek.RotationPolicy` (24 h / 7 d, the Go defaults), `StekRing.needsRotation`/`maybeRotate`/`expire`/`openAt`; no clock or RNG inside (caller passes `now_s` and key bytes).

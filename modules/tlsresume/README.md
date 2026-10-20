@@ -93,6 +93,7 @@ const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 var result: tlsresume.select.Selection(32) = undefined;
 try tlsresume.select.selectPsk(
     Hkdf, Hmac, tlsresume.stek.DefaultRing, &result, &ring,
+    policy, // stek.RotationPolicy: keys past lifetime_s never open a ticket
     offered_identities, offered_binders,
     empty_transcript_hash, truncated_client_hello_transcript_hash,
     now_ms, freshness_window_ms,
