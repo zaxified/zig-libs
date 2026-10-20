@@ -42,7 +42,9 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 The same day `certverify.zig` and its KAT vectors followed (`tls13.certverify`,
 re-exported as `dtls.certverify`; the signer burns `ecdsa_burn`/`ed25519_burn`/
 `rsa_burn` moved to `tls13/src/burn.zig`). `stackprobe_test.zig` still measures
-`certverify.sign` from here.
+`certverify.sign` from here. Then the (EC)DHE key exchange (`tls13.kex`); `Connection.zig`
+keeps the group policy and wrappers named `ecdheGenerate`/`ecdheSharedSecret`/
+`ecdheServerExchange`.
 
 **STATUS UPDATE (crypto core AND flight engine landed):** the crypto-core
 layer (`keyschedule.zig`, `aead.zig`) is REAL and KAT-validated — the 15

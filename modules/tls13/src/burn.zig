@@ -56,3 +56,18 @@ pub const ed25519_burn = 40 * 1024;
 /// pointer API the by-value key copies reached 26.9 KiB deep (2026-10-08).
 /// 8 KiB is a margin, not a measured depth.
 pub const rsa_burn = 8 * 1024;
+
+// `kex` entry points, per group (the group is a runtime value, so each arm
+// instantiates its own burn). Depths are the dirty stack of the unburned
+// bodies in ReleaseFast, from `stackprobe_test.zig` (2026-10-20), as
+// generate / serverExchange / sharedSecret; each burn is ~1.6-2x the deepest,
+// rounded. `serverExchange` is the deepest of the curve arms because its
+// keygen and multiplication are inlined into one frame.
+
+/// x25519: 18.0 / 58.2 / 30.8 KiB.
+pub const kex_x25519_burn = 96 * 1024;
+/// secp256r1 (std P-256): 24.0 / 64.1 / 36.8 KiB.
+pub const kex_p256_burn = 112 * 1024;
+/// X25519MLKEM768 (ML-KEM-768 keygen / encaps / decaps plus X25519):
+/// 61.4 / 60.9 / 77.6 KiB.
+pub const kex_hybrid_burn = 160 * 1024;

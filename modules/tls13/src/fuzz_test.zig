@@ -12,6 +12,11 @@
 //! signature bytes never panics and is accepted only when it is the genuine
 //! triple. A share of runs signs a fresh transcript hash (ECDSA, Ed25519;
 //! deterministic and with noise) and verifies it back.
+//! `tls13-kex`: `kex.serverExchange` / `kex.sharedSecret` on peer shares. For
+//! every group a genuine exchange agrees on both sides; a peer share of any
+//! length, damaged genuine shares (random octets, the SEC1 prefix, the
+//! hybrid's X25519 half zeroed) and arbitrary group code points end in a typed
+//! error or an exchange, never a panic; a failure leaves no secret in `out`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -20,6 +25,7 @@ const fuzz_driver = testkit.fuzz.driver;
 const ScriptSource = testkit.fuzz.ScriptSource;
 
 const cv = @import("certverify.zig");
+const kex = @import("kex.zig");
 const kat = @import("certverify_kat_vectors.zig");
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;
@@ -232,6 +238,138 @@ fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     }
 }
 
+const KexMark = Marker(enum {
+    agree_x25519,
+    agree_p256,
+    agree_hybrid,
+    server_refused,
+    server_accepted_damaged,
+    client_refused,
+    client_accepted_damaged,
+    zeroed_on_failure,
+    unusable_refused,
+    unknown_group,
+});
+
+fn allZero(b: []const u8) bool {
+    for (b) |x| if (x != 0) return false;
+    return true;
+}
+
+const Damaged = struct {
+    n: usize,
+    /// The damage makes the share unusable by construction (an all-zero
+    /// X25519 point, a zeroed hybrid X25519 half, a SEC1 form octet other
+    /// than 0x04): the exchange MUST refuse it.
+    must_refuse: bool,
+};
+
+/// `share` with 1-3 random octets replaced, or one structural spot aimed at,
+/// and sometimes truncated / extended.
+fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, buf: []u8) Damaged {
+    var d: Damaged = .{ .n = share.len, .must_refuse = false };
+    @memcpy(buf[0..d.n], share);
+    switch (src.valueRangeAtMost(u8, 0, 3)) {
+        0 => if (group == kex.secp256r1_group) {
+            buf[0] = src.value(u8); // the SEC1 form octet
+            d.must_refuse = buf[0] != 0x04;
+        } else if (group == kex.x25519_mlkem768_group) {
+            @memset(buf[d.n - 32 .. d.n], 0); // identity X25519 half
+            d.must_refuse = true;
+        } else {
+            @memset(buf[0..d.n], 0);
+            d.must_refuse = true;
+        },
+        1 => buf[d.n - 1] ^= 0x80, // the curve point's last coordinate octet
+        else => for (0..src.valueRangeAtMost(u8, 1, 3)) |_| {
+            buf[src.index(d.n)] = src.value(u8);
+        },
+    }
+    if (src.valueRangeAtMost(u8, 0, 5) == 0) {
+        const new_n = src.valueRangeAtMost(u16, 0, @intCast(@min(buf.len, d.n + 4)));
+        if (new_n > d.n) src.bytes(buf[d.n..new_n]);
+        if (new_n != d.n) d.must_refuse = true; // every group's length is exact
+        d.n = new_n;
+    }
+    return d;
+}
+
+fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var seed: [32]u8 = undefined;
+    src.bytes(&seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    const rnd = csprng.random();
+    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.x25519_mlkem768_group };
+    const group = groups[src.index(groups.len)];
+
+    var kp: kex.KeyPair = undefined;
+    try kex.generate(group, rnd, &kp);
+    var ex: kex.ServerExchange = undefined;
+    try kex.serverExchange(group, kp.public[0..kp.public_len], rnd, &ex);
+    var ss: kex.SharedSecret = undefined;
+    try kex.sharedSecret(group, &kp.secret, ex.public[0..ex.public_len], &ss);
+    if (!std.mem.eql(u8, ss.slice(), ex.shared.slice())) return error.SidesDisagree;
+    switch (group) {
+        kex.x25519_group => KexMark.mark(.agree_x25519),
+        kex.secp256r1_group => KexMark.mark(.agree_p256),
+        else => KexMark.mark(.agree_hybrid),
+    }
+
+    // The server on a damaged client share.
+    var buf: [kex.max_share_len + 8]u8 = undefined;
+    {
+        const d = damageShare(S, src, group, kp.public[0..kp.public_len], &buf);
+        var out: kex.ServerExchange = undefined;
+        @memset(&out.shared.bytes, 0xAB);
+        if (kex.serverExchange(group, buf[0..d.n], rnd, &out)) |_| {
+            if (d.must_refuse) return error.UnusableShareAccepted;
+            KexMark.mark(.server_accepted_damaged);
+        } else |_| {
+            if (!allZero(&out.shared.bytes)) return error.SecretLeftOnFailure;
+            KexMark.mark(.server_refused);
+            KexMark.mark(.zeroed_on_failure);
+            if (d.must_refuse) KexMark.mark(.unusable_refused);
+        }
+    }
+    // The client on a damaged server share.
+    {
+        const d = damageShare(S, src, group, ex.public[0..ex.public_len], &buf);
+        var out: kex.SharedSecret = .{ .bytes = @splat(0xAB), .len = 0 };
+        if (kex.sharedSecret(group, &kp.secret, buf[0..d.n], &out)) |_| {
+            if (d.must_refuse) return error.UnusableShareAccepted;
+            // A damaged hybrid ciphertext decapsulates (FIPS 203 implicit
+            // rejection) — to a different secret unless untouched.
+            if (std.mem.eql(u8, buf[0..d.n], ex.public[0..ex.public_len])) {
+                if (!std.mem.eql(u8, out.slice(), ss.slice())) return error.SidesDisagree;
+            }
+            KexMark.mark(.client_accepted_damaged);
+        } else |_| {
+            if (!allZero(&out.bytes)) return error.SecretLeftOnFailure;
+            KexMark.mark(.client_refused);
+        }
+    }
+    // An arbitrary group code point with arbitrary share bytes.
+    {
+        const g = src.value(u16);
+        const n = src.valueRangeAtMost(u16, 0, 80);
+        src.bytes(buf[0..n]);
+        var out: kex.ServerExchange = undefined;
+        @memset(&out.shared.bytes, 0xAB);
+        if (kex.serverExchange(g, buf[0..n], rnd, &out)) |_| {
+            if (kex.expectedShareLen(g) == 0) return error.UnknownGroupAccepted;
+        } else |_| {
+            if (!allZero(&out.shared.bytes)) return error.SecretLeftOnFailure;
+        }
+        if (kex.expectedShareLen(g) == 0) KexMark.mark(.unknown_group);
+    }
+}
+
+fn fuzzKexSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [1024]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzKex(ScriptSource, &src, testing.allocator);
+}
+
 fn fuzzVerifySmith(_: void, smith: *std.testing.Smith) anyerror!void {
     var script: [1024]u8 = undefined;
     var src: ScriptSource = .init(script[0..smith.slice(&script)]);
@@ -246,4 +384,14 @@ test "fuzz driver: TLS13_FUZZ (certverify)" {
 }
 test "fuzz harness: certverify, 200 seeds, reaches every outcome" {
     try Mark.reach(fuzzVerify, "tls13-certverify", 200);
+}
+
+test "fuzz: tls13 kex, genuine exchanges agree / damaged shares never panic" {
+    try testing.fuzz({}, fuzzKexSmith, .{});
+}
+test "fuzz driver: TLS13_FUZZ (kex)" {
+    try fuzz_driver.run(fuzzKex, .{ .prefix = "TLS13_FUZZ", .name = "tls13-kex" });
+}
+test "fuzz harness: kex, 200 seeds, reaches every outcome" {
+    try KexMark.reach(fuzzKex, "tls13-kex", 200);
 }

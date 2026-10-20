@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `kex`: the (EC)DHE key exchange (x25519, secp256r1, X25519MLKEM768:
+  `generate`, `sharedSecret`, `serverExchange`, `expectedShareLen`), moved from
+  `dtls/src/Connection.zig` (earlier history there). Secrets now come out through out-pointers,
+  each entry point burns per group (96 / 112 / 160 KiB, measured by a new ReleaseFast stack probe)
+  and zeroes `out` on an error. Anchors and tests moved with the code; new fuzz harness
+  `tls13-kex` (160,000-run verdict clean, four planted mutants caught). Third step of the
+  `tlsserver` M0.
+
 - **2026-10-20** — `certverify`: the RFC 8446 §4.4.3 CertificateVerify signed content and
   sign/verify (ECDSA P-256/P-384 and Ed25519 through std, RSA-PSS through `rsa`), moved
   unchanged from `dtls` (earlier history: `modules/dtls/src/certverify.zig`) with its KAT

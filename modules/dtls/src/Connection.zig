@@ -925,31 +925,26 @@ fn selectSignatureScheme(
 
 // ── (EC)DHE groups: the `.cert_dhe` key exchange ──────────────────────────
 
+// The computation lives in `tls13.kex` since 2026-10-20 (shared with
+// `tlsserver`); this file keeps the group POLICY (`advertised_groups`, the
+// share a fresh ClientHello offers, preference order) and thin wrappers under
+// the old names, so the engine and its tests read as before.
+const kex = @import("tls13").kex;
+
 const x25519_group: u16 = @backingInt(messages.NamedGroup.x25519);
 const secp256r1_group: u16 = @backingInt(messages.NamedGroup.secp256r1);
 const x25519_mlkem768_group: u16 = @backingInt(messages.NamedGroup.x25519_ml_kem768);
-
-/// The ML-KEM-768 half of the `x25519_ml_kem768` hybrid. The construction is
-/// draft-ietf-tls-ecdhe-mlkem's, transcribed here rather than taken from
-/// `std.crypto.kem.hybrid.MlKem768X25519` — std's type has the SAME share
-/// sizes but is X-Wing (a SHA3-256 combiner over secrets ‖ ciphertext ‖ key
-/// ‖ label), while TLS feeds the bare `ss_MLKEM ‖ ss_X25519` concatenation
-/// to its key schedule. Reusing std's combiner would interoperate with
-/// nothing — the same trap `ssh`'s `SHA256(ss_M ‖ ss_X)` documents.
-const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
-
-/// draft-ietf-tls-ecdhe-mlkem §3.1.1/§3.1.2 fixed sizes for X25519MLKEM768,
-/// pinned as comptime facts so a std resize (there has been one Kyber →
-/// ML-KEM transition already) breaks the build here, not on the wire:
-/// client share = encapsulation key ‖ X25519 public (ML-KEM FIRST, despite
-/// the group's name), server share = ciphertext ‖ X25519 public.
-const hybrid_client_share_len = MlKem768.PublicKey.encoded_length + 32;
-const hybrid_server_share_len = MlKem768.ciphertext_length + 32;
 comptime {
-    std.debug.assert(hybrid_client_share_len == 1216);
-    std.debug.assert(hybrid_server_share_len == 1120);
-    std.debug.assert(MlKem768.shared_length == 32);
+    std.debug.assert(x25519_group == kex.x25519_group);
+    std.debug.assert(secp256r1_group == kex.secp256r1_group);
+    std.debug.assert(x25519_mlkem768_group == kex.x25519_mlkem768_group);
 }
+
+/// ML-KEM-768, the post-quantum half of the hybrid (tests decapsulate with it
+/// directly); the construction notes are on `tls13.kex`.
+const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+const hybrid_client_share_len = kex.hybrid_client_share_len;
+const hybrid_server_share_len = kex.hybrid_server_share_len;
 
 /// The `supported_groups` (RFC 8446 §4.2.7) this module advertises. It is
 /// ONE list, used by both ClientHello builders and by the HelloRetryRequest
@@ -972,7 +967,7 @@ const advertised_groups = [_]u16{ x25519_mlkem768_group, x25519_group, secp256r1
 
 /// The longest `KeyShareEntry.key_exchange` any advertised group produces:
 /// the hybrid's client share (ML-KEM-768 encapsulation key ‖ X25519 public).
-const max_key_share_len = hybrid_client_share_len;
+const max_key_share_len = kex.max_share_len;
 
 /// Upper bound on a ClientHello BODY this module can build or accept. Its
 /// own worst case (the hybrid share dominates): fixed fields (versions,
@@ -1003,295 +998,47 @@ fn groupAdvertised(group: u16) bool {
     return false;
 }
 
-/// The exact CLIENT-form `KeyShareEntry.key_exchange` length RFC 8446
-/// §4.2.8.1/§4.2.8.2 (and draft-ietf-tls-ecdhe-mlkem for the hybrid) fixes
-/// for each wired group. Exact, not a maximum: a P-256 share that is not 65
-/// bytes is not a P-256 share, and accepting a short one would hand
-/// peer-controlled bytes to `fromSec1` on the strength of the group id alone.
-/// Returns 0 for groups this module does not speak, which never matches a
-/// real share length and so reads as "unusable".
+/// The exact CLIENT-form share length per group (`tls13.kex.expectedShareLen`;
+/// 0 for a group this module does not speak).
+const expectedShareLen = kex.expectedShareLen;
+
+/// Private-key bytes an `EcdheKeyPair` holds (`tls13.kex.secret_len`).
+const ecdhe_secret_len = kex.secret_len;
+
+const EcdheKeyPair = kex.KeyPair;
+const DheSecret = kex.SharedSecret;
+const ServerExchange = kex.ServerExchange;
+
+/// This side's ephemeral share in `group` (`tls13.kex.generate`).
 ///
-/// CLIENT-form, because the two curves are symmetric but the hybrid is not:
-/// a hybrid CLIENT offers the 1216-byte encapsulation-key form (what this
-/// function returns — it sizes what a server accepts and what
-/// `ecdheGenerate` produces), while a hybrid SERVER answers with the
-/// 1120-byte ciphertext form (checked where the client consumes it,
-/// `ecdheSharedSecret`).
-fn expectedShareLen(group: u16) usize {
-    return switch (group) {
-        x25519_group => 32,
-        secp256r1_group => 65,
-        x25519_mlkem768_group => hybrid_client_share_len,
-        else => 0,
-    };
-}
-
-/// Private-key bytes an `EcdheKeyPair` holds: a 32-byte scalar for the two
-/// curves; for the hybrid, the 64-byte ML-KEM-768 keygen seed (`d ‖ z` —
-/// re-expanded at decapsulation time, FIPS 203's compact seed form, 25×
-/// smaller than the expanded decapsulation key) followed by the 32-byte
-/// X25519 scalar.
-const ecdhe_secret_len = MlKem768.seed_length + 32;
-comptime {
-    std.debug.assert(ecdhe_secret_len == 96);
-}
-
-/// An ephemeral key pair for one handshake, in whichever advertised group;
-/// the public part is the wire CLIENT-form `key_share` value. Only the
-/// group's own prefix of `secret` is meaningful (see `ecdhe_secret_len`);
-/// zeroization always covers the whole array.
-const EcdheKeyPair = struct {
-    group: u16,
-    secret: [ecdhe_secret_len]u8,
-    public: [max_key_share_len]u8,
-    public_len: usize,
-};
-
-/// The key-exchange output fed to `keyschedule.deriveHandshakeSecret`: 32
-/// bytes for the two curves, 64 (`ss_MLKEM ‖ ss_X25519`) for the hybrid.
-/// A struct rather than a slice so the secret bytes live in (and are wiped
-/// from) exactly one place per side.
-const DheSecret = struct {
-    bytes: [64]u8,
-    len: usize,
-
-    fn slice(self: *const DheSecret) []const u8 {
-        return self.bytes[0..self.len];
-    }
-};
-
-/// Generates this side's ephemeral share in `group` from the caller-supplied
-/// `Entropy` (std 0.16 removed `std.crypto.random`, so every source of
-/// randomness in this collection is an argument).
+/// `entropy` MUST be a cryptographically secure source — `.csprng`. The
+/// bytes drawn here ARE the ephemeral PRIVATE KEY; under a predictable
+/// generator a passive eavesdropper who learns the seed decrypts every
+/// recorded session retroactively (see `Entropy.seeded_for_test`). That is
+/// why the choice is a named union arm the caller writes out at every entry
+/// point that reaches here (`startHandshake`, `handleFlight`).
 ///
-/// `entropy` MUST be a cryptographically secure source — `.csprng`. This is
-/// the highest-consequence use of randomness in the module: the bytes drawn
-/// here ARE the ephemeral PRIVATE KEY (the x25519 / secp256r1 scalar, and
-/// for the hybrid also the ML-KEM-768 keygen seed). Under a predictable
-/// generator — the `.seeded_for_test` arm, a PID, a boot timestamp — a passive
-/// eavesdropper who learns the seed derives the same private key, recomputes
-/// the (EC)DHE shared secret, and decrypts every session recorded from that
-/// peer, retroactively; forward secrecy, the entire reason the handshake
-/// generates an ephemeral key at all, is gone. There is no way for this
-/// function to tell a real CSPRNG from a seeded PRNG — `std.Random` is a
-/// vtable — which is exactly why the choice is a named union arm the caller
-/// has to write out at every entry point that reaches here
-/// (`startHandshake`, `handleFlight`), rather than a bare parameter.
-///
-///   * x25519 (RFC 7748 / RFC 8446 §4.2.8.1): 32 random bytes as the secret
-///     scalar — `generateDeterministic` clamps — and the 32-byte public key
-///     as the share.
-///   * secp256r1 (RFC 8446 §4.2.8.2): a scalar in `[1, n-1]` by rejection
-///     sampling (`P256.scalar.rejectNonCanonical` refuses `>= n`; zero is
-///     refused separately), and `0x04 || X || Y` as the share. Rejection
-///     probability is ~2^-32 per draw, so the bounded loop below cannot
-///     realistically exhaust; it fails closed with a typed error rather than
-///     looping forever on a broken RNG.
-///   * x25519_ml_kem768 (draft-ietf-tls-ecdhe-mlkem): a 64-byte ML-KEM-768
-///     keygen seed plus an x25519 scalar as above; the share is the 1216-byte
-///     `encapsulation key ‖ X25519 public` — the ML-KEM half FIRST, despite
-///     the group's name (the draft's one famous inconsistency).
+/// Returns by value: private, and every caller runs inside an entry point's
+/// burn (`burn.start_burn` / `burn.flight_burn`).
 fn ecdheGenerate(group: u16, entropy: Entropy) HandshakeError!EcdheKeyPair {
-    const random = entropy.source();
-    var kp: EcdheKeyPair = .{ .group = group, .secret = undefined, .public = undefined, .public_len = 0 };
-    switch (group) {
-        x25519_group => {
-            var seed: [32]u8 = undefined;
-            random.bytes(&seed);
-            const x = X25519.KeyPair.generateDeterministic(seed);
-            std.crypto.secureZero(u8, &seed);
-            kp.secret[0..32].* = x.secret_key;
-            kp.public[0..32].* = x.public_key;
-            kp.public_len = 32;
-        },
-        secp256r1_group => {
-            var tries: usize = 0;
-            while (tries < 64) : (tries += 1) {
-                var candidate: [32]u8 = undefined;
-                random.bytes(&candidate);
-                P256.scalar.rejectNonCanonical(candidate, .big) catch continue; // >= n
-                if (std.mem.allEqual(u8, &candidate, 0)) continue; // == 0
-                // basePoint * a nonzero canonical scalar is never the identity.
-                const point = P256.basePoint.mul(candidate, .big) catch continue;
-                kp.secret[0..32].* = candidate;
-                kp.public[0..65].* = point.toUncompressedSec1();
-                kp.public_len = 65;
-                return kp;
-            }
-            return error.KeyExchangeFailed;
-        },
-        x25519_mlkem768_group => {
-            var kem_seed: [MlKem768.seed_length]u8 = undefined;
-            random.bytes(&kem_seed);
-            const kem_kp = MlKem768.KeyPair.generateDeterministic(kem_seed) catch {
-                std.crypto.secureZero(u8, &kem_seed);
-                return error.KeyExchangeFailed;
-            };
-            var x_seed: [32]u8 = undefined;
-            random.bytes(&x_seed);
-            const x = X25519.KeyPair.generateDeterministic(x_seed);
-            kp.secret[0..MlKem768.seed_length].* = kem_seed;
-            kp.secret[MlKem768.seed_length..][0..32].* = x.secret_key;
-            std.crypto.secureZero(u8, &kem_seed);
-            std.crypto.secureZero(u8, &x_seed);
-            kp.public[0..MlKem768.PublicKey.encoded_length].* = kem_kp.public_key.toBytes();
-            kp.public[MlKem768.PublicKey.encoded_length..][0..32].* = x.public_key;
-            kp.public_len = hybrid_client_share_len;
-        },
-        else => return error.MissingKeyShare,
-    }
+    var kp: EcdheKeyPair = undefined;
+    try kex.generate(group, entropy.source(), &kp);
     return kp;
 }
 
-/// The key-exchange shared secret fed to `keyschedule.deriveHandshakeSecret`
-/// — the side that HOLDS a private key (the client always; the server only
-/// for the two symmetric curve groups, via `ecdheServerExchange`).
-///
-/// The groups differ in more than size, and conflating them is a real
-/// interop bug rather than a cosmetic one: X25519's `scalarmult` output IS
-/// the shared secret, whereas for the NIST curves RFC 8446 §7.4.2 takes only
-/// the X COORDINATE of the shared point ("the shared secret is the x
-/// coordinate ... converted to a byte string"), not the 65-byte point. The
-/// hybrid is the 64-byte `ss_MLKEM ‖ ss_X25519` concatenation, fed to the
-/// key schedule AS-IS (draft-ietf-tls-ecdhe-mlkem) — no hash combiner (see
-/// the `MlKem768` note for the two same-sized constructions that DO hash).
-/// For the hybrid, `peer_share` is the SERVER form (ciphertext ‖ X25519
-/// public, 1120 bytes) — this path only ever runs on the client, because
-/// only the client holds a decapsulation key.
-///
-/// `secret` is the group's own prefix of `EcdheKeyPair.secret` (32 bytes for
-/// the curves, `ecdhe_secret_len` for the hybrid); a wrong length is a typed
-/// error, so a caller cannot silently decapsulate with a truncated key.
-///
-/// Every path rejects a degenerate result rather than using it: X25519's
-/// low-order/identity outputs are rejected by std (in the hybrid too — a
-/// poisoned X25519 half must not yield a secret whose classical component
-/// the peer controls), and P-256's identity output by `mul`. `peer_share`
-/// is peer-controlled, so a wrong length or an off-curve point is a typed
-/// error here, never a panic. ML-KEM decapsulation of a valid-length
-/// ciphertext cannot fail by design (FIPS 203 implicit rejection: a forged
-/// ciphertext yields a garbage secret and the handshake dies at Finished),
-/// so there is deliberately no "bad ciphertext" arm to test for.
+/// The (EC)DHE shared secret on the side that holds a private key
+/// (`tls13.kex.sharedSecret`).
 fn ecdheSharedSecret(group: u16, secret: []const u8, peer_share: []const u8) HandshakeError!DheSecret {
-    switch (group) {
-        x25519_group => {
-            if (secret.len < 32) return error.KeyExchangeFailed;
-            if (peer_share.len != 32) return error.MissingKeyShare;
-            const ss = X25519.scalarmult(secret[0..32].*, peer_share[0..32].*) catch return error.KeyExchangeFailed;
-            var out: DheSecret = .{ .bytes = undefined, .len = 32 };
-            out.bytes[0..32].* = ss;
-            return out;
-        },
-        secp256r1_group => {
-            if (secret.len < 32) return error.KeyExchangeFailed;
-            if (peer_share.len != 65) return error.MissingKeyShare;
-            const point = P256.fromSec1(peer_share) catch return error.KeyExchangeFailed;
-            const shared = point.mul(secret[0..32].*, .big) catch return error.KeyExchangeFailed;
-            var out: DheSecret = .{ .bytes = undefined, .len = 32 };
-            out.bytes[0..32].* = shared.affineCoordinates().x.toBytes(.big);
-            return out;
-        },
-        x25519_mlkem768_group => {
-            if (secret.len < ecdhe_secret_len) return error.KeyExchangeFailed;
-            if (peer_share.len != hybrid_server_share_len) return error.MissingKeyShare;
-            // Re-expand the decapsulation key from its FIPS 203 seed (the
-            // stored private form — see `ecdhe_secret_len`); one keygen,
-            // tens of microseconds, once per handshake.
-            // Audit A1 (dtls) F5/LOW5: every SEED in this file is wiped on
-            // every exit, but the values derived from a seed are equally
-            // sufficient to recompute the session keys from a recorded
-            // handshake, and `kem_kp`/`ss_pq`/`ss_x` below are not seeds —
-            // `kem_kp` re-expands the FULL ML-KEM decapsulation key
-            // (~2.4 KB) from the stored seed, and the two `ss_*` are the raw
-            // (still un-combined-with-the-transcript) shared secrets. None
-            // of the three is read again after this function returns, so
-            // all three are wiped before returning, not just the seed that
-            // fed them.
-            var kem_kp = MlKem768.KeyPair.generateDeterministic(secret[0..MlKem768.seed_length].*) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
-            var ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_pq);
-            var ss_x = X25519.scalarmult(
-                secret[MlKem768.seed_length..][0..32].*,
-                peer_share[MlKem768.ciphertext_length..][0..32].*,
-            ) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_x);
-            var out: DheSecret = .{ .bytes = undefined, .len = 64 };
-            out.bytes[0..32].* = ss_pq;
-            out.bytes[32..64].* = ss_x;
-            return out;
-        },
-        else => return error.MissingKeyShare,
-    }
+    var out: DheSecret = undefined;
+    try kex.sharedSecret(group, secret, peer_share, &out);
+    return out;
 }
 
-/// The SERVER half of the key exchange, in one step: consume the client's
-/// offered share, produce this server's answering share and the shared
-/// secret. One function rather than the old `ecdheGenerate` +
-/// `ecdheSharedSecret` pair at the call site, because the hybrid cannot be
-/// decomposed that way — encapsulation needs the peer's key at "generate"
-/// time, and the server's wire share IS the ciphertext, not a public key.
-/// For the two curve groups this is exactly the old pair (and their server
-/// share stays the CLIENT-form length); nothing private outlives the call —
-/// a server never needs its ephemeral secret again.
-const ServerExchange = struct {
-    group: u16,
-    public: [max_key_share_len]u8,
-    public_len: usize,
-    shared: DheSecret,
-};
-
+/// The server's one-step answer to a client share (`tls13.kex.serverExchange`).
 fn ecdheServerExchange(group: u16, peer_share: []const u8, entropy: Entropy) HandshakeError!ServerExchange {
-    switch (group) {
-        x25519_group, secp256r1_group => {
-            var kp = try ecdheGenerate(group, entropy);
-            defer std.crypto.secureZero(u8, &kp.secret);
-            const shared = try ecdheSharedSecret(group, kp.secret[0..32], peer_share);
-            return .{ .group = group, .public = kp.public, .public_len = kp.public_len, .shared = shared };
-        },
-        x25519_mlkem768_group => {
-            if (peer_share.len != hybrid_client_share_len) return error.MissingKeyShare;
-            // FIPS 203 §7.2 encapsulation-key check: `fromBytes` rejects a
-            // non-canonical (out-of-modulus) key — peer-controlled bytes,
-            // typed error, never a panic.
-            const ek = MlKem768.PublicKey.fromBytes(peer_share[0..MlKem768.PublicKey.encoded_length]) catch return error.KeyExchangeFailed;
-            const random = entropy.source();
-            var encaps_seed: [MlKem768.encaps_seed_length]u8 = undefined;
-            random.bytes(&encaps_seed);
-            var enc = ek.encapsDeterministic(&encaps_seed);
-            std.crypto.secureZero(u8, &encaps_seed);
-            // Audit A1 (dtls) F5/LOW5: `enc.shared_secret`, `x.secret_key`
-            // and `ss_x` are the DERIVED values, not the seeds that fed
-            // them — every seed in this function is already wiped, but
-            // these three are equally sufficient to recompute the session
-            // keys from a recorded handshake and were left on the stack.
-            // `enc.ciphertext` is copied into `r.public` (it is sent on the
-            // wire, not secret) and is fine to leave as-is; only the two
-            // secret fields below are cleared.
-            defer std.crypto.secureZero(u8, &enc.shared_secret);
-            var x_seed: [32]u8 = undefined;
-            random.bytes(&x_seed);
-            var x = X25519.KeyPair.generateDeterministic(x_seed);
-            std.crypto.secureZero(u8, &x_seed);
-            defer std.crypto.secureZero(u8, &x.secret_key);
-            // Same low-order/identity rejection as the classical arm — the
-            // X25519 half of a hybrid must not be poisonable either.
-            var ss_x = X25519.scalarmult(x.secret_key, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_x);
-            var r: ServerExchange = .{
-                .group = group,
-                .public = undefined,
-                .public_len = hybrid_server_share_len,
-                .shared = .{ .bytes = undefined, .len = 64 },
-            };
-            r.public[0..MlKem768.ciphertext_length].* = enc.ciphertext;
-            r.public[MlKem768.ciphertext_length..][0..32].* = x.public_key;
-            r.shared.bytes[0..32].* = enc.shared_secret;
-            r.shared.bytes[32..64].* = ss_x;
-            return r;
-        },
-        else => return error.MissingKeyShare,
-    }
+    var out: ServerExchange = undefined;
+    try kex.serverExchange(group, peer_share, entropy.source(), &out);
+    return out;
 }
 
 // ── RFC 9147 §5.1 stateless HelloRetryRequest cookie ─────────────────────
@@ -7201,116 +6948,6 @@ test "advertised_groups and the (EC)DHE implementation agree (no group we cannot
     try testing.expect(!groupAdvertised(0x001e));
     try testing.expectEqual(@as(usize, 0), expectedShareLen(0x001e));
     try testing.expectError(error.MissingKeyShare, ecdheGenerate(0x001e, rnd));
-}
-
-test "ecdheSharedSecret secp256r1 KAT: byte-exact against Python `cryptography` (OpenSSL) ECDH" {
-    // An INDEPENDENT oracle for the P-256 half of the key exchange, in the
-    // same spirit as the RFC 8448 X25519 vector above. Generated with
-    // `cryptography` 46.0.5 (OpenSSL 3.5.5): two fixed private scalars,
-    // their SEC1 uncompressed public points, and the ECDH output — which for
-    // the NIST curves is the shared point's X COORDINATE ONLY (RFC 8446
-    // §7.4.2 / SEC1 ECDH), not the 65-byte point. Returning the point, or
-    // X||Y, would still make both sides of a self-interop test agree and
-    // would still "work" — against nothing but itself.
-    const a_scalar = hx(32, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
-    const a_point = hx(65, "04515c3d6eb9e396b904d3feca7f54fdcd0cc1e997bf375dca515ad0a6c3b4035f4536be3a50f318fbf9a5475902a221502bef0d57e08c53b2cc0a56f17d9f9354");
-    const b_scalar = hx(32, "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90");
-    const b_point = hx(65, "0477186fee3e281f9d033a64994f823f7e384151e7383090c3c2954340f295153601a0e901c22a7a492a04cce5c24768a613f77c71b3380043912955379ec12723");
-    const shared = hx(32, "ead387cf12ed00b1fd75e195c967ff086d52da18622a70a9b6c05603cbdd913c");
-
-    // (1) the public shares this module would put on the wire, recovered
-    //     from the same scalars OpenSSL used.
-    try testing.expectEqualSlices(u8, &a_point, &(try P256.basePoint.mul(a_scalar, .big)).toUncompressedSec1());
-    try testing.expectEqualSlices(u8, &b_point, &(try P256.basePoint.mul(b_scalar, .big)).toUncompressedSec1());
-
-    // (2) the shared secret, from BOTH sides.
-    try testing.expectEqualSlices(u8, &shared, (try ecdheSharedSecret(secp256r1_group, &a_scalar, &b_point)).slice());
-    try testing.expectEqualSlices(u8, &shared, (try ecdheSharedSecret(secp256r1_group, &b_scalar, &a_point)).slice());
-}
-
-test "ecdheSharedSecret: peer-supplied garbage is a typed error, never a panic" {
-    const a_scalar = hx(32, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20");
-    // Wrong length for the group (an x25519-sized share labelled P-256).
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(secp256r1_group, &a_scalar, &(@as([32]u8, @splat(0xAA)))));
-    // Right length, not a point on the curve.
-    var off_curve = @as([65]u8, @splat(0));
-    off_curve[0] = 0x04;
-    off_curve[1] = 0x01;
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(secp256r1_group, &a_scalar, &off_curve));
-    // A group this module does not speak.
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(0x001e, &a_scalar, &(@as([32]u8, @splat(0xAA)))));
-    // x25519's own low-order/identity rejection still stands.
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_group, &a_scalar, &(@as([32]u8, @splat(0)))));
-    // A private key shorter than the group needs is a typed error too — the
-    // hybrid arm must not decapsulate with a truncated seed.
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_mlkem768_group, &a_scalar, &(@as([hybrid_server_share_len]u8, @splat(0xAA)))));
-}
-
-test "hybrid X25519MLKEM768: both sides agree, and each half is the RIGHT half in the RIGHT place" {
-    // No byte-exact external vector exists for the concatenation itself
-    // (draft-ietf-tls-ecdhe-mlkem publishes none — the composition is two
-    // already-anchored primitives glued end to end), and a plain self-interop
-    // round trip would stay green with the halves SWAPPED on both sides. So
-    // each half is pinned independently against the primitive it must equal:
-    // bytes 0..32 must be the ML-KEM shared secret (recomputed by direct
-    // decapsulation of the server's ciphertext), bytes 32..64 the X25519
-    // scalarmult output — the draft's order, ML-KEM first despite the name.
-    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x77)));
-    const rnd = seededForTest(&csprng);
-
-    const kp = try ecdheGenerate(x25519_mlkem768_group, rnd);
-    try testing.expectEqual(@as(usize, hybrid_client_share_len), kp.public_len);
-
-    var ex = try ecdheServerExchange(x25519_mlkem768_group, kp.public[0..kp.public_len], rnd);
-    try testing.expectEqual(@as(usize, hybrid_server_share_len), ex.public_len);
-    try testing.expectEqual(@as(usize, 64), ex.shared.len);
-
-    const client_shared = try ecdheSharedSecret(x25519_mlkem768_group, &kp.secret, ex.public[0..ex.public_len]);
-    try testing.expectEqual(@as(usize, 64), client_shared.len);
-    try testing.expectEqualSlices(u8, ex.shared.slice(), client_shared.slice());
-
-    // The ML-KEM half, via direct decapsulation with the re-expanded seed.
-    const kem_kp = try MlKem768.KeyPair.generateDeterministic(kp.secret[0..MlKem768.seed_length].*);
-    const ss_pq = try kem_kp.secret_key.decaps(ex.public[0..MlKem768.ciphertext_length]);
-    try testing.expectEqualSlices(u8, &ss_pq, client_shared.bytes[0..32]);
-    // The X25519 half, via direct scalarmult of the two ephemerals.
-    const ss_x = try X25519.scalarmult(
-        kp.secret[MlKem768.seed_length..][0..32].*,
-        ex.public[MlKem768.ciphertext_length..][0..32].*,
-    );
-    try testing.expectEqualSlices(u8, &ss_x, client_shared.bytes[32..64]);
-    // ...which also proves the wire layout: the ciphertext occupies the
-    // server share's FIRST 1088 bytes, the X25519 public its last 32.
-}
-
-test "hybrid X25519MLKEM768: peer-supplied garbage is a typed error, never a panic" {
-    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x78)));
-    const rnd = seededForTest(&csprng);
-
-    // Server side: wrong client-share length (the SERVER form's 1120 —
-    // right length for the other direction, so a copy-paste of the two
-    // constants would pass a naive length check).
-    try testing.expectError(error.MissingKeyShare, ecdheServerExchange(x25519_mlkem768_group, &(@as([hybrid_server_share_len]u8, @splat(0xAA))), rnd));
-    // Server side: right length, non-canonical encapsulation key (0xFF
-    // coefficients are ≥ q, FIPS 203 §7.2's modulus check must refuse).
-    try testing.expectError(error.KeyExchangeFailed, ecdheServerExchange(x25519_mlkem768_group, &(@as([hybrid_client_share_len]u8, @splat(0xFF))), rnd));
-    // Server side: canonical ML-KEM key, but the X25519 half is the
-    // identity — the classical poisoning the hybrid must still refuse.
-    const kp = try ecdheGenerate(x25519_mlkem768_group, rnd);
-    var poisoned = kp.public;
-    @memset(poisoned[MlKem768.PublicKey.encoded_length..][0..32], 0);
-    try testing.expectError(error.KeyExchangeFailed, ecdheServerExchange(x25519_mlkem768_group, poisoned[0..hybrid_client_share_len], rnd));
-
-    // Client side: wrong server-share length (the CLIENT form's 1216).
-    try testing.expectError(error.MissingKeyShare, ecdheSharedSecret(x25519_mlkem768_group, &kp.secret, &(@as([hybrid_client_share_len]u8, @splat(0xAA)))));
-    // Client side: identity X25519 half in an otherwise well-formed answer.
-    var ex = try ecdheServerExchange(x25519_mlkem768_group, kp.public[0..kp.public_len], rnd);
-    @memset(ex.public[MlKem768.ciphertext_length..][0..32], 0);
-    try testing.expectError(error.KeyExchangeFailed, ecdheSharedSecret(x25519_mlkem768_group, &kp.secret, ex.public[0..ex.public_len]));
-    // (No "bad ciphertext" arm: FIPS 203 implicit rejection makes a forged
-    // ciphertext decapsulate SUCCESSFULLY to garbage, by design — the
-    // handshake then dies at Finished. Tested at the primitive level in std;
-    // a typed error here would be a misimplementation, not a hardening.)
 }
 
 // ── HelloRetryRequest in `.cert_dhe` mode (RFC 8446 §4.1.4's (EC)DHE half) ──

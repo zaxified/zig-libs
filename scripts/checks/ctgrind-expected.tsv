@@ -1356,8 +1356,8 @@ tlsclient	ReleaseFast	cv	1	30	18801e923ae8944b	a92e71f50313cf2b
 # engine.zig). hs 119 is almost all (b) — the encrypted handshake flight is
 # public to the peer that sent it; app 14 = 4 AEAD verdicts + seq-number
 # reconstruction + padding scan + content-type dispatch per record.
-dtls	ReleaseFast	hs	1	119	160cb381bfe306f0	ca9a2595f120b466
-dtls	ReleaseFast	app	1	14	160cb381bfe306f0	ac0eb91f2511d729
+dtls	ReleaseFast	hs	1	119	ffe0ee33b9b354cd	ca9a2595f120b466
+dtls	ReleaseFast	app	1	14	ffe0ee33b9b354cd	ac0eb91f2511d729
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a

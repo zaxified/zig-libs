@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** the (EC)DHE key exchange (x25519,
+  secp256r1, X25519MLKEM768) moved to `tls13.kex`; `Connection.zig` keeps the group policy
+  (`advertised_groups`, the offered share, preference order) and thin wrappers under the old
+  names. Each exchange now runs under its own burn inside the entry points' burns. Its four kex
+  unit tests moved with the code; the wolfSSL replay, stack probes and ctgrind counts (hs 119,
+  app 14) are unchanged.
+
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** `certverify` (CertificateVerify sign/verify)
   and its KAT vectors moved to the `tls13` module; `dtls.certverify` re-exports it, so the API
   and the types are the same. Its 29 tests now run in `test-tls13`; the stack probe of

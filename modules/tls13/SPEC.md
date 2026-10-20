@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz 2026-10-20 (`certverify.verify`, 320,000-run budget, clean, TLS13_FUZZ; 5 planted mutants all caught) · ct none
+**Hardening:** fuzz 2026-10-20 (`certverify.verify` 320,000 runs and `kex` 160,000 runs, clean, TLS13_FUZZ; 9 planted mutants all caught) · ct none
 
 **Performance:** not measured
 
@@ -19,15 +19,17 @@
 ## What this module is, and what it is not
 
 The TLS 1.3 handshake building blocks that more than one TLS-family engine in the collection
-needs, so each is written, anchored and audited once. Today, both moved from `dtls` on
+needs, so each is written, anchored and audited once. Today, all moved from `dtls` on
 2026-10-20 as step M0 of the `tlsserver` plan (`~/CML/tlsserver-2026-10-20/DESIGN.md` in the
 coordinator's workspace):
 
 - the RFC 8446 §7.1 key schedule (`keyschedule.zig`);
-- the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`).
+- the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`);
+- the (EC)DHE key exchange for x25519, secp256r1 and X25519MLKEM768 (`kex.zig`).
 
 **Not here:** anything that sends, parses or decides — handshake messages, the state machine,
-record protection, certificate parsing and chain verification, choosing a signature scheme. Those stay in the engines (`dtls`, `tlsserver`,
+record protection, certificate parsing and chain verification, choosing a signature scheme or
+which groups to advertise and offer. Those stay in the engines (`dtls`, `tlsserver`,
 `tlsclient`) until a second engine needs the same piece; then it moves here (*Backlog*).
 
 ## Wire format / algorithm
@@ -66,6 +68,23 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 - `candidateSchemes(SecretKey)`: the schemes a key's family can sign under (RSA: all three PSS
   hashes); `maxSignatureLen(scheme)`: an output-buffer bound.
 
+### Key exchange (`kex.zig`, RFC 8446 §4.2.8 / §7.4, draft-ietf-tls-ecdhe-mlkem)
+
+- Groups by `NamedGroup` code point: `x25519_group` 0x001d, `secp256r1_group` 0x0017,
+  `x25519_mlkem768_group` 0x11ec. `expectedShareLen(group)`: the exact CLIENT-form share length
+  (32 / 65 / 1216; 0 = not computed here).
+- `generate(group, random, *KeyPair)`: x25519 (clamped scalar), secp256r1 (rejection-sampled
+  scalar in [1, n-1], share `0x04 ‖ X ‖ Y`), hybrid (ML-KEM-768 keygen seed + X25519 scalar,
+  share `encapsulation key ‖ X25519 public`, ML-KEM first).
+- `sharedSecret(group, secret, peer_share, *SharedSecret)` on the side holding a private key:
+  X25519 output; for P-256 the shared point's X coordinate only (RFC 8446 §7.4.2); for the
+  hybrid `ss_MLKEM ‖ ss_X25519` (64 bytes, no combiner), from the 1120-byte server form
+  `ciphertext ‖ X25519 public`.
+- `serverExchange(group, client_share, random, *ServerExchange)`: the server's answer in one
+  step (the hybrid server encapsulates, so it cannot be split into generate + shared).
+- The private form of the hybrid key is the 64-byte FIPS 203 seed (`secret_len` 96 with the
+  X25519 scalar), re-expanded at decapsulation.
+
 Generic over the hash: `Hkdf`/`Hmac` are std types (`HkdfSha256`, `Hkdf(HmacSha384)`); every
 buffer is `Hkdf.prk_length` or `Hmac.mac_length`.
 
@@ -83,6 +102,11 @@ constant-time behaviour is theirs. The only comparison here is the Ed25519 publi
 (`timing_safe.eql`, pinned in `scripts/checks/ct-compare-expected.tsv`). Verification handles
 public data only.
 
+`kex`: the secrets are the ephemeral scalars / ML-KEM seed and the shared secret. The
+arithmetic is std's (X25519, P-256, ML-KEM-768); the code here branches only on the public group
+id and on lengths. Every seed and every derived intermediate (expanded decapsulation key, raw
+shared secrets) is wiped before return; on an error the `out` secret is zeroed.
+
 Key schedule: machine-checked only through `dtls`'s ctgrind rows (`dtls hs`: the whole PSK handshake schedule
 tainted, in-file contexts as recorded there); `tls13` has no ctgrind row of its own yet
 (*Backlog*).
@@ -93,7 +117,11 @@ Dead stack (`CONVENTIONS.md` §2.1.1): secrets in by `*const`, out through out-p
 steps need none. `certverify.sign` runs each signer under its own burn (`ecdsa_burn` 48 KiB,
 `ed25519_burn` 40 KiB, `rsa_burn` 8 KiB above `rsa`'s own); secret keys are borrowed by pointer
 in every `SecretKey` variant. Probed by `dtls`'s `stackprobe_test.zig`/`stackprobe2_test.zig`
-(ReleaseFast), through the `keyschedule` shim and the `certverify` re-export.
+(ReleaseFast), through the `keyschedule` shim and the `certverify` re-export. `kex`'s entry
+points burn per group (`kex_x25519_burn` 96 KiB, `kex_p256_burn` 112 KiB, `kex_hybrid_burn`
+160 KiB, ~1.6–2× the unburned ReleaseFast depth, deepest 58 / 64 / 78 KiB) and are probed by
+this module's own `stackprobe_test.zig` (residue below the burn, secrets as needles). Cost: one
+burn per exchange, ~2–3 µs of stack zeroing at ~50 B/ns.
 
 ## Limits and refusals
 
@@ -107,6 +135,13 @@ the wrong family, a short output buffer, a missing `Random` for RSA-PSS, a degen
 inconsistent secret key (`KeyMismatch`, including an Ed25519 key whose embedded public half is
 not its own — checked in every mode, std checks it only under runtime safety), an RSA fault
 (`FaultDetected`), and any malformed or wrong signature (`InvalidSignature`).
+
+`kex` refuses with `MissingKeyShare` (a group it does not compute, a peer share of other than
+the group's exact length) or `KeyExchangeFailed` (X25519 low-order / identity results — in the
+hybrid's X25519 half too —, a P-256 point off the curve, a non-canonical ML-KEM encapsulation
+key, a private key shorter than the group needs, 64 failed P-256 scalar draws). A forged hybrid
+ciphertext is NOT refused here: FIPS 203 implicit rejection decapsulates it to a garbage secret
+and the handshake fails at Finished.
 
 ## Anchoring
 
@@ -126,6 +161,12 @@ not its own — checked in every mode, std checks it only under runtime safety),
   path — a regression pin, not an external oracle); tamper, reject-path and RSA-PSS round-trip
   tests. In addition `dtls`'s wolfSSL 5.9.1 replay (14 flows, certificate mode included) runs
   these signatures against a foreign implementation's transcript.
+
+- **kex:** x25519 against RFC 8448 §3's ephemeral keys and shared secret; secp256r1 against
+  Python `cryptography` 46.0.5 / OpenSSL 3.5.5 ECDH (both sides, X-coordinate output); the
+  hybrid's two halves each pinned against the primitive it must equal (direct decapsulation,
+  direct scalarmult). In addition `dtls`'s wolfSSL 5.9.1 replay runs all three groups against a
+  foreign implementation (x25519 5 flows, P-256 2, X25519MLKEM768 3).
 
 **Anchor grade:** class A · oracle EXTERNAL
 
@@ -147,6 +188,17 @@ Harness checked by five planted mutants (schemata, one build): context string ig
 P-256 verify ignoring the verdict, Ed25519 length check removed (a panic), the content's 0x00
 separator changed, RSA-PSS verify on a shortened signature — each caught on the first seeds.
 
+`tls13-kex`: for each group a genuine `generate` → `serverExchange` → `sharedSecret` agrees on
+both sides; a damaged client share (server side) and a damaged server share (client side) —
+random octets, the SEC1 form octet, an all-zero X25519 point or a zeroed hybrid X25519 half,
+the last coordinate octet, truncation and extension — end in a typed error or an exchange, and
+the damage that makes a share unusable by construction (zero point, zeroed X25519 half, a SEC1
+form octet other than 0x04, any length change) MUST be refused; a failure leaves `out` zeroed;
+an arbitrary group code point never succeeds unless the group is one of the three. Verdict
+2026-10-20: 8 × 20,000 runs, ReleaseSafe, clean (~570 runs/s per job). Four planted mutants
+caught: X25519 identity accepted, the error-path zeroing removed, the hybrid halves swapped on
+the client, the hybrid client-share length check removed (a panic).
+
 ## What is deliberately not done
 
 - **Forwarding to `std.crypto.tls.hkdfExpandLabel`:** not done — it hardcodes `"tls13 "`, and
@@ -159,7 +211,11 @@ separator changed, RSA-PSS verify on a shortened signature — each caught on th
 - **ECDSA and Ed25519 through the collection's primitives** (`p256`, and the `p384`/`ct25519`
   equivalents where they exist) instead of std: qap measured std ECDSA P-256 signing at 394 µs
   vs 102 µs with `p256` — ~60 % of a handshake. Planned for `tlsserver` M3 (perf seams).
-- **Next pieces for `tlsserver` (M0/M1):** the (EC)DHE + X25519MLKEM768 key exchange (`dtls/Connection.zig` ~999–1360), a hash-generic
+- **secp384r1 key exchange** (`kex`): the qap fork serves it by default; `tlsserver` M1 adds it
+  (std `P384`, KAT against `cryptography`/OpenSSL) so a P-384-only client is not regressed.
+- **`kex` through the collection's primitives** (`ct25519` for X25519, `p256`): qap measured
+  X25519 at ~28 % of handshake CPU; `tlsserver` M3.
+- **Next pieces for `tlsserver` (M0/M1):** a hash-generic
   transcript (`dtls/engine.zig`), certificate-authentication helpers (`dtls/certauth.zig`).
 - **Own ctgrind row** for the key schedule (today covered only inside `dtls hs`).
 - **Survey** for the Scope line (rustls `tls13::key_schedule`, Go `crypto/tls` key_schedule.go).
@@ -168,4 +224,6 @@ separator changed, RSA-PSS verify on a shortened signature — each caught on th
 
 - Audit and mutation have not run on this module as such; the code is `dtls`'s, reviewed there
   (2026-09-10), plus the five new derivations of 2026-10-20 (anchored, not yet reviewed).
-  `certverify` moved unchanged apart from its doc comments.
+  `certverify` moved unchanged apart from its doc comments; `kex` moved with one API change
+  (secrets out through out-pointers, per-group burns, `out` zeroed on error) and otherwise the
+  same code.

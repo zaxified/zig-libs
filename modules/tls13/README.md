@@ -7,7 +7,9 @@ The TLS 1.3 handshake building blocks shared by the collection's TLS-family engi
   `keyschedule.tls13` (`"tls13 "`) and `keyschedule.dtls13` (`"dtls13"`, RFC 9147 §5.9) —
   including the resumption, exporter and KeyUpdate steps;
 - `certverify`: the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify for
-  ECDSA P-256/P-384, Ed25519 and RSA-PSS (`rsa_pss_rsae_sha256/384/512`).
+  ECDSA P-256/P-384, Ed25519 and RSA-PSS (`rsa_pss_rsae_sha256/384/512`);
+- `kex`: the (EC)DHE key exchange for x25519, secp256r1 and the X25519MLKEM768 hybrid — a
+  client's share, the server's one-step answer, the client's shared secret.
 
 Pure functions over caller bytes: no I/O, no allocation, no key storage, no
 handshake decisions.
@@ -15,7 +17,8 @@ handshake decisions.
 - **Model after:** RFC 8446 §7 and RFC 9147 §5.9; the API split follows rustls's
   `tls13::key_schedule` (one function per derivation, secrets through out-pointers).
 - **Platform:** any (pure computation). **Role:** codec. **Concurrency:** reentrant.
-  **Deps:** `rsa` (RSA-PSS); otherwise std (HKDF/HMAC, ECDSA, Ed25519).
+  **Deps:** `rsa` (RSA-PSS); otherwise std (HKDF/HMAC, ECDSA, Ed25519, X25519, P-256,
+  ML-KEM-768).
 
 Provenance: original work of the zig-libs authors (MIT), written from RFC 8446 / RFC 9147 —
 public standards, not copyrightable works. The test vectors are RFC 8448's, an independent
@@ -45,6 +48,15 @@ const sig = try cv.sign(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &secret_key },
 try cv.verify(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = public_key }, .server, &transcript_hash, sig);
 ```
 
+```zig
+const kex = @import("tls13").kex;
+
+var server_ex: kex.ServerExchange = undefined; // server: answer the client's key_share
+try kex.serverExchange(kex.x25519_mlkem768_group, client_share, random, &server_ex);
+// send server_ex.public[0..server_ex.public_len]; feed server_ex.shared.slice() to
+// deriveHandshakeSecret, then secureZero it
+```
+
 Every secret goes in by `*const` and comes out through an out-pointer, never by value, and the
 entry points that hold a secret in a local burn their stack (`CONVENTIONS.md` §2.1.1). Compare a
 received Finished or binder with `std.crypto.timing_safe.eql`, never `std.mem.eql`.
@@ -57,5 +69,5 @@ binder), an independent Python oracle for the `dtls13` prefix, and std's
 `std.crypto.tls.hkdfExpandLabel` for `traffic upd` at SHA-256 and SHA-384. `certverify`: the
 signed content byte-exact, verify KATs for every scheme (RSA-PSS by OpenSSL, Ed25519 by
 `cryptography`), deterministic ECDSA/Ed25519 sign reproduced byte-exact, tamper and reject-path
-tests. Fuzz: `TLS13_FUZZ=<runs>` drives the `tls13-certverify` harness (see `SPEC.md`
+tests. Fuzz: `TLS13_FUZZ=<runs>` drives the `tls13-certverify` and `tls13-kex` harnesses (see `SPEC.md`
 § Fuzzing). Example: `zig build run-example-tls13`.
