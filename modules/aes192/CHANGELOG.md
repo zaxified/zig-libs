@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **New:** `Aes192EncryptCtx.ctr(dst, src, iv)` — CTR with the whole block as a 128-bit big-endian counter, byte for byte `std.crypto.core.modes.ctr(…, .big)`. On Zig 0.17 std's `ctr` writes each counter with a byte-by-byte `mem.writeInt(u128)` (#36256): 2.32× OpenSSL EVP AES-192-CTR at 16 KiB; this one is 0.96×. Tests: SP 800-38A F.5.5/F.5.6 through it, every length over two wide batches and the half-carry / full-wrap counters against std, a `ctr_mode`/`ctr_carry` fuzz check; ctgrind `enc` covers it.
+
 - **2026-10-20** — **Security fix:** without AES hardware (x86-64 without AES-NI or AVX,
   arm64 without the Crypto Extensions, other architectures) the rounds now run on std 0.17's
   bitsliced constant-time core (`src/bitsliced.zig`, a copy — std keeps it private) whenever

@@ -278,6 +278,53 @@ pub const Aes192EncryptCtx = struct {
         inline for (0..count) |j| dst[j * 16 ..][0..16].* = ts[j].xorBytes(src[j * 16 ..][0..16]);
     }
 
+    /// CTR mode (SP 800-38A §6.5) with the whole block as a 128-bit
+    /// big-endian counter, wrapping: `dst[0..src.len]` ← `src` XOR
+    /// E(`iv`), E(`iv` + 1), … — byte for byte
+    /// `std.crypto.core.modes.ctr(Aes192EncryptCtx, ctx, dst, src, iv, .big)`.
+    ///
+    /// Why not that: Zig 0.17 lowers its per-block `mem.writeInt(u128, …,
+    /// .big)` byte by byte (#36256) — 45 % of the cycles and 2.3× OpenSSL's
+    /// EVP AES-192-CTR at 16 KiB (`bench-aes192`, 2026-10-20). Here the
+    /// counter is two `u64` halves, each byte-swapped whole.
+    ///
+    /// Dead stack: as `xorWide` — the keystream is working state (§2.1 Z3);
+    /// the caller that owns key and message burns.
+    pub fn ctr(ctx: Self, dst: []u8, src: []const u8, iv: [16]u8) void {
+        std.debug.assert(dst.len >= src.len);
+        const n = Block.parallel.optimal_parallel_blocks;
+        var hi = std.mem.readInt(u64, iv[0..8], .big);
+        var lo = std.mem.readInt(u64, iv[8..16], .big);
+        var counters: [16 * n]u8 = undefined;
+        var i: usize = 0;
+        while (i < src.len) : (i += 16 * n) {
+            if (lo <= std.math.maxInt(u64) - n) {
+                // No carry into `hi` within this batch (the counter is
+                // public): each block is one vector byte swap. Vector to
+                // vector `@bitCast` -- `@Vector(2, u64)` straight to `[16]u8`
+                // is lowered byte by byte on 0.17 (#36256).
+                const V2 = @Vector(2, u64);
+                inline for (0..n) |j| {
+                    const be: @Vector(16, u8) = @bitCast(@byteSwap(V2{ hi, lo + j }));
+                    counters[j * 16 ..][0..16].* = be;
+                }
+                lo += n;
+            } else inline for (0..n) |j| {
+                counters[j * 16 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, hi));
+                counters[j * 16 + 8 ..][0..8].* = @bitCast(std.mem.nativeToBig(u64, lo));
+                lo +%= 1;
+                hi +%= @intFromBool(lo == 0);
+            }
+            if (i + 16 * n <= src.len) {
+                ctx.xorWide(n, dst[i..][0 .. 16 * n], src[i..][0 .. 16 * n], counters);
+            } else {
+                var ks: [16 * n]u8 = undefined;
+                ctx.encryptWide(n, &ks, &counters);
+                for (dst[i..src.len], src[i..], ks[0 .. src.len - i]) |*d, s, k| d.* = s ^ k;
+            }
+        }
+    }
+
     /// Zero the round keys (and their packed form).
     pub fn wipe(ctx: *Self) void {
         std.crypto.secureZero(u8, std.mem.asBytes(ctx));
@@ -535,6 +582,34 @@ test "SP 800-38A F.1.3/F.1.4 and F.5.5/F.5.6: ECB and CTR (std.crypto.core.modes
     try testing.expectEqualSlices(u8, &ctr, &out);
     std.crypto.core.modes.ctr(Aes192EncryptCtx, enc, &out, &ctr, iv, .big);
     try testing.expectEqualSlices(u8, &pt, &out);
+    enc.ctr(&out, &pt, iv);
+    try testing.expectEqualSlices(u8, &ctr, &out);
+    enc.ctr(&out, &ctr, iv);
+    try testing.expectEqualSlices(u8, &pt, &out);
+}
+
+test "ctr equals std modes.ctr: every length through two wide batches, counters across the half carry and the full wrap" {
+    const enc = Aes192.initEnc(fromHex(24, "000102030405060708090a0b0c0d0e0f1011121314151617"));
+    const n = Block.parallel.optimal_parallel_blocks;
+    const max_len = 16 * n * 2 + 17;
+    var src: [max_len]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @truncate(i *% 151 +% 7);
+    // Low half 3 blocks short of its carry; low half one short with the high
+    // half all ones too (the whole counter wraps to zero inside a batch); zero.
+    const ivs = [_][16]u8{
+        fromHex(16, "0011223344556677fffffffffffffffd"),
+        fromHex(16, "fffffffffffffffffffffffffffffffe"),
+        @splat(0),
+    };
+    for (ivs) |iv| {
+        for (0..max_len + 1) |len| {
+            var want: [max_len]u8 = @splat(0xaa);
+            var got: [max_len]u8 = @splat(0xaa);
+            std.crypto.core.modes.ctr(Aes192EncryptCtx, enc, want[0..len], src[0..len], iv, .big);
+            enc.ctr(got[0..len], src[0..len], iv);
+            try testing.expectEqualSlices(u8, &want, &got);
+        }
+    }
 }
 
 test "wide and xor paths agree with the one-block path, every width 1..9" {

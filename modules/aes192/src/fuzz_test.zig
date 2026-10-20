@@ -16,7 +16,10 @@
 //!     uses the equivalent inverse cipher, the model the plain one);
 //!   * `xorWide(n)` with drawn counters == `encrypt(counter) ^ src`, and
 //!     applying it twice is the identity;
-//!   * `initEncInto`/`initDecInto` build the same schedules as `init*`.
+//!   * `initEncInto`/`initDecInto` build the same schedules as `init*`;
+//!   * `ctr` over a drawn IV and a length that may end mid-block ==
+//!     `std.crypto.core.modes.ctr` (`ctr_carry`: the IV's low half is forced
+//!     within 8 of its carry, every second input).
 
 const std = @import("std");
 const testing = std.testing;
@@ -25,7 +28,7 @@ const fuzz_driver = testkit.fuzz.driver;
 const root = @import("root.zig");
 const model = @import("model_test.zig");
 
-const Label = enum { one_block, wide, wide_max, decrypt_model, ctr };
+const Label = enum { one_block, wide, wide_max, decrypt_model, ctr, ctr_mode, ctr_carry };
 var counts: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -98,6 +101,20 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         },
         else => unreachable,
     }
+
+    var iv: [16]u8 = ctrs[0..16].*;
+    if (in[24] & 0x80 != 0) {
+        @memset(iv[8..15], 0xff);
+        iv[15] = 0xff - (in[25] & 7);
+        mark(.ctr_carry);
+    }
+    const len = 16 * nblocks - @as(usize, in[26]) % 16;
+    var want: [16 * max_blocks]u8 = undefined;
+    var x: [16 * max_blocks]u8 = undefined;
+    std.crypto.core.modes.ctr(root.Aes192EncryptCtx, enc, want[0..len], data[0..len], iv, .big);
+    enc.ctr(x[0..len], data[0..len], iv);
+    try testing.expectEqualSlices(u8, want[0..len], x[0..len]);
+    mark(.ctr_mode);
 }
 
 test "fuzz driver: AES192_FUZZ (cipher)" {

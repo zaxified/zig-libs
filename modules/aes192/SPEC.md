@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-20 (200,000 runs clean, AES192_FUZZ, every reach label hit; on `-Dcpu=x86_64`, the bitsliced backend — 2026-10-10 on AES-NI) · ct 2026-10-20 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; bitsliced: key + batch tainted through packKeys and both directions, 0 in-file)
 
-**Performance:** ref 0.74–1.01× OpenSSL 3.5.5 EVP AES-192 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.83–1.01× OpenSSL 3.5.5 EVP AES-192 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -39,8 +39,8 @@ is not constant time at all (row above).
 The AES-192 block cipher, as the third member of std's `Aes128`/`Aes256` family. Purpose and
 usage: [README.md](README.md).
 
-**Not here:** any mode of operation (CBC, CTR beyond what `std.crypto.core.modes.ctr` already
-gives, GCM, KW, …). Those live in `aescbc`, `aesgcm`, `aeskw`, `jwe`, `xmlenc`, `ssh`; giving
+**Not here:** any mode of operation (CBC, GCM, KW, …) other than plain CTR, which the
+encryption context carries as `ctr` (*Design*). Those live in `aescbc`, `aesgcm`, `aeskw`, `jwe`, `xmlenc`, `ssh`; giving
 them a 192-bit key is phase 2 (*Open*). No own round implementation and no own S-box either —
 deliberately (*Design*).
 
@@ -79,6 +79,13 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   needs no change beyond accepting the third type (test: SP 800-38A CTR through
   `std.crypto.core.modes.ctr`). std's own `AesEncryptCtx` cannot be reused: it asserts
   `key_bits == 128 or 256`, and its `KeySchedule` is private.
+- **`Aes192EncryptCtx.ctr` (2026-10-20)** is `std.crypto.core.modes.ctr(…, .big)` byte for
+  byte (tests: SP 800-38A F.5.5/F.5.6 through both; every length over two wide batches and the
+  half-carry / full-wrap counters against std; fuzz `ctr_mode`/`ctr_carry`). It exists because
+  Zig 0.17 lowers std's per-block `mem.writeInt(u128, …, .big)` byte by byte (#36256): std's
+  `ctr` over this context is 2.32× OpenSSL's EVP CTR at 16 KiB, this one 0.96×. The counter is
+  two `u64` halves; while the low half cannot carry inside a batch (public), each counter block
+  is one vector byte swap with a vector-to-vector `@bitCast`.
 - **Backend = std's, at compile time**, by the same switch as for `Aes128`/`Aes256`
   (`has_hardware_support` re-exported).
 - **Dead stack** (`CONVENTIONS.md` §2.1.1): `init`/`initInto` of both contexts (and the
@@ -151,6 +158,8 @@ Key exactly 24 bytes (by type). Block exactly 16 bytes (by type). No runtime err
 
 ## Performance
 
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aes192`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average ~4.2 from other sessions, largest spread 9.3 %): ref 0.83–1.01× OpenSSL 3.5.5 — `ecb_enc` 0.997, `ecb_dec` 1.010, `cbc_enc` 1.001, `ctr` 0.959, `key_enc` 0.896, `key_dec` 0.833. On 0.17 the `ctr` row first read **2.32×**: it timed std's `modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256; 45 % of the loop's cycles). The row now times `Aes192EncryptCtx.ctr` (*Design*), byte-identical output; a first cut with scalar `u64` counter halves still read 1.16×, the vector byte swap brought it to 0.96×. The table below is the 0.16.0 measurement (its `ctr` row was std's `modes.ctr` then).
+
 Measured 2026-10-11 against OpenSSL 3.5.5 (system `libcrypto.so.3`, EVP AES-192: the AES-NI
 `aesni_*` kernels). Host: Intel Core i7-7920HQ (Kaby Lake; AES-NI, no VAES), Linux 7.0, Zig
 0.16.0 ReleaseFast against `zig cc -O3 -march=native`, load average ~2.7 (other sessions).
@@ -165,7 +174,7 @@ each side's best of `BENCH_ROUNDS=5`). Before timing, OpenSSL's ECB, CBC and CTR
 | `ecb_enc_16384` | `encryptWide` at `optimal_parallel_blocks` vs EVP ECB | 3460 | 3506 | 0.997 |
 | `ecb_dec_16384` | `decryptWide` vs EVP ECB | 3536 | 3451 | 1.013 |
 | `cbc_enc_16384` | chained `encrypt` (latency) vs EVP CBC | 14533 | 14581 | 1.004 |
-| `ctr_16384` | `std.crypto.core.modes.ctr` vs EVP CTR | 3474 | 3614 | 0.965 |
+| `ctr_16384` | `std.crypto.core.modes.ctr` (0.16.0; `ctr` since 2026-10-20) vs EVP CTR | 3474 | 3614 | 0.965 |
 | `key_enc` | `Aes192EncryptCtx.init` (burn included) vs `EVP_EncryptInit_ex` with the key | 69 | 86 | 0.805 |
 | `key_dec` | `Aes192DecryptCtx.init` vs `EVP_DecryptInit_ex` with the key | 69 | 93 | 0.741 |
 

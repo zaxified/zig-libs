@@ -16,8 +16,8 @@
 //! AES-192-ECB); `cbc_enc_16384` -- chained blocks, i.e. the latency of one
 //! block (ours: `encrypt` on the XOR of the previous output, theirs: EVP
 //! AES-192-CBC with the IV set per op); `ctr_16384` -- counter mode (ours:
-//! `std.crypto.core.modes.ctr` over `Aes192EncryptCtx`, as `ssh`'s aes192-ctr
-//! does; theirs: EVP AES-192-CTR, IV set per op); `key_enc` / `key_dec` -- one
+//! `Aes192EncryptCtx.ctr`, which `std.crypto.core.modes.ctr` matches byte for
+//! byte but Zig 0.17 runs 2.3x slower; theirs: EVP AES-192-CTR, IV set per op); `key_enc` / `key_dec` -- one
 //! key schedule per op (ours: `Aes192EncryptCtx.init` / `Aes192DecryptCtx.init`,
 //! burn included; theirs: `EVP_*Init_ex` with only the key on a context that
 //! already holds the cipher). Inputs are written into `.zig-cache/bench-aes192/`
@@ -81,7 +81,7 @@ fn once(x: *Ctx) usize {
         .ecb_enc => ecbEnc(x.enc, x.out, x.msg),
         .ecb_dec => ecbDec(x.dec, x.out, x.msg),
         .cbc_enc => cbcEnc(x.enc, x.out, x.msg, x.iv),
-        .ctr => std.crypto.core.modes.ctr(aes192.Aes192EncryptCtx, x.enc, x.out, x.msg, x.iv, .big),
+        .ctr => x.enc.ctr(x.out, x.msg, x.iv),
         .key_enc => {
             const c = aes192.Aes192EncryptCtx.init(x.key);
             std.mem.doNotOptimizeAway(&c);

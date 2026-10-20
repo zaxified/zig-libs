@@ -12,7 +12,8 @@
 //!  * `enc` — the key and four plaintext blocks tainted: `initEnc`,
 //!    `initEncInto` (the key expansion, i.e. `subWord` through std's
 //!    `encryptLast`), `encrypt`, `encryptWide(4)`, `xor`, `xorWide(4)` and
-//!    `std.crypto.core.modes.ctr` over the context.
+//!    `std.crypto.core.modes.ctr` over the context and the context's own
+//!    `ctr`.
 //!  * `dec` — the key and four ciphertext blocks tainted: `initDec`,
 //!    `initDecInto`, `initFromEnc` (the InvMixColumns of the schedule),
 //!    `decrypt` and `decryptWide(4)`.
@@ -79,6 +80,8 @@ fn runEnc(t: Taint) void {
     ctx.xorWide(4, &out, &pt, ctrs);
     print(&out);
     std.crypto.core.modes.ctr(aes192.Aes192EncryptCtx, ctx, &out, &pt, iv, .big);
+    print(&out);
+    ctx.ctr(&out, &pt, iv);
     print(&out);
 }
 
