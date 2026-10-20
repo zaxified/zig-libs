@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** bench rows for the CJK encodings (decode/encode Shift_JIS, EUC-KR, gb18030, Big5, ISO-2022-JP; streaming Shift_JIS) — tools only.
 - **2026-10-20** — `encoding.cjk`: Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, gb18030, GBK, Big5 (WHATWG,
   GB18030-2022), decoders/encoders in the caller-buffer shape, tables generated from vendored WHATWG
   indexes (`tools/gen_cjk_tables.py`), x/text oracle. **Behavioural:** `LabelTarget.unsupported` is

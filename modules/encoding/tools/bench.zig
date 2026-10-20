@@ -43,6 +43,11 @@
 //!   cell_dec        1 000 000 20-byte windows-1250 cells (Czech mix), one
 //!                   whole-buffer decode per cell
 //!   cell_enc        the same cells as UTF-8, one whole-buffer encode per cell
+//!   dec_sjis/euckr/gb18030/big5  `encoding.cjk` decode of ~16-22 MiB of two-byte
+//!                   text (~10 % ASCII; ranges all three sides agree on, see the
+//!                   generator); enc_* the same text as UTF-8 -> legacy bytes
+//!   dec_iso2022jp / enc_iso2022jp  ASCII words + kanji + kana runs (escapes)
+//!   stream_sjis     the streaming `cjk.Decoder` over 4 KiB chunks (Shift_JIS)
 //!
 //! Every op is the whole input through the whole-buffer API and leaves an OWNED
 //! output allocated for that op (ours `page_allocator` for the 32 MiB rows --
@@ -89,8 +94,9 @@ const chunk = 4096;
 const fnv_off: u64 = 0xcbf29ce484222325;
 const fnv_prime: u64 = 0x100000001b3;
 
-const Kind = enum { dec1250, decutf8, u16dec, u16enc, enc1250, stream1250, streamutf8, celldec, cellenc };
-const Work = struct { name: []const u8, kind: Kind, file: []const u8 };
+const cjk = encoding.cjk;
+const Kind = enum { dec1250, decutf8, u16dec, u16enc, enc1250, stream1250, streamutf8, celldec, cellenc, cjkdec, cjkenc, streamcjk };
+const Work = struct { name: []const u8, kind: Kind, file: []const u8, cjk: cjk.Cjk = .shift_jis };
 const works = [_]Work{
     .{ .name = "dec_1250_ascii", .kind = .dec1250, .file = "ascii-v1.bin" },
     .{ .name = "dec_1250_czech", .kind = .dec1250, .file = "cz1250-v1.bin" },
@@ -106,6 +112,17 @@ const works = [_]Work{
     .{ .name = "stream_utf8", .kind = .streamutf8, .file = "multi-v1.txt" },
     .{ .name = "cell_dec", .kind = .celldec, .file = "cells1250-v1.bin" },
     .{ .name = "cell_enc", .kind = .cellenc, .file = "cellsutf8-v1.bin" },
+    .{ .name = "dec_sjis", .kind = .cjkdec, .file = "cjk-sjis-v1.bin", .cjk = .shift_jis },
+    .{ .name = "enc_sjis", .kind = .cjkenc, .file = "cjk-sjis-v1.txt", .cjk = .shift_jis },
+    .{ .name = "dec_euckr", .kind = .cjkdec, .file = "cjk-euckr-v1.bin", .cjk = .euc_kr },
+    .{ .name = "enc_euckr", .kind = .cjkenc, .file = "cjk-euckr-v1.txt", .cjk = .euc_kr },
+    .{ .name = "dec_gb18030", .kind = .cjkdec, .file = "cjk-gb18030-v1.bin", .cjk = .gb18030 },
+    .{ .name = "enc_gb18030", .kind = .cjkenc, .file = "cjk-gb18030-v1.txt", .cjk = .gb18030 },
+    .{ .name = "dec_big5", .kind = .cjkdec, .file = "cjk-big5-v1.bin", .cjk = .big5 },
+    .{ .name = "enc_big5", .kind = .cjkenc, .file = "cjk-big5-v1.txt", .cjk = .big5 },
+    .{ .name = "dec_iso2022jp", .kind = .cjkdec, .file = "cjk-iso2022jp-v1.bin", .cjk = .iso_2022_jp },
+    .{ .name = "enc_iso2022jp", .kind = .cjkenc, .file = "cjk-iso2022jp-v1.txt", .cjk = .iso_2022_jp },
+    .{ .name = "stream_sjis", .kind = .streamcjk, .file = "cjk-sjis-v1.bin", .cjk = .shift_jis },
 };
 
 /// Output sink: the length always, FNV-1a-64 only in check mode.
@@ -157,6 +174,32 @@ fn run(c: *const Ctx, wk: Work, o: *Out) void {
             const r = encoding.encodeFromUtf8(a, c.data, .windows_1250) catch @panic("oom");
             o.take(r);
             a.free(r);
+        },
+        .cjkdec => {
+            const r = cjk.decodeToUtf8(a, c.data, wk.cjk) catch @panic("oom");
+            o.take(r);
+            a.free(r);
+        },
+        .cjkenc => {
+            const r = cjk.encodeFromUtf8(a, c.data, wk.cjk, .{}) catch @panic("oom");
+            o.take(r);
+            a.free(r);
+        },
+        .streamcjk => {
+            var d: cjk.Decoder = .init(wk.cjk, .{});
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(a);
+            buf.ensureTotalCapacity(a, 3 * chunk + 16) catch @panic("oom");
+            var i: usize = 0;
+            while (i < c.data.len) {
+                const e = @min(i + chunk, c.data.len);
+                d.feed(a, &buf, c.data[i..e]) catch @panic("feed");
+                o.take(buf.items);
+                buf.clearRetainingCapacity();
+                i = e;
+            }
+            d.finish(a, &buf) catch @panic("finish");
+            o.take(buf.items);
         },
         .stream1250, .streamutf8 => {
             var d: encoding.Decoder = .init(.{ .encoding = if (wk.kind == .stream1250) .windows_1250 else .utf8 }, .{});
@@ -393,6 +436,154 @@ fn genCells(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
     try b.close(io);
 }
 
+// ── CJK data ─────────────────────────────────────────────────────────────────
+//
+// Text of the script's own kind: ~10 % ASCII, the rest two-byte characters
+// drawn from the ranges where all three implementations agree (JIS X 0208
+// level 1 kanji + kana, KS X 1001 hangul, GB2312 hanzi, Big5 frequent hanzi;
+// no gb18030 four-byte forms and no 2022 additions -- x/text lags GB18030-2022).
+// The legacy bytes are made by OUR encoder from the UTF-8 text and verified by
+// our strict decoder (round trip) at generation time; every side then decodes
+// the same file and the pre-check compares the three outputs.
+
+const CjkSpec = struct { enc: cjk.Cjk, bin: []const u8, txt: []const u8, seed: u64 };
+const cjk_specs = [_]CjkSpec{
+    .{ .enc = .shift_jis, .bin = "cjk-sjis-v1.bin", .txt = "cjk-sjis-v1.txt", .seed = 0x656e_6310 },
+    .{ .enc = .euc_kr, .bin = "cjk-euckr-v1.bin", .txt = "cjk-euckr-v1.txt", .seed = 0x656e_6311 },
+    .{ .enc = .gb18030, .bin = "cjk-gb18030-v1.bin", .txt = "cjk-gb18030-v1.txt", .seed = 0x656e_6312 },
+    .{ .enc = .big5, .bin = "cjk-big5-v1.bin", .txt = "cjk-big5-v1.txt", .seed = 0x656e_6313 },
+    .{ .enc = .iso_2022_jp, .bin = "cjk-iso2022jp-v1.bin", .txt = "cjk-iso2022jp-v1.txt", .seed = 0x656e_6314 },
+};
+const cjk_utf8_target: usize = 24 << 20;
+
+const SjisClass = enum { hiragana, katakana, kanji };
+
+fn sjisPair(r: std.Random, class: SjisClass) [2]u8 {
+    switch (class) {
+        .hiragana => return .{ 0x82, 0x9F + r.uintLessThan(u8, 83) },
+        .katakana => {
+            var t: u8 = 0x40 + r.uintLessThan(u8, 86);
+            if (t >= 0x7F) t += 1;
+            return .{ 0x83, t };
+        },
+        .kanji => {
+            var t: u8 = 0x40 + r.uintLessThan(u8, 188);
+            if (t >= 0x7F) t += 1;
+            return .{ 0x89 + r.uintLessThan(u8, 15), t };
+        },
+    }
+}
+
+fn cjkPair(r: std.Random, enc: cjk.Cjk) [2]u8 {
+    switch (enc) {
+        .shift_jis => {
+            const x = r.uintLessThan(u8, 100);
+            return sjisPair(r, if (x < 12) .hiragana else if (x < 25) .katakana else .kanji);
+        },
+        .euc_kr => return .{ 0xB0 + r.uintLessThan(u8, 25), 0xA1 + r.uintLessThan(u8, 94) },
+        .gb18030 => {
+            const n = r.uintLessThan(u8, 71);
+            return .{ if (n < 39) 0xB0 + n else 0xD8 + (n - 39), 0xA1 + r.uintLessThan(u8, 94) };
+        },
+        .big5 => {
+            const n = r.uintLessThan(u8, 157);
+            return .{ 0xA4 + r.uintLessThan(u8, 34), if (n < 63) 0x40 + n else 0xA1 + (n - 63) };
+        },
+        else => unreachable,
+    }
+}
+
+/// The code point of a two-byte character (our strict decoder; any error is a
+/// generator bug).
+fn pairCp(enc: cjk.Cjk, pair: [2]u8) u21 {
+    var d: cjk.Decoder = .init(enc, .{ .fatal = true });
+    var out: [16]u8 = undefined;
+    const p = d.decodeInto(&pair, &out, true);
+    if (p.status != .input_empty or p.written == 0 or p.replaced) @panic("cjk generator: pair does not decode");
+    return std.unicode.utf8Decode(out[0..p.written]) catch @panic("cjk generator: utf8");
+}
+
+fn appendCp(a: std.mem.Allocator, v: *std.ArrayList(u8), cp: u21) !void {
+    var b: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &b) catch unreachable;
+    try v.appendSlice(a, b[0..n]);
+}
+
+/// Big5 maps some characters from two pointers (the HKSCS compatibility rows);
+/// the Standard's encoder takes the LAST, x/text's the other, both valid. The
+/// generator drops those characters (a cell in `dup` is any code point decoded
+/// from more than one two-byte pair).
+fn big5Duplicates(a: std.mem.Allocator) !std.AutoHashMap(u21, u8) {
+    var m: std.AutoHashMap(u21, u8) = .init(a);
+    var lead: u16 = 0x81;
+    while (lead <= 0xFE) : (lead += 1) {
+        var trail: u16 = 0x40;
+        while (trail <= 0xFE) : (trail += 1) {
+            if (trail > 0x7E and trail < 0xA1) continue;
+            var d: cjk.Decoder = .init(.big5, .{ .fatal = true });
+            var out: [16]u8 = undefined;
+            const pair = [2]u8{ @intCast(lead), @intCast(trail) };
+            const p = d.decodeInto(&pair, &out, true);
+            if (p.status != .input_empty or p.written == 0) continue;
+            const cp = std.unicode.utf8Decode(out[0..p.written]) catch continue; // two-code-point pointers
+            const e = try m.getOrPut(cp);
+            e.value_ptr.* = if (e.found_existing) 2 else 1;
+        }
+    }
+    return m;
+}
+
+fn genCjkText(a: std.mem.Allocator, r: std.Random, enc: cjk.Cjk) !std.ArrayList(u8) {
+    var dup: std.AutoHashMap(u21, u8) = if (enc == .big5) try big5Duplicates(a) else .init(a);
+    defer dup.deinit();
+    var v: std.ArrayList(u8) = .empty;
+    try v.ensureTotalCapacity(a, cjk_utf8_target + 64);
+    if (enc == .iso_2022_jp) {
+        // ASCII words, then kanji and kana runs: every switch is an escape sequence.
+        while (v.items.len < cjk_utf8_target) {
+            for (0..r.intRangeAtMost(u8, 3, 8)) |_| {
+                const c = asciiChar(r);
+                try v.append(a, if (c == '\n') ' ' else c);
+            }
+            for (0..r.intRangeAtMost(u8, 1, 5)) |_| try appendCp(a, &v, pairCp(.shift_jis, sjisPair(r, .kanji)));
+            for (0..r.intRangeAtMost(u8, 1, 4)) |_| try appendCp(a, &v, pairCp(.shift_jis, sjisPair(r, if (r.boolean()) .hiragana else .katakana)));
+        }
+        return v;
+    }
+    while (v.items.len < cjk_utf8_target) {
+        if (r.uintLessThan(u8, 100) < 10) {
+            try v.append(a, asciiChar(r));
+        } else {
+            const cp = pairCp(enc, cjkPair(r, enc));
+            if (dup.get(cp) orelse 1 > 1) continue;
+            try appendCp(a, &v, cp);
+        }
+    }
+    return v;
+}
+
+fn genCjk(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) !void {
+    const pa = std.heap.page_allocator;
+    for (cjk_specs) |sp| {
+        if (exists(io, dir, &.{ sp.bin, sp.txt })) continue;
+        std.debug.print("{s}: generating {s}, {s} ...\n", .{ bench_name, sp.bin, sp.txt });
+        var prng = std.Random.DefaultPrng.init(sp.seed);
+        var txt = try genCjkText(pa, prng.random(), sp.enc);
+        defer txt.deinit(pa);
+        const bin = try cjk.encodeFromUtf8(pa, txt.items, sp.enc, .{ .unmappable = .fatal });
+        defer pa.free(bin);
+        const back = try cjk.decodeFatal(pa, bin, sp.enc);
+        defer pa.free(back);
+        if (!std.mem.eql(u8, back, txt.items)) @panic("cjk generator: round trip differs");
+        const a = try FileSink.open(arena, io, dir, sp.bin);
+        try a.w().writeAll(bin);
+        try a.close(io);
+        const b = try FileSink.open(arena, io, dir, sp.txt);
+        try b.w().writeAll(txt.items);
+        try b.close(io);
+    }
+}
+
 fn splitCells(arena: std.mem.Allocator, data: []const u8) ![]const []const u8 {
     var v: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
@@ -454,6 +645,7 @@ pub fn main(init: std.process.Init) !u8 {
     try genCz(arena, io, dir);
     try genMulti(arena, io, dir);
     try genCells(arena, io, dir);
+    try genCjk(arena, io, dir);
 
     const gexe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     var env = try init.environ_map.clone(arena);
@@ -556,7 +748,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (s.worst_ref <= 1.1) "P2 met (every row <= 1.1x)" else "P2 NOT met",
     });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× encoding_rs 0.8.42 (14 rows, wall time, whole-buffer API) · worst {d:.2}× x/text\n", .{ s.best_ref, s.worst_ref, worst_go });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× encoding_rs 0.8.42 ({d} rows, wall time, whole-buffer API) · worst {d:.2}× x/text\n", .{ s.best_ref, s.worst_ref, works.len, worst_go });
     try w.flush();
     return 0;
 }

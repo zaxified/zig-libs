@@ -27,13 +27,13 @@
 //              buffer (the stream is consumed per chunk, nothing accumulates)
 //   celldec    one decode_without_bom_handling per 20-byte cell, 1 000 000 cells
 //   cellenc    one WINDOWS_1250.encode per cell
-use encoding_rs::{Encoding, EncoderResult, CoderResult, UTF_16LE, UTF_8, WINDOWS_1250};
+use encoding_rs::{Encoding, EncoderResult, CoderResult, BIG5, EUC_KR, GB18030, ISO_2022_JP, SHIFT_JIS, UTF_16LE, UTF_8, WINDOWS_1250};
 use std::time::Instant;
 
 const CHUNK: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind { Dec1250, DecUtf8, U16Dec, U16Enc, Enc1250, Enc1250U, Stream1250, StreamUtf8, CellDec, CellEnc }
+enum Kind { Dec1250, DecUtf8, U16Dec, U16Enc, Enc1250, Enc1250U, Stream1250, StreamUtf8, CellDec, CellEnc, CjkDec, CjkEnc, StreamCjk }
 
 const WORKS: &[(&str, Kind, &str)] = &[
     ("dec_1250_ascii", Kind::Dec1250, "ascii-v1.bin"),
@@ -50,7 +50,30 @@ const WORKS: &[(&str, Kind, &str)] = &[
     ("stream_utf8", Kind::StreamUtf8, "multi-v1.txt"),
     ("cell_dec", Kind::CellDec, "cells1250-v1.bin"),
     ("cell_enc", Kind::CellEnc, "cellsutf8-v1.bin"),
+    ("dec_sjis", Kind::CjkDec, "cjk-sjis-v1.bin"),
+    ("enc_sjis", Kind::CjkEnc, "cjk-sjis-v1.txt"),
+    ("dec_euckr", Kind::CjkDec, "cjk-euckr-v1.bin"),
+    ("enc_euckr", Kind::CjkEnc, "cjk-euckr-v1.txt"),
+    ("dec_gb18030", Kind::CjkDec, "cjk-gb18030-v1.bin"),
+    ("enc_gb18030", Kind::CjkEnc, "cjk-gb18030-v1.txt"),
+    ("dec_big5", Kind::CjkDec, "cjk-big5-v1.bin"),
+    ("enc_big5", Kind::CjkEnc, "cjk-big5-v1.txt"),
+    ("dec_iso2022jp", Kind::CjkDec, "cjk-iso2022jp-v1.bin"),
+    ("enc_iso2022jp", Kind::CjkEnc, "cjk-iso2022jp-v1.txt"),
+    ("stream_sjis", Kind::StreamCjk, "cjk-sjis-v1.bin"),
 ];
+
+/// The CJK rows' encoding, by the workload name's suffix.
+fn cjk_encoding(name: &str) -> &'static Encoding {
+    match name.split_once('_').map(|p| p.1) {
+        Some("sjis") => SHIFT_JIS,
+        Some("euckr") => EUC_KR,
+        Some("gb18030") => GB18030,
+        Some("big5") => BIG5,
+        Some("iso2022jp") => ISO_2022_JP,
+        _ => panic!("no CJK encoding for {name}"),
+    }
+}
 
 /// Output sink: length always, FNV-1a-64 only in check mode.
 struct Out { n: u64, h: u64, hashing: bool }
@@ -79,7 +102,7 @@ fn cells(data: &[u8]) -> Vec<&[u8]> {
     v
 }
 
-fn run(kind: Kind, data: &[u8], cs: &[&[u8]], strs: &[&str], whole: Option<&str>, out: &mut Out) {
+fn run(name: &str, kind: Kind, data: &[u8], cs: &[&[u8]], strs: &[&str], whole: Option<&str>, out: &mut Out) {
     match kind {
         Kind::Dec1250 => {
             let s = WINDOWS_1250.decode_without_bom_handling(std::hint::black_box(data)).0.into_owned();
@@ -124,8 +147,20 @@ fn run(kind: Kind, data: &[u8], cs: &[&[u8]], strs: &[&str], whole: Option<&str>
             }
             out.take(&dst[..o]);
         }
-        Kind::Stream1250 | Kind::StreamUtf8 => {
-            let enc: &'static Encoding = if kind == Kind::Stream1250 { WINDOWS_1250 } else { UTF_8 };
+        Kind::CjkDec => {
+            let s = cjk_encoding(name).decode_without_bom_handling(std::hint::black_box(data)).0.into_owned();
+            out.take(s.as_bytes());
+        }
+        Kind::CjkEnc => {
+            let v = cjk_encoding(name).encode(std::hint::black_box(whole.unwrap())).0.into_owned();
+            out.take(&v);
+        }
+        Kind::Stream1250 | Kind::StreamUtf8 | Kind::StreamCjk => {
+            let enc: &'static Encoding = match kind {
+                Kind::Stream1250 => WINDOWS_1250,
+                Kind::StreamUtf8 => UTF_8,
+                _ => cjk_encoding(name),
+            };
             let mut dec = enc.new_decoder_without_bom_handling();
             let mut dst = vec![0u8; dec.max_utf8_buffer_length(CHUNK).unwrap()];
             let n = data.len().div_ceil(CHUNK);
@@ -176,7 +211,7 @@ fn main() {
         (vec![], vec![])
     };
     // &str input of the encoders: validated once, untimed.
-    let whole = if matches!(kind, Kind::Enc1250 | Kind::Enc1250U | Kind::U16Enc) {
+    let whole = if matches!(kind, Kind::Enc1250 | Kind::Enc1250U | Kind::U16Enc | Kind::CjkEnc) {
         Some(std::str::from_utf8(&data).unwrap_or_else(|e| fail(&format!("{file}: {e}"))))
     } else {
         None
@@ -184,14 +219,14 @@ fn main() {
 
     if check {
         let mut o = Out::new(true);
-        run(kind, &data, &cs, &strs, whole, &mut o);
+        run(name, kind, &data, &cs, &strs, whole, &mut o);
         println!("{} {}", o.n, o.h);
         return;
     }
 
     let op = || {
         let mut o = Out::new(false);
-        run(kind, &data, &cs, &strs, whole, &mut o);
+        run(name, kind, &data, &cs, &strs, whole, &mut o);
         o.n
     };
     let mut n = 1usize;

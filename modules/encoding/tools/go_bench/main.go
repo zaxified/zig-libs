@@ -32,11 +32,16 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 	"unicode/utf8"
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/encoding/korean"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 )
@@ -56,6 +61,9 @@ const (
 	streamUTF8
 	cellDec
 	cellEnc
+	cjkDec
+	cjkEnc
+	streamCJK
 )
 
 var works = []struct {
@@ -77,6 +85,34 @@ var works = []struct {
 	{"stream_utf8", streamUTF8, "multi-v1.txt"},
 	{"cell_dec", cellDec, "cells1250-v1.bin"},
 	{"cell_enc", cellEnc, "cellsutf8-v1.bin"},
+	{"dec_sjis", cjkDec, "cjk-sjis-v1.bin"},
+	{"enc_sjis", cjkEnc, "cjk-sjis-v1.txt"},
+	{"dec_euckr", cjkDec, "cjk-euckr-v1.bin"},
+	{"enc_euckr", cjkEnc, "cjk-euckr-v1.txt"},
+	{"dec_gb18030", cjkDec, "cjk-gb18030-v1.bin"},
+	{"enc_gb18030", cjkEnc, "cjk-gb18030-v1.txt"},
+	{"dec_big5", cjkDec, "cjk-big5-v1.bin"},
+	{"enc_big5", cjkEnc, "cjk-big5-v1.txt"},
+	{"dec_iso2022jp", cjkDec, "cjk-iso2022jp-v1.bin"},
+	{"enc_iso2022jp", cjkEnc, "cjk-iso2022jp-v1.txt"},
+	{"stream_sjis", streamCJK, "cjk-sjis-v1.bin"},
+}
+
+// cjkEncoding: the CJK rows' encoding, by the workload name's suffix.
+func cjkEncoding(name string) encoding.Encoding {
+	switch name[strings.Index(name, "_")+1:] {
+	case "sjis":
+		return japanese.ShiftJIS
+	case "euckr":
+		return korean.EUCKR
+	case "gb18030":
+		return simplifiedchinese.GB18030
+	case "big5":
+		return traditionalchinese.Big5
+	case "iso2022jp":
+		return japanese.ISO2022JP
+	}
+	panic("no CJK encoding for " + name)
 }
 
 var sink uint64
@@ -163,7 +199,7 @@ func stream(t transform.Transformer, data []byte, o *out) {
 	}
 }
 
-func run(k kind, data []byte, cs [][]byte, o *out) {
+func run(name string, k kind, data []byte, cs [][]byte, o *out) {
 	switch k {
 	case dec1250:
 		o.take(must(charmap.Windows1250.NewDecoder().Bytes(data)))
@@ -181,6 +217,12 @@ func run(k kind, data []byte, cs [][]byte, o *out) {
 		stream(charmap.Windows1250.NewDecoder(), data, o)
 	case streamUTF8:
 		stream(unicode.UTF8.NewDecoder(), data, o)
+	case cjkDec:
+		o.take(must(cjkEncoding(name).NewDecoder().Bytes(data)))
+	case cjkEnc:
+		o.take(must(cjkEncoding(name).NewEncoder().Bytes(data)))
+	case streamCJK:
+		stream(cjkEncoding(name).NewDecoder(), data, o)
 	case cellDec:
 		d := charmap.Windows1250.NewDecoder()
 		for _, c := range cs {
@@ -220,13 +262,13 @@ func main() {
 	}
 	if check {
 		o := out{h: 0xcbf29ce484222325, hashing: true}
-		run(w.k, data, cs, &o)
+		run(w.name, w.k, data, cs, &o)
 		fmt.Printf("%d %d\n", o.n, o.h)
 		return
 	}
 	op := func() uint64 {
 		o := out{h: 0xcbf29ce484222325}
-		run(w.k, data, cs, &o)
+		run(w.name, w.k, data, cs, &o)
 		return o.n
 	}
 	n := 1
