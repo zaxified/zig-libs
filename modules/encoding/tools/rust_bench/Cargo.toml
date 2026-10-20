@@ -1,0 +1,20 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference side of `zig build bench-encoding` (modules/encoding/tools/bench.zig):
+# encoding_rs 0.8.42 (MIT OR Apache-2.0, the WHATWG Encoding Standard
+# implementation of Firefox), pinned exactly, default features only (its
+# `simd-accel` feature is nightly-only).
+[dependencies]
+encoding_rs = "=0.8.42"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** comparative bench `zig build bench-encoding` vs encoding_rs 0.8.42 and Go x/text v0.42.0 (tools only).
 - **2026-10-18** — Ported to Zig 0.17.0: tests: enum iteration via `field_values`; `strRepeat` branch quota scaled with length.
 - **2026-10-09** — tests: deterministic fuzz driver `ENCODING_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Behaviour change:** the labels `cp819` and `ibm819` (IANA's own aliases of
