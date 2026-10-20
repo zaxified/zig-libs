@@ -111,7 +111,9 @@ grouped with the repo's other Linux-only members (icmp/rawsock/netlink/wireguard
 
 Reads are bounded, and a bounded read **says so**: `readVirtualFileReporting` returns whether the
 limit was hit, `readSockets` returns `SocketTable.truncated`, `readConntrack` returns
-`ConntrackResult.text_truncated`, `indexSocketOwners` returns `truncated`, and
+`ConntrackResult.text_truncated`, `indexSocketOwners` returns `truncated`, the five line-table
+readers have `readArpReporting`/`readRoutesReporting`/`readIpv6RoutesReporting`/
+`readNetDevReporting`/`readDiskstatsReporting` twins returning `Reported(T){ entries, truncated }`, and
 `listProcesses`/`readConntrack` take an explicit cap. So an adversarially huge `/proc` table (a
 conntrack flood, a process holding 8 000 descriptors) cannot force unbounded allocation and
 cannot silently shorten an answer either. ⚠ `indexSocketOwners`' caps bound the *walk*; its
@@ -283,7 +285,7 @@ pass for the wrong reason.
 
 ## Backlog / deferred
 - **`/proc/net/unix` can be forged by a local user** *(audit 2026-10-19, `procnet-S9-3`)* — `src/unix.zig` `parseUnix`: a pathname socket name may contain `\n`, so `bind("x\n<well-formed row>")` makes the kernel print a second, attacker-written row (any inode, flags, path). Not fixable in a text parser (a forged row is indistinguishable); documented at `parseUnix`. A consumer deciding who listens on what should use `NETLINK_SOCK_DIAG` (`ss` does), which is a different module's job (`netlink`).
-- **`readArp`/`readRoutes`/`readIpv6Routes`/`readNetDev`/`readDiskstats` truncate silently** *(audit 2026-10-19)* — the cap (256 KiB arp/route ≈ 3 000 rows) is documented, but unlike `readSockets`/`readConntrack`/`readUnix` the result carries no `truncated` flag; adding one changes the return types (BREAKING), so it waits for an owner decision.
+- **`readArp`/`readRoutes`/`readIpv6Routes`/`readNetDev`/`readDiskstats` truncate silently** *(audit 2026-10-19)* — the cap (256 KiB arp/route ≈ 3 000 rows) is documented, but unlike `readSockets`/`readConntrack`/`readUnix` the result carries no `truncated` flag; adding one changes the return types (BREAKING), so it waits for an owner decision. **DONE 2026-10-20:** non-breaking `read*Reporting` twins returning `Reported(T){ entries, truncated }`; the plain readers are unchanged thin wrappers.
 **2026-10-17 — done, prometheus/procfs parity pass:** `/proc/net/unix`, `/proc/<pid>/status`, `/proc/net/{snmp,netstat}` (and the per-pid twins), plus full `/proc/<pid>/stat`, `limits`, `io`, `cmdline`, `cgroup`, fd count, `ProcRef` (`.self`/pid) and the runtime page size. The entries below that name them are history. Still open: mutation run 2026-10-18 (60/62, 2 eq) and the 8×200k fuzz driver run on the new files, no bench vs procfs.
 
 Per the module README's "DEFER" list: `/proc/net/unix` (the AF_UNIX table, `ss -x` — a different row

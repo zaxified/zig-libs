@@ -103,10 +103,12 @@ pub const unix = @import("unix.zig");
 pub const ArpEntry = arp.ArpEntry;
 pub const parseArp = arp.parseArp;
 pub const readArp = arp.readArp;
+pub const readArpReporting = arp.readArpReporting;
 
 pub const RouteEntry = routes.RouteEntry;
 pub const parseRoutes = routes.parseRoutes;
 pub const readRoutes = routes.readRoutes;
+pub const readRoutesReporting = routes.readRoutesReporting;
 // For a capture taken off a kernel whose byte order differs from this
 // machine's — the hex address columns are that kernel's memory image, so the
 // producer's byte order is part of the encoding. `parseRoutes` means "this
@@ -184,6 +186,7 @@ pub const readUnix = unix.readUnix;
 pub const NetDevEntry = counters.NetDevEntry;
 pub const parseNetDev = counters.parseNetDev;
 pub const readNetDev = counters.readNetDev;
+pub const readNetDevReporting = counters.readNetDevReporting;
 pub const CpuTimes = counters.CpuTimes;
 pub const Stat = counters.Stat;
 pub const parseStat = counters.parseStat;
@@ -194,9 +197,11 @@ pub const readMeminfo = counters.readMeminfo;
 pub const DiskStat = counters.DiskStat;
 pub const parseDiskstats = counters.parseDiskstats;
 pub const readDiskstats = counters.readDiskstats;
+pub const readDiskstatsReporting = counters.readDiskstatsReporting;
 pub const Ipv6RouteEntry = counters.Ipv6RouteEntry;
 pub const parseIpv6Routes = counters.parseIpv6Routes;
 pub const readIpv6Routes = counters.readIpv6Routes;
+pub const readIpv6RoutesReporting = counters.readIpv6RoutesReporting;
 
 // ── virtual-file reading ────────────────────────────────────────────────────
 
@@ -244,6 +249,17 @@ pub const VirtualFile = struct {
     /// The file was at least `limit` bytes and `bytes` is a prefix of it.
     truncated: bool,
 };
+
+/// Result of a `read*Reporting` table reader: the parsed rows plus whether the
+/// read hit its byte cap. When `truncated` is true, `entries` covers only the
+/// complete rows before the cap (the cut row is dropped, see
+/// `readVirtualLinesReporting`). Caller owns `entries` (`gpa.free`).
+pub fn Reported(comptime T: type) type {
+    return struct {
+        entries: []T,
+        truncated: bool,
+    };
+}
 
 pub fn readVirtualFileReporting(
     gpa: std.mem.Allocator,

@@ -83,15 +83,29 @@ pub fn parseArp(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Erro
 /// an empty slice (no ARP module, or first boot with an empty cache), not an
 /// error.
 pub fn readArp(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]ArpEntry {
-    const text = procnet.readVirtualLines(gpa, io, "/proc/net/arp", 256 * 1024) orelse return &.{};
-    defer gpa.free(text);
-    return parseArp(gpa, text);
+    return (try readArpReporting(gpa, io)).entries;
+}
+
+/// `readArp` plus whether the byte cap cut the table (`truncated`: `entries`
+/// holds only the complete rows before the cap).
+pub fn readArpReporting(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!procnet.Reported(ArpEntry) {
+    return readArpFrom(gpa, io, "/proc/net/arp", 256 * 1024);
+}
+
+fn readArpFrom(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!procnet.Reported(ArpEntry) {
+    const r = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return .{ .entries = &.{}, .truncated = false };
+    defer gpa.free(r.bytes);
+    return .{ .entries = try parseArp(gpa, r.bytes), .truncated = r.truncated };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const fixture = @embedFile("testdata/arp.txt");
+
+test "readArpReporting: a cap inside the last row sets truncated and drops that row" {
+    try @import("reported_test.zig").expectReportedCut(ArpEntry, readArpFrom, fixture);
+}
 
 test "parseArp: real /proc/net/arp fixture" {
     const entries = try parseArp(testing.allocator, fixture);

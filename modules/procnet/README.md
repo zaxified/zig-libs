@@ -40,6 +40,8 @@ const io = threaded.io();
 const neighbors = try procnet.readArp(gpa, io);
 defer gpa.free(neighbors);
 for (neighbors) |n| _ = .{ n.ip, n.mac, n.device() };
+// `readArpReporting` (likewise `readRoutesReporting`, `readIpv6RoutesReporting`,
+// `readNetDevReporting`, `readDiskstatsReporting`) returns `{ entries, truncated }`.
 
 // IPv4 routes (/proc/net/route) — typed Prefix + optional gateway
 const routes = try procnet.readRoutes(gpa, io);

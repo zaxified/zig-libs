@@ -151,17 +151,31 @@ pub fn parseRoutesWithEndian(
 /// Read + parse the live `/proc/net/route`. A missing/unreadable file
 /// yields an empty slice, not an error.
 pub fn readRoutes(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]RouteEntry {
-    const text = procnet.readVirtualLines(gpa, io, "/proc/net/route", 256 * 1024) orelse return &.{};
-    defer gpa.free(text);
+    return (try readRoutesReporting(gpa, io)).entries;
+}
+
+/// `readRoutes` plus whether the byte cap cut the table (`truncated`:
+/// `entries` holds only the complete rows before the cap).
+pub fn readRoutesReporting(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!procnet.Reported(RouteEntry) {
+    return readRoutesFrom(gpa, io, "/proc/net/route", 256 * 1024);
+}
+
+fn readRoutesFrom(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!procnet.Reported(RouteEntry) {
+    const r = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return .{ .entries = &.{}, .truncated = false };
+    defer gpa.free(r.bytes);
     // The producer of a live read IS the running kernel, so the native order
     // is not merely the default here — it is the only right answer.
-    return parseRoutesWithEndian(gpa, text, native_endian);
+    return .{ .entries = try parseRoutesWithEndian(gpa, r.bytes, native_endian), .truncated = r.truncated };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const fixture = @embedFile("testdata/route.txt");
+
+test "readRoutesReporting: a cap inside the last row sets truncated and drops that row" {
+    try @import("reported_test.zig").expectReportedCut(RouteEntry, readRoutesFrom, fixture);
+}
 
 test "parseRoutes: real /proc/net/route fixture" {
     // ⚠ A LITTLE-ENDIAN CAPTURE, said out loud rather than left to

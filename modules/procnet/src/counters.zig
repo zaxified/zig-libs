@@ -102,9 +102,19 @@ pub fn parseNetDev(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.E
 
 /// Read + parse the live `/proc/net/dev` (missing file → empty slice).
 pub fn readNetDev(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]NetDevEntry {
-    const text = procnet.readVirtualLines(gpa, io, "/proc/net/dev", 1 << 20) orelse return &.{};
-    defer gpa.free(text);
-    return parseNetDev(gpa, text);
+    return (try readNetDevReporting(gpa, io)).entries;
+}
+
+/// `readNetDev` plus whether the byte cap cut the table (`truncated`:
+/// `entries` holds only the complete rows before the cap).
+pub fn readNetDevReporting(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!procnet.Reported(NetDevEntry) {
+    return readNetDevFrom(gpa, io, "/proc/net/dev", 1 << 20);
+}
+
+fn readNetDevFrom(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!procnet.Reported(NetDevEntry) {
+    const r = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return .{ .entries = &.{}, .truncated = false };
+    defer gpa.free(r.bytes);
+    return .{ .entries = try parseNetDev(gpa, r.bytes), .truncated = r.truncated };
 }
 
 // ── /proc/stat ───────────────────────────────────────────────────────────────
@@ -376,9 +386,19 @@ pub fn parseDiskstats(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocato
 
 /// Read + parse the live `/proc/diskstats` (missing file → empty slice).
 pub fn readDiskstats(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]DiskStat {
-    const text = procnet.readVirtualLines(gpa, io, "/proc/diskstats", 1 << 20) orelse return &.{};
-    defer gpa.free(text);
-    return parseDiskstats(gpa, text);
+    return (try readDiskstatsReporting(gpa, io)).entries;
+}
+
+/// `readDiskstats` plus whether the byte cap cut the table (`truncated`:
+/// `entries` holds only the complete rows before the cap).
+pub fn readDiskstatsReporting(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!procnet.Reported(DiskStat) {
+    return readDiskstatsFrom(gpa, io, "/proc/diskstats", 1 << 20);
+}
+
+fn readDiskstatsFrom(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!procnet.Reported(DiskStat) {
+    const r = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return .{ .entries = &.{}, .truncated = false };
+    defer gpa.free(r.bytes);
+    return .{ .entries = try parseDiskstats(gpa, r.bytes), .truncated = r.truncated };
 }
 
 // ── /proc/net/ipv6_route ─────────────────────────────────────────────────────
@@ -468,9 +488,19 @@ pub fn parseIpv6Routes(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocat
 
 /// Read + parse the live `/proc/net/ipv6_route` (no IPv6 → empty slice).
 pub fn readIpv6Routes(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error![]Ipv6RouteEntry {
-    const text = procnet.readVirtualLines(gpa, io, "/proc/net/ipv6_route", 4 << 20) orelse return &.{};
-    defer gpa.free(text);
-    return parseIpv6Routes(gpa, text);
+    return (try readIpv6RoutesReporting(gpa, io)).entries;
+}
+
+/// `readIpv6Routes` plus whether the byte cap cut the table (`truncated`:
+/// `entries` holds only the complete rows before the cap).
+pub fn readIpv6RoutesReporting(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!procnet.Reported(Ipv6RouteEntry) {
+    return readIpv6RoutesFrom(gpa, io, "/proc/net/ipv6_route", 4 << 20);
+}
+
+fn readIpv6RoutesFrom(gpa: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) std.mem.Allocator.Error!procnet.Reported(Ipv6RouteEntry) {
+    const r = procnet.readVirtualLinesReporting(gpa, io, path, limit) orelse return .{ .entries = &.{}, .truncated = false };
+    defer gpa.free(r.bytes);
+    return .{ .entries = try parseIpv6Routes(gpa, r.bytes), .truncated = r.truncated };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -481,6 +511,12 @@ pub fn readIpv6Routes(gpa: std.mem.Allocator, io: std.Io) std.mem.Allocator.Erro
 // not taken from what the parser returned.
 
 const testing = std.testing;
+
+test "read*Reporting: a cap inside the last row sets truncated and drops that row" {
+    try @import("reported_test.zig").expectReportedCut(NetDevEntry, readNetDevFrom, @embedFile("testdata/net_dev.txt"));
+    try @import("reported_test.zig").expectReportedCut(DiskStat, readDiskstatsFrom, @embedFile("testdata/diskstats.txt"));
+    try @import("reported_test.zig").expectReportedCut(Ipv6RouteEntry, readIpv6RoutesFrom, @embedFile("testdata/ipv6_route.txt"));
+}
 
 fn findDev(es: []const NetDevEntry, nm: []const u8) ?NetDevEntry {
     for (es) |e| if (std.mem.eql(u8, e.name(), nm)) return e;
