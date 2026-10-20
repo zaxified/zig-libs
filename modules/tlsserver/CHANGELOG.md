@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `keys.CertKeyPair`: the certificate chain and private key from PEM (SEC1
+  `EC PRIVATE KEY`, PKCS#8 `PRIVATE KEY` for EC P-256/P-384, Ed25519 and RSA, PKCS#1 `RSA PRIVATE
+  KEY`), the key checked against the leaf (`KeyMismatch`), its PEM body decoded in constant time
+  (`b64ct`) under a 64 KiB burn. Anchored on keys the OpenSSL 3.5.5 command line wrote
+  (`tools/key_vectors.py`); fuzz harness `tlsserver-keys` (120,000 runs clean, five mutants
+  caught; an independent review's MEDIUM — an EC scalar ≥ the order accepted — and LOWs
+  fixed before the first commit). New dependencies: `x509`, `rsa` (was test-only), `b64ct`.
 - **2026-10-20** — secp384r1 key exchange (through `tls13.kex`) and ECDSA P-384 certificates.
   **BEHAVIOURAL:** `default_groups` gains secp384r1 (last), as qap's fork serves it. Interop with
   OpenSSL `s_client` grows to ten sessions (P-256 over secp384r1, a P-384 certificate over

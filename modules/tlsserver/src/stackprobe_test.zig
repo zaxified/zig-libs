@@ -45,3 +45,42 @@ test "STACKPROBE: no traffic secret, key state or IV residue after any record en
     try probeSuite("aes256", .aes_256_gcm_sha384);
     try probeSuite("chacha", .chacha20_poly1305_sha256);
 }
+
+// ── keys.CertKeyPair.fromPem ────────────────────────────────────────────
+
+const keys = @import("keys.zig");
+const key_vectors = @import("key_vectors.zig");
+
+var heap_buf: [64 * 1024]u8 = undefined;
+var pair: keys.CertKeyPair = undefined;
+
+test "STACKPROBE: no private-key residue after CertKeyPair.fromPem" {
+    try sp.skipUnlessOptimized();
+    inline for (key_vectors.cases) |c| {
+        var fba: std.heap.FixedBufferAllocator = .init(&heap_buf);
+        const gpa = fba.allocator();
+        // The needles are the loaded secret's bytes, known only afterwards:
+        // load once, copy the secret out, wipe, then probe a second load.
+        try keys.CertKeyPair.fromPem(&pair, gpa, c.cert_pem, c.key_pem);
+        var secret: [64]u8 = undefined;
+        const n: usize = switch (pair.key) {
+            .ecdsa_p256 => |k| blk: {
+                secret[0..32].* = k.toBytes();
+                break :blk 32;
+            },
+            .ecdsa_p384 => |k| blk: {
+                secret[0..48].* = k.toBytes();
+                break :blk 48;
+            },
+            .ed25519 => |k| blk: {
+                secret[0..32].* = k.seed();
+                break :blk 32;
+            },
+            .rsa => 0, // `rsa` burns its own parse; residue is still checked
+        };
+        pair.deinit(gpa);
+        fba.reset();
+        _ = try P.run("fromPem " ++ c.name, keys.CertKeyPair.fromPem, .{ &pair, gpa, c.cert_pem, c.key_pem }, &[_][]const u8{secret[0..n]}, .{});
+        pair.deinit(gpa);
+    }
+}

@@ -30,8 +30,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 
 **Where we are ahead:** nothing yet. **Where we are behind:** a full (EC)DHE handshake with a
 certificate works against OpenSSL 3.5's `s_client` and Zig std's client, sans-I/O or through the
-blocking `Connection`; HelloRetryRequest, resumption, client certificates, KeyUpdate, a key
-loader and the BoGo gate are still to come (milestones M1–M2, *Backlog*).
+blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
+HelloRetryRequest, resumption, client certificates, KeyUpdate and the BoGo gate are still to come (milestones M1–M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -47,7 +47,8 @@ application data both ways and close_notify, over the record layer (header, in-p
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
 OpenSSL 3.5's `s_client` (ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; all three
 suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI) and with Zig std's client;
-`Connection` drives it over a `std.Io.Reader`/`Writer` pair. It is not yet a server to deploy:
+`Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
+certificate chain and private key from PEM. It is not yet a server to deploy:
 no HelloRetryRequest (a client that sent no share for the chosen group is refused), no
 resumption, no client certificates, no KeyUpdate — a client's KeyUpdate is answered with
 `unexpected_message`, and after `max_records_per_key` (2^23) records the server closes instead
@@ -58,6 +59,31 @@ early data, kTLS, ECH and post-handshake client authentication (*What is deliber
 done*).
 
 ## Wire format / algorithm
+
+### Certificate and key loading (`keys.zig`)
+
+`CertKeyPair.fromPem(out, gpa, chain_pem, key_pem)`: every `CERTIFICATE` block of `chain_pem`
+(leaf first; blocks of other labels skipped, so one combined file can serve as both arguments,
+and a file concatenated without a final newline still splits), and the first private-key block
+of `key_pem`:
+
+| Label | Content | Keys |
+|---|---|---|
+| `EC PRIVATE KEY` | RFC 5915 ECPrivateKey; the `[0]` curve required | P-256, P-384 |
+| `PRIVATE KEY` | RFC 5958 PrivateKeyInfo / OneAsymmetricKey (v0 or v1) | EC P-256/P-384 (a `[0]` inside must agree), Ed25519 (RFC 8410: no parameters, a 32-octet seed), RSA (`rsa.fromPkcs8`) |
+| `RSA PRIVATE KEY` | PKCS#1 RSAPrivateKey | RSA (`rsa.SecretKey.fromDer`: two-prime, consistency-checked) |
+| `ENCRYPTED PRIVATE KEY`, or any key with RFC 1421 `Proc-Type` headers | — | refused, `UnsupportedKey` |
+
+An EC scalar shorter than the order is left-padded (as OpenSSL reads it); longer, zero or ≥ the
+order is `MalformedKey` (std's `SecretKey.fromBytes` checks nothing, so the range is checked
+here). Every chain entry must be readable by `x509.spkiOf`, not merely DER
+(`MalformedCertificate`); an END line must name its BEGIN's label (`InvalidPem`); CRLF is
+accepted. An RSA key under an id-RSASSA-PSS leaf is `UnsupportedKey`. Other curves (P-521, secp256k1) and algorithms are `UnsupportedKey`.
+The key must belong to the leaf (`x509.spkiOf`: algorithm, named curve, and the public key
+derived from the private one equal to the certificate's), else `KeyMismatch` — rustls's
+`keys_match`, Go's `X509KeyPair`. DER is read strictly: definite lengths, minimal length
+octets, at most two length octets. `certifiedKey()` borrows from the pair (it must not move);
+`deinit` wipes the key and frees.
 
 **The handshake** (`server.Server`, RFC 8446 §2 Figure 1, full handshake): the caller feeds
 received octets (`feed` → `need_more`, `handshake_done`, `app_data`, `peer_closed`, and how much
@@ -178,6 +204,16 @@ RFC 8446 §5, record layer over a byte stream:
 
 ## Constant-time contract
 
+**Key loading** (`keys`): the private key's PEM body is decoded by `b64ct` (constant time) into
+a stack buffer that is wiped on every exit; the block search walks block by block and skips a
+foreign body with a scan for its END line's first `-` (a compare false on every base64
+character), never a Boyer-Moore-Horspool `std.mem.find` over key text — `acme`'s `pemBlockStart`
+approach. The DER walk branches on tags and lengths (the key's layout, not its value); the
+scalar range check and the key-to-leaf comparison are std's and a `mem.eql` over public values.
+`fromPem` runs under a 64 KiB burn (`burn.key_burn`; unburned 35 / 39 / 31 KiB for P-256 /
+P-384 / Ed25519, an RSA parse burns its own below), held by `src/stackprobe_test.zig`. No
+ctgrind row yet.
+
 Secrets: the traffic secret, the AEAD key state and the IV. The AEADs are the collection's
 (`aesgcm` with its own ctgrind rows, `chachapoly`); the code here branches only on public
 values — the suite, lengths, the sequence number, the tag verdict. The content-type scan in
@@ -239,7 +275,15 @@ The receive side's refusals are the table under *Wire format*. Record protection
   client against SNI `localhost`, under TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
   TLS_CHACHA20_POLY1305_SHA256 with X25519MLKEM768, and under X25519 and secp256r1; a request,
   a response and close_notify each way (std's client advertises `ed25519` but cannot verify it,
-  so Ed25519 and RSA are covered by the OpenSSL sessions).
+  so Ed25519 and RSA are covered by the OpenSSL sessions). The same handshake with P-256 and
+  P-384 chains and keys loaded by `keys` from the openssl-written vectors (SEC1 and PKCS#8).
+- **External (foreign implementation):** `keys` on private keys in every PEM form the OpenSSL
+  3.5.5 command line writes — `ecparam -genkey` (an `EC PARAMETERS` block, then SEC1), `ec`,
+  `genpkey` (PKCS#8: P-256, P-384, Ed25519, RSA), `pkcs8 -topk8`, `rsa -traditional` (PKCS#1) —
+  each with an `openssl req -x509` certificate; every key loads and matches its certificate and
+  is refused (`KeyMismatch`) against every other certificate, including another P-256 one; an
+  encrypted PKCS#8 key and a P-521 key are refused. `tools/key_vectors.py` →
+  `src/key_vectors.zig`.
 - **External (foreign implementation):** TLS_AES_256_GCM_SHA384 and
   TLS_CHACHA20_POLY1305_SHA256, which RFC 8448 does not cover — records sealed by OpenSSL
   through `cryptography` in the same tool (padding, sequence numbers up to 2^64 − 2), sealed
@@ -302,6 +346,30 @@ message damaged never panics, and whatever it decodes to is walked to the end by
 and the 32-octet session id limit removed, the binder offset two octets early, the ALPN iterator
 skipping one octet short (a panic), the key share read one octet early.
 
+Harness `tlsserver-keys`: `keys.CertKeyPair.fromPem` on the key vectors — the key's DER with
+octets rewritten (anywhere, or among the leading tags and lengths), truncated or extended and
+re-armoured under its own or another key label; rebuilt from a model of its fields (version,
+the scalar or seed at lengths around the curve's, own or other curve OIDs, optional `[0]` /
+`[1]`, with or without the PKCS#8 wrapper, Ed25519 parameters that RFC 8410 forbids); or the
+PEM text itself with octets rewritten or cut. Any outcome is a typed error, or exactly the
+genuine key (compared with a genuine load); never a panic, never a leak. Verdict 2026-10-20:
+4 × 30,000 runs, ReleaseSafe, clean (~450 runs/s per job, RSA dominates; rerun clean after
+the review fixes below). Five planted mutants
+caught: the DER length bound removed (a panic), the EC key-to-leaf comparison removed (a
+different key loaded), the Ed25519 seed length check removed (survived the first harness,
+which never shortened a nested octet string consistently — the model mode added), the scalar
+length bound removed, the long-form length bound removed.
+
+Independent read-only review of `keys` (Sonnet, 2026-10-20): no HIGH. MEDIUM fixed — an EC
+scalar ≥ the order loaded and failed only at the first signature (std's `fromBytes` does not
+range-check; test with d = n, n + 1, 0). LOWs fixed: legacy `Proc-Type` encrypted keys gave
+`InvalidPem` (now `UnsupportedKey`); a skipped block with a cut END line swallowed the next
+BEGIN (END must now match); one pass over the blocks instead of one per label; intermediates
+are checked; the key's size limit no longer counts whitespace; an RSA-PSS leaf is named. Added:
+an allocation-failure sweep (`checkAllAllocationFailures`) over every key form, CRLF, `out`
+zeroed after an error. Documented, not changed: the pair must not move after `certifiedKey`,
+and `fromPem` wants ~110 KiB of stack (more for RSA).
+
 ## What is deliberately not done
 
 - **TLS 1.2, SSL 3, TLS 1.0/1.1:** never. The suites and the record format are TLS 1.3's only.
@@ -317,9 +385,11 @@ skipping one octet short (a panic), the key share read one octet early.
 
 ## Backlog / deferred
 
-- **M1 (next):** secp384r1 key exchange (`tls13.kex`) and a P-384 certificate, a certificate
-  and key loader (PEM, PKCS#8, SEC1); interop with the Go client and `tlsclient`; a fuzz
-  harness over `Server`; the BoGo shim.
+- **M1 (next):** interop with the Go client and `tlsclient`; a fuzz harness over `Server`; the
+  BoGo shim. (Done 2026-10-20: secp384r1 and P-384 certificates; the key loader.)
+- **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
+  `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
+  `x509/SPEC.md` § Backlog).
 - **M2:** KeyUpdate both ways (until then a client's KeyUpdate kills the connection and the
   server stops at `max_records_per_key`, independent review 2026-10-20, MEDIUM).
 - **M2:** HRR, KeyUpdate, NewSessionTicket and resumption through `tlsresume`, mTLS through

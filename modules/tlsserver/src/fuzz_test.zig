@@ -10,6 +10,7 @@
 //! bytes in place of the ciphertext — or opened under another sequence number
 //! is refused, never accepted unless identical, never a panic; a refused
 //! record never advances the sequence number.
+//! `tlsserver-keys` (`keys.CertKeyPair.fromPem`) is described at its section.
 
 const std = @import("std");
 const testing = std.testing;
@@ -857,4 +858,290 @@ test "fuzz driver: TLSSERVER_FUZZ (hello)" {
 }
 test "fuzz harness: hello, 300 seeds, reaches every outcome" {
     try HelloMark.reach(fuzzHello, "tlsserver-hello", 300);
+}
+
+// ── tlsserver-keys ───────────────────────────────────────────────────────
+//
+// `keys.CertKeyPair.fromPem` on the openssl-written key vectors, damaged:
+// the key's DER with 1..3 octets rewritten (a tag, a length octet or any
+// octet), truncated or extended and re-armoured under its own or another
+// key label; or rebuilt from a model of its fields (version, the scalar or
+// seed at a length around the curve's, the curve OIDs, the optional [0] and
+// [1], the PKCS#8 wrapper or not), the way the hello harness builds a
+// ClientHello; or the PEM text itself with octets rewritten or cut. Every
+// outcome is a typed error or a key of the case's kind that matches the
+// certificate; never a panic, never a leak (the driver's allocator checks).
+
+const keys = @import("keys.zig");
+const key_vectors = @import("key_vectors.zig");
+
+const KeyMark = Marker(enum {
+    genuine,
+    der_damaged_refused,
+    der_damaged_loaded,
+    relabelled_refused,
+    model_loaded,
+    model_refused,
+    text_damaged_refused,
+    malformed,
+    invalid_pem,
+    unsupported,
+    mismatch,
+    missing,
+});
+
+const key_label_names = [_][]const u8{ "EC PRIVATE KEY", "PRIVATE KEY", "RSA PRIVATE KEY", "ENCRYPTED PRIVATE KEY" };
+
+/// The last block of `pem` (a key file's key block): its label and body.
+fn lastBlock(pem: []const u8) struct { []const u8, []const u8 } {
+    const bi = std.mem.lastIndexOf(u8, pem, "-----BEGIN ").?;
+    const label_end = std.mem.indexOfPos(u8, pem, bi + 11, "-----").?;
+    const body_start = std.mem.indexOfScalarPos(u8, pem, label_end, '\n').? + 1;
+    const body_end = std.mem.indexOfPos(u8, pem, body_start, "-----END").?;
+    return .{ pem[bi + 11 .. label_end], pem[body_start..body_end] };
+}
+
+fn armour(w: *std.Io.Writer, label: []const u8, der: []const u8) !void {
+    var b64: [8192]u8 = undefined;
+    const text = std.base64.standard.Encoder.encode(&b64, der);
+    try w.print("-----BEGIN {s}-----\n", .{label});
+    var rest = text;
+    while (rest.len > 64) : (rest = rest[64..]) try w.print("{s}\n", .{rest[0..64]});
+    try w.print("{s}\n-----END {s}-----\n", .{ rest, label });
+}
+
+fn sameKey(a: *const keys.PrivateKey, b: *const keys.PrivateKey) bool {
+    return switch (a.*) {
+        .ecdsa_p256 => |k| std.mem.eql(u8, &k.toBytes(), &b.ecdsa_p256.toBytes()),
+        .ecdsa_p384 => |k| std.mem.eql(u8, &k.toBytes(), &b.ecdsa_p384.toBytes()),
+        .ed25519 => |k| std.mem.eql(u8, &k.toBytes(), &b.ed25519.toBytes()),
+        .rsa => |k| k.publicKey().equal(&b.rsa.publicKey()),
+    };
+}
+
+/// A DER builder over a fixed buffer, back to front: `tlv` wraps everything
+/// written since `mark` in one element.
+const DerOut = struct {
+    buf: [1024]u8 = undefined,
+    len: usize = 0,
+
+    fn put(o: *DerOut, bytes: []const u8) void {
+        @memcpy(o.buf[o.len..][0..bytes.len], bytes);
+        o.len += bytes.len;
+    }
+    fn mark(o: *const DerOut) usize {
+        return o.len;
+    }
+    /// `[tag][len][content written since start]`, shifting the content.
+    fn wrap(o: *DerOut, start: usize, tag: u8) void {
+        const n = o.len - start;
+        var hdr: [4]u8 = undefined;
+        var h: usize = 0;
+        hdr[0] = tag;
+        if (n < 0x80) {
+            hdr[1] = @intCast(n);
+            h = 2;
+        } else if (n < 0x100) {
+            hdr[1] = 0x81;
+            hdr[2] = @intCast(n);
+            h = 3;
+        } else {
+            hdr[1] = 0x82;
+            hdr[2] = @intCast(n >> 8);
+            hdr[3] = @intCast(n & 0xff);
+            h = 4;
+        }
+        std.mem.copyBackwards(u8, o.buf[start + h ..][0..n], o.buf[start..][0..n]);
+        @memcpy(o.buf[start..][0..h], hdr[0..h]);
+        o.len += h;
+    }
+    fn tlv(o: *DerOut, tag: u8, content: []const u8) void {
+        const m = o.mark();
+        o.put(content);
+        o.wrap(m, tag);
+    }
+};
+
+const oid_ec = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 };
+const oid_p256 = [_]u8{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+const oid_p384 = [_]u8{ 0x2b, 0x81, 0x04, 0x00, 0x22 };
+const oid_ed = [_]u8{ 0x2b, 0x65, 0x70 };
+
+/// The key's secret field at a length around `n`: the genuine bytes,
+/// left-padded or cut, or random.
+fn secretField(comptime S: type, src: *S, genuine: []const u8, out: []u8) []u8 {
+    const n = genuine.len;
+    const len: usize = switch (src.valueRangeAtMost(u8, 0, 5)) {
+        0, 1, 2 => n,
+        3 => n - 1 - src.index(3),
+        4 => n + 1 + src.index(3),
+        else => src.index(70),
+    };
+    if (src.valueRangeAtMost(u8, 0, 7) == 0) {
+        src.bytes(out[0..len]);
+    } else if (len >= n) {
+        @memset(out[0 .. len - n], 0);
+        @memcpy(out[len - n ..][0..n], genuine);
+    } else @memcpy(out[0..len], genuine[n - len ..]);
+    return out[0..len];
+}
+
+/// A key DER from a model of its fields; the label it goes under.
+fn modelKey(comptime S: type, src: *S, genuine: *const keys.PrivateKey, o: *DerOut) []const u8 {
+    var field_buf: [80]u8 = undefined;
+    const pkcs8 = src.valueRangeAtMost(u8, 0, 1) == 0;
+    const top = o.mark();
+    switch (genuine.*) {
+        .ecdsa_p256, .ecdsa_p384 => {
+            const is384 = genuine.* == .ecdsa_p384;
+            var sk: [48]u8 = undefined;
+            const n: usize = if (is384) 48 else 32;
+            if (is384) sk[0..48].* = genuine.ecdsa_p384.toBytes() else sk[0..32].* = genuine.ecdsa_p256.toBytes();
+            const own: []const u8 = if (is384) &oid_p384 else &oid_p256;
+            const other: []const u8 = if (is384) &oid_p256 else &oid_p384;
+            const curve_oid = if (src.valueRangeAtMost(u8, 0, 5) == 0) other else own;
+            if (pkcs8) {
+                o.tlv(0x02, &.{if (src.valueRangeAtMost(u8, 0, 7) == 0) src.value(u8) else 0});
+                const alg = o.mark();
+                o.tlv(0x06, if (src.valueRangeAtMost(u8, 0, 9) == 0) &oid_ed else &oid_ec);
+                o.tlv(0x06, curve_oid);
+                o.wrap(alg, 0x30);
+            }
+            const inner = o.mark();
+            o.tlv(0x02, &.{if (src.valueRangeAtMost(u8, 0, 7) == 0) src.value(u8) else 1});
+            o.tlv(0x04, secretField(S, src, sk[0..n], &field_buf));
+            if (!pkcs8 or src.valueRangeAtMost(u8, 0, 2) == 0) { // [0] curve
+                const p = o.mark();
+                o.tlv(0x06, if (src.valueRangeAtMost(u8, 0, 5) == 0) other else own);
+                o.wrap(p, 0xa0);
+            }
+            if (src.valueRangeAtMost(u8, 0, 1) == 0) { // [1] some public key
+                var pk: [98]u8 = undefined;
+                pk[0] = 0;
+                src.bytes(pk[1..]);
+                const p = o.mark();
+                o.tlv(0x03, pk[0 .. 2 + src.index(96)]);
+                o.wrap(p, 0xa1);
+            }
+            o.wrap(inner, 0x30);
+            if (pkcs8) {
+                o.wrap(inner, 0x04);
+                o.wrap(top, 0x30);
+                return "PRIVATE KEY";
+            }
+            return "EC PRIVATE KEY";
+        },
+        .ed25519 => |k| {
+            o.tlv(0x02, &.{if (src.valueRangeAtMost(u8, 0, 7) == 0) src.value(u8) else src.valueRangeAtMost(u8, 0, 1)});
+            const alg = o.mark();
+            o.tlv(0x06, &oid_ed);
+            if (src.valueRangeAtMost(u8, 0, 7) == 0) o.tlv(0x05, ""); // parameters, which RFC 8410 forbids
+            o.wrap(alg, 0x30);
+            const priv = o.mark();
+            o.tlv(0x04, secretField(S, src, &k.seed(), &field_buf));
+            o.wrap(priv, 0x04);
+            o.wrap(top, 0x30);
+            return "PRIVATE KEY";
+        },
+        .rsa => unreachable,
+    }
+}
+
+fn fuzzKeys(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const c = key_vectors.cases[src.index(key_vectors.cases.len)];
+    var text_buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&text_buf);
+    var mode = src.valueRangeAtMost(u8, 0, 11);
+    if (mode >= 7 and mode <= 8 and c.kind == .rsa) mode = 1; // no RSA model
+    var damaged = true;
+    var relabel = false;
+    if (mode == 0) {
+        try w.writeAll(c.key_pem);
+        damaged = false;
+    } else if (mode <= 6) {
+        // The DER, damaged and re-armoured.
+        const label, const body = lastBlock(c.key_pem);
+        var der_buf: [4096]u8 = undefined;
+        const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
+        var n = try dec.decode(&der_buf, body);
+        var orig_buf: [4096]u8 = undefined;
+        const orig = orig_buf[0..n];
+        @memcpy(orig, der_buf[0..n]);
+        switch (src.valueRangeAtMost(u8, 0, 3)) {
+            0 => n = src.valueRangeAtMost(u16, 0, @intCast(n)), // truncated
+            1 => { // extended
+                const m = src.valueRangeAtMost(u16, 1, 16);
+                src.bytes(der_buf[n..][0..m]);
+                n += m;
+            },
+            2 => { // a header octet near the front (tags and lengths live there)
+                if (n > 0) der_buf[src.index(@min(n, 40))] = src.value(u8);
+            },
+            else => if (n > 0) for (0..src.valueRangeAtMost(u8, 1, 3)) |_| {
+                der_buf[src.index(n)] = src.value(u8);
+            },
+        }
+        const out_label = if (src.valueRangeAtMost(u8, 0, 3) == 0) key_label_names[src.index(key_label_names.len)] else label;
+        relabel = !std.mem.eql(u8, out_label, label);
+        // A rewrite can leave the octets as they were: then only a label
+        // change counts as damage.
+        damaged = relabel or !std.mem.eql(u8, der_buf[0..n], orig);
+        try armour(&w, out_label, der_buf[0..n]);
+    } else if (mode <= 8) {
+        // Rebuilt from the model.
+        var genuine: keys.CertKeyPair = undefined;
+        try keys.CertKeyPair.fromPem(&genuine, gpa, c.cert_pem, c.key_pem);
+        defer genuine.deinit(gpa);
+        var o: DerOut = .{};
+        const label = modelKey(S, src, &genuine.key, &o);
+        try armour(&w, label, o.buf[0..o.len]);
+    } else {
+        // The PEM text itself.
+        try w.writeAll(c.key_pem);
+        const t = w.buffered();
+        if (src.valueRangeAtMost(u8, 0, 1) == 0) {
+            for (0..src.valueRangeAtMost(u8, 1, 3)) |_| t[src.index(t.len)] = src.value(u8);
+        } else {
+            w.end = src.index(t.len);
+        }
+    }
+
+    var pair: keys.CertKeyPair = undefined;
+    if (keys.CertKeyPair.fromPem(&pair, gpa, c.cert_pem, w.buffered())) |_| {
+        defer pair.deinit(gpa);
+        if (!std.mem.eql(u8, @tagName(c.kind), @tagName(std.meta.activeTag(pair.key)))) return error.WrongKeyKind;
+        // Whatever loads is the genuine key, not merely one of its kind.
+        var genuine: keys.CertKeyPair = undefined;
+        try keys.CertKeyPair.fromPem(&genuine, gpa, c.cert_pem, c.key_pem);
+        defer genuine.deinit(gpa);
+        if (!sameKey(&pair.key, &genuine.key)) return error.DifferentKeyLoaded;
+        if (!damaged) KeyMark.mark(.genuine) else if (mode <= 6) KeyMark.mark(.der_damaged_loaded) else if (mode <= 8) KeyMark.mark(.model_loaded);
+    } else |err| {
+        if (!damaged) return err;
+        switch (err) {
+            error.MalformedKey => KeyMark.mark(.malformed),
+            error.InvalidPem => KeyMark.mark(.invalid_pem),
+            error.UnsupportedKey => KeyMark.mark(.unsupported),
+            error.KeyMismatch => KeyMark.mark(.mismatch),
+            error.MissingPrivateKey => KeyMark.mark(.missing),
+            error.OutOfMemory, error.MissingCertificate, error.MalformedCertificate => return err,
+        }
+        if (mode > 8) KeyMark.mark(.text_damaged_refused) else if (mode > 6) KeyMark.mark(.model_refused) else if (relabel) KeyMark.mark(.relabelled_refused) else KeyMark.mark(.der_damaged_refused);
+    }
+}
+
+fn fuzzKeysSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [1024]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzKeys(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver keys, damaged key PEM is a typed error" {
+    try testing.fuzz({}, fuzzKeysSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (keys)" {
+    try fuzz_driver.run(fuzzKeys, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-keys" });
+}
+test "fuzz harness: keys, 400 seeds, reaches every outcome" {
+    try KeyMark.reach(fuzzKeys, "tlsserver-keys", 400);
 }

@@ -6,9 +6,9 @@
 //! (plan: milestones M1–M4, `SPEC.md`). Today: `Server`, a sans-I/O full
 //! handshake with a certificate (TLS_AES_128_GCM_SHA256,
 //! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
-//! X25519, secp256r1), then application data — no HelloRetryRequest,
-//! resumption, client certificates or KeyUpdate yet — and `Connection`, the
-//! blocking wrapper. Interoperates with OpenSSL 3.5's s_client.
+//! X25519, secp256r1, secp384r1), then application data — no
+//! HelloRetryRequest, resumption, client certificates or KeyUpdate yet —
+//! `Connection`, the blocking wrapper, and `keys`, the PEM loader. Interoperates with OpenSSL 3.5's s_client.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
 
@@ -17,7 +17,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1), no HelloRetryRequest, resumption or client certificates yet",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1) and a PEM certificate/key loader, no HelloRetryRequest, resumption or client certificates yet",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},
@@ -27,7 +27,7 @@ pub const meta = .{
     // shared or global.
     .concurrency = .single_owner,
     .model_after = "RFC 8446; rustls `ServerConnection` (buffer-driven core) for scope and API split",
-    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr" }, // tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI
+    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct" }, // tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key
 };
 
 /// The TLS 1.3 record layer: header, `Protection` (seal / open in place).
@@ -58,8 +58,12 @@ pub const CertifiedKey = server.CertifiedKey;
 pub const connection = @import("connection.zig");
 pub const Connection = connection.Connection;
 
+/// Loading a certificate chain and its private key from PEM.
+pub const keys = @import("keys.zig");
+pub const CertKeyPair = keys.CertKeyPair;
+
 /// TEST certificates and private keys (self-signed, CN=tlsserver-test, SAN
-/// localhost: ECDSA P-256, Ed25519, RSA-2048), published for this module's
+/// localhost: ECDSA P-256 and P-384, Ed25519, RSA-2048), published for this module's
 /// interop program and for consumers' own tests. The keys are public:
 /// never serve anything real with them.
 pub const test_fixtures = @import("test_certs.zig");
@@ -73,16 +77,20 @@ test {
     _ = messages;
     _ = server;
     _ = connection;
+    _ = keys;
     _ = @import("handshake_test.zig");
     _ = @import("interop_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
 }
 
-test "meta.deps is {tls13, aesgcm, chachapoly, netaddr}" {
-    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
+test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct}" {
+    try std.testing.expectEqual(@as(usize, 7), meta.deps.len);
     try std.testing.expectEqualStrings("tls13", meta.deps[0]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
     try std.testing.expectEqualStrings("netaddr", meta.deps[3]);
+    try std.testing.expectEqualStrings("x509", meta.deps[4]);
+    try std.testing.expectEqualStrings("rsa", meta.deps[5]);
+    try std.testing.expectEqualStrings("b64ct", meta.deps[6]);
 }

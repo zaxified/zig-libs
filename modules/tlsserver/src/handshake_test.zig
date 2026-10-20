@@ -188,3 +188,21 @@ test "std client ↔ Server: the x25519 and secp256r1 groups" {
         try testing.expectEqualStrings("hello there", o.echoed);
     }
 }
+
+test "std client ↔ Server: chains and keys loaded from openssl's PEM forms (`keys`)" {
+    const key_vectors = @import("key_vectors.zig");
+    const CertKeyPair = @import("keys.zig").CertKeyPair;
+    for (key_vectors.cases) |c| {
+        // ECDSA only: std's client checks neither Ed25519 nor (here) RSA-PSS
+        // certificates; the loader's other forms are pinned in `keys.zig`.
+        if (c.kind != .ecdsa_p256 and c.kind != .ecdsa_p384) continue;
+        errdefer std.debug.print("case {s}\n", .{c.name});
+        var pair: CertKeyPair = undefined;
+        try CertKeyPair.fromPem(&pair, testing.allocator, c.cert_pem, c.key_pem);
+        defer pair.deinit(testing.allocator);
+        const ck = pair.certifiedKey();
+        const o = try handshake(testing.allocator, &ck, &server_mod.default_cipher_suites, &server_mod.default_groups);
+        defer testing.allocator.free(o.echoed);
+        try testing.expectEqualStrings("hello there", o.echoed);
+    }
+}

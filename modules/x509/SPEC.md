@@ -535,6 +535,18 @@ matching rule fail closed (§ Threat model).
 
 ## Backlog / deferred
 
+- **Private-key readers (requested 2026-10-20 by `tlsserver`).** No shared reader for SEC1
+  `EC PRIVATE KEY` and PKCS#8 `PRIVATE KEY` (EC, Ed25519) exists: `acme/src/x509.zig`
+  (`keyFromDer`, typed to its `p256`/`p384`/`p521` pairs) and `tlsserver/src/keys.zig`
+  (`fromPkcs8`/`ecFromSec1`, std's ECDSA/Ed25519 types) each carry one, with the same
+  constant-time PEM block walk (`pemBlockStart` / `BlockIterator`); `rsa` has its own for RSA,
+  `ssh` its own for OpenSSH. Ideal API (Go's `ParseECPrivateKey` / `ParsePKCS8PrivateKey`
+  shape, type-agnostic): `x509.keys.parsePrivateKey(der) → {alg: ec(curve) | ed25519 | rsa,
+  secret: []const u8 (the scalar / seed / PKCS#1 DER, a slice of the input)}` plus a
+  `pemSecretBlock(text, labels) → body` and a `b64ct` decode into a caller buffer. Then
+  `acme` and `tlsserver` keep only the step into their key types. Effort: small–medium (move,
+  re-pin acme's `pem` ctgrind row).
+
 - **Build option: post-quantum signature verifiers in chain building** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/chain.zig:681-686 dispatches
   ML-DSA (3 sets) and SLH-DSA (12 sets, `inline else` over algorithm.zig:37-113) for every chain verifier. Measured (HTTPS sizeprobe,
   baseline x86_64 ReleaseSafe): SLH-DSA engine ~62 KB + ML-DSA ~56 KB. `.small` could drop SLH-DSA (no Web PKI issuer uses it) →

@@ -51,3 +51,9 @@ pub const record_burn = 4 * 1024;
 /// signing and HKDF below them burn their own. A margin, not yet measured
 /// (*Open* in SPEC.md: the stack probe does not cover the server yet).
 pub const handshake_burn = 16 * 1024;
+
+/// `keys.CertKeyPair.fromPem`: the PEM and DER walk, the Ed25519 seed
+/// expansion and the key-to-certificate check (a scalar multiplication for
+/// EC). Unburned depth 35.1 / 38.9 / 31.2 KiB (P-256 / P-384 / Ed25519, SEC1
+/// and PKCS#8 alike); an RSA key's parse burns its own 200 KiB below.
+pub const key_burn = 64 * 1024;
