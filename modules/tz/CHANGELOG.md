@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `tz.full` (`find`, `zones`): the pre-1970 history table is now reachable without editing
+  the module; only a program that references it pays its ~78 KB. The generator emits one abbreviation table
+  for both variants (in `tz_data.zig`; new pre-1970 names appended, default indices unchanged). Bench
+  `zig build bench-tz` against glibc `localtime_r`/`mktime` and Go time over the pinned 2026a tree.
 - **2026-10-20** — S2 batch. Footers parsed at generation time (`Zone.footer`; footer-era `offsetAt`
   145–167 → 63–74 ns); `abbrevAt` (per-transition abbreviation index + string table, `<+05>` form);
   `nextTransition`/`prevTransition` (`Change`); `localToUnix(zone, y, m, d, hh, mm, ss, policy)`;

@@ -108,11 +108,24 @@ pub fn main(init: std.process.Init) !void {
 
     const links = try readLinks(arena, io, root, raws.items);
 
+    // Both variants share ONE abbreviation table (emitted in tz_data.zig,
+    // imported by tz_data_full.zig), so a zone of either table resolves its
+    // `abbr` indices the same way and `tz.full.find` zones go through every
+    // function of the module. Default zones intern first, so the default
+    // table's indices do not depend on the pre-1970 history.
+    const zones_default = try buildZones(arena, raws.items, links, cutoff_default);
+    const zones_full = try buildZones(arena, raws.items, links, cutoff_full);
+    var abbrevs: Abbrevs = .{};
+    for ([_][]const ZoneOut{ zones_default, zones_full }) |set| for (set) |z| {
+        _ = try abbrevs.intern(arena, z.init_abbr);
+        for (z.trans) |t| _ = try abbrevs.intern(arena, t.abbr);
+    };
+
     inline for (.{ false, true }) |full| {
         const path: ?[]const u8 = if (full) full_path else out_path;
         if (path) |p| {
-            const zones = try buildZones(arena, raws.items, links, if (full) cutoff_full else cutoff_default);
-            try emit(gpa, io, p, version, zones, full);
+            const zones = if (full) zones_full else zones_default;
+            try emit(gpa, io, p, version, zones, &abbrevs, full);
             std.debug.print("tz-gen: {d} zones from tzdata {s} -> {s}\n", .{ zones.len, version, p });
         }
     }
@@ -279,7 +292,7 @@ const Abbrevs = struct {
     }
 };
 
-fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []const u8, zones: []const ZoneOut, full: bool) !void {
+fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []const u8, zones: []const ZoneOut, abbrevs: *const Abbrevs, full: bool) !void {
     var out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{});
     defer out_file.close(io);
     var wbuf: [128 * 1024]u8 = undefined;
@@ -300,8 +313,8 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
     if (full) {
         try w.writeAll(
             \\// FULL variant: every offset/DST/abbreviation change zic emits, back to the
-            \\// zone's first (local mean time) state, which is `init_*`. Not imported by
-            \\// the module by default; swap `@import("tz_data.zig")` in root.zig for it.
+            \\// zone's first (local mean time) state, which is `init_*`. Reached through
+            \\// `tz.full`; compiled only into a program that uses it.
             \\
         );
     } else {
@@ -315,7 +328,8 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
     try w.writeAll(
         \\// `posix` is the zone's POSIX-TZ footer rule, applied for instants after the
         \\// last explicit transition; `footer` is the same rule parsed at generation
-        \\// time. `abbr`/`init_abbr` are byte offsets into `abbrevs`.
+        \\// time. `abbr`/`init_abbr` are byte offsets into `abbrevs` (one table for
+        \\// both variants, defined in tz_data.zig).
         \\
         \\const types = @import("types.zig");
         \\pub const Transition = types.Transition;
@@ -325,27 +339,25 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
         \\
     );
 
-    // Abbreviations, interned in table order (zones are sorted by name).
-    var abbrevs: Abbrevs = .{};
-    for (zones) |z| {
-        _ = try abbrevs.intern(arena, z.init_abbr);
-        for (z.trans) |t| _ = try abbrevs.intern(arena, t.abbr);
-    }
-    try w.writeAll("/// NUL-terminated abbreviations; offset 0 is the empty string.\n");
-    try w.writeAll("pub const abbrevs: []const u8 =\n");
-    {
-        // One literal per abbreviation, a few per line.
-        var col: usize = 0;
-        try w.writeAll("    \"\\x00\"");
-        var at: usize = 1;
-        while (at < abbrevs.blob.items.len) {
-            const end = std.mem.findScalarPos(u8, abbrevs.blob.items, at, 0).?;
-            if (col % 8 == 7) try w.writeAll("\n    ++ ") else try w.writeAll(" ++ ");
-            try w.print("\"{s}\\x00\"", .{abbrevs.blob.items[at..end]});
-            col += 1;
-            at = end + 1;
+    if (full) {
+        try w.writeAll("/// The shared abbreviation table (tz_data.zig).\npub const abbrevs = @import(\"tz_data.zig\").abbrevs;\n\n");
+    } else {
+        try w.writeAll("/// NUL-terminated abbreviations; offset 0 is the empty string.\n");
+        try w.writeAll("pub const abbrevs: []const u8 =\n");
+        {
+            // One literal per abbreviation, a few per line.
+            var col: usize = 0;
+            try w.writeAll("    \"\\x00\"");
+            var at: usize = 1;
+            while (at < abbrevs.blob.items.len) {
+                const end = std.mem.findScalarPos(u8, abbrevs.blob.items, at, 0).?;
+                if (col % 8 == 7) try w.writeAll("\n    ++ ") else try w.writeAll(" ++ ");
+                try w.print("\"{s}\\x00\"", .{abbrevs.blob.items[at..end]});
+                col += 1;
+                at = end + 1;
+            }
+            try w.writeAll(";\n\n");
         }
-        try w.writeAll(";\n\n");
     }
 
     // Footers, deduplicated by their text.
@@ -385,7 +397,7 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
             continue;
         }
         var text: std.Io.Writer.Allocating = .init(arena);
-        try emitTransBody(&text.writer, &abbrevs, z.trans);
+        try emitTransBody(&text.writer, abbrevs, z.trans);
         const key = text.written();
         if (dedup.get(key)) |idx| {
             syms[i] = idx;
@@ -402,7 +414,7 @@ fn emit(gpa: std.mem.Allocator, io: std.Io, out_path: []const u8, version: []con
     for (zones, 0..) |z, i| {
         try w.writeAll("    .{ .name = ");
         try emitStr(w, z.name);
-        try w.print(", .init_off = {d}, .init_dst = {}, .init_abbr = {d}, .trans = ", .{ z.init_off, z.init_dst, try abbrevs.intern(arena, z.init_abbr) });
+        try w.print(", .init_off = {d}, .init_dst = {}, .init_abbr = {d}, .trans = ", .{ z.init_off, z.init_dst, abbrevs.index.get(z.init_abbr) orelse 0 });
         if (syms[i]) |idx| {
             try w.print("&t{d}", .{idx});
         } else {
@@ -429,7 +441,7 @@ fn emitRule(w: *std.Io.Writer, r: posix.Rule) !void {
     }
 }
 
-fn emitTransBody(w: *std.Io.Writer, abbrevs: *Abbrevs, trans: []const Tr) !void {
+fn emitTransBody(w: *std.Io.Writer, abbrevs: *const Abbrevs, trans: []const Tr) !void {
     var col: usize = 0;
     for (trans) |t| {
         if (col == 0) try w.writeAll("    ");

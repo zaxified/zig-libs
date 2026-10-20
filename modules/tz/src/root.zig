@@ -7,11 +7,14 @@
 //! its POSIX-TZ footer rule. This module resolves a zone by name and reports
 //! the UTC offset (and DST flag) at a given instant: a binary search over the
 //! explicit transitions, then the POSIX rule for instants past the last one
-//! (~2038+).
+//! (~2038+). `full` is the same API over the table that also keeps the history
+//! before 1970 (`tz_data_full.zig`); it is compiled only into a program that
+//! uses it.
 
 const std = @import("std");
 const datefmt = @import("datefmt");
 const tz_data = @import("tz_data.zig");
+const tz_data_full = @import("tz_data_full.zig");
 const posix = @import("posix.zig");
 
 pub const meta = .{
@@ -46,15 +49,33 @@ pub const Offset = struct {
 /// Resolve an IANA zone id (`"Europe/Prague"`, `"America/New_York"`, `"UTC"`).
 /// Case-sensitive, matching the IANA database. Returns null for unknown names.
 pub fn find(name: []const u8) ?*const tz_data.Zone {
+    return findIn(&tz_data.zones, name);
+}
+
+/// The table with every change back to each zone's local mean time (pre-1970
+/// history included; `tz.zones` folds it into the state at the epoch). Its
+/// zones go through every function of this module: both tables share one
+/// abbreviation table, and they agree from 1970 on. About +79 KB, paid only
+/// by a program that references `full`.
+pub const full = struct {
+    pub const zones = tz_data_full.zones;
+
+    /// `tz.find` over the full table.
+    pub fn find(name: []const u8) ?*const tz_data.Zone {
+        return findIn(&tz_data_full.zones, name);
+    }
+};
+
+fn findIn(table: []const tz_data.Zone, name: []const u8) ?*const tz_data.Zone {
     // zones are emitted sorted by name → binary search.
     var lo: usize = 0;
-    var hi: usize = tz_data.zones.len;
+    var hi: usize = table.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        switch (std.mem.order(u8, tz_data.zones[mid].name, name)) {
+        switch (std.mem.order(u8, table[mid].name, name)) {
             .lt => lo = mid + 1,
             .gt => hi = mid,
-            .eq => return &tz_data.zones[mid],
+            .eq => return &table[mid],
         }
     }
     return null;
@@ -814,7 +835,6 @@ test "localToUnix: parts form agrees with localToUtc, rejects invalid fields" {
 }
 
 test "tz_data_full: same footer era, same history since 1970, LMT before" {
-    const full = @import("tz_data_full.zig");
     try testing.expectEqual(tz_data.zones.len, full.zones.len);
     var prng = std.Random.DefaultPrng.init(0xf011);
     const r = prng.random();
@@ -838,11 +858,18 @@ test "tz_data_full: same footer era, same history since 1970, LMT before" {
     }
     try testing.expect(older > 300);
     // Prague before 1970: LMT +0:57:44 until 1891, then CET.
-    const pz = for (&full.zones) |*fzone| {
-        if (std.mem.eql(u8, fzone.name, "Europe/Prague")) break fzone;
-    } else unreachable;
+    const pz = full.find("Europe/Prague").?;
     try testing.expectEqual(@as(i32, 3464), offsetAt(pz, -4_000_000_000).off);
     try testing.expectEqual(@as(i32, 3600), offsetAt(pz, -2_000_000_000).off);
+    // The shared abbreviation table: pre-1970 names resolve, and the default
+    // table's zones keep theirs.
+    try testing.expectEqualStrings("PMT", abbrevAt(pz, -3_000_000_000));
+    try testing.expectEqualStrings("LMT", abbrevAt(pz, -4_000_000_000));
+    try testing.expectEqualStrings("CET", abbrevAt(pz, -2_000_000_000));
+    try testing.expectEqualStrings(abbrevAt(find("Europe/Prague").?, 1705320000), abbrevAt(pz, 1705320000));
+    try testing.expect(full.find("Not/AZone") == null);
+    // Local -> UTC before 1970: 1880-06-01 12:00 PMT = 11:02:16 UTC.
+    try testing.expectEqual(@as(i64, -2826968264), try localToUnix(pz, 1880, 6, 1, 12, 0, 0, .compatible));
 }
 
 test "find: known + unknown zones" {

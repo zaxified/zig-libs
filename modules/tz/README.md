@@ -108,12 +108,19 @@ argument: there is no silent default for a time that does not exist.
 ## Pre-1970 history
 
 The default table starts at 1970: earlier history is folded into `init_*`, so
-a pre-1970 instant gets the state of 1970. `src/tz_data_full.zig` (generated
-together with it) keeps the whole history, back to local mean time. It is
-NOT imported by default (about +80 KB in a ReleaseSmall binary over the
-default table): to use it, change the `tz_data.zig` import in `src/root.zig`
-to `tz_data_full.zig`; the types are shared (`src/types.zig`), nothing else
-changes. A build option for this needs a `build.zig` change and is not wired.
+a pre-1970 instant gets the state of 1970. `tz.full` is the whole history,
+back to local mean time, from `src/tz_data_full.zig` (generated together with
+the default table):
+
+```zig
+const z = tz.full.find("Europe/Prague").?;
+tz.offsetAt(z, -3_000_000_000); // 1874: Prague Mean Time, +0:57:44
+tz.abbrevAt(z, -3_000_000_000); // "PMT"
+```
+
+Its zones go through every function of the module (the two tables share one
+abbreviation table and agree from 1970 on). A program that never references
+`tz.full` does not contain it; one that does pays about +78 KB in ReleaseSmall.
 
 ## Defer (not in this extraction)
 
