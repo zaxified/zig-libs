@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !u8 {
         fn digest(i: std.Io, d: std.Io.Dir) ![minisign.prehash_length]u8 {
             var f = try d.openFile(i, "data.bin", .{});
             defer f.close(i);
-            var h = std.crypto.hash.blake2.Blake2b512.init(.{});
+            var h = minisign.Blake2b512.init();
             var chunk: [64 * 1024]u8 = undefined;
             var r = f.readerStreaming(i, &.{});
             while (true) {

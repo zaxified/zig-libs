@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `Blake2b512`: a row-vectorized BLAKE2b-512 (four `@Vector(4, u64)` rows,
+  byte-shuffle rotations; AVX2 on x86_64, std's elsewhere) for streaming `signFileDigest` /
+  `verifyFileDigest` input, used by `signMessage`/`verifyMessage`'s prehash too. Byte-identical to
+  std's (every length 0..1025, every split; RFC 7693 "abc"); 981 MB/s against std's 782 —
+  `bench-minisign` 1.30× → 0.93–1.10× the reference CLI. Additive.
+- **2026-10-20** — Constant-time harness (`src/ctgrind_harness.zig`; ctgrind sign/seal/open): no
+  minisign branch on a secret; the contexts are std's (Ed25519 `rejectIdentity` on R, scrypt's ROMix
+  index) plus the designed `WrongPassword` verdict. Card: grade 3 → 2 (H1, P2).
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-18** — **Constant time:** the key/signature base64 codec moved from `std.base64.standard` to the constant-time `b64ct` module (new dep). For an unencrypted secret key (`kdf_alg` none) the base64 text is the raw Ed25519 secret key, and std's decoder/encoder index their alphabet table by each secret character/sextet. Text format, lengths and errors (`WrongLength`, `InvalidBase64`) are unchanged; public keys and signatures use the same codec.
 - **2026-10-09** — `RawSecretKey.toBytes` and `RawSecretKey.fromBytes` now run under a burn (`codec_burn`); `formatKeyId` is marked a false positive of the dead-stack lint (a key id is public). No signature changed. Probe: `src/stackprobe2_test.zig`.

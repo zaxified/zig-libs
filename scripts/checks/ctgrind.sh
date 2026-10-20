@@ -328,6 +328,8 @@ declare -A TARGETS=(
     [acme]="jws csr pem pem384 pkcs8 anykey"
     # ── 2026-10-13: jwt: HMAC secrets (sign + verify), ES/EdDSA/RS/PS signing keys ──
     [jwt]="hmac ec rsa"
+    # ── 2026-10-20: minisign: Ed25519 seed (sign), password + key (seal), password (open) ──
+    [minisign]="sign seal open"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -414,6 +416,7 @@ declare -A MODES=(
     [tlsresume]="ReleaseFast"
     [acme]="ReleaseFast"
     [jwt]="ReleaseFast"
+    [minisign]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -790,6 +793,9 @@ declare -A PATTERN=(
     [jwt/hmac]='root[.]zig|encode[.]zig|burn[.]zig'
     [jwt/ec]='root[.]zig|encode[.]zig|burn[.]zig'
     [jwt/rsa]='root[.]zig|encode[.]zig|burn[.]zig'
+    [minisign/sign]='root[.]zig|burn[.]zig|blake2b[.]zig'
+    [minisign/seal]='root[.]zig|burn[.]zig|blake2b[.]zig'
+    [minisign/open]='root[.]zig|burn[.]zig|blake2b[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 # WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
@@ -1057,6 +1063,9 @@ declare -A LABEL=(
     [jwt/hmac]='jwt HS256/384/512 sign + verify accept + reject (secret tainted)'
     [jwt/ec]='jwt ES256/ES384/ES512/EdDSA sign (signing key tainted)'
     [jwt/rsa]='jwt RS256 + PS256 sign (rsa secret members tainted)'
+    [minisign/sign]='minisign signDigest + signTrustedComment (Ed25519 seed tainted)'
+    [minisign/seal]='minisign sealSecretKey (seed + password tainted)'
+    [minisign/open]='minisign openSecretKey (password tainted)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

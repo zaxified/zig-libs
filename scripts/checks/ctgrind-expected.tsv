@@ -1703,6 +1703,22 @@ jwt	ReleaseFast	ec	1	9	4170116c42f7e7c3	6c14c21a4454880c
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
 jwt	ReleaseFast	rsa	1	3	4170116c42f7e7c3	f2bee89c3c58cdaf
+# minisign (2026-10-20). Every in-file context is std's, attributed because a
+# minisign frame (root.zig edSignBody / sealSecretKeyBody / openSecretKeyBody)
+# is on its stack; read from --stacks, none is a minisign branch on a secret
+# except the one designed verdict:
+#  sign 2 — std edwards25519 pcMul16 `rejectIdentity` on the nonce point R
+#    (one per signature: file + trusted comment), the same std context jwt's
+#    EdDSA row carries; probability of the branch going the other way 2^-252.
+#  seal 2 — std scrypt smix `blockXor`: ROMix reads V at an index taken from
+#    the password-derived state (RFC 7914 by design; libsodium's too).
+#  open 4 — the same scrypt 2; openSecretKeyBody's `timing_safe.eql` verdict
+#    (WrongPassword or not, public by design); std `Ed25519.KeyPair.
+#    fromSecretKey` comparing the recomputed public key with the stored one
+#    (a public value derived from the secret).
+minisign	ReleaseFast	sign	1	2	bfd5f68eeaf3f6ec	812c5ebd56623021
+minisign	ReleaseFast	seal	1	2	bfd5f68eeaf3f6ec	d241260799cd24a3
+minisign	ReleaseFast	open	1	4	bfd5f68eeaf3f6ec	1876f3ea9f53cddd
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and

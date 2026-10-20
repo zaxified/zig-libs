@@ -67,7 +67,7 @@ pub fn verifyFile(allocator, public_key: RawPublicKey, message: []const u8, pars
 
 // sign / verify a PRECOMPUTED BLAKE2b-512 digest instead — this is what
 // lets a caller stream a multi-gigabyte file (e.g. via
-// std.crypto.hash.blake2.Blake2b512.update in a chunked read loop) rather
+// minisign.Blake2b512.update (AVX2-vectorized; std's is byte-identical) in a chunked read loop) rather
 // than holding it resident in RAM. Prehashed ("ED") only — the legacy
 // ("Ed") algorithm signs raw file bytes directly and cannot stream.
 pub fn signDigest(key_pair: *const KeyPair, digest: [64]u8) !RawSignature;

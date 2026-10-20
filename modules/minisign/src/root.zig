@@ -824,9 +824,18 @@ fn openSecretKeyBody(
 
 fn prehash(message: []const u8) [prehash_length]u8 {
     var digest: [prehash_length]u8 = undefined;
-    std.crypto.hash.blake2.Blake2b512.hash(message, &digest, .{});
+    var h = Blake2b512.init();
+    h.update(message);
+    h.final(&digest);
     return digest;
 }
+
+/// The streaming BLAKE2b-512 for `signFileDigest`/`verifyFileDigest`: `init`,
+/// `update` per chunk, `final`. Byte-identical to
+/// `std.crypto.hash.blake2.Blake2b512`, and on x86_64 with AVX2 row-vectorized
+/// (≈ 1.25× std's throughput, the reference CLI's libsodium speed); elsewhere
+/// it is std's.
+pub const Blake2b512 = @import("blake2b.zig").Blake2b512;
 
 const EdSignError = std.crypto.errors.IdentityElementError || std.crypto.errors.NonCanonicalError ||
     std.crypto.errors.KeyMismatchError || std.crypto.errors.WeakPublicKeyError;
@@ -917,7 +926,7 @@ pub const SignedFile = struct {
 // `signMessage`/`verifyMessage` need the whole message resident in RAM even
 // for `.prehashed`, because they compute the BLAKE2b-512 digest internally.
 // A caller signing/verifying a multi-gigabyte file wants to stream it through
-// `std.crypto.hash.blake2.Blake2b512.update` in fixed-size chunks instead —
+// `Blake2b512.update` (this module's, or std's — same bytes) in fixed-size chunks instead —
 // this module owns that entry point because *which bytes get signed* is a
 // correctness-relevant part of the wire format (the digest, tagged
 // `sig_alg_prehashed`), not filesystem plumbing. Opening the file and
@@ -1785,6 +1794,7 @@ test {
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("blake2b.zig");
 }
 
 test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {
