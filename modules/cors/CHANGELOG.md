@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **CONSUMER-VISIBLE (headers):** with a `.list`, `.patterns` or `.predicate`
+  origin policy, every actual response now carries `Vary: Origin` — also when the Origin is
+  absent or refused or the method gate fails, not only on a grant (rs/cors parity; audit
+  2026-10-19 S8-2). Without it a shared cache could store a response without CORS headers and
+  serve it to an allowed cross-origin page. `.any`, `.none` and the static posture are
+  unchanged; on a grant the header order is unchanged. Browser-oracle vectors re-taken with
+  Chrome 155 (504 fetches agree; 74 refusal answers gained the field).
+
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (test and bench tool). No behaviour change.
 
 - **2026-10-12** — The actual-request gate checks the method as sent (`Request.methodName()`,

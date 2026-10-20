@@ -538,16 +538,34 @@ pub const Cors = struct {
             return;
         }
 
-        const origin = req.header("Origin") orelse return;
-        const acao = c.allowOriginValue(origin) orelse return;
-        // rs/cors gate: an actual method outside allowed_methods gets no
-        // CORS headers either (OPTIONS always passes, see methodTokenAllowed).
-        if (!c.methodTokenAllowed(req.methodName())) return;
+        // A non-`*` policy makes every actual response depend on `Origin` —
+        // granted, refused or absent — so `Vary: Origin` goes on all of
+        // them, before any gate (rs/cors `handleActualRequest`: "Always set
+        // Vary"). Set only on a grant, a shared cache could store a response
+        // without CORS headers (no or a refused Origin) and serve it to an
+        // allowed cross-origin page, which the browser then blocks (audit
+        // 2026-10-19 S8-2). The literal `*` does not vary, and `.none`
+        // answers every Origin the same (nothing). On a grant `Vary` follows
+        // `Access-Control-Allow-Origin`, as before (the frozen browser-oracle
+        // answers pin that order).
+        const varies = switch (c.options.allowed_origins) {
+            .none, .any => false,
+            .list, .predicate, .patterns => true,
+        };
+        const acao = grant: {
+            const origin = req.header("Origin") orelse break :grant null;
+            const acao = c.allowOriginValue(origin) orelse break :grant null;
+            // rs/cors gate: an actual method outside allowed_methods gets no
+            // CORS headers either (OPTIONS always passes, see methodTokenAllowed).
+            if (!c.methodTokenAllowed(req.methodName())) break :grant null;
+            break :grant acao;
+        } orelse {
+            if (varies) try res.setHeader("Vary", "Origin");
+            return;
+        };
 
         try res.setHeader("Access-Control-Allow-Origin", acao);
-        // Echoing a specific origin makes the response vary by it; the
-        // literal `*` does not.
-        if (c.options.allowed_origins != .any) try res.setHeader("Vary", "Origin");
+        if (varies) try res.setHeader("Vary", "Origin");
         if (c.options.allow_credentials)
             try res.setHeader("Access-Control-Allow-Credentials", "true");
         if (c.expose_headers_value.len != 0)
@@ -1110,11 +1128,23 @@ test "methodTokenAllowed is case-sensitive, as the browser's check is" {
     try testing.expect(!c.methodTokenAllowed("POST"));
 }
 
-test "actual: Vary is withheld (not just Allow-Origin) when the method gate fails" {
-    // The existing "method outside allowed_methods" test only checks that
-    // Access-Control-Allow-Origin is absent; it never checked Vary
-    // specifically, so a Vary-before-the-method-gate ordering bug would
-    // have gone unnoticed.
+test "actual: a list policy sends Vary: Origin even without an Origin header (audit S8-2)" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/t", ""), &buf);
+    try expectStatus(got, "200");
+    try expectNoCorsHeaders(got);
+    try expectHeaderLine(got, "Vary: Origin");
+}
+
+test "actual: a failed method gate withholds Allow-Origin but still sends Vary: Origin" {
+    // rs/cors sets Vary before every gate; since 2026-10-20 (audit S8-2) so
+    // does this module — the response still depends on Origin.
     var c: Cors = try .init(testing.allocator, .{
         .allowed_origins = .{ .list = &.{"https://app.example"} },
         .allowed_methods = &.{.get},
@@ -1126,7 +1156,8 @@ test "actual: Vary is withheld (not just Allow-Origin) when the method gate fail
 
     const got = runWire(&r, wire("POST", "/t", "Origin: https://app.example\r\n"), &buf);
     try expectStatus(got, "200");
-    try expectNoHeader(got, "Vary");
+    try expectNoHeader(got, "Access-Control-Allow-Origin");
+    try expectHeaderLine(got, "Vary: Origin");
 }
 
 test "preflight: intercepted before 405 and 404 (the global-middleware point)" {
@@ -1382,7 +1413,7 @@ test "actual: disallowed origin / absent Origin / default .none → no CORS head
         const got = runWire(&r, wire("GET", "/t", "Origin: https://evil.example\r\n"), &buf);
         try expectStatus(got, "200");
         try expectNoCorsHeaders(got);
-        try expectNoHeader(got, "Vary");
+        try expectHeaderLine(got, "Vary: Origin"); // audit S8-2: a refusal varies too
         try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nok"));
         try testing.expect(flag.hit);
     }
@@ -1403,6 +1434,7 @@ test "actual: disallowed origin / absent Origin / default .none → no CORS head
         const got = runWire(&r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
         try expectStatus(got, "200");
         try expectNoCorsHeaders(got);
+        try expectNoHeader(got, "Vary"); // nothing varies under .none
     }
 }
 
@@ -1737,7 +1769,8 @@ test "integration: preflight 204 (handler not invoked), allowed GET gets Allow-O
         defer res.deinit();
         try testing.expectEqual(@as(u16, 200), res.status);
         try testing.expect(res.header("access-control-allow-origin") == null);
-        try testing.expect(res.header("vary") == null);
+        // audit S8-2: a refused Origin still varies the response.
+        try testing.expectEqualStrings("Origin", res.header("vary").?);
         try testing.expectEqual(@as(u32, 2), hits.load(.monotonic));
     }
 }

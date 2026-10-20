@@ -26,7 +26,7 @@ allowed (this module's gate), and a response header is readable when exposed
 (`*` only without credentials). The static posture has no gate of its own, so
 only the browser's checks apply to its constant grant.
 
-**What the replay holds** (2026-10-05, Chrome 154.0.8037.97): 504 fetches, every
+**What the replay holds** (re-taken 2026-10-20, Chrome 155.0.8059.84; first 2026-10-05, Chrome 154): 504 fetches, every
 one with Chrome's verdict equal to the model's; the requests Chrome sent, minus
 the headers that carry its identity and version (`User-Agent`, `sec-*`, `Accept*`,
 ...), and the status and `Access-Control-*`/`Vary` fields the middleware
