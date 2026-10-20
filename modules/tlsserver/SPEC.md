@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught) · ct none
+**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught) · ct none
 
 **Performance:** not measured
 
@@ -29,7 +29,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference (P2) for this module's handshake and bulk rows. |
 
 **Where we are ahead:** nothing yet. **Where we are behind:** everything but the record layer —
-this is the first piece of the server (milestone M1, *Backlog*).
+records, the receive side and alerts are the first pieces of the server (milestone M1,
+*Backlog*).
 
 ## What this module is, and what it is not
 
@@ -39,8 +40,9 @@ CertificateVerify, key exchange, transcript) and the collection's AEADs (`aesgcm
 `chachapoly`). It is being built to replace qap's fork of a third-party TLS server, milestone by
 milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 
-**Today it is only the record layer**: the 5-byte header and per-direction in-place record
-protection. There is no handshake, no connection object and nothing that talks to a socket — a
+**Today it is only the record layer**: the 5-byte header, per-direction in-place record
+protection, the receive side (records → whole handshake messages, alerts, application data) and
+alerts. There is no handshake, no connection object and nothing that talks to a socket — a
 reader looking for a usable TLS server will not find one here yet.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
@@ -70,6 +72,35 @@ RFC 8446 §5, record layer over a byte stream:
 
   The AES suites keep an expanded `aesgcm` context per direction, so a record pays no key
   schedule (the fork's per-direction context, which qap measured at 1.6–1.8× std at 16 KiB).
+- **Receive side** (`inbound.Inbound.next`), sans-I/O: takes the received octets, returns one
+  event — a whole handshake message, application data, `peer_closed` or `need_more` — and how
+  many octets it is done with. Protected records are opened in place, so application data is a
+  slice of the caller's buffer; handshake fragments are copied into a `Joiner` (caller's buffer,
+  `Joiner.bufferLen(max_message)`, default cap 64 KiB as in rustls) which joins a message
+  across records and splits several out of one. Rules (RFC 8446 §5; where it names no alert,
+  rustls 0.23's choice):
+
+  | Input | Result |
+  |---|---|
+  | Outer type not 20–23, version not `0x03XX`, empty non-`application_data` record | `decode_error` (header alone) |
+  | Plaintext record > 2^14, protected > 2^14 + 256 | `record_overflow` (header alone) |
+  | Handshake message over the joiner's cap | `decode_error` (its header alone) |
+  | Another record type inside a fragmented handshake message | `unexpected_message` |
+  | Receive key change with any handshake octet held (`installRx`) | `unexpected_message` |
+  | Plaintext `change_cipher_spec` `0x01` after the first ClientHello, before the client Finished, ≤ 2 | dropped |
+  | Any other CCS: before a ClientHello, after Finished, other content, a third one, protected | `unexpected_message` |
+  | Plaintext handshake or application data under a receive key; plaintext application data at all | `unexpected_message` |
+  | Plaintext alert under a receive key after a protected record was opened, or > 2 octets | `unexpected_message` |
+  | Zero-length protected handshake or alert content (§5.4) | `unexpected_message` |
+  | Application data before the engine sets `app_data_ok` (no 0-RTT) | `unexpected_message` |
+  | Alert content not two octets | `decode_error` |
+  | Alert of unknown level | `illegal_parameter` |
+  | Warning other than `close_notify`, `user_canceled` | `decode_error` |
+  | `user_canceled` warning | ignored, 4 per connection, then `unexpected_message` |
+  | `close_notify` after the handshake / before it | `peer_closed` (later octets ignored) / abort, no alert |
+  | Fatal alert | abort, no alert (`peer_alert` holds it) |
+
+  `inbound.alertFor` maps each error to the alert to send (none for the peer's own abort).
 - **In place:** `seal` takes the content at `buf[5..]` and writes type, padding, tag and header
   around it; `open` decrypts over the ciphertext and returns a slice of the same buffer. That is
   the layout qap's zero-copy record codecs read and write.
@@ -90,7 +121,14 @@ HKDF and AES key expansion burn their own 8 KiB below); `seal` / `open` under 4 
 (`burn.record_burn`; AES-GCM in place reaches 1.2–1.4 KiB, ChaCha20-Poly1305 burns its own).
 Measured and held by `src/stackprobe_test.zig` (ReleaseFast).
 
+The receive side branches only on framing values (record types, lengths, the handshake header,
+the alert octets). Decrypted application data stays in the caller's buffer; joined handshake
+messages stay in the joiner's buffer until `Inbound.wipe`, which zeroes every octet the joiner
+ever wrote and the receive key.
+
 ## Limits and refusals
+
+The receive side's refusals are the table under *Wire format*. Record protection:
 
 - `TLSInnerPlaintext` ≤ 2^14 + 1 octets (§5.2): `seal` refuses more (`RecordOverflow`), `open`
   refuses an authentic one that is larger (`RecordOverflow`, the `record_overflow` alert).
@@ -131,10 +169,26 @@ opened under another sequence number is refused, never accepted unless the bytes
 identical, never a panic, and a refused record never advances the sequence number.
 `fuzz harness: record, 300 seeds, reaches every outcome` runs in every test lane.
 
+Harness `tlsserver-inbound`: 1–4 handshake messages (bodies up to 20,000 octets) cut into records
+at random points — short cuts, whole 2^14 records and anything between — plaintext or protected
+under a random suite, with compatibility CCS records at message boundaries and, when protected,
+application data and a close_notify after them, fed to `Inbound.next` in random chunk sizes
+(1–8 octets one time in four). The events must give back exactly the messages, the application
+data and the close; the same stream damaged (a flipped bit, a rewritten header octet,
+truncation, spliced random octets) never panics, and damage that reaches a protected record
+carrying output is never accepted with the genuine output. `fuzz harness: inbound, 300 seeds,
+reaches every outcome` runs in every test lane.
+
 Verdict 2026-10-20: 8 × 1,500,000 runs, ReleaseSafe, clean (~42,000 runs/s per job). Five
 planted mutants caught (schemata, one build): the sequence number left out of the nonce, the
 header left out of the additional data, the sequence advanced on a failed open, the content
 type kept in the content, the record-length check removed (a panic).
+
+Verdict `tlsserver-inbound` 2026-10-20: 4 × 300,000 runs, ReleaseSafe, clean (~5,700 runs/s per
+job). Five planted mutants caught: a whole message held back one octet, the joiner's compaction
+left out, the last record left out of `consumed`, the header kept in the body, the protected
+record limit set to the plaintext one (survived the first harness, which almost never cut a
+whole 2^14 record; whole records are now one cut in eight).
 
 ## What is deliberately not done
 
@@ -148,9 +202,7 @@ type kept in the content, the record-length check removed (a panic).
 
 ## Backlog / deferred
 
-- **M1 (next):** plaintext record framing for the ClientHello (reassembly across records,
-  `legacy_record_version` rules, the compatibility-mode `change_cipher_spec`), alerts and their
-  mapping from errors, the sans-I/O server state machine for the full handshake (x25519 /
+- **M1 (next):** the sans-I/O server state machine for the full handshake (x25519 /
   secp256r1 / secp384r1 / X25519MLKEM768; the three suites; ECDSA P-256/P-384, Ed25519 and
   RSA-PSS certificates; SNI certificate selection; ALPN), the blocking wrapper, a certificate
   and key loader; interop with OpenSSL `s_client`, the Go client and `tlsclient`; the BoGo shim.
