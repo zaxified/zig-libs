@@ -35,6 +35,11 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 ## Design & invariants
 
+**2026-10-20:** the key schedule's code now lives in the `tls13` module
+(`tls13.keyschedule.dtls13`, shared with the planned `tlsserver`);
+`src/keyschedule.zig` is a shim that binds it to the names below (only
+`deriveSequenceNumberKey` is still defined here), and the KATs moved with it.
+
 **STATUS UPDATE (crypto core AND flight engine landed):** the crypto-core
 layer (`keyschedule.zig`, `aead.zig`) is REAL and KAT-validated — the 15
 functions below are implemented (see each file's tests + `root.zig`'s module

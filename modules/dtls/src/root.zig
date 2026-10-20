@@ -385,7 +385,7 @@ pub const meta = .{
     // OpenSSL-anchored differential oracle.
     // The PSK-only flight engine itself still needs no sibling modules,
     // see the "meta.deps" test below.
-    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm" }, // aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
+    .deps = .{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, // tls13: the key schedule (keyschedule.zig is a shim since 2026-10-20); aesgcm: Connection.zig's AES-128-GCM suite (std AES-GCM is 2.6x slower on Zig 0.17, #36256)
 };
 
 // ── dark-tests aggregator (CONVENTIONS.md §6 step 3) ────────────────────
@@ -414,12 +414,13 @@ test {
     _ = @import("stackprobe2_test.zig");
 }
 
-test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites; the PSK flight engine itself needs no sibling modules)" {
-    try std.testing.expectEqual(@as(usize, 4), meta.deps.len);
+test "meta.deps is {\"rsa\", \"x509\", \"chachapoly\", \"aesgcm\", \"tls13\"} (certverify.zig's RSASSA-PSS dispatch + certauth.zig's cert parsing + Connection.zig's ChaCha20-Poly1305 and AES-128-GCM suites + the shared key schedule; the PSK flight engine itself needs no other sibling modules)" {
+    try std.testing.expectEqual(@as(usize, 5), meta.deps.len);
     try std.testing.expectEqualStrings("rsa", meta.deps[0]);
     try std.testing.expectEqualStrings("x509", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[3]);
+    try std.testing.expectEqualStrings("tls13", meta.deps[4]);
 }
 
 test "keyschedule.hkdfExpandLabel: uses the DTLS \"dtls13\" prefix (RFC 9147 §5.9)" {

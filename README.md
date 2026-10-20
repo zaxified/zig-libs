@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 249 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 250 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -285,7 +285,7 @@ those crypto and format modules are yours too without going looking.
 | `web` | 36 | [`netaddr`](modules/netaddr/README.md) (net) · [`zstd`](modules/zstd/README.md) (format) · [`entropy`](modules/entropy/README.md) (crypto) · [`rsa`](modules/rsa/README.md) (crypto) · [`regex`](modules/regex/README.md) (format) · [`protobuf`](modules/protobuf/README.md) (format) · [`p256`](modules/p256/README.md) (crypto) |
 | `net` | 75 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
 | `storage` | 15 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
-| `crypto` | 85 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
+| `crypto` | 86 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
 | `format` | 25 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 13 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
@@ -297,7 +297,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 249 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 249 modules — a linux64-only module has nothing further to show here.
+Every one of the 250 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 250 modules — a linux64-only module has nothing further to show here.
 
 40 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 43 declared pairs, 42 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -573,7 +573,7 @@ way to recognise it.
 | [`decaf448`](modules/decaf448/README.md) | 3 (S,P) | decaf448 prime-order group (RFC 9496) over `ed448` — eliminates cofactor-4 pitfalls for threshold signing, VRFs, anonymous credentials. | any | ed448 |
 | [`dkg`](modules/dkg/README.md) | 4 (S,E) | Dealer-free Distributed Key Generation (GJKR) for `threshold_ecdsa` — bias-resistant secp256k1 key sharing feeding threshold signing. | any | threshold_ecdsa, paillier |
 | [`drand`](modules/drand/README.md) | 3 (S,P) | drand randomness-beacon client — chain-info and round codec, BLS-verifies a round signature against the chain public key. Transport-agnostic. | any | bls12_381, tlock |
-| [`dtls`](modules/dtls/README.md) | 4 (S) | DTLS 1.3 (RFC 9147), PSK mode — key schedule, AEAD record layer, handshake fragmentation/reassembly, anti-replay window. | any | rsa, x509, chachapoly, aesgcm |
+| [`dtls`](modules/dtls/README.md) | 4 (S) | DTLS 1.3 (RFC 9147), PSK mode — key schedule, AEAD record layer, handshake fragmentation/reassembly, anti-replay window. | any | rsa, x509, chachapoly, aesgcm, tls13 |
 | [`ecvrf`](modules/ecvrf/README.md) | 3 (S,P) | ECVRF-EDWARDS25519-SHA512-TAI (RFC 9381 Verifiable Random Function) — prove/verify a deterministic, unbiasable output under a public key. | any | ct25519 |
 | [`ed448`](modules/ed448/README.md) | 4 (P) | Ed448 + X448 — the 448-bit "Goldilocks" curve (RFC 8032 + RFC 7748): constant-time X448 DH and Ed448/Ed448ph EdDSA signing. | any | entropy |
 | [`entropy`](modules/entropy/README.md) | 2 (S,E,A,P) | Fail-closed entropy source — `fill` draws from the kernel CRNG (vDSO `getrandom` under std's Threaded Io on Linux, else `std.Io.randomSecure`) or aborts the process; no generator, no silent degrade. **Panics on failure.** | any | — |
@@ -623,6 +623,7 @@ way to recognise it.
 | [`threshold_ecdsa`](modules/threshold_ecdsa/README.md) | 3 (S,E,P) | GG20 threshold ECDSA over secp256k1 (t-of-n) — dealer keygen, per-signer presigning state machine with identifiable abort, one-round online signing; standard verifiable ECDSA sigs. **Audit warranted before production use.** | any | paillier, montint |
 | [`timelock_envelope`](modules/timelock_envelope/README.md) | 3 (S,E,P) | Hybrid sealed envelope — unlocks only once both a drand timelock round publishes AND the recipient holds the PQ-KEM secret; AEAD-sealed content. | any | tlock, hqc, chachapoly, entropy |
 | [`tlock`](modules/tlock/README.md) | 3 (S,P) | drand-style timelock encryption (Boneh-Franklin IBE over `bls12_381`) — encrypt to a future drand round; decryptable once it publishes. Not post-quantum. | any | bls12_381, entropy, chachapoly |
+| [`tls13`](modules/tls13/README.md) | 4? (A,H) | TLS 1.3 handshake building blocks shared by the TLS-family engines: the RFC 8446 §7.1 key schedule for TLS 1.3 and DTLS 1.3 labels (resumption, exporter and KeyUpdate steps included) | any (pure computation) | — |
 | [`tlsclient`](modules/tlsclient/README.md) | 2 (S,E,A,P) | std's TLS 1.3/1.2 client with the server chain verified by RFC 5280 (x509.verifyChain) — closes ziglang/zig #35877 — grown to Go crypto/tls client parity: Go's defaults (2 key shares + HelloRetryRequest, OCSP/SCT, EMS), client certificates incl. RSA and TLS 1.2, session view + verification hook, exporter, TLS 1.3 resumption. | any | x509, p256, p384, p521, rsa, tlsresume |
 | [`tlsresume`](modules/tlsresume/README.md) | 2 (S,E,A,P) | Server-side TLS 1.3 session-ticket resumption (RFC 8446) — ticket seal/open, PSK binder derivation, 0-RTT early-data key schedule. | any | aesgcm |
 | [`vdf`](modules/vdf/README.md) | 4 (S,E) | Wesolowski Verifiable Delay Function over an RSA hidden-order group — sequential-squaring delay with prove/verify. A caller-supplied modulus needs a trusted setup. | any | montint |
