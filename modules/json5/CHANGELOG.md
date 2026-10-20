@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `stringify` (S2 R3): a JSON5 writer — `writeValue` (a `std.json.Value`) and
+  `write` (any Zig value, the `std.json.Stringify` type mapping), `Options{indent, quote: auto/double/
+  single, unquoted_keys, trailing_commas}`. Quoting and layout ported from json5/json5 v2.2.3
+  `lib/stringify.js` (NOTICE); 50 goldens captured from json5@2.2.3 under bun, all byte-identical, each
+  round-tripped through `preprocess` + `std.json`. Additive.
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-17** — **BEHAVIOURAL:** `Diagnostic` gains `col` (1-based, bytes), `offset` and `len`

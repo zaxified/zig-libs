@@ -6,6 +6,10 @@
 
 const std = @import("std");
 
+/// JSON5 writer (the other direction): `stringify.writeValue(w, value, opts)`
+/// for a `std.json.Value`, `stringify.write(w, anytype, opts)` for a Zig value.
+pub const stringify = @import("stringify.zig");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
@@ -2117,6 +2121,7 @@ const jsonParses = fz.jsonParses;
 // ── external anchor: json5/json5-tests corpus ───────────────────────────────
 // See json5_tests_test.zig / json5_tests_vectors.zig / NOTICE.
 test {
+    _ = stringify;
     _ = @import("fuzz_test.zig");
     _ = @import("json5_tests_vectors.zig");
     _ = @import("json5_tests_test.zig");

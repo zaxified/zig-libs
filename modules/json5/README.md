@@ -63,7 +63,8 @@ defer alloc.free(q);
   whitespace and string-escape form (`\v`, `\0`, `\xHH`, escaped non-escape characters);
   see below for what is deferred.
 
-Provenance: original work of the zig-libs authors (MIT). The
+Provenance: original work of the zig-libs authors (MIT), except `src/stringify.zig`
+(quoting/layout ported from json5/json5 v2.2.3, MIT — see NOTICE). The
 conformance test suite additionally vendors the official `json5/json5-tests`
 fixture corpus (test data only, no source code) — see NOTICE. DATA:
 `src/ref_oracle_vectors.zig` holds the verdicts of the reference `json5`
