@@ -164,6 +164,28 @@ stdout cannot hold the return past the grace, and an unrequested token changes n
 
 ## Backlog / deferred
 
+**S2 plan — survey 2026-10-20** (Sonnet, read-only; Python subprocess, Go os/exec, Rust std::process, duct,
+libuv, Zig std.process). Main finding: on Zig 0.17 the "NOT POSSIBLE" items below are stale — std's
+`SpawnOptions.inherit_files`/`inherit_dirs` clear CLOEXEC after fork (Python's own `pass_fds` mechanism)
+and `uid`/`gid` exist.
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | `Spec.pass_fds` via std's `inherit_files` (same fd number in the child, as Python) | S | do; correct this SPEC's "impossible" text |
+| R2 | `uid`/`gid` pass-through | S | do; document that supplementary groups are NOT dropped (std has no setgroups — Python's `user=` without `extra_groups` behaves the same) |
+| R3 | Default stdin `.close` → `/dev/null` (Go's default; a closed fd 0 is reused by the child's first open) | S | do — breaking default, no consumer relies on it (bxp, ttydesk set stdin) |
+| R4 | Core-dump flag next to `Term` | S | do |
+| — | `rusage` via std's `request_resource_usage_statistics` | S | do |
+| R10 | pidfd signalling (PID-reuse window) | M | do if time allows |
+| R6/R8 | `setsid`, PDEATHSIG | – | not doing — std has no pre-exec hook; `new_process_group` + group kill covers the clean case |
+| R5/R7/R9/R11/R13 | PATH policy, umask, close_fds walk, pipelines, pty | – | not doing (reasons in the survey) |
+| R14 | Windows parity tests | M | out of scope without a Windows runner |
+
+Evidence plan (E3 → E2): a scenario table run through procrun and through Python `subprocess` (and Go for
+signals/fds) comparing exit/signal, captured bytes (SHA-256), env seen by the child, cwd, `/proc/self/fd`,
+process groups, timeouts; invariants: no zombie, no fd/thread leak. Bench: Go os/exec as the reference,
+Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB capture, cat round trip.
+
 - ~~**Graceful cancellation**~~ — DONE 2026-09-29. `Spec.cancel_grace_ns: ?u64` (default null =
   SIGKILL at once, unchanged): on `Cancel.request` or the `runTimeout` deadline the killer thread
   sends SIGTERM (to `-pgid` with `new_process_group`), polls every 5 ms for the direct child to
