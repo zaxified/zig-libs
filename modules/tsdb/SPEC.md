@@ -483,7 +483,7 @@ also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
 | R1 | `maintain(now, policy)` = compact + sweep + budget, and say consumers must run it | S | do |
 | R2 | Label matchers `!=`, `=~`, `!~` (scan-based first; the 0x04 postings partition only if series counts grow) | S→M | do (scan-based) |
 | R3 | `labelNames` / `labelValues` listing | S | do |
-| R4 | WAL + in-memory head (Prometheus' durability model) | L | **owner question** — the P axis depends on it (durable commit = 2 fsyncs) |
+| R4 | WAL + in-memory head (Prometheus' durability model) | L | not doing — **owner 2026-10-20:** the speed reference for P is aidlx/tsink (Rust, MIT) with its WAL synced per append, the like-for-like durable mode; Prometheus stays the scope reference, its number informative |
 | R5 | Per-bucket min/max/sum/count/last read helper over `Range` | S | do (downsampling storage: nobody in the reference layer) |
 | R6 | Cardinality limit `Options.max_series` → `error.TooManySeries`, bounded series cache | S | do |
 | R8 | Thread-safe `Db` (cache sync); readers already MVCC | M | document single-owner; later |
