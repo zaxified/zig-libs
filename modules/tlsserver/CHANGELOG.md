@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `Connection`, the blocking wrapper over `std.Io.Reader`/`Writer` (in-place
+  records in the reader's buffer). Interop with OpenSSL 3.5 `s_client` (`tools/interop.zig`:
+  P-256, Ed25519 and RSA-PSS certificates, all suites, X25519MLKEM768/X25519/secp256r1, ALPN, no
+  SNI), its sessions replayed byte-exact in the tests. **BEHAVIOURAL, not breaking:** a failure
+  wipes every key and secret at once; `close` keeps the connection readable;
+  `max_records_per_key` (2^23) ends a connection that has not rekeyed (no KeyUpdate yet); two
+  compatibility CCS records are no longer accepted with one ClientHello; `test_fixtures`
+  exports the test certificates.
 - **2026-10-20** — The server: `Server` (sans-I/O full TLS 1.3 handshake with a certificate,
   then application data and close_notify), `Config` (fixed certificate or a `CertificateSelector`
   by SNI, enabled suites and groups, ALPN, the CSPRNG), `CertifiedKey`, `minOutputLen`. Negotiation

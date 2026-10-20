@@ -206,7 +206,9 @@ pub const Inbound = struct {
     /// close_notify are accepted, compatibility CCS no longer is.
     app_data_ok: bool = false,
     closed: bool = false,
-    ccs_left: u8 = max_compat_ccs,
+    /// One compatibility CCS per ClientHello the engine can accept: set to
+    /// `max_compat_ccs` once HelloRetryRequest exists (M2).
+    ccs_left: u8 = 1,
     warnings: u8 = 0,
     /// The description of the alert behind `error.PeerAborted`.
     peer_alert: ?alert.Description = null,
@@ -493,6 +495,7 @@ test "compatibility CCS: dropped after a ClientHello, refused before, malformed 
     s.plain(.change_cipher_spec, &.{1});
     const two_ccs = s.len;
     s.plain(.change_cipher_spec, &.{1});
+    in.ccs_left = max_compat_ccs;
     const r = try in.next(s.bytes());
     try expectHandshake(r, 1, "hello");
     // Two dropped silently...

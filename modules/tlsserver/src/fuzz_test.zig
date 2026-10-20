@@ -385,6 +385,8 @@ fn fuzzInbound(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void 
             // The first message plays the ClientHello for CCS purposes.
             in.handshake_seen = true;
             in.app_data_ok = ok;
+            // The harness sends up to two (the budget once HRR exists).
+            in.ccs_left = inbound.max_compat_ccs;
             if (p) try in.installRx(s, sec);
             return in;
         }

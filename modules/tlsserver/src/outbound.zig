@@ -118,6 +118,12 @@ pub const Outbound = struct {
         self.protected = true;
     }
 
+    /// Zero the send key; records already framed stay pending.
+    pub fn wipeKey(self: *Outbound) void {
+        if (self.protected) self.tx.wipe();
+        self.protected = false;
+    }
+
     /// Zero the send key and every octet of the buffer.
     pub fn wipe(self: *Outbound) void {
         if (self.protected) self.tx.wipe();

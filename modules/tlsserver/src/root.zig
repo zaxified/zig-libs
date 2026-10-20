@@ -7,8 +7,8 @@
 //! handshake with a certificate (TLS_AES_128_GCM_SHA256,
 //! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
 //! X25519, secp256r1), then application data — no HelloRetryRequest,
-//! resumption, client certificates or KeyUpdate yet — over the record layer,
-//! the ClientHello decoder and the message encoders.
+//! resumption, client certificates or KeyUpdate yet — and `Connection`, the
+//! blocking wrapper. Interoperates with OpenSSL 3.5's s_client.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
 
@@ -54,6 +54,16 @@ pub const Server = server.Server;
 pub const Config = server.Config;
 pub const CertifiedKey = server.CertifiedKey;
 
+/// The blocking wrapper over a `std.Io.Reader` / `Writer` pair.
+pub const connection = @import("connection.zig");
+pub const Connection = connection.Connection;
+
+/// TEST certificates and private keys (self-signed, CN=tlsserver-test, SAN
+/// localhost: ECDSA P-256, Ed25519, RSA-2048), published for this module's
+/// interop program and for consumers' own tests. The keys are public:
+/// never serve anything real with them.
+pub const test_fixtures = @import("test_certs.zig");
+
 test {
     _ = record;
     _ = alert;
@@ -62,7 +72,9 @@ test {
     _ = hello;
     _ = messages;
     _ = server;
+    _ = connection;
     _ = @import("handshake_test.zig");
+    _ = @import("interop_replay_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
 }

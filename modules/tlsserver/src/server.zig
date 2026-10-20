@@ -87,6 +87,11 @@ pub const Config = struct {
     random: std.Random,
 };
 
+/// Records sealed under one send key before the connection must stop
+/// (RFC 8446 §5.5: AES-GCM's limit is 2^24.5 full records; qap rekeys at
+/// 2^23, which is the bound here until KeyUpdate arrives in M2).
+pub const max_records_per_key: u64 = 1 << 23;
+
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group };
 
@@ -107,6 +112,9 @@ pub const Error = inbound.Error || error{
     Closed,
     /// Application data before the handshake completed.
     NotConnected,
+    /// The send key sealed `max_records_per_key` records and there is no
+    /// KeyUpdate yet (M2): the connection ends with close_notify.
+    KeyLimitReached,
 };
 
 /// The alert a failure sends (null: none — the peer aborted, or the
@@ -121,6 +129,8 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.NoApplicationProtocol => .no_application_protocol,
         error.InternalError => .internal_error,
         error.OutputFull, error.Closed, error.NotConnected => null,
+        // Not the peer's fault, and no alert names it: close politely.
+        error.KeyLimitReached => .close_notify,
         else => |e| inbound.alertFor(@errorCast(e)),
     };
 }
@@ -189,6 +199,10 @@ pub const Server = struct {
     out: outbound.Outbound,
     state: State = .client_hello,
     suite: record.CipherSuite = undefined,
+    /// `suite` has been chosen (the ClientHello got that far).
+    has_suite: bool = false,
+    /// close_notify sent: no more writes, reading goes on.
+    write_closed: bool = false,
     transcript: Transcript = undefined,
     /// Secrets of the schedule, `suite.hashLen()` octets each. The
     /// handshake ones are wiped once the client's Finished is verified.
@@ -237,7 +251,7 @@ pub const Server = struct {
     }
 
     pub fn cipherSuite(self: *const Server) ?record.CipherSuite {
-        return if (self.state == .client_hello) null else self.suite;
+        return if (self.has_suite) self.suite else null;
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -281,6 +295,10 @@ pub const Server = struct {
             .failed => return error.Closed,
             else => return error.NotConnected,
         }
+        if (self.write_closed) return error.Closed;
+        // RFC 8446 §5.5: an AEAD key must be retired well before its usage
+        // limit. Until KeyUpdate exists (M2) the connection ends instead.
+        if (self.out.tx.seq >= max_records_per_key) return self.fail(error.KeyLimitReached);
         var done: usize = 0;
         while (done < data.len) {
             const s = self.out.slot();
@@ -294,18 +312,31 @@ pub const Server = struct {
         return done;
     }
 
-    /// Queue close_notify. Nothing more can be written afterwards.
+    /// Queue close_notify. Nothing more can be written afterwards; the
+    /// client's remaining data and its close_notify can still be read.
     pub fn close(self: *Server) Error!void {
-        if (self.state == .failed) return error.Closed;
+        if (self.state == .failed or self.write_closed) return error.Closed;
         self.out.write(.alert, &alert.Alert.close_notify.encode()) catch {};
-        self.state = .failed;
+        self.write_closed = true;
+        self.out.wipeKey();
     }
 
+    /// Queue the error's alert, then wipe every key and secret (the queued
+    /// records stay for the caller to send).
     fn fail(self: *Server, err: anyerror) Error {
         const e: Error = @errorCast(err);
         if (self.state != .failed) {
-            if (alertFor(e)) |d| self.out.write(.alert, &alert.Alert.fatal(d).encode()) catch {};
+            if (!self.write_closed) if (alertFor(e)) |d| {
+                const a: alert.Alert = if (d == .close_notify) .close_notify else .fatal(d);
+                self.out.write(.alert, &a.encode()) catch {};
+            };
             self.state = .failed;
+            self.out.wipeKey();
+            self.inbound.wipe();
+            self.wipeHandshakeSecrets();
+            std.crypto.secureZero(u8, &self.master_secret);
+            std.crypto.secureZero(u8, &self.client_application_secret);
+            std.crypto.secureZero(u8, &self.server_application_secret);
         }
         return e;
     }
@@ -357,7 +388,7 @@ pub const Server = struct {
         var cs = ch.cipherSuites();
         const suite: record.CipherSuite = while (cs.next()) |c| {
             const cand: record.CipherSuite = @fromBackingInt(c);
-            if (std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) break cand;
+            if (cand.hashLen() != null and std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) break cand;
         } else return error.HandshakeFailure;
         var gs = ch.supportedGroups() orelse return error.HandshakeFailure;
         const group: u16 = while (gs.next()) |g| {
@@ -395,9 +426,16 @@ pub const Server = struct {
 
         var ex: kex.ServerExchange = undefined;
         defer std.crypto.secureZero(u8, &ex.shared.bytes);
-        kex.serverExchange(group, client_share, cfg.random, &ex) catch return error.IllegalParameter;
+        // A share that does not exchange (wrong length, low order, off the
+        // curve) is the peer's fault; a group this build cannot compute
+        // being enabled is the configuration's.
+        kex.serverExchange(group, client_share, cfg.random, &ex) catch |err| return switch (err) {
+            error.KeyExchangeFailed => error.IllegalParameter,
+            error.MissingKeyShare => if (kex.expectedShareLen(group) != 0) error.IllegalParameter else error.InternalError,
+        };
 
         self.suite = suite;
+        self.has_suite = true;
         switch (suite) {
             .aes_256_gcm_sha384 => {
                 self.transcript = .{ .sha384 = .{} };
@@ -870,4 +908,34 @@ test "alertFor covers every error" {
     inline for (@typeInfo(Error).error_set.error_names.?) |name| {
         _ = alertFor(@field(anyerror, name));
     }
+}
+
+test "after a refusal every secret is wiped; the suite is unknown if it was not chosen" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .groups = &.{0x0100} });
+    defer testing.allocator.free(rec);
+    try testing.expectError(error.HandshakeFailure, s.feed(rec));
+    try testing.expectEqual(@as(?record.CipherSuite, null), s.cipherSuite());
+
+    // Refused after the keys exist: a bad Finished.
+    var s2: Server = .init(&cfg, &joiner, &out);
+    defer s2.deinit();
+    const ok = try buildRecord(testing.allocator, .{});
+    defer testing.allocator.free(ok);
+    _ = try s2.feed(ok);
+    var tx: record.Protection = undefined;
+    try tx.init(.aes_128_gcm_sha256, s2.client_handshake_secret[0..32]);
+    var buf: [128]u8 = undefined;
+    const fin = [_]u8{ 20, 0, 0, 32 } ++ @as([32]u8, @splat(0xee));
+    @memcpy(buf[5..][0..fin.len], &fin);
+    try testing.expectError(error.DecryptError, s2.feed(try tx.seal(&buf, fin.len, .handshake, 0)));
+    for ([_][]const u8{ &s2.handshake_secret, &s2.client_handshake_secret, &s2.master_secret, &s2.client_application_secret, &s2.server_application_secret }) |sec|
+        for (sec) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expect(!s2.out.protected and !s2.inbound.protected);
+    try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, s2.cipherSuite().?);
 }
