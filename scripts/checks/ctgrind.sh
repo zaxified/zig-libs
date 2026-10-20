@@ -317,7 +317,7 @@ declare -A TARGETS=(
     [dnp3]="mac keys"
     # ── 2026-10-10: ct-wave: SNMPv3 USM password, auth + priv keys ──
     [snmp]="kdf auth aes des"
-    [aes192]="enc dec"
+    [aes192]="enc dec bitsliced"
     # ── 2026-10-10: p521 (NIST P-521): mul/keygen/sign/ecdh claims + the vartime positive control ──
     [p521]="mul keygen sign ecdh vartime"
     # ── 2026-10-13: p384 (NIST P-384): mul/keygen/sign/ecdh claims + the vartime positive control ──
@@ -756,8 +756,9 @@ declare -A PATTERN=(
     # aes192 (2026-10-10): own key expansion + std's round primitive. std's AES
     # files are named on purpose -- the rounds ARE this module's rounds, on
     # whichever backend the build's CPU selects (skylake here: aesni.zig).
-    [aes192/enc]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig|modes[.]zig'
-    [aes192/dec]='root[.]zig|burn[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig'
+    [aes192/enc]='root[.]zig|burn[.]zig|bitsliced[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig|modes[.]zig'
+    [aes192/dec]='root[.]zig|burn[.]zig|bitsliced[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|armcrypto[.]zig'
+    [aes192/bitsliced]='root[.]zig|bitsliced[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig'
     # p521 (2026-10-10): the module's own files, plus std's HMAC/SHA-2 for the
     # RFC 6979 DRBG on the sign path -- that HMAC is this module's nonce
     # derivation, so its contexts are this module's.
@@ -1033,6 +1034,7 @@ declare -A LABEL=(
     [snmp/des]='snmp DES-CBC priv round trip (key+PDU tainted)'
     [aes192/enc]='aes192 init/encrypt/wide/xor/modes.ctr (key+plaintext tainted)'
     [aes192/dec]='aes192 initDec/initFromEnc/decrypt/wide (key+ciphertext tainted)'
+    [aes192/bitsliced]='aes192 bitsliced packKeys/encrypt/decrypt, 12 rounds (key+batch tainted)'
     [p521/mul]='p521 mulInto, non-base point (scalar tainted)'
     [p384/mul]='p384 mulInto, non-base point (scalar tainted)'
     [p521/keygen]='p521 KeyPair.fromSecretKeyInto (d tainted)'

@@ -7,15 +7,16 @@ family with the same declarations — `key_bits`, `rounds`, `block`, `initEnc`, 
 contexts with `encrypt`/`xor`/`encryptWide`/`xorWide`/`decrypt`/`decryptWide` — so code written
 generically over std's `Aes128`/`Aes256` (including `std.crypto.core.modes.ctr`) takes
 `Aes192` unchanged. Only the key expansion (FIPS-197 §5.2, Nk = 6, Nr = 12) is new; every round
-runs on std's own primitive for the target: AES-NI on amd64, ARMv8 Crypto on arm64, std's
-software path elsewhere.
+runs on std's own code for the target: AES-NI on amd64, ARMv8 Crypto on arm64, and elsewhere
+std 0.17's bitsliced (constant-time) core, copied in because std does not export it.
 
 - **Model after:** FIPS-197 §5.2, and std's `Aes128`/`Aes256` API shape.
 - **Platform:** any (hardware AES via std where the target has it, software otherwise).
   **Role:** crypto primitive. **Concurrency:** reentrant. **Deps:** none (`std.crypto.core.aes`).
 
 Provenance: original work of the zig-libs authors (MIT), written from FIPS-197 — a public
-standard, not a copyrightable work. The test vectors are NIST's (FIPS-197 appendices, CAVP
+standard, not a copyrightable work — except `src/bitsliced.zig`, a copy of Zig 0.17.0's
+`lib/std/crypto/aes/bitsliced.zig` (MIT, Zig contributors; terms in `NOTICE`). The test vectors are NIST's (FIPS-197 appendices, CAVP
 AESAVS, SP 800-38A; US Government works). See `SPEC.md`.
 
 ## Usage
@@ -87,13 +88,15 @@ pub const Aes192DecryptCtx = struct {   // = std's AesDecryptCtx(Aes) shape
 A context holds the round keys — the key, in effect. It is never written after `init`, so one
 context may be shared by threads; call `wipe` when the key is retired (nothing else clears it).
 
-Without hardware AES (`has_hardware_support == false`) the rounds are std's table-based
-software path with cache-line masking: not constant time against a co-located cache attacker.
-⚠ On Zig 0.17 this is **weaker than std's own `Aes128`/`Aes256`**, whose software contexts are
-bitsliced (constant time) unless `side_channels_mitigations == .none`. 0.17 falls back to
-software on x86-64 without AES-NI *or without AVX* (Atom-class router CPUs, `-Dcpu=baseline`),
-arm64 without the Crypto Extensions (e.g. Cortex-A72), and every other architecture. See
-`SPEC.md`, *Constant-time contract* and *Backlog / deferred*.
+Without hardware AES (`has_hardware_support == false`) the rounds are bitsliced — no
+secret-dependent memory access — exactly as std 0.17's own `Aes128`/`Aes256` software contexts,
+unless `side_channels_mitigations == .none` (then std's unmasked tables, as std). 0.17 falls back
+to software on x86-64 without AES-NI *or without AVX* (Atom-class router CPUs,
+`-Dcpu=baseline`), arm64 without the Crypto Extensions (e.g. Cortex-A72), and every other
+architecture. One context then also carries the 13 packed round keys (3.3 KiB on 64-bit), and a
+single-block call costs a whole bitsliced batch, as in std. The key expansion keeps std's
+masked S-box (std's own software key expansion does the same). See `SPEC.md`, *Constant-time
+contract*.
 
 ## Tests
 

@@ -16,11 +16,20 @@
 //!  * `dec` — the key and four ciphertext blocks tainted: `initDec`,
 //!    `initDecInto`, `initFromEnc` (the InvMixColumns of the schedule),
 //!    `decrypt` and `decryptWide(4)`.
+//!  * `bitsliced` — the key and one full batch of plaintext tainted: the
+//!    round keys packed (`bitsliced.zig` `Wide.packKeys`, what the contexts
+//!    do at `init` without AES hardware), then `Wide.encrypt(12, …)` and
+//!    `Wide.decrypt(12, …)` over the batch — the rounds every context call
+//!    runs on the software backend (`root.zig` `bitslicedBlocks` adds only
+//!    two `@memcpy`s around them).
 //!
-//! Which backend is measured is the build's CPU: `ctgrind.sh` pins
-//! `-Dcpu=skylake` (AES-NI). `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh
-//! aes192` measures std's software path instead (SPEC.md records the result;
-//! not a pinned row, because the script pins one CPU for every module).
+//! Which backend `enc`/`dec` measure is the build's CPU: `ctgrind.sh` pins
+//! `-Dcpu=skylake` (AES-NI). The bitsliced core is plain integer code, so the
+//! `bitsliced` row measures it on that same pinned CPU; that is why it is a
+//! target of its own rather than an `enc`/`dec` run under
+//! `CTGRIND_CPU=x86_64`, where the key expansion (std's masked S-box
+//! through `subWord`, level with std's own soft `expandKey`) adds loads the
+//! rounds no longer have (SPEC.md, *Constant-time contract*).
 //!
 //! ## The propagation witness
 //!
@@ -31,8 +40,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const aes192 = @import("root.zig");
+const bitsliced = @import("bitsliced.zig");
 
-const Target = enum { enc, dec };
+const Target = enum { enc, dec, bitsliced };
 const Taint = enum { yes, no };
 
 fn secretBytes(comptime n: usize, label: []const u8) [n]u8 {
@@ -93,6 +103,27 @@ fn runDec(t: Taint) void {
     print(&out);
 }
 
+fn runBitsliced(t: Taint) void {
+    var key = secretBytes(24, "ctgrind-aes192-key-v1");
+    var data: [bitsliced.width * 16]u8 = undefined;
+    for (0..bitsliced.width) |i| {
+        var label = "ctgrind-aes192-bs-v1-00".*;
+        label[label.len - 2] = '0' + @as(u8, @intCast(i / 10));
+        label[label.len - 1] = '0' + @as(u8, @intCast(i % 10));
+        data[i * 16 ..][0..16].* = secretBytes(16, &label);
+    }
+    if (t == .yes) {
+        std.valgrind.memcheck.makeMemUndefined(&key);
+        std.valgrind.memcheck.makeMemUndefined(&data);
+    }
+    const ctx = aes192.Aes192.initEnc(key);
+    const keys = bitsliced.Wide.packKeys(ctx.key_schedule.round_keys[0..]);
+    bitsliced.Wide.encrypt(aes192.rounds, &keys, &data);
+    print(&data);
+    bitsliced.Wide.decrypt(aes192.rounds, &keys, &data);
+    print(&data);
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var it = init.args.iterate();
     _ = it.next(); // argv[0]
@@ -105,5 +136,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     switch (target) {
         .enc => runEnc(taint),
         .dec => runDec(taint),
+        .bitsliced => runBitsliced(taint),
     }
 }

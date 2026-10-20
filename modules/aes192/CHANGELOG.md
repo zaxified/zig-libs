@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **Security fix:** without AES hardware (x86-64 without AES-NI or AVX,
+  arm64 without the Crypto Extensions, other architectures) the rounds now run on std 0.17's
+  bitsliced constant-time core (`src/bitsliced.zig`, a copy — std keeps it private) whenever
+  `side_channels_mitigations != .none`, as std's own `Aes128`/`Aes256` do; until now they were
+  std's cache-line-masked table lookups (audit 2026-10-19, O5-1). Same API and outputs; on that
+  backend a context also carries the 13 packed round keys (`packed_keys`, 3.3 KiB on 64-bit,
+  cleared by `wipe`), the init burn is 8 KiB, and a one-block call costs a 16-block batch, as in
+  std. Hardware backends unchanged (identical ctgrind output digests). Evidence: suite, stack
+  probe and 200 000-run model fuzz on `-Dcpu=x86_64`; new ctgrind row `bitsliced` 0 in-file;
+  consumers aesgcm/aeskw/aescbc green on `-Dcpu=x86_64`. New `NOTICE` (Zig's MIT terms).
+
 - **2026-10-19** — **Fix:** Docs (security claim): the *Constant-time contract* said the
   software backend has "exactly std's `Aes128`/`Aes256` posture, no worse" and that neither std
   nor this module has a bitsliced AES; the 2026-10-18 entry below said this was re-checked on

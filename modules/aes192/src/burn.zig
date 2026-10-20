@@ -34,6 +34,12 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
+const std = @import("std");
+
 /// Key expansion: once per key, a 208-byte word array plus the schedule, so a
-/// tight burn. `stackprobe_test.zig` measures it in ReleaseFast.
-pub const schedule_burn = 512;
+/// tight burn. On the bitsliced backend (`root.zig`, `bitsliced_rounds`) the
+/// body also packs the 13 round keys (3328 B on 64-bit, built by value in
+/// `bitsliced.zig`'s `packKeys`): 7071 B dirtied, ReleaseFast `-Dcpu=x86_64`,
+/// 2026-10-20. `stackprobe_test.zig` measures both in ReleaseFast.
+pub const schedule_burn = if (!std.crypto.core.aes.has_hardware_support and
+    std.options.side_channels_mitigations != .none) 8192 else 512;

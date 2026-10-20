@@ -5,11 +5,13 @@
 //! only), shaped exactly like std's two so a mode written generically over
 //! them takes this one unchanged.
 //!
-//! Only the key expansion is new. The rounds are std's own block primitive,
-//! `std.crypto.core.aes.Block` — AES-NI on amd64, the ARMv8 Crypto Extensions
-//! on arm64, std's table-based software path everywhere else — so the
-//! per-block code and its constant-time posture are std's, chosen at compile
-//! time by the same switch that chooses them for `Aes128`/`Aes256`.
+//! Only the key expansion is new. The rounds are std's own: the block
+//! primitive `std.crypto.core.aes.Block` on AES-NI (amd64) and the ARMv8
+//! Crypto Extensions (arm64), and without AES hardware std 0.17's bitsliced
+//! core (`bitsliced.zig`, a copy — std does not export it) whenever
+//! `std.options.side_channels_mitigations != .none`, exactly as std's own
+//! `Aes128`/`Aes256` contexts choose. So the per-block code and its
+//! constant-time posture are std's for every backend.
 //!
 //! The key expansion (FIPS-197 §5.2) needs SubWord on secret words. It owns
 //! no S-box: `subWord` runs the word through std's `Block.encryptLast` with a
@@ -26,13 +28,14 @@
 const std = @import("std");
 const aes = std.crypto.core.aes;
 const burn = @import("burn.zig");
+const bitsliced = @import("bitsliced.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "AES-192 block cipher (FIPS-197 Nk=6/Nr=12) on std's AES-NI / ARMv8 / software round primitive, shaped like std's Aes128/Aes256 so modes can be generic over it",
+    .doc = "AES-192 block cipher (FIPS-197 Nk=6/Nr=12) on std's AES-NI / ARMv8 rounds or std 0.17's bitsliced constant-time core, shaped like std's Aes128/Aes256 so modes can be generic over it",
     // Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "any (AES-NI / ARMv8 Crypto via std, software fallback)",
+    .platform_note = "any (AES-NI / ARMv8 Crypto via std, bitsliced software fallback)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
@@ -46,10 +49,15 @@ pub const meta = .{
 pub const Block = aes.Block;
 
 /// `true` when the rounds run on AES hardware (AES-NI on amd64, ARMv8 Crypto
-/// on arm64). Without it std's software path is table-based with cache-line
-/// masking (`std.options.side_channels_mitigations`), not bitsliced — this
-/// module inherits exactly that posture (SPEC.md, *Constant-time contract*).
+/// on arm64). Without it the rounds are bitsliced (constant time) unless
+/// `std.options.side_channels_mitigations == .none`, as for std's
+/// `Aes128`/`Aes256` (SPEC.md, *Constant-time contract*).
 pub const has_hardware_support = aes.has_hardware_support;
+
+/// The rounds run on the bitsliced core: no AES hardware and side-channel
+/// mitigations on — the same condition as std 0.17's soft `AesEncryptCtx`
+/// (`protected` in `lib/std/crypto/aes/soft.zig`).
+const bitsliced_rounds = !has_hardware_support and std.options.side_channels_mitigations != .none;
 
 /// The key length in bytes.
 pub const key_length = 24;
@@ -128,6 +136,45 @@ inline fn subWord32(w: u32) u32 {
     return std.mem.readInt(u32, &subWord(b), .little);
 }
 
+/// The 13 forward round keys in the bitsliced core's packed form, each
+/// broadcast to every block of a batch. Both directions use the forward keys
+/// (the core's `decrypt` runs the inverse cipher on them).
+const PackedSchedule = [rounds + 1]bitsliced.State;
+
+/// The context field holding `PackedSchedule`: `void` unless the rounds are
+/// bitsliced, so the hardware contexts keep std's size.
+const PackedKeys = if (bitsliced_rounds) PackedSchedule else void;
+
+fn packSchedule(ks: *const KeySchedule) PackedSchedule {
+    return bitsliced.Wide.packKeys(ks.round_keys[0..]);
+}
+
+/// `count` blocks through the bitsliced core, `bitsliced.width` at a time;
+/// a short last batch is padded with stack bytes whose output is dropped.
+/// The shape of std's `bitslicedOperation` (`lib/std/crypto/aes/soft.zig`,
+/// Zig 0.17.0).
+fn bitslicedBlocks(
+    comptime op: enum { encrypt, decrypt },
+    keys: *const PackedSchedule,
+    comptime count: usize,
+    dst: *[16 * count]u8,
+    src: *const [16 * count]u8,
+) void {
+    const w = bitsliced.width;
+    inline for (0..(count + w - 1) / w) |c| {
+        const lo: usize = c * w * 16;
+        const blocks: usize = @min(w, count - c * w);
+        const n = blocks * 16;
+        var buf: [w * 16]u8 = undefined;
+        @memcpy(buf[0..n], src[lo..][0..n]);
+        switch (op) {
+            .encrypt => bitsliced.Wide.encrypt(rounds, keys, &buf),
+            .decrypt => bitsliced.Wide.decrypt(rounds, keys, &buf),
+        }
+        @memcpy(dst[lo..][0..n], buf[0..n]);
+    }
+}
+
 const RoundOp = enum { encrypt, encryptLast, decrypt, decryptLast };
 
 /// One round over `count` independent blocks with the same round key — what
@@ -147,7 +194,8 @@ inline fn roundWide(comptime op: RoundOp, comptime count: usize, ts: [count]Bloc
 /// and a `block` with `parallel`, so `std.crypto.core.modes.ctr` and any
 /// mode generic over std's contexts accept it.
 ///
-/// It holds the round keys, i.e. the key. Call `wipe` when the key is
+/// It holds the round keys (and, on the bitsliced backend, their packed
+/// form), i.e. the key. Call `wipe` when the key is
 /// retired — nothing else clears it (`CONVENTIONS.md` §2.1, Z2).
 ///
 /// Dead stack (`CONVENTIONS.md` §2.1.1): `init`/`initInto` burn (key
@@ -159,6 +207,7 @@ pub const Aes192EncryptCtx = struct {
     pub const block = Block;
     pub const block_length = Block.block_length;
     key_schedule: KeySchedule,
+    packed_keys: PackedKeys,
 
     /// The context for `key`. `initInto` is the dead-stack-clean form: no
     /// key copy in the caller's frame, no context in its result slot.
@@ -168,17 +217,23 @@ pub const Aes192EncryptCtx = struct {
 
     /// `out` ← the context for `*key` (the pointer twin of `init`).
     pub fn initInto(out: *Self, key: *const [key_length]u8) void {
-        burn.run(burn.schedule_burn, void, expand, .{ &out.key_schedule, key });
+        burn.run(burn.schedule_burn, void, initIntoBody, .{ out, key });
     }
 
     fn initBody(key: *const [key_length]u8) Self {
         var ctx: Self = undefined;
-        expand(&ctx.key_schedule, key);
+        initIntoBody(&ctx, key);
         return ctx;
+    }
+
+    fn initIntoBody(out: *Self, key: *const [key_length]u8) void {
+        expand(&out.key_schedule, key);
+        if (bitsliced_rounds) out.packed_keys = packSchedule(&out.key_schedule);
     }
 
     /// Encrypt one block.
     pub fn encrypt(ctx: Self, dst: *[16]u8, src: *const [16]u8) void {
+        if (bitsliced_rounds) return bitslicedBlocks(.encrypt, &ctx.packed_keys, 1, dst, src);
         const rk = ctx.key_schedule.round_keys;
         var t = Block.fromBytes(src).xorBlocks(rk[0]);
         inline for (1..rounds) |i| t = t.encrypt(rk[i]);
@@ -188,6 +243,7 @@ pub const Aes192EncryptCtx = struct {
 
     /// `dst` ← `src` XOR the encryption of `counter` (one CTR step).
     pub fn xor(ctx: Self, dst: *[16]u8, src: *const [16]u8, counter: [16]u8) void {
+        if (bitsliced_rounds) return ctx.xorWide(1, dst, src, counter);
         const rk = ctx.key_schedule.round_keys;
         var t = Block.fromBytes(&counter).xorBlocks(rk[0]);
         inline for (1..rounds) |i| t = t.encrypt(rk[i]);
@@ -197,6 +253,7 @@ pub const Aes192EncryptCtx = struct {
 
     /// Encrypt `count` blocks, interleaved so the backend can pipeline them.
     pub fn encryptWide(ctx: Self, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8) void {
+        if (bitsliced_rounds) return bitslicedBlocks(.encrypt, &ctx.packed_keys, count, dst, src);
         const rk = ctx.key_schedule.round_keys;
         var ts: [count]Block = undefined;
         inline for (0..count) |j| ts[j] = Block.fromBytes(src[j * 16 ..][0..16]).xorBlocks(rk[0]);
@@ -207,6 +264,12 @@ pub const Aes192EncryptCtx = struct {
 
     /// `count` CTR steps at once: `dst` ← `src` XOR E(`counters`).
     pub fn xorWide(ctx: Self, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8, counters: [16 * count]u8) void {
+        if (bitsliced_rounds) {
+            var ks: [16 * count]u8 = undefined;
+            bitslicedBlocks(.encrypt, &ctx.packed_keys, count, &ks, &counters);
+            for (dst, ks, src) |*d, k, s| d.* = k ^ s;
+            return;
+        }
         const rk = ctx.key_schedule.round_keys;
         var ts: [count]Block = undefined;
         inline for (0..count) |j| ts[j] = Block.fromBytes(counters[j * 16 ..][0..16]).xorBlocks(rk[0]);
@@ -215,9 +278,9 @@ pub const Aes192EncryptCtx = struct {
         inline for (0..count) |j| dst[j * 16 ..][0..16].* = ts[j].xorBytes(src[j * 16 ..][0..16]);
     }
 
-    /// Zero the round keys.
+    /// Zero the round keys (and their packed form).
     pub fn wipe(ctx: *Self) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(&ctx.key_schedule));
+        std.crypto.secureZero(u8, std.mem.asBytes(ctx));
     }
 };
 
@@ -229,10 +292,13 @@ pub const Aes192DecryptCtx = struct {
     pub const block = Block;
     pub const block_length = Block.block_length;
     key_schedule: KeySchedule,
+    /// The FORWARD keys, packed (the bitsliced inverse cipher runs on them),
+    /// as in std's soft `AesDecryptCtx`.
+    packed_keys: PackedKeys,
 
     /// The decryption context for the key of an existing encryption context.
     pub fn initFromEnc(ctx: Aes192EncryptCtx) Self {
-        return .{ .key_schedule = ctx.key_schedule.invert() };
+        return .{ .key_schedule = ctx.key_schedule.invert(), .packed_keys = ctx.packed_keys };
     }
 
     /// The decryption context for `key`. `initInto` is the dead-stack-clean
@@ -247,19 +313,21 @@ pub const Aes192DecryptCtx = struct {
     }
 
     fn initBody(key: *const [key_length]u8) Self {
-        var enc: KeySchedule = undefined;
-        expand(&enc, key);
-        return .{ .key_schedule = enc.invert() };
+        var ctx: Self = undefined;
+        initIntoBody(&ctx, key);
+        return ctx;
     }
 
     fn initIntoBody(out: *Self, key: *const [key_length]u8) void {
         var enc: KeySchedule = undefined;
         expand(&enc, key);
+        if (bitsliced_rounds) out.packed_keys = packSchedule(&enc);
         out.key_schedule = enc.invert();
     }
 
     /// Decrypt one block.
     pub fn decrypt(ctx: Self, dst: *[16]u8, src: *const [16]u8) void {
+        if (bitsliced_rounds) return bitslicedBlocks(.decrypt, &ctx.packed_keys, 1, dst, src);
         const rk = ctx.key_schedule.round_keys;
         var t = Block.fromBytes(src).xorBlocks(rk[0]);
         inline for (1..rounds) |i| t = t.decrypt(rk[i]);
@@ -269,6 +337,7 @@ pub const Aes192DecryptCtx = struct {
 
     /// Decrypt `count` blocks, interleaved so the backend can pipeline them.
     pub fn decryptWide(ctx: Self, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8) void {
+        if (bitsliced_rounds) return bitslicedBlocks(.decrypt, &ctx.packed_keys, count, dst, src);
         const rk = ctx.key_schedule.round_keys;
         var ts: [count]Block = undefined;
         inline for (0..count) |j| ts[j] = Block.fromBytes(src[j * 16 ..][0..16]).xorBlocks(rk[0]);
@@ -277,9 +346,9 @@ pub const Aes192DecryptCtx = struct {
         inline for (0..count) |j| dst[j * 16 ..][0..16].* = ts[j].toBytes();
     }
 
-    /// Zero the round keys.
+    /// Zero the round keys (and their packed form).
     pub fn wipe(ctx: *Self) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(&ctx.key_schedule));
+        std.crypto.secureZero(u8, std.mem.asBytes(ctx));
     }
 };
 
@@ -509,8 +578,8 @@ test "the *Into twins build the same contexts as the by-value constructors" {
     Aes192.initDecInto(&d, &key);
     const e2 = Aes192.initEnc(key);
     const d2 = Aes192.initDec(key);
-    try testing.expectEqualSlices(u8, std.mem.asBytes(&e2.key_schedule), std.mem.asBytes(&e.key_schedule));
-    try testing.expectEqualSlices(u8, std.mem.asBytes(&d2.key_schedule), std.mem.asBytes(&d.key_schedule));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&e2), std.mem.asBytes(&e));
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&d2), std.mem.asBytes(&d));
     try testing.expect(!std.mem.eql(u8, std.mem.asBytes(&e.key_schedule), std.mem.asBytes(&d.key_schedule)));
 }
 
@@ -520,10 +589,49 @@ test "wipe zeroes the round keys" {
     var d = Aes192.initDec(key);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&e.key_schedule), 0));
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&d.key_schedule), 0));
+    if (bitsliced_rounds) {
+        try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&e.packed_keys), 0));
+        try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&d.packed_keys), 0));
+    }
     e.wipe();
     d.wipe();
-    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&e.key_schedule), 0));
-    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&d.key_schedule), 0));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&e), 0));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&d), 0));
+}
+
+test "the bitsliced core at 12 rounds agrees with the round-primitive path (every backend)" {
+    // On AES hardware the contexts never reach `bitsliced.zig`; this drives it
+    // directly so a native test run still checks the AES-192 batch shape
+    // (13 packed keys, Nr = 12, short last batch) against FIPS-197 C.2 and
+    // against the hardware rounds.
+    const key = fromHex(24, "000102030405060708090a0b0c0d0e0f1011121314151617");
+    var ks: KeySchedule = undefined;
+    expand(&ks, &key);
+    const keys = packSchedule(&ks);
+    const pt = fromHex(16, "00112233445566778899aabbccddeeff");
+    const ct = fromHex(16, "dda97ca4864cdfe06eaf70a0ec0d7191");
+    var one: [16]u8 = undefined;
+    bitslicedBlocks(.encrypt, &keys, 1, &one, &pt);
+    try testing.expectEqualSlices(u8, &ct, &one);
+    bitslicedBlocks(.decrypt, &keys, 1, &one, &ct);
+    try testing.expectEqualSlices(u8, &pt, &one);
+
+    const enc = Aes192.initEnc(key);
+    const dec = Aes192.initDec(key);
+    const n_max = 2 * bitsliced.width + 3;
+    var src: [16 * n_max]u8 = undefined;
+    for (&src, 0..) |*b, i| b.* = @truncate(i *% 53 +% 29);
+    inline for (.{ 1, bitsliced.width - 1, bitsliced.width, bitsliced.width + 1, n_max }) |count| {
+        const n = 16 * count;
+        var got: [n]u8 = undefined;
+        var want: [n]u8 = undefined;
+        bitslicedBlocks(.encrypt, &keys, count, &got, src[0..n]);
+        for (0..count) |j| enc.encrypt(want[j * 16 ..][0..16], src[j * 16 ..][0..16]);
+        try testing.expectEqualSlices(u8, &want, &got);
+        bitslicedBlocks(.decrypt, &keys, count, &got, src[0..n]);
+        for (0..count) |j| dec.decrypt(want[j * 16 ..][0..16], src[j * 16 ..][0..16]);
+        try testing.expectEqualSlices(u8, &want, &got);
+    }
 }
 
 test "subWord is FIPS-197 SubWord for all 256 bytes, in every byte position" {

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-10 · mutation 2026-10-10 (21/22, 1 eq) · src 510d8447160244b9
 
-**Hardening:** fuzz 2026-10-10 (200,000 runs clean, AES192_FUZZ, every reach label hit) · ct 2026-10-10 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; software backend measured unpinned, see *Constant-time contract*)
+**Hardening:** fuzz 2026-10-20 (200,000 runs clean, AES192_FUZZ, every reach label hit; on `-Dcpu=x86_64`, the bitsliced backend — 2026-10-10 on AES-NI) · ct 2026-10-20 (ctgrind enc/dec: key + plaintext/ciphertext tainted, 0 in-file on AES-NI; bitsliced: key + batch tainted through packKeys and both directions, 0 in-file)
 
 **Performance:** ref 0.74–1.01× OpenSSL 3.5.5 EVP AES-192 · fastest ? (measured 2026-10-11)
 
@@ -26,15 +26,13 @@ README.
 |---|---|---|--:|---|---|
 | [openssl/openssl](https://github.com/openssl/openssl) — **reference** | C | Apache-2.0 | 30.9k | openssl-4.0.3 (2026-09-29); measured 3.5.5 | AES-192 in every mode through EVP, AES-NI/VAES kernels, a constant-time SSSE3 software path *(inferred, from its documented `vpaes` code)*. `zig build bench-aes192` (2026-10-11, *Performance*): level on bulk work (ECB both ways, CBC chained, CTR: 0.97–1.01×), ahead on key setup (0.74–0.81×, EVP's per-call overhead included on its side). |
 | [Go `crypto/aes`](https://pkg.go.dev/crypto/aes) | Go | BSD-3-Clause | 139k | go1.27.2 | 24-byte keys through `NewCipher`; the docs say the software path is **not** constant time, only AES-NI (amd64) and MSA (s390x) are — the same posture as this module. |
-| [RustCrypto/block-ciphers](https://github.com/RustCrypto/block-ciphers) `aes` | Rust | Apache-2.0 OR MIT | 786 | crate 0.9.3 (2026-08-28); pushed 2026-10-06 | `Aes192` with runtime AES-NI detection and a **bitsliced constant-time software fallback**; one NCC Group audit (README). Not measured. |
+| [RustCrypto/block-ciphers](https://github.com/RustCrypto/block-ciphers) `aes` | Rust | Apache-2.0 OR MIT | 786 | crate 0.9.3 (2026-08-28); pushed 2026-10-06 | `Aes192` with runtime AES-NI detection and a bitsliced constant-time software fallback — the same posture as this module since 2026-10-20; one NCC Group audit (README). Not measured. |
 | Zig `std.crypto` 0.16.0, Zig ecosystem | Zig | MIT | — | Zig 0.16.0 | std has `Aes128`/`Aes256` only (its context asserts `key_bits == 128 or 256`); GitHub search (`aes`, language Zig) found modes over std's AES, no AES-192. This module is the only one. |
 
 **Where we are ahead:** the only Zig AES-192, std-shaped so std's generic modes take it unchanged;
-ctgrind-checked on AES-NI; works around two std software-backend defects (present in 0.16 and 0.17.0) (*Algorithm*).
-**Where we are behind:** no constant-time software backend — RustCrypto has a bitsliced one,
-and so does std 0.17 for its own `Aes128`/`Aes256` contexts (`std/crypto/aes/bitsliced.zig`,
-private to std), so on a target without hardware AES this module is weaker than std's two
-siblings (*Constant-time contract*; plan in *Backlog / deferred*).
+ctgrind-checked on AES-NI and on the bitsliced core; works around two std software-backend defects (present in 0.16 and 0.17.0) (*Algorithm*).
+**Where we are behind:** nothing a user notices against std or RustCrypto; Go's software path
+is not constant time at all (row above).
 
 ## What this module is, and what it is not
 
@@ -58,7 +56,11 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   `encryptLast(w‖w‖w‖w, 0)` = ShiftRows(SubBytes(·)) ⊕ 0, and ShiftRows is the identity when
   each row holds one repeated byte, so the first column is SubWord(w). This keeps the only
   secret-indexed operation of the expansion inside the backend std already chose.
-- **Cipher** — §5.1: AddRoundKey(rk0), 11 × `Block.encrypt`, `Block.encryptLast(rk12)`.
+- **Cipher** — §5.1: AddRoundKey(rk0), 11 × `Block.encrypt`, `Block.encryptLast(rk12)`. On the
+  bitsliced backend (*Constant-time contract*): the 13 round keys packed once at `init`
+  (`bitsliced.Wide.packKeys`), then `Wide.encrypt(12, …)` over batches of `bitsliced.width`
+  blocks (16 on 64-bit), a short last batch padded and its extra output dropped — std's
+  `bitslicedOperation` shape (`bitslicedBlocks`, `root.zig`).
 - **Decryption** — the equivalent inverse cipher, §5.3.5 (as std's `AesDecryptCtx`): round
   keys reversed, InvMixColumns on rk1..rk11, then `Block.decrypt` × 11 and `decryptLast`.
   InvMixColumns is composed as `decrypt(encryptLast(x, 0), 0)` rather than
@@ -84,8 +86,11 @@ FIPS-197 (2001; 2023 update `-upd1`), Nk = 6, Nr = 12.
   512 is the probe's minimum zero run; 4 KiB until 2026-10-11, when it was half of `init`'s time); the by-value `initEnc`/`initDec`/`init`
   are the std-shaped surface, with `*Into` twins. Per-block calls do not burn (§2.1 Z3: the
   burn belongs to the mode's entry point that owns key and message). `stackprobe_test.zig`
-  (ReleaseFast) holds the burn deep enough.
-- **Zeroization:** a context is caller-owned storage (§2.1 Z2): `wipe()` on each, documented,
+  (ReleaseFast) holds the burn deep enough. On the bitsliced backend the burn is 8 KiB: the
+  body also builds the packed keys by value (7071 B dirtied, ReleaseFast `-Dcpu=x86_64`,
+  2026-10-20).
+- **Zeroization:** a context is caller-owned storage (§2.1 Z2): `wipe()` on each zeroes the
+  whole context (round keys and, on the bitsliced backend, the packed keys), documented,
   tested (`wipe zeroes the round keys`). The 52-word expansion buffer is Z3 (a key schedule),
   covered by the burn.
 
@@ -99,26 +104,28 @@ Secret: the key (hence every round key) and the data blocks.
   script's pinned CPU): rows `enc` and `dec` in `ctgrind-expected.tsv`, **0 in-file**; all
   contexts are the harness's printed results (witness). ARMv8 is not measured under valgrind
   here (no arm64 host); the claim there rests on the code being std's `aese`/`aesd` sequences.
-- **Software backend** (`has_hardware_support == false`): **WEAKER than std's
-  `Aes128`/`Aes256` on Zig 0.17** (audit 2026-10-19, O5-1). Every round of this module runs
-  on std's soft `Block.encrypt`/`decrypt`/`*Last`, i.e. 32-bit T-table / S-box lookups read
-  with cache-line-granular masking (`std.options.side_channels_mitigations`, default
-  `.medium`) — a mitigation, not constant time: memcheck sees the secret-indexed loads.
-  Measured 2026-10-10 on 0.16, `CTGRIND_CPU=x86_64 scripts/checks/ctgrind.sh --stacks aes192`
-  (not a pinned row — the script pins one CPU for all modules): `enc` 356 in-file, `dec` 349
-  in-file, every one a "Use of uninitialised value" (a load address) in std's `soft.zig`
-  table/S-box lookups, zero conditional jumps. std 0.17's own soft contexts no longer take
-  that path: `AesEncryptCtx`/`AesDecryptCtx` `encrypt`/`decrypt`/`*Wide` run
-  `std/crypto/aes/bitsliced.zig` ("no data-dependent memory access") whenever
-  `side_channels_mitigations != .none`, so an AES-128/256 data path is constant time there
-  and this module's AES-192 data path is not. Only the key expansion is still level: std's
-  soft `expandKey` uses the same masked `sbox_lookup` this module reaches through
-  `subWord`. Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`): x86-64
-  without AES-NI **or without AVX** (0.17 requires both — e.g. Atom/Goldmont/Tremont-class
+- **Software backend** (`has_hardware_support == false`): **level with std's
+  `Aes128`/`Aes256` on Zig 0.17** (since 2026-10-20; audit 2026-10-19, O5-1). When
+  `std.options.side_channels_mitigations != .none` (default `.medium`) — the condition std's
+  soft contexts use — every encrypt/decrypt/`*Wide`/`xor*` call runs `src/bitsliced.zig`, a
+  copy of std 0.17's `bitsliced.zig` ("no data-dependent memory access"; std does not export
+  it), on the 13 forward round keys packed at `init` (`packed_keys`, also in the decrypt
+  context: the core's inverse cipher takes the forward keys, as std's `initFromEnc` copies
+  them). Machine-checked by the ctgrind row `bitsliced`: key and one full batch tainted
+  through `packKeys`, `Wide.encrypt(12, …)` and `Wide.decrypt(12, …)`, **0 in-file** — on the
+  pinned skylake build, because the core is plain integer code; `root.zig`'s
+  `bitslicedBlocks` adds only two `@memcpy`s. With `.none` the rounds are std's unmasked
+  tables, as std's. Still level, not better: the **key expansion** reaches std's masked
+  `sbox_lookup` through `subWord` (a secret-indexed load per S-box byte, cache-line masked),
+  exactly as std's own soft `expandKey` — once per key, not per block. Before 2026-10-20 the
+  rounds were std's soft `Block` lookups (`enc` 356 / `dec` 349 in-file loads under
+  `CTGRIND_CPU=x86_64`). Which targets get the soft backend on 0.17 (`std/crypto/aes.zig`):
+  x86-64 without AES-NI **or without AVX** (0.17 requires both — e.g. Atom/Goldmont/Tremont-class
   router and NAS CPUs that have AES-NI but no AVX, and any `-Dcpu=baseline` /
   `x86_64` / `x86_64_v2` build), arm64 without the Crypto Extensions (e.g. Cortex-A72 as in
-  a Raspberry Pi 4), and every other architecture. The plan to close the gap is in
-  *Backlog / deferred*.
+  a Raspberry Pi 4), and every other architecture. Tested there by running the whole suite,
+  the stack probe and the model fuzz with `-Dcpu=x86_64` (2026-10-20); a native run also
+  drives the core directly (test "the bitsliced core at 12 rounds …").
 
 ## Limits and refusals
 
@@ -172,36 +179,20 @@ words; with a 512-byte burn and `u32` words it is 0.74–0.81×. Grade: worst ro
 
 ## What is deliberately not done
 
-- **An own software AES** written here: not done. The reasoning that it was "a std gap for
-  all three key sizes, not an AES-192 one" no longer holds on Zig 0.17 (std's
-  `Aes128`/`Aes256` soft contexts are bitsliced); the fix is to reuse std's bitsliced core,
-  not to write a new one — see *Backlog / deferred*.
+- **An own software AES** written here: not done. The software backend is std 0.17's bitsliced
+  core, copied verbatim (`src/bitsliced.zig`, only the std `@import` changed) because std keeps
+  it private; re-copy it when std changes it (its sha256 is in the file header).
 - **aeskeygenassist-based expansion on AES-NI:** not done. The generic expansion is the same
   code on every backend and runs once per key; with word-wide XORs it is already 0.74–0.81×
   OpenSSL's EVP key setup (*Performance*), so a second, x86-only path buys nothing a user sees.
 
 ## Backlog / deferred
 
-- **Constant-time software backend: AES-192 on std 0.17's bitsliced core** *(audit
-  2026-10-19, O5-1; owner decision pending)*. What: on `has_hardware_support == false` the
-  rounds (`Aes192EncryptCtx.encrypt`/`xor`/`encryptWide`/`xorWide`,
-  `Aes192DecryptCtx.decrypt`/`decryptWide`, `src/root.zig` — the `Block.encrypt`/`decrypt`
-  loops) use std's masked table lookups, while std 0.17's `Aes128`/`Aes256` soft contexts
-  use `std/crypto/aes/bitsliced.zig` when `side_channels_mitigations != .none`. Impact: a
-  cache-timing side channel on key and data for every AES-192 user on the targets listed in
-  *Constant-time contract* — consumers `aesgcm` (`Aes192Gcm` generic backend), `aeskw`
-  (A192KW), `rsa` (PBES2 `aes192-cbc` encrypted PKCS#8, via `aescbc`), `ssh` (`aes192-ctr`),
-  and through them `jwe`/`xmlenc`. Proposed fix: vendor std's `bitsliced.zig` (MIT, std's
-  licence; NOTICE entry; it is not `pub` from `std.crypto.core.aes`) into `src/`, keep the
-  existing key expansion, and on the soft backend when protected pack the 13 round keys
-  once at `init` (`Wide.packKeys`, a `packed_keys` field as std's contexts have) and run
-  `Wide.encrypt(12, …)` / `Wide.decrypt(12, …)` over `bitsliced.width`-block batches for
-  `encrypt`/`decrypt`/`*Wide`/`xor*` (std's `bitslicedOperation` shape; check whether the
-  decrypt side wants the forward keys, as std's `initFromEnc` copies them). Evidence to add:
-  the existing FIPS-197 / CAVP / SP 800-38A KATs and the fuzz model on `-Dcpu=x86_64` (soft
-  backend), a pinned ctgrind row for the soft backend (`CTGRIND_CPU=x86_64`, 0 in-file on
-  the data path), stack probe re-measured (`packed_keys` is key material: `wipe` must clear
-  it). Coordinator runs ctgrind; this is a CT restructure, not done inside the audit.
+- **Software key expansion through the bitsliced core** *(2026-10-20)*: `subWord` still runs
+  std's masked S-box on the software backend (level with std's own soft `expandKey`). Running
+  SubWord through `bitsliced.Wide.encrypt`'s S-box instead would make the expansion constant
+  time too — better than std, at the cost of a bitsliced batch per SubWord (8 per key). Not done:
+  no consumer asked, and the masked lookup is once per key.
 
 ## Open
 

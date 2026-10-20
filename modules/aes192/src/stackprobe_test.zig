@@ -22,7 +22,8 @@ test "STACKPROBE: no key or round-key residue after initEncInto / initDecInto" {
     key = full[0..24].*;
     // The schedules are written by the calls under test; the probe searches
     // the stack for any 16-byte run of them, and for the key itself.
-    const secrets = [_][]const u8{ &key, std.mem.asBytes(&enc.key_schedule), std.mem.asBytes(&dec.key_schedule) };
+    // `asBytes(&enc)` includes the packed keys on the bitsliced backend.
+    const secrets = [_][]const u8{ &key, std.mem.asBytes(&enc), std.mem.asBytes(&dec) };
     _ = try P.run("initEncInto", root.Aes192.initEncInto, .{ &enc, &key }, &secrets, .{});
     _ = try P.run("initDecInto", root.Aes192.initDecInto, .{ &dec, &key }, &secrets, .{});
     try std.testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&dec.key_schedule), 0));

@@ -1544,13 +1544,19 @@ snmp	ReleaseFast	des	1	256	74cdcb4742558a04	f7e7b8e6152d7073
 # aes192 (2026-10-10) — enc / dec: key + plaintext (enc) or ciphertext (dec)
 # tainted through initEnc/initEncInto/initDec/initDecInto/initFromEnc, the
 # one-block, wide and xor paths and std's modes.ctr. Pinned on the AES-NI
-# backend (CTGRIND_CPU=skylake): 0 in-file. std's software backend
-# (CTGRIND_CPU=x86_64, not a pinned row) reads 356 / 349 in-file, every one a
-# secret-indexed LOAD in std's cache-line-masked sbox/table lookups
-# (soft.zig:127-134, 838-840, 878-880), no branch — std's own Aes128/Aes256
-# posture there; see modules/aes192/SPEC.md.
-aes192	ReleaseFast	enc	1	0	3fc0be6866777f1a	2b73cb024e51118c
-aes192	ReleaseFast	dec	1	0	3fc0be6866777f1a	68602ef849690825
+# backend (CTGRIND_CPU=skylake): 0 in-file.
+# 2026-10-20 (audit O5-1): without AES hardware the rounds now run on std
+# 0.17's bitsliced core (modules/aes192/src/bitsliced.zig, a copy), as std's
+# own Aes128/Aes256 do; until then they were std's cache-line-masked table
+# lookups (356 / 349 in-file on CTGRIND_CPU=x86_64, every one a LOAD). Row
+# `bitsliced`: key + one full batch tainted through packKeys and the 12-round
+# Wide.encrypt / Wide.decrypt, measured on the pinned CPU (plain integer
+# code): 0 in-file. The software key expansion is still std's masked S-box
+# via subWord (std's soft expandKey has the same posture); see
+# modules/aes192/SPEC.md.
+aes192	ReleaseFast	enc	1	0	3a267c2af452f75b	2b73cb024e51118c
+aes192	ReleaseFast	dec	1	0	3a267c2af452f75b	68602ef849690825
+aes192	ReleaseFast	bitsliced	1	0	ad17aebab81e2735	5ea64f081b0ffcbb
 # p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
 # secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
 # four. The branches the API reveals (range and identity verdicts, r = 0 /
