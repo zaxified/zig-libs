@@ -3104,6 +3104,81 @@ fn writeAnnotations(jw: *std.json.Stringify, a: Annotations) std.Io.Writer.Error
     try jw.endObject();
 }
 
+/// A request or notification method this module does not define — a vendor
+/// method (`acme/search`) or an extension's (`skills/list` of
+/// `io.modelcontextprotocol/skills`) — registered with `Server.addMethod` /
+/// `addNotification`. Without it such a request is -32601 and such a
+/// notification is dropped (TS `setRequestHandler`, Python
+/// `add_request_handler`). `stateless`/`session` say which era may call it.
+pub const Method = struct {
+    name: []const u8,
+    handler: MethodHandler,
+    ctx: ?*anyopaque = null,
+    /// Callable by a 2026-07-28 (stateless) request.
+    stateless: bool = true,
+    /// Callable on an `initialize` session.
+    session: bool = true,
+};
+
+/// A request handler writes the result **object** (JSON text, e.g.
+/// `{"items":[]}`) with `req.write`/`print` — `{}` when it writes nothing —
+/// and returns `true`; `false` answers -32603. A 2026-07-28 answer gets
+/// `resultType` and `_meta.serverInfo` added. A notification handler's
+/// output and return value are ignored (nothing is ever written back).
+pub const MethodHandler = *const fn (ctx: ?*anyopaque, req: *MethodRequest) bool;
+
+/// Everything a `Method` handler gets: `params` (`.null` when absent), the
+/// per-request arena, the request context `ToolCall` has, and the result
+/// accumulator.
+pub const MethodRequest = struct {
+    arena: std.mem.Allocator,
+    /// The method name as received (lets one handler serve several).
+    method: []const u8,
+    params: std.json.Value,
+    out: *std.ArrayList(u8),
+    /// True for a notification: there is no response to write.
+    notification: bool = false,
+    progress: ?Progress = null,
+    server: ?*Server = null,
+    peer: u64 = 0,
+    modern: ?*const ModernRequest = null,
+    meta: std.json.Value = .null,
+    protocol_error: ?ProtocolError = null,
+
+    /// Append raw result-object text (OOM swallowed; a truncated object turns
+    /// into -32603, never a malformed line).
+    pub fn write(self: *MethodRequest, bytes: []const u8) void {
+        self.out.appendSlice(self.arena, bytes) catch {};
+    }
+
+    /// Append formatted result-object text.
+    pub fn print(self: *MethodRequest, comptime fmt: []const u8, args: anytype) void {
+        const text = self.arena.print(fmt, args) catch return;
+        self.out.appendSlice(self.arena, text) catch {};
+    }
+
+    /// What the client declared (see `ToolCall.clientCapabilities`).
+    pub fn clientCapabilities(self: *const MethodRequest) ClientCapabilities {
+        return requestCaps(self.server, self.peer, self.modern);
+    }
+
+    /// Emit one `notifications/progress` — a no-op without a progressToken.
+    pub fn reportProgress(self: *const MethodRequest, progress: u64, total: u64, msg: []const u8) void {
+        if (self.progress) |p| p.report(progress, total, msg);
+    }
+
+    /// Answer with a JSON-RPC error instead of the result.
+    pub fn failWith(self: *MethodRequest, pe: ProtocolError) bool {
+        self.protocol_error = pe;
+        return true;
+    }
+
+    /// `failWith(.{ .code = code, .message = message, .data_json = data_json })`.
+    pub fn failProtocol(self: *MethodRequest, code: i32, msg: []const u8, data_json: []const u8) bool {
+        return self.failWith(.{ .code = code, .message = msg, .data_json = data_json });
+    }
+};
+
 /// One content block of a tool result or prompt message (spec
 /// `ContentBlock`, server/tools.mdx "Tool Result"). Binary data is passed
 /// **already base64-encoded** (`ToolCall.addImage`/`addAudio` encode raw
@@ -3272,6 +3347,12 @@ pub const Server = struct {
     /// null when it is not valid RFC 6570 or has no deterministic inverse.
     template_parsed: std.ArrayList(?uri_template.Template) = .empty,
     catalog_arena: ?*std.heap.ArenaAllocator = null,
+    custom_methods: std.ArrayList(Method) = .empty,
+    custom_notifications: std.ArrayList(Method) = .empty,
+    /// `capabilities.extensions` / `.experimental` (JSON object text, ""
+    /// = none), set through `setCapabilityExtras`.
+    extensions_json: []const u8 = "",
+    experimental_json: []const u8 = "",
     /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
     /// override it per read (`ResourceRequest.cache`).
     read_cache: CacheHint = .{},
@@ -3292,6 +3373,8 @@ pub const Server = struct {
             self.gpa.destroy(a);
         }
         self.template_parsed.deinit(self.gpa);
+        self.custom_methods.deinit(self.gpa);
+        self.custom_notifications.deinit(self.gpa);
         for (self.tool_checks.items) |c| c.deinit(self.gpa);
         self.tool_checks.deinit(self.gpa);
         self.tools.deinit(self.gpa);
@@ -3434,6 +3517,98 @@ pub const Server = struct {
         try self.template_parsed.ensureUnusedCapacity(self.gpa, 1);
         try self.resource_templates.append(self.gpa, template);
         self.template_parsed.appendAssumeCapacity(if (parsed) |pt| (if (pt.unmatchable == null) pt else null) else null);
+    }
+
+    pub const MethodError = error{ OutOfMemory, DuplicateMethod, ReservedMethod };
+
+    /// Register a request method this module does not define (see `Method`).
+    /// A name this module dispatches itself (`tools/call`, …) is refused, so
+    /// a custom handler can never shadow the protocol. Slices must outlive
+    /// the server.
+    pub fn addMethod(self: *Server, method: Method) MethodError!void {
+        try checkCustomName(self.custom_methods.items, method.name);
+        try self.custom_methods.append(self.gpa, method);
+    }
+
+    /// Register a notification handler (`notifications/acme/...`); the same
+    /// rules as `addMethod`. `notifications/initialized` and
+    /// `notifications/cancelled` are this module's own.
+    pub fn addNotification(self: *Server, method: Method) MethodError!void {
+        if (std.mem.eql(u8, method.name, "notifications/cancelled")) return error.ReservedMethod;
+        try checkCustomName(self.custom_notifications.items, method.name);
+        try self.custom_notifications.append(self.gpa, method);
+    }
+
+    fn checkCustomName(existing: []const Method, name: []const u8) MethodError!void {
+        if (name.len == 0 or std.meta.stringToEnum(DispatchMethod, name) != null) return error.ReservedMethod;
+        for (existing) |m| if (std.mem.eql(u8, m.name, name)) return error.DuplicateMethod;
+    }
+
+    fn findCustom(list: []const Method, name: []const u8) ?*const Method {
+        for (list) |*m| if (std.mem.eql(u8, m.name, name)) return m;
+        return null;
+    }
+
+    /// Advertise `capabilities.extensions` (SEP-2133: extension id → its
+    /// settings object, e.g. `{"io.modelcontextprotocol/ui":{}}`) and
+    /// `capabilities.experimental`, in both `initialize` and
+    /// `server/discover`. Each must be a JSON object ("" = none). The text is
+    /// borrowed and must outlive the server.
+    pub fn setCapabilityExtras(self: *Server, extensions_json: []const u8, experimental_json: []const u8) error{ OutOfMemory, InvalidCapabilityJson }!void {
+        for ([_][]const u8{ extensions_json, experimental_json }) |text| {
+            if (text.len == 0) continue;
+            const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, text, .{}) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.InvalidCapabilityJson,
+            };
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidCapabilityJson;
+        }
+        self.extensions_json = extensions_json;
+        self.experimental_json = experimental_json;
+    }
+
+    fn writeCapabilityExtras(self: *const Server, jw: *std.json.Stringify) std.Io.Writer.Error!void {
+        const pairs = [_]struct { []const u8, []const u8 }{ .{ "extensions", self.extensions_json }, .{ "experimental", self.experimental_json } };
+        for (pairs) |pair| {
+            if (pair[1].len == 0) continue;
+            try jw.objectField(pair[0]);
+            try jw.beginWriteRaw();
+            try writeStrippingNewlines(jw.writer, pair[1]);
+            jw.endWriteRaw();
+        }
+    }
+
+    fn handleCustom(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, method: *const Method, obj: std.json.ObjectMap, peer: u64, modern: ?*const ModernRequest) Error!void {
+        const params: std.json.Value = obj.get("params") orelse .null;
+        const req_meta: std.json.Value = if (params == .object) requestMeta(params.object) else .null;
+        var buf: std.ArrayList(u8) = .empty;
+        var req = MethodRequest{
+            .arena = arena,
+            .method = method.name,
+            .params = params,
+            .out = &buf,
+            .notification = id == null,
+            .progress = progressFrom(arena, out, req_meta),
+            .server = self,
+            .peer = peer,
+            .modern = modern,
+            .meta = req_meta,
+        };
+        const ok = method.handler(method.ctx, &req);
+        if (id == null) return; // a notification: nothing is ever written back
+        if (req.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
+        if (!ok) return sendError(arena, out, id, error_code.internal_error, "Method failed");
+        const text = if (buf.items.len == 0) "{}" else buf.items;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return sendError(arena, out, id, error_code.internal_error, "Method result is not a JSON object"),
+        };
+        if (v != .object) return sendError(arena, out, id, error_code.internal_error, "Method result is not a JSON object");
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        buildCustomResult(&jw, v.object, &self.info, modern != null) catch return error.OutOfMemory;
+        try sendResultRaw(arena, out, id, aw.written());
     }
 
     /// Long-lived storage for what registration derives from the catalog
@@ -3859,10 +4034,32 @@ pub const Server = struct {
             return;
         }
         // Notification for a request-only method (or for one we do not know at
-        // all): ignore, never respond.
-        if (id == null) return;
-        const m = dm orelse
-            return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+        // all): ignore, never respond — unless the application registered it.
+        if (id == null) {
+            if (dm == null) if (findCustom(self.custom_notifications.items, method)) |cm| {
+                const modern_n: ?*const ModernRequest = switch (classifyRequest(obj.get("params"))) {
+                    .modern => |*r| r,
+                    .legacy => null,
+                    else => return, // a malformed notification has no one to tell
+                };
+                if (if (modern_n != null) !cm.stateless else !cm.session) return;
+                return self.handleCustom(arena, out, null, cm, obj, peer, modern_n);
+            };
+            return;
+        }
+        const m = dm orelse {
+            const cm = findCustom(self.custom_methods.items, method) orelse
+                return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+            const modern_c: ?*const ModernRequest = switch (classifyRequest(obj.get("params"))) {
+                .legacy => null,
+                .modern => |*r| r,
+                .malformed => |why| return sendError(arena, out, id, error_code.invalid_params, why),
+                .unsupported => |requested| return sendErrorWithData(arena, out, id, error_code.unsupported_protocol_version, "Unsupported protocol version", .{ .supported = all_versions[0..], .requested = requested }),
+            };
+            if (if (modern_c != null) !cm.stateless else !cm.session)
+                return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+            return self.handleCustom(arena, out, id, cm, obj, peer, modern_c);
+        };
 
         // Which era this request speaks — see `classifyRequest`. `initialize`
         // is the session opener whatever its `_meta` says: a dual-era server
@@ -3976,6 +4173,7 @@ pub const Server = struct {
             try jw.beginObject();
             try jw.endObject();
         }
+        try self.writeCapabilityExtras(jw);
         try jw.endObject();
         if (self.info.instructions) |instr| {
             try jw.objectField("instructions");
@@ -4060,6 +4258,7 @@ pub const Server = struct {
             try jw.write(false);
             try jw.endObject();
         }
+        try self.writeCapabilityExtras(jw);
         try jw.endObject();
         try jw.objectField("serverInfo");
         try jw.beginObject();
@@ -4535,6 +4734,19 @@ fn buildReadResult(jw: *std.json.Stringify, req: *const ResourceRequest, info: *
 /// Serialize one `prompts/get` result: `{description?, messages:[{role,
 /// content:{type:"text", text}}, …]}` — description comes from the
 /// registration (omitted when "").
+fn buildCustomResult(jw: *std.json.Stringify, members: std.json.ObjectMap, info: *const Info, modern: bool) std.Io.Writer.Error!void {
+    try beginResult(jw, modern);
+    var it = members.iterator();
+    while (it.next()) |e| {
+        // `endResult` writes the 2026-07-28 `_meta` (serverInfo); a handler's
+        // own `_meta` and `resultType` give way to it there.
+        if (modern and (std.mem.eql(u8, e.key_ptr.*, "_meta") or std.mem.eql(u8, e.key_ptr.*, "resultType"))) continue;
+        try jw.objectField(e.key_ptr.*);
+        try jw.write(e.value_ptr.*);
+    }
+    try endResult(jw, info, modern, null);
+}
+
 fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const PromptRequest, info: *const Info, modern: bool) std.Io.Writer.Error!void {
     try beginResult(jw, modern);
     if (prompt.description.len != 0) {
@@ -5375,6 +5587,100 @@ test "prompts/get: a message may carry an image block" {
         \\{"jsonrpc":"2.0","id":1,"result":{"messages":[{"role":"user","content":{"type":"text","text":"What is in this picture?"}},{"role":"user","content":{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}}]}}
         \\
     );
+}
+
+fn searchMethod(_: ?*anyopaque, req: *MethodRequest) bool {
+    const q = if (req.params == .object) (if (req.params.object.get("q")) |v| (if (v == .string) v.string else "") else "") else "";
+    if (std.mem.eql(u8, q, "bad")) {
+        req.write("[1]");
+        return true;
+    }
+    if (std.mem.eql(u8, q, "boom")) return false;
+    req.print("{{\"hits\":[\"{s}\"]}}", .{q});
+    return true;
+}
+
+fn countNotification(ctx: ?*anyopaque, _: *MethodRequest) bool {
+    const n: *u32 = @ptrCast(@alignCast(ctx.?));
+    n.* += 1;
+    return true;
+}
+
+test "custom methods: a vendor request is dispatched in both eras; notifications reach their handler" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    var pings: u32 = 0;
+    try s.addMethod(.{ .name = "acme/search", .handler = searchMethod });
+    try s.addMethod(.{ .name = "acme/legacy", .handler = searchMethod, .stateless = false });
+    try s.addNotification(.{ .name = "notifications/acme/ping", .handler = countNotification, .ctx = &pings });
+    try testing.expectError(error.ReservedMethod, s.addMethod(.{ .name = "tools/call", .handler = searchMethod }));
+    try testing.expectError(error.DuplicateMethod, s.addMethod(.{ .name = "acme/search", .handler = searchMethod }));
+    try testing.expectError(error.ReservedMethod, s.addNotification(.{ .name = "notifications/cancelled", .handler = countNotification }));
+
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"acme/search","params":{"q":"mug"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"hits":["mug"]}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"acme/search","params":{"q":"mug","_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","hits":["mug"],"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"t","version":"0"}}}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"acme/legacy","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"acme/search","params":{"q":"bad"}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":"Method result is not a JSON object"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"acme/search","params":{"q":"boom"}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"error":{"code":-32603,"message":"Method failed"}}
+        \\
+    );
+    // A notification is handled and never answered; an unknown one is dropped.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/acme/ping"}
+    , "");
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","method":"notifications/acme/other"}
+    , "");
+    try testing.expectEqual(@as(u32, 1), pings);
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":6,"method":"acme/nope"}
+    ,
+        \\{"jsonrpc":"2.0","id":6,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    );
+}
+
+test "capabilities: extensions and experimental are advertised in both eras" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try testing.expectError(error.InvalidCapabilityJson, s.setCapabilityExtras("[1]", ""));
+    try testing.expectError(error.InvalidCapabilityJson, s.setCapabilityExtras("{", ""));
+    try s.setCapabilityExtras("{\"io.modelcontextprotocol/ui\":{}}", "{\"acme\":{\"v\":1}}");
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{"listChanged":false},"extensions":{"io.modelcontextprotocol/ui":{}},"experimental":{"acme":{"v":1}}},"serverInfo":{"name":"t","title":"t","version":"0"}}}
+        \\
+    );
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"capabilities\":{\"tools\":{},\"extensions\":{\"io.modelcontextprotocol/ui\":{}},\"experimental\":{\"acme\":{\"v\":1}}}") != null);
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {

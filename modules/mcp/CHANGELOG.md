@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Custom methods and capability extras (S2 R9). `Server.addMethod` / `addNotification`
+  register a request or notification this module does not define (`MethodRequest`: params, the request
+  context, `write`/`print` of the result object, `failWith`); per-method `stateless`/`session`. A
+  2026-07-28 answer gets `resultType` + `_meta.serverInfo`. Built-in names are refused
+  (`ReservedMethod`). `Server.setCapabilityExtras` advertises `capabilities.extensions` (SEP-2133) and
+  `experimental` in `initialize` and `server/discover`. Additive.
 - **2026-10-20** — Content blocks (S2 R1). `Content` (`text` with annotations, `image`, `audio`,
   `resource_link`, embedded `resource`) — `ToolCall.add`/`addImage`/`addAudio` append blocks after the
   text one (a result with no text and some blocks is the blocks alone);

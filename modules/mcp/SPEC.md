@@ -427,7 +427,7 @@ coordinator's under the rule "parity with the reference, or safer":
 | R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (bxp request) | S | **DONE 2026-10-20** |
 | R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | **DONE 2026-10-20** — `schema_check.zig` (2020-12 subset, JSON-Schema-Test-Suite 625 cases) |
 | R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | **DONE 2026-10-20** |
-| R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | do — generic hook; Apps/Skills helpers later |
+| R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | **DONE 2026-10-20** — `addMethod`/`addNotification`, `setCapabilityExtras`; Apps/Skills helpers later |
 | R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | **DONE 2026-10-20** |
 | R11 | `completion/complete` for prompt arguments and template variables | M | do |
 | R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | do — both SDKs ship it |
