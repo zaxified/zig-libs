@@ -53,13 +53,10 @@
 //!
 //! Provenance: original scaffold by the zig-libs authors (MIT), modeled
 //! after Java `BigDecimal` / IBM General Decimal Arithmetic (design
-//! reference only). The KAT vectors wired in below are drawn from the actual
-//! IBM/Mike Cowlishaw `decTest` suite v2.62 (add.decTest / multiply.decTest /
-//! quantize.decTest / rounding.decTest inline; remainder / min / max /
-//! squareroot / power as `src/testdata/*.vec`), "Reproduced with permission
-//! ... Copyright 1997, 2009 by International Business Machines Corporation"
-//! per https://speleotrove.com/decimal/dectest.html — see per-block
-//! provenance comments below, each vector file's header, and NOTICE.
+//! reference only). Test data is our own: a few hand-written known-answer
+//! tests inline, and generated conformance tables (`src/testdata/conform_*.vec`,
+//! produced by `tools/py_conform.py`, expected values from Python's `decimal`
+//! module) — see the "conformance tables" comment below and NOTICE.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -263,7 +260,7 @@ pub const BigDecimal = struct {
     /// `coeff`/`exponent` *is* the value's actual stored precision (Java
     /// `BigDecimal` / GDA semantics — `1.50` and `1.5` are distinct
     /// `BigDecimal`s with different scales that happen to `order()` equal;
-    /// see the `mulx011`/`mulx012`/`addx007`/`addx008` KAT below, which only
+    /// see the exact add/mul KATs below, which only
     /// pass because trailing zeros are preserved). Zero always prints as
     /// plain `"0"` regardless of `exponent` or its sign bit; `toSci` and
     /// `toStringFixed` show a zero's scale (`0.00`, `0E+2`), and no function
@@ -707,7 +704,7 @@ pub const BigDecimal = struct {
     /// **truncated** integer division, `a − trunc(a/b) × b`.
     ///
     /// The result takes the sign of the **dividend**, never the divisor —
-    /// `-2.4 rem 1 = -0.4` while `2.4 rem -1 = 0.4` (decTest remx011/remx012).
+    /// `-2.4 rem 1 = -0.4` while `2.4 rem -1 = 0.4` (`-2.4 rem 1` and `2.4 rem -1` differ in sign only).
     /// The result exponent is `min(a.exponent, b.exponent)`, the GDA rule, so
     /// `5 rem 2.000` is `1.000` and not `1`.
     ///
@@ -718,7 +715,7 @@ pub const BigDecimal = struct {
     /// Deliberate divergence from GDA, stated so it isn't mistaken for a bug:
     /// GDA raises `Division_impossible` when the *integer quotient* would need
     /// more digits than the context precision. This module has no context
-    /// precision, so it just returns the exact answer. Those decTest cases are
+    /// precision, so it just returns the exact answer. Reference-implementation cases of that kind are
     /// skipped rather than asserted — see the vector file header.
     pub fn remainder(allocator: Allocator, a: BigDecimal, b: BigDecimal) DivError!BigDecimal {
         if (b.isZero()) return error.DivisionByZero;
@@ -742,7 +739,7 @@ pub const BigDecimal = struct {
         // Truncating division: the remainder carries the dividend's sign,
         // which is exactly the GDA/Java rule. (`divFloor` would instead take
         // the divisor's sign — that is `modulo`, a different operation, and
-        // remx011/remx012 tell the two apart.)
+        // `-2.4 rem 1` versus `2.4 rem -1` tells the two apart.)
         try q.divTrunc(&r, &an, &bn);
         return .{ .coeff = r, .exponent = lo_exp };
     }
@@ -755,7 +752,7 @@ pub const BigDecimal = struct {
     /// do": ties go to the operand with the **larger** exponent when the value
     /// is positive and the **smaller** exponent when it is negative — i.e.
     /// always the one whose representation is "further from zero" in scale
-    /// terms (decTest maxx282/maxx283). Signs never actually differ on a
+    /// terms (`max(-1.0, -1.00)` is `-1.00`). Signs never actually differ on a
     /// numeric tie except for zeros, where GDA prefers `+0`.
     pub fn max(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
         return if (try pickA(allocator, a, b, true)) a.clone() else b.clone();
@@ -779,7 +776,7 @@ pub const BigDecimal = struct {
     /// and **not** a General Decimal Arithmetic rule — GDA bounds results by
     /// the context precision, which this module does not have. It exists
     /// because `pow` in particular turns a small input into an unbounded
-    /// output: `1.1 ^ 1000000007` (a real case in the decTest `power` file)
+    /// output: `1.1 ^ 1000000007` (a plausible request, e.g. from a fuzzer)
     /// has on the order of 10^8 decimal digits, and computing it would exhaust
     /// memory long before returning. The budget is checked **before** any
     /// allocation, from the operand's digit count, never after the fact.
@@ -814,9 +811,8 @@ pub const BigDecimal = struct {
     /// `mode` is a generalisation: GDA fixes square-root at round-half-even.
     /// A tie is possible only when the scaled root is an exact integer ending
     /// in `5·10^(drop−1)`, so the mode is almost never observable — it is
-    /// exposed for consistency with the rest of the module, and the decTest
-    /// blocks are replayed under whichever mode their `rounding:` directive
-    /// names.
+    /// exposed for consistency with the rest of the module, and the generated
+    /// conformance table replays every mode.
     ///
     /// `error.NegativeOperand` on a negative `a` (GDA's `Invalid_operation`);
     /// `error.PrecisionTooLarge` when `prec` exceeds `max_result_digits`.
@@ -962,7 +958,7 @@ pub const BigDecimal = struct {
     /// with an argument, so the digit budget is not optional: the result has at
     /// most `precision(a) × n` digits, and that product is checked against
     /// `max_result_digits` **before anything is allocated**. Without it,
-    /// `pow("1.1", 1000000007)` — a real decTest case — asks for a
+    /// `pow("1.1", 1000000007)` asks for a
     /// ~10^8-digit number and takes the machine down with it.
     pub fn pow(allocator: Allocator, a: BigDecimal, n: i32) PowError!BigDecimal {
         if (n < 0) return error.NegativeExponent;
@@ -2645,8 +2641,8 @@ fn digitsOfLimb(v: u64) u32 {
 /// the tie: when `a` and `b` are numerically equal but stored at different
 /// exponents, GDA still names exactly one of them, and which one depends on
 /// the sign. For `max`, a positive tie picks the larger exponent and a
-/// negative tie the smaller (decTest maxx282/maxx283 and the `-0`/`-0.0`
-/// block); `min` mirrors both. Signs can only differ on a numeric tie when
+/// negative tie the smaller (`max(-1.0, -1.00)` is `-1.00`, and the
+/// `-0`/`-0.0` block); `min` mirrors both. Signs can only differ on a numeric tie when
 /// both operands are zero, where GDA prefers the positive one.
 fn pickA(allocator: Allocator, a: BigDecimal, b: BigDecimal, want_max: bool) BigDecimal.Error!bool {
     switch (try BigDecimal.order(allocator, a, b)) {
@@ -2659,8 +2655,8 @@ fn pickA(allocator: Allocator, a: BigDecimal, b: BigDecimal, want_max: bool) Big
     if (a_neg != b_neg) return if (want_max) !a_neg else a_neg;
     // Same sign, equal value: the exponent decides, and the sign flips which
     // way. `max` of two positives keeps the larger exponent but `max` of two
-    // negatives keeps the smaller one (decTest maxx036 vs maxx282), and `min`
-    // mirrors both (mnmx417: `min(-0.100, -0.10)` is `-0.10`).
+    // negatives keeps the smaller one (`max(-1.0, -1.00)` is `-1.00`, unlike two
+    // positives), and `min` mirrors both (`min(-0.100, -0.10)` is `-0.10`).
     return if (a_neg)
         (a.exponent <= b.exponent) == want_max
     else
@@ -3105,37 +3101,28 @@ test "div — division-by-zero and zero-dividend short-circuits" {
 }
 
 // ---------------------------------------------------------------------------
-// KAT — exact add/mul, from the IBM/Mike Cowlishaw General Decimal
-// Arithmetic Testcases v2.62, "Reproduced with permission ... Copyright
-// 1997, 2009 by International Business Machines Corporation"
-// (https://speleotrove.com/decimal/dectest.html), files add.decTest /
-// multiply.decTest. Test IDs kept for traceability to the source file.
+// Hand-written known-answer tests for the exact add/mul/rescale paths and the
+// rounded-division core (`roundedDivMag`, reached through `div`/`rescale`).
+// The large generated tables (Python `decimal` as oracle) follow further down,
+// in the "conformance tables" section.
 //
-// Only vectors with NO `Inexact`/`Rounded` flag in the source are used here:
-// those flags reflect the *reference implementation's* fixed context
-// precision (9 significant digits in these files), which this
-// arbitrary-precision `add`/`mul` has no equivalent of — an unflagged
-// vector's expected value is the mathematically exact result, which is
-// exactly what unbounded add/mul must reproduce. (Zero-result vectors, e.g.
-// multiply.decTest's `-1.20 * 0 -> -0.00`, are also excluded: this module's
-// `toStringAlloc` deliberately drops the exponent/sign on a zero result —
-// see its doc comment — so it cannot reproduce GDA's signed/scaled zero
-// display, only the value zero.)
+// Trailing zeros are significant here (`1.25 + 1.25 = 2.50`, `2.5 * 4 = 10.0`):
+// `toStringAlloc` keeps them, which is what these cases pin down. Zero results
+// are left to the generated tables, which compare `toSci` and so see the
+// exponent of a zero.
 // ---------------------------------------------------------------------------
 
-test "KAT: add.decTest exact vectors" {
-    const Case = struct { a: []const u8, b: []const u8, want: []const u8, id: []const u8 };
+test "KAT: exact add" {
+    const Case = struct { a: []const u8, b: []const u8, want: []const u8 };
     const cases = [_]Case{
-        .{ .id = "addx001", .a = "1", .b = "1", .want = "2" },
-        .{ .id = "addx002", .a = "2", .b = "3", .want = "5" },
-        .{ .id = "addx003", .a = "5.75", .b = "3.3", .want = "9.05" },
-        .{ .id = "addx004", .a = "5", .b = "-3", .want = "2" },
-        .{ .id = "addx005", .a = "-5", .b = "-3", .want = "-8" },
-        .{ .id = "addx006", .a = "-7", .b = "2.5", .want = "-4.5" },
-        .{ .id = "addx007", .a = "0.7", .b = "0.3", .want = "1.0" },
-        .{ .id = "addx008", .a = "1.25", .b = "1.25", .want = "2.50" },
-        .{ .id = "addx009", .a = "1.23456789", .b = "1.00000000", .want = "2.23456789" },
-        .{ .id = "addx010", .a = "1.23456789", .b = "1.00000011", .want = "2.23456800" },
+        .{ .a = "1", .b = "1", .want = "2" },
+        .{ .a = "5.75", .b = "3.3", .want = "9.05" },
+        .{ .a = "5", .b = "-3", .want = "2" },
+        .{ .a = "-5", .b = "-3", .want = "-8" },
+        .{ .a = "-7", .b = "2.5", .want = "-4.5" },
+        .{ .a = "0.7", .b = "0.3", .want = "1.0" },
+        .{ .a = "1.25", .b = "1.25", .want = "2.50" },
+        .{ .a = "1.23456789", .b = "1.00000011", .want = "2.23456800" },
     };
     for (cases) |c| {
         var a = try BigDecimal.parse(talloc, c.a);
@@ -3145,26 +3132,23 @@ test "KAT: add.decTest exact vectors" {
         var got = try BigDecimal.add(talloc, a, b);
         defer got.deinit();
         expectStr(got, c.want) catch |err| {
-            std.debug.print("KAT {s} (add.decTest) failed\n", .{c.id});
+            std.debug.print("KAT add {s} + {s} failed\n", .{ c.a, c.b });
             return err;
         };
     }
 }
 
-test "KAT: multiply.decTest exact vectors" {
-    const Case = struct { a: []const u8, b: []const u8, want: []const u8, id: []const u8 };
+test "KAT: exact mul" {
+    const Case = struct { a: []const u8, b: []const u8, want: []const u8 };
     const cases = [_]Case{
-        .{ .id = "mulx000", .a = "2", .b = "2", .want = "4" },
-        .{ .id = "mulx001", .a = "2", .b = "3", .want = "6" },
-        .{ .id = "mulx002", .a = "5", .b = "1", .want = "5" },
-        .{ .id = "mulx003", .a = "5", .b = "2", .want = "10" },
-        .{ .id = "mulx004", .a = "1.20", .b = "2", .want = "2.40" },
-        .{ .id = "mulx006", .a = "1.20", .b = "-2", .want = "-2.40" },
-        .{ .id = "mulx007", .a = "-1.20", .b = "2", .want = "-2.40" },
-        .{ .id = "mulx009", .a = "-1.20", .b = "-2", .want = "2.40" },
-        .{ .id = "mulx010", .a = "5.09", .b = "7.1", .want = "36.139" },
-        .{ .id = "mulx011", .a = "2.5", .b = "4", .want = "10.0" },
-        .{ .id = "mulx012", .a = "2.50", .b = "4", .want = "10.00" },
+        .{ .a = "2", .b = "3", .want = "6" },
+        .{ .a = "5", .b = "2", .want = "10" },
+        .{ .a = "1.20", .b = "2", .want = "2.40" },
+        .{ .a = "1.20", .b = "-2", .want = "-2.40" },
+        .{ .a = "-1.20", .b = "-2", .want = "2.40" },
+        .{ .a = "5.09", .b = "7.1", .want = "36.139" },
+        .{ .a = "2.5", .b = "4", .want = "10.0" },
+        .{ .a = "2.50", .b = "4", .want = "10.00" },
     };
     for (cases) |c| {
         var a = try BigDecimal.parse(talloc, c.a);
@@ -3174,83 +3158,40 @@ test "KAT: multiply.decTest exact vectors" {
         var got = try BigDecimal.mul(talloc, a, b);
         defer got.deinit();
         expectStr(got, c.want) catch |err| {
-            std.debug.print("KAT {s} (multiply.decTest) failed\n", .{c.id});
+            std.debug.print("KAT mul {s} * {s} failed\n", .{ c.a, c.b });
             return err;
         };
     }
 }
 
-test "KAT: quantize.decTest widening vectors (exact — no stub involved)" {
-    const Case = struct { a: []const u8, exponent: i32, want: []const u8, id: []const u8 };
-    // Only the *widening* (new_exponent <= a.exponent) vectors from
-    // quantize.decTest: these exercise rescale's fully-implemented exact
-    // branch. Narrowing vectors (e.g. quax012) are in the roundedDivMag KAT
-    // block below instead.
-    const cases = [_]Case{
-        .{ .id = "quax007", .a = "0.1", .exponent = -1, .want = "0.1" },
-        .{ .id = "quax008", .a = "0.1", .exponent = -2, .want = "0.10" },
-        .{ .id = "quax014", .a = "0.9", .exponent = -2, .want = "0.90" },
-    };
-    for (cases) |c| {
-        var a = try BigDecimal.parse(talloc, c.a);
-        defer a.deinit();
-        var got = try BigDecimal.rescale(talloc, a, c.exponent, .half_up);
-        defer got.deinit();
-        expectStr(got, c.want) catch |err| {
-            std.debug.print("KAT {s} (quantize.decTest) failed\n", .{c.id});
-            return err;
-        };
-    }
-}
+const DivCase = struct { a: []const u8, b: []const u8, scale: i32, mode: RoundingMode, want: []const u8 };
 
-// ---------------------------------------------------------------------------
-// Fable worklist — KAT vectors for roundedDivMag, exercised via div/rescale.
-//
-// Provenance: same IBM/Mike Cowlishaw decTest v2.62 suite as above; files
-// divide.decTest, quantize.decTest and rounding.decTest. The rounding.decTest
-// vectors originally test a fixed-context-precision `add` (5 significant
-// digits) under each rounding mode; they're re-expressed here as a single
-// `rescale` call on the already-summed value (e.g. `radx194`'s
-// `add(12345, 0.5)` under `half_even` becomes `rescale("12345.5", 0,
-// .half_even)`) since BigDecimal has no context-precision concept — see
-// SPEC.md. Test IDs kept for traceability to the source file/testcase.
-//
-// These all reach `roundedDivMag` (now implemented): a live regression suite
-// for the sign-aware arbitrary-precision rounding core.
-// ---------------------------------------------------------------------------
-
-const DivCase = struct { a: []const u8, b: []const u8, scale: i32, mode: RoundingMode, want: []const u8, id: []const u8 };
-
-/// GDA's context rounding for divide.decTest is `half_up`.
 pub const div_kat_vectors = [_]DivCase{
-    .{ .id = "divx001", .a = "1", .b = "1", .scale = 0, .mode = .half_up, .want = "1" },
-    .{ .id = "divx003", .a = "1", .b = "2", .scale = 1, .mode = .half_up, .want = "0.5" },
-    .{ .id = "divx007", .a = "1", .b = "3", .scale = 9, .mode = .half_up, .want = "0.333333333" },
-    .{ .id = "divx008", .a = "2", .b = "3", .scale = 9, .mode = .half_up, .want = "0.666666667" },
-    .{ .id = "divx021", .a = "5", .b = "2", .scale = 1, .mode = .half_up, .want = "2.5" },
-    .{ .id = "divx028", .a = "5", .b = "0.20", .scale = 0, .mode = .half_up, .want = "25" },
-    // Exact half-way ties (2r == d) under half_up — the audit-F1 gap: the vectors
-    // above are all terminating or non-tie, so the half_up bump-on-tie branch had
-    // no positive control (a mutation skipping the bump passed the suite clean).
-    .{ .id = "divTIE1", .a = "5", .b = "2", .scale = 0, .mode = .half_up, .want = "3" }, // 2.5 -> 3
-    .{ .id = "divTIE2", .a = "1", .b = "2", .scale = 0, .mode = .half_up, .want = "1" }, // 0.5 -> 1
-    .{ .id = "divTIE3", .a = "7", .b = "2", .scale = 0, .mode = .half_up, .want = "4" }, // 3.5 -> 4
+    .{ .a = "1", .b = "1", .scale = 0, .mode = .half_up, .want = "1" },
+    .{ .a = "1", .b = "2", .scale = 1, .mode = .half_up, .want = "0.5" },
+    .{ .a = "1", .b = "3", .scale = 9, .mode = .half_up, .want = "0.333333333" },
+    .{ .a = "2", .b = "3", .scale = 9, .mode = .half_up, .want = "0.666666667" },
+    .{ .a = "5", .b = "0.20", .scale = 0, .mode = .half_up, .want = "25" },
+    // Exact half-way ties (2r == d) under half_up: the quotients above terminate or are
+    // not ties, so these are the positive control for the bump-on-tie branch (a
+    // mutation skipping the bump once passed the suite clean).
+    .{ .a = "5", .b = "2", .scale = 0, .mode = .half_up, .want = "3" }, // 2.5 -> 3
+    .{ .a = "1", .b = "2", .scale = 0, .mode = .half_up, .want = "1" }, // 0.5 -> 1
+    .{ .a = "7", .b = "2", .scale = 0, .mode = .half_up, .want = "4" }, // 3.5 -> 4
 };
 
-const RescaleCase = struct { a: []const u8, exponent: i32, mode: RoundingMode, want: []const u8, id: []const u8 };
+const RescaleCase = struct { a: []const u8, exponent: i32, mode: RoundingMode, want: []const u8 };
 
-/// quax012 is a genuine narrowing quantize; the radx* vectors are the
-/// rounding.decTest half_even-tie-break block, recombined as described
-/// above (source: `add 12345 0.5 -> 12346` etc. under `rounding: half_even`).
 pub const rescale_kat_vectors = [_]RescaleCase{
-    .{ .id = "quax012", .a = "0.9", .exponent = 0, .mode = .half_up, .want = "1" },
-    .{ .id = "radx194", .a = "12345.5", .exponent = 0, .mode = .half_even, .want = "12346" }, // tie, odd -> bumps to even
-    .{ .id = "radx186", .a = "12346.5", .exponent = 0, .mode = .half_even, .want = "12346" }, // tie, even -> stays
-    .{ .id = "radx190", .a = "12345.4", .exponent = 0, .mode = .half_even, .want = "12345" }, // below tie -> down
-    .{ .id = "radx199", .a = "12345.6", .exponent = 0, .mode = .half_even, .want = "12346" }, // above tie -> up
+    .{ .a = "0.1", .exponent = -2, .mode = .half_up, .want = "0.10" }, // widening is exact
+    .{ .a = "0.9", .exponent = 0, .mode = .half_up, .want = "1" },
+    .{ .a = "12345.5", .exponent = 0, .mode = .half_even, .want = "12346" }, // tie, odd -> bumps to even
+    .{ .a = "12346.5", .exponent = 0, .mode = .half_even, .want = "12346" }, // tie, even -> stays
+    .{ .a = "12345.4", .exponent = 0, .mode = .half_even, .want = "12345" }, // below tie -> down
+    .{ .a = "12345.6", .exponent = 0, .mode = .half_even, .want = "12346" }, // above tie -> up
 };
 
-test "Fable worklist: div/rescale KAT (roundedDivMag)" {
+test "KAT: div/rescale (roundedDivMag)" {
     for (div_kat_vectors) |c| {
         var a = try BigDecimal.parse(talloc, c.a);
         defer a.deinit();
@@ -3259,7 +3200,7 @@ test "Fable worklist: div/rescale KAT (roundedDivMag)" {
         var got = try BigDecimal.div(talloc, a, b, c.scale, c.mode);
         defer got.deinit();
         expectStr(got, c.want) catch |err| {
-            std.debug.print("KAT {s} (divide.decTest) failed\n", .{c.id});
+            std.debug.print("KAT div {s} / {s} failed\n", .{ c.a, c.b });
             return err;
         };
     }
@@ -3269,14 +3210,14 @@ test "Fable worklist: div/rescale KAT (roundedDivMag)" {
         var got = try BigDecimal.rescale(talloc, a, c.exponent, c.mode);
         defer got.deinit();
         expectStr(got, c.want) catch |err| {
-            std.debug.print("KAT {s} (rounding/quantize.decTest) failed\n", .{c.id});
+            std.debug.print("KAT rescale {s} failed\n", .{c.a});
             return err;
         };
     }
 }
 
 // ---------------------------------------------------------------------------
-// Accessors, remainder, min/max — unit tests. The decTest conformance tables
+// Accessors, remainder, min/max — unit tests. The generated conformance tables
 // follow below.
 // ---------------------------------------------------------------------------
 
@@ -3519,8 +3460,8 @@ test "pow — exact, and the digit budget refuses before it allocates" {
     // truncated reciprocal. (Java throws here for the same reason.)
     try testing.expectError(error.NegativeExponent, BigDecimal.pow(talloc, a, -1));
 
-    // THE memory guard. decTest power.decTest really does contain exponent
-    // 1000000007; `1.1 ^ 1000000007` has ~10^8 digits and computing it would
+    // THE memory guard. An exponent such as 1000000007 is entirely plausible input;
+    // `1.1 ^ 1000000007` has ~10^8 digits and computing it would
     // exhaust this machine. The refusal is computed from precision(a) × n
     // before a single limb is allocated.
     try testing.expectError(error.ResultTooLarge, BigDecimal.pow(talloc, a, 1_000_000_007));
@@ -3538,32 +3479,31 @@ test "pow — exact, and the digit budget refuses before it allocates" {
 }
 
 // ---------------------------------------------------------------------------
-// decTest conformance tables — remainder / min / max / square-root / power.
+// Conformance tables — add / mul / quantize / divide / divPrec / remainder /
+// min / max / square-root / power.
 //
-// Provenance: the same IBM / Mike Cowlishaw "General Decimal Arithmetic
-// Testcases" v2.62 suite as the KAT blocks above, "Reproduced with permission
-// ... Copyright 1997, 2009 by International Business Machines Corporation"
-// (https://speleotrove.com/decimal/dectest.html) — see NOTICE.
+// Generated by `tools/py_conform.py` (seeded, deterministic): the operands are
+// random plus designed edge classes, every expected value comes from Python's
+// `decimal` module (the General Decimal Arithmetic reference implementation),
+// and the files are `src/testdata/conform_*.vec`, `@embedFile`d here. Python is
+// not needed at test time. Each file's header records the line format; the
+// generator's header lists the contract it respects (no signed zero, no
+// NaN/Infinity, integer non-negative `pow` exponents only, ...).
 //
-// These tables are two to three orders of magnitude larger than the
-// hand-picked blocks above (3268 square-root cases alone), so they live in
-// `src/testdata/*.vec` and are `@embedFile`d rather than inlined. Each file's
-// header records the source file, the line format, and — case by case, with
-// counts — exactly which source cases were NOT wired and under which rule.
-// The extraction is mechanical (a script; see SPEC.md), never by eye.
-//
-// Every check asserts the **exponent** as well as the digits, because for
-// these five operations the scale of the result is part of the specification:
+// Every check compares `toSci` and asserts the **exponent** as well, because
+// for these operations the scale of the result is part of the specification:
 // `remainder` takes min(ea, eb), `min`/`max` resolve a numeric tie by
 // exponent, `square-root` has an ideal exponent for exact roots, and `pow`'s
-// is `a.exponent × n`. A digits-only comparison would pass while all four
-// rules were wrong.
+// is `a.exponent × n`. A digits-only comparison would pass while all of those
+// rules were wrong. The expected case count of every file is asserted, so a
+// truncated file fails.
 // ---------------------------------------------------------------------------
 
 /// Line reader for `testdata/*.vec`: skips blank and `#` lines, splits the
 /// rest on `|` into exactly `n` fields.
 const VecReader = struct {
     it: std.mem.SplitIterator(u8, .scalar),
+    line_no: usize = 0,
 
     fn init(data: []const u8) VecReader {
         return .{ .it = std.mem.splitScalar(u8, data, '\n') };
@@ -3571,6 +3511,7 @@ const VecReader = struct {
 
     fn next(self: *VecReader, comptime n: usize) ?[n][]const u8 {
         while (self.it.next()) |raw| {
+            self.line_no += 1;
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
             var fields: [n][]const u8 = undefined;
@@ -3587,89 +3528,195 @@ const VecReader = struct {
     }
 };
 
-fn expectVec(d: BigDecimal, want: []const u8, want_exp: []const u8) !void {
-    try expectStr(d, want);
-    try testing.expectEqual(try std.fmt.parseInt(i32, want_exp, 10), d.exponent);
+/// `want` is `ERR:<name>` or a to-scientific string; `want_exp` the exponent the
+/// result must carry (`-` for an error). Takes the error union of a `BigDecimal`.
+fn expectVec(got_in: anytype, want: []const u8, want_exp: []const u8) !void {
+    if (std.mem.startsWith(u8, want, "ERR:")) {
+        if (got_in) |v| {
+            var vv = v;
+            vv.deinit();
+            return error.ExpectedError;
+        } else |err| try testing.expectEqualStrings(want[4..], @errorName(err));
+        return;
+    }
+    var v = got_in catch |err| {
+        std.debug.print("unexpected error {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer v.deinit();
+    const s = try v.toSci(talloc);
+    defer talloc.free(s);
+    try testing.expectEqualStrings(want, s);
+    try testing.expectEqual(try std.fmt.parseInt(i32, want_exp, 10), v.exponent);
 }
 
-test "decTest: remainder.decTest" {
-    var r = VecReader.init(@embedFile("testdata/remainder.vec"));
-    var n: usize = 0;
-    while (r.next(5)) |f| : (n += 1) {
-        var a = try BigDecimal.parse(talloc, f[1]);
-        defer a.deinit();
-        var b = try BigDecimal.parse(talloc, f[2]);
-        defer b.deinit();
-        var got = try BigDecimal.remainder(talloc, a, b);
-        defer got.deinit();
-        expectVec(got, f[3], f[4]) catch |err| {
-            std.debug.print("decTest {s} (remainder.decTest): {s} rem {s}\n", .{ f[0], f[1], f[2] });
-            return err;
+/// Replays `data` through `run` (one call per case, `n` fields each). Reports up
+/// to 20 failing lines in one go, then fails; `count` pins the case number.
+fn replay(comptime n: usize, data: []const u8, count: usize, comptime run: fn ([n][]const u8) anyerror!void) !void {
+    var r = VecReader.init(data);
+    var seen: usize = 0;
+    var failed: usize = 0;
+    while (r.next(n)) |f| : (seen += 1) {
+        run(f) catch |err| {
+            failed += 1;
+            if (failed <= 20) {
+                std.debug.print("conformance case (file line {d}) failed with {s}:", .{ r.line_no, @errorName(err) });
+                for (f) |x| std.debug.print(" |{s}", .{x});
+                std.debug.print("\n", .{});
+            }
         };
     }
-    try testing.expectEqual(@as(usize, 279), n); // the whole file, not a prefix
+    try testing.expectEqual(@as(usize, 0), failed);
+    try testing.expectEqual(count, seen); // the whole file, not a prefix
 }
 
-test "decTest: min.decTest and max.decTest" {
-    inline for (.{ "min", "max" }) |op| {
-        var r = VecReader.init(@embedFile("testdata/" ++ op ++ ".vec"));
-        var n: usize = 0;
-        while (r.next(5)) |f| : (n += 1) {
-            var a = try BigDecimal.parse(talloc, f[1]);
-            defer a.deinit();
-            var b = try BigDecimal.parse(talloc, f[2]);
-            defer b.deinit();
-            var got = if (comptime std.mem.eql(u8, op, "min"))
-                try BigDecimal.min(talloc, a, b)
-            else
-                try BigDecimal.max(talloc, a, b);
-            defer got.deinit();
-            expectVec(got, f[3], f[4]) catch |err| {
-                std.debug.print("decTest {s} ({s}.decTest): {s}, {s}\n", .{ f[0], op, f[1], f[2] });
-                return err;
-            };
-        }
-        try testing.expectEqual(@as(usize, 105), n);
-    }
+fn bigOf(s: []const u8) !BigDecimal {
+    return BigDecimal.parse(talloc, s);
 }
 
-test "decTest: squareroot.decTest" {
-    var r = VecReader.init(@embedFile("testdata/sqrt.vec"));
-    var n: usize = 0;
-    while (r.next(6)) |f| : (n += 1) {
-        var a = try BigDecimal.parse(talloc, f[1]);
-        defer a.deinit();
-        const prec = try std.fmt.parseInt(u32, f[2], 10);
-        const mode = std.meta.stringToEnum(RoundingMode, f[3]).?;
-        var got = try BigDecimal.sqrt(talloc, a, prec, mode);
-        defer got.deinit();
-        expectVec(got, f[4], f[5]) catch |err| {
-            std.debug.print(
-                "decTest {s} (squareroot.decTest): sqrt({s}) at precision {d}, {s}\n",
-                .{ f[0], f[1], prec, f[3] },
-            );
-            return err;
-        };
-    }
-    try testing.expectEqual(@as(usize, 3268), n);
+fn runAdd(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    try expectVec(BigDecimal.add(talloc, a, b), f[2], f[3]);
 }
 
-test "decTest: power.decTest (integer exponents)" {
-    var r = VecReader.init(@embedFile("testdata/pow.vec"));
-    var n: usize = 0;
-    while (r.next(5)) |f| : (n += 1) {
-        var a = try BigDecimal.parse(talloc, f[1]);
-        defer a.deinit();
-        const e = try std.fmt.parseInt(i32, f[2], 10);
-        var got = try BigDecimal.pow(talloc, a, e);
-        defer got.deinit();
-        expectVec(got, f[3], f[4]) catch |err| {
-            std.debug.print("decTest {s} (power.decTest): {s} ^ {d}\n", .{ f[0], f[1], e });
-            return err;
-        };
-    }
-    try testing.expectEqual(@as(usize, 130), n);
+fn runMul(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    try expectVec(BigDecimal.mul(talloc, a, b), f[2], f[3]);
 }
+
+fn runQuant(f: [5][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    const mode = std.meta.stringToEnum(RoundingMode, f[2]).?;
+    try expectVec(BigDecimal.rescale(talloc, a, try std.fmt.parseInt(i32, f[1], 10), mode), f[3], f[4]);
+}
+
+fn runDiv(f: [6][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    const mode = std.meta.stringToEnum(RoundingMode, f[3]).?;
+    try expectVec(BigDecimal.div(talloc, a, b, try std.fmt.parseInt(i32, f[2], 10), mode), f[4], f[5]);
+}
+
+fn runDivPrec(f: [8][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    const mode = std.meta.stringToEnum(RoundingMode, f[3]).?;
+    const got = BigDecimal.divPrec(talloc, a, b, try std.fmt.parseInt(u32, f[2], 10), mode);
+    if (std.mem.startsWith(u8, f[4], "ERR:")) {
+        if (got) |v| {
+            var vv = v;
+            vv.value.deinit();
+            return error.ExpectedError;
+        } else |err| return testing.expectEqualStrings(f[4][4..], @errorName(err));
+    }
+    var v = try got;
+    defer v.deinit();
+    const s = try v.value.toSci(talloc);
+    defer talloc.free(s);
+    try testing.expectEqualStrings(f[4], s);
+    try testing.expectEqual(try std.fmt.parseInt(i32, f[5], 10), v.value.exponent);
+    try testing.expectEqual(f[6][0] == '1', v.inexact);
+    try testing.expectEqual(f[7][0] == '1', v.rounded);
+}
+
+fn runRem(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    try expectVec(BigDecimal.remainder(talloc, a, b), f[2], f[3]);
+}
+
+fn runMin(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    try expectVec(BigDecimal.min(talloc, a, b), f[2], f[3]);
+}
+
+fn runMax(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    var b = try bigOf(f[1]);
+    defer b.deinit();
+    try expectVec(BigDecimal.max(talloc, a, b), f[2], f[3]);
+}
+
+fn runSqrt(f: [5][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    const mode = std.meta.stringToEnum(RoundingMode, f[2]).?;
+    try expectVec(BigDecimal.sqrt(talloc, a, try std.fmt.parseInt(u32, f[1], 10), mode), f[3], f[4]);
+}
+
+fn runPow(f: [4][]const u8) anyerror!void {
+    var a = try bigOf(f[0]);
+    defer a.deinit();
+    try expectVec(BigDecimal.pow(talloc, a, try std.fmt.parseInt(i32, f[1], 10)), f[2], f[3]);
+}
+
+test "conformance: add (exact)" {
+    try replay(4, @embedFile("testdata/conform_add.vec"), COUNT_ADD, runAdd);
+}
+
+test "conformance: mul (exact)" {
+    try replay(4, @embedFile("testdata/conform_mul.vec"), COUNT_MUL, runMul);
+}
+
+test "conformance: quantize / rescale, all rounding modes" {
+    try replay(5, @embedFile("testdata/conform_quant.vec"), COUNT_QUANT, runQuant);
+}
+
+test "conformance: div at a given scale, all rounding modes" {
+    try replay(6, @embedFile("testdata/conform_div.vec"), COUNT_DIV, runDiv);
+}
+
+test "conformance: divPrec at a given precision, all rounding modes" {
+    try replay(8, @embedFile("testdata/conform_divprec.vec"), COUNT_DIVPREC, runDivPrec);
+}
+
+test "conformance: remainder" {
+    try replay(4, @embedFile("testdata/conform_rem.vec"), COUNT_REM, runRem);
+}
+
+test "conformance: min" {
+    try replay(4, @embedFile("testdata/conform_min.vec"), COUNT_MIN, runMin);
+}
+
+test "conformance: max" {
+    try replay(4, @embedFile("testdata/conform_max.vec"), COUNT_MAX, runMax);
+}
+
+test "conformance: square root, precisions 1..60 and large, all rounding modes" {
+    try replay(5, @embedFile("testdata/conform_sqrt.vec"), COUNT_SQRT, runSqrt);
+}
+
+test "conformance: pow (integer exponents, typed errors)" {
+    try replay(4, @embedFile("testdata/conform_pow.vec"), COUNT_POW, runPow);
+}
+
+const COUNT_ADD = 1044;
+const COUNT_MUL = 702;
+const COUNT_QUANT = 5044;
+const COUNT_DIV = 1700;
+const COUNT_DIVPREC = 1820;
+const COUNT_REM = 1272;
+const COUNT_MIN = 976;
+const COUNT_MAX = 976;
+const COUNT_SQRT = 3411;
+const COUNT_POW = 1034;
 
 // ---------------------------------------------------------------------------
 // Float bridge — every expected value below comes from an EXTERNAL oracle:

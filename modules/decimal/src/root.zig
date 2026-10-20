@@ -65,8 +65,8 @@ pub const meta = .{
 pub const RoundingMode = @import("rounding_mode.zig").RoundingMode;
 
 /// Arbitrary-precision decimal (`std.math.big.int`-backed significand ×
-/// 10^exponent). Rounding core complete and KAT-covered against the IBM/
-/// Mike Cowlishaw decTest suite — see big.zig's module doc for the full
+/// 10^exponent). Rounding core complete and covered by generated conformance
+/// tables whose expected values come from Python `decimal` — see big.zig's module doc for the full
 /// status writeup (no open backlog).
 pub const BigDecimal = big_impl.BigDecimal;
 

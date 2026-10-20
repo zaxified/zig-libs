@@ -12,7 +12,7 @@
 
 **Performance:** ref 0.02–1.04× libmpdec 4.0.1 (built -O2 from source; `zig build bench-decimal`: parse, add/sub chain, mul rounded to 12 and 2 places, divRound to 12, toString on 100k money values; BigDecimal add/mul/divPrec/sqrt at 28 and 200 digits; our BigDecimal results on a bump allocator rewound per batch, as libmpdec reuses its result) · fastest 2.39× worst vs the faster of libmpdec and rust_decimal 1.42.1 (parse; mul/divRound 0.4–1.0×) (measured 2026-10-20)
 
-**Evidence:** model — expected values from Python 3.14 decimal (frozen: `src/testdata/s2_oracle.vec`, 14 851 cases over every op added 2026-10-20, all 8 rounding modes, `tools/py_oracle.py`) + IBM decTest subsets + random-bit-pattern float round trip; fuzz never-panic only
+**Evidence:** model — expected values from Python 3.14 decimal (frozen: `src/testdata/s2_oracle.vec`, 14 851 cases over every op added 2026-10-20, all 8 rounding modes, `tools/py_oracle.py`; and `src/testdata/conform_*.vec`, 17 979 cases over add/mul/quantize/div/divPrec/remainder/min/max/sqrt/pow, `tools/py_conform.py`) + random-bit-pattern float round trip; fuzz never-panic only
 
 **Known defects:** none recorded
 
@@ -34,7 +34,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [AS400JPLPC/zig_decimal](https://github.com/AS400JPLPC/zig_decimal) | Zig | MIT | 3 | pushed 2025-12-21 | README: "with mpdecimal as a backdrop" — wraps or follows the C library *(inferred which)*; targets a Zig 0.15 nightly. |
 | Zig `std.math.big.int` | Zig | MIT | — | Zig 0.16.0 | Integers only (no decimal type in `lib/std/math/big/`); this module's `BigDecimal` is built on it. |
 
-**Where we are ahead:** against every Zig entry: the only pure-Zig decimal with **both** a fixed-scale money type (i128, 12 digits, i256 intermediates, typed `Overflow`, 8 GDA rounding modes (`round_05up` since 2026-10-20) with exact half-way detection) **and** an arbitrary-precision `BigDecimal` replayed against the IBM decTest vectors (remainder 279, min/max 105 each, square-root 3268, power 130 cases, plus divide/rounding/quantize subsets); `sqrt` is correctly rounded, not iterated. **Where we are behind:** no `Infinity`/`NaN`/signed zero or condition-flag register (typed errors and per-call `{inexact, rounded}` instead), since 2026-10-20 also correctly rounded `exp`/`ln`/`log10`/`power`; and precision rounding, `divPrec`, sci/eng output, `rem`/`divideInteger`/`remainderNear`/`compareTotal`, `pow`/`sqrt` on `Decimal` and fixed-places output exist. The float bridge (`fromFloat`/`fromFloatShortest`/`toFloat` on both types, exact and correctly rounded, at the entry points only) closed 2026-09-30 (→ Design & invariants).
+**Where we are ahead:** against every Zig entry: the only pure-Zig decimal with **both** a fixed-scale money type (i128, 12 digits, i256 intermediates, typed `Overflow`, 8 GDA rounding modes (`round_05up` since 2026-10-20) with exact half-way detection) **and** an arbitrary-precision `BigDecimal` replayed against our own generated vectors with Python `decimal` as oracle (`conform_*.vec`: remainder 1272, min/max 976 each, square-root 3411, power 1034 cases, plus add/mul/quantize/div/divPrec); `sqrt` is correctly rounded, not iterated. **Where we are behind:** no `Infinity`/`NaN`/signed zero or condition-flag register (typed errors and per-call `{inexact, rounded}` instead), since 2026-10-20 also correctly rounded `exp`/`ln`/`log10`/`power`; and precision rounding, `divPrec`, sci/eng output, `rem`/`divideInteger`/`remainderNear`/`compareTotal`, `pow`/`sqrt` on `Decimal` and fixed-places output exist. The float bridge (`fromFloat`/`fromFloatShortest`/`toFloat` on both types, exact and correctly rounded, at the entry points only) closed 2026-09-30 (→ Design & invariants).
 
 ## Design & invariants
 Pure integer, no float *arithmetic*, never UB (the one float boundary is the bridge below): `i128` scaled by `10^12` (12 fractional digits), range ±1.7e26
@@ -121,7 +121,7 @@ pass — but every primitive it needs (division, remainder, magnitude comparison
 std, so it is not an irreducibly novel algorithm the way the underlying bignum division itself
 would have been. Closer to an Opus-tier "get every edge case exactly right" task than a true
 from-scratch Fable algorithm-design task; routed to the Fable worklist anyway because of the
-correctness stakes and the value of an exhaustive decTest-style pass, not because it's
+correctness stakes and the value of an exhaustive conformance pass, not because it's
 algorithmically novel.
 
 **The rounding primitive:** `roundedDivMag` in `modules/decimal/src/big.zig` (see its doc comment
@@ -131,7 +131,7 @@ to resolve the discarded remainder for all 7 `RoundingMode`s, sign-aware. It gen
 `i256` `divRoundMag` mode-for-mode. Everything rounding-sensitive routes through it: `div` (always),
 `rescale`/`quantize`/`roundToIntegral` (only when narrowing precision — their widening branch is a
 pure multiply). KAT vectors (`div_kat_vectors`/`rescale_kat_vectors` in big.zig) are a live
-regression suite over divide.decTest + the rounding.decTest half-even tie block.
+regression suite for the half-up and half-even tie paths, next to the generated tables.
 
 **Operation surface beyond the rounding core:** `remainder` (truncated-division remainder — sign of
 the *dividend*, exponent `min(ea, eb)`), `min`/`max` (GDA tie rule: equal values resolve by
@@ -153,8 +153,8 @@ vector files keep operands in their original scaled form rather than a flattened
 **`sqrt`/`pow` have a digit budget; every other op does not need one.** `max_result_digits`
 (100,000) bounds what a single operation will *produce*, checked **before** allocating — from
 `precision(a) × n` for `pow` and from `prec` for `sqrt`. Like `max_align_shift` this is a pragmatic
-guard, not a GDA rule. It is not optional for `pow`: power.decTest genuinely contains exponent
-`1000000007`, and `1.1 ^ 1000000007` is a ~10^8-digit number that exhausts memory long before it
+guard, not a GDA rule. It is not optional for `pow`: an exponent like
+`1000000007` is plausible input, and `1.1 ^ 1000000007` is a ~10^8-digit number that exhausts memory long before it
 returns. `pow` is **integer-exponent-only** (the `java.math.BigDecimal.pow(int)` contract: exact,
 result exponent `a.exponent × n`, negative `n` refused); GDA's general `power` over non-integer
 exponents needs `exp`/`ln` on arbitrary-precision decimals — a transcendental-function project of
@@ -190,26 +190,28 @@ rounding at the 12th-digit boundary both signs; i256-intermediate large-product 
 formatting exactly; hostile parse (mantissa×exponent) not trapping. RoundingMode: 16-row × 7-mode
 truth table hand-derived from BigDecimal/GDA/Python definitions, plus half-way-at-2dp every mode
 both signs, and `rescale`/`divRound`/`quantize` edges. `BigDecimal`: parse/format round-trip incl.
-beyond-i128 magnitudes, exact add/sub/mul, normalize, compare, widening-rescale, and KAT drawn from
-the IBM/Mike Cowlishaw General Decimal Arithmetic Testcases v2.62 (add.decTest/multiply.decTest/
-quantize.decTest exact subsets; divide.decTest/rounding.decTest vectors exercising `roundedDivMag`
-sign-aware at arbitrary precision).
+beyond-i128 magnitudes, exact add/sub/mul, normalize, compare, widening-rescale, and hand-written
+known-answer tests plus the generated tables below (`roundedDivMag` sign-aware at arbitrary precision).
 
-**decTest conformance tables** (`src/testdata/*.vec`, `@embedFile`d by big.zig): remainder 279,
-min 105, max 105, square-root 3268, integer power 130 cases. Extracted mechanically by script from
-the v2.62 suite — never transcribed by eye — with the directives (`precision:`/`rounding:`) tracked
-so each case replays under its own context. Every check asserts the **exponent** as well as the
-digits, because for these five operations the result's scale is part of the specification and a
-digits-only comparison would pass with all four scale rules wrong. Operands are carried through as
-their raw source tokens (`1E+2`, not `100`) since square-root's ideal exponent depends on the
-operand's stored scale. Each file's header records, with counts, exactly which source cases were
-*not* wired and under which rule: hard condition flags with no analogue here (no `Inf`/`NaN`, no
-flag register), zero results (this module prints a bare `"0"`), context-precision `Inexact`/
-`Rounded` on the exact operations, non-integer/negative `power` exponents, and anything past the
-stated extraction bounds (`|exponent| > 10_000` or `> 1000` coefficient digits). `remainder`
-additionally diverges from GDA by design: GDA raises `Division_impossible` when the integer quotient
-exceeds the context precision, and with no context precision this module simply returns the exact
-answer, so those 29 cases are skipped rather than asserted.
+**Conformance tables** (`src/testdata/conform_*.vec`, `@embedFile`d by big.zig, generated by
+`tools/py_conform.py`, seeded and deterministic): `add` 1044, `mul` 702, quantize/`rescale` 5044
+(all 8 modes, exact ties at several exponents), `div` at a scale 1700, `divPrec` 1820, `remainder`
+1272, `min` 976, `max` 976, square-root 3411 (precisions 1..60 plus 100..1000, all 8 modes, exact roots
+with the ideal exponent), integer power 1034 cases. Operands are our own (random plus designed edge
+classes: carries, huge exponent gaps, ties, trailing zeros, mixed signs); every expected value is
+computed by Python's `decimal` module. Every check compares `toSci` and asserts the **exponent** as
+well, because for these operations the result's scale is part of the specification and a digits-only
+comparison would pass with the scale rules wrong; the case count of each file is asserted so a
+truncated file fails. Python's `sqrt` rounds half-even only, so for the other modes the expected
+value is the root at a much higher precision rounded once in the mode (half-even is also checked
+against Python's direct result). The generator respects this module's contract and never emits: a
+signed zero, NaN/Infinity, a flag other than `divPrec`'s, a context-precision `Inexact`/`Rounded`
+on the exact operations, or `0^n` with `n > 0` (Python keeps the zero's scaled exponent, this module
+returns `0` at exponent 0: documented choice). `pow` with a negative exponent, over the digit budget
+or past the `i32` exponent range expects the typed error. `remainder` diverges from GDA by design:
+GDA raises `Division_impossible` when the integer quotient exceeds the context precision, and with no
+context precision this module returns the exact answer; the generator keeps quotients within
+Python's context so the two agree.
 
 **Mutation-tested.** 16 mutations were applied one at a time and each confirmed to turn a test red,
 with the tree restored byte-identical afterwards: sqrt's half-way comparison inverted; sqrt's ideal
@@ -262,9 +264,10 @@ values (bxp expr.zig:2806-2989, 4705) — the module lacks them.
 | — | Bug found: `BigDecimal.sqrt` bumped an exact root in `up`/`ceiling` when the discarded digits were zero (`sqrt(100.00)` at prec 2 → 11, Python 10) | – | **FIXED 2026-10-20** with a test |
 | R8–R12 | Inf/NaN + trap register, scale kept in `Decimal`, serde, allocation helper, parse extras | – | not doing (contract: typed errors, DECIMAL(38,12)); R10 serde optional |
 
-⚠ Owner question (2026-10-20): the vendored IBM dectest vectors carry "Copyright (c) IBM … All rights
-reserved" with no licence grant (speleotrove only says "reproduced with permission"); CPython and apd
-redistribute them. Bench: `tools/bench.zig` (libmpdec C driver, rust_decimal), DONE 2026-10-20.
+Decision (owner, 2026-10-20): the IBM General Decimal Arithmetic *test cases* carry "Copyright (c) IBM …
+All rights reserved" with no licence grant, so they are not used; they were removed and replaced by our own
+generated vectors (`tools/py_conform.py`, expected values from Python `decimal`). The IBM *specification*
+stays a design reference only. Bench: `tools/bench.zig` (libmpdec C driver, rust_decimal), DONE 2026-10-20.
 None open. The rounding core (`roundedDivMag`) is implemented and KAT-covered, and the
 `java.math.BigDecimal`/GDA operation gaps (`sqrt`, `pow`, `remainder`, `min`, `max`, `precision`,
 `signum`, `scaleByPowerOfTen`, `stripTrailingZeros`) plus the `Decimal` ↔ `BigDecimal` bridge are
