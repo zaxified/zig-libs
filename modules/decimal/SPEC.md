@@ -246,6 +246,25 @@ digits of an exponent literal, so `1e0000000000000012` had exponent 1 (now leadi
 skipped and more than 15 significant digits is `Overflow`).
 
 ## Backlog / deferred
+
+**S2 plan — survey 2026-10-20** (Sonnet, read-only; Python decimal/libmpdec, cockroachdb/apd, shopspring,
+rust_decimal, bigdecimal-rs, Java BigDecimal). bxp hand-rolls MOD/MROUND/TRUNC/SIGN/POWER/SQRT on raw
+values (bxp expr.zig:2806-2989, 4705) — the module lacks them.
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | `BigDecimal.roundToPrecision(prec, mode)` + `divPrec(a, b, prec, mode)` returning `{value, inexact, rounded}` | M | do (also opens dectest replay of add/mul/div with context precision) |
+| R2 | `Decimal.rem`, `roundToMultiple`, `pow(i32)`, `sqrt`, `signum`, `min`/`max` | S each | do |
+| R3 | Fixed-places output `toStringFixed(places)`; `BigDecimal.format` | S | do |
+| R4 | Scientific / engineering output; zero with scale | S (display) | do (signed zero: not, `Decimal` has none) |
+| R5 | `ROUND_05UP` (8th GDA mode) | S | do — source-breaking for an exhaustive switch |
+| R6 | `divideInteger`, `remainderNear`, `compareTotal`, `maxMag`/`minMag`, `adjusted` | S-M | do |
+| R7 | `exp`/`ln`/`log10`/non-integer `pow` (correctly rounded) | L | later, own step (no in-house consumer; Python/apd/rust_decimal have it) |
+| R8–R12 | Inf/NaN + trap register, scale kept in `Decimal`, serde, allocation helper, parse extras | – | not doing (contract: typed errors, DECIMAL(38,12)); R10 serde optional |
+
+⚠ Owner question (2026-10-20): the vendored IBM dectest vectors carry "Copyright (c) IBM … All rights
+reserved" with no licence grant (speleotrove only says "reproduced with permission"); CPython and apd
+redistribute them. Bench plan: reference libmpdec built from source (C driver), fastest rust_decimal.
 None open. The rounding core (`roundedDivMag`) is implemented and KAT-covered, and the
 `java.math.BigDecimal`/GDA operation gaps (`sqrt`, `pow`, `remainder`, `min`, `max`, `precision`,
 `signum`, `scaleByPowerOfTen`, `stripTrailingZeros`) plus the `Decimal` ↔ `BigDecimal` bridge are
