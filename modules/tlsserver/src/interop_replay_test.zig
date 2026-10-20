@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
-//! Replays the OpenSSL `s_client` sessions `tools/interop.zig --capture`
-//! recorded (`interop_vectors.zig`): a server with the recorded
+//! Replays the OpenSSL `s_client` and Go crypto/tls client sessions
+//! `tools/interop.zig --capture` recorded (`interop_vectors.zig`): a server with the recorded
 //! configuration and seed is driven through `Connection` over a reader
 //! holding exactly the octets OpenSSL sent, runs the same application
 //! protocol (receive "ping\n", answer "pong\n", close_notify, read to the
 //! client's close_notify), and must write exactly the octets OpenSSL
 //! accepted. A change to anything the server puts on the wire — or to what
-//! it accepts — fails here, in every test lane, with no OpenSSL around.
+//! it accepts — fails here, in every test lane, with neither OpenSSL nor Go
+//! around.
 
 const std = @import("std");
 const testing = std.testing;
@@ -90,7 +91,7 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
 }
 
-test "OpenSSL s_client sessions replay byte-exact through Connection" {
+test "OpenSSL and Go client sessions replay byte-exact through Connection" {
     for (vectors.cases) |v| {
         replay(testing.allocator, v) catch |err| {
             std.debug.print("case {s}: {t}\n", .{ v.name, err });
@@ -104,6 +105,7 @@ test "a recording with one octet of OpenSSL's flipped is refused" {
     // application data; flipping the final octet of the recording hits
     // the client's close_notify (sealed) instead: bad_record_mac either way.
     const v = vectors.cases[1];
+    try testing.expectEqualStrings("p256-aes128", v.name);
     const flipped = try testing.allocator.dupe(u8, v.client);
     defer testing.allocator.free(flipped);
     flipped[flipped.len - 1] ^= 1;

@@ -54,7 +54,7 @@ and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls cl
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
-the `tlsserver-record`, `-inbound`, `-hello` and `-keys` harnesses (`SPEC.md` § Fuzzing). Dead
+the `tlsserver-record`, `-inbound`, `-hello`, `-keys` and `-server` harnesses (`SPEC.md` § Fuzzing). Dead
 stack: `src/stackprobe_test.zig` (ReleaseFast). Example: `zig build run-example-tlsserver`.
 
 Provenance: clean-room from RFC 8446 (a public standard), no third-party source ported or

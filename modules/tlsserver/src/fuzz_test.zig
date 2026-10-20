@@ -10,7 +10,8 @@
 //! bytes in place of the ciphertext — or opened under another sequence number
 //! is refused, never accepted unless identical, never a panic; a refused
 //! record never advances the sequence number.
-//! `tlsserver-keys` (`keys.CertKeyPair.fromPem`) is described at its section.
+//! `tlsserver-keys` (`keys.CertKeyPair.fromPem`) and `tlsserver-server`
+//! (`Server` on recorded real clients) are described at their sections.
 
 const std = @import("std");
 const testing = std.testing;
@@ -1144,4 +1145,377 @@ test "fuzz driver: TLSSERVER_FUZZ (keys)" {
 }
 test "fuzz harness: keys, 400 seeds, reaches every outcome" {
     try KeyMark.reach(fuzzKeys, "tlsserver-keys", 400);
+}
+
+// ── tlsserver-server ─────────────────────────────────────────────────────
+//
+// `Server` as a whole, fed real clients: the OpenSSL and Go sessions in
+// `interop_vectors.zig`. A server with the recorded seed is a function of
+// what it receives, so the genuine stream — cut into random chunks, down to
+// one octet at a time — must produce the recorded output byte for byte.
+// Damaged streams:
+//
+// - a flipped bit in a record's body (the plaintext ClientHello is in the
+//   transcript, everything after it is sealed) never ends like the genuine
+//   session, and when it hits a record up to the client's Finished the
+//   handshake never completes;
+// - a flipped bit in a record header may be refused, stall or (for octets
+//   no one reads) pass — but passing means the recorded output;
+// - (white box: the harness takes the client's handshake traffic secret
+//   from the server, which only it can, as no change to the ClientHello
+//   leaves the client's keys valid) the client's Finished opened and
+//   resealed: damaged — a flipped verify_data bit, one octet short, another
+//   message type — it is refused and the handshake never completes; intact
+//   with random padding, the session ends as recorded;
+// - a truncated stream never errs and its output is a prefix of the
+//   recording;
+// - random octets spliced in at a record boundary;
+//
+// and over all of them: a failure leaves `feed` returning `Closed`; a
+// failure before the server wrote anything leaves exactly the plaintext
+// fatal alert `alertFor` names, after its flight one sealed alert record;
+// application data never precedes `handshake_done`; `write` before it is
+// `NotConnected`.
+
+const server_mod = @import("server.zig");
+const interop = @import("interop_vectors.zig");
+const certs = @import("test_certs.zig");
+const rsa = @import("rsa");
+
+const SrvMark = Marker(enum {
+    openssl_case,
+    go_case,
+    genuine_chunked,
+    genuine_bytewise,
+    truncated_waits,
+    body_flip_refused,
+    body_flip_before_finished,
+    header_flip_refused,
+    header_flip_passed,
+    header_flip_stalled,
+    splice_refused,
+    finished_forged_refused,
+    finished_repadded,
+    plain_alert,
+    sealed_alert,
+    closed_after_error,
+});
+
+const FuzzKeys = struct {
+    p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey,
+    p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
+    ed25519: std.crypto.sign.Ed25519.SecretKey,
+    rsa2048: rsa.SecretKey,
+    chains: [4][1][]const u8,
+    cks: [4]server_mod.CertifiedKey,
+};
+var fuzz_keys: ?*FuzzKeys = null;
+
+/// Built once per process (RSA's parse dominates a run otherwise); never
+/// freed — test-only, and the driver's leak check sees only `gpa`.
+fn fuzzKeys_() !*FuzzKeys {
+    if (fuzz_keys) |k| return k;
+    const k = try std.heap.page_allocator.create(FuzzKeys);
+    k.p256 = try .fromBytes(certs.p256_scalar);
+    k.p384 = try .fromBytes(certs.p384_scalar);
+    k.ed25519 = try .fromBytes(certs.ed25519_secret);
+    try rsa.SecretKey.fromDer(&k.rsa2048, &certs.rsa2048_pkcs1);
+    k.chains = .{ .{&certs.p256_cert}, .{&certs.p384_cert}, .{&certs.ed25519_cert}, .{&certs.rsa2048_cert} };
+    k.cks = .{
+        .{ .chain = &k.chains[0], .key = .{ .ecdsa_p256 = &k.p256 } },
+        .{ .chain = &k.chains[1], .key = .{ .ecdsa_p384 = &k.p384 } },
+        .{ .chain = &k.chains[2], .key = .{ .ed25519 = &k.ed25519 } },
+        .{ .chain = &k.chains[3], .key = .{ .rsa = &k.rsa2048 } },
+    };
+    fuzz_keys = k;
+    return k;
+}
+
+const SrvRun = struct {
+    out: std.ArrayList(u8) = .empty,
+    app: std.ArrayList(u8) = .empty,
+    handshake_done: bool = false,
+    peer_closed: bool = false,
+    answered: bool = false,
+    failure: ?server_mod.Error = null,
+
+    fn deinit(r: *SrvRun, gpa: std.mem.Allocator) void {
+        r.out.deinit(gpa);
+        r.app.deinit(gpa);
+    }
+};
+
+/// Drain the server's output into `run.out`.
+fn drainOut(server: *server_mod.Server, run: *SrvRun, gpa: std.mem.Allocator) !void {
+    const p = server.pendingOutput();
+    try run.out.appendSlice(gpa, p);
+    server.discardOutput(p.len);
+}
+
+/// Feed `stream` in chunks the source chooses (`bytewise`: one octet at a
+/// time), running the interop application protocol (answer "ping\n" with
+/// "pong\n" and close_notify), checking the invariants on the way.
+fn driveServer(comptime S: type, src: *S, gpa: std.mem.Allocator, server: *server_mod.Server, stream: []const u8, bytewise: bool, run: *SrvRun) !void {
+    const in = try gpa.alloc(u8, 2 * record.max_record_len);
+    defer gpa.free(in);
+    var have: usize = 0;
+    var at: usize = 0;
+    if (server.write("early") catch |e| e != error.NotConnected) return error.WriteBeforeHandshake;
+    while (at < stream.len or have != 0) {
+        if (at < stream.len) {
+            const n = if (bytewise) 1 else src.valueRangeAtMost(u16, 1, @intCast(@min(stream.len - at, 4096)));
+            if (have + n > in.len) return error.HarnessBufferFull;
+            @memcpy(in[have..][0..n], stream[at..][0..n]);
+            have += n;
+            at += n;
+        }
+        while (true) {
+            const out_before = run.out.items.len;
+            const closed_before = server.write_closed;
+            const r = server.feed(in[0..have]) catch |err| {
+                run.failure = err;
+                try drainOut(server, run, gpa);
+                try checkFailure(server, run, err, out_before, closed_before);
+                return;
+            };
+            if (r.consumed > have) return error.ConsumedTooMuch;
+            switch (r.event) {
+                .need_more => {},
+                .handshake_done => {
+                    if (run.handshake_done) return error.HandshakeDoneTwice;
+                    run.handshake_done = true;
+                },
+                .app_data => |d| {
+                    if (!run.handshake_done) return error.AppDataBeforeHandshake;
+                    try run.app.appendSlice(gpa, d);
+                    if (!run.answered and std.mem.endsWith(u8, run.app.items, "ping\n")) {
+                        _ = try server.write("pong\n");
+                        try server.close();
+                        run.answered = true;
+                    }
+                },
+                .peer_closed => run.peer_closed = true,
+            }
+            std.mem.copyForwards(u8, in[0 .. have - r.consumed], in[r.consumed..have]);
+            have -= r.consumed;
+            try drainOut(server, run, gpa);
+            if (run.peer_closed) return;
+            if (r.event == .need_more) break;
+        }
+        if (at == stream.len) return; // stalled: the rest is an incomplete record
+    }
+}
+
+fn checkFailure(server: *server_mod.Server, run: *SrvRun, err: server_mod.Error, out_before: usize, closed_before: bool) !void {
+    if (server.feed(@constCast("")) catch |e| e != error.Closed) return error.FeedAfterFailure;
+    SrvMark.mark(.closed_after_error);
+    const added = run.out.items[out_before..];
+    // After its own close_notify the server sends nothing more; an error
+    // that names no alert sends none.
+    const d = (if (closed_before) null else server_mod.alertFor(err)) orelse {
+        if (added.len != 0) return error.AlertAfterClose;
+        return;
+    };
+    // The alert is the last record out: in plaintext if it is all the
+    // server ever sent, else sealed (2 octets + inner type + tag) after the
+    // flight — which may have gone out in this same `feed`.
+    const all = run.out.items;
+    if (all.len == 7) {
+        const level: u8 = if (d == .close_notify) 1 else 2;
+        const want = [7]u8{ 21, 3, 3, 0, 2, level, @backingInt(d) };
+        if (!std.mem.eql(u8, all, &want)) return error.WrongPlainAlert;
+        SrvMark.mark(.plain_alert);
+        return;
+    }
+    if (added.len < 24 or all.len == 24 or !std.mem.eql(u8, all[all.len - 24 ..][0..5], &.{ 23, 3, 3, 0, 19 })) {
+        std.debug.print("{t}: {d} octets out before, added {x}\n", .{ err, out_before, added });
+        return error.MissingAlert;
+    }
+    SrvMark.mark(.sealed_alert);
+}
+
+/// The record boundaries of a recording: `starts[i]` is record i's header.
+fn recordStarts(stream: []const u8, starts: []usize) []usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 5 <= stream.len and n < starts.len) {
+        starts[n] = i;
+        n += 1;
+        i += 5 + std.mem.readInt(u16, stream[i + 3 ..][0..2], .big);
+    }
+    return starts[0..n];
+}
+
+fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const fk = try fuzzKeys_();
+    // RSA signing dominates a run: one run in ten picks among all cases.
+    var v: interop.Case = undefined;
+    while (true) {
+        v = interop.cases[src.index(interop.cases.len)];
+        if (v.cert != .rsa2048 or src.valueRangeAtMost(u8, 0, 9) == 0) break;
+    }
+    if (std.mem.startsWith(u8, v.name, "go-")) SrvMark.mark(.go_case) else SrvMark.mark(.openssl_case);
+    const ck = &fk.cks[@backingInt(v.cert)];
+    var suites: [8]record.CipherSuite = undefined;
+    for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
+    var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    const cfg: server_mod.Config = .{
+        .certificate = .{ .fixed = ck },
+        .cipher_suites = suites[0..v.suites.len],
+        .groups = v.groups,
+        .alpn_protocols = v.alpn,
+        .random = csprng.random(),
+    };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const outb = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
+    defer gpa.free(outb);
+    var server: server_mod.Server = .init(&cfg, joiner, outb);
+    defer server.deinit();
+
+    const stream = try gpa.dupe(u8, v.client);
+    defer gpa.free(stream);
+    var starts_buf: [64]usize = undefined;
+    const starts = recordStarts(v.client, &starts_buf);
+    // The client's Finished: its first sealed record.
+    const finished_rec = for (starts, 0..) |s, i| {
+        if (v.client[s] == 23) break i;
+    } else return error.NoFinishedInRecording;
+
+    var run: SrvRun = .{};
+    defer run.deinit(gpa);
+    const mode = src.valueRangeAtMost(u8, 0, 11);
+    const genuine_end = struct {
+        fn f(r: *const SrvRun, want: []const u8) bool {
+            return r.failure == null and r.peer_closed and std.mem.eql(u8, r.out.items, want) and std.mem.eql(u8, r.app.items, "ping\n");
+        }
+    }.f;
+    switch (mode) {
+        0, 1 => {
+            const bytewise = mode == 1;
+            try driveServer(S, src, gpa, &server, stream, bytewise, &run);
+            if (run.failure) |f| {
+                std.debug.print("genuine {s}: {t}\n", .{ v.name, f });
+                return error.GenuineRefused;
+            }
+            if (!genuine_end(&run, v.server)) return error.GenuineDiffers;
+            if (bytewise) SrvMark.mark(.genuine_bytewise) else SrvMark.mark(.genuine_chunked);
+        },
+        2 => {
+            const cut = src.index(stream.len);
+            try driveServer(S, src, gpa, &server, stream[0..cut], false, &run);
+            if (run.failure) |f| {
+                std.debug.print("truncated {s} at {d}: {t}\n", .{ v.name, cut, f });
+                return error.TruncatedRefused;
+            }
+            if (!std.mem.startsWith(u8, v.server, run.out.items)) return error.TruncatedOutputNotPrefix;
+            SrvMark.mark(.truncated_waits);
+        },
+        3, 4, 5, 6 => {
+            // A body octet: not inside any record header.
+            const ri = src.index(starts.len);
+            const body_start = starts[ri] + 5;
+            const body_end = if (ri + 1 < starts.len) starts[ri + 1] else stream.len;
+            if (body_end <= body_start) return;
+            const pos = body_start + src.index(body_end - body_start);
+            stream[pos] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+            try driveServer(S, src, gpa, &server, stream, false, &run);
+            if (genuine_end(&run, v.server)) return error.BodyFlipAccepted;
+            if (ri <= finished_rec) {
+                if (run.handshake_done) return error.HandshakeWithDamagedRecord;
+                SrvMark.mark(.body_flip_before_finished);
+            }
+            if (run.failure != null) SrvMark.mark(.body_flip_refused);
+        },
+        7, 8 => {
+            const ri = src.index(starts.len);
+            const pos = starts[ri] + src.index(5);
+            stream[pos] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+            try driveServer(S, src, gpa, &server, stream, false, &run);
+            if (run.failure != null) {
+                SrvMark.mark(.header_flip_refused);
+            } else if (run.peer_closed) {
+                // Passing: the server saw the same handshake.
+                if (!genuine_end(&run, v.server)) return error.HeaderFlipPassedDifferently;
+                SrvMark.mark(.header_flip_passed);
+            } else {
+                if (!std.mem.startsWith(u8, v.server, run.out.items)) return error.HeaderFlipStalledDifferently;
+                SrvMark.mark(.header_flip_stalled);
+            }
+        },
+        10, 11 => {
+            // Up to the client's Finished, then that record resealed.
+            const fs = starts[finished_rec];
+            const fe = if (finished_rec + 1 < starts.len) starts[finished_rec + 1] else stream.len;
+            try driveServer(S, src, gpa, &server, stream[0..fs], false, &run);
+            if (run.failure != null or server.state != .client_finished) return error.PrefixDidNotReachFinished;
+            const suite = server.cipherSuite().?;
+            var rx: record.Protection = undefined;
+            try rx.init(suite, server.client_handshake_secret[0..suite.hashLen().?]);
+            defer rx.wipe();
+            const sealed = try gpa.dupe(u8, stream[fs..fe]);
+            defer gpa.free(sealed);
+            const opened = try rx.open(sealed);
+            if (opened.content_type != .handshake or opened.content.len < 5 or opened.content.len > 4 + 48) return error.RecordingFinishedShape;
+            var msg_buf: [4 + 48]u8 = undefined;
+            var msg: []u8 = msg_buf[0..opened.content.len];
+            @memcpy(msg, opened.content);
+            const forged = mode == 10;
+            if (forged) switch (src.valueRangeAtMost(u8, 0, 2)) {
+                0 => msg[4 + src.index(msg.len - 4)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7)),
+                1 => {
+                    msg = msg[0 .. msg.len - 1];
+                    std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
+                },
+                else => msg[0] = if (src.value(bool)) 15 else 24, // certificate_verify, key_update
+            };
+            const pad: usize = src.valueRangeAtMost(u16, 0, 300);
+            var tx: record.Protection = undefined;
+            try tx.init(suite, server.client_handshake_secret[0..suite.hashLen().?]);
+            defer tx.wipe();
+            const rebuilt = try gpa.alloc(u8, record.header_len + msg.len + 1 + pad + record.tag_len + (stream.len - fe));
+            defer gpa.free(rebuilt);
+            @memcpy(rebuilt[record.header_len..][0..msg.len], msg);
+            const rec = try tx.seal(rebuilt, msg.len, .handshake, pad);
+            @memcpy(rebuilt[rec.len..][0 .. stream.len - fe], stream[fe..]);
+            try driveServer(S, src, gpa, &server, rebuilt[0 .. rec.len + stream.len - fe], false, &run);
+            if (forged) {
+                if (run.handshake_done or run.failure == null) return error.ForgedFinishedAccepted;
+                SrvMark.mark(.finished_forged_refused);
+            } else {
+                if (!genuine_end(&run, v.server)) return error.RepaddedFinishedDiffers;
+                SrvMark.mark(.finished_repadded);
+            }
+        },
+        else => {
+            // Splice random octets in at a record boundary.
+            const ri = src.index(starts.len);
+            const n = src.valueRangeAtMost(u16, 1, 64);
+            var junk: [64]u8 = undefined;
+            src.bytes(junk[0..n]);
+            const spliced = try gpa.alloc(u8, stream.len + n);
+            defer gpa.free(spliced);
+            @memcpy(spliced[0..starts[ri]], stream[0..starts[ri]]);
+            @memcpy(spliced[starts[ri]..][0..n], junk[0..n]);
+            @memcpy(spliced[starts[ri] + n ..], stream[starts[ri]..]);
+            try driveServer(S, src, gpa, &server, spliced, false, &run);
+            if (run.failure != null) SrvMark.mark(.splice_refused);
+        },
+    }
+}
+
+fn fuzzServerSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [4096]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzServer(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver server, recorded clients whole, cut and damaged" {
+    try testing.fuzz({}, fuzzServerSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (server)" {
+    try fuzz_driver.run(fuzzServer, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-server" });
+}
+test "fuzz harness: server, 400 seeds, reaches every outcome" {
+    try SrvMark.reach(fuzzServer, "tlsserver-server", 400);
 }

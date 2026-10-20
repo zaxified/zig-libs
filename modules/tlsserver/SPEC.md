@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught) · ct none
+**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct none
 
 **Performance:** not measured
 
@@ -379,6 +379,28 @@ different key loaded), the Ed25519 seed length check removed (survived the first
 which never shortened a nested octet string consistently — the model mode added), the scalar
 length bound removed, the long-form length bound removed.
 
+Harness `tlsserver-server`: `Server` as a whole, fed the twenty recorded OpenSSL and Go client
+streams (`interop_vectors.zig`) with the recorded seed, so its output is a function of its
+input. The genuine stream cut into random chunks, or fed one octet at a time, ends exactly as
+recorded; truncated, it never errs and its output is a prefix of the recording; a flipped bit
+in a record body never ends as recorded and, up to the client's Finished, never completes the
+handshake; a flipped header bit may be refused, stall (output a prefix) or pass (output exactly
+the recording — the record version octets nobody reads); random octets spliced in at a record
+boundary never panic. White box: the harness takes the client's handshake traffic secret from
+the server, opens the client's Finished and reseals it — damaged (a verify_data bit, one octet
+short, another message type) it is refused and the handshake never completes; intact with up
+to 300 octets of padding it ends as recorded. Over every run: after a failure `feed` returns
+`Closed`; the alert is the last record out — plaintext and exactly `alertFor`'s fatal alert if
+the server had sent nothing else, else one sealed alert record, and none after the server's own
+close_notify or for an error naming none; application data never precedes `handshake_done`;
+`write` before it is `NotConnected`. RSA cases run one time in ten (signing dominates).
+`fuzz harness: server, 400 seeds, reaches every outcome` runs in every test lane. Verdict
+2026-10-20: 4 × 40,000 runs, ReleaseSafe, clean (~1,070 runs/s per job). Five planted mutants
+caught: the client's Finished check removed (survived the first harness — every change to the
+ClientHello changes the client's keys, so damage never got past the AEAD to the Finished
+check; the resealing white-box mode added), the failed state not kept, one octet more awaited
+than a record needs, any change_cipher_spec body accepted, the alert after the flight left out.
+
 Independent read-only review of `keys` (Sonnet, 2026-10-20): no HIGH. MEDIUM fixed — an EC
 scalar ≥ the order loaded and failed only at the first signature (std's `fromBytes` does not
 range-check; test with d = n, n + 1, 0). LOWs fixed: legacy `Proc-Type` encrypted keys gave
@@ -404,8 +426,8 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 ## Backlog / deferred
 
-- **M1 (next):** a fuzz harness over `Server`; the BoGo shim. (Done 2026-10-20: secp384r1 and
-  P-384 certificates; the key loader; interop with the Go client and `tlsclient`.)
+- **M1 (next):** the BoGo shim. (Done 2026-10-20: secp384r1 and P-384 certificates; the key
+  loader; interop with the Go client and `tlsclient`; the `tlsserver-server` fuzz harness.)
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).

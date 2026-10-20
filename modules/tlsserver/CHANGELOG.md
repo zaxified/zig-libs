@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Fuzz harness `tlsserver-server`: the whole `Server` on the recorded OpenSSL and
+  Go client streams — genuine in random chunks and octet by octet, truncated, bit-flipped in
+  bodies and headers, spliced, and (white box) the client's Finished resealed damaged or padded;
+  alert and failed-state invariants on every run. 160,000 runs clean, five planted mutants
+  caught. The interop replay test is renamed for the Go sessions it now covers.
 - **2026-10-20** — `Server.negotiatedGroup` and `Server.alpnProtocol`. Interop with Go 1.26's
   crypto/tls client (`tools/go_client/main.go`, ten sessions in `tools/interop.zig`, captured and
   replayed byte-exact with the OpenSSL ones: Go's defaults, every suite, secp256r1/secp384r1,
