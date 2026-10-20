@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 batch. **Breaking default:** `Spec.stdin` defaults to `.ignore` (`/dev/null`, Go's
+  default) instead of `.close` — a closed fd 0 is reused by the child's first `open`. New: `Spec.pass_fds`
+  (same fd numbers in the child, over Zig 0.17's `inherit_files`), `Spec.uid`/`gid`, `Output.core_dumped`,
+  `Output.rusage`, `Exit` + `waitTolerantExit`. **Fix:** a failed spawn (missing program, bad cwd) leaked
+  the two parent pipe ends — a Zig 0.17 std defect in `processSpawnPosix`; procrun now makes its `.pipe`
+  streams itself and closes them on error. Evidence: 55 scenarios replayed against Python `subprocess`.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README note on `Child.wait` and `ECHILD` re-checked against the 0.17.0 std (still a `errnoBug`).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `bufPrintSentinel` for `bufPrintZ`; `wait4` status is `i32`.

@@ -1,0 +1,502 @@
+{
+ "scenarios": [
+  {
+   "name": "exit_0",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 0"
+   ]
+  },
+  {
+   "name": "exit_1",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 1"
+   ]
+  },
+  {
+   "name": "exit_126",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 126"
+   ]
+  },
+  {
+   "name": "exit_127",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 127"
+   ]
+  },
+  {
+   "name": "exit_255",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 255"
+   ]
+  },
+  {
+   "name": "exit_127_not_found",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "orc_no_such_command_xyz"
+   ]
+  },
+  {
+   "name": "exit_126_not_executable",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "/etc/passwd"
+   ]
+  },
+  {
+   "name": "sig_kill",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "kill -KILL $$"
+   ]
+  },
+  {
+   "name": "sig_segv",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "ulimit -c 0; kill -SEGV $$"
+   ]
+  },
+  {
+   "name": "sig_abrt",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "ulimit -c 0; kill -ABRT $$"
+   ]
+  },
+  {
+   "name": "sig_term",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "kill -TERM $$"
+   ]
+  },
+  {
+   "name": "err_program_missing",
+   "argv": [
+    "/nonexistent/orc_prog"
+   ]
+  },
+  {
+   "name": "err_program_not_executable",
+   "argv": [
+    "/etc/passwd"
+   ]
+  },
+  {
+   "name": "err_program_is_directory",
+   "argv": [
+    "/usr"
+   ]
+  },
+  {
+   "name": "err_cwd_missing",
+   "argv": [
+    "/bin/true"
+   ],
+   "cwd": "/nonexistent_orc_dir"
+  },
+  {
+   "name": "err_cwd_is_file",
+   "argv": [
+    "/bin/true"
+   ],
+   "cwd": "/etc/passwd"
+  },
+  {
+   "name": "out_stdout_2mib",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "seq 1 400000 | head -c 2097152"
+   ]
+  },
+  {
+   "name": "out_stderr_2mib",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "seq 1 400000 | head -c 2097152 >&2"
+   ]
+  },
+  {
+   "name": "out_both_2mib",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "(seq 1 400000 | head -c 2097152) & (seq 400 400000 | head -c 2097152 >&2); wait"
+   ]
+  },
+  {
+   "name": "out_empty",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "true"
+   ]
+  },
+  {
+   "name": "merge_order_small",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "echo a; echo b >&2; echo c; echo d >&2; echo e"
+   ],
+   "merge_stderr": true
+  },
+  {
+   "name": "merge_order_loop",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "i=0; while [ $i -lt 2000 ]; do echo o$i; echo e$i >&2; i=$((i+1)); done"
+   ],
+   "merge_stderr": true
+  },
+  {
+   "name": "merge_big",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "(seq 1 400000 | head -c 2097152); (seq 7 400000 | head -c 2097152 >&2)"
+   ],
+   "merge_stderr": true
+  },
+  {
+   "name": "cap_stdout",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "seq 1 400000 | head -c 2097152"
+   ],
+   "cap": 1000
+  },
+  {
+   "name": "cap_stderr_and_stdout",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "(seq 1 400000 | head -c 300000); (seq 9 400000 | head -c 300000 >&2)"
+   ],
+   "cap": 4096
+  },
+  {
+   "name": "cap_exact",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "head -c 1000 /dev/zero | tr '\\0' q"
+   ],
+   "cap": 1000
+  },
+  {
+   "name": "cap_merged",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "(seq 1 400000 | head -c 300000); (seq 9 400000 | head -c 300000 >&2)"
+   ],
+   "cap": 5000,
+   "merge_stderr": true
+  },
+  {
+   "name": "stdin_default_dev_null",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "readlink /proc/$$/fd/0"
+   ]
+  },
+  {
+   "name": "stdin_default_cat_eof",
+   "argv": [
+    "/bin/cat"
+   ]
+  },
+  {
+   "name": "stdin_empty_pipe",
+   "argv": [
+    "/bin/cat"
+   ],
+   "stdin": "pipe"
+  },
+  {
+   "name": "stdin_small",
+   "argv": [
+    "/bin/cat"
+   ],
+   "stdin": "pipe",
+   "stdin_text": "hello\n"
+  },
+  {
+   "name": "stdin_4mib_echo",
+   "argv": [
+    "/bin/cat"
+   ],
+   "stdin": "pipe",
+   "stdin_len": 4194304
+  },
+  {
+   "name": "stdin_early_close",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "head -c 10"
+   ],
+   "stdin": "pipe",
+   "stdin_len": 4194304,
+   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (bxp's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
+   "procrun_override": {
+    "kind": "error",
+    "err": "BrokenPipe"
+   }
+  },
+  {
+   "name": "stdin_child_ignores",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "exit 3"
+   ],
+   "stdin": "pipe",
+   "stdin_len": 1048576,
+   "diff": "procrun surfaces a stdin write that hit a closed pipe as error.BrokenPipe (bxp's runPhaseLabel relies on it); Python and Go swallow EPIPE and return the child's result",
+   "procrun_override": {
+    "kind": "error",
+    "err": "BrokenPipe"
+   }
+  },
+  {
+   "name": "env_clear_empty",
+   "argv": [
+    "/usr/bin/env",
+    "-0"
+   ],
+   "env_mode": "clear",
+   "post": "nul_set"
+  },
+  {
+   "name": "env_clear_vars",
+   "argv": [
+    "/usr/bin/env",
+    "-0"
+   ],
+   "env_mode": "clear",
+   "env": {
+    "ORC_A": "1",
+    "ORC_B": "two words",
+    "ORC_EMPTY": "",
+    "ORC_EQ": "a=b"
+   },
+   "post": "nul_set"
+  },
+  {
+   "name": "env_merge_vars",
+   "argv": [
+    "/usr/bin/env",
+    "-0"
+   ],
+   "env_mode": "merge",
+   "env": {
+    "ORC_A": "1",
+    "ORC_B": "two words",
+    "ORC_EMPTY": "",
+    "ORC_EQ": "a=b"
+   },
+   "post": "nul_set",
+   "prefix": "ORC_"
+  },
+  {
+   "name": "env_inherit_filtered",
+   "argv": [
+    "/usr/bin/env",
+    "-0"
+   ],
+   "env_mode": "inherit",
+   "post": "nul_set",
+   "prefix": "ORC_"
+  },
+  {
+   "name": "env_merge_override_path",
+   "argv": [
+    "/usr/bin/env",
+    "-0"
+   ],
+   "env_mode": "merge",
+   "env": {
+    "PATH": "/orc/path"
+   },
+   "post": "nul_set",
+   "prefix": "PATH="
+  },
+  {
+   "name": "env_merge_keeps_parent_path",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "test -n \"$PATH\" && echo has_path"
+   ],
+   "env_mode": "merge",
+   "env": {
+    "ORC_A": "1"
+   }
+  },
+  {
+   "name": "env_inherit_has_path",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "test -n \"$PATH\" && echo has_path"
+   ]
+  },
+  {
+   "name": "cwd_absolute_usr",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pwd -P"
+   ],
+   "cwd": "/usr"
+  },
+  {
+   "name": "cwd_absolute_root",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pwd -P"
+   ],
+   "cwd": "/"
+  },
+  {
+   "name": "cwd_relative_dot",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pwd -P"
+   ],
+   "cwd": ".",
+   "post": "cwd_parent"
+  },
+  {
+   "name": "cwd_inherit",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pwd -P"
+   ],
+   "post": "cwd_parent"
+  },
+  {
+   "name": "fd_inheritable_leak",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "if [ -e /proc/$$/fd/{FD} ]; then echo seen; else echo absent; fi"
+   ],
+   "marker": "inheritable",
+   "diff": "procrun does not close_fds: a non-CLOEXEC fd leaks into the child; Python's default close_fds=True closes it",
+   "procrun_override": {
+    "stdout_text": "seen\n"
+   }
+  },
+  {
+   "name": "fd_inheritable_leak_python_close_fds_false",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "if [ -e /proc/$$/fd/{FD} ]; then echo seen; else echo absent; fi"
+   ],
+   "marker": "inheritable",
+   "py_close_fds": false
+  },
+  {
+   "name": "fd_cloexec_not_passed",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "if [ -e /proc/$$/fd/{FD} ]; then echo seen; else echo absent; fi"
+   ],
+   "marker": "cloexec"
+  },
+  {
+   "name": "fd_pass_fds",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "if [ -e /proc/$$/fd/{FD} ]; then echo seen; else echo absent; fi"
+   ],
+   "marker": "cloexec",
+   "pass_marker": true
+  },
+  {
+   "name": "fd_pass_fds_with_inheritable",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "if [ -e /proc/$$/fd/{FD} ]; then echo seen; else echo absent; fi"
+   ],
+   "marker": "inheritable",
+   "pass_marker": true
+  },
+  {
+   "name": "pgroup_default_inherited",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pg=$(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f3); ppg=$(sed 's/^.*) //' /proc/$PPID/stat | cut -d' ' -f3); if [ $pg = $$ ]; then echo leader; elif [ $pg = $ppg ]; then echo inherited; else echo other; fi"
+   ]
+  },
+  {
+   "name": "pgroup_new_group",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "pg=$(sed 's/^.*) //' /proc/$$/stat | cut -d' ' -f3); ppg=$(sed 's/^.*) //' /proc/$PPID/stat | cut -d' ' -f3); if [ $pg = $$ ]; then echo leader; elif [ $pg = $ppg ]; then echo inherited; else echo other; fi"
+   ],
+   "new_group": true
+  },
+  {
+   "name": "timeout_kill",
+   "argv": [
+    "/usr/bin/sleep",
+    "30"
+   ],
+   "timeout_ms": 300
+  },
+  {
+   "name": "timeout_partial_output",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "echo partial; exec sleep 30"
+   ],
+   "timeout_ms": 300
+  },
+  {
+   "name": "timeout_not_reached",
+   "argv": [
+    "/bin/sh",
+    "-c",
+    "sleep 0.05; echo done"
+   ],
+   "timeout_ms": 10000
+  }
+ ]
+}

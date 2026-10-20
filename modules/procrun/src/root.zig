@@ -61,7 +61,10 @@ pub const default_max_line_bytes: usize = 1024 * 1024;
 pub const StdioMode = union(enum) {
     /// Spawn the child with the stream closed (advanced; child may hit EBADF).
     /// Prefer `.ignore`: a child that writes to a closed fd 1 gets EBADF, and
-    /// one that opens a file meanwhile receives that file AS fd 1.
+    /// one that opens a file meanwhile receives that file AS fd 0/1/2 (the
+    /// lowest free descriptor), which is how a "closed stdin" turns into a
+    /// corrupted data file. Since 2026-10-20 `Spec.stdin` no longer defaults
+    /// to this.
     close,
     /// Share the parent's stream.
     inherit,
@@ -120,7 +123,13 @@ pub const Spec = struct {
     env_mode: EnvMode = .inherit,
     /// Working directory for the child; null = inherit the parent's.
     cwd: ?[]const u8 = null,
-    stdin: StdioMode = .close,
+    /// Default `.ignore` (`/dev/null`; Go's default for a nil `Cmd.Stdin`):
+    /// the child reads EOF at once and fd 0 is never free for its first
+    /// `open`. Before 2026-10-20 the default was `.close`, which handed the
+    /// child a closed fd 0 -- a hazard, not a feature. `.close` stays
+    /// available for the caller who really wants it. (Python's default is
+    /// to inherit the parent's stdin; ask for that with `.inherit`.)
+    stdin: StdioMode = .ignore,
     stdout: StdioMode = .pipe,
     stderr: StdioMode = .pipe,
     /// Per-stream capture cap for `run`/`runTimeout`. Bounds MEMORY only —
@@ -145,6 +154,27 @@ pub const Spec = struct {
     /// pid, no separate id needs to be tracked. POSIX-only; has no effect on
     /// Windows (no process-group concept exposed here).
     new_process_group: bool = false,
+    /// Parent descriptors the child keeps open across `exec` under the SAME
+    /// descriptor number (Python's `pass_fds`). Implemented by std's
+    /// `SpawnOptions.inherit_files`, which clears `FD_CLOEXEC` on the fd in
+    /// the forked child only, so the parent's flags are untouched and a
+    /// sibling thread's concurrent spawn cannot inherit it -- race-free.
+    /// Every other descriptor keeps its own `FD_CLOEXEC` state: this module
+    /// does NOT close descriptors the caller left non-CLOEXEC (no
+    /// `close_fds` walk). A file also used as `.file` stdio needs no entry
+    /// here. The entries are borrowed; procrun never closes them.
+    pass_fds: []const std.Io.File = &.{},
+    /// Switch the child to this user id between fork and exec (std's
+    /// `SpawnOptions.uid`; `setreuid(uid, uid)`). A refusal (EPERM for an
+    /// unprivileged parent) is `error.PermissionDenied`. POSIX only; the field is
+    /// `?void` where there are no uids.
+    uid: ?std.posix.uid_t = null,
+    /// Likewise the group id (`setregid(gid, gid)`; std applies it before
+    /// `uid`). NOTE: supplementary groups are NOT touched -- std has no
+    /// `setgroups` -- so a child started as another user keeps the parent's
+    /// supplementary groups (Python's `user=` / `group=` without
+    /// `extra_groups` behaves the same).
+    gid: ?std.posix.gid_t = null,
     /// Optional rlimit sandbox applied to the child before it execs the
     /// caller's program — see `RlimitSpec`. `null` (default) applies no
     /// limits. POSIX-only; `error.OperationUnsupported` on Windows.
@@ -266,6 +296,22 @@ pub const RlimitSpec = struct {
     file_size_bytes: ?u64 = null,
 };
 
+/// `wait4`'s resource usage record (`std.posix.rusage`); `void` on Windows,
+/// where `Output.rusage` is always `null`.
+pub const Rusage = switch (builtin.os.tag) {
+    .windows => void,
+    else => std.posix.rusage,
+};
+
+/// How a child ended, with what `Term` alone cannot carry. See
+/// `waitTolerantExit`.
+pub const Exit = struct {
+    term: Term,
+    /// `WCOREDUMP`: the signal that killed the child also dumped core.
+    core_dumped: bool = false,
+    rusage: ?Rusage = null,
+};
+
 /// Result of a blocking `run`/`runTimeout`. Caller owns `stdout`/`stderr`.
 pub const Output = struct {
     term: Term,
@@ -299,6 +345,16 @@ pub const Output = struct {
     /// grace after SIGTERM and was SIGKILLed. `false` while `canceled` or
     /// `timed_out` is set means it exited on its own within the grace.
     grace_expired: bool = false,
+    /// `term` is `.signal` and the kernel wrote a core dump (`WCOREDUMP`,
+    /// bit 0x80 of the wait status). `false` when no core was produced
+    /// (`RLIMIT_CORE` 0, a core pattern that refuses it) and on targets or
+    /// races where the status is unreadable (`.unknown`).
+    core_dumped: bool = false,
+    /// Resource usage of the child as reported by `wait4` (CPU times, peak
+    /// RSS in `maxrss`, page faults, context switches). `null` where the
+    /// reap did not return one: Windows, targets without `wait4`, or the
+    /// out-of-band-reaped `.unknown` case.
+    rusage: ?Rusage = null,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -365,10 +421,15 @@ const have_wait4 = switch (builtin.os.tag) {
 /// does not exist in 0.16, and `std.process.Child.wait` deliberately panics on
 /// `ECHILD`, so a hand-rolled reap is unavoidable.
 pub fn waitTolerant(io: std.Io, child: *std.process.Child) Term {
+    return waitTolerantExit(io, child).term;
+}
+
+/// `waitTolerant` plus the core-dump flag and the child's `rusage`.
+pub fn waitTolerantExit(io: std.Io, child: *std.process.Child) Exit {
     switch (builtin.os.tag) {
-        .windows => return child.wait(io) catch Term{ .unknown = 0 },
+        .windows => return .{ .term = child.wait(io) catch Term{ .unknown = 0 } },
         else => {
-            const term: Term = if (child.id) |pid| reapTolerantPosix(pid) else .{ .unknown = 0 };
+            const exit: Exit = if (child.id) |pid| reapTolerantPosix(pid) else .{ .term = .{ .unknown = 0 } };
             // Mark reaped so a later std `kill`/`wait` is a safe no-op, and
             // close any pipe ends we still own (the new Child no longer
             // auto-closes them the way the old blocking wait did).
@@ -385,30 +446,40 @@ pub fn waitTolerant(io: std.Io, child: *std.process.Child) Term {
                 f.close(io);
                 child.stderr = null;
             }
-            return term;
+            return exit;
         },
     }
 }
 
-fn reapTolerantPosix(pid: std.posix.pid_t) Term {
+fn exitOf(status: u32, ru: ?Rusage) Exit {
+    return .{ .term = statusToTerm(status), .core_dumped = statusCoreDumped(status), .rusage = ru };
+}
+
+fn reapTolerantPosix(pid: std.posix.pid_t) Exit {
     const posix = std.posix;
     var status: if (builtin.link_libc) c_int else i32 = undefined;
     if (have_wait4) {
-        while (true) switch (posix.errno(posix.system.wait4(pid, &status, 0, null))) {
-            .SUCCESS => return statusToTerm(@bitCast(status)),
+        var ru: posix.rusage = undefined;
+        while (true) switch (posix.errno(posix.system.wait4(pid, &status, 0, &ru))) {
+            .SUCCESS => return exitOf(@bitCast(status), ru),
             .INTR => continue,
             // Reaped out-of-band (or auto-reaped): child is gone but its status
             // is unreadable. This is the case std would panic on.
-            .CHILD => return .{ .unknown = 0 },
-            else => return .{ .unknown = 0 },
+            .CHILD => return .{ .term = .{ .unknown = 0 } },
+            else => return .{ .term = .{ .unknown = 0 } },
         };
     }
     while (true) switch (posix.errno(posix.system.waitpid(pid, &status, 0))) {
-        .SUCCESS => return statusToTerm(@bitCast(status)),
+        .SUCCESS => return exitOf(@bitCast(status), null),
         .INTR => continue,
-        .CHILD => return .{ .unknown = 0 },
-        else => return .{ .unknown = 0 },
+        .CHILD => return .{ .term = .{ .unknown = 0 } },
+        else => return .{ .term = .{ .unknown = 0 } },
     };
+}
+
+/// `WCOREDUMP(status)`: killed by a signal AND the 0x80 core bit is set.
+fn statusCoreDumped(status: u32) bool {
+    return std.posix.W.IFSIGNALED(status) and (status & 0x80) != 0;
 }
 
 fn statusToTerm(status: u32) Term {
@@ -625,36 +696,66 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     if (spec.stdin == .stdout or spec.stdout == .stdout) return error.InvalidStdio;
     const merge = spec.stderr == .stdout;
     if (merge and spec.stdout == .close) return error.InvalidStdio;
+    //
+    // `.pipe` streams are also created HERE rather than by std (workaround,
+    // std 0.17.0 pipe leak on failed spawn): `Io.Threaded.processSpawnPosix`
+    // returns the child's exec error without closing the parent's pipe ends it
+    // had already made, so every failed spawn (program missing, not
+    // executable, bad cwd) leaked one descriptor per `.pipe` stream. Pipes we
+    // own are closed on that path. Same CLOEXEC discipline as above.
+    var in_io = toStdIo(spec.stdin);
     var out_io = toStdIo(spec.stdout);
     var err_io = if (merge) out_io else toStdIo(spec.stderr);
-    var merge_read: ?std.Io.File = null;
-    var merge_write: ?std.Io.File = null;
-    errdefer if (merge_read) |f| f.close(io);
-    defer if (merge_write) |f| f.close(io);
-    if (merge and spec.stdout == .pipe) {
-        if (builtin.os.tag == .windows) return error.OperationUnsupported;
-        const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
-        merge_read = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
-        merge_write = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
-        out_io = .{ .file = merge_write.? };
-        err_io = out_io;
+    var in_pipe: PipeEnds = .{};
+    var out_pipe: PipeEnds = .{};
+    var err_pipe: PipeEnds = .{};
+    defer {
+        in_pipe.closeChild(io);
+        out_pipe.closeChild(io);
+        err_pipe.closeChild(io);
+    }
+    errdefer {
+        in_pipe.closeParent(io);
+        out_pipe.closeParent(io);
+        err_pipe.closeParent(io);
+    }
+    if (builtin.os.tag == .windows) {
+        if (merge and spec.stdout == .pipe) return error.OperationUnsupported;
+    } else {
+        if (spec.stdin == .pipe) {
+            in_pipe = try PipeEnds.make(.parent_writes);
+            in_io = .{ .file = in_pipe.child.? };
+        }
+        if (spec.stdout == .pipe) {
+            out_pipe = try PipeEnds.make(.parent_reads);
+            out_io = .{ .file = out_pipe.child.? };
+            if (merge) err_io = out_io;
+        }
+        if (!merge and spec.stderr == .pipe) {
+            err_pipe = try PipeEnds.make(.parent_reads);
+            err_io = .{ .file = err_pipe.child.? };
+        }
     }
 
     // fd-hygiene note: any parent fd NOT marked FD_CLOEXEC is inherited by
     // the child across this spawn — `Spec` only controls stdin/stdout/stderr
-    // (`StdioMode`), it does not close arbitrary other open fds. Callers that
-    // hold sensitive fds open (sockets, secret-bearing files, …) must set
-    // FD_CLOEXEC on them themselves if the child must not inherit them.
-    // pass_fds is deliberately absent: std's fork path only wires fds 0-2,
-    // so it cannot be done race-free (SPEC § Backlog).
+    // (`StdioMode`) and `pass_fds`; it does not close arbitrary other open
+    // fds (no `close_fds` walk). Callers that hold sensitive fds open
+    // (sockets, secret-bearing files, …) must set FD_CLOEXEC on them
+    // themselves if the child must not inherit them. `pass_fds` goes
+    // through std's `inherit_files`, which clears FD_CLOEXEC after the fork,
+    // in the child only (race-free, same fd number).
     var child = try std.process.spawn(io, .{
         .argv = effective_argv,
         .cwd = cwd,
         .environ_map = env_ptr,
-        .stdin = toStdIo(spec.stdin),
+        .stdin = in_io,
         .stdout = out_io,
         .stderr = err_io,
         .create_no_window = true,
+        .inherit_files = spec.pass_fds,
+        .uid = spec.uid,
+        .gid = spec.gid,
         // `pgid` is `?posix.pid_t` — an integer on POSIX, but a HANDLE
         // (`?*anyopaque`) on Windows, where the POSIX "0 = lead your own
         // group" literal does not typecheck. `Spec.new_process_group` is
@@ -662,12 +763,52 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
         // keep that promise rather than failing to build there.
         .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
     });
-    if (merge_read) |f| {
+    // Ownership of the parent ends moves to the Child (std left these null,
+    // it was given `.file`s).
+    if (in_pipe.parent) |f| {
+        child.stdin = f;
+        in_pipe.parent = null;
+    }
+    if (out_pipe.parent) |f| {
         child.stdout = f;
-        merge_read = null; // ownership moved to the Child
+        out_pipe.parent = null;
+    }
+    if (err_pipe.parent) |f| {
+        child.stderr = f;
+        err_pipe.parent = null;
     }
     return child;
 }
+
+/// One `O_CLOEXEC` pipe we create for a child's stream: `child` is the end
+/// handed to std (it `dup2`s it onto fd 0/1/2, clearing CLOEXEC there only),
+/// `parent` the end the caller keeps. POSIX only.
+const PipeEnds = struct {
+    parent: ?std.Io.File = null,
+    child: ?std.Io.File = null,
+
+    const Dir = enum { parent_reads, parent_writes };
+
+    fn make(dir: Dir) !PipeEnds {
+        const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        const r: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+        const w: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+        return switch (dir) {
+            .parent_reads => .{ .parent = r, .child = w },
+            .parent_writes => .{ .parent = w, .child = r },
+        };
+    }
+
+    fn closeChild(p: *PipeEnds, io: std.Io) void {
+        if (p.child) |f| f.close(io);
+        p.child = null;
+    }
+
+    fn closeParent(p: *PipeEnds, io: std.Io) void {
+        if (p.parent) |f| f.close(io);
+        p.parent = null;
+    }
+};
 
 const RlimitWrap = struct {
     /// `["/bin/sh", "-c", script, "sh", <argv0 (possibly resolved)>,
@@ -1061,8 +1202,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u
     pumps.join();
 
     if (pumps.firstErr()) |e| return e;
-    const term = waitTolerant(io, &child);
-    return finish(&pumps, term);
+    return finish(&pumps, waitTolerantExit(io, &child));
 }
 
 /// Like `run`, but if the child has not finished within `timeout_ns` it is
@@ -1171,22 +1311,23 @@ fn runKilled(
     killer.join();
 
     if (pumps.firstErr()) |e| return e;
-    const term = waitTolerant(io, &child);
-    var out = try finish(&pumps, term);
+    var out = try finish(&pumps, waitTolerantExit(io, &child));
     out.canceled = canceled.load(.acquire);
     out.timed_out = timed_out.load(.acquire);
     out.grace_expired = grace_expired.load(.acquire);
     return out;
 }
 
-fn finish(pumps: *Pumps, term: Term) !Output {
+fn finish(pumps: *Pumps, exit: Exit) !Output {
     const out = try pumps.out_list.toOwnedSlice(pumps.gpa);
     errdefer pumps.gpa.free(out);
     const err = try pumps.err_list.toOwnedSlice(pumps.gpa);
     return .{
-        .term = term,
+        .term = exit.term,
         .stdout = out,
         .stderr = err,
+        .core_dumped = exit.core_dumped,
+        .rusage = exit.rusage,
         .truncated_stdout = pumps.trunc_out.load(.acquire),
         .truncated_stderr = pumps.trunc_err.load(.acquire),
         .stdout_deadline_stopped = pumps.deadline_hit_out.load(.acquire),
@@ -2417,8 +2558,8 @@ test ".ignore: stdout is discarded however much the child writes; stdin reads EO
     try testing.expectEqualStrings("", w.stdout);
     try testing.expectEqualStrings("", w.stderr);
 
-    // `cat` on a null stdin sees EOF immediately and exits 0. With the
-    // default `.close` it would hit EBADF instead (exit 1).
+    // `cat` on a null stdin sees EOF immediately and exits 0. With an
+    // explicit `.close` it would hit EBADF instead (exit 1).
     var r = try runTimeout(testing.allocator, io, .{
         .argv = &.{"cat"},
         .stdin = .ignore,
@@ -3556,4 +3697,116 @@ test "spawnStreaming: on_stdout_line respects stdout permits (one per line)" {
     h.ack();
     try testing.expect(h.wait() == .exited);
     try expectLines(&log, &.{ "a", "b", "c", "d", "e" });
+}
+
+test "Spec.pass_fds: the child sees the fd under the same number, and only then" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // /proc/self/fd
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "marker.txt", .data = "x" });
+    const f = try tmp.dir.openFile(io, "marker.txt", .{}); // O_CLOEXEC, like every std open
+    defer f.close(io);
+
+    const script = try std.fmt.allocPrint(testing.allocator, "readlink /proc/$$/fd/{d}", .{f.handle});
+    defer testing.allocator.free(script);
+    const argv = [_][]const u8{ "sh", "-c", script };
+
+    var without = try run(testing.allocator, io, .{ .argv = &argv }, "");
+    defer without.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 1), without.term.exited);
+    try testing.expectEqualStrings("", without.stdout);
+
+    const fds = [_]std.Io.File{f};
+    var with = try run(testing.allocator, io, .{ .argv = &argv, .pass_fds = &fds }, "");
+    defer with.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 0), with.term.exited);
+    try testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, with.stdout, "\n"), "marker.txt"));
+
+    // The parent's own flag is untouched (std clears CLOEXEC in the child
+    // only), so a later spawn without pass_fds does not see it again.
+    var again = try run(testing.allocator, io, .{ .argv = &argv }, "");
+    defer again.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 1), again.term.exited);
+}
+
+test "Spec.uid: an unprivileged parent is refused with a typed error" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    if (std.os.linux.geteuid() == 0) return error.SkipZigTest; // root may switch freely
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const other = std.os.linux.geteuid() +% 1;
+    try testing.expectError(error.PermissionDenied, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .uid = other,
+    }, ""));
+    try testing.expectError(error.PermissionDenied, run(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .gid = std.os.linux.getegid() +% 1,
+    }, ""));
+}
+
+test "Spec.stdin defaults to /dev/null, not to a closed fd 0" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var o = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "readlink /proc/$$/fd/0; cat; echo $?" },
+    }, "");
+    defer o.deinit(testing.allocator);
+    try testing.expectEqualStrings("/dev/null\n0\n", o.stdout);
+
+    // An explicit `.close` is still honoured: fd 0 does not exist.
+    var c = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "test -e /proc/$$/fd/0" },
+        .stdin = .close,
+    }, "");
+    defer c.deinit(testing.allocator);
+    try testing.expectEqual(@as(u8, 1), c.term.exited);
+}
+
+test "Output.core_dumped and Output.rusage" {
+    // POSIX wait statuses only (`std.posix.W` is void on Windows).
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    // The decoder, from raw wait statuses.
+    try testing.expect(statusCoreDumped(0x8b)); // SIGSEGV + core
+    try testing.expect(!statusCoreDumped(0x0b)); // SIGSEGV, no core
+    try testing.expect(!statusCoreDumped(7 << 8));
+    try testing.expect(!statusCoreDumped(0x7f)); // stopped, not signalled
+
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // RLIMIT_CORE 0 inside the child keeps the dump (and a slow
+    // systemd-coredump round trip) away; the flag itself is host policy --
+    // a piped core_pattern sets WCOREDUMP even then -- so it is checked
+    // against an independent reap in oracle_test.zig, not asserted here.
+    var seg = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "ulimit -c 0; kill -SEGV $$" },
+    }, "");
+    defer seg.deinit(testing.allocator);
+    try testing.expectEqual(std.posix.SIG.SEGV, seg.term.signal);
+
+    var ok = try run(testing.allocator, io, .{ .argv = &.{ "sh", "-c", "head -c 3000000 /dev/zero | tr '\\0' x >/dev/null" } }, "");
+    defer ok.deinit(testing.allocator);
+    try testing.expect(!ok.core_dumped);
+    const ru = ok.rusage orelse return error.TestUnexpectedResult;
+    try testing.expect(ru.maxrss > 0);
+}
+
+test {
+    // External evidence: replay of frozen Python `subprocess` results.
+    _ = @import("oracle_test.zig");
 }

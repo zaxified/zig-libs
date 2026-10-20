@@ -22,7 +22,9 @@ Provenance: original work of the zig-libs authors (MIT) — the `waitTolerant` /
 `ensureChildReaping` / `restoreChildReaping` `SIGCHLD` fixup, and the capped
 3-thread drain / streaming-with-cancel machinery. procrun uses
 `std.posix.system.wait4`/`waitpid` — on Linux that is `std.os.linux`, i.e. raw
-syscalls, keeping the module **libc-free**.
+syscalls, keeping the module **libc-free**. DATA: `src/oracle_results.json` is a capture of Python 3.14's `subprocess` run as
+a black-box oracle on this machine (own tooling: `tools/oracle/run_python.py`); no
+third-party data is reproduced.
 
 - **Model after:** Python `subprocess.run`/`Popen`, Go `os/exec`.
 - **Platform:** any (full behavior on POSIX; the reap-race handling,
@@ -176,8 +178,25 @@ Done since v1:
 
 - **Stdio redirection.** `StdioMode` gains `.ignore` (`/dev/null`), `.file`
   (caller-owned `std.Io.File`) and, for `Spec.stderr`, `.stdout` (Python's
-  `stderr=STDOUT`: one shared pipe, write order preserved). `pass_fds` is not
-  possible race-free over `std.process.spawn` (see `SPEC.md` Backlog).
+  `stderr=STDOUT`: one shared pipe, write order preserved).
+- **`pass_fds`, `uid`/`gid`, `/dev/null` stdin, core flag, rusage
+  (2026-10-20).** `Spec.pass_fds: []const std.Io.File` keeps those descriptors
+  open in the child under the same numbers (std's `inherit_files`: CLOEXEC is
+  cleared in the forked child only, so it is race-free); every other
+  descriptor keeps its own CLOEXEC state (no `close_fds` walk -- a non-CLOEXEC
+  fd still leaks). `Spec.uid`/`Spec.gid` are passed to std (`setreuid`/
+  `setregid`; a refusal is `error.PermissionDenied`; supplementary groups are
+  NOT touched). **`Spec.stdin` now defaults to `.ignore` (`/dev/null`)**, not
+  `.close`. `Output.core_dumped` (`WCOREDUMP`) and `Output.rusage` (`wait4`'s
+  record, e.g. `maxrss`) come from `run`/`runTimeout`; `waitTolerantExit` is the
+  `waitTolerant` that returns them.
+- **Evidence.** `src/oracle_test.zig` replays ~55 scenarios (exit codes,
+  deaths by signal, 2 MiB/4 MiB I/O, merge order, caps, env, cwd, fds,
+  process groups, timeouts) against the frozen results of Python's
+  `subprocess` (`src/oracle_results.json`, produced by
+  `python3 -I tools/oracle/run_python.py`; no Python at test time), plus
+  no-zombie and stable-fd-count invariants. Deliberate differences carry a
+  `diff` reason in `src/oracle_scenarios.json`.
 - **Graceful cancellation.** `Spec.cancel_grace_ns` (blocking runs: `Cancel`
   and the `runTimeout` deadline) and `Handle.terminate`/`terminateGroup`
   (streaming): SIGTERM, wait up to the grace, then SIGKILL. `Output.timed_out`
