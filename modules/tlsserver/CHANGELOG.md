@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — The server: `Server` (sans-I/O full TLS 1.3 handshake with a certificate,
+  then application data and close_notify), `Config` (fixed certificate or a `CertificateSelector`
+  by SNI, enabled suites and groups, ALPN, the CSPRNG), `CertifiedKey`, `minOutputLen`. Negotiation
+  and alerts follow rustls 0.23; no HelloRetryRequest, resumption, client certificates or
+  KeyUpdate yet. `outbound` (records framed, fragmented at 2^14 and sealed in place);
+  `inbound.Inbound.skip_early` skips rejected 0-RTT records (trial decryption);
+  `messages.CertificateEntry.ocsp_response` replaces `ocspStatusData`. Verified by whole
+  handshakes against Zig std's TLS client (three suites; X25519MLKEM768, X25519, secp256r1) and
+  by every refusal's alert.
 - **2026-10-20** — The server's handshake message encoders: `messages` (ServerHello,
   HelloRetryRequest, EncryptedExtensions, Certificate with per-entry extensions, CertificateVerify,
   Finished; ALPN and OCSP extension bodies), each rebuilt byte-exact from its fields against RFC

@@ -45,3 +45,9 @@ pub const init_burn = 1024;
 /// ChaCha20-Poly1305 burns its own (2–4 KiB). ~3x the deepest, ~80 ns of
 /// zeroing per record.
 pub const record_burn = 4 * 1024;
+
+/// `Server` handshake steps (ClientHello → first flight, client Finished):
+/// their own frames hold hashes, the kex output and finished keys; kex,
+/// signing and HKDF below them burn their own. A margin, not yet measured
+/// (*Open* in SPEC.md: the stack probe does not cover the server yet).
+pub const handshake_burn = 16 * 1024;

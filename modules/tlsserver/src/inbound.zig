@@ -210,6 +210,11 @@ pub const Inbound = struct {
     warnings: u8 = 0,
     /// The description of the alert behind `error.PeerAborted`.
     peer_alert: ?alert.Description = null,
+    /// Rejected 0-RTT: protected records that fail to open are dropped
+    /// while their ciphertext fits this budget, until one opens (RFC 8446
+    /// §4.2.10, trial decryption; rustls drops up to 16 KiB when no early
+    /// data was ever offered). Set by the engine with the receive key.
+    skip_early: usize = 0,
 
     pub fn init(joiner_buf: []u8) Inbound {
         return .{ .joiner = .init(joiner_buf) };
@@ -307,7 +312,12 @@ pub const Inbound = struct {
             }
         }
         const o = self.rx.open(rec) catch |err| return switch (err) {
-            error.BadRecordMac => error.BadRecordMac,
+            error.BadRecordMac => if (self.skip_early >= h.length and self.joiner.isEmpty()) {
+                // An early-data record under the key the client used for
+                // 0-RTT: skip it (`open` left the sequence number alone).
+                self.skip_early -= h.length;
+                return null;
+            } else error.BadRecordMac,
             error.RecordOverflow => error.RecordOverflow,
             error.MissingContentType => error.UnexpectedMessage,
             error.SequenceExhausted => error.SequenceExhausted,
@@ -315,6 +325,8 @@ pub const Inbound = struct {
             error.BadRecordLength, error.UnexpectedRecordType => unreachable,
         };
         self.decrypted_any = true;
+        // The first record that opens ends the early data.
+        self.skip_early = 0;
         switch (o.content_type) {
             .handshake => {
                 // RFC 8446 §5.4: no zero-length handshake content.
@@ -672,6 +684,42 @@ test "key change: refused with handshake data pending, partial or whole" {
     _ = try in.next(s.bytes());
     try in.installRx(.aes_128_gcm_sha256, &secret);
     in.wipe();
+}
+
+test "rejected early data: records that fail to open are skipped within the budget, until one opens" {
+    const hs_secret: [32]u8 = @splat(0x21);
+    const early_secret: [32]u8 = @splat(0x22);
+    var hs_tx: record.Protection = undefined;
+    try hs_tx.init(.aes_128_gcm_sha256, &hs_secret);
+    var early_tx: record.Protection = undefined;
+    try early_tx.init(.aes_128_gcm_sha256, &early_secret);
+    var s: Stream = .{};
+    s.sealed(&early_tx, .application_data, "0-RTT request one");
+    s.sealed(&early_tx, .application_data, "0-RTT request two");
+    const fin = hsMsg(20, "finished");
+    s.sealed(&hs_tx, .handshake, &fin);
+    const after_fin = s.len;
+    s.sealed(&early_tx, .application_data, "too late");
+
+    var in: Inbound = .init(&joiner_storage);
+    try in.installRx(.aes_128_gcm_sha256, &hs_secret);
+    in.skip_early = 1000;
+    const r = try in.next(s.bytes());
+    try expectHandshake(r, 20, "finished");
+    try testing.expectEqual(after_fin, r.consumed);
+    try testing.expectEqual(@as(usize, 0), in.skip_early);
+    // After a record opened, a failing one is a failure again.
+    try testing.expectError(error.BadRecordMac, in.next(s.bytes()[after_fin..]));
+
+    // Over the budget: refused.
+    var in2: Inbound = .init(&joiner_storage);
+    try in2.installRx(.aes_128_gcm_sha256, &hs_secret);
+    in2.skip_early = 40; // less than the two records' 2 x 34 octets
+    try testing.expectError(error.BadRecordMac, in2.next(s.bytes()));
+    // Without a budget nothing is skipped.
+    var in3: Inbound = .init(&joiner_storage);
+    try in3.installRx(.aes_128_gcm_sha256, &hs_secret);
+    try testing.expectError(error.BadRecordMac, in3.next(s.bytes()));
 }
 
 test "joiner: reset zeroes what compaction left behind" {

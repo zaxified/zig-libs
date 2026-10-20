@@ -205,21 +205,13 @@ pub fn alpnData(out: []u8, protocol: []const u8) Error![]u8 {
     return out[0..w.n];
 }
 
-/// The `status_request` extension body of a CertificateEntry (RFC 8446
-/// §4.4.2.1): a `CertificateStatus` of type ocsp with the DER response.
-pub fn ocspStatusData(out: []u8, ocsp_response: []const u8) Error![]u8 {
-    if (ocsp_response.len == 0) return error.FieldTooLong; // `opaque OCSPResponse<1..2^24-1>`
-    var w: Writer = .{ .out = out };
-    try w.int(u8, 1);
-    if (ocsp_response.len > std.math.maxInt(u24)) return error.FieldTooLong;
-    try w.int(u24, @intCast(ocsp_response.len));
-    try w.bytes(ocsp_response);
-    return out[0..w.n];
-}
-
 pub const CertificateEntry = struct {
     /// The DER certificate.
     cert_data: []const u8,
+    /// A DER OCSPResponse, sent as this entry's `status_request` extension
+    /// (RFC 8446 §4.4.2.1: a `CertificateStatus` of type ocsp), after
+    /// `extensions`.
+    ocsp_response: ?[]const u8 = null,
     extensions: []const Extension = &.{},
 };
 
@@ -236,6 +228,16 @@ pub fn certificate(out: []u8, context: []const u8, entries: []const CertificateE
         try w.bytes(e.cert_data);
         const exts = try w.open(u16);
         for (e.extensions) |x| try w.extension(x);
+        if (e.ocsp_response) |o| {
+            // `opaque OCSPResponse<1..2^24-1>`
+            if (o.len == 0 or o.len > std.math.maxInt(u24)) return error.FieldTooLong;
+            try w.int(u16, 5);
+            const st = try w.open(u16);
+            try w.int(u8, 1);
+            try w.int(u24, @intCast(o.len));
+            try w.bytes(o);
+            try w.close(u16, st);
+        }
         try w.close(u16, exts);
     }
     try w.close(u24, list);
@@ -358,7 +360,7 @@ test "RFC 8448 §3 Certificate, CertificateVerify, Finished" {
     try testing.expectEqualSlices(u8, f, try finished(&out, f[4..]));
 }
 
-test "ALPN and OCSP extension bodies; a chain with an OCSP staple on the leaf" {
+test "ALPN extension body; a chain with an OCSP staple on the leaf" {
     var a: [32]u8 = undefined;
     try testing.expectEqualSlices(u8, &.{ 0, 3, 2, 'h', '2' }, try alpnData(&a, "h2"));
     try testing.expectError(error.FieldTooLong, alpnData(&a, ""));
@@ -366,13 +368,9 @@ test "ALPN and OCSP extension bodies; a chain with an OCSP staple on the leaf" {
     var b: [300]u8 = undefined;
     try testing.expectError(error.FieldTooLong, alpnData(&b, &long));
 
-    var o: [16]u8 = undefined;
-    const st = try ocspStatusData(&o, &.{ 0x30, 0x03, 0x0a, 0x01, 0x00 });
-    try testing.expectEqualSlices(u8, &.{ 1, 0, 0, 5, 0x30, 0x03, 0x0a, 0x01, 0x00 }, st);
-
     var out: [128]u8 = undefined;
     const m = try certificate(&out, "", &.{
-        .{ .cert_data = "LEAF", .extensions = &.{.{ .type = 5, .data = st }} },
+        .{ .cert_data = "LEAF", .ocsp_response = &.{ 0x30, 0x03, 0x0a, 0x01, 0x00 } },
         .{ .cert_data = "CA" },
     });
     const leaf = "\x00\x00\x04LEAF" ++ "\x00\x0d" ++ "\x00\x05\x00\x09" ++ "\x01\x00\x00\x05\x30\x03\x0a\x01\x00";
@@ -389,6 +387,7 @@ test "buffer too small, fields too long" {
     try testing.expectError(error.FieldTooLong, serverHello(&big, .{ .random = &r, .legacy_session_id_echo = &@as([33]u8, @splat(0)), .cipher_suite = 0x1301, .key_share = null }));
     try testing.expectError(error.FieldTooLong, helloRetryRequest(&big, .{ .legacy_session_id_echo = "", .cipher_suite = 0x1301, .selected_group = null, .cookie = "" }));
     try testing.expectError(error.FieldTooLong, certificate(&big, "", &.{.{ .cert_data = "" }}));
+    try testing.expectError(error.FieldTooLong, certificate(&big, "", &.{.{ .cert_data = "x", .ocsp_response = "" }}));
     // Every prefix of the output buffer short of the message is refused.
     var full: [128]u8 = undefined;
     const m = try serverHello(&full, .{ .random = &r, .legacy_session_id_echo = "abc", .cipher_suite = 0x1302, .key_share = .{ .group = 0x1d, .key_exchange = &r }, .selected_identity = 3 });

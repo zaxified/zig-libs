@@ -28,10 +28,10 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [aws/s2n-tls](https://github.com/aws/s2n-tls) | C | Apache-2.0 | 4.8k | v1.7.12 (2026-10-16) | Full TLS 1.3 server incl. 0-RTT (anti-replay left to the application), HRR, ticket key rotation. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference (P2) for this module's handshake and bulk rows. |
 
-**Where we are ahead:** nothing yet. **Where we are behind:** everything but the record layer —
-records, the receive side, alerts, the ClientHello decoder and the server's message encoders are
-the first pieces of the server (milestone M1,
-*Backlog*).
+**Where we are ahead:** nothing yet. **Where we are behind:** a full (EC)DHE handshake with a
+certificate works (against Zig std's client); HelloRetryRequest, resumption, client
+certificates, KeyUpdate, the blocking wrapper, a key loader and the external interop/BoGo gates
+are still to come (milestones M1–M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -41,17 +41,44 @@ CertificateVerify, key exchange, transcript) and the collection's AEADs (`aesgcm
 `chachapoly`). It is being built to replace qap's fork of a third-party TLS server, milestone by
 milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 
-**Today it is only the record layer**: the 5-byte header, per-direction in-place record
-protection, the receive side (records → whole handshake messages, alerts, application data),
-alerts, the ClientHello decoder and the encoders of the server's handshake messages. There is no
-handshake state machine yet, no connection object and nothing that talks to a socket — a
-reader looking for a usable TLS server will not find one here yet.
+**Today:** `Server`, a sans-I/O full handshake — ClientHello → ServerHello, compatibility CCS,
+EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's Finished — then
+application data both ways and close_notify, over the record layer (header, in-place protection,
+the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
+Zig std's TLS client under all three suites and the X25519MLKEM768, X25519 and secp256r1
+groups. It is not yet a server to deploy: no HelloRetryRequest (a client that sent no share for
+the chosen group is refused), no resumption, no client certificates, no KeyUpdate, nothing that
+talks to a socket, and no interop beyond std's client.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
 early data, kTLS, ECH and post-handshake client authentication (*What is deliberately not
 done*).
 
 ## Wire format / algorithm
+
+**The handshake** (`server.Server`, RFC 8446 §2 Figure 1, full handshake): the caller feeds
+received octets (`feed` → `need_more`, `handshake_done`, `app_data`, `peer_closed`, and how much
+was consumed) and drains `pendingOutput`. On the ClientHello, in rustls 0.23's order and with its
+alerts: compression must include null (`illegal_parameter`); an invalid SNI is
+`illegal_parameter`; no `signature_algorithms` is `handshake_failure`; no TLS 1.3 in
+`supported_versions` is `protocol_version`; the certificate is fixed or chosen by
+`CertificateSelector` from the SNI (`access_denied` when none); the signature scheme is the key's
+first candidate the client offers; the suite is the client's first enabled one; the group is the
+client's first `supported_groups` entry the server enables — every one of these without a match
+is `handshake_failure`; compression other than exactly null is `illegal_parameter`; no
+`key_share` is `handshake_failure`, two shares of one group or a share that does not exchange
+(`kex`: wrong length, low order) `illegal_parameter`, no share for the chosen group
+`handshake_failure` (M2: HelloRetryRequest); `pre_shared_key` without `psk_key_exchange_modes` is
+`missing_extension` (otherwise the offer is ignored: full handshake); ALPN is the server's first
+protocol the client offers (`no_application_protocol` when the server has some and none match).
+The server then sends ServerHello (plaintext), a compatibility CCS, and under its handshake key
+EncryptedExtensions (the ALPN choice; an empty `server_name` acknowledging a DNS-name SNI),
+Certificate (an OCSP staple on the leaf if requested and configured), CertificateVerify and
+Finished, one record per message; it switches its sending key to the application secret and
+waits for the client's Finished (`decrypt_error` if it does not verify), after which application
+data flows. Early data is never accepted; records the client sent under a 0-RTT key are skipped
+(up to 2^14 octets). Every refusal queues its alert in `pendingOutput` (sealed once the server
+sends protected) and leaves the connection dead (`error.Closed` afterwards).
 
 RFC 8446 §5, record layer over a byte stream:
 
@@ -184,6 +211,13 @@ The receive side's refusals are the table under *Wire format*. Record protection
   key and IV it printed. Extracted from the RFC text by `tools/rfc8448_records.py`, which
   re-opens every record with Python `cryptography` (OpenSSL) before writing
   `src/record_kat_vectors.zig`.
+- **External (foreign implementation):** whole handshakes against Zig std's
+  `crypto.tls.Client` (`src/handshake_test.zig`, in one thread through in-memory pipes): an
+  ECDSA P-256 certificate (self-signed test fixture, `tools/test_certs.py`) verified by the
+  client against SNI `localhost`, under TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
+  TLS_CHACHA20_POLY1305_SHA256 with X25519MLKEM768, and under X25519 and secp256r1; a request,
+  a response and close_notify each way. Ed25519 and RSA certificates wait for the OpenSSL / Go
+  interop: std's client advertises `ed25519` but cannot verify it.
 - **External (foreign implementation):** TLS_AES_256_GCM_SHA384 and
   TLS_CHACHA20_POLY1305_SHA256, which RFC 8448 does not cover — records sealed by OpenSSL
   through `cryptography` in the same tool (padding, sequence numbers up to 2^64 − 2), sealed
@@ -261,15 +295,20 @@ skipping one octet short (a panic), the key share read one octet early.
 
 ## Backlog / deferred
 
-- **M1 (next):** the sans-I/O server state machine for the full handshake (x25519 /
-  secp256r1 / secp384r1 / X25519MLKEM768; the three suites; ECDSA P-256/P-384, Ed25519 and
-  RSA-PSS certificates; SNI certificate selection; ALPN), the blocking wrapper, a certificate
-  and key loader; interop with OpenSSL `s_client`, the Go client and `tlsclient`; the BoGo shim.
+- **M1 (next):** secp384r1 key exchange (`tls13.kex`), the blocking wrapper, a certificate and
+  key loader (PEM, PKCS#8, SEC1); interop with OpenSSL `s_client`, the Go client and
+  `tlsclient` (Ed25519, RSA-PSS and P-384 certificates with them); a fuzz harness over
+  `Server`; the BoGo shim.
 - **M2:** HRR, KeyUpdate, NewSessionTicket and resumption through `tlsresume`, mTLS through
   `x509.verifyChain`, OCSP stapling. **M3:** qap's seams and performance (`p256`, `ct25519`).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 
 ## Open
+
+- `burn.handshake_burn` (16 KiB around each handshake step) is a margin, not a measured depth:
+  the stack probe does not drive the server yet.
+- No fuzz harness drives `Server` yet (the ClientHello decoder, the receive side and record
+  protection each have one).
 
 - No ctgrind row and no audit or mutation run yet; the record layer is new code.
 - The bulk path is not measured against OpenSSL libssl (P2), nor is the cost of the per-record

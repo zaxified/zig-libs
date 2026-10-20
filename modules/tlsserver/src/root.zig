@@ -3,12 +3,12 @@
 //! tlsserver — a TLS 1.3 server (RFC 8446), buffer-driven (sans-I/O) with a
 //! blocking wrapper on top, built on the collection's `tls13` handshake
 //! building blocks and its `aesgcm` / `chachapoly` AEADs. Under construction
-//! (plan: milestones M1–M4, `SPEC.md`); today it has the record layer:
-//! the 5-byte header, per-direction in-place record protection for
-//! TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
-//! TLS_CHACHA20_POLY1305_SHA256, the receive side (records → handshake
-//! messages, alerts, application data), alerts, the ClientHello decoder and
-//! the encoders of the server's handshake messages.
+//! (plan: milestones M1–M4, `SPEC.md`). Today: `Server`, a sans-I/O full
+//! handshake with a certificate (TLS_AES_128_GCM_SHA256,
+//! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
+//! X25519, secp256r1), then application data — no HelloRetryRequest,
+//! resumption, client certificates or KeyUpdate yet — over the record layer,
+//! the ClientHello decoder and the message encoders.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
 
@@ -17,7 +17,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today the record layer (in-place record protection for the AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 suites, the receive side joining handshake messages, alerts, the ClientHello decoder, the server's message encoders)",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1), no HelloRetryRequest, resumption or client certificates yet",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},
@@ -39,18 +39,30 @@ pub const alert = @import("alert.zig");
 /// The receive side: records → handshake messages, alerts, application data.
 pub const inbound = @import("inbound.zig");
 
+/// The send side: content framed into records, fragmented and sealed in place.
+pub const outbound = @import("outbound.zig");
+
 /// The ClientHello, decoded into slices with every extension checked.
 pub const hello = @import("hello.zig");
 
 /// The handshake messages the server writes (ServerHello … Finished).
 pub const messages = @import("messages.zig");
 
+/// The sans-I/O server: the full handshake, then application data.
+pub const server = @import("server.zig");
+pub const Server = server.Server;
+pub const Config = server.Config;
+pub const CertifiedKey = server.CertifiedKey;
+
 test {
     _ = record;
     _ = alert;
     _ = inbound;
+    _ = outbound;
     _ = hello;
     _ = messages;
+    _ = server;
+    _ = @import("handshake_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
 }
