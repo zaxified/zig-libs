@@ -7,7 +7,8 @@
 //! the 5-byte header, per-direction in-place record protection for
 //! TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and
 //! TLS_CHACHA20_POLY1305_SHA256, the receive side (records → handshake
-//! messages, alerts, application data), alerts and the ClientHello decoder.
+//! messages, alerts, application data), alerts, the ClientHello decoder and
+//! the encoders of the server's handshake messages.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
 
@@ -16,7 +17,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today the record layer (in-place record protection for the AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 suites, the receive side joining handshake messages, alerts, the ClientHello decoder)",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today the record layer (in-place record protection for the AES-128-GCM, AES-256-GCM and ChaCha20-Poly1305 suites, the receive side joining handshake messages, alerts, the ClientHello decoder, the server's message encoders)",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},
@@ -41,11 +42,15 @@ pub const inbound = @import("inbound.zig");
 /// The ClientHello, decoded into slices with every extension checked.
 pub const hello = @import("hello.zig");
 
+/// The handshake messages the server writes (ServerHello … Finished).
+pub const messages = @import("messages.zig");
+
 test {
     _ = record;
     _ = alert;
     _ = inbound;
     _ = hello;
+    _ = messages;
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
 }

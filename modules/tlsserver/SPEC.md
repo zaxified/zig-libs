@@ -29,7 +29,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference (P2) for this module's handshake and bulk rows. |
 
 **Where we are ahead:** nothing yet. **Where we are behind:** everything but the record layer —
-records, the receive side, alerts and the ClientHello decoder are the first pieces of the server (milestone M1,
+records, the receive side, alerts, the ClientHello decoder and the server's message encoders are
+the first pieces of the server (milestone M1,
 *Backlog*).
 
 ## What this module is, and what it is not
@@ -42,7 +43,8 @@ milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 
 **Today it is only the record layer**: the 5-byte header, per-direction in-place record
 protection, the receive side (records → whole handshake messages, alerts, application data),
-alerts and the ClientHello decoder. There is no handshake, no connection object and nothing that talks to a socket — a
+alerts, the ClientHello decoder and the encoders of the server's handshake messages. There is no
+handshake state machine yet, no connection object and nothing that talks to a socket — a
 reader looking for a usable TLS server will not find one here yet.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
@@ -126,6 +128,12 @@ RFC 8446 §5, record layer over a byte stream:
   name type other than `host_name` ends the list. `pre_shared_key.binders_offset` is where the
   binder transcript ends (§4.2.11.2). Duplicate detection is an 8 KiB bit set over the whole
   type space, so it is linear in the number of extensions.
+- **Server messages** (`messages`, RFC 8446 §4): ServerHello, HelloRetryRequest (the §4.1.3
+  random), EncryptedExtensions, Certificate (entries with their extensions, e.g. an OCSP
+  `status_request` on the leaf, §4.4.2.1), CertificateVerify and Finished, each returned whole
+  (header ‖ body) from the caller's buffer; ALPN and OCSP extension bodies. ServerHello extension
+  order is `pre_shared_key`, `key_share`, `cookie`, `supported_versions` (RFC 8448's). A field
+  too long for its length prefix is `FieldTooLong`, a short buffer `BufferTooSmall`.
 - **In place:** `seal` takes the content at `buf[5..]` and writes type, padding, tag and header
   around it; `open` decrypts over the ciphertext and returns a slice of the same buffer. That is
   the layout qap's zero-copy record codecs read and write.
@@ -184,8 +192,14 @@ The receive side's refusals are the table under *Wire format*. Record protection
 - **External:** RFC 8448's ClientHellos — §3 (1-RTT), §4 (resumed 0-RTT: `early_data`,
   `pre_shared_key` with one identity and binder), §5 (ClientHello1 and ClientHello2 with the
   cookie) — decode to the fields the RFC shows; §4's binder offset reproduces the RFC's "binder
-  hash" (SHA-256 of the prefix). Extracted by `tools/rfc8448_hellos.py`, which checks the printed
-  prefix and its hash before writing `src/hello_kat_vectors.zig`.
+  hash" (SHA-256 of the prefix). Extracted by `tools/rfc8448_messages.py`, which checks the printed
+  prefix and its hash before writing `src/message_kat_vectors.zig`.
+
+- **External:** the server's messages of RFC 8448 — §3 ServerHello, EncryptedExtensions,
+  Certificate, CertificateVerify, Finished; §4 ServerHello (with `pre_shared_key`) and
+  EncryptedExtensions (with `early_data`); §5 HelloRetryRequest (with the cookie ClientHello2
+  echoes) and the secp256r1 ServerHello — rebuilt byte-exact from their fields by `messages`
+  (same tool, `src/message_kat_vectors.zig`).
 
 **Anchor grade:** class A · oracle EXTERNAL
 

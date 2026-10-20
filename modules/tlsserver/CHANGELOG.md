@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — The server's handshake message encoders: `messages` (ServerHello,
+  HelloRetryRequest, EncryptedExtensions, Certificate with per-entry extensions, CertificateVerify,
+  Finished; ALPN and OCSP extension bodies), each rebuilt byte-exact from its fields against RFC
+  8448 §3/§4/§5. The RFC extraction tool is now `tools/rfc8448_messages.py` (ClientHellos and the
+  server's messages, `src/message_kat_vectors.zig`).
 - **2026-10-20** — The ClientHello decoder: `hello.parseClientHello` (zero-copy, iterators over
   the wire lists; the extensions a TLS 1.3 server reads checked for form; duplicate extensions,
   `pre_shared_key` not last and mismatched PSK identity/binder counts refused; SNI classified

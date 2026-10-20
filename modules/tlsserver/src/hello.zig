@@ -434,7 +434,7 @@ fn parsePreSharedKey(data: []const u8, data_at: usize) Error!PreSharedKey {
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
-const kat = @import("hello_kat_vectors.zig");
+const kat = @import("message_kat_vectors.zig");
 
 fn hexDecode(comptime hex: []const u8) [hex.len / 2]u8 {
     var out: [hex.len / 2]u8 = undefined;
