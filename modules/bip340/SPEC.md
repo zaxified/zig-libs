@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, BIP340_FUZZ, forgery check) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 1.30–3.99× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.38–3.85× libsecp256k1 v0.8.0 schnorrsig · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -296,6 +296,10 @@ check, the four burns (`sign`, `signFromSecretKey`'s, `fromSecretKey`'s, `comput
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** official BIP340 19 test vectors embedded verbatim in kat_vectors.zig
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-bip340`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.38–3.85×, against 1.30–3.99× before. The card carries these figures.
 
 ## Backlog / deferred
 

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per target, 5 targets, BOLT8_FUZZ) · ct 2026-09-08 (ctgrind)
 
-**Performance:** ref 0.79–1.13× lnd brontide v0.21.3-beta · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.53–1.28× lnd brontide v0.21.3-beta · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -487,6 +487,10 @@ plus an independent interop anchor: `tools/peer.zig` paired against lnd's own `b
 1100-message bidirectional transport exchange in both roles, and this module fails closed with
 `error.DecryptionFailed` against two forged-handshake wire attacks — see `tools/README.md` for the
 measured run.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-bolt8`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.53–1.28×, against 0.79–1.13× before. The card carries these figures.
 
 ## Backlog / deferred
 

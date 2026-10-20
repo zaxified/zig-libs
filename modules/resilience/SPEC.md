@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, RESILIENCE_FUZZ: breaker, retry, run) · ct n/a — circuit breaker (keyword review, 2026-10-07)
 
-**Performance:** ref 0.03–0.60× gobreaker 2.4.0 / failsafe-go 0.9.8 / cenkalti/backoff 5.0.3 (Go 1.26.8) · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.03–0.67× gobreaker 2.4.0 / failsafe-go 0.9.8 / cenkalti/backoff 5.0.3 (Go 1.26.8) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — a naive breaker that recounts its window from a plain call list (consecutive, count and time windows, modes, half-open k of n, listener sequence), a rational model of the delay schedule, and an interpreter of `run`'s documented composition against a scripted fake breaker; 8 planted mutants all killed (2026-10-17)
 
@@ -135,6 +135,10 @@ assignment `probes_admitted = probes_succeeded` is a no-op. Tests added for the 
 a new half-open episode starts from zero successes, a later probe admission moves the reclaim
 anchor, `abandonProbe` is a no-op while open after a half-open trip, and a full non-waiting
 bulkhead never reads its clock.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-resilience`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.03–0.67×, against 0.03–0.60× before. The card carries these figures.
 
 ## Backlog / deferred
 

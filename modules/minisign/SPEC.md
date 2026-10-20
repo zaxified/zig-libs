@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (500,000 runs clean per harness, MINISIGN_FUZZ) · ct none
 
-**Performance:** ref 1.29–1.31× minisign 0.12 CLI · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.30–1.32× minisign 0.12 CLI · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -263,6 +263,10 @@ bits, every target this module has). No defect found.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** byte-exact vs real minisign 0.12 binary, README
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-minisign`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.30–1.32×, against 1.29–1.31× before. The card carries these figures.
 
 ## Backlog / deferred
 

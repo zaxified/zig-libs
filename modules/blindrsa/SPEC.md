@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (20,000 runs clean, BLINDRSA_FUZZ, forgery check) · ct 2026-10-02 (ctgrind)
 
-**Performance:** ref 0.35–8.85× CIRCL v1.6.1 `blindsign/blindrsa` (stand-in for RFC 9474, which has no code) · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.18–5.45× CIRCL v1.6.1 `blindsign/blindrsa` (stand-in for RFC 9474, which has no code) · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -311,6 +311,10 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
 - To re-derive/re-check `kat_vectors.zig`'s recomputed `r` in Python:
   `r = pow(inv, -1, n)`, then assert `r * inv % n == 1` and
   `blinded_msg == encoded_msg * pow(r, e, n) % n` for both A.1 and A.4.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-blindrsa`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.18–5.45×, against 0.35–8.85× before. The card carries these figures.
 
 ## Backlog / deferred
 

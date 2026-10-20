@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file digests, no keys (keyword review, 2026-10-07)
 
-**Performance:** ref 0.84–1.40× Go 1.26.0 crypto + encoding/hex · fastest 1.60× OpenSSL 3.5.5 (measured 2026-10-10)
+**Performance:** ref 0.85–1.41× Go 1.26.8 crypto + encoding/hex · fastest 1.60× OpenSSL 3.5.5 (measured 2026-10-20)
 
 **Evidence:** kat — thin std.crypto wrapper; official RFC/BLAKE vectors only
 
@@ -67,6 +67,8 @@ different lengths is already false. One test added for the two real gaps: a buff
 short of `hexLength` is `ShortBuffer` in both `hex` and `finalHex`.
 
 ## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-hashdigest`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.85–1.41×, fastest 1.60×, against 0.84–1.40× before. The card carries these figures; what follows is the earlier measurement.
 
 Measured 2026-10-10 by `zig build bench-hashdigest` (`tools/bench.zig` driving
 `tools/go_bench/main.go` and `tools/c_bench/foreign_bench.c`). Reference: Go 1.26.0's one-shot

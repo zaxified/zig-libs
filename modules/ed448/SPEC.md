@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, ED448_FUZZ) · ct 2026-08-11 (ctgrind)
 
-**Performance:** ref 0.99–3.99× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.10–3.94× OpenSSL 3.5.5 Ed448/X448 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -368,6 +368,10 @@ final swap, `z = 0`, top bit); field canonical check, the fold rounds,
   the last `swap` is always 0); `reduceAfterFold`'s third round (by the bound
   argument in its doc comment, round 2's fold never pushes a limb past
   2^56 − 1, so round 3 never changes a limb).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ed448`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.10–3.94×, against 0.99–3.99× before. The card carries these figures.
 
 ## Backlog / deferred
 

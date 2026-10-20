@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-16 (200,000-run budget per harness clean, AESCBC_FUZZ: cbc, padding, cts, stream) · ct 2026-10-18 on Zig 0.17.0 (ctgrind: all five unpadders, 1 in-file context each = the accept/reject verdict, 0 for unpadZero; the verdict goes through the `rejectIf` asm barrier since 0.17 split iso7816's into two jumps, see `root.zig` `rejectIf`)
 
-**Performance:** ref 0.19–0.83× Go 1.26.8 crypto/cipher · fastest 1.03× OpenSSL 3.5.5 (measured 2026-10-16)
+**Performance:** ref 0.20–0.77× Go 1.26.8 crypto/cipher · fastest 1.20× OpenSSL 3.5.5 (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -268,8 +268,13 @@ what). No defect. Gap closed: the "pad length > block_len" test set only the las
 so the byte comparison refused it too and `n > block_len` was unpinned (`n > 17` survived) — a
 whole block of 0x11 is now refused by both unpadders.
 
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aescbc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.20–0.77×, fastest 1.20×, against 0.19–0.83× before (bench repeated after the fix: the CTS rows (OpenSSL only: Go has no CTS) now count for `fastest`, not for the Go ratio — since `testkit.bench` (2026-10-17) they had gone into it, so the first 0.17 run read ref 0.21–1.21×). The card carries these figures.
+
 ## Backlog / deferred
 
+- **CTS encrypt 1.20× OpenSSL** *(bench 2026-10-20, `cts_enc_1000`; `cts_dec_1000` 0.98×)*: the one-shot `encryptCts` pays the key expansion and a 1536-byte burn per call over a latency-bound CBC chain (63 blocks); OpenSSL's provider path is ~200 ns cheaper per call. Counts for `fastest` only (Go has no CTS), so it blocks P1, not P2. Candidates: a smaller burn sized to the body, or a keyed CTS context.
 - ~~**(survey 2026-09-30) Incremental CBC state**~~ — done 2026-10-16: `Encryptor`/`Decryptor`, plus `StreamEncryptor`/`StreamDecryptor` for any chunk length.
 - ~~**(survey 2026-09-30) Further padding schemes**~~ — done 2026-10-16: ANSI X9.23, ISO 10126, ISO/IEC 7816-4, zero.
 - ~~**Ciphertext stealing**~~ — done 2026-10-16 (CS1/CS2/CS3; found missing against OpenSSL 3 and RustCrypto `cts` at the S2 pass).

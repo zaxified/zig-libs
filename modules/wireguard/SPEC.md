@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, WIREGUARD_FUZZ) · ct none
 
-**Performance:** ref 0.90–1.37× OpenSSL 3.5.5 ChaCha20-Poly1305 + libsodium 1.0.18 X25519 composition · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.84–1.35× OpenSSL 3.5.5 ChaCha20-Poly1305 + libsodium 1.0.18 X25519 composition · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -103,6 +103,8 @@ direction is cross-checked by decoding both this module's own request and `wg`'s
 equal semantic `Device`.
 
 ## Performance — `bench-wireguard` (2026-10-10)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-wireguard`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.84–1.35×, against 0.90–1.37× before. The card carries these figures; what follows is the earlier measurement.
 
 The comparative benchmark behind the card's Performance line. Neither the in-kernel WireGuard
 (root and a tunnel) nor wireguard-go (not installed) can be timed op for op here, and the

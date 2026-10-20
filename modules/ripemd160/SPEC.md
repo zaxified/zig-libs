@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, RIPEMD160_FUZZ) · ct 2026-10-09 (ctgrind: message tainted, `hash` + `hash160`, 0 in-file)
 
-**Performance:** ref 1.04–1.07× Bitcoin Core v29.0 CRIPEMD160 · fastest ? (measured 2026-10-07)
+**Performance:** ref 1.02–1.05× Bitcoin Core v29.0 CRIPEMD160 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -115,6 +115,8 @@ buffer arithmetic (`update`'s partial-fill / full-block / remainder logic)
 the KATs' one-shot calls can't exercise.
 
 ## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ripemd160`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 1.02–1.05×, against 1.04–1.07× before. The card carries these figures; what follows is the earlier measurement.
 
 `compress`'s 80-round double-line schedule is `inline for (0..80)` (fully
 unrolled at compile time), not a runtime `while` loop over the round tables.

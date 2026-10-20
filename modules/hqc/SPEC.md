@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (100,000 runs clean, HQC_FUZZ, roundtrip and implicit reject) · ct 2026-09-09 (ctgrind)
 
-**Performance:** ref 0.04–0.07× HQC v5.0.0 `ref` lane · fastest 2.28–3.39× HQC v5.0.0 `x86_64/avx256` lane (measured 2026-10-07)
+**Performance:** ref 0.04–0.07× HQC v5.0.0 `ref` lane · fastest 2.46–3.52× HQC v5.0.0 `x86_64/avx256` lane (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -641,6 +641,10 @@ value, not a crash, and different from the real shared secret).
   mechanical struct-packing per spec §3.5/§4.2 and this module's already-
   verified byte sizes (params.zig). **The whole HQC arc is now complete
   and usable as a KEM** (`root.zig`'s `Hqc128`/`Hqc192`/`Hqc256`).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-hqc`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.04–0.07×, fastest 2.46–3.52×, against 0.04–0.07× before. The card carries these figures.
 
 ## Backlog / deferred
 

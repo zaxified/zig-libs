@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-17 (1,000,000 runs clean, B64CT_FUZZ, every reach label hit) · ct 2026-10-17 (ctgrind: octets tainted for `encode`, text for `decode`/`ignore`, 0 in-file; positive controls 204/69/46)
 
-**Performance:** ref 0.06–0.27× libsodium 1.0.22 · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.05–0.28× libsodium 1.0.22 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -189,3 +189,7 @@ non-LLVM backends and on the error paths, which ctgrind has not measured.
   run by any lane.
 - The libsodium differential (`interop-b64ct`) runs in no gate; the fuzz
   oracle for `decodePrefix` is self-consistency, with `pem_whitespace` only.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-b64ct`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.05–0.28×, against 0.06–0.27× before. The card carries these figures.
