@@ -3,14 +3,16 @@
 
 Usage:  python3 -I tools/gen_tables.py [--check]
 
-Reads ONLY src/testdata/encodings.json and src/testdata/index-*.txt (vendored
-byte-for-byte, see ../NOTICE); no network. Deterministic: the same inputs give
+Reads ONLY src/testdata/encodings.json, src/testdata/index-*.txt (WHATWG) and
+src/testdata/CP{437,850,852}.TXT (Unicode.org MICSFT/PC mappings), all vendored
+byte-for-byte, see ../NOTICE; no network. Deterministic: the same inputs give
 the same bytes. --check regenerates in memory and fails if src/sb_tables.zig
 differs.
 
 Output: per single-byte page a 128-entry decode table (byte 0x80..0xFF, 0xFFFF
 = no pointer -> U+FFFD), a sorted encode table (the inverse), the canonical
-name; plus the complete label table of encodings.json.
+name; plus the complete label table of encodings.json and the labels of the
+non-WHATWG DOS pages (DOS_PAGES below).
 """
 import hashlib
 import json
@@ -32,8 +34,21 @@ SPECIAL = {
     "UTF-16LE": "utf16le",
     "UTF-16BE": "utf16be",
     "replacement": "replacement",
-    "x-user-defined": "x_user_defined",
 }
+# `x-user-defined` has no index file: byte 0x80+i is U+F780+i (WHATWG, "x-user-defined
+# decoder"). It becomes a page like the single-byte ones (appended after iso_8859_1).
+X_USER_DEFINED = "x-user-defined"
+
+# NON-WHATWG pages: IBM PC / MS-DOS code pages from Unicode.org's MICSFT/PC
+# mappings. (page name = IANA name, tag, vendored file, labels). The labels are
+# the IANA aliases of each charset (https://www.iana.org/assignments/character-sets),
+# NOT from the WHATWG table: WHATWG has no such encodings, so `lookupLabel`
+# answering them is this module's extension. None may collide with a WHATWG label.
+DOS_PAGES = [
+    ("IBM437", "cp437", "CP437.TXT", ["cp437", "ibm437", "437", "cspc8codepage437"]),
+    ("IBM850", "cp850", "CP850.TXT", ["cp850", "ibm850", "850", "cspc850multilingual"]),
+    ("IBM852", "cp852", "CP852.TXT", ["cp852", "ibm852", "852", "cspcp852"]),
+]
 # Page whose index file is shared (no index-ISO-8859-8-I.txt exists).
 SHARED_INDEX = {"ISO-8859-8-I": "ISO-8859-8"}
 
@@ -99,6 +114,26 @@ def parse_index(name):
     return [SENTINEL if c is None else c for c in dec], ident, date
 
 
+def parse_micsft(fname):
+    """Decode table (128 entries) of a Unicode.org MICSFT/PC mapping file.
+    Every byte must be defined once and 0x00-0x7F must be the identity (the
+    `Encoding` invariant is ASCII compatibility)."""
+    # The files end with a DOS ^Z; only lines starting `0x` are data.
+    text = read(os.path.join(TESTDATA, fname)).decode("ascii")
+    m = {}
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        if not line.startswith("0x"):
+            continue
+        f = line.split("\t")
+        b, cp = int(f[0], 16), int(f[1], 16)
+        assert 0 <= b < 256 and b not in m and cp < SENTINEL, (fname, b)
+        m[b] = cp
+    assert sorted(m) == list(range(256)), fname
+    assert all(m[b] == b for b in range(128)), fname + ": low half is not ASCII"
+    return [m[b] for b in range(128, 256)]
+
+
 def build():
     raw = read(os.path.join(TESTDATA, "encodings.json"))
     groups = json.loads(raw.decode("utf-8"))
@@ -106,6 +141,7 @@ def build():
     pages = []  # (name, tag, decode)
     label_target = {}  # label -> (kind, payload)
     dates = set()
+    late_pages = []  # appended after iso_8859_1
     for g in groups:
         single = g["heading"] == SB_HEADING
         for e in g["encodings"]:
@@ -114,6 +150,9 @@ def build():
                 dec, _, date = parse_index(name)
                 dates.add(date)
                 pages.append((name, tag(name), dec))
+                target = ("page", tag(name))
+            elif name == X_USER_DEFINED:
+                late_pages.append((name, tag(name), [0xF780 + i for i in range(128)]))
                 target = ("page", tag(name))
             elif name in SPECIAL:
                 target = (SPECIAL[name], None)
@@ -133,6 +172,14 @@ def build():
 
     # iso_8859_1: the true Latin-1 identity high half (not a WHATWG encoding).
     pages.append(("iso-8859-1", "iso_8859_1", list(range(0x80, 0x100))))
+    pages.extend(late_pages)
+    n_whatwg_labels = len(label_target)
+    for name, t, fname, labs in DOS_PAGES:
+        pages.append((name, t, parse_micsft(fname)))
+        for lab in labs:
+            assert lab == lab.lower() and lab not in label_target, lab
+            label_target[lab] = ("page", t)
+    dos_labels = {lab for _, _, _, labs in DOS_PAGES for lab in labs}
 
     o = []
     w = o.append
@@ -141,7 +188,9 @@ def build():
     w("//!\n")
     w("//! Source: WHATWG Encoding Standard (https://encoding.spec.whatwg.org/), the vendored\n")
     w("//! src/testdata/index-*.txt (each header: Date: %s) and src/testdata/encodings.json\n" % date)
-    w("//! (sha256 %s).\n" % hashlib.sha256(raw).hexdigest())
+    w("//! (sha256 %s); the DOS pages cp437/cp850/cp852 come from Unicode.org's\n" % hashlib.sha256(raw).hexdigest())
+    w("//! MICSFT/PC mapping files src/testdata/CP{437,850,852}.TXT, and x_user_defined\n")
+    w("//! (U+F780 + byte - 0x80) from the Standard's own definition.\n")
     w("//! Derived data, see ../NOTICE (CC-BY 4.0; this file is a MODIFIED, reformatted\n")
     w("//! rendering of the vendored tables). Regenerate: `python3 -I tools/gen_tables.py`;\n")
     w("//! `--check` verifies this file is current.\n")
@@ -210,18 +259,22 @@ def build():
     w("/// at `labels`). `unsupported` carries the WHATWG name of an encoding that is known\n")
     w("/// but not implemented.\n")
     w("pub const Target = union(enum) {\n")
-    w("    page: Page,\n    utf8,\n    utf16le,\n    utf16be,\n    replacement,\n    x_user_defined,\n")
+    w("    page: Page,\n    utf8,\n    utf16le,\n    utf16be,\n    replacement,\n")
     w("    unsupported: []const u8,\n")
     w("};\n\n")
     w("pub const Label = struct { label: []const u8, target: Target };\n\n")
-    w("/// Every label of encodings.json (%d), sorted bytewise by `label` (all lowercase;\n" % len(label_target))
+    w("/// Every label of encodings.json (%d) plus the %d IANA labels of the non-WHATWG DOS\n" % (n_whatwg_labels, len(dos_labels)))
+    w("/// pages (marked below), sorted bytewise by `label` (all lowercase;\n")
     w("/// the caller trims ASCII whitespace and lowercases, then binary-searches).\n")
     w("/// DEPARTURE from WHATWG: the %d labels of the iso-8859-1 family map to\n" % len(ISO_8859_1_OVERRIDES))
     w("/// `.page = .iso_8859_1` instead of windows-1252, each marked below.\n")
     w("pub const labels = [_]Label{\n")
     for lab in sorted(label_target):
         kind, payload = label_target[lab]
-        if lab in override:
+        if lab in dos_labels:
+            w("    // not WHATWG: IANA alias of a DOS code page\n")
+            tgt = ".{ .page = .%s }" % payload
+        elif lab in override:
             w("    // departure: %s\n" % override[lab])
             tgt = ".{ .page = .iso_8859_1 }"
         elif kind == "page":

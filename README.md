@@ -654,7 +654,7 @@ way to recognise it.
 | [`csvsafe`](modules/csvsafe/README.md) | 3 (S,E,P) | CSV formula-injection guard: OWASP's `=`/`+`/`-`/`@`/tab/CR cell leads, plus LF, `|` and `%`. | any | — |
 | [`csvstream`](modules/csvstream/README.md) | 2 (S,E,A,P) | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
 | [`datefmt`](modules/datefmt/README.md) | 2 (S,E,A,P) | Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970. | any | — |
-| [`encoding`](modules/encoding/README.md) | 3 (S) | Text decoding to and from UTF-8: every WHATWG single-byte code page, UTF-8 and UTF-16 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics). | any | — |
+| [`encoding`](modules/encoding/README.md) | 3 (S) | Text decoding to and from UTF-8: every WHATWG single-byte code page plus DOS CP437/850/852 and custom pages, UTF-8, UTF-16 and UTF-32 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics). | any | — |
 | [`framing`](modules/framing/README.md) | 3 (S,E,P) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
 | [`ini`](modules/ini/README.md) | 3 (S,P) | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
 | [`jinja`](modules/jinja/README.md) | 4 (S) | Jinja2-compatible template engine — expressions, control flow, template inheritance/macros/imports, over a symlink-contained loader. | any | — |

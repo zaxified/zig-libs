@@ -35,7 +35,7 @@ test "every page: each defined high byte decodes and encodes back to itself" {
             } else try testing.expectEqualSlices(u8, &.{byte}, back);
         }
     }
-    try testing.expectEqual(@as(usize, 29), pages);
+    try testing.expectEqual(@as(usize, 33), pages); // 29 WHATWG single-byte + x-user-defined + 3 DOS
     try testing.expect(holes > 0); // windows-1253, ISO-8859-8, … have undefined bytes
 }
 
@@ -66,8 +66,8 @@ test "labels: WHATWG table, module extras, and what is known but not an Encoding
     try testing.expectEqual(enc.LabelTarget{ .utf16 = .le }, enc.lookupLabel("utf-16").?);
     try testing.expectEqual(enc.LabelTarget{ .utf16 = .be }, enc.lookupLabel("UTF-16BE").?);
     try testing.expectEqual(enc.LabelTarget.replacement, enc.lookupLabel("iso-2022-kr").?);
-    try testing.expectEqual(enc.LabelTarget.x_user_defined, enc.lookupLabel("x-user-defined").?);
-    try testing.expectEqualStrings("Shift_JIS", enc.lookupLabel("sjis").?.unsupported);
+    try testing.expectEqual(enc.LabelTarget{ .encoding = .x_user_defined }, enc.lookupLabel("x-user-defined").?);
+    try testing.expectEqual(enc.cjk.Cjk.shift_jis, enc.lookupLabel("sjis").?.cjk);
     try testing.expect(Encoding.parse("sjis") == null);
     try testing.expect(enc.lookupLabel("no-such-label") == null);
     try testing.expectEqualStrings("KOI8-R", Encoding.koi8_r.whatwgName());
@@ -166,6 +166,8 @@ fn encodeTiny(a: std.mem.Allocator, kind: enc.Encoder.Kind, opts: enc.Encoder.Op
 const sample_utf8 = "Příliš žluťoučký kůň \u{1F600} € \xff\xe2\x82 \xed\xa0\x80 ok";
 const sample_1250 = "P\xf8\xedli\x9a \x9elu\x9dou\xe8k\xfd k\xf9\xf2 \x80 \x81!";
 const sample_u16 = "A\x00\x3d\xd8\x00\xde\x00\xd8B\x00\xac\x20\xdc\xdf";
+/// UTF-32LE: A, U+1F600, a lone surrogate, B, above U+10FFFF, U+20AC, 3 stray bytes.
+const sample_u32 = "A\x00\x00\x00" ++ "\x00\xf6\x01\x00" ++ "\x00\xd8\x00\x00" ++ "B\x00\x00\x00" ++ "\x00\x00\x11\x00" ++ "\xac\x20\x00\x00" ++ "\x01\x02\x03";
 
 test "decodeInto: any output room and any cut give the whole-buffer result" {
     const a = testing.allocator;
@@ -175,11 +177,16 @@ test "decodeInto: any output room and any cut give the whole-buffer result" {
         .{ .{ .encoding = .windows_1253 }, "a\xaa\xe1b" },
         .{ .{ .utf16 = .le }, sample_u16 },
         .{ .{ .utf16 = .be }, sample_u16 },
+        .{ .{ .utf32 = .le }, sample_u32 },
+        .{ .{ .utf32 = .be }, sample_u32 },
+        .{ .{ .encoding = .cp852 }, "a\xe7\xfd\xd8b" },
+        .{ .{ .encoding = .x_user_defined }, "a\x80\xffb" },
     };
     for (cases) |c| {
         const want = switch (c[0]) {
             .encoding => |e| try enc.decodeToUtf8(a, c[1], e),
             .utf16 => |e| try enc.decodeUtf16(a, c[1], e),
+            .utf32 => |e| try enc.decodeUtf32(a, c[1], e),
         };
         defer a.free(want);
         for ([_]usize{ 7, 8, 9, 13, 64 }) |room| {
@@ -197,7 +204,7 @@ test "decodeInto: any output room and any cut give the whole-buffer result" {
 
 test "Encoder: any output room and any cut give the whole-buffer result" {
     const a = testing.allocator;
-    const pages = [_]Encoding{ .utf8, .windows_1250, .iso_8859_2, .koi8_r };
+    const pages = [_]Encoding{ .utf8, .windows_1250, .iso_8859_2, .koi8_r, .cp852, .x_user_defined };
     for (pages) |page| {
         for ([_]enc.Unmappable{ .question_mark, .html_ncr, .ignore }) |mode| {
             const want = try enc.encodeFromUtf8Opts(a, sample_utf8, page, .{ .unmappable = mode });
@@ -211,6 +218,20 @@ test "Encoder: any output room and any cut give the whole-buffer result" {
                         return err;
                     };
                 }
+            }
+        }
+    }
+    for ([_]enc.Utf32Endian{ .le, .be }) |endian| {
+        const want = try enc.encodeUtf32(a, sample_utf8, endian, true);
+        defer a.free(want);
+        for ([_]usize{ 8, 9, 11, 64 }) |room| {
+            for (0..sample_utf8.len + 1) |cut| {
+                const got = try encodeTiny(a, .{ .utf32 = endian }, .{ .bom = true }, sample_utf8, room, cut);
+                defer a.free(got);
+                testing.expectEqualSlices(u8, want, got) catch |err| {
+                    std.debug.print("encode utf32 {t} room {d} cut {d}\n", .{ endian, room, cut });
+                    return err;
+                };
             }
         }
     }

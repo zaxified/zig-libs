@@ -309,6 +309,23 @@ pub fn validUtf8(s: []const u8) bool {
     return true;
 }
 
+/// Length of the longest well-formed UTF-8 prefix of `s`: the index of the
+/// first byte that cannot be part of well-formed UTF-8 (the start of an
+/// ill-formed sequence, or of one cut by the end of `s`), or `s.len`. The same
+/// rule as `validUtf8` and `decodeUtf8` (Rust's `Utf8Error::valid_up_to`).
+pub fn utf8ValidUpTo(s: []const u8) usize {
+    var i: usize = utf8_simd.validPrefix(s);
+    while (i < s.len) {
+        i += asciiPrefix(s[i..]);
+        while (i < s.len and s[i] >= 0x80) {
+            const n = wellFormedLen(s, i);
+            if (n == 0) return i;
+            i += n;
+        }
+    }
+    return i;
+}
+
 /// Decode UTF-8 with replacement, one U+FFFD per maximal subpart. `last`:
 /// the end of `src` is the end of the stream (a pending sequence becomes
 /// U+FFFD). Needs room for 6 bytes before each non-ASCII step.
@@ -672,4 +689,146 @@ fn putUtf8(comptime e: Endian, out: []u8, s: []const u8) usize {
     var view = std.unicode.Utf8View.initUnchecked(s).iterator();
     while (view.nextCodepoint()) |cp| w += putCp(e, out[w..], cp);
     return w;
+}
+
+// ── UTF-32 ──────────────────────────────────────────────────────────────────
+
+/// The bytes of a unit started in an earlier call (0..3 of them).
+pub const Utf32State = struct {
+    buf: [4]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn pending(self: Utf32State) bool {
+        return self.len != 0;
+    }
+};
+
+inline fn unit32(src: *const [4]u8, comptime e: Endian) u32 {
+    return std.mem.readInt(u32, src, if (e == .le) .little else .big);
+}
+
+/// A UTF-32 unit as UTF-8 at `dst[w..]`, or U+FFFD when it is no Unicode
+/// scalar value (above U+10FFFF, or a surrogate): one U+FFFD per unit, as
+/// Python's `errors="replace"` and the Unicode recommendation. Returns the
+/// bytes written (at most 4), 0 for `fatal` and a bad unit.
+inline fn putUnit32(u: u32, dst: []u8, w: usize) usize {
+    if (u > 0x10FFFF or (u >= 0xD800 and u <= 0xDFFF)) {
+        @memcpy(dst[w..][0..3], replacement);
+        return 3;
+    }
+    var tmp: [4]u8 = undefined;
+    const n = utf8Encode(@intCast(u), &tmp);
+    @memcpy(dst[w..][0..n], tmp[0..n]);
+    return n;
+}
+
+/// UTF-32 to UTF-8. A malformed unit (a value above U+10FFFF, a surrogate) is
+/// one U+FFFD; so is a unit cut by the end of the stream (1 to 3 bytes left
+/// at `last`, however many) — the same counts as CPython's `utf-32` decoder
+/// with `errors="replace"`. Unlike UTF-16 there is no state beyond the cut
+/// unit: a bad unit never swallows its successor. Needs room for 4 bytes per
+/// step.
+pub fn decodeUtf32(comptime e: Endian, state: *Utf32State, src: []const u8, dst: []u8, last: bool, fatal: bool) Progress {
+    // A local copy, as in `decodeUtf16`.
+    var local = state.*;
+    defer state.* = local;
+    const st = &local;
+    var r: usize = 0;
+    var w: usize = 0;
+    var replaced = false;
+    if (st.len != 0) {
+        // Complete a unit started in an earlier call.
+        while (st.len < 4 and r < src.len) {
+            st.buf[st.len] = src[r];
+            st.len += 1;
+            r += 1;
+        }
+        if (st.len == 4) {
+            if (dst.len - w < 4) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+            const u = unit32(st.buf[0..4], e);
+            st.len = 0;
+            if (u > 0x10FFFF or (u >= 0xD800 and u <= 0xDFFF)) {
+                if (fatal) return .{ .status = .malformed, .read = r, .written = w, .replaced = replaced };
+                replaced = true;
+            }
+            w += putUnit32(u, dst, w);
+        }
+    }
+    while (st.len == 0 and r + 4 <= src.len) {
+        if (dst.len - w < 4) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+        const u = unit32(src[r..][0..4], e);
+        r += 4;
+        if (u > 0x10FFFF or (u >= 0xD800 and u <= 0xDFFF)) {
+            if (fatal) return .{ .status = .malformed, .read = r, .written = w, .replaced = replaced };
+            replaced = true;
+        }
+        w += putUnit32(u, dst, w);
+    }
+    if (st.len == 0 and r < src.len) {
+        // Fewer than 4 bytes left: carried into the next call.
+        while (r < src.len) : (r += 1) {
+            st.buf[st.len] = src[r];
+            st.len += 1;
+        }
+    }
+    if (last and st.len != 0 and st.len < 4) {
+        if (fatal) return .{ .status = .malformed, .read = r, .written = w, .replaced = replaced };
+        if (dst.len - w < 3) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+        st.len = 0;
+        @memcpy(dst[w..][0..3], replacement);
+        w += 3;
+        replaced = true;
+    }
+    return .{ .status = .input_empty, .read = r, .written = w, .replaced = replaced };
+}
+
+inline fn putU32(comptime e: Endian, out: *[4]u8, cp: u32) void {
+    std.mem.writeInt(u32, out, cp, if (e == .le) .little else .big);
+}
+
+/// UTF-8 with replacement (the same WHATWG decoder as `decodeUtf8`) to
+/// UTF-32. Needs room for 8 bytes per step.
+pub fn utf8ToUtf32(comptime e: Endian, st: *Utf8State, src: []const u8, dst: []u8, last: bool) Progress {
+    var r: usize = 0;
+    var w: usize = 0;
+    var replaced = false;
+    while (r < src.len) {
+        if (dst.len - w < 8) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+        const b0 = src[r];
+        if (st.needed == 0) {
+            if (b0 < 0x80) {
+                putU32(e, dst[w..][0..4], b0);
+                w += 4;
+                r += 1;
+                continue;
+            }
+            const len = wellFormedLen(src, r);
+            if (len != 0) {
+                const cp = std.unicode.utf8Decode(src[r..][0..len]) catch unreachable;
+                putU32(e, dst[w..][0..4], cp);
+                w += 4;
+                r += len;
+                continue;
+            }
+        }
+        // Ill-formed or cut: through the state machine into a scratch
+        // buffer (at most U+FFFD plus one more code point), then re-encoded.
+        var tmp: [8]u8 = undefined;
+        var tw: usize = 0;
+        if (utf8Step(st, b0, &tmp, &tw, false) catch unreachable) replaced = true;
+        r += 1;
+        var view = std.unicode.Utf8View.initUnchecked(tmp[0..tw]).iterator();
+        while (view.nextCodepoint()) |cp| {
+            putU32(e, dst[w..][0..4], cp);
+            w += 4;
+        }
+    }
+    if (last and st.needed != 0) {
+        if (dst.len - w < 4) return .{ .status = .output_full, .read = r, .written = w, .replaced = replaced };
+        st.* = .{};
+        putU32(e, dst[w..][0..4], 0xFFFD);
+        w += 4;
+        replaced = true;
+    }
+    return .{ .status = .input_empty, .read = r, .written = w, .replaced = replaced };
 }

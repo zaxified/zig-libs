@@ -118,7 +118,8 @@ pub fn parseUnicodeOrgTable(text: []const u8) !ParseResult {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#') continue;
+        // `\x1a`: the DOS end-of-file marker that ends Microsoft's CP*.TXT.
+        if (line.len == 0 or line[0] == '#' or line[0] == 0x1A) continue;
 
         var fields = std.mem.splitScalar(u8, line, '\t');
         const byte_field = fields.next() orelse return error.MalformedLine;

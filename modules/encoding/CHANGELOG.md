@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `encoding.cjk`: Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, gb18030, GBK, Big5 (WHATWG,
+  GB18030-2022), decoders/encoders in the caller-buffer shape, tables generated from vendored WHATWG
+  indexes (`tools/gen_cjk_tables.py`), x/text oracle. **Behavioural:** `LabelTarget.unsupported` is
+  replaced by `.cjk`. CJK fuzz harness.
+- **2026-10-20** — S2 parity, small items (R9-R12, R15). UTF-32 LE/BE (`decodeUtf32`, `encodeUtf32`,
+  `Decoder.Kind`/`Encoder.Kind` `.utf32`, `Utf32Endian`, `Bom.utf32le/.utf32be` via the new `sniffBom32`
+  and `decode32`; `sniffBom`/`decode` unchanged); `Encoding.x_user_defined` (**behavioural:**
+  `lookupLabel("x-user-defined")` now returns `.encoding = .x_user_defined` and `LabelTarget.x_user_defined`
+  is removed); DOS pages `Encoding.cp437/cp850/cp852` (IANA names and labels, vendored Unicode.org
+  `CP*.TXT`, NOTICE extended); `utf8ValidUpTo`, `isAscii`, `asciiValidUpTo`, `latin1ToUtf8`,
+  `utf8ToLatin1Lossy`; public `Custom(decode_table)` with `decodeCustom`/`encodeCustom`.
+
 - **2026-10-20** — S2 batch and speed. Every WHATWG single-byte encoding (24 new `Encoding` tags,
   appended; tables generated from vendored WHATWG indexes by `tools/gen_tables.py`), the full WHATWG
   label table (`lookupLabel`, `LabelTarget`, `decodeReplacement`), `whatwgName` and introspection,

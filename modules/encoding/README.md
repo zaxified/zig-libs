@@ -14,10 +14,11 @@ source code. Tests are anchored against vendored third-party normative DATA
 (the WHATWG Encoding Standard's `index-*.txt` tables and Unicode.org's
 `8859-1.TXT`); see `modules/encoding/NOTICE` for the attribution that data
 carries.
-This is the WHATWG **single-byte European subset** plus, since 2026-10-04,
-**UTF-16** (LE/BE), **BOM sniffing**, a **streaming** decoder and a **fatal**
-mode — WHATWG semantics throughout. Other single-byte pages and CJK stay out
-of scope — see below.
+Since 2026-10-20 this is the whole WHATWG Encoding Standard: every
+single-byte encoding, UTF-8, UTF-16 (LE/BE), the CJK encodings (`encoding.cjk`),
+the `replacement` encoding, plus UTF-32 and the DOS pages CP437/850/852 —
+BOM sniffing, streaming decoders and encoders, fatal mode, WHATWG semantics
+throughout.
 
 ## Supported encodings
 
@@ -44,12 +45,13 @@ C1) plus per-page override tables.
 const encoding = @import("encoding");
 
 // Every WHATWG single-byte encoding (29 pages; the first five tags are the
-// original ones) plus utf8. 2026-10-20.
+// original ones) plus utf8, x_user_defined and the DOS pages cp437/cp850/cp852
+// (IANA labels, not WHATWG). 2026-10-20.
 pub const Encoding = enum { utf8, windows_1250, windows_1252, iso_8859_1, iso_8859_2, iso_8859_15, ibm866, koi8_r, windows_1251, … };
 fn Encoding.parse(s: []const u8) ?Encoding;          // case-insensitive, every WHATWG label + a few extras
 fn Encoding.canonicalName(self) []const u8;          // "windows-1250", lower case
 fn Encoding.whatwgName(self) []const u8;             // "KOI8-R", the Standard's spelling
-fn lookupLabel(s) ?LabelTarget;                      // .encoding / .utf16 / .replacement / .x_user_defined / .unsupported ("Shift_JIS")
+fn lookupLabel(s) ?LabelTarget;                      // .encoding / .utf16 / .replacement / .unsupported ("Shift_JIS")
 
 fn decodeToUtf8(alloc, bytes: []const u8, enc: Encoding) ![]u8;   // caller owns result
 fn encodeFromUtf8(alloc, utf8: []const u8, enc: Encoding) ![]u8;  // caller owns result; unmappable -> '?'
@@ -57,7 +59,7 @@ fn encodeFromUtf8Opts(alloc, utf8, enc, .{ .unmappable = .html_ncr }) ![]u8; // 
 
 // 2026-10-04: UTF-16, BOM, streaming, fatal
 fn decode(alloc, bytes, fallback: Encoding) !Decoded;           // WHATWG "decode": a BOM wins and is removed
-fn sniffBom(bytes) ?Bom;                                         // .utf8 / .utf16le / .utf16be
+fn sniffBom(bytes) ?Bom;                                         // .utf8 / .utf16le / .utf16be (WHATWG: ff fe 00 00 is UTF-16LE)
 fn decodeUtf16(alloc, bytes, endian: Utf16Endian) ![]u8;
 fn encodeUtf16(alloc, utf8, endian: Utf16Endian, bom: bool) ![]u8;
 fn decodeFatal(alloc, bytes, kind: Decoder.Kind) ![]u8;         // error.Malformed instead of U+FFFD
@@ -66,6 +68,17 @@ var d: Decoder = .init(.{ .encoding = .windows_1250 }, .{});    // or .{ .utf16 
 try d.feed(alloc, &out, chunk);                                  // any chunking: split sequences carry over
 try d.finish(alloc, &out);                                       // end of stream
 
+// 2026-10-20: UTF-32 (Python utf-32 / x/text utf32), helpers, custom pages
+fn decodeUtf32(alloc, bytes, endian: Utf32Endian) ![]u8;         // malformed unit / cut tail = one U+FFFD each
+fn encodeUtf32(alloc, utf8, endian: Utf32Endian, bom: bool) ![]u8;
+fn sniffBom32(bytes) ?Bom;                                       // + .utf32le (ff fe 00 00) / .utf32be (00 00 fe ff)
+fn decode32(alloc, bytes, fallback: Encoding) !Decoded;          // `decode` that honours a UTF-32 BOM too
+// Decoder/Encoder .init(.{ .utf32 = .le }, .{ .bom = true })
+fn utf8ValidUpTo(s) usize;  fn isAscii(s) bool;  fn asciiValidUpTo(s) usize;   // vector
+fn latin1ToUtf8(alloc, bytes) ![]u8;  fn utf8ToLatin1Lossy(alloc, utf8) ![]u8; // identity page, not windows-1252
+const Toy = encoding.Custom(my_decode_table);                    // comptime [128]u16, 0xFFFF = hole
+fn decodeCustom(alloc, bytes, Toy) ![]u8;  fn encodeCustom(alloc, utf8, Toy, .question_mark) ![]u8;
+
 // 2026-10-20: caller-buffer core (no allocation) and the streaming encoder
 const p = d.decodeInto(src, dst, last);       // Progress{ .status = .input_empty / .output_full / .malformed, .read, .written }
 var e: Encoder = .init(.{ .encoding = .windows_1250 }, .{ .unmappable = .question_mark });
@@ -73,7 +86,7 @@ const q = e.encodeInto(cell, buf, true);      // reuse `buf` per cell; e.maxEnco
 try e.feed(alloc, &out, chunk); try e.finish(alloc, &out);
 ```
 
-**UTF-16 is not an `Encoding` member, on purpose.** Every `Encoding` maps bytes
+**UTF-16 and UTF-32 are not `Encoding` members, on purpose.** Every `Encoding` maps bytes
 below 0x80 to ASCII, which is what lets a caller transcode a CSV cell by cell and
 write the delimiters as raw bytes. In UTF-16 `,` is `2c 00`, so UTF-16 has its own
 entry points and cannot be selected through `Encoding.parse` or an enum listing.
@@ -104,12 +117,23 @@ accepted, and leading/trailing whitespace is stripped.
 page through a precomputed UTF-8 table and a two-level reverse table, UTF-8
 validated by the Keiser–Lemire vector algorithm (port of simdjson's, NOTICE).
 
+## CJK (`encoding.cjk`, 2026-10-20)
+
+Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, gb18030, GBK and Big5, exactly as the
+Standard defines them (GB18030-2022 included). They are not ASCII-compatible
+(trail bytes 0x40–0x7E), so they are not `Encoding` members: `cjk.Decoder`,
+`cjk.Encoder`, `cjk.decodeToUtf8`, `cjk.encodeFromUtf8`, same shapes as the
+single-byte API; `lookupLabel("sjis")` answers `.cjk = .shift_jis`. Their
+~300 KB of tables are compiled only into a program that references
+`encoding.cjk` (owner's `-Dcjk` intent, without a build option — the
+`tz.full` precedent). Anchors: every vendored WHATWG index pointer, and
+golang.org/x/text over 6.4 M cases with every divergence assigned to the
+Standard rule that decides it (x/text lags GB18030-2022).
+
 ## Out of scope (not planned)
 
-CJK multi-byte encodings (Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, GBK/GB18030,
-Big5) are decided (owner 2026-10-20) but not built yet: they come behind a
-build option `-Dcjk`, so only a consumer that enables it pays their tables.
-`lookupLabel` already names them (`.unsupported`).
+Encoding detection beyond BOM sniffing (R13, later), Unicode normalization,
+IDNA, UTF-7 (WHATWG maps it to `replacement`).
 
 ## Verify
 

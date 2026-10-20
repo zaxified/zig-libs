@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 //! encoding — legacy single-byte code page ↔ UTF-8 conversion (every
-//! WHATWG single-byte encoding since 2026-10-20), plus UTF-16, BOM sniffing,
-//! streaming decoder and encoder over a caller-buffer core (`core.zig`), and
-//! a fatal mode. Lenient by default.
+//! WHATWG single-byte encoding since 2026-10-20, plus `x-user-defined` and the
+//! DOS pages CP437/CP850/CP852), plus UTF-16 and UTF-32, BOM sniffing,
+//! streaming decoder and encoder over a caller-buffer core (`core.zig`), a
+//! fatal mode, `mem`-style helpers and a public custom-page constructor
+//! (`Custom`). Lenient by default.
 //!
 //! The WHATWG "single-byte" decoder/encoder for the European code pages a
 //! legacy broker / Excel export is realistically saved in. Internal currency
@@ -24,10 +26,15 @@ const std = @import("std");
 const core = @import("core.zig");
 const sb = @import("sb_tables.zig");
 
+/// The WHATWG CJK encodings (Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR,
+/// gb18030, GBK, Big5) — a separate API, compiled only when referenced, so
+/// a program that never uses them carries none of their ~300 KB of tables.
+pub const cjk = @import("cjk.zig");
+
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Text decoding to and from UTF-8: every WHATWG single-byte code page, UTF-8 and UTF-16 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics).",
+    .doc = "Text decoding to and from UTF-8: every WHATWG single-byte code page plus DOS CP437/850/852 and custom pages, UTF-8, UTF-16 and UTF-32 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -44,7 +51,8 @@ pub const meta = .{
 /// pure pass-through. The rest are single-byte code pages: the first five in
 /// the order they were added (their tags are stable), then, since
 /// 2026-10-20, every other single-byte encoding of the WHATWG Encoding
-/// Standard. Every member is ASCII-compatible.
+/// Standard, then `x-user-defined` and three DOS pages (2026-10-20, R11/R12).
+/// Every member is ASCII-compatible.
 pub const Encoding = enum {
     utf8,
     windows_1250, // Central European (Czech, Polish, Hungarian, …)
@@ -76,6 +84,15 @@ pub const Encoding = enum {
     windows_1257,
     windows_1258,
     x_mac_cyrillic,
+    /// WHATWG `x-user-defined` (legacy XHR binary hack): byte 0x80..0xFF is
+    /// U+F780..U+F7FF, a private-use range, so every byte round-trips.
+    x_user_defined,
+    /// IBM PC / MS-DOS code pages, not WHATWG encodings (labels: IANA's).
+    /// Named by their IANA names (`IBM437`, …); the high half is Unicode.org's
+    /// MICSFT/PC mapping (all 128 bytes defined, the low half is ASCII).
+    cp437, // DOS Latin US (legacy ZIP names)
+    cp850, // DOS Latin 1 (Western European)
+    cp852, // DOS Latin 2 (Czech, Polish, Hungarian, …)
 
     /// Parse a config string into an Encoding. Case-insensitive, and leading
     /// and trailing ASCII whitespace is stripped first (WHATWG "get an
@@ -167,11 +184,9 @@ pub const LabelTarget = union(enum) {
     /// security measure, it decodes any non-empty input to one U+FFFD — see
     /// `decodeReplacement`.
     replacement,
-    /// `x-user-defined` (legacy XHR) — known, not provided.
-    x_user_defined,
-    /// A WHATWG encoding this module does not provide (the CJK encodings);
-    /// the payload is its WHATWG name.
-    unsupported: []const u8,
+    /// A CJK multi-byte encoding: not ASCII-compatible (trail bytes in
+    /// 0x40–0x7E), so outside `Encoding` — use `encoding.cjk`.
+    cjk: cjk.Cjk,
 };
 
 /// Common spellings WHATWG lacks, kept from this module's original label
@@ -190,7 +205,10 @@ const extra_labels = [_]struct { []const u8, Encoding }{
 
 /// The WHATWG "get an encoding" lookup: trim ASCII whitespace, compare
 /// case-insensitively against every label of the Standard (plus the
-/// module's extra spellings). Null for a label nobody knows.
+/// module's extra spellings and the IANA labels of the DOS pages — `cp437`,
+/// `ibm437`, `437`, `cspc8codepage437`, `cp850`, `ibm850`, `850`,
+/// `cspc850multilingual`, `cp852`, `ibm852`, `852`, `cspcp852` — which the
+/// Standard does not have). Null for a label nobody knows.
 pub fn lookupLabel(raw: []const u8) ?LabelTarget {
     const s = std.mem.trim(u8, raw, " \t\n\r\x0c");
     var buf: [64]u8 = undefined;
@@ -204,8 +222,12 @@ pub fn lookupLabel(raw: []const u8) ?LabelTarget {
         .utf16le => .{ .utf16 = .le },
         .utf16be => .{ .utf16 = .be },
         .replacement => .replacement,
-        .x_user_defined => .x_user_defined,
-        .unsupported => |name| .{ .unsupported = name },
+        .unsupported => |name| blk: {
+            inline for (comptime std.enums.values(cjk.Cjk)) |c| {
+                if (std.mem.eql(u8, name, c.whatwgName())) break :blk .{ .cjk = c };
+            }
+            unreachable; // the generator names only the seven CJK encodings
+        },
     };
     for (extra_labels) |x| if (std.mem.eql(u8, x[0], low)) return .{ .encoding = x[1] };
     return null;
@@ -305,25 +327,48 @@ pub fn encodeFromUtf8Opts(alloc: std.mem.Allocator, utf8: []const u8, enc: Encod
 // `Encoding.parse` or an enum listing.
 
 pub const Utf16Endian = core.Endian;
+/// Byte order of UTF-32 (the same type as `Utf16Endian`). UTF-32 is outside
+/// `Encoding` for the same reason UTF-16 is, and is not WHATWG at all.
+pub const Utf32Endian = core.Endian;
 
 /// What a byte-order mark at the start of a buffer says.
 pub const Bom = enum {
     utf8, // ef bb bf
     utf16le, // ff fe
     utf16be, // fe ff
+    /// Only `sniffBom32` returns these two.
+    utf32le, // ff fe 00 00
+    utf32be, // 00 00 fe ff
 
     pub fn len(self: Bom) usize {
-        return if (self == .utf8) 3 else 2;
+        return switch (self) {
+            .utf8 => 3,
+            .utf16le, .utf16be => 2,
+            .utf32le, .utf32be => 4,
+        };
     }
 };
 
-/// The BOM `bytes` starts with, if any (WHATWG "BOM sniff"). Note that a
-/// UTF-32LE BOM (`ff fe 00 00`) sniffs as UTF-16LE, as in the Standard.
+/// The BOM `bytes` starts with, if any (WHATWG "BOM sniff"): UTF-8 or UTF-16
+/// only. Note that a UTF-32LE BOM (`ff fe 00 00`) sniffs as UTF-16LE, as in
+/// the Standard; `sniffBom32` is the variant that knows UTF-32.
 pub fn sniffBom(bytes: []const u8) ?Bom {
     if (std.mem.startsWith(u8, bytes, "\xef\xbb\xbf")) return .utf8;
     if (std.mem.startsWith(u8, bytes, "\xff\xfe")) return .utf16le;
     if (std.mem.startsWith(u8, bytes, "\xfe\xff")) return .utf16be;
     return null;
+}
+
+/// `sniffBom` that also recognises the UTF-32 BOMs (Python's `utf-32`, x/text's
+/// `utf32`): `ff fe 00 00` is UTF-32LE and `00 00 fe ff` UTF-32BE, tested
+/// BEFORE UTF-16 — so UTF-16LE text that starts with U+0000 right after its BOM
+/// (`ff fe 00 00`) is read as UTF-32LE here, the unavoidable ambiguity the
+/// Standard avoids by not having UTF-32. Use it only when UTF-32 input is
+/// possible; `sniffBom`/`decode` keep the WHATWG answer.
+pub fn sniffBom32(bytes: []const u8) ?Bom {
+    if (std.mem.startsWith(u8, bytes, "\xff\xfe\x00\x00")) return .utf32le;
+    if (std.mem.startsWith(u8, bytes, "\x00\x00\xfe\xff")) return .utf32be;
+    return sniffBom(bytes);
 }
 
 pub const Decoded = struct {
@@ -339,12 +384,24 @@ pub const Decoded = struct {
 /// declared somewhere but might carry a BOM — an Excel "Unicode Text" export
 /// is UTF-16LE with `ff fe`, whatever the declaration says.
 pub fn decode(alloc: std.mem.Allocator, bytes: []const u8, fallback: Encoding) !Decoded {
-    if (sniffBom(bytes)) |b| {
+    return decodeBom(alloc, bytes, fallback, sniffBom(bytes));
+}
+
+/// `decode` that also honours a UTF-32 BOM (`sniffBom32`): Python `utf-32`
+/// semantics layered on the WHATWG algorithm. Without a BOM `fallback` decides.
+pub fn decode32(alloc: std.mem.Allocator, bytes: []const u8, fallback: Encoding) !Decoded {
+    return decodeBom(alloc, bytes, fallback, sniffBom32(bytes));
+}
+
+fn decodeBom(alloc: std.mem.Allocator, bytes: []const u8, fallback: Encoding, bom: ?Bom) !Decoded {
+    if (bom) |b| {
         const rest = bytes[b.len()..];
         const text = switch (b) {
             .utf8 => try sanitizeUtf8(alloc, rest),
             .utf16le => try decodeUtf16(alloc, rest, .le),
             .utf16be => try decodeUtf16(alloc, rest, .be),
+            .utf32le => try decodeUtf32(alloc, rest, .le),
+            .utf32be => try decodeUtf32(alloc, rest, .be),
         };
         return .{ .text = text, .bom = b };
     }
@@ -372,6 +429,27 @@ pub fn encodeUtf16(alloc: std.mem.Allocator, utf8: []const u8, endian: Utf16Endi
     };
 }
 
+/// Decode UTF-32 (no BOM handling — see `decode32`) into valid UTF-8: a value
+/// above U+10FFFF or a surrogate is one U+FFFD, and so are the 1 to 3 bytes of a
+/// unit cut by the end — one per unit, exactly CPython's `utf-32` decoder with
+/// `errors="replace"` (checked against CPython 3 in `extra_test.zig`'s golden
+/// cases). Caller owns the result.
+pub fn decodeUtf32(alloc: std.mem.Allocator, bytes: []const u8, endian: Utf32Endian) ![]u8 {
+    var d: Decoder = .init(.{ .utf32 = endian }, .{});
+    return d.decodeAll(alloc, bytes) catch |e| lenientOnly(e);
+}
+
+/// Encode UTF-8 as UTF-32 (`bom`: prepend `ff fe 00 00` / `00 00 fe ff`).
+/// Malformed UTF-8 becomes U+FFFD (maximal subparts, as the decoder).
+/// Caller owns the result.
+pub fn encodeUtf32(alloc: std.mem.Allocator, utf8: []const u8, endian: Utf32Endian, bom: bool) ![]u8 {
+    var e: Encoder = .init(.{ .utf32 = endian }, .{ .bom = bom });
+    return e.encodeAll(alloc, utf8) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Unmappable => unreachable, // UTF-32 encodes everything
+    };
+}
+
 /// Whole-buffer decode in FATAL mode (WHATWG `fatal`): `error.Malformed` at
 /// the first ill-formed sequence instead of U+FFFD — for a single-byte page,
 /// at a byte the Standard leaves undefined.
@@ -391,6 +469,7 @@ pub const Decoder = struct {
     fatal: bool,
     utf8: core.Utf8State = .{},
     utf16: core.Utf16State = .{},
+    utf32: core.Utf32State = .{},
     /// Set once `fatal` reported an error; the decoder refuses further input.
     failed: bool = false,
 
@@ -398,6 +477,7 @@ pub const Decoder = struct {
         /// Any `Encoding` (UTF-8 or a single-byte page).
         encoding: Encoding,
         utf16: Utf16Endian,
+        utf32: Utf32Endian,
     };
     pub const Options = struct {
         /// `error.Malformed` instead of U+FFFD (WHATWG `fatal`).
@@ -431,6 +511,9 @@ pub const Decoder = struct {
             },
             .utf16 => |endian| switch (endian) {
                 inline else => |e| core.decodeUtf16(e, &self.utf16, src, dst, last, self.fatal),
+            },
+            .utf32 => |endian| switch (endian) {
+                inline else => |e| core.decodeUtf32(e, &self.utf32, src, dst, last, self.fatal),
             },
         };
         if (p.status == .malformed) self.failed = true;
@@ -474,6 +557,7 @@ pub const Decoder = struct {
         const first = switch (self.kind) {
             .encoding => |e| if (e == .utf8) bytes.len +| 8 else bytes.len +| bytes.len / 4 +| 16,
             .utf16 => bytes.len +| bytes.len / 2 +| 16,
+            .utf32 => bytes.len +| 16,
         };
         try out.ensureTotalCapacity(alloc, first);
         var r: usize = 0;
@@ -492,7 +576,7 @@ pub const Decoder = struct {
 };
 
 /// Streaming encoder from UTF-8 (encoding_rs `Encoder`): into any `Encoding`
-/// (a single-byte page, or UTF-8 as a verbatim copy) or UTF-16. A UTF-8
+/// (a single-byte page, or UTF-8 as a verbatim copy), UTF-16 or UTF-32. A UTF-8
 /// sequence split across chunks is carried over; `encodeInto` is the
 /// caller-buffer form, which allocates nothing — reuse one output buffer
 /// across cells instead of allocating per cell.
@@ -503,7 +587,7 @@ pub const Encoder = struct {
     /// The start of a UTF-8 sequence cut by the end of the previous chunk.
     pending: [4]u8 = undefined,
     pending_len: u8 = 0,
-    /// UTF-16 target: the UTF-8 decoder's state (malformed input becomes
+    /// UTF-16/32 target: the UTF-8 decoder's state (malformed input becomes
     /// U+FFFD) and whether the BOM is still to be written.
     utf8: core.Utf8State = .{},
     bom_due: bool = false,
@@ -511,13 +595,13 @@ pub const Encoder = struct {
     pub const Kind = Decoder.Kind;
     pub const Options = struct {
         unmappable: Unmappable = .question_mark,
-        /// UTF-16 target only: start the output with a byte-order mark.
+        /// UTF-16/32 target only: start the output with a byte-order mark.
         bom: bool = false,
     };
     pub const Error = std.mem.Allocator.Error || error{Unmappable};
 
     pub fn init(kind: Kind, opts: Options) Encoder {
-        return .{ .kind = kind, .unmappable = opts.unmappable, .bom = opts.bom, .bom_due = opts.bom };
+        return .{ .kind = kind, .unmappable = opts.unmappable, .bom = opts.bom, .bom_due = opts.bom and kind != .encoding };
     }
 
     /// An output size that always takes all of `n` input bytes in one
@@ -525,6 +609,7 @@ pub const Encoder = struct {
     pub fn maxEncodedLen(self: *const Encoder, n: usize) usize {
         const per: usize = switch (self.kind) {
             .utf16 => 2, // 1 byte -> 1 unit; 4 bytes -> 2 units
+            .utf32 => 4, // 1 byte -> 1 unit
             .encoding => |e| if (e == .utf8) 1 else if (self.unmappable == .html_ncr) core.max_substitute else 1,
         };
         return n *| per +| core.max_substitute +| 8;
@@ -540,12 +625,21 @@ pub const Encoder = struct {
         var w: usize = 0;
         var replaced = false;
         if (self.bom_due) {
-            if (dst.len < 2) return .{ .status = .output_full, .read = 0, .written = 0 };
-            const bom: u16 = 0xFEFF;
-            const e = self.kind.utf16;
-            dst[0] = if (e == .le) @truncate(bom) else @truncate(bom >> 8);
-            dst[1] = if (e == .le) @truncate(bom >> 8) else @truncate(bom);
-            w = 2;
+            switch (self.kind) {
+                .utf16 => |e| {
+                    if (dst.len < 2) return .{ .status = .output_full, .read = 0, .written = 0 };
+                    const bom: u16 = 0xFEFF;
+                    dst[0] = if (e == .le) @truncate(bom) else @truncate(bom >> 8);
+                    dst[1] = if (e == .le) @truncate(bom >> 8) else @truncate(bom);
+                    w = 2;
+                },
+                .utf32 => |e| {
+                    if (dst.len < 4) return .{ .status = .output_full, .read = 0, .written = 0 };
+                    dst[0..4].* = if (e == .le) .{ 0xFF, 0xFE, 0, 0 } else .{ 0, 0, 0xFE, 0xFF };
+                    w = 4;
+                },
+                .encoding => unreachable, // `bom` only applies to UTF-16/32 targets
+            }
             self.bom_due = false;
         }
         // Complete a sequence cut by the end of the previous call. Only a
@@ -616,6 +710,12 @@ pub const Encoder = struct {
                     return .{ .status = if (p.status == .output_full) .output_full else .input_empty, .read = p.read, .written = p.written, .replaced = p.replaced };
                 },
             },
+            .utf32 => |endian| switch (endian) {
+                inline else => |e| {
+                    const p = core.utf8ToUtf32(e, &self.utf8, src, dst, last);
+                    return .{ .status = if (p.status == .output_full) .output_full else .input_empty, .read = p.read, .written = p.written, .replaced = p.replaced };
+                },
+            },
         }
     }
 
@@ -651,6 +751,7 @@ pub const Encoder = struct {
         errdefer out.deinit(alloc);
         const first = switch (self.kind) {
             .utf16 => utf8.len *| 2 +| 4,
+            .utf32 => utf8.len *| 4 +| 8,
             .encoding => utf8.len +| 16,
         };
         try out.ensureTotalCapacity(alloc, first);
@@ -668,6 +769,132 @@ pub const Encoder = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+// ── `mem`-style helpers (encoding_rs `mem`, 2026-10-20) ─────────────────────
+
+/// Length of the longest well-formed UTF-8 prefix of `s`: the index of the
+/// first byte that is not part of well-formed UTF-8 (the start of an
+/// ill-formed sequence, or of one cut by the end of `s`), or `s.len`. So
+/// `utf8ValidUpTo(s) == s.len` iff `s` is valid. Vector fast path.
+pub fn utf8ValidUpTo(s: []const u8) usize {
+    return core.utf8ValidUpTo(s);
+}
+
+/// Is every byte of `s` below 0x80? (Vector.)
+pub fn isAscii(s: []const u8) bool {
+    return core.asciiPrefix(s) == s.len;
+}
+
+/// Length of the ASCII prefix of `s` (the index of the first byte >= 0x80, or
+/// `s.len`). Vector.
+pub fn asciiValidUpTo(s: []const u8) usize {
+    return core.asciiPrefix(s);
+}
+
+/// ISO-8859-1 bytes to UTF-8: byte N is U+00N. This is the **identity**
+/// high-half page (`Encoding.iso_8859_1`), NOT windows-1252: 0x80..0x9F are the
+/// C1 controls, not `€` and curly quotes (encoding_rs `convert_latin1_to_utf8`).
+/// Caller owns the result.
+pub fn latin1ToUtf8(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    return decodeToUtf8(alloc, bytes, .iso_8859_1);
+}
+
+/// UTF-8 to ISO-8859-1 (the identity high-half page, not windows-1252), lossy:
+/// a code point above U+00FF becomes `?` — NOT truncated to its low byte as
+/// encoding_rs `convert_utf8_to_latin1_lossy` does — and invalid UTF-8 bytes
+/// pass through verbatim (this module's encoder contract). Use
+/// `encodeFromUtf8Opts` for `&#NNNN;`, dropping, or a refusal. Caller owns the
+/// result.
+pub fn utf8ToLatin1Lossy(alloc: std.mem.Allocator, utf8: []const u8) ![]u8 {
+    return encodeFromUtf8(alloc, utf8, .iso_8859_1);
+}
+
+// ── custom single-byte pages (x/text `charmap.Charmap`, Python `charmap_build`) ──
+
+/// A single-byte page of your own: `decode_table[i]` is the code point of byte
+/// `0x80 + i`, or `0xFFFF` for a byte with no character (decodes to U+FFFD, and
+/// `fatal` refuses it). Bytes below 0x80 are ASCII, as in every page of this
+/// module. The result is what `Encoding.page` is for the built-in pages
+/// (a `core.SingleByte`): `decodeToUtf8` / `encodeCp` / `encodeInto` are the
+/// caller-buffer forms, `decodeCustom` / `encodeCustom` the allocating ones.
+/// Entries below U+0080 decode but never encode (ASCII always encodes to
+/// itself); when two bytes decode to one code point the FIRST one encodes it
+/// (WHATWG's rule).
+pub fn Custom(comptime decode_table: [128]u16) type {
+    return struct {
+        const Core = core.SingleByte(decode_table);
+
+        /// The table this page was built from.
+        pub const decode = decode_table;
+        /// A decode-table entry with no character.
+        pub const unmapped = core.unmapped;
+
+        /// The code point of `byte`, or null when the page has none.
+        pub fn decodeByte(byte: u8) ?u21 {
+            if (byte < 0x80) return byte;
+            const cp = decode_table[byte - 0x80];
+            return if (cp == core.unmapped) null else cp;
+        }
+
+        /// The byte of `cp`, or null when the page lacks it.
+        pub fn encodeCp(cp: u21) ?u8 {
+            return Core.encodeCp(cp);
+        }
+
+        /// Caller-buffer decode to UTF-8; stateless (see `Decoder.decodeInto`
+        /// for the contract of `Progress`). `fatal`: stop at an unmapped byte.
+        pub fn decodeToUtf8(src: []const u8, dst: []u8, fatal: bool) Progress {
+            return Core.decodeToUtf8(src, dst, fatal);
+        }
+
+        /// Caller-buffer encode from UTF-8 (see `Encoder.encodeInto`; `dst`
+        /// needs `core.max_substitute` bytes of room per non-ASCII step).
+        pub fn encodeInto(src: []const u8, dst: []u8, last: bool, mode: Unmappable) EncodeProgress {
+            return core.encodeSingleByte(Core, src, dst, last, mode);
+        }
+    };
+}
+
+/// Decode `bytes` in the custom page `Page` (a `Custom(...)`) into valid UTF-8.
+/// Lenient: an unmapped byte is U+FFFD. Caller owns the result.
+pub fn decodeCustom(alloc: std.mem.Allocator, bytes: []const u8, comptime Page: type) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, bytes.len +| bytes.len / 4 +| 16);
+    var r: usize = 0;
+    while (true) {
+        const p = Page.decodeToUtf8(bytes[r..], out.unusedCapacitySlice(), false);
+        out.items.len += p.written;
+        r += p.read;
+        switch (p.status) {
+            .input_empty => break,
+            .output_full => try out.ensureUnusedCapacity(alloc, (bytes.len - r) *| 3 +| 8),
+            .malformed => unreachable, // only with `fatal`
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Encode UTF-8 into the custom page `Page`; `mode` as in `encodeFromUtf8Opts`
+/// (`error.Unmappable` only for `.fatal`). Caller owns the result.
+pub fn encodeCustom(alloc: std.mem.Allocator, utf8: []const u8, comptime Page: type, mode: Unmappable) Encoder.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, utf8.len +| 16);
+    var r: usize = 0;
+    const per: usize = if (mode == .html_ncr) core.max_substitute else 1;
+    while (true) {
+        const p = Page.encodeInto(utf8[r..], out.unusedCapacitySlice(), true, mode);
+        out.items.len += p.written;
+        r += p.read;
+        switch (p.status) {
+            .input_empty => break,
+            .output_full => try out.ensureUnusedCapacity(alloc, (utf8.len - r) *| per +| core.max_substitute +| 8),
+            .unmappable => return error.Unmappable,
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
 
 // ── tests ────────────────────────────────────────────────────────────────
 const testing = std.testing;
@@ -897,6 +1124,9 @@ test {
     _ = @import("core.zig");
     _ = @import("api_test.zig");
     _ = @import("utf8_simd.zig");
+    _ = @import("extra_test.zig");
+    _ = @import("cjk.zig");
+    _ = @import("cjk_test.zig");
 }
 
 // ── fuzz: decode/encode never panic, OOB or leak on arbitrary bytes ────────
@@ -969,6 +1199,17 @@ fn fuzzCodecNeverLeaks(_: void, smith: *std.testing.Smith) !void {
     try fz.codecHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
+test "fuzz: the CJK codecs never panic and agree across chunking" {
+    try std.testing.fuzz({}, fuzzCjk, .{});
+}
+
+fn fuzzCjk(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.cjkHarness(fz.ScriptSource, &src, std.testing.allocator);
+}
+
 const fz = @import("fuzz_test.zig");
 
 test "corpus: every seed reaches both codecs, and the octets produced are pinned" {
@@ -1026,6 +1267,7 @@ fn decodeKind(alloc: std.mem.Allocator, kind: Decoder.Kind, bytes: []const u8) !
     return switch (kind) {
         .encoding => |e| decodeToUtf8(alloc, bytes, e),
         .utf16 => |e| decodeUtf16(alloc, bytes, e),
+        .utf32 => |e| decodeUtf32(alloc, bytes, e),
     };
 }
 

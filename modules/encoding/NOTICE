@@ -46,6 +46,20 @@ page. Driven mechanically by `src/normative_vectors.zig` (parser),
 a MODIFIED (reformatted, inverted, relabelled) rendering of their data — see the
 modification indication below.
 
+Since 2026-10-20, seven more index files of the same Standard (same publication,
+each header `Date: 2024-09-18`) are vendored verbatim in `src/testdata/` for the
+CJK encodings of `src/cjk.zig`: `index-jis0208.txt`, `index-jis0212.txt`,
+`index-iso-2022-jp-katakana.txt`, `index-euc-kr.txt`, `index-gb18030.txt`,
+`index-gb18030-ranges.txt` and `index-big5.txt`. `src/cjk_tables.zig` is GENERATED
+from them by `tools/gen_cjk_tables.py` (a MODIFIED rendering, see below) and is
+anchored to them, every pointer of every index, by `src/cjk_test.zig`.
+The side table of the gb18030 encoder and the byte formulas in `src/cjk.zig` are
+transcribed from the text of the Standard (sections 10-13), whose algorithms the
+code follows step for step; the code itself is original (MIT).
+`src/cjk_oracle_vectors.zig` records only the observable answers of
+golang.org/x/text v0.42.0 (BSD-3-Clause; no code of it is present) and digests of
+a transliteration of the Standard (`tools/cjk_oracle/std_ref.py`).
+
 The Encoding Standard's own terms (`LICENSE` in the `whatwg/encoding`
 repository, checked 2026-10-20; it is CC-BY 4.0 with BSD 3-Clause for portions
 incorporated into source code — the vendored data files are covered by the
@@ -70,8 +84,14 @@ included (the `Date:` line in each index header is the version pin cited above).
 arrays, with undefined bytes marked 0xFFFF, an inverse (encode) table added, and
 eleven labels of the iso-8859-1 family re-pointed from windows-1252 to this
 module's own `iso_8859_1` page (a documented departure, marked in that file).
+`src/cjk_tables.zig` is MODIFIED material too: the seven CJK index files
+transcribed into Zig arrays (no pointer = 0xFFFF; Big5 code points above U+FFFF as a
+low half plus a plane bit), the encode side added as pointer lists sorted by code
+point with the Standard's pointer-selection rules ("first pointer", the Shift_JIS
+exclusion of 8272..8835, the Big5 exclusion below 5024 and its six last-pointer
+code points) pre-applied.
 
-## Unicode.org — `8859-1.TXT`
+## Unicode.org — `8859-1.TXT`, `CP437.TXT`, `CP850.TXT`, `CP852.TXT`
 
 `src/testdata/8859-1.TXT` is vendored verbatim from
 https://www.unicode.org/Public/MAPPINGS/ISO8859/8859-1.TXT (table version 2.0,
@@ -89,6 +109,18 @@ The file's own header:
     # 8859-1.TXT
     # © 2015 Unicode®, Inc.
     # For terms of use, see http://www.unicode.org/terms_of_use.html
+
+`src/testdata/CP437.TXT`, `CP850.TXT` and `CP852.TXT` (added 2026-10-20) are
+vendored verbatim, byte for byte (each ends with a DOS ^Z, which the parser in
+`normative_vectors.zig` skips), from
+https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/ — Microsoft's DOS code
+page -> Unicode tables as published in Unicode.org's MAPPINGS tree (table version
+2.00, dated 1996-04-24; their headers carry no copyright line of their own, they
+are Data Files of the Unicode.org site and are covered by the same notice below).
+They are the source of the `cp437`, `cp850` and `cp852` pages (NOT WHATWG encodings:
+the Standard has no DOS pages), read by `tools/gen_tables.py` into
+`src/sb_tables.zig`, and the anchor `sb_tables_test.zig` checks each page against.
+`src/sb_tables.zig` stays a MODIFIED rendering (arrays, an inverse table added).
 
 Under the Unicode License v3, reproduced verbatim and in full from
 https://www.unicode.org/license.txt (fetched 2026-09-09) because clause (a)
