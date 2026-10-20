@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (2,000–40,000 runs clean per target, 6 targets, ZSTD_FUZZ; found the stale raw-block underflow, fixed) · ct n/a — compression only (keyword review, 2026-10-07)
 
-**Performance:** ref 0.90–1.04× libzstd 1.5.7 · fastest ?× c4milo/stdx (measured 2026-10-09)
+**Performance:** ref 0.92–1.06× libzstd 1.5.7 · fastest ?× c4milo/stdx (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -3405,6 +3405,10 @@ below is this module's own, beyond that gate:
   profiling aid of libzstd's own build with no bearing on the bytes.
   `zstd-cli` refuses both by name. *Never*, both decided by the user
   2026-09-28.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-zstd`, `BENCH_ROUNDS=5`, same host, ReleaseFast, Silesia from `tools/zstd-silesia`): ref 0.92–1.06× libzstd 1.5.7, against 0.90–1.04× on Zig 0.16.0. The card carries these figures; what follows is the earlier measurement.
 
 ## Backlog / deferred
 

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-13 (200,000 runs clean, P384_FUZZ, 8 jobs × 25,000, every reach label hit) · ct 2026-10-13 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags 11)
 
-**Performance:** ref 0.61–1.00× OpenSSL 3.5.5 · fastest ? (measured 2026-10-13)
+**Performance:** ref 0.40–0.58× OpenSSL 3.5.5 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -173,6 +173,8 @@ generate/fromSecretKey/sign/ecdh/mul in ReleaseFast: green.
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`P384_BENCH=1 scripts/modtest p384 -Doptimize=ReleaseFast`, best of 5 × 200, against `openssl speed -seconds 2 ecdsap384 ecdhp384`, 3 OpenSSL runs; our side ran once, the two repeats were cached test results): ECDH 234.3 µs vs 400–404 µs (0.58×), sign 95.7 µs vs 241–243 µs (0.40×), verify 279.8 µs vs 543–554 µs (0.51×); std P384 on the same build 401.9/488.3/537.3 µs. Against 0.61–1.00× on Zig 0.16.0 (2026-10-13: ECDH 423 µs): ours moved, OpenSSL did not — not investigated which change (0.17 codegen or a later commit) did it. The card carries these figures; the table below is the 0.16.0 measurement.
 
 ReleaseFast, Intel i7-7920HQ (Kaby Lake), best of 5 × 200, `P384_BENCH=1` (`bench.zig`), against
 `openssl speed -seconds 2 ecdsap384 ecdhp384` on the same host, 2026-10-13 — three rounds, ours

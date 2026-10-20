@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000 runs clean, P521_FUZZ, every reach label hit) · ct 2026-10-11 (ctgrind mul/keygen/sign/ecdh: secret tainted, 0 in-file; positive control `vartime` flags)
 
-**Performance:** ref 0.74–0.97× OpenSSL 3.5.5 ecp_nistp521 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.73–0.97× OpenSSL 3.5.5 ecp_nistp521 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -200,6 +200,8 @@ by-value forms carry `secret-api-ok` with the `*Into` twin named).
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`P521_BENCH=1 scripts/modtest p521 -Doptimize=ReleaseFast`, against `openssl speed -seconds 2 ecdsap521 ecdhp521`, 3 OpenSSL runs; our side ran once): ECDH 338.4 µs vs 345–351 µs (0.97×), sign 216.7 µs vs 296–299 µs (0.73×), verify 473.4 µs vs 566–571 µs (0.83×); against 0.74–0.97× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
 
 ReleaseFast, Intel i7-7920HQ (Kaby Lake), best of 5 × 200, `P521_BENCH=1`
 (`bench.zig`), against `openssl speed -seconds 2 ecdsap521 ecdhp521` on the
