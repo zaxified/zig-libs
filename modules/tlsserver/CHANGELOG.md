@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — OCSP and SCT stapling (M2 step 5). New `CertifiedKey.sct_list` (a
+  `SignedCertificateTimestampList`, RFC 6962 §3.3) sent on the leaf when the ClientHello carries
+  `signed_certificate_timestamp` (`hello.ClientHello.sct_requested`; a non-empty body is
+  `decode_error`); `messages.CertificateEntry.sct_list`. New `CertifiedKey.check()`
+  (`CheckError`: chain length 1..`max_chain_len` (16), certificate lengths, the whole
+  Certificate message within 2^24-1, a well-formed SCT list, the leaf's extensions within
+  2^16-1), also run on every selected key (failure: `internal_error`). **BEHAVIOURAL:** an empty `ocsp_response` (or `sct_list`) now counts as none,
+  as in rustls (it used to fail the handshake with `internal_error`). BoGo 286 pass / 0 fail (was
+  274; shim `-ocsp-response`, `-signed-cert-timestamps`; `OCSPStapling-Server-TLS13-*`,
+  `SignedCertificateTimestampList-Server-TLS-TLS13`, `SignedCertificateTimestampListInvalid-Server`,
+  `UnsolicitedCertificateExtensions-TLS-TLS13`, `SendNoExtensionsOnIntermediate-TLS13`); interop
+  49/49 (OpenSSL `-status` with and without, Go checks the staple and both SCTs octet for octet;
+  recaptured); fuzz `tlsserver-hello` 1.2M (SCT in the model), `tlsserver-server` and
+  `tlsserver-keyupdate` 80k each, clean; 10/10 planted mutants caught (one after a new test).
+  Independent review (Sonnet): no HIGH; MEDIUM fixed (`check` did not bound the whole chain);
+  LOW fixed (the BoGo shim sized its output without the staple); two LOWs documented in SPEC.
 - **2026-10-20** — Client certificates (M2 step 4). New `Config.client_auth` (`ClientAuth`: a
   `ClientCertVerifier`, `mandatory` (default), `schemes` (rustls's list), `authorities`, a
   `Clock`), `clientauth` (Certificate / CertificateVerify decoders, `leafPublicKey`,

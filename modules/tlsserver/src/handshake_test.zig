@@ -141,6 +141,8 @@ const ClientOffer = struct {
     corrupt_client_hello: bool = false,
     client_auth: ?ZlClient.ClientAuth = null,
     client_auth_select: ?ZlClient.ClientAuthSelect = null,
+    request_ocsp: bool = true,
+    request_scts: bool = true,
 };
 
 const ServerSide = struct {
@@ -197,6 +199,8 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .session_cache = offer.session_cache,
         .client_auth = offer.client_auth,
         .client_auth_select = offer.client_auth_select,
+        .request_ocsp = offer.request_ocsp,
+        .request_scts = offer.request_scts,
     }) else StdClient.init(&pipe.reader, &pipe.client_out, .{
         .host = .{ .explicit = "localhost" },
         .ca = .self_signed,
@@ -351,6 +355,37 @@ test "tlsclient ↔ Server: the client's first group with a share; ALPN" {
     try testing.expectEqual(tls13.kex.x25519_group, o.group);
     try testing.expectEqualStrings("h2", o.alpn.?);
     try testing.expectEqualStrings("h2", info.alpn_protocol.?);
+}
+
+test "tlsclient ↔ Server: the OCSP staple and the SCT list on the leaf, each only when asked for" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ocsp = "\x30\x03\x0a\x01\x01"; // OCSPResponse malformedRequest(1)
+    const scts = "\x00\x10" ++ "\x00\x07SCT-one" ++ "\x00\x05SCT-2";
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 }, .ocsp_response = ocsp, .sct_list = scts };
+    try ck.check();
+    for ([_][2]bool{ .{ true, true }, .{ true, false }, .{ false, true }, .{ false, false } }) |ask| {
+        var storage: [16 * 1024]u8 = undefined;
+        var info: ZlClient.ConnectionInfo = .init(&storage);
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{}, .{ .info = &info, .request_ocsp = ask[0], .request_scts = ask[1] });
+        defer testing.allocator.free(o.echoed);
+        try testing.expectEqualStrings(if (ask[0]) ocsp else "", info.ocsp_response);
+        const got = info.signedCertificateTimestamps();
+        if (ask[1]) {
+            try testing.expectEqual(@as(usize, 2), got.len);
+            try testing.expectEqualStrings("SCT-one", got[0]);
+            try testing.expectEqualStrings("SCT-2", got[1]);
+        } else try testing.expectEqual(@as(usize, 0), got.len);
+        try testing.expectEqual(@as(usize, 1), info.peerCertificates().len);
+    }
+    // Empty counts as none (rustls).
+    const empty: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 }, .ocsp_response = "", .sct_list = "" };
+    var storage: [16 * 1024]u8 = undefined;
+    var info: ZlClient.ConnectionInfo = .init(&storage);
+    const o = try handshake(ZlClient, testing.allocator, &empty, .{}, .{ .info = &info });
+    defer testing.allocator.free(o.echoed);
+    try testing.expectEqualStrings("", info.ocsp_response);
+    try testing.expectEqual(@as(usize, 0), info.signedCertificateTimestamps().len);
 }
 
 test "tlsclient ↔ Server: HelloRetryRequest for a group the client has no share for, every suite" {

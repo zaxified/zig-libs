@@ -32,10 +32,11 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 274 tests with none failing (`tools/bogo/passing.txt`; everything
+BoringSSL's BoGo suite passes 286 tests with none failing (`tools/bogo/passing.txt`; everything
 else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
-both ways (step 2), session tickets with resumption (step 3) and client certificates (step 4)
-work; OCSP-specific work is still to come (milestone M2, *Backlog*).
+both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
+OCSP / SCT stapling (step 5) work; the rustls parity gate is next (*Backlog*). SCT stapling
+(RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
 
 ## What this module is, and what it is not
 
@@ -113,7 +114,9 @@ with it, see *Resumption*); ALPN is the server's first
 protocol the client offers (`no_application_protocol` when the server has some and none match).
 The server then sends ServerHello (plaintext), a compatibility CCS, and under its handshake key
 EncryptedExtensions (the ALPN choice; an empty `server_name` acknowledging a DNS-name SNI),
-Certificate (an OCSP staple on the leaf if requested and configured), CertificateVerify and
+Certificate (on the leaf, an OCSP staple if the client sent `status_request` of type ocsp and
+an SCT list if it sent `signed_certificate_timestamp`, each when configured and non-empty),
+CertificateVerify and
 Finished, one record per message; it switches its sending key to the application secret and
 waits for the client's Finished (`decrypt_error` if it does not verify), after which application
 data flows. Early data is never accepted; records the client sent under a 0-RTT key are skipped
@@ -444,7 +447,8 @@ The receive side's refusals are the table under *Wire format*. Record protection
   Result 2026-10-20 (M1): **130 pass, 0 fail**; with client certificates (M2 step 4: the
   shim's `-require-any-client-certificate`, `-verify-peer`, `-verify-fail`, `-verify-prefs`,
   `-trust-cert` → `X509Verifier`, `-use-client-ca-list`, `-expect-peer-signature-algorithm`,
-  `-expect-peer-cert-file` for a single certificate) **274 pass, 0 fail** — the per-algorithm
+  `-expect-peer-cert-file` for a single certificate) **274 pass, 0 fail**; with stapling (step 5:
+  `-ocsp-response`, `-signed-cert-timestamps`) **286 pass, 0 fail** — the per-algorithm
   `Server-Verify-*`/`Server-InvalidSignature-*` tests (the scheme reported on resumption too),
   key usage, CA lists, empty and refused certificates; the BoGo run found the missing
   `keyUsage` check (a leaf limited to keyEncipherment or keyCertSign signed its
@@ -645,7 +649,16 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).
 - **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), ~~NewSessionTicket and resumption through `tlsresume`~~ (step 3, 2026-10-20), ~~mTLS through
-  `x509.verifyChain`~~ (step 4, 2026-10-20), OCSP stapling.
+  `x509.verifyChain`~~ (step 4, 2026-10-20), ~~OCSP stapling~~ (step 5, 2026-10-20, with SCT
+  lists). Later for stapling: a staple per selected certificate already works through
+  `Config.certificate.select`; BoringSSL's server OCSP callback (`ServerOCSPCallback-*`, disabled
+  by rustls too) and parsing the staple (expiry, matching the leaf) are not done — the caller
+  refreshes it.
+  `CertifiedKey.check` runs right after certificate selection, before the signature scheme is
+  matched: a misconfigured key is `internal_error` even for a client that could not have used it
+  (configuration errors first). After a HelloRetryRequest the second ClientHello's
+  `status_request` / `signed_certificate_timestamp` decide (as in rustls; RFC 8446 §4.1.2 would
+  have them unchanged — only the SNI is compared).
 - **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
   chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
   client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** qap's seams and performance (`p256`, `ct25519`).

@@ -84,6 +84,9 @@ const Options = struct {
     expect_peer_signature_algorithm: ?u16 = null,
     expect_peer_cert_file: ?[]const u8 = null,
     trust_cert: ?[]const u8 = null,
+    /// The credential's OCSP staple and SCT list (base64 on the command line).
+    ocsp_response: ?[]const u8 = null,
+    sct_list: ?[]const u8 = null,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -226,6 +229,10 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             // (the garbage certificate): no anchor, as BoringSSL's shim.
             const v = try value(it, flag);
             o.trust_cert = if (v.len == 0) null else v;
+        } else if (std.mem.eql(u8, flag, "-ocsp-response")) {
+            o.ocsp_response = try base64(gpa, try value(it, flag));
+        } else if (std.mem.eql(u8, flag, "-signed-cert-timestamps")) {
+            o.sct_list = try base64(gpa, try value(it, flag));
         } else if (std.mem.eql(u8, flag, "-expect-peer-cert-file")) {
             o.expect_peer_cert_file = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-use-client-ca-list")) {
@@ -244,6 +251,13 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             } else return unimplemented(flag);
         }
     }
+}
+
+fn base64(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    const D = std.base64.standard.Decoder;
+    const out = try gpa.alloc(u8, try D.calcSizeForSlice(text));
+    try D.decode(out, text);
+    return out;
 }
 
 fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -387,8 +401,12 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .authorities = o.ca_names.items,
         .clock = .{ .ctx = io_ctx, .now_ms = wallMs },
     };
+    var leaf = ck.*;
+    leaf.ocsp_response = o.ocsp_response;
+    leaf.sct_list = o.sct_list;
+    try leaf.check();
     const cfg: server_mod.Config = .{
-        .certificate = .{ .fixed = ck },
+        .certificate = .{ .fixed = &leaf },
         .groups = if (o.groups.items.len != 0) o.groups.items else &server_mod.default_groups,
         .alpn_protocols = o.alpn.items,
         .random = random,
@@ -410,7 +428,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
 
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &leaf) + 4096);
     defer gpa.free(out);
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
     defer c.deinit();

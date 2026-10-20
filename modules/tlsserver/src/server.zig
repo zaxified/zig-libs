@@ -115,9 +115,76 @@ pub const CertifiedKey = struct {
     /// Borrowed (`certverify.SecretKey` holds pointers): must outlive the
     /// connections that use it.
     key: certverify.SecretKey,
-    /// A DER OCSPResponse to staple when the client asks (RFC 8446 §4.4.2.1).
+    /// A DER OCSPResponse to staple on the leaf when the client asks
+    /// (RFC 8446 §4.4.2.1). Empty counts as none (rustls). The module does
+    /// not parse it: refreshing it before it expires is the caller's job.
     ocsp_response: ?[]const u8 = null,
+    /// A `SignedCertificateTimestampList` (RFC 6962 §3.3, with its 2-octet
+    /// length) to send on the leaf when the client asks (§3.3.1). Empty
+    /// counts as none.
+    sct_list: ?[]const u8 = null,
+
+    pub const CheckError = error{
+        /// No certificate, or more than `max_chain_len`.
+        ChainLength,
+        /// An empty certificate or one over 2^24-1 octets.
+        CertificateLength,
+        /// The Certificate message over its 2^24-1 octets.
+        ChainTooLong,
+        /// Not a well-formed `SignedCertificateTimestampList`: a length
+        /// that does not add up, an empty list or an empty SCT.
+        InvalidSctList,
+        /// The leaf's OCSP staple and SCT list together overflow its
+        /// `extensions<0..2^16-1>`.
+        LeafExtensionsTooLong,
+    };
+
+    pub const max_chain_len = 16;
+
+    /// What the handshake would refuse with `internal_error`, reported
+    /// up front: call it when loading the certificate (a `select`
+    /// callback's keys are checked again at every handshake).
+    pub fn check(self: *const CertifiedKey) CheckError!void {
+        if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.ChainLength;
+        // `certificate_request_context` (1) ‖ `certificate_list<0..2^24-1>`.
+        var body: usize = 1 + 3;
+        for (self.chain) |c| {
+            if (c.len == 0 or c.len > std.math.maxInt(u24)) return error.CertificateLength;
+            body += 3 + c.len + 2;
+        }
+        var exts: usize = 0;
+        if (self.ocspStaple()) |o| exts += 4 + 1 + 3 + o.len;
+        if (self.sctList()) |l| {
+            if (!validSctList(l)) return error.InvalidSctList;
+            exts += 4 + l.len;
+        }
+        if (exts > std.math.maxInt(u16)) return error.LeafExtensionsTooLong;
+        if (body + exts > std.math.maxInt(u24)) return error.ChainTooLong;
+    }
+
+    fn ocspStaple(self: *const CertifiedKey) ?[]const u8 {
+        const o = self.ocsp_response orelse return null;
+        return if (o.len == 0) null else o;
+    }
+
+    fn sctList(self: *const CertifiedKey) ?[]const u8 {
+        const l = self.sct_list orelse return null;
+        return if (l.len == 0) null else l;
+    }
 };
+
+/// `SerializedSCT sct_list<1..2^16-1>`, each `opaque SerializedSCT<1..2^16-1>`.
+fn validSctList(l: []const u8) bool {
+    if (l.len < 2 or std.mem.readInt(u16, l[0..2], .big) != l.len - 2 or l.len == 2) return false;
+    var i: usize = 2;
+    while (i < l.len) {
+        if (l.len - i < 2) return false;
+        const n = std.mem.readInt(u16, l[i..][0..2], .big);
+        if (n == 0 or n > l.len - i - 2) return false;
+        i += 2 + n;
+    }
+    return true;
+}
 
 /// Chooses the certificate for a ClientHello. `sni` is the requested DNS
 /// name (null when the client sent none or an IP literal); `ch` is valid
@@ -465,7 +532,8 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
 fn firstFlightLen(ck: *const CertifiedKey) usize {
     var chain: usize = 3;
     for (ck.chain) |c| chain += 3 + c.len + 2;
-    if (ck.ocsp_response) |o| chain += 4 + 4 + o.len;
+    if (ck.ocspStaple()) |o| chain += 4 + 4 + o.len;
+    if (ck.sctList()) |l| chain += 4 + l.len;
     const sig = for (certverify.candidateSchemes(ck.key)) |s| {
         break certverify.maxSignatureLen(s);
     } else 0;
@@ -862,6 +930,7 @@ pub const Server = struct {
             .fixed => |k| k,
             .select => |s| s.select(s.ctx, sni, &ch) orelse return error.AccessDenied,
         };
+        ck.check() catch return error.InternalError;
         const scheme = for (certverify.candidateSchemes(ck.key)) |s| {
             if (sig_algs.contains(@backingInt(s)) and certverify.canSign(ck.key, s)) break s;
         } else return error.HandshakeFailure;
@@ -1182,11 +1251,12 @@ pub const Server = struct {
                 .authorities = ca.authorities,
             })));
 
-            // Certificate, the OCSP staple on the leaf if the client asked.
-            var entries: [16]messages.CertificateEntry = undefined;
-            if (ck.chain.len == 0 or ck.chain.len > entries.len) return error.InternalError;
+            // Certificate, with the OCSP staple and the SCT list on the
+            // leaf if the client asked (`check` bounded the chain).
+            var entries: [CertifiedKey.max_chain_len]messages.CertificateEntry = undefined;
             for (ck.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
-            if (ch.ocsp_requested) entries[0].ocsp_response = ck.ocsp_response;
+            if (ch.ocsp_requested) entries[0].ocsp_response = ck.ocspStaple();
+            if (ch.sct_requested) entries[0].sct_list = ck.sctList();
             try self.send(H, try encoded(messages.certificate(self.out.slot(), "", entries[0..ck.chain.len])));
 
             // CertificateVerify over the transcript through Certificate.
@@ -1655,6 +1725,76 @@ test "certificate selector: sees the SNI, null is access_denied" {
     // An IP literal is no SNI.
     const r2 = try refuse(.{ .sni = "192.0.2.1" }, cfg);
     try testing.expectEqual(error.AccessDenied, r2.err);
+}
+
+test "CertifiedKey.check: chain, SCT list, leaf extensions; a selected key that fails it is internal_error" {
+    const k = testKey();
+    const leaf = k.chain[0];
+    try k.check();
+    var ck: CertifiedKey = k.*;
+    ck.chain = &.{};
+    try testing.expectError(error.ChainLength, ck.check());
+    const many: [CertifiedKey.max_chain_len + 1][]const u8 = @splat(leaf);
+    ck.chain = &many;
+    try testing.expectError(error.ChainLength, ck.check());
+    ck.chain = many[0..CertifiedKey.max_chain_len];
+    try ck.check();
+    ck.chain = &.{ leaf, "" };
+    try testing.expectError(error.CertificateLength, ck.check());
+    // Lengths only: `check` never reads the octets.
+    // One entry: 1 + 3 + (3 + L + 2) = 2^24 - 1 at L = 2^24 - 10.
+    const huge: [*]const u8 = leaf.ptr;
+    ck.chain = &.{huge[0 .. (1 << 24) - 10]};
+    try ck.check();
+    ck.chain = &.{huge[0 .. (1 << 24) - 9]};
+    try testing.expectError(error.ChainTooLong, ck.check());
+    // The leaf's extensions count too.
+    ck.chain = &.{huge[0 .. (1 << 24) - 10 - 9]};
+    ck.sct_list = "\x00\x03\x00\x01x";
+    try ck.check();
+    ck.chain = &.{huge[0 .. (1 << 24) - 10 - 8]};
+    try testing.expectError(error.ChainTooLong, ck.check());
+    ck.sct_list = null;
+    ck.chain = k.chain;
+    // SignedCertificateTimestampList: BoGo's well-formed one, then broken.
+    for ([_][]const u8{ "", "\x00\x06\x00\x04\x05\x06\x07\x08", "\x00\x03\x00\x01x" }) |l| {
+        ck.sct_list = l;
+        try ck.check();
+    }
+    for ([_][]const u8{ "\x00", "\x00\x00", "\x00\x02\x00\x00", "\x00\x03\x00\x02x", "\x00\x04\x00\x01xy", "\x00\x07\x00\x01x\x00", "\x00\x06\x00\x04\x05\x06\x07", "\x00\x09\x00\x01x" }) |l| {
+        ck.sct_list = l;
+        testing.expectError(error.InvalidSctList, ck.check()) catch |e| {
+            std.debug.print("sct list {x}\n", .{l});
+            return e;
+        };
+    }
+    ck.sct_list = null;
+    // OCSP staple + SCT list over the leaf's extensions<0..2^16-1>.
+    const big = try testing.allocator.alloc(u8, 65535 - 8);
+    defer testing.allocator.free(big);
+    @memset(big, 0x30);
+    ck.ocsp_response = big[0 .. 65535 - 8];
+    try ck.check();
+    ck.ocsp_response = big[0 .. 65535 - 8 - 9];
+    ck.sct_list = "\x00\x03\x00\x01x";
+    try ck.check();
+    ck.ocsp_response = big[0 .. 65535 - 8 - 8];
+    try testing.expectError(error.LeafExtensionsTooLong, ck.check());
+
+    // A selector handing out such a key: refused at the handshake.
+    var prng = std.Random.DefaultPrng.init(1);
+    const Sel = struct {
+        var key: CertifiedKey = undefined;
+        fn select(_: ?*anyopaque, _: ?[]const u8, _: *const hello.ClientHello) ?*const CertifiedKey {
+            return &key;
+        }
+    };
+    Sel.key = k.*;
+    Sel.key.sct_list = "\x00\x00";
+    const cfg: Config = .{ .certificate = .{ .select = .{ .select = Sel.select } }, .random = prng.random() };
+    const r = try refuse(.{}, cfg);
+    try testing.expectEqual(error.InternalError, r.err);
+    try testing.expectEqualSlices(u8, &.{ 2, 80 }, &r.alert.?);
 }
 
 test "first message not a ClientHello; a second ClientHello; a bad client Finished" {

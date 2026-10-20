@@ -498,6 +498,7 @@ const HelloMark = Marker(enum {
     psk,
     cookie,
     ocsp,
+    sct,
     unknown_ext,
     no_ext_block,
     duplicate_refused,
@@ -609,6 +610,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var shares_n: ?usize = null;
     var cookie_len: ?u16 = null;
     var ocsp = false;
+    var sct = false;
     var early = false;
     var psk_ids: ?usize = null;
     var binders_offset: usize = 0;
@@ -621,9 +623,9 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         HelloMark.mark(.no_ext_block);
     } else {
         const ext_at = w.open(u16);
-        // Order: a random permutation of the 12 kinds below, each present
+        // Order: a random permutation of the 13 kinds below, each present
         // with probability 1/2; pre_shared_key goes last on its own.
-        var order: [12]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+        var order: [13]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
         var i: usize = order.len;
         while (i > 1) : (i -= 1) std.mem.swap(u8, &order[i - 1], &order[src.index(i)]);
         var unknown_used: [3]u16 = undefined;
@@ -641,6 +643,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 6 => 44,
                 7 => 5,
                 8 => 42,
+                12 => 18,
                 9, 10, 11 => blk: {
                     // An unknown type (GREASE-like), distinct from the others.
                     var u: u16 = 0x0a0a + 0x1010 * @as(u16, src.valueRangeAtMost(u8, 0, 14));
@@ -726,6 +729,10 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                     HelloMark.mark(.ocsp);
                 },
                 8 => early = true,
+                12 => {
+                    sct = true;
+                    HelloMark.mark(.sct);
+                },
                 else => {
                     const n = src.valueRangeAtMost(u8, 0, 20);
                     src.bytes(w.buf[w.n..][0..n]);
@@ -804,7 +811,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         } else if (ch.key_shares_raw != null) return error.Phantom;
         if ((ch.cookie == null) != (cookie_len == null)) return error.CookieDiffers;
         if (cookie_len) |l| if (ch.cookie.?.len != l) return error.CookieDiffers;
-        if (ch.ocsp_requested != ocsp or ch.early_data != early) return error.FlagDiffers;
+        if (ch.ocsp_requested != ocsp or ch.sct_requested != sct or ch.early_data != early) return error.FlagDiffers;
         if (psk_ids) |n| {
             const p = ch.pre_shared_key orelse return error.PskMissing;
             if (p.binders_offset != binders_offset) return error.BindersOffsetDiffers;
@@ -1415,7 +1422,12 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     }
     if (std.mem.startsWith(u8, v.name, "go-")) SrvMark.mark(.go_case) else SrvMark.mark(.openssl_case);
     if (std.mem.indexOf(u8, v.name, "hrr") != null) SrvMark.mark(.retry_case);
-    const ck = &fk.cks[@backingInt(v.cert)];
+    var leaf = fk.cks[@backingInt(v.cert)];
+    if (v.staple) {
+        leaf.ocsp_response = &interop.ocsp_response;
+        leaf.sct_list = &interop.sct_list;
+    }
+    const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
@@ -1906,7 +1918,12 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         v = interop.cases[src.index(interop.cases.len)];
         if (v.cert != .rsa2048) break;
     }
-    const ck = &fk.cks[@backingInt(v.cert)];
+    var leaf = fk.cks[@backingInt(v.cert)];
+    if (v.staple) {
+        leaf.ocsp_response = &interop.ocsp_response;
+        leaf.sct_list = &interop.sct_list;
+    }
+    const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));

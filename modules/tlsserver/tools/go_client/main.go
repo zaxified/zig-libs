@@ -179,6 +179,12 @@ func main() {
 	fmt.Printf("peer_certs: %d\n", len(cs.PeerCertificates))
 	fmt.Printf("hrr: %v\n", cs.HelloRetryRequest)
 	fmt.Printf("resumed: %v\n", cs.DidResume)
+	fmt.Printf("ocsp: %x\n", cs.OCSPResponse)
+	scts := make([]string, len(cs.SignedCertificateTimestamps))
+	for i, sct := range cs.SignedCertificateTimestamps {
+		scts[i] = fmt.Sprintf("%x", sct)
+	}
+	fmt.Printf("scts: %s\n", strings.Join(scts, ","))
 
 	if _, err := conn.Write([]byte("ping\n")); err != nil {
 		fail("write: %v", err)

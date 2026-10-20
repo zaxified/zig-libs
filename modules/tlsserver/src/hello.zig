@@ -41,6 +41,7 @@ pub const ExtensionType = enum(u16) {
     ec_point_formats = 11,
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
+    signed_certificate_timestamp = 18,
     compress_certificate = 27,
     session_ticket = 35,
     pre_shared_key = 41,
@@ -106,6 +107,9 @@ pub const ClientHello = struct {
     /// `status_request` with `status_type` ocsp (RFC 6066 §8): the client
     /// accepts an OCSP staple. Another status type is ignored.
     ocsp_requested: bool = false,
+    /// `signed_certificate_timestamp` (RFC 6962 §3.3.1, empty in a
+    /// ClientHello): the client accepts an SCT list on the leaf.
+    sct_requested: bool = false,
     supported_groups_raw: ?[]const u8 = null,
     signature_algorithms_raw: ?[]const u8 = null,
     signature_algorithms_cert_raw: ?[]const u8 = null,
@@ -275,6 +279,10 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
             .signature_algorithms => ch.signature_algorithms_raw = try u16ListIn(data, u16),
             .signature_algorithms_cert => ch.signature_algorithms_cert_raw = try u16ListIn(data, u16),
             .application_layer_protocol_negotiation => ch.alpn_raw = try parseAlpn(data),
+            .signed_certificate_timestamp => {
+                if (data.len != 0) return error.DecodeError;
+                ch.sct_requested = true;
+            },
             .compress_certificate => ch.compress_certificate_raw = try u16ListIn(data, u8),
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
@@ -607,6 +615,7 @@ test "malformed known extensions are decode_error" {
         &ext(0, &.{ 0, 3, 0, 0, 0 }), // SNI host_name empty
         &ext(0, &.{ 0, 4, 0, 0, 2, 'a' }), // SNI overruns
         &ext(5, &.{ 1, 0, 0 }), // status_request ocsp truncated
+        &ext(18, &.{0}), // signed_certificate_timestamp with a body
         &ext(11, &.{0}), // ec_point_formats empty
         &ext(27, &.{ 3, 0, 1, 0 }), // compress_certificate odd
         &ext(47, &.{ 0, 2, 0, 5 }), // certificate_authorities overruns
@@ -637,6 +646,9 @@ test "well-formed odd cases are accepted" {
     try testing.expect(!ch.ocsp_requested);
     ch = try parseClientHello(buildHello(&b, &ext(5, &.{ 1, 0, 0, 0, 0 })));
     try testing.expect(ch.ocsp_requested);
+    try testing.expect(!ch.sct_requested);
+    ch = try parseClientHello(buildHello(&b, &ext(18, &.{})));
+    try testing.expect(ch.sct_requested);
     // ALPN with two names.
     ch = try parseClientHello(buildHello(&b, &ext(16, &.{ 0, 12, 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' })));
     var a = ch.alpn().?;

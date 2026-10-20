@@ -39,7 +39,7 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     defer gpa.destroy(rsa_key);
     try rsa.SecretKey.fromDer(rsa_key, &certs.rsa2048_pkcs1);
     var chain: [1][]const u8 = undefined;
-    const ck: server_mod.CertifiedKey = switch (v.cert) {
+    var ck: server_mod.CertifiedKey = switch (v.cert) {
         .p256 => blk: {
             chain[0] = &certs.p256_cert;
             break :blk .{ .chain = &chain, .key = .{ .ecdsa_p256 = &p256 } };
@@ -57,6 +57,10 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
             break :blk .{ .chain = &chain, .key = .{ .rsa = rsa_key } };
         },
     };
+    if (v.staple) {
+        ck.ocsp_response = &vectors.ocsp_response;
+        ck.sct_list = &vectors.sct_list;
+    }
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));

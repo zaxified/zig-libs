@@ -85,7 +85,15 @@ const Case = struct {
     /// The certificate the client presents; the server must end up with it
     /// as `peerCertificate` (from the ticket, on a resumption).
     client_cert: ClientCertKind = .none,
+    /// The leaf carries `interop_ocsp_response` and `interop_sct_list`.
+    staple: bool = false,
 };
+
+/// The OCSP staple and SCT list of every `staple` case: an OCSPResponse of
+/// status malformedRequest(1) (DER-valid, no signed body to verify) and a
+/// SignedCertificateTimestampList of two SCTs, "SCT-one" and "SCT-2".
+pub const interop_ocsp_response = [_]u8{ 0x30, 0x03, 0x0a, 0x01, 0x01 };
+pub const interop_sct_list = [_]u8{ 0x00, 0x10, 0x00, 0x07 } ++ "SCT-one".* ++ [_]u8{ 0x00, 0x05 } ++ "SCT-2".*;
 
 /// The ticket key and clock of every `tickets` case (and of the replay).
 pub const interop_stek_key: [32]u8 = @splat(0x5e);
@@ -112,6 +120,8 @@ const cases = [_]Case{
     .{ .name = "resume-hrr", .why = "resumption after a HelloRetryRequest (the binder over message_hash and the HRR)", .seed = 17, .tickets = true, .resumed = true, .brief = false, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess_in", "openssl.sess", "-groups", "X25519:P-256" }, .expect = &.{ "Reused, TLSv1.3", "Peer Temp Key: ECDH, prime256v1" } },
     .{ .name = "resume-aes128-new", .why = "tickets under TLS_AES_128_GCM_SHA256", .seed = 18, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     .{ .name = "resume-aes128", .why = "resumption under TLS_AES_128_GCM_SHA256", .seed = 19, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
+    .{ .name = "staple", .why = "an OCSP staple (s_client -status; its -ct needs a CT log list, so the SCTs are Go's to check)", .seed = 60, .staple = true, .brief = false, .args = &.{"-status"}, .expect = &.{"OCSP Response Status: malformedrequest (0x1)"} },
+    .{ .name = "staple-not-asked", .why = "a staple configured, s_client without -status (no status_request): the handshake still completes (absence of the staple: handshake_test.zig)", .seed = 61, .staple = true },
     .{ .name = "mtls-p256", .why = "a client certificate (ECDSA P-256) the server requires, verified by x509", .seed = 40, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"Verification: OK"} },
     .{ .name = "mtls-rsa2048", .why = "an RSA client certificate: CertificateVerify in RSA-PSS (SHA-384 suite)", .seed = 41, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"Ciphersuite: TLS_AES_256_GCM_SHA384"} },
     .{ .name = "mtls-ed25519", .why = "an Ed25519 client certificate under TLS_CHACHA20_POLY1305_SHA256", .seed = 42, .client_auth = .mandatory, .client_cert = .ed25519, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256" }, .expect = &.{"Ciphersuite: TLS_CHACHA20_POLY1305_SHA256"} },
@@ -136,6 +146,7 @@ const cases = [_]Case{
     .{ .name = "go-resume-new", .client = .go, .why = "tickets: Go saves the session", .seed = 34, .tickets = true, .args = &.{ "-sess-out", "go.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
     .{ .name = "go-resume", .client = .go, .why = "resumption: Go offers the saved ticket", .seed = 35, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{"resumed: true"} },
     .{ .name = "go-resume-hrr", .client = .go, .why = "resumption after a HelloRetryRequest", .seed = 36, .tickets = true, .resumed = true, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{ "resumed: true", "hrr: true" } },
+    .{ .name = "go-staple", .client = .go, .why = "the OCSP staple and the SCT list, octet for octet (Go always asks for both)", .seed = 62, .staple = true, .expect = &.{ "ocsp: 30030a0101\n", "scts: 5343542d6f6e65,5343542d32\n" } },
     .{ .name = "go-mtls-p256", .client = .go, .why = "a client certificate (ECDSA P-256) the server requires", .seed = 50, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-rsa2048", .client = .go, .why = "an RSA client certificate (RSA-PSS CertificateVerify)", .seed = 51, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-ed25519", .client = .go, .why = "an Ed25519 client certificate", .seed = 52, .client_auth = .mandatory, .client_cert = .ed25519, .expect = &.{"peer_certs: 1"} },
@@ -324,7 +335,11 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     defer stream.close(io);
 
     var chain: [1][]const u8 = undefined;
-    const ck = certifiedKey(keys, c.cert, &chain);
+    var ck = certifiedKey(keys, c.cert, &chain);
+    if (c.staple) {
+        ck.ocsp_response = &interop_ocsp_response;
+        ck.sct_list = &interop_sct_list;
+    }
     const seed: [32]u8 = @splat(c.seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     var ring: tlsresume.stek.DefaultRing = .init();
@@ -382,7 +397,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         return error.NoPong;
     }
     for (c.expect) |e| if (std.mem.indexOf(u8, stderr, e) == null and std.mem.indexOf(u8, stdout, e) == null) {
-        std.debug.print("  client lacks \"{s}\":\n{s}\n", .{ e, stderr });
+        std.debug.print("  client lacks \"{s}\":\n{s}\n--- stdout\n{s}\n", .{ e, stderr, stdout });
         return error.ExpectationMissing;
     };
     if (no_sni and server.serverName() != null) return error.SniFromNowhere;
@@ -432,7 +447,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\pub const ClientAuthMode = enum { off, mandatory, optional };
         \\
     );
-    try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n\n", .{ interop_stek_key[0], interop_clock_ms });
+    try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n", .{ interop_stek_key[0], interop_clock_ms });
+    try w.print("/// The leaf's OCSP staple and SCT list in the `staple` cases.\npub const ocsp_response = hx({d}, \"{x}\");\npub const sct_list = hx({d}, \"{x}\");\n\n", .{ interop_ocsp_response.len, &interop_ocsp_response, interop_sct_list.len, &interop_sct_list });
     try w.writeAll(
         \\pub const Case = struct {
         \\    name: []const u8,
@@ -451,6 +467,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    client_auth: ClientAuthMode = .off,
         \\    /// The server's `peerCertificate` at the end.
         \\    client_cert: ClientCertKind = .none,
+        \\    /// The leaf carried `ocsp_response` and `sct_list`.
+        \\    staple: bool = false,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -473,6 +491,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.resumed) try w.writeAll("        .resumed = true,\n");
         if (c.client_auth != .off) try w.print("        .client_auth = .{t},\n", .{c.client_auth});
         if (c.client_cert != .none) try w.print("        .client_cert = .{t},\n", .{c.client_cert});
+        if (c.staple) try w.writeAll("        .staple = true,\n");
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");

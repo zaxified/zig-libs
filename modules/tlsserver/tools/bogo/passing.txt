@@ -139,6 +139,14 @@ NoClientCertificateRequested-Server-TLS13
 NoNullCompression-TLS13
 NoSupportedCurves-TLS13
 NoSupportedVersions
+OCSPStapling-Server-TLS13-TLS-Async
+OCSPStapling-Server-TLS13-TLS-Async-ImplicitHandshake
+OCSPStapling-Server-TLS13-TLS-Async-PackHandshake
+OCSPStapling-Server-TLS13-TLS-Async-SplitHandshakeRecords
+OCSPStapling-Server-TLS13-TLS-Sync
+OCSPStapling-Server-TLS13-TLS-Sync-ImplicitHandshake
+OCSPStapling-Server-TLS13-TLS-Sync-PackHandshake
+OCSPStapling-Server-TLS13-TLS-Sync-SplitHandshakeRecords
 PAKE-No-Server-Support
 PackedEncryptedHandshake-TLS13
 PartialClientFinishedWithClientHello
@@ -168,6 +176,7 @@ Resume-Server-TLS13-TLS13-TLS
 Resume-Server-UnofferedCipher-TLS13
 SecondClientHelloMissingKeyShare-TLS13
 SecondClientHelloWrongCurve-TLS13
+SendNoExtensionsOnIntermediate-TLS13
 Server-FullSessionID-TLS13
 Server-InvalidSignature-ECDSA_P256_SHA256-TLS13
 Server-InvalidSignature-ECDSA_P384_SHA384-TLS13
@@ -228,6 +237,8 @@ ServerNameExtensionServer-TLS-TLS13
 ServerPaddingServer-NoServerSupport
 ServerPaddingServer-NotRequested
 ServerSkipCertificateVerify-TLS13
+SignedCertificateTimestampList-Server-TLS-TLS13
+SignedCertificateTimestampListInvalid-Server
 SkipChangeCipherSpec-Server-TLS13
 SkipClientCertificate-TLS13
 SkipEarlyData-HRR-FatalAlert-TLS13
@@ -261,6 +272,7 @@ UnexpectedClientEncryptedExtensions-New-TLS-TLS13
 UnexpectedClientEncryptedExtensions-Old-TLS-TLS13
 UnknownCipher-TLS13
 UnknownCurve-TLS13
+UnsolicitedCertificateExtensions-TLS-TLS13
 V2ClientHello-EmptyRecordPrefix
 V2ClientHello-WarningAlertPrefix
 Verify-ClientAuth-SignatureType-TLS13

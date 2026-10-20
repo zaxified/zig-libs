@@ -10,6 +10,9 @@
     "Basic-Server-ECDHE-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "Basic-Server-Ed25519-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Basic-Server-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "OCSPStapling-Server-TLS1-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "OCSPStapling-Server-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "OCSPStapling-Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "CertificateVerification*-Server-TLS1-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "CertificateVerification*-Server-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "CertificateVerification*-Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -129,6 +132,9 @@
     "WrongMessageType-ClientKeyExchange-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope"
   },
   "ErrorMap": {
+    ":INVALID_SCT_LIST:": [
+      ":InvalidSctList:"
+    ],
     ":NO_SHARED_CIPHER:": [
       ":HandshakeFailure:"
     ],

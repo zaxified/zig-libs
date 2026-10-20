@@ -212,6 +212,10 @@ pub const CertificateEntry = struct {
     /// (RFC 8446 §4.4.2.1: a `CertificateStatus` of type ocsp), after
     /// `extensions`.
     ocsp_response: ?[]const u8 = null,
+    /// A `SignedCertificateTimestampList` (RFC 6962 §3.3, with its length),
+    /// sent as this entry's `signed_certificate_timestamp` extension after
+    /// the OCSP staple.
+    sct_list: ?[]const u8 = null,
     extensions: []const Extension = &.{},
 };
 
@@ -236,6 +240,13 @@ pub fn certificate(out: []u8, context: []const u8, entries: []const CertificateE
             try w.int(u8, 1);
             try w.int(u24, @intCast(o.len));
             try w.bytes(o);
+            try w.close(u16, st);
+        }
+        if (e.sct_list) |l| {
+            if (l.len == 0) return error.FieldTooLong;
+            try w.int(u16, 18);
+            const st = try w.open(u16);
+            try w.bytes(l);
             try w.close(u16, st);
         }
         try w.close(u16, exts);
@@ -434,6 +445,14 @@ test "ALPN extension body; a chain with an OCSP staple on the leaf" {
     const ca = "\x00\x00\x02CA" ++ "\x00\x00";
     // header (body 33) ‖ empty context ‖ list length 29 ‖ entries
     try testing.expectEqualSlices(u8, "\x0b\x00\x00\x21" ++ "\x00" ++ "\x00\x00\x1d" ++ leaf ++ ca, m);
+
+    // The SCT list after the staple (RFC 6962 §3.3: extension_data is the
+    // SignedCertificateTimestampList itself).
+    const scts = "\x00\x06\x00\x04\x05\x06\x07\x08";
+    const m2 = try certificate(&out, "", &.{.{ .cert_data = "L", .ocsp_response = "\x30\x00", .sct_list = scts }});
+    const leaf2 = "\x00\x00\x01L" ++ "\x00\x16" ++ "\x00\x05\x00\x06\x01\x00\x00\x02\x30\x00" ++ "\x00\x12\x00\x08" ++ scts;
+    try testing.expectEqualSlices(u8, "\x0b\x00\x00\x20" ++ "\x00" ++ "\x00\x00\x1c" ++ leaf2, m2);
+    try testing.expectError(error.FieldTooLong, certificate(&out, "", &.{.{ .cert_data = "L", .sct_list = "" }}));
 }
 
 test "buffer too small, fields too long" {
