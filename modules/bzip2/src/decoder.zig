@@ -3,7 +3,8 @@
 //! The bzip2 decompressor: concatenated .bz2 streams, block and stream CRCs
 //! checked, randomised blocks of bzip2 0.9.0 handled, memory bounded by one
 //! block (4 bytes per block symbol, at most 3.6 MB for -9, grown as the
-//! block decodes, plus ~25 KB of tables). The format checks follow libbzip2 1.0.8's decompress.c (BSD-style
+//! block decodes — briefly ~1.5× while one growth step copies — plus ~45 KB
+//! of tables). The format checks follow libbzip2 1.0.8's decompress.c (BSD-style
 //! licence, see ../NOTICE; altered: rewritten in Zig around a pull
 //! `std.Io.Reader`, the Huffman decode done on a 20-bit window instead of bit
 //! by bit). Malformed input returns a typed error and never panics.
@@ -112,8 +113,15 @@ pub const Decoder = struct {
     rand_to_go: u32 = 0,
     rand_pos: u32 = 0,
     total_out: u64 = 0,
+    /// The first error: the decoder stays failed (a retry would parse the
+    /// middle of a block as a header, and the bit reader's EOF padding is
+    /// not built to be re-entered after an error).
+    failed: ?Error = null,
 
     pub fn init(gpa: std.mem.Allocator, in: *Reader, opts: Options) error{OutOfMemory}!Decoder {
+        // `in` needs a buffer it can `fill` into (a streaming reader with a
+        // zero-capacity buffer trips std's assertion); `Reader.fixed` of any
+        // slice, the empty one included, is fine — its fill ends the stream.
         return .{ .gpa = gpa, .in = in, .opts = opts, .work = try gpa.create(Work) };
     }
 
@@ -290,6 +298,9 @@ pub const Decoder = struct {
 
         // Coding tables.
         for (0..ng) |t| {
+            // Signed (it walks up and down) but range-checked before every
+            // narrowing; the u8 cast below goes through u32 so it can never
+            // become the signed→narrower-unsigned `trunc nsw` of #37131.
             var curr: i32 = @intCast(try d.bits(5));
             for (0..alpha_size) |i| {
                 while (true) {
@@ -297,7 +308,7 @@ pub const Decoder = struct {
                     if ((try d.bit()) == 0) break;
                     if ((try d.bit()) == 0) curr += 1 else curr -= 1;
                 }
-                w.len[t][i] = @intCast(curr);
+                w.len[t][i] = @intCast(@as(u32, @intCast(curr)));
             }
             w.tables[t].init(&w.len[t], alpha_size);
         }
@@ -513,7 +524,16 @@ pub const Decoder = struct {
     }
 
     /// Decompressed bytes into `dest`; 0 means the end of the last stream.
+    /// After an error every further call returns the same error.
     pub fn read(d: *Decoder, dest: []u8) Error!usize {
+        if (d.failed) |e| return e;
+        return d.readInner(dest) catch |e| {
+            d.failed = e;
+            return e;
+        };
+    }
+
+    fn readInner(d: *Decoder, dest: []u8) Error!usize {
         std.debug.assert(dest.len > 0);
         while (true) switch (d.phase) {
             .done => return 0,

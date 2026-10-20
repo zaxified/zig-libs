@@ -193,3 +193,27 @@ test "randomised blocks (bzip2 0.9.0) are read, and differ on the wire" {
         try testing.expectEqualSlices(u8, plain, back);
     }
 }
+
+test "a failed decoder stays failed (every later read returns the first error)" {
+    const a = std.testing.allocator;
+    var r: std.Io.Reader = .fixed("BZh9" ++ "\x31\x41\x59\x26\x53\x59" ++ "\xff\xff\xff\xff\xff\xff\xff\xff");
+    var d = try @import("decoder.zig").Decoder.init(a, &r, .{});
+    defer d.deinit();
+    var buf: [64]u8 = undefined;
+    const first = d.read(&buf);
+    try std.testing.expect(std.meta.isError(first));
+    const e1 = if (first) |_| unreachable else |e| e;
+    for (0..64) |_| try std.testing.expectError(e1, d.read(&buf));
+}
+
+test "the encoder refuses a second finish and a write after finish" {
+    const a = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    var e = try @import("encoder.zig").Encoder.init(a, &out.writer, .{});
+    defer e.deinit();
+    try e.write("abc");
+    try e.finish();
+    try std.testing.expectError(error.AlreadyFinished, e.finish());
+    try std.testing.expectError(error.AlreadyFinished, e.write("x"));
+}

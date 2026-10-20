@@ -28,7 +28,10 @@ pub const Options = struct {
     work_factor: u8 = 30,
 };
 
-pub const WriteError = Writer.Error || std.mem.Allocator.Error;
+pub const WriteError = Writer.Error || std.mem.Allocator.Error || error{
+    /// `finish` was already called (or `write` after it).
+    AlreadyFinished,
+};
 pub const Error = WriteError || error{InvalidLevel};
 
 /// The most bytes `compress` can produce for `n` input bytes (libbzip2's
@@ -161,7 +164,7 @@ pub const Encoder = struct {
 
     /// Feed `data` to the compressor; whole blocks go out as they fill.
     pub fn write(e: *Encoder, data: []const u8) WriteError!void {
-        std.debug.assert(!e.finished);
+        if (e.finished) return error.AlreadyFinished;
         var i: usize = 0;
         while (i < data.len) {
             if (e.nblock >= e.nblock_max) {
@@ -192,7 +195,9 @@ pub const Encoder = struct {
     /// Ends the stream: the pending run, the last block and the trailer.
     /// `out` is not flushed.
     pub fn finish(e: *Encoder) WriteError!void {
-        std.debug.assert(!e.finished);
+        // Single-shot: a second call would write a second trailer (the
+        // assert this was is a no-op in ReleaseFast).
+        if (e.finished) return error.AlreadyFinished;
         // libbzip2 closes a block that filled up as the last byte of a
         // `BZ_RUN` call went in before `BZ_FINISH` flushes the pending run,
         // which then lands in a block of its own.
