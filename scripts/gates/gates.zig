@@ -1069,6 +1069,7 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
     var lines: std.ArrayList(Line) = .empty;
     var failed = false;
     const today = todayDay(io);
+    const toolchain_day = dayAfter("(measured " ++ perf_toolchain_since ++ ")", "(measured ").?;
     for (module_list) |m| {
         const mat = moduleMaturity(b, io, m.name) orelse {
             failed = true;
@@ -1084,12 +1085,17 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
         // when an audit closes; `src fresh` says whether the recorded one
         // still matches.
         const fresh = if (mat.audited_src) |h| (if (std.mem.eql(u8, h, mat.current_src)) "fresh" else "STALE") else "?";
-        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
-            g.cell(b),                             m.name,
-            g.profile,                             if (g.limits.len > 0) g.limits else "-",
-            scope_line,                            audit_line,
-            mat.current_src,                       fresh,
-            if (mat.consumer) "consumer" else "-",
+        // See `perf_toolchain_since`.
+        const perf_toolchain = switch (mat.perf) {
+            .measured => |p| if (p.day < toolchain_day) "re-measure due" else "current",
+            else => "-",
+        };
+        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            g.cell(b),       m.name,
+            g.profile,       if (g.limits.len > 0) g.limits else "-",
+            scope_line,      audit_line,
+            mat.current_src, fresh,
+            perf_toolchain,  if (mat.consumer) "consumer" else "-",
         }) }) catch @panic("OOM");
     }
     if (failed) return step.fail("maturity-report: a module's maturity card is missing or malformed (logged above)", .{});
@@ -1101,7 +1107,7 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
     }.lt);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
-    try stdout.interface.writeAll("grade\tmodule\tprofile\tlimited by\tscope\taudit\tsrc now\tsrc fresh\tconsumer\n");
+    try stdout.interface.writeAll("grade\tmodule\tprofile\tlimited by\tscope\taudit\tsrc now\tsrc fresh\tP toolchain\tconsumer\n");
     for (lines.items) |l| try stdout.interface.writeAll(l.text);
     try stdout.interface.flush();
 }
@@ -2563,8 +2569,16 @@ const Perf = union(enum) {
     na,
     /// Worst-case time ratios, ours/theirs (lower is better). `fastest` null =
     /// the fastest implementation in the field has not been measured.
-    measured: struct { ref: f64, fastest: ?f64 },
+    measured: struct { ref: f64, fastest: ?f64, day: i64 },
 };
+
+/// The day the collection moved to the current Zig toolchain (0.17 migration,
+/// `460d74cb`). A P number measured before it still counts for the grade
+/// (owner, 2026-10-19: a re-measure is queued, never a drop to P3), but
+/// `maturity-report` lists it as `re-measure due` -- the codegen it was
+/// measured on is gone (0.17's byte-wise wide `@bitCast`, #36256, made std
+/// AES-GCM 2.6× slower). Move this forward on the next toolchain switch.
+const perf_toolchain_since = "2026-10-18";
 const EvidenceCD = enum { model_fuzz, model, kat, unclassified };
 
 /// How old a lead may be before the grade stops believing it, and how old a
@@ -2739,7 +2753,7 @@ fn parsePerf(name: []const u8, path: []const u8, line: []const u8) ?Perf {
             };
         }
     }
-    return .{ .measured = .{ .ref = ref, .fastest = fastest } };
+    return .{ .measured = .{ .ref = ref, .fastest = fastest, .day = dayAfter(line, "(measured ").? } };
 }
 
 /// Parse a module's maturity card. Null means a failure the caller must report,

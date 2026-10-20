@@ -1233,7 +1233,7 @@ pub fn build(b: *std.Build) void {
     // work on (survey the scope, add an external anchor, run the audit).
     {
         const st = gateRun(b, "maturity-report", &.{});
-        b.step("maturity-report", "Print every module's maturity grade as TSV, worst first (grade, module, profile, limited by, scope, audit, current src hash, whether the audited src is fresh, consumer)").dependOn(st);
+        b.step("maturity-report", "Print every module's maturity grade as TSV, worst first (grade, module, profile, limited by, scope, audit, current src hash, whether the audited src is fresh, whether P was measured on the current toolchain, consumer)").dependOn(st);
     }
 
     // `zig build app-list` — the names in `example_apps`, one per line, so
