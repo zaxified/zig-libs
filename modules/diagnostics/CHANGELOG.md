@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `Source.line_starts` + `Source.indexLines(gpa, text)` (S2 R4): a caller-built line
+  index makes each quoted line O(1) instead of a scan from the top of the file per label (N diagnostics
+  over a large file were O(N·F)); without it the scan is memchr per line instead of a splitting
+  iterator. Render stays allocation-free. Additive (a new defaulted field).
 - **2026-10-04** — **mvp → core.** `Diagnostic` gains optional `labels` (`Label`: secondary spans with a
   message, other files allowed), `notes` (`Note`, `NoteKind` note/help), `code_url` and `fix` (`Fix`: replace or
   insert); `snippet` quotes labels under ` ::: ` with `-` marks, `short` appends everything to the one line;

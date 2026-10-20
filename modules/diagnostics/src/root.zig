@@ -202,6 +202,27 @@ pub const Source = struct {
     /// single entry of a one-element `sources` is used whatever its name.
     file: []const u8,
     text: []const u8,
+    /// Optional: where each line of `text` starts (`indexLines`). With it a
+    /// quoted line is found in O(1); without it every label scans `text` from
+    /// the top (`memchr` per line), which is fine for one diagnostic and
+    /// quadratic for thousands over a large file.
+    line_starts: []const u32 = &.{},
+
+    /// The byte offset of every line start of `text` (line 1 at index 0), for
+    /// `line_starts`. Owned by the caller; one allocation, one pass.
+    pub fn indexLines(gpa: std.mem.Allocator, text: []const u8) error{ OutOfMemory, SourceTooLarge }![]u32 {
+        if (text.len > std.math.maxInt(u32)) return error.SourceTooLarge;
+        const n = std.mem.count(u8, text, "\n") + 1;
+        const starts = try gpa.alloc(u32, n);
+        starts[0] = 0;
+        var k: usize = 1;
+        var pos: usize = 0;
+        while (std.mem.findScalarPos(u8, text, pos, '\n')) |nl| : (k += 1) {
+            starts[k] = @intCast(nl + 1);
+            pos = nl + 1;
+        }
+        return starts;
+    }
 };
 
 pub const RenderOptions = struct {
@@ -468,20 +489,28 @@ fn writeSourceLine(w: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void
 fn sourceLine(d: Span, sources: []const Source) ?[]const u8 {
     const line = d.line orelse return null;
     if (line == 0) return null;
-    const src = blk: {
+    const s: Source = blk: {
         if (d.file) |f| {
-            for (sources) |s| if (std.mem.eql(u8, s.file, f)) break :blk s.text;
+            for (sources) |s| if (std.mem.eql(u8, s.file, f)) break :blk s;
             return null;
         }
-        if (sources.len == 1) break :blk sources[0].text;
+        if (sources.len == 1) break :blk sources[0];
         return null;
     };
-    var it = std.mem.splitScalar(u8, src, '\n');
-    var n: u32 = 1;
-    while (it.next()) |l| : (n += 1) {
-        if (n == line) return std.mem.trimEnd(u8, l, "\r");
+    const src = s.text;
+    var start: usize = 0;
+    if (s.line_starts.len != 0) {
+        if (line > s.line_starts.len) return null;
+        start = s.line_starts[line - 1];
+    } else {
+        var n: u32 = 1;
+        while (n < line) : (n += 1) {
+            start = (std.mem.findScalarPos(u8, src, start, '\n') orelse return null) + 1;
+        }
     }
-    return null;
+    if (start > src.len) return null;
+    const end = std.mem.findScalarPos(u8, src, start, '\n') orelse src.len;
+    return std.mem.trimEnd(u8, src[start..end], "\r");
 }
 
 /// Display columns of `bytes`: one per code point (UTF-8 continuation
@@ -745,6 +774,30 @@ test "render: control characters from the input never reach the terminal raw" {
     try testing.expect(std.mem.findScalar(u8, snip, 0x1b) == null);
     try testing.expect(std.mem.findScalar(u8, snip, 0x07) == null);
     try testing.expect(std.mem.find(u8, snip, "1 | ?]0;t?k: 1\n") != null);
+}
+
+fn spanAt(line: u32) Span {
+    return .{ .file = "f", .line = line, .col = null, .end_line = null, .end_col = null };
+}
+
+test "line index: the same quoted lines with and without Source.line_starts" {
+    const text = "one\r\ntwo\n\nfour\nfive";
+    const starts = try Source.indexLines(testing.allocator, text);
+    defer testing.allocator.free(starts);
+    try testing.expectEqualSlices(u32, &.{ 0, 5, 9, 10, 15 }, starts);
+    const plain = [_]Source{.{ .file = "f", .text = text }};
+    const indexed = [_]Source{.{ .file = "f", .text = text, .line_starts = starts }};
+    for (1..7) |ln| {
+        const span: Span = spanAt(@intCast(ln));
+        const a = sourceLine(span, &plain);
+        const b = sourceLine(span, &indexed);
+        try testing.expectEqual(a == null, b == null);
+        if (a) |x| try testing.expectEqualStrings(x, b.?);
+    }
+    try testing.expectEqualStrings("one", sourceLine(spanAt(1), &indexed).?);
+    try testing.expectEqualStrings("", sourceLine(spanAt(3), &indexed).?);
+    try testing.expectEqualStrings("five", sourceLine(spanAt(5), &plain).?);
+    try testing.expect(sourceLine(spanAt(6), &plain) == null);
 }
 
 test "sortByPosition: file, line, col; unknowns last; stable for ties" {

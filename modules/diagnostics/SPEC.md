@@ -122,7 +122,7 @@ also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), 
 | R1 | Several labels on one line merged into one quoted line, sorted (codespan `same_line`/`overlapping`) | M-L | do |
 | R2 | Multi-line spans with start/end markers (`/ \|`); non-overlapping first | S-M (L for overlaps) | do the non-overlapping slice |
 | R3 | LSP both ways: 0-based UTF-16 `character`, relatedInformation, codeDescription, tags, data, source, TextEdit; `fromLsp` | M | do (+ `hint` severity in one coordinated repin) |
-| R4 | Line index instead of re-splitting the source per label (O(N·F) today, `sourceLine` root.zig:468) | S | do first — P axis |
+| R4 | Line index instead of re-splitting the source per label (O(N·F) today, `sourceLine` root.zig:468) | S | **DONE 2026-10-20** — `Source.line_starts` + `Source.indexLines`; without it a memchr scan |
 | R5 | Display width: `tab_width`, East-Asian wide / combining / zero-width | M | do (small range table) |
 | R6 | Line endings: lone CR, U+2028/9, BOM | S | do |
 | R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | do |
