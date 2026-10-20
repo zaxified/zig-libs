@@ -199,6 +199,25 @@ apostrophes and nesting (both entry points), and the 30-character cap on quoted 
 
 ## Backlog / deferred
 
+**S2 plan — survey 2026-10-20** (Sonnet, read-only; grammar already at parity with json5/json5 2.2.3 —
+112 json5-tests fixtures + 2672 reference-oracle documents). The substantial gaps are API, not grammar:
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | Error position in SOURCE coordinates for every syntax error (today `Diagnostic` is filled only for NonFiniteNumber/HexLiteralTooLarge; a std.json error points into the preprocessed text). bxp (`bxp-core/src/config.zig:2525`) and ttydesk (`json5span.zig`) both work around it | M | do (offset map, opt-in via Options) |
+| R2 | Typed one-call parse: `parseFromSlice(T, gpa, json5_text, opts)` keeping the preprocessed buffer alive | S | do |
+| R3 | `stringify` to JSON5 (indent, quote choice, unquoted identifier keys, trailing commas) — json5/json5, pyjson5, json5-rs have it; ttydesk hand-emits | M | in progress (`src/stringify.zig`) |
+| R4 | Format-preserving span find/replace (ttydesk `json5span.zig`) | M | not parity (no reference has it) — owner call |
+| R5 | Strict Unicode ID_Start/ID_Continue for unquoted keys | M | not doing (accepting a superset is harmless) |
+| R6 | Duplicate-key policy | S | pass through std.json's option in R2 |
+| R7 | Depth limit for hostile input | S | `Options.max_depth` with R2 |
+| R8–R10 | Reviver/replacer, streaming reader, comment-preserving round trip | – | not doing (std.json typed decoding replaces the first; nobody does the others) |
+
+Bench plan: reference json5/json5 needs node/bun (absent) → runnable stand-ins Kijewski pyjson5 (Cython,
+fastest Python), json5-rs, titanous/json5 (Go); workloads small config / large document /
+preprocess+std.json into Value and into a struct.
+
+
 Full JSON5 spec gaps — **all struck through 2026-09-30, see the two DONE items below**:
 - ~~Hex numeric literals (`0x1A`).~~
 - ~~Leading-dot/trailing-dot numbers (`.5`, `5.`).~~

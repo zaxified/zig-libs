@@ -112,6 +112,32 @@ over the new rendering code): 11 killed at once, 2 killed by a new test (a `help
 code URL written raw).
 
 ## Backlog / deferred
+
+**S2 plan — survey 2026-10-20** (Sonnet, read-only; reference codespan-reporting 0.13.1, Apache-2.0;
+also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), annotate-snippets
+(MIT OR Apache-2.0 — the table above says Apache only, wrong), LSP 3.17 metaModel):
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | Several labels on one line merged into one quoted line, sorted (codespan `same_line`/`overlapping`) | M-L | do |
+| R2 | Multi-line spans with start/end markers (`/ \|`); non-overlapping first | S-M (L for overlaps) | do the non-overlapping slice |
+| R3 | LSP both ways: 0-based UTF-16 `character`, relatedInformation, codeDescription, tags, data, source, TextEdit; `fromLsp` | M | do (+ `hint` severity in one coordinated repin) |
+| R4 | Line index instead of re-splitting the source per label (O(N·F) today, `sourceLine` root.zig:468) | S | do first — P axis |
+| R5 | Display width: `tab_width`, East-Asian wide / combining / zero-width | M | do (small range table) |
+| R6 | Line endings: lone CR, U+2028/9, BOM | S | do |
+| R7 | Terminal-width truncation around the span (annotate-snippets `term_width`) | M | do |
+| R8 | `hint` severity | S + repin | with R3 |
+| R9 | Unicode box charset, codespan medium/short styles | S | do |
+| R10 | Context lines before/after | S | on request |
+| R11 | Diff-style suggestion rendering (annotate-snippets `Patch`) | M | later |
+| R13 | `expr_off`/`expr_len` documented but never rendered | S | render or correct the doc |
+
+Not doing: per-label colours/24-bit, narrated printer, error framework (miette), OSC-8 links, SARIF.
+Evidence plan (E3 → E2): vendor codespan's `*_no_color` insta snapshots (+ their inputs from tests/term.rs)
+as goldens with a per-case deviation table; a pinned Rust capture (`=0.13.1`) for CRLF/BOM/CJK/long-line
+cases; LSP UTF-16 vectors. Bench: codespan `emit_into_write` NoColor rich vs ours, 10k diagnostics over a
+1 MB file; annotate-snippets as the "fastest" candidate.
+
 The sibling `json5` module additionally intends to formalize its
 `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
