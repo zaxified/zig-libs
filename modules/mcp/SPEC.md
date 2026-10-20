@@ -429,7 +429,7 @@ coordinator's under the rule "parity with the reference, or safer":
 | R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | **DONE 2026-10-20** |
 | R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | **DONE 2026-10-20** — `addMethod`/`addNotification`, `setCapabilityExtras`; Apps/Skills helpers later |
 | R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | **DONE 2026-10-20** |
-| R11 | `completion/complete` for prompt arguments and template variables | M | do |
+| R11 | `completion/complete` for prompt arguments and template variables | M | **DONE 2026-10-20** — `Completer` on `Prompt`/`ResourceTemplate` |
 | R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | do — both SDKs ship it |
 | R13 | `notifications/elicitation/complete` (session era) | S | **DONE 2026-10-20** |
 | R14 | RFC 6570 resource-template matching with extracted variables | M | **DONE 2026-10-20** — `uri_template.zig` (matcher ported from the Python SDK) |

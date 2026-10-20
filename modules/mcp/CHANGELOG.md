@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `completion/complete` (S2 R11). `Prompt.completer` / `ResourceTemplate.completer`
+  (`Completer`, `CompletionRequest.add`/`contextArg`, `total`, `has_more`); at most 100 values, more sets
+  `hasMore`. The `completions` capability is advertised, and the method answered, only when a completer
+  exists (else -32601, completion.mdx). Both eras; pinned to the spec's examples (2025-11-25 byte for
+  byte, 2026-07-28 with `resultType`). New `DispatchMethod` tag (exhaustive switches over it need an arm).
 - **2026-10-20** — Custom methods and capability extras (S2 R9). `Server.addMethod` / `addNotification`
   register a request or notification this module does not define (`MethodRequest`: params, the request
   context, `write`/`print` of the result object, `failWith`); per-method `stateless`/`session`. A

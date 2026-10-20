@@ -243,6 +243,7 @@ pub const DispatchMethod = enum {
     @"prompts/get",
     @"server/discover",
     @"subscriptions/listen",
+    @"completion/complete",
 
     /// Whether a 2026-07-28 (stateless) request may call it. The handshake
     /// pair and `ping` were removed in that revision, so a modern request for
@@ -261,6 +262,7 @@ pub const DispatchMethod = enum {
             .@"prompts/get",
             .@"server/discover",
             .@"subscriptions/listen",
+            .@"completion/complete",
             => true,
         };
     }
@@ -309,6 +311,7 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "sampling/createMessage", .anchor = .literal_example, .reason = "" },
     .{ .method = "elicitation/create", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/elicitation/complete", .anchor = .literal_example, .reason = "" },
+    .{ .method = "completion/complete", .anchor = .literal_example, .reason = "" },
     .{ .method = "notifications/cancelled", .anchor = .partial, .reason = "field order and `reason` text match the spec's cancellation.mdx example exactly; `requestId` is always a bare JSON integer (this server's own monotonic ids), where the spec's illustrative id happens to be a quoted string -- JSON-RPC ids may be either, so this is not a divergence. Also: this module only ever SENDS notifications/cancelled (giving up on its own outbound sampling/elicitation request); it has no dispatch branch for a client cancelling an in-progress tools/call (an unknown id-less notification is silently dropped, which the spec explicitly permits)" },
 };
 
@@ -333,6 +336,7 @@ pub const modern_spec_anchor_index = [_]MethodAnchor{
     .{ .method = "resources/templates/list", .anchor = .literal_example, .reason = "" },
     .{ .method = "prompts/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (an illustrative token there; ours is opaque, see tools/list)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
+    .{ .method = "completion/complete", .anchor = .literal_example, .reason = "" },
     .{ .method = "subscriptions/listen", .anchor = .partial, .reason = "the acknowledgment and the graceful-close response are value-equal to the schema examples (listen-acknowledged.json, listen-closed-response.json) except the acknowledged `notifications` filter: this server emits no change notification of any kind, so it honours none of the requested types, acknowledges `{}` (subscriptions.mdx: unsupported types are omitted) and ends the subscription at once with the completion result; the closing result also carries serverInfo, which the example omits" },
 };
 
@@ -2908,6 +2912,9 @@ pub const ResourceTemplate = struct {
     annotations: ?Annotations = null,
     /// `_meta` as JSON object text ("" = none); see `Tool.meta_json`.
     meta_json: []const u8 = "",
+    /// Completes this template's variables (`completion/complete` with a
+    /// `ref/resource` naming this `uri_template`).
+    completer: ?Completer = null,
     handler: ?ResourceHandler = null,
     /// Opaque app-state pointer threaded to every read this template serves.
     ctx: ?*anyopaque = null,
@@ -3056,6 +3063,8 @@ pub const Prompt = struct {
     icons: []const Icon = &.{},
     /// `_meta` as JSON object text ("" = none); see `Tool.meta_json`.
     meta_json: []const u8 = "",
+    /// Completes this prompt's arguments (`completion/complete`).
+    completer: ?Completer = null,
     handler: PromptHandler,
     /// Opaque app-state pointer threaded to every get of this prompt.
     ctx: ?*anyopaque = null,
@@ -3178,6 +3187,46 @@ pub const MethodRequest = struct {
         return self.failWith(.{ .code = code, .message = msg, .data_json = data_json });
     }
 };
+
+/// Argument autocompletion for a prompt argument or a resource-template
+/// variable (`completion/complete`, server/utilities/completion.mdx). The
+/// handler `add`s candidate values for `argument` given its partial `value`
+/// (and the arguments already chosen, `context_arguments`); the server sends
+/// the first 100 and sets `hasMore` when more were added or `has_more` says so.
+pub const Completer = *const fn (ctx: ?*anyopaque, req: *CompletionRequest) void;
+
+pub const CompletionRequest = struct {
+    arena: std.mem.Allocator,
+    /// The prompt argument or template variable being completed.
+    argument: []const u8,
+    /// What the user has typed so far.
+    value: []const u8,
+    /// `params.context.arguments` — earlier choices (`.null` when absent).
+    context_arguments: std.json.Value = .null,
+    values: std.ArrayList([]const u8) = .empty,
+    /// The total number of matches, when known (omitted when null).
+    total: ?u64 = null,
+    /// Set when there are more matches than were added.
+    has_more: bool = false,
+    server: ?*Server = null,
+    peer: u64 = 0,
+    modern: ?*const ModernRequest = null,
+
+    /// Add one candidate (OOM swallowed).
+    pub fn add(self: *CompletionRequest, v: []const u8) void {
+        self.values.append(self.arena, v) catch {};
+    }
+
+    /// A string from `context_arguments`, or null.
+    pub fn contextArg(self: *const CompletionRequest, name: []const u8) ?[]const u8 {
+        if (self.context_arguments != .object) return null;
+        const v = self.context_arguments.object.get(name) orelse return null;
+        return if (v == .string) v.string else null;
+    }
+};
+
+/// The most values one completion answer carries (completion.mdx).
+pub const max_completion_values = 100;
 
 /// One content block of a tool result or prompt message (spec
 /// `ContentBlock`, server/tools.mdx "Tool Result"). Binary data is passed
@@ -3517,6 +3566,68 @@ pub const Server = struct {
         try self.template_parsed.ensureUnusedCapacity(self.gpa, 1);
         try self.resource_templates.append(self.gpa, template);
         self.template_parsed.appendAssumeCapacity(if (parsed) |pt| (if (pt.unmatchable == null) pt else null) else null);
+    }
+
+    /// Whether any prompt or template can complete — the `completions`
+    /// capability, and whether `completion/complete` exists at all here.
+    fn offersCompletions(self: *const Server) bool {
+        for (self.prompts.items) |p| if (p.completer != null) return true;
+        for (self.resource_templates.items) |rt| if (rt.completer != null) return true;
+        return false;
+    }
+
+    fn handleComplete(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, modern: ?*const ModernRequest) Error!void {
+        // completion.mdx: a server without the capability answers -32601.
+        if (!self.offersCompletions()) return sendError(arena, out, id, error_code.method_not_found, "Method not found");
+        const params = params_opt orelse return sendError(arena, out, id, error_code.invalid_params, "Missing params");
+        if (params != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid params");
+        const ref = params.object.get("ref") orelse return sendError(arena, out, id, error_code.invalid_params, "Missing ref");
+        const arg = params.object.get("argument") orelse return sendError(arena, out, id, error_code.invalid_params, "Missing argument");
+        if (ref != .object or arg != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid params");
+        const ref_type = ref.object.get("type") orelse .null;
+        const arg_name = arg.object.get("name") orelse .null;
+        const arg_value = arg.object.get("value") orelse .null;
+        if (ref_type != .string or arg_name != .string or arg_value != .string)
+            return sendError(arena, out, id, error_code.invalid_params, "Invalid params");
+        var ctx_args: std.json.Value = .null;
+        if (params.object.get("context")) |c| if (c == .object) if (c.object.get("arguments")) |a| {
+            ctx_args = a;
+        };
+
+        var completer: ?Completer = null;
+        var cctx: ?*anyopaque = null;
+        if (std.mem.eql(u8, ref_type.string, "ref/prompt")) {
+            const name = ref.object.get("name") orelse .null;
+            if (name != .string) return sendError(arena, out, id, error_code.invalid_params, "Invalid ref");
+            const p = self.findPrompt(name.string) orelse return sendError(arena, out, id, error_code.invalid_params, "Unknown prompt");
+            completer = p.completer;
+            cctx = p.ctx;
+        } else if (std.mem.eql(u8, ref_type.string, "ref/resource")) {
+            const uri = ref.object.get("uri") orelse .null;
+            if (uri != .string) return sendError(arena, out, id, error_code.invalid_params, "Invalid ref");
+            const rt = for (self.resource_templates.items) |*x| {
+                if (std.mem.eql(u8, x.uri_template, uri.string)) break x;
+            } else return sendError(arena, out, id, error_code.invalid_params, "Unknown resource template");
+            completer = rt.completer;
+            cctx = rt.ctx;
+        } else return sendError(arena, out, id, error_code.invalid_params, "Invalid ref type");
+
+        var req = CompletionRequest{
+            .arena = arena,
+            .argument = arg_name.string,
+            .value = arg_value.string,
+            .context_arguments = ctx_args,
+            .server = self,
+            .peer = peer,
+            .modern = modern,
+        };
+        // A known target without a completer simply has no suggestions.
+        if (completer) |f| f(cctx, &req);
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        buildCompleteResult(&jw, &req, &self.info, modern != null) catch return error.OutOfMemory;
+        try sendResultRaw(arena, out, id, aw.written());
     }
 
     pub const MethodError = error{ OutOfMemory, DuplicateMethod, ReservedMethod };
@@ -4108,6 +4219,7 @@ pub const Server = struct {
             .@"resources/templates/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .templates),
             .@"prompts/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .prompts),
             .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), peer, modern),
+            .@"completion/complete" => try self.handleComplete(arena, out, id, obj.get("params"), peer, modern),
         }
     }
 
@@ -4170,6 +4282,11 @@ pub const Server = struct {
         }
         if (self.prompts.items.len != 0) {
             try jw.objectField("prompts");
+            try jw.beginObject();
+            try jw.endObject();
+        }
+        if (self.offersCompletions()) {
+            try jw.objectField("completions");
             try jw.beginObject();
             try jw.endObject();
         }
@@ -4256,6 +4373,11 @@ pub const Server = struct {
             try jw.beginObject();
             try jw.objectField("listChanged");
             try jw.write(false);
+            try jw.endObject();
+        }
+        if (self.offersCompletions()) {
+            try jw.objectField("completions");
+            try jw.beginObject();
             try jw.endObject();
         }
         try self.writeCapabilityExtras(jw);
@@ -4734,6 +4856,23 @@ fn buildReadResult(jw: *std.json.Stringify, req: *const ResourceRequest, info: *
 /// Serialize one `prompts/get` result: `{description?, messages:[{role,
 /// content:{type:"text", text}}, …]}` — description comes from the
 /// registration (omitted when "").
+fn buildCompleteResult(jw: *std.json.Stringify, req: *const CompletionRequest, info: *const Info, modern: bool) std.Io.Writer.Error!void {
+    try beginResult(jw, modern);
+    try jw.objectField("completion");
+    try jw.beginObject();
+    try jw.objectField("values");
+    const n = @min(req.values.items.len, max_completion_values);
+    try jw.write(req.values.items[0..n]);
+    if (req.total) |tot| {
+        try jw.objectField("total");
+        try jw.write(tot);
+    }
+    try jw.objectField("hasMore");
+    try jw.write(req.has_more or req.values.items.len > max_completion_values);
+    try jw.endObject();
+    try endResult(jw, info, modern, null);
+}
+
 fn buildCustomResult(jw: *std.json.Stringify, members: std.json.ObjectMap, info: *const Info, modern: bool) std.Io.Writer.Error!void {
     try beginResult(jw, modern);
     var it = members.iterator();
@@ -5681,6 +5820,91 @@ test "capabilities: extensions and experimental are advertised in both eras" {
         \\{"jsonrpc":"2.0","id":2,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
     , &aw.writer);
     try testing.expect(std.mem.find(u8, aw.written(), "\"capabilities\":{\"tools\":{},\"extensions\":{\"io.modelcontextprotocol/ui\":{}},\"experimental\":{\"acme\":{\"v\":1}}}") != null);
+}
+
+fn codeReviewCompleter(_: ?*anyopaque, req: *CompletionRequest) void {
+    if (std.mem.eql(u8, req.argument, "language") and std.mem.eql(u8, req.value, "py")) {
+        for ([_][]const u8{ "python", "pytorch", "pyside" }) |v| req.add(v);
+        req.total = 10;
+        req.has_more = true;
+    } else if (std.mem.eql(u8, req.argument, "framework")) {
+        const lang = req.contextArg("language") orelse return;
+        if (std.mem.eql(u8, lang, "python") and std.mem.startsWith(u8, "flask", req.value)) {
+            req.add("flask");
+            req.total = 1;
+        }
+    } else if (std.mem.eql(u8, req.argument, "many")) {
+        for (0..150) |_| req.add("x");
+    }
+}
+
+test "completion/complete: the spec's examples, both eras" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    // No completer anywhere: the capability is absent and the method is -32601.
+    try s.addPrompt(.{ .name = "code_review", .handler = imagePrompt });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"language","value":"py"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}
+        \\
+    );
+
+    var c = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer c.deinit();
+    try c.addPrompt(.{ .name = "code_review", .handler = imagePrompt, .completer = codeReviewCompleter });
+    try c.addResourceTemplate(.{ .uri_template = "file:///{path}", .name = "f" });
+    // 2025-11-25 server/utilities/completion.mdx, both request/response pairs, compacted.
+    try expectResponse(&c,
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"language","value":"py"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["python","pytorch","pyside"],"total":10,"hasMore":true}}}
+        \\
+    );
+    try expectResponse(&c,
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"framework","value":"fla"},"context":{"arguments":{"language":"python"}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"completion":{"values":["flask"],"total":1,"hasMore":false}}}
+        \\
+    );
+    // 2026-07-28: the same plus resultType; `_meta.serverInfo` (which the
+    // example omits, a SHOULD) is the only other member.
+    try expectResponse(&c,
+        \\{"jsonrpc":"2.0","id":1,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"language","value":"py"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","completion":{"values":["python","pytorch","pyside"],"total":10,"hasMore":true},"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"t","version":"0"}}}}
+        \\
+    );
+    // A template without a completer has no suggestions; an unknown target is -32602.
+    try expectResponse(&c,
+        \\{"jsonrpc":"2.0","id":2,"method":"completion/complete","params":{"ref":{"type":"ref/resource","uri":"file:///{path}"},"argument":{"name":"path","value":"s"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"completion":{"values":[],"hasMore":false}}}
+        \\
+    );
+    try expectResponse(&c,
+        \\{"jsonrpc":"2.0","id":3,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"nope"},"argument":{"name":"a","value":""}}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Unknown prompt"}}
+        \\
+    );
+    // At most 100 values; more means hasMore.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try c.handleMessage(
+        \\{"jsonrpc":"2.0","id":4,"method":"completion/complete","params":{"ref":{"type":"ref/prompt","name":"code_review"},"argument":{"name":"many","value":""}}}
+    , &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const comp = parsed.value.object.get("result").?.object.get("completion").?.object;
+    try testing.expectEqual(@as(usize, 100), comp.get("values").?.array.items.len);
+    try testing.expect(comp.get("hasMore").?.bool);
+    // The capability is advertised once a completer exists.
+    aw.clearRetainingCapacity();
+    try c.handleMessage(
+        \\{"jsonrpc":"2.0","id":5,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"completions\":{}") != null);
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {
@@ -8618,7 +8842,7 @@ test "mcp: spec-anchor classification matches the dispatch surface (canary)" {
             },
         }
     }
-    try testing.expectEqual(@as(usize, 9), literal);
+    try testing.expectEqual(@as(usize, 10), literal);
     try testing.expectEqual(@as(usize, 6), partial);
     try testing.expectEqual(@as(usize, 3), no_example);
 }
@@ -10313,8 +10537,8 @@ test "mcp: 2026-07-28 spec-anchor classification matches servedStatelessly (cana
     for (modern_spec_anchor_index) |a| {
         if (a.anchor == .literal_example) literal += 1;
     }
-    try testing.expectEqual(@as(usize, 4), literal);
-    try testing.expectEqual(@as(usize, 9), modern_spec_anchor_index.len);
+    try testing.expectEqual(@as(usize, 5), literal);
+    try testing.expectEqual(@as(usize, 10), modern_spec_anchor_index.len);
 }
 
 // ── multi round-trip requests (2026-07-28) ──────────────────────────────────
