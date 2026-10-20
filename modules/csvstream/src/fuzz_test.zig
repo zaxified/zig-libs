@@ -15,7 +15,7 @@ const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const line = @import("line.zig");
 
-pub const Label = enum { records, unbalanced, fields };
+pub const Label = enum { records, unbalanced, fields, strict_refused, escaped, trimmed, comment_skipped, spanned, fallback };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -77,9 +77,140 @@ pub fn splitHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!
     }
 }
 
+/// The dialect options (2026-10-20) over a small CSV alphabet, both record
+/// modes. Invariants: a split's field count is `countFieldsOpts`'s; `strict`
+/// only refuses — what it accepts reads exactly as the lazy split does; a
+/// lazy split never raises a quote error; records are numbered in order and
+/// line numbers never go back.
+pub fn dialectHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var raw: [320]u8 = undefined;
+    const n: usize = src.slice(&raw);
+    if (n < 2) return;
+    const alphabet = "a,\" \\#\n\r\tb";
+    const sel = raw[0];
+    var text: [318]u8 = undefined;
+    const len = n - 2;
+    for (raw[2..n], 0..) |b, i| text[i] = alphabet[b % alphabet.len];
+    const bytes = text[0..len];
+    const escape: u8 = if (sel & 1 != 0) '\\' else 0;
+    const double_quote = sel & 2 == 0;
+    const trim: line.Trim = switch ((sel >> 2) % 3) {
+        0 => .none,
+        1 => .leading,
+        else => .all,
+    };
+    const comment: u8 = if (sel & 0x20 != 0) '#' else 0;
+    const span = sel & 0x40 != 0;
+    const delimiter: u8 = if (raw[1] & 1 != 0) '\t' else ',';
+    const lazy: line.SplitOptions = .{ .escape = escape, .double_quote = double_quote, .trim = trim };
+    var strict = lazy;
+    strict.strict = true;
+
+    var it = if (span)
+        line.LineIterator.initSpan(bytes, '"', 0, .{ .delimiter = delimiter, .escape = escape, .double_quote = double_quote, .trim = trim, .comment = comment })
+    else
+        line.LineIterator.initOpts(bytes, 0, .{ .escape = escape, .comment = comment });
+    var want_index: u64 = 0;
+    var last_line: u64 = 0;
+    var records: usize = 0;
+    var buf_lazy: [400][]const u8 = undefined;
+    var buf_strict: [400][]const u8 = undefined;
+    var buf_plain: [400][]const u8 = undefined;
+    while (it.next()) |rec| {
+        records += 1;
+        try testing.expect(records <= len + 1);
+        try testing.expectEqual(want_index, rec.record_index);
+        want_index += 1;
+        try testing.expect(rec.line_number > last_line);
+        last_line = rec.line_number;
+        if (rec.spanned) mark(.spanned);
+        if (comment != 0 and rec.bytes.len != 0) try testing.expect(rec.bytes[0] != comment);
+        const fl = line.splitFieldsOpts(rec.bytes, &buf_lazy, delimiter, '"', a, lazy) catch |err| switch (err) {
+            error.BareQuote, error.ExtraneousQuote, error.UnterminatedQuote => return error.LazySplitRaisedQuoteError,
+            else => return err,
+        };
+        try testing.expectEqual(fl.len, line.countFieldsOpts(rec.bytes, delimiter, '"', lazy));
+        if (line.splitFieldsOpts(rec.bytes, &buf_strict, delimiter, '"', a, strict)) |fs| {
+            try testing.expectEqual(fl.len, fs.len);
+            for (fl, fs) |x, y| try testing.expectEqualStrings(x, y);
+        } else |err| switch (err) {
+            error.BareQuote, error.ExtraneousQuote, error.UnterminatedQuote => mark(.strict_refused),
+            else => return err,
+        }
+        // Reach: the options changed something.
+        const plain = try line.splitFieldsOpts(rec.bytes, &buf_plain, delimiter, '"', a, .{ .double_quote = double_quote, .trim = trim });
+        if (escape != 0 and !sameFields(plain, fl)) mark(.escaped);
+        if (trim != .none) {
+            const untrimmed = try line.splitFieldsOpts(rec.bytes, &buf_plain, delimiter, '"', a, .{ .escape = escape, .double_quote = double_quote });
+            if (!sameFields(untrimmed, fl)) mark(.trimmed);
+        }
+    }
+    if (comment != 0 and len > 0 and bytes[0] == comment) mark(.comment_skipped);
+
+    // The event-jumping scanner against its bytewise reference, from every
+    // start, with and without the input's end in view, under caps small
+    // enough to fall back.
+    const scanner = line.SpanScanner.init('"', .{
+        .delimiter = delimiter,
+        .escape = escape,
+        .double_quote = double_quote,
+        .trim = trim,
+        .comment = comment,
+        .max_quoted_lines = raw[1] >> 5,
+        .max_record_len = if (raw[1] & 2 != 0) (raw[1] >> 2) % 32 + 1 else std.math.maxInt(usize),
+    });
+    for (0..len) |s| {
+        for ([_]bool{ true, false }) |at_eof| {
+            const fast = scanner.scanRaw(bytes, s, at_eof);
+            const slow = scanner.scanRawBytewise(bytes, s, at_eof);
+            if (!std.meta.eql(fast, slow)) {
+                std.debug.print("scanRaw != bytewise at {d} (eof {}): {any} vs {any}\n", .{ s, at_eof, fast, slow });
+                return error.ScannerDisagreesWithReference;
+            }
+            if (fast == .record and fast.record.unbalanced) mark(.fallback);
+        }
+    }
+    // The lazy iterator's parity shortcut against the toggling loop.
+    var lz = line.LineIterator.initOpts(bytes, 0, .{ .escape = escape });
+    while (lz.next()) |rec| {
+        try testing.expectEqual(toggleOpen(rec.bytes, escape), rec.unbalanced_quote);
+    }
+}
+
+/// The original `.end_record` quote toggle, kept as the reference for the
+/// parity shortcut. (`rec` may have lost a trailing CR, which holds no quote.)
+fn toggleOpen(rec: []const u8, escape: u8) bool {
+    var in_q = false;
+    var i: usize = 0;
+    while (i < rec.len) {
+        const c = rec[i];
+        if (c == '"') {
+            if (in_q and i + 1 < rec.len and rec[i + 1] == '"') {
+                i += 2;
+                continue;
+            }
+            in_q = !in_q;
+            i += 1;
+        } else if (in_q and escape != 0 and c == escape and i + 1 < rec.len) {
+            i += 2;
+        } else i += 1;
+    }
+    return in_q;
+}
+
+fn sameFields(x: []const []const u8, y: []const []const u8) bool {
+    if (x.len != y.len) return false;
+    for (x, y) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
 test "fuzz driver: CSVSTREAM_FUZZ" {
     try fuzz_driver.run(lineHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-line" });
     try fuzz_driver.run(splitHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-split" });
+    try fuzz_driver.run(dialectHarness, .{ .prefix = "CSVSTREAM_FUZZ", .name = "csvstream-dialect" });
 }
 
 test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
@@ -93,6 +224,10 @@ test "fuzz harness: 500 seeds in every test run, and they get everywhere" {
         };
         splitHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
             std.debug.print("csvstream split seed {d}: {t}\n", .{ seed, err });
+            return err;
+        };
+        dialectHarness(fuzz_driver.Rng, &rng, testing.allocator) catch |err| {
+            std.debug.print("csvstream dialect seed {d}: {t}\n", .{ seed, err });
             return err;
         };
     }

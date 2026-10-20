@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 dialect options (R1–R9 of the 2026-10-20 survey), all opt-in, defaults unchanged:
+  `SplitOptions.escape`/`double_quote`/`trim`/`strict`/`diag` (+ `countFieldsOpts`, errors `BareQuote`,
+  `ExtraneousQuote`, `UnterminatedQuote`), comment lines (`LineIterator.initOpts`, `SpanConfig.comment`),
+  `LineSlice.line_number`/`record_index`, `StreamReader.Options` dialect + `fields_per_record`
+  (`error.FieldCountMismatch`, `last`), `StreamReader.readHeader`, `WriteOptions.quote_style`/`escape`.
+  Split and count now share one field scanner; the `.span` scanner, the lazy record cut and quoted fields
+  jump between events with a 32-byte vector search (bench vs Go encoding/csv: 0.43–0.89×). Dialect
+  differential vs Go/Python (`tools/oracle.py --dialect`), dialect fuzz harness with a bytewise reference.
 - **2026-10-18** — Ported to Zig 0.17.0. Test "a failed split frees the fields it had already allocated": `fail_index` 2 -> 1, because the 0.17 testing allocator shrinks in place on `remap` so `toOwnedSlice` makes one allocation per field instead of two. Same scenario (failure on the second field), no library change.
 - **2026-10-09** — tests: deterministic fuzz driver `CSVSTREAM_FUZZ` over the existing harnesses.
 - **2026-10-05** — **BEHAVIOURAL: `SplitOptions.trailing_empty_field` is now ON by default.** `a,b,`

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Opt-in header-row handling: capture a record's fields as column names and
 //! build a name→index map, so callers who want name-based field access don't
-//! each hand-roll the same `std.StringHashMap(usize)` bookkeeping. Deliberately
-//! NOT wired into `StreamReader`/`LineIterator` automatically — reading past
-//! the header row (or not) is app policy, this is just the capture helper.
+//! each hand-roll the same `std.StringHashMap(usize)` bookkeeping. Never
+//! applied automatically — whether a file has a header row is app policy;
+//! `StreamReader.readHeader` reads one when asked.
 //!
 //! Provenance: original work of the zig-libs authors (MIT).
 

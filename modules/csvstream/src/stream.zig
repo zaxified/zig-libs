@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const line = @import("line.zig");
+const Header = @import("header.zig").Header;
 
 pub const LineSlice = line.LineSlice;
 pub const LineIterator = line.LineIterator;
@@ -261,6 +262,15 @@ pub const StreamReader = struct {
     /// Set once the first chunk has been inspected for a leading UTF-8 BOM
     /// (only the very first bytes of the whole stream can carry one).
     checked_bom: bool = false,
+    /// Dialect and policy for `nextFields` (see `Options`).
+    split: line.SplitOptions,
+    fields_per_record: line.FieldCheck,
+    /// The field count every `nextFields` row must have, once known.
+    expected_fields: ?usize = null,
+    /// The record `next()` returned last — after an error from `nextFields`
+    /// (`FieldCountMismatch`, a `strict` quote error) it is the offending
+    /// one, with its `line_number`, `record_index` and `byte_offset`.
+    last: LineSlice = .{ .bytes = "", .byte_offset = 0 },
 
     pub const Options = struct {
         /// Quoting char (0 disables quoting; '"' = RFC 4180).
@@ -283,16 +293,36 @@ pub const StreamReader = struct {
         /// `.span` mode: the field count a spanned record must have to keep
         /// its span. `.first_record` = the header's.
         field_check: line.FieldCheck = .none,
+        /// Dialect, as `line.SplitOptions` documents each: an escape byte
+        /// inside quotes, `""` as an escape, whitespace trimming. Applied to
+        /// the record scan (`.span`) and to `nextFields` alike.
+        escape: u8 = 0,
+        double_quote: bool = true,
+        trim: line.Trim = .none,
+        /// A record starting with this byte is a comment line and skipped
+        /// (Go `Comment`, rust-csv `comment`). 0 = none.
+        comment: u8 = 0,
+        /// `nextFields` refuses malformed quoting (`line.SplitOptions.strict`).
+        strict: bool = false,
+        /// `nextFields` refuses a row whose field count differs with
+        /// `error.FieldCountMismatch` — Go `FieldsPerRecord` (`.first_record`
+        /// = 0, `.count` = n, `.none` = -1), rust-csv `flexible(false)`.
+        /// `last` names the row. Rows read with `next()` are not checked.
+        fields_per_record: line.FieldCheck = .none,
     };
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, opts: Options) !StreamReader {
         var chunks = try ChunkReader.initMax(io, alloc, file, opts.chunk_size, opts.max_record_len);
-        var lines = LineIterator.init("", opts.quote, 0);
+        var lines = LineIterator.initOpts("", 0, .{ .quote = opts.quote, .escape = opts.escape, .comment = opts.comment });
         if (opts.quoted_newlines == .span) {
             chunks.setSpan(opts.quote, .{
                 .delimiter = opts.delimiter,
                 .max_quoted_lines = opts.max_quoted_lines,
                 .field_check = opts.field_check,
+                .escape = opts.escape,
+                .double_quote = opts.double_quote,
+                .trim = opts.trim,
+                .comment = opts.comment,
             });
             lines = LineIterator.initSpanScanner("", 0, chunks.span.?);
         }
@@ -301,6 +331,17 @@ pub const StreamReader = struct {
             .quote = opts.quote,
             .delimiter = opts.delimiter,
             .lines = lines,
+            .split = .{
+                .escape = opts.escape,
+                .double_quote = opts.double_quote,
+                .trim = opts.trim,
+                .strict = opts.strict,
+            },
+            .fields_per_record = opts.fields_per_record,
+            .expected_fields = switch (opts.fields_per_record) {
+                .count => |n| n,
+                else => null,
+            },
         };
     }
 
@@ -314,7 +355,10 @@ pub const StreamReader = struct {
     /// first record therefore starts right after the BOM, not at 0.
     pub fn next(self: *StreamReader) !?LineSlice {
         while (true) {
-            if (self.lines.next()) |rec| return rec;
+            if (self.lines.next()) |rec| {
+                self.last = rec;
+                return rec;
+            }
             const chunk = (try self.chunks.nextChunk()) orelse return null;
             var bytes = chunk;
             var base_offset = self.chunks.chunk_start_in_file;
@@ -330,10 +374,14 @@ pub const StreamReader = struct {
             }
             // Span mode: the drained iterator's scanner is exactly the state
             // at this chunk's start (it has read every record before it).
-            self.lines = if (self.lines.span) |scanner|
+            // The line and record counters continue across chunks.
+            var lines = if (self.lines.span) |scanner|
                 LineIterator.initSpanScanner(bytes, base_offset, scanner)
             else
-                LineIterator.init(bytes, self.quote, base_offset);
+                LineIterator.initOpts(bytes, base_offset, .{ .quote = self.quote, .escape = self.lines.escape, .comment = self.lines.comment });
+            lines.line = self.lines.line;
+            lines.record = self.lines.record;
+            self.lines = lines;
         }
     }
 
@@ -350,7 +398,8 @@ pub const StreamReader = struct {
         return self.nextFieldsOpts(buf, alloc, .{});
     }
 
-    /// `nextFields` with the caller's overflow policy — the same choice
+    /// `nextFields` with the caller's overflow policy and trailing-field
+    /// reading — the same choice
     /// `splitFieldsOpts` offers, one layer up, so a `StreamReader` caller is
     /// not forced back down to the in-memory API to express it. Per call, not
     /// per reader: a caller splitting a header and its rows with one reader
@@ -363,7 +412,33 @@ pub const StreamReader = struct {
         opts: line.SplitOptions,
     ) !?[][]const u8 {
         const rec = (try self.next()) orelse return null;
-        return try line.splitFieldsOpts(rec.bytes, buf, self.delimiter, self.quote, alloc, opts);
+        // The dialect is the reader's (set at `init`); the caller's options
+        // add the per-call policy: overflow, trailing field, diagnostics.
+        var o = self.split;
+        o.on_overflow = opts.on_overflow;
+        o.trailing_empty_field = opts.trailing_empty_field;
+        o.diag = opts.diag;
+        const fields = try line.splitFieldsOpts(rec.bytes, buf, self.delimiter, self.quote, alloc, o);
+        if (self.fields_per_record != .none) {
+            if (self.expected_fields) |want| {
+                if (fields.len != want) {
+                    line.freeFields(rec.bytes, fields, alloc);
+                    return error.FieldCountMismatch;
+                }
+            } else self.expected_fields = fields.len;
+        }
+        return fields;
+    }
+
+    /// Reads the next record as the header row (rust-csv `has_headers`,
+    /// Python `DictReader`): its fields become a `Header` owned by the
+    /// caller. Null at EOF. `buf` must hold the header's fields. Under
+    /// `fields_per_record = .first_record` the header sets the count.
+    pub fn readHeader(self: *StreamReader, buf: [][]const u8, alloc: std.mem.Allocator) !?Header {
+        var arena: std.heap.ArenaAllocator = .init(alloc);
+        defer arena.deinit();
+        const fields = (try self.nextFieldsOpts(buf, arena.allocator(), .{})) orelse return null;
+        return try Header.init(alloc, fields);
     }
 };
 

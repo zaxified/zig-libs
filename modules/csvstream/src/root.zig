@@ -68,8 +68,18 @@ pub const splitFieldsOpts = line.splitFieldsOpts;
 /// What `splitFieldsOpts` does with a record wider than the field buffer.
 pub const OverflowPolicy = line.OverflowPolicy;
 
-/// Caller policy for `splitFieldsOpts`.
+/// Caller policy for `splitFieldsOpts`: overflow, trailing field, and the
+/// dialect (escape byte, `double_quote`, trim, `strict`).
 pub const SplitOptions = line.SplitOptions;
+
+/// Whitespace trimming around fields (`none`, `leading`, `all`).
+pub const Trim = line.Trim;
+
+/// Where a `strict` split refused (byte column).
+pub const SplitDiag = line.SplitDiag;
+
+/// What a `strict` split refuses: `BareQuote`, `ExtraneousQuote`, `UnterminatedQuote`.
+pub const QuoteError = line.QuoteError;
 
 /// How a newline inside a quoted field is read: `.end_record` (default, every
 /// `\n` ends a record) or `.span` (RFC 4180 multi-line fields, bounded).
@@ -90,6 +100,9 @@ pub const default_max_quoted_lines = line.default_max_quoted_lines;
 
 /// The true field count of one record, independent of any buffer.
 pub const countFields = line.countFields;
+
+/// `countFields` under a split's `SplitOptions` (escape, trim, trailing field).
+pub const countFieldsOpts = line.countFieldsOpts;
 
 // ── Streaming layer (file → records with absolute offsets) ────────────────────
 
@@ -122,6 +135,9 @@ pub const LineTerminator = writer.LineTerminator;
 /// Options for `writeField`/`writeRecord`.
 pub const WriteOptions = writer.WriteOptions;
 
+/// Which fields the writer quotes (`necessary`, `always`, `never`).
+pub const QuoteStyle = writer.QuoteStyle;
+
 /// Writes one field, RFC 4180-quoting it (doubling any embedded quote char)
 /// only if it contains the delimiter, the quote char, a CR, or a LF.
 pub const writeField = writer.writeField;
@@ -133,8 +149,8 @@ pub const writeRecord = writer.writeRecord;
 // ── Header-row handling (opt-in) ──────────────────────────────────────────────
 
 /// Captures a record's fields as column names and builds a name→index map.
-/// Not wired into `StreamReader` automatically — capturing (or skipping) the
-/// header row is app policy; this is just the bookkeeping helper.
+/// `StreamReader.readHeader` reads one from the next record on request;
+/// whether a file has a header row stays the caller's call.
 pub const Header = header.Header;
 
 /// Field-count/arity check against an explicit expected count (see also
@@ -169,4 +185,6 @@ test {
     _ = @import("csv_spectrum_vectors.zig");
     _ = @import("csv_spectrum_test.zig");
     _ = @import("oracle_test.zig");
+    _ = @import("dialect_test.zig");
+    _ = @import("oracle_dialect_test.zig");
 }

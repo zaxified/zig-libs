@@ -37,12 +37,38 @@ pub const WriteOptions = struct {
     quote: u8 = '"',
     /// Record terminator; RFC 4180 default is CRLF.
     line_terminator: LineTerminator = .crlf,
+    /// Which fields are quoted (rust-csv `QuoteStyle`, Python `QUOTE_*`).
+    quote_style: QuoteStyle = .necessary,
+    /// Inside a quoted field, write a quote (and the escape byte itself) as
+    /// `escape` + byte instead of doubling the quote — the writing side of
+    /// `SplitOptions.escape` with `double_quote = false` (rust-csv
+    /// `double_quote(false)` + `escape`, Python `doublequote=False`).
+    /// `0` (default) = RFC 4180 doubling.
+    escape: u8 = 0,
 };
 
-/// Returns true if `field` needs RFC 4180 quoting under `opts`: it contains
-/// the delimiter, the quote char, a CR, or a LF.
+/// Which fields `writeField` quotes.
+pub const QuoteStyle = enum {
+    /// Only a field holding the delimiter, the quote, CR or LF (RFC 4180,
+    /// Python `QUOTE_MINIMAL`, Go, rust-csv `Necessary`).
+    necessary,
+    /// Every field, empty ones included (Python `QUOTE_ALL`, rust-csv `Always`).
+    always,
+    /// No field: written verbatim, as with `quote = 0` (Python `QUOTE_NONE`
+    /// without an escape char, rust-csv `Never`). The caller then guarantees
+    /// that no field holds the delimiter, CR or LF.
+    never,
+};
+
+/// Returns true if `field` is quoted under `opts`: always, never, or (the
+/// default) when it contains the delimiter, the quote char, a CR, or a LF.
 fn needsQuoting(field: []const u8, opts: WriteOptions) bool {
     if (opts.quote == 0) return false;
+    switch (opts.quote_style) {
+        .always => return true,
+        .never => return false,
+        .necessary => {},
+    }
     for (field) |b| {
         if (b == opts.delimiter or b == opts.quote or b == '\r' or b == '\n') return true;
     }
@@ -58,14 +84,15 @@ pub fn writeField(w: *std.Io.Writer, field: []const u8, opts: WriteOptions) std.
         return;
     }
     try w.writeByte(opts.quote);
+    const escape = if (opts.escape == opts.quote) 0 else opts.escape;
     var start: usize = 0;
     for (field, 0..) |b, i| {
-        if (b == opts.quote) {
+        if (b == opts.quote or (escape != 0 and b == escape)) {
             try w.writeAll(field[start..i]);
             // RFC 4180 §2 rule 7: a literal quote inside a quoted field is
-            // escaped by doubling it.
-            try w.writeByte(opts.quote);
-            try w.writeByte(opts.quote);
+            // escaped by doubling it — or, in an escape dialect, prefixed.
+            try w.writeByte(if (escape != 0) escape else opts.quote);
+            try w.writeByte(b);
             start = i + 1;
         }
     }
@@ -83,7 +110,7 @@ pub fn writeRecord(w: *std.Io.Writer, fields: []const []const u8, opts: WriteOpt
     // exactly this case for exactly this reason, and it was the ONLY
     // divergence from it across 6001 random rows. The module's own test
     // asserted the loss as correct (W2 re-audit 2026-09-02, `csvstream` F4).
-    if (fields.len == 1 and fields[0].len == 0 and opts.quote != 0) {
+    if (fields.len == 1 and fields[0].len == 0 and opts.quote != 0 and opts.quote_style != .never) {
         try w.writeByte(opts.quote);
         try w.writeByte(opts.quote);
         try w.writeAll(opts.line_terminator.bytes());

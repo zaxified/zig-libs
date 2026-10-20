@@ -45,7 +45,170 @@ pub const SplitOptions = struct {
     /// the old reading for a caller whose files end every row with a stray
     /// delimiter. `countFields` counts the default way.
     trailing_empty_field: bool = true,
+    /// Escape byte inside a quoted field (`\"` dialects, rust-csv `escape`,
+    /// Python `escapechar`): `escape X` is the literal `X`, whatever `X` is.
+    /// `0` (default) = none. Only inside quotes, as rust-csv/csv-core read it;
+    /// an escape byte equal to `quote` is ignored (that is `double_quote`).
+    escape: u8 = 0,
+    /// `""` inside a quoted field is one literal quote (RFC 4180). `false`
+    /// (rust-csv `double_quote(false)`, Python `doublequote=False`): a doubled
+    /// quote is not an escape and each quote is judged on its own by the
+    /// close-or-literal rule — the dialect then escapes with `escape`.
+    double_quote: bool = true,
+    /// Whitespace (space, tab — never the delimiter itself) around fields.
+    trim: Trim = .none,
+    /// Refuse malformed quoting instead of reading it lazily — Go
+    /// `encoding/csv` with `LazyQuotes = false`, Python `strict=True`:
+    /// `error.BareQuote` (a quote inside an unquoted field),
+    /// `error.ExtraneousQuote` (a quote inside a quoted field followed by
+    /// neither the delimiter nor the record's end), `error.UnterminatedQuote`
+    /// (no closing quote before the record's end). Off by default, for the
+    /// reason `LineIterator` gives: a stray quote costs one record, not the
+    /// file. `diag` receives the byte column.
+    strict: bool = false,
+    /// On a `strict` error: the 0-based byte column in the record of the
+    /// offending quote (Go `ParseError.Column` is the same idea).
+    diag: ?*SplitDiag = null,
 };
+
+/// Whitespace trimming around fields (`SplitOptions.trim`).
+pub const Trim = enum {
+    none,
+    /// Skip whitespace before a field, so ` "a,b"` still opens a quoted
+    /// field — Go `TrimLeadingSpace`, Python `skipinitialspace`.
+    leading,
+    /// `.leading` plus whitespace after a field: trailing blanks of an
+    /// unquoted field and blanks between a closing quote and the delimiter.
+    /// Blanks INSIDE quotes stay — quoting is how a CSV says a blank is data
+    /// (rust-csv `Trim::Fields` also trims inside; documented divergence).
+    all,
+};
+
+/// Where `splitFieldsOpts` refused a record under `strict`.
+pub const SplitDiag = struct { column: usize = 0 };
+
+/// What `strict` refuses.
+pub const QuoteError = error{ BareQuote, ExtraneousQuote, UnterminatedQuote };
+
+fn isTrimSpace(b: u8, delimiter: u8) bool {
+    return (b == ' ' or b == '\t') and b != delimiter;
+}
+
+fn skipTrailing(line: []const u8, pos: usize, delimiter: u8, trim: Trim) usize {
+    var p = pos;
+    if (trim == .all) {
+        while (p < line.len and isTrimSpace(line[p], delimiter)) p += 1;
+    }
+    return p;
+}
+
+/// One field as `scanField` found it.
+const FieldScan = struct {
+    /// Content `line[start..end]` (inside the quotes for a quoted field).
+    start: usize,
+    end: usize,
+    /// Where the next field starts (past this field's delimiter).
+    next: usize,
+    /// The content holds a doubled quote or an escape to resolve.
+    needs_unescape: bool,
+    /// The field ended on a delimiter that was the record's last byte.
+    ended_on_delimiter: bool,
+};
+
+fn quoteFail(opts: SplitOptions, column: usize, err: QuoteError) QuoteError {
+    if (opts.diag) |d| d.column = column;
+    return err;
+}
+
+/// The one field scanner `splitFieldsOpts` and `countFieldsOpts` share, so
+/// the count can never disagree with the split. Always advances: `next > pos`
+/// whenever `pos < line.len`.
+inline fn scanField(line: []const u8, pos0: usize, delimiter: u8, quote: u8, opts: SplitOptions) QuoteError!FieldScan {
+    var pos = pos0;
+    if (opts.trim != .none) {
+        while (pos < line.len and isTrimSpace(line[pos], delimiter)) pos += 1;
+    }
+    if (quote != 0 and pos < line.len and line[pos] == quote) {
+        const open = pos;
+        pos += 1;
+        const start = pos;
+        var needs_unescape = false;
+        var closed = false;
+        const escape = if (opts.escape == quote) 0 else opts.escape;
+        while (pos < line.len) {
+            // Jump to the next quote (or escape byte): the bytes between are
+            // plain field content.
+            pos = (if (escape != 0) findAny(line, pos, 2, .{ quote, escape }) else std.mem.findScalarPos(u8, line, pos, quote)) orelse {
+                pos = line.len;
+                break;
+            };
+            const b = line[pos];
+            if (escape != 0 and b == escape) {
+                // An escape as the record's last byte has nothing to escape
+                // and is kept as a literal byte.
+                if (pos + 1 < line.len) {
+                    needs_unescape = true;
+                    pos += 2;
+                } else pos += 1;
+            } else if (b == quote) {
+                if (opts.double_quote and pos + 1 < line.len and line[pos + 1] == quote) {
+                    needs_unescape = true;
+                    pos += 2; // Skip escaped quote (e.g. "")
+                    continue;
+                }
+                const after = skipTrailing(line, pos + 1, delimiter, opts.trim);
+                if (after == line.len or line[after] == delimiter) {
+                    closed = true; // Closing quote: end of record, or a delimiter next.
+                    break;
+                }
+                // ⚠ A lone quote with something OTHER than a delimiter
+                // after it is a literal quote — Go `encoding/csv`'s
+                // `LazyQuotes` rule, which this module's docs name as
+                // its model. It used to close the field here, so a
+                // field boundary was emitted at a position where the
+                // input contains no delimiter: `"a"b` became two
+                // fields, `"a,b"c,d` became three. File content then
+                // chose a row's column count, `Header.get` read the
+                // wrong column, and `unbalanced_quote` stayed false
+                // because the quotes really were balanced
+                // (W2 re-audit 2026-09-02, `csvstream` F1).
+                if (opts.strict) return quoteFail(opts, pos, error.ExtraneousQuote);
+                pos += 1;
+            } else unreachable; // `findAny` stops only on the quote or the escape
+        }
+        if (!closed) {
+            if (opts.strict) return quoteFail(opts, open, error.UnterminatedQuote);
+            return .{ .start = start, .end = pos, .next = pos, .needs_unescape = needs_unescape, .ended_on_delimiter = false };
+        }
+        var next = skipTrailing(line, pos + 1, delimiter, opts.trim); // past the closing quote
+        var ended = false;
+        if (next < line.len) {
+            next += 1; // Skip delimiter.
+            ended = next == line.len;
+        }
+        return .{ .start = start, .end = pos, .next = next, .needs_unescape = needs_unescape, .ended_on_delimiter = ended };
+    }
+    // Unquoted field: scan until the next delimiter.
+    const start = pos;
+    if (opts.strict and quote != 0) {
+        while (pos < line.len and line[pos] != delimiter) : (pos += 1) {
+            if (line[pos] == quote) return quoteFail(opts, pos, error.BareQuote);
+        }
+    } else {
+        while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
+    }
+    var end = pos;
+    if (opts.trim == .all) {
+        while (end > start and isTrimSpace(line[end - 1], delimiter)) end -= 1;
+    }
+    var next = pos;
+    var ended = false;
+    if (pos < line.len) {
+        next = pos + 1; // Skip delimiter.
+        ended = next == line.len;
+    }
+    return .{ .start = start, .end = end, .next = next, .needs_unescape = false, .ended_on_delimiter = ended };
+}
 
 /// Splits one CSV line into its constituent fields.
 ///
@@ -117,68 +280,13 @@ pub fn splitFieldsOpts(
     // caller's `freeFields` on the success path.
     errdefer freeFields(line, buf[0..count], alloc);
     var ended_on_delimiter = false;
-    // Loop condition: pos <= line.len (one past end) lets the outer while
-    // reach the `if (pos == line.len) break` sentinel for the trailing-field
-    // case, avoiding a separate post-loop append.
-    while (count < buf.len and pos <= line.len) {
-        if (pos == line.len) break;
-        if (quote != 0 and line[pos] == quote) {
-            // Quoted field: scan until the closing quote.
-            // Track whether any doubled-quote escape sequences were found so we
-            // only allocate when actually needed.
-            pos += 1;
-            const start = pos;
-            var has_escaped_quote = false;
-            while (pos < line.len) {
-                const b = line[pos];
-                if (b == quote) {
-                    if (pos + 1 < line.len and line[pos + 1] == quote) {
-                        has_escaped_quote = true;
-                        pos += 2; // Skip escaped quote (e.g. "")
-                    } else if (pos + 1 == line.len or line[pos + 1] == delimiter) {
-                        break; // Closing quote: end of record, or a delimiter next.
-                    } else {
-                        // ⚠ A lone quote with something OTHER than a delimiter
-                        // after it is a literal quote — Go `encoding/csv`'s
-                        // `LazyQuotes` rule, which this module's docs name as
-                        // its model. It used to close the field here, so a
-                        // field boundary was emitted at a position where the
-                        // input contains no delimiter: `"a"b` became two
-                        // fields, `"a,b"c,d` became three. File content then
-                        // chose a row's column count, `Header.get` read the
-                        // wrong column, and `unbalanced_quote` stayed false
-                        // because the quotes really were balanced
-                        // (W2 re-audit 2026-09-02, `csvstream` F1).
-                        pos += 1;
-                    }
-                } else {
-                    pos += 1;
-                }
-            }
-            const raw = line[start..pos];
-            if (pos < line.len) pos += 1; // Skip closing quote.
-            if (pos < line.len and line[pos] == delimiter) {
-                pos += 1; // Skip delimiter.
-                ended_on_delimiter = pos == line.len;
-            }
-
-            // Unescape doubled quote → single quote only when needed (avoids
-            // allocation in the common case).
-            if (has_escaped_quote) {
-                buf[count] = try unescapeQuotes(raw, quote, alloc);
-            } else {
-                buf[count] = raw;
-            }
-        } else {
-            // Unquoted field: scan until the next delimiter.
-            const start = pos;
-            while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
-            buf[count] = line[start..pos];
-            if (pos < line.len) {
-                pos += 1; // Skip delimiter.
-                ended_on_delimiter = pos == line.len;
-            }
-        }
+    while (count < buf.len and pos < line.len) {
+        const f = try scanField(line, pos, delimiter, quote, opts);
+        const raw = line[f.start..f.end];
+        // Unescape only when needed (avoids allocation in the common case).
+        buf[count] = if (f.needs_unescape) try unescapeField(raw, quote, opts, alloc) else raw;
+        pos = f.next;
+        ended_on_delimiter = f.ended_on_delimiter;
         count += 1;
     }
     // The empty field after a final delimiter, when asked for: the loop
@@ -217,40 +325,26 @@ pub fn splitFieldsOpts(
 /// a caller splitting with `.trailing_empty_field = false` gets one fewer
 /// for a record that ends on a delimiter.
 pub fn countFields(line: []const u8, delimiter: u8, quote: u8) usize {
+    return countFieldsOpts(line, delimiter, quote, .{});
+}
+
+/// `countFields` under the same `SplitOptions` a split uses (escape,
+/// `double_quote`, trim, `trailing_empty_field`); `strict`, `diag` and the
+/// overflow policy do not change a count and are ignored.
+pub fn countFieldsOpts(line: []const u8, delimiter: u8, quote: u8, opts: SplitOptions) usize {
+    var o = opts;
+    o.strict = false;
+    o.diag = null;
     var n: usize = 0;
     var pos: usize = 0;
     var ended_on_delimiter = false;
-    while (pos <= line.len) {
-        if (pos == line.len) break;
-        if (quote != 0 and line[pos] == quote) {
-            pos += 1;
-            while (pos < line.len) {
-                const b = line[pos];
-                if (b == quote) {
-                    if (pos + 1 < line.len and line[pos + 1] == quote) {
-                        pos += 2;
-                    } else if (pos + 1 == line.len or line[pos + 1] == delimiter) {
-                        break;
-                    } else {
-                        pos += 1;
-                    }
-                } else pos += 1;
-            }
-            if (pos < line.len) pos += 1;
-            if (pos < line.len and line[pos] == delimiter) {
-                pos += 1;
-                ended_on_delimiter = pos == line.len;
-            }
-        } else {
-            while (pos < line.len and line[pos] != delimiter) : (pos += 1) {}
-            if (pos < line.len) {
-                pos += 1;
-                ended_on_delimiter = pos == line.len;
-            }
-        }
+    while (pos < line.len) {
+        const f = scanField(line, pos, delimiter, quote, o) catch unreachable; // not strict
+        pos = f.next;
+        ended_on_delimiter = f.ended_on_delimiter;
         n += 1;
     }
-    return n + @intFromBool(ended_on_delimiter);
+    return n + @intFromBool(ended_on_delimiter and opts.trailing_empty_field);
 }
 
 /// One record produced by `LineIterator.next()`: the record bytes (a slice into
@@ -273,6 +367,13 @@ pub const LineSlice = struct {
     /// `.span` mode only: the record contains a newline inside a quoted
     /// field, i.e. it covers more than one physical line.
     spanned: bool = false,
+    /// 1-based physical line the record starts on, counting every `\n` of
+    /// the input (empty and comment lines included) — Go `FieldPos` line,
+    /// rust-csv `Position::line`, Python `line_num`.
+    line_number: u64 = 0,
+    /// 0-based index of the record among those returned (empty and comment
+    /// lines are not records) — rust-csv `Position::record`.
+    record_index: u64 = 0,
 };
 
 /// How a newline inside a quoted field is read.
@@ -327,6 +428,20 @@ pub const SpanConfig = struct {
     /// `max_record_len`; in memory it defaults to no cap.
     max_record_len: usize = std.math.maxInt(usize),
     field_check: FieldCheck = .none,
+    /// Dialect, as `SplitOptions` names it — the scanner must close a quoted
+    /// field exactly where the split will, or a newline it calls quoted is
+    /// one the split calls a record end.
+    escape: u8 = 0,
+    double_quote: bool = true,
+    trim: Trim = .none,
+    /// A record whose first byte is this is a comment line: skipped, and its
+    /// quotes never open a field (Go `Comment`, rust-csv `comment`). `0` = none.
+    comment: u8 = 0,
+
+    /// The split options that read fields the way this scanner cut them.
+    pub fn splitOptions(self: SpanConfig) SplitOptions {
+        return .{ .escape = self.escape, .double_quote = self.double_quote, .trim = self.trim };
+    }
 };
 
 /// The `.span` record scanner: `SpanConfig` plus what it has learned so far
@@ -356,7 +471,7 @@ pub const SpanScanner = struct {
     pub const Scan = union(enum) {
         /// A record: `bytes[start..end]` (the terminator and any `\r` before
         /// it not yet stripped); the next record starts at `next`.
-        record: struct { end: usize, next: usize, spanned: bool, unbalanced: bool },
+        record: struct { end: usize, next: usize, spanned: bool, unbalanced: bool, comment: bool = false },
         /// More bytes are needed to decide; only when `at_eof` is false.
         incomplete,
     };
@@ -373,19 +488,114 @@ pub const SpanScanner = struct {
     /// falls back at EOF — to the same physical line.
     pub fn scan(self: *SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
         const r = self.scanRaw(bytes, start, at_eof);
-        if (r == .record and self.awaiting_header) {
+        if (r == .record and self.awaiting_header and !r.record.comment) {
             const rec = trimCr(bytes[start..r.record.end]);
             if (rec.len != 0) {
                 self.awaiting_header = false;
-                self.expected_fields = countFields(rec, self.cfg.delimiter, self.quote);
+                self.expected_fields = countFieldsOpts(rec, self.cfg.delimiter, self.quote, self.cfg.splitOptions());
             }
         }
         return r;
     }
 
-    fn scanRaw(self: *const SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
+    pub fn scanRaw(self: *const SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
         const quote = self.quote;
         const delim = self.cfg.delimiter;
+        const escape = if (self.cfg.escape == quote) 0 else self.cfg.escape;
+        if (self.cfg.comment != 0 and start < bytes.len and bytes[start] == self.cfg.comment) {
+            const nl = std.mem.findScalarPos(u8, bytes, start, '\n') orelse {
+                if (!at_eof) return .incomplete;
+                return .{ .record = .{ .end = bytes.len, .next = bytes.len, .spanned = false, .unbalanced = false, .comment = true } };
+            };
+            return .{ .record = .{ .end = nl, .next = nl + 1, .spanned = false, .unbalanced = false, .comment = true } };
+        }
+        // `scanRawBytewise` below is the byte-at-a-time statement of these
+        // rules (and the fuzz harness's reference); this is the same scan
+        // jumping from event to event with `findAny` -- outside quotes the
+        // events are `\n` and the quote, inside them the quote, `\n` and the
+        // escape byte. Everything between two events is plain field data.
+        var pos = start;
+        var spanned = false;
+        var q_lines: usize = 0;
+        outer: while (true) {
+            // Outside quotes: the next line feed ends the record; a quote
+            // opens a field only at a field start.
+            while (true) {
+                const f = (if (quote != 0) findAny(bytes, pos, 2, .{ '\n', quote }) else std.mem.findScalarPos(u8, bytes, pos, '\n')) orelse {
+                    if (!at_eof) return .incomplete;
+                    return self.finish(bytes, start, bytes.len, bytes.len, spanned, true);
+                };
+                if (bytes[f] == '\n') return self.finish(bytes, start, f, f + 1, spanned, at_eof);
+                pos = f + 1;
+                var q = f;
+                if (self.cfg.trim != .none) {
+                    while (q > start and isTrimSpace(bytes[q - 1], delim)) q -= 1;
+                }
+                if (q == start or bytes[q - 1] == delim) break; // an opening quote
+            }
+            // Inside quotes.
+            while (true) {
+                const f = (if (escape != 0) findAny(bytes, pos, 3, .{ quote, '\n', escape }) else findAny(bytes, pos, 2, .{ quote, '\n' })) orelse {
+                    // Plain bytes up to the end: the bytewise scan checks the cap after each.
+                    if (spanned and bytes.len > pos and bytes.len - start >= self.cfg.max_record_len) return lazyFallback(bytes, start, at_eof);
+                    if (!at_eof) return .incomplete;
+                    // The input ended inside a quote: the opener had no closer at all.
+                    return lazyFallback(bytes, start, true);
+                };
+                if (spanned and f > pos and f - start >= self.cfg.max_record_len) return lazyFallback(bytes, start, at_eof);
+                const c = bytes[f];
+                pos = f;
+                if (c == '\n') {
+                    spanned = true;
+                    q_lines += 1;
+                    if (q_lines > self.cfg.max_quoted_lines) return lazyFallback(bytes, start, at_eof);
+                    pos += 1;
+                } else if (c == quote) {
+                    if (pos + 1 >= bytes.len and !at_eof) return .incomplete;
+                    if (self.cfg.double_quote and pos + 1 < bytes.len and bytes[pos + 1] == quote) {
+                        pos += 2;
+                        continue;
+                    }
+                    switch (self.quoteCloses(bytes, pos + 1, at_eof)) {
+                        .incomplete => return .incomplete,
+                        .close => {
+                            pos += 1;
+                            continue :outer;
+                        },
+                        .literal => pos += 1,
+                    }
+                } else { // the escape byte
+                    if (pos + 1 >= bytes.len) {
+                        if (!at_eof) return .incomplete;
+                        pos += 1;
+                        continue;
+                    }
+                    if (bytes[pos + 1] == '\n') {
+                        spanned = true;
+                        q_lines += 1;
+                        if (q_lines > self.cfg.max_quoted_lines) return lazyFallback(bytes, start, at_eof);
+                    }
+                    pos += 2;
+                }
+                if (spanned and pos - start >= self.cfg.max_record_len) return lazyFallback(bytes, start, at_eof);
+            }
+        }
+    }
+
+    /// The reference statement of the `.span` record rules, one byte at a
+    /// time; `scanRaw` must agree with it on every input (the fuzz harness
+    /// checks). Not on any production path.
+    pub fn scanRawBytewise(self: *const SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
+        const quote = self.quote;
+        const delim = self.cfg.delimiter;
+        const escape = if (self.cfg.escape == quote) 0 else self.cfg.escape;
+        if (self.cfg.comment != 0 and start < bytes.len and bytes[start] == self.cfg.comment) {
+            const nl = std.mem.findScalarPos(u8, bytes, start, '\n') orelse {
+                if (!at_eof) return .incomplete;
+                return .{ .record = .{ .end = bytes.len, .next = bytes.len, .spanned = false, .unbalanced = false, .comment = true } };
+            };
+            return .{ .record = .{ .end = nl, .next = nl + 1, .spanned = false, .unbalanced = false, .comment = true } };
+        }
         var pos = start;
         var field_start = true;
         var in_q = false;
@@ -394,39 +604,35 @@ pub const SpanScanner = struct {
         while (pos < bytes.len) {
             const c = bytes[pos];
             if (in_q) {
-                if (c == quote) {
-                    // The byte after a quote decides escape vs close vs
-                    // literal; at the buffer's end it is not known yet.
+                if (escape != 0 and c == escape) {
                     if (pos + 1 >= bytes.len) {
                         if (!at_eof) return .incomplete;
-                        in_q = false;
                         pos += 1;
                         continue;
                     }
-                    const n = bytes[pos + 1];
-                    if (n == quote) {
+                    if (bytes[pos + 1] == '\n') {
+                        spanned = true;
+                        q_lines += 1;
+                        if (q_lines > self.cfg.max_quoted_lines) return lazyFallback(bytes, start, at_eof);
+                    }
+                    pos += 2;
+                } else if (c == quote) {
+                    // The byte after a quote decides escape vs close vs
+                    // literal; at the buffer's end it is not known yet.
+                    if (pos + 1 >= bytes.len and !at_eof) return .incomplete;
+                    if (self.cfg.double_quote and pos + 1 < bytes.len and bytes[pos + 1] == quote) {
                         pos += 2;
                         continue;
                     }
-                    if (n == delim or n == '\n') {
-                        in_q = false;
-                        pos += 1;
-                        continue;
-                    }
-                    if (n == '\r') {
-                        if (pos + 2 >= bytes.len) {
-                            if (!at_eof) return .incomplete;
+                    switch (self.quoteCloses(bytes, pos + 1, at_eof)) {
+                        .incomplete => return .incomplete,
+                        .close => {
                             in_q = false;
                             pos += 1;
                             continue;
-                        }
-                        if (bytes[pos + 2] == '\n') {
-                            in_q = false;
-                            pos += 1;
-                            continue;
-                        }
+                        },
+                        .literal => pos += 1, // a literal quote inside the field
                     }
-                    pos += 1; // a literal quote inside the field
                 } else {
                     if (c == '\n') {
                         spanned = true;
@@ -441,6 +647,8 @@ pub const SpanScanner = struct {
                 if (field_start and quote != 0 and c == quote) {
                     in_q = true;
                     field_start = false;
+                } else if (field_start and self.cfg.trim != .none and isTrimSpace(c, delim)) {
+                    // Blanks before a field: a quote after them still opens it.
                 } else field_start = c == delim;
                 pos += 1;
             }
@@ -451,10 +659,29 @@ pub const SpanScanner = struct {
         return self.finish(bytes, start, bytes.len, bytes.len, spanned, true);
     }
 
+    /// Does the quote just before `after` close its field? The same rule as
+    /// `scanField`: it does when what follows (past blanks under `.trim =
+    /// .all`) is the delimiter or the record's end — here `\n`, `\r\n` or
+    /// the input's end.
+    fn quoteCloses(self: *const SpanScanner, bytes: []const u8, after: usize, at_eof: bool) enum { close, literal, incomplete } {
+        var p = after;
+        if (self.cfg.trim == .all) {
+            while (p < bytes.len and isTrimSpace(bytes[p], self.cfg.delimiter)) p += 1;
+        }
+        if (p >= bytes.len) return if (at_eof) .close else .incomplete;
+        const n = bytes[p];
+        if (n == self.cfg.delimiter or n == '\n') return .close;
+        if (n == '\r') {
+            if (p + 1 >= bytes.len) return if (at_eof) .close else .incomplete;
+            if (bytes[p + 1] == '\n') return .close;
+        }
+        return .literal;
+    }
+
     fn finish(self: *const SpanScanner, bytes: []const u8, start: usize, end: usize, next: usize, spanned: bool, at_eof: bool) Scan {
         if (spanned) {
             if (self.expected_fields) |want| {
-                if (countFields(trimCr(bytes[start..end]), self.cfg.delimiter, self.quote) != want)
+                if (countFieldsOpts(trimCr(bytes[start..end]), self.cfg.delimiter, self.quote, self.cfg.splitOptions()) != want)
                     return lazyFallback(bytes, start, at_eof);
             }
         }
@@ -470,6 +697,51 @@ pub const SpanScanner = struct {
         return .{ .record = .{ .end = bytes.len, .next = bytes.len, .spanned = false, .unbalanced = true } };
     }
 };
+
+/// `.end_record` mode's quote state at the end of one physical line: does a
+/// quote stay open? Toggle on every quote except a doubled one inside quotes
+/// (and, with an escape byte, an escaped byte inside quotes). Without an
+/// escape that state is just the parity of the quote count: a doubled quote
+/// takes two quotes and leaves the state, a toggle takes one and flips it.
+fn quoteOpenAtEnd(rec: []const u8, quote: u8, escape: u8) bool {
+    if (quote == 0) return false;
+    if (escape == 0) return std.mem.countScalar(u8, rec, quote) & 1 == 1;
+    var in_quotes = false;
+    var i: usize = 0;
+    while (i < rec.len) {
+        const c = rec[i];
+        if (c == quote) {
+            if (in_quotes and i + 1 < rec.len and rec[i + 1] == quote) {
+                i += 2; // escaped quote inside quoted field
+                continue;
+            }
+            in_quotes = !in_quotes;
+            i += 1;
+        } else if (in_quotes and c == escape and i + 1 < rec.len) {
+            i += 2; // escaped byte inside quoted field
+        } else i += 1;
+    }
+    return in_quotes;
+}
+
+/// Index of the first byte at or after `start` equal to any of `needles`,
+/// or null — 32-byte vector compares, scalar tail. Every needle must be a
+/// byte the caller is looking for (no 0 placeholder: it would match NULs).
+pub fn findAny(bytes: []const u8, start: usize, comptime n: usize, needles: [n]u8) ?usize {
+    const lanes = 32;
+    const V = @Vector(lanes, u8);
+    var i = start;
+    while (i + lanes <= bytes.len) : (i += lanes) {
+        const v: V = bytes[i..][0..lanes].*;
+        var bits: u32 = 0;
+        inline for (needles) |c| bits |= @as(u32, @bitCast(v == @as(V, @splat(c))));
+        if (bits != 0) return i + @ctz(bits);
+    }
+    while (i < bytes.len) : (i += 1) {
+        inline for (needles) |c| if (bytes[i] == c) return i;
+    }
+    return null;
+}
 
 fn trimCr(rec: []const u8) []const u8 {
     if (rec.len > 0 and rec[rec.len - 1] == '\r') return rec[0 .. rec.len - 1];
@@ -513,9 +785,40 @@ pub const LineIterator = struct {
     /// Non-null in `.span` mode. Carries what it learned (the header's field
     /// count) from record to record.
     span: ?SpanScanner = null,
+    /// `.end_record` mode's dialect beyond the quote (`.span` mode reads the
+    /// scanner's `SpanConfig`): see `Options`.
+    escape: u8 = 0,
+    comment: u8 = 0,
+    /// Line number of `bytes[pos]` and the index the next record gets —
+    /// `LineSlice.line_number` / `record_index`. A caller resuming in the
+    /// middle of an input sets them (`StreamReader` does, chunk to chunk).
+    line: u64 = 1,
+    record: u64 = 0,
+
+    /// `.end_record` mode's options for `initOpts`.
+    pub const Options = struct {
+        quote: u8 = '"',
+        /// As `SplitOptions.escape`. Here it only decides whether a quote is
+        /// escaped, i.e. what `unbalanced_quote` says: a `\n` still ends the
+        /// record.
+        escape: u8 = 0,
+        /// As `SpanConfig.comment`: a record starting with this byte is skipped.
+        comment: u8 = 0,
+    };
 
     pub fn init(bytes: []const u8, quote: u8, base_offset: u64) LineIterator {
         return .{ .bytes = bytes, .quote = quote, .base_offset = base_offset, .pos = 0 };
+    }
+
+    pub fn initOpts(bytes: []const u8, base_offset: u64, opts: Options) LineIterator {
+        return .{
+            .bytes = bytes,
+            .quote = opts.quote,
+            .base_offset = base_offset,
+            .pos = 0,
+            .escape = if (opts.escape == opts.quote) 0 else opts.escape,
+            .comment = opts.comment,
+        };
     }
 
     pub fn initSpan(bytes: []const u8, quote: u8, base_offset: u64, cfg: SpanConfig) LineIterator {
@@ -534,33 +837,37 @@ pub const LineIterator = struct {
         // non-empty record.
         while (self.pos < self.bytes.len) {
             const rec_start = self.pos;
-            var in_quotes: bool = false;
-            var terminated = false;
-            while (self.pos < self.bytes.len) {
-                const c = self.bytes[self.pos];
-                if (self.quote != 0 and c == self.quote) {
-                    if (in_quotes and self.pos + 1 < self.bytes.len and self.bytes[self.pos + 1] == self.quote) {
-                        self.pos += 2; // escaped quote inside quoted field
-                        continue;
-                    }
-                    in_quotes = !in_quotes;
-                    self.pos += 1;
-                } else if (c == '\n') {
-                    // Newline ALWAYS ends the record (see type doc): even an
-                    // open quote does not let it span lines. `in_quotes` here
-                    // therefore means "stray/unbalanced quote on this line".
-                    terminated = true;
-                    break;
-                } else {
-                    self.pos += 1;
-                }
+            const rec_line = self.line;
+            if (self.comment != 0 and self.bytes[rec_start] == self.comment) {
+                // A comment line: its quotes mean nothing; skip to its end.
+                if (std.mem.findScalarPos(u8, self.bytes, rec_start, '\n')) |nl| {
+                    self.pos = nl + 1;
+                    self.line += 1;
+                } else self.pos = self.bytes.len;
+                continue;
             }
-            var rec = self.bytes[rec_start..self.pos];
-            const unbalanced = in_quotes; // open quote at '\n' or EOF
-            if (terminated) self.pos += 1; // consume the newline
+            // Newline ALWAYS ends the record (see type doc): even an open
+            // quote does not let it span lines.
+            const nl = std.mem.findScalarPos(u8, self.bytes, rec_start, '\n');
+            const end = nl orelse self.bytes.len;
+            var rec = self.bytes[rec_start..end];
+            // Open quote at '\n' or EOF = a stray/unbalanced quote on this line.
+            const unbalanced = quoteOpenAtEnd(rec, self.quote, self.escape);
+            self.pos = end;
+            if (nl != null) {
+                self.pos += 1; // consume the newline
+                self.line += 1;
+            }
             if (rec.len > 0 and rec[rec.len - 1] == '\r') rec = rec[0 .. rec.len - 1];
             if (rec.len == 0) continue; // skip empty record, try next
-            return .{ .bytes = rec, .byte_offset = self.base_offset + rec_start, .unbalanced_quote = unbalanced };
+            defer self.record += 1;
+            return .{
+                .bytes = rec,
+                .byte_offset = self.base_offset + rec_start,
+                .unbalanced_quote = unbalanced,
+                .line_number = rec_line,
+                .record_index = self.record,
+            };
         }
         return null;
     }
@@ -569,16 +876,23 @@ pub const LineIterator = struct {
         const scanner = &self.span.?;
         while (self.pos < self.bytes.len) {
             const rec_start = self.pos;
+            const rec_line = self.line;
             // `at_eof` is true, so the scan always yields a record.
             const r = scanner.scan(self.bytes, rec_start, true).record;
             self.pos = r.next;
+            if (r.spanned) self.line += std.mem.countScalar(u8, self.bytes[rec_start..r.end], '\n');
+            if (r.next > r.end) self.line += 1; // the terminating '\n'
+            if (r.comment) continue;
             const rec = trimCr(self.bytes[rec_start..r.end]);
             if (rec.len == 0) continue;
+            defer self.record += 1;
             return .{
                 .bytes = rec,
                 .byte_offset = self.base_offset + rec_start,
                 .unbalanced_quote = r.unbalanced,
                 .spanned = r.spanned,
+                .line_number = rec_line,
+                .record_index = self.record,
             };
         }
         return null;
@@ -597,8 +911,6 @@ pub fn stripBom(bytes: []const u8) []const u8 {
     return bytes;
 }
 
-/// Returns a copy of `s` with every doubled quote char replaced by a single one.
-/// The returned slice is allocated with `alloc`.
 /// Does `f` point into `line`? A field `splitFieldsOpts` did not unescape is a
 /// sub-slice of `line` by construction; an unescaped copy is a separate
 /// allocation and therefore cannot be. This is what lets the error path tell
@@ -609,20 +921,26 @@ fn borrowsFrom(f: []const u8, line: []const u8) bool {
     return p >= start and p < start + line.len;
 }
 
-fn unescapeQuotes(s: []const u8, quote: u8, alloc: std.mem.Allocator) ![]u8 {
+/// The content of a quoted field with its escapes resolved, in the order
+/// `scanField` reads them: the escape byte first, then a doubled quote.
+fn unescapeField(s: []const u8, quote: u8, opts: SplitOptions, alloc: std.mem.Allocator) ![]u8 {
     var out = std.array_list.Managed(u8).init(alloc);
     // `toOwnedSlice` can allocate too, so a failure anywhere after the
     // reserve leaked the whole list — the same missing-errdefer shape as its
     // caller (W2 re-audit 2026-09-02, `csvstream` F7).
     errdefer out.deinit();
     try out.ensureTotalCapacity(s.len);
+    const escape = if (opts.escape == quote) 0 else opts.escape;
     var i: usize = 0;
     while (i < s.len) {
-        if (s[i] == quote and i + 1 < s.len and s[i + 1] == quote) {
-            try out.append(quote);
+        if (escape != 0 and s[i] == escape and i + 1 < s.len) {
+            out.appendAssumeCapacity(s[i + 1]);
+            i += 2;
+        } else if (opts.double_quote and s[i] == quote and i + 1 < s.len and s[i + 1] == quote) {
+            out.appendAssumeCapacity(quote);
             i += 2;
         } else {
-            try out.append(s[i]);
+            out.appendAssumeCapacity(s[i]);
             i += 1;
         }
     }
@@ -1042,6 +1360,19 @@ fn fuzzSplitFields(_: void, smith: *std.testing.Smith) !void {
     try fz.splitHarness(fz.ScriptSource, &src, t.allocator);
 }
 
+test "fuzz: dialect options never panic, and strict only refuses" {
+    // See the sibling harness above for why this is spelled out rather than
+    // through the `t` alias.
+    try std.testing.fuzz({}, fuzzDialect, .{});
+}
+
+fn fuzzDialect(_: void, smith: *std.testing.Smith) !void {
+    var buf: [320]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.dialectHarness(fz.ScriptSource, &src, t.allocator);
+}
+
 test "corpus: every field seed reaches splitFields, and the fields split are pinned" {
     // Fields split is the second number: `splitFields("")` returns an empty
     // slice without erroring, so an "it did not error" guard reads 100% on a
@@ -1304,7 +1635,7 @@ test "the overflow refusal frees the fields it allocated, however many there wer
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     try std.testing.expectEqual(failing.allocations, failing.deallocations);
     // And the test is not vacuous: every one of the 100 filled slots was a
-    // copy, so the cleanup had at least that many to find. (`unescapeQuotes`
+    // copy, so the cleanup had at least that many to find. (`unescapeField`
     // allocates more than once per field; the count is not pinned exactly,
     // because that is its business and not this invariant's.)
     try std.testing.expect(failing.allocations >= 100);

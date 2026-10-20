@@ -178,6 +178,37 @@ var sr = try csv.StreamReader.init(io, gpa, file, .{
   it, so offsets and records are identical for every chunk size (tested from
   1 byte up), and memory stays at `capacityBound()`.
 
+### Dialect options (all opt-in; the defaults are the reading above)
+
+```zig
+var sr = try csv.StreamReader.init(io, gpa, file, .{
+    .escape = '\\', .double_quote = false, // `"a\"b"` dialects (rust-csv escape, Python escapechar)
+    .trim = .leading,                       // Go TrimLeadingSpace / Python skipinitialspace; `.all` also trailing
+    .comment = '#',                         // skip lines starting with '#' (Go Comment)
+    .strict = true,                         // BareQuote / ExtraneousQuote / UnterminatedQuote instead of lazy
+    .fields_per_record = .first_record,     // error.FieldCountMismatch on a ragged row (Go FieldsPerRecord)
+});
+var header = (try sr.readHeader(&buf, gpa)).?;   // optional header row
+while (sr.nextFields(&buf, arena) catch |e| {
+    // `sr.last.line_number` / `.record_index` / `.byte_offset` name the record.
+    return e;
+}) |row| { _ = header.get(row, "id"); }
+```
+
+- In memory the same options are `SplitOptions` (escape, `double_quote`,
+  trim, `strict` with `diag` for the byte column), `SpanConfig` (the same plus
+  `comment`, so the record scan closes a quote exactly where the split does)
+  and `LineIterator.initOpts` for `.end_record` mode.
+- The escape byte acts only inside quotes (rust-csv); `.trim = .all` keeps
+  blanks inside quotes (rust-csv trims them too — quoting is how a CSV says a
+  blank is data). Trimming never removes a tab that is the delimiter.
+- Every `LineSlice` carries `line_number` (1-based, every physical line
+  counted) and `record_index` (0-based, returned records only).
+- Writer: `WriteOptions.quote_style` (`.necessary` default, `.always`,
+  `.never`) and `.escape` (prefix a quote or escape byte instead of doubling).
+- Anchors: `src/oracle_dialect_test.zig` replays Go `encoding/csv` and Python
+  `csv` answers under the matching options (`tools/oracle.py --dialect`).
+
 ## Tests
 
 `zig build test-csvstream` (headless; green in Debug and
