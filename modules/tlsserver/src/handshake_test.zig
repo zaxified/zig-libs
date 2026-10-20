@@ -120,6 +120,8 @@ const Outcome = struct {
     group: u16,
     alpn: ?[]const u8,
     resumed: bool,
+    retried: bool,
+    age_skew_s: ?i64,
     echoed: []u8,
     /// `Server.peerCertificate` (owned, like `echoed`).
     peer: ?[]u8 = null,
@@ -143,6 +145,8 @@ const ClientOffer = struct {
     client_auth_select: ?ZlClient.ClientAuthSelect = null,
     request_ocsp: bool = true,
     request_scts: bool = true,
+    /// The client's wall clock, ms past 2030-03-17 (`tlsclient` only).
+    clock_ms: i64 = 0,
 };
 
 const ServerSide = struct {
@@ -183,7 +187,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     prng.random().bytes(&entropy);
     var read_buf: [Client.min_buffer_len]u8 = undefined;
     var write_buf: [Client.min_buffer_len]u8 = undefined;
-    const now: std.Io.Timestamp = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s); // 2030
+    const now: std.Io.Timestamp = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s + @as(i96, offer.clock_ms) * std.time.ns_per_ms); // 2030
     var client = (if (C == ZlClient) ZlClient.init(&pipe.reader, &pipe.client_out, .{
         .host = .{ .explicit = "localhost" },
         .ca = .self_signed,
@@ -239,6 +243,8 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .group = server.negotiatedGroup().?,
         .alpn = server.alpnProtocol(),
         .resumed = server.isResumed(),
+        .retried = server.usedHelloRetryRequest(),
+        .age_skew_s = server.ticketAgeSkew(),
         .echoed = try gpa.dupe(u8, got[0..n]),
         .peer = if (server.peerCertificate()) |p| try gpa.dupe(u8, p) else null,
     };
@@ -402,6 +408,7 @@ test "tlsclient ↔ Server: HelloRetryRequest for a group the client has no shar
             const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .groups = &.{g} }, .{ .info = &info });
             defer testing.allocator.free(o.echoed);
             try testing.expect(info.hello_retry_request);
+            try testing.expect(o.retried);
             try testing.expectEqual(g, o.group);
             try testing.expectEqual(g, @backingInt(info.negotiated_group.?));
             try testing.expectEqual(suite, o.suite);
@@ -563,6 +570,35 @@ test "tlsclient ↔ Server: a ticket for another suite, a retired key or past it
         defer testing.allocator.free(o.echoed);
         try testing.expectEqual(case == .at_lifetime, o.resumed);
         try testing.expectEqualStrings("hello there", o.echoed);
+    }
+}
+
+test "tlsclient ↔ Server: ticketAgeSkew is the client's age less the server's, in seconds" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    // How far each clock moves between the two handshakes; each age is
+    // truncated to seconds before the difference.
+    const cases = [_]struct { client_ms: i64, server_ms: i64, skew: i64 }{
+        .{ .client_ms = 15_800, .server_ms = 10_900, .skew = 5 },
+        .{ .client_ms = 0, .server_ms = 21_700, .skew = -21 },
+    };
+    for (cases) |c| {
+        var tf: TicketFixture = undefined;
+        tf.init();
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const srv: ServerSide = .{ .tickets = &tf.tickets };
+        const first = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache });
+        testing.allocator.free(first.echoed);
+        try testing.expectEqual(@as(?i64, null), first.age_skew_s);
+        tf.now_ms += c.server_ms;
+        const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache, .clock_ms = c.client_ms });
+        defer testing.allocator.free(o.echoed);
+        try testing.expect(o.resumed);
+        try testing.expectEqual(@as(?i64, c.skew), o.age_skew_s);
     }
 }
 

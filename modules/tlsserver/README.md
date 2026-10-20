@@ -10,8 +10,10 @@ blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), 
 both ways, session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`), and client
 certificates (`Config.client_auth`: a `ClientCertVerifier`, `X509Verifier` over `x509`;
 `Server.peerCertificate`), and an OCSP staple and SCT list on the leaf when the client asks
-(`CertifiedKey.ocsp_response` / `sct_list`, checked by `CertifiedKey.check`). Next: the rustls
-parity gate (`SPEC.md`, *Backlog*).
+(`CertifiedKey.ocsp_response` / `sct_list`, checked by `CertifiedKey.check`). The rustls parity
+gate runs with BoGo: 247 of the 436 TLS 1.3 server tests rustls passes pass here, 140 are
+disabled with a reason, 49 are gaps (0-RTT, certificate compression, P-521 / ML-DSA keys,
+ML-KEM-1024; `SPEC.md`, *Backlog*).
 
 - **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
   server; qap runs a fork of a third-party one, which this module is meant to replace.
@@ -65,7 +67,7 @@ zeroed; the engine answers it with the matching alert.
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 286 pass); handshakes against Zig std's
+(`-- --bogo`, 339 pass, with the rustls parity report); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
 the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server`, `-keyupdate` and

@@ -10,6 +10,9 @@
     "Basic-Server-ECDHE-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "Basic-Server-Ed25519-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Basic-Server-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Basic-Server-TLS-*": "TLS 1.2 (MaxVersion: VersionTLS12, though the name says no version): out of scope",
+    "Basic-Server-NoTickets-TLS-*": "TLS 1.2 (MaxVersion: VersionTLS12, though the name says no version): out of scope",
+    "Basic-Server-EarlyCallback-TLS-*": "TLS 1.2 (MaxVersion: VersionTLS12, though the name says no version): out of scope",
     "OCSPStapling-Server-TLS1-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "OCSPStapling-Server-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "OCSPStapling-Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -17,6 +20,15 @@
     "CertificateVerification*-Server-TLS11-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "CertificateVerification*-Server-TLS12-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "CertificateVerificationFail-Server-TLS13-TLS-Sync*": "BoringSSL's legacy verify callback answers handshake_failure; tlsserver sends the verifier's alert (certificate_unknown), which the -CustomCallback variant of this test expects",
+    "ExtendedMasterSecret-YesToYes-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "FilterExtraAlgorithms": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ExtendedMasterSecret-TLS1-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "ExtendedMasterSecret-TLS11-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "ExtendedMasterSecret-TLS12-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TLS1-NoTicket-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TLS11-NoTicket-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "TLS12-NoTicket-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MaxSendFragment-TLS12-TooLarge": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "ClientAuth-Enforced": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "ClientAuth-NoCertificate-Server-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "ClientAuth-Server-TLS-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -254,6 +266,9 @@
     ],
     ":KEY_USAGE_BIT_INCORRECT:": [
       ":UnsupportedCertificate:"
+    ],
+    ":UNEXPECTED_EXTENSION:": [
+      ":UnsupportedExtension:"
     ],
     ":UNSUPPORTED_ALGORITHM:": [
       ":UnsupportedCertificate:"

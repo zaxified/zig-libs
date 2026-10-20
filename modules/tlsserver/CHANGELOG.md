@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — rustls parity gate (M2 step 6). New `tools/bogo/rustls_parity.py`: the BoGo
+  server tests at TLS 1.3 that rustls 0.23.43 (aws-lc-rs) passes, reconstructed from its
+  `bogo/config.json.in` and its shim's option table, each test's flags captured from the pinned
+  runner → `tools/bogo/rustls-owed.txt` (436); `interop-tlsserver -- --bogo` reports the gate
+  (`GAP` lines): 247 pass, 140 disabled with a reason (121 TLS 1.2, 19 divergences), 49 gaps
+  (0-RTT, certificate compression, P-521 / ML-DSA keys, ML-KEM-1024). New API:
+  `Config.server_order` (suite and group in the server's order), `Config.max_fragment_len`
+  (records sent split at it, clamped to [512, 2^14]; `outbound.Outbound.max_fragment`,
+  `outbound.min_fragment`; `minOutputLen` counts the extra records),
+  `CertifiedKey.signature_schemes` (restrict and order the CertificateVerify schemes),
+  `Server.usedHelloRetryRequest`, `Server.ticketAgeSkew`. BoGo 339 pass / 0 fail (was 286;
+  shim `-expect-hrr`/`-expect-no-hrr`, `-signing-prefs`, `-server-preference`,
+  `-max-send-fragment`, `-no-ticket`, `-resumption-delay`, `-expect-ticket-age-skew`, ALPN
+  decline / reject / `-expect-advertised-alpn`, `-expect-peer-verify-pref`,
+  `-expect-early-data-reason disabled`); `Basic-Server-*` (TLS 1.2 without a version in the name)
+  and the TLS ≤ 1.2 tests the new flags unhid disabled precisely. 14/14 planted mutants caught (3
+  survived the first tests: short messages and a roomy buffer hid the fragment size; a 64 KiB
+  chain and a full-slot commit added). Fuzz `tlsserver-server`, `-keyupdate`, `-hello` 60k each,
+  clean. Independent review (Sonnet): no HIGH or MEDIUM; LOW fixed (`server_order` could choose
+  an unknown suite enabled in the configuration → `unreachable`).
 - **2026-10-20** — OCSP and SCT stapling (M2 step 5). New `CertifiedKey.sct_list` (a
   `SignedCertificateTimestampList`, RFC 6962 §3.3) sent on the leaf when the ClientHello carries
   `signed_certificate_timestamp` (`hello.ClientHello.sct_requested`; a non-empty body is

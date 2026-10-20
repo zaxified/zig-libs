@@ -38,6 +38,20 @@
 //!   `X509Verifier` over that file's certificates (clientAuth, the wall
 //!   clock), as BoringSSL's X.509 verification with `SSL_VERIFY_PEER`.
 //!
+//! - the ClientHello is seen through `Config.certificate.select` (BoringSSL's
+//!   early callback, so `-use-early-callback` changes nothing): it checks
+//!   `-expect-advertised-alpn` (the client's protocol list on the wire) and
+//!   `-expect-peer-verify-pref` (its `signature_algorithms`, in order).
+//!
+//! - `-resumption-delay S` moves the ticket clock S seconds forward before
+//!   each resumption (BoringSSL's shim clock); `-expect-ticket-age-skew`
+//!   compares `Server.ticketAgeSkew`.
+//!
+//! - `-decline-alpn` is a server without protocols (no ALPN, whatever the
+//!   client offers); `-reject-alpn` one whose protocols no client offers
+//!   (`no_application_protocol` when the client sends ALPN) — what
+//!   BoringSSL's callback returning NOACK / ALERT_FATAL does.
+//!
 //! Only server tests at TLS 1.3 run: a client test, a version range without
 //! TLS 1.3, or any feature the server lacks is exit 89.
 
@@ -87,6 +101,16 @@ const Options = struct {
     /// The credential's OCSP staple and SCT list (base64 on the command line).
     ocsp_response: ?[]const u8 = null,
     sct_list: ?[]const u8 = null,
+    expect_hrr: ?bool = null,
+    signing_prefs: std.ArrayList(u16) = .empty,
+    server_preference: bool = false,
+    max_send_fragment: ?u16 = null,
+    no_ticket: bool = false,
+    resumption_delay_s: i64 = 0,
+    expect_ticket_age_skew: ?i64 = null,
+    expect_advertised_alpn: ?[]const u8 = null,
+    alpn_mode: enum { select, decline, reject } = .select,
+    expect_peer_verify_prefs: std.ArrayList(u16) = .empty,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -98,10 +122,16 @@ const Unimplemented = error{Unimplemented};
 /// `-expect-no-session-id` (no stateful session cache, so never an ID);
 /// `-expect-verify-result` (OpenSSL's verify result: a handshake that
 /// completed verified, or had nothing to verify); `-use-custom-verify-callback`
-/// (the shim's verifier is always a callback).
+/// (the shim's verifier is always a callback); `-use-early-callback` (the
+/// ClientHello always goes through `Config.certificate.select`);
+/// `-expect-extended-master-secret` (BoringSSL `SSL_get_extms_support`
+/// reports TLS 1.3 as having it: its key schedule hashes the transcript);
+/// `-enable-ocsp-stapling` (a client's request for a staple; a server
+/// staples what its `CertifiedKey` holds, and refuses an extension on the
+/// client's Certificate whatever it enabled).
 const ignored_flags = [_][]const u8{
-    "-no-tls1",              "-no-tls11",                   "-no-tls12", "-no-ssl3", "-async", "-implicit-handshake", "-expect-no-session-id",
-    "-expect-verify-result", "-use-custom-verify-callback",
+    "-no-tls1",              "-no-tls11",                   "-no-tls12",           "-no-ssl3",                       "-async",                "-implicit-handshake", "-expect-no-session-id",
+    "-expect-verify-result", "-use-custom-verify-callback", "-use-early-callback", "-expect-extended-master-secret", "-enable-ocsp-stapling",
 };
 
 /// The flag that made this run exit 89, for `run` to log.
@@ -235,6 +265,41 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.sct_list = try base64(gpa, try value(it, flag));
         } else if (std.mem.eql(u8, flag, "-expect-peer-cert-file")) {
             o.expect_peer_cert_file = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-expect-hrr")) {
+            o.expect_hrr = true;
+        } else if (std.mem.eql(u8, flag, "-expect-no-hrr")) {
+            o.expect_hrr = false;
+        } else if (std.mem.eql(u8, flag, "-signing-prefs")) {
+            try o.signing_prefs.append(gpa, try std.fmt.parseInt(u16, try value(it, flag), 10));
+        } else if (std.mem.eql(u8, flag, "-server-preference")) {
+            o.server_preference = true;
+        } else if (std.mem.eql(u8, flag, "-max-send-fragment")) {
+            const v = try std.fmt.parseInt(u16, try value(it, flag), 10);
+            // Below BoringSSL's floor the module clamps: not what was asked.
+            if (v < tlsserver.outbound.min_fragment) return unimplemented(flag);
+            o.max_send_fragment = v;
+        } else if (std.mem.eql(u8, flag, "-read-size")) {
+            // How much the shim reads at a time: `Connection` reads what the
+            // socket has, which covers every size.
+            _ = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-no-ticket")) {
+            o.no_ticket = true;
+        } else if (std.mem.eql(u8, flag, "-resumption-delay")) {
+            o.resumption_delay_s = try std.fmt.parseInt(i64, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-expect-ticket-age-skew")) {
+            o.expect_ticket_age_skew = try std.fmt.parseInt(i64, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-expect-early-data-reason")) {
+            // Early data is never accepted: `disabled` is the only reason
+            // there is (the server enables none).
+            if (!std.mem.eql(u8, try value(it, flag), "disabled")) return unimplemented(flag);
+        } else if (std.mem.eql(u8, flag, "-expect-advertised-alpn")) {
+            o.expect_advertised_alpn = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-decline-alpn")) {
+            o.alpn_mode = .decline;
+        } else if (std.mem.eql(u8, flag, "-reject-alpn")) {
+            o.alpn_mode = .reject;
+        } else if (std.mem.eql(u8, flag, "-expect-peer-verify-pref")) {
+            try o.expect_peer_verify_prefs.append(gpa, try std.fmt.parseInt(u16, try value(it, flag), 10));
         } else if (std.mem.eql(u8, flag, "-use-client-ca-list")) {
             const v = try value(it, flag);
             if (!std.mem.eql(u8, v, "<NULL>") and !std.mem.eql(u8, v, "<EMPTY>")) {
@@ -310,11 +375,49 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 /// The alert the client sent, if a failure came from one.
 var peer_alert: ?tlsserver.alert.Description = null;
 
-/// The ticket clock: the wall clock.
-fn wallMs(ctx: ?*anyopaque) i64 {
-    const io: *const std.Io = @ptrCast(@alignCast(ctx.?));
-    return std.Io.Clock.real.now(io.*).toMilliseconds();
-}
+/// The shim's clock: the wall clock, moved forward by `-resumption-delay`.
+const ShimClock = struct {
+    io: std.Io,
+    offset_ms: i64 = 0,
+
+    fn clock(self: *ShimClock) server_mod.Clock {
+        return .{ .ctx = self, .now_ms = nowMs };
+    }
+
+    fn nowMs(ctx: ?*anyopaque) i64 {
+        const self: *ShimClock = @ptrCast(@alignCast(ctx.?));
+        return std.Io.Clock.real.now(self.io).toMilliseconds() + self.offset_ms;
+    }
+};
+
+/// The ClientHello as BoringSSL's early callback sees it: what the
+/// `-expect-advertised-alpn` and `-expect-peer-verify-pref` flags check,
+/// reported after the handshake (the callback can only refuse).
+const HelloCheck = struct {
+    key: *const tlsserver.CertifiedKey,
+    o: *const Options,
+    failure: ?anyerror = null,
+
+    fn select(ctx: ?*anyopaque, _: ?[]const u8, ch: *const tlsserver.hello.ClientHello) ?*const tlsserver.CertifiedKey {
+        const self: *HelloCheck = @ptrCast(@alignCast(ctx.?));
+        if (self.o.expect_advertised_alpn) |want| {
+            if (!std.mem.eql(u8, ch.alpn_raw orelse "", want)) self.failure = error.AdvertisedAlpnMismatch;
+        }
+        if (self.o.expect_peer_verify_prefs.items.len != 0) {
+            var it = ch.signatureAlgorithms() orelse return self.refuse(error.PeerVerifyPrefsMismatch);
+            for (self.o.expect_peer_verify_prefs.items) |want| {
+                if (it.next() != want) self.failure = error.PeerVerifyPrefsMismatch;
+            }
+            if (it.next() != null) self.failure = error.PeerVerifyPrefsMismatch;
+        }
+        return self.key;
+    }
+
+    fn refuse(self: *HelloCheck, err: anyerror) ?*const tlsserver.CertifiedKey {
+        self.failure = err;
+        return self.key;
+    }
+};
 
 /// BoringSSL's shim verifier: any chain, unless `-verify-fail`.
 const ShimVerifier = struct {
@@ -369,21 +472,23 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume:
     var ring: tlsresume.stek.DefaultRing = .init();
     var stek_key: [32]u8 = undefined;
     csprng.random().bytes(&stek_key);
-    var io_ctx = io;
-    ring.rotate(1, &stek_key, @divFloor(wallMs(&io_ctx), 1000));
+    var clock: ShimClock = .{ .io = io };
+    ring.rotate(1, &stek_key, @divFloor(ShimClock.nowMs(&clock), 1000));
     const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
-    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .ctx = &io_ctx, .now_ms = wallMs } };
+    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = clock.clock() };
 
     for (0..initial.resume_count + 1) |i| {
         const o = if (i == 0) initial else on_resume;
-        const resumed = try connection(gpa, io, &ck, &tickets, csprng.random(), o, &io_ctx);
+        // BoringSSL's shim advances its clock after each connection.
+        if (i != 0) clock.offset_ms += initial.resumption_delay_s * 1000;
+        const resumed = try connection(gpa, io, &ck, if (o.no_ticket) null else &tickets, csprng.random(), o, &clock);
         const want = i != 0 and !o.expect_session_miss;
         if (resumed != want) return if (resumed) error.UnexpectedSessionReuse else error.SessionNotReused;
     }
 }
 
 /// One connection; whether it resumed a session.
-fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: *const server_mod.Tickets, random: std.Random, o: *const Options, io_ctx: *std.Io) !bool {
+fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: ?*const server_mod.Tickets, random: std.Random, o: *const Options, clock: *ShimClock) !bool {
     const want_peer: ?[]const u8 = if (o.expect_peer_cert_file) |f| try singlePemCertificate(gpa, io, f) else null;
     const x509_verifier: tlsserver.X509Verifier = .{
         .gpa = gpa,
@@ -399,16 +504,24 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .mandatory = o.client_auth == .mandatory,
         .schemes = if (o.verify_prefs.items.len != 0) o.verify_prefs.items else &server_mod.default_client_auth_schemes,
         .authorities = o.ca_names.items,
-        .clock = .{ .ctx = io_ctx, .now_ms = wallMs },
+        .clock = clock.clock(),
     };
     var leaf = ck.*;
     leaf.ocsp_response = o.ocsp_response;
     leaf.sct_list = o.sct_list;
+    if (o.signing_prefs.items.len != 0) leaf.signature_schemes = o.signing_prefs.items;
     try leaf.check();
+    var hello_check: HelloCheck = .{ .key = &leaf, .o = o };
     const cfg: server_mod.Config = .{
-        .certificate = .{ .fixed = &leaf },
+        .certificate = .{ .select = .{ .ctx = &hello_check, .select = HelloCheck.select } },
         .groups = if (o.groups.items.len != 0) o.groups.items else &server_mod.default_groups,
-        .alpn_protocols = o.alpn.items,
+        .server_order = o.server_preference,
+        .max_fragment_len = o.max_send_fragment orelse tlsserver.record.max_plaintext_len,
+        .alpn_protocols = switch (o.alpn_mode) {
+            .select => o.alpn.items,
+            .decline => &.{},
+            .reject => &.{"tlsserver-bogo-shim-rejects-every-protocol"},
+        },
         .random = random,
         .tickets = tickets,
         .client_auth = if (o.client_auth != .off) &client_auth else null,
@@ -433,7 +546,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
-    return converse(&c, o, want_peer) catch |err| {
+    return converse(&c, o, want_peer, &hello_check) catch |err| {
         // A lingering close: the alert is out; closing with the runner's
         // unread records in the receive buffer would send a reset, which
         // can beat the alert to the runner (its next write then fails with
@@ -454,8 +567,14 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     };
 }
 
-fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8) !bool {
+fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8, hello_check: *const HelloCheck) !bool {
     try c.handshake();
+    if (hello_check.failure) |err| return err;
+    if (o.expect_hrr) |want| if (c.server.usedHelloRetryRequest() != want) return error.HelloRetryRequestMismatch;
+    // BoringSSL checks the skew on a resumption only, and only a non-zero one.
+    if (o.expect_ticket_age_skew) |want| if (want != 0) if (c.server.ticketAgeSkew()) |got| {
+        if (got != want) return error.TicketAgeSkewMismatch;
+    };
     if (o.expect_server_name) |want| {
         const got = c.server.serverName() orelse return error.ServerNameMissing;
         if (!std.mem.eql(u8, got, want)) return error.ServerNameMismatch;

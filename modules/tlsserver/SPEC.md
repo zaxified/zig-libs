@@ -32,10 +32,16 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 286 tests with none failing (`tools/bogo/passing.txt`; everything
+BoringSSL's BoGo suite passes 339 tests with none failing (`tools/bogo/passing.txt`; everything
 else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
 both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
-OCSP / SCT stapling (step 5) work; the rustls parity gate is next (*Backlog*). SCT stapling
+OCSP / SCT stapling (step 5) work. **rustls parity (step 6):** of the 436 BoGo server tests
+at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here, 140 are
+disabled with a reason (121 run at TLS 1.2 under a name without a version; 19 deliberate
+divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
+runner cannot map, extensions this server ignores), and 49 are gaps: 0-RTT (27),
+certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — see
+*Backlog*. SCT stapling
 (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
 
 ## What this module is, and what it is not
@@ -103,8 +109,11 @@ alerts: compression must include null (`illegal_parameter`); an invalid SNI is
 `illegal_parameter`; no `signature_algorithms` is `handshake_failure`; no TLS 1.3 in
 `supported_versions` is `protocol_version`; the certificate is fixed or chosen by
 `CertificateSelector` from the SNI (`access_denied` when none); the signature scheme is the key's
-first candidate the client offers; the suite is the client's first enabled one; the group is the
-client's first `supported_groups` entry the server enables — every one of these without a match
+first candidate the client offers (or, with `CertifiedKey.signature_schemes`, the first of
+those the key can make and the client offers); the suite is the client's first enabled one; the
+group is the client's first `supported_groups` entry the server enables (with
+`Config.server_order`, suite and group go by the server's lists instead, BoringSSL
+`SSL_OP_CIPHER_SERVER_PREFERENCE`) — every one of these without a match
 is `handshake_failure`; compression other than exactly null is `illegal_parameter`; no
 `key_share` is `handshake_failure`, two shares of one group or a share that does not exchange
 (`kex`: wrong length, low order) `illegal_parameter`, no share for the chosen group
@@ -333,6 +342,9 @@ The receive side's refusals are the table under *Wire format*. Record protection
 - Sequence number 2^64 − 1: both directions refuse (`SequenceExhausted`); the engine must
   KeyUpdate first (§5.3). When to KeyUpdate earlier, at the AEAD's usage limit (§5.5), is the
   engine's policy: `Server` rekeys at `max_records_per_key` (2^23), qap's bound.
+- Records sent carry at most `Config.max_fragment_len` octets of content (2^14 by default,
+  clamped to [512, 2^14]: rustls `max_fragment_size`, BoringSSL `SSL_set_max_send_fragment`);
+  `minOutputLen` counts the extra records a smaller size makes. Records received may be 2^14.
 - The send side keeps `alert_reserve` (24 octets) of the output buffer for one alert, so a fatal
   alert or close_notify can be queued however full the application left it.
 - A client certificate chain: at most `clientauth.max_chain_len` (16) certificates, a leaf of at
@@ -444,7 +456,20 @@ The receive side's refusals are the table under *Wire format*. Record protection
   full: it spawns only the shim, listens on loopback only, writes only its temp test keys
   (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
   refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20 (M1): **130 pass, 0 fail**; with client certificates (M2 step 4: the
+  Result 2026-10-20 (M1): **130 pass, 0 fail**; with the rustls parity gate (M2 step 6) **339
+  pass, 0 fail**: the shim gained `-expect-hrr`/`-expect-no-hrr` (`Server.usedHelloRetryRequest`),
+  `-signing-prefs` (`CertifiedKey.signature_schemes`), `-server-preference`
+  (`Config.server_order`), `-max-send-fragment` (`Config.max_fragment_len`), `-no-ticket`,
+  `-resumption-delay` + `-expect-ticket-age-skew` (`Server.ticketAgeSkew`), ALPN decline /
+  reject / `-expect-advertised-alpn` and `-expect-peer-verify-pref` (checked in the
+  `CertificateSelector`, BoringSSL's early callback), `-expect-early-data-reason disabled`.
+  The gate itself: `tools/bogo/rustls_parity.py` reconstructs the tests rustls passes from its
+  `bogo/config.json.in` (preprocessed as the aws-lc-rs build) and its shim's option table
+  (`bogo/src/main.rs`: a flag it answers 89 or does not know is not owed), with each test's
+  flags captured by running the pinned runner once per test against a stub shim; `--bogo`
+  prints `GAP` for each owed test that does not pass and is not disabled. Three tests named
+  without a version (`Basic-Server-*`) turned out to be TLS 1.2 (`MaxVersion: VersionTLS12`) and
+  are disabled as such; with client certificates (M2 step 4: the
   shim's `-require-any-client-certificate`, `-verify-peer`, `-verify-fail`, `-verify-prefs`,
   `-trust-cert` → `X509Verifier`, `-use-client-ca-list`, `-expect-peer-signature-algorithm`,
   `-expect-peer-cert-file` for a single certificate) **274 pass, 0 fail**; with stapling (step 5:
@@ -642,9 +667,15 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 - **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
   Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
-- **BoGo next:** the rustls parity
-  gate (our pass set ⊇ rustls's for TLS 1.3 server tests) needs rustls's `bogo/config.json`
-  at a pinned tag next to ours.
+- **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
+  `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
+  certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:
+  `Server-Sign*-ECDSA_P521_SHA512`, `Server-Sign*-ML-DSA-*`; zig-libs has `p521` and an ML-DSA
+  module would be needed in `tls13.certverify`) and standalone ML-KEM-1024 as a group (4,
+  `CurveTest-*-MLKEM1024`, `tls13.kex`) are not scheduled yet. `-expect-session-id`
+  (BoringSSL's stateful session cache) waits for the stateful cache (M4). The owed list is
+  re-derived with `tools/bogo/rustls_parity.py` when the rustls reference moves (it takes
+  about 4 minutes).
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).

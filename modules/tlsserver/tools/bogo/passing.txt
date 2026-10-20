@@ -1,6 +1,10 @@
 # BoGo tests tlsserver passes (tools/interop.zig --bogo --bogo-update rewrites this;
 # a listed test that stops passing fails --bogo).
+ALPNServer-Async-TLS-TLS13
+ALPNServer-Decline-TLS-TLS13
 ALPNServer-EmptyProtocolName-TLS-TLS13
+ALPNServer-Reject-TLS-TLS13
+ALPNServer-TLS-TLS13
 Alert
 BadFinished-Server-TLS13
 CertificateVerificationDoesNotFailOnResume-Server-TLS13-CustomCallback-TLS-Async
@@ -93,6 +97,7 @@ DuplicateKeyShares-TLS13
 ECDSACurveMismatch-Sign-TLS13
 ECDSAKeyUsage-Server-TLS13
 EmptySessionID-TLS13
+ExtendedMasterSecret-TLS13-Server
 ExtensionTrailingData-CertificateAuthorities-Server-TLS-TLS13
 ExtensionTrailingData-ServerName-Server-TLS-TLS13
 ExtraCompressionMethods-TLS13
@@ -113,6 +118,8 @@ IgnoreLegacyVersion-TLS13
 KeyUpdate-FromServer
 KeyUpdate-ToServer
 LooseInitialRecordVersion-TLS13
+MaxSendFragment-TLS13
+MaxSendFragment-TLS13-TooLarge
 MinimumVersion-Server-TLS1-TLS13-TLS
 MinimumVersion-Server-TLS11-TLS1-TLS
 MinimumVersion-Server-TLS11-TLS13-TLS
@@ -136,6 +143,7 @@ MinimumVersion-Server2-TLS13-TLS13-TLS
 MissingKeyShare-Server-TLS13
 NoClientCertificate-Server-TLS13
 NoClientCertificateRequested-Server-TLS13
+NoExtendedMasterSecret-TLS13-Server
 NoNullCompression-TLS13
 NoSupportedCurves-TLS13
 NoSupportedVersions
@@ -154,6 +162,7 @@ PartialClientFinishedWithClientHello-NoCCS
 PartialClientFinishedWithSecondClientHello
 PartialClientFinishedWithSecondClientHello-NoCCS
 PartialSecondClientHelloAfterFirst
+PostQuantumEnabledByDefaultForAServer
 RSA-PSS-Large
 RSAKeyUsage-Server-WantSignature-GotEncipherment-TLS13
 RSAKeyUsage-Server-WantSignature-GotSignature-TLS13
@@ -176,6 +185,9 @@ Resume-Server-TLS13-TLS13-TLS
 Resume-Server-UnofferedCipher-TLS13
 SecondClientHelloMissingKeyShare-TLS13
 SecondClientHelloWrongCurve-TLS13
+SendExtensionOnClientCertificate-TLS13
+SendHelloRetryRequest-2-TLS13
+SendHelloRetryRequest-TLS13
 SendNoExtensionsOnIntermediate-TLS13
 Server-FullSessionID-TLS13
 Server-InvalidSignature-ECDSA_P256_SHA256-TLS13
@@ -196,6 +208,24 @@ Server-JDK11-NoWorkaround-7
 Server-JDK11-NoWorkaround-8
 Server-JDK11-NoWorkaround-9
 Server-ShortSessionID-TLS13
+Server-Sign-ECDSA_P256_SHA256-TLS13
+Server-Sign-ECDSA_P384_SHA384-TLS13
+Server-Sign-ECDSA_SHA1-TLS13
+Server-Sign-Ed25519-TLS13
+Server-Sign-Negotiate-ECDSA_P256_SHA256-TLS13
+Server-Sign-Negotiate-ECDSA_P384_SHA384-TLS13
+Server-Sign-Negotiate-Ed25519-TLS13
+Server-Sign-Negotiate-RSA_PSS_SHA256-TLS13
+Server-Sign-Negotiate-RSA_PSS_SHA384-TLS13
+Server-Sign-Negotiate-RSA_PSS_SHA512-TLS13
+Server-Sign-RSA_PKCS1_SHA1-TLS13
+Server-Sign-RSA_PKCS1_SHA256-TLS13
+Server-Sign-RSA_PKCS1_SHA256_LEGACY-TLS13
+Server-Sign-RSA_PKCS1_SHA384-TLS13
+Server-Sign-RSA_PKCS1_SHA512-TLS13
+Server-Sign-RSA_PSS_SHA256-TLS13
+Server-Sign-RSA_PSS_SHA384-TLS13
+Server-Sign-RSA_PSS_SHA512-TLS13
 Server-SignDefault-ECDSA_P256_SHA256-TLS13
 Server-SignDefault-ECDSA_P384_SHA384-TLS13
 Server-SignDefault-ECDSA_SHA1-TLS13
@@ -208,6 +238,7 @@ Server-SignDefault-RSA_PKCS1_SHA512-TLS13
 Server-SignDefault-RSA_PSS_SHA256-TLS13
 Server-SignDefault-RSA_PSS_SHA384-TLS13
 Server-SignDefault-RSA_PSS_SHA512-TLS13
+Server-TLS13-NoSign-RSA_PKCS1_MD5_SHA1
 Server-TLS13-NoVerify-RSA_PKCS1_MD5_SHA1
 Server-TooLongSessionID-TLS13
 Server-Verify-ECDSA_P256_SHA256-TLS13
@@ -232,6 +263,7 @@ Server-VerifyDefault-RSA_PSS_SHA256-TLS13
 Server-VerifyDefault-RSA_PSS_SHA384-TLS13
 Server-VerifyDefault-RSA_PSS_SHA512-TLS13
 ServerAuth-NoFallback-TLS13
+ServerAuth-PeerVerifyPrefs-TLS13
 ServerAuth-SignatureType-TLS13
 ServerNameExtensionServer-TLS-TLS13
 ServerPaddingServer-NoServerSupport
@@ -243,6 +275,7 @@ SkipChangeCipherSpec-Server-TLS13
 SkipClientCertificate-TLS13
 SkipEarlyData-HRR-FatalAlert-TLS13
 SkipEarlyData-HRR-Interleaved-TLS13
+SkipEarlyData-HRR-TLS13
 SkipEarlyData-HRR-TooMuchData-TLS13
 SkipEarlyData-Interleaved-TLS13
 SkipEarlyData-OmitEarlyDataExtension-HelloRetryRequest-TLS13
@@ -250,8 +283,26 @@ SkipEarlyData-OmitEarlyDataExtension-TLS13
 SkipEarlyData-TLS13
 SkipEarlyData-TooMuchData-TLS13
 TLS-ECH-Server-Disabled
+TLS13-1RTT-Server-TLS-Async
+TLS13-1RTT-Server-TLS-Async-ImplicitHandshake
+TLS13-1RTT-Server-TLS-Async-PackHandshake
+TLS13-1RTT-Server-TLS-Async-SplitHandshakeRecords
+TLS13-1RTT-Server-TLS-Sync
+TLS13-1RTT-Server-TLS-Sync-ImplicitHandshake
+TLS13-1RTT-Server-TLS-Sync-PackHandshake
+TLS13-1RTT-Server-TLS-Sync-SplitHandshakeRecords
 TLS13-Empty-Client-CA-List
 TLS13-ExpectNoSessionTicketOnBadKEMode-Server
+TLS13-HelloRetryRequest-Server-TLS-Async
+TLS13-HelloRetryRequest-Server-TLS-Async-ImplicitHandshake
+TLS13-HelloRetryRequest-Server-TLS-Async-PackHandshake
+TLS13-HelloRetryRequest-Server-TLS-Async-SplitHandshakeRecords
+TLS13-HelloRetryRequest-Server-TLS-Sync
+TLS13-HelloRetryRequest-Server-TLS-Sync-ImplicitHandshake
+TLS13-HelloRetryRequest-Server-TLS-Sync-PackHandshake
+TLS13-HelloRetryRequest-Server-TLS-Sync-SplitHandshakeRecords
+TLS13-NoTicket-NoAccept
+TLS13-NoTicket-NoMint
 TLS13-SendBadKEModeSessionTicket-Server
 TLS13-SendNoKEMModesWithPSK-Server
 TLS13-SendUnknownModeSessionTicket-Server
@@ -259,6 +310,8 @@ TLS13-Server-CertReq-CA-List
 TLS13-Server-ClientAuth-ECDSA
 TLS13-Server-ClientAuth-RSA
 TLS13-Server-NoResumptionAcrossNames
+TLS13-TicketAgeSkew-Backward
+TLS13-TicketAgeSkew-Forward
 TooManyChangeCipherSpec-Server-TLS13
 TrailingDataWithFinished-Resume-Server-TLS13
 TrailingDataWithFinished-Server-TLS13

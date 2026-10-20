@@ -16,12 +16,15 @@
 //!   `protocol_version`, checked before anything else;
 //! - **certificate** fixed, or chosen by a callback from the SNI and the
 //!   ClientHello (none chosen: `access_denied`); the signature scheme is
-//!   the key's first candidate the client offers and the key can produce
+//!   the key's first candidate (or `CertifiedKey.signature_schemes` entry)
+//!   the client offers and the key can produce
 //!   (`certverify.canSign`: a 1024-bit RSA key has no `rsa_pss_rsae_sha512`;
 //!   `handshake_failure` if none, or no `signature_algorithms` at all);
-//! - **cipher suite** the client's first that the server enables;
+//! - **cipher suite** the client's first that the server enables
+//!   (`Config.server_order`: the server's first that the client offers);
 //! - **group** the client's first `supported_groups` entry the server
-//!   enables (no `supported_groups` or no `key_share` at all is
+//!   enables (`Config.server_order`: the server's first the client
+//!   supports; no `supported_groups` or no `key_share` at all is
 //!   `missing_extension`, RFC 8446 §9.2); without a share for it the
 //!   server sends a HelloRetryRequest naming it (no cookie, RFC 8446
 //!   §4.1.4);
@@ -123,6 +126,13 @@ pub const CertifiedKey = struct {
     /// length) to send on the leaf when the client asks (§3.3.1). Empty
     /// counts as none.
     sct_list: ?[]const u8 = null,
+    /// The CertificateVerify schemes this key may sign with, most
+    /// preferred first (BoringSSL `SSL_CREDENTIAL_set1_signing_algorithm_prefs`,
+    /// rustls `SigningKey::choose_scheme`); null: every scheme the key can
+    /// produce, in `certverify.candidateSchemes` order. Schemes the key
+    /// cannot produce and the ones TLS 1.3 forbids (RSA PKCS#1 v1.5,
+    /// SHA-1) are skipped.
+    signature_schemes: ?[]const u16 = null,
 
     pub const CheckError = error{
         /// No certificate, or more than `max_chain_len`.
@@ -199,10 +209,22 @@ pub const Config = struct {
         fixed: *const CertifiedKey,
         select: CertificateSelector,
     },
-    /// The suites the server enables (the client's order decides).
+    /// The suites the server enables (the client's order decides, unless
+    /// `server_order`).
     cipher_suites: []const record.CipherSuite = &default_cipher_suites,
-    /// The groups the server enables (the client's order decides).
+    /// The groups the server enables (the client's order decides, unless
+    /// `server_order`).
     groups: []const u16 = &default_groups,
+    /// Choose the cipher suite and the group in the order of
+    /// `cipher_suites` and `groups` instead of the client's (BoringSSL
+    /// `SSL_OP_CIPHER_SERVER_PREFERENCE`, which covers both; rustls
+    /// `ignore_client_order`, suites only). A preferred group the client
+    /// supports without a share costs a HelloRetryRequest.
+    server_order: bool = false,
+    /// The largest record content sent, in [`outbound.min_fragment`, 2^14]
+    /// (rustls `max_fragment_size`, BoringSSL `SSL_set_max_send_fragment`);
+    /// out of range is clamped. Records received may still be 2^14.
+    max_fragment_len: u16 = record.max_plaintext_len,
     /// In the server's order of preference.
     alpn_protocols: []const []const u8 = &.{},
     /// MUST be a cryptographically secure source: it draws the server
@@ -520,16 +542,24 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
         request = 4 + 1 + 2 + 6 + 2 * ca.schemes.len + 6;
         for (ca.authorities) |dn| request += 2 + dn.len;
     }
+    const frag: usize = fragmentLen(cfg);
     var tickets: usize = 0;
     if (cfg.tickets) |tk| {
         const one = 4 + 4 + 4 + 1 + 1 + 2 + max_ticket_len + 2 + 4;
         tickets = tk.count * one;
-        tickets += (tickets / record.max_plaintext_len + 1) * (record.header_len + 1 + record.tag_len);
+        tickets += (tickets / frag + 1) * (record.header_len + 1 + record.tag_len);
     }
-    return @max(firstFlightLen(ck) + request, tickets + outbound.alert_reserve + 64);
+    // The request may add a record when fragments are small.
+    request += (request / frag + 1) * (record.header_len + 1 + record.tag_len);
+    return @max(firstFlightLen(ck, frag) + request, tickets + outbound.alert_reserve + 64);
 }
 
-fn firstFlightLen(ck: *const CertifiedKey) usize {
+/// `Config.max_fragment_len`, clamped.
+fn fragmentLen(cfg: *const Config) u16 {
+    return std.math.clamp(cfg.max_fragment_len, outbound.min_fragment, record.max_plaintext_len);
+}
+
+fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     var chain: usize = 3;
     for (ck.chain) |c| chain += 3 + c.len + 2;
     if (ck.ocspStaple()) |o| chain += 4 + 4 + o.len;
@@ -542,7 +572,9 @@ fn firstFlightLen(ck: *const CertifiedKey) usize {
         6 + // CCS
         (4 + 2 + 4 + 2 + 1 + 255 + 4) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
-    const records = flight / record.max_plaintext_len + 6;
+    // Each message may end a record of its own: one more than the content
+    // needs per message (HRR, SH, CCS ×2, EE, Certificate, CV, Finished).
+    const records = flight / frag + 8;
     return flight + records * (record.header_len + 1 + record.tag_len) + outbound.alert_reserve + 64;
 }
 
@@ -620,6 +652,11 @@ pub const Server = struct {
     tickets_due: u8 = 0,
     /// The handshake resumed a session (a ticket's PSK was accepted).
     resumed: bool = false,
+    /// A HelloRetryRequest was sent.
+    retried: bool = false,
+    /// On a resumption: the client's reported ticket age less the server's,
+    /// in whole seconds (BoringSSL `SSL_get_ticket_age_skew`).
+    age_skew_s: i64 = 0,
     /// The client's certificate (DER leaf), `peer_len` octets: from its
     /// Certificate, or from the ticket resumed.
     peer_buf: [clientauth.max_leaf_len]u8 = undefined,
@@ -635,10 +672,12 @@ pub const Server = struct {
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
+        var out: outbound.Outbound = .init(output_buf);
+        out.max_fragment = fragmentLen(config);
         return .{
             .config = config,
             .inbound = .init(joiner_buf),
-            .out = .init(output_buf),
+            .out = out,
         };
     }
 
@@ -686,6 +725,22 @@ pub const Server = struct {
     /// sent).
     pub fn isResumed(self: *const Server) bool {
         return self.resumed;
+    }
+
+    /// The server sent a HelloRetryRequest (BoringSSL
+    /// `SSL_used_hello_retry_request`).
+    pub fn usedHelloRetryRequest(self: *const Server) bool {
+        return self.retried;
+    }
+
+    /// On a resumption, how far the client's idea of the ticket's age is
+    /// ahead of the server's (negative: behind), in seconds — each age
+    /// truncated to whole seconds first, as BoringSSL
+    /// `SSL_get_ticket_age_skew`. Null without a resumption. The age is
+    /// not checked: no early data is taken, so a replayed ClientHello gains
+    /// nothing (RFC 8446 §8).
+    pub fn ticketAgeSkew(self: *const Server) ?i64 {
+        return if (self.resumed) self.age_skew_s else null;
     }
 
     /// The client's certificate (DER, the leaf of the chain the
@@ -758,7 +813,7 @@ pub const Server = struct {
             if (self.tx_update != null) break;
             const s = self.out.slot();
             if (s.len == 0) break;
-            const n = @min(s.len, data.len - done, record.max_plaintext_len);
+            const n = @min(s.len, data.len - done, self.out.max_fragment);
             @memcpy(s[0..n], data[done..][0..n]);
             self.out.commit(.application_data, n) catch |err| return self.fail(err);
             done += n;
@@ -931,15 +986,9 @@ pub const Server = struct {
             .select => |s| s.select(s.ctx, sni, &ch) orelse return error.AccessDenied,
         };
         ck.check() catch return error.InternalError;
-        const scheme = for (certverify.candidateSchemes(ck.key)) |s| {
-            if (sig_algs.contains(@backingInt(s)) and certverify.canSign(ck.key, s)) break s;
-        } else return error.HandshakeFailure;
+        const scheme = chooseScheme(ck, &sig_algs) orelse return error.HandshakeFailure;
 
-        var cs = ch.cipherSuites();
-        var suite: record.CipherSuite = while (cs.next()) |c| {
-            const cand: record.CipherSuite = @fromBackingInt(c);
-            if (cand.hashLen() != null and std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) break cand;
-        } else return error.HandshakeFailure;
+        var suite: record.CipherSuite = chooseSuite(cfg, &ch) orelse return error.HandshakeFailure;
         // RFC 8446 §4.1.4: the ServerHello repeats the HelloRetryRequest's
         // suite, so the second hello must still offer it (stricter than
         // rustls, which re-chooses and compares only the hash: a client
@@ -949,10 +998,8 @@ pub const Server = struct {
             suite = self.suite;
         }
         // RFC 8446 §9.2: supported_groups and key_share come together.
-        var gs = ch.supportedGroups() orelse return error.MissingExtension;
-        var group: u16 = while (gs.next()) |g| {
-            if (std.mem.indexOfScalar(u16, cfg.groups, g) != null) break g;
-        } else return error.HandshakeFailure;
+        const gs = ch.supportedGroups() orelse return error.MissingExtension;
+        var group: u16 = chooseGroup(cfg, gs) orelse return error.HandshakeFailure;
         // RFC 8446 §4.2.8: the second hello's share is for the group asked
         // for, whatever its supported_groups now prefer (rustls re-chooses).
         if (retried) group = self.group;
@@ -1092,6 +1139,8 @@ pub const Server = struct {
             error.BinderMismatch => error.DecryptError,
         };
         @memcpy(psk_out[0..L], &sel.psk);
+        const reported_ms = ids[sel.selected_index].obfuscated_ticket_age -% sel.session.ticket_age_add;
+        self.age_skew_s = @as(i64, reported_ms / 1000) - @divTrunc(now_ms - sel.session.issued_at_ms, 1000);
         // The ticket's client certificate (in `scratch`, which `selectPsk`
         // last opened the taken ticket into). Kept even if the psk modes
         // then refuse the resumption: `peer_authenticated` decides.
@@ -1102,6 +1151,46 @@ pub const Server = struct {
             self.peer_auth_ms = want.peer_auth_ms;
         }
         return @intCast(sel.selected_index);
+    }
+
+    /// The key's first allowed scheme (`CertifiedKey.signature_schemes`
+    /// order, else its candidates') that the client offers and it can sign.
+    fn chooseScheme(ck: *const CertifiedKey, offered: *const hello.U16Iter) ?certverify.SignatureScheme {
+        const candidates = certverify.candidateSchemes(ck.key);
+        if (ck.signature_schemes) |prefs| {
+            for (prefs) |p| for (candidates) |s| {
+                if (@backingInt(s) == p and offered.contains(p) and certverify.canSign(ck.key, s)) return s;
+            };
+            return null;
+        }
+        for (candidates) |s| if (offered.contains(@backingInt(s)) and certverify.canSign(ck.key, s)) return s;
+        return null;
+    }
+
+    /// The first suite in the deciding order that both sides enable.
+    fn chooseSuite(cfg: *const Config, ch: *const hello.ClientHello) ?record.CipherSuite {
+        if (cfg.server_order) {
+            // An unknown enabled suite (the enum is open) is never chosen.
+            for (cfg.cipher_suites) |c| if (c.hashLen() != null and ch.cipherSuites().contains(@backingInt(c))) return c;
+            return null;
+        }
+        var cs = ch.cipherSuites();
+        while (cs.next()) |c| {
+            const cand: record.CipherSuite = @fromBackingInt(c);
+            if (cand.hashLen() != null and std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) return cand;
+        }
+        return null;
+    }
+
+    /// The first group in the deciding order that both sides support.
+    fn chooseGroup(cfg: *const Config, theirs: hello.U16Iter) ?u16 {
+        if (cfg.server_order) {
+            for (cfg.groups) |g| if (theirs.contains(g)) return g;
+            return null;
+        }
+        var it = theirs;
+        while (it.next()) |g| if (std.mem.indexOfScalar(u16, cfg.groups, g) != null) return g;
+        return null;
     }
 
     fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -1140,6 +1229,7 @@ pub const Server = struct {
         self.suite = suite;
         self.has_suite = true;
         self.group = group;
+        self.retried = true;
         self.setServerName(sni);
         switch (suite) {
             .aes_256_gcm_sha384 => try self.sendRetry(S384, client_hello_raw, ch),
@@ -1921,6 +2011,7 @@ fn retry(first: Hello, between: []const u8, second: Hello) !RetryOutcome {
         try testing.expect(f.event == .need_more);
         try testing.expectEqual(stream.items.len, f.consumed);
         try testing.expectEqual(State.client_finished, s.state);
+        try testing.expect(s.usedHelloRetryRequest());
     } else |err| res.err = err;
     const p = s.pendingOutput();
     res.out_len = @min(p.len, res.out.len);
@@ -1930,6 +2021,127 @@ fn retry(first: Hello, between: []const u8, second: Hello) !RetryOutcome {
 
 const p256_only: Hello = .{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x0017, "" }} };
 const x25519_share_first: Hello = .{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x001d, "" }} };
+
+/// Feed `h` to a server under `cfg`; the server, with its first flight
+/// pending.
+fn accept(s: *Server, cfg: *const Config, joiner: []u8, out: []u8, h: Hello) !void {
+    s.* = .init(cfg, joiner, out);
+    const rec = try buildRecord(testing.allocator, h);
+    defer testing.allocator.free(rec);
+    const r = try s.feed(rec);
+    try testing.expect(r.event == .need_more);
+}
+
+test "server_order: the suite and the group in the server's order, else the client's" {
+    const h: Hello = .{
+        .suites = &.{ 0x1301, 0x1302 },
+        .groups = &.{ 0x001d, 0x0017 },
+        .shares = &.{ .{ 0x001d, "" }, .{ 0x0017, "" } },
+    };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    for ([_]bool{ false, true }) |server_order| {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{
+            .certificate = .{ .fixed = testKey() },
+            .cipher_suites = &.{ .aes_256_gcm_sha384, .aes_128_gcm_sha256 },
+            .groups = &.{ 0x0017, 0x001d },
+            .server_order = server_order,
+            .random = prng.random(),
+        };
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, &out, h);
+        defer s.deinit();
+        try testing.expectEqual(if (server_order) record.CipherSuite.aes_256_gcm_sha384 else .aes_128_gcm_sha256, s.cipherSuite().?);
+        try testing.expectEqual(@as(u16, if (server_order) 0x0017 else 0x001d), s.negotiatedGroup().?);
+        try testing.expect(!s.usedHelloRetryRequest());
+    }
+    // An unknown suite the configuration enables is never chosen, even
+    // first in the server's order and offered by the client.
+    {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{
+            .certificate = .{ .fixed = testKey() },
+            .cipher_suites = &.{ @fromBackingInt(0x00ff), .aes_128_gcm_sha256 },
+            .server_order = true,
+            .random = prng.random(),
+        };
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, &out, .{ .suites = &.{ 0x00ff, 0x1301 } });
+        defer s.deinit();
+        try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, s.cipherSuite().?);
+    }
+    // The server's first group without a share is asked for.
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .groups = &.{ 0x0017, 0x001d }, .server_order = true, .random = prng.random() };
+    var s: Server = undefined;
+    try accept(&s, &cfg, &joiner, &out, .{ .groups = &.{ 0x001d, 0x0017 }, .shares = &.{.{ 0x001d, "" }} });
+    defer s.deinit();
+    try testing.expectEqual(State.client_hello_retry, s.state);
+    try testing.expectEqual(@as(u16, 0x0017), s.group);
+    try testing.expect(s.usedHelloRetryRequest());
+}
+
+test "CertifiedKey.signature_schemes restricts and orders the key's schemes" {
+    var prng = std.Random.DefaultPrng.init(1);
+    var ck = testKey().*;
+    // A scheme the key cannot make is skipped; the next one serves.
+    ck.signature_schemes = &.{ 0x0804, 0x0403 };
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = undefined;
+    try accept(&s, &cfg, &joiner, &out, .{ .sig_algs = &.{ 0x0804, 0x0403 } });
+    s.deinit();
+    // None left that the key can make, or none the client offers.
+    for ([_][]const u16{ &.{0x0804}, &.{}, &.{ 0x0401, 0x0201 } }) |prefs| {
+        ck.signature_schemes = prefs;
+        const r = try refuse(.{ .sig_algs = &.{ 0x0403, 0x0804, 0x0401 } }, cfg);
+        try testing.expectEqual(error.HandshakeFailure, r.err);
+    }
+    ck.signature_schemes = &.{0x0403};
+    try testing.expectEqual(error.HandshakeFailure, (try refuse(.{ .sig_algs = &.{0x0503} }, cfg)).err);
+}
+
+test "max_fragment_len: no record of the first flight carries more; minOutputLen holds it" {
+    var prng = std.Random.DefaultPrng.init(1);
+    // A 64 KiB Certificate message (the server never parses its own
+    // chain): over a hundred small fragments, far more overhead than the
+    // worst-case slack elsewhere in `minOutputLen` (shares, ALPN) covers.
+    const blob: [4096]u8 = @splat(0xab);
+    const chain: [CertifiedKey.max_chain_len][]const u8 = @splat(&blob);
+    var ck = testKey().*;
+    ck.chain = &chain;
+    var records: [3]usize = undefined;
+    for ([_]u16{ outbound.min_fragment, 600, 1 }, &records) |frag, *n_records| {
+        const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .max_fragment_len = frag, .random = prng.random() };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        const out = try testing.allocator.alloc(u8, minOutputLen(&cfg, &ck));
+        defer testing.allocator.free(out);
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, out, .{});
+        defer s.deinit();
+        const limit: usize = @max(frag, outbound.min_fragment); // clamped
+        const p = s.pendingOutput();
+        var at: usize = 0;
+        var protected: usize = 0;
+        while (at < p.len) {
+            const h = record.parseHeader(p[at..][0..5]);
+            // Protected records hold the inner type and the tag besides.
+            const content = if (h.content_type == .application_data) h.length - 1 - record.tag_len else h.length;
+            try testing.expect(content <= limit);
+            if (h.content_type == .application_data) protected += 1;
+            at += 5 + h.length;
+        }
+        try testing.expectEqual(p.len, at);
+        // EncryptedExtensions, CertificateVerify, Finished and the
+        // Certificate's fragments.
+        try testing.expect(protected >= 3 + chain.len * blob.len / limit);
+        n_records.* = protected;
+    }
+    // Below the floor is the floor.
+    try testing.expectEqual(records[0], records[2]);
+}
 
 test "HelloRetryRequest: for the first common group, then one first flight without a second CCS" {
     const r = try retry(x25519_share_first, "", p256_only);

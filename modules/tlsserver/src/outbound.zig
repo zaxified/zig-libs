@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: MIT
 
 //! tlsserver.outbound — the send side of the record layer: content written
-//! straight into the record buffer, then framed — fragmented at 2^14 and,
+//! straight into the record buffer, then framed — fragmented at
+//! `max_fragment` (2^14 unless set lower) and,
 //! once a send key is installed, sealed — in place.
 //!
 //! Usage: write up to `slot().len` octets of content into `slot()`, then
 //! `commit(type, n)`; the records accumulate in `pending()` until the caller
-//! sends them and `discard`s what went out. A message longer than 2^14 is
+//! sends them and `discard`s what went out. A message longer than a fragment is
 //! split across records by moving its tail apart in the buffer (last
 //! fragment first), so it is never copied to a second buffer.
 //!
@@ -33,12 +34,20 @@ pub const Error = error{
 /// Room for one sealed alert: header, two octets, inner type, tag.
 pub const alert_reserve = header_len + 2 + 1 + record.tag_len;
 
+/// The smallest `max_fragment` (BoringSSL's floor for
+/// `SSL_set_max_send_fragment`).
+pub const min_fragment: u16 = 512;
+
 pub const Outbound = struct {
     buf: []u8,
     /// Records framed and not yet discarded: `buf[0..len]`.
     len: usize = 0,
     tx: record.Protection = undefined,
     protected: bool = false,
+    /// The largest record content sent (rustls `max_fragment_size`,
+    /// BoringSSL `SSL_set_max_send_fragment`); set it before the first
+    /// `slot`, within [`min_fragment`, 2^14].
+    max_fragment: u16 = record.max_plaintext_len,
 
     pub fn init(buf: []u8) Outbound {
         return .{ .buf = buf };
@@ -54,20 +63,20 @@ pub const Outbound = struct {
     pub fn slot(self: *Outbound) []u8 {
         const free = (self.buf.len - self.len) -| alert_reserve;
         if (free <= header_len) return self.buf[self.buf.len..];
-        // Content n needs n + ceil(n / 2^14) * overhead; reserve for the
-        // worst case of the free space.
-        const per = record.max_plaintext_len + self.overhead();
+        // Content n needs n + ceil(n / max_fragment) * overhead; reserve
+        // for the worst case of the free space.
+        const per = @as(usize, self.max_fragment) + self.overhead();
         const records = (free + per - 1) / per;
         const usable = free -| records * self.overhead();
         return self.buf[self.len + header_len ..][0..usable];
     }
 
     /// Frame the `n` octets at the start of `slot()` as `content_type`
-    /// records. Content over 2^14 is split; `n == 0` makes one empty record
+    /// records. Content over `max_fragment` is split; `n == 0` makes one empty record
     /// (legal for application data only — the caller's to know). Only an
     /// alert may use the `alert_reserve`.
     pub fn commit(self: *Outbound, content_type: record.ContentType, n: usize) Error!void {
-        const max = record.max_plaintext_len;
+        const max: usize = self.max_fragment;
         const o = self.overhead();
         const k = if (n == 0) 1 else (n + max - 1) / max;
         const keep: usize = if (content_type == .alert) 0 else alert_reserve;
@@ -208,6 +217,39 @@ test "protected: fragments seal in place and open back in order" {
     }
     try testing.expectEqual(@as(usize, 4), records);
     try testing.expectEqual(n, got);
+}
+
+test "a lower max_fragment splits records at it" {
+    const secret: [32]u8 = @splat(7);
+    var b: [4096]u8 = undefined;
+    var o: Outbound = .init(&b);
+    o.max_fragment = min_fragment;
+    try o.installTx(.aes_128_gcm_sha256, &secret);
+    var rx: record.Protection = undefined;
+    try rx.init(.aes_128_gcm_sha256, &secret);
+    const n = 2 * min_fragment + 1;
+    const s = o.slot();
+    for (s[0..n], 0..) |*x, i| x.* = @truncate(i);
+    try o.commit(.application_data, n);
+    var copy: [b.len]u8 = undefined;
+    @memcpy(copy[0..o.len], o.pending());
+    var at: usize = 0;
+    var lens: [3]usize = undefined;
+    var k: usize = 0;
+    while (at < o.len) : (k += 1) {
+        const h = record.parseHeader(copy[at..][0..5]);
+        const opened = try rx.open(copy[at..][0 .. 5 + h.length]);
+        for (opened.content, k * min_fragment..) |x, i| try testing.expectEqual(@as(u8, @truncate(i)), x);
+        lens[k] = opened.content.len;
+        at += 5 + h.length;
+    }
+    try testing.expectEqualSlices(usize, &.{ min_fragment, min_fragment, 1 }, lens[0..k]);
+    // What `slot` offers, `commit` frames — with each fragment's overhead.
+    o.len = 0;
+    const all = o.slot();
+    try testing.expect(all.len > 4 * min_fragment);
+    try o.commit(.application_data, all.len);
+    try testing.expect(o.len <= b.len - alert_reserve);
 }
 
 test "slot never promises more than commit can frame; full buffer is OutputFull" {

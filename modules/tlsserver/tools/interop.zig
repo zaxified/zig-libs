@@ -714,8 +714,40 @@ fn summarizeBogo(gpa: std.mem.Allocator, io: std.Io, json_path: []const u8, root
         try root.writeFile(io, .{ .sub_path = passing_path, .data = out.written() });
         std.debug.print("wrote {s} ({d} tests)\n", .{ passing_path, passed.items.len });
     } else if (new != 0) std.debug.print("{d} test(s) pass that {s} does not list (--bogo-update)\n", .{ new, passing_path });
+    if (full) try reportParity(gpa, io, root, tests);
     std.debug.print("bogo: {d} pass, {d} fail, {d} skip (unimplemented: by flag above); results in {s}\n", .{ pass, fail, skip, json_path });
     return if (fail == 0 and lost == 0) 0 else 1;
+}
+
+const owed_path = "modules/tlsserver/tools/bogo/rustls-owed.txt";
+
+/// The rustls parity gate (`tools/bogo/rustls_parity.py`): of the tests
+/// rustls passes, those tlsserver passes, disables in `config.json` (each
+/// with its reason: TLS 1.2, a deliberate divergence) and still lacks
+/// (`GAP`, with the flag that stopped the shim in the SKIP tally above).
+fn reportParity(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, tests: std.json.Value) !void {
+    const owed = root.readFileAlloc(io, owed_path, gpa, .limited(1 << 22)) catch |err| {
+        std.debug.print("rustls parity: no {s} ({t})\n", .{ owed_path, err });
+        return;
+    };
+    var n: usize = 0;
+    var ok: usize = 0;
+    var disabled: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, owed, '\n');
+    while (lines.next()) |l| {
+        if (l[0] == '#') continue;
+        n += 1;
+        // A full run lists every test it did not disable.
+        const r = tests.object.get(l) orelse {
+            disabled += 1;
+            continue;
+        };
+        const a = (r.object.get("actual") orelse continue).string;
+        if (std.mem.eql(u8, a, "PASS")) {
+            ok += 1;
+        } else std.debug.print("GAP  {s} ({s})\n", .{ l, a });
+    }
+    std.debug.print("rustls parity: {d} of {d} owed tests pass, {d} disabled with a reason ({s}), {d} gaps\n", .{ ok, n, disabled, "tools/bogo/config.json", n - ok - disabled });
 }
 
 fn isSelected(selected: []const []const u8, c: Case) bool {
