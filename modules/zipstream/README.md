@@ -158,8 +158,9 @@ try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_tota
 
 - **zip64** read and write (automatic past 4 GiB / 65 534 entries;
   `force_zip64`; `allow_zip64 = false` restores the classic-only refusal).
-- **Methods:** Store, Deflate, Zstandard (93, via `zstd`), bzip2 (12, via `bzip2`,
-  byte-identical to libbzip2; checked against Python `zipfile`); any other through a
+- **Methods:** Store, Deflate, Zstandard (93, via `zstd`), bzip2 (12, via `bzip2`),
+  LZMA (14) and XZ (95, via `lzma`) — the compressors byte-identical to libbzip2 /
+  liblzma, checked against Python `zipfile` both ways; any other through a
   `Codec` (`Archive.Options.codecs`, `AddEntryOptions.codec`) — Go's
   `RegisterDecompressor`.
 - **Encryption:** WinZip AES-128/192/256 read (AE-1/AE-2) and write (AE-2);
@@ -173,9 +174,8 @@ try zipstream.extractAll(&archive, io, dest_dir, .{ .symlinks = .skip, .max_tota
 
 ## Ceiling (documented, not a bug)
 
-- LZMA (14) / XZ (95) are not built in yet (owner 2026-10-20: a new module
-  `lzma` will plug in as a codec); until then they are listed and refused
-  (`error.UnsupportedCompressionMethod`), or a consumer registers its own `Codec`.
+- Deflate64 (9), PPMd (98) and the legacy PKZIP methods are listed and refused
+  (`error.UnsupportedCompressionMethod`); a consumer can register its own `Codec`.
 - No in-place editing of an existing archive (append, delete, rename).
 
 ## Testing

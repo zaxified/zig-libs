@@ -43,6 +43,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zstd = @import("zstd");
 const bzip2 = @import("bzip2");
+const lzma = @import("lzma");
 /// Hardware-backed CRC-32 (the sibling module; std's is table-driven, ~0.4 GB/s).
 const crc32 = @import("crc32");
 const encoding = @import("encoding");
@@ -70,7 +71,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "APPNOTE.TXT ZIP central-directory streaming reader",
-    .deps = .{ "zstd", "bzip2", "aes192", "encoding", "crc32" },
+    .deps = .{ "zstd", "bzip2", "lzma", "aes192", "encoding", "crc32" },
 };
 
 /// Buffer the file reader uses for compressed bytes pulled from disk.
@@ -115,9 +116,18 @@ pub const Codec = struct {
     context: ?*anyopaque = null,
     /// A decompressor reading the entry's compressed bytes from `input`
     /// (which ends where the entry's data ends).
-    open_reader: ?*const fn (context: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader) anyerror!CodecReader = null,
+    open_reader: ?*const fn (context: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, entry: CodecEntry) anyerror!CodecReader = null,
     /// A compressor writing to `output`; `level` 0 is the codec's default.
     open_writer: ?*const fn (context: ?*anyopaque, gpa: Allocator, output: *std.Io.Writer, level: i32) anyerror!CodecWriter = null,
+    /// General-purpose flag bits a writer of this method sets (LZMA: bit 1,
+    /// "the stream ends with an end marker").
+    write_flags: u16 = 0,
+};
+
+/// What a decompressor may need from the entry's headers.
+pub const CodecEntry = struct {
+    flags: u16,
+    uncompressed_size: u64,
 };
 
 pub const CodecReader = struct {
@@ -148,7 +158,7 @@ const ZstdCodec = struct {
     const R = struct { r: zstd.DecompressReader };
     const W = struct { w: zstd.StreamWriter, buf: [4096]u8 };
 
-    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader) anyerror!CodecReader {
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
         s.r = try zstd.DecompressReader.init(gpa, input, &.{}, .{});
@@ -192,7 +202,7 @@ const Bzip2Codec = struct {
     const R = struct { r: bzip2.DecompressReader, buf: [4096]u8 };
     const W = struct { w: bzip2.StreamWriter, buf: [4096]u8 };
 
-    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader) anyerror!CodecReader {
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
         s.r = try bzip2.DecompressReader.init(gpa, input, &s.buf, .{ .multi_stream = false });
@@ -225,7 +235,94 @@ const Bzip2Codec = struct {
     }
 };
 
-const builtin_codecs = [_]Codec{ zstd_codec, bzip2_codec };
+/// LZMA (method 14) through the sibling `lzma` module: APPNOTE 5.8 — a
+/// 4-byte header (LZMA SDK version, properties size = 5), the 5 properties,
+/// then raw LZMA1; flag bit 1 means the stream ends with an end marker. Written
+/// as Python `zipfile` writes it (version 9.4, end marker, bit 1).
+pub const lzma_codec: Codec = .{
+    .method = 14,
+    .open_reader = LzmaCodec.openReader,
+    .open_writer = LzmaCodec.openWriter,
+    .write_flags = 1 << 1,
+};
+
+/// XZ (method 95): the entry is one `.xz` stream.
+pub const xz_codec: Codec = .{
+    .method = 95,
+    .open_reader = LzmaCodec.openXzReader,
+    .open_writer = LzmaCodec.openXzWriter,
+};
+
+const LzmaCodec = struct {
+    const R = struct { r: lzma.DecompressReader, buf: [4096]u8 };
+    const W = struct { w: lzma.StreamWriter, buf: [4096]u8 };
+
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, entry: CodecEntry) anyerror!CodecReader {
+        var hdr: [9]u8 = undefined;
+        input.readSliceAll(&hdr) catch return Error.ZipBadCentralDirectory;
+        if (std.mem.readInt(u16, hdr[2..4], .little) != 5) return Error.ZipBadCentralDirectory;
+        const props = lzma.Lzma1Props.fromBytes(hdr[4..9]) catch return Error.ZipBadCentralDirectory;
+        return open(gpa, input, .{ .lzma1 = .{
+            .props = props,
+            .uncompressed_size = entry.uncompressed_size,
+            .allow_eopm = entry.flags & (1 << 1) != 0,
+        } });
+    }
+
+    fn openXzReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
+        return open(gpa, input, .xz);
+    }
+
+    fn open(gpa: Allocator, input: *std.Io.Reader, format: lzma.Format) anyerror!CodecReader {
+        const s = try gpa.create(R);
+        errdefer gpa.destroy(s);
+        s.r = try lzma.DecompressReader.init(gpa, input, &s.buf, format, .{ .multi_stream = false });
+        return .{ .reader = &s.r.reader, .state = s, .close = closeReader };
+    }
+
+    fn closeReader(state: *anyopaque, gpa: Allocator) void {
+        const s: *R = @ptrCast(@alignCast(state));
+        s.r.deinit();
+        gpa.destroy(s);
+    }
+
+    fn options(level: i32) lzma.EncodeOptions {
+        const lv: u4 = if (level <= 0) 6 else @intCast(@min(level, 9));
+        return .{ .lzma = lzma.preset(lv, false) };
+    }
+
+    fn openWriter(_: ?*anyopaque, gpa: Allocator, output: *std.Io.Writer, level: i32) anyerror!CodecWriter {
+        const opts = options(level);
+        const p: lzma.Lzma1Props = .{ .lc = @intCast(opts.lzma.lc), .lp = @intCast(opts.lzma.lp), .pb = @intCast(opts.lzma.pb), .dict_size = opts.lzma.dict_size };
+        try output.writeAll(&.{ 9, 4, 5, 0 }); // LZMA SDK 9.4, 5 property bytes
+        try output.writeAll(&p.toBytes());
+        return writer(gpa, output, .lzma1, opts);
+    }
+
+    fn openXzWriter(_: ?*anyopaque, gpa: Allocator, output: *std.Io.Writer, level: i32) anyerror!CodecWriter {
+        return writer(gpa, output, .xz, options(level));
+    }
+
+    fn writer(gpa: Allocator, output: *std.Io.Writer, format: lzma.EncodeFormat, opts: lzma.EncodeOptions) anyerror!CodecWriter {
+        const s = try gpa.create(W);
+        errdefer gpa.destroy(s);
+        s.w = try lzma.StreamWriter.init(gpa, output, &s.buf, format, opts);
+        return .{ .writer = &s.w.writer, .state = s, .finish = finishWriter, .close = closeWriter };
+    }
+
+    fn finishWriter(state: *anyopaque) anyerror!void {
+        const s: *W = @ptrCast(@alignCast(state));
+        try s.w.finish();
+    }
+
+    fn closeWriter(state: *anyopaque, gpa: Allocator) void {
+        const s: *W = @ptrCast(@alignCast(state));
+        s.w.deinit();
+        gpa.destroy(s);
+    }
+};
+
+const builtin_codecs = [_]Codec{ zstd_codec, bzip2_codec, lzma_codec, xz_codec };
 
 /// One archive member. `name` is owned by the parent `Archive` (its name
 /// arena) and stays valid until `Archive.deinit`. Backslashes in the stored
@@ -1132,7 +1229,7 @@ pub const EntryReader = struct {
                 const codec = archive.codecFor(entry.method()) orelse return Error.UnsupportedCompressionMethod;
                 self.gpa = archive.alloc;
                 self.codec_in = in.limited(.limited64(csize), &self.codec_in_buf);
-                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface);
+                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface, .{ .flags = entry.flags, .uncompressed_size = entry.uncompressed_size });
                 self.limited = self.codec.?.reader.limited(.limited64(entry.uncompressed_size), window);
             },
         }
@@ -1277,6 +1374,10 @@ pub const WriteMethod = enum {
     zstd,
     /// bzip2 (method 12), `codec_level` 1..9 (0 = 9).
     bzip2,
+    /// LZMA (method 14), `codec_level` = the xz preset 1..9 (0 = 6).
+    lzma,
+    /// XZ (method 95), `codec_level` as for `.lzma`.
+    xz,
     /// `AddEntryOptions.codec`.
     custom,
 };
@@ -1344,6 +1445,8 @@ fn writeCodec(options: AddEntryOptions) ?*const Codec {
     return switch (options.method) {
         .zstd => &zstd_codec,
         .bzip2 => &bzip2_codec,
+        .lzma => &lzma_codec,
+        .xz => &xz_codec,
         .custom => options.codec orelse unreachable, // `.custom` needs `codec`
         else => null,
     };
@@ -1498,7 +1601,7 @@ pub const ArchiveWriter = struct {
         const real: std.zip.CompressionMethod = switch (method) {
             .store => .store,
             .deflate => .deflate,
-            .zstd, .bzip2, .custom => @fromBackingInt(@intCast(writeCodec(options).?.method)),
+            .zstd, .bzip2, .lzma, .xz, .custom => @fromBackingInt(@intCast(writeCodec(options).?.method)),
         };
         const enc = options.encryption;
         return .{
@@ -1506,7 +1609,8 @@ pub const ArchiveWriter = struct {
             .aes_extra = if (enc) |e| crypto.aesExtra(e.strength, @backingInt(real)) else null,
             // Bit 11 covers the name AND the comment (APPNOTE 4.4.4): a
             // UTF-8 comment on an ASCII name sets it too, as Go's writer does.
-            .flags = nameFlags(name) | nameFlags(options.comment) | @as(u16, if (enc != null) 1 else 0),
+            .flags = nameFlags(name) | nameFlags(options.comment) | @as(u16, if (enc != null) 1 else 0) |
+                (if (writeCodec(options)) |cd| cd.write_flags else 0),
             .dos = if (options.mtime) |t| .fromUnix(t) else .min,
             .ut = ut,
             .unix_mode = if (unix_type != unix_regular_file)
@@ -1599,7 +1703,7 @@ pub const ArchiveWriter = struct {
                 try compress.finish();
                 break :blk deflated.writer.buffered();
             },
-            .zstd, .bzip2, .custom => blk: {
+            .zstd, .bzip2, .lzma, .xz, .custom => blk: {
                 const codec = writeCodec(options).?;
                 try deflated.ensureTotalCapacityPrecise(@max(64, data.len / 2));
                 const cw = try codec.open_writer.?(codec.context, self.alloc, &deflated.writer, options.codec_level);
@@ -1722,7 +1826,7 @@ pub const ArchiveWriter = struct {
                 s.compress = try std.compress.flate.Compress.init(below, &s.window, .raw, options.level);
                 break :blk &s.compress.writer;
             },
-            .zstd, .bzip2, .custom => blk: {
+            .zstd, .bzip2, .lzma, .xz, .custom => blk: {
                 const codec = writeCodec(options).?;
                 s.codec = try codec.open_writer.?(codec.context, self.alloc, below, options.codec_level);
                 break :blk s.codec.?.writer;
@@ -3329,8 +3433,16 @@ fn mutatedHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
             else => .aes256,
         };
         const opts: AddEntryOptions = .{
-            // zstd 1 in 8: its compressor's set-up per member is the costly part.
-            .method = if (src.valueRangeAtMost(u8, 0, 7) == 0) .zstd else methods[src.index(2)],
+            // The codec methods rarely (zstd 1 in 8, bzip2/LZMA/XZ 1 in 128
+            // each, level 1): their per-member set-up dominates a run.
+            .method = switch (src.valueRangeAtMost(u8, 0, 127)) {
+                0...15 => .zstd,
+                16 => .bzip2,
+                17 => .lzma,
+                18 => .xz,
+                else => methods[src.index(2)],
+            },
+            .codec_level = 1,
             // 1 in 128: each AES member costs a PBKDF2 (1000 rounds), which
             // would otherwise dominate the verdict run's budget.
             .encryption = if (src.valueRangeAtMost(u8, 0, 127) == 0) .{ .password = "secret", .strength = strength, .salt = salt[0..strength.saltLen()] } else null,

@@ -271,7 +271,7 @@ test "Zstandard entries (method 93), buffered and streamed, round-trip; a custom
     // A toy codec, method 99: XOR 0x5A, stored otherwise.
     const Xor = struct {
         const S = struct { inner: *std.Io.Reader, iface: std.Io.Reader, buf: [64]u8 };
-        fn open(_: ?*anyopaque, gpa: std.mem.Allocator, input: *std.Io.Reader) anyerror!zs.CodecReader {
+        fn open(_: ?*anyopaque, gpa: std.mem.Allocator, input: *std.Io.Reader, _: zs.CodecEntry) anyerror!zs.CodecReader {
             const s = try gpa.create(S);
             s.inner = input;
             s.iface = .{ .vtable = &.{ .stream = stream }, .buffer = &s.buf, .seek = 0, .end = 0 };
@@ -455,4 +455,47 @@ test "bzip2 (method 12): Python zipfile's archive reads; ours round-trips, buffe
         defer a.free(got);
         try testing.expectEqualSlices(u8, d, got);
     }
+}
+
+test "LZMA (14) from Python zipfile reads; LZMA and XZ (95) round-trip, buffered and streamed" {
+    const a = testing.allocator;
+    var ms: zs.MemorySource = .{ .bytes = @embedFile("testdata/py_lzma.zip") };
+    var py: zs.Archive = undefined;
+    try py.initSource(a, ms.source(), .{});
+    defer py.deinit();
+    var big: std.Io.Writer.Allocating = .init(a);
+    defer big.deinit();
+    for (0..300) |i| try big.writer.print("line {d}: Příliš žluťoučký kůň úpěl ďábelské ódy\n", .{i});
+    for ([_]struct { []const u8, []const u8 }{ .{ "big.txt", big.written() }, .{ "tiny.txt", "tiny\n" } }) |c| {
+        const e = py.find(c[0]).?;
+        try testing.expectEqual(@as(u16, 14), @backingInt(e.compression));
+        try testing.expect(e.flags & (1 << 1) != 0); // Python writes the end marker
+        const got = try readAll(a, &py, e);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, c[1], got);
+    }
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    var zw = zs.ArchiveWriter.init(a, &aw.writer);
+    defer zw.deinit();
+    const d = try pattern(a, 200_000, 9);
+    defer a.free(d);
+    try zw.addEntry("l.xml", d, .{ .method = .lzma, .codec_level = 1 });
+    try zw.addEntry("x.xml", d, .{ .method = .xz, .codec_level = 1 });
+    const w = try zw.beginEntry("ls.xml", .{ .method = .lzma, .codec_level = 1 });
+    try w.writeAll(d);
+    try zw.endEntry();
+    try zw.finish();
+    var ms2: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(a, ms2.source(), .{});
+    defer archive.deinit();
+    for (archive.entries.items) |*e| {
+        try testing.expect(e.compressed_size < e.uncompressed_size / 2);
+        const got = try readAll(a, &archive, e);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, d, got);
+    }
+    try testing.expect(archive.find("l.xml").?.flags & (1 << 1) != 0);
 }

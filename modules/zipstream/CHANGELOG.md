@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — LZMA (method 14, APPNOTE header, end-marker bit 1) and XZ (95) built in via the new
+  `lzma` module: `lzma_codec`, `xz_codec`, `WriteMethod.lzma/.xz`. **API:** `Codec.open_reader` takes a
+  `CodecEntry` (flags, uncompressed size), `Codec.write_flags` (bits a writer sets). New dep `lzma`.
 - **2026-10-20** — bzip2 (method 12) built in: `bzip2_codec`, `WriteMethod.bzip2` (`codec_level` 1..9), read and write through the new `bzip2` module. New dep `bzip2`.
 - **2026-10-20** — S2 batch. Reader: any positional `Source` (`initSource`, `MemorySource`, `FileSource`),
   independent entry cursors (concurrent/threaded reads), `Options.list_directories/codecs/legacy_names`,
