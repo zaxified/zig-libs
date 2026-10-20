@@ -1,7 +1,7 @@
 # Competitive survey playbook
 
 Moved into this repository on 2026-09-08: it is process documentation for
-`zig-libs` modules, and the clean-room rule it carries is this repository's own
+`zig-libs` modules, and the licence rule it carries is this repository's own
 policy, so it belongs beside `CONVENTIONS.md` rather than in a developer's
 notebook where no reader of this repo would find it.
 
@@ -11,7 +11,9 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
 
 ## ⛔ Licence discipline — read this before opening any foreign source
 
-**Only MIT-licensed source may be read.** This is not advisory.
+**Permissive source (MIT, BSD, Apache-2.0) may be read and ported; copyleft source may
+not.** This is not advisory. (Owner, 2026-10-15, correcting the earlier "MIT only, never copy"
+reading; the MCP SDK case below, 2026-10-20.)
 
 1. **Establish the licence before reading a single line of source.** Check the
    repository's `LICENSE` file *and* the GitHub API's `spdx_id`. They disagree more
@@ -21,18 +23,21 @@ built only afterwards. The `rdap`/`whois` survey of 2026-08-22 is the worked pil
    `NOASSERTION`, and `rust-minisign`'s LICENSE is the verbatim MIT body that merely
    omits the "MIT License" header line, which is enough to defeat the detector. Trusting
    the API alone would have wrongly locked us out of both. Quote what you read.
-2. **Dual `MIT OR Apache-2.0` is fine** — take the MIT option and say so.
-3. **Anything else: source is off limits.** README, reference documentation, issues
-   and pull-request prose are still fair game — that text is the authors' own writing
-   about their software, not the licensed software itself. A great deal can be learned
-   from a bug report; the Rust MCP SDK's whole reversal was reconstructed that way.
-4. ⚠ **"Other" / `NOASSERTION` counts as not-MIT.** Several ecosystems are mid
-   relicensing — the official MCP Go, TypeScript and Rust SDKs each say inside their
-   own `LICENSE` that the repository is transitioning MIT→Apache-2.0 per contribution.
-   Do not read their source.
-5. **Never copy code** — not into the report, not into the repo, not "as a reference".
-   What we want out of a survey is *behaviour and reasoning*, never an implementation.
-   `zig-libs` is a public, clean-room repository and takes no code from elsewhere.
+2. **MIT, BSD, Apache-2.0, and any mix of them, are fine** — including a repository
+   whose `LICENSE` says it is mid-transition with each contribution under one of them
+   (the official MCP Go, TypeScript and Rust SDKs, MIT→Apache-2.0; API: `NOASSERTION`).
+   A port carries the upstream copyright + licence text in `modules/<m>/NOTICE` and a
+   `ported from <project> <version> <file>` comment (root `NOTICE` §0).
+3. **Copyleft (GPL, LGPL, AGPL, MPL …): source is off limits** — it would taint the
+   MIT code. It may still serve as a black-box oracle, and README, reference
+   documentation, issues and pull-request prose are fair game — that text is the
+   authors' own writing about their software, not the licensed software itself. A great
+   deal can be learned from a bug report; the Rust MCP SDK's whole reversal was
+   reconstructed that way.
+4. **Unknown or proprietary licence: off limits** as copyleft is.
+5. **Read before you port, verify before you claim.** A port is a decision about a
+   specific hot spot or behaviour, recorded in the NOTICE; a gap claimed from reading
+   foreign code is still checked against OUR code (file:line, profile) first.
 6. **State the licence you found for every project in the report**, including the ones
    you decided not to read. A survey that does not name its licences cannot be trusted
    and will be sent back.
