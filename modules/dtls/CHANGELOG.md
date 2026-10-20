@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** `engine.Transcript` is now
+  `tls13.transcript.Transcript(Sha256)` (same methods, same bytes); its tests moved to `tls13`,
+  where the HelloRetryRequest rewrite is now anchored on RFC 8448 §5. ctgrind counts unchanged.
+
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** the (EC)DHE key exchange (x25519,
   secp256r1, X25519MLKEM768) moved to `tls13.kex`; `Connection.zig` keeps the group policy
   (`advertised_groups`, the offered share, preference order) and thin wrappers under the old

@@ -44,7 +44,8 @@ re-exported as `dtls.certverify`; the signer burns `ecdsa_burn`/`ed25519_burn`/
 `rsa_burn` moved to `tls13/src/burn.zig`). `stackprobe_test.zig` still measures
 `certverify.sign` from here. Then the (EC)DHE key exchange (`tls13.kex`); `Connection.zig`
 keeps the group policy and wrappers named `ecdheGenerate`/`ecdheSharedSecret`/
-`ecdheServerExchange`.
+`ecdheServerExchange`. And the transcript hash: `engine.Transcript` is
+`tls13.transcript.Transcript(Sha256)`.
 
 **STATUS UPDATE (crypto core AND flight engine landed):** the crypto-core
 layer (`keyschedule.zig`, `aead.zig`) is REAL and KAT-validated — the 15

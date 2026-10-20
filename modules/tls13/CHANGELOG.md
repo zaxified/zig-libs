@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `transcript.Transcript(Hash)`: the RFC 8446 §4.4.1 transcript hash (append,
+  current hash, PSK-binder `wouldBeHash`, HelloRetryRequest `resetToMessageHash`), moved from
+  `dtls/src/engine.zig` and made generic over the suite hash so SHA-384 suites
+  (`TLS_AES_256_GCM_SHA384`) use it too. New anchors: RFC 8448 §3 and §5 (HRR) transcripts
+  against the hashes the RFC prints. Fourth step of the `tlsserver` M0.
+
 - **2026-10-20** — `kex`: the (EC)DHE key exchange (x25519, secp256r1, X25519MLKEM768:
   `generate`, `sharedSecret`, `serverExchange`, `expectedShareLen`), moved from
   `dtls/src/Connection.zig` (earlier history there). Secrets now come out through out-pointers,

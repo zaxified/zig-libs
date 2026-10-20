@@ -25,7 +25,8 @@ coordinator's workspace):
 
 - the RFC 8446 §7.1 key schedule (`keyschedule.zig`);
 - the RFC 8446 §4.4.3 CertificateVerify signed content and sign/verify (`certverify.zig`);
-- the (EC)DHE key exchange for x25519, secp256r1 and X25519MLKEM768 (`kex.zig`).
+- the (EC)DHE key exchange for x25519, secp256r1 and X25519MLKEM768 (`kex.zig`);
+- the handshake transcript hash, generic over the suite hash (`transcript.zig`).
 
 **Not here:** anything that sends, parses or decides — handshake messages, the state machine,
 record protection, certificate parsing and chain verification, choosing a signature scheme or
@@ -84,6 +85,15 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   step (the hybrid server encapsulates, so it cannot be split into generate + shared).
 - The private form of the hybrid key is the 64-byte FIPS 203 seed (`secret_len` 96 with the
   X25519 scalar), re-expanded at decapsulation.
+
+### Transcript hash (`transcript.zig`, RFC 8446 §4.4.1)
+
+- `Transcript(Hash)` (SHA-256 or SHA-384 suites): `append(msg_type, body)` hashes
+  `msg_type ‖ uint24 length ‖ body` — the TLS 4-byte header, also for DTLS (RFC 9147 §5.2);
+  `currentHash()` non-destructively; `wouldBeHash(msg_type, full_len, partial_body)` for the PSK
+  binder (RFC 8446 §4.2.11.2: header length of the full message, body truncated before the
+  binders); `resetToMessageHash(Hash(CH1))` for HelloRetryRequest, replacing CH1 by
+  `message_hash (254) ‖ 00 00 Hash.length ‖ Hash(CH1)`.
 
 Generic over the hash: `Hkdf`/`Hmac` are std types (`HkdfSha256`, `Hkdf(HmacSha384)`); every
 buffer is `Hkdf.prk_length` or `Hmac.mac_length`.
@@ -168,6 +178,11 @@ and the handshake fails at Finished.
   direct scalarmult). In addition `dtls`'s wolfSSL 5.9.1 replay runs all three groups against a
   foreign implementation (x25519 5 flows, P-256 2, X25519MLKEM768 3).
 
+- **transcript:** RFC 8448 §3 ClientHello ‖ ServerHello and §5 CH1 → message_hash ‖ HRR ‖
+  CH2 ‖ ServerHello, the messages transcribed from the RFC text, against the hashes the RFC
+  prints for its "c hs traffic" derivations; framing, truncation and the SHA-384 message_hash
+  length against direct hashes.
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Fuzzing
@@ -215,8 +230,8 @@ the client, the hybrid client-share length check removed (a panic).
   (std `P384`, KAT against `cryptography`/OpenSSL) so a P-384-only client is not regressed.
 - **`kex` through the collection's primitives** (`ct25519` for X25519, `p256`): qap measured
   X25519 at ~28 % of handshake CPU; `tlsserver` M3.
-- **Next pieces for `tlsserver` (M0/M1):** a hash-generic
-  transcript (`dtls/engine.zig`), certificate-authentication helpers (`dtls/certauth.zig`).
+- **Next pieces for `tlsserver` (M0/M2):** certificate-authentication helpers
+  (`dtls/certauth.zig`).
 - **Own ctgrind row** for the key schedule (today covered only inside `dtls hs`).
 - **Survey** for the Scope line (rustls `tls13::key_schedule`, Go `crypto/tls` key_schedule.go).
 
@@ -226,4 +241,4 @@ the client, the hybrid client-share length check removed (a panic).
   (2026-09-10), plus the five new derivations of 2026-10-20 (anchored, not yet reviewed).
   `certverify` moved unchanged apart from its doc comments; `kex` moved with one API change
   (secrets out through out-pointers, per-group burns, `out` zeroed on error) and otherwise the
-  same code.
+  same code. `transcript` moved and became generic over the hash.
