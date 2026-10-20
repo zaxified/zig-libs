@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — NOTICE header is "provenance note" (no third-party condition remains after the decTest removal). Documentation only.
 - **2026-10-20** — Tests: all IBM test-suite material removed (owner ruling: the "General Decimal Arithmetic
   Testcases" are Copyright IBM, all rights reserved, no licence grant, not compatible with the MIT model;
   the IBM specification stays a design reference). The five `src/testdata/{remainder,min,max,sqrt,pow}.vec`
