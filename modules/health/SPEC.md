@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — health probes (keyword review, 2026-10-07)
 
-**Performance:** ref 0.01–0.09× alexliesenfeld/health v0.8.1 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.01–0.09× alexliesenfeld/health v0.8.1 · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — seeded random configs (checks, names, paths, `detail`) and requests (method, path) through the middleware compared with a naive probe/body/call-count model
 
@@ -86,6 +86,10 @@ the budget -1/0/+1 bytes. Reach counters fail the test unless every class is hit
 non-probe method, HEAD, custom paths). HEAD bodies are not compared. Negative control: `>` to
 `>=` in the detail budget check (`detail_len + line_len > detail_buf.len`) made the new test fail
 (step 984) as well as the existing exact-fill test.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-health`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 13.2 %): ref 0.01–0.09×, against 0.01–0.09× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 None beyond its place in the "prod-API hardening + nice-to-have cluster"

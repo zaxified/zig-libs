@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — header policy (keyword review, 2026-10-07)
 
-**Performance:** ref 0.01–0.77× unrolled/secure v1.17.0 · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.01–0.73× unrolled/secure v1.17.0 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -133,6 +133,10 @@ comparison (boundary and removal), seven terms of `appliedHeaderBytes` and every
 (Report-Only CSP, COEP, Server, Permissions-Policy) the budget tests never summed; one test
 added that checks the sum against the bytes `apply` actually serialized with every header
 enabled; rerun: 26 killed. No defect found.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-security-headers`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 9.5 %): ref 0.01–0.73×, against 0.01–0.77× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean (ROUTER_FUZZ)) · ct n/a — HTTP routing (keyword review, 2026-10-07)
 
-**Performance:** ref 0.17–0.54× go-chi/chi v5.3.2 · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.19–0.55× go-chi/chi v5.3.2 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -205,6 +205,10 @@ the slash variant. Deterministic driver (`ROUTER_FUZZ`, testkit): 200,000 runs c
 reached (routed, 404, 405, redirect, constrained, mounted, grouped). Planted mutants: caught — a
 dropped literal check, a skipped constraint, a stale capture, an empty capture; not seen (no
 completeness reference) — a missed match, which the unit tests and the chi oracle kill.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-router`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions): ref 0.19–0.55×, against 0.17–0.54× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — token-bucket rate limit (keyword review, 2026-10-07)
 
-**Performance:** ref 0.08–0.38× golang.org/x/time v0.15.0 rate · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.05–0.37× golang.org/x/time v0.15.0 rate · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — token bucket vs frozen reference traces captured from Go x/time/rate (AllowN trace; AllowN/ReserveN/CancelAt/SetLimitAt/SetBurstAt operation sequences)
 
@@ -152,6 +152,10 @@ Run: `zig build test-ratelimit`.
 ⚠ conn.zig's tests are pulled in by an explicit `test { _ = @import("conn.zig"); }` in root.zig.
 Without it Zig never analyses the file and reports a confident all-green run with that entire
 suite missing — observed here as `18/18 tests passed` while 8 tests silently did not exist.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ratelimit`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.6 %): ref 0.05–0.37×, against 0.08–0.38× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

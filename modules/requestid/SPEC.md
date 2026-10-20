@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — request id generation (keyword review, 2026-10-07)
 
-**Performance:** ref 0.15–0.24× go-chi/chi v5.3.2 RequestID · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.14–0.16× go-chi/chi v5.3.2 RequestID · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — seeded random options/headers/lengths through the middleware compared with a naive adopt-or-generate model, plus random bytes against a charset-string model of `isAdoptable`
 
@@ -102,6 +102,10 @@ response header, `current()` (via body) and uniqueness of generated ids. Reach c
 test unless every class is hit: adopted, adopted at exactly 200, regenerated for malformed, for
 over-long, for `trust_incoming=false`, header absent, `echo=false`. Negative control: `>` to `>=` on
 the length cap in `isAdoptable` made both tests fail (seed + case/step printed).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-requestid`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 12.3 %): ref 0.14–0.16×, against 0.15–0.24× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

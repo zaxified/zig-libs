@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, CORS_FUZZ; subdomain patterns added to `gates`) · ct n/a — header policy, no secrets (keyword review, 2026-10-07)
 
-**Performance:** ref 0.23–0.58× rs/cors v1.11.1 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.30–0.48× rs/cors v1.11.1 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -206,6 +206,10 @@ header case-insensitivity, the ACRH trim/empty/failure rules, the interception c
 two tests added (a list origin must match the whole serialization — a prefix match would grant
 `https://app.example.evil`; a bare OPTIONS under `allow_unconditional_wildcard` gets no
 preflight grant); rerun: 36 killed. No defect found.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-cors`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 14.4 %): ref 0.30–0.48×, against 0.23–0.58× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 - ~~**`Vary: Origin` missing on actual responses without an allowed Origin**~~ — DONE 2026-10-20: every actual response of a `.list`/`.patterns`/`.predicate` policy carries `Vary: Origin` (granted, refused, no Origin, failed method gate), as rs/cors's `handleActualRequest` ("Always set Vary"); `.any` and `.none` do not vary. Browser-oracle answers re-taken (74 refusal answers gained the field, 504 fetches still agree with Chrome).

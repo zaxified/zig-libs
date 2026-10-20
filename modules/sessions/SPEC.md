@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, SESSIONS_FUZZ) · ct 2026-10-09 (ctgrind: CSRF key/token + session id tainted, `csrf` + `newid`, 0 in-file after the idhex fix)
 
-**Performance:** ref 0.04–0.22× alexedwards/scs v2.9.0 + memstore · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.04–0.17× alexedwards/scs v2.9.0 + memstore · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — random create/lookup/persist/regenerate/delete/restart sequences over RamcacheStore and KvStore compared to a naive id → {generation, record} model (CAS, strict timeouts, tombstone vs key removal); CSRF hand-written
 
@@ -310,6 +310,10 @@ the model test if `put` stopped replacing in place; `persist_cookie…three Set-
 ignored or `Max-Age` were emitted for `persist_cookie = false`; `rememberMe…KvStore` if bit 63 were dropped
 or the timestamp were not sign-extended; `Manager.iterate…KvStore` if `.destroy` bypassed the generation
 bump (the stale `persist` would succeed); `hash_id_in_store…RamcacheStore` if a raw id reached the store.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-sessions`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 8.6 %): ref 0.04–0.17×, against 0.04–0.22× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

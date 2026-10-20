@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, HTTP_FUZZ) · ct n/a — HTTP codec; creds pass through (keyword review, 2026-10-07)
 
-**Performance:** ref 0.13–0.32× Go 1.26.0 net/http · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.13–0.29× Go 1.26.8 net/http · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -397,6 +397,10 @@ this binary, treat a `-Doptimize=ReleaseSafe` fuzz/CI lane (`zig build test-http
 `test-jwt`/`test-x509`) as a *mandatory*, continuously-running gate on that decision, not an optional
 extra — the perf gap being traded away is small next to what a missed bounds check costs on a
 directly-exposed parser.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-http`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 20.5 %): ref 0.13–0.29×, against 0.13–0.32× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

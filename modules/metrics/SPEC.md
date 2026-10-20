@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — see `**Fuzz exemption:**` below · ct n/a — metric counters (keyword review, 2026-10-07)
 
-**Performance:** ref 0.06–0.79× prometheus/client_golang v1.24.1 · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.05–0.94× prometheus/client_golang v1.24.1 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -152,6 +152,10 @@ convention this module's own checker has no notion of either way, confirmed rath
 assumed. Per the governing rule the tool was run once and its verdict frozen as a permanent
 offline test; no `/NOTICE` entry (black-box parsing oracle, root NOTICE §0 — the module's
 existing NOTICE for the vendored documentation excerpt is unrelated and unaffected).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-metrics`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 6.1 %): ref 0.05–0.94×, against 0.06–0.79× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

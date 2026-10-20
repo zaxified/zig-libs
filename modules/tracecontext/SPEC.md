@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TRACECONTEXT_FUZZ) · ct n/a — trace id headers (keyword review, 2026-10-07)
 
-**Performance:** ref 0.55–0.67× OpenTelemetry Go v1.46.0 TraceContext · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.28–0.42× OpenTelemetry Go v1.46.0 TraceContext · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -114,6 +114,10 @@ under `Options.sampled = false` is unsampled, and DEL in a tracestate fails `isV
 (replaced 2026-10-11 by the member grammar; the DEL test now holds `isValidValue`)
 (asserted on the guard itself: `http.Server`'s h1 parser already refuses a header value with
 DEL, so the wire cannot reach it).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-tracecontext`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 6.0 %): ref 0.28–0.42×, against 0.55–0.67× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 - Beyond the survey items below, none beyond the documented Level-2/vendor-tracestate/sampling-logic/

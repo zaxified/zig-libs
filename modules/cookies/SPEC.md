@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-12 (200,000-run budget per harness clean, COOKIES_FUZZ: jar, parse, secure) · ct 2026-10-12 (ctgrind: secure.zig derive/sign/verify/seal/open)
 
-**Performance:** ref 0.29–0.64× Go 1.26.0 net/http · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.27–0.41× Go 1.26.8 net/http · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -159,6 +159,10 @@ age, every refusal (other name, other key, a rewritten issue time, timed through
 back, every flipped bit, name over 255); the `secure` fuzz harness draws timed values, issue/now
 instants including i64 extremes and cross-mode opens; ctgrind rows tsign/tverify/tseal 0, topen 2
 (aesgcm's verdict); four more stack-probe entry points.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-cookies`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.1 %): ref 0.27–0.41×, against 0.29–0.64× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 - **Constant time (low, found 2026-10-18 pre-tag sweep)**: the public `percentEncode`/`percentDecode` helpers use a hex table / `charToDigit` (root.zig ~368-423) and `isCookieValue` switches per byte (~214, ~281-296) — over a session id on Set-Cookie write. Not used internally with secrets; a CT variant if a consumer needs one.

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, VALIDATE_FUZZ; `cross` harness added) · ct n/a — input validation (keyword review, 2026-10-07)
 
-**Performance:** ref 0.30–0.72× go-playground/validator v10.30.5 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.28–0.67× go-playground/validator v10.30.5 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -155,6 +155,10 @@ table citing the baked-in it follows (`format truth table: ...`); the `cross` fu
 wrapped as a root array. Anchoring of the new formats: go-playground's regexes/functions read by hand (no
 JSON-Schema-Test-Suite file exists for them); NOT yet replayed against a running Go validator.
 Performance: `zig build bench-validate` (tools/bench.zig, tools/go_bench) -- see the card.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-validate`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 12.8 %): ref 0.28–0.67×, against 0.30–0.72× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 Regex-backed `pattern` support is a tracked future ADOPT dependency (README TODO) — not implemented;

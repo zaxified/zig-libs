@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean, NETADDR_FUZZ, round-trip oracle) · ct n/a — IP address types (keyword review, 2026-10-07)
 
-**Performance:** ref 0.24–0.88× Go net/netip + netipx · fastest ? (measured 2026-10-07)
+**Performance:** ref 0.27–0.95× Go net/netip + netipx · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -84,6 +84,10 @@ broadcast/supernet/iterator), `summarize`/`mergePrefixes` minimal-covering check
 parity surface by name (`src/netip_api_test.zig`, including the set algebra against a brute-force
 bitmap model) and replayed against Go (`src/netip_oracle_test.zig`). One Linux-only
 live test exercises `systemSource` against loopback. Run: `zig build test-netaddr`.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-netaddr`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions): ref 0.27–0.95×, against 0.24–0.88× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `ipFromInt`, `ipToInt` (per IPv6 address). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, AAA_GATE_FUZZ: bearer, api-key, query, bearer-value, client-key, basic, cookie, verify, throttle) · ct 2026-10-17 (ctgrind: verify/verifyApiKey/verifyBasic over tainted stored digests, in-file 2 each = the two verdicts)
 
-**Performance:** ref 0.11–0.87× labstack/echo v5.4.0 · fastest ? (measured 2026-10-17)
+**Performance:** ref 0.09–0.75× labstack/echo v5.4.0 · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — the decision table (`verify`/`verifyApiKey`/`verifyBasic` under add/remove rotation, verifier callbacks, open plane) against plain credential lists, and the denied-request throttle end to end on the wire against an array model of its documented rule (window, fold, idle sweep, LRU cap); 3 planted mutants all killed (2026-10-17)
 
@@ -146,6 +146,10 @@ status and the denied-audit coalescing. First run: 39 killed, 4 alive; four test
 stays closed under `allow_when_unconfigured`); rerun: 42 killed, 1 equivalent —
 `bearerTokenOf`'s empty-token check (the whole value is trimmed first, so text after
 `Bearer ` can never trim to empty). No defect found.
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-aaa-gate`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 20.4 %): ref 0.09–0.75×, against 0.11–0.87× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 Reviewed 2026-07-10 (adversarial security pass, paired with `jwt`): const-time compare,

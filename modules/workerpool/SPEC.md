@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — thread pool (keyword review, 2026-10-07)
 
-**Performance:** ref 0.19–0.83× Pithikos/C-Thread-Pool 2b56942a · fastest ? (measured 2026-10-14)
+**Performance:** ref 0.06–0.84× Pithikos/C-Thread-Pool 2b56942a · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — stress tests checking every job runs exactly once and conservation under contention
 
@@ -39,6 +39,8 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 **Where we are ahead:** typed, non-panicking failure modes (`SubmitFailed`, `Shutdown`, `TooManySubmitters`); a *lock-free* submit from any thread (`lockfree.SegQueue`, jobs by value, no allocation per job); futex idle wakeup with a gated `futexWake` and an optional pre-park spin (`spin_ns`); `shutdownNow` that frees queued jobs, `drainedCleanly` to make a producer-quiescence violation visible; a watchdog-instrumented real-thread stress suite in Debug and ReleaseFast. **Where we are behind:** nothing a user of the reference (thpool) notices; since 2026-10-13 `pause`/`resume`, `workingCount` and a bounded queue are implemented. Consciously out, each with its reason (§6b, §7): no result/future handle (`std.Io.Group`/`Io.Future` are the result-carrying API in 0.16; this pool is fire-and-forget, `wait` covers wait-for-all, a per-job result is a caller-owned slot plus `wait`); no panic isolation (Zig has no recover); no dynamic resizing (ants' `Tune`; fixed size like the reference, a resize is a new pool); no blocking submit (deferred: a caller retries or sheds on `QueueFull`).
 
 ## Performance (2026-10-14)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-workerpool`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 17.1 %): ref 0.06–0.84×, against 0.19–0.83× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures; what follows is the earlier measurement.
 
 `zig build bench-workerpool` (`tools/bench.zig` against `tools/c_bench`, thpool at 2b56942a built
 with `zig cc -O2`), 4 workers, 7 rounds, ratio ours/thpool by wall time, best round per side:

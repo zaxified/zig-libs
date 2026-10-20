@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, ACCESSLOG_FUZZ) · ct n/a — log formatting, no keys (keyword review, 2026-10-07)
 
-**Performance:** ref 0.13–0.33× Go 1.26.0 encoding/json + log/slog + go-logfmt v0.6.1 · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.13–0.33× Go 1.26.8 encoding/json + log/slog + go-logfmt v0.6.1 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -295,6 +295,10 @@ still produces a pathologically long — but still single, still well-formed —
 header sizes upstream, e.g. `http.Server.Options`' own 431/414 limits), and PII
 redaction/scrubbing (an app that logs a bearer token in a custom field is an app policy issue,
 not something this formatter can detect).
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-accesslog`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 3.9 %): ref 0.13–0.33×, against 0.13–0.33× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 

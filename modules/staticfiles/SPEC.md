@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, STATICFILES_FUZZ) · ct n/a — static file serving (keyword review, 2026-10-07)
 
-**Performance:** ref 0.11–0.59× Go 1.26.0 net/http FileServer · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.11–0.61× Go 1.26.8 net/http FileServer · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -366,6 +366,10 @@ treats as a programmer bug on `ENAMETOOLONG` (Release mapped it to 404). Regener
 compares.
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: starlette oracle; found If-Range NOT IMPLEMENTED -> backlog 1B-bis
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-staticfiles`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 1–4 from other sessions, largest spread 7.0 %): ref 0.11–0.61×, against 0.11–0.59× on Zig 0.16.0 (Go on the host 1.26.0 → 1.26.8 in between, where Go is a side). The card carries these figures.
 
 ## Backlog / deferred
 
