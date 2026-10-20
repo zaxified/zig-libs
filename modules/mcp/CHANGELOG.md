@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Tool schema validation and resource-template matching (S2 R7, R8, R14).
+  - **Behaviour change (on by default, `Server.validate_tool_io = false` restores the old one):**
+    `tools/call` arguments are checked against the tool's `input_schema` before the handler runs, and a
+    successful result of a tool with an `output_schema` against that schema; a failure is a tool result
+    with `isError:true` ("Input validation error: Invalid arguments for tool <name>: <pointer>: <why>",
+    the TS SDK's wording; "Output validation error: …"). A tool that declares an `output_schema` and
+    prints non-JSON now fails instead of answering text only. Schemas are compiled once at `addTool`;
+    one outside the subset (`patternProperties`, `$anchor`, …) leaves that tool unchecked. New
+    `schema_check` (JSON Schema 2020-12 subset; 625 JSON-Schema-Test-Suite cases; `pattern` not checked;
+    step budget against exponential `anyOf` recursion).
+  - `ResourceRequest.vars` / `variable(name)`: a template read carries the RFC 6570 variables matched
+    out of the uri (null when it does not match — the handler still runs and judges, as before). New
+    `uri_template` (parse, expand levels 1–4, match; matcher ported from the MCP Python SDK, see NOTICE).
+  - The SDK oracle transcript was re-taken with MCP Python SDK 2.3.0 (40 checks, 0 failed): the
+    missing-argument call now answers with the validation message.
 - **2026-10-20** — Pagination and definition metadata (S2 R10, R4). **Additive; with the defaults every
   answer is byte-identical to before.**
   - `Server.page_size` (0 = whole catalog, the default): `tools/list`, `resources/list`,

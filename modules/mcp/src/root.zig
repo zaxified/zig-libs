@@ -103,6 +103,12 @@
 const std = @import("std");
 /// `x-mcp-header` annotation rules, checked by `Server.addTool`.
 pub const header_annotations = @import("header_annotations.zig");
+/// The JSON Schema 2020-12 subset `tools/call` checks arguments and
+/// `structuredContent` against (`Server.validate_tool_io`).
+pub const schema_check = @import("schema_check.zig");
+/// RFC 6570 parse/expand/match; `resources/read` matches a request's uri
+/// against each template (`ResourceRequest.vars`).
+pub const uri_template = @import("uri_template.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -2256,6 +2262,62 @@ const ListKind = enum {
     }
 };
 
+/// A tool's schemas, parsed and compiled once at `addTool` (on an arena the
+/// `Server` owns) so `tools/call` does not re-parse them. A schema that is not
+/// JSON, or is outside `schema_check`'s subset, leaves its slot null: that
+/// side is not checked (`tools/list` still answers -32603 for non-JSON text).
+const ToolCheck = struct {
+    arena: *std.heap.ArenaAllocator,
+    input: ?schema_check.Schema,
+    output: ?schema_check.Schema,
+
+    fn init(gpa: std.mem.Allocator, tool: Tool) error{OutOfMemory}!ToolCheck {
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        arena.* = .init(gpa);
+        errdefer {
+            arena.deinit();
+            gpa.destroy(arena);
+        }
+        return .{
+            .arena = arena,
+            .input = try compileText(arena.allocator(), tool.input_schema),
+            .output = try compileText(arena.allocator(), tool.output_schema),
+        };
+    }
+
+    fn deinit(self: ToolCheck, gpa: std.mem.Allocator) void {
+        self.arena.deinit();
+        gpa.destroy(self.arena);
+    }
+
+    fn compileText(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?schema_check.Schema {
+        if (text.len == 0) return null;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        return schema_check.Schema.compile(arena, v) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
+    }
+};
+
+/// Why a successful result breaks the tool's `output_schema`, or null when it
+/// conforms. A tool that declares one MUST return conforming structured
+/// content (tools.mdx "Output Schema"), so output that is not JSON at all is a
+/// failure too, not a quiet text-only result. On the session path
+/// `structuredContent` is an object; a 2026-07-28 call takes any JSON value.
+fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, text: []const u8, modern: bool) error{OutOfMemory}!?[]const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return "Output validation error: the tool declares an outputSchema but its output is not JSON",
+    };
+    if (v != .object and !modern) return "Output validation error: the tool declares an outputSchema but its output is not a JSON object";
+    const f = (try schema.validate(arena, v)) orelse return null;
+    return try arena.print("Output validation error: {s}{s}{s}", .{ f.pointer, if (f.pointer.len != 0) ": " else "", f.message });
+}
+
 /// What `ToolCall.arg` found for one argument: nothing (absent or JSON
 /// `null`), a value of the requested type, or a value of another JSON type —
 /// the case a handler reports as "'x' must be a string", not "missing 'x'".
@@ -2693,6 +2755,24 @@ pub const ResourceRequest = struct {
     meta: std.json.Value = .null,
     /// Set by `failWith`/`failProtocol`: answer with this JSON-RPC error.
     protocol_error: ?ProtocolError = null,
+    /// For a template read: the template's variables matched out of `uri`
+    /// (RFC 6570, percent-decoded, arena lifetime), or null when the uri does
+    /// not match the template — or the template is not matchable — and the
+    /// handler has to judge `uri` itself, as before matching existed. A
+    /// handler that serves only its template's uris starts with
+    /// `const vars = req.vars orelse return false;`. Null for a static resource.
+    vars: ?[]const uri_template.Var = null,
+
+    /// The string value of template variable `name` (see `vars`), or null.
+    pub fn variable(self: *const ResourceRequest, name: []const u8) ?[]const u8 {
+        for (self.vars orelse return null) |v| {
+            if (std.mem.eql(u8, v.name, name)) return switch (v.value) {
+                .string => |s| s,
+                .list => null,
+            };
+        }
+        return null;
+    }
 
     const ContentItem = struct {
         uri: []const u8,
@@ -3040,6 +3120,19 @@ pub const Server = struct {
     /// Entries per page of the four list methods; 0 (the default) = the whole
     /// catalog in one answer, never a `nextCursor`. See `handleList`.
     page_size: usize = 0,
+    /// Check `tools/call` arguments against each tool's `input_schema`, and a
+    /// successful structured result against its `output_schema`, before
+    /// either crosses (TS and Python SDKs do both). A failure is a tool result
+    /// with `isError:true` naming the offending location. Only schemas inside
+    /// `schema_check`'s subset are checked; a tool whose schema uses anything
+    /// else (`patternProperties`, `$anchor`, …) runs unchecked, as before.
+    validate_tool_io: bool = true,
+    /// Parallel to `tools`: each tool's compiled schemas.
+    tool_checks: std.ArrayList(ToolCheck) = .empty,
+    /// Parallel to `resource_templates`: the parsed, matchable template, or
+    /// null when it is not valid RFC 6570 or has no deterministic inverse.
+    template_parsed: std.ArrayList(?uri_template.Template) = .empty,
+    catalog_arena: ?*std.heap.ArenaAllocator = null,
     /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
     /// override it per read (`ResourceRequest.cache`).
     read_cache: CacheHint = .{},
@@ -3055,6 +3148,13 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        if (self.catalog_arena) |a| {
+            a.deinit();
+            self.gpa.destroy(a);
+        }
+        self.template_parsed.deinit(self.gpa);
+        for (self.tool_checks.items) |c| c.deinit(self.gpa);
+        self.tool_checks.deinit(self.gpa);
         self.tools.deinit(self.gpa);
         self.resources.deinit(self.gpa);
         self.resource_templates.deinit(self.gpa);
@@ -3151,12 +3251,16 @@ pub const Server = struct {
     pub fn addTool(self: *Server, tool: Tool) (error{DuplicateTool} || header_annotations.Error)!void {
         if (self.findTool(tool.name) != null) return error.DuplicateTool;
         try header_annotations.validate(self.gpa, tool.input_schema);
+        const check = try ToolCheck.init(self.gpa, tool);
+        errdefer check.deinit(self.gpa);
+        try self.tool_checks.ensureUnusedCapacity(self.gpa, 1);
         try self.tools.append(self.gpa, tool);
+        self.tool_checks.appendAssumeCapacity(check);
     }
 
-    fn findTool(self: *const Server, name: []const u8) ?*const Tool {
-        for (self.tools.items) |*t| {
-            if (std.mem.eql(u8, t.name, name)) return t;
+    fn findTool(self: *const Server, name: []const u8) ?usize {
+        for (self.tools.items, 0..) |*t, i| {
+            if (std.mem.eql(u8, t.name, name)) return i;
         }
         return null;
     }
@@ -3181,7 +3285,27 @@ pub const Server = struct {
         for (self.resource_templates.items) |*t| {
             if (std.mem.eql(u8, t.uri_template, template.uri_template)) return error.DuplicateResourceTemplate;
         }
+        // A template outside RFC 6570 (or one with no deterministic inverse)
+        // still registers, as before; its reads just carry no `vars`.
+        const arena = try self.catalogArena();
+        const parsed: ?uri_template.Template = uri_template.Template.parse(arena, template.uri_template) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidTemplate => null,
+        };
+        try self.template_parsed.ensureUnusedCapacity(self.gpa, 1);
         try self.resource_templates.append(self.gpa, template);
+        self.template_parsed.appendAssumeCapacity(if (parsed) |pt| (if (pt.unmatchable == null) pt else null) else null);
+    }
+
+    /// Long-lived storage for what registration derives from the catalog
+    /// (parsed uri templates); freed by `deinit`.
+    fn catalogArena(self: *Server) error{OutOfMemory}!std.mem.Allocator {
+        if (self.catalog_arena == null) {
+            const a = try self.gpa.create(std.heap.ArenaAllocator);
+            a.* = .init(self.gpa);
+            self.catalog_arena = a;
+        }
+        return self.catalog_arena.?.allocator();
     }
 
     /// Register a prompt. All slices (including the `arguments` slice) must
@@ -3914,11 +4038,31 @@ pub const Server = struct {
         }
         // Unknown tool => -32602 (MCP treats an unknown tool name as invalid
         // params on tools/call, not a missing method).
-        const tool = self.findTool(name_v.string) orelse {
+        const tool_index = self.findTool(name_v.string) orelse {
             return sendError(arena, out, id, error_code.invalid_params, "Unknown tool");
         };
+        const tool = &self.tools.items[tool_index];
+        const check = &self.tool_checks.items[tool_index];
 
         const args: std.json.Value = params.object.get("arguments") orelse .null;
+
+        // The SDKs' convention (TS `tools.md` "Send arguments the schema
+        // rejects"): arguments that fail `inputSchema` never reach the handler,
+        // and the answer is a tool result with `isError:true`, so the model
+        // reads why and retries. Absent arguments are checked as `{}`.
+        if (self.validate_tool_io) if (check.input) |*schema| {
+            const instance: std.json.Value = if (args == .null) .{ .object = .empty } else args;
+            if (try schema.validate(arena, instance)) |f| {
+                const msg = try arena.print("Input validation error: Invalid arguments for tool {s}: {s}{s}{s}", .{
+                    tool.name, f.pointer, if (f.pointer.len != 0) ": " else "", f.message,
+                });
+                return sendToolResult(arena, out, id, msg, .{
+                    .allow_structured = false,
+                    .is_error = true,
+                    .server_info = if (modern != null) &self.info else null,
+                });
+            }
+        };
 
         const req_meta = requestMeta(params.object);
         const prog = progressFrom(arena, out, req_meta);
@@ -3943,6 +4087,15 @@ pub const Server = struct {
         const is_error = tool.handler(tool.ctx, &call);
         if (call.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (call.input.inputRequired()) return self.sendInputRequired(arena, out, id, &call.input);
+        if (!is_error and self.validate_tool_io and tool.allow_structured) if (check.output) |*schema| {
+            if (try outputFailure(arena, schema, tool_buf.items, modern != null)) |msg| {
+                return sendToolResult(arena, out, id, msg, .{
+                    .allow_structured = false,
+                    .is_error = true,
+                    .server_info = if (modern != null) &self.info else null,
+                });
+            }
+        };
         try sendToolResult(arena, out, id, tool_buf.items, .{
             .allow_structured = tool.allow_structured,
             .is_error = is_error,
@@ -4043,8 +4196,9 @@ pub const Server = struct {
         };
         const found = blk: {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
-            for (self.resource_templates.items) |*t| {
+            for (self.resource_templates.items, self.template_parsed.items) |*t, parsed| {
                 const handler = t.handler orelse continue;
+                req.vars = if (parsed) |pt| try pt.match(arena, req.uri) else null;
                 if (handler(t.ctx, &req) or req.protocol_error != null) break :blk true;
                 // A declining template may have written partial contents, a
                 // caching hint or an input request before bailing — discard
@@ -4539,6 +4693,8 @@ fn expectResponse(s: *Server, msg: []const u8, expected: []const u8) !void {
 // A bare `pub const x = @import(...)` does not pull x's tests in (CONVENTIONS §6).
 test {
     _ = header_annotations;
+    _ = schema_check;
+    _ = uri_template;
     _ = @import("sdk_oracle.zig");
 }
 
@@ -4910,13 +5066,113 @@ test "tools/call: handler failure -> isError:true (missing required arg)" {
     var app = TestApp{};
     var s = testServer(&app);
     defer s.deinit();
+    // The inputSchema requires `text`: the call is refused before the handler.
     try expectResponse(&s,
         \\{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{}}}
     ,
-        \\{"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"error: missing 'text'"}],"isError":true}}
+        \\{"jsonrpc":"2.0","id":12,"result":{"content":[{"type":"text","text":"Input validation error: Invalid arguments for tool echo: missing required property \"text\""}],"isError":true}}
         \\
     );
-    try testing.expectEqual(@as(u32, 1), app.calls); // handler was reached
+    try testing.expectEqual(@as(u32, 0), app.calls);
+    // With validation off the handler sees the call and fails it itself.
+    s.validate_tool_io = false;
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"echo","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":13,"result":{"content":[{"type":"text","text":"error: missing 'text'"}],"isError":true}}
+        \\
+    );
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+fn postsResource(_: ?*anyopaque, req: *ResourceRequest) bool {
+    const id = req.variable("id") orelse return false;
+    const page = req.variable("page") orelse "1";
+    req.text(req.uri, "", req.arena.print("{s}:{s}", .{ id, page }) catch return false);
+    return true;
+}
+
+test "resource templates: the uri's variables reach the handler (RFC 6570)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "users://{id}/posts{?page}", .name = "posts", .handler = postsResource });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"users://a%20b/posts?page=3"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"contents":[{"uri":"users://a%20b/posts?page=3","text":"a b:3"}]}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"users://7/posts"}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"contents":[{"uri":"users://7/posts","text":"7:1"}]}}
+        \\
+    );
+    // Not this template's shape: the handler sees `vars == null` and declines.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"users://7/8/posts"}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"error":{"code":-32002,"message":"Resource not found"}}
+        \\
+    );
+}
+
+fn searchTool(_: ?*anyopaque, call: *ToolCall) bool {
+    call.write(call.strArg("out") orelse "{\"hits\":1}");
+    return false;
+}
+
+test "tools/call: arguments and structured output are checked against the tool's schemas" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "search",
+        .description = "",
+        .input_schema =
+        \\{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer","maximum":50},"out":{"type":"string"}},"required":["query"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"hits":{"type":"integer"}},"required":["hits"]}
+        ,
+        .handler = searchTool,
+    });
+    // An argument the schema rejects never reaches the handler (TS tools.md).
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"query":"mug","limit":999}}}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "Input validation error: Invalid arguments for tool search: /limit: ") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"isError\":true") != null);
+    // Conforming output passes with its structuredContent.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search","arguments":{"query":"mug"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"hits\":1}"}],"structuredContent":{"hits":1},"isError":false}}
+        \\
+    );
+    // Output that breaks the declared outputSchema, or is not JSON at all, is
+    // a tool failure, never a structuredContent the client would reject.
+    aw.clearRetainingCapacity();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"q","out":"{\"hits\":\"many\"}"}}}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "Output validation error: /hits: ") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "structuredContent") == null);
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search","arguments":{"query":"q","out":"plain text"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"Output validation error: the tool declares an outputSchema but its output is not JSON"}],"isError":true}}
+        \\
+    );
+    // A schema outside the checked subset leaves the tool unchecked.
+    try s.addTool(.{ .name = "loose", .description = "", .input_schema = "{\"type\":\"object\",\"patternProperties\":{\"^x\":{\"type\":\"integer\"}},\"required\":[\"q\"]}", .handler = pageTool });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"loose","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":""}],"isError":false}}
+        \\
+    );
 }
 
 fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {
@@ -8292,7 +8548,7 @@ test "corpus: every JSON-RPC seed reaches the dispatcher, and the replies are pi
     }
     // Measured 2026-09-07. Before: 1 round, `handleMessage("")`, one -32700.
     try testing.expectEqual(message_seeds.len - 1, nonempty); // the deliberate empty seed
-    try testing.expectEqual(@as(usize, 1661), reply_octets);
+    try testing.expectEqual(@as(usize, 1731), reply_octets);
     try testing.expectEqual(@as(usize, 9), errors);
 }
 
@@ -10134,6 +10390,99 @@ fn fuzzScript(comptime harness: anytype) fn (void, *std.testing.Smith) anyerror!
     }.f;
 }
 
+/// One of `seeds`, a few octets damaged, maybe cut short (the `handleOne`
+/// shape): structured inputs that random bytes would never form.
+fn damagedSeed(comptime S: type, src: *S, seeds: []const []const u8, buf: []u8) usize {
+    const picked = seeds[src.index(seeds.len)];
+    var len = @min(picked.len, buf.len);
+    @memcpy(buf[0..len], picked[0..len]);
+    if (len != 0) {
+        for (0..src.valueRangeAtMost(u8, 0, 3)) |_| buf[src.index(len)] = src.value(u8);
+        if (src.valueRangeAtMost(u8, 0, 3) == 0) len = src.index(len) + 1;
+    }
+    return len;
+}
+
+const fuzz_schemas = [_][]const u8{
+    \\{"type":"object","properties":{"q":{"type":"string","minLength":1,"maxLength":5},"n":{"type":"integer","minimum":0,"multipleOf":3}},"required":["q"],"additionalProperties":false}
+    ,
+    \\{"$defs":{"n":{"anyOf":[{"type":"object","properties":{"c":{"$ref":"#/$defs/n"}},"allOf":[{"required":["x"]}]},{"type":"object","properties":{"c":{"$ref":"#/$defs/n"}}}]}},"$ref":"#/$defs/n"}
+    ,
+    \\{"type":"array","prefixItems":[{"const":1},{"enum":["a",null,[1]]}],"items":{"oneOf":[{"type":"number"},{"type":"string"}]},"uniqueItems":true,"maxItems":6}
+    ,
+    \\{"if":{"properties":{"k":{"const":"a"}}},"then":{"required":["a"]},"else":{"not":{"required":["a"]}},"minProperties":1}
+    ,
+};
+
+const fuzz_instances = [_][]const u8{
+    \\{"q":"abc","n":9}
+    ,
+    \\{"c":{"c":{"c":{"c":{"c":{"c":{"c":{"c":{"c":{"c":{"c":{"c":{}}}}}}}}}}}}}
+    ,
+    \\[1,"a",2,"b",3.5,"é"]
+    ,
+    \\{"k":"a","a":[1,2,{"x":null}]}
+    ,
+};
+
+fn fuzzSchemaCheck(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Either side may be the damaged one: the schema text is the server's, but
+    // `compile` must still refuse a bad one without a crash.
+    var sbuf: [512]u8 = undefined;
+    var ibuf: [512]u8 = undefined;
+    const schema_text = if (src.value(bool)) sbuf[0..damagedSeed(S, src, &fuzz_schemas, &sbuf)] else fuzz_schemas[src.index(fuzz_schemas.len)];
+    const instance_text = ibuf[0..damagedSeed(S, src, &fuzz_instances, &ibuf)];
+    const sv = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch return fuzz_driver.hit("schema_not_json");
+    const schema = schema_check.Schema.compile(arena, sv) catch return fuzz_driver.hit("schema_refused");
+    const iv = std.json.parseFromSliceLeaky(std.json.Value, arena, instance_text, .{}) catch return fuzz_driver.hit("instance_not_json");
+    if (try schema.validate(arena, iv)) |f| {
+        if (std.mem.eql(u8, f.keyword, "budget")) fuzz_driver.hit("budget") else fuzz_driver.hit("invalid");
+        // A failure's pointer is a JSON Pointer: empty or starting with '/'.
+        try testing.expect(f.pointer.len == 0 or f.pointer[0] == '/');
+    } else fuzz_driver.hit("valid");
+}
+
+const fuzz_templates = [_][]const u8{
+    "users://{id}/posts{?page,limit}{&sort}",
+    "file:///{+path}{.ext}",
+    "x://a{/seg*}/b{;p}{#frag}",
+    "x://{v:3}-{w}",
+};
+
+const fuzz_uris = [_][]const u8{
+    "users://a%20b/posts?limit=2&page=3&sort=up",
+    "file:///src/main.zig",
+    "x://a/p/q/b;p=1#top",
+    "x://abc-d%C3%A9",
+};
+
+fn fuzzUriTemplate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tbuf: [256]u8 = undefined;
+    var ubuf: [256]u8 = undefined;
+    const tmpl_text = if (src.value(bool)) tbuf[0..damagedSeed(S, src, &fuzz_templates, &tbuf)] else fuzz_templates[src.index(fuzz_templates.len)];
+    const uri = ubuf[0..damagedSeed(S, src, &fuzz_uris, &ubuf)];
+    const tmpl = uri_template.Template.parse(arena, tmpl_text) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.InvalidTemplate => return fuzz_driver.hit("template_invalid"),
+    };
+    const vars = (try tmpl.match(arena, uri)) orelse return fuzz_driver.hit("no_match");
+    fuzz_driver.hit("matched");
+    // What matched expands again without failing, and every value is UTF-8
+    // (the matcher's own promise).
+    for (vars) |v| switch (v.value) {
+        .string => |s| try testing.expect(std.unicode.utf8ValidateSlice(s)),
+        .list => |l| for (l) |s| try testing.expect(std.unicode.utf8ValidateSlice(s)),
+    };
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try tmpl.expand(&aw.writer, vars);
+}
+
 test "fuzz: handleMessage, damaged corpus lines" {
     try testing.fuzz({}, fuzzScript(fuzzHandleMessageMutated), .{});
 }
@@ -10141,6 +10490,8 @@ test "fuzz: handleMessage, damaged corpus lines" {
 test "fuzz driver: MCP_FUZZ" {
     try fuzz_driver.run(fuzzHandleMessage, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message" });
     try fuzz_driver.run(fuzzHandleMessageMutated, .{ .prefix = "MCP_FUZZ", .name = "mcp-handle-message-mutated" });
+    try fuzz_driver.run(fuzzSchemaCheck, .{ .prefix = "MCP_FUZZ", .name = "mcp-schema-check" });
+    try fuzz_driver.run(fuzzUriTemplate, .{ .prefix = "MCP_FUZZ", .name = "mcp-uri-template" });
     try fuzz_driver.run(fuzzClientResponse, .{ .prefix = "MCP_FUZZ", .name = "mcp-client-response", .scale = 4 });
 }
 
