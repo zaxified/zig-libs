@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Pagination and definition metadata (S2 R10, R4). **Additive; with the defaults every
+  answer is byte-identical to before.**
+  - `Server.page_size` (0 = whole catalog, the default): `tools/list`, `resources/list`,
+    `resources/templates/list` and `prompts/list` page by it and emit `nextCursor`, an opaque base64url
+    position bound to its list; a cursor that is not ours for that list is -32602 "Invalid cursor"
+    (pagination.mdx SHOULD). With pagination off a request's cursor is ignored, as before.
+  - `meta_json` (`_meta`, a JSON object) on `Tool`, `Resource`, `ResourceTemplate`, `Prompt`;
+    `Annotations` (`audience`, `priority`, `lastModified`) and `size` on `Resource`, annotations on
+    `ResourceTemplate`; `Info.description`/`website_url`/`icons` on both `serverInfo` shapes. A
+    `meta_json` that is not one JSON object answers its list with -32603.
 - **2026-10-20** — S2 work, first batch (survey R-list in SPEC Backlog). **Additive, no wire change for
   existing servers.**
   - `ToolCall.arg(T, key)` → `Arg(T)` (`absent` / `value` / `wrong_type`) for `[]const u8`, `i64`, `f64`,

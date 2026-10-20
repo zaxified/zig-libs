@@ -289,12 +289,12 @@ pub const spec_anchor_index = [_]MethodAnchor{
     .{ .method = "initialize", .anchor = .partial, .reason = "spec's lifecycle.mdx request (roots/sampling/elicitation/tasks capabilities, extended clientInfo) decodes verbatim; the response cannot be byte-identical because this server always advertises its own fixed, narrower capability set (no logging, no tasks, listChanged:false) -- a deliberate design choice (SPEC.md), not a gap" },
     .{ .method = "notifications/initialized", .anchor = .literal_example, .reason = "" },
     .{ .method = "ping", .anchor = .literal_example, .reason = "" },
-    .{ .method = "tools/list", .anchor = .partial, .reason = "spec's tools.mdx request (with a pagination cursor, which this module ignores by design -- pagination is out of scope) decodes verbatim; the response is not compared: the spec's example Tool carries an `execution` field (tasks) this module does not produce. title/icons exist since 2026-09-30 and are compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
+    .{ .method = "tools/list", .anchor = .partial, .reason = "spec's tools.mdx request (with an illustrative pagination cursor, ignored while `page_size` is 0; pagination since 2026-10-20) decodes verbatim; the response is not compared: the spec's example Tool carries an `execution` field (tasks) this module does not produce. title/icons exist since 2026-09-30 and are compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "tools/call", .anchor = .literal_example, .reason = "" },
-    .{ .method = "resources/list", .anchor = .partial, .reason = "spec's resources.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Resource shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
+    .{ .method = "resources/list", .anchor = .partial, .reason = "spec's resources.mdx request (with an illustrative pagination cursor, ignored while `page_size` is 0) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Resource shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "resources/read", .anchor = .literal_example, .reason = "" },
     .{ .method = "resources/templates/list", .anchor = .partial, .reason = "spec's resources.mdx request (no params) decodes trivially; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same ResourceTemplate shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
-    .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with a pagination cursor, ignored by design) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Prompt shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
+    .{ .method = "prompts/list", .anchor = .partial, .reason = "spec's prompts.mdx request (with an illustrative pagination cursor, ignored while `page_size` is 0) decodes verbatim; the response is not compared against the 2025-11-25 example; title/icons exist since 2026-09-30 and the same Prompt shape is compared value-for-value on the 2026-07-28 path (modern_spec_anchor_index)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
     .{ .method = "server/discover", .anchor = .no_example, .reason = "stateless-only (2026-07-28): no session revision defines it, and a session-path request for it lacks the _meta version and is answered -32602. Its anchor is in modern_spec_anchor_index" },
     .{ .method = "subscriptions/listen", .anchor = .no_example, .reason = "stateless-only (2026-07-28): no session revision defines it (resources/subscribe and the GET stream were its predecessors, neither implemented here); a session-path request lacks the _meta version and is answered -32602. Its anchor is in modern_spec_anchor_index" },
@@ -320,12 +320,12 @@ pub const spec_anchor_index = [_]MethodAnchor{
 /// `server/discover` example carries it and is compared with it.
 pub const modern_spec_anchor_index = [_]MethodAnchor{
     .{ .method = "server/discover", .anchor = .partial, .reason = "both the schema example and server/discover.mdx's example match value-for-value except supportedVersions: theirs is a modern-only server listing [\"2026-07-28\"], ours is dual-era and lists the session revisions too -- which basic/versioning.mdx's own UnsupportedProtocolVersionError example does" },
-    .{ .method = "tools/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor: pagination is not implemented (the whole catalog is one page)" },
+    .{ .method = "tools/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor: the example's token is illustrative, ours is an opaque base64url position written only when `page_size` > 0 (pagination since 2026-10-20)" },
     .{ .method = "tools/call", .anchor = .literal_example, .reason = "" },
-    .{ .method = "resources/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (no pagination)" },
+    .{ .method = "resources/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (an illustrative token there; ours is opaque, see tools/list)" },
     .{ .method = "resources/read", .anchor = .literal_example, .reason = "" },
     .{ .method = "resources/templates/list", .anchor = .literal_example, .reason = "" },
-    .{ .method = "prompts/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (no pagination)" },
+    .{ .method = "prompts/list", .anchor = .partial, .reason = "value-equal to the schema example except nextCursor (an illustrative token there; ours is opaque, see tools/list)" },
     .{ .method = "prompts/get", .anchor = .literal_example, .reason = "" },
     .{ .method = "subscriptions/listen", .anchor = .partial, .reason = "the acknowledgment and the graceful-close response are value-equal to the schema examples (listen-acknowledged.json, listen-closed-response.json) except the acknowledged `notifications` filter: this server emits no change notification of any kind, so it honours none of the requested types, acknowledges `{}` (subscriptions.mdx: unsupported types are omitted) and ends the subscription at once with the completion result; the closing result also carries serverInfo, which the example omits" },
 };
@@ -821,7 +821,22 @@ fn writeImplementation(jw: *std.json.Stringify, info: *const Info) std.Io.Writer
     }
     try jw.objectField("version");
     try jw.write(info.version);
+    try writeImplementationExtras(jw, info);
     try jw.endObject();
+}
+
+/// `Implementation`'s optional `description`, `websiteUrl` and `icons`, on
+/// both the session `serverInfo` and the 2026-07-28 `_meta` one.
+fn writeImplementationExtras(jw: *std.json.Stringify, info: *const Info) std.Io.Writer.Error!void {
+    if (info.description) |d| {
+        try jw.objectField("description");
+        try jw.write(d);
+    }
+    if (info.website_url) |u| {
+        try jw.objectField("websiteUrl");
+        try jw.write(u);
+    }
+    if (info.icons.len != 0) try writeTitleIcons(jw, null, info.icons);
 }
 
 /// Open a result object: `{`, plus the `resultType` a 2026-07-28 result MUST
@@ -2182,6 +2197,65 @@ pub const StateSeal = struct {
 
 // ── tool registration ───────────────────────────────────────────────────────
 
+/// The four paginated list methods (spec server/utilities/pagination.mdx).
+const ListKind = enum {
+    tools,
+    resources,
+    templates,
+    prompts,
+
+    fn tag(self: ListKind) u8 {
+        return switch (self) {
+            .tools => 't',
+            .resources => 'r',
+            .templates => 'u',
+            .prompts => 'p',
+        };
+    }
+
+    fn buildFailure(self: ListKind) []const u8 {
+        return switch (self) {
+            .tools => "failed to build tools/list",
+            .resources => "failed to build resources/list",
+            .templates => "failed to build resources/templates/list",
+            .prompts => "failed to build prompts/list",
+        };
+    }
+
+    /// The opaque cursor for "the page starting at entry `start`":
+    /// base64url-nopad of `<tag>:<start>`, so one list's cursor is refused by
+    /// another. A position, not a snapshot: a catalog that grows or shrinks
+    /// between pages shifts what the next page starts with (the spec leaves
+    /// cursor stability to the server).
+    fn cursor(self: ListKind, arena: std.mem.Allocator, start: usize) ![]const u8 {
+        const raw = try arena.print("{c}:{d}", .{ self.tag(), start });
+        const enc = std.base64.url_safe_no_pad.Encoder;
+        const buf = try arena.alloc(u8, enc.calcSize(raw.len));
+        return enc.encode(buf, raw);
+    }
+
+    /// The start index a cursor names, or null when it is not one this list
+    /// minted (or names a position past the end).
+    fn decodeCursor(self: ListKind, text: []const u8, len: usize) ?usize {
+        if (text.len == 0 or text.len > 32) return null;
+        var buf: [24]u8 = undefined;
+        const dec = std.base64.url_safe_no_pad.Decoder;
+        const n = dec.calcSizeForSlice(text) catch return null;
+        if (n > buf.len or n < 3) return null;
+        dec.decode(buf[0..n], text) catch return null;
+        const raw = buf[0..n];
+        if (raw[0] != self.tag() or raw[1] != ':') return null;
+        const digits = raw[2..];
+        // Canonical decimal only: no sign, no leading zero, so each position
+        // has exactly one cursor.
+        if (digits.len > 1 and digits[0] == '0') return null;
+        for (digits) |d| if (d < '0' or d > '9') return null;
+        const start = std.fmt.parseInt(usize, digits, 10) catch return null;
+        if (start > len) return null;
+        return start;
+    }
+};
+
 /// What `ToolCall.arg` found for one argument: nothing (absent or JSON
 /// `null`), a value of the requested type, or a value of another JSON type —
 /// the case a handler reports as "'x' must be a string", not "missing 'x'".
@@ -2573,6 +2647,11 @@ pub const Tool = struct {
     title: ?[]const u8 = null,
     icons: []const Icon = &.{},
     annotations: ?ToolAnnotations = null,
+    /// The definition's `_meta`, as JSON **object** text ("" = none) — where
+    /// extensions put their keys, e.g. MCP Apps' `{"ui":{"resourceUri":
+    /// "ui://…"}}`. Text that is not one JSON object makes the list that
+    /// carries it answer -32603, like an invalid `input_schema`.
+    meta_json: []const u8 = "",
     handler: Handler,
     /// Opaque app-state pointer threaded to every call of this tool.
     ctx: ?*anyopaque = null,
@@ -2701,6 +2780,11 @@ pub const Resource = struct {
     mime_type: []const u8 = "",
     title: ?[]const u8 = null,
     icons: []const Icon = &.{},
+    annotations: ?Annotations = null,
+    /// Size of the raw content in bytes, when known (before base64).
+    size: ?u64 = null,
+    /// `_meta` as JSON object text ("" = none); see `Tool.meta_json`.
+    meta_json: []const u8 = "",
     handler: ResourceHandler,
     /// Opaque app-state pointer threaded to every read of this resource.
     ctx: ?*anyopaque = null,
@@ -2718,6 +2802,9 @@ pub const ResourceTemplate = struct {
     mime_type: []const u8 = "",
     title: ?[]const u8 = null,
     icons: []const Icon = &.{},
+    annotations: ?Annotations = null,
+    /// `_meta` as JSON object text ("" = none); see `Tool.meta_json`.
+    meta_json: []const u8 = "",
     handler: ?ResourceHandler = null,
     /// Opaque app-state pointer threaded to every read this template serves.
     ctx: ?*anyopaque = null,
@@ -2858,6 +2945,8 @@ pub const Prompt = struct {
     arguments: []const PromptArgument = &.{},
     title: ?[]const u8 = null,
     icons: []const Icon = &.{},
+    /// `_meta` as JSON object text ("" = none); see `Tool.meta_json`.
+    meta_json: []const u8 = "",
     handler: PromptHandler,
     /// Opaque app-state pointer threaded to every get of this prompt.
     ctx: ?*anyopaque = null,
@@ -2870,7 +2959,51 @@ pub const Info = struct {
     version: []const u8,
     title: ?[]const u8 = null,
     instructions: ?[]const u8 = null,
+    /// Spec `Implementation` extras (2025-11-25+), omitted when unset.
+    description: ?[]const u8 = null,
+    website_url: ?[]const u8 = null,
+    icons: []const Icon = &.{},
 };
+
+/// Spec `Annotations` on a resource, template or content block: hints for
+/// the client, every field omitted when unset. `priority` is 0..1 (1 = most
+/// important); `last_modified` an ISO 8601 timestamp.
+pub const Annotations = struct {
+    audience: []const RoleAlias = &.{},
+    priority: ?f64 = null,
+    last_modified: ?[]const u8 = null,
+};
+
+fn writeAnnotations(jw: *std.json.Stringify, a: Annotations) std.Io.Writer.Error!void {
+    if (a.audience.len == 0 and a.priority == null and a.last_modified == null) return;
+    try jw.objectField("annotations");
+    try jw.beginObject();
+    if (a.audience.len != 0) {
+        try jw.objectField("audience");
+        try jw.beginArray();
+        for (a.audience) |r| try jw.write(@tagName(r));
+        try jw.endArray();
+    }
+    if (a.priority) |pr| {
+        try jw.objectField("priority");
+        try jw.write(pr);
+    }
+    if (a.last_modified) |lm| {
+        try jw.objectField("lastModified");
+        try jw.write(lm);
+    }
+    try jw.endObject();
+}
+
+/// Emit a definition's `_meta` (see `Tool.meta_json`); refuses text that is
+/// not one JSON object.
+fn writeMetaField(arena: std.mem.Allocator, jw: *std.json.Stringify, meta_json: []const u8) !void {
+    if (meta_json.len == 0) return;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, meta_json, .{});
+    if (v != .object) return error.InvalidMeta;
+    try jw.objectField("_meta");
+    try jw.write(v);
+}
 
 // ── server ──────────────────────────────────────────────────────────────────
 
@@ -2904,6 +3037,9 @@ pub const Server = struct {
     /// (`tools/list`, `resources/list`, `resources/templates/list`,
     /// `prompts/list`). See `CacheHint` for why the default caches nothing.
     list_cache: CacheHint = .{},
+    /// Entries per page of the four list methods; 0 (the default) = the whole
+    /// catalog in one answer, never a `nextCursor`. See `handleList`.
+    page_size: usize = 0,
     /// Default caching hint on a 2026-07-28 `resources/read`; a handler can
     /// override it per read (`ResourceRequest.cache`).
     read_cache: CacheHint = .{},
@@ -3502,23 +3638,15 @@ pub const Server = struct {
                 if (modern == null) return sendError(arena, out, id, error_code.invalid_params, "Missing " ++ meta_key.protocol_version);
                 try self.handleListen(arena, out, id.?, obj.get("params"));
             },
-            .@"tools/list" => {
-                const list = self.buildToolsList(arena, modern != null) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    // A registered schema literal that is not valid JSON is a
-                    // server-side defect — surface it as -32603, don't crash.
-                    else => return sendError(arena, out, id, error_code.internal_error, "failed to build tools/list"),
-                };
-                try sendResultRaw(arena, out, id, list);
-            },
+            .@"tools/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .tools),
             // Session-only: 2026-07-28 removed it (changelog "Major changes"
             // 5), and `servedStatelessly` has already refused a modern one.
             .ping => try sendResultRaw(arena, out, id, "{}"),
             .@"tools/call" => try self.handleCall(arena, out, id, obj.get("params"), peer, modern),
-            .@"resources/list" => try self.handleResourcesList(arena, out, id, modern != null),
+            .@"resources/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .resources),
             .@"resources/read" => try self.handleResourcesRead(arena, out, id, obj.get("params"), peer, modern),
-            .@"resources/templates/list" => try self.handleTemplatesList(arena, out, id, modern != null),
-            .@"prompts/list" => try self.handlePromptsList(arena, out, id, modern != null),
+            .@"resources/templates/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .templates),
+            .@"prompts/list" => try self.handleList(arena, out, id, obj.get("params"), modern != null, .prompts),
             .@"prompts/get" => try self.handlePromptsGet(arena, out, id, obj.get("params"), peer, modern),
         }
     }
@@ -3678,6 +3806,7 @@ pub const Server = struct {
         try jw.write(self.info.title orelse self.info.name);
         try jw.objectField("version");
         try jw.write(self.info.version);
+        try writeImplementationExtras(jw, &self.info);
         try jw.endObject();
         if (self.info.instructions) |instr| {
             try jw.objectField("instructions");
@@ -3695,31 +3824,79 @@ pub const Server = struct {
     /// Tools come out in registration order, which is what 2026-07-28 asks
     /// for ("SHOULD return tools in a deterministic order", for client caches
     /// and LLM prompt-cache hits): the same registrations give the same bytes.
-    fn buildToolsList(self: *const Server, arena: std.mem.Allocator, modern: bool) ![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        try beginResult(&jw, modern);
+    fn buildToolsList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, start: usize, end: usize) !void {
         try jw.objectField("tools");
         try jw.beginArray();
-        for (self.tools.items) |t| {
+        for (self.tools.items[start..end]) |t| {
             try jw.beginObject();
             try jw.objectField("name");
             try jw.write(t.name);
-            try writeTitleIcons(&jw, t.title, t.icons);
+            try writeTitleIcons(jw, t.title, t.icons);
             try jw.objectField("description");
             try jw.write(t.description);
             try jw.objectField("inputSchema");
-            try writeRawJson(arena, &jw, t.input_schema);
+            try writeRawJson(arena, jw, t.input_schema);
             if (t.output_schema.len != 0) {
                 try jw.objectField("outputSchema");
-                try writeRawJson(arena, &jw, t.output_schema);
+                try writeRawJson(arena, jw, t.output_schema);
             }
-            if (t.annotations) |a| try writeToolAnnotations(&jw, a);
+            if (t.annotations) |a| try writeToolAnnotations(jw, a);
+            try writeMetaField(arena, jw, t.meta_json);
             try jw.endObject();
         }
         try jw.endArray();
-        try endResult(&jw, &self.info, modern, self.list_cache);
-        return aw.written();
+    }
+
+    /// The four list methods, one path: the request's `cursor` (an opaque
+    /// token this server minted, `ListKind.cursor`) picks the first entry,
+    /// `page_size` the page, and `nextCursor` is emitted while entries remain.
+    /// With `page_size` 0 the whole catalog is one page and no `nextCursor`
+    /// is ever written — the answers before pagination existed. A cursor that
+    /// is not one of ours for this list is -32602 (pagination.mdx: "Invalid
+    /// cursors SHOULD result in an error with code -32602").
+    fn handleList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params: ?std.json.Value, modern: bool, kind: ListKind) Error!void {
+        const len = switch (kind) {
+            .tools => self.tools.items.len,
+            .resources => self.resources.items.len,
+            .templates => self.resource_templates.items.len,
+            .prompts => self.prompts.items.len,
+        };
+        var start: usize = 0;
+        // Pagination off: this server never minted a cursor, so any cursor is
+        // ignored, as before pagination existed (the spec's own requests carry
+        // an illustrative one).
+        if (self.page_size != 0) if (params) |p| if (p == .object) if (p.object.get("cursor")) |c| switch (c) {
+            .null => {},
+            .string => |s| start = kind.decodeCursor(s, len) orelse
+                return sendError(arena, out, id, error_code.invalid_params, "Invalid cursor"),
+            else => return sendError(arena, out, id, error_code.invalid_params, "Invalid cursor"),
+        };
+        const end = if (self.page_size == 0) len else @min(len, start + self.page_size);
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+        self.buildList(arena, &jw, modern, kind, start, end, len) catch |err| switch (err) {
+            error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+            // A registered schema or `_meta` literal that is not valid JSON is
+            // a server-side defect — surface it as -32603, don't crash.
+            else => return sendError(arena, out, id, error_code.internal_error, kind.buildFailure()),
+        };
+        try sendResultRaw(arena, out, id, aw.written());
+    }
+
+    fn buildList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, modern: bool, kind: ListKind, start: usize, end: usize, len: usize) !void {
+        try beginResult(jw, modern);
+        switch (kind) {
+            .tools => try self.buildToolsList(arena, jw, start, end),
+            .resources => try self.buildResourcesList(arena, jw, start, end),
+            .templates => try self.buildTemplatesList(arena, jw, start, end),
+            .prompts => try self.buildPromptsList(arena, jw, start, end),
+        }
+        if (end < len) {
+            try jw.objectField("nextCursor");
+            try jw.write(try kind.cursor(arena, end));
+        }
+        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     fn handleCall(self: *Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, params_opt: ?std.json.Value, peer: u64, modern: ?*const ModernRequest) Error!void {
@@ -3774,20 +3951,10 @@ pub const Server = struct {
         });
     }
 
-    /// Assemble + send the `resources/list` result from the registered
-    /// catalog (no pagination — never emits `nextCursor`).
-    fn handleResourcesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildResourcesList(&jw, modern) catch return error.OutOfMemory;
-        try sendResultRaw(arena, out, id, aw.written());
-    }
-
-    fn buildResourcesList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
-        try beginResult(jw, modern);
+    fn buildResourcesList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, start: usize, end: usize) !void {
         try jw.objectField("resources");
         try jw.beginArray();
-        for (self.resources.items) |r| {
+        for (self.resources.items[start..end]) |r| {
             try jw.beginObject();
             try jw.objectField("uri");
             try jw.write(r.uri);
@@ -3802,26 +3969,21 @@ pub const Server = struct {
                 try jw.objectField("mimeType");
                 try jw.write(r.mime_type);
             }
+            if (r.annotations) |a| try writeAnnotations(jw, a);
+            if (r.size) |sz| {
+                try jw.objectField("size");
+                try jw.write(sz);
+            }
+            try writeMetaField(arena, jw, r.meta_json);
             try jw.endObject();
         }
         try jw.endArray();
-        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
-    /// Assemble + send the `resources/templates/list` result from the
-    /// registered template catalog.
-    fn handleTemplatesList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildTemplatesList(&jw, modern) catch return error.OutOfMemory;
-        try sendResultRaw(arena, out, id, aw.written());
-    }
-
-    fn buildTemplatesList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
-        try beginResult(jw, modern);
+    fn buildTemplatesList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, start: usize, end: usize) !void {
         try jw.objectField("resourceTemplates");
         try jw.beginArray();
-        for (self.resource_templates.items) |t| {
+        for (self.resource_templates.items[start..end]) |t| {
             try jw.beginObject();
             try jw.objectField("uriTemplate");
             try jw.write(t.uri_template);
@@ -3836,10 +3998,11 @@ pub const Server = struct {
                 try jw.objectField("mimeType");
                 try jw.write(t.mime_type);
             }
+            if (t.annotations) |a| try writeAnnotations(jw, a);
+            try writeMetaField(arena, jw, t.meta_json);
             try jw.endObject();
         }
         try jw.endArray();
-        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     /// `resources/read`: validate params, resolve the uri (exact resource
@@ -3905,20 +4068,10 @@ pub const Server = struct {
         try sendResultRaw(arena, out, id, aw.written());
     }
 
-    /// Assemble + send the `prompts/list` result from the registered catalog
-    /// (no pagination — never emits `nextCursor`).
-    fn handlePromptsList(self: *const Server, arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Value, modern: bool) Error!void {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        self.buildPromptsList(&jw, modern) catch return error.OutOfMemory;
-        try sendResultRaw(arena, out, id, aw.written());
-    }
-
-    fn buildPromptsList(self: *const Server, jw: *std.json.Stringify, modern: bool) std.Io.Writer.Error!void {
-        try beginResult(jw, modern);
+    fn buildPromptsList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, start: usize, end: usize) !void {
         try jw.objectField("prompts");
         try jw.beginArray();
-        for (self.prompts.items) |p| {
+        for (self.prompts.items[start..end]) |p| {
             try jw.beginObject();
             try jw.objectField("name");
             try jw.write(p.name);
@@ -3946,10 +4099,10 @@ pub const Server = struct {
                 }
                 try jw.endArray();
             }
+            try writeMetaField(arena, jw, p.meta_json);
             try jw.endObject();
         }
         try jw.endArray();
-        try endResult(jw, &self.info, modern, self.list_cache);
     }
 
     /// `prompts/get`: validate params + the declared required arguments
@@ -4764,6 +4917,127 @@ test "tools/call: handler failure -> isError:true (missing required arg)" {
         \\
     );
     try testing.expectEqual(@as(u32, 1), app.calls); // handler was reached
+}
+
+fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {
+    return false;
+}
+
+test "pagination: page_size pages the list, nextCursor until the last page, then none" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.page_size = 2;
+    inline for (.{ "a", "b", "c", "d", "e" }) |n| {
+        try s.addTool(.{ .name = n, .description = "", .input_schema = "{}", .handler = pageTool });
+    }
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a","description":"","inputSchema":{}},{"name":"b","description":"","inputSchema":{}}],"nextCursor":"dDoy"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"dDoy"}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"c","description":"","inputSchema":{}},{"name":"d","description":"","inputSchema":{}}],"nextCursor":"dDo0"}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"dDo0"}}
+    ,
+        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"e","description":"","inputSchema":{}}]}}
+        \\
+    );
+    // The end position itself is a valid (empty) page; a null cursor is none.
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{"cursor":"dDo1"}}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"result":{"tools":[]}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{"cursor":null}}
+    ,
+        \\{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"a","description":"","inputSchema":{}},{"name":"b","description":"","inputSchema":{}}],"nextCursor":"dDoy"}}
+        \\
+    );
+    // Not ours, another list's, past the end, non-canonical, not a string: -32602.
+    inline for (.{ "\"zzz\"", "\"cDoy\"", "\"dDo5\"", "\"dDowMg\"", "\"\"", "7" }) |c| {
+        try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\",\"params\":{\"cursor\":" ++ c ++ "}}",
+            \\{"jsonrpc":"2.0","id":6,"error":{"code":-32602,"message":"Invalid cursor"}}
+            \\
+        );
+    }
+}
+
+test "pagination: the 2026-07-28 list keeps resultType/ttl/serverInfo around nextCursor" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.page_size = 1;
+    try s.addPrompt(.{ .name = "p1", .handler = protoErrPrompt });
+    try s.addPrompt(.{ .name = "p2", .handler = protoErrPrompt });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+    , &aw.writer);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const result = parsed.value.object.get("result").?.object;
+    try testing.expectEqualStrings("complete", result.get("resultType").?.string);
+    try testing.expectEqual(@as(usize, 1), result.get("prompts").?.array.items.len);
+    try testing.expectEqualStrings("cDox", result.get("nextCursor").?.string);
+    try testing.expect(result.get("ttlMs") != null);
+}
+
+test "definitions: _meta, resource annotations/size and Implementation extras on the wire" {
+    var s = Server.init(testing.allocator, .{
+        .name = "srv",
+        .version = "1",
+        .description = "does things",
+        .website_url = "https://srv.example/",
+        .icons = &.{.{ .src = "https://srv.example/i.png", .mime_type = "image/png" }},
+    });
+    defer s.deinit();
+    try s.addTool(.{ .name = "app", .description = "", .input_schema = "{}", .meta_json = "{\"ui\":{\"resourceUri\":\"ui://app\"}}", .handler = pageTool });
+    try s.addResource(.{
+        .uri = "file:///a",
+        .name = "a",
+        .annotations = .{ .audience = &.{ .user, .assistant }, .priority = 0.5, .last_modified = "2026-10-20T00:00:00Z" },
+        .size = 42,
+        .meta_json = "{\"k\":1}",
+        .handler = contextResource,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"app","description":"","inputSchema":{},"_meta":{"ui":{"resourceUri":"ui://app"}}}]}}
+        \\
+    );
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"resources":[{"uri":"file:///a","name":"a","annotations":{"audience":["user","assistant"],"priority":0.5,"lastModified":"2026-10-20T00:00:00Z"},"size":42,"_meta":{"k":1}}]}}
+        \\
+    );
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{}}}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(),
+        \\"serverInfo":{"name":"srv","title":"srv","version":"1","description":"does things","websiteUrl":"https://srv.example/","icons":[{"src":"https://srv.example/i.png","mimeType":"image/png"}]}
+    ) != null);
+    // `_meta` that is not one JSON object is a server-side defect: -32603.
+    var bad = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer bad.deinit();
+    try bad.addPrompt(.{ .name = "p", .meta_json = "[1]", .handler = protoErrPrompt });
+    try expectResponse(&bad,
+        \\{"jsonrpc":"2.0","id":4,"method":"prompts/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":4,"error":{"code":-32603,"message":"failed to build prompts/list"}}
+        \\
+    );
 }
 
 test "ToolCall.arg: absent, null, wrong type and each value type apart (bxp request 2026-10-19)" {
@@ -7623,7 +7897,7 @@ test "ping: byte-identical to the spec's example (basic/utilities/ping.mdx)" {
     );
 }
 
-test "tools/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+test "tools/list: the spec's cursor-bearing request decodes verbatim (cursor ignored while page_size is 0)" {
     var s = testServer(null);
     defer s.deinit();
     // Verbatim request from server/tools.mdx ("Listing Tools"); this module
@@ -7772,7 +8046,7 @@ test "resources/read: byte-identical to the spec's example (server/resources.mdx
     );
 }
 
-test "resources/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+test "resources/list: the spec's cursor-bearing request decodes verbatim (cursor ignored while page_size is 0)" {
     var lib = TestLibrary{};
     var s = try libraryServer(&lib);
     defer s.deinit();
@@ -7789,7 +8063,7 @@ test "resources/list: the spec's cursor-bearing request decodes verbatim (pagina
     );
 }
 
-test "prompts/list: the spec's cursor-bearing request decodes verbatim (pagination ignored by design)" {
+test "prompts/list: the spec's cursor-bearing request decodes verbatim (cursor ignored while page_size is 0)" {
     var lib = TestLibrary{};
     var s = try libraryServer(&lib);
     defer s.deinit();

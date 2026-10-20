@@ -422,13 +422,13 @@ coordinator's under the rule "parity with the reference, or safer":
 | R1 | Tool-result content blocks: `image`, `audio`, `resource_link`, embedded `resource`, several per result, block `annotations`; prompt messages with the same blocks | M | do — additive, text stays the default |
 | R2 | Handler-chosen protocol errors (`code`, `message`, `data`) for tools/resources/prompts; `URLElicitationRequiredError` (-32042) and `MissingRequiredClientCapability` (-32021) builders | S | **DONE 2026-10-20** |
 | R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
-| R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | do |
+| R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | **DONE 2026-10-20** |
 | R5 | Inbound `notifications/cancelled` reaching a running tool (cancel flag on the call) | M | do — `serve` stays serial; a concurrent stdio loop is opt-in |
 | R6 | `strArgChecked`/`requireStr` + typed `int/num/bool` accessors (bxp request) | S | **DONE 2026-10-20** |
 | R7 | Tool input validated against `inputSchema` before the handler (documented JSON Schema subset) → `isError:true`, the TS convention | M | do — needs a schema validator; none exists in zig-libs |
 | R8 | `structuredContent` validated against `outputSchema`; a tool that declares one and prints non-JSON → `isError` | S after R7 | do |
 | R9 | Custom request/notification handlers (vendor methods), `capabilities.extensions` + `experimental` | M | do — generic hook; Apps/Skills helpers later |
-| R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | do |
+| R10 | Pagination (`cursor`/`nextCursor`) on the four lists, `Server.page_size` (0 = off, goldens unchanged) | S-M | **DONE 2026-10-20** |
 | R11 | `completion/complete` for prompt arguments and template variables | M | do |
 | R12 | `list_changed`, `resources/subscribe`/`updated`; held-open `subscriptions/listen` (the HTTP half is `mcp-http`'s) | L | do — both SDKs ship it |
 | R13 | `notifications/elicitation/complete` (session era) | S | **DONE 2026-10-20** |
