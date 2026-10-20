@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 batch and speed. Every WHATWG single-byte encoding (24 new `Encoding` tags,
+  appended; tables generated from vendored WHATWG indexes by `tools/gen_tables.py`), the full WHATWG
+  label table (`lookupLabel`, `LabelTarget`, `decodeReplacement`), `whatwgName` and introspection,
+  caller-buffer `Decoder.decodeInto` / `Encoder.encodeInto` (`Progress`), the streaming `Encoder`
+  (pages and UTF-16), unmappable modes (`encodeFromUtf8Opts`: `?`, ignore, `&#NNNN;`, fatal).
+  **Behavioural:** a page byte the Standard leaves undefined decodes to U+FFFD (none of the five old
+  pages has one), and `decodeFatal` refuses it. New core (`core.zig`): ASCII 32 bytes at a time,
+  two-level reverse tables (the encoder searched 128 entries per character), Keiser–Lemire vector
+  UTF-8 validation (`utf8_simd.zig`, simdjson port), branchless UTF-16 → UTF-8. Bench vs encoding_rs
+  0.36–1.06× (was up to 40×).
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** comparative bench `zig build bench-encoding` vs encoding_rs 0.8.42 and Go x/text v0.42.0 (tools only).
 - **2026-10-18** — Ported to Zig 0.17.0: tests: enum iteration via `field_values`; `strRepeat` branch quota scaled with length.
 - **2026-10-09** — tests: deterministic fuzz driver `ENCODING_FUZZ` over the existing harnesses.

@@ -43,12 +43,17 @@ C1) plus per-page override tables.
 ```zig
 const encoding = @import("encoding");
 
-pub const Encoding = enum { utf8, windows_1250, windows_1252, iso_8859_1, iso_8859_2, iso_8859_15 };
-fn Encoding.parse(s: []const u8) ?Encoding;          // case-insensitive, aliases
-fn Encoding.canonicalName(self) []const u8;
+// Every WHATWG single-byte encoding (29 pages; the first five tags are the
+// original ones) plus utf8. 2026-10-20.
+pub const Encoding = enum { utf8, windows_1250, windows_1252, iso_8859_1, iso_8859_2, iso_8859_15, ibm866, koi8_r, windows_1251, … };
+fn Encoding.parse(s: []const u8) ?Encoding;          // case-insensitive, every WHATWG label + a few extras
+fn Encoding.canonicalName(self) []const u8;          // "windows-1250", lower case
+fn Encoding.whatwgName(self) []const u8;             // "KOI8-R", the Standard's spelling
+fn lookupLabel(s) ?LabelTarget;                      // .encoding / .utf16 / .replacement / .x_user_defined / .unsupported ("Shift_JIS")
 
 fn decodeToUtf8(alloc, bytes: []const u8, enc: Encoding) ![]u8;   // caller owns result
-fn encodeFromUtf8(alloc, utf8: []const u8, enc: Encoding) ![]u8;  // caller owns result
+fn encodeFromUtf8(alloc, utf8: []const u8, enc: Encoding) ![]u8;  // caller owns result; unmappable -> '?'
+fn encodeFromUtf8Opts(alloc, utf8, enc, .{ .unmappable = .html_ncr }) ![]u8; // or .ignore / .fatal (error.Unmappable)
 
 // 2026-10-04: UTF-16, BOM, streaming, fatal
 fn decode(alloc, bytes, fallback: Encoding) !Decoded;           // WHATWG "decode": a BOM wins and is removed
@@ -60,6 +65,12 @@ fn decodeFatal(alloc, bytes, kind: Decoder.Kind) ![]u8;         // error.Malform
 var d: Decoder = .init(.{ .encoding = .windows_1250 }, .{});    // or .{ .utf16 = .le }; .fatal = true
 try d.feed(alloc, &out, chunk);                                  // any chunking: split sequences carry over
 try d.finish(alloc, &out);                                       // end of stream
+
+// 2026-10-20: caller-buffer core (no allocation) and the streaming encoder
+const p = d.decodeInto(src, dst, last);       // Progress{ .status = .input_empty / .output_full / .malformed, .read, .written }
+var e: Encoder = .init(.{ .encoding = .windows_1250 }, .{ .unmappable = .question_mark });
+const q = e.encodeInto(cell, buf, true);      // reuse `buf` per cell; e.maxEncodedLen(n) sizes it
+try e.feed(alloc, &out, chunk); try e.finish(alloc, &out);
 ```
 
 **UTF-16 is not an `Encoding` member, on purpose.** Every `Encoding` maps bytes
@@ -70,7 +81,8 @@ An Excel "Unicode Text" export (UTF-16LE with `ff fe`) is read with
 `decode(alloc, bytes, fallback)`.
 
 **Data-lenient — never traps.** `decodeToUtf8` returns **valid UTF-8
-unconditionally**: from a legacy page structurally (all 128 high bytes map),
+unconditionally**: from a legacy page structurally (a byte the Standard leaves
+undefined, as in windows-1253 or ISO-8859-8, becomes U+FFFD),
 and from `.utf8` because malformed input is replaced with U+FFFD — one per
 **maximal subpart** of an ill-formed sequence, WHATWG's decoder error mode (since
 2026-10-04; before it was one per byte, so `e2 82` was two U+FFFD, now one). On encode, a codepoint with no representation in the target
@@ -84,18 +96,20 @@ either behaviour: WHATWG maps the labels `iso-8859-1` / `latin1` to the
 **windows-1252** encoding, because that is what the web contains. Here they
 select `iso_8859_1`, the true ISO/IEC 8859-1 page. `\x93quoted\x94` is
 `“quoted”` in a browser and a pair of C1 controls here. Pass `.windows_1252`
-explicitly for web-sourced data. Every other label in the WHATWG table for
-these five pages is accepted, and leading/trailing whitespace is stripped.
+explicitly for web-sourced data. Every other label in the WHATWG table is
+accepted, and leading/trailing whitespace is stripped.
+
+**Speed (2026-10-20):** 0.36–1.06× encoding_rs 0.8.42 over 14 rows
+(`zig build bench-encoding`): ASCII runs 32 bytes at a time, a single-byte
+page through a precomputed UTF-8 table and a two-level reverse table, UTF-8
+validated by the Keiser–Lemire vector algorithm (port of simdjson's, NOTICE).
 
 ## Out of scope (not planned)
 
-Broader WHATWG Encoding Standard coverage — other single-byte pages
-(windows-1251/1253–1258, KOI8, ISO-8859-3..16) and multi-byte/CJK (Shift-JIS,
-EUC-JP, GBK/GB18030, Big5) — is **intentionally not built** (every table ships
-in every consumer's binary). The
-`build(&overrides)` table pattern would generalize, but there is no in-house
-need beyond the European subset; a project that must ingest CJK/Cyrillic legacy
-text should handle that at its own edge. Reopen only on a concrete requirement.
+CJK multi-byte encodings (Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, GBK/GB18030,
+Big5) are decided (owner 2026-10-20) but not built yet: they come behind a
+build option `-Dcjk`, so only a consumer that enables it pays their tables.
+`lookupLabel` already names them (`.unsupported`).
 
 ## Verify
 

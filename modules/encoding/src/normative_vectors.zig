@@ -145,6 +145,39 @@ pub fn parseUnicodeOrgTable(text: []const u8) !ParseResult {
     return .{ .table = table, .count = count };
 }
 
+/// Result of `parseWhatwgIndexSparse`.
+pub const SparseResult = struct {
+    /// Keyed by `byte - 0x80`; null = the index has no pointer for the byte.
+    table: [128]?u21,
+    /// Number of data lines consumed (128 minus the holes).
+    count: usize,
+};
+
+/// Like `parseWhatwgIndex`, but a pointer that is absent from the file is a
+/// hole (null), not an error: the WHATWG indexes of iso-8859-3/6/7/8,
+/// windows-874/1253/1255/1257 leave some bytes unmapped. A pointer listed
+/// twice or out of range is still an error.
+pub fn parseWhatwgIndexSparse(text: []const u8) !SparseResult {
+    var table: [128]?u21 = @as([128]?u21, @splat(null));
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const idx_field = fields.next() orelse return error.MalformedLine;
+        const cp_field = fields.next() orelse return error.MalformedLine;
+        const idx = try std.fmt.parseInt(usize, std.mem.trim(u8, idx_field, " \t"), 10);
+        if (idx >= 128) return error.IndexOutOfRange;
+        if (table[idx] != null) return error.DuplicateIndex;
+        const cp_s = std.mem.trim(u8, cp_field, " \t");
+        if (!std.mem.startsWith(u8, cp_s, "0x")) return error.MalformedCodepoint;
+        table[idx] = try std.fmt.parseInt(u21, cp_s[2..], 16);
+        count += 1;
+    }
+    return .{ .table = table, .count = count };
+}
+
 const testing = std.testing;
 
 test "parseWhatwgIndex: rejects a truncated table (count assertion fires)" {
@@ -163,4 +196,14 @@ test "parseUnicodeOrgTable: skips ASCII half and rejects truncated table" {
         "0x00\t0x0000\t#\tNULL\n" ++
         "0x80\t0x0080\t#\t<control>\n";
     try testing.expectError(error.MissingIndex, parseUnicodeOrgTable(text));
+}
+
+test "parseWhatwgIndexSparse: holes are null, duplicates rejected" {
+    const text = "# c\n  0\t0x0041\tA\n  2\t0x0042\tB\n";
+    const r = try parseWhatwgIndexSparse(text);
+    try testing.expectEqual(@as(usize, 2), r.count);
+    try testing.expectEqual(@as(?u21, 0x41), r.table[0]);
+    try testing.expectEqual(@as(?u21, null), r.table[1]);
+    try testing.expectEqual(@as(?u21, 0x42), r.table[2]);
+    try testing.expectError(error.DuplicateIndex, parseWhatwgIndexSparse("0\t0x41\n0\t0x42\n"));
 }

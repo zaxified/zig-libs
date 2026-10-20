@@ -23,21 +23,33 @@ MIT's:
     now reproduced verbatim and in full, from https://www.unicode.org/license.txt
     as fetched 2026-09-09.
 
-No data changed in this revision. No third-party SOURCE CODE is present —
-only normative conformance tables used exclusively to drive tests.
+No data changed in this revision. Third-party SOURCE CODE: since
+2026-10-20, one port — the vector UTF-8 validator (`src/utf8_simd.zig`), see
+the simdjson section at the end. The rest is normative conformance tables.
 
 ## WHATWG Encoding Standard — `index-*.txt` normative index tables
 
-`src/testdata/index-windows-1250.txt`, `index-windows-1252.txt`,
-`index-iso-8859-2.txt`, and `index-iso-8859-15.txt` are vendored verbatim from
-the Encoding Standard published at https://encoding.spec.whatwg.org/, each
-file's own header carrying `Date: 2024-09-18` (the version fetched). Each is
-the normative byte-0x80..0xFF -> codepoint mapping for that code page. Driven
-mechanically by `src/normative_vectors.zig` (parser) and `src/normative_test.zig`
-(the exhaustive 128-entry-per-page cross-check against `root.zig`'s tables).
+`src/testdata/index-*.txt` — one file for each of the 27 legacy single-byte
+indexes of the Standard (ibm866, iso-8859-2..8 (-8-I shares iso-8859-8's), 10,
+13..16, koi8-r, koi8-u, macintosh, windows-874, windows-1250..1258,
+x-mac-cyrillic) — and `src/testdata/encodings.json` (the Standard's table of
+encodings and labels) are vendored verbatim from the Encoding Standard published
+at https://encoding.spec.whatwg.org/, each index file's own header carrying
+`Date: 2024-09-18` (the version fetched; `encodings.json` carries no date).
+Each index is the normative byte-0x80..0xFF -> codepoint mapping for that code
+page. Driven mechanically by `src/normative_vectors.zig` (parser),
+`src/normative_test.zig` (the exhaustive 128-entry-per-page cross-check against
+`root.zig`'s tables) and `src/sb_tables_test.zig` (the same for the generated
+`src/sb_tables.zig`, plus the label table).
+
+`src/sb_tables.zig` is GENERATED from these files by `tools/gen_tables.py` and is
+a MODIFIED (reformatted, inverted, relabelled) rendering of their data — see the
+modification indication below.
 
 The Encoding Standard's own terms (`LICENSE` in the `whatwg/encoding`
-repository):
+repository, checked 2026-10-20; it is CC-BY 4.0 with BSD 3-Clause for portions
+incorporated into source code — the vendored data files are covered by the
+former):
 
     Copyright © WHATWG (Apple, Google, Mozilla, Microsoft).
 
@@ -51,10 +63,13 @@ CC-BY 4.0 in full: https://creativecommons.org/licenses/by/4.0/legalcode
 and MIT texts elsewhere in this file, it requires a URI rather than a copy:
 §3(a)(1)(C) is satisfied by "a URI or hyperlink to this Public License").
 
-INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): none. The four
-`index-*.txt` files are vendored byte-for-byte as published, headers included.
-Nothing was reformatted, filtered or re-encoded — which is also why the
-`Date:` line in each file's own header is the version pin cited above.
+INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): the vendored
+`index-*.txt` files and `encodings.json` are byte-for-byte as published, headers
+included (the `Date:` line in each index header is the version pin cited above).
+`src/sb_tables.zig` is MODIFIED material: the same data transcribed into Zig
+arrays, with undefined bytes marked 0xFFFF, an inverse (encode) table added, and
+eleven labels of the iso-8859-1 family re-pointed from windows-1252 to this
+module's own `iso_8859_1` page (a documented departure, marked in that file).
 
 ## Unicode.org — `8859-1.TXT`
 
@@ -125,3 +140,35 @@ test (`decodeToUtf8`/`encodeFromUtf8`/the per-page tables in `root.zig`) is
 the authors' own (MIT), modeled after the WHATWG Encoding Standard's
 single-byte European subset as design reference (recorded in this module's
 `README.md` `Provenance:` statement), not copied from it.
+
+## simdjson — the "lookup" UTF-8 validation algorithm (`src/utf8_simd.zig`)
+
+`src/utf8_simd.zig` ports, from simdjson's `src/generic/utf8_lookup4_algorithm.h`
+(https://github.com/simdjson/simdjson, read 2026-10-20), the three 16-entry
+nibble tables, their error-bit layout and the structure of the check — the
+algorithm of J. Keiser and D. Lemire, "Validating UTF-8 In Less Than One
+Instruction Per Byte", Software: Practice and Experience 51(5), 2021.
+Modified: re-expressed in Zig vectors, with a portable select-tree lookup
+beside `vpshufb`, a group-of-four error test, and a valid-prefix result
+instead of a yes/no answer. simdjson is dual-licensed Apache-2.0 OR MIT; this
+port is taken under MIT, whose notice follows verbatim (LICENSE-MIT, fetched
+2026-10-20):
+
+    Copyright 2018-2025 The simdjson authors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of
+    this software and associated documentation files (the "Software"), to deal in
+    the Software without restriction, including without limitation the rights to
+    use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+    the Software, and to permit persons to whom the Software is furnished to do so,
+    subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+    FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+    COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+    IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+    CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -15,8 +15,9 @@ const testing = std.testing;
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 const encoding = @import("root.zig");
+const core = @import("core.zig");
 
-pub const Label = enum { nonempty, high_bytes, replacement };
+pub const Label = enum { nonempty, high_bytes, replacement, round_trip };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 fn mark(comptime l: Label) void {
@@ -40,24 +41,103 @@ pub const ScriptSource = struct {
     }
 };
 
-/// The encodings the harness sweeps (the passthrough and the five tables).
-const encodings = [_]encoding.Encoding{ .utf8, .windows_1250, .windows_1252, .iso_8859_1, .iso_8859_2, .iso_8859_15 };
+/// Every encoding (the passthrough and all 29 single-byte pages).
+const encodings = blk: {
+    const vals = @typeInfo(encoding.Encoding).@"enum".field_values;
+    var out: [vals.len]encoding.Encoding = undefined;
+    for (vals, 0..) |v, i| out[i] = @fromBackingInt(@intCast(v));
+    const final = out;
+    break :blk final;
+};
 
 /// Neither codec panics, goes out of bounds or leaks on arbitrary bytes, in
-/// every encoding, both directions.
+/// every encoding, both directions; and the caller-buffer core gives the
+/// whole-buffer answer for any cut and any output room, byte-by-byte input
+/// included (which drives the UTF decoders' state machines alone, so it
+/// checks the fast paths against them).
 pub fn codecHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var buf: [256]u8 = undefined;
     const len = src.slice(&buf);
-    const input = buf[0..len];
-    if (len != 0) mark(.nonempty);
+    if (len < 2) return;
+    const sel = buf[0];
+    const room_sel = buf[1];
+    const input = buf[2..len];
+    if (input.len != 0) mark(.nonempty);
     if (std.mem.findAny(u8, input, &[_]u8{ 0x80, 0xC3, 0xFF }) != null) mark(.high_bytes);
-    for (encodings) |enc| {
-        const decoded = try encoding.decodeToUtf8(gpa, input, enc);
-        defer gpa.free(decoded);
-        if (enc == .utf8 and std.mem.find(u8, decoded, "\xEF\xBF\xBD") != null) mark(.replacement);
-        const encoded = try encoding.encodeFromUtf8(gpa, input, enc);
-        defer gpa.free(encoded);
+    try testing.expectEqual(std.unicode.utf8ValidateSlice(input), core.validUtf8(input));
+
+    const e = encodings[sel % encodings.len];
+    const kind: encoding.Decoder.Kind = if (sel & 0x80 != 0) .{ .utf16 = if (sel & 0x40 != 0) .le else .be } else .{ .encoding = e };
+    const whole = switch (kind) {
+        .encoding => |x| try encoding.decodeToUtf8(gpa, input, x),
+        .utf16 => |x| try encoding.decodeUtf16(gpa, input, x),
+    };
+    defer gpa.free(whole);
+    try testing.expect(std.unicode.utf8ValidateSlice(whole));
+    if (std.mem.find(u8, whole, "\xEF\xBF\xBD") != null) mark(.replacement);
+
+    const room = 7 + room_sel % 24;
+    const cut = if (input.len == 0) 0 else room_sel % (input.len + 1);
+    const pieces = try decodePieces(gpa, kind, input, room, cut);
+    defer gpa.free(pieces);
+    try testing.expectEqualStrings(whole, pieces);
+    var d: encoding.Decoder = .init(kind, .{});
+    var bytewise: std.ArrayList(u8) = .empty;
+    defer bytewise.deinit(gpa);
+    for (input) |b| try d.feed(gpa, &bytewise, &.{b});
+    try d.finish(gpa, &bytewise);
+    try testing.expectEqualStrings(whole, bytewise.items);
+
+    // Encode the input (arbitrary bytes, as UTF-8) the same three ways.
+    const ekind: encoding.Encoder.Kind = switch (kind) {
+        .encoding => |x| .{ .encoding = x },
+        .utf16 => |x| .{ .utf16 = x },
+    };
+    const mode: encoding.Unmappable = switch (room_sel % 3) {
+        0 => .question_mark,
+        1 => .html_ncr,
+        else => .ignore,
+    };
+    var ew: encoding.Encoder = .init(ekind, .{ .unmappable = mode });
+    var ewhole: std.ArrayList(u8) = .empty;
+    defer ewhole.deinit(gpa);
+    try ew.feed(gpa, &ewhole, input);
+    try ew.finish(gpa, &ewhole);
+    var eb: encoding.Encoder = .init(ekind, .{ .unmappable = mode });
+    var ebyte: std.ArrayList(u8) = .empty;
+    defer ebyte.deinit(gpa);
+    for (input) |b| try eb.feed(gpa, &ebyte, &.{b});
+    try eb.finish(gpa, &ebyte);
+    try testing.expectEqualSlices(u8, ewhole.items, ebyte.items);
+    if (kind == .encoding and e != .utf8 and std.unicode.utf8ValidateSlice(input)) {
+        // Valid text round-trips except where the page lacks a character.
+        const legacy = try encoding.encodeFromUtf8(gpa, input, e);
+        defer gpa.free(legacy);
+        const back = try encoding.decodeToUtf8(gpa, legacy, e);
+        defer gpa.free(back);
+        if (std.mem.findScalar(u8, legacy, '?') == null) {
+            try testing.expectEqualStrings(input, back);
+            mark(.round_trip);
+        }
     }
+}
+
+fn decodePieces(a: std.mem.Allocator, kind: encoding.Decoder.Kind, input: []const u8, room: usize, cut: usize) ![]u8 {
+    var d: encoding.Decoder = .init(kind, .{});
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const parts = [2][]const u8{ input[0..cut], input[cut..] };
+    for (parts, 0..) |part, pi| {
+        var r: usize = 0;
+        while (true) {
+            var tmp: [32]u8 = undefined;
+            const p = d.decodeInto(part[r..], tmp[0..room], pi == 1);
+            try out.appendSlice(a, tmp[0..p.written]);
+            r += p.read;
+            if (p.status == .input_empty) break;
+        }
+    }
+    return out.toOwnedSlice(a);
 }
 
 test "fuzz driver: ENCODING_FUZZ" {
