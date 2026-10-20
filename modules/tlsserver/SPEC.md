@@ -8,7 +8,7 @@
 
 **Audit:** review none · mutation none · src ?
 
-**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught) · ct none
+**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught) · ct none
 
 **Performance:** not measured
 
@@ -29,7 +29,7 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference (P2) for this module's handshake and bulk rows. |
 
 **Where we are ahead:** nothing yet. **Where we are behind:** everything but the record layer —
-records, the receive side and alerts are the first pieces of the server (milestone M1,
+records, the receive side, alerts and the ClientHello decoder are the first pieces of the server (milestone M1,
 *Backlog*).
 
 ## What this module is, and what it is not
@@ -41,8 +41,8 @@ CertificateVerify, key exchange, transcript) and the collection's AEADs (`aesgcm
 milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 
 **Today it is only the record layer**: the 5-byte header, per-direction in-place record
-protection, the receive side (records → whole handshake messages, alerts, application data) and
-alerts. There is no handshake, no connection object and nothing that talks to a socket — a
+protection, the receive side (records → whole handshake messages, alerts, application data),
+alerts and the ClientHello decoder. There is no handshake, no connection object and nothing that talks to a socket — a
 reader looking for a usable TLS server will not find one here yet.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
@@ -101,6 +101,31 @@ RFC 8446 §5, record layer over a byte stream:
   | Fatal alert | abort, no alert (`peer_alert` holds it) |
 
   `inbound.alertFor` maps each error to the alert to send (none for the peer's own abort).
+- **ClientHello** (`hello.parseClientHello`, RFC 8446 §4.1.2): zero-copy into slices of the
+  message; lists stay in wire form and are walked by iterators that cannot fail (every length was
+  checked). Extensions read: `server_name`, `status_request`, `supported_groups`,
+  `ec_point_formats` (checked, unused), `signature_algorithms`, `signature_algorithms_cert`, ALPN,
+  `compress_certificate`, `session_ticket` (skipped), `pre_shared_key`, `early_data`,
+  `supported_versions`, `cookie`, `psk_key_exchange_modes`, `certificate_authorities` (checked),
+  `key_share`, `renegotiation_info` (checked); others are skipped. Strictness is rustls 0.23's:
+
+  | Input | Result |
+  |---|---|
+  | Any length that does not add up, trailing octets in an extension or the message | `decode_error` |
+  | `legacy_session_id` > 32, empty or odd `cipher_suites`, no compression method | `decode_error` |
+  | An empty list RFC 8446 / 6066 / 7301 declare non-empty (groups, signature schemes, versions, ALPN, ALPN name, cookie, PSK modes, PSK identities/binders, point formats) | `decode_error` |
+  | `early_data` with a body; an empty SNI `host_name` | `decode_error` |
+  | Any extension type twice (known, unknown or GREASE); `pre_shared_key` not last; PSK identities and binders of different counts | `illegal_parameter` |
+  | An empty `key_share` list | accepted (the client asks for a HelloRetryRequest) |
+  | No extension block at all | accepted (the state machine refuses it: no `supported_versions`) |
+
+  SNI: a valid DNS name (rustls-pki-types rules: 1–253 octets, labels 1–63 of letters, digits,
+  `_`, `-` not at a label's ends, an optional trailing dot, last label not all digits) is
+  `dns_name`; an IP literal is `ip_address` and treated as no SNI; anything else, a second
+  `host_name` or an empty list is `invalid` (the state machine answers `illegal_parameter`). A
+  name type other than `host_name` ends the list. `pre_shared_key.binders_offset` is where the
+  binder transcript ends (§4.2.11.2). Duplicate detection is an 8 KiB bit set over the whole
+  type space, so it is linear in the number of extensions.
 - **In place:** `seal` takes the content at `buf[5..]` and writes type, padding, tag and header
   around it; `open` decrypts over the ciphertext and returns a slice of the same buffer. That is
   the layout qap's zero-copy record codecs read and write.
@@ -156,6 +181,12 @@ The receive side's refusals are the table under *Wire format*. Record protection
   through `cryptography` in the same tool (padding, sequence numbers up to 2^64 − 2), sealed
   byte-exact and opened back.
 
+- **External:** RFC 8448's ClientHellos — §3 (1-RTT), §4 (resumed 0-RTT: `early_data`,
+  `pre_shared_key` with one identity and binder), §5 (ClientHello1 and ClientHello2 with the
+  cookie) — decode to the fields the RFC shows; §4's binder offset reproduces the RFC's "binder
+  hash" (SHA-256 of the prefix). Extracted by `tools/rfc8448_hellos.py`, which checks the printed
+  prefix and its hash before writing `src/hello_kat_vectors.zig`.
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Fuzzing
@@ -190,6 +221,17 @@ left out, the last record left out of `consumed`, the header kept in the body, t
 record limit set to the plaintext one (survived the first harness, which almost never cut a
 whole 2^14 record; whole records are now one cut in eight).
 
+Harness `tlsserver-hello`: a ClientHello built from a model — the fixed fields, a random subset
+of nine known extensions with random well-formed bodies and up to three unknown ones, in random
+order, `pre_shared_key` last one time in three — decodes to exactly the model (every list walked,
+the SNI class, the binder offset); planted faults give their error (a repeated extension or
+`pre_shared_key` not last: `illegal_parameter`; a 33-octet session id: `decode_error`). The same
+message damaged never panics, and whatever it decodes to is walked to the end by every iterator
+(bounds-checked in ReleaseSafe). Verdict 2026-10-20: 4 × 1,000,000 runs, ReleaseSafe, clean
+(~23,800 runs/s per job). Six planted mutants caught: the duplicate check, the PSK-last check
+and the 32-octet session id limit removed, the binder offset two octets early, the ALPN iterator
+skipping one octet short (a panic), the key share read one octet early.
+
 ## What is deliberately not done
 
 - **TLS 1.2, SSL 3, TLS 1.0/1.1:** never. The suites and the record format are TLS 1.3's only.
@@ -197,6 +239,9 @@ whole 2^14 record; whole records are now one cut in eight).
   stateful single-use tickets and `tlsresume.replay`.
 - **kTLS:** not in v1 — measured in qap at 41 % slower than userspace records; a secret-export
   hook may come with M4.
+- **Strict parsing of extensions a TLS 1.3 server ignores** (`extended_master_secret`,
+  certificate types, QUIC parameters, ECH): skipped as unknown, where rustls checks their form —
+  a difference only in what malformed-but-ignored octets are refused.
 - **Constant-time padding removal:** not done, as in rustls and OpenSSL (see the constant-time
   contract).
 

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — The ClientHello decoder: `hello.parseClientHello` (zero-copy, iterators over
+  the wire lists; the extensions a TLS 1.3 server reads checked for form; duplicate extensions,
+  `pre_shared_key` not last and mismatched PSK identity/binder counts refused; SNI classified
+  as rustls does — DNS name, IP literal ignored, invalid). New dependency `netaddr` (IP literals
+  in SNI). Anchored on RFC 8448 §3/§4/§5 ClientHellos (§4's binder hash reproduced); fuzz
+  harness `tlsserver-hello` (4,000,000-run verdict clean, six planted mutants caught).
 - **2026-10-20** — The receive side of the record layer: `inbound.Inbound` (records cut from a
   byte stream, plaintext or protected, into whole handshake messages, alerts and application
   data; joining across records and splitting within one, interleaving and key-change alignment,
