@@ -395,6 +395,7 @@ ctrl: ~150 ns) dominates and this module's context path is 1.4–4× faster. Gra
 
 ## Backlog / deferred
 
+- **Generic backend's GCTR on Zig 0.17** *(2026-10-20)*: `Generic.gctr` (`src/root.zig`, the non-AES-NI path) runs std's `crypto.core.modes.ctr`, whose per-block `mem.writeInt(u128, …, .big)` 0.17 lowers byte by byte (#36256) — measured on `aes192`'s bench: 2.32× OpenSSL at 16 KiB, against 0.96× for `Aes192EncryptCtx.ctr`'s two-`u64`, vector-byte-swap counter. Port that counter (inc32 only: the low 32 bits) when the generic path is next measured; the stitched AES-NI kernel is unaffected.
 - **Performance P2 → P1: measure the fastest in the field** *(bench 2026-10-10)*: ours is
   0.97–1.00× OpenSSL 3.5.5 at 16 KiB and faster below; P1 needs `fastest ≤ 1.25×`, and no
   other implementation is measured. Candidates: aws-lc / BoringSSL (same CRYPTOGAMS kernel

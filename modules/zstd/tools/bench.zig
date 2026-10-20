@@ -9,7 +9,7 @@
 //! (it builds `tools/c_bench/libzstd_bench.c` with `zig cc`), the system
 //! libzstd (`libzstd.so.1`, path below or `LIBZSTD_SO`; no headers needed) and
 //! the Silesia corpus: `ZSTD_BENCH_CORPUS=<dir>`, default
-//! `.zig-cache/zstd-compare/silesia` (fetch it from
+//! `tools/zstd-silesia` (gitignored, outside the cache: a download is not a rebuild; fetch it from
 //! https://sun.aei.polsl.pl//~sdeor/corpus/silesia.zip and unzip there). Run
 //! from the repository root; takes several minutes.
 //!
@@ -123,7 +123,7 @@ pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
     const gpa = std.heap.smp_allocator;
 
-    const corpus = init.environ_map.get("ZSTD_BENCH_CORPUS") orelse ".zig-cache/zstd-compare/silesia";
+    const corpus = init.environ_map.get("ZSTD_BENCH_CORPUS") orelse "tools/zstd-silesia";
     const cwd = std.Io.Dir.cwd();
     const corpus_abs = cwd.realPathFileAlloc(io, corpus, arena) catch {
         std.debug.print("bench-zstd: no Silesia corpus at {s} -- see this file's header\n", .{corpus});

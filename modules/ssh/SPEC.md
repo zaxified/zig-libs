@@ -363,6 +363,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18:
 
 ## Backlog / deferred
 
+- **`aes*-ctr` one block at a time** *(2026-10-20)*: `aesCtrXor` (`src/transport.zig`) encrypts one block per call and carries the counter byte by byte — no `encryptWide`, so it never pipelines AES-NI. `aes192.Aes192EncryptCtx.ctr` (2026-10-20, 0.96× OpenSSL EVP CTR at 16 KiB) is the shape to use for aes192, and the same counter over std's `AesEncryptCtx` for aes128/256 (std's own `modes.ctr` is 2.3× on Zig 0.17, #36256). Needs a packet-rate bench first.
 - 2026-10-19: moved to `aesgcm` (Zig 0.17 #36256); bulk path not re-measured yet; per-direction cached `aesgcm` context since the same day (no per-packet key expansion).
 
 - ~~**Ed25519 host key: the seed is not checked against the public key in ReleaseFast/ReleaseSmall**~~
