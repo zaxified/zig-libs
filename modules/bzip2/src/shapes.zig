@@ -80,6 +80,34 @@ pub const shapes = [_]Shape{
     .{ .name = "edge-99970-run11", .kind = .cycle_run, .len = 99_981, .param = 11 },
     .{ .name = "edge-two-blocks", .kind = .cycle_run, .len = 199_962 },
     .{ .name = "edge-two-blocks-run", .kind = .cycle_run, .len = 199_962, .param = 300 },
+    // Table-count thresholds: with this seed a block of N random bytes has
+    // exactly N + 1 MTF symbols (the end-of-block symbol included), so the
+    // lengths straddle the switches 200 / 600 / 1200 / 2400 (2 -> 3 -> 4 -> 5
+    // -> 6 Huffman tables) on both sides and at the edge. Level 9 only.
+    .{ .name = "tc-198", .kind = .random, .len = 198 },
+    .{ .name = "tc-199", .kind = .random, .len = 199 },
+    .{ .name = "tc-200", .kind = .random, .len = 200 },
+    .{ .name = "tc-598", .kind = .random, .len = 598 },
+    .{ .name = "tc-599", .kind = .random, .len = 599 },
+    .{ .name = "tc-600", .kind = .random, .len = 600 },
+    .{ .name = "tc-1198", .kind = .random, .len = 1198 },
+    .{ .name = "tc-1199", .kind = .random, .len = 1199 },
+    .{ .name = "tc-1200", .kind = .random, .len = 1200 },
+    .{ .name = "tc-2398", .kind = .random, .len = 2398 },
+    .{ .name = "tc-2399", .kind = .random, .len = 2399 },
+    .{ .name = "tc-2400", .kind = .random, .len = 2400 },
+    // Work factor / sort path: blocks of about 10 000 bytes that are
+    // periodic, so the main sort runs out of its budget (or is not even
+    // tried) and the fallback sort does the work; the `wf-b*` ones sit on
+    // either side of the 10 000-byte switch. Level 9, work factors 1/30/100.
+    .{ .name = "wf-p1", .kind = .periodic, .len = 10_000, .param = 1 },
+    .{ .name = "wf-p2", .kind = .periodic, .len = 10_000, .param = 2 },
+    .{ .name = "wf-p3", .kind = .periodic, .len = 10_000, .param = 3 },
+    .{ .name = "wf-p7", .kind = .periodic, .len = 10_000, .param = 7 },
+    .{ .name = "wf-p64", .kind = .periodic, .len = 10_000, .param = 64 },
+    .{ .name = "wf-b9999", .kind = .periodic, .len = 9_999, .param = 7 },
+    .{ .name = "wf-b10000", .kind = .periodic, .len = 10_000, .param = 3 },
+    .{ .name = "wf-b10001", .kind = .periodic, .len = 10_001, .param = 7 },
 };
 
 pub fn find(name: []const u8) ?Shape {

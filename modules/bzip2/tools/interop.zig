@@ -145,13 +145,18 @@ fn encoderParity(c: *Ctx, quick: bool, goldens: *std.ArrayList(Golden)) !void {
         const plain = try corpus.generate(c.gpa, shape);
         defer c.gpa.free(plain);
         var wfs: []const u8 = &.{30};
+        // `tc-*` (table-count thresholds) and `wf-*` (sort path) shapes exist
+        // for level 9 only; the `wf-*` ones take all three work factors.
+        const tc = std.mem.startsWith(u8, shape.name, "tc-");
+        const wfshape = std.mem.startsWith(u8, shape.name, "wf-");
         switch (shape.kind) {
-            .zeros, .periodic, .skewed, .runs, .text => if (shape.len >= 100_000 and !quick) {
+            .zeros, .periodic, .skewed, .runs, .text => if ((shape.len >= 100_000 and !quick) or wfshape) {
                 wfs = &.{ 1, 30, 100 };
             },
             else => {},
         }
-        for (levelsFor(shape.len, quick)) |level| {
+        const levels: []const u8 = if (tc or wfshape) &.{9} else levelsFor(shape.len, quick);
+        for (levels) |level| {
             for (wfs) |wf| {
                 const want = try c.refCompress(plain, level, wf, 0);
                 defer c.gpa.free(want);
@@ -168,7 +173,7 @@ fn encoderParity(c: *Ctx, quick: bool, goldens: *std.ArrayList(Golden)) !void {
                     if (!std.mem.eql(u8, back, plain)) c.fail("python bz2 read {s} level {d} wrongly", .{ shape.name, level });
                 } else c.fail("python bz2 refused our {s} level {d}", .{ shape.name, level });
 
-                const keep_stream = shape.len <= 10_000 and (level == 1 or level == 9) and wf == 30;
+                const keep_stream = !tc and !wfshape and shape.len <= 10_000 and (level == 1 or level == 9) and wf == 30;
                 if (level == 1 or level == 9 or wf != 30) {
                     try goldens.append(c.gpa, .{
                         .shape = shape.name,
