@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `Db.seriesIds(specs, out)`: resolve many series at once, registering the missing ones in
+  ONE transaction (a first scrape of 1000 new series was 1000 commits of two fsyncs each); duplicates share
+  an id, all or nothing under `max_series`. `zig build bench-tsdb` (`tools/bench.zig` + `tools/tsink_bench`,
+  Rust, tsink 0.10.2 with WAL fsync per append): 0.28–0.58×. Card: grade 3 → 2 (scope parity, P2).
 - **2026-10-20** — S2 batch (survey 2026-10-20): `maintain(now, Policy)` (sweep + compact + byte budget in
   one call — neither consumer ran `compact`, so both stored raw 25 B/sample); `Db.initOptions` with
   `max_series` (`error.TooManySeries`) and a bounded series cache; `metricNames`/`labelNames`/

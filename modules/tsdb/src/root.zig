@@ -249,6 +249,79 @@ pub const Db = struct {
         return id;
     }
 
+    /// One series to resolve in `seriesIds`.
+    pub const SeriesSpec = struct { name: []const u8, labels: []const Label };
+
+    /// `seriesId` for many series at once: existing ones are looked up, the
+    /// missing ones are registered together in ONE transaction (one commit,
+    /// not one per series — a first scrape of 1000 new series was 1000 commits
+    /// with two fsyncs each). `out[i]` is the id of `specs[i]`; the same series
+    /// twice in `specs` gets the same id. All or nothing: on an error no new
+    /// series exists. `max_series` counts the whole batch.
+    pub fn seriesIds(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
+        std.debug.assert(out.len >= specs.len);
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // Index key of every spec, and which ones are new (deduplicated).
+        const keys = try arena.alloc([]u8, specs.len);
+        var new_ids: std.StringHashMapUnmanaged(SeriesId) = .empty;
+        var new_order: std.ArrayList([]const u8) = .empty;
+        for (specs, 0..) |s, i| {
+            var k: std.ArrayList(u8) = .empty;
+            try self.indexKey(&k, s.name, s.labels);
+            // `indexKey` grows with self.gpa; move it onto the arena.
+            keys[i] = try arena.dupe(u8, k.items);
+            k.deinit(self.gpa);
+            if (self.series_cache.get(keys[i])) |id| {
+                out[i] = id;
+                continue;
+            }
+            if (try self.tree.get(self.gpa, keys[i])) |v| {
+                defer self.gpa.free(v);
+                if (v.len != 8) return error.CorruptIndex;
+                out[i] = std.mem.readInt(u64, v[0..8], .big);
+                self.cacheSeriesId(keys[i], out[i]);
+                continue;
+            }
+            const gop = try new_ids.getOrPut(arena, keys[i]);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = 0;
+                try new_order.append(arena, keys[i]);
+            }
+            out[i] = 0; // filled below
+        }
+        if (new_order.items.len == 0) return;
+
+        if (self.opts.max_series) |limit| {
+            if (try self.countSeries() + new_order.items.len > limit) return error.TooManySeries;
+        }
+        const first = try self.nextSeriesId();
+        var counter: [8]u8 = undefined;
+        std.mem.writeInt(u64, &counter, first + new_order.items.len, .big);
+        var txn = try self.tree.begin();
+        {
+            errdefer txn.rollback();
+            for (new_order.items, 0..) |k, n| {
+                const id = first + n;
+                new_ids.getPtr(k).?.* = id;
+                var id_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u64, &id_bytes, id, .big);
+                const rev_key = reverseKey(id);
+                try txn.put(k, &id_bytes);
+                try txn.put(&rev_key, k[1..]); // canonical form, tag stripped
+            }
+            try txn.put(&codec.meta_key_next_series, &counter);
+        }
+        try txn.commit(); // consumes the txn on both outcomes
+        self.series_count_at = null; // recounted on the next limited creation
+        for (specs, 0..) |_, i| {
+            if (out[i] == 0) out[i] = new_ids.get(keys[i]).?;
+        }
+        for (new_order.items) |k| self.cacheSeriesId(k, new_ids.get(k).?);
+    }
+
     /// Number of registered series: a reverse-index scan, redone only when
     /// the tree's version is not the one the count was last known at.
     fn countSeries(self: *Db) Error!usize {
@@ -3790,6 +3863,41 @@ test "maintain: retention, compaction and the size budget in one call; unset ste
     try testing.expect(b.sweep == null and b.compact == null);
     // saturating subtraction: a huge duration does not overflow
     _ = try fx.db.maintain(all_lo + 5, .{ .retention = all_hi, .compact_after = all_hi });
+}
+
+test "seriesIds: existing looked up, new ones registered in one commit, duplicates share an id" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    const a = try fx.db.seriesId("a", &.{});
+    const lbl = [_]Label{.{ .name = "host", .value = "h1" }};
+    const specs = [_]Db.SeriesSpec{
+        .{ .name = "b", .labels = &lbl },
+        .{ .name = "a", .labels = &.{} },
+        .{ .name = "c", .labels = &.{} },
+        .{ .name = "b", .labels = &lbl },
+    };
+    var ids: [4]SeriesId = undefined;
+    var before = try fx.tree.snapshot();
+    const txn_before = before.txn_id;
+    before.release();
+    try fx.db.seriesIds(&specs, &ids);
+    var after = try fx.tree.snapshot();
+    try testing.expectEqual(txn_before + 1, after.txn_id); // one commit for b and c
+    after.release();
+    try testing.expectEqual(a, ids[1]);
+    try testing.expectEqual(ids[0], ids[3]);
+    try testing.expect(ids[0] != ids[2] and ids[0] != a and ids[2] != a);
+    // The same ids by the one-at-a-time path, also after a reopen.
+    try fx.reopen();
+    try testing.expectEqual(ids[0], try fx.db.seriesId("b", &lbl));
+    try testing.expectEqual(ids[2], try fx.db.seriesId("c", &.{}));
+    // All or nothing under max_series.
+    fx.db.opts.max_series = 4;
+    const more = [_]Db.SeriesSpec{ .{ .name = "d", .labels = &.{} }, .{ .name = "e", .labels = &.{} } };
+    var ids2: [2]SeriesId = undefined;
+    try testing.expectError(error.TooManySeries, fx.db.seriesIds(&more, &ids2));
+    try testing.expect((try fx.db.lookupSeries("d", &.{})) == null);
 }
 
 test "max_series: series N+1 is refused, existing ones resolve, count survives reopen, delete frees a slot" {
