@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **BREAKING:** `select.selectPsk` gains a `filter: ?select.Filter` parameter
+  (the engine's own checks on its fields behind the `SessionState` prefix — suite, SNI, its
+  lifetime — run before the binder), `freshness_window_ms` becomes `?u32` (null: the reported
+  ticket age is not checked, as rustls/BoringSSL/Go outside early data), and a binder that does
+  not verify on the identity that would be taken is now `error.BinderMismatch` instead of a skip
+  to the next identity (RFC 8446 §4.2.11: the server MUST abort; rustls `IncorrectBinder`). The
+  derived PSK, early secret and binder key are wiped per identity. First consumer: `tlsserver`.
 - **2026-10-20** — **BREAKING:** `select.selectPsk` takes a `stek.RotationPolicy` and opens tickets with `openAt` (a retired STEK key still in the ring no longer opens tickets), and skips sessions older than 7 days (RFC 8446 §4.6.1) (audit 2026-10-19 O4).
 - **2026-10-19** — The STEK ticket AEAD (`stek.Aead`, AES-256-GCM) and the early-data test vectors moved from `std.crypto.aead.aes_gcm` to the zig-libs `aesgcm` module (new dep; Zig 0.17 #36256). `stek.Aead` is now `aesgcm.Aes256Gcm` (same `key_length`/`nonce_length`/`tag_length`, same bytes on the wire).
 - **2026-10-13** — `ticket12`: a zero-length ticket is legal (RFC 5077 §3.3, the server withdrawing an announced ticket) — `encode`/`decode` accept it, `isWithdrawal` names it; `stek.depthFor(policy)` gives the ring depth that holds every key a policy accepts (8 for the Go defaults; `DefaultRing` holds ~2 periods). ctgrind harness (`stek`, `psk`, `early`); card Scope core → parity.

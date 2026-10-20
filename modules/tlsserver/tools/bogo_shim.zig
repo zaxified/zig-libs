@@ -22,12 +22,19 @@
 //!   wrote any);
 //! - `-is-handshaker-supported` prints "No" (no split handshakes).
 //!
-//! Only server tests at TLS 1.3 run: a client test, a resumption, a version
-//! range without TLS 1.3, or any feature the server lacks is exit 89.
+//! - `-resume-count N`: N more connections after the first, each starting
+//!   with the shim ID again, sharing one ticket key; a flag prefixed
+//!   `-on-initial-` or `-on-resume-` applies to the first or to the later
+//!   ones only. The first must not resume; a later one must, unless
+//!   `-expect-session-miss`.
+//!
+//! Only server tests at TLS 1.3 run: a client test, a version range without
+//! TLS 1.3, or any feature the server lacks is exit 89.
 
 const std = @import("std");
 const net = std.Io.net;
 const tlsserver = @import("tlsserver");
+const tlsresume = @import("tlsresume");
 
 const record = tlsserver.record;
 const server_mod = tlsserver.server;
@@ -41,6 +48,8 @@ pub fn isShimInvocation(first: ?[]const u8) bool {
 }
 
 const Options = struct {
+    resume_count: u32 = 0,
+    expect_session_miss: bool = false,
     port: u16 = 0,
     shim_id: u64 = 0,
     ipv6: bool = false,
@@ -94,10 +103,44 @@ fn logUnimplemented(io: std.Io, environ: *const std.process.Environ.Map) void {
     dir.writeFile(io, .{ .sub_path = n, .data = unimplemented_flag }) catch {};
 }
 
-fn parseArgs(gpa: std.mem.Allocator, it: *std.process.Args.Iterator, o: *Options) !void {
-    while (it.next()) |flag| {
+/// The arguments, walked once per connection kind.
+const Tokens = struct {
+    toks: []const []const u8,
+    at: usize = 0,
+
+    fn next(t: *Tokens) ?[]const u8 {
+        if (t.at == t.toks.len) return null;
+        defer t.at += 1;
+        return t.toks[t.at];
+    }
+};
+
+/// `initial` gets every flag but the `-on-resume-` ones, `resumed` every
+/// flag but the `-on-initial-` ones (without the prefix).
+fn parseArgs(gpa: std.mem.Allocator, it: *std.process.Args.Iterator, initial: *Options, resumed: *Options) !void {
+    var list: std.ArrayList([]const u8) = .empty;
+    while (it.next()) |a| try list.append(gpa, a);
+    var t: Tokens = .{ .toks = list.items };
+    while (t.next()) |raw| {
+        const start = t.at;
+        if (std.mem.startsWith(u8, raw, "-on-initial-")) {
+            try parseFlag(gpa, raw["-on-initial".len..], &t, initial);
+        } else if (std.mem.startsWith(u8, raw, "-on-resume-")) {
+            try parseFlag(gpa, raw["-on-resume".len..], &t, resumed);
+        } else if (std.mem.startsWith(u8, raw, "-on-")) {
+            return unimplemented(raw);
+        } else {
+            try parseFlag(gpa, raw, &t, initial);
+            t.at = start;
+            try parseFlag(gpa, raw, &t, resumed);
+        }
+    }
+}
+
+fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options) !void {
+    {
         const value = struct {
-            fn f(i: *std.process.Args.Iterator, name: []const u8) ![]const u8 {
+            fn f(i: *Tokens, name: []const u8) ![]const u8 {
                 return i.next() orelse {
                     std.debug.print("flag {s} needs a value\n", .{name});
                     return error.BadArgs;
@@ -129,7 +172,9 @@ fn parseArgs(gpa: std.mem.Allocator, it: *std.process.Args.Iterator, o: *Options
         } else if (std.mem.eql(u8, flag, "-expect-server-name")) {
             o.expect_server_name = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-resume-count")) {
-            if (try std.fmt.parseInt(u32, try value(it, flag), 10) != 0) return unimplemented(flag);
+            o.resume_count = try std.fmt.parseInt(u32, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-expect-session-miss")) {
+            o.expect_session_miss = true;
         } else if (std.mem.eql(u8, flag, "-max-version")) {
             if (try std.fmt.parseInt(u16, try value(it, flag), 10) < 0x0304) return unimplemented(flag);
         } else if (std.mem.eql(u8, flag, "-min-version")) {
@@ -157,7 +202,8 @@ fn readFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
 /// Run as the shim; the process's exit status.
 pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: *std.process.Args.Iterator) u8 {
     var o: Options = .{};
-    parseArgs(gpa, args, &o) catch |err| return switch (err) {
+    var on_resume: Options = .{};
+    parseArgs(gpa, args, &o, &on_resume) catch |err| return switch (err) {
         error.Unimplemented => blk: {
             logUnimplemented(io, environ);
             break :blk exit_unimplemented;
@@ -177,7 +223,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         logUnimplemented(io, environ);
         return exit_unimplemented;
     }
-    serve(gpa, io, &o) catch |err| {
+    serve(gpa, io, &o, &on_resume) catch |err| {
         // A credential the module cannot load (P-521, ML-DSA, …) is a
         // feature it lacks, not a failure.
         if (err == error.UnsupportedKey) {
@@ -199,9 +245,15 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
 /// The alert the client sent, if a failure came from one.
 var peer_alert: ?tlsserver.alert.Description = null;
 
-fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
-    const cert_pem = try readFile(gpa, io, o.cert_file orelse return error.NoCertificate);
-    const key_pem = try readFile(gpa, io, o.key_file orelse return error.NoKey);
+/// The ticket clock: the wall clock.
+fn wallMs(ctx: ?*anyopaque) i64 {
+    const io: *const std.Io = @ptrCast(@alignCast(ctx.?));
+    return std.Io.Clock.real.now(io.*).toMilliseconds();
+}
+
+fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume: *const Options) !void {
+    const cert_pem = try readFile(gpa, io, initial.cert_file orelse return error.NoCertificate);
+    const key_pem = try readFile(gpa, io, initial.key_file orelse return error.NoKey);
     var pair: tlsserver.keys.CertKeyPair = undefined;
     try tlsserver.keys.CertKeyPair.fromPem(&pair, gpa, cert_pem, key_pem);
     defer pair.deinit(gpa);
@@ -210,11 +262,33 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
     var seed: [32]u8 = undefined;
     io.randomSecure(&seed) catch return error.NoEntropy;
     var csprng = std.Random.DefaultCsprng.init(seed);
+
+    // One ticket key for every connection of this run (BoringSSL's
+    // SSL_CTX), installed now.
+    var ring: tlsresume.stek.DefaultRing = .init();
+    var stek_key: [32]u8 = undefined;
+    csprng.random().bytes(&stek_key);
+    var io_ctx = io;
+    ring.rotate(1, &stek_key, @divFloor(wallMs(&io_ctx), 1000));
+    const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
+    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .ctx = &io_ctx, .now_ms = wallMs } };
+
+    for (0..initial.resume_count + 1) |i| {
+        const o = if (i == 0) initial else on_resume;
+        const resumed = try connection(gpa, io, &ck, &tickets, csprng.random(), o);
+        const want = i != 0 and !o.expect_session_miss;
+        if (resumed != want) return if (resumed) error.UnexpectedSessionReuse else error.SessionNotReused;
+    }
+}
+
+/// One connection; whether it resumed a session.
+fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: *const server_mod.Tickets, random: std.Random, o: *const Options) !bool {
     const cfg: server_mod.Config = .{
-        .certificate = .{ .fixed = &ck },
+        .certificate = .{ .fixed = ck },
         .groups = if (o.groups.items.len != 0) o.groups.items else &server_mod.default_groups,
         .alpn_protocols = o.alpn.items,
-        .random = csprng.random(),
+        .random = random,
+        .tickets = tickets,
     };
 
     const addr: net.IpAddress = if (o.ipv6) .{ .ip6 = .loopback(o.port) } else .{ .ip4 = .loopback(o.port) };
@@ -231,7 +305,7 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
 
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 4096);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
     defer gpa.free(out);
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
     defer c.deinit();
@@ -249,7 +323,7 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
         try c.close();
         // Read to the runner's close_notify.
         while (try c.read()) |_| {}
-        return;
+        return c.server.isResumed();
     }
     var echo: [record.max_plaintext_len]u8 = undefined;
     while (true) {
@@ -259,4 +333,5 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
         try c.writeAll(echo[0..d.len]);
     }
     try c.close();
+    return c.server.isResumed();
 }

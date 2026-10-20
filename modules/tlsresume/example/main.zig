@@ -111,6 +111,7 @@ pub fn main() !void {
         now_ms + actual_age_ms,
         60_000,
         &strike,
+        null, // no filter: the engine's own fields (suite, SNI) are not checked here
         &open_scratch,
     );
     std.debug.print(
@@ -136,10 +137,12 @@ pub fn main() !void {
         now_ms + actual_age_ms + 10,
         60_000,
         &strike,
+        null, // no filter: the engine's own fields (suite, SNI) are not checked here
         &open_scratch,
     )) |_| {
         return error.ReplayedTicketShouldHaveBeenRejected;
     } else |err| switch (err) {
         error.NoAcceptableIdentity => std.debug.print("replayed ticket rejected by the strike register\n", .{}),
+        error.BinderMismatch => return error.GenuineBinderRefused,
     }
 }

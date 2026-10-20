@@ -1171,6 +1171,10 @@ test "fuzz harness: keys, 400 seeds, reaches every outcome" {
 // - a truncated stream never errs and its output is a prefix of the
 //   recording;
 // - random octets spliced in at a record boundary;
+// - (the `resumed` cases) a flipped bit in the offered ticket: the server
+//   does not resume, never checks the binder, sends a full flight — and the
+//   client's Finished, keyed for the resumption, fails; a flipped bit in the
+//   binder: decrypt_error before anything else is sent (RFC 8446 §4.2.11);
 //
 // and over all of them: a failure leaves `feed` returning `Closed`; a
 // failure before the server wrote anything leaves exactly the plaintext
@@ -1182,12 +1186,34 @@ const server_mod = @import("server.zig");
 const interop = @import("interop_vectors.zig");
 const certs = @import("test_certs.zig");
 const rsa = @import("rsa");
+const tlsresume = @import("tlsresume");
+
+/// The recordings' ticket key and clock (`interop_vectors.zig`).
+const InteropTickets = struct {
+    ring: tlsresume.stek.DefaultRing,
+    stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing),
+    tickets: server_mod.Tickets,
+
+    fn init(t: *InteropTickets) void {
+        t.ring = .init();
+        t.ring.rotate(1, &interop.stek_key, @divFloor(interop.clock_ms, 1000));
+        t.stek = .{ .ring = &t.ring };
+        t.tickets = .{ .ticketer = t.stek.ticketer(), .clock = .{ .now_ms = clock } };
+    }
+
+    fn clock(_: ?*anyopaque) i64 {
+        return interop.clock_ms;
+    }
+};
 
 const SrvMark = Marker(enum {
     openssl_case,
     go_case,
     retry_case,
     key_update_case,
+    resumed_case,
+    ticket_flip_full_handshake,
+    binder_flip_refused,
     genuine_chunked,
     genuine_bytewise,
     truncated_waits,
@@ -1378,12 +1404,15 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    var it: InteropTickets = undefined;
+    it.init();
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
         .groups = v.groups,
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
+        .tickets = if (v.tickets) &it.tickets else null,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -1404,7 +1433,8 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var run: SrvRun = .{ .key_update = v.key_update };
     defer run.deinit(gpa);
     if (v.key_update) SrvMark.mark(.key_update_case);
-    const mode = src.valueRangeAtMost(u8, 0, 11);
+    if (v.resumed) SrvMark.mark(.resumed_case);
+    const mode = src.valueRangeAtMost(u8, 0, 13);
     const genuine_end = struct {
         fn f(r: *const SrvRun, want: []const u8) bool {
             // s_client's KeyUpdate rides with "again\n" (tools/interop.zig).
@@ -1421,6 +1451,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 return error.GenuineRefused;
             }
             if (!genuine_end(&run, v.server)) return error.GenuineDiffers;
+            if (server.isResumed() != v.resumed) return error.ResumptionDiffers;
             if (bytewise) SrvMark.mark(.genuine_bytewise) else SrvMark.mark(.genuine_chunked);
         },
         2 => {
@@ -1509,6 +1540,42 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 SrvMark.mark(.finished_repadded);
             }
         },
+        12, 13 => {
+            if (!v.resumed) return;
+            // The ClientHello the server resumes on: the last plaintext
+            // handshake record before the Finished (the second one after a
+            // retry), one whole message.
+            const ri = for (0..finished_rec) |k| {
+                const i = finished_rec - 1 - k;
+                if (stream[starts[i]] == 22) break i;
+            } else return error.NoClientHello;
+            const body = stream[starts[ri] + 5 + 4 .. if (ri + 1 < starts.len) starts[ri + 1] else stream.len];
+            const ch = hello.parseClientHello(body) catch return error.RecordedHelloRefused;
+            const offer = ch.pre_shared_key orelse return error.RecordedHelloWithoutPsk;
+            const bit = @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+            const ticket_flip = mode == 12;
+            if (ticket_flip) {
+                var ids = offer.identities();
+                const t = ids.next().?.identity;
+                const off = @intFromPtr(t.ptr) - @intFromPtr(stream.ptr);
+                stream[off + src.index(t.len)] ^= bit;
+            } else {
+                // A binder's octets (after its length octet).
+                const b = offer.binders_raw;
+                const off = @intFromPtr(b.ptr) - @intFromPtr(stream.ptr);
+                stream[off + 1 + src.index(b[0])] ^= bit;
+            }
+            try driveServer(S, src, gpa, &server, stream, false, &run);
+            if (run.handshake_done) return error.DamagedOfferCompleted;
+            const f = run.failure orelse return error.DamagedOfferNotRefused;
+            if (ticket_flip) {
+                if (server.isResumed() or f == error.DecryptError) return error.ForeignTicketResumedOrChecked;
+                SrvMark.mark(.ticket_flip_full_handshake);
+            } else {
+                if (f != error.DecryptError) return error.BadBinderNotDecryptError;
+                SrvMark.mark(.binder_flip_refused);
+            }
+        },
         else => {
             // Splice random octets in at a record boundary.
             const ri = src.index(starts.len);
@@ -1571,6 +1638,7 @@ const KuMark = Marker(enum {
     sha384_suite,
     ku_not_requested,
     ku_requested_answered,
+    tickets_after_finished,
     reply_deferred,
     reply_coalesced,
     own_update_requested,
@@ -1812,12 +1880,15 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    var it: InteropTickets = undefined;
+    it.init();
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
         .groups = v.groups,
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
+        .tickets = if (v.tickets) &it.tickets else null,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -1838,11 +1909,17 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     {
         @memcpy(c.in[0..fin_end], v.client[0..fin_end]);
         var at: usize = 0;
+        var end = starts[fin];
         while (true) {
-            const r = try server.feed(c.in[at..fin_end]);
+            const r = try server.feed(c.in[at..end]);
             at += r.consumed;
             if (r.event == .handshake_done) break;
-            if (r.event != .need_more or at == fin_end) return error.HandshakeDidNotComplete;
+            if (r.event != .need_more) return error.HandshakeDidNotComplete;
+            if (at != end or end == fin_end) return error.HandshakeDidNotComplete;
+            // The first flight went out under the handshake keys; the
+            // client's Finished goes in alone.
+            server.discardOutput(server.pendingOutput().len);
+            end = fin_end;
         }
         if (at != fin_end) return error.HandshakeLeftOctets;
     }
@@ -1853,8 +1930,28 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     @memcpy(c.rx_secret[0..L], server.server_application_secret[0..L]);
     try c.tx.init(c.suite, c.tx_secret[0..L]);
     try c.rx.init(c.suite, c.rx_secret[0..L]);
-    // The first flight went out under the handshake keys.
-    server.discardOutput(server.pendingOutput().len);
+    // What the client's Finished brought: the NewSessionTickets, in one
+    // record, under the application key.
+    {
+        const p = try gpa.dupe(u8, server.pendingOutput());
+        defer gpa.free(p);
+        server.discardOutput(p.len);
+        var n_tickets: usize = 0;
+        var at: usize = 0;
+        while (at < p.len) {
+            const h = record.parseHeader(p[at..][0..5]);
+            const o = c.rx.open(p[at..][0 .. 5 + h.length]) catch return error.TicketRecordDoesNotOpen;
+            at += 5 + h.length;
+            if (o.content_type != .handshake) return error.UnexpectedServerRecord;
+            var m: usize = 0;
+            while (m < o.content.len) : (n_tickets += 1) {
+                if (o.content[m] != 4) return error.UnexpectedServerMessage;
+                m += 4 + std.mem.readInt(u24, o.content[m + 1 ..][0..3], .big);
+            }
+        }
+        if (n_tickets != (if (v.tickets) @as(usize, 2) else 0)) return error.WrongTicketCount;
+        if (n_tickets != 0) KuMark.mark(.tickets_after_finished);
+    }
 
     const steps = src.valueRangeAtMost(u8, 1, 24);
     var data: [256]u8 = undefined;

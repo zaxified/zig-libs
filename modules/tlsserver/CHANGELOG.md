@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Session tickets and PSK resumption (M2 step 3). New `Config.tickets`
+  (`Tickets`: a `Ticketer` — `StekTicketer` over a `tlsresume.StekRing` — a `Clock`, `count` 2,
+  `lifetime_s` 12 h, capped at 7 days); `Server.isResumed`. After the client's Finished the
+  server sends the tickets packed into one record, each with a GREASE extension, none when the
+  client does not offer `psk_dhe_ke`. **BEHAVIOURAL** (with `tickets` set): a `pre_shared_key`
+  offer is resumed through `tlsresume.select.selectPsk` when a ticket opens and matches suite,
+  SNI and lifetime (rustls `can_resume`); its binder not verifying is `decrypt_error`. Without
+  `tickets` nothing changes (offer ignored). Interop: OpenSSL `-sess_out/-sess_in` and Go
+  (file session cache) save and resume, also after a HelloRetryRequest (35/35, recaptured);
+  BoGo 166/0; fuzz `tlsserver-server` gains ticket/binder flips, `tlsserver-keyupdate` opens the
+  tickets; 14/14 planted mutants caught. Found on the way: `TicketFields.parse` overflowed `u8`
+  on a 255-octet ALPN (fixed before commit). Independent review (Sonnet): no HIGH/MEDIUM; fixed:
+  the master secret is wiped once the tickets are out, `lifetime_s = 0` issues no tickets; documented:
+  `StekTicketer` lifetime, one ring = one trust domain, an overdue key seals unopenable tickets.
+  New dep `tlsresume`.
 - **2026-10-20** — KeyUpdate both ways (M2 step 2). **BEHAVIOURAL:** a client's KeyUpdate turns
   the receive key over (was `unexpected_message`); `update_requested` is answered with one
   KeyUpdate of the server's, before its next record (one, however many requests come before it

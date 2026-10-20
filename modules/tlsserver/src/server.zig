@@ -40,6 +40,22 @@
 //!   to the leaf if the client asked for one.
 //!
 //!
+//! With `Config.tickets` set, the server resumes sessions (RFC 8446 §2.2),
+//! as rustls:
+//!
+//! - **tickets** `Tickets.count` NewSessionTickets follow the client's
+//!   Finished in one record (none if the client does not offer
+//!   `psk_dhe_ke`), each with a GREASE extension (RFC 8701); each is a
+//!   `tlsresume.select.SessionState` sealed by the `Ticketer`, with this
+//!   server's fields behind it (SNI, ALPN, suite);
+//! - **resumption** the first offered identity that opens, has the
+//!   negotiated suite and the same SNI and is younger than
+//!   `Tickets.lifetime_s` is the PSK (`tlsresume.select.selectPsk`); its
+//!   binder not verifying is `decrypt_error` (RFC 8446 §4.2.11). Only
+//!   `psk_dhe_ke`: a fresh (EC)DHE runs on every resumption. The reported
+//!   ticket age is not checked (no early data is taken). A resumed handshake
+//!   sends no Certificate or CertificateVerify and no SNI acknowledgement.
+//!
 //! After the handshake (RFC 8446 §4.6.3) a client KeyUpdate turns the receive
 //! key over; `update_requested` is answered with the server's own KeyUpdate
 //! (one, however many requests arrive before it goes out — rustls). At most
@@ -49,10 +65,8 @@
 //! same (rustls `refresh_traffic_keys`), or when the caller asks
 //! (`keyUpdate`).
 //!
-//! Not yet (later milestones): PSK resumption and
-//! NewSessionTicket, client certificates. A pre_shared_key offer
-//! is ignored (full handshake); early data is never accepted and is skipped
-//! (`inbound.Inbound.skip_early`).
+//! Not yet (later milestones): client certificates. Early data is never
+//! accepted and is skipped (`inbound.Inbound.skip_early`).
 
 const std = @import("std");
 const tls13 = @import("tls13");
@@ -63,6 +77,7 @@ const outbound = @import("outbound.zig");
 const hello = @import("hello.zig");
 const messages = @import("messages.zig");
 const burn = @import("burn.zig");
+const tlsresume = @import("tlsresume");
 
 const certverify = tls13.certverify;
 const kex = tls13.kex;
@@ -104,6 +119,155 @@ pub const Config = struct {
     /// MUST be a cryptographically secure source: it draws the server
     /// random, the ephemeral key-exchange secret and signing randomness.
     random: std.Random,
+    /// Session tickets and resumption with them; null: neither (a
+    /// `pre_shared_key` offer gets a full handshake).
+    tickets: ?*const Tickets = null,
+};
+
+/// Session tickets (RFC 8446 §4.6.1).
+pub const Tickets = struct {
+    ticketer: Ticketer,
+    clock: Clock,
+    /// NewSessionTickets after each handshake (rustls `send_tls13_tickets`).
+    count: u8 = 2,
+    /// The `ticket_lifetime` advertised, in seconds (at most 7 days, RFC
+    /// 8446 §4.6.1); an older ticket is not resumed. rustls: 12 hours. 0
+    /// issues no tickets (a lifetime of 0 tells the client to discard it).
+    lifetime_s: u32 = 12 * 3600,
+};
+
+/// The wall clock, milliseconds since the Unix epoch.
+pub const Clock = struct {
+    ctx: ?*anyopaque = null,
+    now_ms: *const fn (ctx: ?*anyopaque) i64,
+};
+
+/// Seals and opens session tickets (rustls `ProducesTickets`): the blob
+/// format and the key rotation are its own. `StekTicketer` wraps a
+/// `tlsresume.StekRing`.
+pub const Ticketer = struct {
+    ctx: *const anyopaque,
+    /// Seal `plaintext` (secret: it holds the resumption master secret)
+    /// into `out` under the AEAD nonce `nonce`; null if it cannot (no key,
+    /// no room).
+    seal: *const fn (ctx: *const anyopaque, plaintext: []const u8, nonce: [12]u8, out: []u8) ?[]u8,
+    /// Open a blob this server sealed under a key still accepted at `now_s`
+    /// into `out`; null for anything else.
+    open: *const fn (ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8,
+};
+
+/// A `Ticketer` over a `tlsresume.StekRing(depth)`: AES-256-GCM, the key id
+/// as AAD, keys past `policy.lifetime_s` refused. The ring is read, never
+/// changed: its owner rotates it (`maybeRotate`) — sealing does not look at
+/// the policy, so an overdue active key issues tickets nothing will open —
+/// and must keep connections on other threads from reading it meanwhile.
+/// One ring is one trust domain: a ticket names only SNI and suite, so
+/// servers sharing a ring resume each other's sessions (rustls likewise).
+pub fn StekTicketer(comptime Ring: type) type {
+    return struct {
+        const Self = @This();
+
+        ring: *const Ring,
+        policy: tlsresume.RotationPolicy = .{},
+
+        /// The `Ticketer` points at `self` (and `self` at the ring): both
+        /// must outlive every `Server` whose `Config.tickets` holds it —
+        /// never call this on a temporary.
+        pub fn ticketer(self: *const Self) Ticketer {
+            return .{ .ctx = self, .seal = seal, .open = open };
+        }
+
+        fn seal(ctx: *const anyopaque, plaintext: []const u8, nonce: [12]u8, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            return self.ring.seal(plaintext, nonce, out) catch null;
+        }
+
+        fn open(ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            return self.ring.openAt(blob, now_s, self.policy, out) catch null;
+        }
+    };
+}
+
+/// The longest ticket plaintext: the `SessionState` prefix with a SHA-384
+/// secret and a 1-octet nonce, then this server's fields (`TicketFields`).
+const max_ticket_plaintext = tlsresume.select.SessionState(48).wireLen(1) + TicketFields.max_len;
+
+/// The ticket blob a `Ticketer` may return (a `StekRing`'s adds 29 octets).
+const max_ticket_len = 1024;
+
+/// PSK identities looked at in one ClientHello; later ones are ignored.
+const max_psk_identities = 32;
+
+/// What this server appends to the `SessionState` in a ticket. The suite is
+/// last, so it is read from the same place whichever hash length the prefix
+/// was parsed with: a ticket of the other hash never matches the suite.
+const TicketFields = struct {
+    sni: ?[]const u8,
+    alpn: ?[]const u8,
+    suite: u16,
+
+    const format: u8 = 1;
+    const max_len = 1 + 1 + 255 + 1 + 255 + 2;
+
+    fn write(f: TicketFields, out: []u8) usize {
+        var n: usize = 0;
+        out[n] = format;
+        n += 1;
+        for ([_]?[]const u8{ f.sni, f.alpn }) |v| {
+            const b = v orelse "";
+            out[n] = @intCast(b.len);
+            @memcpy(out[n + 1 ..][0..b.len], b);
+            n += 1 + b.len;
+        }
+        std.mem.writeInt(u16, out[n..][0..2], f.suite, .big);
+        return n + 2;
+    }
+
+    /// Null for anything this server did not write (another format).
+    fn parse(tail: []const u8) ?TicketFields {
+        if (tail.len < 5 or tail[0] != format) return null;
+        var at: usize = 1;
+        var v: [2]?[]const u8 = undefined;
+        for (&v) |*x| {
+            if (at >= tail.len) return null;
+            const n: usize = tail[at]; // not u8: `1 + n` overflows at 255
+            if (tail.len - at - 1 < n) return null;
+            x.* = if (n == 0) null else tail[at + 1 ..][0..n];
+            at += 1 + n;
+        }
+        if (tail.len - at != 2) return null;
+        return .{ .sni = v[0], .alpn = v[1], .suite = std.mem.readInt(u16, tail[at..][0..2], .big) };
+    }
+};
+
+/// Which of this server's tickets a ClientHello may resume (rustls
+/// `can_resume`: the suite negotiated, the same SNI; younger than the
+/// configured lifetime).
+const Resumable = struct {
+    suite: u16,
+    sni: ?[]const u8,
+    lifetime_ms: i64,
+
+    fn accepts(w: *const Resumable, tail: []const u8, age_ms: i64) bool {
+        const f = TicketFields.parse(tail) orelse return false;
+        return f.suite == w.suite and Server.optEql(f.sni, w.sni) and age_ms <= w.lifetime_ms;
+    }
+
+    /// `tlsresume.select.Filter.accept`.
+    fn accept(ctx: ?*anyopaque, tail: []const u8, age_ms: i64) bool {
+        const w: *const Resumable = @ptrCast(@alignCast(ctx.?));
+        return w.accepts(tail, age_ms);
+    }
+};
+
+/// `selectPsk`'s ring: the configured `Ticketer`.
+const TicketerRing = struct {
+    t: Ticketer,
+
+    pub fn openAt(self: *const TicketerRing, blob: []const u8, now_s: i64, _: tlsresume.RotationPolicy, out: []u8) tlsresume.stek.OpenError![]u8 {
+        return self.t.open(self.t.ctx, blob, now_s, out) orelse error.DecryptionFailed;
+    }
 };
 
 /// Records sealed under one send key before the server turns it over with
@@ -120,6 +284,12 @@ pub const KeyUpdateRequest = enum(u8) {
     update_not_requested = 0,
     update_requested = 1,
 };
+
+/// RFC 8446 §4.6.1: a ticket lives at most 7 days.
+pub const max_ticket_lifetime_s: u32 = 604_800;
+
+/// `psk_key_exchange_modes`: PSK with (EC)DHE, the only mode served.
+const psk_dhe_ke: u8 = 1;
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
@@ -256,6 +426,10 @@ pub const Server = struct {
     /// The server's own KeyUpdate, due but not yet in the output (it had no
     /// room): it goes out before any further record.
     tx_update: ?KeyUpdateRequest = null,
+    /// NewSessionTickets to send after the client's Finished.
+    tickets_due: u8 = 0,
+    /// The handshake resumed a session (a ticket's PSK was accepted).
+    resumed: bool = false,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -304,6 +478,12 @@ pub const Server = struct {
     /// The ALPN protocol chosen (one of `Config.alpn_protocols`), if any.
     pub fn alpnProtocol(self: *const Server) ?[]const u8 {
         return self.alpn;
+    }
+
+    /// The handshake resumed a session from a ticket (no certificate was
+    /// sent).
+    pub fn isResumed(self: *const Server) bool {
+        return self.resumed;
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -562,7 +742,31 @@ pub const Server = struct {
             if (retried) return error.IllegalParameter;
             return self.helloRetry(m.raw, &ch, suite, group, sni);
         };
+        // RFC 8446 §4.2.9.
         if (ch.pre_shared_key != null and ch.psk_key_exchange_modes == null) return error.MissingExtension;
+        if (!retried) self.startTranscript(suite);
+
+        // A ticket's PSK (rustls: before ALPN, so a bad binder is
+        // decrypt_error whatever else fails). Without psk_dhe_ke neither
+        // resumption nor tickets (the only mode served).
+        var psk_buf: [48]u8 = undefined;
+        defer std.crypto.secureZero(u8, &psk_buf);
+        var psk: ?[]const u8 = null;
+        var selected: ?u16 = null;
+        if (cfg.tickets) |tk| {
+            if (ch.pre_shared_key) |offer| {
+                selected = switch (suite) {
+                    .aes_256_gcm_sha384 => try self.choosePsk(S384, tk, m.body, offer, suite, sni, &psk_buf),
+                    else => try self.choosePsk(S256, tk, m.body, offer, suite, sni, &psk_buf),
+                };
+            }
+            const modes = ch.psk_key_exchange_modes orelse "";
+            if (std.mem.indexOfScalar(u8, modes, psk_dhe_ke) != null) {
+                self.tickets_due = if (tk.lifetime_s == 0) 0 else tk.count;
+                if (selected != null) psk = psk_buf[0 .. suite.hashLen() orelse unreachable];
+            } else selected = null;
+        }
+        self.resumed = selected != null;
 
         if (ch.alpn()) |theirs| {
             for (cfg.alpn_protocols) |ours| {
@@ -587,18 +791,68 @@ pub const Server = struct {
             error.MissingKeyShare => if (kex.expectedShareLen(group) != 0) error.IllegalParameter else error.InternalError,
         };
 
-        if (!retried) self.startTranscript(suite);
         self.suite = suite;
         self.has_suite = true;
         self.group = group;
         switch (suite) {
-            .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried),
-            else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried),
+            .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected),
+            else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected),
         }
         // Early data the client may have sent under a PSK we did not take
         // (never after a retry: refused above).
         self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
         self.state = .client_finished;
+    }
+
+    /// RFC 8446 §4.2.11 through `tlsresume.select.selectPsk`: the index of
+    /// the identity taken, its PSK in `psk_out`; null for a full handshake.
+    fn choosePsk(
+        self: *Server,
+        comptime H: type,
+        tk: *const Tickets,
+        body: []const u8,
+        offer: hello.PreSharedKey,
+        suite: record.CipherSuite,
+        sni: ?[]const u8,
+        psk_out: *[48]u8,
+    ) Error!?u16 {
+        const L = H.len;
+        var ids: [max_psk_identities]tlsresume.select.OfferedIdentity = undefined;
+        var binders: [max_psk_identities][L]u8 = undefined;
+        var n: usize = 0;
+        var it = offer.identities();
+        var bt = offer.binders();
+        while (n < max_psk_identities) : (n += 1) {
+            const id = it.next() orelse break;
+            // As many binders as identities (`hello` checked it). A binder
+            // of the wrong length never verifies: for a ticket we would
+            // take, that is decrypt_error (rustls).
+            const b = bt.next().?;
+            ids[n] = .{ .ticket = id.identity, .obfuscated_ticket_age = id.obfuscated_ticket_age };
+            binders[n] = if (b.len == L) b[0..L].* else @splat(0);
+        }
+        // §4.2.11.2: the transcript through the ClientHello up to its
+        // binders (after a HelloRetryRequest, message_hash and the HRR too).
+        const th = H.transcript(&self.transcript).wouldBeHash(@backingInt(messages.HandshakeType.client_hello), body.len, body[0..offer.binders_offset]);
+        var empty_hash: [L]u8 = undefined;
+        H.Hash.hash("", &empty_hash, .{});
+
+        var want: Resumable = .{
+            .suite = @backingInt(suite),
+            .sni = sni,
+            .lifetime_ms = @as(i64, @min(tk.lifetime_s, max_ticket_lifetime_s)) * 1000,
+        };
+        const ring: TicketerRing = .{ .t = tk.ticketer };
+        var scratch: [max_ticket_plaintext]u8 = undefined;
+        defer std.crypto.secureZero(u8, &scratch);
+        var sel: tlsresume.select.Selection(L) = undefined;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
+        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, tk.clock.now_ms(tk.clock.ctx), null, null, .{ .ctx = &want, .accept = Resumable.accept }, &scratch) catch |err| return switch (err) {
+            error.NoAcceptableIdentity => null,
+            error.BinderMismatch => error.DecryptError,
+        };
+        @memcpy(psk_out[0..L], &sel.psk);
+        return @intCast(sel.selected_index);
     }
 
     fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
@@ -687,6 +941,9 @@ pub const Server = struct {
         ex: *const kex.ServerExchange,
         /// The compatibility CCS, unless it followed a HelloRetryRequest.
         ccs: bool,
+        /// A resumption: the PSK and the identity it came from.
+        psk: ?[]const u8,
+        selected_identity: ?u16,
     ) Error!void {
         const cfg = self.config;
         const t = H.transcript(&self.transcript);
@@ -699,17 +956,18 @@ pub const Server = struct {
             .legacy_session_id_echo = ch.legacy_session_id,
             .cipher_suite = @backingInt(self.suite),
             .key_share = .{ .group = group, .key_exchange = ex.public[0..ex.public_len] },
+            .selected_identity = selected_identity,
         })));
         if (ccs) try self.out.write(.change_cipher_spec, &.{1});
 
-        // RFC 8446 §7.1, no PSK.
+        // RFC 8446 §7.1: the PSK, or zeros.
         const L = H.len;
         var empty_hash: [L]u8 = undefined;
         H.Hash.hash("", &empty_hash, .{});
         var early: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &early);
         const zeros: [L]u8 = @splat(0);
-        tls13.keyschedule.earlySecret(H.Hkdf, &early, &zeros);
+        tls13.keyschedule.earlySecret(H.Hkdf, &early, psk orelse &zeros);
         const hs = self.handshake_secret[0..L];
         ks.deriveHandshakeSecret(H.Hkdf, hs, &early, &empty_hash, ex.shared.slice());
         var server_hs: [L]u8 = undefined;
@@ -730,24 +988,28 @@ pub const Server = struct {
             exts[n_exts] = .{ .type = 16, .data = try encoded(messages.alpnData(&alpn_body, p)) };
             n_exts += 1;
         }
-        if (self.sni_len != null) {
+        // RFC 6066 §3: not when resuming (rustls).
+        if (self.sni_len != null and psk == null) {
             exts[n_exts] = .{ .type = 0, .data = "" };
             n_exts += 1;
         }
         try self.send(H, try encoded(messages.encryptedExtensions(self.out.slot(), exts[0..n_exts])));
 
-        // Certificate, the OCSP staple on the leaf if the client asked.
-        var entries: [16]messages.CertificateEntry = undefined;
-        if (ck.chain.len == 0 or ck.chain.len > entries.len) return error.InternalError;
-        for (ck.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
-        if (ch.ocsp_requested) entries[0].ocsp_response = ck.ocsp_response;
-        try self.send(H, try encoded(messages.certificate(self.out.slot(), "", entries[0..ck.chain.len])));
+        // A resumption authenticates with the PSK (RFC 8446 §2.2).
+        if (psk == null) {
+            // Certificate, the OCSP staple on the leaf if the client asked.
+            var entries: [16]messages.CertificateEntry = undefined;
+            if (ck.chain.len == 0 or ck.chain.len > entries.len) return error.InternalError;
+            for (ck.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
+            if (ch.ocsp_requested) entries[0].ocsp_response = ck.ocsp_response;
+            try self.send(H, try encoded(messages.certificate(self.out.slot(), "", entries[0..ck.chain.len])));
 
-        // CertificateVerify over the transcript through Certificate.
-        th = t.currentHash();
-        var sig_buf: [1024]u8 = undefined;
-        const sig = certverify.sign(scheme, ck.key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
-        try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), @backingInt(scheme), sig)));
+            // CertificateVerify over the transcript through Certificate.
+            th = t.currentHash();
+            var sig_buf: [1024]u8 = undefined;
+            const sig = certverify.sign(scheme, ck.key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
+            try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), @backingInt(scheme), sig)));
+        }
 
         // Finished.
         th = t.currentHash();
@@ -773,6 +1035,9 @@ pub const Server = struct {
             else => try self.clientFinished(S256, m),
         }
         self.wipeHandshakeSecrets();
+        // The tickets are out: nothing needs the master secret any more (it
+        // would give every ticket's PSK away).
+        std.crypto.secureZero(u8, &self.master_secret);
         self.inbound.app_data_ok = true;
         self.state = .connected;
     }
@@ -793,6 +1058,63 @@ pub const Server = struct {
             error.UnexpectedMessage => error.UnexpectedMessage,
             else => error.InternalError,
         };
+        if (self.tickets_due != 0) {
+            const through_finished = t.currentHash();
+            self.issueTickets(H, &through_finished);
+        }
+    }
+
+    /// RFC 8446 §4.6.1: `tickets_due` NewSessionTickets, each for its own
+    /// PSK (nonce = its index), packed into one flight (BoringSSL; the
+    /// runner's `ExpectPackedEncryptedHandshake`), each with an empty GREASE
+    /// extension (RFC 8701 §3.2, as BoringSSL). One that cannot be sealed
+    /// or has no room is not sent, nor are the rest (rustls sends none it
+    /// cannot store).
+    fn issueTickets(self: *Server, comptime H: type, th: *const [H.len]u8) void {
+        const L = H.len;
+        const tk = self.config.tickets.?;
+        const Session = tlsresume.select.SessionState(L);
+        var state: Session = .{
+            .resumption_master_secret = undefined,
+            .ticket_nonce = undefined,
+            .issued_at_ms = tk.clock.now_ms(tk.clock.ctx),
+            .ticket_age_add = undefined,
+        };
+        defer std.crypto.secureZero(u8, &state.resumption_master_secret);
+        ks.deriveResumptionMasterSecret(H.Hkdf, &state.resumption_master_secret, self.master_secret[0..L], th);
+        var plain: [max_ticket_plaintext]u8 = undefined;
+        defer std.crypto.secureZero(u8, &plain);
+        var blob: [max_ticket_len]u8 = undefined;
+        const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .suite = @backingInt(self.suite) };
+        const slot = self.out.slot();
+        var used: usize = 0;
+        for (0..self.tickets_due) |i| {
+            const nonce = [1]u8{@intCast(i)};
+            state.ticket_nonce = &nonce;
+            state.ticket_age_add = self.config.random.int(u32);
+            const prefix = state.serialize(&plain) catch unreachable; // sized for it
+            const n = prefix.len + fields.write(plain[prefix.len..]);
+            var aead_nonce: [12]u8 = undefined;
+            self.config.random.bytes(&aead_nonce);
+            const ticket = tk.ticketer.seal(tk.ticketer.ctx, plain[0..n], aead_nonce, &blob) orelse break;
+            if (ticket.len == 0 or ticket.len > max_ticket_len) break;
+            const g: u16 = self.config.random.int(u4);
+            const grease = [_]tlsresume.ticket.Extension{.{ .ext_type = (g << 12) | (g << 4) | 0x0a0a, .data = "" }};
+            if (slot.len - used < 4) break;
+            const body = (tlsresume.ticket.NewSessionTicket{
+                .ticket_lifetime = @min(tk.lifetime_s, max_ticket_lifetime_s),
+                .ticket_age_add = state.ticket_age_add,
+                .ticket_nonce = &nonce,
+                .ticket = ticket,
+                .extensions = &grease,
+            }).encode(slot[used + 4 ..]) catch break;
+            slot[used] = @backingInt(messages.HandshakeType.new_session_ticket);
+            std.mem.writeInt(u24, slot[used + 1 ..][0..3], @intCast(body.len), .big);
+            used += 4 + body.len;
+        }
+        // `slot` leaves room for the records' overhead.
+        if (used != 0) self.out.commit(.handshake, used) catch unreachable;
+        self.tickets_due = 0;
     }
 };
 
@@ -817,6 +1139,8 @@ const Hello = struct {
     sni: ?[]const u8 = null,
     alpn: ?[]const []const u8 = null,
     psk_without_modes: bool = false,
+    /// `psk_key_exchange_modes`.
+    psk_modes: ?[]const u8 = null,
     early_data: bool = false,
     /// Octets of a next handshake message in the same record.
     trailing: []const u8 = "",
@@ -918,6 +1242,12 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
         try W.ext(&e, gpa, 41, &psk);
+    }
+    if (h.psk_modes) |m| {
+        var d: [8]u8 = undefined;
+        d[0] = @intCast(m.len);
+        @memcpy(d[1..][0..m.len], m);
+        try W.ext(&e, gpa, 45, d[0 .. 1 + m.len]);
     }
     if (h.early_data) try W.ext(&e, gpa, 42, "");
     try W.u16be(&b, gpa, e.items.len);
@@ -1566,4 +1896,84 @@ test "a full output still takes the fatal alert, or close_notify" {
         try p.s.close();
         try testing.expectEqual(@as(usize, 1), (try p.drain()).alerts);
     }
+}
+
+test "ticket fields: round trip, and what a ClientHello may resume" {
+    var buf: [TicketFields.max_len]u8 = undefined;
+    const long_alpn: [255]u8 = @splat('a');
+    const long_sni: [253]u8 = @splat('b');
+    for ([_]TicketFields{
+        .{ .sni = "example.com", .alpn = "h2", .suite = 0x1302 },
+        .{ .sni = null, .alpn = null, .suite = 0x1301 },
+        .{ .sni = &long_sni, .alpn = &long_alpn, .suite = 0x1303 },
+    }) |f| {
+        const n = f.write(&buf);
+        const back = TicketFields.parse(buf[0..n]).?;
+        try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and f.suite == back.suite);
+        // Every truncation, an extra octet and another format are refused.
+        for (0..n) |cut| try testing.expect(TicketFields.parse(buf[0..cut]) == null);
+        buf[n] = 0;
+        try testing.expect(TicketFields.parse(buf[0 .. n + 1]) == null);
+        buf[0] ^= 1;
+        try testing.expect(TicketFields.parse(buf[0..n]) == null);
+    }
+
+    const n = (TicketFields{ .sni = "example.com", .alpn = null, .suite = 0x1301 }).write(&buf);
+    const tail = buf[0..n];
+    const want: Resumable = .{ .suite = 0x1301, .sni = "example.com", .lifetime_ms = 1000 };
+    try testing.expect(want.accepts(tail, 0));
+    try testing.expect(want.accepts(tail, 1000));
+    try testing.expect(!want.accepts(tail, 1001));
+    var other = want;
+    other.suite = 0x1303; // same hash, another suite
+    try testing.expect(!other.accepts(tail, 0));
+    other = want;
+    other.sni = "example.org";
+    try testing.expect(!other.accepts(tail, 0));
+    other.sni = null;
+    try testing.expect(!other.accepts(tail, 0));
+    const n2 = (TicketFields{ .sni = null, .alpn = null, .suite = 0x1301 }).write(&buf);
+    try testing.expect(other.accepts(buf[0..n2], 0));
+    try testing.expect(!want.accepts(buf[0..n2], 0));
+}
+
+test "tickets only for a client that offers psk_dhe_ke (rustls)" {
+    const T = struct {
+        fn seal(_: *const anyopaque, _: []const u8, _: [12]u8, _: []u8) ?[]u8 {
+            return null;
+        }
+        fn open(_: *const anyopaque, _: []const u8, _: i64, _: []u8) ?[]u8 {
+            return null;
+        }
+        fn now(_: ?*anyopaque) i64 {
+            return 0;
+        }
+    };
+    const none: u8 = 0;
+    const tickets: Tickets = .{ .ticketer = .{ .ctx = &none, .seal = T.seal, .open = T.open }, .clock = .{ .now_ms = T.now }, .count = 3 };
+    for ([_]struct { ?[]const u8, u8 }{ .{ null, 0 }, .{ &.{0}, 0 }, .{ &.{ 0, 2 }, 0 }, .{ &.{1}, 3 }, .{ &.{ 0, 1 }, 3 } }) |c| {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &tickets };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var out: [32 * 1024]u8 = undefined;
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .psk_modes = c[0] });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        try testing.expectEqual(c[1], s.tickets_due);
+        try testing.expect(!s.isResumed());
+    } // A lifetime of 0 issues none (RFC 8446 §4.6.1: 0 = discard it).
+    var zero = tickets;
+    zero.lifetime_s = 0;
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &zero };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .psk_modes = &.{1} });
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    try testing.expectEqual(@as(u8, 0), s.tickets_due);
 }

@@ -80,7 +80,7 @@ fn openWrap(r: *const Ring, b: []const u8, o: []u8) ![]u8 {
     return r.open(b, o);
 }
 fn selectWrap(o: *Sel, r: *const Ring, id: []const select.OfferedIdentity, b: []const [32]u8) !void {
-    return select.selectPsk(Hkdf, Hmac, Ring, o, r, .{}, id, b, &eh, &th, 5_000, 10_000, null, &scratch);
+    return select.selectPsk(Hkdf, Hmac, Ring, o, r, .{}, id, b, &eh, &th, 5_000, 10_000, null, null, &scratch);
 }
 
 fn fill() void {

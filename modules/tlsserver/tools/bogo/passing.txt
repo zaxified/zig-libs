@@ -4,6 +4,8 @@ ALPNServer-EmptyProtocolName-TLS-TLS13
 Alert
 BadFinished-Server-TLS13
 CheckECDSACurve-NotApplicable-TLS13
+CorruptTicket-TLS-TLS13
+CurveID-Resume-Server-TLS13
 CurveTest-Invalid-Compressed-Server-P-256-TLS13
 CurveTest-Invalid-Compressed-Server-P-384-TLS13
 CurveTest-Invalid-LowOrderX25519Point-Server-X25519-TLS13
@@ -32,6 +34,7 @@ EmptySessionID-TLS13
 ExtensionTrailingData-CertificateAuthorities-Server-TLS-TLS13
 ExtensionTrailingData-ServerName-Server-TLS-TLS13
 ExtraCompressionMethods-TLS13
+ExtraPSKIdentity-TLS13
 FallbackSCSV-VersionMatch-TLS13
 FragmentAlert
 FragmentedClientVersion
@@ -44,6 +47,7 @@ HttpHEAD
 HttpPOST
 HttpPUT
 IgnoreClientVersionOrder
+IgnoreLegacyVersion-TLS13
 KeyUpdate-FromServer
 KeyUpdate-ToServer
 LooseInitialRecordVersion-TLS13
@@ -78,6 +82,21 @@ PartialClientFinishedWithSecondClientHello
 PartialClientFinishedWithSecondClientHello-NoCCS
 PartialSecondClientHelloAfterFirst
 RSA-PSS-Large
+Resume-Server-BinderWrongLength
+Resume-Server-BinderWrongLength-SecondBinder
+Resume-Server-CipherNotPreferred-TLS13
+Resume-Server-ExtraIdentityNoBinder
+Resume-Server-ExtraIdentityNoBinder-SecondBinder
+Resume-Server-ExtraPSKBinder
+Resume-Server-ExtraPSKBinder-SecondBinder
+Resume-Server-InvalidPSKBinder
+Resume-Server-InvalidPSKBinder-SecondBinder
+Resume-Server-NoPSKBinder
+Resume-Server-NoPSKBinder-SecondBinder
+Resume-Server-PSKBinderFirstExtension
+Resume-Server-PSKBinderFirstExtension-SecondBinder
+Resume-Server-TLS13-TLS13-TLS
+Resume-Server-UnofferedCipher-TLS13
 SecondClientHelloMissingKeyShare-TLS13
 SecondClientHelloWrongCurve-TLS13
 Server-FullSessionID-TLS13
@@ -108,6 +127,7 @@ Server-SignDefault-RSA_PSS_SHA512-TLS13
 Server-TooLongSessionID-TLS13
 ServerAuth-NoFallback-TLS13
 ServerAuth-SignatureType-TLS13
+ServerNameExtensionServer-TLS-TLS13
 ServerPaddingServer-NoServerSupport
 ServerPaddingServer-NotRequested
 SkipChangeCipherSpec-Server-TLS13
@@ -121,8 +141,12 @@ SkipEarlyData-TLS13
 SkipEarlyData-TooMuchData-TLS13
 TLS-ECH-Server-Disabled
 TLS13-ExpectNoSessionTicketOnBadKEMode-Server
+TLS13-SendBadKEModeSessionTicket-Server
+TLS13-SendNoKEMModesWithPSK-Server
+TLS13-SendUnknownModeSessionTicket-Server
 TLS13-Server-NoResumptionAcrossNames
 TooManyChangeCipherSpec-Server-TLS13
+TrailingDataWithFinished-Resume-Server-TLS13
 TrailingDataWithFinished-Server-TLS13
 TrailingKeyShareData-TLS13
 TrailingMessageData-ClientHello-TLS

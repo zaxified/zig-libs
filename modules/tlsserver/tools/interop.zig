@@ -30,6 +30,7 @@ const std = @import("std");
 const net = std.Io.net;
 const tlsserver = @import("tlsserver");
 const rsa = @import("rsa");
+const tlsresume = @import("tlsresume");
 const bogo_shim = @import("bogo_shim.zig");
 const certs = tlsserver.test_fixtures;
 
@@ -68,7 +69,16 @@ const Case = struct {
     /// application data (not before close_notify), so it is handed
     /// "again\n" to send.
     key_update: bool = false,
+    /// The server issues tickets and resumes them (`interop_stek_key` and
+    /// `interop_clock_ms`: constants, so a capture replays).
+    tickets: bool = false,
+    /// The server must have resumed a session.
+    resumed: bool = false,
 };
+
+/// The ticket key and clock of every `tickets` case (and of the replay).
+pub const interop_stek_key: [32]u8 = @splat(0x5e);
+pub const interop_clock_ms: i64 = 1_800_000_000_000;
 
 const cases = [_]Case{
     .{ .name = "p256-default", .why = "OpenSSL's defaults: its first group (X25519MLKEM768) and suite", .seed = 1, .expect = &.{ "Protocol version: TLSv1.3", "Ciphersuite: TLS_AES_256_GCM_SHA384", "Verification: OK", "Negotiated TLS1.3 group: X25519MLKEM768" } },
@@ -85,6 +95,12 @@ const cases = [_]Case{
     .{ .name = "keyupdate", .why = "KeyUpdate: the server asks (update_requested), s_client answers; SHA-384 suite", .seed = 13, .key_update = true, .expect = &.{"Ciphersuite: TLS_AES_256_GCM_SHA384"} },
     .{ .name = "keyupdate-chacha", .why = "KeyUpdate under TLS_CHACHA20_POLY1305_SHA256", .seed = 14, .key_update = true, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256" }, .expect = &.{"Ciphersuite: TLS_CHACHA20_POLY1305_SHA256"} },
     .{ .name = "hrr-p384-aes128", .why = "HelloRetryRequest for secp384r1 under TLS_AES_128_GCM_SHA256", .seed = 12, .groups = &.{tlsserver.server.default_groups[3]}, .args = &.{ "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "X25519:P-384" }, .expect = &.{ "Ciphersuite: TLS_AES_128_GCM_SHA256", "Peer Temp Key: ECDH, secp384r1" } },
+    // Resumption: a session saved by one case, resumed by the next ones.
+    .{ .name = "resume-new", .why = "tickets: s_client saves the session (SHA-384 suite)", .seed = 15, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl.sess" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "resume", .why = "resumption: s_client offers the saved ticket (psk_dhe_ke, no Certificate)", .seed = 16, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl.sess" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "resume-hrr", .why = "resumption after a HelloRetryRequest (the binder over message_hash and the HRR)", .seed = 17, .tickets = true, .resumed = true, .brief = false, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess_in", "openssl.sess", "-groups", "X25519:P-256" }, .expect = &.{ "Reused, TLSv1.3", "Peer Temp Key: ECDH, prime256v1" } },
+    .{ .name = "resume-aes128-new", .why = "tickets under TLS_AES_128_GCM_SHA256", .seed = 18, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
+    .{ .name = "resume-aes128", .why = "resumption under TLS_AES_128_GCM_SHA256", .seed = 19, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     // Go: its suite order (AES-128 first on AES hardware) is not
     // configurable in TLS 1.3, so the server's list picks the suite.
     .{ .name = "go-default", .client = .go, .why = "Go's defaults: X25519MLKEM768, its first suite", .seed = 21, .expect = &.{ "version: TLS 1.3", "suite: TLS_AES_128_GCM_SHA256", "group: X25519MLKEM768", "peer_certs: 1" } },
@@ -100,7 +116,14 @@ const cases = [_]Case{
     .{ .name = "go-hrr-p256", .client = .go, .why = "HelloRetryRequest: Go's X25519MLKEM768 + X25519 shares, a server with only secp256r1", .seed = 31, .groups = &.{tlsserver.server.default_groups[2]}, .expect = &.{ "group: CurveP256", "hrr: true" } },
     .{ .name = "go-keyupdate", .client = .go, .why = "KeyUpdate: the server asks (update_requested), Go answers", .seed = 33, .key_update = true, .expect = &.{"suite: TLS_AES_128_GCM_SHA256"} },
     .{ .name = "go-hrr-p384-aes256", .client = .go, .why = "HelloRetryRequest for secp384r1 under TLS_AES_256_GCM_SHA384", .seed = 32, .suites = &.{.aes_256_gcm_sha384}, .groups = &.{tlsserver.server.default_groups[3]}, .expect = &.{ "group: CurveP384", "suite: TLS_AES_256_GCM_SHA384", "hrr: true" } },
+    .{ .name = "go-resume-new", .client = .go, .why = "tickets: Go saves the session", .seed = 34, .tickets = true, .args = &.{ "-sess-out", "go.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
+    .{ .name = "go-resume", .client = .go, .why = "resumption: Go offers the saved ticket", .seed = 35, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{"resumed: true"} },
+    .{ .name = "go-resume-hrr", .client = .go, .why = "resumption after a HelloRetryRequest", .seed = 36, .tickets = true, .resumed = true, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{ "resumed: true", "hrr: true" } },
 };
+
+fn interopNow(_: ?*anyopaque) i64 {
+    return interop_clock_ms;
+}
 
 var child_env: ?*const std.process.Environ.Map = null;
 
@@ -274,12 +297,17 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     const ck = certifiedKey(keys, c.cert, &chain);
     const seed: [32]u8 = @splat(c.seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
+    var ring: tlsresume.stek.DefaultRing = .init();
+    ring.rotate(1, &interop_stek_key, @divFloor(interop_clock_ms, 1000));
+    const stek: tlsserver.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
+    const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = interopNow } };
     const cfg: tlsserver.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = c.suites,
         .groups = c.groups,
         .alpn_protocols = c.alpn,
         .random = csprng.random(),
+        .tickets = if (c.tickets) &tickets else null,
     };
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
@@ -327,6 +355,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     if (no_sni and server.serverName() != null) return error.SniFromNowhere;
     // serve's close_notify waited for the client's KeyUpdate.
     if (c.key_update and !server.write_closed) return error.NoClientKeyUpdate;
+    if (server.isResumed() != c.resumed) return error.ResumptionMismatch;
 }
 
 fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []const struct { Case, Recorded }) !void {
@@ -344,6 +373,9 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\
         \\pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
         \\
+    );
+    try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n\n", .{ interop_stek_key[0], interop_clock_ms });
+    try w.writeAll(
         \\pub const Case = struct {
         \\    name: []const u8,
         \\    cert: CertKind,
@@ -353,6 +385,10 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    alpn: []const []const u8,
         \\    /// The server sent KeyUpdate(update_requested) before "pong\n".
         \\    key_update: bool = false,
+        \\    /// Tickets under `stek_key` (id 1) with the clock at `clock_ms`.
+        \\    tickets: bool = false,
+        \\    /// The server resumed a session.
+        \\    resumed: bool = false,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -371,6 +407,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         for (c.alpn, 0..) |a, i| try w.print("{s}\"{s}\"", .{ listSep(i, c.alpn.len), a });
         try w.print("{s}}},\n", .{listEnd(c.alpn.len)});
         if (c.key_update) try w.writeAll("        .key_update = true,\n");
+        if (c.tickets) try w.writeAll("        .tickets = true,\n");
+        if (c.resumed) try w.writeAll("        .resumed = true,\n");
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");

@@ -110,10 +110,27 @@ pub fn SessionState(comptime rms_len: usize) type {
 pub const max_ticket_lifetime_ms: i64 = 604_800 * 1000;
 
 pub const SelectError = error{
-    /// No offered identity unsealed, passed freshness, and verified its
-    /// binder. The engine should fall back to a full (non-resumed)
-    /// handshake — never treat this as fatal.
+    /// No offered identity unsealed and passed the checks. The engine should
+    /// fall back to a full (non-resumed) handshake — never treat this as
+    /// fatal.
     NoAcceptableIdentity,
+    /// The first identity that unsealed and passed the checks carries a
+    /// binder that does not verify. RFC 8446 §4.2.11: the server MUST abort
+    /// the handshake (`decrypt_error`, as rustls `IncorrectBinder`) — the
+    /// client holds a ticket of ours but not its PSK, or the ClientHello was
+    /// tampered with.
+    BinderMismatch,
+};
+
+/// The engine's own checks on a ticket this server issued (rustls
+/// `can_resume`: same cipher suite, same SNI; a lifetime shorter than the
+/// 7-day cap). `tail` is the opened plaintext after the `SessionState`
+/// prefix — the engine's appended fields, as it sealed them; `age_ms` is
+/// `now_ms - issued_at_ms` (0 ≤ age ≤ `max_ticket_lifetime_ms`). False
+/// skips the identity like an unknown ticket: its binder is never checked.
+pub const Filter = struct {
+    ctx: ?*anyopaque = null,
+    accept: *const fn (ctx: ?*anyopaque, tail: []const u8, age_ms: i64) bool,
 };
 
 /// One offered `PskIdentity` (RFC 8446 §4.2.11) — the opaque ticket bytes
@@ -150,19 +167,27 @@ pub fn Selection(comptime rms_len: usize) type {
 ///      even if `expire` was never called, tampered ciphertext — never
 ///      fatal, just not this server's live ticket).
 ///   2. `SessionState(Hkdf.prk_length).parse(...)` the opened plaintext.
-///   3. `replay.deobfuscateAge` the client's reported age against the
-///      session's `ticket_age_add`, then `replay.withinFreshnessWindow`
-///      against `now_ms - session.issued_at_ms`; skip on failure. A session
-///      older than `max_ticket_lifetime_ms` (7 days, RFC 8446 §4.6.1) or
-///      stamped in the future is skipped first. (`SessionState` carries no
-///      per-ticket lifetime field, so the 7-day cap is the only age limit.)
-///   4. `psk.derivePsk(Hkdf, session.resumption_master_secret,
+///   3. A session older than `max_ticket_lifetime_ms` (7 days, RFC 8446
+///      §4.6.1) or stamped in the future is skipped. Then, if
+///      `freshness_window_ms` is set, `replay.deobfuscateAge` the client's
+///      reported age against the session's `ticket_age_add` and
+///      `replay.withinFreshnessWindow` it against `now_ms -
+///      session.issued_at_ms`; skip on failure. (Null: the reported age is
+///      not checked — rustls, BoringSSL and Go check it only before taking
+///      early data; it bounds a replay window, it authenticates nothing.)
+///   4. If `filter` is set, `filter.accept(tail, age)`; skip on false (the
+///      engine's own fields: suite, SNI, its own lifetime).
+///   5. `psk.derivePsk(Hkdf, session.resumption_master_secret,
 ///      session.ticket_nonce, Hkdf.prk_length)`, then
 ///      `psk.verifyBinder(Hkdf, Hmac, psk.binderKey(Hkdf,
 ///      psk.earlySecret(Hkdf, &derived_psk), empty_transcript_hash),
-///      truncated_client_hello_transcript_hash, binders[i])`; skip on a
-///      failed binder.
-///   5. If `strike` is non-null: `strike.checkAndMark(identities[i].ticket,
+///      truncated_client_hello_transcript_hash, binders[i])`. A binder
+///      that does not verify ends the search with `error.BinderMismatch`
+///      (RFC 8446 §4.2.11: "If this value is not present or does not
+///      validate, the server MUST abort the handshake"; rustls). Only this
+///      one binder is checked (§4.2.11: servers SHOULD NOT validate
+///      several).
+///   6. If `strike` is non-null: `strike.checkAndMark(identities[i].ticket,
 ///      now_ms)`; skip if it reports a replay (or fails to allocate —
 ///      fail-closed). **Ordering: the binder is verified BEFORE the strike
 ///      register is consulted/marked** — an attacker who replays a captured
@@ -174,12 +199,13 @@ pub fn Selection(comptime rms_len: usize) type {
 ///      every later copy is rejected.) Marking only fully-verified tickets
 ///      also keeps the bounded register from being flooded with garbage
 ///      identifiers an attacker can fabricate for free.
-///   6. All checks pass -> write `.{ .selected_index = i, .psk =
+///   7. All checks pass -> write `.{ .selected_index = i, .psk =
 ///      derived_psk, .session = session }` into `out` (zeroed on error).
 ///
 /// `error.NoAcceptableIdentity` if no offered identity passes all checks
 /// (the engine should fall back to a full handshake, not fail the
-/// connection). `open_scratch` backs the unsealed plaintext (see
+/// connection); `error.BinderMismatch` is fatal (see step 5).
+/// `open_scratch` backs the unsealed plaintext (see
 /// `stek.StekRing.open`'s `out` buffer) — sized by the caller for the
 /// largest session-state record it seals; the returned
 /// `session.ticket_nonce` slice points into it.
@@ -199,11 +225,12 @@ pub fn selectPsk(
     empty_transcript_hash: []const u8,
     truncated_client_hello_transcript_hash: []const u8,
     now_ms: i64,
-    freshness_window_ms: u32,
+    freshness_window_ms: ?u32,
     strike: ?*replay.StrikeRegister,
+    filter: ?Filter,
     open_scratch: []u8,
 ) SelectError!void {
-    const r = burn.run(burn.select_burn, SelectError!void, selectBody, .{ Hkdf, Hmac, Ring, out, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch });
+    const r = burn.run(burn.select_burn, SelectError!void, selectBody, .{ Hkdf, Hmac, Ring, out, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, filter, open_scratch });
     r catch std.crypto.secureZero(u8, std.mem.asBytes(out));
     return r;
 }
@@ -220,8 +247,9 @@ fn selectBody(
     empty_transcript_hash: []const u8,
     truncated_client_hello_transcript_hash: []const u8,
     now_ms: i64,
-    freshness_window_ms: u32,
+    freshness_window_ms: ?u32,
     strike: ?*replay.StrikeRegister,
+    filter: ?Filter,
     open_scratch: []u8,
 ) SelectError!void {
     // RFC 8446 §4.2.11.2: binders align 1:1 with identities; a mismatch is
@@ -243,20 +271,32 @@ fn selectBody(
         // so a session that outlived every ticket lifetime never resumes.
         if (elapsed_ms < 0 or elapsed_ms > std.math.maxInt(u32)) continue;
         if (elapsed_ms > max_ticket_lifetime_ms) continue;
-        const reported_age_ms = replay.deobfuscateAge(identity.obfuscated_ticket_age, session.ticket_age_add);
-        if (!replay.withinFreshnessWindow(reported_age_ms, @intCast(elapsed_ms), freshness_window_ms)) continue;
+        if (freshness_window_ms) |window| {
+            const reported_age_ms = replay.deobfuscateAge(identity.obfuscated_ticket_age, session.ticket_age_add);
+            if (!replay.withinFreshnessWindow(reported_age_ms, @intCast(elapsed_ms), window)) continue;
+        }
 
-        // 4. Derive the PSK and verify the binder (RFC 8446 §4.2.11.2) —
-        // constant-time compare inside psk.verifyBinder.
+        // 4. The engine's own fields.
+        if (filter) |f| {
+            const tail = plaintext[SessionState(Hkdf.prk_length).wireLen(session.ticket_nonce.len)..];
+            if (!f.accept(f.ctx, tail, elapsed_ms)) continue;
+        }
+
+        // 5. Derive the PSK and verify the binder (RFC 8446 §4.2.11.2) —
+        // constant-time compare inside psk.verifyBinder. A bad binder on a
+        // ticket we would take is fatal (§4.2.11).
         var derived_psk: [Hkdf.prk_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &derived_psk);
         var early_secret: [Hkdf.prk_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &early_secret);
         var binder_key: [Hkdf.prk_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &binder_key);
         psk.derivePsk(Hkdf, Hkdf.prk_length, &derived_psk, &session.resumption_master_secret, session.ticket_nonce);
         psk.earlySecret(Hkdf, &early_secret, &derived_psk);
         psk.binderKey(Hkdf, &binder_key, &early_secret, empty_transcript_hash);
-        if (!psk.verifyBinder(Hkdf, Hmac, &binder_key, truncated_client_hello_transcript_hash, binder)) continue;
+        if (!psk.verifyBinder(Hkdf, Hmac, &binder_key, truncated_client_hello_transcript_hash, binder)) return error.BinderMismatch;
 
-        // 5. Anti-replay (RFC 8446 §8.1) — only AFTER the binder verified;
+        // 6. Anti-replay (RFC 8446 §8.1) — only AFTER the binder verified;
         // see the doc comment for the ordering rationale. Allocation
         // failure rejects (fail-closed), never accepts.
         if (strike) |register| {
@@ -283,12 +323,12 @@ fn selectV(
     empty_transcript_hash: []const u8,
     truncated_client_hello_transcript_hash: []const u8,
     now_ms: i64,
-    freshness_window_ms: u32,
+    freshness_window_ms: ?u32,
     strike: ?*replay.StrikeRegister,
     open_scratch: []u8,
 ) SelectError!Selection(32) {
     var sel: Selection(32) = undefined;
-    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, open_scratch);
+    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, ring, policy, identities, binders, empty_transcript_hash, truncated_client_hello_transcript_hash, now_ms, freshness_window_ms, strike, null, open_scratch);
     return sel;
 }
 
@@ -641,12 +681,13 @@ test "selectPsk end-to-end: STEK-issued ticket -> ClientHello2 -> restored PSK; 
     // ── replay: the exact same offer again is rejected by the register ──
     try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike, &scratch));
 
-    // ── forged binder: rejected AND does not consume the single-use slot ──
+    // ── forged binder: fatal (RFC 8446 §4.2.11) AND does not consume the
+    // single-use slot ──
     var strike2 = replay.StrikeRegister.init(testing.allocator, 8, 60_000);
     defer strike2.deinit();
     var bad_binder = binder;
     bad_binder[0] ^= 1;
-    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, .{}, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
+    try testing.expectError(error.BinderMismatch, selectV(&ring, .{}, &.{identity}, &.{bad_binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch));
     // The legitimate client still resumes: the forgery attempt above never
     // reached (and thus never marked) the strike register.
     _ = try selectV(&ring, .{}, &.{identity}, &.{binder}, &empty_hash, &truncated_ch_hash, now_ms, window_ms, &strike2, &scratch);
@@ -801,4 +842,81 @@ test "selectPsk: a session older than 7 days (RFC 8446 section 4.6.1) is skipped
     const at_cap: u32 = @intCast(cap);
     _ = try fx.select(&ring, policy, issued_at_ms + cap, at_cap); // exactly 7 days: accepted
     try testing.expectError(error.NoAcceptableIdentity, fx.select(&ring, policy, issued_at_ms + cap + 1, at_cap + 1));
+}
+
+// ── 2026-10-20: tlsserver semantics (rustls) ─────────────────────────────────
+
+test "selectPsk: a bad binder on a ticket we would take aborts, even with a good identity behind it" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    var fx: LifetimeFixture = .{};
+    try fx.build(&ring, 1_000);
+    const id = OfferedIdentity{ .ticket = fx.blob[0..fx.ticket_len], .obfuscated_ticket_age = replay.obfuscateAge(0, LifetimeFixture.age_add) };
+    var bad = fx.binder;
+    bad[31] ^= 0x80;
+    var scratch: [128]u8 = undefined;
+    // RFC 8446 §4.2.11: only the selected PSK's binder is validated, and a
+    // failure is fatal — the second (good) offer is never reached.
+    try testing.expectError(error.BinderMismatch, selectV(&ring, .{}, &.{ id, id }, &.{ bad, fx.binder }, &fx.empty_hash, &fx.ch_hash, 1_000, 10_000, null, &scratch));
+    // A foreign ticket first is skipped, its binder never looked at.
+    const foreign = OfferedIdentity{ .ticket = &(@as([48]u8, @splat(0x5C))), .obfuscated_ticket_age = 0 };
+    const sel = try selectV(&ring, .{}, &.{ foreign, id }, &.{ bad, fx.binder }, &fx.empty_hash, &fx.ch_hash, 1_000, 10_000, null, &scratch);
+    try testing.expectEqual(@as(usize, 1), sel.selected_index);
+}
+
+test "selectPsk: freshness null ignores the reported age; the 7-day cap still holds" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    const policy = stek.RotationPolicy{ .period_s = 24 * 3600, .lifetime_s = 30 * 24 * 3600 };
+    var fx: LifetimeFixture = .{};
+    try fx.build(&ring, 1_000);
+    const id = OfferedIdentity{ .ticket = fx.blob[0..fx.ticket_len], .obfuscated_ticket_age = 12345 }; // nonsense age
+    var scratch: [128]u8 = undefined;
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, policy, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, 500_000, 10_000, null, &scratch));
+    _ = try selectV(&ring, policy, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, 500_000, null, null, &scratch);
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, policy, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, 1_000 + max_ticket_lifetime_ms + 1, null, null, &scratch));
+}
+
+test "selectPsk: the filter sees the engine's tail and the age; refusing skips without a binder check" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    const rms = @as([32]u8, @splat(0x5A));
+    const nonce = [_]u8{ 0, 1 };
+    const state = SessionState(32){ .resumption_master_secret = rms, .ticket_nonce = &nonce, .issued_at_ms = 2_000, .ticket_age_add = 9 };
+    var pt: [128]u8 = undefined;
+    const prefix = try state.serialize(&pt);
+    pt[prefix.len] = 0x13;
+    pt[prefix.len + 1] = 0x02;
+    var blob: [160]u8 = undefined;
+    const ticket = try ring.seal(pt[0 .. prefix.len + 2], @as([stek.nonce_length]u8, @splat(3)), &blob);
+    const empty_hash = sha256Of("");
+    const ch_hash = sha256Of("filter test ClientHello");
+    const binder = clientBinder(&rms, &nonce, &empty_hash, &ch_hash);
+    const id = OfferedIdentity{ .ticket = ticket, .obfuscated_ticket_age = 0 };
+
+    const F = struct {
+        want: [2]u8,
+        seen_tail: [8]u8 = undefined,
+        seen_len: usize = 0,
+        seen_age: i64 = -1,
+        fn accept(ctx: ?*anyopaque, tail: []const u8, age_ms: i64) bool {
+            const f: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(f.seen_tail[0..tail.len], tail);
+            f.seen_len = tail.len;
+            f.seen_age = age_ms;
+            return std.mem.eql(u8, tail, &f.want);
+        }
+    };
+    var scratch: [128]u8 = undefined;
+    var sel: Selection(32) = undefined;
+    var yes: F = .{ .want = .{ 0x13, 0x02 } };
+    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &ring, .{}, &.{id}, &.{binder}, &empty_hash, &ch_hash, 7_000, null, null, .{ .ctx = &yes, .accept = F.accept }, &scratch);
+    try testing.expectEqualSlices(u8, &.{ 0x13, 0x02 }, yes.seen_tail[0..yes.seen_len]);
+    try testing.expectEqual(@as(i64, 5_000), yes.seen_age);
+    // Refused by the filter: a forged binder is not even looked at.
+    var no: F = .{ .want = .{ 0x13, 0x01 } };
+    var bad = binder;
+    bad[0] ^= 1;
+    try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &ring, .{}, &.{id}, &.{bad}, &empty_hash, &ch_hash, 7_000, null, null, .{ .ctx = &no, .accept = F.accept }, &scratch));
+    try testing.expect(no.seen_len == 2);
 }

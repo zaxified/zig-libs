@@ -17,6 +17,7 @@ const inbound = @import("inbound.zig");
 const server_mod = @import("server.zig");
 const certs = @import("test_certs.zig");
 const rsa = @import("rsa");
+const tlsresume = @import("tlsresume");
 
 const Server = server_mod.Server;
 const StdClient = std.crypto.tls.Client;
@@ -35,6 +36,9 @@ const Pipe = struct {
     /// What the client writes (its output `Writer` is fixed over this).
     client_out_buf: [32 * 1024]u8 = undefined,
     client_out: std.Io.Writer = undefined,
+    /// Flip the last octet of the client's first flight (a ClientHello's
+    /// last octet is its last PSK binder's).
+    corrupt_first: bool = false,
     /// Received by the server and not yet consumed.
     server_in: [64 * 1024]u8 = undefined,
     server_in_len: usize = 0,
@@ -58,6 +62,10 @@ const Pipe = struct {
     /// Move the client's output into the server, run it to `need_more`.
     fn pump(p: *Pipe) !void {
         const w = p.client_out.buffered();
+        if (p.corrupt_first and w.len != 0) {
+            w[w.len - 1] ^= 1;
+            p.corrupt_first = false;
+        }
         @memcpy(p.server_in[p.server_in_len..][0..w.len], w);
         p.server_in_len += w.len;
         p.client_out.end = 0;
@@ -111,6 +119,7 @@ const Outcome = struct {
     suite: record.CipherSuite,
     group: u16,
     alpn: ?[]const u8,
+    resumed: bool,
     echoed: []u8,
 };
 
@@ -121,12 +130,15 @@ const ClientOffer = struct {
     alpn: []const []const u8 = &.{},
     /// Filled by `tlsclient` (Go's ConnectionState).
     info: ?*ZlClient.ConnectionInfo = null,
+    session_cache: ?*ZlClient.SessionCache = null,
+    corrupt_client_hello: bool = false,
 };
 
 const ServerSide = struct {
     suites: []const record.CipherSuite = &server_mod.default_cipher_suites,
     groups: []const u16 = &server_mod.default_groups,
     alpn: []const []const u8 = &.{},
+    tickets: ?*const server_mod.Tickets = null,
 };
 
 /// One handshake of client type `C` against the server, then a request, a
@@ -139,6 +151,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .groups = srv.groups,
         .alpn_protocols = srv.alpn,
         .random = prng.random(),
+        .tickets = srv.tickets,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -151,6 +164,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     defer gpa.destroy(pipe);
     pipe.init(&server, gpa);
     defer pipe.deinit();
+    pipe.corrupt_first = offer.corrupt_client_hello;
 
     var entropy: [Client.Options.entropy_len]u8 = undefined;
     prng.random().bytes(&entropy);
@@ -169,6 +183,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .key_share_groups = offer.key_share_groups orelse &ZlClient.default_key_share_groups,
         .alpn_protocols = offer.alpn,
         .connection_info = offer.info,
+        .session_cache = offer.session_cache,
     }) else StdClient.init(&pipe.reader, &pipe.client_out, .{
         .host = .{ .explicit = "localhost" },
         .ca = .self_signed,
@@ -177,7 +192,8 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .entropy = &entropy,
         .realtime_now = now,
     })) catch |err| {
-        std.debug.print("client: {t}; server: {?t}\n", .{ err, pipe.failure });
+        if (pipe.failure) |f| return f;
+        std.debug.print("client: {t}\n", .{err});
         return err;
     };
     // The server learns the handshake is done from the client's Finished,
@@ -205,6 +221,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .suite = server.cipherSuite().?,
         .group = server.negotiatedGroup().?,
         .alpn = server.alpnProtocol(),
+        .resumed = server.isResumed(),
         .echoed = try gpa.dupe(u8, got[0..n]),
     };
 }
@@ -412,4 +429,188 @@ test "tlsclient ↔ Server: KeyUpdate both ways, every suite" {
         try testing.expectEqual(@as(?server_mod.KeyUpdateRequest, null), server.tx_update);
         try testing.expectEqual(@as(usize, 0), server.pendingOutput().len);
     }
+}
+
+/// A STEK ring with one key, a clock the test moves (2030, as the
+/// client's), and the ticket settings over them.
+const TicketFixture = struct {
+    ring: tlsresume.stek.DefaultRing,
+    stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing),
+    now_ms: i64,
+    tickets: server_mod.Tickets,
+
+    fn init(fx: *TicketFixture) void {
+        fx.ring = .init();
+        fx.ring.rotate(1, &@as([32]u8, @splat(0x3c)), 1_900_000_000);
+        fx.stek = .{ .ring = &fx.ring };
+        fx.now_ms = 1_900_000_000_000 + 5_000;
+        fx.tickets = .{ .ticketer = fx.stek.ticketer(), .clock = .{ .ctx = fx, .now_ms = now } };
+    }
+
+    fn now(ctx: ?*anyopaque) i64 {
+        const fx: *TicketFixture = @ptrCast(@alignCast(ctx.?));
+        return fx.now_ms;
+    }
+};
+
+test "tlsclient ↔ Server: tickets, then resumed handshakes, every suite" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var tf: TicketFixture = undefined;
+    tf.init();
+    for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        errdefer std.debug.print("suite {t}\n", .{suite});
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const srv: ServerSide = .{ .suites = &.{suite}, .tickets = &tf.tickets, .alpn = &.{"h2"} };
+        for (0..3) |round| {
+            var storage: [16 * 1024]u8 = undefined;
+            var info: ZlClient.ConnectionInfo = .init(&storage);
+            const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache, .info = &info, .alpn = &.{"h2"} });
+            defer testing.allocator.free(o.echoed);
+            try testing.expectEqualStrings("hello there", o.echoed);
+            try testing.expectEqual(round != 0, o.resumed);
+            try testing.expectEqual(round != 0, info.did_resume);
+            try testing.expectEqualStrings("h2", info.alpn_protocol.?);
+            // The client shows the chain it kept with the ticket.
+            try testing.expectEqualSlices(u8, &certs.p256_cert, info.peerCertificates()[0]);
+        }
+    }
+}
+
+test "tlsclient ↔ Server: a ticket for another suite, a retired key or past its lifetime gets a full handshake" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const Case = enum { other_suite, retired_key, too_old, at_lifetime };
+    for ([_]Case{ .other_suite, .retired_key, .too_old, .at_lifetime }) |case| {
+        errdefer std.debug.print("case {t}\n", .{case});
+        var tf: TicketFixture = undefined;
+        tf.init();
+        tf.tickets.lifetime_s = 3600;
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+        defer testing.allocator.free(entries);
+        var cache: ZlClient.SessionCache = .init(entries, null);
+        defer cache.deinit();
+        const first = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{.aes_128_gcm_sha256}, .tickets = &tf.tickets }, .{ .session_cache = &cache });
+        testing.allocator.free(first.echoed);
+        var suites: []const record.CipherSuite = &.{.aes_128_gcm_sha256};
+        switch (case) {
+            // Same hash, another suite: rustls `can_resume` wants the same.
+            .other_suite => suites = &.{.chacha20_poly1305_sha256},
+            .retired_key => {
+                tf.ring = .init();
+                tf.ring.rotate(2, &@as([32]u8, @splat(0x4d)), 1_900_000_000);
+            },
+            .too_old => tf.now_ms += 3600 * 1000 + 1,
+            .at_lifetime => tf.now_ms += 3600 * 1000,
+        }
+        // The client's clock stays put, so its reported age is off by the
+        // hour: the server does not check it (no early data).
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = suites, .tickets = &tf.tickets }, .{ .session_cache = &cache });
+        defer testing.allocator.free(o.echoed);
+        try testing.expectEqual(case == .at_lifetime, o.resumed);
+        try testing.expectEqualStrings("hello there", o.echoed);
+    }
+}
+
+test "tlsclient ↔ Server: a resumption ClientHello with a bad binder is decrypt_error" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    var tf: TicketFixture = undefined;
+    tf.init();
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+    defer testing.allocator.free(entries);
+    var cache: ZlClient.SessionCache = .init(entries, null);
+    defer cache.deinit();
+    const srv: ServerSide = .{ .tickets = &tf.tickets };
+    const first = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache });
+    testing.allocator.free(first.echoed);
+    try testing.expectError(error.DecryptError, handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &cache, .corrupt_client_hello = true }));
+    // Without tickets configured the binder is never looked at: the server
+    // answers with a full flight, which the client cannot open (the two
+    // transcripts differ in that octet).
+    try testing.expectError(error.TlsBadRecordMac, handshake(ZlClient, testing.allocator, &ck, .{}, .{ .session_cache = &cache, .corrupt_client_hello = true }));
+}
+
+test "Server: the NewSessionTickets after the client's Finished, one record, each its own" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const gpa = testing.allocator;
+    var tf: TicketFixture = undefined;
+    tf.init();
+    tf.tickets.count = 3;
+    tf.tickets.lifetime_s = 8 * 24 * 3600; // capped at 7 days
+    var prng = std.Random.DefaultPrng.init(0x7e57);
+    const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .cipher_suites = &.{.aes_256_gcm_sha384}, .random = prng.random(), .tickets = &tf.tickets };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 64 * 1024);
+    defer gpa.free(out);
+    var server: Server = .init(&config, joiner, out);
+    defer server.deinit();
+    const pipe = try gpa.create(Pipe);
+    defer gpa.destroy(pipe);
+    pipe.init(&server, gpa);
+    defer pipe.deinit();
+    var entropy: [Client.Options.entropy_len]u8 = undefined;
+    prng.random().bytes(&entropy);
+    var read_buf: [Client.min_buffer_len]u8 = undefined;
+    var write_buf: [Client.min_buffer_len]u8 = undefined;
+    _ = try ZlClient.init(&pipe.reader, &pipe.client_out, .{
+        .host = .{ .explicit = "localhost" },
+        .ca = .self_signed,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+        .min_version = .tls_1_3,
+    });
+    // The client's Finished is in its output; nothing of the server's is
+    // left unread.
+    try testing.expectEqual(@as(usize, 0), server.pendingOutput().len);
+    try pipe.pump();
+    try testing.expect(pipe.handshake_done);
+    // Issued: the master secret is gone (review 2026-10-20 LOW-2).
+    try testing.expect(std.mem.allEqual(u8, &server.master_secret, 0));
+
+    const p = try gpa.dupe(u8, server.pendingOutput());
+    defer gpa.free(p);
+    var rx: record.Protection = undefined;
+    try rx.init(.aes_256_gcm_sha384, &server.server_application_secret);
+    defer rx.wipe();
+    const h = record.parseHeader(p[0..5]);
+    try testing.expectEqual(p.len, 5 + h.length); // one record
+    const o = try rx.open(p);
+    try testing.expectEqual(record.ContentType.handshake, o.content_type);
+    var nonces: [3][]const u8 = undefined;
+    var tickets: [3][]const u8 = undefined;
+    var age_adds: [3]u32 = undefined;
+    var at: usize = 0;
+    var n: usize = 0;
+    while (at < o.content.len) : (n += 1) {
+        try testing.expectEqual(@as(u8, 4), o.content[at]);
+        const len = std.mem.readInt(u24, o.content[at + 1 ..][0..3], .big);
+        var exts: [4]tlsresume.ticket.Extension = undefined;
+        const t = try tlsresume.ticket.NewSessionTicket.decode(o.content[at + 4 ..][0..len], &exts);
+        try testing.expectEqual(server_mod.max_ticket_lifetime_s, t.ticket_lifetime);
+        try testing.expectEqual(@as(usize, 1), t.extensions.len);
+        const g = t.extensions[0].ext_type;
+        try testing.expect(g & 0x0f0f == 0x0a0a and g >> 8 == g & 0xff); // RFC 8701 GREASE
+        nonces[n] = t.ticket_nonce;
+        tickets[n] = t.ticket;
+        age_adds[n] = t.ticket_age_add;
+        at += 4 + len;
+    }
+    try testing.expectEqual(@as(usize, 3), n);
+    for (0..3) |i| for (i + 1..3) |j| {
+        try testing.expect(!std.mem.eql(u8, nonces[i], nonces[j]));
+        try testing.expect(!std.mem.eql(u8, tickets[i], tickets[j]));
+        try testing.expect(age_adds[i] != age_adds[j]);
+    };
 }

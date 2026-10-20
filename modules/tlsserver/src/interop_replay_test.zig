@@ -7,7 +7,8 @@
 //! protocol (receive "ping\n", answer "pong\n" — after a KeyUpdate asking
 //! for one back, in the `key_update` cases — close_notify, read to the
 //! client's close_notify), and must write exactly the octets OpenSSL
-//! accepted. A change to anything the server puts on the wire — or to what
+//! accepted — its NewSessionTickets included, and, in the `resumed` cases,
+//! a resumption of the ticket a recorded earlier case issued. A change to anything the server puts on the wire — or to what
 //! it accepts — fails here, in every test lane, with neither OpenSSL nor Go
 //! around.
 
@@ -20,6 +21,11 @@ const server_mod = @import("server.zig");
 const Connection = @import("connection.zig").Connection;
 const certs = @import("test_certs.zig");
 const vectors = @import("interop_vectors.zig");
+const tlsresume = @import("tlsresume");
+
+fn clock(_: ?*anyopaque) i64 {
+    return vectors.clock_ms;
+}
 
 fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     var p256 = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(certs.p256_scalar);
@@ -50,12 +56,17 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    var ring: tlsresume.stek.DefaultRing = .init();
+    ring.rotate(1, &vectors.stek_key, @divFloor(vectors.clock_ms, 1000));
+    const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
+    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = clock } };
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = suites[0..v.suites.len],
         .groups = v.groups,
         .alpn_protocols = v.alpn,
         .random = csprng.random(),
+        .tickets = if (v.tickets) &tickets else null,
     };
 
     // The reader holds the whole recording in a buffer big enough for a
@@ -101,6 +112,7 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
         return err;
     };
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
+    try testing.expectEqual(v.resumed, c.server.isResumed());
 }
 
 test "OpenSSL and Go client sessions replay byte-exact through Connection" {

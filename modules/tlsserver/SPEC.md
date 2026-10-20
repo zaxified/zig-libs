@@ -32,10 +32,10 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 142 tests with none failing (`tools/bogo/passing.txt`; everything
-else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1) and KeyUpdate
-both ways (step 2) work; resumption and client certificates are still to come (milestone M2,
-*Backlog*).
+BoringSSL's BoGo suite passes 166 tests with none failing (`tools/bogo/passing.txt`; everything
+else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
+both ways (step 2) and session tickets with resumption (step 3) work; client certificates and
+OCSP-specific work are still to come (milestone M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -58,8 +58,8 @@ gets a HelloRetryRequest. After the handshake KeyUpdate works both ways: a clien
 receive key over (and `update_requested` is answered once), the server rekeys on its own at
 `max_records_per_key` (2^23 records, asking the client to rekey too) or when the application
 calls `keyUpdate`; at most `max_key_updates` (32) KeyUpdates may come between two
-application-data records (rustls, BoringSSL). It is not yet a server to deploy: no resumption,
-no client certificates.
+application-data records (rustls, BoringSSL). With `Config.tickets` it issues NewSessionTickets
+and resumes them (below). It is not yet a server to deploy: no client certificates.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
 early data, kTLS, ECH and post-handshake client authentication (*What is deliberately not
@@ -105,7 +105,8 @@ is `handshake_failure`; compression other than exactly null is `illegal_paramete
 `key_share` is `handshake_failure`, two shares of one group or a share that does not exchange
 (`kex`: wrong length, low order) `illegal_parameter`, no share for the chosen group
 gets a HelloRetryRequest (below); `pre_shared_key` without `psk_key_exchange_modes` is
-`missing_extension` (otherwise the offer is ignored: full handshake); ALPN is the server's first
+`missing_extension` (otherwise, without `Config.tickets`, the offer is ignored: full handshake;
+with it, see *Resumption*); ALPN is the server's first
 protocol the client offers (`no_application_protocol` when the server has some and none match).
 The server then sends ServerHello (plaintext), a compatibility CCS, and under its handshake key
 EncryptedExtensions (the ALPN choice; an empty `server_name` acknowledging a DNS-name SNI),
@@ -116,6 +117,32 @@ data flows. Early data is never accepted; records the client sent under a 0-RTT 
 (up to 2^14 octets). Every refusal queues its alert in `pendingOutput` (sealed once the server
 sends protected) and leaves the connection dead (`error.Closed` afterwards); every key and secret
 is wiped at that moment. `close` queues close_notify and keeps reading.
+
+**Resumption** (RFC 8446 §2.2, §4.2.11, §4.6.1; rustls 0.23 rules, `Config.tickets`). After
+the client's Finished the server sends `Tickets.count` (2) NewSessionTickets packed into one
+record — none when the client did not offer `psk_dhe_ke`, the only mode served (no `psk_ke`).
+Each ticket is a `Ticketer` blob (`StekTicketer`: `tlsresume`'s AES-256-GCM STEK ring, key id
+as AAD, keys past the rotation policy's lifetime refused) over `tlsresume.select.SessionState`
+(resumption master secret over the transcript through the client's Finished, a one-octet nonce
+= the ticket's index, issue time, `ticket_age_add`) followed by this server's `TicketFields`:
+format 1, SNI, ALPN, suite — the suite last, read from the end, so a SHA-384 ticket opened with
+a SHA-256 prefix can never match the negotiated suite. `ticket_lifetime` is
+`min(Tickets.lifetime_s, 7 days)` (12 h by default, rustls), and each ticket carries an empty
+GREASE extension (RFC 8701 §3.2, as BoringSSL). A ticket that cannot be sealed or has no room
+in the output is not sent, nor are the rest. On a ClientHello with `pre_shared_key` (the second
+one after a HelloRetryRequest; the first is not looked at), `tlsresume.select.selectPsk`
+takes the first of up to 32 identities that opens, is younger than 7 days and the configured
+lifetime, has the negotiated suite and the same SNI (rustls `can_resume`; the client's reported
+age is not checked — it matters only for early data); that identity's binder over
+`Truncate(ClientHello)` (after `message_hash` and the HelloRetryRequest when there was one) must
+verify — otherwise `decrypt_error` (RFC 8446 §4.2.11 MUST; a binder of the wrong length counts
+as wrong) — and nothing is decided before it, the binder of a ticket not taken is never looked
+at; as in rustls the binder is checked before the PSK modes are, so a bad binder with only
+`psk_ke` offered is still `decrypt_error`. The resumed handshake: ServerHello with `pre_shared_key` (the index) and a key share (a
+fresh (EC)DHE always runs), early secret from the PSK, EncryptedExtensions without the SNI
+acknowledgement (RFC 6066 §3), no Certificate or CertificateVerify, Finished; `isResumed()`.
+Every buffer holding the resumption secret, the PSK or a ticket's plaintext is wiped before
+the step returns. Not yet: a stateful cache, early data, the ticket count request (RFC 9149).
 
 **HelloRetryRequest** (RFC 8446 §4.1.4, rustls 0.23 rules): when the client sent no share for
 the chosen group, the server fixes the suite, answers with a HelloRetryRequest naming the group
@@ -355,7 +382,15 @@ The receive side's refusals are the table under *Wire format*. Record protection
   full: it spawns only the shim, listens on loopback only, writes only its temp test keys
   (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
   refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20 (M1): **130 pass, 0 fail**; with KeyUpdate (M2 step 2) **142 pass, 0 fail**
+  Result 2026-10-20 (M1): **130 pass, 0 fail**; with KeyUpdate (M2 step 2) **142 pass, 0 fail**;
+  with resumption (M2 step 3, the shim's `-resume-count` loop with `-on-initial-`/`-on-resume-`
+  flags and `-expect-session-miss`) **166 pass, 0 fail** — binder errors, PSK modes, corrupt
+  tickets, suite/SNI changes on resume; disabled: the TLS ≤ 1.2 resumption tests the
+  `-resume-count` exit 89 used to hide, `Resume-Server-OmitAllPSKsOnSecondClientHello` (rustls
+  divergence: RFC 8446 §4.1.2 lets the second ClientHello drop the PSKs; BoringSSL, having
+  decided on the first, wants `missing_extension`) and `TLS-ECH-Server-ECHInner` (no ECH);
+  `PackedEncryptedHandshake-TLS13` made the server pack its tickets into one record and
+  `GREASE-Server-TLS13` made it GREASE them
   (`KeyUpdate-ToServer`, and `KeyUpdate-FromServer` with the shim's new `-key-update`; the
   other KeyUpdate tests are client, DTLS or BoringSSL-specific); with HelloRetryRequest (M2
   step 1) **140 pass, 0 fail** — the eight HRR globs re-enabled, one rustls-parity divergence disabled
@@ -510,7 +545,7 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).
-- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), NewSessionTicket and resumption through `tlsresume`, mTLS through
+- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), ~~NewSessionTicket and resumption through `tlsresume`~~ (step 3, 2026-10-20), mTLS through
   `x509.verifyChain`, OCSP stapling. **M3:** qap's seams and performance (`p256`, `ct25519`).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 

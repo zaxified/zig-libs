@@ -91,15 +91,20 @@ const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 
 var result: tlsresume.select.Selection(32) = undefined;
-try tlsresume.select.selectPsk(
+tlsresume.select.selectPsk(
     Hkdf, Hmac, tlsresume.stek.DefaultRing, &result, &ring,
     policy, // stek.RotationPolicy: keys past lifetime_s never open a ticket
     offered_identities, offered_binders,
     empty_transcript_hash, truncated_client_hello_transcript_hash,
-    now_ms, freshness_window_ms,
+    now_ms,
+    freshness_window_ms, // ?u32: null = the reported ticket age is not checked (no early data)
     &strike, // ?*replay.StrikeRegister; null only if you never accept early data
+    filter, // ?select.Filter: the engine's own checks on its fields (suite, SNI, lifetime)
     &open_scratch,
-);
+) catch |err| switch (err) {
+    error.NoAcceptableIdentity => {}, // full handshake
+    error.BinderMismatch => return error.DecryptError, // RFC 8446 §4.2.11: abort
+};
 
 // result.psk is the restored resumption PSK; result.selected_index is what
 // the server echoes in its own pre_shared_key extension (RFC 8446 §4.2.11).

@@ -6,8 +6,9 @@
 //! (plan: milestones M1–M4, `SPEC.md`). Today: `Server`, a sans-I/O full
 //! handshake with a certificate (TLS_AES_128_GCM_SHA256,
 //! TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
-//! X25519, secp256r1, secp384r1), then application data with KeyUpdate
-//! both ways — no resumption or client certificates yet —
+//! X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and
+//! resumption, then application data with KeyUpdate both ways — no client
+//! certificates yet —
 //! `Connection`, the blocking wrapper, and `keys`, the PEM loader. Interoperates with OpenSSL 3.5's s_client.
 //!
 //! No TLS 1.2, no 0-RTT in v1 (`SPEC.md`, *What is deliberately not done*).
@@ -17,7 +18,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1), HelloRetryRequest, KeyUpdate and a PEM certificate/key loader, no resumption or client certificates yet",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and resumption, KeyUpdate and a PEM certificate/key loader, no client certificates yet",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},
@@ -27,7 +28,7 @@ pub const meta = .{
     // shared or global.
     .concurrency = .single_owner,
     .model_after = "RFC 8446; rustls `ServerConnection` (buffer-driven core) for scope and API split",
-    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct" }, // tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key
+    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume" }, // tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key; tlsresume: session tickets (STEK ring, PSK selection)
 };
 
 /// The TLS 1.3 record layer: header, `Protection` (seal / open in place).
@@ -53,6 +54,9 @@ pub const server = @import("server.zig");
 pub const Server = server.Server;
 pub const Config = server.Config;
 pub const CertifiedKey = server.CertifiedKey;
+pub const Tickets = server.Tickets;
+pub const Ticketer = server.Ticketer;
+pub const StekTicketer = server.StekTicketer;
 
 /// The blocking wrapper over a `std.Io.Reader` / `Writer` pair.
 pub const connection = @import("connection.zig");
@@ -84,8 +88,8 @@ test {
     _ = @import("fuzz_test.zig");
 }
 
-test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct}" {
-    try std.testing.expectEqual(@as(usize, 7), meta.deps.len);
+test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsresume}" {
+    try std.testing.expectEqual(@as(usize, 8), meta.deps.len);
     try std.testing.expectEqualStrings("tls13", meta.deps[0]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
@@ -93,4 +97,5 @@ test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct}" {
     try std.testing.expectEqualStrings("x509", meta.deps[4]);
     try std.testing.expectEqualStrings("rsa", meta.deps[5]);
     try std.testing.expectEqualStrings("b64ct", meta.deps[6]);
+    try std.testing.expectEqualStrings("tlsresume", meta.deps[7]);
 }
