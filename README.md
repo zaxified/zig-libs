@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 251 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
+**Status:** 252 modules (Zig 0.17.0, tests green in `ReleaseSafe` and `ReleaseFast`)
 · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -286,7 +286,7 @@ those crypto and format modules are yours too without going looking.
 | `net` | 75 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`tlsserver`](modules/tlsserver/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) · [`aesgcm`](modules/aesgcm/README.md) (crypto) |
 | `storage` | 15 | [`zstd`](modules/zstd/README.md) (format) · [`crc32`](modules/crc32/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 87 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
-| `format` | 25 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
+| `format` | 26 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 13 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
 
@@ -297,7 +297,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 251 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 251 modules — a linux64-only module has nothing further to show here.
+Every one of the 252 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI full lane (a tag or `workflow_dispatch`) executes every module's tests in `ReleaseSafe` and `ReleaseFast`, plus a separate arm64 lane. That claim is not repeated below for all 252 modules — a linux64-only module has nothing further to show here.
 
 40 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 43 declared pairs, 42 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -647,6 +647,7 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`base32`](modules/base32/README.md) | 3 (S,P) | Base32 codec (RFC 4648 §6 + base32hex §7) — strict by default (canonical trailing bits, exact padding), opt-in lenient decode (optional padding, lowercase, whitespace); the encoding of TOTP secrets. | any | — |
 | [`blobmsg`](modules/blobmsg/README.md) | 3 (S,P) | OpenWRT ubus client + blob/blobmsg wire codec. | **linux** (codec itself: any) | — |
+| [`bzip2`](modules/bzip2/README.md) | 4 (A) | bzip2 (.bz2 and ZIP method 12): byte-exact libbzip2 1.0.8 compressor (levels 1-9) and a streaming CRC-checked decompressor with a bomb cap | any | — |
 | [`cbor`](modules/cbor/README.md) | 3 (S,P) | CBOR (RFC 8949) codec — all 8 major types, deterministic encoding and strict decoding, sequences, diagnostic notation, streaming reader/writer, typed struct mapping; untrusted-input hardened; plus a minimal COSE (RFC 9052) layer. | any | — |
 | [`cookies`](modules/cookies/README.md) | 2 (S,A,P) | HTTP cookies (RFC 6265) — request `Cookie` parser plus `Set-Cookie` builder (Secure/HttpOnly/SameSite), injection-guarded; signed/encrypted values (cookie-rs format), client jar. | any | http, aesgcm, datefmt |
 | [`crc32`](modules/crc32/README.md) | 2 (S,E,A,P) | CRC-32 (IEEE: gzip/zlib/PNG) — x86-64 PCLMULQDQ folding and ARMv8 CRC instructions picked at run time, slicing-by-8 fallback; drop-in for std.hash.Crc32, streaming, extend, combine. | any (x86-64 PCLMULQDQ / arm64 CRC asm + portable fallback) | — |

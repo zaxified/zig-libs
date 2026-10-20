@@ -1,0 +1,97 @@
+bzip2 — third-party attribution
+
+This file carries a CONDITION. The compressor and the decompressor in `src/` are a
+translation into Zig of C source from libbzip2 1.0.8 (https://sourceware.org/bzip2/, git
+commit f5dfc96063fef2d9c5446d0733867d899ef9b942 of https://sourceware.org/git/bzip2.git),
+Julian R Seward's "bzip2" and "libbzip2". Its licence (below, verbatim) requires the
+copyright notice, the conditions and the disclaimer to travel with redistributions of the
+source, and requires altered versions to be plainly marked as such. They are reproduced in
+full below; each ported file also says so in its header.
+
+**Copyleft:** NONE-SHIPPED — the bzip2 licence is a permissive BSD-style licence, checked from the
+`LICENSE` file of the clone before any source was read.
+
+ALTERED SOURCE: this is NOT the original libbzip2. It is a translation into Zig, restructured
+where the language or the API called for it (typed slices instead of the aliased C buffers,
+a streaming `std.Io.Reader`/`std.Io.Writer` interface instead of `bz_stream`, no verbosity
+output, no assertions that the type system makes unnecessary). Where the output format is
+concerned it is deliberately decision-for-decision the same: the compressor emits the bytes
+libbzip2 emits (see SPEC.md, "Anchoring").
+
+WHAT WAS TAKEN
+
+Translated (source, restructured into Zig):
+
+  blocksort.c     the whole block sort: fallbackSort / fallbackQSort3 /
+                  fallbackSimpleSort, mainSort / mainQSort3 / mainSimpleSort /
+                  mainGtU, the 14-entry shell increments, the work-factor budget
+                                                                       -> src/blocksort.zig
+  huffman.c       BZ2_hbMakeCodeLengths (heap, weight/depth packing, the halving
+                  retry), BZ2_hbAssignCodes, BZ2_hbCreateDecodeTables
+                                                                       -> src/huffman.zig
+  compress.c      generateMTFValues, sendMTFValues (table count, initial partition,
+                  four refinement passes, selector MTF, code-length delta coding),
+                  BZ2_compressBlock                                    -> src/encoder.zig
+  bzlib.c         the initial run-length stage (add_pair_to_block, ADD_CHAR_TO_BLOCK,
+                  the block-full rule), the way a full block is closed, the block and
+                  stream CRC rules                                     -> src/encoder.zig
+  decompress.c    the checks BZ2_decompress makes on a stream (header, selectors,
+                  code lengths 1..20, run-length bound, origin pointer, symbol limits)
+                  and the T^-1 construction and run-length decoding of bzlib.c's
+                  unRLE_obuf_to_output_FAST                            -> src/decoder.zig
+
+Reproduced (data):
+
+  randtable.c     the 512 entries of BZ2_rNums, used to read blocks written by bzip2 0.9.0's
+                  randomisation                                        -> src/randtable.zig
+
+Not copied: crctable.c (the table is generated at compile time from the polynomial
+0x04c11db7 in src/crc.zig), the bzip2 command line program, bzip2recover, the build
+system, the test files and the manual. libbzip2 is also run as a black box for the
+differential tests and the benchmark (tools/), compiled from a clone that is never part of
+this repository.
+
+THE LICENCE (libbzip2's LICENSE, verbatim)
+
+
+--------------------------------------------------------------------------
+
+This program, "bzip2", the associated library "libbzip2", and all
+documentation, are copyright (C) 1996-2019 Julian R Seward.  All
+rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. The origin of this software must not be misrepresented; you must 
+   not claim that you wrote the original software.  If you use this 
+   software in a product, an acknowledgment in the product 
+   documentation would be appreciated but is not required.
+
+3. Altered source versions must be plainly marked as such, and must
+   not be misrepresented as being the original software.
+
+4. The name of the author may not be used to endorse or promote 
+   products derived from this software without specific prior written 
+   permission.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS
+OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Julian Seward, jseward@acm.org
+bzip2/libbzip2 version 1.0.8 of 13 July 2019
+
+--------------------------------------------------------------------------
