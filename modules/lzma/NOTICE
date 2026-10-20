@@ -1,0 +1,25 @@
+lzma — third-party attribution
+
+The encoder in `src/` is a translation into Zig of C source from XZ Utils / liblzma 5.8.1
+(https://tukaani.org/xz/, git tag v5.8.1, commit a522a226545730551f7e7c2685fab27cf567746c of
+https://github.com/tukaani-project/xz). liblzma is under the BSD Zero Clause License (0BSD),
+checked from the clone's `COPYING` and the SPDX line of every file read.
+
+**Copyleft:** NONE-SHIPPED — liblzma is under the permissive BSD Zero Clause License (0BSD), read from the clone's `COPYING` and from the SPDX line of every file before any source was read.
+
+Zero-Clause BSD
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+PERFORMANCE OF THIS SOFTWARE.
+
+Ported (restructured into Zig): lz/lz_encoder.c, lz/lz_encoder_mf.c, lzma/lzma_encoder.c,
+lzma/lzma_encoder_optimum_fast.c, lzma/lzma_encoder_optimum_normal.c, lzma/lzma2_encoder.c,
+lzma/lzma_encoder_presets.c, rangecoder/range_encoder.h, rangecoder/price.h.
