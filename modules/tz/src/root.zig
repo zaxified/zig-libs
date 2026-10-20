@@ -12,11 +12,12 @@
 const std = @import("std");
 const datefmt = @import("datefmt");
 const tz_data = @import("tz_data.zig");
+const posix = @import("posix.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer).",
+    .doc = "IANA time-zone offset lookup — zone name → UTC offset/DST/abbreviation at a given instant (598 zones + POSIX-TZ footer).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -30,7 +31,10 @@ pub const meta = .{
 };
 
 pub const Zone = tz_data.Zone;
+/// A stored table entry (`Zone.trans`). `nextTransition`/`prevTransition`
+/// answer with a `Change`, which carries the abbreviation as text.
 pub const Transition = tz_data.Transition;
+pub const Footer = posix.Footer;
 pub const zones = tz_data.zones;
 
 pub const Offset = struct {
@@ -56,19 +60,39 @@ pub fn find(name: []const u8) ?*const tz_data.Zone {
     return null;
 }
 
-/// UTC offset (+ DST flag) in `zone` at the given Unix instant.
-pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
+/// The zone a name stands for: the target of a link (`US/Eastern` ->
+/// `America/New_York`), the zone's own name for a canonical zone.
+pub fn canonicalName(zone: *const tz_data.Zone) []const u8 {
+    return zone.canonical orelse zone.name;
+}
+
+/// The abbreviation of a state: an index into the table's string table, or
+/// text (a POSIX footer's name).
+const Abbr = union(enum) { idx: u16, text: []const u8 };
+
+const Located = struct { off: i32, dst: bool, abbr: Abbr };
+
+fn abbrText(a: Abbr) []const u8 {
+    return switch (a) {
+        .idx => |i| std.mem.sliceTo(tz_data.abbrevs[i..], 0),
+        .text => |t| t,
+    };
+}
+
+fn fromTrans(t: Transition) Located {
+    return .{ .off = t.off, .dst = t.dst, .abbr = .{ .idx = t.abbr } };
+}
+
+/// The state of `zone` at `unix`: the table, then (past its last transition)
+/// the POSIX footer.
+fn locate(zone: *const tz_data.Zone, unix: i64) Located {
     const tr = zone.trans;
-    if (tr.len == 0) {
-        if (posixOffset(zone.posix, unix)) |o| return o;
-        return .{ .off = zone.init_off, .dst = zone.init_dst };
-    }
-    if (unix < tr[0].ts) return .{ .off = zone.init_off, .dst = zone.init_dst };
+    const init: Located = .{ .off = zone.init_off, .dst = zone.init_dst, .abbr = .{ .idx = zone.init_abbr } };
+    if (tr.len == 0) return footerLocated(zone, unix) orelse init;
+    if (unix < tr[0].ts) return init;
     if (unix >= tr[tr.len - 1].ts) {
         // Past the last explicit transition — apply the POSIX-TZ footer rule.
-        if (posixOffset(zone.posix, unix)) |o| return o;
-        const last = tr[tr.len - 1];
-        return .{ .off = last.off, .dst = last.dst };
+        return footerLocated(zone, unix) orelse fromTrans(tr[tr.len - 1]);
     }
     // Rightmost transition with ts <= unix (unix is within [tr[0], tr[last])).
     var lo: usize = 0;
@@ -77,8 +101,67 @@ pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
         const mid = lo + (hi - lo) / 2;
         if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
     }
-    const t = tr[lo - 1];
-    return .{ .off = t.off, .dst = t.dst };
+    return fromTrans(tr[lo - 1]);
+}
+
+/// UTC offset (+ DST flag) in `zone` at the given Unix instant.
+pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
+    const l = locate(zone, unix);
+    return .{ .off = l.off, .dst = l.dst };
+}
+
+/// The zone's abbreviation at the given Unix instant: `CET`, `CEST`, `EST`,
+/// or for zones tzdata gives no letters `+05`, `-03`, `+0530` (the sign and
+/// digits, no angle brackets). Empty for a hand-built zone whose table
+/// states carry no abbreviation.
+pub fn abbrevAt(zone: *const tz_data.Zone, unix: i64) []const u8 {
+    return abbrText(locate(zone, unix).abbr);
+}
+
+/// Spelling of a UTC offset for `formatOffset`.
+pub const OffsetStyle = enum {
+    /// ISO 8601 extended: `+01:00`, `-03:30`; seconds only when non-zero
+    /// (`+05:53:28`).
+    colon,
+    /// ISO 8601 basic: `+0100`, `-0330` (`+055328` with seconds), the `%z` of
+    /// strftime.
+    basic,
+    /// Hours only when the minutes are zero, as tzdata abbreviations like
+    /// `+05` do: `+01`; `+0530` (basic) otherwise.
+    short,
+};
+
+/// Longest `formatOffset` output (`+05:53:28`).
+pub const max_offset_len = 9;
+
+/// Write `off` (seconds east of UTC) into `buf` in the given style and
+/// return the written slice. `error.NoSpaceLeft` if `buf` is shorter than
+/// the output (`max_offset_len` always suffices); offsets beyond ±99 h are
+/// clamped to ±99:59:59.
+pub fn formatOffset(buf: []u8, off: i32, style: OffsetStyle) error{NoSpaceLeft}![]u8 {
+    const mag: u32 = @min(@abs(@as(i64, off)), 99 * 3600 + 59 * 60 + 59);
+    const h = mag / 3600;
+    const m = (mag % 3600) / 60;
+    const sec = mag % 60;
+    var w: std.Io.Writer = .fixed(buf);
+    const sign: u8 = if (off < 0) '-' else '+';
+    (switch (style) {
+        .colon => if (sec != 0)
+            w.print("{c}{d:0>2}:{d:0>2}:{d:0>2}", .{ sign, h, m, sec })
+        else
+            w.print("{c}{d:0>2}:{d:0>2}", .{ sign, h, m }),
+        .basic => if (sec != 0)
+            w.print("{c}{d:0>2}{d:0>2}{d:0>2}", .{ sign, h, m, sec })
+        else
+            w.print("{c}{d:0>2}{d:0>2}", .{ sign, h, m }),
+        .short => if (sec != 0)
+            w.print("{c}{d:0>2}{d:0>2}{d:0>2}", .{ sign, h, m, sec })
+        else if (m != 0)
+            w.print("{c}{d:0>2}{d:0>2}", .{ sign, h, m })
+        else
+            w.print("{c}{d:0>2}", .{ sign, h }),
+    }) catch return error.NoSpaceLeft;
+    return w.buffered();
 }
 
 // ---------------------------------------------------------------------------
@@ -86,73 +169,25 @@ pub fn offsetAt(zone: *const tz_data.Zone, unix: i64) Offset {
 //   stdoffset[dst[offset][,start[/time],end[/time]]]
 // All three rule forms are evaluated: `Mm.w.d` (nth/last weekday of a month),
 // `Jn` (1<=n<=365, Julian day not counting Feb 29 — day 60 is always March 1),
-// and plain `n` (0<=n<=365, day of year counting Feb 29).
+// and plain `n` (0<=n<=365, day of year counting Feb 29). The grammar is
+// parsed by `posix.zig`: at generation time for every shipped zone
+// (`Zone.footer`), per call only for a zone built by hand without one.
 // ---------------------------------------------------------------------------
 
-const DEFAULT_DST_TIME: i32 = 2 * 3600; // 02:00 local, POSIX default
-
-/// A parsed POSIX-TZ footer: a constant offset, or standard + daylight
-/// offsets with the two yearly rules.
-const PosixRule = struct {
-    utc_std: i32,
-    dst: ?struct {
-        utc_dst: i32,
-        start: Rule,
-        start_time: i32,
-        end: Rule,
-        end_time: i32,
-    },
-
-    /// The UTC instants DST starts and ends in `year` (the year `offsetAt`
-    /// evaluates an instant in is its UTC year).
-    fn transitionsIn(p: PosixRule, year: i32) ?[2]i64 {
-        const d = p.dst orelse return null;
-        const start_local = ruleDateUnix(year, d.start, d.start_time) orelse return null;
-        const end_local = ruleDateUnix(year, d.end, d.end_time) orelse return null;
-        // Transition instants: start is given in standard time, end in daylight time.
-        return .{ start_local - p.utc_std, end_local - d.utc_dst };
-    }
-};
-
-fn parsePosix(posix: []const u8) ?PosixRule {
-    if (posix.len == 0) return null;
-    var i: usize = 0;
-
-    skipAbbrev(posix, &i);
-    const std_written = parseOffsetSeconds(posix, &i) orelse return null;
-    const utc_std: i32 = -std_written; // POSIX offset is add-to-local-for-UTC
-
-    if (i >= posix.len) return .{ .utc_std = utc_std, .dst = null }; // no DST → constant
-
-    skipAbbrev(posix, &i); // dst abbrev
-    // Optional explicit DST offset; default is one hour east of standard.
-    var utc_dst: i32 = utc_std + 3600;
-    if (i < posix.len and posix[i] != ',') {
-        const dst_written = parseOffsetSeconds(posix, &i) orelse return null;
-        utc_dst = -dst_written;
-    }
-
-    if (i >= posix.len or posix[i] != ',') return null; // no rules → cannot place DST
-    i += 1;
-    const start = parseRule(posix, &i) orelse return null;
-    const start_time = parseRuleTime(posix, &i);
-    if (i >= posix.len or posix[i] != ',') return null;
-    i += 1;
-    const end = parseRule(posix, &i) orelse return null;
-    const end_time = parseRuleTime(posix, &i);
-    return .{ .utc_std = utc_std, .dst = .{
-        .utc_dst = utc_dst,
-        .start = start,
-        .start_time = start_time,
-        .end = end,
-        .end_time = end_time,
-    } };
+/// The UTC instants DST starts and ends in `year` (the year `offsetAt`
+/// evaluates an instant in is its UTC year).
+fn footerTransitionsIn(f: *const Footer, year: i32) ?[2]i64 {
+    const d = f.dst orelse return null;
+    const start_local = ruleDateUnix(year, d.start, d.start_time) orelse return null;
+    const end_local = ruleDateUnix(year, d.end, d.end_time) orelse return null;
+    // Transition instants: start is given in standard time, end in daylight time.
+    return .{ start_local - f.utc_std, end_local - d.utc_dst };
 }
 
-fn posixOffset(posix: []const u8, unix: i64) ?Offset {
-    const p = parsePosix(posix) orelse return null;
-    const d = p.dst orelse return .{ .off = p.utc_std, .dst = false };
-    const t = p.transitionsIn(datefmt.unixToParts(unix).year) orelse return null;
+fn evalFooter(f: *const Footer, unix: i64) ?Located {
+    const std_state: Located = .{ .off = f.utc_std, .dst = false, .abbr = .{ .text = f.std_abbr } };
+    const d = f.dst orelse return std_state;
+    const t = footerTransitionsIn(f, datefmt.unixToParts(unix).year) orelse return null;
     const start_utc = t[0];
     const end_utc = t[1];
 
@@ -161,7 +196,123 @@ fn posixOffset(posix: []const u8, unix: i64) ?Offset {
     else
         (unix >= start_utc or unix < end_utc); // southern hemisphere (wraps year)
 
-    return if (in_dst) .{ .off = d.utc_dst, .dst = true } else .{ .off = p.utc_std, .dst = false };
+    return if (in_dst) .{ .off = d.utc_dst, .dst = true, .abbr = .{ .text = d.abbr } } else std_state;
+}
+
+/// The footer state at `unix`; null when the zone has no usable footer.
+fn footerLocated(zone: *const tz_data.Zone, unix: i64) ?Located {
+    if (zone.footer) |f| return evalFooter(f, unix);
+    const parsed = posix.parse(zone.posix) orelse return null;
+    return evalFooter(&parsed, unix);
+}
+
+/// The zone's footer: the stored one, or `posix` parsed into `storage`.
+fn footerOf(zone: *const tz_data.Zone, storage: *Footer) ?*const Footer {
+    if (zone.footer) |f| return f;
+    storage.* = posix.parse(zone.posix) orelse return null;
+    return storage;
+}
+
+// ---------------------------------------------------------------------------
+// Transitions: the next and previous change of a zone's state
+// ---------------------------------------------------------------------------
+
+/// One change of a zone's state: from `ts` on the zone shows `off`/`dst`/
+/// `abbr`. Table entries and footer (DST start/end) changes alike.
+pub const Change = struct {
+    ts: i64,
+    off: i32,
+    dst: bool,
+    abbr: []const u8,
+};
+
+fn changeAt(zone: *const tz_data.Zone, ts: i64) Change {
+    const l = locate(zone, ts);
+    return .{ .ts = ts, .off = l.off, .dst = l.dst, .abbr = abbrText(l.abbr) };
+}
+
+/// Footer change instants around `year`, ascending, for years `y0..y1`.
+/// Only real changes (the footer evaluates differently on the two sides).
+fn footerChanges(f: *const Footer, y0: i32, y1: i32, out: *[8]i64) []const i64 {
+    var n: usize = 0;
+    var y = y0;
+    while (y <= y1) : (y += 1) {
+        const t = footerTransitionsIn(f, y) orelse continue;
+        for (t) |x| {
+            const a = evalFooter(f, x - 1) orelse continue;
+            const b = evalFooter(f, x) orelse continue;
+            if (a.off == b.off and a.dst == b.dst) continue;
+            if (n < out.len) {
+                out[n] = x;
+                n += 1;
+            }
+        }
+    }
+    std.mem.sort(i64, out[0..n], {}, std.sort.asc(i64));
+    return out[0..n];
+}
+
+/// The first change of `zone` strictly after `unix`, or null when there is
+/// none (a zone that no longer changes). Table changes first, then the
+/// POSIX footer's DST starts and ends. The table starts at 1970: for an
+/// earlier instant the answer is the first change since 1970.
+pub fn nextTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
+    const tr = zone.trans;
+    if (tr.len > 0 and unix < tr[tr.len - 1].ts) {
+        // First transition with ts > unix.
+        var lo: usize = 0;
+        var hi: usize = tr.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (tr[mid].ts <= unix) lo = mid + 1 else hi = mid;
+        }
+        const t = tr[lo];
+        return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
+    }
+    var storage: Footer = undefined;
+    const f = footerOf(zone, &storage) orelse return null;
+    const after = if (tr.len > 0) @max(unix, tr[tr.len - 1].ts) else unix;
+    const y = datefmt.unixToParts(after).year;
+    var buf: [8]i64 = undefined;
+    for (footerChanges(f, y - 1, y + 1, &buf)) |t| {
+        if (t > after) return changeAt(zone, t);
+    }
+    return null;
+}
+
+/// The last change of `zone` strictly before `unix`, or null when there is
+/// none (before the table's first entry, or a zone that never changed).
+pub fn prevTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
+    const tr = zone.trans;
+    if (tr.len > 0 and unix <= tr[tr.len - 1].ts) {
+        // First transition with ts >= unix; the one before it is the answer.
+        var lo: usize = 0;
+        var hi: usize = tr.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (tr[mid].ts < unix) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return null;
+        const t = tr[lo - 1];
+        return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
+    }
+    const last_ts: i64 = if (tr.len > 0) tr[tr.len - 1].ts else std.math.minInt(i64);
+    var storage: Footer = undefined;
+    if (footerOf(zone, &storage)) |f| {
+        const y = datefmt.unixToParts(unix).year;
+        var buf: [8]i64 = undefined;
+        const ch = footerChanges(f, y - 2, y, &buf);
+        var i = ch.len;
+        while (i > 0) {
+            i -= 1;
+            if (ch[i] < unix and ch[i] > last_ts) return changeAt(zone, ch[i]);
+        }
+    }
+    if (tr.len > 0) {
+        const t = tr[tr.len - 1];
+        return .{ .ts = t.ts, .off = t.off, .dst = t.dst, .abbr = abbrText(.{ .idx = t.abbr }) };
+    }
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +370,27 @@ pub fn localToUtc(zone: *const tz_data.Zone, local: i64, policy: Disambiguation)
     };
 }
 
+pub const LocalToUnixError = LocalToUtcError || error{InvalidDateTime};
+
+/// The UTC instant a wall-clock date and time names in `zone`, with `policy`
+/// deciding folds and gaps. `error.InvalidDateTime` when a field is out of
+/// range (month 1-12, a day the month has, hour 0-23, minute/second 0-59).
+/// Composes `datefmt.partsToUnix` with `localToUtc`.
+pub fn localToUnix(
+    zone: *const tz_data.Zone,
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    policy: Disambiguation,
+) LocalToUnixError!i64 {
+    const parts: datefmt.DateParts = .{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute, .second = second };
+    if (!datefmt.validate(parts)) return error.InvalidDateTime;
+    return localToUtc(zone, datefmt.partsToUnix(parts), policy);
+}
+
 /// Every offset change a zone can have near an instant lies within this
 /// distance: UTC offsets stay within ±26 h (POSIX's own bound is ±24:59:59),
 /// and a change is found from both of its sides.
@@ -274,9 +446,12 @@ pub fn resolveLocal(zone: *const tz_data.Zone, local: i64) LocalTime {
 }
 
 /// Upper bound on the change points one window can hold: explicit transitions
-/// are months apart in every real zone, and the POSIX rule adds two per year
-/// over the three years a 4-day window can touch.
-const max_changes = 16;
+/// are months apart in every real zone (the generator fails on a table with
+/// more than 12 in a 4-day window; the real maximum is 1), and the POSIX rule
+/// adds at most 4 inside the window. A hand-built zone may exceed it: the
+/// excess is dropped and `truncated` is set (never silently — the test
+/// "no shipped zone truncates a window" holds it at false for every zone).
+const max_changes = 32;
 
 /// The instants in `[lo, hi]` at which `zone`'s offset may change: its
 /// explicit transitions, and the POSIX-footer changes of the years around.
@@ -284,12 +459,13 @@ const max_changes = 16;
 const Changes = struct {
     at: [max_changes]i64 = undefined,
     len: usize = 0,
+    truncated: bool = false,
 
     fn add(c: *Changes, t: i64) void {
         if (c.len < max_changes) {
             c.at[c.len] = t;
             c.len += 1;
-        }
+        } else c.truncated = true;
     }
 
     fn collect(c: *Changes, zone: *const tz_data.Zone, lo: i64, hi: i64) void {
@@ -302,102 +478,23 @@ const Changes = struct {
             if (tr[mid].ts < lo) a = mid + 1 else b = mid;
         }
         while (a < tr.len and tr[a].ts <= hi) : (a += 1) c.add(tr[a].ts);
-        const p = parsePosix(zone.posix) orelse return;
-        if (p.dst == null) return;
+        var storage: Footer = undefined;
+        const f = footerOf(zone, &storage) orelse return;
+        if (f.dst == null) return;
         const y_lo = datefmt.unixToParts(lo).year;
         const y_hi = datefmt.unixToParts(hi).year;
         var y = y_lo - 1;
         while (y <= y_hi + 1) : (y += 1) {
-            const t = p.transitionsIn(y) orelse continue;
+            const t = footerTransitionsIn(f, y) orelse continue;
             for (t) |x| if (x >= lo and x <= hi) c.add(x);
         }
     }
 };
 
-const Rule = union(enum) {
-    mwd: struct { month: i32, week: i32, day: i32 }, // Mm.w.d
-    julian: i32, // Jn — 1..365, Feb 29 never counted (day 60 == March 1 always)
-    yday: i32, // n — 0..365, Feb 29 counted in leap years
-};
-
-fn skipAbbrev(s: []const u8, i: *usize) void {
-    if (i.* < s.len and s[i.*] == '<') {
-        while (i.* < s.len and s[i.*] != '>') i.* += 1;
-        if (i.* < s.len) i.* += 1; // consume '>'
-    } else {
-        while (i.* < s.len and std.ascii.isAlphabetic(s[i.*])) i.* += 1;
-    }
-}
-
-fn readInt(s: []const u8, i: *usize) ?i32 {
-    const start = i.*;
-    while (i.* < s.len and s[i.*] >= '0' and s[i.*] <= '9') i.* += 1;
-    if (i.* == start) return null;
-    return std.fmt.parseInt(i32, s[start..i.*], 10) catch null;
-}
-
-/// `[+-]hh[:mm[:ss]]` → seconds (as written; POSIX west-positive sign).
-fn parseOffsetSeconds(s: []const u8, i: *usize) ?i32 {
-    var neg = false;
-    if (i.* < s.len and (s[i.*] == '+' or s[i.*] == '-')) {
-        neg = s[i.*] == '-';
-        i.* += 1;
-    }
-    const h = readInt(s, i) orelse return null;
-    var secs: i32 = h * 3600;
-    if (i.* < s.len and s[i.*] == ':') {
-        i.* += 1;
-        const m = readInt(s, i) orelse return null;
-        secs += m * 60;
-        if (i.* < s.len and s[i.*] == ':') {
-            i.* += 1;
-            const sec = readInt(s, i) orelse return null;
-            secs += sec;
-        }
-    }
-    return if (neg) -secs else secs;
-}
-
-fn parseRule(s: []const u8, i: *usize) ?Rule {
-    if (i.* >= s.len) return null;
-    if (s[i.*] == 'M') {
-        i.* += 1;
-        const m = readInt(s, i) orelse return null;
-        if (i.* >= s.len or s[i.*] != '.') return null;
-        i.* += 1;
-        const w = readInt(s, i) orelse return null;
-        if (i.* >= s.len or s[i.*] != '.') return null;
-        i.* += 1;
-        const d = readInt(s, i) orelse return null;
-        return .{ .mwd = .{ .month = m, .week = w, .day = d } };
-    }
-    if (s[i.*] == 'J') {
-        i.* += 1;
-        const n = readInt(s, i) orelse return null;
-        if (n < 1 or n > 365) return null;
-        return .{ .julian = n };
-    }
-    if (s[i.*] >= '0' and s[i.*] <= '9') {
-        const n = readInt(s, i) orelse return null;
-        if (n < 0 or n > 365) return null;
-        return .{ .yday = n };
-    }
-    return null;
-}
-
-/// Optional `/time` after a rule; POSIX default is 02:00:00 local.
-fn parseRuleTime(s: []const u8, i: *usize) i32 {
-    if (i.* < s.len and s[i.*] == '/') {
-        i.* += 1;
-        return parseOffsetSeconds(s, i) orelse DEFAULT_DST_TIME;
-    }
-    return DEFAULT_DST_TIME;
-}
-
 /// Local pseudo-Unix (as if the wall-clock were UTC) for a POSIX rule in
 /// `year` at `time_secs` past midnight. Null if the date doesn't exist
 /// (e.g. an `Mm.w.d` weekday that isn't present that month).
-fn ruleDateUnix(year: i32, r: Rule, time_secs: i32) ?i64 {
+fn ruleDateUnix(year: i32, r: posix.Rule, time_secs: i32) ?i64 {
     switch (r) {
         .mwd => |mwd| {
             const iso_dow: i32 = if (mwd.day == 0) 7 else mwd.day; // POSIX 0=Sun → ISO 7
@@ -566,6 +663,188 @@ test "zone count matches what the documentation states" {
     try testing.expectEqual(@as(usize, 598), tz_data.zones.len);
 }
 
+test "abbrevAt: table era, footer era, angle-bracket names, empty hand-built state" {
+    const pr = find("Europe/Prague").?;
+    try testing.expectEqualStrings("CET", abbrevAt(pr, 1705320000)); // 2024-01
+    try testing.expectEqualStrings("CEST", abbrevAt(pr, 1721044800)); // 2024-07
+    const far = datefmt.partsToUnix(.{ .year = 2045, .month = 7, .day = 1 });
+    try testing.expectEqualStrings("CEST", abbrevAt(pr, far)); // footer era
+    try testing.expectEqualStrings("CET", abbrevAt(pr, far + 180 * 86400));
+    try testing.expectEqualStrings("IST", abbrevAt(find("Asia/Kolkata").?, 1721044800));
+    // tzdata names with no letters: `<+05>-5` -> "+05", also in the footer era.
+    const tk = find("Asia/Tashkent").?;
+    try testing.expectEqualStrings("+05", abbrevAt(tk, 1721044800));
+    try testing.expectEqualStrings("+05", abbrevAt(tk, far));
+    try testing.expectEqualStrings("-03", abbrevAt(find("America/Sao_Paulo").?, far));
+    // A zone built by hand: footer parsed per call, table states unnamed.
+    const z = Zone{ .name = "Test/abbr", .init_off = 0, .init_dst = false, .trans = &.{}, .posix = "<-03>3<-02>,M3.5.0/-2,M10.5.0/-1" };
+    try testing.expectEqualStrings("-03", abbrevAt(&z, 1705320000));
+    try testing.expectEqualStrings("-02", abbrevAt(&z, 1721044800));
+    const none = Zone{ .name = "Test/none", .init_off = 60, .init_dst = false, .trans = &.{}, .posix = "" };
+    try testing.expectEqualStrings("", abbrevAt(&none, 0));
+}
+
+test "every shipped zone: stored footer == footer parsed per call (same answers), abbreviations resolve" {
+    var prng = std.Random.DefaultPrng.init(0xf007e4);
+    const r = prng.random();
+    for (&tz_data.zones) |*z| {
+        try testing.expect(z.footer != null);
+        var hand = z.*;
+        hand.footer = null;
+        var i: usize = 0;
+        while (i < 40) : (i += 1) {
+            const t = r.intRangeAtMost(i64, 2_000_000_000, 2_800_000_000);
+            try testing.expectEqual(offsetAt(z, t), offsetAt(&hand, t));
+            try testing.expectEqualStrings(abbrevAt(z, t), abbrevAt(&hand, t));
+            try testing.expect(abbrevAt(z, t).len >= 1);
+        }
+    }
+}
+
+test "no shipped zone truncates a resolveLocal window" {
+    for (&tz_data.zones) |*z| {
+        for (z.trans) |t| {
+            var c: Changes = .{};
+            c.collect(z, t.ts - local_window, t.ts + local_window);
+            try testing.expect(!c.truncated);
+            try testing.expect(c.len <= 8);
+        }
+        var c: Changes = .{};
+        c.collect(z, 2_300_000_000 - local_window, 2_300_000_000 + local_window);
+        try testing.expect(!c.truncated);
+    }
+    // A hand-built zone with more changes than the buffer holds is flagged, not silent.
+    var many: [40]Transition = undefined;
+    for (&many, 0..) |*t, i| t.* = .{ .ts = 1000 + @as(i64, @intCast(i)) * 60, .off = @intCast(i % 2 * 3600), .dst = i % 2 == 1 };
+    const z = Zone{ .name = "Test/many", .init_off = 0, .init_dst = false, .trans = &many, .posix = "" };
+    var c: Changes = .{};
+    c.collect(&z, 0, 5000);
+    try testing.expect(c.truncated);
+    try testing.expectEqual(@as(usize, max_changes), c.len);
+}
+
+test "canonical: links point at their zone, canonical zones at nothing" {
+    const ny = find("America/New_York").?;
+    try testing.expect(ny.canonical == null);
+    try testing.expectEqualStrings("America/New_York", canonicalName(ny));
+    const us = find("US/Eastern").?;
+    try testing.expectEqualStrings("America/New_York", us.canonical.?);
+    try testing.expectEqualStrings("America/New_York", canonicalName(us));
+    var links: usize = 0;
+    for (&tz_data.zones) |*z| {
+        if (z.canonical) |c| {
+            links += 1;
+            const target = find(c).?; // every target exists ...
+            try testing.expect(target.canonical == null); // ... and is itself canonical
+            // A link behaves as its target.
+            try testing.expectEqual(offsetAt(z, 1721044800), offsetAt(target, 1721044800));
+        }
+    }
+    try testing.expect(links > 100 and links < tz_data.zones.len);
+}
+
+test "nextTransition / prevTransition: Prague through the table into the footer era" {
+    const z = find("Europe/Prague").?;
+    // 2024-03-31T01:00:00Z CET -> CEST.
+    const spring = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 1 });
+    const n = nextTransition(z, spring - 86400).?;
+    try testing.expectEqual(spring, n.ts);
+    try testing.expectEqual(@as(i32, 7200), n.off);
+    try testing.expect(n.dst);
+    try testing.expectEqualStrings("CEST", n.abbr);
+    // Strict: asking AT a transition yields the following one.
+    try testing.expectEqual(datefmt.partsToUnix(.{ .year = 2024, .month = 10, .day = 27, .hour = 1 }), nextTransition(z, spring).?.ts);
+    const p = prevTransition(z, spring + 1).?;
+    try testing.expectEqual(spring, p.ts);
+    try testing.expectEqual(datefmt.partsToUnix(.{ .year = 2023, .month = 10, .day = 29, .hour = 1 }), prevTransition(z, spring).?.ts);
+    // Footer era, far past the table: alternates, forever.
+    var t: i64 = datefmt.partsToUnix(.{ .year = 2060 });
+    var last_dst: ?bool = null;
+    for (0..20) |_| {
+        const c = nextTransition(z, t).?;
+        try testing.expect(c.ts > t);
+        if (last_dst) |d| try testing.expect(d != c.dst);
+        last_dst = c.dst;
+        try testing.expectEqual(c.ts, prevTransition(z, c.ts + 1).?.ts);
+        try testing.expectEqual(offsetAt(z, c.ts).off, c.off);
+        t = c.ts;
+    }
+    // Before the table's first entry there is none; a fixed zone never changes.
+    try testing.expect(prevTransition(z, z.trans[0].ts) == null);
+    try testing.expect(prevTransition(z, -1) == null);
+    try testing.expect(nextTransition(find("UTC").?, 0) == null);
+    try testing.expect(prevTransition(find("UTC").?, 2_000_000_000) == null);
+    try testing.expect(nextTransition(find("Asia/Kolkata").?, 2_000_000_000) == null);
+}
+
+test "formatOffset: styles, signs, seconds, buffer" {
+    var buf: [max_offset_len]u8 = undefined;
+    const Case = struct { off: i32, colon: []const u8, basic: []const u8, short: []const u8 };
+    const cases = [_]Case{
+        .{ .off = 0, .colon = "+00:00", .basic = "+0000", .short = "+00" },
+        .{ .off = 3600, .colon = "+01:00", .basic = "+0100", .short = "+01" },
+        .{ .off = -10800, .colon = "-03:00", .basic = "-0300", .short = "-03" },
+        .{ .off = 19800, .colon = "+05:30", .basic = "+0530", .short = "+0530" },
+        .{ .off = -12600, .colon = "-03:30", .basic = "-0330", .short = "-0330" },
+        .{ .off = 20908, .colon = "+05:48:28", .basic = "+054828", .short = "+054828" },
+        .{ .off = 50400, .colon = "+14:00", .basic = "+1400", .short = "+14" },
+        .{ .off = -1, .colon = "-00:00:01", .basic = "-000001", .short = "-000001" },
+    };
+    for (cases) |c| {
+        try testing.expectEqualStrings(c.colon, try formatOffset(&buf, c.off, .colon));
+        try testing.expectEqualStrings(c.basic, try formatOffset(&buf, c.off, .basic));
+        try testing.expectEqualStrings(c.short, try formatOffset(&buf, c.off, .short));
+    }
+    var small: [2]u8 = undefined;
+    try testing.expectError(error.NoSpaceLeft, formatOffset(&small, 3600, .short));
+    try testing.expectEqualStrings("+99:59:59", try formatOffset(&buf, std.math.maxInt(i32), .colon));
+    try testing.expectEqualStrings("-99:59:59", try formatOffset(&buf, std.math.minInt(i32), .colon));
+}
+
+test "localToUnix: parts form agrees with localToUtc, rejects invalid fields" {
+    const z = find("Europe/Prague").?;
+    // 2024-03-31 02:30 does not exist; 2024-10-27 02:30 happens twice.
+    const gap = datefmt.partsToUnix(.{ .year = 2024, .month = 3, .day = 31, .hour = 2, .minute = 30 });
+    try testing.expectEqual(gap - 3600, try localToUnix(z, 2024, 3, 31, 2, 30, 0, .compatible));
+    try testing.expectEqual(gap - 7200, try localToUnix(z, 2024, 3, 31, 2, 30, 0, .earlier));
+    try testing.expectError(error.NonexistentLocalTime, localToUnix(z, 2024, 3, 31, 2, 30, 0, .reject));
+    try testing.expectError(error.AmbiguousLocalTime, localToUnix(z, 2024, 10, 27, 2, 30, 0, .reject));
+    for ([_][6]u32{ .{ 2024, 13, 1, 0, 0, 0 }, .{ 2023, 2, 29, 0, 0, 0 }, .{ 2024, 1, 0, 0, 0, 0 }, .{ 2024, 1, 1, 24, 0, 0 }, .{ 2024, 1, 1, 0, 60, 0 }, .{ 2024, 1, 1, 0, 0, 60 } }) |a|
+        try testing.expectError(error.InvalidDateTime, localToUnix(z, @intCast(a[0]), a[1], a[2], a[3], a[4], a[5], .compatible));
+}
+
+test "tz_data_full: same footer era, same history since 1970, LMT before" {
+    const full = @import("tz_data_full.zig");
+    try testing.expectEqual(tz_data.zones.len, full.zones.len);
+    var prng = std.Random.DefaultPrng.init(0xf011);
+    const r = prng.random();
+    var older: usize = 0;
+    for (&full.zones) |*fzone| {
+        const z = find(fzone.name).?;
+        try testing.expectEqualStrings(z.posix, fzone.posix);
+        try testing.expectEqual(z.canonical == null, fzone.canonical == null);
+        var i: usize = 0;
+        while (i < 30) : (i += 1) {
+            const t = r.intRangeAtMost(i64, 0, 2_800_000_000);
+            try testing.expectEqual(offsetAt(z, t), offsetAt(fzone, t));
+        }
+        if (fzone.trans.len > z.trans.len) older += 1;
+        // Everything the default table knows is the tail of the full one.
+        try testing.expect(fzone.trans.len >= z.trans.len);
+        for (z.trans, fzone.trans[fzone.trans.len - z.trans.len ..]) |a, b| {
+            try testing.expectEqual(a.ts, b.ts);
+            try testing.expectEqual(a.off, b.off);
+        }
+    }
+    try testing.expect(older > 300);
+    // Prague before 1970: LMT +0:57:44 until 1891, then CET.
+    const pz = for (&full.zones) |*fzone| {
+        if (std.mem.eql(u8, fzone.name, "Europe/Prague")) break fzone;
+    } else unreachable;
+    try testing.expectEqual(@as(i32, 3464), offsetAt(pz, -4_000_000_000).off);
+    try testing.expectEqual(@as(i32, 3600), offsetAt(pz, -2_000_000_000).off);
+}
+
 test "find: known + unknown zones" {
     try testing.expect(find("Europe/Prague") != null);
     try testing.expect(find("America/New_York") != null);
@@ -639,7 +918,7 @@ test "offsetAt: fixed UTC" {
 // ---------------------------------------------------------------------------
 //
 // These use synthetic zones (empty `trans`, so offsetAt always falls through
-// to posixOffset) with a footer of the form `XST0XDT,<rule>/0,<rule2>/0` —
+// to the footer) with a footer of the form `XST0XDT,<rule>/0,<rule2>/0` —
 // standard offset UTC+0, DST +1h, transitions at 00:00:00 local so the rule's
 // calendar date maps 1:1 onto a UTC instant.
 
@@ -901,6 +1180,8 @@ test "corpus: every footer reaches offsetAt, and the generator actually varies" 
 test {
     _ = @import("fuzz_test.zig");
     _ = @import("posix_test.zig");
+    _ = @import("posix.zig");
+    _ = @import("all_kat_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

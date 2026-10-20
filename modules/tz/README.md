@@ -1,6 +1,6 @@
 # tz
 
-IANA time-zone offset lookup: zone name → UTC offset/DST at a given instant.
+IANA time-zone offset lookup: zone name → UTC offset/DST/abbreviation at a given instant.
 
 - Composes the `datefmt` module for the POSIX-TZ
   footer's calendar math.
@@ -30,17 +30,27 @@ const Offset = struct { off: i32, dst: bool }; // off: seconds east of UTC
 
 fn find(name: []const u8) ?*const tz.Zone;         // "Europe/Prague", "UTC", ...
 fn offsetAt(zone: *const tz.Zone, unix: i64) Offset;
+fn abbrevAt(zone: *const tz.Zone, unix: i64) []const u8; // "CET", "CEST", "+05"
+fn canonicalName(zone: *const tz.Zone) []const u8;       // "US/Eastern" -> "America/New_York"
 
 pub const Zone = struct {
     name: []const u8,
     init_off: i32,
     init_dst: bool,
+    init_abbr: u16 = 0,        // offset into the table's abbreviation string
     trans: []const Transition, // sorted ascending by ts
     posix: []const u8,         // POSIX-TZ footer string
+    footer: ?*const Footer = null,  // `posix`, parsed at generation time
+    canonical: ?[]const u8 = null,  // set for links (aliases)
 };
-pub const Transition = struct { ts: i64, off: i32, dst: bool };
+pub const Transition = struct { ts: i64, off: i32, dst: bool, abbr: u16 = 0 };
 pub const zones: []const Zone; // all 598 zones, sorted by name
 ```
+
+A zone built by hand (a test, a caller's own `TZ` string) leaves `footer`
+null: `offsetAt` then parses `posix` per call, as it did before the footer
+was stored. Every shipped zone has `footer` set and `offsetAt` never re-parses
+(footer era: about 2.4x faster, 145-165 ns to 63-73 ns per call, ReleaseFast).
 
 `find` binary-searches `zones` by name (case-sensitive, matching IANA
 spelling exactly). `offsetAt`:
@@ -50,6 +60,29 @@ spelling exactly). `offsetAt`:
 3. At/after the last transition → the POSIX footer rule for that instant's
    year, falling back to the last transition's offset if the footer can't be
    evaluated (see Defer below).
+
+### Transitions and abbreviations
+
+```zig
+const Change = struct { ts: i64, off: i32, dst: bool, abbr: []const u8 };
+fn nextTransition(zone: *const tz.Zone, unix: i64) ?Change; // first change with ts > unix
+fn prevTransition(zone: *const tz.Zone, unix: i64) ?Change; // last change with ts < unix
+```
+
+Both walk the table and then the POSIX footer's DST starts and ends (no end:
+`null` means the zone never changes again, or, for `prevTransition`, has not
+changed since the table's start at 1970). A change is any difference in
+offset, DST flag or abbreviation. Abbreviations are tzdata's: `CET`, `EST`,
+and for zones with no letters the signed digits without angle brackets
+(`+05`, `-03`, `+0530`).
+
+### Offset formatting
+
+```zig
+fn formatOffset(buf: []u8, off: i32, style: tz.OffsetStyle) ![]u8; // buf of tz.max_offset_len always fits
+// .colon "+01:00" · .basic "+0100" · .short "+01" (hours only if minutes are 0, else "+0530")
+// a non-zero seconds part is kept: "+05:48:28" / "+054828"
+```
 
 ### Local wall-clock time → UTC
 
@@ -62,10 +95,25 @@ fn localToUtc(zone: *const tz.Zone, local: i64, policy: tz.Disambiguation) !i64;
 //         .reject (error.AmbiguousLocalTime / error.NonexistentLocalTime)
 ```
 
+```zig
+// the same from the date and time fields; error.InvalidDateTime for an out-of-range field
+fn localToUnix(zone, year: i32, month, day, hour, minute, second: u32, policy) !i64;
+```
+
 Prague, 2024-03-31 02:30 (skipped): `.compatible`/`.later` → 01:30Z (reads as
 03:30 CEST), `.earlier` → 00:30Z (01:30 CET). 2024-10-27 02:30 (twice):
 `.earlier` → 00:30Z (CEST), `.later` → 01:30Z (CET). The policy is an explicit
 argument: there is no silent default for a time that does not exist.
+
+## Pre-1970 history
+
+The default table starts at 1970: earlier history is folded into `init_*`, so
+a pre-1970 instant gets the state of 1970. `src/tz_data_full.zig` (generated
+together with it) keeps the whole history, back to local mean time. It is
+NOT imported by default (about +80 KB in a ReleaseSmall binary over the
+default table): to use it, change the `tz_data.zig` import in `src/root.zig`
+to `tz_data_full.zig`; the types are shared (`src/types.zig`), nothing else
+changes. A build option for this needs a `build.zig` change and is not wired.
 
 ## Defer (not in this extraction)
 
@@ -89,11 +137,13 @@ argument: there is no silent default for a time that does not exist.
   It fetches the pinned release from IANA against a pinned SHA-256, compiles
   it with the system `zic`, and generates from THAT — so the table is derived
   from the release it claims, not from whichever one this machine has
-  installed. `--check` verifies the committed table reproduces, without
-  writing it.
+  installed. `--check` verifies the committed tables (default and full)
+  reproduce, without writing them. The generator fails if a zone has no
+  footer, a footer does not parse, a link target is missing, or a 4-day
+  window holds too many changes for `resolveLocal`'s buffer.
 
-Provenance: `src/root.zig` is original work of the zig-libs authors (MIT);
-`src/tz_data.zig` is generated data — the UTC-offset transition tables and
+Provenance: `src/root.zig`, `src/posix.zig` and `src/types.zig` are original work of the zig-libs authors (MIT);
+`src/tz_data.zig` (and `tz_data_full.zig`) is generated data — the UTC-offset transition tables and
 POSIX-TZ footer rule per zone (598 zones, transitions from 1970 onward),
 produced ahead of time by the `tz-gen` tool from the IANA Time Zone Database
 (tzdata 2026a release, <https://www.iana.org/time-zones>), which is in the
@@ -110,3 +160,8 @@ required.
 zig build test-tz
 zig build test-tz -Doptimize=ReleaseFast
 ```
+
+`src/all_kat.bin` replays every zone against Python's zoneinfo over the same
+tzdata release (1970-2050: offset, DST flag, abbreviation, transitions, local
+time under every policy); regenerate with `tools/gen_all_kat.py` (usage in its
+docstring).

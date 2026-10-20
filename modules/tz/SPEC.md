@@ -87,21 +87,23 @@ wrong within ~2 h of a transition) instead of `localToUtc`.
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | `localToUnix(zone, y, m, d, hh, mm, ss, Disambiguation)` parts-based wrapper (promised at 2026-09-30) | S | do; bxp moves onto it at repin |
-| R2 | Zone abbreviations (`CET`/`CEST`/`+05`, angle-bracket form) per transition and from the footer | M | do (measure the size) |
-| R3 | Pre-1970 history as an opt-in build option (default keeps today's size; document that `init_off` folds it) | M | do |
-| R4 | `nextTransition` / `prevTransition` | S | do |
-| R5 | Canonical-vs-link flag for aliases | S | do (low) |
-| R7 | Offset formatting (`+01:00`, `+0100`, `+01`) | S | do |
-| R10 | No silent fallback: generator asserts every footer parses; the 16-candidate `Changes` truncation guarded | S | do |
-| R11 | Parse the POSIX footer once (generation time), not per `offsetAt` | S-M | do — the main bench lever |
+| R1 | `localToUnix(zone, y, m, d, hh, mm, ss, Disambiguation)` parts-based wrapper (promised at 2026-09-30) | S | **DONE 2026-10-20**; bxp moves onto it at repin |
+| R2 | Zone abbreviations (`CET`/`CEST`/`+05`, angle-bracket form) per transition and from the footer | M | **DONE 2026-10-20** — `abbrevAt`; data +27 % source, +24 KB in a stripped ReleaseSmall exe |
+| R3 | Pre-1970 history as an opt-in build option (default keeps today's size; document that `init_off` folds it) | M | **DONE 2026-10-20** as a generated `tz_data_full.zig` (+79 KB); a build option needs build.zig — next |
+| R4 | `nextTransition` / `prevTransition` | S | **DONE 2026-10-20** |
+| R5 | Canonical-vs-link flag for aliases | S | **DONE 2026-10-20** — `Zone.canonical`, `canonicalName` |
+| R7 | Offset formatting (`+01:00`, `+0100`, `+01`) | S | **DONE 2026-10-20** — `formatOffset` |
+| R10 | No silent fallback: generator asserts every footer parses; the 16-candidate `Changes` truncation guarded | S | **DONE 2026-10-20** — bound 32 + `truncated` flag; generator refuses unparsable footers |
+| R11 | Parse the POSIX footer once (generation time), not per `offsetAt` | S-M | **DONE 2026-10-20** — footer era 145–167 → 63–74 ns |
 | R8 | Delta-encoded transitions, shared alias tables | M | after R2/R3, measured |
 | R6 | RFC 9557 `[Zone]` suffix / ZonedDateTime | – | not doing in tz (a datetime layer) |
 | R9 | System TZif loading (`TZ`, `TZDIR`) | – | not in tz (pure, no IO); a separate loader module — owner question (embedded 2026a vs system 2026e) |
 | R12 | Windows zone mapping | – | not doing (no consumer) |
 
-Evidence plan: Python zoneinfo against the pinned 2026a tree over all 598 zones × sampled instants
-1970–2050 (today only 12 zones + the footer era are oracle-checked). Bench: glibc `localtime_r` (C, one
+Evidence (DONE 2026-10-20): Python zoneinfo against the pinned 2026a tree over all 598 zones, every change
+1970–2050 found by scan + bisection (`tools/gen_all_kat.py` → `src/all_kat.bin`, 324 distinct traces):
+offset, dst, abbreviation, next/prev transition, and local→UTC at every gap/fold under all four policies —
+0 disagreements. Bench: glibc `localtime_r` (C, one
 zone per process, TZDIR = pinned tree) as the reference, Go `time` second; UTC→offset in table and footer
 eras, local→UTC with gaps/folds under each policy, `find`.
 - **Build option: zone data subset** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). src/tz_data.zig is 1 MB of source (~0.45 MB in a binary, estimate).

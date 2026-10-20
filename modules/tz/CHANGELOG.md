@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 batch. Footers parsed at generation time (`Zone.footer`; footer-era `offsetAt`
+  145–167 → 63–74 ns); `abbrevAt` (per-transition abbreviation index + string table, `<+05>` form);
+  `nextTransition`/`prevTransition` (`Change`); `localToUnix(zone, y, m, d, hh, mm, ss, policy)`;
+  `formatOffset`; `Zone.canonical`/`canonicalName` for links; `tz_data_full.zig` with pre-1970 history
+  (generated, not yet selectable); the generator refuses an unparsable footer, `Changes` is bounded with a
+  `truncated` flag; `posix.parse` returns null on an overflowing number instead of panicking. `Transition`
+  gains `abbr` and `Zone` gains defaulted fields (source-breaking only for positional construction).
+  Evidence: all 598 zones against Python zoneinfo (2026a), 0 disagreements.
 - **2026-10-09** — tests: deterministic fuzz driver `TZ_FUZZ` over the existing harnesses.
 - **2026-10-05** — **Tests:** POSIX-footer evaluation anchored externally (`src/posix_test.zig`,
   vectors `posix_kat.zig` from `tools/gen_posix_kat.py` + `tools/go_posix/`): every zone 2037..2050

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Regenerate (or verify) modules/tz/src/tz_data.zig from a PINNED IANA tzdata
+# Regenerate (or verify) modules/tz/src/tz_data.zig and tz_data_full.zig from a PINNED IANA tzdata
 # release, instead of from whatever this machine happens to have installed.
 #
 # Why this exists: tz-gen reads a compiled zoneinfo tree, and the obvious tree
@@ -27,6 +27,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 committed="$repo/modules/tz/src/tz_data.zig"
+committed_full="$repo/modules/tz/src/tz_data_full.zig"
 
 check_only=0
 release=""
@@ -122,22 +123,31 @@ tar xzf "$tarball" -C src
 # tarball's `version` file is exactly the latter's content.
 cp src/version "$zoneinfo/+VERSION"
 
+# The compiled tree does not say which names are aliases: the `Link` lines of
+# the source files do ("Link <target> <name>"). tz-gen reads them from here.
+( cd src && cat africa antarctica asia australasia europe northamerica southamerica \
+    etcetera backward factory | sed 's/#.*//' | awk '$1 == "Link" { print $2, $3 }' | sort ) \
+    > "$zoneinfo/+LINKS"
+[ -s "$zoneinfo/+LINKS" ] || { echo "tz-gen: no Link lines found in the tzdata sources" >&2; exit 1; }
+
 if [ "$check_only" = 1 ]; then
     out="$work/tz_data.check.zig"
+    out_full="$work/tz_data_full.check.zig"
 else
     out="$committed"
+    out_full="$committed_full"
 fi
 
-( cd "$here" && zig build run -- "$out" "$zoneinfo" )
-zig fmt "$out" >/dev/null
+( cd "$here" && zig build run -- "$out" "$zoneinfo" "$out_full" )
+zig fmt "$out" "$out_full" >/dev/null
 
 if [ "$check_only" = 1 ]; then
-    if diff -u "$committed" "$out"; then
-        echo "tz-gen: modules/tz/src/tz_data.zig reproduces from tzdata $release."
+    if diff -u "$committed" "$out" && diff -u "$committed_full" "$out_full"; then
+        echo "tz-gen: modules/tz/src/tz_data.zig and tz_data_full.zig reproduce from tzdata $release."
     else
-        echo "tz-gen: the committed table does NOT match tzdata $release (diff above)." >&2
+        echo "tz-gen: the committed tables do NOT match tzdata $release (diff above)." >&2
         exit 1
     fi
 else
-    echo "tz-gen: wrote $committed from tzdata $release."
+    echo "tz-gen: wrote $committed and $committed_full from tzdata $release."
 fi
