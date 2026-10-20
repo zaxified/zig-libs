@@ -214,6 +214,44 @@ pub fn candidateSchemes(secret_key: SecretKey) []const SignatureScheme {
     };
 }
 
+/// Whether `secret_key` can sign under `scheme`: its family's candidate,
+/// and for RSA-PSS a modulus large enough for the encoding (RFC 8017
+/// §9.1.1: emLen = ceil((modBits − 1) / 8) ≥ hLen + sLen + 2, with
+/// sLen = hLen per RFC 8446 §4.2.3) — a 1024-bit key cannot do
+/// `rsa_pss_rsae_sha512` (128 < 130). A negotiator offering only what this
+/// accepts never reaches a `sign` that fails for the key's size.
+// secret-api-ok: reads the union's tag and the RSA public modulus length, never secret bytes.
+pub fn canSign(secret_key: SecretKey, scheme: SignatureScheme) bool {
+    if (std.mem.indexOfScalar(SignatureScheme, candidateSchemes(secret_key), scheme) == null) return false;
+    return switch (secret_key) {
+        .rsa => |k| pssFits(k.n.bits(), scheme),
+        else => true,
+    };
+}
+
+fn pssFits(mod_bits: usize, scheme: SignatureScheme) bool {
+    const h: usize = switch (scheme) {
+        .rsa_pss_rsae_sha256 => 32,
+        .rsa_pss_rsae_sha384 => 48,
+        .rsa_pss_rsae_sha512 => 64,
+        else => return false,
+    };
+    if (mod_bits == 0) return false;
+    return (mod_bits - 1 + 7) / 8 >= 2 * h + 2;
+}
+
+test "canSign: RSA-PSS needs emLen >= 2 hLen + 2" {
+    // 1024-bit: emLen 128 — SHA-256 (66) and SHA-384 (98) fit, SHA-512 (130) not.
+    try std.testing.expect(pssFits(1024, .rsa_pss_rsae_sha256));
+    try std.testing.expect(pssFits(1024, .rsa_pss_rsae_sha384));
+    try std.testing.expect(!pssFits(1024, .rsa_pss_rsae_sha512));
+    // The boundary: emLen = ceil((b-1)/8) reaches 130 at modBits 1034.
+    try std.testing.expect(!pssFits(1033, .rsa_pss_rsae_sha512));
+    try std.testing.expect(pssFits(1034, .rsa_pss_rsae_sha512));
+    try std.testing.expect(pssFits(2048, .rsa_pss_rsae_sha512));
+    try std.testing.expect(!pssFits(2048, .ecdsa_secp256r1_sha256));
+}
+
 // ── maxSignatureLen: caller-facing output-buffer sizing ──────────────────
 
 /// Conservative upper bound (bytes) on a `sign()` output for `scheme`, for

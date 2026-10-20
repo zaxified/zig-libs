@@ -30,6 +30,7 @@ const std = @import("std");
 const net = std.Io.net;
 const tlsserver = @import("tlsserver");
 const rsa = @import("rsa");
+const bogo_shim = @import("bogo_shim.zig");
 const certs = tlsserver.test_fixtures;
 
 const Server = tlsserver.Server;
@@ -37,6 +38,7 @@ const record = tlsserver.record;
 
 const usage =
     \\usage: interop-tlsserver [--case NAME]... [--capture] [--list] [--repo-root PATH]
+    \\       interop-tlsserver --bogo [--bogo-update] [--bogo-test GLOB] [--bogo-arg RUNNER-ARG]... [--bogo-src DIR] [--repo-root PATH]
     \\
 ;
 
@@ -372,6 +374,197 @@ fn hexField(w: *std.Io.Writer, name: []const u8, data: []const u8) !void {
     try w.writeAll("),\n");
 }
 
+// ── BoGo ─────────────────────────────────────────────────────────────────
+
+/// The BoringSSL commit whose runner was reviewed (`tools/bogo/MANIFEST`).
+const bogo_commit = "784fcafc464b219638e1e7dcad923d7476093ab0";
+
+/// Every file `tools/bogo/MANIFEST` lists, in `src`, with its git blob
+/// hash: the runner that is built is the one that was read.
+fn verifyBogoSource(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, src: std.Io.Dir) !void {
+    const manifest = try root.readFileAlloc(io, "modules/tlsserver/tools/bogo/MANIFEST", gpa, .limited(1 << 20));
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    var n: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var f = std.mem.tokenizeScalar(u8, line, ' ');
+        const path = f.next() orelse return error.BadManifest;
+        _ = f.next() orelse return error.BadManifest;
+        const want = f.next() orelse return error.BadManifest;
+        const data = src.readFileAlloc(io, path, gpa, .limited(1 << 24)) catch |err| {
+            std.debug.print("bogo source: {s}: {t}\n", .{ path, err });
+            return error.BogoSourceIncomplete;
+        };
+        var h = std.crypto.hash.Sha1.init(.{});
+        var hdr: [32]u8 = undefined;
+        h.update(try std.mem.print(&hdr, "blob {d}\x00", .{data.len}));
+        h.update(data);
+        var got: [20]u8 = undefined;
+        h.final(&got);
+        var hex: [40]u8 = undefined;
+        _ = try std.mem.print(&hex, "{x}", .{&got});
+        if (!std.mem.eql(u8, &hex, want)) {
+            std.debug.print("bogo source: {s} differs from the reviewed blob {s}\n", .{ path, want });
+            return error.BogoSourceChanged;
+        }
+        n += 1;
+    }
+    std.debug.print("bogo source: {d} files match the reviewed manifest\n", .{n});
+}
+
+fn runChild(io: std.Io, cwd: std.Io.Dir, argv: []const []const u8, env: *const std.process.Environ.Map) !void {
+    var child = try std.process.spawn(io, .{ .argv = argv, .cwd = .{ .dir = cwd }, .environ_map = env });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) {
+        std.debug.print("{s} ended {any}\n", .{ argv[0], term });
+        return error.ChildFailed;
+    }
+}
+
+/// Build BoringSSL's runner from the reviewed source (offline: modules
+/// from `.zig-cache/bogo-gomod`, checked against its go.sum) and run it
+/// with this executable as the shim. The runner's own exit status is not
+/// the verdict yet (most tests are unimplemented, exit 89, `-allow-
+/// unimplemented`); the summary counts are.
+fn runBogo(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, src_path: []const u8, test_glob: ?[]const u8, extra: []const []const u8, update: bool) !u8 {
+    var src = root.openDir(io, src_path, .{}) catch {
+        std.debug.print("no BoGo source at {s}: fetch BoringSSL {s} (the files in tools/bogo/MANIFEST)\n", .{ src_path, bogo_commit });
+        return 2;
+    };
+    defer src.close(io);
+    try verifyBogoSource(gpa, io, root, src);
+
+    const abs_root = try root.realPathFileAlloc(io, ".", gpa);
+    var env = try child_env.?.clone(gpa);
+    try env.put("GOTOOLCHAIN", "local");
+    try env.put("GOFLAGS", "-mod=readonly");
+    try env.put("CGO_ENABLED", "0");
+    try env.put("GOMODCACHE", try std.fs.path.join(gpa, &.{ abs_root, ".zig-cache/bogo-gomod" }));
+    const work_abs = try std.fs.path.join(gpa, &.{ abs_root, ".zig-cache/tlsserver-interop" });
+    // The runner writes its test keys under TMPDIR: not tmpfs.
+    const tmp = try std.fs.path.join(gpa, &.{ work_abs, "bogo-tmp" });
+    try root.createDirPath(io, ".zig-cache/tlsserver-interop/bogo-tmp");
+    try env.put("TMPDIR", tmp);
+    // One file per skipped shim run, naming the flag (`bogo_shim.zig`).
+    const log_rel = ".zig-cache/tlsserver-interop/bogo-unimplemented";
+    root.deleteTree(io, log_rel) catch {};
+    try root.createDirPath(io, log_rel);
+    try env.put("TLSSERVER_BOGO_LOG", try std.fs.path.join(gpa, &.{ abs_root, log_rel }));
+    const runner = try std.fs.path.join(gpa, &.{ work_abs, "bogo-runner" });
+    // The runner is a test package: `runner_test.go`'s TestAll calls main().
+    try runChild(io, src, &.{ "go", "test", "-c", "-tags", "purego", "-trimpath", "-o", runner, "./ssl/test/runner" }, &env);
+
+    const self = try std.process.executablePathAlloc(io, gpa);
+    const config = try std.fs.path.join(gpa, &.{ abs_root, "modules/tlsserver/tools/bogo/config.json" });
+    const json_out = try std.fs.path.join(gpa, &.{ work_abs, "bogo-results.json" });
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(gpa, &.{ runner, "-test.run", "^TestAll$", "-shim-path", self, "-shim-config", config, "-allow-unimplemented", "-pipe", "-json-output", json_out, "-num-workers", "4" });
+    if (test_glob) |g| try argv.appendSlice(gpa, &.{ "-test", g });
+    try argv.appendSlice(gpa, extra);
+    var runner_dir = try src.openDir(io, "ssl/test/runner", .{});
+    defer runner_dir.close(io);
+    runChild(io, runner_dir, argv.items, &env) catch |err| std.debug.print("runner: {t} (unexpected results; summary below)\n", .{err});
+    const full = test_glob == null and extra.len == 0;
+    return summarizeBogo(gpa, io, json_out, root, log_rel, full, full and update);
+}
+
+const passing_path = "modules/tlsserver/tools/bogo/passing.txt";
+
+fn summarizeBogo(gpa: std.mem.Allocator, io: std.Io, json_path: []const u8, root: std.Io.Dir, log_rel: []const u8, full: bool, update: bool) !u8 {
+    // Skips by the flag that caused them, most frequent first.
+    var by_flag: std.StringArrayHashMapUnmanaged(usize) = .empty;
+    {
+        var d = try root.openDir(io, log_rel, .{ .iterate = true });
+        defer d.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |e| {
+            const flag = try d.readFileAlloc(io, e.name, gpa, .limited(256));
+            const gop = try by_flag.getOrPut(gpa, flag);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+    }
+    const Ctx = struct {
+        v: []const usize,
+        pub fn lessThan(c: @This(), a: usize, b: usize) bool {
+            return c.v[a] > c.v[b];
+        }
+    };
+    by_flag.sort(Ctx{ .v = by_flag.values() });
+    for (by_flag.keys(), by_flag.values()) |k, v| std.debug.print("SKIP {d:>5} {s}\n", .{ v, k });
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, json_path, gpa, .limited(1 << 26)) catch |err| {
+        std.debug.print("bogo: no results ({s}: {t}) — the runner stopped before any test\n", .{ json_path, err });
+        return 1;
+    };
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, gpa, data, .{});
+    const tests = parsed.object.get("tests") orelse return error.BadResults;
+    var pass: usize = 0;
+    var fail: usize = 0;
+    var skip: usize = 0;
+    var failed: std.ArrayList([]const u8) = .empty;
+    var passed: std.ArrayList([]const u8) = .empty;
+    var it = tests.object.iterator();
+    while (it.next()) |e| {
+        const actual = (e.value_ptr.object.get("actual") orelse continue).string;
+        if (std.mem.eql(u8, actual, "PASS")) {
+            pass += 1;
+            try passed.append(gpa, e.key_ptr.*);
+        } else if (std.mem.eql(u8, actual, "SKIP")) {
+            skip += 1;
+        } else {
+            fail += 1;
+            try failed.append(gpa, e.key_ptr.*);
+        }
+    }
+    const lt = struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt;
+    std.mem.sort([]const u8, failed.items, {}, lt);
+    std.mem.sort([]const u8, passed.items, {}, lt);
+    for (failed.items) |n| std.debug.print("FAIL {s}\n", .{n});
+
+    // The ratchet: every test `passing.txt` names must still pass (a filtered
+    // run checks only the tests it ran).
+    var lost: usize = 0;
+    const known = root.readFileAlloc(io, passing_path, gpa, .limited(1 << 22)) catch "";
+    var known_set: std.StringHashMapUnmanaged(void) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, known, '\n');
+    while (lines.next()) |l| {
+        if (l[0] == '#') continue;
+        try known_set.put(gpa, l, {});
+        const r = tests.object.get(l) orelse {
+            // Only a full run ran everything: there a missing name is a
+            // test that disappeared (renamed upstream, or newly disabled).
+            if (full) {
+                std.debug.print("LOST {s} (not run; listed in {s})\n", .{ l, passing_path });
+                lost += 1;
+            }
+            continue;
+        };
+        const a = (r.object.get("actual") orelse continue).string;
+        if (!std.mem.eql(u8, a, "PASS")) {
+            std.debug.print("LOST {s} ({s}; listed in {s})\n", .{ l, a, passing_path });
+            lost += 1;
+        }
+    }
+    var new: usize = 0;
+    for (passed.items) |n| if (!known_set.contains(n)) {
+        new += 1;
+    };
+    if (update) {
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        try out.writer.writeAll("# BoGo tests tlsserver passes (tools/interop.zig --bogo --bogo-update rewrites this;\n# a listed test that stops passing fails --bogo).\n");
+        for (passed.items) |n| try out.writer.print("{s}\n", .{n});
+        try root.writeFile(io, .{ .sub_path = passing_path, .data = out.written() });
+        std.debug.print("wrote {s} ({d} tests)\n", .{ passing_path, passed.items.len });
+    } else if (new != 0) std.debug.print("{d} test(s) pass that {s} does not list (--bogo-update)\n", .{ new, passing_path });
+    std.debug.print("bogo: {d} pass, {d} fail, {d} skip (unimplemented: by flag above); results in {s}\n", .{ pass, fail, skip, json_path });
+    return if (fail == 0 and lost == 0) 0 else 1;
+}
+
 fn isSelected(selected: []const []const u8, c: Case) bool {
     if (selected.len == 0) return true;
     for (selected) |s| if (std.mem.eql(u8, s, c.name)) return true;
@@ -406,11 +599,26 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var env_map: std.process.Environ.Map = .init(gpa);
     try env_map.putPosixBlock(init.environ.block.view());
+    {
+        // The BoGo runner starts this same executable as its shim.
+        var probe = init.args.iterate();
+        _ = probe.next();
+        if (bogo_shim.isShimInvocation(probe.next())) {
+            var shim_args = init.args.iterate();
+            _ = shim_args.next();
+            return bogo_shim.run(gpa, io, &env_map, &shim_args);
+        }
+    }
     // The Go client is built with the installed toolchain only.
     try env_map.put("GOTOOLCHAIN", "local");
     child_env = &env_map;
 
     var capture = false;
+    var bogo = false;
+    var bogo_test: ?[]const u8 = null;
+    var bogo_args: std.ArrayList([]const u8) = .empty;
+    var bogo_update = false;
+    var bogo_src: []const u8 = ".zig-cache/bogo-src/" ++ bogo_commit;
     var repo_root: []const u8 = ".";
     var selected: std.ArrayList([]const u8) = .empty;
     var args = init.args.iterate();
@@ -426,6 +634,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 std.debug.print("{s}", .{usage});
                 return 2;
             });
+        } else if (std.mem.eql(u8, arg, "--bogo")) {
+            bogo = true;
+        } else if (std.mem.eql(u8, arg, "--bogo-test")) {
+            bogo_test = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--bogo-update")) {
+            bogo_update = true;
+        } else if (std.mem.eql(u8, arg, "--bogo-arg")) {
+            try bogo_args.append(gpa, args.next() orelse return 2);
+        } else if (std.mem.eql(u8, arg, "--bogo-src")) {
+            bogo_src = args.next() orelse return 2;
         } else if (std.mem.eql(u8, arg, "--repo-root")) {
             repo_root = args.next() orelse return 2;
         } else {
@@ -446,6 +664,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try root.createDirPath(io, ".zig-cache/tlsserver-interop");
     var work = try root.openDir(io, ".zig-cache/tlsserver-interop", .{});
     defer work.close(io);
+    if (bogo) return runBogo(gpa, io, root, bogo_src, bogo_test, bogo_args.items, bogo_update);
     try work.writeFile(io, .{ .sub_path = "p256.pem", .data = try pem(gpa, &certs.p256_cert) });
     try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });
     try work.writeFile(io, .{ .sub_path = "ed25519.pem", .data = try pem(gpa, &certs.ed25519_cert) });

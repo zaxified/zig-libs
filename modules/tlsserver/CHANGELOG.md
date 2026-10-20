@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — The BoGo shim (`tools/bogo_shim.zig`, `zig build interop-tlsserver -- --bogo`):
+  BoringSSL's runner at 784fcafc, reviewed in full and pinned by `tools/bogo/MANIFEST`, 130 tests
+  pass, none fail (`tools/bogo/passing.txt` ratchets them). **BEHAVIOURAL**, from its first run:
+  the version is checked before anything else the ClientHello lacks (`protocol_version`, was
+  `handshake_failure` for an old client without `signature_algorithms`); no `supported_groups`
+  or no `key_share` is `missing_extension` (was `handshake_failure`; RFC 8446 §9.2); a
+  signature scheme the key cannot produce is not chosen (`tls13.certverify.canSign`: a 1024-bit
+  RSA key and `rsa_pss_rsae_sha512` now refuse with `handshake_failure`, were `internal_error`).
 - **2026-10-20** — Fuzz harness `tlsserver-server`: the whole `Server` on the recorded OpenSSL and
   Go client streams — genuine in random chunks and octet by octet, truncated, bit-flipped in
   bodies and headers, spliced, and (white box) the client's Finished resealed damaged or padded;

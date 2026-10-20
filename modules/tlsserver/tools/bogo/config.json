@@ -1,0 +1,173 @@
+{
+  "DisabledTests": {
+    "*-TLS1": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "*-TLS11": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "*-TLS12": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "*SSL3*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "BadFinished-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "BadRSAClientKeyExchange-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Basic-Server-ECDHE-ECDSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Basic-Server-ECDHE-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Basic-Server-RSA-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ClientHelloVersionTooHigh": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ConflictingVersionNegotiation*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "Downgrade-TLS1-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "Downgrade-TLS11-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "Downgrade-TLS12-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "DuplicateCertCompressionExt-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "DuplicateExtensionServer-TLS-*": "a repeated ClientHello extension is illegal_parameter, as in rustls 0.23 (BoringSSL: decode_error)",
+    "EarlyChangeCipherSpec-server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ExpectOmitExtensions": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ExtensionTrailingData-TrustAnchors-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "FallbackSCSV": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "FragmentAcrossChangeCipherSpec-Server*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "KeyUpdate-ToServer": "needs KeyUpdate (milestone M2)",
+    "MajorVersionTolerance": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "MinimumVersion-Server-TLS1-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server-TLS1-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server-TLS1-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server-TLS11-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server-TLS11-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server-TLS12-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS1-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS1-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS1-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS11-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS11-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinimumVersion-Server2-TLS12-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "MinorVersionTolerance": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "NoCommonCurves": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "NoCommonSignatureAlgorithms-TLS12-Fallback": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoEd25519-TLS11-ServerAuth-Sign": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoExtendedMasterSecret-TLS1-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoExtendedMasterSecret-TLS11-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoExtendedMasterSecret-TLS12-Server": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "NoSupportedCurves": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "PAKE-Extension-Duplicate": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "PartialClientFinishedWithSecondClientHello*": "needs HelloRetryRequest (milestone M2)",
+    "PartialClientKeyExchangeWithClientHello": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "PartialSecondClientHelloAfterFirst": "needs HelloRetryRequest (milestone M2)",
+    "PointFormat-Server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "RejectEmptyCertificateAuthorities-Server-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "Renegotiate-Server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "SecondClientHelloMissingKeyShare-TLS13": "needs HelloRetryRequest (milestone M2)",
+    "SecondClientHelloWrongCurve-*": "needs HelloRetryRequest (milestone M2)",
+    "Server-JDK11-NoWorkaround-9": "needs HelloRetryRequest (milestone M2): its only key share is secp256r1 while x25519 comes first in supported_groups (rustls asks for x25519)",
+    "ServerAuth-SHA1-Fallback-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ServerAuth-SignatureType": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "ServerCertificateType-Server-RejectsDefaultOnly-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "ServerCipherFilter-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "SessionTicketsDisabled-Server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "SkipChangeCipherSpec-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "SkipEarlyData-HRR-*": "needs HelloRetryRequest (milestone M2)",
+    "SkipEarlyData-OmitEarlyDataExtension-HelloRetryRequest-*": "needs HelloRetryRequest (milestone M2)",
+    "SkipEarlyData-SecondClientHelloEarlyData-*": "needs HelloRetryRequest (milestone M2)",
+    "TLS-ECH-Server-ECHInner-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "TrailingMessageData-ClientFinished-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "TrailingMessageData-ClientKeyExchange-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "TrustAnchors-EmptyID-ClientHello": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
+    "UnknownCipher": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "UnknownCurve": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "VersionNegotiation-Server-TLS13-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiation-Server-TLS13-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiation-Server-TLS13-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiation-Server2-TLS13-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiation-Server2-TLS13-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiation-Server2-TLS13-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2): the client caps itself below TLS 1.3 and expects that version",
+    "VersionNegotiationExtension-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "VersionNegotiationExtension-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "VersionNegotiationExtension-TLS12-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
+    "WrongMessageType-ClientFinished-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
+    "WrongMessageType-ClientKeyExchange-TLS": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope"
+  },
+  "ErrorMap": {
+    ":NO_SHARED_CIPHER:": [
+      ":HandshakeFailure:"
+    ],
+    ":NO_SHARED_GROUP:": [
+      ":HandshakeFailure:",
+      ":MissingExtension:"
+    ],
+    ":NO_COMMON_SIGNATURE_ALGORITHMS:": [
+      ":HandshakeFailure:"
+    ],
+    ":MISSING_KEY_SHARE:": [
+      ":MissingExtension:"
+    ],
+    ":BAD_ECPOINT:": [
+      ":IllegalParameter:"
+    ],
+    ":DUPLICATE_KEY_SHARE:": [
+      ":IllegalParameter:"
+    ],
+    ":INVALID_COMPRESSION_LIST:": [
+      ":IllegalParameter:"
+    ],
+    ":DECODE_ERROR:": [
+      ":DecodeError:"
+    ],
+    ":CLIENTHELLO_PARSE_FAILED:": [
+      ":DecodeError:"
+    ],
+    ":ERROR_PARSING_EXTENSION:": [
+      ":DecodeError:",
+      ":IllegalParameter:"
+    ],
+    ":BAD_ALERT:": [
+      ":DecodeError:",
+      ":IllegalParameter:"
+    ],
+    ":WRONG_VERSION_NUMBER:": [
+      ":DecodeError:"
+    ],
+    ":HTTP_REQUEST:": [
+      ":DecodeError:"
+    ],
+    ":HTTPS_PROXY_REQUEST:": [
+      ":DecodeError:"
+    ],
+    ":UNEXPECTED_MESSAGE:": [
+      ":UnexpectedMessage:"
+    ],
+    ":UNEXPECTED_RECORD:": [
+      ":UnexpectedMessage:"
+    ],
+    ":EXCESS_HANDSHAKE_DATA:": [
+      ":UnexpectedMessage:"
+    ],
+    ":DIGEST_CHECK_FAILED:": [
+      ":DecryptError:"
+    ],
+    ":DECRYPTION_FAILED_OR_BAD_RECORD_MAC:": [
+      ":BadRecordMac:"
+    ],
+    ":BAD_DECRYPT:": [
+      ":BadRecordMac:"
+    ],
+    ":TLSV1_ALERT_RECORD_OVERFLOW:": [
+      ":RecordOverflow:",
+      "alert=record_overflow"
+    ],
+    ":UNSUPPORTED_PROTOCOL:": [
+      ":ProtocolVersion:"
+    ],
+    ":NO_APPLICATION_PROTOCOL:": [
+      ":NoApplicationProtocol:"
+    ],
+    ":MISSING_EXTENSION:": [
+      ":MissingExtension:"
+    ],
+    ":SSLV3_ALERT_HANDSHAKE_FAILURE:": [
+      "alert=handshake_failure"
+    ],
+    ":PARSE_TLSEXT:": [
+      ":DecodeError:"
+    ],
+    ":TOO_MANY_EMPTY_FRAGMENTS:": [
+      ":UnexpectedMessage:"
+    ],
+    ":TOO_MUCH_SKIPPED_EARLY_DATA:": [
+      ":BadRecordMac:"
+    ]
+  }
+}

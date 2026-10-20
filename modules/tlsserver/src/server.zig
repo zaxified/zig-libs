@@ -13,14 +13,17 @@
 //! Negotiation follows rustls 0.23 (the scope reference):
 //!
 //! - **version** TLS 1.3 only — no `supported_versions` with 0x0304 is
-//!   `protocol_version`;
+//!   `protocol_version`, checked before anything else;
 //! - **certificate** fixed, or chosen by a callback from the SNI and the
 //!   ClientHello (none chosen: `access_denied`); the signature scheme is
-//!   the key's first candidate the client offers (`handshake_failure` if
-//!   none, or no `signature_algorithms` at all);
+//!   the key's first candidate the client offers and the key can produce
+//!   (`certverify.canSign`: a 1024-bit RSA key has no `rsa_pss_rsae_sha512`;
+//!   `handshake_failure` if none, or no `signature_algorithms` at all);
 //! - **cipher suite** the client's first that the server enables;
 //! - **group** the client's first `supported_groups` entry the server
-//!   enables, and the client must have sent a share for it — the
+//!   enables (no `supported_groups` or no `key_share` at all is
+//!   `missing_extension`, RFC 8446 §9.2), and the client must have sent a
+//!   share for it — the
 //!   HelloRetryRequest that would ask for one comes with M2, so for now it
 //!   is `handshake_failure`;
 //! - **ALPN** the server's first protocol the client offers; none in
@@ -386,16 +389,18 @@ pub const Server = struct {
             .ip_address => {},
             .invalid => return error.IllegalParameter,
         };
-        const sig_algs = ch.signatureAlgorithms() orelse return error.HandshakeFailure;
+        // The version first: a TLS 1.2 (or older) client gets
+        // `protocol_version` whatever else its hello lacks (rustls order).
         const versions = ch.supportedVersions() orelse return error.ProtocolVersion;
         if (!versions.contains(messages.tls13_version)) return error.ProtocolVersion;
+        const sig_algs = ch.signatureAlgorithms() orelse return error.HandshakeFailure;
 
         const ck: *const CertifiedKey = switch (cfg.certificate) {
             .fixed => |k| k,
             .select => |s| s.select(s.ctx, sni, &ch) orelse return error.AccessDenied,
         };
         const scheme = for (certverify.candidateSchemes(ck.key)) |s| {
-            if (sig_algs.contains(@backingInt(s))) break s;
+            if (sig_algs.contains(@backingInt(s)) and certverify.canSign(ck.key, s)) break s;
         } else return error.HandshakeFailure;
 
         var cs = ch.cipherSuites();
@@ -403,13 +408,14 @@ pub const Server = struct {
             const cand: record.CipherSuite = @fromBackingInt(c);
             if (cand.hashLen() != null and std.mem.indexOfScalar(record.CipherSuite, cfg.cipher_suites, cand) != null) break cand;
         } else return error.HandshakeFailure;
-        var gs = ch.supportedGroups() orelse return error.HandshakeFailure;
+        // RFC 8446 §9.2: supported_groups and key_share come together.
+        var gs = ch.supportedGroups() orelse return error.MissingExtension;
         const group: u16 = while (gs.next()) |g| {
             if (std.mem.indexOfScalar(u16, cfg.groups, g) != null) break g;
         } else return error.HandshakeFailure;
 
         if (ch.legacy_compression_methods.len != 1) return error.IllegalParameter;
-        var shares = ch.keyShares() orelse return error.HandshakeFailure;
+        var shares = ch.keyShares() orelse return error.MissingExtension;
         var seen: std.StaticBitSet(1 << 16) = .empty;
         var share: ?[]const u8 = null;
         while (shares.next()) |e| {
@@ -792,11 +798,13 @@ test "refusals and their alerts" {
     try expectRefusal(.{ .sig_algs = null }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .sig_algs = &.{ 0x0807, 0x0804 } }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .suites = &.{ 0xc02f, 0x1304 } }, error.HandshakeFailure, .handshake_failure);
-    try expectRefusal(.{ .groups = null }, error.HandshakeFailure, .handshake_failure);
+    try expectRefusal(.{ .groups = null }, error.MissingExtension, .missing_extension);
+    // The version is checked before anything else the hello lacks.
+    try expectRefusal(.{ .versions = null, .sig_algs = null, .groups = null }, error.ProtocolVersion, .protocol_version);
     try expectRefusal(.{ .groups = &.{ 0x0019, 0x0100 } }, error.HandshakeFailure, .handshake_failure);
     // A group in common but no share for it (HelloRetryRequest: M2).
     try expectRefusal(.{ .groups = &.{ 0x0017, 0x001d }, .shares = &.{.{ 0x001d, "" }} }, error.HandshakeFailure, .handshake_failure);
-    try expectRefusal(.{ .shares = null }, error.HandshakeFailure, .handshake_failure);
+    try expectRefusal(.{ .shares = null }, error.MissingExtension, .missing_extension);
     // Malformed or forbidden.
     try expectRefusal(.{ .shares = &.{ .{ 0x001d, "" }, .{ 0x001d, "" } } }, error.IllegalParameter, .illegal_parameter);
     try expectRefusal(.{ .shares = &.{.{ 0x001d, &@as([31]u8, @splat(9)) }} }, error.IllegalParameter, .illegal_parameter);

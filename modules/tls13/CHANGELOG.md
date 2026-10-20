@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `certverify.canSign(key, scheme)`: the family's candidate and, for RSA-PSS, a
+  modulus large enough for the encoding (RFC 8017 §9.1.1: emLen ≥ 2·hLen + 2 — a 1024-bit key
+  has no `rsa_pss_rsae_sha512`). Found by BoGo's `RSA-PSS-Large` through `tlsserver`.
 - **2026-10-20** — `kex`: secp384r1 (0x0018, std `P384`): `generate`, `sharedSecret` (48-byte X
   coordinate), `serverExchange`; new `scalarLen(group)` (the private prefix a group uses). The NIST
   arms are one generic body for P-256 and P-384. Anchor: `cryptography` 46.0.5 / OpenSSL 3.5.5

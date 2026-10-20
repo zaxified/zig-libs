@@ -32,7 +32,9 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-HelloRetryRequest, resumption, client certificates, KeyUpdate and the BoGo gate are still to come (milestones M1–M2, *Backlog*).
+BoringSSL's BoGo suite passes 130 tests with none failing (`tools/bogo/passing.txt`; everything
+else is unimplemented or disabled with a reason). HelloRetryRequest, resumption, client
+certificates and KeyUpdate are still to come (milestone M2, *Backlog*).
 
 ## What this module is, and what it is not
 
@@ -320,6 +322,27 @@ The receive side's refusals are the table under *Wire format*. Record protection
   echoes) and the secp256r1 ServerHello — rebuilt byte-exact from their fields by `messages`
   (same tool, `src/message_kat_vectors.zig`).
 
+- **External (foreign test suite):** BoringSSL's BoGo runner (`ssl/test/runner` at 784fcafc,
+  2026-08-31 — the last commit before it required Go 1.27), with `tlsserver` as its shim
+  (`tools/bogo_shim.zig`, `zig build interop-tlsserver -- --bogo`). Before the first build the
+  runner's 75 source files (~50,000 lines) and the 75 third-party files compiled into it
+  (x/crypto, x/sys/unix, x/term, filippo.io/mldsa; `-tags purego`, ~27,000 lines) were read in
+  full: it spawns only the shim, listens on loopback only, writes only its temp test keys
+  (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
+  refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
+  Result 2026-10-20: **130 pass, 0 fail**; 6,047 exit 89 (unimplemented: client tests, DTLS,
+  QUIC, resumption, client certificates, OCSP, BoringSSL-only features — the shim logs the flag
+  of each); 3,676 disabled in `tools/bogo/config.json`, each glob with its reason (TLS ≤ 1.2;
+  HelloRetryRequest and KeyUpdate, M2; extensions the server ignores; one rustls-parity
+  divergence). `tools/bogo/passing.txt` is a ratchet: a listed test that fails or disappears
+  fails the run (negative controls: a bogus entry → LOST; the version check moved back after
+  `signature_algorithms` → 11 LOST). The first run found four defects, fixed with it: a client
+  without `supported_versions` got `handshake_failure` instead of `protocol_version` (the
+  version is now checked first); no `supported_groups` or no `key_share` was
+  `handshake_failure` instead of `missing_extension` (RFC 8446 §9.2); a 1024-bit RSA key was
+  offered `rsa_pss_rsae_sha512`, which it cannot encode (`tls13.certverify.canSign`; signing
+  then failed with `internal_error` instead of refusing with `handshake_failure`).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Fuzzing
@@ -426,8 +449,11 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 ## Backlog / deferred
 
-- **M1 (next):** the BoGo shim. (Done 2026-10-20: secp384r1 and P-384 certificates; the key
-  loader; interop with the Go client and `tlsclient`; the `tlsserver-server` fuzz harness.)
+- **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
+  Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
+- **BoGo next:** the HRR- and KeyUpdate-disabled tests come back with M2; the rustls parity
+  gate (our pass set ⊇ rustls's for TLS 1.3 server tests) needs rustls's `bogo/config.json`
+  at a pinned tag next to ours.
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).
@@ -441,8 +467,8 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 - `burn.handshake_burn` (16 KiB around each handshake step) is a margin, not a measured depth:
   the stack probe does not drive the server yet.
-- No fuzz harness drives `Server` yet (the ClientHello decoder, the receive side and record
-  protection each have one).
+- `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);
+  a model client that builds ClientHellos from fields (as `tlsserver-hello` does) is not there.
 - Independent read-only review 2026-10-20 (Sonnet, of server/inbound/outbound): no HIGH; the
   MEDIUM (KeyUpdate / AEAD limit) is M2 with the stop-gap above; LOWs fixed the same day
   (`cipherSuite` before a suite was chosen, secrets kept after a failure, two compatibility CCS
