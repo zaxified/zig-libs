@@ -21,7 +21,6 @@
     "ExtensionTrailingData-TrustAnchors-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "FallbackSCSV": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "FragmentAcrossChangeCipherSpec-Server*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
-    "KeyUpdate-ToServer": "needs KeyUpdate (milestone M2)",
     "MajorVersionTolerance": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "MinimumVersion-Server-TLS1-TLS1-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "MinimumVersion-Server-TLS1-TLS11-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",

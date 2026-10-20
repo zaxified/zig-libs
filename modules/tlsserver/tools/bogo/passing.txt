@@ -44,6 +44,8 @@ HttpHEAD
 HttpPOST
 HttpPUT
 IgnoreClientVersionOrder
+KeyUpdate-FromServer
+KeyUpdate-ToServer
 LooseInitialRecordVersion-TLS13
 MinimumVersion-Server-TLS1-TLS13-TLS
 MinimumVersion-Server-TLS11-TLS1-TLS

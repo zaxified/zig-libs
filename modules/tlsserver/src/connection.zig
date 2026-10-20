@@ -35,6 +35,7 @@ pub const Connection = struct {
     output: *std.Io.Writer,
 
     /// `joiner_buf`, `output_buf`: as for `Server.init`.
+    /// secret-api-ok: returns the initial state; every secret in `server` is zero until the handshake runs (under `Server`'s burns).
     pub fn init(
         config: *const server_mod.Config,
         input: *std.Io.Reader,
@@ -81,6 +82,7 @@ pub const Connection = struct {
     }
 
     /// Run the handshake to completion (the client's Finished verified).
+    /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn handshake(self: *Connection) Error!void {
         while (!self.server.isConnected()) {
             switch (try self.step()) {
@@ -98,6 +100,7 @@ pub const Connection = struct {
     /// The next application data, a slice of the reader's buffer valid until
     /// the next `read`/`handshake`; null once the client sent close_notify.
     /// Runs the handshake first if it has not completed. Never empty.
+    /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn read(self: *Connection) Error!?[]u8 {
         if (!self.server.isConnected()) try self.handshake();
         if (self.server.peer_closed) return null;
@@ -105,13 +108,15 @@ pub const Connection = struct {
             switch (try self.step()) {
                 .app_data => |d| if (d.len != 0) return d,
                 .peer_closed => return null,
-                // Post-handshake handshake messages fail inside `feed`.
+                // A KeyUpdate is handled inside `feed`; other post-handshake
+                // messages fail there.
                 .handshake_done, .need_more => unreachable,
             }
         }
     }
 
     /// Seal and send all of `data`.
+    /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn writeAll(self: *Connection, data: []const u8) Error!void {
         var done: usize = 0;
         while (done < data.len) {
@@ -127,7 +132,22 @@ pub const Connection = struct {
         try self.flush();
     }
 
+    /// Turn the send key over and send the KeyUpdate (`Server.keyUpdate`).
+    /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
+    pub fn keyUpdate(self: *Connection, request: server_mod.KeyUpdateRequest) Error!void {
+        try self.server.keyUpdate(request);
+        // No room for it behind what is queued: drain, then it fits.
+        if (self.server.tx_update != null) {
+            try self.flush();
+            try self.server.keyUpdate(request);
+            // An output buffer below `minOutputLen` cannot take it even empty.
+            if (self.server.tx_update != null) return error.OutputFull;
+        }
+        try self.flush();
+    }
+
     /// Send close_notify. The connection takes no more writes.
+    /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn close(self: *Connection) Error!void {
         try self.server.close();
         try self.flush();

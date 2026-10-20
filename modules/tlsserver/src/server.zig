@@ -39,8 +39,18 @@
 //!   `server_name` and carry the ALPN choice; an OCSP response is stapled
 //!   to the leaf if the client asked for one.
 //!
+//!
+//! After the handshake (RFC 8446 §4.6.3) a client KeyUpdate turns the receive
+//! key over; `update_requested` is answered with the server's own KeyUpdate
+//! (one, however many requests arrive before it goes out — rustls). At most
+//! `max_key_updates` KeyUpdates may come between two application-data
+//! records (rustls, BoringSSL `kMaxKeyUpdates`). The server turns its send
+//! key over by itself at `max_records_per_key`, asking the client to do the
+//! same (rustls `refresh_traffic_keys`), or when the caller asks
+//! (`keyUpdate`).
+//!
 //! Not yet (later milestones): PSK resumption and
-//! NewSessionTicket, client certificates, KeyUpdate. A pre_shared_key offer
+//! NewSessionTicket, client certificates. A pre_shared_key offer
 //! is ignored (full handshake); early data is never accepted and is skipped
 //! (`inbound.Inbound.skip_early`).
 
@@ -96,10 +106,20 @@ pub const Config = struct {
     random: std.Random,
 };
 
-/// Records sealed under one send key before the connection must stop
-/// (RFC 8446 §5.5: AES-GCM's limit is 2^24.5 full records; qap rekeys at
-/// 2^23, which is the bound here until KeyUpdate arrives in M2).
+/// Records sealed under one send key before the server turns it over with
+/// a KeyUpdate (RFC 8446 §5.5: AES-GCM's limit is 2^24.5 full records; qap
+/// rekeys at 2^23).
 pub const max_records_per_key: u64 = 1 << 23;
+
+/// KeyUpdates accepted between two application-data records (rustls
+/// `INITIAL_KEY_UPDATE_REQUESTS`, BoringSSL `kMaxKeyUpdates`).
+pub const max_key_updates: u8 = 32;
+
+/// `KeyUpdate.request_update` (RFC 8446 §4.6.3).
+pub const KeyUpdateRequest = enum(u8) {
+    update_not_requested = 0,
+    update_requested = 1,
+};
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
@@ -121,9 +141,10 @@ pub const Error = inbound.Error || error{
     Closed,
     /// Application data before the handshake completed.
     NotConnected,
-    /// The send key sealed `max_records_per_key` records and there is no
-    /// KeyUpdate yet (M2): the connection ends with close_notify.
-    KeyLimitReached,
+    /// More than `max_key_updates` KeyUpdates without application data
+    /// between them (`unexpected_message`, as BoringSSL; rustls closes
+    /// without an alert).
+    TooManyKeyUpdates,
 };
 
 /// The alert a failure sends (null: none — the peer aborted, or the
@@ -138,8 +159,7 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.NoApplicationProtocol => .no_application_protocol,
         error.InternalError => .internal_error,
         error.OutputFull, error.Closed, error.NotConnected => null,
-        // Not the peer's fault, and no alert names it: close politely.
-        error.KeyLimitReached => .close_notify,
+        error.TooManyKeyUpdates => .unexpected_message,
         else => |e| inbound.alertFor(@errorCast(e)),
     };
 }
@@ -149,6 +169,7 @@ pub fn alertFor(err: Error) ?alert.Description {
 /// with an OCSP staple, CertificateVerify, Finished, each record's
 /// overhead, plus one alert — and a HelloRetryRequest with its CCS, should
 /// the caller not drain the output between the two ClientHellos.
+/// secret-api-ok: reads the chain's lengths and the key's tag (its signature schemes), never the key bytes.
 pub fn minOutputLen(ck: *const CertifiedKey) usize {
     var chain: usize = 3;
     for (ck.chain) |c| chain += 3 + c.len + 2;
@@ -162,7 +183,7 @@ pub fn minOutputLen(ck: *const CertifiedKey) usize {
         (4 + 2 + 4 + 2 + 1 + 255 + 4) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
     const records = flight / record.max_plaintext_len + 6;
-    return flight + records * (record.header_len + 1 + record.tag_len) + 64;
+    return flight + records * (record.header_len + 1 + record.tag_len) + outbound.alert_reserve + 64;
 }
 
 pub const Event = union(enum) {
@@ -229,7 +250,14 @@ pub const Server = struct {
     sni_buf: [253]u8 = undefined,
     sni_len: ?u8 = null,
     peer_closed: bool = false,
+    /// KeyUpdates the client may still send before its next application
+    /// data.
+    key_updates_left: u8 = max_key_updates,
+    /// The server's own KeyUpdate, due but not yet in the output (it had no
+    /// room): it goes out before any further record.
+    tx_update: ?KeyUpdateRequest = null,
 
+    /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
         return .{
             .config = config,
@@ -292,13 +320,17 @@ pub const Server = struct {
     /// send it, then close.
     pub fn feed(self: *Server, buf: []u8) Error!Result {
         if (self.state == .failed) return error.Closed;
+        self.flushKeyUpdate() catch |err| return self.fail(err);
         var at: usize = 0;
         while (true) {
             const r = self.inbound.next(buf[at..]) catch |err| return self.fail(err);
             at += r.consumed;
             switch (r.event) {
                 .need_more => return .{ .event = .need_more, .consumed = at },
-                .app_data => |d| return .{ .event = .{ .app_data = d }, .consumed = at },
+                .app_data => |d| {
+                    self.key_updates_left = max_key_updates;
+                    return .{ .event = .{ .app_data = d }, .consumed = at };
+                },
                 .peer_closed => {
                     self.peer_closed = true;
                     return .{ .event = .peer_closed, .consumed = at };
@@ -320,11 +352,13 @@ pub const Server = struct {
             else => return error.NotConnected,
         }
         if (self.write_closed) return error.Closed;
-        // RFC 8446 §5.5: an AEAD key must be retired well before its usage
-        // limit. Until KeyUpdate exists (M2) the connection ends instead.
-        if (self.out.tx.seq >= max_records_per_key) return self.fail(error.KeyLimitReached);
         var done: usize = 0;
         while (done < data.len) {
+            // RFC 8446 §5.5: retire the key well before its usage limit.
+            if (self.out.tx.seq >= max_records_per_key and self.tx_update == null)
+                self.tx_update = .update_requested;
+            self.flushKeyUpdate() catch |err| return self.fail(err);
+            if (self.tx_update != null) break;
             const s = self.out.slot();
             if (s.len == 0) break;
             const n = @min(s.len, data.len - done, record.max_plaintext_len);
@@ -336,13 +370,64 @@ pub const Server = struct {
         return done;
     }
 
+    /// Turn the send key over now (RFC 8446 §4.6.3), asking the client to
+    /// turn its own over too when `request` is `update_requested`. The
+    /// KeyUpdate goes out before any later record — at once if the output
+    /// has room. A KeyUpdate already due is not repeated, but one due
+    /// without a request is turned into `update_requested` if that is asked.
+    pub fn keyUpdate(self: *Server, request: KeyUpdateRequest) Error!void {
+        switch (self.state) {
+            .connected => {},
+            .failed => return error.Closed,
+            else => return error.NotConnected,
+        }
+        if (self.write_closed) return error.Closed;
+        if (self.tx_update == null or request == .update_requested) self.tx_update = request;
+        self.flushKeyUpdate() catch |err| return self.fail(err);
+    }
+
+    /// Send the due KeyUpdate, if the output has room: sealed under the old
+    /// key, everything after it under the next one.
+    fn flushKeyUpdate(self: *Server) Error!void {
+        const request = self.tx_update orelse return;
+        if (self.write_closed) {
+            self.tx_update = null;
+            return;
+        }
+        const msg = [_]u8{ @backingInt(messages.HandshakeType.key_update), 0, 0, 1, @backingInt(request) };
+        self.out.write(.handshake, &msg) catch |err| switch (err) {
+            error.OutputFull => return,
+            else => |e| return e,
+        };
+        self.tx_update = null;
+        const secret = self.nextSecret(&self.server_application_secret);
+        self.out.installTx(self.suite, secret) catch return error.InternalError;
+    }
+
+    /// `secret` ← application_traffic_secret_N+1 (RFC 8446 §7.2), in place.
+    fn nextSecret(self: *const Server, secret: *[48]u8) []const u8 {
+        switch (self.suite) {
+            .aes_256_gcm_sha384 => {
+                ks.nextApplicationTrafficSecret(S384.Hkdf, secret, secret);
+                return secret;
+            },
+            else => {
+                ks.nextApplicationTrafficSecret(S256.Hkdf, secret[0..32], secret[0..32]);
+                return secret[0..32];
+            },
+        }
+    }
+
     /// Queue close_notify. Nothing more can be written afterwards; the
     /// client's remaining data and its close_notify can still be read.
+    /// secret-api-ok: seals one alert (`record` burns its own frame) and zeroes the send secret; no secret is copied into this frame.
     pub fn close(self: *Server) Error!void {
         if (self.state == .failed or self.write_closed) return error.Closed;
         self.out.write(.alert, &alert.Alert.close_notify.encode()) catch {};
         self.write_closed = true;
         self.out.wipeKey();
+        // Nothing more is sealed: the send secret is dead.
+        std.crypto.secureZero(u8, &self.server_application_secret);
     }
 
     /// Queue the error's alert, then wipe every key and secret (the queued
@@ -378,9 +463,34 @@ pub const Server = struct {
                 try burn.run(burn.handshake_burn, Error!void, onClientFinished, .{ self, m });
                 return true;
             },
-            // Post-handshake messages (KeyUpdate, M2) are not handled yet.
-            .connected => return error.UnexpectedMessage,
+            // Of the post-handshake messages a client sends only KeyUpdate
+            // (no post-handshake authentication is requested).
+            .connected => {
+                if (t != .key_update) return error.UnexpectedMessage;
+                try self.onKeyUpdate(m);
+                return false;
+            },
             .failed => unreachable,
+        }
+    }
+
+    /// RFC 8446 §4.6.3: the client's next messages come under its next
+    /// application secret. It must end its record (rustls
+    /// `check_aligned_handshake`; `installRx` refuses held octets).
+    fn onKeyUpdate(self: *Server, m: inbound.HandshakeMessage) Error!void {
+        if (m.body.len != 1) return error.DecodeError;
+        if (self.key_updates_left == 0) return error.TooManyKeyUpdates;
+        self.key_updates_left -= 1;
+        const request = std.enums.fromInt(KeyUpdateRequest, m.body[0]) orelse return error.IllegalParameter;
+        const secret = self.nextSecret(&self.client_application_secret);
+        self.inbound.installRx(self.suite, secret) catch |err| return switch (err) {
+            error.UnexpectedMessage => error.UnexpectedMessage,
+            else => error.InternalError,
+        };
+        // After close_notify nothing is sent, a KeyUpdate included.
+        if (request == .update_requested and self.tx_update == null and !self.write_closed) {
+            self.tx_update = .update_not_requested;
+            try self.flushKeyUpdate();
         }
     }
 
@@ -1182,4 +1292,278 @@ test "HelloRetryRequest: a first hello sharing its record with the next message 
     var first = x25519_share_first;
     first.trailing = &.{ 1, 0, 0 };
     try expectRefusal(first, error.UnexpectedMessage, .unexpected_message);
+}
+
+/// A server past the client's Finished, built white-box (the Finished comes
+/// from the server's own secrets), with the client's side of the
+/// application keys: `tx` seals what the client sends, `rx` opens what the
+/// server sends, each following the KeyUpdates.
+const Peer = struct {
+    prng: std.Random.DefaultPrng,
+    cfg: Config,
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    out: [32 * 1024]u8,
+    in: [record.max_record_len]u8,
+    s: Server,
+    tx: record.Protection,
+    rx: record.Protection,
+    tx_secret: [32]u8,
+    rx_secret: [32]u8,
+
+    fn create() !*Peer {
+        const p = try testing.allocator.create(Peer);
+        errdefer testing.allocator.destroy(p);
+        p.prng = .init(1);
+        p.cfg = .{ .certificate = .{ .fixed = testKey() }, .random = p.prng.random() };
+        p.s = .init(&p.cfg, &p.joiner, &p.out);
+        const rec = try buildRecord(testing.allocator, .{});
+        defer testing.allocator.free(rec);
+        _ = try p.s.feed(rec);
+        const th = p.s.transcript.sha256.currentHash();
+        var fk: [32]u8 = undefined;
+        ks.deriveFinishedKey(S256.Hkdf, 32, &fk, p.s.client_handshake_secret[0..32]);
+        var fin: [36]u8 = undefined;
+        fin[0..4].* = .{ 20, 0, 0, 32 };
+        tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[4..36], &fk, &th);
+        var hs: record.Protection = undefined;
+        try hs.init(.aes_128_gcm_sha256, p.s.client_handshake_secret[0..32]);
+        @memcpy(p.in[5..][0..fin.len], &fin);
+        const r = try p.s.feed(try hs.seal(&p.in, fin.len, .handshake, 0));
+        try testing.expect(r.event == .handshake_done);
+        p.tx_secret = p.s.client_application_secret[0..32].*;
+        p.rx_secret = p.s.server_application_secret[0..32].*;
+        try p.tx.init(.aes_128_gcm_sha256, &p.tx_secret);
+        try p.rx.init(.aes_128_gcm_sha256, &p.rx_secret);
+        // The first flight went out under the handshake keys.
+        p.s.discardOutput(p.s.pendingOutput().len);
+        return p;
+    }
+
+    fn destroy(p: *Peer) void {
+        p.s.deinit();
+        testing.allocator.destroy(p);
+    }
+
+    /// Seal `content` as one client record and feed it.
+    fn send(p: *Peer, ct: record.ContentType, content: []const u8) Error!Result {
+        @memcpy(p.in[5..][0..content.len], content);
+        const sealed = p.tx.seal(&p.in, content.len, ct, 0) catch unreachable;
+        return p.s.feed(sealed);
+    }
+
+    /// The client turns its key over after sending this record.
+    fn sendKeyUpdate(p: *Peer, request: u8) Error!Result {
+        const r = p.send(.handshake, &.{ 24, 0, 0, 1, request });
+        ks.nextApplicationTrafficSecret(S256.Hkdf, &p.tx_secret, &p.tx_secret);
+        p.tx.init(.aes_128_gcm_sha256, &p.tx_secret) catch unreachable;
+        return r;
+    }
+
+    const Drained = struct {
+        /// The request octet of each KeyUpdate, in order.
+        updates: [8]u8 = undefined,
+        n_updates: usize = 0,
+        app: [256]u8 = undefined,
+        app_len: usize = 0,
+        alerts: usize = 0,
+    };
+
+    /// Open everything the server queued, following its KeyUpdates.
+    fn drain(p: *Peer) !Drained {
+        var d: Drained = .{};
+        var buf: [32 * 1024]u8 = undefined;
+        const pending = p.s.pendingOutput();
+        @memcpy(buf[0..pending.len], pending);
+        p.s.discardOutput(pending.len);
+        var at: usize = 0;
+        while (at < pending.len) {
+            const h = record.parseHeader(buf[at..][0..5]);
+            const o = try p.rx.open(buf[at..][0 .. 5 + h.length]);
+            at += 5 + h.length;
+            switch (o.content_type) {
+                .handshake => {
+                    try testing.expectEqualSlices(u8, &.{ 24, 0, 0, 1 }, o.content[0..4]);
+                    try testing.expectEqual(@as(usize, 5), o.content.len);
+                    d.updates[d.n_updates] = o.content[4];
+                    d.n_updates += 1;
+                    ks.nextApplicationTrafficSecret(S256.Hkdf, &p.rx_secret, &p.rx_secret);
+                    try p.rx.init(.aes_128_gcm_sha256, &p.rx_secret);
+                },
+                .application_data => {
+                    const n = @min(o.content.len, d.app.len - d.app_len);
+                    @memcpy(d.app[d.app_len..][0..n], o.content[0..n]);
+                    d.app_len += n;
+                },
+                .alert => d.alerts += 1,
+                else => return error.UnexpectedRecord,
+            }
+        }
+        return d;
+    }
+};
+
+test "KeyUpdate from the client: update_not_requested turns only the receive key" {
+    const p = try Peer.create();
+    defer p.destroy();
+    for (0..3) |_| {
+        try testing.expect((try p.sendKeyUpdate(0)).event == .need_more);
+        const r = try p.send(.application_data, "ping");
+        try testing.expectEqualStrings("ping", r.event.app_data);
+    }
+    // Nothing went back; the server still sends under its first key.
+    try testing.expectEqual(@as(usize, 0), p.s.pendingOutput().len);
+    _ = try p.s.write("pong");
+    const d = try p.drain();
+    try testing.expectEqual(@as(usize, 0), d.n_updates);
+    try testing.expectEqualStrings("pong", d.app[0..d.app_len]);
+}
+
+test "KeyUpdate from the client: update_requested is answered once, before the next record" {
+    const p = try Peer.create();
+    defer p.destroy();
+    _ = try p.sendKeyUpdate(1);
+    // The reply is queued at once: sealed under the old key.
+    try testing.expect(p.s.pendingOutput().len != 0);
+    try testing.expect(p.s.tx_update == null);
+    _ = try p.s.write("a");
+    var d = try p.drain();
+    try testing.expectEqual(@as(usize, 1), d.n_updates);
+    try testing.expectEqual(@as(u8, 0), d.updates[0]);
+    try testing.expectEqualStrings("a", d.app[0..d.app_len]);
+
+    // Several requests before the reply can go out (the output is full):
+    // one reply.
+    while (p.s.out.slot().len > 64) _ = try p.s.write(&@as([1024]u8, @splat('x')));
+    while (p.s.out.slot().len > 0) _ = p.s.write("y") catch break;
+    for (0..3) |_| _ = try p.sendKeyUpdate(1);
+    try testing.expectEqual(KeyUpdateRequest.update_not_requested, p.s.tx_update.?);
+    try testing.expectError(error.OutputFull, p.s.write("z"));
+    _ = try p.drain();
+    _ = try p.s.write("z");
+    d = try p.drain();
+    try testing.expectEqual(@as(usize, 1), d.n_updates);
+    try testing.expectEqualStrings("z", d.app[0..d.app_len]);
+    // The client's data still opens under its third next key.
+    try testing.expectEqualStrings("q", (try p.send(.application_data, "q")).event.app_data);
+}
+
+test "KeyUpdate from the client: a due reply also goes out from feed once there is room" {
+    const p = try Peer.create();
+    defer p.destroy();
+    while (p.s.out.slot().len > 64) _ = try p.s.write(&@as([1024]u8, @splat('x')));
+    while (p.s.out.slot().len > 0) _ = p.s.write("y") catch break;
+    _ = try p.sendKeyUpdate(1);
+    try testing.expect(p.s.tx_update != null);
+    _ = try p.drain();
+    var empty: [0]u8 = .{};
+    _ = try p.s.feed(&empty);
+    try testing.expect(p.s.tx_update == null);
+    try testing.expectEqual(@as(usize, 1), (try p.drain()).n_updates);
+}
+
+test "KeyUpdate refusals: request octet, length, alignment, too many" {
+    {
+        const p = try Peer.create();
+        defer p.destroy();
+        try testing.expectError(error.IllegalParameter, p.sendKeyUpdate(2));
+    }
+    for ([_][]const u8{ &.{ 24, 0, 0, 2, 0, 0 }, &.{ 24, 0, 0, 0 } }) |msg| {
+        const p = try Peer.create();
+        defer p.destroy();
+        try testing.expectError(error.DecodeError, p.send(.handshake, msg));
+    }
+    {
+        // A KeyUpdate must end its record: the next message's start would
+        // be read under the new key (RFC 8446 §5.1).
+        const p = try Peer.create();
+        defer p.destroy();
+        try testing.expectError(error.UnexpectedMessage, p.send(.handshake, &.{ 24, 0, 0, 1, 0, 24, 0 }));
+        // Each alert went out sealed (under the key in force).
+        try testing.expectEqual(@as(usize, 1), (try p.drain()).alerts);
+    }
+    {
+        // max_key_updates in a row are fine; one more is not.
+        const p = try Peer.create();
+        defer p.destroy();
+        for (0..max_key_updates) |_| _ = try p.sendKeyUpdate(0);
+        try testing.expectEqualStrings("x", (try p.send(.application_data, "x")).event.app_data);
+        // Application data resets the count.
+        for (0..max_key_updates) |_| _ = try p.sendKeyUpdate(0);
+        try testing.expectError(error.TooManyKeyUpdates, p.sendKeyUpdate(0));
+        const d = try p.drain();
+        try testing.expectEqual(@as(usize, 1), d.alerts);
+    }
+    {
+        // Other post-handshake messages: NewSessionTicket from a client.
+        const p = try Peer.create();
+        defer p.destroy();
+        try testing.expectError(error.UnexpectedMessage, p.send(.handshake, &.{ 4, 0, 0, 0 }));
+    }
+}
+
+test "the server turns its own key over: on request, and at max_records_per_key" {
+    const p = try Peer.create();
+    defer p.destroy();
+    try p.s.keyUpdate(.update_not_requested);
+    _ = try p.s.write("1");
+    var d = try p.drain();
+    try testing.expectEqual(@as(usize, 1), d.n_updates);
+    try testing.expectEqual(@as(u8, 0), d.updates[0]);
+    try testing.expectEqualStrings("1", d.app[0..d.app_len]);
+
+    // At the limit the next record is preceded by update_requested; the
+    // sequence restarts under the new key.
+    p.s.out.tx.seq = max_records_per_key - 1;
+    p.rx.seq = max_records_per_key - 1;
+    _ = try p.s.write("2");
+    _ = try p.s.write("3");
+    d = try p.drain();
+    try testing.expectEqual(@as(usize, 1), d.n_updates);
+    try testing.expectEqual(@as(u8, 1), d.updates[0]);
+    try testing.expectEqualStrings("23", d.app[0..d.app_len]);
+    try testing.expectEqual(@as(u64, 1), p.s.out.tx.seq);
+    // The client answers; its data still opens.
+    _ = try p.sendKeyUpdate(0);
+    try testing.expectEqualStrings("ok", (try p.send(.application_data, "ok")).event.app_data);
+}
+
+test "after close_notify a requested KeyUpdate is not answered, and keyUpdate is refused" {
+    const p = try Peer.create();
+    defer p.destroy();
+    try p.s.close();
+    _ = try p.sendKeyUpdate(1);
+    try testing.expect(p.s.tx_update == null);
+    try testing.expectError(error.Closed, p.s.keyUpdate(.update_requested));
+    // Only the close_notify went out.
+    const d = try p.drain();
+    try testing.expectEqual(@as(usize, 0), d.n_updates);
+    try testing.expectEqual(@as(usize, 1), d.alerts);
+}
+
+test "keyUpdate before the handshake completes is NotConnected" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    try testing.expectError(error.NotConnected, s.keyUpdate(.update_requested));
+}
+
+test "a full output still takes the fatal alert, or close_notify" {
+    {
+        const p = try Peer.create();
+        defer p.destroy();
+        while (true) _ = p.s.write(&@as([1024]u8, @splat('x'))) catch break;
+        try testing.expectError(error.IllegalParameter, p.sendKeyUpdate(7));
+        const d = try p.drain();
+        try testing.expectEqual(@as(usize, 1), d.alerts);
+    }
+    {
+        const p = try Peer.create();
+        defer p.destroy();
+        while (true) _ = p.s.write(&@as([1024]u8, @splat('x'))) catch break;
+        try p.s.close();
+        try testing.expectEqual(@as(usize, 1), (try p.drain()).alerts);
+    }
 }

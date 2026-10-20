@@ -10,6 +10,10 @@
 //! split across records by moving its tail apart in the buffer (last
 //! fragment first), so it is never copied to a second buffer.
 //!
+//! The last `alert_reserve` octets of the buffer are kept for one alert:
+//! however full the application leaves it, a fatal alert or close_notify
+//! can still be queued (only `.alert` content may use them).
+//!
 //! No padding is added (RFC 8446 §5.4 leaves it to policy; rustls pads
 //! nothing either).
 
@@ -25,6 +29,9 @@ pub const Error = error{
     /// The send sequence number is exhausted (`record.SealError`).
     SequenceExhausted,
 };
+
+/// Room for one sealed alert: header, two octets, inner type, tag.
+pub const alert_reserve = header_len + 2 + 1 + record.tag_len;
 
 pub const Outbound = struct {
     buf: []u8,
@@ -45,7 +52,7 @@ pub const Outbound = struct {
     /// Where the next content goes. Its length bounds what `commit` can
     /// frame (fragmentation overhead included, conservatively).
     pub fn slot(self: *Outbound) []u8 {
-        const free = self.buf.len - self.len;
+        const free = (self.buf.len - self.len) -| alert_reserve;
         if (free <= header_len) return self.buf[self.buf.len..];
         // Content n needs n + ceil(n / 2^14) * overhead; reserve for the
         // worst case of the free space.
@@ -57,12 +64,15 @@ pub const Outbound = struct {
 
     /// Frame the `n` octets at the start of `slot()` as `content_type`
     /// records. Content over 2^14 is split; `n == 0` makes one empty record
-    /// (legal for application data only — the caller's to know).
+    /// (legal for application data only — the caller's to know). Only an
+    /// alert may use the `alert_reserve`.
     pub fn commit(self: *Outbound, content_type: record.ContentType, n: usize) Error!void {
         const max = record.max_plaintext_len;
         const o = self.overhead();
         const k = if (n == 0) 1 else (n + max - 1) / max;
-        if (self.buf.len - self.len < n + k * o) return error.OutputFull;
+        const keep: usize = if (content_type == .alert) 0 else alert_reserve;
+        const room = (self.buf.len - self.len) -| keep;
+        if (room < n + k * o) return error.OutputFull;
         const base = self.len + header_len;
         // Move fragments apart, last first: each one's destination is at or
         // past its source and past every earlier fragment's source.
@@ -94,9 +104,10 @@ pub const Outbound = struct {
     /// Copy `data` in and frame it (for short, already-built content: an
     /// alert, a CCS).
     pub fn write(self: *Outbound, content_type: record.ContentType, data: []const u8) Error!void {
-        const s = self.slot();
-        if (s.len < data.len) return error.OutputFull;
-        @memcpy(s[0..data.len], data);
+        // Not through `slot`, which leaves out the alert reserve; `commit`
+        // checks the room exactly.
+        if (self.buf.len - self.len < header_len + data.len) return error.OutputFull;
+        @memcpy(self.buf[self.len + header_len ..][0..data.len], data);
         try self.commit(content_type, data.len);
     }
 
@@ -205,11 +216,17 @@ test "slot never promises more than commit can frame; full buffer is OutputFull"
     const secret: [32]u8 = @splat(1);
     try o.installTx(.chacha20_poly1305_sha256, &secret);
     const s = o.slot();
-    // One record: 100 octets less header, type octet and tag.
-    try testing.expectEqual(@as(usize, 100 - 22), s.len);
+    // One record: 100 octets less the alert reserve, header, type octet and
+    // tag.
+    try testing.expectEqual(@as(usize, 100 - alert_reserve - 22), s.len);
     try o.commit(.application_data, s.len);
-    try testing.expectEqual(@as(usize, 100), o.len);
+    try testing.expectEqual(@as(usize, 100 - alert_reserve), o.len);
     try testing.expectEqual(@as(usize, 0), o.slot().len);
+    try testing.expectError(error.OutputFull, o.commit(.application_data, 0));
+    try testing.expectError(error.OutputFull, o.write(.handshake, &.{ 24, 0, 0, 1, 0 }));
+    // The reserve takes exactly one alert.
+    try o.write(.alert, &.{ 2, 10 });
+    try testing.expectEqual(@as(usize, 100), o.len);
     try testing.expectError(error.OutputFull, o.write(.alert, &.{ 2, 10 }));
     o.discard(40);
     try testing.expectEqual(@as(usize, 60), o.len);

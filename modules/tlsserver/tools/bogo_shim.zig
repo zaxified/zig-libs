@@ -50,6 +50,10 @@ const Options = struct {
     key_file: ?[]const u8 = null,
     shim_writes_first: bool = false,
     shim_shuts_down: bool = false,
+    /// BoringSSL `SSL_key_update(NOT_REQUESTED)` once after the handshake,
+    /// or before every read.
+    key_update: bool = false,
+    key_update_before_read: bool = false,
     expect_server_name: ?[]const u8 = null,
     expect_curve_id: ?u16 = null,
     alpn: std.ArrayList([]const u8) = .empty,
@@ -118,6 +122,10 @@ fn parseArgs(gpa: std.mem.Allocator, it: *std.process.Args.Iterator, o: *Options
             o.shim_writes_first = true;
         } else if (std.mem.eql(u8, flag, "-shim-shuts-down")) {
             o.shim_shuts_down = true;
+        } else if (std.mem.eql(u8, flag, "-key-update")) {
+            o.key_update = true;
+        } else if (std.mem.eql(u8, flag, "-key-update-before-read")) {
+            o.key_update_before_read = true;
         } else if (std.mem.eql(u8, flag, "-expect-server-name")) {
             o.expect_server_name = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-resume-count")) {
@@ -235,6 +243,7 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
         if (!std.mem.eql(u8, got, want)) return error.ServerNameMismatch;
     }
     if (o.expect_curve_id) |want| if (c.server.negotiatedGroup() != want) return error.CurveMismatch;
+    if (o.key_update) try c.keyUpdate(.update_not_requested);
     if (o.shim_writes_first) try c.writeAll("hello");
     if (o.shim_shuts_down) {
         try c.close();
@@ -243,7 +252,9 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, o: *const Options) !void {
         return;
     }
     var echo: [record.max_plaintext_len]u8 = undefined;
-    while (try c.read()) |d| {
+    while (true) {
+        if (o.key_update_before_read) try c.keyUpdate(.update_not_requested);
+        const d = try c.read() orelse break;
         for (echo[0..d.len], d) |*e, b| e.* = b ^ 0xff;
         try c.writeAll(echo[0..d.len]);
     }

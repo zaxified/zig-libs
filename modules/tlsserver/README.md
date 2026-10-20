@@ -6,8 +6,8 @@ AEADs. **Under construction (milestone M2):** a full (EC)DHE handshake with a ce
 TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
 X25519, secp256r1, secp384r1; ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; SNI
 certificate selection; ALPN; HelloRetryRequest for a group the client sent no share for — then application data and close_notify, sans-I/O (`Server`) or
-blocking (`Connection`), with the certificate and key loaded from PEM (`keys`). No
-resumption, client certificates or KeyUpdate yet (`SPEC.md`, *Backlog*).
+blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), and KeyUpdate
+both ways. No resumption or client certificates yet (`SPEC.md`, *Backlog*).
 
 - **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
   server; qap runs a fork of a third-party one, which this module is meant to replace.

@@ -112,6 +112,7 @@ pub const CertKeyPair = struct {
     }
 
     /// The `CertifiedKey` for `Config.certificate`, borrowing from `self`.
+    /// secret-api-ok: returns pointers to the key held in `self` (`CertifiedKey.key` is a union of pointers), never key bytes.
     pub fn certifiedKey(self: *const CertKeyPair) CertifiedKey {
         return .{ .chain = self.chain, .key = switch (self.key) {
             .ecdsa_p256 => |*k| .{ .ecdsa_p256 = k },

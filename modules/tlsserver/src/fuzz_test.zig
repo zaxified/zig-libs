@@ -10,8 +10,9 @@
 //! bytes in place of the ciphertext — or opened under another sequence number
 //! is refused, never accepted unless identical, never a panic; a refused
 //! record never advances the sequence number.
-//! `tlsserver-keys` (`keys.CertKeyPair.fromPem`) and `tlsserver-server`
-//! (`Server` on recorded real clients) are described at their sections.
+//! `tlsserver-keys` (`keys.CertKeyPair.fromPem`), `tlsserver-server`
+//! (`Server` on recorded real clients) and `tlsserver-keyupdate` (KeyUpdate
+//! against a model client) are described at their sections.
 
 const std = @import("std");
 const testing = std.testing;
@@ -1186,6 +1187,7 @@ const SrvMark = Marker(enum {
     openssl_case,
     go_case,
     retry_case,
+    key_update_case,
     genuine_chunked,
     genuine_bytewise,
     truncated_waits,
@@ -1217,7 +1219,7 @@ var fuzz_keys: ?*FuzzKeys = null;
 /// freed — test-only, and the driver's leak check sees only `gpa`.
 fn fuzzKeys_() !*FuzzKeys {
     if (fuzz_keys) |k| return k;
-    const k = try std.heap.page_allocator.create(FuzzKeys);
+    const k = try std.heap.page_allocator.create(FuzzKeys); // global-alloc-ok: process-lifetime fuzz/test fixture cached across driver runs, outlives testing.allocator's per-test teardown
     k.p256 = try .fromBytes(certs.p256_scalar);
     k.p384 = try .fromBytes(certs.p384_scalar);
     k.ed25519 = try .fromBytes(certs.ed25519_secret);
@@ -1239,6 +1241,8 @@ const SrvRun = struct {
     handshake_done: bool = false,
     peer_closed: bool = false,
     answered: bool = false,
+    /// The recording's server asked for a KeyUpdate before "pong\n".
+    key_update: bool = false,
     failure: ?server_mod.Error = null,
 
     fn deinit(r: *SrvRun, gpa: std.mem.Allocator) void {
@@ -1291,6 +1295,7 @@ fn driveServer(comptime S: type, src: *S, gpa: std.mem.Allocator, server: *serve
                     if (!run.handshake_done) return error.AppDataBeforeHandshake;
                     try run.app.appendSlice(gpa, d);
                     if (!run.answered and std.mem.endsWith(u8, run.app.items, "ping\n")) {
+                        if (run.key_update) try server.keyUpdate(.update_requested);
                         _ = try server.write("pong\n");
                         try server.close();
                         run.answered = true;
@@ -1396,12 +1401,15 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (v.client[s] == 23) break i;
     } else return error.NoFinishedInRecording;
 
-    var run: SrvRun = .{};
+    var run: SrvRun = .{ .key_update = v.key_update };
     defer run.deinit(gpa);
+    if (v.key_update) SrvMark.mark(.key_update_case);
     const mode = src.valueRangeAtMost(u8, 0, 11);
     const genuine_end = struct {
         fn f(r: *const SrvRun, want: []const u8) bool {
-            return r.failure == null and r.peer_closed and std.mem.eql(u8, r.out.items, want) and std.mem.eql(u8, r.app.items, "ping\n");
+            // s_client's KeyUpdate rides with "again\n" (tools/interop.zig).
+            const app_ok = std.mem.eql(u8, r.app.items, "ping\n") or (r.key_update and std.mem.eql(u8, r.app.items, "ping\nagain\n"));
+            return r.failure == null and r.peer_closed and std.mem.eql(u8, r.out.items, want) and app_ok;
         }
     }.f;
     switch (mode) {
@@ -1532,4 +1540,488 @@ test "fuzz driver: TLSSERVER_FUZZ (server)" {
 }
 test "fuzz harness: server, 400 seeds, reaches every outcome" {
     try SrvMark.reach(fuzzServer, "tlsserver-server", 400);
+}
+
+// ── tlsserver-keyupdate ──────────────────────────────────────────────────
+//
+// `Server` after a recorded handshake (an interop case fed through the
+// client's Finished), then a script of post-handshake steps against a model
+// client that follows every KeyUpdate: client KeyUpdates of either request,
+// whole or split across two records; client application data, empty
+// records too; server writes, an output left full, server-initiated
+// KeyUpdates, the send key at `max_records_per_key`, close_notify; and one
+// closing refusal — an invalid request octet, a wrong length, a KeyUpdate
+// sharing its record with the next message, more than `max_key_updates` in
+// a row, a record under the client's previous key.
+//
+// Invariants: everything the server sends opens under the model's keys, in
+// order; data arrives intact both ways; a KeyUpdate the client requested is
+// out before the server's next application data, and the number of server
+// KeyUpdates (and of those requesting one back) is exactly what the
+// requests, the `keyUpdate` calls and the key limit account for —
+// coalesced while one is still due, dropped after close_notify; a refusal
+// is the predicted error, its alert the last record (sealed under the key
+// in force), and the server takes nothing more.
+
+const tls13 = @import("tls13");
+const ks13 = tls13.keyschedule.tls13;
+const alert_mod = @import("alert.zig");
+
+const KuMark = Marker(enum {
+    sha384_suite,
+    ku_not_requested,
+    ku_requested_answered,
+    reply_deferred,
+    reply_coalesced,
+    own_update_requested,
+    own_update_not_requested,
+    limit_rekey,
+    split_message,
+    empty_app_record,
+    output_full,
+    after_close,
+    refused_illegal_parameter,
+    refused_decode_error,
+    refused_misaligned,
+    refused_too_many,
+    refused_stale_key,
+});
+
+fn nextSecret(suite: record.CipherSuite, secret: *[48]u8) []const u8 {
+    if (suite == .aes_256_gcm_sha384) {
+        ks13.nextApplicationTrafficSecret(std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384), secret, secret);
+        return secret;
+    }
+    ks13.nextApplicationTrafficSecret(std.crypto.kdf.hkdf.HkdfSha256, secret[0..32], secret[0..32]);
+    return secret[0..32];
+}
+
+const KuClient = struct {
+    server: *server_mod.Server,
+    suite: record.CipherSuite,
+    gpa: std.mem.Allocator,
+    in: []u8,
+    tx: record.Protection = undefined,
+    rx: record.Protection = undefined,
+    tx_secret: [48]u8 = @splat(0),
+    rx_secret: [48]u8 = @splat(0),
+    /// The client's previous send key (secret, next sequence number).
+    prev_secret: ?[48]u8 = null,
+    prev_seq: u64 = 0,
+    /// Octets of server output the model has opened.
+    out_total: usize = 0,
+    /// Output offsets from which a requested KeyUpdate is due, oldest first.
+    due: [64]usize = undefined,
+    n_due: usize = 0,
+    allowed: usize = 0,
+    allowed_requested: usize = 0,
+    seen: usize = 0,
+    seen_requested: usize = 0,
+    /// The server asked for a KeyUpdate: the client's next record is one.
+    owes: bool = false,
+    in_a_row: usize = 0,
+    closed: bool = false,
+    /// The server's close_notify has been opened: nothing may follow it.
+    closed_seen: bool = false,
+    /// Server → client: what `write` took, what opened.
+    want: std.ArrayList(u8) = .empty,
+    got: std.ArrayList(u8) = .empty,
+
+    fn deinit(c: *KuClient) void {
+        c.want.deinit(c.gpa);
+        c.got.deinit(c.gpa);
+        c.gpa.free(c.in);
+    }
+
+    /// A fatal alert's octets (close_notify is `closed_seen`).
+    const Opened = struct { alert: ?[2]u8 = null };
+
+    /// Open everything the server queued.
+    fn drain(c: *KuClient) !Opened {
+        var res: Opened = .{};
+        const p = c.server.pendingOutput();
+        const buf = try c.gpa.dupe(u8, p);
+        defer c.gpa.free(buf);
+        c.server.discardOutput(p.len);
+        var at: usize = 0;
+        while (at < buf.len) {
+            if (buf.len - at < 5) return error.PartialRecordOut;
+            const h = record.parseHeader(buf[at..][0..5]);
+            if (h.content_type != .application_data) return error.PlaintextAfterHandshake;
+            const start = c.out_total + at;
+            const o = c.rx.open(buf[at..][0 .. 5 + h.length]) catch return error.ServerRecordDoesNotOpen;
+            at += 5 + h.length;
+            if (res.alert != null or c.closed_seen) return error.RecordAfterAlert;
+            switch (o.content_type) {
+                .handshake => {
+                    if (o.content.len != 5 or !std.mem.eql(u8, o.content[0..4], &.{ 24, 0, 0, 1 })) return error.UnexpectedServerMessage;
+                    if (o.content[4] > 1) return error.BadServerRequest;
+                    c.seen += 1;
+                    if (o.content[4] == 1) {
+                        c.seen_requested += 1;
+                        c.owes = true;
+                    }
+                    if (c.seen > c.allowed or c.seen_requested > c.allowed_requested) return error.UnaskedKeyUpdate;
+                    if (c.n_due != 0) {
+                        std.mem.copyForwards(usize, c.due[0 .. c.n_due - 1], c.due[1..c.n_due]);
+                        c.n_due -= 1;
+                    }
+                    try c.rx.init(c.suite, nextSecret(c.suite, &c.rx_secret));
+                },
+                .application_data => {
+                    if (c.n_due != 0 and start >= c.due[0]) return error.DataBeforeRequestedKeyUpdate;
+                    try c.got.appendSlice(c.gpa, o.content);
+                },
+                .alert => {
+                    if (o.content.len != 2) return error.BadAlertOut;
+                    if (std.mem.eql(u8, o.content, &alert_mod.Alert.close_notify.encode())) {
+                        if (!c.closed) return error.UnaskedCloseNotify;
+                        c.closed_seen = true;
+                    } else res.alert = o.content[0..2].*;
+                },
+                else => return error.UnexpectedServerRecord,
+            }
+        }
+        c.out_total += buf.len;
+        if (!std.mem.startsWith(u8, c.want.items, c.got.items)) return error.ServerDataDiffers;
+        return res;
+    }
+
+    /// Feed `n` octets of `in` (whole records); the application data that
+    /// arrives goes to `app`.
+    fn feed(c: *KuClient, n: usize, app: *std.ArrayList(u8)) !?server_mod.Error {
+        var at: usize = 0;
+        while (true) {
+            const r = c.server.feed(c.in[at..n]) catch |err| {
+                const refused: ?server_mod.Error = err;
+                return refused;
+            };
+            at += r.consumed;
+            switch (r.event) {
+                .need_more => {
+                    if (at != n) return error.WholeRecordsLeftOver;
+                    return null;
+                },
+                .app_data => |d| try app.appendSlice(c.gpa, d),
+                .handshake_done, .peer_closed => return error.UnexpectedEvent,
+            }
+        }
+    }
+
+    /// Seal one record into `in` at `at`; returns the new end.
+    fn seal(c: *KuClient, at: usize, ct: record.ContentType, content: []const u8) usize {
+        @memcpy(c.in[at + 5 ..][0..content.len], content);
+        return at + (c.tx.seal(c.in[at..], content.len, ct, 0) catch unreachable).len;
+    }
+
+    fn rotateTx(c: *KuClient) void {
+        c.prev_secret = c.tx_secret;
+        c.prev_seq = c.tx.seq;
+        c.tx.init(c.suite, nextSecret(c.suite, &c.tx_secret)) catch unreachable;
+    }
+
+    /// The bookkeeping of a KeyUpdate request the server is about to see.
+    fn requestArrives(c: *KuClient) void {
+        if (c.closed) {
+            KuMark.mark(.after_close);
+            return;
+        }
+        // `feed` first sends a KeyUpdate still due, if it fits now; only one
+        // that stays queued answers this request too.
+        const ku_record = 5 + 4 + 1 + 1 + record.tag_len;
+        const fits = c.server.out.buf.len - c.server.out.len >= @import("outbound.zig").alert_reserve + ku_record;
+        if (c.server.tx_update != null and !fits) {
+            KuMark.mark(.reply_coalesced);
+            return;
+        }
+        c.allowed += 1;
+        c.due[c.n_due] = c.out_total + c.server.pendingOutput().len;
+        c.n_due += 1;
+    }
+
+    /// Settle what the client owes before its next record (true: done; false:
+    /// the owed KeyUpdate was the refused one).
+    fn payDebt(c: *KuClient) !bool {
+        if (!c.owes) return true;
+        c.owes = false;
+        return c.clientKeyUpdate(0, false);
+    }
+
+    /// One KeyUpdate from the client, whole or split over two records.
+    /// False: refused as predicted (too many).
+    fn clientKeyUpdate(c: *KuClient, request: u8, split: bool) !bool {
+        if (c.in_a_row == server_mod.max_key_updates) {
+            const end = c.seal(0, .handshake, &.{ 24, 0, 0, 1, request });
+            try c.expectRefusal(end, error.TooManyKeyUpdates);
+            KuMark.mark(.refused_too_many);
+            return false;
+        }
+        var app: std.ArrayList(u8) = .empty;
+        defer app.deinit(c.gpa);
+        const msg = [_]u8{ 24, 0, 0, 1, request };
+        const end = if (split) blk: {
+            const e1 = c.seal(0, .handshake, msg[0..2]);
+            break :blk c.seal(e1, .handshake, msg[2..]);
+        } else c.seal(0, .handshake, &msg);
+        if (request == 1) c.requestArrives();
+        c.in_a_row += 1;
+        if (try c.feed(end, &app)) |err| {
+            std.debug.print("client KeyUpdate({d}) refused: {t}\n", .{ request, err });
+            return error.KeyUpdateRefused;
+        }
+        if (app.items.len != 0) return error.DataFromNowhere;
+        if (request == 1 and !c.closed and c.server.tx_update != null) KuMark.mark(.reply_deferred);
+        c.rotateTx();
+        if (split) KuMark.mark(.split_message);
+        if (request == 1) KuMark.mark(.ku_requested_answered) else KuMark.mark(.ku_not_requested);
+        return true;
+    }
+
+    /// Feed the `n` octets of `in`; the server must fail with `want`, send
+    /// that error's alert last (sealed under the key in force) and refuse
+    /// everything after.
+    fn expectRefusal(c: *KuClient, n: usize, want: server_mod.Error) !void {
+        var app: std.ArrayList(u8) = .empty;
+        defer app.deinit(c.gpa);
+        const got = (try c.feed(n, &app)) orelse return error.RefusalAccepted;
+        if (got != want) {
+            std.debug.print("want {t}, got {t}\n", .{ want, got });
+            return error.WrongRefusal;
+        }
+        const o = try c.drain();
+        if (c.closed) {
+            if (o.alert != null) return error.AlertAfterClose;
+        } else {
+            const d = server_mod.alertFor(want).?;
+            const a = o.alert orelse return error.MissingAlert;
+            if (!std.mem.eql(u8, &a, &alert_mod.Alert.fatal(d).encode())) return error.WrongAlert;
+        }
+        var empty: [0]u8 = .{};
+        if (c.server.feed(&empty)) |_| return error.FeedAfterFailure else |e| if (e != error.Closed) return error.FeedAfterFailure;
+    }
+};
+
+fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const fk = try fuzzKeys_();
+    var v: interop.Case = undefined;
+    while (true) {
+        v = interop.cases[src.index(interop.cases.len)];
+        if (v.cert != .rsa2048) break;
+    }
+    const ck = &fk.cks[@backingInt(v.cert)];
+    var suites: [8]record.CipherSuite = undefined;
+    for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
+    var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    const cfg: server_mod.Config = .{
+        .certificate = .{ .fixed = ck },
+        .cipher_suites = suites[0..v.suites.len],
+        .groups = v.groups,
+        .alpn_protocols = v.alpn,
+        .random = csprng.random(),
+    };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const outb = try gpa.alloc(u8, server_mod.minOutputLen(ck) + 4096);
+    defer gpa.free(outb);
+    var server: server_mod.Server = .init(&cfg, joiner, outb);
+    defer server.deinit();
+
+    // The recording through the client's Finished.
+    var starts_buf: [64]usize = undefined;
+    const starts = recordStarts(v.client, &starts_buf);
+    const fin = for (starts, 0..) |s, i| {
+        if (v.client[s] == 23) break i;
+    } else return error.NoFinishedInRecording;
+    const fin_end = if (fin + 1 < starts.len) starts[fin + 1] else v.client.len;
+    var c: KuClient = .{ .server = &server, .suite = undefined, .gpa = gpa, .in = try gpa.alloc(u8, 4 * record.max_record_len) };
+    defer c.deinit();
+    {
+        @memcpy(c.in[0..fin_end], v.client[0..fin_end]);
+        var at: usize = 0;
+        while (true) {
+            const r = try server.feed(c.in[at..fin_end]);
+            at += r.consumed;
+            if (r.event == .handshake_done) break;
+            if (r.event != .need_more or at == fin_end) return error.HandshakeDidNotComplete;
+        }
+        if (at != fin_end) return error.HandshakeLeftOctets;
+    }
+    c.suite = server.cipherSuite().?;
+    if (c.suite == .aes_256_gcm_sha384) KuMark.mark(.sha384_suite);
+    const L = c.suite.hashLen().?;
+    @memcpy(c.tx_secret[0..L], server.client_application_secret[0..L]);
+    @memcpy(c.rx_secret[0..L], server.server_application_secret[0..L]);
+    try c.tx.init(c.suite, c.tx_secret[0..L]);
+    try c.rx.init(c.suite, c.rx_secret[0..L]);
+    // The first flight went out under the handshake keys.
+    server.discardOutput(server.pendingOutput().len);
+
+    const steps = src.valueRangeAtMost(u8, 1, 24);
+    var data: [256]u8 = undefined;
+    for (0..steps) |_| {
+        switch (src.valueRangeAtMost(u8, 0, 13)) {
+            0, 1 => if (!try c.payDebt() or !try c.clientKeyUpdate(0, false)) return,
+            2, 3 => if (!try c.payDebt() or !try c.clientKeyUpdate(1, false)) return,
+            4 => if (!try c.payDebt() or !try c.clientKeyUpdate(src.valueRangeAtMost(u8, 0, 1), true)) return,
+            5 => {
+                if (!try c.payDebt()) return;
+                const n = src.valueRangeAtMost(u16, 0, 64);
+                src.bytes(data[0..n]);
+                const end = c.seal(0, .application_data, data[0..n]);
+                var app: std.ArrayList(u8) = .empty;
+                defer app.deinit(gpa);
+                if (try c.feed(end, &app)) |err| {
+                    std.debug.print("client data refused: {t}\n", .{err});
+                    return error.DataRefused;
+                }
+                if (!std.mem.eql(u8, app.items, data[0..n])) return error.ClientDataDiffers;
+                if (n == 0) KuMark.mark(.empty_app_record);
+                c.in_a_row = 0;
+            },
+            6, 7 => {
+                const n = src.valueRangeAtMost(u16, 1, 200);
+                src.bytes(data[0..n]);
+                if (server.out.tx.seq >= server_mod.max_records_per_key and server.tx_update == null and !c.closed) {
+                    c.allowed += 1;
+                    c.allowed_requested += 1;
+                    KuMark.mark(.limit_rekey);
+                }
+                if (server.write(data[0..n])) |k| {
+                    if (c.closed) return error.WriteAfterClose;
+                    try c.want.appendSlice(gpa, data[0..k]);
+                } else |err| switch (err) {
+                    error.OutputFull => KuMark.mark(.output_full),
+                    error.Closed => if (!c.closed) return error.UnexpectedClosed,
+                    else => return err,
+                }
+            },
+            8 => {
+                const req: server_mod.KeyUpdateRequest = if (src.value(bool)) .update_requested else .update_not_requested;
+                const before = server.tx_update;
+                if (server.keyUpdate(req)) {
+                    if (c.closed) return error.KeyUpdateAfterClose;
+                    if (before == null) {
+                        c.allowed += 1;
+                        if (req == .update_requested) c.allowed_requested += 1;
+                    } else if (before.? == .update_not_requested and req == .update_requested) {
+                        // The queued one becomes a request.
+                        c.allowed_requested += 1;
+                    }
+                    if (req == .update_requested) KuMark.mark(.own_update_requested) else KuMark.mark(.own_update_not_requested);
+                } else |err| if (err != error.Closed or !c.closed) return err;
+            },
+            9 => _ = try c.drain(),
+            10 => {
+                // Leave the output full.
+                for (0..400) |_| {
+                    if (c.closed) break;
+                    if (server.out.tx.seq >= server_mod.max_records_per_key and server.tx_update == null) {
+                        c.allowed += 1;
+                        c.allowed_requested += 1;
+                        KuMark.mark(.limit_rekey);
+                    }
+                    const filler: [200]u8 = @splat('f');
+                    const k = server.write(&filler) catch |err| switch (err) {
+                        error.OutputFull => break,
+                        else => return err,
+                    };
+                    try c.want.appendSlice(gpa, filler[0..k]);
+                }
+                KuMark.mark(.output_full);
+            },
+            11 => {
+                // The send key just short of its limit (model in step).
+                if ((try c.drain()).alert != null) return error.UnexpectedAlert;
+                const k = src.valueRangeAtMost(u8, 0, 2);
+                server.out.tx.seq = server_mod.max_records_per_key - k;
+                c.rx.seq = server.out.tx.seq;
+            },
+            12 => if (!c.closed) {
+                // An undelivered KeyUpdate is dropped with close_notify.
+                if (server.tx_update != null) {
+                    c.allowed -= 1;
+                    if (server.tx_update.? == .update_requested) c.allowed_requested -= 1;
+                }
+                try server.close();
+                c.closed = true;
+                c.n_due = 0;
+            },
+            else => {
+                if (!try c.payDebt()) return;
+                switch (src.valueRangeAtMost(u8, 0, 4)) {
+                    0 => {
+                        const r = src.valueRangeAtMost(u8, 2, 255);
+                        const end = c.seal(0, .handshake, &.{ 24, 0, 0, 1, r });
+                        if (c.in_a_row == server_mod.max_key_updates) {
+                            try c.expectRefusal(end, error.TooManyKeyUpdates);
+                            KuMark.mark(.refused_too_many);
+                        } else {
+                            try c.expectRefusal(end, error.IllegalParameter);
+                            KuMark.mark(.refused_illegal_parameter);
+                        }
+                    },
+                    1 => {
+                        const end = if (src.value(bool)) c.seal(0, .handshake, &.{ 24, 0, 0, 0 }) else c.seal(0, .handshake, &.{ 24, 0, 0, 2, 0, 0 });
+                        try c.expectRefusal(end, error.DecodeError);
+                        KuMark.mark(.refused_decode_error);
+                    },
+                    2 => {
+                        // The next message starts in the KeyUpdate's record.
+                        const tail = src.valueRangeAtMost(u8, 1, 5);
+                        const msg = [_]u8{ 24, 0, 0, 1, 0, 24, 0, 0, 1, 0 };
+                        const end = c.seal(0, .handshake, msg[0 .. 5 + tail]);
+                        if (c.in_a_row == server_mod.max_key_updates) {
+                            try c.expectRefusal(end, error.TooManyKeyUpdates);
+                            KuMark.mark(.refused_too_many);
+                        } else {
+                            try c.expectRefusal(end, error.UnexpectedMessage);
+                            KuMark.mark(.refused_misaligned);
+                        }
+                    },
+                    3 => {
+                        while (try c.clientKeyUpdate(0, false)) {}
+                    },
+                    else => {
+                        const prev = c.prev_secret orelse return;
+                        var old: record.Protection = undefined;
+                        var ps = prev;
+                        try old.init(c.suite, ps[0..L]);
+                        old.seq = c.prev_seq;
+                        @memcpy(c.in[5..][0..3], "old");
+                        const end = (try old.seal(c.in, 3, .application_data, 0)).len;
+                        try c.expectRefusal(end, error.BadRecordMac);
+                        KuMark.mark(.refused_stale_key);
+                    },
+                }
+                return;
+            },
+        }
+    }
+    // Everything settles: the output drained, a due KeyUpdate goes out.
+    _ = try c.drain();
+    var empty: [0]u8 = .{};
+    _ = try server.feed(&empty);
+    _ = try c.drain();
+    if (c.n_due != 0) return error.RequestedKeyUpdateNeverSent;
+    if (c.seen != c.allowed or c.seen_requested != c.allowed_requested) {
+        std.debug.print("KeyUpdates seen {d} ({d} requesting), allowed {d} ({d})\n", .{ c.seen, c.seen_requested, c.allowed, c.allowed_requested });
+        return error.KeyUpdateCountDiffers;
+    }
+    if (!std.mem.eql(u8, c.want.items, c.got.items)) return error.ServerDataDiffers;
+}
+
+fn fuzzKeyUpdateSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [4096]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzKeyUpdate(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver KeyUpdate, scripted against a model client" {
+    try testing.fuzz({}, fuzzKeyUpdateSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (keyupdate)" {
+    try fuzz_driver.run(fuzzKeyUpdate, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-keyupdate" });
+}
+test "fuzz harness: keyupdate, 400 seeds, reaches every outcome" {
+    try KuMark.reach(fuzzKeyUpdate, "tlsserver-keyupdate", 400);
 }

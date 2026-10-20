@@ -343,3 +343,73 @@ test "tlsclient ↔ Server: HelloRetryRequest for a group the client has no shar
         }
     }
 }
+
+test "tlsclient ↔ Server: KeyUpdate both ways, every suite" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const gpa = testing.allocator;
+    for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        errdefer std.debug.print("suite {t}\n", .{suite});
+        var prng = std.Random.DefaultPrng.init(0x7e57);
+        const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .cipher_suites = &.{suite}, .random = prng.random() };
+        const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        defer gpa.free(joiner);
+        const out = try gpa.alloc(u8, server_mod.minOutputLen(&ck) + 64 * 1024);
+        defer gpa.free(out);
+        var server: Server = .init(&config, joiner, out);
+        defer server.deinit();
+        const pipe = try gpa.create(Pipe);
+        defer gpa.destroy(pipe);
+        pipe.init(&server, gpa);
+        defer pipe.deinit();
+
+        var entropy: [Client.Options.entropy_len]u8 = undefined;
+        prng.random().bytes(&entropy);
+        var read_buf: [Client.min_buffer_len]u8 = undefined;
+        var write_buf: [Client.min_buffer_len]u8 = undefined;
+        var client = try ZlClient.init(&pipe.reader, &pipe.client_out, .{
+            .host = .{ .explicit = "localhost" },
+            .ca = .self_signed,
+            .read_buffer = &read_buf,
+            .write_buffer = &write_buf,
+            .entropy = &entropy,
+            .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+            .min_version = .tls_1_3,
+        });
+        try client.writer.writeAll("hi");
+        try client.writer.flush();
+        try pipe.pump();
+        try testing.expect(pipe.handshake_done);
+
+        var got: [16]u8 = undefined;
+        for (0..3) |i| {
+            // The server asks; the client answers before its next record.
+            try server.keyUpdate(.update_requested);
+            var msg: [8]u8 = undefined;
+            const m = try std.fmt.bufPrint(&msg, "srv{d}", .{i});
+            _ = try server.write(m);
+            try client.reader.readSliceAll(got[0..m.len]);
+            try testing.expectEqualStrings(m, got[0..m.len]);
+            try testing.expect(client.key_update_pending);
+            const c = try std.fmt.bufPrint(&msg, "cli{d}", .{i});
+            try client.writer.writeAll(c);
+            try client.writer.flush();
+            try testing.expect(!client.key_update_pending);
+            pipe.received.clearRetainingCapacity();
+            try pipe.pump();
+            if (pipe.failure) |f| return f;
+            try testing.expectEqualStrings(c, pipe.received.items);
+        }
+        // The client turns its key over unasked: nothing comes back.
+        client.key_update_pending = true;
+        try client.writer.writeAll("last");
+        try client.writer.flush();
+        pipe.received.clearRetainingCapacity();
+        try pipe.pump();
+        if (pipe.failure) |f| return f;
+        try testing.expectEqualStrings("last", pipe.received.items);
+        try testing.expectEqual(@as(?server_mod.KeyUpdateRequest, null), server.tx_update);
+        try testing.expectEqual(@as(usize, 0), server.pendingOutput().len);
+    }
+}

@@ -32,9 +32,10 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
-BoringSSL's BoGo suite passes 140 tests with none failing (`tools/bogo/passing.txt`; everything
-else is unimplemented or disabled with a reason). HelloRetryRequest works (M2 step 1);
-resumption, client certificates and KeyUpdate are still to come (milestone M2, *Backlog*).
+BoringSSL's BoGo suite passes 142 tests with none failing (`tools/bogo/passing.txt`; everything
+else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1) and KeyUpdate
+both ways (step 2) work; resumption and client certificates are still to come (milestone M2,
+*Backlog*).
 
 ## What this module is, and what it is not
 
@@ -53,10 +54,12 @@ suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI
 crypto/tls client (the same, Go's own defaults), with `tlsclient` and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
 certificate chain and private key from PEM. A client that sent no share for the chosen group
-gets a HelloRetryRequest. It is not yet a server to deploy: no
-resumption, no client certificates, no KeyUpdate — a client's KeyUpdate is answered with
-`unexpected_message`, and after `max_records_per_key` (2^23) records the server closes instead
-of rekeying.
+gets a HelloRetryRequest. After the handshake KeyUpdate works both ways: a client's turns the
+receive key over (and `update_requested` is answered once), the server rekeys on its own at
+`max_records_per_key` (2^23 records, asking the client to rekey too) or when the application
+calls `keyUpdate`; at most `max_key_updates` (32) KeyUpdates may come between two
+application-data records (rustls, BoringSSL). It is not yet a server to deploy: no resumption,
+no client certificates.
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
 early data, kTLS, ECH and post-handshake client authentication (*What is deliberately not
@@ -264,7 +267,9 @@ The receive side's refusals are the table under *Wire format*. Record protection
 - An inner plaintext that is all zeros: `MissingContentType` (§5.4, `unexpected_message`).
 - Sequence number 2^64 − 1: both directions refuse (`SequenceExhausted`); the engine must
   KeyUpdate first (§5.3). When to KeyUpdate earlier, at the AEAD's usage limit (§5.5), is the
-  engine's policy.
+  engine's policy: `Server` rekeys at `max_records_per_key` (2^23), qap's bound.
+- The send side keeps `alert_reserve` (24 octets) of the output buffer for one alert, so a fatal
+  alert or close_notify can be queued however full the application left it.
 
 ## Anchoring
 
@@ -282,7 +287,9 @@ The receive side's refusals are the table under *Wire format*. Record protection
   secp384r1, a P-384 certificate (`ecdsa_secp384r1_sha384`) over secp384r1, an Ed25519 and
   an RSA-PSS certificate, ALPN `h2` chosen from `http/1.1,h2`, no SNI, and two
   HelloRetryRequests (s_client's lone X25519 share against a server with only secp256r1 under
-  SHA-384, only secp384r1 under TLS_AES_128_GCM_SHA256) — each verified by
+  SHA-384, only secp384r1 under TLS_AES_128_GCM_SHA256), and two KeyUpdates (the server asks
+  with `update_requested` before "pong", under SHA-384 and ChaCha20; s_client answers only
+  with its next application data, so the tool hands it "again") — each verified by
   s_client against the test certificate and `localhost`, with ping/pong and close_notify.
   `--capture` records every octet both ways into `src/interop_vectors.zig`;
   `src/interop_replay_test.zig` drives a server with the same seed through `Connection` over
@@ -348,8 +355,10 @@ The receive side's refusals are the table under *Wire format*. Record protection
   full: it spawns only the shim, listens on loopback only, writes only its temp test keys
   (under `.zig-cache`). `tools/bogo/MANIFEST` pins every source file's git blob hash and `--bogo`
   refuses a tree that differs; Go modules come from `go.sum` (`GOFLAGS=-mod=readonly`).
-  Result 2026-10-20 (M1): **130 pass, 0 fail**; with HelloRetryRequest (M2 step 1) **140 pass,
-  0 fail** — the eight HRR globs re-enabled, one rustls-parity divergence disabled
+  Result 2026-10-20 (M1): **130 pass, 0 fail**; with KeyUpdate (M2 step 2) **142 pass, 0 fail**
+  (`KeyUpdate-ToServer`, and `KeyUpdate-FromServer` with the shim's new `-key-update`; the
+  other KeyUpdate tests are client, DTLS or BoringSSL-specific); with HelloRetryRequest (M2
+  step 1) **140 pass, 0 fail** — the eight HRR globs re-enabled, one rustls-parity divergence disabled
   (`SkipEarlyData-SecondClientHelloEarlyData`: early_data in the second ClientHello is
   `illegal_parameter` here and in rustls, `bad_record_mac` in BoringSSL; rustls maps it with a
   `TestLocalErrorMap` runner 784fcafc lacks). M1 run: 6,047 exit 89 (unimplemented: client tests, DTLS,
@@ -424,7 +433,7 @@ different key loaded), the Ed25519 seed length check removed (survived the first
 which never shortened a nested octet string consistently — the model mode added), the scalar
 length bound removed, the long-form length bound removed.
 
-Harness `tlsserver-server`: `Server` as a whole, fed the twenty recorded OpenSSL and Go client
+Harness `tlsserver-server`: `Server` as a whole, fed the recorded OpenSSL and Go client
 streams (`interop_vectors.zig`) with the recorded seed, so its output is a function of its
 input. The genuine stream cut into random chunks, or fed one octet at a time, ends exactly as
 recorded; truncated, it never errs and its output is a prefix of the recording; a flipped bit
@@ -445,6 +454,28 @@ caught: the client's Finished check removed (survived the first harness — ever
 ClientHello changes the client's keys, so damage never got past the AEAD to the Finished
 check; the resealing white-box mode added), the failed state not kept, one octet more awaited
 than a record needs, any change_cipher_spec body accepted, the alert after the flight left out.
+The KeyUpdate recordings (2026-10-20) are driven with the same KeyUpdate before "pong" (and
+s_client's "again"); 4 × 12,000 runs clean.
+
+Harness `tlsserver-keyupdate`: `Server` after a recorded handshake (fed through the client's
+Finished), then up to 24 scripted post-handshake steps against a model client that follows
+every key: client KeyUpdates of either request, whole or split over two records; client
+application data, empty records included; server writes, an output left full,
+`Server.keyUpdate` either way, the send key set just short of `max_records_per_key` (white
+box), close_notify; and one closing refusal — an invalid request octet, a wrong length, a
+KeyUpdate sharing its record with the next message, more than `max_key_updates` in a row, a
+record under the client's previous key. Invariants: every server record opens under the
+model's keys, in order; data arrives intact both ways; a requested KeyUpdate is out before the
+server's next application data; the number of server KeyUpdates, and of those requesting one
+back, is exactly what the requests, the `keyUpdate` calls and the key limit account for
+(coalesced while one stays queued, dropped after close_notify); a refusal is the predicted
+error, its alert the last record, sealed under the key in force; nothing is accepted after.
+`fuzz harness: keyupdate, 400 seeds, reaches every outcome` runs in every test lane. Verdict
+2026-10-20: 4 × 12,000 runs, ReleaseSafe, clean (~750 runs/s per job). Seven planted mutants
+caught, each within seconds: the reply sealed under the new key, the KeyUpdate count not reset
+by application data, `update_requested` never answered, no rekey at the limit, no alert
+reserve (the harness's first run found that defect for real: a full output dropped the fatal
+alert), an invalid request octet taken as `update_not_requested`, a deferred reply dropped.
 
 Independent read-only review of `keys` (Sonnet, 2026-10-20): no HIGH. MEDIUM fixed — an EC
 scalar ≥ the order loaded and failed only at the first signature (std's `fromBytes` does not
@@ -473,26 +504,31 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 - **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
   Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
-- **BoGo next:** the KeyUpdate-disabled tests come back with M2; the rustls parity
+- **BoGo next:** the rustls parity
   gate (our pass set ⊇ rustls's for TLS 1.3 server tests) needs rustls's `bogo/config.json`
   at a pinned tag next to ours.
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).
-- **M2:** KeyUpdate both ways (until then a client's KeyUpdate kills the connection and the
-  server stops at `max_records_per_key`, independent review 2026-10-20, MEDIUM).
-- **M2:** ~~HRR~~ (step 1, 2026-10-20), KeyUpdate, NewSessionTicket and resumption through `tlsresume`, mTLS through
+- **M2:** ~~HRR~~ (step 1, 2026-10-20), ~~KeyUpdate~~ (step 2, 2026-10-20), NewSessionTicket and resumption through `tlsresume`, mTLS through
   `x509.verifyChain`, OCSP stapling. **M3:** qap's seams and performance (`p256`, `ct25519`).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 
 ## Open
+
+- KeyUpdate review 2026-10-20 (Sonnet, read-only): no HIGH or MEDIUM; four LOWs fixed the same
+  day (see CHANGELOG). Accepted as rustls does: an empty application-data record resets the
+  KeyUpdate count, so a peer may alternate 32 KeyUpdates and an empty record (one HKDF and two
+  key setups per 27 octets it sends; replies stay bounded, one at a time). The KeyUpdate path
+  holds only pointers in its own frames (HKDF and record setup burn their own) and is not yet
+  in the stack probe.
 
 - `burn.handshake_burn` (16 KiB around each handshake step) is a margin, not a measured depth:
   the stack probe does not drive the server yet.
 - `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);
   a model client that builds ClientHellos from fields (as `tlsserver-hello` does) is not there.
 - Independent read-only review 2026-10-20 (Sonnet, of server/inbound/outbound): no HIGH; the
-  MEDIUM (KeyUpdate / AEAD limit) is M2 with the stop-gap above; LOWs fixed the same day
+  MEDIUM (KeyUpdate / AEAD limit) closed by M2 step 2; LOWs fixed the same day
   (`cipherSuite` before a suite was chosen, secrets kept after a failure, two compatibility CCS
   with one ClientHello, every kex error as `illegal_parameter`, an unknown enabled suite) or
   accepted: the 0-RTT skip budget of 2^14 octets cannot skip a full-size early record (rustls has

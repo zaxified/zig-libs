@@ -62,6 +62,12 @@ const Case = struct {
     /// `-brief` (a summary on stderr); without it the full session report
     /// goes to stdout — the only place s_client names the ALPN protocol.
     brief: bool = true,
+    /// The server answers "ping\n" with a KeyUpdate asking for one back,
+    /// then "pong\n", and sends close_notify once the client's KeyUpdate
+    /// arrived. Go answers at once; s_client only before its next
+    /// application data (not before close_notify), so it is handed
+    /// "again\n" to send.
+    key_update: bool = false,
 };
 
 const cases = [_]Case{
@@ -76,6 +82,8 @@ const cases = [_]Case{
     .{ .name = "alpn-h2", .why = "ALPN: the server's choice among the client's offers", .seed = 7, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .brief = false, .expect = &.{"ALPN protocol: h2"} },
     .{ .name = "no-sni", .why = "a client that sends no server_name", .seed = 8, .args = &.{"-noservername"}, .expect = &.{"Verification: OK"} },
     .{ .name = "hrr-p256", .why = "HelloRetryRequest: s_client's lone X25519 share, a server with only secp256r1 (SHA-384 transcript)", .seed = 11, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-groups", "X25519:P-256" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Peer Temp Key: ECDH, prime256v1", "Verification: OK" } },
+    .{ .name = "keyupdate", .why = "KeyUpdate: the server asks (update_requested), s_client answers; SHA-384 suite", .seed = 13, .key_update = true, .expect = &.{"Ciphersuite: TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "keyupdate-chacha", .why = "KeyUpdate under TLS_CHACHA20_POLY1305_SHA256", .seed = 14, .key_update = true, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256" }, .expect = &.{"Ciphersuite: TLS_CHACHA20_POLY1305_SHA256"} },
     .{ .name = "hrr-p384-aes128", .why = "HelloRetryRequest for secp384r1 under TLS_AES_128_GCM_SHA256", .seed = 12, .groups = &.{tlsserver.server.default_groups[3]}, .args = &.{ "-ciphersuites", "TLS_AES_128_GCM_SHA256", "-groups", "X25519:P-384" }, .expect = &.{ "Ciphersuite: TLS_AES_128_GCM_SHA256", "Peer Temp Key: ECDH, secp384r1" } },
     // Go: its suite order (AES-128 first on AES hardware) is not
     // configurable in TLS 1.3, so the server's list picks the suite.
@@ -90,6 +98,7 @@ const cases = [_]Case{
     .{ .name = "go-no-sni", .client = .go, .why = "Go without server_name (verified by hand)", .seed = 29, .args = &.{"-nosni"}, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-no-hybrid", .client = .go, .why = "a server without X25519MLKEM768: Go's X25519 share, no retry", .seed = 30, .groups = &.{ tlsserver.server.default_groups[1], tlsserver.server.default_groups[2] }, .expect = &.{"group: X25519\n"} },
     .{ .name = "go-hrr-p256", .client = .go, .why = "HelloRetryRequest: Go's X25519MLKEM768 + X25519 shares, a server with only secp256r1", .seed = 31, .groups = &.{tlsserver.server.default_groups[2]}, .expect = &.{ "group: CurveP256", "hrr: true" } },
+    .{ .name = "go-keyupdate", .client = .go, .why = "KeyUpdate: the server asks (update_requested), Go answers", .seed = 33, .key_update = true, .expect = &.{"suite: TLS_AES_128_GCM_SHA256"} },
     .{ .name = "go-hrr-p384-aes256", .client = .go, .why = "HelloRetryRequest for secp384r1 under TLS_AES_256_GCM_SHA384", .seed = 32, .suites = &.{.aes_256_gcm_sha384}, .groups = &.{tlsserver.server.default_groups[3]}, .expect = &.{ "group: CurveP384", "suite: TLS_AES_256_GCM_SHA384", "hrr: true" } },
 };
 
@@ -145,8 +154,10 @@ const Recorded = struct {
 
 /// Serve one connection by hand, recording every octet both ways. The
 /// application protocol: receive "ping\n", answer "pong\n", close_notify,
-/// then read until the client closes.
-fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server, rec: *Recorded) !void {
+/// then read until the client closes. With `key_update` a KeyUpdate asking
+/// for one back goes before "pong\n", `poke` (s_client's stdin, if any)
+/// gets "again\n", and close_notify waits for the client's KeyUpdate.
+fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server, rec: *Recorded, key_update: bool, poke: ?*std.Io.Writer) !void {
     var rbuf: [8192]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     var wbuf: [8192]u8 = undefined;
@@ -156,6 +167,8 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server
     var app: std.ArrayList(u8) = .empty;
     defer app.deinit(gpa);
     var answered = false;
+    // The client's send key when the server asked: a KeyUpdate changes it.
+    var asked_secret: [48]u8 = undefined;
     while (true) {
         const r = server.feed(in[0..have]) catch |err| {
             try flushOut(server, &sw.interface, rec, gpa);
@@ -167,13 +180,24 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server
             .app_data => |d| {
                 try app.appendSlice(gpa, d);
                 if (!answered and std.mem.endsWith(u8, app.items, "ping\n")) {
+                    if (key_update) {
+                        asked_secret = server.client_application_secret;
+                        try server.keyUpdate(.update_requested);
+                    }
                     _ = try server.write("pong\n");
-                    try server.close();
+                    if (!key_update) try server.close();
                     answered = true;
+                    if (poke) |w| {
+                        try flushOut(server, &sw.interface, rec, gpa);
+                        try w.writeAll("again\n");
+                        try w.flush();
+                    }
                 }
             },
             .peer_closed => {},
         }
+        if (key_update and answered and !server.write_closed and
+            !std.mem.eql(u8, &asked_secret, &server.client_application_secret)) try server.close();
         std.mem.copyForwards(u8, in[0 .. have - r.consumed], in[r.consumed..have]);
         have -= r.consumed;
         try flushOut(server, &sw.interface, rec, gpa);
@@ -238,12 +262,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     });
     var waited = false;
     defer if (!waited) child.kill(io);
-    {
-        var b: [16]u8 = undefined;
-        var w = child.stdin.?.writer(io, &b);
-        try w.interface.writeAll("ping\n");
-        try w.interface.flush();
-    }
+    var stdin_buf: [16]u8 = undefined;
+    var stdin_w = child.stdin.?.writer(io, &stdin_buf);
+    try stdin_w.interface.writeAll("ping\n");
+    try stdin_w.interface.flush();
 
     const stream = try listener.accept(io);
     defer stream.close(io);
@@ -266,7 +288,8 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     var server: Server = .init(&cfg, joiner, out);
     defer server.deinit();
 
-    const served = serve(gpa, io, stream, &server, rec);
+    const poke: ?*std.Io.Writer = if (c.key_update and c.client == .openssl) &stdin_w.interface else null;
+    const served = serve(gpa, io, stream, &server, rec, c.key_update, poke);
     child.stdin.?.close(io);
     child.stdin = null;
 
@@ -302,6 +325,8 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         return error.ExpectationMissing;
     };
     if (no_sni and server.serverName() != null) return error.SniFromNowhere;
+    // serve's close_notify waited for the client's KeyUpdate.
+    if (c.key_update and !server.write_closed) return error.NoClientKeyUpdate;
 }
 
 fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []const struct { Case, Recorded }) !void {
@@ -326,6 +351,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    suites: []const u16,
         \\    groups: []const u16,
         \\    alpn: []const []const u8,
+        \\    /// The server sent KeyUpdate(update_requested) before "pong\n".
+        \\    key_update: bool = false,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -343,6 +370,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         try w.print("{s}}},\n        .alpn = &.{{", .{listEnd(c.groups.len)});
         for (c.alpn, 0..) |a, i| try w.print("{s}\"{s}\"", .{ listSep(i, c.alpn.len), a });
         try w.print("{s}}},\n", .{listEnd(c.alpn.len)});
+        if (c.key_update) try w.writeAll("        .key_update = true,\n");
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");

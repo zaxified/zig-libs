@@ -66,6 +66,8 @@ modules/tlock/src/age.zig	1	10
 modules/tlsclient/src/Client.zig	2	6
 modules/tlsresume/src/cache.zig	1	0
 modules/tlsresume/src/psk.zig	1	0
+# tlsserver 2026-10-20: the client's Finished verify_data is compared with timing_safe.eql; the 4 plain compares are ALPN names, the SNI of a retried ClientHello, and two in tests (an SNI, the HelloRetryRequest random) -- all public.
+modules/tlsserver/src/server.zig	1	4
 modules/voprf/src/root.zig	5	1
 modules/webhooksig/src/root.zig	2	4
 modules/wireguard/src/handshake.zig	4	11

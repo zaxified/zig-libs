@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — KeyUpdate both ways (M2 step 2). **BEHAVIOURAL:** a client's KeyUpdate turns
+  the receive key over (was `unexpected_message`); `update_requested` is answered with one
+  KeyUpdate of the server's, before its next record (one, however many requests come before it
+  goes out — rustls); more than `max_key_updates` (32) KeyUpdates between two application-data
+  records is `unexpected_message` (`TooManyKeyUpdates`), an invalid request octet
+  `illegal_parameter`, a KeyUpdate not ending its record `unexpected_message`. At
+  `max_records_per_key` the server rekeys with `update_requested` instead of closing
+  (`KeyLimitReached` is gone). New `Server.keyUpdate` / `Connection.keyUpdate`. The output
+  buffer now always keeps room for one alert (`outbound.alert_reserve`, 24 octets): a fatal
+  alert or close_notify used to be dropped silently when the application had filled the output
+  (found by the new fuzz harness). Interop: three sessions where the server asks for a KeyUpdate
+  (two OpenSSL, one Go; captured, replayed), `tlsclient` both ways under every suite; BoGo 142
+  pass / 0 fail (`KeyUpdate-ToServer`, `KeyUpdate-FromServer` back); new fuzz harness
+  `tlsserver-keyupdate` (a model client following every key; 48,000 runs clean, seven planted
+  mutants caught). Independent review: no HIGH or MEDIUM; LOWs fixed — `Connection.keyUpdate`
+  reports `OutputFull` instead of leaving a KeyUpdate due behind a too-small buffer,
+  `keyUpdate(.update_requested)` upgrades a queued unrequested one, `minOutputLen` counts the
+  alert reserve, `close` wipes the dead send secret.
 - **2026-10-20** — HelloRetryRequest (M2 step 1). **BEHAVIOURAL:** a client without a share for
   the chosen group gets a HelloRetryRequest naming it (was `handshake_failure`); the second
   ClientHello must keep the HelloRetryRequest's suite and group (stricter than rustls, which

@@ -4,7 +4,8 @@
 //! `tools/interop.zig --capture` recorded (`interop_vectors.zig`): a server with the recorded
 //! configuration and seed is driven through `Connection` over a reader
 //! holding exactly the octets OpenSSL sent, runs the same application
-//! protocol (receive "ping\n", answer "pong\n", close_notify, read to the
+//! protocol (receive "ping\n", answer "pong\n" — after a KeyUpdate asking
+//! for one back, in the `key_update` cases — close_notify, read to the
 //! client's close_notify), and must write exactly the octets OpenSSL
 //! accepted. A change to anything the server puts on the wire — or to what
 //! it accepts — fails here, in every test lane, with neither OpenSSL nor Go
@@ -80,9 +81,20 @@ fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
         const d = (try c.read()) orelse return error.ClosedBeforePing;
         try got.appendSlice(gpa, d);
     }
+    // The client's KeyUpdate (no reply due; s_client's comes with
+    // "again\n") arrived before the server's close_notify in the
+    // recording; reading it after makes the same octets out.
+    const asked = c.server.client_application_secret;
+    if (v.key_update) try c.keyUpdate(.update_requested);
     try c.writeAll("pong\n");
     try c.close();
-    try testing.expectEqual(@as(?[]u8, null), try c.read());
+    var after: std.ArrayList(u8) = .empty;
+    defer after.deinit(gpa);
+    while (try c.read()) |d| try after.appendSlice(gpa, d);
+    if (v.key_update) {
+        try testing.expect(!std.mem.eql(u8, &asked, &c.server.client_application_secret));
+        if (after.items.len != 0) try testing.expectEqualStrings("again\n", after.items);
+    } else try testing.expectEqual(@as(usize, 0), after.items.len);
     try testing.expectEqualStrings("ping\n", got.items);
     testing.expectEqualSlices(u8, v.server, written.written()) catch |err| {
         std.debug.print("case {s}: the server's octets differ from the recording\n", .{v.name});
