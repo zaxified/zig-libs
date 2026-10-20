@@ -230,8 +230,8 @@ the client, the hybrid client-share length check removed (a panic).
   (std `P384`, KAT against `cryptography`/OpenSSL) so a P-384-only client is not regressed.
 - **`kex` through the collection's primitives** (`ct25519` for X25519, `p256`): qap measured
   X25519 at ~28 % of handshake CPU; `tlsserver` M3.
-- **Next pieces for `tlsserver` (M0/M2):** certificate-authentication helpers
-  (`dtls/certauth.zig`).
+- **Certificate-authentication helpers** (`dtls/certauth.zig`): deferred to `tlsserver` M2
+  (client auth), where the one-hop `verifyLeafAgainstAnchor` gives way to `x509.verifyChain`.
 - **Own ctgrind row** for the key schedule (today covered only inside `dtls hs`).
 - **Survey** for the Scope line (rustls `tls13::key_schedule`, Go `crypto/tls` key_schedule.go).
 
