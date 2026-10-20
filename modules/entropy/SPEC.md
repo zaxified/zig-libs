@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time
 
-**Performance:** ref 0.98–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-10)
+**Performance:** ref 0.92–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-20)
 
 **Evidence:** model — vDSO symbol lookup against an independent section-table model on every exported symbol; output invariants (byte chi-square, per-position coverage) on every route; route pinned by `CountingIo`
 
@@ -242,6 +242,8 @@ extreme statement of the degrade, and if either half of that contract changes,
 the test says so.
 
 ## What a draw costs, and why the adapter is not where to fix it
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-entropy`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions): ref 0.92–1.01× Go crypto/rand.Read, against 0.98–1.01× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
 
 `SecureSource` makes one `getrandom(2)` syscall per `std.Random` draw, including
 the four bytes `std.Random.int(u32)` takes. That is the design — every byte came

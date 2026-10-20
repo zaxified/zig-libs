@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-11 (200,000-run budget per harness clean, X509_FUZZ, incl. `x509-names` and `x509-policy`) · ct n/a — public certificate verification (keyword review, 2026-10-07)
 
-**Performance:** ref 0.85–0.95× Go 1.26.0 crypto/x509 · fastest ? (measured 2026-10-11)
+**Performance:** ref 0.68–0.77× Go 1.26.8 crypto/x509 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -316,6 +316,8 @@ fixture certificate, a `std.testing.fuzz` walk, explicit hostile shapes, and
 a regression test pinned to the reproduced std hazard.
 
 ## Performance — signatures through `p256` and `rsa.VerifyKey` (2026-10-11)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-x509`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 8.4 %): ref 0.68–0.77× Go 1.26.8 crypto/x509, against 0.85–0.95× (Go 1.26.0) on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement. The host's Go moved from 1.26.0 to 1.26.8 in between.
 
 **A chain verification is its signatures and nothing else** (measured 2026-09-08 and again by
 profile 2026-10-11): path building, DER parsing, extension walking, name constraints and the

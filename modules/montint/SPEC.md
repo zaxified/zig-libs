@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-06 (ctgrind)
 
-**Performance:** ref 0.90–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-14)
+**Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20)
 
 **Evidence:** model-fuzz — CPython bignum KATs plus asm core vs portable oracle on random (a,b,N) differential
 
@@ -530,6 +530,8 @@ caught the same way this one was.
      previously stated without its precondition.
 
 ## Benchmarks — the zig-vs-OpenSSL table (this host, ReleaseFast)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-montint`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average ~4.4 from other sessions, largest spread 14.7 %): ref 0.91–1.02× OpenSSL 3.5.5, against 0.90–1.02× on Zig 0.16.0. A first 0.17 run read `exp_1536` 1.28× with 41 %/80 % spread on the two sides — load, gone on the repeat. The card carries these figures; what follows is the 0.16.0 measurement.
 
 Host: Intel i7-7920HQ (Kaby Lake, mobile). All four columns measured on the
 **same** host; numbers are noisy (turbo/thermal on a laptop) — read them as

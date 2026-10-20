@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-29 (ctgrind)
 
-**Performance:** ref 0.58–1.09× libsodium 1.0.18 · fastest 1.21× OpenSSL 3.5.5 (measured 2026-10-10)
+**Performance:** ref 0.56–1.08× libsodium 1.0.18 · fastest 1.20× OpenSSL 3.5.5 (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -747,6 +747,8 @@ original targets; the `comb`, `ladderbase` and `ladder` targets and their
 positive controls are in § "C3 — the base point uses a fixed-base comb".
 
 ## Performance — `bench-ct25519` (2026-10-10)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ct25519`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 17.4 %): ref 0.56–1.08× libsodium 1.0.18, fastest 1.20× (OpenSSL 3.5.5, X25519 rows), against 0.58–1.09× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
 
 The comparative benchmark behind the card's Performance line. **Reference: libsodium 1.0.18**
 (system `libsodium.so.23`) as a stand-in: the scope's reference, curve25519-dalek 5.0, is a Rust

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind)
 
-**Performance:** ref 0.81–1.06× OpenSSL 3.5.5 · fastest ? (measured 2026-10-14)
+**Performance:** ref 0.78–1.05× OpenSSL 3.5.5 · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -294,6 +294,8 @@ there are no GLV constants to own here.
   and the Jacobian join's `P = ±Q` cases.
 
 ## Performance — `bench-p256` against OpenSSL (2026-10-10)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-p256`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 6.4 %): ref 0.78–1.05× OpenSSL 3.5.5, against 0.81–1.06× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
 
 The comparative benchmark behind the card's Performance line (the section below,
 "Performance status", is the older in-module `P256_BENCH` history against `std`). Reference:

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv)
 
-**Performance:** ref 0.20–0.99× golang-jwt v5.3.1 (Go 1.26.0) · fastest ? (measured 2026-10-13)
+**Performance:** ref 0.20–0.98× golang-jwt v5.3.1 (Go 1.26.8) · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -356,6 +356,8 @@ redundant: an id-0 entry is never stored or never probed); `require_exp` not fol
 key (a hit re-runs `checkTimes`, which applies it).
 
 ## Performance — `bench-jwt` (2026-10-13)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-jwt`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 16.9 %): ref 0.20–0.98× golang-jwt v5.3.1 (Go 1.26.8), against 0.20–0.99× (Go 1.26.0) on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement. The first 0.17 run stopped at its interop check: RS*/PS* verification read the modulus through a dangling pointer and refused valid tokens in optimized builds (fixed the same day, CHANGELOG 2026-10-20); the figures are from the run after the fix.
 
 The comparative benchmark behind the card's Performance line. Reference: golang-jwt/jwt v5.3.1
 (the scope's reference) on Go 1.26.0's standard-library crypto, built offline from the Go

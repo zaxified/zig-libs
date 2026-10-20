@@ -9,7 +9,7 @@
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/23) · src ?
 
 **Hardening:** fuzz 2026-10-13 (`tlsclient-chain` 200,000-run budget clean; `tlsclient-flight` 200,000 runs clean — genuine TLS 1.3 flights, plain and after a cookie HelloRetryRequest, read to close_notify across a KeyUpdate, and a plaintext TLS 1.2 flight, damaged, with the session view and a certificate selector on; the first runs found five server-triggerable std crashes, fixed; TLSCLIENT_FUZZ) · ct 2026-10-13 (ctgrind: key-share secrets through key generation (std's derivation in `keygen.zig`, public points from the `p256`/`p384` combs), ECDHE + key schedule, client-auth key through signCertificateVerify; `kex` 17 / `cv` 30 in-file (`kex` 18 until 2026-10-13: p256's `rejectIdentity` now one jump; `cv` 32 until Zig 0.17.0, whose std Ed25519 signing path has no context left) (cv incl. the TLS 1.2 prehashed path), all std keygen/ECDSA identity and range verdicts (P-384 via `p384`: 0), none a Client.zig branch; 2026-10-11 positive control: a secret-indexed comb table load adds a context; encrypted flight not measured)
-**Performance:** ref 0.74–0.81× Go 1.26.0 crypto/tls client · fastest ? (measured 2026-10-13)
+**Performance:** ref 0.68–0.70× Go 1.26.8 crypto/tls client · fastest ? (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -270,6 +270,10 @@ test goes red when `p384`'s verify is skipped (2026-10-13).
   `Client.zig` (ALPN names, public): pin `2 4`.
 
 **Anchor grade:** class A · oracle EXTERNAL
+
+## Performance
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-tlsclient`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 13.0 %): ref 0.68–0.70× Go 1.26.8 crypto/tls, against 0.74–0.81× (Go 1.26.0) on Zig 0.16.0. The card carries these figures. The host's Go moved from 1.26.0 to 1.26.8 in between.
 
 ## Backlog / deferred
 

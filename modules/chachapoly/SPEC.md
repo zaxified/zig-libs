@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the variants and the u64-lane pass: counts unchanged, new `xaead` target for XChaCha20-Poly1305 and the 64-bit counter, digests updated)
 
-**Performance:** ref 0.83–1.03× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.03× libsodium 1.0.18 (measured 2026-10-13)
+**Performance:** ref 0.69–1.02× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.02× libsodium 1.0.18 (measured 2026-10-20)
 
 **Known defects:** none recorded
 
@@ -450,6 +450,8 @@ different property — every comparison replayed against every implementation of
 it, which is how two real routing holes in `decrypt` and `stream` were found.
 
 ## Performance — `bench-chachapoly` (2026-10-10, re-measured 2026-10-13)
+
+**Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-chachapoly`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 7.0 %): ref 0.69–1.02× OpenSSL 3.5.5, fastest 1.02× (libsodium 1.0.18 or OpenSSL per row), against 0.83–1.03× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
 
 The comparative benchmark behind the card's Performance line. Reference: OpenSSL 3.5.5 (the
 scope's reference; system `libcrypto.so.3`, EVP `chacha20-poly1305`, AVX2 assembly); also
