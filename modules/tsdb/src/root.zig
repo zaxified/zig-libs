@@ -54,7 +54,7 @@ pub const meta = .{
     // ordered range scans (kvtree's own lineage). No third-party
     // implementation was studied — see SPEC.md §Provenance.
     .model_after = "Prometheus TSDB / OpenTSDB composite (series, timestamp) row keys; LMDB-style ordered scans",
-    .deps = .{"kvtree"},
+    .deps = .{ "kvtree", "regex" },
 };
 
 pub const codec = @import("codec.zig");
