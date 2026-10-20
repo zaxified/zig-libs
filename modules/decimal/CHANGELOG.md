@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Performance (no API change): 256-bit division in `Decimal` takes a 128-bit or 64-bit-divisor
+  path instead of compiler-rt's generic one, powers of ten come from a table, `parse` gathers 19 digits per
+  u64, `toString` stays in 64-bit arithmetic; `BigDecimal` counts digits without allocating, runs
+  add/mul/`divPrec` on machine integers up to 38 digits, adds same-exponent coefficients on the limbs,
+  `sqrt` takes one integer root instead of two, from a double-precision start. Results unchanged (the fast
+  paths are cross-checked against the general ones). Bench `zig build bench-decimal` against libmpdec 4.0.1
+  and rust_decimal 1.42.1.
 - **2026-10-20** — `BigDecimal.exp`, `ln`, `log10`, `power` (S2 R7): correctly rounded in all eight modes
   (Python's libmpdec rounds these half_even whatever the context), Ziv loop over integer fixed point with a
   carried error bound; exact results detected (`log10` of a power of ten, `4^0.5`). Typed errors

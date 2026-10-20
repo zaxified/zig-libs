@@ -519,7 +519,7 @@ way to recognise it.
 |---|:-:|---|---|---|
 | [`blobstore`](modules/blobstore/README.md) | 3 (S,E,P) | Content-addressed blob store (git-object/restic style) with refcounted GC, configurable fan-out and a cross-process ingest lock, plus name-addressed and small named-record layers; crash-safe. | posix | hashdigest |
 | [`dataset`](modules/dataset/README.md) | 3 (S,P) | Canonical in-memory columnar-typed table — the normalization seam between data sources and consumers. | any | — |
-| [`decimal`](modules/decimal/README.md) | 3 (S,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
+| [`decimal`](modules/decimal/README.md) | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
 | [`filestore`](modules/filestore/README.md) | 3 (S,E,P) | DB-less durable keyed document store — one atomically-written file per record, plus a typed-JSON convenience layer. | posix | — |
 | [`finstats`](modules/finstats/README.md) | 3 (S,E,P) | Portfolio/financial statistics over `dataset` — XIRR, TWR, risk, beta, Monte-Carlo, correlation matrix. | any | dataset |
 | [`fuzzysearch`](modules/fuzzysearch/README.md) | 3 (S,P) | Bounded-edit-distance typo-tolerant lookup over a static string set — DoS-bounded, the typo-tolerant sibling of `trie`. | any | trie |
@@ -675,7 +675,7 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`decimal`](modules/decimal/README.md) *(storage)* | 3 (S,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
+| [`decimal`](modules/decimal/README.md) *(storage)* | 2 (S,E,A,P) | Exact i128 fixed-point decimal for money math with IEEE/GDA rounding modes and rescale — float-free arithmetic, f64 only at an explicit fromFloat/toFloat boundary. | any | — |
 | [`http`](modules/http/README.md) *(web)* | 2 (S,A,P) | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
 
 ### Host / OS / agent — process, sandboxing, IPC, and the agent-side glue

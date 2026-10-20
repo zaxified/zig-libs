@@ -743,7 +743,11 @@ pub const Decimal = struct {
         }
 
         // Mantissa: integer digits, optional '.', fractional digits.
+        // Digits gather in a u64 chunk (19 at a time) and only then enter
+        // the i256 accumulator: a 256-bit multiply per digit dominated parse.
         var mant: i256 = 0;
+        var chunk: u64 = 0;
+        var chunk_len: u32 = 0;
         var digits_seen: u32 = 0;
         var frac_digits: i64 = 0;
         var seen_dot = false;
@@ -760,10 +764,17 @@ pub const Decimal = struct {
             // Cap mantissa width so the i256 accumulator can't overflow; far
             // more digits than any representable value needs.
             if (digits_seen > 60) return error.Overflow;
-            mant = mant * 10 + @as(i256, c - '0');
+            chunk = chunk * 10 + (c - '0');
+            chunk_len += 1;
+            if (chunk_len == 19) {
+                mant = mant * pow10_table[19] + chunk;
+                chunk = 0;
+                chunk_len = 0;
+            }
             if (seen_dot) frac_digits += 1;
         }
         if (digits_seen == 0) return error.InvalidCharacter;
+        mant = if (mant == 0) chunk else mant * pow10_table[chunk_len] + chunk;
 
         // Optional exponent.
         var exp: i64 = 0;
@@ -818,9 +829,11 @@ pub const Decimal = struct {
             @as(u128, @intCast(-(self.raw + 1))) + 1
         else
             @intCast(self.raw);
-        const scale_u: u128 = @intCast(scale_factor);
-        const int_part = mag / scale_u;
-        const frac = mag % scale_u;
+        // Whole-u64 values (|x| < 1.8e7) stay in 64-bit arithmetic: a 128-bit
+        // `/` or `%` is a compiler-rt call, one per digit below.
+        const scale_u: u64 = @intCast(scale_factor);
+        const int_part: u128 = if (mag >> 64 == 0) @as(u64, @intCast(mag)) / scale_u else mag / scale_u;
+        const frac: u64 = @intCast(if (mag >> 64 == 0) @as(u64, @intCast(mag)) % scale_u else mag % scale_u);
 
         var i: usize = 0;
         if (negative) {
@@ -831,11 +844,17 @@ pub const Decimal = struct {
         var tmp: [27]u8 = undefined; // max integer part is 27 digits
         var n: usize = 0;
         var v = int_part;
-        while (true) {
+        while (v >> 64 != 0) {
             tmp[n] = @intCast('0' + v % 10);
             n += 1;
             v /= 10;
-            if (v == 0) break;
+        }
+        var v64: u64 = @intCast(v);
+        while (true) {
+            tmp[n] = @intCast('0' + v64 % 10);
+            n += 1;
+            v64 /= 10;
+            if (v64 == 0) break;
         }
         while (n > 0) {
             n -= 1;
@@ -885,10 +904,52 @@ fn isqrt256(n: u256) u256 {
 /// e — most at `max_pow10`, `divRound` up to 60). Runtime loop — the exponent
 /// is bounded and small, so this is not a hot path worth a lookup table.
 fn pow10_256(e: u32) i256 {
-    var r: i256 = 1;
-    var k: u32 = 0;
+    if (e < pow10_table.len) return pow10_table[e];
+    var r: i256 = pow10_table[pow10_table.len - 1];
+    var k: u32 = pow10_table.len - 1;
     while (k < e) : (k += 1) r *= 10;
     return r;
+}
+
+/// 10^0 .. 10^60 — every exponent the operations above ask for on their hot
+/// paths (a table load instead of a chain of 256-bit multiplications).
+const pow10_table = blk: {
+    var t: [61]i256 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// Truncating division of non-negative 256-bit magnitudes. Generic `i256`
+/// division is compiler-rt's arbitrary-width long division, several times the
+/// cost of the shapes that actually occur here, so two are taken directly:
+/// both operands within 128 bits (one 128-bit division), and a divisor within
+/// 64 bits (four 128-by-64-bit steps, one per limb).
+fn divTruncMag(n: i256, d: i256) struct { q: i256, r: i256 } {
+    std.debug.assert(n >= 0 and d > 0);
+    const nu: u256 = @intCast(n);
+    const du: u256 = @intCast(d);
+    if (nu >> 128 == 0 and du >> 128 == 0) {
+        const a: u128 = @intCast(nu);
+        const b: u128 = @intCast(du);
+        const q = a / b;
+        return .{ .q = q, .r = a - q * b };
+    }
+    if (du >> 64 == 0) {
+        const b: u64 = @intCast(du);
+        var rem: u64 = 0;
+        var q: u256 = 0;
+        var i: u9 = 256;
+        while (i > 0) {
+            i -= 64;
+            const cur = (@as(u128, rem) << 64) | @as(u64, @truncate(nu >> @intCast(i)));
+            const ql: u64 = @intCast(cur / b);
+            rem = @intCast(cur - @as(u128, ql) * b);
+            q |= @as(u256, ql) << @intCast(i);
+        }
+        return .{ .q = @intCast(q), .r = rem };
+    }
+    return .{ .q = @divTrunc(n, d), .r = @rem(n, d) };
 }
 
 /// num / den rounded half-away-from-zero, sign-aware. `den` must be non-zero.
@@ -915,8 +976,9 @@ fn divRoundWithMode(num: i256, den: i256, mode: RoundingMode) i256 {
 /// positive. Half-way detection is exact integer math: `r == d - r` iff
 /// `2r == d` (written subtraction-side to rule out doubling overflow).
 fn divRoundMag(n: i256, d: i256, result_neg: bool, mode: RoundingMode) i256 {
-    var q = @divTrunc(n, d);
-    const r = @rem(n, d);
+    const qr = divTruncMag(n, d);
+    var q = qr.q;
+    const r = qr.r;
     if (r != 0) {
         const bump = switch (mode) {
             .up => true,

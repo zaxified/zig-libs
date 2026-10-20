@@ -148,16 +148,17 @@ pub const BigDecimal = struct {
     /// digit), not 0. The sign and the exponent play no part: `-0.00123`
     /// (coefficient `-123`) has precision 3.
     ///
-    /// Exact, via `std.math.big.int`'s base-10 logarithm (`log10Alloc`) —
-    /// not `sizeInBaseUpperBound`, which is only an upper bound. The scratch
-    /// buffer it needs is why this takes an allocator and can fail.
+    /// Exact (not `sizeInBaseUpperBound`, which is only an upper bound): a
+    /// bit-length estimate checked against a power of ten on the stack; past
+    /// 64 limbs (~1200 digits) std's `log10Alloc`, whose scratch is why this
+    /// takes an allocator and can fail.
     pub fn precision(self: BigDecimal, allocator: Allocator) Allocator.Error!u32 {
         if (self.coeff.eqlZero()) return 1;
         // Borrow the limbs as a positive Const: log10 asserts a positive,
         // nonzero operand, and cloning just to drop a sign bit would be
         // wasteful on a large coefficient.
         const mag: bigint.Const = .{ .limbs = self.coeff.limbs[0..self.coeff.len()], .positive = true };
-        return @intCast(try mag.log10Alloc(allocator) + 1);
+        return digitCount(allocator, mag);
     }
 
     // -----------------------------------------------------------------
@@ -358,28 +359,25 @@ pub const BigDecimal = struct {
     /// exactly widened (multiplied by `10^k`) to match before adding.
     pub fn add(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
         if (a.exponent == b.exponent) {
-            var r = try Managed.init(allocator);
-            errdefer r.deinit();
-            try r.add(&a.coeff, &b.coeff);
-            return .{ .coeff = r, .exponent = a.exponent };
+            if (smallMag(&a.coeff)) |ma| if (smallMag(&b.coeff)) |mb| {
+                const sa: i256 = if (a.coeff.isPositive()) ma else -@as(i256, ma);
+                const sb: i256 = if (b.coeff.isPositive()) mb else -@as(i256, mb);
+                const sum = sa + sb;
+                return .{ .coeff = try managedFromU256(allocator, @abs(sum), sum < 0), .exponent = a.exponent };
+            };
+            return .{ .coeff = try addSigned(allocator, &a.coeff, &b.coeff), .exponent = a.exponent };
         }
         const lo_exp = @min(a.exponent, b.exponent);
         if (a.exponent > b.exponent) {
             const shift = try alignShift(a.exponent, lo_exp);
             var a_scaled = try scaleUp(allocator, &a.coeff, shift);
             defer a_scaled.deinit();
-            var r = try Managed.init(allocator);
-            errdefer r.deinit();
-            try r.add(&a_scaled, &b.coeff);
-            return .{ .coeff = r, .exponent = lo_exp };
+            return .{ .coeff = try addSigned(allocator, &a_scaled, &b.coeff), .exponent = lo_exp };
         } else {
             const shift = try alignShift(b.exponent, lo_exp);
             var b_scaled = try scaleUp(allocator, &b.coeff, shift);
             defer b_scaled.deinit();
-            var r = try Managed.init(allocator);
-            errdefer r.deinit();
-            try r.add(&a.coeff, &b_scaled);
-            return .{ .coeff = r, .exponent = lo_exp };
+            return .{ .coeff = try addSigned(allocator, &a.coeff, &b_scaled), .exponent = lo_exp };
         }
     }
 
@@ -398,7 +396,11 @@ pub const BigDecimal = struct {
     pub fn mul(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
         const exp64: i64 = @as(i64, a.exponent) + @as(i64, b.exponent);
         if (exp64 > std.math.maxInt(i32) or exp64 < std.math.minInt(i32)) return error.Overflow;
-        var r = try Managed.init(allocator);
+        if (smallMag(&a.coeff)) |ma| if (smallMag(&b.coeff)) |mb| {
+            const neg = a.coeff.isPositive() != b.coeff.isPositive();
+            return .{ .coeff = try managedFromU256(allocator, std.math.mulWide(u128, ma, mb), neg), .exponent = @intCast(exp64) };
+        };
+        var r = try Managed.initCapacity(allocator, a.coeff.len() + b.coeff.len() + 1);
         errdefer r.deinit();
         try r.mul(&a.coeff, &b.coeff);
         return .{ .coeff = r, .exponent = @intCast(exp64) };
@@ -842,29 +844,6 @@ pub const BigDecimal = struct {
         var n0 = try scaleUp(allocator, &a.coeff, t);
         defer n0.deinit();
 
-        // Exact-root fast path — and it must be exact in the strict sense
-        // (I² == N), not "close enough": a mis-detected exact root would emit
-        // the ideal exponent for an inexact value.
-        {
-            var exact_root = try Managed.init(allocator);
-            errdefer exact_root.deinit();
-            exact_root.sqrt(&n0) catch |err| switch (err) {
-                error.SqrtOfNegativeNumber => unreachable, // sign checked above
-                error.OutOfMemory => return error.OutOfMemory,
-            };
-            var sq = try Managed.init(allocator);
-            defer sq.deinit();
-            try sq.mul(&exact_root, &exact_root);
-            const is_exact = sq.toConst().order(n0.toConst()) == .eq;
-            const fits = is_exact and
-                (try (BigDecimal{ .coeff = exact_root, .exponent = 0 }).precision(allocator)) <= prec;
-            if (fits) {
-                if (m > std.math.maxInt(i32) or m < std.math.minInt(i32)) return error.Overflow;
-                return .{ .coeff = exact_root, .exponent = @intCast(m) };
-            }
-            exact_root.deinit();
-        }
-
         // Rounding path. Gain k = prec+1 decimal digits of root by scaling the
         // radicand by 10^(2k); √(N·10^2k) = √N·10^k, so ⌊√·⌋ then has at least
         // k+1 ≥ prec+2 digits — enough to place the half-way point exactly.
@@ -872,12 +851,38 @@ pub const BigDecimal = struct {
         var n = try scaleUp(allocator, &n0, 2 * k);
         defer n.deinit();
 
-        var root = try Managed.init(allocator);
+        var root = try isqrt(allocator, &n);
         defer root.deinit();
-        root.sqrt(&n) catch |err| switch (err) {
-            error.SqrtOfNegativeNumber => unreachable,
-            error.OutOfMemory => return error.OutOfMemory,
+
+        // Exactness from the one root: ⌊√(N·10^2k)⌋² == N·10^2k iff N is a
+        // perfect square (√N = R/10^k is rational, hence an integer) — exact
+        // in the strict sense (R² == N·10^2k), never "close enough": a
+        // mis-detected exact root would emit the ideal exponent for an
+        // inexact value. Then the exact root R/10^k is returned as is when it
+        // fits `prec` digits.
+        const root_is_exact = blk: {
+            var sq = try Managed.init(allocator);
+            defer sq.deinit();
+            try sq.mul(&root, &root);
+            break :blk sq.toConst().order(n.toConst()) == .eq;
         };
+        if (root_is_exact) {
+            var ten_k = try pow10(allocator, k);
+            defer ten_k.deinit();
+            var exact_root = try Managed.init(allocator);
+            errdefer exact_root.deinit();
+            var rem = try Managed.init(allocator);
+            defer rem.deinit();
+            try exact_root.divTrunc(&rem, &root, &ten_k);
+            std.debug.assert(rem.eqlZero());
+            const fits = exact_root.eqlZero() or
+                (try (BigDecimal{ .coeff = exact_root, .exponent = 0 }).precision(allocator)) <= prec;
+            if (fits) {
+                if (m > std.math.maxInt(i32) or m < std.math.minInt(i32)) return error.Overflow;
+                return .{ .coeff = exact_root, .exponent = @intCast(m) };
+            }
+            exact_root.deinit();
+        }
 
         const d: u32 = try (BigDecimal{ .coeff = root, .exponent = 0 }).precision(allocator);
         std.debug.assert(d > prec);
@@ -896,12 +901,7 @@ pub const BigDecimal = struct {
             var rem = try Managed.init(allocator);
             defer rem.deinit();
             try q.divTrunc(&rem, &root, &ten_drop);
-            if (rem.eqlZero()) {
-                var sq = try Managed.init(allocator);
-                defer sq.deinit();
-                try sq.mul(&root, &root);
-                exact_discard = sq.toConst().order(n.toConst()) == .eq;
-            }
+            exact_discard = rem.eqlZero() and root_is_exact;
         }
 
         // Exact half-way test on the *true* root, not on ⌊√N⌋: the midpoint
@@ -1080,15 +1080,22 @@ pub const BigDecimal = struct {
                 .rounded = false,
             };
         }
+        if (try divPrecSmall(allocator, a, b, prec, mode, ideal)) |r| return r;
+        return divPrecGeneral(allocator, a, b, prec, mode, ideal);
+    }
+
+    /// `divPrec` on `std.math.big.int` (any size), after the zero and
+    /// argument checks.
+    fn divPrecGeneral(allocator: Allocator, a: BigDecimal, b: BigDecimal, prec: u32, mode: RoundingMode, ideal: i64) DivPrecError!Rounded {
         const result_neg = a.coeff.isPositive() != b.coeff.isPositive();
         const da: i64 = try a.precision(allocator);
         const db: i64 = try b.precision(allocator);
 
-        var num = try a.coeff.clone();
-        defer num.deinit();
+        // Read-only magnitude views: a shallow copy shares the limbs, and
+        // `abs` touches only the copy's sign (never deinit or write these).
+        var num = a.coeff;
         num.abs();
-        var den = try b.coeff.clone();
-        defer den.deinit();
+        var den = b.coeff;
         den.abs();
 
         // Scale by 10^s so the truncated quotient has `prec` or `prec + 1`
@@ -1103,6 +1110,7 @@ pub const BigDecimal = struct {
         errdefer q.deinit();
         var r = try Managed.init(allocator);
         defer r.deinit();
+        var divisor: *const Managed = &den;
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             const mag: i64 = if (s < 0) -s else s;
@@ -1111,12 +1119,13 @@ pub const BigDecimal = struct {
             defer p.deinit();
             if (s >= 0) {
                 try n2.mul(&num, &p);
-                try d2.copy(den.toConst());
+                divisor = &den;
+                try q.divTrunc(&r, &n2, divisor);
             } else {
-                try n2.copy(num.toConst());
                 try d2.mul(&den, &p);
+                divisor = &d2;
+                try q.divTrunc(&r, &num, divisor);
             }
-            try q.divTrunc(&r, &n2, &d2);
             const qd = try (BigDecimal{ .coeff = q, .exponent = 0 }).precision(allocator);
             if (qd <= prec) break;
             std.debug.assert(attempt == 0 and qd == prec + 1);
@@ -1140,7 +1149,7 @@ pub const BigDecimal = struct {
                 e += 1;
             }
         } else {
-            try applyRounding(allocator, &q, &r, &d2, result_neg, mode);
+            try applyRounding(allocator, &q, &r, divisor, result_neg, mode);
             try foldCarry(allocator, &q, &e, prec);
         }
         if (e > std.math.maxInt(i32) or e < std.math.minInt(i32)) return error.Overflow;
@@ -2290,12 +2299,344 @@ fn exactPowerCandidate(allocator: Allocator, base: BigDecimal, y: BigDecimal, e:
 /// caller (`max_align_shift` for alignment, `max_result_digits` for
 /// `sqrt`/`pow`) before it gets here.
 fn pow10(allocator: Allocator, k: u32) Allocator.Error!Managed {
-    var ten = try Managed.initSet(allocator, 10);
-    defer ten.deinit();
-    var r = try Managed.init(allocator);
-    errdefer r.deinit();
-    try r.pow(&ten, k);
+    if (!limb64 or k > pow10_by_limbs_max) {
+        // Huge exponents: `pow`'s squaring wins over k/19 linear steps.
+        var ten = try Managed.initSet(allocator, 10);
+        defer ten.deinit();
+        var r = try Managed.init(allocator);
+        errdefer r.deinit();
+        try r.pow(&ten, k);
+        return r;
+    }
+    var r = try Managed.initCapacity(allocator, k / 19 + 2);
+    r.setMetadata(true, pow10Into(r.limbs, k));
     return r;
+}
+
+const Limb = std.math.big.Limb;
+/// The limb-level fast paths below assume 64-bit limbs (10^19 per limb, a
+/// u128 in two limbs); on 32-bit targets every caller takes the general path.
+const limb64 = @bitSizeOf(Limb) == 64;
+
+/// 10^0 .. 10^19 — every power of ten a limb holds.
+const pow10_limb = blk: {
+    var t: [20]u64 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// Above this exponent `pow10` switches to `Managed.pow` (quadratic vs. squaring).
+const pow10_by_limbs_max = 2000;
+
+/// `limbs[0..len] *= m` in place; returns the new length. `limbs` must have
+/// room for one more limb.
+fn mulLimbInPlace(limbs: []Limb, len: usize, m: Limb) usize {
+    var carry: Limb = 0;
+    for (limbs[0..len]) |*l| {
+        const p = @as(u128, l.*) * m + carry;
+        l.* = @truncate(p);
+        carry = @intCast(p >> 64);
+    }
+    if (carry == 0) return len;
+    limbs[len] = carry;
+    return len + 1;
+}
+
+/// Write 10^k into `limbs` (at least k/19 + 2 long); returns its length.
+fn pow10Into(limbs: []Limb, k: u32) usize {
+    limbs[0] = pow10_limb[k % 19];
+    var len: usize = 1;
+    var left = k / 19;
+    while (left > 0) : (left -= 1) len = mulLimbInPlace(limbs, len, pow10_limb[19]);
+    return len;
+}
+
+/// Decimal digits of a positive, nonzero magnitude, without allocating up to
+/// `digit_count_stack_limbs` limbs (std's `log10` divides by 10^19 once per
+/// limb and allocates its scratch — it dominated `divPrec` and `sqrt`).
+/// The bit length gives a lower bound `est` with 10^est <= value; the count is
+/// the first d > est with value < 10^d, found by comparing against 10^d.
+fn digitCount(allocator: Allocator, mag: bigint.Const) Allocator.Error!u32 {
+    std.debug.assert(mag.positive and !mag.eqlZero());
+    const n = mag.limbs.len;
+    if (!limb64) return @intCast(try mag.log10Alloc(allocator) + 1);
+    if (n == 1) return digitsOfLimb(mag.limbs[0]);
+    if (n > digit_count_stack_limbs) return @intCast(try mag.log10Alloc(allocator) + 1);
+    const bits: u64 = @as(u64, n) * 64 - @clz(mag.limbs[n - 1]);
+    // 78913 / 2^18 < log10(2): a lower bound on floor((bits - 1) * log10 2).
+    const est: u32 = @intCast(((bits - 1) * 78913) >> 18);
+    var buf: [digit_count_stack_limbs + 4]Limb = undefined;
+    var d: u32 = est + 1;
+    var p: bigint.Const = .{ .limbs = buf[0..pow10Into(&buf, d)], .positive = true };
+    while (mag.order(p) != .lt) : (d += 1) {
+        p.limbs = buf[0..mulLimbInPlace(&buf, p.limbs.len, 10)];
+    }
+    return d;
+}
+
+const digit_count_stack_limbs = 64;
+
+// ---------------------------------------------------------------------------
+// Two-limb fast paths. A coefficient of up to 38 digits (Python's default
+// context is 28) fits a u128; there `add`, `mul` and `divPrec` run on
+// machine integers instead of `std.math.big.int`, whose per-call set-up,
+// scratch allocations and generic long division cost several times the
+// arithmetic at this size. Every path computes exactly what the general one
+// does (the tests cross-check them on random operands).
+// ---------------------------------------------------------------------------
+
+/// The magnitude of `c` when it fits two limbs.
+fn smallMag(c: *const Managed) ?u128 {
+    if (!limb64) return null;
+    const n = c.len();
+    if (n > 2) return null;
+    const hi: u128 = if (n == 2) c.limbs[1] else 0;
+    return (hi << 64) | c.limbs[0];
+}
+
+/// A new `Managed` holding `±v`.
+fn managedFromU256(allocator: Allocator, v: u256, negative: bool) Allocator.Error!Managed {
+    var r = try Managed.initCapacity(allocator, 4);
+    var len: usize = 0;
+    var x = v;
+    while (true) {
+        r.limbs[len] = @truncate(x);
+        len += 1;
+        x >>= 64;
+        if (x == 0) break;
+    }
+    r.setMetadata(!negative or v == 0, len);
+    return r;
+}
+
+fn digitsOfU128(v: u128) u32 {
+    if (v >> 64 == 0) return digitsOfLimb(@intCast(v));
+    var d: u32 = 20;
+    while (d < 39 and v >= pow10_u128[d]) d += 1;
+    return d;
+}
+
+/// 10^0 .. 10^38.
+const pow10_u128 = blk: {
+    var t: [39]u128 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// 10^0 .. 10^76.
+const pow10_u256 = blk: {
+    var t: [77]u256 = undefined;
+    t[0] = 1;
+    for (1..t.len) |i| t[i] = t[i - 1] * 10;
+    break :blk t;
+};
+
+/// `n / d` and `n % d` for a quotient that fits a u128 (`n < d·2^128`):
+/// Knuth's algorithm D with 64-bit digits, the remainder kept as a u256.
+fn divWide(n: u256, d: u128) struct { q: u128, r: u128 } {
+    std.debug.assert(d != 0 and n >> 128 < d);
+    if (n >> 128 == 0) {
+        const a: u128 = @intCast(n);
+        return .{ .q = a / d, .r = a % d };
+    }
+    if (d >> 64 == 0) {
+        const b: u64 = @intCast(d);
+        var rem: u64 = 0;
+        var q: u256 = 0;
+        var i: u9 = 256;
+        while (i > 0) {
+            i -= 64;
+            const cur = (@as(u128, rem) << 64) | @as(u64, @truncate(n >> @intCast(i)));
+            const ql: u64 = @intCast(cur / b);
+            rem = @intCast(cur - @as(u128, ql) * b);
+            q |= @as(u256, ql) << @intCast(i);
+        }
+        return .{ .q = @intCast(q), .r = rem };
+    }
+    // Normalise: the divisor's top bit set; n < d·2^128 keeps n·2^sh in u256.
+    const sh: u7 = @intCast(@clz(d));
+    const dn: u128 = d << sh;
+    var rem: u256 = n << sh;
+    const v1: u64 = @intCast(dn >> 64);
+    const v0: u64 = @truncate(dn);
+    var q: u128 = 0;
+    var j: u9 = 64;
+    while (true) {
+        // Estimate the quotient digit from the top two remainder digits.
+        const top: u128 = @truncate(rem >> @intCast(j + 64));
+        var qhat: u128 = top / v1;
+        var rhat: u128 = top - qhat * v1;
+        const below: u64 = @truncate(rem >> @intCast(j));
+        while (qhat >> 64 != 0 or qhat * v0 > ((rhat << 64) | below)) {
+            qhat -= 1;
+            rhat += v1;
+            if (rhat >> 64 != 0) break;
+        }
+        var prod: u256 = (@as(u256, qhat) * dn) << @intCast(j);
+        while (prod > rem) {
+            qhat -= 1;
+            prod -= @as(u256, dn) << @intCast(j);
+        }
+        rem -= prod;
+        q |= qhat << @intCast(j);
+        if (j == 0) break;
+        j -= 64;
+    }
+    return .{ .q = q, .r = @intCast(rem >> sh) };
+}
+
+/// `a + b` (signed), straight on the limbs: `Managed.add`'s generic set-up
+/// cost about as much as the carry loop itself at a few limbs.
+fn addSigned(allocator: Allocator, a: *const Managed, b: *const Managed) Allocator.Error!Managed {
+    const al = a.limbs[0..a.len()];
+    const bl = b.limbs[0..b.len()];
+    const ap = a.isPositive();
+    const bp = b.isPositive();
+    var r = try Managed.initCapacity(allocator, @max(al.len, bl.len) + 1);
+    if (ap == bp) {
+        const big_, const small_ = if (al.len >= bl.len) .{ al, bl } else .{ bl, al };
+        var carry: u1 = 0;
+        for (big_, 0..) |x, i| {
+            const y: Limb = if (i < small_.len) small_[i] else 0;
+            const s1 = @addWithOverflow(x, y);
+            const s2 = @addWithOverflow(s1[0], carry);
+            r.limbs[i] = s2[0];
+            carry = s1[1] | s2[1];
+        }
+        var len = big_.len;
+        if (carry != 0) {
+            r.limbs[len] = 1;
+            len += 1;
+        }
+        r.setMetadata(ap, len);
+        return r;
+    }
+    // Opposite signs: the larger magnitude minus the smaller, its sign.
+    const ord = (bigint.Const{ .limbs = al, .positive = true }).orderAbs(.{ .limbs = bl, .positive = true });
+    if (ord == .eq) {
+        r.limbs[0] = 0;
+        r.setMetadata(true, 1);
+        return r;
+    }
+    const big_, const small_, const positive = if (ord == .gt) .{ al, bl, ap } else .{ bl, al, bp };
+    var borrow: u1 = 0;
+    for (big_, 0..) |x, i| {
+        const y: Limb = if (i < small_.len) small_[i] else 0;
+        const d1 = @subWithOverflow(x, y);
+        const d2 = @subWithOverflow(d1[0], borrow);
+        r.limbs[i] = d2[0];
+        borrow = d1[1] | d2[1];
+    }
+    std.debug.assert(borrow == 0);
+    var len = big_.len;
+    while (len > 1 and r.limbs[len - 1] == 0) len -= 1;
+    r.setMetadata(positive, len);
+    return r;
+}
+
+/// ⌊√n⌋ for a positive `n`: Brent and Zimmermann's SqrtInt (as in std's
+/// `Managed.sqrt`), started from a double-precision estimate instead of
+/// 2^⌈bits/2⌉. The start is still ≥ ⌊√n⌋, which the loop needs, but has ~52
+/// correct bits instead of one, so two or three divisions replace about
+/// log2(bits) — the dominant cost of `BigDecimal.sqrt`.
+fn isqrt(allocator: Allocator, n: *const Managed) Allocator.Error!Managed {
+    std.debug.assert(n.isPositive() and !n.eqlZero());
+    const bits = n.toConst().bitCountAbs();
+    // top = ⌊n / 2^e⌋ with e even and top below 2^106: √n < (√top + 1)·2^(e/2),
+    // and +2 covers the double's rounding of √top (≤ 2^53, so ±1 at most).
+    const e: usize = if (bits > 104) (bits - 104 + 1) & ~@as(usize, 1) else 0;
+    var top: u128 = 0;
+    {
+        var shifted = try Managed.init(allocator);
+        defer shifted.deinit();
+        try shifted.shiftRight(n, e);
+        top = shifted.toInt(u128) catch unreachable;
+    }
+    const est: u128 = @as(u128, @intFromFloat(@sqrt(@as(f64, @floatFromInt(top))))) + 2;
+    var s = try Managed.initSet(allocator, est);
+    errdefer s.deinit();
+    try s.shiftLeft(&s, e / 2);
+    var t = try Managed.init(allocator);
+    defer t.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    var u = try Managed.init(allocator);
+    defer u.deinit();
+    while (true) {
+        try t.divTrunc(&rem, n, &s);
+        try t.add(&t, &s);
+        try u.shiftRight(&t, 1);
+        if (u.toConst().order(s.toConst()).compare(.gte)) return s;
+        s.swap(&u);
+    }
+}
+
+/// `divPrec` for two-limb operands and `prec <= 37`; null when the operands
+/// do not fit (the caller takes the general path).
+fn divPrecSmall(
+    allocator: Allocator,
+    a: BigDecimal,
+    b: BigDecimal,
+    prec: u32,
+    mode: RoundingMode,
+    ideal: i64,
+) Allocator.Error!?BigDecimal.Rounded {
+    if (prec > 37) return null;
+    const num = smallMag(&a.coeff) orelse return null;
+    const den = smallMag(&b.coeff) orelse return null;
+    const result_neg = a.coeff.isPositive() != b.coeff.isPositive();
+    const da: i64 = digitsOfU128(num);
+    const db: i64 = digitsOfU128(den);
+    var s: i64 = @as(i64, prec) + db - da;
+    var q: u128 = undefined;
+    var r: u128 = undefined;
+    var divisor: u128 = undefined;
+    while (true) {
+        if (s >= 0) {
+            // num·10^s < 10^(prec+db) <= 10^75: inside u256, and q < 10^38.
+            const qr = divWide(@as(u256, num) * pow10_u256[@intCast(s)], den);
+            q = qr.q;
+            r = qr.r;
+            divisor = den;
+        } else {
+            // den·10^-s < 10^(da-prec) <= 10^38.
+            divisor = den * pow10_u128[@intCast(-s)];
+            q = num / divisor;
+            r = num % divisor;
+        }
+        if (digitsOfU128(q) <= prec) break;
+        s -= 1;
+    }
+    var e: i64 = ideal - s;
+    const exact = r == 0;
+    if (exact) {
+        while (e < ideal and q % 10 == 0) {
+            q /= 10;
+            e += 1;
+        }
+    } else {
+        const half: std.math.Order = if (r < divisor - r) .lt else if (r == divisor - r) .eq else .gt;
+        const last = q % 10;
+        if (roundBump(mode, half, q & 1 == 1, last == 0 or last == 5, result_neg)) q += 1;
+        if (q == pow10_u128[prec]) {
+            q /= 10;
+            e += 1;
+        }
+    }
+    if (e > std.math.maxInt(i32) or e < std.math.minInt(i32)) return null; // general path reports it
+    return .{
+        .value = .{ .coeff = try managedFromU256(allocator, q, result_neg), .exponent = @intCast(e) },
+        .inexact = !exact,
+        .rounded = !exact or e > ideal,
+    };
+}
+
+fn digitsOfLimb(v: u64) u32 {
+    var d: u32 = 1;
+    while (d < 20 and v >= pow10_limb[d]) d += 1;
+    return d;
 }
 
 /// GDA `min`/`max` operand selection: returns `true` when `a` is the answer.
@@ -2460,6 +2801,137 @@ fn lastDigit05(allocator: Allocator, mode: RoundingMode, q: *const Managed) Allo
 
 const testing = std.testing;
 const talloc = testing.allocator;
+
+test "two-limb fast paths agree with the general ones" {
+    if (!limb64) return error.SkipZigTest; // the fast paths are off on 32-bit limbs
+    var prng = std.Random.DefaultPrng.init(0xdec1);
+    const rnd = prng.random();
+    const modes = [_]RoundingMode{ .half_even, .half_up, .half_down, .up, .down, .ceiling, .floor, .round_05up };
+    var n: usize = 0;
+    while (n < 20000) : (n += 1) {
+        var ops: [2]BigDecimal = undefined;
+        for (&ops) |*o| {
+            // 1..38 digits, sign, small exponent; some exact quotients via
+            // small values and powers of ten.
+            const digits = rnd.intRangeAtMost(u32, 1, 38);
+            var v: u128 = rnd.int(u128) % pow10_u128[digits];
+            if (rnd.boolean()) v = (v % 1000) * pow10_u128[rnd.uintLessThan(u32, 30)];
+            if (v == 0) v = 1; // divPrec rejects a zero divisor before the fast path
+            o.* = .{ .coeff = try Managed.initSet(talloc, v), .exponent = rnd.intRangeAtMost(i32, -40, 40) };
+            if (rnd.boolean()) o.coeff.negate();
+        }
+        defer for (&ops) |*o| o.deinit();
+        const a = ops[0];
+        var b = ops[1];
+        if (rnd.uintLessThan(u8, 4) == 0) b.exponent = a.exponent; // exercise add's fast path
+        const prec = rnd.intRangeAtMost(u32, 1, 37);
+        const mode = modes[rnd.uintLessThan(usize, modes.len)];
+        const ideal: i64 = @as(i64, a.exponent) - @as(i64, b.exponent);
+
+        var fast = (try divPrecSmall(talloc, a, b, prec, mode, ideal)).?;
+        defer fast.value.deinit();
+        var slow = try BigDecimal.divPrecGeneral(talloc, a, b, prec, mode, ideal);
+        defer slow.value.deinit();
+        try testing.expect(fast.value.coeff.toConst().eql(slow.value.coeff.toConst()));
+        try testing.expectEqual(slow.value.exponent, fast.value.exponent);
+        try testing.expectEqual(slow.inexact, fast.inexact);
+        try testing.expectEqual(slow.rounded, fast.rounded);
+
+        // add / mul: the fast result against Managed's.
+        var s_fast = try BigDecimal.add(talloc, a, b);
+        defer s_fast.deinit();
+        var p_fast = try BigDecimal.mul(talloc, a, b);
+        defer p_fast.deinit();
+        var p_slow = try Managed.init(talloc);
+        defer p_slow.deinit();
+        try p_slow.mul(&a.coeff, &b.coeff);
+        try testing.expect(p_fast.coeff.toConst().eql(p_slow.toConst()));
+        if (a.exponent == b.exponent) {
+            var s_slow = try Managed.init(talloc);
+            defer s_slow.deinit();
+            try s_slow.add(&a.coeff, &b.coeff);
+            try testing.expect(s_fast.coeff.toConst().eql(s_slow.toConst()));
+        }
+    }
+}
+
+test "addSigned agrees with Managed.add on multi-limb operands" {
+    var prng = std.Random.DefaultPrng.init(0xadd5);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 5000) : (n += 1) {
+        var ops: [2]Managed = undefined;
+        for (&ops) |*o| {
+            o.* = try Managed.initCapacity(talloc, 8);
+            const len = rnd.intRangeAtMost(usize, 1, 8);
+            for (o.limbs[0..len]) |*l| l.* = switch (rnd.uintLessThan(u8, 4)) {
+                0 => 0,
+                1 => std.math.maxInt(Limb),
+                else => rnd.int(Limb),
+            };
+            var nl = len;
+            while (nl > 1 and o.limbs[nl - 1] == 0) nl -= 1;
+            o.setMetadata(rnd.boolean() or (nl == 1 and o.limbs[0] == 0), nl);
+        }
+        defer for (&ops) |*o| o.deinit();
+        if (rnd.uintLessThan(u8, 8) == 0) try ops[1].copy(ops[0].toConst()); // a + a
+        if (rnd.uintLessThan(u8, 8) == 0) { // a + (-a) = 0
+            try ops[1].copy(ops[0].toConst());
+            ops[1].negate();
+        }
+        var got = try addSigned(talloc, &ops[0], &ops[1]);
+        defer got.deinit();
+        var want = try Managed.init(talloc);
+        defer want.deinit();
+        try want.add(&ops[0], &ops[1]);
+        try testing.expect(got.toConst().eql(want.toConst()));
+    }
+}
+
+test "isqrt agrees with Managed.sqrt" {
+    var prng = std.Random.DefaultPrng.init(0x5a7);
+    const rnd = prng.random();
+    var n: usize = 0;
+    while (n < 3000) : (n += 1) {
+        var x = try Managed.initCapacity(talloc, 12);
+        defer x.deinit();
+        const len = rnd.intRangeAtMost(usize, 1, 12);
+        for (x.limbs[0..len]) |*l| l.* = rnd.int(Limb);
+        if (x.limbs[len - 1] == 0) x.limbs[len - 1] = 1;
+        x.setMetadata(true, len);
+        // Perfect squares and their neighbours too.
+        if (rnd.boolean()) {
+            try x.mul(&x, &x);
+            if (rnd.boolean()) try x.addScalar(&x, -1) else if (rnd.boolean()) try x.addScalar(&x, 1);
+            if (x.eqlZero()) try x.set(1);
+        }
+        var got = try isqrt(talloc, &x);
+        defer got.deinit();
+        var want = try Managed.init(talloc);
+        defer want.deinit();
+        try want.sqrt(&x);
+        try testing.expect(got.toConst().eql(want.toConst()));
+    }
+}
+
+test "digitCount: every power of ten and its neighbours, up to 1300 digits" {
+    var p = try Managed.initSet(talloc, 1);
+    defer p.deinit();
+    var ten = try Managed.initSet(talloc, 10);
+    defer ten.deinit();
+    var below = try Managed.init(talloc);
+    defer below.deinit();
+    var k: u32 = 0;
+    while (k < 1300) : (k += 1) {
+        try testing.expectEqual(k + 1, try digitCount(talloc, p.toConst()));
+        if (k > 0) {
+            try below.sub(&p, &ten);
+            try below.addScalar(&below, 9); // 10^k - 1
+            try testing.expectEqual(k, try digitCount(talloc, below.toConst()));
+        }
+        try p.mul(&p, &ten);
+    }
+}
 
 fn expectStr(d: BigDecimal, want: []const u8) !void {
     const s = try d.toStringAlloc(talloc);
