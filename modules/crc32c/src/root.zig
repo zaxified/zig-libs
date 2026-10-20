@@ -308,7 +308,49 @@ const X86 = struct {
               [_] "0" (c),
         );
     }
+
+    /// The three streams over blocks of `n` bytes at `p` as ONE asm loop
+    /// behind `.p2align 5`. Intel's JCC erratum (Skylake…Cascade Lake
+    /// microcode) sends a fused `cmp`+`jb` that crosses a 32-byte boundary to
+    /// the legacy decoder: the compiled loop ran 13–30 % slower depending only
+    /// on where the linker put it (2026-10-19, `~/CML/zig-017/jcc/REPORT.md`;
+    /// bench-crc32c 1.38× Go on 0.17, 2026-10-20). Here the ends of the three
+    /// blocks are the bases and a negative index counts up to 0, so `add`+`jnz`
+    /// fuse with no `cmp` and the 27-byte body sits inside one 32-byte window.
+    /// LLVM only: the self-hosted assembler is not asked for `.p2align` and
+    /// memory-operand `crc32q` (`threeWay` keeps the plain loop there).
+    inline fn block3(comptime n: usize, c0: *u64, c1: *u64, c2: *u64, p: [*]const u8) void {
+        var a: u64 = undefined;
+        var b: u64 = undefined;
+        var d: u64 = undefined;
+        var i: isize = undefined;
+        asm volatile (
+            \\ .p2align 5
+            \\ 1:
+            \\ crc32q (%[e0],%[i]), %[a]
+            \\ crc32q (%[e1],%[i]), %[b]
+            \\ crc32q (%[e2],%[i]), %[d]
+            \\ addq $8, %[i]
+            \\ jnz 1b
+            : [a] "=r" (a),
+              [b] "=r" (b),
+              [d] "=r" (d),
+              [i] "=r" (i),
+            : [_] "0" (c0.*),
+              [_] "1" (c1.*),
+              [_] "2" (c2.*),
+              [_] "3" (-@as(isize, n)),
+              [e0] "r" (p + n),
+              [e1] "r" (p + 2 * n),
+              [e2] "r" (p + 3 * n),
+            : .{ .cc = true, .memory = true });
+        c0.* = a;
+        c1.* = b;
+        c2.* = d;
+    }
 };
+
+const x86_block_asm = builtin.zig_backend != .stage2_x86_64;
 
 const Arm = struct {
     const State = u32;
@@ -332,11 +374,15 @@ fn threeWay(comptime Isa: type, reg: u32, bytes: []const u8) u32 {
             var c0: Isa.State = c;
             var c1: Isa.State = 0;
             var c2: Isa.State = 0;
-            var i: usize = 0;
-            while (i < n) : (i += 8) {
-                c0 = Isa.step8(c0, std.mem.readInt(u64, p[i..][0..8], .little));
-                c1 = Isa.step8(c1, std.mem.readInt(u64, p[n + i ..][0..8], .little));
-                c2 = Isa.step8(c2, std.mem.readInt(u64, p[2 * n + i ..][0..8], .little));
+            if (comptime Isa == X86 and x86_block_asm) {
+                X86.block3(n, &c0, &c1, &c2, p.ptr);
+            } else {
+                var i: usize = 0;
+                while (i < n) : (i += 8) {
+                    c0 = Isa.step8(c0, std.mem.readInt(u64, p[i..][0..8], .little));
+                    c1 = Isa.step8(c1, std.mem.readInt(u64, p[n + i ..][0..8], .little));
+                    c2 = Isa.step8(c2, std.mem.readInt(u64, p[2 * n + i ..][0..8], .little));
+                }
             }
             c = shift(blk[1], @truncate(c0)) ^ @as(u32, @truncate(c1));
             c = shift(blk[1], c) ^ @as(u32, @truncate(c2));
