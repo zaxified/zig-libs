@@ -28,7 +28,7 @@
 //!
 //! Controlled rounding (IEEE 754-2008 / General Decimal Arithmetic): the
 //! `RoundingMode` enum — `half_even` (banker's, the GDA default), `half_up`,
-//! `half_down`, `up`, `down`, `ceiling`, `floor` — drives `rescale`,
+//! `half_down`, `up`, `down`, `ceiling`, `floor`, `round_05up` — drives `rescale`,
 //! `roundToIntegral`, `quantize` and `divRound` (division computed at an
 //! explicit result scale). Modelled after Java `BigDecimal.RoundingMode` and
 //! the IBM General Decimal Arithmetic spec; pure integer paths, overflow →
@@ -282,6 +282,236 @@ pub const Decimal = struct {
         const signed: i256 = if (result_neg) -scaled else scaled;
         if (signed > std.math.maxInt(i128) or signed < std.math.minInt(i128)) return error.Overflow;
         return .{ .raw = @intCast(signed) };
+    }
+
+    // -----------------------------------------------------------------
+    // S2: remainder / multiples / powers / roots / extrema. Expected values
+    // are frozen from Python `decimal` (tools/py_oracle.py).
+    // -----------------------------------------------------------------
+
+    /// `-1`, `0` or `1`.
+    pub fn signum(self: Decimal) i8 {
+        return if (self.raw < 0) -1 else if (self.raw > 0) 1 else 0;
+    }
+
+    /// The smaller of two values. (There is no scale to break a tie by; see
+    /// `BigDecimal.min` for GDA's exponent rule.)
+    pub fn min(a: Decimal, b: Decimal) Decimal {
+        return if (b.raw < a.raw) b else a;
+    }
+
+    /// The larger of two values.
+    pub fn max(a: Decimal, b: Decimal) Decimal {
+        return if (b.raw > a.raw) b else a;
+    }
+
+    /// GDA `min-magnitude` (Python `min_mag`): the smaller absolute value; equal
+    /// magnitudes (`-3` vs `3`) fall back to `min`.
+    pub fn minMag(a: Decimal, b: Decimal) Decimal {
+        const aa = @abs(a.raw);
+        const ab = @abs(b.raw);
+        if (aa != ab) return if (aa < ab) a else b;
+        return a.min(b);
+    }
+
+    /// GDA `max-magnitude` (Python `max_mag`): the larger absolute value; equal
+    /// magnitudes fall back to `max`.
+    pub fn maxMag(a: Decimal, b: Decimal) Decimal {
+        const aa = @abs(a.raw);
+        const ab = @abs(b.raw);
+        if (aa != ab) return if (aa > ab) a else b;
+        return a.max(b);
+    }
+
+    /// Remainder of the **truncated** division, `a - b·trunc(a/b)`: the sign of
+    /// the dividend, like Python `Decimal % Decimal`, GDA `remainder` and bxp's
+    /// MOD (`-7 rem 3 = -1`, `7 rem -3 = 1`). Exact; `|result| < |b|`, so it
+    /// never overflows. `error.DivisionByZero` on `b = 0`.
+    pub fn rem(a: Decimal, b: Decimal) error{DivisionByZero}!Decimal {
+        if (b.raw == 0) return error.DivisionByZero;
+        // i256: `@rem(minInt, -1)` is not defined on i128; the value is 0.
+        return .{ .raw = @intCast(@rem(@as(i256, a.raw), @as(i256, b.raw))) };
+    }
+
+    /// GDA `divide-integer` (Python `a // b`): the integer part of `a / b`,
+    /// truncated toward zero, as a plain integer. `error.DivisionByZero` on
+    /// `b = 0`; `error.Overflow` when the quotient leaves `i128` (only
+    /// possible for a divisor below 1: `1e26 // 1e-12`).
+    pub fn divideInteger(a: Decimal, b: Decimal) DivError!i128 {
+        if (b.raw == 0) return error.DivisionByZero;
+        const q = @divTrunc(@as(i256, a.raw), @as(i256, b.raw));
+        if (q > std.math.maxInt(i128) or q < std.math.minInt(i128)) return error.Overflow;
+        return @intCast(q);
+    }
+
+    /// GDA `remainder-near` (Python `a.remainder_near(b)`): `a - b·n` for the
+    /// integer `n` nearest `a / b`, a tie to the even `n`; the sign may be
+    /// either and `|result| <= |b| / 2`. Exact, never overflows.
+    /// `error.DivisionByZero` on `b = 0`.
+    pub fn remainderNear(a: Decimal, b: Decimal) error{DivisionByZero}!Decimal {
+        if (b.raw == 0) return error.DivisionByZero;
+        const an: i256 = a.raw;
+        const bn: i256 = b.raw;
+        var r = @rem(an, bn);
+        const ar = if (r < 0) -r else r;
+        const ab = if (bn < 0) -bn else bn;
+        const twice = ar * 2;
+        if (twice > ab or (twice == ab and @rem(@divTrunc(an, bn), 2) != 0)) {
+            r = if (r > 0) r - ab else r + ab;
+        }
+        return .{ .raw = @intCast(r) };
+    }
+
+    /// Round to the nearest multiple of `m` with `mode` — bxp's MROUND, Excel
+    /// `MROUND`/`CEILING`/`FLOOR` in one: `roundToMultiple(0.075, 0.05,
+    /// .half_up)` is `0.1`, `(12.37, 0.05, .half_even)` is `12.35`. The sign of
+    /// `m` is ignored (only the step size matters); the sign of `x` is kept
+    /// (`.ceiling`/`.floor` are directed on the signed value). Exact.
+    /// `error.DivisionByZero` on `m = 0`; `error.Overflow` when the multiple
+    /// leaves the range.
+    pub fn roundToMultiple(x: Decimal, m: Decimal, mode: RoundingMode) DivError!Decimal {
+        if (m.raw == 0) return error.DivisionByZero;
+        const step: i256 = if (m.raw < 0) -@as(i256, m.raw) else m.raw;
+        // Both operands carry the same scale, so it cancels in the quotient.
+        const count = divRoundWithMode(@as(i256, x.raw), step, mode);
+        const v = count * step;
+        if (v > std.math.maxInt(i128) or v < std.math.minInt(i128)) return error.Overflow;
+        return .{ .raw = @intCast(v) };
+    }
+
+    /// `PowError`: `Overflow` = the result leaves the range; `DivisionByZero` =
+    /// `0` to a negative power; `ResultTooLarge` = the *exact* power would need
+    /// more than `BigDecimal.max_result_digits` digits (the digit budget of the
+    /// arbitrary-precision core; only reachable for a base within a few ulps of
+    /// 1 or 0 and an exponent in the thousands -- the clear cases are decided
+    /// before computing).
+    pub const PowError = error{ Overflow, DivisionByZero, ResultTooLarge } || std.mem.Allocator.Error;
+
+    /// `self^n` for any integer `n`, computed **exactly** and rounded once to 12
+    /// places, **half_even** (Python `Decimal ** int` at unlimited precision,
+    /// then `quantize(1e-12)`): `1.1^2` is `1.21`, `3^-1` is `0.333333333333`.
+    /// Exact whenever the true power has at most 12 fractional digits. `x^0`
+    /// is `1` for every `x`, zero included (as `BigDecimal.pow` and Java; Python
+    /// raises for `0^0`). Needs an allocator for the exact intermediate.
+    pub fn pow(self: Decimal, allocator: std.mem.Allocator, n: i32) PowError!Decimal {
+        if (n == 0) return Decimal.one;
+        if (self.raw == 0) return if (n < 0) error.DivisionByZero else Decimal.zero;
+        if (self.raw == scale_factor) return Decimal.one;
+        if (self.raw == -scale_factor) return if (n & 1 == 0) Decimal.one else self;
+        // |x| >= 2 or |x| <= 1/2 with a large exponent: the answer is out of range
+        // or below half an ulp (2^88 > i128 max; 2^-41 < 5e-13), whatever the digits.
+        const mag = @abs(self.raw);
+        const big_base = mag >= 2 * @as(u128, @intCast(scale_factor));
+        const small_base = mag <= @as(u128, @intCast(scale_factor)) / 2;
+        const e: u32 = @abs(n);
+        if (big_base or small_base) {
+            const grows = big_base == (n > 0); // the magnitude of the result grows
+            if (grows and e >= 88) return error.Overflow;
+            if (!grows and e >= 41) return Decimal.zero; // < 4.6e-13, half_even rounds to 0
+        }
+        if (e > std.math.maxInt(i32)) return error.ResultTooLarge;
+
+        var b = try self.toBigDecimal(allocator);
+        defer b.deinit();
+        var nb = try BigDecimal.normalize(allocator, b); // fewer digits, same value
+        defer nb.deinit();
+        var p = BigDecimal.pow(allocator, nb, @intCast(e)) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Overflow, error.ResultTooLarge => return error.ResultTooLarge,
+            error.NegativeExponent => unreachable,
+        };
+        defer p.deinit();
+        if (n > 0) return Decimal.fromBigDecimal(allocator, p, .half_even) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Overflow => return error.Overflow,
+        };
+        var unit = try BigDecimal.fromInt(allocator, 1);
+        defer unit.deinit();
+        // 1 / x^e correctly rounded at 12 places, then it is already at scale 12.
+        var inv = BigDecimal.div(allocator, unit, p, scale, .half_even) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DivisionByZero => unreachable, // x != 0
+            error.Overflow => return error.ResultTooLarge,
+        };
+        defer inv.deinit();
+        return Decimal.fromBigDecimal(allocator, inv, .half_even) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Overflow => return error.Overflow,
+        };
+    }
+
+    /// Square root **correctly rounded to 12 places** (the nearest raw value to
+    /// `√self`; a tie cannot occur, `k + 1/2` squared is never an integer) --
+    /// `sqrt(2)` is `1.414213562373`, `sqrt(6.25)` is `2.5`, and the same value
+    /// `BigDecimal.sqrt` gives rounded once. Exact integer math (`⌊√(raw·10^12)⌋`
+    /// on a `u256`, one comparison for the rounding), allocation-free.
+    /// `error.NegativeOperand` for a negative value.
+    pub fn sqrt(self: Decimal) error{NegativeOperand}!Decimal {
+        if (self.raw < 0) return error.NegativeOperand;
+        // value = raw/10^12, root in raw units = √(raw · 10^12), raw·10^12 < 2^168.
+        const n: u256 = @as(u256, @intCast(self.raw)) * @as(u256, @intCast(scale_factor));
+        const k = isqrt256(n);
+        const up = n > k * k + k; // √n > k + 1/2  <=>  n > k² + k
+        return .{ .raw = @intCast(k + @intFromBool(up)) };
+    }
+
+    // -----------------------------------------------------------------
+    // Fixed-places output.
+    // -----------------------------------------------------------------
+
+    /// Capacity `toStringFixed(buf, places, …)` can need: sign, up to 27
+    /// integer digits, and `places` fraction digits with the point.
+    pub fn fixedBufLen(places: u32) usize {
+        return 1 + 27 + (if (places > 0) @as(usize, places) + 1 else 0);
+    }
+
+    /// Print rounded to exactly `places` fractional digits with `mode`, trailing
+    /// zeros kept (`2.5` at 3 places is `2.500`, `7` at 2 is `7.00`); `places`
+    /// above 12 pads with zeros. Rounds on the exact value in `i256`, so no
+    /// `Overflow` is possible even when rounding carries past the range's last
+    /// integer: the text is not a `Decimal`. There is no negative zero
+    /// (`-0.004` at 2 places prints `0.00`). `error.NoSpaceLeft` when `buf` is
+    /// shorter than `fixedBufLen(places)` requires for this value.
+    pub fn toStringFixed(self: Decimal, buf: []u8, places: u32, mode: RoundingMode) error{NoSpaceLeft}![]const u8 {
+        const p: u32 = @min(places, scale);
+        // Magnitude at 10^-p, rounded (sign-aware for the directed modes).
+        const q: i256 = if (p == scale)
+            self.raw
+        else
+            divRoundWithMode(@as(i256, self.raw), pow10_256(scale - p), mode);
+        const negative = q < 0;
+        var m: u256 = @intCast(if (negative) -q else q);
+        var tmp: [48]u8 = undefined; // 28 digits at most, plus zero padding below
+        var nd: usize = 0;
+        while (nd < p + 1 or m != 0) : (nd += 1) {
+            tmp[nd] = @intCast('0' + m % 10);
+            m /= 10;
+        }
+        const need = @intFromBool(negative) + nd + (if (places > 0) 1 + @as(usize, places) else 0);
+        if (need > buf.len) return error.NoSpaceLeft;
+        var i: usize = 0;
+        if (negative) {
+            buf[0] = '-';
+            i = 1;
+        }
+        var k = nd;
+        while (k > p) {
+            k -= 1;
+            buf[i] = tmp[k];
+            i += 1;
+        }
+        if (places > 0) {
+            buf[i] = '.';
+            i += 1;
+            while (k > 0) {
+                k -= 1;
+                buf[i] = tmp[k];
+                i += 1;
+            }
+            @memset(buf[i..][0 .. places - p], '0');
+            i += places - p;
+        }
+        return buf[0..i];
     }
 
     // -----------------------------------------------------------------
@@ -639,6 +869,18 @@ pub const Decimal = struct {
     }
 };
 
+/// ⌊√n⌋ (Newton from a power-of-two upper bound). `n` below 2^200 in practice.
+fn isqrt256(n: u256) u256 {
+    if (n < 2) return n;
+    const bits: u32 = 256 - @clz(n);
+    var x: u256 = @as(u256, 1) << @intCast((bits + 1) / 2); // >= √n
+    while (true) {
+        const y = (x + n / x) >> 1;
+        if (y >= x) return x;
+        x = y;
+    }
+}
+
 /// 10^e as i256, for e in [0, 60] (10^60 ≪ i256 max ≈ 5.7e76; callers bound
 /// e — most at `max_pow10`, `divRound` up to 60). Runtime loop — the exponent
 /// is bounded and small, so this is not a hot path worth a lookup table.
@@ -684,6 +926,11 @@ fn divRoundMag(n: i256, d: i256, result_neg: bool, mode: RoundingMode) i256 {
             .half_up => r >= d - r,
             .half_down => r > d - r,
             .half_even => if (r != d - r) r > d - r else @rem(q, 2) != 0,
+            // GDA ROUND_05UP: away from zero iff the last kept digit is 0 or 5.
+            .round_05up => blk: {
+                const last = @rem(q, 10);
+                break :blk last == 0 or last == 5;
+            },
         };
         if (bump) q += 1;
     }
@@ -695,7 +942,8 @@ fn divRoundMag(n: i256, d: i256, result_neg: bool, mode: RoundingMode) i256 {
 /// possible, so only the away-from-zero directions produce a nonzero result.
 fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
     return switch (mode) {
-        .up => true,
+        // round_05up: the kept quotient is 0, whose last digit is 0 -> away.
+        .up, .round_05up => true,
         .ceiling => !result_neg,
         .floor => result_neg,
         .down, .half_up, .half_down, .half_even => false,
@@ -711,6 +959,7 @@ fn roundsAwayWhenBelowHalf(result_neg: bool, mode: RoundingMode) bool {
 test {
     _ = @import("big.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("s2_test.zig");
 }
 
 // ---------------------------------------------------------------------------
@@ -926,27 +1175,28 @@ test "std.fmt {f} integration" {
 
 test "rounding truth table — all modes at scale 0 (BigDecimal javadoc inputs)" {
     try testing.expect(RoundingMode.default == .half_even);
-    const modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even };
-    const Case = struct { in: []const u8, want: [7][]const u8 };
+    const modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even, .round_05up };
+    const Case = struct { in: []const u8, want: [8][]const u8 };
     // Column order matches `modes`: up, down, ceiling, floor, half_up,
-    // half_down, half_even.
+    // half_down, half_even, round_05up (the last column is Python's
+    // `Decimal(in).quantize(Decimal(1), ROUND_05UP)`).
     const cases = [_]Case{
-        .{ .in = "5.5", .want = .{ "6", "5", "6", "5", "6", "5", "6" } },
-        .{ .in = "3.5", .want = .{ "4", "3", "4", "3", "4", "3", "4" } },
-        .{ .in = "2.6", .want = .{ "3", "2", "3", "2", "3", "3", "3" } },
-        .{ .in = "2.5", .want = .{ "3", "2", "3", "2", "3", "2", "2" } },
-        .{ .in = "2.4", .want = .{ "3", "2", "3", "2", "2", "2", "2" } },
-        .{ .in = "1.6", .want = .{ "2", "1", "2", "1", "2", "2", "2" } },
-        .{ .in = "1.1", .want = .{ "2", "1", "2", "1", "1", "1", "1" } },
-        .{ .in = "1.0", .want = .{ "1", "1", "1", "1", "1", "1", "1" } },
-        .{ .in = "-1.0", .want = .{ "-1", "-1", "-1", "-1", "-1", "-1", "-1" } },
-        .{ .in = "-1.1", .want = .{ "-2", "-1", "-1", "-2", "-1", "-1", "-1" } },
-        .{ .in = "-1.6", .want = .{ "-2", "-1", "-1", "-2", "-2", "-2", "-2" } },
-        .{ .in = "-2.4", .want = .{ "-3", "-2", "-2", "-3", "-2", "-2", "-2" } },
-        .{ .in = "-2.5", .want = .{ "-3", "-2", "-2", "-3", "-3", "-2", "-2" } },
-        .{ .in = "-2.6", .want = .{ "-3", "-2", "-2", "-3", "-3", "-3", "-3" } },
-        .{ .in = "-3.5", .want = .{ "-4", "-3", "-3", "-4", "-4", "-3", "-4" } },
-        .{ .in = "-5.5", .want = .{ "-6", "-5", "-5", "-6", "-6", "-5", "-6" } },
+        .{ .in = "5.5", .want = .{ "6", "5", "6", "5", "6", "5", "6", "6" } },
+        .{ .in = "3.5", .want = .{ "4", "3", "4", "3", "4", "3", "4", "3" } },
+        .{ .in = "2.6", .want = .{ "3", "2", "3", "2", "3", "3", "3", "2" } },
+        .{ .in = "2.5", .want = .{ "3", "2", "3", "2", "3", "2", "2", "2" } },
+        .{ .in = "2.4", .want = .{ "3", "2", "3", "2", "2", "2", "2", "2" } },
+        .{ .in = "1.6", .want = .{ "2", "1", "2", "1", "2", "2", "2", "1" } },
+        .{ .in = "1.1", .want = .{ "2", "1", "2", "1", "1", "1", "1", "1" } },
+        .{ .in = "1.0", .want = .{ "1", "1", "1", "1", "1", "1", "1", "1" } },
+        .{ .in = "-1.0", .want = .{ "-1", "-1", "-1", "-1", "-1", "-1", "-1", "-1" } },
+        .{ .in = "-1.1", .want = .{ "-2", "-1", "-1", "-2", "-1", "-1", "-1", "-1" } },
+        .{ .in = "-1.6", .want = .{ "-2", "-1", "-1", "-2", "-2", "-2", "-2", "-1" } },
+        .{ .in = "-2.4", .want = .{ "-3", "-2", "-2", "-3", "-2", "-2", "-2", "-2" } },
+        .{ .in = "-2.5", .want = .{ "-3", "-2", "-2", "-3", "-3", "-2", "-2", "-2" } },
+        .{ .in = "-2.6", .want = .{ "-3", "-2", "-2", "-3", "-3", "-3", "-3", "-2" } },
+        .{ .in = "-3.5", .want = .{ "-4", "-3", "-3", "-4", "-4", "-3", "-4", "-3" } },
+        .{ .in = "-5.5", .want = .{ "-6", "-5", "-5", "-6", "-6", "-5", "-6", "-6" } },
     };
     for (cases) |c| {
         const v = dec(c.in);
@@ -1060,7 +1310,7 @@ test "quantize — GDA/Python-style exponent" {
 // oracle.
 // ---------------------------------------------------------------------------
 
-const all_modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even };
+const all_modes = [_]RoundingMode{ .up, .down, .ceiling, .floor, .half_up, .half_down, .half_even, .round_05up };
 
 fn expectBigStr(b: BigDecimal, want: []const u8) !void {
     const s = try b.toStringAlloc(testing.allocator);

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — S2 batch (survey 2026-10-20). `RoundingMode.round_05up` (8th GDA mode; source-breaking
+  for an exhaustive `switch` — none in consumers). `Decimal`: `rem`, `divideInteger`, `remainderNear`,
+  `roundToMultiple` (bxp MROUND), `pow(gpa, i32)` (`PowError`, `0^0 = 1`), allocation-free correctly
+  rounded `sqrt`, `signum`, `min`/`max`/`minMag`/`maxMag`, `toStringFixed`. `BigDecimal`:
+  `roundToPrecision`/`divPrec` → `Rounded{value, inexact, rounded}` (GDA ideal exponent kept),
+  `divideInteger`, `remainderNear`, `compareTotal`, `maxMag`/`minMag`, `adjusted`, `toSci`/`toEng`,
+  `toStringFixed`, `{f}`. **Fix:** `BigDecimal.sqrt` over-rounded an exact root in `up`/`ceiling` when the
+  discarded digits were zero. Evidence: 14 851 frozen Python 3.14 cases (`tools/py_oracle.py`).
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-09** — tests: deterministic fuzz driver `DECIMAL_FUZZ` over the existing harnesses.
 - **2026-10-04** — **BEHAVIOURAL** fixes found by the mutation run: `Decimal.round(n)` with a rounding

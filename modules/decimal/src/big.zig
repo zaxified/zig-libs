@@ -256,17 +256,17 @@ pub const BigDecimal = struct {
         return .{ .coeff = coeff, .exponent = @intCast(exponent64) };
     }
 
-    /// Canonical **plain-notation** string — this module never emits
-    /// scientific notation (a deliberate scope cut; see SPEC.md). Unlike the
+    /// Canonical **plain-notation** string (`toSci`/`toEng` give GDA's
+    /// scientific/engineering forms). Unlike the
     /// fixed-scale `Decimal.toString`, trailing zeros are **not** trimmed:
     /// `coeff`/`exponent` *is* the value's actual stored precision (Java
     /// `BigDecimal` / GDA semantics — `1.50` and `1.5` are distinct
     /// `BigDecimal`s with different scales that happen to `order()` equal;
     /// see the `mulx011`/`mulx012`/`addx007`/`addx008` KAT below, which only
     /// pass because trailing zeros are preserved). Zero always prints as
-    /// plain `"0"` regardless of `exponent` or its sign bit — GDA's "ideal
-    /// exponent" preservation for zero (`0.00`, `-0.00`, `0E+2`) is a
-    /// documented non-goal, not an oversight (see `negate`'s doc comment).
+    /// plain `"0"` regardless of `exponent` or its sign bit; `toSci` and
+    /// `toStringFixed` show a zero's scale (`0.00`, `0E+2`), and no function
+    /// here surfaces a negative zero (see `negate`'s doc comment).
     pub fn toStringAlloc(self: BigDecimal, allocator: Allocator) Allocator.Error![]u8 {
         if (self.isZero()) return allocator.dupe(u8, "0");
 
@@ -325,12 +325,8 @@ pub const BigDecimal = struct {
         return out;
     }
 
-    // Note: no `std.fmt` `{f}` formatter is provided. The fixed-scale
-    // `Decimal.format` can be allocation-free because its output length is
-    // bounded (`str_buf_len`); an arbitrary-precision significand has no
-    // such bound, so formatting genuinely needs an allocator, and
-    // `std.Io.Writer`'s `format(self, writer)` callback signature has
-    // nowhere to thread one through. Call `toStringAlloc` directly instead.
+    // `format` (`{f}`), `toSci`, `toEng` and `toStringFixed` live in the S2
+    // section at the end of the struct; they need an allocator for the digits.
 
     // -----------------------------------------------------------------
     // Comparison — exact. Aligning exponents by exact widening (never
@@ -891,10 +887,21 @@ pub const BigDecimal = struct {
         defer ten_drop.deinit();
         var q = try Managed.init(allocator);
         errdefer q.deinit();
+        // The discarded part of ⌊√N⌋ is zero AND ⌊√N⌋² == N exactly iff the root
+        // is exact at the kept digits (e.g. √100.00 at 2 digits is exactly 10):
+        // then no rounding decision exists and every mode must agree. Without
+        // this, `up`/`ceiling`/`round_05up` would bump an exact root.
+        var exact_discard = false;
         {
             var rem = try Managed.init(allocator);
             defer rem.deinit();
             try q.divTrunc(&rem, &root, &ten_drop);
+            if (rem.eqlZero()) {
+                var sq = try Managed.init(allocator);
+                defer sq.deinit();
+                try sq.mul(&root, &root);
+                exact_discard = sq.toConst().order(n.toConst()) == .eq;
+            }
         }
 
         // Exact half-way test on the *true* root, not on ⌊√N⌋: the midpoint
@@ -914,7 +921,8 @@ pub const BigDecimal = struct {
             try four_n.add(&four_n, &four_n);
             break :blk four_n.toConst().order(mid.toConst());
         };
-        if (roundBump(mode, half, q.isOdd(), false)) try q.addScalar(&q, 1);
+        if (!exact_discard and roundBump(mode, half, q.isOdd(), try lastDigit05(allocator, mode, &q), false))
+            try q.addScalar(&q, 1);
 
         var exp64: i64 = m - @as(i64, k) + @as(i64, drop);
         // Rounding up can carry into an extra digit (…999 → 1000…): renormalise
@@ -973,6 +981,376 @@ pub const BigDecimal = struct {
         errdefer r.deinit();
         try r.pow(&a.coeff, e);
         return .{ .coeff = r, .exponent = @intCast(exp64) };
+    }
+
+    // -----------------------------------------------------------------
+    // Context-precision rounding (GDA "significant digits" semantics), the
+    // other half of the integer division family, a total order and the
+    // text forms GDA defines. Everything here is exact except where a
+    // `mode` is taken; expected values are frozen from Python `decimal`
+    // (tools/py_oracle.py -> src/testdata/s2_oracle.vec).
+    // -----------------------------------------------------------------
+
+    /// Outcome of an operation rounded to a number of significant digits, with
+    /// the two GDA condition flags it would have raised:
+    ///   `rounded`  digits were discarded (even if they were all zeros:
+    ///              `1.200` to 2 digits is `1.2`, rounded but not inexact);
+    ///   `inexact`  a nonzero part was discarded, so `value` differs from the
+    ///              true result.
+    /// The caller owns `value` (`deinit`).
+    pub const Rounded = struct {
+        value: BigDecimal,
+        inexact: bool,
+        rounded: bool,
+
+        pub fn deinit(self: *Rounded) void {
+            self.value.deinit();
+        }
+    };
+
+    /// `InvalidPrecision` = `prec == 0` (GDA precision is at least 1).
+    pub const PrecError = Error || error{InvalidPrecision};
+    /// `PrecisionTooLarge` = `prec > max_result_digits` (the digit budget).
+    pub const DivPrecError = DivError || error{ InvalidPrecision, PrecisionTooLarge };
+
+    /// Round `a` to `prec` significant digits with `mode` — GDA's unary `plus`
+    /// under a context of precision `prec` (Python `Context(prec=prec,
+    /// rounding=mode).plus(a)`). A value that already has at most `prec` digits
+    /// is returned unchanged (no trailing zeros are added or removed, flags
+    /// clear). Otherwise the surplus low digits are dropped through the same
+    /// `roundedDivMag` decision as `rescale`; a carry that makes the coefficient
+    /// `prec + 1` digits long (`9.99` to 2 digits is `10`, not `10.0`) is folded
+    /// back into the exponent, so the result never has more than `prec` digits.
+    /// `error.Overflow` if the exponent leaves `i32` or more than
+    /// `max_align_shift` digits must be dropped.
+    pub fn roundToPrecision(allocator: Allocator, a: BigDecimal, prec: u32, mode: RoundingMode) PrecError!Rounded {
+        if (prec == 0) return error.InvalidPrecision;
+        const digits = try a.precision(allocator);
+        if (digits <= prec) return .{ .value = try a.clone(), .inexact = false, .rounded = false };
+
+        const drop: u32 = digits - prec; // >= 1, and a is nonzero (zero has 1 digit)
+        if (drop > max_align_shift) return error.Overflow;
+        var exp64: i64 = @as(i64, a.exponent) + drop;
+        if (exp64 > std.math.maxInt(i32)) return error.Overflow;
+        const result_neg = !a.coeff.isPositive();
+
+        var num = try a.coeff.clone();
+        defer num.deinit();
+        num.abs();
+        var ten_drop = try pow10(allocator, drop);
+        defer ten_drop.deinit();
+        var q = try Managed.init(allocator);
+        errdefer q.deinit();
+        var r = try Managed.init(allocator);
+        defer r.deinit();
+        try q.divTrunc(&r, &num, &ten_drop);
+        const inexact = !r.eqlZero();
+        if (inexact) try applyRounding(allocator, &q, &r, &ten_drop, result_neg, mode);
+        try foldCarry(allocator, &q, &exp64, prec);
+        if (result_neg) q.negate();
+        return .{ .value = .{ .coeff = q, .exponent = @intCast(exp64) }, .inexact = inexact, .rounded = true };
+    }
+
+    /// `a / b` rounded to `prec` significant digits (GDA `divide` under a
+    /// context of that precision; Python `Context(prec=prec, rounding=mode)
+    /// .divide(a, b)`) — the context-precision counterpart of `div`, which
+    /// takes a result scale instead.
+    ///
+    /// An **exact** quotient that fits in `prec` digits is returned exactly, with
+    /// trailing zeros removed as far as the *ideal exponent*
+    /// `a.exponent - b.exponent` allows (`100/10` is `10`, `2.40/2` is `1.20`,
+    /// `1/4` is `0.25`), flags clear -- except `rounded` when the exact
+    /// quotient has more than `prec` digits at the ideal exponent and sheds
+    /// zeros (`2550E+7` at 3 digits is `255E+8`). An inexact quotient has exactly `prec`
+    /// digits and sets `inexact` and `rounded`. A zero dividend gives zero at the
+    /// ideal exponent. `error.DivisionByZero` on `b = 0`;
+    /// `error.InvalidPrecision` on `prec = 0`; `error.PrecisionTooLarge` past
+    /// `max_result_digits`; `error.Overflow` when an alignment needs more than
+    /// `max_align_shift` digits or the exponent leaves `i32`.
+    pub fn divPrec(allocator: Allocator, a: BigDecimal, b: BigDecimal, prec: u32, mode: RoundingMode) DivPrecError!Rounded {
+        if (prec == 0) return error.InvalidPrecision;
+        if (prec > max_result_digits) return error.PrecisionTooLarge;
+        if (b.isZero()) return error.DivisionByZero;
+        const ideal: i64 = @as(i64, a.exponent) - @as(i64, b.exponent);
+        if (ideal > std.math.maxInt(i32) or ideal < std.math.minInt(i32)) return error.Overflow;
+        if (a.isZero()) {
+            return .{
+                .value = .{ .coeff = try Managed.init(allocator), .exponent = @intCast(ideal) },
+                .inexact = false,
+                .rounded = false,
+            };
+        }
+        const result_neg = a.coeff.isPositive() != b.coeff.isPositive();
+        const da: i64 = try a.precision(allocator);
+        const db: i64 = try b.precision(allocator);
+
+        var num = try a.coeff.clone();
+        defer num.deinit();
+        num.abs();
+        var den = try b.coeff.clone();
+        defer den.deinit();
+        den.abs();
+
+        // Scale by 10^s so the truncated quotient has `prec` or `prec + 1`
+        // digits (da + s digits over db digits); one more step down if it has
+        // the extra digit, which leaves exactly `prec`.
+        var s: i64 = @as(i64, prec) + db - da;
+        var n2 = try Managed.init(allocator);
+        defer n2.deinit();
+        var d2 = try Managed.init(allocator);
+        defer d2.deinit();
+        var q = try Managed.init(allocator);
+        errdefer q.deinit();
+        var r = try Managed.init(allocator);
+        defer r.deinit();
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            const mag: i64 = if (s < 0) -s else s;
+            if (mag > max_align_shift) return error.Overflow;
+            var p = try pow10(allocator, @intCast(mag));
+            defer p.deinit();
+            if (s >= 0) {
+                try n2.mul(&num, &p);
+                try d2.copy(den.toConst());
+            } else {
+                try n2.copy(num.toConst());
+                try d2.mul(&den, &p);
+            }
+            try q.divTrunc(&r, &n2, &d2);
+            const qd = try (BigDecimal{ .coeff = q, .exponent = 0 }).precision(allocator);
+            if (qd <= prec) break;
+            std.debug.assert(attempt == 0 and qd == prec + 1);
+            s -= 1;
+        }
+
+        var e: i64 = ideal - s;
+        const exact = r.eqlZero();
+        if (exact) {
+            // Strip trailing zeros down toward the ideal exponent only.
+            var ten = try Managed.initSet(allocator, 10);
+            defer ten.deinit();
+            var quo = try Managed.init(allocator);
+            defer quo.deinit();
+            var rem = try Managed.init(allocator);
+            defer rem.deinit();
+            while (e < ideal) {
+                try quo.divTrunc(&rem, &q, &ten);
+                if (!rem.eqlZero()) break;
+                q.swap(&quo);
+                e += 1;
+            }
+        } else {
+            try applyRounding(allocator, &q, &r, &d2, result_neg, mode);
+            try foldCarry(allocator, &q, &e, prec);
+        }
+        if (e > std.math.maxInt(i32) or e < std.math.minInt(i32)) return error.Overflow;
+        if (result_neg) q.negate();
+        // An exact quotient above the ideal exponent had to shed trailing zeros to fit
+        // `prec` digits: GDA (and Python) flag that as Rounded, though not Inexact.
+        return .{ .value = .{ .coeff = q, .exponent = @intCast(e) }, .inexact = !exact, .rounded = !exact or e > ideal };
+    }
+
+    /// GDA `divide-integer` / Python `a // b`: the integer part of `a / b`,
+    /// truncated toward zero, with exponent 0 (zero is `0`). Exact. Both
+    /// operands are aligned to a common exponent first (`max_align_shift`
+    /// applies). `error.DivisionByZero` on `b = 0`.
+    pub fn divideInteger(allocator: Allocator, a: BigDecimal, b: BigDecimal) DivError!BigDecimal {
+        if (b.isZero()) return error.DivisionByZero;
+        var al = try alignPair(allocator, a, b);
+        defer al.deinit();
+        var q = try Managed.init(allocator);
+        errdefer q.deinit();
+        var r = try Managed.init(allocator);
+        defer r.deinit();
+        try q.divTrunc(&r, &al.an, &al.bn);
+        if (q.eqlZero()) q.setSign(true); // no negative zero
+        return .{ .coeff = q, .exponent = 0 };
+    }
+
+    /// GDA `remainder-near` / Python `a.remainder_near(b)`: `a - b·n` where `n`
+    /// is the integer **nearest** `a / b` (a tie goes to the even `n`). Unlike
+    /// `remainder` the sign may be either, and `|result| <= |b| / 2`. Exponent
+    /// `min(a.exponent, b.exponent)`. Exact. As `remainder`, no
+    /// `Division_impossible` (there is no context precision). `error
+    /// .DivisionByZero` on `b = 0`.
+    pub fn remainderNear(allocator: Allocator, a: BigDecimal, b: BigDecimal) DivError!BigDecimal {
+        if (b.isZero()) return error.DivisionByZero;
+        var al = try alignPair(allocator, a, b);
+        defer al.deinit();
+        var q = try Managed.init(allocator);
+        defer q.deinit();
+        var r = try Managed.init(allocator);
+        errdefer r.deinit();
+        try q.divTrunc(&r, &al.an, &al.bn); // truncated: r has a's sign
+        if (!r.eqlZero()) {
+            var ar = try r.clone();
+            defer ar.deinit();
+            ar.abs();
+            var ab = try al.bn.clone();
+            defer ab.deinit();
+            ab.abs();
+            var twice = try Managed.init(allocator);
+            defer twice.deinit();
+            try twice.add(&ar, &ar);
+            const c = twice.toConst().order(ab.toConst());
+            if (c == .gt or (c == .eq and q.isOdd())) {
+                // Step to the other neighbouring multiple: toward the other side
+                // of zero by |b|.
+                if (r.isPositive()) try r.sub(&r, &ab) else try r.add(&r, &ab);
+            }
+        }
+        if (r.eqlZero()) r.setSign(true);
+        return .{ .coeff = r, .exponent = al.lo };
+    }
+
+    /// GDA `compare-total` for finite numbers (Python `a.compare_total(b)`):
+    /// a total order. Numerically smaller is `.lt`; numerically equal values are
+    /// ordered by exponent so that **`1.0` is greater than `1.00`** (a larger
+    /// exponent is the greater representation of a positive value, the smaller
+    /// of a negative one: `-1.0 < -1.00`). `.eq` only when value and exponent
+    /// both agree. Zero has no sign here (this type surfaces no negative zero),
+    /// so `0E+2 > 0.00`. Unlike `order` it distinguishes `eql` operands.
+    pub fn compareTotal(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!std.math.Order {
+        const num = try order(allocator, a, b);
+        if (num != .eq) return num;
+        const c = std.math.order(a.exponent, b.exponent);
+        const negative = !a.isZero() and !a.coeff.isPositive(); // equal values: same sign
+        return if (negative) c.invert() else c;
+    }
+
+    /// GDA `max-magnitude` (Python `max_mag`): the operand with the larger
+    /// absolute value, as an owned clone. Equal magnitudes fall back to `max`
+    /// (so `max_mag(-1.0, 1.00)` is `1.00`).
+    pub fn maxMag(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
+        return if (try pickMag(allocator, a, b, true)) a.clone() else b.clone();
+    }
+
+    /// GDA `min-magnitude` (Python `min_mag`): the smaller absolute value;
+    /// equal magnitudes fall back to `min`.
+    pub fn minMag(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!BigDecimal {
+        return if (try pickMag(allocator, a, b, false)) a.clone() else b.clone();
+    }
+
+    /// GDA `adjusted`: the exponent of the most significant digit,
+    /// `exponent + precision - 1` (`123E+2` is 4, `0.00123` is -3). Zero has one
+    /// digit, so it is its own exponent. Fits `i64` always.
+    pub fn adjusted(self: BigDecimal, allocator: Allocator) Allocator.Error!i64 {
+        return @as(i64, self.exponent) + @as(i64, try self.precision(allocator)) - 1;
+    }
+
+    // -----------------------------------------------------------------
+    // Text forms. `toStringAlloc`/`format` stay plain notation (zero is
+    // always "0"); these are the GDA forms that keep a zero's scale.
+    // -----------------------------------------------------------------
+
+    /// GDA `to-scientific-string` (what Python's `str(Decimal)` prints):
+    /// `coefficient` and exponent are shown exactly as stored. Plain notation
+    /// when `exponent <= 0` and the adjusted exponent is >= -6
+    /// (`123.45`, `0.000001`, **`0.00`** — zero keeps its scale), otherwise
+    /// `d.dddE+n` / `dE-n` (`1.2E+3`, `1E-7`, `0E+2`). No negative zero.
+    /// Round-trips through `parse` (value and exponent).
+    pub fn toSci(self: BigDecimal, allocator: Allocator) Allocator.Error![]u8 {
+        return self.toExpString(allocator, false);
+    }
+
+    /// GDA `to-engineering-string` (Python `to_eng_string`): like `toSci`, but
+    /// the exponent is a multiple of three and 1–3 digits precede the point
+    /// (`123E+3`, `1.2E+6`; `1E+1` is `10`, zero-padded; a zero is `0.00E+3`).
+    pub fn toEng(self: BigDecimal, allocator: Allocator) Allocator.Error![]u8 {
+        return self.toExpString(allocator, true);
+    }
+
+    fn toExpString(self: BigDecimal, allocator: Allocator, eng: bool) Allocator.Error![]u8 {
+        const zero = self.isZero();
+        const raw = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
+        defer allocator.free(raw);
+        const neg = !zero and raw[0] == '-';
+        const digits: []const u8 = if (zero) "0" else if (neg) raw[1..] else raw;
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (neg) try out.append(allocator, '-');
+        const e: i64 = self.exponent;
+        const n: i64 = @intCast(digits.len);
+        const adj = e + n - 1;
+        if (e <= 0 and adj >= -6) {
+            try appendPlain(&out, allocator, digits, e);
+            return out.toOwnedSlice(allocator);
+        }
+        var sfx: [24]u8 = undefined;
+        if (!eng) {
+            try out.append(allocator, digits[0]);
+            if (digits.len > 1) {
+                try out.append(allocator, '.');
+                try out.appendSlice(allocator, digits[1..]);
+            }
+            try out.appendSlice(allocator, std.fmt.bufPrint(&sfx, "E{s}{d}", .{ if (adj < 0) "-" else "+", @abs(adj) }) catch unreachable);
+            return out.toOwnedSlice(allocator);
+        }
+        if (zero) {
+            // The exponent rounds *up* to a multiple of three; the difference
+            // becomes fractional zeros ("0E+1" is "0.00E+3").
+            const ee = e + @mod(-e, 3);
+            try out.append(allocator, '0');
+            if (ee > e) {
+                try out.append(allocator, '.');
+                try out.appendNTimes(allocator, '0', @intCast(ee - e));
+            }
+            try out.appendSlice(allocator, std.fmt.bufPrint(&sfx, "E{s}{d}", .{ if (ee < 0) "-" else "+", @abs(ee) }) catch unreachable);
+            return out.toOwnedSlice(allocator);
+        }
+        const m = @mod(adj, 3);
+        const ee = adj - m;
+        const ints: usize = @intCast(m + 1);
+        if (digits.len <= ints) {
+            try out.appendSlice(allocator, digits);
+            try out.appendNTimes(allocator, '0', ints - digits.len);
+        } else {
+            try out.appendSlice(allocator, digits[0..ints]);
+            try out.append(allocator, '.');
+            try out.appendSlice(allocator, digits[ints..]);
+        }
+        if (ee != 0) try out.appendSlice(allocator, std.fmt.bufPrint(&sfx, "E{s}{d}", .{ if (ee < 0) "-" else "+", @abs(ee) }) catch unreachable);
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Fixed-places plain notation: round to exactly `places` fractional digits
+    /// with `mode` (`rescale` to exponent `-places`) and print it with that many
+    /// digits, trailing zeros and a zero included — `1.5` at 3 places is
+    /// `1.500`, `0` at 2 is `0.00`. A negative `places` rounds to
+    /// tens/hundreds/… and prints an integer (`1250` at -2, `half_up`: `1300`).
+    /// No negative zero (`-0.4` at 0 places is `0`). `error.Overflow` as
+    /// `rescale`.
+    pub fn toStringFixed(self: BigDecimal, allocator: Allocator, places: i32, mode: RoundingMode) Error![]u8 {
+        const exp64: i64 = -@as(i64, places);
+        if (exp64 > std.math.maxInt(i32)) return error.Overflow;
+        var r = try rescale(allocator, self, @intCast(exp64), mode);
+        defer r.deinit();
+        const zero = r.isZero();
+        const raw = try r.coeff.toConst().toStringAlloc(allocator, 10, .lower);
+        defer allocator.free(raw);
+        const neg = !zero and raw[0] == '-';
+        const digits: []const u8 = if (zero) "0" else if (neg) raw[1..] else raw;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (neg) try out.append(allocator, '-');
+        if (r.exponent > 0 and zero) {
+            try out.append(allocator, '0');
+        } else {
+            try appendPlain(&out, allocator, digits, r.exponent);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// `std.fmt` integration: `{f}` prints the plain notation of
+    /// `toStringAlloc` (zero is `0`; use `toSci` to keep a zero's scale).
+    /// Needs memory for the digits, taken from the coefficient's own
+    /// allocator; a failure surfaces as `error.WriteFailed`.
+    pub fn format(self: BigDecimal, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const allocator = self.coeff.allocator;
+        const s = self.toStringAlloc(allocator) catch return error.WriteFailed;
+        defer allocator.free(s);
+        try writer.writeAll(s);
     }
 };
 
@@ -1034,6 +1412,105 @@ pub fn f64Shortest(x: f64) error{NotFinite}!F64Decimal {
     }
     const exp = std.fmt.parseInt(i32, text[i + 1 ..], 10) catch unreachable; // "e" + optional '-' + digits
     return .{ .neg = neg, .digits = digits, .exp10 = if (digits == 0) 0 else exp - frac_digits };
+}
+
+/// Plain-notation body for an unsigned digit string at `exponent`: digits and
+/// zeros for `exponent >= 0`, otherwise the point inserted (leading `0.` and
+/// zero padding when the digits are fewer than the fractional places).
+fn appendPlain(out: *std.ArrayList(u8), allocator: Allocator, digits: []const u8, exponent: i64) Allocator.Error!void {
+    if (exponent >= 0) {
+        try out.appendSlice(allocator, digits);
+        try out.appendNTimes(allocator, '0', @intCast(exponent));
+        return;
+    }
+    const frac: usize = @intCast(-exponent);
+    if (digits.len > frac) {
+        const int_len = digits.len - frac;
+        try out.appendSlice(allocator, digits[0..int_len]);
+        try out.append(allocator, '.');
+        try out.appendSlice(allocator, digits[int_len..]);
+    } else {
+        try out.appendSlice(allocator, "0.");
+        try out.appendNTimes(allocator, '0', frac - digits.len);
+        try out.appendSlice(allocator, digits);
+    }
+}
+
+/// Both operands' coefficients widened (exactly) to the smaller exponent.
+const Aligned = struct {
+    an: Managed,
+    bn: Managed,
+    lo: i32,
+
+    fn deinit(self: *Aligned) void {
+        self.an.deinit();
+        self.bn.deinit();
+    }
+};
+
+fn alignPair(allocator: Allocator, a: BigDecimal, b: BigDecimal) BigDecimal.Error!Aligned {
+    const lo = @min(a.exponent, b.exponent);
+    var an = if (a.exponent == lo)
+        try a.coeff.clone()
+    else
+        try scaleUp(allocator, &a.coeff, try alignShift(a.exponent, lo));
+    errdefer an.deinit();
+    const bn = if (b.exponent == lo)
+        try b.coeff.clone()
+    else
+        try scaleUp(allocator, &b.coeff, try alignShift(b.exponent, lo));
+    return .{ .an = an, .bn = bn, .lo = lo };
+}
+
+/// `max_mag`/`min_mag` operand selection (`true` = `a`): larger/smaller
+/// absolute value; equal magnitudes defer to the `max`/`min` rule.
+fn pickMag(allocator: Allocator, a: BigDecimal, b: BigDecimal, want_max: bool) BigDecimal.Error!bool {
+    var aa = try a.clone();
+    defer aa.deinit();
+    aa.absVal();
+    var bb = try b.clone();
+    defer bb.deinit();
+    bb.absVal();
+    switch (try BigDecimal.order(allocator, aa, bb)) {
+        .gt => return want_max,
+        .lt => return !want_max,
+        .eq => return pickA(allocator, a, b, want_max),
+    }
+}
+
+/// After rounding up, a coefficient can have grown to `prec + 1` digits
+/// (`99 + 1 = 100`): it is then exactly `10^prec`, so drop one trailing zero
+/// into the exponent.
+fn foldCarry(allocator: Allocator, q: *Managed, exp: *i64, prec: u32) Allocator.Error!void {
+    if ((try (BigDecimal{ .coeff = q.*, .exponent = 0 }).precision(allocator)) <= prec) return;
+    var ten = try Managed.initSet(allocator, 10);
+    defer ten.deinit();
+    var quo = try Managed.init(allocator);
+    defer quo.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    try quo.divTrunc(&rem, q, &ten);
+    std.debug.assert(rem.eqlZero());
+    q.swap(&quo);
+    exp.* += 1;
+}
+
+/// The rounding decision for a **nonzero** remainder `r` of `q = ⌊num/den⌋`
+/// (`result_neg`: sign of the eventual result), applied to `q` in place.
+/// Shared by `roundedDivMag`, `roundToPrecision` and `divPrec`.
+fn applyRounding(
+    allocator: Allocator,
+    q: *Managed,
+    r: *const Managed,
+    den: *const Managed,
+    result_neg: bool,
+    mode: RoundingMode,
+) Allocator.Error!void {
+    var two_r = try Managed.init(allocator);
+    defer two_r.deinit();
+    try two_r.add(r, r);
+    const half = two_r.order(den.*);
+    if (roundBump(mode, half, q.isOdd(), try lastDigit05(allocator, mode, q), result_neg)) try q.addScalar(q, 1);
 }
 
 /// Exact: multiply `coeff` by `10^shift`. This is the "gain precision"
@@ -1099,13 +1576,17 @@ fn pickA(allocator: Allocator, a: BigDecimal, b: BigDecimal, want_max: bool) Big
 ///                 true root against the midpoint.)
 ///   `q_odd`       parity of the truncated quotient, for the `half_even`
 ///                 tie-break.
+///   `q_05`        whether the last digit of the truncated quotient is 0 or 5,
+///                 for `round_05up` (computed only when the mode needs it, see
+///                 `lastDigit05`; `false` otherwise).
 ///   `result_neg`  sign the result will eventually carry — the directed modes
 ///                 `ceiling`/`floor` are the only ones that depend on it.
 ///
 /// Callers must only reach this with a **nonzero** discarded remainder; an
 /// exact result needs no decision and every mode agrees on it.
-fn roundBump(mode: RoundingMode, half: std.math.Order, q_odd: bool, result_neg: bool) bool {
+fn roundBump(mode: RoundingMode, half: std.math.Order, q_odd: bool, q_05: bool, result_neg: bool) bool {
     return switch (mode) {
+        .round_05up => q_05,
         .up => true,
         .down => false,
         .ceiling => !result_neg,
@@ -1192,8 +1673,25 @@ fn roundedDivMag(
     //   half_even above/below half decide; a tie rounds to even (bump iff q odd)
     //   up/down   unconditional; ceiling/floor sign-directed (q is a magnitude,
     //             so the eventual sign is `result_neg`).
-    if (roundBump(mode, half, q.isOdd(), result_neg)) try q.addScalar(&q, 1);
+    if (roundBump(mode, half, q.isOdd(), try lastDigit05(allocator, mode, &q), result_neg)) try q.addScalar(&q, 1);
     return q;
+}
+
+/// For `round_05up` only: is the last decimal digit of `q` 0 or 5? (One
+/// `divTrunc` by 10; the limb's low bits cannot answer it because 2^64 is not
+/// a multiple of 10.) Every other mode does not look at it, so it costs nothing
+/// there and returns `false`.
+fn lastDigit05(allocator: Allocator, mode: RoundingMode, q: *const Managed) Allocator.Error!bool {
+    if (mode != .round_05up) return false;
+    var ten = try Managed.initSet(allocator, 10);
+    defer ten.deinit();
+    var quo = try Managed.init(allocator);
+    defer quo.deinit();
+    var rem = try Managed.init(allocator);
+    defer rem.deinit();
+    try quo.divTrunc(&rem, q, &ten);
+    const d = rem.toInt(u8) catch unreachable; // 0..9
+    return d == 0 or d == 5;
 }
 
 // ---------------------------------------------------------------------------
