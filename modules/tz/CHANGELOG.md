@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — R9 (loading the system's TZif files) rejected by the owner: zone data come only from the
+  official IANA release fetched by `scripts/gen/tz-gen/fetch-and-build.sh` (SHA-256 pinned). Documentation only.
 - **2026-10-20** — `tz.full` (`find`, `zones`): the pre-1970 history table is now reachable without editing
   the module; only a program that references it pays its ~78 KB. The generator emits one abbreviation table
   for both variants (in `tz_data.zig`; new pre-1970 names appended, default indices unchanged). Bench
