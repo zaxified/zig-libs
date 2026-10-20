@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const Decimal = @import("decimal").Decimal;
+const cldr = @import("cldr_locales.zig");
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -103,14 +104,10 @@ pub fn parseGroupedNumber(s: []const u8, thousands_sep: u8, decimal_sep: u8) ?De
 // parse: one grammar, configurable symbols (2026-10-04)
 // ---------------------------------------------------------------------------
 
-/// How digits are grouped left of the decimal separator.
-pub const Grouping = enum {
-    /// Groups of three: `1,234,567` (most of CLDR).
-    western,
-    /// Indian lakh/crore: the last group three, the others two —
-    /// `12,34,567` (CLDR pattern `#,##,##0`, e.g. `en_IN`, `hi`).
-    indian,
-};
+/// How digits are grouped left of the decimal separator. The variants are
+/// CLDR's decimal-format patterns as Babel reads them: `#,##0` western,
+/// `#,##,##0` indian, `#,#0` two (`tok`), `0` none (`en_US_POSIX`).
+pub const Grouping = cldr.Grouping;
 
 /// What `parse` accepts. Every separator is a UTF-8 slice, so the space-like
 /// separators of CLDR (U+00A0 in cs/ru/pl, U+202F in fr, `’` in de_CH) work.
@@ -139,34 +136,66 @@ pub const Options = struct {
     /// A trailing percent sign, optionally after one space-like character
     /// (`12,5 %` in cs/de/fr); the value is divided by 100.
     percent: bool = false,
+    /// Code point of the digit zero; the ten digits are `zero..zero+9`
+    /// (UTF-8 in the input). The default reads ASCII digits. Native digits of a
+    /// numbering system (`٠`, `०`, ...) come from `localeNative`. The result is
+    /// always built from ASCII digits. Digits of an exponent stay ASCII.
+    zero: u21 = '0',
 };
 
-/// CLDR number symbols for a handful of locales (group, decimal, grouping),
-/// as CLDR 46 publishes them — read off Babel 2.17's data by
-/// `tools/babel-oracle.py`, which also checks this table against it. Names
-/// are `lang` or `lang_REGION`; an unknown name gives null.
-pub fn locale(name: []const u8) ?Options {
-    const nbsp = "\u{00A0}";
-    const nnbsp = "\u{202F}";
-    const Row = struct { []const u8, []const u8, []const u8, Grouping };
-    const rows = [_]Row{
-        .{ "en", ",", ".", .western },    .{ "en_US", ",", ".", .western },
-        .{ "en_GB", ",", ".", .western }, .{ "en_IN", ",", ".", .indian },
-        .{ "hi", ",", ".", .indian },     .{ "ja", ",", ".", .western },
-        .{ "zh", ",", ".", .western },    .{ "de", ".", ",", .western },
-        .{ "de_AT", ".", ",", .western }, .{ "de_CH", "\u{2019}", ".", .western },
-        .{ "it", ".", ",", .western },    .{ "es", ".", ",", .western },
-        .{ "pt_BR", ".", ",", .western }, .{ "nl", ".", ",", .western },
-        .{ "da", ".", ",", .western },    .{ "fr", nnbsp, ",", .western },
-        .{ "cs", nbsp, ",", .western },   .{ "sk", nbsp, ",", .western },
-        .{ "pl", nbsp, ",", .western },   .{ "ru", nbsp, ",", .western },
-        .{ "uk", nbsp, ",", .western },   .{ "sv", nbsp, ",", .western },
-        .{ "fi", nbsp, ",", .western },   .{ "hu", nbsp, ",", .western },
-        .{ "nb", nbsp, ",", .western },
-    };
-    for (rows) |r| if (std.mem.eql(u8, r[0], name))
-        return .{ .group_sep = r[1], .decimal_sep = r[2], .grouping = r[3] };
+/// Folds one name byte for lookup: ASCII case-insensitive, `-` is `_`.
+fn fold(c: u8) u8 {
+    return if (c == '-') '_' else std.ascii.toLower(c);
+}
+
+fn nameOrder(name: []const u8, row_name: []const u8) std.math.Order {
+    // `row_name` is stored lowercased-sorted but keeps its CLDR case; fold both.
+    const n = @min(name.len, row_name.len);
+    for (name[0..n], row_name[0..n]) |a, b| {
+        const fa = fold(a);
+        const fb = fold(b);
+        if (fa != fb) return std.math.order(fa, fb);
+    }
+    return std.math.order(name.len, row_name.len);
+}
+
+fn findRow(name: []const u8) ?*const cldr.Row {
+    var lo: usize = 0;
+    var hi: usize = cldr.rows.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (nameOrder(name, cldr.rows[mid].name)) {
+            .eq => return &cldr.rows[mid],
+            .lt => hi = mid,
+            .gt => lo = mid + 1,
+        }
+    }
     return null;
+}
+
+/// CLDR number symbols of every locale identifier Babel 2.17 knows (1066;
+/// CLDR 46): group and decimal separator and grouping, with Latin digits —
+/// the `numbering_system='latn'` reading of Babel's `parse_decimal`. Read off
+/// Babel's data by `tools/babel-oracle.py --gen-table` into
+/// `src/cldr_locales.zig`. `name` is a CLDR identifier (`en`, `pt_BR`,
+/// `zh_Hant_TW`, `en_US_POSIX`), matched ASCII case-insensitively with `-` or
+/// `_`; an unknown name gives null. Binary search, no allocation.
+pub fn locale(name: []const u8) ?Options {
+    const r = findRow(name) orelse return null;
+    return .{ .group_sep = r.group, .decimal_sep = r.decimal, .grouping = r.grouping };
+}
+
+/// Like `locale`, but with the locale's own default numbering system: its
+/// digits (`zero`) and its group/decimal symbols (`ar_EG` → Arabic-Indic digits,
+/// `٬` and `٫`). For the 954 locales whose default is Latin this equals `locale`.
+pub fn localeNative(name: []const u8) ?Options {
+    const r = findRow(name) orelse return null;
+    return .{
+        .group_sep = r.native_group,
+        .decimal_sep = r.native_decimal,
+        .grouping = r.grouping,
+        .zero = cldr.systems[r.native].zero,
+    };
 }
 
 const space_likes = [_][]const u8{ " ", "\u{00A0}", "\u{202F}", "\u{2009}" };
@@ -184,6 +213,8 @@ fn isSpaceLike(s: []const u8) bool {
 ///            grouped                (one separator spelling throughout)
 ///     western grouped = d{1,3} (G d{3})+
 ///     indian  grouped = d{1,2} (G d{2})* G d{3}
+///     two     grouped = d{1,2} (G d{2})+
+///     none            = a group separator is refused (digits only)
 ///
 /// plus `(…)` and a trailing `-` when `opts` allows them. A grouped number
 /// must not start with `0` (`0.234` under `.` grouping is far more likely an
@@ -249,29 +280,28 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
     if (negative and !put(&buf, &n, '-')) return null;
 
     // Integer part: a run of digits, then group separators decide the shape.
-    const first_start = i;
-    while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
-    const first = body[first_start..i];
-    for (first) |c| if (!put(&buf, &n, c)) return null;
+    const first_start = n;
+    const first_len = scanDigits(body, &i, opts.zero, &buf, &n) orelse return null;
+    const first_zero = first_len > 0 and buf[first_start] == '0';
 
     var grouped = false;
     if (sepAt(body, i, opts)) |g| {
         // Grouped: the first group's width and the rest follow the pattern.
-        if (first.len == 0 or first[0] == '0') return null;
+        if (first_len == 0 or first_zero) return null;
+        if (opts.grouping == .none) return null; // the locale does not group
         const max_first: usize = if (opts.grouping == .western) 3 else 2;
-        if (first.len > max_first) return null;
+        if (first_len > max_first) return null;
         grouped = true;
         var widths_seen: usize = 0;
         while (std.mem.startsWith(u8, body[i..], g)) {
             i += g.len;
-            const gs = i;
-            while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
-            const w = i - gs;
-            for (body[gs..i]) |c| if (!put(&buf, &n, c)) return null;
+            const w = scanDigits(body, &i, opts.zero, &buf, &n) orelse return null;
             widths_seen += 1;
             const last = !std.mem.startsWith(u8, body[i..], g);
             switch (opts.grouping) {
                 .western => if (w != 3) return null,
+                .two => if (w != 2) return null,
+                .none => unreachable,
                 .indian => if (last) {
                     if (w != 3) return null;
                 } else if (w != 2) return null,
@@ -288,16 +318,14 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
     var has_frac = false;
     if (std.mem.startsWith(u8, body[i..], opts.decimal_sep)) {
         i += opts.decimal_sep.len;
-        const fs = i;
-        while (i < body.len and std.ascii.isDigit(body[i])) i += 1;
-        if (i == fs) return null; // `5.`
         if (!put(&buf, &n, '.')) return null;
-        for (body[fs..i]) |c| if (!put(&buf, &n, c)) return null;
+        const fl = scanDigits(body, &i, opts.zero, &buf, &n) orelse return null;
+        if (fl == 0) return null; // `5.`
         has_frac = true;
     }
     // Redundant with Decimal.parse refusing an empty mantissa (mutation
     // 2026-10-04 confirmed), kept because it states the grammar.
-    if (first.len == 0 and !has_frac) return null;
+    if (first_len == 0 and !has_frac) return null;
 
     // Exponent (ungrouped only), with the percent folded into it.
     var exp: i64 = 0;
@@ -324,6 +352,33 @@ pub fn parse(s: []const u8, opts: Options) ?Decimal {
         for (es) |c| if (!put(&buf, &n, c)) return null;
     }
     return Decimal.parse(buf[0..n]) catch null;
+}
+
+/// Appends the run of digits at `body[i.*..]` to `buf` as ASCII and advances
+/// `i`. A digit is `'0'..'9'` when `zero == '0'`, else the UTF-8 encoded code
+/// points `zero..zero+9`. Returns the digit count, or null when `buf` is full.
+fn scanDigits(body: []const u8, i: *usize, zero: u21, buf: *[96]u8, n: *usize) ?usize {
+    var count: usize = 0;
+    while (i.* < body.len) {
+        var d: u8 = undefined;
+        var w: usize = 1;
+        if (zero == '0') {
+            if (!std.ascii.isDigit(body[i.*])) break;
+            d = body[i.*];
+        } else {
+            w = std.unicode.utf8ByteSequenceLength(body[i.*]) catch break;
+            if (i.* + w > body.len) break;
+            const cp = std.unicode.utf8Decode(body[i.*..][0..w]) catch break;
+            if (cp < zero or cp > @as(u21, zero) + 9) break;
+            d = '0' + @as(u8, @intCast(cp - zero));
+        }
+        if (n.* >= buf.len) return null;
+        buf[n.*] = d;
+        n.* += 1;
+        i.* += w;
+        count += 1;
+    }
+    return count;
 }
 
 /// The group separator spelling that starts at `body[i]`, if any: the
@@ -400,13 +455,22 @@ test "parse: differential against Babel's strict parse_decimal over CLDR locales
     var lines = std.mem.splitScalar(u8, golden, '\n');
     var cases: usize = 0;
     var accepted: usize = 0;
+    var native_cases: usize = 0;
+    var locales_seen: usize = 0; // runs of equal names; the file is grouped by locale
+    var last_name: []const u8 = "";
     while (lines.next()) |line| {
         if (line.len == 0 or line[0] == '#') continue;
         var f = std.mem.splitScalar(u8, line, '\t');
-        const name = f.next().?;
+        const full = f.next().?;
         const input = f.next().?;
         const want = f.next().?;
-        const opts = locale(name) orelse return error.UnknownLocaleInGolden;
+        // `name:native` lines are read with the locale's own numbering system.
+        const native = std.mem.endsWith(u8, full, ":native");
+        const name = if (native) full[0 .. full.len - ":native".len] else full;
+        const opts = (if (native) localeNative(name) else locale(name)) orelse return error.UnknownLocaleInGolden;
+        if (native) native_cases += 1;
+        locales_seen += @intFromBool(!std.mem.eql(u8, name, last_name));
+        last_name = name;
         try expectParse(if (std.mem.eql(u8, want, "-")) null else want, input, opts);
         cases += 1;
         if (!std.mem.eql(u8, want, "-")) accepted += 1;
@@ -415,6 +479,116 @@ test "parse: differential against Babel's strict parse_decimal over CLDR locales
     // file must not pass as "no disagreement".
     try testing.expect(cases > 5000);
     try testing.expect(accepted > 1000);
+    // The extended part: >= 40 locales in latn, native-digit lines among them.
+    try testing.expect(locales_seen >= 40);
+    try testing.expect(native_cases > 100);
+}
+
+test "locale: CLDR table lookup" {
+    // The 25 original rows keep their Options.
+    const de = locale("de").?;
+    try testing.expectEqualStrings(".", de.group_sep);
+    try testing.expectEqualStrings(",", de.decimal_sep);
+    try testing.expectEqual(Grouping.western, de.grouping);
+    try testing.expectEqualStrings("\u{202F}", locale("fr").?.group_sep);
+    try testing.expectEqualStrings("\u{2019}", locale("de_CH").?.group_sep);
+    try testing.expectEqual(Grouping.indian, locale("en_IN").?.grouping);
+    // Case-insensitive, `-` and `_` alike.
+    try testing.expectEqualStrings(locale("zh_Hant_TW").?.group_sep, locale("ZH-hant-tw").?.group_sep);
+    try testing.expect(locale("pt-br") != null);
+    try testing.expect(locale("EN_us_posix") != null);
+    // Unknown, empty, a prefix of a real name, a real name plus junk.
+    for ([_][]const u8{ "", "xx", "e", "en_U", "en_USS", "english", "en US", "zz_ZZ" }) |n| {
+        try testing.expect(locale(n) == null);
+        try testing.expect(localeNative(n) == null);
+    }
+    // Every row is found by its own name (sorted for the binary search) and
+    // the table is strictly ordered.
+    var prev: []const u8 = "";
+    for (cldr.rows) |r| {
+        try testing.expect(locale(r.name) != null);
+        try testing.expect(nameOrder(prev, r.name) == .lt);
+        prev = r.name;
+    }
+    try testing.expect(cldr.rows.len > 1000);
+    // Native digits: ar_EG reads Arabic-Indic, a Latin locale keeps ASCII.
+    try testing.expectEqual(@as(u21, 0x660), localeNative("ar_EG").?.zero);
+    try testing.expectEqualStrings("\u{66C}", localeNative("ar_EG").?.group_sep);
+    try testing.expectEqualStrings("\u{66B}", localeNative("ar_EG").?.decimal_sep);
+    try testing.expectEqualStrings(",", locale("ar_EG").?.group_sep);
+    try testing.expectEqual(@as(u21, '0'), locale("ar_EG").?.zero);
+    try testing.expectEqual(@as(u21, '0'), localeNative("de").?.zero);
+    // Grouping kinds present in CLDR 46 / Babel 2.17: 1010 / 53 / 2 / 1.
+    var counts = [_]usize{ 0, 0, 0, 0 };
+    for (cldr.rows) |r| counts[@backingInt(r.grouping)] += 1;
+    try testing.expectEqual([_]usize{ 1010, 53, 2, 1 }, counts);
+}
+
+test "parse: native digits (ungrouped agree with Babel; grouped are ours alone)" {
+    // Ungrouped native digits: also in the golden file, spelled out here.
+    try expectParse("123.5", "\u{0661}\u{0662}\u{0663}\u{066B}\u{0665}", localeNative("ar_EG").?);
+    // Grouped: Babel's strict mode refuses these (it re-formats with Latin
+    // digits), so the expectations are hand-checked against the CLDR pattern.
+    const ar = localeNative("ar_EG").?; // ٬ group, ٫ decimal, Arabic-Indic
+    try expectParse("1234.5", "\u{0661}\u{066C}\u{0662}\u{0663}\u{0664}\u{066B}\u{0665}", ar);
+    try expectParse("-1234567", "-\u{0661}\u{066C}\u{0662}\u{0663}\u{0664}\u{066C}\u{0665}\u{0666}\u{0667}", ar);
+    try expectParse(null, "\u{0661}\u{066C}\u{0662}\u{0663}", ar); // group of two
+    try expectParse(null, "1\u{066C}234", ar); // ASCII digits are not ar_EG's native ones
+    try expectParse(null, "\u{0661}\u{0662}\u{0663}3", ar); // mixed digits
+    // The digit range ends at zero+9: U+066A (percent sign) is no digit.
+    try expectParse(null, "\u{0661}\u{066A}", ar);
+    try expectParse(null, "\u{0661}\xD9", ar); // truncated sequence
+    try expectParse(null, "\u{0661}\xFF\xFF", ar); // invalid UTF-8
+    // Devanagari with Indian grouping (ne: `,` group): 12,34,567.
+    const ne = localeNative("ne").?;
+    try testing.expectEqual(@as(u21, 0x966), ne.zero);
+    try expectParse("1234567", "\u{0967}\u{0968},\u{0969}\u{096A},\u{096B}\u{096C}\u{096D}", ne);
+    try expectParse(null, "\u{0967},\u{0968}\u{0969}\u{096A}\u{096B}", ne);
+    // Extended Arabic-Indic (fa) and an astral zero (Adlam, U+1E950).
+    const fa = localeNative("fa").?;
+    try testing.expectEqual(@as(u21, 0x6F0), fa.zero);
+    try expectParse("1234.5", "\u{06F1}\u{066C}\u{06F2}\u{06F3}\u{06F4}\u{066B}\u{06F5}", fa);
+    const adlm = Options{ .zero = 0x1E950 };
+    try expectParse("90.5", "\u{1E959}\u{1E950}.\u{1E955}", adlm);
+    try expectParse(null, "\u{1E95A}", adlm);
+    // Every system's ten digits map to 0..9, in order.
+    for (cldr.systems) |sy| {
+        var txt: [40]u8 = undefined;
+        var len: usize = 0;
+        for (1..10) |k| len += std.unicode.utf8Encode(@intCast(sy.zero + k), txt[len..]) catch unreachable;
+        try expectParse("123456789", txt[0..len], .{ .zero = sy.zero });
+        // zero+10 is not a digit.
+        const past = std.unicode.utf8Encode(@intCast(sy.zero + 10), txt[len..]) catch unreachable;
+        try expectParse(null, txt[0 .. len + past], .{ .zero = sy.zero });
+    }
+}
+
+test "parse: groups of two (.two) and no grouping (.none)" {
+    // tok: nbsp group, `,` decimal, pattern `#,#0.###`: d{1,2} (G d{2})+.
+    const tok = locale("tok").?;
+    try testing.expectEqual(Grouping.two, tok.grouping);
+    try expectParse("1234", "12\u{00A0}34", tok);
+    try expectParse("123", "1\u{00A0}23", tok);
+    try expectParse("1234567.5", "1\u{00A0}23\u{00A0}45\u{00A0}67,5", tok);
+    try expectParse(null, "123\u{00A0}45", tok); // first group at most two
+    try expectParse(null, "12\u{00A0}345", tok); // later groups exactly two
+    try expectParse(null, "12\u{00A0}3", tok);
+    try expectParse(null, "12\u{00A0}34\u{00A0}5", tok);
+    try expectParse(null, "0\u{00A0}12", tok); // leading-zero group
+    try expectParse("12345", "12345", tok); // ungrouped is fine
+    // en_US_POSIX: no grouping; digits and decimal only.
+    const posix = locale("en_US_POSIX").?;
+    try testing.expectEqual(Grouping.none, posix.grouping);
+    try expectParse("1234.5", "1234.5", posix);
+    try expectParse("0.25", "0.25", posix);
+    try expectParse(null, "1,234", posix);
+    try expectParse(null, "1,234.5", posix);
+    try expectParse(null, "12,34", posix);
+    try expectParse(null, ",234", posix);
+    try expectParse(null, "1,", posix);
+    // Also with a hand-built Options.
+    try expectParse(null, "1;234", .{ .group_sep = ";", .grouping = .none });
+    try expectParse("1234", "1234", .{ .group_sep = ";", .grouping = .none });
 }
 
 test "parse: CLDR space-like and apostrophe separators" {
