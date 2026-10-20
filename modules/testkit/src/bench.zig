@@ -209,6 +209,11 @@ pub fn Work(comptime Op: type) type {
         ours_foreign: ?[]const u8 = null,
         /// Wall time only for our side (see `timeIt`).
         wall_only: bool = false,
+        /// The card's reference has no such workload, so `ref` here names
+        /// the fastest candidate instead (aescbc's CTS rows: Go has no CTS,
+        /// OpenSSL does): the row counts for `Summary.worst_fast`, never for
+        /// the reference ratio.
+        fast_only: bool = false,
     };
 }
 
@@ -223,6 +228,8 @@ pub const Line = struct {
     spread: f64,
     same_count: bool,
     info: bool,
+    /// See `Work.fast_only`: `ref` is the fastest candidate's ratio.
+    fast_only: bool = false,
 };
 
 pub fn score(ours: Side, ref: Side, alt: ?Side, info: bool) Line {
@@ -258,7 +265,9 @@ pub const Summary = struct {
     /// count check, never for the ratios the card quotes.
     pub fn add(s: *Summary, l: Line) void {
         s.by_cycles = s.by_cycles and l.by_cycles;
-        if (!l.info) {
+        if (l.fast_only) {
+            if (!l.info) s.worst_fast = @max(s.worst_fast orelse 0, l.fast);
+        } else if (!l.info) {
             s.worst_ref = @max(s.worst_ref, l.ref);
             s.best_ref = @min(s.best_ref, l.ref);
             if (l.has_alt) s.worst_fast = @max(s.worst_fast orelse 0, l.fast);
@@ -309,7 +318,8 @@ pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, compt
             } else ours.add(timeIt(io, cyc, once, .{ctx}, x.wall_only));
             if (x.alt) |a| alt.add(try foreign(arena, io, run.name, run.exes[x.alt_exe], run.abs, a, &s.alt_banner));
         }
-        const l = score(ours, ref, if (x.alt != null) alt else null, x.info);
+        var l = score(ours, ref, if (x.alt != null) alt else null, x.info);
+        l.fast_only = x.fast_only;
         s.add(l);
         const by = l.by_cycles;
         try w.print("{s:<18} {d:>11.0} {d:>11.0} {d:>11.0} {d:>7.3} {d:>7.3} {d:>5.1}% {d:>5.1}% {d:>5.1}%  {d}{s}\n", .{
@@ -431,6 +441,15 @@ test "Summary: no alt anywhere leaves fastest unmeasured, not zero" {
     var s: Summary = .{};
     s.add(.{ .by_cycles = true, .ref = 0.9, .fast = 0.9, .has_alt = false, .spread = 0, .same_count = true, .info = false });
     try testing.expectEqual(@as(?f64, null), s.worst_fast);
+}
+
+test "Summary: a fast_only line counts for fastest, never for the reference ratio" {
+    var s: Summary = .{};
+    s.add(.{ .by_cycles = true, .ref = 0.8, .fast = 0.8, .has_alt = false, .spread = 0, .same_count = true, .info = false });
+    s.add(.{ .by_cycles = true, .ref = 1.21, .fast = 1.21, .has_alt = false, .spread = 0, .same_count = true, .info = false, .fast_only = true });
+    try testing.expectEqual(@as(f64, 0.8), s.worst_ref);
+    try testing.expectEqual(@as(f64, 0.8), s.best_ref);
+    try testing.expectEqual(@as(?f64, 1.21), s.worst_fast);
 }
 
 test "parseForeign: four (or three) tab-separated fields, name checked" {

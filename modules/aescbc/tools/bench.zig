@@ -191,7 +191,7 @@ pub fn main(init: std.process.Init) !u8 {
     inline for (@typeInfo(Op).@"enum".field_names, @typeInfo(Op).@"enum".field_values) |f_name, f_value| {
         const op: Op = @fromBackingInt(@intCast(f_value));
         if (std.mem.findScalar(Op, &openssl_only, op) != null)
-            try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .ref_exe = 1 })
+            try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .ref_exe = 1, .fast_only = true })
         else
             try ws.append(arena, .{ .name = f_name, .op = op, .ref = f_name, .alt = f_name, .ref_exe = 0, .alt_exe = 1 });
     }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **Added:** `bench.Work.fast_only` — a row whose `ref` side is the fastest candidate because the card's reference has no such workload (aescbc's CTS rows); it counts for `Summary.worst_fast`, never for the reference ratio. Since the 2026-10-17 move to `testkit.bench` such rows had gone into the reference ratio (aescbc read ref 1.21× Go from OpenSSL-only rows).
+
 - **2026-10-20** — **Changed (performance):** `fuzz.driver` renews its `SafeAllocator` per batch of seeds (1024, or 64 MiB allocated) instead of per seed; a counting `SeedLedger` still fails a leak on the seed that made it (`error.MemoryLeakDetected`, `FAIL … seed=N: memory leak`). Per-seed init + deinit was ~1 µs (`threads: [128]Thread`), 4.2× a 0.3 µs harness; now 1.03–1.07× a bare loop (`bench-testkit`, whose bare side now also allocates through a `SafeAllocator`). Tests: a leak past a batch boundary, realloc growth/shrink across batches.
 
 - **2026-10-19** — **Fix (test only):** pin the per-seed leak check of `runSeedsReporting` (a harness leaking in one seed returns `error.MemoryLeakDetected`; self-test, silent via `deinitLog(report)`). The leak log is no longer printed when `report` is false (S7 audit).
