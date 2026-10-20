@@ -473,6 +473,30 @@ Named as scope decisions, not omissions.
 
 ## Backlog / deferred
 
+**S2 plan — survey 2026-10-20** (Sonnet, read-only; reference Prometheus tsdb v3.15.0, Apache-2.0; also
+VictoriaMetrics, InfluxDB 3, QuestDB, TimescaleDB (Apache part only), nakabonne/tstorage). Key finding:
+`compact` (9.2× on ttydesk data) is called by NEITHER consumer — both run on raw 25 B/sample keys; wgs
+also bypasses `appendBatch` with raw `codec` calls (history.zig:185-215).
+
+| # | Item | Effort | Decision |
+|---|---|---|---|
+| R1 | `maintain(now, policy)` = compact + sweep + budget, and say consumers must run it | S | do |
+| R2 | Label matchers `!=`, `=~`, `!~` (scan-based first; the 0x04 postings partition only if series counts grow) | S→M | do (scan-based) |
+| R3 | `labelNames` / `labelValues` listing | S | do |
+| R4 | WAL + in-memory head (Prometheus' durability model) | L | **owner question** — the P axis depends on it (durable commit = 2 fsyncs) |
+| R5 | Per-bucket min/max/sum/count/last read helper over `Range` | S | do (downsampling storage: nobody in the reference layer) |
+| R6 | Cardinality limit `Options.max_series` → `error.TooManySeries`, bounded series cache | S | do |
+| R8 | Thread-safe `Db` (cache sync); readers already MVCC | M | document single-owner; later |
+| R11 | Consistent snapshot copy while writing | S-M | belongs to kvtree; document |
+| R13 | `deleteRange(series, from, to)` | S | do |
+| R14 | Coalesce small compacted blocks (sparse series: 25 → 20 B/sample only) | M | do |
+| — | WAL replay, exemplars, native histograms, PromQL, per-series retention, mmap | – | not doing (reasons in the survey; mmap is kvtree's) |
+
+Ahead: reader-during-writer via MVCC, crash sweeps at every storage side effect, out-of-order/overwrite
+with no window, negative timestamps, atomic multi-series `appendBatch`, exact `sweepToBudget`.
+Bench plan: Prometheus tsdb as a Go library (pin v3.15.0) — scrape-shaped append, bulk append, range
+query, matcher select, compaction size; equality by an FNV hash of (labels, ts, f64 bits).
+
 (survey 2026-09-30, re-checked 2026-10-04)
 - ~~**Sample compression**~~ — **done 2026-10-04** (§5b, `Db.compact`, `chunk.zig`).
 - ~~**Series deletion**~~ — **done 2026-10-04** (`Db.deleteSeries`).
