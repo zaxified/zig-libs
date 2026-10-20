@@ -29,7 +29,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference (P2) for this module's handshake and bulk rows. |
 
 **Where we are ahead:** nothing yet. **Where we are behind:** a full (EC)DHE handshake with a
-certificate works against OpenSSL 3.5's `s_client` and Zig std's client, sans-I/O or through the
+certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
+collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
 HelloRetryRequest, resumption, client certificates, KeyUpdate and the BoGo gate are still to come (milestones M1–M2, *Backlog*).
 
@@ -46,7 +47,8 @@ EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's F
 application data both ways and close_notify, over the record layer (header, in-place protection,
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
 OpenSSL 3.5's `s_client` (ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; all three
-suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI) and with Zig std's client;
+suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI), with Go's
+crypto/tls client (the same, Go's own defaults), with `tlsclient` and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
 certificate chain and private key from PEM. It is not yet a server to deploy:
 no HelloRetryRequest (a client that sent no share for the chosen group is refused), no
@@ -269,6 +271,17 @@ The receive side's refusals are the table under *Wire format*. Record protection
   `src/interop_replay_test.zig` drives a server with the same seed through `Connection` over
   OpenSSL's recorded octets and requires the recorded answer byte for byte (and refuses the
   recording with one octet flipped), in every test lane.
+- **External (foreign implementation):** Go 1.26.8 crypto/tls client (`tools/go_client/main.go`,
+  built by the same tool with `GOTOOLCHAIN=local`), ten more sessions in the same tool and the
+  same capture: Go's defaults (X25519MLKEM768, TLS_AES_128_GCM_SHA256), TLS_AES_256_GCM_SHA384
+  and TLS_CHACHA20_POLY1305_SHA256 (the server enabling only that suite: Go's TLS 1.3 suite
+  order cannot be configured), secp256r1 and secp384r1 as Go's only group, a P-384, an Ed25519
+  and an RSA-PSS certificate, ALPN `h2`, no SNI (verified by hand in `VerifyConnection`), and a
+  server without the hybrid taking Go's X25519 share without a retry. The Go client verifies the
+  chain with `x509.Certificate.Verify`, prints the negotiated version, suite, group (`CurveID`)
+  and ALPN — anchored on the end of the line, so `X25519` does not match `X25519MLKEM768`
+  (negative control 2026-10-20: the no-hybrid case against a server with the hybrid fails) —
+  and requires close_notify (`io.ReadAll` without an error).
 - **External (foreign implementation):** whole handshakes against Zig std's
   `crypto.tls.Client` (`src/handshake_test.zig`, in one thread through in-memory pipes): an
   ECDSA P-256 certificate (self-signed test fixture, `tools/test_certs.py`) verified by the
@@ -277,6 +290,12 @@ The receive side's refusals are the table under *Wire format*. Record protection
   a response and close_notify each way (std's client advertises `ed25519` but cannot verify it,
   so Ed25519 and RSA are covered by the OpenSSL sessions). The same handshake with P-256 and
   P-384 chains and keys loaded by `keys` from the openssl-written vectors (SEC1 and PKCS#8).
+  The same pipes with the collection's `tlsclient` (std's client with `x509.verifyChain`, grown
+  to Go's client options): P-256, P-384, Ed25519 and RSA-PSS certificates verified; every group
+  as the lone key share × every suite (12 handshakes); tlsclient's two default shares against a
+  server without the hybrid (X25519 taken, no retry) with ALPN `h2` — the client's
+  `ConnectionInfo` (suite, group, ALPN, peer chain) checked against the server's
+  `cipherSuite`/`negotiatedGroup`/`alpnProtocol`.
 - **External (foreign implementation):** `keys` on private keys in every PEM form the OpenSSL
   3.5.5 command line writes — `ecparam -genkey` (an `EC PARAMETERS` block, then SEC1), `ec`,
   `genpkey` (PKCS#8: P-256, P-384, Ed25519, RSA), `pkcs8 -topk8`, `rsa -traditional` (PKCS#1) —
@@ -385,8 +404,8 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 ## Backlog / deferred
 
-- **M1 (next):** interop with the Go client and `tlsclient`; a fuzz harness over `Server`; the
-  BoGo shim. (Done 2026-10-20: secp384r1 and P-384 certificates; the key loader.)
+- **M1 (next):** a fuzz harness over `Server`; the BoGo shim. (Done 2026-10-20: secp384r1 and
+  P-384 certificates; the key loader; interop with the Go client and `tlsclient`.)
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).

@@ -213,6 +213,8 @@ pub const Server = struct {
     server_application_secret: [48]u8 = @splat(0),
     /// The negotiated ALPN protocol (one of `config.alpn_protocols`).
     alpn: ?[]const u8 = null,
+    /// The negotiated key-exchange group (0: not chosen yet).
+    group: u16 = 0,
     sni_buf: [253]u8 = undefined,
     sni_len: ?u8 = null,
     peer_closed: bool = false,
@@ -252,6 +254,17 @@ pub const Server = struct {
 
     pub fn cipherSuite(self: *const Server) ?record.CipherSuite {
         return if (self.has_suite) self.suite else null;
+    }
+
+    /// The key-exchange group of the handshake (IANA code point), once the
+    /// ClientHello was accepted.
+    pub fn negotiatedGroup(self: *const Server) ?u16 {
+        return if (self.group != 0) self.group else null;
+    }
+
+    /// The ALPN protocol chosen (one of `Config.alpn_protocols`), if any.
+    pub fn alpnProtocol(self: *const Server) ?[]const u8 {
+        return self.alpn;
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -436,6 +449,7 @@ pub const Server = struct {
 
         self.suite = suite;
         self.has_suite = true;
+        self.group = group;
         switch (suite) {
             .aes_256_gcm_sha384 => {
                 self.transcript = .{ .sha384 = .{} };

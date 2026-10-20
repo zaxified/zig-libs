@@ -50,8 +50,9 @@ zeroed; the engine answers it with the matching alert.
 ## Tests
 
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
-and server messages byte-exact; OpenSSL 3.5 `s_client` sessions (`zig build interop-tlsserver`,
-replayed byte-exact in the tests); handshakes against Zig std's client; keys in every PEM form
+and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
+(`zig build interop-tlsserver`, replayed byte-exact in the tests); handshakes against Zig std's
+client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
 the `tlsserver-record`, `-inbound`, `-hello` and `-keys` harnesses (`SPEC.md` § Fuzzing). Dead
 stack: `src/stackprobe_test.zig` (ReleaseFast). Example: `zig build run-example-tlsserver`.

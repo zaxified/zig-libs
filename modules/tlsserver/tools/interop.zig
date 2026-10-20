@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-//! Interop: OpenSSL's `s_client` (a foreign TLS 1.3 client) against
+//! Interop: OpenSSL's `s_client` and Go's crypto/tls client
+//! (`tools/go_client/main.go`) — two foreign TLS 1.3 clients — against
 //! `tlsserver.Server` over loopback TCP, one connection per case.
 //!
 //!     zig build interop-tlsserver                     # run every case
@@ -10,17 +11,19 @@
 //!
 //! Each case: the server (a seeded CSPRNG, so its output is a function of
 //! what it receives) completes the handshake, receives "ping\n", answers
-//! "pong\n" and sends close_notify. A case passes when s_client exits 0,
+//! "pong\n" and sends close_notify. A case passes when the client exits 0,
 //! verified our certificate against the test CA file and SNI `localhost`,
 //! printed what the case expects (suite, group, signature type, ALPN) and
-//! received "pong". With `--capture` every octet each side sent is written
+//! received "pong" (the Go client also requires the close_notify). With `--capture` every octet each side sent is written
 //! to `src/interop_vectors.zig`; the module's hermetic test
 //! (`interop_replay_test.zig`) feeds the client's octets to a server with
 //! the same seed through `Connection` and requires the same octets back —
-//! so "OpenSSL accepted it" keeps being checked in every test lane, with no
-//! OpenSSL there.
+//! so "OpenSSL / Go accepted it" keeps being checked in every test lane,
+//! with neither there.
 //!
-//! Needs `openssl` (3.x) on PATH. Run from the repository root (`zig build`
+//! Needs `openssl` (3.x) and `go` (1.25+: `ConnectionState.CurveID`) on
+//! PATH; the Go client is built into `.zig-cache/tlsserver-interop` first
+//! (`GOTOOLCHAIN=local`, nothing downloaded). Run from the repository root (`zig build`
 //! does) or pass `--repo-root <path>`.
 
 const std = @import("std");
@@ -39,17 +42,20 @@ const usage =
 
 pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
 
+const Peer = enum { openssl, go };
+
 const Case = struct {
     name: []const u8,
+    client: Peer = .openssl,
     why: []const u8,
     cert: CertKind = .p256,
     seed: u8,
     suites: []const record.CipherSuite = &tlsserver.server.default_cipher_suites,
     groups: []const u16 = &tlsserver.server.default_groups,
     alpn: []const []const u8 = &.{},
-    /// Extra `s_client` arguments.
+    /// Extra client arguments (`s_client`'s, or go-client's flags).
     args: []const []const u8 = &.{},
-    /// Substrings s_client must print (its stdout or stderr).
+    /// Substrings the client must print (its stdout or stderr).
     expect: []const []const u8 = &.{},
     /// `-brief` (a summary on stderr); without it the full session report
     /// goes to stdout — the only place s_client names the ALPN protocol.
@@ -67,6 +73,18 @@ const cases = [_]Case{
     .{ .name = "rsa2048-pss", .why = "an RSA certificate signed with RSA-PSS", .cert = .rsa2048, .seed = 6, .expect = &.{ "Signature type: rsa_pss_rsae_sha256", "Verification: OK" } },
     .{ .name = "alpn-h2", .why = "ALPN: the server's choice among the client's offers", .seed = 7, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .brief = false, .expect = &.{"ALPN protocol: h2"} },
     .{ .name = "no-sni", .why = "a client that sends no server_name", .seed = 8, .args = &.{"-noservername"}, .expect = &.{"Verification: OK"} },
+    // Go: its suite order (AES-128 first on AES hardware) is not
+    // configurable in TLS 1.3, so the server's list picks the suite.
+    .{ .name = "go-default", .client = .go, .why = "Go's defaults: X25519MLKEM768, its first suite", .seed = 21, .expect = &.{ "version: TLS 1.3", "suite: TLS_AES_128_GCM_SHA256", "group: X25519MLKEM768", "peer_certs: 1" } },
+    .{ .name = "go-aes256", .client = .go, .why = "TLS_AES_256_GCM_SHA384 (the server enables only it)", .seed = 22, .suites = &.{.aes_256_gcm_sha384}, .expect = &.{"suite: TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "go-chacha", .client = .go, .why = "TLS_CHACHA20_POLY1305_SHA256 over X25519", .seed = 23, .suites = &.{.chacha20_poly1305_sha256}, .args = &.{ "-groups", "X25519" }, .expect = &.{ "suite: TLS_CHACHA20_POLY1305_SHA256", "group: X25519\n" } },
+    .{ .name = "go-p256group", .client = .go, .why = "secp256r1 as Go's only group", .seed = 24, .args = &.{ "-groups", "P-256" }, .expect = &.{"group: CurveP256"} },
+    .{ .name = "go-p384", .client = .go, .why = "an ECDSA P-384 certificate over secp384r1", .cert = .p384, .seed = 25, .args = &.{ "-groups", "P-384" }, .expect = &.{"group: CurveP384"} },
+    .{ .name = "go-ed25519", .client = .go, .why = "an Ed25519 certificate", .cert = .ed25519, .seed = 26, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-rsa2048-pss", .client = .go, .why = "an RSA certificate signed with RSA-PSS", .cert = .rsa2048, .seed = 27, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-alpn-h2", .client = .go, .why = "ALPN: the server's choice among Go's offers", .seed = 28, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .expect = &.{"alpn: h2"} },
+    .{ .name = "go-no-sni", .client = .go, .why = "Go without server_name (verified by hand)", .seed = 29, .args = &.{"-nosni"}, .expect = &.{"peer_certs: 1"} },
+    .{ .name = "go-no-hybrid", .client = .go, .why = "a server without X25519MLKEM768: Go's X25519 share, no retry", .seed = 30, .groups = &.{ tlsserver.server.default_groups[1], tlsserver.server.default_groups[2] }, .expect = &.{"group: X25519\n"} },
 };
 
 var child_env: ?*const std.process.Environ.Map = null;
@@ -191,12 +209,17 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .ed25519 => "ed25519.pem",
         .rsa2048 => "rsa2048.pem",
     };
-    try argv.appendSlice(gpa, &.{ "openssl", "s_client", "-connect", target, "-tls1_3", if (c.brief) "-brief" else "-ign_eof", "-ign_eof", "-verify_return_error", "-CAfile", ca_file, "-verify_hostname", "localhost" });
     var no_sni = false;
-    for (c.args) |a| if (std.mem.eql(u8, a, "-noservername")) {
+    for (c.args) |a| if (std.mem.eql(u8, a, "-noservername") or std.mem.eql(u8, a, "-nosni")) {
         no_sni = true;
     };
-    if (!no_sni) try argv.appendSlice(gpa, &.{ "-servername", "localhost" });
+    switch (c.client) {
+        .openssl => {
+            try argv.appendSlice(gpa, &.{ "openssl", "s_client", "-connect", target, "-tls1_3", if (c.brief) "-brief" else "-ign_eof", "-ign_eof", "-verify_return_error", "-CAfile", ca_file, "-verify_hostname", "localhost" });
+            if (!no_sni) try argv.appendSlice(gpa, &.{ "-servername", "localhost" });
+        },
+        .go => try argv.appendSlice(gpa, &.{ "./go-client", "-addr", target, "-ca", ca_file, "-servername", "localhost" }),
+    }
     try argv.appendSlice(gpa, c.args);
 
     var child = try std.process.spawn(io, .{
@@ -251,25 +274,25 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     waited = true;
 
     served catch |err| {
-        std.debug.print("  server: {t}\n  s_client said:\n{s}\n", .{ err, stderr });
+        std.debug.print("  server: {t}\n  client said:\n{s}\n", .{ err, stderr });
         return err;
     };
     switch (term) {
         .exited => |code| if (code != 0) {
-            std.debug.print("  s_client exited {d}:\n{s}\n", .{ code, stderr });
+            std.debug.print("  client exited {d}:\n{s}\n", .{ code, stderr });
             return error.ClientFailed;
         },
         else => {
-            std.debug.print("  s_client ended {any}\n", .{term});
+            std.debug.print("  client ended {any}\n", .{term});
             return error.ClientFailed;
         },
     }
     if (std.mem.indexOf(u8, stdout, "pong") == null) {
-        std.debug.print("  s_client did not receive pong; stdout: {s}\n", .{stdout});
+        std.debug.print("  client did not receive pong; stdout: {s}\n", .{stdout});
         return error.NoPong;
     }
     for (c.expect) |e| if (std.mem.indexOf(u8, stderr, e) == null and std.mem.indexOf(u8, stdout, e) == null) {
-        std.debug.print("  s_client lacks \"{s}\":\n{s}\n", .{ e, stderr });
+        std.debug.print("  client lacks \"{s}\":\n{s}\n", .{ e, stderr });
         return error.ExpectationMissing;
     };
     if (no_sni and server.serverName() != null) return error.SniFromNowhere;
@@ -282,8 +305,9 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     try w.writeAll(
         \\// SPDX-License-Identifier: MIT
         \\
-        \\//! Recorded OpenSSL `s_client` sessions against `Server`, written by
-        \\//! `tools/interop.zig --capture` (OpenSSL 3.5). Each case: the server's
+        \\//! Recorded OpenSSL `s_client` and Go crypto/tls client sessions against
+        \\//! `Server`, written by `tools/interop.zig --capture` (OpenSSL 3.5, Go
+        \\//! 1.26). Each case: the server's
         \\//! configuration and seed, every octet the client sent, every octet the
         \\//! server sent. Replayed by `interop_replay_test.zig`. Do not edit by hand.
         \\
@@ -306,12 +330,13 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     for (done) |d| {
         const c = d[0];
         try w.print("    .{{\n        .name = \"{s}\",\n        .cert = .{t},\n        .seed = {d},\n        .suites = &.{{", .{ c.name, c.cert, c.seed });
-        for (c.suites, 0..) |s, i| try w.print("{s}0x{x:0>4}", .{ if (i == 0) " " else ", ", @backingInt(s) });
-        try w.writeAll(" },\n        .groups = &.{");
-        for (c.groups, 0..) |g, i| try w.print("{s}0x{x:0>4}", .{ if (i == 0) " " else ", ", g });
-        try w.writeAll(" },\n        .alpn = &.{");
-        for (c.alpn, 0..) |a, i| try w.print("{s}\"{s}\"", .{ if (i == 0) " " else ", ", a });
-        try w.writeAll(if (c.alpn.len == 0) "},\n" else " },\n");
+        // zig fmt's spacing: `&.{}`, `&.{x}`, `&.{ x, y }`.
+        for (c.suites, 0..) |s, i| try w.print("{s}0x{x:0>4}", .{ listSep(i, c.suites.len), @backingInt(s) });
+        try w.print("{s}}},\n        .groups = &.{{", .{listEnd(c.suites.len)});
+        for (c.groups, 0..) |g, i| try w.print("{s}0x{x:0>4}", .{ listSep(i, c.groups.len), g });
+        try w.print("{s}}},\n        .alpn = &.{{", .{listEnd(c.groups.len)});
+        for (c.alpn, 0..) |a, i| try w.print("{s}\"{s}\"", .{ listSep(i, c.alpn.len), a });
+        try w.print("{s}}},\n", .{listEnd(c.alpn.len)});
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");
@@ -330,6 +355,14 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     try root.writeFile(io, .{ .sub_path = "modules/tlsserver/src/interop_vectors.zig", .data = out.written() });
 }
 
+fn listSep(i: usize, len: usize) []const u8 {
+    return if (i != 0) ", " else if (len == 1) "" else " ";
+}
+
+fn listEnd(len: usize) []const u8 {
+    return if (len <= 1) "" else " ";
+}
+
 fn hexField(w: *std.Io.Writer, name: []const u8, data: []const u8) !void {
     try w.print("        .{s} = &hx({d}, \"\"", .{ name, data.len });
     var i: usize = 0;
@@ -337,6 +370,27 @@ fn hexField(w: *std.Io.Writer, name: []const u8, data: []const u8) !void {
         try w.print(" ++\n            \"{x}\"", .{data[i..@min(data.len, i + 48)]});
     }
     try w.writeAll("),\n");
+}
+
+fn isSelected(selected: []const []const u8, c: Case) bool {
+    if (selected.len == 0) return true;
+    for (selected) |s| if (std.mem.eql(u8, s, c.name)) return true;
+    return false;
+}
+
+/// `go build` the Go client into the work directory (Go's build cache makes
+/// a repeat cheap). The work directory is `<root>/.zig-cache/tlsserver-interop`.
+fn buildGoClient(io: std.Io, work: std.Io.Dir) !void {
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "go", "build", "-o", "go-client", "../../modules/tlsserver/tools/go_client/main.go" },
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+    });
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) {
+        std.debug.print("go build of tools/go_client failed: {any}\n", .{term});
+        return error.GoBuildFailed;
+    }
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -352,6 +406,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     var env_map: std.process.Environ.Map = .init(gpa);
     try env_map.putPosixBlock(init.environ.block.view());
+    // The Go client is built with the installed toolchain only.
+    try env_map.put("GOTOOLCHAIN", "local");
     child_env = &env_map;
 
     var capture = false;
@@ -401,14 +457,16 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     keys.ed25519 = try .fromBytes(certs.ed25519_secret);
     try rsa.SecretKey.fromDer(&keys.rsa2048, &certs.rsa2048_pkcs1);
 
+    for (cases) |c| {
+        if (c.client != .go or !isSelected(selected.items, c)) continue;
+        try buildGoClient(io, work);
+        break;
+    }
+
     var done: std.ArrayList(struct { Case, Recorded }) = .empty;
     var failed: usize = 0;
     for (cases) |c| {
-        if (selected.items.len != 0) {
-            for (selected.items) |s| {
-                if (std.mem.eql(u8, s, c.name)) break;
-            } else continue;
-        }
+        if (!isSelected(selected.items, c)) continue;
         std.debug.print("{s}: {s}\n", .{ c.name, c.why });
         var rec: Recorded = .{};
         runCase(gpa, io, work, &keys, c, &rec) catch |err| {

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `Server.negotiatedGroup` and `Server.alpnProtocol`. Interop with Go 1.26's
+  crypto/tls client (`tools/go_client/main.go`, ten sessions in `tools/interop.zig`, captured and
+  replayed byte-exact with the OpenSSL ones: Go's defaults, every suite, secp256r1/secp384r1,
+  P-384/Ed25519/RSA-PSS certificates, ALPN, no SNI, X25519 without the hybrid) and in-process
+  handshakes against the collection's `tlsclient` (every certificate kind, every group × suite,
+  ALPN; new test dependency).
 - **2026-10-20** — `keys.CertKeyPair`: the certificate chain and private key from PEM (SEC1
   `EC PRIVATE KEY`, PKCS#8 `PRIVATE KEY` for EC P-256/P-384, Ed25519 and RSA, PKCS#1 `RSA PRIVATE
   KEY`), the key checked against the leaf (`KeyMismatch`), its PEM body decoded in constant time
