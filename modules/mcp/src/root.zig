@@ -2524,6 +2524,29 @@ pub const ToolCall = struct {
     protocol_error: ?ProtocolError = null,
     /// The request's raw `params._meta` object (`.null` when absent).
     meta: std.json.Value = .null,
+    /// Content blocks after the text one (see `add`).
+    blocks: std.ArrayList(Content) = .empty,
+
+    /// Append a content block to the result (image, audio, a resource link,
+    /// an embedded resource, or a text block with annotations). The text
+    /// written with `write`/`print` stays the first block — and still feeds
+    /// `structuredContent` — unless it is empty and blocks were added, then
+    /// the result is the blocks alone. OOM is swallowed, as for `write`.
+    pub fn add(self: *ToolCall, c: Content) void {
+        self.blocks.append(self.arena, c) catch {};
+    }
+
+    /// `add(.{ .image = ... })` from raw bytes (base64-encoded here).
+    pub fn addImage(self: *ToolCall, bytes: []const u8, mime_type: []const u8) void {
+        const b64 = base64Alloc(self.arena, bytes) orelse return;
+        self.add(.{ .image = .{ .data_base64 = b64, .mime_type = mime_type } });
+    }
+
+    /// `add(.{ .audio = ... })` from raw bytes (base64-encoded here).
+    pub fn addAudio(self: *ToolCall, bytes: []const u8, mime_type: []const u8) void {
+        const b64 = base64Alloc(self.arena, bytes) orelse return;
+        self.add(.{ .audio = .{ .data_base64 = b64, .mime_type = mime_type } });
+    }
 
     /// Answer this call with a JSON-RPC error rather than a tool result (a
     /// protocol failure, not a tool failure the model should read). Returns
@@ -2934,7 +2957,7 @@ pub const PromptRequest = struct {
 
     const Message = struct {
         role: RoleAlias,
-        text: []const u8,
+        content: Content,
     };
 
     /// Fetch a string argument, or null when absent or not a string.
@@ -2957,7 +2980,13 @@ pub const PromptRequest = struct {
     /// Append one text message to the rendered prompt (OOM swallowed — same
     /// policy as `ToolCall.write`).
     pub fn message(self: *PromptRequest, role: RoleAlias, msg_text: []const u8) void {
-        self.messages.append(self.arena, .{ .role = role, .text = msg_text }) catch {};
+        self.messages.append(self.arena, .{ .role = role, .content = .{ .text = .{ .text = msg_text } } }) catch {};
+    }
+
+    /// Append one message carrying any content block (an image, an embedded
+    /// resource, …); same OOM policy as `message`.
+    pub fn messageContent(self: *PromptRequest, role: RoleAlias, content: Content) void {
+        self.messages.append(self.arena, .{ .role = role, .content = content }) catch {};
     }
 
     /// Append one formatted text message (same OOM policy as `message`).
@@ -3073,6 +3102,116 @@ fn writeAnnotations(jw: *std.json.Stringify, a: Annotations) std.Io.Writer.Error
         try jw.write(lm);
     }
     try jw.endObject();
+}
+
+/// One content block of a tool result or prompt message (spec
+/// `ContentBlock`, server/tools.mdx "Tool Result"). Binary data is passed
+/// **already base64-encoded** (`ToolCall.addImage`/`addAudio` encode raw
+/// bytes for you); every optional field is omitted when unset.
+pub const Content = union(enum) {
+    text: Text,
+    image: Media,
+    audio: Media,
+    resource_link: ResourceLink,
+    resource: Embedded,
+
+    pub const Text = struct {
+        text: []const u8,
+        annotations: ?Annotations = null,
+    };
+    pub const Media = struct {
+        data_base64: []const u8,
+        mime_type: []const u8,
+        annotations: ?Annotations = null,
+    };
+    /// A pointer to a resource the client may read or subscribe to; it need
+    /// not appear in `resources/list` (tools.mdx).
+    pub const ResourceLink = struct {
+        uri: []const u8,
+        name: []const u8,
+        title: ?[]const u8 = null,
+        description: ?[]const u8 = null,
+        mime_type: ?[]const u8 = null,
+        size: ?u64 = null,
+        annotations: ?Annotations = null,
+    };
+    /// A resource's contents inline: exactly one of `text` / `blob_base64`.
+    pub const Embedded = struct {
+        uri: []const u8,
+        mime_type: ?[]const u8 = null,
+        text: ?[]const u8 = null,
+        blob_base64: ?[]const u8 = null,
+        annotations: ?Annotations = null,
+    };
+};
+
+fn writeContent(jw: *std.json.Stringify, c: Content) std.Io.Writer.Error!void {
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write(@tagName(c));
+    switch (c) {
+        .text => |x| {
+            try jw.objectField("text");
+            try jw.write(x.text);
+            if (x.annotations) |a| try writeAnnotations(jw, a);
+        },
+        .image, .audio => |x| {
+            try jw.objectField("data");
+            try jw.write(x.data_base64);
+            try jw.objectField("mimeType");
+            try jw.write(x.mime_type);
+            if (x.annotations) |a| try writeAnnotations(jw, a);
+        },
+        .resource_link => |x| {
+            try jw.objectField("uri");
+            try jw.write(x.uri);
+            try jw.objectField("name");
+            try jw.write(x.name);
+            if (x.title) |v| {
+                try jw.objectField("title");
+                try jw.write(v);
+            }
+            if (x.description) |v| {
+                try jw.objectField("description");
+                try jw.write(v);
+            }
+            if (x.mime_type) |v| {
+                try jw.objectField("mimeType");
+                try jw.write(v);
+            }
+            if (x.size) |v| {
+                try jw.objectField("size");
+                try jw.write(v);
+            }
+            if (x.annotations) |a| try writeAnnotations(jw, a);
+        },
+        .resource => |x| {
+            try jw.objectField("resource");
+            try jw.beginObject();
+            try jw.objectField("uri");
+            try jw.write(x.uri);
+            if (x.mime_type) |v| {
+                try jw.objectField("mimeType");
+                try jw.write(v);
+            }
+            if (x.text) |v| {
+                try jw.objectField("text");
+                try jw.write(v);
+            } else {
+                try jw.objectField("blob");
+                try jw.write(x.blob_base64 orelse "");
+            }
+            if (x.annotations) |a| try writeAnnotations(jw, a);
+            try jw.endObject();
+        },
+    }
+    try jw.endObject();
+}
+
+fn base64Alloc(arena: std.mem.Allocator, bytes: []const u8) ?[]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const buf = arena.alloc(u8, enc.calcSize(bytes.len)) catch return null;
+    return enc.encode(buf, bytes);
 }
 
 /// Emit a definition's `_meta` (see `Tool.meta_json`); refuses text that is
@@ -4099,6 +4238,7 @@ pub const Server = struct {
         try sendToolResult(arena, out, id, tool_buf.items, .{
             .allow_structured = tool.allow_structured,
             .is_error = is_error,
+            .blocks = call.blocks.items,
             .any_structured_value = modern != null and tool.output_schema.len != 0,
             .server_info = if (modern != null) &self.info else null,
         });
@@ -4408,12 +4548,7 @@ fn buildPromptResult(jw: *std.json.Stringify, prompt: *const Prompt, req: *const
         try jw.objectField("role");
         try jw.write(@tagName(m.role));
         try jw.objectField("content");
-        try jw.beginObject();
-        try jw.objectField("type");
-        try jw.write("text");
-        try jw.objectField("text");
-        try jw.write(m.text);
-        try jw.endObject();
+        try writeContent(jw, m.content);
         try jw.endObject();
     }
     try jw.endArray();
@@ -4475,6 +4610,8 @@ fn sendResultRaw(arena: std.mem.Allocator, out: *std.Io.Writer, id: ?std.json.Va
 const ToolResultOptions = struct {
     allow_structured: bool,
     is_error: bool,
+    /// `ToolCall.add`'s blocks, after the text one.
+    blocks: []const Content = &.{},
     /// 2026-07-28 call to a tool with an `output_schema`: `structuredContent`
     /// may be any JSON value, not only an object (see `Tool`).
     any_structured_value: bool = false,
@@ -4494,9 +4631,19 @@ fn buildToolResultLine(gpa: std.mem.Allocator, w: *std.Io.Writer, id: ?std.json.
     try writeId(w, id);
     try w.writeAll(",\"result\":{");
     if (opts.server_info != null) try w.writeAll("\"resultType\":\"complete\",");
-    try w.writeAll("\"content\":[{\"type\":\"text\",\"text\":");
-    try std.json.Stringify.encodeJsonString(text, .{}, w);
-    try w.writeAll("}]");
+    try w.writeAll("\"content\":[");
+    const text_block = text.len != 0 or opts.blocks.len == 0;
+    if (text_block) {
+        try w.writeAll("{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.encodeJsonString(text, .{}, w);
+        try w.writeAll("}");
+    }
+    for (opts.blocks, 0..) |b, i| {
+        if (text_block or i != 0) try w.writeAll(",");
+        var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
+        try writeContent(&jw, b);
+    }
+    try w.writeAll("]");
     const structured = opts.allow_structured and
         (isSingleJsonObject(gpa, text) or (opts.any_structured_value and isSingleJsonValue(gpa, text)));
     if (structured) {
@@ -5171,6 +5318,61 @@ test "tools/call: arguments and structured output are checked against the tool's
         \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"loose","arguments":{}}}
     ,
         \\{"jsonrpc":"2.0","id":5,"result":{"content":[{"type":"text","text":""}],"isError":false}}
+        \\
+    );
+}
+
+fn blocksTool(_: ?*anyopaque, call: *ToolCall) bool {
+    // The four examples of 2025-11-25 server/tools.mdx "Tool Result", in order.
+    call.add(.{ .image = .{ .data_base64 = "base64-encoded-data", .mime_type = "image/png", .annotations = .{ .audience = &.{.user}, .priority = 0.9 } } });
+    call.add(.{ .audio = .{ .data_base64 = "base64-encoded-audio-data", .mime_type = "audio/wav" } });
+    call.add(.{ .resource_link = .{ .uri = "file:///project/src/main.rs", .name = "main.rs", .description = "Primary application entry point", .mime_type = "text/x-rust" } });
+    call.add(.{ .resource = .{
+        .uri = "file:///project/src/main.rs",
+        .mime_type = "text/x-rust",
+        .text = "fn main() {\n    println!(\"Hello world!\");\n}",
+        .annotations = .{ .audience = &.{ .user, .assistant }, .priority = 0.7, .last_modified = "2025-05-03T14:30:00Z" },
+    } });
+    if (call.strArg("caption")) |c| call.write(c);
+    return false;
+}
+
+test "tools/call: content blocks are byte-identical to the spec's examples (tools.mdx)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "blocks", .description = "", .input_schema = "{}", .handler = blocksTool });
+    // No text written: the blocks alone (each compacted from the spec page).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"blocks","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"base64-encoded-data","mimeType":"image/png","annotations":{"audience":["user"],"priority":0.9}},{"type":"audio","data":"base64-encoded-audio-data","mimeType":"audio/wav"},{"type":"resource_link","uri":"file:///project/src/main.rs","name":"main.rs","description":"Primary application entry point","mimeType":"text/x-rust"},{"type":"resource","resource":{"uri":"file:///project/src/main.rs","mimeType":"text/x-rust","text":"fn main() {\n    println!(\"Hello world!\");\n}","annotations":{"audience":["user","assistant"],"priority":0.7,"lastModified":"2025-05-03T14:30:00Z"}}}],"isError":false}}
+        \\
+    );
+    // Text written: it leads, then the blocks.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"blocks","arguments":{"caption":"see"}}}
+    , &aw.writer);
+    try testing.expect(std.mem.startsWith(u8, aw.written(),
+        \\{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"see"},{"type":"image",
+    ));
+}
+
+fn imagePrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    req.message(.user, "What is in this picture?");
+    req.messageContent(.user, .{ .image = .{ .data_base64 = "iVBORw0KGgo=", .mime_type = "image/png" } });
+    return true;
+}
+
+test "prompts/get: a message may carry an image block" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addPrompt(.{ .name = "pic", .handler = imagePrompt });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"pic"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"messages":[{"role":"user","content":{"type":"text","text":"What is in this picture?"}},{"role":"user","content":{"type":"image","data":"iVBORw0KGgo=","mimeType":"image/png"}}]}}
         \\
     );
 }

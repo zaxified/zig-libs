@@ -419,7 +419,7 @@ coordinator's under the rule "parity with the reference, or safer":
 
 | # | Item | Effort | Decision |
 |---|---|---|---|
-| R1 | Tool-result content blocks: `image`, `audio`, `resource_link`, embedded `resource`, several per result, block `annotations`; prompt messages with the same blocks | M | do — additive, text stays the default |
+| R1 | Tool-result content blocks: `image`, `audio`, `resource_link`, embedded `resource`, several per result, block `annotations`; prompt messages with the same blocks | M | **DONE 2026-10-20** — `Content`, `ToolCall.add`, `PromptRequest.messageContent` |
 | R2 | Handler-chosen protocol errors (`code`, `message`, `data`) for tools/resources/prompts; `URLElicitationRequiredError` (-32042) and `MissingRequiredClientCapability` (-32021) builders | S | **DONE 2026-10-20** |
 | R3 | One request context for prompts and resources too: progress, client capabilities/info, version, `_meta` | S | **DONE 2026-10-20** |
 | R4 | `_meta` on Tool/Resource/Template/Prompt; Resource `annotations` + `size`; `Info.description`/`websiteUrl`/`icons` | S | **DONE 2026-10-20** |

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Content blocks (S2 R1). `Content` (`text` with annotations, `image`, `audio`,
+  `resource_link`, embedded `resource`) — `ToolCall.add`/`addImage`/`addAudio` append blocks after the
+  text one (a result with no text and some blocks is the blocks alone);
+  `PromptRequest.messageContent` sends a message with any block. Pinned byte for byte to the four
+  examples of 2025-11-25 server/tools.mdx. Additive: a tool that adds no block answers as before.
 - **2026-10-20** — Tool schema validation and resource-template matching (S2 R7, R8, R14).
   - **Behaviour change (on by default, `Server.validate_tool_io = false` restores the old one):**
     `tools/call` arguments are checked against the tool's `input_schema` before the handler runs, and a
