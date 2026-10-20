@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Fix: `certverify.sign` / `verify` no longer require the transcript hash to
+  be as long as the signature scheme's hash (`HashLengthMismatch` is gone). RFC 8446 §4.4.3 signs
+  the cipher suite's Transcript-Hash: an `ecdsa_secp256r1_sha256` certificate under
+  TLS_AES_256_GCM_SHA384 signs a 48-octet hash, and an RSA key could not sign
+  `rsa_pss_rsae_sha384/512` over dtls's SHA-256 transcripts. Found while building `tlsserver`.
 - **2026-10-20** — `transcript.Transcript(Hash)`: the RFC 8446 §4.4.1 transcript hash (append,
   current hash, PSK-binder `wouldBeHash`, HelloRetryRequest `resetToMessageHash`), moved from
   `dtls/src/engine.zig` and made generic over the suite hash so SHA-384 suites

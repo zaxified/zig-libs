@@ -70,11 +70,9 @@ pub const SignatureScheme = enum(u16) {
     /// validate the caller's transcript hash length against) and for any
     /// unrecognized scheme.
     ///
-    /// `sign`/`verify` use this to reject a `transcript_hash` whose length
-    /// doesn't match what the scheme expects -- catching a caller wiring
-    /// e.g. a SHA-384 transcript hash to `ecdsa_secp256r1_sha256` (which
-    /// RFC 8446 §4.2.3 pairs with SHA-256 specifically) before it reaches
-    /// the crypto layer.
+    /// Not a constraint on the transcript hash: RFC 8446 §4.4.3 signs the
+    /// suite's Transcript-Hash, whatever its length, and applies this hash
+    /// to the signed content.
     pub fn hashDigestLen(scheme: SignatureScheme) ?usize {
         return switch (scheme) {
             .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 => 32,
@@ -246,9 +244,6 @@ pub const VerifyError = BuildContentError || error{
     /// `public_key`'s active union field does not match the key family
     /// `scheme` requires.
     KeyMismatch,
-    /// `transcript_hash.len` does not equal `scheme.hashDigestLen()` (for
-    /// schemes that mandate one).
-    HashLengthMismatch,
     /// The signature is malformed (e.g. bad ASN.1 DER for an ECDSA scheme,
     /// wrong length for RSA-PSS/Ed25519) or cryptographically invalid for
     /// `(scheme, public_key, side, transcript_hash)`.
@@ -264,7 +259,7 @@ pub const VerifyError = BuildContentError || error{
 /// signature check dispatches to one of four private `verifyXxx` primitives
 /// (see the "crypto dispatch" section below). The dispatch logic itself
 /// (which primitive gets called for which scheme) is additionally covered by
-/// the `KeyMismatch`/`UnsupportedScheme`/`HashLengthMismatch` reject-path
+/// the `KeyMismatch`/`UnsupportedScheme` reject-path
 /// tests below, which short-circuit before reaching the crypto layer.
 pub fn verify(
     scheme: SignatureScheme,
@@ -273,9 +268,6 @@ pub fn verify(
     transcript_hash: []const u8,
     signature: []const u8,
 ) VerifyError!void {
-    if (scheme.hashDigestLen()) |want| {
-        if (transcript_hash.len != want) return error.HashLengthMismatch;
-    }
     var content_buf: [max_signed_content_len]u8 = undefined;
     const content = try buildSignedContent(side, transcript_hash, &content_buf);
 
@@ -317,7 +309,6 @@ pub fn verify(
 pub const SignError = BuildContentError || error{
     UnsupportedScheme,
     KeyMismatch,
-    HashLengthMismatch,
     /// RFC 8446 §4.2.3 fixes RSA-PSS's salt length to `Hash.digest_length`
     /// for every `rsa_pss_rsae_*` scheme -- unlike RFC 8017 (PKCS#1 v2.2),
     /// which allows a `salt_len = 0` deterministic mode, TLS 1.3 has no
@@ -362,9 +353,6 @@ pub fn sign(
     random: ?std.Random,
     out: []u8,
 ) SignError![]u8 {
-    if (scheme.hashDigestLen()) |want| {
-        if (transcript_hash.len != want) return error.HashLengthMismatch;
-    }
     var content_buf: [max_signed_content_len]u8 = undefined;
     const content = try buildSignedContent(side, transcript_hash, &content_buf);
 
@@ -413,7 +401,7 @@ pub fn sign(
 // surface: each wraps exactly one primitive call (+ DER glue for ECDSA) into
 // this module's `content`/`signature` byte-slice shape. None of them is
 // reached from the reject-path tests above (`KeyMismatch`/
-// `UnsupportedScheme`/`HashLengthMismatch` all short-circuit before
+// `UnsupportedScheme` all short-circuit before
 // dispatch); the KAT tests in this file's `test` block below DO exercise
 // them, byte-exact.
 
@@ -669,10 +657,25 @@ test "verify: rejects a key-family mismatch before reaching the crypto stub" {
     try testing.expectError(error.KeyMismatch, verify(.ecdsa_secp256r1_sha256, wrong_key, .server, &kat.ecdsa_p256_server.transcript_hash, &kat.ecdsa_p256_server.signature_der));
 }
 
-test "verify: rejects a transcript hash length that doesn't match the scheme's hash" {
+test "sign/verify: the transcript hash is the suite's, not the scheme's (P-256 under SHA-384)" {
+    // RFC 8446 §4.4.3: the signed content carries Transcript-Hash, the
+    // cipher suite's hash; the scheme's hash is applied to that content.
+    // TLS_AES_256_GCM_SHA384 with an ecdsa_secp256r1_sha256 certificate (a
+    // common pairing) signs a 48-octet transcript hash. Until 2026-10-20
+    // this was refused as `HashLengthMismatch` (a DTLS-only assumption:
+    // dtls has SHA-256 suites only).
+    const sk = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(kat.ecdsa_p256_server.secret_key_bytes);
     const pk = PublicKey{ .ecdsa_p256 = try kat.ecdsa_p256_server.publicKey() };
-    const wrong_len_hash = @as([48]u8, @splat(0)); // ecdsa_secp256r1_sha256 wants 32
-    try testing.expectError(error.HashLengthMismatch, verify(.ecdsa_secp256r1_sha256, pk, .server, &wrong_len_hash, &kat.ecdsa_p256_server.signature_der));
+    const th48: [48]u8 = @splat(0x5c);
+    var out: [Ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = try sign(.ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &sk }, .server, &th48, null, &out);
+    try verify(.ecdsa_secp256r1_sha256, pk, .server, &th48, sig);
+    // And RSA-PSS SHA-512 over a SHA-256 transcript.
+    const rpk = PublicKey{ .rsa = try kat.rsa_pss_sha256_server.publicKey() };
+    try testing.expectError(error.InvalidSignature, verify(.rsa_pss_rsae_sha512, rpk, .server, &kat.rsa_pss_sha256_server.transcript_hash, &kat.rsa_pss_sha256_server.signature));
+    // The only length limit left is the content buffer's.
+    const th65: [65]u8 = @splat(0);
+    try testing.expectError(error.TranscriptHashTooLong, verify(.ecdsa_secp256r1_sha256, pk, .server, &th65, sig));
 }
 
 test "verify: rejects an unrecognized SignatureScheme wire value" {
