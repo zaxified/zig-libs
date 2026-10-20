@@ -20,6 +20,7 @@
 //! the way `std.process.run`'s `error.StreamTooLong` does.
 
 const std = @import("std");
+const vfork_spawn = @import("vfork_spawn.zig");
 const builtin = @import("builtin");
 const argsafe = @import("argsafe");
 
@@ -745,24 +746,27 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     // themselves if the child must not inherit them. `pass_fds` goes
     // through std's `inherit_files`, which clears FD_CLOEXEC after the fork,
     // in the child only (race-free, same fd number).
-    var child = try std.process.spawn(io, .{
-        .argv = effective_argv,
-        .cwd = cwd,
-        .environ_map = env_ptr,
-        .stdin = in_io,
-        .stdout = out_io,
-        .stderr = err_io,
-        .create_no_window = true,
-        .inherit_files = spec.pass_fds,
-        .uid = spec.uid,
-        .gid = spec.gid,
-        // `pgid` is `?posix.pid_t` — an integer on POSIX, but a HANDLE
-        // (`?*anyopaque`) on Windows, where the POSIX "0 = lead your own
-        // group" literal does not typecheck. `Spec.new_process_group` is
-        // documented as a no-op on Windows anyway, so branch at comptime and
-        // keep that promise rather than failing to build there.
-        .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
-    });
+    var child = if (comptime vfork_spawn.supported)
+        try spawnVfork(gpa, io, spec, effective_argv, env_ptr, in_io, out_io, err_io)
+    else
+        try std.process.spawn(io, .{
+            .argv = effective_argv,
+            .cwd = cwd,
+            .environ_map = env_ptr,
+            .stdin = in_io,
+            .stdout = out_io,
+            .stderr = err_io,
+            .create_no_window = true,
+            .inherit_files = spec.pass_fds,
+            .uid = spec.uid,
+            .gid = spec.gid,
+            // `pgid` is `?posix.pid_t` — an integer on POSIX, but a HANDLE
+            // (`?*anyopaque`) on Windows, where the POSIX "0 = lead your own
+            // group" literal does not typecheck. `Spec.new_process_group` is
+            // documented as a no-op on Windows anyway, so branch at comptime and
+            // keep that promise rather than failing to build there.
+            .pgid = if (builtin.os.tag == .windows) null else if (spec.new_process_group) 0 else null,
+        });
     // Ownership of the parent ends moves to the Child (std left these null,
     // it was given `.file`s).
     if (in_pipe.parent) |f| {
@@ -780,6 +784,67 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     return child;
 }
 
+/// Linux: spawn through `vfork_spawn` (clone with CLONE_VM | CLONE_VFORK) —
+/// constant cost however much memory this process maps, where std's
+/// `fork()` copies page tables (measured 31 ms per spawn at 512 MiB RSS).
+/// The same inputs as the std call in `spawnChild`, the same errors.
+fn spawnVfork(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    spec: Spec,
+    argv: []const []const u8,
+    env_ptr: ?*const std.process.Environ.Map,
+    in_io: std.process.SpawnOptions.StdIo,
+    out_io: std.process.SpawnOptions.StdIo,
+    err_io: std.process.SpawnOptions.StdIo,
+) !std.process.Child {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // argv[0] is searched on the PARENT's PATH (std's rule); the child's
+    // environment is `env_ptr` or, for `.inherit`, the parent's.
+    var parent: std.process.Environ.Map = .init(arena);
+    try loadParentEnv(arena, io, &parent);
+    const search_path = parent.get("PATH") orelse std.Io.Threaded.default_PATH;
+    const env_map: *const std.process.Environ.Map = env_ptr orelse &parent;
+    var entries: std.ArrayList([]const u8) = .empty;
+    var it = env_map.iterator();
+    while (it.next()) |e| {
+        // std removes it when no progress node is passed; so do we.
+        if (std.mem.eql(u8, e.key_ptr.*, "ZIG_PROGRESS")) continue;
+        try entries.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.* }));
+    }
+    const fds = try arena.alloc(std.posix.fd_t, spec.pass_fds.len);
+    for (spec.pass_fds, fds) |f, *d| d.* = f.handle;
+
+    const pid = try vfork_spawn.spawn(gpa, .{
+        .argv = argv,
+        .cwd = spec.cwd,
+        .env = entries.items,
+        .search_path = search_path,
+        .stdin = toVforkStdio(in_io),
+        .stdout = toVforkStdio(out_io),
+        .stderr = toVforkStdio(err_io),
+        .pass_fds = fds,
+        .uid = spec.uid,
+        .gid = spec.gid,
+        .pgid = if (spec.new_process_group) 0 else null,
+    });
+    return .{ .id = pid, .thread_handle = {}, .stdin = null, .stdout = null, .stderr = null, .request_resource_usage_statistics = false };
+}
+
+fn toVforkStdio(s: std.process.SpawnOptions.StdIo) vfork_spawn.Stdio {
+    return switch (s) {
+        .inherit => .inherit,
+        .close => .close,
+        .ignore => .ignore,
+        .file => |f| .{ .fd = f.handle },
+        // `spawnChild` replaces every `.pipe` with a `.file` it owns on POSIX.
+        .pipe => unreachable,
+    };
+}
+
 /// One `O_CLOEXEC` pipe we create for a child's stream: `child` is the end
 /// handed to std (it `dup2`s it onto fd 0/1/2, clearing CLOEXEC there only),
 /// `parent` the end the caller keeps. POSIX only.
@@ -793,6 +858,11 @@ const PipeEnds = struct {
         const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
         const r: std.Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
         const w: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+        // A captured stream gets a 1 MiB pipe (Linux, best effort: past
+        // /proc/sys/fs/pipe-max-size it just stays 64 KiB): fewer wakeups of
+        // the drainer and larger reads into the capture buffer.
+        if (builtin.os.tag == .linux and dir == .parent_reads)
+            _ = std.os.linux.fcntl(fds[0], std.os.linux.F.SETPIPE_SZ, 1 << 20);
         return switch (dir) {
             .parent_reads => .{ .parent = r, .child = w },
             .parent_writes => .{ .parent = w, .child = r },
@@ -1021,7 +1091,11 @@ const cancel_poll_slice_ms: i32 = 50;
 
 fn drainLoop(d: Drainer) void {
     defer d.file.close(d.io);
-    var rbuf: [8192]u8 = undefined;
+    // Past the cap the bytes are read and dropped here; below it they are
+    // read straight into the list's spare capacity (no second copy), at least
+    // one pipe's worth (64 KiB) per read — the 8 KiB bounce buffer this
+    // replaced made a 100 MiB capture 1.8× Go's.
+    var rbuf: [64 * 1024]u8 = undefined;
     while (true) {
         const late: u64 = if (d.stop_ns) |s| s.load(.acquire) else no_deadline;
         const deadline: ?u64 = if (d.deadline_ns) |dl| @min(dl, late) else if (d.stop_ns != null) late else null;
@@ -1044,21 +1118,29 @@ fn drainLoop(d: Drainer) void {
             const poll_in = if (builtin.os.tag == .windows) 0 else std.posix.POLL.IN;
             if (!pollReady(d.file.handle, poll_in, ms)) continue;
         }
-        const n = d.file.readStreaming(d.io, &.{rbuf[0..]}) catch return;
-        if (n == 0) return;
         const have = d.list.items.len;
         if (have >= d.cap) {
             // Keep draining past the cap so the child can flush + exit, but
             // store nothing more.
+            const n = d.file.readStreaming(d.io, &.{rbuf[0..]}) catch return;
+            if (n == 0) return;
             d.truncated.store(true, .release);
             continue;
         }
-        const take = @min(n, d.cap - have);
-        d.list.appendSlice(d.gpa, rbuf[0..take]) catch |e| {
-            d.err.* = e;
-            return;
-        };
-        if (take < n) d.truncated.store(true, .release);
+        if (d.list.capacity - have < @min(rbuf.len, d.cap - have)) {
+            // Double (bounded by the cap), as Go's bytes.Buffer does: std's
+            // 1.5× growth copied a 100 MiB capture noticeably more often.
+            const want = @min(d.cap, @max(d.list.capacity * 2, have + rbuf.len));
+            d.list.ensureTotalCapacityPrecise(d.gpa, want) catch |e| {
+                d.err.* = e;
+                return;
+            };
+        }
+        const spare = d.list.unusedCapacitySlice();
+        const room = @min(spare.len, d.cap - have);
+        const n = d.file.readStreaming(d.io, &.{spare[0..room]}) catch return;
+        if (n == 0) return;
+        d.list.items.len += n;
     }
 }
 

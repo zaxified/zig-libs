@@ -1,0 +1,16 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Fastest-candidate side of `zig build bench-procrun` (modules/procrun/tools/bench.zig):
+# Rust std::process, standard library only (no dependencies).
+[dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

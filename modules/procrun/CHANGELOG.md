@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **Linux spawns with `clone(CLONE_VM | CLONE_VFORK)`** (`src/vfork_spawn.zig`, structure ported
+  from musl's posix_spawn — NOTICE) instead of std's `fork()`: a spawn no longer costs time proportional to
+  this process's mapped memory (std: 0.65 ms at 0 MiB, 7.5 ms at 128 MiB, 31 ms at 512 MiB per `/bin/true`;
+  now flat, like Go and Rust), and concurrent spawns no longer serialise on the page-table copy (8 threads:
+  4.9× Go → 1.0×). Same steps, order and errors as std; other targets keep std. `.inherit` env now reads the
+  parent's real environment (as `.merge` does) — std's could be empty under an `Io.Threaded` built without
+  `.environ`. Capture reads straight into the buffer's spare capacity (doubling growth, 1 MiB capture pipes
+  on Linux): a 100 MiB capture 1.8× → ~1.1× Go. `zig build bench-procrun` (Go os/exec reference, Rust
+  std::process fastest).
 - **2026-10-20** — S2 batch. **Breaking default:** `Spec.stdin` defaults to `.ignore` (`/dev/null`, Go's
   default) instead of `.close` — a closed fd 0 is reused by the child's first `open`. New: `Spec.pass_fds`
   (same fd numbers in the child, over Zig 0.17's `inherit_files`), `Spec.uid`/`gid`, `Output.core_dumped`,

@@ -17,7 +17,7 @@ a per-stream cap that **keeps the prefix and keeps draining** past the cap
 everything), env/cwd control, a hard timeout, and a streaming variant with
 signal-based cancel/kill and backpressure.
 
-Provenance: original work of the zig-libs authors (MIT) — the `waitTolerant` /
+Provenance: original work of the zig-libs authors (MIT), except the Linux spawner `src/vfork_spawn.zig` (structure ported from musl 1.2.5 posix_spawn, MIT — see NOTICE) — the `waitTolerant` /
 `reapTolerantPosix` / `statusToTerm` reap-race core, the
 `ensureChildReaping` / `restoreChildReaping` `SIGCHLD` fixup, and the capped
 3-thread drain / streaming-with-cancel machinery. procrun uses
