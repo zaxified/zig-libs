@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `zig build bench-json5` (`tools/bench.zig` + `tools/bench_ref.js`, json5 2.2.3 under
+  bun): 0.08–0.11× the reference. Card: grade 3 → 2 (scope parity after the 2026-10-20 survey, P2).
 - **2026-10-20** — `parseFromSlice(T, gpa, json5_text, ParseOptions)` (S2 R2): preprocess +
   `std.json.parseFromTokenSource` in one call, strings always copied (the intermediate JSON is freed).
   On a `std.json` error `ParseOptions.diagnostic` gets the line/column/offset in the JSON5 **source**
