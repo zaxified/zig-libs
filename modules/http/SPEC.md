@@ -400,6 +400,21 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **Threaded h2: a worker's `.close` does not wake the connection's blocking read** *(audit
+  2026-10-19 S10-1, low; owner decision 2026-10-20: FIX — Go closes the connection after GOAWAY
+  instead of waiting on the peer)*. In Dispatcher mode a worker returning `.close` (e.g. 413 over
+  the cap + GOAWAY, `h2_server.zig` ~920-926, 998, 1094) only sets `closing`; the connection task
+  stays parked in `pump`'s blocking read until the peer sends or the read times out (forever with a
+  BYO reader without a timeout). Sequential mode returns at once. Fix: the worker shuts the socket
+  down (`shutdown(RD)` or a cancel of the read) — the connection owns the socket, so this needs an
+  ownership seam (a "wake" callback in the Dispatcher contract). No memory-safety effect.
+- **A body framing failure answers 400, not 500** *(audit 2026-10-19 O1, owner decision
+  2026-10-20: FIX — nginx answers 400 for a malformed chunked body; Go leaves the status to the
+  handler)*. Since O1-1 a refused chunk line is final and the connection closes, but the status is
+  the generic 500 for a handler error. Fix: when a handler fails while the request body reader
+  holds a framing error (`ChunkedReader` failed, Content-Length short) and nothing was sent yet,
+  answer 400 (client fault) instead of 500.
+
 - ~~**Constant time: header bytes go through tables**~~ — DONE 2026-10-18 for the h1 value check (vector/SWAR, faster than the table) and the HPACK encoder (credentials never indexed + raw by default, `Encoder.Options.default_sensitive`); the HPACK **decoder** still walks a Huffman-coded secret per bit — RFC-mandated input, cannot be refused, documented. Was (found 2026-10-18, pre-tag sweep; owner decision — hot path): `h1.zig` `isValidFieldValue` indexes a 256-entry table by every header-value byte (h1.zig ~221/246), and HPACK's Huffman encoder indexes `huff_codes[b]` by each byte and its decoder walks a tree per bit (hpack.zig ~342-373, ~410-426, ~511-514) — both over `Authorization`, `Cookie` and API-key values (llmclient's `x-api-key` too). Options: an arithmetic range check in `isValidFieldValue` (cost to measure on the h1 bench); for HPACK, emit sensitive fields (`authorization`, `cookie`, `proxy-authorization`, a caller list) as raw never-indexed literals (RFC 7541 §7.1.3 recommends never-indexed for them; Huffman stays for the rest) — the decoder side cannot be helped the same way. Severity low-medium (local cache side channel).
 - **HPACK encoder: fast path for a field repeated from the previous block** *(2026-10-18, qap repin A/B)* —
   static response headers (comptime slices in rodata: `setHeaderStatic`, `security-headers` `applyStatic`,

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: owner decisions on the audit 2026-10-19 open questions recorded (fix accepted, not yet done).
+
 - **2026-10-20** — **CONSUMER-VISIBLE (behavior change, security):** `Client.request` now
   refuses a redirect hop from `https://` to `http://` with `error.RedirectRefused`, before the
   `http://` target is dialed. New `RequestOptions.allow_https_to_http_redirect` (default
