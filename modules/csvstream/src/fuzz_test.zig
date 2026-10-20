@@ -126,7 +126,28 @@ pub fn dialectHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
         want_index += 1;
         try testing.expect(rec.line_number > last_line);
         last_line = rec.line_number;
-        if (rec.spanned) mark(.spanned);
+        if (rec.spanned) {
+            mark(.spanned);
+            // The scanner and the split agree: every line feed inside a
+            // spanned record lies inside a quoted field as the split reads it.
+            var pos: usize = 0;
+            var nl_at: usize = 0;
+            while (pos < rec.bytes.len) {
+                const f = try line.scanField(rec.bytes, pos, delimiter, '"', lazy);
+                const quoted = f.start > 0 and f.start - 1 >= pos and rec.bytes[f.start - 1] == '"' and f.start - 1 < f.next;
+                const lo = if (quoted) f.start else f.next;
+                const hi = if (quoted) f.end else f.next;
+                while (std.mem.findScalarPos(u8, rec.bytes, nl_at, '\n')) |nl| {
+                    if (nl >= f.next) break;
+                    if (!(nl >= lo and nl < hi)) {
+                        std.debug.print("line feed at {d} outside a quoted field in {f}\n", .{ nl, std.zig.fmtString(rec.bytes) });
+                        return error.ScannerAndSplitDisagree;
+                    }
+                    nl_at = nl + 1;
+                }
+                pos = f.next;
+            }
+        }
         if (comment != 0 and rec.bytes.len != 0) try testing.expect(rec.bytes[0] != comment);
         const fl = line.splitFieldsOpts(rec.bytes, &buf_lazy, delimiter, '"', a, lazy) catch |err| switch (err) {
             error.BareQuote, error.ExtraneousQuote, error.UnterminatedQuote => return error.LazySplitRaisedQuoteError,
@@ -176,19 +197,20 @@ pub fn dialectHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerro
     // The lazy iterator's parity shortcut against the toggling loop.
     var lz = line.LineIterator.initOpts(bytes, 0, .{ .escape = escape });
     while (lz.next()) |rec| {
-        try testing.expectEqual(toggleOpen(rec.bytes, escape), rec.unbalanced_quote);
+        // `double_quote` must not matter to the flag: both readings agree.
+        try testing.expectEqual(toggleOpen(rec.bytes, escape, double_quote), rec.unbalanced_quote);
     }
 }
 
 /// The original `.end_record` quote toggle, kept as the reference for the
 /// parity shortcut. (`rec` may have lost a trailing CR, which holds no quote.)
-fn toggleOpen(rec: []const u8, escape: u8) bool {
+fn toggleOpen(rec: []const u8, escape: u8, double_quote: bool) bool {
     var in_q = false;
     var i: usize = 0;
     while (i < rec.len) {
         const c = rec[i];
         if (c == '"') {
-            if (in_q and i + 1 < rec.len and rec[i + 1] == '"') {
+            if (double_quote and in_q and i + 1 < rec.len and rec[i + 1] == '"') {
                 i += 2;
                 continue;
             }

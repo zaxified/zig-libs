@@ -269,7 +269,8 @@ pub const StreamReader = struct {
     expected_fields: ?usize = null,
     /// The record `next()` returned last — after an error from `nextFields`
     /// (`FieldCountMismatch`, a `strict` quote error) it is the offending
-    /// one, with its `line_number`, `record_index` and `byte_offset`.
+    /// one, with its `line_number`, `record_index` and `byte_offset`. Its
+    /// `bytes` follow `next()`'s borrow contract (valid until a new chunk).
     last: LineSlice = .{ .bytes = "", .byte_offset = 0 },
 
     pub const Options = struct {
@@ -308,6 +309,9 @@ pub const StreamReader = struct {
         /// `error.FieldCountMismatch` — Go `FieldsPerRecord` (`.first_record`
         /// = 0, `.count` = n, `.none` = -1), rust-csv `flexible(false)`.
         /// `last` names the row. Rows read with `next()` are not checked.
+        /// The count is the first row's as split, so under `.truncate` or
+        /// `trailing_empty_field = false` it is that reading's count (the
+        /// `.span` scanner's `field_check` always counts the default way).
         fields_per_record: line.FieldCheck = .none,
     };
 
@@ -398,8 +402,12 @@ pub const StreamReader = struct {
         return self.nextFieldsOpts(buf, alloc, .{});
     }
 
-    /// `nextFields` with the caller's overflow policy and trailing-field
-    /// reading — the same choice
+    /// `nextFields` with the caller's per-call policy. Of `opts`, only
+    /// `on_overflow`, `trailing_empty_field` and `diag` are taken, and
+    /// `strict = true` turns strictness on for this call; the dialect
+    /// (`escape`, `double_quote`, `trim`) is the reader's, set at `init` —
+    /// it has to be, because the record scan already read the file by it.
+    /// The overflow choice is the same one
     /// `splitFieldsOpts` offers, one layer up, so a `StreamReader` caller is
     /// not forced back down to the in-memory API to express it. Per call, not
     /// per reader: a caller splitting a header and its rows with one reader
@@ -418,6 +426,7 @@ pub const StreamReader = struct {
         o.on_overflow = opts.on_overflow;
         o.trailing_empty_field = opts.trailing_empty_field;
         o.diag = opts.diag;
+        o.strict = o.strict or opts.strict;
         const fields = try line.splitFieldsOpts(rec.bytes, buf, self.delimiter, self.quote, alloc, o);
         if (self.fields_per_record != .none) {
             if (self.expected_fields) |want| {

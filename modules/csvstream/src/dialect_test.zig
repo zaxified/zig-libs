@@ -231,6 +231,27 @@ fn expectWrite(fields: []const []const u8, opts: writer.WriteOptions, want: []co
     try t.expectEqualStrings(want, w.buffered());
 }
 
+test "lazy unbalanced flag: an escaped quote inside quotes does not toggle" {
+    var it = line.LineIterator.initOpts("\"a\\\"\n", 0, .{ .escape = '\\' });
+    try t.expect(it.next().?.unbalanced_quote); // `"a\"`: the second quote is escaped, the field stays open
+    var plain = line.LineIterator.initOpts("\"a\\\"\n", 0, .{});
+    try t.expect(!plain.next().?.unbalanced_quote); // without the escape: open, close
+}
+
+test "writer quotes a first field that starts with the comment byte" {
+    try expectWrite(&.{ "#x", "#y" }, .{ .comment = '#', .line_terminator = .lf }, "\"#x\",#y\n");
+    try expectWrite(&.{ "#x", "y" }, .{ .line_terminator = .lf }, "#x,y\n");
+}
+
+test "nextFieldsOpts: caller strict turns strictness on for the call" {
+    try withFile("a\"b\n", .{}, struct {
+        fn run(r: *stream.StreamReader) !void {
+            var buf: [4][]const u8 = undefined;
+            try t.expectError(error.BareQuote, r.nextFieldsOpts(&buf, t.allocator, .{ .strict = true }));
+        }
+    }.run);
+}
+
 test "writer quote styles" {
     try expectWrite(&.{ "a", "", "b c" }, .{ .quote_style = .always, .line_terminator = .lf }, "\"a\",\"\",\"b c\"\n");
     try expectWrite(&.{ "a", "x,y" }, .{ .quote_style = .never, .line_terminator = .lf }, "a,x,y\n");

@@ -43,11 +43,11 @@ unbalanced-quote flagged per line instead of swallowing the file; BOM stripping;
 against Python `csv` and Go `encoding/csv` over 1833 inputs, record offsets and the writer
 (`tools/oracle.py`, Anchoring), documenting every disagreement; multi-line quoted fields as an opt-in with a stated bound on what a stray quote can
 cost (`.span`, 2026-09-30) — the peers span without one. **Where we are behind:** multi-line
-fields are opt-in, not the default; no separate
-escape char (`\"` dialects), no struct/serde mapping, no SIMD (→ Backlog).
+fields are opt-in, not the default; no struct/serde mapping, seek or dialect sniffing (R10–R12);
+the vector search covers event finding only, not a full SIMD tokenizer (R17).
 
 ## Design & invariants
-- **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote }`.
+- **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote, spanned, line_number, record_index }`.
   In-memory `LineIterator`/`splitFields` (standalone, caller already holds the bytes) and streaming
   `StreamReader` (file → chunks → records, bounded memory — peak is `max_record_len + chunk_size`,
   twice the chunk size by default, not file size).
@@ -219,9 +219,8 @@ ReleaseFast, 4 threads not involved (single reader). Ratios go on the `**Perform
 
 From README "Deferred (not implemented in v1)", now trimmed to what's still actually deferred:
 
-- **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both; some dialects (e.g.
-  `\`-escaped) use a different one. Not implemented — would touch both `splitFields`/`LineIterator`
-  and the new writer's escaping, and no concrete consumer has asked for a non-RFC dialect yet.
+- ~~**Distinct quote-vs-escape char.**~~ DONE 2026-10-20 (R3/R5: `SplitOptions.escape` +
+  `double_quote`, `SpanConfig`, `WriteOptions.escape`).
 - ~~**Strict RFC 4180 opt-in, remaining half:** (b) a trailing delimiter emitting a final empty
   field.~~ DONE 2026-10-05 as `SplitOptions.trailing_empty_field`, the DEFAULT the same day (a row
   whose last value is empty read as a short row; the writer did not round-trip). `false` keeps the

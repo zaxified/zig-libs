@@ -233,10 +233,7 @@ inconsistent fixture pair. See NOTICE for provenance.
 One item remains deliberately out of scope (multi-line quoted fields are
 now the opt-in `.span` mode above):
 
-- **Distinct quote-vs-escape char.** RFC 4180 reuses the same char for both
-  quoting and escaping; some dialects (`\`-escaped) use a different one. Would
-  touch `splitFields`/`LineIterator` and the writer's escaping together, and no
-  concrete consumer needs a non-RFC dialect yet.
+- ~~Distinct quote-vs-escape char~~ — done 2026-10-20, see "Dialect options".
 
 Everything else previously listed here (configurable delimiter, header-row
 handling, typed field coercion, CSV writing, BOM handling, field-count

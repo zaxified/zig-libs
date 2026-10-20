@@ -103,7 +103,7 @@ fn skipTrailing(line: []const u8, pos: usize, delimiter: u8, trim: Trim) usize {
 }
 
 /// One field as `scanField` found it.
-const FieldScan = struct {
+pub const FieldScan = struct {
     /// Content `line[start..end]` (inside the quotes for a quoted field).
     start: usize,
     end: usize,
@@ -123,7 +123,7 @@ fn quoteFail(opts: SplitOptions, column: usize, err: QuoteError) QuoteError {
 /// The one field scanner `splitFieldsOpts` and `countFieldsOpts` share, so
 /// the count can never disagree with the split. Always advances: `next > pos`
 /// whenever `pos < line.len`.
-inline fn scanField(line: []const u8, pos0: usize, delimiter: u8, quote: u8, opts: SplitOptions) QuoteError!FieldScan {
+pub inline fn scanField(line: []const u8, pos0: usize, delimiter: u8, quote: u8, opts: SplitOptions) QuoteError!FieldScan {
     var pos = pos0;
     if (opts.trim != .none) {
         while (pos < line.len and isTrimSpace(line[pos], delimiter)) pos += 1;
@@ -703,6 +703,10 @@ pub const SpanScanner = struct {
 /// (and, with an escape byte, an escaped byte inside quotes). Without an
 /// escape that state is just the parity of the quote count: a doubled quote
 /// takes two quotes and leaves the state, a toggle takes one and flips it.
+///
+/// `double_quote` cannot change it: two toggles leave the state as the
+/// skipped pair does. A heuristic flag, not the split's verdict: a mid-field
+/// literal quote (`5" floppy`) counts too, as it always has.
 fn quoteOpenAtEnd(rec: []const u8, quote: u8, escape: u8) bool {
     if (quote == 0) return false;
     if (escape == 0) return std.mem.countScalar(u8, rec, quote) & 1 == 1;
@@ -717,7 +721,7 @@ fn quoteOpenAtEnd(rec: []const u8, quote: u8, escape: u8) bool {
             }
             in_quotes = !in_quotes;
             i += 1;
-        } else if (in_quotes and c == escape and i + 1 < rec.len) {
+        } else if (in_quotes and escape != 0 and c == escape and i + 1 < rec.len) {
             i += 2; // escaped byte inside quoted field
         } else i += 1;
     }
@@ -772,7 +776,8 @@ fn trimCr(rec: []const u8) []const u8 {
 /// streamed from a file this is `ChunkReader.chunk_start_in_file` at the time
 /// the chunk was returned, so emitted offsets are absolute file offsets.
 ///
-/// Empty records (consecutive `\n` or trailing `\n` at EOF) are skipped.
+/// Empty records (consecutive `\n` or trailing `\n` at EOF) are skipped, and
+/// so are comment lines when `Options.comment` / `SpanConfig.comment` is set.
 /// Returns `null` once the buffer is exhausted.
 ///
 /// `initSpan` selects `.span` mode instead: quoted fields may contain

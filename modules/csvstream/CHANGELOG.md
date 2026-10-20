@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — Review fixes: `nextFieldsOpts` honours a caller `strict = true` and documents which
+  options it takes; `WriteOptions.comment` quotes a first field starting with the reader's comment byte;
+  docs (`.never` caveats, `fields_per_record` counting, `last` borrow, stale "no escape/SIMD" notes);
+  fuzz: every line feed of a spanned record must lie inside a quoted field as the split reads it.
 - **2026-10-20** — S2 dialect options (R1–R9 of the 2026-10-20 survey), all opt-in, defaults unchanged:
   `SplitOptions.escape`/`double_quote`/`trim`/`strict`/`diag` (+ `countFieldsOpts`, errors `BareQuote`,
   `ExtraneousQuote`, `UnterminatedQuote`), comment lines (`LineIterator.initOpts`, `SpanConfig.comment`),

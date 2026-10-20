@@ -45,6 +45,10 @@ pub const WriteOptions = struct {
     /// `double_quote(false)` + `escape`, Python `doublequote=False`).
     /// `0` (default) = RFC 4180 doubling.
     escape: u8 = 0,
+    /// The reader's comment byte, if it has one: a record whose first field
+    /// starts with it is quoted, or the reader would skip it as a comment
+    /// (rust-csv quotes it too). `0` = none.
+    comment: u8 = 0,
 };
 
 /// Which fields `writeField` quotes.
@@ -56,7 +60,8 @@ pub const QuoteStyle = enum {
     always,
     /// No field: written verbatim, as with `quote = 0` (Python `QUOTE_NONE`
     /// without an escape char, rust-csv `Never`). The caller then guarantees
-    /// that no field holds the delimiter, CR or LF.
+    /// that no field holds the delimiter, the quote, CR or LF, and that no
+    /// record is a single empty field (it would read back as an empty line).
     never,
 };
 
@@ -118,7 +123,11 @@ pub fn writeRecord(w: *std.Io.Writer, fields: []const []const u8, opts: WriteOpt
     }
     for (fields, 0..) |field, i| {
         if (i != 0) try w.writeByte(opts.delimiter);
-        try writeField(w, field, opts);
+        if (i == 0 and opts.comment != 0 and opts.quote != 0 and field.len != 0 and field[0] == opts.comment and opts.quote_style != .never) {
+            var o = opts;
+            o.quote_style = .always;
+            try writeField(w, field, o);
+        } else try writeField(w, field, opts);
     }
     try w.writeAll(opts.line_terminator.bytes());
 }
