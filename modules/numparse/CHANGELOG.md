@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-20** — `zig build bench-numparse` (`tools/bench.zig` + `tools/bench_ref.py`, Babel 2.17 under python 3.14): 0.007–0.04× the reference. Card: grade 3 → 2 (scope parity, P2).
 - **2026-10-20** — Every CLDR locale and native digits (S2). `locale(name)` reads a generated table of
   Babel 2.17's 1066 locales (`src/cldr_locales.zig`, `tools/babel-oracle.py --gen-table`; ASCII
   case-insensitive, `-` = `_`); `Grouping` gains `.two` (tok) and `.none` (en_US_POSIX);
