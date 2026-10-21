@@ -4,7 +4,8 @@
 //! `CertifiedKey` a `Config` borrows. What `openssl` and the ACME clients
 //! write: a chain of `CERTIFICATE` blocks (leaf first), and the key as
 //! `EC PRIVATE KEY` (RFC 5915 / SEC1), `PRIVATE KEY` (PKCS#8, RFC 5958: EC on
-//! P-256/P-384, Ed25519 per RFC 8410, or RSA) or `RSA PRIVATE KEY` (PKCS#1).
+//! P-256/P-384/P-521, Ed25519 per RFC 8410, RSA, or ML-DSA per RFC 9881 in
+//! any of its three private-key forms) or `RSA PRIVATE KEY` (PKCS#1).
 //! The key must belong to the leaf certificate (`KeyMismatch` otherwise, as
 //! rustls's `CertifiedKey::keys_match` and Go's `tls.X509KeyPair` refuse).
 //!
@@ -23,13 +24,16 @@ const std = @import("std");
 const b64ct = @import("b64ct");
 const rsa = @import("rsa");
 const x509 = @import("x509");
+const p521 = @import("p521");
 const certverify = @import("tls13").certverify;
 const burn = @import("burn.zig");
 const CertifiedKey = @import("server.zig").CertifiedKey;
 
 const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const EcdsaP384 = std.crypto.sign.ecdsa.EcdsaP384Sha384;
+const EcdsaP521 = p521.EcdsaP521Sha512;
 const Ed25519 = std.crypto.sign.Ed25519;
+const mldsa = std.crypto.sign.mldsa;
 
 pub const Error = error{
     OutOfMemory,
@@ -45,24 +49,30 @@ pub const Error = error{
     /// The key's DER, or a scalar out of range.
     MalformedKey,
     /// A key this server cannot sign with: an encrypted key (PKCS#8 or the
-    /// legacy `Proc-Type` form), a curve other than P-256/P-384, an algorithm
-    /// other than EC, Ed25519 and RSA; or an RSA key under an id-RSASSA-PSS
-    /// leaf.
+    /// legacy `Proc-Type` form), a curve other than P-256/P-384/P-521, an
+    /// algorithm other than EC, Ed25519, RSA and ML-DSA; or an RSA key under
+    /// an id-RSASSA-PSS leaf.
     UnsupportedKey,
     /// The private key does not belong to the leaf certificate.
     KeyMismatch,
 };
 
 /// The longest key DER this reader takes: the largest PKCS#8 RSA key `rsa`
-/// accepts (EC and Ed25519 keys are under 200 bytes).
-pub const max_key_der_len = @max(rsa.max_pkcs8_der_len, 512);
+/// accepts, or an ML-DSA-87 key in the "both" form (seed and the 4,896-octet
+/// expanded key); EC and Ed25519 keys are under 250 bytes.
+pub const max_key_der_len: usize = @max(rsa.max_pkcs8_der_len, mldsa.MLDSA87.SecretKey.encoded_length + 128);
 
-/// A private key held by value (RSA by pointer: `rsa.SecretKey` is large).
+/// A private key held by value (RSA and ML-DSA by pointer: `rsa.SecretKey`
+/// is 11.8 KiB, std's expanded ML-DSA keys 30-110 KiB).
 pub const PrivateKey = union(enum) {
     ecdsa_p256: EcdsaP256.SecretKey,
     ecdsa_p384: EcdsaP384.SecretKey,
+    ecdsa_p521: EcdsaP521.SecretKey,
     ed25519: Ed25519.SecretKey,
     rsa: *rsa.SecretKey,
+    mldsa44: *mldsa.MLDSA44.SecretKey,
+    mldsa65: *mldsa.MLDSA65.SecretKey,
+    mldsa87: *mldsa.MLDSA87.SecretKey,
 };
 
 /// A certificate chain and its private key, owning both. `certifiedKey`
@@ -83,8 +93,9 @@ pub const CertKeyPair = struct {
     /// nothing is allocated and `out` is zeroed (`deinit` on it is then a
     /// no-op free of empty slices). Runs under a dead-stack burn
     /// (`burn.key_burn`): needs ~110 KiB of stack, more for an RSA key
-    /// (`rsa` burns 200 KiB of its own) — call it from a thread with a
-    /// normal-sized stack, not a small pool worker.
+    /// (`rsa` burns 200 KiB of its own) and much more for an ML-DSA one
+    /// (`burn.mldsa_key_burn`: up to 1.3 MiB for ML-DSA-87) — call it from
+    /// a thread with a normal-sized stack, not a small pool worker.
     pub fn fromPem(out: *CertKeyPair, gpa: std.mem.Allocator, chain_pem: []const u8, key_pem: []const u8) Error!void {
         return burn.run(burn.key_burn, Error!void, fromPemBody, .{ out, gpa, chain_pem, key_pem });
     }
@@ -117,8 +128,12 @@ pub const CertKeyPair = struct {
         return .{ .chain = self.chain, .key = switch (self.key) {
             .ecdsa_p256 => |*k| .{ .ecdsa_p256 = k },
             .ecdsa_p384 => |*k| .{ .ecdsa_p384 = k },
+            .ecdsa_p521 => |*k| .{ .ecdsa_p521 = k },
             .ed25519 => |*k| .{ .ed25519 = k },
             .rsa => |k| .{ .rsa = k },
+            .mldsa44 => |k| .{ .mldsa44 = k },
+            .mldsa65 => |k| .{ .mldsa65 = k },
+            .mldsa87 => |k| .{ .mldsa87 = k },
         } };
     }
 };
@@ -126,6 +141,10 @@ pub const CertKeyPair = struct {
 fn wipeKey(key: *PrivateKey, gpa: std.mem.Allocator) void {
     switch (key.*) {
         .rsa => |k| {
+            std.crypto.secureZero(u8, std.mem.asBytes(k));
+            gpa.destroy(k);
+        },
+        inline .mldsa44, .mldsa65, .mldsa87 => |k| {
             std.crypto.secureZero(u8, std.mem.asBytes(k));
             gpa.destroy(k);
         },
@@ -264,11 +283,12 @@ fn loadRsa(out: *PrivateKey, gpa: std.mem.Allocator, der: []const u8, comptime f
     out.* = .{ .rsa = k };
 }
 
-const Curve = enum { p256, p384 };
+const Curve = enum { p256, p384, p521 };
 
 fn curveOf(oid: []const u8) Error!Curve {
     if (std.mem.eql(u8, oid, &x509.safe.oid_prime256v1)) return .p256;
     if (std.mem.eql(u8, oid, &x509.safe.oid_secp384r1)) return .p384;
+    if (std.mem.eql(u8, oid, &x509.safe.oid_secp521r1)) return .p521;
     return error.UnsupportedKey;
 }
 
@@ -301,7 +321,70 @@ fn fromPkcs8(out: *PrivateKey, gpa: std.mem.Allocator, der: []const u8) Error!vo
         return;
     }
     if (std.mem.eql(u8, oid, &x509.safe.oid_rsa_encryption)) return loadRsa(out, gpa, der, .pkcs8);
+    if (x509.MlDsa.map.get(oid)) |set| {
+        try alg.end(); // RFC 9881 §2: parameters MUST be absent
+        return switch (set) {
+            .ml_dsa_44 => loadMlDsa(.mldsa44, out, gpa, private),
+            .ml_dsa_65 => loadMlDsa(.mldsa65, out, gpa, private),
+            .ml_dsa_87 => loadMlDsa(.mldsa87, out, gpa, private),
+        };
+    }
     return error.UnsupportedKey;
+}
+
+/// The std type behind an ML-DSA `PrivateKey` tag.
+fn MlDsaOf(comptime tag: std.meta.Tag(PrivateKey)) type {
+    return switch (tag) {
+        .mldsa44 => mldsa.MLDSA44,
+        .mldsa65 => mldsa.MLDSA65,
+        .mldsa87 => mldsa.MLDSA87,
+        else => @compileError("not an ML-DSA key"),
+    };
+}
+
+fn loadMlDsa(comptime tag: std.meta.Tag(PrivateKey), out: *PrivateKey, gpa: std.mem.Allocator, private: []const u8) Error!void {
+    const M = MlDsaOf(tag);
+    const k = try gpa.create(M.SecretKey);
+    errdefer {
+        std.crypto.secureZero(u8, std.mem.asBytes(k));
+        gpa.destroy(k);
+    }
+    try burn.run(@field(burn.mldsa_key_burn, @tagName(tag)), Error!void, mlDsaExpand, .{ M, k, private });
+    out.* = @unionInit(PrivateKey, @tagName(tag), k);
+}
+
+/// ML-DSA-PrivateKey ::= CHOICE { seed [0] IMPLICIT OCTET STRING (SIZE (32)),
+/// expandedKey OCTET STRING, both SEQUENCE { seed, expandedKey } } (RFC 9881
+/// §6; OpenSSL 3.5 writes `both` by default). The key is expanded from the
+/// seed; `both` must agree with its own seed (OpenSSL refuses such a key
+/// too). `expandedKey` alone is `UnsupportedKey`: only its public half can
+/// be checked against the leaf — a damaged `K`, `tr` or `t0` (std has no
+/// call that recomputes them) would load and sign garbage or under another
+/// key (found by the `tlsserver-keys` fuzz harness, 2026-10-21).
+fn mlDsaExpand(comptime M: type, k: *M.SecretKey, private: []const u8) Error!void {
+    var top = try Der.init(private);
+    switch (top.peekTag() orelse return error.MalformedKey) {
+        0x80 => {
+            const seed = try top.expect(0x80);
+            try top.end();
+            if (seed.len != M.seed_length) return error.MalformedKey;
+            k.* = M.newKeyFromSeed(seed[0..M.seed_length]).sk;
+        },
+        0x04 => return error.UnsupportedKey,
+        0x30 => {
+            var both = try top.seq();
+            try top.end();
+            const seed = try both.expect(0x04);
+            const expanded = try both.expect(0x04);
+            try both.end();
+            if (seed.len != M.seed_length or expanded.len != M.SecretKey.encoded_length) return error.MalformedKey;
+            k.* = M.newKeyFromSeed(seed[0..M.seed_length]).sk;
+            var own = k.toBytes();
+            defer std.crypto.secureZero(u8, &own);
+            if (!std.crypto.timing_safe.eql([M.SecretKey.encoded_length]u8, own, expanded[0..M.SecretKey.encoded_length].*)) return error.MalformedKey;
+        },
+        else => return error.MalformedKey,
+    }
 }
 
 /// ECPrivateKey ::= SEQUENCE { version 1, privateKey OCTET STRING,
@@ -324,14 +407,15 @@ fn ecFromSec1(out: *PrivateKey, der: []const u8, known: ?Curve) Error!void {
         curve = c;
     }
     switch (curve orelse return error.MalformedKey) {
-        .p256 => out.* = .{ .ecdsa_p256 = try scalar(EcdsaP256, raw) },
-        .p384 => out.* = .{ .ecdsa_p384 = try scalar(EcdsaP384, raw) },
+        .p256 => out.* = .{ .ecdsa_p256 = try scalar(EcdsaP256, EcdsaP256.Curve.scalar.rejectNonCanonical, raw) },
+        .p384 => out.* = .{ .ecdsa_p384 = try scalar(EcdsaP384, EcdsaP384.Curve.scalar.rejectNonCanonical, raw) },
+        .p521 => out.* = .{ .ecdsa_p521 = try scalar(EcdsaP521, p521.scalar.rejectNonCanonical, raw) },
     }
 }
 
 /// RFC 5915 fixes the octet string at the order's length; a shorter one
 /// (leading zeros dropped by some encoders) is left-padded, as OpenSSL reads it.
-fn scalar(comptime E: type, raw: []const u8) Error!E.SecretKey {
+fn scalar(comptime E: type, comptime rejectNonCanonical: anytype, raw: []const u8) Error!E.SecretKey {
     const n = E.SecretKey.encoded_length;
     if (raw.len == 0 or raw.len > n) return error.MalformedKey;
     var bytes: [n]u8 = @splat(0);
@@ -341,7 +425,7 @@ fn scalar(comptime E: type, raw: []const u8) Error!E.SecretKey {
     // would load here and fail only when the first handshake signs
     // (independent review 2026-10-20, MEDIUM). Zero is refused below by
     // `fromSecretKey`'s identity check in `matches`.
-    E.Curve.scalar.rejectNonCanonical(bytes, .big) catch return error.MalformedKey;
+    rejectNonCanonical(bytes, .big) catch return error.MalformedKey;
     return E.SecretKey.fromBytes(bytes) catch error.MalformedKey;
 }
 
@@ -351,6 +435,8 @@ fn matches(key: *const PrivateKey, spki: x509.Spki) Error!void {
     switch (key.*) {
         .ecdsa_p256 => |*k| try ecMatches(EcdsaP256, &x509.safe.oid_prime256v1, k, spki),
         .ecdsa_p384 => |*k| try ecMatches(EcdsaP384, &x509.safe.oid_secp384r1, k, spki),
+        .ecdsa_p521 => |*k| try ecMatches(EcdsaP521, &x509.safe.oid_secp521r1, k, spki),
+        inline .mldsa44, .mldsa65, .mldsa87 => |k, tag| try burn.run(@field(burn.mldsa_key_burn, @tagName(tag)), Error!void, mlDsaMatches, .{ MlDsaOf(tag), k, spki }),
         .ed25519 => |*k| {
             if (!spki.algorithmIs(&x509.safe.oid_ed25519)) return error.KeyMismatch;
             const public = k.publicKeyBytes();
@@ -364,6 +450,17 @@ fn matches(key: *const PrivateKey, spki: x509.Spki) Error!void {
             if (!own.equal(&cert_key)) return error.KeyMismatch;
         },
     }
+}
+
+fn mlDsaMatches(comptime M: type, k: *const M.SecretKey, spki: x509.Spki) Error!void {
+    const set = x509.MlDsa.map.get(spki.algorithm_oid) orelse return error.KeyMismatch;
+    switch (set) {
+        inline else => |s| if (x509.MlDsa.Impl(s) != M) return error.KeyMismatch,
+    }
+    if (spki.key_bits.len != M.PublicKey.encoded_length) return error.MalformedCertificate;
+    var kp = M.KeyPair.fromSecretKey(k.*) catch return error.MalformedKey;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kp));
+    if (!std.mem.eql(u8, &kp.public_key.toBytes(), spki.key_bits)) return error.KeyMismatch;
 }
 
 fn ecMatches(comptime E: type, curve_oid: []const u8, k: *const E.SecretKey, spki: x509.Spki) Error!void {
@@ -556,15 +653,63 @@ test "every allocation failure is clean (no leak, no double free), every key for
     }
 }
 
-test "refusals: no blocks, encrypted keys, other curves, damaged PEM" {
+test "refusals: no blocks, encrypted keys, other curves, expanded-only ML-DSA, damaged PEM" {
     const c = key_vectors.cases[0];
     var pair: CertKeyPair = undefined;
     const gpa = testing.allocator;
     try testing.expectError(error.MissingCertificate, CertKeyPair.fromPem(&pair, gpa, c.key_pem, c.key_pem));
     try testing.expectError(error.MissingPrivateKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, c.cert_pem));
     try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, key_vectors.encrypted_pem));
-    try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, key_vectors.p521_pem));
+    try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, key_vectors.k256_pem));
+    for (key_vectors.cases) |m| if (m.kind == .mldsa44) {
+        try testing.expectError(error.UnsupportedKey, CertKeyPair.fromPem(&pair, gpa, m.cert_pem, key_vectors.mldsa44_expanded_pem));
+    };
     try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, "-----BEGIN EC PRIVATE KEY-----\nAAAA\n"));
     try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, "-----BEGIN EC PRIVATE KEY-----\n!!!!\n-----END EC PRIVATE KEY-----\n"));
     try testing.expectError(error.InvalidPem, CertKeyPair.fromPem(&pair, gpa, c.cert_pem, "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"));
+}
+
+test "ML-DSA: a `both` key whose expanded half is not its seed's is MalformedKey" {
+    for (key_vectors.cases) |c| if (c.kind == .mldsa44 and std.mem.endsWith(u8, c.name, "-both")) {
+        const label, const body = blk: {
+            var it: BlockIterator = .{ .text = c.key_pem };
+            const b = (try it.next()).?;
+            break :blk .{ b.label, b.body };
+        };
+        var der_buf: [max_key_der_len]u8 = undefined;
+        const der = try b64ct.standard.decodeIgnoring(&der_buf, body, b64ct.pem_whitespace);
+        der[der.len - 1] ^= 0x01; // the last octet of t0
+        var b64: [2 * max_key_der_len]u8 = undefined;
+        const text = std.base64.standard.Encoder.encode(&b64, der);
+        var pem: std.ArrayList(u8) = .empty;
+        defer pem.deinit(testing.allocator);
+        try pem.print(testing.allocator, "-----BEGIN {s}-----\n{s}\n-----END {s}-----\n", .{ label, text, label });
+        var pair: CertKeyPair = undefined;
+        try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, testing.allocator, c.cert_pem, pem.items));
+        try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&pair), 0));
+    };
+}
+
+test "ML-DSA: a seed-form key with anything after the seed is MalformedKey" {
+    for (key_vectors.cases) |c| if (c.kind == .mldsa44 and std.mem.endsWith(u8, c.name, "-seed")) {
+        var it: BlockIterator = .{ .text = c.key_pem };
+        const b = (try it.next()).?;
+        var der_buf: [max_key_der_len]u8 = undefined;
+        const der = try b64ct.standard.decodeIgnoring(&der_buf, b.body, b64ct.pem_whitespace);
+        // PrivateKeyInfo { 0, AlgorithmIdentifier, OCTET STRING { [0] seed } }:
+        // grow the OCTET STRING (and the SEQUENCE) by an empty OCTET STRING.
+        try testing.expectEqual(@as(usize, 54), der.len);
+        var grown: [56]u8 = undefined;
+        @memcpy(grown[0..54], der);
+        grown[54] = 0x04;
+        grown[55] = 0x00;
+        grown[1] += 2; // SEQUENCE length
+        grown[19] += 2; // OCTET STRING length
+        var b64: [128]u8 = undefined;
+        const text = std.base64.standard.Encoder.encode(&b64, &grown);
+        var pem_buf: [256]u8 = undefined;
+        const pem = try std.fmt.bufPrint(&pem_buf, "-----BEGIN PRIVATE KEY-----\n{s}\n-----END PRIVATE KEY-----\n", .{text});
+        var pair: CertKeyPair = undefined;
+        try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, testing.allocator, c.cert_pem, pem));
+    };
 }

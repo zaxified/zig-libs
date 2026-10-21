@@ -63,8 +63,9 @@ milestone (plan: `~/CML/tlsserver-2026-10-20/DESIGN.md`).
 EncryptedExtensions, Certificate, CertificateVerify, Finished → the client's Finished — then
 application data both ways and close_notify, over the record layer (header, in-place protection,
 the receive side, alerts), the ClientHello decoder and the message encoders. It handshakes with
-OpenSSL 3.5's `s_client` (ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; all three
-suites; X25519MLKEM768, X25519, secp256r1, secp384r1; ALPN; with and without SNI), with Go's
+OpenSSL 3.5's `s_client` (ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS and ML-DSA-65
+certificates; all three suites; X25519MLKEM768, X25519, secp256r1, secp384r1, ML-KEM-1024;
+ALPN; with and without SNI), with Go's
 crypto/tls client (the same, Go's own defaults), with `tlsclient` and with Zig std's client;
 `Connection` drives it over a `std.Io.Reader`/`Writer` pair; `keys.CertKeyPair` loads the
 certificate chain and private key from PEM. A client that sent no share for the chosen group
@@ -94,7 +95,7 @@ of `key_pem`:
 | Label | Content | Keys |
 |---|---|---|
 | `EC PRIVATE KEY` | RFC 5915 ECPrivateKey; the `[0]` curve required | P-256, P-384 |
-| `PRIVATE KEY` | RFC 5958 PrivateKeyInfo / OneAsymmetricKey (v0 or v1) | EC P-256/P-384 (a `[0]` inside must agree), Ed25519 (RFC 8410: no parameters, a 32-octet seed), RSA (`rsa.fromPkcs8`) |
+| `PRIVATE KEY` | RFC 5958 PrivateKeyInfo / OneAsymmetricKey (v0 or v1) | EC P-256/P-384/P-521 (a `[0]` inside must agree), Ed25519 (RFC 8410: no parameters, a 32-octet seed), RSA (`rsa.fromPkcs8`), ML-DSA-44/65/87 (RFC 9881: no parameters; the `seed` and `both` forms — `both` must match its seed; `expandedKey` alone is `UnsupportedKey`, as only its public half could be checked against the leaf) |
 | `RSA PRIVATE KEY` | PKCS#1 RSAPrivateKey | RSA (`rsa.SecretKey.fromDer`: two-prime, consistency-checked) |
 | `ENCRYPTED PRIVATE KEY`, or any key with RFC 1421 `Proc-Type` headers | — | refused, `UnsupportedKey` |
 
@@ -178,7 +179,9 @@ malformed is `decode_error`; another context `illegal_parameter`; an entry with 
 `ClientAuth.mandatory` (the default), otherwise the client goes on unauthenticated (no
 CertificateVerify). Otherwise: at most 16 certificates and a leaf of at most 4096 octets
 (`bad_certificate` past either); the leaf's key must be one `certverify` verifies (RSA, ECDSA
-P-256/P-384, Ed25519) and its `keyUsage`, if present, must assert `digitalSignature`
+P-256/P-384/P-521, Ed25519, ML-DSA — the last two only with their schemes in
+`ClientAuth.schemes`, and an ML-DSA-65/87 leaf is over the 4096-octet cap) and its `keyUsage`,
+if present, must assert `digitalSignature`
 (`unsupported_certificate`; BoringSSL checks this in the TLS layer whatever the verifier says,
 read from an `x509.safe`-vetted copy); then the chain, leaf first, goes to
 `ClientCertVerifier.verify` with the `ClientAuth.clock` time, whose refusal names the alert
@@ -676,7 +679,10 @@ BEGIN (END must now match); one pass over the blocks instead of one per label; i
 are checked; the key's size limit no longer counts whitespace; an RSA-PSS leaf is named. Added:
 an allocation-failure sweep (`checkAllAllocationFailures`) over every key form, CRLF, `out`
 zeroed after an error. Documented, not changed: the pair must not move after `certifiedKey`,
-and `fromPem` wants ~110 KiB of stack (more for RSA).
+and `fromPem` wants ~110 KiB of stack (more for RSA; for ML-DSA, 2026-10-21, up to 1.3 MiB —
+`burn.mldsa_key_burn`). A handshake signs and exchanges under `tls13`'s burns: up to 352 KiB
+for an ML-DSA-87 signature and 256 KiB for ML-KEM-1024 (ReleaseFast depths ×1.3; Debug frames
+are larger), so a small-stack worker must be sized for the keys and groups it enables.
 
 ## What is deliberately not done
 
@@ -698,6 +704,13 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
 
 - **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
   Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
+- **M4 step 1 (2026-10-21): ML-KEM-1024, P-521 and ML-DSA** — 16 of the 49 gaps closed (BoGo
+  359/0, parity 267 of 436, 33 gaps). Open: ML-DSA-65/87 client leaves (5.5-7.5 KB) exceed
+  `clientauth.max_leaf_len` — raising it costs every connection 4 KiB (`Server.peer_buf`) and
+  ticket scratch; a caller-supplied leaf buffer (the qap item below) is the other way: an owner
+  decision (`Server-Verify-ML-DSA-65/87`, `Server-InvalidSignature-ML-DSA-65/87` disabled with
+  that reason). The ML-DSA AlgorithmIdentifier's absent parameters are checked for the private
+  key, not for a client leaf (`x509.Spki` does not expose them).
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:

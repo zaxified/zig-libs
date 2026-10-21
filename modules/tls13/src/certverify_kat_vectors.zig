@@ -158,3 +158,50 @@ pub const rsa_pss_sha256_server = struct {
         return rsa.PublicKey.fromBytes(&n, &e);
     }
 };
+
+// ── ECDSA P-521, server side ─────────────────────────────────────────────
+//
+// PROVENANCE: externally cross-checked. OpenSSL 3.5.5 `pkeyutl -sign -rawin
+// -digest sha512 -pkeyopt nonce-type:1` (RFC 6979 deterministic nonce) over
+// `content`, with the private scalar `d` below (a fixed test constant, PKCS#8
+// from Python `cryptography`); `p521`'s RFC 6979 path reproduces the DER
+// byte for byte when `sign` gets no randomness (2026-10-21).
+
+pub const ecdsa_p521_server = struct {
+    pub const secret_key_bytes = hexLit("01a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5");
+    pub const public_key_uncompressed_sec1 = hexLit("04006d5cc96239f41ac90e921eaafa7482ab18c225099ffe730fec44bcd0424317c3bbe7a9959cc7c3df5f4f89eef673ec9ddaed9d89c91f299c86adbdc386c7925ae1018b0c3ccd5f7d85b1489ba093395f7dbd0222409b2436bce09d0228758ef3bd42f7877bf4a0ff7cebb29a1b0c4fa6bdda8175fd61f49597e5ca222c0af3a82713d7");
+    pub const transcript_hash = @as([64]u8, @splat(0x33));
+    pub const signature_der = hexLit("308187024201b0a864b15eb48bcfa19bd05110cd74358b02bc9c4cb431887b9dd05b894c9d36609022406053d9d05a4fd9987ab221a09105ecf4df2fd86164aa9e5e967a5d38e2024116c533f5c4321785097e7ab39cbd9f0fc251bff7ae8464623e7d812ad785fa99854a2e2123c5eec053286ac061a9d519741347ba2611024067e4ca1a1b802e7383");
+};
+
+// ── ML-DSA-44/65/87, server side ─────────────────────────────────────────
+//
+// PROVENANCE: externally cross-checked. OpenSSL 3.5.5 `genpkey -algorithm
+// ML-DSA-<n> -pkeyopt hexseed:<seed>` and `pkeyutl -sign -rawin -pkeyopt
+// deterministic:1` (pure ML-DSA, empty context) over the server content for
+// `transcript_hash`. The keys and signatures are kilobytes, so their SHA-256
+// is pinned: std's FIPS 204 keygen from the same seed and its deterministic
+// signature must hash to the same values (2026-10-21).
+
+pub const MlDsaVector = struct {
+    seed: [32]u8,
+    transcript_hash: [48]u8 = @splat(0x44),
+    public_key_sha256: [32]u8,
+    signature_sha256: [32]u8,
+};
+
+pub const mldsa44_server: MlDsaVector = .{
+    .seed = @splat(0x6c),
+    .public_key_sha256 = hexLit("f35a6495991ebe97591669669d4074249497053979563f509c1b5464f755649f"),
+    .signature_sha256 = hexLit("003332d514ea0648930cdc6b5d1d9f47794a62507443ddcc6998014b2ac3d64f"),
+};
+pub const mldsa65_server: MlDsaVector = .{
+    .seed = @splat(0x81),
+    .public_key_sha256 = hexLit("7b7b3c4da475e1143f6877d3aba9f9b24aaf6565977c81cefa19edf13c5dbf5d"),
+    .signature_sha256 = hexLit("e0ffa5ee251c070ecbedac23ba4d3069ac4f482eab49adecd34ab7f0ecce12aa"),
+};
+pub const mldsa87_server: MlDsaVector = .{
+    .seed = @splat(0x97),
+    .public_key_sha256 = hexLit("66ccfa44828d8d5c53f1d461fd8d13276ea1f5641eb7225efe74e30d37caeef2"),
+    .signature_sha256 = hexLit("6f042e3dccd89d99b0c73b0487a3a695bab62c361fd99beb179038759c3dfb8c"),
+};

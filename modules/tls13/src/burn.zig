@@ -50,6 +50,13 @@ pub const ecdsa_burn = 48 * 1024;
 /// `signEd25519` (std `Ed25519.KeyPair.generateDeterministic` + `sign`)
 /// dirtied 33.8 KiB in ReleaseFast (2026-10-08).
 pub const ed25519_burn = 40 * 1024;
+/// ML-DSA (std), per parameter set: `sign` borrows the expanded key but
+/// keeps its vectors on the stack; `verify` decodes the public key with its
+/// matrix A by value. ReleaseFast depths from `stackprobe_test.zig`
+/// (2026-10-21), sign / verify: ML-DSA-44 95.9 / 153.4 KiB, ML-DSA-65
+/// 163.8 / 217.0 KiB, ML-DSA-87 258.3 / 337.3 KiB; each burn ~1.3x.
+pub const mldsa_sign_burn = .{ .mldsa44 = 128 * 1024, .mldsa65 = 224 * 1024, .mldsa87 = 352 * 1024 };
+pub const mldsa_verify_burn = .{ .mldsa44 = 208 * 1024, .mldsa65 = 288 * 1024, .mldsa87 = 448 * 1024 };
 
 /// `signRsaPss`: the frames above `rsa.signPss` (key by pointer, no copy) are
 /// well under 1 KiB and `rsa` burns its own 200 KiB below them; before the
@@ -73,3 +80,6 @@ pub const kex_p384_burn = 112 * 1024;
 /// X25519MLKEM768 (ML-KEM-768 keygen / encaps / decaps plus X25519):
 /// 61.4 / 60.9 / 77.6 KiB.
 pub const kex_hybrid_burn = 160 * 1024;
+/// MLKEM1024 (ML-KEM-1024 keygen / encaps / decaps, out of line):
+/// 114.1 / 103.9 / 184.9 KiB.
+pub const kex_mlkem1024_burn = 256 * 1024;

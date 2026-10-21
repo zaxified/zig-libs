@@ -965,8 +965,10 @@ const hybrid_server_share_len = kex.hybrid_server_share_len;
 /// its share costs 1216, and the two decisions are deliberately separate.
 const advertised_groups = [_]u16{ x25519_mlkem768_group, x25519_group, secp256r1_group };
 
-/// The longest `KeyShareEntry.key_exchange` any advertised group produces:
-/// the hybrid's client share (ML-KEM-768 encapsulation key ‖ X25519 public).
+/// Room for the longest `KeyShareEntry.key_exchange` `tls13.kex` computes:
+/// 1568 since its ML-KEM-1024 (2026-10-21), which dtls does not advertise —
+/// its own longest is the hybrid's 1216-octet client share. The extra 352
+/// octets only widen the buffers; the ClientHello bound below is unchanged.
 const max_key_share_len = kex.max_share_len;
 
 /// Upper bound on a ClientHello BODY this module can build or accept. Its

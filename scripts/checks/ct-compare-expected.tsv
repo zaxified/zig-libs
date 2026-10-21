@@ -26,7 +26,8 @@ modules/dkg/src/core.zig	2	0
 modules/dns/src/tsig.zig	1	0
 modules/dnssec/src/ds.zig	1	0
 modules/dtls/src/Connection.zig	4	8
-modules/tls13/src/certverify.zig	1	1
+# tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
+modules/tls13/src/certverify.zig	1	2
 modules/tls13/src/keyschedule.zig	2	3
 modules/ecvrf/src/ecvrf.zig	1	5
 modules/idempotency/src/root.zig	2	7
@@ -66,6 +67,8 @@ modules/tlock/src/age.zig	1	10
 modules/tlsclient/src/Client.zig	2	6
 modules/tlsresume/src/cache.zig	1	0
 modules/tlsresume/src/psk.zig	1	0
+# tlsserver keys 2026-10-21: an ML-DSA `both` key's expanded half against its seed's is timing_safe.eql (secret); the plain compares are PEM labels, OIDs, public keys against the leaf and tests -- all public.
+modules/tlsserver/src/keys.zig	1	14
 # tlsserver 2026-10-20: the client's Finished verify_data is compared with timing_safe.eql; the 4 plain compares are ALPN names, the SNI of a retried ClientHello, and two in tests (an SNI, the HelloRetryRequest random) -- all public.
 modules/tlsserver/src/server.zig	1	4
 modules/voprf/src/root.zig	5	1

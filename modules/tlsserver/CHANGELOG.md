@@ -10,6 +10,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (remote DoS on a server with ALPN or tickets). The `tlsserver-hello` harness drew names of
   1-16 octets and 32-octet binders only; it now draws 254/255 too (negative control: it finds the
   old code). Found by a minOutputLen test with a 255-octet ALPN name.
+- **2026-10-21** — M4 step 1: ML-KEM-1024, P-521 and ML-DSA (rustls parity 247 → 267, BoGo
+  339 → 359/0). `server.supported_groups` (the defaults plus `tls13.kex.mlkem1024_group`, opt-in
+  through `Config.groups`); P-521 and ML-DSA-44/65/87 server certificates — `keys.PrivateKey`
+  gains `ecdsa_p521` (SEC1/PKCS#8) and `mldsa44/65/87` (RFC 9881 `seed` and `both` forms; the
+  expanded-only form is refused) — and client certificates (`clientauth.leafPublicKey`; the
+  schemes must be listed in `ClientAuth.schemes`). New dep `p521`. Interop: OpenSSL `s_client`
+  on a P-521 and an ML-DSA-65 certificate, the latter over ML-KEM-1024 (51 recorded sessions).
+  `test_key_vectors` / `testKeyVector` exported.
 - **2026-10-21** — M3 step 3, the per-connection wipe. `Outbound.wipe` zeroed the whole output
   buffer with `std.crypto.secureZero` (a byte at a time: ~16 µs for qap's 48 KiB, on every
   connection); it now zeroes up to the high-water mark of what was written (`Outbound.dirty`,

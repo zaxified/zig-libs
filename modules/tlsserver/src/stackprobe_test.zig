@@ -51,7 +51,9 @@ test "STACKPROBE: no traffic secret, key state or IV residue after any record en
 const keys = @import("keys.zig");
 const key_vectors = @import("key_vectors.zig");
 
-var heap_buf: [64 * 1024]u8 = undefined;
+var heap_buf: [256 * 1024]u8 = undefined; // an expanded ML-DSA-87 key is ~110 KiB
+/// Past the deepest `burn.mldsa_key_burn` (1.25 MiB) and the burn's own frame.
+const PKey = sp.Probe(.{ .window = 1536 * 1024 });
 var pair: keys.CertKeyPair = undefined;
 
 test "STACKPROBE: no private-key residue after CertKeyPair.fromPem" {
@@ -62,7 +64,7 @@ test "STACKPROBE: no private-key residue after CertKeyPair.fromPem" {
         // The needles are the loaded secret's bytes, known only afterwards:
         // load once, copy the secret out, wipe, then probe a second load.
         try keys.CertKeyPair.fromPem(&pair, gpa, c.cert_pem, c.key_pem);
-        var secret: [64]u8 = undefined;
+        var secret: [66]u8 = undefined;
         const n: usize = switch (pair.key) {
             .ecdsa_p256 => |k| blk: {
                 secret[0..32].* = k.toBytes();
@@ -76,11 +78,20 @@ test "STACKPROBE: no private-key residue after CertKeyPair.fromPem" {
                 secret[0..32].* = k.seed();
                 break :blk 32;
             },
+            .ecdsa_p521 => |k| blk: {
+                secret[0..66].* = k.toBytes();
+                break :blk 66;
+            },
             .rsa => 0, // `rsa` burns its own parse; residue is still checked
+            // The signing seed `K` of the expanded key.
+            inline .mldsa44, .mldsa65, .mldsa87 => |k| blk: {
+                secret[0..32].* = k.key;
+                break :blk 32;
+            },
         };
         pair.deinit(gpa);
         fba.reset();
-        _ = try P.run("fromPem " ++ c.name, keys.CertKeyPair.fromPem, .{ &pair, gpa, c.cert_pem, c.key_pem }, &[_][]const u8{secret[0..n]}, .{});
+        _ = try PKey.run("fromPem " ++ c.name, keys.CertKeyPair.fromPem, .{ &pair, gpa, c.cert_pem, c.key_pem }, &[_][]const u8{secret[0..n]}, .{});
         pair.deinit(gpa);
     }
 }

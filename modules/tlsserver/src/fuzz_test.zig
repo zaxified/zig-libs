@@ -932,8 +932,10 @@ fn sameKey(a: *const keys.PrivateKey, b: *const keys.PrivateKey) bool {
     return switch (a.*) {
         .ecdsa_p256 => |k| std.mem.eql(u8, &k.toBytes(), &b.ecdsa_p256.toBytes()),
         .ecdsa_p384 => |k| std.mem.eql(u8, &k.toBytes(), &b.ecdsa_p384.toBytes()),
+        .ecdsa_p521 => |k| std.mem.eql(u8, &k.toBytes(), &b.ecdsa_p521.toBytes()),
         .ed25519 => |k| std.mem.eql(u8, &k.toBytes(), &b.ed25519.toBytes()),
         .rsa => |k| k.publicKey().equal(&b.rsa.publicKey()),
+        inline .mldsa44, .mldsa65, .mldsa87 => |k, tag| std.mem.eql(u8, &k.toBytes(), &@field(b, @tagName(tag)).toBytes()),
     };
 }
 
@@ -1061,7 +1063,7 @@ fn modelKey(comptime S: type, src: *S, genuine: *const keys.PrivateKey, o: *DerO
             o.wrap(top, 0x30);
             return "PRIVATE KEY";
         },
-        .rsa => unreachable,
+        .rsa, .ecdsa_p521, .mldsa44, .mldsa65, .mldsa87 => unreachable,
     }
 }
 
@@ -1070,7 +1072,11 @@ fn fuzzKeys(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var text_buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&text_buf);
     var mode = src.valueRangeAtMost(u8, 0, 11);
-    if (mode >= 7 and mode <= 8 and c.kind == .rsa) mode = 1; // no RSA model
+    // No model of RSA, P-521 (the P-256/P-384 one's code path) or ML-DSA keys.
+    if (mode >= 7 and mode <= 8 and switch (c.kind) {
+        .ecdsa_p256, .ecdsa_p384, .ed25519 => false,
+        else => true,
+    }) mode = 1;
     var damaged = true;
     var relabel = false;
     if (mode == 0) {
@@ -1079,10 +1085,10 @@ fn fuzzKeys(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     } else if (mode <= 6) {
         // The DER, damaged and re-armoured.
         const label, const body = lastBlock(c.key_pem);
-        var der_buf: [4096]u8 = undefined;
+        var der_buf: [keys.max_key_der_len + 16]u8 = undefined;
         const dec = std.base64.standard.decoderWithIgnore(" \t\r\n");
         var n = try dec.decode(&der_buf, body);
-        var orig_buf: [4096]u8 = undefined;
+        var orig_buf: [keys.max_key_der_len]u8 = undefined;
         const orig = orig_buf[0..n];
         @memcpy(orig, der_buf[0..n]);
         switch (src.valueRangeAtMost(u8, 0, 3)) {
@@ -1266,8 +1272,12 @@ const FuzzKeys = struct {
     p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
     ed25519: std.crypto.sign.Ed25519.SecretKey,
     rsa2048: rsa.SecretKey,
+    /// The interop program's P-521 and ML-DSA-65 keys (`key_vectors`).
+    p521: keys.CertKeyPair,
+    mldsa65: keys.CertKeyPair,
     chains: [4][1][]const u8,
-    cks: [4]server_mod.CertifiedKey,
+    /// Indexed by `interop.CertKind`.
+    cks: [std.enums.values(interop.CertKind).len]server_mod.CertifiedKey,
 };
 var fuzz_keys: ?*FuzzKeys = null;
 
@@ -1281,11 +1291,17 @@ fn fuzzKeys_() !*FuzzKeys {
     k.ed25519 = try .fromBytes(certs.ed25519_secret);
     try rsa.SecretKey.fromDer(&k.rsa2048, &certs.rsa2048_pkcs1);
     k.chains = .{ .{&certs.p256_cert}, .{&certs.p384_cert}, .{&certs.ed25519_cert}, .{&certs.rsa2048_cert} };
+    inline for (.{ .{ &k.p521, "p521-pkcs8" }, .{ &k.mldsa65, "mldsa65-both" } }) |e| {
+        const v = @import("root.zig").testKeyVector(e[1]);
+        try e[0].fromPem(std.heap.page_allocator, v.cert_pem, v.key_pem); // global-alloc-ok: the same process-lifetime fixture
+    }
     k.cks = .{
         .{ .chain = &k.chains[0], .key = .{ .ecdsa_p256 = &k.p256 } },
         .{ .chain = &k.chains[1], .key = .{ .ecdsa_p384 = &k.p384 } },
         .{ .chain = &k.chains[2], .key = .{ .ed25519 = &k.ed25519 } },
         .{ .chain = &k.chains[3], .key = .{ .rsa = &k.rsa2048 } },
+        k.p521.certifiedKey(),
+        k.mldsa65.certifiedKey(),
     };
     fuzz_keys = k;
     return k;
@@ -1422,11 +1438,12 @@ fn recordStarts(stream: []const u8, starts: []usize) []usize {
 
 fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const fk = try fuzzKeys_();
-    // RSA signing dominates a run: one run in ten picks among all cases.
+    // RSA and ML-DSA signing dominate a run: one run in ten picks among
+    // all cases.
     var v: interop.Case = undefined;
     while (true) {
         v = interop.cases[src.index(interop.cases.len)];
-        if (v.cert != .rsa2048 or src.valueRangeAtMost(u8, 0, 9) == 0) break;
+        if ((v.cert != .rsa2048 and v.cert != .mldsa65) or src.valueRangeAtMost(u8, 0, 9) == 0) break;
     }
     if (std.mem.startsWith(u8, v.name, "go-")) SrvMark.mark(.go_case) else SrvMark.mark(.openssl_case);
     if (std.mem.indexOf(u8, v.name, "hrr") != null) SrvMark.mark(.retry_case);
@@ -1924,7 +1941,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var v: interop.Case = undefined;
     while (true) {
         v = interop.cases[src.index(interop.cases.len)];
-        if (v.cert != .rsa2048) break;
+        if (v.cert != .rsa2048 and v.cert != .mldsa65) break;
     }
     var leaf = fk.cks[@backingInt(v.cert)];
     if (v.staple) {

@@ -33,19 +33,23 @@ const std = @import("std");
 const rsa = @import("rsa");
 const p256 = @import("p256");
 const p384 = @import("p384");
+const p521 = @import("p521");
 const burn = @import("burn.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP521 = p521.EcdsaP521Sha512;
+const mldsa = std.crypto.sign.mldsa;
 
 // ── SignatureScheme (RFC 8446 §4.2.3) ────────────────────────────────────
 
 /// TLS 1.3 `SignatureScheme` code points this module supports. RFC 8446
 /// defines many more (legacy PKCS#1 v1.5 schemes for backward-compat-only
 /// certificate verification, ecdsa_sha1, various historical/reserved
-/// values); this module only targets the six code points the task brief
-/// scoped it to (`rsa_pss_rsae_sha{256,384,512}`, `ecdsa_secp{256,384}r1_sha*`,
-/// `ed25519`) -- notably NOT `ed448` (a separate `ed448` module already
+/// values); this module targets `rsa_pss_rsae_sha{256,384,512}`,
+/// `ecdsa_secp{256,384,521}r1_sha*`, `ed25519` and pure ML-DSA
+/// (`mldsa{44,65,87}`, draft-ietf-tls-mldsa, empty context; 2026-10-21 for
+/// rustls parity) -- notably NOT `ed448` (a separate `ed448` module already
 /// exists in this collection, see its README/SPEC) or the `rsa_pss_pss_*`
 /// family (RSA-PSS with an embedded-in-the-key hash/salt-length identifier,
 /// distinct from `rsa_pss_rsae_*`'s "any RSA key" form).
@@ -57,10 +61,14 @@ const Ed25519 = std.crypto.sign.Ed25519;
 pub const SignatureScheme = enum(u16) {
     ecdsa_secp256r1_sha256 = 0x0403,
     ecdsa_secp384r1_sha384 = 0x0503,
+    ecdsa_secp521r1_sha512 = 0x0603,
     rsa_pss_rsae_sha256 = 0x0804,
     rsa_pss_rsae_sha384 = 0x0805,
     rsa_pss_rsae_sha512 = 0x0806,
     ed25519 = 0x0807,
+    mldsa44 = 0x0904,
+    mldsa65 = 0x0905,
+    mldsa87 = 0x0906,
     _,
 
     /// Digest length (bytes) of the hash this scheme signs with, for the
@@ -69,7 +77,8 @@ pub const SignatureScheme = enum(u16) {
     /// fed to the signature primitive per SEC1). Returns `null` for
     /// `ed25519` (PureEdDSA, RFC 8032 -- it hashes the message internally
     /// with SHA-512 and has no separate "signature hash" parameter to
-    /// validate the caller's transcript hash length against) and for any
+    /// validate the caller's transcript hash length against), for ML-DSA
+    /// (it hashes the message itself with SHAKE256) and for any
     /// unrecognized scheme.
     ///
     /// Not a constraint on the transcript hash: RFC 8446 §4.4.3 signs the
@@ -79,8 +88,8 @@ pub const SignatureScheme = enum(u16) {
         return switch (scheme) {
             .ecdsa_secp256r1_sha256, .rsa_pss_rsae_sha256 => 32,
             .ecdsa_secp384r1_sha384, .rsa_pss_rsae_sha384 => 48,
-            .rsa_pss_rsae_sha512 => 64,
-            .ed25519 => null,
+            .ecdsa_secp521r1_sha512, .rsa_pss_rsae_sha512 => 64,
+            .ed25519, .mldsa44, .mldsa65, .mldsa87 => null,
             _ => null,
         };
     }
@@ -178,7 +187,15 @@ pub const PublicKey = union(enum) {
     rsa: rsa.PublicKey,
     ecdsa_p256: Ecdsa.EcdsaP256Sha256.PublicKey,
     ecdsa_p384: Ecdsa.EcdsaP384Sha384.PublicKey,
+    ecdsa_p521: EcdsaP521.PublicKey,
     ed25519: Ed25519.PublicKey,
+    /// The encoded key (FIPS 204 `pkEncode`, the certificate's
+    /// subjectPublicKey), BORROWED: std's decoded `PublicKey` carries the
+    /// expanded matrix A (up to 56 KiB), so it is decoded inside `verify`'s
+    /// burn, never held. Its length must be the parameter set's.
+    mldsa44: []const u8,
+    mldsa65: []const u8,
+    mldsa87: []const u8,
 };
 
 /// A CertificateVerify-capable secret (signing) key, tagged by key family --
@@ -192,7 +209,12 @@ pub const SecretKey = union(enum) {
     rsa: *const rsa.SecretKey,
     ecdsa_p256: *const Ecdsa.EcdsaP256Sha256.SecretKey,
     ecdsa_p384: *const Ecdsa.EcdsaP384Sha384.SecretKey,
+    ecdsa_p521: *const EcdsaP521.SecretKey,
     ed25519: *const Ed25519.SecretKey,
+    /// std's expanded keys (~10-100 KiB with the cached NTT forms).
+    mldsa44: *const mldsa.MLDSA44.SecretKey,
+    mldsa65: *const mldsa.MLDSA65.SecretKey,
+    mldsa87: *const mldsa.MLDSA87.SecretKey,
 };
 
 // ── candidateSchemes: signature_algorithms negotiation support ──────────
@@ -212,7 +234,11 @@ pub fn candidateSchemes(secret_key: SecretKey) []const SignatureScheme {
         .rsa => &.{ .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 },
         .ecdsa_p256 => &.{.ecdsa_secp256r1_sha256},
         .ecdsa_p384 => &.{.ecdsa_secp384r1_sha384},
+        .ecdsa_p521 => &.{.ecdsa_secp521r1_sha512},
         .ed25519 => &.{.ed25519},
+        .mldsa44 => &.{.mldsa44},
+        .mldsa65 => &.{.mldsa65},
+        .mldsa87 => &.{.mldsa87},
     };
 }
 
@@ -270,9 +296,20 @@ pub fn maxSignatureLen(scheme: SignatureScheme) usize {
         .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => rsa.max_modulus_len,
         .ecdsa_secp256r1_sha256 => Ecdsa.EcdsaP256Sha256.Signature.der_encoded_length_max,
         .ecdsa_secp384r1_sha384 => Ecdsa.EcdsaP384Sha384.Signature.der_encoded_length_max,
+        .ecdsa_secp521r1_sha512 => EcdsaP521.Signature.der_encoded_length_max,
         .ed25519 => Ed25519.Signature.encoded_length,
+        .mldsa44 => mldsa.MLDSA44.Signature.encoded_length,
+        .mldsa65 => mldsa.MLDSA65.Signature.encoded_length,
+        .mldsa87 => mldsa.MLDSA87.Signature.encoded_length,
         _ => 0,
     };
+}
+
+/// The longest signature any scheme here produces (ML-DSA-87's 4627
+/// octets; RSA-PSS is bounded by `rsa.max_modulus_len`).
+pub const max_signature_len = @max(rsa.max_modulus_len, mldsa.MLDSA87.Signature.encoded_length);
+comptime {
+    for (std.enums.values(SignatureScheme)) |s| std.debug.assert(maxSignatureLen(s) <= max_signature_len);
 }
 
 // ── verify ────────────────────────────────────────────────────────────────
@@ -333,12 +370,24 @@ pub fn verify(
             };
             break :blk verifyEcdsaP384(pk, content, signature);
         },
+        .ecdsa_secp521r1_sha512 => blk: {
+            const pk = switch (public_key) {
+                .ecdsa_p521 => |k| k,
+                else => return error.KeyMismatch,
+            };
+            break :blk verifyEcdsaP521(pk, content, signature);
+        },
         .ed25519 => blk: {
             const pk = switch (public_key) {
                 .ed25519 => |k| k,
                 else => return error.KeyMismatch,
             };
             break :blk verifyEd25519(pk, content, signature);
+        },
+        inline .mldsa44, .mldsa65, .mldsa87 => |s| blk: {
+            if (std.meta.activeTag(public_key) != @field(std.meta.Tag(PublicKey), @tagName(s))) return error.KeyMismatch;
+            const pk = @field(public_key, @tagName(s));
+            break :blk burn.run(@field(burn.mldsa_verify_burn, @tagName(s)), VerifyError!void, verifyMlDsa, .{ MlDsaOf(s), pk, content, signature });
         },
         _ => error.UnsupportedScheme,
     };
@@ -430,6 +479,21 @@ pub fn sign(
             };
             if (out.len < Ed25519.Signature.encoded_length) return error.BufferTooSmall;
             break :blk burn.run(burn.ed25519_burn, SignError![]u8, signEd25519, .{ sk, content, random, out });
+        },
+        .ecdsa_secp521r1_sha512 => blk: {
+            const sk = switch (secret_key) {
+                .ecdsa_p521 => |k| k,
+                else => return error.KeyMismatch,
+            };
+            if (out.len < EcdsaP521.Signature.der_encoded_length_max) return error.BufferTooSmall;
+            break :blk burn.run(burn.ecdsa_burn, SignError![]u8, signEcdsaP521, .{ sk, content, random, out });
+        },
+        inline .mldsa44, .mldsa65, .mldsa87 => |s| blk: {
+            const M = MlDsaOf(s);
+            if (std.meta.activeTag(secret_key) != @field(std.meta.Tag(SecretKey), @tagName(s))) return error.KeyMismatch;
+            const sk = @field(secret_key, @tagName(s));
+            if (out.len < M.Signature.encoded_length) return error.BufferTooSmall;
+            break :blk burn.run(@field(burn.mldsa_sign_burn, @tagName(s)), SignError![]u8, signMlDsa, .{ M, sk, content, random, out });
         },
         _ => error.UnsupportedScheme,
     };
@@ -546,6 +610,66 @@ fn signEcdsaP384(sk: *const Ecdsa.EcdsaP384Sha384.SecretKey, content: []const u8
     } else null; // null => RFC 6979 deterministic
     const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
     return sig.toDer(out[0..Fast.Signature.der_encoded_length_max]);
+}
+
+fn verifyEcdsaP521(pk: EcdsaP521.PublicKey, content: []const u8, signature: []const u8) VerifyError!void {
+    // Same shape as verifyEcdsaP256, on the collection's `p521` (std has no
+    // P-521); its `fromDer` is strict DER.
+    const sig = EcdsaP521.Signature.fromDer(signature) catch return error.InvalidSignature;
+    sig.verify(content, pk) catch return error.InvalidSignature;
+}
+
+fn signEcdsaP521(sk: *const EcdsaP521.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+    // RFC 6979 nonces with the noise as §3.6 additional data (`p521`'s
+    // `sign`); `fromSecretKeyInto` refuses a scalar outside [1, n − 1].
+    var key_pair: EcdsaP521.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&key_pair.secret_key));
+    EcdsaP521.KeyPair.fromSecretKeyInto(&key_pair, sk) catch return error.KeyMismatch;
+    var noise_buf: [EcdsaP521.noise_length]u8 = undefined;
+    const noise: ?[EcdsaP521.noise_length]u8 = if (random) |rnd| blk: {
+        rnd.bytes(&noise_buf);
+        break :blk noise_buf;
+    } else null; // null => RFC 6979 deterministic
+    const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
+    return sig.toDer(out[0..EcdsaP521.Signature.der_encoded_length_max]);
+}
+
+/// The std instantiation for an ML-DSA scheme.
+fn MlDsaOf(comptime s: SignatureScheme) type {
+    return switch (s) {
+        .mldsa44 => mldsa.MLDSA44,
+        .mldsa65 => mldsa.MLDSA65,
+        .mldsa87 => mldsa.MLDSA87,
+        else => @compileError("not an ML-DSA scheme"),
+    };
+}
+
+fn verifyMlDsa(comptime M: type, encoded_key: []const u8, content: []const u8, signature: []const u8) VerifyError!void {
+    // draft-ietf-tls-mldsa §3: pure ML-DSA (FIPS 204 §5.2) over the signed
+    // content with an empty context string, the raw signature on the wire.
+    // Both lengths are fixed by the parameter set.
+    if (encoded_key.len != M.PublicKey.encoded_length) return error.KeyMismatch;
+    if (signature.len != M.Signature.encoded_length) return error.InvalidSignature;
+    const pk = M.PublicKey.fromBytes(encoded_key[0..M.PublicKey.encoded_length].*) catch return error.KeyMismatch;
+    const sig = M.Signature.fromBytes(signature[0..M.Signature.encoded_length].*) catch return error.InvalidSignature;
+    sig.verify(content, pk) catch return error.InvalidSignature;
+}
+
+fn signMlDsa(comptime M: type, sk: *const M.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
+    // Hedged (FIPS 204 §3.4) with `random`'s 32 octets, deterministic
+    // without. std's signer borrows the key; its rejection loop cannot fail.
+    var noise_buf: [M.noise_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &noise_buf);
+    const noise: ?[M.noise_length]u8 = if (random) |rnd| blk: {
+        rnd.bytes(&noise_buf);
+        break :blk noise_buf;
+    } else null;
+    var signer = sk.signer(noise) catch return error.KeyMismatch;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&signer));
+    signer.update(content);
+    const sig = signer.finalize().toBytes();
+    @memcpy(out[0..M.Signature.encoded_length], &sig);
+    return out[0..M.Signature.encoded_length];
 }
 
 fn verifyEd25519(pk: Ed25519.PublicKey, content: []const u8, signature: []const u8) VerifyError!void {
@@ -856,4 +980,81 @@ test "KAT: ed25519 sign reproduces the cryptography-cross-checked vector byte-ex
     var out: [Ed25519.Signature.encoded_length]u8 = undefined;
     const sig = try sign(.ed25519, sk, .client, &kat.ed25519_client.transcript_hash, null, &out);
     try testing.expectEqualSlices(u8, &kat.ed25519_client.signature, sig);
+}
+
+test "KAT: ecdsa_secp521r1_sha512 sign reproduces OpenSSL's RFC 6979 DER vector byte-exact, verify accepts it" {
+    const v = kat.ecdsa_p521_server;
+    const sk = try EcdsaP521.SecretKey.fromBytes(v.secret_key_bytes);
+    var out: [EcdsaP521.Signature.der_encoded_length_max]u8 = undefined;
+    const sig = try sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk }, .server, &v.transcript_hash, null, &out);
+    try testing.expectEqualSlices(u8, &v.signature_der, sig);
+    const pk = PublicKey{ .ecdsa_p521 = try EcdsaP521.PublicKey.fromSec1(&v.public_key_uncompressed_sec1) };
+    try verify(.ecdsa_secp521r1_sha512, pk, .server, &v.transcript_hash, &v.signature_der);
+    var tampered = v.signature_der;
+    tampered[tampered.len - 1] ^= 0x01;
+    try testing.expectError(error.InvalidSignature, verify(.ecdsa_secp521r1_sha512, pk, .server, &v.transcript_hash, &tampered));
+    // The other side's context string is another message.
+    try testing.expectError(error.InvalidSignature, verify(.ecdsa_secp521r1_sha512, pk, .client, &v.transcript_hash, &v.signature_der));
+    // A P-384 key under the P-521 scheme.
+    try testing.expectError(error.KeyMismatch, verify(.ecdsa_secp521r1_sha512, .{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() }, .server, &v.transcript_hash, &v.signature_der));
+}
+
+fn expectMlDsaKat(comptime scheme: SignatureScheme, comptime v: kat.MlDsaVector) !void {
+    const M = MlDsaOf(scheme);
+    const kp = try testing.allocator.create(M.KeyPair);
+    defer testing.allocator.destroy(kp);
+    kp.* = try M.KeyPair.generateDeterministic(v.seed);
+    const pk_bytes = kp.public_key.toBytes();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&pk_bytes, &digest, .{});
+    try testing.expectEqualSlices(u8, &v.public_key_sha256, &digest);
+
+    const sk: SecretKey = @unionInit(SecretKey, @tagName(scheme), &kp.secret_key);
+    var out: [max_signature_len]u8 = undefined;
+    const sig = try sign(scheme, sk, .server, &v.transcript_hash, null, &out);
+    try testing.expectEqual(maxSignatureLen(scheme), sig.len);
+    std.crypto.hash.sha2.Sha256.hash(sig, &digest, .{});
+    try testing.expectEqualSlices(u8, &v.signature_sha256, &digest);
+
+    const pk: PublicKey = @unionInit(PublicKey, @tagName(scheme), &pk_bytes);
+    try verify(scheme, pk, .server, &v.transcript_hash, sig);
+    // Hedged signatures differ and verify too.
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x5a)));
+    var hedged_buf: [max_signature_len]u8 = undefined;
+    const hedged = try sign(scheme, sk, .server, &v.transcript_hash, csprng.random(), &hedged_buf);
+    try testing.expect(!std.mem.eql(u8, sig, hedged));
+    try verify(scheme, pk, .server, &v.transcript_hash, hedged);
+    // Tampered, truncated, the other context, a key of the wrong length.
+    out[17] ^= 0x01;
+    try testing.expectError(error.InvalidSignature, verify(scheme, pk, .server, &v.transcript_hash, sig));
+    out[17] ^= 0x01;
+    try testing.expectError(error.InvalidSignature, verify(scheme, pk, .server, &v.transcript_hash, sig[0 .. sig.len - 1]));
+    // One octet more: the length is the parameter set's, exactly.
+    var longer: [max_signature_len + 1]u8 = undefined;
+    @memcpy(longer[0..sig.len], sig);
+    longer[sig.len] = 0;
+    try testing.expectError(error.InvalidSignature, verify(scheme, pk, .server, &v.transcript_hash, longer[0 .. sig.len + 1]));
+    try testing.expectError(error.InvalidSignature, verify(scheme, pk, .client, &v.transcript_hash, sig));
+    try testing.expectError(error.KeyMismatch, verify(scheme, @unionInit(PublicKey, @tagName(scheme), pk_bytes[1..]), .server, &v.transcript_hash, sig));
+    // A buffer one short.
+    try testing.expectError(error.BufferTooSmall, sign(scheme, sk, .server, &v.transcript_hash, null, out[0 .. maxSignatureLen(scheme) - 1]));
+}
+
+test "KAT: mldsa44/65/87 keygen and deterministic sign hash to OpenSSL's, verify and reject" {
+    try expectMlDsaKat(.mldsa44, kat.mldsa44_server);
+    try expectMlDsaKat(.mldsa65, kat.mldsa65_server);
+    try expectMlDsaKat(.mldsa87, kat.mldsa87_server);
+}
+
+test "ML-DSA: a key of another parameter set is KeyMismatch both ways" {
+    const kp = try testing.allocator.create(mldsa.MLDSA44.KeyPair);
+    defer testing.allocator.destroy(kp);
+    kp.* = try mldsa.MLDSA44.KeyPair.generateDeterministic(@splat(1));
+    var out: [max_signature_len]u8 = undefined;
+    const th = @as([32]u8, @splat(0));
+    try testing.expectError(error.KeyMismatch, sign(.mldsa65, .{ .mldsa44 = &kp.secret_key }, .server, &th, null, &out));
+    const pk_bytes = kp.public_key.toBytes();
+    try testing.expectError(error.KeyMismatch, verify(.mldsa65, .{ .mldsa44 = &pk_bytes }, .server, &th, out[0..3309]));
+    try testing.expect(canSign(.{ .mldsa44 = &kp.secret_key }, .mldsa44));
+    try testing.expect(!canSign(.{ .mldsa44 = &kp.secret_key }, .mldsa87));
 }

@@ -29,6 +29,7 @@ const kex = @import("kex.zig");
 const kat = @import("certverify_kat_vectors.zig");
 const Ecdsa = std.crypto.sign.ecdsa;
 const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP521 = @import("p521").EcdsaP521Sha512;
 
 /// Reach counters for one harness's labels (copied from `aeskw`'s fuzz_test).
 /// `mark` also feeds the driver's `REACH` report; `reach` runs `seeds` seeds
@@ -66,6 +67,8 @@ const Mark = Marker(enum {
     genuine_p384,
     genuine_ed25519,
     genuine_rsa,
+    genuine_p521,
+    genuine_mldsa,
     damaged_refused,
     damaged_header,
     damaged_resized,
@@ -76,7 +79,25 @@ const Mark = Marker(enum {
     wild_known_scheme,
     fresh_ecdsa,
     fresh_ed25519,
+    fresh_mldsa,
 });
+
+/// ML-DSA-44's KAT key (`kat.mldsa44_server`) and its deterministic
+/// signature, made once per process: the key is ~80 KiB and signing is the
+/// slow part.
+const MlDsa44 = std.crypto.sign.mldsa.MLDSA44;
+var mldsa_kp: MlDsa44.KeyPair = undefined;
+var mldsa_pk: [MlDsa44.PublicKey.encoded_length]u8 = undefined;
+var mldsa_sig: [MlDsa44.Signature.encoded_length]u8 = undefined;
+var mldsa_ready = false;
+
+fn mldsaFixture() !void {
+    if (mldsa_ready) return;
+    mldsa_kp = try MlDsa44.KeyPair.generateDeterministic(kat.mldsa44_server.seed);
+    mldsa_pk = mldsa_kp.public_key.toBytes();
+    _ = try cv.sign(.mldsa44, .{ .mldsa44 = &mldsa_kp.secret_key }, .server, &kat.mldsa44_server.transcript_hash, null, &mldsa_sig);
+    mldsa_ready = true;
+}
 
 /// One KAT key with its genuine (scheme, side, transcript hash, signature).
 const Case = struct {
@@ -97,7 +118,14 @@ fn pickCase(which: u8) !Case {
         0 => .{ .scheme = .ecdsa_secp256r1_sha256, .pk = .{ .ecdsa_p256 = p256_pk }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.ecdsa_p256_server.transcript_hash, .sig = &kat.ecdsa_p256_server.signature_der, .der = true },
         1 => .{ .scheme = .ecdsa_secp384r1_sha384, .pk = .{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() }, .other = .{ .ecdsa_p256 = p256_pk }, .side = .server, .th = &kat.ecdsa_p384_server.transcript_hash, .sig = &kat.ecdsa_p384_server.signature_der, .der = true },
         2 => .{ .scheme = .ed25519, .pk = .{ .ed25519 = ed_pk }, .other = .{ .ecdsa_p256 = p256_pk }, .side = .client, .th = &kat.ed25519_client.transcript_hash, .sig = &kat.ed25519_client.signature, .der = false },
-        else => .{ .scheme = .rsa_pss_rsae_sha256, .pk = .{ .rsa = try kat.rsa_pss_sha256_server.publicKey() }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.rsa_pss_sha256_server.transcript_hash, .sig = &kat.rsa_pss_sha256_server.signature, .der = false },
+        3 => .{ .scheme = .rsa_pss_rsae_sha256, .pk = .{ .rsa = try kat.rsa_pss_sha256_server.publicKey() }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.rsa_pss_sha256_server.transcript_hash, .sig = &kat.rsa_pss_sha256_server.signature, .der = false },
+        // P-521's DER has a long-form SEQUENCE length, so the header spots
+        // aimed at below are off by one or two: still damage to refuse.
+        4 => .{ .scheme = .ecdsa_secp521r1_sha512, .pk = .{ .ecdsa_p521 = try EcdsaP521.PublicKey.fromSec1(&kat.ecdsa_p521_server.public_key_uncompressed_sec1) }, .other = .{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() }, .side = .server, .th = &kat.ecdsa_p521_server.transcript_hash, .sig = &kat.ecdsa_p521_server.signature_der, .der = true },
+        else => blk: {
+            try mldsaFixture();
+            break :blk .{ .scheme = .mldsa44, .pk = .{ .mldsa44 = &mldsa_pk }, .other = .{ .ed25519 = ed_pk }, .side = .server, .th = &kat.mldsa44_server.transcript_hash, .sig = &mldsa_sig, .der = false };
+        },
     };
 }
 
@@ -111,10 +139,10 @@ fn expectInvalid(r: cv.VerifyError!void) !void {
     }
 }
 
-const max_sig = 512; // the KAT RSA key is 2048-bit; room for growth by damage
+const max_sig = cv.max_signature_len + 16; // room for growth by damage
 
 fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
-    const which = src.valueRangeAtMost(u8, 0, 3);
+    const which = src.valueRangeAtMost(u8, 0, 5);
     const c = try pickCase(which);
 
     try cv.verify(c.scheme, c.pk, c.side, c.th, c.sig);
@@ -122,7 +150,9 @@ fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         0 => Mark.mark(.genuine_p256),
         1 => Mark.mark(.genuine_p384),
         2 => Mark.mark(.genuine_ed25519),
-        else => Mark.mark(.genuine_rsa),
+        3 => Mark.mark(.genuine_rsa),
+        4 => Mark.mark(.genuine_p521),
+        else => Mark.mark(.genuine_mldsa),
     }
 
     // A damaged signature: accepted only if the damage left it identical.
@@ -182,7 +212,7 @@ fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         const scheme: cv.SignatureScheme = if (src.value(bool))
             @fromBackingInt(src.value(u16))
         else blk: {
-            const known = [_]cv.SignatureScheme{ .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512, .ed25519 };
+            const known = [_]cv.SignatureScheme{ .ecdsa_secp256r1_sha256, .ecdsa_secp384r1_sha384, .ecdsa_secp521r1_sha512, .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512, .ed25519, .mldsa44, .mldsa65, .mldsa87 };
             Mark.mark(.wild_known_scheme);
             break :blk known[src.index(known.len)];
         };
@@ -201,10 +231,29 @@ fn fuzzVerify(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     // signing is the slow part). RSA is left out: its signer is ~1 ms and the
     // PSS round trip is pinned by the unit tests.
     if (src.valueRangeAtMost(u8, 0, 3) == 0) {
-        var sig_buf: [cv.maxSignatureLen(.ecdsa_secp384r1_sha384)]u8 = undefined;
+        var sig_buf: [cv.max_signature_len]u8 = undefined;
         var noise_prng = std.Random.DefaultPrng.init(src.value(u64));
         const random: ?std.Random = if (src.value(bool)) noise_prng.random() else null;
-        switch (src.valueRangeAtMost(u8, 0, 2)) {
+        switch (src.valueRangeAtMost(u8, 0, 4)) {
+            3 => {
+                var th: [64]u8 = undefined;
+                src.bytes(&th);
+                const sk = try EcdsaP521.SecretKey.fromBytes(kat.ecdsa_p521_server.secret_key_bytes);
+                const sig = try cv.sign(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = &sk }, .server, &th, random, &sig_buf);
+                try cv.verify(.ecdsa_secp521r1_sha512, .{ .ecdsa_p521 = try EcdsaP521.PublicKey.fromSec1(&kat.ecdsa_p521_server.public_key_uncompressed_sec1) }, .server, &th, sig);
+                Mark.mark(.fresh_ecdsa);
+            },
+            4 => {
+                // Pure ML-DSA signs the content itself: any hash length.
+                try mldsaFixture();
+                var th: [64]u8 = undefined;
+                const th_len = src.valueRangeAtMost(u16, 0, th.len);
+                src.bytes(th[0..th_len]);
+                const sig = try cv.sign(.mldsa44, .{ .mldsa44 = &mldsa_kp.secret_key }, .client, th[0..th_len], random, &sig_buf);
+                try cv.verify(.mldsa44, .{ .mldsa44 = &mldsa_pk }, .client, th[0..th_len], sig);
+                try expectInvalid(cv.verify(.mldsa44, .{ .mldsa44 = &mldsa_pk }, .server, th[0..th_len], sig));
+                Mark.mark(.fresh_mldsa);
+            },
             0 => {
                 var th: [32]u8 = undefined;
                 src.bytes(&th);
@@ -243,6 +292,7 @@ const KexMark = Marker(enum {
     agree_p256,
     agree_p384,
     agree_hybrid,
+    agree_mlkem1024,
     server_refused,
     server_accepted_damaged,
     client_refused,
@@ -267,7 +317,9 @@ const Damaged = struct {
 
 /// `share` with 1-3 random octets replaced, or one structural spot aimed at,
 /// and sometimes truncated / extended.
-fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, buf: []u8) Damaged {
+/// `to_server`: `share` is a client-form share the server consumes (an
+/// ML-KEM-1024 encapsulation key is checked; its ciphertext never is).
+fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, to_server: bool, buf: []u8) Damaged {
     var d: Damaged = .{ .n = share.len, .must_refuse = false };
     @memcpy(buf[0..d.n], share);
     switch (src.valueRangeAtMost(u8, 0, 3)) {
@@ -277,6 +329,12 @@ fn damageShare(comptime S: type, src: *S, group: u16, share: []const u8, buf: []
         } else if (group == kex.x25519_mlkem768_group) {
             @memset(buf[d.n - 32 .. d.n], 0); // identity X25519 half
             d.must_refuse = true;
+        } else if (group == kex.mlkem1024_group) {
+            // First coefficient 0xFFF ≥ q: a non-canonical encapsulation
+            // key (FIPS 203 §7.2); in a ciphertext, implicit rejection.
+            buf[0] = 0xFF;
+            buf[1] |= 0x0F;
+            d.must_refuse = to_server;
         } else {
             @memset(buf[0..d.n], 0);
             d.must_refuse = true;
@@ -300,7 +358,7 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     src.bytes(&seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
     const rnd = csprng.random();
-    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.x25519_mlkem768_group };
+    const groups = [_]u16{ kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group, kex.x25519_mlkem768_group, kex.mlkem1024_group };
     const group = groups[src.index(groups.len)];
 
     var kp: kex.KeyPair = undefined;
@@ -314,13 +372,14 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
         kex.x25519_group => KexMark.mark(.agree_x25519),
         kex.secp256r1_group => KexMark.mark(.agree_p256),
         kex.secp384r1_group => KexMark.mark(.agree_p384),
+        kex.mlkem1024_group => KexMark.mark(.agree_mlkem1024),
         else => KexMark.mark(.agree_hybrid),
     }
 
     // The server on a damaged client share.
     var buf: [kex.max_share_len + 8]u8 = undefined;
     {
-        const d = damageShare(S, src, group, kp.public[0..kp.public_len], &buf);
+        const d = damageShare(S, src, group, kp.public[0..kp.public_len], true, &buf);
         var out: kex.ServerExchange = undefined;
         @memset(&out.shared.bytes, 0xAB);
         if (kex.serverExchange(group, buf[0..d.n], rnd, &out)) |_| {
@@ -335,7 +394,7 @@ fn fuzzKex(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     }
     // The client on a damaged server share.
     {
-        const d = damageShare(S, src, group, ex.public[0..ex.public_len], &buf);
+        const d = damageShare(S, src, group, ex.public[0..ex.public_len], false, &buf);
         var out: kex.SharedSecret = .{ .bytes = @splat(0xAB), .len = 0 };
         if (kex.sharedSecret(group, &kp.secret, buf[0..d.n], &out)) |_| {
             if (d.must_refuse) return error.UnusableShareAccepted;

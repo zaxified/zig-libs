@@ -24,6 +24,7 @@ const server_mod = @import("server.zig");
 const Connection = @import("connection.zig").Connection;
 const Sink = @import("test_sink.zig").Sink;
 const certs = @import("test_certs.zig");
+const keys_mod = @import("keys.zig");
 const vectors = @import("interop_vectors.zig");
 const clientauth = @import("clientauth.zig");
 const client_certs = @import("client_certs.zig");
@@ -40,21 +41,44 @@ const Keys = struct {
     p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
     ed: std.crypto.sign.Ed25519.SecretKey,
     rsa: *rsa.SecretKey,
+    /// The interop program's P-521 and ML-DSA-65 keys (`key_vectors`).
+    p521: *keys_mod.CertKeyPair,
+    mldsa65: *keys_mod.CertKeyPair,
 
     fn init(gpa: std.mem.Allocator) !Keys {
         const rsa_key = try gpa.create(rsa.SecretKey);
         errdefer gpa.destroy(rsa_key);
         try rsa.SecretKey.fromDer(rsa_key, &certs.rsa2048_pkcs1);
+        const p521 = try loadVector(gpa, "p521-pkcs8");
+        errdefer freeVector(gpa, p521);
+        const mldsa65 = try loadVector(gpa, "mldsa65-both");
         return .{
             .p256 = try .fromBytes(certs.p256_scalar),
             .p384 = try .fromBytes(certs.p384_scalar),
             .ed = try .fromBytes(certs.ed25519_secret),
             .rsa = rsa_key,
+            .p521 = p521,
+            .mldsa65 = mldsa65,
         };
+    }
+
+    fn loadVector(gpa: std.mem.Allocator, comptime name: []const u8) !*keys_mod.CertKeyPair {
+        const v = @import("root.zig").testKeyVector(name);
+        const pair = try gpa.create(keys_mod.CertKeyPair);
+        errdefer gpa.destroy(pair);
+        try pair.fromPem(gpa, v.cert_pem, v.key_pem);
+        return pair;
+    }
+
+    fn freeVector(gpa: std.mem.Allocator, pair: *keys_mod.CertKeyPair) void {
+        pair.deinit(gpa);
+        gpa.destroy(pair);
     }
 
     fn deinit(k: *Keys, gpa: std.mem.Allocator) void {
         gpa.destroy(k.rsa);
+        freeVector(gpa, k.p521);
+        freeVector(gpa, k.mldsa65);
     }
 };
 
@@ -128,6 +152,8 @@ const Harness = struct {
                 h.chain[0] = &certs.rsa2048_cert;
                 break :blk .{ .chain = &h.chain, .key = .{ .rsa = keys.rsa } };
             },
+            .p521 => keys.p521.certifiedKey(),
+            .mldsa65 => keys.mldsa65.certifiedKey(),
         };
         if (v.staple) {
             h.ck.ocsp_response = &vectors.ocsp_response;

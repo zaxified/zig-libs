@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! tls13.kex -- the (EC)DHE key exchange of a TLS/DTLS 1.3 handshake (RFC 8446
-//! §4.2.7/§4.2.8, §7.4) for the groups x25519, secp256r1, secp384r1 and the
-//! X25519MLKEM768 hybrid (draft-ietf-tls-ecdhe-mlkem): the ephemeral share a
+//! §4.2.7/§4.2.8, §7.4) for the groups x25519, secp256r1, secp384r1, the
+//! X25519MLKEM768 hybrid (draft-ietf-tls-ecdhe-mlkem) and standalone
+//! ML-KEM-1024 (draft-ietf-tls-mlkem): the ephemeral share a
 //! side offers, the shared secret the side holding a private key computes, and
 //! the server's one-step answer (needed because the hybrid server
 //! ENCAPSULATES to the client's key instead of generating a key pair). Moved
@@ -41,6 +42,10 @@ const P384 = std.crypto.ecc.P384;
 /// to its key schedule. Reusing std's combiner would interoperate with
 /// nothing — the same trap `ssh`'s `SHA256(ss_M ‖ ss_X)` documents.
 const MlKem768 = std.crypto.kem.ml_kem.MLKem768;
+/// Standalone ML-KEM-1024 (draft-ietf-tls-mlkem): the client share is the
+/// encapsulation key, the server's the ciphertext, the secret ML-KEM's own
+/// 32 bytes. std's type is plain FIPS 203 (no combiner), so it is used as is.
+const MlKem1024 = std.crypto.kem.ml_kem.MLKem1024;
 
 /// RFC 8446 §4.2.7 `NamedGroup` code points of the groups this file computes.
 pub const x25519_group: u16 = 0x001d;
@@ -48,6 +53,8 @@ pub const secp256r1_group: u16 = 0x0017;
 pub const secp384r1_group: u16 = 0x0018;
 /// draft-ietf-tls-ecdhe-mlkem §6 (IANA TLS Supported Groups registry).
 pub const x25519_mlkem768_group: u16 = 0x11ec;
+/// draft-ietf-tls-mlkem §6 (IANA TLS Supported Groups registry: MLKEM1024).
+pub const mlkem1024_group: u16 = 0x0202;
 
 /// draft-ietf-tls-ecdhe-mlkem §3.1.1/§3.1.2 fixed sizes for X25519MLKEM768,
 /// pinned as comptime facts so a std resize (there has been one Kyber →
@@ -62,15 +69,31 @@ comptime {
     std.debug.assert(MlKem768.shared_length == 32);
 }
 
-/// The longest `KeyShareEntry.key_exchange` any group here produces: the
-/// hybrid's client share (ML-KEM-768 encapsulation key ‖ X25519 public).
-pub const max_share_len = hybrid_client_share_len;
+/// draft-ietf-tls-mlkem §4 fixed sizes for MLKEM1024: client share = the
+/// encapsulation key, server share = the ciphertext (the same length, by
+/// coincidence of the parameter set).
+pub const mlkem1024_client_share_len = MlKem1024.PublicKey.encoded_length;
+pub const mlkem1024_server_share_len = MlKem1024.ciphertext_length;
+comptime {
+    std.debug.assert(mlkem1024_client_share_len == 1568);
+    std.debug.assert(mlkem1024_server_share_len == 1568);
+    std.debug.assert(MlKem1024.shared_length == 32);
+    std.debug.assert(MlKem1024.seed_length == MlKem768.seed_length);
+}
+
+/// The longest `KeyShareEntry.key_exchange` any group here produces, in
+/// either direction: ML-KEM-1024's encapsulation key and ciphertext.
+pub const max_share_len = @max(hybrid_client_share_len, mlkem1024_client_share_len, mlkem1024_server_share_len);
+/// The longest SERVER-form share (`ServerExchange.public`): ML-KEM-1024's
+/// ciphertext. Sizes a ServerHello.
+pub const max_server_share_len = @max(hybrid_server_share_len, mlkem1024_server_share_len, 97);
 
 /// Private-key bytes a `KeyPair` holds: a 32-byte scalar for x25519 and
 /// secp256r1, a 48-byte one for secp384r1 (`scalarLen`);
 /// for the hybrid, the 64-byte ML-KEM-768 keygen seed (`d ‖ z` — re-expanded
 /// at decapsulation time, FIPS 203's compact seed form, 25× smaller than the
-/// expanded decapsulation key) followed by the 32-byte X25519 scalar.
+/// expanded decapsulation key) followed by the 32-byte X25519 scalar; for
+/// ML-KEM-1024 its 64-byte keygen seed alone.
 pub const secret_len = MlKem768.seed_length + 32;
 comptime {
     std.debug.assert(secret_len == 96);
@@ -107,18 +130,21 @@ pub fn expectedShareLen(group: u16) usize {
         secp256r1_group => 65,
         secp384r1_group => 97,
         x25519_mlkem768_group => hybrid_client_share_len,
+        mlkem1024_group => mlkem1024_client_share_len,
         else => 0,
     };
 }
 
 /// The prefix of `KeyPair.secret` the group uses: its scalar for the three
-/// curves, the whole `secret_len` for the hybrid; 0 for groups this file does
-/// not compute. The least `sharedSecret` accepts as `secret`.
+/// curves, the whole `secret_len` for the hybrid, the 64-byte seed for
+/// ML-KEM-1024; 0 for groups this file does not compute. The least
+/// `sharedSecret` accepts as `secret`.
 pub fn scalarLen(group: u16) usize {
     return switch (group) {
         x25519_group, secp256r1_group => 32,
         secp384r1_group => 48,
         x25519_mlkem768_group => secret_len,
+        mlkem1024_group => MlKem1024.seed_length,
         else => 0,
     };
 }
@@ -134,7 +160,8 @@ pub const KeyPair = struct {
 };
 
 /// The key-exchange output fed to `keyschedule.*.deriveHandshakeSecret`: 32
-/// bytes for x25519 and secp256r1, 48 for secp384r1, 64 (`ss_MLKEM ‖ ss_X25519`) for the hybrid.
+/// bytes for x25519, secp256r1 and ML-KEM-1024, 48 for secp384r1, 64
+/// (`ss_MLKEM ‖ ss_X25519`) for the hybrid.
 /// A struct rather than a slice so the secret bytes live in (and are wiped
 /// from) exactly one place per side.
 pub const SharedSecret = struct {
@@ -147,12 +174,12 @@ pub const SharedSecret = struct {
 };
 
 /// The server's answer: its wire share (the CLIENT-form length for the
-/// curves, the 1120-byte ciphertext form for the hybrid) and the shared
+/// curves, the ciphertext for the hybrid and ML-KEM-1024) and the shared
 /// secret. Nothing private outlives the call — a server never needs its
 /// ephemeral secret again.
 pub const ServerExchange = struct {
     group: u16,
-    public: [max_share_len]u8,
+    public: [max_server_share_len]u8,
     public_len: usize,
     shared: SharedSecret,
 };
@@ -180,12 +207,15 @@ pub const ServerExchange = struct {
 ///     keygen seed plus an x25519 scalar as above; the share is the 1216-byte
 ///     `encapsulation key ‖ X25519 public` — the ML-KEM half FIRST, despite
 ///     the group's name (the draft's one famous inconsistency).
+///   * mlkem1024 (draft-ietf-tls-mlkem): a 64-byte ML-KEM-1024 keygen seed;
+///     the share is the 1568-byte encapsulation key.
 pub fn generate(group: u16, random: std.Random, out: *KeyPair) Error!void {
     return switch (group) {
         x25519_group => burn.run(burn.kex_x25519_burn, Error!void, generateBody, .{ group, random, out }),
         secp256r1_group => burn.run(burn.kex_p256_burn, Error!void, generateBody, .{ group, random, out }),
         secp384r1_group => burn.run(burn.kex_p384_burn, Error!void, generateBody, .{ group, random, out }),
         x25519_mlkem768_group => burn.run(burn.kex_hybrid_burn, Error!void, generateBody, .{ group, random, out }),
+        mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, generateBody, .{ group, random, out }),
         else => {
             std.crypto.secureZero(u8, &out.secret);
             return error.MissingKeyShare;
@@ -221,6 +251,7 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
             out.public[0..MlKem768.PublicKey.encoded_length].* = kem_kp.public_key.toBytes();
             out.public_len = hybrid_client_share_len;
         },
+        mlkem1024_group => try mlkem1024Generate(random, out),
         else => return error.MissingKeyShare,
     }
 }
@@ -281,6 +312,7 @@ pub fn sharedSecret(group: u16, secret: []const u8, peer_share: []const u8, out:
         secp256r1_group => burn.run(burn.kex_p256_burn, Error!void, sharedSecretBody, .{ group, secret, peer_share, out }),
         secp384r1_group => burn.run(burn.kex_p384_burn, Error!void, sharedSecretBody, .{ group, secret, peer_share, out }),
         x25519_mlkem768_group => burn.run(burn.kex_hybrid_burn, Error!void, sharedSecretBody, .{ group, secret, peer_share, out }),
+        mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, sharedSecretBody, .{ group, secret, peer_share, out }),
         else => {
             std.crypto.secureZero(u8, &out.bytes);
             return error.MissingKeyShare;
@@ -333,6 +365,7 @@ fn sharedSecretBody(group: u16, secret: []const u8, peer_share: []const u8, out:
             out.bytes[0..32].* = ss_pq;
             out.len = 64;
         },
+        mlkem1024_group => try mlkem1024Decaps(secret, peer_share, out),
         else => return error.MissingKeyShare,
     }
 }
@@ -354,6 +387,7 @@ pub fn serverExchange(group: u16, peer_share: []const u8, random: std.Random, ou
         secp256r1_group => burn.run(burn.kex_p256_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         secp384r1_group => burn.run(burn.kex_p384_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         x25519_mlkem768_group => burn.run(burn.kex_hybrid_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
+        mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         else => {
             std.crypto.secureZero(u8, &out.shared.bytes);
             return error.MissingKeyShare;
@@ -400,8 +434,46 @@ fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, ou
             out.shared.bytes[0..32].* = enc.shared_secret;
             out.shared.len = 64;
         },
+        mlkem1024_group => try mlkem1024Encaps(peer_share, random, out),
         else => return error.MissingKeyShare,
     }
+}
+
+// The ML-KEM-1024 arms, out of line: inlined into the bodies above, their
+// key structures would deepen the shared frame for every group (the stack
+// probe measured x25519's `serverExchange` at 161 KiB instead of 58).
+
+noinline fn mlkem1024Generate(random: std.Random, out: *KeyPair) Error!void {
+    random.bytes(out.secret[0..MlKem1024.seed_length]);
+    var kem_kp = MlKem1024.KeyPair.generateDeterministic(out.secret[0..MlKem1024.seed_length].*) catch return error.KeyExchangeFailed;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp.secret_key));
+    out.public[0..mlkem1024_client_share_len].* = kem_kp.public_key.toBytes();
+    out.public_len = mlkem1024_client_share_len;
+}
+
+noinline fn mlkem1024Decaps(secret: []const u8, peer_share: []const u8, out: *SharedSecret) Error!void {
+    if (secret.len < MlKem1024.seed_length) return error.KeyExchangeFailed;
+    if (peer_share.len != mlkem1024_server_share_len) return error.MissingKeyShare;
+    // The same seed re-expansion and wipes as the hybrid's ML-KEM half.
+    var kem_kp = MlKem1024.KeyPair.generateDeterministic(secret[0..MlKem1024.seed_length].*) catch return error.KeyExchangeFailed;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
+    out.bytes[0..32].* = kem_kp.secret_key.decaps(peer_share[0..MlKem1024.ciphertext_length]) catch return error.KeyExchangeFailed;
+    out.len = 32;
+}
+
+noinline fn mlkem1024Encaps(peer_share: []const u8, random: std.Random, out: *ServerExchange) Error!void {
+    if (peer_share.len != mlkem1024_client_share_len) return error.MissingKeyShare;
+    // FIPS 203 §7.2 modulus check, as for the hybrid.
+    const ek = MlKem1024.PublicKey.fromBytes(peer_share[0..MlKem1024.PublicKey.encoded_length]) catch return error.KeyExchangeFailed;
+    var encaps_seed: [MlKem1024.encaps_seed_length]u8 = undefined;
+    random.bytes(&encaps_seed);
+    var enc = ek.encapsDeterministic(&encaps_seed);
+    std.crypto.secureZero(u8, &encaps_seed);
+    defer std.crypto.secureZero(u8, &enc.shared_secret);
+    out.public[0..MlKem1024.ciphertext_length].* = enc.ciphertext;
+    out.public_len = mlkem1024_server_share_len;
+    out.shared.bytes[0..32].* = enc.shared_secret;
+    out.shared.len = 32;
 }
 
 // ── tests (moved from dtls/src/Connection.zig with the code) ─────────────
@@ -411,7 +483,7 @@ const hx = @import("testkit").hex.bytes;
 
 test "every group computes and has an exact share length; others are refused" {
     var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x91)));
-    for ([_]u16{ x25519_mlkem768_group, x25519_group, secp256r1_group, secp384r1_group }) |g| {
+    for ([_]u16{ x25519_mlkem768_group, mlkem1024_group, x25519_group, secp256r1_group, secp384r1_group }) |g| {
         var kp: KeyPair = undefined;
         try generate(g, csprng.random(), &kp);
         try testing.expectEqual(g, kp.group);
@@ -603,4 +675,40 @@ test "hybrid X25519MLKEM768: peer-supplied garbage is a typed error, never a pan
     // (No "bad ciphertext" arm: FIPS 203 implicit rejection makes a forged
     // ciphertext decapsulate SUCCESSFULLY to garbage, by design — the
     // handshake then dies at Finished.)
+}
+
+test "mlkem1024: both sides agree, the secret is ML-KEM's own, garbage is a typed error" {
+    // The group is plain FIPS 203 on the wire (no combiner, no second half),
+    // so the shared secret must equal a direct decapsulation of the server's
+    // ciphertext with the re-expanded seed — and std's ML-KEM-1024 is
+    // anchored on its own KATs.
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x79)));
+    const rnd = csprng.random();
+    var kp: KeyPair = undefined;
+    try generate(mlkem1024_group, rnd, &kp);
+    try testing.expectEqual(@as(usize, mlkem1024_client_share_len), kp.public_len);
+    var ex: ServerExchange = undefined;
+    try serverExchange(mlkem1024_group, kp.public[0..kp.public_len], rnd, &ex);
+    try testing.expectEqual(@as(usize, mlkem1024_server_share_len), ex.public_len);
+    try testing.expectEqual(@as(usize, 32), ex.shared.len);
+    var ss: SharedSecret = undefined;
+    try sharedSecret(mlkem1024_group, &kp.secret, ex.public[0..ex.public_len], &ss);
+    try testing.expectEqualSlices(u8, ex.shared.slice(), ss.slice());
+    const kem_kp = try MlKem1024.KeyPair.generateDeterministic(kp.secret[0..MlKem1024.seed_length].*);
+    try testing.expectEqualSlices(u8, &kem_kp.public_key.toBytes(), kp.public[0..kp.public_len]);
+    try testing.expectEqualSlices(u8, &(try kem_kp.secret_key.decaps(ex.public[0..MlKem1024.ciphertext_length])), ss.slice());
+
+    // Non-canonical encapsulation key (BoGo MLKEMEncapKeyNotReduced), a
+    // truncated and a padded one (TruncateKeyShare / PadKeyShare).
+    ex.shared.bytes = @splat(0xAB);
+    try testing.expectError(error.KeyExchangeFailed, serverExchange(mlkem1024_group, &(@as([mlkem1024_client_share_len]u8, @splat(0xFF))), rnd, &ex));
+    try testing.expect(std.mem.allEqual(u8, &ex.shared.bytes, 0));
+    try testing.expectError(error.MissingKeyShare, serverExchange(mlkem1024_group, kp.public[0 .. kp.public_len - 1], rnd, &ex));
+    var padded: [mlkem1024_client_share_len + 1]u8 = undefined;
+    @memcpy(padded[0..kp.public_len], kp.public[0..kp.public_len]);
+    padded[kp.public_len] = 0;
+    try testing.expectError(error.MissingKeyShare, serverExchange(mlkem1024_group, &padded, rnd, &ex));
+    // The hybrid's share lengths are not ML-KEM-1024's (both directions).
+    try testing.expectError(error.MissingKeyShare, sharedSecret(mlkem1024_group, &kp.secret, &(@as([hybrid_server_share_len]u8, @splat(0xAA))), &ss));
+    try testing.expectError(error.KeyExchangeFailed, sharedSecret(mlkem1024_group, kp.secret[0..32], ex.public[0..ex.public_len], &ss));
 }

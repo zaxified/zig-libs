@@ -4,7 +4,8 @@ A TLS 1.3 server (RFC 8446) for the collection: a buffer-driven (sans-I/O) core 
 wrapper on top, built on the `tls13` handshake building blocks and the `aesgcm` / `chachapoly`
 AEADs. **Under construction (milestone M2):** a full (EC)DHE handshake with a certificate —
 TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
-X25519, secp256r1, secp384r1; ECDSA P-256/P-384, Ed25519 and RSA-PSS certificates; SNI
+X25519, secp256r1, secp384r1 (and ML-KEM-1024 when enabled); ECDSA P-256/P-384/P-521,
+Ed25519, RSA-PSS and ML-DSA-44/65/87 certificates; SNI
 certificate selection; ALPN; HelloRetryRequest for a group the client sent no share for — then application data and close_notify, sans-I/O (`Server`) or
 blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), KeyUpdate
 both ways, session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`), and client

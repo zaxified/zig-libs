@@ -59,3 +59,8 @@ pub const handshake_burn = 32 * 1024;
 /// EC). Unburned depth 35.1 / 38.9 / 31.2 KiB (P-256 / P-384 / Ed25519, SEC1
 /// and PKCS#8 alike); an RSA key's parse burns its own 200 KiB below.
 pub const key_burn = 64 * 1024;
+/// `keys` on an ML-DSA key, per parameter set: std builds the expanded key
+/// and the public key with its matrix A by value, and copies them. The
+/// deepest `fromPem` reached in ReleaseFast (stack probe, 2026-10-21):
+/// ML-DSA-44 350.5 KiB, ML-DSA-65 553.6 KiB, ML-DSA-87 998.6 KiB; ~1.25x.
+pub const mldsa_key_burn = .{ .mldsa44 = 448 * 1024, .mldsa65 = 704 * 1024, .mldsa87 = 1280 * 1024 };

@@ -235,7 +235,7 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             if (try std.fmt.parseInt(u16, try value(it, flag), 10) > 0x0304) return unimplemented(flag);
         } else if (std.mem.eql(u8, flag, "-curves")) {
             const g = try std.fmt.parseInt(u16, try value(it, flag), 10);
-            if (std.mem.indexOfScalar(u16, &server_mod.default_groups, g) == null) return unimplemented(flag);
+            if (std.mem.indexOfScalar(u16, &server_mod.supported_groups, g) == null) return unimplemented(flag);
             try o.groups.append(gpa, g);
         } else if (std.mem.eql(u8, flag, "-expect-curve-id")) {
             o.expect_curve_id = try std.fmt.parseInt(u16, try value(it, flag), 10);

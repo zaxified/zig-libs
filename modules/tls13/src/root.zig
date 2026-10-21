@@ -19,7 +19,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 handshake building blocks shared by the TLS-family engines: the RFC 8446 §7.1 key schedule for TLS 1.3 and DTLS 1.3 labels (resumption, exporter and KeyUpdate steps included), CertificateVerify sign/verify (ECDSA P-256/P-384, Ed25519, RSA-PSS), the (EC)DHE key exchange (x25519, secp256r1, secp384r1, X25519MLKEM768) and a SHA-256/SHA-384 transcript hash",
+    .doc = "TLS 1.3 handshake building blocks shared by the TLS-family engines: the RFC 8446 §7.1 key schedule for TLS 1.3 and DTLS 1.3 labels (resumption, exporter and KeyUpdate steps included), CertificateVerify sign/verify (ECDSA P-256/P-384/P-521, Ed25519, RSA-PSS, ML-DSA), the (EC)DHE key exchange (x25519, secp256r1, secp384r1, X25519MLKEM768, ML-KEM-1024) and a SHA-256/SHA-384 transcript hash",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation)",
     .targets = .{.linux64},
@@ -27,7 +27,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant,
     .model_after = "RFC 8446 §7 / RFC 9147 §5.9 (rustls `tls13::key_schedule` for the API split)",
-    .deps = .{ "rsa", "ct25519", "p256", "p384" }, // rsa: certverify's RSASSA-PSS (rsa_pss_rsae_sha{256,384,512}); ct25519/p256/p384: kex and ECDSA arithmetic (std's is 3x slower per handshake, measured through tlsserver 2026-10-21)
+    .deps = .{ "rsa", "ct25519", "p256", "p384", "p521" }, // p521: ecdsa_secp521r1_sha512 (std has no P-521); rsa: certverify's RSASSA-PSS (rsa_pss_rsae_sha{256,384,512}); ct25519/p256/p384: kex and ECDSA arithmetic (std's is 3x slower per handshake, measured through tlsserver 2026-10-21)
 };
 
 /// The RFC 8446 §7.1 key schedule: `keyschedule.tls13` and

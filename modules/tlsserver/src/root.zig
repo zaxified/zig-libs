@@ -28,7 +28,7 @@ pub const meta = .{
     // shared or global.
     .concurrency = .single_owner,
     .model_after = "RFC 8446; rustls `ServerConnection` (buffer-driven core) for scope and API split",
-    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume" }, // tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key; tlsresume: session tickets (STEK ring, PSK selection)
+    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521" }, // p521: P-521 private keys (std has no P-521); tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key; tlsresume: session tickets (STEK ring, PSK selection)
 };
 
 /// The TLS 1.3 record layer: header, `Protection` (seal / open in place).
@@ -85,6 +85,19 @@ pub const test_fixtures = @import("test_certs.zig");
 /// with them.
 pub const test_client_fixtures = @import("client_certs.zig");
 
+/// TEST private keys in every PEM form `openssl` writes (P-256, P-384,
+/// P-521, Ed25519, RSA-2048, ML-DSA-44/65/87), each with a self-signed
+/// certificate: the key loader's vectors, and the P-521 and ML-DSA
+/// certificates of the interop program. The keys are public.
+pub const test_key_vectors = @import("key_vectors.zig");
+
+/// The `test_key_vectors` case called `name` (comptime: a typo is a compile error).
+pub fn testKeyVector(comptime name: []const u8) test_key_vectors.Case {
+    return comptime for (test_key_vectors.cases) |c| {
+        if (std.mem.eql(u8, c.name, name)) break c;
+    } else @compileError("no key vector " ++ name);
+}
+
 test {
     _ = record;
     _ = alert;
@@ -103,8 +116,8 @@ test {
     _ = @import("fuzz_test.zig");
 }
 
-test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsresume}" {
-    try std.testing.expectEqual(@as(usize, 8), meta.deps.len);
+test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsresume, p521}" {
+    try std.testing.expectEqual(@as(usize, 9), meta.deps.len);
     try std.testing.expectEqualStrings("tls13", meta.deps[0]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
@@ -113,4 +126,5 @@ test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsres
     try std.testing.expectEqualStrings("rsa", meta.deps[5]);
     try std.testing.expectEqualStrings("b64ct", meta.deps[6]);
     try std.testing.expectEqualStrings("tlsresume", meta.deps[7]);
+    try std.testing.expectEqualStrings("p521", meta.deps[8]);
 }

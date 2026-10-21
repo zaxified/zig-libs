@@ -227,8 +227,8 @@ pub const Config = struct {
     /// The suites the server enables (the client's order decides, unless
     /// `server_order`).
     cipher_suites: []const record.CipherSuite = &default_cipher_suites,
-    /// The groups the server enables (the client's order decides, unless
-    /// `server_order`).
+    /// The groups the server enables, any of `supported_groups` (the
+    /// client's order decides, unless `server_order`).
     groups: []const u16 = &default_groups,
     /// Choose the cipher suite and the group in the order of
     /// `cipher_suites` and `groups` instead of the client's (BoringSSL
@@ -275,6 +275,9 @@ pub const ClientAuth = struct {
 /// rustls's (ring provider) `supported_verify_schemes`: ECDSA P-384 and
 /// P-256, Ed25519, RSA-PSS, then RSA PKCS#1 v1.5 — for certificates only,
 /// never a TLS 1.3 CertificateVerify.
+/// P-521 (0x0603) and ML-DSA (0x0904-0x0906) client keys verify too, but
+/// only when listed in `ClientAuth.schemes` (rustls's default leaves them
+/// out as well; an ML-DSA-65/87 leaf is also over `clientauth.max_leaf_len`).
 pub const default_client_auth_schemes = [_]u16{ 0x0503, 0x0403, 0x0807, 0x0806, 0x0805, 0x0804, 0x0601, 0x0501, 0x0401 };
 
 /// Session tickets (RFC 8446 §4.6.1).
@@ -490,6 +493,10 @@ const psk_dhe_ke: u8 = 1;
 
 pub const default_cipher_suites = [_]record.CipherSuite{ .aes_256_gcm_sha384, .aes_128_gcm_sha256, .chacha20_poly1305_sha256 };
 pub const default_groups = [_]u16{ kex.x25519_mlkem768_group, kex.x25519_group, kex.secp256r1_group, kex.secp384r1_group };
+/// Every group `Config.groups` may enable: the defaults and standalone
+/// ML-KEM-1024 (draft-ietf-tls-mlkem; rustls and BoringSSL leave it out of
+/// their defaults too — its shares are 1568 octets each way).
+pub const supported_groups = default_groups ++ [_]u16{kex.mlkem1024_group};
 
 pub const Error = inbound.Error || clientauth.VerifyError || error{
     /// A mandatory client certificate was not sent.
@@ -587,7 +594,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
         break certverify.maxSignatureLen(s);
     } else 0;
     const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
-    const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.hybrid_server_share_len + 6) + // ServerHello
+    const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
         (4 + 2 + 4 + 2 + 1 + 255 + 4) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
@@ -1458,7 +1465,7 @@ pub const Server = struct {
 
             // CertificateVerify over the transcript through Certificate.
             th = t.currentHash();
-            var sig_buf: [1024]u8 = undefined;
+            var sig_buf: [certverify.max_signature_len]u8 = undefined;
             const sig = certverify.sign(scheme, ck.key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
             try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), @backingInt(scheme), sig)));
         }
@@ -2907,4 +2914,25 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
         var s = rfc8448S6Server(&cfg, &joiner, &out);
         try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
     }
+}
+
+test "minOutputLen covers the largest first flight: ML-KEM-1024's share, an ML-DSA-87 leaf, a 255-octet ALPN name" {
+    const gpa = testing.allocator;
+    const v = @import("root.zig").testKeyVector("mldsa87-seed");
+    var pair: @import("keys.zig").CertKeyPair = undefined;
+    try pair.fromPem(gpa, v.cert_pem, v.key_pem);
+    defer pair.deinit(gpa);
+    const ck = pair.certifiedKey();
+    var prng = std.Random.DefaultPrng.init(7);
+    const proto: [255]u8 = @splat('a');
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .groups = &.{kex.mlkem1024_group}, .alpn_protocols = &.{&proto}, .random = prng.random() };
+    var kp: kex.KeyPair = undefined;
+    try kex.generate(kex.mlkem1024_group, prng.random(), &kp);
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const out = try gpa.alloc(u8, minOutputLen(&cfg, &ck));
+    defer gpa.free(out);
+    var s: Server = undefined;
+    try accept(&s, &cfg, joiner, out, .{ .groups = &.{kex.mlkem1024_group}, .shares = &.{.{ kex.mlkem1024_group, kp.public[0..kp.public_len] }}, .sig_algs = &.{0x0906}, .alpn = &.{&proto} });
+    defer s.deinit();
 }

@@ -24,6 +24,7 @@ const std = @import("std");
 const x509 = @import("x509");
 const rsa = @import("rsa");
 const certverify = @import("tls13").certverify;
+const p521 = @import("p521");
 
 pub const Error = error{
     /// A malformed message (`decode_error`).
@@ -189,8 +190,8 @@ pub fn parseCertificateVerify(body: []const u8) Error!CertificateVerify {
 
 /// The leaf's public key for `certverify.verify`, through `x509.spkiOf`
 /// (bounds-checked; std's certificate parser is not safe on hostile DER).
-/// RSA (rsaEncryption), ECDSA P-256 / P-384, Ed25519 — the keys
-/// `certverify` verifies with (as `dtls.certauth.parseLeafPublicKey`).
+/// RSA (rsaEncryption), ECDSA P-256 / P-384 / P-521, Ed25519, ML-DSA — the
+/// keys `certverify` verifies with (as `dtls.certauth.parseLeafPublicKey`).
 pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
     const spki = x509.spkiOf(der) catch return error.BadCertificate;
     const bits = spki.key_bits;
@@ -202,6 +203,8 @@ pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
             return .{ .ecdsa_p256 = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(bits) catch return error.BadCertificate };
         if (std.mem.eql(u8, curve, &x509.safe.oid_secp384r1))
             return .{ .ecdsa_p384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(bits) catch return error.BadCertificate };
+        if (std.mem.eql(u8, curve, &x509.safe.oid_secp521r1))
+            return .{ .ecdsa_p521 = p521.EcdsaP521Sha512.PublicKey.fromSec1(bits) catch return error.BadCertificate };
         return error.UnsupportedCertificate;
     }
     if (spki.algorithmIs(&x509.safe.oid_ed25519)) {
@@ -209,7 +212,20 @@ pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
         if (bits.len != n) return error.BadCertificate;
         return .{ .ed25519 = std.crypto.sign.Ed25519.PublicKey.fromBytes(bits[0..n].*) catch return error.BadCertificate };
     }
-    // id-RSASSA-PSS keys, P-521, ML-DSA …
+    // ML-DSA (RFC 9881): the encoded key, borrowed from `der`.
+    if (x509.MlDsa.map.get(spki.algorithm_oid)) |set| {
+        // A key of another length is a malformed certificate, not a
+        // signature that fails (independent review 2026-10-21, LOW).
+        switch (set) {
+            inline else => |c| if (bits.len != x509.MlDsa.Impl(c).PublicKey.encoded_length) return error.BadCertificate,
+        }
+        return switch (set) {
+            .ml_dsa_44 => .{ .mldsa44 = bits },
+            .ml_dsa_65 => .{ .mldsa65 = bits },
+            .ml_dsa_87 => .{ .mldsa87 = bits },
+        };
+    }
+    // id-RSASSA-PSS keys …
     return error.UnsupportedCertificate;
 }
 
@@ -328,4 +344,26 @@ test "checkLeafKeyUsage: digitalSignature or no keyUsage at all" {
     // The CA's keyUsage is keyCertSign + cRLSign only.
     try testing.expectError(error.UnsupportedCertificate, checkLeafKeyUsage(&client_certs.ca_cert));
     try testing.expectError(error.BadCertificate, checkLeafKeyUsage("GARBAGE"));
+}
+
+test "leafPublicKey: P-521 and ML-DSA leaves give their own key kinds" {
+    const kv = @import("key_vectors.zig");
+    const b64ct = @import("b64ct");
+    for (kv.cases) |c| {
+        const want: ?std.meta.Tag(certverify.PublicKey) = switch (c.kind) {
+            .ecdsa_p521 => .ecdsa_p521,
+            .mldsa44 => .mldsa44,
+            .mldsa65 => .mldsa65,
+            .mldsa87 => .mldsa87,
+            else => null,
+        };
+        const tag = want orelse continue;
+        const begin = "-----BEGIN CERTIFICATE-----\n";
+        const at = std.mem.indexOf(u8, c.cert_pem, begin).? + begin.len;
+        const end = std.mem.indexOfPos(u8, c.cert_pem, at, "-----END").?;
+        var der_buf: [8192]u8 = undefined;
+        const der = try b64ct.standard.decodeIgnoring(&der_buf, c.cert_pem[at..end], b64ct.pem_whitespace);
+        const pk = try leafPublicKey(der);
+        try std.testing.expectEqual(tag, std.meta.activeTag(pk));
+    }
 }

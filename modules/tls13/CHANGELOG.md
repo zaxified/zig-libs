@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — ML-KEM-1024 (`kex.mlkem1024_group` 0x0202, out-of-line arms under
+  `burn.kex_mlkem1024_burn`; `max_share_len` 1216 → 1568, new `max_server_share_len`), and
+  CertificateVerify for `ecdsa_secp521r1_sha512` (the `p521` module, new dep) and pure ML-DSA
+  `mldsa44/65/87` (std, empty context; `PublicKey.mldsa*` borrows the encoded key, `SecretKey.mldsa*`
+  points to std's expanded key; per-set burns). `max_signature_len` (4627). KATs: P-521 DER byte
+  for byte and ML-DSA keys/signatures by SHA-256 against OpenSSL 3.5.5; the certverify and kex
+  fuzz harnesses and the stack probe cover the new arms.
+
 - **2026-10-21** — `kex` and `certverify` compute on the collection's curves: X25519 on
   `ct25519` (comb key generation, MULX/ADX ladder), P-256 on `p256`, P-384 on `p384` (key
   generation, ECDH, ECDSA sign and verify); Ed25519 and ML-KEM-768 stay std's. Same octets for

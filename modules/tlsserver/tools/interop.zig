@@ -48,7 +48,7 @@ const usage =
     \\
 ;
 
-pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
+pub const CertKind = enum { p256, p384, ed25519, rsa2048, p521, mldsa65 };
 
 /// The client's certificate (`tlsserver.test_client_fixtures`).
 pub const ClientCertKind = enum { none, p256, rsa2048, ed25519 };
@@ -110,6 +110,8 @@ const cases = [_]Case{
     .{ .name = "p256-aes256-x25519", .why = "a P-256 certificate under the SHA-384 suite (the transcript hash is not the scheme's)", .seed = 4, .args = &.{ "-ciphersuites", "TLS_AES_256_GCM_SHA384", "-groups", "X25519" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Signature type: ecdsa_secp256r1_sha256" } },
     .{ .name = "p256-p384group", .why = "TLS_AES_256_GCM_SHA384 over secp384r1", .seed = 9, .args = &.{ "-groups", "P-384" }, .expect = &.{ "Ciphersuite: TLS_AES_256_GCM_SHA384", "Peer Temp Key: ECDH, secp384r1" } },
     .{ .name = "p384", .why = "an ECDSA P-384 certificate over secp384r1", .cert = .p384, .seed = 10, .args = &.{ "-groups", "P-384:X25519" }, .expect = &.{ "Signature type: ecdsa_secp384r1_sha384", "Peer Temp Key: ECDH, secp384r1", "Verification: OK" } },
+    .{ .name = "p521", .why = "an ECDSA P-521 certificate (ecdsa_secp521r1_sha512, `p521`)", .cert = .p521, .seed = 70, .args = &.{ "-groups", "X25519" }, .expect = &.{ "Signature type: ecdsa_secp521r1_sha512", "Verification: OK" } },
+    .{ .name = "mldsa65-mlkem1024", .why = "an ML-DSA-65 certificate over standalone ML-KEM-1024", .cert = .mldsa65, .seed = 71, .groups = &tlsserver.server.supported_groups, .args = &.{ "-groups", "MLKEM1024" }, .expect = &.{ "Signature type: mldsa65", "MLKEM1024", "Verification: OK" } },
     .{ .name = "ed25519", .why = "an Ed25519 certificate (std's client cannot check one)", .cert = .ed25519, .seed = 5, .expect = &.{ "Signature type: ed25519", "Verification: OK" } },
     .{ .name = "rsa2048-pss", .why = "an RSA certificate signed with RSA-PSS", .cert = .rsa2048, .seed = 6, .expect = &.{ "Signature type: rsa_pss_rsae_sha256", "Verification: OK" } },
     .{ .name = "alpn-h2", .why = "ALPN: the server's choice among the client's offers", .seed = 7, .alpn = &.{ "h2", "http/1.1" }, .args = &.{ "-alpn", "http/1.1,h2" }, .brief = false, .expect = &.{"ALPN protocol: h2"} },
@@ -169,7 +171,13 @@ const Keys = struct {
     p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
     ed25519: std.crypto.sign.Ed25519.SecretKey,
     rsa2048: rsa.SecretKey,
+    /// From `tlsserver.test_key_vectors` (OpenSSL-made) through `keys`.
+    p521: tlsserver.keys.CertKeyPair,
+    mldsa65: tlsserver.keys.CertKeyPair,
 };
+
+const p521_vector = tlsserver.testKeyVector("p521-pkcs8");
+const mldsa65_vector = tlsserver.testKeyVector("mldsa65-both");
 
 fn certifiedKey(keys: *const Keys, kind: CertKind, chain: *[1][]const u8) tlsserver.CertifiedKey {
     return switch (kind) {
@@ -189,6 +197,8 @@ fn certifiedKey(keys: *const Keys, kind: CertKind, chain: *[1][]const u8) tlsser
             chain[0] = &certs.rsa2048_cert;
             break :blk .{ .chain = chain, .key = .{ .rsa = &keys.rsa2048 } };
         },
+        .p521 => keys.p521.certifiedKey(),
+        .mldsa65 => keys.mldsa65.certifiedKey(),
     };
 }
 
@@ -302,6 +312,8 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .p384 => "p384.pem",
         .ed25519 => "ed25519.pem",
         .rsa2048 => "rsa2048.pem",
+        .p521 => "p521.pem",
+        .mldsa65 => "mldsa65.pem",
     };
     var no_sni = false;
     for (c.args) |a| if (std.mem.eql(u8, a, "-noservername") or std.mem.eql(u8, a, "-nosni")) {
@@ -446,7 +458,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\//! configuration and seed, every octet the client sent, every octet the
         \\//! server sent. Replayed by `interop_replay_test.zig`. Do not edit by hand.
         \\
-        \\pub const CertKind = enum { p256, p384, ed25519, rsa2048 };
+        \\pub const CertKind = enum { p256, p384, ed25519, rsa2048, p521, mldsa65 };
         \\pub const ClientCertKind = enum { none, p256, rsa2048, ed25519 };
         \\pub const ClientAuthMode = enum { off, mandatory, optional };
         \\
@@ -871,6 +883,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });
     try work.writeFile(io, .{ .sub_path = "ed25519.pem", .data = try pem(gpa, &certs.ed25519_cert) });
     try work.writeFile(io, .{ .sub_path = "rsa2048.pem", .data = try pem(gpa, &certs.rsa2048_cert) });
+    try work.writeFile(io, .{ .sub_path = "p521.pem", .data = p521_vector.cert_pem });
+    try work.writeFile(io, .{ .sub_path = "mldsa65.pem", .data = mldsa65_vector.cert_pem });
     for ([_]struct { ClientCertKind, []const u8, []const u8 }{
         .{ .p256, &client_certs.p256_cert, &client_certs.p256_pkcs8 },
         .{ .rsa2048, &client_certs.rsa2048_cert, &client_certs.rsa2048_pkcs8 },
@@ -886,6 +900,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     keys.p384 = try .fromBytes(certs.p384_scalar);
     keys.ed25519 = try .fromBytes(certs.ed25519_secret);
     try rsa.SecretKey.fromDer(&keys.rsa2048, &certs.rsa2048_pkcs1);
+    try keys.p521.fromPem(gpa, p521_vector.cert_pem, p521_vector.key_pem);
+    try keys.mldsa65.fromPem(gpa, mldsa65_vector.cert_pem, mldsa65_vector.key_pem);
 
     for (cases) |c| {
         if (c.client != .go or !isSelected(selected.items, c)) continue;

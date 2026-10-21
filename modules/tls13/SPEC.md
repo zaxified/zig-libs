@@ -74,9 +74,12 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 ### Key exchange (`kex.zig`, RFC 8446 §4.2.8 / §7.4, draft-ietf-tls-ecdhe-mlkem)
 
 - Groups by `NamedGroup` code point: `x25519_group` 0x001d, `secp256r1_group` 0x0017,
-  `secp384r1_group` 0x0018, `x25519_mlkem768_group` 0x11ec. `expectedShareLen(group)`: the exact
-  CLIENT-form share length (32 / 65 / 97 / 1216; 0 = not computed here). `scalarLen(group)`: the
-  prefix of `KeyPair.secret` the group uses (32 / 32 / 48 / 96; 0 = not computed here).
+  `secp384r1_group` 0x0018, `x25519_mlkem768_group` 0x11ec, `mlkem1024_group` 0x0202
+  (draft-ietf-tls-mlkem: encapsulation key and ciphertext 1568 octets each, a 32-octet secret).
+  `expectedShareLen(group)`: the exact CLIENT-form share length (32 / 65 / 97 / 1216 / 1568; 0 =
+  not computed here). `scalarLen(group)`: the prefix of `KeyPair.secret` the group uses
+  (32 / 32 / 48 / 96 / 64; 0 = not computed here). `max_share_len` 1568, `max_server_share_len`
+  1568 (`ServerExchange.public`).
 - `generate(group, random, *KeyPair)`: x25519 (clamped scalar), secp256r1/secp384r1 (rejection-sampled
   scalar in [1, n-1], share `0x04 ‖ X ‖ Y`), hybrid (ML-KEM-768 keygen seed + X25519 scalar,
   share `encapsulation key ‖ X25519 public`, ML-KEM first).
