@@ -127,6 +127,10 @@ pub const Connection = struct {
             self.input.toss(r.consumed);
             if (r.event != .need_more) return r.event;
             try self.flushOut();
+            // A reader buffer under `record.max_record_len` (the `init`
+            // assert, gone in ReleaseFast) cannot hold a record the client
+            // may send: refuse instead of asking a full buffer for more.
+            if (self.input.bufferedLen() == self.input.buffer.len) return error.ReadFailed;
             self.input.fillMore() catch |err| return switch (err) {
                 error.EndOfStream => error.EndOfStream,
                 error.ReadFailed => error.ReadFailed,

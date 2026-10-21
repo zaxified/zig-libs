@@ -238,6 +238,8 @@ pub const Inbound = struct {
     pub fn installRx(self: *Inbound, suite: record.CipherSuite, traffic_secret: []const u8) (Error || record.InitError)!void {
         if (!self.joiner.isEmpty()) return error.UnexpectedMessage;
         if (self.protected) self.rx.wipe();
+        // Not "protected" by a wiped (all-zero) key if `init` refuses.
+        self.protected = false;
         try self.rx.init(suite, traffic_secret);
         self.protected = true;
     }

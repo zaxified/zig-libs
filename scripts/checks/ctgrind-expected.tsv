@@ -1379,9 +1379,9 @@ dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
 # Finished (length + timing_safe.eql), AEAD tags; (c) the inbound path over
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
-tlsserver	ReleaseFast	hs	1	28	adf473bbc381ae48	9dc2249fb8b05195
-tlsserver	ReleaseFast	app	1	8	adf473bbc381ae48	ded7de421ed83ff8
-tlsserver	ReleaseFast	ticket	1	74	adf473bbc381ae48	0108994991d5547e
+tlsserver	ReleaseFast	hs	1	28	a0a674eef7857ae0	9dc2249fb8b05195
+tlsserver	ReleaseFast	app	1	8	a0a674eef7857ae0	ded7de421ed83ff8
+tlsserver	ReleaseFast	ticket	1	74	a0a674eef7857ae0	0108994991d5547e
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a

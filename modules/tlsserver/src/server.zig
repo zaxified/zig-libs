@@ -1294,7 +1294,10 @@ pub const Server = struct {
                         self.early_left -= @intCast(d.len);
                         return .{ .event = .{ .early_data = d }, .consumed = at };
                     }
-                    self.key_updates_left = max_key_updates;
+                    // Only a record that carries data refills the KeyUpdate
+                    // budget (BoringSSL `kMaxKeyUpdates`): empty records
+                    // between KeyUpdates would make the cap moot.
+                    if (d.len != 0) self.key_updates_left = max_key_updates;
                     return .{ .event = .{ .app_data = d }, .consumed = at };
                 },
                 .peer_closed => {
@@ -3453,6 +3456,15 @@ test "KeyUpdate refusals: request octet, length, alignment, too many" {
         try testing.expectEqual(@as(usize, 1), d.alerts);
     }
     {
+        // An empty application_data record does not reset it: KeyUpdates
+        // interleaved with empty records still hit the cap.
+        const p = try Peer.create();
+        defer p.destroy();
+        for (0..max_key_updates) |_| _ = try p.sendKeyUpdate(0);
+        try testing.expectEqual(@as(usize, 0), (try p.send(.application_data, "")).event.app_data.len);
+        try testing.expectError(error.TooManyKeyUpdates, p.sendKeyUpdate(0));
+    }
+    {
         // Other post-handshake messages: NewSessionTicket from a client.
         const p = try Peer.create();
         defer p.destroy();
@@ -4043,9 +4055,15 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
         try testing.expectError(error.UnsupportedCertificate, s.onHandshake(handshakeMessage(&msg)));
         try testing.expectEqual(alert.Description.unsupported_certificate, alertFor(error.UnsupportedCertificate).?);
     }
-    // Out of order: a Finished where the Certificate belongs.
+    // Out of order: a Finished where the Certificate belongs, and where
+    // the CertificateVerify belongs.
     {
         var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
+    }
+    {
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        _ = try s.onHandshake(handshakeMessage(cert_msg));
         try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
     }
 }

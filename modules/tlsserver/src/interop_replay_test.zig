@@ -287,6 +287,25 @@ test "OpenSSL and Go client sessions replay byte-exact through Connection" {
     }
 }
 
+test "a resumption under client authentication leaves no ticket secret in the peer buffer" {
+    // The ticket is opened into the caller's peer buffer (its leaf moved to
+    // its place behind the head): everything before the leaf is wiped.
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("mtls-resume"), &keys);
+    defer h.destroy();
+    // No tickets re-issued: issuing builds them in the same head and wipes
+    // it again, which would hide a missing wipe after the opening.
+    h.tickets.count = 0;
+    try h.conn.handshake();
+    try testing.expect(h.conn.server.isResumed());
+    const leaf = h.conn.server.peerCertificate().?;
+    const head = @intFromPtr(leaf.ptr) - @intFromPtr(h.peer.ptr);
+    try testing.expect(head > 0 and head < h.peer.len);
+    try testing.expect(std.mem.allEqual(u8, h.peer[0..head], 0));
+}
+
 // Server-side handshakes per second, measured by replaying recorded
 // sessions (the server's work only: key exchange, CertificateVerify,
 // key schedule, records, the client's Finished checked; no client). Off by

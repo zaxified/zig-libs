@@ -194,7 +194,7 @@ pub const KeyShareIter = struct {
     pub fn next(it: *KeyShareIter) ?KeyShareEntry {
         if (it.rest.len == 0) return null;
         const g = std.mem.readInt(u16, it.rest[0..2], .big);
-        const n = std.mem.readInt(u16, it.rest[2..4], .big);
+        const n: usize = std.mem.readInt(u16, it.rest[2..4], .big); // not u16: `4 + n` wraps
         defer it.rest = it.rest[4 + n ..];
         return .{ .group = g, .key_exchange = it.rest[4..][0..n] };
     }
@@ -210,7 +210,7 @@ pub const PskIdentityIter = struct {
 
     pub fn next(it: *PskIdentityIter) ?PskIdentity {
         if (it.rest.len == 0) return null;
-        const n = std.mem.readInt(u16, it.rest[0..2], .big);
+        const n: usize = std.mem.readInt(u16, it.rest[0..2], .big); // not u16: `2 + n + 4` wraps
         defer it.rest = it.rest[2 + n + 4 ..];
         return .{
             .identity = it.rest[2..][0..n],

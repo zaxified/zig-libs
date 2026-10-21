@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — Audit (two whole-module reviews + 62 mutant schemata, 62/62).
+  **Fixed:** a zero-length application_data record refilled the KeyUpdate budget, so a client
+  interleaving empty records could send KeyUpdates without end (`max_key_updates` now counts
+  between records that carry data, as BoringSSL); `Connection` refuses a reader buffer under
+  `record.max_record_len` at run time (was a debug assert); a refused key install no longer
+  leaves its direction marked protected; `KeyShareIter`/`PskIdentityIter` lengths widened.
+  New tests for the three mutation survivors. Card: Audit 4 → 1.
+
 - **2026-10-21** — **Added (instrument):** the constant-time harness (`src/ctgrind_harness.zig`,
   `scripts/checks/ctgrind.sh tlsserver`): `hs` (recorded ClientHellos to the first flight, every
   octet of `Config.random` and the certificate key tainted), `app` (`record.Protection` seal and

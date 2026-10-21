@@ -149,6 +149,8 @@ pub const Outbound = struct {
     /// Protect every later record under `traffic_secret` (sequence 0).
     pub fn installTx(self: *Outbound, suite: record.CipherSuite, traffic_secret: []const u8) record.InitError!void {
         if (self.protected) self.tx.wipe();
+        // Not "protected" by a wiped (all-zero) key if `init` refuses.
+        self.protected = false;
         try self.tx.init(suite, traffic_secret);
         self.protected = true;
     }

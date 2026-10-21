@@ -465,6 +465,12 @@ test "open: length, type and size limits" {
     // Too short to carry a tag and a type octet.
     writeHeader(buf[0..5], .application_data, tag_len);
     try testing.expectError(error.BadRecordMac, rx.open(buf[0 .. header_len + tag_len]));
+    // Shorter than the tag itself, down to empty: refused before the
+    // ciphertext length is computed.
+    for ([_]u16{ 0, 1, tag_len - 1 }) |n| {
+        writeHeader(buf[0..5], .application_data, n);
+        try testing.expectError(error.BadRecordMac, rx.open(buf[0 .. header_len + n]));
+    }
     try testing.expectEqual(@as(u64, 0), rx.seq);
 }
 
