@@ -277,6 +277,8 @@ declare -A TARGETS=(
     [tlsclient]="kex cv"
     # ── 2026-10-10: ct-wave: DTLS 1.3 PSK, key schedule, record keys ──
     [dtls]="hs app"
+    # ── 2026-10-21: TLS 1.3 server first flight, record keys, ticket key ──
+    [tlsserver]="hs app ticket"
     # ── 2026-10-10: ct-wave: QUIC 1-RTT traffic secret, packet + header protection ──
     [quic-crypto]="aes chacha"
     # ── 2026-10-10: ct-wave: Megolm ratchet + signing key, session export, sealed pickle ──
@@ -390,6 +392,7 @@ declare -A MODES=(
     [noise]="ReleaseFast"
     [tlsclient]="ReleaseFast"
     [dtls]="ReleaseFast"
+    [tlsserver]="ReleaseFast"
     [quic-crypto]="ReleaseFast"
     [megolm]="ReleaseFast"
     [mls]="ReleaseFast"
@@ -716,6 +719,9 @@ declare -A PATTERN=(
     [tlsclient/kex]='Client[.]zig|verify[.]zig|burn[.]zig|keygen[.]zig'
     [tlsclient/cv]='Client[.]zig|burn[.]zig'
     [dtls/hs]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
+    [tlsserver/hs]='server[.]zig|record[.]zig|inbound[.]zig|outbound[.]zig|hello[.]zig|messages[.]zig|burn[.]zig|zeroize[.]zig|keys[.]zig|clientauth[.]zig|alert[.]zig|connection[.]zig|root[.]zig'
+    [tlsserver/app]='server[.]zig|record[.]zig|inbound[.]zig|outbound[.]zig|hello[.]zig|messages[.]zig|burn[.]zig|zeroize[.]zig|keys[.]zig|clientauth[.]zig|alert[.]zig|connection[.]zig|root[.]zig'
+    [tlsserver/ticket]='server[.]zig|record[.]zig|inbound[.]zig|outbound[.]zig|hello[.]zig|messages[.]zig|burn[.]zig|zeroize[.]zig|keys[.]zig|clientauth[.]zig|alert[.]zig|connection[.]zig|root[.]zig'
     [dtls/app]='Connection[.]zig|aead[.]zig|keyschedule[.]zig|record[.]zig|engine[.]zig|handshake[.]zig|flight[.]zig|messages[.]zig|burn[.]zig|root[.]zig'
     [quic-crypto/aes]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
     [quic-crypto/chacha]='keyschedule[.]zig|protection[.]zig|headerprot[.]zig|burn[.]zig|root[.]zig|version[.]zig'
@@ -999,6 +1005,9 @@ declare -A LABEL=(
     [tlsclient/cv]='tlsclient signCertificateVerify P-256/P-384/Ed25519 (key tainted)'
     [dtls/hs]='dtls PSK handshake (psk tainted)'
     [dtls/app]='dtls send/recv AES-GCM+ChaCha (record keys tainted)'
+    [tlsserver/hs]='tlsserver ClientHello -> first flight (randomness + cert key tainted)'
+    [tlsserver/app]='tlsserver record seal/open x3 suites (traffic secret tainted)'
+    [tlsserver/ticket]='tlsserver ticket issue + resume (STEK tainted)'
     [quic-crypto/aes]='quic-crypto keys+seal/open+HP AES (traffic secret tainted)'
     [quic-crypto/chacha]='quic-crypto keys+seal/open+HP ChaCha (traffic secret tainted)'
     [megolm/msg]='megolm encrypt/decrypt (ratchet+signing key tainted)'

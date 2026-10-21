@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added (instrument):** the constant-time harness (`src/ctgrind_harness.zig`,
+  `scripts/checks/ctgrind.sh tlsserver`): `hs` (recorded ClientHellos to the first flight, every
+  octet of `Config.random` and the certificate key tainted), `app` (`record.Protection` seal and
+  open per suite, traffic secret tainted), `ticket` (recorded issue + resumption, STEK tainted).
+  In-file 28 / 8 / 74, read context by context: none is a branch on key octets (rows and reading
+  in `scripts/checks/ctgrind-expected.tsv`); the card's Hardening line gains its ct entry.
+  **NO CONSUMER-VISIBLE CHANGE.**
+
 - **2026-10-21** — **Performance:** the qap churn lane (X25519, ECDSA P-256) is at the ianic
   fork's rate: 3,379 / 3,343 vs 3,291 / 3,333 connections/s, 187–193 vs 189–190 µs of user CPU
   per connection (before: 2,971 / 2,989, 231 µs). From a profile by function against the fork:
