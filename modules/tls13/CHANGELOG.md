@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — `Schedule.exportKeyingMaterial(Hash, Hkdf, out, exporter_master_secret, label,
+  context)`: the RFC 8446 §7.5 exporter with a run-time output length (burned like the other
+  steps), plus `max_exporter_label_len` and `maxExporterLen`. KATs from an independent Python
+  `hmac`/`hashlib` reimplementation over RFC 8448 §3's exporter master secret (SHA-256: 1, 32 and
+  100 octets) and a SHA-384 one; a dead-stack probe (`stackprobe_test.zig`) for the label's
+  secret.
+
 - **2026-10-21** — ML-KEM-1024 (`kex.mlkem1024_group` 0x0202, out-of-line arms under
   `burn.kex_mlkem1024_burn`; `max_share_len` 1216 → 1568, new `max_server_share_len`), and
   CertificateVerify for `ecdsa_secp521r1_sha512` (the `p521` module, new dep) and pure ML-DSA

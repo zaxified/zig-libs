@@ -54,6 +54,12 @@
 //!   checked once the handshake completed (BoringSSL's names,
 //!   `EarlyDataReason.name`).
 //!
+//! - `-export-keying-material N` writes `Server.exportKeyingMaterial`'s N
+//!   octets for `-export-label` / `-export-context` once the handshake
+//!   returned (half-RTT with early data), before anything else is written;
+//!   without `-use-export-context` the context is absent, which TLS 1.3
+//!   treats as empty (RFC 8446 §7.5).
+//!
 //! - `-decline-alpn` is a server without protocols (no ALPN, whatever the
 //!   client offers); `-reject-alpn` one whose protocols no client offers
 //!   (`no_application_protocol` when the client sends ALPN) — what
@@ -125,6 +131,10 @@ const Options = struct {
     /// `-expect-accept-early-data` (true) / `-expect-reject-early-data`.
     expect_early_data_accepted: ?bool = null,
     expect_early_data_reason: ?[]const u8 = null,
+    export_keying_material: usize = 0,
+    export_label: []const u8 = "",
+    export_context: []const u8 = "",
+    use_export_context: bool = false,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -312,6 +322,14 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.expect_early_data_accepted = false;
         } else if (std.mem.eql(u8, flag, "-expect-advertised-alpn")) {
             o.expect_advertised_alpn = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-export-keying-material")) {
+            o.export_keying_material = try std.fmt.parseInt(usize, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-export-label")) {
+            o.export_label = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-export-context")) {
+            o.export_context = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-use-export-context")) {
+            o.use_export_context = true;
         } else if (std.mem.eql(u8, flag, "-decline-alpn")) {
             o.alpn_mode = .decline;
         } else if (std.mem.eql(u8, flag, "-reject-alpn")) {
@@ -662,6 +680,15 @@ fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8,
         if (!std.mem.eql(u8, got, want)) return error.PeerCertificateMismatch;
     }
     if (o.expect_peer_signature_algorithm) |want| if (c.server.peerSignatureScheme() != want) return error.PeerSignatureAlgorithmMismatch;
+    if (o.export_keying_material != 0) {
+        var material: [record.max_plaintext_len]u8 = undefined;
+        if (o.export_keying_material > material.len) return unimplemented("-export-keying-material (over 16 KiB)");
+        const out = material[0..o.export_keying_material];
+        // Without -use-export-context the context is absent: in TLS 1.3 the
+        // same as an empty one, whatever -export-context says.
+        try c.server.exportKeyingMaterial(out, o.export_label, if (o.use_export_context) o.export_context else "");
+        try c.writeAll(out);
+    }
     if (o.key_update) try c.keyUpdate(.update_not_requested);
     if (o.shim_writes_first) try c.writeAll("hello");
     if (o.shim_shuts_down) {

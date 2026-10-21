@@ -107,6 +107,7 @@ func main() {
 	sessIn := flag.String("sess-in", "", "offer the session ticket in this file")
 	certFile := flag.String("cert", "", "client certificate (PEM), with -key")
 	keyFile := flag.String("key", "", "the client certificate's private key (PEM)")
+	exportLabel := flag.String("export", "", "print 48 octets of exported keying material for this label (no context)")
 	flag.Parse()
 
 	pem, err := os.ReadFile(*caFile)
@@ -185,6 +186,13 @@ func main() {
 		scts[i] = fmt.Sprintf("%x", sct)
 	}
 	fmt.Printf("scts: %s\n", strings.Join(scts, ","))
+	if *exportLabel != "" {
+		km, err := cs.ExportKeyingMaterial(*exportLabel, nil, 48)
+		if err != nil {
+			fail("export: %v", err)
+		}
+		fmt.Printf("exported: %x\n", km)
+	}
 
 	if _, err := conn.Write([]byte("ping\n")); err != nil {
 		fail("write: %v", err)

@@ -264,6 +264,11 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, path: 
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
     try testing.expectEqual(v.resumed, c.server.isResumed());
     try testing.expectEqual(v.early_accepted, c.server.earlyDataAccepted());
+    if (v.exported) |want| {
+        var km: [vectors.exporter_len]u8 = undefined;
+        try c.server.exportKeyingMaterial(&km, vectors.exporter_label, "");
+        try testing.expectEqualSlices(u8, &want, &km);
+    }
     const want_peer: ?[]const u8 = switch (v.client_cert) {
         .none => null,
         .p256 => &client_certs.p256_cert,

@@ -226,6 +226,8 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     };
     // The server learns the handshake is done from the client's Finished,
     // which the client sends with its first write.
+    var exported: [100]u8 = undefined;
+    try testing.expectError(error.HandshakeNotComplete, server.exportKeyingMaterial(&exported, "EXPERIMENTAL-tlsserver", "ctx"));
     try client.writer.writeAll("GET / HTTP/1.1\r\n\r\n");
     try client.writer.flush();
     try pipe.pump();
@@ -234,6 +236,27 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     try testing.expect(server.isConnected());
     try testing.expectEqualStrings("localhost", server.serverName().?);
     try testing.expectEqualStrings("GET / HTTP/1.1\r\n\r\n", pipe.received.items);
+
+    // The exporter: the client's (tlsclient's own RFC 8446 §7.5 code) over
+    // more than one HKDF block, with and without a context.
+    if (C == ZlClient) {
+        for ([_][]const u8{ "ctx", "" }) |context| {
+            try server.exportKeyingMaterial(&exported, "EXPERIMENTAL-tlsserver", context);
+            var theirs: [100]u8 = undefined;
+            try client.exportKeyingMaterial("EXPERIMENTAL-tlsserver", context, &theirs);
+            try testing.expectEqualSlices(u8, &theirs, &exported);
+        }
+        try testing.expectError(error.LabelTooLong, server.exportKeyingMaterial(&exported, &@as([Server.max_exporter_label_len + 1]u8, @splat('a')), ""));
+        const big = try gpa.alloc(u8, Server.maxExporterLen(server.cipherSuite().?) + 1);
+        defer gpa.free(big);
+        try testing.expectError(error.OutputTooLong, server.exportKeyingMaterial(big, "EXPERIMENTAL-tlsserver", ""));
+        // The longest output, all 255 HKDF blocks.
+        const theirs_big = try gpa.alloc(u8, big.len - 1);
+        defer gpa.free(theirs_big);
+        try server.exportKeyingMaterial(big[1..], "EXPERIMENTAL-tlsserver", "");
+        try client.exportKeyingMaterial("EXPERIMENTAL-tlsserver", "", theirs_big);
+        try testing.expectEqualSlices(u8, theirs_big, big[1..]);
+    }
 
     // Server → client, then close_notify both ways.
     try testing.expectEqual(@as(usize, 11), try server.write("hello there"));

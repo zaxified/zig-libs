@@ -100,7 +100,14 @@ const Case = struct {
     /// The server must have taken the client's early data ("ping\n" in
     /// `early.txt`; its stdin is then left empty).
     early_accepted: bool = false,
+    /// The client prints `interop_exporter_len` octets exported for
+    /// `interop_exporter_label` (no context); the server's must match.
+    exporter: bool = false,
 };
+
+/// The exporter label and length of the `exporter` cases.
+pub const interop_exporter_label = "EXPERIMENTAL-tlsserver-interop";
+pub const interop_exporter_len = 48;
 
 /// The OCSP staple and SCT list of every `staple` case: an OCSPResponse of
 /// status malformedRequest(1) (DER-valid, no signed body to verify) and a
@@ -143,6 +150,8 @@ const cases = [_]Case{
     .{ .name = "early-new", .why = "tickets with early_data (max_early_data_size)", .seed = 72, .tickets = true, .early_data = true, .brief = false, .args = &.{ "-sess_out", "openssl-early.sess" }, .expect = &.{ "New, TLSv1.3", "Max Early Data: 16384" } },
     .{ .name = "early", .why = "0-RTT: s_client's early data taken under the ticket's PSK, pong as half-RTT data, EndOfEarlyData", .seed = 73, .tickets = true, .early_data = true, .resumed = true, .early_accepted = true, .brief = false, .args = &.{ "-sess_in", "openssl-early.sess", "-early_data", "early.txt" }, .expect = &.{ "Reused, TLSv1.3", "Early data was accepted" } },
     .{ .name = "early-refused", .why = "0-RTT offered to a server that takes none: resumed, the early data skipped", .seed = 74, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-early.sess", "-early_data", "early.txt" }, .expect = &.{ "Reused, TLSv1.3", "Early data was rejected" } },
+    .{ .name = "exporter", .why = "RFC 8446 §7.5 keying material: s_client's (-keymatexport) is the server's (SHA-384 suite)", .seed = 75, .exporter = true, .brief = false, .expect = &.{"Cipher is TLS_AES_256_GCM_SHA384"} },
+    .{ .name = "exporter-chacha", .why = "the exporter under TLS_CHACHA20_POLY1305_SHA256 (SHA-256)", .seed = 76, .exporter = true, .brief = false, .args = &.{ "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256" }, .expect = &.{"Cipher is TLS_CHACHA20_POLY1305_SHA256"} },
     .{ .name = "staple", .why = "an OCSP staple (s_client -status; its -ct needs a CT log list, so the SCTs are Go's to check)", .seed = 60, .staple = true, .brief = false, .args = &.{"-status"}, .expect = &.{"OCSP Response Status: malformedrequest (0x1)"} },
     .{ .name = "cert-comp-zlib", .why = "RFC 8879: the Certificate zlib-compressed (s_client offers zlib and zstd)", .seed = 63, .cert_comp = true, .brief = false, .args = &.{"-msg"}, .expect = &.{ "], CompressedCertificate", "Verification: OK" } },
     .{ .name = "staple-not-asked", .why = "a staple configured, s_client without -status (no status_request): the handshake still completes (absence of the staple: handshake_test.zig)", .seed = 61, .staple = true },
@@ -175,6 +184,7 @@ const cases = [_]Case{
     .{ .name = "go-mtls-rsa2048", .client = .go, .why = "an RSA client certificate (RSA-PSS CertificateVerify)", .seed = 51, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-ed25519", .client = .go, .why = "an Ed25519 client certificate", .seed = 52, .client_auth = .mandatory, .client_cert = .ed25519, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-resume-new", .client = .go, .why = "tickets after client authentication", .seed = 53, .tickets = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-out", "go-mtls.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
+    .{ .name = "go-exporter", .client = .go, .why = "the exporter: Go's ExportKeyingMaterial is the server's (TLS_AES_128_GCM_SHA256)", .seed = 77, .exporter = true, .expect = &.{"suite: TLS_AES_128_GCM_SHA256"} },
     .{ .name = "go-mtls-resume", .client = .go, .why = "resumption with a mandatory client certificate: the ticket's identity", .seed = 54, .tickets = true, .resumed = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-in", "go-mtls.sess" }, .expect = &.{"resumed: true"} },
 };
 
@@ -244,6 +254,8 @@ const Recorded = struct {
     server: std.ArrayList(u8) = .empty,
     /// A `cert_comp` case's compressed certificate.
     compressed: ?tlsserver.CertifiedKey.CompressedCertificate = null,
+    /// An `exporter` case's keying material.
+    exported: ?[interop_exporter_len]u8 = null,
 };
 
 /// `ck`'s Certificate without staples, zlib-compressed (RFC 8879
@@ -367,6 +379,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         try argv.appendSlice(gpa, &.{ "-cert", files[0], "-key", files[1] });
     }
     try argv.appendSlice(gpa, c.args);
+    if (c.exporter) try argv.appendSlice(gpa, switch (c.client) {
+        .openssl => &.{ "-keymatexport", interop_exporter_label, "-keymatexportlen", std.fmt.comptimePrint("{d}", .{interop_exporter_len}) },
+        .go => &.{ "-export", interop_exporter_label },
+    });
 
     var child = try std.process.spawn(io, .{
         .argv = argv.items,
@@ -469,6 +485,21 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     // serve's close_notify waited for the client's KeyUpdate.
     if (c.key_update and !server.write_closed) return error.NoClientKeyUpdate;
     if (server.isResumed() != c.resumed) return error.ResumptionMismatch;
+    if (c.exporter) {
+        var km: [interop_exporter_len]u8 = undefined;
+        try server.exportKeyingMaterial(&km, interop_exporter_label, "");
+        // s_client prints upper-case hex, the Go client lower-case.
+        var line_buf: [64 + 2 * interop_exporter_len]u8 = undefined;
+        const line = switch (c.client) {
+            .openssl => try std.mem.print(&line_buf, "Keying material: {X}", .{&km}),
+            .go => try std.mem.print(&line_buf, "exported: {x}", .{&km}),
+        };
+        if (std.mem.indexOf(u8, stdout, line) == null) {
+            std.debug.print("  the client's keying material is not the server's ({s}):\n{s}\n", .{ line, stdout });
+            return error.ExporterMismatch;
+        }
+        rec.exported = km;
+    }
     if (server.earlyDataAccepted() != c.early_accepted) {
         std.debug.print("  early data: {s}\n", .{server.earlyDataReason().name()});
         return error.EarlyDataMismatch;
@@ -518,6 +549,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     );
     try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n", .{ interop_stek_key[0], interop_clock_ms });
     try w.print("/// `EarlyData.max_size` of the `early_data` cases.\npub const max_early_data: u32 = {d};\n", .{interop_max_early_data});
+    try w.print("/// The exporter label and length of the cases with `exported`.\npub const exporter_label = \"{s}\";\npub const exporter_len = {d};\n", .{ interop_exporter_label, interop_exporter_len });
     try w.print("/// The leaf's OCSP staple and SCT list in the `staple` cases.\npub const ocsp_response = hx({d}, \"{x}\");\npub const sct_list = hx({d}, \"{x}\");\n\n", .{ interop_ocsp_response.len, &interop_ocsp_response, interop_sct_list.len, &interop_sct_list });
     try w.writeAll(
         \\pub const Case = struct {
@@ -546,6 +578,9 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    early_data: bool = false,
         \\    /// It took the client's ("ping\\n").
         \\    early_accepted: bool = false,
+        \\    /// The server's keying material for `exporter_label` (no context),
+        \\    /// which the client printed too.
+        \\    exported: ?[exporter_len]u8 = null,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -578,6 +613,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
             try hexFieldAt(w, "            ", "data", cc.data);
             try w.writeAll("        },\n");
         }
+        if (d[1].exported) |km| try w.print("        .exported = hx({d}, \"{x}\"),\n", .{ km.len, &km });
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");

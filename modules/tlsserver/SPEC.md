@@ -37,11 +37,11 @@ else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1),
 both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
 OCSP / SCT stapling (step 5) work. **rustls parity (step 6):** of the 436 BoGo server tests
 at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here (278 after
-M4 step 3, 304 after step 4 — 0-RTT; the one gap left is the exporter), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
+M4 step 3, 304 after step 4 — 0-RTT; 305 after step 5, the exporter: no gap left), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
 divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
-runner cannot map, extensions this server ignores), and 49 are gaps: 0-RTT (27),
-certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — see
-*Backlog*. SCT stapling
+runner cannot map, extensions this server ignores), and 49 were gaps on 2026-10-20: 0-RTT (27),
+certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — all
+closed by M4 step 5 (see *Backlog*). SCT stapling
 (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
 **tlsfuzzer (M2 exit gate, 2026-10-21):** 50 of its TLS 1.3 scripts run
 (`interop-tlsserver -- --tlsfuzzer DIR`, counts in `tools/tlsfuzzer/baseline.tsv`); against
@@ -197,6 +197,23 @@ tickets only, `send_half_rtt_data` off by default) early data rides on stateless
 replay guard, and half-RTT writes are always allowed once early data is taken (as BoringSSL).
 `Connection.handshake` returns once early data is taken (`server.inEarlyData()`); `read`
 returns it and completes the handshake.
+
+**Exporter** (RFC 8446 §7.5, RFC 5705's interface): `Server.exportKeyingMaterial(out, label,
+context)` fills `out` with `HKDF-Expand-Label(Derive-Secret(exporter_master_secret, label, ""),
+"exporter", Hash(context), out.len)`. The `exporter_master_secret` is derived with the
+application secrets (over the transcript through the server's Finished) and kept for the
+connection's life — wiped by `deinit` or a failure, unlike the master secret, which goes with
+the client's Finished. It answers once `canWrite()` holds: the handshake completed, or early
+data was taken and the server writes half-RTT data (BoringSSL `SSL_export_keying_material`;
+BoGo `ExportKeyingMaterial-Server-HalfRTT`) — the client's Finished, and its certificate, are
+then still to come; before that `HandshakeNotComplete`. No context and an empty one are the
+same value (§7.5), so there is one form. Refused: a label over `max_exporter_label_len` (249,
+`HkdfLabel`'s 255 less `"tls13 "`: `LabelTooLong`), an output over `maxExporterLen(suite)` (255
+HKDF blocks: 8160 octets with SHA-256, 12240 with SHA-384: `OutputTooLong`). RFC 5705's reserved
+labels are TLS 1.2's PRF labels and not checked (rustls neither). The derivation is
+`tls13.keyschedule`'s (`Schedule.exportKeyingMaterial`, run-time length, burned). Not done: the
+early exporter (`early_exporter_master_secret`, RFC 8446 §7.5's 0-RTT variant; rustls has none
+on the server).
 
 **Client certificates** (RFC 8446 §4.3.2, §4.4.2, §4.4.3; rustls 0.23 rules,
 `Config.client_auth`). A full handshake sends a CertificateRequest after the
@@ -778,6 +795,16 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   tiny refused records can exceed it, as with rustls); empty early records cost nothing (a
   binder is needed first); a server KeyUpdate at 2^23 records could fall before the client's
   Finished (not reachable in practice).
+- **M4 step 5 (2026-10-21): the exporter** (RFC 8446 §7.5, `Server.exportKeyingMaterial`) — BoGo
+  401/0, rustls parity 305 of 436 with **no gap left** (`ExportKeyingMaterial-Server-HalfRTT`).
+  The shim taking `-export-keying-material` unhid BoringSSL's TLS 1.0–1.2 cipher-suite tests
+  (`TLS-TLS1x-<suite>-server`, the version as an infix): disabled precisely in `config.json`.
+  Interop: `s_client -keymatexport` (`exporter`, `exporter-chacha`) and Go
+  `ExportKeyingMaterial` (`go-exporter`) print the server's octets; the recorded value is checked
+  in the replay (58 recorded sessions). Every `tlsclient` handshake test compares both sides'
+  exports (with and without a context, the longest output), and refuses one before the client's
+  Finished. tls13: KATs from an independent Python reimplementation, a dead-stack probe
+  (negative control: without the burn it finds the label's secret). Not done: the early exporter.
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:

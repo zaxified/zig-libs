@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M4 step 5, the exporter (RFC 8446 §7.5): `Server.exportKeyingMaterial(out,
+  label, context)`, `Server.ExportError`, `max_exporter_label_len`, `maxExporterLen(suite)`;
+  available once `canWrite()` (half-RTT included, as BoringSSL). The exporter master secret
+  lives until `deinit` or a failure. BoGo shim `-export-keying-material`/`-export-label`/
+  `-export-context`/`-use-export-context`; interop cases `exporter`, `exporter-chacha`
+  (`s_client -keymatexport`) and `go-exporter` (Go `ExportKeyingMaterial`), the recorded value
+  checked in the replay; every `tlsclient` handshake test compares both sides' exports.
+
 - **2026-10-21** — M4 step 4, 0-RTT early data (rustls parity 278 → 304, BoGo 370 → 400/0; the one
   gap left is the exporter). New `Config.early_data: ?*const EarlyData` (`max_size`, a mandatory
   `ReplayGuard`, `max_age_skew_s`), `strikeRegisterGuard` over `tlsresume.replay.StrikeRegister`,

@@ -80,3 +80,29 @@ test "STACKPROBE: no key residue after certverify sign/verify, P-521 and ML-DSA"
     try probeMlDsa("mldsa65", mldsa.MLDSA65, .mldsa65);
     try probeMlDsa("mldsa87", mldsa.MLDSA87, .mldsa87);
 }
+
+// ── keyschedule: the exporter (its own burned entry point, not `dtls`'s) ──
+
+const ks = @import("keyschedule.zig").tls13;
+const Sha384 = std.crypto.hash.sha2.Sha384;
+const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+
+const PKs = sp.Probe(.{ .window = 64 * 1024 });
+
+var exporter_secret: [48]u8 = @splat(0x2f);
+var exported: [100]u8 = undefined;
+
+fn exportIt() void {
+    ks.exportKeyingMaterial(Sha384, Hkdf384, &exported, &exporter_secret, "EXPERIMENTAL-probe", "ctx");
+}
+
+test "STACKPROBE: no exporter secret residue after exportKeyingMaterial" {
+    try sp.skipUnlessOptimized();
+    // The label's own secret, Derive-Secret(exporter_master_secret, label,
+    // ""), lives only inside the call.
+    var empty_hash: [48]u8 = undefined;
+    Sha384.hash("", &empty_hash, .{});
+    var inner: [48]u8 = undefined;
+    ks.deriveSecret(Hkdf384, &inner, &exporter_secret, "EXPERIMENTAL-probe", &empty_hash);
+    _ = try PKs.run("exportKeyingMaterial", exportIt, .{}, &[_][]const u8{ &exporter_secret, &inner }, .{});
+}

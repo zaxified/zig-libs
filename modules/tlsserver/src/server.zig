@@ -944,6 +944,9 @@ pub const Server = struct {
     master_secret: [48]u8 = @splat(0),
     client_application_secret: [48]u8 = @splat(0),
     server_application_secret: [48]u8 = @splat(0),
+    /// RFC 8446 §7.5's base, kept for the connection's life
+    /// (`exportKeyingMaterial`).
+    exporter_master_secret: [48]u8 = @splat(0),
     /// The negotiated ALPN protocol (one of `config.alpn_protocols`).
     alpn: ?[]const u8 = null,
     /// The negotiated key-exchange group (0: not chosen yet).
@@ -1027,6 +1030,7 @@ pub const Server = struct {
         std.crypto.secureZero(u8, &self.master_secret);
         std.crypto.secureZero(u8, &self.client_application_secret);
         std.crypto.secureZero(u8, &self.server_application_secret);
+        std.crypto.secureZero(u8, &self.exporter_master_secret);
         self.state = .failed;
     }
 
@@ -1126,6 +1130,46 @@ pub const Server = struct {
             .early_data, .client_finished => self.early_reason == .accepted,
             else => false,
         };
+    }
+
+    pub const ExportError = error{
+        /// Neither complete nor writing half-RTT data (`canWrite`).
+        HandshakeNotComplete,
+        /// Over `max_exporter_label_len` octets.
+        LabelTooLong,
+        /// Over `maxExporterLen` octets for the suite's hash.
+        OutputTooLong,
+    };
+
+    /// The longest exporter label (RFC 8446 §7.1 `HkdfLabel`).
+    pub const max_exporter_label_len = ks.max_exporter_label_len;
+
+    /// The longest exporter output under `suite`: 255 HKDF blocks (8160
+    /// octets with SHA-256, 12240 with SHA-384).
+    pub fn maxExporterLen(suite: record.CipherSuite) usize {
+        return switch (suite) {
+            .aes_256_gcm_sha384 => ks.maxExporterLen(S384.Hkdf),
+            else => ks.maxExporterLen(S256.Hkdf),
+        };
+    }
+
+    /// RFC 8446 §7.5 (RFC 5705's interface): `out.len` octets of keying
+    /// material for `label` and `context` from the exporter master secret.
+    /// No context and an empty one give the same value in TLS 1.3, so
+    /// there is no "no context" form. Available once `canWrite()` holds:
+    /// the handshake completed, or early data was taken and the server is
+    /// writing half-RTT data (BoringSSL; the client's Finished, and its
+    /// certificate, are then still to come). Not the early exporter
+    /// (`early_exporter_master_secret`). The secret lives until `deinit`
+    /// or a failure.
+    pub fn exportKeyingMaterial(self: *const Server, out: []u8, label: []const u8, context: []const u8) ExportError!void {
+        if (!self.canWrite()) return error.HandshakeNotComplete;
+        if (label.len > max_exporter_label_len) return error.LabelTooLong;
+        if (out.len > maxExporterLen(self.suite)) return error.OutputTooLong;
+        switch (self.suite) {
+            .aes_256_gcm_sha384 => ks.exportKeyingMaterial(S384.Hash, S384.Hkdf, out, &self.exporter_master_secret, label, context),
+            else => ks.exportKeyingMaterial(S256.Hash, S256.Hkdf, out, self.exporter_master_secret[0..32], label, context),
+        }
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -1334,6 +1378,7 @@ pub const Server = struct {
             std.crypto.secureZero(u8, &self.master_secret);
             std.crypto.secureZero(u8, &self.client_application_secret);
             std.crypto.secureZero(u8, &self.server_application_secret);
+            std.crypto.secureZero(u8, &self.exporter_master_secret);
         }
         return e;
     }
@@ -1934,6 +1979,7 @@ pub const Server = struct {
         ks.deriveMasterSecret(H.Hkdf, ms, hs, &empty_hash);
         th = t.currentHash();
         ks.deriveApplicationTrafficSecrets(H.Hkdf, self.client_application_secret[0..L], self.server_application_secret[0..L], ms, &th);
+        ks.deriveExporterMasterSecret(H.Hkdf, self.exporter_master_secret[0..L], ms, &th);
         self.out.installTx(self.suite, self.server_application_secret[0..L]) catch return error.InternalError;
     }
 
@@ -2649,7 +2695,7 @@ test "after a refusal every secret is wiped; the suite is unknown if it was not 
     const fin = [_]u8{ 20, 0, 0, 32 } ++ @as([32]u8, @splat(0xee));
     @memcpy(buf[5..][0..fin.len], &fin);
     try testing.expectError(error.DecryptError, s2.feed(try tx.seal(&buf, fin.len, .handshake, 0)));
-    for ([_][]const u8{ &s2.handshake_secret, &s2.client_handshake_secret, &s2.master_secret, &s2.client_application_secret, &s2.server_application_secret }) |sec|
+    for ([_][]const u8{ &s2.handshake_secret, &s2.client_handshake_secret, &s2.master_secret, &s2.client_application_secret, &s2.server_application_secret, &s2.exporter_master_secret }) |sec|
         for (sec) |b| try testing.expectEqual(@as(u8, 0), b);
     try testing.expect(!s2.out.protected and !s2.inbound.protected);
     try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, s2.cipherSuite().?);

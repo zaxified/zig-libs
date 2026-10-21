@@ -45,7 +45,9 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   `deriveHandshakeSecret` (salt = Derive-Secret(early, "derived", ""), IKM = the (EC)DHE secret
   or zeros), `deriveHandshakeTrafficSecrets` ("c/s hs traffic"), `deriveMasterSecret`,
   `deriveApplicationTrafficSecrets` ("c/s ap traffic", transcript through the SERVER Finished),
-  `deriveExporterMasterSecret` ("exp master", same transcript), `deriveResumptionMasterSecret`
+  `deriveExporterMasterSecret` ("exp master", same transcript), `exportKeyingMaterial` (§7.5,
+  run-time output length up to `maxExporterLen(Hkdf)` = 255 blocks, label up to
+  `max_exporter_label_len`), `deriveResumptionMasterSecret`
   ("res master", transcript through the CLIENT Finished), `deriveResumptionPsk` (§4.6.1,
   "resumption" with the ticket nonce as context), `nextApplicationTrafficSecret` (§7.2,
   "traffic upd"), `deriveFinishedKey`, `deriveTrafficKeyIv` (§7.3, "key"/"iv").

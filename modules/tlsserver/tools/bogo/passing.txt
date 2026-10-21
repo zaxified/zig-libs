@@ -120,6 +120,7 @@ EarlyData-Server-TLS13
 EarlyData-SkipEndOfEarlyData-TLS13
 EarlyData-UnexpectedHandshake-Server-TLS13
 EmptySessionID-TLS13
+ExportKeyingMaterial-Server-HalfRTT-TLS-TLS13
 ExtendedMasterSecret-TLS13-Server
 ExtensionTrailingData-CertificateAuthorities-Server-TLS-TLS13
 ExtensionTrailingData-ServerName-Server-TLS-TLS13
