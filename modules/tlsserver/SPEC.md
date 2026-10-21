@@ -148,7 +148,8 @@ Each ticket is a `Ticketer` blob (`StekTicketer`: `tlsresume`'s AES-256-GCM STEK
 as AAD, keys past the rotation policy's lifetime refused) over `tlsresume.select.SessionState`
 (resumption master secret over the transcript through the client's Finished, a one-octet nonce
 = the ticket's index, issue time, `ticket_age_add`) followed by this server's `TicketFields`:
-format 2, SNI, ALPN, the client's certificate (DER leaf, ≤ 4096 octets; empty without one) and
+format 2, SNI, ALPN, the client's certificate (DER leaf, ≤ `ClientAuth.max_leaf_len`; empty
+without one) and
 the scheme it signed with, suite — the suite last, read from the end, so a SHA-384 ticket opened
 with a SHA-256 prefix can never match the negotiated suite. `ticket_lifetime` is
 `min(Tickets.lifetime_s, 7 days)` (12 h by default, rustls), and each ticket carries an empty
@@ -165,8 +166,11 @@ at; as in rustls the binder is checked before the PSK modes are, so a bad binder
 `psk_ke` offered is still `decrypt_error`. The resumed handshake: ServerHello with `pre_shared_key` (the index) and a key share (a
 fresh (EC)DHE always runs), early secret from the PSK, EncryptedExtensions without the SNI
 acknowledgement (RFC 6066 §3), no Certificate or CertificateVerify, Finished; `isResumed()`.
-Every buffer holding the resumption secret, the PSK or a ticket's plaintext is wiped before
-the step returns. Not yet: a stateful cache, early data, the ticket count request (RFC 9149).
+A ticket's plaintext is built around the leaf where it lies in the caller's peer buffer
+(below), and opened there — a ticket whose leaf is over this connection's cap is not resumed,
+nor one with a leaf when there is no client authentication — and the sealed blob goes straight
+into its place in the output: no copy of the leaf, no ticket-sized stack array. Every buffer
+holding the resumption secret, the PSK or a ticket's plaintext is wiped before the step returns. Not yet: a stateful cache, early data, the ticket count request (RFC 9149).
 
 **Client certificates** (RFC 8446 §4.3.2, §4.4.2, §4.4.3; rustls 0.23 rules,
 `Config.client_auth`). A full handshake sends a CertificateRequest after the
@@ -177,13 +181,14 @@ resumption sends none. The client's Certificate (`clientauth.parseCertificate`, 
 malformed is `decode_error`; another context `illegal_parameter`; an entry with any extension
 `unsupported_extension` (the request asks for none). Empty: `certificate_required` when
 `ClientAuth.mandatory` (the default), otherwise the client goes on unauthenticated (no
-CertificateVerify). Otherwise: at most 16 certificates and a leaf of at most 4096 octets
-(`bad_certificate` past either); the leaf's key must be one `certverify` verifies (RSA, ECDSA
-P-256/P-384/P-521, Ed25519, ML-DSA — the last two only with their schemes in
-`ClientAuth.schemes`, and an ML-DSA-65/87 leaf is over the 4096-octet cap) and its `keyUsage`,
+CertificateVerify). Otherwise: at most 16 certificates and a leaf of at most
+`ClientAuth.max_leaf_len` octets (4096 by default; `bad_certificate` past either); the leaf's
+key must be one `certverify` verifies (RSA, ECDSA P-256/P-384/P-521, Ed25519, ML-DSA — the last
+two only with their schemes in `ClientAuth.schemes`; an ML-DSA-65/87 leaf, 5.5-7.5 KB, needs a
+larger `max_leaf_len`) and its `keyUsage`,
 if present, must assert `digitalSignature`
 (`unsupported_certificate`; BoringSSL checks this in the TLS layer whatever the verifier says,
-read from an `x509.safe`-vetted copy); then the chain, leaf first, goes to
+read from an `x509.safe`-vetted copy, made where the leaf is kept); then the chain, leaf first, goes to
 `ClientCertVerifier.verify` with the `ClientAuth.clock` time, whose refusal names the alert
 (`bad_certificate`, `unsupported_certificate`, `certificate_revoked`, `certificate_expired`,
 `unknown_ca`, `access_denied`, `certificate_unknown`). `X509Verifier` is RFC 5280 path
@@ -379,9 +384,15 @@ The receive side's refusals are the table under *Wire format*. Record protection
   BoGo `TrailingMessageData-TLS13-ClientFinished-TLS`); OpenSSL and tlsfuzzer want
   `decode_error`.
 - A client certificate chain: at most `clientauth.max_chain_len` (16) certificates, a leaf of at
-  most `clientauth.max_leaf_len` (4096) octets (`bad_certificate`), the whole message within the
-  joiner's cap (64 KiB by default, `decode_error`). `minOutputLen(config, key)` sizes the output
-  for the first flight with a CertificateRequest and for the tickets with the longest leaf.
+  most `ClientAuth.max_leaf_len` (default `clientauth.default_max_leaf_len`, 4096) octets
+  (`bad_certificate`), the whole message within the joiner's cap (64 KiB by default,
+  `decode_error`). The leaf is kept in a buffer the caller gives each `Server`
+  (`setPeerBuffer`, `peerBufferLen(max_leaf_len)` octets: the leaf with room for a ticket's
+  other fields around it and `x509.safe`'s padding after it), like the joiner's; under
+  `client_auth` a missing or shorter one is `internal_error` at the ClientHello. Only the
+  connections of a configuration with client authentication pay for it, and only as much as
+  its cap. `minOutputLen(config, key)` sizes the output for the first flight with a
+  CertificateRequest and for the tickets with the longest leaf.
 
 ## Anchoring
 
@@ -705,12 +716,11 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
 - **M1 closed 2026-10-20:** secp384r1 and P-384 certificates; the key loader; interop with the
   Go client and `tlsclient`; the `tlsserver-server` fuzz harness; the BoGo shim (130 pass).
 - **M4 step 1 (2026-10-21): ML-KEM-1024, P-521 and ML-DSA** — 16 of the 49 gaps closed (BoGo
-  359/0, parity 267 of 436, 33 gaps). Open: ML-DSA-65/87 client leaves (5.5-7.5 KB) exceed
-  `clientauth.max_leaf_len` — raising it costs every connection 4 KiB (`Server.peer_buf`) and
-  ticket scratch; a caller-supplied leaf buffer (the qap item below) is the other way: an owner
-  decision (`Server-Verify-ML-DSA-65/87`, `Server-InvalidSignature-ML-DSA-65/87` disabled with
-  that reason). **Decided 2026-10-21 (owner): the caller-supplied leaf buffer.** The ML-DSA AlgorithmIdentifier's absent parameters are checked for the private
-  key, not for a client leaf (`x509.Spki` does not expose them).
+  359/0, parity 267 of 436, 33 gaps). ML-DSA-65/87 client leaves (5.5-7.5 KB): the owner chose
+  (2026-10-21) a caller-supplied leaf buffer over a larger constant cap — done in M4 step 2
+  (`ClientAuth.max_leaf_len`, `Server.setPeerBuffer`). The ML-DSA AlgorithmIdentifier's absent
+  parameters are checked for the private key, not for a client leaf (`x509.Spki` does not
+  expose them).
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:
@@ -739,10 +749,6 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   (configuration errors first). After a HelloRetryRequest the second ClientHello's
   `status_request` / `signed_certificate_timestamp` decide (as in rustls; RFC 8446 §4.1.2 would
   have them unchanged — only the SNI is compared).
-- **Client leaf cap as a Config field (qap, 2026-10-21):** `clientauth.max_leaf_len` (4096) is a
-  constant, so is `Server.peer_buf`; qap's `Tls.max_client_cert_bytes` goes up to 16384 and its
-  tlsserver path refuses a configuration above 4096 at compile time (`src/session.zig`
-  `secureZl`). Ideal: the leaf buffer supplied by the caller (as `joiner_buf`), its length the cap.
 - **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
   chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
   client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** the differential run against the fork and
@@ -773,10 +779,12 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   precondition documented. Accepted: the leaf's key and keyUsage are checked before the verifier
   (BoringSSL's order; rustls verifies first, so an untrusted unusable leaf gets
   `unsupported_certificate` here, `unknown_ca` there); a chain signature that does not verify is
-  `bad_certificate` (rustls: `decrypt_error`); 4 KiB of `peer_buf` per `Server`.
+  `bad_certificate` (rustls: `decrypt_error`); 4 KiB of `peer_buf` per `Server` (gone
+  2026-10-21: the caller's buffer, only under client authentication).
 
-- `burn.handshake_burn` (32 KiB around each handshake step since client certificates: the ticket
-  plaintext and blob buffers hold a client leaf) is a margin, not a measured depth: the stack
+- `burn.handshake_burn` (32 KiB around each handshake step since client certificates, when the
+  ticket plaintext and blob were stack buffers holding a client leaf — since 2026-10-21 they are
+  not) is a margin, not a measured depth: the stack
   probe does not drive the server yet. The client Certificate and CertificateVerify steps run
   unburned: they touch no secret.
 - `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);

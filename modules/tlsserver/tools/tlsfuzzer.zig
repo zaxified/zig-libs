@@ -108,7 +108,9 @@ fn connectionThread(l: *const Listener, stream: net.Stream) void {
     var rbuf: [record.max_record_len]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, wbuf);
+    var peer: [server_mod.peerBufferLen(tlsserver.clientauth.default_max_leaf_len)]u8 = undefined;
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
+    c.server.setPeerBuffer(&peer);
     defer c.deinit();
     (if (l.echo) echo(&c) else converse(&c)) catch {
         // A lingering close (as the BoGo shim's): the alert is out, and

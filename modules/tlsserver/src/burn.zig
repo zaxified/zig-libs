@@ -47,11 +47,12 @@ pub const init_burn = 1024;
 pub const record_burn = 4 * 1024;
 
 /// `Server` handshake steps (ClientHello → first flight, client Finished):
-/// their own frames hold hashes, the kex output and finished keys, and the
-/// ticket plaintexts (up to 4.7 KiB each with a client leaf: the PSK
-/// selection's scratch, the issuing buffer); kex, signing and HKDF below
-/// them burn their own. A margin, not yet measured (*Open* in SPEC.md: the
-/// stack probe does not cover the server yet).
+/// their own frames hold hashes, the kex output and finished keys, and,
+/// without client authentication, a ticket plaintext (0.6 KiB; with it the
+/// plaintext lies in the caller's peer buffer, wiped in place); kex, signing
+/// and HKDF below them burn their own. A margin, not yet measured (*Open*
+/// in SPEC.md: the stack probe does not cover the server yet) — sized when
+/// the plaintexts were 4.7 KiB stack arrays, so likely loose now.
 pub const handshake_burn = 32 * 1024;
 
 /// `keys.CertKeyPair.fromPem`: the PEM and DER walk, the Ed25519 seed

@@ -61,9 +61,10 @@ pub const VerifyError = error{
 /// `bad_certificate`.
 pub const max_chain_len = 16;
 
-/// The longest client leaf the server keeps (for `Server.peerCertificate`
-/// and the session tickets); a longer leaf is `bad_certificate`.
-pub const max_leaf_len = 4096;
+/// `ClientAuth.max_leaf_len`'s default: the longest client leaf the server
+/// keeps (for `Server.peerCertificate` and the session tickets); a longer
+/// leaf is `bad_certificate`. An ML-DSA-65/87 leaf (5.5-7.5 KB) needs more.
+pub const default_max_leaf_len = 4096;
 
 /// Checks a client's chain. `chain` is DER, leaf first, never empty, valid
 /// only during the call; `now_s` is the `ClientAuth.clock`'s time in
@@ -233,11 +234,12 @@ pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
 /// must assert `digitalSignature` to sign a CertificateVerify
 /// (`unsupported_certificate` otherwise; BoringSSL `ssl_cert_check_key_usage`
 /// checks it in the TLS layer whatever the verifier). Read from a copy
-/// `x509.safe` vetted: std's DER walk is not safe on hostile input.
-pub fn checkLeafKeyUsage(der: []const u8) VerifyError!void {
-    if (der.len > max_leaf_len) return error.BadCertificate;
-    var scratch: [max_leaf_len + x509.safe.parse_slack]u8 = undefined;
-    const cert = x509.safe.safeCertificate(der, &scratch) catch return error.BadCertificate;
+/// `x509.safe` vetted: std's DER walk is not safe on hostile input. The
+/// copy is made into `scratch` (at least `der.len + x509.safe.parse_slack`
+/// octets, else `bad_certificate`; it must not overlap `der`) and stays
+/// there: `der` at its front.
+pub fn checkLeafKeyUsage(der: []const u8, scratch: []u8) VerifyError!void {
+    const cert = x509.safe.safeCertificateOpts(der, scratch, .{ .max_len = x509.safe.max_pq_certificate_len }) catch return error.BadCertificate;
     const exts = (x509.extensions.findExtensions(cert) catch return error.BadCertificate) orelse return;
     var it = x509.extensions.iterate(exts, cert);
     while (it.next() catch return error.BadCertificate) |e| {
@@ -339,11 +341,14 @@ test "leafPublicKey: the test certificates" {
 test "checkLeafKeyUsage: digitalSignature or no keyUsage at all" {
     const certs = @import("test_certs.zig");
     const client_certs = @import("client_certs.zig");
-    try checkLeafKeyUsage(&client_certs.p256_cert); // digitalSignature
-    try checkLeafKeyUsage(&certs.p256_cert); // no keyUsage
+    var scratch: [4096 + x509.safe.parse_slack]u8 = undefined;
+    try checkLeafKeyUsage(&client_certs.p256_cert, &scratch); // digitalSignature
+    try testing.expectEqualSlices(u8, &client_certs.p256_cert, scratch[0..client_certs.p256_cert.len]);
+    try checkLeafKeyUsage(&certs.p256_cert, &scratch); // no keyUsage
     // The CA's keyUsage is keyCertSign + cRLSign only.
-    try testing.expectError(error.UnsupportedCertificate, checkLeafKeyUsage(&client_certs.ca_cert));
-    try testing.expectError(error.BadCertificate, checkLeafKeyUsage("GARBAGE"));
+    try testing.expectError(error.UnsupportedCertificate, checkLeafKeyUsage(&client_certs.ca_cert, &scratch));
+    try testing.expectError(error.BadCertificate, checkLeafKeyUsage("GARBAGE", &scratch));
+    try testing.expectError(error.BadCertificate, checkLeafKeyUsage(&certs.p256_cert, scratch[0 .. certs.p256_cert.len + x509.safe.parse_slack - 1]));
 }
 
 test "leafPublicKey: P-521 and ML-DSA leaves give their own key kinds" {

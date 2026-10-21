@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M4 step 2, the client leaf's cap per configuration. **BREAKING**
+  `clientauth.max_leaf_len` → `ClientAuth.max_leaf_len` (default
+  `clientauth.default_max_leaf_len`, 4096), and the leaf lives in a buffer the caller gives
+  each `Server`: `Server.setPeerBuffer(buf)`, `server.peerBufferLen(max_leaf_len)` octets
+  (`Connection`: `conn.server.setPeerBuffer`); under `client_auth` a missing or short one is
+  `internal_error` at the ClientHello. `Server` loses its inline 4 KiB `peer_buf`; tickets are
+  built and opened around the leaf in that buffer and sealed straight into the output (no
+  ticket-sized stack arrays). `clientauth.checkLeafKeyUsage(der, scratch)` copies into
+  `scratch` (the peer buffer). Asked for by qap (`Tls.max_client_cert_bytes` up to 16384).
+  BoGo `Server-Verify-ML-DSA-65/87` and `Server-InvalidSignature-ML-DSA-65/87` re-enabled.
 - **2026-10-21** — **Fix (HIGH, in pushed code):** `hello.Opaque8Iter` computed `1 + n` in u8 —
   a 255-octet ALPN name or PSK binder panicked in safe builds and looped forever in ReleaseFast
   (remote DoS on a server with ALPN or tickets). The `tlsserver-hello` harness drew names of

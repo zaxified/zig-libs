@@ -270,6 +270,14 @@ pub const ClientAuth = struct {
     authorities: []const []const u8 = &.{},
     /// The verifier's time.
     clock: Clock,
+    /// The longest client leaf taken (`bad_certificate` past it). Each
+    /// `Server` keeps the leaf in a buffer of `peerBufferLen(max_leaf_len)`
+    /// octets its caller gives it (`Server.setPeerBuffer`; a smaller one, or
+    /// none, is `InternalError` at the ClientHello), so a larger cap costs
+    /// only the connections of this configuration. ML-DSA-65/87 leaves are
+    /// 5.5-7.5 KB. Past about 64 KB less 0.6 KB the tickets no longer fit
+    /// their 16-bit length: none is issued.
+    max_leaf_len: u16 = clientauth.default_max_leaf_len,
 };
 
 /// rustls's (ring provider) `supported_verify_schemes`: ECDSA P-384 and
@@ -277,7 +285,7 @@ pub const ClientAuth = struct {
 /// never a TLS 1.3 CertificateVerify.
 /// P-521 (0x0603) and ML-DSA (0x0904-0x0906) client keys verify too, but
 /// only when listed in `ClientAuth.schemes` (rustls's default leaves them
-/// out as well; an ML-DSA-65/87 leaf is also over `clientauth.max_leaf_len`).
+/// out as well; an ML-DSA-65/87 leaf also needs a larger `max_leaf_len`).
 pub const default_client_auth_schemes = [_]u16{ 0x0503, 0x0403, 0x0807, 0x0806, 0x0805, 0x0804, 0x0601, 0x0501, 0x0401 };
 
 /// Session tickets (RFC 8446 §4.6.1).
@@ -308,7 +316,8 @@ pub const Ticketer = struct {
     /// no room).
     seal: *const fn (ctx: *const anyopaque, plaintext: []const u8, nonce: [12]u8, out: []u8) ?[]u8,
     /// Open a blob this server sealed under a key still accepted at `now_s`
-    /// into `out`; null for anything else.
+    /// into `out`, returning a prefix of `out` (the server wipes the secret
+    /// there by its position); null for anything else.
     open: *const fn (ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8,
 };
 
@@ -345,12 +354,32 @@ pub fn StekTicketer(comptime Ring: type) type {
     };
 }
 
-/// The longest ticket plaintext: the `SessionState` prefix with a SHA-384
-/// secret and a 1-octet nonce, then this server's fields (`TicketFields`).
-const max_ticket_plaintext = tlsresume.select.SessionState(48).wireLen(1) + TicketFields.max_len;
+/// A ticket's plaintext is built around the client's leaf where it lies in
+/// the peer buffer (`Server.setPeerBuffer`), and opened there: the
+/// `SessionState` prefix (a SHA-384 secret, a 1-octet nonce) and the
+/// `TicketFields` before the leaf end at `ticket_head_len`, the fields after
+/// it follow it.
+const ticket_head_len = tlsresume.select.SessionState(48).wireLen(1) + TicketFields.head_max;
 
-/// The ticket blob a `Ticketer` may return (a `StekRing`'s adds 29 octets).
-const max_ticket_len = max_ticket_plaintext + 128;
+/// Room after the leaf: the ticket's last fields, and `x509.safe`'s
+/// zero padding behind the copy `clientauth.checkLeafKeyUsage` reads.
+const leaf_tail_room = @max(TicketFields.tail_len, x509_parse_slack);
+const x509_parse_slack = @import("x509").safe.parse_slack;
+
+/// What a `Ticketer` may add to the plaintext (a `StekRing` adds 29).
+const ticket_seal_overhead = 128;
+
+/// The peer buffer a `Server` needs under a `ClientAuth.max_leaf_len` of
+/// `max_leaf_len` (`Server.setPeerBuffer`).
+pub fn peerBufferLen(max_leaf_len: u16) usize {
+    return ticket_head_len + @as(usize, max_leaf_len) + leaf_tail_room;
+}
+
+/// The longest ticket blob this configuration issues.
+fn maxTicketLen(cfg: *const Config) usize {
+    const leaf: usize = if (cfg.client_auth) |ca| ca.max_leaf_len else 0;
+    return @min(ticket_head_len + leaf + TicketFields.tail_len + ticket_seal_overhead, std.math.maxInt(u16));
+}
 
 /// PSK identities looked at in one ClientHello; later ones are ignored.
 const max_psk_identities = 32;
@@ -371,30 +400,39 @@ const TicketFields = struct {
     suite: u16,
 
     const format: u8 = 2;
-    const max_len = 1 + 1 + 255 + 1 + 255 + 2 + clientauth.max_leaf_len + 2 + 8 + 2;
+    /// The longest run before the leaf, and the run after it.
+    const head_max = 1 + 1 + 255 + 1 + 255 + 2;
+    const tail_len = 2 + 8 + 2;
 
-    fn write(f: TicketFields, out: []u8) usize {
-        var n: usize = 0;
-        out[n] = format;
+    /// Writes the fields around a leaf that is already at `buf[leaf_at..]`
+    /// (`f.peer`, if any, is that very slice): the run before it ends at
+    /// `leaf_at` (which must leave `head_max` octets), the run after it
+    /// follows it. Returns the fields' extent in `buf`.
+    fn writeAround(f: TicketFields, buf: []u8, leaf_at: usize) []u8 {
+        const p = f.peer orelse "";
+        if (f.peer) |leaf| std.debug.assert(leaf.ptr == buf[leaf_at..].ptr);
+        const sni = f.sni orelse "";
+        const alpn = f.alpn orelse "";
+        const start = leaf_at - (1 + 1 + sni.len + 1 + alpn.len + 2);
+        var n = start;
+        buf[n] = format;
         n += 1;
-        for ([_]?[]const u8{ f.sni, f.alpn }) |v| {
-            const b = v orelse "";
-            out[n] = @intCast(b.len);
-            @memcpy(out[n + 1 ..][0..b.len], b);
+        for ([_][]const u8{ sni, alpn }) |b| {
+            buf[n] = @intCast(b.len);
+            @memcpy(buf[n + 1 ..][0..b.len], b);
             n += 1 + b.len;
         }
-        const p = f.peer orelse "";
-        std.mem.writeInt(u16, out[n..][0..2], @intCast(p.len), .big);
-        @memcpy(out[n + 2 ..][0..p.len], p);
+        std.mem.writeInt(u16, buf[n..][0..2], @intCast(p.len), .big);
         n += 2 + p.len;
-        std.mem.writeInt(u16, out[n..][0..2], f.peer_scheme, .big);
-        std.mem.writeInt(i64, out[n + 2 ..][0..8], f.peer_auth_ms, .big);
-        std.mem.writeInt(u16, out[n + 10 ..][0..2], f.suite, .big);
-        return n + 12;
+        std.mem.writeInt(u16, buf[n..][0..2], f.peer_scheme, .big);
+        std.mem.writeInt(i64, buf[n + 2 ..][0..8], f.peer_auth_ms, .big);
+        std.mem.writeInt(u16, buf[n + 10 ..][0..2], f.suite, .big);
+        return buf[start .. n + tail_len];
     }
 
-    /// Null for anything this server did not write (another format).
-    fn parse(tail: []const u8) ?TicketFields {
+    /// Null for anything this server did not write (another format), or
+    /// with a leaf over `max_peer` octets.
+    fn parse(tail: []const u8, max_peer: usize) ?TicketFields {
         if (tail.len < 7 or tail[0] != format) return null;
         var at: usize = 1;
         var v: [2]?[]const u8 = undefined;
@@ -408,7 +446,7 @@ const TicketFields = struct {
         if (tail.len - at < 2) return null;
         const n: usize = std.mem.readInt(u16, tail[at..][0..2], .big);
         at += 2;
-        if (tail.len - at < n or n > clientauth.max_leaf_len) return null;
+        if (tail.len - at < n or n > max_peer) return null;
         const peer: ?[]const u8 = if (n == 0) null else tail[at..][0..n];
         at += n;
         if (tail.len - at != 12) return null;
@@ -436,6 +474,9 @@ const Resumable = struct {
     lifetime_ms: i64,
     now_ms: i64 = 0,
     need_peer: bool = false,
+    /// The longest leaf a ticket may carry (this connection's cap; 0
+    /// without client authentication).
+    max_peer: usize = 0,
     /// Out: the client certificate of the last ticket accepted (the one
     /// `selectPsk` took, if it took one), a slice of its scratch, and the
     /// scheme it signed with.
@@ -444,7 +485,7 @@ const Resumable = struct {
     peer_auth_ms: i64 = 0,
 
     fn accepts(w: *Resumable, tail: []const u8, age_ms: i64) bool {
-        const f = TicketFields.parse(tail) orelse return false;
+        const f = TicketFields.parse(tail, w.max_peer) orelse return false;
         if (f.suite != w.suite or !Server.optEql(f.sni, w.sni) or age_ms > w.lifetime_ms) return false;
         if (w.need_peer and f.peer == null) return false;
         if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms - f.peer_auth_ms > w.lifetime_ms)) return false;
@@ -571,7 +612,7 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
     const frag: usize = fragmentLen(cfg);
     var tickets: usize = 0;
     if (cfg.tickets) |tk| {
-        const one = 4 + 4 + 4 + 1 + 1 + 2 + max_ticket_len + 2 + 4;
+        const one = 4 + 4 + 4 + 1 + 1 + 2 + maxTicketLen(cfg) + 2 + 4;
         tickets = tk.count * one;
         tickets += (tickets / frag + 1) * (record.header_len + 1 + record.tag_len);
     }
@@ -688,17 +729,18 @@ pub const Server = struct {
     /// On a resumption: the client's reported ticket age less the server's,
     /// in whole seconds (BoringSSL `SSL_get_ticket_age_skew`).
     age_skew_s: i64 = 0,
-    /// The client's certificate (DER leaf), `peer_len` octets: from its
-    /// Certificate, or from the ticket resumed.
-    peer_buf: [clientauth.max_leaf_len]u8 = undefined,
+    /// The caller's (`setPeerBuffer`): the client's certificate (DER leaf),
+    /// `peer_len` octets at `ticket_head_len`, from its Certificate or the
+    /// ticket resumed; the tickets are sealed and opened around it.
+    peer_buf: []u8 = &.{},
     peer_len: u16 = 0,
-    /// The client proved it holds the key of `peer_buf` (its
+    /// The client proved it holds the key of the leaf (its
     /// CertificateVerify verified, or the ticket was issued after one).
     peer_authenticated: bool = false,
     /// The scheme of the client's CertificateVerify (0: none), from the
     /// ticket on a resumption.
     peer_scheme: u16 = 0,
-    /// When the client proved `peer_buf` (`TicketFields.peer_auth_ms`).
+    /// When the client proved the leaf (`TicketFields.peer_auth_ms`).
     peer_auth_ms: i64 = 0,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
@@ -710,6 +752,21 @@ pub const Server = struct {
             .inbound = .init(joiner_buf),
             .out = out,
         };
+    }
+
+    /// With `Config.client_auth`: the buffer the client's leaf is kept in,
+    /// at least `peerBufferLen(ClientAuth.max_leaf_len)` octets, owned by the
+    /// caller until `deinit` (like the joiner's). Set before the first
+    /// `feed`. Tickets are sealed and opened in it; their secrets are wiped
+    /// as soon as that is done, the leaf (not a secret) stays — also after
+    /// `deinit`: a pooled buffer holds the last client's certificate.
+    pub fn setPeerBuffer(self: *Server, buf: []u8) void {
+        std.debug.assert(self.state == .client_hello);
+        self.peer_buf = buf;
+    }
+
+    fn peerLeaf(self: *const Server) []u8 {
+        return self.peer_buf[ticket_head_len..][0..self.peer_len];
     }
 
     /// Wipe every secret and both buffers.
@@ -780,7 +837,7 @@ pub const Server = struct {
     /// key; null without client authentication. On a resumption, the one
     /// of the handshake that issued the ticket. Valid while `self` is.
     pub fn peerCertificate(self: *const Server) ?[]const u8 {
-        return if (self.peer_authenticated) self.peer_buf[0..self.peer_len] else null;
+        return if (self.peer_authenticated) self.peerLeaf() else null;
     }
 
     /// The signature scheme of the client's CertificateVerify (null: no
@@ -1085,6 +1142,7 @@ pub const Server = struct {
             .select => |s| s.select(s.ctx, sni, &ch) orelse return error.AccessDenied,
         };
         ck.check() catch return error.InternalError;
+        if (cfg.client_auth) |ca| if (self.peer_buf.len < peerBufferLen(ca.max_leaf_len)) return error.InternalError;
         const scheme = chooseScheme(ck, &sig_algs) orelse return error.HandshakeFailure;
 
         var suite: record.CipherSuite = chooseSuite(cfg, &ch) orelse return error.HandshakeFailure;
@@ -1235,13 +1293,18 @@ pub const Server = struct {
             .lifetime_ms = @as(i64, @min(tk.lifetime_s, max_ticket_lifetime_s)) * 1000,
             .now_ms = now_ms,
             .need_peer = if (self.config.client_auth) |ca| ca.mandatory else false,
+            .max_peer = if (self.config.client_auth) |ca| ca.max_leaf_len else 0,
         };
         const ring: TicketerRing = .{ .t = tk.ticketer };
-        var scratch: [max_ticket_plaintext]u8 = undefined;
-        defer zeroize(&scratch);
+        // Opened in the peer buffer (no leaf there yet): the taken ticket's
+        // leaf is then moved to its place. Every ticket's secret lies before
+        // `ticket_head_len`.
+        var no_peer: [ticket_head_len + TicketFields.tail_len]u8 = undefined;
+        const scratch: []u8 = if (self.peer_buf.len >= no_peer.len) self.peer_buf else &no_peer;
+        defer zeroize(scratch[0..ticket_head_len]);
         var sel: tlsresume.select.Selection(L) = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
-        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, &scratch) catch |err| return switch (err) {
+        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, scratch) catch |err| return switch (err) {
             error.NoAcceptableIdentity => null,
             error.BinderMismatch => error.DecryptError,
         };
@@ -1252,7 +1315,9 @@ pub const Server = struct {
         // last opened the taken ticket into). Kept even if the psk modes
         // then refuse the resumption: `peer_authenticated` decides.
         if (want.peer) |p| {
-            @memcpy(self.peer_buf[0..p.len], p);
+            // `parse` bounded it by the cap, which the buffer holds.
+            const dst = self.peer_buf[ticket_head_len..][0..p.len];
+            if (@intFromPtr(dst.ptr) > @intFromPtr(p.ptr)) std.mem.copyBackwards(u8, dst, p) else std.mem.copyForwards(u8, dst, p);
             self.peer_len = @intCast(p.len);
             self.peer_scheme = want.peer_scheme;
             self.peer_auth_ms = want.peer_auth_ms;
@@ -1516,14 +1581,14 @@ pub const Server = struct {
             if (n == chain.len) return error.BadCertificate;
             chain[n] = der;
         }
-        if (chain[0].len > clientauth.max_leaf_len) return error.BadCertificate;
+        if (chain[0].len > ca.max_leaf_len) return error.BadCertificate;
         // The leaf must be able to sign the CertificateVerify, whatever
-        // the verifier says (BoringSSL checks both here, before it).
+        // the verifier says (BoringSSL checks both here, before it). The
+        // keyUsage check copies it to its place in the peer buffer.
         _ = try clientauth.leafPublicKey(chain[0]);
-        try clientauth.checkLeafKeyUsage(chain[0]);
+        try clientauth.checkLeafKeyUsage(chain[0], self.peer_buf[ticket_head_len..]);
         const now_s = @divFloor(ca.clock.now_ms(ca.clock.ctx), 1000);
         try ca.verifier.verify(ca.verifier.ctx, chain[0..n], now_s);
-        @memcpy(self.peer_buf[0..chain[0].len], chain[0]);
         self.peer_len = @intCast(chain[0].len);
         self.appendTranscript(m);
         self.state = .client_certificate_verify;
@@ -1536,7 +1601,7 @@ pub const Server = struct {
         const cv = clientauth.parseCertificateVerify(m.body) catch return error.DecodeError;
         // rustls `SignedHandshakeWithUnadvertisedSigScheme`.
         if (std.mem.indexOfScalar(u16, ca.schemes, cv.scheme) == null) return error.IllegalParameter;
-        const key = try clientauth.leafPublicKey(self.peer_buf[0..self.peer_len]);
+        const key = try clientauth.leafPublicKey(self.peerLeaf());
         const scheme: certverify.SignatureScheme = @fromBackingInt(cv.scheme);
         var th_buf: [48]u8 = undefined;
         const th: []const u8 = switch (self.transcript) {
@@ -1619,35 +1684,48 @@ pub const Server = struct {
         };
         defer std.crypto.secureZero(u8, &state.resumption_master_secret);
         ks.deriveResumptionMasterSecret(H.Hkdf, &state.resumption_master_secret, self.master_secret[0..L], th);
-        var plain: [max_ticket_plaintext]u8 = undefined;
-        defer zeroize(&plain);
-        var blob: [max_ticket_len]u8 = undefined;
+        // The plaintext is built around the leaf in the peer buffer; the
+        // blob is sealed straight into its place in the output.
+        var no_peer: [ticket_head_len + TicketFields.tail_len]u8 = undefined;
+        const buf: []u8 = if (self.peer_buf.len >= no_peer.len) self.peer_buf else &no_peer;
+        defer zeroize(buf[0..ticket_head_len]);
         const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .peer = self.peerCertificate(), .peer_scheme = self.peerSignatureScheme() orelse 0, .peer_auth_ms = self.peer_auth_ms, .suite = @backingInt(self.suite) };
+        const prefix_len = Session.wireLen(1);
         const slot = self.out.slot();
         var used: usize = 0;
         for (0..self.tickets_due) |i| {
             const nonce = [1]u8{@intCast(i)};
             state.ticket_nonce = &nonce;
             state.ticket_age_add = self.config.random.int(u32);
-            const prefix = state.serialize(&plain) catch unreachable; // sized for it
-            const n = prefix.len + fields.write(plain[prefix.len..]);
+            const after = fields.writeAround(buf, ticket_head_len);
+            const start = after.ptr - buf.ptr - prefix_len;
+            _ = state.serialize(buf[start..][0..prefix_len]) catch unreachable; // sized for it
+            const plain = buf[start .. start + prefix_len + after.len];
             var aead_nonce: [12]u8 = undefined;
             self.config.random.bytes(&aead_nonce);
-            const ticket = tk.ticketer.seal(tk.ticketer.ctx, plain[0..n], aead_nonce, &blob) orelse break;
-            if (ticket.len == 0 or ticket.len > max_ticket_len) break;
+            // NewSessionTicket (RFC 8446 §4.6.1): type, length, lifetime,
+            // age_add, nonce<1>, ticket<2>, then one empty GREASE extension.
+            const head = 4 + 4 + 4 + 1 + nonce.len + 2;
+            const ext = 2 + 4;
+            if (slot.len - used < head + 1 + ext) break;
+            const room = slot[used + head ..][0..@min(slot.len - used - head - ext, std.math.maxInt(u16))];
+            const ticket = tk.ticketer.seal(tk.ticketer.ctx, plain, aead_nonce, room) orelse break;
+            if (ticket.len == 0 or ticket.len > room.len) break;
+            if (ticket.ptr != room.ptr) std.mem.copyForwards(u8, room[0..ticket.len], ticket);
+            const m = slot[used..][0 .. head + ticket.len + ext];
+            m[0] = @backingInt(messages.HandshakeType.new_session_ticket);
+            std.mem.writeInt(u24, m[1..4], @intCast(m.len - 4), .big);
+            std.mem.writeInt(u32, m[4..8], @min(tk.lifetime_s, max_ticket_lifetime_s), .big);
+            std.mem.writeInt(u32, m[8..12], state.ticket_age_add, .big);
+            m[12] = nonce.len;
+            m[13] = nonce[0];
+            std.mem.writeInt(u16, m[14..16], @intCast(ticket.len), .big);
             const g: u16 = self.config.random.int(u4);
-            const grease = [_]tlsresume.ticket.Extension{.{ .ext_type = (g << 12) | (g << 4) | 0x0a0a, .data = "" }};
-            if (slot.len - used < 4) break;
-            const body = (tlsresume.ticket.NewSessionTicket{
-                .ticket_lifetime = @min(tk.lifetime_s, max_ticket_lifetime_s),
-                .ticket_age_add = state.ticket_age_add,
-                .ticket_nonce = &nonce,
-                .ticket = ticket,
-                .extensions = &grease,
-            }).encode(slot[used + 4 ..]) catch break;
-            slot[used] = @backingInt(messages.HandshakeType.new_session_ticket);
-            std.mem.writeInt(u24, slot[used + 1 ..][0..3], @intCast(body.len), .big);
-            used += 4 + body.len;
+            const e = m[head + ticket.len ..];
+            std.mem.writeInt(u16, e[0..2], 4, .big);
+            std.mem.writeInt(u16, e[2..4], (g << 12) | (g << 4) | 0x0a0a, .big);
+            std.mem.writeInt(u16, e[4..6], 0, .big);
+            used += m.len;
         }
         // `slot` leaves room for the records' overhead.
         if (used != 0) self.out.commit(.handshake, used) catch unreachable;
@@ -2708,37 +2786,48 @@ test "a full output still takes the fatal alert, or close_notify" {
     }
 }
 
+/// `f` written as `issueTickets` does: its peer copied to its place first.
+fn testTicketFields(buf: []u8, f: TicketFields) []u8 {
+    var g = f;
+    if (f.peer) |p| {
+        @memcpy(buf[TicketFields.head_max..][0..p.len], p);
+        g.peer = buf[TicketFields.head_max..][0..p.len];
+    }
+    return g.writeAround(buf, TicketFields.head_max);
+}
+
 test "ticket fields: round trip, and what a ClientHello may resume" {
-    var buf: [TicketFields.max_len]u8 = undefined;
+    const cap = 8192;
+    var buf: [TicketFields.head_max + cap + 1 + TicketFields.tail_len]u8 = undefined;
     const long_alpn: [255]u8 = @splat('a');
     const long_sni: [253]u8 = @splat('b');
-    const long_peer: [clientauth.max_leaf_len]u8 = @splat('c');
+    const long_peer: [cap]u8 = @splat('c');
     for ([_]TicketFields{
         .{ .sni = "example.com", .alpn = "h2", .peer = null, .suite = 0x1302 },
         .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0804, .suite = 0x1301 },
         .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .suite = 0x1303 },
     }) |f| {
-        const n = f.write(&buf);
-        const back = TicketFields.parse(buf[0..n]).?;
+        const w = testTicketFields(&buf, f);
+        const n = w.len;
+        const back = TicketFields.parse(w, cap).?;
         try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and
             Server.optEql(f.peer, back.peer) and f.peer_scheme == back.peer_scheme and f.suite == back.suite);
         // Every truncation, an extra octet and another format are refused.
-        for (0..n) |cut| try testing.expect(TicketFields.parse(buf[0..cut]) == null);
-        if (n < buf.len) {
-            buf[n] = 0;
-            try testing.expect(TicketFields.parse(buf[0 .. n + 1]) == null);
+        for (0..n) |cut| try testing.expect(TicketFields.parse(w[0..cut], cap) == null);
+        const start = w.ptr - &buf;
+        if (start + n < buf.len) {
+            buf[start + n] = 0;
+            try testing.expect(TicketFields.parse(buf[start..][0 .. n + 1], cap) == null);
         }
-        buf[0] ^= 1;
-        try testing.expect(TicketFields.parse(buf[0..n]) == null);
+        w[0] ^= 1;
+        try testing.expect(TicketFields.parse(w, cap) == null);
     }
-    // A peer longer than the cap is not this server's (its octets there).
-    var over: [TicketFields.max_len + 1]u8 = undefined;
-    const too_long: [clientauth.max_leaf_len + 1]u8 = @splat('d');
-    const no = (TicketFields{ .sni = null, .alpn = null, .peer = &too_long, .suite = 0x1301 }).write(&over);
-    try testing.expect(TicketFields.parse(over[0..no]) == null);
+    // A peer longer than the cap is not this server's.
+    const too_long: [cap + 1]u8 = @splat('d');
+    try testing.expect(TicketFields.parse(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = &too_long, .suite = 0x1301 }), cap) == null);
+    try testing.expect(TicketFields.parse(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .suite = 0x1301 }), 3) == null);
 
-    const n = (TicketFields{ .sni = "example.com", .alpn = null, .peer = null, .suite = 0x1301 }).write(&buf);
-    const tail = buf[0..n];
+    const tail = testTicketFields(&buf, .{ .sni = "example.com", .alpn = null, .peer = null, .suite = 0x1301 });
     var want: Resumable = .{ .suite = 0x1301, .sni = "example.com", .lifetime_ms = 1000 };
     try testing.expect(want.accepts(tail, 0));
     try testing.expect(want.accepts(tail, 1000));
@@ -2751,29 +2840,33 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     try testing.expect(!other.accepts(tail, 0));
     other.sni = null;
     try testing.expect(!other.accepts(tail, 0));
-    const n2 = (TicketFields{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 }).write(&buf);
-    try testing.expect(other.accepts(buf[0..n2], 0));
-    try testing.expect(!want.accepts(buf[0..n2], 0));
+    const t2 = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 });
+    try testing.expect(other.accepts(t2, 0));
+    try testing.expect(!want.accepts(t2, 0));
 
     // A mandatory client certificate: only a ticket that carries one, which
     // is handed out.
-    var need: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000, .need_peer = true };
-    try testing.expect(!need.accepts(buf[0..n2], 0));
+    var need: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000, .need_peer = true, .max_peer = cap };
+    try testing.expect(!need.accepts(t2, 0));
     try testing.expectEqual(null, need.peer);
-    const n3 = (TicketFields{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0807, .suite = 0x1301 }).write(&buf);
-    try testing.expect(need.accepts(buf[0..n3], 0));
+    const t3 = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0807, .suite = 0x1301 });
+    try testing.expect(need.accepts(t3, 0));
     try testing.expectEqualStrings("LEAF", need.peer.?);
     try testing.expectEqual(@as(u16, 0x0807), need.peer_scheme);
     // The certificate is good for the lifetime from its proof, whatever
     // the ticket's own age (a re-issued ticket is young).
-    const n4 = (TicketFields{ .sni = null, .alpn = null, .peer = "LEAF", .peer_auth_ms = 5_000, .suite = 0x1301 }).write(&buf);
+    const t4 = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_auth_ms = 5_000, .suite = 0x1301 });
     need.now_ms = 6_000;
-    try testing.expect(need.accepts(buf[0..n4], 0));
+    try testing.expect(need.accepts(t4, 0));
     try testing.expectEqual(@as(i64, 5_000), need.peer_auth_ms);
     need.now_ms = 6_001;
-    try testing.expect(!need.accepts(buf[0..n4], 0));
+    try testing.expect(!need.accepts(t4, 0));
     need.now_ms = 4_999; // proved in the future
-    try testing.expect(!need.accepts(buf[0..n4], 0));
+    try testing.expect(!need.accepts(t4, 0));
+    // Without client authentication (no cap) a ticket with a leaf is not resumed.
+    var anon: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000 };
+    try testing.expect(!anon.accepts(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .suite = 0x1301 }), 0));
+    try testing.expect(anon.accepts(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 }), 0));
 }
 
 test "tickets only for a client that offers psk_dhe_ke (rustls)" {
@@ -2834,9 +2927,10 @@ fn handshakeMessage(raw: []const u8) inbound.HandshakeMessage {
 
 /// A server white-box at the client's second flight of RFC 8448 §6: the
 /// transcript through the server's Finished.
-fn rfc8448S6Server(cfg: *const Config, joiner: []u8, out: []u8) Server {
+fn rfc8448S6Server(cfg: *const Config, joiner: []u8, out: []u8, peer: []u8) Server {
     const kat = @import("message_kat_vectors.zig");
     var s: Server = .init(cfg, joiner, out);
+    s.setPeerBuffer(peer);
     s.suite = .aes_128_gcm_sha256;
     s.has_suite = true;
     s.startTranscript(.aes_128_gcm_sha256);
@@ -2856,11 +2950,12 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
     const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
     var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
     var out: [4096]u8 = undefined;
+    var peer: [peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     // The leaf: certificate_list at 4 + 1 + 3, its cert_data length first.
     const cert_msg = &kat.rfc8448_s6_client_certificate;
     const leaf = cert_msg[11..][0..std.mem.readInt(u24, cert_msg[8..11], .big)];
     {
-        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
         try testing.expect(!try s.onHandshake(handshakeMessage(cert_msg)));
         try testing.expectEqual(null, s.peerCertificate()); // not before its CertificateVerify
         try testing.expect(!try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_certificate_verify)));
@@ -2876,7 +2971,7 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
     {
         var cv = kat.rfc8448_s6_client_certificate_verify;
         cv[cv.len - 1] ^= 1;
-        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
         _ = try s.onHandshake(handshakeMessage(cert_msg));
         try testing.expectError(error.DecryptError, s.onHandshake(handshakeMessage(&cv)));
     }
@@ -2886,7 +2981,7 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
         auth.schemes = c[0];
         var cv = kat.rfc8448_s6_client_certificate_verify;
         std.mem.writeInt(u16, cv[4..6], c[1], .big);
-        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
         _ = try s.onHandshake(handshakeMessage(cert_msg));
         try testing.expectError(error.IllegalParameter, s.onHandshake(handshakeMessage(&cv)));
     }
@@ -2905,14 +3000,78 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
         @memcpy(msg[11..][0..ca.len], ca);
         msg[msg.len - 2] = 0;
         msg[msg.len - 1] = 0;
-        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
         try testing.expectError(error.UnsupportedCertificate, s.onHandshake(handshakeMessage(&msg)));
         try testing.expectEqual(alert.Description.unsupported_certificate, alertFor(error.UnsupportedCertificate).?);
     }
     // Out of order: a Finished where the Certificate belongs.
     {
-        var s = rfc8448S6Server(&cfg, &joiner, &out);
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
         try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
+    }
+}
+
+test "an ML-DSA-65 client leaf: over the default cap, taken under a larger ClientAuth.max_leaf_len" {
+    const gpa = testing.allocator;
+    const v = @import("root.zig").testKeyVector("mldsa65-seed");
+    var pair: @import("keys.zig").CertKeyPair = undefined;
+    try pair.fromPem(gpa, v.cert_pem, v.key_pem);
+    defer pair.deinit(gpa);
+    const ck = pair.certifiedKey();
+    const leaf = ck.chain[0];
+    try testing.expect(leaf.len > clientauth.default_max_leaf_len);
+    const msg = try gpa.alloc(u8, 4 + 1 + 3 + 3 + leaf.len + 2);
+    defer gpa.free(msg);
+    msg[0] = 11;
+    std.mem.writeInt(u24, msg[1..4], @intCast(msg.len - 4), .big);
+    msg[4] = 0;
+    std.mem.writeInt(u24, msg[5..8], @intCast(3 + leaf.len + 2), .big);
+    std.mem.writeInt(u24, msg[8..11], @intCast(leaf.len), .big);
+    @memcpy(msg[11..][0..leaf.len], leaf);
+    @memset(msg[msg.len - 2 ..], 0);
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock }, .schemes = &.{0x0905} };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    const peer = try gpa.alloc(u8, peerBufferLen(8192));
+    defer gpa.free(peer);
+    {
+        var s = rfc8448S6Server(&cfg, &joiner, &out, peer);
+        try testing.expectError(error.BadCertificate, s.onHandshake(handshakeMessage(msg)));
+    }
+    auth.max_leaf_len = 8192;
+    var s = rfc8448S6Server(&cfg, &joiner, &out, peer);
+    try testing.expect(!try s.onHandshake(handshakeMessage(msg)));
+    const th = s.transcript.sha256.currentHash();
+    var cv: [4 + 4 + certverify.max_signature_len]u8 = undefined;
+    const sig = try certverify.sign(.mldsa65, ck.key, .client, &th, prng.random(), cv[8..]);
+    cv[0] = 15;
+    std.mem.writeInt(u24, cv[1..4], @intCast(4 + sig.len), .big);
+    std.mem.writeInt(u16, cv[4..6], 0x0905, .big);
+    std.mem.writeInt(u16, cv[6..8], @intCast(sig.len), .big);
+    try testing.expect(!try s.onHandshake(handshakeMessage(cv[0 .. 8 + sig.len])));
+    try testing.expectEqualSlices(u8, leaf, s.peerCertificate().?);
+    try testing.expectEqual(@as(?u16, 0x0905), s.peerSignatureScheme());
+}
+
+test "client authentication without a large enough peer buffer: internal_error at the ClientHello" {
+    var prng = std.Random.DefaultPrng.init(4);
+    const auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock } };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [16384]u8 = undefined;
+    var peer: [peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
+    const rec = try buildRecord(testing.allocator, .{});
+    defer testing.allocator.free(rec);
+    for ([_][]u8{ &.{}, peer[0 .. peer.len - 1], &peer }) |buf| {
+        var s: Server = .init(&cfg, &joiner, &out);
+        s.setPeerBuffer(buf);
+        defer s.deinit();
+        if (buf.len == peer.len) {
+            try testing.expect((try s.feed(rec)).event == .need_more);
+        } else try testing.expectError(error.InternalError, s.feed(rec));
     }
 }
 

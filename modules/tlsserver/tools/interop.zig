@@ -377,7 +377,9 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     defer gpa.free(joiner);
     const out = try gpa.alloc(u8, tlsserver.server.minOutputLen(&cfg, &ck) + 4096);
     defer gpa.free(out);
+    var peer: [tlsserver.server.peerBufferLen(tlsserver.clientauth.default_max_leaf_len)]u8 = undefined;
     var server: Server = .init(&cfg, joiner, out);
+    server.setPeerBuffer(&peer);
     defer server.deinit();
 
     const poke: ?*std.Io.Writer = if (c.key_update and c.client == .openssl) &stdin_w.interface else null;

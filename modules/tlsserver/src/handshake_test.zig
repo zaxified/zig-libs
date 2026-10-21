@@ -174,7 +174,12 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     defer gpa.free(joiner);
     const out = try gpa.alloc(u8, server_mod.minOutputLen(&config, ck) + 64 * 1024);
     defer gpa.free(out);
+    // Without client authentication a short buffer must be ignored (tickets
+    // are then built on the stack), not written past.
+    const peer = try gpa.alloc(u8, if (srv.client_auth) |ca| server_mod.peerBufferLen(ca.max_leaf_len) else 16);
+    defer gpa.free(peer);
     var server: Server = .init(&config, joiner, out);
+    server.setPeerBuffer(peer);
     defer server.deinit();
 
     const pipe = try gpa.create(Pipe);

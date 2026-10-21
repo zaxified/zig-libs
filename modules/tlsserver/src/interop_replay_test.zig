@@ -129,6 +129,7 @@ const Harness = struct {
     out: []u8,
     sink: Sink,
     joiner: []u8,
+    peer: []u8,
     conn: Connection,
 
     fn create(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !*Harness {
@@ -188,7 +189,10 @@ const Harness = struct {
         errdefer gpa.free(h.out);
         h.sink = .init(gpa, h.out);
         h.joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        errdefer gpa.free(h.joiner);
+        h.peer = try gpa.alloc(u8, server_mod.peerBufferLen(h.client_auth.max_leaf_len));
         h.conn = .init(&h.cfg, &h.reader, &h.sink.writer, h.joiner);
+        h.conn.server.setPeerBuffer(h.peer);
         return h;
     }
 
@@ -197,6 +201,7 @@ const Harness = struct {
         h.conn.deinit();
         h.sink.deinit();
         gpa.free(h.joiner);
+        gpa.free(h.peer);
         gpa.free(h.out);
         gpa.free(h.in_buf);
         gpa.destroy(h);

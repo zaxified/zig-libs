@@ -199,6 +199,8 @@ Server-InvalidSignature-ECDSA_P384_SHA384-TLS13
 Server-InvalidSignature-ECDSA_P521_SHA512-TLS13
 Server-InvalidSignature-Ed25519-TLS13
 Server-InvalidSignature-ML-DSA-44-TLS13
+Server-InvalidSignature-ML-DSA-65-TLS13
+Server-InvalidSignature-ML-DSA-87-TLS13
 Server-InvalidSignature-RSA_PSS_SHA256-TLS13
 Server-InvalidSignature-RSA_PSS_SHA384-TLS13
 Server-InvalidSignature-RSA_PSS_SHA512-TLS13
@@ -265,6 +267,8 @@ Server-Verify-ECDSA_P521_SHA512-TLS13
 Server-Verify-ECDSA_SHA1-TLS13
 Server-Verify-Ed25519-TLS13
 Server-Verify-ML-DSA-44-TLS13
+Server-Verify-ML-DSA-65-TLS13
+Server-Verify-ML-DSA-87-TLS13
 Server-Verify-RSA_PKCS1_SHA1-TLS13
 Server-Verify-RSA_PKCS1_SHA256-TLS13
 Server-Verify-RSA_PKCS1_SHA384-TLS13

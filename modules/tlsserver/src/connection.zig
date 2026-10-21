@@ -68,7 +68,9 @@ pub const Connection = struct {
     err: ?Error = null,
 
     /// `output`'s buffer becomes the server's output buffer (see the file
-    /// comment); it must be empty. `joiner_buf`: as for `Server.init`.
+    /// comment); it must be empty. `joiner_buf`: as for `Server.init`. With
+    /// client authentication, give the server its peer buffer before the
+    /// handshake (`server.setPeerBuffer`).
     /// secret-api-ok: returns the initial state; every secret in `server` is zero until the handshake runs (under `Server`'s burns).
     pub fn init(
         config: *const server_mod.Config,

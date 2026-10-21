@@ -505,6 +505,8 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .schemes = if (o.verify_prefs.items.len != 0) o.verify_prefs.items else &server_mod.default_client_auth_schemes,
         .authorities = o.ca_names.items,
         .clock = clock.clock(),
+        // ML-DSA-87 leaves (BoGo `Server-Verify-ML-DSA-87-TLS13`) are 7.5 KB.
+        .max_leaf_len = 8192,
     };
     var leaf = ck.*;
     leaf.ocsp_response = o.ocsp_response;
@@ -543,7 +545,10 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
 
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
+    const peer = try gpa.alloc(u8, server_mod.peerBufferLen(client_auth.max_leaf_len));
+    defer gpa.free(peer);
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
+    c.server.setPeerBuffer(peer);
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
     return converse(&c, o, want_peer, &hello_check) catch |err| {

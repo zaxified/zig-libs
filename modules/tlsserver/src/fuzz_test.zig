@@ -1471,7 +1471,9 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     defer gpa.free(joiner);
     const outb = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
     defer gpa.free(outb);
+    var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     var server: server_mod.Server = .init(&cfg, joiner, outb);
+    server.setPeerBuffer(&peer);
     defer server.deinit();
 
     const stream = try gpa.dupe(u8, v.client);
@@ -1967,7 +1969,9 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     defer gpa.free(joiner);
     const outb = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
     defer gpa.free(outb);
+    var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     var server: server_mod.Server = .init(&cfg, joiner, outb);
+    server.setPeerBuffer(&peer);
     defer server.deinit();
 
     // The recording through the client's Finished.
@@ -2247,6 +2251,9 @@ fn fuzzClientAuth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
     }
     putU24(&buf, 1, at - 4);
     var msg: []u8 = buf[0..at];
+    // `checkLeafKeyUsage`'s copy, as the server's peer buffer (its leaf is
+    // never longer than the message).
+    var scratch: [buf.len + 64 + @import("x509").safe.parse_slack]u8 = undefined;
 
     if (src.valueRangeAtMost(u8, 0, 3) == 0) {
         const c = try clientauth.parseCertificate(msg, "");
@@ -2261,9 +2268,9 @@ fn fuzzClientAuth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         const leaf = pool[picked[0]];
         _ = try clientauth.leafPublicKey(leaf);
         if (picked[0] == 3) {
-            if (clientauth.checkLeafKeyUsage(leaf)) |_| return error.CaSigns else |e| if (e != error.UnsupportedCertificate) return e;
+            if (clientauth.checkLeafKeyUsage(leaf, &scratch)) |_| return error.CaSigns else |e| if (e != error.UnsupportedCertificate) return e;
             CaMark.mark(.usage_refused);
-        } else try clientauth.checkLeafKeyUsage(leaf);
+        } else try clientauth.checkLeafKeyUsage(leaf, &scratch);
         CaMark.mark(.genuine);
     } else {
         var spliced: [4 * 1024 + 64]u8 = undefined;
@@ -2290,7 +2297,7 @@ fn fuzzClientAuth(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!vo
         var it = c.certificates();
         while (it.next()) |der| {
             if (clientauth.leafPublicKey(der)) |_| CaMark.mark(.damaged_leaf_key_ok) else |_| CaMark.mark(.damaged_leaf_key_refused);
-            if (clientauth.checkLeafKeyUsage(der)) |_| CaMark.mark(.damaged_usage_ok) else |_| CaMark.mark(.damaged_usage_refused);
+            if (clientauth.checkLeafKeyUsage(der, &scratch)) |_| CaMark.mark(.damaged_usage_ok) else |_| CaMark.mark(.damaged_usage_refused);
         }
     }
 
