@@ -718,6 +718,10 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   (configuration errors first). After a HelloRetryRequest the second ClientHello's
   `status_request` / `signed_certificate_timestamp` decide (as in rustls; RFC 8446 §4.1.2 would
   have them unchanged — only the SNI is compared).
+- **Client leaf cap as a Config field (qap, 2026-10-21):** `clientauth.max_leaf_len` (4096) is a
+  constant, so is `Server.peer_buf`; qap's `Tls.max_client_cert_bytes` goes up to 16384 and its
+  tlsserver path refuses a configuration above 4096 at compile time (`src/session.zig`
+  `secureZl`). Ideal: the leaf buffer supplied by the caller (as `joiner_buf`), its length the cap.
 - **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
   chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
   client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** the differential run against the fork and

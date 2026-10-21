@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — SPEC backlog only: the client leaf's cap (`clientauth.max_leaf_len`, 4096) as
+  a caller-supplied buffer, asked for by qap's tlsserver branch (`Tls.max_client_cert_bytes`
+  goes up to 16384). No code change.
 - **2026-10-21** — M3 step 2, qap's zero-copy seams. **BREAKING** `Connection.init(config,
   input, output, joiner_buf)`: no output buffer of its own — records are sealed in the
   transport writer's buffer (size it with `minOutputLen`; it must be stream-shaped, `flush`
