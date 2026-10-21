@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — `kex` and `certverify` compute on the collection's curves: X25519 on
+  `ct25519` (comb key generation, MULX/ADX ladder), P-256 on `p256`, P-384 on `p384` (key
+  generation, ECDH, ECDSA sign and verify); Ed25519 and ML-KEM-768 stay std's. Same octets for
+  X25519 and P-256 (dtls's wolfSSL replay and tlsserver's 49 recorded OpenSSL/Go sessions replay
+  unchanged); a P-384 signature is now RFC 6979's — the KAT is re-anchored on OpenSSL 3.5.5's
+  deterministic ECDSA, byte-exact. A `tlsserver` handshake (P-256 certificate, X25519,
+  TLS_AES_256_GCM_SHA384) goes from 2,012 to 6,705 per second server-side, P-384 from 506 to
+  1,832. New deps `ct25519`, `p256`, `p384`. The example's wrong-hash-length step (broken since
+  `HashLengthMismatch` went) now expects `InvalidSignature`.
 - **2026-10-20** — `certverify.canSign(key, scheme)`: the family's candidate and, for RSA-PSS, a
   modulus large enough for the encoding (RFC 8017 §9.1.1: emLen ≥ 2·hLen + 2 — a 1024-bit key
   has no `rsa_pss_rsae_sha512`). Found by BoGo's `RSA-PSS-Large` through `tlsserver`.

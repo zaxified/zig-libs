@@ -338,7 +338,7 @@ pub const module_list = [_]Module{
     .{ .name = "hqc", .libs = &.{"crypto"}, .test_deps = &.{"testkit"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly", "aesgcm", "tls13" }, .test_deps = &.{"testkit"} },
     .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
-    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
+    .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
     .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume" }, .test_deps = &.{ "testkit", "tlsclient" } }, // TLS 1.3 server (under construction, M1)
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },

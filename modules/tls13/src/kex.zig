@@ -16,11 +16,20 @@
 //! secrets through an out-pointer; each runs under a dead-stack burn sized
 //! for its group (`burn.zig`). On an error the out-pointer's secret bytes are
 //! zeroed.
+//!
+//! The curve arithmetic is the collection's, not std's (2026-10-21, M3 of
+//! `tlsserver`): `ct25519.X25519` (comb key generation, MULX/ADX ladder),
+//! `p256` and `p384` (comb `k·G`, asm field). Each is byte-exact with std's
+//! (their own differential tests), so the shares and secrets are the same
+//! octets std computed; std's curves still check the scalar range.
 
 const std = @import("std");
 const burn = @import("burn.zig");
+const ct25519 = @import("ct25519");
+const p256 = @import("p256");
+const p384 = @import("p384");
 
-const X25519 = std.crypto.dh.X25519;
+const X25519 = ct25519.X25519;
 const P256 = std.crypto.ecc.P256;
 const P384 = std.crypto.ecc.P384;
 
@@ -190,16 +199,13 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
     out.public_len = 0;
     switch (group) {
         x25519_group => {
-            var seed: [32]u8 = undefined;
-            random.bytes(&seed);
-            const x = X25519.KeyPair.generateDeterministic(seed);
-            std.crypto.secureZero(u8, &seed);
-            out.secret[0..32].* = x.secret_key;
-            out.public[0..32].* = x.public_key;
+            random.bytes(out.secret[0..32]);
+            // Never fails: a clamped scalar times the base point is not the identity.
+            X25519.recoverPublicKeyInto(out.public[0..32], out.secret[0..32]) catch return error.KeyExchangeFailed;
             out.public_len = 32;
         },
-        secp256r1_group => try generateNist(P256, random, out),
-        secp384r1_group => try generateNist(P384, random, out),
+        secp256r1_group => try generateNist(p256.EcdsaP256Sha256, P256, random, out),
+        secp384r1_group => try generateNist(p384.EcdsaP384Sha384, P384, random, out),
         x25519_mlkem768_group => {
             var kem_seed: [MlKem768.seed_length]u8 = undefined;
             random.bytes(&kem_seed);
@@ -207,34 +213,34 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
                 std.crypto.secureZero(u8, &kem_seed);
                 return error.KeyExchangeFailed;
             };
-            var x_seed: [32]u8 = undefined;
-            random.bytes(&x_seed);
-            const x = X25519.KeyPair.generateDeterministic(x_seed);
             out.secret[0..MlKem768.seed_length].* = kem_seed;
-            out.secret[MlKem768.seed_length..][0..32].* = x.secret_key;
             std.crypto.secureZero(u8, &kem_seed);
-            std.crypto.secureZero(u8, &x_seed);
+            const x_secret = out.secret[MlKem768.seed_length..][0..32];
+            random.bytes(x_secret);
+            X25519.recoverPublicKeyInto(out.public[MlKem768.PublicKey.encoded_length..][0..32], x_secret) catch return error.KeyExchangeFailed;
             out.public[0..MlKem768.PublicKey.encoded_length].* = kem_kp.public_key.toBytes();
-            out.public[MlKem768.PublicKey.encoded_length..][0..32].* = x.public_key;
             out.public_len = hybrid_client_share_len;
         },
         else => return error.MissingKeyShare,
     }
 }
 
-/// The secp256r1 / secp384r1 arm of `generate`; `C` is std's `P256` or `P384`.
-fn generateNist(comptime C: type, random: std.Random, out: *KeyPair) Error!void {
+/// The secp256r1 / secp384r1 arm of `generate`: `E` is the collection's
+/// `p256.EcdsaP256Sha256` / `p384.EcdsaP384Sha384` (its key pair is `d·G` on
+/// the fixed-base comb), `C` std's `P256` / `P384` for the range check.
+fn generateNist(comptime E: type, comptime C: type, random: std.Random, out: *KeyPair) Error!void {
     const n = C.scalar.encoded_length;
     var tries: usize = 0;
     while (tries < 64) : (tries += 1) {
-        var candidate: [n]u8 = undefined;
-        random.bytes(&candidate);
-        C.scalar.rejectNonCanonical(candidate, .big) catch continue; // >= n
-        if (std.mem.allEqual(u8, &candidate, 0)) continue; // == 0
+        const candidate = out.secret[0..n];
+        random.bytes(candidate);
+        C.scalar.rejectNonCanonical(candidate.*, .big) catch continue; // >= n
+        if (std.mem.allEqual(u8, candidate, 0)) continue; // == 0
+        var kp: E.KeyPair = undefined;
+        defer std.crypto.secureZero(u8, &kp.secret_key.bytes);
         // basePoint * a nonzero canonical scalar is never the identity.
-        const point = C.basePoint.mul(candidate, .big) catch continue;
-        out.secret[0..n].* = candidate;
-        out.public[0 .. 2 * n + 1].* = point.toUncompressedSec1();
+        E.KeyPair.fromSecretKeyInto(&kp, &.{ .bytes = candidate.* }) catch continue;
+        out.public[0 .. 2 * n + 1].* = kp.public_key.toUncompressedSec1();
         out.public_len = 2 * n + 1;
         return;
     }
@@ -288,11 +294,21 @@ fn sharedSecretBody(group: u16, secret: []const u8, peer_share: []const u8, out:
         x25519_group => {
             if (secret.len < 32) return error.KeyExchangeFailed;
             if (peer_share.len != 32) return error.MissingKeyShare;
-            out.bytes[0..32].* = X25519.scalarmult(secret[0..32].*, peer_share[0..32].*) catch return error.KeyExchangeFailed;
+            X25519.scalarmultInto(out.bytes[0..32], secret[0..32], peer_share[0..32].*) catch return error.KeyExchangeFailed;
             out.len = 32;
         },
-        secp256r1_group => try sharedNist(P256, secret, peer_share, out),
-        secp384r1_group => try sharedNist(P384, secret, peer_share, out),
+        secp256r1_group => {
+            if (secret.len < 32) return error.KeyExchangeFailed;
+            if (peer_share.len != 65) return error.MissingKeyShare;
+            p256.ecdhInto(out.bytes[0..32], secret[0..32], peer_share) catch return error.KeyExchangeFailed;
+            out.len = 32;
+        },
+        secp384r1_group => {
+            if (secret.len < 48) return error.KeyExchangeFailed;
+            if (peer_share.len != 97) return error.MissingKeyShare;
+            p384.ecdhInto(out.bytes[0..48], secret[0..48], peer_share) catch return error.KeyExchangeFailed;
+            out.len = 48;
+        },
         x25519_mlkem768_group => {
             if (secret.len < secret_len) return error.KeyExchangeFailed;
             if (peer_share.len != hybrid_server_share_len) return error.MissingKeyShare;
@@ -309,29 +325,16 @@ fn sharedSecretBody(group: u16, secret: []const u8, peer_share: []const u8, out:
             defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
             var ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
             defer std.crypto.secureZero(u8, &ss_pq);
-            var ss_x = X25519.scalarmult(
-                secret[MlKem768.seed_length..][0..32].*,
+            X25519.scalarmultInto(
+                out.bytes[32..64],
+                secret[MlKem768.seed_length..][0..32],
                 peer_share[MlKem768.ciphertext_length..][0..32].*,
             ) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_x);
             out.bytes[0..32].* = ss_pq;
-            out.bytes[32..64].* = ss_x;
             out.len = 64;
         },
         else => return error.MissingKeyShare,
     }
-}
-
-/// The secp256r1 / secp384r1 arm of `sharedSecret`: the shared point's X
-/// coordinate (RFC 8446 §7.4.2).
-fn sharedNist(comptime C: type, secret: []const u8, peer_share: []const u8, out: *SharedSecret) Error!void {
-    const n = C.scalar.encoded_length;
-    if (secret.len < n) return error.KeyExchangeFailed;
-    if (peer_share.len != 2 * n + 1) return error.MissingKeyShare;
-    const point = C.fromSec1(peer_share) catch return error.KeyExchangeFailed;
-    const shared = point.mul(secret[0..n].*, .big) catch return error.KeyExchangeFailed;
-    out.bytes[0..n].* = shared.affineCoordinates().x.toBytes(.big);
-    out.len = n;
 }
 
 /// The SERVER half of the key exchange, in one step: consume the client's
@@ -385,20 +388,16 @@ fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, ou
             // recompute the session keys from a recorded handshake, so they
             // are wiped too. `enc.ciphertext` goes on the wire.
             defer std.crypto.secureZero(u8, &enc.shared_secret);
-            var x_seed: [32]u8 = undefined;
-            random.bytes(&x_seed);
-            var x = X25519.KeyPair.generateDeterministic(x_seed);
-            std.crypto.secureZero(u8, &x_seed);
-            defer std.crypto.secureZero(u8, &x.secret_key);
+            var x_secret: [32]u8 = undefined;
+            random.bytes(&x_secret);
+            defer std.crypto.secureZero(u8, &x_secret);
+            X25519.recoverPublicKeyInto(out.public[MlKem768.ciphertext_length..][0..32], &x_secret) catch return error.KeyExchangeFailed;
             // Same low-order/identity rejection as the classical arm — the
             // X25519 half of a hybrid must not be poisonable either.
-            var ss_x = X25519.scalarmult(x.secret_key, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_x);
+            X25519.scalarmultInto(out.shared.bytes[32..64], &x_secret, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
             out.public[0..MlKem768.ciphertext_length].* = enc.ciphertext;
-            out.public[MlKem768.ciphertext_length..][0..32].* = x.public_key;
             out.public_len = hybrid_server_share_len;
             out.shared.bytes[0..32].* = enc.shared_secret;
-            out.shared.bytes[32..64].* = ss_x;
             out.shared.len = 64;
         },
         else => return error.MissingKeyShare,
@@ -565,7 +564,7 @@ test "hybrid X25519MLKEM768: both sides agree, and each half is the RIGHT half i
     const ss_pq = try kem_kp.secret_key.decaps(ex.public[0..MlKem768.ciphertext_length]);
     try testing.expectEqualSlices(u8, &ss_pq, client_shared.bytes[0..32]);
     // The X25519 half, via direct scalarmult of the two ephemerals.
-    const ss_x = try X25519.scalarmult(
+    const ss_x = try std.crypto.dh.X25519.scalarmult(
         kp.secret[MlKem768.seed_length..][0..32].*,
         ex.public[MlKem768.ciphertext_length..][0..32].*,
     );

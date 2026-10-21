@@ -720,7 +720,14 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   have them unchanged — only the SNI is compared).
 - **Client certificates, later:** raw public keys (RFC 7250, rustls has them), the whole client
   chain kept for the application (rustls `peer_certificates`; here the leaf), P-521 and ML-DSA
-  client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** qap's seams and performance (`p256`, `ct25519`).
+  client keys (with `tls13.certverify`), post-handshake authentication (not in rustls either). **M3:** qap's seams (in-place records,
+  `max_encrypt_seq`, atomics, output-buffer access) and the differential run against the fork;
+  the curve arithmetic moved to `ct25519`/`p256`/`p384` on 2026-10-21 (through `tls13`).
+  Server-side handshakes per second, replayed recordings (`TLSSERVER_BENCH`, ReleaseFast, one
+  core, this host, best of 5 × 0.4 s): P-256 certificate + X25519 + TLS_AES_256_GCM_SHA384 2,012
+  → 6,705; X25519MLKEM768 1,825 → 4,788; P-384 certificate 506 → 1,832; Ed25519 3,036 → 3,491;
+  RSA-2048 1,124 → 1,202; resumption 4,480 → 5,496. Not a P-axis number (that is the in-memory
+  harness against OpenSSL libssl, M4).
   **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
 
 ## Open

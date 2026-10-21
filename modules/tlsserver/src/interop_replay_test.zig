@@ -31,30 +31,55 @@ fn clock(_: ?*anyopaque) i64 {
     return vectors.clock_ms;
 }
 
+/// The recorded server's private keys, parsed once (an RSA key's CRT
+/// set-up costs more than a handshake).
+const Keys = struct {
+    p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey,
+    p384: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey,
+    ed: std.crypto.sign.Ed25519.SecretKey,
+    rsa: *rsa.SecretKey,
+
+    fn init(gpa: std.mem.Allocator) !Keys {
+        const rsa_key = try gpa.create(rsa.SecretKey);
+        errdefer gpa.destroy(rsa_key);
+        try rsa.SecretKey.fromDer(rsa_key, &certs.rsa2048_pkcs1);
+        return .{
+            .p256 = try .fromBytes(certs.p256_scalar),
+            .p384 = try .fromBytes(certs.p384_scalar),
+            .ed = try .fromBytes(certs.ed25519_secret),
+            .rsa = rsa_key,
+        };
+    }
+
+    fn deinit(k: *Keys, gpa: std.mem.Allocator) void {
+        gpa.destroy(k.rsa);
+    }
+};
+
 fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
-    var p256 = try std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(certs.p256_scalar);
-    var p384 = try std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(certs.p384_scalar);
-    var ed = try std.crypto.sign.Ed25519.SecretKey.fromBytes(certs.ed25519_secret);
-    const rsa_key = try gpa.create(rsa.SecretKey);
-    defer gpa.destroy(rsa_key);
-    try rsa.SecretKey.fromDer(rsa_key, &certs.rsa2048_pkcs1);
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    return replayWith(gpa, v, &keys);
+}
+
+fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !void {
     var chain: [1][]const u8 = undefined;
     var ck: server_mod.CertifiedKey = switch (v.cert) {
         .p256 => blk: {
             chain[0] = &certs.p256_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p256 = &p256 } };
+            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p256 = &keys.p256 } };
         },
         .p384 => blk: {
             chain[0] = &certs.p384_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p384 = &p384 } };
+            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p384 = &keys.p384 } };
         },
         .ed25519 => blk: {
             chain[0] = &certs.ed25519_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ed25519 = &ed } };
+            break :blk .{ .chain = &chain, .key = .{ .ed25519 = &keys.ed } };
         },
         .rsa2048 => blk: {
             chain[0] = &certs.rsa2048_cert;
-            break :blk .{ .chain = &chain, .key = .{ .rsa = rsa_key } };
+            break :blk .{ .chain = &chain, .key = .{ .rsa = keys.rsa } };
         },
     };
     if (v.staple) {
@@ -140,6 +165,51 @@ test "OpenSSL and Go client sessions replay byte-exact through Connection" {
             return err;
         };
     }
+}
+
+// Server-side handshakes per second, measured by replaying recorded
+// sessions (the server's work only: key exchange, CertificateVerify,
+// key schedule, records, the client's Finished checked; no client). Off by
+// default; opt in with `TLSSERVER_BENCH` (`1` = every case, a case name =
+// that one), in an optimized build:
+//
+//   TLSSERVER_BENCH=1 <test binary built -OReleaseFast>
+test "bench: replayed handshakes per second (opt-in via TLSSERVER_BENCH)" {
+    const only = std.testing.environ.getPosix("TLSSERVER_BENCH") orelse return error.SkipZigTest;
+    const names = [_][]const u8{ "p256-aes256-x25519", "p256-default", "p256-p384group", "p384", "ed25519", "rsa2048-pss", "resume" };
+    // An arena kept across replays: after the first one no replay asks the
+    // kernel for memory.
+    var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    var keys: Keys = try .init(std.heap.page_allocator);
+    defer keys.deinit(std.heap.page_allocator);
+    for (names) |name| {
+        // A case name runs that case alone (for a profile).
+        if (!std.mem.eql(u8, only, "1") and !std.mem.eql(u8, only, name)) continue;
+        const v = for (vectors.cases) |c| {
+            if (std.mem.eql(u8, c.name, name)) break c;
+        } else return error.NoSuchCase;
+        try replayWith(gpa, v, &keys); // warm-up, and still byte-exact
+        var best: f64 = 0;
+        for (0..5) |_| {
+            const t0 = nowNs();
+            var n: usize = 0;
+            while (nowNs() - t0 < 400_000_000) : (n += 1) {
+                try replayWith(gpa, v, &keys);
+                _ = arena.reset(.retain_capacity);
+            }
+            const rate = @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(nowNs() - t0));
+            best = @max(best, rate);
+        }
+        std.debug.print("bench {s:<20} {d:>8.0} handshakes/s (best of 5)\n", .{ name, best });
+    }
+}
+
+fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 test "a recording with one octet of OpenSSL's flipped is refused" {

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M3 step 1: `tls13`'s key exchange and ECDSA now run on `ct25519`/`p256`/
+  `p384`; server-side handshakes per second (P-256 certificate, X25519,
+  TLS_AES_256_GCM_SHA384) 2,012 → 6,705, P-384 506 → 1,832 (SPEC *Backlog*). New opt-in
+  bench in `interop_replay_test.zig` (`TLSSERVER_BENCH=1|<case>`, an optimized test binary):
+  replays recorded sessions, server work only; the recorded keys are parsed once (an RSA key's
+  CRT set-up cost more than a handshake). Interop vectors recaptured (P-384 signatures are RFC
+  6979's now): OpenSSL 3.5.5 and Go 1.26.8, 49/49; BoGo 339/0 and tlsfuzzer unchanged.
 - **2026-10-21** — tlsfuzzer gate (M2 exit gate). `interop-tlsserver -- --tlsfuzzer DIR` runs
   50 TLS 1.3 tlsfuzzer scripts (new `tools/tlsfuzzer.zig`: three loopback listeners — plain,
   optional client certificates, echo — a key per client scheme list through the new

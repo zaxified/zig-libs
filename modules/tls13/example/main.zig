@@ -56,8 +56,9 @@ pub fn main() !void {
     std.debug.print("CertificateVerify: {d}-byte DER signature verified\n", .{sig.len});
 
     // The same signature under the client's context string is not a valid
-    // client CertificateVerify, and a SHA-256-sized hash is refused before
-    // any crypto runs.
+    // client CertificateVerify, and neither is it one over a shorter
+    // transcript hash (any length is signable, RFC 8446 §4.4.3; the content
+    // differs).
     if (cv.verify(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = kp.public_key }, .client, &th_cv, sig)) |_| {
         return error.CrossContextSignatureAccepted;
     } else |err| switch (err) {
@@ -67,7 +68,7 @@ pub fn main() !void {
     if (cv.verify(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = kp.public_key }, .server, th_cv[0..32], sig)) |_| {
         return error.WrongHashLengthAccepted;
     } else |err| switch (err) {
-        error.HashLengthMismatch => std.debug.print("32-byte hash for a SHA-384 scheme refused (HashLengthMismatch)\n", .{}),
+        error.InvalidSignature => std.debug.print("signature over a 32-byte prefix of the hash refused (InvalidSignature)\n", .{}),
         else => return err,
     }
 

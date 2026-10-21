@@ -31,6 +31,8 @@
 
 const std = @import("std");
 const rsa = @import("rsa");
+const p256 = @import("p256");
+const p384 = @import("p384");
 const burn = @import("burn.zig");
 
 const Ecdsa = std.crypto.sign.ecdsa;
@@ -485,50 +487,65 @@ fn signRsaPss(scheme: SignatureScheme, sk: *const rsa.SecretKey, content: []cons
     };
 }
 
+// The ECDSA arms compute on the collection's curves (`p256`, `p384`:
+// asm field, fixed-base comb for `k·G`, 2026-10-21) behind std's key types,
+// which stay the public API: a key crosses over as its octets. `p256`'s
+// signatures are byte-exact with std's; `p384`'s nonce is RFC 6979's with
+// the noise as §3.6 additional data, where std mixes in a zero block.
+
 fn verifyEcdsaP256(pk: Ecdsa.EcdsaP256Sha256.PublicKey, content: []const u8, signature: []const u8) VerifyError!void {
     // RFC 8446 §4.3.2: ECDSA signatures are ASN.1 DER on the wire, never raw
     // r||s. fromDer's EncodingError (malformed DER) and verify's whole error
     // set (SignatureVerificationFailed/IdentityElement/NonCanonical) all
     // collapse into this module's single InvalidSignature.
-    const sig = Ecdsa.EcdsaP256Sha256.Signature.fromDer(signature) catch return error.InvalidSignature;
-    sig.verify(content, pk) catch return error.InvalidSignature;
+    const Fast = p256.EcdsaP256Sha256;
+    const key = Fast.PublicKey.fromSec1(&pk.toUncompressedSec1()) catch return error.InvalidSignature;
+    const sig = Fast.Signature.fromDer(signature) catch return error.InvalidSignature;
+    sig.verify(content, key) catch return error.InvalidSignature;
 }
 
 fn signEcdsaP256(sk: *const Ecdsa.EcdsaP256Sha256.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
-    const Scheme = Ecdsa.EcdsaP256Sha256;
+    const Fast = p256.EcdsaP256Sha256;
     // fromSecretKey/sign only fail on a degenerate secret key (identity /
     // non-canonical scalar) -- a key problem, mapped to KeyMismatch.
-    const key_pair = Scheme.KeyPair.fromSecretKey(sk.*) catch return error.KeyMismatch;
-    var noise_buf: [Scheme.noise_length]u8 = undefined;
-    const noise: ?[Scheme.noise_length]u8 = if (random) |rnd| blk: {
+    var key_pair: Fast.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, &key_pair.secret_key.bytes);
+    Fast.KeyPair.fromSecretKeyInto(&key_pair, &.{ .bytes = sk.bytes }) catch return error.KeyMismatch;
+    var noise_buf: [Fast.noise_length]u8 = undefined;
+    const noise: ?[Fast.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
         break :blk noise_buf;
     } else null; // null => std's fully deterministic nonce derivation
     const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
     // RFC 8446 §4.3.2 mandates DER on the wire; `sign` pre-checked
     // out.len >= der_encoded_length_max.
-    return sig.toDer(out[0..Scheme.Signature.der_encoded_length_max]);
+    return sig.toDer(out[0..Fast.Signature.der_encoded_length_max]);
 }
 
 fn verifyEcdsaP384(pk: Ecdsa.EcdsaP384Sha384.PublicKey, content: []const u8, signature: []const u8) VerifyError!void {
     // Same shape as verifyEcdsaP256, over the P-384/SHA-384 instantiation.
-    const sig = Ecdsa.EcdsaP384Sha384.Signature.fromDer(signature) catch return error.InvalidSignature;
-    sig.verify(content, pk) catch return error.InvalidSignature;
+    const Fast = p384.EcdsaP384Sha384;
+    const key = Fast.PublicKey.fromSec1(&pk.toUncompressedSec1()) catch return error.InvalidSignature;
+    const sig = Fast.Signature.fromDer(signature) catch return error.InvalidSignature;
+    sig.verify(content, key) catch return error.InvalidSignature;
 }
 
 fn signEcdsaP384(sk: *const Ecdsa.EcdsaP384Sha384.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     // Same shape as signEcdsaP256, over the P-384/SHA-384 instantiation
     // (noise_length is 48 here -- the curve's scalar length, not the caller's
-    // concern: it comes from the Scheme type).
-    const Scheme = Ecdsa.EcdsaP384Sha384;
-    const key_pair = Scheme.KeyPair.fromSecretKey(sk.*) catch return error.KeyMismatch;
-    var noise_buf: [Scheme.noise_length]u8 = undefined;
-    const noise: ?[Scheme.noise_length]u8 = if (random) |rnd| blk: {
+    // concern: it comes from the Scheme type). `fromSecretKeyInto` refuses a
+    // scalar outside [1, n − 1].
+    const Fast = p384.EcdsaP384Sha384;
+    var key_pair: Fast.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, &key_pair.secret_key.bytes);
+    Fast.KeyPair.fromSecretKeyInto(&key_pair, &.{ .bytes = sk.bytes }) catch return error.KeyMismatch;
+    var noise_buf: [Fast.noise_length]u8 = undefined;
+    const noise: ?[Fast.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
         break :blk noise_buf;
-    } else null;
+    } else null; // null => RFC 6979 deterministic
     const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
-    return sig.toDer(out[0..Scheme.Signature.der_encoded_length_max]);
+    return sig.toDer(out[0..Fast.Signature.der_encoded_length_max]);
 }
 
 fn verifyEd25519(pk: Ed25519.PublicKey, content: []const u8, signature: []const u8) VerifyError!void {
@@ -797,12 +814,12 @@ test "KAT: ecdsa_secp256r1_sha256 sign reproduces the deterministic DER vector b
     try testing.expectEqualSlices(u8, &kat.ecdsa_p256_server.signature_der, sig);
 }
 
-test "KAT: ecdsa_secp384r1_sha384 verify accepts the self-generated-deterministic DER vector" {
+test "KAT: ecdsa_secp384r1_sha384 verify accepts the OpenSSL RFC 6979 DER vector" {
     const pk = PublicKey{ .ecdsa_p384 = try kat.ecdsa_p384_server.publicKey() };
     try verify(.ecdsa_secp384r1_sha384, pk, .server, &kat.ecdsa_p384_server.transcript_hash, &kat.ecdsa_p384_server.signature_der);
 }
 
-test "KAT: ecdsa_secp384r1_sha384 sign reproduces the deterministic DER vector byte-exact" {
+test "KAT: ecdsa_secp384r1_sha384 sign reproduces OpenSSL's RFC 6979 DER vector byte-exact" {
     const ec_sk = try kat.ecdsa_p384_server.secretKey();
     const sk = SecretKey{ .ecdsa_p384 = &ec_sk };
     var out: [Ecdsa.EcdsaP384Sha384.Signature.der_encoded_length_max]u8 = undefined;

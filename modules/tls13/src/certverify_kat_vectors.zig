@@ -91,8 +91,14 @@ pub const ecdsa_p256_server = struct {
 
 // ── ECDSA P-384 / SHA-384, server side ───────────────────────────────────
 //
-// PROVENANCE: same as ecdsa_p256_server above -- self-generated-deterministic
-// via std's own deterministic sign path, DER round-trip self-verified.
+// PROVENANCE: EXTERNAL (2026-10-21). The signature is RFC 6979's
+// deterministic ECDSA, produced by OpenSSL 3.5.5 over the exact `content`
+// below (`openssl pkeyutl -sign -rawin -digest sha384 -pkeyopt
+// nonce-type:1`, key = `secret_key_bytes` as PKCS#8 via `cryptography`),
+// reproduced on a second run and verified by `pkeyutl -verify`. `sign` with
+// no randomness signs through `p384` (RFC 6979) and must give these octets.
+// (The vector was std's own deterministic signature until `certverify`
+// moved to `p384`; std's nonce is not RFC 6979's.)
 
 pub const ecdsa_p384_server = struct {
     pub const seed = hexLit("efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef");
@@ -100,8 +106,8 @@ pub const ecdsa_p384_server = struct {
     pub const public_key_uncompressed_sec1 = hexLit("042df805cdc6f5d2e9094bc2432a413e975d18da91fe920bbee152e8950de9b0dfdd6b1517c5ea5463c937ffd5dd721ebee5e4356468174dca8d2ca5e5469644014a899731b8b8bb3e197bfbe4ec987f4944dc60671b4b381fc8d6a90272b50864");
     pub const transcript_hash = @as([48]u8, @splat(0x22));
     pub const content = hexLit("20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020544c5320312e332c2073657276657220436572746966696361746556657269667900222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222");
-    pub const signature_raw = hexLit("e626f16735e281b1f20157db23355fe4ca4cc1a055e72fd633b63b06860bb37c518ab56ab665fed02ba1d896480a58a61881487571d0b80127ee5aa842bad2bbedd5f962b8f1c4d816580a8f5ecf5675e5ab4a780fea592255d826fd6b0eac36");
-    pub const signature_der = hexLit("3065023100e626f16735e281b1f20157db23355fe4ca4cc1a055e72fd633b63b06860bb37c518ab56ab665fed02ba1d896480a58a602301881487571d0b80127ee5aa842bad2bbedd5f962b8f1c4d816580a8f5ecf5675e5ab4a780fea592255d826fd6b0eac36");
+    pub const signature_raw = hexLit("9b93edba815e951292fcff6dcf7567ee2a94562a8f6ef3501a42c06b51321051652f7e06ff9ee017f47dfaaf014d63513d1103a148c8a64ab1ac45bf58b4a34e15439dd5282349c33489082269f68b40d6ffed7a94bb89395bb6c4cbf2a31c30");
+    pub const signature_der = hexLit("30650231009b93edba815e951292fcff6dcf7567ee2a94562a8f6ef3501a42c06b51321051652f7e06ff9ee017f47dfaaf014d635102303d1103a148c8a64ab1ac45bf58b4a34e15439dd5282349c33489082269f68b40d6ffed7a94bb89395bb6c4cbf2a31c30");
 
     pub fn publicKey() !std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey {
         return std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(&public_key_uncompressed_sec1);
