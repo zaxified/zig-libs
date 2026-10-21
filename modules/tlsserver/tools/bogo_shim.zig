@@ -47,6 +47,13 @@
 //!   each resumption (BoringSSL's shim clock); `-expect-ticket-age-skew`
 //!   compares `Server.ticketAgeSkew`.
 //!
+//! - 0-RTT: `-enable-early-data` takes early data on resumptions, single
+//!   use through a `StrikeRegister` for the run; the early data is echoed
+//!   as half-RTT data; `-expect-accept-early-data` /
+//!   `-expect-reject-early-data` and `-expect-early-data-reason` are
+//!   checked once the handshake completed (BoringSSL's names,
+//!   `EarlyDataReason.name`).
+//!
 //! - `-decline-alpn` is a server without protocols (no ALPN, whatever the
 //!   client offers); `-reject-alpn` one whose protocols no client offers
 //!   (`no_application_protocol` when the client sends ALPN) — what
@@ -114,6 +121,10 @@ const Options = struct {
     /// BoringSSL's mock certificate compression algorithms installed: all
     /// of them, or the one named.
     cert_compression: union(enum) { none, all, one: u16 } = .none,
+    enable_early_data: bool = false,
+    /// `-expect-accept-early-data` (true) / `-expect-reject-early-data`.
+    expect_early_data_accepted: ?bool = null,
+    expect_early_data_reason: ?[]const u8 = null,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -292,9 +303,13 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
         } else if (std.mem.eql(u8, flag, "-expect-ticket-age-skew")) {
             o.expect_ticket_age_skew = try std.fmt.parseInt(i64, try value(it, flag), 10);
         } else if (std.mem.eql(u8, flag, "-expect-early-data-reason")) {
-            // Early data is never accepted: `disabled` is the only reason
-            // there is (the server enables none).
-            if (!std.mem.eql(u8, try value(it, flag), "disabled")) return unimplemented(flag);
+            o.expect_early_data_reason = try value(it, flag);
+        } else if (std.mem.eql(u8, flag, "-enable-early-data")) {
+            o.enable_early_data = true;
+        } else if (std.mem.eql(u8, flag, "-expect-accept-early-data")) {
+            o.expect_early_data_accepted = true;
+        } else if (std.mem.eql(u8, flag, "-expect-reject-early-data")) {
+            o.expect_early_data_accepted = false;
         } else if (std.mem.eql(u8, flag, "-expect-advertised-alpn")) {
             o.expect_advertised_alpn = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-decline-alpn")) {
@@ -483,19 +498,25 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume:
     ring.rotate(1, &stek_key, @divFloor(ShimClock.nowMs(&clock), 1000));
     const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
     const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = clock.clock() };
+    // One replay register for the run too (BoringSSL's shim keeps none: its
+    // tests resume each ticket once). `-resumption-delay` moves the clock by
+    // up to a few minutes: a day's window outlasts every run.
+    var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 64, 24 * 3600 * 1000);
+    defer strikes.deinit();
+    const early: server_mod.EarlyData = .{ .replay = server_mod.strikeRegisterGuard(&strikes) };
 
     for (0..initial.resume_count + 1) |i| {
         const o = if (i == 0) initial else on_resume;
         // BoringSSL's shim advances its clock after each connection.
         if (i != 0) clock.offset_ms += initial.resumption_delay_s * 1000;
-        const resumed = try connection(gpa, io, &ck, if (o.no_ticket) null else &tickets, csprng.random(), o, &clock);
+        const resumed = try connection(gpa, io, &ck, if (o.no_ticket) null else &tickets, if (o.enable_early_data) &early else null, csprng.random(), o, &clock);
         const want = i != 0 and !o.expect_session_miss;
         if (resumed != want) return if (resumed) error.UnexpectedSessionReuse else error.SessionNotReused;
     }
 }
 
 /// One connection; whether it resumed a session.
-fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: ?*const server_mod.Tickets, random: std.Random, o: *const Options, clock: *ShimClock) !bool {
+fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: ?*const server_mod.Tickets, early: ?*const server_mod.EarlyData, random: std.Random, o: *const Options, clock: *ShimClock) !bool {
     const want_peer: ?[]const u8 = if (o.expect_peer_cert_file) |f| try singlePemCertificate(gpa, io, f) else null;
     const x509_verifier: tlsserver.X509Verifier = .{
         .gpa = gpa,
@@ -535,6 +556,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .random = random,
         .tickets = tickets,
         .client_auth = if (o.client_auth != .off) &client_auth else null,
+        .early_data = early,
     };
 
     const addr: net.IpAddress = if (o.ipv6) .{ .ip6 = .loopback(o.port) } else .{ .ip4 = .loopback(o.port) };
@@ -646,15 +668,29 @@ fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8,
         try c.close();
         // Read to the runner's close_notify.
         while (try c.read()) |_| {}
+        try checkEarlyData(c, o);
         return c.server.isResumed();
     }
     var echo: [record.max_plaintext_len]u8 = undefined;
     while (true) {
-        if (o.key_update_before_read) try c.keyUpdate(.update_not_requested);
+        if (o.key_update_before_read and c.server.isConnected()) try c.keyUpdate(.update_not_requested);
+        // Early data is echoed as it comes: half-RTT data, before the
+        // client's Finished (the runner's `ExpectHalfRTTData`).
         const d = try c.read() orelse break;
         for (echo[0..d.len], d) |*e, b| e.* = b ^ 0xff;
         try c.writeAll(echo[0..d.len]);
     }
+    try checkEarlyData(c, o);
     try c.close();
     return c.server.isResumed();
+}
+
+/// BoringSSL checks the early-data outcome once the handshake is confirmed.
+fn checkEarlyData(c: *const tlsserver.Connection, o: *const Options) !void {
+    if (!c.server.isConnected()) return;
+    if (o.expect_early_data_accepted) |want| if (c.server.earlyDataAccepted() != want) return error.EarlyDataAcceptedMismatch;
+    if (o.expect_early_data_reason) |want| if (!std.mem.eql(u8, c.server.earlyDataReason().name(), want)) {
+        std.debug.print("early data reason {s}, wanted {s}\n", .{ c.server.earlyDataReason().name(), want });
+        return error.EarlyDataReasonMismatch;
+    };
 }

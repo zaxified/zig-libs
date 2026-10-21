@@ -94,6 +94,12 @@ const Case = struct {
     /// The Certificate (without staples) is also there zlib-compressed
     /// (RFC 8879), by std's deflate.
     cert_comp: bool = false,
+    /// The server takes early data (`interop_max_early_data`, a fresh
+    /// replay register per case).
+    early_data: bool = false,
+    /// The server must have taken the client's early data ("ping\n" in
+    /// `early.txt`; its stdin is then left empty).
+    early_accepted: bool = false,
 };
 
 /// The OCSP staple and SCT list of every `staple` case: an OCSPResponse of
@@ -101,6 +107,9 @@ const Case = struct {
 /// SignedCertificateTimestampList of two SCTs, "SCT-one" and "SCT-2".
 pub const interop_ocsp_response = [_]u8{ 0x30, 0x03, 0x0a, 0x01, 0x01 };
 pub const interop_sct_list = [_]u8{ 0x00, 0x10, 0x00, 0x07 } ++ "SCT-one".* ++ [_]u8{ 0x00, 0x05 } ++ "SCT-2".*;
+
+/// `EarlyData.max_size` of the `early_data` cases.
+pub const interop_max_early_data: u32 = 16384;
 
 /// The ticket key and clock of every `tickets` case (and of the replay).
 pub const interop_stek_key: [32]u8 = @splat(0x5e);
@@ -129,6 +138,11 @@ const cases = [_]Case{
     .{ .name = "resume-hrr", .why = "resumption after a HelloRetryRequest (the binder over message_hash and the HRR)", .seed = 17, .tickets = true, .resumed = true, .brief = false, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess_in", "openssl.sess", "-groups", "X25519:P-256" }, .expect = &.{ "Reused, TLSv1.3", "Peer Temp Key: ECDH, prime256v1" } },
     .{ .name = "resume-aes128-new", .why = "tickets under TLS_AES_128_GCM_SHA256", .seed = 18, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     .{ .name = "resume-aes128", .why = "resumption under TLS_AES_128_GCM_SHA256", .seed = 19, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
+    // 0-RTT: a ticket that allows early data, then s_client's early data
+    // taken (answered half-RTT), then refused by a server that takes none.
+    .{ .name = "early-new", .why = "tickets with early_data (max_early_data_size)", .seed = 72, .tickets = true, .early_data = true, .brief = false, .args = &.{ "-sess_out", "openssl-early.sess" }, .expect = &.{ "New, TLSv1.3", "Max Early Data: 16384" } },
+    .{ .name = "early", .why = "0-RTT: s_client's early data taken under the ticket's PSK, pong as half-RTT data, EndOfEarlyData", .seed = 73, .tickets = true, .early_data = true, .resumed = true, .early_accepted = true, .brief = false, .args = &.{ "-sess_in", "openssl-early.sess", "-early_data", "early.txt" }, .expect = &.{ "Reused, TLSv1.3", "Early data was accepted" } },
+    .{ .name = "early-refused", .why = "0-RTT offered to a server that takes none: resumed, the early data skipped", .seed = 74, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-early.sess", "-early_data", "early.txt" }, .expect = &.{ "Reused, TLSv1.3", "Early data was rejected" } },
     .{ .name = "staple", .why = "an OCSP staple (s_client -status; its -ct needs a CT log list, so the SCTs are Go's to check)", .seed = 60, .staple = true, .brief = false, .args = &.{"-status"}, .expect = &.{"OCSP Response Status: malformedrequest (0x1)"} },
     .{ .name = "cert-comp-zlib", .why = "RFC 8879: the Certificate zlib-compressed (s_client offers zlib and zstd)", .seed = 63, .cert_comp = true, .brief = false, .args = &.{"-msg"}, .expect = &.{ "], CompressedCertificate", "Verification: OK" } },
     .{ .name = "staple-not-asked", .why = "a staple configured, s_client without -status (no status_request): the handshake still completes (absence of the staple: handshake_test.zig)", .seed = 61, .staple = true },
@@ -271,9 +285,9 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server
             return err;
         };
         switch (r.event) {
-            .need_more => {},
-            .handshake_done => {},
-            .app_data => |d| {
+            .need_more, .handshake_done, .early_data_accepted => {},
+            // Answered as it comes (half-RTT), like application data.
+            .app_data, .early_data => |d| {
                 try app.appendSlice(gpa, d);
                 if (!answered and std.mem.endsWith(u8, app.items, "ping\n")) {
                     if (key_update) {
@@ -366,8 +380,11 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     defer if (!waited) child.kill(io);
     var stdin_buf: [16]u8 = undefined;
     var stdin_w = child.stdin.?.writer(io, &stdin_buf);
-    try stdin_w.interface.writeAll("ping\n");
-    try stdin_w.interface.flush();
+    // With its early data taken the client has said it all.
+    if (!c.early_accepted) {
+        try stdin_w.interface.writeAll("ping\n");
+        try stdin_w.interface.flush();
+    }
 
     const stream = try listener.accept(io);
     defer stream.close(io);
@@ -390,6 +407,9 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = interopNow } };
     const verifier: tlsserver.X509Verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
     const client_auth: tlsserver.ClientAuth = .{ .verifier = verifier.verifier(), .mandatory = c.client_auth == .mandatory, .clock = .{ .now_ms = interopNow } };
+    var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 16, 3600 * 1000);
+    defer strikes.deinit();
+    const early: tlsserver.server.EarlyData = .{ .max_size = interop_max_early_data, .replay = tlsserver.server.strikeRegisterGuard(&strikes) };
     const cfg: tlsserver.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = c.suites,
@@ -398,6 +418,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .random = csprng.random(),
         .tickets = if (c.tickets) &tickets else null,
         .client_auth = if (c.client_auth != .off) &client_auth else null,
+        .early_data = if (c.early_data) &early else null,
     };
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
@@ -448,6 +469,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     // serve's close_notify waited for the client's KeyUpdate.
     if (c.key_update and !server.write_closed) return error.NoClientKeyUpdate;
     if (server.isResumed() != c.resumed) return error.ResumptionMismatch;
+    if (server.earlyDataAccepted() != c.early_accepted) {
+        std.debug.print("  early data: {s}\n", .{server.earlyDataReason().name()});
+        return error.EarlyDataMismatch;
+    }
     const want_peer: ?[]const u8 = clientCertDer(c.client_cert);
     const got_peer = server.peerCertificate();
     if ((want_peer == null) != (got_peer == null) or
@@ -492,6 +517,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\
     );
     try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n", .{ interop_stek_key[0], interop_clock_ms });
+    try w.print("/// `EarlyData.max_size` of the `early_data` cases.\npub const max_early_data: u32 = {d};\n", .{interop_max_early_data});
     try w.print("/// The leaf's OCSP staple and SCT list in the `staple` cases.\npub const ocsp_response = hx({d}, \"{x}\");\npub const sct_list = hx({d}, \"{x}\");\n\n", .{ interop_ocsp_response.len, &interop_ocsp_response, interop_sct_list.len, &interop_sct_list });
     try w.writeAll(
         \\pub const Case = struct {
@@ -516,6 +542,10 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    /// The leaf's Certificate (no staples) also went as this
         \\    /// CompressedCertificate to a client that offered its algorithm.
         \\    compressed: ?Compressed = null,
+        \\    /// The server took early data (`max_early_data`).
+        \\    early_data: bool = false,
+        \\    /// It took the client's ("ping\\n").
+        \\    early_accepted: bool = false,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -541,6 +571,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.client_auth != .off) try w.print("        .client_auth = .{t},\n", .{c.client_auth});
         if (c.client_cert != .none) try w.print("        .client_cert = .{t},\n", .{c.client_cert});
         if (c.staple) try w.writeAll("        .staple = true,\n");
+        if (c.early_data) try w.writeAll("        .early_data = true,\n");
+        if (c.early_accepted) try w.writeAll("        .early_accepted = true,\n");
         if (d[1].compressed) |cc| {
             try w.print("        .compressed = .{{\n            .algorithm = {d},\n            .uncompressed_len = {d},\n", .{ cc.algorithm, cc.uncompressed_len });
             try hexFieldAt(w, "            ", "data", cc.data);
@@ -922,6 +954,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     if (tlsfuzzer_dir) |d| return tlsfuzzer.run(gpa, io, root, d, tlsfuzzer_python, tlsfuzzer_scripts.items, tlsfuzzer_update, &env_map);
     if (bogo) return runBogo(gpa, io, root, bogo_src, bogo_test, bogo_args.items, bogo_update);
     try work.writeFile(io, .{ .sub_path = "p256.pem", .data = try pem(gpa, &certs.p256_cert) });
+    // s_client's `-early_data` file.
+    try work.writeFile(io, .{ .sub_path = "early.txt", .data = "ping\n" });
     try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });
     try work.writeFile(io, .{ .sub_path = "ed25519.pem", .data = try pem(gpa, &certs.ed25519_cert) });
     try work.writeFile(io, .{ .sub_path = "rsa2048.pem", .data = try pem(gpa, &certs.rsa2048_cert) });

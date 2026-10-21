@@ -91,8 +91,17 @@
 //!   here only the leaf is kept). With a mandatory certificate, a ticket
 //!   without one is not resumed (stricter than rustls, which resumes it).
 //!
-//! Early data is never accepted and is skipped
-//! (`inbound.Inbound.skip_early`).
+//! With `Config.early_data` set (and tickets), a resumption takes 0-RTT
+//! early data (RFC 8446 §2.3, §4.2.10), as BoringSSL decides it
+//! (`EarlyDataReason`): the first identity offered, resumed with the
+//! ticket's ALPN protocol, a ticket issued with `max_early_data_size`, a
+//! reported age within `EarlyData.max_age_skew_s`, no HelloRetryRequest —
+//! and then the `ReplayGuard` admitting the ticket (single use, RFC 8446
+//! §8.1). The EncryptedExtensions acknowledge it; `early_data` events carry
+//! up to the ticket's `max_early_data_size` octets until the client's
+//! EndOfEarlyData, and the server may write half-RTT data meanwhile
+//! (`canWrite`). Early data not taken is skipped
+//! (`inbound.Inbound.skip_early`, 2^14 octets or `max_size`).
 
 const std = @import("std");
 const tls13 = @import("tls13");
@@ -347,6 +356,9 @@ pub const Config = struct {
     tickets: ?*const Tickets = null,
     /// Client certificates; null: none is asked for.
     client_auth: ?*const ClientAuth = null,
+    /// 0-RTT early data on resumptions (with `tickets`); null: none is
+    /// taken, and what a client sends is skipped.
+    early_data: ?*const EarlyData = null,
 };
 
 /// Client authentication (RFC 8446 §4.3.2, §4.4.2; rustls
@@ -395,6 +407,98 @@ pub const Tickets = struct {
     /// 8446 §4.6.1); an older ticket is not resumed. rustls: 12 hours. 0
     /// issues no tickets (a lifetime of 0 tells the client to discard it).
     lifetime_s: u32 = 12 * 3600,
+};
+
+/// 0-RTT early data (RFC 8446 §2.3, §4.2.10), taken on a resumption with
+/// `Config.tickets` (rustls `max_early_data_size`, BoringSSL
+/// `SSL_set_early_data_enabled`). Early data is not replay-protected by
+/// TLS: the server answers it before the client's Finished, so a ClientHello
+/// recorded on the wire can be sent again. `replay` stops the same ticket
+/// from carrying early data twice (RFC 8446 §8.1), and the reported ticket
+/// age bounds how long a recording stays usable (§8.3); what early data may
+/// do is still the application's call (RFC 8470 for HTTP). The identity a
+/// resumed ticket carries (`Server.peerCertificate`) is not proved before
+/// the client's Finished: authorize nothing in early data by it.
+pub const EarlyData = struct {
+    /// The `max_early_data_size` advertised in each NewSessionTicket and the
+    /// most early plaintext taken (more is `unexpected_message`, rustls
+    /// `TooMuchEarlyDataReceived`). BoringSSL: 14336. 0 takes none.
+    max_size: u32 = 14336,
+    /// Asked last, once every other condition holds: true lets this ticket
+    /// carry early data, false refuses it (the handshake goes on in 1-RTT).
+    replay: ReplayGuard,
+    /// The largest gap, in whole seconds, between the client's idea of the
+    /// ticket's age and the server's (`Server.ticketAgeSkew`) for which
+    /// early data is taken (BoringSSL `kMaxTicketAgeSkewSeconds`, rustls
+    /// `MAX_FRESHNESS_SKEW_MS`: 60). A recorded ClientHello stays within it
+    /// for up to twice this long after it was sent.
+    max_age_skew_s: u32 = 60,
+};
+
+/// Single use for the tickets that carry early data (RFC 8446 §8.1).
+pub const ReplayGuard = struct {
+    ctx: ?*anyopaque = null,
+    /// True the first time `ticket` (the PSK identity, the ticket blob as
+    /// sent; valid during the call) asks for early data; false for a ticket
+    /// seen before, or when the guard cannot tell (fail closed). `now_ms`
+    /// is `Tickets.clock`'s reading. It must remember a ticket for at least
+    /// twice `EarlyData.max_age_skew_s` plus one second (ages are compared
+    /// in whole seconds; a recording replayed later is refused by its age).
+    /// Its memory is its scope: a guard per process lets a recording through
+    /// on another instance, or after a restart within that window; a clock
+    /// stepped back re-arms what it forgot.
+    admit: *const fn (ctx: ?*anyopaque, ticket: []const u8, now_ms: i64) bool,
+};
+
+/// A `ReplayGuard` over a `tlsresume.replay.StrikeRegister` (its window at
+/// least twice `EarlyData.max_age_skew_s` plus one second; full or out of
+/// memory refuses).
+/// The register is not locked: servers on several threads sharing it need
+/// a guard of their own that takes a lock around `checkAndMark`.
+pub fn strikeRegisterGuard(register: *tlsresume.replay.StrikeRegister) ReplayGuard {
+    return .{ .ctx = register, .admit = StrikeRegisterAdmit.admit };
+}
+
+const StrikeRegisterAdmit = struct {
+    fn admit(ctx: ?*anyopaque, ticket: []const u8, now_ms: i64) bool {
+        const register: *tlsresume.replay.StrikeRegister = @ptrCast(@alignCast(ctx.?));
+        return register.checkAndMark(ticket, now_ms) catch false;
+    }
+};
+
+/// Why early data was or was not taken (BoringSSL `ssl_early_data_reason_t`,
+/// whose names `name` gives).
+pub const EarlyDataReason = enum {
+    /// `Config.early_data` is null (or takes none), or there are no tickets.
+    disabled,
+    accepted,
+    /// The client offered no early data.
+    peer_declined,
+    /// The client offered no ticket.
+    no_session_offered,
+    /// The client's tickets were not resumed.
+    session_not_resumed,
+    /// The ticket resumed was issued without early data.
+    unsupported_for_session,
+    /// A HelloRetryRequest was sent (RFC 8446 §4.2.10).
+    hello_retry_request,
+    /// The protocol negotiated is not the ticket's (RFC 8446 §4.2.10).
+    alpn_mismatch,
+    /// The reported ticket age is off by more than `max_age_skew_s`.
+    ticket_age_skew,
+    /// The ticket resumed is not the first one offered (RFC 8446 §4.2.10).
+    not_first_identity,
+    /// `ReplayGuard.admit` refused the ticket.
+    replayed,
+
+    /// BoringSSL's `SSL_early_data_reason_string` (this module's own two
+    /// reasons have names of their own).
+    pub fn name(r: EarlyDataReason) []const u8 {
+        return switch (r) {
+            .accepted => "accept",
+            else => @tagName(r),
+        };
+    }
 };
 
 /// The wall clock, milliseconds since the Unix epoch.
@@ -481,6 +585,23 @@ fn maxTicketLen(cfg: *const Config) usize {
 /// PSK identities looked at in one ClientHello; later ones are ignored.
 const max_psk_identities = 32;
 
+/// The ticket `choosePsk` resumed, for the early-data decision.
+const PskTaken = struct {
+    /// Its place among the offered identities.
+    index: u16 = 0,
+    /// The identity as sent (a slice of the ClientHello).
+    identity: []const u8 = "",
+    /// The ALPN protocol it was issued under.
+    alpn_buf: [255]u8 = undefined,
+    alpn_len: ?u8 = null,
+    /// Its `max_early_data_size` (0: it allows no early data).
+    max_early_data: u32 = 0,
+
+    fn alpn(t: *const PskTaken) ?[]const u8 {
+        return if (t.alpn_len) |n| t.alpn_buf[0..n] else null;
+    }
+};
+
 /// What this server appends to the `SessionState` in a ticket. The suite is
 /// last, so it is read from the same place whichever hash length the prefix
 /// was parsed with: a ticket of the other hash never matches the suite.
@@ -494,12 +615,14 @@ const TicketFields = struct {
     /// When the client proved that certificate (the full handshake's time,
     /// carried across resumptions), ms since the epoch.
     peer_auth_ms: i64 = 0,
+    /// The `max_early_data_size` the ticket was issued with (0: none).
+    max_early_data: u32 = 0,
     suite: u16,
 
-    const format: u8 = 2;
+    const format: u8 = 3;
     /// The longest run before the leaf, and the run after it.
     const head_max = 1 + 1 + 255 + 1 + 255 + 2;
-    const tail_len = 2 + 8 + 2;
+    const tail_len = 2 + 8 + 4 + 2;
 
     /// Writes the fields around a leaf that is already at `buf[leaf_at..]`
     /// (`f.peer`, if any, is that very slice): the run before it ends at
@@ -523,7 +646,8 @@ const TicketFields = struct {
         n += 2 + p.len;
         std.mem.writeInt(u16, buf[n..][0..2], f.peer_scheme, .big);
         std.mem.writeInt(i64, buf[n + 2 ..][0..8], f.peer_auth_ms, .big);
-        std.mem.writeInt(u16, buf[n + 10 ..][0..2], f.suite, .big);
+        std.mem.writeInt(u32, buf[n + 10 ..][0..4], f.max_early_data, .big);
+        std.mem.writeInt(u16, buf[n + 14 ..][0..2], f.suite, .big);
         return buf[start .. n + tail_len];
     }
 
@@ -546,14 +670,15 @@ const TicketFields = struct {
         if (tail.len - at < n or n > max_peer) return null;
         const peer: ?[]const u8 = if (n == 0) null else tail[at..][0..n];
         at += n;
-        if (tail.len - at != 12) return null;
+        if (tail.len - at != tail_len) return null;
         return .{
             .sni = v[0],
             .alpn = v[1],
             .peer = peer,
             .peer_scheme = std.mem.readInt(u16, tail[at..][0..2], .big),
             .peer_auth_ms = std.mem.readInt(i64, tail[at + 2 ..][0..8], .big),
-            .suite = std.mem.readInt(u16, tail[at + 10 ..][0..2], .big),
+            .max_early_data = std.mem.readInt(u32, tail[at + 10 ..][0..4], .big),
+            .suite = std.mem.readInt(u16, tail[at + 14 ..][0..2], .big),
         };
     }
 };
@@ -580,6 +705,10 @@ const Resumable = struct {
     peer: ?[]const u8 = null,
     peer_scheme: u16 = 0,
     peer_auth_ms: i64 = 0,
+    /// Out: that ticket's ALPN protocol, a slice of the scratch too, and
+    /// its `max_early_data_size`.
+    alpn: ?[]const u8 = null,
+    max_early_data: u32 = 0,
 
     fn accepts(w: *Resumable, tail: []const u8, age_ms: i64) bool {
         const f = TicketFields.parse(tail, w.max_peer) orelse return false;
@@ -589,6 +718,8 @@ const Resumable = struct {
         w.peer = f.peer;
         w.peer_scheme = f.peer_scheme;
         w.peer_auth_ms = f.peer_auth_ms;
+        w.alpn = f.alpn;
+        w.max_early_data = f.max_early_data;
         return true;
     }
 
@@ -657,6 +788,9 @@ pub const Error = inbound.Error || clientauth.VerifyError || error{
     Closed,
     /// Application data before the handshake completed.
     NotConnected,
+    /// More early data than `EarlyData.max_size` (`unexpected_message`,
+    /// rustls `TooMuchEarlyDataReceived`).
+    TooMuchEarlyData,
     /// More than `max_key_updates` KeyUpdates without application data
     /// between them (`unexpected_message`, as BoringSSL; rustls closes
     /// without an alert).
@@ -675,7 +809,7 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.NoApplicationProtocol => .no_application_protocol,
         error.InternalError => .internal_error,
         error.OutputFull, error.Closed, error.NotConnected => null,
-        error.TooManyKeyUpdates => .unexpected_message,
+        error.TooManyKeyUpdates, error.TooMuchEarlyData => .unexpected_message,
         error.CertificateRequired => .certificate_required,
         error.UnsupportedExtension => .unsupported_extension,
         error.BadCertificate => .bad_certificate,
@@ -709,7 +843,7 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
     const frag: usize = fragmentLen(cfg);
     var tickets: usize = 0;
     if (cfg.tickets) |tk| {
-        const one = 4 + 4 + 4 + 1 + 1 + 2 + maxTicketLen(cfg) + 2 + 4;
+        const one = 4 + 4 + 4 + 1 + 1 + 2 + maxTicketLen(cfg) + 2 + 4 + @as(usize, if (cfg.early_data != null) 8 else 0);
         tickets = tk.count * one;
         tickets += (tickets / frag + 1) * (record.header_len + 1 + record.tag_len);
     }
@@ -737,7 +871,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
     const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
-        (4 + 2 + 4 + 2 + 1 + 255 + 4) + // EncryptedExtensions
+        (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
     // Each message may end a record of its own: one more than the content
     // needs per message (HRR, SH, CCS ×2, EE, Certificate, CV, Finished).
@@ -750,6 +884,14 @@ pub const Event = union(enum) {
     need_more,
     /// The client's Finished verified: the connection is up.
     handshake_done,
+    /// The ClientHello's early data is taken (`Config.early_data`): the
+    /// server's flight is queued, `early_data` events follow until the
+    /// client's EndOfEarlyData, then `handshake_done`. The server may write
+    /// from here on (half-RTT data, before the client is authenticated).
+    early_data_accepted,
+    /// 0-RTT application data, which a recorded ClientHello can replay (RFC
+    /// 8446 §8): a slice as for `app_data`.
+    early_data: []u8,
     /// Application data, a slice of the buffer given to `feed` (inside
     /// `consumed`: use it before discarding those octets).
     app_data: []u8,
@@ -762,7 +904,7 @@ pub const Result = struct {
     consumed: usize,
 };
 
-const State = enum { client_hello, client_hello_retry, client_certificate, client_certificate_verify, client_finished, connected, failed };
+const State = enum { client_hello, client_hello_retry, early_data, client_certificate, client_certificate_verify, client_finished, connected, failed };
 
 const Transcript = union(enum) {
     sha256: tls13.transcript.Transcript(Sha256),
@@ -842,6 +984,13 @@ pub const Server = struct {
     peer_scheme: u16 = 0,
     /// When the client proved the leaf (`TicketFields.peer_auth_ms`).
     peer_auth_ms: i64 = 0,
+    /// What became of the client's early data (set at the last ClientHello).
+    early_reason: EarlyDataReason = .disabled,
+    /// The first ClientHello offered early data, and a HelloRetryRequest
+    /// answered it.
+    early_hrr: bool = false,
+    /// Early plaintext the client may still send (`EarlyData.max_size`).
+    early_left: u32 = 0,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -925,9 +1074,9 @@ pub const Server = struct {
     /// On a resumption, how far the client's idea of the ticket's age is
     /// ahead of the server's (negative: behind), in seconds — each age
     /// truncated to whole seconds first, as BoringSSL
-    /// `SSL_get_ticket_age_skew`. Null without a resumption. The age is
-    /// not checked: no early data is taken, so a replayed ClientHello gains
-    /// nothing (RFC 8446 §8).
+    /// `SSL_get_ticket_age_skew`. Null without a resumption. It decides
+    /// only whether early data is taken (`EarlyData.max_age_skew_s`): a
+    /// resumption without early data gains a replayer nothing (RFC 8446 §8).
     pub fn ticketAgeSkew(self: *const Server) ?i64 {
         return if (self.resumed) self.age_skew_s else null;
     }
@@ -936,6 +1085,9 @@ pub const Server = struct {
     /// `ClientCertVerifier` accepted), once the client proved it holds its
     /// key; null without client authentication. On a resumption, the one
     /// of the handshake that issued the ticket. Valid while `self` is.
+    /// While `inEarlyData()` (and until the client's Finished) that identity
+    /// is only claimed: a replayed ClientHello carries the same ticket, so
+    /// early data attributed to it may come from a replayer (RFC 8446 §8).
     pub fn peerCertificate(self: *const Server) ?[]const u8 {
         return if (self.peer_authenticated) self.peerLeaf() else null;
     }
@@ -945,6 +1097,35 @@ pub const Server = struct {
     /// issued the ticket (BoringSSL `SSL_get_peer_signature_algorithm`).
     pub fn peerSignatureScheme(self: *const Server) ?u16 {
         return if (self.peer_authenticated and self.peer_scheme != 0) self.peer_scheme else null;
+    }
+
+    /// The client's early data was taken (BoringSSL `SSL_early_data_accepted`).
+    pub fn earlyDataAccepted(self: *const Server) bool {
+        return self.early_reason == .accepted;
+    }
+
+    /// Why the client's early data was or was not taken (BoringSSL
+    /// `SSL_get_early_data_reason`); meaningful once the ClientHello was
+    /// accepted.
+    pub fn earlyDataReason(self: *const Server) EarlyDataReason {
+        return self.early_reason;
+    }
+
+    /// Early data was taken and the client's EndOfEarlyData has not come
+    /// yet: application data received now is 0-RTT (BoringSSL
+    /// `SSL_in_early_data`).
+    pub fn inEarlyData(self: *const Server) bool {
+        return self.state == .early_data;
+    }
+
+    /// Application data may be written: the handshake completed, or the
+    /// server's flight is out after taking early data (half-RTT).
+    pub fn canWrite(self: *const Server) bool {
+        return switch (self.state) {
+            .connected => true,
+            .early_data, .client_finished => self.early_reason == .accepted,
+            else => false,
+        };
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
@@ -969,6 +1150,12 @@ pub const Server = struct {
             switch (r.event) {
                 .need_more => return .{ .event = .need_more, .consumed = at },
                 .app_data => |d| {
+                    if (self.state == .early_data) {
+                        // RFC 8446 §4.2.10: no more than max_early_data_size.
+                        if (d.len > self.early_left) return self.fail(error.TooMuchEarlyData);
+                        self.early_left -= @intCast(d.len);
+                        return .{ .event = .{ .early_data = d }, .consumed = at };
+                    }
                     self.key_updates_left = max_key_updates;
                     return .{ .event = .{ .app_data = d }, .consumed = at };
                 },
@@ -977,8 +1164,8 @@ pub const Server = struct {
                     return .{ .event = .peer_closed, .consumed = at };
                 },
                 .handshake => |m| {
-                    const done = self.onHandshake(m) catch |err| return self.fail(err);
-                    if (done) return .{ .event = .handshake_done, .consumed = at };
+                    const ev = self.onHandshake(m) catch |err| return self.fail(err);
+                    if (ev) |e| return .{ .event = e, .consumed = at };
                 },
             }
         }
@@ -990,12 +1177,7 @@ pub const Server = struct {
     /// that first (`error.OutputFull` when nothing was taken). An output
     /// smaller than `full_record_output_len` cuts records to what it holds.
     pub fn write(self: *Server, data: []const u8) Error!usize {
-        switch (self.state) {
-            .connected => {},
-            .failed => return error.Closed,
-            else => return error.NotConnected,
-        }
-        if (self.write_closed) return error.Closed;
+        try self.checkWritable();
         var done: usize = 0;
         while (done < data.len) {
             const s = try self.writeSlot();
@@ -1021,12 +1203,7 @@ pub const Server = struct {
     /// send the pending output first. A KeyUpdate that is due goes out
     /// before the slot is given.
     pub fn writeSlot(self: *Server) Error![]u8 {
-        switch (self.state) {
-            .connected => {},
-            .failed => return error.Closed,
-            else => return error.NotConnected,
-        }
-        if (self.write_closed) return error.Closed;
+        try self.checkWritable();
         // RFC 8446 §5.5: retire the key well before its usage limit.
         if (self.out.tx.seq >= max_records_per_key and self.tx_update == null)
             self.tx_update = .update_requested;
@@ -1047,13 +1224,18 @@ pub const Server = struct {
     pub fn commitWrite(self: *Server, n: usize) Error!void {
         self.closeWriteSlot(n);
         if (n == 0) return;
-        if (self.state != .connected or self.write_closed) return error.Closed;
+        if (!self.canWrite() or self.write_closed) return error.Closed;
         std.debug.assert(n <= self.out.max_fragment);
         self.out.commit(.application_data, n) catch |err| {
             // Not sealed: the plaintext does not wait for `deinit` to go.
             zeroize(self.out.buf[self.out.len..]);
             return self.fail(err);
         };
+    }
+
+    fn checkWritable(self: *const Server) Error!void {
+        if (self.state == .failed or self.write_closed) return error.Closed;
+        if (!self.canWrite()) return error.NotConnected;
     }
 
     /// Give up the last `writeSlot` after writing its first `n` octets
@@ -1156,39 +1338,61 @@ pub const Server = struct {
         return e;
     }
 
-    fn onHandshake(self: *Server, m: inbound.HandshakeMessage) Error!bool {
+    /// The event a handshake message ends with, if any.
+    fn onHandshake(self: *Server, m: inbound.HandshakeMessage) Error!?Event {
         const t: messages.HandshakeType = @fromBackingInt(m.msg_type);
         switch (self.state) {
             .client_hello, .client_hello_retry => {
                 if (t != .client_hello) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientHello, .{ self, m });
-                return false;
+                return if (self.state == .early_data) .early_data_accepted else null;
+            },
+            .early_data => {
+                if (t != .end_of_early_data) return error.UnexpectedMessage;
+                try self.onEndOfEarlyData(m);
+                return null;
             },
             // No secret is touched: the chain and the signature are public.
             .client_certificate => {
                 if (t != .certificate) return error.UnexpectedMessage;
                 try self.onClientCertificate(m);
-                return false;
+                return null;
             },
             .client_certificate_verify => {
                 if (t != .certificate_verify) return error.UnexpectedMessage;
                 try self.onClientCertificateVerify(m);
-                return false;
+                return null;
             },
             .client_finished => {
                 if (t != .finished) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientFinished, .{ self, m });
-                return true;
+                return .handshake_done;
             },
             // Of the post-handshake messages a client sends only KeyUpdate
             // (no post-handshake authentication is requested).
             .connected => {
                 if (t != .key_update) return error.UnexpectedMessage;
                 try self.onKeyUpdate(m);
-                return false;
+                return null;
             },
             .failed => unreachable,
         }
+    }
+
+    /// RFC 8446 §4.5: the early data ends; the client's next messages come
+    /// under its handshake secret. It must end its record (`installRx`
+    /// refuses held octets: BoGo `PartialEndOfEarlyDataWithClientHello`).
+    /// No secret is derived: the handshake secret is installed as is.
+    fn onEndOfEarlyData(self: *Server, m: inbound.HandshakeMessage) Error!void {
+        if (m.body.len != 0) return error.DecodeError;
+        self.appendTranscript(m);
+        const L = self.suite.hashLen() orelse unreachable;
+        self.inbound.installRx(self.suite, self.client_handshake_secret[0..L]) catch |err| return switch (err) {
+            error.UnexpectedMessage => error.UnexpectedMessage,
+            else => error.InternalError,
+        };
+        self.inbound.early_data_ok = false;
+        self.state = .client_finished;
     }
 
     /// RFC 8446 §4.6.3: the client's next messages come under its next
@@ -1296,12 +1500,14 @@ pub const Server = struct {
         defer std.crypto.secureZero(u8, &psk_buf);
         var psk: ?[]const u8 = null;
         var selected: ?u16 = null;
+        var taken: PskTaken = .{};
         if (cfg.tickets) |tk| {
             if (ch.pre_shared_key) |offer| {
-                selected = switch (suite) {
-                    .aes_256_gcm_sha384 => try self.choosePsk(S384, tk, m.body, offer, suite, sni, &psk_buf),
-                    else => try self.choosePsk(S256, tk, m.body, offer, suite, sni, &psk_buf),
+                const took = switch (suite) {
+                    .aes_256_gcm_sha384 => try self.choosePsk(S384, tk, m.body, offer, suite, sni, &psk_buf, &taken),
+                    else => try self.choosePsk(S256, tk, m.body, offer, suite, sni, &psk_buf, &taken),
                 };
+                if (took) selected = taken.index;
             }
             const modes = ch.psk_key_exchange_modes orelse "";
             if (std.mem.indexOfScalar(u8, modes, psk_dhe_ke) != null) {
@@ -1339,22 +1545,66 @@ pub const Server = struct {
             error.KeyExchangeFailed => error.IllegalParameter,
             error.MissingKeyShare => if (kex.expectedShareLen(group) != 0) error.IllegalParameter else error.InternalError,
         };
+        // After the exchange: a share refused does not spend the ticket's
+        // single use.
+        self.early_reason = self.decideEarlyData(&ch, selected != null, &taken);
+        const early = self.early_reason == .accepted;
 
         self.suite = suite;
         self.has_suite = true;
         self.group = group;
         switch (suite) {
-            .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected),
-            else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected),
+            .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
+            else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
+        }
+        if (early) {
+            self.inbound.early_data_ok = true;
+            // The ticket's promise, or less if the server now takes less.
+            self.early_left = @min(cfg.early_data.?.max_size, taken.max_early_data);
+            self.state = .early_data;
+            return;
         }
         // Early data the client may have sent under a PSK we did not take
         // (never after a retry: refused above).
-        self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
+        self.inbound.skip_early = if (ch.early_data) skipBudget(cfg) else 0;
         self.state = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
     }
 
-    /// RFC 8446 §4.2.11 through `tlsresume.select.selectPsk`: the index of
-    /// the identity taken, its PSK in `psk_out`; null for a full handshake.
+    /// Early data refused is skipped up to 2^14 octets of ciphertext, or
+    /// `EarlyData.max_size` if that is more (rustls skips the configured
+    /// size, 2^14 without one; BoringSSL always 2^14). Ciphertext: a client
+    /// sending its `max_size` in many small records can run past it (each
+    /// costs 17 octets more) and is then refused, as with rustls.
+    fn skipBudget(cfg: *const Config) usize {
+        const max: usize = if (cfg.early_data) |ed| ed.max_size else 0;
+        return @max(record.max_plaintext_len, max);
+    }
+
+    /// RFC 8446 §4.2.10 and §8, in BoringSSL's order of reasons: early data
+    /// is taken on a resumption of the first identity offered, with the
+    /// ticket's ALPN protocol, a fresh reported age and no HelloRetryRequest
+    /// (the suite and the version are the ticket's already: `Resumable`) —
+    /// then the replay guard is asked, and only then (it remembers).
+    fn decideEarlyData(self: *Server, ch: *const hello.ClientHello, resumed: bool, taken: *const PskTaken) EarlyDataReason {
+        const cfg = self.config;
+        const ed = cfg.early_data orelse return .disabled;
+        const tk = cfg.tickets orelse return .disabled;
+        if (ed.max_size == 0) return .disabled;
+        if (ch.pre_shared_key == null) return .no_session_offered;
+        if (!resumed) return .session_not_resumed;
+        // BoringSSL decides on the first ClientHello, which the retry answered.
+        if (self.early_hrr) return .hello_retry_request;
+        if (!ch.early_data) return .peer_declined;
+        if (taken.max_early_data == 0) return .unsupported_for_session;
+        if (taken.index != 0) return .not_first_identity;
+        if (!optEql(taken.alpn(), self.alpn)) return .alpn_mismatch;
+        if (@abs(self.age_skew_s) > ed.max_age_skew_s) return .ticket_age_skew;
+        if (!ed.replay.admit(ed.replay.ctx, taken.identity, tk.clock.now_ms(tk.clock.ctx))) return .replayed;
+        return .accepted;
+    }
+
+    /// RFC 8446 §4.2.11 through `tlsresume.select.selectPsk`: whether a
+    /// ticket was taken; its PSK in `psk_out`, the rest in `taken`.
     fn choosePsk(
         self: *Server,
         comptime H: type,
@@ -1364,7 +1614,8 @@ pub const Server = struct {
         suite: record.CipherSuite,
         sni: ?[]const u8,
         psk_out: *[48]u8,
-    ) Error!?u16 {
+        taken: *PskTaken,
+    ) Error!bool {
         const L = H.len;
         var ids: [max_psk_identities]tlsresume.select.OfferedIdentity = undefined;
         var binders: [max_psk_identities][L]u8 = undefined;
@@ -1405,9 +1656,17 @@ pub const Server = struct {
         var sel: tlsresume.select.Selection(L) = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
         tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, scratch) catch |err| return switch (err) {
-            error.NoAcceptableIdentity => null,
+            error.NoAcceptableIdentity => false,
             error.BinderMismatch => error.DecryptError,
         };
+        taken.index = @intCast(sel.selected_index);
+        taken.identity = ids[sel.selected_index].ticket;
+        taken.alpn_len = null;
+        taken.max_early_data = want.max_early_data;
+        if (want.alpn) |p| {
+            @memcpy(taken.alpn_buf[0..p.len], p);
+            taken.alpn_len = @intCast(p.len);
+        }
         @memcpy(psk_out[0..L], &sel.psk);
         const reported_ms = ids[sel.selected_index].obfuscated_ticket_age -% sel.session.ticket_age_add;
         self.age_skew_s = @as(i64, reported_ms / 1000) - @divTrunc(now_ms - sel.session.issued_at_ms, 1000);
@@ -1422,7 +1681,7 @@ pub const Server = struct {
             self.peer_scheme = want.peer_scheme;
             self.peer_auth_ms = want.peer_auth_ms;
         }
-        return @intCast(sel.selected_index);
+        return true;
     }
 
     /// The key's first allowed scheme (`CertifiedKey.signature_schemes`
@@ -1509,6 +1768,7 @@ pub const Server = struct {
         self.has_suite = true;
         self.group = group;
         self.retried = true;
+        self.early_hrr = ch.early_data;
         self.setServerName(sni);
         switch (suite) {
             .aes_256_gcm_sha384 => try self.sendRetry(S384, client_hello_raw, ch),
@@ -1519,7 +1779,7 @@ pub const Server = struct {
         self.inbound.ccs_left += 1;
         // RFC 8446 §4.2.10: the client's early data is skipped up to the
         // budget (rustls: 16 KiB when the server takes none).
-        self.inbound.skip_early = if (ch.early_data) record.max_plaintext_len else 0;
+        self.inbound.skip_early = if (ch.early_data) skipBudget(self.config) else 0;
         self.state = .client_hello_retry;
     }
 
@@ -1562,10 +1822,14 @@ pub const Server = struct {
         /// A resumption: the PSK and the identity it came from.
         psk: ?[]const u8,
         selected_identity: ?u16,
+        /// The client's early data is taken (`decideEarlyData`).
+        early: bool,
     ) Error!void {
         const cfg = self.config;
         const t = H.transcript(&self.transcript);
         t.append(client_hello_raw[0], client_hello_raw[4..]);
+        // RFC 8446 §7.1: client_early_traffic_secret over the ClientHello.
+        const ch_hash = t.currentHash();
 
         var random: [32]u8 = undefined;
         cfg.random.bytes(&random);
@@ -1582,25 +1846,32 @@ pub const Server = struct {
         const L = H.len;
         var empty_hash: [L]u8 = undefined;
         H.Hash.hash("", &empty_hash, .{});
-        var early: [L]u8 = undefined;
-        defer std.crypto.secureZero(u8, &early);
+        var early_secret: [L]u8 = undefined;
+        defer std.crypto.secureZero(u8, &early_secret);
         const zeros: [L]u8 = @splat(0);
-        tls13.keyschedule.earlySecret(H.Hkdf, &early, psk orelse &zeros);
+        tls13.keyschedule.earlySecret(H.Hkdf, &early_secret, psk orelse &zeros);
         const hs = self.handshake_secret[0..L];
-        ks.deriveHandshakeSecret(H.Hkdf, hs, &early, &empty_hash, ex.shared.slice());
+        ks.deriveHandshakeSecret(H.Hkdf, hs, &early_secret, &empty_hash, ex.shared.slice());
         var server_hs: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &server_hs);
         var th = t.currentHash();
         ks.deriveHandshakeTrafficSecrets(H.Hkdf, self.client_handshake_secret[0..L], &server_hs, hs, &th);
         self.out.installTx(self.suite, &server_hs) catch return error.InternalError;
-        self.inbound.installRx(self.suite, self.client_handshake_secret[0..L]) catch |err| return switch (err) {
+        // The client goes on under its early secret until EndOfEarlyData
+        // (`onEndOfEarlyData` installs the handshake one), or at once under
+        // its handshake secret.
+        var client_early: [L]u8 = undefined;
+        defer std.crypto.secureZero(u8, &client_early);
+        if (early) ks.deriveSecret(H.Hkdf, &client_early, &early_secret, "c e traffic", &ch_hash);
+        const rx: []const u8 = if (early) &client_early else self.client_handshake_secret[0..L];
+        self.inbound.installRx(self.suite, rx) catch |err| return switch (err) {
             error.UnexpectedMessage => error.UnexpectedMessage,
             else => error.InternalError,
         };
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [2]messages.Extension = undefined;
+        var exts: [3]messages.Extension = undefined;
         var n_exts: usize = 0;
         if (self.alpn) |p| {
             exts[n_exts] = .{ .type = 16, .data = try encoded(messages.alpnData(&alpn_body, p)) };
@@ -1609,6 +1880,11 @@ pub const Server = struct {
         // RFC 6066 §3: not when resuming (rustls).
         if (self.sni_len != null and psk == null) {
             exts[n_exts] = .{ .type = 0, .data = "" };
+            n_exts += 1;
+        }
+        // RFC 8446 §4.2.10: the early data is taken.
+        if (early) {
+            exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.early_data), .data = "" };
             n_exts += 1;
         }
         try self.send(H, try encoded(messages.encryptedExtensions(self.out.slot(), exts[0..n_exts])));
@@ -1768,7 +2044,10 @@ pub const Server = struct {
             error.UnexpectedMessage => error.UnexpectedMessage,
             else => error.InternalError,
         };
-        if (self.tickets_due != 0) {
+        // Nothing is sent after close_notify, which a server writing
+        // half-RTT data may have sent before this Finished: the send key is
+        // gone, and a ticket would go out in the clear.
+        if (self.tickets_due != 0 and !self.write_closed) {
             const through_finished = t.currentHash();
             self.issueTickets(H, &through_finished);
         }
@@ -1797,7 +2076,16 @@ pub const Server = struct {
         var no_peer: [ticket_head_len + TicketFields.tail_len]u8 = undefined;
         const buf: []u8 = if (self.peer_buf.len >= no_peer.len) self.peer_buf else &no_peer;
         defer zeroize(buf[0..ticket_head_len]);
-        const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .peer = self.peerCertificate(), .peer_scheme = self.peerSignatureScheme() orelse 0, .peer_auth_ms = self.peer_auth_ms, .suite = @backingInt(self.suite) };
+        const early_ext: usize = if (self.config.early_data) |ed| (if (ed.max_size != 0) 8 else 0) else 0;
+        const fields: TicketFields = .{
+            .sni = self.serverName(),
+            .alpn = self.alpn,
+            .peer = self.peerCertificate(),
+            .peer_scheme = self.peerSignatureScheme() orelse 0,
+            .peer_auth_ms = self.peer_auth_ms,
+            .max_early_data = if (early_ext != 0) self.config.early_data.?.max_size else 0,
+            .suite = @backingInt(self.suite),
+        };
         const prefix_len = Session.wireLen(1);
         const slot = self.out.slot();
         var used: usize = 0;
@@ -1812,9 +2100,10 @@ pub const Server = struct {
             var aead_nonce: [12]u8 = undefined;
             self.config.random.bytes(&aead_nonce);
             // NewSessionTicket (RFC 8446 §4.6.1): type, length, lifetime,
-            // age_add, nonce<1>, ticket<2>, then one empty GREASE extension.
+            // age_add, nonce<1>, ticket<2>, then early_data (§4.2.10) when
+            // early data is taken, and one empty GREASE extension.
             const head = 4 + 4 + 4 + 1 + nonce.len + 2;
-            const ext = 2 + 4;
+            const ext = 2 + early_ext + 4;
             if (slot.len - used < head + 1 + ext) break;
             const room = slot[used + head ..][0..@min(slot.len - used - head - ext, std.math.maxInt(u16))];
             const ticket = tk.ticketer.seal(tk.ticketer.ctx, plain, aead_nonce, room) orelse break;
@@ -1829,10 +2118,17 @@ pub const Server = struct {
             m[13] = nonce[0];
             std.mem.writeInt(u16, m[14..16], @intCast(ticket.len), .big);
             const g: u16 = self.config.random.int(u4);
-            const e = m[head + ticket.len ..];
-            std.mem.writeInt(u16, e[0..2], 4, .big);
-            std.mem.writeInt(u16, e[2..4], (g << 12) | (g << 4) | 0x0a0a, .big);
-            std.mem.writeInt(u16, e[4..6], 0, .big);
+            var e = m[head + ticket.len ..];
+            std.mem.writeInt(u16, e[0..2], @intCast(early_ext + 4), .big);
+            e = e[2..];
+            if (early_ext != 0) {
+                std.mem.writeInt(u16, e[0..2], @backingInt(hello.ExtensionType.early_data), .big);
+                std.mem.writeInt(u16, e[2..4], 4, .big);
+                std.mem.writeInt(u32, e[4..8], self.config.early_data.?.max_size, .big);
+                e = e[8..];
+            }
+            std.mem.writeInt(u16, e[0..2], (g << 12) | (g << 4) | 0x0a0a, .big);
+            std.mem.writeInt(u16, e[2..4], 0, .big);
             used += m.len;
         }
         // `slot` leaves room for the records' overhead.
@@ -1975,10 +2271,6 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         defer gpa.free(d);
         try W.ext(&e, gpa, 27, d);
     }
-    if (h.psk_without_modes) {
-        const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
-        try W.ext(&e, gpa, 41, &psk);
-    }
     if (h.psk_modes) |m| {
         var d: [8]u8 = undefined;
         d[0] = @intCast(m.len);
@@ -1986,6 +2278,11 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         try W.ext(&e, gpa, 45, d[0 .. 1 + m.len]);
     }
     if (h.early_data) try W.ext(&e, gpa, 42, "");
+    // pre_shared_key last (RFC 8446 §4.2.11).
+    if (h.psk_without_modes) {
+        const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
+        try W.ext(&e, gpa, 41, &psk);
+    }
     try W.u16be(&b, gpa, e.items.len);
     try b.appendSlice(gpa, e.items);
     const body_len = b.items.len - 9;
@@ -3092,13 +3389,15 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     for ([_]TicketFields{
         .{ .sni = "example.com", .alpn = "h2", .peer = null, .suite = 0x1302 },
         .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0804, .suite = 0x1301 },
-        .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .suite = 0x1303 },
+        .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .peer_auth_ms = -2, .max_early_data = 0xfedc_ba98, .suite = 0x1303 },
     }) |f| {
         const w = testTicketFields(&buf, f);
         const n = w.len;
         const back = TicketFields.parse(w, cap).?;
         try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and
             Server.optEql(f.peer, back.peer) and f.peer_scheme == back.peer_scheme and f.suite == back.suite);
+        try testing.expectEqual(f.peer_auth_ms, back.peer_auth_ms);
+        try testing.expectEqual(f.max_early_data, back.max_early_data);
         // Every truncation, an extra octet and another format are refused.
         for (0..n) |cut| try testing.expect(TicketFields.parse(w[0..cut], cap) == null);
         const start = w.ptr - &buf;
@@ -3197,6 +3496,265 @@ test "tickets only for a client that offers psk_dhe_ke (rustls)" {
     try testing.expectEqual(@as(u8, 0), s.tickets_due);
 }
 
+// ── 0-RTT ────────────────────────────────────────────────────────────────
+
+const NoTickets = struct {
+    fn seal(_: *const anyopaque, _: []const u8, _: [12]u8, _: []u8) ?[]u8 {
+        return null;
+    }
+    fn open(_: *const anyopaque, _: []const u8, _: i64, _: []u8) ?[]u8 {
+        return null;
+    }
+    fn now(_: ?*anyopaque) i64 {
+        return 0;
+    }
+    const none: u8 = 0;
+    const tickets: Tickets = .{ .ticketer = .{ .ctx = &none, .seal = seal, .open = open }, .clock = .{ .now_ms = now } };
+};
+
+/// Counts its calls; admits while `answer`.
+const CountingGuard = struct {
+    asked: usize = 0,
+    answer: bool = true,
+
+    fn guard(g: *CountingGuard) ReplayGuard {
+        return .{ .ctx = g, .admit = admit };
+    }
+
+    fn admit(ctx: ?*anyopaque, ticket: []const u8, _: i64) bool {
+        const g: *CountingGuard = @ptrCast(@alignCast(ctx.?));
+        std.debug.assert(std.mem.eql(u8, ticket, "TICKET"));
+        g.asked += 1;
+        return g.answer;
+    }
+};
+
+test "early data: BoringSSL's order of reasons, the replay guard asked last" {
+    var g: CountingGuard = .{};
+    var early: EarlyData = .{ .replay = g.guard() };
+    var prng = std.Random.DefaultPrng.init(1);
+    var cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &NoTickets.tickets, .early_data = &early };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const Parsed = struct {
+        rec: []u8,
+        ch: hello.ClientHello,
+        fn of(h: Hello) !@This() {
+            const rec = try buildRecord(testing.allocator, h);
+            errdefer testing.allocator.free(rec);
+            return .{ .rec = rec, .ch = try hello.parseClientHello(rec[5 + 4 ..]) };
+        }
+    };
+    const offer = try Parsed.of(.{ .psk_without_modes = true, .early_data = true });
+    defer testing.allocator.free(offer.rec);
+    const no_early = try Parsed.of(.{ .psk_without_modes = true });
+    defer testing.allocator.free(no_early.rec);
+    const no_psk = try Parsed.of(.{ .early_data = true });
+    defer testing.allocator.free(no_psk.rec);
+    var taken: PskTaken = .{ .identity = "TICKET", .max_early_data = 14336 };
+    taken.alpn_buf[0..2].* = "h2".*;
+
+    // What is checked before the ticket.
+    try testing.expectEqual(EarlyDataReason.accepted, s.decideEarlyData(&offer.ch, true, &taken));
+    try testing.expectEqual(@as(usize, 1), g.asked);
+    cfg.early_data = null;
+    try testing.expectEqual(EarlyDataReason.disabled, s.decideEarlyData(&offer.ch, true, &taken));
+    cfg.early_data = &early;
+    cfg.tickets = null;
+    try testing.expectEqual(EarlyDataReason.disabled, s.decideEarlyData(&offer.ch, true, &taken));
+    cfg.tickets = &NoTickets.tickets;
+    early.max_size = 0;
+    try testing.expectEqual(EarlyDataReason.disabled, s.decideEarlyData(&offer.ch, true, &taken));
+    early.max_size = 14336;
+    try testing.expectEqual(EarlyDataReason.no_session_offered, s.decideEarlyData(&no_psk.ch, true, &taken));
+    try testing.expectEqual(EarlyDataReason.session_not_resumed, s.decideEarlyData(&offer.ch, false, &taken));
+    s.early_hrr = true;
+    try testing.expectEqual(EarlyDataReason.hello_retry_request, s.decideEarlyData(&offer.ch, true, &taken));
+    s.early_hrr = false;
+    try testing.expectEqual(EarlyDataReason.peer_declined, s.decideEarlyData(&no_early.ch, true, &taken));
+
+    // What the ticket must match (RFC 8446 §4.2.10).
+    var t = taken;
+    t.max_early_data = 0;
+    try testing.expectEqual(EarlyDataReason.unsupported_for_session, s.decideEarlyData(&offer.ch, true, &t));
+    t = taken;
+    t.index = 1;
+    try testing.expectEqual(EarlyDataReason.not_first_identity, s.decideEarlyData(&offer.ch, true, &t));
+    t = taken;
+    t.alpn_len = 2;
+    try testing.expectEqual(EarlyDataReason.alpn_mismatch, s.decideEarlyData(&offer.ch, true, &t));
+    s.alpn = "h2";
+    try testing.expectEqual(EarlyDataReason.alpn_mismatch, s.decideEarlyData(&offer.ch, true, &taken));
+    try testing.expectEqual(EarlyDataReason.accepted, s.decideEarlyData(&offer.ch, true, &t));
+    s.alpn = null;
+    for ([_]struct { i64, EarlyDataReason }{ .{ 60, .accepted }, .{ -60, .accepted }, .{ 61, .ticket_age_skew }, .{ -61, .ticket_age_skew } }) |c| {
+        s.age_skew_s = c[0];
+        try testing.expectEqual(c[1], s.decideEarlyData(&offer.ch, true, &taken));
+    }
+    s.age_skew_s = 0;
+    try testing.expectEqual(@as(usize, 4), g.asked);
+
+    // The guard, last: its refusal is the reason.
+    g.answer = false;
+    try testing.expectEqual(EarlyDataReason.replayed, s.decideEarlyData(&offer.ch, true, &taken));
+    try testing.expectEqual(@as(usize, 5), g.asked);
+    try testing.expectEqualStrings("accept", EarlyDataReason.accepted.name());
+    try testing.expectEqualStrings("ticket_age_skew", EarlyDataReason.ticket_age_skew.name());
+}
+
+/// A server white-box in the early-data state: the client's early secret
+/// (`early_secret`) installed, its handshake secret all `0x22`.
+fn earlyServer(s: *Server, early_secret: []const u8) !void {
+    s.suite = .aes_128_gcm_sha256;
+    s.has_suite = true;
+    s.startTranscript(s.suite);
+    s.early_reason = .accepted;
+    s.client_handshake_secret = @splat(0x22);
+    try s.inbound.installRx(s.suite, early_secret);
+    s.inbound.handshake_seen = true;
+    s.inbound.early_data_ok = true;
+    s.early_left = 4;
+    s.state = .early_data;
+}
+
+test "early data: EndOfEarlyData (empty, a message of its own) switches to the handshake secret" {
+    var g: CountingGuard = .{};
+    const early: EarlyData = .{ .replay = g.guard() };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &NoTickets.tickets, .early_data = &early };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    const secret: [32]u8 = @splat(0x11);
+    {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        try earlyServer(&s, &secret);
+        try testing.expect(s.inEarlyData() and s.canWrite() and !s.isConnected());
+        try testing.expectError(error.DecodeError, s.onHandshake(handshakeMessage(&.{ 5, 0, 0, 1, 0 })));
+    }
+    for ([_]u8{ 0, 1, 15, 20, 24 }) |t| {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        try earlyServer(&s, &secret);
+        try testing.expectError(error.UnexpectedMessage, s.onHandshake(handshakeMessage(&.{ t, 0, 0, 0 })));
+    }
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    try earlyServer(&s, &secret);
+    try testing.expect(try s.onHandshake(handshakeMessage(&.{ 5, 0, 0, 0 })) == null);
+    try testing.expectEqual(State.client_finished, s.state);
+    try testing.expect(!s.inEarlyData() and !s.inbound.early_data_ok and s.canWrite());
+    // Records now open under the handshake secret, not the early one.
+    var tx: record.Protection = undefined;
+    try tx.init(.aes_128_gcm_sha256, &(@as([32]u8, @splat(0x22))));
+    defer tx.wipe();
+    var rec: [64]u8 = undefined;
+    const fin = [_]u8{ 20, 0, 0, 32 } ++ @as([32]u8, @splat(0));
+    @memcpy(rec[record.header_len..][0..fin.len], &fin);
+    const r = try tx.seal(&rec, fin.len, .handshake, 0);
+    try testing.expectError(error.DecryptError, s.feed(rec[0..r.len]));
+
+    // Application data under the handshake secret, after EndOfEarlyData
+    // and before the Finished, is no early data any more.
+    var s2: Server = .init(&cfg, &joiner, &out);
+    defer s2.deinit();
+    try earlyServer(&s2, &secret);
+    _ = try s2.onHandshake(handshakeMessage(&.{ 5, 0, 0, 0 }));
+    var tx2: record.Protection = undefined;
+    try tx2.init(.aes_128_gcm_sha256, &(@as([32]u8, @splat(0x22))));
+    defer tx2.wipe();
+    @memcpy(rec[record.header_len..][0..2], "hi");
+    const r2 = try tx2.seal(&rec, 2, .application_data, 0);
+    try testing.expectError(error.UnexpectedMessage, s2.feed(rec[0..r2.len]));
+}
+
+test "early data: max_size is a budget of plaintext octets, more is unexpected_message" {
+    var g: CountingGuard = .{};
+    const early: EarlyData = .{ .replay = g.guard() };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &NoTickets.tickets, .early_data = &early };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    const secret: [32]u8 = @splat(0x11);
+    var tx: record.Protection = undefined;
+    try tx.init(.aes_128_gcm_sha256, &secret);
+    defer tx.wipe();
+    var recs: [128]u8 = undefined;
+    var n: usize = 0;
+    for ([_][]const u8{ "abc", "d", "e" }) |d| {
+        @memcpy(recs[n + record.header_len ..][0..d.len], d);
+        n += (try tx.seal(recs[n..], d.len, .application_data, 0)).len;
+    }
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    try earlyServer(&s, &secret);
+    var at: usize = 0;
+    for ([_][]const u8{ "abc", "d" }) |want| {
+        const r = try s.feed(recs[at..n]);
+        try testing.expectEqualStrings(want, r.event.early_data);
+        at += r.consumed;
+    }
+    try testing.expectEqual(@as(u32, 0), s.early_left);
+    try testing.expectError(error.TooMuchEarlyData, s.feed(recs[at..n]));
+    try testing.expectEqualSlices(u8, &.{ 21, 3, 3, 0, 2, 2, 10 }, s.pendingOutput());
+}
+
+test "early data: tickets advertise max_early_data_size; after a half-RTT close_notify none go out" {
+    var ring: tlsresume.stek.DefaultRing = .init();
+    ring.rotate(1, &(@as([32]u8, @splat(7))), 0);
+    const stek: StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
+    const tickets: Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = NoTickets.now }, .count = 1 };
+    var g: CountingGuard = .{};
+    const early: EarlyData = .{ .max_size = 0x01020304, .replay = g.guard() };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .tickets = &tickets, .early_data = &early };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    s.suite = .aes_128_gcm_sha256;
+    s.has_suite = true;
+    s.tickets_due = 1;
+    try s.out.installTx(s.suite, &(@as([32]u8, @splat(0x33))));
+    var th: [32]u8 = @splat(0);
+    s.issueTickets(S256, &th);
+    // Open the record: NewSessionTicket ‖ extensions early_data(42, 4) then GREASE.
+    var rx: record.Protection = undefined;
+    try rx.init(s.suite, &(@as([32]u8, @splat(0x33))));
+    defer rx.wipe();
+    const sealed = try testing.allocator.dupe(u8, s.pendingOutput());
+    defer testing.allocator.free(sealed);
+    const o = try rx.open(sealed);
+    const m = o.content;
+    try testing.expectEqual(@as(u8, 4), m[0]);
+    const tlen = std.mem.readInt(u16, m[14..16], .big);
+    const exts = m[16 + tlen ..];
+    try testing.expectEqualSlices(u8, &.{ 0, 12, 0, 42, 0, 4, 1, 2, 3, 4 }, exts[0..10]);
+    try testing.expectEqual(@as(usize, 2 + 8 + 4), exts.len);
+
+    // close_notify sent (half-RTT) before the client's Finished: the
+    // Finished still completes the handshake, but no ticket follows the
+    // close_notify (the send key is gone: it would go out in the clear).
+    s.discardOutput(s.pendingOutput().len);
+    s.startTranscript(s.suite);
+    s.early_reason = .accepted;
+    s.state = .client_finished;
+    s.client_handshake_secret = @splat(0x22);
+    try s.close();
+    const closed_len = s.pendingOutput().len;
+    s.tickets_due = 1;
+    var finished_key: [32]u8 = undefined;
+    ks.deriveFinishedKey(S256.Hkdf, 32, &finished_key, s.client_handshake_secret[0..32]);
+    const th0 = s.transcript.sha256.currentHash();
+    var fin = [_]u8{ 20, 0, 0, 32 } ++ @as([32]u8, undefined);
+    tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[4..36], &finished_key, &th0);
+    try testing.expect((try s.onHandshake(handshakeMessage(&fin))).? == .handshake_done);
+    try testing.expect(s.isConnected());
+    try testing.expectEqual(closed_len, s.pendingOutput().len);
+}
+
 // ── client certificates (RFC 8448 §6) ────────────────────────────────────
 
 const AcceptAny = struct {
@@ -3243,15 +3801,15 @@ test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) ver
     const leaf = cert_msg[11..][0..std.mem.readInt(u24, cert_msg[8..11], .big)];
     {
         var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
-        try testing.expect(!try s.onHandshake(handshakeMessage(cert_msg)));
+        try testing.expect(try s.onHandshake(handshakeMessage(cert_msg)) == null);
         try testing.expectEqual(null, s.peerCertificate()); // not before its CertificateVerify
-        try testing.expect(!try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_certificate_verify)));
+        try testing.expect(try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_certificate_verify)) == null);
         try testing.expectEqual(State.client_finished, s.state);
         try testing.expectEqualSlices(u8, leaf, s.peerCertificate().?);
         // The client's Finished, over the transcript through its
         // CertificateVerify, under the RFC's client handshake secret.
         s.client_handshake_secret[0..32].* = kat.rfc8448_s6_client_handshake_secret;
-        try testing.expect(try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished)));
+        try testing.expect((try s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_finished))).? == .handshake_done);
         try testing.expect(s.isConnected());
     }
     // One signature octet off: decrypt_error.
@@ -3330,7 +3888,7 @@ test "an ML-DSA-65 client leaf: over the default cap, taken under a larger Clien
     }
     auth.max_leaf_len = 8192;
     var s = rfc8448S6Server(&cfg, &joiner, &out, peer);
-    try testing.expect(!try s.onHandshake(handshakeMessage(msg)));
+    try testing.expect(try s.onHandshake(handshakeMessage(msg)) == null);
     const th = s.transcript.sha256.currentHash();
     var cv: [4 + 4 + certverify.max_signature_len]u8 = undefined;
     const sig = try certverify.sign(.mldsa65, ck.key, .client, &th, prng.random(), cv[8..]);
@@ -3338,7 +3896,7 @@ test "an ML-DSA-65 client leaf: over the default cap, taken under a larger Clien
     std.mem.writeInt(u24, cv[1..4], @intCast(4 + sig.len), .big);
     std.mem.writeInt(u16, cv[4..6], 0x0905, .big);
     std.mem.writeInt(u16, cv[6..8], @intCast(sig.len), .big);
-    try testing.expect(!try s.onHandshake(handshakeMessage(cv[0 .. 8 + sig.len])));
+    try testing.expect(try s.onHandshake(handshakeMessage(cv[0 .. 8 + sig.len])) == null);
     try testing.expectEqualSlices(u8, leaf, s.peerCertificate().?);
     try testing.expectEqual(@as(?u16, 0x0905), s.peerSignatureScheme());
 }

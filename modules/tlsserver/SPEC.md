@@ -37,7 +37,7 @@ else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1),
 both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
 OCSP / SCT stapling (step 5) work. **rustls parity (step 6):** of the 436 BoGo server tests
 at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here (278 after
-M4 step 3), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
+M4 step 3, 304 after step 4 — 0-RTT; the one gap left is the exporter), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
 divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
 runner cannot map, extensions this server ignores), and 49 are gaps: 0-RTT (27),
 certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — see
@@ -79,8 +79,8 @@ the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with client
 client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. It
 is not yet the server qap runs (M3: qap's seams and performance).
 
-**Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** 0-RTT
-early data, kTLS, ECH and post-handshake client authentication (*What is deliberately not
+**Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS,
+ECH and post-handshake client authentication (*What is deliberately not
 done*).
 
 ## Wire format / algorithm
@@ -136,8 +136,8 @@ an SCT list if it sent `signed_certificate_timestamp`, each when configured and 
 CertificateVerify and
 Finished, one record per message; it switches its sending key to the application secret and
 waits for the client's Finished (`decrypt_error` if it does not verify), after which application
-data flows. Early data is never accepted; records the client sent under a 0-RTT key are skipped
-(up to 2^14 octets). Every refusal queues its alert in `pendingOutput` (sealed once the server
+data flows. Early data is taken only with `Config.early_data` (*0-RTT* below); otherwise records
+the client sent under a 0-RTT key are skipped (up to 2^14 octets, or `EarlyData.max_size`). Every refusal queues its alert in `pendingOutput` (sealed once the server
 sends protected) and leaves the connection dead (`error.Closed` afterwards); every key and secret
 is wiped at that moment. `close` queues close_notify and keeps reading.
 
@@ -170,7 +170,33 @@ A ticket's plaintext is built around the leaf where it lies in the caller's peer
 (below), and opened there — a ticket whose leaf is over this connection's cap is not resumed,
 nor one with a leaf when there is no client authentication — and the sealed blob goes straight
 into its place in the output: no copy of the leaf, no ticket-sized stack array. Every buffer
-holding the resumption secret, the PSK or a ticket's plaintext is wiped before the step returns. Not yet: a stateful cache, early data, the ticket count request (RFC 9149).
+holding the resumption secret, the PSK or a ticket's plaintext is wiped before the step returns. Not yet: a stateful cache, the ticket count request (RFC 9149).
+
+**0-RTT early data** (RFC 8446 §2.3, §4.2.10, §4.5, §8; opt-in `Config.early_data`, with
+tickets). Each NewSessionTicket carries `early_data` with `EarlyData.max_size` (BoringSSL's
+14336 by default) before its GREASE extension, and the ticket records that size (ticket format
+3; older tickets resume nothing). A resumed ClientHello's early data is taken, in BoringSSL's
+order of reasons (`EarlyDataReason`, `Server.earlyDataReason`): `disabled` (no `early_data`
+configuration, `max_size` 0 or no tickets), `no_session_offered`, `session_not_resumed`,
+`hello_retry_request` (the first ClientHello offered it and was retried), `peer_declined`,
+`unsupported_for_session` (a ticket issued without it), `not_first_identity`, `alpn_mismatch`
+(the protocol negotiated is not the ticket's), `ticket_age_skew` (`|ticketAgeSkew()|` over
+`max_age_skew_s`, 60 s as BoringSSL and rustls), then `replayed` — the `ReplayGuard` is asked
+last and only once (single-use tickets, RFC 8446 §8.1; `strikeRegisterGuard` over a
+`tlsresume.replay.StrikeRegister`, whose window must be at least twice `max_age_skew_s`, since
+a recording stays within the skew for up to that long). Taken: the EncryptedExtensions carry an
+empty `early_data`, the receive key is the client's early traffic secret (over the complete
+ClientHello), `feed` returns `early_data_accepted` and then `early_data` events (0-RTT data,
+replayable) up to the ticket's `max_early_data_size` and the configured one, whichever is less
+(more is `unexpected_message`); the server may write half-RTT data (`canWrite`). The client's
+EndOfEarlyData must be empty (`decode_error`), a message of its own ending its record
+(`unexpected_message`), and switches the receive key to the client's handshake secret; any
+other handshake message in the early state is `unexpected_message`. A close_notify sent
+half-RTT ends the writing: no ticket follows the client's Finished. Unlike rustls (stateful
+tickets only, `send_half_rtt_data` off by default) early data rides on stateless tickets with a
+replay guard, and half-RTT writes are always allowed once early data is taken (as BoringSSL).
+`Connection.handshake` returns once early data is taken (`server.inEarlyData()`); `read`
+returns it and completes the handshake.
 
 **Client certificates** (RFC 8446 §4.3.2, §4.4.2, §4.4.3; rustls 0.23 rules,
 `Config.client_auth`). A full handshake sends a CertificateRequest after the
@@ -699,8 +725,9 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
 ## What is deliberately not done
 
 - **TLS 1.2, SSL 3, TLS 1.0/1.1:** never. The suites and the record format are TLS 1.3's only.
-- **0-RTT early data:** not in v1 (qap refuses early data). Planned for M4 as opt-in with
-  stateful single-use tickets and `tlsresume.replay`.
+- **0-RTT without a replay guard:** `EarlyData.replay` is mandatory (BoringSSL takes early
+  data with none and leaves anti-replay to the application). What early data may do is still
+  the application's call (RFC 8470 for HTTP): the module only marks it (`early_data` events).
 - **kTLS:** not in v1 — measured in qap at 41 % slower than userspace records; a secret-export
   hook may come with M4.
 - **Strict parsing of extensions a TLS 1.3 server ignores** (`extended_master_secret`,
@@ -740,6 +767,17 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   CertificateRequest and a decompressor bounded by `max_leaf_len`) — BoGo has no server test for
   it, so parity does not ask; a built-in zlib/brotli/zstd helper (the caller picks; `zstd` and
   `brotli` are modules here, zlib is in std).
+- **M4 step 4 (2026-10-21): 0-RTT early data** — BoGo 400/0, parity 304 of 436, one gap left
+  (`ExportKeyingMaterial-Server-HalfRTT`: the exporter). OpenSSL `s_client -early_data` interop
+  (`early-new`, `early`, `early-refused`; 55 recorded sessions), replayed byte-exact; a replay of
+  the recorded 0-RTT ClientHello is refused (`replayed`). Not done: early exporters
+  (`early_exporter_master_secret`), a guard shared across threads (the caller's lock).
+  Review 2026-10-21 (Sonnet): no HIGH; fixed: the HRR path's skip budget (`skipBudget`), the
+  claimed identity during early data documented, the guard window (2 × skew + 1 s) and scope,
+  the guard asked only after the key exchange. Accepted: the skip budget counts ciphertext (many
+  tiny refused records can exceed it, as with rustls); empty early records cost nothing (a
+  binder is needed first); a server KeyUpdate at 2^23 records could fall before the client's
+  Finished (not reachable in practice).
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:

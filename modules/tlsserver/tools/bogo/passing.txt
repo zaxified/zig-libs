@@ -107,6 +107,18 @@ DuplicateCertCompressionExt2-TLS13
 DuplicateKeyShares-TLS13
 ECDSACurveMismatch-Sign-TLS13
 ECDSAKeyUsage-Server-TLS13
+EarlyData-ALPNMismatch-Server-TLS13
+EarlyData-ALPNOmitted1-Server-TLS13
+EarlyData-ALPNOmitted2-Server-TLS13
+EarlyData-FirstTicket-Server-TLS13
+EarlyData-HRR-RejectTicket-Server-TLS13
+EarlyData-HRR-Server-TLS13
+EarlyData-NonZeroRTTSession-Server-TLS13
+EarlyData-RejectTicket-Server-TLS13
+EarlyData-Server-BadFinished-TLS13
+EarlyData-Server-TLS13
+EarlyData-SkipEndOfEarlyData-TLS13
+EarlyData-UnexpectedHandshake-Server-TLS13
 EmptySessionID-TLS13
 ExtendedMasterSecret-TLS13-Server
 ExtensionTrailingData-CertificateAuthorities-Server-TLS-TLS13
@@ -172,6 +184,8 @@ PartialClientFinishedWithClientHello
 PartialClientFinishedWithClientHello-NoCCS
 PartialClientFinishedWithSecondClientHello
 PartialClientFinishedWithSecondClientHello-NoCCS
+PartialEndOfEarlyDataWithClientHello
+PartialEndOfEarlyDataWithClientHello-NoCCS
 PartialSecondClientHelloAfterFirst
 PostQuantumEnabledByDefaultForAServer
 RSA-PSS-Large
@@ -222,6 +236,7 @@ Server-JDK11-NoWorkaround-6
 Server-JDK11-NoWorkaround-7
 Server-JDK11-NoWorkaround-8
 Server-JDK11-NoWorkaround-9
+Server-NonEmptyEndOfEarlyData-TLS13
 Server-ShortSessionID-TLS13
 Server-Sign-ECDSA_P256_SHA256-TLS13
 Server-Sign-ECDSA_P384_SHA384-TLS13
@@ -324,6 +339,7 @@ TLS13-1RTT-Server-TLS-Sync-PackHandshake
 TLS13-1RTT-Server-TLS-Sync-SplitHandshakeRecords
 TLS13-Empty-Client-CA-List
 TLS13-ExpectNoSessionTicketOnBadKEMode-Server
+TLS13-ExpectTicketEarlyDataSupport
 TLS13-HelloRetryRequest-Server-TLS-Async
 TLS13-HelloRetryRequest-Server-TLS-Async-ImplicitHandshake
 TLS13-HelloRetryRequest-Server-TLS-Async-PackHandshake
@@ -332,6 +348,14 @@ TLS13-HelloRetryRequest-Server-TLS-Sync
 TLS13-HelloRetryRequest-Server-TLS-Sync-ImplicitHandshake
 TLS13-HelloRetryRequest-Server-TLS-Sync-PackHandshake
 TLS13-HelloRetryRequest-Server-TLS-Sync-SplitHandshakeRecords
+TLS13-MaxEarlyData-Server-TLS-Async
+TLS13-MaxEarlyData-Server-TLS-Async-ImplicitHandshake
+TLS13-MaxEarlyData-Server-TLS-Async-PackHandshake
+TLS13-MaxEarlyData-Server-TLS-Async-SplitHandshakeRecords
+TLS13-MaxEarlyData-Server-TLS-Sync
+TLS13-MaxEarlyData-Server-TLS-Sync-ImplicitHandshake
+TLS13-MaxEarlyData-Server-TLS-Sync-PackHandshake
+TLS13-MaxEarlyData-Server-TLS-Sync-SplitHandshakeRecords
 TLS13-NoTicket-NoAccept
 TLS13-NoTicket-NoMint
 TLS13-SendBadKEModeSessionTicket-Server
@@ -342,7 +366,11 @@ TLS13-Server-ClientAuth-ECDSA
 TLS13-Server-ClientAuth-RSA
 TLS13-Server-NoResumptionAcrossNames
 TLS13-TicketAgeSkew-Backward
+TLS13-TicketAgeSkew-Backward-60-Accept
+TLS13-TicketAgeSkew-Backward-61-Reject
 TLS13-TicketAgeSkew-Forward
+TLS13-TicketAgeSkew-Forward-60-Accept
+TLS13-TicketAgeSkew-Forward-61-Reject
 TooManyChangeCipherSpec-Server-TLS13
 TrailingDataWithFinished-Resume-Server-TLS13
 TrailingDataWithFinished-Server-TLS13
@@ -352,6 +380,7 @@ TrailingMessageData-TLS13-ClientCertificate-TLS
 TrailingMessageData-TLS13-ClientCertificateVerify-TLS
 TrailingMessageData-TLS13-ClientFinished-TLS
 TrailingMessageData-TLS13-ClientHello-TLS
+TrailingMessageData-TLS13-EndOfEarlyData-TLS
 UnexpectedClientEncryptedExtensions-New-TLS-TLS13
 UnexpectedClientEncryptedExtensions-Old-TLS-TLS13
 UnknownCipher-TLS13
@@ -370,3 +399,4 @@ WrongMessageType-TLS13-ClientCertificate-TLS
 WrongMessageType-TLS13-ClientCertificateVerify-TLS
 WrongMessageType-TLS13-ClientFinished-TLS
 WrongMessageType-TLS13-ClientHello-TLS
+WrongMessageType-TLS13-EndOfEarlyData-TLS

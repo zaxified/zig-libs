@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M4 step 4, 0-RTT early data (rustls parity 278 → 304, BoGo 370 → 400/0; the one
+  gap left is the exporter). New `Config.early_data: ?*const EarlyData` (`max_size`, a mandatory
+  `ReplayGuard`, `max_age_skew_s`), `strikeRegisterGuard` over `tlsresume.replay.StrikeRegister`,
+  `EarlyDataReason` (BoringSSL's names via `name`), `Server.earlyDataAccepted`,
+  `earlyDataReason`, `inEarlyData`, `canWrite`, `Error.TooMuchEarlyData`. **BREAKING**
+  `Event` gains `early_data_accepted` and `early_data` (exhaustive switches over it must add
+  them); `write`/`writeSlot` work half-RTT once early data is taken; `Connection.handshake`
+  returns in the early-data state and `read` returns the early data. Tickets carry
+  `early_data` (`max_early_data_size`) and record it: **ticket format 3**, earlier tickets get a
+  full handshake. `inbound.Inbound.early_data_ok`. A close_notify sent before the client's
+  Finished now suppresses the tickets (they would have gone out unprotected). Interop: OpenSSL
+  `s_client -early_data` (`early-new`, `early`, `early-refused`), every session recaptured; the
+  BoGo shim's `-enable-early-data`, `-expect-accept/reject-early-data`,
+  `-expect-early-data-reason`; `HalfRTTTickets: 0` (tickets after the client's Finished, as
+  rustls). Fuzz harnesses replay the 0-RTT recordings; 19/19 mutants killed.
+
 - **2026-10-21** — M4 step 3, RFC 8879 certificate compression (server side; rustls parity
   271 → 278, BoGo 363 → 370/0, the remaining 27 gaps are 0-RTT). `CertifiedKey.compressed_certificates`
   (`CompressedCertificate`: algorithm, `Staples`, uncompressed length, data) holds the

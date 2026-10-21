@@ -78,6 +78,8 @@ const Pipe = struct {
                 .need_more => {},
                 .handshake_done => p.handshake_done = true,
                 .app_data => |d| try p.received.appendSlice(p.gpa, d),
+                // tlsclient sends no early data.
+                .early_data_accepted, .early_data => return error.UnexpectedEarlyData,
                 .peer_closed => {},
             }
             std.mem.copyForwards(u8, p.server_in[0 .. p.server_in_len - r.consumed], p.server_in[r.consumed..p.server_in_len]);

@@ -23,7 +23,8 @@
 //!   opened (rustls: a client that cannot read the ServerHello alerts in the
 //!   clear).
 //! - **Application data** is refused until the engine sets `app_data_ok`
-//!   (after the client's Finished; there is no 0-RTT in v1).
+//!   (after the client's Finished), or `early_data_ok` (0-RTT taken, until
+//!   the client's EndOfEarlyData).
 //!
 //! Choices where RFC 8446 names no alert follow rustls 0.23: an unknown
 //! outer type, a non-`0x03XX` version and an empty plaintext handshake or
@@ -206,6 +207,9 @@ pub const Inbound = struct {
     /// The engine verified the client's Finished: application data and
     /// close_notify are accepted, compatibility CCS no longer is.
     app_data_ok: bool = false,
+    /// The engine took the client's early data: application data under the
+    /// receive key installed (the client's early secret) is delivered.
+    early_data_ok: bool = false,
     closed: bool = false,
     /// One compatibility CCS per ClientHello the engine accepts: the engine
     /// adds one when it sends a HelloRetryRequest (at most
@@ -360,7 +364,7 @@ pub const Inbound = struct {
             },
             .application_data => {
                 try self.notInterleaved();
-                if (!self.app_data_ok) return error.UnexpectedMessage;
+                if (!self.app_data_ok and !self.early_data_ok) return error.UnexpectedMessage;
                 return .{ .app_data = o.content };
             },
             // A protected change_cipher_spec, or an unknown inner type.

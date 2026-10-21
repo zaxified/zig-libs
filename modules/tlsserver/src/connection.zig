@@ -134,16 +134,21 @@ pub const Connection = struct {
         }
     }
 
-    /// Run the handshake to completion (the client's Finished verified).
+    /// Run the handshake until the client's Finished verified — or, with
+    /// `Config.early_data`, only until the client's early data is taken
+    /// (BoringSSL `SSL_do_handshake`; the client is not authenticated yet:
+    /// check `server.isConnected()`): then `server.inEarlyData()`, and
+    /// `read` returns the early data and completes the handshake; writes go
+    /// out as half-RTT data. Called again in that state it returns at once.
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn handshake(self: *Connection) Error!void {
-        while (!self.server.isConnected()) {
+        while (!self.server.isConnected() and !self.server.inEarlyData()) {
             switch (try self.step()) {
-                .handshake_done => {},
-                // Neither can come before the client's Finished: inbound
-                // refuses application data and treats close_notify as an
-                // abort until then.
-                .app_data, .peer_closed => unreachable,
+                .handshake_done, .early_data_accepted => {},
+                // None can come before the client's Finished (or before the
+                // early data is taken): inbound refuses application data and
+                // treats close_notify as an abort until then.
+                .app_data, .early_data, .peer_closed => unreachable,
                 .need_more => unreachable,
             }
         }
@@ -152,18 +157,23 @@ pub const Connection = struct {
 
     /// The next application data, a slice of the reader's buffer valid until
     /// the next `read`/`handshake`; null once the client sent close_notify.
-    /// Runs the handshake first if it has not completed. Never empty.
+    /// Runs the handshake first if it has not completed. Never empty. Data
+    /// returned while `server.inEarlyData()` is 0-RTT data, which a
+    /// recorded ClientHello can replay (RFC 8446 §8).
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn read(self: *Connection) Error!?[]u8 {
         if (!self.server.isConnected()) try self.handshake();
         if (self.server.peer_closed) return null;
         while (true) {
             switch (try self.step()) {
-                .app_data => |d| if (d.len != 0) return d,
+                .app_data, .early_data => |d| if (d.len != 0) return d,
                 .peer_closed => return null,
+                // The client's Finished after its early data: what the
+                // server queued (its tickets) goes out with the next flush.
+                .handshake_done => {},
                 // A KeyUpdate is handled inside `feed`; other post-handshake
                 // messages fail there.
-                .handshake_done, .need_more => unreachable,
+                .early_data_accepted, .need_more => unreachable,
             }
         }
     }

@@ -1255,8 +1255,13 @@ const InteropTickets = struct {
     /// The recordings' client authentication (`tools/interop.zig`).
     verifier: clientauth.X509Verifier,
     client_auth: server_mod.ClientAuth,
+    /// The recordings' early data (`early_data` cases), single use per run.
+    strikes: tlsresume.replay.StrikeRegister,
+    early: server_mod.EarlyData,
 
     fn init(t: *InteropTickets, gpa: std.mem.Allocator, mode: interop.ClientAuthMode) void {
+        t.strikes = .init(gpa, 4, 3600 * 1000);
+        t.early = .{ .max_size = interop.max_early_data, .replay = server_mod.strikeRegisterGuard(&t.strikes) };
         t.ring = .init();
         t.ring.rotate(1, &interop.stek_key, @divFloor(interop.clock_ms, 1000));
         t.stek = .{ .ring = &t.ring };
@@ -1269,6 +1274,10 @@ const InteropTickets = struct {
         return if (mode == .off) null else &t.client_auth;
     }
 
+    fn deinit(t: *InteropTickets) void {
+        t.strikes.deinit();
+    }
+
     fn clock(_: ?*anyopaque) i64 {
         return interop.clock_ms;
     }
@@ -1276,6 +1285,8 @@ const InteropTickets = struct {
 
 const SrvMark = Marker(enum {
     openssl_case,
+    /// A recording whose early data the server takes.
+    early_case,
     go_case,
     retry_case,
     key_update_case,
@@ -1398,8 +1409,14 @@ fn driveServer(comptime S: type, src: *S, gpa: std.mem.Allocator, server: *serve
                     if (run.handshake_done) return error.HandshakeDoneTwice;
                     run.handshake_done = true;
                 },
-                .app_data => |d| {
-                    if (!run.handshake_done) return error.AppDataBeforeHandshake;
+                .early_data_accepted => {
+                    if (run.handshake_done or !server.inEarlyData() or !server.canWrite()) return error.EarlyAcceptedOutOfPlace;
+                },
+                // Answered as it comes (half-RTT), as `tools/interop.zig` did.
+                .app_data, .early_data => |d| {
+                    if (r.event == .early_data) {
+                        if (run.handshake_done or !server.inEarlyData()) return error.EarlyDataOutOfPlace;
+                    } else if (!run.handshake_done) return error.AppDataBeforeHandshake;
                     try run.app.appendSlice(gpa, d);
                     if (!run.answered and std.mem.endsWith(u8, run.app.items, "ping\n")) {
                         if (run.key_update) try server.keyUpdate(.update_requested);
@@ -1471,6 +1488,20 @@ fn recordStarts(stream: []const u8, starts: []usize) []usize {
     return starts[0..n];
 }
 
+/// The recording's last ClientHello before record `before` (its first
+/// sealed one) offers early data.
+fn offeredEarlyData(client: []const u8, starts: []const usize, before: usize) bool {
+    var i = before;
+    while (i > 0) {
+        i -= 1;
+        if (client[starts[i]] != 22) continue;
+        const end = if (i + 1 < starts.len) starts[i + 1] else client.len;
+        const ch = hello.parseClientHello(client[starts[i] + 5 + 4 .. end]) catch return false;
+        return ch.early_data;
+    }
+    return false;
+}
+
 fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const fk = try fuzzKeys_();
     // RSA and ML-DSA signing dominate a run: one run in ten picks among
@@ -1498,6 +1529,8 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
     it.init(gpa, v.client_auth);
+    defer it.deinit();
+    if (v.early_accepted) SrvMark.mark(.early_case);
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -1506,6 +1539,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .random = csprng.random(),
         .tickets = if (v.tickets) &it.tickets else null,
         .client_auth = it.clientAuth(v.client_auth),
+        .early_data = if (v.early_data) &it.early else null,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -1524,6 +1558,9 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const finished_rec = for (starts, 0..) |s, i| {
         if (v.client[s] == 23) break i;
     } else return error.NoFinishedInRecording;
+    // Early data the server refuses: the first sealed record is that early
+    // data, which the server skips unopened (trial decryption).
+    const skipped_early = offeredEarlyData(v.client, starts, finished_rec) and !v.early_accepted;
 
     var run: SrvRun = .{ .key_update = v.key_update };
     defer run.deinit(gpa);
@@ -1552,6 +1589,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             }
             if (!genuine_end(&run, v.server)) return error.GenuineDiffers;
             if (server.isResumed() != v.resumed) return error.ResumptionDiffers;
+            if (server.earlyDataAccepted() != v.early_accepted) return error.EarlyDataDiffers;
             if (bytewise) SrvMark.mark(.genuine_bytewise) else SrvMark.mark(.genuine_chunked);
         },
         2 => {
@@ -1573,6 +1611,10 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             const pos = body_start + src.index(body_end - body_start);
             stream[pos] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
             try driveServer(S, src, gpa, &server, stream, false, &run);
+            if (skipped_early and ri == finished_rec) {
+                if (!genuine_end(&run, v.server)) return error.SkippedEarlyDataMattered;
+                return;
+            }
             if (genuine_end(&run, v.server)) return error.BodyFlipAccepted;
             if (ri <= finished_rec) {
                 if (run.handshake_done) return error.HandshakeWithDamagedRecord;
@@ -1599,7 +1641,8 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         10, 11 => {
             // Up to the client's first sealed record (its Finished, or with
             // client authentication its Certificate, maybe more), then that
-            // record resealed.
+            // record resealed. A 0-RTT client's first one is early data.
+            if (skipped_early or v.early_accepted) return;
             const fs = starts[finished_rec];
             const fe = if (finished_rec + 1 < starts.len) starts[finished_rec + 1] else stream.len;
             try driveServer(S, src, gpa, &server, stream[0..fs], false, &run);
@@ -1676,6 +1719,13 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             }
             try driveServer(S, src, gpa, &server, stream, false, &run);
             if (run.handshake_done) return error.DamagedOfferCompleted;
+            // A full handshake instead, while the client offered early data:
+            // what it sends under the keys of its PSK is skipped as early
+            // data (trial decryption), to the end of the recording.
+            if (ticket_flip and ch.early_data and run.failure == null) {
+                if (server.isResumed()) return error.ForeignTicketResumedOrChecked;
+                return;
+            }
             const f = run.failure orelse return error.DamagedOfferNotRefused;
             if (ticket_flip) {
                 if (server.isResumed() or f == error.DecryptError) return error.ForeignTicketResumedOrChecked;
@@ -1880,7 +1930,7 @@ const KuClient = struct {
                     return null;
                 },
                 .app_data => |d| try app.appendSlice(c.gpa, d),
-                .handshake_done, .peer_closed => return error.UnexpectedEvent,
+                .handshake_done, .peer_closed, .early_data_accepted, .early_data => return error.UnexpectedEvent,
             }
         }
     }
@@ -1983,7 +2033,8 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var v: interop.Case = undefined;
     while (true) {
         v = interop.cases[src.index(interop.cases.len)];
-        if (v.cert != .rsa2048 and v.cert != .mldsa65) break;
+        // A 0-RTT recording's first sealed record is its early data.
+        if (v.cert != .rsa2048 and v.cert != .mldsa65 and !v.early_accepted) break;
     }
     var leaf = fk.cks[@backingInt(v.cert)];
     if (v.staple) {
@@ -2001,6 +2052,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
     it.init(gpa, v.client_auth);
+    defer it.deinit();
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],

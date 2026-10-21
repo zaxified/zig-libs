@@ -124,6 +124,10 @@ const Harness = struct {
     tickets: server_mod.Tickets,
     verifier: clientauth.X509Verifier,
     client_auth: server_mod.ClientAuth,
+    /// The replay register of the `early_data` cases (`strikes` is the
+    /// caller's when given: a second replay of a case is a replay).
+    own_strikes: tlsresume.replay.StrikeRegister,
+    early: server_mod.EarlyData,
     cfg: server_mod.Config,
     in_buf: []u8,
     reader: std.Io.Reader,
@@ -134,6 +138,10 @@ const Harness = struct {
     conn: Connection,
 
     fn create(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !*Harness {
+        return createWith(gpa, v, keys, null);
+    }
+
+    fn createWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, strikes: ?*tlsresume.replay.StrikeRegister) !*Harness {
         const h = try gpa.create(Harness);
         errdefer gpa.destroy(h);
         h.gpa = gpa;
@@ -173,6 +181,8 @@ const Harness = struct {
         h.tickets = .{ .ticketer = h.stek.ticketer(), .clock = .{ .now_ms = clock } };
         h.verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
         h.client_auth = .{ .verifier = h.verifier.verifier(), .mandatory = v.client_auth == .mandatory, .clock = .{ .now_ms = clock } };
+        h.own_strikes = .init(gpa, 4, 3600 * 1000);
+        h.early = .{ .max_size = vectors.max_early_data, .replay = server_mod.strikeRegisterGuard(strikes orelse &h.own_strikes) };
         h.cfg = .{
             .certificate = .{ .fixed = &h.ck },
             .cipher_suites = h.suites[0..v.suites.len],
@@ -181,6 +191,7 @@ const Harness = struct {
             .random = h.csprng.random(),
             .tickets = if (v.tickets) &h.tickets else null,
             .client_auth = if (v.client_auth != .off) &h.client_auth else null,
+            .early_data = if (v.early_data) &h.early else null,
         };
         // The reader holds the whole recording in a buffer big enough for a
         // record (Connection's requirement).
@@ -204,6 +215,7 @@ const Harness = struct {
     fn destroy(h: *Harness) void {
         const gpa = h.gpa;
         h.conn.deinit();
+        h.own_strikes.deinit();
         h.sink.deinit();
         gpa.free(h.joiner);
         gpa.free(h.peer);
@@ -251,6 +263,7 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, path: 
     };
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
     try testing.expectEqual(v.resumed, c.server.isResumed());
+    try testing.expectEqual(v.early_accepted, c.server.earlyDataAccepted());
     const want_peer: ?[]const u8 = switch (v.client_cert) {
         .none => null,
         .p256 => &client_certs.p256_cert,
@@ -321,6 +334,41 @@ test "the same sessions replay byte-exact through reader() and writer()" {
             return err;
         };
     }
+}
+
+test "0-RTT replayed: the second time the ticket's early data is refused, and the recording's Finished fails" {
+    const v = try caseNamed("early");
+    try testing.expect(v.early_accepted);
+    var keys: Keys = try .init(testing.allocator);
+    defer keys.deinit(testing.allocator);
+    var strikes: tlsresume.replay.StrikeRegister = .init(testing.allocator, 4, 3600 * 1000);
+    defer strikes.deinit();
+    {
+        const h: *Harness = try .createWith(testing.allocator, v, &keys, &strikes);
+        defer h.destroy();
+        try h.conn.handshake();
+        try testing.expect(h.conn.server.inEarlyData());
+        try testing.expectEqualStrings("ping\n", (try h.conn.read()).?);
+    }
+    {
+        // A server that now takes more than the ticket promised holds the
+        // client to the ticket's max_early_data_size (RFC 8446 §4.2.10).
+        const h: *Harness = try .create(testing.allocator, v, &keys);
+        defer h.destroy();
+        h.early.max_size = 1 << 20;
+        try h.conn.handshake();
+        try testing.expectEqualStrings("ping\n", (try h.conn.read()).?);
+        try testing.expectEqual(vectors.max_early_data - 5, h.conn.server.early_left);
+    }
+    const h: *Harness = try .createWith(testing.allocator, v, &keys, &strikes);
+    defer h.destroy();
+    // Same seed, same handshake keys: the early records are skipped (they
+    // do not open under the handshake key), the Finished opens but was
+    // computed over an EncryptedExtensions with early_data and an
+    // EndOfEarlyData this server never saw.
+    try testing.expectError(error.DecryptError, h.conn.handshake());
+    try testing.expectEqual(server_mod.EarlyDataReason.replayed, h.conn.server.earlyDataReason());
+    try testing.expect(!h.conn.server.isConnected());
 }
 
 fn caseNamed(name: []const u8) !vectors.Case {
