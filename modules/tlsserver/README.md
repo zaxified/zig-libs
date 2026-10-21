@@ -47,9 +47,10 @@ const stek: tlsserver.StekTicketer(@TypeOf(ring)) = .{ .ring = &ring };
 const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = wallMs } };
 // config.tickets = &tickets;  — 2 tickets per handshake, 12 h lifetime (rustls)
 
-// Per connection: a joiner and an output buffer, and a reader whose buffer
-// holds one whole record (`record.max_record_len`).
-var conn: tlsserver.Connection = .init(&config, reader, writer, joiner_buf, output_buf);
+// Per connection: a joiner, a reader whose buffer holds one whole record
+// (`record.max_record_len`), and a stream writer (a socket's) whose buffer
+// holds the first flight (`Server.minOutputLen`): records are sealed in it.
+var conn: tlsserver.Connection = .init(&config, reader, writer, joiner_buf);
 defer conn.deinit();
 try conn.handshake();
 while (try conn.read()) |data| try conn.writeAll(data); // echo until close_notify

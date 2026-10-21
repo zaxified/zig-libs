@@ -19,8 +19,10 @@ const testing = std.testing;
 const rsa = @import("rsa");
 const record = @import("record.zig");
 const inbound = @import("inbound.zig");
+const outbound = @import("outbound.zig");
 const server_mod = @import("server.zig");
 const Connection = @import("connection.zig").Connection;
+const Sink = @import("test_sink.zig").Sink;
 const certs = @import("test_certs.zig");
 const vectors = @import("interop_vectors.zig");
 const clientauth = @import("clientauth.zig");
@@ -56,76 +58,135 @@ const Keys = struct {
     }
 };
 
-fn replay(gpa: std.mem.Allocator, v: vectors.Case) !void {
+/// How the application side talks to the `Connection`: `read`/`writeAll`,
+/// or the zero-copy `reader()`/`writer()` streams. Both must put the same
+/// octets on the wire.
+const Path = enum { calls, streams };
+
+fn replay(gpa: std.mem.Allocator, v: vectors.Case, path: Path) !void {
     var keys: Keys = try .init(gpa);
     defer keys.deinit(gpa);
-    return replayWith(gpa, v, &keys);
+    return replayWith(gpa, v, &keys, path);
 }
 
-fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !void {
-    var chain: [1][]const u8 = undefined;
-    var ck: server_mod.CertifiedKey = switch (v.cert) {
-        .p256 => blk: {
-            chain[0] = &certs.p256_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p256 = &keys.p256 } };
+/// The next application data through `path` (null after close_notify).
+fn nextData(c: *Connection, path: Path) !?[]const u8 {
+    switch (path) {
+        .calls => return c.read(),
+        .streams => {
+            const r = c.reader();
+            const d = r.peekGreedy(1) catch |err| return switch (err) {
+                error.EndOfStream => null,
+                error.ReadFailed => c.err.?,
+            };
+            r.toss(d.len);
+            return d;
         },
-        .p384 => blk: {
-            chain[0] = &certs.p384_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ecdsa_p384 = &keys.p384 } };
-        },
-        .ed25519 => blk: {
-            chain[0] = &certs.ed25519_cert;
-            break :blk .{ .chain = &chain, .key = .{ .ed25519 = &keys.ed } };
-        },
-        .rsa2048 => blk: {
-            chain[0] = &certs.rsa2048_cert;
-            break :blk .{ .chain = &chain, .key = .{ .rsa = keys.rsa } };
-        },
-    };
-    if (v.staple) {
-        ck.ocsp_response = &vectors.ocsp_response;
-        ck.sct_list = &vectors.sct_list;
     }
-    var suites: [8]record.CipherSuite = undefined;
-    for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
-    var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
-    var ring: tlsresume.stek.DefaultRing = .init();
-    ring.rotate(1, &vectors.stek_key, @divFloor(vectors.clock_ms, 1000));
-    const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
-    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = clock } };
-    const verifier: clientauth.X509Verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
-    const client_auth: server_mod.ClientAuth = .{ .verifier = verifier.verifier(), .mandatory = v.client_auth == .mandatory, .clock = .{ .now_ms = clock } };
-    const cfg: server_mod.Config = .{
-        .certificate = .{ .fixed = &ck },
-        .cipher_suites = suites[0..v.suites.len],
-        .groups = v.groups,
-        .alpn_protocols = v.alpn,
-        .random = csprng.random(),
-        .tickets = if (v.tickets) &tickets else null,
-        .client_auth = if (v.client_auth != .off) &client_auth else null,
-    };
+}
 
-    // The reader holds the whole recording in a buffer big enough for a
-    // record (Connection's requirement).
-    const in_buf = try gpa.alloc(u8, @max(v.client.len, record.max_record_len));
-    defer gpa.free(in_buf);
-    @memcpy(in_buf[0..v.client.len], v.client);
-    var reader: std.Io.Reader = .fixed(in_buf[0..v.client.len]);
-    reader.buffer = in_buf;
-    var written: std.Io.Writer.Allocating = .init(gpa);
-    defer written.deinit();
-    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
-    defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &ck) + 4096);
-    defer gpa.free(out);
+/// A `Connection` set up as the recorded server, its input the client's
+/// recorded octets, its output a `Sink`. On the heap: the configuration
+/// points into it.
+const Harness = struct {
+    gpa: std.mem.Allocator,
+    chain: [1][]const u8,
+    ck: server_mod.CertifiedKey,
+    suites: [8]record.CipherSuite,
+    csprng: std.Random.DefaultCsprng,
+    ring: tlsresume.stek.DefaultRing,
+    stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing),
+    tickets: server_mod.Tickets,
+    verifier: clientauth.X509Verifier,
+    client_auth: server_mod.ClientAuth,
+    cfg: server_mod.Config,
+    in_buf: []u8,
+    reader: std.Io.Reader,
+    out: []u8,
+    sink: Sink,
+    joiner: []u8,
+    conn: Connection,
 
-    var c: Connection = .init(&cfg, &reader, &written.writer, joiner, out);
-    defer c.deinit();
+    fn create(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !*Harness {
+        const h = try gpa.create(Harness);
+        errdefer gpa.destroy(h);
+        h.gpa = gpa;
+        h.ck = switch (v.cert) {
+            .p256 => blk: {
+                h.chain[0] = &certs.p256_cert;
+                break :blk .{ .chain = &h.chain, .key = .{ .ecdsa_p256 = &keys.p256 } };
+            },
+            .p384 => blk: {
+                h.chain[0] = &certs.p384_cert;
+                break :blk .{ .chain = &h.chain, .key = .{ .ecdsa_p384 = &keys.p384 } };
+            },
+            .ed25519 => blk: {
+                h.chain[0] = &certs.ed25519_cert;
+                break :blk .{ .chain = &h.chain, .key = .{ .ed25519 = &keys.ed } };
+            },
+            .rsa2048 => blk: {
+                h.chain[0] = &certs.rsa2048_cert;
+                break :blk .{ .chain = &h.chain, .key = .{ .rsa = keys.rsa } };
+            },
+        };
+        if (v.staple) {
+            h.ck.ocsp_response = &vectors.ocsp_response;
+            h.ck.sct_list = &vectors.sct_list;
+        }
+        for (v.suites, 0..) |s, i| h.suites[i] = @fromBackingInt(s);
+        h.csprng = .init(@splat(v.seed));
+        h.ring = .init();
+        h.ring.rotate(1, &vectors.stek_key, @divFloor(vectors.clock_ms, 1000));
+        h.stek = .{ .ring = &h.ring };
+        h.tickets = .{ .ticketer = h.stek.ticketer(), .clock = .{ .now_ms = clock } };
+        h.verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
+        h.client_auth = .{ .verifier = h.verifier.verifier(), .mandatory = v.client_auth == .mandatory, .clock = .{ .now_ms = clock } };
+        h.cfg = .{
+            .certificate = .{ .fixed = &h.ck },
+            .cipher_suites = h.suites[0..v.suites.len],
+            .groups = v.groups,
+            .alpn_protocols = v.alpn,
+            .random = h.csprng.random(),
+            .tickets = if (v.tickets) &h.tickets else null,
+            .client_auth = if (v.client_auth != .off) &h.client_auth else null,
+        };
+        // The reader holds the whole recording in a buffer big enough for a
+        // record (Connection's requirement).
+        h.in_buf = try gpa.alloc(u8, @max(v.client.len, record.max_record_len));
+        errdefer gpa.free(h.in_buf);
+        @memcpy(h.in_buf[0..v.client.len], v.client);
+        h.reader = .fixed(h.in_buf[0..v.client.len]);
+        h.reader.buffer = h.in_buf;
+        // Room for a full record besides the first flight.
+        h.out = try gpa.alloc(u8, server_mod.minOutputLen(&h.cfg, &h.ck) + server_mod.full_record_output_len);
+        errdefer gpa.free(h.out);
+        h.sink = .init(gpa, h.out);
+        h.joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        h.conn = .init(&h.cfg, &h.reader, &h.sink.writer, h.joiner);
+        return h;
+    }
+
+    fn destroy(h: *Harness) void {
+        const gpa = h.gpa;
+        h.conn.deinit();
+        h.sink.deinit();
+        gpa.free(h.joiner);
+        gpa.free(h.out);
+        gpa.free(h.in_buf);
+        gpa.destroy(h);
+    }
+};
+
+fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, path: Path) !void {
+    const h: *Harness = try .create(gpa, v, keys);
+    defer h.destroy();
+    const c = &h.conn;
+    const written = &h.sink;
     try c.handshake();
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(gpa);
     while (!std.mem.endsWith(u8, got.items, "ping\n")) {
-        const d = (try c.read()) orelse return error.ClosedBeforePing;
+        const d = (try nextData(c, path)) orelse return error.ClosedBeforePing;
         try got.appendSlice(gpa, d);
     }
     // The client's KeyUpdate (no reply due; s_client's comes with
@@ -133,11 +194,16 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !void 
     // recording; reading it after makes the same octets out.
     const asked = c.server.client_application_secret;
     if (v.key_update) try c.keyUpdate(.update_requested);
-    try c.writeAll("pong\n");
+    switch (path) {
+        .calls => try c.writeAll("pong\n"),
+        // Sealed by `close`, in one record before the close_notify — the
+        // octets `writeAll` sends.
+        .streams => c.writer().writeAll("pong\n") catch return c.err.?,
+    }
     try c.close();
     var after: std.ArrayList(u8) = .empty;
     defer after.deinit(gpa);
-    while (try c.read()) |d| try after.appendSlice(gpa, d);
+    while (try nextData(c, path)) |d| try after.appendSlice(gpa, d);
     if (v.key_update) {
         try testing.expect(!std.mem.eql(u8, &asked, &c.server.client_application_secret));
         if (after.items.len != 0) try testing.expectEqualStrings("again\n", after.items);
@@ -160,7 +226,7 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys) !void 
 
 test "OpenSSL and Go client sessions replay byte-exact through Connection" {
     for (vectors.cases) |v| {
-        replay(testing.allocator, v) catch |err| {
+        replay(testing.allocator, v, .calls) catch |err| {
             std.debug.print("case {s}: {t}\n", .{ v.name, err });
             return err;
         };
@@ -190,13 +256,13 @@ test "bench: replayed handshakes per second (opt-in via TLSSERVER_BENCH)" {
         const v = for (vectors.cases) |c| {
             if (std.mem.eql(u8, c.name, name)) break c;
         } else return error.NoSuchCase;
-        try replayWith(gpa, v, &keys); // warm-up, and still byte-exact
+        try replayWith(gpa, v, &keys, .calls); // warm-up, and still byte-exact
         var best: f64 = 0;
         for (0..5) |_| {
             const t0 = nowNs();
             var n: usize = 0;
             while (nowNs() - t0 < 400_000_000) : (n += 1) {
-                try replayWith(gpa, v, &keys);
+                try replayWith(gpa, v, &keys, .calls);
                 _ = arena.reset(.retain_capacity);
             }
             const rate = @as(f64, @floatFromInt(n)) * 1e9 / @as(f64, @floatFromInt(nowNs() - t0));
@@ -212,6 +278,186 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+test "the same sessions replay byte-exact through reader() and writer()" {
+    for (vectors.cases) |v| {
+        replay(testing.allocator, v, .streams) catch |err| {
+            std.debug.print("case {s}: {t}\n", .{ v.name, err });
+            return err;
+        };
+    }
+}
+
+fn caseNamed(name: []const u8) !vectors.Case {
+    for (vectors.cases) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    return error.NoSuchCase;
+}
+
+test "writer(): records follow the data — a short write topped up, full records, a splat" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const v = try caseNamed("p256-aes256-x25519"); // no tickets: nothing sealed after the handshake
+    try testing.expect(!v.tickets);
+    const h: *Harness = try .create(gpa, v, &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    const from = h.sink.written().len;
+    var rx: record.Protection = undefined;
+    try rx.init(c.server.suite, c.server.server_application_secret[0..48]);
+
+    // An h2-style frame: a 9-octet header, then a payload too long for the
+    // record's rest, then padding as a splat.
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    const w = c.writer();
+    try w.writeAll("123456789");
+    try want.appendSlice(gpa, "123456789");
+    var payload: [40_000]u8 = undefined;
+    for (&payload, 0..) |*x, i| x.* = @truncate(i *% 7 +% 1);
+    try w.writeAll(&payload);
+    try want.appendSlice(gpa, &payload);
+    try w.splatByteAll('z', 20_000);
+    try want.appendNTimes(gpa, 'z', 20_000);
+    try w.flush();
+
+    const sent = try gpa.dupe(u8, h.sink.written()[from..]);
+    defer gpa.free(sent);
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    var lens: std.ArrayList(usize) = .empty;
+    defer lens.deinit(gpa);
+    var at: usize = 0;
+    while (at < sent.len) {
+        const hd = record.parseHeader(sent[at..][0..5]);
+        const opened = try rx.open(sent[at..][0 .. 5 + hd.length]);
+        try testing.expectEqual(record.ContentType.application_data, opened.content_type);
+        try got.appendSlice(gpa, opened.content);
+        try lens.append(gpa, opened.content.len);
+        at += 5 + hd.length;
+    }
+    try testing.expectEqualSlices(u8, want.items, got.items);
+    // 60,009 octets: three full records and the rest — the 9-octet header
+    // did not go out alone.
+    try testing.expectEqualSlices(usize, &.{ 16384, 16384, 16384, 60_009 - 3 * 16384 }, lens.items);
+
+    // Octets kept across a record are refused, not copied.
+    try w.writeAll("ab");
+    try testing.expectError(error.WriteFailed, w.rebase(1, w.buffer.len));
+    try testing.expectEqual(error.RecordBoundary, c.err.?);
+}
+
+/// Opens every record of `sent` with `rx`, collecting each one's content.
+fn openAll(gpa: std.mem.Allocator, rx: *record.Protection, sent: []u8, contents: *std.ArrayList([]u8)) !void {
+    var at: usize = 0;
+    while (at < sent.len) {
+        const hd = record.parseHeader(sent[at..][0..5]);
+        const opened = try rx.open(sent[at..][0 .. 5 + hd.length]);
+        try contents.append(gpa, opened.content);
+        at += 5 + hd.length;
+    }
+}
+
+test "writer(): octets written before a read are sealed first and keep their place" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    const from = h.sink.written().len;
+    var rx: record.Protection = undefined;
+    try rx.init(c.server.suite, c.server.server_application_secret[0..48]);
+
+    const w = c.writer();
+    try w.writeAll("a");
+    // The ping is already in the input: this read queues "a" and sends
+    // nothing, and the next write must not land on the sealed record.
+    try testing.expectEqualStrings("ping\n", (try nextData(c, .streams)).?);
+    try w.writeAll("b");
+    try w.flush();
+
+    const sent = try gpa.dupe(u8, h.sink.written()[from..]);
+    defer gpa.free(sent);
+    var contents: std.ArrayList([]u8) = .empty;
+    defer contents.deinit(gpa);
+    try openAll(gpa, &rx, sent, &contents);
+    try testing.expectEqual(@as(usize, 2), contents.items.len);
+    try testing.expectEqualStrings("a", contents.items[0]);
+    try testing.expectEqualStrings("b", contents.items[1]);
+}
+
+test "writeSlot: no slot while a KeyUpdate is due, even where a short record would fit" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    const s = &c.server;
+    // Pretend output is pending until 25 octets are left above the alert
+    // reserve: a 3-octet record fits (22 of overhead), the KeyUpdate (27)
+    // does not.
+    s.out.len = s.out.buf.len - outbound.alert_reserve - 25;
+    try s.keyUpdate(.update_not_requested);
+    try testing.expect(s.tx_update != null);
+    try testing.expectEqual(@as(usize, 0), (try s.writeSlot()).len);
+    s.out.len = 0;
+    try testing.expect((try s.writeSlot()).len != 0);
+    try testing.expect(s.tx_update == null);
+}
+
+test "writer(): drain takes the last slice `splat` times — none at 0" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    const w = c.writer();
+    try testing.expectEqual(@as(usize, 2), try w.vtable.drain(w, &.{ "ab", "cd" }, 0));
+    try testing.expectEqual(@as(usize, 3), try w.vtable.drain(w, &.{ "x", "yz" }, 1));
+    try testing.expectEqual(@as(usize, 3), try w.vtable.drain(w, &.{"q"}, 3));
+    try testing.expectEqualStrings("abxyzqqq", w.buffered());
+}
+
+test "writeAll into an output that never takes a record is OutputFull, not a loop" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    try c.handshake();
+    // As if the writer's buffer were below `minOutputLen`: room for the
+    // alert reserve and a few octets, never a record.
+    const full = c.server.out.buf;
+    c.server.out.buf = full[0 .. outbound.alert_reserve + 10];
+    try testing.expectError(error.OutputFull, c.writeAll("x"));
+    c.server.out.buf = full;
+    c.deinit();
+    // After deinit no alias is left to write into.
+    try testing.expectEqual(@as(usize, 0), c.writer().buffer.len);
+    try testing.expectEqual(@as(usize, 0), c.reader().buffer.len);
+}
+
+test "reader(): more contiguous octets than one record holds is RecordBoundary" {
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, try caseNamed("p256-aes256-x25519"), &keys);
+    defer h.destroy();
+    const c = &h.conn;
+    // "ping\n" came in one record of five octets: six are not there.
+    const r = c.reader();
+    try testing.expectError(error.ReadFailed, r.peek(6));
+    try testing.expectEqual(error.RecordBoundary, c.err.?);
+    try testing.expectEqualStrings("ping\n", r.buffered());
+}
+
 test "a recording with one octet of OpenSSL's flipped is refused" {
     // The client's Finished sits in the last records before the
     // application data; flipping the final octet of the recording hits
@@ -223,5 +469,5 @@ test "a recording with one octet of OpenSSL's flipped is refused" {
     flipped[flipped.len - 1] ^= 1;
     var w = v;
     w.client = flipped;
-    try testing.expectError(error.BadRecordMac, replay(testing.allocator, w));
+    try testing.expectError(error.BadRecordMac, replay(testing.allocator, w, .calls));
 }

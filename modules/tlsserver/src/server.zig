@@ -827,25 +827,55 @@ pub const Server = struct {
         if (self.write_closed) return error.Closed;
         var done: usize = 0;
         while (done < data.len) {
-            // RFC 8446 §5.5: retire the key well before its usage limit.
-            if (self.out.tx.seq >= max_records_per_key and self.tx_update == null)
-                self.tx_update = .update_requested;
-            self.flushKeyUpdate() catch |err| return self.fail(err);
-            if (self.tx_update != null) break;
-            const s = self.out.slot();
-            if (s.len == 0) break;
+            const s = try self.writeSlot();
             // A record cut short only because earlier records still wait
             // in the buffer goes out whole after the caller sends them
             // (record boundaries follow the data, not the buffer's fill).
             const want = @min(data.len - done, self.out.max_fragment);
-            if (s.len < want and self.out.len != 0) break;
+            if (s.len == 0 or (s.len < want and self.out.len != 0)) break;
             const n = @min(s.len, want);
             @memcpy(s[0..n], data[done..][0..n]);
-            self.out.commit(.application_data, n) catch |err| return self.fail(err);
+            try self.commitWrite(n);
             done += n;
         }
         if (done == 0 and data.len != 0) return error.OutputFull;
         return done;
+    }
+
+    /// Where application data can be written in place, inside the record
+    /// it will be sealed in (no copy): at most one record's content
+    /// (`Config.max_fragment_len`), less when output still pending leaves
+    /// less room. Write up to its length, then `commitWrite` — with no other
+    /// call on the server in between (each may queue records over it). Empty:
+    /// send the pending output first. A KeyUpdate that is due goes out
+    /// before the slot is given.
+    pub fn writeSlot(self: *Server) Error![]u8 {
+        switch (self.state) {
+            .connected => {},
+            .failed => return error.Closed,
+            else => return error.NotConnected,
+        }
+        if (self.write_closed) return error.Closed;
+        // RFC 8446 §5.5: retire the key well before its usage limit.
+        if (self.out.tx.seq >= max_records_per_key and self.tx_update == null)
+            self.tx_update = .update_requested;
+        self.flushKeyUpdate() catch |err| return self.fail(err);
+        if (self.tx_update != null) return self.out.buf[0..0];
+        const s = self.out.slot();
+        return s[0..@min(s.len, self.out.max_fragment)];
+    }
+
+    /// Seal the first `n` octets of the last `writeSlot` as one application
+    /// data record (`n` at most its length; 0 seals nothing).
+    pub fn commitWrite(self: *Server, n: usize) Error!void {
+        if (n == 0) return;
+        if (self.state != .connected or self.write_closed) return error.Closed;
+        std.debug.assert(n <= self.out.max_fragment);
+        self.out.commit(.application_data, n) catch |err| {
+            // Not sealed: the plaintext does not wait for `deinit` to go.
+            std.crypto.secureZero(u8, self.out.buf[self.out.len..]);
+            return self.fail(err);
+        };
     }
 
     /// Turn the send key over now (RFC 8446 §4.6.3), asking the client to

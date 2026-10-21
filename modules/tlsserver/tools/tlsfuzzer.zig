@@ -101,14 +101,14 @@ fn connectionThread(l: *const Listener, stream: net.Stream) void {
     const gpa = std.heap.page_allocator;
     const joiner = gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message)) catch return;
     defer gpa.free(joiner);
-    const out = gpa.alloc(u8, out_len + 4096) catch return;
-    defer gpa.free(out);
+    // The writer's buffer is the server's output buffer.
+    const wbuf = gpa.alloc(u8, out_len + 4096) catch return;
+    defer gpa.free(wbuf);
 
     var rbuf: [record.max_record_len]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
-    var wbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
-    var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
+    var sw = stream.writer(io, wbuf);
+    var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
     defer c.deinit();
     (if (l.echo) echo(&c) else converse(&c)) catch {
         // A lingering close (as the BoGo shim's): the alert is out, and

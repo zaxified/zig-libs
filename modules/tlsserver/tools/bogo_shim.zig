@@ -532,8 +532,10 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     defer stream.close(io);
     var rbuf: [record.max_record_len]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
-    var wbuf: [4096]u8 = undefined;
-    var sw = stream.writer(io, &wbuf);
+    // The writer's buffer is the server's output buffer.
+    const wbuf = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &leaf) + 4096);
+    defer gpa.free(wbuf);
+    var sw = stream.writer(io, wbuf);
     var id: [8]u8 = undefined;
     std.mem.writeInt(u64, &id, o.shim_id, .little);
     try sw.interface.writeAll(&id);
@@ -541,9 +543,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
 
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
-    const out = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &leaf) + 4096);
-    defer gpa.free(out);
-    var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner, out);
+    var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
     return converse(&c, o, want_peer, &hello_check) catch |err| {

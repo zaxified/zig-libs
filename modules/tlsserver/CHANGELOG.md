@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M3 step 2, qap's zero-copy seams. **BREAKING** `Connection.init(config,
+  input, output, joiner_buf)`: no output buffer of its own — records are sealed in the
+  transport writer's buffer (size it with `minOutputLen`; it must be stream-shaped, `flush`
+  emptying it in place), so a connection holds one send buffer instead of two and nothing is
+  copied. New `Connection.reader()` / `writer()`: a `std.Io.Reader` over the record just opened
+  where it lies in the input, a `std.Io.Writer` whose buffer is the next record's content in the
+  output (sealed in place; a short write topped up, not sent alone); cross-record contiguity is
+  `error.RecordBoundary` (qap's `RecordReader`/`RecordWriter` contract, without their stepping
+  aside for KeyUpdates — the server handles those). `Connection.flush`, `Connection.err`. New
+  `Server.writeSlot()` / `commitWrite(n)`; `Server.write` is built on them. Evidence: the 49
+  recorded sessions replay byte-exact through `reader()`/`writer()` too; record layout, ordering
+  across a read, KeyUpdate precedence and drain's splat pinned by new tests; 10/10 mutants of
+  the new code killed (4 survived the first test set); BoGo 339/0, tlsfuzzer 0 worse (both over
+  sockets through the new `Connection`); fuzz server + keyupdate 60k each clean. Sonnet review: no
+  HIGH; fixed: no reader/writer alias survives `deinit`, `writeAll` into an output that never
+  takes a record is `OutputFull` (was a loop), an unsealed slot is wiped when sealing fails, a
+  one-octet splat is a memset; documented: end of transport without close_notify is
+  `error.EndOfStream` in `err` (a truncation, as the fork's `TlsConnectionTruncated`).
 - **2026-10-21** — M3 step 1: `tls13`'s key exchange and ECDSA now run on `ct25519`/`p256`/
   `p384`; server-side handshakes per second (P-256 certificate, X25519,
   TLS_AES_256_GCM_SHA384) 2,012 → 6,705, P-384 506 → 1,832 (SPEC *Backlog*). New opt-in
