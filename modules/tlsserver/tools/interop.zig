@@ -8,6 +8,8 @@
 //!     zig build interop-tlsserver -- --case p256-aes128
 //!     zig build interop-tlsserver -- --capture        # also rewrite
 //!                                                     # src/interop_vectors.zig
+//!     zig build interop-tlsserver -- --tlsfuzzer DIR  # tlsfuzzer's scripts
+//!                                                     # (tlsfuzzer.zig)
 //!
 //! Each case: the server (a seeded CSPRNG, so its output is a function of
 //! what it receives) completes the handshake, receives "ping\n", answers
@@ -32,6 +34,7 @@ const tlsserver = @import("tlsserver");
 const rsa = @import("rsa");
 const tlsresume = @import("tlsresume");
 const bogo_shim = @import("bogo_shim.zig");
+const tlsfuzzer = @import("tlsfuzzer.zig");
 const certs = tlsserver.test_fixtures;
 const client_certs = tlsserver.test_client_fixtures;
 
@@ -41,6 +44,7 @@ const record = tlsserver.record;
 const usage =
     \\usage: interop-tlsserver [--case NAME]... [--capture] [--list] [--repo-root PATH]
     \\       interop-tlsserver --bogo [--bogo-update] [--bogo-test GLOB] [--bogo-arg RUNNER-ARG]... [--bogo-src DIR] [--repo-root PATH]
+    \\       interop-tlsserver --tlsfuzzer DIR [--tlsfuzzer-python PATH] [--tlsfuzzer-script [LISTENER:]NAME]... [--tlsfuzzer-update] [--repo-root PATH]
     \\
 ;
 
@@ -804,6 +808,10 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     var bogo_args: std.ArrayList([]const u8) = .empty;
     var bogo_update = false;
     var bogo_src: []const u8 = ".zig-cache/bogo-src/" ++ bogo_commit;
+    var tlsfuzzer_dir: ?[]const u8 = null;
+    var tlsfuzzer_python: ?[]const u8 = null;
+    var tlsfuzzer_scripts: std.ArrayList([]const u8) = .empty;
+    var tlsfuzzer_update = false;
     var repo_root: []const u8 = ".";
     var selected: std.ArrayList([]const u8) = .empty;
     var args = init.args.iterate();
@@ -829,6 +837,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             try bogo_args.append(gpa, args.next() orelse return 2);
         } else if (std.mem.eql(u8, arg, "--bogo-src")) {
             bogo_src = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--tlsfuzzer")) {
+            tlsfuzzer_dir = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--tlsfuzzer-python")) {
+            tlsfuzzer_python = args.next() orelse return 2;
+        } else if (std.mem.eql(u8, arg, "--tlsfuzzer-update")) {
+            tlsfuzzer_update = true;
+        } else if (std.mem.eql(u8, arg, "--tlsfuzzer-script")) {
+            try tlsfuzzer_scripts.append(gpa, args.next() orelse return 2);
         } else if (std.mem.eql(u8, arg, "--repo-root")) {
             repo_root = args.next() orelse return 2;
         } else {
@@ -849,6 +865,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try root.createDirPath(io, ".zig-cache/tlsserver-interop");
     var work = try root.openDir(io, ".zig-cache/tlsserver-interop", .{});
     defer work.close(io);
+    if (tlsfuzzer_dir) |d| return tlsfuzzer.run(gpa, io, root, d, tlsfuzzer_python, tlsfuzzer_scripts.items, tlsfuzzer_update, &env_map);
     if (bogo) return runBogo(gpa, io, root, bogo_src, bogo_test, bogo_args.items, bogo_update);
     try work.writeFile(io, .{ .sub_path = "p256.pem", .data = try pem(gpa, &certs.p256_cert) });
     try work.writeFile(io, .{ .sub_path = "p384.pem", .data = try pem(gpa, &certs.p384_cert) });

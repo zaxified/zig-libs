@@ -487,6 +487,54 @@ test "tlsclient ↔ Server: KeyUpdate both ways, every suite" {
     }
 }
 
+test "tlsclient ↔ Server: write sends whole records, not ones cut to fit behind pending output" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7e58);
+    const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const out = try gpa.alloc(u8, @max(server_mod.minOutputLen(&config, &ck), server_mod.full_record_output_len) + 1000);
+    defer gpa.free(out);
+    var server: Server = .init(&config, joiner, out);
+    defer server.deinit();
+    const pipe = try gpa.create(Pipe);
+    defer gpa.destroy(pipe);
+    pipe.init(&server, gpa);
+    defer pipe.deinit();
+
+    var entropy: [Client.Options.entropy_len]u8 = undefined;
+    prng.random().bytes(&entropy);
+    var read_buf: [Client.min_buffer_len]u8 = undefined;
+    var write_buf: [Client.min_buffer_len]u8 = undefined;
+    var client = try ZlClient.init(&pipe.reader, &pipe.client_out, .{
+        .host = .{ .explicit = "localhost" },
+        .ca = .self_signed,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+        .min_version = .tls_1_3,
+    });
+    try client.writer.writeAll("hi");
+    try client.writer.flush();
+    try pipe.pump();
+    try testing.expect(pipe.handshake_done);
+    try testing.expectEqual(@as(usize, 0), server.pendingOutput().len);
+
+    const data: [10_000]u8 = @splat('d');
+    const sealed = record.header_len + data.len + 1 + record.tag_len;
+    try testing.expectEqual(data.len, try server.write(&data));
+    try testing.expectEqual(sealed, server.pendingOutput().len);
+    // The rest of the buffer holds a part only: nothing is taken.
+    try testing.expectError(error.OutputFull, server.write(&data));
+    server.discardOutput(sealed);
+    try testing.expectEqual(data.len, try server.write(&data));
+    try testing.expectEqual(sealed, server.pendingOutput().len);
+}
+
 /// A STEK ring with one key, a clock the test moves (2030, as the
 /// client's), and the ticket settings over them.
 const TicketFixture = struct {

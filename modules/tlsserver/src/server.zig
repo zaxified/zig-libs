@@ -12,8 +12,9 @@
 //!
 //! Negotiation follows rustls 0.23 (the scope reference):
 //!
-//! - **version** TLS 1.3 only — no `supported_versions` with 0x0304 is
-//!   `protocol_version`, checked before anything else;
+//! - **version** TLS 1.3 only — no `supported_versions` with 0x0304, or a
+//!   `legacy_version` below 0x0301, is `protocol_version`, checked before
+//!   anything else;
 //! - **certificate** fixed, or chosen by a callback from the SNI and the
 //!   ClientHello (none chosen: `access_denied`); the signature scheme is
 //!   the key's first candidate (or `CertifiedKey.signature_schemes` entry)
@@ -27,7 +28,8 @@
 //!   supports; no `supported_groups` or no `key_share` at all is
 //!   `missing_extension`, RFC 8446 §9.2); without a share for it the
 //!   server sends a HelloRetryRequest naming it (no cookie, RFC 8446
-//!   §4.1.4);
+//!   §4.1.4); a key_share entry for a group the client does not list, or
+//!   for an obsolete one (RFC 8446 §4.2.7), is `illegal_parameter`;
 //! - **second ClientHello** (after a HelloRetryRequest) must carry a share
 //!   for the group asked for, still offer the suite named, the same SNI and
 //!   no `early_data` (`illegal_parameter` otherwise; rustls re-chooses suite
@@ -203,6 +205,18 @@ pub const CertificateSelector = struct {
     ctx: ?*anyopaque = null,
     select: *const fn (ctx: ?*anyopaque, sni: ?[]const u8, ch: *const hello.ClientHello) ?*const CertifiedKey,
 };
+
+/// For a `CertificateSelector` serving several keys (RSA, ECDSA, Ed25519)
+/// under one name: the first of `keys`, in the server's order, that can
+/// sign a CertificateVerify in a scheme the client offers (BoringSSL's
+/// credential list). None can: `keys[0]`, so the handshake refuses with
+/// `handshake_failure` as for a single key; null only for an empty list.
+pub fn firstUsableKey(keys: []const CertifiedKey, ch: *const hello.ClientHello) ?*const CertifiedKey {
+    if (keys.len == 0) return null;
+    const offered = ch.signatureAlgorithms() orelse return &keys[0];
+    for (keys) |*k| if (Server.chooseScheme(k, &offered) != null) return k;
+    return &keys[0];
+}
 
 pub const Config = struct {
     certificate: union(enum) {
@@ -528,6 +542,10 @@ pub fn alertFor(err: Error) ?alert.Description {
     };
 }
 
+/// An output that takes a full 2^14 application data record when empty
+/// (with the alert reserve): below it `write` sends shorter records.
+pub const full_record_output_len = record.max_record_len + outbound.alert_reserve;
+
 /// An output buffer that holds the first flight for `ck` under `cfg`:
 /// ServerHello (with the largest share), CCS, EncryptedExtensions (ALPN), a
 /// CertificateRequest, the chain with an OCSP staple, CertificateVerify,
@@ -797,6 +815,9 @@ pub const Server = struct {
 
     /// Seal application data into the output, as much as fits (at least
     /// one octet unless the output is full). Returns how much was taken.
+    /// A record is not cut short to fit behind output still pending: send
+    /// that first (`error.OutputFull` when nothing was taken). An output
+    /// smaller than `full_record_output_len` cuts records to what it holds.
     pub fn write(self: *Server, data: []const u8) Error!usize {
         switch (self.state) {
             .connected => {},
@@ -813,7 +834,12 @@ pub const Server = struct {
             if (self.tx_update != null) break;
             const s = self.out.slot();
             if (s.len == 0) break;
-            const n = @min(s.len, data.len - done, self.out.max_fragment);
+            // A record cut short only because earlier records still wait
+            // in the buffer goes out whole after the caller sends them
+            // (record boundaries follow the data, not the buffer's fill).
+            const want = @min(data.len - done, self.out.max_fragment);
+            if (s.len < want and self.out.len != 0) break;
+            const n = @min(s.len, want);
             @memcpy(s[0..n], data[done..][0..n]);
             self.out.commit(.application_data, n) catch |err| return self.fail(err);
             done += n;
@@ -977,6 +1003,10 @@ pub const Server = struct {
         if (retried and !optEql(sni, self.serverName())) return error.IllegalParameter;
         // The version first: a TLS 1.2 (or older) client gets
         // `protocol_version` whatever else its hello lacks (rustls order).
+        // A legacy_version below TLS 1.0 (SSL 3.0, or not a version at all)
+        // is refused even beside 0x0304 (RFC 8446 §D.5, RFC 7568; OpenSSL,
+        // tlsfuzzer `test-tls13-legacy-version`; rustls ignores it).
+        if (ch.legacy_version < 0x0301) return error.ProtocolVersion;
         const versions = ch.supportedVersions() orelse return error.ProtocolVersion;
         if (!versions.contains(messages.tls13_version)) return error.ProtocolVersion;
         const sig_algs = ch.signatureAlgorithms() orelse return error.HandshakeFailure;
@@ -1011,6 +1041,14 @@ pub const Server = struct {
         while (shares.next()) |e| {
             if (seen.isSet(e.group)) return error.IllegalParameter;
             seen.set(e.group);
+            // RFC 8446 §4.2.8: a share only for a group in supported_groups
+            // (the server MAY check; rustls does not), and never for an
+            // obsolete_RESERVED one (§4.2.7: "MUST NOT be offered or
+            // negotiated by TLS 1.3 implementations"). Obsolete groups in
+            // supported_groups alone are let through: JDK 11 lists sect*
+            // and secp256k1 beside TLS 1.3 (BoGo `Server-JDK11-*`), so the
+            // stricter tlsfuzzer `test-tls13-obsolete-curves` would cut it off.
+            if (!gs.contains(e.group) or isObsoleteGroup(e.group)) return error.IllegalParameter;
             if (e.group == group) share = e.key_exchange;
         }
         // RFC 8446 §4.2.10: no early data after a HelloRetryRequest.
@@ -1183,6 +1221,13 @@ pub const Server = struct {
     }
 
     /// The first group in the deciding order that both sides support.
+    /// RFC 8446 §4.2.7 `obsolete_RESERVED`: the TLS 1.2 binary and prime
+    /// curves (0x0001–0x0016), brainpool r1 (0x001A–0x001C) and the
+    /// explicit-curve codes (0xFF01, 0xFF02).
+    fn isObsoleteGroup(g: u16) bool {
+        return (g >= 0x0001 and g <= 0x0016) or (g >= 0x001a and g <= 0x001c) or g == 0xff01 or g == 0xff02;
+    }
+
     fn chooseGroup(cfg: *const Config, theirs: hello.U16Iter) ?u16 {
         if (cfg.server_order) {
             for (cfg.groups) |g| if (theirs.contains(g)) return g;
@@ -1472,6 +1517,9 @@ pub const Server = struct {
         var expected: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &expected);
         tls13.keyschedule.computeFinishedVerifyData(H.Hmac, &expected, &finished_key, &th);
+        // A verify_data of another length is decrypt_error too (BoringSSL,
+        // rustls; BoGo `TrailingMessageData-TLS13-ClientFinished-TLS`).
+        // OpenSSL and tlsfuzzer `test-tls13-finished` want decode_error.
         if (m.body.len != L or !std.crypto.timing_safe.eql([L]u8, expected, m.body[0..L].*)) return error.DecryptError;
         t.append(m.msg_type, m.body);
         self.inbound.installRx(self.suite, self.client_application_secret[0..L]) catch |err| return switch (err) {
@@ -1549,6 +1597,7 @@ const certs = @import("test_certs.zig");
 
 const Hello = struct {
     versions: ?[]const u16 = &.{0x0304},
+    legacy_version: u16 = 0x0303,
     sig_algs: ?[]const u16 = &.{0x0403},
     suites: []const u16 = &.{0x1301},
     groups: ?[]const u16 = &.{0x001d},
@@ -1588,7 +1637,7 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     };
     // Record header and handshake header, lengths patched at the end.
     try b.appendSlice(gpa, &.{ 22, 3, 1, 0, 0, 1, 0, 0, 0 });
-    try b.appendSlice(gpa, &.{ 3, 3 });
+    try W.u16be(&b, gpa, h.legacy_version);
     try b.appendNTimes(gpa, 0x42, 32);
     try b.append(gpa, 0);
     try W.u16be(&b, gpa, h.suites.len * 2);
@@ -1743,10 +1792,27 @@ test "a well-formed hello gets a first flight (the builder works)" {
     try testing.expectEqual(@as(u8, 23), p[5 + sh_len + 6]);
 }
 
+test "obsolete groups in supported_groups alone are served (JDK 11 lists them)" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .groups = &.{ 0x001d, 0x0009, 0x0016, 0x0017 } });
+    defer testing.allocator.free(rec);
+    const r = try s.feed(rec);
+    try testing.expect(r.event == .need_more);
+    try testing.expectEqual(@as(?u16, 0x001d), s.negotiatedGroup());
+}
+
 test "refusals and their alerts" {
     // Not TLS 1.3.
     try expectRefusal(.{ .versions = null }, error.ProtocolVersion, .protocol_version);
     try expectRefusal(.{ .versions = &.{ 0x0303, 0x0302 } }, error.ProtocolVersion, .protocol_version);
+    // SSL 3.0 or garbage as legacy_version, even beside 0x0304.
+    try expectRefusal(.{ .legacy_version = 0x0300 }, error.ProtocolVersion, .protocol_version);
+    try expectRefusal(.{ .legacy_version = 0x0002 }, error.ProtocolVersion, .protocol_version);
     // Nothing to sign with, nothing in common.
     try expectRefusal(.{ .sig_algs = null }, error.HandshakeFailure, .handshake_failure);
     try expectRefusal(.{ .sig_algs = &.{ 0x0807, 0x0804 } }, error.HandshakeFailure, .handshake_failure);
@@ -1755,6 +1821,13 @@ test "refusals and their alerts" {
     // The version is checked before anything else the hello lacks.
     try expectRefusal(.{ .versions = null, .sig_algs = null, .groups = null }, error.ProtocolVersion, .protocol_version);
     try expectRefusal(.{ .groups = &.{ 0x0019, 0x0100 } }, error.HandshakeFailure, .handshake_failure);
+    // A share for an obsolete group (RFC 8446 §4.2.7), even beside a good
+    // one, at either end of each range; a share for a group the client
+    // does not list.
+    for ([_]u16{ 0x0001, 0x0016, 0x001a, 0x001c, 0xff01, 0xff02 }) |g| {
+        try expectRefusal(.{ .groups = &.{ 0x001d, g }, .shares = &.{ .{ 0x001d, "" }, .{ g, &@as([32]u8, @splat(0xab)) } } }, error.IllegalParameter, .illegal_parameter);
+    }
+    try expectRefusal(.{ .groups = &.{0x0017}, .shares = &.{.{ 0x001d, "" }} }, error.IllegalParameter, .illegal_parameter);
     try expectRefusal(.{ .shares = null }, error.MissingExtension, .missing_extension);
     // Malformed or forbidden.
     try expectRefusal(.{ .shares = &.{ .{ 0x001d, "" }, .{ 0x001d, "" } } }, error.IllegalParameter, .illegal_parameter);
@@ -1815,6 +1888,26 @@ test "certificate selector: sees the SNI, null is access_denied" {
     // An IP literal is no SNI.
     const r2 = try refuse(.{ .sni = "192.0.2.1" }, cfg);
     try testing.expectEqual(error.AccessDenied, r2.err);
+}
+
+test "firstUsableKey: the first key the client's schemes allow, else the first key" {
+    const ed = try std.crypto.sign.Ed25519.SecretKey.fromBytes(certs.ed25519_secret);
+    const ed_chain = [_][]const u8{&certs.ed25519_cert};
+    const keys = [_]CertifiedKey{ testKey().*, .{ .chain = &ed_chain, .key = .{ .ed25519 = &ed } } };
+    var random: [32]u8 = @splat(0);
+    var ch: hello.ClientHello = .{ .legacy_version = 0x0303, .random = &random, .legacy_session_id = "", .cipher_suites_raw = &.{ 0x13, 0x01 }, .legacy_compression_methods = &.{0} };
+    // The server's order decides when the client allows both.
+    ch.signature_algorithms_raw = &.{ 0x08, 0x07, 0x04, 0x03 };
+    try testing.expectEqual(&keys[0], firstUsableKey(&keys, &ch).?);
+    ch.signature_algorithms_raw = &.{ 0x08, 0x07 };
+    try testing.expectEqual(&keys[1], firstUsableKey(&keys, &ch).?);
+    // Nothing usable, or no signature_algorithms: the first key (the
+    // handshake then refuses as for one key).
+    ch.signature_algorithms_raw = &.{ 0x08, 0x04 };
+    try testing.expectEqual(&keys[0], firstUsableKey(&keys, &ch).?);
+    ch.signature_algorithms_raw = null;
+    try testing.expectEqual(&keys[0], firstUsableKey(&keys, &ch).?);
+    try testing.expect(firstUsableKey(&.{}, &ch) == null);
 }
 
 test "CertifiedKey.check: chain, SCT list, leaf extensions; a selected key that fails it is internal_error" {
@@ -1933,6 +2026,21 @@ test "first message not a ClientHello; a second ClientHello; a bad client Finish
         try testing.expectError(error.DecryptError, s.feed(sealed));
         // One more record went out: the protected alert.
         try testing.expectEqual(flight + 5 + 2 + 1 + 16, s.pendingOutput().len);
+    }
+    // A Finished one octet short or long: decrypt_error as well (BoGo).
+    for ([_]usize{ 31, 33 }) |n| {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{});
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        var tx: record.Protection = undefined;
+        try tx.init(.aes_128_gcm_sha256, s.client_handshake_secret[0..32]);
+        var buf: [128]u8 = undefined;
+        buf[5..9].* = .{ 20, 0, 0, @intCast(n) };
+        @memset(buf[9..][0..n], 0xee);
+        const sealed = try tx.seal(&buf, 4 + n, .handshake, 0);
+        try testing.expectError(error.DecryptError, s.feed(sealed));
     }
 }
 
@@ -2375,7 +2483,8 @@ test "KeyUpdate from the client: update_requested is answered once, before the n
 
     // Several requests before the reply can go out (the output is full):
     // one reply.
-    while (p.s.out.slot().len > 64) _ = try p.s.write(&@as([1024]u8, @splat('x')));
+    // Whole records while one fits, then single octets to the brim.
+    while (p.s.out.slot().len > 64) _ = p.s.write(&@as([1024]u8, @splat('x'))) catch break;
     while (p.s.out.slot().len > 0) _ = p.s.write("y") catch break;
     for (0..3) |_| _ = try p.sendKeyUpdate(1);
     try testing.expectEqual(KeyUpdateRequest.update_not_requested, p.s.tx_update.?);
@@ -2392,7 +2501,8 @@ test "KeyUpdate from the client: update_requested is answered once, before the n
 test "KeyUpdate from the client: a due reply also goes out from feed once there is room" {
     const p = try Peer.create();
     defer p.destroy();
-    while (p.s.out.slot().len > 64) _ = try p.s.write(&@as([1024]u8, @splat('x')));
+    // Whole records while one fits, then single octets to the brim.
+    while (p.s.out.slot().len > 64) _ = p.s.write(&@as([1024]u8, @splat('x'))) catch break;
     while (p.s.out.slot().len > 0) _ = p.s.write("y") catch break;
     _ = try p.sendKeyUpdate(1);
     try testing.expect(p.s.tx_update != null);

@@ -1,0 +1,66 @@
+# tlsfuzzer scripts `interop-tlsserver --tlsfuzzer DIR` runs (tools/tlsfuzzer.zig)
+# and the counts tlsserver gives. More failures than listed = FAIL; fewer, or
+# another PASS count = NOTE, update the line ("PASS *": any number). The note says what the remaining
+# failures are and what qap's fork of ianic/tls.zig gives
+# (qap scripts/conformance-baseline/tlsfuzzer.tsv): the M2 gate is "no script
+# worse than the fork", except two deliberate divergences named in their notes
+# (connection-abort: no tickets without psk_key_exchange_modes; obsolete-curves:
+# JDK 11 compatibility). Scripts that sample their cases run with -n 0.
+# Not run: test-tls13-mlkem.py (needs the kyber-py package, which qap's venv
+# lacks; X25519MLKEM768 is covered by the OpenSSL / Go interop and BoGo),
+# test-tls13-mldsa-in-certificate-verify.py and
+# test-tls13-ecdsa-brainpool-in-certificate-verify.py (client keys of kinds
+# not served), test-tls13-psk_ke.py and test-tls13-psk_dhe_ke.py (external
+# PSKs: none), test-tls13-post-handshake-auth.py (not implemented, rustls
+# neither), test-tls13-client-certificate-compression.py (RFC 8879, M4).
+# script<TAB>listener (plain | mtls | echo)<TAB>args (";"-separated, "-": none; @NAME: a client file)<TAB>PASS n FAIL m<TAB>note
+test-tls13-0rtt-garbage.py	plain	-	PASS 10 FAIL 1	1 = a TLS 1.2 downgrade case (TLS 1.3 only)
+test-tls13-ccs.py	plain	-	PASS 5 FAIL 0	-
+test-tls13-certificate-compression.py	plain	-	PASS 17 FAIL 12	12 = RFC 8879 certificate compression, not implemented (M4) and a TLS 1.2 case
+test-tls13-certificate-request.py	mtls	-s;ecdsa_secp384r1_sha384 ecdsa_secp256r1_sha256 ed25519 rsa_pss_rsae_sha512 rsa_pss_rsae_sha384 rsa_pss_rsae_sha256 rsa_pkcs1_sha512 rsa_pkcs1_sha384 rsa_pkcs1_sha256;-k;@client-rsa2048.key;-c;@client-rsa2048.pem	PASS 5 FAIL 0	-
+test-tls13-certificate-verify.py	mtls	-s;ecdsa_secp384r1_sha384 ecdsa_secp256r1_sha256 ed25519 rsa_pss_rsae_sha512 rsa_pss_rsae_sha384 rsa_pss_rsae_sha256 rsa_pkcs1_sha512 rsa_pkcs1_sha384 rsa_pkcs1_sha256;-k;@client-rsa2048.key;-c;@client-rsa2048.pem	PASS 31 FAIL 0	-
+test-tls13-connection-abort.py	plain	-	PASS 140 FAIL 10	fork 150/0; 10 = 'After NewSessionTicket': the script's client sends no psk_key_exchange_modes yet requires a ticket; none is sent then (RFC 8446 §4.6.1 SHOULD NOT, rustls), the fork sends them anyway
+test-tls13-conversation.py	plain	-	PASS 3 FAIL 0	fork 3/0
+test-tls13-count-tickets.py	plain	-t;2	PASS 3 FAIL 0	fork 3/0 (fork -t 1; two tickets here)
+test-tls13-crfg-curves.py	plain	-	PASS 10 FAIL 8	fork 10/8; 8 = x448 (no such group)
+test-tls13-dhe-shared-secret-padding.py	plain	-n;0;-e;TLS 1.3 with x448;-e;TLS 1.3 with secp521r1;-e;TLS 1.3 with ffdhe2048;-e;TLS 1.3 with ffdhe3072	PASS * FAIL 0	repeats each group until a shared secret with a leading zero octet shows up (PASS varies); x448, secp521r1 and FFDHE excluded (no such groups)
+test-tls13-ecdhe-brainpool-curves.py	plain	-	PASS 0 FAIL 23	23 = brainpool groups: not in TLS 1.3 servers we follow (rustls, BoringSSL)
+test-tls13-ecdhe-curves.py	plain	-	PASS 21 FAIL 12	fork 21/12; 12 = secp521r1 and x448 (no such groups: their sanity and each malformed share, refused with handshake_failure)
+test-tls13-ecdsa-in-certificate-verify.py	mtls	-s;ecdsa_secp384r1_sha384 ecdsa_secp256r1_sha256 ed25519 rsa_pss_rsae_sha512 rsa_pss_rsae_sha384 rsa_pss_rsae_sha256 rsa_pkcs1_sha512 rsa_pkcs1_sha384 rsa_pkcs1_sha256;-k;@client-p256.key;-c;@client-p256.pem	PASS 132 FAIL 0	client P-256 certificates
+test-tls13-ecdsa-support.py	plain	-	PASS 6 FAIL 4	fork 5/5; 4 = brainpool x3 and secp521r1 certificates (none)
+test-tls13-eddsa-in-certificate-verify.py	mtls	-s;ecdsa_secp384r1_sha384 ecdsa_secp256r1_sha256 ed25519 rsa_pss_rsae_sha512 rsa_pss_rsae_sha384 rsa_pss_rsae_sha256 rsa_pkcs1_sha512 rsa_pkcs1_sha384 rsa_pkcs1_sha256;-k;@client-ed25519.key;-c;@client-ed25519.pem	PASS 132 FAIL 0	client Ed25519 certificates
+test-tls13-eddsa.py	plain	-	PASS 6 FAIL 3	fork 7/2; 3 = ed448 (no such key) and the 'ecdsa_* only' cases, which assume a server with an Ed25519 certificate only (this one also has ECDSA)
+test-tls13-empty-alert.py	plain	-	PASS 10 FAIL 0	fork 10/0
+test-tls13-ffdhe-groups.py	plain	-	PASS 0 FAIL 62	62 = FFDHE groups: not implemented (rustls likewise by default)
+test-tls13-ffdhe-sanity.py	plain	-	PASS 0 FAIL 7	7 = FFDHE groups, as above
+test-tls13-finished-plaintext.py	plain	-	PASS 3 FAIL 0	-
+test-tls13-finished.py	plain	-n;0	PASS 646 FAIL 68	68 = a Finished of the wrong length: decrypt_error here (BoringSSL, rustls; BoGo TrailingMessageData-TLS13-ClientFinished-TLS, owed to rustls), decode_error wanted (OpenSSL)
+test-tls13-hrr.py	plain	-	PASS 3 FAIL 0	-
+test-tls13-invalid-ciphers.py	plain	-	PASS 52 FAIL 0	-
+test-tls13-keyshare-omitted.py	plain	-	PASS 5 FAIL 0	fork 5/0
+test-tls13-keyupdate-from-server.py	plain	-	PASS 3 FAIL 0	'GET /keyupdate' convention (tlsfuzzer.zig)
+test-tls13-keyupdate.py	plain	-	PASS 62 FAIL 0	-
+test-tls13-large-number-of-extensions.py	plain	-n;0;--exc;11;--exc;27	PASS 82 FAIL 0	ids 11 (ec_point_formats) and 27 (compress_certificate) excluded: the script counts them unassigned and fills them at random, this server parses them (rustls too), so a malformed body is rightly decode_error
+test-tls13-legacy-version.py	plain	-	PASS 10 FAIL 0	fork 10/0
+test-tls13-lengths.py	echo	-n;200	PASS 202 FAIL 0	a 200-length sample (16,384 with -n 0); needs whole records (Server.write)
+test-tls13-minerva.py	plain	-	PASS 3 FAIL 0	fork 3/0
+test-tls13-multiple-ccs-messages.py	plain	-	PASS 7 FAIL 0	-
+test-tls13-no-unknown-groups.py	plain	-n;0	PASS 258 FAIL 1	1 = its 'unknown' range 4356-4611 holds X25519MLKEM768 (0x11ec), which is served: a HelloRetryRequest for it
+test-tls13-nociphers.py	plain	-	PASS 3 FAIL 0	-
+test-tls13-non-support.py	plain	-	PASS 0 FAIL 53	53 = a server without TLS 1.3 expected (the script's precondition)
+test-tls13-obsolete-curves.py	plain	-	PASS 88 FAIL 83	fork 169/2; 83 = obsolete groups in supported_groups alone are let through (JDK 11 lists them beside TLS 1.3: BoGo Server-JDK11-*); a share for one is refused
+test-tls13-pkcs-signature.py	plain	-	PASS 8 FAIL 0	fork 8/0
+test-tls13-record-layer-limits.py	plain	-n;0	PASS 144 FAIL 2	2 = a padded Finished of the wrong length, as test-tls13-finished
+test-tls13-record-padding.py	plain	-	PASS 4 FAIL 0	-
+test-tls13-rsa-signatures.py	plain	-	PASS 8 FAIL 0	-
+test-tls13-rsapss-signatures.py	plain	-	PASS 0 FAIL 8	8 = the script assumes an RSA-PSS (id-RSASSA-PSS) certificate: none here
+test-tls13-serverhello-random.py	plain	-	PASS 128 FAIL 128	128 = its ffdhe2048 half (no FFDHE)
+test-tls13-session-resumption.py	plain	-	PASS 4 FAIL 3	fork 4/3; 3 = two TLS 1.2 conversations and PSK_ONLY (psk_ke: never, as rustls)
+test-tls13-shuffled-extentions.py	plain	-	PASS 2 FAIL 17	17 = a second ClientHello with its extensions reordered is accepted (RFC 8446 §4.1.2 wants it unchanged; rustls compares less too) -- SPEC backlog
+test-tls13-signature-algorithms.py	plain	-n;0	PASS 278 FAIL 4	fork 98/4 (sampled, -n 100); 4 = 32,715 schemes = a ClientHello over the 64 KiB message cap (decode_error)
+test-tls13-symetric-ciphers.py	plain	-n;0	PASS 773 FAIL 386	386 = TLS_AES_128_CCM_SHA256 and TLS_AES_128_CCM_8_SHA256: not implemented (rustls likewise)
+test-tls13-unencrypted-alert.py	plain	-	PASS 4 FAIL 0	fork 4/0
+test-tls13-unrecognised-groups.py	plain	-	PASS 20 FAIL 12	12 = its ffdhe2048 cases
+test-tls13-version-negotiation.py	plain	-n;0	PASS 9 FAIL 260	260 = fallbacks to TLS 1.2 (TLS 1.3 only)
+test-tls13-zero-content-type.py	plain	-	PASS 8 FAIL 0	fork 8/0
+test-tls13-zero-length-data.py	plain	-	PASS 11 FAIL 0	-

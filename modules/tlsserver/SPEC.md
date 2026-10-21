@@ -43,6 +43,13 @@ runner cannot map, extensions this server ignores), and 49 are gaps: 0-RTT (27),
 certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — see
 *Backlog*. SCT stapling
 (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
+**tlsfuzzer (M2 exit gate, 2026-10-21):** 50 of its TLS 1.3 scripts run
+(`interop-tlsserver -- --tlsfuzzer DIR`, counts in `tools/tlsfuzzer/baseline.tsv`); against
+the 17 scripts qap's fork of ianic/tls.zig is held to, none is worse except two deliberate
+divergences (`connection-abort`: no tickets for a client without `psk_key_exchange_modes`;
+`obsolete-curves`: JDK 11 compatibility), three are better (`signature-algorithms` 278/4
+over all its cases, `ecdsa-support` with a P-384 key, `eddsa` with an Ed25519 key), and
+`legacy-version` reached the fork's 10/0 with a fix found by it.
 
 ## What this module is, and what it is not
 
@@ -347,6 +354,19 @@ The receive side's refusals are the table under *Wire format*. Record protection
   `minOutputLen` counts the extra records a smaller size makes. Records received may be 2^14.
 - The send side keeps `alert_reserve` (24 octets) of the output buffer for one alert, so a fatal
   alert or close_notify can be queued however full the application left it.
+- `Server.write` never cuts a record short to fit behind output still pending: it takes
+  nothing (`OutputFull`) until the caller sends what waits, so record boundaries follow the
+  data. An output below `full_record_output_len` (2^14 + 256 + 5 + 24) cuts records to what it
+  holds even when empty.
+- ClientHello: a `legacy_version` below 0x0301 is `protocol_version` even beside 0x0304 in
+  `supported_versions` (RFC 8446 §D.5, OpenSSL; rustls ignores it). A key_share entry for a
+  group missing from `supported_groups` (§4.2.8, a MAY) or for an obsolete_RESERVED group
+  (§4.2.7) is `illegal_parameter`; obsolete groups in `supported_groups` alone are served
+  (JDK 11 lists sect* and secp256k1 beside TLS 1.3, BoGo `Server-JDK11-*`), which
+  tlsfuzzer's `test-tls13-obsolete-curves` (OpenSSL only with `--relaxed`) counts against.
+- A client Finished of the wrong length is `decrypt_error`, as a wrong one (BoringSSL, rustls,
+  BoGo `TrailingMessageData-TLS13-ClientFinished-TLS`); OpenSSL and tlsfuzzer want
+  `decode_error`.
 - A client certificate chain: at most `clientauth.max_chain_len` (16) certificates, a leaf of at
   most `clientauth.max_leaf_len` (4096) octets (`bad_certificate`), the whole message within the
   joiner's cap (64 KiB by default, `decode_error`). `minOutputLen(config, key)` sizes the output
@@ -662,6 +682,9 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   a difference only in what malformed-but-ignored octets are refused.
 - **Constant-time padding removal:** not done, as in rustls and OpenSSL (see the constant-time
   contract).
+- **FFDHE groups, AES-CCM suites, brainpool and x448 / Ed448:** not offered (rustls's default
+  provider neither); tlsfuzzer's scripts for them stay red by design (`tools/tlsfuzzer/baseline.tsv`).
+- **psk_ke (PSK without (EC)DHE) and external PSKs:** never (rustls likewise).
 
 ## Backlog / deferred
 
@@ -676,6 +699,11 @@ and `fromPem` wants ~110 KiB of stack (more for RSA).
   (BoringSSL's stateful session cache) waits for the stateful cache (M4). The owed list is
   re-derived with `tools/bogo/rustls_parity.py` when the rustls reference moves (it takes
   about 4 minutes).
+- **Second ClientHello unchanged (2026-10-21, tlsfuzzer `test-tls13-shuffled-extentions`, 17):**
+  RFC 8446 §4.1.2 has the client resend the same ClientHello after a HelloRetryRequest but for
+  the listed changes; only the suite, the group's share, SNI and early_data are compared now
+  (rustls compares less). A comparison of the first hello's other extensions (kept as a hash
+  of their octets) would refuse a reordered or altered one with `illegal_parameter`.
 - **Key loading:** encrypted PKCS#8 (`rsa` already decrypts PBES2 for RSA keys:
   `fromPemEncrypted`), a private-key reader shared with `acme` (request filed in
   `x509/SPEC.md` § Backlog).

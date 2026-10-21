@@ -67,7 +67,9 @@ zeroed; the engine answers it with the matching alert.
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 339 pass, with the rustls parity report); handshakes against Zig std's
+(`-- --bogo`, 339 pass, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
+(`-- --tlsfuzzer DIR`, a checkout such as qap's `scripts/tools/tlsfuzzer`; counts held in
+`tools/tlsfuzzer/baseline.tsv`); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form
 the OpenSSL command line writes (`tools/key_vectors.py`). Fuzz: `TLSSERVER_FUZZ=<runs>` drives
 the `tlsserver-record`, `-inbound`, `-hello`, `-keys`, `-server`, `-keyupdate` and
@@ -76,4 +78,5 @@ stack: `src/stackprobe_test.zig` (ReleaseFast). Example: `zig build run-example-
 
 Provenance: clean-room from RFC 8446 (a public standard), no third-party source ported or
 studied, so no `NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0). The test vectors
-are RFC 8448's and OpenSSL's output (via Python `cryptography`).
+are RFC 8448's and OpenSSL's output (via Python `cryptography`). tlsfuzzer (GPL-2.0) is only
+run against the server as an external oracle, never copied or linked.

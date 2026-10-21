@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — tlsfuzzer gate (M2 exit gate). `interop-tlsserver -- --tlsfuzzer DIR` runs
+  50 TLS 1.3 tlsfuzzer scripts (new `tools/tlsfuzzer.zig`: three loopback listeners — plain,
+  optional client certificates, echo — a key per client scheme list through the new
+  `server.firstUsableKey`, tickets, the `GET /keyupdate` convention) and holds their counts
+  in `tools/tlsfuzzer/baseline.tsv` (`--tlsfuzzer-update` rewrites them, notes kept). Against
+  qap's fork none of its 17 scripts is worse but two deliberate divergences, three are better.
+  Found and fixed: a `legacy_version` below 0x0301 beside 0x0304 is now `protocol_version`
+  (legacy-version 2/8 → 10/0); a key_share for a group not in `supported_groups`, or for an
+  obsolete one, is `illegal_parameter`; `Server.write` no longer cuts a record short to fit
+  behind pending output (`OutputFull` until it is sent; new `full_record_output_len`) — the
+  echo script saw a 14,000-octet write leave as two records. Tried and reverted, with tests
+  pinning the choice: refusing obsolete groups in `supported_groups` (BoGo `Server-JDK11-*`: JDK
+  11 lists them beside TLS 1.3) and `decode_error` for a Finished of the wrong length (BoGo
+  `TrailingMessageData-TLS13-ClientFinished-TLS`, owed to rustls). BoGo 339 / 0 unchanged,
+  rustls parity unchanged; 10/10 planted mutants caught; fuzz `tlsserver-server`,
+  `-keyupdate`, `-hello`, `-clientauth` 60k each, clean.
 - **2026-10-20** — rustls parity gate (M2 step 6). New `tools/bogo/rustls_parity.py`: the BoGo
   server tests at TLS 1.3 that rustls 0.23.43 (aws-lc-rs) passes, reconstructed from its
   `bogo/config.json.in` and its shim's option table, each test's flags captured from the pinned
