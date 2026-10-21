@@ -709,7 +709,7 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   `clientauth.max_leaf_len` — raising it costs every connection 4 KiB (`Server.peer_buf`) and
   ticket scratch; a caller-supplied leaf buffer (the qap item below) is the other way: an owner
   decision (`Server-Verify-ML-DSA-65/87`, `Server-InvalidSignature-ML-DSA-65/87` disabled with
-  that reason). The ML-DSA AlgorithmIdentifier's absent parameters are checked for the private
+  that reason). **Decided 2026-10-21 (owner): the caller-supplied leaf buffer.** The ML-DSA AlgorithmIdentifier's absent parameters are checked for the private
   key, not for a client leaf (`x509.Spki` does not expose them).
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
