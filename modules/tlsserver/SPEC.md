@@ -170,7 +170,17 @@ A ticket's plaintext is built around the leaf where it lies in the caller's peer
 (below), and opened there — a ticket whose leaf is over this connection's cap is not resumed,
 nor one with a leaf when there is no client authentication — and the sealed blob goes straight
 into its place in the output: no copy of the leaf, no ticket-sized stack array. Every buffer
-holding the resumption secret, the PSK or a ticket's plaintext is wiped before the step returns. Not yet: a stateful cache, the ticket count request (RFC 9149).
+holding the resumption secret, the PSK or a ticket's plaintext is wiped before the step returns.
+**Stateful tickets** (RFC 8446 §2.2's database lookup; rustls's default `session_storage`):
+`CacheTicketer` keeps the plaintext in a `tlsresume.SessionCache` (`SessionCache(max_leaf_len)`:
+fixed entries of `ticketStateLen(max_leaf_len)` octets, oldest-first eviction, timeout, no lock)
+under a random 32-octet id that is the ticket; opening takes the entry out (rustls `take`), so a
+ticket resumes at most once, binder good or not, and its `replayGuard()` admits every early-data
+ticket (a replayed ClientHello finds no session). Costs of single use (rustls has them too): the
+id crosses the wire in the clear, so whoever saw a ClientHello can spend its ticket with a bad
+binder; a flood of full handshakes evicts real sessions; every lookup scans the whole cache (up to
+32 identities per ClientHello). Entries are sized by the configuration's `max_leaf_len` (a
+smaller cache issues no ticket to a longer leaf). Not yet: the ticket count request (RFC 9149).
 
 **0-RTT early data** (RFC 8446 §2.3, §4.2.10, §4.5, §8; opt-in `Config.early_data`, with
 tickets). Each NewSessionTicket carries `early_data` with `EarlyData.max_size` (BoringSSL's
@@ -810,8 +820,7 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:
   `Server-Sign*-ECDSA_P521_SHA512`, `Server-Sign*-ML-DSA-*`; zig-libs has `p521` and an ML-DSA
   module would be needed in `tls13.certverify`) and standalone ML-KEM-1024 as a group (4,
-  `CurveTest-*-MLKEM1024`, `tls13.kex`) are not scheduled yet. `-expect-session-id`
-  (BoringSSL's stateful session cache) waits for the stateful cache (M4). The owed list is
+  `CurveTest-*-MLKEM1024`, `tls13.kex`) are not scheduled yet. The owed list is
   re-derived with `tools/bogo/rustls_parity.py` when the rustls reference moves (it takes
   about 4 minutes).
 - **Second ClientHello unchanged (2026-10-21, tlsfuzzer `test-tls13-shuffled-extentions`, 17):**

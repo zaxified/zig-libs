@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M4 step 6, stateful tickets (rustls's default `session_storage`):
+  `CacheTicketer(Cache)` keeps each ticket's plaintext in a `tlsresume.SessionCache` under a
+  random 32-octet id (`cache_id_len`) and takes it out on opening, so a ticket resumes once;
+  `SessionCache(max_leaf_len)` / `ticketStateLen(max_leaf_len)` size its entries;
+  `CacheTicketer.replayGuard()` admits early data (a replayed ClientHello finds no session).
+  BoGo shim `TLSSERVER_BOGO_STATEFUL`: the whole run over the cache, 401/0 as with the STEK
+  (negative control with `open` refusing: 116 fail).
+
 - **2026-10-21** — M4 step 5, the exporter (RFC 8446 §7.5): `Server.exportKeyingMaterial(out,
   label, context)`, `Server.ExportError`, `max_exporter_label_len`, `maxExporterLen(suite)`;
   available once `canWrite()` (half-RTT included, as BoringSSL). The exporter master secret

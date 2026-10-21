@@ -615,6 +615,67 @@ test "tlsclient ↔ Server: tickets, then resumed handshakes, every suite" {
     }
 }
 
+test "tlsclient ↔ Server: a stateful ticket resumes once, a STEK ticket again" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const Cache = server_mod.SessionCache(0);
+    for ([_]bool{ true, false }) |stateful| {
+        errdefer std.debug.print("stateful {}\n", .{stateful});
+        var tf: TicketFixture = undefined;
+        tf.init();
+        var cache: Cache = try .init(testing.allocator, 4, 3600);
+        defer cache.deinit();
+        var prng = std.Random.DefaultPrng.init(9);
+        const ct: server_mod.CacheTicketer(Cache) = .{ .cache = &cache, .clock = tf.tickets.clock, .random = prng.random() };
+        if (stateful) tf.tickets.ticketer = ct.ticketer();
+        tf.tickets.count = 1;
+        const entries = try testing.allocator.alloc(ZlClient.ClientSession, 1);
+        defer testing.allocator.free(entries);
+        var client_cache: ZlClient.SessionCache = .init(entries, null);
+        defer client_cache.deinit();
+        const srv: ServerSide = .{ .tickets = &tf.tickets };
+        for (0..3) |round| {
+            // No ticket after the first: the client offers the same one
+            // again after resuming with it.
+            if (round == 1) tf.tickets.count = 0;
+            const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &client_cache });
+            defer testing.allocator.free(o.echoed);
+            try testing.expectEqualStrings("hello there", o.echoed);
+            try testing.expectEqual(round == 1 or (round == 2 and !stateful), o.resumed);
+        }
+        try testing.expectEqual(@as(usize, 0), cache.count());
+    }
+}
+
+test "tlsclient ↔ Server: a stateful ticket offered with a bad binder is spent" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const Cache = server_mod.SessionCache(0);
+    var tf: TicketFixture = undefined;
+    tf.init();
+    var cache: Cache = try .init(testing.allocator, 4, 3600);
+    defer cache.deinit();
+    var prng = std.Random.DefaultPrng.init(9);
+    const ct: server_mod.CacheTicketer(Cache) = .{ .cache = &cache, .clock = tf.tickets.clock, .random = prng.random() };
+    tf.tickets.ticketer = ct.ticketer();
+    tf.tickets.count = 1;
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 1);
+    defer testing.allocator.free(entries);
+    var client_cache: ZlClient.SessionCache = .init(entries, null);
+    defer client_cache.deinit();
+    const srv: ServerSide = .{ .tickets = &tf.tickets };
+    const first = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &client_cache });
+    testing.allocator.free(first.echoed);
+    try testing.expectEqual(@as(usize, 1), cache.count());
+    try testing.expectError(error.DecryptError, handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &client_cache, .corrupt_client_hello = true }));
+    try testing.expectEqual(@as(usize, 0), cache.count());
+    const o = try handshake(ZlClient, testing.allocator, &ck, srv, .{ .session_cache = &client_cache });
+    defer testing.allocator.free(o.echoed);
+    try testing.expect(!o.resumed);
+}
+
 test "tlsclient ↔ Server: a ticket for another suite, a retired key or past its lifetime gets a full handshake" {
     var fx: Fixture = undefined;
     try fx.init();

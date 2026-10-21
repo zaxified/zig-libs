@@ -555,6 +555,100 @@ pub fn StekTicketer(comptime Ring: type) type {
     };
 }
 
+/// The identity a `CacheTicketer` issues: random octets naming the session
+/// kept server-side (rustls `ServerSessionMemoryCache`, 32 as rustls).
+pub const cache_id_len = 32;
+
+/// The longest ticket plaintext under a `ClientAuth.max_leaf_len` of
+/// `max_leaf_len` (0 without client authentication): the state a
+/// `CacheTicketer`'s cache keeps per session.
+pub fn ticketStateLen(max_leaf_len: u16) usize {
+    return ticket_head_len + @as(usize, max_leaf_len) + TicketFields.tail_len;
+}
+
+/// The cache a `CacheTicketer` keeps the sessions of a configuration with
+/// that `max_leaf_len` in: entries of `ticketStateLen(max_leaf_len)`
+/// octets each, allocated at `init` (with its capacity and timeout).
+pub fn SessionCache(comptime max_leaf_len: u16) type {
+    return tlsresume.SessionCache(cache_id_len, ticketStateLen(max_leaf_len));
+}
+
+/// A stateful `Ticketer` (rustls's default server `session_storage`, RFC
+/// 8446 §2.2's "database lookup"): the session stays in `cache` and the
+/// client gets a random id for it. Opening a ticket takes it out of the
+/// cache, so each resumes at most once (rustls `take`), whether its binder,
+/// SNI or suite then match or not — so anyone who saw a ClientHello (the
+/// id is sent in the clear) can spend its ticket with a bad binder, and the
+/// client's next connection is a full handshake (rustls likewise; a
+/// `StekTicketer` has no such effect). A session evicted (oldest first: a
+/// flood of full handshakes pushes out real ones) or past the cache's
+/// timeout gets a full handshake too.
+/// Sizing: `Cache` is `SessionCache(m)` with `m` the configuration's
+/// `ClientAuth.max_leaf_len` (0 without client authentication; a smaller
+/// one issues no ticket to a client with a longer leaf), each entry costs
+/// `ticketStateLen(m)` octets whether used or not, and every lookup scans
+/// all of them, up to 32 times per ClientHello (one per identity offered):
+/// keep the capacity modest. Set the cache's timeout to at least
+/// `Tickets.lifetime_s`, and `clock` to `Tickets.clock` (the cache dates its
+/// entries by `clock`, the server opens them by `Tickets.clock`).
+/// Unlike a `StekTicketer`, a ticket is good only where its cache is: one
+/// cache per process means no resumption on another instance or after a
+/// restart.
+/// The cache is not locked: servers on several threads sharing it need a
+/// `Ticketer` of their own that takes a lock around `seal` and `open`.
+pub fn CacheTicketer(comptime Cache: type) type {
+    return struct {
+        const Self = @This();
+
+        cache: *Cache,
+        /// The time a session is stored at (`seal` is not given one).
+        clock: Clock,
+        /// The ids' source: a CSPRNG, as `Config.random`. The id is no
+        /// secret (it crosses the wire in the clear); it must not be
+        /// guessable, or a guessed id resumes nothing but spends another
+        /// client's ticket, and two equal ids overwrite a session.
+        random: std.Random,
+
+        /// A `ReplayGuard` for `EarlyData.replay` alongside `self.ticketer()`:
+        /// a ticket is taken from the cache when it is opened, so a recorded
+        /// ClientHello sent again finds no session and resumes nothing —
+        /// the guard need not remember anything (rustls takes 0-RTT only
+        /// from a stateful cache, for this reason). With any other
+        /// `Tickets.ticketer` (a `StekTicketer`, or a wrapper whose `open`
+        /// does not take) it lets every replay through: never mix them.
+        pub fn replayGuard(self: *const Self) ReplayGuard {
+            return .{ .ctx = @constCast(self), .admit = admitTaken };
+        }
+
+        /// The `Ticketer` points at `self` (and `self` at the cache): both
+        /// must outlive every `Server` whose `Config.tickets` holds it —
+        /// never call this on a temporary.
+        pub fn ticketer(self: *const Self) Ticketer {
+            return .{ .ctx = self, .seal = seal, .open = open };
+        }
+
+        fn seal(ctx: *const anyopaque, plaintext: []const u8, _: [12]u8, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            if (out.len < cache_id_len) return null;
+            const id = out[0..cache_id_len];
+            self.random.bytes(id);
+            const now_s = @divFloor(self.clock.now_ms(self.clock.ctx), 1000);
+            self.cache.put(id, plaintext, now_s) catch return null;
+            return id;
+        }
+
+        fn open(ctx: *const anyopaque, blob: []const u8, now_s: i64, out: []u8) ?[]u8 {
+            const self: *const Self = @ptrCast(@alignCast(ctx));
+            if (blob.len != cache_id_len) return null;
+            return self.cache.take(blob, now_s, out);
+        }
+
+        fn admitTaken(_: ?*anyopaque, _: []const u8, _: i64) bool {
+            return true;
+        }
+    };
+}
+
 /// A ticket's plaintext is built around the client's leaf where it lies in
 /// the peer buffer (`Server.setPeerBuffer`), and opened there: the
 /// `SessionState` prefix (a SHA-384 secret, a 1-octet nonce) and the
@@ -1591,7 +1685,8 @@ pub const Server = struct {
             error.MissingKeyShare => if (kex.expectedShareLen(group) != 0) error.IllegalParameter else error.InternalError,
         };
         // After the exchange: a share refused does not spend the ticket's
-        // single use.
+        // single use in the replay guard (a `CacheTicketer`'s ticket was
+        // spent when `choosePsk` opened it).
         self.early_reason = self.decideEarlyData(&ch, selected != null, &taken);
         const early = self.early_reason == .accepted;
 
@@ -3499,6 +3594,43 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     var anon: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000 };
     try testing.expect(!anon.accepts(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .suite = 0x1301 }), 0));
     try testing.expect(anon.accepts(testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 }), 0));
+}
+
+test "CacheTicketer: a random id for the cached state, opened once" {
+    const Cache = SessionCache(0);
+    var cache: Cache = try .init(testing.allocator, 2, 100);
+    defer cache.deinit();
+    const Fixed = struct {
+        fn now(_: ?*anyopaque) i64 {
+            return 50_999;
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(3);
+    const ct: CacheTicketer(Cache) = .{ .cache = &cache, .clock = .{ .now_ms = Fixed.now }, .random = prng.random() };
+    const t = ct.ticketer();
+    var room: [64]u8 = undefined;
+    // Too little room for the id: nothing is stored.
+    try testing.expect(t.seal(t.ctx, "state", @splat(0), room[0 .. cache_id_len - 1]) == null);
+    try testing.expectEqual(@as(usize, 0), cache.count());
+    var id_a: [cache_id_len]u8 = undefined;
+    @memcpy(&id_a, t.seal(t.ctx, "state-a", @splat(0), &room).?);
+    var id_b: [cache_id_len]u8 = undefined;
+    @memcpy(&id_b, t.seal(t.ctx, "state-b", @splat(0), &room).?);
+    try testing.expect(!std.mem.eql(u8, &id_a, &id_b));
+    // A plaintext over the cache's entries is not sealed.
+    const big: [ticketStateLen(0) + 1]u8 = @splat(1);
+    try testing.expect(t.seal(t.ctx, &big, @splat(0), &room) == null);
+
+    var out: [ticketStateLen(0)]u8 = undefined;
+    // Not an id: wrong length, or a prefix of one.
+    try testing.expect(t.open(t.ctx, id_a[0 .. cache_id_len - 1], 50, &out) == null);
+    try testing.expectEqualStrings("state-a", t.open(t.ctx, &id_a, 50, &out).?);
+    try testing.expect(t.open(t.ctx, &id_a, 50, &out) == null); // taken
+    // Stored at second 50 (the clock's, floored): gone at the timeout.
+    try testing.expect(t.open(t.ctx, &id_b, 150, &out) == null);
+    try testing.expectEqual(@as(usize, 0), cache.count());
+    const guard = ct.replayGuard();
+    try testing.expect(guard.admit(guard.ctx, &id_a, 0));
 }
 
 test "tickets only for a client that offers psk_dhe_ke (rustls)" {

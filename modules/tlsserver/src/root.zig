@@ -57,6 +57,8 @@ pub const CertifiedKey = server.CertifiedKey;
 pub const Tickets = server.Tickets;
 pub const Ticketer = server.Ticketer;
 pub const StekTicketer = server.StekTicketer;
+pub const CacheTicketer = server.CacheTicketer;
+pub const SessionCache = server.SessionCache;
 pub const ClientAuth = server.ClientAuth;
 
 /// Client certificates: the Certificate / CertificateVerify decoders, the

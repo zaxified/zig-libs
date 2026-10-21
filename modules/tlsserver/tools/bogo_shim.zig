@@ -26,7 +26,9 @@
 //!   with the shim ID again, sharing one ticket key; a flag prefixed
 //!   `-on-initial-` or `-on-resume-` applies to the first or to the later
 //!   ones only. The first must not resume; a later one must, unless
-//!   `-expect-session-miss`.
+//!   `-expect-session-miss`. With `TLSSERVER_BOGO_STATEFUL` set the tickets
+//!   are a `CacheTicketer`'s (single use; its guard for 0-RTT) instead of a
+//!   STEK's.
 //!
 //! - client certificates: `-require-any-client-certificate` (mandatory) and
 //!   `-verify-peer` (optional) with BoringSSL's shim verifier, which accepts
@@ -393,7 +395,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, environ: *const std.process.Envir
         logUnimplemented(io, environ);
         return exit_unimplemented;
     }
-    serve(gpa, io, &o, &on_resume) catch |err| {
+    serve(gpa, io, &o, &on_resume, environ.get("TLSSERVER_BOGO_STATEFUL") != null) catch |err| {
         // A credential the module cannot load (P-521, ML-DSA, …) is a
         // feature it lacks, not a failure.
         if (err == error.UnsupportedKey or err == error.Unimplemented) {
@@ -495,7 +497,10 @@ fn singlePemCertificate(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![
     return all[0];
 }
 
-fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume: *const Options) !void {
+/// ML-DSA-87 leaves (BoGo `Server-Verify-ML-DSA-87-TLS13`) are 7.5 KB.
+const shim_max_leaf_len = 8192;
+
+fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume: *const Options, stateful: bool) !void {
     const cert_pem = try readFile(gpa, io, initial.cert_file orelse return error.NoCertificate);
     const key_pem = try readFile(gpa, io, initial.key_file orelse return error.NoKey);
     var pair: tlsserver.keys.CertKeyPair = undefined;
@@ -515,13 +520,20 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume:
     var clock: ShimClock = .{ .io = io };
     ring.rotate(1, &stek_key, @divFloor(ShimClock.nowMs(&clock), 1000));
     const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
-    const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = clock.clock() };
+    // `TLSSERVER_BOGO_STATEFUL`: tickets kept in a session cache instead
+    // (`CacheTicketer`), single-use; a day's timeout outlasts every run.
+    const Cache = server_mod.SessionCache(shim_max_leaf_len);
+    var cache: Cache = try .init(gpa, 64, 24 * 3600);
+    defer cache.deinit();
+    const cached: server_mod.CacheTicketer(Cache) = .{ .cache = &cache, .clock = clock.clock(), .random = csprng.random() };
+    const tickets: server_mod.Tickets = .{ .ticketer = if (stateful) cached.ticketer() else stek.ticketer(), .clock = clock.clock() };
     // One replay register for the run too (BoringSSL's shim keeps none: its
     // tests resume each ticket once). `-resumption-delay` moves the clock by
     // up to a few minutes: a day's window outlasts every run.
     var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 64, 24 * 3600 * 1000);
     defer strikes.deinit();
-    const early: server_mod.EarlyData = .{ .replay = server_mod.strikeRegisterGuard(&strikes) };
+    const replay = if (stateful) cached.replayGuard() else server_mod.strikeRegisterGuard(&strikes);
+    const early: server_mod.EarlyData = .{ .replay = replay };
 
     for (0..initial.resume_count + 1) |i| {
         const o = if (i == 0) initial else on_resume;
@@ -551,8 +563,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .schemes = if (o.verify_prefs.items.len != 0) o.verify_prefs.items else &server_mod.default_client_auth_schemes,
         .authorities = o.ca_names.items,
         .clock = clock.clock(),
-        // ML-DSA-87 leaves (BoGo `Server-Verify-ML-DSA-87-TLS13`) are 7.5 KB.
-        .max_leaf_len = 8192,
+        .max_leaf_len = shim_max_leaf_len,
     };
     var leaf = ck.*;
     leaf.ocsp_response = o.ocsp_response;
