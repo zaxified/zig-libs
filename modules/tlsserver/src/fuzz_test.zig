@@ -1246,6 +1246,7 @@ const client_certs = @import("client_certs.zig");
 const clientauth = @import("clientauth.zig");
 const rsa = @import("rsa");
 const tlsresume = @import("tlsresume");
+const x509 = @import("x509");
 
 /// The recordings' ticket key and clock (`interop_vectors.zig`).
 const InteropTickets = struct {
@@ -1254,6 +1255,8 @@ const InteropTickets = struct {
     tickets: server_mod.Tickets,
     /// The recordings' client authentication (`tools/interop.zig`).
     verifier: clientauth.X509Verifier,
+    allowed: [1][]const u8,
+    allow: clientauth.RawKeyAllowlist,
     client_auth: server_mod.ClientAuth,
     /// The recordings' early data (`early_data` cases), single use per run.
     strikes: tlsresume.replay.StrikeRegister,
@@ -1268,6 +1271,15 @@ const InteropTickets = struct {
         t.tickets = .{ .ticketer = t.stek.ticketer(), .clock = .{ .now_ms = clock } };
         t.verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
         t.client_auth = .{ .verifier = t.verifier.verifier(), .mandatory = mode == .mandatory, .clock = .{ .now_ms = clock } };
+    }
+
+    /// A `raw_client` recording: its client's P-256 SPKI, the one key
+    /// allowed. Call after `init`, on the final address.
+    fn rawClient(t: *InteropTickets, v: interop.Case) void {
+        if (!v.raw_client) return;
+        t.allowed = .{(x509.spkiOf(&client_certs.p256_cert) catch unreachable).der};
+        t.allow = .{ .keys = &t.allowed };
+        t.client_auth.raw_public_keys = t.allow.verifier();
     }
 
     fn clientAuth(t: *const InteropTickets, mode: interop.ClientAuthMode) ?*const server_mod.ClientAuth {
@@ -1523,12 +1535,20 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         compressed = .{.{ .algorithm = c.algorithm, .uncompressed_len = c.uncompressed_len, .data = c.data }};
         leaf.compressed_certificates = &compressed;
     }
+    // RFC 7250 recordings: the leaf's bare SubjectPublicKeyInfo.
+    var raw_chain: [1][]const u8 = undefined;
+    if (v.raw_server) {
+        raw_chain[0] = (x509.spkiOf(leaf.chain[0]) catch unreachable).der;
+        leaf.chain = &raw_chain;
+        leaf.raw_public_key = true;
+    }
     const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
     it.init(gpa, v.client_auth);
+    it.rawClient(v);
     defer it.deinit();
     if (v.early_accepted) SrvMark.mark(.early_case);
     const cfg: server_mod.Config = .{
@@ -2046,12 +2066,20 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         compressed = .{.{ .algorithm = c.algorithm, .uncompressed_len = c.uncompressed_len, .data = c.data }};
         leaf.compressed_certificates = &compressed;
     }
+    // RFC 7250 recordings: the leaf's bare SubjectPublicKeyInfo.
+    var raw_chain: [1][]const u8 = undefined;
+    if (v.raw_server) {
+        raw_chain[0] = (x509.spkiOf(leaf.chain[0]) catch unreachable).der;
+        leaf.chain = &raw_chain;
+        leaf.raw_public_key = true;
+    }
     const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
     var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
     var it: InteropTickets = undefined;
     it.init(gpa, v.client_auth);
+    it.rawClient(v);
     defer it.deinit();
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },

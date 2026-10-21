@@ -74,6 +74,36 @@ pub const ClientCertVerifier = struct {
     verify: *const fn (ctx: ?*const anyopaque, chain: []const []const u8, now_s: i64) VerifyError!void,
 };
 
+/// Decides whether a client's RFC 7250 raw public key (its DER
+/// SubjectPublicKeyInfo) is one this server takes (rustls's verifier with
+/// `requires_raw_public_keys`). No chain, no names, no validity period:
+/// the key is the identity. A resumption does not ask it again (as the
+/// X.509 verifier is not): a key taken stays taken for the ticket's
+/// lifetime from its proof (`Tickets.lifetime_s`).
+pub const RawKeyVerifier = struct {
+    ctx: ?*const anyopaque = null,
+    verify: *const fn (ctx: ?*const anyopaque, spki_der: []const u8) VerifyError!void,
+};
+
+/// A `RawKeyVerifier` over a fixed set of keys: the client's must be one of
+/// `keys` (DER SubjectPublicKeyInfo, compared octet for octet; public data),
+/// else `access_denied`.
+pub const RawKeyAllowlist = struct {
+    keys: []const []const u8,
+
+    /// The verifier points at `self`: it must outlive every `Server` whose
+    /// `Config.client_auth` holds it.
+    pub fn verifier(self: *const RawKeyAllowlist) RawKeyVerifier {
+        return .{ .ctx = self, .verify = verifyKey };
+    }
+
+    fn verifyKey(ctx: ?*const anyopaque, spki_der: []const u8) VerifyError!void {
+        const self: *const RawKeyAllowlist = @ptrCast(@alignCast(ctx.?));
+        for (self.keys) |k| if (std.mem.eql(u8, k, spki_der)) return;
+        return error.AccessDenied;
+    }
+};
+
 /// RFC 5280 path validation of a client chain to `anchors` with the
 /// `clientAuth` extended key usage, through `x509.verifyChain` (rustls
 /// `WebPkiClientVerifier`). The leaf's names are not checked: which client
@@ -194,7 +224,16 @@ pub fn parseCertificateVerify(body: []const u8) Error!CertificateVerify {
 /// RSA (rsaEncryption), ECDSA P-256 / P-384 / P-521, Ed25519, ML-DSA — the
 /// keys `certverify` verifies with (as `dtls.certauth.parseLeafPublicKey`).
 pub fn leafPublicKey(der: []const u8) VerifyError!certverify.PublicKey {
-    const spki = x509.spkiOf(der) catch return error.BadCertificate;
+    return publicKeyOf(x509.spkiOf(der) catch return error.BadCertificate);
+}
+
+/// An RFC 7250 raw public key's (a DER SubjectPublicKeyInfo) key for
+/// `certverify.verify`: the keys `leafPublicKey` takes.
+pub fn rawPublicKey(spki_der: []const u8) VerifyError!certverify.PublicKey {
+    return publicKeyOf(x509.parseSpki(spki_der) catch return error.BadCertificate);
+}
+
+fn publicKeyOf(spki: x509.Spki) VerifyError!certverify.PublicKey {
     const bits = spki.key_bits;
     if (spki.algorithmIs(&x509.safe.oid_rsa_encryption))
         return .{ .rsa = rsa.PublicKey.fromDer(bits) catch return error.BadCertificate };

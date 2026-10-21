@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** `parseSpki` (`safe.parseSpki`): a bare DER SubjectPublicKeyInfo
+  — an RFC 7250 raw public key, a PEM `PUBLIC KEY` body — parsed to the same `Spki` `spkiOf`
+  returns for a certificate's (exactly one well-formed TLV). `spkiOf` now shares that walk
+  (`spkiAt`); its errors are unchanged. For `tlsserver`'s raw public keys.
+
 - **2026-10-19** — **Fix (BEHAVIOUR CHANGE):** (name-constraints bypass) directoryName constraints compared a constraint's whole `Name` (`[4] EXPLICIT Name`, a SEQUENCE) with the certificate subject's RDN content as given, so on real certificates an excluded directoryName never matched (bypass) and a permitted one refused every subject. `names.match` now compares RDN sequences on both sides (`rdnSequence`: a value that is exactly one SEQUENCE is unwrapped; SAN directoryName entries likewise). A chain whose CA carries a permitted directoryName now verifies when the subject is inside it. Test in `src/chain_test.zig` ("a real directoryName constraint …"), real DER; the earlier test fed RDNs straight inside `[4]`, a shape no certificate has.
 
 - **2026-10-19** — **Fix (BEHAVIOUR CHANGE):** (name-constraints bypass) the permitted subtrees of the CAs on a path were walked as one union (`checkOneName` over all accumulated blobs), so a CA constrained to `example.org` could issue a sub-CA permitting `evil.com` and a leaf for `www.evil.com` verified. Now they intersect as RFC 5280 §6.1.4 (g)(1) and Go require: every CA's permitted set that restricts the name's type must admit it (entries inside one CA's set are still alternatives; excluded subtrees stay a union; types a CA does not restrict stay unrestricted). A chain that relied on the union is now `NameConstraintViolated`. Test in `src/chain_test.zig` ("permitted subtrees of successive CAs intersect …"); negative control checked (the union walk fails it).

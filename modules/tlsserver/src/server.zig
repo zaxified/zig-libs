@@ -125,8 +125,20 @@ const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const HmacSha384 = std.crypto.auth.hmac.sha2.HmacSha384;
 
 /// A certificate chain (DER, leaf first) and the leaf's signing key.
+/// RFC 7250 `CertificateType` values (IANA TLS Certificate Types).
+pub const cert_type_x509: u8 = 0;
+pub const cert_type_raw_public_key: u8 = 2;
+
 pub const CertifiedKey = struct {
+    /// The X.509 chain, leaf first — or, with `raw_public_key`, one entry:
+    /// the DER SubjectPublicKeyInfo of `key`.
     chain: []const []const u8,
+    /// RFC 7250: the server authenticates with the bare public key
+    /// (`chain[0]`), not a certificate (rustls `only_raw_public_keys`). Only
+    /// a client that offers RawPublicKey in `server_certificate_type` is
+    /// taken (others get `handshake_failure`); no OCSP staple or SCT list
+    /// is sent.
+    raw_public_key: bool = false,
     /// Borrowed (`certverify.SecretKey` holds pointers): must outlive the
     /// connections that use it.
     key: certverify.SecretKey,
@@ -190,6 +202,10 @@ pub const CertifiedKey = struct {
         /// The leaf's OCSP staple and SCT list together overflow its
         /// `extensions<0..2^16-1>`.
         LeafExtensionsTooLong,
+        /// `raw_public_key`, and `chain[0]` is not a DER
+        /// SubjectPublicKeyInfo (or there is more than one entry:
+        /// `ChainLength`).
+        InvalidRawPublicKey,
         /// A compressed certificate that is empty or longer than a
         /// CompressedCertificate's 2^24-1 octets hold, or under the
         /// reserved algorithm 0.
@@ -207,6 +223,10 @@ pub const CertifiedKey = struct {
     /// callback's keys are checked again at every handshake).
     pub fn check(self: *const CertifiedKey) CheckError!void {
         if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.ChainLength;
+        if (self.raw_public_key) {
+            if (self.chain.len != 1) return error.ChainLength;
+            _ = x509.parseSpki(self.chain[0]) catch return error.InvalidRawPublicKey;
+        }
         // `certificate_request_context` (1) ‖ `certificate_list<0..2^24-1>`.
         var body: usize = 1 + 3;
         for (self.chain) |c| {
@@ -265,6 +285,8 @@ pub const CertifiedKey = struct {
     /// The staples a ClientHello gets: the ones it asks for that the key
     /// holds.
     fn staplesFor(self: *const CertifiedKey, ch: *const hello.ClientHello) Staples {
+        // RFC 7250 §4.2: certificate status is not for a raw public key.
+        if (self.raw_public_key) return .{};
         return .{
             .ocsp = ch.ocsp_requested and self.ocspStaple() != null,
             .sct = ch.sct_requested and self.sctList() != null,
@@ -390,6 +412,12 @@ pub const ClientAuth = struct {
     /// 5.5-7.5 KB. Past about 64 KB less 0.6 KB the tickets no longer fit
     /// their 16-bit length: none is issued.
     max_leaf_len: u16 = clientauth.default_max_leaf_len,
+    /// RFC 7250: the client authenticates with a raw public key, judged by
+    /// this verifier instead of `verifier` (rustls's verifier with
+    /// `requires_raw_public_keys`); only a client that offers RawPublicKey
+    /// in `client_certificate_type` is taken. `peerCertificate` is then the
+    /// key's DER SubjectPublicKeyInfo (`peerRawPublicKey` true).
+    raw_public_keys: ?clientauth.RawKeyVerifier = null,
 };
 
 /// rustls's (ring provider) `supported_verify_schemes`: ECDSA P-384 and
@@ -662,7 +690,8 @@ const ticket_head_len = tlsresume.select.SessionState(48).wireLen(1) + TicketFie
 /// Room after the leaf: the ticket's last fields, and `x509.safe`'s
 /// zero padding behind the copy `clientauth.checkLeafKeyUsage` reads.
 const leaf_tail_room = @max(TicketFields.tail_len, x509_parse_slack);
-const x509_parse_slack = @import("x509").safe.parse_slack;
+const x509 = @import("x509");
+const x509_parse_slack = x509.safe.parse_slack;
 
 /// What a `Ticketer` may add to the plaintext (a `StekRing` adds 29).
 const ticket_seal_overhead = 128;
@@ -708,6 +737,9 @@ const TicketFields = struct {
     /// The client's certificate (DER leaf), if it authenticated, and the
     /// scheme of its CertificateVerify (0 without one).
     peer: ?[]const u8,
+    /// `peer` is an RFC 7250 raw public key (written as format
+    /// `format_raw`, so tickets from before stay readable).
+    peer_raw: bool = false,
     peer_scheme: u16 = 0,
     /// When the client proved that certificate (the full handshake's time,
     /// carried across resumptions), ms since the epoch.
@@ -717,6 +749,7 @@ const TicketFields = struct {
     suite: u16,
 
     const format: u8 = 3;
+    const format_raw: u8 = 4;
     /// The longest run before the leaf, and the run after it.
     const head_max = 1 + 1 + 255 + 1 + 255 + 2;
     const tail_len = 2 + 8 + 4 + 2;
@@ -732,7 +765,7 @@ const TicketFields = struct {
         const alpn = f.alpn orelse "";
         const start = leaf_at - (1 + 1 + sni.len + 1 + alpn.len + 2);
         var n = start;
-        buf[n] = format;
+        buf[n] = if (f.peer_raw and f.peer != null) format_raw else format;
         n += 1;
         for ([_][]const u8{ sni, alpn }) |b| {
             buf[n] = @intCast(b.len);
@@ -751,7 +784,7 @@ const TicketFields = struct {
     /// Null for anything this server did not write (another format), or
     /// with a leaf over `max_peer` octets.
     fn parse(tail: []const u8, max_peer: usize) ?TicketFields {
-        if (tail.len < 7 or tail[0] != format) return null;
+        if (tail.len < 7 or (tail[0] != format and tail[0] != format_raw)) return null;
         var at: usize = 1;
         var v: [2]?[]const u8 = undefined;
         for (&v) |*x| {
@@ -768,10 +801,12 @@ const TicketFields = struct {
         const peer: ?[]const u8 = if (n == 0) null else tail[at..][0..n];
         at += n;
         if (tail.len - at != tail_len) return null;
+        if (tail[0] == format_raw and peer == null) return null;
         return .{
             .sni = v[0],
             .alpn = v[1],
             .peer = peer,
+            .peer_raw = tail[0] == format_raw,
             .peer_scheme = std.mem.readInt(u16, tail[at..][0..2], .big),
             .peer_auth_ms = std.mem.readInt(i64, tail[at + 2 ..][0..8], .big),
             .max_early_data = std.mem.readInt(u32, tail[at + 10 ..][0..4], .big),
@@ -793,6 +828,9 @@ const Resumable = struct {
     lifetime_ms: i64,
     now_ms: i64 = 0,
     need_peer: bool = false,
+    /// A client certificate in the ticket must be of this type (a raw
+    /// public key or X.509), the one negotiated for this hello.
+    peer_raw: bool = false,
     /// The longest leaf a ticket may carry (this connection's cap; 0
     /// without client authentication).
     max_peer: usize = 0,
@@ -811,6 +849,7 @@ const Resumable = struct {
         const f = TicketFields.parse(tail, w.max_peer) orelse return false;
         if (f.suite != w.suite or !Server.optEql(f.sni, w.sni) or age_ms > w.lifetime_ms) return false;
         if (w.need_peer and f.peer == null) return false;
+        if (f.peer != null and f.peer_raw != w.peer_raw) return false;
         if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms - f.peer_auth_ms > w.lifetime_ms)) return false;
         w.peer = f.peer;
         w.peer_scheme = f.peer_scheme;
@@ -1084,6 +1123,12 @@ pub const Server = struct {
     peer_scheme: u16 = 0,
     /// When the client proved the leaf (`TicketFields.peer_auth_ms`).
     peer_auth_ms: i64 = 0,
+    /// RFC 7250 at the last ClientHello: the `server_certificate_type` and
+    /// `client_certificate_type` chosen (null: the client sent none).
+    server_cert_type: ?u8 = null,
+    client_cert_type: ?u8 = null,
+    /// The client's leaf is a raw public key (a SubjectPublicKeyInfo).
+    peer_raw: bool = false,
     /// What became of the client's early data (set at the last ClientHello).
     early_reason: EarlyDataReason = .disabled,
     /// The first ClientHello offered early data, and a HelloRetryRequest
@@ -1191,6 +1236,14 @@ pub const Server = struct {
     /// early data attributed to it may come from a replayer (RFC 8446 §8).
     pub fn peerCertificate(self: *const Server) ?[]const u8 {
         return if (self.peer_authenticated) self.peerLeaf() else null;
+    }
+
+    /// `peerCertificate` is an RFC 7250 raw public key: a DER
+    /// SubjectPublicKeyInfo, not a certificate (`ClientAuth.raw_public_keys`).
+    /// Check it before parsing `peerCertificate` as X.509 (`x509.parseSpki`
+    /// for the key, `x509.spkiOf` for a certificate).
+    pub fn peerRawPublicKey(self: *const Server) bool {
+        return self.peer_authenticated and self.peer_raw;
     }
 
     /// The signature scheme of the client's CertificateVerify (null: no
@@ -1688,6 +1741,12 @@ pub const Server = struct {
         };
         ck.check() catch return error.InternalError;
         if (cfg.client_auth) |ca| if (self.peer_buf.len < peerBufferLen(ca.max_leaf_len)) return error.InternalError;
+        // RFC 7250, in rustls's terms: each side's type is the one this
+        // server requires, if the client can do it. On every hello, a
+        // resuming one included (rustls too): a client resuming with a
+        // raw-key server must offer RawPublicKey again.
+        self.server_cert_type = try negotiateCertType(ck.raw_public_key, ch.server_certificate_types);
+        self.client_cert_type = try negotiateCertType(if (cfg.client_auth) |ca| ca.raw_public_keys != null else false, ch.client_certificate_types);
         const scheme = chooseScheme(ck, &sig_algs) orelse return error.HandshakeFailure;
 
         var suite: record.CipherSuite = chooseSuite(cfg, &ch) orelse return error.HandshakeFailure;
@@ -1871,6 +1930,7 @@ pub const Server = struct {
             .lifetime_ms = @as(i64, @min(tk.lifetime_s, max_ticket_lifetime_s)) * 1000,
             .now_ms = now_ms,
             .need_peer = if (self.config.client_auth) |ca| ca.mandatory else false,
+            .peer_raw = self.client_cert_type == cert_type_raw_public_key,
             .max_peer = if (self.config.client_auth) |ca| ca.max_leaf_len else 0,
         };
         const ring: TicketerRing = .{ .t = tk.ticketer };
@@ -1905,10 +1965,23 @@ pub const Server = struct {
             const dst = self.peer_buf[ticket_head_len..][0..p.len];
             if (@intFromPtr(dst.ptr) > @intFromPtr(p.ptr)) std.mem.copyBackwards(u8, dst, p) else std.mem.copyForwards(u8, dst, p);
             self.peer_len = @intCast(p.len);
+            self.peer_raw = want.peer_raw;
             self.peer_scheme = want.peer_scheme;
             self.peer_auth_ms = want.peer_auth_ms;
         }
         return true;
+    }
+
+    /// RFC 7250 §4.2 as rustls decides it: RawPublicKey when this server
+    /// requires it and the client offers it, X.509 when it does not require
+    /// it and the client offers X.509; null when the client sent no list
+    /// (X.509, nothing echoed); anything else `handshake_failure`.
+    fn negotiateCertType(requires_raw: bool, offered: ?[]const u8) Error!?u8 {
+        const list = offered orelse return if (requires_raw) error.HandshakeFailure else null;
+        const raw = std.mem.indexOfScalar(u8, list, cert_type_raw_public_key) != null;
+        const x = std.mem.indexOfScalar(u8, list, cert_type_x509) != null;
+        if (requires_raw) return if (raw) cert_type_raw_public_key else error.HandshakeFailure;
+        return if (x) cert_type_x509 else error.HandshakeFailure;
     }
 
     /// The key's first allowed scheme (`CertifiedKey.signature_schemes`
@@ -2101,8 +2174,25 @@ pub const Server = struct {
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [3]messages.Extension = undefined;
+        var exts: [5]messages.Extension = undefined;
         var n_exts: usize = 0;
+        // RFC 7250 §4.2: each type only with the message it governs — the
+        // server's with its Certificate, the client's with the
+        // CertificateRequest.
+        var server_type: [1]u8 = undefined;
+        var client_type: [1]u8 = undefined;
+        if (psk == null) {
+            if (self.server_cert_type) |st| {
+                server_type[0] = st;
+                exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.server_certificate_type), .data = &server_type };
+                n_exts += 1;
+            }
+            if (cfg.client_auth != null) if (self.client_cert_type) |ct| {
+                client_type[0] = ct;
+                exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.client_certificate_type), .data = &client_type };
+                n_exts += 1;
+            };
+        }
         if (self.alpn) |p| {
             exts[n_exts] = .{ .type = 16, .data = try encoded(messages.alpnData(&alpn_body, p)) };
             n_exts += 1;
@@ -2196,6 +2286,19 @@ pub const Server = struct {
             chain[n] = der;
         }
         if (chain[0].len > ca.max_leaf_len) return error.BadCertificate;
+        if (self.client_cert_type == cert_type_raw_public_key) {
+            // RFC 7250 §3: one entry, the SubjectPublicKeyInfo, judged by
+            // the raw-key verifier alone.
+            if (n != 1) return error.BadCertificate;
+            _ = try clientauth.rawPublicKey(chain[0]);
+            try ca.raw_public_keys.?.verify(ca.raw_public_keys.?.ctx, chain[0]);
+            @memcpy(self.peer_buf[ticket_head_len..][0..chain[0].len], chain[0]);
+            self.peer_len = @intCast(chain[0].len);
+            self.peer_raw = true;
+            self.appendTranscript(m);
+            self.state = .client_certificate_verify;
+            return;
+        }
         // The leaf must be able to sign the CertificateVerify, whatever
         // the verifier says (BoringSSL checks both here, before it). The
         // keyUsage check copies it to its place in the peer buffer.
@@ -2215,7 +2318,7 @@ pub const Server = struct {
         const cv = clientauth.parseCertificateVerify(m.body) catch return error.DecodeError;
         // rustls `SignedHandshakeWithUnadvertisedSigScheme`.
         if (std.mem.indexOfScalar(u16, ca.schemes, cv.scheme) == null) return error.IllegalParameter;
-        const key = try clientauth.leafPublicKey(self.peerLeaf());
+        const key = try if (self.peer_raw) clientauth.rawPublicKey(self.peerLeaf()) else clientauth.leafPublicKey(self.peerLeaf());
         const scheme: certverify.SignatureScheme = @fromBackingInt(cv.scheme);
         var th_buf: [48]u8 = undefined;
         const th: []const u8 = switch (self.transcript) {
@@ -2311,6 +2414,7 @@ pub const Server = struct {
             .sni = self.serverName(),
             .alpn = self.alpn,
             .peer = self.peerCertificate(),
+            .peer_raw = self.peerRawPublicKey(),
             .peer_scheme = self.peerSignatureScheme() orelse 0,
             .peer_auth_ms = self.peer_auth_ms,
             .max_early_data = if (early_ext != 0) self.config.early_data.?.max_size else 0,
@@ -2397,6 +2501,9 @@ const Hello = struct {
     sct: bool = false,
     /// RFC 8879 `compress_certificate` algorithms.
     compress_certificate: ?[]const u16 = null,
+    /// RFC 7250 `server_certificate_type` / `client_certificate_type` lists.
+    server_cert_types: ?[]const u8 = null,
+    client_cert_types: ?[]const u8 = null,
     /// Octets of a next handshake message in the same record.
     trailing: []const u8 = "",
 };
@@ -2496,6 +2603,12 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     }
     if (h.ocsp) try W.ext(&e, gpa, 5, &.{ 1, 0, 0, 0, 0 });
     if (h.sct) try W.ext(&e, gpa, 18, "");
+    for ([_]struct { u16, ?[]const u8 }{ .{ 20, h.server_cert_types }, .{ 19, h.client_cert_types } }) |ct| if (ct[1]) |types| {
+        var d: [256]u8 = undefined;
+        d[0] = @intCast(types.len);
+        @memcpy(d[1..][0..types.len], types);
+        try W.ext(&e, gpa, ct[0], d[0 .. 1 + types.len]);
+    };
     if (h.compress_certificate) |algs| {
         const d = try W.list16(gpa, u8, algs);
         defer gpa.free(d);
@@ -3683,6 +3796,9 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     for ([_]TicketFields{
         .{ .sni = "example.com", .alpn = "h2", .peer = null, .suite = 0x1302 },
         .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_scheme = 0x0804, .suite = 0x1301 },
+        .{ .sni = null, .alpn = null, .peer = "SPKI", .peer_raw = true, .peer_scheme = 0x0403, .suite = 0x1301 },
+        // A raw-key flag without a key is not written (format 3).
+        .{ .sni = "x", .alpn = null, .peer = null, .peer_raw = true, .suite = 0x1301 },
         .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .peer_auth_ms = -2, .max_early_data = 0xfedc_ba98, .suite = 0x1303 },
     }) |f| {
         const w = testTicketFields(&buf, f);
@@ -3690,6 +3806,7 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
         const back = TicketFields.parse(w, cap).?;
         try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and
             Server.optEql(f.peer, back.peer) and f.peer_scheme == back.peer_scheme and f.suite == back.suite);
+        try testing.expectEqual(f.peer_raw and f.peer != null, back.peer_raw);
         try testing.expectEqual(f.peer_auth_ms, back.peer_auth_ms);
         try testing.expectEqual(f.max_early_data, back.max_early_data);
         // Every truncation, an extra octet and another format are refused.
@@ -3733,6 +3850,20 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
     try testing.expect(need.accepts(t3, 0));
     try testing.expectEqualStrings("LEAF", need.peer.?);
     try testing.expectEqual(@as(u16, 0x0807), need.peer_scheme);
+    // RFC 7250: a client key resumes only as the type negotiated now — a
+    // raw public key never as a certificate, nor the other way round; a
+    // format-4 ticket without a key is not this server's.
+    {
+        var raw = need;
+        raw.peer_raw = true;
+        try testing.expect(!raw.accepts(t3, 0));
+        const t_raw = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "SPKI", .peer_raw = true, .suite = 0x1301 });
+        try testing.expect(raw.accepts(t_raw, 0));
+        try testing.expect(!need.accepts(t_raw, 0));
+        var no_key = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 });
+        no_key[0] = TicketFields.format_raw;
+        try testing.expect(TicketFields.parse(no_key, cap) == null);
+    }
     // The certificate is good for the lifetime from its proof, whatever
     // the ticket's own age (a re-issued ticket is young).
     const t4 = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_auth_ms = 5_000, .suite = 0x1301 });
@@ -4117,6 +4248,118 @@ fn rfc8448S6Server(cfg: *const Config, joiner: []u8, out: []u8, peer: []u8) Serv
     }) |m| s.transcript.sha256.append(m[0], m[4..]);
     s.state = .client_certificate;
     return s;
+}
+
+test "RFC 7250: certificate types as rustls negotiates them; refusals are handshake_failure" {
+    // (requires a raw key, the client's list) → the type echoed, or refused.
+    try testing.expectEqual(@as(?u8, null), try Server.negotiateCertType(false, null));
+    try testing.expectError(error.HandshakeFailure, Server.negotiateCertType(true, null));
+    try testing.expectEqual(@as(?u8, 0), try Server.negotiateCertType(false, &.{ 2, 0 }));
+    try testing.expectError(error.HandshakeFailure, Server.negotiateCertType(false, &.{2}));
+    try testing.expectEqual(@as(?u8, 2), try Server.negotiateCertType(true, &.{ 0, 2 }));
+    try testing.expectError(error.HandshakeFailure, Server.negotiateCertType(true, &.{0}));
+    try testing.expectError(error.HandshakeFailure, Server.negotiateCertType(true, &.{ 1, 3, 255 }));
+
+    var prng = std.Random.DefaultPrng.init(1);
+    const spki = (try x509.spkiOf(&certs.p256_cert)).der;
+    var raw_chain = [1][]const u8{spki};
+    var ck: CertifiedKey = .{ .chain = &raw_chain, .key = testKey().key, .raw_public_key = true };
+    try ck.check();
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    var s: Server = undefined;
+    try accept(&s, &cfg, &joiner, &out, .{ .server_cert_types = &.{ 0, 2 } });
+    try testing.expectEqual(@as(?u8, 2), s.server_cert_type);
+    try testing.expectEqual(@as(?u8, null), s.client_cert_type);
+    // A client that cannot take a raw key, or says nothing.
+    for ([_]?[]const u8{ null, &.{0} }) |types| {
+        s = .init(&cfg, &joiner, &out);
+        const rec = try buildRecord(testing.allocator, .{ .server_cert_types = types });
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.HandshakeFailure, s.feed(rec));
+    }
+    // An X.509 server: a client that only takes raw keys, or only sends one
+    // (no client authentication asks for it), is refused as rustls does.
+    const x_cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    for ([_]Hello{ .{ .server_cert_types = &.{2} }, .{ .client_cert_types = &.{2} } }) |h| {
+        s = .init(&x_cfg, &joiner, &out);
+        const rec = try buildRecord(testing.allocator, h);
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.HandshakeFailure, s.feed(rec));
+    }
+    try accept(&s, &x_cfg, &joiner, &out, .{ .server_cert_types = &.{ 2, 0 }, .client_cert_types = &.{0} });
+    try testing.expectEqual(@as(?u8, 0), s.server_cert_type);
+    // `check`: one SubjectPublicKeyInfo, nothing else.
+    var two = [2][]const u8{ spki, spki };
+    try testing.expectError(error.ChainLength, (CertifiedKey{ .chain = &two, .key = testKey().key, .raw_public_key = true }).check());
+    var cert_chain = [1][]const u8{&certs.p256_cert};
+    try testing.expectError(error.InvalidRawPublicKey, (CertifiedKey{ .chain = &cert_chain, .key = testKey().key, .raw_public_key = true }).check());
+}
+
+test "RFC 7250: a client's raw public key — one entry, the allowlist's call, its key for the CertificateVerify" {
+    const kat = @import("message_kat_vectors.zig");
+    var prng = std.Random.DefaultPrng.init(1);
+    // The RFC's client leaf, sent as its SubjectPublicKeyInfo.
+    const cert_msg = &kat.rfc8448_s6_client_certificate;
+    const leaf = cert_msg[11..][0..std.mem.readInt(u24, cert_msg[8..11], .big)];
+    const spki = (try x509.spkiOf(leaf)).der;
+    var allowed = [1][]const u8{spki};
+    var allow: clientauth.RawKeyAllowlist = .{ .keys = &allowed };
+    var auth: ClientAuth = .{ .verifier = .{ .verify = AcceptAny.verify }, .clock = .{ .now_ms = AcceptAny.clock }, .raw_public_keys = allow.verifier() };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .client_auth = &auth };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [4096]u8 = undefined;
+    var peer: [peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
+    var msg_buf: [1024]u8 = undefined;
+    const Msg = struct {
+        /// Certificate { context "", entries each `spki` } with no extensions.
+        fn build(buf: []u8, key: []const u8, n: usize) []const u8 {
+            buf[0] = 11;
+            buf[4] = 0;
+            var at: usize = 8;
+            for (0..n) |_| {
+                std.mem.writeInt(u24, buf[at..][0..3], @intCast(key.len), .big);
+                @memcpy(buf[at + 3 ..][0..key.len], key);
+                at += 3 + key.len;
+                buf[at] = 0;
+                buf[at + 1] = 0;
+                at += 2;
+            }
+            std.mem.writeInt(u24, buf[5..8], @intCast(at - 8), .big);
+            std.mem.writeInt(u24, buf[1..4], @intCast(at - 4), .big);
+            return buf[0..at];
+        }
+    };
+    {
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        s.client_cert_type = cert_type_raw_public_key;
+        try testing.expect(try s.onHandshake(handshakeMessage(Msg.build(&msg_buf, spki, 1))) == null);
+        try testing.expectEqual(State.client_certificate_verify, s.state);
+        try testing.expectEqualSlices(u8, spki, s.peerLeaf());
+        try testing.expect(s.peer_raw);
+        // The RFC's CertificateVerify signed a transcript with the X.509
+        // Certificate in it: under the raw key it is a signature that does
+        // not verify (decrypt_error) — the key itself was taken.
+        try testing.expectError(error.DecryptError, s.onHandshake(handshakeMessage(&kat.rfc8448_s6_client_certificate_verify)));
+    }
+    {
+        // Two entries.
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        s.client_cert_type = cert_type_raw_public_key;
+        try testing.expectError(error.BadCertificate, s.onHandshake(handshakeMessage(Msg.build(&msg_buf, spki, 2))));
+    }
+    {
+        // A key the allowlist does not hold; a certificate where the key
+        // belongs.
+        allowed[0] = (try x509.spkiOf(&certs.p256_cert)).der;
+        var s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        s.client_cert_type = cert_type_raw_public_key;
+        try testing.expectError(error.AccessDenied, s.onHandshake(handshakeMessage(Msg.build(&msg_buf, spki, 1))));
+        s = rfc8448S6Server(&cfg, &joiner, &out, &peer);
+        s.client_cert_type = cert_type_raw_public_key;
+        try testing.expectError(error.BadCertificate, s.onHandshake(handshakeMessage(cert_msg)));
+    }
 }
 
 test "RFC 8448 §6: the client's Certificate and CertificateVerify (RSA-PSS) verify" {

@@ -32,6 +32,7 @@ const std = @import("std");
 const net = std.Io.net;
 const tlsserver = @import("tlsserver");
 const rsa = @import("rsa");
+const x509 = @import("x509");
 const tlsresume = @import("tlsresume");
 const bogo_shim = @import("bogo_shim.zig");
 const tlsfuzzer = @import("tlsfuzzer.zig");
@@ -103,6 +104,12 @@ const Case = struct {
     /// The client prints `interop_exporter_len` octets exported for
     /// `interop_exporter_label` (no context); the server's must match.
     exporter: bool = false,
+    /// RFC 7250: the server authenticates with its key's bare
+    /// SubjectPublicKeyInfo (`CertifiedKey.raw_public_key`).
+    raw_server: bool = false,
+    /// RFC 7250: the client authenticates with a raw public key, the
+    /// `client_cert`'s SPKI, taken by an allowlist of that one key.
+    raw_client: bool = false,
 };
 
 /// The exporter label and length of the `exporter` cases.
@@ -161,6 +168,13 @@ const cases = [_]Case{
     .{ .name = "mtls-optional-none", .why = "an optional client certificate, none sent (an empty Certificate)", .seed = 43, .client_auth = .optional, .expect = &.{"Verification: OK"} },
     .{ .name = "mtls-resume-new", .why = "tickets after client authentication: they carry the client certificate", .seed = 44, .tickets = true, .brief = false, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess_out", "openssl-mtls.sess" }, .expect = &.{"New, TLSv1.3"} },
     .{ .name = "mtls-resume", .why = "resumption with a mandatory client certificate: no CertificateRequest, the ticket's identity", .seed = 45, .tickets = true, .resumed = true, .brief = false, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess_in", "openssl-mtls.sess" }, .expect = &.{"Reused, TLSv1.3"} },
+    .{ .name = "rpk-server", .why = "RFC 7250: the server's raw public key (s_client -enable_server_rpk)", .seed = 70, .raw_server = true, .brief = false, .args = &.{"-enable_server_rpk"}, .expect = &.{"Server raw public key"} },
+    .{ .name = "rpk-mutual", .why = "RFC 7250 both ways: raw public keys for the server and the client", .seed = 71, .raw_server = true, .raw_client = true, .client_auth = .mandatory, .client_cert = .p256, .brief = false, .args = &.{ "-enable_server_rpk", "-enable_client_rpk" }, .expect = &.{"Server raw public key"} },
+    .{ .name = "rpk-client", .why = "RFC 7250: a client raw public key to an X.509 server", .seed = 72, .raw_client = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{"-enable_client_rpk"}, .expect = &.{"Verification: OK"} },
+    .{ .name = "rpk-server-status", .why = "RFC 7250 §4.2: a raw-key server staples nothing, though the client asks (s_client -status)", .seed = 75, .raw_server = true, .staple = true, .brief = false, .args = &.{ "-enable_server_rpk", "-status" }, .expect = &.{ "Server raw public key", "OCSP response: no response sent" } },
+    .{ .name = "rpk-client-unasked", .why = "RFC 7250 §4.2: a client offering a raw key to a server that asks for no certificate: no client_certificate_type back", .seed = 76, .args = &.{"-enable_client_rpk"}, .expect = &.{"Verification: OK"} },
+    .{ .name = "rpk-resume-new", .why = "tickets after raw-public-key client authentication: they carry the key (ticket format 4)", .seed = 73, .tickets = true, .raw_client = true, .client_auth = .mandatory, .client_cert = .p256, .brief = false, .args = &.{ "-enable_client_rpk", "-sess_out", "openssl-rpk.sess" }, .expect = &.{"New, TLSv1.3"} },
+    .{ .name = "rpk-resume", .why = "resumption of a raw-public-key client: the ticket's key", .seed = 74, .tickets = true, .resumed = true, .raw_client = true, .client_auth = .mandatory, .client_cert = .p256, .brief = false, .args = &.{ "-enable_client_rpk", "-sess_in", "openssl-rpk.sess" }, .expect = &.{"Reused, TLSv1.3"} },
     // Go: its suite order (AES-128 first on AES hardware) is not
     // configurable in TLS 1.3, so the server's list picks the suite.
     .{ .name = "go-default", .client = .go, .why = "Go's defaults: X25519MLKEM768, its first suite", .seed = 21, .expect = &.{ "version: TLS 1.3", "suite: TLS_AES_128_GCM_SHA256", "group: X25519MLKEM768", "peer_certs: 1" } },
@@ -369,7 +383,13 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     };
     switch (c.client) {
         .openssl => {
-            try argv.appendSlice(gpa, &.{ "openssl", "s_client", "-connect", target, "-tls1_3", if (c.brief) "-brief" else "-ign_eof", "-ign_eof", "-verify_return_error", "-CAfile", ca_file, "-verify_hostname", "localhost" });
+            try argv.appendSlice(gpa, &.{
+                "openssl",                                                "s_client", "-connect", target,             "-tls1_3",   if (c.brief) "-brief" else "-ign_eof", "-ign_eof",
+                // A raw public key cannot chain to the CA, and s_client 3.5
+                // has no `-expected-rpks`: it reports the key unverified and
+                // goes on (the `expect` lines check what it printed).
+                if (c.raw_server) "-ign_eof" else "-verify_return_error", "-CAfile",  ca_file,    "-verify_hostname", "localhost",
+            });
             if (!no_sni) try argv.appendSlice(gpa, &.{ "-servername", "localhost" });
         },
         .go => try argv.appendSlice(gpa, &.{ "./go-client", "-addr", target, "-ca", ca_file, "-servername", "localhost" }),
@@ -407,6 +427,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
 
     var chain: [1][]const u8 = undefined;
     var ck = certifiedKey(keys, c.cert, &chain);
+    if (c.raw_server) {
+        chain[0] = (try x509.spkiOf(chain[0])).der;
+        ck.raw_public_key = true;
+    }
     if (c.staple) {
         ck.ocsp_response = &interop_ocsp_response;
         ck.sct_list = &interop_sct_list;
@@ -422,7 +446,14 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     const stek: tlsserver.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
     const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = interopNow } };
     const verifier: tlsserver.X509Verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
-    const client_auth: tlsserver.ClientAuth = .{ .verifier = verifier.verifier(), .mandatory = c.client_auth == .mandatory, .clock = .{ .now_ms = interopNow } };
+    const allowed = [1][]const u8{clientPeerDer(c) orelse ""};
+    const allow: tlsserver.clientauth.RawKeyAllowlist = .{ .keys = &allowed };
+    const client_auth: tlsserver.ClientAuth = .{
+        .verifier = verifier.verifier(),
+        .mandatory = c.client_auth == .mandatory,
+        .clock = .{ .now_ms = interopNow },
+        .raw_public_keys = if (c.raw_client) allow.verifier() else null,
+    };
     var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 16, 3600 * 1000);
     defer strikes.deinit();
     const early: tlsserver.server.EarlyData = .{ .max_size = interop_max_early_data, .replay = tlsserver.server.strikeRegisterGuard(&strikes) };
@@ -504,7 +535,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         std.debug.print("  early data: {s}\n", .{server.earlyDataReason().name()});
         return error.EarlyDataMismatch;
     }
-    const want_peer: ?[]const u8 = clientCertDer(c.client_cert);
+    const want_peer: ?[]const u8 = clientPeerDer(c);
     const got_peer = server.peerCertificate();
     if ((want_peer == null) != (got_peer == null) or
         (want_peer != null and !std.mem.eql(u8, want_peer.?, got_peer.?))) return error.PeerCertificateMismatch;
@@ -518,6 +549,13 @@ fn clientCertFiles(k: ClientCertKind) [2][]const u8 {
         .rsa2048 => .{ "client-rsa2048.pem", "client-rsa2048.key" },
         .ed25519 => .{ "client-ed25519.pem", "client-ed25519.key" },
     };
+}
+
+/// What the server must end up with as `peerCertificate`: the client
+/// certificate, or its SPKI when it went as a raw public key.
+fn clientPeerDer(c: Case) ?[]const u8 {
+    const der = clientCertDer(c.client_cert) orelse return null;
+    return if (c.raw_client) (x509.spkiOf(der) catch unreachable).der else der;
 }
 
 pub fn clientCertDer(k: ClientCertKind) ?[]const u8 {
@@ -569,6 +607,11 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    client_auth: ClientAuthMode = .off,
         \\    /// The server's `peerCertificate` at the end.
         \\    client_cert: ClientCertKind = .none,
+        \\    /// RFC 7250: the server's key went as its bare SubjectPublicKeyInfo.
+        \\    raw_server: bool = false,
+        \\    /// RFC 7250: the client's `client_cert` went as its SPKI, taken by an
+        \\    /// allowlist of that key.
+        \\    raw_client: bool = false,
         \\    /// The leaf carried `ocsp_response` and `sct_list`.
         \\    staple: bool = false,
         \\    /// The leaf's Certificate (no staples) also went as this
@@ -608,6 +651,8 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.staple) try w.writeAll("        .staple = true,\n");
         if (c.early_data) try w.writeAll("        .early_data = true,\n");
         if (c.early_accepted) try w.writeAll("        .early_accepted = true,\n");
+        if (c.raw_server) try w.writeAll("        .raw_server = true,\n");
+        if (c.raw_client) try w.writeAll("        .raw_client = true,\n");
         if (d[1].compressed) |cc| {
             try w.print("        .compressed = .{{\n            .algorithm = {d},\n            .uncompressed_len = {d},\n", .{ cc.algorithm, cc.uncompressed_len });
             try hexFieldAt(w, "            ", "data", cc.data);

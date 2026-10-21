@@ -620,10 +620,34 @@ pub fn spkiOf(certificate_der: []const u8) SpkiError!Spki {
         pos = f.content_end;
     }
 
+    return spkiAt(b, pos, lim) catch |err| switch (err) {
+        // No field where the SPKI belongs: the TBSCertificate is short.
+        error.MissingSubjectPublicKeyInfo => return error.MalformedTbsCertificate,
+        else => |e| return e,
+    };
+}
+
+/// Parse a bare DER `SubjectPublicKeyInfo` — an RFC 7250 raw public key (a
+/// TLS `Certificate` entry when the raw-public-key certificate type is
+/// negotiated), a PEM `PUBLIC KEY`. Exactly one TLV, well-formed DER (as
+/// `validate`), shaped as `spkiOf` requires of a certificate's. The
+/// returned fields borrow `spki_der` (see `Spki`).
+pub fn parseSpki(spki_der: []const u8) SpkiError!Spki {
+    try validate(spki_der);
+    const s = spkiAt(spki_der, 0, spki_der.len) catch |err| switch (err) {
+        error.MissingSubjectPublicKeyInfo => return error.MalformedSubjectPublicKeyInfo,
+        else => |e| return e,
+    };
+    if (s.der.len != spki_der.len) return error.MalformedSubjectPublicKeyInfo;
+    return s;
+}
+
+/// The SubjectPublicKeyInfo TLV starting at `spki_start` (inside a container
+/// ending at `lim`).
+fn spkiAt(b: []const u8, spki_start: usize, lim: usize) (SpkiError || error{MissingSubjectPublicKeyInfo})!Spki {
     // SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier,
     //   subjectPublicKey BIT STRING }
-    const spki_start = pos;
-    const spki = nextField(b, spki_start, lim) orelse return error.MalformedTbsCertificate;
+    const spki = nextField(b, spki_start, lim) orelse return error.MissingSubjectPublicKeyInfo;
     if (b[spki_start] != 0x30) return error.MalformedSubjectPublicKeyInfo;
 
     const alg_start = spki.content_start;
@@ -965,6 +989,26 @@ test "spkiOf: EC fixtures report the right named curve; Ed25519 reports none" {
     try testing.expect(ed.algorithmIs(&oid_ed25519));
     try testing.expectEqual(@as(?[]const u8, null), ed.parameters); // no AlgorithmIdentifier parameters at all
     try testing.expectEqual(@as(usize, 32), ed.key_bits.len);
+}
+
+test "parseSpki: a bare SubjectPublicKeyInfo parses as the certificate's does; anything else is a typed error" {
+    for ([_][]const u8{ &fixtures.leaf_rsa, &fixtures.leaf_ec256, &fixtures.leaf_ed }) |cert| {
+        const want = try spkiOf(cert);
+        const got = try parseSpki(want.der);
+        try testing.expectEqualSlices(u8, want.der, got.der);
+        try testing.expectEqualSlices(u8, want.algorithm_oid, got.algorithm_oid);
+        try testing.expectEqualSlices(u8, want.key_bits, got.key_bits);
+        // Every prefix, and a trailing octet: refused, never a panic.
+        for (0..want.der.len) |n| {
+            if (parseSpki(want.der[0..n])) |_| return error.PrefixAccepted else |_| {}
+        }
+        var longer: [1024]u8 = undefined;
+        @memcpy(longer[0..want.der.len], want.der);
+        longer[want.der.len] = 0;
+        if (parseSpki(longer[0 .. want.der.len + 1])) |_| return error.TrailingAccepted else |_| {}
+        // A whole certificate is not a SubjectPublicKeyInfo.
+        if (parseSpki(cert)) |_| return error.CertificateAccepted else |_| {}
+    }
 }
 
 test "spkiOf: works on RSASSA-PSS certificates, which std cannot parse at all" {

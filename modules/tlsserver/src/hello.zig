@@ -42,6 +42,8 @@ pub const ExtensionType = enum(u16) {
     signature_algorithms = 13,
     application_layer_protocol_negotiation = 16,
     signed_certificate_timestamp = 18,
+    client_certificate_type = 19,
+    server_certificate_type = 20,
     compress_certificate = 27,
     session_ticket = 35,
     pre_shared_key = 41,
@@ -125,6 +127,11 @@ pub const ClientHello = struct {
     cookie: ?[]const u8 = null,
     /// RFC 8879 `CertificateCompressionAlgorithm algorithms<2..2^8-2>`.
     compress_certificate_raw: ?[]const u8 = null,
+    /// RFC 7250 `CertificateType client_certificate_types<1..2^8-1>` and
+    /// `server_certificate_types<1..2^8-1>`: the certificate types the
+    /// client can send and take (X.509 0, RawPublicKey 2), preferred first.
+    client_certificate_types: ?[]const u8 = null,
+    server_certificate_types: ?[]const u8 = null,
     /// The number of extensions, unknown ones included.
     extension_count: usize = 0,
 
@@ -284,6 +291,8 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
                 ch.sct_requested = true;
             },
             .compress_certificate => ch.compress_certificate_raw = try parseCompressCertificate(data),
+            .client_certificate_type => ch.client_certificate_types = try nonEmptyIn(data, u8),
+            .server_certificate_type => ch.server_certificate_types = try nonEmptyIn(data, u8),
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
                 // RFC 8446 §4.2.11: MUST be the last extension.

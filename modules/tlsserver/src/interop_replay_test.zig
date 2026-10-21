@@ -29,6 +29,7 @@ const vectors = @import("interop_vectors.zig");
 const clientauth = @import("clientauth.zig");
 const client_certs = @import("client_certs.zig");
 const tlsresume = @import("tlsresume");
+const x509 = @import("x509");
 
 fn clock(_: ?*anyopaque) i64 {
     return vectors.clock_ms;
@@ -123,6 +124,9 @@ const Harness = struct {
     stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing),
     tickets: server_mod.Tickets,
     verifier: clientauth.X509Verifier,
+    /// The `raw_client` cases' one allowed key (the client's SPKI).
+    allowed: [1][]const u8,
+    allow: clientauth.RawKeyAllowlist,
     client_auth: server_mod.ClientAuth,
     /// The replay register of the `early_data` cases (`strikes` is the
     /// caller's when given: a second replay of a case is a replay).
@@ -165,6 +169,10 @@ const Harness = struct {
             .p521 => keys.p521.certifiedKey(),
             .mldsa65 => keys.mldsa65.certifiedKey(),
         };
+        if (v.raw_server) {
+            h.chain[0] = (try x509.spkiOf(h.chain[0])).der;
+            h.ck.raw_public_key = true;
+        }
         if (v.staple) {
             h.ck.ocsp_response = &vectors.ocsp_response;
             h.ck.sct_list = &vectors.sct_list;
@@ -180,7 +188,14 @@ const Harness = struct {
         h.stek = .{ .ring = &h.ring };
         h.tickets = .{ .ticketer = h.stek.ticketer(), .clock = .{ .now_ms = clock } };
         h.verifier = .{ .gpa = gpa, .anchors = &.{&client_certs.ca_cert} };
-        h.client_auth = .{ .verifier = h.verifier.verifier(), .mandatory = v.client_auth == .mandatory, .clock = .{ .now_ms = clock } };
+        h.allowed = .{wantPeer(v) orelse ""};
+        h.allow = .{ .keys = &h.allowed };
+        h.client_auth = .{
+            .verifier = h.verifier.verifier(),
+            .mandatory = v.client_auth == .mandatory,
+            .clock = .{ .now_ms = clock },
+            .raw_public_keys = if (v.raw_client) h.allow.verifier() else null,
+        };
         h.own_strikes = .init(gpa, 4, 3600 * 1000);
         h.early = .{ .max_size = vectors.max_early_data, .replay = server_mod.strikeRegisterGuard(strikes orelse &h.own_strikes) };
         h.cfg = .{
@@ -269,13 +284,21 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, path: 
         try c.server.exportKeyingMaterial(&km, vectors.exporter_label, "");
         try testing.expectEqualSlices(u8, &want, &km);
     }
-    const want_peer: ?[]const u8 = switch (v.client_cert) {
-        .none => null,
+    const want_peer = wantPeer(v);
+    try testing.expectEqual(v.raw_client and want_peer != null, c.server.peerRawPublicKey());
+    if (want_peer) |p| try testing.expectEqualSlices(u8, p, c.server.peerCertificate().?) else try testing.expectEqual(null, c.server.peerCertificate());
+}
+
+/// The server's `peerCertificate` at the end of a recording: the client
+/// certificate, or its SPKI when it went as a raw public key.
+fn wantPeer(v: vectors.Case) ?[]const u8 {
+    const der: []const u8 = switch (v.client_cert) {
+        .none => return null,
         .p256 => &client_certs.p256_cert,
         .rsa2048 => &client_certs.rsa2048_cert,
         .ed25519 => &client_certs.ed25519_cert,
     };
-    if (want_peer) |p| try testing.expectEqualSlices(u8, p, c.server.peerCertificate().?) else try testing.expectEqual(null, c.server.peerCertificate());
+    return if (v.raw_client) (x509.spkiOf(der) catch unreachable).der else der;
 }
 
 test "OpenSSL and Go client sessions replay byte-exact through Connection" {

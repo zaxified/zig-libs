@@ -1379,9 +1379,13 @@ dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
 # Finished (length + timing_safe.eql), AEAD tags; (c) the inbound path over
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
-tlsserver	ReleaseFast	hs	1	28	c55224077d18ae38	9dc2249fb8b05195
-tlsserver	ReleaseFast	app	1	8	c55224077d18ae38	ded7de421ed83ff8
-tlsserver	ReleaseFast	ticket	1	74	c55224077d18ae38	0108994991d5547e
+tlsserver	ReleaseFast	hs	1	28	189ff14a764dffc4	7366854d19f7f738
+tlsserver	ReleaseFast	app	1	8	189ff14a764dffc4	ded7de421ed83ff8
+# 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
+# raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
+# (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
+# recordings, recaptured the same day.
+tlsserver	ReleaseFast	ticket	1	75	189ff14a764dffc4	cbdfd1824232e735
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a

@@ -6,9 +6,9 @@
 
 **Scope:** poc — rustls 0.23.46 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-21 · mutation 2026-10-21 (68/68) · src 2ca8a57963d7b587
+**Audit:** review 2026-10-22 · mutation 2026-10-22 (78/78) · src 100984b3fcfead68
 
-**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-21 (ctgrind: the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 74 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records)
+**Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-21 (ctgrind: the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 75 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records)
 
 **Performance:** ref 0.48–0.90× OpenSSL 3.5.5 libssl (server side only, replayed sessions: full handshake ECDSA P-256 / RSA-2048 over X25519 and P-256 over X25519MLKEM768, resumption, AES-256-GCM 16 KiB records sent and received) · fastest ? (measured 2026-10-21)
 
@@ -41,7 +41,9 @@ M4 step 3, 304 after step 4 — 0-RTT; 305 after step 5, the exporter: no gap le
 divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
 runner cannot map, extensions this server ignores), and 49 were gaps on 2026-10-20: 0-RTT (27),
 certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — all
-closed by M4 step 5 (see *Backlog*). SCT stapling
+closed by M4 step 5 (see *Backlog*). RFC 7250 raw
+public keys, both ways and across resumption, work against OpenSSL 3.5 (2026-10-22). The one rustls
+server feature still missing is its QUIC API (`rustls::quic`; owner 2026-10-21: to be done). SCT stapling
 (RFC 6962) is beyond rustls, which dropped it; BoringSSL and OpenSSL have it.
 **tlsfuzzer (M2 exit gate, 2026-10-21):** 50 of its TLS 1.3 scripts run
 (`interop-tlsserver -- --tlsfuzzer DIR`, counts in `tools/tlsfuzzer/baseline.tsv`); against
@@ -800,7 +802,12 @@ the same head and hid it); 62/62 over src `8959c5888ec76b96`. Then the kTLS secr
 reviewed on its own (no HIGH/MEDIUM; the send key at its AEAD record limit is now refused,
 its documentation names what the caller must have drained and what is gone afterwards; a test
 per suite for the derived key/IV) and given 6 mutants of its own: final run 68/68 over src
-`2ca8a57963d7b587`.
+`2ca8a57963d7b587`. RFC 7250 raw public keys (2026-10-22) had a review of their own (no
+HIGH/MEDIUM; documented: `peerCertificate` is an SPKI when `peerRawPublicKey`, a resumption does
+not ask the raw-key verifier again, a resuming client must offer RawPublicKey again as in
+rustls) and 10 mutants; two survived until OpenSSL sessions showed them (`rpk-server-status`:
+no staple from a raw-key server; `rpk-client-unasked`: no `client_certificate_type` without a
+CertificateRequest): final run 78/78 over src `100984b3fcfead68`.
 
 ## Performance
 

@@ -199,6 +199,7 @@ pub const verifySlhDsaLink = chain.verifySlhDsaLink;
 pub const spkiOf = safe.spkiOf;
 pub const Spki = safe.Spki;
 pub const SpkiError = safe.SpkiError;
+pub const parseSpki = safe.parseSpki;
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:

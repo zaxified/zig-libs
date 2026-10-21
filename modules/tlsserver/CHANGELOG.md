@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** RFC 7250 raw public keys (rustls `only_raw_public_keys` /
+  `requires_raw_public_keys`): `CertifiedKey.raw_public_key` (the server sends its key's
+  SubjectPublicKeyInfo; no staples), `ClientAuth.raw_public_keys` with
+  `clientauth.RawKeyVerifier`/`RawKeyAllowlist` (the client's key judged instead of a chain),
+  `Server.peerRawPublicKey`. Negotiated per rustls's table; `server_certificate_type` echoed only
+  with a Certificate, `client_certificate_type` only with a CertificateRequest (RFC 7250 §4.2).
+  Tickets carrying a raw key are format 4 (format-3 tickets still resume) and resume only as a
+  raw key. OpenSSL 3.5 interop: 7 new recorded sessions (`rpk-*`). Review: no HIGH/MEDIUM;
+  mutation 78/78.
+
 - **2026-10-21** — **Added:** kTLS secret hand-over (rustls `enable_secret_extraction` /
   `dangerous_extract_secrets`): `Config.enable_secret_extraction` (default off),
   `Server.extractSecrets(*ExtractedSecrets)` — suite, and per direction the AEAD key, static IV
