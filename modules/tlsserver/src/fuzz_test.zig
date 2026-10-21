@@ -493,6 +493,10 @@ const HelloMark = Marker(enum {
     sni_dns,
     sni_ip,
     alpn,
+    /// A 254- or 255-octet name: `1 + n` in u8 overflowed at 255 (2026-10-21).
+    alpn_long,
+    /// A binder of the longest length, 255 (the same overflow).
+    binder_long,
     key_shares,
     empty_key_shares,
     psk,
@@ -603,7 +607,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var sni: ?std.meta.Tag(hello.ServerName) = null;
     var sni_name: [64]u8 = undefined;
     var sni_len: usize = 0;
-    var alpn_names: [4][16]u8 = undefined;
+    var alpn_names: [4][255]u8 = undefined;
     var alpn_lens: [4]u8 = undefined;
     var alpn_n: ?usize = null;
     var shares: [3]struct { g: u16, len: u16, first: u8 } = undefined;
@@ -689,7 +693,8 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                     const list_at = w.open(u16);
                     alpn_n = src.valueRangeAtMost(u8, 1, 4);
                     for (0..alpn_n.?) |k| {
-                        alpn_lens[k] = src.valueRangeAtMost(u8, 1, 16);
+                        alpn_lens[k] = if (src.valueRangeAtMost(u8, 0, 7) == 0) src.valueRangeAtMost(u8, 254, 255) else src.valueRangeAtMost(u8, 1, 16);
+                        if (alpn_lens[k] >= 254) HelloMark.mark(.alpn_long);
                         src.bytes(alpn_names[k][0..alpn_lens[k]]);
                         w.int(u8, alpn_lens[k]);
                         w.bytes(alpn_names[k][0..alpn_lens[k]]);
@@ -764,9 +769,12 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             binders_offset = w.n;
             const bs_at = w.open(u16);
             for (0..n_ids) |_| {
-                w.int(u8, 32);
-                src.bytes(w.buf[w.n..][0..32]);
-                w.n += 32;
+                // RFC 8446 §4.2.11: PskBinderEntry<32..255>.
+                const bl: u8 = if (src.valueRangeAtMost(u8, 0, 7) == 0) 255 else 32;
+                if (bl == 255) HelloMark.mark(.binder_long);
+                w.int(u8, bl);
+                src.bytes(w.buf[w.n..][0..bl]);
+                w.n += bl;
             }
             w.close(u16, bs_at);
             w.close(u16, at);

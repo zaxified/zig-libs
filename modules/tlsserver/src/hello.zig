@@ -177,7 +177,7 @@ pub const Opaque8Iter = struct {
 
     pub fn next(it: *Opaque8Iter) ?[]const u8 {
         if (it.rest.len == 0) return null;
-        const n = it.rest[0];
+        const n: usize = it.rest[0]; // not u8: `1 + n` overflows at 255 (ReleaseFast: wraps to 0 and never advances)
         defer it.rest = it.rest[1 + n ..];
         return it.rest[1..][0..n];
     }
@@ -696,4 +696,20 @@ test "isDnsName" {
     };
     try testing.expect(isDnsName(&long));
     try testing.expect(!isDnsName(&long ++ "d"));
+}
+
+test "Opaque8Iter: a 255-octet element (an ALPN name, a binder) advances past itself" {
+    // `1 + n` in u8 overflowed at 255: a panic in safe builds, and in
+    // ReleaseFast a wrap to 0 that never advanced — an endless loop on one
+    // ClientHello whose ALPN list or PSK binders held a 255-octet element
+    // (found 2026-10-21 by the minOutputLen test with a 255-octet ALPN name).
+    var raw: [1 + 255 + 1 + 2]u8 = undefined;
+    raw[0] = 255;
+    @memset(raw[1..256], 'a');
+    raw[256] = 2;
+    raw[257..259].* = "h2".*;
+    var it: Opaque8Iter = .{ .rest = &raw };
+    try testing.expectEqual(@as(usize, 255), it.next().?.len);
+    try testing.expectEqualStrings("h2", it.next().?);
+    try testing.expectEqual(@as(?[]const u8, null), it.next());
 }

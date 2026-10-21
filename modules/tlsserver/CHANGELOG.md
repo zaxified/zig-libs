@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Fix (HIGH, in pushed code):** `hello.Opaque8Iter` computed `1 + n` in u8 —
+  a 255-octet ALPN name or PSK binder panicked in safe builds and looped forever in ReleaseFast
+  (remote DoS on a server with ALPN or tickets). The `tlsserver-hello` harness drew names of
+  1-16 octets and 32-octet binders only; it now draws 254/255 too (negative control: it finds the
+  old code). Found by a minOutputLen test with a 255-octet ALPN name.
 - **2026-10-21** — M3 step 3, the per-connection wipe. `Outbound.wipe` zeroed the whole output
   buffer with `std.crypto.secureZero` (a byte at a time: ~16 µs for qap's 48 KiB, on every
   connection); it now zeroes up to the high-water mark of what was written (`Outbound.dirty`,
