@@ -185,6 +185,34 @@ pub const Protection = struct {
         out.seq = 0;
     }
 
+    /// RFC 8446 §7.3: the AEAD key and static IV `init` derives from
+    /// `traffic_secret`, for a record layer outside this module (kTLS).
+    /// Returns the key's length (16 or 32 octets of `key`).
+    pub fn trafficKeyIv(suite: CipherSuite, traffic_secret: []const u8, key: *[32]u8, iv: *[nonce_len]u8) InitError!usize {
+        return burn.run(burn.init_burn, InitError!usize, trafficKeyIvBody, .{ suite, traffic_secret, key, iv });
+    }
+
+    fn trafficKeyIvBody(suite: CipherSuite, traffic_secret: []const u8, key: *[32]u8, iv: *[nonce_len]u8) InitError!usize {
+        const want = suite.hashLen() orelse return error.UnsupportedSuite;
+        if (traffic_secret.len != want) return error.BadKeyLength;
+        switch (suite) {
+            .aes_128_gcm_sha256 => {
+                key.* = @splat(0);
+                ks.deriveTrafficKeyIv(std.crypto.kdf.hkdf.HkdfSha256, 16, nonce_len, key[0..16], iv, traffic_secret[0..32]);
+                return 16;
+            },
+            .aes_256_gcm_sha384 => {
+                ks.deriveTrafficKeyIv(HkdfSha384, 32, nonce_len, key, iv, traffic_secret[0..48]);
+                return 32;
+            },
+            .chacha20_poly1305_sha256 => {
+                ks.deriveTrafficKeyIv(std.crypto.kdf.hkdf.HkdfSha256, 32, nonce_len, key, iv, traffic_secret[0..32]);
+                return 32;
+            },
+            _ => unreachable,
+        }
+    }
+
     /// `out` ← the protection for an explicit key and IV, sequence number 0
     /// — for known-answer tests and for keys derived elsewhere.
     pub fn initKeyIv(out: *Protection, suite: CipherSuite, key: []const u8, iv: *const [nonce_len]u8) InitError!void {
@@ -518,6 +546,30 @@ test "seal: limits and sequence exhaustion" {
     rx.seq = std.math.maxInt(u64);
     writeHeader(buf[0..5], .application_data, 20);
     try testing.expectError(error.SequenceExhausted, rx.open(buf[0..25]));
+}
+
+test "trafficKeyIv: the key and IV init derives, every suite" {
+    var secret: [48]u8 = undefined;
+    for (&secret, 0..) |*b, i| b.* = @truncate(i * 7 + 1);
+    for ([_]CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        const L = suite.hashLen().?;
+        var key: [32]u8 = undefined;
+        var iv: [nonce_len]u8 = undefined;
+        const kl = try Protection.trafficKeyIv(suite, secret[0..L], &key, &iv);
+        try testing.expectEqual(@as(usize, if (suite == .aes_128_gcm_sha256) 16 else 32), kl);
+        var a: Protection = undefined;
+        var b: Protection = undefined;
+        try a.init(suite, secret[0..L]);
+        try b.initKeyIv(suite, key[0..kl], &iv);
+        var ra: [64]u8 = undefined;
+        var rb: [64]u8 = undefined;
+        @memcpy(ra[header_len..][0..5], "hello");
+        @memcpy(rb[header_len..][0..5], "hello");
+        try testing.expectEqualSlices(u8, try a.seal(&ra, 5, .application_data, 0), try b.seal(&rb, 5, .application_data, 0));
+    }
+    var key: [32]u8 = undefined;
+    var iv: [nonce_len]u8 = undefined;
+    try testing.expectError(error.BadKeyLength, Protection.trafficKeyIv(.aes_256_gcm_sha384, secret[0..32], &key, &iv));
 }
 
 test "init: suite and key-length errors" {

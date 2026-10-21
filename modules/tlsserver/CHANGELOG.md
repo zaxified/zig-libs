@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added:** kTLS secret hand-over (rustls `enable_secret_extraction` /
+  `dangerous_extract_secrets`): `Config.enable_secret_extraction` (default off),
+  `Server.extractSecrets(*ExtractedSecrets)` — suite, and per direction the AEAD key, static IV
+  and next sequence number — refused unless connected and quiescent (output sent, no KeyUpdate
+  due, send key under its record limit, no open slot or half message); the server is wiped and
+  closed afterwards. `record.Protection.trafficKeyIv`. Independent review: no HIGH/MEDIUM.
+
 - **2026-10-21** — Audit (two whole-module reviews + 62 mutant schemata, 62/62).
   **Fixed:** a zero-length application_data record refilled the KeyUpdate budget, so a client
   interleaving empty records could send KeyUpdates without end (`max_key_updates` now counts

@@ -6,7 +6,7 @@
 
 **Scope:** poc — rustls 0.23.46 (surveyed 2026-10-20)
 
-**Audit:** review 2026-10-21 · mutation 2026-10-21 (62/62) · src 8959c5888ec76b96
+**Audit:** review 2026-10-21 · mutation 2026-10-21 (68/68) · src 2ca8a57963d7b587
 
 **Hardening:** fuzz 2026-10-20 (`tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-21 (ctgrind: the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 74 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records)
 
@@ -79,8 +79,8 @@ the chain (`ClientCertVerifier`; `X509Verifier` = `x509.verifyChain` with client
 client's CertificateVerify, and reports the leaf (`peerCertificate`), resumptions included. It
 is not yet the server qap runs (M3: qap's seams and performance).
 
-**Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS,
-ECH and post-handshake client authentication (*What is deliberately not
+**Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS itself (the
+record keys can be handed over to it: `Server.extractSecrets`), ECH and post-handshake client authentication (*What is deliberately not
 done*).
 
 ## Wire format / algorithm
@@ -755,8 +755,11 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
 - **0-RTT without a replay guard:** `EarlyData.replay` is mandatory (BoringSSL takes early
   data with none and leaves anti-replay to the application). What early data may do is still
   the application's call (RFC 8470 for HTTP): the module only marks it (`early_data` events).
-- **kTLS:** not in v1 — measured in qap at 41 % slower than userspace records; a secret-export
-  hook may come with M4.
+- **kTLS:** not driven by this module — measured in qap at 41 % slower than userspace records.
+  `Config.enable_secret_extraction` + `Server.extractSecrets` hand both directions' keys, IVs
+  and sequence numbers to a caller that sets the socket up (rustls `enable_secret_extraction` /
+  `dangerous_extract_secrets`, added 2026-10-21); like rustls, no traffic secrets, so a
+  KeyUpdate after the hand-over cannot be followed.
 - **Strict parsing of extensions a TLS 1.3 server ignores** (`extended_master_secret`,
   certificate types, QUIC parameters, ECH): skipped as unknown, where rustls checks their form —
   a difference only in what malformed-but-ignored octets are refused.
@@ -793,7 +796,11 @@ framing and CCS rules, extension parsing, client-leaf key usage, output room. Th
 suite (ReleaseSafe, one binary, `TSMUT=n`). First run 58/61; the three survivors became
 tests (a Finished where the CertificateVerify belongs; records shorter than the tag; the
 ticket head wiped in the peer buffer after a resumption, with re-issue off — issuing wipes
-the same head and hid it); final run 62/62 over src `8959c5888ec76b96`.
+the same head and hid it); 62/62 over src `8959c5888ec76b96`. Then the kTLS secret hand-over (`extractSecrets`) was added,
+reviewed on its own (no HIGH/MEDIUM; the send key at its AEAD record limit is now refused,
+its documentation names what the caller must have drained and what is gone afterwards; a test
+per suite for the derived key/IV) and given 6 mutants of its own: final run 68/68 over src
+`2ca8a57963d7b587`.
 
 ## Performance
 

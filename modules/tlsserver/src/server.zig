@@ -359,6 +359,9 @@ pub const Config = struct {
     /// 0-RTT early data on resumptions (with `tickets`); null: none is
     /// taken, and what a client sends is skipped.
     early_data: ?*const EarlyData = null,
+    /// `Server.extractSecrets` may hand the record keys out (rustls
+    /// `enable_secret_extraction`, for kTLS); false refuses it.
+    enable_secret_extraction: bool = false,
 };
 
 /// Client authentication (RFC 8446 §4.3.2, §4.4.2; rustls
@@ -1245,6 +1248,73 @@ pub const Server = struct {
             .aes_256_gcm_sha384 => ks.maxExporterLen(S384.Hkdf),
             else => ks.maxExporterLen(S256.Hkdf),
         };
+    }
+
+    /// One direction's record protection as a record layer outside this
+    /// module needs it (kTLS `tls12_crypto_info_*`, which TLS 1.3 uses
+    /// too): key, static IV and the next record's sequence number.
+    pub const ExtractedDirection = struct {
+        key: [32]u8,
+        /// 16 (AES-128-GCM) or 32.
+        key_len: u8,
+        iv: [record.nonce_len]u8,
+        seq: u64,
+    };
+
+    /// rustls `ExtractedSecrets`. Holds secrets: `wipe` it once installed.
+    pub const ExtractedSecrets = struct {
+        suite: record.CipherSuite,
+        /// Server to client.
+        tx: ExtractedDirection,
+        /// Client to server.
+        rx: ExtractedDirection,
+
+        pub fn wipe(self: *ExtractedSecrets) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+
+    pub const ExtractError = error{
+        /// `Config.enable_secret_extraction` is off.
+        SecretExtractionDisabled,
+        /// The handshake is not complete (early data included), or the
+        /// connection failed or was closed.
+        NotConnected,
+        /// Records are still queued (`pendingOutput`), a KeyUpdate is due
+        /// or the send key is at its record limit (`keyUpdate`, send it,
+        /// then hand over), a write slot is open, or a handshake message is
+        /// half received.
+        NotQuiescent,
+    };
+
+    /// Hand the record protection over (rustls `dangerous_extract_secrets`):
+    /// both directions' keys, IVs and sequence numbers, after which this
+    /// server is finished — every secret wiped (the exporter's included),
+    /// every call `Closed`, and `peerCertificate`/`peerSignatureScheme`
+    /// null: read the identity, ALPN, SNI and exported keying material
+    /// first. The caller must have sent `pendingOutput` and fed every
+    /// octet received so far, and must hold none unconsumed after the last
+    /// `feed` (the server cannot see a partial record in the caller's
+    /// buffer; under `Connection`, its reader's buffer must be empty); what
+    /// arrives next is the new record layer's. As in rustls, the result has
+    /// no traffic secrets: a KeyUpdate after the hand-over cannot be
+    /// followed.
+    pub fn extractSecrets(self: *Server, out: *ExtractedSecrets) ExtractError!void {
+        if (!self.config.enable_secret_extraction) return error.SecretExtractionDisabled;
+        if (self.state != .connected or self.write_closed or self.peer_closed) return error.NotConnected;
+        if (self.pendingOutput().len != 0 or self.tx_update != null or !self.inbound.joiner.isEmpty() or self.write_slot_end != 0)
+            return error.NotQuiescent;
+        if (self.out.tx.seq >= max_records_per_key) return error.NotQuiescent;
+        const L = self.suite.hashLen().?;
+        out.* = std.mem.zeroes(ExtractedSecrets);
+        out.suite = self.suite;
+        out.tx.key_len = @intCast(record.Protection.trafficKeyIv(self.suite, self.server_application_secret[0..L], &out.tx.key, &out.tx.iv) catch unreachable);
+        out.tx.seq = self.out.tx.seq;
+        out.rx.key_len = @intCast(record.Protection.trafficKeyIv(self.suite, self.client_application_secret[0..L], &out.rx.key, &out.rx.iv) catch unreachable);
+        out.rx.seq = self.inbound.rx.seq;
+        // `fail`'s wipe, without an alert (`Closed` calls for none).
+        const e = self.fail(error.Closed);
+        std.debug.assert(e == error.Closed);
     }
 
     /// RFC 8446 §7.5 (RFC 5705's interface): `out.len` octets of keying
@@ -3421,6 +3491,61 @@ test "KeyUpdate from the client: a due reply also goes out from feed once there 
     _ = try p.s.feed(&empty);
     try testing.expect(p.s.tx_update == null);
     try testing.expectEqual(@as(usize, 1), (try p.drain()).n_updates);
+}
+
+test "extractSecrets: the record keys and sequence numbers a kTLS socket continues with" {
+    const p = try Peer.create();
+    defer p.destroy();
+    var x: Server.ExtractedSecrets = undefined;
+    try testing.expectError(error.SecretExtractionDisabled, p.s.extractSecrets(&x));
+    p.cfg.enable_secret_extraction = true;
+    // Traffic both ways, a client KeyUpdate: neither sequence is 0, the
+    // receive key is the second one.
+    _ = try p.send(.application_data, "a");
+    _ = try p.sendKeyUpdate(0);
+    _ = try p.send(.application_data, "b");
+    try testing.expectEqual(@as(usize, 1), try p.s.write("c"));
+    try testing.expectError(error.NotQuiescent, p.s.extractSecrets(&x));
+    {
+        const sent = p.s.pendingOutput();
+        @memcpy(p.in[0..sent.len], sent);
+        try testing.expectEqualStrings("c", (try p.rx.open(p.in[0..sent.len])).content);
+        p.s.discardOutput(sent.len);
+    }
+    // A send key at its record limit is not handed over: KeyUpdate first.
+    {
+        const seq = p.s.out.tx.seq;
+        p.s.out.tx.seq = max_records_per_key;
+        try testing.expectError(error.NotQuiescent, p.s.extractSecrets(&x));
+        p.s.out.tx.seq = seq;
+    }
+    try p.s.extractSecrets(&x);
+    defer x.wipe();
+    try testing.expectEqual(record.CipherSuite.aes_128_gcm_sha256, x.suite);
+    try testing.expectEqual(@as(u8, 16), x.tx.key_len);
+    try testing.expectEqual(@as(u64, 1), x.tx.seq);
+    try testing.expectEqual(@as(u64, 1), x.rx.seq);
+    // The server's side, continued outside: its next record opens at the
+    // client; the client's next record opens under the extracted key.
+    var tx: record.Protection = undefined;
+    try tx.initKeyIv(x.suite, x.tx.key[0..x.tx.key_len], &x.tx.iv);
+    tx.seq = x.tx.seq;
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[5..][0..1], "d");
+    const r1 = try tx.seal(&buf, 1, .application_data, 0);
+    try testing.expectEqualStrings("d", (try p.rx.open(r1)).content);
+    var rx: record.Protection = undefined;
+    try rx.initKeyIv(x.suite, x.rx.key[0..x.rx.key_len], &x.rx.iv);
+    rx.seq = x.rx.seq;
+    @memcpy(p.in[5..][0..1], "e");
+    const r2 = try p.tx.seal(&p.in, 1, .application_data, 0);
+    try testing.expectEqualStrings("e", (try rx.open(r2)).content);
+    // The server is done with: every secret gone, nothing more works.
+    try testing.expect(!p.s.isConnected());
+    try testing.expectError(error.Closed, p.s.write("f"));
+    try testing.expect(std.mem.allEqual(u8, &p.s.server_application_secret, 0));
+    try testing.expect(std.mem.allEqual(u8, &p.s.client_application_secret, 0));
+    try testing.expectError(error.NotConnected, p.s.extractSecrets(&x));
 }
 
 test "KeyUpdate refusals: request octet, length, alignment, too many" {
