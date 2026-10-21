@@ -38,7 +38,6 @@
     "Downgrade-TLS1-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Downgrade-TLS11-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "Downgrade-TLS12-Server-TLS": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
-    "DuplicateCertCompressionExt-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "DuplicateExtensionServer-TLS-*": "a repeated ClientHello extension is illegal_parameter, as in rustls 0.23 (BoringSSL: decode_error)",
     "EarlyChangeCipherSpec-server-*": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "ExpectOmitExtensions": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",

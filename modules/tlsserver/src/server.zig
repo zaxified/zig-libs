@@ -136,6 +136,37 @@ pub const CertifiedKey = struct {
     /// cannot produce and the ones TLS 1.3 forbids (RSA PKCS#1 v1.5,
     /// SHA-1) are skipped.
     signature_schemes: ?[]const u16 = null,
+    /// The Certificate message compressed ahead of time (RFC 8879), in the
+    /// server's order of preference: the first one whose algorithm the
+    /// client's `compress_certificate` offers and whose staples are the ones
+    /// this handshake sends goes as a CompressedCertificate; with none, the
+    /// Certificate goes uncompressed. Each is `uncompressedCertificate`'s
+    /// output for its `staples`, compressed by the caller (rustls compresses
+    /// per handshake behind a cache; here no compressor runs in the
+    /// handshake). Replacing the chain, the OCSP staple or the SCT list
+    /// means compressing again: `check` sees only a length that changed,
+    /// so a same-length replacement (a refreshed staple usually is one)
+    /// left uncompressed would reach compressing clients stale.
+    compressed_certificates: []const CompressedCertificate = &.{},
+
+    /// What the leaf carries in a Certificate message: the OCSP staple and
+    /// the SCT list go only to a client that asked for them.
+    pub const Staples = struct {
+        ocsp: bool = false,
+        sct: bool = false,
+    };
+
+    pub const CompressedCertificate = struct {
+        /// `CertificateCompressionAlgorithm` (zlib 1, brotli 2, zstd 3).
+        algorithm: u16,
+        /// The staples in the compressed message (a staple the key does not
+        /// hold cannot be in it).
+        staples: Staples = .{},
+        /// `uncompressedCertificate(…, staples).len`.
+        uncompressed_len: u24,
+        /// `opaque compressed_certificate_message<1..2^24-1>`.
+        data: []const u8,
+    };
 
     pub const CheckError = error{
         /// No certificate, or more than `max_chain_len`.
@@ -150,6 +181,14 @@ pub const CertifiedKey = struct {
         /// The leaf's OCSP staple and SCT list together overflow its
         /// `extensions<0..2^16-1>`.
         LeafExtensionsTooLong,
+        /// A compressed certificate that is empty or longer than a
+        /// CompressedCertificate's 2^24-1 octets hold, or under the
+        /// reserved algorithm 0.
+        CompressedLength,
+        /// A compressed certificate whose `uncompressed_len` is not the
+        /// length of the message it stands for (compressed before the
+        /// staples changed), or with a staple the key does not hold.
+        CompressedStale,
     };
 
     pub const max_chain_len = 16;
@@ -173,6 +212,64 @@ pub const CertifiedKey = struct {
         }
         if (exts > std.math.maxInt(u16)) return error.LeafExtensionsTooLong;
         if (body + exts > std.math.maxInt(u24)) return error.ChainTooLong;
+        for (self.compressed_certificates) |c| {
+            if (c.algorithm == 0 or c.data.len == 0 or c.data.len > std.math.maxInt(u24) - (2 + 3 + 3)) return error.CompressedLength;
+            const len = self.certificateBodyLen(c.staples) orelse return error.CompressedStale;
+            if (c.uncompressed_len != len) return error.CompressedStale;
+        }
+    }
+
+    /// The length of the Certificate message body with `staples` (null: a
+    /// staple the key does not hold). `check` bounded it.
+    fn certificateBodyLen(self: *const CertifiedKey, staples: Staples) ?usize {
+        var body: usize = 1 + 3;
+        for (self.chain) |c| body += 3 + c.len + 2;
+        if (staples.ocsp) body += 4 + 1 + 3 + (self.ocspStaple() orelse return null).len;
+        if (staples.sct) body += 4 + (self.sctList() orelse return null).len;
+        return body;
+    }
+
+    /// The Certificate message body (without its 4-octet header) the
+    /// handshake sends with `staples`: what RFC 8879 compresses, for
+    /// `compressed_certificates`. Call `check` first.
+    /// `InvalidChain`: what `check` refuses about the chain.
+    pub fn uncompressedCertificate(self: *const CertifiedKey, out: []u8, staples: Staples) error{ BufferTooSmall, InvalidStaples, InvalidChain }![]u8 {
+        if (out.len < 4) return error.BufferTooSmall;
+        var entries: [max_chain_len]messages.CertificateEntry = undefined;
+        const m = self.certificateMessage(out, &entries, staples) catch |err| return switch (err) {
+            error.BufferTooSmall => error.BufferTooSmall,
+            error.InvalidStaples => error.InvalidStaples,
+            error.FieldTooLong => error.InvalidChain,
+        };
+        return m[4..];
+    }
+
+    /// The Certificate message (header ‖ body) with `staples`.
+    fn certificateMessage(self: *const CertifiedKey, out: []u8, entries: *[max_chain_len]messages.CertificateEntry, staples: Staples) (messages.Error || error{InvalidStaples})![]u8 {
+        if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.FieldTooLong;
+        for (self.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
+        if (staples.ocsp) entries[0].ocsp_response = self.ocspStaple() orelse return error.InvalidStaples;
+        if (staples.sct) entries[0].sct_list = self.sctList() orelse return error.InvalidStaples;
+        return messages.certificate(out, "", entries[0..self.chain.len]);
+    }
+
+    /// The staples a ClientHello gets: the ones it asks for that the key
+    /// holds.
+    fn staplesFor(self: *const CertifiedKey, ch: *const hello.ClientHello) Staples {
+        return .{
+            .ocsp = ch.ocsp_requested and self.ocspStaple() != null,
+            .sct = ch.sct_requested and self.sctList() != null,
+        };
+    }
+
+    /// The first compressed certificate for these staples in an algorithm
+    /// the client offers.
+    fn compressedFor(self: *const CertifiedKey, ch: *const hello.ClientHello, staples: Staples) ?*const CompressedCertificate {
+        const offered = ch.compressCertificate() orelse return null;
+        for (self.compressed_certificates) |*c| {
+            if (c.staples.ocsp == staples.ocsp and c.staples.sct == staples.sct and offered.contains(c.algorithm)) return c;
+        }
+        return null;
     }
 
     fn ocspStaple(self: *const CertifiedKey) ?[]const u8 {
@@ -631,6 +728,9 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     for (ck.chain) |c| chain += 3 + c.len + 2;
     if (ck.ocspStaple()) |o| chain += 4 + 4 + o.len;
     if (ck.sctList()) |l| chain += 4 + l.len;
+    // A compressed one may be the longer: algorithm, two lengths and the
+    // data, against the context octet and `chain` counted below.
+    for (ck.compressed_certificates) |c| chain = @max(chain, 2 + 3 + 3 + c.data.len - 1);
     const sig = for (certverify.candidateSchemes(ck.key)) |s| {
         break certverify.maxSignatureLen(s);
     } else 0;
@@ -1521,12 +1621,20 @@ pub const Server = struct {
             })));
 
             // Certificate, with the OCSP staple and the SCT list on the
-            // leaf if the client asked (`check` bounded the chain).
-            var entries: [CertifiedKey.max_chain_len]messages.CertificateEntry = undefined;
-            for (ck.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
-            if (ch.ocsp_requested) entries[0].ocsp_response = ck.ocspStaple();
-            if (ch.sct_requested) entries[0].sct_list = ck.sctList();
-            try self.send(H, try encoded(messages.certificate(self.out.slot(), "", entries[0..ck.chain.len])));
+            // leaf if the client asked (`check` bounded the chain), or the
+            // same compressed (RFC 8879: the CompressedCertificate is what
+            // the transcript hashes).
+            const staples = ck.staplesFor(ch);
+            if (ck.compressedFor(ch, staples)) |c| {
+                try self.send(H, try encoded(messages.compressedCertificate(self.out.slot(), c.algorithm, c.uncompressed_len, c.data)));
+            } else {
+                var entries: [CertifiedKey.max_chain_len]messages.CertificateEntry = undefined;
+                const m = ck.certificateMessage(self.out.slot(), &entries, staples) catch |err| return switch (err) {
+                    error.BufferTooSmall => error.OutputFull,
+                    error.FieldTooLong, error.InvalidStaples => error.InternalError,
+                };
+                try self.send(H, m);
+            }
 
             // CertificateVerify over the transcript through Certificate.
             th = t.currentHash();
@@ -1758,6 +1866,11 @@ const Hello = struct {
     /// `psk_key_exchange_modes`.
     psk_modes: ?[]const u8 = null,
     early_data: bool = false,
+    /// `status_request` (ocsp), `signed_certificate_timestamp`.
+    ocsp: bool = false,
+    sct: bool = false,
+    /// RFC 8879 `compress_certificate` algorithms.
+    compress_certificate: ?[]const u16 = null,
     /// Octets of a next handshake message in the same record.
     trailing: []const u8 = "",
 };
@@ -1854,6 +1967,13 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
             try d.appendSlice(gpa, n);
         }
         try W.ext(&e, gpa, 16, d.items);
+    }
+    if (h.ocsp) try W.ext(&e, gpa, 5, &.{ 1, 0, 0, 0, 0 });
+    if (h.sct) try W.ext(&e, gpa, 18, "");
+    if (h.compress_certificate) |algs| {
+        const d = try W.list16(gpa, u8, algs);
+        defer gpa.free(d);
+        try W.ext(&e, gpa, 27, d);
     }
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
@@ -2396,6 +2516,173 @@ test "max_fragment_len: no record of the first flight carries more; minOutputLen
     }
     // Below the floor is the floor.
     try testing.expectEqual(records[0], records[2]);
+}
+
+/// The first flight to the ClientHello record `rec` (AES-128-GCM-SHA256,
+/// no HelloRetryRequest), opened: the protected handshake messages,
+/// joined, in `msgs`; returns their length. The server's handshake key
+/// comes from its handshake secret and the transcript through the
+/// ServerHello.
+fn openFirstFlight(s: *Server, rec: []u8, msgs: []u8) !usize {
+    const r = try s.feed(rec);
+    try testing.expect(r.event == .need_more);
+    const p = s.pendingOutput();
+    const sh_len = std.mem.readInt(u16, p[3..5], .big);
+    var th: [32]u8 = undefined;
+    var hash = Sha256.init(.{});
+    hash.update(rec[5..]);
+    hash.update(p[5..][0..sh_len]);
+    hash.final(&th);
+    var c_hs: [32]u8 = undefined;
+    var s_hs: [32]u8 = undefined;
+    ks.deriveHandshakeTrafficSecrets(S256.Hkdf, &c_hs, &s_hs, s.handshake_secret[0..32], &th);
+    var rx: record.Protection = undefined;
+    try rx.init(.aes_128_gcm_sha256, &s_hs);
+    var buf: [32 * 1024]u8 = undefined;
+    @memcpy(buf[0..p.len], p);
+    var at: usize = 5 + sh_len + 6; // the ServerHello, the CCS
+    var n: usize = 0;
+    while (at < p.len) {
+        const hd = record.parseHeader(buf[at..][0..5]);
+        const o = try rx.open(buf[at..][0 .. 5 + hd.length]);
+        try testing.expectEqual(record.ContentType.handshake, o.content_type);
+        @memcpy(msgs[n..][0..o.content.len], o.content);
+        n += o.content.len;
+        at += 5 + hd.length;
+    }
+    return n;
+}
+
+/// The handshake message after EncryptedExtensions in a joined flight.
+fn certificateMessageOf(msgs: []const u8) []const u8 {
+    const ee_len = std.mem.readInt(u24, msgs[1..4], .big);
+    const m = msgs[4 + ee_len ..];
+    return m[0 .. 4 + std.mem.readInt(u24, m[1..4], .big)];
+}
+
+test "RFC 8879: a compressed certificate for the staples sent, first in the server's order; the transcript hashes it" {
+    const gpa = testing.allocator;
+    var ck = testKey().*;
+    ck.ocsp_response = "\x30\x03\x0a\x01\x00";
+    ck.sct_list = "\x00\x03\x00\x01x";
+    // The server never decompresses: a marker octet before the body stands
+    // in for a compressor.
+    var bodies: [2][]u8 = undefined;
+    var datas: [3][]u8 = undefined;
+    var scratch: [4096]u8 = undefined;
+    for ([_]bool{ false, true }, &bodies) |ocsp, *b| b.* = try gpa.dupe(u8, try ck.uncompressedCertificate(&scratch, .{ .ocsp = ocsp }));
+    defer for (bodies) |b| gpa.free(b);
+    for ([_]u8{ 'E', 'S', 'O' }, [_]usize{ 0, 0, 1 }, &datas) |mark, i, *d| d.* = try std.mem.concat(gpa, u8, &.{ &.{mark}, bodies[i] });
+    defer for (datas) |d| gpa.free(d);
+    const compressed = [_]CertifiedKey.CompressedCertificate{
+        .{ .algorithm = 0xff02, .uncompressed_len = @intCast(bodies[0].len), .data = datas[0] },
+        .{ .algorithm = 0xff01, .uncompressed_len = @intCast(bodies[0].len), .data = datas[1] },
+        .{ .algorithm = 0xff01, .staples = .{ .ocsp = true }, .uncompressed_len = @intCast(bodies[1].len), .data = datas[2] },
+    };
+    ck.compressed_certificates = &compressed;
+    try ck.check();
+
+    const Case = struct { algs: ?[]const u16, ocsp: bool = false, sct: bool = false, want: ?u8 };
+    const cases = [_]Case{
+        .{ .algs = null, .want = null },
+        .{ .algs = &.{0x0001}, .want = null }, // no common algorithm
+        .{ .algs = &.{0xff01}, .want = 'S' },
+        .{ .algs = &.{ 0xff01, 0xff02 }, .want = 'E' }, // the server's order
+        .{ .algs = &.{0xff01}, .ocsp = true, .want = 'O' },
+        .{ .algs = &.{0xff02}, .ocsp = true, .want = null }, // none with the staple
+        .{ .algs = &.{ 0xff01, 0xff02 }, .sct = true, .want = null }, // nor with the SCTs
+    };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var msgs: [32 * 1024]u8 = undefined;
+    for (cases, 0..) |c, i| {
+        errdefer std.debug.print("case {d}\n", .{i});
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(gpa, .{ .compress_certificate = c.algs, .ocsp = c.ocsp, .sct = c.sct });
+        defer gpa.free(rec);
+        const n = try openFirstFlight(&s, rec, &msgs);
+        const m = certificateMessageOf(msgs[0..n]);
+        if (c.want) |mark| {
+            const cc = for (&compressed) |*x| {
+                if (x.data[0] == mark) break x;
+            } else unreachable;
+            var want: [4096]u8 = undefined;
+            try testing.expectEqualSlices(u8, try messages.compressedCertificate(&want, cc.algorithm, cc.uncompressed_len, cc.data), m);
+        } else {
+            try testing.expectEqual(@as(u8, 11), m[0]);
+            try testing.expectEqualSlices(u8, try ck.uncompressedCertificate(&scratch, .{ .ocsp = c.ocsp, .sct = c.sct }), m[4..]);
+        }
+
+        // The client's Finished over the transcript as sent.
+        var t = Sha256.init(.{});
+        const p = s.pendingOutput();
+        t.update(rec[5..]);
+        t.update(p[5..][0..std.mem.readInt(u16, p[3..5], .big)]);
+        t.update(msgs[0..n]);
+        var th: [32]u8 = undefined;
+        t.final(&th);
+        var fk: [32]u8 = undefined;
+        ks.deriveFinishedKey(S256.Hkdf, 32, &fk, s.client_handshake_secret[0..32]);
+        var fin: [5 + 36 + 1 + record.tag_len]u8 = undefined;
+        fin[5..][0..4].* = .{ 20, 0, 0, 32 };
+        tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[9..41], &fk, &th);
+        var tx: record.Protection = undefined;
+        try tx.init(.aes_128_gcm_sha256, s.client_handshake_secret[0..32]);
+        const r = try s.feed(try tx.seal(&fin, 36, .handshake, 0));
+        try testing.expect(r.event == .handshake_done);
+    }
+}
+
+test "CertifiedKey.check: compressed certificates must match the message they stand for" {
+    var ck = testKey().*;
+    var scratch: [4096]u8 = undefined;
+    const body = try ck.uncompressedCertificate(&scratch, .{});
+    const len: u24 = @intCast(body.len);
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = len, .data = "x" }};
+    try ck.check();
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = len, .data = "" }};
+    try testing.expectError(error.CompressedLength, ck.check());
+    ck.compressed_certificates = &.{.{ .algorithm = 0, .uncompressed_len = len, .data = "x" }};
+    try testing.expectError(error.CompressedLength, ck.check());
+    // The message's own u24 length holds the algorithm and two lengths too
+    // (lengths only: `check` never reads the octets).
+    const huge: [*]const u8 = ck.chain[0].ptr;
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = len, .data = huge[0 .. (1 << 24) - 1 - 8] }};
+    try ck.check();
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = len, .data = huge[0 .. (1 << 24) - 8] }};
+    try testing.expectError(error.CompressedLength, ck.check());
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = len + 1, .data = "x" }};
+    try testing.expectError(error.CompressedStale, ck.check());
+    // A staple the key does not hold, then one it holds (the length
+    // follows it).
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .staples = .{ .sct = true }, .uncompressed_len = len, .data = "x" }};
+    try testing.expectError(error.CompressedStale, ck.check());
+    try testing.expectError(error.InvalidStaples, ck.uncompressedCertificate(&scratch, .{ .sct = true }));
+    ck.sct_list = "\x00\x03\x00\x01x";
+    try testing.expectError(error.CompressedStale, ck.check());
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .staples = .{ .sct = true }, .uncompressed_len = len + 4 + 5, .data = "x" }};
+    try ck.check();
+    try testing.expectEqual(@as(usize, len + 4 + 5), (try ck.uncompressedCertificate(&scratch, .{ .sct = true })).len);
+    try testing.expectError(error.BufferTooSmall, ck.uncompressedCertificate(scratch[0..8], .{}));
+}
+
+test "minOutputLen holds a compressed certificate longer than the chain" {
+    var ck = testKey().*;
+    const big: [8000]u8 = @splat(0xcd);
+    var scratch: [4096]u8 = undefined;
+    const len: u24 = @intCast((try ck.uncompressedCertificate(&scratch, .{})).len);
+    ck.compressed_certificates = &.{.{ .algorithm = 2, .uncompressed_len = len, .data = &big }};
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    const out = try testing.allocator.alloc(u8, minOutputLen(&cfg, &ck));
+    defer testing.allocator.free(out);
+    var s: Server = undefined;
+    try accept(&s, &cfg, &joiner, out, .{ .compress_certificate = &.{2} });
+    defer s.deinit();
 }
 
 test "HelloRetryRequest: for the first common group, then one first flight without a second CCS" {

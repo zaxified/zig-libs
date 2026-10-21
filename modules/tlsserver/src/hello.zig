@@ -283,7 +283,7 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
                 if (data.len != 0) return error.DecodeError;
                 ch.sct_requested = true;
             },
-            .compress_certificate => ch.compress_certificate_raw = try u16ListIn(data, u8),
+            .compress_certificate => ch.compress_certificate_raw = try parseCompressCertificate(data),
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
                 // RFC 8446 §4.2.11: MUST be the last extension.
@@ -330,6 +330,20 @@ fn u16ListIn(data: []const u8, comptime L: type) Error![]const u8 {
     const v = try vecIn(data, L);
     try u16List(v);
     return v;
+}
+
+/// RFC 8879 §3: a repeated algorithm is `decode_error` (BoringSSL; at most
+/// 127 of them, so the quadratic walk is bounded).
+fn parseCompressCertificate(data: []const u8) Error![]const u8 {
+    const list = try u16ListIn(data, u8);
+    var i: usize = 0;
+    while (i < list.len) : (i += 2) {
+        var j = i + 2;
+        while (j < list.len) : (j += 2) {
+            if (std.mem.eql(u8, list[i..][0..2], list[j..][0..2])) return error.DecodeError;
+        }
+    }
+    return list;
 }
 
 fn parseServerName(data: []const u8) Error!ServerName {
@@ -618,6 +632,8 @@ test "malformed known extensions are decode_error" {
         &ext(18, &.{0}), // signed_certificate_timestamp with a body
         &ext(11, &.{0}), // ec_point_formats empty
         &ext(27, &.{ 3, 0, 1, 0 }), // compress_certificate odd
+        &ext(27, &.{ 4, 0, 1, 0, 1 }), // compress_certificate repeats an algorithm
+        &ext(27, &.{ 6, 0, 2, 0, 1, 0, 2 }), // … not next to itself
         &ext(47, &.{ 0, 2, 0, 5 }), // certificate_authorities overruns
         &ext(0xff01, &.{1}), // renegotiation_info overruns
         &[_]u8{ 0, 43, 0, 9, 2, 3, 4 }, // extension overruns the block
@@ -649,6 +665,10 @@ test "well-formed odd cases are accepted" {
     try testing.expect(!ch.sct_requested);
     ch = try parseClientHello(buildHello(&b, &ext(18, &.{})));
     try testing.expect(ch.sct_requested);
+    // compress_certificate: distinct algorithms.
+    ch = try parseClientHello(buildHello(&b, &ext(27, &.{ 6, 0, 2, 0, 1, 0xff, 0x01 })));
+    try testing.expect(ch.compressCertificate().?.contains(0xff01));
+    try testing.expect(!ch.compressCertificate().?.contains(3));
     // ALPN with two names.
     ch = try parseClientHello(buildHello(&b, &ext(16, &.{ 0, 12, 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' })));
     var a = ch.alpn().?;

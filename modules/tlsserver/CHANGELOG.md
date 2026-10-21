@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M4 step 3, RFC 8879 certificate compression (server side; rustls parity
+  271 → 278, BoGo 363 → 370/0, the remaining 27 gaps are 0-RTT). `CertifiedKey.compressed_certificates`
+  (`CompressedCertificate`: algorithm, `Staples`, uncompressed length, data) holds the
+  Certificate message compressed by the caller ahead of time; `CertifiedKey.uncompressedCertificate(out,
+  staples)` gives the octets to compress. The handshake sends the first entry whose algorithm the
+  client's `compress_certificate` offers and whose staples match as a CompressedCertificate
+  (`messages.compressedCertificate`, `HandshakeType.compressed_certificate`), else the Certificate.
+  `CertifiedKey.check` gains `CompressedLength` (also algorithm 0) and `CompressedStale` (a
+  changed length only: replacing the chain or a staple means compressing again). `hello`: a repeated
+  algorithm in `compress_certificate` is `decode_error`. Interop case `cert-comp-zlib` (OpenSSL
+  `s_client`, std zlib); the BoGo shim's `-install-cert-compression-algs` /
+  `-install-one-cert-compression-alg`; the `tlsserver-hello` harness models the extension.
+  Independent review (Sonnet): no HIGH; MEDIUM (stale detection by length only) documented,
+  LOWs fixed (u24 bound of the whole message, algorithm 0, `InvalidChain`).
+
 - **2026-10-21** — M4 step 2, the client leaf's cap per configuration. **BREAKING**
   `clientauth.max_leaf_len` → `ClientAuth.max_leaf_len` (default
   `clientauth.default_max_leaf_len`, 4096), and the leaf lives in a buffer the caller gives

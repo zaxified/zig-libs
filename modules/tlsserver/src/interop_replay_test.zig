@@ -116,6 +116,7 @@ const Harness = struct {
     gpa: std.mem.Allocator,
     chain: [1][]const u8,
     ck: server_mod.CertifiedKey,
+    compressed: [1]server_mod.CertifiedKey.CompressedCertificate,
     suites: [8]record.CipherSuite,
     csprng: std.Random.DefaultCsprng,
     ring: tlsresume.stek.DefaultRing,
@@ -159,6 +160,10 @@ const Harness = struct {
         if (v.staple) {
             h.ck.ocsp_response = &vectors.ocsp_response;
             h.ck.sct_list = &vectors.sct_list;
+        }
+        if (v.compressed) |c| {
+            h.compressed = .{.{ .algorithm = c.algorithm, .uncompressed_len = c.uncompressed_len, .data = c.data }};
+            h.ck.compressed_certificates = &h.compressed;
         }
         for (v.suites, 0..) |s, i| h.suites[i] = @fromBackingInt(s);
         h.csprng = .init(@splat(v.seed));

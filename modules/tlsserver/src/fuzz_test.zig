@@ -503,6 +503,9 @@ const HelloMark = Marker(enum {
     cookie,
     ocsp,
     sct,
+    compress_certificate,
+    /// A repeated algorithm in `compress_certificate` (RFC 8879; decode_error).
+    compress_duplicate_refused,
     unknown_ext,
     no_ext_block,
     duplicate_refused,
@@ -616,6 +619,9 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var ocsp = false;
     var sct = false;
     var early = false;
+    var comp_buf: [6]u16 = undefined;
+    var comp: ?[]u16 = null;
+    var comp_duplicate = false;
     var psk_ids: ?usize = null;
     var binders_offset: usize = 0;
 
@@ -627,9 +633,9 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         HelloMark.mark(.no_ext_block);
     } else {
         const ext_at = w.open(u16);
-        // Order: a random permutation of the 13 kinds below, each present
+        // Order: a random permutation of the 14 kinds below, each present
         // with probability 1/2; pre_shared_key goes last on its own.
-        var order: [13]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+        var order: [14]u8 = .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
         var i: usize = order.len;
         while (i > 1) : (i -= 1) std.mem.swap(u8, &order[i - 1], &order[src.index(i)]);
         var unknown_used: [3]u16 = undefined;
@@ -648,6 +654,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                 7 => 5,
                 8 => 42,
                 12 => 18,
+                13 => 27,
                 9, 10, 11 => blk: {
                     // An unknown type (GREASE-like), distinct from the others.
                     var u: u16 = 0x0a0a + 0x1010 * @as(u16, src.valueRangeAtMost(u8, 0, 14));
@@ -738,6 +745,31 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
                     sct = true;
                     HelloMark.mark(.sct);
                 },
+                13 => {
+                    // Distinct algorithms (the real ones and BoGo's mocks
+                    // most often), or one repeated.
+                    const n = src.valueRangeAtMost(u8, 1, 5);
+                    const list_at = w.open(u8);
+                    for (comp_buf[0..n], 0..) |*a, k| {
+                        a.* = switch (src.valueRangeAtMost(u8, 0, 3)) {
+                            0 => src.valueRangeAtMost(u16, 1, 3),
+                            1 => 0xff01 + @as(u16, src.valueRangeAtMost(u8, 0, 2)),
+                            else => src.value(u16),
+                        };
+                        while (std.mem.indexOfScalar(u16, comp_buf[0..k], a.*) != null) a.* +%= 1;
+                        w.int(u16, a.*);
+                    }
+                    comp = comp_buf[0..n];
+                    if (src.valueRangeAtMost(u8, 0, 3) == 0) {
+                        const d = comp_buf[src.index(n)];
+                        comp_buf[n] = d;
+                        w.int(u16, d);
+                        comp = comp_buf[0 .. n + 1];
+                        comp_duplicate = true;
+                    }
+                    w.close(u8, list_at);
+                    HelloMark.mark(.compress_certificate);
+                },
                 else => {
                     const n = src.valueRangeAtMost(u8, 0, 20);
                     src.bytes(w.buf[w.n..][0..n]);
@@ -791,7 +823,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
 
     // Genuine (or with a planted fault).
     if (hello.parseClientHello(body)) |ch| {
-        if (long_sid or duplicate_planted or psk_misplaced) return error.FaultAccepted;
+        if (long_sid or duplicate_planted or psk_misplaced or comp_duplicate) return error.FaultAccepted;
         if (!std.mem.eql(u8, ch.random, &random)) return error.RandomDiffers;
         if (!std.mem.eql(u8, ch.legacy_session_id, sid[0..sid_len])) return error.SessionIdDiffers;
         try expectU16s(ch.cipherSuites(), suites);
@@ -820,6 +852,7 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if ((ch.cookie == null) != (cookie_len == null)) return error.CookieDiffers;
         if (cookie_len) |l| if (ch.cookie.?.len != l) return error.CookieDiffers;
         if (ch.ocsp_requested != ocsp or ch.sct_requested != sct or ch.early_data != early) return error.FlagDiffers;
+        if (comp) |c| try expectU16s(ch.compressCertificate(), c) else if (ch.compress_certificate_raw != null) return error.Phantom;
         if (psk_ids) |n| {
             const p = ch.pre_shared_key orelse return error.PskMissing;
             if (p.binders_offset != binders_offset) return error.BindersOffsetDiffers;
@@ -836,6 +869,8 @@ fn fuzzHello(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             HelloMark.mark(.duplicate_refused);
         } else if (psk_misplaced and err == error.IllegalParameter) {
             HelloMark.mark(.psk_not_last_refused);
+        } else if (comp_duplicate and err == error.DecodeError) {
+            HelloMark.mark(.compress_duplicate_refused);
         } else return err;
     }
 
@@ -1452,6 +1487,11 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         leaf.ocsp_response = &interop.ocsp_response;
         leaf.sct_list = &interop.sct_list;
     }
+    var compressed: [1]server_mod.CertifiedKey.CompressedCertificate = undefined;
+    if (v.compressed) |c| {
+        compressed = .{.{ .algorithm = c.algorithm, .uncompressed_len = c.uncompressed_len, .data = c.data }};
+        leaf.compressed_certificates = &compressed;
+    }
     const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;
     for (v.suites, 0..) |s, i| suites[i] = @fromBackingInt(s);
@@ -1949,6 +1989,11 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     if (v.staple) {
         leaf.ocsp_response = &interop.ocsp_response;
         leaf.sct_list = &interop.sct_list;
+    }
+    var compressed: [1]server_mod.CertifiedKey.CompressedCertificate = undefined;
+    if (v.compressed) |c| {
+        compressed = .{.{ .algorithm = c.algorithm, .uncompressed_len = c.uncompressed_len, .data = c.data }};
+        leaf.compressed_certificates = &compressed;
     }
     const ck = &leaf;
     var suites: [8]record.CipherSuite = undefined;

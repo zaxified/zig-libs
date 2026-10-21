@@ -7,6 +7,11 @@ ALPNServer-Reject-TLS-TLS13
 ALPNServer-TLS-TLS13
 Alert
 BadFinished-Server-TLS13
+CertCompressionExpands-TLS13
+CertCompressionNoCommonAlgs-TLS13
+CertCompressionPriority-TLS13
+CertCompressionRandom-TLS13
+CertCompressionShrinks-TLS13
 CertificateVerificationDoesNotFailOnResume-Server-TLS13-CustomCallback-TLS-Async
 CertificateVerificationDoesNotFailOnResume-Server-TLS13-CustomCallback-TLS-Async-ImplicitHandshake
 CertificateVerificationDoesNotFailOnResume-Server-TLS13-CustomCallback-TLS-Async-PackHandshake
@@ -97,6 +102,8 @@ CurveTest-Server-X25519MLKEM768-TLS13
 CurveTest-SetX25519HighBit-Server-X25519-TLS13
 CurveTest-SetX25519HighBit-Server-X25519MLKEM768-TLS13
 DoubleAlert
+DuplicateCertCompressionExt-TLS13
+DuplicateCertCompressionExt2-TLS13
 DuplicateKeyShares-TLS13
 ECDSACurveMismatch-Sign-TLS13
 ECDSAKeyUsage-Server-TLS13

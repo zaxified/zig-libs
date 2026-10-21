@@ -36,8 +36,8 @@ BoringSSL's BoGo suite passes 339 tests with none failing (`tools/bogo/passing.t
 else is unimplemented or disabled with a reason). HelloRetryRequest (M2 step 1), KeyUpdate
 both ways (step 2), session tickets with resumption (step 3), client certificates (step 4) and
 OCSP / SCT stapling (step 5) work. **rustls parity (step 6):** of the 436 BoGo server tests
-at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here, 140 are
-disabled with a reason (121 run at TLS 1.2 under a name without a version; 19 deliberate
+at TLS 1.3 that rustls 0.23.43 passes (`tools/bogo/rustls-owed.txt`), 247 pass here (278 after
+M4 step 3), 140 are disabled with a reason (131 after it) (121 run at TLS 1.2 under a name without a version; 19 deliberate
 divergences: P-521 and ML-DSA client keys, four with rustls's own behaviour that the pinned
 runner cannot map, extensions this server ignores), and 49 are gaps: 0-RTT (27),
 certificate compression (6), P-521 and ML-DSA server keys (12), standalone ML-KEM-1024 (4) — see
@@ -290,6 +290,7 @@ RFC 8446 §5, record layer over a byte stream:
   | `legacy_session_id` > 32, empty or odd `cipher_suites`, no compression method | `decode_error` |
   | An empty list RFC 8446 / 6066 / 7301 declare non-empty (groups, signature schemes, versions, ALPN, ALPN name, cookie, PSK modes, PSK identities/binders, point formats) | `decode_error` |
   | `early_data` with a body; an empty SNI `host_name` | `decode_error` |
+  | A repeated algorithm in `compress_certificate` (RFC 8879; BoringSSL, and rustls passes BoGo's `DuplicateCertCompressionExt`) | `decode_error` |
   | Any extension type twice (known, unknown or GREASE); `pre_shared_key` not last; PSK identities and binders of different counts | `illegal_parameter` |
   | An empty `key_share` list | accepted (the client asks for a HelloRetryRequest) |
   | No extension block at all | accepted (the state machine refuses it: no `supported_versions`) |
@@ -721,6 +722,24 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   (`ClientAuth.max_leaf_len`, `Server.setPeerBuffer`). The ML-DSA AlgorithmIdentifier's absent
   parameters are checked for the private key, not for a client leaf (`x509.Spki` does not
   expose them).
+- **M4 step 3 (2026-10-21): RFC 8879 certificate compression, server side** — BoGo 370/0,
+  parity 278 of 436, 27 gaps (0-RTT only). The caller compresses the Certificate message ahead of
+  time (`CertifiedKey.uncompressedCertificate(out, staples)` → any compressor →
+  `CertifiedKey.compressed_certificates`, in its order of preference, one entry per algorithm and
+  per set of staples); the handshake sends the first one whose algorithm the client offers and
+  whose staples are the ones this handshake sends, else the Certificate uncompressed. No
+  compressor runs in the handshake and the module gains no dependency (rustls compresses per
+  handshake behind a small cache; BoringSSL per handshake). `check` refuses an entry whose
+  `uncompressed_len` no longer matches (`CompressedStale`), but a same-length change (a refreshed
+  OCSP staple usually is one) is not seen: the caller compresses again whenever it replaces the
+  chain or a staple (review 2026-10-21, MEDIUM, documented rather than hashed per handshake; a
+  digest of the body in each entry, checked at load time, is the backlog option). Interop: OpenSSL
+  3.5 `s_client` decompresses a std-zlib one (`cert-comp-zlib`, 52 recorded sessions); the BoGo
+  shim installs BoringSSL's three mock algorithms. **Not done:** compressed *client*
+  certificates (rustls `ServerConfig::cert_decompressors`: `compress_certificate` in the
+  CertificateRequest and a decompressor bounded by `max_leaf_len`) — BoGo has no server test for
+  it, so parity does not ask; a built-in zlib/brotli/zstd helper (the caller picks; `zstd` and
+  `brotli` are modules here, zlib is in std).
 - **rustls parity gaps (2026-10-20, 49 tests, `--bogo` prints them as `GAP`):** 0-RTT (27:
   `EarlyData-*`, `TLS13-MaxEarlyData-*`, `TLS13-TicketAgeSkew-*-60-*`, EndOfEarlyData) and
   certificate compression (6, RFC 8879) are M4; P-521 and ML-DSA server keys (12:
@@ -761,7 +780,7 @@ are larger), so a small-stack worker must be sized for the keys and groups it en
   → 6,705; X25519MLKEM768 1,825 → 4,788; P-384 certificate 506 → 1,832; Ed25519 3,036 → 3,491;
   RSA-2048 1,124 → 1,202; resumption 4,480 → 5,496. Not a P-axis number (that is the in-memory
   harness against OpenSSL libssl, M4).
-  **M4:** rustls scope (0-RTT, certificate compression), ctgrind, mutation, independent review.
+  **M4:** rustls scope (0-RTT, ~~certificate compression~~ step 3), ctgrind, mutation, independent review.
 
 ## Open
 

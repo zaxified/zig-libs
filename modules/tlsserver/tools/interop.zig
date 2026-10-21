@@ -91,6 +91,9 @@ const Case = struct {
     client_cert: ClientCertKind = .none,
     /// The leaf carries `interop_ocsp_response` and `interop_sct_list`.
     staple: bool = false,
+    /// The Certificate (without staples) is also there zlib-compressed
+    /// (RFC 8879), by std's deflate.
+    cert_comp: bool = false,
 };
 
 /// The OCSP staple and SCT list of every `staple` case: an OCSPResponse of
@@ -127,6 +130,7 @@ const cases = [_]Case{
     .{ .name = "resume-aes128-new", .why = "tickets under TLS_AES_128_GCM_SHA256", .seed = 18, .tickets = true, .brief = false, .args = &.{ "-sess_out", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     .{ .name = "resume-aes128", .why = "resumption under TLS_AES_128_GCM_SHA256", .seed = 19, .tickets = true, .resumed = true, .brief = false, .args = &.{ "-sess_in", "openssl-aes128.sess", "-ciphersuites", "TLS_AES_128_GCM_SHA256" }, .expect = &.{"Reused, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256"} },
     .{ .name = "staple", .why = "an OCSP staple (s_client -status; its -ct needs a CT log list, so the SCTs are Go's to check)", .seed = 60, .staple = true, .brief = false, .args = &.{"-status"}, .expect = &.{"OCSP Response Status: malformedrequest (0x1)"} },
+    .{ .name = "cert-comp-zlib", .why = "RFC 8879: the Certificate zlib-compressed (s_client offers zlib and zstd)", .seed = 63, .cert_comp = true, .brief = false, .args = &.{"-msg"}, .expect = &.{ "], CompressedCertificate", "Verification: OK" } },
     .{ .name = "staple-not-asked", .why = "a staple configured, s_client without -status (no status_request): the handshake still completes (absence of the staple: handshake_test.zig)", .seed = 61, .staple = true },
     .{ .name = "mtls-p256", .why = "a client certificate (ECDSA P-256) the server requires, verified by x509", .seed = 40, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"Verification: OK"} },
     .{ .name = "mtls-rsa2048", .why = "an RSA client certificate: CertificateVerify in RSA-PSS (SHA-384 suite)", .seed = 41, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"Ciphersuite: TLS_AES_256_GCM_SHA384"} },
@@ -224,7 +228,25 @@ fn pemLabel(gpa: std.mem.Allocator, label: []const u8, der: []const u8) ![]u8 {
 const Recorded = struct {
     client: std.ArrayList(u8) = .empty,
     server: std.ArrayList(u8) = .empty,
+    /// A `cert_comp` case's compressed certificate.
+    compressed: ?tlsserver.CertifiedKey.CompressedCertificate = null,
 };
+
+/// `ck`'s Certificate without staples, zlib-compressed (RFC 8879
+/// algorithm 1).
+fn zlibCertificate(gpa: std.mem.Allocator, ck: *const tlsserver.CertifiedKey) !tlsserver.CertifiedKey.CompressedCertificate {
+    const body_buf = try gpa.alloc(u8, 1 << 16);
+    defer gpa.free(body_buf);
+    const body = try ck.uncompressedCertificate(body_buf, .{});
+    var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 4096);
+    errdefer out.deinit();
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
+    var z = try std.compress.flate.Compress.init(&out.writer, window, .zlib, .default);
+    try z.writer.writeAll(body);
+    try z.finish();
+    return .{ .algorithm = 1, .uncompressed_len = @intCast(body.len), .data = try out.toOwnedSlice() };
+}
 
 /// Serve one connection by hand, recording every octet both ways. The
 /// application protocol: receive "ping\n", answer "pong\n", close_notify,
@@ -355,6 +377,10 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     if (c.staple) {
         ck.ocsp_response = &interop_ocsp_response;
         ck.sct_list = &interop_sct_list;
+    }
+    if (c.cert_comp) {
+        rec.compressed = try zlibCertificate(gpa, &ck);
+        ck.compressed_certificates = (&rec.compressed.?)[0..1];
     }
     const seed: [32]u8 = @splat(c.seed);
     var csprng = std.Random.DefaultCsprng.init(seed);
@@ -487,9 +513,14 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    client_cert: ClientCertKind = .none,
         \\    /// The leaf carried `ocsp_response` and `sct_list`.
         \\    staple: bool = false,
+        \\    /// The leaf's Certificate (no staples) also went as this
+        \\    /// CompressedCertificate to a client that offered its algorithm.
+        \\    compressed: ?Compressed = null,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
+        \\
+        \\pub const Compressed = struct { algorithm: u16, uncompressed_len: u24, data: []const u8 };
         \\
         \\pub const cases = [_]Case{
         \\
@@ -510,6 +541,11 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.client_auth != .off) try w.print("        .client_auth = .{t},\n", .{c.client_auth});
         if (c.client_cert != .none) try w.print("        .client_cert = .{t},\n", .{c.client_cert});
         if (c.staple) try w.writeAll("        .staple = true,\n");
+        if (d[1].compressed) |cc| {
+            try w.print("        .compressed = .{{\n            .algorithm = {d},\n            .uncompressed_len = {d},\n", .{ cc.algorithm, cc.uncompressed_len });
+            try hexFieldAt(w, "            ", "data", cc.data);
+            try w.writeAll("        },\n");
+        }
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");
@@ -537,10 +573,14 @@ fn listEnd(len: usize) []const u8 {
 }
 
 fn hexField(w: *std.Io.Writer, name: []const u8, data: []const u8) !void {
-    try w.print("        .{s} = &hx({d}, \"\"", .{ name, data.len });
+    return hexFieldAt(w, "        ", name, data);
+}
+
+fn hexFieldAt(w: *std.Io.Writer, indent: []const u8, name: []const u8, data: []const u8) !void {
+    try w.print("{s}.{s} = &hx({d}, \"\"", .{ indent, name, data.len });
     var i: usize = 0;
     while (i < data.len) : (i += 48) {
-        try w.print(" ++\n            \"{x}\"", .{data[i..@min(data.len, i + 48)]});
+        try w.print(" ++\n{s}    \"{x}\"", .{ indent, data[i..@min(data.len, i + 48)] });
     }
     try w.writeAll("),\n");
 }

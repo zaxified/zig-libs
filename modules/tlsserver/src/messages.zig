@@ -2,8 +2,9 @@
 
 //! tlsserver.messages — the handshake messages a TLS 1.3 server writes
 //! (RFC 8446 §4): ServerHello, HelloRetryRequest, EncryptedExtensions,
-//! CertificateRequest, Certificate, CertificateVerify, Finished, each with
-//! its four-octet handshake header, into a caller's buffer.
+//! CertificateRequest, Certificate (or RFC 8879 CompressedCertificate),
+//! CertificateVerify, Finished, each with its four-octet handshake header,
+//! into a caller's buffer.
 //!
 //! Every encoder returns the whole message (header ‖ body), the octets the
 //! transcript hashes and the record layer frames. Nothing is chosen here:
@@ -24,6 +25,7 @@ pub const HandshakeType = enum(u8) {
     certificate_verify = 15,
     finished = 20,
     key_update = 24,
+    compressed_certificate = 25,
     message_hash = 254,
     _,
 };
@@ -255,6 +257,17 @@ pub fn certificate(out: []u8, context: []const u8, entries: []const CertificateE
     return w.done(at);
 }
 
+/// RFC 8879 §4: a Certificate message body compressed under `algorithm`.
+pub fn compressedCertificate(out: []u8, algorithm: u16, uncompressed_len: u24, data: []const u8) Error![]u8 {
+    if (data.len == 0) return error.FieldTooLong; // `<1..2^24-1>`
+    var w: Writer = .{ .out = out };
+    const at = try w.message(.compressed_certificate);
+    try w.int(u16, algorithm);
+    try w.int(u24, uncompressed_len);
+    try w.vec(u24, data);
+    return w.done(at);
+}
+
 pub const CertificateRequest = struct {
     /// Empty during the handshake (RFC 8446 §4.3.2).
     context: []const u8 = "",
@@ -453,6 +466,13 @@ test "ALPN extension body; a chain with an OCSP staple on the leaf" {
     const leaf2 = "\x00\x00\x01L" ++ "\x00\x16" ++ "\x00\x05\x00\x06\x01\x00\x00\x02\x30\x00" ++ "\x00\x12\x00\x08" ++ scts;
     try testing.expectEqualSlices(u8, "\x0b\x00\x00\x20" ++ "\x00" ++ "\x00\x00\x1c" ++ leaf2, m2);
     try testing.expectError(error.FieldTooLong, certificate(&out, "", &.{.{ .cert_data = "L", .sct_list = "" }}));
+}
+
+test "CompressedCertificate (RFC 8879 §4)" {
+    var out: [32]u8 = undefined;
+    try testing.expectEqualSlices(u8, "\x19\x00\x00\x0a" ++ "\x00\x02" ++ "\x00\x01\x00" ++ "\x00\x00\x02" ++ "xy", try compressedCertificate(&out, 2, 256, "xy"));
+    try testing.expectError(error.FieldTooLong, compressedCertificate(&out, 2, 256, ""));
+    try testing.expectError(error.BufferTooSmall, compressedCertificate(out[0..13], 2, 256, "xy"));
 }
 
 test "buffer too small, fields too long" {

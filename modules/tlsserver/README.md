@@ -11,10 +11,11 @@ blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), 
 both ways, session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`), and client
 certificates (`Config.client_auth`: a `ClientCertVerifier`, `X509Verifier` over `x509`;
 `Server.peerCertificate`), and an OCSP staple and SCT list on the leaf when the client asks
-(`CertifiedKey.ocsp_response` / `sct_list`, checked by `CertifiedKey.check`). The rustls parity
-gate runs with BoGo: 247 of the 436 TLS 1.3 server tests rustls passes pass here, 140 are
-disabled with a reason, 49 are gaps (0-RTT, certificate compression, P-521 / ML-DSA keys,
-ML-KEM-1024; `SPEC.md`, *Backlog*).
+(`CertifiedKey.ocsp_response` / `sct_list`, checked by `CertifiedKey.check`), and the
+Certificate compressed (RFC 8879) when the client offers an algorithm the caller compressed it
+with ahead of time (`CertifiedKey.compressed_certificates`). The rustls parity gate runs with
+BoGo: 278 of the 436 TLS 1.3 server tests rustls passes pass here, 131 are disabled with a
+reason, 27 are gaps (0-RTT; `SPEC.md`, *Backlog*).
 
 - **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
   server; qap runs a fork of a third-party one, which this module is meant to replace.
@@ -48,6 +49,16 @@ const stek: tlsserver.StekTicketer(@TypeOf(ring)) = .{ .ring = &ring };
 const tickets: tlsserver.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = wallMs } };
 // config.tickets = &tickets;  — 2 tickets per handshake, 12 h lifetime (rustls)
 
+// Certificate compression (RFC 8879, optional): compress the Certificate
+// message once, when the certificate is loaded, with any compressor —
+// here zlib from std (algorithm 1). One entry per algorithm and per set of
+// staples sent (`.{ .ocsp = true }` for clients that ask for the staple).
+const body = try ck.uncompressedCertificate(&body_buf, .{});
+const zlib_data = try zlibCompress(gpa, body); // e.g. std.compress.flate, `.zlib`
+var compressed_ck = ck;
+compressed_ck.compressed_certificates = &.{.{ .algorithm = 1, .uncompressed_len = @intCast(body.len), .data = zlib_data }};
+try compressed_ck.check(); // compress again whenever the chain or a staple is replaced
+
 // Per connection: a joiner, a reader whose buffer holds one whole record
 // (`record.max_record_len`), and a stream writer (a socket's) whose buffer
 // holds the first flight (`Server.minOutputLen`): records are sealed in it.
@@ -69,7 +80,7 @@ zeroed; the engine answers it with the matching alert.
 `zig build test-tlsserver`. Anchors (`SPEC.md` § Anchoring): RFC 8448's records, ClientHellos
 and server messages byte-exact; OpenSSL 3.5 `s_client` and Go 1.26 crypto/tls client sessions
 (`zig build interop-tlsserver`, replayed byte-exact in the tests); BoringSSL's BoGo suite
-(`-- --bogo`, 339 pass, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
+(`-- --bogo`, 370 pass, with the rustls parity report); tlsfuzzer's TLS 1.3 scripts
 (`-- --tlsfuzzer DIR`, a checkout such as qap's `scripts/tools/tlsfuzzer`; counts held in
 `tools/tlsfuzzer/baseline.tsv`); handshakes against Zig std's
 client and the collection's `tlsclient`; keys in every PEM form

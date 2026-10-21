@@ -111,6 +111,9 @@ const Options = struct {
     expect_advertised_alpn: ?[]const u8 = null,
     alpn_mode: enum { select, decline, reject } = .select,
     expect_peer_verify_prefs: std.ArrayList(u16) = .empty,
+    /// BoringSSL's mock certificate compression algorithms installed: all
+    /// of them, or the one named.
+    cert_compression: union(enum) { none, all, one: u16 } = .none,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -300,6 +303,10 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.alpn_mode = .reject;
         } else if (std.mem.eql(u8, flag, "-expect-peer-verify-pref")) {
             try o.expect_peer_verify_prefs.append(gpa, try std.fmt.parseInt(u16, try value(it, flag), 10));
+        } else if (std.mem.eql(u8, flag, "-install-cert-compression-algs")) {
+            o.cert_compression = .all;
+        } else if (std.mem.eql(u8, flag, "-install-one-cert-compression-alg")) {
+            o.cert_compression = .{ .one = try std.fmt.parseInt(u16, try value(it, flag), 10) };
         } else if (std.mem.eql(u8, flag, "-use-client-ca-list")) {
             const v = try value(it, flag);
             if (!std.mem.eql(u8, v, "<NULL>") and !std.mem.eql(u8, v, "<EMPTY>")) {
@@ -512,6 +519,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     leaf.ocsp_response = o.ocsp_response;
     leaf.sct_list = o.sct_list;
     if (o.signing_prefs.items.len != 0) leaf.signature_schemes = o.signing_prefs.items;
+    leaf.compressed_certificates = try compressCertificates(gpa, &leaf, random, o.cert_compression);
     try leaf.check();
     var hello_check: HelloCheck = .{ .key = &leaf, .o = o };
     const cfg: server_mod.Config = .{
@@ -570,6 +578,48 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         }
         return err;
     };
+}
+
+/// BoringSSL's shim's mock compression algorithms (`test_config.cc`,
+/// `cert_compression_tests.go`), in the order it installs them, which is
+/// its order of preference.
+const MockCompression = enum(u16) {
+    /// `1 2 3 4` before the message.
+    expanding = 0xff02,
+    /// The message less its first two octets (always zero: the empty
+    /// context and the high octet of the list length).
+    shrinking = 0xff01,
+    /// A random octet before the message.
+    random = 0xff03,
+};
+
+/// Every compressed certificate the installed algorithms make, for each
+/// set of staples `leaf` can send, compressed once (BoringSSL compresses
+/// per handshake; `CertCompressionRandom` checks that the message sent is
+/// the one hashed, which holds either way).
+fn compressCertificates(gpa: std.mem.Allocator, leaf: *const tlsserver.CertifiedKey, random: std.Random, which: @FieldType(Options, "cert_compression")) ![]const tlsserver.CertifiedKey.CompressedCertificate {
+    if (which == .none) return &.{};
+    try leaf.check();
+    var out: std.ArrayList(tlsserver.CertifiedKey.CompressedCertificate) = .empty;
+    const body_buf = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(body_buf);
+    for (std.enums.values(MockCompression)) |alg| {
+        if (which == .one and which.one != @backingInt(alg)) continue;
+        for ([_]bool{ false, true }) |ocsp| for ([_]bool{ false, true }) |sct| {
+            const staples: tlsserver.CertifiedKey.Staples = .{ .ocsp = ocsp, .sct = sct };
+            const body = leaf.uncompressedCertificate(body_buf, staples) catch |err| switch (err) {
+                error.InvalidStaples => continue, // a staple the key does not hold
+                else => return err,
+            };
+            const data = switch (alg) {
+                .expanding => try std.mem.concat(gpa, u8, &.{ &.{ 1, 2, 3, 4 }, body }),
+                .shrinking => try gpa.dupe(u8, body[2..]),
+                .random => try std.mem.concat(gpa, u8, &.{ &.{random.int(u8)}, body }),
+            };
+            try out.append(gpa, .{ .algorithm = @backingInt(alg), .staples = staples, .uncompressed_len = @intCast(body.len), .data = data });
+        };
+    }
+    return out.items;
 }
 
 fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8, hello_check: *const HelloCheck) !bool {
