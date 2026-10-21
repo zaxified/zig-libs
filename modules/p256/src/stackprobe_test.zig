@@ -338,6 +338,12 @@ noinline fn callStdSignNoise() void {
     std.mem.doNotOptimizeAway(&sig);
 }
 
+var sig_sink: Ecdsa.Signature = undefined;
+
+noinline fn callSignWithSecretKey() void {
+    Ecdsa.signWithSecretKey(&sig_sink, &cur_pair.secret_key, msg, &cur_nonce) catch unreachable;
+}
+
 noinline fn callFromSecretKey() void {
     Ecdsa.KeyPair.fromSecretKeyInto(&pair_sink, &cur_std_sk) catch unreachable;
 }
@@ -374,6 +380,7 @@ test "STACKPROBE: no key or nonce residue on the dead stack after ECDSA signing"
             .{ .name = "ecdsaSignDeterministic", .call = callEcdsaSignDeterministic, .sig = try p256.sign.ecdsaSignDeterministic(&cur_sk, msg) },
             .{ .name = "EcdsaP256Sha256 sign", .call = callStdSign, .sig = (try cur_pair.sign(msg, null)).toBytes() },
             .{ .name = "EcdsaP256Sha256 sign+noise", .call = callStdSignNoise, .sig = (try cur_pair.sign(msg, cur_nonce)).toBytes() },
+            .{ .name = "EcdsaP256Sha256 signWithSecretKey", .call = callSignWithSecretKey, .sig = (try cur_pair.sign(msg, cur_nonce)).toBytes() },
         };
         for (signers) |sg| {
             var n: Needles = .{};

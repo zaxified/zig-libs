@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Performance:** a full SHA-384 handshake's key schedule runs ~25 SHA-384
+  compressions fewer, and its dead-stack burns zero ~170 KiB less. **Added:**
+  `keyschedule.Schedule.deriveHandshakeSecretNoPsk` (the no-PSK early secret's `"derived"` salt
+  as a constant, `noPskDerivedSalt`, from an independent Python computation, recomputed in a
+  test), `deriveApplicationSecrets` (both application traffic secrets and the exporter master
+  secret over one master-secret HMAC key setup) and `keyschedule.emptyTranscriptHash`.
+  `deriveHandshakeTrafficSecrets`, `deriveApplicationTrafficSecrets` and `deriveTrafficKeyIv`
+  absorb HMAC's key pads once per secret (RFC 2104 §4); outputs unchanged (the RFC 8448 KATs,
+  and a test of the new path against HKDF-Expand-Label over both hashes, both prefixes, every
+  output length). `certverify` signs ECDSA P-256/P-384 with `signWithSecretKey` (no `d·G` per
+  signature; signatures unchanged). `kex`'s X25519MLKEM768 arms are out of line, so a curve
+  group's frames are ~2 KiB: `kex_x25519/p256/p384_burn` 96/112/112 → 4 KiB, `ecdsa_burn`
+  48 → 8 KiB, `ks_burn` 8 → 6 KiB, all measured by the stack probe with the burn off (new
+  probes for ECDSA P-256/P-384 signing and the handshake's key-schedule steps).
+
 - **2026-10-21** — `Schedule.exportKeyingMaterial(Hash, Hkdf, out, exporter_master_secret, label,
   context)`: the RFC 8446 §7.5 exporter with a run-time output length (burned like the other
   steps), plus `max_exporter_label_len` and `maxExporterLen`. KATs from an independent Python

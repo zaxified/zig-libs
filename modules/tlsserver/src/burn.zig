@@ -50,10 +50,13 @@ pub const record_burn = 4 * 1024;
 /// their own frames hold hashes, the kex output and finished keys, and,
 /// without client authentication, a ticket plaintext (0.6 KiB; with it the
 /// plaintext lies in the caller's peer buffer, wiped in place); kex, signing
-/// and HKDF below them burn their own. A margin, not yet measured (*Open*
-/// in SPEC.md: the stack probe does not cover the server yet) — sized when
-/// the plaintexts were 4.7 KiB stack arrays, so likely loose now.
-pub const handshake_burn = 32 * 1024;
+/// and HKDF below them burn their own. The steps reach 10.2 KiB below the
+/// burn's top in ReleaseFast (`interop_replay_test.zig`'s handshake probe
+/// with this burn off: full, hybrid, HRR, resumed, RSA, P-384, Ed25519;
+/// 2026-10-21); ~1.6x. Was 32 KiB, a margin — which the steps outgrew by
+/// 3 KiB while the ClientHello's two 8 KiB duplicate bitsets sat inlined in
+/// `onClientHello`'s frame (out of line since).
+pub const handshake_burn = 16 * 1024;
 
 /// `keys.CertKeyPair.fromPem`: the PEM and DER walk, the Ed25519 seed
 /// expansion and the key-to-certificate check (a scalar multiplication for

@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Performance:** the qap churn lane (X25519, ECDSA P-256) is at the ianic
+  fork's rate: 3,379 / 3,343 vs 3,291 / 3,333 connections/s, 187–193 vs 189–190 µs of user CPU
+  per connection (before: 2,971 / 2,989, 231 µs). From a profile by function against the fork:
+  the P-256 public key recomputed per signature (14 µs, `tls13`/`p256`), the dead-stack burns
+  (~13 µs, `tls13` and below) and ~25 SHA-384 compressions of the key schedule (`tls13`). Here:
+  the handshake takes the no-PSK constant salt and `deriveApplicationSecrets`, computes the
+  ClientHello hash only for early data, and the ClientHello parse and the key-share check (each
+  with an 8 KiB duplicate bitset) run out of line. **Fixed:** with those bitsets inlined,
+  `onClientHello`'s frame was 27.5 KiB and the handshake steps reached 3 KiB past
+  `handshake_burn` (32 KiB) — found by the new stack probe of whole recorded handshakes
+  (`interop_replay_test.zig`); the steps now reach 10.2 KiB, `handshake_burn` 16 KiB. Output
+  octet-identical (every recorded session replays byte for byte).
+
 - **2026-10-21** — **Added (instrument):** the comparative benchmark against OpenSSL 3's libssl
   (`zig build bench-tlsserver`, `tools/bench.zig` + `tools/c_bench/foreign_bench.c`): the
   server's work alone, both sides replaying a recorded session into a fresh server with

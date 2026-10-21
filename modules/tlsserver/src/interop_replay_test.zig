@@ -560,3 +560,33 @@ test "a recording with one octet of OpenSSL's flipped is refused" {
     w.client = flipped;
     try testing.expectError(error.BadRecordMac, replay(testing.allocator, w, .calls));
 }
+
+// ── dead-stack probe of a whole handshake (`burn.handshake_burn`) ───────
+
+const sp = @import("testkit").stackprobe;
+/// Past the deepest burn under a handshake (`tls13`'s hybrid kex, 160 KiB)
+/// and the frames above it. One call per measurement: a second
+/// `handshake` on a connected `Connection` does nothing.
+const PHs = sp.Probe(.{ .window = 320 * 1024, .repeats = 1 });
+
+test "STACKPROBE: no secret residue after a recorded handshake (full, hybrid, HRR, resumed, mTLS, RSA)" {
+    try sp.skipUnlessOptimized();
+    const gpa = testing.allocator;
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    inline for (.{ "p256-aes256-x25519", "go-no-hybrid", "p256-default", "hrr-p256", "resume", "mtls-p256", "rsa2048-pss", "p384", "ed25519" }) |name| {
+        const h: *Harness = try .create(gpa, try caseNamed(name), &keys);
+        defer h.destroy();
+        const s = &h.conn.server;
+        // The client's Certificate and CertificateVerify are checked in
+        // unburned steps (public data: its chain, its signature, the
+        // transcript hash), whose verifier frames reach far below the
+        // burns: needles only there.
+        const expect: sp.Expect = if (comptime std.mem.startsWith(u8, name, "mtls")) .{ .residue = false } else .{};
+        _ = try PHs.run(name, Connection.handshake, .{&h.conn}, &[_][]const u8{
+            &keys.p256.bytes,             &keys.p384.bytes,             &keys.ed.bytes,
+            &s.client_application_secret, &s.server_application_secret, &s.exporter_master_secret,
+        }, expect);
+        try testing.expect(s.isConnected());
+    }
+}

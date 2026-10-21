@@ -106,3 +106,54 @@ test "STACKPROBE: no exporter secret residue after exportKeyingMaterial" {
     ks.deriveSecret(Hkdf384, &inner, &exporter_secret, "EXPERIMENTAL-probe", &empty_hash);
     _ = try PKs.run("exportKeyingMaterial", exportIt, .{}, &[_][]const u8{ &exporter_secret, &inner }, .{});
 }
+
+// ── certverify: ECDSA P-256 / P-384 (`burn.ecdsa_burn`) ──────────────────
+
+const Ecdsa = std.crypto.sign.ecdsa;
+
+test "STACKPROBE: no key residue after certverify sign, ECDSA P-256 and P-384" {
+    try sp.skipUnlessOptimized();
+    const sk256 = try Ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(@splat(0x21));
+    _ = try PSig.run("p256 sign", signInto, .{ .ecdsa_secp256r1_sha256, .{ .ecdsa_p256 = &sk256 } }, &[_][]const u8{&sk256.bytes}, .{});
+    const sk384 = try Ecdsa.EcdsaP384Sha384.SecretKey.fromBytes(@splat(0x23));
+    _ = try PSig.run("p384 sign", signInto, .{ .ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &sk384 } }, &[_][]const u8{&sk384.bytes}, .{});
+}
+
+// ── keyschedule: the steps a handshake runs (`burn.ks_burn`) ──────────────
+
+var ks_secret: [48]u8 = @splat(0x4d);
+var ks_out: [3][48]u8 = undefined;
+var ks_key: [32]u8 = undefined;
+var ks_iv: [12]u8 = undefined;
+const ks_th: [48]u8 = @splat(0x15);
+const ks_dhe: [32]u8 = @splat(0x52);
+
+fn ksHandshakeTraffic() void {
+    ks.deriveHandshakeTrafficSecrets(Hkdf384, &ks_out[0], &ks_out[1], &ks_secret, &ks_th);
+}
+fn ksApplication() void {
+    ks.deriveApplicationSecrets(Hkdf384, &ks_out[0], &ks_out[1], &ks_out[2], &ks_secret, &ks_th);
+}
+fn ksKeyIv() void {
+    ks.deriveTrafficKeyIv(Hkdf384, 32, 12, &ks_key, &ks_iv, &ks_secret);
+}
+fn ksNoPsk() void {
+    ks.deriveHandshakeSecretNoPsk(Hkdf384, &ks_out[0], &ks_dhe);
+}
+fn ksMaster() void {
+    ks.deriveMasterSecret(Hkdf384, &ks_out[0], &ks_secret, @import("keyschedule.zig").emptyTranscriptHash(Sha384));
+}
+fn ksFinished() void {
+    @import("keyschedule.zig").computeFinishedVerifyData(std.crypto.auth.hmac.sha2.HmacSha384, &ks_out[0], &ks_secret, &ks_th);
+}
+
+test "STACKPROBE: no secret residue after the keyschedule steps of a handshake" {
+    try sp.skipUnlessOptimized();
+    const outs = [_][]const u8{ &ks_secret, &ks_out[0], &ks_out[1], &ks_out[2] };
+    _ = try PKs.run("deriveHandshakeTrafficSecrets", ksHandshakeTraffic, .{}, &outs, .{});
+    _ = try PKs.run("deriveApplicationSecrets", ksApplication, .{}, &outs, .{});
+    _ = try PKs.run("deriveTrafficKeyIv", ksKeyIv, .{}, &[_][]const u8{ &ks_secret, &ks_key, &ks_iv }, .{});
+    _ = try PKs.run("deriveHandshakeSecretNoPsk", ksNoPsk, .{}, &[_][]const u8{ &ks_dhe, &ks_out[0] }, .{});
+    _ = try PKs.run("deriveMasterSecret", ksMaster, .{}, &outs, .{});
+    _ = try PKs.run("computeFinishedVerifyData", ksFinished, .{}, &outs, .{});
+}

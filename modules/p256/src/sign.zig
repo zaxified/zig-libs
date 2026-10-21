@@ -261,6 +261,29 @@ pub fn Ecdsa(comptime Hash: type) type {
                 return .{ .public_key = kp.public_key, .secret_key = kp.secret_key };
             }
         };
+
+        /// Sign `msg` with the secret scalar alone, into `out` (`noise` as
+        /// `KeyPair.sign`'s, by pointer). std's signer reads only the secret
+        /// key, so this skips the `d·G` that `KeyPair.fromSecretKeyInto`
+        /// computes for the public half — a server that signs once per
+        /// handshake with a key it loaded once paid it every time (14 µs of
+        /// a 326 µs qap connection, 2026-10-21). `error.IdentityElement` for
+        /// a scalar outside [1, n − 1]. Burned.
+        pub fn signWithSecretKey(out: *Signature, secret_key: *const SecretKey, msg: []const u8, noise: ?*const [noise_length]u8) StdSignError!void {
+            const r = signWithSecretKeyUnburned(out, secret_key, msg, noise);
+            burn.stack(burn.sign_burn);
+            return r;
+        }
+
+        noinline fn signWithSecretKeyUnburned(out: *Signature, secret_key: *const SecretKey, msg: []const u8, noise: ?*const [noise_length]u8) StdSignError!void {
+            // Branches only on whether the key is valid at all.
+            if (!KeyPair.scalarInRange(&secret_key.bytes)) return error.IdentityElement;
+            // std's `KeyPair.signer` hands only `secret_key` to its `Signer`;
+            // the base point stands in for the public half it never reads
+            // (a test pins the signatures to `KeyPair.sign`'s).
+            const kp: Std.KeyPair = .{ .public_key = .{ .p = P256.basePoint }, .secret_key = secret_key.* };
+            out.* = try kp.sign(msg, if (noise) |n| n.* else null);
+        }
     };
 }
 
@@ -856,6 +879,13 @@ test "KeyPair.generate: the range test keeps exactly 0 < d < n" {
         std.mem.writeInt(u256, &b, c.v, .big);
         try std.testing.expectEqual(c.ok, EcdsaP256Sha256.KeyPair.scalarInRange(&b));
     }
+    // `signWithSecretKey` refuses the same scalars `fromSecretKey` does.
+    for ([_]u256{ 0, n, std.math.maxInt(u256) }) |v| {
+        var sk: EcdsaP256Sha256.SecretKey = undefined;
+        std.mem.writeInt(u256, &sk.bytes, v, .big);
+        var sig: EcdsaP256Sha256.Signature = undefined;
+        try std.testing.expectError(error.IdentityElement, EcdsaP256Sha256.signWithSecretKey(&sig, &sk, "m", null));
+    }
     // A generated pair is consistent: its public key is d·G.
     const kp = EcdsaP256Sha256.KeyPair.generate(std.testing.io);
     const again = try EcdsaP256Sha256.KeyPair.fromSecretKey(kp.secret_key);
@@ -894,6 +924,11 @@ test "Ecdsa(Hash): signatures are byte-identical to std's Ecdsa(P256, Hash) for 
                 H.hash(&msg, &digest, .{});
                 const pre = try kp.signPrehashed(digest, nz);
                 try std.testing.expectEqualSlices(u8, &sig.toBytes(), &pre.toBytes());
+
+                // So is a signature from the secret key alone.
+                var alone: Ours.Signature = undefined;
+                try Ours.signWithSecretKey(&alone, &kp.secret_key, &msg, if (nz) |*n| n else null);
+                try std.testing.expectEqualSlices(u8, &sig.toBytes(), &alone.toBytes());
 
                 // A flipped message bit and a flipped signature bit are refused.
                 var bad_msg = msg;

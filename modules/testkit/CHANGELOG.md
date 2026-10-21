@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added:** `stackprobe.Expect.residue` (default `true`): `false` checks only
+  the needles, for a call whose frames below its burns may hold public data by design (a TLS
+  server's unburned client-certificate verification). Self-tested both ways: public residue
+  passes, a secret parked after the burn still fails.
+
 - **2026-10-21** — **Fix:** `bench.drive` closes its user-mode cycle counter (`Cycles.close`, new). A bench that calls `drive` once per workload left one counter open per call on the same thread; past the PMU's counters they were multiplexed and each read only part of the cycles, so later workloads' ratios came out too low (tlsserver's bench: workloads 4–6 at 0.35–0.54× by cycles while wall time said 0.46–0.90×). Benches calling `drive` once were not affected.
 
 - **2026-10-20** — **Added:** `bench.Work.fast_only` — a row whose `ref` side is the fastest candidate because the card's reference has no such workload (aescbc's CTS rows); it counts for `Summary.worst_fast`, never for the reference ratio. Since the 2026-10-17 move to `testkit.bench` such rows had gone into the reference ratio (aescbc read ref 1.21× Go from OpenSSL-only rows).

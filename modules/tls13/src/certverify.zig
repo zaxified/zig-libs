@@ -570,17 +570,17 @@ fn verifyEcdsaP256(pk: Ecdsa.EcdsaP256Sha256.PublicKey, content: []const u8, sig
 
 fn signEcdsaP256(sk: *const Ecdsa.EcdsaP256Sha256.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     const Fast = p256.EcdsaP256Sha256;
-    // fromSecretKey/sign only fail on a degenerate secret key (identity /
-    // non-canonical scalar) -- a key problem, mapped to KeyMismatch.
-    var key_pair: Fast.KeyPair = undefined;
-    defer std.crypto.secureZero(u8, &key_pair.secret_key.bytes);
-    Fast.KeyPair.fromSecretKeyInto(&key_pair, &.{ .bytes = sk.bytes }) catch return error.KeyMismatch;
+    // The secret scalar alone (no `d·G` per signature); it only fails on a
+    // degenerate secret key (outside [1, n − 1]) -- a key problem, mapped to
+    // KeyMismatch.
     var noise_buf: [Fast.noise_length]u8 = undefined;
-    const noise: ?[Fast.noise_length]u8 = if (random) |rnd| blk: {
+    defer std.crypto.secureZero(u8, &noise_buf);
+    const noise: ?*const [Fast.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
-        break :blk noise_buf;
+        break :blk &noise_buf;
     } else null; // null => std's fully deterministic nonce derivation
-    const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
+    var sig: Fast.Signature = undefined;
+    Fast.signWithSecretKey(&sig, &.{ .bytes = sk.bytes }, content, noise) catch return error.KeyMismatch;
     // RFC 8446 §4.3.2 mandates DER on the wire; `sign` pre-checked
     // out.len >= der_encoded_length_max.
     return sig.toDer(out[0..Fast.Signature.der_encoded_length_max]);
@@ -597,18 +597,17 @@ fn verifyEcdsaP384(pk: Ecdsa.EcdsaP384Sha384.PublicKey, content: []const u8, sig
 fn signEcdsaP384(sk: *const Ecdsa.EcdsaP384Sha384.SecretKey, content: []const u8, random: ?std.Random, out: []u8) SignError![]u8 {
     // Same shape as signEcdsaP256, over the P-384/SHA-384 instantiation
     // (noise_length is 48 here -- the curve's scalar length, not the caller's
-    // concern: it comes from the Scheme type). `fromSecretKeyInto` refuses a
+    // concern: it comes from the Scheme type). `signWithSecretKey` refuses a
     // scalar outside [1, n − 1].
     const Fast = p384.EcdsaP384Sha384;
-    var key_pair: Fast.KeyPair = undefined;
-    defer std.crypto.secureZero(u8, &key_pair.secret_key.bytes);
-    Fast.KeyPair.fromSecretKeyInto(&key_pair, &.{ .bytes = sk.bytes }) catch return error.KeyMismatch;
     var noise_buf: [Fast.noise_length]u8 = undefined;
-    const noise: ?[Fast.noise_length]u8 = if (random) |rnd| blk: {
+    defer std.crypto.secureZero(u8, &noise_buf);
+    const noise: ?*const [Fast.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
-        break :blk noise_buf;
+        break :blk &noise_buf;
     } else null; // null => RFC 6979 deterministic
-    const sig = key_pair.sign(content, noise) catch return error.KeyMismatch;
+    var sig: Fast.Signature = undefined;
+    Fast.signWithSecretKey(&sig, &.{ .bytes = sk.bytes }, content, noise) catch return error.KeyMismatch;
     return sig.toDer(out[0..Fast.Signature.der_encoded_length_max]);
 }
 

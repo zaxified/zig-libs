@@ -236,21 +236,7 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
         },
         secp256r1_group => try generateNist(p256.EcdsaP256Sha256, P256, random, out),
         secp384r1_group => try generateNist(p384.EcdsaP384Sha384, P384, random, out),
-        x25519_mlkem768_group => {
-            var kem_seed: [MlKem768.seed_length]u8 = undefined;
-            random.bytes(&kem_seed);
-            const kem_kp = MlKem768.KeyPair.generateDeterministic(kem_seed) catch {
-                std.crypto.secureZero(u8, &kem_seed);
-                return error.KeyExchangeFailed;
-            };
-            out.secret[0..MlKem768.seed_length].* = kem_seed;
-            std.crypto.secureZero(u8, &kem_seed);
-            const x_secret = out.secret[MlKem768.seed_length..][0..32];
-            random.bytes(x_secret);
-            X25519.recoverPublicKeyInto(out.public[MlKem768.PublicKey.encoded_length..][0..32], x_secret) catch return error.KeyExchangeFailed;
-            out.public[0..MlKem768.PublicKey.encoded_length].* = kem_kp.public_key.toBytes();
-            out.public_len = hybrid_client_share_len;
-        },
+        x25519_mlkem768_group => try hybridGenerate(random, out),
         mlkem1024_group => try mlkem1024Generate(random, out),
         else => return error.MissingKeyShare,
     }
@@ -259,7 +245,7 @@ fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
 /// The secp256r1 / secp384r1 arm of `generate`: `E` is the collection's
 /// `p256.EcdsaP256Sha256` / `p384.EcdsaP384Sha384` (its key pair is `d·G` on
 /// the fixed-base comb), `C` std's `P256` / `P384` for the range check.
-fn generateNist(comptime E: type, comptime C: type, random: std.Random, out: *KeyPair) Error!void {
+noinline fn generateNist(comptime E: type, comptime C: type, random: std.Random, out: *KeyPair) Error!void {
     const n = C.scalar.encoded_length;
     var tries: usize = 0;
     while (tries < 64) : (tries += 1) {
@@ -341,30 +327,7 @@ fn sharedSecretBody(group: u16, secret: []const u8, peer_share: []const u8, out:
             p384.ecdhInto(out.bytes[0..48], secret[0..48], peer_share) catch return error.KeyExchangeFailed;
             out.len = 48;
         },
-        x25519_mlkem768_group => {
-            if (secret.len < secret_len) return error.KeyExchangeFailed;
-            if (peer_share.len != hybrid_server_share_len) return error.MissingKeyShare;
-            // Re-expand the decapsulation key from its FIPS 203 seed (the
-            // stored private form — see `secret_len`); one keygen, tens of
-            // microseconds, once per handshake.
-            // Audit A1 (dtls) F5/LOW5: every SEED here is wiped on every
-            // exit, but the values derived from a seed are equally
-            // sufficient to recompute the session keys from a recorded
-            // handshake: `kem_kp` re-expands the FULL ML-KEM decapsulation
-            // key (~2.4 KB), and the two `ss_*` are the raw shared secrets.
-            // None is read again after this returns, so all three are wiped.
-            var kem_kp = MlKem768.KeyPair.generateDeterministic(secret[0..MlKem768.seed_length].*) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
-            var ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
-            defer std.crypto.secureZero(u8, &ss_pq);
-            X25519.scalarmultInto(
-                out.bytes[32..64],
-                secret[MlKem768.seed_length..][0..32],
-                peer_share[MlKem768.ciphertext_length..][0..32].*,
-            ) catch return error.KeyExchangeFailed;
-            out.bytes[0..32].* = ss_pq;
-            out.len = 64;
-        },
+        x25519_mlkem768_group => try hybridDecaps(secret, peer_share, out),
         mlkem1024_group => try mlkem1024Decaps(secret, peer_share, out),
         else => return error.MissingKeyShare,
     }
@@ -407,41 +370,86 @@ fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, ou
             out.public = kp.public;
             out.public_len = kp.public_len;
         },
-        x25519_mlkem768_group => {
-            if (peer_share.len != hybrid_client_share_len) return error.MissingKeyShare;
-            // FIPS 203 §7.2 encapsulation-key check: `fromBytes` rejects a
-            // non-canonical (out-of-modulus) key — peer-controlled bytes,
-            // typed error, never a panic.
-            const ek = MlKem768.PublicKey.fromBytes(peer_share[0..MlKem768.PublicKey.encoded_length]) catch return error.KeyExchangeFailed;
-            var encaps_seed: [MlKem768.encaps_seed_length]u8 = undefined;
-            random.bytes(&encaps_seed);
-            var enc = ek.encapsDeterministic(&encaps_seed);
-            std.crypto.secureZero(u8, &encaps_seed);
-            // Audit A1 (dtls) F5/LOW5: `enc.shared_secret`, `x.secret_key`
-            // and `ss_x` are the DERIVED values, equally sufficient to
-            // recompute the session keys from a recorded handshake, so they
-            // are wiped too. `enc.ciphertext` goes on the wire.
-            defer std.crypto.secureZero(u8, &enc.shared_secret);
-            var x_secret: [32]u8 = undefined;
-            random.bytes(&x_secret);
-            defer std.crypto.secureZero(u8, &x_secret);
-            X25519.recoverPublicKeyInto(out.public[MlKem768.ciphertext_length..][0..32], &x_secret) catch return error.KeyExchangeFailed;
-            // Same low-order/identity rejection as the classical arm — the
-            // X25519 half of a hybrid must not be poisonable either.
-            X25519.scalarmultInto(out.shared.bytes[32..64], &x_secret, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
-            out.public[0..MlKem768.ciphertext_length].* = enc.ciphertext;
-            out.public_len = hybrid_server_share_len;
-            out.shared.bytes[0..32].* = enc.shared_secret;
-            out.shared.len = 64;
-        },
+        x25519_mlkem768_group => try hybridEncaps(peer_share, random, out),
         mlkem1024_group => try mlkem1024Encaps(peer_share, random, out),
         else => return error.MissingKeyShare,
     }
 }
 
-// The ML-KEM-1024 arms, out of line: inlined into the bodies above, their
-// key structures would deepen the shared frame for every group (the stack
-// probe measured x25519's `serverExchange` at 161 KiB instead of 58).
+// The ML-KEM arms (X25519MLKEM768's and ML-KEM-1024's), out of line:
+// inlined into the bodies above, their key structures deepen the shared
+// frame for every group (the stack probe measured x25519's
+// `serverExchange` at 161 KiB instead of 58 with ML-KEM-1024 inline; with
+// the hybrid inline its curve work began 44 KiB down, 2026-10-21).
+
+noinline fn hybridGenerate(random: std.Random, out: *KeyPair) Error!void {
+    var kem_seed: [MlKem768.seed_length]u8 = undefined;
+    random.bytes(&kem_seed);
+    const kem_kp = MlKem768.KeyPair.generateDeterministic(kem_seed) catch {
+        std.crypto.secureZero(u8, &kem_seed);
+        return error.KeyExchangeFailed;
+    };
+    out.secret[0..MlKem768.seed_length].* = kem_seed;
+    std.crypto.secureZero(u8, &kem_seed);
+    const x_secret = out.secret[MlKem768.seed_length..][0..32];
+    random.bytes(x_secret);
+    X25519.recoverPublicKeyInto(out.public[MlKem768.PublicKey.encoded_length..][0..32], x_secret) catch return error.KeyExchangeFailed;
+    out.public[0..MlKem768.PublicKey.encoded_length].* = kem_kp.public_key.toBytes();
+    out.public_len = hybrid_client_share_len;
+}
+
+noinline fn hybridDecaps(secret: []const u8, peer_share: []const u8, out: *SharedSecret) Error!void {
+    if (secret.len < secret_len) return error.KeyExchangeFailed;
+    if (peer_share.len != hybrid_server_share_len) return error.MissingKeyShare;
+    // Re-expand the decapsulation key from its FIPS 203 seed (the
+    // stored private form — see `secret_len`); one keygen, tens of
+    // microseconds, once per handshake.
+    // Audit A1 (dtls) F5/LOW5: every SEED here is wiped on every
+    // exit, but the values derived from a seed are equally
+    // sufficient to recompute the session keys from a recorded
+    // handshake: `kem_kp` re-expands the FULL ML-KEM decapsulation
+    // key (~2.4 KB), and the two `ss_*` are the raw shared secrets.
+    // None is read again after this returns, so all three are wiped.
+    var kem_kp = MlKem768.KeyPair.generateDeterministic(secret[0..MlKem768.seed_length].*) catch return error.KeyExchangeFailed;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
+    var ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
+    defer std.crypto.secureZero(u8, &ss_pq);
+    X25519.scalarmultInto(
+        out.bytes[32..64],
+        secret[MlKem768.seed_length..][0..32],
+        peer_share[MlKem768.ciphertext_length..][0..32].*,
+    ) catch return error.KeyExchangeFailed;
+    out.bytes[0..32].* = ss_pq;
+    out.len = 64;
+}
+
+noinline fn hybridEncaps(peer_share: []const u8, random: std.Random, out: *ServerExchange) Error!void {
+    if (peer_share.len != hybrid_client_share_len) return error.MissingKeyShare;
+    // FIPS 203 §7.2 encapsulation-key check: `fromBytes` rejects a
+    // non-canonical (out-of-modulus) key — peer-controlled bytes,
+    // typed error, never a panic.
+    const ek = MlKem768.PublicKey.fromBytes(peer_share[0..MlKem768.PublicKey.encoded_length]) catch return error.KeyExchangeFailed;
+    var encaps_seed: [MlKem768.encaps_seed_length]u8 = undefined;
+    random.bytes(&encaps_seed);
+    var enc = ek.encapsDeterministic(&encaps_seed);
+    std.crypto.secureZero(u8, &encaps_seed);
+    // Audit A1 (dtls) F5/LOW5: `enc.shared_secret`, `x.secret_key`
+    // and `ss_x` are the DERIVED values, equally sufficient to
+    // recompute the session keys from a recorded handshake, so they
+    // are wiped too. `enc.ciphertext` goes on the wire.
+    defer std.crypto.secureZero(u8, &enc.shared_secret);
+    var x_secret: [32]u8 = undefined;
+    random.bytes(&x_secret);
+    defer std.crypto.secureZero(u8, &x_secret);
+    X25519.recoverPublicKeyInto(out.public[MlKem768.ciphertext_length..][0..32], &x_secret) catch return error.KeyExchangeFailed;
+    // Same low-order/identity rejection as the classical arm — the
+    // X25519 half of a hybrid must not be poisonable either.
+    X25519.scalarmultInto(out.shared.bytes[32..64], &x_secret, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
+    out.public[0..MlKem768.ciphertext_length].* = enc.ciphertext;
+    out.public_len = hybrid_server_share_len;
+    out.shared.bytes[0..32].* = enc.shared_secret;
+    out.shared.len = 64;
+}
 
 noinline fn mlkem1024Generate(random: std.Random, out: *KeyPair) Error!void {
     random.bytes(out.secret[0..MlKem1024.seed_length]);

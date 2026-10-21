@@ -381,6 +381,18 @@ pub fn Ecdsa(comptime Hash: type) type {
             }
         };
 
+        /// Sign `msg` with the secret scalar alone, into `out` (`noise` as
+        /// `KeyPair.sign`'s, by pointer): the signature never needs the
+        /// public half, so this skips the `d·G` of `KeyPair.fromSecretKeyInto`
+        /// for a caller that keeps only the secret key (a TLS server signing
+        /// once per handshake). `error.NonCanonical` / `error.IdentityElement`
+        /// as `fromSecretKey`. Burned.
+        pub fn signWithSecretKey(out: *Signature, secret_key: *const SecretKey, msg: []const u8, noise: ?*const [noise_length]u8) SignError!void {
+            var h: [Hash.digest_length]u8 = undefined;
+            Hash.hash(msg, &h, .{});
+            return burn.run(burn.sign_burn, SignError!void, signCore, .{ out, &secret_key.bytes, &h, noise });
+        }
+
         /// bits2int(h) mod n (RFC 6979 §2.3.2): a digest of up to 48 bytes
         /// is the integer itself, a longer one its leftmost 48 bytes
         /// (qlen = 384 is a whole number of bytes, so no bit shift).

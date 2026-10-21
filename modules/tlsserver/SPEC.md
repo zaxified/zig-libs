@@ -908,11 +908,14 @@ per-record 4 KiB burn).
   `bad_certificate` (rustls: `decrypt_error`); 4 KiB of `peer_buf` per `Server` (gone
   2026-10-21: the caller's buffer, only under client authentication).
 
-- `burn.handshake_burn` (32 KiB around each handshake step since client certificates, when the
-  ticket plaintext and blob were stack buffers holding a client leaf — since 2026-10-21 they are
-  not) is a margin, not a measured depth: the stack
-  probe does not drive the server yet. The client Certificate and CertificateVerify steps run
-  unburned: they touch no secret.
+- `burn.handshake_burn` (16 KiB around each handshake step) is measured since 2026-10-21: a
+  stack probe in `src/interop_replay_test.zig` replays recorded handshakes (full, hybrid, HRR,
+  resumed, mTLS, RSA, P-384, Ed25519) through `Connection.handshake` in ReleaseFast; the steps
+  reach 10.2 KiB below the burn. Its first run failed: the steps reached 3 KiB past the then
+  32 KiB burn, because `onClientHello` held two 8 KiB duplicate bitsets (extension types in the
+  inlined ClientHello parse, key-share groups) — both out of line now. The client Certificate
+  and CertificateVerify steps run unburned (they touch no secret; their verifier frames reach
+  ~190 KiB down), so the mTLS cases are probed for needles only (`Expect.residue = false`).
 - `tlsserver-server` drives `Server` only through recorded clients (plus resealed Finished);
   a model client that builds ClientHellos from fields (as `tlsserver-hello` does) is not there.
 - Independent read-only review 2026-10-20 (Sonnet, of server/inbound/outbound): no HIGH; the

@@ -160,6 +160,11 @@ test "RFC 6979 A.2.6: P-384, SHA-1/224/256/384/512, \"sample\" and \"test\"" {
         try testing.expectEqualSlices(u8, &hex(48, c[3]), &sig.r);
         try testing.expectEqualSlices(u8, &hex(48, c[4]), &sig.s);
         try sig.verify(c[1], kp.public_key);
+        // The secret key alone gives the same signature.
+        var alone: E.Signature = undefined;
+        try E.signWithSecretKey(&alone, &.{ .bytes = x }, c[1], null);
+        try testing.expectEqualSlices(u8, &sig.r, &alone.r);
+        try testing.expectEqualSlices(u8, &sig.s, &alone.s);
         // With the RFC's k given explicitly the same signature results.
         var digest: [H.digest_length]u8 = undefined;
         H.hash(c[1], &digest, .{});
@@ -296,6 +301,9 @@ test "refusals: zero secret key, zero r or s, non-strict DER signatures" {
     var bad_kp = kp;
     bad_kp.secret_key.bytes = zero;
     try testing.expectError(error.IdentityElement, bad_kp.sign("m", null));
+    var sig_sink: E.Signature = undefined;
+    try testing.expectError(error.IdentityElement, E.signWithSecretKey(&sig_sink, &.{ .bytes = zero }, "m", null));
+    try testing.expectError(error.NonCanonical, E.signWithSecretKey(&sig_sink, &.{ .bytes = @splat(0xff) }, "m", null));
 
     const sig = try kp.sign("m", null);
     var bad = sig;

@@ -28,7 +28,7 @@ modules/dnssec/src/ds.zig	1	0
 modules/dtls/src/Connection.zig	4	8
 # tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
 modules/tls13/src/certverify.zig	1	2
-modules/tls13/src/keyschedule.zig	2	3
+modules/tls13/src/keyschedule.zig	2	4
 modules/ecvrf/src/ecvrf.zig	1	5
 modules/idempotency/src/root.zig	2	7
 modules/iec62351/src/acse.zig	1	0

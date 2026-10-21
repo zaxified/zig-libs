@@ -1554,10 +1554,39 @@ pub const Server = struct {
         }
     }
 
+    /// The client's share for `group`, if any, after checking every share:
+    /// one per group, each for a group in supported_groups. Out of line:
+    /// its 8 KiB bitset of the groups seen (any u16 may come) would deepen
+    /// `onClientHello`'s frame, and every secret-holding frame below it,
+    /// past `burn.handshake_burn` (stack probe, 2026-10-21). Public data
+    /// only, so its own frame needs no burn.
+    noinline fn findShare(shares_in: hello.KeyShareIter, gs: hello.U16Iter, group: u16) Error!?[]const u8 {
+        var shares = shares_in;
+        var seen: std.StaticBitSet(1 << 16) = .empty;
+        var share: ?[]const u8 = null;
+        while (shares.next()) |e| {
+            if (seen.isSet(e.group)) return error.IllegalParameter;
+            seen.set(e.group);
+            // RFC 8446 §4.2.8: a share only for a group in supported_groups
+            // (the server MAY check; rustls does not), and never for an
+            // obsolete_RESERVED one (§4.2.7: "MUST NOT be offered or
+            // negotiated by TLS 1.3 implementations"). Obsolete groups in
+            // supported_groups alone are let through: JDK 11 lists sect*
+            // and secp256k1 beside TLS 1.3 (BoGo `Server-JDK11-*`), so the
+            // stricter tlsfuzzer `test-tls13-obsolete-curves` would cut it off.
+            if (!gs.contains(e.group) or isObsoleteGroup(e.group)) return error.IllegalParameter;
+            if (e.group == group) share = e.key_exchange;
+        }
+        return share;
+    }
+
     fn onClientHello(self: *Server, m: inbound.HandshakeMessage) Error!void {
         const cfg = self.config;
         const retried = self.state == .client_hello_retry;
-        const ch = hello.parseClientHello(m.body) catch |err| return switch (err) {
+        // Out of line, as `findShare`: the parse keeps an 8 KiB bitset of
+        // the extension types seen, which inlined here put every frame
+        // below this one (kex, signing, the key schedule) 8 KiB deeper.
+        const ch = @call(.never_inline, hello.parseClientHello, .{m.body}) catch |err| return switch (err) {
             error.DecodeError => error.DecodeError,
             error.IllegalParameter => error.IllegalParameter,
         };
@@ -1605,22 +1634,8 @@ pub const Server = struct {
         if (retried) group = self.group;
 
         if (ch.legacy_compression_methods.len != 1) return error.IllegalParameter;
-        var shares = ch.keyShares() orelse return error.MissingExtension;
-        var seen: std.StaticBitSet(1 << 16) = .empty;
-        var share: ?[]const u8 = null;
-        while (shares.next()) |e| {
-            if (seen.isSet(e.group)) return error.IllegalParameter;
-            seen.set(e.group);
-            // RFC 8446 §4.2.8: a share only for a group in supported_groups
-            // (the server MAY check; rustls does not), and never for an
-            // obsolete_RESERVED one (§4.2.7: "MUST NOT be offered or
-            // negotiated by TLS 1.3 implementations"). Obsolete groups in
-            // supported_groups alone are let through: JDK 11 lists sect*
-            // and secp256k1 beside TLS 1.3 (BoGo `Server-JDK11-*`), so the
-            // stricter tlsfuzzer `test-tls13-obsolete-curves` would cut it off.
-            if (!gs.contains(e.group) or isObsoleteGroup(e.group)) return error.IllegalParameter;
-            if (e.group == group) share = e.key_exchange;
-        }
+        const shares = ch.keyShares() orelse return error.MissingExtension;
+        const share = try findShare(shares, gs, group);
         // RFC 8446 §4.2.10: no early data after a HelloRetryRequest.
         if (retried and ch.early_data) return error.IllegalParameter;
         const client_share = share orelse {
@@ -1774,8 +1789,7 @@ pub const Server = struct {
         // §4.2.11.2: the transcript through the ClientHello up to its
         // binders (after a HelloRetryRequest, message_hash and the HRR too).
         const th = H.transcript(&self.transcript).wouldBeHash(@backingInt(messages.HandshakeType.client_hello), body.len, body[0..offer.binders_offset]);
-        var empty_hash: [L]u8 = undefined;
-        H.Hash.hash("", &empty_hash, .{});
+        const empty_hash = tls13.keyschedule.emptyTranscriptHash(H.Hash);
 
         const now_ms = tk.clock.now_ms(tk.clock.ctx);
         var want: Resumable = .{
@@ -1795,7 +1809,7 @@ pub const Server = struct {
         defer zeroize(scratch[0..ticket_head_len]);
         var sel: tlsresume.select.Selection(L) = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
-        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, scratch) catch |err| return switch (err) {
+        tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, scratch) catch |err| return switch (err) {
             error.NoAcceptableIdentity => false,
             error.BinderMismatch => error.DecryptError,
         };
@@ -1969,7 +1983,7 @@ pub const Server = struct {
         const t = H.transcript(&self.transcript);
         t.append(client_hello_raw[0], client_hello_raw[4..]);
         // RFC 8446 §7.1: client_early_traffic_secret over the ClientHello.
-        const ch_hash = t.currentHash();
+        const ch_hash = if (early) t.currentHash() else undefined;
 
         var random: [32]u8 = undefined;
         cfg.random.bytes(&random);
@@ -1982,16 +1996,19 @@ pub const Server = struct {
         })));
         if (ccs) try self.out.write(.change_cipher_spec, &.{1});
 
-        // RFC 8446 §7.1: the PSK, or zeros.
+        // RFC 8446 §7.1: the PSK, or zeros (whose early secret's salt is a
+        // constant).
         const L = H.len;
-        var empty_hash: [L]u8 = undefined;
-        H.Hash.hash("", &empty_hash, .{});
+        const empty_hash = tls13.keyschedule.emptyTranscriptHash(H.Hash);
         var early_secret: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &early_secret);
-        const zeros: [L]u8 = @splat(0);
-        tls13.keyschedule.earlySecret(H.Hkdf, &early_secret, psk orelse &zeros);
         const hs = self.handshake_secret[0..L];
-        ks.deriveHandshakeSecret(H.Hkdf, hs, &early_secret, &empty_hash, ex.shared.slice());
+        if (psk) |k| {
+            tls13.keyschedule.earlySecret(H.Hkdf, &early_secret, k);
+            ks.deriveHandshakeSecret(H.Hkdf, hs, &early_secret, empty_hash, ex.shared.slice());
+        } else {
+            ks.deriveHandshakeSecretNoPsk(H.Hkdf, hs, ex.shared.slice());
+        }
         var server_hs: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &server_hs);
         var th = t.currentHash();
@@ -2071,10 +2088,9 @@ pub const Server = struct {
         // Application secrets over the transcript through the server's
         // Finished; the server sends under its application key from here.
         const ms = self.master_secret[0..L];
-        ks.deriveMasterSecret(H.Hkdf, ms, hs, &empty_hash);
+        ks.deriveMasterSecret(H.Hkdf, ms, hs, empty_hash);
         th = t.currentHash();
-        ks.deriveApplicationTrafficSecrets(H.Hkdf, self.client_application_secret[0..L], self.server_application_secret[0..L], ms, &th);
-        ks.deriveExporterMasterSecret(H.Hkdf, self.exporter_master_secret[0..L], ms, &th);
+        ks.deriveApplicationSecrets(H.Hkdf, self.client_application_secret[0..L], self.server_application_secret[0..L], self.exporter_master_secret[0..L], ms, &th);
         self.out.installTx(self.suite, self.server_application_secret[0..L]) catch return error.InternalError;
     }
 

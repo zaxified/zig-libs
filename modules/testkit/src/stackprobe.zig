@@ -109,6 +109,11 @@ pub const Expect = struct {
     /// The entry point burns (a zero run must exist). `false` for a call
     /// that needs no burn and is probed for needles only.
     burn: bool = true,
+    /// Residue fails the probe. `false` for a call whose frames below its
+    /// burns may hold only public data by design — a server's handshake
+    /// that verified a peer's certificate chain and signature in unburned
+    /// steps — so only the needles (the secrets) are checked.
+    residue: bool = true,
     /// No report on stderr when the probe fails: for a positive control that
     /// is expected to fail (a lane treats stderr from a passing test as a
     /// failure).
@@ -398,7 +403,7 @@ pub fn Probe(comptime cfg: Config) type {
                 return error.TooManyNeedles;
             }
             const no_burn = expect.burn and total.burn_top == 0;
-            const bad = total.needle_hits != 0 or total.residue_bytes != 0 or no_burn;
+            const bad = total.needle_hits != 0 or (expect.residue and total.residue_bytes != 0) or no_burn;
             if (cfg.verbose or (bad and !expect.quiet)) {
                 std.debug.print(
                     "\n=== STACKPROBE {s} ({t}): needles {d} ({d} windows, {d}..{d} B deep), residue {d} B (to {d} B), " ++
@@ -475,6 +480,38 @@ test "stackprobe: residue under a too-short burn fails on its own (no needle, a 
     try skipUnlessOptimized();
     std.crypto.hash.sha2.Sha384.hash("testkit stackprobe residue", &t_secret, .{});
     try std.testing.expectError(error.DeadStackResidue, T.run("short burn (expected to fail)", shortBurnedEntry, .{ &t_secret, &t_out }, &.{&t_secret}, .{ .quiet = true }));
+}
+
+noinline fn leakSecret(secret: *const [48]u8) void {
+    var local: [512]u8 = @splat(0);
+    local[64..][0..48].* = secret.*;
+    std.mem.doNotOptimizeAway(&local);
+}
+
+/// Public octets written only at the deep end of a frame below the burn,
+/// so the burn's zero run above them stays whole.
+noinline fn publicDeepTail() void {
+    var local: [6144]u8 = undefined;
+    for (local[0..256], 0..) |*b, j| b.* = @truncate(j *% 151 +% 3);
+    std.mem.doNotOptimizeAway(&local);
+}
+
+fn publicResidueEntry(secret: *const [48]u8, out: *[32]u8) void {
+    goodEntry(secret, out);
+    publicDeepTail(); // public frames after the burn
+}
+
+fn leakAfterBurnEntry(secret: *const [48]u8, out: *[32]u8) void {
+    goodEntry(secret, out);
+    leakSecret(secret);
+}
+
+test "stackprobe: `residue = false` lets public residue pass, never a needle" {
+    try skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha384.hash("testkit stackprobe public", &t_secret, .{});
+    try std.testing.expectError(error.DeadStackResidue, T.run("public residue (expected to fail)", publicResidueEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{ .quiet = true }));
+    _ = try T.run("public residue allowed", publicResidueEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{ .residue = false });
+    try std.testing.expectError(error.DeadStackResidue, T.run("secret after the burn (expected to fail)", leakAfterBurnEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{ .residue = false, .quiet = true }));
 }
 
 test "analyse: residue counts bytes that are neither zero nor paint, below the burn" {

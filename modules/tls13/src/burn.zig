@@ -34,18 +34,22 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
     return r;
 }
 
-/// `keyschedule` building blocks: one HKDF-Expand / Extract / HMAC with a
-/// handful of 32..48-byte locals, one-shot per handshake step. Generous
-/// margin, not a measured depth (the value dtls used since 2026-10-08).
-pub const ks_burn = 8 * 1024;
+/// `keyschedule` building blocks: HKDF-Expand / Extract / HMAC with a
+/// handful of 32..48-byte locals, ~15 per handshake. Deepest 3.1 KiB
+/// (`deriveMasterSecret`, its inner `deriveSecret` unburned) of the
+/// handshake steps in `stackprobe_test.zig`, ReleaseFast, 2026-10-21; ~2x.
+/// Was 8 KiB, a margin from dtls (2026-10-08).
+pub const ks_burn = 6 * 1024;
 
 // `certverify.sign` signers, moved with the file from `dtls/src/burn.zig`
 // (2026-10-20); depths measured there, by dtls's `stackprobe_test.zig`.
 
-/// ECDSA through std's `Ecdsa(P256, Sha256)` / `Ecdsa(P384, Sha384)`:
-/// `signEcdsaP256` dirtied 38.6 KiB, `signEcdsaP384` 34.1 KiB in ReleaseFast
-/// (2026-10-08). One size for both.
-pub const ecdsa_burn = 48 * 1024;
+/// ECDSA on the collection's `p256` / `p384` / `p521`, which burn their
+/// own signing frames (`sign_burn`): the frames left to this burn reach
+/// 2.1 / 2.3 / 2.8 KiB (ReleaseFast, `stackprobe_test.zig` with this burn
+/// off, 2026-10-21); ~3x. Was 48 KiB while the signers were std's (38.6 KiB
+/// for P-256, 2026-10-08) — 1.4 µs of zeroing per handshake.
+pub const ecdsa_burn = 8 * 1024;
 
 /// `signEd25519` (std `Ed25519.KeyPair.generateDeterministic` + `sign`)
 /// dirtied 33.8 KiB in ReleaseFast (2026-10-08).
@@ -65,21 +69,24 @@ pub const mldsa_verify_burn = .{ .mldsa44 = 208 * 1024, .mldsa65 = 288 * 1024, .
 pub const rsa_burn = 8 * 1024;
 
 // `kex` entry points, per group (the group is a runtime value, so each arm
-// instantiates its own burn). Depths are the dirty stack of the unburned
-// bodies in ReleaseFast, from `stackprobe_test.zig` (2026-10-20), as
-// generate / serverExchange / sharedSecret; each burn is ~1.6-2x the deepest,
-// rounded. `serverExchange` is the deepest of the curve arms because its
-// keygen and multiplication are inlined into one frame.
+// instantiates its own burn). Depths: how deep this module's frames leave
+// non-zero bytes with these burns off (`stackprobe_test.zig`, ReleaseFast,
+// 2026-10-21), as generate / serverExchange / sharedSecret; each burn is
+// ~1.5-2x the deepest, rounded. The curve groups compute on `ct25519` /
+// `p256` / `p384`, which burn their own frames, and the ML-KEM arms are out
+// of line, so a curve arm's own frames are ~2 KiB. (2026-10-20, with std's
+// curves and the hybrid arms inline, they were 18-67 KiB, the burns
+// 96-112 KiB: ~5 µs of zeroing per handshake.)
 
-/// x25519: 18.0 / 58.2 / 30.8 KiB.
-pub const kex_x25519_burn = 96 * 1024;
-/// secp256r1 (std P-256): 24.0 / 64.1 / 36.8 KiB.
-pub const kex_p256_burn = 112 * 1024;
-/// secp384r1 (std P-384): 27.4 / 66.5 / 39.8 KiB.
-pub const kex_p384_burn = 112 * 1024;
-/// X25519MLKEM768 (ML-KEM-768 keygen / encaps / decaps plus X25519):
-/// 61.4 / 60.9 / 77.6 KiB.
+/// x25519: 0.3 / 2.0 / 0.2 KiB.
+pub const kex_x25519_burn = 4 * 1024;
+/// secp256r1: 0.7 / 2.0 / 0.2 KiB.
+pub const kex_p256_burn = 4 * 1024;
+/// secp384r1: 1.6 / 2.0 / 0.2 KiB.
+pub const kex_p384_burn = 4 * 1024;
+/// X25519MLKEM768 (std's ML-KEM-768 keygen / encaps / decaps plus X25519):
+/// 58.1 / 57.2 / 90.8 KiB.
 pub const kex_hybrid_burn = 160 * 1024;
-/// MLKEM1024 (ML-KEM-1024 keygen / encaps / decaps, out of line):
-/// 114.1 / 103.9 / 184.9 KiB.
+/// MLKEM1024 (std's ML-KEM-1024 keygen / encaps / decaps):
+/// 98.4 / 78.1 / 137.2 KiB.
 pub const kex_mlkem1024_burn = 256 * 1024;

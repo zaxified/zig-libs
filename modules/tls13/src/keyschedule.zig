@@ -115,6 +115,103 @@ fn expandLabelSliceBody(
     Hkdf.expand(out, info_buf[0..i], secret.*);
 }
 
+/// The hash under an HKDF instance (`std.crypto.kdf.hkdf.Hkdf(Hmac)` names
+/// neither; `extractInit` returns the `Hmac`, whose `hash` field is it).
+fn HashOf(comptime Hkdf: type) type {
+    const Hmac = @typeInfo(@TypeOf(Hkdf.extractInit)).@"fn".return_type.?;
+    return @FieldType(Hmac, "hash");
+}
+
+/// HKDF-Expand-Label over one secret with HMAC's two key pads absorbed once
+/// (RFC 2104 §4's precomputation). std's `Hmac` hashes both pads on every
+/// call, so an expansion of up to one hash length is four compressions;
+/// over a `Prk` it is two (the info block and the inner digest) after the
+/// two of `init`. Pays from the second label over the same secret on (the
+/// handshake's SHA-384 schedule: ~25 compressions fewer, 2026-10-21). The
+/// pads are the secret's image: `wipe` when done; used only inside burned
+/// bodies.
+fn Prk(comptime Hkdf: type) type {
+    const Hash = HashOf(Hkdf);
+    comptime std.debug.assert(Hkdf.prk_length == Hash.digest_length);
+    comptime std.debug.assert(Hash.digest_length <= Hash.block_length);
+    return struct {
+        const Self = @This();
+
+        inner: Hash,
+        outer: Hash,
+
+        fn init(out: *Self, secret: *const [Hkdf.prk_length]u8) void {
+            // A key no longer than a block is zero-padded (RFC 2104 §2).
+            var i_pad: [Hash.block_length]u8 = @splat(0x36);
+            var o_pad: [Hash.block_length]u8 = @splat(0x5c);
+            defer std.crypto.secureZero(u8, &i_pad);
+            defer std.crypto.secureZero(u8, &o_pad);
+            for (secret, 0..) |b, i| {
+                i_pad[i] ^= b;
+                o_pad[i] ^= b;
+            }
+            out.inner = Hash.init(.{});
+            out.inner.update(&i_pad);
+            out.outer = Hash.init(.{});
+            out.outer.update(&o_pad);
+        }
+
+        /// `expandLabelBody` for an output of one HKDF block: `T(1) =
+        /// HMAC(secret, HkdfLabel || 0x01)`.
+        fn expandLabel(self: *const Self, comptime prefix: []const u8, comptime len: usize, out: *[len]u8, label: []const u8, context: []const u8) void {
+            comptime std.debug.assert(len <= Hash.digest_length);
+            std.debug.assert(prefix.len + label.len <= 255);
+            std.debug.assert(context.len <= 255);
+
+            var info_buf: [2 + 1 + 255 + 1 + 255 + 1]u8 = undefined;
+            std.mem.writeInt(u16, info_buf[0..2], @intCast(len), .big);
+            info_buf[2] = @intCast(prefix.len + label.len);
+            var i: usize = 3;
+            @memcpy(info_buf[i..][0..prefix.len], prefix);
+            i += prefix.len;
+            @memcpy(info_buf[i..][0..label.len], label);
+            i += label.len;
+            info_buf[i] = @intCast(context.len);
+            i += 1;
+            @memcpy(info_buf[i..][0..context.len], context);
+            i += context.len;
+            info_buf[i] = 1;
+            i += 1;
+
+            var h = self.inner;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+            h.update(info_buf[0..i]);
+            var digest: [Hash.digest_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &digest);
+            h.final(&digest);
+            h = self.outer;
+            h.update(&digest);
+            h.final(&digest);
+            out.* = digest[0..len].*;
+        }
+
+        fn wipe(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(self));
+        }
+    };
+}
+
+/// `Hash("")`, the transcript hash of no messages, as a constant (SHA-256 or
+/// SHA-384; tested against the hash).
+pub fn emptyTranscriptHash(comptime Hash: type) *const [Hash.digest_length]u8 {
+    return switch (Hash.digest_length) {
+        32 => comptime &hexConst(32, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        48 => comptime &hexConst(48, "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"),
+        else => @compileError("emptyTranscriptHash: SHA-256 or SHA-384"),
+    };
+}
+
+fn hexConst(comptime n: usize, comptime s: []const u8) [n]u8 {
+    var out: [n]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, s) catch unreachable;
+    return out;
+}
+
 fn exportKeyingMaterialBody(
     comptime Hash: type,
     comptime Hkdf: type,
@@ -302,8 +399,55 @@ pub fn Schedule(comptime prefix: []const u8) type {
             handshake_secret: *const [Hkdf.prk_length]u8,
             transcript_hash_through_server_hello: []const u8,
         ) void {
-            deriveSecret(Hkdf, out_client, handshake_secret, "c hs traffic", transcript_hash_through_server_hello);
-            deriveSecret(Hkdf, out_server, handshake_secret, "s hs traffic", transcript_hash_through_server_hello);
+            burn.run(burn.ks_burn, void, deriveSecretsBody, .{ Hkdf, 2, [_]*[Hkdf.prk_length]u8{ out_client, out_server }, handshake_secret, [_][]const u8{ "c hs traffic", "s hs traffic" }, transcript_hash_through_server_hello });
+        }
+
+        /// `Derive-Secret` of each label over one secret and one transcript
+        /// hash, the pads hashed once (`Prk`). The outputs may alias
+        /// `secret`.
+        fn deriveSecretsBody(
+            comptime Hkdf: type,
+            comptime n: usize,
+            outs: [n]*[Hkdf.prk_length]u8,
+            secret: *const [Hkdf.prk_length]u8,
+            labels: [n][]const u8,
+            transcript_hash: []const u8,
+        ) void {
+            var prk: Prk(Hkdf) = undefined;
+            defer prk.wipe();
+            prk.init(secret);
+            for (outs, labels) |o, l| prk.expandLabel(prefix, Hkdf.prk_length, o, l, transcript_hash);
+        }
+
+        /// RFC 8446 §7.1's handshake secret of a handshake WITHOUT a PSK:
+        /// its early secret and that secret's `"derived"` salt depend on the
+        /// hash alone, so the salt is a constant here (`noPskDerivedSalt`)
+        /// and only `HKDF-Extract(salt, dhe_shared_secret)` runs — the same
+        /// value as `deriveHandshakeSecret` over `earlySecret(0^L)`, nine
+        /// compressions fewer. `out` may alias nothing secret.
+        pub fn deriveHandshakeSecretNoPsk(
+            comptime Hkdf: type,
+            out: *[Hkdf.prk_length]u8,
+            dhe_shared_secret: []const u8,
+        ) void {
+            burn.run(burn.ks_burn, void, deriveHandshakeSecretNoPskBody, .{ Hkdf, out, dhe_shared_secret });
+        }
+
+        fn deriveHandshakeSecretNoPskBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, dhe_shared_secret: []const u8) void {
+            out.* = Hkdf.extract(noPskDerivedSalt(Hkdf), dhe_shared_secret);
+        }
+
+        /// `Derive-Secret(HKDF-Extract(0^L, 0^L), "derived", "")` — public,
+        /// a function of the hash and the label prefix only. Values from an
+        /// independent Python `hmac`/`hashlib` computation (SHA-256 `tls13 `
+        /// is RFC 8448 §3's); a test recomputes them.
+        pub fn noPskDerivedSalt(comptime Hkdf: type) *const [Hkdf.prk_length]u8 {
+            const tls = comptime std.mem.eql(u8, prefix, tls13_prefix);
+            return switch (Hkdf.prk_length) {
+                32 => comptime &hexConst(32, if (tls) "6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba" else "b17bce9451ee8bc6e8aebc0aa9e98295677a4a6a91f78440833146e465f2ff95"),
+                48 => comptime &hexConst(48, if (tls) "1591dac5cbbf0330a4a84de9c753330e92d01f0a88214b4464972fd668049e93e52f2b16fad922fdc0584478428f282b" else "27008605d3396f8844197565caecc592b3e58f2eae55f841b577cfbcabb47e221f674ed3a68aa893439cf557f111c0fc"),
+                else => @compileError("noPskDerivedSalt: SHA-256 or SHA-384"),
+            };
         }
 
         /// RFC 8446 §7.1: `master_secret = HKDF-Extract(salt =
@@ -341,8 +485,20 @@ pub fn Schedule(comptime prefix: []const u8) type {
             master_secret: *const [Hkdf.prk_length]u8,
             transcript_hash_through_server_finished: []const u8,
         ) void {
-            deriveSecret(Hkdf, out_client, master_secret, "c ap traffic", transcript_hash_through_server_finished);
-            deriveSecret(Hkdf, out_server, master_secret, "s ap traffic", transcript_hash_through_server_finished);
+            burn.run(burn.ks_burn, void, deriveSecretsBody, .{ Hkdf, 2, [_]*[Hkdf.prk_length]u8{ out_client, out_server }, master_secret, [_][]const u8{ "c ap traffic", "s ap traffic" }, transcript_hash_through_server_finished });
+        }
+
+        /// `deriveApplicationTrafficSecrets` and `deriveExporterMasterSecret`
+        /// in one: the three labels over the master secret share its pads.
+        pub fn deriveApplicationSecrets(
+            comptime Hkdf: type,
+            out_client: *[Hkdf.prk_length]u8,
+            out_server: *[Hkdf.prk_length]u8,
+            out_exporter: *[Hkdf.prk_length]u8,
+            master_secret: *const [Hkdf.prk_length]u8,
+            transcript_hash_through_server_finished: []const u8,
+        ) void {
+            burn.run(burn.ks_burn, void, deriveSecretsBody, .{ Hkdf, 3, [_]*[Hkdf.prk_length]u8{ out_client, out_server, out_exporter }, master_secret, [_][]const u8{ "c ap traffic", "s ap traffic", "exp master" }, transcript_hash_through_server_finished });
         }
 
         /// RFC 8446 §7.1: `exporter_master_secret = Derive-Secret(master,
@@ -443,8 +599,22 @@ pub fn Schedule(comptime prefix: []const u8) type {
             out_iv: *[iv_len]u8,
             traffic_secret: *const [Hkdf.prk_length]u8,
         ) void {
-            hkdfExpandLabel(Hkdf, key_len, out_key, traffic_secret, "key", "");
-            hkdfExpandLabel(Hkdf, iv_len, out_iv, traffic_secret, "iv", "");
+            burn.run(burn.ks_burn, void, deriveTrafficKeyIvBody, .{ Hkdf, key_len, iv_len, out_key, out_iv, traffic_secret });
+        }
+
+        fn deriveTrafficKeyIvBody(
+            comptime Hkdf: type,
+            comptime key_len: usize,
+            comptime iv_len: usize,
+            out_key: *[key_len]u8,
+            out_iv: *[iv_len]u8,
+            traffic_secret: *const [Hkdf.prk_length]u8,
+        ) void {
+            var prk: Prk(Hkdf) = undefined;
+            defer prk.wipe();
+            prk.init(traffic_secret);
+            prk.expandLabel(prefix, key_len, out_key, "key", "");
+            prk.expandLabel(prefix, iv_len, out_iv, "iv", "");
         }
     };
 }
@@ -853,4 +1023,93 @@ test "tls13 instance: KeyUpdate's traffic upd equals std's hardcoded-tls13 expan
     var d256: [32]u8 = undefined;
     dtls13.nextApplicationTrafficSecret(HkdfSha256, &d256, &s256);
     try testing.expect(!std.mem.eql(u8, &n256, &d256));
+}
+
+test "Prk.expandLabel equals HKDF-Expand-Label (both hashes, both prefixes, every output length)" {
+    var prng = std.Random.DefaultPrng.init(0x7a11);
+    const r = prng.random();
+    inline for (.{ HkdfSha256, std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384) }) |Hkdf| {
+        inline for (.{ tls13_prefix, dtls13_prefix }) |prefix| {
+            var secret: [Hkdf.prk_length]u8 = undefined;
+            var label_buf: [255 - prefix.len]u8 = undefined;
+            var ctx_buf: [255]u8 = undefined;
+            for (0..40) |_| {
+                r.bytes(&secret);
+                const label = label_buf[0..r.uintAtMost(usize, label_buf.len)];
+                r.bytes(label);
+                const ctx = ctx_buf[0..r.uintAtMost(usize, ctx_buf.len)];
+                r.bytes(ctx);
+                var prk: Prk(Hkdf) = undefined;
+                prk.init(&secret);
+                inline for (1..Hkdf.prk_length + 1) |len| {
+                    var want: [len]u8 = undefined;
+                    expandLabelBody(Hkdf, prefix, len, &want, &secret, label, ctx);
+                    var got: [len]u8 = undefined;
+                    prk.expandLabel(prefix, len, &got, label, ctx);
+                    try testing.expectEqualSlices(u8, &want, &got);
+                }
+                prk.wipe();
+                try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&prk), 0));
+            }
+        }
+    }
+}
+
+test "emptyTranscriptHash and noPskDerivedSalt are the values they stand for" {
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+    const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+    try testing.expectEqualSlices(u8, &emptyHash(), emptyTranscriptHash(Sha256));
+    var e384: [48]u8 = undefined;
+    Sha384.hash("", &e384, .{});
+    try testing.expectEqualSlices(u8, &e384, emptyTranscriptHash(Sha384));
+    inline for (.{ .{ HkdfSha256, Sha256 }, .{ Hkdf384, Sha384 } }) |c| {
+        const Hkdf = c[0];
+        const L = Hkdf.prk_length;
+        inline for (.{ tls13, dtls13 }) |S| {
+            var early: [L]u8 = undefined;
+            earlySecret(Hkdf, &early, &@as([L]u8, @splat(0)));
+            var salt: [L]u8 = undefined;
+            S.deriveSecret(Hkdf, &salt, &early, "derived", emptyTranscriptHash(c[1]));
+            try testing.expectEqualSlices(u8, &salt, S.noPskDerivedSalt(Hkdf));
+            // And the handshake secret over it is deriveHandshakeSecret's.
+            const dhe: [32]u8 = @splat(0x3c);
+            var want: [L]u8 = undefined;
+            S.deriveHandshakeSecret(Hkdf, &want, &early, emptyTranscriptHash(c[1]), &dhe);
+            var got: [L]u8 = undefined;
+            S.deriveHandshakeSecretNoPsk(Hkdf, &got, &dhe);
+            try testing.expectEqualSlices(u8, &want, &got);
+        }
+    }
+    // RFC 8448 §3: the handshake secret of its full handshake.
+    var hs: [32]u8 = undefined;
+    tls13.deriveHandshakeSecretNoPsk(HkdfSha256, &hs, &hexTo(32, "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"));
+    try testing.expectEqualSlices(u8, &hexTo(32, "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"), &hs);
+}
+
+test "deriveApplicationSecrets equals the application and exporter derivations one by one" {
+    const T = tls13;
+    const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
+    inline for (.{ HkdfSha256, Hkdf384 }) |Hkdf| {
+        const L = Hkdf.prk_length;
+        const ms: [L]u8 = @splat(0x61);
+        const th: [L]u8 = @splat(0x9e);
+        var c1: [L]u8 = undefined;
+        var s1: [L]u8 = undefined;
+        var e1: [L]u8 = undefined;
+        T.deriveApplicationTrafficSecrets(Hkdf, &c1, &s1, &ms, &th);
+        T.deriveExporterMasterSecret(Hkdf, &e1, &ms, &th);
+        try testing.expectEqualSlices(u8, &v_expandLabel(Hkdf, tls13_prefix, ms, "c ap traffic", &th, L), &c1);
+        try testing.expectEqualSlices(u8, &v_expandLabel(Hkdf, tls13_prefix, ms, "s ap traffic", &th, L), &s1);
+        var c2: [L]u8 = undefined;
+        var s2: [L]u8 = undefined;
+        var e2: [L]u8 = undefined;
+        T.deriveApplicationSecrets(Hkdf, &c2, &s2, &e2, &ms, &th);
+        try testing.expectEqualSlices(u8, &c1, &c2);
+        try testing.expectEqualSlices(u8, &s1, &s2);
+        try testing.expectEqualSlices(u8, &e1, &e2);
+        // An output may alias the master secret.
+        var alias = ms;
+        T.deriveApplicationSecrets(Hkdf, &c2, &s2, &alias, &alias, &th);
+        try testing.expectEqualSlices(u8, &e1, &alias);
+    }
 }

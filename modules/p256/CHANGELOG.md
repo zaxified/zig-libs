@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added:** `Ecdsa(Hash).signWithSecretKey(out, secret_key, msg, noise)`: a
+  signature from the secret scalar alone, byte-identical to `KeyPair.sign`'s (tested over
+  SHA-256/384/512 and SHA3-256, with and without noise), refusing a scalar outside [1, n − 1]
+  with `error.IdentityElement`; burned and stack-probed. It skips the `d·G` a caller holding
+  only the secret key paid through `KeyPair.fromSecretKeyInto` on every signature — 14 µs of a
+  326 µs qap TLS connection (`tls13.certverify`).
+
 - **2026-10-18** — Ported to Zig 0.17.0: `Fe.field_order` and `scalar.field_order` are now `comptime_int` like std (0.17 `Ecdsa` evaluates `2 * n` at comptime).
 - **2026-10-14** — perf (no API change): the Jacobian doubling and the CT mixed addition run as ONE generated asm block each (`src/point_asm.zig`: a comptime field program over a scratch frame — `fast_core`'s Montgomery multiply/square text rebased onto frame offsets, add/sub/half with memory operands, register forwarding between consecutive ops, stores only for slots read later), in nistz256's operation order: doubling 4M + 4S with 11 add/sub/half (was dbl-2001-b 3M + 5S + 16 add/sub; same polynomials, bit-identical), CT mixed addition madd-2004-hmv 8M + 3S + 7 add/sub (was madd-2007-bl 7M + 4S + 14; another Jacobian representative of the same point — the Zig `addMixedCtFormula` moved with it). The window's five doublings share one frame (`Jac.dblTimes`). New differential: both programs (and 5 chained doublings) == the Zig formulas bit for bit on random and edge coordinates. `bench-p256` vs OpenSSL 3.5.5: ecdh 1.24 → 1.05×, verify 1.04 → 0.94×, sign 1.06 → 0.99×, keygen 0.92 → 0.81× (card P3 → P2). ctgrind patterns `p256/comb`, `p256/sign` gain `point_asm.zig`.
 - **2026-10-13** — Fix: the variable-time base-table walk indexed the table with a `u64` window digit, which does not compile on 32-bit targets (`check-portable` linux32 via dns → http → tlsclient); now `@intCast` (the digit is < 2^w).

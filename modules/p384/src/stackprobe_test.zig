@@ -39,6 +39,8 @@ test "STACKPROBE: no key, seed or shared-secret residue after the secret entry p
     const sign_secrets = [_][]const u8{&kp.secret_key.bytes};
     _ = try P.run("signPrehashedInto", E.KeyPair.signPrehashedInto, .{ &sig, &kp, &digest, null }, &sign_secrets, .{});
     try sig.verifyPrehashed(digest, kp.public_key);
+    _ = try P.run("signWithSecretKey", E.signWithSecretKey, .{ &sig, &kp.secret_key, "p384 probe message", null }, &sign_secrets, .{});
+    try sig.verify("p384 probe message", kp.public_key);
 
     peer = root.P384.basePoint.dbl().toUncompressedSec1();
     const ecdh_secrets = [_][]const u8{ &sk.bytes, &shared };

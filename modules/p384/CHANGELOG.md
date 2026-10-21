@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added:** `Ecdsa(Hash).signWithSecretKey(out, secret_key, msg, noise)`: the
+  RFC 6979 signature from the secret scalar alone (no `d·G`), equal to `KeyPair.sign`'s on the
+  RFC 6979 A.2.6 vectors; `error.NonCanonical` / `error.IdentityElement` as `fromSecretKey`.
+  Burned and stack-probed.
+
 - **2026-10-13** — Fix: the variable-time base-table walk indexed the table with a `u64` window digit, which does not compile on 32-bit targets (`check-portable` linux32 via dns → http → tlsclient); now `@intCast` (the digit is < 2^w).
 - **2026-10-13** — **New module.** NIST P-384: Montgomery field in std's `P384.Fe` representation
   (portable `mont.zig`, shared with the scalar field; amd64 `MULX`/`ADCX`/`ADOX` CIOS core in
