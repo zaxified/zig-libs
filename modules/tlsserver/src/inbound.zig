@@ -35,6 +35,7 @@
 
 const std = @import("std");
 const record = @import("record.zig");
+const zeroize = @import("zeroize.zig").zeroize;
 const alert = @import("alert.zig");
 
 const header_len = record.header_len;
@@ -126,7 +127,7 @@ pub const Joiner = struct {
     /// Zero every octet written and forget them (client certificates and
     /// Finished messages need not outlive the connection).
     pub fn reset(self: *Joiner) void {
-        std.crypto.secureZero(u8, self.buf[0..self.dirty]);
+        zeroize(self.buf[0..self.dirty]);
         self.start = 0;
         self.end = 0;
         self.dirty = 0;

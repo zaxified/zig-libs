@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — M3 step 3, the per-connection wipe. `Outbound.wipe` zeroed the whole output
+  buffer with `std.crypto.secureZero` (a byte at a time: ~16 µs for qap's 48 KiB, on every
+  connection); it now zeroes up to the high-water mark of what was written (`Outbound.dirty`,
+  `Outbound.touch`), with volatile 32-byte stores (`src/zeroize.zig`, copied from `http`). The
+  joiner reset and the ticket/PSK scratch use the same store. New `Server.abandonWrite(n)`
+  (`Connection.deinit` calls it for a half-written record). Tests: every path that writes the
+  output is zero after `wipe`; a slot written and never committed is zero after `deinit`.
 - **2026-10-21** — SPEC backlog only: the client leaf's cap (`clientauth.max_leaf_len`, 4096) as
   a caller-supplied buffer, asked for by qap's tlsserver branch (`Tls.max_client_cert_bytes`
   goes up to 16384). No code change.

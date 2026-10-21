@@ -96,6 +96,7 @@ test {
     _ = clientauth;
     _ = connection;
     _ = keys;
+    _ = @import("zeroize.zig");
     _ = @import("handshake_test.zig");
     _ = @import("interop_replay_test.zig");
     _ = @import("stackprobe_test.zig");

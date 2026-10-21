@@ -103,6 +103,7 @@ const outbound = @import("outbound.zig");
 const hello = @import("hello.zig");
 const messages = @import("messages.zig");
 const burn = @import("burn.zig");
+const zeroize = @import("zeroize.zig").zeroize;
 const clientauth = @import("clientauth.zig");
 const tlsresume = @import("tlsresume");
 
@@ -668,6 +669,11 @@ pub const Server = struct {
     tx_update: ?KeyUpdateRequest = null,
     /// NewSessionTickets to send after the client's Finished.
     tickets_due: u8 = 0,
+    /// The output octets the last `writeSlot` gave, [start, end), until
+    /// `commitWrite` or `abandonWrite` (end 0: none open). `deinit` wipes
+    /// them even if never committed.
+    write_slot_start: usize = 0,
+    write_slot_end: usize = 0,
     /// The handshake resumed a session (a ticket's PSK was accepted).
     resumed: bool = false,
     /// A HelloRetryRequest was sent.
@@ -701,6 +707,7 @@ pub const Server = struct {
 
     /// Wipe every secret and both buffers.
     pub fn deinit(self: *Server) void {
+        self.out.touch(self.write_slot_end);
         self.inbound.wipe();
         self.out.wipe();
         self.wipeHandshakeSecrets();
@@ -862,20 +869,42 @@ pub const Server = struct {
         self.flushKeyUpdate() catch |err| return self.fail(err);
         if (self.tx_update != null) return self.out.buf[0..0];
         const s = self.out.slot();
-        return s[0..@min(s.len, self.out.max_fragment)];
+        const w = s[0..@min(s.len, self.out.max_fragment)];
+        if (w.len != 0) {
+            self.write_slot_start = @intFromPtr(w.ptr) - @intFromPtr(self.out.buf.ptr);
+            self.write_slot_end = self.write_slot_start + w.len;
+        }
+        return w;
     }
 
     /// Seal the first `n` octets of the last `writeSlot` as one application
-    /// data record (`n` at most its length; 0 seals nothing).
+    /// data record (`n` at most its length; 0 seals nothing). `n` is what
+    /// was written: octets of the slot past it must not hold data.
     pub fn commitWrite(self: *Server, n: usize) Error!void {
+        self.closeWriteSlot(n);
         if (n == 0) return;
         if (self.state != .connected or self.write_closed) return error.Closed;
         std.debug.assert(n <= self.out.max_fragment);
         self.out.commit(.application_data, n) catch |err| {
             // Not sealed: the plaintext does not wait for `deinit` to go.
-            std.crypto.secureZero(u8, self.out.buf[self.out.len..]);
+            zeroize(self.out.buf[self.out.len..]);
             return self.fail(err);
         };
+    }
+
+    /// Give up the last `writeSlot` after writing its first `n` octets
+    /// (`Connection` closing with a partial record): nothing is sealed, and
+    /// `deinit` wipes just those `n`.
+    pub fn abandonWrite(self: *Server, n: usize) void {
+        self.closeWriteSlot(n);
+    }
+
+    /// The open slot's first `n` octets hold data; it is closed.
+    fn closeWriteSlot(self: *Server, n: usize) void {
+        if (self.write_slot_end == 0) return;
+        std.debug.assert(n <= self.write_slot_end - self.write_slot_start);
+        self.out.touch(self.write_slot_start + n);
+        self.write_slot_end = 0;
     }
 
     /// Turn the send key over now (RFC 8446 §4.6.3), asking the client to
@@ -948,6 +977,9 @@ pub const Server = struct {
                 self.out.write(.alert, &a.encode()) catch {};
             };
             self.state = .failed;
+            // An encoder that ran out of room or refused a field left a
+            // partial message in the slot, past what `Outbound` saw.
+            if (e == error.OutputFull or e == error.InternalError) self.out.touch(self.out.buf.len);
             // A failed handshake reports no identity.
             self.peer_authenticated = false;
             self.out.wipeKey();
@@ -1199,7 +1231,7 @@ pub const Server = struct {
         };
         const ring: TicketerRing = .{ .t = tk.ticketer };
         var scratch: [max_ticket_plaintext]u8 = undefined;
-        defer std.crypto.secureZero(u8, &scratch);
+        defer zeroize(&scratch);
         var sel: tlsresume.select.Selection(L) = undefined;
         defer std.crypto.secureZero(u8, std.mem.asBytes(&sel));
         tlsresume.select.selectPsk(H.Hkdf, H.Hmac, TicketerRing, &sel, &ring, .{}, ids[0..n], binders[0..n], &empty_hash, &th, now_ms, null, null, .{ .ctx = &want, .accept = Resumable.accept }, &scratch) catch |err| return switch (err) {
@@ -1581,7 +1613,7 @@ pub const Server = struct {
         defer std.crypto.secureZero(u8, &state.resumption_master_secret);
         ks.deriveResumptionMasterSecret(H.Hkdf, &state.resumption_master_secret, self.master_secret[0..L], th);
         var plain: [max_ticket_plaintext]u8 = undefined;
-        defer std.crypto.secureZero(u8, &plain);
+        defer zeroize(&plain);
         var blob: [max_ticket_len]u8 = undefined;
         const fields: TicketFields = .{ .sni = self.serverName(), .alpn = self.alpn, .peer = self.peerCertificate(), .peer_scheme = self.peerSignatureScheme() orelse 0, .peer_auth_ms = self.peer_auth_ms, .suite = @backingInt(self.suite) };
         const slot = self.out.slot();
@@ -2496,6 +2528,25 @@ test "KeyUpdate from the client: update_not_requested turns only the receive key
     const d = try p.drain();
     try testing.expectEqual(@as(usize, 0), d.n_updates);
     try testing.expectEqualStrings("pong", d.app[0..d.app_len]);
+}
+
+test "deinit wipes the output a handshake and records wrote, and an open slot's data, committed or not" {
+    for ([_]?usize{ null, 10 }) |abandon| {
+        const p = try Peer.create();
+        defer testing.allocator.destroy(p);
+        // Past the mark nothing was written (the buffer started undefined).
+        @memset(p.out[p.s.out.dirty..], 0);
+        _ = try p.s.write("sealed");
+        const slot = try p.s.writeSlot();
+        @memset(slot[0..100], 0xee);
+        const flight = p.s.out.dirty;
+        if (abandon) |n| p.s.abandonWrite(n);
+        // Abandoned after 10 octets: the 90 past them count as never written.
+        const end = @intFromPtr(slot.ptr) - @intFromPtr(&p.out) + (abandon orelse 100);
+        if (abandon != null) try testing.expectEqual(@max(flight, end), p.s.out.dirty);
+        p.s.deinit();
+        for (p.out[0..end]) |x| try testing.expectEqual(@as(u8, 0), x);
+    }
 }
 
 test "KeyUpdate from the client: update_requested is answered once, before the next record" {

@@ -333,6 +333,14 @@ The receive side branches only on framing values (record types, lengths, the han
 the alert octets). Decrypted application data stays in the caller's buffer; joined handshake
 messages stay in the joiner's buffer until `Inbound.wipe`, which zeroes every octet the joiner
 ever wrote and the receive key.
+The send side likewise: `Outbound.wipe` (from `Server.deinit`) zeroes the send key and every
+octet of the output buffer written since `init` — up to its high-water mark (`Outbound.dirty`:
+content framed or refused by `commit`, `write`, and what `touch` reports), not the whole
+buffer. A `writeSlot` not yet committed counts in full; `abandonWrite(n)` (what
+`Connection.deinit` calls) narrows it to the `n` octets written. An encoder that fails
+(`OutputFull`, `InternalError`) marks the whole buffer. Every per-connection wipe of a buffer
+uses `zeroize` (volatile 32-byte stores): `std.crypto.secureZero` stores a byte at a time, and
+wiping qap's 48 KiB output that way cost ~16 µs a connection.
 
 ## Limits and refusals
 

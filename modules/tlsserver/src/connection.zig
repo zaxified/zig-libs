@@ -85,6 +85,8 @@ pub const Connection = struct {
     /// included, which holds the records — but not the reader's buffer: the
     /// caller owns it, and it holds decrypted application data.
     pub fn deinit(self: *Connection) void {
+        // A record left half-written: the server wipes just what was written.
+        if (self.app_out.buffer.len != 0) self.server.abandonWrite(self.app_out.end);
         self.server.deinit();
         self.output.end = 0;
         // No alias outlives the connection: a late write must not land in

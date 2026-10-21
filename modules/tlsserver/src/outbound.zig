@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const record = @import("record.zig");
+const zeroize = @import("zeroize.zig").zeroize;
 
 const header_len = record.header_len;
 
@@ -48,6 +49,10 @@ pub const Outbound = struct {
     /// BoringSSL `SSL_set_max_send_fragment`); set it before the first
     /// `slot`, within [`min_fragment`, 2^14].
     max_fragment: u16 = record.max_plaintext_len,
+    /// Every octet past it is untouched since `init` or the last `wipe`:
+    /// `wipe` zeroes `buf[0..dirty]`, not the whole buffer (qap's is
+    /// 48 KiB; a connection's flight is a few KiB).
+    dirty: usize = 0,
 
     pub fn init(buf: []u8) Outbound {
         return .{ .buf = buf };
@@ -81,8 +86,10 @@ pub const Outbound = struct {
         const k = if (n == 0) 1 else (n + max - 1) / max;
         const keep: usize = if (content_type == .alert) 0 else alert_reserve;
         const room = (self.buf.len - self.len) -| keep;
-        if (room < n + k * o) return error.OutputFull;
         const base = self.len + header_len;
+        // The caller wrote the content into the slot, framed or not.
+        self.touch(base + n);
+        if (room < n + k * o) return error.OutputFull;
         // Move fragments apart, last first: each one's destination is at or
         // past its source and past every earlier fragment's source.
         var i = k;
@@ -108,6 +115,13 @@ pub const Outbound = struct {
                 self.len += header_len + clen;
             }
         }
+        self.touch(self.len);
+    }
+
+    /// Octets up to `end` may hold data: written into `slot()` but never
+    /// committed, say. `wipe` zeroes them.
+    pub fn touch(self: *Outbound, end: usize) void {
+        self.dirty = @max(self.dirty, @min(end, self.buf.len));
     }
 
     /// Copy `data` in and frame it (for short, already-built content: an
@@ -117,6 +131,7 @@ pub const Outbound = struct {
         // checks the room exactly.
         if (self.buf.len - self.len < header_len + data.len) return error.OutputFull;
         @memcpy(self.buf[self.len + header_len ..][0..data.len], data);
+        self.touch(self.len + header_len + data.len);
         try self.commit(content_type, data.len);
     }
 
@@ -144,11 +159,13 @@ pub const Outbound = struct {
         self.protected = false;
     }
 
-    /// Zero the send key and every octet of the buffer.
+    /// Zero the send key and every octet of the buffer written since `init`
+    /// (through `commit`, `write`, or reported by `touch`).
     pub fn wipe(self: *Outbound) void {
         if (self.protected) self.tx.wipe();
         self.protected = false;
-        std.crypto.secureZero(u8, self.buf);
+        zeroize(self.buf[0..self.dirty]);
+        self.dirty = 0;
         self.len = 0;
     }
 };
@@ -273,6 +290,33 @@ test "slot never promises more than commit can frame; full buffer is OutputFull"
     o.discard(40);
     try testing.expectEqual(@as(usize, 60), o.len);
     try testing.expectError(error.OutputFull, o.commit(.application_data, 50));
+    o.wipe();
+    for (b) |x| try testing.expectEqual(@as(u8, 0), x);
+}
+
+test "wipe zeroes every octet any path wrote, a failed commit's content and a touched slot included" {
+    const secret: [32]u8 = @splat(3);
+    var b: [3 * 4096]u8 = @splat(0);
+    var o: Outbound = .init(&b);
+    o.max_fragment = min_fragment;
+    try o.installTx(.aes_128_gcm_sha256, &secret);
+    // Fragmented, sealed, then partly discarded (moves the tail forward).
+    const s = o.slot();
+    @memset(s[0 .. 3 * min_fragment], 0xa1);
+    try o.commit(.application_data, 3 * min_fragment);
+    o.discard(100);
+    try o.write(.alert, &.{ 1, 0 });
+    // Content past what `commit` can frame: refused, still wiped.
+    const s2 = o.slot();
+    @memset(s2, 0xb2);
+    try testing.expectError(error.OutputFull, o.commit(.application_data, s2.len + alert_reserve));
+    o.wipe();
+    for (b) |x| try testing.expectEqual(@as(u8, 0), x);
+    try testing.expectEqual(@as(usize, 0), o.dirty);
+    // Written into the slot and never committed: only `touch` reports it.
+    const s3 = o.slot();
+    @memset(s3[0..77], 0xc3);
+    o.touch(@intFromPtr(s3.ptr) - @intFromPtr(&b) + 77);
     o.wipe();
     for (b) |x| try testing.expectEqual(@as(u8, 0), x);
 }
