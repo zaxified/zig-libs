@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Added (instrument):** the comparative benchmark against OpenSSL 3's libssl
+  (`zig build bench-tlsserver`, `tools/bench.zig` + `tools/c_bench/foreign_bench.c`): the
+  server's work alone, both sides replaying a recorded session into a fresh server with
+  seeded randomness (OpenSSL through a deterministic `RAND_METHOD`), replay checked octet for
+  octet before timing. Full handshakes (ECDSA P-256 and RSA-2048 over X25519, P-256 over
+  X25519MLKEM768), resumption, 16 KiB records sent and received: 0.48–0.90× OpenSSL 3.5.5
+  (§ Performance; the card's P axis now 2). **NO CONSUMER-VISIBLE CHANGE.**
+
 - **2026-10-21** — M4 step 6, stateful tickets (rustls's default `session_storage`):
   `CacheTicketer(Cache)` keeps each ticket's plaintext in a `tlsresume.SessionCache` under a
   random 32-octet id (`cache_id_len`) and takes it out on opening, so a ticket resumes once;

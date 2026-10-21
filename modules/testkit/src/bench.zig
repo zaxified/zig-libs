@@ -81,6 +81,16 @@ pub const Cycles = struct {
         _ = std.os.linux.read(fd, @ptrCast(&v), @sizeOf(u64));
         return v;
     }
+
+    /// Release the counter. One left open per `drive` call piled up on the
+    /// thread: past the PMU's counters they are multiplexed and each reads
+    /// only part of the cycles (tlsserver's bench, one `drive` per workload,
+    /// 2026-10-21: workloads 4–6 read 0.35–0.54× while wall time said
+    /// 0.46–0.90×).
+    pub fn close(c: Cycles) void {
+        if (builtin.os.tag != .linux) return;
+        if (c.fd) |fd| _ = std.os.linux.close(fd);
+    }
 };
 
 /// Time `@call(once, args)`: double the batch until it takes over 100 ms,
@@ -301,6 +311,7 @@ pub const Run = struct {
 /// workload's `op` before `once(ctx)` is timed.
 pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, comptime once: anytype, ws: anytype, w: *std.Io.Writer) !Summary {
     const cyc: Cycles = .open();
+    defer cyc.close();
     var s: Summary = .{};
     try w.print("{s:<18} {s:>11} {s:>11} {s:>11} {s:>7} {s:>7} {s:>6} {s:>6} {s:>6}  count\n", .{ "workload", "ours ns", "ref ns", "alt ns", "/ref", "/fast", "spr us", "spr rf", "spr al" });
     try w.flush();

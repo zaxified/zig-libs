@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-21** — **Fix:** `bench.drive` closes its user-mode cycle counter (`Cycles.close`, new). A bench that calls `drive` once per workload left one counter open per call on the same thread; past the PMU's counters they were multiplexed and each read only part of the cycles, so later workloads' ratios came out too low (tlsserver's bench: workloads 4–6 at 0.35–0.54× by cycles while wall time said 0.46–0.90×). Benches calling `drive` once were not affected.
+
 - **2026-10-20** — **Added:** `bench.Work.fast_only` — a row whose `ref` side is the fastest candidate because the card's reference has no such workload (aescbc's CTS rows); it counts for `Summary.worst_fast`, never for the reference ratio. Since the 2026-10-17 move to `testkit.bench` such rows had gone into the reference ratio (aescbc read ref 1.21× Go from OpenSSL-only rows).
 
 - **2026-10-20** — **Changed (performance):** `fuzz.driver` renews its `SafeAllocator` per batch of seeds (1024, or 64 MiB allocated) instead of per seed; a counting `SeedLedger` still fails a leak on the seed that made it (`error.MemoryLeakDetected`, `FAIL … seed=N: memory leak`). Per-seed init + deinit was ~1 µs (`threads: [128]Thread`), 4.2× a 0.3 µs harness; now 1.03–1.07× a bare loop (`bench-testkit`, whose bare side now also allocates through a `SafeAllocator`). Tests: a leak past a batch boundary, realloc growth/shrink across batches.
