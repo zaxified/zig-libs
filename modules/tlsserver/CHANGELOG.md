@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Fixed:** a `Connection` read sends what the server queued before it
+  waits, so a writer parked mid-send (an HTTP/2 stream on a fiber of the same thread, qap's
+  `Config.h2_concurrency`) and the reader sent the same records twice — a corrupt stream, or
+  the `outbound.discard` assertion. **Added:** `Connection.guard` (`Connection.Guard`: a lock
+  the caller's scheduler parks on), held wherever the connection changes or sends its output
+  and released while a read waits for input. Test over a socketpair with a blocked writer
+  thread; without the guard it fails in seconds.
+
 - **2026-10-22** — **Added:** QUIC (RFC 9001; rustls `quic::ServerConnection`, Go
   `tls.QUICServer`): `Config.quic` (`Quic.transport_parameters`, `Quic.accept_early`),
   `Server.quicFeed(level, data)` → `QuicResult` (event, the client's transport parameters),

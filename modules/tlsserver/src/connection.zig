@@ -34,6 +34,16 @@
 //!
 //! An error is final. A refusal's alert is sent (best effort) before the
 //! error is returned.
+//!
+//! **A reader and writers on fibers.** Reading sends too (what the server
+//! queued, before a read waits), so a reader and a writer that may park
+//! while sending — fibers of one thread, an HTTP/2 stream per fiber — would
+//! both send the same queued octets. Give the connection a `Guard` (a
+//! mutex that parks): it is held wherever the connection changes or sends
+//! its output and released while a read waits for input. Writers must still
+//! be serialised among themselves (`writer()` buffers without calling in),
+//! and the guard does not make the connection safe across threads: the
+//! octets a writer buffers are sealed by whichever side calls in next.
 
 const std = @import("std");
 const record = @import("record.zig");
@@ -66,6 +76,25 @@ pub const Connection = struct {
     /// The error behind `reader()`'s `ReadFailed` or `writer()`'s
     /// `WriteFailed`.
     err: ?Error = null,
+    /// A reader and writers on fibers (see the file comment); null: one
+    /// caller at a time.
+    guard: ?Guard = null,
+
+    /// A mutex the caller's scheduler can park on. Not reentrant: the
+    /// connection never takes it twice.
+    pub const Guard = struct {
+        ctx: *anyopaque,
+        lock: *const fn (ctx: *anyopaque) void,
+        unlock: *const fn (ctx: *anyopaque) void,
+    };
+
+    fn enter(self: *Connection) void {
+        if (self.guard) |g| g.lock(g.ctx);
+    }
+
+    fn leave(self: *Connection) void {
+        if (self.guard) |g| g.unlock(g.ctx);
+    }
 
     /// `output`'s buffer becomes the server's output buffer (see the file
     /// comment); it must be empty. `joiner_buf`: as for `Server.init`. With
@@ -131,7 +160,11 @@ pub const Connection = struct {
             // assert, gone in ReleaseFast) cannot hold a record the client
             // may send: refuse instead of asking a full buffer for more.
             if (self.input.bufferedLen() == self.input.buffer.len) return error.ReadFailed;
-            self.input.fillMore() catch |err| return switch (err) {
+            // Waiting for input: writers may send meanwhile.
+            self.leave();
+            const filled = self.input.fillMore();
+            self.enter();
+            filled catch |err| return switch (err) {
                 error.EndOfStream => error.EndOfStream,
                 error.ReadFailed => error.ReadFailed,
             };
@@ -146,6 +179,12 @@ pub const Connection = struct {
     /// out as half-RTT data. Called again in that state it returns at once.
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn handshake(self: *Connection) Error!void {
+        self.enter();
+        defer self.leave();
+        return self.handshakeGuarded();
+    }
+
+    fn handshakeGuarded(self: *Connection) Error!void {
         while (!self.server.isConnected() and !self.server.inEarlyData()) {
             switch (try self.step()) {
                 .handshake_done, .early_data_accepted => {},
@@ -166,7 +205,9 @@ pub const Connection = struct {
     /// recorded ClientHello can replay (RFC 8446 §8).
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn read(self: *Connection) Error!?[]u8 {
-        if (!self.server.isConnected()) try self.handshake();
+        self.enter();
+        defer self.leave();
+        if (!self.server.isConnected()) try self.handshakeGuarded();
         if (self.server.peer_closed) return null;
         while (true) {
             switch (try self.step()) {
@@ -185,6 +226,8 @@ pub const Connection = struct {
     /// Seal and send all of `data`.
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn writeAll(self: *Connection, data: []const u8) Error!void {
+        self.enter();
+        defer self.leave();
         try self.emit();
         var done: usize = 0;
         while (done < data.len) {
@@ -206,6 +249,8 @@ pub const Connection = struct {
     /// Seal what `writer()` holds and send everything queued.
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn flush(self: *Connection) Error!void {
+        self.enter();
+        defer self.leave();
         try self.emit();
         try self.flushOut();
     }
@@ -213,6 +258,8 @@ pub const Connection = struct {
     /// Turn the send key over and send the KeyUpdate (`Server.keyUpdate`).
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn keyUpdate(self: *Connection, request: server_mod.KeyUpdateRequest) Error!void {
+        self.enter();
+        defer self.leave();
         try self.emit();
         try self.server.keyUpdate(request);
         // No room for it behind what is queued: drain, then it fits.
@@ -229,6 +276,8 @@ pub const Connection = struct {
     /// no more writes.
     /// secret-api-ok: chains `Server` calls only; their secret work (record seal/open, HKDF, the handshake steps) runs under burns of its own, and no secret is held in this frame.
     pub fn close(self: *Connection) Error!void {
+        self.enter();
+        defer self.leave();
         try self.emit();
         try self.server.close();
         try self.flushOut();
@@ -392,9 +441,16 @@ pub const Connection = struct {
         // call.
         const topped = fill(w, data, splat);
         if (topped != 0) return topped;
+        try self.renew();
+        return fill(w, data, splat);
+    }
+
+    /// Seal the record `writer()` holds and give it a fresh one.
+    fn renew(self: *Connection) std.Io.Writer.Error!void {
+        self.enter();
+        defer self.leave();
         self.emit() catch |err| return self.writeFailed(err);
         self.reserve() catch |err| return self.writeFailed(err);
-        return fill(w, data, splat);
     }
 
     fn writerFlush(w: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -407,8 +463,7 @@ pub const Connection = struct {
     fn writerRebase(w: *std.Io.Writer, preserve: usize, capacity: usize) std.Io.Writer.Error!void {
         const self: *Connection = @alignCast(@fieldParentPtr("app_out", w));
         if (preserve != 0) return self.writeFailed(error.RecordBoundary);
-        self.emit() catch |err| return self.writeFailed(err);
-        self.reserve() catch |err| return self.writeFailed(err);
+        try self.renew();
         if (w.buffer.len - w.end < capacity) return self.writeFailed(error.RecordBoundary);
     }
 };
@@ -475,4 +530,138 @@ test "a writer that keeps its bytes (Writer.fixed) is refused, not corrupted" {
     // still comes back (the alert is best effort).
     try testing.expectError(error.UnexpectedMessage, c.handshake());
     try testing.expectError(error.WriteFailed, c.flushOut());
+}
+
+/// The client end of the guard test: waits until the server's writer has
+/// filled the socket, sends one record, then reads the writer's payload.
+const GuardPeer = struct {
+    io: std.Io,
+    fd: std.posix.fd_t,
+    payload: []const u8,
+    got: []u8,
+    err: ?anyerror = null,
+
+    fn run(p: *GuardPeer) void {
+        p.go() catch |err| {
+            p.err = err;
+            // A corrupt stream: unblock the server's writer and reader so
+            // the test fails instead of hanging.
+            _ = std.os.linux.shutdown(p.fd, std.os.linux.SHUT.RDWR);
+        };
+    }
+
+    fn go(p: *GuardPeer) !void {
+        const Client = @import("tlsclient").Client;
+        const stream: std.Io.net.Stream = .{ .socket = .{ .handle = p.fd, .address = undefined } };
+        var net_in: [Client.min_buffer_len]u8 = undefined;
+        var net_out: [Client.min_buffer_len]u8 = undefined;
+        var app_in: [Client.min_buffer_len]u8 = undefined;
+        var app_out: [Client.min_buffer_len]u8 = undefined;
+        var sr = stream.reader(p.io, &net_in);
+        var sw = stream.writer(p.io, &net_out);
+        const entropy: [Client.Options.entropy_len]u8 = @splat(7);
+        var c = try Client.init(&sr.interface, &sw.interface, .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .read_buffer = &app_in,
+            .write_buffer = &app_out,
+            .entropy = &entropy,
+            .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+            .min_version = .tls_1_3,
+        });
+        // The server's writer blocks on the full socket meanwhile; its reader
+        // then waits for this record.
+        try p.io.sleep(.fromMilliseconds(200), .awake);
+        try c.writer.writeAll("a");
+        try c.writer.flush();
+        try sw.interface.flush();
+        try c.reader.readSliceAll(p.got);
+        try c.end();
+        try sw.interface.flush();
+    }
+};
+
+test "a guard keeps a reader from resending what a parked writer is still sending" {
+    // A writer blocked in sending (a fiber parked on a full socket, here a
+    // thread) and a reader that needs input: without the guard the reader
+    // sends the same queued records again, and the client sees a corrupt
+    // stream (qap's HTTP/2 streams on fibers, 2026-10-22).
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var fds: [2]linux.fd_t = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    defer for (fds) |fd| {
+        _ = linux.close(fd);
+    };
+    const small: c_int = 4096;
+    _ = linux.setsockopt(fds[0], linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    _ = linux.setsockopt(fds[1], linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+
+    const certs = @import("test_certs.zig");
+    const p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = try .fromBytes(certs.p256_scalar);
+    const chain = [_][]const u8{&certs.p256_cert};
+    const ck: server_mod.CertifiedKey = .{ .chain = &chain, .key = .{ .ecdsa_p256 = &p256 } };
+    var prng = std.Random.DefaultPrng.init(11);
+    const cfg: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+
+    const payload = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const got = try gpa.alloc(u8, payload.len);
+    defer gpa.free(got);
+    var peer: GuardPeer = .{ .io = io, .fd = fds[1], .payload = payload, .got = got };
+    const peer_thread = try std.Thread.spawn(.{}, GuardPeer.run, .{&peer});
+
+    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
+    const in_buf = try gpa.alloc(u8, record.max_record_len);
+    defer gpa.free(in_buf);
+    const out_buf = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &ck) + server_mod.full_record_output_len);
+    defer gpa.free(out_buf);
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    var sr = stream.reader(io, in_buf);
+    var sw = stream.writer(io, out_buf);
+    var conn: Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
+    defer conn.deinit();
+
+    const Mutex = struct {
+        m: std.Io.Mutex = .init,
+        io: std.Io,
+        fn lock(ctx: *anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.m.lockUncancelable(s.io);
+        }
+        fn unlock(ctx: *anyopaque) void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.m.unlock(s.io);
+        }
+    };
+    var mutex: Mutex = .{ .io = io };
+    conn.guard = .{ .ctx = &mutex, .lock = Mutex.lock, .unlock = Mutex.unlock };
+
+    try conn.handshake();
+    const Writer = struct {
+        fn run(c: *Connection, data: []const u8, err: *?Error) void {
+            c.writeAll(data) catch |e| {
+                err.* = e;
+            };
+        }
+    };
+    var write_err: ?Error = null;
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{ &conn, payload, &write_err });
+    // Let the writer fill the socket and block.
+    try io.sleep(.fromMilliseconds(50), .awake);
+    const first = try conn.read();
+    try testing.expectEqualStrings("a", first.?);
+    writer_thread.join();
+    try testing.expectEqual(null, write_err);
+    try testing.expectEqual(null, try conn.read()); // close_notify
+    peer_thread.join();
+    try testing.expectEqual(null, peer.err);
+    try testing.expectEqualSlices(u8, payload, got);
 }
