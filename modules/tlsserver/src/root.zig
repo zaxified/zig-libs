@@ -60,6 +60,11 @@ pub const StekTicketer = server.StekTicketer;
 pub const CacheTicketer = server.CacheTicketer;
 pub const SessionCache = server.SessionCache;
 pub const ClientAuth = server.ClientAuth;
+pub const SignatureRequest = server.SignatureRequest;
+pub const Signer = server.Signer;
+/// `tls13.certverify`: the key and scheme types of `CertifiedKey`, and
+/// `signContent` for a signer that holds an offloaded key.
+pub const certverify = @import("tls13").certverify;
 
 /// Client certificates: the Certificate / CertificateVerify decoders, the
 /// leaf's key, the `ClientCertVerifier` and its `x509` implementation.

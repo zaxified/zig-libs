@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** offloaded signing (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n async
+  pkey; rustls has none): `CertifiedKey.offload` (`key` is now optional — set exactly one),
+  `Event.signature_needed`, `Server.signatureRequest` / `provideSignature` / `signatureFailed`,
+  `Connection.signer`, `Error.NoSignatureRequested`, `connection.Error.SignatureNeeded`,
+  `CheckError.SigningKey`; `certverify` re-exported. The BoGo shim runs `-async` with the key
+  offloaded: 401 pass / 0 fail, the 49 `*-Async` tests through the new path. **Breaking:** an
+  exhaustive switch over `Event` needs the new tag; code reading `CertifiedKey.key` gets an optional.
+
 - **2026-10-22** — **Fixed:** what `writer()` left in an open record is sealed on every pass
   of a read, not only when the read starts: a writer could open a record while the reader
   waited for input, and a KeyUpdate reply or an alert queued then landed over it (the guard's

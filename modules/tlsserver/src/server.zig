@@ -140,8 +140,15 @@ pub const CertifiedKey = struct {
     /// is sent.
     raw_public_key: bool = false,
     /// Borrowed (`certverify.SecretKey` holds pointers): must outlive the
-    /// connections that use it.
-    key: certverify.SecretKey,
+    /// connections that use it. Null exactly when `offload` is set.
+    key: ?certverify.SecretKey,
+    /// The key lives elsewhere — an HSM, a KMS, a signing service, another
+    /// thread (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n async pkey, picotls
+    /// async sign; rustls signs synchronously in the handshake): `feed`
+    /// stops with `signature_needed` after queueing the Certificate, the
+    /// caller signs `Server.signatureRequest` and hands the signature to
+    /// `Server.provideSignature`, and the handshake goes on.
+    offload: ?Offload = null,
     /// A DER OCSPResponse to staple on the leaf when the client asks
     /// (RFC 8446 §4.4.2.1). Empty counts as none (rustls). The module does
     /// not parse it: refreshing it before it expires is the caller's job.
@@ -177,6 +184,27 @@ pub const CertifiedKey = struct {
     pub const Staples = struct {
         ocsp: bool = false,
         sct: bool = false,
+    };
+
+    pub const Offload = struct {
+        /// The CertificateVerify schemes the key behind the signer can make,
+        /// most preferred first; those of `certverify.SignatureScheme` only
+        /// (others are skipped). It replaces `signature_schemes`.
+        schemes: []const u16,
+        /// Check every signature against the leaf's public key before it
+        /// goes out (s2n `S2N_ASYNC_PKEY_VALIDATION_STRICT`): a signer that
+        /// answers for the wrong key or garbles the signature fails the
+        /// handshake here with `internal_error`, not at the client as
+        /// `decrypt_error`. A verification costs about as much as a
+        /// signature for ECDSA, a few percent of one for RSA.
+        verify: bool = true,
+
+        /// The longest signature of `schemes` (0: none known).
+        fn maxSignatureLen(self: Offload) usize {
+            var n: usize = 0;
+            for (self.schemes) |s| n = @max(n, certverify.maxSignatureLen(@fromBackingInt(s)));
+            return n;
+        }
     };
 
     pub const CompressedCertificate = struct {
@@ -216,6 +244,9 @@ pub const CertifiedKey = struct {
         /// CompressedCertificate's 2^24-1 octets hold, or under the
         /// reserved algorithm 0.
         CompressedLength,
+        /// Neither `key` nor `offload`, or both; or `offload` with no
+        /// scheme `certverify` knows.
+        SigningKey,
         /// A compressed certificate whose `uncompressed_len` (or `digest`)
         /// is not the message it stands for (compressed before the chain
         /// or the staples changed), or with a staple the key does not hold.
@@ -229,6 +260,8 @@ pub const CertifiedKey = struct {
     /// callback's keys are checked again at every handshake).
     pub fn check(self: *const CertifiedKey) CheckError!void {
         if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.ChainLength;
+        if ((self.key == null) == (self.offload == null)) return error.SigningKey;
+        if (self.offload) |o| if (o.maxSignatureLen() == 0) return error.SigningKey;
         if (self.raw_public_key) {
             if (self.chain.len != 1) return error.ChainLength;
             _ = x509.parseSpki(self.chain[0]) catch return error.InvalidRawPublicKey;
@@ -1046,6 +1079,8 @@ pub const Error = inbound.Error || clientauth.VerifyError || error{
     /// A record-layer call (`feed`, `write`, `keyUpdate`, `close`…) on a
     /// QUIC connection, or a `quic…` call on a TLS one.
     WrongTransport,
+    /// `provideSignature` while no offloaded signature is awaited.
+    NoSignatureRequested,
 };
 
 /// The alert a failure sends (null: none — the peer aborted, or the
@@ -1059,7 +1094,7 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.AccessDenied => .access_denied,
         error.NoApplicationProtocol => .no_application_protocol,
         error.InternalError => .internal_error,
-        error.OutputFull, error.Closed, error.NotConnected, error.WrongTransport => null,
+        error.OutputFull, error.Closed, error.NotConnected, error.WrongTransport, error.NoSignatureRequested => null,
         error.TooManyKeyUpdates, error.TooMuchEarlyData => .unexpected_message,
         error.CertificateRequired => .certificate_required,
         error.UnsupportedExtension => .unsupported_extension,
@@ -1116,9 +1151,9 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     // A compressed one may be the longer: algorithm, two lengths and the
     // data, against the context octet and `chain` counted below.
     for (ck.compressed_certificates) |c| chain = @max(chain, 2 + 3 + 3 + c.data.len - 1);
-    const sig = for (certverify.candidateSchemes(ck.key)) |s| {
+    const sig = if (ck.key) |k| for (certverify.candidateSchemes(k)) |s| {
         break certverify.maxSignatureLen(s);
-    } else 0;
+    } else 0 else if (ck.offload) |o| o.maxSignatureLen() else 0;
     const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
     const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
@@ -1148,6 +1183,11 @@ pub const Event = union(enum) {
     app_data: []u8,
     /// The client sent close_notify. It may still be written to.
     peer_closed,
+    /// The certificate's key is offloaded (`CertifiedKey.offload`): the
+    /// flight up to the Certificate is queued (send it now), and the
+    /// handshake waits for `provideSignature` over `signatureRequest`.
+    /// `feed` takes nothing until then and says this again.
+    signature_needed,
 };
 
 pub const Result = struct {
@@ -1155,7 +1195,26 @@ pub const Result = struct {
     consumed: usize,
 };
 
-const State = enum { client_hello, client_hello_retry, early_data, client_certificate, client_certificate_verify, client_finished, connected, failed };
+const State = enum { client_hello, client_hello_retry, server_signature, early_data, client_certificate, client_certificate_verify, client_finished, connected, failed };
+
+/// What an offloaded key signs (`Server.signatureRequest`).
+pub const SignatureRequest = struct {
+    /// A `certverify.SignatureScheme` of `CertifiedKey.Offload.schemes`.
+    scheme: u16,
+    /// RFC 8446 §4.4.3's content — 64 spaces, the server's context string,
+    /// a zero octet, the transcript hash — to sign as the scheme says (the
+    /// signer hashes it: it is not a digest). Valid until
+    /// `provideSignature` or `deinit`.
+    message: []const u8,
+};
+
+/// A signer for an offloaded key that answers at once (`Connection`'s):
+/// the signature of `message` under `scheme`, in `out`
+/// (`certverify.max_signature_len` octets).
+pub const Signer = struct {
+    ctx: ?*anyopaque = null,
+    sign: *const fn (ctx: ?*anyopaque, scheme: u16, message: []const u8, out: []u8) error{SigningFailed}![]const u8,
+};
 
 const Transcript = union(enum) {
     sha256: tls13.transcript.Transcript(Sha256),
@@ -1268,6 +1327,16 @@ pub const Server = struct {
     early_hrr: bool = false,
     /// Early plaintext the client may still send (`EarlyData.max_size`).
     early_left: u32 = 0,
+    /// An offloaded signature awaited (`server_signature`): the content to
+    /// sign, its scheme, the key it is for, the server's handshake traffic
+    /// secret the Finished is made with (wiped with the other handshake
+    /// secrets), and the state the client's flight then starts in.
+    sign_content: [certverify.max_signed_content_len]u8 = undefined,
+    sign_len: u8 = 0,
+    sign_scheme: u16 = 0,
+    sign_key: ?*const CertifiedKey = null,
+    sign_server_hs: [48]u8 = @splat(0),
+    after_signature: State = .failed,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -1316,6 +1385,7 @@ pub const Server = struct {
         std.crypto.secureZero(u8, &self.client_handshake_secret);
         std.crypto.secureZero(u8, &self.quic_server_hs);
         std.crypto.secureZero(u8, &self.quic_client_early);
+        std.crypto.secureZero(u8, &self.sign_server_hs);
     }
 
     pub fn isConnected(self: *const Server) bool {
@@ -1417,6 +1487,54 @@ pub const Server = struct {
             .early_data, .client_finished => self.early_reason == .accepted,
             else => false,
         };
+    }
+
+    /// The signature an offloaded key owes (`signature_needed`), or null.
+    pub fn signatureRequest(self: *const Server) ?SignatureRequest {
+        if (self.state != .server_signature) return null;
+        return .{ .scheme = self.sign_scheme, .message = self.sign_content[0..self.sign_len] };
+    }
+
+    /// The offloaded key's signature over `signatureRequest().message`: the
+    /// CertificateVerify and the Finished are queued, and `feed` goes on.
+    /// With `Offload.verify` a signature that does not verify under the
+    /// leaf's key fails the handshake (`InternalError`). Not awaiting one:
+    /// `error.NoSignatureRequested`, and nothing changes.
+    pub fn provideSignature(self: *Server, signature: []const u8) Error!void {
+        if (self.state != .server_signature) return if (self.state == .failed) error.Closed else error.NoSignatureRequested;
+        burn.run(burn.handshake_burn, Error!void, completeSignature, .{ self, signature }) catch |err| return self.fail(err);
+    }
+
+    /// The signer could not sign: the handshake fails with `internal_error`
+    /// (queued for the caller to send).
+    pub fn signatureFailed(self: *Server) void {
+        if (self.state != .server_signature) return;
+        std.debug.assert(self.fail(error.InternalError) == error.InternalError);
+    }
+
+    fn completeSignature(self: *Server, signature: []const u8) Error!void {
+        const ck = self.sign_key.?;
+        const scheme: certverify.SignatureScheme = @fromBackingInt(self.sign_scheme);
+        if (signature.len == 0 or signature.len > certverify.maxSignatureLen(scheme)) return error.InternalError;
+        if (ck.offload.?.verify) {
+            const leaf = ck.chain[0];
+            const public = (if (ck.raw_public_key) clientauth.rawPublicKey(leaf) else clientauth.leafPublicKey(leaf)) catch return error.InternalError;
+            const L = self.suite.hashLen().?;
+            const th = self.sign_content[self.sign_len - L .. self.sign_len];
+            certverify.verify(scheme, public, .server, th, signature) catch return error.InternalError;
+        }
+        switch (self.suite) {
+            .aes_256_gcm_sha384 => try self.sendSignature(S384, signature),
+            else => try self.sendSignature(S256, signature),
+        }
+        std.crypto.secureZero(u8, &self.sign_server_hs);
+        self.sign_key = null;
+        self.state = self.after_signature;
+    }
+
+    fn sendSignature(self: *Server, comptime H: type, signature: []const u8) Error!void {
+        try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), self.sign_scheme, signature)));
+        try self.finishFlight(H, self.sign_server_hs[0..H.len]);
     }
 
     pub const ExportError = error{
@@ -1583,7 +1701,7 @@ pub const Server = struct {
         if (self.config.quic == null or !self.has_suite) return null;
         const L = self.suite.hashLen().?;
         const handshaking = switch (self.state) {
-            .client_certificate, .client_certificate_verify, .client_finished => true,
+            .server_signature, .client_certificate, .client_certificate_verify, .client_finished => true,
             else => false,
         };
         return switch (direction) {
@@ -1660,6 +1778,7 @@ pub const Server = struct {
     pub fn feed(self: *Server, buf: []u8) Error!Result {
         if (self.config.quic != null) return error.WrongTransport;
         if (self.state == .failed) return error.Closed;
+        if (self.state == .server_signature) return .{ .event = .signature_needed, .consumed = 0 };
         self.flushKeyUpdate() catch |err| return self.fail(err);
         var at: usize = 0;
         while (true) {
@@ -1875,8 +1994,12 @@ pub const Server = struct {
             .client_hello, .client_hello_retry => {
                 if (t != .client_hello) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientHello, .{ self, m });
+                if (self.state == .server_signature) return .signature_needed;
                 return if (self.state == .early_data or self.quic_early) .early_data_accepted else null;
             },
+            // The client has nothing to send before the server's Finished
+            // (QUIC: `feed` takes nothing in this state).
+            .server_signature => return error.UnexpectedMessage,
             .early_data => {
                 if (t != .end_of_early_data) return error.UnexpectedMessage;
                 try self.onEndOfEarlyData(m);
@@ -2124,6 +2247,15 @@ pub const Server = struct {
             .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
             else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
         }
+        // An offloaded signature (a full handshake: never with early data).
+        const next: State = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
+        if (self.sign_key != null) {
+            std.debug.assert(!early);
+            self.inbound.skip_early = if (ch.early_data) skipBudget(cfg) else 0;
+            self.after_signature = next;
+            self.state = .server_signature;
+            return;
+        }
         if (early and cfg.quic != null) {
             // RFC 9001 §8.3: no EndOfEarlyData; 0-RTT packets are the QUIC
             // stack's, under `quicSecret(.read, .early)`.
@@ -2138,7 +2270,7 @@ pub const Server = struct {
         // Early data the client may have sent under a PSK we did not take
         // (never after a retry: refused above).
         self.inbound.skip_early = if (ch.early_data) skipBudget(cfg) else 0;
-        self.state = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
+        self.state = next;
     }
 
     /// Early data refused is skipped up to 2^14 octets of ciphertext, or
@@ -2280,14 +2412,20 @@ pub const Server = struct {
     /// The key's first allowed scheme (`CertifiedKey.signature_schemes`
     /// order, else its candidates') that the client offers and it can sign.
     fn chooseScheme(ck: *const CertifiedKey, offered: *const hello.U16Iter) ?certverify.SignatureScheme {
-        const candidates = certverify.candidateSchemes(ck.key);
+        const key = ck.key orelse {
+            // Offloaded: the signer's list, of the schemes `certverify` knows.
+            const o = ck.offload orelse return null;
+            for (o.schemes) |p| if (offered.contains(p) and certverify.maxSignatureLen(@fromBackingInt(p)) != 0) return @fromBackingInt(p);
+            return null;
+        };
+        const candidates = certverify.candidateSchemes(key);
         if (ck.signature_schemes) |prefs| {
             for (prefs) |p| for (candidates) |s| {
-                if (@backingInt(s) == p and offered.contains(p) and certverify.canSign(ck.key, s)) return s;
+                if (@backingInt(s) == p and offered.contains(p) and certverify.canSign(key, s)) return s;
             };
             return null;
         }
-        for (candidates) |s| if (offered.contains(@backingInt(s)) and certverify.canSign(ck.key, s)) return s;
+        for (candidates) |s| if (offered.contains(@backingInt(s)) and certverify.canSign(key, s)) return s;
         return null;
     }
 
@@ -2535,16 +2673,34 @@ pub const Server = struct {
 
             // CertificateVerify over the transcript through Certificate.
             th = t.currentHash();
+            const key = ck.key orelse {
+                // Offloaded: the rest waits for `provideSignature`.
+                const content = certverify.buildSignedContent(.server, &th, &self.sign_content) catch unreachable;
+                self.sign_len = @intCast(content.len);
+                self.sign_scheme = @backingInt(scheme);
+                self.sign_key = ck;
+                @memcpy(self.sign_server_hs[0..L], &server_hs);
+                return;
+            };
             var sig_buf: [certverify.max_signature_len]u8 = undefined;
-            const sig = certverify.sign(scheme, ck.key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
+            const sig = certverify.sign(scheme, key, .server, &th, cfg.random, &sig_buf) catch return error.InternalError;
             try self.send(H, try encoded(messages.certificateVerify(self.out.slot(), @backingInt(scheme), sig)));
         }
+        try self.finishFlight(H, &server_hs);
+    }
 
-        // Finished.
-        th = t.currentHash();
+    /// The server's Finished, then the application secrets over the
+    /// transcript through it; the server sends under its application key
+    /// from here.
+    fn finishFlight(self: *Server, comptime H: type, server_hs: *const [H.len]u8) Error!void {
+        const L = H.len;
+        const t = H.transcript(&self.transcript);
+        const empty_hash = tls13.keyschedule.emptyTranscriptHash(H.Hash);
+        const hs = self.handshake_secret[0..L];
+        var th = t.currentHash();
         var finished_key: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &finished_key);
-        ks.deriveFinishedKey(H.Hkdf, L, &finished_key, &server_hs);
+        ks.deriveFinishedKey(H.Hkdf, L, &finished_key, server_hs);
         var verify_data: [L]u8 = undefined;
         tls13.keyschedule.computeFinishedVerifyData(H.Hmac, &verify_data, &finished_key, &th);
         try self.send(H, try encoded(messages.finished(self.out.slot(), &verify_data)));
@@ -3019,6 +3175,122 @@ test "a well-formed hello gets a first flight (the builder works)" {
     const sh_len = std.mem.readInt(u16, p[3..5], .big);
     try testing.expectEqualSlices(u8, &.{ 20, 3, 3, 0, 1, 1 }, p[5 + sh_len ..][0..6]);
     try testing.expectEqual(@as(u8, 23), p[5 + sh_len + 6]);
+}
+
+fn offloadedTestKey(verify: bool) CertifiedKey {
+    return .{ .chain = &test_chain, .key = null, .offload = .{ .schemes = &.{ 0x0804, 0x0403 }, .verify = verify } };
+}
+
+/// A server fed one ClientHello for an offloaded key: it waits for the signature.
+const OffloadRun = struct {
+    prng: std.Random.DefaultPrng,
+    ck: CertifiedKey,
+    cfg: Config,
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    out: [32 * 1024]u8,
+    s: Server,
+
+    fn start(r: *OffloadRun, verify: bool) !void {
+        r.prng = .init(1);
+        r.ck = offloadedTestKey(verify);
+        r.cfg = .{ .certificate = .{ .fixed = &r.ck }, .random = r.prng.random() };
+        r.s = .init(&r.cfg, &r.joiner, &r.out);
+        const rec = try buildRecord(testing.allocator, .{});
+        defer testing.allocator.free(rec);
+        const res = try r.s.feed(rec);
+        try testing.expect(res.event == .signature_needed);
+        try testing.expectEqual(rec.len, res.consumed);
+    }
+
+    fn sign(_: *OffloadRun, message: []const u8, buf: []u8) ![]const u8 {
+        return certverify.signContent(.ecdsa_secp256r1_sha256, testKey().key.?, message, null, buf);
+    }
+};
+
+test "offloaded key: the flight stops after the Certificate until the signature comes, then goes on" {
+    var r: OffloadRun = undefined;
+    try r.start(true);
+    defer r.s.deinit();
+    // ServerHello, CCS, EncryptedExtensions and Certificate are queued.
+    const before = r.s.pendingOutput().len;
+    try testing.expect(before > 0);
+    // Nothing is taken meanwhile; the event repeats.
+    var more = [_]u8{ 20, 3, 3, 0, 1, 1 };
+    const again = try r.s.feed(&more);
+    try testing.expect(again.event == .signature_needed);
+    try testing.expectEqual(@as(usize, 0), again.consumed);
+    try testing.expect(!r.s.canWrite());
+    // The client offers ecdsa_secp256r1_sha256 but not RSA-PSS: the
+    // signer's first scheme the client offers.
+    const req = r.s.signatureRequest().?;
+    try testing.expectEqual(@as(u16, 0x0403), req.scheme);
+    try testing.expectEqualSlices(u8, &@as([64]u8, @splat(0x20)), req.message[0..64]);
+    try testing.expectEqualStrings(certverify.server_context_string ++ "\x00", req.message[64..][0 .. certverify.server_context_string.len + 1]);
+    try testing.expectEqual(@as(usize, 64 + certverify.server_context_string.len + 1 + 32), req.message.len);
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    try r.s.provideSignature(try r.sign(req.message, &buf));
+    // CertificateVerify and Finished follow; the client's flight is next.
+    try testing.expect(r.s.pendingOutput().len > before);
+    try testing.expectEqual(State.client_finished, r.s.state);
+    try testing.expectEqual(null, r.s.signatureRequest());
+    try testing.expectError(error.NoSignatureRequested, r.s.provideSignature("x"));
+    try testing.expectEqualSlices(u8, &@as([48]u8, @splat(0)), &r.s.sign_server_hs);
+}
+
+test "offloaded key: a signature that does not verify, an empty one, or the signer's failure is internal_error" {
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    for (0..3) |case| {
+        var r: OffloadRun = undefined;
+        try r.start(true);
+        defer r.s.deinit();
+        const req = r.s.signatureRequest().?;
+        switch (case) {
+            0 => {
+                // Signed over other content (a stale transcript).
+                var other: [certverify.max_signed_content_len]u8 = undefined;
+                @memcpy(other[0..req.message.len], req.message);
+                other[req.message.len - 1] ^= 1;
+                try testing.expectError(error.InternalError, r.s.provideSignature(try r.sign(other[0..req.message.len], &buf)));
+            },
+            1 => try testing.expectError(error.InternalError, r.s.provideSignature("")),
+            else => r.s.signatureFailed(),
+        }
+        const p = r.s.pendingOutput();
+        // The fatal alert is the last record queued (under the handshake key).
+        try testing.expectEqual(@as(u8, 23), p[p.len - (5 + 2 + 1 + record.tag_len)]);
+        try testing.expectEqual(State.failed, r.s.state);
+        try testing.expectEqualSlices(u8, &@as([48]u8, @splat(0)), &r.s.sign_server_hs);
+        try testing.expectError(error.Closed, r.s.feed(&.{}));
+        try testing.expectError(error.Closed, r.s.provideSignature("x"));
+    }
+    // Without `verify` the signature goes out as given.
+    var r: OffloadRun = undefined;
+    try r.start(false);
+    defer r.s.deinit();
+    try r.s.provideSignature("not a signature");
+    try testing.expectEqual(State.client_finished, r.s.state);
+}
+
+test "offloaded key: check, scheme choice and the output it needs" {
+    var ck = offloadedTestKey(true);
+    try ck.check();
+    // Neither, both, or only schemes certverify does not know.
+    ck.offload = null;
+    try testing.expectError(error.SigningKey, ck.check());
+    ck = testKey().*;
+    ck.offload = offloadedTestKey(true).offload;
+    try testing.expectError(error.SigningKey, ck.check());
+    ck = offloadedTestKey(true);
+    ck.offload.?.schemes = &.{ 0x0401, 0x0201 };
+    try testing.expectError(error.SigningKey, ck.check());
+    // None of the signer's schemes offered: handshake_failure.
+    var prng = std.Random.DefaultPrng.init(1);
+    const off = offloadedTestKey(true);
+    const cfg: Config = .{ .certificate = .{ .fixed = &off }, .random = prng.random() };
+    const r = try refuse(.{ .sig_algs = &.{0x0807} }, cfg);
+    try testing.expectEqual(error.HandshakeFailure, r.err);
+    // RSA-PSS among the schemes: room for a 4096-bit signature.
+    try testing.expect(minOutputLen(&cfg, &off) > minOutputLen(&cfg, testKey()) + 400);
 }
 
 test "obsolete groups in supported_groups alone are served (JDK 11 lists them)" {
@@ -4905,7 +5177,7 @@ test "an ML-DSA-65 client leaf: over the default cap, taken under a larger Clien
     try testing.expect(try s.onHandshake(handshakeMessage(msg)) == null);
     const th = s.transcript.sha256.currentHash();
     var cv: [4 + 4 + certverify.max_signature_len]u8 = undefined;
-    const sig = try certverify.sign(.mldsa65, ck.key, .client, &th, prng.random(), cv[8..]);
+    const sig = try certverify.sign(.mldsa65, ck.key.?, .client, &th, prng.random(), cv[8..]);
     cv[0] = 15;
     std.mem.writeInt(u24, cv[1..4], @intCast(4 + sig.len), .big);
     std.mem.writeInt(u16, cv[4..6], 0x0905, .big);

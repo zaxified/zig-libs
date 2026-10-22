@@ -137,14 +137,16 @@ const Options = struct {
     export_label: []const u8 = "",
     export_context: []const u8 = "",
     use_export_context: bool = false,
+    /// `-async`: BoringSSL's private key method returns "retry" — here the
+    /// key is offloaded (`CertifiedKey.offload`), signed between feeds by
+    /// `Connection.signer`.
+    async_sign: bool = false,
 };
 
 const Unimplemented = error{Unimplemented};
 
 /// Flags that change nothing here: the versions below TLS 1.3 (never
-/// spoken); `-async` (BoringSSL's own callbacks returning "retry"; the
-/// sans-I/O core has no such retries to exercise, so the protocol is the
-/// same); `-implicit-handshake` (`Connection.read` runs the handshake);
+/// spoken); `-implicit-handshake` (`Connection.read` runs the handshake);
 /// `-expect-no-session-id` (no stateful session cache, so never an ID);
 /// `-expect-verify-result` (OpenSSL's verify result: a handshake that
 /// completed verified, or had nothing to verify); `-use-custom-verify-callback`
@@ -156,7 +158,7 @@ const Unimplemented = error{Unimplemented};
 /// staples what its `CertifiedKey` holds, and refuses an extension on the
 /// client's Certificate whatever it enabled).
 const ignored_flags = [_][]const u8{
-    "-no-tls1",              "-no-tls11",                   "-no-tls12",           "-no-ssl3",                       "-async",                "-implicit-handshake", "-expect-no-session-id",
+    "-no-tls1",              "-no-tls11",                   "-no-tls12",           "-no-ssl3",                       "-implicit-handshake",   "-expect-no-session-id",
     "-expect-verify-result", "-use-custom-verify-callback", "-use-early-callback", "-expect-extended-master-secret", "-enable-ocsp-stapling",
 };
 
@@ -332,6 +334,8 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.export_context = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-use-export-context")) {
             o.use_export_context = true;
+        } else if (std.mem.eql(u8, flag, "-async")) {
+            o.async_sign = true;
         } else if (std.mem.eql(u8, flag, "-decline-alpn")) {
             o.alpn_mode = .decline;
         } else if (std.mem.eql(u8, flag, "-reject-alpn")) {
@@ -461,6 +465,17 @@ const HelloCheck = struct {
     }
 };
 
+/// `-async`'s signer: the credential's key, here, when asked.
+const ShimSigner = struct {
+    key: tlsserver.certverify.SecretKey,
+    random: std.Random,
+
+    fn sign(ctx: ?*anyopaque, scheme: u16, message: []const u8, out: []u8) error{SigningFailed}![]const u8 {
+        const self: *ShimSigner = @ptrCast(@alignCast(ctx.?));
+        return tlsserver.certverify.signContent(@fromBackingInt(scheme), self.key, message, self.random, out) catch error.SigningFailed;
+    }
+};
+
 /// BoringSSL's shim verifier: any chain, unless `-verify-fail`.
 const ShimVerifier = struct {
     fn accept(_: ?*const anyopaque, _: []const []const u8, _: i64) tlsserver.clientauth.VerifyError!void {}
@@ -570,6 +585,22 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     leaf.sct_list = o.sct_list;
     if (o.signing_prefs.items.len != 0) leaf.signature_schemes = o.signing_prefs.items;
     leaf.compressed_certificates = try compressCertificates(gpa, &leaf, random, o.cert_compression);
+    var offload_schemes: std.ArrayList(u16) = .empty;
+    var signer: ShimSigner = .{ .key = ck.key.?, .random = random };
+    if (o.async_sign) {
+        // The schemes the key can make, in its order (or `-signing-prefs`').
+        const key = ck.key.?;
+        for (tlsserver.certverify.candidateSchemes(key)) |s| if (tlsserver.certverify.canSign(key, s)) try offload_schemes.append(gpa, @backingInt(s));
+        if (leaf.signature_schemes) |prefs| {
+            var kept: std.ArrayList(u16) = .empty;
+            for (prefs) |p| if (std.mem.indexOfScalar(u16, offload_schemes.items, p) != null) try kept.append(gpa, p);
+            offload_schemes = kept;
+        }
+        if (offload_schemes.items.len == 0) return unimplemented("-async (no scheme the key can make)");
+        leaf.key = null;
+        leaf.signature_schemes = null;
+        leaf.offload = .{ .schemes = offload_schemes.items };
+    }
     try leaf.check();
     var hello_check: HelloCheck = .{ .key = &leaf, .o = o };
     const cfg: server_mod.Config = .{
@@ -608,6 +639,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     defer gpa.free(peer);
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
     c.server.setPeerBuffer(peer);
+    if (o.async_sign) c.signer = .{ .ctx = &signer, .sign = ShimSigner.sign };
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
     return converse(&c, o, want_peer, &hello_check) catch |err| {

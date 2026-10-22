@@ -444,7 +444,22 @@ pub fn sign(
 ) SignError![]u8 {
     var content_buf: [max_signed_content_len]u8 = undefined;
     const content = try buildSignedContent(side, transcript_hash, &content_buf);
+    return signContent(scheme, secret_key, content, random, out);
+}
 
+/// `sign` over content already built (`buildSignedContent`'s output): what
+/// a signer holding the key elsewhere gets from a TLS stack that offloads
+/// the CertificateVerify (BoringSSL `SSL_PRIVATE_KEY_METHOD.sign`'s `in`,
+/// s2n `s2n_async_pkey_op_get_input`). The content is not checked against
+/// RFC 8446 §4.4.3's form: any octets are signed.
+// secret-api-ok: as `sign` — the union holds pointers; the signers run under their own burns.
+pub fn signContent(
+    scheme: SignatureScheme,
+    secret_key: SecretKey,
+    content: []const u8,
+    random: ?std.Random,
+    out: []u8,
+) SignError![]u8 {
     return switch (scheme) {
         .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => blk: {
             const sk = switch (secret_key) {
@@ -979,6 +994,17 @@ test "KAT: ed25519 sign reproduces the cryptography-cross-checked vector byte-ex
     var out: [Ed25519.Signature.encoded_length]u8 = undefined;
     const sig = try sign(.ed25519, sk, .client, &kat.ed25519_client.transcript_hash, null, &out);
     try testing.expectEqualSlices(u8, &kat.ed25519_client.signature, sig);
+}
+
+test "KAT: signContent over buildSignedContent's output is sign's signature (Ed25519, ECDSA P-384)" {
+    var content_buf: [max_signed_content_len]u8 = undefined;
+    const ed_sk = try Ed25519.SecretKey.fromBytes(kat.ed25519_client.secret_key_bytes);
+    var out: [max_signature_len]u8 = undefined;
+    const ed_content = try buildSignedContent(.client, &kat.ed25519_client.transcript_hash, &content_buf);
+    try testing.expectEqualSlices(u8, &kat.ed25519_client.signature, try signContent(.ed25519, .{ .ed25519 = &ed_sk }, ed_content, null, &out));
+    const ec_sk = try kat.ecdsa_p384_server.secretKey();
+    const ec_content = try buildSignedContent(.server, &kat.ecdsa_p384_server.transcript_hash, &content_buf);
+    try testing.expectEqualSlices(u8, &kat.ecdsa_p384_server.signature_der, try signContent(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &ec_sk }, ec_content, null, &out));
 }
 
 test "KAT: ecdsa_secp521r1_sha512 sign reproduces OpenSSL's RFC 6979 DER vector byte-exact, verify accepts it" {

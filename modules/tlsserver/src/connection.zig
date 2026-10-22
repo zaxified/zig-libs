@@ -66,6 +66,9 @@ pub const Error = server_mod.Error || error{
     /// `reader()` was asked for more contiguous octets than one record
     /// holds, or `writer()` to keep octets across a record.
     RecordBoundary,
+    /// The certificate's key is offloaded and the connection has no
+    /// `signer`, or the signer failed (`internal_error` is sent).
+    SignatureNeeded,
 };
 
 pub const Connection = struct {
@@ -82,6 +85,11 @@ pub const Connection = struct {
     /// A reader and writers on fibers (see the file comment); null: one
     /// caller at a time.
     guard: ?Guard = null,
+    /// Signs for an offloaded certificate key (`CertifiedKey.offload`): the
+    /// flight up to the Certificate is sent first, then the signer is
+    /// called. Null with an offloaded key: the handshake fails with
+    /// `error.SignatureNeeded` (the sans-I/O `Server` signs asynchronously).
+    signer: ?server_mod.Signer = null,
 
     /// A mutex the caller's scheduler can park on. Not reentrant: the
     /// connection never takes it twice.
@@ -160,6 +168,10 @@ pub const Connection = struct {
             // The consumed octets stay in the buffer until the next fill, so
             // an `app_data` slice is still valid when it is returned.
             self.input.toss(r.consumed);
+            if (r.event == .signature_needed) {
+                try self.sign();
+                continue;
+            }
             if (r.event != .need_more) return r.event;
             try self.flushOut();
             // A reader buffer under `record.max_record_len` (the `init`
@@ -175,6 +187,28 @@ pub const Connection = struct {
                 error.ReadFailed => error.ReadFailed,
             };
         }
+    }
+
+    /// The offloaded signature, from `signer`, once the flight so far is
+    /// out (the client hashes it while the key signs).
+    fn sign(self: *Connection) Error!void {
+        const req = self.server.signatureRequest().?;
+        const s = self.signer orelse {
+            self.server.signatureFailed();
+            self.flushOut() catch {};
+            return error.SignatureNeeded;
+        };
+        try self.flushOut();
+        var buf: [@import("tls13").certverify.max_signature_len]u8 = undefined;
+        const sig = s.sign(s.ctx, req.scheme, req.message, &buf) catch {
+            self.server.signatureFailed();
+            self.flushOut() catch {};
+            return error.SignatureNeeded;
+        };
+        self.server.provideSignature(sig) catch |err| {
+            self.flushOut() catch {};
+            return err;
+        };
     }
 
     /// Run the handshake until the client's Finished verified — or, with
@@ -198,7 +232,8 @@ pub const Connection = struct {
                 // early data is taken): inbound refuses application data and
                 // treats close_notify as an abort until then.
                 .app_data, .early_data, .peer_closed => unreachable,
-                .need_more => unreachable,
+                // `step` signs (or fails) itself.
+                .need_more, .signature_needed => unreachable,
             }
         }
         try self.flushOut();
@@ -224,7 +259,7 @@ pub const Connection = struct {
                 .handshake_done => {},
                 // A KeyUpdate is handled inside `feed`; other post-handshake
                 // messages fail there.
-                .early_data_accepted, .need_more => unreachable,
+                .early_data_accepted, .need_more, .signature_needed => unreachable,
             }
         }
     }
@@ -875,6 +910,65 @@ test "every send happens with the guard held, from every entry point" {
     try testing.expectEqualSlices(u8, a, got[0..a.len]);
     try testing.expectEqualSlices(u8, a, got[a.len..]);
     try testing.expectEqual(@as(usize, 0), g.unguarded_sends);
+}
+
+test "an offloaded key signs through Connection.signer, after the flight so far went out; without one, internal_error" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const Signer = struct {
+        signed: usize = 0,
+        rig: *GuardRig,
+
+        fn sign(ctx: ?*anyopaque, scheme: u16, message: []const u8, out: []u8) error{SigningFailed}![]const u8 {
+            const s: *@This() = @ptrCast(@alignCast(ctx.?));
+            // The ServerHello through the Certificate are on the socket.
+            var avail: c_int = 0;
+            _ = std.os.linux.ioctl(s.rig.fds[1], std.os.linux.T.FIONREAD, @intFromPtr(&avail));
+            if (avail == 0 or s.rig.conn.server.pendingOutput().len != 0) return error.SigningFailed;
+            s.signed += 1;
+            const tls13 = @import("tls13");
+            return tls13.certverify.signContent(@fromBackingInt(scheme), .{ .ecdsa_p256 = &s.rig.p256 }, message, null, out) catch error.SigningFailed;
+        }
+    };
+    {
+        const g = try GuardRig.createWith(gpa, true);
+        defer g.destroy();
+        g.ck.key = null;
+        g.ck.offload = .{ .schemes = &.{0x0403} };
+        var signer: Signer = .{ .rig = g };
+        g.conn.signer = .{ .ctx = &signer, .sign = Signer.sign };
+        var got: [5]u8 = undefined;
+        var peer: GuardRig.Peer = .{ .rig = g, .mode = .read_then_send, .got = &got };
+        var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+        defer peer_thread.join();
+        errdefer g.shutdown();
+        try g.conn.handshake();
+        try testing.expectEqual(@as(usize, 1), signer.signed);
+        try g.conn.writeAll("hello");
+        try testing.expectEqualStrings("a", (try g.conn.read()).?);
+        try g.conn.close();
+        try testing.expectEqual(null, try g.conn.read());
+        peer_thread.join();
+        try testing.expectEqual(null, peer.err);
+        try testing.expectEqualStrings("hello", &got);
+        try testing.expectEqual(@as(usize, 0), g.unguarded_sends);
+    }
+    {
+        // No signer: the handshake fails, and the client hears why.
+        const g = try GuardRig.create(gpa);
+        defer g.destroy();
+        g.ck.key = null;
+        g.ck.offload = .{ .schemes = &.{0x0403} };
+        var got: [1]u8 = undefined;
+        var peer: GuardRig.Peer = .{ .rig = g, .mode = .read_then_send, .got = &got };
+        var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+        defer peer_thread.join();
+        errdefer g.shutdown();
+        try testing.expectError(error.SignatureNeeded, g.conn.handshake());
+        g.shutdown();
+        peer_thread.join();
+        try testing.expect(peer.err != null);
+    }
 }
 
 test "what a writer left in an open record is sealed before the reader queues anything" {

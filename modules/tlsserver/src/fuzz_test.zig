@@ -1425,6 +1425,8 @@ fn driveServer(comptime S: type, src: *S, gpa: std.mem.Allocator, server: *serve
                 .early_data_accepted => {
                     if (run.handshake_done or !server.inEarlyData() or !server.canWrite()) return error.EarlyAcceptedOutOfPlace;
                 },
+                // The fuzzed keys sign in the handshake.
+                .signature_needed => return error.UnexpectedSignatureRequest,
                 // Answered as it comes (half-RTT), as `tools/interop.zig` did.
                 .app_data, .early_data => |d| {
                     if (r.event == .early_data) {
@@ -1953,7 +1955,7 @@ const KuClient = struct {
                     return null;
                 },
                 .app_data => |d| try app.appendSlice(c.gpa, d),
-                .handshake_done, .peer_closed, .early_data_accepted, .early_data => return error.UnexpectedEvent,
+                .handshake_done, .peer_closed, .early_data_accepted, .early_data, .signature_needed => return error.UnexpectedEvent,
             }
         }
     }

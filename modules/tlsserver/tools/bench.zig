@@ -219,7 +219,7 @@ const Pipe = struct {
             switch (r.event) {
                 .handshake_done => p.done = true,
                 .need_more, .app_data, .peer_closed => {},
-                .early_data_accepted, .early_data => return error.UnexpectedEarlyData,
+                .early_data_accepted, .early_data, .signature_needed => return error.UnexpectedEvent,
             }
             dropFront(&p.pending, r.consumed);
             dropFront(&p.raw, r.consumed);

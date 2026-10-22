@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** `certverify.signContent` — `sign` over content already built
+  (`buildSignedContent`'s output), for a signer holding a key a TLS stack offloads
+  (`tlsserver`'s `CertifiedKey.offload`); `sign` now calls it. KAT: equal to `sign`'s
+  signatures (Ed25519, ECDSA P-384).
+
 - **2026-10-21** — **Performance:** a full SHA-384 handshake's key schedule runs ~25 SHA-384
   compressions fewer, and its dead-stack burns zero ~170 KiB less. **Added:**
   `keyschedule.Schedule.deriveHandshakeSecretNoPsk` (the no-PSK early secret's `"derived"` salt

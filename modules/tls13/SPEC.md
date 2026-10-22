@@ -68,6 +68,9 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
   match the scheme is `KeyMismatch`. The transcript hash is the cipher suite's (any length up to
   64 octets, `TranscriptHashTooLong` beyond), independent of the scheme's hash — e.g. an
   `ecdsa_secp256r1_sha256` certificate under TLS_AES_256_GCM_SHA384 signs a 48-octet hash.
+- `signContent(scheme, SecretKey, content, ?Random, out)`: `sign` over content already built —
+  what a TLS stack hands a signer when the key is offloaded (`tlsserver`'s
+  `CertifiedKey.offload`); the content is not checked against §4.4.3's form.
   ECDSA signatures are DER on the wire, Ed25519 raw 64 bytes (verified with `verifyStrict`),
   RSA-PSS with salt = hash length and therefore a mandatory `Random` (`RandomRequired`).
 - `candidateSchemes(SecretKey)`: the schemes a key's family can sign under (RSA: all three PSS

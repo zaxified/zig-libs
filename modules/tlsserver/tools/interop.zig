@@ -339,6 +339,7 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server
         };
         switch (r.event) {
             .need_more, .handshake_done, .early_data_accepted => {},
+            .signature_needed => return error.UnexpectedSignatureRequest,
             // Answered as it comes (half-RTT), like application data.
             .app_data, .early_data => |d| {
                 try app.appendSlice(gpa, d);

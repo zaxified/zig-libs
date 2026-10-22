@@ -48,6 +48,10 @@ const Pipe = struct {
     received: std.ArrayList(u8) = .empty,
     gpa: std.mem.Allocator,
     failure: ?server_mod.Error = null,
+    /// The key an offloaded certificate signs with, here at once
+    /// (`signature_needed`), and how many signatures it made.
+    offload_key: ?tls13.certverify.SecretKey = null,
+    signed: usize = 0,
 
     fn init(p: *Pipe, server: *Server, gpa: std.mem.Allocator) void {
         p.* = .{ .reader = undefined, .server = server, .gpa = gpa };
@@ -81,6 +85,21 @@ const Pipe = struct {
                 // tlsclient sends no early data.
                 .early_data_accepted, .early_data => return error.UnexpectedEarlyData,
                 .peer_closed => {},
+                .signature_needed => {
+                    const key = p.offload_key orelse return error.UnexpectedSignatureRequest;
+                    // The flight so far is queued: the Certificate is its last message.
+                    const out = p.server.pendingOutput();
+                    if (out.len == 0) return error.FlightNotQueued;
+                    const req = p.server.signatureRequest().?;
+                    var prng = std.Random.DefaultPrng.init(p.signed);
+                    var buf: [tls13.certverify.max_signature_len]u8 = undefined;
+                    const sig = try tls13.certverify.signContent(@fromBackingInt(req.scheme), key, req.message, prng.random(), &buf);
+                    p.server.provideSignature(sig) catch |err| {
+                        p.failure = err;
+                        return;
+                    };
+                    p.signed += 1;
+                },
             }
             std.mem.copyForwards(u8, p.server_in[0 .. p.server_in_len - r.consumed], p.server_in[r.consumed..p.server_in_len]);
             p.server_in_len -= r.consumed;
@@ -127,6 +146,8 @@ const Outcome = struct {
     echoed: []u8,
     /// `Server.peerCertificate` (owned, like `echoed`).
     peer: ?[]u8 = null,
+    /// Offloaded signatures made.
+    signed: usize = 0,
 
     fn deinit(o: Outcome, gpa: std.mem.Allocator) void {
         gpa.free(o.echoed);
@@ -157,6 +178,8 @@ const ServerSide = struct {
     alpn: []const []const u8 = &.{},
     tickets: ?*const server_mod.Tickets = null,
     client_auth: ?*const server_mod.ClientAuth = null,
+    /// Signs for a certificate whose key is offloaded.
+    offload_key: ?tls13.certverify.SecretKey = null,
 };
 
 /// One handshake of client type `C` against the server, then a request, a
@@ -189,6 +212,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
     pipe.init(&server, gpa);
     defer pipe.deinit();
     pipe.corrupt_first = offer.corrupt_client_hello;
+    pipe.offload_key = srv.offload_key;
 
     var entropy: [Client.Options.entropy_len]u8 = undefined;
     prng.random().bytes(&entropy);
@@ -277,6 +301,7 @@ fn handshake(comptime C: type, gpa: std.mem.Allocator, ck: *const server_mod.Cer
         .age_skew_s = server.ticketAgeSkew(),
         .echoed = try gpa.dupe(u8, got[0..n]),
         .peer = if (server.peerCertificate()) |p| try gpa.dupe(u8, p) else null,
+        .signed = pipe.signed,
     };
 }
 
@@ -905,6 +930,74 @@ test "tlsclient ↔ Server: client certificates of every kind, verified by x509,
         try testing.expectEqualStrings("hello there", o.echoed);
         try testing.expectEqualSlices(u8, c[0], o.peer.?);
     };
+}
+
+/// The schemes a key can make, as `Offload.schemes` lists them.
+fn schemesOf(key: tls13.certverify.SecretKey, buf: *[4]u16) []const u16 {
+    const c = tls13.certverify.candidateSchemes(key);
+    for (c, 0..) |s, i| buf[i] = @backingInt(s);
+    return buf[0..c.len];
+}
+
+test "tlsclient ↔ Server: an offloaded key signs between feeds — every key kind, every suite, after a HelloRetryRequest, with a client certificate" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const chains = [_][1][]const u8{ .{&certs.p256_cert}, .{&certs.p384_cert}, .{&certs.ed25519_cert}, .{&certs.rsa2048_cert} };
+    const keys = [_]tls13.certverify.SecretKey{ .{ .ecdsa_p256 = &fx.p256 }, .{ .ecdsa_p384 = &fx.p384 }, .{ .ed25519 = &fx.ed25519 }, .{ .rsa = &fx.rsa2048 } };
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var ckeys: ClientKeys = undefined;
+    try ckeys.init();
+    for (keys, &chains) |key, *chain| for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        errdefer std.debug.print("suite {t}, key {t}\n", .{ suite, key });
+        var sb: [4]u16 = undefined;
+        for ([_]bool{ false, true }) |verify| {
+            const ck: server_mod.CertifiedKey = .{ .chain = chain, .key = null, .offload = .{ .schemes = schemesOf(key, &sb), .verify = verify } };
+            try ck.check();
+            var storage: [16 * 1024]u8 = undefined;
+            var info: ZlClient.ConnectionInfo = .init(&storage);
+            const o = try handshake(ZlClient, testing.allocator, &ck, .{ .suites = &.{suite}, .offload_key = key }, .{ .info = &info });
+            defer o.deinit(testing.allocator);
+            try testing.expectEqualStrings("hello there", o.echoed);
+            try testing.expectEqual(@as(usize, 1), o.signed);
+            try testing.expectEqualSlices(u8, chain[0], info.peerCertificates()[0]);
+        }
+        // A HelloRetryRequest first (the server's group has no share), and a
+        // client certificate after the signature.
+        const ck: server_mod.CertifiedKey = .{ .chain = chain, .key = null, .offload = .{ .schemes = schemesOf(key, &sb) } };
+        var cchain: [1][]const u8 = undefined;
+        const o = try handshake(ZlClient, testing.allocator, &ck, .{
+            .suites = &.{suite},
+            .groups = &.{tls13.kex.secp256r1_group},
+            .client_auth = &ca.auth,
+            .offload_key = key,
+        }, .{ .client_auth = clientCert(&client_certs.p256_cert, &ckeys.p256, &cchain) });
+        defer o.deinit(testing.allocator);
+        try testing.expect(o.retried);
+        try testing.expectEqual(@as(usize, 1), o.signed);
+        try testing.expectEqualSlices(u8, &client_certs.p256_cert, o.peer.?);
+    };
+}
+
+test "tlsclient ↔ Server: a resumption with an offloaded key asks for no signature" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const key: tls13.certverify.SecretKey = .{ .ecdsa_p256 = &fx.p256 };
+    var sb: [4]u16 = undefined;
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = null, .offload = .{ .schemes = schemesOf(key, &sb) } };
+    var tf: TicketFixture = undefined;
+    tf.init();
+    const entries = try testing.allocator.alloc(ZlClient.ClientSession, 2);
+    defer testing.allocator.free(entries);
+    var cache: ZlClient.SessionCache = .init(entries, null);
+    defer cache.deinit();
+    const first = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets, .offload_key = key }, .{ .session_cache = &cache });
+    defer first.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), first.signed);
+    const again = try handshake(ZlClient, testing.allocator, &ck, .{ .tickets = &tf.tickets, .offload_key = key }, .{ .session_cache = &cache });
+    defer again.deinit(testing.allocator);
+    try testing.expect(again.resumed);
+    try testing.expectEqual(@as(usize, 0), again.signed);
 }
 
 /// `ClientAuthSelect` that sends no certificate, and records the request.
