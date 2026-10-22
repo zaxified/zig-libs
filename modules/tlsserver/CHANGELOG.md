@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Tools:** ctgrind target `ech` (the recorded Go ECH sessions with the ECH
+  private key tainted): 384 in-file contexts, all on the decrypted inner hello's rebuild,
+  parse and handshake (public once decrypted), plus std's X25519 identity verdict below
+  `hpke` — none on the key. hs/app/ticket unchanged (28/8/77); digests and outputs re-pinned.
+
 - **2026-10-22** — **Fixed** (two independent reviews of the day's features, no HIGH):
   an inner ECH offer on the wire is `illegal_parameter` when ECH keys are set (RFC 9849 §7;
   the backend's confirmation only without keys), `retry_configs` only for an outer offer;

@@ -30,6 +30,13 @@
 //!    (`resume`): sealing, then opening and parsing the ticket — whose
 //!    content is the tainted plaintext after decryption.
 //!
+//!  * `ech` — the recorded Go ECH sessions (`go-ech`, `go-ech-hrr`) up to
+//!    the first flight with the ECH private key tainted: the HPKE decap
+//!    (`hpke`'s own story), the open of the inner hello and the accept
+//!    confirmations. The decrypted inner hello is then tainted content:
+//!    rebuilding and parsing it (`ech.reconstruct`, `hello.parseClientHello`)
+//!    is public work on what the client encrypted, counted as such.
+//!
 //! The in-file pattern is this module's own files; `tls13`, `aesgcm`,
 //! `tlsresume` and std's X25519/ML-KEM/P-256/P-384/Ed25519/HKDF carry their
 //! own constant-time story and are counted in the total only.
@@ -52,7 +59,7 @@ const certs = @import("test_certs.zig");
 const Server = server_mod.Server;
 const memcheck = std.valgrind.memcheck;
 
-const Target = enum { hs, app, ticket };
+const Target = enum { hs, app, ticket, ech };
 const Taint = enum { yes, no };
 
 var taint_on = false;
@@ -78,6 +85,9 @@ var p256_key: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = undefined;
 var p384_key: std.crypto.sign.ecdsa.EcdsaP384Sha384.SecretKey = undefined;
 var ed_key: std.crypto.sign.Ed25519.SecretKey = undefined;
 var stek_key: [32]u8 = vectors.stek_key;
+var ech_key: [32]u8 = vectors.ech_key;
+var ech_config: [128]u8 = undefined;
+var ech_buf: [server_mod.ech.bufferLen(8192)]u8 = undefined;
 
 fn clock(_: ?*anyopaque) i64 {
     return vectors.clock_ms;
@@ -108,7 +118,7 @@ var in_buf: [16 * 1024]u8 = undefined;
 var peer: [server_mod.peerBufferLen(4096)]u8 = undefined;
 
 /// Drives a server over `client` (fed whole), printing what it sends.
-fn run(v: vectors.Case, client_len: usize, rng_taint: bool, key_taint: bool, stek_taint: bool) !void {
+fn run(v: vectors.Case, client_len: usize, rng_taint: bool, key_taint: bool, stek_taint: bool, ech_taint: bool) !void {
     var chain: [1][]const u8 = undefined;
     var ck: server_mod.CertifiedKey = switch (v.cert) {
         .p256 => blk: {
@@ -146,6 +156,11 @@ fn run(v: vectors.Case, client_len: usize, rng_taint: bool, key_taint: bool, ste
     const stek: server_mod.StekTicketer(tlsresume.stek.DefaultRing) = .{ .ring = &ring };
     const tickets: server_mod.Tickets = .{ .ticketer = stek.ticketer(), .clock = .{ .now_ms = clock } };
 
+    ech_key = vectors.ech_key;
+    const ech_public = std.crypto.dh.X25519.recoverPublicKey(ech_key);
+    if (ech_taint) memcheck.makeMemUndefined(&ech_key);
+    const ech_keys = [_]server_mod.ech.Key{.{ .config = try server_mod.ech.makeConfig(&ech_config, 7, &ech_public, "public.example", 0), .private_key = &ech_key }};
+    const ech_cfg: server_mod.ech.Ech = .{ .keys = &ech_keys };
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = &ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -153,10 +168,12 @@ fn run(v: vectors.Case, client_len: usize, rng_taint: bool, key_taint: bool, ste
         .alpn_protocols = v.alpn,
         .random = rng.random(),
         .tickets = if (v.tickets) &tickets else null,
+        .ech = if (v.ech) &ech_cfg else null,
     };
     var s: Server = .init(&cfg, &joiner, &out_buf);
     defer s.deinit();
     s.setPeerBuffer(&peer);
+    s.setEchBuffer(&ech_buf);
 
     @memcpy(in_buf[0..client_len], v.client[0..client_len]);
     var at: usize = 0;
@@ -184,7 +201,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     switch (target) {
         .hs => for ([_][]const u8{ "p256-aes256-x25519", "p256-default", "p384", "ed25519", "hrr-p256" }) |name| {
             const v = try caseNamed(name);
-            try run(v, plaintextPrefix(v.client), taint_on, taint_on, false);
+            try run(v, plaintextPrefix(v.client), taint_on, taint_on, false, false);
         },
         .app => for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
             var secret: [48]u8 = undefined;
@@ -209,7 +226,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .ticket => for ([_][]const u8{ "resume-new", "resume" }) |name| {
             const v = try caseNamed(name);
-            try run(v, v.client.len, false, false, taint_on);
+            try run(v, v.client.len, false, false, taint_on, false);
+        },
+        .ech => for ([_][]const u8{ "go-ech", "go-ech-hrr" }) |name| {
+            const v = try caseNamed(name);
+            try run(v, plaintextPrefix(v.client), false, false, false, taint_on);
         },
     }
 }

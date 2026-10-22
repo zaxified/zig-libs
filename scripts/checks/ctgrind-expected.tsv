@@ -1379,8 +1379,8 @@ dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
 # Finished (length + timing_safe.eql), AEAD tags; (c) the inbound path over
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
-tlsserver	ReleaseFast	hs	1	28	b579f2ba9d3c1090	58c4cda2880a2cbb
-tlsserver	ReleaseFast	app	1	8	b579f2ba9d3c1090	ded7de421ed83ff8
+tlsserver	ReleaseFast	hs	1	28	53f4dfb9d17ae048	18b712e147be54c3
+tlsserver	ReleaseFast	app	1	8	53f4dfb9d17ae048	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1388,7 +1388,19 @@ tlsserver	ReleaseFast	app	1	8	b579f2ba9d3c1090	ded7de421ed83ff8
 # 2026-10-22 — ticket 75 -> 77 (QUIC): the format octet's range and the QUIC formats' extra
 # field (TicketFields.parse) and the ticket's transport compared with this connection's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned (recordings recaptured).
-tlsserver	ReleaseFast	ticket	1	77	b579f2ba9d3c1090	a8d33ab8b4aaabfe
+tlsserver	ReleaseFast	ticket	1	77	53f4dfb9d17ae048	915935a402728fb8
+# 2026-10-22 — ech 384: the recorded Go ECH sessions (go-ech, go-ech-hrr) up to the first
+# flight with the ECH private key tainted. Read by stack (--stacks): 1 context below hpke is
+# std's X25519 identity verdict (curve25519.zig:77, `x2.isZero()` on the decap result — the
+# class the hs rows already hold); every other one sits on the DECRYPTED inner hello, which
+# carries the key's taint through AES-GCM: ech.reconstruct and its Reader (the encoded
+# hello's lengths, the outer-extension scan), hello.parseClientHello / parseServerName /
+# isDnsName on it, then the handshake over it (suite/group/ALPN choice, setServerName,
+# optEql, the transcript and the ServerHello/flight built from its fields). Public work on
+# what the client encrypted, as the ticket rows' parse of a decrypted ticket; none branches
+# on the private key or the HPKE context. Hardening: the HPKE context is wiped after the
+# server flight (2026-10-22 review).
+tlsserver	ReleaseFast	ech	1	384	53f4dfb9d17ae048	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a
