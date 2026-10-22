@@ -52,6 +52,9 @@ pub const fingerprint = @import("fingerprint.zig");
 /// TLS Encrypted Client Hello (RFC 9849): configs, offers, decryption.
 pub const ech = server.ech;
 
+/// Delegated credentials (RFC 9345): parse, check, issue.
+pub const delegated = server.delegated;
+
 /// The handshake messages the server writes (ServerHello … Finished).
 pub const messages = @import("messages.zig");
 
@@ -120,6 +123,7 @@ test {
     _ = hello;
     _ = fingerprint;
     _ = ech;
+    _ = delegated;
     _ = messages;
     _ = server;
     _ = clientauth;

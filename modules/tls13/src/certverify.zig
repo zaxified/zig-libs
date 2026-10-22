@@ -347,7 +347,19 @@ pub fn verify(
 ) VerifyError!void {
     var content_buf: [max_signed_content_len]u8 = undefined;
     const content = try buildSignedContent(side, transcript_hash, &content_buf);
+    return verifyContent(scheme, public_key, content, signature);
+}
 
+/// `verify` over content the caller built: for a signature in TLS 1.3's
+/// form with another context string, as a delegated credential's (RFC
+/// 9345 §4: "TLS, server delegated credentials" over the certificate and
+/// the credential).
+pub fn verifyContent(
+    scheme: SignatureScheme,
+    public_key: PublicKey,
+    content: []const u8,
+    signature: []const u8,
+) VerifyError!void {
     return switch (scheme) {
         .rsa_pss_rsae_sha256, .rsa_pss_rsae_sha384, .rsa_pss_rsae_sha512 => blk: {
             const pk = switch (public_key) {
@@ -1005,6 +1017,15 @@ test "KAT: signContent over buildSignedContent's output is sign's signature (Ed2
     const ec_sk = try kat.ecdsa_p384_server.secretKey();
     const ec_content = try buildSignedContent(.server, &kat.ecdsa_p384_server.transcript_hash, &content_buf);
     try testing.expectEqualSlices(u8, &kat.ecdsa_p384_server.signature_der, try signContent(.ecdsa_secp384r1_sha384, .{ .ecdsa_p384 = &ec_sk }, ec_content, null, &out));
+}
+
+test "KAT: verifyContent over buildSignedContent's output is verify (Ed25519); other content fails" {
+    var content_buf: [max_signed_content_len]u8 = undefined;
+    const pk = PublicKey{ .ed25519 = try Ed25519.PublicKey.fromBytes(kat.ed25519_client.public_key_bytes) };
+    const content = try buildSignedContent(.client, &kat.ed25519_client.transcript_hash, &content_buf);
+    try verifyContent(.ed25519, pk, content, &kat.ed25519_client.signature);
+    content[0] ^= 1;
+    try testing.expectError(error.InvalidSignature, verifyContent(.ed25519, pk, content, &kat.ed25519_client.signature));
 }
 
 test "KAT: ecdsa_secp521r1_sha512 sign reproduces OpenSSL's RFC 6979 DER vector byte-exact, verify accepts it" {

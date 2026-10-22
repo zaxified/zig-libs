@@ -1,5 +1,7 @@
 {
   "DisabledTests": {
+    "DelegatedCredentials-TLS11-Forbidden": "TLS 1.1: never spoken (TLS 1.3 only)",
+    "DelegatedCredentials-TLS12-Forbidden": "TLS 1.2: never spoken (TLS 1.3 only)",
     "*-TLS1": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "*-TLS11": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "*-TLS12": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -174,6 +176,15 @@
     ],
     ":DECODE_ERROR": [
       ":EchInvalidPadding:"
+    ],
+    ":UNKNOWN_CERTIFICATE_TYPE:": [
+      ":HandshakeFailure:"
+    ],
+    ":KEY_VALUES_MISMATCH:": [
+      ":KeyMismatch:"
+    ],
+    ":INVALID_SIGNATURE_ALGORITHM:": [
+      ":UnsupportedAlgorithm:"
     ],
     ":INVALID_CLIENT_HELLO_INNER:": [
       ":EchInvalidInner:"

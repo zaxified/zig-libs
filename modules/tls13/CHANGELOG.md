@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** `certverify.verifyContent` — `verify` over content the caller
+  built (RFC 9345's delegated credential signature); `verify` now calls it. KAT: Ed25519.
+
 - **2026-10-22** — **Added:** `certverify.signContent` — `sign` over content already built
   (`buildSignedContent`'s output), for a signer holding a key a TLS stack offloads
   (`tlsserver`'s `CertifiedKey.offload`); `sign` now calls it. KAT: equal to `sign`'s

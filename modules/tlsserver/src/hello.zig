@@ -46,6 +46,7 @@ pub const ExtensionType = enum(u16) {
     server_certificate_type = 20,
     compress_certificate = 27,
     record_size_limit = 28,
+    delegated_credential = 34,
     session_ticket = 35,
     pre_shared_key = 41,
     early_data = 42,
@@ -142,6 +143,10 @@ pub const ClientHello = struct {
     /// plaintext (TLS 1.3: content and its type octet) the client takes;
     /// 64 or more (less is `illegal_parameter`).
     record_size_limit: ?u16 = null,
+    /// RFC 9345 `SignatureScheme signature_algorithms<2..2^16-2>` of
+    /// `delegated_credential`: the CertificateVerify schemes the client
+    /// takes from a delegated credential.
+    delegated_credential_raw: ?[]const u8 = null,
     /// RFC 9849 `encrypted_client_hello` as sent (`ech.parseOffer` reads it).
     ech_raw: ?[]const u8 = null,
     /// The number of extensions, unknown ones included.
@@ -170,6 +175,9 @@ pub const ClientHello = struct {
     }
     pub fn alpn(ch: *const ClientHello) ?Opaque8Iter {
         return if (ch.alpn_raw) |r| .{ .rest = r } else null;
+    }
+    pub fn delegatedCredentialSchemes(ch: *const ClientHello) ?U16Iter {
+        return if (ch.delegated_credential_raw) |r| .{ .rest = r } else null;
     }
     pub fn compressCertificate(ch: *const ClientHello) ?U16Iter {
         return if (ch.compress_certificate_raw) |r| .{ .rest = r } else null;
@@ -310,6 +318,7 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
             .client_certificate_type => ch.client_certificate_types = try nonEmptyIn(data, u8),
             .server_certificate_type => ch.server_certificate_types = try nonEmptyIn(data, u8),
             .quic_transport_parameters => ch.quic_transport_parameters = data,
+            .delegated_credential => ch.delegated_credential_raw = try u16ListIn(data, u16),
             .record_size_limit => {
                 if (data.len != 2) return error.DecodeError;
                 const v = std.mem.readInt(u16, data[0..2], .big);

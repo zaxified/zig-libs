@@ -28,7 +28,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [aws/s2n-tls](https://github.com/aws/s2n-tls) | C | Apache-2.0 | 4.8k | v1.7.12 (2026-10-16) | Full TLS 1.3 server incl. 0-RTT (anti-replay left to the application), HRR, ticket key rotation. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference for this module's handshake and bulk rows. |
 
-**Where we are ahead:** Encrypted Client Hello (RFC 9849) — rustls serves none (its
+**Where we are ahead:** delegated credentials (RFC 9345; rustls and Go have none,
+BoringSSL does); Encrypted Client Hello (RFC 9849) — rustls serves none (its
 BoGo config: "ECH server support NYI"; Go, BoringSSL and picotls do); offloaded (asynchronous) signing of the CertificateVerify — an HSM,
 KMS or signing service, or a thread off the event loop (rustls has none; BoringSSL, s2n and
 picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early data only with
@@ -300,6 +301,33 @@ live and replayed byte-exact (`go-ech`, `go-ech-hrr`, `go-ech-resume*`), and the
 with its error). Not done: split mode as a client-facing server (forwarding the inner
 hello), ECH over DTLS, `ECHConfig` extensions (ignored, none is mandatory today),
 HKDF-SHA384/512 and non-X25519 KEMs.
+
+**Delegated credentials** (RFC 9345, `delegated`, `CertifiedKey.delegated_credential`;
+BoringSSL serves them, rustls and Go do not; Firefox takes them). A credential is a
+short-lived key the certificate's key signed: the edge holds only it, valid at most 7 days
+past the leaf's notBefore. A `CertifiedKey` with `delegated_credential` has the issuing
+chain, the credential's key (`key`, or `offload`) and the `DelegatedCredential`
+(`delegated.issue` makes one; `keys.CertKeyPair.fromPemDelegated` loads its key, matched
+against the credential's SubjectPublicKeyInfo). It is usable only with a client whose
+`delegated_credential` extension offers its `dc_cert_verify_algorithm` and whose
+`signature_algorithms` offer the leaf's signature over it (BoringSSL's rule; otherwise
+`firstUsableKey` moves to the next key, and a lone credential is `handshake_failure`); it
+then travels as the leaf's `delegated_credential` extension (in the RFC 8879 digest and
+compressed forms too) and the CertificateVerify is the credential key's. `check` parses
+it (at most 7 days, ECDSA or Ed25519 only, as BoringSSL; not with a raw public key);
+`checkDelegated`, once at load, also verifies the leaf's signature (RFC 9345 §4: 64
+spaces, the context string, 0, the leaf's DER, `cred`, `algorithm`) and that `key` is the
+credential's (`checkDelegatedKey` without the signature). DelegationUsage on the leaf is
+the client's check (BoringSSL's server makes none): `delegated.hasDelegationUsage`.
+Checked by BoGo's `DelegatedCredentials-*` server tests (basic, both algorithm fields,
+multiple credentials, key mismatch, RSA refused) — the shim now takes BoringSSL's
+credential list (`-new-x509-credential`, `-new-delegated-credential`,
+`-expect-selected-credential`), which also runs 21 `CertificateSelection-Server-*` tests.
+**Finding:** BoGo's runner signs and verifies credentials over leaf ‖ `algorithm` ‖
+`cred` (`delegatedCredentialSignedMessage`), RFC 9345 §4 over leaf ‖ `cred` ‖
+`algorithm`; BoringSSL's own server never computes it (it sends what it is given), so
+only BoGo's credentials are affected. `delegated` follows the RFC; the shim checks the
+key and the algorithm, not the signature.
 
 **JA4 fingerprint** (`fingerprint.ja4`, FoxIO's `technical_details/JA4.md`; JA4 is
 BSD-3-Clause, the other JA4+ methods are under the FoxIO License and are not implemented; s2n

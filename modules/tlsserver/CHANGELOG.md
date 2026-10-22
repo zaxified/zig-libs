@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** delegated credentials (RFC 9345; rustls has none):
+  `CertifiedKey.delegated_credential`, `checkDelegated` / `checkDelegatedKey`,
+  `CheckError.DelegatedCredential`, the `delegated` file (`parse`, `check`, `issue`,
+  `signedMessage`, `hasDelegationUsage`, SPKI helpers), `keys.CertKeyPair.fromPemDelegated`,
+  `hello.ClientHello.delegatedCredentialSchemes`. The BoGo shim takes BoringSSL's
+  credential list: BoGo 476 pass / 0 fail (+9 DelegatedCredentials, +21
+  CertificateSelection-Server). Finding: BoGo's runner signs credentials in a
+  non-RFC order (algorithm before cred).
+
 - **2026-10-22** — **Added:** Encrypted Client Hello (RFC 9849; rustls serves none):
   `Config.ech` (`ech.Ech`: keys = `ECHConfig` + X25519 private key + retry flag),
   `Server.setEchBuffer`, `Server.echAccepted`, `ech.makeConfig` / `configList` /

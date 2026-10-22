@@ -21,6 +21,7 @@
 //! `modules/x509/SPEC.md`).
 
 const std = @import("std");
+const delegated = @import("delegated.zig");
 const b64ct = @import("b64ct");
 const rsa = @import("rsa");
 const x509 = @import("x509");
@@ -111,6 +112,30 @@ pub const CertKeyPair = struct {
         try loadKey(&out.key, gpa, key_pem);
         errdefer wipeKey(&out.key, gpa);
         const spki = x509.spkiOf(out.chain[0]) catch return error.MalformedCertificate;
+        try matches(&out.key, spki);
+    }
+
+    /// RFC 9345: as `fromPem`, for a delegated credential — the key is the
+    /// credential's, so it must match `delegated_credential`'s
+    /// SubjectPublicKeyInfo instead of the leaf's (`KeyMismatch`; a credential
+    /// that does not parse is `MalformedKey`). The caller sets
+    /// `CertifiedKey.delegated_credential` and calls `checkDelegated`.
+    pub fn fromPemDelegated(out: *CertKeyPair, gpa: std.mem.Allocator, chain_pem: []const u8, key_pem: []const u8, delegated_credential: []const u8) Error!void {
+        return burn.run(burn.key_burn, Error!void, fromPemDelegatedBody, .{ out, gpa, chain_pem, key_pem, delegated_credential });
+    }
+
+    fn fromPemDelegatedBody(out: *CertKeyPair, gpa: std.mem.Allocator, chain_pem: []const u8, key_pem: []const u8, delegated_credential: []const u8) Error!void {
+        const c = delegated.parse(delegated_credential) catch return error.MalformedKey;
+        const spki = x509.parseSpki(c.spki) catch return error.MalformedKey;
+        out.* = .{ .der = &.{}, .chain = &.{}, .key = .{ .ed25519 = undefined } };
+        errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        try loadChain(out, gpa, chain_pem);
+        errdefer {
+            gpa.free(out.chain);
+            gpa.free(out.der);
+        }
+        try loadKey(&out.key, gpa, key_pem);
+        errdefer wipeKey(&out.key, gpa);
         try matches(&out.key, spki);
     }
 

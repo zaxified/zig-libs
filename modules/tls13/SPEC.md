@@ -71,6 +71,8 @@ RFC 8446 §7.1, with the HKDF-Expand-Label prefix as the only parameter:
 - `signContent(scheme, SecretKey, content, ?Random, out)`: `sign` over content already built —
   what a TLS stack hands a signer when the key is offloaded (`tlsserver`'s
   `CertifiedKey.offload`); the content is not checked against §4.4.3's form.
+- `verifyContent(scheme, PublicKey, content, signature)`: `verify` over content the caller
+  built (RFC 9345's delegated credential signature has its own context string).
   ECDSA signatures are DER on the wire, Ed25519 raw 64 bytes (verified with `verifyStrict`),
   RSA-PSS with salt = hash length and therefore a mandatory `Random` (`RandomRequired`).
 - `candidateSchemes(SecretKey)`: the schemes a key's family can sign under (RSA: all three PSS

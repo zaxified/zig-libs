@@ -115,6 +115,7 @@ const burn = @import("burn.zig");
 const zeroize = @import("zeroize.zig").zeroize;
 const clientauth = @import("clientauth.zig");
 const fingerprint = @import("fingerprint.zig");
+pub const delegated = @import("delegated.zig");
 pub const ech = @import("ech.zig");
 const tlsresume = @import("tlsresume");
 
@@ -151,6 +152,17 @@ pub const CertifiedKey = struct {
     /// caller signs `Server.signatureRequest` and hands the signature to
     /// `Server.provideSignature`, and the handshake goes on.
     offload: ?Offload = null,
+    /// RFC 9345: this is a delegated credential — `chain` is the issuing
+    /// certificate's (whose leaf carries DelegationUsage), `key` (or
+    /// `offload`) the credential's key, and this the `DelegatedCredential`
+    /// the leaf's key signed (`delegated.issue`). Used only with a client
+    /// whose `delegated_credential` offers its scheme and whose
+    /// `signature_algorithms` offer the leaf's signature over it (BoringSSL's
+    /// credential rules; `firstUsableKey` then moves on to the next key). It
+    /// travels as the leaf's `delegated_credential` extension; the
+    /// CertificateVerify is the credential key's. Call `checkDelegated` once
+    /// when loading it (signature, key, DelegationUsage); `check` only parses.
+    delegated_credential: ?[]const u8 = null,
     /// A DER OCSPResponse to staple on the leaf when the client asks
     /// (RFC 8446 §4.4.2.1). Empty counts as none (rustls). The module does
     /// not parse it: refreshing it before it expires is the caller's job.
@@ -249,6 +261,9 @@ pub const CertifiedKey = struct {
         /// Neither `key` nor `offload`, or both; or `offload` with no
         /// scheme `certverify` knows.
         SigningKey,
+        /// `delegated_credential` malformed, valid over 7 days, of a scheme
+        /// other than ECDSA or Ed25519, or beside a raw public key.
+        DelegatedCredential,
         /// A compressed certificate whose `uncompressed_len` (or `digest`)
         /// is not the message it stands for (compressed before the chain
         /// or the staples changed), or with a staple the key does not hold.
@@ -265,6 +280,11 @@ pub const CertifiedKey = struct {
         if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.ChainLength;
         if ((self.key == null) == (self.offload == null)) return error.SigningKey;
         if (self.offload) |o| if (o.maxSignatureLen() == 0) return error.SigningKey;
+        if (self.delegated_credential) |dc| {
+            const c = delegated.parse(dc) catch return error.DelegatedCredential;
+            if (c.valid_time > delegated.max_valid_time_s or !delegated.schemeAllowed(c.scheme) or self.raw_public_key)
+                return error.DelegatedCredential;
+        }
         if (self.raw_public_key) {
             if (self.chain.len != 1) return error.ChainLength;
             _ = x509.parseSpki(self.chain[0]) catch return error.InvalidRawPublicKey;
@@ -276,6 +296,7 @@ pub const CertifiedKey = struct {
             body += 3 + c.len + 2;
         }
         var exts: usize = 0;
+        if (self.delegated_credential) |dc| exts += 4 + dc.len;
         if (self.ocspStaple()) |o| exts += 4 + 1 + 3 + o.len;
         if (self.sctList()) |l| {
             if (!validSctList(l)) return error.InvalidSctList;
@@ -289,6 +310,43 @@ pub const CertifiedKey = struct {
             if (c.uncompressed_len != len) return error.CompressedStale;
             if (c.digest) |d| if (!std.mem.eql(u8, &d, &self.certificateDigest(c.staples).?)) return error.CompressedStale;
         }
+    }
+
+    pub const DelegatedError = delegated.Error || error{
+        /// No `delegated_credential`.
+        NotDelegated,
+        /// `key` is not the credential's key.
+        KeyMismatch,
+    };
+
+    /// RFC 9345, once when loading: the credential's own checks
+    /// (`delegated.check`: valid at most 7 days, an allowed scheme, the
+    /// leaf's signature over it; DelegationUsage is the client's to check,
+    /// `delegated.hasDelegationUsage`) and that
+    /// `key` is the credential's (a signature made with it verifies under the
+    /// credential's public key; an `offload` key is the signer's to keep).
+    pub fn checkDelegated(self: *const CertifiedKey) DelegatedError!void {
+        const dc = self.delegated_credential orelse return error.NotDelegated;
+        _ = try delegated.check(dc, self.chain[0]);
+        try self.checkDelegatedKey();
+    }
+
+    /// `checkDelegated` without the leaf's signature over the credential:
+    /// parses, at most 7 days, an allowed scheme, `key` the credential's.
+    // secret-api-ok: signs a fixed public message with `key` (the union holds pointers; `certverify.signContent` burns its frames).
+    pub fn checkDelegatedKey(self: *const CertifiedKey) DelegatedError!void {
+        const dc = self.delegated_credential orelse return error.NotDelegated;
+        const c = try delegated.parse(dc);
+        if (c.valid_time > delegated.max_valid_time_s) return error.ValidTooLong;
+        if (!delegated.schemeAllowed(c.scheme)) return error.UnsupportedAlgorithm;
+        const key = self.key orelse return;
+        const scheme: certverify.SignatureScheme = @fromBackingInt(c.scheme);
+        if (!certverify.canSign(key, scheme)) return error.KeyMismatch;
+        const probe = "tlsserver: the delegated credential's key";
+        var sig_buf: [certverify.max_signature_len]u8 = undefined;
+        const sig = certverify.signContent(scheme, key, probe, null, &sig_buf) catch return error.KeyMismatch;
+        const public = clientauth.rawPublicKey(c.spki) catch return error.KeyMismatch;
+        certverify.verifyContent(scheme, public, probe, sig) catch return error.KeyMismatch;
     }
 
     /// SHA-256 of `uncompressedCertificate(…, staples)` without the buffer:
@@ -307,11 +365,20 @@ pub const CertifiedKey = struct {
             h.update(der);
             const ocsp = if (i == 0 and staples.ocsp) self.ocspStaple().? else null;
             const sct = if (i == 0 and staples.sct) self.sctList().? else null;
+            const dc = if (i == 0) self.delegated_credential else null;
             var exts: usize = 0;
+            if (dc) |d| exts += 4 + d.len;
             if (ocsp) |o| exts += 4 + 1 + 3 + o.len;
             if (sct) |l| exts += 4 + l.len;
             std.mem.writeInt(u16, be[0..2], @intCast(exts), .big);
             h.update(be[0..2]);
+            if (dc) |d| {
+                std.mem.writeInt(u16, be[0..2], delegated.ext_delegated_credential, .big);
+                h.update(be[0..2]);
+                std.mem.writeInt(u16, be[0..2], @intCast(d.len), .big);
+                h.update(be[0..2]);
+                h.update(d);
+            }
             if (ocsp) |o| {
                 std.mem.writeInt(u16, be[0..2], 5, .big); // status_request
                 h.update(be[0..2]);
@@ -338,6 +405,7 @@ pub const CertifiedKey = struct {
     fn certificateBodyLen(self: *const CertifiedKey, staples: Staples) ?usize {
         var body: usize = 1 + 3;
         for (self.chain) |c| body += 3 + c.len + 2;
+        if (self.delegated_credential) |dc| body += 4 + dc.len;
         if (staples.ocsp) body += 4 + 1 + 3 + (self.ocspStaple() orelse return null).len;
         if (staples.sct) body += 4 + (self.sctList() orelse return null).len;
         return body;
@@ -362,6 +430,8 @@ pub const CertifiedKey = struct {
     fn certificateMessage(self: *const CertifiedKey, out: []u8, entries: *[max_chain_len]messages.CertificateEntry, staples: Staples) (messages.Error || error{InvalidStaples})![]u8 {
         if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.FieldTooLong;
         for (self.chain, 0..) |der, i| entries[i] = .{ .cert_data = der };
+        const dc_ext = [1]messages.Extension{.{ .type = delegated.ext_delegated_credential, .data = self.delegated_credential orelse "" }};
+        if (self.delegated_credential != null) entries[0].extensions = &dc_ext;
         if (staples.ocsp) entries[0].ocsp_response = self.ocspStaple() orelse return error.InvalidStaples;
         if (staples.sct) entries[0].sct_list = self.sctList() orelse return error.InvalidStaples;
         return messages.certificate(out, "", entries[0..self.chain.len]);
@@ -428,7 +498,7 @@ pub const CertificateSelector = struct {
 pub fn firstUsableKey(keys: []const CertifiedKey, ch: *const hello.ClientHello) ?*const CertifiedKey {
     if (keys.len == 0) return null;
     const offered = ch.signatureAlgorithms() orelse return &keys[0];
-    for (keys) |*k| if (Server.chooseScheme(k, &offered) != null) return k;
+    for (keys) |*k| if (Server.chooseScheme(k, &offered, ch) != null) return k;
     return &keys[0];
 }
 
@@ -1196,6 +1266,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     for (ck.chain) |c| chain += 3 + c.len + 2;
     if (ck.ocspStaple()) |o| chain += 4 + 4 + o.len;
     if (ck.sctList()) |l| chain += 4 + l.len;
+    if (ck.delegated_credential) |dc| chain += 4 + dc.len;
     // A compressed one may be the longer: algorithm, two lengths and the
     // data, against the context octet and `chain` counted below.
     for (ck.compressed_certificates) |c| chain = @max(chain, 2 + 3 + 3 + c.data.len - 1);
@@ -2303,7 +2374,7 @@ pub const Server = struct {
             if (ch.legacy_session_id.len != 0) return error.IllegalParameter;
             self.quic_peer_params = ch.quic_transport_parameters;
         }
-        const scheme = chooseScheme(ck, &sig_algs) orelse return error.HandshakeFailure;
+        const scheme = chooseScheme(ck, &sig_algs, &ch) orelse return error.HandshakeFailure;
 
         var suite: record.CipherSuite = chooseSuite(cfg, &ch) orelse return error.HandshakeFailure;
         // RFC 8446 §4.1.4: the ServerHello repeats the HelloRetryRequest's
@@ -2633,7 +2704,19 @@ pub const Server = struct {
 
     /// The key's first allowed scheme (`CertifiedKey.signature_schemes`
     /// order, else its candidates') that the client offers and it can sign.
-    fn chooseScheme(ck: *const CertifiedKey, offered: *const hello.U16Iter) ?certverify.SignatureScheme {
+    fn chooseScheme(ck: *const CertifiedKey, offered: *const hello.U16Iter, ch: *const hello.ClientHello) ?certverify.SignatureScheme {
+        if (ck.delegated_credential) |dc| {
+            // RFC 9345 §4.1.1: the client's `delegated_credential` takes the
+            // credential's scheme, its `signature_algorithms` the leaf's
+            // signature over it; the CertificateVerify is the credential's.
+            const c = delegated.parse(dc) catch return null;
+            const takes = ch.delegatedCredentialSchemes() orelse return null;
+            if (!takes.contains(c.scheme) or !offered.contains(c.algorithm)) return null;
+            const s: certverify.SignatureScheme = @fromBackingInt(c.scheme);
+            if (ck.key) |k| return if (certverify.canSign(k, s)) s else null;
+            const o = ck.offload orelse return null;
+            return if (std.mem.indexOfScalar(u16, o.schemes, c.scheme) != null) s else null;
+        }
         const key = ck.key orelse {
             // Offloaded: the signer's list, of the schemes `certverify` knows.
             const o = ck.offload orelse return null;
@@ -3234,6 +3317,8 @@ const Hello = struct {
     trailing: []const u8 = "",
     /// RFC 8449 `record_size_limit`.
     record_size_limit: ?u16 = null,
+    /// RFC 9345 `delegated_credential` schemes.
+    dc_schemes: ?[]const u16 = null,
 };
 
 fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
@@ -3352,6 +3437,11 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     }
     if (h.early_data) try W.ext(&e, gpa, 42, "");
     if (h.record_size_limit) |l| try W.ext(&e, gpa, 28, &.{ @truncate(l >> 8), @truncate(l) });
+    if (h.dc_schemes) |v| {
+        const d = try W.list16(gpa, u16, v);
+        defer gpa.free(d);
+        try W.ext(&e, gpa, 34, d);
+    }
     // pre_shared_key last (RFC 8446 §4.2.11).
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
@@ -3575,6 +3665,104 @@ test "Config.ja4: the first ClientHello's fingerprint is kept" {
     defer off.deinit();
     _ = try off.feed(rec);
     try testing.expectEqual(null, off.ja4());
+}
+
+/// A delegated credential for `test_chain`'s P-256 leaf: an Ed25519 key,
+/// signed by the leaf's key (ECDSA P-256), valid a day.
+const TestDc = struct {
+    ed: std.crypto.sign.Ed25519.KeyPair,
+    spki: [44]u8,
+    raw: [600]u8,
+    dc: []const u8,
+
+    fn init(t: *TestDc) !void {
+        t.ed = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x33)) catch unreachable;
+        const spki = delegated.spkiEd25519(&t.spki, &t.ed.public_key.bytes);
+        t.dc = try delegated.issue(&t.raw, test_chain[0], testKey().key.?, 0x0403, spki, 0x0807, 86400, null);
+    }
+
+    fn certifiedKey(t: *const TestDc) CertifiedKey {
+        return .{ .chain = &test_chain, .key = .{ .ed25519 = &t.ed.secret_key }, .delegated_credential = t.dc };
+    }
+};
+
+test "RFC 9345: a delegated credential checks, and is used only when the client takes it" {
+    var t: TestDc = undefined;
+    try t.init();
+    const ck = t.certifiedKey();
+    try ck.check();
+    try ck.checkDelegated();
+    // The credential travels on the leaf.
+    var buf: [4096]u8 = undefined;
+    const body = try ck.uncompressedCertificate(&buf, .{});
+    try testing.expect(std.mem.indexOf(u8, body, t.dc) != null);
+    try testing.expectEqual(ck.certificateDigest(.{}).?, blk: {
+        var h: Sha256 = .init(.{});
+        h.update(body);
+        break :blk h.finalResult();
+    });
+    // The client must take the credential's scheme (Ed25519) and offer the
+    // leaf's signature over it (ECDSA P-256) in signature_algorithms.
+    const plain = testKey().*;
+    const keys = [_]CertifiedKey{ ck, plain };
+    // (hello, the credential usable, the key `firstUsableKey` picks: none
+    // usable falls back to the first).
+    for ([_]struct { Hello, bool, usize }{
+        .{ .{ .dc_schemes = &.{0x0807}, .sig_algs = &.{0x0403} }, true, 0 },
+        .{ .{ .dc_schemes = &.{0x0403}, .sig_algs = &.{0x0403} }, false, 1 },
+        .{ .{ .dc_schemes = &.{0x0807}, .sig_algs = &.{0x0804} }, false, 0 },
+        .{ .{ .sig_algs = &.{ 0x0403, 0x0807 } }, false, 1 },
+    }) |c| {
+        const rec = try buildRecord(testing.allocator, c[0]);
+        defer testing.allocator.free(rec);
+        const ch = try hello.parseClientHello(rec[5 + 4 ..]);
+        const offered = ch.signatureAlgorithms().?;
+        try testing.expectEqual(c[1], Server.chooseScheme(&ck, &offered, &ch) == .ed25519);
+        try testing.expectEqual(&keys[c[2]], firstUsableKey(&keys, &ch).?);
+    }
+    // A handshake with it: the Certificate carries it, the CertificateVerify
+    // is Ed25519.
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .dc_schemes = &.{0x0807} });
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    try testing.expectEqual(State.client_finished, s.state);
+    // Without the client's extension it cannot be used: handshake_failure.
+    const r = try refuse(.{}, cfg);
+    try testing.expectEqual(error.HandshakeFailure, r.err);
+}
+
+test "RFC 9345: checkDelegated refuses another key, a broken signature, RSA, over 7 days" {
+    var t: TestDc = undefined;
+    try t.init();
+    var ck = t.certifiedKey();
+    // Another key than the credential's.
+    const other = std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(0x44)) catch unreachable;
+    ck.key = .{ .ed25519 = &other.secret_key };
+    try testing.expectError(error.KeyMismatch, ck.checkDelegated());
+    ck = t.certifiedKey();
+    // The leaf's signature over another credential (one octet of valid_time).
+    var bad: [600]u8 = undefined;
+    @memcpy(bad[0..t.dc.len], t.dc);
+    bad[3] ^= 1;
+    ck.delegated_credential = bad[0..t.dc.len];
+    try testing.expectError(error.BadSignature, ck.checkDelegated());
+    try ck.checkDelegatedKey();
+    // Over 7 days, and an RSA scheme: refused by `check` already.
+    var long: [600]u8 = undefined;
+    const spki = delegated.spkiEd25519(&t.spki, &t.ed.public_key.bytes);
+    ck.delegated_credential = try delegated.issue(&long, test_chain[0], testKey().key.?, 0x0403, spki, 0x0807, delegated.max_valid_time_s + 1, null);
+    try testing.expectError(error.DelegatedCredential, ck.check());
+    try testing.expectError(error.ValidTooLong, ck.checkDelegated());
+    ck.delegated_credential = try delegated.issue(&long, test_chain[0], testKey().key.?, 0x0403, spki, 0x0804, 60, null);
+    try testing.expectError(error.DelegatedCredential, ck.check());
+    try testing.expectError(error.UnsupportedAlgorithm, ck.checkDelegated());
+    try testing.expect(!delegated.hasDelegationUsage(test_chain[0]));
 }
 
 test "obsolete groups in supported_groups alone are served (JDK 11 lists them)" {

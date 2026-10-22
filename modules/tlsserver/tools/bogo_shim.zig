@@ -147,7 +147,27 @@ const Options = struct {
     ech_keys: std.ArrayList([]const u8) = .empty,
     ech_retry: std.ArrayList(bool) = .empty,
     expect_ech_accept: bool = false,
+    /// `-new-x509-credential` / `-new-delegated-credential`, each with the
+    /// credential flags after it (BoringSSL `SSL_add1_credential`), tried
+    /// in order (`server.firstUsableKey`); `-expect-selected-credential`
+    /// names the one the handshake used (-1: the default credential).
+    credentials: std.ArrayList(Cred) = .empty,
+    expect_selected_credential: ?i32 = null,
 };
+
+const Cred = struct {
+    delegated: bool,
+    cert_file: ?[]const u8 = null,
+    key_file: ?[]const u8 = null,
+    ocsp_response: ?[]const u8 = null,
+    sct_list: ?[]const u8 = null,
+    signing_prefs: std.ArrayList(u16) = .empty,
+    /// `-delegated-credential`: the DelegatedCredential (RFC 9345).
+    dc: ?[]const u8 = null,
+};
+
+/// The flags that, after `-new-…-credential`, belong to that credential.
+const credential_flags = [_][]const u8{ "-cert-file", "-key-file", "-ocsp-response", "-signed-cert-timestamps", "-signing-prefs", "-delegated-credential", "-must-match-issuer", "-trust-anchor-id" };
 
 const Unimplemented = error{Unimplemented};
 
@@ -235,7 +255,29 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
                 };
             }
         }.f;
-        if (std.mem.eql(u8, flag, "-port")) {
+        const credential_flag = for (credential_flags) |f| {
+            if (std.mem.eql(u8, flag, f)) break true;
+        } else false;
+        if (std.mem.eql(u8, flag, "-new-x509-credential") or std.mem.eql(u8, flag, "-new-delegated-credential")) {
+            try o.credentials.append(gpa, .{ .delegated = flag[5] == 'd' });
+        } else if (o.credentials.items.len != 0 and credential_flag) {
+            const c = &o.credentials.items[o.credentials.items.len - 1];
+            if (std.mem.eql(u8, flag, "-cert-file")) {
+                c.cert_file = try value(it, flag);
+            } else if (std.mem.eql(u8, flag, "-key-file")) {
+                c.key_file = try value(it, flag);
+            } else if (std.mem.eql(u8, flag, "-ocsp-response")) {
+                c.ocsp_response = try base64(gpa, try value(it, flag));
+            } else if (std.mem.eql(u8, flag, "-signed-cert-timestamps")) {
+                c.sct_list = try base64(gpa, try value(it, flag));
+            } else if (std.mem.eql(u8, flag, "-signing-prefs")) {
+                try c.signing_prefs.append(gpa, try std.fmt.parseInt(u16, try value(it, flag), 10));
+            } else if (std.mem.eql(u8, flag, "-delegated-credential")) {
+                c.dc = try base64(gpa, try value(it, flag));
+            } else return unimplemented(flag);
+        } else if (std.mem.eql(u8, flag, "-expect-selected-credential")) {
+            o.expect_selected_credential = try std.fmt.parseInt(i32, try value(it, flag), 10);
+        } else if (std.mem.eql(u8, flag, "-port")) {
             o.port = try std.fmt.parseInt(u16, try value(it, flag), 10);
         } else if (std.mem.eql(u8, flag, "-shim-id")) {
             o.shim_id = try std.fmt.parseInt(u64, try value(it, flag), 10);
@@ -456,9 +498,11 @@ const ShimClock = struct {
 /// `-expect-advertised-alpn` and `-expect-peer-verify-pref` flags check,
 /// reported after the handshake (the callback can only refuse).
 const HelloCheck = struct {
-    key: *const tlsserver.CertifiedKey,
+    /// The credentials, tried in order; which one the handshake took.
+    keys: []const tlsserver.CertifiedKey,
     o: *const Options,
     failure: ?anyerror = null,
+    selected: ?usize = null,
 
     fn select(ctx: ?*anyopaque, _: ?[]const u8, ch: *const tlsserver.hello.ClientHello) ?*const tlsserver.CertifiedKey {
         const self: *HelloCheck = @ptrCast(@alignCast(ctx.?));
@@ -472,23 +516,28 @@ const HelloCheck = struct {
             }
             if (it.next() != null) self.failure = error.PeerVerifyPrefsMismatch;
         }
-        return self.key;
+        const k = server_mod.firstUsableKey(self.keys, ch) orelse return null;
+        self.selected = (@intFromPtr(k) - @intFromPtr(self.keys.ptr)) / @sizeOf(tlsserver.CertifiedKey);
+        return k;
     }
 
     fn refuse(self: *HelloCheck, err: anyerror) ?*const tlsserver.CertifiedKey {
         self.failure = err;
-        return self.key;
+        return &self.keys[0];
     }
 };
 
 /// `-async`'s signer: the credential's key, here, when asked.
 const ShimSigner = struct {
-    key: tlsserver.certverify.SecretKey,
+    /// The credentials' keys, by `hello_check.selected`.
+    keys: []const tlsserver.certverify.SecretKey,
+    hello_check: *const HelloCheck,
     random: std.Random,
 
     fn sign(ctx: ?*anyopaque, scheme: u16, message: []const u8, out: []u8) error{SigningFailed}![]const u8 {
         const self: *ShimSigner = @ptrCast(@alignCast(ctx.?));
-        return tlsserver.certverify.signContent(@fromBackingInt(scheme), self.key, message, self.random, out) catch error.SigningFailed;
+        const key = self.keys[self.hello_check.selected orelse return error.SigningFailed];
+        return tlsserver.certverify.signContent(@fromBackingInt(scheme), key, message, self.random, out) catch error.SigningFailed;
     }
 };
 
@@ -532,12 +581,31 @@ fn singlePemCertificate(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ![
 const shim_max_leaf_len = 8192;
 
 fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume: *const Options, stateful: bool) !void {
-    const cert_pem = try readFile(gpa, io, initial.cert_file orelse return error.NoCertificate);
-    const key_pem = try readFile(gpa, io, initial.key_file orelse return error.NoKey);
-    var pair: tlsserver.keys.CertKeyPair = undefined;
-    try tlsserver.keys.CertKeyPair.fromPem(&pair, gpa, cert_pem, key_pem);
-    defer pair.deinit(gpa);
-    const ck = pair.certifiedKey();
+    // The `-new-…-credential` ones, then the default credential (BoringSSL
+    // falls back to it when none of the others matches).
+    const creds = initial.credentials.items;
+    if (on_resume.credentials.items.len != creds.len) return unimplemented("-on-resume-new-*-credential");
+    const has_default = initial.cert_file != null;
+    if (creds.len == 0 and !has_default) return error.NoCertificate;
+    const pairs = try gpa.alloc(tlsserver.keys.CertKeyPair, creds.len + @intFromBool(has_default));
+    var loaded: usize = 0;
+    defer for (pairs[0..loaded]) |*p| p.deinit(gpa);
+    for (creds) |c| {
+        const cert_pem = try readFile(gpa, io, c.cert_file orelse return error.NoCertificate);
+        const key_pem = try readFile(gpa, io, c.key_file orelse return error.NoKey);
+        if (c.delegated) {
+            try tlsserver.keys.CertKeyPair.fromPemDelegated(&pairs[loaded], gpa, cert_pem, key_pem, c.dc orelse return error.NoDelegatedCredential);
+        } else try tlsserver.keys.CertKeyPair.fromPem(&pairs[loaded], gpa, cert_pem, key_pem);
+        loaded += 1;
+    }
+    if (has_default) {
+        const cert_pem = try readFile(gpa, io, initial.cert_file.?);
+        const key_pem = try readFile(gpa, io, initial.key_file orelse return error.NoKey);
+        try tlsserver.keys.CertKeyPair.fromPem(&pairs[loaded], gpa, cert_pem, key_pem);
+        loaded += 1;
+    }
+    const base = try gpa.alloc(tlsserver.CertifiedKey, loaded);
+    for (base, pairs[0..loaded]) |*b, *p| b.* = p.certifiedKey();
 
     var seed: [32]u8 = undefined;
     io.randomSecure(&seed) catch return error.NoEntropy;
@@ -570,14 +638,14 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, initial: *const Options, on_resume:
         const o = if (i == 0) initial else on_resume;
         // BoringSSL's shim advances its clock after each connection.
         if (i != 0) clock.offset_ms += initial.resumption_delay_s * 1000;
-        const resumed = try connection(gpa, io, &ck, if (o.no_ticket) null else &tickets, if (o.enable_early_data) &early else null, csprng.random(), o, &clock);
+        const resumed = try connection(gpa, io, base, if (o.no_ticket) null else &tickets, if (o.enable_early_data) &early else null, csprng.random(), o, &clock);
         const want = i != 0 and !o.expect_session_miss;
         if (resumed != want) return if (resumed) error.UnexpectedSessionReuse else error.SessionNotReused;
     }
 }
 
 /// One connection; whether it resumed a session.
-fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.CertifiedKey, tickets: ?*const server_mod.Tickets, early: ?*const server_mod.EarlyData, random: std.Random, o: *const Options, clock: *ShimClock) !bool {
+fn connection(gpa: std.mem.Allocator, io: std.Io, base: []const tlsserver.CertifiedKey, tickets: ?*const server_mod.Tickets, early: ?*const server_mod.EarlyData, random: std.Random, o: *const Options, clock: *ShimClock) !bool {
     const want_peer: ?[]const u8 = if (o.expect_peer_cert_file) |f| try singlePemCertificate(gpa, io, f) else null;
     const x509_verifier: tlsserver.X509Verifier = .{
         .gpa = gpa,
@@ -596,29 +664,47 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .clock = clock.clock(),
         .max_leaf_len = shim_max_leaf_len,
     };
-    var leaf = ck.*;
-    leaf.ocsp_response = o.ocsp_response;
-    leaf.sct_list = o.sct_list;
-    if (o.signing_prefs.items.len != 0) leaf.signature_schemes = o.signing_prefs.items;
-    leaf.compressed_certificates = try compressCertificates(gpa, &leaf, random, o.cert_compression);
-    var offload_schemes: std.ArrayList(u16) = .empty;
-    var signer: ShimSigner = .{ .key = ck.key.?, .random = random };
-    if (o.async_sign) {
-        // The schemes the key can make, in its order (or `-signing-prefs`').
-        const key = ck.key.?;
-        for (tlsserver.certverify.candidateSchemes(key)) |s| if (tlsserver.certverify.canSign(key, s)) try offload_schemes.append(gpa, @backingInt(s));
-        if (leaf.signature_schemes) |prefs| {
-            var kept: std.ArrayList(u16) = .empty;
-            for (prefs) |p| if (std.mem.indexOfScalar(u16, offload_schemes.items, p) != null) try kept.append(gpa, p);
-            offload_schemes = kept;
+    const leaves = try gpa.alloc(tlsserver.CertifiedKey, base.len);
+    const keys = try gpa.alloc(tlsserver.certverify.SecretKey, base.len);
+    for (leaves, base, keys, 0..) |*leaf, b, *key, i| {
+        leaf.* = b;
+        key.* = b.key.?;
+        const prefs = if (i == o.credentials.items.len) blk: {
+            leaf.ocsp_response = o.ocsp_response;
+            leaf.sct_list = o.sct_list;
+            break :blk o.signing_prefs.items;
+        } else blk: {
+            const c = o.credentials.items[i];
+            leaf.ocsp_response = c.ocsp_response;
+            leaf.sct_list = c.sct_list;
+            leaf.delegated_credential = c.dc;
+            break :blk c.signing_prefs.items;
+        };
+        if (prefs.len != 0) leaf.signature_schemes = prefs;
+        // RFC 9345: what BoringSSL checks when the credential is added. Not
+        // the leaf's signature over it: the runner signs leaf ‖ algorithm ‖
+        // cred (`delegatedCredentialSignedMessage`), RFC 9345 §4 leaf ‖ cred
+        // ‖ algorithm, which `delegated.check` follows.
+        if (leaf.delegated_credential != null) try leaf.checkDelegatedKey();
+        leaf.compressed_certificates = try compressCertificates(gpa, leaf, random, o.cert_compression);
+        if (o.async_sign) {
+            // The schemes the key can make, in its order (or `-signing-prefs`').
+            var offload_schemes: std.ArrayList(u16) = .empty;
+            for (tlsserver.certverify.candidateSchemes(key.*)) |s| if (tlsserver.certverify.canSign(key.*, s)) try offload_schemes.append(gpa, @backingInt(s));
+            if (leaf.signature_schemes) |p| {
+                var kept: std.ArrayList(u16) = .empty;
+                for (p) |x| if (std.mem.indexOfScalar(u16, offload_schemes.items, x) != null) try kept.append(gpa, x);
+                offload_schemes = kept;
+            }
+            if (offload_schemes.items.len == 0) return unimplemented("-async (no scheme the key can make)");
+            leaf.key = null;
+            leaf.signature_schemes = null;
+            leaf.offload = .{ .schemes = offload_schemes.items };
         }
-        if (offload_schemes.items.len == 0) return unimplemented("-async (no scheme the key can make)");
-        leaf.key = null;
-        leaf.signature_schemes = null;
-        leaf.offload = .{ .schemes = offload_schemes.items };
+        try leaf.check();
     }
-    try leaf.check();
-    var hello_check: HelloCheck = .{ .key = &leaf, .o = o };
+    var hello_check: HelloCheck = .{ .keys = leaves, .o = o };
+    var signer: ShimSigner = .{ .keys = keys, .hello_check = &hello_check, .random = random };
     // ECH keys, as BoringSSL's shim adds them (one triple per key).
     const ech_keys = try gpa.alloc(tlsserver.ech.Key, o.ech_configs.items.len);
     if (o.ech_keys.items.len != ech_keys.len or o.ech_retry.items.len != ech_keys.len) return error.BadEchFlags;
@@ -651,7 +737,9 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     var rbuf: [record.max_record_len]u8 = undefined;
     var sr = stream.reader(io, &rbuf);
     // The writer's buffer is the server's output buffer.
-    const wbuf = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &leaf) + 4096);
+    var out_len: usize = 0;
+    for (leaves) |*l| out_len = @max(out_len, server_mod.minOutputLen(&cfg, l));
+    const wbuf = try gpa.alloc(u8, out_len + 4096);
     defer gpa.free(wbuf);
     var sw = stream.writer(io, wbuf);
     var id: [8]u8 = undefined;
@@ -743,6 +831,11 @@ fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8,
         if (got != want) return error.TicketAgeSkewMismatch;
     };
     if (o.expect_ech_accept and !c.server.echAccepted()) return error.EchNotAccepted;
+    if (o.expect_selected_credential) |want| {
+        const sel = hello_check.selected orelse return error.NoCredentialSelected;
+        const got: i32 = if (sel == o.credentials.items.len) -1 else @intCast(sel);
+        if (got != want) return error.SelectedCredentialMismatch;
+    }
     if (o.expect_server_name) |want| {
         const got = c.server.serverName() orelse return error.ServerNameMissing;
         if (!std.mem.eql(u8, got, want)) return error.ServerNameMismatch;
