@@ -685,7 +685,7 @@ test "tlsclient ↔ Server: a connection serialized, sealed, resumed in a new Se
     for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
         errdefer std.debug.print("suite {t}\n", .{suite});
         var prng = std.Random.DefaultPrng.init(0x5e7);
-        const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .cipher_suites = &.{suite}, .alpn_protocols = &.{ "h2", "http/1.1" }, .client_auth = &ca.auth };
+        const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .cipher_suites = &.{suite}, .alpn_protocols = &.{ "h2", "http/1.1" }, .client_auth = &ca.auth, .enable_secret_extraction = true };
         const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
         defer gpa.free(joiner);
         const out = try gpa.alloc(u8, @max(server_mod.minOutputLen(&config, &ck), server_mod.full_record_output_len) + 1000);
@@ -729,8 +729,13 @@ test "tlsclient ↔ Server: a connection serialized, sealed, resumed in a new Se
         // Sealed, the old server finished; a wrong key, a flipped octet refused.
         const key: [32]u8 = @splat(0x7a);
         var blob_buf: [4096]u8 = undefined;
-        try testing.expectError(error.BufferTooSmall, server.serialize(blob_buf[0 .. server.blobLen() - 1], &key));
-        const blob = try server.serialize(&blob_buf, &key);
+        try testing.expectError(error.BufferTooSmall, server.serialize(blob_buf[0 .. server.blobLen() - 1], &key, "conn-1/gen-1"));
+        // Not without `enable_secret_extraction` (checked first).
+        var cfg_off = config;
+        cfg_off.enable_secret_extraction = false;
+        var no_extract: Server = .init(&cfg_off, joiner, out);
+        try testing.expectError(error.SecretExtractionDisabled, no_extract.serialize(&blob_buf, &key, ""));
+        const blob = try server.serialize(&blob_buf, &key, "conn-1/gen-1");
         try testing.expectError(error.Closed, server.feed(&.{}));
         try testing.expectEqual(null, server.peerCertificate());
         try testing.expect(std.mem.indexOf(u8, blob, &client_certs.p256_cert) == null);
@@ -745,16 +750,19 @@ test "tlsclient ↔ Server: a connection serialized, sealed, resumed in a new Se
         for ([_]usize{ 0, 1, 20, blob.len - 1 }) |at| {
             @memcpy(copy[0..blob.len], blob);
             copy[at] ^= 1;
-            try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &key));
+            try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &key, "conn-1/gen-1"));
         }
         @memcpy(copy[0..blob.len], blob);
-        try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &@as([32]u8, @splat(0x7b))));
+        try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &@as([32]u8, @splat(0x7b)), "conn-1/gen-1"));
         @memcpy(copy[0..blob.len], blob);
         const no_alpn: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .alpn_protocols = &.{"http/1.1"} };
-        try testing.expectError(error.ConfigMismatch, Server.deserialize(&scratch, &no_alpn, joiner2, out2, peer2, copy[0..blob.len], &key));
+        try testing.expectError(error.ConfigMismatch, Server.deserialize(&scratch, &no_alpn, joiner2, out2, peer2, copy[0..blob.len], &key, "conn-1/gen-1"));
         @memcpy(copy[0..blob.len], blob);
         var moved: Server = undefined;
-        try Server.deserialize(&moved, &config, joiner2, out2, peer2, copy[0..blob.len], &key);
+        // Another connection's (or generation's) context.
+        try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &key, "conn-1/gen-2"));
+        @memcpy(copy[0..blob.len], blob);
+        try Server.deserialize(&moved, &config, joiner2, out2, peer2, copy[0..blob.len], &key, "conn-1/gen-1");
         defer moved.deinit();
         pipe.server = &moved;
 

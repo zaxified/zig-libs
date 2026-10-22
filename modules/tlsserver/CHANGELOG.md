@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Fixed** (two independent reviews of the day's features, no HIGH):
+  an inner ECH offer on the wire is `illegal_parameter` when ECH keys are set (RFC 9849 §7;
+  the backend's confirmation only without keys), `retry_configs` only for an outer offer;
+  an ECH key whose config skipped `Ech.check` (short public key, over 1024 octets) is
+  declined, not a panic; the HPKE context is wiped once no second hello can come, the
+  inner hello in `deinit`; `provideSignature` after `close()` is `Closed` (the flight no
+  longer went out in the clear); an offloaded delegated credential's signature is verified
+  under the credential's key; dynamic records count idleness from the last record
+  written. **Breaking:** `serialize` / `deserialize` take a `context` bound into the seal
+  (a blob is single-use: name the connection and the generation), and `serialize` needs
+  `Config.enable_secret_extraction`; `deserialize` refuses an over-long blob;
+  `Connection.serialize` added. **Tools:** the `tlsserver-keyupdate` harness's model reset
+  its KeyUpdate count on an empty record, which the server stopped doing on 2026-10-21 —
+  found by seeds the recaptured vectors moved.
+
 - **2026-10-22** — **Added:** connection migration: `Server.serialize(out, key)` seals a
   connected server's state (traffic and exporter secrets, sequence numbers, every
   negotiated parameter, the client's certificate) under AES-256-GCM, and

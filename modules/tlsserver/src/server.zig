@@ -1524,6 +1524,9 @@ pub const Server = struct {
 
     /// Wipe every secret and both buffers.
     pub fn deinit(self: *Server) void {
+        // The decrypted inner ClientHello (the real SNI, PSK identities): not
+        // a key, but what ECH hides.
+        if (self.ech_state != .none) zeroize(self.ech_buf);
         self.out.touch(self.write_slot_end);
         self.inbound.wipe();
         self.out.wipe();
@@ -1664,6 +1667,8 @@ pub const Server = struct {
         return .{ .scheme = self.sign_scheme, .message = self.sign_content[0..self.sign_len] };
     }
 
+    /// The `CertifiedKey` the handshake chose is read again here: it must
+    /// outlive the wait (as every key outlives its connections).
     /// The offloaded key's signature over `signatureRequest().message`: the
     /// CertificateVerify and the Finished are queued, and `feed` goes on.
     /// With `Offload.verify` a signature that does not verify under the
@@ -1671,6 +1676,9 @@ pub const Server = struct {
     /// `error.NoSignatureRequested`, and nothing changes.
     pub fn provideSignature(self: *Server, signature: []const u8) Error!void {
         if (self.state != .server_signature) return if (self.state == .failed) error.Closed else error.NoSignatureRequested;
+        // `close` while the key signed: the flight is not finished in the
+        // clear after the send key was wiped.
+        if (self.write_closed) return self.fail(error.Closed);
         burn.run(burn.handshake_burn, Error!void, completeSignature, .{ self, signature }) catch |err| return self.fail(err);
     }
 
@@ -1687,7 +1695,13 @@ pub const Server = struct {
         if (signature.len == 0 or signature.len > certverify.maxSignatureLen(scheme)) return error.InternalError;
         if (ck.offload.?.verify) {
             const leaf = ck.chain[0];
-            const public = (if (ck.raw_public_key) clientauth.rawPublicKey(leaf) else clientauth.leafPublicKey(leaf)) catch return error.InternalError;
+            // A delegated credential's key signs, not the leaf's.
+            const public = (if (ck.delegated_credential) |dc|
+                clientauth.rawPublicKey((delegated.parse(dc) catch return error.InternalError).spki)
+            else if (ck.raw_public_key)
+                clientauth.rawPublicKey(leaf)
+            else
+                clientauth.leafPublicKey(leaf)) catch return error.InternalError;
             const L = self.suite.hashLen().?;
             const th = self.sign_content[self.sign_len - L .. self.sign_len];
             certverify.verify(scheme, public, .server, th, signature) catch return error.InternalError;
@@ -1798,6 +1812,11 @@ pub const Server = struct {
     }
 
     pub const SerializeError = error{
+        /// `Config.enable_secret_extraction` is off: the blob carries the
+        /// traffic secrets, as `extractSecrets`'s result does.
+        SecretExtractionDisabled,
+        /// `context` over `max_blob_context_len` octets.
+        ContextTooLong,
         /// The handshake is not complete, or the connection failed or was
         /// closed (either way).
         NotConnected,
@@ -1812,7 +1831,8 @@ pub const Server = struct {
     };
 
     pub const DeserializeError = error{
-        /// Not a blob of this version, sealed under `key`, intact.
+        /// Not a blob of this version, sealed under `key` for `context`,
+        /// intact.
         BadBlob,
         /// The blob's ALPN protocol is not among `config.alpn_protocols`, its
         /// client certificate does not fit the peer buffer, or `config` is
@@ -1823,6 +1843,16 @@ pub const Server = struct {
     /// The version octet a blob starts with.
     pub const blob_version: u8 = 1;
     const blob_ad = "tlsserver connection v1";
+    /// The longest `context` a blob is bound to.
+    pub const max_blob_context_len = 255;
+
+    /// The blob's AAD: the label, the version, the caller's context.
+    fn blobAd(buf: *[blob_ad.len + 1 + max_blob_context_len]u8, context: []const u8) []const u8 {
+        @memcpy(buf[0..blob_ad.len], blob_ad);
+        buf[blob_ad.len] = blob_version;
+        @memcpy(buf[blob_ad.len + 1 ..][0..context.len], context);
+        return buf[0 .. blob_ad.len + 1 + context.len];
+    }
     /// version ‖ nonce ‖ ciphertext ‖ tag; the plaintext's fixed part.
     const blob_overhead = 1 + 12 + 16;
     const blob_fixed = 2 + 2 + 3 * 48 + 8 + 8 + 1 + 1 + 1 + 255 + 1 + 253 + 1 + 8 + 2 + 1 + 2 + 8 + 1 + 1 + 3 + 1 + 1 + fingerprint.ja4_len + 1 + 2;
@@ -1841,7 +1871,16 @@ pub const Server = struct {
     /// The connection, sealed under `key` (AES-256-GCM, a random nonce), to
     /// go on in another process or after a restart (`deserialize`) without
     /// the client noticing (s2n `s2n_connection_serialize`, whose blob is
-    /// plaintext for the caller to protect; rustls has none). It holds the
+    /// plaintext for the caller to protect; rustls has none). Needs
+    /// `Config.enable_secret_extraction` (the blob carries the traffic
+    /// secrets). `context` (at most 255 octets) is bound into the seal:
+    /// `deserialize` must get the same — make it name this connection and
+    /// this hand-over (an id and a generation counter), so a blob cannot
+    /// be resumed for another connection or twice: **a blob is single-use.**
+    /// Two live copies seal different records under one key and one
+    /// sequence number (AES-GCM nonce reuse): the caller keeps the blob
+    /// from being resumed twice or rolled back. `config.random` must be a
+    /// CSPRNG (it draws the nonce). It holds the
     /// application traffic secrets and the exporter's, both sequence
     /// numbers, the negotiated parameters (suite, group, ALPN, SNI, the
     /// client's certificate and how it was proved, resumption, early data,
@@ -1850,14 +1889,16 @@ pub const Server = struct {
     /// unconsumed go along with the blob), no KeyUpdate due. Afterwards this
     /// server is finished, as after `extractSecrets`: one live copy of the
     /// keys, so the record nonces never repeat. Rotate `key` as a STEK.
-    pub fn serialize(self: *Server, out: []u8, key: *const [32]u8) SerializeError![]u8 {
+    pub fn serialize(self: *Server, out: []u8, key: *const [32]u8, context: []const u8) SerializeError![]u8 {
         if (self.config.quic != null) return error.WrongTransport;
+        if (!self.config.enable_secret_extraction) return error.SecretExtractionDisabled;
+        if (context.len > max_blob_context_len) return error.ContextTooLong;
         if (self.state != .connected or self.write_closed or self.peer_closed) return error.NotConnected;
         if (self.pendingOutput().len != 0 or self.tx_update != null or !self.inbound.joiner.isEmpty() or self.write_slot_end != 0)
             return error.NotQuiescent;
         if (self.out.tx.seq >= max_records_per_key) return error.NotQuiescent;
         if (out.len < serializedLen(self.peer_len)) return error.BufferTooSmall;
-        burn.run(burn.handshake_burn, void, serializeBody, .{ self, out, key });
+        burn.run(burn.handshake_burn, void, serializeBody, .{ self, out, key, context });
         const n = serializedLen(self.peer_len);
         // `fail`'s wipe, without an alert (`Closed` calls for none).
         const e = self.fail(error.Closed);
@@ -1865,7 +1906,7 @@ pub const Server = struct {
         return out[0..n];
     }
 
-    fn serializeBody(self: *Server, out: []u8, key: *const [32]u8) void {
+    fn serializeBody(self: *Server, out: []u8, key: *const [32]u8, context: []const u8) void {
         const pt = out[13..][0 .. blob_fixed + self.peer_len];
         @memset(pt, 0);
         var w: std.Io.Writer = .fixed(pt);
@@ -1914,7 +1955,8 @@ pub const Server = struct {
         out[0] = blob_version;
         self.config.random.bytes(out[1..13]);
         const tag = out[13 + pt.len ..][0..16];
-        aesgcm.Aes256Gcm.encryptInto(pt, tag, pt, blob_ad, out[1..13].*, key);
+        var ad: [blob_ad.len + 1 + max_blob_context_len]u8 = undefined;
+        aesgcm.Aes256Gcm.encryptInto(pt, tag, pt, blobAd(&ad, context), out[1..13].*, key);
     }
 
     /// The connection `serialize` sealed, resumed into `out` over `config`
@@ -1924,21 +1966,25 @@ pub const Server = struct {
     /// made (and any the old one left unconsumed). The configuration must
     /// offer the same ALPN protocol (`ConfigMismatch`); the rest of it
     /// (tickets, KeyUpdate limits, dynamic records) is the new one's.
-    /// `blob` is decrypted in place (its secrets wiped). On an error `out`
-    /// is a failed server (`deinit` it as any).
-    pub fn deserialize(out: *Server, config: *const Config, joiner_buf: []u8, output_buf: []u8, peer_buf: []u8, blob: []u8, key: *const [32]u8) DeserializeError!void {
+    /// `blob` is decrypted in place and consumed: its secrets are wiped,
+    /// so a failed attempt (`ConfigMismatch`) cannot be retried with it.
+    /// `out` must hold no live server (it is overwritten); on an error it is
+    /// a failed one (`deinit` it as any). `context` is `serialize`'s.
+    pub fn deserialize(out: *Server, config: *const Config, joiner_buf: []u8, output_buf: []u8, peer_buf: []u8, blob: []u8, key: *const [32]u8, context: []const u8) DeserializeError!void {
         out.* = .init(config, joiner_buf, output_buf);
         out.peer_buf = peer_buf;
         errdefer out.deinit();
         if (config.quic != null) return error.ConfigMismatch;
-        if (blob.len < blob_overhead + blob_fixed or blob[0] != blob_version) return error.BadBlob;
-        try burn.run(burn.handshake_burn, DeserializeError!void, deserializeBody, .{ out, blob, key });
+        if (context.len > max_blob_context_len) return error.BadBlob;
+        if (blob.len < blob_overhead + blob_fixed or blob.len > serializedLen(std.math.maxInt(u16)) or blob[0] != blob_version) return error.BadBlob;
+        try burn.run(burn.handshake_burn, DeserializeError!void, deserializeBody, .{ out, blob, key, context });
     }
 
-    fn deserializeBody(s: *Server, blob: []u8, key: *const [32]u8) DeserializeError!void {
+    fn deserializeBody(s: *Server, blob: []u8, key: *const [32]u8, context: []const u8) DeserializeError!void {
         const pt = blob[13 .. blob.len - 16];
         defer std.crypto.secureZero(u8, pt[0..@min(pt.len, 2 + 2 + 3 * 48)]);
-        aesgcm.Aes256Gcm.decryptInto(pt, pt, blob[blob.len - 16 ..][0..16].*, blob_ad, blob[1..13].*, key) catch return error.BadBlob;
+        var ad: [blob_ad.len + 1 + max_blob_context_len]u8 = undefined;
+        aesgcm.Aes256Gcm.decryptInto(pt, pt, blob[blob.len - 16 ..][0..16].*, blobAd(&ad, context), blob[1..13].*, key) catch return error.BadBlob;
         var r: std.Io.Reader = .fixed(pt);
         const get = struct {
             fn int(rd: *std.Io.Reader, comptime T: type) T {
@@ -2018,9 +2064,11 @@ pub const Server = struct {
     }
 
     pub const QuicResult = struct {
-        /// `handshake_done` (the client's Finished verified) or
+        /// `handshake_done` (the client's Finished verified),
         /// `early_data_accepted` (its 0-RTT is taken: `quicSecret(.read,
-        /// .early)`); null: nothing to report.
+        /// .early)`) or `signature_needed` (an offloaded key: answer with
+        /// `provideSignature`, then send `quicOutput`); null: nothing to
+        /// report.
         event: ?Event = null,
         /// The client's transport parameters, when this call took its
         /// ClientHello (the second one after a HelloRetryRequest): opaque
@@ -2267,9 +2315,10 @@ pub const Server = struct {
             zeroize(self.out.buf[self.out.len..]);
             return self.fail(err);
         };
-        if (self.config.dynamic_records != null) {
+        if (self.config.dynamic_records) |d| {
             self.dyn_sent +|= n;
             self.dyn_records +|= 1;
+            if (d.clock) |c| self.dyn_last_ms = c.now_ms(c.ctx);
         }
     }
 
@@ -2279,14 +2328,11 @@ pub const Server = struct {
     pub fn recordLen(self: *Server) u16 {
         const max = self.out.max_fragment;
         const d = self.config.dynamic_records orelse return max;
-        if (d.clock) |c| {
-            const now = c.now_ms(c.ctx);
-            if (self.dyn_records != 0 and now -| self.dyn_last_ms >= d.idle_reset_ms) {
-                self.dyn_sent = 0;
-                self.dyn_records = 0;
-            }
-            self.dyn_last_ms = now;
-        }
+        // Idle since the last record written (`commitWrite` stamps it).
+        if (d.clock) |c| if (self.dyn_records != 0 and c.now_ms(c.ctx) -| self.dyn_last_ms >= d.idle_reset_ms) {
+            self.dyn_sent = 0;
+            self.dyn_records = 0;
+        };
         if (self.dyn_sent >= d.boost_after) return max;
         const n = @as(u64, @max(d.segment_len, 1)) * (@as(u64, self.dyn_records) + 1);
         return @intCast(@min(n, max));
@@ -2538,8 +2584,9 @@ pub const Server = struct {
         };
         // RFC 9849 §7.2: as a backend server (split mode: a client-facing
         // server decrypted the hello and passed the inner one on), a hello
-        // with an inner offer gets the confirmation too (BoringSSL always).
-        if (!retried and self.ech_state != .accepted) if (ch.ech_raw) |data| {
+        // with an inner offer gets the confirmation (BoringSSL always). Only
+        // without ECH keys: a client-facing server refused it above.
+        if (!retried and cfg.ech == null) if (ch.ech_raw) |data| {
             if (data.len != 0 and data[0] == 1) {
                 _ = try echOffer(data);
                 self.ech_state = .backend;
@@ -2698,6 +2745,8 @@ pub const Server = struct {
             .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
             else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
         }
+        // RFC 9849: the HPKE context is for a second ClientHello only.
+        self.ech_opener.wipe();
         // An offloaded signature (a full handshake: never with early data).
         const next: State = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
         if (self.sign_cert != null) {
@@ -2733,8 +2782,9 @@ pub const Server = struct {
             self.ech_offered = false;
             const data = outer.ech_raw orelse return null;
             const offer = switch (try echOffer(data)) {
-                // A backend's part (split mode, below), not this one's.
-                .inner => return null,
+                // RFC 9849 §7: a client-facing server refuses an inner offer
+                // (the backend's part, below, is only a server without keys).
+                .inner => return error.IllegalParameter,
                 .outer => |o| o,
             };
             self.ech_offered = true;
@@ -2750,7 +2800,10 @@ pub const Server = struct {
         // §7.1.1: declined (or not offered) on the first hello, the second
         // is not decrypted either.
         if (self.ech_state != .accepted) {
-            if (outer.ech_raw != null) self.ech_offered = true;
+            // `retry_configs` answers an outer offer only (§5).
+            if (outer.ech_raw) |data| if (try echOffer(data) == .outer) {
+                self.ech_offered = true;
+            };
             return null;
         }
         const data = outer.ech_raw orelse return error.MissingExtension;
@@ -3540,6 +3593,8 @@ const Hello = struct {
     record_size_limit: ?u16 = null,
     /// RFC 9345 `delegated_credential` schemes.
     dc_schemes: ?[]const u16 = null,
+    /// RFC 9849 `encrypted_client_hello`, as is.
+    ech: ?[]const u8 = null,
 };
 
 fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
@@ -3658,6 +3713,7 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     }
     if (h.early_data) try W.ext(&e, gpa, 42, "");
     if (h.record_size_limit) |l| try W.ext(&e, gpa, 28, &.{ @truncate(l >> 8), @truncate(l) });
+    if (h.ech) |d| try W.ext(&e, gpa, 0xfe0d, d);
     if (h.dc_schemes) |v| {
         const d = try W.list16(gpa, u16, v);
         defer gpa.free(d);
@@ -3984,6 +4040,77 @@ test "RFC 9345: checkDelegated refuses another key, a broken signature, RSA, ove
     try testing.expectError(error.DelegatedCredential, ck.check());
     try testing.expectError(error.UnsupportedAlgorithm, ck.checkDelegated());
     try testing.expect(!delegated.hasDelegationUsage(test_chain[0]));
+}
+
+test "review fixes: close() while a signature is awaited; offload with a delegated credential and verify" {
+    // close() first: the signature that comes later is refused, nothing goes
+    // out in the clear.
+    var r: OffloadRun = undefined;
+    try r.start(true);
+    defer r.s.deinit();
+    try r.s.close();
+    const before = r.s.pendingOutput().len;
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    const req = r.s.signatureRequest().?;
+    try testing.expectError(error.Closed, r.s.provideSignature(try r.sign(req.message, &buf)));
+    try testing.expectEqual(before, r.s.pendingOutput().len);
+    try testing.expectEqual(State.failed, r.s.state);
+
+    // An offloaded delegated credential: verified under the credential's key.
+    var t: TestDc = undefined;
+    try t.init();
+    var ck = t.certifiedKey();
+    ck.key = null;
+    ck.offload = .{ .schemes = &.{0x0807} };
+    try ck.check();
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .dc_schemes = &.{0x0807} });
+    defer testing.allocator.free(rec);
+    try testing.expect((try s.feed(rec)).event == .signature_needed);
+    const dreq = s.signatureRequest().?;
+    try testing.expectEqual(@as(u16, 0x0807), dreq.scheme);
+    const sig = try certverify.signContent(.ed25519, .{ .ed25519 = &t.ed.secret_key }, dreq.message, null, &buf);
+    try s.provideSignature(sig);
+    try testing.expectEqual(State.client_finished, s.state);
+}
+
+test "review fixes: ECH — an inner offer refused when keys are set; a key with a short public key never panics" {
+    const kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+    var cbuf: [256]u8 = undefined;
+    const config = try ech.makeConfig(&cbuf, 9, &kp.public_key, "public.example", 0);
+    var prng = std.Random.DefaultPrng.init(1);
+    const keys = [_]ech.Key{.{ .config = config, .private_key = &kp.secret_key }};
+    const e: ech.Ech = .{ .keys = &keys };
+    var cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .ech = &e };
+    var r = try refuse(.{ .ech = &.{1} }, cfg);
+    try testing.expectEqual(error.IllegalParameter, r.err);
+    // A config whose public key is 31 octets (never `check`ed): an offer for
+    // it is declined, not a panic.
+    var short: [256]u8 = undefined;
+    @memcpy(short[0..config.len], config);
+    short[4 + 1 + 2 + 1] = 31; // the public key's length octet
+    const bad = [_]ech.Key{.{ .config = short[0..config.len], .private_key = &kp.secret_key }};
+    const e2: ech.Ech = .{ .keys = &bad };
+    try testing.expectError(error.InvalidConfig, e2.check());
+    cfg.ech = &e2;
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    const ebuf = try testing.allocator.alloc(u8, ech.bufferLen(e2.max_client_hello_len));
+    defer testing.allocator.free(ebuf);
+    var s: Server = .init(&cfg, &joiner, &out);
+    s.setEchBuffer(ebuf);
+    defer s.deinit();
+    const offer = [_]u8{ 0, 0, 1, 0, 1, 9, 0, 32 } ++ @as([32]u8, @splat(9)) ++ [_]u8{ 0, 20 } ++ @as([20]u8, @splat(1));
+    const rec = try buildRecord(testing.allocator, .{ .ech = &offer });
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    try testing.expect(!s.echAccepted());
+    _ = &r;
 }
 
 test "obsolete groups in supported_groups alone are served (JDK 11 lists them)" {

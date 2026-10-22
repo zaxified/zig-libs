@@ -128,7 +128,7 @@ pub fn check(raw: []const u8, leaf_der: []const u8) Error!Credential {
     if (c.valid_time > max_valid_time_s) return error.ValidTooLong;
     if (!schemeAllowed(c.scheme)) return error.UnsupportedAlgorithm;
     if (leaf_der.len > max_leaf_len) return error.BadSignature;
-    var buf: [64 + context_string.len + 1 + max_leaf_len + 9 + 1024]u8 = undefined;
+    var buf: [64 + context_string.len + 1 + max_leaf_len + 9 + 1024 + 2]u8 = undefined;
     if (c.cred.len > 9 + 1024) return error.Malformed;
     const msg = signedMessage(&buf, leaf_der, c.cred, c.algorithm) catch return error.Malformed;
     const public = clientauth.leafPublicKey(leaf_der) catch return error.BadSignature;
@@ -154,7 +154,7 @@ pub fn issue(out: []u8, leaf_der: []const u8, leaf_key: certverify.SecretKey, al
     std.mem.writeInt(u24, out[6..9], @intCast(spki.len), .big);
     @memcpy(out[9..][0..spki.len], spki);
     std.mem.writeInt(u16, out[cred_len..][0..2], algorithm, .big);
-    var mbuf: [64 + context_string.len + 1 + max_leaf_len + 9 + 1024]u8 = undefined;
+    var mbuf: [64 + context_string.len + 1 + max_leaf_len + 9 + 1024 + 2]u8 = undefined;
     const msg = try signedMessage(&mbuf, leaf_der, out[0..cred_len], algorithm);
     const sig = try certverify.signContent(@fromBackingInt(algorithm), leaf_key, msg, random, out[cred_len + 4 ..]);
     std.mem.writeInt(u16, out[cred_len + 2 ..][0..2], @intCast(sig.len), .big);

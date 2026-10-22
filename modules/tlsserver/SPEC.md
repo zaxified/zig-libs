@@ -293,7 +293,8 @@ no key (a GREASE offer, a stale config, a hello over `max_client_hello_len`) is 
 error: the outer hello goes on (its SNI picks the public name's certificate) and the
 EncryptedExtensions carry `retry_configs`, the keys marked `retry`. A hello with an
 inner offer and no outer one gets the confirmation too (the backend's part in split
-mode, as BoringSSL). `Server.echAccepted()` reports it. Checked by: BoGo's 45 TLS
+mode, as BoringSSL — only on a server without ECH keys: a client-facing one refuses an
+inner offer with `illegal_parameter`, RFC 9849 §7). `Server.echAccepted()` reports it. Checked by: BoGo's 45 TLS
 `ECH-Server-*` tests (accept, decline with retry configs, HRR, outer extensions and their
 faults, padding, ciphers, early data, client certificates, backend role; the shim's
 `-ech-server-config/-key/-is-retry-config`, `-expect-ech-accept`), Go 1.26's ECH client
@@ -335,11 +336,19 @@ key and the algorithm, not the signature.
 traffic secrets and the exporter's, both sequence numbers, the KeyUpdate budget, suite,
 group, ALPN, SNI, the client's certificate and how it was proved, resumption and early-data
 outcome, ECH, the client's record size limit, JA4 — sealed into a blob under the caller's
-32-octet key (AES-256-GCM, a random nonce, version 1, `serializedLen` / `blobLen`), so a
+32-octet key and to a `context` the caller names (AES-256-GCM, a random nonce, the AAD
+"tlsserver connection v1" ‖ version ‖ context; `serializedLen` / `blobLen`), so a
 restart, an upgrade or another process takes the connection over without the client
 noticing (qap: zero-downtime reload with the socket handed over). Unlike s2n's plaintext
 blob, which its documentation tells the caller to encrypt and MAC, this one is sealed
-already; a flipped octet, a wrong key or another version is `BadBlob`. Conditions are
+already; a flipped octet, a wrong key, another context or another version is `BadBlob`.
+**A blob is single-use:** two live copies seal different records under one key and
+sequence number (AES-GCM nonce reuse), so the context should name the connection and the
+hand-over's generation, and keeping a blob from being resumed twice or rolled back is
+the caller's (the old server is finished; `deserialize` consumes the blob, wiping its
+secrets). It needs `Config.enable_secret_extraction`, as `extractSecrets` does, and
+`config.random` must be a CSPRNG (it draws the nonce). `Connection.serialize` refuses
+while `reader()` holds decrypted octets or `writer()` unflushed ones. Conditions are
 `extractSecrets`'s (output sent, every received octet fed — octets the caller holds
 unconsumed travel with the blob, no KeyUpdate due), and the old server is finished
 afterwards (one live copy: record nonces never repeat). `deserialize(out, config,

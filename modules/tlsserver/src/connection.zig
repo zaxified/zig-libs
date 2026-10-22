@@ -189,6 +189,22 @@ pub const Connection = struct {
         }
     }
 
+    /// `Server.serialize` for a connection driven here: everything it
+    /// queued is sent first, and nothing may be held in `reader()` (decrypted
+    /// and not read: `error.NotQuiescent`) or `writer()` (written and not
+    /// flushed: flush first). Octets in `input`'s buffer not yet consumed
+    /// go with the blob, as the caller's.
+    /// secret-api-ok: chains `Server.serialize`, which seals under its own burn; no secret is held in this frame.
+    pub fn serialize(self: *Connection, out: []u8, key: *const [32]u8, context: []const u8) (Error || Server.SerializeError)![]u8 {
+        self.enter();
+        defer self.leave();
+        if (self.app_in.seek != self.app_in.end or self.app_out.end != 0) return error.NotQuiescent;
+        if (self.app_out.buffer.len != 0) self.server.abandonWrite(0);
+        self.app_out.buffer = &.{};
+        try self.flushOut();
+        return self.server.serialize(out, key, context);
+    }
+
     /// The offloaded signature, from `signer`, once the flight so far is
     /// out (the client hashes it while the key signs).
     fn sign(self: *Connection) Error!void {

@@ -2131,6 +2131,8 @@ fn nextSecret(suite: record.CipherSuite, secret: *[48]u8) []const u8 {
 
 const KuClient = struct {
     server: *server_mod.Server,
+    /// The recording the connection came from (for a failure's report).
+    case_name: []const u8 = "",
     suite: record.CipherSuite,
     gpa: std.mem.Allocator,
     in: []u8,
@@ -2299,7 +2301,7 @@ const KuClient = struct {
         if (request == 1) c.requestArrives();
         c.in_a_row += 1;
         if (try c.feed(end, &app)) |err| {
-            std.debug.print("client KeyUpdate({d}) refused: {t}\n", .{ request, err });
+            std.debug.print("client KeyUpdate({d}) refused: {t} (case {s}, {d} in a row, server budget {d})\n", .{ request, err, c.case_name, c.in_a_row, c.server.key_updates_left });
             return error.KeyUpdateRefused;
         }
         if (app.items.len != 0) return error.DataFromNowhere;
@@ -2396,7 +2398,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     const fin = for (starts, 0..) |s, i| {
         if (v.client[s] == 23) break i;
     } else return error.NoFinishedInRecording;
-    var c: KuClient = .{ .server = &server, .suite = undefined, .gpa = gpa, .in = try gpa.alloc(u8, 4 * record.max_record_len) };
+    var c: KuClient = .{ .server = &server, .case_name = v.name, .suite = undefined, .gpa = gpa, .in = try gpa.alloc(u8, 4 * record.max_record_len) };
     defer c.deinit();
     {
         @memcpy(c.in[0..v.client.len], v.client);
@@ -2467,8 +2469,9 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
                     return error.DataRefused;
                 }
                 if (!std.mem.eql(u8, app.items, data[0..n])) return error.ClientDataDiffers;
-                if (n == 0) KuMark.mark(.empty_app_record);
-                c.in_a_row = 0;
+                // Only a record with data refills the server's KeyUpdate
+                // budget (since 2026-10-21, BoringSSL `kMaxKeyUpdates`).
+                if (n == 0) KuMark.mark(.empty_app_record) else c.in_a_row = 0;
             },
             6, 7 => {
                 const n = src.valueRangeAtMost(u16, 1, 200);

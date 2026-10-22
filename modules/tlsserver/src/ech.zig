@@ -41,6 +41,9 @@ pub const ext_encrypted_client_hello: u16 = 0xfe0d;
 pub const ext_ech_outer_extensions: u16 = 0xfd00;
 
 pub const kem_x25519: u16 = 0x0020;
+
+/// The longest `ECHConfig` served (its HPKE `info` is built on the stack).
+pub const max_config_len = 1024;
 pub const kdf_hkdf_sha256: u16 = 0x0001;
 pub const aead_aes128_gcm: u16 = 0x0001;
 pub const aead_aes256_gcm: u16 = 0x0002;
@@ -72,7 +75,8 @@ pub const Ech = struct {
     max_client_hello_len: u16 = 8192,
 
     pub const CheckError = ParseError || error{
-        /// No key, or a config that is not X25519 / has no suite served.
+        /// No key, or a config that is not X25519 / has no suite served /
+        /// is over `max_config_len` octets.
         Unsupported,
         /// The private key's public half is not the config's.
         KeyMismatch,
@@ -87,7 +91,7 @@ pub const Ech = struct {
         var retry_len: usize = 0;
         for (self.keys) |k| {
             const c = try parseConfig(k.config);
-            if (c.kem_id != kem_x25519 or c.public_key.len != 32) return error.Unsupported;
+            if (c.kem_id != kem_x25519 or c.public_key.len != 32 or k.config.len > max_config_len) return error.Unsupported;
             var any = false;
             var it = c.suites();
             while (it.next()) |s| any = any or supported(s.kdf, s.aead);
@@ -308,8 +312,8 @@ pub const Opener = union(enum) {
     // secret-api-ok: the private key is copied into one KeyPair local, wiped on return; hpke's decap runs under its own burn.
     fn setup(self: *Opener, key: *const Key, config: *const Config, offer: *const Offer) bool {
         if (offer.enc.len != @typeInfo(X25519Kem.EncappedKey).array.len) return false;
-        var info: [8 + 1024]u8 = undefined;
-        if (key.config.len > 1024) return false;
+        var info: [8 + max_config_len]u8 = undefined;
+        if (key.config.len > max_config_len) return false;
         @memcpy(info[0..8], "tls ech\x00");
         @memcpy(info[8..][0..key.config.len], key.config);
         var kp: X25519Kem.KeyPair = .{ .public_key = config.public_key[0..32].*, .secret_key = key.private_key.* };
@@ -363,7 +367,8 @@ pub fn openFirst(e: *const Ech, outer: *const hello.ClientHello, body: []const u
     const plain = buf[body.len..][0 .. offer.payload.len - 16];
     for (e.keys) |*k| {
         const c = parseConfig(k.config) catch continue;
-        if (c.config_id != offer.config_id or c.kem_id != kem_x25519) continue;
+        // `check` refuses these; a key that skipped it must not panic here.
+        if (c.config_id != offer.config_id or c.kem_id != kem_x25519 or c.public_key.len != 32 or k.config.len > max_config_len) continue;
         var served = false;
         var it = c.suites();
         while (it.next()) |s| served = served or (s.kdf == offer.kdf and s.aead == offer.aead);
