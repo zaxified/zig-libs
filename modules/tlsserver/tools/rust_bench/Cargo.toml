@@ -1,0 +1,21 @@
+[package]
+name = "rust_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Alt side of `zig build bench-tlsserver` (modules/tlsserver/tools/bench.zig):
+# rustls 0.23.43 (Apache-2.0 OR ISC OR MIT) over aws-lc-rs 1.18.0, pinned
+# exactly. Default features off: the aws-lc-rs provider and std only, no
+# TLS 1.2, no `ring`.
+[dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std"] }
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["aws-lc-sys"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

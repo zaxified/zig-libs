@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Tools:** `bench-tlsserver` measures the fastest in the field too:
+  rustls 0.23.43 over aws-lc-rs 1.18.0 (`tools/rust_bench`, built offline by cargo; a fresh
+  rustls client and server per handshake op, only the server's calls timed — aws-lc cannot
+  replay). Card: fastest 1.02× worst (sending a 16 KiB record), P2 → P1.
+
 - **2026-10-22** — **Fixed:** a `Connection` read sends what the server queued before it
   waits, so a writer parked mid-send (an HTTP/2 stream on a fiber of the same thread, qap's
   `Config.h2_concurrency`) and the reader sent the same records twice — a corrupt stream, or

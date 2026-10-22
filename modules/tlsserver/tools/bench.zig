@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 
 //! Comparative benchmark: `tlsserver.Server` against OpenSSL 3's libssl TLS
-//! 1.3 server (the reference named by the maturity card), the program behind
-//! the `**Performance:**` line of the card (CONVENTIONS.md §9, kept
+//! 1.3 server (the reference named by the maturity card) and against rustls
+//! over aws-lc-rs (the fastest in the field, the `alt` column), the program
+//! behind the `**Performance:**` line of the card (CONVENTIONS.md §9, kept
 //! instrument kind 3).
 //!
 //! What is timed is the SERVER's work only. Each side first records a session
@@ -18,9 +19,16 @@
 //! group and signature scheme, one ticket per handshake where tickets are on,
 //! stateless tickets, no session cache).
 //!
+//! The rustls side (`tools/rust_bench`, read its header) cannot replay:
+//! aws-lc takes ECDSA nonces, RSA-PSS salts and ephemeral keys from its own
+//! RNG. Each of its handshake ops is a fresh rustls client and server in
+//! memory, and only the server's calls are timed.
+//!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-tlsserver` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs `zig` on PATH (it
-//! builds the C side with `zig cc -O3 -march=native`) and the system OpenSSL 3
+//! builds the C side with `zig cc -O3 -march=native`), `cargo` with rustls
+//! 0.23.43 and aws-lc-rs 1.18.0 in the local registry (built offline into
+//! `.zig-cache/bench-tlsserver/target`), and the system OpenSSL 3
 //! (`libssl.so.3` + `libcrypto.so.3`, paths below or `LIBSSL_SO` /
 //! `LIBCRYPTO_SO`; no headers needed). Run from the repository root.
 //!
@@ -43,7 +51,8 @@
 //! `BENCH_ROUNDS` (default 3) rounds, each keeping its best; the spread
 //! printed is (worst round − best round) / best round per side. Ratios are
 //! ours/theirs by user-mode cycles when both sides count them, else by wall
-//! time. Arguments filter workloads by substring (no card line then).
+//! time; `/fast` is ours over the faster of OpenSSL and rustls. Arguments
+//! filter workloads by substring (no card line then).
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -57,6 +66,7 @@ const certs = tlsserver.test_fixtures;
 const Work = bench.Work(Op);
 
 const bench_name = "bench-tlsserver";
+const cargo_manifest = "modules/tlsserver/tools/rust_bench/Cargo.toml";
 const work_dir = ".zig-cache/bench-tlsserver";
 const default_ssl = "/usr/lib/x86_64-linux-gnu/libssl.so.3";
 const default_crypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
@@ -386,6 +396,24 @@ pub fn main(init: std.process.Init) !u8 {
     const exe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, "modules/tlsserver/tools/c_bench/foreign_bench.c", &.{ ssl_so, crypto_so });
     // OpenSSL records and checks its replays before anything is timed.
     try bench.foreignOnce(arena, io, bench_name, exe, abs, "interop");
+    // rustls: built once, offline; checks what each workload negotiates.
+    var env = try init.environ_map.clone(arena);
+    const target = try arena.print("{s}/target", .{abs});
+    try env.put("CARGO_TARGET_DIR", target);
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const cargo = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", cargo_manifest },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the benchmark needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (cargo.term != .exited or cargo.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, cargo.stderr });
+        return 1;
+    }
+    const rust_exe = try arena.print("{s}/release/rust_bench", .{target});
+    try bench.foreignOnce(arena, io, bench_name, rust_exe, abs, "interop");
 
     const x = try arena.create(Ctx);
     x.* = .{
@@ -409,9 +437,9 @@ pub fn main(init: std.process.Init) !u8 {
         const name = @tagName(c);
         if (!bench.selected(name, filters)) continue;
         try setup(x, c);
-        const ws = [_]Work{.{ .name = name, .op = c, .ref = name }};
+        const ws = [_]Work{.{ .name = name, .op = c, .ref = name, .alt = name, .alt_exe = 1 }};
         var line: std.Io.Writer.Allocating = .init(arena);
-        const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .rounds = rounds }, x, once, &ws, &line.writer);
+        const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, rust_exe }, .abs = abs, .rounds = rounds }, x, once, &ws, &line.writer);
         // `drive` prints a header and a rounds line per call: keep the row.
         var it = std.mem.splitScalar(u8, line.written(), '\n');
         _ = it.next();
@@ -422,11 +450,13 @@ pub fn main(init: std.process.Init) !u8 {
         total.max_spread = @max(total.max_spread, s.max_spread);
         total.best_ref = @min(total.best_ref, s.best_ref);
         total.worst_ref = @max(total.worst_ref, s.worst_ref);
+        total.alt_banner = s.alt_banner;
+        if (s.worst_fast) |f| total.worst_fast = @max(total.worst_fast orelse 0, f);
     }
     try w.print("rounds: {d}; ratios by {s}; largest spread {d:.1}%{s}\n", .{ rounds, if (total.by_cycles) "user-mode cycles" else "wall time", 100 * total.max_spread, if (total.max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
-    try w.print("reference: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, total.banner, "\n"), total.worst_ref, total.best_ref });
+    try w.print("reference: {s}\ncandidate: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3}); worst ours/min(OpenSSL, rustls) = {d:.3}\n", .{ std.mem.trimEnd(u8, total.banner, "\n"), std.mem.trimEnd(u8, total.alt_banner, "\n"), total.worst_ref, total.best_ref, total.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libssl (server side, replayed sessions: full handshake P-256/RSA-2048/X25519MLKEM768, resumption, AES-256-GCM 16 KiB records) · fastest ? (measured <today>)\n", .{ total.best_ref, total.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> libssl (server side, replayed sessions: full handshake P-256/RSA-2048/X25519MLKEM768, resumption, AES-256-GCM 16 KiB records) · fastest {d:.2}× worst vs the faster of OpenSSL and rustls 0.23.43 + aws-lc-rs 1.18.0 (measured <today>)\n", .{ total.best_ref, total.worst_ref, total.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }
