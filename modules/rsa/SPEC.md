@@ -355,6 +355,10 @@ within 0.6 % of the unblinded ones, as OpenSSL's do. What is left at 2048 for `.
 stateless draw (the inverse and `r^e`, ~4.7 % of cycles); the modexp itself (`pow`, REDC 54 % of it
 at L = 16) is the next lever and is not touched here.
 
+Re-measured on a quiet host 2026-10-22 (`22733ec8`, Zig 0.17, two runs of 7 rounds; our spreads
+≤ 0.6 %, OpenSSL's up to 6 %): worst 1.088× (`signbl_2048`) / 1.084× (`decbl_2048`), 3072 and 4096
+≤ 1.025×, verify 0.82–0.89×. The P2 bar (≤ 1.10×) holds; the 10-18 "1.12×" was the loaded host.
+
 ## Performance posture — measured 2026-09-08, and deliberately not chased further
 
 Numbers are ReleaseFast on one desktop; treat them as ratios. OpenSSL 3.5.5 on the
