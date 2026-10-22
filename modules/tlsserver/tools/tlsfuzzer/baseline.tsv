@@ -40,7 +40,7 @@ test-tls13-invalid-ciphers.py	plain	-	PASS 52 FAIL 0	-
 test-tls13-keyshare-omitted.py	plain	-	PASS 5 FAIL 0	fork 5/0
 test-tls13-keyupdate-from-server.py	plain	-	PASS 3 FAIL 0	'GET /keyupdate' convention (tlsfuzzer.zig)
 test-tls13-keyupdate.py	plain	-	PASS 62 FAIL 0	-
-test-tls13-large-number-of-extensions.py	plain	-n;0;--exc;11;--exc;27	PASS 82 FAIL 0	ids 11 (ec_point_formats) and 27 (compress_certificate) excluded: the script counts them unassigned and fills them at random, this server parses them (rustls too), so a malformed body is rightly decode_error
+test-tls13-large-number-of-extensions.py	plain	-n;0;--exc;11;--exc;27;--exc;28;--exc;34	PASS 82 FAIL 0	ids 11 (ec_point_formats), 27 (compress_certificate), 28 (record_size_limit, RFC 8449) and 34 (delegated_credential, RFC 9345) excluded: the script counts them unassigned and fills them empty or at random, this server parses them, so a malformed body is rightly decode_error
 test-tls13-legacy-version.py	plain	-	PASS 10 FAIL 0	fork 10/0
 test-tls13-lengths.py	echo	-n;200	PASS 202 FAIL 0	a 200-length sample (16,384 with -n 0); needs whole records (Server.write)
 test-tls13-minerva.py	plain	-	PASS 3 FAIL 0	fork 3/0

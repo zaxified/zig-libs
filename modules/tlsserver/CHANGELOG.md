@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Tools:** tlsfuzzer baseline: `test-tls13-large-number-of-extensions`
+  also excludes ids 28 (`record_size_limit`) and 34 (`delegated_credential`), which the
+  script counts unassigned and sends empty; the server now parses both (`decode_error`).
+  Full run: 51 scripts, none worse than the baseline.
+
 - **2026-10-22** — **Tools:** ctgrind target `ech` (the recorded Go ECH sessions with the ECH
   private key tainted): 384 in-file contexts, all on the decrypted inner hello's rebuild,
   parse and handshake (public once decrypted), plus std's X25519 identity verdict below
