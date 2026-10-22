@@ -57,7 +57,9 @@ pub const ClientCertKind = enum { none, p256, rsa2048, ed25519 };
 /// `Config.client_auth`: none, or the test client CA through `x509`.
 pub const ClientAuthMode = enum { off, mandatory, optional };
 
-const Peer = enum { openssl, go };
+/// `go_quic`: Go's `tls.QUICClient` over framed TCP (`tools/go_quic_client`),
+/// against `Config.quic`.
+const Peer = enum { openssl, go, go_quic };
 
 const Case = struct {
     name: []const u8,
@@ -110,7 +112,18 @@ const Case = struct {
     /// RFC 7250: the client authenticates with a raw public key, the
     /// `client_cert`'s SPKI, taken by an allowlist of that one key.
     raw_client: bool = false,
+    /// QUIC: `Quic.accept_early` refuses the ticket's resumption data (the
+    /// server's transport parameters, `setQuicResumptionData`): 0-RTT is
+    /// declined though everything else allows it.
+    quic_veto: bool = false,
 };
+
+/// `Quic.accept_early` of the QUIC cases: the ticket must carry
+/// `interop_server_tp`, and `ctx` (a bool) must not veto.
+fn quicAcceptEarly(ctx: ?*anyopaque, data: []const u8) bool {
+    const veto: *const bool = @ptrCast(@alignCast(ctx.?));
+    return !veto.* and std.mem.eql(u8, data, &interop_server_tp);
+}
 
 /// The exporter label and length of the `exporter` cases.
 pub const interop_exporter_label = "EXPERIMENTAL-tlsserver-interop";
@@ -128,6 +141,11 @@ pub const interop_max_early_data: u32 = 16384;
 /// The ticket key and clock of every `tickets` case (and of the replay).
 pub const interop_stek_key: [32]u8 = @splat(0x5e);
 pub const interop_clock_ms: i64 = 1_800_000_000_000;
+
+/// The QUIC cases' transport parameters (opaque to the TLS layer; RFC 9000
+/// §18 encodings: initial_max_data 1 MiB, initial_source_connection_id).
+pub const interop_server_tp = [_]u8{ 0x04, 0x04, 0x80, 0x10, 0x00, 0x00, 0x0f, 0x04, 0x53, 0x52, 0x56, 0x31 };
+pub const interop_client_tp = [_]u8{ 0x04, 0x04, 0x80, 0x08, 0x00, 0x00, 0x0f, 0x04, 0x43, 0x4c, 0x49, 0x31 };
 
 const cases = [_]Case{
     .{ .name = "p256-default", .why = "OpenSSL's defaults: its first group (X25519MLKEM768) and suite", .seed = 1, .expect = &.{ "Protocol version: TLSv1.3", "Ciphersuite: TLS_AES_256_GCM_SHA384", "Verification: OK", "Negotiated TLS1.3 group: X25519MLKEM768" } },
@@ -194,6 +212,13 @@ const cases = [_]Case{
     .{ .name = "go-resume", .client = .go, .why = "resumption: Go offers the saved ticket", .seed = 35, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{"resumed: true"} },
     .{ .name = "go-resume-hrr", .client = .go, .why = "resumption after a HelloRetryRequest", .seed = 36, .tickets = true, .resumed = true, .groups = &.{tlsserver.server.default_groups[2]}, .args = &.{ "-sess-in", "go.sess" }, .expect = &.{ "resumed: true", "hrr: true" } },
     .{ .name = "go-staple", .client = .go, .why = "the OCSP staple and the SCT list, octet for octet (Go always asks for both)", .seed = 62, .staple = true, .expect = &.{ "ocsp: 30030a0101\n", "scts: 5343542d6f6e65,5343542d32\n" } },
+    .{ .name = "quic-basic", .client = .go_quic, .why = "QUIC (RFC 9001): Go's QUICClient, secrets per level and transport parameters both ways", .seed = 80, .alpn = &.{"h3"}, .expect = &.{ "alpn: h3", "peer_tp: " ++ std.fmt.comptimePrint("{x}", .{&interop_server_tp}) } },
+    .{ .name = "quic-hrr", .client = .go_quic, .why = "QUIC with a HelloRetryRequest (the client's share X25519, the server wants P-256)", .seed = 81, .alpn = &.{"h3"}, .groups = &.{0x0017}, .expect = &.{"alpn: h3"} },
+    .{ .name = "quic-resume-new", .client = .go_quic, .why = "QUIC: tickets at the application level (max_early_data 0xffffffff)", .seed = 82, .alpn = &.{"h3"}, .tickets = true, .early_data = true, .args = &.{ "-sess-out", "go-quic.sess" }, .expect = &.{"saved: true"} },
+    .{ .name = "quic-resume", .client = .go_quic, .why = "QUIC resumption", .seed = 83, .alpn = &.{"h3"}, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go-quic.sess" }, .expect = &.{"resumed: true"} },
+    .{ .name = "quic-early-vetoed", .client = .go_quic, .why = "QUIC 0-RTT declined by Quic.accept_early (RFC 9001 §4.6.2): resumed, early data rejected", .seed = 86, .alpn = &.{"h3"}, .tickets = true, .resumed = true, .early_data = true, .quic_veto = true, .args = &.{ "-sess-in", "go-quic.sess", "-early" }, .expect = &.{ "resumed: true", "early_rejected: true" } },
+    .{ .name = "quic-mtls", .client = .go_quic, .why = "QUIC with a client certificate (ECDSA P-256): Certificate and CertificateVerify at the Handshake level", .seed = 85, .alpn = &.{"h3"}, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"alpn: h3"} },
+    .{ .name = "quic-early", .client = .go_quic, .why = "QUIC 0-RTT taken: the client's early secret, no EndOfEarlyData (RFC 9001 §8.3)", .seed = 84, .alpn = &.{"h3"}, .tickets = true, .resumed = true, .early_data = true, .early_accepted = true, .args = &.{ "-sess-in", "go-quic.sess", "-early" }, .expect = &.{"resumed: true"} },
     .{ .name = "go-mtls-p256", .client = .go, .why = "a client certificate (ECDSA P-256) the server requires", .seed = 50, .client_auth = .mandatory, .client_cert = .p256, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-rsa2048", .client = .go, .why = "an RSA client certificate (RSA-PSS CertificateVerify)", .seed = 51, .client_auth = .mandatory, .client_cert = .rsa2048, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-ed25519", .client = .go, .why = "an Ed25519 client certificate", .seed = 52, .client_auth = .mandatory, .client_cert = .ed25519, .expect = &.{"peer_certs: 1"} },
@@ -270,6 +295,8 @@ const Recorded = struct {
     compressed: ?tlsserver.CertifiedKey.CompressedCertificate = null,
     /// An `exporter` case's keying material.
     exported: ?[interop_exporter_len]u8 = null,
+    /// A QUIC case's server handshake traffic secret (the client's read one).
+    quic_server_hs: ?[]const u8 = null,
 };
 
 /// `ck`'s Certificate without staples, zlib-compressed (RFC 8879
@@ -351,6 +378,106 @@ fn serve(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server
     }
 }
 
+/// The traffic secrets the server made available, by direction (0 read,
+/// 1 write) and level, as `quicSecret` gave them.
+const QuicSecrets = struct {
+    s: [2][4][48]u8 = undefined,
+    len: [2][4]usize = @splat(@splat(0)),
+
+    fn take(q: *QuicSecrets, server: *const Server) void {
+        for ([_]Server.QuicDirection{ .read, .write }, 0..) |d, di| {
+            for (std.enums.values(tlsserver.server.QuicLevel)) |l| {
+                const sec = server.quicSecret(d, l) orelse continue;
+                @memcpy(q.s[di][@backingInt(l)][0..sec.len], sec);
+                q.len[di][@backingInt(l)] = sec.len;
+            }
+        }
+    }
+};
+
+/// One frame of the QUIC cases' TCP framing: level, 4-octet length, data.
+fn writeQuicFrame(w: *std.Io.Writer, rec: *std.ArrayList(u8), gpa: std.mem.Allocator, level: u8, data: []const u8) !void {
+    var h: [5]u8 = undefined;
+    h[0] = level;
+    std.mem.writeInt(u32, h[1..5], @intCast(data.len), .big);
+    try w.writeAll(&h);
+    try w.writeAll(data);
+    try rec.appendSlice(gpa, &h);
+    try rec.appendSlice(gpa, data);
+}
+
+/// The QUIC handshake over the framing: each client frame to `quicFeed`,
+/// every secret that appears kept, the server's output framed back; done
+/// once the client's Finished verified and the tickets went out.
+fn serveQuic(gpa: std.mem.Allocator, io: std.Io, stream: net.Stream, server: *Server, rec: *Recorded, seen: *QuicSecrets) !void {
+    var rbuf: [8192]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var wbuf: [8192]u8 = undefined;
+    var sw = stream.writer(io, &wbuf);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(gpa);
+    while (true) {
+        var h: [5]u8 = undefined;
+        try sr.interface.readSliceAll(&h);
+        const n = std.mem.readInt(u32, h[1..5], .big);
+        if (n > 1 << 20 or h[0] > 3) return error.BadFrame;
+        try data.resize(gpa, n);
+        try sr.interface.readSliceAll(data.items);
+        try rec.client.appendSlice(gpa, &h);
+        try rec.client.appendSlice(gpa, data.items);
+        const r = server.quicFeed(@fromBackingInt(@intCast(h[0])), data.items) catch |err| {
+            std.debug.print("  server alert: {?t}\n", .{server.quicAlert()});
+            return err;
+        };
+        if (r.transport_parameters) |tp| if (!std.mem.eql(u8, tp, &interop_client_tp)) return error.TransportParametersMismatch;
+        seen.take(server);
+        while (server.quicOutput()) |o| {
+            try writeQuicFrame(&sw.interface, &rec.server, gpa, @backingInt(o.level), o.data);
+            server.discardOutput(o.data.len);
+        }
+        if (r.event) |e| if (e == .handshake_done) {
+            // The end of the exchange (not recorded): the client stops
+            // reading.
+            try sw.interface.writeAll(&.{ 0xff, 0, 0, 0, 0 });
+            try sw.interface.flush();
+            return;
+        };
+        try sw.interface.flush();
+    }
+}
+
+/// Every secret the client installed must be the server's for the other
+/// direction at that level (the Initial ones are the QUIC stack's).
+fn checkQuicSecrets(gpa: std.mem.Allocator, stdout: []const u8, seen: *const QuicSecrets) !void {
+    var matched: usize = 0;
+    var lines = std.mem.splitScalar(u8, stdout, '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "secret: ")) continue;
+        var f = std.mem.tokenizeScalar(u8, line["secret: ".len..], ' ');
+        const dir = f.next() orelse return error.BadSecretLine;
+        const level = std.meta.stringToEnum(tlsserver.server.QuicLevel, f.next() orelse return error.BadSecretLine) orelse return error.BadSecretLine;
+        _ = f.next(); // suite
+        const hex = f.next() orelse return error.BadSecretLine;
+        if (level == .initial) continue;
+        // A client offering 0-RTT installs its early key before it learns
+        // the server declined: then the server has none.
+        if (level == .early and std.mem.indexOf(u8, stdout, "early_rejected: true") != null) continue;
+        const want = try gpa.alloc(u8, hex.len / 2);
+        defer gpa.free(want);
+        _ = try std.fmt.hexToBytes(want, hex);
+        // The client's write secret is the server's read one.
+        const di: usize = if (std.mem.eql(u8, dir, "write")) 0 else 1;
+        const got = seen.s[di][@backingInt(level)][0..seen.len[di][@backingInt(level)]];
+        if (!std.mem.eql(u8, want, got)) {
+            std.debug.print("  {s} {t}: client {s}, server {x}\n", .{ dir, level, hex, got });
+            return error.QuicSecretMismatch;
+        }
+        matched += 1;
+    }
+    // Handshake and application, both directions.
+    if (matched < 4) return error.QuicSecretsMissing;
+}
+
 fn flushOut(server: *Server, w: *std.Io.Writer, rec: *Recorded, gpa: std.mem.Allocator) !void {
     const p = server.pendingOutput();
     if (p.len == 0) return;
@@ -393,6 +520,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
             if (!no_sni) try argv.appendSlice(gpa, &.{ "-servername", "localhost" });
         },
         .go => try argv.appendSlice(gpa, &.{ "./go-client", "-addr", target, "-ca", ca_file, "-servername", "localhost" }),
+        .go_quic => try argv.appendSlice(gpa, &.{ "./go-quic-client", "-addr", target, "-ca", ca_file, "-servername", "localhost", "-tp", std.fmt.comptimePrint("{x}", .{&interop_client_tp}) }),
     }
     if (c.client_cert != .none) {
         const files = clientCertFiles(c.client_cert);
@@ -402,6 +530,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     if (c.exporter) try argv.appendSlice(gpa, switch (c.client) {
         .openssl => &.{ "-keymatexport", interop_exporter_label, "-keymatexportlen", std.fmt.comptimePrint("{d}", .{interop_exporter_len}) },
         .go => &.{ "-export", interop_exporter_label },
+        .go_quic => unreachable, // no exporter case over QUIC
     });
 
     var child = try std.process.spawn(io, .{
@@ -456,6 +585,8 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     };
     var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 16, 3600 * 1000);
     defer strikes.deinit();
+    var veto = c.quic_veto;
+    const quic_cfg: tlsserver.server.Quic = .{ .transport_parameters = &interop_server_tp, .accept_early = .{ .ctx = &veto, .accept = quicAcceptEarly } };
     const early: tlsserver.server.EarlyData = .{ .max_size = interop_max_early_data, .replay = tlsserver.server.strikeRegisterGuard(&strikes) };
     const cfg: tlsserver.Config = .{
         .certificate = .{ .fixed = &ck },
@@ -466,6 +597,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .tickets = if (c.tickets) &tickets else null,
         .client_auth = if (c.client_auth != .off) &client_auth else null,
         .early_data = if (c.early_data) &early else null,
+        .quic = if (c.client == .go_quic) &quic_cfg else null,
     };
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
@@ -474,10 +606,12 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     var peer: [tlsserver.server.peerBufferLen(tlsserver.clientauth.default_max_leaf_len)]u8 = undefined;
     var server: Server = .init(&cfg, joiner, out);
     server.setPeerBuffer(&peer);
+    if (c.client == .go_quic) server.setQuicResumptionData(&interop_server_tp);
     defer server.deinit();
 
     const poke: ?*std.Io.Writer = if (c.key_update and c.client == .openssl) &stdin_w.interface else null;
-    const served = serve(gpa, io, stream, &server, rec, c.key_update, poke);
+    var seen: QuicSecrets = .{};
+    const served = if (c.client == .go_quic) serveQuic(gpa, io, stream, &server, rec, &seen) else serve(gpa, io, stream, &server, rec, c.key_update, poke);
     child.stdin.?.close(io);
     child.stdin = null;
 
@@ -504,7 +638,11 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
             return error.ClientFailed;
         },
     }
-    if (std.mem.indexOf(u8, stdout, "pong") == null) {
+    if (c.client == .go_quic) {
+        try checkQuicSecrets(gpa, stdout, &seen);
+        rec.quic_server_hs = try gpa.dupe(u8, seen.s[1][2][0..seen.len[1][2]]);
+        if (std.mem.indexOf(u8, stdout, "done: true") == null) return error.QuicNotDone;
+    } else if (std.mem.indexOf(u8, stdout, "pong") == null) {
         std.debug.print("  client did not receive pong; stdout: {s}\n", .{stdout});
         return error.NoPong;
     }
@@ -524,6 +662,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         const line = switch (c.client) {
             .openssl => try std.mem.print(&line_buf, "Keying material: {X}", .{&km}),
             .go => try std.mem.print(&line_buf, "exported: {x}", .{&km}),
+            .go_quic => unreachable,
         };
         if (std.mem.indexOf(u8, stdout, line) == null) {
             std.debug.print("  the client's keying material is not the server's ({s}):\n{s}\n", .{ line, stdout });
@@ -587,6 +726,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     );
     try w.print("/// The ticket key and the clock of the `tickets` cases.\npub const stek_key: [32]u8 = @splat(0x{x:0>2});\npub const clock_ms: i64 = {d};\n", .{ interop_stek_key[0], interop_clock_ms });
     try w.print("/// `EarlyData.max_size` of the `early_data` cases.\npub const max_early_data: u32 = {d};\n", .{interop_max_early_data});
+    try w.print("/// The QUIC cases' transport parameters, the server's and the client's.\npub const quic_server_tp = hx({d}, \"{x}\");\npub const quic_client_tp = hx({d}, \"{x}\");\n", .{ interop_server_tp.len, &interop_server_tp, interop_client_tp.len, &interop_client_tp });
     try w.print("/// The exporter label and length of the cases with `exported`.\npub const exporter_label = \"{s}\";\npub const exporter_len = {d};\n", .{ interop_exporter_label, interop_exporter_len });
     try w.print("/// The leaf's OCSP staple and SCT list in the `staple` cases.\npub const ocsp_response = hx({d}, \"{x}\");\npub const sct_list = hx({d}, \"{x}\");\n\n", .{ interop_ocsp_response.len, &interop_ocsp_response, interop_sct_list.len, &interop_sct_list });
     try w.writeAll(
@@ -612,6 +752,16 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    /// RFC 7250: the client's `client_cert` went as its SPKI, taken by an
         \\    /// allowlist of that key.
         \\    raw_client: bool = false,
+        \\    /// QUIC (`Config.quic`, `quic_server_tp`): `client` and `server` are
+        \\    /// frames of a level octet, a 4-octet big-endian length and the
+        \\    /// handshake data at that level.
+        \\    quic: bool = false,
+        \\    /// QUIC: `Quic.accept_early` vetoed the ticket's resumption data (the
+        \\    /// tickets carry `quic_server_tp`).
+        \\    quic_veto: bool = false,
+        \\    /// QUIC: the server's handshake traffic secret (`quicSecret(.write,
+        \\    /// .handshake)`), as the client installed it to read.
+        \\    quic_server_hs: ?[]const u8 = null,
         \\    /// The leaf carried `ocsp_response` and `sct_list`.
         \\    staple: bool = false,
         \\    /// The leaf's Certificate (no staples) also went as this
@@ -653,12 +803,15 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.early_accepted) try w.writeAll("        .early_accepted = true,\n");
         if (c.raw_server) try w.writeAll("        .raw_server = true,\n");
         if (c.raw_client) try w.writeAll("        .raw_client = true,\n");
+        if (c.client == .go_quic) try w.writeAll("        .quic = true,\n");
+        if (c.quic_veto) try w.writeAll("        .quic_veto = true,\n");
         if (d[1].compressed) |cc| {
             try w.print("        .compressed = .{{\n            .algorithm = {d},\n            .uncompressed_len = {d},\n", .{ cc.algorithm, cc.uncompressed_len });
             try hexFieldAt(w, "            ", "data", cc.data);
             try w.writeAll("        },\n");
         }
         if (d[1].exported) |km| try w.print("        .exported = hx({d}, \"{x}\"),\n", .{ km.len, &km });
+        if (d[1].quic_server_hs) |s| try w.print("        .quic_server_hs = &hx({d}, \"{x}\"),\n", .{ s.len, s });
         try hexField(w, "client", d[1].client.items);
         try hexField(w, "server", d[1].server.items);
         try w.writeAll("    },\n");
@@ -940,6 +1093,16 @@ fn buildGoClient(io: std.Io, work: std.Io.Dir) !void {
         std.debug.print("go build of tools/go_client failed: {any}\n", .{term});
         return error.GoBuildFailed;
     }
+    var quic_child = try std.process.spawn(io, .{
+        .argv = &.{ "go", "build", "-o", "go-quic-client", "../../modules/tlsserver/tools/go_quic_client/main.go" },
+        .cwd = .{ .dir = work },
+        .environ_map = child_env,
+    });
+    const quic_term = try quic_child.wait(io);
+    if (quic_term != .exited or quic_term.exited != 0) {
+        std.debug.print("go build of tools/go_quic_client failed: {any}\n", .{quic_term});
+        return error.GoBuildFailed;
+    }
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
@@ -1061,7 +1224,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     try keys.mldsa65.fromPem(gpa, mldsa65_vector.cert_pem, mldsa65_vector.key_pem);
 
     for (cases) |c| {
-        if (c.client != .go or !isSelected(selected.items, c)) continue;
+        if (c.client == .openssl or !isSelected(selected.items, c)) continue;
         try buildGoClient(io, work);
         break;
     }

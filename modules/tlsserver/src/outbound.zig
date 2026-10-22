@@ -53,6 +53,15 @@ pub const Outbound = struct {
     /// `wipe` zeroes `buf[0..dirty]`, not the whole buffer (qap's is
     /// 48 KiB; a connection's flight is a few KiB).
     dirty: usize = 0,
+    /// QUIC (RFC 9001 §4): no records. Handshake messages are kept as they
+    /// are, per encryption level (`quic_lens`, in level order: the levels
+    /// only advance), `installTx` moves to the next level instead of
+    /// installing a key, and CCS and alerts are not written.
+    quic: bool = false,
+    /// The send level: 0 Initial, 2 Handshake, 3 Application (`QuicLevel`).
+    quic_level: u2 = 0,
+    /// Octets pending per level; they lie in `buf[0..len]` in level order.
+    quic_lens: [4]usize = @splat(0),
 
     pub fn init(buf: []u8) Outbound {
         return .{ .buf = buf };
@@ -66,6 +75,7 @@ pub const Outbound = struct {
     /// Where the next content goes. Its length bounds what `commit` can
     /// frame (fragmentation overhead included, conservatively).
     pub fn slot(self: *Outbound) []u8 {
+        if (self.quic) return self.buf[self.len..];
         const free = (self.buf.len - self.len) -| alert_reserve;
         if (free <= header_len) return self.buf[self.buf.len..];
         // Content n needs n + ceil(n / max_fragment) * overhead; reserve
@@ -81,6 +91,15 @@ pub const Outbound = struct {
     /// (legal for application data only — the caller's to know). Only an
     /// alert may use the `alert_reserve`.
     pub fn commit(self: *Outbound, content_type: record.ContentType, n: usize) Error!void {
+        if (self.quic) {
+            // Only handshake messages travel as QUIC CRYPTO data.
+            std.debug.assert(content_type == .handshake);
+            self.touch(self.len + n);
+            if (self.buf.len - self.len < n) return error.OutputFull;
+            self.len += n;
+            self.quic_lens[self.quic_level] += n;
+            return;
+        }
         const max: usize = self.max_fragment;
         const o = self.overhead();
         const k = if (n == 0) 1 else (n + max - 1) / max;
@@ -127,6 +146,8 @@ pub const Outbound = struct {
     /// Copy `data` in and frame it (for short, already-built content: an
     /// alert, a CCS).
     pub fn write(self: *Outbound, content_type: record.ContentType, data: []const u8) Error!void {
+        // QUIC has no CCS, and carries alerts as its own error codes.
+        if (self.quic and content_type != .handshake) return;
         // Not through `slot`, which leaves out the alert reserve; `commit`
         // checks the room exactly.
         if (self.buf.len - self.len < header_len + data.len) return error.OutputFull;
@@ -140,14 +161,41 @@ pub const Outbound = struct {
     }
 
     /// The caller sent the first `n` pending octets.
-    pub fn discard(self: *Outbound, n: usize) void {
+    pub fn discard(self: *Outbound, n_: usize) void {
+        var n = n_;
+        if (self.quic) {
+            // From the lowest level with octets pending, within it (never
+            // past it, whatever the caller asks).
+            const p = self.quicPending() orelse return;
+            std.debug.assert(n <= p.data.len);
+            n = @min(n, p.data.len);
+            self.quic_lens[p.level] -= n;
+        }
         std.debug.assert(n <= self.len);
         std.mem.copyForwards(u8, self.buf[0 .. self.len - n], self.buf[n..self.len]);
         self.len -= n;
     }
 
-    /// Protect every later record under `traffic_secret` (sequence 0).
+    /// QUIC: the pending octets of the lowest level that has any.
+    pub fn quicPending(self: *const Outbound) ?struct { level: u2, data: []const u8 } {
+        var at: usize = 0;
+        for (self.quic_lens, 0..) |n, l| {
+            if (n != 0) return .{ .level = @intCast(l), .data = self.buf[at..][0..n] };
+            at += n;
+        }
+        return null;
+    }
+
+    /// Protect every later record under `traffic_secret` (sequence 0). QUIC:
+    /// go to the next send level (Initial → Handshake → Application); the
+    /// key is the QUIC stack's, from the secret.
     pub fn installTx(self: *Outbound, suite: record.CipherSuite, traffic_secret: []const u8) record.InitError!void {
+        if (self.quic) {
+            const want = suite.hashLen() orelse return error.UnsupportedSuite;
+            if (want != traffic_secret.len) return error.BadKeyLength;
+            self.quic_level = if (self.quic_level == 0) 2 else 3;
+            return;
+        }
         if (self.protected) self.tx.wipe();
         // Not "protected" by a wiped (all-zero) key if `init` refuses.
         self.protected = false;
@@ -169,6 +217,7 @@ pub const Outbound = struct {
         zeroize(self.buf[0..self.dirty]);
         self.dirty = 0;
         self.len = 0;
+        self.quic_lens = @splat(0);
     }
 };
 

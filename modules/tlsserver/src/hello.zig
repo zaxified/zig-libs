@@ -54,6 +54,7 @@ pub const ExtensionType = enum(u16) {
     certificate_authorities = 47,
     signature_algorithms_cert = 50,
     key_share = 51,
+    quic_transport_parameters = 57,
     renegotiation_info = 0xff01,
     _,
 };
@@ -132,6 +133,9 @@ pub const ClientHello = struct {
     /// client can send and take (X.509 0, RawPublicKey 2), preferred first.
     client_certificate_types: ?[]const u8 = null,
     server_certificate_types: ?[]const u8 = null,
+    /// RFC 9001 §8.2: the client's QUIC transport parameters, opaque here
+    /// (RFC 9000 §18 is the QUIC stack's to parse; may be empty).
+    quic_transport_parameters: ?[]const u8 = null,
     /// The number of extensions, unknown ones included.
     extension_count: usize = 0,
 
@@ -293,6 +297,7 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
             .compress_certificate => ch.compress_certificate_raw = try parseCompressCertificate(data),
             .client_certificate_type => ch.client_certificate_types = try nonEmptyIn(data, u8),
             .server_certificate_type => ch.server_certificate_types = try nonEmptyIn(data, u8),
+            .quic_transport_parameters => ch.quic_transport_parameters = data,
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
                 // RFC 8446 §4.2.11: MUST be the last extension.

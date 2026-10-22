@@ -132,6 +132,8 @@ const Harness = struct {
     /// caller's when given: a second replay of a case is a replay).
     own_strikes: tlsresume.replay.StrikeRegister,
     early: server_mod.EarlyData,
+    quic_cfg: server_mod.Quic,
+    veto: bool,
     cfg: server_mod.Config,
     in_buf: []u8,
     reader: std.Io.Reader,
@@ -198,6 +200,8 @@ const Harness = struct {
         };
         h.own_strikes = .init(gpa, 4, 3600 * 1000);
         h.early = .{ .max_size = vectors.max_early_data, .replay = server_mod.strikeRegisterGuard(strikes orelse &h.own_strikes) };
+        h.veto = v.quic_veto;
+        h.quic_cfg = .{ .transport_parameters = &vectors.quic_server_tp, .accept_early = .{ .ctx = &h.veto, .accept = quicAcceptEarly } };
         h.cfg = .{
             .certificate = .{ .fixed = &h.ck },
             .cipher_suites = h.suites[0..v.suites.len],
@@ -207,6 +211,7 @@ const Harness = struct {
             .tickets = if (v.tickets) &h.tickets else null,
             .client_auth = if (v.client_auth != .off) &h.client_auth else null,
             .early_data = if (v.early_data) &h.early else null,
+            .quic = if (v.quic) &h.quic_cfg else null,
         };
         // The reader holds the whole recording in a buffer big enough for a
         // record (Connection's requirement).
@@ -224,6 +229,7 @@ const Harness = struct {
         h.peer = try gpa.alloc(u8, server_mod.peerBufferLen(h.client_auth.max_leaf_len));
         h.conn = .init(&h.cfg, &h.reader, &h.sink.writer, h.joiner);
         h.conn.server.setPeerBuffer(h.peer);
+        if (v.quic) h.conn.server.setQuicResumptionData(&vectors.quic_server_tp);
         return h;
     }
 
@@ -301,8 +307,75 @@ fn wantPeer(v: vectors.Case) ?[]const u8 {
     return if (v.raw_client) (x509.spkiOf(der) catch unreachable).der else der;
 }
 
+/// As `tools/interop.zig`'s: the ticket's data must be the server's
+/// transport parameters, and `ctx` (a bool) must not veto.
+fn quicAcceptEarly(ctx: ?*anyopaque, data: []const u8) bool {
+    const veto: *const bool = @ptrCast(@alignCast(ctx.?));
+    return !veto.* and std.mem.eql(u8, data, &vectors.quic_server_tp);
+}
+
+/// A QUIC recording: the client's frames through `quicFeed`; the server's
+/// output, framed as `tools/interop.zig` framed it, must be the recording's
+/// octet for octet.
+fn replayQuic(gpa: std.mem.Allocator, v: vectors.Case) !void {
+    var keys: Keys = try .init(gpa);
+    defer keys.deinit(gpa);
+    const h: *Harness = try .create(gpa, v, &keys);
+    defer h.destroy();
+    const s = &h.conn.server;
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    var at: usize = 0;
+    var done = false;
+    var hs_seen = false;
+    while (at < v.client.len) {
+        const n = std.mem.readInt(u32, v.client[at + 1 ..][0..4], .big);
+        const data = v.client[at + 5 ..][0..n];
+        const r = try s.quicFeed(@fromBackingInt(@intCast(v.client[at])), data);
+        at += 5 + n;
+        if (r.transport_parameters) |tp| try testing.expectEqualSlices(u8, &vectors.quic_client_tp, tp);
+        // The handshake secret the client read the server's flight with.
+        if (s.quicSecret(.write, .handshake)) |hs| {
+            try testing.expectEqualSlices(u8, v.quic_server_hs.?, hs);
+            hs_seen = true;
+        }
+        while (s.quicOutput()) |o| {
+            var hdr: [5]u8 = undefined;
+            hdr[0] = @backingInt(o.level);
+            std.mem.writeInt(u32, hdr[1..5], @intCast(o.data.len), .big);
+            try got.appendSlice(gpa, &hdr);
+            try got.appendSlice(gpa, o.data);
+            s.discardOutput(o.data.len);
+        }
+        if (r.event) |e| if (e == .handshake_done) {
+            done = true;
+        };
+    }
+    try testing.expect(done and s.isConnected() and hs_seen);
+    // Once connected the handshake secrets are gone.
+    try testing.expectEqual(null, s.quicSecret(.write, .handshake));
+    try testing.expect(std.mem.allEqual(u8, &s.quic_server_hs, 0));
+    try testing.expectEqualSlices(u8, v.server, got.items);
+    try testing.expectEqual(v.resumed, s.isResumed());
+    try testing.expectEqual(v.early_accepted, s.earlyDataAccepted());
+    if (v.resumed) try testing.expectEqualSlices(u8, &vectors.quic_server_tp, s.quicResumptionData().?) else try testing.expectEqual(null, s.quicResumptionData());
+    if (v.quic_veto) try testing.expectEqual(server_mod.EarlyDataReason.quic_parameter_mismatch, s.earlyDataReason());
+    const want_peer = wantPeer(v);
+    if (want_peer) |p| try testing.expectEqualSlices(u8, p, s.peerCertificate().?) else try testing.expectEqual(null, s.peerCertificate());
+    // RFC 9001 §6: a TLS KeyUpdate over QUIC is a connection error.
+    try testing.expectError(error.UnexpectedMessage, s.quicFeed(.application, &.{ 24, 0, 0, 1, 0 }));
+    try testing.expectEqual(@import("alert.zig").Description.unexpected_message, s.quicAlert().?);
+}
+
 test "OpenSSL and Go client sessions replay byte-exact through Connection" {
     for (vectors.cases) |v| {
+        if (v.quic) {
+            replayQuic(testing.allocator, v) catch |err| {
+                std.debug.print("case {s}: {t}\n", .{ v.name, err });
+                return err;
+            };
+            continue;
+        }
         replay(testing.allocator, v, .calls) catch |err| {
             std.debug.print("case {s}: {t}\n", .{ v.name, err });
             return err;
@@ -376,6 +449,7 @@ fn nowNs() u64 {
 
 test "the same sessions replay byte-exact through reader() and writer()" {
     for (vectors.cases) |v| {
+        if (v.quic) continue; // no streams over QUIC
         replay(testing.allocator, v, .streams) catch |err| {
             std.debug.print("case {s}: {t}\n", .{ v.name, err });
             return err;

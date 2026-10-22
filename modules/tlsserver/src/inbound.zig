@@ -225,6 +225,9 @@ pub const Inbound = struct {
     /// or, after a HelloRetryRequest, before any: then `application_data`
     /// records are dropped unopened until the second ClientHello.
     skip_early: usize = 0,
+    /// QUIC (RFC 9001 §4): handshake data arrives as CRYPTO data, straight
+    /// into `joiner` (`Server.quicFeed`); `installRx` installs no key.
+    quic: bool = false,
 
     pub fn init(joiner_buf: []u8) Inbound {
         return .{ .joiner = .init(joiner_buf) };
@@ -237,6 +240,8 @@ pub const Inbound = struct {
     /// be read under the new one (RFC 8446 §5.1).
     pub fn installRx(self: *Inbound, suite: record.CipherSuite, traffic_secret: []const u8) (Error || record.InitError)!void {
         if (!self.joiner.isEmpty()) return error.UnexpectedMessage;
+        // QUIC: the key is the QUIC stack's; only the alignment matters.
+        if (self.quic) return;
         if (self.protected) self.rx.wipe();
         // Not "protected" by a wiped (all-zero) key if `init` refuses.
         self.protected = false;

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** QUIC (RFC 9001; rustls `quic::ServerConnection`, Go
+  `tls.QUICServer`): `Config.quic` (`Quic.transport_parameters`, `Quic.accept_early`),
+  `Server.quicFeed(level, data)` → `QuicResult` (event, the client's transport parameters),
+  `quicOutput()`, `quicSecret(direction, level)`, `quicAlert()`, `setQuicResumptionData` /
+  `quicResumptionData`, `QuicLevel`; error `WrongTransport` for record-layer calls on a QUIC
+  connection (and `quic…` calls on a TLS one). No CCS, EndOfEarlyData or KeyUpdate; ALPN and
+  transport parameters mandatory; empty legacy_session_id; NewSessionTicket early_data
+  0xffffffff; QUIC tickets (formats 5/6) resume over QUIC only. Interop: Go 1.26 `tls.QUICClient`
+  (`tools/go_quic_client`, 7 recorded sessions, secrets compared per level). New fuzz harness
+  `tlsserver-quic`. Card: Scope poc → parity (grade 2).
+
 - **2026-10-22** — **Added:** RFC 7250 raw public keys (rustls `only_raw_public_keys` /
   `requires_raw_public_keys`): `CertifiedKey.raw_public_key` (the server sends its key's
   SubjectPublicKeyInfo; no staples), `ClientAuth.raw_public_keys` with

@@ -12,7 +12,8 @@
 //! record never advances the sequence number.
 //! `tlsserver-keys` (`keys.CertKeyPair.fromPem`), `tlsserver-server`
 //! (`Server` on recorded real clients), `tlsserver-keyupdate` (KeyUpdate
-//! against a model client) and `tlsserver-clientauth` (the client
+//! against a model client), `tlsserver-quic` (QUIC mode on recorded Go
+//! QUICClient sessions) and `tlsserver-clientauth` (the client
 //! Certificate / CertificateVerify decoders) are described at their sections.
 
 const std = @import("std");
@@ -1521,6 +1522,8 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var v: interop.Case = undefined;
     while (true) {
         v = interop.cases[src.index(interop.cases.len)];
+        // QUIC recordings are not record streams.
+        if (v.quic) continue;
         if ((v.cert != .rsa2048 and v.cert != .mldsa65) or src.valueRangeAtMost(u8, 0, 9) == 0) break;
     }
     if (std.mem.startsWith(u8, v.name, "go-")) SrvMark.mark(.go_case) else SrvMark.mark(.openssl_case);
@@ -2054,7 +2057,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     while (true) {
         v = interop.cases[src.index(interop.cases.len)];
         // A 0-RTT recording's first sealed record is its early data.
-        if (v.cert != .rsa2048 and v.cert != .mldsa65 and !v.early_accepted) break;
+        if (v.cert != .rsa2048 and v.cert != .mldsa65 and !v.early_accepted and !v.quic) break;
     }
     var leaf = fk.cks[@backingInt(v.cert)];
     if (v.staple) {
@@ -2325,6 +2328,190 @@ test "fuzz driver: TLSSERVER_FUZZ (keyupdate)" {
 }
 test "fuzz harness: keyupdate, 400 seeds, reaches every outcome" {
     try KuMark.reach(fuzzKeyUpdate, "tlsserver-keyupdate", 400);
+}
+
+// ── tlsserver-quic ───────────────────────────────────────────────────────
+//
+// `Server` in QUIC mode (RFC 9001) on the recorded Go QUICClient sessions
+// (`interop_vectors.zig`, `quic` cases: CRYPTO data per level, framed):
+// fed as recorded, cut into random pieces at their level, or damaged — a
+// flipped bit, a frame at another level, cut short, a frame added after
+// the end. Genuine (whole or in pieces): the handshake completes with the
+// recorded output and handshake secret. Damaged: refused (a flip, a wrong
+// level, an extra frame) or still waiting (cut short, or a length made
+// longer) — never complete, never a panic; a
+// refusal leaves an alert to send, no output and no secret.
+
+const QuicMark = Marker(enum {
+    genuine_done,
+    pieces_done,
+    flip_refused,
+    /// The flip made a length longer: still waiting.
+    flip_waits,
+    level_refused,
+    truncated_waits,
+    extra_refused,
+    resumed_case,
+    early_case,
+});
+
+fn fuzzQuic(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const fk = try fuzzKeys_();
+    var quic_cases: [16]interop.Case = undefined;
+    var n_quic: usize = 0;
+    for (interop.cases) |c| if (c.quic) {
+        quic_cases[n_quic] = c;
+        n_quic += 1;
+    };
+    const v = quic_cases[src.index(n_quic)];
+    if (v.resumed) QuicMark.mark(.resumed_case);
+    if (v.early_accepted) QuicMark.mark(.early_case);
+    const ck = &fk.cks[@backingInt(v.cert)];
+    var suites: [8]record.CipherSuite = undefined;
+    for (v.suites, 0..) |c, i| suites[i] = @fromBackingInt(c);
+    var csprng = std.Random.DefaultCsprng.init(@splat(v.seed));
+    var it: InteropTickets = undefined;
+    it.init(gpa, v.client_auth);
+    defer it.deinit();
+    var veto = v.quic_veto;
+    const quic: server_mod.Quic = .{ .transport_parameters = &interop.quic_server_tp, .accept_early = .{ .ctx = &veto, .accept = quicAcceptEarly } };
+    const cfg: server_mod.Config = .{
+        .certificate = .{ .fixed = ck },
+        .cipher_suites = suites[0..v.suites.len],
+        .groups = v.groups,
+        .alpn_protocols = v.alpn,
+        .random = csprng.random(),
+        .tickets = if (v.tickets) &it.tickets else null,
+        .client_auth = it.clientAuth(v.client_auth),
+        .early_data = if (v.early_data) &it.early else null,
+        .quic = &quic,
+    };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const outb = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, ck) + 4096);
+    defer gpa.free(outb);
+    var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
+    var server: server_mod.Server = .init(&cfg, joiner, outb);
+    server.setPeerBuffer(&peer);
+    server.setQuicResumptionData(&interop.quic_server_tp);
+    defer server.deinit();
+
+    // The recording's frames, a copy to damage.
+    const stream = try gpa.dupe(u8, v.client);
+    defer gpa.free(stream);
+    var frames_buf: [16][]u8 = undefined;
+    var levels: [16]u8 = undefined;
+    var n_frames: usize = 0;
+    var at: usize = 0;
+    while (at < stream.len) : (n_frames += 1) {
+        const n = std.mem.readInt(u32, stream[at + 1 ..][0..4], .big);
+        levels[n_frames] = stream[at];
+        frames_buf[n_frames] = stream[at + 5 ..][0..n];
+        at += 5 + n;
+    }
+    const frames = frames_buf[0..n_frames];
+
+    const Mode = enum { genuine, pieces, flip, level, truncate, extra };
+    const mode = std.enums.values(Mode)[src.index(std.enums.values(Mode).len)];
+    var last = frames.len;
+    switch (mode) {
+        .genuine, .pieces, .extra => {},
+        .flip => {
+            const f = frames[src.index(frames.len)];
+            f[src.index(f.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7));
+        },
+        .level => {
+            const i = src.index(frames.len);
+            levels[i] = (levels[i] + src.valueRangeAtMost(u8, 1, 3)) % 4;
+        },
+        .truncate => last = src.index(frames.len),
+    }
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var done = false;
+    var hs_secret_ok = false;
+    var refused: ?anyerror = null;
+    feed: for (frames[0..last], levels[0..last]) |f, l| {
+        // In pieces: the frame's data over several calls at its level.
+        var rest: []const u8 = f;
+        while (true) {
+            const take: usize = if (mode == .pieces and rest.len > 1) src.valueRangeAtMost(u16, 1, @intCast(@min(rest.len, 0xffff))) else rest.len;
+            const r = server.quicFeed(@fromBackingInt(@intCast(l)), rest[0..take]) catch |err| {
+                refused = err;
+                break :feed;
+            };
+            rest = rest[take..];
+            if (server.quicSecret(.write, .handshake)) |hs| hs_secret_ok = std.mem.eql(u8, hs, v.quic_server_hs.?);
+            while (server.quicOutput()) |o| {
+                var hdr: [5]u8 = undefined;
+                hdr[0] = @backingInt(o.level);
+                std.mem.writeInt(u32, hdr[1..5], @intCast(o.data.len), .big);
+                try out.appendSlice(gpa, &hdr);
+                try out.appendSlice(gpa, o.data);
+                server.discardOutput(o.data.len);
+            }
+            if (r.event) |e| if (e == .handshake_done) {
+                done = true;
+            };
+            if (rest.len == 0) break;
+        }
+    }
+
+    switch (mode) {
+        .genuine, .pieces, .extra => {
+            if (refused) |e| return e;
+            if (!done or !hs_secret_ok) return error.QuicHandshakeIncomplete;
+            if (!std.mem.eql(u8, out.items, v.server)) return error.ServerDataDiffers;
+            if (mode == .extra) {
+                // Nothing may follow at any level: a Finished again.
+                if (server.quicFeed(.application, &.{ 20, 0, 0, 0 })) |_| return error.ExtraAccepted else |_| {}
+                if (server.quicAlert() == null) return error.NoAlert;
+                QuicMark.mark(.extra_refused);
+            } else if (mode == .genuine) QuicMark.mark(.genuine_done) else QuicMark.mark(.pieces_done);
+        },
+        .truncate => {
+            if (refused) |e| return e;
+            if (done) return error.TruncatedCompleted;
+            QuicMark.mark(.truncated_waits);
+        },
+        .flip, .level => {
+            // A flip in a message's length leaves the server waiting for
+            // the rest; it must never complete.
+            const e = refused orelse {
+                if (done or mode != .flip) return error.DamageAccepted;
+                QuicMark.mark(.flip_waits);
+                return;
+            };
+            if (e != error.Closed and server.quicAlert() == null) return error.NoAlert;
+            if (server.quicOutput() != null) return error.OutputAfterFailure;
+            for ([_]server_mod.Server.QuicDirection{ .read, .write }) |d| for (std.enums.values(server_mod.QuicLevel)) |l| {
+                if (server.quicSecret(d, l) != null) return error.SecretAfterFailure;
+            };
+            if (!std.mem.allEqual(u8, &server.quic_server_hs, 0)) return error.SecretNotWiped;
+            if (mode == .flip) QuicMark.mark(.flip_refused) else QuicMark.mark(.level_refused);
+        },
+    }
+}
+
+fn quicAcceptEarly(ctx: ?*anyopaque, data: []const u8) bool {
+    const veto: *const bool = @ptrCast(@alignCast(ctx.?));
+    return !veto.* and std.mem.eql(u8, data, &interop.quic_server_tp);
+}
+
+fn fuzzQuicSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [4096]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzQuic(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver QUIC mode on recorded Go QUICClient sessions" {
+    try testing.fuzz({}, fuzzQuicSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (quic)" {
+    try fuzz_driver.run(fuzzQuic, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-quic" });
+}
+test "fuzz harness: quic, 400 seeds, reaches every outcome" {
+    try QuicMark.reach(fuzzQuic, "tlsserver-quic", 400);
 }
 
 // ── tlsserver-clientauth ─────────────────────────────────────────────────

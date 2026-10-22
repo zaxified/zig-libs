@@ -384,6 +384,35 @@ pub const Config = struct {
     /// `Server.extractSecrets` may hand the record keys out (rustls
     /// `enable_secret_extraction`, for kTLS); false refuses it.
     enable_secret_extraction: bool = false,
+    /// QUIC (RFC 9001; rustls `quic::ServerConnection`, Go `QUICServer`):
+    /// no record layer — handshake messages go in and out per encryption
+    /// level (`quicFeed`, `quicOutput`) and the QUIC stack takes each
+    /// level's traffic secret (`quicSecret`) to protect its packets
+    /// (zig-libs `quic-crypto`). Null: TLS over a byte stream.
+    quic: ?*const Quic = null,
+};
+
+/// QUIC encryption levels (RFC 9001 §4.1.4): which packet space handshake
+/// data travels in, and which keys protect it.
+pub const QuicLevel = enum(u2) { initial = 0, early = 1, handshake = 2, application = 3 };
+
+pub const Quic = struct {
+    /// This server's transport parameters (RFC 9000 §18, encoded by the
+    /// QUIC stack), sent as `quic_transport_parameters` in its
+    /// EncryptedExtensions. The client must send its own, and an ALPN
+    /// protocol must be agreed (RFC 9001 §8.1-8.2).
+    transport_parameters: []const u8,
+    /// 0-RTT on a resumption only if this accepts the resumption data the
+    /// ticket carries (`Server.setQuicResumptionData` at issue; RFC 9001
+    /// §4.6.2: the transport parameters remembered must still allow what
+    /// the client may send early). Null: the ticket's data is not checked.
+    /// Asked before `EarlyData.replay`.
+    accept_early: ?EarlyCheck = null,
+
+    pub const EarlyCheck = struct {
+        ctx: ?*anyopaque = null,
+        accept: *const fn (ctx: ?*anyopaque, resumption_data: []const u8) bool,
+    };
 };
 
 /// Client authentication (RFC 8446 §4.3.2, §4.4.2; rustls
@@ -521,6 +550,9 @@ pub const EarlyDataReason = enum {
     not_first_identity,
     /// `ReplayGuard.admit` refused the ticket.
     replayed,
+    /// QUIC: `Quic.accept_early` refused the ticket's resumption data
+    /// (RFC 9001 §4.6.2; BoringSSL's name).
+    quic_parameter_mismatch,
 
     /// BoringSSL's `SSL_early_data_reason_string` (this module's own two
     /// reasons have names of their own).
@@ -720,11 +752,19 @@ const PskTaken = struct {
     /// The ALPN protocol it was issued under.
     alpn_buf: [255]u8 = undefined,
     alpn_len: ?u8 = null,
+    /// A QUIC ticket's resumption data (copied out: the ticket's scratch is
+    /// wiped).
+    app_buf: [255]u8 = undefined,
+    app_len: ?u8 = null,
     /// Its `max_early_data_size` (0: it allows no early data).
     max_early_data: u32 = 0,
 
     fn alpn(t: *const PskTaken) ?[]const u8 {
         return if (t.alpn_len) |n| t.alpn_buf[0..n] else null;
+    }
+
+    fn app(t: *const PskTaken) []const u8 {
+        return if (t.app_len) |n| t.app_buf[0..n] else "";
     }
 };
 
@@ -747,11 +787,18 @@ const TicketFields = struct {
     /// The `max_early_data_size` the ticket was issued with (0: none).
     max_early_data: u32 = 0,
     suite: u16,
+    /// Issued over QUIC (formats `format_quic`/`format_quic_raw`): resumed
+    /// over QUIC only, and with `app`, the QUIC stack's resumption data
+    /// (`Server.setQuicResumptionData`, at most 255 octets).
+    quic: bool = false,
+    app: ?[]const u8 = null,
 
     const format: u8 = 3;
     const format_raw: u8 = 4;
+    const format_quic: u8 = 5;
+    const format_quic_raw: u8 = 6;
     /// The longest run before the leaf, and the run after it.
-    const head_max = 1 + 1 + 255 + 1 + 255 + 2;
+    const head_max = 1 + 1 + 255 + 1 + 255 + 1 + 255 + 2;
     const tail_len = 2 + 8 + 4 + 2;
 
     /// Writes the fields around a leaf that is already at `buf[leaf_at..]`
@@ -763,11 +810,16 @@ const TicketFields = struct {
         if (f.peer) |leaf| std.debug.assert(leaf.ptr == buf[leaf_at..].ptr);
         const sni = f.sni orelse "";
         const alpn = f.alpn orelse "";
-        const start = leaf_at - (1 + 1 + sni.len + 1 + alpn.len + 2);
+        const app = f.app orelse "";
+        std.debug.assert(f.quic or app.len == 0);
+        const app_field: usize = if (f.quic) 1 + app.len else 0;
+        const start = leaf_at - (1 + 1 + sni.len + 1 + alpn.len + app_field + 2);
         var n = start;
-        buf[n] = if (f.peer_raw and f.peer != null) format_raw else format;
+        const raw = f.peer_raw and f.peer != null;
+        buf[n] = if (f.quic) (if (raw) format_quic_raw else format_quic) else if (raw) format_raw else format;
         n += 1;
-        for ([_][]const u8{ sni, alpn }) |b| {
+        for ([_][]const u8{ sni, alpn, app }, 0..) |b, i| {
+            if (i == 2 and !f.quic) break;
             buf[n] = @intCast(b.len);
             @memcpy(buf[n + 1 ..][0..b.len], b);
             n += 1 + b.len;
@@ -784,10 +836,12 @@ const TicketFields = struct {
     /// Null for anything this server did not write (another format), or
     /// with a leaf over `max_peer` octets.
     fn parse(tail: []const u8, max_peer: usize) ?TicketFields {
-        if (tail.len < 7 or (tail[0] != format and tail[0] != format_raw)) return null;
+        if (tail.len < 7 or tail[0] < format or tail[0] > format_quic_raw) return null;
+        const quic = tail[0] >= format_quic;
+        const raw = tail[0] == format_raw or tail[0] == format_quic_raw;
         var at: usize = 1;
-        var v: [2]?[]const u8 = undefined;
-        for (&v) |*x| {
+        var v: [3]?[]const u8 = @splat(null);
+        for (v[0..if (quic) 3 else 2]) |*x| {
             if (at >= tail.len) return null;
             const n: usize = tail[at]; // not u8: `1 + n` overflows at 255
             if (tail.len - at - 1 < n) return null;
@@ -801,12 +855,14 @@ const TicketFields = struct {
         const peer: ?[]const u8 = if (n == 0) null else tail[at..][0..n];
         at += n;
         if (tail.len - at != tail_len) return null;
-        if (tail[0] == format_raw and peer == null) return null;
+        if (raw and peer == null) return null;
         return .{
             .sni = v[0],
             .alpn = v[1],
+            .quic = quic,
+            .app = v[2],
             .peer = peer,
-            .peer_raw = tail[0] == format_raw,
+            .peer_raw = raw,
             .peer_scheme = std.mem.readInt(u16, tail[at..][0..2], .big),
             .peer_auth_ms = std.mem.readInt(i64, tail[at + 2 ..][0..8], .big),
             .max_early_data = std.mem.readInt(u32, tail[at + 10 ..][0..4], .big),
@@ -831,6 +887,11 @@ const Resumable = struct {
     /// A client certificate in the ticket must be of this type (a raw
     /// public key or X.509), the one negotiated for this hello.
     peer_raw: bool = false,
+    /// This connection runs over QUIC: only a QUIC ticket resumes (and a
+    /// TLS one only over TLS).
+    quic: bool = false,
+    /// Out: the QUIC ticket's resumption data (a slice of the scratch).
+    app: ?[]const u8 = null,
     /// The longest leaf a ticket may carry (this connection's cap; 0
     /// without client authentication).
     max_peer: usize = 0,
@@ -850,11 +911,13 @@ const Resumable = struct {
         if (f.suite != w.suite or !Server.optEql(f.sni, w.sni) or age_ms > w.lifetime_ms) return false;
         if (w.need_peer and f.peer == null) return false;
         if (f.peer != null and f.peer_raw != w.peer_raw) return false;
+        if (f.quic != w.quic) return false;
         if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms - f.peer_auth_ms > w.lifetime_ms)) return false;
         w.peer = f.peer;
         w.peer_scheme = f.peer_scheme;
         w.peer_auth_ms = f.peer_auth_ms;
         w.alpn = f.alpn;
+        w.app = f.app;
         w.max_early_data = f.max_early_data;
         return true;
     }
@@ -931,6 +994,9 @@ pub const Error = inbound.Error || clientauth.VerifyError || error{
     /// between them (`unexpected_message`, as BoringSSL; rustls closes
     /// without an alert).
     TooManyKeyUpdates,
+    /// A record-layer call (`feed`, `write`, `keyUpdate`, `close`…) on a
+    /// QUIC connection, or a `quic…` call on a TLS one.
+    WrongTransport,
 };
 
 /// The alert a failure sends (null: none — the peer aborted, or the
@@ -944,7 +1010,7 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.AccessDenied => .access_denied,
         error.NoApplicationProtocol => .no_application_protocol,
         error.InternalError => .internal_error,
-        error.OutputFull, error.Closed, error.NotConnected => null,
+        error.OutputFull, error.Closed, error.NotConnected, error.WrongTransport => null,
         error.TooManyKeyUpdates, error.TooMuchEarlyData => .unexpected_message,
         error.CertificateRequired => .certificate_required,
         error.UnsupportedExtension => .unsupported_extension,
@@ -1129,6 +1195,23 @@ pub const Server = struct {
     client_cert_type: ?u8 = null,
     /// The client's leaf is a raw public key (a SubjectPublicKeyInfo).
     peer_raw: bool = false,
+    /// QUIC: the server's handshake traffic secret and the client's early
+    /// one (the record layer keeps neither: the QUIC stack takes them from
+    /// `quicSecret`); wiped with the other handshake secrets.
+    quic_server_hs: [48]u8 = @splat(0),
+    quic_client_early: [48]u8 = @splat(0),
+    /// QUIC: the client's 0-RTT is taken.
+    quic_early: bool = false,
+    /// QUIC: the alert a failure calls for, for the QUIC stack to send as
+    /// CRYPTO_ERROR 0x100 + the description (RFC 9001 §4.8).
+    quic_alert: ?alert.Description = null,
+    /// QUIC: the last ClientHello's transport parameters (in the joiner).
+    quic_peer_params: ?[]const u8 = null,
+    /// QUIC: what the tickets issued carry (`setQuicResumptionData`), and
+    /// what the resumed one carried (null: not resumed).
+    quic_resumption_data: []const u8 = "",
+    quic_received: [255]u8 = undefined,
+    quic_received_len: ?u8 = null,
     /// What became of the client's early data (set at the last ClientHello).
     early_reason: EarlyDataReason = .disabled,
     /// The first ClientHello offered early data, and a HelloRetryRequest
@@ -1141,9 +1224,12 @@ pub const Server = struct {
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
         var out: outbound.Outbound = .init(output_buf);
         out.max_fragment = fragmentLen(config);
+        out.quic = config.quic != null;
+        var in: inbound.Inbound = .init(joiner_buf);
+        in.quic = config.quic != null;
         return .{
             .config = config,
-            .inbound = .init(joiner_buf),
+            .inbound = in,
             .out = out,
         };
     }
@@ -1179,6 +1265,8 @@ pub const Server = struct {
     fn wipeHandshakeSecrets(self: *Server) void {
         std.crypto.secureZero(u8, &self.handshake_secret);
         std.crypto.secureZero(u8, &self.client_handshake_secret);
+        std.crypto.secureZero(u8, &self.quic_server_hs);
+        std.crypto.secureZero(u8, &self.quic_client_early);
     }
 
     pub fn isConnected(self: *const Server) bool {
@@ -1338,6 +1426,8 @@ pub const Server = struct {
         /// then hand over), a write slot is open, or a handshake message is
         /// half received.
         NotQuiescent,
+        /// A QUIC connection: its keys are `quicSecret`'s.
+        WrongTransport,
     };
 
     /// Hand the record protection over (rustls `dangerous_extract_secrets`):
@@ -1353,6 +1443,7 @@ pub const Server = struct {
     /// no traffic secrets: a KeyUpdate after the hand-over cannot be
     /// followed.
     pub fn extractSecrets(self: *Server, out: *ExtractedSecrets) ExtractError!void {
+        if (self.config.quic != null) return error.WrongTransport;
         if (!self.config.enable_secret_extraction) return error.SecretExtractionDisabled;
         if (self.state != .connected or self.write_closed or self.peer_closed) return error.NotConnected;
         if (self.pendingOutput().len != 0 or self.tx_update != null or !self.inbound.joiner.isEmpty() or self.write_slot_end != 0)
@@ -1368,6 +1459,119 @@ pub const Server = struct {
         // `fail`'s wipe, without an alert (`Closed` calls for none).
         const e = self.fail(error.Closed);
         std.debug.assert(e == error.Closed);
+    }
+
+    pub const QuicResult = struct {
+        /// `handshake_done` (the client's Finished verified) or
+        /// `early_data_accepted` (its 0-RTT is taken: `quicSecret(.read,
+        /// .early)`); null: nothing to report.
+        event: ?Event = null,
+        /// The client's transport parameters, when this call took its
+        /// ClientHello (the second one after a HelloRetryRequest): opaque
+        /// RFC 9000 §18 octets, valid until the next `quicFeed`.
+        transport_parameters: ?[]const u8 = null,
+    };
+
+    /// QUIC: handshake octets the client sent in CRYPTO frames at `level`,
+    /// in order (RFC 9001 §4.1.3). Data at a level the handshake is not at
+    /// (Initial for the ClientHello, Handshake for the client's flight; 0-RTT
+    /// packets carry none), or data past a message that changes the level,
+    /// is `unexpected_message`. After each call: send `quicOutput`, and
+    /// install every `quicSecret` that became available. On an error the
+    /// handshake is dead: close with CRYPTO_ERROR for `quicAlert`.
+    pub fn quicFeed(self: *Server, level: QuicLevel, data: []const u8) Error!QuicResult {
+        if (self.config.quic == null) return error.WrongTransport;
+        if (self.state == .failed) return error.Closed;
+        var res: QuicResult = .{};
+        var at: usize = 0;
+        while (at < data.len) {
+            if (level != self.quicReadLevel()) return self.fail(error.UnexpectedMessage);
+            const n = @min(data.len - at, record.max_plaintext_len);
+            self.inbound.joiner.push(data[at..][0..n]) catch |err| return self.fail(err);
+            at += n;
+            while (self.inbound.joiner.next() catch |err| return self.fail(err)) |m| {
+                const is_hello = m.msg_type == @backingInt(messages.HandshakeType.client_hello);
+                if (self.onHandshake(m) catch |err| return self.fail(err)) |e| res.event = e;
+                if (is_hello) res.transport_parameters = self.quic_peer_params;
+            }
+            // A message that moved the level ended this level's data: what
+            // is left in the joiner `installRx` refused, the next chunk the
+            // level check above refuses.
+        }
+        return res;
+    }
+
+    /// The level the client's next CRYPTO data must come at.
+    fn quicReadLevel(self: *const Server) QuicLevel {
+        return switch (self.state) {
+            .client_hello, .client_hello_retry => .initial,
+            .connected, .failed => .application,
+            else => .handshake,
+        };
+    }
+
+    /// QUIC: the handshake octets to send next, at their level (lowest
+    /// level first); `discardOutput` what went into CRYPTO frames.
+    pub fn quicOutput(self: *const Server) ?struct { level: QuicLevel, data: []const u8 } {
+        // After a failure a flight may be cut short: nothing goes out (the
+        // QUIC stack closes with `quicAlert`).
+        if (self.state == .failed) return null;
+        const p = self.out.quicPending() orelse return null;
+        return .{ .level = @fromBackingInt(@intCast(p.level)), .data = p.data };
+    }
+
+    pub const QuicDirection = enum { read, write };
+
+    /// QUIC: the traffic secret protecting `level` in `direction` (the QUIC
+    /// stack derives its packet keys with `quic-crypto`, the hash being
+    /// `cipherSuite()`'s), or null while there is none — Initial keys come
+    /// from the connection ID (`quic-crypto` `deriveInitialSecrets`). The
+    /// handshake (and early) secrets are wiped once the client's Finished
+    /// is verified, the application ones at `deinit`: take them after the
+    /// `quicFeed` that made them available.
+    /// secret-api-ok: returns a slice of the server's own secret fields; nothing is derived or copied in this frame.
+    pub fn quicSecret(self: *const Server, direction: QuicDirection, level: QuicLevel) ?[]const u8 {
+        if (self.config.quic == null or !self.has_suite) return null;
+        const L = self.suite.hashLen().?;
+        const handshaking = switch (self.state) {
+            .client_certificate, .client_certificate_verify, .client_finished => true,
+            else => false,
+        };
+        return switch (direction) {
+            .write => switch (level) {
+                .handshake => if (handshaking) self.quic_server_hs[0..L] else null,
+                .application => if (self.out.quic_level == 3 and self.state != .failed) self.server_application_secret[0..L] else null,
+                .initial, .early => null,
+            },
+            .read => switch (level) {
+                .early => if (self.quic_early and handshaking) self.quic_client_early[0..L] else null,
+                .handshake => if (handshaking) self.client_handshake_secret[0..L] else null,
+                .application => if (self.state == .connected) self.client_application_secret[0..L] else null,
+                .initial => null,
+            },
+        };
+    }
+
+    /// QUIC: the data each NewSessionTicket carries for the QUIC stack (at
+    /// most 255 octets; rustls `set_resumption_data`), typically the
+    /// transport parameters 0-RTT must be checked against. Set before the
+    /// client's Finished (the tickets are issued then); borrowed until.
+    pub fn setQuicResumptionData(self: *Server, data: []const u8) void {
+        std.debug.assert(data.len <= 255);
+        self.quic_resumption_data = data;
+    }
+
+    /// QUIC: the resumption data of the ticket this connection resumed
+    /// (rustls `received_resumption_data`); null on a full handshake.
+    pub fn quicResumptionData(self: *const Server) ?[]const u8 {
+        return if (self.quic_received_len) |n| self.quic_received[0..n] else null;
+    }
+
+    /// QUIC: the alert behind the last failure, for CRYPTO_ERROR 0x100 +
+    /// its code (RFC 9001 §4.8); null: none to send (the peer aborted, or a
+    /// misuse such as `WrongTransport`) — close with INTERNAL_ERROR.
+    pub fn quicAlert(self: *const Server) ?alert.Description {
+        return self.quic_alert;
     }
 
     /// RFC 8446 §7.5 (RFC 5705's interface): `out.len` octets of keying
@@ -1390,6 +1594,9 @@ pub const Server = struct {
     }
 
     pub fn pendingOutput(self: *const Server) []const u8 {
+        // QUIC: one level at a time (`quicOutput` names it); the levels'
+        // octets must never go out together.
+        if (self.config.quic != null) return if (self.quicOutput()) |o| o.data else "";
         return self.out.pending();
     }
 
@@ -1402,6 +1609,7 @@ pub const Server = struct {
     /// the alert it calls for (if any) is already in `pendingOutput` —
     /// send it, then close.
     pub fn feed(self: *Server, buf: []u8) Error!Result {
+        if (self.config.quic != null) return error.WrongTransport;
         if (self.state == .failed) return error.Closed;
         self.flushKeyUpdate() catch |err| return self.fail(err);
         var at: usize = 0;
@@ -1441,6 +1649,7 @@ pub const Server = struct {
     /// that first (`error.OutputFull` when nothing was taken). An output
     /// smaller than `full_record_output_len` cuts records to what it holds.
     pub fn write(self: *Server, data: []const u8) Error!usize {
+        if (self.config.quic != null) return error.WrongTransport;
         try self.checkWritable();
         var done: usize = 0;
         while (done < data.len) {
@@ -1467,6 +1676,7 @@ pub const Server = struct {
     /// send the pending output first. A KeyUpdate that is due goes out
     /// before the slot is given.
     pub fn writeSlot(self: *Server) Error![]u8 {
+        if (self.config.quic != null) return error.WrongTransport;
         try self.checkWritable();
         // RFC 8446 §5.5: retire the key well before its usage limit.
         if (self.out.tx.seq >= max_records_per_key and self.tx_update == null)
@@ -1486,6 +1696,7 @@ pub const Server = struct {
     /// data record (`n` at most its length; 0 seals nothing). `n` is what
     /// was written: octets of the slot past it must not hold data.
     pub fn commitWrite(self: *Server, n: usize) Error!void {
+        if (self.config.quic != null) return error.WrongTransport;
         self.closeWriteSlot(n);
         if (n == 0) return;
         if (!self.canWrite() or self.write_closed) return error.Closed;
@@ -1506,6 +1717,7 @@ pub const Server = struct {
     /// (`Connection` closing with a partial record): nothing is sealed, and
     /// `deinit` wipes just those `n`.
     pub fn abandonWrite(self: *Server, n: usize) void {
+        if (self.config.quic != null) return;
         self.closeWriteSlot(n);
     }
 
@@ -1523,6 +1735,7 @@ pub const Server = struct {
     /// has room. A KeyUpdate already due is not repeated, but one due
     /// without a request is turned into `update_requested` if that is asked.
     pub fn keyUpdate(self: *Server, request: KeyUpdateRequest) Error!void {
+        if (self.config.quic != null) return error.WrongTransport;
         switch (self.state) {
             .connected => {},
             .failed => return error.Closed,
@@ -1569,6 +1782,7 @@ pub const Server = struct {
     /// client's remaining data and its close_notify can still be read.
     /// secret-api-ok: seals one alert (`record` burns its own frame) and zeroes the send secret; no secret is copied into this frame.
     pub fn close(self: *Server) Error!void {
+        if (self.config.quic != null) return error.WrongTransport;
         if (self.state == .failed or self.write_closed) return error.Closed;
         self.out.write(.alert, &alert.Alert.close_notify.encode()) catch {};
         self.write_closed = true;
@@ -1582,6 +1796,8 @@ pub const Server = struct {
     fn fail(self: *Server, err: anyerror) Error {
         const e: Error = @errorCast(err);
         if (self.state != .failed) {
+            // QUIC: our own output failing is an internal error too.
+            if (self.config.quic != null) self.quic_alert = if (e == error.OutputFull) .internal_error else alertFor(e);
             if (!self.write_closed) if (alertFor(e)) |d| {
                 const a: alert.Alert = if (d == .close_notify) .close_notify else .fatal(d);
                 self.out.write(.alert, &a.encode()) catch {};
@@ -1610,7 +1826,7 @@ pub const Server = struct {
             .client_hello, .client_hello_retry => {
                 if (t != .client_hello) return error.UnexpectedMessage;
                 try burn.run(burn.handshake_burn, Error!void, onClientHello, .{ self, m });
-                return if (self.state == .early_data) .early_data_accepted else null;
+                return if (self.state == .early_data or self.quic_early) .early_data_accepted else null;
             },
             .early_data => {
                 if (t != .end_of_early_data) return error.UnexpectedMessage;
@@ -1636,7 +1852,9 @@ pub const Server = struct {
             // Of the post-handshake messages a client sends only KeyUpdate
             // (no post-handshake authentication is requested).
             .connected => {
-                if (t != .key_update) return error.UnexpectedMessage;
+                // RFC 9001 §6: QUIC updates its keys itself; a TLS KeyUpdate
+                // is a connection error.
+                if (t != .key_update or self.config.quic != null) return error.UnexpectedMessage;
                 try self.onKeyUpdate(m);
                 return null;
             },
@@ -1747,6 +1965,13 @@ pub const Server = struct {
         // raw-key server must offer RawPublicKey again.
         self.server_cert_type = try negotiateCertType(ck.raw_public_key, ch.server_certificate_types);
         self.client_cert_type = try negotiateCertType(if (cfg.client_auth) |ca| ca.raw_public_keys != null else false, ch.client_certificate_types);
+        if (cfg.quic != null) {
+            // RFC 9001 §8.2: transport parameters are mandatory; §8.4: no
+            // middlebox compatibility mode (rustls: illegal_parameter).
+            if (ch.quic_transport_parameters == null) return error.MissingExtension;
+            if (ch.legacy_session_id.len != 0) return error.IllegalParameter;
+            self.quic_peer_params = ch.quic_transport_parameters;
+        }
         const scheme = chooseScheme(ck, &sig_algs) orelse return error.HandshakeFailure;
 
         var suite: record.CipherSuite = chooseSuite(cfg, &ch) orelse return error.HandshakeFailure;
@@ -1818,8 +2043,11 @@ pub const Server = struct {
                 };
                 if (self.alpn != null) break;
             }
-            if (self.alpn == null and cfg.alpn_protocols.len != 0) return error.NoApplicationProtocol;
+            if (self.alpn == null and (cfg.alpn_protocols.len != 0 or cfg.quic != null)) return error.NoApplicationProtocol;
         }
+        // RFC 9001 §8.1: QUIC agrees on an application protocol, or fails
+        // (rustls `NoApplicationProtocol` too).
+        if (cfg.quic != null and self.alpn == null) return error.NoApplicationProtocol;
         self.setServerName(sni);
 
         var ex: kex.ServerExchange = undefined;
@@ -1834,6 +2062,9 @@ pub const Server = struct {
         // After the exchange: a share refused does not spend the ticket's
         // single use in the replay guard (a `CacheTicketer`'s ticket was
         // spent when `choosePsk` opened it).
+        // A QUIC resumption: the stack's data from the ticket.
+        self.quic_received_len = if (selected != null and cfg.quic != null) taken.app_len orelse 0 else null;
+        if (self.quic_received_len) |n| @memcpy(self.quic_received[0..n], taken.app_buf[0..n]);
         self.early_reason = self.decideEarlyData(&ch, selected != null, &taken);
         const early = self.early_reason == .accepted;
 
@@ -1844,7 +2075,11 @@ pub const Server = struct {
             .aes_256_gcm_sha384 => try self.serverFlight(S384, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
             else => try self.serverFlight(S256, m.raw, &ch, ck, scheme, group, &ex, !retried, psk, selected, early),
         }
-        if (early) {
+        if (early and cfg.quic != null) {
+            // RFC 9001 §8.3: no EndOfEarlyData; 0-RTT packets are the QUIC
+            // stack's, under `quicSecret(.read, .early)`.
+            self.quic_early = true;
+        } else if (early) {
             self.inbound.early_data_ok = true;
             // The ticket's promise, or less if the server now takes less.
             self.early_left = @min(cfg.early_data.?.max_size, taken.max_early_data);
@@ -1886,6 +2121,9 @@ pub const Server = struct {
         if (taken.index != 0) return .not_first_identity;
         if (!optEql(taken.alpn(), self.alpn)) return .alpn_mismatch;
         if (@abs(self.age_skew_s) > ed.max_age_skew_s) return .ticket_age_skew;
+        // RFC 9001 §4.6.2: 0-RTT only where the transport parameters the
+        // ticket remembers still hold — the QUIC stack's call.
+        if (cfg.quic) |q| if (q.accept_early) |a| if (!a.accept(a.ctx, taken.app())) return .quic_parameter_mismatch;
         if (!ed.replay.admit(ed.replay.ctx, taken.identity, tk.clock.now_ms(tk.clock.ctx))) return .replayed;
         return .accepted;
     }
@@ -1931,6 +2169,7 @@ pub const Server = struct {
             .now_ms = now_ms,
             .need_peer = if (self.config.client_auth) |ca| ca.mandatory else false,
             .peer_raw = self.client_cert_type == cert_type_raw_public_key,
+            .quic = self.config.quic != null,
             .max_peer = if (self.config.client_auth) |ca| ca.max_leaf_len else 0,
         };
         const ring: TicketerRing = .{ .t = tk.ticketer };
@@ -1953,6 +2192,11 @@ pub const Server = struct {
         if (want.alpn) |p| {
             @memcpy(taken.alpn_buf[0..p.len], p);
             taken.alpn_len = @intCast(p.len);
+        }
+        taken.app_len = null;
+        if (want.app) |a| {
+            @memcpy(taken.app_buf[0..a.len], a);
+            taken.app_len = @intCast(a.len);
         }
         @memcpy(psk_out[0..L], &sel.psk);
         const reported_ms = ids[sel.selected_index].obfuscated_ticket_age -% sel.session.ticket_age_add;
@@ -2166,7 +2410,11 @@ pub const Server = struct {
         var client_early: [L]u8 = undefined;
         defer std.crypto.secureZero(u8, &client_early);
         if (early) ks.deriveSecret(H.Hkdf, &client_early, &early_secret, "c e traffic", &ch_hash);
-        const rx: []const u8 = if (early) &client_early else self.client_handshake_secret[0..L];
+        if (self.config.quic != null) {
+            @memcpy(self.quic_server_hs[0..L], &server_hs);
+            if (early) @memcpy(self.quic_client_early[0..L], &client_early);
+        }
+        const rx: []const u8 = if (early and self.config.quic == null) &client_early else self.client_handshake_secret[0..L];
         self.inbound.installRx(self.suite, rx) catch |err| return switch (err) {
             error.UnexpectedMessage => error.UnexpectedMessage,
             else => error.InternalError,
@@ -2174,8 +2422,12 @@ pub const Server = struct {
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [5]messages.Extension = undefined;
+        var exts: [6]messages.Extension = undefined;
         var n_exts: usize = 0;
+        if (cfg.quic) |q| {
+            exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.quic_transport_parameters), .data = q.transport_parameters };
+            n_exts += 1;
+        }
         // RFC 7250 §4.2: each type only with the message it governs — the
         // server's with its Certificate, the client's with the
         // CertificateRequest.
@@ -2419,6 +2671,8 @@ pub const Server = struct {
             .peer_auth_ms = self.peer_auth_ms,
             .max_early_data = if (early_ext != 0) self.config.early_data.?.max_size else 0,
             .suite = @backingInt(self.suite),
+            .quic = self.config.quic != null,
+            .app = if (self.config.quic != null) self.quic_resumption_data else null,
         };
         const prefix_len = Session.wireLen(1);
         const slot = self.out.slot();
@@ -2458,7 +2712,9 @@ pub const Server = struct {
             if (early_ext != 0) {
                 std.mem.writeInt(u16, e[0..2], @backingInt(hello.ExtensionType.early_data), .big);
                 std.mem.writeInt(u16, e[2..4], 4, .big);
-                std.mem.writeInt(u32, e[4..8], self.config.early_data.?.max_size, .big);
+                // RFC 9001 §4.6.1: over QUIC the field only says "0-RTT
+                // allowed" and MUST be 0xffffffff.
+                std.mem.writeInt(u32, e[4..8], if (self.config.quic != null) 0xffff_ffff else self.config.early_data.?.max_size, .big);
                 e = e[8..];
             }
             std.mem.writeInt(u16, e[0..2], (g << 12) | (g << 4) | 0x0a0a, .big);
@@ -2504,6 +2760,12 @@ const Hello = struct {
     /// RFC 7250 `server_certificate_type` / `client_certificate_type` lists.
     server_cert_types: ?[]const u8 = null,
     client_cert_types: ?[]const u8 = null,
+    /// RFC 9001 `quic_transport_parameters`, and a legacy_session_id.
+    quic_tp: ?[]const u8 = null,
+    session_id: []const u8 = "",
+    /// A padding extension (RFC 7685) making the message this many octets,
+    /// header included (0: none).
+    pad_to: usize = 0,
     /// Octets of a next handshake message in the same record.
     trailing: []const u8 = "",
 };
@@ -2532,7 +2794,8 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     try b.appendSlice(gpa, &.{ 22, 3, 1, 0, 0, 1, 0, 0, 0 });
     try W.u16be(&b, gpa, h.legacy_version);
     try b.appendNTimes(gpa, 0x42, 32);
-    try b.append(gpa, 0);
+    try b.append(gpa, @intCast(h.session_id.len));
+    try b.appendSlice(gpa, h.session_id);
     try W.u16be(&b, gpa, h.suites.len * 2);
     for (h.suites) |s| try W.u16be(&b, gpa, s);
     try b.append(gpa, @intCast(h.compression.len));
@@ -2609,6 +2872,7 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         @memcpy(d[1..][0..types.len], types);
         try W.ext(&e, gpa, ct[0], d[0 .. 1 + types.len]);
     };
+    if (h.quic_tp) |tp| try W.ext(&e, gpa, 57, tp);
     if (h.compress_certificate) |algs| {
         const d = try W.list16(gpa, u8, algs);
         defer gpa.free(d);
@@ -2625,6 +2889,15 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
         try W.ext(&e, gpa, 41, &psk);
+    }
+    if (h.pad_to != 0) {
+        // Message so far: what `b` holds after the record header, the
+        // extensions' length, the extensions, a padding header.
+        const so_far = (b.items.len - 5) + 2 + e.items.len + 4;
+        const pad = try gpa.alloc(u8, h.pad_to - so_far);
+        defer gpa.free(pad);
+        @memset(pad, 0);
+        try W.ext(&e, gpa, 21, pad);
     }
     try W.u16be(&b, gpa, e.items.len);
     try b.appendSlice(gpa, e.items);
@@ -3799,6 +4072,9 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
         .{ .sni = null, .alpn = null, .peer = "SPKI", .peer_raw = true, .peer_scheme = 0x0403, .suite = 0x1301 },
         // A raw-key flag without a key is not written (format 3).
         .{ .sni = "x", .alpn = null, .peer = null, .peer_raw = true, .suite = 0x1301 },
+        // QUIC (formats 5, 6): with the stack's resumption data, empty or not.
+        .{ .sni = "x", .alpn = "h3", .peer = null, .quic = true, .app = "TP", .suite = 0x1301 },
+        .{ .sni = null, .alpn = "h3", .peer = "SPKI", .peer_raw = true, .quic = true, .suite = 0x1302 },
         .{ .sni = &long_sni, .alpn = &long_alpn, .peer = &long_peer, .peer_scheme = 0x0403, .peer_auth_ms = -2, .max_early_data = 0xfedc_ba98, .suite = 0x1303 },
     }) |f| {
         const w = testTicketFields(&buf, f);
@@ -3807,6 +4083,9 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
         try testing.expect(Server.optEql(f.sni, back.sni) and Server.optEql(f.alpn, back.alpn) and
             Server.optEql(f.peer, back.peer) and f.peer_scheme == back.peer_scheme and f.suite == back.suite);
         try testing.expectEqual(f.peer_raw and f.peer != null, back.peer_raw);
+        try testing.expectEqual(f.quic, back.quic);
+        // An empty field reads back as none.
+        try testing.expect(Server.optEql(if (f.quic and (f.app orelse @as([]const u8, "")).len != 0) f.app else null, back.app));
         try testing.expectEqual(f.peer_auth_ms, back.peer_auth_ms);
         try testing.expectEqual(f.max_early_data, back.max_early_data);
         // Every truncation, an extra octet and another format are refused.
@@ -3860,6 +4139,14 @@ test "ticket fields: round trip, and what a ClientHello may resume" {
         const t_raw = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "SPKI", .peer_raw = true, .suite = 0x1301 });
         try testing.expect(raw.accepts(t_raw, 0));
         try testing.expect(!need.accepts(t_raw, 0));
+        // A ticket resumes only on the transport it was issued over.
+        var over_quic = raw;
+        over_quic.quic = true;
+        try testing.expect(!over_quic.accepts(t_raw, 0));
+        const t_quic = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "SPKI", .peer_raw = true, .quic = true, .app = "TP", .suite = 0x1301 });
+        try testing.expect(!raw.accepts(t_quic, 0));
+        try testing.expect(over_quic.accepts(t_quic, 0));
+        try testing.expectEqualStrings("TP", over_quic.app.?);
         var no_key = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = null, .suite = 0x1301 });
         no_key[0] = TicketFields.format_raw;
         try testing.expect(TicketFields.parse(no_key, cap) == null);
@@ -4248,6 +4535,77 @@ fn rfc8448S6Server(cfg: *const Config, joiner: []u8, out: []u8, peer: []u8) Serv
     }) |m| s.transcript.sha256.append(m[0], m[4..]);
     s.state = .client_certificate;
     return s;
+}
+
+test "QUIC: what RFC 9001 requires of a ClientHello, levels, and the record-layer calls refused" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .alpn_protocols = &.{"h3"}, .quic = &quic };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    const good: Hello = .{ .alpn = &.{"h3"}, .quic_tp = "client" };
+    const Run = struct {
+        fn hello(s: *Server, cfg_: *const Config, j: []u8, o: []u8, h: Hello, level: QuicLevel) !Server.QuicResult {
+            s.* = .init(cfg_, j, o);
+            const rec = try buildRecord(testing.allocator, h);
+            defer testing.allocator.free(rec);
+            return s.quicFeed(level, rec[5..]);
+        }
+    };
+    var s: Server = undefined;
+    {
+        const r = try Run.hello(&s, &cfg, &joiner, &out, good, .initial);
+        try testing.expectEqualStrings("client", r.transport_parameters.?);
+        // ServerHello at Initial, the rest of the flight at Handshake; the
+        // keys for both directions of the Handshake level and for sending
+        // at the Application level.
+        const o = s.quicOutput().?;
+        try testing.expectEqual(QuicLevel.initial, o.level);
+        // Two levels pending, `pendingOutput` gives one at a time.
+        try testing.expectEqual(o.data.len, s.pendingOutput().len);
+        try testing.expectEqual(@as(u8, 2), o.data[0]); // server_hello
+        s.discardOutput(o.data.len);
+        const o2 = s.quicOutput().?;
+        try testing.expectEqual(QuicLevel.handshake, o2.level);
+        try testing.expectEqual(@as(u8, 8), o2.data[0]); // encrypted_extensions
+        try testing.expect(std.mem.indexOf(u8, o2.data, &.{ 0, 57, 0, 2, 'T', 'P' }) != null);
+        for ([_]struct { Server.QuicDirection, QuicLevel }{ .{ .read, .handshake }, .{ .write, .handshake }, .{ .write, .application } }) |k|
+            try testing.expect(s.quicSecret(k[0], k[1]) != null);
+        try testing.expect(s.quicSecret(.read, .application) == null and s.quicSecret(.read, .early) == null);
+        // The record layer is not there.
+        var buf: [8]u8 = undefined;
+        try testing.expectError(error.WrongTransport, s.feed(&buf));
+        try testing.expectError(error.WrongTransport, s.write("x"));
+        try testing.expectError(error.WrongTransport, s.keyUpdate(.update_not_requested));
+        try testing.expectError(error.WrongTransport, s.close());
+        // Handshake data at the Initial level now: unexpected_message.
+        try testing.expectError(error.UnexpectedMessage, s.quicFeed(.initial, &.{ 20, 0, 0, 0 }));
+        try testing.expectEqual(alert.Description.unexpected_message, s.quicAlert().?);
+        // The flight left unsent is not sent after the failure.
+        try testing.expectEqual(null, s.quicOutput());
+    }
+    // RFC 9001 §8.2: no transport parameters; §8.4: a legacy_session_id;
+    // §8.1: no ALPN protocol agreed.
+    for ([_]struct { Hello, Error }{
+        .{ .{ .alpn = &.{"h3"} }, error.MissingExtension },
+        .{ .{ .alpn = &.{"h3"}, .quic_tp = "c", .session_id = "abcd" }, error.IllegalParameter },
+        .{ .{ .alpn = &.{"h2"}, .quic_tp = "c" }, error.NoApplicationProtocol },
+        .{ .{ .quic_tp = "c" }, error.NoApplicationProtocol },
+    }) |c| {
+        try testing.expectError(c[1], Run.hello(&s, &cfg, &joiner, &out, c[0], .initial));
+        try testing.expectEqual(alertFor(c[1]).?, s.quicAlert().?);
+    }
+    // The ClientHello at the wrong level, or with more data behind it — in
+    // the same chunk, or in the next one after a hello that fills one
+    // exactly (the joiner is then empty: only the level check sees it).
+    try testing.expectError(error.UnexpectedMessage, Run.hello(&s, &cfg, &joiner, &out, good, .handshake));
+    try testing.expectError(error.UnexpectedMessage, Run.hello(&s, &cfg, &joiner, &out, .{ .alpn = &.{"h3"}, .quic_tp = "c", .trailing = &.{ 20, 0, 0, 0 } }, .initial));
+    try testing.expectError(error.UnexpectedMessage, Run.hello(&s, &cfg, &joiner, &out, .{ .alpn = &.{"h3"}, .quic_tp = "c", .pad_to = record.max_plaintext_len, .trailing = &.{ 20, 0, 0, 0 } }, .initial));
+    _ = try Run.hello(&s, &cfg, &joiner, &out, .{ .alpn = &.{"h3"}, .quic_tp = "c", .pad_to = record.max_plaintext_len }, .initial);
+    // A TLS server takes no QUIC calls.
+    const tls_cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    s = .init(&tls_cfg, &joiner, &out);
+    try testing.expectError(error.WrongTransport, s.quicFeed(.initial, "x"));
 }
 
 test "RFC 7250: certificate types as rustls negotiates them; refusals are handshake_failure" {
