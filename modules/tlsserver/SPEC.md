@@ -6,7 +6,7 @@
 
 **Scope:** parity — rustls 0.23.46 (surveyed 2026-10-20; re-surveyed 2026-10-22 against rustls 0.23.43's server source: the BoGo tests rustls passes all pass here (parity gate, 0 gaps), and its server features beyond them — RFC 7250 raw public keys, the QUIC API, kTLS secret extraction — are here too; TLS 1.2 deliberately not, see *What is deliberately not done*)
 
-**Audit:** review 2026-10-22 · mutation 2026-10-22 (97/99, 2 eq) · src 85b081da243a31ea
+**Audit:** review 2026-10-22 · mutation 2026-10-22 (97/99, 2 eq) · src d19e8a87fe2503c2
 
 **Hardening:** fuzz 2026-10-22 (`tlsserver-quic`, 800,000 runs, clean, TLSSERVER_FUZZ: recorded Go QUICClient sessions whole, in pieces, flipped, at a wrong level, cut short; reach 8/8 in 400 seeds; `tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-21 (ctgrind: the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 77 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records)
 

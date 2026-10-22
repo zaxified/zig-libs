@@ -18,7 +18,7 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper — under construction: today a full handshake with a certificate (three suites; X25519MLKEM768, X25519, secp256r1, secp384r1), HelloRetryRequest, session tickets and resumption, client certificates (mTLS), OCSP and SCT stapling, KeyUpdate and a PEM certificate/key loader",
+    .doc = "TLS 1.3 server (RFC 8446), sans-I/O core with a blocking wrapper, at rustls's server scope: hybrid and classical key exchange, HelloRetryRequest, stateless and stateful tickets, 0-RTT with a replay guard, client certificates and RFC 7250 raw public keys, OCSP/SCT stapling, certificate compression, exporter, kTLS secret hand-over and a QUIC mode (RFC 9001)",
     // Rendered by `gen-catalog` alongside `doc`.
     .platform_note = "any (pure computation; the planned blocking wrapper uses std.Io)",
     .targets = .{.linux64},

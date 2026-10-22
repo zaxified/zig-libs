@@ -2,23 +2,22 @@
 
 A TLS 1.3 server (RFC 8446) for the collection: a buffer-driven (sans-I/O) core with a blocking
 wrapper on top, built on the `tls13` handshake building blocks and the `aesgcm` / `chachapoly`
-AEADs. **Under construction (milestone M2):** a full (EC)DHE handshake with a certificate —
-TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256; X25519MLKEM768,
-X25519, secp256r1, secp384r1 (and ML-KEM-1024 when enabled); ECDSA P-256/P-384/P-521,
-Ed25519, RSA-PSS and ML-DSA-44/65/87 certificates; SNI
-certificate selection; ALPN; HelloRetryRequest for a group the client sent no share for — then application data and close_notify, sans-I/O (`Server`) or
-blocking (`Connection`), with the certificate and key loaded from PEM (`keys`), KeyUpdate
-both ways, session tickets with PSK resumption (`psk_dhe_ke`, through `tlsresume`), and client
-certificates (`Config.client_auth`: a `ClientCertVerifier`, `X509Verifier` over `x509`;
-`Server.peerCertificate`), and an OCSP staple and SCT list on the leaf when the client asks
-(`CertifiedKey.ocsp_response` / `sct_list`, checked by `CertifiedKey.check`), and the
-Certificate compressed (RFC 8879) when the client offers an algorithm the caller compressed it
-with ahead of time (`CertifiedKey.compressed_certificates`). The rustls parity gate runs with
-BoGo: 278 of the 436 TLS 1.3 server tests rustls passes pass here, 131 are disabled with a
-reason, 27 are gaps (0-RTT; `SPEC.md`, *Backlog*).
+AEADs. At rustls's server scope (re-surveyed 2026-10-22, grade 2): a full (EC)DHE handshake with
+a certificate — TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256;
+X25519MLKEM768, X25519, secp256r1, secp384r1 (and ML-KEM-1024 when enabled); ECDSA
+P-256/P-384/P-521, Ed25519, RSA-PSS and ML-DSA-44/65/87 certificates or RFC 7250 raw public
+keys; SNI certificate selection; ALPN; HelloRetryRequest; KeyUpdate both ways; session tickets
+(stateless over a STEK ring, or stateful over a session cache) with PSK resumption and 0-RTT
+behind a mandatory replay guard; client certificates or raw public keys (`Config.client_auth`);
+OCSP and SCT stapling; RFC 8879 certificate compression (precompressed by the caller); the
+RFC 8446 §7.5 exporter; kTLS secret hand-over (`extractSecrets`); and a QUIC mode (RFC 9001,
+`Config.quic`: CRYPTO data and traffic secrets per encryption level). Sans-I/O (`Server`) or
+blocking (`Connection`), certificate and key from PEM (`keys`). The rustls parity gate runs
+with BoGo: the 305 TLS 1.3 server tests rustls passes that apply all pass here (131 more are
+disabled with a reason, 0 gaps; `SPEC.md`).
 
-- **Status:** gap — the collection has a TLS client (`tlsclient`) and DTLS (`dtls`), no TLS
-  server; qap runs a fork of a third-party one, which this module is meant to replace.
+- **Status:** the collection's TLS 1.3 server (with `tlsclient` and `dtls`); qap runs it behind
+  `-Dtls-engine=tlsserver` while its fork of a third-party server is still the default.
 - **Model after:** RFC 8446; rustls `ServerConnection` for scope and the buffer-driven split.
 - **Platform:** any (pure computation; `Connection` uses std.Io). **Role:** server.
   **Concurrency:** single owner. **Deps:** `tls13`, `aesgcm`, `chachapoly`, `netaddr`,
