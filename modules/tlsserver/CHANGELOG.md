@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Performance:** `Connection.step` no longer inlines the handshake
+  (`Server.onHandshake` via `feed`, and `sign` with its 4.6 KiB signature buffer): its frame
+  was 22.7 KiB on the path of every read, and an idle connection parks below it. Now under
+  0.5 KiB. qap, 200 held TLS connections after 2 requests each: resident fiber stack
+  10 → 7 pages per connection (−12 KiB), worker anon RSS 9.2 → 6.8 MB. No API change.
 - **2026-10-22** — **Fixed:** `serialize` on a server without a peer buffer (no client
   authentication) sliced past it and panicked (`peerLeaf`); found by the mutation run's new
   tests. **Tests:** 75 tests for the surviving mutants of the day's features (149 schemata:

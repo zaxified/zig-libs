@@ -2242,7 +2242,11 @@ pub const Server = struct {
                     return .{ .event = .peer_closed, .consumed = at };
                 },
                 .handshake => |m| {
-                    const ev = self.onHandshake(m) catch |err| return self.fail(err);
+                    // Out of line: inlined, the handshake's dispatch made
+                    // the caller's frame (`Connection.step`) ~18 KiB, on
+                    // the path of every read and below which a connection
+                    // parks between requests.
+                    const ev = @call(.never_inline, onHandshake, .{ self, m }) catch |err| return self.fail(err);
                     if (ev) |e| return .{ .event = e, .consumed = at };
                 },
             }

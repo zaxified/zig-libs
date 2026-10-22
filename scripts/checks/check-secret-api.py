@@ -453,7 +453,16 @@ def is_trivial(body):
 
 
 BURN = re.compile(r"(?i)burn")
-CALL = re.compile(r"(?<![\w@])(\w+)\s*\(")
+_CALL = re.compile(r"(?<![\w@])(\w+)\s*\(|@call\(\s*\.\w+\s*,\s*(?:\w+\.)*(\w+)\s*,")
+
+
+class CALL:
+    """Names called in a body: `name(` and `@call(.modifier, name, ...)` (an
+    out-of-line call is still a call into whatever burns below it)."""
+
+    @staticmethod
+    def findall(body):
+        return [a or b for a, b in _CALL.findall(body)]
 
 
 def module_files(module):

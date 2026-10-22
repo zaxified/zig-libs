@@ -169,7 +169,9 @@ pub const Connection = struct {
             // an `app_data` slice is still valid when it is returned.
             self.input.toss(r.consumed);
             if (r.event == .signature_needed) {
-                try self.sign();
+                // Out of line: its signature buffer (4.6 KiB) stays off the
+                // frame every read parks below.
+                try @call(.never_inline, sign, .{self});
                 continue;
             }
             if (r.event != .need_more) return r.event;
