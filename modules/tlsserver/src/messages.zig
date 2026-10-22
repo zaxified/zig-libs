@@ -146,6 +146,10 @@ pub const HelloRetryRequest = struct {
     /// cookie is asked back).
     selected_group: ?u16,
     cookie: ?[]const u8 = null,
+    /// RFC 9849 §7.2.1: an `encrypted_client_hello` extension with this
+    /// payload, last (the confirmation is computed over zeros, then
+    /// written over the message's last 8 octets).
+    ech_confirmation: ?*const [8]u8 = null,
 };
 
 /// RFC 8446 §4.1.4: a ServerHello with `hello_retry_request_random`.
@@ -167,6 +171,11 @@ pub fn helloRetryRequest(out: []u8, hrr: HelloRetryRequest) Error![]u8 {
         try w.close(u16, e);
     }
     try supportedVersions(&w);
+    if (hrr.ech_confirmation) |c| {
+        try w.int(u16, 0xfe0d);
+        try w.int(u16, 8);
+        try w.bytes(c);
+    }
     try w.close(u16, exts);
     return w.done(at);
 }

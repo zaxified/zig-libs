@@ -115,6 +115,7 @@ const burn = @import("burn.zig");
 const zeroize = @import("zeroize.zig").zeroize;
 const clientauth = @import("clientauth.zig");
 const fingerprint = @import("fingerprint.zig");
+pub const ech = @import("ech.zig");
 const tlsresume = @import("tlsresume");
 
 const certverify = tls13.certverify;
@@ -484,6 +485,12 @@ pub const Config = struct {
     /// (`fingerprint.ja4`; a `CertificateSelector` can compute it itself, to
     /// refuse a client before anything is sent).
     ja4: bool = false,
+    /// TLS Encrypted Client Hello (RFC 9849; Go `EncryptedClientHelloKeys`,
+    /// BoringSSL `SSL_CTX_set1_ech_keys`; rustls serves none): a client's
+    /// encrypted inner ClientHello is decrypted with these keys and the
+    /// handshake is the inner one's (its SNI, ALPN, tickets); a declined
+    /// offer gets `retry_configs`. Needs `Server.setEchBuffer`.
+    ech: ?*const ech.Ech = null,
 };
 
 /// Go's progression: record k (from 0) of a burst carries at most
@@ -1107,6 +1114,15 @@ pub const Error = inbound.Error || clientauth.VerifyError || error{
     WrongTransport,
     /// `provideSignature` while no offloaded signature is awaited.
     NoSignatureRequested,
+    /// RFC 9849 (`illegal_parameter` unless said): the inner hello lacks its
+    /// inner offer or offers TLS 1.2 or older; a bad `ech_outer_extensions`
+    /// reference; non-zero padding; the second offer changed; the second
+    /// payload did not open (`decrypt_error`).
+    EchInvalidInner,
+    EchInvalidOuterExtension,
+    EchInvalidPadding,
+    EchOfferChanged,
+    EchDecryptionFailed,
 };
 
 /// The alert a failure sends (null: none — the peer aborted, or the
@@ -1123,6 +1139,8 @@ pub fn alertFor(err: Error) ?alert.Description {
         error.OutputFull, error.Closed, error.NotConnected, error.WrongTransport, error.NoSignatureRequested => null,
         error.TooManyKeyUpdates, error.TooMuchEarlyData => .unexpected_message,
         error.CertificateRequired => .certificate_required,
+        error.EchInvalidInner, error.EchInvalidOuterExtension, error.EchInvalidPadding, error.EchOfferChanged => .illegal_parameter,
+        error.EchDecryptionFailed => .decrypt_error,
         error.UnsupportedExtension => .unsupported_extension,
         error.BadCertificate => .bad_certificate,
         error.UnsupportedCertificate => .unsupported_certificate,
@@ -1364,7 +1382,7 @@ pub const Server = struct {
     sign_content: [certverify.max_signed_content_len]u8 = undefined,
     sign_len: u8 = 0,
     sign_scheme: u16 = 0,
-    sign_key: ?*const CertifiedKey = null,
+    sign_cert: ?*const CertifiedKey = null,
     sign_server_hs: [48]u8 = @splat(0),
     after_signature: State = .failed,
     /// RFC 8449: the client's `record_size_limit` (null: none sent).
@@ -1374,6 +1392,15 @@ pub const Server = struct {
     dyn_sent: u64 = 0,
     dyn_records: u32 = 0,
     dyn_last_ms: i64 = 0,
+    /// `Config.ech`: the caller's buffer (`setEchBuffer`), what became of
+    /// the first hello's offer, whether a hello offered at all (for
+    /// `retry_configs`), the accepted offer and its HPKE context (a key:
+    /// wiped with the handshake secrets).
+    ech_buf: []u8 = &.{},
+    ech_state: enum { none, accepted, rejected, backend } = .none,
+    ech_offered: bool = false,
+    ech_first: ech.Offer = undefined,
+    ech_opener: ech.Opener = .{ .aes128 = undefined },
     /// `Config.ja4`: the first ClientHello's fingerprint.
     ja4_buf: [fingerprint.ja4_len]u8 = undefined,
     has_ja4: bool = false,
@@ -1403,6 +1430,22 @@ pub const Server = struct {
         self.peer_buf = buf;
     }
 
+    /// With `Config.ech`: the buffer a client's encrypted ClientHello is
+    /// decrypted and rebuilt in, `ech.bufferLen(Ech.max_client_hello_len)`
+    /// octets, the caller's until `deinit` (it holds the inner ClientHello,
+    /// not a secret). Without it every offer is declined. Set before the
+    /// first `feed`.
+    pub fn setEchBuffer(self: *Server, buf: []u8) void {
+        std.debug.assert(self.state == .client_hello);
+        self.ech_buf = buf;
+    }
+
+    /// RFC 9849: the client's encrypted ClientHello was decrypted and the
+    /// handshake is the inner one's.
+    pub fn echAccepted(self: *const Server) bool {
+        return self.ech_state == .accepted;
+    }
+
     fn peerLeaf(self: *const Server) []u8 {
         return self.peer_buf[ticket_head_len..][0..self.peer_len];
     }
@@ -1426,6 +1469,7 @@ pub const Server = struct {
         std.crypto.secureZero(u8, &self.quic_server_hs);
         std.crypto.secureZero(u8, &self.quic_client_early);
         std.crypto.secureZero(u8, &self.sign_server_hs);
+        self.ech_opener.wipe();
     }
 
     pub fn isConnected(self: *const Server) bool {
@@ -1566,7 +1610,7 @@ pub const Server = struct {
     }
 
     fn completeSignature(self: *Server, signature: []const u8) Error!void {
-        const ck = self.sign_key.?;
+        const ck = self.sign_cert.?;
         const scheme: certverify.SignatureScheme = @fromBackingInt(self.sign_scheme);
         if (signature.len == 0 or signature.len > certverify.maxSignatureLen(scheme)) return error.InternalError;
         if (ck.offload.?.verify) {
@@ -1581,7 +1625,7 @@ pub const Server = struct {
             else => try self.sendSignature(S256, signature),
         }
         std.crypto.secureZero(u8, &self.sign_server_hs);
-        self.sign_key = null;
+        self.sign_cert = null;
         self.state = self.after_signature;
     }
 
@@ -1813,6 +1857,7 @@ pub const Server = struct {
         }
     }
 
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn pendingOutput(self: *const Server) []const u8 {
         // QUIC: one level at a time (`quicOutput` names it); the levels'
         // octets must never go out together.
@@ -1869,6 +1914,7 @@ pub const Server = struct {
     /// A record is not cut short to fit behind output still pending: send
     /// that first (`error.OutputFull` when nothing was taken). An output
     /// smaller than `full_record_output_len` cuts records to what it holds.
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn write(self: *Server, data: []const u8) Error!usize {
         if (self.config.quic != null) return error.WrongTransport;
         try self.checkWritable();
@@ -1896,6 +1942,7 @@ pub const Server = struct {
     /// call on the server in between (each may queue records over it). Empty:
     /// send the pending output first. A KeyUpdate that is due goes out
     /// before the slot is given.
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn writeSlot(self: *Server) Error![]u8 {
         if (self.config.quic != null) return error.WrongTransport;
         try self.checkWritable();
@@ -1916,6 +1963,7 @@ pub const Server = struct {
     /// Seal the first `n` octets of the last `writeSlot` as one application
     /// data record (`n` at most its length; 0 seals nothing). `n` is what
     /// was written: octets of the slot past it must not hold data.
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn commitWrite(self: *Server, n: usize) Error!void {
         if (self.config.quic != null) return error.WrongTransport;
         self.closeWriteSlot(n);
@@ -1960,6 +2008,7 @@ pub const Server = struct {
     /// Give up the last `writeSlot` after writing its first `n` octets
     /// (`Connection` closing with a partial record): nothing is sealed, and
     /// `deinit` wipes just those `n`.
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn abandonWrite(self: *Server, n: usize) void {
         if (self.config.quic != null) return;
         self.closeWriteSlot(n);
@@ -1978,6 +2027,7 @@ pub const Server = struct {
     /// KeyUpdate goes out before any later record — at once if the output
     /// has room. A KeyUpdate already due is not repeated, but one due
     /// without a request is turned into `update_requested` if that is asked.
+    /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn keyUpdate(self: *Server, request: KeyUpdateRequest) Error!void {
         if (self.config.quic != null) return error.WrongTransport;
         switch (self.state) {
@@ -2172,15 +2222,36 @@ pub const Server = struct {
         return share;
     }
 
-    fn onClientHello(self: *Server, m: inbound.HandshakeMessage) Error!void {
+    fn onClientHello(self: *Server, m_wire: inbound.HandshakeMessage) Error!void {
         const cfg = self.config;
         const retried = self.state == .client_hello_retry;
         // Out of line, as `findShare`: the parse keeps an 8 KiB bitset of
         // the extension types seen, which inlined here put every frame
         // below this one (kex, signing, the key schedule) 8 KiB deeper.
-        const ch = @call(.never_inline, hello.parseClientHello, .{m.body}) catch |err| return switch (err) {
+        const outer = @call(.never_inline, hello.parseClientHello, .{m_wire.body}) catch |err| return switch (err) {
             error.DecodeError => error.DecodeError,
             error.IllegalParameter => error.IllegalParameter,
+        };
+        // RFC 9849: with ECH accepted the handshake is the inner hello's,
+        // rebuilt in the ECH buffer; the outer one is gone from here on.
+        var m = m_wire;
+        var ch = outer;
+        if (cfg.ech) |e| if (try @call(.never_inline, echInner, .{ self, e, &outer, m_wire.body, retried })) |inner| {
+            m = .{ .msg_type = inner[0], .body = inner[4..], .raw = inner };
+            ch = @call(.never_inline, hello.parseClientHello, .{m.body}) catch |err| return switch (err) {
+                error.DecodeError => error.DecodeError,
+                error.IllegalParameter => error.IllegalParameter,
+            };
+            try checkInner(&ch);
+        };
+        // RFC 9849 §7.2: as a backend server (split mode: a client-facing
+        // server decrypted the hello and passed the inner one on), a hello
+        // with an inner offer gets the confirmation too (BoringSSL always).
+        if (!retried and self.ech_state != .accepted) if (ch.ech_raw) |data| {
+            if (data.len != 0 and data[0] == 1) {
+                _ = try echOffer(data);
+                self.ech_state = .backend;
+            }
         };
         if (std.mem.indexOfScalar(u8, ch.legacy_compression_methods, 0) == null) return error.IllegalParameter;
         var sni: ?[]const u8 = null;
@@ -2201,7 +2272,7 @@ pub const Server = struct {
         if (cfg.ja4 and !retried) {
             // Out of line: its 2 KiB of sort buffers would deepen this frame
             // and every secret-holding one below it (as `findShare`).
-            self.has_ja4 = if (@call(.never_inline, fingerprint.ja4, .{ &ch, if (cfg.quic != null) fingerprint.Transport.quic else .tcp, &self.ja4_buf })) true else |_| false;
+            self.has_ja4 = if (@call(.never_inline, fingerprint.ja4, .{ &outer, if (cfg.quic != null) fingerprint.Transport.quic else .tcp, &self.ja4_buf })) true else |_| false;
         }
         // The version first: a TLS 1.2 (or older) client gets
         // `protocol_version` whatever else its hello lacks (rustls order).
@@ -2337,7 +2408,7 @@ pub const Server = struct {
         }
         // An offloaded signature (a full handshake: never with early data).
         const next: State = if (cfg.client_auth != null and psk == null) .client_certificate else .client_finished;
-        if (self.sign_key != null) {
+        if (self.sign_cert != null) {
             std.debug.assert(!early);
             self.inbound.skip_early = if (ch.early_data) skipBudget(cfg) else 0;
             self.after_signature = next;
@@ -2359,6 +2430,69 @@ pub const Server = struct {
         // (never after a retry: refused above).
         self.inbound.skip_early = if (ch.early_data) skipBudget(cfg) else 0;
         self.state = next;
+    }
+
+    /// RFC 9849 §7.1: the inner hello of an accepted offer (null: ECH not
+    /// offered, or declined — the outer hello goes on). A declined offer
+    /// is not an error: it may be GREASE.
+    fn echInner(self: *Server, e: *const ech.Ech, outer: *const hello.ClientHello, body: []const u8, retried: bool) Error!?[]const u8 {
+        if (!retried) {
+            self.ech_state = .none;
+            self.ech_offered = false;
+            const data = outer.ech_raw orelse return null;
+            const offer = switch (try echOffer(data)) {
+                // A backend's part (split mode, below), not this one's.
+                .inner => return null,
+                .outer => |o| o,
+            };
+            self.ech_offered = true;
+            const inner = ech.openFirst(e, outer, body, &offer, self.ech_buf, &self.ech_opener) catch |err| return echError(err);
+            if (inner) |i| {
+                self.ech_state = .accepted;
+                self.ech_first = .{ .kdf = offer.kdf, .aead = offer.aead, .config_id = offer.config_id, .enc = "", .payload = "" };
+                return i;
+            }
+            self.ech_state = .rejected;
+            return null;
+        }
+        // §7.1.1: declined (or not offered) on the first hello, the second
+        // is not decrypted either.
+        if (self.ech_state != .accepted) {
+            if (outer.ech_raw != null) self.ech_offered = true;
+            return null;
+        }
+        const data = outer.ech_raw orelse return error.MissingExtension;
+        const offer = switch (try echOffer(data)) {
+            .inner => return error.IllegalParameter,
+            .outer => |o| o,
+        };
+        return ech.openSecond(&self.ech_first, &self.ech_opener, outer, body, &offer, self.ech_buf) catch |err| echError(err);
+    }
+
+    fn echOffer(data: []const u8) Error!ech.OfferKind {
+        return ech.parseOffer(data) catch |err| echError(err);
+    }
+
+    fn echError(err: ech.Error) Error {
+        return switch (err) {
+            error.DecodeError => error.DecodeError,
+            error.IllegalParameter => error.IllegalParameter,
+            error.InvalidOuterExtension => error.EchInvalidOuterExtension,
+            error.InvalidPadding => error.EchInvalidPadding,
+            error.OfferChanged => error.EchOfferChanged,
+            error.DecryptError => error.EchDecryptionFailed,
+        };
+    }
+
+    /// RFC 9849 §7.1: the inner hello carries an inner offer and offers
+    /// nothing below TLS 1.3 (`illegal_parameter`).
+    fn checkInner(ch: *const hello.ClientHello) Error!void {
+        const data = ch.ech_raw orelse return error.EchInvalidInner;
+        if ((ech.parseOffer(data) catch return error.EchInvalidInner) != .inner) return error.EchInvalidInner;
+        var versions = ch.supportedVersions() orelse return error.EchInvalidInner;
+        while (versions.next()) |v| {
+            if (v < messages.tls13_version and !fingerprint.isGrease(v)) return error.EchInvalidInner;
+        }
     }
 
     /// Early data refused is skipped up to 2^14 octets of ciphertext, or
@@ -2606,11 +2740,21 @@ pub const Server = struct {
         const t = H.transcript(&self.transcript);
         t.append(client_hello_raw[0], client_hello_raw[4..]);
         t.resetToMessageHash(t.currentHash());
-        try self.send(H, try encoded(messages.helloRetryRequest(self.out.slot(), .{
+        const ech_accepted = self.ech_state == .accepted or self.ech_state == .backend;
+        const zeros: [8]u8 = @splat(0);
+        const hrr = try encoded(messages.helloRetryRequest(self.out.slot(), .{
             .legacy_session_id_echo = ch.legacy_session_id,
             .cipher_suite = @backingInt(self.suite),
             .selected_group = self.group,
-        })));
+            .ech_confirmation = if (ech_accepted) &zeros else null,
+        }));
+        if (ech_accepted) {
+            // RFC 9849 §7.2.1, over message_hash(inner hello 1) and this
+            // HelloRetryRequest with the payload zero.
+            const th = t.wouldBeHash(hrr[0], hrr.len - 4, hrr[4..]);
+            hrr[hrr.len - 8 ..][0..8].* = ech.confirmation(H.Hkdf, ch.random, "hrr ech accept confirmation", &th);
+        }
+        try self.send(H, hrr);
     }
 
     /// Frame the message just encoded at the start of the output slot and
@@ -2652,13 +2796,22 @@ pub const Server = struct {
 
         var random: [32]u8 = undefined;
         cfg.random.bytes(&random);
-        try self.send(H, try encoded(messages.serverHello(self.out.slot(), .{
+        const ech_accepted = self.ech_state == .accepted or self.ech_state == .backend;
+        if (ech_accepted) @memset(random[24..], 0);
+        const sh = try encoded(messages.serverHello(self.out.slot(), .{
             .random = &random,
             .legacy_session_id_echo = ch.legacy_session_id,
             .cipher_suite = @backingInt(self.suite),
             .key_share = .{ .group = group, .key_exchange = ex.public[0..ex.public_len] },
             .selected_identity = selected_identity,
-        })));
+        }));
+        if (ech_accepted) {
+            // RFC 9849 §7.2: the last 8 random octets confirm ECH, over the
+            // inner hello's transcript through this ServerHello with them zero.
+            const th = t.wouldBeHash(sh[0], sh.len - 4, sh[4..]);
+            sh[4 + 2 + 24 ..][0..8].* = ech.confirmation(H.Hkdf, ch.random, "ech accept confirmation", &th);
+        }
+        try self.send(H, sh);
         if (ccs) try self.out.write(.change_cipher_spec, &.{1});
 
         // RFC 8446 §7.1: the PSK, or zeros (whose early secret's salt is a
@@ -2700,8 +2853,17 @@ pub const Server = struct {
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [7]messages.Extension = undefined;
+        var exts: [8]messages.Extension = undefined;
         var n_exts: usize = 0;
+        // RFC 9849 §7.1: an offer declined (or a second hello's offer after
+        // none on the first) gets the retry configs.
+        if (cfg.ech) |e| if (self.ech_state != .accepted and self.ech_offered) {
+            const list = ech.retryConfigs(self.ech_buf, e) catch "";
+            if (list.len > 2) {
+                exts[n_exts] = .{ .type = ech.ext_encrypted_client_hello, .data = list };
+                n_exts += 1;
+            }
+        };
         // RFC 8449 §4: what this server takes, 2^14 + 1 in TLS 1.3.
         const own_limit = comptime std.mem.toBytes(std.mem.nativeToBig(u16, record.max_plaintext_len + 1));
         if (self.peer_record_limit != null) {
@@ -2775,7 +2937,7 @@ pub const Server = struct {
                 const content = certverify.buildSignedContent(.server, &th, &self.sign_content) catch unreachable;
                 self.sign_len = @intCast(content.len);
                 self.sign_scheme = @backingInt(scheme);
-                self.sign_key = ck;
+                self.sign_cert = ck;
                 @memcpy(self.sign_server_hs[0..L], &server_hs);
                 return;
             };

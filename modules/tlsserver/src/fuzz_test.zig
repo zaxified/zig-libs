@@ -13,8 +13,10 @@
 //! `tlsserver-keys` (`keys.CertKeyPair.fromPem`), `tlsserver-server`
 //! (`Server` on recorded real clients), `tlsserver-keyupdate` (KeyUpdate
 //! against a model client), `tlsserver-quic` (QUIC mode on recorded Go
-//! QUICClient sessions) and `tlsserver-clientauth` (the client
-//! Certificate / CertificateVerify decoders) are described at their sections.
+//! QUICClient sessions), `tlsserver-clientauth` (the client
+//! Certificate / CertificateVerify decoders) and `tlsserver-ech` (the
+//! rebuilding of an Encrypted Client Hello's inner hello) are described at
+//! their sections.
 
 const std = @import("std");
 const testing = std.testing;
@@ -914,6 +916,256 @@ test "fuzz harness: hello, 300 seeds, reaches every outcome" {
     try HelloMark.reach(fuzzHello, "tlsserver-hello", 300);
 }
 
+// ── tlsserver-ech ────────────────────────────────────────────────────────
+//
+// `ech.reconstruct`, the decoder of what anyone holding the public ECH
+// config can encrypt (RFC 9849 §5.1): an outer ClientHello of random
+// extensions, and an EncodedClientHelloInner built from a model — its own
+// extensions interleaved with `ech_outer_extensions` lists naming outer
+// ones in order — rebuilds to exactly the model (the outer session id, the
+// merged extensions in order, the padding gone). Planted faults give their
+// error: references out of order, repeated, missing or to
+// `encrypted_client_hello` are InvalidOuterExtension; non-zero padding or a
+// session id InvalidPadding; an odd or empty reference list DecodeError.
+// Damaged encodings (flipped, truncated, random) never panic and never
+// write past the buffer.
+
+const ech = @import("ech.zig");
+
+const EchMark = Marker(enum {
+    rebuilt,
+    rebuilt_with_refs,
+    rebuilt_two_lists,
+    refused_order,
+    refused_repeat,
+    refused_missing,
+    refused_self,
+    refused_padding,
+    refused_session_id,
+    refused_list,
+    damaged,
+});
+
+const EchFault = enum { none, order, repeat, missing, self, padding, session_id, list, damaged };
+
+fn fuzzEch(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const ob = try gpa.alloc(u8, 4096);
+    defer gpa.free(ob);
+    const eb = try gpa.alloc(u8, 4096);
+    defer gpa.free(eb);
+
+    // The outer hello: unknown extensions of increasing type, perhaps
+    // `encrypted_client_hello` among them.
+    var w: Writer = .{ .buf = ob };
+    w.int(u16, 0x0303);
+    var random: [32]u8 = undefined;
+    src.bytes(&random);
+    w.bytes(&random);
+    const sid_len = src.valueRangeAtMost(u8, 0, 32);
+    var sid: [32]u8 = undefined;
+    src.bytes(sid[0..sid_len]);
+    w.int(u8, sid_len);
+    w.bytes(sid[0..sid_len]);
+    w.bytes(&.{ 0, 2, 0x13, 0x01, 1, 0 });
+    const exts_at = w.open(u16);
+    var outer_types: [10]u16 = undefined;
+    var outer_data: [10][]const u8 = undefined;
+    const n_outer = src.valueRangeAtMost(u8, 0, 10);
+    var t: u16 = 0x1000;
+    const ech_at: ?usize = if (n_outer != 0 and src.valueRangeAtMost(u8, 0, 3) == 0) src.index(n_outer) else null;
+    for (0..n_outer) |i| {
+        t += src.valueRangeAtMost(u16, 1, 40);
+        outer_types[i] = if (ech_at == i) ech.ext_encrypted_client_hello else t;
+        w.int(u16, outer_types[i]);
+        const len = src.valueRangeAtMost(u8, 0, 24);
+        w.int(u16, len);
+        const at = w.n;
+        src.bytes(w.buf[w.n..][0..len]);
+        w.n += len;
+        outer_data[i] = w.buf[at..w.n];
+    }
+    w.close(u16, exts_at);
+    const outer_body = ob[0..w.n];
+    const outer = try hello.parseClientHello(outer_body);
+
+    // The model of the inner extensions: own ones and references.
+    const Item = struct { t: u16, data: []const u8 };
+    var want: [24]Item = undefined;
+    var n_want: usize = 0;
+    var refs: [10]u16 = undefined;
+    var n_refs: usize = 0;
+    for (0..n_outer) |i| if (outer_types[i] != ech.ext_encrypted_client_hello and (src.valueRangeAtMost(u8, 0, 1) == 1)) {
+        refs[n_refs] = outer_types[i];
+        n_refs += 1;
+    };
+    var fault: EchFault = std.enums.values(EchFault)[src.index(std.enums.values(EchFault).len)];
+    // A fault that needs references it lacks becomes none.
+    switch (fault) {
+        .order => if (n_refs < 2) {
+            fault = .none;
+        },
+        .repeat => if (n_refs < 1) {
+            fault = .none;
+        },
+        else => {},
+    }
+
+    var e: Writer = .{ .buf = eb };
+    e.int(u16, 0x0303);
+    var inner_random: [32]u8 = undefined;
+    src.bytes(&inner_random);
+    e.bytes(&inner_random);
+    if (fault == .session_id) {
+        e.int(u8, 1);
+        e.int(u8, 7);
+    } else e.int(u8, 0);
+    e.bytes(&.{ 0, 4, 0x13, 0x01, 0x13, 0x02, 1, 0 });
+    const inner_exts_at = e.open(u16);
+    var own_t: u16 = 0x2000;
+    var lists: usize = 0;
+    var r: usize = 0;
+    var own_data: [8][4]u8 = undefined;
+    var n_own: usize = 0;
+    while (r < n_refs or (n_own < 8 and src.valueRangeAtMost(u8, 0, 2) != 0)) {
+        const take_refs = r < n_refs and (n_own >= 8 or (src.valueRangeAtMost(u8, 0, 1) == 1));
+        if (take_refs) {
+            // One list of the next 1..3 references.
+            const k = @min(n_refs - r, src.valueRangeAtMost(u8, 1, 3));
+            e.int(u16, ech.ext_ech_outer_extensions);
+            const at = e.open(u16);
+            const list_at = e.open(u8);
+            for (refs[r..][0..k], 0..) |rt, j| {
+                var v = rt;
+                if (fault == .order and r + j == 0) v = refs[1];
+                if (fault == .order and r + j == 1) v = refs[0];
+                e.int(u16, v);
+                const oi = std.mem.indexOfScalar(u16, outer_types[0..n_outer], rt).?;
+                if (n_want < want.len) {
+                    want[n_want] = .{ .t = rt, .data = outer_data[oi] };
+                    n_want += 1;
+                }
+            }
+            if (fault == .repeat and lists == 0) e.int(u16, refs[r + k - 1]);
+            if (fault == .missing and lists == 0) e.int(u16, 0x3000);
+            if (fault == .self and lists == 0) e.int(u16, ech.ext_encrypted_client_hello);
+            if (fault == .list and lists == 0) e.int(u8, 0);
+            e.close(u8, list_at);
+            e.close(u16, at);
+            r += k;
+            lists += 1;
+        } else {
+            own_t += src.valueRangeAtMost(u16, 1, 9);
+            src.bytes(&own_data[n_own]);
+            const len = src.valueRangeAtMost(u8, 0, 4);
+            e.int(u16, own_t);
+            e.int(u16, len);
+            e.bytes(own_data[n_own][0..len]);
+            if (n_want < want.len) {
+                want[n_want] = .{ .t = own_t, .data = own_data[n_own][0..len] };
+                n_want += 1;
+            }
+            n_own += 1;
+        }
+    }
+    // Faults that need a reference list get one of their own.
+    if (lists == 0 and (fault == .missing or fault == .self or fault == .list)) {
+        e.int(u16, ech.ext_ech_outer_extensions);
+        const at = e.open(u16);
+        const list_at = e.open(u8);
+        switch (fault) {
+            .missing => e.int(u16, 0x3000),
+            .self => e.int(u16, ech.ext_encrypted_client_hello),
+            else => e.int(u8, 0),
+        }
+        e.close(u8, list_at);
+        e.close(u16, at);
+    }
+    e.close(u16, inner_exts_at);
+    const pad = src.valueRangeAtMost(u8, 0, 40);
+    @memset(e.buf[e.n..][0..pad], 0);
+    e.n += pad;
+    if (fault == .padding) {
+        e.buf[e.n] = src.valueRangeAtMost(u8, 1, 255);
+        e.n += 1;
+    }
+    var encoded = eb[0..e.n];
+    if (fault == .damaged) {
+        switch (src.valueRangeAtMost(u8, 0, 2)) {
+            0 => encoded[src.index(encoded.len)] ^= @as(u8, 1) << @intCast(src.valueRangeAtMost(u8, 0, 7)),
+            1 => encoded = encoded[0..src.index(encoded.len)],
+            else => src.bytes(encoded[34..]),
+        }
+    }
+
+    // The buffer the server would have: what is left past the AAD and the
+    // plaintext, with a guard beyond it.
+    const room = 4 + encoded.len + outer_body.len;
+    const out = try gpa.alloc(u8, room + 16);
+    defer gpa.free(out);
+    @memset(out[room..], 0xa5);
+    const got = ech.reconstruct(encoded, &outer, out[0..room]);
+    for (out[room..]) |b| if (b != 0xa5) return error.WrotePastBuffer;
+    switch (fault) {
+        .damaged => {
+            if (got) |m| if (m.len > room) return error.TooLong else {} else |_| {}
+            EchMark.mark(.damaged);
+            return;
+        },
+        .none => {},
+        else => {
+            const err = if (got) |_| return error.FaultAccepted else |x| x;
+            const expected: ech.Error = switch (fault) {
+                .order, .repeat, .missing, .self => error.InvalidOuterExtension,
+                .padding, .session_id => error.InvalidPadding,
+                .list => error.DecodeError,
+                .none, .damaged => unreachable,
+            };
+            if (err != expected) return error.WrongError;
+            switch (fault) {
+                .order => EchMark.mark(.refused_order),
+                .repeat => EchMark.mark(.refused_repeat),
+                .missing => EchMark.mark(.refused_missing),
+                .self => EchMark.mark(.refused_self),
+                .padding => EchMark.mark(.refused_padding),
+                .session_id => EchMark.mark(.refused_session_id),
+                else => EchMark.mark(.refused_list),
+            }
+            return;
+        },
+    }
+    const msg = try got;
+    if (msg[0] != 1 or std.mem.readInt(u24, msg[1..4], .big) != msg.len - 4) return error.BadHeader;
+    const inner = try hello.parseClientHello(msg[4..]);
+    if (!std.mem.eql(u8, inner.random, &inner_random)) return error.RandomDiffers;
+    if (!std.mem.eql(u8, inner.legacy_session_id, sid[0..sid_len])) return error.SessionIdDiffers;
+    if (!inner.cipherSuites().contains(0x1302)) return error.SuitesDiffer;
+    var rest = inner.extensions_raw;
+    for (want[0..n_want]) |it| {
+        if (rest.len < 4) return error.ExtensionsDiffer;
+        const len = std.mem.readInt(u16, rest[2..4], .big);
+        if (std.mem.readInt(u16, rest[0..2], .big) != it.t or !std.mem.eql(u8, rest[4..][0..len], it.data)) return error.ExtensionsDiffer;
+        rest = rest[4 + len ..];
+    }
+    if (rest.len != 0) return error.ExtensionsDiffer;
+    if (lists > 1) EchMark.mark(.rebuilt_two_lists) else if (lists == 1) EchMark.mark(.rebuilt_with_refs) else EchMark.mark(.rebuilt);
+}
+
+fn fuzzEchSmith(_: void, smith: *std.testing.Smith) anyerror!void {
+    var script: [4096]u8 = undefined;
+    var src: ScriptSource = .init(script[0..smith.slice(&script)]);
+    try fuzzEch(ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: tlsserver ech, model → encoded inner → rebuilt" {
+    try testing.fuzz({}, fuzzEchSmith, .{});
+}
+test "fuzz driver: TLSSERVER_FUZZ (ech)" {
+    try fuzz_driver.run(fuzzEch, .{ .prefix = "TLSSERVER_FUZZ", .name = "tlsserver-ech" });
+}
+test "fuzz harness: ech, 400 seeds, reaches every outcome" {
+    try EchMark.reach(fuzzEch, "tlsserver-ech", 400);
+}
+
 // ── tlsserver-keys ───────────────────────────────────────────────────────
 //
 // `keys.CertKeyPair.fromPem` on the openssl-written key vectors, damaged:
@@ -1296,8 +1548,29 @@ const InteropTickets = struct {
     }
 };
 
+/// The recordings' ECH key (`interop.ech_key`), for the `ech` cases.
+const InteropEch = struct {
+    config: [128]u8,
+    key: server_mod.ech.Key,
+    cfg: server_mod.ech.Ech,
+    buf: []u8,
+
+    fn init(e: *InteropEch, gpa: std.mem.Allocator) !void {
+        const public = std.crypto.dh.X25519.recoverPublicKey(interop.ech_key);
+        e.key = .{ .config = server_mod.ech.makeConfig(&e.config, 7, &public, "public.example", 0) catch unreachable, .private_key = &interop.ech_key };
+        e.cfg = .{ .keys = (&e.key)[0..1] };
+        e.buf = try gpa.alloc(u8, server_mod.ech.bufferLen(e.cfg.max_client_hello_len));
+    }
+
+    fn deinit(e: *InteropEch, gpa: std.mem.Allocator) void {
+        gpa.free(e.buf);
+    }
+};
+
 const SrvMark = Marker(enum {
     openssl_case,
+    /// A recording with Encrypted Client Hello (the inner hello decrypted).
+    ech_case,
     /// A recording whose early data the server takes.
     early_case,
     go_case,
@@ -1556,6 +1829,10 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     it.rawClient(v);
     defer it.deinit();
     if (v.early_accepted) SrvMark.mark(.early_case);
+    if (v.ech) SrvMark.mark(.ech_case);
+    var ie: InteropEch = undefined;
+    try ie.init(gpa);
+    defer ie.deinit(gpa);
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -1565,6 +1842,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         .tickets = if (v.tickets) &it.tickets else null,
         .client_auth = it.clientAuth(v.client_auth),
         .early_data = if (v.early_data) &it.early else null,
+        .ech = if (v.ech) &ie.cfg else null,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -1573,6 +1851,7 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     var server: server_mod.Server = .init(&cfg, joiner, outb);
     server.setPeerBuffer(&peer);
+    server.setEchBuffer(ie.buf);
     defer server.deinit();
 
     const stream = try gpa.dupe(u8, v.client);
@@ -1718,7 +1997,9 @@ fn fuzzServer(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             }
         },
         12, 13 => {
-            if (!v.resumed) return;
+            // ECH: the PSK rides in the encrypted inner hello (flipping it
+            // is a ciphertext flip, which the other modes cover).
+            if (!v.resumed or v.ech) return;
             // The ClientHello the server resumes on: the last plaintext
             // handshake record before the Finished (the second one after a
             // retry), one whole message.
@@ -2086,6 +2367,9 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     it.init(gpa, v.client_auth);
     it.rawClient(v);
     defer it.deinit();
+    var ie: InteropEch = undefined;
+    try ie.init(gpa);
+    defer ie.deinit(gpa);
     const cfg: server_mod.Config = .{
         .certificate = .{ .fixed = ck },
         .cipher_suites = suites[0..v.suites.len],
@@ -2094,6 +2378,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
         .random = csprng.random(),
         .tickets = if (v.tickets) &it.tickets else null,
         .client_auth = it.clientAuth(v.client_auth),
+        .ech = if (v.ech) &ie.cfg else null,
     };
     const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
     defer gpa.free(joiner);
@@ -2102,6 +2387,7 @@ fn fuzzKeyUpdate(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!voi
     var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     var server: server_mod.Server = .init(&cfg, joiner, outb);
     server.setPeerBuffer(&peer);
+    server.setEchBuffer(ie.buf);
     defer server.deinit();
 
     // The recording through the client's Finished.

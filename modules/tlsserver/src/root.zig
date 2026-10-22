@@ -28,7 +28,7 @@ pub const meta = .{
     // shared or global.
     .concurrency = .single_owner,
     .model_after = "RFC 8446; rustls `ServerConnection` (buffer-driven core) for scope and API split",
-    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521" }, // p521: P-521 private keys (std has no P-521); tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key; tlsresume: session tickets (STEK ring, PSK selection)
+    .deps = .{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521", "hpke" }, // hpke: Encrypted Client Hello (RFC 9849); p521: P-521 private keys (std has no P-521); tls13: key schedule; aesgcm/chachapoly: record AEADs (std AES-GCM is 2.6x slower on Zig 0.17, #36256); netaddr: an IP literal in SNI; x509: the leaf's public key (`keys`); rsa: RSA private keys; b64ct: constant-time PEM of the private key; tlsresume: session tickets (STEK ring, PSK selection)
 };
 
 /// The TLS 1.3 record layer: header, `Protection` (seal / open in place).
@@ -48,6 +48,9 @@ pub const hello = @import("hello.zig");
 
 /// JA4, the TLS client fingerprint of a ClientHello.
 pub const fingerprint = @import("fingerprint.zig");
+
+/// TLS Encrypted Client Hello (RFC 9849): configs, offers, decryption.
+pub const ech = server.ech;
 
 /// The handshake messages the server writes (ServerHello … Finished).
 pub const messages = @import("messages.zig");
@@ -116,6 +119,7 @@ test {
     _ = outbound;
     _ = hello;
     _ = fingerprint;
+    _ = ech;
     _ = messages;
     _ = server;
     _ = clientauth;
@@ -128,8 +132,8 @@ test {
     _ = @import("fuzz_test.zig");
 }
 
-test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsresume, p521}" {
-    try std.testing.expectEqual(@as(usize, 9), meta.deps.len);
+test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsresume, p521, hpke}" {
+    try std.testing.expectEqual(@as(usize, 10), meta.deps.len);
     try std.testing.expectEqualStrings("tls13", meta.deps[0]);
     try std.testing.expectEqualStrings("aesgcm", meta.deps[1]);
     try std.testing.expectEqualStrings("chachapoly", meta.deps[2]);
@@ -139,4 +143,5 @@ test "meta.deps is {tls13, aesgcm, chachapoly, netaddr, x509, rsa, b64ct, tlsres
     try std.testing.expectEqualStrings("b64ct", meta.deps[6]);
     try std.testing.expectEqualStrings("tlsresume", meta.deps[7]);
     try std.testing.expectEqualStrings("p521", meta.deps[8]);
+    try std.testing.expectEqualStrings("hpke", meta.deps[9]);
 }

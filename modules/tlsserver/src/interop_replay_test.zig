@@ -134,6 +134,10 @@ const Harness = struct {
     early: server_mod.EarlyData,
     quic_cfg: server_mod.Quic,
     veto: bool,
+    ech_config: [128]u8,
+    ech_cfg: server_mod.ech.Ech,
+    ech_key: server_mod.ech.Key,
+    ech_buf: []u8,
     cfg: server_mod.Config,
     in_buf: []u8,
     reader: std.Io.Reader,
@@ -212,7 +216,13 @@ const Harness = struct {
             .client_auth = if (v.client_auth != .off) &h.client_auth else null,
             .early_data = if (v.early_data) &h.early else null,
             .quic = if (v.quic) &h.quic_cfg else null,
+            .ech = if (v.ech) &h.ech_cfg else null,
         };
+        const ech_public = std.crypto.dh.X25519.recoverPublicKey(vectors.ech_key);
+        h.ech_key = .{ .config = server_mod.ech.makeConfig(&h.ech_config, 7, &ech_public, "public.example", 0) catch unreachable, .private_key = &vectors.ech_key };
+        h.ech_cfg = .{ .keys = (&h.ech_key)[0..1] };
+        h.ech_buf = try gpa.alloc(u8, server_mod.ech.bufferLen(h.ech_cfg.max_client_hello_len));
+        errdefer gpa.free(h.ech_buf);
         // The reader holds the whole recording in a buffer big enough for a
         // record (Connection's requirement).
         h.in_buf = try gpa.alloc(u8, @max(v.client.len, record.max_record_len));
@@ -229,6 +239,7 @@ const Harness = struct {
         h.peer = try gpa.alloc(u8, server_mod.peerBufferLen(h.client_auth.max_leaf_len));
         h.conn = .init(&h.cfg, &h.reader, &h.sink.writer, h.joiner);
         h.conn.server.setPeerBuffer(h.peer);
+        h.conn.server.setEchBuffer(h.ech_buf);
         if (v.quic) h.conn.server.setQuicResumptionData(&vectors.quic_server_tp);
         return h;
     }
@@ -242,6 +253,7 @@ const Harness = struct {
         gpa.free(h.peer);
         gpa.free(h.out);
         gpa.free(h.in_buf);
+        gpa.free(h.ech_buf);
         gpa.destroy(h);
     }
 };
@@ -284,6 +296,7 @@ fn replayWith(gpa: std.mem.Allocator, v: vectors.Case, keys: *const Keys, path: 
     };
     if (v.alpn.len != 0) try testing.expect(c.server.alpn != null);
     try testing.expectEqual(v.resumed, c.server.isResumed());
+    try testing.expectEqual(v.ech, c.server.echAccepted());
     try testing.expectEqual(v.early_accepted, c.server.earlyDataAccepted());
     if (v.exported) |want| {
         var km: [vectors.exporter_len]u8 = undefined;

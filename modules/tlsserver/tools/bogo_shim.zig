@@ -141,6 +141,12 @@ const Options = struct {
     /// key is offloaded (`CertifiedKey.offload`), signed between feeds by
     /// `Connection.signer`.
     async_sign: bool = false,
+    /// `-ech-server-config` / `-ech-server-key` / `-ech-is-retry-config`
+    /// triples (BoringSSL `SSL_ECH_KEYS_add`), and `-expect-ech-accept`.
+    ech_configs: std.ArrayList([]const u8) = .empty,
+    ech_keys: std.ArrayList([]const u8) = .empty,
+    ech_retry: std.ArrayList(bool) = .empty,
+    expect_ech_accept: bool = false,
 };
 
 const Unimplemented = error{Unimplemented};
@@ -334,6 +340,16 @@ fn parseFlag(gpa: std.mem.Allocator, flag: []const u8, it: *Tokens, o: *Options)
             o.export_context = try value(it, flag);
         } else if (std.mem.eql(u8, flag, "-use-export-context")) {
             o.use_export_context = true;
+        } else if (std.mem.eql(u8, flag, "-ech-server-config")) {
+            try o.ech_configs.append(gpa, try base64(gpa, try value(it, flag)));
+        } else if (std.mem.eql(u8, flag, "-ech-server-key")) {
+            const k = try base64(gpa, try value(it, flag));
+            if (k.len != 32) return unimplemented("-ech-server-key (not X25519)");
+            try o.ech_keys.append(gpa, k);
+        } else if (std.mem.eql(u8, flag, "-ech-is-retry-config")) {
+            try o.ech_retry.append(gpa, !std.mem.eql(u8, try value(it, flag), "0"));
+        } else if (std.mem.eql(u8, flag, "-expect-ech-accept")) {
+            o.expect_ech_accept = true;
         } else if (std.mem.eql(u8, flag, "-async")) {
             o.async_sign = true;
         } else if (std.mem.eql(u8, flag, "-decline-alpn")) {
@@ -603,6 +619,15 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     }
     try leaf.check();
     var hello_check: HelloCheck = .{ .key = &leaf, .o = o };
+    // ECH keys, as BoringSSL's shim adds them (one triple per key).
+    const ech_keys = try gpa.alloc(tlsserver.ech.Key, o.ech_configs.items.len);
+    if (o.ech_keys.items.len != ech_keys.len or o.ech_retry.items.len != ech_keys.len) return error.BadEchFlags;
+    for (ech_keys, o.ech_configs.items, o.ech_keys.items, o.ech_retry.items) |*k, c, sk, r| k.* = .{ .config = c, .private_key = sk[0..32], .retry = r };
+    const ech_cfg: tlsserver.ech.Ech = .{ .keys = ech_keys };
+    if (ech_keys.len != 0) ech_cfg.check() catch |err| {
+        std.debug.print("ECH keys: {t}\n", .{err});
+        return unimplemented("-ech-server-config (unsupported config)");
+    };
     const cfg: server_mod.Config = .{
         .certificate = .{ .select = .{ .ctx = &hello_check, .select = HelloCheck.select } },
         .groups = if (o.groups.items.len != 0) o.groups.items else &server_mod.default_groups,
@@ -617,6 +642,7 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
         .tickets = tickets,
         .client_auth = if (o.client_auth != .off) &client_auth else null,
         .early_data = early,
+        .ech = if (ech_keys.len != 0) &ech_cfg else null,
     };
 
     const addr: net.IpAddress = if (o.ipv6) .{ .ip6 = .loopback(o.port) } else .{ .ip4 = .loopback(o.port) };
@@ -640,6 +666,9 @@ fn connection(gpa: std.mem.Allocator, io: std.Io, ck: *const tlsserver.Certified
     var c: tlsserver.Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
     c.server.setPeerBuffer(peer);
     if (o.async_sign) c.signer = .{ .ctx = &signer, .sign = ShimSigner.sign };
+    const ech_buf = try gpa.alloc(u8, tlsserver.ech.bufferLen(ech_cfg.max_client_hello_len));
+    defer gpa.free(ech_buf);
+    if (ech_keys.len != 0) c.server.setEchBuffer(ech_buf);
     defer c.deinit();
     defer peer_alert = c.server.inbound.peer_alert;
     return converse(&c, o, want_peer, &hello_check) catch |err| {
@@ -713,6 +742,7 @@ fn converse(c: *tlsserver.Connection, o: *const Options, want_peer: ?[]const u8,
     if (o.expect_ticket_age_skew) |want| if (want != 0) if (c.server.ticketAgeSkew()) |got| {
         if (got != want) return error.TicketAgeSkewMismatch;
     };
+    if (o.expect_ech_accept and !c.server.echAccepted()) return error.EchNotAccepted;
     if (o.expect_server_name) |want| {
         const got = c.server.serverName() orelse return error.ServerNameMissing;
         if (!std.mem.eql(u8, got, want)) return error.ServerNameMismatch;

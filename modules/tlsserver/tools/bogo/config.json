@@ -115,8 +115,6 @@
     "SkipChangeCipherSpec-Server": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
     "SkipEarlyData-SecondClientHelloEarlyData-TLS13": "rustls behaviour, kept (RFC 8446 §4.2.10): early_data in the second ClientHello is illegal_parameter where BoringSSL answers bad_record_mac; rustls 0.23.43 maps the local error with TestLocalErrorMap, which runner 784fcafc lacks",
     "SupportTicketsWithSessionID": "runs at the runner's default TLS 1.2 (no MaxVersion: VersionTLS13): out of scope",
-    "TLS-ECH-Server-ECHInner": "ECH server: not implemented (rustls: TLS-ECH-Server* NYI)",
-    "TLS-ECH-Server-ECHInner-*": "an extension tlsserver does not implement is ignored (RFC 8446 §4.2), so its malformed or duplicate forms pass",
     "TLS1-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "TLS11-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
     "TLS12-Server-*": "TLS 1.2 and older: out of scope (TLS 1.3-only server; rustls parity excludes TLS 1.2)",
@@ -170,7 +168,21 @@
       ":IllegalParameter:"
     ],
     ":DECODE_ERROR:": [
-      ":DecodeError:"
+      ":DecodeError:",
+      ":EchInvalidPadding:",
+      ":EchOfferChanged:"
+    ],
+    ":DECODE_ERROR": [
+      ":EchInvalidPadding:"
+    ],
+    ":INVALID_CLIENT_HELLO_INNER:": [
+      ":EchInvalidInner:"
+    ],
+    ":INVALID_OUTER_EXTENSION:": [
+      ":EchInvalidOuterExtension:"
+    ],
+    ":DECRYPTION_FAILED:": [
+      ":EchDecryptionFailed:"
     ],
     ":CLIENTHELLO_PARSE_FAILED:": [
       ":DecodeError:"

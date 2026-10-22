@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** Encrypted Client Hello (RFC 9849; rustls serves none):
+  `Config.ech` (`ech.Ech`: keys = `ECHConfig` + X25519 private key + retry flag),
+  `Server.setEchBuffer`, `Server.echAccepted`, `ech.makeConfig` / `configList` /
+  `retryConfigs` / `parseConfig` / `reconstruct`; the inner hello decrypted with `hpke`
+  and rebuilt from `ech_outer_extensions`, accept confirmations in ServerHello and
+  HelloRetryRequest, `retry_configs` on decline, the backend's confirmation for an inner
+  offer. New errors `EchInvalidInner`, `EchInvalidOuterExtension`, `EchInvalidPadding`,
+  `EchOfferChanged`, `EchDecryptionFailed`; `hello.ClientHello.ech_raw`; new dependency
+  `hpke`. BoGo 446 pass / 0 fail (+45 ECH); Go 1.26 ECH client live and replayed (interop
+  vectors recaptured, 76 cases); new fuzz harness `tlsserver-ech`.
+
 - **2026-10-22** — **Added:** `fingerprint.ja4` — the JA4 TLS client fingerprint (BSD-3
   spec by FoxIO; JA4+ not) of a parsed ClientHello, allocation-free; `Config.ja4` /
   `Server.ja4()` keep the first hello's; `hello.ClientHello.extensions_raw`. Anchored on the

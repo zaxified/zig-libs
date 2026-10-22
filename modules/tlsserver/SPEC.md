@@ -28,7 +28,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [aws/s2n-tls](https://github.com/aws/s2n-tls) | C | Apache-2.0 | 4.8k | v1.7.12 (2026-10-16) | Full TLS 1.3 server incl. 0-RTT (anti-replay left to the application), HRR, ticket key rotation. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference for this module's handshake and bulk rows. |
 
-**Where we are ahead:** offloaded (asynchronous) signing of the CertificateVerify — an HSM,
+**Where we are ahead:** Encrypted Client Hello (RFC 9849) — rustls serves none (its
+BoGo config: "ECH server support NYI"; Go, BoringSSL and picotls do); offloaded (asynchronous) signing of the CertificateVerify — an HSM,
 KMS or signing service, or a thread off the event loop (rustls has none; BoringSSL, s2n and
 picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early data only with
 its stateful cache); SCT stapling (rustls dropped it); RFC 8449 `record_size_limit` for
@@ -93,7 +94,7 @@ client's CertificateVerify, and reports the leaf (`peerCertificate`), resumption
 is not yet the server qap runs (M3: qap's seams and performance).
 
 **Never in scope:** TLS 1.2 and earlier, and DTLS (the `dtls` module). **Not in v1:** kTLS itself (the
-record keys can be handed over to it: `Server.extractSecrets`), ECH and post-handshake client authentication (*What is deliberately not
+record keys can be handed over to it: `Server.extractSecrets`) and post-handshake client authentication (*What is deliberately not
 done*).
 
 ## Wire format / algorithm
@@ -261,6 +262,44 @@ the first octets of a response from the first segment instead of waiting for 16 
 `Server.recordLen()` is the next record's length; `write` and `writeSlot` keep to it, and
 `Connection`'s writer seals records of that length. Off by default (a server tuned for bulk
 throughput would pay ~1.8 % more record overhead in the first 128 KiB).
+
+**Encrypted Client Hello** (RFC 9849, `ech`, `Config.ech`; Go and BoringSSL and picotls
+serve it, rustls does not: its BoGo config says "ECH server support NYI"). The client
+encrypts its real ClientHello (the inner, with the real SNI, ALPN and tickets) to the
+server's ECH key inside an outer one naming a public name. `ech.Ech.keys` are `ECHConfig`s
+(version 0xfe0d) with their X25519 private keys; served: DHKEM(X25519, HKDF-SHA256) with
+HKDF-SHA256 and AES-128-GCM, AES-256-GCM or ChaCha20-Poly1305 (`hpke`). `ech.makeConfig`
+and `ech.configList` build a config and the `ECHConfigList` for a DNS HTTPS record;
+`Ech.check` validates the keys. On the first ClientHello the key with the offer's
+config_id and suite opens the payload — HPKE `SetupBaseR(enc, sk, "tls ech" ‖ 0 ‖ config)`,
+`Open(outer hello with the payload zeroed, payload)` — and the inner hello is rebuilt in the
+caller's ECH buffer (`Server.setEchBuffer`, `ech.bufferLen(max_client_hello_len)`): the
+outer session id in, `ech_outer_extensions` replaced by the outer extensions it names, in
+one forward pass (missing, repeated, out of order or `encrypted_client_hello` itself:
+`EchInvalidOuterExtension`; non-zero padding or an inner session id: `EchInvalidPadding`;
+all `illegal_parameter`). The inner hello must carry an inner offer and offer nothing
+below TLS 1.3 (`EchInvalidInner`). From then on the handshake is the inner hello's
+(transcript, certificate choice, PSKs, early data, ALPN, JA4 aside: JA4 is the outer's,
+the one on the wire); the ServerHello's last 8 random octets carry
+`HKDF-Expand-Label(HKDF-Extract(0, inner.random), "ech accept confirmation", transcript, 8)`.
+A HelloRetryRequest carries the "hrr ech accept confirmation" in its own
+`encrypted_client_hello`; the second outer hello must offer again with the same
+config_id and suite and an empty `enc` (`EchOfferChanged`, `illegal_parameter`;
+none at all: `missing_extension`), its payload opens under the same HPKE context
+(sequence 1; failing: `EchDecryptionFailed`, `decrypt_error`). An offer that opens with
+no key (a GREASE offer, a stale config, a hello over `max_client_hello_len`) is not an
+error: the outer hello goes on (its SNI picks the public name's certificate) and the
+EncryptedExtensions carry `retry_configs`, the keys marked `retry`. A hello with an
+inner offer and no outer one gets the confirmation too (the backend's part in split
+mode, as BoringSSL). `Server.echAccepted()` reports it. Checked by: BoGo's 45 TLS
+`ECH-Server-*` tests (accept, decline with retry configs, HRR, outer extensions and their
+faults, padding, ciphers, early data, client certificates, backend role; the shim's
+`-ech-server-config/-key/-is-retry-config`, `-expect-ech-accept`), Go 1.26's ECH client
+live and replayed byte-exact (`go-ech`, `go-ech-hrr`, `go-ech-resume*`), and the
+`tlsserver-ech` fuzz harness (the inner hello rebuilt from a model, every fault refused
+with its error). Not done: split mode as a client-facing server (forwarding the inner
+hello), ECH over DTLS, `ECHConfig` extensions (ignored, none is mandatory today),
+HKDF-SHA384/512 and non-X25519 KEMs.
 
 **JA4 fingerprint** (`fingerprint.ja4`, FoxIO's `technical_details/JA4.md`; JA4 is
 BSD-3-Clause, the other JA4+ methods are under the FoxIO License and are not implemented; s2n

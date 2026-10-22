@@ -116,7 +116,20 @@ const Case = struct {
     /// server's transport parameters, `setQuicResumptionData`): 0-RTT is
     /// declined though everything else allows it.
     quic_veto: bool = false,
+    /// RFC 9849: the server holds `interop_ech_key` (config id 7, public
+    /// name "public.example") and the Go client encrypts its ClientHello to
+    /// it; the server must have accepted.
+    ech: bool = false,
 };
+
+/// The ECH key of the `ech` cases.
+pub const interop_ech_key: [32]u8 = @splat(0x45);
+
+/// The `ECHConfigList` of `interop_ech_key`, base64 for go-client's `-ech`.
+fn interopEchConfig(buf: []u8) []u8 {
+    const public = std.crypto.dh.X25519.recoverPublicKey(interop_ech_key);
+    return tlsserver.ech.makeConfig(buf, 7, &public, "public.example", 0) catch unreachable;
+}
 
 /// `Quic.accept_early` of the QUIC cases: the ticket must carry
 /// `interop_server_tp`, and `ctx` (a bool) must not veto.
@@ -224,6 +237,10 @@ const cases = [_]Case{
     .{ .name = "go-mtls-ed25519", .client = .go, .why = "an Ed25519 client certificate", .seed = 52, .client_auth = .mandatory, .client_cert = .ed25519, .expect = &.{"peer_certs: 1"} },
     .{ .name = "go-mtls-resume-new", .client = .go, .why = "tickets after client authentication", .seed = 53, .tickets = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-out", "go-mtls.sess" }, .expect = &.{ "resumed: false", "saved: true" } },
     .{ .name = "go-exporter", .client = .go, .why = "the exporter: Go's ExportKeyingMaterial is the server's (TLS_AES_128_GCM_SHA256)", .seed = 77, .exporter = true, .expect = &.{"suite: TLS_AES_128_GCM_SHA256"} },
+    .{ .name = "go-ech", .client = .go, .why = "Encrypted Client Hello (RFC 9849): Go's inner hello decrypted, the confirmation in the ServerHello", .seed = 90, .ech = true, .expect = &.{ "ech: true", "peer_certs: 1" } },
+    .{ .name = "go-ech-hrr", .client = .go, .why = "ECH with a HelloRetryRequest (only secp256r1): the second inner hello under the same HPKE context, the HRR confirmation", .seed = 91, .ech = true, .groups = &.{tlsserver.server.default_groups[2]}, .expect = &.{ "ech: true", "hrr: true" } },
+    .{ .name = "go-ech-resume-new", .client = .go, .why = "ECH with tickets", .seed = 92, .ech = true, .tickets = true, .args = &.{ "-sess-out", "go-ech.sess" }, .expect = &.{ "ech: true", "saved: true" } },
+    .{ .name = "go-ech-resume", .client = .go, .why = "resumption inside the encrypted inner hello", .seed = 93, .ech = true, .tickets = true, .resumed = true, .args = &.{ "-sess-in", "go-ech.sess" }, .expect = &.{ "ech: true", "resumed: true" } },
     .{ .name = "go-mtls-resume", .client = .go, .why = "resumption with a mandatory client certificate: the ticket's identity", .seed = 54, .tickets = true, .resumed = true, .client_auth = .mandatory, .client_cert = .p256, .args = &.{ "-sess-in", "go-mtls.sess" }, .expect = &.{"resumed: true"} },
 };
 
@@ -528,6 +545,13 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         try argv.appendSlice(gpa, &.{ "-cert", files[0], "-key", files[1] });
     }
     try argv.appendSlice(gpa, c.args);
+    var ech_b64: [256]u8 = undefined;
+    if (c.ech) {
+        var cb: [128]u8 = undefined;
+        var lb: [160]u8 = undefined;
+        const list = try tlsserver.ech.configList(&lb, &.{interopEchConfig(&cb)});
+        try argv.appendSlice(gpa, &.{ "-ech", std.base64.standard.Encoder.encode(&ech_b64, list) });
+    }
     if (c.exporter) try argv.appendSlice(gpa, switch (c.client) {
         .openssl => &.{ "-keymatexport", interop_exporter_label, "-keymatexportlen", std.fmt.comptimePrint("{d}", .{interop_exporter_len}) },
         .go => &.{ "-export", interop_exporter_label },
@@ -586,6 +610,9 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     };
     var strikes: tlsresume.replay.StrikeRegister = .init(gpa, 16, 3600 * 1000);
     defer strikes.deinit();
+    var ech_config_buf: [128]u8 = undefined;
+    const ech_cfg: tlsserver.ech.Ech = .{ .keys = &.{.{ .config = interopEchConfig(&ech_config_buf), .private_key = &interop_ech_key }} };
+    var ech_buf: [tlsserver.ech.bufferLen(8192)]u8 = undefined;
     var veto = c.quic_veto;
     const quic_cfg: tlsserver.server.Quic = .{ .transport_parameters = &interop_server_tp, .accept_early = .{ .ctx = &veto, .accept = quicAcceptEarly } };
     const early: tlsserver.server.EarlyData = .{ .max_size = interop_max_early_data, .replay = tlsserver.server.strikeRegisterGuard(&strikes) };
@@ -599,6 +626,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
         .client_auth = if (c.client_auth != .off) &client_auth else null,
         .early_data = if (c.early_data) &early else null,
         .quic = if (c.client == .go_quic) &quic_cfg else null,
+        .ech = if (c.ech) &ech_cfg else null,
     };
     const joiner = try gpa.alloc(u8, tlsserver.inbound.Joiner.bufferLen(tlsserver.inbound.default_max_message));
     defer gpa.free(joiner);
@@ -607,6 +635,7 @@ fn runCase(gpa: std.mem.Allocator, io: std.Io, work: std.Io.Dir, keys: *const Ke
     var peer: [tlsserver.server.peerBufferLen(tlsserver.clientauth.default_max_leaf_len)]u8 = undefined;
     var server: Server = .init(&cfg, joiner, out);
     server.setPeerBuffer(&peer);
+    if (c.ech) server.setEchBuffer(&ech_buf);
     if (c.client == .go_quic) server.setQuicResumptionData(&interop_server_tp);
     defer server.deinit();
 
@@ -729,6 +758,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
     try w.print("/// `EarlyData.max_size` of the `early_data` cases.\npub const max_early_data: u32 = {d};\n", .{interop_max_early_data});
     try w.print("/// The QUIC cases' transport parameters, the server's and the client's.\npub const quic_server_tp = hx({d}, \"{x}\");\npub const quic_client_tp = hx({d}, \"{x}\");\n", .{ interop_server_tp.len, &interop_server_tp, interop_client_tp.len, &interop_client_tp });
     try w.print("/// The exporter label and length of the cases with `exported`.\npub const exporter_label = \"{s}\";\npub const exporter_len = {d};\n", .{ interop_exporter_label, interop_exporter_len });
+    try w.print("/// The ECH private key of the `ech` cases.\npub const ech_key: [32]u8 = @splat(0x{x:0>2});\n", .{interop_ech_key[0]});
     try w.print("/// The leaf's OCSP staple and SCT list in the `staple` cases.\npub const ocsp_response = hx({d}, \"{x}\");\npub const sct_list = hx({d}, \"{x}\");\n\n", .{ interop_ocsp_response.len, &interop_ocsp_response, interop_sct_list.len, &interop_sct_list });
     try w.writeAll(
         \\pub const Case = struct {
@@ -775,6 +805,9 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         \\    /// The server's keying material for `exporter_label` (no context),
         \\    /// which the client printed too.
         \\    exported: ?[exporter_len]u8 = null,
+        \\    /// RFC 9849: the server held `ech_key` (config id 7, public name
+        \\    /// "public.example") and accepted the client's encrypted hello.
+        \\    ech: bool = false,
         \\    client: []const u8,
         \\    server: []const u8,
         \\};
@@ -806,6 +839,7 @@ fn writeVectors(gpa: std.mem.Allocator, io: std.Io, root: std.Io.Dir, done: []co
         if (c.raw_client) try w.writeAll("        .raw_client = true,\n");
         if (c.client == .go_quic) try w.writeAll("        .quic = true,\n");
         if (c.quic_veto) try w.writeAll("        .quic_veto = true,\n");
+        if (c.ech) try w.writeAll("        .ech = true,\n");
         if (d[1].compressed) |cc| {
             try w.print("        .compressed = .{{\n            .algorithm = {d},\n            .uncompressed_len = {d},\n", .{ cc.algorithm, cc.uncompressed_len });
             try hexFieldAt(w, "            ", "data", cc.data);

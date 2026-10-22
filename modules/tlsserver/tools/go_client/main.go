@@ -21,6 +21,7 @@ package main
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -108,6 +109,7 @@ func main() {
 	certFile := flag.String("cert", "", "client certificate (PEM), with -key")
 	keyFile := flag.String("key", "", "the client certificate's private key (PEM)")
 	exportLabel := flag.String("export", "", "print 48 octets of exported keying material for this label (no context)")
+	echList := flag.String("ech", "", "ECHConfigList (base64): encrypt the ClientHello to it (RFC 9849)")
 	flag.Parse()
 
 	pem, err := os.ReadFile(*caFile)
@@ -158,6 +160,13 @@ func main() {
 	if *alpn != "" {
 		cfg.NextProtos = strings.Split(*alpn, ",")
 	}
+	if *echList != "" {
+		list, err := base64.StdEncoding.DecodeString(*echList)
+		if err != nil {
+			fail("-ech: %v", err)
+		}
+		cfg.EncryptedClientHelloConfigList = list
+	}
 	cache := &fileCache{out: *sessOut}
 	if *sessIn != "" {
 		cache.in = loadSession(*sessIn)
@@ -180,6 +189,7 @@ func main() {
 	fmt.Printf("peer_certs: %d\n", len(cs.PeerCertificates))
 	fmt.Printf("hrr: %v\n", cs.HelloRetryRequest)
 	fmt.Printf("resumed: %v\n", cs.DidResume)
+	fmt.Printf("ech: %v\n", cs.ECHAccepted)
 	fmt.Printf("ocsp: %x\n", cs.OCSPResponse)
 	scts := make([]string, len(cs.SignedCertificateTimestamps))
 	for i, sct := range cs.SignedCertificateTimestamps {

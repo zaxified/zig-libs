@@ -57,6 +57,7 @@ pub const ExtensionType = enum(u16) {
     key_share = 51,
     quic_transport_parameters = 57,
     renegotiation_info = 0xff01,
+    encrypted_client_hello = 0xfe0d,
     _,
 };
 
@@ -141,6 +142,8 @@ pub const ClientHello = struct {
     /// plaintext (TLS 1.3: content and its type octet) the client takes;
     /// 64 or more (less is `illegal_parameter`).
     record_size_limit: ?u16 = null,
+    /// RFC 9849 `encrypted_client_hello` as sent (`ech.parseOffer` reads it).
+    ech_raw: ?[]const u8 = null,
     /// The number of extensions, unknown ones included.
     extension_count: usize = 0,
     /// The extensions block as sent (each `type ‖ length ‖ data`), checked:
@@ -331,6 +334,7 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
             .certificate_authorities => try parseCertificateAuthorities(data),
             .key_share => ch.key_shares_raw = try parseKeyShares(data),
             .renegotiation_info => _ = try vecIn(data, u8),
+            .encrypted_client_hello => ch.ech_raw = data,
             _ => {},
         }
     }
