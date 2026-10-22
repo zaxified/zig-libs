@@ -1126,7 +1126,8 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
         request = 4 + 1 + 2 + 6 + 2 * ca.schemes.len + 6;
         for (ca.authorities) |dn| request += 2 + dn.len;
     }
-    const frag: usize = fragmentLen(cfg);
+    // A client's `record_size_limit` may bring records down to 63 octets.
+    const frag: usize = @min(fragmentLen(cfg), min_record_size_limit - 1);
     var tickets: usize = 0;
     if (cfg.tickets) |tk| {
         const one = 4 + 4 + 4 + 1 + 1 + 2 + maxTicketLen(cfg) + 2 + 4 + @as(usize, if (cfg.early_data != null) 8 else 0);
@@ -1137,6 +1138,9 @@ pub fn minOutputLen(cfg: *const Config, ck: *const CertifiedKey) usize {
     request += (request / frag + 1) * (record.header_len + 1 + record.tag_len);
     return @max(firstFlightLen(ck, frag) + request, tickets + outbound.alert_reserve + 64);
 }
+
+/// RFC 8449 §4: the smallest `record_size_limit` a client may send.
+pub const min_record_size_limit = 64;
 
 /// `Config.max_fragment_len`, clamped.
 fn fragmentLen(cfg: *const Config) u16 {
@@ -1157,7 +1161,7 @@ fn firstFlightLen(ck: *const CertifiedKey, frag: usize) usize {
     const hrr = record.header_len + (4 + 2 + 32 + 33 + 3 + 2 + 6 + 6) + 6;
     const flight = hrr + (4 + 2 + 32 + 33 + 3 + 2 + 8 + kex.max_server_share_len + 6) + // ServerHello
         6 + // CCS
-        (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4) + // EncryptedExtensions
+        (4 + 2 + 4 + 2 + 1 + 255 + 4 + 4 + 6) + // EncryptedExtensions
         (4 + 1 + chain) + (4 + 4 + sig) + (4 + 48);
     // Each message may end a record of its own: one more than the content
     // needs per message (HRR, SH, CCS ×2, EE, Certificate, CV, Finished).
@@ -1337,6 +1341,8 @@ pub const Server = struct {
     sign_key: ?*const CertifiedKey = null,
     sign_server_hs: [48]u8 = @splat(0),
     after_signature: State = .failed,
+    /// RFC 8449: the client's `record_size_limit` (null: none sent).
+    peer_record_limit: ?u16 = null,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -1422,6 +1428,12 @@ pub const Server = struct {
     /// `SSL_used_hello_retry_request`).
     pub fn usedHelloRetryRequest(self: *const Server) bool {
         return self.retried;
+    }
+
+    /// The client's RFC 8449 `record_size_limit`, if it sent one: the
+    /// server's protected records stay within it (`write` included).
+    pub fn peerRecordSizeLimit(self: *const Server) ?u16 {
+        return self.peer_record_limit;
     }
 
     /// On a resumption, how far the client's idea of the ticket's age is
@@ -2115,6 +2127,12 @@ pub const Server = struct {
         };
         // rustls `ServerNameDifferedOnRetry`.
         if (retried and !optEql(sni, self.serverName())) return error.IllegalParameter;
+        // RFC 8449: the client's record size limit (not in QUIC, which has
+        // no records). A second hello repeats the first's (RFC 8446 §4.1.2:
+        // only the listed changes; tlsfuzzer `test-record-size-limit`).
+        const record_limit: ?u16 = if (cfg.quic != null) null else ch.record_size_limit;
+        if (retried and !std.meta.eql(record_limit, self.peer_record_limit)) return error.IllegalParameter;
+        self.peer_record_limit = record_limit;
         // The version first: a TLS 1.2 (or older) client gets
         // `protocol_version` whatever else its hello lacks (rustls order).
         // A legacy_version below TLS 1.0 (SSL 3.0, or not a version at all)
@@ -2591,6 +2609,9 @@ pub const Server = struct {
         var th = t.currentHash();
         ks.deriveHandshakeTrafficSecrets(H.Hkdf, self.client_handshake_secret[0..L], &server_hs, hs, &th);
         self.out.installTx(self.suite, &server_hs) catch return error.InternalError;
+        // RFC 8449 §4: every protected record within the client's limit,
+        // which counts the content type octet in TLS 1.3 (2^14 + 1 at most).
+        if (self.peer_record_limit) |l| self.out.max_fragment = @min(self.out.max_fragment, @min(l, record.max_plaintext_len + 1) - 1);
         // The client goes on under its early secret until EndOfEarlyData
         // (`onEndOfEarlyData` installs the handshake one), or at once under
         // its handshake secret.
@@ -2609,8 +2630,14 @@ pub const Server = struct {
 
         // EncryptedExtensions.
         var alpn_body: [2 + 1 + 255]u8 = undefined;
-        var exts: [6]messages.Extension = undefined;
+        var exts: [7]messages.Extension = undefined;
         var n_exts: usize = 0;
+        // RFC 8449 §4: what this server takes, 2^14 + 1 in TLS 1.3.
+        const own_limit = comptime std.mem.toBytes(std.mem.nativeToBig(u16, record.max_plaintext_len + 1));
+        if (self.peer_record_limit != null) {
+            exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.record_size_limit), .data = &own_limit };
+            n_exts += 1;
+        }
         if (cfg.quic) |q| {
             exts[n_exts] = .{ .type = @backingInt(hello.ExtensionType.quic_transport_parameters), .data = q.transport_parameters };
             n_exts += 1;
@@ -2973,6 +3000,8 @@ const Hello = struct {
     pad_to: usize = 0,
     /// Octets of a next handshake message in the same record.
     trailing: []const u8 = "",
+    /// RFC 8449 `record_size_limit`.
+    record_size_limit: ?u16 = null,
 };
 
 fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
@@ -3090,6 +3119,7 @@ fn buildRecord(gpa: std.mem.Allocator, h: Hello) ![]u8 {
         try W.ext(&e, gpa, 45, d[0 .. 1 + m.len]);
     }
     if (h.early_data) try W.ext(&e, gpa, 42, "");
+    if (h.record_size_limit) |l| try W.ext(&e, gpa, 28, &.{ @truncate(l >> 8), @truncate(l) });
     // pre_shared_key last (RFC 8446 §4.2.11).
     if (h.psk_without_modes) {
         const psk = [_]u8{ 0, 7, 0, 1, 0xaa, 0, 0, 0, 0, 0, 33, 32 } ++ @as([32]u8, @splat(0x55));
@@ -4013,6 +4043,46 @@ test "HelloRetryRequest: second-hello refusals (rustls)" {
     try testing.expect(r.err == null);
     const sh = 5 + std.mem.readInt(u16, r.out[3..5], .big) + 6;
     try testing.expectEqualSlices(u8, &.{ 0x13, 0x01 }, r.out[sh + 5 + 4 + 2 + 32 + 1 ..][0..2]);
+}
+
+test "RFC 8449: protected records within the client's record_size_limit; the second hello must repeat it" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    for ([_]u16{ 64, 100, 16385, 0xffff }) |limit| {
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        const out = try testing.allocator.alloc(u8, minOutputLen(&cfg, testKey()));
+        defer testing.allocator.free(out);
+        var s: Server = .init(&cfg, &joiner, out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .record_size_limit = limit, .sni = "example.com" });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        try testing.expectEqual(@as(?u16, limit), s.peerRecordSizeLimit());
+        // ServerHello and CCS in the clear, as they are; then sealed
+        // records of at most `limit` octets of TLSInnerPlaintext.
+        const p = s.pendingOutput();
+        var at: usize = 5 + std.mem.readInt(u16, p[3..5], .big) + 6;
+        var records: usize = 0;
+        while (at < p.len) : (records += 1) {
+            const n = std.mem.readInt(u16, p[at + 3 ..][0..2], .big);
+            try testing.expectEqual(@as(u8, 23), p[at]);
+            try testing.expect(n - record.tag_len <= @min(limit, 16385));
+            at += 5 + n;
+        }
+        try testing.expectEqual(p.len, at);
+        if (limit == 64) try testing.expect(records > 4);
+    }
+    // A HelloRetryRequest: the second hello must carry the same limit.
+    var a = p256_only;
+    a.record_size_limit = 1000;
+    var b = a;
+    b.record_size_limit = 999;
+    var first = x25519_share_first;
+    first.record_size_limit = 1000;
+    try testing.expectEqual(error.IllegalParameter, (try retry(first, "", b)).err.?);
+    try testing.expectEqual(error.IllegalParameter, (try retry(first, "", p256_only)).err.?);
+    try testing.expectEqual(error.IllegalParameter, (try retry(x25519_share_first, "", a)).err.?);
+    try testing.expect((try retry(first, "", a)).err == null);
 }
 
 test "minOutputLen holds a HelloRetryRequest and the first flight undrained" {

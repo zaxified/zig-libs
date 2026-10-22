@@ -45,6 +45,7 @@ pub const ExtensionType = enum(u16) {
     client_certificate_type = 19,
     server_certificate_type = 20,
     compress_certificate = 27,
+    record_size_limit = 28,
     session_ticket = 35,
     pre_shared_key = 41,
     early_data = 42,
@@ -136,6 +137,10 @@ pub const ClientHello = struct {
     /// RFC 9001 §8.2: the client's QUIC transport parameters, opaque here
     /// (RFC 9000 §18 is the QUIC stack's to parse; may be empty).
     quic_transport_parameters: ?[]const u8 = null,
+    /// RFC 8449 `uint16 RecordSizeLimit`: the largest protected record
+    /// plaintext (TLS 1.3: content and its type octet) the client takes;
+    /// 64 or more (less is `illegal_parameter`).
+    record_size_limit: ?u16 = null,
     /// The number of extensions, unknown ones included.
     extension_count: usize = 0,
 
@@ -298,6 +303,13 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
             .client_certificate_type => ch.client_certificate_types = try nonEmptyIn(data, u8),
             .server_certificate_type => ch.server_certificate_types = try nonEmptyIn(data, u8),
             .quic_transport_parameters => ch.quic_transport_parameters = data,
+            .record_size_limit => {
+                if (data.len != 2) return error.DecodeError;
+                const v = std.mem.readInt(u16, data[0..2], .big);
+                // RFC 8449 §4: below 64 is illegal_parameter.
+                if (v < 64) return error.IllegalParameter;
+                ch.record_size_limit = v;
+            },
             .session_ticket => {}, // TLS 1.2 tickets: any payload
             .pre_shared_key => {
                 // RFC 8446 §4.2.11: MUST be the last extension.
@@ -650,6 +662,9 @@ test "malformed known extensions are decode_error" {
         &ext(27, &.{ 6, 0, 2, 0, 1, 0, 2 }), // … not next to itself
         &ext(47, &.{ 0, 2, 0, 5 }), // certificate_authorities overruns
         &ext(0xff01, &.{1}), // renegotiation_info overruns
+        &ext(28, &.{}), // record_size_limit empty
+        &ext(28, &.{ 0, 0x40, 0 }), // record_size_limit padded
+        &ext(28, &.{0x40}), // record_size_limit short
         &[_]u8{ 0, 43, 0, 9, 2, 3, 4 }, // extension overruns the block
     };
     for (cases, 0..) |c, i| {
@@ -683,6 +698,12 @@ test "well-formed odd cases are accepted" {
     ch = try parseClientHello(buildHello(&b, &ext(27, &.{ 6, 0, 2, 0, 1, 0xff, 0x01 })));
     try testing.expect(ch.compressCertificate().?.contains(0xff01));
     try testing.expect(!ch.compressCertificate().?.contains(3));
+    // record_size_limit: 64 up to 2^16-1 (the server clamps); 63 is illegal.
+    ch = try parseClientHello(buildHello(&b, &ext(28, &.{ 0, 64 })));
+    try testing.expectEqual(@as(?u16, 64), ch.record_size_limit);
+    ch = try parseClientHello(buildHello(&b, &ext(28, &.{ 0xff, 0xff })));
+    try testing.expectEqual(@as(?u16, 0xffff), ch.record_size_limit);
+    try testing.expectError(error.IllegalParameter, parseClientHello(buildHello(&b, &ext(28, &.{ 0, 63 }))));
     // ALPN with two names.
     ch = try parseClientHello(buildHello(&b, &ext(16, &.{ 0, 12, 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' })));
     var a = ch.alpn().?;

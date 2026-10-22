@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** RFC 8449 `record_size_limit` (rustls and Go have none): the
+  client's limit bounds every protected record from the EncryptedExtensions on, which answer
+  with 2^14 + 1; below 64 is `illegal_parameter`, a second ClientHello must repeat it.
+  `Server.peerRecordSizeLimit`, `hello.ClientHello.record_size_limit`,
+  `server.min_record_size_limit`; `minOutputLen` sizes for 63-octet records (larger than
+  before). tlsfuzzer `test-record-size-limit.py`: every TLS 1.3 case passes (19/21, the 21 are
+  TLS ≤ 1.2).
+
 - **2026-10-22** — **Added:** offloaded signing (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n async
   pkey; rustls has none): `CertifiedKey.offload` (`key` is now optional — set exactly one),
   `Event.signature_needed`, `Server.signatureRequest` / `provideSignature` / `signatureFailed`,

@@ -31,7 +31,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 **Where we are ahead:** offloaded (asynchronous) signing of the CertificateVerify — an HSM,
 KMS or signing service, or a thread off the event loop (rustls has none; BoringSSL, s2n and
 picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early data only with
-its stateful cache); SCT stapling (rustls dropped it). **Where we are behind:** a full (EC)DHE handshake with a
+its stateful cache); SCT stapling (rustls dropped it); RFC 8449 `record_size_limit` for
+constrained clients (rustls and Go have none). **Where we are behind:** a full (EC)DHE handshake with a
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
@@ -234,6 +235,18 @@ labels are TLS 1.2's PRF labels and not checked (rustls neither). The derivation
 `tls13.keyschedule`'s (`Schedule.exportKeyingMaterial`, run-time length, burned). Not done: the
 early exporter (`early_exporter_master_secret`, RFC 8446 §7.5's 0-RTT variant; rustls has none
 on the server).
+
+**Record size limit** (RFC 8449; rustls and Go have none — rustls only a configured
+`max_fragment_size`; NSS/Firefox send it). A client's `record_size_limit` (64 or more, else
+`illegal_parameter`; not two octets, `decode_error`) bounds every protected record the server
+sends from the EncryptedExtensions on: TLSInnerPlaintext (content and type octet) at most the
+limit, clamped to 2^14 + 1, so content at most limit − 1 (`write`, tickets and alerts included;
+`Config.max_fragment_len` still applies when lower). The ServerHello and the CCS go in the clear
+as they are (§4: unprotected records are not limited). The EncryptedExtensions answer with the
+server's own limit, 2^14 + 1 (what it receives). A second ClientHello must repeat the first's
+(present or not, same value: `illegal_parameter`). Not in QUIC (no records). `minOutputLen`
+sizes for 63-octet records. `peerRecordSizeLimit()` reports it. Checked by tlsfuzzer's
+`test-record-size-limit.py` (every TLS 1.3 case, `tools/tlsfuzzer/baseline.tsv`).
 
 **Offloaded signing** (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n `s2n_async_pkey`, picotls
 `ptls_async_job_t`; rustls signs synchronously inside the handshake, `Signer::sign`). A
