@@ -28,7 +28,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 | [aws/s2n-tls](https://github.com/aws/s2n-tls) | C | Apache-2.0 | 4.8k | v1.7.12 (2026-10-16) | Full TLS 1.3 server incl. 0-RTT (anti-replay left to the application), HRR, ticket key rotation. |
 | [openssl/openssl](https://github.com/openssl/openssl) | C | Apache-2.0 | 31.0k | openssl-4.0.3 (2026-09-29) | The performance reference for this module's handshake and bulk rows. |
 
-**Where we are ahead:** delegated credentials (RFC 9345; rustls and Go have none,
+**Where we are ahead:** sealed connection migration (rustls has none, s2n's blob is
+plaintext); delegated credentials (RFC 9345; rustls and Go have none,
 BoringSSL does); Encrypted Client Hello (RFC 9849) — rustls serves none (its
 BoGo config: "ECH server support NYI"; Go, BoringSSL and picotls do); offloaded (asynchronous) signing of the CertificateVerify — an HSM,
 KMS or signing service, or a thread off the event loop (rustls has none; BoringSSL, s2n and
@@ -328,6 +329,26 @@ credential list (`-new-x509-credential`, `-new-delegated-credential`,
 `algorithm`; BoringSSL's own server never computes it (it sends what it is given), so
 only BoGo's credentials are affected. `delegated` follows the RFC; the shim checks the
 key and the algorithm, not the signature.
+
+**Connection migration** (`Server.serialize` / `deserialize`; s2n
+`s2n_connection_serialize`, rustls none). A connected server's state — the application
+traffic secrets and the exporter's, both sequence numbers, the KeyUpdate budget, suite,
+group, ALPN, SNI, the client's certificate and how it was proved, resumption and early-data
+outcome, ECH, the client's record size limit, JA4 — sealed into a blob under the caller's
+32-octet key (AES-256-GCM, a random nonce, version 1, `serializedLen` / `blobLen`), so a
+restart, an upgrade or another process takes the connection over without the client
+noticing (qap: zero-downtime reload with the socket handed over). Unlike s2n's plaintext
+blob, which its documentation tells the caller to encrypt and MAC, this one is sealed
+already; a flipped octet, a wrong key or another version is `BadBlob`. Conditions are
+`extractSecrets`'s (output sent, every received octet fed — octets the caller holds
+unconsumed travel with the blob, no KeyUpdate due), and the old server is finished
+afterwards (one live copy: record nonces never repeat). `deserialize(out, config,
+buffers, blob, key)` needs a configuration offering the same ALPN protocol
+(`ConfigMismatch`) and a peer buffer for a blob with a client certificate; the rest of
+the configuration is the new one's. Checked by: through `tlsclient` in every suite, a
+connection with a client certificate and ALPN moved to a new `Server` on fresh buffers —
+data both ways, the exporter's value unchanged, a KeyUpdate both ways, close — and every
+refusal. Blobs are for builds of one tlsserver version.
 
 **JA4 fingerprint** (`fingerprint.ja4`, FoxIO's `technical_details/JA4.md`; JA4 is
 BSD-3-Clause, the other JA4+ methods are under the FoxIO License and are not implemented; s2n

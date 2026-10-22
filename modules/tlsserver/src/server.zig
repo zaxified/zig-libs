@@ -118,6 +118,7 @@ const fingerprint = @import("fingerprint.zig");
 pub const delegated = @import("delegated.zig");
 pub const ech = @import("ech.zig");
 const tlsresume = @import("tlsresume");
+const aesgcm = @import("aesgcm");
 
 const certverify = tls13.certverify;
 const kex = tls13.kex;
@@ -1794,6 +1795,226 @@ pub const Server = struct {
         // `fail`'s wipe, without an alert (`Closed` calls for none).
         const e = self.fail(error.Closed);
         std.debug.assert(e == error.Closed);
+    }
+
+    pub const SerializeError = error{
+        /// The handshake is not complete, or the connection failed or was
+        /// closed (either way).
+        NotConnected,
+        /// As for `extractSecrets`: output queued, a KeyUpdate due, the send
+        /// key at its limit, a write slot open, a handshake message half
+        /// received.
+        NotQuiescent,
+        /// A QUIC connection.
+        WrongTransport,
+        /// `out` is shorter than `blobLen()`.
+        BufferTooSmall,
+    };
+
+    pub const DeserializeError = error{
+        /// Not a blob of this version, sealed under `key`, intact.
+        BadBlob,
+        /// The blob's ALPN protocol is not among `config.alpn_protocols`, its
+        /// client certificate does not fit the peer buffer, or `config` is
+        /// QUIC.
+        ConfigMismatch,
+    };
+
+    /// The version octet a blob starts with.
+    pub const blob_version: u8 = 1;
+    const blob_ad = "tlsserver connection v1";
+    /// version ‖ nonce ‖ ciphertext ‖ tag; the plaintext's fixed part.
+    const blob_overhead = 1 + 12 + 16;
+    const blob_fixed = 2 + 2 + 3 * 48 + 8 + 8 + 1 + 1 + 1 + 255 + 1 + 253 + 1 + 8 + 2 + 1 + 2 + 8 + 1 + 1 + 3 + 1 + 1 + fingerprint.ja4_len + 1 + 2;
+
+    /// The length of the blob `serialize` writes for a client leaf of
+    /// `peer` octets (0 without one; `blobLen` for this connection's).
+    pub fn serializedLen(peer: usize) usize {
+        return blob_overhead + blob_fixed + peer;
+    }
+
+    /// `serializedLen` for this connection.
+    pub fn blobLen(self: *const Server) usize {
+        return serializedLen(self.peer_len);
+    }
+
+    /// The connection, sealed under `key` (AES-256-GCM, a random nonce), to
+    /// go on in another process or after a restart (`deserialize`) without
+    /// the client noticing (s2n `s2n_connection_serialize`, whose blob is
+    /// plaintext for the caller to protect; rustls has none). It holds the
+    /// application traffic secrets and the exporter's, both sequence
+    /// numbers, the negotiated parameters (suite, group, ALPN, SNI, the
+    /// client's certificate and how it was proved, resumption, early data,
+    /// ECH, the record size limit, JA4). Conditions are `extractSecrets`'s:
+    /// output sent, every octet received fed (octets the caller holds
+    /// unconsumed go along with the blob), no KeyUpdate due. Afterwards this
+    /// server is finished, as after `extractSecrets`: one live copy of the
+    /// keys, so the record nonces never repeat. Rotate `key` as a STEK.
+    pub fn serialize(self: *Server, out: []u8, key: *const [32]u8) SerializeError![]u8 {
+        if (self.config.quic != null) return error.WrongTransport;
+        if (self.state != .connected or self.write_closed or self.peer_closed) return error.NotConnected;
+        if (self.pendingOutput().len != 0 or self.tx_update != null or !self.inbound.joiner.isEmpty() or self.write_slot_end != 0)
+            return error.NotQuiescent;
+        if (self.out.tx.seq >= max_records_per_key) return error.NotQuiescent;
+        if (out.len < serializedLen(self.peer_len)) return error.BufferTooSmall;
+        burn.run(burn.handshake_burn, void, serializeBody, .{ self, out, key });
+        const n = serializedLen(self.peer_len);
+        // `fail`'s wipe, without an alert (`Closed` calls for none).
+        const e = self.fail(error.Closed);
+        std.debug.assert(e == error.Closed);
+        return out[0..n];
+    }
+
+    fn serializeBody(self: *Server, out: []u8, key: *const [32]u8) void {
+        const pt = out[13..][0 .. blob_fixed + self.peer_len];
+        @memset(pt, 0);
+        var w: std.Io.Writer = .fixed(pt);
+        const put = struct {
+            fn int(wr: *std.Io.Writer, comptime T: type, v: T) void {
+                wr.writeInt(T, v, .big) catch unreachable;
+            }
+            fn bytes(wr: *std.Io.Writer, b: []const u8) void {
+                wr.writeAll(b) catch unreachable;
+            }
+        };
+        put.int(&w, u16, @backingInt(self.suite));
+        put.int(&w, u16, self.group);
+        put.bytes(&w, &self.client_application_secret);
+        put.bytes(&w, &self.server_application_secret);
+        put.bytes(&w, &self.exporter_master_secret);
+        put.int(&w, u64, self.out.tx.seq);
+        put.int(&w, u64, self.inbound.rx.seq);
+        put.int(&w, u8, self.key_updates_left);
+        const alpn = self.alpn orelse "";
+        put.int(&w, u8, @intFromBool(self.alpn != null));
+        put.int(&w, u8, @intCast(alpn.len));
+        var pad: [255]u8 = @splat(0);
+        @memcpy(pad[0..alpn.len], alpn);
+        put.bytes(&w, &pad);
+        put.int(&w, u8, @intFromBool(self.sni_len != null));
+        @memset(&pad, 0);
+        if (self.sni_len) |n| @memcpy(pad[0..n], self.sni_buf[0..n]);
+        put.bytes(&w, pad[0..253]);
+        put.int(&w, u8, self.sni_len orelse 0);
+        put.int(&w, i64, self.age_skew_s);
+        put.int(&w, u16, self.peer_scheme);
+        put.int(&w, u8, @as(u8, @intFromBool(self.resumed)) | @as(u8, @intFromBool(self.retried)) << 1 | @as(u8, @intFromBool(self.peer_authenticated)) << 2 | @as(u8, @intFromBool(self.peer_raw)) << 3 | @as(u8, @intFromBool(self.ech_state == .accepted)) << 4 | @as(u8, @intFromBool(self.has_ja4)) << 5);
+        put.int(&w, u16, self.peer_len);
+        put.int(&w, i64, self.peer_auth_ms);
+        put.int(&w, u8, self.server_cert_type orelse 0xff);
+        put.int(&w, u8, self.client_cert_type orelse 0xff);
+        put.int(&w, u24, if (self.peer_record_limit) |l| l else 0);
+        put.int(&w, u8, @backingInt(self.early_reason));
+        put.int(&w, u8, @intFromBool(self.dyn_sent >= (if (self.config.dynamic_records) |d| d.boost_after else 0)));
+        put.bytes(&w, if (self.has_ja4) &self.ja4_buf else &@as([fingerprint.ja4_len]u8, @splat(0)));
+        put.int(&w, u8, 0); // reserved
+        put.int(&w, u16, 0); // reserved
+        std.debug.assert(w.end == blob_fixed);
+        put.bytes(&w, self.peerLeaf());
+        out[0] = blob_version;
+        self.config.random.bytes(out[1..13]);
+        const tag = out[13 + pt.len ..][0..16];
+        aesgcm.Aes256Gcm.encryptInto(pt, tag, pt, blob_ad, out[1..13].*, key);
+    }
+
+    /// The connection `serialize` sealed, resumed into `out` over `config`
+    /// with fresh buffers (as for `init`; `peer_buf` as for `setPeerBuffer`,
+    /// needed only for a blob with a client certificate): connected, every
+    /// parameter as it was. Feed it the octets received after the blob was
+    /// made (and any the old one left unconsumed). The configuration must
+    /// offer the same ALPN protocol (`ConfigMismatch`); the rest of it
+    /// (tickets, KeyUpdate limits, dynamic records) is the new one's.
+    /// `blob` is decrypted in place (its secrets wiped). On an error `out`
+    /// is a failed server (`deinit` it as any).
+    pub fn deserialize(out: *Server, config: *const Config, joiner_buf: []u8, output_buf: []u8, peer_buf: []u8, blob: []u8, key: *const [32]u8) DeserializeError!void {
+        out.* = .init(config, joiner_buf, output_buf);
+        out.peer_buf = peer_buf;
+        errdefer out.deinit();
+        if (config.quic != null) return error.ConfigMismatch;
+        if (blob.len < blob_overhead + blob_fixed or blob[0] != blob_version) return error.BadBlob;
+        try burn.run(burn.handshake_burn, DeserializeError!void, deserializeBody, .{ out, blob, key });
+    }
+
+    fn deserializeBody(s: *Server, blob: []u8, key: *const [32]u8) DeserializeError!void {
+        const pt = blob[13 .. blob.len - 16];
+        defer std.crypto.secureZero(u8, pt[0..@min(pt.len, 2 + 2 + 3 * 48)]);
+        aesgcm.Aes256Gcm.decryptInto(pt, pt, blob[blob.len - 16 ..][0..16].*, blob_ad, blob[1..13].*, key) catch return error.BadBlob;
+        var r: std.Io.Reader = .fixed(pt);
+        const get = struct {
+            fn int(rd: *std.Io.Reader, comptime T: type) T {
+                return rd.takeInt(T, .big) catch unreachable;
+            }
+            fn bytes(rd: *std.Io.Reader, n: usize) []u8 {
+                return rd.take(n) catch unreachable;
+            }
+        };
+        const suite: record.CipherSuite = @fromBackingInt(get.int(&r, u16));
+        const L = suite.hashLen() orelse return error.BadBlob;
+        s.suite = suite;
+        s.has_suite = true;
+        s.group = get.int(&r, u16);
+        @memcpy(&s.client_application_secret, get.bytes(&r, 48));
+        @memcpy(&s.server_application_secret, get.bytes(&r, 48));
+        @memcpy(&s.exporter_master_secret, get.bytes(&r, 48));
+        const tx_seq = get.int(&r, u64);
+        const rx_seq = get.int(&r, u64);
+        s.key_updates_left = get.int(&r, u8);
+        const has_alpn = get.int(&r, u8) != 0;
+        const alpn_len = get.int(&r, u8);
+        const alpn = get.bytes(&r, 255)[0..alpn_len];
+        if (has_alpn) {
+            s.alpn = for (s.config.alpn_protocols) |p| {
+                if (std.mem.eql(u8, p, alpn)) break p;
+            } else return error.ConfigMismatch;
+        }
+        const has_sni = get.int(&r, u8) != 0;
+        const sni = get.bytes(&r, 253);
+        const sni_len = get.int(&r, u8);
+        if (has_sni) {
+            if (sni_len > 253) return error.BadBlob;
+            s.setServerName(sni[0..sni_len]);
+        }
+        s.age_skew_s = get.int(&r, i64);
+        s.peer_scheme = get.int(&r, u16);
+        const flags = get.int(&r, u8);
+        s.resumed = flags & 1 != 0;
+        s.retried = flags & 2 != 0;
+        s.peer_authenticated = flags & 4 != 0;
+        s.peer_raw = flags & 8 != 0;
+        if (flags & 16 != 0) s.ech_state = .accepted;
+        s.has_ja4 = flags & 32 != 0;
+        const peer_len = get.int(&r, u16);
+        s.peer_auth_ms = get.int(&r, i64);
+        const sct = get.int(&r, u8);
+        const cct = get.int(&r, u8);
+        s.server_cert_type = if (sct == 0xff) null else sct;
+        s.client_cert_type = if (cct == 0xff) null else cct;
+        const limit = get.int(&r, u24);
+        s.peer_record_limit = if (limit == 0) null else @intCast(limit);
+        s.early_reason = std.enums.fromInt(EarlyDataReason, get.int(&r, u8)) orelse return error.BadBlob;
+        if (get.int(&r, u8) != 0) if (s.config.dynamic_records) |d| {
+            s.dyn_sent = d.boost_after;
+        };
+        @memcpy(&s.ja4_buf, get.bytes(&r, fingerprint.ja4_len));
+        _ = get.int(&r, u8);
+        _ = get.int(&r, u16);
+        if (r.bufferedLen() != peer_len) return error.BadBlob;
+        if (peer_len != 0) {
+            if (s.peer_buf.len < ticket_head_len + peer_len) return error.ConfigMismatch;
+            @memcpy(s.peer_buf[ticket_head_len..][0..peer_len], get.bytes(&r, peer_len));
+        }
+        s.peer_len = peer_len;
+        // The record layer, where the old one stopped.
+        s.out.installTx(suite, s.server_application_secret[0..L]) catch return error.BadBlob;
+        s.out.tx.seq = tx_seq;
+        if (s.peer_record_limit) |l| s.out.max_fragment = @min(s.out.max_fragment, @min(l, record.max_plaintext_len + 1) - 1);
+        s.inbound.installRx(suite, s.client_application_secret[0..L]) catch return error.BadBlob;
+        s.inbound.rx.seq = rx_seq;
+        s.inbound.handshake_seen = true;
+        s.inbound.decrypted_any = true;
+        s.inbound.app_data_ok = true;
+        s.inbound.ccs_left = 0;
+        s.state = .connected;
     }
 
     pub const QuicResult = struct {

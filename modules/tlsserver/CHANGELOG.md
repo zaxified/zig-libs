@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** connection migration: `Server.serialize(out, key)` seals a
+  connected server's state (traffic and exporter secrets, sequence numbers, every
+  negotiated parameter, the client's certificate) under AES-256-GCM, and
+  `Server.deserialize(out, config, buffers, blob, key)` resumes it on fresh buffers;
+  `serializedLen` / `blobLen`, `SerializeError`, `DeserializeError`. s2n has a plaintext
+  equivalent, rustls none. Test: a `tlsclient` connection moved mid-stream in every suite.
+
 - **2026-10-22** — **Added:** delegated credentials (RFC 9345; rustls has none):
   `CertifiedKey.delegated_credential`, `checkDelegated` / `checkDelegatedKey`,
   `CheckError.DelegatedCredential`, the `delegated` file (`parse`, `check`, `issue`,

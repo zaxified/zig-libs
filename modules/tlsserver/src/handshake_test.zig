@@ -673,6 +673,123 @@ test "tlsclient ↔ Server: dynamic record sizing — one segment, growing, full
     try client.reader.readSliceAll(got[0..n]);
 }
 
+test "tlsclient ↔ Server: a connection serialized, sealed, resumed in a new Server — data both ways, KeyUpdate, exporter, client certificate" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const gpa = testing.allocator;
+    var ca: ClientAuthFixture = undefined;
+    ca.init(true);
+    var ckeys: ClientKeys = undefined;
+    try ckeys.init();
+    for ([_]record.CipherSuite{ .aes_128_gcm_sha256, .aes_256_gcm_sha384, .chacha20_poly1305_sha256 }) |suite| {
+        errdefer std.debug.print("suite {t}\n", .{suite});
+        var prng = std.Random.DefaultPrng.init(0x5e7);
+        const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .cipher_suites = &.{suite}, .alpn_protocols = &.{ "h2", "http/1.1" }, .client_auth = &ca.auth };
+        const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        defer gpa.free(joiner);
+        const out = try gpa.alloc(u8, @max(server_mod.minOutputLen(&config, &ck), server_mod.full_record_output_len) + 1000);
+        defer gpa.free(out);
+        const peer = try gpa.alloc(u8, server_mod.peerBufferLen(ca.auth.max_leaf_len));
+        defer gpa.free(peer);
+        var server: Server = .init(&config, joiner, out);
+        server.setPeerBuffer(peer);
+        defer server.deinit();
+        const pipe = try gpa.create(Pipe);
+        defer gpa.destroy(pipe);
+        pipe.init(&server, gpa);
+        defer pipe.deinit();
+        var entropy: [Client.Options.entropy_len]u8 = undefined;
+        prng.random().bytes(&entropy);
+        var read_buf: [Client.min_buffer_len]u8 = undefined;
+        var write_buf: [Client.min_buffer_len]u8 = undefined;
+        var cchain: [1][]const u8 = undefined;
+        var client = try ZlClient.init(&pipe.reader, &pipe.client_out, .{
+            .host = .{ .explicit = "localhost" },
+            .ca = .self_signed,
+            .read_buffer = &read_buf,
+            .write_buffer = &write_buf,
+            .entropy = &entropy,
+            .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+            .min_version = .tls_1_3,
+            .alpn_protocols = &.{"h2"},
+            .client_auth = clientCert(&client_certs.p256_cert, &ckeys.p256, &cchain),
+        });
+        try client.writer.writeAll("before");
+        try client.writer.flush();
+        try pipe.pump();
+        try testing.expect(pipe.handshake_done);
+        try testing.expectEqualStrings("before", pipe.received.items);
+        _ = try server.write("one");
+        var got: [64]u8 = undefined;
+        try client.reader.readSliceAll(got[0..3]);
+        var exported: [32]u8 = undefined;
+        try server.exportKeyingMaterial(&exported, "EXPERIMENTAL-migrate", "");
+
+        // Sealed, the old server finished; a wrong key, a flipped octet refused.
+        const key: [32]u8 = @splat(0x7a);
+        var blob_buf: [4096]u8 = undefined;
+        try testing.expectError(error.BufferTooSmall, server.serialize(blob_buf[0 .. server.blobLen() - 1], &key));
+        const blob = try server.serialize(&blob_buf, &key);
+        try testing.expectError(error.Closed, server.feed(&.{}));
+        try testing.expectEqual(null, server.peerCertificate());
+        try testing.expect(std.mem.indexOf(u8, blob, &client_certs.p256_cert) == null);
+        const joiner2 = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        defer gpa.free(joiner2);
+        const out2 = try gpa.alloc(u8, out.len);
+        defer gpa.free(out2);
+        const peer2 = try gpa.alloc(u8, peer.len);
+        defer gpa.free(peer2);
+        var copy: [4096]u8 = undefined;
+        var scratch: Server = undefined;
+        for ([_]usize{ 0, 1, 20, blob.len - 1 }) |at| {
+            @memcpy(copy[0..blob.len], blob);
+            copy[at] ^= 1;
+            try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &key));
+        }
+        @memcpy(copy[0..blob.len], blob);
+        try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &config, joiner2, out2, peer2, copy[0..blob.len], &@as([32]u8, @splat(0x7b))));
+        @memcpy(copy[0..blob.len], blob);
+        const no_alpn: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .alpn_protocols = &.{"http/1.1"} };
+        try testing.expectError(error.ConfigMismatch, Server.deserialize(&scratch, &no_alpn, joiner2, out2, peer2, copy[0..blob.len], &key));
+        @memcpy(copy[0..blob.len], blob);
+        var moved: Server = undefined;
+        try Server.deserialize(&moved, &config, joiner2, out2, peer2, copy[0..blob.len], &key);
+        defer moved.deinit();
+        pipe.server = &moved;
+
+        // The same client, unaware.
+        try testing.expect(moved.isConnected());
+        try testing.expectEqual(suite, moved.cipherSuite().?);
+        try testing.expectEqualStrings("h2", moved.alpnProtocol().?);
+        try testing.expectEqualStrings("localhost", moved.serverName().?);
+        try testing.expectEqualSlices(u8, &client_certs.p256_cert, moved.peerCertificate().?);
+        var again: [32]u8 = undefined;
+        try moved.exportKeyingMaterial(&again, "EXPERIMENTAL-migrate", "");
+        try testing.expectEqualSlices(u8, &exported, &again);
+        _ = try moved.write("two");
+        try client.reader.readSliceAll(got[0..3]);
+        try testing.expectEqualStrings("two", got[0..3]);
+        try client.writer.writeAll("after");
+        try client.writer.flush();
+        try pipe.pump();
+        try testing.expectEqualStrings("beforeafter", pipe.received.items);
+        // KeyUpdate both ways from the new process.
+        try moved.keyUpdate(.update_requested);
+        _ = try moved.write("three");
+        try client.reader.readSliceAll(got[0..5]);
+        try client.writer.writeAll("!");
+        try client.writer.flush();
+        try pipe.pump();
+        try testing.expectEqualStrings("beforeafter!", pipe.received.items);
+        try moved.close();
+        while (true) {
+            const k = client.reader.readSliceShort(&got) catch break;
+            if (k == 0) break;
+        }
+    }
+}
+
 /// A STEK ring with one key, a clock the test moves (2030, as the
 /// client's), and the ticket settings over them.
 const TicketFixture = struct {
