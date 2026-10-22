@@ -438,7 +438,7 @@ pub const Connection = struct {
     /// sent first, so records follow the data rather than the buffer.
     fn reserve(self: *Connection) Error!void {
         var s = try self.server.writeSlot();
-        if (s.len < self.server.out.max_fragment and self.server.pendingOutput().len != 0) {
+        if (s.len < self.server.recordLen() and self.server.pendingOutput().len != 0) {
             try self.flushOut();
             s = try self.server.writeSlot();
         }

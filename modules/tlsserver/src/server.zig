@@ -472,6 +472,26 @@ pub const Config = struct {
     /// level's traffic secret (`quicSecret`) to protect its packets
     /// (zig-libs `quic-crypto`). Null: TLS over a byte stream.
     quic: ?*const Quic = null,
+    /// Application data records start at one TCP segment and grow, so the
+    /// first octets of a response can be decrypted before a whole 16 KiB
+    /// record has arrived (Go `crypto/tls`, on by default there; s2n
+    /// `s2n_connection_set_dynamic_record_threshold`; rustls has none).
+    /// Null: every record up to `max_fragment_len`.
+    dynamic_records: ?DynamicRecords = null,
+};
+
+/// Go's progression: record k (from 0) of a burst carries at most
+/// `segment_len × (k + 1)` octets, up to `max_fragment_len`, and once
+/// `boost_after` octets went out, every record is full; with a `clock`, a
+/// writer idle for `idle_reset_ms` starts small again (s2n's timeout:
+/// the congestion window shrinks while a connection idles).
+pub const DynamicRecords = struct {
+    /// Content of the first record: Go's 1208-octet TCP segment estimate
+    /// less a TLS 1.3 record's header, type octet and tag.
+    segment_len: u16 = 1208 - record.header_len - 1 - record.tag_len,
+    boost_after: u32 = 128 * 1024,
+    clock: ?Clock = null,
+    idle_reset_ms: u32 = 1000,
 };
 
 /// QUIC encryption levels (RFC 9001 §4.1.4): which packet space handshake
@@ -1343,6 +1363,11 @@ pub const Server = struct {
     after_signature: State = .failed,
     /// RFC 8449: the client's `record_size_limit` (null: none sent).
     peer_record_limit: ?u16 = null,
+    /// `Config.dynamic_records`: application data octets and records sent
+    /// since the last reset, and when the last one was written.
+    dyn_sent: u64 = 0,
+    dyn_records: u32 = 0,
+    dyn_last_ms: i64 = 0,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -1837,7 +1862,7 @@ pub const Server = struct {
             // A record cut short only because earlier records still wait
             // in the buffer goes out whole after the caller sends them
             // (record boundaries follow the data, not the buffer's fill).
-            const want = @min(data.len - done, self.out.max_fragment);
+            const want = @min(data.len - done, self.recordLen());
             if (s.len == 0 or (s.len < want and self.out.len != 0)) break;
             const n = @min(s.len, want);
             @memcpy(s[0..n], data[done..][0..n]);
@@ -1864,7 +1889,7 @@ pub const Server = struct {
         self.flushKeyUpdate() catch |err| return self.fail(err);
         if (self.tx_update != null) return self.out.buf[0..0];
         const s = self.out.slot();
-        const w = s[0..@min(s.len, self.out.max_fragment)];
+        const w = s[0..@min(s.len, self.recordLen())];
         if (w.len != 0) {
             self.write_slot_start = @intFromPtr(w.ptr) - @intFromPtr(self.out.buf.ptr);
             self.write_slot_end = self.write_slot_start + w.len;
@@ -1886,6 +1911,29 @@ pub const Server = struct {
             zeroize(self.out.buf[self.out.len..]);
             return self.fail(err);
         };
+        if (self.config.dynamic_records != null) {
+            self.dyn_sent +|= n;
+            self.dyn_records +|= 1;
+        }
+    }
+
+    /// The content of the next application data record, at most: the
+    /// configured fragment, or less while `Config.dynamic_records` is
+    /// ramping up (a writer that fills `writeSlot` sends records this long).
+    pub fn recordLen(self: *Server) u16 {
+        const max = self.out.max_fragment;
+        const d = self.config.dynamic_records orelse return max;
+        if (d.clock) |c| {
+            const now = c.now_ms(c.ctx);
+            if (self.dyn_records != 0 and now -| self.dyn_last_ms >= d.idle_reset_ms) {
+                self.dyn_sent = 0;
+                self.dyn_records = 0;
+            }
+            self.dyn_last_ms = now;
+        }
+        if (self.dyn_sent >= d.boost_after) return max;
+        const n = @as(u64, @max(d.segment_len, 1)) * (@as(u64, self.dyn_records) + 1);
+        return @intCast(@min(n, max));
     }
 
     fn checkWritable(self: *const Server) Error!void {

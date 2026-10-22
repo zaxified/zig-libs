@@ -590,6 +590,89 @@ test "tlsclient ↔ Server: write sends whole records, not ones cut to fit behin
     try testing.expectEqual(sealed, server.pendingOutput().len);
 }
 
+test "tlsclient ↔ Server: dynamic record sizing — one segment, growing, full after boost_after; small again after idling" {
+    var fx: Fixture = undefined;
+    try fx.init();
+    const ck: server_mod.CertifiedKey = .{ .chain = &p256_chain, .key = .{ .ecdsa_p256 = &fx.p256 } };
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x7e59);
+    const Clock = struct {
+        var now: i64 = 1_900_000_000_000;
+        fn ms(_: ?*anyopaque) i64 {
+            return now;
+        }
+    };
+    const dyn: server_mod.DynamicRecords = .{ .clock = .{ .now_ms = Clock.ms } };
+    const config: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random(), .dynamic_records = dyn };
+    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+    defer gpa.free(joiner);
+    const out = try gpa.alloc(u8, @max(server_mod.minOutputLen(&config, &ck), server_mod.full_record_output_len) + 1000);
+    defer gpa.free(out);
+    var server: Server = .init(&config, joiner, out);
+    defer server.deinit();
+    const pipe = try gpa.create(Pipe);
+    defer gpa.destroy(pipe);
+    pipe.init(&server, gpa);
+    defer pipe.deinit();
+    var entropy: [Client.Options.entropy_len]u8 = undefined;
+    prng.random().bytes(&entropy);
+    var read_buf: [Client.min_buffer_len]u8 = undefined;
+    var write_buf: [Client.min_buffer_len]u8 = undefined;
+    var client = try ZlClient.init(&pipe.reader, &pipe.client_out, .{
+        .host = .{ .explicit = "localhost" },
+        .ca = .self_signed,
+        .read_buffer = &read_buf,
+        .write_buffer = &write_buf,
+        .entropy = &entropy,
+        .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+        .min_version = .tls_1_3,
+    });
+    try client.writer.writeAll("hi");
+    try client.writer.flush();
+    try pipe.pump();
+    try testing.expect(pipe.handshake_done);
+
+    const data = try gpa.alloc(u8, 200_000);
+    defer gpa.free(data);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 7 +% 1);
+    const got = try gpa.alloc(u8, data.len);
+    defer gpa.free(got);
+    // Every record's content length, in order, and the client reads it all.
+    var lens: std.ArrayList(usize) = .empty;
+    defer lens.deinit(gpa);
+    var done: usize = 0;
+    var read: usize = 0;
+    while (done < data.len) {
+        done += try server.write(data[done..]);
+        const p = server.pendingOutput();
+        var at: usize = 0;
+        while (at < p.len) {
+            const n = std.mem.readInt(u16, p[at + 3 ..][0..2], .big);
+            try lens.append(gpa, n - 1 - record.tag_len);
+            at += 5 + n;
+        }
+        try client.reader.readSliceAll(got[read..done]);
+        read = done;
+    }
+    try testing.expectEqualSlices(u8, data, got);
+    var sent: usize = 0;
+    for (lens.items, 0..) |n, k| {
+        const want = if (sent >= dyn.boost_after) 16384 else @min(16384, @as(usize, dyn.segment_len) * (k + 1));
+        try testing.expectEqual(@min(want, data.len - sent), n);
+        sent += n;
+    }
+    try testing.expectEqual(@as(usize, 1186), lens.items[0]);
+    // Idle for the reset time: one segment again; just under it: not.
+    Clock.now += 999;
+    var n = try server.write(data[0..20_000]);
+    try testing.expectEqual(@as(usize, 16384), std.mem.readInt(u16, server.pendingOutput()[3..5], .big) - 1 - record.tag_len);
+    try client.reader.readSliceAll(got[0..n]);
+    Clock.now += 1000;
+    n = try server.write(data[0..20_000]);
+    try testing.expectEqual(@as(usize, 1186), std.mem.readInt(u16, server.pendingOutput()[3..5], .big) - 1 - record.tag_len);
+    try client.reader.readSliceAll(got[0..n]);
+}
+
 /// A STEK ring with one key, a clock the test moves (2030, as the
 /// client's), and the ticket settings over them.
 const TicketFixture = struct {

@@ -62,6 +62,7 @@ pub const SessionCache = server.SessionCache;
 pub const ClientAuth = server.ClientAuth;
 pub const SignatureRequest = server.SignatureRequest;
 pub const Signer = server.Signer;
+pub const DynamicRecords = server.DynamicRecords;
 /// `tls13.certverify`: the key and scheme types of `CertifiedKey`, and
 /// `signContent` for a signer that holds an offloaded key.
 pub const certverify = @import("tls13").certverify;

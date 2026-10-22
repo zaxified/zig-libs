@@ -32,7 +32,8 @@ Surveyed 2026-10-20 (the `tlsserver` plan's foreign survey, coordinator's worksp
 KMS or signing service, or a thread off the event loop (rustls has none; BoringSSL, s2n and
 picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early data only with
 its stateful cache); SCT stapling (rustls dropped it); RFC 8449 `record_size_limit` for
-constrained clients (rustls and Go have none). **Where we are behind:** a full (EC)DHE handshake with a
+constrained clients (rustls and Go have none); dynamic record sizing with an idle reset (Go
+has it without the reset, s2n with it, rustls not). **Where we are behind:** a full (EC)DHE handshake with a
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
@@ -247,6 +248,18 @@ server's own limit, 2^14 + 1 (what it receives). A second ClientHello must repea
 (present or not, same value: `illegal_parameter`). Not in QUIC (no records). `minOutputLen`
 sizes for 63-octet records. `peerRecordSizeLimit()` reports it. Checked by tlsfuzzer's
 `test-record-size-limit.py` (every TLS 1.3 case, `tools/tlsfuzzer/baseline.tsv`).
+
+**Dynamic record sizing** (Go `crypto/tls`, on by default there; s2n
+`s2n_connection_set_dynamic_record_threshold`; rustls has none). With `Config.dynamic_records`,
+application data records start at one TCP segment — `segment_len`, 1186 octets of content: Go's
+1208-octet estimate less a TLS 1.3 record's 22 octets — and grow as Go's do: record k (from 0)
+carries at most `segment_len × (k + 1)`, up to `max_fragment_len` (or the client's record size
+limit), and every record is full once `boost_after` (128 KiB) went out. The client can decrypt
+the first octets of a response from the first segment instead of waiting for 16 KiB. With a
+`clock`, a writer idle for `idle_reset_ms` (1 s) starts small again (s2n; Go never does).
+`Server.recordLen()` is the next record's length; `write` and `writeSlot` keep to it, and
+`Connection`'s writer seals records of that length. Off by default (a server tuned for bulk
+throughput would pay ~1.8 % more record overhead in the first 128 KiB).
 
 **Offloaded signing** (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n `s2n_async_pkey`, picotls
 `ptls_async_job_t`; rustls signs synchronously inside the handshake, `Signer::sign`). A

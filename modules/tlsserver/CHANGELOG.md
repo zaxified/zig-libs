@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** dynamic record sizing (`Config.dynamic_records`,
+  `DynamicRecords`; Go's progression from one TCP segment, full records after 128 KiB, s2n's
+  reset after idling) and `Server.recordLen`; `write`, `writeSlot` and `Connection`'s writer
+  follow it. Off by default. Test: 200 KB through `tlsclient`, every record's length checked,
+  and the idle reset.
+
 - **2026-10-22** — **Added:** RFC 8449 `record_size_limit` (rustls and Go have none): the
   client's limit bounds every protected record from the EncryptedExtensions on, which answer
   with 2^14 + 1; below 64 is `illegal_parameter`, a second ClientHello must repeat it.
