@@ -511,6 +511,14 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 ## Backlog
 
+- **Self-hosted Debug does not compile (found 2026-10-22 from qap's test redesign).** `fast_core.zig:81`
+  says "No `movabsq` (rejected by the self-hosted assembler)", but `fast_core.zig:560/712/921/924/974`
+  and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also reports "ran out of
+  registers lowering inline asm" at `fast_core.zig:904/956`. Any consumer's `-fno-llvm` Debug build
+  (the T0 edit loop of `~/.claude/zig-backend.md`) fails in p256. Fix: the module's own recipe
+  (`movl $imm32` + `shlq`/`orq`), in the generator for `point_asm`; then a self-hosted Debug
+  `modtest` lane (or `-Dselfhosted` compile) so it cannot regress silently. montint has the same gap.
+
 **Performance levers.** Done 2026-10-14 (SPEC "After the 2026-10-14 pass"): point formulas as
 generated asm, nistz256's operation order, register forwarding — ecdh 1.24 → 1.05×, every row
 ≤ 1.1. Open, none needed for P2:

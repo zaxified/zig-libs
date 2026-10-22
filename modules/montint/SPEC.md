@@ -778,6 +778,12 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at wgs's request:
 
 ## Backlog / deferred
 
+- **Self-hosted Debug does not compile `zeroWords` (found 2026-10-22 from qap's test redesign).** The
+  self-hosted backend rejects `asm_core.zig:1185`'s generated store (`unknown size: '0(%%rdi)'`: AT&T
+  needs the `q` suffix the generated text leaves out), so a consumer's `-fno-llvm` Debug build fails,
+  although `asm_core.zig:252/407` take care to support that backend. Fix the generator (`movq`), and
+  add a self-hosted compile to the module's checks. p256 has the same gap (its SPEC backlog).
+
 - **`DynModint` code size — slot policy (DEFAULT) + build option `montint-asm-unroll`** (wgs request 2026-10-17; decisions
   of the user 2026-10-17). Every `DynModint` operation dispatches on the slot through `inline while (s <= max_limbs) : (s += step)`
   with `step = min_limbs = 4`, so `DynModint(8192)` instantiates 32 `Modint(64·L)` slots, and on an ADX/BMI2 CPU each slot's
