@@ -192,3 +192,42 @@ test "parse: lengths add up exactly" {
     try testing.expectError(error.Malformed, parse(raw[0 .. raw.len - 1]));
     try testing.expectError(error.Malformed, parse(&(raw ++ [_]u8{0})));
 }
+
+test "parse: an empty SubjectPublicKeyInfo or signature is malformed" {
+    // spki_len 0 (RFC 9345 §4: opaque ASN1_subjectPublicKeyInfo<1..2^24-1>).
+    try testing.expectError(error.Malformed, parse(&.{ 0, 0, 0, 60, 0x04, 0x03, 0, 0, 0, 0x08, 0x04, 0, 1, 0xcc }));
+    // signature<1..2^16-1> empty.
+    try testing.expectError(error.Malformed, parse(&.{ 0, 0, 0, 60, 0x04, 0x03, 0, 0, 2, 0xaa, 0xbb, 0x08, 0x04, 0, 0 }));
+    _ = try parse(&.{ 0, 0, 0, 60, 0x04, 0x03, 0, 0, 2, 0xaa, 0xbb, 0x08, 0x04, 0, 1, 0xcc });
+}
+
+test "signedMessage: 64 spaces, the context string, a zero octet, the leaf, the credential, the algorithm (RFC 9345 §4)" {
+    const cred = "\x00\x00\x00\x3c\x04\x03\x00\x00\x02\xaa\xbb";
+    // Built here, not by `signedMessage`.
+    const want = @as([64]u8, @splat(0x20)) ++ "TLS, server delegated credentials" ++ "\x00" ++ "LEAF" ++ cred ++ "\x08\x04";
+    var buf: [200]u8 = undefined;
+    try testing.expectEqualSlices(u8, want, try signedMessage(&buf, "LEAF", cred, 0x0804));
+    try testing.expectError(error.BufferTooSmall, signedMessage(buf[0 .. want.len - 1], "LEAF", cred, 0x0804));
+}
+
+test "check: valid for exactly 7 days is taken, a second more is not; only ECDSA and Ed25519 schemes" {
+    const certs = @import("test_certs.zig");
+    const EcdsaP256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+    const sk = EcdsaP256.SecretKey.fromBytes(certs.p256_scalar) catch unreachable;
+    var spki_buf: [44]u8 = undefined;
+    const spki = spkiEd25519(&spki_buf, &@as([32]u8, @splat(0x42)));
+    var raw: [600]u8 = undefined;
+    const leaf = certs.p256_cert;
+    const key: certverify.SecretKey = .{ .ecdsa_p256 = &sk };
+    const at_limit = try issue(&raw, &leaf, key, 0x0403, spki, 0x0807, max_valid_time_s, null);
+    try testing.expectEqual(max_valid_time_s, (try check(at_limit, &leaf)).valid_time);
+    const over = try issue(&raw, &leaf, key, 0x0403, spki, 0x0807, max_valid_time_s + 1, null);
+    try testing.expectError(error.ValidTooLong, check(over, &leaf));
+    // An RSA-PSS credential scheme, though the leaf signed it fine.
+    const rsa_scheme = try issue(&raw, &leaf, key, 0x0403, spki, 0x0804, 60, null);
+    try testing.expectError(error.UnsupportedAlgorithm, check(rsa_scheme, &leaf));
+    // Signed over another leaf: not verified.
+    const fine = try issue(&raw, &leaf, key, 0x0403, spki, 0x0807, 60, null);
+    _ = try check(fine, &leaf);
+    try testing.expectError(error.BadSignature, check(fine, "another leaf"));
+}

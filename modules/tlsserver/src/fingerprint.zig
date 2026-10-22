@@ -278,3 +278,35 @@ test "isGrease: the sixteen RFC 8701 values only" {
     try testing.expectEqual(@as(usize, 16), n);
     try testing.expect(isGrease(0xfafa) and !isGrease(0x0a1a));
 }
+
+test "JA4: GREASE signature algorithms are left out of the c part" {
+    var buf: [1024]u8 = undefined;
+    var out: [ja4_len]u8 = undefined;
+    var plain: [ja4_len]u8 = undefined;
+    var ch = try hello.parseClientHello(body(&buf, 0x0303, &.{0x1301}, &.{.{ 0x000d, &.{ 0, 4, 4, 3, 8, 4 } }}));
+    try ja4(&ch, .tcp, &plain);
+    ch = try hello.parseClientHello(body(&buf, 0x0303, &.{0x1301}, &.{.{ 0x000d, &.{ 0, 8, 0x1a, 0x1a, 4, 3, 0x7a, 0x7a, 8, 4 } }}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings(&plain, &out);
+    // The list itself is in the hash: other algorithms, another hash.
+    ch = try hello.parseClientHello(body(&buf, 0x0303, &.{0x1301}, &.{.{ 0x000d, &.{ 0, 4, 4, 3, 8, 5 } }}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expect(!std.mem.eql(u8, plain[24..36], out[24..36]));
+}
+
+test "JA4: the suite count stops at 99; a first ALPN value of a non-alphanumeric first octet is in hex" {
+    var buf: [1024]u8 = undefined;
+    var out: [ja4_len]u8 = undefined;
+    var suites: [100]u16 = undefined;
+    for (&suites, 0..) |*s, i| s.* = @intCast(0x1000 + i);
+    var ch = try hello.parseClientHello(body(&buf, 0x0303, &suites, &.{}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings("t12i99", out[0..6]);
+    ch = try hello.parseClientHello(body(&buf, 0x0303, suites[0..99], &.{}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings("t12i99", out[0..6]);
+    // "\x01a": the first octet is no letter or digit, the last is.
+    ch = try hello.parseClientHello(body(&buf, 0x0303, &.{0x1301}, &.{.{ 0x0010, &.{ 0, 3, 2, 0x01, 'a' } }}));
+    try ja4(&ch, .tcp, &out);
+    try testing.expectEqualStrings("01", out[8..10]);
+}

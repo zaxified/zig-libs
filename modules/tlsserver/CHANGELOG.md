@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Fixed:** `serialize` on a server without a peer buffer (no client
+  authentication) sliced past it and panicked (`peerLeaf`); found by the mutation run's new
+  tests. **Tests:** 75 tests for the surviving mutants of the day's features (149 schemata:
+  68 → 143 killed, the 6 left equivalent). **Card:** Scope `ahead` (eight feature leads over
+  rustls 0.23), Audit over src `643af7ae`, Hardening with the new fuzz and ctgrind runs.
+
 - **2026-10-22** — **Tools:** tlsfuzzer baseline: `test-tls13-large-number-of-extensions`
   also excludes ids 28 (`record_size_limit`) and 34 (`delegated_credential`), which the
   script counts unassigned and sends empty; the server now parses both (`decode_error`).

@@ -1519,7 +1519,7 @@ pub const Server = struct {
     }
 
     fn peerLeaf(self: *const Server) []u8 {
-        return self.peer_buf[ticket_head_len..][0..self.peer_len];
+        return if (self.peer_len == 0) self.peer_buf[0..0] else self.peer_buf[ticket_head_len..][0..self.peer_len];
     }
 
     /// Wipe every secret and both buffers.
@@ -6085,4 +6085,904 @@ test "minOutputLen covers the largest first flight: ML-KEM-1024's share, an ML-D
     var s: Server = undefined;
     try accept(&s, &cfg, joiner, out, .{ .groups = &.{kex.mlkem1024_group}, .shares = &.{.{ kex.mlkem1024_group, kp.public[0..kp.public_len] }}, .sig_algs = &.{0x0906}, .alpn = &.{&proto} });
     defer s.deinit();
+}
+
+// ── tests added for the 2026-10 mutation run (appended: the mutation inserter is line-anchored) ──
+
+const hpke = @import("hpke");
+
+/// A `Peer` whose first hello and configuration are the caller's.
+const PeerOpts = struct {
+    hello: Hello = .{},
+    extract: bool = false,
+    ja4: bool = false,
+    dynamic: ?DynamicRecords = null,
+};
+
+fn createPeerWith(o: PeerOpts) !*Peer {
+    const p = try testing.allocator.create(Peer);
+    errdefer testing.allocator.destroy(p);
+    p.prng = .init(1);
+    p.cfg = .{ .certificate = .{ .fixed = testKey() }, .random = p.prng.random(), .enable_secret_extraction = o.extract, .ja4 = o.ja4, .dynamic_records = o.dynamic };
+    p.s = .init(&p.cfg, &p.joiner, &p.out);
+    p.s.setPeerBuffer(&test_peer_buf);
+    const rec = try buildRecord(testing.allocator, o.hello);
+    defer testing.allocator.free(rec);
+    _ = try p.s.feed(rec);
+    const th = p.s.transcript.sha256.currentHash();
+    var fk: [32]u8 = undefined;
+    ks.deriveFinishedKey(S256.Hkdf, 32, &fk, p.s.client_handshake_secret[0..32]);
+    var fin: [36]u8 = undefined;
+    fin[0..4].* = .{ 20, 0, 0, 32 };
+    tls13.keyschedule.computeFinishedVerifyData(S256.Hmac, fin[4..36], &fk, &th);
+    var hs: record.Protection = undefined;
+    try hs.init(.aes_128_gcm_sha256, p.s.client_handshake_secret[0..32]);
+    @memcpy(p.in[5..][0..fin.len], &fin);
+    const r = try p.s.feed(try hs.seal(&p.in, fin.len, .handshake, 0));
+    try testing.expect(r.event == .handshake_done);
+    p.tx_secret = p.s.client_application_secret[0..32].*;
+    p.rx_secret = p.s.server_application_secret[0..32].*;
+    try p.tx.init(.aes_128_gcm_sha256, &p.tx_secret);
+    try p.rx.init(.aes_128_gcm_sha256, &p.rx_secret);
+    p.s.discardOutput(p.s.pendingOutput().len);
+    return p;
+}
+
+/// The extension `ext_type` of the EncryptedExtensions in the server's
+/// queued first flight (null: it carries none). The flight is opened with
+/// the server's handshake key: `prefix` is the transcript before the
+/// ServerHello (the ClientHello message, AES-128-GCM-SHA256 and no
+/// HelloRetryRequest), the ServerHello the last plaintext handshake record.
+fn eeExtension(s: *Server, prefix: []const u8, ext_type: u16, buf: []u8) !?[]const u8 {
+    const p = s.pendingOutput();
+    @memcpy(buf[0..p.len], p);
+    var hash = Sha256.init(.{});
+    hash.update(prefix);
+    var at: usize = 0;
+    while (at < p.len) {
+        const h = record.parseHeader(buf[at..][0..5]);
+        if (h.content_type == .handshake) hash.update(buf[at + 5 ..][0..h.length]);
+        at += 5 + h.length;
+    }
+    const th = hash.finalResult();
+    var c_hs: [32]u8 = undefined;
+    var s_hs: [32]u8 = undefined;
+    ks.deriveHandshakeTrafficSecrets(S256.Hkdf, &c_hs, &s_hs, s.handshake_secret[0..32], &th);
+    var rx: record.Protection = undefined;
+    try rx.init(.aes_128_gcm_sha256, &s_hs);
+    at = 0;
+    while (at < p.len) {
+        const h = record.parseHeader(buf[at..][0..5]);
+        const start = at;
+        at += 5 + h.length;
+        if (h.content_type != .application_data) continue;
+        // The first protected record opens with the EncryptedExtensions.
+        const o = try rx.open(buf[start..at]);
+        try testing.expectEqual(@as(u8, 8), o.content[0]);
+        var ex = o.content[4..];
+        ex = ex[2..][0..std.mem.readInt(u16, ex[0..2], .big)];
+        while (ex.len >= 4) {
+            const t = std.mem.readInt(u16, ex[0..2], .big);
+            const n = std.mem.readInt(u16, ex[2..4], .big);
+            if (t == ext_type) return ex[4..][0..n];
+            ex = ex[4 + n ..];
+        }
+        return null;
+    }
+    return error.NoEncryptedExtensions;
+}
+
+/// `Server.setPeerBuffer`'s: serialize reads `peerLeaf` even without a client certificate.
+var test_peer_buf: [ticket_head_len]u8 = undefined;
+
+const move_key: [32]u8 = @splat(0x61);
+
+/// A server resumed from a blob.
+const Moved = struct {
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    out: [32 * 1024]u8,
+    peer: [64]u8,
+    s: Server,
+
+    fn destroy(m: *Moved) void {
+        m.s.deinit();
+        testing.allocator.destroy(m);
+    }
+};
+
+/// `p` serialized and resumed in a new server over the same configuration.
+fn moveServer(p: *Peer, context: []const u8) !*Moved {
+    const m = try testing.allocator.create(Moved);
+    errdefer testing.allocator.destroy(m);
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const sealed = try p.s.serialize(&blob, &move_key, context);
+    try testing.expectEqual(blob.len, sealed.len);
+    try Server.deserialize(&m.s, &p.cfg, &m.joiner, &m.out, &m.peer, sealed, &move_key, context);
+    return m;
+}
+
+test "serialize: not before the handshake, after a close, with output or input pending, a KeyUpdate due, a slot open, nor on QUIC" {
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    // The handshake is under way (its flight queued).
+    {
+        var prng = std.Random.DefaultPrng.init(1);
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .enable_secret_extraction = true };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var out: [32 * 1024]u8 = undefined;
+        var s: Server = undefined;
+        try accept(&s, &cfg, &joiner, &out, .{});
+        defer s.deinit();
+        try testing.expectError(error.NotConnected, s.serialize(&blob, &move_key, ""));
+    }
+    const Case = enum { quic, closed, peer_closed, pending, key_update, half_message, open_slot, context };
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const long_context: [Server.max_blob_context_len + 1]u8 = @splat('c');
+    for ([_]Case{ .quic, .closed, .peer_closed, .pending, .key_update, .half_message, .open_slot, .context }) |c| {
+        const p = try createPeerWith(.{ .extract = true });
+        defer p.destroy();
+        var want: Server.SerializeError = error.NotQuiescent;
+        var context: []const u8 = "";
+        switch (c) {
+            .quic => {
+                p.cfg.quic = &quic;
+                want = error.WrongTransport;
+            },
+            .closed => {
+                try p.s.close();
+                p.s.discardOutput(p.s.pendingOutput().len);
+                want = error.NotConnected;
+            },
+            .peer_closed => {
+                try testing.expect((try p.send(.alert, &.{ 1, 0 })).event == .peer_closed);
+                p.s.discardOutput(p.s.pendingOutput().len);
+                want = error.NotConnected;
+            },
+            .pending => _ = try p.s.write("x"),
+            .key_update => p.s.tx_update = .update_not_requested,
+            // A KeyUpdate whose body has not arrived.
+            .half_message => try testing.expect((try p.send(.handshake, &.{ 24, 0, 0, 1 })).event == .need_more),
+            .open_slot => _ = try p.s.writeSlot(),
+            .context => {
+                context = &long_context;
+                want = error.ContextTooLong;
+            },
+        }
+        try testing.expectError(want, p.s.serialize(&blob, &move_key, context));
+    }
+}
+
+test "deserialize: a QUIC configuration is refused; a blob with no client certificate and a 255-octet context goes through, a longer context does not" {
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    var context: [Server.max_blob_context_len + 1]u8 = @splat('c');
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const sealed = try p.s.serialize(&blob, &move_key, context[0..Server.max_blob_context_len]);
+    // No client certificate: the fixed part and nothing behind it.
+    try testing.expectEqual(Server.serializedLen(0), sealed.len);
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var peer: [64]u8 = undefined;
+    var copy = blob;
+    var scratch: Server = undefined;
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    var quic_cfg = p.cfg;
+    quic_cfg.quic = &quic;
+    try testing.expectError(error.ConfigMismatch, Server.deserialize(&scratch, &quic_cfg, &joiner, &out, &peer, &copy, &move_key, context[0..Server.max_blob_context_len]));
+    copy = blob;
+    try testing.expectError(error.BadBlob, Server.deserialize(&scratch, &p.cfg, &joiner, &out, &peer, &copy, &move_key, &context));
+    copy = blob;
+    var moved: Server = undefined;
+    try Server.deserialize(&moved, &p.cfg, &joiner, &out, &peer, &copy, &move_key, context[0..Server.max_blob_context_len]);
+    defer moved.deinit();
+    try testing.expect(moved.isConnected());
+}
+
+test "serialize round trip: ECH accepted, JA4, the client's record_size_limit and the dynamic-record ramp go along" {
+    // ECH (the state a full exchange leaves; the exchange is tested below).
+    {
+        const p = try createPeerWith(.{ .extract = true });
+        defer p.destroy();
+        try testing.expect(!p.s.echAccepted());
+        p.s.ech_state = .accepted;
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expect(m.s.echAccepted());
+    }
+    {
+        const p = try createPeerWith(.{ .extract = true, .ja4 = true, .hello = .{ .sni = "example.com", .alpn = &.{"h2"} } });
+        defer p.destroy();
+        const before = p.s.ja4().?.*;
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expectEqualSlices(u8, &before, m.s.ja4().?);
+    }
+    // RFC 8449: records within the limit, before and after the move.
+    {
+        const p = try createPeerWith(.{ .extract = true, .hello = .{ .record_size_limit = 1000 } });
+        defer p.destroy();
+        try testing.expectEqual(@as(u16, 999), p.s.recordLen());
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expectEqual(@as(?u16, 1000), m.s.peerRecordSizeLimit());
+        try testing.expectEqual(@as(u16, 999), m.s.recordLen());
+    }
+    // A connection past `boost_after` stays at full records (also with a
+    // clock far past the last write: no record was written since the move);
+    // a fresh one stays small.
+    const FarClock = struct {
+        fn now(_: ?*anyopaque) i64 {
+            return 1_000_000;
+        }
+    };
+    const dyn: DynamicRecords = .{ .segment_len = 100, .boost_after = 250, .clock = .{ .now_ms = FarClock.now } };
+    {
+        const p = try createPeerWith(.{ .extract = true, .dynamic = dyn });
+        defer p.destroy();
+        try testing.expectEqual(@as(u16, 100), p.s.recordLen());
+        p.s.dyn_sent = dyn.boost_after;
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expectEqual(@as(u16, record.max_plaintext_len), m.s.recordLen());
+    }
+    {
+        const p = try createPeerWith(.{ .extract = true, .dynamic = dyn });
+        defer p.destroy();
+        const m = try moveServer(p, "ctx");
+        defer m.destroy();
+        try testing.expectEqual(@as(u16, 100), m.s.recordLen());
+    }
+}
+
+test "deserialize: the peer buffer must hold the head and the client's certificate, which the blob must carry whole" {
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const context = "ctx";
+    const sealed = try p.s.serialize(&blob, &move_key, context);
+    // The same blob declaring a client leaf of `declared` octets and carrying
+    // `carried`: open it, change the length and the tail, seal it again (the
+    // format is `serializeBody`'s).
+    const Craft = struct {
+        fn make(out: []u8, sealed_: []const u8, declared: u16, carried: usize) ![]u8 {
+            @memcpy(out[0..sealed_.len], sealed_);
+            var ad: [Server.blob_ad.len + 1 + Server.max_blob_context_len]u8 = undefined;
+            const old_pt = out[13 .. sealed_.len - 16];
+            try aesgcm.Aes256Gcm.decryptInto(old_pt, old_pt, sealed_[sealed_.len - 16 ..][0..16].*, Server.blobAd(&ad, context), sealed_[1..13].*, &move_key);
+            const pt = out[13..][0 .. Server.blob_fixed + carried];
+            // The tail of the fixed part holds peer_auth_ms, the two
+            // certificate types, the limit, the early-data reason, the dynamic
+            // flag, the JA4 and the reserved octets: 54 octets behind peer_len.
+            const peer_len_at = Server.blob_fixed - 54 - 2;
+            std.mem.writeInt(u16, pt[peer_len_at..][0..2], declared, .big);
+            @memset(pt[Server.blob_fixed..], 0xcc);
+            aesgcm.Aes256Gcm.encryptInto(pt, out[13 + pt.len ..][0..16], pt, Server.blobAd(&ad, context), out[1..13].*, &move_key);
+            return out[0 .. 13 + pt.len + 16];
+        }
+    };
+    var big: [Server.serializedLen(11)]u8 = undefined;
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var peer: [ticket_head_len + 10]u8 = undefined;
+    var s: Server = undefined;
+    // One octet short of the head and the leaf.
+    var crafted = try Craft.make(&big, sealed, 10, 10);
+    try testing.expectError(error.ConfigMismatch, Server.deserialize(&s, &p.cfg, &joiner, &out, peer[0 .. peer.len - 1], crafted, &move_key, context));
+    // A leaf shorter or longer than the length says.
+    for ([_]usize{ 9, 11 }) |carried| {
+        crafted = try Craft.make(&big, sealed, 10, carried);
+        try testing.expectError(error.BadBlob, Server.deserialize(&s, &p.cfg, &joiner, &out, &peer, crafted, &move_key, context));
+    }
+    crafted = try Craft.make(&big, sealed, 10, 10);
+    try Server.deserialize(&s, &p.cfg, &joiner, &out, &peer, crafted, &move_key, context);
+    defer s.deinit();
+    try testing.expectEqual(@as(u16, 10), s.peer_len);
+    try testing.expect(s.isConnected());
+}
+
+test "dynamic records: full once boost_after octets are out (exactly boost_after included); a zero segment_len still moves" {
+    const p = try createPeerWith(.{ .dynamic = .{ .segment_len = 100, .boost_after = 250 } });
+    defer p.destroy();
+    const full = p.s.out.max_fragment;
+    // 100, then 200 octets; 300 octets are out by then, past 250.
+    for ([_]u16{ 100, 200 }) |want| {
+        try testing.expectEqual(want, p.s.recordLen());
+        const slot = try p.s.writeSlot();
+        try testing.expectEqual(@as(usize, want), slot.len);
+        @memset(slot, 'x');
+        try p.s.commitWrite(slot.len);
+        p.s.discardOutput(p.s.pendingOutput().len);
+    }
+    try testing.expectEqual(full, p.s.recordLen());
+    // Exactly boost_after octets sent.
+    const q = try createPeerWith(.{ .dynamic = .{ .segment_len = 100, .boost_after = 100 } });
+    defer q.destroy();
+    const slot = try q.s.writeSlot();
+    try testing.expectEqual(@as(usize, 100), slot.len);
+    @memset(slot, 'x');
+    try q.s.commitWrite(100);
+    try testing.expectEqual(full, q.s.recordLen());
+    // No segment: one octet, then two.
+    const z = try createPeerWith(.{ .dynamic = .{ .segment_len = 0, .boost_after = 1_000_000 } });
+    defer z.destroy();
+    try testing.expectEqual(@as(u16, 1), z.s.recordLen());
+    const one = try z.s.writeSlot();
+    try testing.expectEqual(@as(usize, 1), one.len);
+    one[0] = 'x';
+    try z.s.commitWrite(1);
+    try testing.expectEqual(@as(u16, 2), z.s.recordLen());
+}
+
+test "RFC 8449: the server's records stay within the client's limit (2^14 + 1 at most, the type octet counted); QUIC takes none" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    // (the client's limit, the content of a full record)
+    for ([_][2]u16{ .{ 64, 63 }, .{ 100, 99 }, .{ 16384, 16383 }, .{ 16385, 16384 }, .{ 0xffff, 16384 } }) |c| {
+        var s: Server = undefined;
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        const out = try testing.allocator.alloc(u8, 64 * 1024);
+        defer testing.allocator.free(out);
+        try accept(&s, &cfg, &joiner, out, .{ .record_size_limit = c[0] });
+        defer s.deinit();
+        try testing.expectEqual(c[1], s.recordLen());
+    }
+    // The extension is echoed (2^14 + 1) to a client that sent one only.
+    for ([_]?u16{ 1000, null }) |limit| {
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var out: [32 * 1024]u8 = undefined;
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .record_size_limit = limit });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        var buf: [32 * 1024]u8 = undefined;
+        const echoed = try eeExtension(&s, rec[5..], 28, &buf);
+        if (limit != null) {
+            try testing.expectEqualSlices(u8, &.{ 0x40, 0x01 }, echoed.?);
+        } else try testing.expect(echoed == null);
+    }
+    // QUIC has no records: the client's limit is not kept, not echoed.
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const qcfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .alpn_protocols = &.{"h3"}, .quic = &quic };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&qcfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .alpn = &.{"h3"}, .quic_tp = "client", .record_size_limit = 1000 });
+    defer testing.allocator.free(rec);
+    _ = try s.quicFeed(.initial, rec[5..]);
+    try testing.expectEqual(@as(?u16, null), s.peerRecordSizeLimit());
+    s.discardOutput(s.quicOutput().?.data.len);
+    try testing.expect(std.mem.indexOf(u8, s.quicOutput().?.data, &.{ 0, 28, 0, 2 }) == null);
+}
+
+test "minOutputLen counts the records of the smallest record_size_limit for a long chain" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const blob: [4096]u8 = @splat(0xab);
+    const chain: [3][]const u8 = @splat(&blob);
+    var ck = testKey().*;
+    ck.chain = &chain;
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    // Without client authentication or tickets: the flight, and the one
+    // record the request's slot adds.
+    try testing.expect(minOutputLen(&cfg, &ck) >= firstFlightLen(&ck, min_record_size_limit - 1) + record.header_len + 1 + record.tag_len);
+}
+
+test "offloaded key: signatureFailed outside a wait changes nothing; an empty signature is refused even unverified" {
+    var prng = std.Random.DefaultPrng.init(1);
+    // Before any hello.
+    {
+        const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+        var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+        var out: [32 * 1024]u8 = undefined;
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        s.signatureFailed();
+        try testing.expectEqual(State.client_hello, s.state);
+        try testing.expectEqual(@as(usize, 0), s.pendingOutput().len);
+    }
+    // Connected.
+    {
+        const p = try Peer.create();
+        defer p.destroy();
+        p.s.signatureFailed();
+        try testing.expect(p.s.isConnected());
+        try testing.expectEqual(@as(usize, 0), p.s.pendingOutput().len);
+    }
+    // Failed already: no second alert.
+    {
+        var r: OffloadRun = undefined;
+        try r.start(true);
+        defer r.s.deinit();
+        r.s.signatureFailed();
+        const queued = r.s.pendingOutput().len;
+        r.s.signatureFailed();
+        try testing.expectEqual(State.failed, r.s.state);
+        try testing.expectEqual(queued, r.s.pendingOutput().len);
+    }
+    // Not verifying does not mean taking nothing.
+    {
+        var r: OffloadRun = undefined;
+        try r.start(false);
+        defer r.s.deinit();
+        try testing.expectError(error.InternalError, r.s.provideSignature(""));
+        try testing.expectEqual(State.failed, r.s.state);
+    }
+}
+
+test "offloaded key: a raw public key leaf is verified as the SubjectPublicKeyInfo it is" {
+    const spki = (try x509.spkiOf(&certs.p256_cert)).der;
+    const chain = [1][]const u8{spki};
+    const ck: CertifiedKey = .{ .chain = &chain, .key = null, .raw_public_key = true, .offload = .{ .schemes = &.{0x0403}, .verify = true } };
+    try ck.check();
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .server_cert_types = &.{ 0, 2 } });
+    defer testing.allocator.free(rec);
+    try testing.expect((try s.feed(rec)).event == .signature_needed);
+    const req = s.signatureRequest().?;
+    var buf: [certverify.max_signature_len]u8 = undefined;
+    const sig = try certverify.signContent(.ecdsa_secp256r1_sha256, testKey().key.?, req.message, null, &buf);
+    try s.provideSignature(sig);
+    try testing.expectEqual(State.client_finished, s.state);
+}
+
+test "offloaded key: the signer's first scheme that certverify knows and the client offers" {
+    // 0x0401 (RSA PKCS#1) is the client's and the signer's, and no scheme of ours.
+    const off: CertifiedKey = .{ .chain = &test_chain, .key = null, .offload = .{ .schemes = &.{ 0x0401, 0x0403 } } };
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = &off }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const rec = try buildRecord(testing.allocator, .{ .sig_algs = &.{ 0x0401, 0x0403 } });
+    defer testing.allocator.free(rec);
+    try testing.expect((try s.feed(rec)).event == .signature_needed);
+    try testing.expectEqual(@as(u16, 0x0403), s.signatureRequest().?.scheme);
+}
+
+test "RFC 9345: the credential's scheme needs a key, or a signer, that makes it" {
+    var t: TestDc = undefined;
+    try t.init();
+    var prng = std.Random.DefaultPrng.init(1);
+    const h: Hello = .{ .dc_schemes = &.{0x0807}, .sig_algs = &.{0x0403} };
+    // The leaf's P-256 key beside an Ed25519 credential.
+    var ck = t.certifiedKey();
+    ck.key = testKey().key;
+    var r = try refuse(h, .{ .certificate = .{ .fixed = &ck }, .random = prng.random() });
+    try testing.expectEqual(error.HandshakeFailure, r.err);
+    // A signer that makes ECDSA only.
+    ck = t.certifiedKey();
+    ck.key = null;
+    ck.offload = .{ .schemes = &.{0x0403} };
+    try ck.check();
+    r = try refuse(h, .{ .certificate = .{ .fixed = &ck }, .random = prng.random() });
+    try testing.expectEqual(error.HandshakeFailure, r.err);
+}
+
+test "CertifiedKey.check: a delegated credential valid exactly 7 days is taken; beside a raw public key, or with extensions past their length, it is not" {
+    var t: TestDc = undefined;
+    try t.init();
+    var raw: [600]u8 = undefined;
+    const spki = delegated.spkiEd25519(&t.spki, &t.ed.public_key.bytes);
+    var ck = t.certifiedKey();
+    ck.delegated_credential = try delegated.issue(&raw, test_chain[0], testKey().key.?, 0x0403, spki, 0x0807, delegated.max_valid_time_s, null);
+    try ck.check();
+    try ck.checkDelegatedKey();
+    ck.delegated_credential = try delegated.issue(&raw, test_chain[0], testKey().key.?, 0x0403, spki, 0x0807, delegated.max_valid_time_s + 1, null);
+    try testing.expectError(error.DelegatedCredential, ck.check());
+    try testing.expectError(error.ValidTooLong, ck.checkDelegatedKey());
+    // RFC 9345 §4.1: the credential goes in an X.509 leaf's extensions.
+    const raw_chain = [1][]const u8{(try x509.spkiOf(&certs.p256_cert)).der};
+    ck = t.certifiedKey();
+    ck.chain = &raw_chain;
+    ck.raw_public_key = true;
+    try testing.expectError(error.DelegatedCredential, ck.check());
+    // The extension's header counts: 4 + 65533 octets do not fit 2^16 - 1.
+    const dc = try testing.allocator.alloc(u8, 65533);
+    defer testing.allocator.free(dc);
+    @memset(dc, 0xaa);
+    std.mem.writeInt(u32, dc[0..4], 60, .big);
+    std.mem.writeInt(u16, dc[4..6], 0x0403, .big);
+    std.mem.writeInt(u24, dc[6..9], 65519, .big);
+    std.mem.writeInt(u16, dc[9 + 65519 ..][0..2], 0x0403, .big);
+    std.mem.writeInt(u16, dc[9 + 65519 + 2 ..][0..2], 1, .big);
+    ck = t.certifiedKey();
+    ck.delegated_credential = dc;
+    try testing.expectError(error.LeafExtensionsTooLong, ck.check());
+}
+
+// ── ECH (RFC 9849) from the client's side ──
+
+/// The server with an ECH key, and an HPKE sender to it.
+const EchTest = struct {
+    prng: std.Random.DefaultPrng,
+    kp: std.crypto.dh.X25519.KeyPair,
+    config_buf: [256]u8,
+    config: []u8,
+    keys: [1]ech.Key,
+    keys_cfg: ech.Ech,
+    cfg: Config,
+    joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8,
+    out: [32 * 1024]u8,
+    ebuf: []u8,
+    s: Server,
+    sender: hpke.Setup(hpke.X25519Kem, aesgcm.Aes128Gcm, 32),
+
+    const Opts = struct {
+        /// The config's (KDF, AEAD) list, raw (default: HKDF-SHA256 with the three AEADs).
+        suites: ?[12]u8 = null,
+        retry: bool = true,
+        max_len: u16 = 8192,
+        ja4: bool = false,
+    };
+
+    fn create(o: Opts) !*EchTest {
+        const t = try testing.allocator.create(EchTest);
+        errdefer testing.allocator.destroy(t);
+        t.prng = .init(1);
+        t.kp = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(3));
+        t.config = try ech.makeConfig(&t.config_buf, 9, &t.kp.public_key, "public.example", 0);
+        // version, length, config_id, KEM, public key (length, 32), then the suites' length.
+        if (o.suites) |suites| @memcpy(t.config[4 + 1 + 2 + 2 + 32 + 2 ..][0..12], &suites);
+        t.keys = .{.{ .config = t.config, .private_key = &t.kp.secret_key, .retry = o.retry }};
+        t.keys_cfg = .{ .keys = &t.keys, .max_client_hello_len = o.max_len };
+        t.cfg = .{ .certificate = .{ .fixed = testKey() }, .random = t.prng.random(), .ech = &t.keys_cfg, .ja4 = o.ja4 };
+        t.ebuf = try testing.allocator.alloc(u8, ech.bufferLen(o.max_len));
+        errdefer testing.allocator.free(t.ebuf);
+        t.s = .init(&t.cfg, &t.joiner, &t.out);
+        t.s.setEchBuffer(t.ebuf);
+        var info: [8 + 256]u8 = undefined;
+        @memcpy(info[0..8], "tls ech\x00");
+        @memcpy(info[8..][0..t.config.len], t.config);
+        const eph = std.crypto.dh.X25519.KeyPair.generateDeterministic(@splat(0x55));
+        try hpke.schedule.setupBaseSDeterministic(hpke.X25519Kem, aesgcm.Aes128Gcm, 32, &t.sender, t.kp.public_key, &eph, info[0 .. 8 + t.config.len]);
+        return t;
+    }
+
+    fn destroy(t: *EchTest) void {
+        t.s.deinit();
+        testing.allocator.free(t.ebuf);
+        testing.allocator.destroy(t);
+    }
+
+    /// The ClientHelloOuter record around the sealed `inner`.
+    fn clientHello(t: *EchTest, outer: Hello, inner: Hello, o: EchOffer) ![]u8 {
+        const gpa = testing.allocator;
+        var ih = inner;
+        ih.ech = o.inner_ech;
+        ih.session_id = "";
+        const irec = try buildRecord(gpa, ih);
+        defer gpa.free(irec);
+        // EncodedClientHelloInner: the body of the inner hello (no session id).
+        const plain = o.plaintext orelse irec[9..];
+        const payload_len = plain.len + 16;
+        const enc: []const u8 = o.enc orelse if (o.second) "" else &t.sender.enc;
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(gpa);
+        try data.append(gpa, 0); // outer
+        try data.appendSlice(gpa, &.{ @truncate(o.kdf >> 8), @truncate(o.kdf), @truncate(o.aead >> 8), @truncate(o.aead), o.config_id });
+        try data.appendSlice(gpa, &.{ @truncate(enc.len >> 8), @truncate(enc.len) });
+        try data.appendSlice(gpa, enc);
+        try data.appendSlice(gpa, &.{ @truncate(payload_len >> 8), @truncate(payload_len) });
+        try data.appendNTimes(gpa, 0, payload_len);
+        var oh = outer;
+        oh.ech = data.items;
+        const rec = try buildRecord(gpa, oh);
+        errdefer gpa.free(rec);
+        // The payload is the last thing in the record; the AAD is the body
+        // with it zero.
+        const sealed = try gpa.alloc(u8, payload_len);
+        defer gpa.free(sealed);
+        try t.sender.context.seal(rec[9..], plain, sealed);
+        @memcpy(rec[rec.len - payload_len ..], sealed);
+        return rec;
+    }
+};
+
+/// What an ECH offer varies.
+const EchOffer = struct {
+    kdf: u16 = 1,
+    aead: u16 = 1,
+    config_id: u8 = 9,
+    /// Null: the sender's `enc` in a first hello, none in a second.
+    enc: ?[]const u8 = null,
+    second: bool = false,
+    /// Sealed instead of the encoded inner hello.
+    plaintext: ?[]const u8 = null,
+    /// The inner hello's own `encrypted_client_hello`.
+    inner_ech: ?[]const u8 = &.{1},
+};
+
+fn echFeed(t: *EchTest, h: Hello) !Error!Result {
+    const rec = try buildRecord(testing.allocator, h);
+    defer testing.allocator.free(rec);
+    return t.s.feed(rec);
+}
+
+/// A first hello that asks for P-256 with an X25519 share: ECH accepted, a HelloRetryRequest sent.
+fn echFirstWithRetry(t: *EchTest) !void {
+    var outer = x25519_share_first;
+    outer.sni = "public.example";
+    const rec = try t.clientHello(outer, x25519_share_first, .{});
+    defer testing.allocator.free(rec);
+    const r = try t.s.feed(rec);
+    try testing.expect(r.event == .need_more);
+    try testing.expectEqual(State.client_hello_retry, t.s.state);
+    try testing.expect(t.s.echAccepted());
+}
+
+fn echSecondHello(t: *EchTest, o: EchOffer) !Error!Result {
+    var offer = o;
+    offer.second = true;
+    var outer = p256_only;
+    outer.sni = "public.example";
+    const rec = try t.clientHello(outer, p256_only, offer);
+    defer testing.allocator.free(rec);
+    return t.s.feed(rec);
+}
+
+test "ECH: the offer is opened by the key of its config_id, KDF and AEAD, within max_client_hello_len; else it is declined" {
+    const outer: Hello = .{ .sni = "public.example" };
+    const inner: Hello = .{ .sni = "secret.example" };
+    var body_len: usize = 0;
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(outer, inner, .{});
+        defer testing.allocator.free(rec);
+        body_len = rec.len - 9;
+        _ = try t.s.feed(rec);
+        try testing.expect(t.s.echAccepted());
+        try testing.expectEqualStrings("secret.example", t.s.serverName().?);
+    }
+    // An outer hello of exactly max_client_hello_len octets is opened.
+    {
+        const t = try EchTest.create(.{ .max_len = @intCast(body_len) });
+        defer t.destroy();
+        const rec = try t.clientHello(outer, inner, .{});
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(t.s.echAccepted());
+    }
+    const EchCase = struct { opts: EchTest.Opts = .{}, offer: EchOffer = .{} };
+    const cases = [_]EchCase{
+        // One octet over max_client_hello_len.
+        .{ .opts = .{ .max_len = @intCast(body_len - 1) } },
+        // Another config_id, though sealed to our key.
+        .{ .offer = .{ .config_id = 10 } },
+        // A config without AES-128-GCM; with another KDF.
+        .{ .opts = .{ .suites = .{ 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 3 } } },
+        .{ .opts = .{ .suites = .{ 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 0, 3 } } },
+        // A KDF this server does not serve (listed by the config, offered).
+        .{ .opts = .{ .suites = .{ 0, 2, 0, 1, 0, 2, 0, 2, 0, 2, 0, 3 } }, .offer = .{ .kdf = 2 } },
+        // A payload of the tag alone (no encoded hello): declined unopened.
+        .{ .offer = .{ .plaintext = "" } },
+    };
+    for (cases) |c| {
+        const t = try EchTest.create(c.opts);
+        defer t.destroy();
+        const rec = try t.clientHello(outer, inner, c.offer);
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(!t.s.echAccepted());
+        // The outer hello goes on, its SNI.
+        try testing.expectEqualStrings("public.example", t.s.serverName().?);
+    }
+}
+
+test "ECH: the second hello after a HelloRetryRequest keeps the suite, config_id and no enc, and opens under the same context" {
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        try echFirstWithRetry(t);
+        const r = try echSecondHello(t, .{});
+        _ = try r;
+        try testing.expectEqual(State.client_finished, t.s.state);
+        try testing.expect(t.s.echAccepted());
+    }
+    const changed = [_]EchOffer{ .{ .kdf = 2 }, .{ .aead = 2 }, .{ .config_id = 10 }, .{ .enc = "e" } };
+    for (changed) |o| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        try echFirstWithRetry(t);
+        try testing.expectError(error.EchOfferChanged, try echSecondHello(t, o));
+    }
+    // A payload of the tag alone does not open to anything: decrypt_error.
+    const t = try EchTest.create(.{});
+    defer t.destroy();
+    try echFirstWithRetry(t);
+    try testing.expectError(error.EchDecryptionFailed, try echSecondHello(t, .{ .plaintext = "" }));
+}
+
+test "ECH: a second hello must carry the outer offer when the first was accepted" {
+    // (The first hello's inner one had no SNI; a changed one is refused on its own.)
+    const no_ech = p256_only;
+    var inner_offer = no_ech;
+    inner_offer.ech = &.{1};
+    for ([_]struct { Hello, Error }{ .{ no_ech, error.MissingExtension }, .{ inner_offer, error.IllegalParameter } }) |c| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        try echFirstWithRetry(t);
+        try testing.expectError(c[1], try echFeed(t, c[0]));
+    }
+}
+
+test "ECH: retry_configs go in the EncryptedExtensions of a declined offer, and only then" {
+    var buf: [32 * 1024]u8 = undefined;
+    var want: [512]u8 = undefined;
+    // An offer for another config_id: the retry configs of the keys marked so.
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{}, .{ .config_id = 10 });
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect(!t.s.echAccepted());
+        const list = try ech.retryConfigs(&want, &t.keys_cfg);
+        try testing.expectEqualSlices(u8, list, (try eeExtension(&t.s, rec[5..], ech.ext_encrypted_client_hello, &buf)).?);
+    }
+    // No offer at all.
+    {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try buildRecord(testing.allocator, .{ .sni = "public.example" });
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect((try eeExtension(&t.s, rec[5..], ech.ext_encrypted_client_hello, &buf)) == null);
+    }
+    // An offer, but no key is marked for retry: no empty list.
+    {
+        const t = try EchTest.create(.{ .retry = false });
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{}, .{ .config_id = 10 });
+        defer testing.allocator.free(rec);
+        _ = try t.s.feed(rec);
+        try testing.expect((try eeExtension(&t.s, rec[5..], ech.ext_encrypted_client_hello, &buf)) == null);
+    }
+    // No ECH on the first hello: an inner offer on the second asks for no
+    // retry_configs (it is no offer to this server); an outer one does.
+    const outer_offer = [_]u8{ 0, 0, 1, 0, 1, 9, 0, 0, 0, 17 } ++ @as([17]u8, @splat(7));
+    for ([_]struct { []const u8, bool }{ .{ &.{1}, false }, .{ &outer_offer, true } }) |c| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        var first = x25519_share_first;
+        first.sni = "public.example";
+        var second = p256_only;
+        second.sni = "public.example";
+        second.ech = c[0];
+        _ = try (try echFeed(t, first));
+        try testing.expectEqual(State.client_hello_retry, t.s.state);
+        _ = try (try echFeed(t, second));
+        try testing.expectEqual(State.client_finished, t.s.state);
+        try testing.expectEqual(c[1], t.s.ech_offered);
+    }
+}
+
+test "ECH: the inner hello carries an inner offer and nothing below TLS 1.3 (GREASE versions aside)" {
+    const outer_offer = [_]u8{ 0, 0, 1, 0, 1, 9, 0, 0, 0, 1, 0xaa };
+    const bad = [_]EchOffer{ .{ .inner_ech = null }, .{ .inner_ech = &outer_offer } };
+    for (bad) |o| {
+        const t = try EchTest.create(.{});
+        defer t.destroy();
+        const rec = try t.clientHello(.{ .sni = "public.example" }, .{}, o);
+        defer testing.allocator.free(rec);
+        try testing.expectError(error.EchInvalidInner, t.s.feed(rec));
+    }
+    const t = try EchTest.create(.{});
+    defer t.destroy();
+    const rec = try t.clientHello(.{ .sni = "public.example" }, .{ .versions = &.{ 0x0a0a, 0x0304 } }, .{});
+    defer testing.allocator.free(rec);
+    _ = try t.s.feed(rec);
+    try testing.expect(t.s.echAccepted());
+}
+
+test "RFC 9849 §7.2: a backend server (no ECH keys) confirms an inner offer in the ServerHello and the HelloRetryRequest" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random() };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    const inner_random: [32]u8 = @splat(0x42);
+    // ServerHello: the last 8 octets of its random, over the hello and the
+    // ServerHello with them zero.
+    {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        const rec = try buildRecord(testing.allocator, .{ .ech = &.{1} });
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        const p = s.pendingOutput();
+        const sh_len = std.mem.readInt(u16, p[3..5], .big);
+        var sh: [256]u8 = undefined;
+        @memcpy(sh[0..sh_len], p[5..][0..sh_len]);
+        const got = sh[30..38].*;
+        @memset(sh[30..38], 0);
+        var h = Sha256.init(.{});
+        h.update(rec[5..]);
+        h.update(sh[0..sh_len]);
+        const th = h.finalResult();
+        try testing.expectEqualSlices(u8, &ech.confirmation(S256.Hkdf, &inner_random, "ech accept confirmation", &th), &got);
+    }
+    // HelloRetryRequest: its last 8 octets, over message_hash(hello) and the
+    // HelloRetryRequest with them zero.
+    {
+        var s: Server = .init(&cfg, &joiner, &out);
+        defer s.deinit();
+        var first = x25519_share_first;
+        first.ech = &.{1};
+        const rec = try buildRecord(testing.allocator, first);
+        defer testing.allocator.free(rec);
+        _ = try s.feed(rec);
+        const p = s.pendingOutput();
+        const hrr_len = std.mem.readInt(u16, p[3..5], .big);
+        var hrr: [256]u8 = undefined;
+        @memcpy(hrr[0..hrr_len], p[5..][0..hrr_len]);
+        const got = hrr[hrr_len - 8 ..][0..8].*;
+        @memset(hrr[hrr_len - 8 .. hrr_len], 0);
+        var h = Sha256.init(.{});
+        h.update(rec[5..]);
+        const ch_hash = h.finalResult();
+        h = Sha256.init(.{});
+        h.update(&.{ 254, 0, 0, 32 });
+        h.update(&ch_hash);
+        h.update(hrr[0..hrr_len]);
+        const th = h.finalResult();
+        try testing.expectEqualSlices(u8, &ech.confirmation(S256.Hkdf, &inner_random, "hrr ech accept confirmation", &th), &got);
+    }
+}
+
+test "Config.ja4 with ECH accepted: the fingerprint is the outer hello's" {
+    const t = try EchTest.create(.{ .ja4 = true });
+    defer t.destroy();
+    const rec = try t.clientHello(.{ .sni = "public.example", .suites = &.{0x1301} }, .{ .sni = "secret.example", .suites = &.{ 0x1301, 0x1302 } }, .{});
+    defer testing.allocator.free(rec);
+    _ = try t.s.feed(rec);
+    try testing.expect(t.s.echAccepted());
+    const outer = try hello.parseClientHello(rec[9..]);
+    var want: [fingerprint.ja4_len]u8 = undefined;
+    try fingerprint.ja4(&outer, .tcp, &want);
+    try testing.expectEqualSlices(u8, &want, t.s.ja4().?);
+}
+
+test "Config.ja4: after a HelloRetryRequest the fingerprint is still the first hello's" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .ja4 = true };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const first = try buildRecord(testing.allocator, x25519_share_first);
+    defer testing.allocator.free(first);
+    _ = try s.feed(first);
+    const want = s.ja4().?.*;
+    // The suites reordered and one more: allowed on the second hello.
+    var again = p256_only;
+    again.suites = &.{ 0x1303, 0x1301 };
+    const second = try buildRecord(testing.allocator, again);
+    defer testing.allocator.free(second);
+    _ = try s.feed(second);
+    try testing.expectEqual(State.client_finished, s.state);
+    try testing.expectEqualSlices(u8, &want, s.ja4().?);
+}
+
+test "serialize without a peer buffer (no client authentication): no client leaf to carry" {
+    // `setPeerBuffer` is for client authentication; a server without one
+    // serialized (2026-10-22: `peerLeaf` sliced past an empty buffer).
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    p.s.peer_buf = &.{};
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const sealed = try p.s.serialize(&blob, &move_key, "no-peer");
+    try testing.expectEqual(blob.len, sealed.len);
+    var m: Server = undefined;
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    try Server.deserialize(&m, &p.cfg, &joiner, &out, &.{}, sealed, &move_key, "no-peer");
+    defer m.deinit();
+    try testing.expect(m.isConnected());
+    try testing.expectEqual(null, m.peerCertificate());
 }

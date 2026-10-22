@@ -562,3 +562,54 @@ test "reconstruct: outer extensions in relative order, the outer session id, pad
     const two = helloBody(&eb, "", &.{ .{ 0xfd00, &.{ 2, 0x12, 0x34 } }, .{ 0xfd00, &.{ 2, 0x56, 0x78 } } });
     _ = try reconstruct(two, &outer, &out);
 }
+
+test "reconstruct: an ech_outer_extensions list must be non-empty and the whole extension" {
+    var ob: [512]u8 = undefined;
+    const outer_body = helloBody(&ob, &.{ 7, 7, 7 }, &.{.{ 0x1234, "abc" }});
+    const outer = try hello.parseClientHello(outer_body);
+    var eb: [512]u8 = undefined;
+    var out: [1024]u8 = undefined;
+    // One octet behind the list; an empty list (RFC 9849 §5.1: 2..254 octets).
+    for ([_][]const u8{ &.{ 2, 0x12, 0x34, 0xff }, &.{0} }) |data| {
+        const bad = helloBody(&eb, "", &.{.{ 0xfd00, data }});
+        try testing.expectError(error.DecodeError, reconstruct(bad, &outer, &out));
+    }
+    // The well-formed one resolves.
+    const good = helloBody(&eb, "", &.{.{ 0xfd00, &.{ 2, 0x12, 0x34 } }});
+    _ = try reconstruct(good, &outer, &out);
+}
+
+test "parseOffer: an outer offer is exactly its fields, no octet behind them" {
+    try testing.expectError(error.DecodeError, parseOffer(&.{ 0, 0, 1, 0, 3, 42, 0, 2, 0xaa, 0xbb, 0, 1, 0xcc, 0xdd }));
+    _ = try parseOffer(&.{ 0, 0, 1, 0, 3, 42, 0, 2, 0xaa, 0xbb, 0, 1, 0xcc });
+}
+
+/// An ECHConfig with the given HPKE suite list (raw) and public name.
+fn rawConfig(buf: []u8, suites: []const u8, name: []const u8) []u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const len = 1 + 2 + 2 + 32 + 2 + suites.len + 1 + 1 + name.len + 2;
+    w.writeInt(u16, version, .big) catch unreachable;
+    w.writeInt(u16, @intCast(len), .big) catch unreachable;
+    w.writeByte(7) catch unreachable;
+    w.writeInt(u16, kem_x25519, .big) catch unreachable;
+    w.writeInt(u16, 32, .big) catch unreachable;
+    w.splatByteAll(1, 32) catch unreachable;
+    w.writeInt(u16, @intCast(suites.len), .big) catch unreachable;
+    w.writeAll(suites) catch unreachable;
+    w.writeByte(0) catch unreachable;
+    w.writeByte(@intCast(name.len)) catch unreachable;
+    w.writeAll(name) catch unreachable;
+    w.writeInt(u16, 0, .big) catch unreachable;
+    return w.buffered();
+}
+
+test "parseConfig: a public name is required, and the suites are whole (KDF, AEAD) pairs" {
+    var buf: [128]u8 = undefined;
+    const suites = [_]u8{ 0, 1, 0, 1 };
+    _ = try parseConfig(rawConfig(&buf, &suites, "a.example"));
+    // RFC 9849 §4: public_name<1..255>.
+    try testing.expectError(error.InvalidConfig, parseConfig(rawConfig(&buf, &suites, "")));
+    // A suite list that is not a multiple of 4 octets.
+    try testing.expectError(error.InvalidConfig, parseConfig(rawConfig(&buf, &(suites ++ [_]u8{ 0, 1 }), "a.example")));
+    try testing.expectError(error.InvalidConfig, parseConfig(rawConfig(&buf, &.{ 0, 1, 0 }, "a.example")));
+}
