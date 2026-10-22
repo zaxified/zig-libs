@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Fixed:** what `writer()` left in an open record is sealed on every pass
+  of a read, not only when the read starts: a writer could open a record while the reader
+  waited for input, and a KeyUpdate reply or an alert queued then landed over it (the guard's
+  review). **Added:** `CertifiedKey.CompressedCertificate.digest` and
+  `CertifiedKey.certificateDigest(staples)` — `check` refuses a precompressed certificate
+  whose message changed at the same length (a refreshed OCSP staple), not only one whose
+  length changed. Tests: the guard per entry point (socketpair, blocked sender) and an
+  every-send-under-the-guard invariant; mutation 9/9.
+
 - **2026-10-22** — **Tools:** `bench-tlsserver` measures the fastest in the field too:
   rustls 0.23.43 over aws-lc-rs 1.18.0 (`tools/rust_bench`, built offline by cargo; a fresh
   rustls client and server per handshake op, only the server's calls timed — aws-lc cannot

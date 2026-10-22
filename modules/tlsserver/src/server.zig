@@ -165,9 +165,11 @@ pub const CertifiedKey = struct {
     /// output for its `staples`, compressed by the caller (rustls compresses
     /// per handshake behind a cache; here no compressor runs in the
     /// handshake). Replacing the chain, the OCSP staple or the SCT list
-    /// means compressing again: `check` sees only a length that changed,
-    /// so a same-length replacement (a refreshed staple usually is one)
-    /// left uncompressed would reach compressing clients stale.
+    /// means compressing again: give each entry its `digest` and `check`
+    /// refuses one that no longer matches. Without it `check` sees only a
+    /// length that changed, so a same-length replacement (a refreshed
+    /// staple usually is one) left uncompressed would reach compressing
+    /// clients stale.
     compressed_certificates: []const CompressedCertificate = &.{},
 
     /// What the leaf carries in a Certificate message: the OCSP staple and
@@ -185,6 +187,10 @@ pub const CertifiedKey = struct {
         staples: Staples = .{},
         /// `uncompressedCertificate(…, staples).len`.
         uncompressed_len: u24,
+        /// SHA-256 of `uncompressedCertificate(…, staples)` (or
+        /// `certificateDigest(staples)`), compared by `check`; null: only
+        /// the length is.
+        digest: ?[32]u8 = null,
         /// `opaque compressed_certificate_message<1..2^24-1>`.
         data: []const u8,
     };
@@ -210,9 +216,9 @@ pub const CertifiedKey = struct {
         /// CompressedCertificate's 2^24-1 octets hold, or under the
         /// reserved algorithm 0.
         CompressedLength,
-        /// A compressed certificate whose `uncompressed_len` is not the
-        /// length of the message it stands for (compressed before the
-        /// staples changed), or with a staple the key does not hold.
+        /// A compressed certificate whose `uncompressed_len` (or `digest`)
+        /// is not the message it stands for (compressed before the chain
+        /// or the staples changed), or with a staple the key does not hold.
         CompressedStale,
     };
 
@@ -245,7 +251,50 @@ pub const CertifiedKey = struct {
             if (c.algorithm == 0 or c.data.len == 0 or c.data.len > std.math.maxInt(u24) - (2 + 3 + 3)) return error.CompressedLength;
             const len = self.certificateBodyLen(c.staples) orelse return error.CompressedStale;
             if (c.uncompressed_len != len) return error.CompressedStale;
+            if (c.digest) |d| if (!std.mem.eql(u8, &d, &self.certificateDigest(c.staples).?)) return error.CompressedStale;
         }
+    }
+
+    /// SHA-256 of `uncompressedCertificate(…, staples)` without the buffer:
+    /// for `CompressedCertificate.digest`. Null: a staple the key does not
+    /// hold. Call `check` first (it bounds the lengths).
+    pub fn certificateDigest(self: *const CertifiedKey, staples: Staples) ?[32]u8 {
+        const body = self.certificateBodyLen(staples) orelse return null;
+        var h: Sha256 = .init(.{});
+        var be: [4]u8 = undefined;
+        h.update(&.{0}); // certificate_request_context: empty
+        std.mem.writeInt(u24, be[0..3], @intCast(body - 1 - 3), .big);
+        h.update(be[0..3]);
+        for (self.chain, 0..) |der, i| {
+            std.mem.writeInt(u24, be[0..3], @intCast(der.len), .big);
+            h.update(be[0..3]);
+            h.update(der);
+            const ocsp = if (i == 0 and staples.ocsp) self.ocspStaple().? else null;
+            const sct = if (i == 0 and staples.sct) self.sctList().? else null;
+            var exts: usize = 0;
+            if (ocsp) |o| exts += 4 + 1 + 3 + o.len;
+            if (sct) |l| exts += 4 + l.len;
+            std.mem.writeInt(u16, be[0..2], @intCast(exts), .big);
+            h.update(be[0..2]);
+            if (ocsp) |o| {
+                std.mem.writeInt(u16, be[0..2], 5, .big); // status_request
+                h.update(be[0..2]);
+                std.mem.writeInt(u16, be[0..2], @intCast(1 + 3 + o.len), .big);
+                h.update(be[0..2]);
+                h.update(&.{1}); // ocsp
+                std.mem.writeInt(u24, be[0..3], @intCast(o.len), .big);
+                h.update(be[0..3]);
+                h.update(o);
+            }
+            if (sct) |l| {
+                std.mem.writeInt(u16, be[0..2], 18, .big); // signed_certificate_timestamp
+                h.update(be[0..2]);
+                std.mem.writeInt(u16, be[0..2], @intCast(l.len), .big);
+                h.update(be[0..2]);
+                h.update(l);
+            }
+        }
+        return h.finalResult();
     }
 
     /// The length of the Certificate message body with `staples` (null: a
@@ -3580,6 +3629,33 @@ test "CertifiedKey.check: compressed certificates must match the message they st
     try ck.check();
     try testing.expectEqual(@as(usize, len + 4 + 5), (try ck.uncompressedCertificate(&scratch, .{ .sct = true })).len);
     try testing.expectError(error.BufferTooSmall, ck.uncompressedCertificate(scratch[0..8], .{}));
+}
+
+test "CertifiedKey.certificateDigest is the hash of the message, and catches a same-length staple" {
+    // Two certificates, so the entries after the leaf (no staples) count too.
+    const chain = [_][]const u8{ &certs.p256_cert, &certs.p256_cert };
+    var ck = testKey().*;
+    ck.chain = &chain;
+    ck.ocsp_response = "\x30\x03\x0a\x01\x00";
+    ck.sct_list = "\x00\x03\x00\x01x";
+    var scratch: [8192]u8 = undefined;
+    for ([_]CertifiedKey.Staples{ .{}, .{ .ocsp = true }, .{ .sct = true }, .{ .ocsp = true, .sct = true } }) |st| {
+        var want: [32]u8 = undefined;
+        Sha256.hash(try ck.uncompressedCertificate(&scratch, st), &want, .{});
+        try testing.expectEqualSlices(u8, &want, &ck.certificateDigest(st).?);
+    }
+    try testing.expectEqual(null, (CertifiedKey{ .chain = &chain, .key = ck.key }).certificateDigest(.{ .ocsp = true }));
+
+    const st: CertifiedKey.Staples = .{ .ocsp = true };
+    const len: u24 = @intCast((try ck.uncompressedCertificate(&scratch, st)).len);
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .staples = st, .uncompressed_len = len, .digest = ck.certificateDigest(st).?, .data = "x" }};
+    try ck.check();
+    // A refreshed staple of the same length: the length cannot tell, the
+    // digest can.
+    ck.ocsp_response = "\x30\x03\x0a\x01\x01";
+    try testing.expectError(error.CompressedStale, ck.check());
+    ck.compressed_certificates = &.{.{ .algorithm = 1, .staples = st, .uncompressed_len = len, .data = "x" }};
+    try ck.check(); // without a digest, as before
 }
 
 test "minOutputLen holds a compressed certificate longer than the chain" {

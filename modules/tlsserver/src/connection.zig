@@ -42,8 +42,11 @@
 //! mutex that parks): it is held wherever the connection changes or sends
 //! its output and released while a read waits for input. Writers must still
 //! be serialised among themselves (`writer()` buffers without calling in),
-//! and the guard does not make the connection safe across threads: the
-//! octets a writer buffers are sealed by whichever side calls in next.
+//! there is one reader, `deinit` comes after every fiber is done with the
+//! connection, and `err` holds whichever side's error came last. The guard
+//! does not make the connection safe across threads: the octets a writer
+//! buffers are sealed by whichever side calls in next, and that is only
+//! safe where nothing runs between a writer's octets and its next park.
 
 const std = @import("std");
 const record = @import("record.zig");
@@ -145,8 +148,11 @@ pub const Connection = struct {
 
     /// Feed what the reader holds; read more when the server needs it.
     fn step(self: *Connection) Error!server_mod.Event {
-        try self.emit();
         while (true) {
+            // Every pass: a writer may have opened a record while this one
+            // waited for input, and what `feed` queues (a KeyUpdate, an
+            // alert) would land where that record's octets lie.
+            try self.emit();
             const r = self.server.feed(self.input.buffered()) catch |err| {
                 self.flushOut() catch {};
                 return err;
@@ -532,136 +538,379 @@ test "a writer that keeps its bytes (Writer.fixed) is refused, not corrupted" {
     try testing.expectError(error.WriteFailed, c.flushOut());
 }
 
-/// The client end of the guard test: waits until the server's writer has
-/// filled the socket, sends one record, then reads the writer's payload.
-const GuardPeer = struct {
-    io: std.Io,
-    fd: std.posix.fd_t,
-    payload: []const u8,
-    got: []u8,
-    err: ?anyerror = null,
+/// The guard tests' rig: a `Connection` over one end of a socketpair (small
+/// buffers, so a writer blocks soon), a `tlsclient` on the other end in a
+/// thread of its own. Heap-allocated: the threads hold pointers into it.
+const GuardRig = struct {
+    const linux = std.os.linux;
+    const Client = @import("tlsclient").Client;
+    const certs = @import("test_certs.zig");
 
-    fn run(p: *GuardPeer) void {
-        p.go() catch |err| {
-            p.err = err;
-            // A corrupt stream: unblock the server's writer and reader so
-            // the test fails instead of hanging.
-            _ = std.os.linux.shutdown(p.fd, std.os.linux.SHUT.RDWR);
-        };
+    gpa: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    fds: [2]linux.fd_t,
+    p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey,
+    chain: [1][]const u8,
+    ck: server_mod.CertifiedKey,
+    prng: std.Random.DefaultPrng,
+    cfg: server_mod.Config,
+    in_buf: []u8,
+    out_buf: []u8,
+    joiner: []u8,
+    sr: std.Io.net.Stream.Reader,
+    sw: std.Io.net.Stream.Writer,
+    conn: Connection,
+    mutex: std.Io.Mutex = .init,
+    /// Set by the server side's writer thread once its octets are buffered.
+    slot_open: std.atomic.Value(bool) = .init(false),
+    /// Whether the guard is held, and sends made without it (`checked`).
+    held: bool = false,
+    unguarded_sends: usize = 0,
+    /// With `checked`: the connection's output, which forwards to `sw` and
+    /// counts every send made without the guard held.
+    checked: std.Io.Writer = undefined,
+    fwd_buf: [512]u8 = undefined,
+
+    fn create(gpa: std.mem.Allocator) !*GuardRig {
+        return createWith(gpa, false);
     }
 
-    fn go(p: *GuardPeer) !void {
-        const Client = @import("tlsclient").Client;
-        const stream: std.Io.net.Stream = .{ .socket = .{ .handle = p.fd, .address = undefined } };
-        var net_in: [Client.min_buffer_len]u8 = undefined;
-        var net_out: [Client.min_buffer_len]u8 = undefined;
-        var app_in: [Client.min_buffer_len]u8 = undefined;
-        var app_out: [Client.min_buffer_len]u8 = undefined;
-        var sr = stream.reader(p.io, &net_in);
-        var sw = stream.writer(p.io, &net_out);
-        const entropy: [Client.Options.entropy_len]u8 = @splat(7);
-        var c = try Client.init(&sr.interface, &sw.interface, .{
-            .host = .no_verification,
-            .ca = .no_verification,
-            .read_buffer = &app_in,
-            .write_buffer = &app_out,
-            .entropy = &entropy,
-            .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
-            .min_version = .tls_1_3,
-        });
-        // The server's writer blocks on the full socket meanwhile; its reader
-        // then waits for this record.
-        try p.io.sleep(.fromMilliseconds(200), .awake);
-        try c.writer.writeAll("a");
-        try c.writer.flush();
-        try sw.interface.flush();
-        try c.reader.readSliceAll(p.got);
-        try c.end();
-        try sw.interface.flush();
+    fn createWith(gpa: std.mem.Allocator, checked: bool) !*GuardRig {
+        const g = try gpa.create(GuardRig);
+        errdefer gpa.destroy(g);
+        g.gpa = gpa;
+        g.threaded = .init(gpa, .{});
+        errdefer g.threaded.deinit();
+        if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &g.fds)) != .SUCCESS) return error.SkipZigTest;
+        const small: c_int = 4096;
+        _ = linux.setsockopt(g.fds[0], linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+        _ = linux.setsockopt(g.fds[1], linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+        g.p256 = try .fromBytes(certs.p256_scalar);
+        g.chain = .{&certs.p256_cert};
+        g.ck = .{ .chain = &g.chain, .key = .{ .ecdsa_p256 = &g.p256 } };
+        g.prng = .init(11);
+        g.cfg = .{ .certificate = .{ .fixed = &g.ck }, .random = g.prng.random() };
+        g.in_buf = try gpa.alloc(u8, record.max_record_len);
+        g.out_buf = try gpa.alloc(u8, server_mod.minOutputLen(&g.cfg, &g.ck) + server_mod.full_record_output_len);
+        g.joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
+        const io = g.threaded.io();
+        const stream: std.Io.net.Stream = .{ .socket = .{ .handle = g.fds[0], .address = undefined } };
+        g.sr = stream.reader(io, g.in_buf);
+        g.held = false;
+        g.unguarded_sends = 0;
+        if (checked) {
+            g.sw = stream.writer(io, &g.fwd_buf);
+            g.checked = .{ .vtable = &.{ .drain = checkedDrain }, .buffer = g.out_buf, .end = 0 };
+            g.conn = .init(&g.cfg, &g.sr.interface, &g.checked, g.joiner);
+        } else {
+            g.sw = stream.writer(io, g.out_buf);
+            g.conn = .init(&g.cfg, &g.sr.interface, &g.sw.interface, g.joiner);
+        }
+        g.conn.guard = .{ .ctx = g, .lock = lock, .unlock = unlock };
+        g.slot_open = .init(false);
+        g.mutex = .init;
+        return g;
     }
+
+    fn destroy(g: *GuardRig) void {
+        g.conn.deinit();
+        for (g.fds) |fd| _ = linux.close(fd);
+        g.gpa.free(g.in_buf);
+        g.gpa.free(g.out_buf);
+        g.gpa.free(g.joiner);
+        g.threaded.deinit();
+        g.gpa.destroy(g);
+    }
+
+    /// Unblock every thread on the socket: a failing test ends, not hangs.
+    fn shutdown(g: *GuardRig) void {
+        for (g.fds) |fd| _ = linux.shutdown(fd, linux.SHUT.RDWR);
+    }
+
+    fn lock(ctx: *anyopaque) void {
+        const g: *GuardRig = @ptrCast(@alignCast(ctx));
+        g.mutex.lockUncancelable(g.threaded.io());
+        g.held = true;
+    }
+
+    fn unlock(ctx: *anyopaque) void {
+        const g: *GuardRig = @ptrCast(@alignCast(ctx));
+        g.held = false;
+        g.mutex.unlock(g.threaded.io());
+    }
+
+    /// The `checked` output: a send is where a parked writer and the reader
+    /// could meet, so each must happen with the guard held.
+    fn checkedDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const g: *GuardRig = @alignCast(@fieldParentPtr("checked", w));
+        if (!g.held) g.unguarded_sends += 1;
+        const out = &g.sw.interface;
+        try out.writeAll(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data, 0..) |d, i| {
+            const times = if (i == data.len - 1) splat else 1;
+            for (0..times) |_| try out.writeAll(d);
+            n += d.len * times;
+        }
+        try out.flush();
+        return n;
+    }
+
+    /// Wait (up to 5 s) until the server's writer has put octets on the
+    /// socket the client does not read, then a little longer: it has filled
+    /// the small socket buffers and blocks. (How much stays queued depends
+    /// on what the client's reader took in with the handshake's last
+    /// flight, so the test waits for any, not for a count.) If the writer
+    /// has not blocked by then, the reader merely waits for input first,
+    /// and the race this rig is for goes unexercised: the test fails open.
+    fn awaitWriterBlocked(g: *GuardRig) !void {
+        for (0..500) |_| {
+            var avail: c_int = 0;
+            _ = linux.ioctl(g.fds[1], linux.T.FIONREAD, @intFromPtr(&avail));
+            if (avail > 0) return g.threaded.io().sleep(.fromMilliseconds(50), .awake);
+            try g.threaded.io().sleep(.fromMilliseconds(10), .awake);
+        }
+        return error.WriterNeverBlocked;
+    }
+
+    /// A thread joined once, by whichever comes first: the test, or the
+    /// `defer` of a test that failed.
+    const Joined = struct {
+        t: std.Thread,
+        done: bool = false,
+
+        fn join(j: *Joined) void {
+            if (j.done) return;
+            j.t.join();
+            j.done = true;
+        }
+    };
+
+    /// The client side, in its own thread.
+    const Peer = struct {
+        rig: *GuardRig,
+        /// What it does once the handshake is done.
+        mode: enum { send_then_read, junk_after_slot, read_then_send },
+        got: []u8,
+        err: ?anyerror = null,
+
+        fn run(p: *Peer) void {
+            p.go() catch |err| {
+                p.err = err;
+                p.rig.shutdown();
+            };
+        }
+
+        fn go(p: *Peer) !void {
+            const g = p.rig;
+            const io = g.threaded.io();
+            const stream: std.Io.net.Stream = .{ .socket = .{ .handle = g.fds[1], .address = undefined } };
+            var net_in: [Client.min_buffer_len]u8 = undefined;
+            var net_out: [Client.min_buffer_len]u8 = undefined;
+            var app_in: [Client.min_buffer_len]u8 = undefined;
+            var app_out: [Client.min_buffer_len]u8 = undefined;
+            var sr = stream.reader(io, &net_in);
+            var sw = stream.writer(io, &net_out);
+            const entropy: [Client.Options.entropy_len]u8 = @splat(7);
+            var c = try Client.init(&sr.interface, &sw.interface, .{
+                .host = .no_verification,
+                .ca = .no_verification,
+                .read_buffer = &app_in,
+                .write_buffer = &app_out,
+                .entropy = &entropy,
+                .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
+                .min_version = .tls_1_3,
+            });
+            switch (p.mode) {
+                .send_then_read => {
+                    // Once the server's writer blocks on the full socket.
+                    try g.awaitWriterBlocked();
+                    try c.writer.writeAll("a");
+                    try c.writer.flush();
+                    try sw.interface.flush();
+                    try c.reader.readSliceAll(p.got);
+                    try c.end();
+                    try sw.interface.flush();
+                },
+                .read_then_send => {
+                    // Everything the server sends, then one record, then
+                    // the server's close_notify.
+                    try c.reader.readSliceAll(p.got);
+                    try c.writer.writeAll("a");
+                    try c.writer.flush();
+                    try sw.interface.flush();
+                    var rest: [1]u8 = undefined;
+                    if (try c.reader.readSliceShort(&rest) != 0) return error.DataAfterClose;
+                    try c.end();
+                    try sw.interface.flush();
+                },
+                .junk_after_slot => {
+                    // Once the server's writer has its octets in an open
+                    // record (and its reader waits for input): a record that
+                    // does not open, so the server queues an alert.
+                    for (0..500) |_| {
+                        if (g.slot_open.load(.acquire)) break;
+                        try io.sleep(.fromMilliseconds(10), .awake);
+                    } else return error.SlotNeverOpened;
+                    const junk = [_]u8{ 0x17, 0x03, 0x03, 0x00, 0x14 } ++ @as([20]u8, @splat(0));
+                    if (linux.errno(linux.write(g.fds[1], &junk, junk.len)) != .SUCCESS) return error.WriteFailed;
+                    // The writer's octets come first, sealed, then the alert.
+                    try c.reader.readSliceAll(p.got);
+                },
+            }
+        }
+    };
 };
 
-test "a guard keeps a reader from resending what a parked writer is still sending" {
-    // A writer blocked in sending (a fiber parked on a full socket, here a
-    // thread) and a reader that needs input: without the guard the reader
-    // sends the same queued records again, and the client sees a corrupt
-    // stream (qap's HTTP/2 streams on fibers, 2026-10-22).
+/// The call a guard test's writer thread blocks in, sending.
+const ParkedSend = enum { write_all, flush, key_update, close };
+
+/// A writer blocked in sending (a fiber parked on a full socket, here a
+/// thread) and a reader that needs input: without the guard the reader
+/// sends the same queued records again, and the client sees a corrupt stream
+/// (qap's HTTP/2 streams on fibers, 2026-10-22). `write_all` sends a payload
+/// through `writeAll`; the others queue one with `Server.write` first and
+/// block in `flush`, `keyUpdate` or `close`. Not through `writer()`: it
+/// buffers outside the guard, which only fibers of one thread make safe (the
+/// file comment), so threads cannot stand in for them on that path.
+fn guardParkedSender(kind: ParkedSend) !void {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-    const linux = std.os.linux;
     const gpa = testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var fds: [2]linux.fd_t = undefined;
-    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
-    defer for (fds) |fd| {
-        _ = linux.close(fd);
-    };
-    const small: c_int = 4096;
-    _ = linux.setsockopt(fds[0], linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
-    _ = linux.setsockopt(fds[1], linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
-
-    const certs = @import("test_certs.zig");
-    const p256: std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey = try .fromBytes(certs.p256_scalar);
-    const chain = [_][]const u8{&certs.p256_cert};
-    const ck: server_mod.CertifiedKey = .{ .chain = &chain, .key = .{ .ecdsa_p256 = &p256 } };
-    var prng = std.Random.DefaultPrng.init(11);
-    const cfg: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
-
+    const g = try GuardRig.create(gpa);
+    defer g.destroy();
     const payload = try gpa.alloc(u8, 256 * 1024);
     defer gpa.free(payload);
     for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
     const got = try gpa.alloc(u8, payload.len);
     defer gpa.free(got);
-    var peer: GuardPeer = .{ .io = io, .fd = fds[1], .payload = payload, .got = got };
-    const peer_thread = try std.Thread.spawn(.{}, GuardPeer.run, .{&peer});
 
-    const stream: std.Io.net.Stream = .{ .socket = .{ .handle = fds[0], .address = undefined } };
-    const in_buf = try gpa.alloc(u8, record.max_record_len);
-    defer gpa.free(in_buf);
-    const out_buf = try gpa.alloc(u8, server_mod.minOutputLen(&cfg, &ck) + server_mod.full_record_output_len);
-    defer gpa.free(out_buf);
-    const joiner = try gpa.alloc(u8, inbound.Joiner.bufferLen(inbound.default_max_message));
-    defer gpa.free(joiner);
-    var sr = stream.reader(io, in_buf);
-    var sw = stream.writer(io, out_buf);
-    var conn: Connection = .init(&cfg, &sr.interface, &sw.interface, joiner);
-    defer conn.deinit();
+    var peer: GuardRig.Peer = .{ .rig = g, .mode = .send_then_read, .got = got };
+    var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+    defer peer_thread.join();
+    errdefer g.shutdown();
+    try g.conn.handshake();
 
-    const Mutex = struct {
-        m: std.Io.Mutex = .init,
-        io: std.Io,
-        fn lock(ctx: *anyopaque) void {
-            const s: *@This() = @ptrCast(@alignCast(ctx));
-            s.m.lockUncancelable(s.io);
-        }
-        fn unlock(ctx: *anyopaque) void {
-            const s: *@This() = @ptrCast(@alignCast(ctx));
-            s.m.unlock(s.io);
-        }
-    };
-    var mutex: Mutex = .{ .io = io };
-    conn.guard = .{ .ctx = &mutex, .lock = Mutex.lock, .unlock = Mutex.unlock };
+    // Queued, not sent: more than the socket buffers take.
+    var data: []const u8 = payload;
+    if (kind != .write_all) {
+        data = payload[0..try g.conn.server.write(payload)];
+        try testing.expect(data.len >= 16 * 1024);
+    }
+    // The client reads what it will be sent (before the writer starts).
+    peer.got = got[0..data.len];
 
-    try conn.handshake();
     const Writer = struct {
-        fn run(c: *Connection, data: []const u8, err: *?Error) void {
-            c.writeAll(data) catch |e| {
+        fn run(c: *Connection, k: ParkedSend, d: []const u8, err: *?anyerror) void {
+            (switch (k) {
+                .write_all => c.writeAll(d),
+                .flush => c.flush(),
+                .key_update => c.keyUpdate(.update_not_requested),
+                .close => c.close(),
+            }) catch |e| {
                 err.* = e;
             };
         }
     };
-    var write_err: ?Error = null;
-    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{ &conn, payload, &write_err });
-    // Let the writer fill the socket and block.
-    try io.sleep(.fromMilliseconds(50), .awake);
-    const first = try conn.read();
+    var write_err: ?anyerror = null;
+    var writer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, Writer.run, .{ &g.conn, kind, data, &write_err }) };
+    defer writer_thread.join();
+    errdefer g.shutdown();
+    g.awaitWriterBlocked() catch |err| {
+        std.debug.print("peer: {?}\n", .{peer.err});
+        return err;
+    };
+    const first = try g.conn.read();
     try testing.expectEqualStrings("a", first.?);
+    try testing.expectEqual(null, try g.conn.read()); // close_notify
     writer_thread.join();
     try testing.expectEqual(null, write_err);
-    try testing.expectEqual(null, try conn.read()); // close_notify
     peer_thread.join();
     try testing.expectEqual(null, peer.err);
-    try testing.expectEqualSlices(u8, payload, got);
+    try testing.expectEqualSlices(u8, data, got[0..data.len]);
+}
+
+test "a guard keeps a reader from resending what a parked writer is still sending" {
+    try guardParkedSender(.write_all);
+}
+
+test "a guard keeps a reader from resending what a parked flush, keyUpdate or close is sending" {
+    try guardParkedSender(.flush);
+    try guardParkedSender(.key_update);
+    try guardParkedSender(.close);
+}
+
+test "every send happens with the guard held, from every entry point" {
+    // Where a parked writer and the reader could meet is a send: each one
+    // goes through an output that counts the sends made without the guard.
+    // One thread, no timing: the handshake, `writeAll`, `writer()` turning
+    // records over (`renew`) and its `flush`, `keyUpdate`, a `read` that
+    // queues nothing and `close`.
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const g = try GuardRig.createWith(gpa, true);
+    defer g.destroy();
+    const a = try gpa.alloc(u8, 40 * 1024);
+    defer gpa.free(a);
+    for (a, 0..) |*b, i| b.* = @truncate(i *% 13 +% 5);
+    const got = try gpa.alloc(u8, 2 * a.len);
+    defer gpa.free(got);
+
+    var peer: GuardRig.Peer = .{ .rig = g, .mode = .read_then_send, .got = got };
+    var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+    defer peer_thread.join();
+    errdefer g.shutdown();
+
+    try g.conn.handshake();
+    try g.conn.writeAll(a);
+    const w = g.conn.writer();
+    try w.writeAll(a);
+    try w.flush();
+    try g.conn.keyUpdate(.update_not_requested);
+    try testing.expectEqualStrings("a", (try g.conn.read()).?);
+    try g.conn.close();
+    try testing.expectEqual(null, try g.conn.read());
+    peer_thread.join();
+    try testing.expectEqual(null, peer.err);
+    try testing.expectEqualSlices(u8, a, got[0..a.len]);
+    try testing.expectEqualSlices(u8, a, got[a.len..]);
+    try testing.expectEqual(@as(usize, 0), g.unguarded_sends);
+}
+
+test "what a writer left in an open record is sealed before the reader queues anything" {
+    // The reader waits for input with the guard released; a writer opens a
+    // record and leaves octets in it (no flush). The client's next record
+    // makes the server queue an alert — which must come after those octets,
+    // not over them (review of the guard, 2026-10-22).
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const g = try GuardRig.create(gpa);
+    defer g.destroy();
+    var got: [5]u8 = undefined;
+    var peer: GuardRig.Peer = .{ .rig = g, .mode = .junk_after_slot, .got = &got };
+    var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+    defer peer_thread.join();
+    errdefer g.shutdown();
+    try g.conn.handshake();
+
+    const Writer = struct {
+        fn run(rig: *GuardRig, err: *?anyerror) void {
+            // After the reader has parked in its read.
+            rig.threaded.io().sleep(.fromMilliseconds(100), .awake) catch {};
+            rig.conn.writer().writeAll("hello") catch |e| {
+                err.* = e;
+            };
+            rig.slot_open.store(true, .release);
+        }
+    };
+    var write_err: ?anyerror = null;
+    var writer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, Writer.run, .{ g, &write_err }) };
+    defer writer_thread.join();
+    errdefer g.shutdown();
+    try testing.expectError(error.BadRecordMac, g.conn.read());
+    writer_thread.join();
+    try testing.expectEqual(null, write_err);
+    peer_thread.join();
+    try testing.expectEqual(null, peer.err);
+    try testing.expectEqualStrings("hello", &got);
 }
