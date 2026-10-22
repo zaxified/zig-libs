@@ -114,6 +114,7 @@ const messages = @import("messages.zig");
 const burn = @import("burn.zig");
 const zeroize = @import("zeroize.zig").zeroize;
 const clientauth = @import("clientauth.zig");
+const fingerprint = @import("fingerprint.zig");
 const tlsresume = @import("tlsresume");
 
 const certverify = tls13.certverify;
@@ -258,6 +259,7 @@ pub const CertifiedKey = struct {
     /// What the handshake would refuse with `internal_error`, reported
     /// up front: call it when loading the certificate (a `select`
     /// callback's keys are checked again at every handshake).
+    /// secret-api-ok: tests whether `key` is null (the union holds pointers), never reads key bytes.
     pub fn check(self: *const CertifiedKey) CheckError!void {
         if (self.chain.len == 0 or self.chain.len > max_chain_len) return error.ChainLength;
         if ((self.key == null) == (self.offload == null)) return error.SigningKey;
@@ -478,6 +480,10 @@ pub const Config = struct {
     /// `s2n_connection_set_dynamic_record_threshold`; rustls has none).
     /// Null: every record up to `max_fragment_len`.
     dynamic_records: ?DynamicRecords = null,
+    /// Keep the JA4 fingerprint of the (first) ClientHello for `ja4()`
+    /// (`fingerprint.ja4`; a `CertificateSelector` can compute it itself, to
+    /// refuse a client before anything is sent).
+    ja4: bool = false,
 };
 
 /// Go's progression: record k (from 0) of a burst carries at most
@@ -1368,6 +1374,9 @@ pub const Server = struct {
     dyn_sent: u64 = 0,
     dyn_records: u32 = 0,
     dyn_last_ms: i64 = 0,
+    /// `Config.ja4`: the first ClientHello's fingerprint.
+    ja4_buf: [fingerprint.ja4_len]u8 = undefined,
+    has_ja4: bool = false,
 
     /// secret-api-ok: returns the initial state; every secret field is zero until `feed` runs a handshake step (under `burn.handshake_burn`).
     pub fn init(config: *const Config, joiner_buf: []u8, output_buf: []u8) Server {
@@ -1453,6 +1462,13 @@ pub const Server = struct {
     /// `SSL_used_hello_retry_request`).
     pub fn usedHelloRetryRequest(self: *const Server) bool {
         return self.retried;
+    }
+
+    /// The JA4 fingerprint of the client's first ClientHello (`Config.ja4`;
+    /// null without it, before a ClientHello, or for one with more than
+    /// `fingerprint.max_entries` suites or extensions).
+    pub fn ja4(self: *const Server) ?*const [fingerprint.ja4_len]u8 {
+        return if (self.has_ja4) &self.ja4_buf else null;
     }
 
     /// The client's RFC 8449 `record_size_limit`, if it sent one: the
@@ -2181,6 +2197,12 @@ pub const Server = struct {
         const record_limit: ?u16 = if (cfg.quic != null) null else ch.record_size_limit;
         if (retried and !std.meta.eql(record_limit, self.peer_record_limit)) return error.IllegalParameter;
         self.peer_record_limit = record_limit;
+        // JA4 of the first hello only (the one a client's software chose).
+        if (cfg.ja4 and !retried) {
+            // Out of line: its 2 KiB of sort buffers would deepen this frame
+            // and every secret-holding one below it (as `findShare`).
+            self.has_ja4 = if (@call(.never_inline, fingerprint.ja4, .{ &ch, if (cfg.quic != null) fingerprint.Transport.quic else .tcp, &self.ja4_buf })) true else |_| false;
+        }
         // The version first: a TLS 1.2 (or older) client gets
         // `protocol_version` whatever else its hello lacks (rustls order).
         // A legacy_version below TLS 1.0 (SSL 3.0, or not a version at all)
@@ -3369,6 +3391,28 @@ test "offloaded key: check, scheme choice and the output it needs" {
     try testing.expectEqual(error.HandshakeFailure, r.err);
     // RSA-PSS among the schemes: room for a 4096-bit signature.
     try testing.expect(minOutputLen(&cfg, &off) > minOutputLen(&cfg, testKey()) + 400);
+}
+
+test "Config.ja4: the first ClientHello's fingerprint is kept" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .ja4 = true };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    try testing.expectEqual(null, s.ja4());
+    const rec = try buildRecord(testing.allocator, .{ .sni = "example.com", .alpn = &.{"h2"} });
+    defer testing.allocator.free(rec);
+    _ = try s.feed(rec);
+    // One suite; supported_versions, signature_algorithms, supported_groups,
+    // key_share, server_name, ALPN.
+    try testing.expectEqualStrings("t13d0106h2_", s.ja4().?[0..11]);
+    var joiner2: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out2: [32 * 1024]u8 = undefined;
+    var off: Server = .init(&.{ .certificate = .{ .fixed = testKey() }, .random = prng.random() }, &joiner2, &out2);
+    defer off.deinit();
+    _ = try off.feed(rec);
+    try testing.expectEqual(null, off.ja4());
 }
 
 test "obsolete groups in supported_groups alone are served (JDK 11 lists them)" {

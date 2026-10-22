@@ -33,7 +33,8 @@ KMS or signing service, or a thread off the event loop (rustls has none; BoringS
 picotls do); 0-RTT on stateless tickets with a replay guard (rustls takes early data only with
 its stateful cache); SCT stapling (rustls dropped it); RFC 8449 `record_size_limit` for
 constrained clients (rustls and Go have none); dynamic record sizing with an idle reset (Go
-has it without the reset, s2n with it, rustls not). **Where we are behind:** a full (EC)DHE handshake with a
+has it without the reset, s2n with it, rustls not); the JA4 client fingerprint (s2n has it,
+rustls and Go not). **Where we are behind:** a full (EC)DHE handshake with a
 certificate works against OpenSSL 3.5's `s_client`, Go 1.26's crypto/tls client, the
 collection's `tlsclient` and Zig std's client, sans-I/O or through the
 blocking `Connection`, with its certificate and key loaded from openssl's PEM forms;
@@ -260,6 +261,20 @@ the first octets of a response from the first segment instead of waiting for 16 
 `Server.recordLen()` is the next record's length; `write` and `writeSlot` keep to it, and
 `Connection`'s writer seals records of that length. Off by default (a server tuned for bulk
 throughput would pay ~1.8 % more record overhead in the first 128 KiB).
+
+**JA4 fingerprint** (`fingerprint.ja4`, FoxIO's `technical_details/JA4.md`; JA4 is
+BSD-3-Clause, the other JA4+ methods are under the FoxIO License and are not implemented; s2n
+offers JA3/JA4, rustls only a `ClientHello` view). The 36-character `a_b_c` fingerprint of a
+parsed ClientHello: transport, version (highest `supported_versions`), SNI or not, suite and
+extension counts, ALPN's first and last character; SHA-256 prefixes of the sorted suites and of
+the sorted extensions (without SNI and ALPN) with the signature algorithms in order; GREASE left
+out everywhere. Allocation-free; a hello with more than 512 suites or extensions has none.
+`Config.ja4` keeps the first ClientHello's for `Server.ja4()`; a `CertificateSelector` can call
+`fingerprint.ja4` on the `ClientHello` it gets and refuse the client before anything is sent.
+`hello.ClientHello.extensions_raw` is the checked extension block. Anchored on the
+specification's worked example (`t13d1516h2_8daaf6152771_e5627efa2ab1`, its two hashes
+recomputed independently), with GREASE and shuffled order added. Backlog: a differential check
+against Wireshark's JA4 field (`tshark` is not installed here).
 
 **Offloaded signing** (BoringSSL `SSL_PRIVATE_KEY_METHOD`, s2n `s2n_async_pkey`, picotls
 `ptls_async_job_t`; rustls signs synchronously inside the handshake, `Signer::sign`). A

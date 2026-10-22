@@ -143,6 +143,9 @@ pub const ClientHello = struct {
     record_size_limit: ?u16 = null,
     /// The number of extensions, unknown ones included.
     extension_count: usize = 0,
+    /// The extensions block as sent (each `type ‖ length ‖ data`), checked:
+    /// for what reads every extension, known or not (`fingerprint.ja4`).
+    extensions_raw: []const u8 = "",
 
     pub fn cipherSuites(ch: *const ClientHello) U16Iter {
         return .{ .rest = ch.cipher_suites_raw };
@@ -279,6 +282,7 @@ pub fn parseClientHello(body: []const u8) Error!ClientHello {
 
     const exts = try r.vec(u16);
     try r.done();
+    ch.extensions_raw = exts;
     var er: Reader = .{ .buf = exts };
     var seen: std.StaticBitSet(1 << 16) = .empty;
     while (er.left() > 0) {

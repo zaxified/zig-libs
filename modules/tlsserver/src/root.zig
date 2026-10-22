@@ -46,6 +46,9 @@ pub const outbound = @import("outbound.zig");
 /// The ClientHello, decoded into slices with every extension checked.
 pub const hello = @import("hello.zig");
 
+/// JA4, the TLS client fingerprint of a ClientHello.
+pub const fingerprint = @import("fingerprint.zig");
+
 /// The handshake messages the server writes (ServerHello … Finished).
 pub const messages = @import("messages.zig");
 
@@ -112,6 +115,7 @@ test {
     _ = inbound;
     _ = outbound;
     _ = hello;
+    _ = fingerprint;
     _ = messages;
     _ = server;
     _ = clientauth;

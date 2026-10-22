@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-22** — **Added:** `fingerprint.ja4` — the JA4 TLS client fingerprint (BSD-3
+  spec by FoxIO; JA4+ not) of a parsed ClientHello, allocation-free; `Config.ja4` /
+  `Server.ja4()` keep the first hello's; `hello.ClientHello.extensions_raw`. Anchored on the
+  specification's worked example (hashes recomputed independently), GREASE and order ignored.
+
 - **2026-10-22** — **Added:** dynamic record sizing (`Config.dynamic_records`,
   `DynamicRecords`; Go's progression from one TCP segment, full records after 128 KiB, s2n's
   reset after idling) and `Server.recordLen`; `write`, `writeSlot` and `Connection`'s writer
