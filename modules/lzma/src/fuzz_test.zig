@@ -427,12 +427,14 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(gpa);
 
-    const pooled = getPool()[src.valueRangeAtMost(u8, 0, pool_len - 1)];
+    // First draw from a full-range u64: a ranged first draw returns its minimum for
+    // almost every --fuzz seed (check-fuzz-reach R1), pinning the pool entry to 0.
+    const pooled = getPool()[@intCast(src.value(u64) % pool_len)];
     const o = pooled.opts;
     var f = pooled.format;
     var fmt = formatFor(f, o);
 
-    const mode = src.valueRangeAtMost(u8, 0, 7);
+    const mode: u8 = @intCast(src.value(u64) % 8); // full range: a switch discriminant (check-fuzz-reach R2)
     switch (mode) {
         0 => {
             mark("mode_raw");
@@ -460,7 +462,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                 for (0..src.valueRangeAtMost(u8, 0, 3)) |_| {
                     if (stream.items.len <= first) break;
                     const room = stream.items.len - first;
-                    const at = first + @as(usize, src.valueRangeAtMost(u32, 0, @intCast(room - 1)));
+                    const at = first + @as(usize, @intCast(src.value(u64) % room));
                     switch (src.valueRangeAtMost(u8, 0, 3)) {
                         0 => stream.items[at] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
                         1 => stream.items[at] = src.value(u8),
@@ -504,7 +506,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
             fmt = formatFor(f, l2.opts);
             try stream.appendSlice(gpa, z);
             for (0..src.valueRangeAtMost(u8, 1, 3)) |_| {
-                const at = @as(usize, src.valueRangeAtMost(u32, 0, @intCast(@min(stream.items.len, 8) - 1)));
+                const at: usize = @intCast(src.value(u64) % @min(stream.items.len, 8));
                 stream.items[at] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7);
             }
         },
@@ -516,7 +518,8 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
 
 pub fn roundtripHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var data: [40_000]u8 = undefined;
-    const want_len: usize = switch (src.valueRangeAtMost(u8, 0, 7)) {
+    // Full-range first draw, see decodeHarness (check-fuzz-reach R1).
+    const want_len: usize = switch (src.value(u64) % 8) {
         0 => 0,
         1...5 => src.valueRangeAtMost(u16, 1, 3000),
         else => src.valueRangeAtMost(u16, 3000, 40_000),

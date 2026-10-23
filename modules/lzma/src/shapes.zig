@@ -115,15 +115,11 @@ pub fn fill(out: []u8, s: Shape) void {
         .random => rnd.bytes(out),
         .zeros => @memset(out, 0),
         .periodic => {
-            const seedbuf = std.heap.page_allocator.alloc(u8, s.param) catch unreachable;
-            defer std.heap.page_allocator.free(seedbuf);
-            for (seedbuf) |*b| b.* = 'a' + rnd.uintLessThan(u8, 26);
-            var i: usize = 0;
-            for (out) |*b| {
-                b.* = seedbuf[i];
-                i += 1;
-                if (i == seedbuf.len) i = 0;
-            }
+            // The seed text is the output's own first `param` bytes (the same
+            // draws in the same order as a separate seed buffer), then repeated.
+            const p = @min(@as(usize, s.param), out.len);
+            for (out[0..p]) |*b| b.* = 'a' + rnd.uintLessThan(u8, 26);
+            for (out[p..], p..) |*b, i| b.* = out[i - p];
         },
         .runs => {
             var i: usize = 0;

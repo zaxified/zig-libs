@@ -172,6 +172,10 @@ pub fn validPrefix(s: []const u8) usize {
 }
 
 inline fn scan(s: []const u8, dst: ?[]u8) usize {
+    // Every inline loop below (lookup16Portable's select tree above all, on a
+    // target without AVX2) charges this one function's branch quota; the
+    // x86_64-windows baseline build ran past the default 1000.
+    @setEvalBranchQuota(10_000);
     var prev: V = @splat(0);
     var pending: V = @splat(0);
     var i: usize = 0;

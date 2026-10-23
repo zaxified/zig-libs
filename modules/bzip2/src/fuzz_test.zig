@@ -260,14 +260,16 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(gpa);
 
-    const mode = src.valueRangeAtMost(u8, 0, 5);
+    // First draw from a full-range u64: a ranged first draw returns its minimum for
+    // almost every --fuzz seed (check-fuzz-reach R1), pinning the mode to 0.
+    const mode: u8 = @intCast(src.value(u64) % 6);
     switch (mode) {
         0 => {
             mark("mode_raw");
             var raw: [300]u8 = undefined;
-            const n = src.slice(&raw);
-            if (n >= 4 and src.valueRangeAtMost(u8, 0, 1) == 0) @memcpy(raw[0..3], "BZh");
-            try stream.appendSlice(gpa, raw[0..n]);
+            const raw_len = src.slice(&raw);
+            if (raw_len >= 4 and src.valueRangeAtMost(u8, 0, 1) == 0) @memcpy(raw[0..3], "BZh");
+            try stream.appendSlice(gpa, raw[0..raw_len]);
         },
         1, 2, 5 => {
             const n = drawStructured(S, src, data[0..@as(usize, src.valueRangeAtMost(u16, 0, 3000))]);
@@ -290,7 +292,7 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
                 for (0..src.valueRangeAtMost(u8, 0, 3)) |_| {
                     if (stream.items.len <= first) break;
                     const room = stream.items.len - first;
-                    const at = first + @as(usize, src.valueRangeAtMost(u32, 0, @intCast(room - 1)));
+                    const at = first + @as(usize, @intCast(src.value(u64) % room));
                     switch (src.valueRangeAtMost(u8, 0, 3)) {
                         0 => stream.items[at] ^= @as(u8, 1) << src.valueRangeAtMost(u3, 0, 7),
                         1 => stream.items[at] = src.value(u8),
@@ -322,7 +324,8 @@ pub fn decodeHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror
 
 pub fn roundtripHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var data: [30_000]u8 = undefined;
-    const want_len: usize = switch (src.valueRangeAtMost(u8, 0, 7)) {
+    // Full-range first draw, see decodeHarness (check-fuzz-reach R1).
+    const want_len: usize = switch (src.value(u64) % 8) {
         0 => 0,
         1...5 => src.valueRangeAtMost(u16, 1, 2000),
         6 => src.valueRangeAtMost(u16, 9990, 10_010),

@@ -76,3 +76,5 @@ modules/webhooksig/src/root.zig	2	4
 modules/wireguard/src/handshake.zig	4	11
 # wireguard 2026-10-18: keyFromBase64Body's re-encode check moved to timing_safe.eql over the key text (b64ct decode); the 7 plain compares are a peer public-key match (peer merge) and the fuzz harness's round-trip checks (test-only, over its own fixture keys).
 modules/wireguard/src/root.zig	1	7
+# zipstream 2026-10-23: AesReader compares the WinZip AE password verifier and the HMAC-SHA1 auth code with timing_safe.eql.
+modules/zipstream/src/crypto.zig	2	0

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — Fix: `decodeUtf8`/`validPrefix` failed to compile for a target without AVX2 in an optimized mode (x86_64-windows baseline, `ReleaseSmall`: "evaluation exceeded 1000 backwards branches" in the portable lookup tree); `scan` raises its branch quota.
 - **2026-10-20** — CJK speed: inline two-byte fast paths in the Shift_JIS/EUC-KR/gb18030/GBK/Big5/ISO-2022-JP decoders, two-level code-point maps in the encoders (+49–73 KB per encoding family, only when referenced). Bench vs encoding_rs 0.09–1.10× over all 25 rows.
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** bench rows for the CJK encodings (decode/encode Shift_JIS, EUC-KR, gb18030, Big5, ISO-2022-JP; streaming Shift_JIS) — tools only.
 - **2026-10-20** — `encoding.cjk`: Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR, gb18030, GBK, Big5 (WHATWG,
