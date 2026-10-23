@@ -65,7 +65,9 @@ try diag.writeJson(w); // [{"path":…,"file":…,"line":3,…,"severity":"warni
 `Diagnostic.file` names the source a finding is in. `line`/`col` are 1-based
 (`col` in bytes), `end_line`/`end_col` end the span exclusively, as in LSP.
 The renderer escapes control characters in everything it prints (a key name
-carrying an ANSI escape sequence reaches the terminal as `\x1b`), so a
+carrying an ANSI escape sequence reaches the terminal as `\x1b`; C1 controls,
+U+2028/U+2029 and the bidirectional controls U+202A–U+202E/U+2066–U+2069 of
+"Trojan Source" as `\u{NNNN}`, a byte that is not UTF-8 as `\xNN`), so a
 `short` finding is always one line. Carets line up across tabs, multi-byte
 UTF-8 and display widths (see "Width, charset, terminal width" below).
 
@@ -153,8 +155,8 @@ combining marks, ZWJ and variation selectors none, ambiguous characters one.
 `Diagnostic.col` stays a byte column; `RenderOptions.column = .char` only
 changes what the `-->` line prints (the character column; `short` always prints
 the column as given). Lines end at `\n` (`\r\n` too); a lone `\r`, any
-control character (C0 and C1), U+2028/U+2029 and an invalid UTF-8 byte are
-shown as `?` so no terminal escape can come out of a quoted line, and a BOM is
+control character (C0 and C1), U+2028/U+2029, a bidirectional control
+(U+202A–U+202E, U+2066–U+2069) and an invalid UTF-8 byte are shown as `?` so no terminal escape can come out of a quoted line, and a BOM is
 not written. With `term_width` the lines of a file are cut by one window chosen
 around its spans (the algorithm of annotate-snippets 0.12), `...` marks a cut
 end, and the carets keep their characters; labels may still run past the width.

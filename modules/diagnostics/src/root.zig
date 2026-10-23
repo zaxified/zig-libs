@@ -341,8 +341,8 @@ fn digits(n: u32) usize {
 /// `tab_width` and carets line up for multi-byte UTF-8 by display width
 /// (`charWidth`: East Asian wide and emoji are two columns, combining marks and
 /// zero-width characters none). Lines end at `\n` (a `\r` before it is part of
-/// the break); a lone `\r`, a C0/C1 control, U+2028/U+2029 and an invalid
-/// byte are shown as `?`; a U+FEFF is not written.
+/// the break); a lone `\r`, a C0/C1 control, U+2028/U+2029, a bidirectional
+/// control and an invalid byte are shown as `?`; a U+FEFF is not written.
 pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.Writer.Error!void {
     const c: Sgr = .{ .on = opts.color };
     switch (opts.style) {
@@ -490,10 +490,16 @@ pub fn charWidth(cp: u21) u2 {
 }
 
 /// Characters the quoted source shows as `?`: C0/C1 controls (a C1 control such
-/// as U+009B is a terminal escape in some terminals), DEL, and the line and
-/// paragraph separators U+2028/U+2029.
+/// as U+009B is a terminal escape in some terminals), DEL, the line and
+/// paragraph separators U+2028/U+2029, and the bidirectional embedding,
+/// override and isolate controls U+202A–U+202E and U+2066–U+2069 ("Trojan
+/// Source", CVE-2021-42574: they reorder what a terminal shows; rustc and
+/// annotate-snippets replace the same set).
 fn isShownAsQuestion(cp: u21) bool {
-    return cp < 0x20 or (cp >= 0x7f and cp < 0xa0) or cp == 0x2028 or cp == 0x2029;
+    return switch (cp) {
+        0...0x1f, 0x7f...0x9f, 0x2028, 0x2029, 0x202a...0x202e, 0x2066...0x2069 => true,
+        else => false,
+    };
 }
 
 /// The columns a character takes in the quoted source (`?` for what
@@ -1445,10 +1451,38 @@ fn writeLocation(w: *std.Io.Writer, d: Span) std.Io.Writer.Error!bool {
     return any;
 }
 
+/// Finding text with every character `isShownAsQuestion` written as an escape:
+/// `\n` `\r` `\t`, `\xNN` for another C0 control, DEL and a byte that is not
+/// valid UTF-8 (a lone 0x9B is an 8-bit CSI to a Latin-1 terminal), `\u{NNNN}`
+/// for a C1 control, U+2028/U+2029 and a bidirectional control.
 fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     var start: usize = 0;
-    for (s, 0..) |c, i| {
-        if (c >= 0x20 and c != 0x7f) continue;
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c >= 0x20 and c < 0x7f) {
+            i += 1;
+            continue;
+        }
+        if (c >= 0x80) {
+            const n = std.unicode.utf8ByteSequenceLength(c) catch 0;
+            const cp: ?u21 = if (n != 0 and i + n <= s.len) std.unicode.utf8Decode(s[i..][0..n]) catch null else null;
+            if (cp) |v| {
+                if (!isShownAsQuestion(v)) {
+                    i += n;
+                    continue;
+                }
+                try w.writeAll(s[start..i]);
+                try w.print("\\u{{{x:0>4}}}", .{v});
+                i += n;
+            } else {
+                try w.writeAll(s[start..i]);
+                try w.print("\\x{x:0>2}", .{c});
+                i += 1;
+            }
+            start = i;
+            continue;
+        }
         try w.writeAll(s[start..i]);
         switch (c) {
             '\n' => try w.writeAll("\\n"),
@@ -1456,7 +1490,8 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
             '\t' => try w.writeAll("\\t"),
             else => try w.print("\\x{x:0>2}", .{c}),
         }
-        start = i + 1;
+        i += 1;
+        start = i;
     }
     try w.writeAll(s[start..]);
 }
@@ -2410,4 +2445,27 @@ test "snippet: Unicode whitespace before a multi-line span's start gives the cor
     const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 4, .end_line = 2, .end_col = 3, .severity = .@"error", .code = "", .message = "m", .span_message = "here" };
     const out = try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = "\u{3000}ab\ncd\n" }}, .column = .char });
     try testing.expectEqualStrings("error: m\n  --> f:1:2\n  |  \n1 | / \u{3000}ab\n2 | | cd\n  | \\--^ here\n\n", out);
+}
+
+test "escaping: bidi controls, C1 controls and invalid bytes never reach the terminal" {
+    // Trojan Source (CVE-2021-42574): U+202E in a key name reorders what the
+    // terminal shows. codespan-reporting 0.13.1 writes it, ESC and BEL raw
+    // (tools/interop.zig's oracle on the same input); rustc/annotate-snippets
+    // replace the bidi set; so do we, in finding text and in the quoted line.
+    var buf: [1024]u8 = undefined;
+    const hostile = "k\u{202e}ey\u{2066}\u{9b}2J\xff\u{2028}x";
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 2, .end_line = 1, .end_col = 5, .severity = .@"error", .code = "", .message = hostile, .span_message = hostile, .notes = &.{.{ .message = hostile }} };
+    for ([_]bool{ false, true }) |color| {
+        for ([_]RenderStyle{ .short, .snippet }) |style| {
+            const out = try renderToString(&buf, d, .{ .style = style, .color = color, .sources = &.{.{ .file = "f", .text = hostile ++ "\n" }} });
+            for ([_][]const u8{ "\u{202e}", "\u{2066}", "\u{9b}", "\xff", "\u{2028}" }) |bad|
+                try testing.expect(std.mem.find(u8, out, bad) == null);
+            if (style == .short) {
+                try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+                try testing.expect(std.mem.find(u8, out, "k\\u{202e}ey\\u{2066}\\u{009b}2J\\xff\\u{2028}x") != null);
+            } else try testing.expect(std.mem.find(u8, out, "1 | k?ey?\u{9b}") == null);
+        }
+    }
+    const snip = try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = hostile ++ "\n" }} });
+    try testing.expect(std.mem.find(u8, snip, "1 | k?ey??2J??x\n") != null);
 }

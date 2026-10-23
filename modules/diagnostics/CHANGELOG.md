@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **SECURITY (terminal output, LOW–MED):** the bidirectional controls U+202A–U+202E and
+  U+2066–U+2069 ("Trojan Source", CVE-2021-42574) went to the terminal unchanged, in the quoted line and in
+  finding text, and finding text also passed C1 controls (U+0080–U+009F), U+2028/U+2029 and bytes that are
+  not UTF-8 (a lone 0x9B is an 8-bit CSI). The quoted line now shows them as `?`; finding text writes
+  `\u{NNNN}` / `\xNN`. codespan-reporting 0.13.1 writes all of these raw (probe through the interop
+  oracle); rustc/annotate-snippets replace the bidi set.
+
 - **2026-10-23** — **FIX:** a multi-line span starting after Unicode whitespace other than space/tab
   (U+3000, U+00A0, U+2000–U+200A …) was drawn with a `/----^` top row instead of the corner at the line
   start; `leadingSpace` now counts Unicode White_Space as codespan's `str::trim_start` does. Found by the
