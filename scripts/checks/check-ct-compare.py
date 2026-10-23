@@ -185,11 +185,44 @@ HEADER = """\
 """
 
 
+def read_notes():
+    """{path: [comment lines]} -- the dated `#` notes written above a row.
+
+    They are the only record of WHY a count moved, so `--update` must carry
+    them over; the first version rewrote the file from HEADER and silently
+    dropped all of them (noticed 2026-10-23 pinning zipstream).
+    """
+    notes, pending, in_header = {}, [], True
+    if not os.path.exists(PIN):
+        return notes
+    with open(PIN, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                if not in_header:
+                    pending.append(line)
+                continue
+            if not line:
+                continue
+            in_header = False
+            notes[line.split("\t")[0]] = pending
+            pending = []
+    return notes
+
+
 def write_pin(rows):
+    notes = read_notes()
+    for path in sorted(set(notes) - set(rows)):
+        if notes[path]:
+            print(f"check-ct-compare: {path} is gone; its note is dropped:", file=sys.stderr)
+            for line in notes[path]:
+                print(f"  {line}", file=sys.stderr)
     with open(PIN, "w", encoding="utf-8") as fh:
         fh.write(HEADER)
         for path in sorted(rows):
             ct, plain = rows[path]
+            for line in notes.get(path, []):
+                fh.write(line + "\n")
             fh.write(f"{path}\t{ct}\t{plain}\n")
 
 
