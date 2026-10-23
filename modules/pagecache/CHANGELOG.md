@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — Fixes: a truncating `open` whose bookkeeping failed (OOM) left other handles serving pre-truncation pages as hits — the pages now go before anything can fail; a write landing during a parked `truncate` past the old end could stay cached (the narrow drop now falls back to the sweep when the epoch moved); `max_pages * page_size` overflow panics by name instead of wrapping into a tiny budget in ReleaseFast. Added: `Storage.allocate` is forwarded to the inner backend. Docs: `Stats.resident_pages` bound includes borrowed pages; `deinit` needs every borrow released. Close/delete of a large resident file is no longer quadratic (ramcache `removeMatching`). Audit A1 (37/42, 5 eq).
+
 - **2026-10-19** — **Fix:** read-ahead inserted the REQUESTED page unconditionally after its parked inner `pread`, so a write to that very page that landed meanwhile (fiber-reentrant caller) was overwritten in the cache by the older bytes and served as a stale hit. The write-epoch guard now covers the requested page like the prefetched extras (the 2026-09-29 test only wrote an extra page).
 
 - **2026-10-18** — Ported to Zig 0.17.0 (test-only: `std.meta.fields` -> `@typeInfo(..).field_names`).

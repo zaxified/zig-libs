@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — Performance: `removeMatching` collects up to 512 matches per scan of the map and removes them, instead of re-scanning after every removal — `ceil(matches / 512)` scans, was one per match (a 1 GiB fully resident `pagecache` file close was ~10^10 steps). Same result, still allocation-free and infallible.
+
 - **2026-10-18** — Ported to Zig 0.17.0. Tests iterate `Stats` `field_names` (0.17 `@typeInfo`).
 - **2026-10-11** — Performance (layout only, behaviour unchanged): an entry lives in its node, with its key bytes in the same allocation, and the map holds only `*Node` (Caffeine's node-in-map shape) — a lookup is three dependent loads on three memory pages instead of five (metadata, key slot, separate key copy, value slot, node), one allocation fewer per insert. `release` files the node under a deadline stashed at `pin` instead of looking its key up again. Bench vs otter v2.3.0: get hit 0.81×, worst row get miss 1.07× (was 1.10×). Added `Cache.markCleanIf` (what `Sharded.markCleanIf` did under the shard lock, now available on `Cache` too).
 

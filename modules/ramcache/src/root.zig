@@ -873,28 +873,37 @@ pub const Cache = struct {
     /// to decouple RAM from; this walks the resident set instead, which is
     /// bounded by `max_pages` by construction.
     ///
-    /// Allocation-free, and therefore infallible: it re-scans from the start
-    /// after each removal rather than buffering the matches, since removing
-    /// invalidates the map iterator. That is quadratic in the number of
-    /// matches within a set already bounded by the cache's own capacity, on a
-    /// path that runs once per file close.
+    /// Allocation-free, and therefore infallible: removing invalidates the
+    /// map iterator, so one scan collects up to `remove_batch` matches into a
+    /// stack buffer, then removes them, and scans again only while a scan
+    /// filled the buffer. Until 2026-10-23 it re-scanned after EVERY removal:
+    /// quadratic in the matches, ~10^10 steps for one file close over a
+    /// 1 GiB fully resident `pagecache`; now `ceil(matches / remove_batch)`
+    /// scans.
     pub fn removeMatching(self: *Cache, prefix: []const u8) usize {
         var removed: usize = 0;
-        outer: while (true) {
+        var batch: [remove_batch][]const u8 = undefined;
+        while (true) {
+            var n: usize = 0;
             var it = self.map.keyIterator();
             while (it.next()) |np| {
                 const k = np.*.key;
                 if (k.len < prefix.len) continue;
                 if (!std.mem.eql(u8, k[0..prefix.len], prefix)) continue;
-                // `dropKey` frees this very slice; nothing reads it after.
-                _ = self.dropKey(k);
-                removed += 1;
-                continue :outer;
+                batch[n] = k;
+                n += 1;
+                if (n == batch.len) break;
             }
-            break;
+            // Each slice is its own node's key: dropping one frees only that
+            // one, so the rest of the batch stays valid.
+            for (batch[0..n]) |k| _ = self.dropKey(k);
+            removed += n;
+            if (n < batch.len) break;
         }
         return removed;
     }
+
+    const remove_batch = 512;
 
     // ── borrow seam: zero-copy reads out of cache storage ───────────────────
     //
@@ -2635,6 +2644,24 @@ test "removeMatching removes exactly the prefix, and nothing else" {
     // Idempotent, and an empty prefix is the whole cache.
     try testing.expectEqual(@as(usize, 0), c.removeMatching("\x01\x00"));
     try testing.expectEqual(@as(usize, 2), c.removeMatching(""));
+}
+
+test "removeMatching: match counts on and past the batch size are all removed, the rest kept" {
+    const rb = Cache.remove_batch;
+    for ([_]usize{ rb - 1, rb, rb + 1, 2 * rb + 7 }) |m| {
+        var c = Cache.init(testing.allocator, .{ .max_bytes = 1 << 22, .max_entries = 4096 });
+        defer c.deinit();
+        var key: [5]u8 = undefined;
+        for (0..m + 100) |i| {
+            key[0] = if (i < m) 'a' else 'b';
+            std.mem.writeInt(u32, key[1..5], @intCast(i), .little);
+            c.put(&key, "v", 0, 0, 0);
+        }
+        try testing.expectEqual(m + 100, c.map.count());
+        try testing.expectEqual(m, c.removeMatching("a"));
+        try testing.expectEqual(@as(usize, 100), c.map.count());
+        try testing.expectEqual(@as(usize, 0), c.removeMatching("a"));
+    }
 }
 
 test "borrow: a reserve that fails leaves the caller's existing entry alone" {

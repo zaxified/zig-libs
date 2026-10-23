@@ -142,7 +142,8 @@ pub const Stats = struct {
     hits: u64,
     /// Page-aligned reads that had to fall through to the inner Storage.
     misses: u64,
-    /// Currently resident pages (always `<= max_pages`).
+    /// Currently resident pages: `<= max_pages + borrowed_pages` (a borrowed
+    /// page is resident and unevictable; with none outstanding, `<= max_pages`).
     resident_pages: usize,
     /// Currently resident value bytes (`<= max_pages * page_size`).
     resident_bytes: usize,
@@ -221,11 +222,15 @@ pub const PageCache = struct {
         // it even returns. `page_size == 0` is the same shape one modulo away.
         if (options.page_size == 0) std.debug.panic("pagecache: page_size must be > 0", .{});
         if (options.max_pages == 0) std.debug.panic("pagecache: max_pages must be > 0", .{});
+        // Checked: wrapped in ReleaseFast, the byte budget came out small and
+        // the cache refused every page without a word.
+        const max_bytes = std.math.mul(usize, options.max_pages, options.page_size) catch
+            std.debug.panic("pagecache: max_pages * page_size overflows usize", .{});
         return .{
             .inner = inner,
             .cache = ramcache.Cache.init(gpa, .{
                 .max_entries = options.max_pages,
-                .max_bytes = options.max_pages * options.page_size,
+                .max_bytes = max_bytes,
             }),
             .page_size = options.page_size,
             .page_shift = if (std.math.isPowerOfTwo(options.page_size)) std.math.log2_int(u64, options.page_size) else null,
@@ -235,6 +240,8 @@ pub const PageCache = struct {
         };
     }
 
+    /// Every `preadRef` borrow must be released first: a borrowed page's
+    /// bytes belong to the borrower until `releasePage`.
     pub fn deinit(self: *PageCache) void {
         for (self.files.items) |f| if (f.path) |p| self.gpa.free(p);
         self.files.deinit(self.gpa);
@@ -419,7 +426,7 @@ pub const PageCache = struct {
             const first = len / self.page_size;
             const end = os / self.page_size + @intFromBool(os % self.page_size != 0);
             if (end <= first) return; // grew or unchanged: no resident page lies past the old end
-            if (end - first <= 4 * self.max_pages) {
+            if (end - first <= 4 *| self.max_pages) {
                 var i = first;
                 while (i < end) : (i += 1) {
                     const key = pageKey(file, i);
@@ -498,11 +505,20 @@ pub const PageCache = struct {
         .preadRef = vPreadRef,
         .releaseRef = vReleaseRef,
         .list = vList,
+        .allocate = vAllocate,
     };
 
     fn vOpen(ctx: *anyopaque, path: []const u8, mode: Storage.OpenMode) Storage.Error!Storage.Handle {
         const self = cast(ctx);
         const h = try self.inner.open(path, mode);
+        // A truncating open has emptied the file on media already: its pages
+        // under other open handles go NOW, before anything below can fail.
+        // Until 2026-10-23 they went at the end, so an allocation failure in
+        // between left those handles serving pre-truncation bytes as hits.
+        if (mode == .create_truncate) if (self.findByPath(path)) |i| {
+            self.epoch +%= 1;
+            self.dropFile(self.files.items[i].id);
+        };
         // Everything below runs without yielding to another fiber, so the
         // tables cannot change between the lookup and the update.
         errdefer self.inner.close(h);
@@ -525,14 +541,9 @@ pub const PageCache = struct {
             self.files.appendAssumeCapacity(.{ .id = fid, .path = fresh_path, .refs = 1 });
         }
         self.handle_file.putAssumeCapacity(h, fid);
-        // A truncating open discards the file's contents: pages cached for it
-        // under OTHER open handles on the same path would go stale. They share
-        // this file id, so dropping exactly that file's pages is enough.
-        if (mode == .create_truncate) {
-            self.epoch +%= 1;
-            self.dropFile(fid);
-            self.forgetAccess(h);
-        }
+        // (A truncating open's pages went above, before anything could fail;
+        // a file new to the table has none.)
+        if (mode == .create_truncate) self.forgetAccess(h);
         return h;
     }
 
@@ -666,12 +677,17 @@ pub const PageCache = struct {
         // truncate because afterwards it is gone.
         const old_size: ?u64 = self.inner.size(h) catch null;
         self.epoch +%= 1;
+        const during = self.epoch;
         const result = self.inner.truncate(h, len);
+        // A write that landed while the truncate was parked may have cached a
+        // page past `old_size`, which the narrow span would miss: then sweep.
+        const raced = self.epoch != during;
         self.epoch +%= 1;
         // Also on failure: a failed truncate leaves the media state unknown,
         // and "absent" is the only honest answer (see `vWriteAll`).
         if (self.fileOf(h)) |fid| {
-            self.dropFrom(fid, len, old_size, if (result) |_| true else |_| false);
+            const ok = if (result) |_| true else |_| false;
+            self.dropFrom(fid, len, old_size, ok and !raced);
         }
         self.forgetAccess(h);
         return result;
@@ -734,6 +750,13 @@ pub const PageCache = struct {
             self.dropFile(self.files.items[i].id);
             self.orphan(i);
         }
+    }
+
+    /// Forwarded: preallocation only adds zeros past the end, and no page
+    /// past the end is ever resident (a partial page is never cached), so
+    /// nothing to invalidate. A backend that cannot preallocate answers false.
+    fn vAllocate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
+        return cast(ctx).inner.allocate(h, len);
     }
 
     fn vSyncDir(ctx: *anyopaque) Storage.Error!void {
@@ -2318,8 +2341,17 @@ const CountingStorage = struct {
     inner: Storage,
     preads: usize = 0,
     fail_next_pread: bool = false,
+    /// The next `pread` returns at most this many bytes (a file that shrank
+    /// between `size` and `pread`).
+    short_next_pread: ?usize = null,
     hook: ?*const fn (*CountingStorage) void = null,
     hook_pc: ?*PageCache = null,
+    /// Run once inside `truncate`, before the inner truncate.
+    truncate_hook: ?*const fn (*CountingStorage) void = null,
+    syncs: usize = 0,
+    sync_datas: usize = 0,
+    shared_locks: usize = 0,
+    allocates: usize = 0,
 
     fn cast(ctx: *anyopaque) *CountingStorage {
         return @ptrCast(@alignCast(ctx));
@@ -2337,7 +2369,9 @@ const CountingStorage = struct {
             self.fail_next_pread = false;
             return error.NoSpaceLeft;
         }
-        const n = try self.inner.pread(h, buf, off);
+        const lim = if (self.short_next_pread) |m| @min(m, buf.len) else buf.len;
+        self.short_next_pread = null;
+        const n = try self.inner.pread(h, buf[0..lim], off);
         if (self.hook) |f| {
             self.hook = null; // once
             f(self);
@@ -2348,10 +2382,28 @@ const CountingStorage = struct {
         return cast(ctx).inner.writeAll(h, bytes, off);
     }
     fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        cast(ctx).syncs += 1;
         return cast(ctx).inner.sync(h);
     }
+    fn vSyncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+        cast(ctx).sync_datas += 1;
+        return cast(ctx).inner.syncData(h);
+    }
+    fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
+        cast(ctx).shared_locks += 1;
+        return cast(ctx).inner.tryLockShared(h);
+    }
+    fn vAllocate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
+        cast(ctx).allocates += 1;
+        return cast(ctx).inner.allocate(h, len);
+    }
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
-        return cast(ctx).inner.truncate(h, len);
+        const self = cast(ctx);
+        if (self.truncate_hook) |f| {
+            self.truncate_hook = null; // once
+            f(self);
+        }
+        return self.inner.truncate(h, len);
     }
     fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
         cast(ctx).inner.close(h);
@@ -2380,6 +2432,9 @@ const CountingStorage = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLock,
+        .syncData = vSyncData,
+        .tryLockShared = vTryLockShared,
+        .allocate = vAllocate,
     };
     fn storage(self: *CountingStorage) Storage {
         return .{ .ctx = self, .vtable = &vtable };
@@ -2711,6 +2766,236 @@ test "a write landing during a plain miss's inner read is not overwritten by the
     _ = try st.pread(h, &buf, 3 * default_page_size);
     for (buf) |x| try testing.expectEqual(@as(u8, 0xEE), x);
     try testing.expectEqual(reads, cs.preads); // and served from the cache, not re-read
+}
+
+// ── review + mutation additions (2026-10-23) ────────────────────────────────
+
+fn truncatingOpenDuringRead(cs: *CountingStorage) void {
+    // A "second fiber" truncates the file by reopening it while the first is
+    // parked in its inner pread (which already holds the old bytes).
+    const st = cs.hook_pc.?.storage();
+    const h2 = st.open("f", .create_truncate) catch unreachable;
+    st.close(h2);
+}
+
+test "a truncating open landing during a parked read is never overtaken by the older bytes" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 2, 1);
+    pc.cache.clear();
+    cs.hook = truncatingOpenDuringRead;
+    cs.hook_pc = &pc;
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0); // parked; the file is emptied meanwhile
+    try testing.expectEqual(@as(usize, 0), try st.pread(h, &buf, 0)); // EOF, not a stale hit
+}
+
+fn closeDuringRead(cs: *CountingStorage) void {
+    cs.hook_pc.?.storage().close(0);
+}
+
+test "a read whose handle is closed while it is parked leaves no orphan page behind" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try testing.expectEqual(@as(Storage.Handle, 0), h);
+    try fillFile(gpa, st, h, 1, 1);
+    pc.cache.clear();
+    cs.hook = closeDuringRead;
+    cs.hook_pc = &pc;
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    // The file is gone from the table: a page put under its id now would sit
+    // in the budget, unreachable, until evicted.
+    try testing.expectEqual(@as(usize, 0), pc.stats().resident_pages);
+}
+
+test "truncate forgets the handle's read sequence: the next read does not read ahead" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 4 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    try st.truncate(h, 8 * default_page_size); // same length: only the sequence is reset
+    _ = try st.pread(h, &buf, default_page_size);
+    try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+}
+
+test "read-ahead: a read shorter than one page (the file shrank meanwhile) falls back, a short tail caches nothing extra" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16, .read_ahead_pages = 4 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 8, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    cs.short_next_pread = 10; // the read-ahead's pread returns 10 bytes
+    try testing.expectEqual(@as(usize, default_page_size), try st.pread(h, &buf, default_page_size));
+    for (buf) |x| try testing.expectEqual(@as(u8, 2), x); // the fallback's bytes, whole
+    try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+
+    // A read-ahead whose pread returns exactly one page caches no extra page.
+    pc.cache.clear();
+    _ = try st.pread(h, &buf, 3 * default_page_size);
+    cs.short_next_pread = default_page_size;
+    _ = try st.pread(h, &buf, 4 * default_page_size);
+    try testing.expectEqual(@as(u64, 0), pc.stats().readahead_pages);
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages); // pages 3 and 4
+}
+
+test "read-ahead: never more extra pages per read than the budget leaves" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 2, .read_ahead_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 12, 1);
+    pc.cache.clear();
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    _ = try st.pread(h, &buf, default_page_size);
+    try testing.expectEqual(@as(u64, 1), pc.stats().readahead_pages); // max_pages - 1
+}
+
+test "a failed sub-page write drops the file's pages: a torn page is never masked" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var fault = FaultStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, fault.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 2, 0x11);
+    fault.fail_write_index = fault.writes;
+    fault.torn_prefix = 3;
+    try testing.expectError(error.NoSpaceLeft, st.writeAll(h, "ZZZZZ", 100));
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, 0);
+    try testing.expectEqualStrings("ZZZ", buf[100..103]); // media, torn
+    try testing.expectEqual(@as(u8, 0x11), buf[103]);
+}
+
+test "a handle number the backend recycles without a close releases the stale file" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const a = try st.open("a", .create_truncate);
+    sim.storage().close(a); // behind the cache's back
+    const b = try st.open("b", .create_truncate);
+    try testing.expectEqual(a, b); // the backend recycled the number
+    try testing.expectEqual(@as(usize, 1), pc.files.items.len); // "a" released, not leaked
+    st.close(b);
+}
+
+test "a fresh file id never reuses a live one (after the counter wraps)" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const a = try st.open("a", .create_truncate);
+    try fillFile(gpa, st, a, 1, 0xAA);
+    pc.next_id = pc.handle_file.get(a).?; // as if 2^32 opens later
+    const b = try st.open("b", .create_truncate);
+    try testing.expect(pc.handle_file.get(a).? != pc.handle_file.get(b).?);
+    var buf: [default_page_size]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try st.pread(b, &buf, 0)); // not a's page
+}
+
+test "syncData, tryLockShared and allocate reach the inner Storage as themselves" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try st.syncData(h);
+    try testing.expectEqual(@as(usize, 1), cs.sync_datas);
+    try testing.expectEqual(@as(usize, 0), cs.syncs);
+    _ = try st.tryLockShared(h);
+    try testing.expectEqual(@as(usize, 1), cs.shared_locks);
+    _ = try st.allocate(h, 4 * default_page_size);
+    try testing.expectEqual(@as(usize, 1), cs.allocates);
+}
+
+test "a truncating open that fails after the backend emptied the file leaves no stale page under the other handles" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    var pc = PageCache.init(failing.allocator(), sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const a = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, a, 1, 0x5A);
+    // Fill the handle table to its capacity, so the next open must grow it.
+    var extra: [64]Storage.Handle = undefined;
+    var n: usize = 0;
+    while (pc.handle_file.available != 0) : (n += 1) extra[n] = try st.open("other", .create_truncate);
+    failing.fail_index = failing.alloc_index; // the growth fails
+    try testing.expectError(error.OutOfMemory, st.open("f", .create_truncate));
+    var buf: [default_page_size]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try st.pread(a, &buf, 0)); // emptied on media: EOF
+    for (extra[0..n]) |x| st.close(x);
+}
+
+fn writePastEndDuringTruncate(cs: *CountingStorage) void {
+    var page: [default_page_size]u8 = undefined;
+    @memset(&page, 0xCD);
+    cs.hook_pc.?.storage().writeAll(0, &page, 5 * default_page_size) catch unreachable;
+}
+
+test "a write that lands during a parked truncate past the old end is not left cached" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var cs = CountingStorage{ .inner = sim.storage() };
+    var pc = PageCache.init(gpa, cs.storage(), .{ .max_pages = 16 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try testing.expectEqual(@as(Storage.Handle, 0), h);
+    try fillFile(gpa, st, h, 2, 1); // old size: 2 pages
+    cs.truncate_hook = writePastEndDuringTruncate; // page 5, then the cut to 0
+    cs.hook_pc = &pc;
+    try st.truncate(h, 0);
+    var buf: [default_page_size]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), try st.pread(h, &buf, 5 * default_page_size));
 }
 
 test "read-ahead: budget of one page still holds and reads stay correct" {
