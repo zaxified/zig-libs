@@ -15,6 +15,7 @@
 //! manager writes PEM.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
@@ -216,6 +217,21 @@ pub const DirStorage = struct {
         // crash; the value must be on disk before it replaces the old one.
         atomic.file.sync(d.io) catch return error.StorageFailed;
         atomic.replace(d.io) catch return error.StorageFailed;
+        // The rename itself lives in the parent directory's entry.
+        try d.syncParent(key);
+    }
+
+    /// fsync the directory that holds `key`, so a just-renamed or linked
+    /// entry survives a power loss (the file's own `sync` does not cover it).
+    /// Opened with `iterate` only because that is a plain O_RDONLY handle on
+    /// Linux; without it std opens O_PATH, which `fsync` refuses.
+    fn syncParent(d: *DirStorage, key: []const u8) Error!void {
+        if (builtin.os.tag == .windows) return; // a directory handle cannot be flushed there
+        const parent = if (std.mem.findScalarLast(u8, key, '/')) |i| key[0..i] else ".";
+        var dir = d.dir.openDir(d.io, parent, .{ .iterate = true }) catch return error.StorageFailed;
+        defer dir.close(d.io);
+        const as_file: std.Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
+        as_file.sync(d.io) catch return error.StorageFailed;
     }
 
     fn dirDelete(ptr: *anyopaque, key: []const u8) Error!void {
@@ -246,6 +262,7 @@ pub const DirStorage = struct {
             error.PathAlreadyExists => return false,
             else => return error.StorageFailed,
         };
+        try d.syncParent(path);
         return true;
     }
 
@@ -544,6 +561,11 @@ fn checkContract(s: Storage) !void {
     try testing.expectError(error.NotFound, s.load(gpa, "k/v"));
     try testing.expectError(error.InvalidKey, s.store("../x", "v"));
     try testing.expectError(error.InvalidKey, s.load(gpa, "a//b"));
+    // mutation 2026-10-23: #263 -- delete refuses a traversal key too
+    // (without the check DirStorage would unlink outside its root).
+    try testing.expectError(error.InvalidKey, s.delete("../x"));
+    try testing.expectError(error.InvalidKey, s.delete("a//b"));
+    try testing.expectError(error.InvalidKey, s.delete(""));
 
     // create: only when absent, never replaces.
     try testing.expect(try s.create(gpa, "k/new", "first"));

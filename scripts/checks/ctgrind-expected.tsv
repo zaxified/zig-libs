@@ -1704,10 +1704,10 @@ tlsresume	ReleaseFast	early	1	0	7925e34b53e391de	042b8c43588c7881
 # context). Writer side 0. pkcs8 17 (2 of them the findScalarPos above, one per read) = PKCS#8 round trips of the P-256 key (2: keyFromDer's [0]
 # test on the inner ECPrivateKey, p256 comb) and of the P-384 key (13: the pem384 classes); the
 # writer side 0. Read in the --stacks dump of the day; nothing in jws/burn, nothing new in kind.
-acme	ReleaseFast	pem	1	18	14edc86939d21047	e3f3e71bec825dd7
-acme	ReleaseFast	pem384	1	18	14edc86939d21047	5eb84a3bc4959381
-acme	ReleaseFast	pkcs8	1	17	14edc86939d21047	b26448f1c577ca4e
-acme	ReleaseFast	anykey	1	5	14edc86939d21047	7dff1d27c302259e
+acme	ReleaseFast	pem	1	18	6c6c7cd38158c704	e3f3e71bec825dd7
+acme	ReleaseFast	pem384	1	18	6c6c7cd38158c704	5eb84a3bc4959381
+acme	ReleaseFast	pkcs8	1	17	6c6c7cd38158c704	b26448f1c577ca4e
+acme	ReleaseFast	anykey	1	5	6c6c7cd38158c704	7dff1d27c302259e
 # jwt (2026-10-13) — every secret the module holds: HMAC secrets (HS256/384/512,
 # sign and verify), ES256 (p256 module), ES384 (std), ES512 (p521 module), EdDSA
 # (std Ed25519; only the 32-byte seed is tainted) and RSA (RS256 + PS256 through

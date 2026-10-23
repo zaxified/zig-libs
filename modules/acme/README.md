@@ -30,6 +30,9 @@ shape only). Test data: `src/testdata/pebble_transcript.zig` is a capture
 of what Pebble (Let's Encrypt's ACME test CA, MPL-2.0, run as a black-box
 oracle binary outside the repository) answered this client, recorded by our own
 tooling (`tools/pebble.sh`, `tools/pebble_helper`); no Pebble code is in it.
+`tools/autocert_lead` is our own tooling too: a Go program that drives
+`x/crypto/acme/autocert` (from the Go module cache, not vendored) against
+Pebble for the `**Ahead:**` measurements; its `go.mod`/`go.sum` pin that version.
 
 ## ⚠ Staging by default
 

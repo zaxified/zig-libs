@@ -9,8 +9,8 @@
 //!
 //! Scope is deliberately tiny: P-256, P-384 and P-521 keys (ES256 / ES384 /
 //! ES512 signatures) and RSA 2048..4096 keys (RS256: sha256WithRSAEncryption;
-//! keys are the `rsa` module's), dNSName SANs, RFC 5915, PKCS#1 and PKCS#8
-//! key PEM, the RFC 9773 CertID.
+//! keys are the `rsa` module's), dNSName and iPAddress SANs (RFC 8738 IP
+//! identifiers), RFC 5915, PKCS#1 and PKCS#8 key PEM, the RFC 9773 CertID.
 //! The CSR uses an **empty subject** — RFC 8555 §7.4 requires the SAN
 //! extension to carry the identifiers and Let's Encrypt ignores (and is
 //! phasing out) the CN; skipping CN also avoids its 64-byte limit.
@@ -110,8 +110,11 @@ const oid_acme_identifier = "\x2b\x06\x01\x05\x05\x07\x01\x1f"; // 1.3.6.1.5.5.7
 // ── domain validation ───────────────────────────────────────────────────────
 
 /// LDH hostname check (letters/digits/hyphen labels, 1–63 chars each, ≤253
-/// total). Deliberately rejects wildcards — RFC 8555 §7.1.3 allows them
-/// only for the dns-01 challenge, which this module does not implement.
+/// total). Deliberately rejects wildcards (`isValidWildcardDomain` accepts
+/// them) — RFC 8555 §7.1.3 allows them only for the dns-01 challenge, so the
+/// caller decides whether it has one. Note it accepts a dotted-quad such as
+/// `203.0.113.5` (all-digit labels are valid LDH): test for an IP literal
+/// first where that matters.
 pub fn isValidDomain(name: []const u8) bool {
     if (name.len == 0 or name.len > 253) return false;
     var it = std.mem.splitScalar(u8, name, '.');
@@ -2970,6 +2973,190 @@ test "pemBlockCount counts every block; PKCS#8 version 1 is accepted" {
     defer gpa.free(v1_pem);
     var out: Es256.KeyPair = undefined;
     try pkcs8PrivateKeyFromPem(&out, gpa, v1_pem);
+}
+
+// ── mutation 2026-10-23: survivors of the acme mutation run ─────────────────
+
+test "readElem: a header that ends exactly at the buffer end, and the 0x81 / 0x84 length forms at their bounds" {
+    // mutation 2026-10-23: #301 -- `05 00` fills the buffer to the last byte.
+    const null_elem = try readElem("\x05\x00", 0);
+    try testing.expectEqual(@as(u8, 0x05), null_elem.tag);
+    try testing.expectEqual(@as(usize, 2), null_elem.start);
+    try testing.expectEqual(@as(usize, 2), null_elem.end);
+    // One byte less is no header at all.
+    try testing.expectError(error.Malformed, readElem("\x05", 0));
+
+    // mutation 2026-10-23: #305 -- the long-form length octets end exactly at
+    // the buffer end (`04 81 00`: an empty element, content at 3..3).
+    const long_empty = try readElem("\x04\x81\x00", 0);
+    try testing.expectEqual(@as(usize, 3), long_empty.start);
+    try testing.expectEqual(@as(usize, 3), long_empty.end);
+    try testing.expectError(error.Malformed, readElem("\x04\x81", 0));
+
+    // mutation 2026-10-23: #304 -- four length octets are the widest form read.
+    const four = try readElem("\x04\x84\x00\x00\x00\x02ab", 0);
+    try testing.expectEqual(@as(usize, 6), four.start);
+    try testing.expectEqual(@as(usize, 8), four.end);
+    try testing.expectError(error.Malformed, readElem("\x04\x85\x00\x00\x00\x00\x00", 0));
+
+    // mutation 2026-10-23: #302 -- 0x80 is the indefinite form even when 128
+    // bytes follow (read as a short length it would be a 128-byte element).
+    var ind: [2 + 128]u8 = @splat(0);
+    ind[0] = 0x30;
+    ind[1] = 0x80;
+    try testing.expectError(error.Malformed, readElem(&ind, 0));
+    // 0x7f is the longest short form and still reads.
+    var short: [2 + 127]u8 = @splat(0);
+    short[0] = 0x04;
+    short[1] = 0x7f;
+    const e127 = try readElem(&short, 0);
+    try testing.expectEqual(@as(usize, 129), e127.end);
+}
+
+test "TLS-ALPN-01 cert: an IPv6 or IPv4 literal is an iPAddress SAN, and the TBS version is v3 (INTEGER 2)" {
+    const kp = testKeyPair(70);
+    const acme_id: [32]u8 = @splat(0x5a);
+
+    // mutation 2026-10-23: #296 -- an IPv6 literal fails `isValidDomain`
+    // (colons) and must be accepted through `netaddr.parseIp`.
+    const v6 = try tlsAlpnCertDer(testing.allocator, kp, "2001:db8::1", acme_id, "\x01", tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(v6);
+    try verifySelfSigned(v6);
+    var v6_san: [2 + 16]u8 = @splat(0);
+    v6_san[0] = 0x87;
+    v6_san[1] = 16;
+    v6_san[2..6].* = .{ 0x20, 0x01, 0x0d, 0xb8 };
+    v6_san[17] = 0x01;
+    try testing.expect(std.mem.find(u8, v6, &v6_san) != null);
+    try testing.expect(std.mem.find(u8, v6, "\x82\x0b") == null); // no dNSName
+
+    const v4 = try tlsAlpnCertDer(testing.allocator, kp, "192.0.2.1", acme_id, "\x01", tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(v4);
+    try testing.expect(std.mem.find(u8, v4, "\x87\x04\xc0\x00\x02\x01") != null);
+
+    // Neither a host name nor an address.
+    try testing.expectError(error.InvalidDomain, tlsAlpnCertDer(testing.allocator, kp, "2001:db8::zz", acme_id, "\x01", tls_alpn_not_before, tls_alpn_not_after));
+
+    // mutation 2026-10-23: #300 -- parse the TBS back: [0] EXPLICIT INTEGER 2.
+    const cert = try readElem(v6, 0);
+    const tbs = try expectElem(v6, cert.start, 0x30);
+    const version = try expectElem(v6, tbs.start, 0xa0);
+    try testing.expectEqualSlices(u8, "\x02\x01\x02", version.content(v6));
+}
+
+/// `csrVariant` with the SAN extension's extnValue under a tag of the caller's choosing.
+fn csrExtnTagVariant(gpa: Allocator, key_pair: *const Es256.KeyPair, extn_tag: u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d: Der = .{ .a = arena.allocator() };
+    const pub_sec1 = key_pair.public_key.toUncompressedSec1();
+    const spki = try d.seq(&.{
+        try d.seq(&.{ try d.oid(oid_ec_public_key), try d.oid(oid_p256) }),
+        try d.bitString(&pub_sec1),
+    });
+    const names = try d.seq(&.{try d.tlv(0x82, "example.org")});
+    const san_ext = try d.seq(&.{ try d.oid(oid_subject_alt_name), try d.tlv(extn_tag, names) });
+    const attributes = try d.tlv(0xa0, try d.seq(&.{ try d.oid(oid_extension_request), try d.tlv(0x31, try d.seq(&.{san_ext})) }));
+    const info = try d.seq(&.{ try d.tlv(0x02, "\x00"), try d.seq(&.{}), spki, attributes });
+    const sig = try key_pair.sign(info, null);
+    var sig_buf: [Es256.Signature.der_encoded_length_max]u8 = undefined;
+    const csr = try d.seq(&.{ info, try d.seq(&.{try d.oid(oid_ecdsa_sha256)}), try d.bitString(sig.toDer(&sig_buf)) });
+    return gpa.dupe(u8, csr);
+}
+
+test "parseCsr: the SAN extension's extnValue must be an OCTET STRING" {
+    const kp = testKeyPair(5);
+    const good = try csrExtnTagVariant(testing.allocator, kp, 0x04); // control
+    defer testing.allocator.free(good);
+    var p = try parseCsr(testing.allocator, good);
+    p.deinit();
+    // mutation 2026-10-23: #315 -- a BIT STRING (0x03) holding the very same
+    // GeneralNames is not an extnValue; the signature over it is valid.
+    const bits = try csrExtnTagVariant(testing.allocator, kp, 0x03);
+    defer testing.allocator.free(bits);
+    try testing.expectError(error.MalformedCsr, parseCsr(testing.allocator, bits));
+}
+
+const RsaSpkiShape = enum { plain, alg_trailing, spki_trailing };
+
+/// An RSA CSR like `csrDer`'s, signed for real, whose SPKI is bent: `alg_trailing`
+/// puts a second NULL after the parameters inside the AlgorithmIdentifier,
+/// `spki_trailing` a NULL after the BIT STRING inside the SPKI.
+fn rsaCsrSpkiVariant(gpa: Allocator, kp: *const rsa.KeyPair, shape: RsaSpkiShape) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const d: Der = .{ .a = arena.allocator() };
+    var spki_buf: [rsa.max_spki_der_len]u8 = undefined;
+    const spki_der = try d.a.dupe(u8, try kp.public_key.toSpkiDer(&spki_buf));
+    const outer = try readElem(spki_der, 0);
+    const alg = try readElem(spki_der, outer.start);
+    const bits_elem = spki_der[alg.end..outer.end];
+    const null_elem = try d.tlv(0x05, "");
+    const spki = switch (shape) {
+        .plain => spki_der,
+        .alg_trailing => try d.seq(&.{ try d.seq(&.{ try d.oid(oid_rsa_encryption), null_elem, null_elem }), bits_elem }),
+        .spki_trailing => try d.seq(&.{ spki_der[outer.start..outer.end], null_elem }),
+    };
+    const names = try d.seq(&.{try d.tlv(0x82, "example.org")});
+    const san_ext = try d.seq(&.{ try d.oid(oid_subject_alt_name), try d.tlv(0x04, names) });
+    const attributes = try d.tlv(0xa0, try d.seq(&.{ try d.oid(oid_extension_request), try d.tlv(0x31, try d.seq(&.{san_ext})) }));
+    const info = try d.seq(&.{ try d.tlv(0x02, "\x00"), try d.seq(&.{}), spki, attributes });
+    var rsa_sig: [rsa.max_modulus_len]u8 = undefined;
+    const raw = try rsa.signPkcs1v15(&kp.secret_key, Sha256, info, &rsa_sig);
+    const csr = try d.seq(&.{ info, try sigAlgId(d, .rs256), try d.bitString(raw) });
+    return gpa.dupe(u8, csr);
+}
+
+test "parseCsr: an RSA SPKI with anything after the NULL parameter or after the key is refused by name" {
+    const kp = try testRsaPair();
+    const plain = try rsaCsrSpkiVariant(testing.allocator, kp, .plain); // control: the helper's own CSR is good
+    defer testing.allocator.free(plain);
+    var ok = try parseCsrAny(testing.allocator, plain);
+    ok.deinit();
+
+    // mutation 2026-10-23: #309 -- the AlgorithmIdentifier is { rsaEncryption,
+    // NULL, NULL }; `rsa.VerifyKey.fromDer` ignores the tail, so only the
+    // NULL-is-last check refuses it (the signature is valid).
+    const alg_tail = try rsaCsrSpkiVariant(testing.allocator, kp, .alg_trailing);
+    defer testing.allocator.free(alg_tail);
+    try testing.expectError(error.UnsupportedCsr, parseCsrAny(testing.allocator, alg_tail));
+
+    // mutation 2026-10-23: #310 -- a NULL after the BIT STRING inside the SPKI:
+    // `Malformed` here, while the key parser alone would say UnsupportedCsr.
+    const spki_tail = try rsaCsrSpkiVariant(testing.allocator, kp, .spki_trailing);
+    defer testing.allocator.free(spki_tail);
+    try testing.expectError(error.MalformedCsr, parseCsrAny(testing.allocator, spki_tail));
+}
+
+test "pemDecode and pemBlockCount: a 48-character label is the longest accepted, 49 is LabelTooLong" {
+    const gpa = testing.allocator;
+    const l48 = strRepeat("L", max_pem_label_len);
+    const l49 = strRepeat("L", max_pem_label_len + 1);
+    const pem = try pemEncode(gpa, l48, "abc-der");
+    defer gpa.free(pem);
+    // mutation 2026-10-23: #318
+    const der_bytes = try pemDecode(gpa, l48, pem);
+    defer gpa.free(der_bytes);
+    try testing.expectEqualStrings("abc-der", der_bytes);
+    try testing.expectError(error.LabelTooLong, pemDecode(gpa, l49, pem));
+    // mutation 2026-10-23: #323
+    try testing.expectEqual(@as(usize, 1), try pemBlockCount(l48, pem));
+    try testing.expectError(error.LabelTooLong, pemBlockCount(l49, pem));
+}
+
+test "ariCertId: a zero-length serial INTEGER is a malformed certificate, not a missing AKI" {
+    // mutation 2026-10-23: #330 -- the x509 module reads `02 00` as a serial of
+    // no octets, so only this check refuses it. The TLS-ALPN certificate has
+    // no authorityKeyIdentifier: with a serial it is `NoAuthorityKeyIdentifier`
+    // (control), with an empty serial the serial check comes first.
+    const kp = testKeyPair(70);
+    const acme_id: [32]u8 = @splat(0x5a);
+    const with_serial = try tlsAlpnCertDer(testing.allocator, kp, "example.org", acme_id, "\x01", tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(with_serial);
+    try testing.expectError(error.NoAuthorityKeyIdentifier, ariCertId(testing.allocator, with_serial));
+    const empty_serial = try tlsAlpnCertDer(testing.allocator, kp, "example.org", acme_id, "", tls_alpn_not_before, tls_alpn_not_after);
+    defer testing.allocator.free(empty_serial);
+    try testing.expectError(error.MalformedCertificate, ariCertId(testing.allocator, empty_serial));
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

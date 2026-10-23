@@ -50,6 +50,9 @@ const FakeIssuer = struct {
     last_names_len: usize = 0,
     ari_window: ?Manager.Window = null,
     window_calls: usize = 0,
+    /// Make `window` fail (not `NotSupported`), with this Retry-After.
+    window_fail: bool = false,
+    window_fail_retry_after_s: ?u64 = null,
     /// Make `issue` slow (needs `io`), for the concurrency tests.
     io: ?std.Io = null,
     delay_ms: u32 = 0,
@@ -109,9 +112,12 @@ const FakeIssuer = struct {
 
     fn window(ctx: *anyopaque, chain_pem: []const u8, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Window {
         _ = chain_pem;
-        _ = diag;
         const f: *FakeIssuer = @ptrCast(@alignCast(ctx));
         f.window_calls += 1;
+        if (f.window_fail) {
+            diag.retry_after_s = f.window_fail_retry_after_s;
+            return error.IssueFailed;
+        }
         return f.ari_window orelse error.NotSupported;
     }
 };
@@ -426,6 +432,72 @@ test "schedule: ten days or less renews at half the lifetime" {
     try m.addIssuer(fake.issuer(false));
     try m.manage(&.{"s.example"});
     try testing.expectEqual(day0 + 3 * day, m.maintain());
+    // The window is a share of the lifetime, so a short certificate is not
+    // renewed again at once — autocert with a fixed `RenewBefore` longer than
+    // the lifetime re-issues in a loop (tools/autocert_lead).
+    try testing.expectEqual(day0 + 3 * day, m.maintain());
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "schedule: the largest renewal_window_pct still waits for 1% of a short lifetime" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.short_crt), .key = fx.short_key } }} };
+    var o = opts();
+    o.renewal_window_pct = 99;
+    var m = f.manager(o);
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(&.{"s.example"});
+    const six_days: i64 = 6 * day;
+    try testing.expectEqual(day0 + 6 * day - @divFloor(six_days * 99, 100), m.maintain());
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+fn maintainOnce(m: *Manager) void {
+    _ = m.maintain();
+}
+
+test "fleet: two nodes on one storage due at once issue one certificate" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{
+        .script = &.{
+            .{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } },
+            .{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } },
+        },
+        .io = f.threaded.io(),
+        .delay_ms = 200,
+    };
+    var m1 = f.manager(opts());
+    defer m1.deinit();
+    var o2 = opts();
+    o2.storage = f.mem.storage();
+    o2.clock = f.clock.clock();
+    o2.random_seed = 8;
+    o2.node_id = "node-b";
+    var m2 = Manager.init(f.threaded.io(), testing.allocator, o2);
+    defer m2.deinit();
+    try m1.addIssuer(fake.issuer(false));
+    try m2.addIssuer(fake.issuer(false));
+    try m1.manage(a_names);
+    try m2.manage(a_names);
+
+    // node-a is inside the CA round trip when node-b's turn comes.
+    const th = try std.Thread.spawn(.{}, maintainOnce, .{&m1});
+    while (fake.in_flight.load(.acquire) == 0) std.atomic.spinLoopHint();
+    try testing.expectEqual(f.clock.t + 60, m2.maintain());
+    th.join();
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+
+    // node-b's next look adopts node-a's certificate; the CA was asked once.
+    f.clock.t += 60;
+    _ = m2.maintain();
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try expectServes(&m1, "a.example", chainOf(fx.a1_crt));
+    try expectServes(&m2, "www.a.example", chainOf(fx.a1_crt));
 }
 
 test "schedule: renewal_window_pct; the default server name answers an empty SNI" {
@@ -1313,11 +1385,16 @@ test "issue: problems name what is wrong; the longest Retry-After of several iss
 
 const UnmanagingIssuer = struct {
     m: *Manager,
+    /// Fail after unmanaging instead of issuing.
+    fail: bool = false,
     fn issue(ctx: *anyopaque, gpa: Allocator, req: *const Manager.IssueRequest, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Issued {
         const s: *UnmanagingIssuer = @ptrCast(@alignCast(ctx));
         _ = req;
-        _ = diag;
         _ = s.m.unmanage("a.example"); // while this very issuance is in flight
+        if (s.fail) {
+            diag.note("refused");
+            return error.IssueFailed;
+        }
         const chain = try gpa.dupe(u8, chainOf(fx.a1_crt));
         errdefer gpa.free(chain);
         return .{ .chain_pem = chain, .key_pem = try gpa.dupe(u8, fx.a1_key), .not_after = 0 };
@@ -1546,7 +1623,7 @@ test "ARI: a renewed certificate takes the CA's window again, even an unchanged 
             .{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } },
             .{ .ok = .{ .chain = chainOf(fx.a2_crt), .key = fx.a2_key } },
         },
-        .ari_window = .{ .start = day0 + 40 * day, .end = day0 + 41 * day, .retry_after_s = 3600 },
+        .ari_window = .{ .start = day0 + 56 * day, .end = day0 + 57 * day, .retry_after_s = 3600 },
     };
     var m = f.manager(opts());
     defer m.deinit();
@@ -1554,7 +1631,8 @@ test "ARI: a renewed certificate takes the CA's window again, even an unchanged 
     try m.manage(a_names);
     _ = m.maintain(); // a1
     _ = m.maintain(); // window polled, renewal picked inside it
-    f.clock.t = day0 + 42 * day;
+    // a2 starts at day 59: it is accepted only from a day before that.
+    f.clock.t = day0 + 58 * day;
     _ = m.maintain(); // due: a2 issued
     try expectServes(&m, "a.example", chainOf(fx.a2_crt));
     _ = m.maintain(); // the same window again, for the new certificate
@@ -1647,6 +1725,613 @@ test "certificate: malformed names never reach the policy; a 253-character name 
     mat.deinit(testing.allocator);
 }
 
+// ── review 2026-10-23: Manager / storage fixes ──────────────────────────────
+
+test "backoff: an expired certificate keeps the exponential back-off, capped at ten minutes" {
+    var f: Fixture = undefined;
+    f.init(day0 + 70 * day);
+    defer f.deinit();
+    try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+    const fails = @as([5]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "CA down" } }));
+    var fake: FakeIssuer = .{ .script = &fails };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain(); // 1st failure, the certificate is valid: a minute
+    try testing.expectEqual(@as(i64, 60), f.rec.last_retry_at - f.clock.t);
+    f.clock.t = day0 + 91 * day; // expired: retrying every minute helps nobody
+    for ([_]i64{ 120, 240, 480, 600 }) |want| { // failures 2..5; 960 s is capped at 600
+        _ = m.maintain();
+        try testing.expectEqual(want, f.rec.last_retry_at - f.clock.t);
+        f.clock.t = f.rec.last_retry_at;
+    }
+}
+
+test "backoff: in the last hour a Retry-After is still a floor (at most a day)" {
+    { // 3600 s asked, the certificate ends in 30 minutes
+        var f: Fixture = undefined;
+        f.init(day0 + 90 * day - 1800);
+        defer f.deinit();
+        try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+        var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "later", .retry_after_s = 3600 } }} };
+        var m = f.manager(opts());
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try m.manage(a_names);
+        _ = m.maintain();
+        try testing.expectEqual(@as(i64, 3600), f.rec.last_retry_at - f.clock.t);
+    }
+    { // a year asked in the last hour: a day
+        var f: Fixture = undefined;
+        f.init(day0 + 90 * day - 1800);
+        defer f.deinit();
+        try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+        var fake: FakeIssuer = .{ .script = &.{.{ .fail = .{ .problem = "later", .retry_after_s = 365 * day } }} };
+        var m = f.manager(opts());
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try m.manage(a_names);
+        _ = m.maintain();
+        try testing.expectEqual(@as(i64, day), f.rec.last_retry_at - f.clock.t);
+    }
+}
+
+test "on-demand: a handshake waits for an issuance in flight at most wait_ms" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{
+        .script = &.{.{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } }},
+        .io = f.threaded.io(),
+        .delay_ms = 1500,
+    };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow, .wait_ms = 150 } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    var got: std.atomic.Value(u32) = .init(0);
+    const starter = try std.Thread.spawn(.{}, askThread, .{ &m, &got });
+    defer starter.join();
+    while (fake.in_flight.load(.acquire) == 0) std.atomic.spinLoopHint();
+    const io = f.threaded.io();
+    const t0 = std.Io.Clock.awake.now(io);
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "od.example"));
+    const waited = t0.durationTo(std.Io.Clock.awake.now(io)).toMilliseconds();
+    try testing.expect(waited >= 140);
+    try testing.expect(waited < 1000); // not the whole issuance
+    try testing.expectEqual(@as(usize, 1), policy.asked); // the waiter never asked the policy
+}
+
+test "manage: a name twice in the list, even in another case, is refused and leaves nothing behind" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var m = f.manager(opts());
+    defer m.deinit();
+    try testing.expectError(error.InvalidName, m.manage(&.{ "a.example", "a.example" }));
+    try testing.expectError(error.InvalidName, m.manage(&.{ "a.example", "www.a.example", "A.EXAMPLE" }));
+    try testing.expectEqual(@as(usize, 0), m.entries.items.len);
+    try testing.expectEqual(@as(u32, 0), m.by_name.count());
+    try m.manage(&.{ "a.example", "www.a.example" }); // the names are still free
+}
+
+test "failed: the retry time counts from when the attempt ended, not from the round's start" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    const Slow = struct {
+        clock: *FakeClock,
+        fn issue(ctx: *anyopaque, gpa: Allocator, req: *const Manager.IssueRequest, diag: *Manager.Diagnostics) Manager.IssueError!Manager.Issued {
+            _ = gpa;
+            _ = req;
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            s.clock.t += 300; // the order took five minutes
+            diag.note("boom");
+            return error.IssueFailed;
+        }
+    };
+    var slow: Slow = .{ .clock = &f.clock };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(.{ .ctx = &slow, .name = "slow", .issue = Slow.issue });
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(day0 + day + 300 + 60, f.rec.last_retry_at);
+}
+
+test "certificate: an IP literal SNI reaches neither the policy nor the CA" {
+    var policy: Policy = .{};
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{} };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = Policy.allow } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "203.0.113.5"));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "2001:db8::1"));
+    try testing.expectEqual(@as(usize, 0), policy.asked);
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+    try testing.expectEqual(@as(usize, 0), m.entries.items.len);
+}
+
+test "unmanage during a failed issuance: the failure is not reported" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var m = f.manager(opts());
+    defer m.deinit();
+    var ui: UnmanagingIssuer = .{ .m = &m, .fail = true };
+    try m.addIssuer(.{ .ctx = &ui, .name = "unmanaging", .issue = UnmanagingIssuer.issue });
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 0), f.rec.failed);
+    try testing.expectEqual(@as(usize, 0), f.rec.installed);
+}
+
+/// MemStorage whose `load` unmanages `a.example` first (a stored certificate
+/// is being adopted when the entry is removed).
+const UnmanagingStore = struct {
+    mem: *storage.MemStorage,
+    m: *Manager,
+    fn storageOf(b: *UnmanagingStore) storage.Storage {
+        var s = b.mem.storage();
+        s.ptr = b;
+        s.vtable = &vt;
+        return s;
+    }
+    const vt: storage.Storage.VTable = .{
+        .load = load,
+        .store = store,
+        .delete = del,
+        .create = create,
+        .tryLock = tryLock,
+        .unlock = unlock,
+    };
+    fn of(p: *anyopaque) *UnmanagingStore {
+        return @ptrCast(@alignCast(p));
+    }
+    fn load(p: *anyopaque, gpa: Allocator, path: []const u8) storage.Error![]u8 {
+        _ = of(p).m.unmanage("a.example");
+        return of(p).mem.storage().load(gpa, path);
+    }
+    fn store(p: *anyopaque, path: []const u8, value: []const u8) storage.Error!void {
+        return of(p).mem.storage().store(path, value);
+    }
+    fn del(p: *anyopaque, path: []const u8) storage.Error!void {
+        return of(p).mem.storage().delete(path);
+    }
+    fn create(p: *anyopaque, path: []const u8, value: []const u8) storage.Error!bool {
+        return of(p).mem.storage().vtable.create.?(of(p).mem, path, value);
+    }
+    fn tryLock(p: *anyopaque, name: []const u8, owner: []const u8, t: i64, lease: u32) storage.Error!bool {
+        return of(p).mem.storage().tryLock(name, owner, t, lease);
+    }
+    fn unlock(p: *anyopaque, name: []const u8, owner: []const u8) void {
+        of(p).mem.storage().unlock(name, owner);
+    }
+};
+
+test "unmanage while a stored certificate is adopted: nothing is reported" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+    var m = f.manager(opts());
+    defer m.deinit();
+    var us: UnmanagingStore = .{ .mem = &f.mem, .m = &m };
+    m.options.storage = us.storageOf();
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 0), f.rec.installed);
+    try testing.expectEqual(@as(usize, 0), m.entries.items.len);
+}
+
+test "ARI: a failed poll waits like a successful one: Retry-After (at most a week), a minute at least" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }} };
+    var o = opts();
+    o.ari_poll_s = 10; // below the floor
+    var m = f.manager(o);
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(true));
+    try m.manage(a_names);
+    _ = m.maintain(); // issued; the first poll is due at once
+    fake.window_fail = true;
+    const cases = [_]struct { ra: ?u64, want: i64 }{
+        .{ .ra = 10, .want = 60 }, // floor
+        .{ .ra = 100_000, .want = 100_000 }, // the CA's word
+        .{ .ra = 30 * day, .want = 7 * day }, // capped at a week
+        .{ .ra = null, .want = 60 }, // no Retry-After: ari_poll_s, floored
+    };
+    for (cases) |c| {
+        fake.window_fail_retry_after_s = c.ra;
+        const before = f.clock.t;
+        try testing.expectEqual(before + c.want, m.maintain());
+        f.clock.t = before + c.want;
+    }
+}
+
+test "checkPair: a certificate valid only from more than a day ahead is refused" {
+    const gpa = testing.allocator;
+    // a1 starts at day0: exactly one day ahead is skew, one second more is not.
+    _ = try Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, day0 - day, &.{});
+    try testing.expectError(error.Expired, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, day0 - day - 1, &.{}));
+    try testing.expectError(error.Expired, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, day0 - 2 * day, &.{}));
+    // and a stored one is not adopted then
+    var f: Fixture = undefined;
+    f.init(day0 - 2 * day);
+    defer f.deinit();
+    try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+    var fake: FakeIssuer = .{ .script = &.{} };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 0), f.rec.installed);
+}
+
+test "unmanage: trailing dot and case are ignored, a wildcard of 253 characters fits" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.manage(&.{"a.example"});
+    try testing.expect(m.unmanage("A.Example."));
+    try testing.expect(!m.unmanage("a.example"));
+    const long = strRepeat((strRepeat("a", 63) ++ "."), 3) ++ (strRepeat("a", 61));
+    try testing.expectEqual(@as(usize, 253), long.len);
+    try m.manage(&.{"*." ++ long});
+    try testing.expect(m.unmanage("*." ++ long));
+    try testing.expect(!m.unmanage(""));
+    try testing.expect(!m.unmanage("."));
+}
+
+// ── mutation 2026-10-23: survivors of the acme mutation run ─────────────────
+
+test "init: a node_id of exactly 32 characters is the longest accepted; addIssuer wakes the run loop" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    // mutation 2026-10-23: #118 -- `>=` would panic on the 32nd character.
+    const id = strRepeat("n", 32);
+    var o = opts();
+    o.storage = f.mem.storage();
+    o.clock = f.clock.clock();
+    o.node_id = id;
+    var m = Manager.init(f.threaded.io(), testing.allocator, o);
+    defer m.deinit();
+    try testing.expectEqualStrings(id, m.node_id_buf[0..m.node_id_len]);
+
+    // mutation 2026-10-23: #120 -- the flag `run` polls every second.
+    try testing.expect(!m.wake.load(.acquire));
+    var fake: FakeIssuer = .{ .script = &.{} };
+    try m.addIssuer(fake.issuer(false));
+    try testing.expect(m.wake.load(.acquire));
+}
+
+test "maintain: only idle on-demand names left means look again in an hour, not at their back-off" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{ .script = &.{} }; // every issuance fails
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{
+        .ctx = &policy,
+        .allow = Policy.allow,
+        .failure_backoff_s = 300,
+    } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "od.example"));
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    // mutation 2026-10-23: #137 -- the failed name stays (back-off 300 s) but
+    // is idle: it does not bring the next round forward.
+    try testing.expectEqual(f.clock.t + 3600, m.maintain());
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "issue: with use_ari off no `replaces` is sent on a renewal" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{
+        .{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } },
+        .{ .ok = .{ .chain = chainOf(fx.a2_crt), .key = fx.a2_key } },
+    } };
+    // mutation 2026-10-23: #149
+    var m = f.manager(.{ .storage = undefined, .use_ari = false });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    f.clock.t = day0 + 60 * day;
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 2), fake.calls); // a renewal, as the default test shows
+    try testing.expect(fake.last_replaces == null);
+    try expectServes(&m, "a.example", chainOf(fx.a2_crt));
+}
+
+test "backoff: max_backoff_s caps the doubling" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    const fails = @as([6]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "boom" } }));
+    var fake: FakeIssuer = .{ .script = &fails };
+    // mutation 2026-10-23: #166 -- 60, 120, 240, then 480 would exceed 300.
+    var m = f.manager(.{ .storage = undefined, .max_backoff_s = 300 });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    const want = [_]i64{ 60, 120, 240, 300, 300, 300 };
+    for (want) |w| {
+        _ = m.maintain();
+        try testing.expectEqual(w, f.rec.last_retry_at - f.clock.t);
+        f.clock.t = f.rec.last_retry_at;
+    }
+}
+
+test "ARI: of several issuers failing the poll, the longest Retry-After sets the next poll" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var first: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.a1_crt), .key = fx.a1_key } }} };
+    var second: FakeIssuer = .{ .name = "fake2", .script = &.{} };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(first.issuer(true));
+    try m.addIssuer(second.issuer(true));
+    try m.manage(a_names);
+    _ = m.maintain(); // issued by the first; the first poll is due at once
+    first.window_fail = true;
+    first.window_fail_retry_after_s = 100_000;
+    second.window_fail = true;
+    second.window_fail_retry_after_s = 1000;
+    // mutation 2026-10-23: #182 -- the later, shorter answer must not win.
+    const before = f.clock.t;
+    try testing.expectEqual(before + 100_000, m.maintain());
+    try testing.expectEqual(@as(usize, 1), first.window_calls);
+    try testing.expectEqual(@as(usize, 1), second.window_calls);
+}
+
+test "HTTP-01 redirect: a Host the parser lets through but a redirect must not carry, an empty Host, an absolute-form target" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var m = f.manager(.{ .storage = undefined, .http_redirect = true });
+    defer m.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(m.httpMiddleware());
+    try r.get("/", hApp);
+    var buf: [1024]u8 = undefined;
+
+    // mutation 2026-10-23: #207 -- `http.h1.isValidHost` accepts these
+    // sub-delimiters and '_', '~', '%'; `validRedirectHost` does not, and the
+    // answer is the middleware's own 400 (its body), not the parser's.
+    // ('/' and '@' never get this far: the parser refuses them, which is why
+    // #215 -- letting them through `validRedirectHost` -- cannot be seen.)
+    const odd_hosts = [_][]const u8{ "a_b.example", "a~b", "a%41", "a!b", "a$b", "a&b", "a'b", "a(b)", "a*b", "a+b", "a;b", "a=b" };
+    inline for (odd_hosts) |h| {
+        const out = runWire(&r, "GET / HTTP/1.1\r\nHost: " ++ h ++ "\r\nConnection: close\r\n\r\n", &buf);
+        try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 400"));
+        try testing.expect(std.mem.endsWith(u8, out, "missing or invalid Host\n"));
+    }
+    // Control: a plain host passes and is redirected.
+    const good = runWire(&r, "GET / HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, good, "HTTP/1.1 302"));
+
+    // mutation 2026-10-23: #208 -- a Host that is only a port reduces to no
+    // host; so does an HTTP/1.0 request without a Host header.
+    const only_port = runWire(&r, "GET / HTTP/1.1\r\nHost: :80\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, only_port, "HTTP/1.1 400"));
+    try testing.expect(std.mem.endsWith(u8, only_port, "missing or invalid Host\n"));
+    const no_host = runWire(&r, "GET / HTTP/1.0\r\n\r\n", &buf);
+    try testing.expect(std.mem.find(u8, no_host, " 400 ") != null);
+    try testing.expect(std.mem.endsWith(u8, no_host, "missing or invalid Host\n"));
+
+    // mutation 2026-10-23: #209 -- absolute-form (the Host must agree with the
+    // authority): the redirect goes to the origin-form fallback "/", the
+    // target is not appended to the host.
+    const absolute = runWire(&r, "GET http://a.example/p?q=1 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, absolute, "HTTP/1.1 302"));
+    try testing.expect(std.mem.find(u8, absolute, "\r\nLocation: https://a.example/\r\n") != null);
+}
+
+test "presentHttp01: a storage that refuses the write leaves no token published" {
+    var f: Fixture = undefined;
+    f.init(day0);
+    defer f.deinit();
+    var broken: BrokenStore = .{ .mem = &f.mem };
+    var m = f.manager(.{ .storage = undefined, .distributed_challenges = true });
+    m.options.storage = broken.storageOf();
+    defer m.deinit();
+    const solvers = m.challengeSolvers();
+    // mutation 2026-10-23: #222 -- the token was set before the write failed
+    // and must be taken back, or this node would answer for a challenge the
+    // issuance already gave up.
+    try testing.expectError(error.SolverFailed, solvers[0].present(solvers[0].ctx, &challenge_req));
+    try testing.expectEqual(@as(usize, 0), m.http_tokens.count());
+    var buf: [jws.max_key_authorization_len]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), m.http_tokens.lookup(challenge_req.token, &buf));
+}
+
+test "on-demand rate limit: a max above 256 is held to the ring's 256 slots" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    var fake: FakeIssuer = .{ .script = &.{} }; // every issuance fails, quickly
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{
+        .ctx = &policy,
+        .allow = Policy.allow,
+        .rate = .{ .max = 300, .window_s = 3600 },
+        .failure_backoff_s = 3600,
+    } });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    // mutation 2026-10-23: #251 -- with `max` 300 the 257th event would index
+    // slot 256 of a 256-entry ring.
+    var name_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 257) : (i += 1) {
+        const name = std.mem.print(&name_buf, "n{d}.example", .{i}) catch unreachable;
+        try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, name));
+    }
+    try testing.expectEqual(@as(usize, 256), fake.calls); // the 257th was refused by the limiter
+}
+
+// ── AcmeIssuer against a minimal CA (no account, no orders) ─────────────────
+
+/// Serves a directory, a newNonce that never sends `Replay-Nonce`, and an
+/// ARI answer with a Retry-After — enough for the two `AcmeIssuer` paths the
+/// full mock CA of `Client.zig`'s tests leaves unpinned.
+const MiniCa = struct {
+    port: u16 = 0,
+    /// Requests to newNonce (HEAD or GET) so far.
+    nonce_hits: std.atomic.Value(u32) = .init(0),
+
+    fn of(ctx: *router.Ctx) *MiniCa {
+        return @ptrCast(@alignCast(ctx.state.?));
+    }
+
+    fn directory(ctx: *router.Ctx) anyerror!void {
+        const p = of(ctx).port;
+        var buf: [512]u8 = undefined;
+        const body = try std.mem.print(
+            &buf,
+            "{{\"newNonce\":\"http://127.0.0.1:{d}/new-nonce\",\"newAccount\":\"http://127.0.0.1:{d}/new-acct\"," ++
+                "\"newOrder\":\"http://127.0.0.1:{d}/new-order\",\"renewalInfo\":\"http://127.0.0.1:{d}/ari\"}}",
+            .{ p, p, p, p },
+        );
+        ctx.res.setStatus(200);
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.writeAll(body);
+    }
+
+    fn newNonce(ctx: *router.Ctx) anyerror!void {
+        _ = of(ctx).nonce_hits.fetchAdd(1, .acq_rel);
+        ctx.res.setStatus(200); // no Replay-Nonce header
+    }
+
+    fn renewalInfo(ctx: *router.Ctx) anyerror!void {
+        ctx.res.setStatus(200);
+        try ctx.res.setHeader("Content-Type", "application/json");
+        try ctx.res.setHeader("Retry-After", "21600");
+        try ctx.res.writeAll(
+            \\{"suggestedWindow":{"start":"2025-01-02T04:00:00Z","end":"2025-01-03T04:00:00Z"}}
+        );
+    }
+};
+
+const MiniLab = struct {
+    threaded: std.Io.Threaded,
+    ca: MiniCa,
+    ca_router: router.Router,
+    ca_server: http.Server,
+    transport: http.Client,
+    thread: ?std.Thread = null,
+    dir_url_buf: [64]u8 = undefined,
+    dir_url: []const u8 = "",
+
+    fn serveWrap(s: *http.Server) void {
+        s.serve() catch {};
+    }
+
+    fn start(lab: *MiniLab) !void {
+        lab.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        errdefer lab.threaded.deinit();
+        const io = lab.threaded.io();
+        lab.ca = .{};
+        lab.thread = null;
+        lab.dir_url = "";
+        lab.ca_router = router.Router.init(testing.allocator);
+        errdefer lab.ca_router.deinit();
+        lab.ca_router.state = &lab.ca;
+        try lab.ca_router.get("/dir", MiniCa.directory);
+        try lab.ca_router.head("/new-nonce", MiniCa.newNonce);
+        try lab.ca_router.get("/new-nonce", MiniCa.newNonce);
+        try lab.ca_router.get("/ari/:id", MiniCa.renewalInfo);
+        lab.ca_server = http.Server.init(io, testing.allocator, .{
+            .handler = lab.ca_router.handler(),
+            .context = &lab.ca_router,
+        });
+        errdefer lab.ca_server.deinit();
+        lab.ca_server.bind() catch |err| {
+            return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        };
+        lab.ca.port = lab.ca_server.boundAddress().getPort();
+        lab.dir_url = try std.mem.print(&lab.dir_url_buf, "http://127.0.0.1:{d}/dir", .{lab.ca.port});
+        lab.transport = http.Client.init(io, testing.allocator, .{});
+        errdefer lab.transport.deinit();
+        lab.thread = try std.Thread.spawn(.{}, serveWrap, .{&lab.ca_server});
+    }
+
+    fn stop(lab: *MiniLab) void {
+        lab.transport.deinit(); // idle keep-alive connections first, or the shutdown drains them for ~10 s
+        if (lab.thread) |t| {
+            lab.ca_server.shutdown();
+            t.join();
+        }
+        lab.ca_server.deinit();
+        lab.ca_router.deinit();
+        lab.threaded.deinit();
+    }
+};
+
+test "AcmeIssuer.windowFn: the CA's ARI Retry-After reaches the manager's window" {
+    var lab: MiniLab = undefined;
+    try lab.start();
+    defer lab.stop();
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(77)));
+    var c = Client.init(lab.threaded.io(), testing.allocator, &lab.transport, &account_key, .{ .directory_url = lab.dir_url });
+    defer c.deinit();
+    var ai: Manager.AcmeIssuer = .{ .client = &c, .name = "mini" };
+    const iss = ai.issuer();
+    var diag: Manager.Diagnostics = .{};
+    const w = try iss.renewal_window.?(iss.ctx, chainOf(fx.a1_crt), &diag);
+    try testing.expectEqual(@as(i64, day), w.end - w.start);
+    // mutation 2026-10-23: #248 -- dropped on the way from `Client.RenewalInfo`.
+    try testing.expectEqual(@as(?u64, 21600), w.retry_after_s);
+}
+
+test "AcmeIssuer.issueFn: only a CA refusal (AcmeProblem) is retried without `replaces`" {
+    var lab: MiniLab = undefined;
+    try lab.start();
+    defer lab.stop();
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    try jws.Es256.KeyPair.generateDeterministicInto(&account_key, &@as([32]u8, @splat(78)));
+    var c = Client.init(lab.threaded.io(), testing.allocator, &lab.transport, &account_key, .{ .directory_url = lab.dir_url });
+    defer c.deinit();
+    var ai: Manager.AcmeIssuer = .{ .client = &c, .name = "mini" };
+    const iss = ai.issuer();
+    var diag: Manager.Diagnostics = .{};
+
+    // Without `replaces`: one attempt; it reaches newNonce, which answers
+    // without Replay-Nonce (MalformedResponse, not a CA problem document).
+    const names: []const []const u8 = &.{"a.example"};
+    const plain: Manager.IssueRequest = .{ .names = names };
+    try testing.expectError(error.IssueFailed, iss.issue(iss.ctx, testing.allocator, &plain, &diag));
+    const per_attempt = lab.ca.nonce_hits.load(.acquire);
+    try testing.expect(per_attempt >= 1);
+
+    // With `replaces`: the same single attempt -- a transport-level failure
+    // says nothing about `replaces`. mutation 2026-10-23: #243 -- retrying on
+    // any error doubles the requests.
+    const renewal: Manager.IssueRequest = .{ .names = names, .replaces = "aYhba4dGQEHhs3uEe6CuLN4ByNQ.AIdlQyE" };
+    try testing.expectError(error.IssueFailed, iss.issue(iss.ctx, testing.allocator, &renewal, &diag));
+    try testing.expectEqual(2 * per_attempt, lab.ca.nonce_hits.load(.acquire));
+}
+
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
@@ -1657,4 +2342,33 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk rep_final;
     };
     return &rep_result;
+}
+
+/// A policy that, while it is being asked, has the name `manage`d and
+/// issued — what a second handshake (or the operator) racing this one does.
+const RacingPolicy = struct {
+    m: *Manager = undefined,
+    fn allow(ctx: ?*anyopaque, name: []const u8) bool {
+        const p: *RacingPolicy = @ptrCast(@alignCast(ctx.?));
+        p.m.manage(&.{name}) catch return false;
+        _ = p.m.maintain();
+        return true;
+    }
+};
+
+// mutation 2026-10-23: #199
+test "on-demand: a name managed while the policy was asked is served from that entry" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: RacingPolicy = .{};
+    var fake: FakeIssuer = .{ .script = &.{.{ .ok = .{ .chain = chainOf(fx.od1_crt), .key = fx.od1_key } }} };
+    var m = f.manager(.{ .storage = undefined, .on_demand = .{ .ctx = &policy, .allow = RacingPolicy.allow } });
+    defer m.deinit();
+    policy.m = &m;
+    try m.addIssuer(fake.issuer(false));
+    // The on-demand add finds the name taken (AlreadyManaged) and serves the
+    // managed entry's certificate instead of none.
+    try expectServes(&m, "od.example", chainOf(fx.od1_crt));
+    try testing.expectEqual(@as(usize, 1), fake.calls);
 }

@@ -1960,3 +1960,92 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ── mutation follow-up 2026-10-23: the survivors that were plain gaps ───────
+
+test "isValidToken: 256 characters is the longest token" {
+    // mutation 2026-10-23: #332
+    try testing.expect(isValidToken(strRepeat("x", 256)));
+    try testing.expect(!isValidToken(strRepeat("x", 257)));
+    const kp = try rfc7515KeyPair();
+    var buf: [max_key_authorization_len]u8 = undefined;
+    const ka = try keyAuthorization(&buf, strRepeat("x", 256), kp.public_key);
+    try testing.expectEqual(@as(usize, max_key_authorization_len), ka.len);
+}
+
+test "verifyEab: an empty part is malformed; an alg other than HS256 is unsupported even under a valid MAC" {
+    // mutation 2026-10-23: #337 #338
+    const gpa = testing.allocator;
+    const key = "eab-hmac-key";
+    const hs256_head = try base64UrlEncodeAlloc(gpa, "{\"alg\":\"HS256\",\"kid\":\"k1\",\"url\":\"https://ca.example/new-acct\"}");
+    defer gpa.free(hs256_head);
+
+    // An empty signature, and an empty protected header with some signature.
+    const no_sig = try gpa.print("{{\"protected\":\"{s}\",\"payload\":\"e30\",\"signature\":\"\"}}", .{hs256_head});
+    defer gpa.free(no_sig);
+    try testing.expectError(error.MalformedJws, verifyEab(gpa, no_sig, key));
+    try testing.expectError(error.MalformedJws, verifyEab(gpa, "{\"protected\":\"\",\"payload\":\"e30\",\"signature\":\"AAAA\"}", key));
+
+    // The header names HS384, the MAC is the right HS256 one over the signing input.
+    const hs384_head = try base64UrlEncodeAlloc(gpa, "{\"alg\":\"HS384\",\"kid\":\"k1\",\"url\":\"https://ca.example/new-acct\"}");
+    defer gpa.free(hs384_head);
+    const input = try gpa.print("{s}.e30", .{hs384_head});
+    defer gpa.free(input);
+    const mac = hs256(key, input);
+    var mac_b64: [base64UrlLen(mac.len)]u8 = undefined;
+    _ = b64.Encoder.encode(&mac_b64, &mac);
+    const wrong_alg = try gpa.print("{{\"protected\":\"{s}\",\"payload\":\"e30\",\"signature\":\"{s}\"}}", .{ hs384_head, mac_b64 });
+    defer gpa.free(wrong_alg);
+    try testing.expectError(error.UnsupportedJws, verifyEab(gpa, wrong_alg, key));
+
+    // Control: the same construction with HS256 verifies.
+    const input256 = try gpa.print("{s}.e30", .{hs256_head});
+    defer gpa.free(input256);
+    const mac256 = hs256(key, input256);
+    var mac256_b64: [base64UrlLen(mac256.len)]u8 = undefined;
+    _ = b64.Encoder.encode(&mac256_b64, &mac256);
+    const good = try gpa.print("{{\"protected\":\"{s}\",\"payload\":\"e30\",\"signature\":\"{s}\"}}", .{ hs256_head, mac256_b64 });
+    defer gpa.free(good);
+    var v = try verifyEab(gpa, good, key);
+    defer v.deinit();
+    try testing.expectEqualStrings("k1", v.kid);
+}
+
+test "RS256 JWK: 4096 bits is the largest modulus accepted, 4097 is refused" {
+    // mutation 2026-10-23: #349 (the all-zero signature reaches the verifier only for an accepted key)
+    const gpa = testing.allocator;
+    var n4096: [512]u8 = @splat(0xc3);
+    n4096[511] = 0x01; // odd
+    const n4096_b64 = try base64UrlEncodeAlloc(gpa, &n4096);
+    defer gpa.free(n4096_b64);
+    const jwk4096 = try gpa.print("{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{n4096_b64});
+    defer gpa.free(jwk4096);
+    const at_max = try craftJwsRaw(gpa, "RS256", jwk4096, 512);
+    defer gpa.free(at_max);
+    try testing.expectError(error.BadSignature, verifyFlattenedAny(gpa, at_max, null));
+
+    var n4097: [513]u8 = @splat(0xc3);
+    n4097[0] = 0x01; // one bit over
+    n4097[512] = 0x01;
+    const n4097_b64 = try base64UrlEncodeAlloc(gpa, &n4097);
+    defer gpa.free(n4097_b64);
+    const jwk4097 = try gpa.print("{{\"e\":\"AQAB\",\"kty\":\"RSA\",\"n\":\"{s}\"}}", .{n4097_b64});
+    defer gpa.free(jwk4097);
+    const over = try craftJwsRaw(gpa, "RS256", jwk4097, 513);
+    defer gpa.free(over);
+    try testing.expectError(error.MalformedJws, verifyFlattenedAny(gpa, over, null));
+}
+
+test "EC JWK: a y coordinate of the wrong length is refused, short or long" {
+    // mutation 2026-10-23: #350 (an unchecked y would trip the copy into the SEC1 buffer)
+    const gpa = testing.allocator;
+    const too_long = try base64UrlEncodeAlloc(gpa, &@as([33]u8, @splat(0x11)));
+    defer gpa.free(too_long);
+    for ([_][]const u8{ "AA", too_long }) |y| {
+        const jwk = try gpa.print("{{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}", .{ rfc7515_x, y });
+        defer gpa.free(jwk);
+        const crafted = try craftJwsRaw(gpa, "ES256", jwk, 64);
+        defer gpa.free(crafted);
+        try testing.expectError(error.MalformedJws, verifyFlattenedAny(gpa, crafted, null));
+    }
+}

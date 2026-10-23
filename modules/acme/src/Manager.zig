@@ -116,7 +116,9 @@ pub const Options = struct {
     /// How soon to look again while another node holds the issuance lock.
     lock_poll_s: u32 = 60,
     /// This node's lock-owner name (1..32 of `[A-Za-z0-9._@+-]`, else `init`
-    /// panics); null: a random one per `Manager`.
+    /// panics); null: a random one per `Manager`. Must be unique per node:
+    /// the issuance lock is re-entrant for its owner id, so two nodes (or two
+    /// managers on one storage) with the same id both "hold" it.
     node_id: ?[]const u8 = null,
     /// Also write HTTP-01 / TLS-ALPN-01 challenge data to `storage`, and
     /// fall back to it when a token is not found locally: the node the CA
@@ -152,7 +154,10 @@ pub const Clock = struct {
 /// On-demand issuance: a certificate is obtained during the first TLS
 /// handshake for a name nobody `manage`d. Without `allow` an attacker could
 /// make the server order a certificate for every name it sends — so it is
-/// required.
+/// required. An on-demand entry that holds a certificate stays managed
+/// afterwards (renewed by `maintain`, never evicted): the set grows by one
+/// entry per allowed name, so `allow` must name a bounded set. Only a name
+/// that never got a certificate is forgotten after its failure back-off.
 pub const OnDemand = struct {
     ctx: ?*anyopaque = null,
     /// May a certificate be obtained for `name` (lower-case, no trailing
@@ -164,6 +169,11 @@ pub const OnDemand = struct {
     /// After a failed on-demand issuance, handshakes for that name get no
     /// certificate for this long, without asking the CA again.
     failure_backoff_s: u32 = 5 * 60,
+    /// How long a handshake waits for an issuance already in flight for its
+    /// name, then gets no certificate (autocert bounds the same wait with its
+    /// handshake timeout). Not a limit on the handshake that started the
+    /// issuance.
+    wait_ms: u32 = 30_000,
 };
 
 /// `window_s` 0 means no limit; `max` 0 means no on-demand issuance at all.
@@ -404,7 +414,12 @@ const Entry = struct {
 
 /// Keep one certificate covering `names` current: loaded from storage or
 /// obtained on the next `maintain`. Names are hostnames, `*.` wildcards
-/// (they need a DNS-01 issuer) or IP literals; they are lower-cased.
+/// (they need a DNS-01 issuer) or IP literals; they are lower-cased. A name
+/// twice in the list (case aside) is `error.InvalidName`.
+///
+/// The storage files are named after `names[0]`: two managers sharing one
+/// storage (a fleet) must give the same list, first name included, or they
+/// neither share the certificate nor the issuance lock.
 pub fn manage(m: *Manager, names: []const []const u8) Error!void {
     _ = try m.addEntry(names, false);
     m.wake.store(true, .release);
@@ -416,6 +431,9 @@ pub fn manage(m: *Manager, names: []const []const u8) Error!void {
 fn addEntry(m: *Manager, names: []const []const u8, on_demand: bool) Error!*Entry {
     if (names.len == 0 or names.len > max_names) return error.InvalidName;
     for (names) |n| if (!validName(n)) return error.InvalidName;
+    // One name twice (also differing in case only) would be inserted into
+    // `by_name` twice.
+    for (names, 0..) |n, i| for (names[0..i]) |p| if (std.ascii.eqlIgnoreCase(n, p)) return error.InvalidName;
 
     const e = try m.gpa.create(Entry);
     errdefer m.gpa.destroy(e);
@@ -444,12 +462,14 @@ fn addEntry(m: *Manager, names: []const []const u8, on_demand: bool) Error!*Entr
     return e;
 }
 
-/// Stop managing the certificate whose first name is `name` (stored files
-/// are kept). False when no such certificate.
+/// Stop managing the certificate whose first name is `name` (case-insensitive,
+/// a trailing dot is ignored; stored files are kept). False when no such
+/// certificate.
 pub fn unmanage(m: *Manager, name: []const u8) bool {
-    var lower_buf: [253]u8 = undefined;
-    if (name.len > lower_buf.len) return false;
-    const lower = std.ascii.lowerString(&lower_buf, name);
+    var lower_buf: [255]u8 = undefined; // `*.` + a 253-character name
+    const trimmed = std.mem.trimEnd(u8, name, ".");
+    if (trimmed.len == 0 or trimmed.len > lower_buf.len) return false;
+    const lower = std.ascii.lowerString(&lower_buf, trimmed);
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
     const e = m.by_name.get(lower) orelse return false;
@@ -606,7 +626,7 @@ fn obtain(m: *Manager, e: *Entry, t: i64) void {
     const locked = m.options.storage.tryLock(lock_name, m.nodeId(), t, m.options.lock_lease_s) catch |err| {
         var d: Diagnostics = .{};
         d.note(@errorName(err));
-        return m.failed(e, t, &d, "storage lock failed");
+        return m.failed(e, &d, "storage lock failed");
     };
     if (!locked) {
         // Another node is issuing; its result lands in storage.
@@ -719,7 +739,7 @@ fn issue(m: *Manager, e: *Entry, t: i64) void {
         return;
     }
     if (retry_after) |ra| d.retry_after_s = @max(d.retry_after_s orelse 0, ra);
-    m.failed(e, t, &d, "issuance failed");
+    m.failed(e, &d, "issuance failed");
 }
 
 fn storePair(m: *Manager, e: *const Entry, key_pem: []const u8, chain_pem: []const u8) bool {
@@ -752,7 +772,9 @@ fn install(m: *Manager, e: *Entry, ct: Cert, t: i64, source: Event.Source, issue
     e.ari_end = 0;
     e.failures = 0;
     e.retry_at = 0;
+    const removed = e.removed;
     m.mutex.unlock(m.io);
+    if (removed) return; // `unmanage`d meanwhile: not reported
     // The entry is busy, so `e.cert` cannot change under the hook.
     m.emit(&.{ .installed = .{
         .names = namesView(e),
@@ -783,20 +805,38 @@ fn backoffS(failures: u32, cap: u32) i64 {
     return @min(@as(i64, 60) << shift, cap);
 }
 
-fn failed(m: *Manager, e: *Entry, t: i64, d: *const Diagnostics, fallback: []const u8) void {
+/// Record a failed attempt and schedule the next one from the current time
+/// (an issuance can last minutes, so not from the round's start).
+fn failed(m: *Manager, e: *Entry, d: *const Diagnostics, fallback: []const u8) void {
+    const t = m.now();
     m.mutex.lockUncancelable(m.io);
     e.failures +|= 1;
     var wait = backoffS(e.failures, m.options.max_backoff_s);
     if (e.on_demand and e.cert == null) if (m.options.on_demand) |od| {
         wait = @max(wait, od.failure_backoff_s);
     };
-    if (d.retry_after_s) |ra| wait = @max(wait, @as(i64, @intCast(@min(ra, 365 * std.time.s_per_day))));
+    const plain_wait = wait;
+    // A CA's Retry-After is a floor, at most a year long; in the last hour
+    // of a certificate (below) at most a day.
+    var floor: i64 = 0;
+    if (d.retry_after_s) |ra| {
+        wait = @max(wait, @as(i64, @intCast(@min(ra, 365 * std.time.s_per_day))));
+        floor = @intCast(@min(ra, std.time.s_per_day));
+    }
     e.retry_at = t + wait;
     // A valid certificate is retried before it expires, whatever the CA's
-    // Retry-After said.
-    if (e.cert) |ct| e.retry_at = @min(e.retry_at, @max(t + 60, ct.not_after - 3600));
+    // Retry-After said — but only while that can still help: the cap is the
+    // later of "the back-off, at most ten minutes" and "an hour before the
+    // end", so an expired certificate keeps the exponential back-off instead
+    // of a retry every minute. The Retry-After floor holds even then.
+    if (e.cert) |ct| {
+        const cap = @max(t + @min(plain_wait, 600), ct.not_after - 3600);
+        e.retry_at = @max(@min(e.retry_at, cap), t + floor);
+    }
     const retry_at = e.retry_at;
+    const removed = e.removed;
     m.mutex.unlock(m.io);
+    if (removed) return; // `unmanage`d meanwhile: nothing to report
     m.emit(&.{ .failed = .{
         .names = namesView(e),
         .problem = if (d.problem_len != 0) d.problem() else fallback,
@@ -815,6 +855,8 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
 
     const ct = e.cert.?; // busy: stable
     var unsupported = true;
+    // The longest Retry-After any issuer gave on a failed poll.
+    var retry_after: ?u64 = null;
     for (issuers_buf[0..count]) |slot| {
         const iss = slot.issuer;
         const window_fn = iss.renewal_window orelse continue;
@@ -823,7 +865,10 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
         const result = window_fn(iss.ctx, ct.chain_pem, &d);
         slot.lock.unlock(m.io);
         const w = result catch |err| {
-            if (err != error.NotSupported) unsupported = false;
+            if (err != error.NotSupported) {
+                unsupported = false;
+                if (d.retry_after_s) |ra| retry_after = @max(retry_after orelse 0, ra);
+            }
             continue;
         };
         m.mutex.lockUncancelable(m.io);
@@ -847,7 +892,13 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
     }
     m.mutex.lockUncancelable(m.io);
     defer m.mutex.unlock(m.io);
-    e.ari_at = if (unsupported) null else t + m.options.ari_poll_s;
+    if (unsupported) {
+        e.ari_at = null;
+    } else {
+        // As on success: the CA's Retry-After (at most a week), a minute at least.
+        const poll: i64 = if (retry_after) |ra| @intCast(@min(ra, 7 * std.time.s_per_day)) else m.options.ari_poll_s;
+        e.ari_at = t + @max(poll, 60);
+    }
 }
 
 fn emit(m: *Manager, event: *const Event) void {
@@ -862,7 +913,9 @@ fn emit(m: *Manager, event: *const Event) void {
 /// there is none. An empty `sni` means `Options.default_server_name`.
 /// With `Options.on_demand`, an unmanaged name the policy allows is
 /// obtained now — the call then blocks for the issuance, and concurrent
-/// calls for the same name wait for the same result. (Two allocations per
+/// calls for the same name wait for the same result, at most
+/// `OnDemand.wait_ms` (then they get null) — so a call can block up to that
+/// long, or for the whole issuance when it is the one that started it. (Two allocations per
 /// call; a server with a certificate store of its own installs from
 /// `Options.on_event` instead and asks here only for on-demand names.)
 pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemory}!?Material {
@@ -874,6 +927,7 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     if (!x509.isValidDomain(name)) return null;
     const t = m.now(); // the caller's clock, read outside the lock
 
+    var deadline: ?std.Io.Timeout = null;
     m.mutex.lockUncancelable(m.io);
     while (m.lookup(name)) |e| {
         if (e.cert) |ct| {
@@ -884,7 +938,18 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
         // that result. A `manage`d name's first issuance (which may take
         // minutes) is not waited for — the handshake gets nothing.
         if (e.busy and e.on_demand) {
-            m.idle.waitUncancelable(m.io, &m.mutex);
+            const wait_ms = if (m.options.on_demand) |od| od.wait_ms else 0;
+            const dl = deadline orelse blk: {
+                const d: std.Io.Timeout = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(wait_ms), .clock = .awake } }).toDeadline(m.io);
+                deadline = d;
+                break :blk d;
+            };
+            // The mutex is held again when this returns, an error included.
+            // Timed out (or canceled): no certificate for this handshake.
+            m.idle.waitTimeout(m.io, &m.mutex, dl) catch {
+                m.mutex.unlock(m.io);
+                return null;
+            };
             continue;
         }
         if (e.on_demand and !e.busy and t >= e.retry_at) {
@@ -899,6 +964,9 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     m.mutex.unlock(m.io);
 
     const od = m.options.on_demand orelse return null;
+    // An IP literal is never a hostname to order for (and `isValidDomain`
+    // accepts a dotted quad): it reaches neither the policy nor the CA.
+    if (netaddr.parseIp(name) != null) return null;
     if (!od.allow(od.ctx, name)) return null;
 
     m.mutex.lockUncancelable(m.io);
@@ -1138,7 +1206,8 @@ pub const CheckError = error{
     MalformedChain,
     /// The chain does not verify to the anchors (signature, CA flags, EKU).
     Untrusted,
-    /// Outside its validity window at the time of the check.
+    /// Outside its validity window at the time of the check (or valid only
+    /// from more than a day in the future).
     Expired,
     /// A managed name is not in the leaf's subjectAltName.
     NameNotCovered,
@@ -1172,6 +1241,9 @@ pub fn checkPair(
     const nb: i64 = @intCast(validity.not_before);
     const na: i64 = @intCast(validity.not_after);
     if (t >= na) return error.Expired;
+    // A certificate that starts more than a day ahead of our clock is not
+    // one to serve (a little skew is tolerated, see below).
+    if (nb - t > std.time.s_per_day) return error.Expired;
 
     // A fresh certificate may start a little in the future (clock skew; CAs
     // backdate, not all of them): judge the chain from its own start then.
@@ -1386,8 +1458,19 @@ pub const AcmeIssuer = struct {
     }
 
     fn fail(a: *AcmeIssuer, diag: *Diagnostics, err: Client.Error) IssueError {
-        diag.note(a.client.lastProblem() orelse @errorName(err));
-        diag.retry_after_s = a.client.retryAfter();
+        // The client keeps the last problem document and Retry-After of the
+        // last request the CA refused: only an error that came from such a
+        // refusal may report them (a transport error would show stale ones).
+        const from_ca = switch (err) {
+            error.AcmeProblem, error.RateLimited, error.AuthorizationFailed, error.OrderFailed => true,
+            else => false,
+        };
+        if (from_ca) {
+            diag.note(a.client.lastProblem() orelse @errorName(err));
+            diag.retry_after_s = a.client.retryAfter();
+        } else {
+            diag.note(@errorName(err));
+        }
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.RateLimited => error.RateLimited,
@@ -1452,4 +1535,29 @@ test "rsaPublicEql: modulus bytes and exponent both count, a different bit lengt
     try t.expect(!rsaPublicEql(&a, &other_e));
     try t.expect(!rsaPublicEql(&a, &shorter));
     try t.expect(!rsaPublicEql(&shorter, &a));
+}
+
+test "AcmeIssuer.fail: only a CA refusal reports the client's last problem and Retry-After" {
+    const c = try std.testing.allocator.create(Client);
+    defer std.testing.allocator.destroy(c);
+    @memcpy(c.problem_buf[0..5], "stale");
+    c.problem_len = 5;
+    c.problem_retry_after_s = 3600;
+    var ai: AcmeIssuer = .{ .client = c, .name = "t" };
+    // A transport error carries no Retry-After and no old problem text.
+    for ([_]Client.Error{ error.HttpFailed, error.Timeout, error.PollTimeout }) |err| {
+        var d: Diagnostics = .{};
+        try std.testing.expect(ai.fail(&d, err) == error.IssueFailed);
+        try std.testing.expectEqual(@as(?u64, null), d.retry_after_s);
+        try std.testing.expectEqualStrings(@errorName(err), d.problem());
+    }
+    for ([_]Client.Error{ error.AcmeProblem, error.AuthorizationFailed, error.OrderFailed }) |err| {
+        var d: Diagnostics = .{};
+        try std.testing.expect(ai.fail(&d, err) == error.IssueFailed);
+        try std.testing.expectEqual(@as(?u64, 3600), d.retry_after_s);
+        try std.testing.expectEqualStrings("stale", d.problem());
+    }
+    var d: Diagnostics = .{};
+    try std.testing.expect(ai.fail(&d, error.RateLimited) == error.RateLimited);
+    try std.testing.expectEqual(@as(?u64, 3600), d.retry_after_s);
 }
