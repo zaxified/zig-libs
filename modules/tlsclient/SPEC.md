@@ -200,7 +200,9 @@ the handshake, and their tests at the end of the file. The offline test
 Also re-apply the 2026-10-11 performance changes, all marked `zig-libs
 tlsclient`: `KeyShare.init` taking its P-256/P-384 pairs from `keygen.zig`,
 and `CertificatePublicKey.verifySignature` routing P-256 to `p256` and RSA to
-`rsa.VerifyKey` (and, since 2026-10-13, P-384 everywhere to `p384`).
+`rsa.VerifyKey` (and, since 2026-10-13, P-384 everywhere to `p384`). And the
+2026-10-23 fix in the handshake record read: an alert under the handshake key
+is `TlsAlert` (std: `TlsUnexpectedMessage`), marked the same way.
 `keygen.zig`'s std copy (`deterministicSecret`) is pinned by its differential
 tests against the new std; re-copy it if those go red.
 

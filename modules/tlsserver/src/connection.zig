@@ -571,6 +571,71 @@ test "a transport that ends mid-handshake is EndOfStream" {
     try testing.expectError(error.EndOfStream, c.handshake());
 }
 
+test "a full reader buffer under max_record_len is refused, not asked for more" {
+    // `init` asserts the length; ReleaseFast drops the assert, so `step`
+    // refuses too. Swapped in after `init` to reach that check in any mode.
+    var prng = std.Random.DefaultPrng.init(3);
+    const ck: server_mod.CertifiedKey = undefined;
+    const cfg: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var in_buf: [record.max_record_len]u8 = undefined;
+    var reader: std.Io.Reader = .fixed(in_buf[0..0]);
+    reader.buffer = &in_buf;
+    var out_buf: [4096]u8 = undefined;
+    var sink: Sink = .init(testing.allocator, &out_buf);
+    defer sink.deinit();
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var c: Connection = .init(&cfg, &reader, &sink.writer, &joiner);
+    defer c.deinit();
+    // A ClientHello record's first 16 octets, filling the small buffer.
+    var small_buf = [_]u8{ 22, 3, 1, 0, 200, 1, 0, 0, 196, 3, 3, 0, 0, 0, 0, 0 };
+    var small: std.Io.Reader = .fixed(&small_buf);
+    c.input = &small;
+    try testing.expectError(error.ReadFailed, c.handshake());
+}
+
+/// Runtime-known, so the test below is analysed in every mode; only the
+/// optimizer inlines, so only optimized builds can show the frame it guards.
+var frame_test_enabled: bool = @import("builtin").mode != .debug;
+
+test "a read waits under a shallow frame: the handshake and the signer stay out of line" {
+    // A parked connection keeps the stack down to where its read waits: an
+    // inlined `onHandshake` (through `feed`) or `sign` made `step` 22.7 KiB,
+    // 3 resident pages per idle connection in qap. Measured here: from a
+    // caller's frame to the reader's `stream`, through `handshake` and `step`.
+    if (!@as(*volatile bool, &frame_test_enabled).*) return error.SkipZigTest;
+    const Probe = struct {
+        r: std.Io.Reader,
+        at: usize = 0,
+        fn stream(r: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const p: *@This() = @alignCast(@fieldParentPtr("r", r));
+            p.at = @frameAddress();
+            return error.EndOfStream;
+        }
+        /// The top of the measured range: above it lie only the test's
+        /// buffers.
+        fn handshake(c: *Connection, top: *usize) Error!void {
+            top.* = @frameAddress();
+            return c.handshake();
+        }
+    };
+    var prng = std.Random.DefaultPrng.init(3);
+    const ck: server_mod.CertifiedKey = undefined;
+    const cfg: server_mod.Config = .{ .certificate = .{ .fixed = &ck }, .random = prng.random() };
+    var in_buf: [record.max_record_len]u8 = undefined;
+    var probe: Probe = .{ .r = .{ .vtable = &.{ .stream = Probe.stream }, .buffer = &in_buf, .seek = 0, .end = 0 } };
+    var out_buf: [4096]u8 = undefined;
+    var sink: Sink = .init(testing.allocator, &out_buf);
+    defer sink.deinit();
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var c: Connection = .init(&cfg, &probe.r, &sink.writer, &joiner);
+    defer c.deinit();
+    var top: usize = 0;
+    try testing.expectError(error.EndOfStream, @call(.never_inline, Probe.handshake, .{ &c, &top }));
+    try testing.expect(probe.at != 0 and probe.at < top);
+    // < 0.5 KiB of `step` since d240f4e1; either call inlined is ≥ 4.6 KiB.
+    try testing.expect(top - probe.at < 4096);
+}
+
 test "a writer that keeps its bytes (Writer.fixed) is refused, not corrupted" {
     var prng = std.Random.DefaultPrng.init(3);
     const ck: server_mod.CertifiedKey = undefined;
@@ -747,6 +812,8 @@ const GuardRig = struct {
         mode: enum { send_then_read, junk_after_slot, read_then_send },
         got: []u8,
         err: ?anyerror = null,
+        /// The server's alert, when the handshake ends in one (`error.TlsAlert`).
+        alert: std.crypto.tls.Alert = .{ .level = .warning, .description = .close_notify },
 
         fn run(p: *Peer) void {
             p.go() catch |err| {
@@ -774,6 +841,7 @@ const GuardRig = struct {
                 .entropy = &entropy,
                 .realtime_now = .fromNanoseconds(@as(i96, 1_900_000_000) * std.time.ns_per_s),
                 .min_version = .tls_1_3,
+                .alert = &p.alert,
             });
             switch (p.mode) {
                 .send_then_read => {
@@ -985,7 +1053,31 @@ test "an offloaded key signs through Connection.signer, after the flight so far 
         try testing.expectError(error.SignatureNeeded, g.conn.handshake());
         g.shutdown();
         peer_thread.join();
-        try testing.expect(peer.err != null);
+        try testing.expectEqual(@as(?anyerror, error.TlsAlert), peer.err);
+        try testing.expectEqual(std.crypto.tls.Alert.Description.internal_error, peer.alert.description);
+    }
+    {
+        // A signer that fails: the same, the client hears internal_error.
+        const Failing = struct {
+            fn sign(_: ?*anyopaque, _: u16, _: []const u8, _: []u8) error{SigningFailed}![]const u8 {
+                return error.SigningFailed;
+            }
+        };
+        const g = try GuardRig.create(gpa);
+        defer g.destroy();
+        g.ck.key = null;
+        g.ck.offload = .{ .schemes = &.{0x0403} };
+        g.conn.signer = .{ .ctx = null, .sign = Failing.sign };
+        var got: [1]u8 = undefined;
+        var peer: GuardRig.Peer = .{ .rig = g, .mode = .read_then_send, .got = &got };
+        var peer_thread: GuardRig.Joined = .{ .t = try std.Thread.spawn(.{}, GuardRig.Peer.run, .{&peer}) };
+        defer peer_thread.join();
+        errdefer g.shutdown();
+        try testing.expectError(error.SignatureNeeded, g.conn.handshake());
+        g.shutdown();
+        peer_thread.join();
+        try testing.expectEqual(@as(?anyerror, error.TlsAlert), peer.err);
+        try testing.expectEqual(std.crypto.tls.Alert.Description.internal_error, peer.alert.description);
     }
 }
 

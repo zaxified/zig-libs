@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix:** (std bug, remote server) an alert under the handshake key — a server refusing after its ServerHello, e.g. `internal_error` when its signer fails — ended `init` with `TlsUnexpectedMessage` and the description was lost. It is `TlsAlert` now, with `Options.alert` filled; only that record's octets are read as the alert. Found by `tlsserver`'s mutation run; regression test there (`connection.zig`, "an offloaded key signs through Connection.signer…"), negative control checked (without the fix: `TlsUnexpectedMessage`).
+
 - **2026-10-19** — **Fix:** (std bug, remote server; panic in safe builds, write past `read_buffer` in ReleaseFast) the application read path decrypts each record in place after the plaintext the caller still has buffered, and std only *asserted* there was room for the whole ciphertext. A `peek`/`fill` of more than is buffered (e.g. a delimiter search) with over `min_buffer_len - record` octets still buffered, met by a full-size record (a legal 2^14-octet one is enough on a `min_buffer_len` buffer with 261 octets buffered), now fails the read with `TlsRecordOverflow` instead. Regression test in `src/fuzz_test.zig` ("a full record with the caller's plaintext still buffered …"), negative control checked (fix reverted: the assert fires).
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

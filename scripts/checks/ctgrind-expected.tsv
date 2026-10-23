@@ -1326,7 +1326,7 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-tlsclient	ReleaseFast	kex	1	17	7d5ad51b7304d4bd	18dc5af726922286
+tlsclient	ReleaseFast	kex	1	17	057a749537bcbdd7	18dc5af726922286
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1339,7 +1339,7 @@ tlsclient	ReleaseFast	kex	1	17	7d5ad51b7304d4bd	18dc5af726922286
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	18801e923ae8944b	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	5913dd9dfbab52a1	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under
@@ -1379,8 +1379,8 @@ dtls	ReleaseFast	app	1	14	837948b7d3b86ece	ac0eb91f2511d729
 # Finished (length + timing_safe.eql), AEAD tags; (c) the inbound path over
 # records decrypted under PSK-derived keys (inbound next/dispatch, alert
 # classify, installRx). None branches on STEK or resumption-secret octets.
-tlsserver	ReleaseFast	hs	1	28	530212473fe151cf	18b712e147be54c3
-tlsserver	ReleaseFast	app	1	8	530212473fe151cf	ded7de421ed83ff8
+tlsserver	ReleaseFast	hs	1	28	75cffe8d243d9d91	18b712e147be54c3
+tlsserver	ReleaseFast	app	1	8	75cffe8d243d9d91	ded7de421ed83ff8
 # 2026-10-22 — ticket 74 -> 75 (RFC 7250): the decrypted ticket's format octet now also names a
 # raw-key leaf (format 4: TicketFields.parse) and its type is compared with this hello's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned: the harness replays the
@@ -1388,7 +1388,7 @@ tlsserver	ReleaseFast	app	1	8	530212473fe151cf	ded7de421ed83ff8
 # 2026-10-22 — ticket 75 -> 77 (QUIC): the format octet's range and the QUIC formats' extra
 # field (TicketFields.parse) and the ticket's transport compared with this connection's
 # (Resumable.accepts) — ticket metadata, class (a). Outputs re-pinned (recordings recaptured).
-tlsserver	ReleaseFast	ticket	1	77	530212473fe151cf	915935a402728fb8
+tlsserver	ReleaseFast	ticket	1	77	75cffe8d243d9d91	915935a402728fb8
 # 2026-10-22 — ech 384: the recorded Go ECH sessions (go-ech, go-ech-hrr) up to the first
 # flight with the ECH private key tainted. Read by stack (--stacks): 1 context below hpke is
 # std's X25519 identity verdict (curve25519.zig:77, `x2.isZero()` on the decap result — the
@@ -1400,7 +1400,7 @@ tlsserver	ReleaseFast	ticket	1	77	530212473fe151cf	915935a402728fb8
 # what the client encrypted, as the ticket rows' parse of a decrypted ticket; none branches
 # on the private key or the HPKE context. Hardening: the HPKE context is wiped after the
 # server flight (2026-10-22 review).
-tlsserver	ReleaseFast	ech	1	384	530212473fe151cf	c257fcbb1b68d8df
+tlsserver	ReleaseFast	ech	1	384	75cffe8d243d9d91	c257fcbb1b68d8df
 # quic-crypto (2026-10-10) — aes / chacha: a 1-RTT traffic secret tainted
 # through derivePacketKeys, advanceKeys, Protection.seal/open and header
 # protection (computeMask*, apply, remove). In-file 4 each, none a branch on a

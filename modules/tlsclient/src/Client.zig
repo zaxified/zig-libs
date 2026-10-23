@@ -862,6 +862,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                 if (record_ct != .application_data) return error.TlsUnexpectedMessage;
                 try record_decoder.ensure(record_len);
                 const cleartext_buf = &cleartext_bufs[cert_buf_index % 2];
+                const record_start = cleartext_fragment_end;
                 switch (handshake_cipher) {
                     inline else => |*p| {
                         const pv = &p.version.tls_1_3;
@@ -892,6 +893,16 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                 read_seq += 1;
                 cleartext_fragment_end -= 1;
                 const ct: tls.ContentType = @fromBackingInt(@intCast(cleartext_buf[cleartext_fragment_end]));
+                // zig-libs tlsclient: an alert under the handshake key (a
+                // server refusing after its ServerHello, RFC 8446 §6) is
+                // `TlsAlert` with its description; std called it an
+                // unexpected message. Only this record's octets: a partial
+                // handshake message may precede them in the buffer.
+                if (ct == .alert) {
+                    const a = cleartext_buf[record_start..cleartext_fragment_end];
+                    cleartext_fragment_end = record_start;
+                    break :content .{ tls.Decoder.fromTheirSlice(@constCast(a)), ct };
+                }
                 if (ct != .handshake) return error.TlsUnexpectedMessage;
                 break :content .{ tls.Decoder.fromTheirSlice(@constCast(cleartext_buf[cleartext_fragment_start..cleartext_fragment_end])), ct };
             },
