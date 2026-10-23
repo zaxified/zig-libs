@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **BREAKING:** `Guard.ban` and `Guard.greylist` return `error{StoreFull}!void` — a key the full store cannot track used to lose the ban silently. Fixed: eviction at capacity is O(1) (three LRU lists: idle, idle banned, live) — it walked every live and banned entry under the lock; an overfull `restore` keeps the most recently touched bans (records applied last to first); `init` checks its `Options` in every build mode (`@panic`, were debug-only asserts). Behavioural: closing a key's last connection counts as a touch for the LRU; `snapshot` lists ranges, then idle banned keys, live keys, other idle keys. Grade 1 (lead vs nginx `limit_conn`, `tools/nginx_probe`).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
 
 - **2026-10-18** — Ported to Zig 0.17.0. model-fuzz reach loop uses `@typeInfo(..).field_names` (`std.meta.fields` is gone). No behaviour change.

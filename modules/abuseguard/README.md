@@ -22,7 +22,9 @@ Provenance: original work of the zig-libs authors (MIT) — no third-party code.
 references: nginx `limit_conn` (BSD-2-Clause; documented behavior only) and
 fail2ban (GPL-2.0; **documented behavior only — no source consulted or
 copied**), plus the `ratelimit` sibling for the bounded-LRU/clock-injection
-store shape.
+store shape. Data: `tools/nginx_probe/nginx.conf` is a fixture of our own tooling for
+running Ubuntu's nginx binary as a black-box oracle (no nginx source or data
+reproduced).
 
 ## Layers
 
