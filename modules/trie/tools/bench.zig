@@ -31,6 +31,17 @@
 //! (default 3) rounds, each keeping its best. Ratios are ours/fst by wall time;
 //! the verdict is the WORST ratio over the timed rows. Arguments filter rows.
 //!
+//! A second foreign side, tools/cpp_bench (s-yata/darts-clone 0.32h and
+//! s-yata/marisa-trie 0.3.1 through `build.sh`: pinned fetch into
+//! tools/trie-cpp-vendor on the first run, then one g++ call), is timed the same
+//! way for the rows each library can do -- the "fastest in the field" of the
+//! card. darts-clone does exact lookups only (no enumeration under a prefix);
+//! marisa adds `predictive_search`; neither does ranges, automata or set
+//! operations, so those rows are fst-only. `marisa` is the library default,
+//! `marisa-fast` its speed setting (one trie, huge cache). The card's fastest
+//! figure is ours / min(fst, darts, marisa, marisa-fast) per row, worst over the
+//! timed rows. `BENCH_CPP=0` skips the C++ side (needs g++, git, network once).
+//!
 //! Not like-for-like, by construction: fst's index is a minimized transducer
 //! (smaller, see `size`), ours an un-minimized path-compressed trie; `build`
 //! compares a streaming builder on sorted input on both sides; fst `get` and
@@ -43,6 +54,9 @@ const trie = @import("trie");
 const bench_name = "bench-trie";
 const cargo_manifest = "modules/trie/tools/rust_bench/Cargo.toml";
 const rust_exe = "modules/trie/tools/rust_bench/target/release/trie_bench";
+const cpp_build = "modules/trie/tools/cpp_bench/build.sh";
+const cpp_exe = "modules/trie/tools/cpp_bench/target/trie_bench_cpp";
+const cpp_libs = [_][]const u8{ "darts", "marisa", "marisa-fast" };
 const ref_short = "fst";
 const ref_card = "BurntSushi/fst 0.4.7";
 
@@ -255,6 +269,8 @@ pub fn main(init: std.process.Init) !u8 {
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
 
     try rustBuild(arena, io);
+    const use_cpp = if (init.environ_map.get("BENCH_CPP")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_cpp) try cppBuild(arena, io);
     const d: Data = try setup(arena);
 
     var buf: [4096]u8 = undefined;
@@ -271,9 +287,12 @@ pub fn main(init: std.process.Init) !u8 {
         d.keys.len,
     });
     try w.print("{s:<14} {s:>13} {s:>13} {s:>8} {s:>7} {s:>7}  count / sum\n", .{ "row", "ours ns", ref_short ++ " ns", "ratio", "spr us", "spr ref" });
+    if (use_cpp) try w.print("{s:<14} {s:>13} {s:>13} {s:>13} {s:>9}  vs fastest (who)\n", .{ "", "darts ns", "marisa ns", "marisa-f ns", "ours/best" });
     try w.flush();
 
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
+    var worst_fast_row: []const u8 = "";
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
@@ -285,8 +304,15 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var ours: Side = .{};
         var ref: Side = .{};
+        var cpp: [cpp_libs.len]Side = @splat(.{});
+        // false once a library answers "unsupported" for this row
+        var cpp_ok: [cpp_libs.len]bool = @splat(use_cpp);
         for (0..rounds) |_| {
             ref.add(try rustRun(arena, io, name));
+            for (cpp_libs, 0..) |lib, li| {
+                if (!cpp_ok[li]) continue;
+                if (try cppRun(arena, io, lib, name)) |r| cpp[li].add(r) else cpp_ok[li] = false;
+            }
             ours.add(timeIt(io, &d, wi));
         }
         const ratio = ours.best_ns / ref.best_ns;
@@ -305,6 +331,33 @@ pub fn main(init: std.process.Init) !u8 {
             ratio,      100 * ours.spread(), 100 * ref.spread(),
             ours.count, ours.sum,            if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " != " ++ ref_short,
         });
+        if (use_cpp) {
+            var fastest_ns = ref.best_ns;
+            var fastest_who: []const u8 = ref_short;
+            try w.print("{s:<14}", .{""});
+            for (cpp_libs, 0..) |lib, li| {
+                if (!cpp_ok[li]) {
+                    try w.print(" {s:>13}", .{"-"});
+                    continue;
+                }
+                try w.print(" {d:>13.0}", .{cpp[li].best_ns});
+                max_spread = @max(max_spread, cpp[li].spread());
+                if (cpp[li].count != ref.count or cpp[li].sum != ref.sum) {
+                    mismatch = true;
+                    try w.print(" ({s}: {d} / {d} != {s})", .{ lib, cpp[li].count, cpp[li].sum, ref_short });
+                }
+                if (cpp[li].best_ns < fastest_ns) {
+                    fastest_ns = cpp[li].best_ns;
+                    fastest_who = lib;
+                }
+            }
+            const ratio_fast = ours.best_ns / fastest_ns;
+            if (!info and ratio_fast > worst_fast) {
+                worst_fast = ratio_fast;
+                worst_fast_row = name;
+            }
+            try w.print(" {d:>9.3}  ({s})\n", .{ ratio_fast, fastest_who });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -314,8 +367,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_cpp) try w.print("worst vs fastest = {d:.2} (row {s})\n", .{ worst_fast, worst_fast_row });
+    if (filters.len == 0) {
+        if (use_cpp)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× darts-clone 0.32h / marisa-trie 0.3.1 / fst (measured <today>)\n", .{ best, worst, ref_card, worst_fast })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
 }
@@ -383,6 +441,36 @@ fn rustRun(arena: std.mem.Allocator, io: std.Io, name: []const u8) !Row {
     const res = try std.process.run(arena, io, .{ .argv = &.{ rust_exe, name } });
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: Rust side failed on {s}:\n{s}\n", .{ bench_name, name, res.stderr });
+        return error.ForeignFailed;
+    }
+    var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');
+    if (!std.mem.eql(u8, f.next() orelse return error.BadForeignOutput, name)) return error.BadForeignOutput;
+    const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
+    const count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
+    const sum = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
+    return .{ .ns = ns, .count = count, .sum = sum };
+}
+
+/// Build the C++ side (`build.sh`: pinned fetch on the first run, one g++ call).
+fn cppBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the C++ side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{ .argv = &.{ "bash", cpp_build } }) catch |e| {
+        std.debug.print("{s}: could not run {s} ({t}) -- BENCH_CPP=0 skips the C++ side\n", .{ bench_name, cpp_build, e });
+        return error.CppBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: C++ build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CppBuildFailed;
+    }
+}
+
+/// `<exe> <lib> <row>`: null when the library cannot do the row (exit 3,
+/// `row<TAB>unsupported`), else the same four fields as the Rust side.
+fn cppRun(arena: std.mem.Allocator, io: std.Io, lib: []const u8, name: []const u8) !?Row {
+    const res = try std.process.run(arena, io, .{ .argv = &.{ cpp_exe, lib, name } });
+    if (res.term == .exited and res.term.exited == 3) return null;
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: C++ side ({s}) failed on {s}:\n{s}\n", .{ bench_name, lib, name, res.stderr });
         return error.ForeignFailed;
     }
     var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');

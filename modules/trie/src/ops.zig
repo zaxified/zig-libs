@@ -130,6 +130,9 @@ pub const OpIterator = struct {
         const bit = @as(u64, 1) << @intCast(i);
         const got = it.nextValue() catch |e| {
             if (e == error.TooComplex) return self.exhaust();
+            // A corrupt node or a failed allocation: the input's walk cannot
+            // be resumed, so neither can the operation.
+            self.done = true;
             return e;
         };
         if (got) |v| {
@@ -151,6 +154,7 @@ pub const OpIterator = struct {
     /// `indexes.len` entries always suffice). null when exhausted.
     /// `error.KeyTooLong` / `error.ValuesBufferTooSmall` leave the iterator
     /// where it was, so the same call with bigger buffers retries the key.
+    /// Any other error finishes it (later calls return null).
     pub fn next(self: *OpIterator, key_buf: []u8, values_buf: []IndexedValue) OpError!?OpItem {
         while (!self.done) {
             var p = self.pending;
@@ -335,7 +339,7 @@ test "KeyTooLong and ValuesBufferTooSmall leave the iterator where it was" {
     var it = try opIterator(testing.allocator, &.{ fa, fa }, .@"union", 0);
     defer it.deinit();
     var small: [4]u8 = undefined;
-    var big: [8]u8 = undefined;
+    var big: [5]u8 = undefined; // exactly "hello": a key that fits to the byte is not KeyTooLong
     var one: [1]IndexedValue = undefined;
     var two: [2]IndexedValue = undefined;
     try testing.expectError(error.KeyTooLong, it.next(&small, &two));
@@ -405,6 +409,53 @@ test "the budget is shared by all inputs and reported" {
         try testing.expect(total <= need - 1); // the TOTAL, not per input
         // Once spent, the iterator stays finished.
         try testing.expect((try it.next(&kb, &vb)) == null);
+    }
+    // Every budget, not just need - 1: the total never overshoots it, also when
+    // one input spends all of it before the next has decoded a single node.
+    var budget: usize = 1;
+    while (budget <= need) : (budget += 1) {
+        var it = try opIterator(testing.allocator, &idx, .@"union", budget);
+        defer it.deinit();
+        var n: usize = 0;
+        const cut = while (true) {
+            const r = it.next(&kb, &vb) catch |e| {
+                try testing.expectEqual(error.TooComplex, e);
+                break true;
+            };
+            if (r == null) break false;
+            n += 1;
+        };
+        try testing.expect(it.visitedTotal() <= budget);
+        try testing.expectEqual(cut, it.truncated());
+        try testing.expectEqual(budget < need, cut);
+        if (!cut) try testing.expectEqual(@as(usize, 600), n);
+    }
+}
+
+test "intersection and difference stop at the input that ends them" {
+    // A = {a}, B = 300 keys after it: once A is drained neither operation can
+    // emit another key, so B must not be walked to its end.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pb = try arena.alloc(builder.Pair, 300);
+    for (pb, 0..) |*p, i| p.* = .{ .key = try arena.print("b{d:0>5}", .{i}), .value = @intCast(i) };
+    const ba = try buildSet(&.{.{ .key = "a", .value = 1 }}, .{ .v2 = .{} });
+    defer testing.allocator.free(ba);
+    const bb = try buildSet(pb, .{ .v2 = .{} });
+    defer testing.allocator.free(bb);
+    const idx = [_]Frozen{ try Frozen.load(ba), try Frozen.load(bb) };
+
+    var kb: [16]u8 = undefined;
+    var vb: [2]IndexedValue = undefined;
+    for ([_]SetOp{ .intersection, .difference }) |op| {
+        var it = try opIterator(testing.allocator, &idx, op, 0);
+        defer it.deinit();
+        var n: usize = 0;
+        while (try it.next(&kb, &vb)) |_| n += 1;
+        try testing.expectEqual(@as(usize, if (op == .difference) 1 else 0), n);
+        // B's first key only (a handful of nodes), never its 300 keys.
+        try testing.expect(it.iters[1].visited < 20);
     }
 }
 

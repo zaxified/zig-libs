@@ -19,8 +19,10 @@
 //! rather than a silently slow or wrong search). Contract, as in fst
 //! (`automaton/mod.rs:41-66`):
 //!
-//!   * `canMatch(s)` false ⇒ no continuation of `s` is ever a match. The search
-//!     prunes the whole subtree there. Returning true too often is only slow.
+//!   * `canMatch(s)` false ⇒ no continuation of `s` is ever a match, the empty
+//!     one included (`isMatch(s)` is false too): the search prunes the node
+//!     and its whole subtree there without asking `isMatch`. Returning true
+//!     too often is only slow.
 //!   * `willAlwaysMatch(s)` true ⇒ every continuation of `s` is a match. The
 //!     search then stops feeding bytes below that point. Returning false too
 //!     often is only slow. (fst declares this hook but its own stream never

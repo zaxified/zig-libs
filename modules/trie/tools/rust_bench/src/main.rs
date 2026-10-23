@@ -20,6 +20,8 @@
 //	union_2        union of the even and the odd positions as two maps
 //	load           Map::new over the borrowed bytes (informational)
 //	size           count = index bytes (no timing)
+//	corrupt        NOT a timing row: robustness over damaged indexes, see
+//	               `corrupt` below; prints its own line
 //
 // Timing matches the Zig side: double the batch until one batch takes over
 // 100 ms, then keep the best of five.
@@ -151,6 +153,10 @@ fn main() {
     let name = std::env::args().nth(1).expect("row name");
     let d = gen();
     let refs: Vec<&Vec<u8>> = d.keys.iter().collect();
+    if name == "corrupt" {
+        corrupt(&refs);
+        return;
+    }
     let bytes = build(&refs, 0, 1);
     let map = Map::new(bytes.as_slice()).unwrap();
 
@@ -239,4 +245,59 @@ fn main() {
         }
     };
     println!("{name}\t{ns}\t{count}\t{sum}");
+}
+
+/// Robustness of fst's query path over a damaged index (the trie card's
+/// `**Ahead:**` correctness claim; the Zig side's counterpart is the module's
+/// seeded corrupt-buffer sweep). `Map::new` checks only the header and the
+/// root address -- its doc: "no verification on the integrity of the FST is
+/// performed ... the program will probably panic" -- and `Fst::verify` is a
+/// CRC, which whoever crafts a buffer recomputes, so neither is a defence
+/// against an untrusted index. An index of every 997th key (1 004 keys) gets
+/// 1..4 random byte overwrites per trial; each trial opens it, looks up every
+/// one of its keys and streams it (capped at 10 M keys: more than that from a
+/// 1 004-key index is a runaway walk), inside `catch_unwind`. Prints
+///
+///	corrupt  trials  panicked  runaway  refused-at-open  answered
+fn corrupt(refs: &[&Vec<u8>]) {
+    const TRIALS: u64 = 100_000;
+    const CAP: u64 = 10_000_000;
+    let small: Vec<&Vec<u8>> = refs.iter().step_by(997).copied().collect();
+    let good = build(&small, 0, 1);
+    std::panic::set_hook(Box::new(|_| {})); // count panics, do not print 100 000 of them
+    let mut rng = SplitMix(0x636f_7272);
+    let (mut panicked, mut runaway, mut refused, mut answered) = (0u64, 0u64, 0u64, 0u64);
+    for _ in 0..TRIALS {
+        let mut b = good.clone();
+        for _ in 0..1 + rng.next() % 4 {
+            let i = (rng.next() % b.len() as u64) as usize;
+            b[i] = rng.next() as u8;
+        }
+        let r = std::panic::catch_unwind(|| {
+            let m = match Map::new(b.as_slice()) {
+                Ok(m) => m,
+                Err(_) => return 1u8,
+            };
+            for k in &small {
+                black_box(m.get(k));
+            }
+            let mut st = m.stream();
+            let mut n = 0u64;
+            while let Some(kv) = st.next() {
+                black_box(kv);
+                n += 1;
+                if n > CAP {
+                    return 2u8;
+                }
+            }
+            0u8
+        });
+        match r {
+            Ok(0) => answered += 1,
+            Ok(1) => refused += 1,
+            Ok(_) => runaway += 1,
+            Err(_) => panicked += 1,
+        }
+    }
+    println!("corrupt\t{TRIALS}\t{panicked}\t{runaway}\t{refused}\t{answered}");
 }

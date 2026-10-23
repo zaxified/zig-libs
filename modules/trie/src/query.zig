@@ -501,6 +501,9 @@ pub const PrefixIterator = struct {
     /// `max_visited`: how `ops.zig` expresses "shared budget spent", which
     /// `max_visited == 0` (unbounded) cannot.
     hard_stop: bool = false,
+    /// The value of a key `next` could not copy out (`error.KeyTooLong`):
+    /// returned again by the next `next` instead of advancing.
+    unemitted: ?u32 = null,
 
     const Frame = struct {
         node: format.NodeView,
@@ -603,10 +606,15 @@ pub const PrefixIterator = struct {
 
     /// Next key, in lexicographic order, reconstructed into `key_buf` (which
     /// the returned `key` borrows). null when exhausted. `error.KeyTooLong` if
-    /// a key does not fit `key_buf`.
+    /// a key does not fit `key_buf`; the iterator stays on that key, so the same
+    /// call with a bigger buffer returns it. After any other error the
+    /// iterator is finished: do not call `next` again.
     pub fn next(self: *PrefixIterator, key_buf: []u8) (QueryError || Allocator.Error)!?Completion {
-        const v = (try self.nextValue()) orelse return null;
-        return try emit(self.path.items, v, key_buf);
+        const v = self.unemitted orelse ((try self.nextValue()) orelse return null);
+        self.unemitted = v;
+        const c = try emit(self.path.items, v, key_buf);
+        self.unemitted = null;
+        return c;
     }
 
     /// The key `nextValue` last returned, borrowed from the iterator: valid
@@ -633,8 +641,11 @@ pub const PrefixIterator = struct {
                 self.visited += 1;
                 const child = try format.follow(top.node, e.child);
                 const mark = self.path.items.len;
-                try self.path.append(self.gpa, e.label);
-                try self.path.appendSlice(self.gpa, child.tail);
+                // Reserve first: a failed allocation must not leave half a
+                // path behind.
+                try self.path.ensureUnusedCapacity(self.gpa, 1 + child.tail.len);
+                self.path.appendAssumeCapacity(e.label);
+                self.path.appendSliceAssumeCapacity(child.tail);
                 if (self.hi) |h| if (std.mem.order(u8, self.path.items, h) != .lt) {
                     // Every key from here on starts with this path or sorts
                     // after it: all ≥ hi. Done.
@@ -712,14 +723,23 @@ pub fn SearchIterator(comptime A: type) type {
         }
 
         /// Next matching key in ascending order, reconstructed into `key_buf`
-        /// (which the returned `key` borrows); null when exhausted.
+        /// (which the returned `key` borrows); null when exhausted. A key that
+        /// does not fit `key_buf` is `error.KeyTooLong` and is returned again
+        /// by a retry with a bigger buffer; one deeper than `max_depth` is
+        /// `error.KeyTooLong` too, and like every other error it finishes
+        /// the iterator.
         pub fn next(self: *Self, key_buf: []u8) (QueryError || Allocator.Error)!?Completion {
             while (self.stack.items.len > 0) {
                 const top = &self.stack.items[self.stack.items.len - 1];
                 if (!top.self_done) {
+                    if (top.node.terminal and (top.always or self.aut.isMatch(top.state))) {
+                        // `self_done` only once the key is out: KeyTooLong
+                        // leaves the frame on it, so a retry returns it.
+                        const c = try PrefixIterator.emit(self.path.items, top.node.value, key_buf);
+                        top.self_done = true;
+                        return c;
+                    }
                     top.self_done = true;
-                    if (top.node.terminal and (top.always or self.aut.isMatch(top.state)))
-                        return try PrefixIterator.emit(self.path.items, top.node.value, key_buf);
                 }
                 if (top.edge_idx >= top.node.edge_count) {
                     self.path.shrinkRetainingCapacity(top.mark);
@@ -764,8 +784,9 @@ pub fn SearchIterator(comptime A: type) type {
         fn push(self: *Self, label: u8, child: format.NodeView, st: A.State, always: bool) (QueryError || Allocator.Error)!void {
             const mark = self.path.items.len;
             if (mark + 1 + child.tail.len > max_depth) return error.KeyTooLong;
-            try self.path.append(self.gpa, label);
-            try self.path.appendSlice(self.gpa, child.tail);
+            try self.path.ensureUnusedCapacity(self.gpa, 1 + child.tail.len);
+            self.path.appendAssumeCapacity(label);
+            self.path.appendSliceAssumeCapacity(child.tail);
             try self.stack.append(self.gpa, .{ .node = child, .mark = mark, .state = st, .always = always });
         }
     };
@@ -939,14 +960,14 @@ test "prefixIterator.next: undersized key_buf is KeyTooLong, not a truncated/cor
     defer it1.deinit();
     var too_small: [4]u8 = undefined; // "hello" is 5 bytes
     try testing.expectError(error.KeyTooLong, it1.next(&too_small));
+    try testing.expectError(error.KeyTooLong, it1.next(&too_small));
 
-    // A fresh iterator (the failed attempt above already advanced `it1` past
-    // "hello" — `next` does not retry a slot it already tried to emit).
-    var it2 = try f.prefixIterator(testing.allocator, "");
-    defer it2.deinit();
-    var just_right: [5]u8 = undefined; // boundary: exactly key.len must succeed
-    const c = try it2.next(&just_right);
+    // The iterator stayed on "hello": the retry with a buffer of exactly
+    // key.len bytes (the boundary) returns it, then the walk goes on.
+    var just_right: [5]u8 = undefined;
+    const c = try it1.next(&just_right);
     try testing.expectEqualStrings("hello", c.?.key);
+    try testing.expect((try it1.next(&just_right)) == null);
 }
 
 test "topN: a reconstructed key crossing max_depth is KeyTooLong via the path_len gate specifically" {
@@ -1007,6 +1028,17 @@ test "topN (v2): a key whose compressed edge would cross max_depth is KeyTooLong
     defer testing.allocator.free(buf2);
     const f2 = try Frozen.load(buf2);
     try testing.expectError(error.KeyTooLong, f2.topN(k1[0 .. max_depth - 5], &results, &kb, .{}));
+
+    // `search` has the same gate (`mark + 1 + tail.len > max_depth` in its
+    // `push`), checked before the key ever reaches a `key_buf` that would hold it.
+    const am = automaton.AlwaysMatch{};
+    var it1 = try f1.search(testing.allocator, automaton.AlwaysMatch, &am, 0);
+    defer it1.deinit();
+    try testing.expectEqual(max_depth, (try it1.next(&kb)).?.key.len);
+    var it2 = try f2.search(testing.allocator, automaton.AlwaysMatch, &am, 0);
+    defer it2.deinit();
+    try testing.expectEqual(max_depth, (try it2.next(&kb)).?.key.len);
+    try testing.expectError(error.KeyTooLong, it2.next(&kb));
 }
 
 test "loadVerified rejects a body bit-flip that load accepts" {

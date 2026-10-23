@@ -36,6 +36,8 @@ __pycache__/
 
 # Cargo build trees of Rust reference sides under modules/*/tools/ (benches, vector generators)
 modules/*/tools/*/target/
+# Foreign sources a benchmark side fetches at pinned tags (modules/trie/tools/cpp_bench/build.sh).
+tools/trie-cpp-vendor/
 
 # Silesia corpus for the zstd bench (downloaded, not reproducible by a rebuild).
 # Outside modules/: check-copyleft walks every shipped module dir, ignored files too.

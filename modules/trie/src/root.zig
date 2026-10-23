@@ -623,7 +623,7 @@ test "search prunes on canMatch and stops feeding bytes on willAlwaysMatch (budg
     }
 }
 
-test "search: key_buf too small is KeyTooLong; AlwaysMatch equals prefixIterator" {
+test "search: key_buf too small is KeyTooLong, and the retry returns that same key" {
     const buf = try freezeFromPairs(testing.allocator, testing.allocator, &.{
         .{ .key = "hello", .value = 1 }, .{ .key = "help", .value = 2 },
     });
@@ -634,8 +634,118 @@ test "search: key_buf too small is KeyTooLong; AlwaysMatch equals prefixIterator
     defer it.deinit();
     var small: [4]u8 = undefined;
     try testing.expectError(error.KeyTooLong, it.next(&small)); // "hello" is 5
-    var kb: [8]u8 = undefined;
+    var kb: [5]u8 = undefined; // exactly "hello"
+    try testing.expectEqualStrings("hello", (try it.next(&kb)).?.key);
     try testing.expectEqualStrings("help", (try it.next(&kb)).?.key);
+    try testing.expect((try it.next(&kb)) == null);
+}
+
+/// `Counting(true, true)`'s machine, but it counts the bytes the search feeds
+/// to a state it may no longer feed: one `canMatch` rejected (dead, 3) or one
+/// `willAlwaysMatch` accepted (2). `Frozen.search` promises both never happen.
+const Strict = struct {
+    calls: *usize,
+    violations: *usize,
+    dead_start: bool = false,
+    pub const State = u8;
+    pub fn start(a: *const Strict) State {
+        return if (a.dead_start) 3 else 0;
+    }
+    pub fn isMatch(_: *const Strict, s: State) bool {
+        return s == 2;
+    }
+    pub fn canMatch(_: *const Strict, s: State) bool {
+        return s != 3;
+    }
+    pub fn willAlwaysMatch(_: *const Strict, s: State) bool {
+        return s == 2;
+    }
+    pub fn accept(a: *const Strict, s: State, byte: u8) State {
+        a.calls.* += 1;
+        if (s >= 2) a.violations.* += 1;
+        return switch (s) {
+            0 => if (byte == 'k') 1 else 3,
+            1 => if (byte == '0') 2 else 3,
+            else => s,
+        };
+    }
+};
+
+test "search never feeds a dead or an always-matching state, also inside a compressed edge" {
+    // Root edges 'k' and 'x' keep "k0xyz…" and "k9ab…" on compressed edges in
+    // v2: the state turns always-matching ('0') and dead ('9') in the middle
+    // of a tail, with children below that must not be fed either.
+    const sets = [_][]const builder.Pair{
+        &.{ .{ .key = "k0xyz1", .value = 1 }, .{ .key = "k0xyz2", .value = 2 }, .{ .key = "x", .value = 3 } },
+        &.{ .{ .key = "k9abc", .value = 1 }, .{ .key = "k9abd", .value = 2 }, .{ .key = "x", .value = 3 } },
+    };
+    for (all_formats) |fmt| {
+        for (sets, [_]usize{ 2, 0 }) |pairs, want| {
+            const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
+            defer testing.allocator.free(buf);
+            const f = try Frozen.load(buf);
+            var kb: [16]u8 = undefined;
+            var calls: usize = 0;
+            var bad: usize = 0;
+            const aut = Strict{ .calls = &calls, .violations = &bad };
+            var it = try f.search(testing.allocator, Strict, &aut, 0);
+            defer it.deinit();
+            var n: usize = 0;
+            while (try it.next(&kb)) |_| n += 1;
+            try testing.expectEqual(want, n);
+            try testing.expectEqual(@as(usize, 0), bad);
+
+            // A start state that cannot match walks nothing at all.
+            calls = 0;
+            const dead = Strict{ .calls = &calls, .violations = &bad, .dead_start = true };
+            var none = try f.search(testing.allocator, Strict, &dead, 0);
+            defer none.deinit();
+            try testing.expect((try none.next(&kb)) == null);
+            try testing.expectEqual(@as(usize, 0), none.visited);
+            try testing.expectEqual(@as(usize, 0), calls);
+        }
+    }
+}
+
+test "search budget: every budget is honoured to the node, and a cut search stays finished" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pairs = try arena.alloc(builder.Pair, 60);
+    for (pairs, 0..) |*p, i| p.* = .{ .key = try arena.print("k{d:0>3}", .{i * 7}), .value = @intCast(i) };
+    for (all_formats) |fmt| {
+        const buf = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        const am = automaton.AlwaysMatch{};
+        var kb: [16]u8 = undefined;
+        const need = blk: {
+            var it = try f.search(testing.allocator, automaton.AlwaysMatch, &am, 0);
+            defer it.deinit();
+            while (try it.next(&kb)) |_| {}
+            break :blk it.visited;
+        };
+        var budget: usize = 1;
+        while (budget <= need) : (budget += 1) {
+            var it = try f.search(testing.allocator, automaton.AlwaysMatch, &am, budget);
+            defer it.deinit();
+            var n: usize = 0;
+            const cut = while (true) {
+                const r = it.next(&kb) catch |e| {
+                    try testing.expectEqual(error.TooComplex, e);
+                    break true;
+                };
+                if (r == null) break false;
+                n += 1;
+            };
+            try testing.expect(it.visited <= budget);
+            try testing.expectEqual(cut, it.truncated());
+            try testing.expectEqual(budget < need, cut);
+            if (cut) {
+                try testing.expect((try it.next(&kb)) == null);
+            } else try testing.expectEqual(pairs.len, n);
+        }
+    }
 }
 
 /// Naive set operation over the per-index oracles. `all` is every distinct key
@@ -1280,6 +1390,70 @@ test "format 2: seeded corrupt-buffer sweep never panics, and reaches the walk" 
         try testing.expect(reach.search_ok > 70 and reach.search_err > 2000);
         try testing.expect(reach.ops_ok > 70 and reach.ops_err > 2000);
     }
+}
+
+test "format 2: the fst `corrupt` experiment, our side: damaged and re-sealed, refused or answered" {
+    // The counterpart of `trie_bench corrupt` (tools/rust_bench, the card's
+    // `**Ahead:**` correctness claim): the same key shape (`w<8 letters>/<n>`,
+    // ~1 000 keys), the same damage (1..4 random byte overwrites), and the
+    // checksums re-sealed every time -- fst's `Map::new` checks none, so this is
+    // the like-for-like door. Every damaged index must load or be refused, and
+    // every query must answer or fail with a typed error; a panic fails the
+    // test (Debug / ReleaseSafe). fst 0.4.7 panicked on 84 552 of 100 000.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var gen = std.Random.DefaultPrng.init(0x636f_7272);
+    const g = gen.random();
+    var keys: std.ArrayList([]const u8) = .empty;
+    for (0..1004) |_| {
+        var k: [16]u8 = undefined;
+        k[0] = 'w';
+        for (k[1..9]) |*c| c.* = 'a' + g.intRangeLessThan(u8, 0, 26);
+        k[9] = '/';
+        const n = (try std.mem.print(k[10..], "{d}", .{g.intRangeLessThan(u16, 0, 10_000)})).len;
+        try keys.append(arena, try arena.dupe(u8, k[0 .. 10 + n]));
+    }
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+    const pairs = try arena.alloc(builder.Pair, keys.items.len);
+    for (pairs, keys.items, 0..) |*p, k, i| p.* = .{ .key = k, .value = @intCast(i) };
+    const base = try freezeFromPairsWith(testing.allocator, testing.allocator, pairs, .{ .v2 = .{} });
+    defer testing.allocator.free(base);
+
+    const copy = try testing.allocator.alloc(u8, base.len);
+    defer testing.allocator.free(copy);
+    var refused: usize = 0;
+    var answered: usize = 0;
+    var typed_error: usize = 0;
+    var kb: [64]u8 = undefined;
+    for (0..2000) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        @memcpy(copy, base);
+        for (0..r.intRangeAtMost(usize, 1, 4)) |_| copy[r.intRangeLessThan(usize, 0, copy.len)] = r.int(u8);
+        resealV2(copy);
+        const f = Frozen.load(copy) catch {
+            refused += 1;
+            continue;
+        };
+        const ok = walk: {
+            for (keys.items) |k| _ = f.lookup(k) catch break :walk false;
+            var it = f.prefixIteratorBounded(testing.allocator, "", 10 * base.len) catch break :walk false;
+            defer it.deinit();
+            while (it.next(&kb) catch break :walk false) |_| {}
+            break :walk true;
+        };
+        if (ok) answered += 1 else typed_error += 1;
+    }
+    // Measured 2026-10-23: refused 2, answered 773, typed error 1225 (of
+    // 2000). Re-sealing gets nearly every damaged index past the door, and the
+    // walks meet the damage in most of them -- both sides of the claim.
+    try testing.expectEqual(@as(usize, 2000), refused + answered + typed_error);
+    try testing.expect(answered > 500 and typed_error > 500);
 }
 
 test "format 2: each load and decode check refuses its own damage" {

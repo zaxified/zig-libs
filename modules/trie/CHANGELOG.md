@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Behaviour:** `error.KeyTooLong` from `PrefixIterator.next` /
+  `SearchIterator.next` (a `key_buf` too small) now leaves the iterator on that key, so a retry
+  with a bigger buffer returns it; before, the key was skipped. Any other error finishes the
+  iterator (an `OpIterator` too), and a failed allocation no longer leaves a stray byte in the
+  path. **Audit:** independent review + 34-mutant run over the search / set-operation code (33
+  killed, 1 equivalent), five new tests from the survivors. **Card:** scope `ahead` (fst panics
+  on 84.6 % of damaged indexes with a matching checksum, this module on none; ranked top-N
+  pages; key ↔ rank), A1, and the fastest in the field measured: darts-clone's exact lookup is
+  2.13× faster on a miss, so P stays 2 and the grade 2. `bench-trie` times darts-clone 0.32h and
+  marisa-trie 0.3.1 beside fst (`tools/cpp_bench`); `trie_bench corrupt` is the fst side of the
+  robustness claim.
 - **2026-10-18** — Ported to Zig 0.17.0: `Fn.params` -> `param_types` in the automaton interface check.
 - **2026-10-13** — **core → parity with BurntSushi/fst 0.4 (S2).** New
   `automaton.zig` + `Frozen.search`: every key a byte automaton matches, in
