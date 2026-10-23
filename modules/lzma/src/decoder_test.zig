@@ -147,3 +147,26 @@ test "hand-built Lzma1Props out of range are refused, not used as table sizes" {
         try std.testing.expectError(error.BadHeader, lz.decompress(a, "\x00\x00\x00\x00\x00", .{ .lzma1 = .{ .props = p, .uncompressed_size = 0, .allow_eopm = true } }, .{}));
     }
 }
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "DecompressReader: small reads after the buffer filled are served from a refilled buffer" {
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    const z = try lz.compress(gpa, &plain, .xz, .{});
+    defer gpa.free(z);
+    var in: std.Io.Reader = .fixed(z);
+    var buf: [64]u8 = undefined;
+    var d = try lz.DecompressReader.init(gpa, &in, &buf, .xz, .{});
+    defer d.deinit();
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try d.reader.readSliceAll(&got);
+        try std.testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (d.reader.bufferedLen() > 0) buffered += 1;
+    }
+    try std.testing.expect(buffered * 2 >= reads);
+}

@@ -2712,7 +2712,7 @@ const StreamBody = struct {
             .budget = opts.budget,
             .scratch = opts.scratch,
             .reader = .{
-                .vtable = &.{ .stream = streamFn },
+                .vtable = &.{ .stream = streamFn, .readVec = refillReadVec },
                 .buffer = opts.buffer,
                 .seek = 0,
                 .end = 0,
@@ -3250,6 +3250,20 @@ fn runOffline(peer: *TestPeer, opts: Options, out_buf: []u8) !void {
     serve(testing.allocator, opts, &in, &out);
     peer.wire.clearRetainingCapacity();
     try peer.feed(out.buffered());
+}
+
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
 }
 
 test "h2 DoS limits: the SHIPPED default values, written out as literals" {

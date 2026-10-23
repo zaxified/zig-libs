@@ -1750,7 +1750,7 @@ pub const Decompressor = struct {
     /// `in` must have a non-empty buffer (as for `decompressStream`).
     pub fn init(gpa: std.mem.Allocator, in: *std.Io.Reader, buffer: []u8, options: Options) Decompressor {
         return .{
-            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .reader = .{ .vtable = &.{ .stream = stream, .readVec = refillReadVec }, .buffer = buffer, .seek = 0, .end = 0 },
             .err = if (prefixOf(options)) |_| null else |e| e,
             .arena_state = .init(gpa),
             .br = .initStream(in),
@@ -1799,6 +1799,20 @@ pub const Decompressor = struct {
         }
     }
 };
+
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
+}
 
 test "WBITS codes (RFC 7932 section 9.1)" {
     // The stream header: "0" is 16; "1" + 3 bits n != 0 is 17 + n; "1" + "000"

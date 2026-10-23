@@ -170,7 +170,7 @@ pub const AesReader = struct {
             .remaining = stored_size - sl - verifier_len - mac_len,
             .ctr = k.ctr,
             .mac = k.mac,
-            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .interface = .{ .vtable = &.{ .stream = stream, .readVec = refillReadVec }, .buffer = buffer, .seek = 0, .end = 0 },
         };
     }
 
@@ -367,7 +367,7 @@ pub const ZipCryptoReader = struct {
             .source = source,
             .remaining = stored_size - header_len,
             .keys = keys,
-            .interface = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .interface = .{ .vtable = &.{ .stream = stream, .readVec = refillReadVec }, .buffer = buffer, .seek = 0, .end = 0 },
         };
     }
 
@@ -385,6 +385,20 @@ pub const ZipCryptoReader = struct {
     }
 };
 
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
+}
+
 test "AES-CTR: WinZip counter is little-endian and starts at 1" {
     var c: Ctr = .init(.aes128, &(@as([16]u8, @splat(0))));
     var buf: [32]u8 = @splat(0);
@@ -395,4 +409,63 @@ test "AES-CTR: WinZip counter is little-endian and starts at 1" {
     const e = aes.Aes128.initEnc(@splat(0));
     e.encrypt(&ks, &block);
     try std.testing.expectEqualSlices(u8, &ks, buf[16..32]);
+}
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "AesReader: small reads after the buffer filled are served from a refilled buffer" {
+    const gpa = std.testing.allocator;
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    var sealed: std.Io.Writer.Allocating = .init(gpa);
+    defer sealed.deinit();
+    var wr: AesWriter = undefined;
+    const salt: [16]u8 = @splat(0x42);
+    try wr.start(&sealed.writer, .aes256, "pw", salt[0..Strength.aes256.saltLen()], &.{});
+    try wr.interface.writeAll(&plain);
+    try wr.finish();
+    var src: std.Io.Reader = .fixed(sealed.written());
+    var buf: [64]u8 = undefined;
+    var r: AesReader = undefined;
+    try r.init(&src, sealed.written().len, .aes256, "pw", &buf);
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try r.interface.readSliceAll(&got);
+        try std.testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (r.interface.bufferedLen() > 0) buffered += 1;
+    }
+    try std.testing.expect(buffered * 2 >= reads);
+}
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "ZipCryptoReader: small reads after the buffer filled are served from a refilled buffer" {
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    const check: u8 = 0x5a;
+    var stored: [ZipCryptoReader.header_len + plain.len]u8 = undefined;
+    var keys: ZipCryptoKeys = .{};
+    for ("pw") |b| keys.update(b);
+    for (&stored, 0..) |*c, i| {
+        const p: u8 = if (i < ZipCryptoReader.header_len - 1) @truncate(i *% 31) else if (i == ZipCryptoReader.header_len - 1) check else plain[i - ZipCryptoReader.header_len];
+        c.* = p ^ keys.streamByte();
+        keys.update(p);
+    }
+    var src: std.Io.Reader = .fixed(&stored);
+    var buf: [64]u8 = undefined;
+    var r: ZipCryptoReader = undefined;
+    try r.init(&src, stored.len, "pw", check, &buf);
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try r.interface.readSliceAll(&got);
+        try std.testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (r.interface.bufferedLen() > 0) buffered += 1;
+    }
+    try std.testing.expect(buffered * 2 >= reads);
 }

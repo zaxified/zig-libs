@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix (performance):** WinZip AES and ZipCrypto entries: `AesReader`/`ZipCryptoReader` refill their 4 KiB buffer on small reads. Before, once that buffer had been filled to its end (Zig 0.17 `defaultReadVec`), the deflate input's 1 KiB reads each became one `pread` plus a decrypt/HMAC call. Regression tests with a negative control. No API change.
+
 - **2026-10-20** — LZMA (method 14, APPNOTE header, end-marker bit 1) and XZ (95) built in via the new
   `lzma` module: `lzma_codec`, `xz_codec`, `WriteMethod.lzma/.xz`. **API:** `Codec.open_reader` takes a
   `CodecEntry` (flags, uncompressed size), `Codec.write_flags` (bits a writer sets). New dep `lzma`.

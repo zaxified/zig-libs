@@ -843,7 +843,7 @@ pub const ChunkedReader = struct {
                     c.state = if (size == 0) .trailers else .{ .body = size };
                 },
                 .body => |remaining| {
-                    const n = c.in.stream(w, limit.min(.limited64(remaining))) catch |err| switch (err) {
+                    const n = streamBuffered(c.in, w, limit.min(.limited64(remaining))) catch |err| switch (err) {
                         error.EndOfStream => return c.fail(.truncated_body),
                         error.ReadFailed, error.WriteFailed => |e| return e,
                     };
@@ -983,6 +983,25 @@ fn isQuotedPairChar(ch: u8) bool {
     };
 }
 
+// ── body reads through the connection's buffer ──────────────────────────────
+
+/// `in.stream(w, limit)` for a body reader over the connection reader `in`.
+/// `Reader.stream` hands a request straight to `in`'s vtable whenever `in`
+/// holds nothing buffered, so a handler reading a body in small slices made
+/// one `recv` of that slice's size per call (Zig 0.17: once a reader's
+/// buffer is filled to its end, `defaultReadVec` streams every small
+/// `readSlice*` directly). A request smaller than `in`'s buffer refills that
+/// buffer first and is served from it.
+fn streamBuffered(in: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
+    if (in.bufferedLen() == 0 and limit.minInt(w.buffer.len - w.end) < in.buffer.len) {
+        in.fillMore() catch |err| switch (err) {
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+    }
+    return in.stream(w, limit);
+}
+
 // ── Content-Length bounded reader ───────────────────────────────────────────
 
 /// Body reader for a `Content-Length: n` response: yields exactly `n` bytes
@@ -1012,7 +1031,7 @@ pub const ContentLengthReader = struct {
     fn streamFn(r: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
         const c: *ContentLengthReader = @alignCast(@fieldParentPtr("reader", r));
         if (c.remaining == 0) return error.EndOfStream;
-        const n = c.in.stream(w, limit.min(.limited64(c.remaining))) catch |err| switch (err) {
+        const n = streamBuffered(c.in, w, limit.min(.limited64(c.remaining))) catch |err| switch (err) {
             error.EndOfStream => {
                 c.truncated = true;
                 return error.ReadFailed;
@@ -1135,6 +1154,67 @@ const Trickle = struct {
         return 1;
     }
 };
+
+/// A connection reader with only `stream` in its vtable that counts its
+/// stream calls — each one stands for a `recv`.
+const CountedSource = struct {
+    src: []const u8,
+    pos: usize = 0,
+    calls: usize = 0,
+    reader: Reader,
+
+    fn init(src: []const u8, buffer: []u8) CountedSource {
+        return .{ .src = src, .reader = .{
+            .vtable = &.{ .stream = streamFn },
+            .buffer = buffer,
+            .seek = 0,
+            .end = 0,
+        } };
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: Limit) Reader.StreamError!usize {
+        const s: *CountedSource = @alignCast(@fieldParentPtr("reader", r));
+        s.calls += 1;
+        if (s.pos == s.src.len) return error.EndOfStream;
+        const n = try w.write(s.src[s.pos..][0..limit.minInt(s.src.len - s.pos)]);
+        s.pos += n;
+        return n;
+    }
+};
+
+/// Reads `body` in 8-octet slices and checks it; the source must have been
+/// asked at most once per 256 octets (its buffer) plus the end.
+fn expectFewRecvs(body: *Reader, src: *CountedSource, want: []const u8) !void {
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    while (off < want.len) : (off += got.len) {
+        try body.readSliceAll(&got);
+        try testing.expectEqualSlices(u8, want[off..][0..got.len], &got);
+    }
+    try testing.expect(src.calls <= src.src.len / 256 + 2);
+}
+
+test "ContentLengthReader: small reads are served from the connection's buffer, not one recv each" {
+    var want: [4096]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var in_buf: [256]u8 = undefined;
+    var src: CountedSource = .init(&want, &in_buf);
+    var body_buf: [64]u8 = undefined;
+    var cl: ContentLengthReader = .init(&src.reader, want.len, &body_buf);
+    try expectFewRecvs(&cl.reader, &src, &want);
+}
+
+test "ChunkedReader: small reads are served from the connection's buffer, not one recv each" {
+    var want: [4096]u8 = undefined;
+    for (&want, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var wire: [4096 + 32]u8 = undefined;
+    const framed = try std.fmt.bufPrint(&wire, "1000\r\n{s}\r\n0\r\n\r\n", .{want[0..]});
+    var in_buf: [256]u8 = undefined;
+    var src: CountedSource = .init(framed, &in_buf);
+    // Unbuffered, as `Server.RequestBody.Capped` builds it.
+    var ch: ChunkedReader = .init(&src.reader, &.{});
+    try expectFewRecvs(&ch.reader, &src, &want);
+}
 
 /// A reader that hands out its input a record at a time and **cannot join two
 /// of them** — the shape of a TLS record reader or a frame reader, where the

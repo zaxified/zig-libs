@@ -564,7 +564,7 @@ const SourceReader = struct {
         const self: *SourceReader = @alignCast(@fieldParentPtr("interface", r));
         if (r.seek != 0) {
             const live = r.end - r.seek;
-            std.mem.copyForwards(u8, r.buffer[0..live], r.buffer[r.seek..r.end]);
+            @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
             r.seek = 0;
             r.end = live;
         }

@@ -644,7 +644,7 @@ pub const DecompressReader = struct {
     /// is allocated when the header has been read.
     pub fn init(gpa: std.mem.Allocator, in: *Reader, buffer: []u8, format: Format, opts: Options) error{OutOfMemory}!DecompressReader {
         return .{
-            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 },
+            .reader = .{ .vtable = &.{ .stream = stream, .readVec = refillReadVec }, .buffer = buffer, .seek = 0, .end = 0 },
             .dec = try .init(gpa, in, format, opts),
         };
     }
@@ -679,3 +679,17 @@ pub const DecompressReader = struct {
         return n;
     }
 };
+
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
+}

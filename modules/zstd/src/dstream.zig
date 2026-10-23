@@ -588,7 +588,7 @@ pub const Reader = struct {
         r.* = undefined;
     }
 
-    const vtable: std.Io.Reader.VTable = .{ .stream = streamFn };
+    const vtable: std.Io.Reader.VTable = .{ .stream = streamFn, .readVec = refillReadVec };
 
     fn streamFn(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
         const r: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
@@ -629,3 +629,41 @@ pub const Reader = struct {
         }
     }
 };
+
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
+}
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "Reader: small reads after the buffer filled are served from a refilled buffer" {
+    const gpa = std.testing.allocator;
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    const z = try @import("root.zig").compressAlloc(gpa, &plain, .{});
+    defer gpa.free(z);
+    var in: std.Io.Reader = .fixed(z);
+    var buf: [64]u8 = undefined;
+    var d = try Reader.init(gpa, &in, &buf, .{});
+    defer d.deinit();
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try d.interface.readSliceAll(&got);
+        try std.testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (d.interface.bufferedLen() > 0) buffered += 1;
+    }
+    try std.testing.expect(buffered * 2 >= reads);
+}

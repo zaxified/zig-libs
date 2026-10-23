@@ -650,3 +650,27 @@ test "fuzz: stream and one-shot agree on damaged streams (coverage-guided explor
         }
     }.one, .{});
 }
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "Decompressor: small reads after the buffer filled are served from a refilled buffer" {
+    const gpa = testing.allocator;
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    const z = try brotli.compress(gpa, &plain);
+    defer gpa.free(z);
+    var in: std.Io.Reader = .fixed(z);
+    var buf: [64]u8 = undefined;
+    var d: brotli.Decompressor = .init(gpa, &in, &buf, .{});
+    defer d.deinit();
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try d.reader.readSliceAll(&got);
+        try testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (d.reader.bufferedLen() > 0) buffered += 1;
+    }
+    try testing.expect(buffered * 2 >= reads);
+}

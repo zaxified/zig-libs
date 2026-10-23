@@ -146,7 +146,7 @@ pub const FdReader = struct {
         return .{
             .fd = fd,
             .interface = .{
-                .vtable = &.{ .stream = stream },
+                .vtable = &.{ .stream = stream, .readVec = refillReadVec },
                 .buffer = buffer,
                 .seek = 0,
                 .end = 0,
@@ -411,6 +411,20 @@ pub fn Bus(comptime max_keys: usize) type {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+/// `readVec` for a reader with only `stream` behind it. Zig 0.17's
+/// `defaultReadVec` streams straight into the caller's slice whenever that
+/// slice is at least the buffer's free tail, and nothing moves the unread
+/// octets back to the front: once the buffer had been filled to its end,
+/// every small `readSlice*` became its own `stream` call. Rebasing first
+/// leaves the whole buffer free, so a small read refills it.
+fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
+    const live = r.end - r.seek;
+    @memmove(r.buffer[0..live], r.buffer[r.seek..r.end]);
+    r.seek = 0;
+    r.end = live;
+    return std.Io.Reader.defaultReadVec(r, data);
+}
 
 test "Bus: set/get/list + eviction at max_keys (no transport)" {
     var bus = Bus(3).init(testing.allocator);
@@ -696,4 +710,29 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk rep_final;
     };
     return &rep_result;
+}
+
+// Guards the std 0.17 `defaultReadVec` direct read: a reader without `.readVec = refillReadVec` fails this.
+test "FdReader: small reads after the buffer filled are served from a refilled buffer" {
+    var fds: [2]i32 = undefined;
+    try testing.expect(linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &fds)) == .SUCCESS);
+    defer closeFd(fds[0]);
+    defer closeFd(fds[1]);
+    var plain: [6000]u8 = undefined;
+    for (&plain, 0..) |*b, i| b.* = @truncate(i *% 7 +% i / 13);
+    try writeAllFd(fds[0], &plain);
+
+    var buf: [64]u8 = undefined;
+    var fr = FdReader.init(fds[1], &buf);
+    var got: [8]u8 = undefined;
+    var off: usize = 0;
+    var reads: usize = 0;
+    var buffered: usize = 0;
+    while (off < plain.len) : (off += got.len) {
+        try fr.interface.readSliceAll(&got);
+        try testing.expectEqualSlices(u8, plain[off..][0..got.len], &got);
+        reads += 1;
+        if (fr.interface.bufferedLen() > 0) buffered += 1;
+    }
+    try testing.expect(buffered * 2 >= reads);
 }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix (performance):** `DecompressReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
+
 - **2026-10-20** — Independent review (no HIGH): `compressBound` now holds for raw LZMA1 and `.lzma`
   (incompressible input grows ~1.4 %; the old bound allowed 0.1 %), `Format.lzma1` props are range-checked
   (`error.BadHeader`; hand-built props bypassed `fromBytes`), `max_dict` caps the allocated ring (a small

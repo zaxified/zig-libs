@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix (performance):** `DecompressReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
+
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** tests for the survivors of the mutation run. Hand-built streams (a small bit writer in `decoder_test.zig`) pin the decoder's validation: level digit, table count 0/1, selector lists past 18002, code lengths 0/20/21, origin pointer judged before the body, RUNA/RUNB limit 2^21, level-1 block fill, first block-magic bytes, a randomised block past the 512-entry flip table; 20 new libbzip2 goldens (`tc-*` table-count edges, `wf-*` periodic sort-path blocks at work factors 1/30/100; `zig build interop-bzip2 -- --capture`).
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** mutation run (schemata, 94 mutants: 56 killed, 9 equivalent); the surviving decoder-validation and encoder-threshold mutants are open test gaps (SPEC Backlog).
 - **2026-10-20** — Independent review (no HIGH/MEDIUM): the decoder now stays failed after its first error

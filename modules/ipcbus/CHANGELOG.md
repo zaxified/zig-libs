@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix (performance):** `FdReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so a long-lived reader paid one `read(2)` per frame-length prefix. Regression test with a negative control. No API change.
+
 - **2026-10-18** — Ported to Zig 0.17.0. test helper `bufPrintZ` -> `bufPrintSentinel`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-05** — Mutation run: 25 of 25 killed, 0 equivalent; 7 tests added
   (`CLOEXEC` on every fd, stale-path replace and unlink on `deinit`, one-byte

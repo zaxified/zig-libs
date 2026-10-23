@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Fix (performance):** `Decompressor` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
+
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat`/`arrRepeat` branch quota scaled with length.
 - **2026-10-17** — Test-only: the guard-page buffer behind the fuzz harnesses is now `testkit.guard.Guarded` (the same layout; `stream_test.Guarded` re-exports it). **NO CONSUMER-VISIBLE CHANGE.**
 - **2026-10-16** — New `parallel.compress(gpa, io, input, opts, .{ .job_size, .threads })`: multithreaded compression of one stream (as rust-brotli's `compress_multi`). Jobs of `job_size` bytes (default twice the window, at least 1 MiB) run on `io`'s concurrent tasks plus the calling thread and join into one ordinary stream; each job sees the window before it (copies across the cut) and starts from a distance ring nothing matches. The bytes depend on `job_size`, never on the worker count; one job is `compressWith`'s bytes; a prefix dictionary compresses in one pass. Cuts cost 0–9 % CPU and ±0.03 % of size at 4 MiB jobs. `gpa` must be thread-safe. Scope line now **parity — google/brotli 1.2.0** (S2): every substantial feature of the field (`~/CML/20261016-brotli-s2/gap-analysis.md`); the remaining speed rows outside the bench and niche features are Backlog R18–R20.
