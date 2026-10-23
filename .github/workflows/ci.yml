@@ -331,21 +331,33 @@ jobs:
           use-cache: false
       # ⭐ ZIG 0.17 BUILDS ITS BUILD SYSTEM FIRST (2026-10-18): every `zig
       # build` on a fresh runner compiles the configurer and the maker before
-      # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
-      # which none of the entries above keep. One entry per OS/arch/zig version,
-      # saved once on the first miss and never again (the key has no source
-      # hash and no week; a bad first entry is retired by bumping the `-gN`
-      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
-      # anything this repository's sources decide. `--global-cache-dir` is gone
-      # from `zig build` in 0.17, so the location is set by environment.
+      # it reads build.zig, into the GLOBAL cache, which none of the entries
+      # above keep. One entry per OS/arch/CPU MODEL/zig version, saved once on
+      # the first miss and never again (no source hash, no week; a bad entry is
+      # retired by bumping the `-gN` epoch at the end of the key): it holds
+      # compiled-once toolchain artefacts, not anything this repository's
+      # sources decide (the build.zig-dependent configurer lands in the LOCAL
+      # .zig-cache, ~36 s when it misses). `--global-cache-dir` is gone from
+      # `zig build` in 0.17, so the location is set by environment.
+      # ⚠ THE CPU MODEL IS IN THE KEY (2026-10-24): the maker is compiled for
+      # the NATIVE CPU, and GitHub's amd64 pool mixes EPYC 7763 / 9V74 / 9V45.
+      # The one entry keyed without it had been saved on a 9V74, so only 9V74
+      # runners hit it (30 s before the first gate); every 7763 recompiled the
+      # maker, 2 min 15 s, in every lane of every push (runs 40006392214,
+      # 40031451641). Measured locally: empty global cache 147 s, warm 0.03 s.
       - name: Point the Zig global cache at a cacheable path
-        run: echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+        id: zg
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu=$(printf '%s' "${cpu:-unknown}" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache the Zig global cache (0.17 configurer + maker)
         if: env.ZIGLIBS_DRY_RUN != '1'
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
       # ⭐ A WEEK IN EVERY BUILD-CACHE KEY (2026-09-18). An entry restores the
       # previous tree, adds to it and saves the whole, and nothing ever
       # deletes: the scoped entry grew 589 -> 646 -> 1156 -> 1364 MB over four
@@ -518,21 +530,33 @@ jobs:
           use-cache: false
       # ⭐ ZIG 0.17 BUILDS ITS BUILD SYSTEM FIRST (2026-10-18): every `zig
       # build` on a fresh runner compiles the configurer and the maker before
-      # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
-      # which none of the entries above keep. One entry per OS/arch/zig version,
-      # saved once on the first miss and never again (the key has no source
-      # hash and no week; a bad first entry is retired by bumping the `-gN`
-      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
-      # anything this repository's sources decide. `--global-cache-dir` is gone
-      # from `zig build` in 0.17, so the location is set by environment.
+      # it reads build.zig, into the GLOBAL cache, which none of the entries
+      # above keep. One entry per OS/arch/CPU MODEL/zig version, saved once on
+      # the first miss and never again (no source hash, no week; a bad entry is
+      # retired by bumping the `-gN` epoch at the end of the key): it holds
+      # compiled-once toolchain artefacts, not anything this repository's
+      # sources decide (the build.zig-dependent configurer lands in the LOCAL
+      # .zig-cache, ~36 s when it misses). `--global-cache-dir` is gone from
+      # `zig build` in 0.17, so the location is set by environment.
+      # ⚠ THE CPU MODEL IS IN THE KEY (2026-10-24): the maker is compiled for
+      # the NATIVE CPU, and GitHub's amd64 pool mixes EPYC 7763 / 9V74 / 9V45.
+      # The one entry keyed without it had been saved on a 9V74, so only 9V74
+      # runners hit it (30 s before the first gate); every 7763 recompiled the
+      # maker, 2 min 15 s, in every lane of every push (runs 40006392214,
+      # 40031451641). Measured locally: empty global cache 147 s, warm 0.03 s.
       - name: Point the Zig global cache at a cacheable path
-        run: echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+        id: zg
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu=$(printf '%s' "${cpu:-unknown}" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache the Zig global cache (0.17 configurer + maker)
         if: env.ZIGLIBS_DRY_RUN != '1'
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
       - name: The sub-second gates, before anything expensive starts
         run: bash scripts/test.sh checks-fast
       - name: Choose the lanes
@@ -854,21 +878,33 @@ jobs:
           use-cache: false
       # ⭐ ZIG 0.17 BUILDS ITS BUILD SYSTEM FIRST (2026-10-18): every `zig
       # build` on a fresh runner compiles the configurer and the maker before
-      # it reads build.zig -- ~110 s measured locally -- into the GLOBAL cache,
-      # which none of the entries above keep. One entry per OS/arch/zig version,
-      # saved once on the first miss and never again (the key has no source
-      # hash and no week; a bad first entry is retired by bumping the `-gN`
-      # epoch at the end of the key): it holds compiled-once toolchain artefacts, not
-      # anything this repository's sources decide. `--global-cache-dir` is gone
-      # from `zig build` in 0.17, so the location is set by environment.
+      # it reads build.zig, into the GLOBAL cache, which none of the entries
+      # above keep. One entry per OS/arch/CPU MODEL/zig version, saved once on
+      # the first miss and never again (no source hash, no week; a bad entry is
+      # retired by bumping the `-gN` epoch at the end of the key): it holds
+      # compiled-once toolchain artefacts, not anything this repository's
+      # sources decide (the build.zig-dependent configurer lands in the LOCAL
+      # .zig-cache, ~36 s when it misses). `--global-cache-dir` is gone from
+      # `zig build` in 0.17, so the location is set by environment.
+      # ⚠ THE CPU MODEL IS IN THE KEY (2026-10-24): the maker is compiled for
+      # the NATIVE CPU, and GitHub's amd64 pool mixes EPYC 7763 / 9V74 / 9V45.
+      # The one entry keyed without it had been saved on a 9V74, so only 9V74
+      # runners hit it (30 s before the first gate); every 7763 recompiled the
+      # maker, 2 min 15 s, in every lane of every push (runs 40006392214,
+      # 40031451641). Measured locally: empty global cache 147 s, warm 0.03 s.
       - name: Point the Zig global cache at a cacheable path
-        run: echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+        id: zg
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global" >> "$GITHUB_ENV"
+          cpu="$(grep -m1 -E 'model name|Model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
+          echo "cpu=$(printf '%s' "${cpu:-unknown}" | tr -c 'A-Za-z0-9' '-')" >> "$GITHUB_OUTPUT"
       - name: Cache the Zig global cache (0.17 configurer + maker)
         if: env.ZIGLIBS_DRY_RUN != '1'
         uses: actions/cache@v6
         with:
           path: ${{ runner.temp }}/zig-global
-          key: zig-global-${{ runner.os }}-${{ runner.arch }}-0.17.0-g1
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ steps.zg.outputs.cpu }}-0.17.0-g2
       # Weekly cache generation, as in the scoped job -- see there.
       - name: Cache generation
         id: gen
