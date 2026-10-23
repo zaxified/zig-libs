@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **FIX:** a multi-line span starting after Unicode whitespace other than space/tab
+  (U+3000, U+00A0, U+2000–U+200A …) was drawn with a `/----^` top row instead of the corner at the line
+  start; `leadingSpace` now counts Unicode White_Space as codespan's `str::trim_start` does. Found by the
+  new differential fuzz `zig build interop-diagnostics` (`tools/interop.zig` + an oracle binary in
+  `tools/codespan_bench`): 20 000 random cases against codespan-reporting 0.13.1, 39 862 renders
+  byte-identical. **Card: Evidence model → model-fuzz (E1).**
+
 - **2026-10-20** — `zig build bench-diagnostics` (`tools/bench.zig` + `tools/codespan_bench`, Rust, pinned
   codespan-reporting 0.13.1 and annotate-snippets 0.12.17): 0.42–0.60× codespan. Info row: with `term_width`
   on a 100 KB line we are ~3× annotate (our cut path still walks the whole line — a Backlog item). Card:

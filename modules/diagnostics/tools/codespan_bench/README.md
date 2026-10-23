@@ -1,6 +1,8 @@
 # codespan_bench
 
-Reference side of `zig build bench-diagnostics` (`../bench.zig`): times
+Two binaries. `oracle` (`src/bin/oracle.rs`) is the codespan side of the differential fuzz
+`zig build interop-diagnostics` (`../interop.zig`; input/output format in its header). The default
+one is the reference side of `zig build bench-diagnostics` (`../bench.zig`): times
 codespan-reporting 0.13.1 (Apache-2.0; "rich" style, `Chars::ascii()`, no colour,
 `term::emit_to_io_write` into a reused `Vec<u8>`) and annotate-snippets 0.12.17
 (MIT OR Apache-2.0; `Renderer::plain()`) through their public APIs, on the

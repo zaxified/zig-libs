@@ -562,10 +562,27 @@ fn overlaps(a0: usize, a1: usize, b0: usize, b1: usize) bool {
     return @max(a0, b0) < @min(a1, b1);
 }
 
+/// Bytes of leading whitespace, as codespan's `str::trim_start` counts it:
+/// the Unicode White_Space property (Rust's `char::is_whitespace`), so an
+/// ideographic space U+3000 before a multi-line span's start still gives the
+/// top-left corner form.
 fn leadingSpace(text: []const u8) usize {
     var n: usize = 0;
-    while (n < text.len and (text[n] == ' ' or text[n] == '\t')) n += 1;
+    while (n < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[n]) catch return n;
+        if (n + len > text.len) return n;
+        const cp = std.unicode.utf8Decode(text[n..][0..len]) catch return n;
+        if (!isWhiteSpace(cp)) return n;
+        n += len;
+    }
     return n;
+}
+
+fn isWhiteSpace(cp: u21) bool {
+    return switch (cp) {
+        '\t'...'\r', ' ', 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => true,
+        else => false,
+    };
 }
 
 /// The primary style at `[a, b)` of the single-line labels, or null.
@@ -2383,4 +2400,14 @@ test {
     _ = @import("codespan_test.zig");
     _ = @import("lsp_test.zig");
     _ = @import("render_test.zig");
+}
+
+test "snippet: Unicode whitespace before a multi-line span's start gives the corner form" {
+    // codespan's `str::trim_start` counts Unicode White_Space, so an ideographic
+    // space (U+3000) is lead-in like ' ' and '\t' (found by interop-diagnostics;
+    // expected text: codespan-reporting 0.13.1 on the same input).
+    var buf: [256]u8 = undefined;
+    const d: Diagnostic = .{ .path = "", .file = "f", .line = 1, .col = 4, .end_line = 2, .end_col = 3, .severity = .@"error", .code = "", .message = "m", .span_message = "here" };
+    const out = try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = "\u{3000}ab\ncd\n" }}, .column = .char });
+    try testing.expectEqualStrings("error: m\n  --> f:1:2\n  |  \n1 | / \u{3000}ab\n2 | | cd\n  | \\--^ here\n\n", out);
 }
