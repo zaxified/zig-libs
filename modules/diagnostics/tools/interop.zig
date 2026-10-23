@@ -15,6 +15,7 @@
 //!   zig build interop-diagnostics                     # 20 000 seeds from 1
 //!   zig build interop-diagnostics -- --seeds N --from S
 //!   zig build interop-diagnostics -- --seed S         # replay one, print both sides
+//!   zig build interop-diagnostics -- --lead           # the card's Ahead claim (raw control characters)
 //!
 //! Every seed is one case: 1-2 files of random text (ASCII, tabs, 2-, 3- and
 //! 4-byte UTF-8, wide CJK and emoji, combining marks, CRLF, empty lines, with
@@ -337,6 +338,46 @@ const Reach = struct {
     }
 };
 
+// ── the lead (the card's **Ahead:** line) ────────────────────────────────────
+
+/// Terminal-control characters a hostile key name carries into a finding: ESC
+/// (an OSC title change and a screen clear), BEL, and the bidi override U+202E
+/// of "Trojan Source" (CVE-2021-42574).
+const hostile_key = "key\x1b]0;pwned\x07\x1b[2J\u{202e}";
+const raw_controls = [_][]const u8{ "\x1b", "\x07", "\u{202e}" };
+
+/// `--lead`: one finding quoting `hostile_key` in the source, the message, a
+/// label and a note, rendered by codespan and by us; counts the raw control
+/// characters that reach the output. Ours must be 0, codespan's is the lead.
+fn lead(arena: std.mem.Allocator, io: std.Io, exe: []const u8, abs: []const u8) !u8 {
+    const src = "{\"" ++ hostile_key ++ "\": 1}\n";
+    const labels = [_]Lab{.{ .primary = true, .file = 0, .start = 1, .end = 1 + hostile_key.len + 2, .msg = "unknown " ++ hostile_key }};
+    const notes = [_][]const u8{"did you mean " ++ hostile_key ++ "?"};
+    const diags = [_]Diag{.{ .sev = .@"error", .code = "", .msg = "unknown key '" ++ hostile_key ++ "'", .labels = &labels, .notes = &notes }};
+    const files = [_]File{.{ .name = "f.json", .text = src }};
+    const c: Case = .{ .id = 0, .ctx = .{ 3, 1, 0, 0 }, .files = &files, .diags = &diags };
+    var file: std.Io.Writer.Allocating = .init(arena);
+    try writeCase(&file.writer, c);
+    const cwd = std.Io.Dir.cwd();
+    const cases_path = try arena.print("{s}/lead.txt", .{abs});
+    const out_path = try arena.print("{s}/lead.out", .{abs});
+    try cwd.writeFile(io, .{ .sub_path = cases_path, .data = file.written() });
+    const ran = try std.process.run(arena, io, .{ .argv = &.{ exe, cases_path, out_path } });
+    if (ran.term != .exited or ran.term.exited != 0) return 1;
+    const theirs_all = try cwd.readFileAlloc(io, out_path, arena, .limited(1 << 20));
+    var pos: usize = 0;
+    const theirs = try nextRecord(theirs_all, &pos, 0, .ascii);
+    const ours = try renderOurs(arena, c, .ascii);
+    var ours_n: usize = 0;
+    var theirs_n: usize = 0;
+    for (raw_controls) |r| {
+        ours_n += std.mem.count(u8, ours, r);
+        theirs_n += std.mem.count(u8, theirs.text, r);
+    }
+    std.debug.print("lead: raw ESC/BEL/U+202E in the output -- codespan-reporting 0.13.1: {d}, ours: {d}\n", .{ theirs_n, ours_n });
+    return if (ours_n == 0 and theirs_n > 0) 0 else 1;
+}
+
 // ── driver ───────────────────────────────────────────────────────────────────
 
 const Theirs = struct { panicked: bool, text: []const u8 };
@@ -380,6 +421,7 @@ pub fn main(init: std.process.Init) !u8 {
     var from: u64 = 1;
     var seeds: u64 = 20_000;
     var replay: ?u64 = null;
+    var lead_only = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -390,8 +432,11 @@ pub fn main(init: std.process.Init) !u8 {
             from = try std.fmt.parseInt(u64, val, 10);
         } else if (std.mem.eql(u8, a, "--seed")) {
             replay = try std.fmt.parseInt(u64, val, 10);
+        } else if (std.mem.eql(u8, a, "--lead")) {
+            lead_only = true;
+            continue;
         } else {
-            std.debug.print("usage: interop-diagnostics [--seeds N] [--from S] [--seed S]\n", .{});
+            std.debug.print("usage: interop-diagnostics [--seeds N] [--from S] [--seed S] [--lead]\n", .{});
             return 2;
         }
         i += 1;
@@ -405,6 +450,7 @@ pub fn main(init: std.process.Init) !u8 {
     try cwd.createDirPath(io, scratch);
     const abs = try cwd.realPathFileAlloc(io, scratch, arena);
     const exe = buildOracle(arena, io, init.environ_map, abs) catch return 1;
+    if (lead_only) return lead(arena, io, exe, abs);
 
     // Our side renders while the cases file is written; the oracle then renders all of them in one run.
     const cases = try arena.alloc(Case, seeds);

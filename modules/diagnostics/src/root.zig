@@ -2469,3 +2469,9 @@ test "escaping: bidi controls, C1 controls and invalid bytes never reach the ter
     const snip = try renderToString(&buf, d, .{ .style = .snippet, .sources = &.{.{ .file = "f", .text = hostile ++ "\n" }} });
     try testing.expect(std.mem.find(u8, snip, "1 | k?ey??2J??x\n") != null);
 }
+
+test "escaping: a tab in finding text is \\t, DEL is \\x7f" {
+    var buf: [256]u8 = undefined;
+    const d: Diagnostic = .{ .path = "", .severity = .@"error", .code = "", .message = "a\tb\x7fc" };
+    try testing.expectEqualStrings("error: a\\tb\\x7fc\n", try renderToString(&buf, d, .{}));
+}

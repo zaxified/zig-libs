@@ -481,3 +481,23 @@ test "writeLsp and writeJson: invalid UTF-8 in finding text still gives valid JS
     try testing.expect(std.unicode.utf8ValidateSlice(out2.written()));
     _ = try parse(a, out2.written());
 }
+
+test "fromLsp: a percent escape with a bad second digit stays literal; a negative or oversize position is refused" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try parse(a,
+        \\{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"message":"m",
+        \\"relatedInformation":[{"location":{"uri":"file:///a%f+b","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}},"message":"r"}]}
+    );
+    try testing.expectEqualStrings("/a%f+b", (try dg.fromLsp(a, v, null, &.{}, .utf16, .{})).labels.?[0].file.?);
+    for ([_][]const u8{
+        \\{"range":{"start":{"line":-1,"character":0},"end":{"line":0,"character":0}},"message":"m"}
+        ,
+        \\{"range":{"start":{"line":0,"character":4294967296},"end":{"line":0,"character":0}},"message":"m"}
+    }) |text| try testing.expectError(error.InvalidDiagnostic, dg.fromLsp(a, try parse(a, text), null, &.{}, .utf16, .{}));
+}
+
+test "lspCharacter: U+10000, the first astral code point, is two UTF-16 units" {
+    try testing.expectEqual(@as(u32, 3), dg.lspCharacter("\u{10000}x", 5 + 1, .utf16));
+}

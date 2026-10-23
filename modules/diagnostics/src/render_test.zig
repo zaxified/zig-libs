@@ -193,3 +193,19 @@ test "term_width: tiny widths, wide characters and multi-line spans stay bounded
         try testing.expect(std.mem.endsWith(u8, got, "\n\n"));
     }
 }
+
+test "edges the mutation run asked for: DEL, C1, BOM on line 2, the empty last line, a far end column, context past the end" {
+    // charWidth: DEL has no width (it is a control), like the C1 block.
+    try testing.expectEqual(@as(u2, 0), dg.charWidth(0x7f));
+    // U+009F, the last C1 control, is shown as `?` in the quoted line.
+    try expectRender("error: m\n  --> f:1:1\n  |\n1 | ?x\n  | ^^ here\n\n", diag(1, 1, 4), "\u{9f}x", .{});
+    // A U+FEFF opening line 2 counts as a character for the `-->` column (only
+    // line 1's BOM does not); it is never written.
+    try expectRender("error: m\n  --> f:2:2\n  |\n2 | x\n  | ^ here\n\n", diag(2, 4, 5), "a\n\u{feff}x", .{ .column = .char });
+    // The empty line after a final newline is a line (no line index given).
+    try expectRender("error: m\n  --> f:2:1\n  |\n2 | \n  | ^ here\n\n", diag(2, 1, 1), "a\n", .{});
+    // An end column far past the line end is clamped to it.
+    try expectRender("error: m\n  --> f:1:2\n  |\n1 | abc\n  |  ^^ here\n\n", diag(1, 2, 999), "abc", .{});
+    // after_label_lines past the end of the source adds nothing.
+    try expectRender("error: m\n  --> f:2:1\n  |\n2 | b\n  | ^ here\n\n", diag(2, 1, 2), "a\nb", .{ .after_label_lines = 5 });
+}
