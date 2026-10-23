@@ -2764,6 +2764,114 @@ test "preflight_passthrough: a failed preflight also reaches the handler, header
     }
 }
 
+// ── audit 2026-10-23 (mutation round): gaps the schemata run exposed ───────
+
+test "preflight: request header NAMES are matched case-insensitively, and the first occurrence wins (PreflightIn.gather vs req.header)" {
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post },
+        .allow_private_network = true,
+    });
+    defer c.deinit();
+    var r = try testRouter(&c, null);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    // All-lower and all-upper spellings of the four names `gather` reads.
+    var got = runWire(&r, wire("OPTIONS", "/t", "origin: https://app.example\r\n" ++
+        "access-control-request-method: POST\r\n" ++
+        "access-control-request-headers: x-a\r\n" ++
+        "access-control-request-private-network: true\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: x-a");
+    try expectHeaderLine(got, "Access-Control-Allow-Private-Network: true");
+    got = runWire(&r, wire("OPTIONS", "/t", "ORIGIN: https://app.example\r\n" ++
+        "ACCESS-CONTROL-REQUEST-METHOD: POST\r\n" ++
+        "ACCESS-CONTROL-REQUEST-HEADERS: x-a\r\n" ++
+        "ACCESS-CONTROL-REQUEST-PRIVATE-NETWORK: true\r\n"), &buf);
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: x-a");
+    try expectHeaderLine(got, "Access-Control-Allow-Private-Network: true");
+    // First occurrence wins, as `req.header` does: a refused Origin first,
+    // an allowed one second must NOT be granted (and the reverse is).
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://evil.example\r\n" ++
+        "Origin: https://app.example\r\n" ++
+        "Access-Control-Request-Method: POST\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectNoCorsHeaders(got);
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+        "Origin: https://evil.example\r\n" ++
+        "Access-Control-Request-Method: POST\r\n"), &buf);
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    // Same for the requested method: DELETE first is refused, POST second is not consulted.
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+        "Access-Control-Request-Method: DELETE\r\n" ++
+        "Access-Control-Request-Method: POST\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectNoCorsHeaders(got);
+    // ... and the first Access-Control-Request-Private-Network decides.
+    got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+        "Access-Control-Request-Method: POST\r\n" ++
+        "Access-Control-Request-Private-Network: false\r\n" ++
+        "Access-Control-Request-Private-Network: true\r\n"), &buf);
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+}
+
+test "preflight: `.any` without an Origin header is not a grant; an empty reflected ACRH emits no Allow-Headers" {
+    var buf: [2048]u8 = undefined;
+    { // .any, no Origin: the gate needs an Origin to answer (headerless 204)
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .any });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, wire("OPTIONS", "/t", "Access-Control-Request-Method: GET\r\n"), &buf);
+        try expectStatus(got, "204");
+        try expectNoCorsHeaders(got);
+    }
+    { // gated .reflect: an empty ACRH value is not echoed as an empty header
+        var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .list = &.{"https://app.example"} } });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWire(&r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+            "Access-Control-Request-Method: GET\r\n" ++
+            "Access-Control-Request-Headers:\r\n"), &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectNoHeader(got, "Access-Control-Allow-Headers");
+    }
+    { // unconditional wildcard: same, and PNA is answered on this path too
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .any,
+            .allow_unconditional_wildcard = true,
+            .allow_private_network = true,
+        });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        var got = runWire(&r, wire("OPTIONS", "/t", "Access-Control-Request-Method: GET\r\n" ++
+            "Access-Control-Request-Headers:\r\n" ++
+            "Access-Control-Request-Private-Network: true\r\n"), &buf);
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
+        try expectHeaderLine(got, "Access-Control-Allow-Private-Network: true");
+        try expectNoHeader(got, "Access-Control-Allow-Headers");
+        got = runWire(&r, wire("OPTIONS", "/t", "Access-Control-Request-Method: GET\r\n"), &buf);
+        try expectNoHeader(got, "Access-Control-Allow-Private-Network");
+    }
+}
+
+test "patterns: exact entries are byte-compared, and a pattern's scheme prefix must match even when the lengths line up" {
+    var c: Cors = try .init(testing.allocator, .{ .allowed_origins = pattern_origins });
+    defer c.deinit();
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("https://APP.example"));
+    // `http://ab.example.com` is longer than the `https://*.example.com`
+    // frame, so only the prefix compare (not the length) refuses it.
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("http://ab.example.com"));
+    try testing.expectEqual(@as(?[]const u8, null), c.allowOriginValue("httpx://ab.example.com"));
+}
+
 // ── external anchor: headless Chrome against this middleware ───────────────
 // See browser_oracle_test.zig / tools/interop.zig / tools/browser_oracle.js.
 test {

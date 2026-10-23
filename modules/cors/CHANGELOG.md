@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Card: grade 1** (S1 E1 A1 H1 P1). Audit over the current source (independent
+  review, no defect; 56 mutants, 55 killed, 1 equivalent; three new tests). Scope `ahead`: rs/cors
+  silently answers a credentialed wildcard policy with a header pair browsers refuse, which this
+  module refuses at `init` (`tools/lead_probe`); the compile-time static posture. Tests only.
 - **2026-10-23** — **Faster preflight** (net 1.38× → 1.13–1.23× tower-http): the request headers a
   preflight reads (Origin, Access-Control-Request-Method/-Headers/-Private-Network) are found in one
   pass over the head instead of one `req.header` scan each (the middleware no longer looks up the
