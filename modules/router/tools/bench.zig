@@ -24,6 +24,15 @@
 //! until it takes over 100 ms, best of five) and report a result count (matched
 //! routes, or the sum of the status codes); a count that differs fails the run.
 //! The verdict is the WORST ratio, ours/chi.
+//!
+//! A second part answers "how far from the fastest in the field": the same
+//! `lookup` over the PLAIN subset of the table (static segments, whole-segment
+//! `{name}` captures, a trailing `*`; no regexp constraint, no capture inside a
+//! segment -- what every colon-syntax router can express) against
+//! julienschmidt/httprouter, labstack/echo and uptrace/bunrouter
+//! (tools/go_fast_bench) and ibraheemdev/matchit (tools/rust_fast_bench). A
+//! contender that cannot express a plain route exits 3 and is reported as
+//! unsupported, never silently run on a different table. BENCH_FAST=0 skips it.
 
 const std = @import("std");
 const http = @import("http");
@@ -86,6 +95,88 @@ const static_routes: [routes.len]router.StaticRoute = blk: {
 const Table = router.Static(&static_routes, .{});
 
 const work_dir = ".zig-cache/bench-router";
+const fast_dir = "modules/router/tools/go_fast_bench";
+const rust_manifest = "modules/router/tools/rust_fast_bench/Cargo.toml";
+const rust_target = ".zig-cache/bench-router/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+const Contender = struct { name: []const u8, label: []const u8, rust: bool = false };
+const contenders = [_]Contender{
+    .{ .name = "httprouter", .label = "httprouter v1.3.0" },
+    .{ .name = "echo", .label = "echo v4.16.2" },
+    .{ .name = "bunrouter", .label = "bunrouter v1.0.23" },
+    .{ .name = "matchit", .label = "matchit 0.9.2", .rust = true },
+};
+
+/// True when every segment is a literal, a whole-segment `{name}` or a final `*`.
+fn isPlain(pattern: []const u8) bool {
+    const specials = "{}:*";
+    var it = std.mem.splitScalar(u8, pattern, '/');
+    while (it.next()) |seg| {
+        if (std.mem.findAny(u8, seg, specials) == null) continue;
+        if (std.mem.eql(u8, seg, "*")) continue;
+        if (seg.len > 2 and seg[0] == '{' and seg[seg.len - 1] == '}' and
+            std.mem.findAny(u8, seg[1 .. seg.len - 1], specials) == null) continue;
+        return false;
+    }
+    return true;
+}
+
+const plain_count = blk: {
+    @setEvalBranchQuota(100_000);
+    var n: usize = 0;
+    for (routes) |r| {
+        if (isPlain(r.p)) n += 1;
+    }
+    break :blk n;
+};
+const plain_routes: [plain_count]R = blk: {
+    @setEvalBranchQuota(100_000);
+    var t: [plain_count]R = undefined;
+    var i: usize = 0;
+    for (routes) |r| {
+        if (isPlain(r.p)) {
+            t[i] = r;
+            i += 1;
+        }
+    }
+    const frozen = t;
+    break :blk frozen;
+};
+const plain_static: [plain_count]router.StaticRoute = blk: {
+    var t: [plain_count]router.StaticRoute = undefined;
+    for (plain_routes, 0..) |r, i| t[i] = .{ .method = r.m, .pattern = r.p };
+    const frozen = t;
+    break :blk frozen;
+};
+const PlainTable = router.Static(&plain_static, .{});
+
+/// The requests the plain table is timed on, set once in main(): those on which
+/// the full table and the plain table agree whether a route matches, so a
+/// request is dropped exactly when it needed a route the plain subset lacks.
+var plain_requests: []const R = &.{};
+
+fn lookupPlain() usize {
+    var params: router.Params = .{};
+    var found: usize = 0;
+    for (plain_requests) |q| {
+        switch (PlainTable.match(q.m, q.p, &params)) {
+            .found => found += 1,
+            else => {},
+        }
+    }
+    return found;
+}
+
+fn isFound(comptime T: type, q: R) bool {
+    var params: router.Params = .{};
+    return switch (T.match(q.m, q.p, &params)) {
+        .found => true,
+        else => false,
+    };
+}
+
+const GoRow = struct { ns: f64, count: usize };
 
 fn ok(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("ok");
@@ -161,6 +252,22 @@ pub fn main(init: std.process.Init) !u8 {
     list.clearRetainingCapacity();
     for (requests) |q| try list.writer.print("{s}\t{s}\n", .{ q.m.token(), q.p });
     try dir.writeFile(io, .{ .sub_path = "requests.tsv", .data = list.written() });
+    // The plain subset, for the fastest-in-the-field contenders.
+    var plain_buf: [requests.len]R = undefined;
+    var n_plain: usize = 0;
+    for (requests) |q| {
+        if (isFound(Table, q) == isFound(PlainTable, q)) {
+            plain_buf[n_plain] = q;
+            n_plain += 1;
+        }
+    }
+    plain_requests = plain_buf[0..n_plain];
+    list.clearRetainingCapacity();
+    for (plain_routes) |r| try list.writer.print("{s}\t{s}\n", .{ r.m.token(), r.p });
+    try dir.writeFile(io, .{ .sub_path = "routes_plain.tsv", .data = list.written() });
+    list.clearRetainingCapacity();
+    for (plain_requests) |q| try list.writer.print("{s}\t{s}\n", .{ q.m.token(), q.p });
+    try dir.writeFile(io, .{ .sub_path = "requests_plain.tsv", .data = list.written() });
 
     var env = try init.environ_map.clone(arena);
     try env.put("GOTOOLCHAIN", "local");
@@ -180,7 +287,6 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("bench-router: go_bench failed:\n{s}\n", .{go.stderr});
         return 1;
     }
-    const GoRow = struct { ns: f64, count: usize };
     var go_rows: std.StringHashMapUnmanaged(GoRow) = .empty;
     var lines = std.mem.tokenizeScalar(u8, go.stdout, '\n');
     while (lines.next()) |line| {
@@ -201,6 +307,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     const lookup = timeIt(io, .{}, lookupAll);
     const serve = timeIt(io, .{ &r, &wires }, serveAll);
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    const lookup_plain = timeIt(io, .{}, lookupPlain);
+    var fast: [contenders.len]?GoRow = @splat(null);
+    if (use_fast) {
+        std.debug.print("bench-router: building the Rust side ...\n", .{});
+        try rustBuild(arena, io, &env);
+        for (contenders, 0..) |c, i| {
+            std.debug.print("bench-router: {s} ...\n", .{c.label});
+            fast[i] = try fastRun(arena, io, &env, abs, c);
+        }
+    }
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -228,7 +345,89 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try w.writeAll("(serve includes each side's HTTP/1.1 parser and response writer, not only the router)\n");
     try w.print("\nworst ours/chi = {d:.2} (best {d:.2})\n", .{ worst, best });
-    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× go-chi/chi v5.3.2 · fastest ? (measured <today>)\n", .{ best, worst });
+    if (!use_fast) {
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× go-chi/chi v5.3.2 · fastest ? (measured <today>)\n", .{ best, worst });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: lookup over the plain subset ----
+    try w.print("\nfastest in the field -- lookup, plain subset ({d} routes, one op = {d} requests)\n", .{ plain_count, plain_requests.len });
+    try w.print("{s:<20} {s:>12} {s:>9}  count\n", .{ "contender", "ns/op", "ours/it" });
+    try w.print("{s:<20} {d:>12.1} {s:>9}  {d}\n", .{ "ours (plain)", lookup_plain.ns, "-", lookup_plain.count });
+    var fastest_ns = std.math.inf(f64);
+    var fastest_who: []const u8 = "";
+    var fast_mismatch = false;
+    for (contenders, 0..) |c, i| {
+        const row = fast[i] orelse {
+            try w.print("{s:<20} {s:>12} {s:>9}  unsupported on the plain table\n", .{ c.label, "-", "-" });
+            continue;
+        };
+        const same = row.count == lookup_plain.count;
+        if (!same) fast_mismatch = true;
+        try w.print("{s:<20} {d:>12.1} {d:>9.2}  {d}{s}\n", .{ c.label, row.ns, lookup_plain.ns / row.ns, row.count, if (same) "" else " != ours" });
+        if (row.ns < fastest_ns) {
+            fastest_ns = row.ns;
+            fastest_who = c.label;
+        }
+    }
+    if (fast_mismatch) {
+        try w.writeAll("bench-router: FAILED -- a contender's match count differs from ours on the plain subset; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    if (fastest_who.len == 0) {
+        try w.writeAll("bench-router: FAILED -- no contender could run the plain table\n");
+        try w.flush();
+        return 1;
+    }
+    // One workload (lookup), so the worst row is that row.
+    const worst_fast = lookup_plain.ns / fastest_ns;
+    try w.print("\nworst vs fastest = {d:.2} (row lookup, {s})\n", .{ worst_fast, fastest_who });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× go-chi/chi v5.3.2 · fastest {d:.2}× {s} (measured <today>)\n", .{ best, worst, worst_fast, fastest_who });
     try w.flush();
     return 0;
+}
+
+/// Build the Rust side once (no network: the crate is in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map) !void {
+    try env.put("CARGO_NET_OFFLINE", "true");
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = env,
+    }) catch |e| {
+        std.debug.print("bench-router: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{e});
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("bench-router: cargo build failed:\n{s}\n", .{res.stderr});
+        return error.RustBuildFailed;
+    }
+}
+
+/// One contender on the plain subset: null when it exits 3 (`unsupported`),
+/// else its `lookup<TAB>ns<TAB>count` line.
+fn fastRun(arena: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, abs: []const u8, c: Contender) !?GoRow {
+    const res = (if (c.rust)
+        std.process.run(arena, io, .{ .argv = &.{ rust_exe, abs }, .environ_map = env })
+    else
+        std.process.run(arena, io, .{
+            .argv = &.{ "go", "run", ".", c.name, abs },
+            .environ_map = env,
+            .cwd = .{ .path = fast_dir },
+        })) catch |e| {
+        std.debug.print("bench-router: could not run {s} ({t})\n", .{ c.name, e });
+        return error.ForeignFailed;
+    };
+    if (res.term == .exited and res.term.exited == 3) return null;
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("bench-router: {s} failed:\n{s}\n", .{ c.name, res.stderr });
+        return error.ForeignFailed;
+    }
+    var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');
+    if (!std.mem.eql(u8, f.next() orelse return error.BadForeignOutput, "lookup")) return error.BadForeignOutput;
+    const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
+    const count = try std.fmt.parseInt(usize, f.next() orelse return error.BadForeignOutput, 10);
+    return .{ .ns = ns, .count = count };
 }
