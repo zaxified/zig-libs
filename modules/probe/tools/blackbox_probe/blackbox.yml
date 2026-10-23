@@ -1,0 +1,6 @@
+# Scratch blackbox_exporter config for probe.py: the documented defaults of
+# the tcp prober (preferred_ip_protocol ip6, ip_protocol_fallback true).
+modules:
+  tcp_connect:
+    prober: tcp
+    timeout: 2s

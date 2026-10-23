@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — Fixed: `PosixConnector` tried the resolved addresses one after another with the whole remaining budget each, so a black-holed first address (broken IPv6 path) made a service up on the second read `.timeout` — the addresses now race RFC 8305 style (250 ms attempt delay, `PosixConnector.attempt_delay_ns`). Fixed: a cancelation is no longer one sample's outcome — the first `.canceled` (or a canceled interval sleep) ends the run for every worker; a canceled `.system` lookup is `.canceled`, not `.error`. **BREAKING:** `Sleeper.sleepFn` returns `error{Canceled}!void` (a custom sleeper must return the error; `IoSleeper` does). Behavioural: `PosixConnector`'s `rtt_ns` for `.up` is the winning connect alone (resolution and other attempts excluded; `LiveConnector` unchanged); `socket()` failures carry their errno. Grade 1 (lead vs blackbox_exporter, `tools/blackbox_probe`).
+
 - **2026-10-18** — Example only (big-endian): `example/main.zig` built 127.0.0.1 as `@bitCast([4]u8{...})`, octet-reversed on big-endian under Zig 0.17; now one `std.mem.bytesToValue(u32, ...)` constant (memory = network order).
 - **2026-10-18** — Ported to Zig 0.17.0. sockaddr.in `addr` <-> `[4]u8` conversions use `std.mem.bytesToValue`/`toBytes` (memory order); fixed a malformed model-test `reach` counter left by the 0.17 codemod. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-11** — **Added (additive; every new field defaults to the old behaviour):**

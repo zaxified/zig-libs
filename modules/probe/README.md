@@ -55,10 +55,12 @@ underlying error: `errno` (the raw `SO_ERROR`/`connect()` code) from `PosixConne
 for `.up`, and **both null on the several `.error` exits that have no error to name**
 (SPEC lists them). Treat them as optional; `r.errno.?` on a non-`up` result will
 eventually panic. Useful when the classification alone is not enough, e.g. logging
-`EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`. `canceled` is
-`LiveConnector`-only: it means the caller's own `std.Io` task was canceled
-(`Future.cancel`) while this attempt was in flight, not that anything about the
-target failed — `PosixConnector`'s raw-syscall path never produces it.
+`EHOSTUNREACH` vs `ENETUNREACH` even though both are `.error`. `canceled` means the
+caller's own `std.Io` task was canceled (`Future.cancel`) — seen by `LiveConnector`'s
+connect, `PosixConnector`'s `.system` lookup or an `IoSleeper` interval — not that anything
+about the target failed; it ends the run, every repetition and target not yet probed is
+`.canceled` too. A name with several addresses is raced (RFC 8305), and `rtt_ns` is the
+winning connect alone.
 
 ```zig
 const probe = @import("probe");
@@ -104,3 +106,5 @@ the accepted peer address is checked; device `lo`). All hermetic: loopback only,
 Provenance: clean-room — implements the standard TCP-connect probing technique
 (`nmap -sT` / `fping` fan-out, public knowledge); no third-party source consulted
 or copied — behavior only. Deps `netaddr` + `latency-stats` are sibling modules.
+Data: `tools/blackbox_probe/blackbox.yml` is a fixture of our own tooling that runs
+Ubuntu's blackbox_exporter binary as a black-box oracle (no source of it read or copied).

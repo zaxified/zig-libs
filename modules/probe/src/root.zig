@@ -111,10 +111,12 @@ pub const meta = .{
 ///                 cancellation (`Future.cancel`) before it completed. Distinct
 ///                 from `error` on purpose: nothing about the host or network
 ///                 failed, so folding this into `error` would report a live
-///                 target as down. Only `LiveConnector` can produce it —
-///                 `PosixConnector`'s raw syscalls sit outside `std.Io`'s
-///                 cancellation registry and never see a cancelation (see its
-///                 doc comment).
+///                 target as down. `LiveConnector` reports it from the connect,
+///                 `PosixConnector` from a `.system` name lookup (its connects
+///                 are raw syscalls outside `std.Io`'s cancellation registry),
+///                 and an `IoSleeper` interval from the sleep. A canceled
+///                 repetition ends the run: every repetition and target not yet
+///                 probed is `.canceled` too (see `probeTarget`, `probeMany`).
 ///  * `error`   — DNS failure, unreachable network, or any other error.
 pub const Status = enum { up, refused, timeout, canceled, @"error" };
 
@@ -283,21 +285,24 @@ pub const Interval = struct {
 
 /// A sleep seam, same shape as `Connector`/`AppCheck`, so the engine stays
 /// free of `std.Io` and tests never sleep: the engine calls `sleepFn(ctx, ns)`
-/// between repetitions (`Options.interval`).
+/// between repetitions (`Options.interval`). `error.Canceled` ends the run
+/// (the remaining repetitions and targets are `.canceled`).
 pub const Sleeper = struct {
     ctx: *anyopaque,
-    sleepFn: *const fn (ctx: *anyopaque, ns: u64) void,
+    sleepFn: *const fn (ctx: *anyopaque, ns: u64) error{Canceled}!void,
 
-    fn sleep(self: Sleeper, ns: u64) void {
-        self.sleepFn(self.ctx, ns);
+    fn sleep(self: Sleeper, ns: u64) error{Canceled}!void {
+        return self.sleepFn(self.ctx, ns);
     }
 };
 
 /// `Sleeper` over `std.Io`: `io.sleep` on the monotonic (`.awake`) clock. Hold
 /// one and hand `sleeper()` to `Options`; it must outlive any probe using it.
-/// A canceled sleep returns early (the following repetition then runs sooner
-/// than `Interval.ms`) — cancelation is the caller's doing, and the engine has
-/// no error channel for it.
+/// A canceled sleep answers `error.Canceled` and re-arms the cancelation
+/// (`io.recancel()`), so the run stops and the caller's next cancelation point
+/// still sees it. Until 2026-10-23 the cancelation was swallowed here: std
+/// reports it once, so every later repetition and target ran as if nothing
+/// had happened.
 pub const IoSleeper = struct {
     io: std.Io,
 
@@ -305,9 +310,12 @@ pub const IoSleeper = struct {
         return .{ .ctx = self, .sleepFn = sleepImpl };
     }
 
-    fn sleepImpl(ctx: *anyopaque, ns: u64) void {
+    fn sleepImpl(ctx: *anyopaque, ns: u64) error{Canceled}!void {
         const self: *IoSleeper = @ptrCast(@alignCast(ctx));
-        self.io.sleep(.fromNanoseconds(ns), .awake) catch {};
+        self.io.sleep(.fromNanoseconds(ns), .awake) catch {
+            self.io.recancel();
+            return error.Canceled;
+        };
     }
 };
 
@@ -374,18 +382,36 @@ pub fn probeTarget(gpa: Allocator, target: Target, opts: Options) Allocator.Erro
         .samples = try gpa.alloc(Result, count),
         .stats = undefined,
     };
-    probeInto(&r, opts);
+    var stop: std.atomic.Value(bool) = .init(false);
+    probeInto(&r, opts, &stop);
     return r;
 }
 
 /// Fill `r.samples` and compute `r.stats`. Pure w.r.t. allocation (samples
-/// already allocated) — safe to call from a worker thread.
-fn probeInto(r: *TargetResult, opts: Options) void {
+/// already allocated) — safe to call from a worker thread. A cancelation
+/// (a `.canceled` sample, or the interval sleep answering `error.Canceled`)
+/// sets `stop`; once it is set, no further connect is made, here or in any
+/// other worker of the batch, and the repetitions left are `.canceled`.
+/// Until 2026-10-23 one canceled sample changed nothing: std reports a
+/// cancelation once, so the next repetition and the next target connected
+/// as usual, and `probeMany`'s helper threads (plain threads, not `Io`
+/// tasks) never saw it at all.
+fn probeInto(r: *TargetResult, opts: Options, stop: *std.atomic.Value(bool)) void {
     for (r.samples, 0..) |*s, i| {
+        if (stop.load(.acquire)) {
+            for (r.samples[i..]) |*rest| rest.* = .{ .kind = .canceled };
+            break;
+        }
         // Between repetitions only: not before the first, not after the last.
-        if (i > 0) if (opts.interval) |iv| if (iv.ms != 0)
-            iv.sleeper.sleep(@as(u64, iv.ms) * std.time.ns_per_ms);
+        if (i > 0) if (opts.interval) |iv| if (iv.ms != 0) {
+            iv.sleeper.sleep(@as(u64, iv.ms) * std.time.ns_per_ms) catch {
+                stop.store(true, .release);
+                for (r.samples[i..]) |*rest| rest.* = .{ .kind = .canceled };
+                break;
+            };
+        };
         s.* = probeTcp(r.target, opts);
+        if (s.kind == .canceled) stop.store(true, .release);
     }
     var acc = latency.Accumulator.init();
     for (r.samples) |s| {
@@ -445,6 +471,8 @@ const FanCtx = struct {
     results: []TargetResult,
     opts: Options,
     next: *std.atomic.Value(usize),
+    /// Set by the first cancelation any worker sees; see `probeInto`.
+    stop: std.atomic.Value(bool) = .init(false),
 };
 
 fn runInline(ctx: *FanCtx) void {
@@ -452,7 +480,7 @@ fn runInline(ctx: *FanCtx) void {
     while (true) {
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= n) break;
-        probeInto(&ctx.results[i], ctx.opts);
+        probeInto(&ctx.results[i], ctx.opts, &ctx.stop);
     }
 }
 
@@ -750,8 +778,15 @@ fn selectAddresses(addrs: *[PosixConnector.max_addresses]netaddr.Ip, n: usize, p
 ///    of a `.system` attempt is `timeout_ns` **plus** up to the resolver's own
 ///    timeout.
 ///
-/// `rtt_ns` is the total elapsed time of the attempt, resolution included —
-/// the same convention `LiveConnector` already uses.
+/// `rtt_ns` of an `.up` is the winning address's own connect time: the name
+/// resolution and the other addresses' attempts are charged against the
+/// budget but are not in it (fping/nmap time the connect alone; until
+/// 2026-10-23 it was the whole attempt, so a cold resolver skewed min/avg/max).
+/// `LiveConnector` cannot split them: its `rtt_ns` stays the whole attempt.
+/// A `.timeout`'s `rtt_ns` is the whole attempt.
+///
+/// Several addresses (a `.system` name) race, RFC 8305 style: see
+/// `connectRace`. At most `max_addresses` of them are tried.
 ///
 /// ## Platform
 ///
@@ -796,7 +831,8 @@ pub const PosixConnector = struct {
             .literal_only => return .{ .status = .@"error" },
             .system => {
                 const io = self.io orelse return .{ .status = .@"error" };
-                n = resolveAll(io, target.host, target.port, &addrs);
+                n = resolveAll(io, target.host, target.port, &addrs) catch
+                    return .{ .status = .canceled };
                 if (n == 0) return .{ .status = .@"error" };
             },
         }
@@ -807,44 +843,38 @@ pub const PosixConnector = struct {
         n = selectAddresses(&addrs, n, self.ip_protocol);
         if (n == 0) return .{ .status = .@"error" };
 
-        // Every resolved address gets a turn against what is left of the
-        // budget, and a definitive negative is only reported once they have
-        // all been tried (F1). `.refused` outranks `.@"error"` as the answer
-        // to keep: it is the one the caller is told is definitive.
-        var fold: VerdictFold = .{};
-        for (addrs[0..n]) |ip| {
-            // Charge resolution and earlier attempts against the budget: each
-            // connect gets the REMAINDER, and once it is gone nothing more is
-            // attempted.
-            const spent_now = monoNs() -| start;
-            const remaining: u64 = if (timeout_ns == 0)
-                0 // 0 == "no budget", same convention as `overBudget`
-            else if (spent_now >= timeout_ns) {
-                fold.budgetGone();
-                break;
-            } else timeout_ns - spent_now;
+        // Resolution is charged against the budget: the race gets what is
+        // left, and nothing is attempted once it is gone.
+        const spent = monoNs() -| start;
+        const remaining: u64 = if (timeout_ns == 0)
+            0 // 0 == "no budget", same convention as `overBudget`
+        else if (spent >= timeout_ns)
+            return .{ .status = .timeout, .rtt_ns = spent }
+        else
+            timeout_ns - spent;
 
-            if (fold.add(connectBounded(ip, target.port, remaining, self.source, self.device))) break;
-        }
-
-        const v = fold.result();
-        const rtt = monoNs() -| start;
+        const race = connectRace(addrs[0..n], target.port, remaining, self.source, self.device);
+        const v = race.verdict;
+        const total = monoNs() -| start;
         return switch (v.status) {
-            // `overBudget` still guards the success path: a connect that
-            // completed synchronously after a slow resolution is a budget
-            // miss, not an OS-level error — no errno to carry either way.
-            .up => overBudget(rtt, timeout_ns),
-            .timeout => .{ .status = .timeout, .rtt_ns = rtt, .errno = v.errno },
+            // The budget still guards the success path: a connect that
+            // completed after a slow resolution is a budget miss, not an
+            // OS-level error -- no errno to carry either way. The RTT is the
+            // winning attempt's own connect, not resolution or the losers.
+            .up => if (timeout_ns != 0 and total > timeout_ns)
+                .{ .status = .timeout, .rtt_ns = total }
+            else
+                .{ .status = .up, .rtt_ns = race.connect_ns },
+            .timeout => .{ .status = .timeout, .rtt_ns = total, .errno = v.errno },
             .refused, .@"error" => .{ .status = v.status, .errno = v.errno },
-            // `connectBounded` never produces this: it is plain
-            // `std.os.linux` syscalls, outside `std.Io`'s cancellation
-            // registry, so there is nothing here to observe a cancelation
-            // (see `Status.canceled`'s doc comment).
+            // No attempt reports it: the race is plain `std.os.linux`
+            // syscalls, outside `std.Io`'s cancellation registry. (A canceled
+            // `.system` lookup returned above, before the race.)
             .canceled => unreachable,
         };
     }
 
-    /// `connectBounded`'s verdict: the classified `Status` plus the raw errno
+    /// One attempt's verdict: the classified `Status` plus the raw errno
     /// it was classified FROM, when one is known. `null` on `.up` (nothing
     /// failed) and on the handful of exits with no specific errno to name
     /// (`POLLNVAL`, "writable check came back clear but not writable").
@@ -888,25 +918,28 @@ pub const PosixConnector = struct {
         }
     };
 
-    /// One non-blocking connect bounded by `budget_ns` (0 = unbounded).
-    /// Never allocates; closes its descriptor on every exit path.
-    fn connectBounded(
-        ip: netaddr.Ip,
-        port: u16,
-        budget_ns: u64,
-        source: ?netaddr.Ip,
-        device: ?[]const u8,
-    ) Verdict {
+    /// RFC 8305's "Connection Attempt Delay", at its recommended value: how
+    /// long a still-pending attempt runs alone before the next address starts
+    /// beside it.
+    pub const attempt_delay_ns: u64 = 250 * std.time.ns_per_ms;
+
+    const Started = union(enum) { done: Verdict, pending: i32 };
+
+    /// Open a non-blocking socket to `ip:port` and start the handshake. A
+    /// verdict when it is decided at once (a synchronous connect, a refusal,
+    /// a setup failure: the descriptor is closed), else the pending fd, which
+    /// the caller owns.
+    fn startAttempt(ip: netaddr.Ip, port: u16, source: ?netaddr.Ip, device: ?[]const u8) Started {
         if (comptime builtin.os.tag != .linux)
             @compileError("probe.PosixConnector is Linux-only (raw socket syscalls, no libc)");
         const linux = std.os.linux;
 
         // Checked before any descriptor exists: nothing to close, no syscall.
         if (source) |src| {
-            if ((src == .v6) != (ip == .v6)) return .{ .status = .@"error" };
+            if ((src == .v6) != (ip == .v6)) return .{ .done = .{ .status = .@"error" } };
         }
         if (device) |d| {
-            if (!validDeviceName(d)) return .{ .status = .@"error" };
+            if (!validDeviceName(d)) return .{ .done = .{ .status = .@"error" } };
         }
 
         const family: u32 = switch (ip) {
@@ -918,10 +951,15 @@ pub const PosixConnector = struct {
             linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
             0,
         );
-        if (linux.errno(sock_rc) != .SUCCESS) return .{ .status = .@"error" };
+        // The errno says WHY (EMFILE under fd exhaustion is a local limit,
+        // not a dead host); until 2026-10-23 it was dropped here.
+        if (linux.errno(sock_rc) != .SUCCESS)
+            return .{ .done = .{ .status = .@"error", .errno = @backingInt(linux.errno(sock_rc)) } };
         const fd: i32 = @intCast(sock_rc);
-        // The only descriptor this function owns, released on every path.
-        defer _ = linux.close(fd);
+        var keep = false;
+        defer if (!keep) {
+            _ = linux.close(fd);
+        };
 
         if (device) |d| {
             // NUL-terminated copy: the kernel reads `optlen` bytes into its own
@@ -930,7 +968,7 @@ pub const PosixConnector = struct {
             @memcpy(name[0..d.len], d);
             const rc = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.BINDTODEVICE, &name, @intCast(d.len + 1));
             if (linux.errno(rc) != .SUCCESS)
-                return .{ .status = .@"error", .errno = @backingInt(linux.errno(rc)) };
+                return .{ .done = .{ .status = .@"error", .errno = @backingInt(linux.errno(rc)) } };
         }
         if (source) |src| {
             const bind_rc = switch (src) {
@@ -944,12 +982,8 @@ pub const PosixConnector = struct {
                 },
             };
             if (linux.errno(bind_rc) != .SUCCESS)
-                return .{ .status = .@"error", .errno = @backingInt(linux.errno(bind_rc)) };
+                return .{ .done = .{ .status = .@"error", .errno = @backingInt(linux.errno(bind_rc)) } };
         }
-
-        // Saturating: `Connector.connect` takes an arbitrary u64 from the
-        // caller, and a plain `+` on a maxInt budget would trap in Debug.
-        const deadline: ?u64 = if (budget_ns == 0) null else monoNs() +| budget_ns;
 
         const be_port = std.mem.nativeToBig(u16, port);
         var sa4: linux.sockaddr.in = undefined;
@@ -968,37 +1002,21 @@ pub const PosixConnector = struct {
         };
         switch (linux.errno(conn_rc)) {
             // Loopback and same-host connects frequently complete right here.
-            .SUCCESS => return .{ .status = .up },
+            .SUCCESS => return .{ .done = .{ .status = .up } },
             // The handshake is under way; EINTR means the same thing — POSIX
             // requires polling for completion, NOT a second connect().
-            .INPROGRESS, .INTR => {},
+            .INPROGRESS, .INTR => {
+                keep = true;
+                return .{ .pending = fd };
+            },
             // Everything definitive arrives synchronously, ECONNREFUSED included.
-            else => |e| return .{ .status = classifyErrno(@backingInt(e)), .errno = @backingInt(e) },
+            else => |e| return .{ .done = .{ .status = classifyErrno(@backingInt(e)), .errno = @backingInt(e) } },
         }
+    }
 
-        var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-        while (true) {
-            // Recomputed from the clock every iteration. A signal storm must
-            // not extend the budget, and a short poll must not shorten it.
-            const wait_ms: i32 = blk: {
-                const d = deadline orelse break :blk -1;
-                const now = monoNs();
-                if (now >= d) return .{ .status = .timeout };
-                const left_ms = (d - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
-                break :blk @intCast(@min(left_ms, @as(u64, std.math.maxInt(i32))));
-            };
-            pfd[0].revents = 0;
-            const poll_rc = linux.poll(&pfd, 1, wait_ms);
-            switch (linux.errno(poll_rc)) {
-                .SUCCESS => {},
-                .INTR => continue, // budget recomputed at the top of the loop
-                else => |e| return .{ .status = .@"error", .errno = @backingInt(e) },
-            }
-            if (poll_rc == 0) continue; // timed out (or short) — the top decides
-            break;
-        }
-
-        const revents = pfd[0].revents;
+    /// The verdict of a pending attempt `poll` reported on. Does not close.
+    fn finishAttempt(fd: i32, revents: i16) Verdict {
+        const linux = std.os.linux;
         if (revents & linux.POLL.NVAL != 0) return .{ .status = .@"error" };
 
         // SO_ERROR decides, not POLLOUT: a refusal is POLLOUT|POLLERR|POLLHUP
@@ -1020,6 +1038,142 @@ pub const PosixConnector = struct {
         return .{ .status = classifyErrno(so_error), .errno = so_error };
     }
 
+    const RaceResult = struct {
+        verdict: Verdict,
+        /// The winning attempt's own connect time, for an `.up`.
+        connect_ns: ?u64 = null,
+    };
+
+    /// Connect to the first of `addrs` that answers, within `budget_ns`
+    /// (0 = unbounded): RFC 8305 Happy Eyeballs. The first address starts at
+    /// once; each next one starts `attempt_delay_ns` after the previous, or
+    /// at once when every started attempt has failed, while the earlier ones
+    /// keep running; one `poll` waits on all of them and the first completed
+    /// handshake wins. The verdicts fold as `VerdictFold` describes.
+    ///
+    /// Until 2026-10-23 the addresses were tried one after another, each with
+    /// the WHOLE remaining budget: a black-holed first address (a dual-stack
+    /// name whose IPv6 path is broken) used it all, and a service listening
+    /// on the second address was reported `.timeout` -- the false "down" the
+    /// F1 fix of 2026-09-02 had moved, not removed. `LiveConnector` (std's
+    /// `HostName.connect`) races the addresses too.
+    ///
+    /// Never allocates; every descriptor it opened is closed on return.
+    fn connectRace(addrs: []const netaddr.Ip, port: u16, budget_ns: u64, source: ?netaddr.Ip, device: ?[]const u8) RaceResult {
+        var sys: RealSys = .{ .source = source, .device = device };
+        return connectRaceWith(RealSys, &sys, addrs, port, budget_ns);
+    }
+
+    /// The system calls `connectRaceWith` makes, as a value: the real ones
+    /// here, a scripted one with a virtual clock in the tests -- the race's
+    /// timing and bookkeeping are only reachable that way (on loopback a
+    /// refusal and a success both complete inside `connect`, and an
+    /// asynchronous failure arrives with the first SYN retransmit, >= 1 s).
+    const RealSys = struct {
+        source: ?netaddr.Ip,
+        device: ?[]const u8,
+
+        fn now(_: *RealSys) u64 {
+            return monoNs();
+        }
+        fn start(self: *RealSys, ip: netaddr.Ip, port: u16) Started {
+            return startAttempt(ip, port, self.source, self.device);
+        }
+        fn finish(_: *RealSys, fd: i32, revents: i16) Verdict {
+            return finishAttempt(fd, revents);
+        }
+        fn close(_: *RealSys, fd: i32) void {
+            _ = std.os.linux.close(fd);
+        }
+        /// `poll(2)`: the ready count, or the errno.
+        fn poll(_: *RealSys, pfds: []std.os.linux.pollfd, wait_ms: i32) union(enum) { ready: usize, err: std.os.linux.E } {
+            const linux = std.os.linux;
+            const rc = linux.poll(pfds.ptr, @intCast(pfds.len), wait_ms);
+            return switch (linux.errno(rc)) {
+                .SUCCESS => .{ .ready = rc },
+                else => |e| .{ .err = e },
+            };
+        }
+    };
+
+    fn connectRaceWith(comptime Sys: type, sys: *Sys, addrs: []const netaddr.Ip, port: u16, budget_ns: u64) RaceResult {
+        const linux = std.os.linux;
+        var fold: VerdictFold = .{};
+        var pfds: [max_addresses]linux.pollfd = undefined;
+        var began: [max_addresses]u64 = undefined;
+        var open: usize = 0;
+        defer for (pfds[0..open]) |pf| sys.close(pf.fd);
+        var next: usize = 0;
+        const t0 = sys.now();
+        // Saturating: `Connector.connect` takes an arbitrary u64 from the
+        // caller, and a plain `+` on a maxInt budget would trap in Debug.
+        const deadline: ?u64 = if (budget_ns == 0) null else t0 +| budget_ns;
+        var next_start = t0;
+
+        while (true) {
+            const now = sys.now();
+            if (deadline) |d| if (now >= d) {
+                fold.budgetGone();
+                break;
+            };
+            if (next < addrs.len and (open == 0 or now >= next_start)) {
+                const ip = addrs[next];
+                next += 1;
+                next_start = now +| attempt_delay_ns;
+                switch (sys.start(ip, port)) {
+                    .done => |v| if (fold.add(v)) return .{ .verdict = v, .connect_ns = sys.now() -| now },
+                    .pending => |fd| {
+                        pfds[open] = .{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 };
+                        began[open] = now;
+                        open += 1;
+                    },
+                }
+                continue;
+            }
+            if (open == 0) break; // every address tried and decided
+
+            // Recomputed from the clock every iteration: a signal storm must
+            // not extend the budget, and a short poll must not shorten it.
+            var wait_ns: ?u64 = if (deadline) |d| d - now else null;
+            if (next < addrs.len) {
+                const until_next = next_start -| now;
+                wait_ns = if (wait_ns) |w| @min(w, until_next) else until_next;
+            }
+            const wait_ms: i32 = if (wait_ns) |w|
+                @intCast(@min((w + std.time.ns_per_ms - 1) / std.time.ns_per_ms, @as(u64, std.math.maxInt(i32))))
+            else
+                -1;
+            for (pfds[0..open]) |*pf| pf.revents = 0;
+            switch (sys.poll(pfds[0..open], wait_ms)) {
+                .ready => |ready| if (ready == 0) continue, // timed out (or short) — the top decides
+                .err => |e| switch (e) {
+                    .INTR => continue, // budget recomputed at the top of the loop
+                    else => {
+                        _ = fold.add(.{ .status = .@"error", .errno = @backingInt(e) });
+                        break;
+                    },
+                },
+            }
+            var i: usize = 0;
+            while (i < open) {
+                if (pfds[i].revents == 0) {
+                    i += 1;
+                    continue;
+                }
+                const v = sys.finish(pfds[i].fd, pfds[i].revents);
+                const took = sys.now() -| began[i];
+                sys.close(pfds[i].fd);
+                open -= 1;
+                pfds[i] = pfds[open];
+                began[i] = began[open];
+                if (fold.add(v)) return .{ .verdict = v, .connect_ns = took };
+                // A failed attempt lets the next address start at once (RFC 8305 §5).
+                next_start = sys.now();
+            }
+        }
+        return .{ .verdict = fold.result() };
+    }
+
     /// How many resolved addresses one `.system` probe will try. std's
     /// resolver has already ordered them; this bounds the work, not the
     /// choice.
@@ -1038,12 +1192,24 @@ pub const PosixConnector = struct {
     /// `.timeout`. `.system` is the default and `PosixConnector` is the
     /// recommended connector, so that is a false "service down" on the health
     /// checker this module exists for (W2 re-audit 2026-09-02, `probe` F1).
-    fn resolveAll(io: std.Io, host: []const u8, port: u16, out: *[max_addresses]netaddr.Ip) usize {
+    ///
+    /// `error.Canceled` when the caller's task was canceled during the lookup
+    /// (re-armed with `io.recancel()` for the caller's next cancelation
+    /// point): until 2026-10-23 it was swallowed into "0 addresses", and a
+    /// canceled probe reported `.error` -- the live-target-reported-dead
+    /// shape `.canceled` exists to prevent.
+    fn resolveAll(io: std.Io, host: []const u8, port: u16, out: *[max_addresses]netaddr.Ip) error{Canceled}!usize {
         const host_name = net.HostName.init(host) catch return 0;
         // `lookup` is documented not to block with capacity >= 16.
         var buf: [32]net.HostName.LookupResult = undefined;
         var queue: std.Io.Queue(net.HostName.LookupResult) = .init(&buf);
-        host_name.lookup(io, &queue, .{ .port = port }) catch return 0;
+        host_name.lookup(io, &queue, .{ .port = port }) catch |err| switch (err) {
+            error.Canceled => {
+                io.recancel();
+                return error.Canceled;
+            },
+            else => return 0,
+        };
         var n: usize = 0;
         while (queue.getOne(io)) |res| switch (res) {
             .address => |addr| {
@@ -1055,7 +1221,13 @@ pub const PosixConnector = struct {
                 if (n == max_addresses) return n;
             },
             .canonical_name => continue,
-        } else |_| return n;
+        } else |err| switch (err) {
+            error.Canceled => {
+                io.recancel();
+                return error.Canceled;
+            },
+            else => return n,
+        }
         return n;
     }
 };
@@ -1674,6 +1846,329 @@ const BlackHole = struct {
     }
 };
 
+/// `PosixConnector.connectRaceWith`'s system calls, scripted, on a virtual
+/// clock: address `10.0.0.k` follows `plans[k]`. `poll` jumps the clock to
+/// the earliest completion (or to its own timeout); a descriptor already
+/// closed reports `POLLNVAL`, as a stale entry would.
+const FakeSys = struct {
+    const ms = std.time.ns_per_ms;
+    const Plan = union(enum) {
+        /// Decided inside `start` (a synchronous connect / refusal).
+        done: PosixConnector.Verdict,
+        /// Completes `after_ns` after its start; `never` for a black hole.
+        pending: struct { after_ns: u64, verdict: PosixConnector.Verdict = .{ .status = .up } },
+    };
+    const never = std.math.maxInt(u64);
+
+    plans: []const Plan,
+    clock: u64 = 1000 * ms,
+    began: [8]u64 = @splat(0),
+    started: [8]?u64 = @splat(null),
+    closed: [8]bool = @splat(false),
+    closes: usize = 0,
+
+    fn index(fd: i32) usize {
+        return @intCast(fd - 100);
+    }
+    fn now(self: *FakeSys) u64 {
+        return self.clock;
+    }
+    fn start(self: *FakeSys, ip: netaddr.Ip, port: u16) PosixConnector.Started {
+        _ = port;
+        const k = ip.v4[3];
+        self.started[k] = self.clock;
+        return switch (self.plans[k]) {
+            .done => |v| .{ .done = v },
+            .pending => {
+                self.began[k] = self.clock;
+                return .{ .pending = 100 + @as(i32, k) };
+            },
+        };
+    }
+    fn finish(self: *FakeSys, fd: i32, revents: i16) PosixConnector.Verdict {
+        if (revents & tl.POLL.NVAL != 0) return .{ .status = .@"error" };
+        return self.plans[index(fd)].pending.verdict;
+    }
+    fn close(self: *FakeSys, fd: i32) void {
+        self.closed[index(fd)] = true;
+        self.closes += 1;
+    }
+    fn due(self: *const FakeSys, k: usize) u64 {
+        const after = self.plans[k].pending.after_ns;
+        return if (after == never) never else self.began[k] + after;
+    }
+    fn poll(self: *FakeSys, pfds: []tl.pollfd, wait_ms: i32) union(enum) { ready: usize, err: tl.E } {
+        var ready: usize = 0;
+        for (pfds) |*pf| if (self.closed[index(pf.fd)]) {
+            pf.revents = tl.POLL.NVAL;
+            ready += 1;
+        };
+        if (ready != 0) return .{ .ready = ready };
+        var best: u64 = never;
+        for (pfds) |pf| best = @min(best, self.due(index(pf.fd)));
+        const limit: u64 = if (wait_ms < 0) never else self.clock + @as(u64, @intCast(wait_ms)) * ms;
+        if (best == never and limit == never) @panic("FakeSys: poll would wait forever");
+        if (best <= limit) {
+            self.clock = best;
+            for (pfds) |*pf| if (self.due(index(pf.fd)) == best) {
+                pf.revents = tl.POLL.OUT;
+                ready += 1;
+            };
+            return .{ .ready = ready };
+        }
+        self.clock = limit;
+        return .{ .ready = 0 };
+    }
+};
+
+fn fakeAddrs(comptime n: u8) [n]netaddr.Ip {
+    var a: [n]netaddr.Ip = undefined;
+    for (&a, 0..) |*x, k| x.* = .{ .v4 = .{ 10, 0, 0, @intCast(k) } };
+    return a;
+}
+
+test "race (scripted): a failure while pending starts the next address at once, not after the delay" {
+    const ms = FakeSys.ms;
+    // 0: a black hole, still pending throughout; 1 starts at 250 ms and is
+    // refused at 300; 2 must start then, not at 500 (250 after 1).
+    var sys: FakeSys = .{ .plans = &.{
+        .{ .pending = .{ .after_ns = FakeSys.never } },
+        .{ .pending = .{ .after_ns = 50 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+        .{ .pending = .{ .after_ns = 10 * ms } },
+    } };
+    const addrs = fakeAddrs(3);
+    const t0 = sys.clock;
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+    try testing.expectEqual(Status.up, r.verdict.status);
+    try testing.expectEqual(@as(u64, 300 * ms), sys.started[2].? - t0); // at the failure, not at 500 ms
+    try testing.expectEqual(@as(u64, 10 * ms), r.connect_ns.?);
+    try testing.expectEqual(@as(usize, 3), sys.closes); // the black hole too, by the defer
+}
+
+test "race (scripted): a failure in the middle of the open set does not lose the attempts after it" {
+    const ms = FakeSys.ms;
+    var sys: FakeSys = .{
+        .plans = &.{
+            .{ .pending = .{ .after_ns = 400 * ms, .verdict = .{ .status = .refused, .errno = 111 } } },
+            .{ .pending = .{ .after_ns = 350 * ms } }, // starts at 250, up at 600
+        },
+    };
+    const addrs = fakeAddrs(2);
+    const t0 = sys.clock;
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.time.ns_per_s);
+    try testing.expectEqual(Status.up, r.verdict.status);
+    try testing.expectEqual(@as(u64, 600 * ms), sys.clock - t0);
+    try testing.expectEqual(@as(u64, 350 * ms), r.connect_ns.?);
+    try testing.expectEqual(@as(usize, 2), sys.closes);
+}
+
+test "race (scripted): black holes start one delay apart, the budget ends them all, every descriptor closed" {
+    const ms = FakeSys.ms;
+    const hole: FakeSys.Plan = .{ .pending = .{ .after_ns = FakeSys.never } };
+    var sys: FakeSys = .{ .plans = &.{ hole, hole, hole, hole, hole } };
+    const addrs = fakeAddrs(5);
+    const t0 = sys.clock;
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 600 * ms);
+    try testing.expectEqual(Status.timeout, r.verdict.status);
+    try testing.expectEqual(@as(u64, 0), sys.started[0].? - t0);
+    try testing.expectEqual(@as(u64, 250 * ms), sys.started[1].? - t0);
+    try testing.expectEqual(@as(u64, 500 * ms), sys.started[2].? - t0);
+    try testing.expect(sys.started[3] == null); // the budget ran out first
+    try testing.expectEqual(@as(u64, 600 * ms), sys.clock - t0);
+    try testing.expectEqual(@as(usize, 3), sys.closes);
+}
+
+test "race (scripted): a synchronous refusal moves on at once; refused outranks a later timeout" {
+    const ms = FakeSys.ms;
+    var sys: FakeSys = .{ .plans = &.{
+        .{ .done = .{ .status = .refused, .errno = 111 } },
+        .{ .pending = .{ .after_ns = FakeSys.never } },
+    } };
+    const addrs = fakeAddrs(2);
+    const t0 = sys.clock;
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, 300 * ms);
+    try testing.expectEqual(@as(u64, 0), sys.started[1].? - t0);
+    try testing.expectEqual(Status.refused, r.verdict.status);
+    try testing.expectEqual(@as(?i32, 111), r.verdict.errno);
+}
+
+/// A listener on `ip:port` (IPv4); any failure is the caller's skip.
+fn listenAt4(ip: [4]u8, port: u16, backlog: u32) ?i32 {
+    const rc = tl.socket(tl.AF.INET, tl.SOCK.STREAM | tl.SOCK.CLOEXEC, 0);
+    if (tl.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    var sa: tl.sockaddr.in = .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.bytesToValue(u32, &ip) };
+    if (tl.errno(tl.bind(fd, @ptrCast(&sa), @sizeOf(tl.sockaddr.in))) != .SUCCESS or
+        tl.errno(tl.listen(fd, backlog)) != .SUCCESS)
+    {
+        _ = tl.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+test "race: a black-holed first address does not starve a listening second one (RFC 8305)" {
+    var bh = try BlackHole.init(); // 127.0.0.1:P neither answers nor refuses
+    defer bh.deinit();
+    // The same port on 127.0.0.2 (all of 127/8 is local) listens.
+    const live = listenAt4(.{ 127, 0, 0, 2 }, bh.port, 8) orelse return error.SkipZigTest;
+    defer _ = tl.close(live);
+    const addrs = [_]netaddr.Ip{ .{ .v4 = .{ 127, 0, 0, 1 } }, .{ .v4 = .{ 127, 0, 0, 2 } } };
+
+    const t0 = monoNs();
+    const r = PosixConnector.connectRace(&addrs, bh.port, 2 * std.time.ns_per_s, null, null);
+    const el = monoNs() -| t0;
+    // Before 2026-10-23: the first address took the whole 2 s and the answer
+    // was `.timeout`.
+    try testing.expectEqual(Status.up, r.verdict.status);
+    try testing.expect(el >= PosixConnector.attempt_delay_ns); // the second started after the delay
+    try testing.expect(el < std.time.ns_per_s);
+    // The RTT is the winning attempt's own connect, not the 250 ms it waited.
+    try testing.expect(r.connect_ns.? < PosixConnector.attempt_delay_ns);
+
+    // A refused first address lets the second start at once.
+    const closed = listenAt4(.{ 127, 0, 0, 3 }, bh.port, 1) orelse return error.SkipZigTest;
+    _ = tl.close(closed); // nothing listens on 127.0.0.3:P now: refused
+    const addrs2 = [_]netaddr.Ip{ .{ .v4 = .{ 127, 0, 0, 3 } }, .{ .v4 = .{ 127, 0, 0, 2 } } };
+    const t1 = monoNs();
+    const r2 = PosixConnector.connectRace(&addrs2, bh.port, 2 * std.time.ns_per_s, null, null);
+    try testing.expectEqual(Status.up, r2.verdict.status);
+    try testing.expect(monoNs() -| t1 < PosixConnector.attempt_delay_ns);
+
+    // Both black-holed: the budget decides, `.timeout`.
+    const addrs3 = [_]netaddr.Ip{ .{ .v4 = .{ 127, 0, 0, 1 } }, .{ .v4 = .{ 127, 0, 0, 1 } } };
+    const r3 = PosixConnector.connectRace(&addrs3, bh.port, 400 * std.time.ns_per_ms, null, null);
+    try testing.expectEqual(Status.timeout, r3.verdict.status);
+}
+
+test "race: the reported RTT is the winning connect, not the wait behind a black hole" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
+    const n = try PosixConnector.resolveAll(io, "localhost", 0, &addrs);
+    // Needs localhost = [127.0.0.1, ::1] in that order (glibc's default).
+    if (n < 2 or addrs[0] != .v4 or addrs[1] != .v6) return error.SkipZigTest;
+    var bh = try BlackHole.init();
+    defer bh.deinit();
+    const ln6 = blk: {
+        const rc = tl.socket(tl.AF.INET6, tl.SOCK.STREAM | tl.SOCK.CLOEXEC, 0);
+        if (tl.errno(rc) != .SUCCESS) return error.SkipZigTest;
+        const fd: i32 = @intCast(rc);
+        var sa: tl.sockaddr.in6 = .{ .port = std.mem.nativeToBig(u16, bh.port), .flowinfo = 0, .addr = @as([15]u8, @splat(0)) ++ [_]u8{1}, .scope_id = 0 };
+        if (tl.errno(tl.bind(fd, @ptrCast(&sa), @sizeOf(tl.sockaddr.in6))) != .SUCCESS or tl.errno(tl.listen(fd, 8)) != .SUCCESS) {
+            _ = tl.close(fd);
+            return error.SkipZigTest;
+        }
+        break :blk fd;
+    };
+    defer _ = tl.close(ln6);
+    var pc: PosixConnector = .{ .io = io, .resolve = .system };
+    const t0 = monoNs();
+    const out = pc.connector().connect(.{ .host = "localhost", .port = bh.port }, 2 * std.time.ns_per_s);
+    const el = monoNs() -| t0;
+    try testing.expectEqual(Status.up, out.status);
+    try testing.expect(el >= PosixConnector.attempt_delay_ns);
+    try testing.expect(out.rtt_ns.? < PosixConnector.attempt_delay_ns);
+}
+
+fn probeTargetTask(io: std.Io, target: Target, opts: Options, block_first: bool) Allocator.Error!TargetResult {
+    if (block_first) io.sleep(.fromSeconds(10), .awake) catch io.recancel();
+    return probeTarget(testing.allocator, target, opts);
+}
+
+test "cancel: a canceled interval sleep ends the run -- no connect after it" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "svc", .outcomes = &.{.{ .status = .up, .rtt_ns = 7 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    var sl: IoSleeper = .{ .io = io };
+    const opts: Options = .{
+        .connector = fake.connector(),
+        .count = 5,
+        .interval = .{ .ms = 10_000, .sleeper = sl.sleeper() },
+    };
+    var fut = io.concurrent(probeTargetTask, .{ io, Target{ .host = "svc", .port = 1 }, opts, false }) catch
+        return error.SkipZigTest;
+    sleepMs(100); // the first connect is done, the first sleep has begun
+    const r = try fut.cancel(io);
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1), fake.total_calls.load(.monotonic));
+    try testing.expectEqual(Status.up, r.samples[0].kind);
+    try testing.expectEqual(@as(usize, 4), r.canceledCount());
+}
+
+fn probeManyTask(targets: []const Target, opts: Options) ManyError![]TargetResult {
+    return probeMany(testing.allocator, targets, opts);
+}
+
+test "cancel: a canceled interval sleep in probeMany ends the whole batch" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "a", .outcomes = &.{.{ .status = .up, .rtt_ns = 7 }} },
+        .{ .host = "b", .outcomes = &.{.{ .status = .up, .rtt_ns = 7 }} },
+        .{ .host = "c", .outcomes = &.{.{ .status = .up, .rtt_ns = 7 }} },
+    };
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    var sl: IoSleeper = .{ .io = io };
+    const targets = [_]Target{ .{ .host = "a", .port = 1 }, .{ .host = "b", .port = 1 }, .{ .host = "c", .port = 1 } };
+    const opts: Options = .{
+        .connector = fake.connector(),
+        .count = 3,
+        .max_concurrent = 1, // one worker: the calling task, which sees the cancel
+        .interval = .{ .ms = 10_000, .sleeper = sl.sleeper() },
+    };
+    var fut = io.concurrent(probeManyTask, .{ &targets, opts }) catch return error.SkipZigTest;
+    sleepMs(100);
+    const rs = try fut.cancel(io);
+    defer freeResults(testing.allocator, rs);
+    try testing.expectEqual(@as(u32, 1), fake.total_calls.load(.monotonic));
+    try testing.expectEqual(@as(usize, 2), rs[0].canceledCount());
+    try testing.expectEqual(@as(usize, 3), rs[1].canceledCount());
+    try testing.expectEqual(@as(usize, 3), rs[2].canceledCount());
+}
+
+test "cancel: a .system lookup canceled by the caller is .canceled, not .error" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var pc: PosixConnector = .{ .io = io, .resolve = .system };
+    const opts: Options = .{ .connector = pc.connector(), .count = 2 };
+    // The task blocks in a sleep, the cancel lands there, `recancel` re-arms
+    // it: the lookup is the next cancelation point and sees it.
+    var fut = io.concurrent(probeTargetTask, .{ io, Target{ .host = "localhost", .port = 1 }, opts, true }) catch
+        return error.SkipZigTest;
+    sleepMs(50);
+    const r = try fut.cancel(io);
+    defer r.deinit(testing.allocator);
+    try testing.expectEqual(Status.canceled, r.samples[0].kind);
+    try testing.expectEqual(@as(usize, 2), r.canceledCount()); // and the run ended there
+}
+
+test "cancel: one worker's cancelation stops every worker of a probeMany batch" {
+    var scripts = [_]FakeConnector.Script{
+        .{ .host = "c", .outcomes = &.{.{ .status = .canceled }} },
+        .{ .host = "a", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+        .{ .host = "b", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+        .{ .host = "d", .outcomes = &.{.{ .status = .up, .rtt_ns = 1 }} },
+    };
+    // Slow connects, so the other workers are mid-run when "c" cancels.
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 2_000_000 };
+    const targets = [_]Target{
+        .{ .host = "c", .port = 1 }, .{ .host = "a", .port = 1 },
+        .{ .host = "b", .port = 1 }, .{ .host = "d", .port = 1 },
+    };
+    const rs = try probeMany(testing.allocator, &targets, .{ .connector = fake.connector(), .count = 200, .max_concurrent = 4 });
+    defer freeResults(testing.allocator, rs);
+    for (rs) |r| try testing.expect(r.canceledCount() > 0);
+    try testing.expect(fake.total_calls.load(.monotonic) < 4 * 200);
+}
+
 test "live: a black hole returns on the budget, and the budget is what decides" {
     var bh = try BlackHole.init();
     defer bh.deinit();
@@ -1771,17 +2266,23 @@ test "canceledCount counts only cancellations; one up repetition is reachable" {
     // least one repetition connected" -- one is enough. Mutation 2026-10-04:
     // counting timeouts as cancelled, and needing two ups, both survived.
     var scripts = [_]FakeConnector.Script{
-        .{ .host = "mix", .outcomes = &.{
-            .{ .status = .canceled },
-            .{ .status = .timeout },
-            .{ .status = .up, .rtt_ns = 5 },
-        } },
+        .{
+            .host = "mix",
+            .outcomes = &.{
+                .{ .status = .timeout },
+                .{ .status = .up, .rtt_ns = 5 },
+                .{ .status = .canceled },
+                .{ .status = .up, .rtt_ns = 5 }, // never reached: the cancel ends the run
+            },
+        },
     };
     var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
-    const r = try probeTarget(testing.allocator, .{ .host = "mix", .port = 1 }, .{ .connector = fake.connector(), .count = 3 });
+    const r = try probeTarget(testing.allocator, .{ .host = "mix", .port = 1 }, .{ .connector = fake.connector(), .count = 5 });
     defer r.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 1), r.canceledCount());
+    try testing.expectEqual(@as(usize, 3), r.canceledCount()); // the canceled one and the two after it
+    try testing.expectEqual(@as(u32, 3), fake.total_calls.load(.monotonic)); // no connect after the cancel
     try testing.expectEqual(@as(u64, 1), r.stats.received);
+    try testing.expectEqual(@as(u64, 2), r.stats.sent);
     try testing.expect(r.reachable());
 }
 
@@ -2001,7 +2502,7 @@ test "live: system resolution does resolve a name, without leaving the host" {
     // hermetic — while still exercising the real `HostName.lookup` path that
     // `.system` uses.
     var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
-    const n = PosixConnector.resolveAll(threaded.io(), "localhost", 0, &addrs);
+    const n = try PosixConnector.resolveAll(threaded.io(), "localhost", 0, &addrs);
     if (n == 0) return error.LocalhostDidNotResolve;
     for (addrs[0..n]) |ip| {
         const loopback = switch (ip) {
@@ -2028,7 +2529,7 @@ test "system resolution tries every address, not just the first" {
     const io = threaded.io();
 
     var addrs: [PosixConnector.max_addresses]netaddr.Ip = undefined;
-    const n = PosixConnector.resolveAll(io, "localhost", 0, &addrs);
+    const n = try PosixConnector.resolveAll(io, "localhost", 0, &addrs);
     if (n < 2) return error.SkipZigTest; // single-stack host: nothing to prove
 
     // A listener on the SECOND resolved address only. Before the fix this was
@@ -2435,13 +2936,41 @@ test "model: probeTarget and probeMany agree with a naive model on random outcom
         };
         defer freeResults(testing.allocator, results);
 
+        // A cancelation ends the run (`probeInto`): per target, the scripted
+        // outcomes up to the first `.canceled`, then `.canceled` to the end.
+        // `probeTarget` stops only its own target; `probeMany` stops the whole
+        // batch -- in order on one worker, at a scheduling-dependent point on
+        // several, so there only "a prefix, then canceled" is pinned, and the
+        // prefix is whole when no script cancels at all.
+        const workers = workerCount(opts.max_concurrent, n_targets);
+        var any_cancel = false;
+        for (0..n_targets) |t| {
+            for (outcomes[t][0..eff]) |o| if (o.status == .canceled) {
+                any_cancel = true;
+            };
+        }
+        var batch_stopped = false;
         for (results, 0..) |r, t| {
             try testing.expectEqualStrings(targets[t].host, r.target.host);
             try testing.expectEqual(eff, r.samples.len);
+            var first_c: usize = eff;
+            for (outcomes[t][0..eff], 0..) |o, i| if (o.status == .canceled) {
+                first_c = i;
+                break;
+            };
+            // How many samples ran to their scripted outcome.
+            const ran: usize = if (!many) first_c else if (workers == 1) (if (batch_stopped) 0 else first_c) else blk: {
+                var k: usize = 0;
+                while (k < eff and r.samples[k].kind != .canceled) k += 1;
+                try testing.expect(k <= first_c);
+                if (!any_cancel) try testing.expectEqual(eff, k);
+                break :blk k;
+            };
+            if (many and workers == 1 and first_c < eff) batch_stopped = true;
             var canceled: usize = 0;
-            for (r.samples, outcomes[t][0..eff]) |got, o| {
+            for (r.samples, outcomes[t][0..eff], 0..) |got, o, i| {
                 const app_ok = !use_app or targets[t].port % 2 == 0;
-                const want = ProbeModel.sample(o, app_ok);
+                const want = if (i < ran) ProbeModel.sample(o, app_ok) else Result{ .kind = .canceled };
                 try testing.expectEqual(want.kind, got.kind);
                 try testing.expectEqual(want.rtt_ns, got.rtt_ns);
                 try testing.expectEqual(want.errno, got.errno);
@@ -2486,7 +3015,7 @@ const SleepRec = struct {
         return .{ .ctx = self, .sleepFn = sleepImpl };
     }
 
-    fn sleepImpl(ctx: *anyopaque, ns: u64) void {
+    fn sleepImpl(ctx: *anyopaque, ns: u64) error{Canceled}!void {
         const self: *SleepRec = @ptrCast(@alignCast(ctx));
         const i = self.calls.fetchAdd(1, .monotonic);
         if (ns != self.expect_ns) _ = self.wrong_ns.fetchAdd(1, .monotonic);
@@ -2565,7 +3094,7 @@ test "IoSleeper sleeps for the requested time on the std.Io clock" {
     defer threaded.deinit();
     var s: IoSleeper = .{ .io = threaded.io() };
     const t0 = monoNs();
-    s.sleeper().sleep(20 * std.time.ns_per_ms);
+    try s.sleeper().sleep(20 * std.time.ns_per_ms);
     // A lower bound only: an upper bound on a sleep flakes under load.
     try testing.expect(monoNs() -| t0 >= 20 * std.time.ns_per_ms);
 }
