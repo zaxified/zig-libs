@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Added:** `Response.readAllAllocTimeout(gpa, max_len, timeout_ms)` — `readAllAlloc` under a deadline (`error.Timeout`), enforced like the client's other budgets (a concurrent task canceled at the deadline; unbounded without concurrency). For a caller that cannot let a peer that sent its head and stalls park the thread — `total_timeout_ms` ends with the head by design (first user: `acme`). Test against a peer that sends a head and goes silent.
+
 - **2026-10-23** — **Fix (performance):** `h1.ContentLengthReader` and `h1.ChunkedReader` (every h1 request/response body, also under `Server.BodyLimit` and `RequestBody.Capped`) refill the connection reader's buffer before serving a read smaller than it. Before, a handler reading a body in small slices (`readSliceShort(&buf)` with a 512-octet `buf`) made one `recv` of that size per call: Zig 0.17's `Reader.stream` hands a request straight to the inner vtable when nothing is buffered. h2 `StreamBody` gets the refilling `readVec` too (a lock pair per small read before). Regression tests count the source's reads (negative control: they fail without the fix). No API change.
 
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: owner decisions on the audit 2026-10-19 open questions recorded (fix accepted, not yet done).

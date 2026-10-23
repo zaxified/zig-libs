@@ -49,8 +49,8 @@
 //!
 //! What is NOT bounded, deliberately and not for want of a mechanism:
 //!   * reading a response body through `Response.reader`. The caller drives
-//!     those reads and decides how long a slow trickle is acceptable; wrap
-//!     the read in your own `runBounded`-shaped race if you need one.
+//!     those reads and decides how long a slow trickle is acceptable —
+//!     `Response.readAllAllocTimeout` reads a whole body under a deadline.
 //!   * `H2Session` (`connectH2c`/`connectH2Over`) past the dial. Its dial
 //!     gets `connect_timeout_ms` like any other, but the multiplexed session
 //!     that follows has no single "the request" to bound — `h2_client` pumps
@@ -996,6 +996,24 @@ pub const Response = struct {
             error.OutOfMemory => error.OutOfMemory,
             error.StreamTooLong => error.BodyTooLarge,
             error.ReadFailed => res.readFailure(),
+        };
+    }
+
+    /// `readAllAlloc` with a deadline: `error.Timeout` when the whole body
+    /// has not arrived `timeout_ms` from now (0 = unbounded). For a caller
+    /// that wants the body in one piece and cannot let a peer that sent its
+    /// head and then stalls (or trickles) park the thread — the gap
+    /// `total_timeout_ms` leaves by design. Enforced like the client's other
+    /// budgets (a concurrent task, canceled at the deadline); with no
+    /// concurrency to give (`Options.inline_blocking`, a full `Threaded`) it
+    /// reads unbounded. A timed-out connection is not reused.
+    pub fn readAllAllocTimeout(res: *Response, gpa: std.mem.Allocator, max_len: usize, timeout_ms: u32) Error![]u8 {
+        if (timeout_ms == 0) return res.readAllAlloc(gpa, max_len);
+        const c = res.conn.client;
+        const deadline: std.Io.Clock.Timestamp = .fromNow(c.io, .{ .raw = .fromMilliseconds(timeout_ms), .clock = .awake });
+        return runBounded(c.io, c.options.inline_blocking, deadline, readAllAlloc, .{ res, gpa, max_len }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => res.readAllAlloc(gpa, max_len),
+            else => |e| e,
         };
     }
 
@@ -4332,6 +4350,36 @@ fn awaitPeerFlag(io: std.Io, flag: *const std.atomic.Value(u32), watchdog_ms: i6
         io.sleep(.fromMilliseconds(1), .awake) catch return flag.load(.acquire) != 0;
     }
     return true;
+}
+
+test "readAllAllocTimeout: a peer that sends its head and stalls ends in Timeout" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        return testkit.loopbackSkip("readAllAllocTimeout test listen failed ({t})", .{err});
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: HeadThenSilentPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, HeadThenSilentPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.release(port);
+
+    var client = Client.init(io, testing.allocator, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    var res = try client.request(.get, url, .{});
+    defer res.deinit();
+    const t0 = testNowMs(io);
+    try testing.expectError(error.Timeout, res.readAllAllocTimeout(testing.allocator, 64, 200));
+    // Enforced, not eventual: well under the 30 s request budget.
+    try testing.expect(testNowMs(io) - t0 < 5000);
 }
 
 fn readAllAllocOnce(res: *Response, gpa: std.mem.Allocator) Error![]u8 {
