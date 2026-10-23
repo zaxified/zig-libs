@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — valyala/fasthttp 1.76.0 joins the fastest-in-the-field figure (its go-brrr
+  dependency swept first): parse rows unchanged, but `build` is 1.59× fasthttp, which writes
+  without validating. **Card: grade 2** (P2); the slice-append route is in SPEC Backlog.
+
 - **2026-10-23** — **SECURITY (client jar, MED):** a `Domain` attribute with a trailing dot passed the
   Public Suffix List check (`co.uk.`'s last label is empty), so a fully qualified host
   (`http://bank.co.uk./`) could set a cookie that every `*.co.uk.` host then received. Such a Domain
