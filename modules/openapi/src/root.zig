@@ -243,9 +243,10 @@ pub const RouteExtra = struct {
 
 pub const BuildError = error{
     OutOfMemory,
-    /// A `RouteDoc.request_schema` is not valid JSON.
+    /// A `RouteDoc.request_schema` is not a JSON Schema (JSON text whose
+    /// value is an object or a boolean).
     InvalidRequestSchema,
-    /// A `RouteDoc.Response.schema` is not valid JSON.
+    /// A `RouteDoc.Response.schema` is not a JSON Schema.
     InvalidResponseSchema,
     /// A `RouteDoc.query_schema` is not an object schema whose
     /// `properties` are the parameters (see `writeQueryParameters`).
@@ -274,7 +275,7 @@ pub const BuildError = error{
     /// self-check, below) -- would mean a bug in the generator itself,
     /// not a caller input problem; surfaced rather than served.
     SelfCheckMalformed,
-    /// A `schemas` entry is not valid JSON.
+    /// A `schemas` entry is not a JSON Schema.
     InvalidComponentSchema,
     /// The same `schemas` name with two different bodies (compared as
     /// normalized JSON text, key order significant).
@@ -282,7 +283,7 @@ pub const BuildError = error{
     /// Two security schemes with one name (`bearerAuth` counts when
     /// `bearer_auth` is on).
     DuplicateSecurityScheme,
-    /// A `RouteExtra` parameter `schema` is not valid JSON.
+    /// A `RouteExtra` parameter `schema` is not a JSON Schema.
     InvalidParameterSchema,
     /// A `RouteExtra` example is not valid JSON.
     InvalidExample,
@@ -321,7 +322,7 @@ pub const Generator = struct {
     pub fn buildRoutes(gpa: Allocator, routes: []const router.Route, info: Info) BuildError![]u8 {
         var out: Writer.Allocating = .init(gpa);
         defer out.deinit();
-        writeRoutes(gpa, routes, info, &out.writer) catch |err| switch (err) {
+        emitRoutes(gpa, routes, info, &out.writer) catch |err| switch (err) {
             // The allocating writer fails only on allocation failure.
             error.WriteFailed => return error.OutOfMemory,
             else => |e| return e,
@@ -330,19 +331,32 @@ pub const Generator = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch
             return error.SelfCheckMalformed;
         defer parsed.deinit();
-        try validateOpenApi31(parsed.value);
+        try validateOpenApi31(gpa, parsed.value);
         return out.toOwnedSlice();
     }
 
-    /// Stream the document into any writer. `gpa` is scratch (path
-    /// conversion + request-schema validation) — everything is freed
-    /// before returning.
+    /// The document written into any writer -- `build`'s, self-check
+    /// included, so `w` receives either the whole validated document or
+    /// nothing (an error before the first byte). It is built in memory
+    /// first: streaming it straight into `w` handed a caller half a
+    /// document on any error found mid-walk (`PathCollision`, a bad
+    /// schema) and skipped the self-check (review 2026-10-23). `gpa` holds
+    /// the document and scratch until this returns.
     pub fn write(gpa: Allocator, r: *const router.Router, info: Info, w: *Writer) (BuildError || Writer.Error)!void {
         return writeRoutes(gpa, r.routes(), info, w);
     }
 
     /// `write` over a plain route slice; see `buildRoutes`.
     pub fn writeRoutes(gpa: Allocator, routes: []const router.Route, info: Info, w: *Writer) (BuildError || Writer.Error)!void {
+        const json = try buildRoutes(gpa, routes, info);
+        defer gpa.free(json);
+        try w.writeAll(json);
+    }
+
+    /// The document streamed into `w`, unchecked: an error found mid-walk
+    /// leaves `w` holding a prefix. Only `buildRoutes` calls it, into a
+    /// buffer it discards on error.
+    fn emitRoutes(gpa: Allocator, routes: []const router.Route, info: Info, w: *Writer) (BuildError || Writer.Error)!void {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -411,6 +425,7 @@ pub const Generator = struct {
             }
             try route_groups.items[gop.value_ptr.*].append(arena, i);
         }
+        const op_ids = try operationIds(arena, rs, converted, route_groups.items);
 
         var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
         try jw.beginObject();
@@ -481,7 +496,7 @@ pub const Generator = struct {
                     }
                 }
                 if (match) |i| {
-                    try writeOperation(&jw, arena, rs[i], path, extra_of[i]);
+                    try writeOperation(&jw, arena, rs[i], op_ids[i], extra_of[i]);
                 }
             }
             try jw.endObject();
@@ -528,7 +543,7 @@ fn registerSchemas(arena: Allocator, schemas: []const NamedSchema) BuildError![]
     var out: std.ArrayList(Registered) = .empty;
     var texts: std.ArrayList([]const u8) = .empty;
     for (schemas) |s| {
-        const value = (try parseText(arena, s.schema)) orelse return error.InvalidComponentSchema;
+        const value = (try parseSchema(arena, s.schema)) orelse return error.InvalidComponentSchema;
         const norm = try std.json.Stringify.valueAlloc(arena, value, .{});
         const prior: ?[]const u8 = for (out.items, texts.items) |q, t| {
             if (std.mem.eql(u8, q.name, s.name)) break t;
@@ -541,6 +556,20 @@ fn registerSchemas(arena: Allocator, schemas: []const NamedSchema) BuildError![]
         try texts.append(arena, norm);
     }
     return out.items;
+}
+
+/// `text` as a JSON Schema, null when it is not one: JSON whose value is an
+/// object or a boolean (JSON Schema 2020-12 §4.3.1, the OAS 3.1 dialect). Any
+/// other JSON value (`null`, `5`, `[]`) went out as the `schema` before, a
+/// document openapi-spec-validator refuses ("is not of type 'object',
+/// 'boolean'", review 2026-10-23).
+fn parseSchema(arena: Allocator, text: []const u8) Allocator.Error!?std.json.Value {
+    const v = (try parseText(arena, text)) orelse return null;
+    return if (isSchema(v)) v else null;
+}
+
+fn isSchema(v: std.json.Value) bool {
+    return v == .object or v == .bool;
 }
 
 /// `text` as a JSON value, null when it is not JSON.
@@ -810,7 +839,7 @@ fn writeOperation(
     jw: *std.json.Stringify,
     arena: Allocator,
     rt: router.Route,
-    converted_path: []const u8,
+    operation_id: []const u8,
     extra: ?*const RouteExtra,
 ) (BuildError || Writer.Error)!void {
     try jw.objectField(@tagName(rt.method)); // OpenAPI method keys are lowercase
@@ -829,14 +858,15 @@ fn writeOperation(
             try jw.write(s);
         }
     }
-    try writeOperationId(jw, arena, rt.method, converted_path);
+    try jw.objectField("operationId");
+    try jw.write(operation_id);
     try writeParameters(jw, arena, rt, extra);
     {
         const schema_text: ?[]const u8 = if (rt.doc) |d| d.request_schema else null;
         const example_text: ?[]const u8 = if (extra) |x| x.request_example else null;
         if (schema_text != null or example_text != null) {
             const schema: ?std.json.Value = if (schema_text) |t|
-                (try parseText(arena, t)) orelse return error.InvalidRequestSchema
+                (try parseSchema(arena, t)) orelse return error.InvalidRequestSchema
             else
                 null;
             const example: ?std.json.Value = if (example_text) |t|
@@ -869,17 +899,15 @@ fn writeOperation(
         // with the documented contract (P2), not a new error: the
         // pre-fix output was not valid JSON at all, so there is no
         // well-formed behavior being taken away.
-        var seen_buf: [32]u16 = undefined;
-        var seen_count: usize = 0;
-        for (rt.doc.?.responses) |resp| {
-            const dup = for (seen_buf[0..seen_count]) |s| {
-                if (s == resp.status) break true;
+        // Earlier entries scanned directly: a capped "seen" buffer (32 used
+        // to be the cap) let a repeat past it out as a duplicate key
+        // (review 2026-10-23); the list is the caller's, short.
+        const responses = rt.doc.?.responses;
+        for (responses, 0..) |resp, ri| {
+            const dup = for (responses[0..ri]) |prev| {
+                if (prev.status == resp.status) break true;
             } else false;
             if (dup) continue;
-            if (seen_count < seen_buf.len) {
-                seen_buf[seen_count] = resp.status;
-                seen_count += 1;
-            }
             var code_buf: [5]u8 = undefined;
             const code = std.mem.print(&code_buf, "{d}", .{resp.status}) catch unreachable;
             try jw.objectField(code);
@@ -889,7 +917,7 @@ fn writeOperation(
             const example_text = responseExample(extra, resp.status);
             if (resp.schema != null or example_text != null) {
                 const schema: ?std.json.Value = if (resp.schema) |t|
-                    (try parseText(arena, t)) orelse return error.InvalidResponseSchema
+                    (try parseSchema(arena, t)) orelse return error.InvalidResponseSchema
                 else
                     null;
                 const example: ?std.json.Value = if (example_text) |t|
@@ -962,19 +990,16 @@ fn checkResponseExamples(rt: router.Route, x: *const RouteExtra) BuildError!void
 /// method + `_` + the converted path's segments joined by `_`, with a
 /// templated segment's `{`/`}` stripped (keeping the capture's own name).
 /// `/users/{id}` + GET -> `get_users_id`; root `/` + GET -> `get` (no
-/// segments to append). Unique across one document BY CONSTRUCTION: this
-/// is textually `(method, converted_path)`, and F5's `error.PathCollision`
-/// already guarantees that pair cannot repeat. `operationId` is optional
+/// segments to append). This base is NOT injective (review 2026-10-23):
+/// `/a/b` and `/a_b`, `/users` and `/users/`, `/u/:id` and `/u/id` all
+/// share one, and openapi-spec-validator refuses the document
+/// (`DuplicateOperationIDError`) -- see `operationIds` for the
+/// disambiguation. `operationId` is optional
 /// in OpenAPI 3.1, but omitting it (the pre-fix behavior, justified only
 /// as "no stable naming source in a fn-pointer table") gave up a real one
 /// most generators rely on: without it, SDK generators invent method
 /// names themselves, and those names are not stable across regenerations.
-fn writeOperationId(
-    jw: *std.json.Stringify,
-    arena: Allocator,
-    method: http.Method,
-    converted_path: []const u8,
-) (BuildError || Writer.Error)!void {
+fn operationIdBase(arena: Allocator, method: http.Method, converted_path: []const u8) Allocator.Error![]const u8 {
     var id: std.ArrayList(u8) = .empty;
     try id.appendSlice(arena, @tagName(method));
     var it = std.mem.splitScalar(u8, converted_path, '/');
@@ -984,8 +1009,49 @@ fn writeOperationId(
         // Template braces dropped: `{id}` → `id`, `{name}.{ext}` → `name.ext`.
         for (seg) |c| if (c != '{' and c != '}') try id.append(arena, c);
     }
-    try jw.objectField("operationId");
-    try jw.write(id.items);
+    return id.items;
+}
+
+/// The `operationId` of each route, index-aligned with `rs`: its
+/// `operationIdBase`, unless an operation earlier in the document (paths in
+/// first-registration order, methods in `http.Method` order) already holds
+/// that id -- then the base plus the smallest `_<n>` (n >= 2) that is neither
+/// another route's base nor already picked. Unique across the document (OAS
+/// 3.1 §4.8.10), and a route whose base collides with nothing keeps it, so
+/// the ids of existing documents do not move.
+fn operationIds(
+    arena: Allocator,
+    rs: []const router.Route,
+    converted: []const []const u8,
+    groups: []const std.ArrayList(usize),
+) Allocator.Error![]const []const u8 {
+    const ids = try arena.alloc([]const u8, rs.len);
+    var bases: std.StringHashMapUnmanaged(void) = .empty;
+    for (ids, rs, converted) |*slot, rt, p| {
+        slot.* = try operationIdBase(arena, rt.method, p);
+        try bases.put(arena, slot.*, {});
+    }
+    var taken: std.StringHashMapUnmanaged(void) = .empty;
+    for (groups) |group| {
+        inline for (@typeInfo(http.Method).@"enum".field_values) |fv| {
+            const method: http.Method = @fromBackingInt(@intCast(fv));
+            for (group.items) |i| {
+                if (rs[i].method != method) continue;
+                if (taken.contains(ids[i])) {
+                    var n: usize = 2;
+                    while (true) : (n += 1) {
+                        const c = try arena.print("{s}_{d}", .{ ids[i], n });
+                        if (!bases.contains(c) and !taken.contains(c)) {
+                            ids[i] = c;
+                            break;
+                        }
+                    }
+                }
+                try taken.put(arena, ids[i], {});
+            }
+        }
+    }
+    return ids;
 }
 
 /// `parameters` for every `:param`/`*wild` in the pattern — path params
@@ -996,22 +1062,20 @@ fn writeOperationId(
 /// explicitly forbids ("The list MUST NOT include duplicated
 /// parameters."). `router` itself now refuses to register such a pattern
 /// (audit finding router-F8, closing this module's own Š2 seam), so no
-/// live caller can reach this anymore — the capped array of seen names
-/// below (path segments are bounded in practice; router patterns are
-/// short) stays as defense in depth, deduping without allocating.
+/// `Router` caller can reach this anymore (a `buildRoutes` slice still can)
+/// — the re-walk of the earlier captures below stays as defense in depth,
+/// deduping without allocating.
 fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool) Writer.Error!void {
     var it: router.PatternCaptures = .init(pattern);
-    var seen_buf: [64][]const u8 = undefined;
-    var seen_count: usize = 0;
-    while (it.next()) |name| {
-        const dup = for (seen_buf[0..seen_count]) |s| {
-            if (std.mem.eql(u8, s, name)) break true;
+    var index: usize = 0;
+    while (it.next()) |name| : (index += 1) {
+        // The captures before this one, re-walked (no capped buffer: a
+        // repeat past its cap went out twice, review 2026-10-23).
+        var prev: router.PatternCaptures = .init(pattern);
+        const dup = for (0..index) |_| {
+            if (std.mem.eql(u8, prev.next().?, name)) break true;
         } else false;
         if (dup) continue;
-        if (seen_count < seen_buf.len) {
-            seen_buf[seen_count] = name;
-            seen_count += 1;
-        }
         try openParameters(jw, any);
         try jw.beginObject();
         try jw.objectField("name");
@@ -1053,7 +1117,7 @@ fn writeExtraParameters(
     any: *bool,
 ) (BuildError || Writer.Error)!void {
     for (params) |p| {
-        const schema = (try parseText(arena, p.schema)) orelse return error.InvalidParameterSchema;
+        const schema = (try parseSchema(arena, p.schema)) orelse return error.InvalidParameterSchema;
         try openParameters(jw, any);
         try jw.beginObject();
         try jw.objectField("name");
@@ -1097,15 +1161,27 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
         else => return error.InvalidQuerySchema,
     };
     if (schema != .object) return error.InvalidQuerySchema;
-    const parts: []const std.json.Value = if (schema.object.get("allOf")) |all| switch (all) {
-        .array => |a| a.items,
+    // The schema's own `properties`/`required` count beside its `allOf`
+    // parts. They used to be dropped once `allOf` was present (review
+    // 2026-10-23) -- and `validate.writeJsonSchemaFor` puts its cross-field
+    // rules exactly there (`{"properties":…,"allOf":[{"anyOf":[…]}]}`), so
+    // every parameter of such a type vanished from the document.
+    var parts: std.ArrayList(std.json.Value) = .empty;
+    try parts.append(arena, schema);
+    if (schema.object.get("allOf")) |all| switch (all) {
+        .array => |a| try parts.appendSlice(arena, a.items),
         else => return error.InvalidQuerySchema,
-    } else (&schema)[0..1];
+    };
 
     const Param = struct { name: []const u8, schemas: std.ArrayList(std.json.Value) = .empty, required: bool = false };
     var params: std.ArrayList(Param) = .empty;
-    for (parts) |part| {
+    for (parts.items) |part| {
         if (part != .object) return error.InvalidQuerySchema;
+        // A `$ref` hides the properties it names (not followed here): refused
+        // rather than read as "no parameters". `anyOf`/`oneOf`/`not`/`if`
+        // parts are conditional constraints -- they add no parameter and
+        // require none unconditionally, so they are skipped.
+        if (part.object.get("$ref") != null) return error.InvalidQuerySchema;
         const props = if (part.object.get("properties")) |pv| switch (pv) {
             .object => |o| o,
             else => return error.InvalidQuerySchema,
@@ -1113,12 +1189,13 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
         if (props) |o| {
             var it = o.iterator();
             while (it.next()) |e| {
+                if (!isSchema(e.value_ptr.*)) return error.InvalidQuerySchema;
                 const slot = try paramSlot(Param, arena, &params, e.key_ptr.*);
                 try slot.schemas.append(arena, e.value_ptr.*);
             }
         }
     }
-    for (parts) |part| {
+    for (parts.items) |part| {
         const required = part.object.get("required") orelse continue;
         if (required != .array) return error.InvalidQuerySchema;
         for (required.array.items) |r| {
@@ -1243,8 +1320,13 @@ pub const Endpoint = struct {
         // work; see F2 in the audit for the wall-time cost of that.
         const result: CachedResult = if (Generator.build(e.gpa, e.router, e.info)) |doc|
             .{ .ok = .{ .json = doc, .etag = etagOf(doc) } }
-        else |err|
-            .{ .err = err };
+        else |err| switch (err) {
+            // A transient condition, not a property of the route table:
+            // caching it would answer every later request with it until a
+            // restart (review 2026-10-23). The next request builds again.
+            error.OutOfMemory => return error.OutOfMemory,
+            else => .{ .err = err },
+        };
 
         lockSpin(&e.lock);
         defer e.lock.unlock();
@@ -1335,7 +1417,7 @@ fn serveIntercepted(e: *Endpoint, ctx: *router.Ctx, what: enum { spec, docs }) a
                 ctx.res.setStatus(200);
                 try ctx.res.setHeader("Content-Type", "text/html; charset=utf-8");
                 try ctx.res.writeAll(docs_html_head);
-                try ctx.res.writeAll(e.path);
+                try writeScriptString(ctx.res, e.path);
                 try ctx.res.writeAll(docs_html_tail);
             },
         },
@@ -1348,9 +1430,12 @@ fn serveIntercepted(e: *Endpoint, ctx: *router.Ctx, what: enum { spec, docs }) a
     }
 }
 
-// The minimal self-contained docs page: zero external assets (strict-CSP
-// friendly), vanilla JS fetches the spec from the Endpoint's `path`
-// (spliced between the two halves) and lists every operation.
+// The minimal self-contained docs page: zero external assets, vanilla JS
+// fetches the spec from the Endpoint's `path` (spliced between the two
+// halves as a JS string literal) and lists every operation. The script and
+// style are inline, so a strict `Content-Security-Policy` (no
+// `'unsafe-inline'`) blocks them -- serve the page under a policy that
+// allows them, or not at all.
 const docs_html_head =
     \\<!doctype html>
     \\<meta charset="utf-8">
@@ -1366,10 +1451,10 @@ const docs_html_head =
     \\</style>
     \\<h1 id="t"></h1><p id="v"></p><p id="d"></p><div id="ops"></div>
     \\<script>
-    \\fetch("
+    \\fetch(
 ;
 const docs_html_tail =
-    \\").then(function(r){return r.json()}).then(function(s){
+    \\).then(function(r){return r.json()}).then(function(s){
     \\document.getElementById("t").textContent=s.info.title;
     \\document.getElementById("v").textContent="version "+s.info.version+" — OpenAPI "+s.openapi;
     \\document.getElementById("d").textContent=s.info.description||"";
@@ -1389,6 +1474,28 @@ const docs_html_tail =
     \\});
     \\</script>
 ;
+
+/// `s` as a double-quoted JS string literal safe inside an HTML `<script>`:
+/// `"`, `\\` and control bytes escaped, `<` as `\\u003c` so no `</script>`
+/// can close the element. The path is the developer's, but it went out raw
+/// before (review 2026-10-23): a `"` in it broke the page.
+fn writeScriptString(res: anytype, s: []const u8) !void {
+    try res.writeAll("\"");
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        if (c >= 0x20 and c != '"' and c != '\\' and c != '<') continue;
+        try res.writeAll(s[start..i]);
+        var esc: [6]u8 = undefined;
+        try res.writeAll(switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            else => std.mem.print(&esc, "\\u{x:0>4}", .{c}) catch unreachable,
+        });
+        start = i + 1;
+    }
+    try res.writeAll(s[start..]);
+    try res.writeAll("\"");
+}
 
 // ── conformance: a real OpenAPI 3.1 structural validator ────────────────────
 //
@@ -1466,9 +1573,16 @@ pub const ConformanceError = error{
     /// A `components.schemas` / `securitySchemes` key outside
     /// `[A-Za-z0-9._-]+` (OAS 3.1 §4.8.7).
     InvalidComponentName,
+    /// Two operations with one `operationId` (OAS 3.1 §4.8.10: unique among
+    /// all operations); openapi-spec-validator refuses it
+    /// (`DuplicateOperationIDError`).
+    DuplicateOperationId,
+    OutOfMemory,
 };
 
-pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
+/// `gpa` is scratch for the `operationId` uniqueness check, freed before
+/// returning.
+pub fn validateOpenApi31(gpa: Allocator, doc: std.json.Value) ConformanceError!void {
     if (doc != .object) return error.NotAnObject;
     const root = doc.object;
 
@@ -1497,6 +1611,8 @@ pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
     try validateServers(root.get("servers"));
     const schemes = try validateComponents(root.get("components"));
     try validateSecurityList(root.get("security"), schemes);
+    var op_ids: std.StringHashMapUnmanaged(void) = .empty;
+    defer op_ids.deinit(gpa);
     inline for (.{ "paths", "webhooks" }) |key| {
         if (root.get(key)) |items| {
             var it = items.object.iterator();
@@ -1504,6 +1620,9 @@ pub fn validateOpenApi31(doc: std.json.Value) ConformanceError!void {
                 for (http_method_keys) |m| {
                     const op = entry.value_ptr.*.object.get(m) orelse continue;
                     try validateSecurityList(op.object.get("security"), schemes);
+                    const id = paramField(op, "operationId") orelse continue;
+                    const gop = try op_ids.getOrPut(gpa, id);
+                    if (gop.found_existing) return error.DuplicateOperationId;
                 }
             }
         }
@@ -1608,10 +1727,15 @@ fn validateSecurityList(list: ?std.json.Value, schemes: ?std.json.ObjectMap) Con
 
 /// Every `$ref` string beginning with `#` must resolve inside `root`. Applies
 /// to the whole document, so a literal `{"$ref":"#/..."}` object inside
-/// example data counts as a reference too.
+/// example data counts as a reference too. A subtree with its own string
+/// `$id` is a schema resource with its own base URI (JSON Schema 2020-12
+/// §8.2.1): a `#/...` inside it points into that resource, not the document,
+/// so it is not followed (openapi-spec-validator accepts
+/// `{"$id":…,"$defs":{"a":…},"$ref":"#/$defs/a"}`, review 2026-10-23).
 fn validateRefs(root: std.json.Value, v: std.json.Value) ConformanceError!void {
     switch (v) {
         .object => |o| {
+            if (o.get("$id")) |id| if (id == .string) return;
             if (o.get("$ref")) |r| {
                 if (r == .string and !refResolves(root, r.string)) return error.DanglingRef;
             }
@@ -1647,8 +1771,10 @@ fn refResolves(root: std.json.Value, ref: []const u8) bool {
     return true;
 }
 
-/// A JSON Pointer reference token against an object key (RFC 6901 §4: `~1` is
-/// `/`, `~0` is `~`).
+/// A JSON Pointer reference token from a URI fragment against an object key:
+/// `%XX` percent-decoded first (RFC 6901 §6: the fragment is URI-encoded, so
+/// `{`/`}` of a path key arrive as `%7B`/`%7D`), then `~1` is `/` and `~0` is
+/// `~` (§4).
 fn pointerTokenEql(token: []const u8, key: []const u8) bool {
     var i: usize = 0;
     var j: usize = 0;
@@ -1656,6 +1782,13 @@ fn pointerTokenEql(token: []const u8, key: []const u8) bool {
         if (j >= key.len) return false;
         var c = token[i];
         i += 1;
+        if (c == '%' and i + 2 <= token.len) {
+            if (std.fmt.parseInt(u8, token[i .. i + 2], 16)) |b| {
+                if (key[j] != b) return false;
+                i += 2;
+                continue;
+            } else |_| {}
+        }
         if (c == '~' and i < token.len) {
             switch (token[i]) {
                 '0' => c = '~',
@@ -1891,7 +2024,7 @@ const oai_webhook_example =
 test "conformance: the checker accepts the OpenAPI Initiative's own published v3.1 example" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, oai_webhook_example, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 test "conformance: the checker rejects documents missing required structure (sanity: it is not vacuous)" {
@@ -1899,17 +2032,17 @@ test "conformance: the checker rejects documents missing required structure (san
     {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}}", .{});
         defer parsed.deinit();
-        try testing.expectError(error.MissingTopLevelContent, validateOpenApi31(parsed.value));
+        try testing.expectError(error.MissingTopLevelContent, validateOpenApi31(testing.allocator, parsed.value));
     }
     {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"/x\":{\"get\":{}}}}", .{});
         defer parsed.deinit();
-        try testing.expectError(error.MissingResponses, validateOpenApi31(parsed.value));
+        try testing.expectError(error.MissingResponses, validateOpenApi31(testing.allocator, parsed.value));
     }
     {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"openapi\":\"2.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{}}", .{});
         defer parsed.deinit();
-        try testing.expectError(error.UnsupportedOpenApiVersion, validateOpenApi31(parsed.value));
+        try testing.expectError(error.UnsupportedOpenApiVersion, validateOpenApi31(testing.allocator, parsed.value));
     }
 }
 
@@ -1982,7 +2115,7 @@ test "generate: golden OpenAPI 3.1 document for a known route set" {
     // well-formedness, prove nothing about real OpenAPI 3.1 validity (see the
     // conformance-checker section above) — also run the real structural
     // checker against it.
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 test "generate: buildRoutes over a plain slice equals build over the Router with the same routes" {
@@ -2020,7 +2153,7 @@ test "generate: empty router → valid empty-paths document, no panic" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     try testing.expectEqual(@as(usize, 0), parsed.value.object.get("paths").?.object.count());
-    try validateOpenApi31(parsed.value); // an empty `paths` object still satisfies §4.8.1
+    try validateOpenApi31(testing.allocator, parsed.value); // an empty `paths` object still satisfies §4.8.1
 }
 
 test "generate: method grouping is deterministic (enum order, not registration order)" {
@@ -2052,7 +2185,7 @@ test "generate: TRACE is an operation; CONNECT and extension-method routes are l
         "}}}", json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 /// What `validate.writeJsonSchemaFor(T)` writes for a query struct
@@ -2086,7 +2219,7 @@ test "generate: query_schema becomes in:query parameters after the path's, requi
         "}}", json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 // External anchor, frozen 2026-09-28: the document this test expects is `OK`
@@ -2116,7 +2249,7 @@ test "generate: an allOf query_schema (derived + declared rules) merges paramete
         "}}", json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 test "generate: a query_schema that does not name parameters is error.InvalidQuerySchema" {
@@ -2157,7 +2290,7 @@ test "generate: router's `{name}` captures, whole and inside a segment, become p
     defer testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
     const paths = parsed.value.object.get("paths").?.object;
     const files = paths.get("/files/{name}.{ext}").?.object.get("get").?.object;
     try testing.expectEqualStrings("get_files_name.ext", files.get("operationId").?.string);
@@ -2329,7 +2462,7 @@ test "generate: Generator.build now runs its own validateOpenApi31 on its own ou
     defer testing.allocator.free(json);
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
 }
 
 // ── external anchor: independently validated by `openapi_spec_validator` ───
@@ -2477,7 +2610,7 @@ test "external anchor: a document our checker rejects, a real validator rejects 
     // 'description' is a required property (validating
     // .paths./broken.get.responses.200 against the OAS 3.1 Response Object
     // schema) — the same structural defect, independently confirmed.
-    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(parsed.value));
+    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(testing.allocator, parsed.value));
 }
 
 // ── tests: endpoint over the socket-free server codec ───────────────────────
@@ -2858,7 +2991,7 @@ test "generate: two responses sharing a status code dedupe (first wins) instead 
     // conformance checker.
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
+    try validateOpenApi31(testing.allocator, parsed.value);
     const responses = parsed.value.object.get("paths").?.object.get("/dup").?.object
         .get("get").?.object.get("responses").?.object;
     try testing.expectEqual(@as(usize, 1), responses.count());
@@ -2935,7 +3068,7 @@ test "conformance: the checker rejects an empty responses object (F16/M14)" {
         .{},
     );
     defer parsed.deinit();
-    try testing.expectError(error.EmptyResponses, validateOpenApi31(parsed.value));
+    try testing.expectError(error.EmptyResponses, validateOpenApi31(testing.allocator, parsed.value));
 }
 
 test "conformance: the checker rejects a paths key that does not start with '/' (F16/M15)" {
@@ -2946,7 +3079,7 @@ test "conformance: the checker rejects a paths key that does not start with '/' 
         .{},
     );
     defer parsed.deinit();
-    try testing.expectError(error.InvalidPathKey, validateOpenApi31(parsed.value));
+    try testing.expectError(error.InvalidPathKey, validateOpenApi31(testing.allocator, parsed.value));
 }
 
 test "conformance: a response description must be a string; non-operation path-item members are legal" {
@@ -2961,7 +3094,7 @@ test "conformance: a response description must be a string; non-operation path-i
         .{},
     );
     defer bad_desc.deinit();
-    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(bad_desc.value));
+    try testing.expectError(error.MissingResponseDescription, validateOpenApi31(testing.allocator, bad_desc.value));
     const members = try std.json.parseFromSlice(
         std.json.Value,
         testing.allocator,
@@ -2969,7 +3102,7 @@ test "conformance: a response description must be a string; non-operation path-i
         .{},
     );
     defer members.deinit();
-    try validateOpenApi31(members.value);
+    try validateOpenApi31(testing.allocator, members.value);
 }
 
 test "endpoint: self-contained docs page (no external assets)" {
@@ -3080,4 +3213,275 @@ test {
     _ = @import("spec_oracle_test.zig");
     _ = @import("parity_test.zig");
     _ = @import("fuzz_test.zig");
+}
+
+// ── review 2026-10-23 (A1 re-audit) ─────────────────────────────────────────
+
+/// `paths[path][method].operationId` of a built document.
+fn opIdOf(paths: std.json.ObjectMap, path: []const u8, method: []const u8) []const u8 {
+    return paths.get(path).?.object.get(method).?.object.get("operationId").?.string;
+}
+
+test "generate: routes whose operationId bases collide get unique ids, the first keeps its base" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/a/b", hOk);
+    try r.get("/a_b", hOk); // base get_a_b; get_a_b_2 is /a/b/2's own base
+    try r.get("/a/b/2", hOk);
+    try r.get("/users", hOk);
+    try r.get("/users/", hOk);
+    try r.get("/u/:id", hOk);
+    try r.get("/u/id", hOk);
+    try r.post("/u/id", hOk); // another method: its own base, no suffix
+
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const paths = parsed.value.object.get("paths").?.object;
+    try testing.expectEqualStrings("get_a_b", opIdOf(paths, "/a/b", "get"));
+    try testing.expectEqualStrings("get_a_b_3", opIdOf(paths, "/a_b", "get"));
+    try testing.expectEqualStrings("get_a_b_2", opIdOf(paths, "/a/b/2", "get"));
+    try testing.expectEqualStrings("get_users", opIdOf(paths, "/users", "get"));
+    try testing.expectEqualStrings("get_users_2", opIdOf(paths, "/users/", "get"));
+    try testing.expectEqualStrings("get_u_id", opIdOf(paths, "/u/{id}", "get"));
+    try testing.expectEqualStrings("get_u_id_2", opIdOf(paths, "/u/id", "get"));
+    try testing.expectEqualStrings("post_u_id", opIdOf(paths, "/u/id", "post"));
+}
+
+test "conformance: two operations sharing an operationId are refused (openapi-spec-validator: DuplicateOperationIDError)" {
+    const doc =
+        \\{"openapi":"3.1.0","info":{"title":"T","version":"1"},"paths":{
+        \\"/users":{"get":{"operationId":"get_users","responses":{"200":{"description":"ok"}}}},
+        \\"/users/":{"get":{"operationId":"get_users","responses":{"200":{"description":"ok"}}}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doc, .{});
+    defer parsed.deinit();
+    try testing.expectError(error.DuplicateOperationId, validateOpenApi31(testing.allocator, parsed.value));
+    // The same id on a webhook counts too (uniqueness is over ALL operations).
+    const hook =
+        \\{"openapi":"3.1.0","info":{"title":"T","version":"1"},
+        \\"paths":{"/a":{"get":{"operationId":"x","responses":{"200":{"description":"ok"}}}}},
+        \\"webhooks":{"w":{"post":{"operationId":"x","responses":{"200":{"description":"ok"}}}}}}
+    ;
+    const p2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, hook, .{});
+    defer p2.deinit();
+    try testing.expectError(error.DuplicateOperationId, validateOpenApi31(testing.allocator, p2.value));
+}
+
+test "endpoint: an OutOfMemory build is not cached -- the next request builds again" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/hello", hHello);
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var e: Endpoint = .{ .gpa = failing.allocator(), .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+    try testing.expectError(error.OutOfMemory, e.spec());
+    try testing.expect(e.cached == null);
+    e.gpa = testing.allocator;
+    const doc = try e.spec();
+    try testing.expect(std.mem.find(u8, doc.json, "\"/hello\"") != null);
+}
+
+test "generate: a schema that is JSON but not a JSON Schema (not an object or boolean) is refused" {
+    // openapi-spec-validator 0.7.1 (2026-10-23): `5`, `null`, `[]` as a schema
+    // -> "is not of type 'object', 'boolean'"; `true` accepted.
+    const info: Info = .{ .title = "T", .version = "1" };
+    inline for (.{ "5", "null", "[]", "\"x\"" }) |bad| {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.addDoc(.post, "/a", hOk, .{ .request_schema = bad });
+        try testing.expectError(error.InvalidRequestSchema, Generator.build(testing.allocator, &r, info));
+
+        var r2 = router.Router.init(testing.allocator);
+        defer r2.deinit();
+        try r2.addDoc(.get, "/a", hOk, .{ .responses = &.{.{ .status = 200, .description = "ok", .schema = bad }} });
+        try testing.expectError(error.InvalidResponseSchema, Generator.build(testing.allocator, &r2, info));
+
+        var r3 = router.Router.init(testing.allocator);
+        defer r3.deinit();
+        try r3.get("/a", hOk);
+        try testing.expectError(error.InvalidComponentSchema, Generator.build(testing.allocator, &r3, .{
+            .title = "T",
+            .version = "1",
+            .schemas = &.{.{ .name = "M", .schema = bad }},
+        }));
+        try testing.expectError(error.InvalidParameterSchema, Generator.build(testing.allocator, &r3, .{
+            .title = "T",
+            .version = "1",
+            .route_extras = &.{.{ .method = .get, .pattern = "/a", .header_parameters = &.{.{ .name = "X-A", .schema = bad }} }},
+        }));
+
+        var r4 = router.Router.init(testing.allocator);
+        defer r4.deinit();
+        try r4.addDoc(.get, "/a", hOk, .{ .query_schema = "{\"properties\":{\"q\":" ++ bad ++ "}}" });
+        try testing.expectError(error.InvalidQuerySchema, Generator.build(testing.allocator, &r4, info));
+    }
+    // A boolean schema is a schema.
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.post, "/a", hOk, .{ .request_schema = "true", .query_schema = "{\"properties\":{\"q\":true}}" });
+    const json = try Generator.build(testing.allocator, &r, info);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.find(u8, json, "\"schema\":true") != null);
+}
+
+test "generate: query_schema properties beside allOf count (validate's cross-field shape), a $ref is refused" {
+    // `validate.writeJsonSchemaFor` of a type with a cross-field rule: the
+    // parameters at the top, the rule in `allOf`.
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/s", hOk, .{
+        .query_schema =
+        \\{"type":"object","properties":{"email":{"type":"string"},"phone":{"type":"string"}},"required":["email"],
+        \\"allOf":[{"anyOf":[{"required":["email"]},{"required":["phone"]}]},{"properties":{"page":{"type":"integer"}}}]}
+        ,
+    });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.find(u8, json,
+        \\"parameters":[{"name":"email","in":"query","required":true,"schema":{"type":"string"}},{"name":"phone","in":"query","required":false,"schema":{"type":"string"}},{"name":"page","in":"query","required":false,"schema":{"type":"integer"}}]
+    ) != null);
+
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.addDoc(.get, "/s", hOk, .{ .query_schema = schemaRef("Q") });
+    try testing.expectError(error.InvalidQuerySchema, Generator.build(testing.allocator, &r2, .{
+        .title = "T",
+        .version = "1",
+        .schemas = &.{.{ .name = "Q", .schema = "{\"properties\":{\"a\":{}}}" }},
+    }));
+}
+
+test "generate: write hands the writer nothing on an error found mid-document" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/ok", hOk);
+    try r.get("/f/:p", hOk);
+    try r.get("/f/*p", hOk);
+    var buf: [4096]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    try testing.expectError(error.PathCollision, Generator.write(testing.allocator, &r, .{ .title = "T", .version = "1" }, &w));
+    try testing.expectEqual(@as(usize, 0), w.buffered().len);
+}
+
+test "conformance: a $ref inside a schema with its own $id is not resolved against the document; %XX in a pointer is decoded" {
+    // openapi-spec-validator 0.7.1 accepts this request schema (2026-10-23).
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.post, "/a", hOk, .{
+        .request_schema =
+        \\{"$id":"https://example.com/s","$defs":{"a":{"type":"string"}},"$ref":"#/$defs/a"}
+        ,
+    });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    testing.allocator.free(json);
+    // Without its own $id the same pointer is resolved against the document.
+    var r2 = router.Router.init(testing.allocator);
+    defer r2.deinit();
+    try r2.addDoc(.post, "/a", hOk, .{ .request_schema = "{\"$defs\":{\"a\":{}},\"$ref\":\"#/$defs/a\"}" });
+    try testing.expectError(error.DanglingRef, Generator.build(testing.allocator, &r2, .{ .title = "T", .version = "1" }));
+
+    const doc =
+        \\{"openapi":"3.1.0","info":{"title":"T","version":"1"},
+        \\"paths":{"/u/{id}":{"get":{"parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],"responses":{"200":{"description":"ok"}}}}},
+        \\"components":{"schemas":{"X":{"$ref":"#/paths/~1u~1%7Bid%7D/get"},"Y":{"$ref":"#/paths/~1u~1%7Bix%7D/get"}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, doc, .{});
+    defer parsed.deinit();
+    // X resolves (decoded `{id}`), Y does not (`{ix}`).
+    try testing.expectError(error.DanglingRef, validateOpenApi31(testing.allocator, parsed.value));
+    _ = parsed.value.object.getPtr("components").?.object.getPtr("schemas").?.object.orderedRemove("Y");
+    try validateOpenApi31(testing.allocator, parsed.value);
+}
+
+test "endpoint: the docs page splices its spec path as an escaped script string" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{
+        .gpa = testing.allocator,
+        .router = &r,
+        .info = .{ .title = "T", .version = "1" },
+        .path = "/a\"b\\c</script>\x01",
+        .docs_path = "/docs",
+    };
+    defer e.deinit();
+    try r.use(e.middleware());
+    var buf: [16384]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/docs"), &buf);
+    try expectStatus(got, "200");
+    try testing.expect(std.mem.find(u8, bodyOf(got), "fetch(\"/a\\\"b\\\\c\\u003c/script>\\u0001\")") != null);
+    try testing.expect(std.mem.find(u8, bodyOf(got), "</script>\\u0001") == null);
+}
+
+test "generate: a response status repeated past the 32nd distinct one is still written once" {
+    const responses = comptime blk: {
+        var rs: [41]router.RouteDoc.Response = undefined;
+        for (0..40) |i| rs[i] = .{ .status = 200 + i, .description = "ok" };
+        rs[40] = .{ .status = 239, .description = "again" };
+        break :blk rs;
+    };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/a", hOk, .{ .responses = &responses });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "\"239\":"));
+    try testing.expect(std.mem.find(u8, json, "again") == null);
+}
+
+test "generate: a RouteExtra matches its method too, not only the pattern" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x", hOk);
+    try r.post("/x", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{
+        .title = "T",
+        .version = "1",
+        .route_extras = &.{.{ .method = .post, .pattern = "/x", .header_parameters = &.{.{ .name = "X-Post" }} }},
+    });
+    defer testing.allocator.free(json);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, json, "X-Post"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const item = parsed.value.object.get("paths").?.object.get("/x").?.object;
+    try testing.expect(item.get("get").?.object.get("parameters") == null);
+    try testing.expect(item.get("post").?.object.get("parameters") != null);
+}
+
+test "generate: an escaped brace inside a capture's constraint does not end the capture" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/e/{id:a\\}b}", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.find(u8, json, "\"/e/{id}\":") != null);
+}
+
+test "conformance: each structural rule refuses on its own (mutation 2026-10-23)" {
+    const Case = struct { err: ConformanceError, doc: []const u8 };
+    const head = "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},";
+    const ok_resp = "\"responses\":{\"200\":{\"description\":\"ok\"}}";
+    const cases = [_]Case{
+        // OAuth2 implicit flow needs an authorizationUrl (OAS 3.1 §4.8.30).
+        .{ .err = error.InvalidSecurityScheme, .doc = head ++ "\"paths\":{},\"components\":{\"securitySchemes\":{\"o\":{\"type\":\"oauth2\",\"flows\":{\"implicit\":{\"scopes\":{}}}}}}}" },
+        // A `}` outside a template expression, and an empty one.
+        .{ .err = error.InvalidPathKey, .doc = head ++ "\"paths\":{\"/a}b\":{\"get\":{" ++ ok_resp ++ "}}}}" },
+        .{ .err = error.InvalidPathKey, .doc = head ++ "\"paths\":{\"/a/{}\":{\"get\":{" ++ ok_resp ++ "}}}}" },
+        // `in` outside query/header/path/cookie (Swagger 2.0's `body`).
+        .{ .err = error.InvalidParameter, .doc = head ++ "\"paths\":{\"/a\":{\"get\":{\"parameters\":[{\"name\":\"b\",\"in\":\"body\",\"schema\":{}}]," ++ ok_resp ++ "}}}}" },
+        // A query parameter named like the template variable does not resolve it.
+        .{ .err = error.UnresolvedPathParameter, .doc = head ++ "\"paths\":{\"/u/{id}\":{\"get\":{\"parameters\":[{\"name\":\"id\",\"in\":\"query\",\"schema\":{}}]," ++ ok_resp ++ "}}}}" },
+        // Status keys: 100-599 or 1XX-5XX.
+        .{ .err = error.InvalidResponseKey, .doc = head ++ "\"paths\":{\"/a\":{\"get\":{\"responses\":{\"600\":{\"description\":\"x\"}}}}}}" },
+        .{ .err = error.InvalidResponseKey, .doc = head ++ "\"paths\":{\"/a\":{\"get\":{\"responses\":{\"2ab\":{\"description\":\"x\"}}}}}}" },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.doc, .{});
+        defer parsed.deinit();
+        testing.expectError(c.err, validateOpenApi31(testing.allocator, parsed.value)) catch |e| {
+            std.debug.print("case: {s}\n", .{c.doc});
+            return e;
+        };
+    }
 }

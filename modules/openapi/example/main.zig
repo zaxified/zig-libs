@@ -121,7 +121,7 @@ pub fn main() !void {
     // ── this module's own structural OpenAPI 3.1 checker ────────────────
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, doc_text, .{});
     defer parsed.deinit();
-    try openapi.validateOpenApi31(parsed.value);
+    try openapi.validateOpenApi31(gpa, parsed.value);
     std.debug.print("validateOpenApi31: structurally valid OpenAPI 3.1\n", .{});
 
     // Sanity on the actual shape asserted: path param converted, tag/schema

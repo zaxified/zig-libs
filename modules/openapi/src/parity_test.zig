@@ -22,7 +22,7 @@ fn build(routes: []const router.Route, info: oa.Info) ![]u8 {
 fn check(json: []const u8) oa.ConformanceError!void {
     const parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{}) catch unreachable;
     defer parsed.deinit();
-    return oa.validateOpenApi31(parsed.value);
+    return oa.validateOpenApi31(testing.allocator, parsed.value);
 }
 
 const user_schema = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}";

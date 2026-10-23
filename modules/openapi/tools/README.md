@@ -8,6 +8,7 @@ Python (`CONVENTIONS.md` §9).
 |---|---|
 | `interop.zig` | `zig build interop-openapi`: has `spec_oracle.py gen` draw route tables, registers each on a `router.Router`, builds its document with `Generator.build`, has `spec_oracle.py judge` give the verdicts, and writes (or with `--check` compares) the vectors. |
 | `spec_oracle.py` | `gen`: seeded route tables (+ crafted ones). `judge`: openapi-spec-validator on every built document, and on mutations of the accepted ones; the classes where `validateOpenApi31` may answer otherwise; FastAPI's mapping of the same routes. |
+| `fastapi_lead/probe.py` | The maturity card's `**Ahead:**` claim, re-checkable: in the FastAPI virtualenv below, `GET /f/{p}` and `GET /f/{p:path}` both answer (dispatched through the ASGI app itself), yet FastAPI's document lists one of them; prints the dispatch results, the document's operations under `/f/{p}` and the warnings (none). |
 | `fastapi_oracle/fastapi_paths.py` | FastAPI, in its own virtualenv outside the repository: registers each table's routes (`:name` → `{name}`, `*name` → `{name:path}`) and reduces its document to path templates → methods → path parameters. |
 
 ```bash

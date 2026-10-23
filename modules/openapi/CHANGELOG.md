@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **BREAKING:** `validateOpenApi31(gpa, doc)` takes a scratch allocator (no
+  consumer outside the module calls it); `ConformanceError` gains `DuplicateOperationId` and
+  `OutOfMemory`. Grade 1 re-audit (review + 95/95 mutants), fixes: duplicate `operationId`s
+  (`/a/b` and `/a_b`, `/users` and `/users/`, `/u/:id` and `/u/id`) — a repeat now gets the
+  smallest free `_<n>` suffix, ids without a collision unchanged, and the checker refuses
+  duplicates; `Endpoint` no longer caches a transient `OutOfMemory`; a schema that is JSON but not a
+  JSON Schema (`null`, `5`, `[]`) is the field's typed error; a `query_schema`'s own
+  `properties`/`required` count beside its `allOf` (`validate.writeJsonSchemaFor` types with
+  cross-field rules documented no query parameters), a `$ref` part is `InvalidQuerySchema`;
+  `Generator.write`/`writeRoutes` write the self-checked document or nothing (were streaming,
+  unchecked); `$ref` inside a subtree with its own `$id` is not resolved against the document,
+  `%XX` in a pointer is decoded; the docs page escapes `Endpoint.path` in its script; no cap on
+  the duplicate-status / duplicate-capture checks. Lead on the card: FastAPI drops a reachable
+  route from its document on a path collision (`tools/fastapi_lead/probe.py`).
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/interop.zig`: `dupeZ` -> `dupeSentinel`, `Ast.parse` takes `.{ .mode = .zig }`.
 - **2026-10-18** — Ported to Zig 0.17.0. method loop uses `@typeInfo(http.Method).@"enum".field_values` (`.fields` is gone). No behaviour change.
 

@@ -337,7 +337,7 @@ pub fn buildHarness(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     // `buildRoutes`'s own self-check.
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, built, .{});
     defer parsed.deinit();
-    try oa.validateOpenApi31(parsed.value);
+    try oa.validateOpenApi31(gpa, parsed.value);
     mark(.build_ok);
 }
 
@@ -427,7 +427,7 @@ fn checkText(gpa: Allocator, text: []const u8, base: ?[]const u8) !void {
         },
     };
     defer parsed.deinit();
-    oa.validateOpenApi31(parsed.value) catch {
+    oa.validateOpenApi31(gpa, parsed.value) catch {
         if (base) |b| if (std.mem.eql(u8, b, text)) return error.BaseDocumentRejected;
         mark(.spec_rejected);
         return;

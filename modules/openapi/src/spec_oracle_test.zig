@@ -70,7 +70,7 @@ test "spec oracle: validateOpenApi31 answers what the validator answered on each
     for (vectors.mutations) |m| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, m.doc, .{});
         defer parsed.deinit();
-        const ok = if (openapi.validateOpenApi31(parsed.value)) |_| true else |_| false;
+        const ok = if (openapi.validateOpenApi31(testing.allocator, parsed.value)) |_| true else |_| false;
         if (ok != m.want) {
             bad += 1;
             if (bad <= 10) std.debug.print("table {d} {s}: checker ok={}, want {} (validator {}: {s})\n", .{ m.table, m.mutation, ok, m.want, m.valid, m.why });
