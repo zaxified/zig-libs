@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Faster `SetCookie.write`** (999 → 757–836 ns for the bench's 8 specs, 1.35× →
+  1.08–1.10× cookie-rs): name, value, Path and Domain are checked against 256-entry tables built at
+  compile time (one load and an OR per byte, no branch), and `Max-Age` is written without the
+  generic formatter. Same accepts and refusals. **Card:** fastest in the field measured
+  (`bench-cookies` also times cookie-rs 0.18.2, `tools/rust_fast_bench`, and can time fasthttp,
+  `tools/go_fast_bench`, with `BENCH_FASTHTTP=1`).
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the mechanical codemod.

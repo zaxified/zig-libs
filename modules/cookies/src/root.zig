@@ -209,7 +209,7 @@ pub const SetCookie = struct {
         // without regard to case. A quoted value (`"x"`), which the grammar
         // allows, was refused.
         if (sc.name.len == 0) return error.InvalidCookie;
-        for (sc.name) |c| if (!isTokenChar(c)) return error.InvalidCookie;
+        if (anyBad(&bad_token, sc.name)) return error.InvalidCookie;
         // Do NOT auto-quote a bad value — reject it (injection guard).
         if (!isCookieValue(sc.value)) return error.InvalidCookie;
         if (sc.name.len + sc.value.len > max_name_value_bytes) return error.InvalidCookie;
@@ -243,7 +243,22 @@ pub const SetCookie = struct {
             try w.writeAll("; Domain=");
             try w.writeAll(d);
         }
-        if (sc.max_age) |a| try w.print("; Max-Age={d}", .{a});
+        if (sc.max_age) |a| {
+            // Not `w.print`: the generic formatter was a measurable part of a
+            // whole `write` (bench-cookies `build`, 2026-10-23).
+            var digits: [20]u8 = undefined;
+            var i: usize = digits.len;
+            var m: u64 = @abs(a);
+            while (true) {
+                i -= 1;
+                digits[i] = '0' + @as(u8, @intCast(m % 10));
+                m /= 10;
+                if (m == 0) break;
+            }
+            try w.writeAll("; Max-Age=");
+            if (a < 0) try w.writeByte('-');
+            try w.writeAll(digits[i..]);
+        }
         if (sc.expires) |e| {
             try w.writeAll("; Expires=");
             try w.writeAll(e);
@@ -265,6 +280,34 @@ pub const SetCookie = struct {
             else => |x| return x,
         };
         return fw.buffered();
+    }
+
+    /// 1 for every byte `ok` refuses: a 256-entry table, so a whole field is
+    /// checked with one load and an OR per byte and no branch (`anyBad`).
+    fn badTable(comptime ok: fn (u8) bool) [256]u8 {
+        @setEvalBranchQuota(10_000);
+        var t: [256]u8 = undefined;
+        for (&t, 0..) |*e, c| e.* = @intFromBool(!ok(@intCast(c)));
+        return t;
+    }
+    const bad_token = badTable(isTokenChar);
+    const bad_octet = badTable(isCookieOctet);
+    const bad_path = badTable(isPathChar);
+    const bad_label = badTable(isLabelChar);
+
+    fn anyBad(comptime table: *const [256]u8, s: []const u8) bool {
+        var acc: u8 = 0;
+        for (s) |c| acc |= table[c];
+        return acc != 0;
+    }
+
+    /// RFC 6265bis av-octet as `isPathValue` takes it: printable ASCII and SP, no `;`.
+    fn isPathChar(c: u8) bool {
+        return c >= 0x20 and c <= 0x7e and c != ';';
+    }
+
+    fn isLabelChar(c: u8) bool {
+        return std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
     }
 
     /// RFC 6265 §4.1.1 cookie-name token char (RFC 2616 token): no CTL
@@ -290,8 +333,7 @@ pub const SetCookie = struct {
     /// two DQUOTEs (the quotes are part of the value a browser stores).
     fn isCookieValue(v: []const u8) bool {
         const inner = if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
-        for (inner) |c| if (!isCookieOctet(c)) return false;
-        return true;
+        return !anyBad(&bad_octet, inner);
     }
 
     /// RFC 6265bis §5.6: a user agent ignores an attribute whose value is
@@ -305,8 +347,7 @@ pub const SetCookie = struct {
     /// ASCII and SP, no `;`), at most 1024 bytes.
     fn isPathValue(p: []const u8) bool {
         if (p.len == 0 or p[0] != '/' or p.len > max_attribute_value_bytes) return false;
-        for (p) |c| if (c < 0x20 or c > 0x7e or c == ';') return false;
-        return true;
+        return !anyBad(&bad_path, p);
     }
 
     /// Domain: a host name -- dot-separated labels of letters, digits, `-`
@@ -321,7 +362,7 @@ pub const SetCookie = struct {
         while (labels.next()) |label| {
             if (label.len == 0 or label.len > 63) return false;
             if (label[0] == '-' or label[label.len - 1] == '-') return false;
-            for (label) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+            if (anyBad(&bad_label, label)) return false;
         }
         return true;
     }

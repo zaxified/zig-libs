@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Faster preflight** (net 1.38× → 1.13–1.23× tower-http): the request headers a
+  preflight reads (Origin, Access-Control-Request-Method/-Headers/-Private-Network) are found in one
+  pass over the head instead of one `req.header` scan each (the middleware no longer looks up the
+  request method twice), and the constant `Vary` / `*` / PNA values go through `setHeaderStatic`.
+  Same answers. **Card:** fastest in the field measured (`bench-cors` also times labstack/echo
+  v5.4.2, `tools/go_fast_bench`, and tower-http 0.7.1, `tools/rust_fast_bench`).
 - **2026-10-20** — **CONSUMER-VISIBLE (headers):** with a `.list`, `.patterns` or `.predicate`
   origin policy, every actual response now carries `Vary: Origin` — also when the Origin is
   absent or refused or the method gate fails, not only on a grant (rs/cors parity; audit

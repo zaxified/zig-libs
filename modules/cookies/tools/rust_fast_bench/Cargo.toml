@@ -1,0 +1,20 @@
+[package]
+name = "cookies_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-cookies`
+# (modules/cookies/tools/bench.zig): the `cookie` crate (SergioBenitez/cookie-rs,
+# the module's scope reference), pinned exactly, with default features off
+# (no percent-encoding, no signed/private jars: parse and Set-Cookie
+# rendering only).
+[dependencies]
+cookie = { version = "=0.18.2", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

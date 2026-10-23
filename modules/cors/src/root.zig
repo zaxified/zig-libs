@@ -391,13 +391,45 @@ pub const Cors = struct {
     /// run a handler afterwards — a preflight is answered, never routed.
     pub fn applyPreflight(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         res.setStatus(204);
-        return c.writePreflightHeaders(req, res);
+        return c.writePreflightHeaders(PreflightIn.gather(req), res);
     }
+
+    /// The request headers a preflight answer reads, found in ONE pass over
+    /// the head instead of a `req.header` scan each (bench-cors `preflight`,
+    /// 2026-10-23: the scans were the largest cost of the answer). First
+    /// occurrence wins and values are OWS-trimmed, exactly as `req.header`.
+    const PreflightIn = struct {
+        origin: ?[]const u8 = null,
+        acrm: ?[]const u8 = null,
+        acrh: ?[]const u8 = null,
+        pna: ?[]const u8 = null,
+
+        fn gather(req: *const http.Server.Request) PreflightIn {
+            var in: PreflightIn = .{};
+            var it = req.iterateHeaders();
+            while (it.next()) |h| {
+                const slot: *?[]const u8 = switch (h.name.len) {
+                    "Origin".len => if (std.ascii.eqlIgnoreCase(h.name, "Origin")) &in.origin else continue,
+                    "Access-Control-Request-Method".len => if (std.ascii.eqlIgnoreCase(h.name, "Access-Control-Request-Method")) &in.acrm else continue,
+                    "Access-Control-Request-Headers".len => if (std.ascii.eqlIgnoreCase(h.name, "Access-Control-Request-Headers")) &in.acrh else continue,
+                    "Access-Control-Request-Private-Network".len => if (std.ascii.eqlIgnoreCase(h.name, "Access-Control-Request-Private-Network")) &in.pna else continue,
+                    else => continue,
+                };
+                if (slot.* == null) slot.* = h.value;
+            }
+            return in;
+        }
+    };
 
     /// `applyPreflight` minus the status: what `preflight_passthrough` runs
     /// before handing the request on (the handler chooses the status).
-    fn writePreflightHeaders(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
-        try res.setHeader("Vary", if (c.options.allow_private_network) preflight_vary_pna else preflight_vary);
+    fn writePreflightHeaders(c: *const Cors, in: PreflightIn, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+        // Constant values: `setHeaderStatic` skips the run-time validation
+        // and the copy into the response's header store.
+        if (c.options.allow_private_network)
+            try res.setHeaderStatic("Vary", preflight_vary_pna)
+        else
+            try res.setHeaderStatic("Vary", preflight_vary);
 
         // The `allow_unconditional_wildcard` deviation: every intercepted
         // OPTIONS — preflight or bare — gets the wildcard, unconditionally.
@@ -417,10 +449,10 @@ pub const Cors = struct {
         // client-side — precisely the wire change this option exists to
         // avoid for a legacy always-open API (SPEC.md, README.md).
         if (c.options.allow_unconditional_wildcard) {
-            try res.setHeader("Access-Control-Allow-Origin", "*");
-            if (req.header("Access-Control-Request-Method") == null) return; // bare OPTIONS: nothing more to advertise
+            try res.setHeaderStatic("Access-Control-Allow-Origin", "*");
+            if (in.acrm == null) return; // bare OPTIONS: nothing more to advertise
             try res.setHeader("Access-Control-Allow-Methods", c.allow_methods_value);
-            const acrh = req.header("Access-Control-Request-Headers");
+            const acrh = in.acrh;
             switch (c.options.allowed_headers) {
                 // Same HeaderBytesExhausted handling as the gated path below
                 // (root.zig, long-ACRH MEDIUM finding): a failed reflect
@@ -437,22 +469,22 @@ pub const Cors = struct {
             }
             // `allow_credentials` is unreachable here — rejected together
             // with `.any` at init (same as `applyActual`).
-            try c.privateNetworkGrant(req, res);
+            try c.privateNetworkGrant(in.pna, res);
             if (c.options.max_age_s != null)
                 try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
             return;
         }
 
         emit: {
-            const origin = req.header("Origin") orelse break :emit;
+            const origin = in.origin orelse break :emit;
             const acao = c.allowOriginValue(origin) orelse break :emit;
             // The middleware only routes true preflights (ACRM present)
             // here, but a direct `applyPreflight` caller might not honor
             // that contract — an absent ACRM is then a failed preflight
             // (headerless 204), never a crash.
-            const req_method = req.header("Access-Control-Request-Method") orelse break :emit;
+            const req_method = in.acrm orelse break :emit;
             if (!c.methodTokenAllowed(req_method)) break :emit;
-            const acrh = req.header("Access-Control-Request-Headers");
+            const acrh = in.acrh;
             if (c.options.allowed_headers == .list) {
                 if (acrh) |h| if (!c.requestedHeadersAllowed(h)) break :emit;
             }
@@ -483,7 +515,7 @@ pub const Cors = struct {
             }
             if (c.options.allow_credentials)
                 try res.setHeader("Access-Control-Allow-Credentials", "true");
-            try c.privateNetworkGrant(req, res);
+            try c.privateNetworkGrant(in.pna, res);
             if (c.options.max_age_s != null)
                 try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
         }
@@ -504,11 +536,11 @@ pub const Cors = struct {
 
     /// Private Network Access answer (rs/cors cors.go:390): only when the
     /// option is on and the request says exactly `true`.
-    fn privateNetworkGrant(c: *const Cors, req: *const http.Server.Request, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
+    fn privateNetworkGrant(c: *const Cors, pna: ?[]const u8, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         if (!c.options.allow_private_network) return;
-        const v = req.header("Access-Control-Request-Private-Network") orelse return;
+        const v = pna orelse return;
         if (std.mem.eql(u8, v, "true"))
-            try res.setHeader("Access-Control-Allow-Private-Network", "true");
+            try res.setHeaderStatic("Access-Control-Allow-Private-Network", "true");
     }
 
     /// Actual request: set the response CORS headers when Origin + method
@@ -664,15 +696,18 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // OPTIONS request (no ACRM) is an actual request and routes normally.
     // `allow_unconditional_wildcard` deviates: it treats EVERY OPTIONS as
     // interceptable, ACRM or not (see the module doc + SPEC.md).
-    if (ctx.req.method == .options and
-        (ctx.req.header("Access-Control-Request-Method") != null or c.options.allow_unconditional_wildcard))
-    {
-        if (c.options.preflight_passthrough) {
-            // rs/cors OptionsPassthrough (cors.go:281): headers, then the chain.
-            try c.writePreflightHeaders(ctx.req, ctx.res);
-            return next.run(ctx);
+    if (ctx.req.method == .options) {
+        const in = Cors.PreflightIn.gather(ctx.req);
+        if (in.acrm != null or c.options.allow_unconditional_wildcard) {
+            if (c.options.preflight_passthrough) {
+                // rs/cors OptionsPassthrough (cors.go:281): headers, then the chain.
+                try c.writePreflightHeaders(in, ctx.res);
+                return next.run(ctx);
+            }
+            // short-circuit: next is never called
+            ctx.res.setStatus(204);
+            return c.writePreflightHeaders(in, ctx.res);
         }
-        return c.applyPreflight(ctx.req, ctx.res); // short-circuit: next is never called
     }
     try c.applyActual(ctx.req, ctx.res);
     return next.run(ctx);
