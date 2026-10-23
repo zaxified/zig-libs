@@ -283,6 +283,12 @@ pub const Jar = struct {
         var host_only = true;
         if (sc.domain) |raw| {
             const d = lowerInto(&dom_buf, raw) orelse return;
+            // A Domain with a trailing dot is dropped (audit 2026-10-23, MED):
+            // the PSL lookup reads `co.uk.` as no public suffix -- its last
+            // label is empty -- so `http://bank.co.uk./` could set a cookie
+            // for every `*.co.uk.` host. Only a fully qualified host ends in a
+            // dot, and it still gets its host-only cookies.
+            if (d.len != 0 and d[d.len - 1] == '.') return;
             const is_ip = isIp(host);
             const public = if (is_ip) false else if (j.options.psl) |list| list.isPublicSuffix(d) else true;
             if (is_ip or public) {
@@ -306,8 +312,10 @@ pub const Jar = struct {
         j.lock();
         defer j.mutex.unlock();
         // 6265bis §5.7 step 13: a plain origin cannot shadow a secure cookie.
+        // An expired cookie shadows nothing: it is gone, only not purged yet
+        // (audit 2026-10-23).
         if (!secure_origin) for (j.entries.items) |*e| {
-            if (e.secure and std.mem.eql(u8, e.name, sc.name) and
+            if (e.secure and !e.expired(now) and std.mem.eql(u8, e.name, sc.name) and
                 (domainMatch(e.domain, domain) or domainMatch(domain, e.domain)) and
                 pathMatch(path, e.path)) return;
         };
@@ -605,6 +613,30 @@ test "PSL: a public suffix Domain is refused unless it is the host, then host-on
     try testing.expectEqualStrings("", try header(&j, "http://other.co.uk/", t0));
 }
 
+test "PSL: a trailing-dot Domain is dropped, so a fully qualified host cannot reach its public suffix" {
+    // audit 2026-10-23 (MED): `co.uk.` passed the PSL check (empty last
+    // label) and `bank.co.uk.` set a cookie every `*.co.uk.` host received.
+    var list = try PublicSuffixList.parse(testing.allocator, "uk\nco.uk\n");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    try j.setCookieAt(u("http://bank.co.uk./"), "evil=1; Domain=co.uk.", t0);
+    try j.setCookieAt(u("http://bank.co.uk./"), "evil2=1; Domain=bank.co.uk.", t0);
+    try testing.expectEqual(@as(usize, 0), j.count());
+    try testing.expectEqualStrings("", try header(&j, "http://victim.co.uk./", t0));
+    // The fully qualified host still keeps its host-only cookies.
+    try j.setCookieAt(u("http://bank.co.uk./"), "own=1", t0);
+    try testing.expectEqualStrings("own=1", try header(&j, "http://bank.co.uk./", t0));
+}
+
+test "an expired Secure cookie no longer shadows a plain-origin store" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    try j.setCookieAt(u("https://example.com/"), "s=1; Secure; Max-Age=1", t0);
+    try j.setCookieAt(u("http://example.com/"), "s=2", t0 + 10);
+    try testing.expectEqualStrings("s=2", try header(&j, "http://example.com/", t0 + 10));
+}
+
 test "no list: every Domain counts as a public suffix (fail-closed)" {
     var j = Jar.init(testing.allocator, undefined, .{});
     defer j.deinit();
@@ -696,6 +728,123 @@ test "domainMatch, pathMatch, defaultPath" {
     try testing.expectEqualStrings("/", defaultPath("/page"));
     try testing.expectEqualStrings("/a/b", defaultPath("/a/b/page"));
     try testing.expectEqualStrings("/a/b", defaultPath("/a/b/"));
+}
+
+// ── audit 2026-10-23: tests asked for by mutation survivors ──────────────────
+
+test "SetCookie.parse: size boundaries, TAB, saturating Max-Age" {
+    // An attribute value: 1024 bytes are kept, 1025 are ignored.
+    var p1024: [10 + 1024]u8 = @splat('/');
+    @memcpy(p1024[0..10], "a=1; Path=");
+    try testing.expectEqual(@as(usize, 1024), SetCookie.parse(&p1024).?.path.?.len);
+    var p1025: [10 + 1025]u8 = @splat('/');
+    @memcpy(p1025[0..10], "a=1; Path=");
+    try testing.expect(SetCookie.parse(&p1025).?.path == null);
+    // TAB is the one control byte a value may hold (6265bis §5.6); other CTLs refuse.
+    try testing.expectEqualStrings("b\tc", SetCookie.parse("a=b\tc").?.value);
+    try testing.expect(SetCookie.parse("a=b\x1fc") == null);
+    // Max-Age saturates instead of overflowing, in both directions.
+    const max = std.math.maxInt(i64);
+    try testing.expectEqual(@as(?i64, max), SetCookie.parse("a=1; Max-Age=99999999999999999999").?.max_age);
+    try testing.expectEqual(@as(?i64, -max), SetCookie.parse("a=1; Max-Age=-99999999999999999999").?.max_age);
+    try testing.expectEqual(@as(?i64, max), SetCookie.parse("a=1; Max-Age=9223372036854775807").?.max_age);
+    try testing.expectEqual(@as(?i64, 0), SetCookie.parse("a=1; Max-Age=0").?.max_age);
+}
+
+test "parseCookieDate: year 99, impossible fields and malformed time/day tokens" {
+    const want = parseCookieDate("Sun, 06 Nov 1999 08:49:37 GMT").?;
+    try testing.expectEqual(@as(?i64, want), parseCookieDate("Sunday, 06-Nov-99 08:49:37 GMT"));
+    try testing.expectEqual(@as(?i64, 784111777), parseCookieDate("06@Nov@1994 08:49:37")); // `@` delimits
+    for ([_][]const u8{
+        "0 Nov 1994 08:49:37", // day 0
+        "06 Nov 1994 08:49:60", // §5.1.1 step 5: > 59 fails
+        "06 Nov 1994 08:49:007", // a time component has at most 2 digits
+        "06 Nov 1994 008:49:37",
+        "006 Nov 1994 08:49:37", // a day has at most 2 digits
+        "31 Apr 1994 08:49:37",
+        "29 Feb 2023 08:49:37",
+        "06 Nov 1994 08:49", // not a time
+    }) |s| try testing.expectEqual(@as(?i64, null), parseCookieDate(s));
+    // The last day of a month exists.
+    for ([_][]const u8{ "31 Jan 2030 00:00:00", "30 Apr 2030 00:00:00", "29 Feb 2024 00:00:00", "28 Feb 2023 00:00:00", "31 Dec 2030 23:59:59" }) |s|
+        try testing.expect(parseCookieDate(s) != null);
+}
+
+test "Secure shadowing: a plain origin below a secure domain cookie, other paths allowed" {
+    var list = try PublicSuffixList.parse(testing.allocator, "com\n");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    // A secure Domain cookie for example.com ...
+    try j.setCookieAt(u("https://example.com/"), "s=1; Secure; Domain=example.com", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    // ... cannot be shadowed from a plain sub-domain (6265bis §5.7 step 13,
+    // the new cookie's domain is *below* the secure one) ...
+    try j.setCookieAt(u("http://a.example.com/"), "s=evil", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    // ... nor from a plain parent of a secure host-only cookie.
+    try j.setCookieAt(u("https://b.example.com/"), "t=1; Secure", t0);
+    try j.setCookieAt(u("http://example.com/"), "t=evil; Domain=example.com", t0);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    // A path the secure cookie does not cover is not shadowed: allowed.
+    try j.setCookieAt(u("https://example.com/a"), "p=1; Secure; Path=/a", t0);
+    try j.setCookieAt(u("http://example.com/b"), "p=2; Path=/b", t0);
+    try testing.expectEqual(@as(usize, 4), j.count());
+    try j.setCookieAt(u("http://example.com/a/x"), "p=3; Path=/a/x", t0); // under /a: refused
+    try testing.expectEqual(@as(usize, 4), j.count());
+}
+
+test "a host-only and a Domain cookie of the same name, domain and path are two cookies" {
+    var list = try PublicSuffixList.parse(testing.allocator, "com\n");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    try j.setCookieAt(u("http://example.com/"), "a=1", t0);
+    try j.setCookieAt(u("http://example.com/"), "a=2; Domain=example.com", t0);
+    try testing.expectEqual(@as(usize, 2), j.count());
+    try testing.expectEqualStrings("a=1; a=2", try header(&j, "http://example.com/", t0));
+    try testing.expectEqualStrings("a=2", try header(&j, "http://www.example.com/", t0));
+}
+
+test "expired cookies leave on the next store, and do not count against the limits" {
+    var j = Jar.init(testing.allocator, undefined, .{ .max_per_domain = 2 });
+    defer j.deinit();
+    const url = "http://h.test/";
+    try j.setCookieAt(u(url), "live=1", t0);
+    try j.setCookieAt(u(url), "short=1; Max-Age=5", t0);
+    try j.setCookieAt(u(url), "new=1", t0 + 10); // `short` is gone by now
+    try testing.expectEqual(@as(usize, 2), j.count());
+    try testing.expectEqualStrings("live=1; new=1", try header(&j, url, t0 + 10));
+}
+
+test "sending a cookie makes it recently used" {
+    var j = Jar.init(testing.allocator, undefined, .{ .max_per_domain = 3 });
+    defer j.deinit();
+    try j.setCookieAt(u("http://a.test/"), "a1=1; Path=/only", t0);
+    try j.setCookieAt(u("http://a.test/"), "a2=1; Path=/z", t0);
+    try j.setCookieAt(u("http://a.test/"), "a3=1; Path=/z", t0);
+    try testing.expectEqualStrings("a1=1", try header(&j, "http://a.test/only/x", t0)); // only a1 is sent
+    try j.setCookieAt(u("http://a.test/"), "a4=1; Path=/z", t0); // a2 is the least recently used
+    try testing.expectEqualStrings("a1=1", try header(&j, "http://a.test/only/x", t0));
+    try testing.expectEqualStrings("a3=1; a4=1", try header(&j, "http://a.test/z", t0));
+}
+
+test "isIp: a dotted quad is an IP, a five-part numeric host is not" {
+    // Pins the dot count (mutation 2026-10-23: `dots >= 3` survived).
+    try testing.expect(isIp("1.2.3.4"));
+    try testing.expect(!isIp("1.2.3.4.5"));
+    try testing.expect(!isIp("1.2.3"));
+}
+
+test "IPv6 hosts are IPs: no Domain suffix match, even on a v4-mapped tail" {
+    var list = try PublicSuffixList.parse(testing.allocator, "");
+    defer list.deinit();
+    var j = Jar.init(testing.allocator, undefined, .{ .psl = &list });
+    defer j.deinit();
+    try j.setCookieAt(u("http://[::ffff:1.2.3.4]/"), "a=1; Domain=3.4", t0);
+    try testing.expectEqual(@as(usize, 0), j.count());
+    try j.setCookieAt(u("http://[::ffff:1.2.3.4]/"), "b=1", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
 }
 
 // ── fuzz: arbitrary Set-Cookie fields from several origins, then requests ──

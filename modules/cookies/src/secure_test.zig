@@ -296,3 +296,44 @@ test "private timed: round trip, the max-age edge, domain separation, rotation" 
         raw[bit / 8] ^= @as(u8, 1) << @intCast(bit % 8);
     }
 }
+
+// ── audit 2026-10-23: tests asked for by mutation survivors ──────────────────
+
+test "private timed: an exact-size out buffer is enough, sealTimed draws a fresh nonce" {
+    const k = vectorKey();
+    const t0: i64 = 1_760_000_000;
+    var sb: [128]u8 = undefined;
+    var s1b: [128]u8 = undefined;
+    var s2b: [128]u8 = undefined;
+    const s = try secure.private.sealTimedNonce(&k, "sid", "user=42", t0, @splat(3), &sb);
+    // The decoded size is the exact minimum the doc promises (`openBufLen` is
+    // only an upper bound of it); one byte less is refused.
+    const raw_len = try std.base64.standard.Decoder.calcSizeForSlice(s);
+    var plain: [128]u8 = undefined;
+    try testing.expectEqualStrings("user=42", secure.private.openTimed(&.{k}, "sid", s, t0, 60, plain[0..raw_len]).?);
+    try testing.expect(secure.private.openTimed(&.{k}, "sid", s, t0, 60, plain[0 .. raw_len - 1]) == null);
+    // Same for the untimed form.
+    const u = try secure.private.seal(&k, "sid", "user=42", @splat(3), &sb);
+    const u_len = try std.base64.standard.Decoder.calcSizeForSlice(u);
+    try testing.expectEqualStrings("user=42", secure.private.open(&.{k}, "sid", u, plain[0..u_len]).?);
+    try testing.expect(secure.private.open(&.{k}, "sid", u, plain[0 .. u_len - 1]) == null);
+    // Two sealTimed of one input differ (a fixed nonce would repeat under one key).
+    const r1 = try secure.private.sealTimed(testing.io, &k, "sid", "v", t0, &s1b);
+    const r2 = try secure.private.sealTimed(testing.io, &k, "sid", "v", t0, &s2b);
+    try testing.expect(!std.mem.eql(u8, r1, r2));
+}
+
+test "private: an empty plaintext opens, timed and untimed" {
+    const k = vectorKey();
+    var b: [128]u8 = undefined;
+    var plain: [128]u8 = undefined;
+    const t0: i64 = 1_760_000_000;
+    const e = try secure.private.seal(&k, "sid", "", @splat(1), &b);
+    try testing.expectEqual(@as(usize, 0), secure.private.open(&.{k}, "sid", e, &plain).?.len);
+    const et = try secure.private.sealTimedNonce(&k, "sid", "", t0, @splat(1), &b);
+    try testing.expectEqual(@as(usize, 0), secure.private.openTimed(&.{k}, "sid", et, t0, 0, &plain).?.len);
+    const st = try secure.signed.signTimed(&k, "sid", "", t0, &b);
+    try testing.expectEqual(@as(usize, 0), secure.signed.verifyTimed(&.{k}, "sid", st, t0, 0).?.len);
+    const sn = try secure.signed.sign(&k, "sid", "", &b, .{});
+    try testing.expectEqual(@as(usize, 0), secure.signed.verify(&.{k}, "sid", sn, .{}).?.len);
+}

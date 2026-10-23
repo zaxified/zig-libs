@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **SECURITY (client jar, MED):** a `Domain` attribute with a trailing dot passed the
+  Public Suffix List check (`co.uk.`'s last label is empty), so a fully qualified host
+  (`http://bank.co.uk./`) could set a cookie that every `*.co.uk.` host then received. Such a Domain
+  is now dropped. Also fixed: an expired, not yet purged `Secure` cookie blocked a plain-origin
+  store of the same name. **Card: grade 1** (S1 E1 A1 H1 P1): independent review + 126 mutants
+  (121 killed, 5 equivalent; 37 new tests), Go `net/http` writing five cookies browsers drop
+  (`tools/lead_probe`), server-side expiry in signed/private values. ctgrind digests re-pinned,
+  counts unchanged.
 - **2026-10-23** — **Faster `SetCookie.write`** (999 → 757–836 ns for the bench's 8 specs, 1.35× →
   1.08–1.10× cookie-rs): name, value, Path and Domain are checked against 256-entry tables built at
   compile time (one load and an OR per byte, no branch), and `Max-Age` is written without the

@@ -1057,6 +1057,124 @@ test "find matches the cookie name case-sensitively" {
     try testing.expectEqual(@as(?[]const u8, null), find("SESSION=x", "session"));
 }
 
+// ── audit 2026-10-23: tests asked for by mutation survivors ──────────────────
+
+/// `write` accepts `sc` (true) or refuses it with `InvalidCookie` (false).
+fn writeAccepts(sc: SetCookie) !bool {
+    var buf: [8192]u8 = undefined;
+    if (sc.bufPrint(&buf)) |_| return true else |e| {
+        try testing.expect(e == error.InvalidCookie);
+        return false;
+    }
+}
+
+test "SetCookie.write: name, value, Path and Domain byte sets, pinned byte by byte" {
+    // The accept sets are written out from the RFCs here, not read from the
+    // predicates, so a table that drifts in either direction fails. (Mutation
+    // survivors: non-ASCII, `?`, `@` in a name; non-ASCII in a value; 0x1f in
+    // a Path; `_` and `-` in a Domain label.)
+    for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        // RFC 6265 §4.1.1 name = RFC 2616 token.
+        const tchar = std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
+        try testing.expectEqual(tchar, try writeAccepts(.{ .name = &.{ 'a', c, 'b' }, .value = "v" }));
+        // cookie-octet: 0x21, 0x23-0x2B, 0x2D-0x3A, 0x3C-0x5B, 0x5D-0x7E.
+        const octet = c == 0x21 or (c >= 0x23 and c <= 0x2b) or (c >= 0x2d and c <= 0x3a) or
+            (c >= 0x3c and c <= 0x5b) or (c >= 0x5d and c <= 0x7e);
+        try testing.expectEqual(octet, try writeAccepts(.{ .name = "n", .value = &.{ 'a', c, 'b' } }));
+        // Path: av-octets, printable ASCII and SP, no `;`.
+        const av = c >= 0x20 and c <= 0x7e and c != ';';
+        try testing.expectEqual(av, try writeAccepts(.{ .name = "n", .value = "v", .path = &.{ '/', c, 'x' } }));
+        // Domain label: letters, digits, `-`, `_` (and `.` between labels).
+        const host = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.';
+        try testing.expectEqual(host, try writeAccepts(.{ .name = "n", .value = "v", .domain = &.{ 'a', c, 'b', '.', 'c', 'o', 'm' } }));
+    }
+}
+
+test "SetCookie.write: quoted values, only a balanced pair is stripped" {
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "\"abc\"" }));
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "\"\"" }));
+    // The byte under the closing quote position must still be checked: an
+    // unbalanced quote must not hide a `;` (header injection) at the end.
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"abc;" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"abc " }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"abc" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"a\"b\"" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"a;b\"" }));
+}
+
+test "SetCookie.write: Domain and Path length and shape limits" {
+    const a63 = strRepeat("a", 63);
+    // 253 bytes is the longest host name, 63 the longest label.
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .domain = a63 ++ "." ++ a63 ++ "." ++ a63 ++ "." ++ strRepeat("a", 61) }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .domain = a63 ++ "." ++ a63 ++ "." ++ a63 ++ "." ++ strRepeat("a", 62) }));
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .domain = a63 ++ ".com" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .domain = a63 ++ "a.com" }));
+    for ([_][]const u8{ "ab-.com", "-ab.com", "a.-b.com", "a.b-.com", "", ".", "..a.com", "a..com", "a.com." }) |d|
+        try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .domain = d }));
+    for ([_][]const u8{ "a-b.com", "a_b.com", ".example.com", "localhost", "1.2.3.4" }) |d|
+        try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .domain = d }));
+    // Path: absolute, at most 1024 bytes.
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .path = "/" ++ strRepeat("a", 1023) }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .path = "/" ++ strRepeat("a", 1024) }));
+    for ([_][]const u8{ "", "a", "a/b" }) |p|
+        try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .path = p }));
+    // Name + value: 4096 is the most, and the line has to fit `max_set_cookie_bytes`.
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = strRepeat("v", 4095) }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = strRepeat("v", 4096) }));
+}
+
+test "SetCookie.write: expires must be an IMF-fixdate, field by field" {
+    const base = "Wed, 09 Jun 2021 10:18:14 GMT";
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .expires = base }));
+    for ([_][]const u8{
+        "Wed, 31 Dec 9999 23:59:59 GMT",
+        "Wed, 09 Jun 2021 10:18:60 GMT", // leap second
+        "Wed, 01 Jan 2021 00:00:00 GMT",
+        "Sun, 09 Jun 2021 10:18:14 GMT", // the weekday is not cross-checked
+    }) |e| try testing.expect(try writeAccepts(.{ .name = "n", .value = "v", .expires = e }));
+    for ([_][]const u8{
+        "Wed, 00 Jun 2021 10:18:14 GMT", // day 0
+        "Wed, 32 Jun 2021 10:18:14 GMT",
+        "Wed, 99 Jun 2021 10:18:14 GMT",
+        "Wed, 09 Jun 2021 24:18:14 GMT",
+        "Wed, 09 Jun 2021 99:18:14 GMT",
+        "Wed, 09 Jun 2021 10:60:14 GMT",
+        "Wed, 09 Jun 2021 10:18:61 GMT",
+        "Xyz, 09 Jun 2021 10:18:14 GMT", // weekday name
+        "Wed, 09 Foo 2021 10:18:14 GMT", // month name
+        "Wed, 09 jun 2021 10:18:14 GMT", // names are case-sensitive
+        "Wed, 09 Jun 2021 10-18:14 GMT", // each separator
+        "Wed, 09 Jun 2021 10:18-14 GMT",
+        "Wed, 09 Jun 2021 10:18:14 UTC",
+        "Wed, 09 Jun 2021 10:18:14 GMT ",
+        "Wed,  9 Jun 2021 10:18:14 GMT",
+        "Wed; 09 Jun 2021 10:18:14 GMT",
+        "Wed, 09-Jun 2021 10:18:14 GMT",
+        "Wed, 09 Jun-2021 10:18:14 GMT",
+        "Wed, 09 Jun 2021-10:18:14 GMT",
+        "Wed, 0a Jun 2021 10:18:14 GMT",
+        "Wed, 09 Jun 20x1 10:18:14 GMT",
+        "Wed, 09 Jun 2021 10:18:14 GMT; Domain=evil.example",
+        "tomorrow",
+        "",
+    }) |e| try testing.expect(!try writeAccepts(.{ .name = "n", .value = "v", .expires = e }));
+}
+
+test "SetCookie.write: Max-Age at the extremes of i64" {
+    var buf: [128]u8 = undefined;
+    for ([_]struct { i64, []const u8 }{
+        .{ 0, "n=v; Max-Age=0" },
+        .{ 9, "n=v; Max-Age=9" },
+        .{ 10, "n=v; Max-Age=10" },
+        .{ 1_000_000_007, "n=v; Max-Age=1000000007" },
+        .{ -10, "n=v; Max-Age=-10" },
+        .{ std.math.maxInt(i64), "n=v; Max-Age=9223372036854775807" },
+        .{ std.math.minInt(i64), "n=v; Max-Age=-9223372036854775808" },
+    }) |c| try testing.expectEqualStrings(c[1], try (SetCookie{ .name = "n", .value = "v", .max_age = c[0] }).bufPrint(&buf));
+}
+
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
     const rep_result = comptime blk: {
