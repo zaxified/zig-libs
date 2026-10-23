@@ -124,8 +124,26 @@ def zig_str(s):
     return '"' + "".join(out) + '"'
 
 
+def check_rows(rows):
+    """What `parse` assumes of every row (review 2026-10-23): a CLDR update that
+    breaks one of these would make the row refuse every input, silently."""
+    reserved = set("+-%()eE\u2212") | set("0123456789")
+    folded = [n.lower().replace("-", "_") for (n, *_rest) in rows]
+    assert folded == sorted(folded) and len(set(folded)) == len(folded), "row names not strictly sorted under the Zig fold"
+    for (n, g, d, _k, ns, ng, nd) in rows:
+        z = zero_of(ns)
+        native_digits = {chr(z + i) for i in range(10)}
+        for grp, dec, digits in ((g, d, set()), (ng, nd, native_digits)):
+            assert grp and dec, "%s: empty separator" % n
+            assert grp != dec, "%s: group == decimal" % n
+            assert not grp.startswith(dec) and not dec.startswith(grp), "%s: one separator prefixes the other" % n
+            for s in (grp, dec):
+                assert not (set(s) & (reserved | digits)), "%s: separator %r holds a digit or a sign" % (n, s)
+
+
 def gen_table_text():
     rows = locale_rows()
+    check_rows(rows)
     systems = sorted({r[4] for r in rows} | {"latn"})
     try:
         cldr = babel.core.get_cldr_version()

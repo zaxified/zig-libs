@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Card: grade 1** (S1 E1 A1 P1). Speed: 0.11× ICU4C's `DecimalFormat::parse`
+  (`bench-numparse` now also times the system ICU, `tools/icu_bench`; ICU and Babel agree with us on
+  every line), a Babel defect (strict refuses correctly grouped native digits), accounting negatives
+  and percent. Audit: independent review (no defect) + 33 mutants (30 killed, 3 equivalent).
+  **Docs/tests only:** `percent` is ASCII `%` and comes off before a trailing minus (`5-%` is
+  -0.05), tests for empty bodies and malformed UTF-8, the table generator asserts what `parse`
+  assumes of every row. No behaviour change.
 - **2026-10-20** — `zig build bench-numparse` (`tools/bench.zig` + `tools/bench_ref.py`, Babel 2.17 under python 3.14): 0.007–0.04× the reference. Card: grade 3 → 2 (scope parity, P2).
 - **2026-10-20** — Every CLDR locale and native digits (S2). `locale(name)` reads a generated table of
   Babel 2.17's 1066 locales (`src/cldr_locales.zig`, `tools/babel-oracle.py --gen-table`; ASCII

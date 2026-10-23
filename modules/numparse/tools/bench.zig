@@ -29,6 +29,12 @@
 //! but mis-parses cannot agree. The sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best; ratios are ours/reference by wall time; the
 //! verdict is the worst. Arguments filter workloads.
+//!
+//! The fastest in the field is timed beside it: ICU4C's `DecimalFormat::parse`
+//! (strict, the system libicu via `tools/icu_bench/build.sh`; needs g++ and
+//! libicu-dev, `BENCH_ICU=0` skips it), over the same files and with the same
+//! `count`, so it must agree with Babel too. The card's `fastest` figure is
+//! ours / min(Babel, ICU) per workload, worst over the workloads.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -37,6 +43,8 @@ const numparse = @import("numparse");
 const bench_name = "bench-numparse";
 const work_dir = ".zig-cache/bench-numparse";
 const ref_script = "modules/numparse/tools/bench_ref.py";
+const icu_build = "modules/numparse/tools/icu_bench/build.sh";
+const icu_exe = "modules/numparse/tools/icu_bench/target/icu_bench";
 const lines_per_op = 1000;
 
 const Work = struct { name: []const u8, locale: []const u8, native: bool = false };
@@ -189,6 +197,18 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk std.mem.trim(u8, r.stdout, " \n");
     };
 
+    const use_icu = if (init.environ_map.get("BENCH_ICU")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_icu) {
+        const r = std.process.run(arena, io, .{ .argv = &.{ "bash", icu_build } }) catch |e| {
+            std.debug.print("{s}: could not run {s} ({t}) -- BENCH_ICU=0 skips the ICU side\n", .{ bench_name, icu_build, e });
+            return 1;
+        };
+        if (r.term != .exited or r.term.exited != 0) {
+            std.debug.print("{s}: ICU side build failed:\n{s}\n", .{ bench_name, r.stderr });
+            return 1;
+        }
+    }
+
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -196,16 +216,20 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("{s:<16} {s:>13} {s:>13} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", "ref ns", "/ref", "spr us", "spr ref" });
     try w.flush();
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
     var banner: []const u8 = "";
+    var icu_banner: []const u8 = "";
     for (works, 0..) |wk, wi| {
         if (!selected(wk.name, filters)) continue;
         var ours: bench.Side = .{};
         var ref: bench.Side = .{};
+        var icu: bench.Side = .{};
         for (0..rounds) |_| {
             ref.add(try bench.foreignArgv(arena, io, bench_name, &.{ "python3", "-I", ref_script, abs, wk.name }, wk.name, &banner));
+            if (use_icu) icu.add(try bench.foreignArgv(arena, io, bench_name, &.{ icu_exe, abs, wk.name }, wk.name, &icu_banner));
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &ps, wi }, true));
         }
         const ratio = ours.best_ns / ref.best_ns;
@@ -216,18 +240,33 @@ pub fn main(init: std.process.Init) !u8 {
         mismatch = mismatch or !same;
         try w.print("{s:<16} {d:>13.0} {d:>13.0} {d:>8.4} {d:>6.1}% {d:>6.1}%  accepted {d}, digest {d}{s}\n", .{ wk.name, ours.best_ns, ref.best_ns, ratio, 100 * ours.spread(false), 100 * ref.spread(false), ours.count & 0xFFFFFFFF, ours.count >> 32, if (same) "" else " ≠ ref" });
         if (!same) try w.print("  ref accepted {d}, digest {d}\n", .{ ref.count & 0xFFFFFFFF, ref.count >> 32 });
+        if (use_icu) {
+            const fastest = @min(ref.best_ns, icu.best_ns);
+            const rf = ours.best_ns / fastest;
+            worst_fast = @max(worst_fast, rf);
+            max_spread = @max(max_spread, icu.spread(false));
+            const icu_same = icu.count == ref.count;
+            mismatch = mismatch or !icu_same;
+            try w.print("{s:<16} {s:>13} {d:>13.0} {d:>8.4} {s:>7} {d:>6.1}%  ICU{s}\n", .{ "", "", icu.best_ns, rf, "", 100 * icu.spread(false), if (icu_same) "" else " ≠ ref" });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (banner.len > 0) try w.print("reference: {s}\n", .{std.mem.trim(u8, banner, " \n")});
+    if (icu_banner.len > 0) try w.print("fastest side: {s}\n", .{std.mem.trim(u8, icu_banner, " \n")});
     if (mismatch) {
         try w.writeAll(bench_name ++ ": FAILED -- a result count differs from the reference's; the timing means nothing until it agrees\n");
         try w.flush();
         return 1;
     }
     try w.print("\nworst ours/ref = {d:.4} (best {d:.4})\n", .{ worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.4}–{d:.4}× Babel {s} parse_decimal(strict) · fastest ? (measured <today>)\n", .{ best, worst, py_ver });
+    if (use_icu) try w.print("worst ours/fastest = {d:.4}\n", .{worst_fast});
+    if (filters.len == 0) {
+        if (use_icu)
+            try w.print("card: **Performance:** ref {d:.4}–{d:.4}× Babel {s} parse_decimal(strict) · fastest {d:.3}× ICU4C DecimalFormat::parse (measured <today>)\n", .{ best, worst, py_ver, worst_fast })
+        else
+            try w.print("card: **Performance:** ref {d:.4}–{d:.4}× Babel {s} parse_decimal(strict) · fastest ? (measured <today>)\n", .{ best, worst, py_ver });
+    }
     try w.flush();
     return 0;
 }

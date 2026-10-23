@@ -70,7 +70,9 @@ pub fn parseGroupedNumber(s: []const u8, thousands_sep: u8, decimal_sep: u8) ?De
             !std.ascii.isDigit(s[i + 3])) return null;
         i += 4;
         groups += 1;
-        // A digit immediately after the group means >3 digits between separators → invalid
+        // A digit immediately after the group means >3 digits between separators → invalid.
+        // Redundant with the decimal-part check below, which refuses that digit
+        // too (mutation 2026-10-23: equivalent); kept because it states the grammar.
         if (i < s.len and std.ascii.isDigit(s[i])) return null;
     }
     if (groups == 0) return null;
@@ -84,8 +86,10 @@ pub fn parseGroupedNumber(s: []const u8, thousands_sep: u8, decimal_sep: u8) ?De
     if (i != s.len) return null;
     // Strip thousands and rewrite the decimal char to '.' into a stack
     // buffer, then re-parse with the fixed-point decimal parser. The 40-byte
-    // buffer covers any value the fixed-point range can hold (≈27 integer
-    // digits + dot + 12 fractional), far beyond what 3+N*4 digits can express.
+    // buffer holds ≈27 integer digits + dot + 12 fractional; a longer
+    // normalized string (more fraction digits, or the very edge of the range
+    // with its sign) is refused, not cut -- `parse` takes up to 96 bytes and
+    // rounds the fraction instead (review 2026-10-23).
     var buf: [40]u8 = undefined;
     var bi: usize = 0;
     for (s) |c| {
@@ -133,10 +137,13 @@ pub const Options = struct {
     /// Scientific notation on an UNGROUPED number: `1.5E3`, `2,5e-3` (`e` or
     /// `E`; CLDR's `×10^` forms are not read).
     exponent: bool = false,
-    /// A trailing percent sign, optionally after one space-like character
-    /// (`12,5 %` in cs/de/fr); the value is divided by 100.
+    /// A trailing ASCII percent sign, optionally after one space-like
+    /// character (`12,5 %` in cs/de/fr); the value is divided by 100. Native
+    /// percent signs (`٪`) and prefix percent (tr `%12`) are not read. It comes
+    /// off before a trailing minus: `5-%` is -0.05, `5%-` is refused.
     percent: bool = false,
-    /// Code point of the digit zero; the ten digits are `zero..zero+9`
+    /// Code point of a real digit zero (Unicode `Nd` with nine digits after
+    /// it); the ten digits are `zero..zero+9`
     /// (UTF-8 in the input). The default reads ASCII digits. Native digits of a
     /// numbering system (`٠`, `०`, ...) come from `localeNative`. The result is
     /// always built from ASCII digits. Digits of an exponent stay ASCII.
@@ -369,6 +376,8 @@ fn scanDigits(body: []const u8, i: *usize, zero: u21, buf: *[96]u8, n: *usize) ?
             w = std.unicode.utf8ByteSequenceLength(body[i.*]) catch break;
             if (i.* + w > body.len) break;
             const cp = std.unicode.utf8Decode(body[i.*..][0..w]) catch break;
+            // `zero + 10` admitted by mistake would still be refused: it maps to
+            // ':', which `Decimal.parse` rejects (mutation 2026-10-23: equivalent).
             if (cp < zero or cp > @as(u21, zero) + 9) break;
             d = '0' + @as(u8, @intCast(cp - zero));
         }
@@ -539,6 +548,13 @@ test "parse: native digits (ungrouped agree with Babel; grouped are ours alone)"
     try expectParse(null, "\u{0661}\u{066A}", ar);
     try expectParse(null, "\u{0661}\xD9", ar); // truncated sequence
     try expectParse(null, "\u{0661}\xFF\xFF", ar); // invalid UTF-8
+    // Overlong forms, a surrogate, a lone continuation byte, a cut astral
+    // sequence: each ends the digit run, never decodes to a digit (review 2026-10-23).
+    for ([_][]const u8{ "\xC0\xA0", "\xE0\x80\xB1", "\xED\xA0\x80", "\x80", "\xF0\x9E\xA5" }) |bad| {
+        var b: [16]u8 = undefined;
+        const s = try std.mem.print(&b, "\u{0661}{s}", .{bad});
+        try expectParse(null, s, ar);
+    }
     // Devanagari with Indian grouping (ne: `,` group): 12,34,567.
     const ne = localeNative("ne").?;
     try testing.expectEqual(@as(u21, 0x966), ne.zero);
@@ -647,6 +663,10 @@ test "parse: signs, accounting negatives, percent and exponent" {
     try expectParse("0.125", "12,5%", cs);
     try expectParse("12.34567", "1\u{00A0}234,567\u{00A0}%", cs);
     try expectParse(null, "12,5 %", locale("cs").?); // percent off
+    // ONE space-like character before the sign, not a run of them
+    // (mutation 2026-10-23: stripping every one survived).
+    try expectParse(null, "12,5\u{00A0}\u{00A0}%", cs);
+    try expectParse(null, "12,5\u{00A0} %", cs); // NBSP then space: the strip order
 
     o = .{ .exponent = true };
     try expectParse("1500", "1.5E3", o);
@@ -657,9 +677,20 @@ test "parse: signs, accounting negatives, percent and exponent" {
     // An exponent long enough to overflow i64 is refused by the digit cap,
     // not accumulated (mutation 2026-10-04: without the cap this panicked).
     try expectParse(null, "1E" ++ strRepeat("9", 25), o);
+    // The cap counts digits, leading zeros included: four are read, a fifth
+    // is refused (mutation 2026-10-23: a cap of five survived).
+    try expectParse("1500", "1.5E0003", o);
+    try expectParse(null, "1.5E00003", o);
     try expectParse(null, "1.5E3", .{}); // off by default
     o.percent = true;
     try expectParse("15", "1.5E3%", o); // the percent folds into the exponent
+
+    // Nothing left after the strips is not a number (review 2026-10-23).
+    const all: Options = .{ .parentheses = true, .trailing_minus = true, .percent = true };
+    for ([_][]const u8{ "()", "(%)", "%", " %", "-%", "-", "(-)", "()-" }) |s| try expectParse(null, s, all);
+    // Percent comes off before the trailing minus: the order is the grammar.
+    try expectParse("-0.05", "5-%", all);
+    try expectParse(null, "5%-", all);
 }
 
 test "parse: shape refusals" {
