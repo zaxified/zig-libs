@@ -340,8 +340,9 @@ fn digits(n: u32) usize {
 /// In `snippet` a tab is shown as spaces up to the next multiple of
 /// `tab_width` and carets line up for multi-byte UTF-8 by display width
 /// (`charWidth`: East Asian wide and emoji are two columns, combining marks and
-/// zero-width characters none). Lines end at `\n` (a `\r` before it is part of
-/// the break); a lone `\r`, a C0/C1 control, U+2028/U+2029, a bidirectional
+/// zero-width characters none). Lines end at `\n`; every `\r` at the end of a
+/// line (before its `\n` or at the end of the text) is part of the break, as
+/// codespan's `trim_end_matches` has it; another `\r`, a C0/C1 control, U+2028/U+2029, a bidirectional
 /// control and an invalid byte are shown as `?`; a U+FEFF is not written.
 pub fn renderOne(w: *std.Io.Writer, d: Diagnostic, opts: RenderOptions) std.Io.Writer.Error!void {
     const c: Sgr = .{ .on = opts.color };
@@ -1837,12 +1838,11 @@ fn fileFromUri(arena: std.mem.Allocator, uri: []const u8, prefix: []const u8) st
     var n: usize = 0;
     var i: usize = 0;
     while (i < rest.len) : (n += 1) {
-        if (rest[i] == '%' and i + 2 < rest.len) {
-            if (std.fmt.parseInt(u8, rest[i + 1 ..][0..2], 16)) |b| {
-                out[n] = b;
-                i += 3;
-                continue;
-            } else |_| {}
+        // Two hex digits exactly: `parseInt` alone would take a sign (`%+f`).
+        if (rest[i] == '%' and i + 2 < rest.len and std.ascii.isHex(rest[i + 1]) and std.ascii.isHex(rest[i + 2])) {
+            out[n] = std.fmt.parseInt(u8, rest[i + 1 ..][0..2], 16) catch unreachable;
+            i += 3;
+            continue;
         }
         out[n] = rest[i];
         i += 1;

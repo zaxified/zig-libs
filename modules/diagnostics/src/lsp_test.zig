@@ -454,3 +454,30 @@ test "hint: short, snippet, colour, JSON and counting" {
     try testing.expectEqual(@as(usize, 2), diag.countBySeverity(.hint));
     try testing.expectEqual(@as(usize, 0), diag.countBySeverity(.info));
 }
+
+test "fromLsp: a percent escape is exactly two hex digits (no sign)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try parse(a,
+        \\{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}},"message":"m",
+        \\"relatedInformation":[{"location":{"uri":"file:///a%+fb%-0c%41","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":0}}},"message":"r"}]}
+    );
+    const d = try dg.fromLsp(a, v, null, &.{}, .utf16, .{});
+    try testing.expectEqualStrings("/a%+fb%-0cA", d.labels.?[0].file.?);
+}
+
+test "writeLsp and writeJson: invalid UTF-8 in finding text still gives valid JSON" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const d: dg.Diagnostic = .{ .path = "p\xff", .file = "f", .line = 1, .col = 1, .severity = .@"error", .code = "c\xc2", .message = "bad \xff\xfe key" };
+    var out: std.Io.Writer.Allocating = .init(a);
+    try dg.writeLsp(&out.writer, d, &.{}, .utf16, .{});
+    try testing.expect(std.unicode.utf8ValidateSlice(out.written()));
+    _ = try parse(a, out.written());
+    var out2: std.Io.Writer.Allocating = .init(a);
+    try dg.writeJsonSlice(&out2.writer, &.{d});
+    try testing.expect(std.unicode.utf8ValidateSlice(out2.written()));
+    _ = try parse(a, out2.written());
+}

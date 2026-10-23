@@ -113,6 +113,12 @@ code URL written raw).
 
 ## Backlog / deferred
 
+**From the 2026-10-23 review (LOW, no promise broken):** (a) `end_col` without `end_line` is ignored by the
+snippet renderer (one caret) but honoured by `writeLsp`, and a span with `line` but no `col` is one caret at
+column 1 in the snippet but the whole line in LSP — align or document; (b) `term_width`'s margin measures a
+label message raw, so a message with control characters (printed escaped, 2–6 columns each) can place the
+window a few columns off.
+
 **S2 plan — survey 2026-10-20** (Sonnet, read-only; reference codespan-reporting 0.13.1, Apache-2.0;
 also ariadne (MIT; archived on GitHub, moved to Codeberg), miette (Apache-2.0), annotate-snippets
 (MIT OR Apache-2.0 — the table above says Apache only, wrong), LSP 3.17 metaModel):

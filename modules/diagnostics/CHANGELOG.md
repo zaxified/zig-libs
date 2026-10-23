@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — independent review of the 10-20 rewrite: `fromLsp` decoded `%+f` in a related-information
+  URI as a byte (`parseInt` takes a sign) — now exactly two hex digits; tests pin that `writeLsp`/`writeJson`
+  stay valid UTF-8 JSON for invalid finding text; trailing-CR handling documented as codespan's. Two LOW
+  layout/LSP inconsistencies to Backlog.
+
 - **2026-10-23** — **SECURITY (terminal output, LOW–MED):** the bidirectional controls U+202A–U+202E and
   U+2066–U+2069 ("Trojan Source", CVE-2021-42574) went to the terminal unchanged, in the quoted line and in
   finding text, and finding text also passed C1 controls (U+0080–U+009F), U+2028/U+2029 and bytes that are

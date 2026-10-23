@@ -154,7 +154,8 @@ unicode-width 0.2.2): East Asian wide, fullwidth and emoji are two columns,
 combining marks, ZWJ and variation selectors none, ambiguous characters one.
 `Diagnostic.col` stays a byte column; `RenderOptions.column = .char` only
 changes what the `-->` line prints (the character column; `short` always prints
-the column as given). Lines end at `\n` (`\r\n` too); a lone `\r`, any
+the column as given). Lines end at `\n` (`\r\n` too; every `\r` that ends a line is part of its
+break, as in codespan); a `\r` inside a line, any
 control character (C0 and C1), U+2028/U+2029, a bidirectional control
 (U+202A–U+202E, U+2066–U+2069) and an invalid UTF-8 byte are shown as `?` so no terminal escape can come out of a quoted line, and a BOM is
 not written. With `term_width` the lines of a file are cut by one window chosen
