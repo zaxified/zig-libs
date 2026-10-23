@@ -39,7 +39,9 @@ is simply not expressible against a concrete `ResponseWriter`):
 
 - The **middleware** owns the *replay* half. On a guarded request with a valid
   key it looks the (scoped) key up in the `Store`; on a hit it writes the
-  cached status + `Content-Type` + body, stamps `Idempotent-Replayed: true`,
+  cached status + `Content-Type` + the headers the handler (or a middleware
+  inside the guard) set — `Location`, `ETag`, … — + body, stamps
+  `Idempotent-Replayed: true`,
   and short-circuits the chain — **the handler genuinely never runs** (the
   strongest guarantee, and what the hit-counter test asserts). On a miss it
   binds the scoped key to the request (`store.current(ctx.req)`) and runs the
@@ -145,8 +147,10 @@ it cannot read a record — never a second run.
 
 Provenance: clean-room from the Idempotency-Key pattern (Stripe's idempotent
 requests; `draft-ietf-httpapi-idempotency-key-header`). No third-party source
-consulted or copied; built on the sibling `ramcache`, `router` and `http`
-modules.
+copied; built on the sibling `ramcache`, `router` and `http` modules.
+`tools/lead_probe` is own tooling that runs `@node-idempotency/core` 1.1.0
+(MIT, read in full before running) as a black-box oracle; no data of it is
+committed.
 
 ## Verification
 

@@ -23,7 +23,8 @@
 //!
 //! - The **middleware** owns the *replay* half. On a guarded request carrying a
 //!   valid key it looks the key up in the `Store`; on a hit it writes the
-//!   cached status + `Content-Type` + body and short-circuits the chain — the
+//!   cached status + `Content-Type` + the headers the guarded chain set +
+//!   body and short-circuits the chain — the
 //!   handler genuinely never runs (the strongest guarantee, and what the
 //!   hit-counter test asserts). On a miss it exposes the (scoped) key via
 //!   `Store.current(req)` and runs the chain.
@@ -48,7 +49,8 @@
 //!
 //! ## What is and isn't handled
 //!
-//! Cached: completed responses (status + optional `Content-Type` + body) with
+//! Cached: completed responses (status + optional `Content-Type` + the
+//! response headers set inside the guarded chain, e.g. `Location` + body) with
 //! a TTL and a bounded, W-TinyLFU-evicting store (`ramcache`). Concurrent
 //! first-flights of the same key are handled by an **in-flight reservation**:
 //! the first request reserves the key for the duration of its handler, and a
@@ -314,6 +316,11 @@ pub const Store = struct {
     pub const Current = struct {
         key: []const u8,
         digest: [digest_len]u8,
+        /// `ctx.res.headers_len` when the middleware reserved the key: the
+        /// response headers from here on were set inside the guarded chain
+        /// and are recorded by `respond` (the ones before it belong to outer
+        /// middleware, which runs again on a replay).
+        headers_mark: usize = 0,
     };
 
     /// Release the in-flight reservation set. Call once when the store is no
@@ -463,6 +470,12 @@ pub const Store = struct {
         return store.pending.get(@intFromPtr(request));
     }
 
+    fn markHeaders(store: *Store, request: *const anyopaque, mark: usize) void {
+        lockSpin(&store.lock);
+        defer store.lock.unlock();
+        if (store.pending.getPtr(@intFromPtr(request))) |c| c.headers_mark = mark;
+    }
+
     /// Write `body` to the response with `status` and optional `content_type`,
     /// **and** record it under the key the middleware exposed for this request
     /// (`current(ctx.req)`) so a later replay of the same key returns it. When
@@ -479,8 +492,16 @@ pub const Store = struct {
     ) anyerror!void {
         ctx.res.setStatus(status);
         if (content_type) |ct| try ctx.res.setHeader("Content-Type", ct);
+        // Record BEFORE writing: once the handler has reached `respond` the
+        // side effect has run, so a write that fails (the client dropped the
+        // connection, the exact case this module exists for) must still leave
+        // the record a retry replays. Until 2026-10-23 the write came first and
+        // its error skipped the record -- the retry ran the side effect again.
+        if (store.current(ctx.req)) |c| {
+            const hs = ctx.res.headers[@min(c.headers_mark, ctx.res.headers_len)..ctx.res.headers_len];
+            store.recordWithHeaders(c.key, c.digest, status, content_type orelse "", hs, body);
+        }
         try ctx.res.writeAll(body);
-        if (store.current(ctx.req)) |c| store.record(c.key, c.digest, status, content_type orelse "", body);
     }
 
     /// Record a completed response under `key`, alongside `digest` — the
@@ -496,8 +517,17 @@ pub const Store = struct {
     /// Callable directly when a handler does not use `respond` -- pair with
     /// `current(ctx.req)` for the key and matching fingerprint.
     pub fn record(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) void {
+        store.recordWithHeaders(key, digest, status, content_type, &.{}, body);
+    }
+
+    /// `record` plus response headers to replay (what `respond` passes: the
+    /// ones the guarded chain set). Headers that describe one transfer rather
+    /// than the response -- `Content-Type` (recorded on its own),
+    /// `Content-Length`, `Transfer-Encoding`, `Content-Encoding`, `Trailer`,
+    /// `Connection`, `Keep-Alive`, `Upgrade`, `Date` -- are left out.
+    pub fn recordWithHeaders(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, headers: []const http.Header, body: []const u8) void {
         const a = store.alloc();
-        const blob = encode(a, digest, status, content_type, body) catch return;
+        const blob = encode(a, digest, status, content_type, headers, body) catch return;
         defer a.free(blob);
         const now = store.clock.now();
         if (store.backend) |b| return b.vtable.put(b.ptr, key, blob, now, store.ttl_ns);
@@ -516,16 +546,66 @@ pub const RecordedResponse = struct {
     status: u16,
     content_type: []const u8,
     body: []const u8,
+    /// The recorded headers, encoded; walk them with `headerIterator`.
+    headers: []const u8 = "",
+
+    pub fn headerIterator(rec: *const RecordedResponse) HeaderIterator {
+        return .{ .rest = rec.headers };
+    }
+
+    pub const HeaderIterator = struct {
+        rest: []const u8,
+
+        /// `decode` validated the block, so every entry is whole.
+        pub fn next(it: *HeaderIterator) ?http.Header {
+            if (it.rest.len == 0) return null;
+            const nl = std.mem.readInt(u16, it.rest[0..2], .big);
+            const vl = std.mem.readInt(u16, it.rest[2..4], .big);
+            const h: http.Header = .{ .name = it.rest[4..][0..nl], .value = it.rest[4 + nl ..][0..vl] };
+            it.rest = it.rest[4 + @as(usize, nl) + vl ..];
+            return h;
+        }
+    };
 };
 
-fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) ![]u8 {
+/// Status bit 15 set: a header block follows the content type. A record
+/// without replayable headers keeps the original layout byte for byte, so
+/// records written before 2026-10-23 (and `KvBackend` files) still decode.
+const headers_flag: u16 = 0x8000;
+
+fn replayable(name: []const u8) bool {
+    const skip = [_][]const u8{ "content-type", "content-length", "transfer-encoding", "content-encoding", "trailer", "connection", "keep-alive", "upgrade", "date" };
+    for (skip) |n| if (std.ascii.eqlIgnoreCase(name, n)) return false;
+    return true;
+}
+
+fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_type: []const u8, headers: []const http.Header, body: []const u8) ![]u8 {
+    if (status & headers_flag != 0) return error.InvalidRecord;
     const ct_len = std.math.cast(u16, content_type.len) orelse return error.InvalidRecord;
-    const blob = try gpa.alloc(u8, digest_len + 4 + content_type.len + body.len);
+    var block_len: usize = 0;
+    for (headers) |h| if (replayable(h.name)) {
+        if (h.name.len > std.math.maxInt(u16) or h.value.len > std.math.maxInt(u16)) return error.InvalidRecord;
+        block_len += 4 + h.name.len + h.value.len;
+    };
+    const hdr_part: usize = if (block_len == 0) 0 else 4 + block_len;
+    const blob = try gpa.alloc(u8, digest_len + 4 + content_type.len + hdr_part + body.len);
     @memcpy(blob[0..digest_len], &digest);
-    std.mem.writeInt(u16, blob[digest_len..][0..2], status, .big);
+    std.mem.writeInt(u16, blob[digest_len..][0..2], if (block_len == 0) status else status | headers_flag, .big);
     std.mem.writeInt(u16, blob[digest_len + 2 ..][0..2], ct_len, .big);
     @memcpy(blob[digest_len + 4 ..][0..content_type.len], content_type);
-    @memcpy(blob[digest_len + 4 + content_type.len ..], body);
+    var at = digest_len + 4 + content_type.len;
+    if (block_len != 0) {
+        std.mem.writeInt(u32, blob[at..][0..4], std.math.cast(u32, block_len) orelse return error.InvalidRecord, .big);
+        at += 4;
+        for (headers) |h| if (replayable(h.name)) {
+            std.mem.writeInt(u16, blob[at..][0..2], @intCast(h.name.len), .big);
+            std.mem.writeInt(u16, blob[at + 2 ..][0..2], @intCast(h.value.len), .big);
+            @memcpy(blob[at + 4 ..][0..h.name.len], h.name);
+            @memcpy(blob[at + 4 + h.name.len ..][0..h.value.len], h.value);
+            at += 4 + h.name.len + h.value.len;
+        };
+    }
+    @memcpy(blob[at..], body);
     return blob;
 }
 
@@ -535,14 +615,33 @@ pub fn decode(blob: []const u8) ?RecordedResponse {
     if (blob.len < digest_len + 4) return null;
     var digest: [digest_len]u8 = undefined;
     @memcpy(&digest, blob[0..digest_len]);
-    const status = std.mem.readInt(u16, blob[digest_len..][0..2], .big);
+    const raw_status = std.mem.readInt(u16, blob[digest_len..][0..2], .big);
     const ct_len = std.mem.readInt(u16, blob[digest_len + 2 ..][0..2], .big);
-    if (digest_len + 4 + @as(usize, ct_len) > blob.len) return null;
+    var at = digest_len + 4 + @as(usize, ct_len);
+    if (at > blob.len) return null;
+    const content_type = blob[digest_len + 4 ..][0..ct_len];
+    var headers: []const u8 = "";
+    if (raw_status & headers_flag != 0) {
+        if (blob.len - at < 4) return null;
+        const block_len = std.mem.readInt(u32, blob[at..][0..4], .big);
+        at += 4;
+        if (block_len == 0 or blob.len - at < block_len) return null;
+        headers = blob[at..][0..block_len];
+        at += block_len;
+        var rest = headers;
+        while (rest.len != 0) {
+            if (rest.len < 4) return null;
+            const n = 4 + @as(usize, std.mem.readInt(u16, rest[0..2], .big)) + std.mem.readInt(u16, rest[2..4], .big);
+            if (n > rest.len) return null;
+            rest = rest[n..];
+        }
+    }
     return .{
         .digest = digest,
-        .status = status,
-        .content_type = blob[digest_len + 4 ..][0..ct_len],
-        .body = blob[digest_len + 4 + ct_len ..],
+        .status = raw_status & ~headers_flag,
+        .content_type = content_type,
+        .body = blob[at..],
+        .headers = headers,
     };
 }
 
@@ -598,8 +697,14 @@ pub const Idempotency = struct {
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const idem: *const Idempotency = @ptrCast(@alignCast(state.?));
     if (!methodGuarded(idem.options.methods, ctx.req.method)) return next.run(ctx);
-    const client_key = ctx.req.header(idem.options.header_name) orelse return next.run(ctx);
-    if (!validKey(client_key, idem.options.max_key_len)) return badRequest(ctx);
+    var fields = ctx.req.headerAll(idem.options.header_name);
+    const raw_key = fields.next() orelse return next.run(ctx);
+    // A second field line makes the value a list, not the one String the
+    // draft defines (RFC 9651 combines repeated lines): which key is meant is
+    // ambiguous, and a proxy that keeps the other one would disagree with us.
+    if (fields.next() != null) return badRequest(ctx);
+    var key_text: [max_scoped_key]u8 = undefined;
+    const client_key = parseKey(raw_key, idem.options.max_key_len, &key_text) orelse return badRequest(ctx);
 
     // A caller-scoped server whose request names no caller has nobody to
     // keep the record apart for: run it, record nothing (A1 F1).
@@ -652,7 +757,9 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // One atomic step: replay a completed response, flag a body-fingerprint
     // mismatch, reject a concurrent in-flight duplicate (409), or reserve
     // this key and run the handler.
-    switch (try idem.store.begin(scoped, digest, ctx.req, idem.store.alloc())) {
+    const begun = try idem.store.begin(scoped, digest, ctx.req, idem.store.alloc());
+    if (begun == .reserved) idem.store.markHeaders(ctx.req, ctx.res.headers_len);
+    switch (begun) {
         .replay => |blob| {
             // A hit writes the recorded response and short-circuits the chain,
             // so the handler never runs.
@@ -668,6 +775,8 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
             // length.
             if (rec.content_type.len != 0)
                 try ctx.res.setHeader("Content-Type", rec.content_type);
+            var hs = rec.headerIterator();
+            while (hs.next()) |h| try ctx.res.setHeader(h.name, h.value);
             if (idem.options.replay_header.len != 0)
                 try ctx.res.setHeader(idem.options.replay_header, "true");
             try ctx.res.writeAll(rec.body); // writeAll copies, so freeing blob after is safe
@@ -721,6 +830,37 @@ pub fn validKey(v: []const u8, max_len: usize) bool {
         if (c <= ' ' or c >= 0x7f) return false;
     }
     return true;
+}
+
+/// The client key an `Idempotency-Key` field value names, or null when it
+/// names none (answer 400). The draft (rev 07 §2) defines the value as an
+/// RFC 9651 sf-string -- `"8e03978e-40d5-43e8-bc93-6894a57f9324"` -- and
+/// Stripe sends the bare token; both are accepted, and both spellings of one
+/// key are one key (the quotes and escapes are not part of it). A quoted key
+/// may hold spaces (sf-string allows %x20-7E); a bare one must pass
+/// `validKey`. Parameters after the string are refused. `buf` holds an
+/// unescaped key, which can be no longer than `max_len`.
+pub fn parseKey(raw: []const u8, max_len: usize, buf: []u8) ?[]const u8 {
+    if (raw.len == 0 or raw[0] != '"') return if (validKey(raw, max_len)) raw else null;
+    var n: usize = 0;
+    var i: usize = 1;
+    while (i < raw.len) : (i += 1) {
+        var c = raw[i];
+        if (c == '"') {
+            if (i + 1 != raw.len or n == 0) return null; // trailing bytes / ""
+            return buf[0..n];
+        }
+        if (c == '\\') {
+            i += 1;
+            if (i == raw.len) return null;
+            c = raw[i];
+            if (c != '"' and c != '\\') return null;
+        } else if (c < 0x20 or c > 0x7e) return null;
+        if (n == max_len or n == buf.len) return null;
+        buf[n] = c;
+        n += 1;
+    }
+    return null; // no closing quote
 }
 
 /// Build the scoped cache key into `buf`, or null when it would overflow.
@@ -920,6 +1060,187 @@ test "first key runs the handler once; replay returns the cached response withou
     try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
     try testing.expectEqualStrings("application/json", headerValue(replay, "Content-Type").?);
     try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+// ── review additions (2026-10-23) ───────────────────────────────────────────
+
+fn idemRouter(r: *router.Router, idem: *Idempotency, app: *App, h: router.Handler) !void {
+    r.state = app;
+    try r.use(idem.middleware());
+    try r.post("/orders", h);
+}
+
+fn hBig(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    const body: [6000]u8 = @splat('z');
+    try app.store.respond(ctx, 201, "text/plain", &body);
+}
+
+test "respond records before it writes: a write that fails still leaves the record the retry replays" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hBig);
+
+    // 6000 bytes overflow the 4 KiB response buffer, so `writeAll` flushes
+    // into a 64-byte connection: the write fails mid-body, after the side
+    // effect. Kills: the record after the write.
+    var tiny: [64]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "big-1"), &tiny);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+
+    var b: [8192]u8 = undefined;
+    const replay = runWire(&r, reqKey("POST", "/orders", "big-1"), &b);
+    try testing.expectEqualStrings("true", headerValue(replay, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+var outer_count: u32 = 0;
+
+fn outerStamp(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    outer_count += 1;
+    var buf: [16]u8 = undefined;
+    try ctx.res.setHeader("X-Outer", std.mem.print(&buf, "{d}", .{outer_count}) catch unreachable);
+    return next.run(ctx);
+}
+
+fn hLocation(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    try ctx.res.setHeader("Location", "/orders/1");
+    try ctx.res.setHeader("ETag", "\"v1\"");
+    try app.store.respond(ctx, 201, "application/json", "{}");
+}
+
+test "a replay carries the headers the guarded handler set, not the outer middleware's" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    outer_count = 0;
+    try r.use(.{ .state = null, .run = outerStamp }); // outside the guard
+    try r.use(idem.middleware());
+    try r.post("/orders", hLocation);
+
+    var b1: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "loc-1"), &b1);
+    try testing.expectEqualStrings("/orders/1", headerValue(first, "Location").?);
+    try testing.expectEqualStrings("1", headerValue(first, "X-Outer").?);
+
+    var b2: [2048]u8 = undefined;
+    const replay = runWire(&r, reqKey("POST", "/orders", "loc-1"), &b2);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    try testing.expectEqualStrings("/orders/1", headerValue(replay, "Location").?);
+    try testing.expectEqualStrings("\"v1\"", headerValue(replay, "ETag").?);
+    try testing.expectEqualStrings("application/json", headerValue(replay, "Content-Type").?);
+    // The outer middleware ran again for the replay; its old value is not
+    // replayed over the new one.
+    try testing.expectEqualStrings("2", headerValue(replay, "X-Outer").?);
+}
+
+test "the draft's sf-string key and the bare token are one key; parameters, empties and duplicates are 400" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hOrder);
+
+    var b: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "\"8e03978e\""), &b);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    const bare = runWire(&r, reqKey("POST", "/orders", "8e03978e"), &b);
+    try testing.expectEqualStrings("true", headerValue(bare, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+    // A space is fine inside quotes; an escape is unescaped.
+    _ = runWire(&r, reqKey("POST", "/orders", "\"a b\""), &b);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    _ = runWire(&r, reqKey("POST", "/orders", "\"q\\\"x\""), &b);
+    try testing.expectEqual(@as(u32, 3), app.calls);
+    for ([_][]const u8{
+        reqKey("POST", "/orders", "\"k\";p=1"),
+        reqKey("POST", "/orders", "\"\""),
+        reqKey("POST", "/orders", "\"open"),
+        reqKey("POST", "/orders", "\"bad\\x\""),
+        "POST /orders HTTP/1.1\r\nHost: t\r\nIdempotency-Key: k1\r\nIdempotency-Key: k2\r\nConnection: close\r\n\r\n",
+    }) |req| {
+        const got = runWire(&r, req, &b);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+    }
+    try testing.expectEqual(@as(u32, 3), app.calls);
+}
+
+fn hFailOnce(ctx: *router.Ctx) anyerror!void {
+    const app: *App = @ptrCast(@alignCast(ctx.state.?));
+    app.calls += 1;
+    if (app.calls == 1) return error.Boom;
+    try app.store.respond(ctx, 201, null, "done");
+}
+
+test "a handler that fails releases the reservation: the retry runs, it is not a 409" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try idemRouter(&r, &idem, &app, hFailOnce);
+
+    var b: [2048]u8 = undefined;
+    const first = runWire(&r, reqKey("POST", "/orders", "f-1"), &b);
+    try testing.expect(std.mem.startsWith(u8, first, "HTTP/1.1 500"));
+    const retry = runWire(&r, reqKey("POST", "/orders", "f-1"), &b);
+    try testing.expect(std.mem.startsWith(u8, retry, "HTTP/1.1 201"));
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    try testing.expectEqual(@as(usize, 0), store.in_flight.count());
+    // ...and its binding: a stale one would hand a later request at the same
+    // address this key, and its `respond` would record over the key's answer.
+    try testing.expectEqual(@as(usize, 0), store.pending.count());
+}
+
+test "encode keeps only replayable headers and refuses a status with bit 15; parseKey bounds" {
+    const hs = [_]http.Header{
+        .{ .name = "Date", .value = "Thu, 23 Oct 2026 00:00:00 GMT" },
+        .{ .name = "Location", .value = "/x" },
+        .{ .name = "content-length", .value = "2" },
+        .{ .name = "Connection", .value = "close" },
+    };
+    const d: [digest_len]u8 = @splat(1);
+    const blob = try encode(testing.allocator, d, 201, "text/plain", &hs, "ok");
+    defer testing.allocator.free(blob);
+    const rec = decode(blob).?;
+    var it = rec.headerIterator();
+    const only = it.next().?;
+    try testing.expectEqualStrings("Location", only.name);
+    try testing.expectEqualStrings("/x", only.value);
+    try testing.expect(it.next() == null);
+    try testing.expectEqual(@as(u16, 201), rec.status);
+    try testing.expectError(error.InvalidRecord, encode(testing.allocator, d, 0x8000 | 201, "", &.{}, ""));
+
+    var buf: [max_scoped_key]u8 = undefined;
+    const k255 = "\"" ++ @as([255]u8, @splat('k')) ++ "\"";
+    const k256 = "\"" ++ @as([256]u8, @splat('k')) ++ "\"";
+    try testing.expectEqual(@as(usize, 255), parseKey(k255, 255, &buf).?.len);
+    try testing.expect(parseKey(k256, 255, &buf) == null);
+    try testing.expect(parseKey("\"a\x01b\"", 255, &buf) == null);
+    try testing.expect(parseKey("\"a\x7fb\"", 255, &buf) == null);
+    try testing.expectEqualStrings("a b", parseKey("\"a b\"", 255, &buf).?);
 }
 
 /// Test app for the concurrent first-flight case: while its handler is still
@@ -1224,7 +1545,7 @@ test "TTL expiry: after the recorded response expires, the handler re-runs" {
 
 test "encode/decode round-trips digest, status, content-type and body" {
     const d1: [digest_len]u8 = @as([digest_len]u8, @splat(0xAB));
-    const blob = try encode(testing.allocator, d1, 201, "application/json", "{\"ok\":true}");
+    const blob = try encode(testing.allocator, d1, 201, "application/json", &.{}, "{\"ok\":true}");
     defer testing.allocator.free(blob);
     const rec = decode(blob).?;
     try testing.expectEqualSlices(u8, &d1, &rec.digest);
@@ -1235,7 +1556,7 @@ test "encode/decode round-trips digest, status, content-type and body" {
     // Empty content-type is valid; an all-zero digest is a valid bit pattern
     // too (just not one SHA-256 is expected to ever actually produce).
     const d2: [digest_len]u8 = @as([digest_len]u8, @splat(0));
-    const blob2 = try encode(testing.allocator, d2, 204, "", "");
+    const blob2 = try encode(testing.allocator, d2, 204, "", &.{}, "");
     defer testing.allocator.free(blob2);
     const rec2 = decode(blob2).?;
     try testing.expectEqualSlices(u8, &d2, &rec2.digest);
@@ -1483,12 +1804,26 @@ const FzOp = struct {
 };
 
 fn fzKeyValid(k: []const u8) bool {
-    if (k.len == 0) return false;
-    if (k.len > 255) return false;
-    for (k) |c| {
-        if (c < 0x21 or c > 0x7e) return false;
+    return fzKey(k) != null;
+}
+
+/// The model of `parseKey` over the fuzz pool (no escapes in it): a quoted
+/// key is its inside (spaces allowed, nothing after the closing quote), a
+/// bare one is printable non-space ASCII; 1..255 bytes either way.
+fn fzKey(k: []const u8) ?[]const u8 {
+    var inner = k;
+    var space_ok = false;
+    if (k.len != 0 and k[0] == '"') {
+        if (k.len < 2 or k[k.len - 1] != '"') return null;
+        inner = k[1 .. k.len - 1];
+        space_ok = true;
+        if (std.mem.findAny(u8, inner, "\\\"") != null) return null;
     }
-    return true;
+    if (inner.len == 0 or inner.len > 255) return null;
+    for (inner) |c| {
+        if (c > 0x7e or c < 0x20 or (c == ' ' and !space_ok)) return null;
+    }
+    return inner;
 }
 
 test "model-fuzz: request sequences through the middleware vs. a linear-scan model" {
@@ -1512,8 +1847,9 @@ fn fuzzSequences(comptime use_kv: bool) !void {
     const paths = [_][]const u8{ "/orders", "/refunds", "/raw" };
     const long255: [255]u8 = @splat('k');
     const long256: [256]u8 = @splat('k');
-    const keys = [_][]const u8{ "k1", "k2", "k3", "a.b_c-d~!", &long255 };
-    const bad_keys = [_][]const u8{ "bad key", &long256, "" };
+    // `"k1"` is k1 in the draft's sf-string spelling: one key, not two.
+    const keys = [_][]const u8{ "k1", "k2", "k3", "a.b_c-d~!", &long255, "\"k1\"", "\"a b\"" };
+    const bad_keys = [_][]const u8{ "bad key", &long256, "", "\"k1\";p=1", "\"\"", "\"open" };
     const x32: [fz_cap]u8 = @splat('x');
     const y32: [fz_cap]u8 = @splat('y');
     const x33: [fz_cap + 1]u8 = @splat('x');
@@ -1667,14 +2003,15 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                 }
                 if (!bypass) {
                     if (op.body.len == fz_cap) reach.too_big_at_cap_ok += 1;
-                    if (op.key.?.len == 255) reach.key255_ok += 1;
+                    const mkey = fzKey(op.key.?).?;
+                    if (mkey.len == 255) reach.key255_ok += 1;
                     // Find a live record that matches this request's scope.
                     var found: ?usize = null;
                     var i: usize = 0;
                     while (i < recs.items.len) : (i += 1) {
                         const rec = recs.items[i];
                         if (!std.mem.eql(u8, rec.caller, who)) continue;
-                        if (!std.mem.eql(u8, rec.key, op.key.?)) continue;
+                        if (!std.mem.eql(u8, rec.key, mkey)) continue;
                         if (!key_only and (rec.method != op.method or rec.path != op.path)) continue;
                         found = i;
                         break;
@@ -1707,7 +2044,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                     }
                     // Miss: classify what kept an existing record from matching.
                     for (recs.items) |rec| {
-                        if (!std.mem.eql(u8, rec.key, op.key.?)) continue;
+                        if (!std.mem.eql(u8, rec.key, mkey)) continue;
                         if (std.mem.eql(u8, rec.caller, who) and !key_only and (rec.method != op.method or rec.path != op.path))
                             reach.target_isolated_miss += 1;
                         if (!std.mem.eql(u8, rec.caller, who) and (key_only or (rec.method == op.method and rec.path == op.path)))
@@ -1736,7 +2073,7 @@ fn fuzzSequences(comptime use_kv: bool) !void {
                         .caller = who,
                         .method = op.method,
                         .path = op.path,
-                        .key = try testing.allocator.dupe(u8, op.key.?),
+                        .key = try testing.allocator.dupe(u8, fzKey(op.key.?).?),
                         .req_body = try testing.allocator.dupe(u8, op.body),
                         .status = want_status,
                         .ct = ct,
@@ -1839,38 +2176,96 @@ test "model-fuzz: validKey, scopeKey, principalTag and decode vs. models on rand
         }
         try testing.expectEqualStrings(&want_tag, tag);
 
-        // decode: build a blob from fields (digest | status BE | ctlen BE | ct | body),
-        // then maybe truncate or corrupt the length field.
-        var blob: [200]u8 = undefined;
-        var bl: usize = 0;
+        // decode: build a blob from fields (digest | status BE | ctlen BE | ct |
+        // [block_len BE32 | (nl BE16, vl BE16, name, value)*] | body), the
+        // header block only with status bit 15, then maybe truncate or
+        // corrupt a length field.
+        var blob: [400]u8 = undefined;
         rnd.bytes(blob[0..32]);
-        const status: u16 = rnd.int(u16);
-        blob[32] = @intCast(status >> 8);
-        blob[33] = @intCast(status & 0xff);
+        const status: u16 = rnd.int(u15);
+        const with_headers = rnd.boolean();
+        const flagged = if (with_headers) status | 0x8000 else status;
+        blob[32] = @intCast(flagged >> 8);
+        blob[33] = @intCast(flagged & 0xff);
         const ctl = rnd.uintLessThan(usize, 20);
-        const bodyl = rnd.uintLessThan(usize, 40);
         blob[34] = @intCast(ctl >> 8);
         blob[35] = @intCast(ctl & 0xff);
-        rnd.bytes(blob[36 .. 36 + ctl + bodyl]);
-        bl = 36 + ctl + bodyl;
-        switch (rnd.uintLessThan(u8, 4)) {
+        rnd.bytes(blob[36..][0..ctl]);
+        var at: usize = 36 + ctl;
+        var block_end: usize = at; // where the body starts
+        var block_len: usize = 0;
+        var n_headers: usize = 0;
+        var bounds: [5]usize = undefined; // block offsets where an entry ends
+        if (with_headers) {
+            n_headers = 1 + rnd.uintLessThan(usize, 4);
+            var q = at + 4;
+            for (0..n_headers) |k| {
+                const nl = rnd.uintLessThan(usize, 12);
+                const vl = rnd.uintLessThan(usize, 20);
+                std.mem.writeInt(u16, blob[q..][0..2], @intCast(nl), .big);
+                std.mem.writeInt(u16, blob[q + 2 ..][0..2], @intCast(vl), .big);
+                rnd.bytes(blob[q + 4 ..][0 .. nl + vl]);
+                q += 4 + nl + vl;
+                bounds[k] = q - at - 4;
+            }
+            block_len = q - at - 4;
+            std.mem.writeInt(u32, blob[at..][0..4], @intCast(block_len), .big);
+            block_end = q;
+        }
+        const bodyl = rnd.uintLessThan(usize, 40);
+        rnd.bytes(blob[block_end..][0..bodyl]);
+        at = block_end + bodyl;
+        var bl = at;
+        var block_lie = false;
+        switch (rnd.uintLessThan(u8, 5)) {
             0 => bl = rnd.uintLessThan(usize, bl + 1), // truncate anywhere
             1 => { // claim a longer content type than present
-                const lie = ctl + bodyl + 1 + rnd.uintLessThan(usize, 5);
+                const lie = ctl + (block_end - 36 - ctl) + bodyl + 1 + rnd.uintLessThan(usize, 5);
                 blob[34] = @intCast(lie >> 8);
                 blob[35] = @intCast(lie & 0xff);
+            },
+            2 => if (with_headers) { // a block length that splits an entry
+                const off = 36 + ctl;
+                const short = rnd.uintLessThan(usize, block_len);
+                std.mem.writeInt(u32, blob[off..][0..4], @intCast(short), .big);
+                // On an entry boundary the shorter block is a valid record
+                // with fewer headers, the rest read as body.
+                block_lie = true;
+                for (bounds[0..n_headers], 0..) |e, k| if (short != 0 and e == short) {
+                    block_lie = false;
+                    n_headers = k + 1;
+                    block_end = 36 + ctl + 4 + short;
+                };
             },
             else => {},
         }
         const claimed = (@as(usize, blob[34]) << 8) | blob[35];
         const decoded = decode(blob[0..bl]);
-        if (bl >= 36 and 36 + claimed <= bl) {
+        // The model: a header block whose length is shorter than its entries
+        // never parses (the lie cuts the last entry, or claims 0).
+        const ok = bl >= 36 and 36 + claimed <= bl and claimed == ctl and
+            (!with_headers or (!block_lie and bl >= block_end));
+        const ok_v1 = !with_headers and bl >= 36 and 36 + claimed <= bl;
+        if (ok or ok_v1) {
             dec_ok += 1;
             const d = decoded.?;
             try testing.expectEqualSlices(u8, blob[0..32], &d.digest);
             try testing.expectEqual(status, d.status);
             try testing.expectEqualSlices(u8, blob[36 .. 36 + claimed], d.content_type);
-            try testing.expectEqualSlices(u8, blob[36 + claimed .. bl], d.body);
+            if (with_headers) {
+                try testing.expectEqualSlices(u8, blob[36 + ctl + 4 .. block_end], d.headers);
+                var it = d.headerIterator();
+                var seen: usize = 0;
+                while (it.next()) |_| seen += 1;
+                try testing.expectEqual(n_headers, seen);
+                try testing.expectEqualSlices(u8, blob[block_end..bl], d.body);
+            } else {
+                try testing.expectEqualSlices(u8, blob[36 + claimed .. bl], d.body);
+            }
+        } else if (with_headers and claimed != ctl) {
+            // A lied content-type length moves where the block is read
+            // from: whatever decode answers, it must stay inside the blob.
+            if (decoded) |d| try testing.expect(d.body.len <= bl);
         } else {
             dec_null += 1;
             try testing.expect(decoded == null);

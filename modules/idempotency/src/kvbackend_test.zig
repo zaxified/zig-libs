@@ -96,12 +96,16 @@ test "KvBackend: a concurrent first-flight is 409 until released; a lease hands 
     // Released without a record: the next request runs.
     try testing.expect((try store.begin("k", digest_a, null, testing.allocator)) == .reserved);
 
-    // Lease: no takeover before it runs out, takeover after.
+    // Lease: no takeover before it runs out, takeover the instant it does
+    // (age == lease), and the taker holds a fresh lease: a third request
+    // right after is 409, not a second takeover (two runs at once).
     store.lease_ns = 500;
     clk.now += 499;
     try testing.expect((try store.begin("k", digest_a, null, testing.allocator)) == .in_flight);
-    clk.now += 2;
+    clk.now += 1;
     try testing.expect((try store.begin("k", digest_a, null, testing.allocator)) == .reserved);
+    clk.now += 1;
+    try testing.expect((try store.begin("k", digest_a, null, testing.allocator)) == .in_flight);
     store.finish("k", null);
     try testing.expectEqual(@as(usize, 0), kb.in_flight.count());
 }
