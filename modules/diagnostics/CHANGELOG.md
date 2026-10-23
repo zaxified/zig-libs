@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-23** — **Card: grade 1** (S1 E1 A1 H– P1): `**Ahead:**` line (codespan-reporting 0.13.1 writes 16
+  raw ESC/BEL/U+202E characters of a hostile key name to the terminal, ours none; `interop-diagnostics --lead`),
+  re-audit over the current source (review + 50 schemata mutants, 47 killed, 3 equivalent; 8 new edge tests).
+
 - **2026-10-23** — independent review of the 10-20 rewrite: `fromLsp` decoded `%+f` in a related-information
   URI as a byte (`parseInt` takes a sign) — now exactly two hex digits; tests pin that `writeLsp`/`writeJson`
   stay valid UTF-8 JSON for invalid finding text; trailing-CR handling documented as codespan's. Two LOW
