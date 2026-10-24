@@ -211,6 +211,16 @@ const json_max_checks = 256;
 /// escaped; a name that is not valid UTF-8 has every byte >= 0x80 written as
 /// `\u00XX` so the document stays valid JSON.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    // A plain ASCII name (the usual "database", "cache") needs no escape:
+    // one write instead of a call per byte (2026-10-24: the per-byte path was
+    // most of a 3-check JSON readiness probe, 1.28x fiber's healthcheck).
+    for (s) |c| {
+        if (c < 0x20 or c >= 0x7f or c == '"' or c == '\\') break;
+    } else {
+        try w.writeByte('"');
+        try w.writeAll(s);
+        return w.writeByte('"');
+    }
     const utf8 = std.unicode.utf8ValidateSlice(s);
     try w.writeByte('"');
     for (s) |c| {
@@ -617,6 +627,29 @@ test "readiness: each check is evaluated exactly once per probe" {
     try testing.expect(std.mem.startsWith(u8, down, "HTTP/1.1 503"));
     try testing.expectEqualStrings("not ready: a\nnot ready: b\n", bodyOf(down));
     try testing.expectEqual(@as(usize, 2), eval_count);
+}
+
+test "non-probe methods on a probe path reach the app and run no check (the reference runs every check)" {
+    // alexliesenfeld/health v0.8.1's handler never reads the method, so a
+    // POST or DELETE to its path runs every dependency check (tools/lead_probe).
+    var checks = [_]Check{.{ .name = "a", .checkFn = countingFailingCheck }};
+    var h = Health{ .checks = &checks };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(h.middleware());
+    try r.post("/readyz", hApp);
+    try r.delete("/readyz", hApp);
+
+    var buf: [1024]u8 = undefined;
+    eval_count = 0;
+    for ([_][]const u8{ "POST", "DELETE" }) |m| {
+        var req_buf: [128]u8 = undefined;
+        const req = try std.mem.print(&req_buf, "{s} /readyz HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{m});
+        const got = runWire(&r, req, &buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+        try testing.expectEqualStrings("app", bodyOf(got));
+    }
+    try testing.expectEqual(@as(usize, 0), eval_count);
 }
 
 test "readiness: detail=false keeps the status but not the dependency names" {

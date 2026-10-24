@@ -47,8 +47,10 @@ Provenance: clean-room from the documented Kubernetes liveness/readiness probe
 model and the conventional `/healthz`–`/readyz` endpoints. The opt-in JSON
 body (2026-10-11) takes its *shape* from alexliesenfeld/health v0.8.1 (MIT),
 read for its output format only; no code copied. The comparative benchmark
-under `tools/` (`bench.zig` and its `go_bench/` reference side, 2026-10-11) is
-our own tooling; it drives the reference only through its public API.
+under `tools/` (`bench.zig`, its `go_bench/` reference side, 2026-10-11, and its
+`go_fast_bench/` gofiber/fiber side, 2026-10-24) and the `lead_probe/` behaviour
+probe of the reference (2026-10-24) are our own tooling; they drive the other
+implementations only through their public APIs.
 
 ## Verification
 
