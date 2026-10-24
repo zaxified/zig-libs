@@ -1271,8 +1271,8 @@ stun	ReleaseFast	ltkey	1	0	e8d3196d3d70b4db	f48e64fbf4283df1
 # (8 in-file before idhex: std.fmt.bytesToHex's table index, then 6 from
 # std.fmt.hexToBytes on the presented = secret token); newid: the session-id
 # bytes through idhex.encode (what Manager.newId runs on its draw).
-sessions	ReleaseFast	csrf	1	0	dbc512f165ae4d1d	f2cf7c06791be126
-sessions	ReleaseFast	newid	1	0	fae23c13b3adfa40	7a197b81f402a7ea
+sessions	ReleaseFast	csrf	1	0	d251759a8bfeaa88	f2cf7c06791be126
+sessions	ReleaseFast	newid	1	0	0ef09fb575a2a1f0	7a197b81f402a7ea
 # mqtt (2026-10-09) — CONNECT password + 5.0 authentication data tainted
 # through encodePacket (CONNECT 3.1.1/5.0, AUTH) and, as wire bytes only,
 # through decodePacket. The codec copies/slices them and nothing else.

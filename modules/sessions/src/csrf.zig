@@ -62,7 +62,14 @@ pub const Csrf = struct {
     /// Query-parameter fallback name (also the conventional hidden-form-field
     /// name apps use with `verify`). Taken verbatim (not percent-decoded).
     form_field: []const u8 = default_form_field,
-    /// Session cookie whose value is the HMAC message.
+    /// Session cookie whose value is the HMAC message. Must be the sessions
+    /// `Options.cookie_name` (a `__Host-session` there needs it here too, or
+    /// every guarded request is refused). The token binds to the cookie's
+    /// VALUE, whatever session it names: a safe request carrying any cookie
+    /// value gets a token for it. That hands an attacker nothing new — a
+    /// cookie-injecting attacker gets a valid pair for a real session of his
+    /// own by visiting normally; the defence against injected cookies is the
+    /// `__Host-` prefix on both cookies.
     session_cookie: []const u8 = default_session_cookie,
     /// `SameSite` for the token cookie.
     same_site: cookies.SameSite = .lax,
@@ -617,6 +624,15 @@ test "verify: a token must be exactly 64 hex digits — a prefix of the right on
     try testing.expect(c.verify("sid", tok)); // control
     try testing.expect(!c.verify("sid", tok[0 .. tok.len - 2]));
     try testing.expect(!c.verify("sid", tok[0..2]));
+    // ...and a longer one fails too: the decode reads only the first 64
+    // digits, so without the length check `tok ++ "00"` verified in
+    // ReleaseFast (mutation survivor, judged 2026-10-24).
+    var long: [token_hex_len + 2]u8 = undefined;
+    @memcpy(long[0..token_hex_len], tok);
+    for ([_][]const u8{ "00", "zz" }) |tail| {
+        @memcpy(long[token_hex_len..], tail);
+        try testing.expect(!c.verify("sid", &long));
+    }
 }
 
 test "Csrf.presented: an empty header falls back to the query; an empty or look-alike query is absent" {

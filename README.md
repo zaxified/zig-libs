@@ -393,7 +393,7 @@ way to recognise it.
 | [`router`](modules/router/README.md) | 2 (S,A,P) | REST routing, go-chi/chi parity — trie matcher ({name}, in-segment, regexp, wildcard), middleware, groups/mount, host routing, 404/405 | any | http, regex |
 | [`saml`](modules/saml/README.md) | 3 (S,E,H,P) | SAML 2.0 SSO **service-provider** — XSW-hardened Response verification against an IdP key, AuthnRequest builder, SP-metadata generator, IdP-metadata parser, multi-key IdP rollover; decrypts `EncryptedAssertion` via `xmlenc` | any | xmldsig, xml, xmlenc, rsa, x509, datefmt |
 | [`security-headers`](modules/security-headers/README.md) | 2 (S,A,P) | Secure-by-default response headers (HSTS/CSP/nosniff/frame/referrer/COOP/CORP) | any | router, http |
-| [`sessions`](modules/sessions/README.md) | 2 (S,A,P) | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy, kv |
+| [`sessions`](modules/sessions/README.md) | 1 | Server-side web sessions + OWASP-hardened cookies + signed double-submit CSRF middleware | any | router, http, cookies, ramcache, entropy, kv |
 | [`staticfiles`](modules/staticfiles/README.md) | 2 (S,E,A,P) | Path-traversal-safe static file handler over `http` — MIME by extension, ETag/conditional 304, byte-range 206/416; symlinks not followed, dotfiles refused by default | any | http |
 | [`throttle`](modules/throttle/README.md) | 3 (S,P) | Global concurrency limit + load-shedding → 503 | posix | router, http |
 | [`tracecontext`](modules/tracecontext/README.md) | 2 (S,E,A,P) | W3C Trace Context — `traceparent`/`tracestate` parse + generate + propagation middleware (child span per hop) for distributed tracing | any | router, http |

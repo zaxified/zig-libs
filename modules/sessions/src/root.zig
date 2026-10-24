@@ -217,10 +217,12 @@ fn realtimeNowNs(_: ?*anyopaque) i64 {
 pub const StoreError = error{OutOfMemory};
 
 /// The generation (version) a store keeps per key for optimistic concurrency.
-/// **0 means "no live record"** — absent or tombstoned. Every stored record
-/// carries a generation `>= 1`, and *every* mutation (a CAS `put` or a
-/// `delete`) bumps it, so a stale writer's expected generation can never match
-/// the store again after any concurrent change to that key. This is the whole
+/// **0 means "no live record"** — the key is absent. Every stored record
+/// carries a generation `>= 1`; a CAS `put` bumps it and a `delete` removes
+/// the key, so a stale writer's expected generation (`>= 1`) can never match
+/// the store again after any concurrent data change, logout or rotation. Only
+/// `touch` (an unchanged session rolling its idle window) rewrites a record
+/// at the SAME generation, so it never makes a concurrent data write lose. This is the whole
 /// mechanism behind the cross-request resurrection defense (see `Manager.save`
 /// / `Manager.regenerate`).
 pub const Generation = u64;
@@ -258,12 +260,21 @@ pub const Store = struct {
         /// applied. This is what makes a racing `save` unable to resurrect a
         /// session another request just destroyed or rotated.
         put: *const fn (ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation,
-        /// Remove the record under `id` (idempotent) and **bump its
-        /// generation** (leaving a tombstone that remembers the new
-        /// generation) so any in-flight CAS `put` still holding the
-        /// pre-delete generation fails closed — a delete always wins over a
-        /// concurrent stale save.
+        /// Remove the record under `id` (idempotent). The key then reads as
+        /// generation 0, so any in-flight CAS `put` still holding the
+        /// pre-delete generation (`>= 1`) fails closed — a delete always wins
+        /// over a concurrent stale save. (A tombstone at "current + 1" is NOT
+        /// enough: after the live record was evicted it reuses the generation
+        /// a stale writer holds — sessions review 2026-10-24.)
         delete: *const fn (ptr: *anyopaque, id: []const u8) void,
+        /// Optional **same-generation CAS write**: store `record` under `id`
+        /// iff the store holds `expected` (`>= 1`), keeping `expected` as its
+        /// generation; true when written. `Manager` uses it for a session
+        /// whose data did not change (only `last_seen` rolls), so a racing
+        /// request's real data write still matches and is not lost. Null ⇒
+        /// `Store.touch` falls back to `put` (bumps; the pre-2026-10-24
+        /// behaviour).
+        touch: ?*const fn (ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) bool = null,
         /// Optional enumeration of every live record: call `visit(ctx, id,
         /// loaded)` for each (`loaded.record` is borrowed for the call only;
         /// `id` is the store key, which under `Options.hash_id_in_store` is
@@ -288,6 +299,11 @@ pub const Store = struct {
     pub fn delete(s: Store, id: []const u8) void {
         s.vtable.delete(s.ptr, id);
     }
+    /// Same-generation CAS write; see `VTable.touch`. Without one, a `put`.
+    pub fn touch(s: Store, id: []const u8, record: []const u8, expected: Generation) bool {
+        const f = s.vtable.touch orelse return s.put(id, record, expected) != null;
+        return f(s.ptr, id, record, expected);
+    }
     /// Enumerate the live records; see `VTable.iterate`.
     pub fn iterate(
         s: Store,
@@ -306,16 +322,15 @@ pub const Store = struct {
 /// store safe from all of `http.Server`'s connection threads at once.
 ///
 /// Optimistic concurrency: each cached value is framed as
-/// `[generation u64 LE] ++ record`. A **tombstone** is the 8-byte generation
-/// alone (no record); a live value is 8 + record bytes (a real record is
-/// always ≥ `record_header_len`, so an 8-byte value is unambiguously a
-/// tombstone). `get` reports a tombstone as absent but keeps the generation
-/// so a `delete` can be *seen* by a racing `put`. `put` is a compare-and-swap
-/// on that generation, done atomically under this store's lock. Because an
-/// absent key reads as generation 0 and every live/tombstoned record is `>= 1`,
-/// a stale `put` (whose `expected >= 1`) can never match even if the tombstone
-/// is later LRU-evicted — the delete still wins. The tombstone occupies one
-/// bounded cache slot (backstopped by `ttl_ns`) until overwritten or evicted.
+/// `[generation u64 LE] ++ record`. `put` is a compare-and-swap on that
+/// generation, done atomically under this store's lock; `delete` removes the
+/// entry. An absent key reads as generation 0 and every live record is `>= 1`,
+/// so a stale `put` (whose `expected >= 1`) can never match after a delete,
+/// nor after an eviction. Until 2026-10-24 `delete` left a tombstone at
+/// "current + 1": once the live record had been evicted that was generation 1
+/// again, and a stale save expecting 1 brought a logged-out session back.
+/// A `put` whose entry the cache did not take (ramcache drops a write on OOM)
+/// reports failure instead of a generation for a record that is not there.
 pub const RamcacheStore = struct {
     cache: *ramcache.Cache,
     /// Time source handed to `ramcache` for its own TTL bookkeeping (the
@@ -333,7 +348,7 @@ pub const RamcacheStore = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl };
+    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .touch = touchImpl };
 
     // Value framing: [generation u64 LE] ++ record.
     const gen_prefix_len = 8;
@@ -355,38 +370,45 @@ pub const RamcacheStore = struct {
         const v = self.cache.get(id, now, 0) orelse return null;
         if (v.len < gen_prefix_len) return null; // legacy/corrupt → absent
         const generation = std.mem.readInt(u64, v[0..gen_prefix_len], .little);
-        if (v.len == gen_prefix_len) return null; // tombstone → no live record
+        if (v.len == gen_prefix_len) return null; // pre-2026-10-24 tombstone → no live record
         return .{ .record = try gpa.dupe(u8, v[gen_prefix_len..]), .generation = generation };
     }
 
     fn putImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation {
         const self: *RamcacheStore = @ptrCast(@alignCast(ptr));
+        return self.writeCas(id, record, expected, expected + 1);
+    }
+
+    fn touchImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) bool {
+        const self: *RamcacheStore = @ptrCast(@alignCast(ptr));
+        if (expected == 0) return false; // nothing stored to touch
+        return self.writeCas(id, record, expected, expected) != null;
+    }
+
+    /// Write `record` at generation `next` iff the stored generation is
+    /// `expected`; `next`, or null when the CAS failed or the cache did not
+    /// take the entry.
+    fn writeCas(self: *RamcacheStore, id: []const u8, record: []const u8, expected: Generation, next: Generation) ?Generation {
         const now = self.clock.now();
         lockSpin(&self.lock);
         defer self.lock.unlock();
         // The compare of the CAS — atomic with the write below under the lock.
         if (self.currentGen(id, now) != expected) return null; // stale write dropped
-        const next: Generation = expected + 1;
         var buf: [gen_prefix_len + record_header_len + max_session_bytes]u8 = undefined;
         if (record.len > buf.len - gen_prefix_len) return null; // never in practice
         std.mem.writeInt(u64, buf[0..gen_prefix_len], next, .little);
         @memcpy(buf[gen_prefix_len..][0..record.len], record);
         self.cache.put(id, buf[0 .. gen_prefix_len + record.len], now, self.ttl_ns, 0);
+        // `put` is void and drops the write on OOM: report what actually landed.
+        if (self.currentGen(id, now) != next) return null;
         return next;
     }
 
     fn deleteImpl(ptr: *anyopaque, id: []const u8) void {
         const self: *RamcacheStore = @ptrCast(@alignCast(ptr));
-        const now = self.clock.now();
         lockSpin(&self.lock);
         defer self.lock.unlock();
-        // Tombstone at a bumped generation so a concurrent stale `put` (which
-        // holds the pre-delete generation) can no longer CAS-match — the
-        // delete wins.
-        const next: Generation = self.currentGen(id, now) + 1;
-        var tomb: [gen_prefix_len]u8 = undefined;
-        std.mem.writeInt(u64, tomb[0..gen_prefix_len], next, .little);
-        self.cache.put(id, &tomb, now, self.ttl_ns, 0);
+        _ = self.cache.remove(id); // absent ⇒ generation 0: no stale save matches
     }
 };
 
@@ -452,7 +474,7 @@ pub const KvStore = struct {
         return self.failed.load(.acquire);
     }
 
-    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .iterate = iterateImpl, .persistent = true };
+    const vtable: Store.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl, .touch = touchImpl, .iterate = iterateImpl, .persistent = true };
 
     const gen_prefix_len = 8;
     const KeyBuf = [max_prefix_len + 2 * max_id_bytes]u8;
@@ -491,6 +513,18 @@ pub const KvStore = struct {
 
     fn putImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation {
         const self: *KvStore = @ptrCast(@alignCast(ptr));
+        return self.writeCas(id, record, expected, expected + 1);
+    }
+
+    fn touchImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) bool {
+        const self: *KvStore = @ptrCast(@alignCast(ptr));
+        if (expected == 0) return false; // nothing stored to touch
+        return self.writeCas(id, record, expected, expected) != null;
+    }
+
+    /// Write `record` at generation `next` iff the stored generation is
+    /// `expected`; `next`, or null (CAS failed, closed store, `kv` error).
+    fn writeCas(self: *KvStore, id: []const u8, record: []const u8, expected: Generation, next: Generation) ?Generation {
         var kbuf: KeyBuf = undefined;
         const k = self.key(&kbuf, id) orelse return null;
         var vbuf: ValueBuf = undefined;
@@ -501,7 +535,6 @@ pub const KvStore = struct {
         // The compare of the CAS — atomic with the write below under the lock.
         const current: Generation = if (self.read(&vbuf, k)) |v| std.mem.readInt(u64, v[0..gen_prefix_len], .little) else 0;
         if (current != expected) return null; // stale write dropped
-        const next: Generation = expected + 1;
         std.mem.writeInt(u64, vbuf[0..gen_prefix_len], next, .little);
         @memcpy(vbuf[gen_prefix_len..][0..record.len], record);
         const value = vbuf[0 .. gen_prefix_len + record.len];
@@ -579,6 +612,11 @@ pub const Session = struct {
     generation: Generation = 0,
     /// Set by `revoke()` — the middleware destroys instead of saving.
     revoked: bool = false,
+    /// True after a `Manager.persist` (or `save`) that landed — a `put` OR a
+    /// same-generation `touch`. Since 2026-10-24 an unchanged session's save
+    /// keeps `generation`, so "did the generation move" no longer says
+    /// whether the save won; this does.
+    persisted: bool = false,
     /// Set by `Manager.regenerate()` — the id in this `Session` has already
     /// been rotated (the old id killed in the store) during this request.
     /// The end-of-request save is still required (it persists the record
@@ -988,8 +1026,22 @@ pub const Manager = struct {
         std.mem.writeInt(i64, buf[8..16], s.last_seen_ns, .little);
         @memcpy(buf[record_header_len..][0..s.data_len], s.data());
         var key_buf: [store_key_max]u8 = undefined;
-        const new_gen = m.store.put(m.storeKey(&key_buf, s.id()), buf[0 .. record_header_len + s.data_len], s.generation) orelse return false;
+        const k = m.storeKey(&key_buf, s.id());
+        const rec = buf[0 .. record_header_len + s.data_len];
+        // An unchanged session only rolls `last_seen`: rewrite it at the same
+        // generation, so a concurrent request of this session that DID change
+        // its data still wins its CAS (sessions review 2026-10-24: an asset
+        // request's refresh landing first made a parallel XHR's write vanish).
+        if (!s.kept and !s.regenerated and s.generation != 0) {
+            s.persisted = m.store.touch(k, rec, s.generation);
+            return s.persisted;
+        }
+        const new_gen = m.store.put(k, rec, s.generation) orelse {
+            s.persisted = false;
+            return false;
+        };
         s.generation = new_gen;
+        s.persisted = true;
         return true;
     }
 
@@ -1138,7 +1190,8 @@ pub const Manager = struct {
 
 fn maxAgeSeconds(idle_ns: i64) i64 {
     if (idle_ns <= 0) return default_absolute_timeout_ns / std.time.ns_per_s;
-    return @divTrunc(idle_ns, std.time.ns_per_s);
+    // At least 1: `Max-Age=0` would make the browser drop the cookie at once.
+    return @max(1, @divTrunc(idle_ns, std.time.ns_per_s));
 }
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
@@ -1154,7 +1207,15 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     ctx.data = &s;
     defer ctx.data = saved;
 
-    try next.run(ctx); // handler error → propagate, no save (nothing persisted)
+    // A handler error propagates without a save — except a logout the handler
+    // already asked for, which still happens: skipping it on an error (a
+    // failed render after `revoke()`) left the user logged in (fail open,
+    // sessions review 2026-10-24). A `regenerate` followed by an error loses
+    // the session (the old id is already gone, the new one unsaved): closed.
+    next.run(ctx) catch |err| {
+        if (s.revoked) m.destroy(ctx.res, s.id());
+        return err;
+    };
 
     // `s.revoked` (set by `Session.revoke()`) means the handler asked to log
     // this session out: destroy it, and — critically — do NOT also save,
@@ -1371,7 +1432,7 @@ test "cross-request race: a stale save cannot resurrect a session destroyed by a
     try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &b));
     try testing.expectEqual(a.generation, b.generation);
 
-    // A logs out — the store effect of destroy()/revoke (bumps to a tombstone).
+    // A logs out — the store effect of destroy()/revoke (removes the record).
     m.store.delete(a.id());
 
     // B's trailing save races in with its stale generation → CAS FAILS (no-op).
@@ -1380,6 +1441,120 @@ test "cross-request race: a stale save cannot resurrect a session destroyed by a
     // The session stays dead: B did not resurrect it.
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "cross-request race: a logout after the live record was EVICTED still wins over a stale save" {
+    // Sessions review 2026-10-24: `delete` wrote a tombstone at "current + 1";
+    // with the live record already evicted that was generation 1 again — the
+    // very generation the stale request held — and its save revived the
+    // logged-out session.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10_000, .absolute = 100_000 });
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("uid=7");
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    seed(&m, &s); // generation 1
+
+    var b: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &b));
+    try testing.expect(env.cache.remove(id)); // cache pressure evicts the live record
+    m.store.delete(id); // then A logs out
+    b.kept = true; // B changed its data
+    try testing.expect(!m.persist(&b));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "cross-request race: an unchanged session's refresh does not make a concurrent data write lose" {
+    // Sessions review 2026-10-24: request A (an asset, nothing changed) saved
+    // first and bumped the generation, so request B's real write (a cart, a
+    // login) failed its CAS and vanished. A refresh now keeps the generation.
+    inline for (.{ false, true }) |kv_backed| {
+        var env: if (kv_backed) KvEnv else Env = undefined;
+        if (kv_backed) try env.init() else {
+            env = Env.init();
+            env.wire();
+        }
+        defer env.deinit();
+        var m = try Manager.init(testing.allocator, env.store.store(), .{ .io = testing.io, .clock = env.clk.clock(), .idle_timeout_ns = 10_000, .absolute_timeout_ns = 100_000 });
+        var s: Session = .{};
+        m.create(&s);
+        try s.setData("cart=");
+        try testing.expect(m.persist(&s));
+        const id = try testing.allocator.dupe(u8, s.id());
+        defer testing.allocator.free(id);
+
+        var a: Session = .{};
+        var b: Session = .{};
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &a));
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &b));
+        env.clk.now_ns += 100;
+        try testing.expect(m.persist(&a)); // A: refresh only, lands first
+        try testing.expectEqual(b.generation, a.generation); // ...at the same generation
+        try testing.expect(a.persisted);
+        try b.setData("cart=book");
+        try testing.expect(m.persist(&b)); // B's write still wins its CAS
+        var l: Session = .{};
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+        try testing.expectEqualStrings("cart=book", l.data());
+        // And a refresh racing a write that landed first is the one dropped.
+        var c: Session = .{};
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &c));
+        var d: Session = .{};
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &d));
+        try d.setData("cart=pen");
+        try testing.expect(m.persist(&d));
+        try testing.expect(!m.persist(&c));
+        try testing.expect(!c.persisted);
+        try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+        try testing.expectEqualStrings("cart=pen", l.data());
+    }
+}
+
+test "Store.touch: refuses generation 0 on both stores, and falls back to put without a touch slot" {
+    // Mutation 2026-10-24: the `expected == 0` guards and the fallback were
+    // never driven -- `Manager.persist` only touches a stored session.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var kenv: KvEnv = undefined;
+    try kenv.init();
+    defer kenv.deinit();
+    const rec: [record_header_len]u8 = @splat(0);
+    const id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    for ([_]Store{ env.store.store(), kenv.store.store() }) |st| {
+        try testing.expect(!st.touch(id, &rec, 0)); // nothing stored: a touch never creates
+        try testing.expectEqual(@as(?Loaded, null), try st.get(testing.allocator, id));
+    }
+    // A store without `touch`: the fallback is a bumping put.
+    const bare: Store.VTable = .{ .get = RamcacheStore.getImpl, .put = RamcacheStore.putImpl, .delete = RamcacheStore.deleteImpl };
+    const st: Store = .{ .ptr = &env.store, .vtable = &bare };
+    const g = st.put(id, &rec, 0).?;
+    try testing.expect(st.touch(id, &rec, g));
+    const l = (try st.get(testing.allocator, id)).?;
+    defer testing.allocator.free(l.record);
+    try testing.expectEqual(g + 1, l.generation);
+    try testing.expect(!st.touch(id, &rec, g)); // and it is still a CAS
+}
+
+test "RamcacheStore: a save the cache did not take is a failed save, not a phantom generation" {
+    // `ramcache.put` is void and drops what it cannot hold (OOM, or a value
+    // larger than the whole cache): `persist` must not report a record that
+    // is not there (review 2026-10-24).
+    var cache = ramcache.Cache.init(testing.allocator, .{ .max_bytes = 32, .max_entries = 4 });
+    defer cache.deinit();
+    var clk: ManualClock = .{ .now_ns = 1000 };
+    var store: RamcacheStore = .{ .cache = &cache, .clock = clk.clock() };
+    var m = try Manager.init(testing.allocator, store.store(), .{ .io = testing.io, .clock = clk.clock() });
+    var s: Session = .{};
+    m.create(&s);
+    try s.setData("a payload that cannot fit a 32-byte cache");
+    try testing.expect(!m.persist(&s));
+    try testing.expect(!s.persisted);
 }
 
 test "cross-request race: a stale save cannot resurrect a session rotated by a concurrent regenerate" {
@@ -1538,7 +1713,11 @@ test "KvStore: sessions survive a restart of the store" {
     try testing.expectEqualStrings("uid=42", l.data());
     try testing.expectEqual(s.created_ns, l.created_ns);
     try testing.expectEqual(@as(Generation, 2), l.generation);
-    // The CAS carries on from the stored generation.
+    // The CAS carries on from the stored generation: an unchanged session's
+    // refresh keeps it, a data change bumps it.
+    try testing.expect(m.persist(&l));
+    try testing.expectEqual(@as(Generation, 2), l.generation);
+    try l.setData("uid=43");
     try testing.expect(m.persist(&l));
     try testing.expectEqual(@as(Generation, 3), l.generation);
 }
@@ -1852,7 +2031,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
 
 const App = struct {
     manager: *Manager,
-    action: enum { touch, write_big, revoke, regenerate, regenerate_only, read_only, keep, put_uid, remember, flash_set, flash_pop } = .touch,
+    action: enum { touch, write_big, revoke, revoke_then_fail, regenerate, regenerate_only, read_only, keep, put_uid, remember, flash_set, flash_pop } = .touch,
 };
 
 fn hSession(ctx: *router.Ctx) anyerror!void {
@@ -1872,6 +2051,10 @@ fn hSession(ctx: *router.Ctx) anyerror!void {
         .revoke => {
             s.revoke();
             try ctx.res.writeAll("bye");
+        },
+        .revoke_then_fail => {
+            s.revoke();
+            return error.RenderFailed; // e.g. the logout page failed to render
         },
         .regenerate => {
             app.manager.regenerate(s);
@@ -2109,6 +2292,39 @@ test "middleware: revoke expires the cookie and evicts the session" {
     try testing.expect(std.mem.find(u8, headerValue(got, "Set-Cookie").?, "Max-Age=-1") != null);
 
     // And the session is gone from the store.
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
+}
+
+test "middleware: a handler that fails after revoke() still logs the session out" {
+    // Sessions review 2026-10-24: the error path skipped the destroy, so a
+    // logout whose page failed to render left the user logged in.
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .idle = 10 * std.time.ns_per_s, .absolute = 100 * std.time.ns_per_s });
+    var app = App{ .manager = &m };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.post("/", hSession);
+    try r.post("/logout", hSession);
+
+    app.action = .touch;
+    var out0: [4096]u8 = undefined;
+    var rb0: [1024]u8 = undefined;
+    const first = runWire(&r, "POST / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out0, &rb0);
+    const id = try testing.allocator.dupe(u8, cookieId(headerValue(first, "Set-Cookie").?));
+    defer testing.allocator.free(id);
+
+    app.action = .revoke_then_fail;
+    const reqline = testing.allocator.print("POST /logout HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{id}) catch unreachable;
+    defer testing.allocator.free(reqline);
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = runWire(&r, reqline, &out, &rbody);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 500"));
     var l: Session = .{};
     try testing.expectEqual(Manager.LoadResult.absent, m.lookup(id, &l));
 }
@@ -2589,6 +2805,8 @@ test "maxAgeSeconds: a disabled idle timeout gives the absolute default, never 0
     try testing.expectEqual(@as(i64, 12 * 60 * 60), maxAgeSeconds(0));
     try testing.expectEqual(@as(i64, 12 * 60 * 60), maxAgeSeconds(-5));
     try testing.expectEqual(@as(i64, 30), maxAgeSeconds(30 * std.time.ns_per_s));
+    // A sub-second idle timeout must not round down to Max-Age=0 (review 2026-10-24).
+    try testing.expectEqual(@as(i64, 1), maxAgeSeconds(500 * std.time.ns_per_ms));
 }
 
 test "middleware: allow_insecure_cookie really drops Secure from the Set-Cookie" {
@@ -2916,9 +3134,9 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
 // { generation, record } that re-states the documented semantics on its own —
 // expiry is `now − created > absolute` or `now − last_seen > idle` (strict,
 // 0 disables), and expiry deletes; `persist` is a compare-and-swap that lands
-// iff the store's generation for the id equals the session's; `delete` bumps
-// the generation and leaves a tombstone (`RamcacheStore`) or removes the key so
-// the generation reads 0 again (`KvStore`, documented: "no tombstone"); a
+// iff the store's generation for the id equals the session's, and bumps it
+// unless the session's data did not change (a `touch` keeps it); `delete`
+// removes the key so the generation reads 0 again (both stores); a
 // `regenerate`d session is a fresh id at generation 0 carrying the old
 // `created` and data, with the old id deleted. Several handles may hold the
 // same id at different generations: two requests racing on one session.
@@ -2929,7 +3147,6 @@ const SessionModel = struct {
 
     arena: Allocator,
     map: std.StringHashMapUnmanaged(Entry) = .empty,
-    tombstones: bool,
     idle: i64,
     absolute: i64,
 
@@ -2945,7 +3162,7 @@ const SessionModel = struct {
     fn delete(md: *SessionModel, id: []const u8) !void {
         const e = try md.entry(id);
         e.rec = null;
-        e.gen = if (md.tombstones) e.gen + 1 else 0;
+        e.gen = 0;
     }
 
     const Lookup = union(enum) { absent, expired_absolute, expired_idle, loaded: struct { rec: Rec, gen: Generation } };
@@ -2964,17 +3181,18 @@ const SessionModel = struct {
         return .{ .loaded = .{ .rec = rec, .gen = e.gen } };
     }
 
-    /// The CAS: lands iff the generations match; returns the new one.
-    fn persist(md: *SessionModel, id: []const u8, expected: Generation, created: i64, now: i64, data: []const u8) !?Generation {
+    /// The CAS: lands iff the generations match; returns the new one (the
+    /// same one for an unchanged session, `bump == false`).
+    fn persist(md: *SessionModel, id: []const u8, expected: Generation, created: i64, now: i64, data: []const u8, bump: bool) !?Generation {
         const e = try md.entry(id);
         if (e.gen != expected) return null;
-        e.gen = expected + 1;
+        if (bump) e.gen = expected + 1;
         e.rec = .{ .created = created, .last_seen = now, .data = try md.arena.dupe(u8, data) };
         return e.gen;
     }
 };
 
-const ModelReach = enum { loaded, absent, expired_idle, expired_absolute, persist_won, persist_stale, regenerated, deleted, restarted };
+const ModelReach = enum { loaded, absent, expired_idle, expired_absolute, persist_won, persist_stale, touched, regenerated, deleted, restarted };
 
 fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(ModelReach).@"enum".field_names.len]usize) !void {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3001,7 +3219,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
         .absolute_timeout_ns = absolute,
     });
 
-    var md: SessionModel = .{ .arena = arena, .tombstones = !kv_backed, .idle = idle, .absolute = absolute };
+    var md: SessionModel = .{ .arena = arena, .idle = idle, .absolute = absolute };
     const handles = try testing.allocator.alloc(Session, 6);
     defer testing.allocator.free(handles);
     var live = @as([6]bool, @splat(false));
@@ -3018,7 +3236,7 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                 const n = if (rnd.uintLessThan(u8, 16) == 0) max_session_bytes else rnd.uintLessThan(usize, 64);
                 rnd.bytes(data_buf[0..n]);
                 try handles[h].setData(data_buf[0..n]);
-                const want = try md.persist(handles[h].id(), 0, handles[h].created_ns, clock_ptr.now_ns, handles[h].data());
+                const want = try md.persist(handles[h].id(), 0, handles[h].created_ns, clock_ptr.now_ns, handles[h].data(), true);
                 try testing.expect(want != null); // a fresh CSPRNG id
                 try testing.expect(m.persist(&handles[h]));
                 try testing.expectEqual(want.?, handles[h].generation);
@@ -3065,8 +3283,11 @@ fn sessionModelRun(comptime kv_backed: bool, case_seed: u64, reach: *[@typeInfo(
                     rnd.bytes(data_buf[0..n]);
                     try handles[h].setData(data_buf[0..n]);
                 }
-                const want = try md.persist(handles[h].id(), handles[h].generation, handles[h].created_ns, clock_ptr.now_ns, handles[h].data());
-                const ok = m.persist(&handles[h]);
+                const hh = &handles[h];
+                const bump = hh.kept or hh.regenerated or hh.generation == 0;
+                if (!bump) reach[@backingInt(ModelReach.touched)] += 1;
+                const want = try md.persist(hh.id(), hh.generation, hh.created_ns, clock_ptr.now_ns, hh.data(), bump);
+                const ok = m.persist(hh);
                 try testing.expectEqual(want != null, ok);
                 if (want) |g| try testing.expectEqual(g, handles[h].generation);
                 reach[@backingInt(if (ok) ModelReach.persist_won else ModelReach.persist_stale)] += 1;

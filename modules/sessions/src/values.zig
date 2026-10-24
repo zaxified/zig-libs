@@ -203,6 +203,19 @@ test "put with a key or value that points into the buffer itself" {
     try testing.expectEqualStrings("k", (try get(buf[0..len], "e")).?);
 }
 
+test "put: a key that aliases bytes the replace shifts is copied first" {
+    // Mutation 2026-10-24: dropping the key copy survived -- in the test above
+    // the aliased key sits before anything that moves. Here the key is b's
+    // VALUE ("a"), and replacing a with a value one byte longer shifts b one
+    // byte right -- b's length byte lands exactly on the key.
+    var buf: [tcap]u8 = undefined;
+    var len = try put(tcap, &buf, 0, "a", "1");
+    len = try put(tcap, &buf, len, "b", "a");
+    len = try put(tcap, &buf, len, (try get(buf[0..len], "b")).?, "12");
+    try testing.expectEqualStrings("12", (try get(buf[0..len], "a")).?);
+    try testing.expectEqualStrings("a", (try get(buf[0..len], "b")).?);
+}
+
 test "malformed blobs are errors, never a value" {
     const bad = [_][]const u8{
         &.{0x00}, // wrong tag

@@ -165,10 +165,9 @@ safe methods specially.
 A built `Manager`/`Csrf` is immutable and shared across `http.Server`'s
 connection threads. The only mutable state is the `Store`, whose default
 `RamcacheStore` serializes every cache touch behind its **own**
-`std.atomic.Mutex` (`ramcache` is single-owner). Deletion writes a
-**tombstone** rather than calling `ramcache`'s `remove`: the 8-byte bumped
-generation alone, which reads as absent but keeps the generation, so a racing
-compare-and-swap save sees the delete (a live record is always ≥ 8 + 16 bytes). Per-request `Session` state lives
+`std.atomic.Mutex` (`ramcache` is single-owner). Deletion removes the entry: an
+absent key reads as generation 0, so no racing compare-and-swap save (which
+expects `>= 1`) can bring it back, evicted or not. Per-request `Session` state lives
 on the serving thread's stack. The `Set-Cookie` value is staged in a
 **thread-local** buffer: the response writer stores header slices uncopied and
 serializes them lazily at `writeHead`, *after* the handler returns — a stack
@@ -188,7 +187,7 @@ CSRF body form-field extraction (use `Csrf.verify` from the handler instead).
 Provenance: original work of the zig-libs authors (MIT); modeled after the
 OWASP Session Management and CSRF Prevention Cheat Sheets. No third-party
 source consulted or copied; built on the sibling `router`, `http`, `cookies`,
-`ramcache`, `entropy` and `kv` modules. The comparative benchmark under `tools/` (`bench.zig` and its `go_bench/` reference side against alexedwards/scs v2.9.0, 2026-10-11) is our own tooling; it drives the reference only through its public API.
+`ramcache`, `entropy` and `kv` modules. The comparative benchmark under `tools/` (`bench.zig`, its `go_bench/` reference side against alexedwards/scs v2.9.0, 2026-10-11, and its `go_fast_bench/` gofiber/fiber v3.6.1 side, 2026-10-24) and the `lead_probe/` race probe of scs (2026-10-24) are our own tooling; they drive the other implementations only through their public APIs.
 
 ## Verification
 

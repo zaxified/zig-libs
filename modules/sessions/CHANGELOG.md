@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **SECURITY (fix):** `RamcacheStore.delete` wrote a tombstone at "current
+  generation + 1"; when the cache had already evicted the live record that was generation 1 again, and
+  a concurrent request's stale save expecting 1 brought a logged-out session back. `delete` now removes
+  the entry (absent = generation 0, which no stale save matches), as `KvStore` already did.
+  **SECURITY (fix):** a handler that called `Session.revoke()` and then returned an error skipped the
+  logout (fail open); the middleware now destroys the session on the error path too. **Behaviour
+  change (fix):** a session whose data did not change is saved with the new optional `Store.touch`
+  (same CAS, generation kept), so a concurrent request's data write is no longer the one dropped;
+  `Session.persisted` says whether a save landed (the generation no longer moves on every save — a
+  caller that compared generations, as qap's `finish` does, must switch). `RamcacheStore` reports a
+  write the cache dropped (OOM) as a failed save. `maxAgeSeconds` never rounds a sub-second idle
+  timeout to `Max-Age=0`. Docs: `Csrf.session_cookie` must equal `Options.cookie_name`; what the
+  token binds to. Test: a CSRF token longer than 64 digits is refused (mutation survivor). Tools: a gofiber/fiber v3.6.1
+  session side in the bench (`tools/go_fast_bench`, `BENCH_FAST=0` skips) and `tools/lead_probe` (scs
+  resurrects a logged-out or rotated session from a concurrent request). Grade 1.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0 (`tools/bench.zig`: `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase`). No library behaviour change.

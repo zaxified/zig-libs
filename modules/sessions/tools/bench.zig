@@ -35,6 +35,19 @@
 //! 100 ms, best of five); the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. Ratios are ours/scs by wall time; the verdict
 //! is the WORST net ratio. Arguments filter workloads.
+//!
+//! "Fastest in the field": `tools/go_fast_bench` (the `middleware/session` of
+//! gofiber/fiber v3.6.1 with its built-in in-memory storage, on fasthttp
+//! v1.75.0, driven in-process: one `fasthttp.RequestCtx`, the app's
+//! `Handler()`) is timed the same way over the same five workloads, with its
+//! own `passthrough` baseline so the verdict stays NET of the HTTP stack. Like
+//! scs it builds its own requests (the cookies come from its own sessions), so
+//! no `.wire` files are written. Not byte-identical work: gob-encoded session
+//! data, a base64url id, an extra absolute-deadline value; the source header
+//! says where. The count (status codes + Set-Cookie presence + body lengths)
+//! still agrees. A workload it cannot do (exit 3) drops the row. `BENCH_FAST=0`
+//! skips it. The card's fastest figure is ours / the cheaper net cost of
+//! {reference, fiber} per row, worst over the rows.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -48,6 +61,10 @@ const work_dir = ".zig-cache/bench-sessions";
 const go_dir = "modules/sessions/tools/go_bench";
 const ref_short = "scs";
 const ref_card = "alexedwards/scs v2.9.0 + memstore";
+
+const fast_go_dir = "modules/sessions/tools/go_fast_bench";
+const fast_name = "fiber";
+const fast_card = "gofiber/fiber v3.6.1 session + memory storage";
 
 const net_base: ?[]const u8 = "passthrough";
 const info_only = [_][]const u8{"passthrough"};
@@ -195,12 +212,19 @@ pub fn main(init: std.process.Init) !u8 {
     for (&d.rows, 0..) |*row, wi| row.* = try setupRow(arena, io, wi);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    const fast_exe = if (use_fast) try fastGoBuild(arena, io, init.environ_map, abs) else "";
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<22} {s:>11} {s:>11} {s:>8} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "gross", "net", "spr us", "spr ref" });
+    if (use_fast) try w.print("{s:<22} {s:>11} {s:>9}  net, vs cheapest (who)\n", .{ "", fast_name ++ " ns", "ours/best" });
     try w.flush();
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
+    var worst_fast_row: []const u8 = "";
+    var worst_fast_who: []const u8 = "";
+    var base_fast: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
@@ -214,8 +238,14 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var fast: bench.Side = .{};
+        // false once the contender answers "unsupported" for this workload
+        var fast_ok = use_fast;
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (fast_ok) {
+                if (try fastRun(arena, io, fast_exe, abs, name)) |r| fast.add(r) else fast_ok = false;
+            }
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const gross = ours.best_ns / go.best_ns;
@@ -242,6 +272,37 @@ pub fn main(init: std.process.Init) !u8 {
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
         try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        if (fast_ok) {
+            // net cost of each side = workload - its own `passthrough`; the
+            // cheaper of the reference and the contender is the yardstick
+            const is_base = std.mem.eql(u8, net_base.?, name);
+            const ours_cost = ours.best_ns - base_ours;
+            var fastest_cost: f64 = if (go.best_ns > base_ref) go.best_ns - base_ref else std.math.inf(f64);
+            var fastest_who: []const u8 = ref_short;
+            try w.print("{s:<22} {d:>11.0}", .{ "", fast.best_ns });
+            max_spread = @max(max_spread, fast.spread(false));
+            if (fast.count != ours.count) {
+                mismatch = true;
+                try w.print(" ({s}: {d} != ours {d})", .{ fast_name, fast.count, ours.count });
+            }
+            if (is_base) {
+                base_fast = fast.best_ns;
+            } else if (fast.best_ns > base_fast and fast.best_ns - base_fast < fastest_cost) {
+                fastest_cost = fast.best_ns - base_fast;
+                fastest_who = fast_card;
+            }
+            if (!is_base and std.math.isFinite(fastest_cost)) {
+                const ratio_fast = if (ours_cost > 0) ours_cost / fastest_cost else 0;
+                if (!info and ratio_fast > worst_fast) {
+                    worst_fast = ratio_fast;
+                    worst_fast_row = name;
+                    worst_fast_who = fastest_who;
+                }
+                try w.print(" {d:>9.3}  ({s})\n", .{ ratio_fast, fastest_who });
+            } else try w.writeAll("\n");
+        } else if (use_fast) {
+            try w.print("{s:<22} {s} unsupported: row dropped for it\n", .{ "", fast_name });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -251,8 +312,55 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_fast) try w.print("worst vs fastest = {d:.2} (row {s}, {s})\n", .{ worst_fast, worst_fast_row, worst_fast_who });
+    if (filters.len == 0) {
+        if (use_fast)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_fast_who })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
+}
+
+// ---- the "fastest in the field" side ----
+
+/// Build tools/go_fast_bench (same environment as `bench.goBuild`: local
+/// toolchain, `GOPROXY=off`, read-only modules) into `<abs>/go_fast_bench`.
+fn fastGoBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, abs: []const u8) ![]const u8 {
+    var env = try environ.clone(arena);
+    try env.put("GOTOOLCHAIN", "local");
+    try env.put("GOPROXY", "off");
+    try env.put("GOFLAGS", "-mod=readonly");
+    const exe = try arena.print("{s}/go_fast_bench", .{abs});
+    std.debug.print("{s}: building the Go fastest-in-the-field side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "go", "build", "-o", exe, "." },
+        .environ_map = &env,
+        .cwd = .{ .path = fast_go_dir },
+    }) catch |e| {
+        std.debug.print("{s}: could not run go ({t}) -- BENCH_FAST=0 skips this side\n", .{ bench_name, e });
+        return error.GoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: go build (go_fast_bench) failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.GoBuildFailed;
+    }
+    return exe;
+}
+
+/// `<exe> <work dir> <workload> <contender>` prints `name \t ns/op \t count`.
+/// Null when the contender cannot do the workload (exit 3).
+fn fastRun(arena: std.mem.Allocator, io: std.Io, exe: []const u8, abs: []const u8, name: []const u8) !?bench.Row {
+    const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, name, fast_name } });
+    if (res.term == .exited and res.term.exited == 3) return null;
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: {s} failed on {s}:\n{s}\n", .{ bench_name, fast_name, name, res.stderr });
+        return error.ForeignFailed;
+    }
+    var f = std.mem.tokenizeScalar(u8, std.mem.trimEnd(u8, res.stdout, "\n"), '\t');
+    if (!std.mem.eql(u8, f.next() orelse return error.BadForeignOutput, name)) return error.BadForeignOutput;
+    const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
+    const count = try std.fmt.parseInt(u64, f.next() orelse return error.BadForeignOutput, 10);
+    return .{ .ns = ns, .count = count };
 }
