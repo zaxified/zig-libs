@@ -14,7 +14,7 @@ const std = @import("std");
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations, compiled_ok, compiled_invalid, compiled_gave_up };
+pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations, compiled_ok, compiled_invalid, compiled_gave_up, unique_dup, unique_none };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {

@@ -76,6 +76,7 @@ const testkit = @import("testkit");
 const router = @import("router");
 const http = @import("http");
 const netaddr = @import("netaddr");
+const case_tables = @import("case_tables.zig");
 const datefmt = @import("datefmt");
 
 pub const meta = .{
@@ -155,8 +156,9 @@ pub const Matcher = struct {
 /// - `email` — practical RFC 5321 subset: dot-atom local part (1–64 chars,
 ///   no quoted strings) `@` a hostname containing a dot, ≤ 254 total.
 /// - `uri` — RFC 3986 structural check: valid scheme + only URI characters,
-///   well-formed `%XX` escapes, at most one `#`. `uri_reference` is the
-///   same without requiring a scheme ("" and relative refs are valid).
+///   well-formed `%XX` escapes, at most one `#`, `[`/`]` only around an
+///   authority's IP-literal host (IPv6, no zone, or IPvFuture). `uri_reference`
+///   is the same without requiring a scheme ("" and relative refs are valid).
 /// - `uuid` — the 8-4-4-4-12 hex shape, case-insensitive. The variant and
 ///   version nibbles are deliberately **not** checked (any hex accepted).
 /// - `ipv4` / `ipv6` — `netaddr.parseIp`, asserting the parsed family.
@@ -195,8 +197,9 @@ pub const Matcher = struct {
 ///   `[-+]?[0-9]+(\.[0-9]+)?` (`isAlpha` 1977, `isAlphanum` 1972, `isNumeric` 1962).
 /// - `ascii` — every byte below 0x80, the empty string included (`isASCII`, 636).
 /// - `lowercase` / `uppercase` — non-empty, equal to its own case mapping
-///   (`isLowercase` 3063, `isUppercase` 3077). Case mapping here covers ASCII
-///   and Latin-1; a string that is not UTF-8 fails.
+///   (`isLowercase` 3063, `isUppercase` 3077), with Go's own `unicode.ToLower`
+///   / `ToUpper` change-sets (`case_tables.zig`, Unicode 15.0.0): every script
+///   Go maps, titlecase `ǅ` neither; a string that is not UTF-8 fails.
 /// - `jwt` — three dot-separated base64url runs, the signature possibly empty
 ///   (`isJWT`, 3021; shape only, no signature or JSON check).
 /// - `semver` — semver.org 2.0.0 (regexes.go `semverRegexString`).
@@ -293,8 +296,12 @@ pub const Rule = struct {
     /// 2026-09-02.
     min_bytes: ?usize = null,
     max_bytes: ?usize = null,
-    /// One-of allow-list for strings (the JSON Schema `enum` keyword; named
-    /// `one_of` because `enum` is a Zig keyword).
+    /// One-of allow-list (the JSON Schema `enum` keyword; named `one_of`
+    /// because `enum` is a Zig keyword). Strings by text; on an `.int` /
+    /// `.float` rule the entries are JSON number texts compared by value
+    /// (go-playground `oneof=5 7 9`), and one that is no number matches
+    /// nothing. Under `.any` the entries are strings and refuse every
+    /// non-string.
     one_of: ?[]const []const u8 = null,
     pattern: ?Pattern = null,
     /// String format assertion (JSON Schema 2020-12 `format` keyword);
@@ -307,6 +314,15 @@ pub const Rule = struct {
     /// Rule applied to every element of an `.array` field (JSON Schema
     /// `items`); error paths become "field[i]".
     items: ?*const Rule = null,
+    /// The items of an array must be pairwise distinct (JSON Schema
+    /// `uniqueItems`, go-playground `unique`; code `unique_items`). Equality
+    /// is JSON's: numbers by value (`1` equals `1.0`), strings by text,
+    /// objects by their members whatever the order, arrays item by item.
+    /// Integers are exact within i128; numbers past it compare as f64 (two
+    /// spellings of one huge integer may then differ). Ignored on a value
+    /// that is not an array. The streaming paths materialize such an array,
+    /// as for `custom`.
+    unique: bool = false,
     /// Cross-field rules: this field against its siblings in the same
     /// object (go-playground's `eqfield` .. `required_without`). Evaluated
     /// when the object is complete, on the tree and the streaming path
@@ -881,6 +897,13 @@ fn intFloatOrder(a: i128, f: f64) ?std.math.Order {
 /// float (review 2026-10-24 M2: `18446744073709551615` and
 /// `18446744073709551614` were equal as f64); anything else as f64.
 fn numberOrder(x: Value, y: Value) ?std.math.Order {
+    // An integer text past i128 against a value inside the i128 range (an
+    // exact integer, or a float in [-2^127, 2^127)): the text is the larger
+    // in magnitude, so its sign decides. f64 would round both and could call
+    // them equal (review 2026-10-24: `170141183460469231731687303715884105727`
+    // == `170141183460469231731687303715884105728`).
+    if (bigIntNegative(y)) |neg| if (inI128Domain(x)) return if (neg) .gt else .lt;
+    if (bigIntNegative(x)) |neg| if (inI128Domain(y)) return if (neg) .lt else .gt;
     if (exactInt(x)) |a| {
         if (exactInt(y)) |b| return std.math.order(a, b);
         if (y == .float) return intFloatOrder(a, y.float);
@@ -896,6 +919,22 @@ fn numberOrder(x: Value, y: Value) ?std.math.Order {
         else => return null,
     };
     return std.math.order(fx, fy);
+}
+
+/// `v` is an integer text past the i128 range: is it negative? Null when it
+/// is anything else.
+fn bigIntNegative(v: Value) ?bool {
+    if (v != .number_string) return null;
+    const s = v.number_string;
+    if (!std.json.Scanner.isNumberFormattedLikeAnInteger(s) or exactInt(v) != null) return null;
+    return s.len > 0 and s[0] == '-';
+}
+
+/// An exact integer, or a float with a value in [-2^127, 2^127) -- the
+/// values `numberOrder` and `jsonHash` treat as i128.
+fn inI128Domain(v: Value) bool {
+    if (exactInt(v) != null) return true;
+    return v == .float and v.float >= -0x1p127 and v.float < 0x1p127;
 }
 
 /// An instant: whole seconds since the epoch plus the fraction digits as
@@ -1167,6 +1206,15 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 // `.number_string` reached `appendTypeError(.any)`).
                 try appendTypeError(b, path, effective);
             }
+            // go-playground's `oneof` on a number (`oneof=5 7 9`): each entry
+            // is a JSON number text, compared by value (integers exactly).
+            // ⛔ An `.int`/`.float` rule ignored `one_of` before 2026-10-24,
+            // while the schema it exported listed the entries as strings and
+            // so refused every number.
+            if (rule.one_of) |allowed| if (rule.kind != .any and numValue(v) != null and !oneOfNumber(allowed, v)) {
+                const joined = try std.mem.join(b.a(), ", ", allowed);
+                try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
+            };
         },
         .string => {
             const s = v.string;
@@ -1205,6 +1253,8 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 try b.appendf(path, "too_short", "Array should have at least {d} items", .{m});
             if (rule.max_len) |m| if (items.len > m)
                 try b.appendf(path, "too_long", "Array should have at most {d} items", .{m});
+            if (rule.unique) if (try firstDuplicate(b.a(), items)) |d|
+                try b.appendf(path, "unique_items", "Array items should be unique (items {d} and {d} are equal)", .{ d[0], d[1] });
             if (rule.items) |item_rule| {
                 for (items, 0..) |item, i| {
                     try checkRule(b, try b.indexPath(path, i), item, item_rule);
@@ -1308,6 +1358,169 @@ fn checkNotAString(b: *Builder, path: []const u8, rule: *const Rule) Allocator.E
     }
     if (rule.pattern) |p| if (p == .literal)
         try b.appendf(path, "string_pattern_mismatch", "String should be \"{s}\"", .{p.literal});
+}
+
+/// The first pair of equal items `{i, j}` (i < j, the smallest such j), in
+/// O(n log n): items are sorted by a structural hash and only neighbours
+/// with equal hashes are compared. A quadratic scan would be a DoS lever: an
+/// array may hold `max_array_elements` (10,000) items. The hash is 128-bit
+/// SipHash, so a run of colliding but unequal items (which the inner loop
+/// would compare pairwise) costs a crafter ~2^64 work even with the key public.
+fn firstDuplicate(a: Allocator, items: []const Value) Allocator.Error!?[2]usize {
+    if (items.len < 2) return null;
+    const Entry = struct { h: u128, i: usize };
+    const es = try a.alloc(Entry, items.len);
+    for (items, es, 0..) |v, *e, i| e.* = .{ .h = try jsonHash(a, v), .i = i };
+    std.mem.sort(Entry, es, {}, struct {
+        fn lt(_: void, x: Entry, y: Entry) bool {
+            return x.h < y.h or (x.h == y.h and x.i < y.i);
+        }
+    }.lt);
+    var best: ?[2]usize = null;
+    var run: usize = 0;
+    while (run < es.len) {
+        var end = run + 1;
+        while (end < es.len and es[end].h == es[run].h) end += 1;
+        // Within one hash run, pair each item with the earliest equal one.
+        for (es[run..end], run..) |y, k| {
+            for (es[run..k]) |x| if (countComparison() and jsonEqual(items[x.i], items[y.i])) {
+                if (best == null or y.i < best.?[1]) best = .{ x.i, y.i };
+                break;
+            };
+        }
+        run = end;
+    }
+    return best;
+}
+
+/// Test-only count of the `jsonEqual` calls `firstDuplicate` makes, so a test
+/// can pin that the hash keeps the cost n log n (a constant or weakened hash
+/// still answers right, only quadratically).
+var duplicate_comparisons: usize = 0;
+
+fn countComparison() bool {
+    if (@import("builtin").is_test) duplicate_comparisons += 1;
+    return true;
+}
+
+/// Hash consistent with `jsonEqual`: equal values hash alike. A number in
+/// the i128 domain that is integral hashes as that integer whatever its
+/// spelling; any other number as its f64 (`numberOrder` compares those as
+/// f64 too). Object members are hashed in the order of their own hashes, so
+/// member order does not matter -- sorted, not summed: a sum of hashes under
+/// a public key falls to a generalized-birthday attack (review 2026-10-24),
+/// which would put crafted objects in one run of `firstDuplicate`.
+fn jsonHash(a: Allocator, v: Value) Allocator.Error!u128 {
+    var h = JsonHasher.init(&json_hash_key);
+    switch (v) {
+        .null => h.update("n"),
+        .bool => |p| h.update(if (p) "t" else "f"),
+        .string => |s| {
+            h.update("s");
+            h.update(s);
+        },
+        .integer, .float, .number_string => {
+            h.update("#");
+            if (exactInt(v)) |i| {
+                h.update(std.mem.asBytes(&i));
+            } else if (numValue(v)) |f| {
+                if (inI128Domain(v) and @floor(f) == f) {
+                    const i: i128 = @intFromFloat(f);
+                    h.update(std.mem.asBytes(&i));
+                } else h.update(std.mem.asBytes(&f)); // never a zero: ±0 is in the i128 domain
+            }
+        },
+        .array => |arr| {
+            h.update("[");
+            for (arr.items) |item| {
+                const x = try jsonHash(a, item);
+                h.update(std.mem.asBytes(&x));
+            }
+        },
+        .object => |obj| {
+            h.update("{");
+            const members = try a.alloc(u128, obj.count());
+            var it = obj.iterator();
+            var i: usize = 0;
+            while (it.next()) |e| : (i += 1) {
+                var m = JsonHasher.init(&json_member_key);
+                m.update(e.key_ptr.*);
+                const x = try jsonHash(a, e.value_ptr.*);
+                m.update(std.mem.asBytes(&x));
+                members[i] = m.finalInt();
+            }
+            std.mem.sort(u128, members, {}, std.sort.asc(u128));
+            const count: u64 = members.len;
+            h.update(std.mem.asBytes(&count));
+            h.update(std.mem.sliceAsBytes(members));
+        },
+    }
+    return h.finalInt();
+}
+
+const JsonHasher = std.crypto.auth.siphash.SipHash128(1, 3);
+const json_hash_key: [16]u8 = "validate.unique0".*;
+const json_member_key: [16]u8 = "validate.member0".*;
+
+/// JSON equality (JSON Schema `uniqueItems`): numbers by value, integers
+/// exactly; objects by members whatever their order; arrays item by item.
+fn jsonEqual(x: Value, y: Value) bool {
+    switch (x) {
+        .integer, .float, .number_string => return if (numberOrder(x, y)) |o| o == .eq else false,
+        .null => return y == .null,
+        .bool => |p| return y == .bool and y.bool == p,
+        .string => |s| return y == .string and std.mem.eql(u8, s, y.string),
+        .array => |xa| {
+            if (y != .array or y.array.items.len != xa.items.len) return false;
+            for (xa.items, y.array.items) |p, q| if (!jsonEqual(p, q)) return false;
+            return true;
+        },
+        .object => |xo| {
+            if (y != .object or y.object.count() != xo.count()) return false;
+            var it = xo.iterator();
+            while (it.next()) |e| {
+                const other = y.object.get(e.key_ptr.*) orelse return false;
+                if (!jsonEqual(e.value_ptr.*, other)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+/// Is the number `v` one of `allowed` (JSON number texts; an entry that is
+/// not one matches nothing)?
+fn oneOfNumber(allowed: []const []const u8, v: Value) bool {
+    for (allowed) |a| {
+        if (!isJsonNumberText(a)) continue;
+        if (numberOrder(v, .{ .number_string = a })) |o| if (o == .eq) return true;
+    }
+    return false;
+}
+
+/// RFC 8259 `number`: `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`.
+fn isJsonNumberText(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    if (i == s.len) return false;
+    if (s[i] == '0') {
+        i += 1;
+    } else if (s[i] >= '1' and s[i] <= '9') {
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    } else return false;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const start = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == start) return false;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        const start = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == start) return false;
+    }
+    return i == s.len;
 }
 
 fn containsString(list: []const []const u8, s: []const u8) bool {
@@ -1490,14 +1703,56 @@ fn isUri(s: []const u8, require_scheme: bool) bool {
             return false;
         }
     }
-    if (!require_scheme) return true;
-    const colon = std.mem.findScalar(u8, s, ':') orelse return false;
-    if (colon == 0 or !std.ascii.isAlphabetic(s[0])) return false;
+    const scheme_len = uriSchemeLen(s);
+    if (require_scheme and scheme_len == null) return false;
+    return uriBracketsOk(if (scheme_len) |n| s[n + 1 ..] else s);
+}
+
+/// Length of `s`'s scheme when it starts with `scheme ":"`, else null. The
+/// first ':' must be the scheme separator, not part of a path/query/fragment.
+fn uriSchemeLen(s: []const u8) ?usize {
+    const colon = std.mem.findScalar(u8, s, ':') orelse return null;
+    if (colon == 0 or !std.ascii.isAlphabetic(s[0])) return null;
     for (s[1..colon]) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return false;
+        if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return null;
     }
-    // The first ':' must be the scheme separator, not path/query/fragment.
-    return std.mem.findAny(u8, s[0..colon], "/?#") == null;
+    return colon;
+}
+
+/// `[` and `]` are gen-delims RFC 3986 admits in one place only: around the
+/// IP-literal host of an authority (§3.2.2), `[` IPv6address `]` or
+/// `[v` HEXDIG+ `.` … `]`. Anywhere else (`https://examp[e.com`, `[::1]]`)
+/// the reference is not a URI; go-playground's `uri` refuses both (go format
+/// oracle, 2026-10-24) and so does this. `rest` is what follows the scheme.
+fn uriBracketsOk(rest: []const u8) bool {
+    if (std.mem.findAny(u8, rest, "[]") == null) return true;
+    if (!std.mem.startsWith(u8, rest, "//")) return false;
+    const after = rest[2..];
+    const auth = after[0 .. std.mem.findAny(u8, after, "/?#") orelse after.len];
+    // Exactly one bracket pair, both inside the authority.
+    if (std.mem.count(u8, rest, "[") != 1 or std.mem.count(u8, rest, "]") != 1) return false;
+    const host = auth[if (std.mem.findScalarLast(u8, auth, '@')) |at| at + 1 else 0..];
+    if (host.len == 0 or host[0] != '[') return false;
+    const close = std.mem.findScalar(u8, host, ']') orelse return false;
+    const port = host[close + 1 ..];
+    if (port.len != 0) {
+        if (port[0] != ':') return false;
+        for (port[1..]) |c| if (!std.ascii.isDigit(c)) return false;
+    }
+    const lit = host[1..close];
+    if (lit.len > 0 and (lit[0] == 'v' or lit[0] == 'V')) {
+        // IPvFuture: "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" )
+        const dot = std.mem.findScalar(u8, lit, '.') orelse return false;
+        if (dot < 2 or dot + 1 == lit.len) return false;
+        for (lit[1..dot]) |c| if (!std.ascii.isHex(c)) return false;
+        for (lit[dot + 1 ..]) |c| {
+            if (!std.ascii.isAlphanumeric(c) and std.mem.findScalar(u8, "-._~!$&'()*+,;=:", c) == null) return false;
+        }
+        return true;
+    }
+    // IPv6address; RFC 3986 has no zone identifier (that is RFC 6874's `%25`).
+    if (std.mem.findScalar(u8, lit, '%') != null) return false;
+    return if (netaddr.parseIp(lit)) |ip| ip == .v6 else false;
 }
 
 /// unreserved / gen-delims / sub-delims ('%' and '#' are handled above).
@@ -1820,24 +2075,42 @@ fn isAscii(s: []const u8) bool {
 /// Non-empty and unchanged by `toUpper` (`upper`) or `toLower` (not): a
 /// string with a character that has a case mapping to the other case fails.
 /// ASCII and Latin-1 carry case here; a string that is not UTF-8 fails.
+/// go-playground's `lowercase` is `s == strings.ToLower(s)` (`uppercase`
+/// likewise), and Go maps rune by rune with `unicode.ToLower`/`ToUpper`: a
+/// string is lowercase when none of its code points is one `ToLower` changes.
+/// The sets are Go's own (`case_tables.zig`, generated by tools/go_casetables),
+/// so titlecase letters (`ǅ`: neither) and every script Go maps agree with it
+/// (the go format oracle caught `ǅ` passing both when only Latin-1 was mapped).
 fn isCased(s: []const u8, upper: bool) bool {
     if (s.len == 0) return false;
     const view = std.unicode.Utf8View.init(s) catch return false;
+    const table: []const case_tables.Triple = if (upper)
+        &case_tables.changes_when_uppered
+    else
+        &case_tables.changes_when_lowered;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
-        if (cp >= 'A' and cp <= 'Z') {
-            if (!upper) return false;
-        } else if (cp >= 'a' and cp <= 'z') {
-            if (upper) return false;
-        } else if (cp >= 0xC0 and cp <= 0xDE and cp != 0xD7) {
-            if (!upper) return false;
-        } else if (cp >= 0xE0 and cp <= 0xFE and cp != 0xF7) {
-            if (upper) return false;
-        } else if (cp == 0xB5 or cp == 0xFF) {
-            if (upper) return false; // µ and ÿ are lowercase (their uppercase is outside Latin-1)
-        }
+        if (cp < 0x80) {
+            if (if (upper) cp >= 'a' and cp <= 'z' else cp >= 'A' and cp <= 'Z') return false;
+        } else if (caseTableHas(table, cp)) return false;
     }
     return true;
+}
+
+fn caseTableHas(table: []const case_tables.Triple, cp: u21) bool {
+    // Spans are sorted and disjoint (each holds only its own points).
+    var lo: usize = 0;
+    var hi: usize = table.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const t = table[mid];
+        if (cp < t.lo) {
+            hi = mid;
+        } else if (cp > t.hi) {
+            lo = mid + 1;
+        } else return (cp - t.lo) % t.stride == 0;
+    }
+    return false;
 }
 
 fn isBase64UrlRun(s: []const u8, allow_empty: bool) bool {
@@ -2773,8 +3046,8 @@ fn scalarType(comptime T: type) bool {
 
 /// Whether `parseCompiled` handles a `T` value held to `actives`: scalars,
 /// structs, slices and optionals of them, with no `cross` rule anywhere and
-/// no `custom` one on a container (those need the walker's captures and
-/// materialized subtrees),
+/// no `custom` or `unique` one on a container (those need the walker's
+/// captures and materialized subtrees),
 /// and every rule naming a member `T` has (a rule for a member the decoder
 /// skips is the walker's job).
 fn compiles(comptime T: type, comptime actives: []const CActive) bool {
@@ -2784,7 +3057,7 @@ fn compiles(comptime T: type, comptime actives: []const CActive) bool {
         // `checkRule` runs a scalar's `custom` as the walker does; a
         // container's needs the walker's materialized subtree.
         if (scalarType(T)) return true;
-        for (actives) |a| if (a.rule.custom != null) return false;
+        for (actives) |a| if (a.rule.custom != null or a.rule.unique) return false;
         switch (@typeInfo(T)) {
             .optional => |o| return compiles(o.child, actives),
             .@"struct" => |s| {
@@ -3587,7 +3860,7 @@ const Walker = struct {
                 const kind: ContainerKind = if (token == .object_begin) .object else .array;
                 try w.limitEnter(kind);
                 if (w.top()) |f| if (f.kind == .object) if (f.cap_idx) |ci| captureContainer(f, ci);
-                for (active) |a| if (a.rule.custom != null) return w.matBegin(seg, active, kind);
+                for (active) |a| if (a.rule.custom != null or a.rule.unique) return w.matBegin(seg, active, kind);
                 return w.open(seg, active, kind);
             },
             else => {
@@ -4332,6 +4605,10 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
         try s.objectField("maxItems");
         try s.write(m);
     };
+    if (arrays and r.unique) {
+        try s.objectField("uniqueItems");
+        try s.write(true);
+    }
     if (r.min_bytes) |m| {
         try s.objectField("x-minBytes");
         try s.write(m);
@@ -4345,17 +4622,23 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
     // type array alone would let `enum`/`const` refuse it): `one_of`, kept to
     // the literal when both are set.
     const literal: ?[]const u8 = if (r.pattern) |p| (if (p == .literal) p.literal else null) else null;
+    // On an `.int`/`.float` rule the entries are numbers (`oneOfNumber`) and
+    // are written as such; one that is not a JSON number matches nothing and
+    // is left out.
+    const numeric = r.kind == .int or r.kind == .float;
     if (r.allow_null and (r.one_of != null or literal != null)) {
         try s.objectField("enum");
         try s.beginArray();
         if (r.one_of) |allowed| {
-            for (allowed) |a| if (literal == null or std.mem.eql(u8, a, literal.?)) try s.write(a);
+            for (allowed) |a| if (literal == null or std.mem.eql(u8, a, literal.?)) try writeEnumEntry(s, a, numeric);
         } else try s.write(literal.?);
         try s.write(null);
         try s.endArray();
     } else if (r.one_of) |allowed| {
         try s.objectField("enum");
-        try s.write(allowed);
+        try s.beginArray();
+        for (allowed) |a| try writeEnumEntry(s, a, numeric);
+        try s.endArray();
     }
     if (r.pattern) |p| switch (p) {
         .literal => |lit| if (!r.allow_null) {
@@ -4410,6 +4693,14 @@ fn minOpt(a: ?usize, b: ?usize) ?usize {
     if (a == null) return b;
     if (b == null) return a;
     return @min(a.?, b.?);
+}
+
+/// One `one_of` entry: a string, or on a numeric rule the number text as
+/// written (an entry that is no JSON number matches nothing and is left out).
+fn writeEnumEntry(s: *std.json.Stringify, a: []const u8, numeric: bool) std.Io.Writer.Error!void {
+    if (!numeric) return s.write(a);
+    if (!isJsonNumberText(a)) return;
+    try s.print("{s}", .{a});
 }
 
 /// An integral bound as an integer (`255`, not `2.55e2`), anything else as
@@ -6381,6 +6672,220 @@ test "writeJsonSchema: two rules for one field are allOf, required listed once, 
     , w.buffered());
 }
 
+test "one_of on a number: entries compared by value, integers exactly (go-playground oneof=5 7 9)" {
+    const schema = [_]Rule{
+        .{ .field = "n", .kind = .int, .one_of = &.{ "5", "7", "9", "18446744073709551617", "x" } },
+        .{ .field = "f", .kind = .float, .one_of = &.{ "0.5", "2" } },
+    };
+    try expectBoth("{\"n\":7,\"f\":0.5}", &schema, &.{});
+    try expectBoth("{\"n\":7.0,\"f\":2}", &schema, &.{}); // 7.0 is the integer 7; 2 equals 2.0
+    try expectBoth("{\"n\":18446744073709551617,\"f\":2e0}", &schema, &.{});
+    try expectBoth("{\"n\":6,\"f\":0.25}", &schema, &.{ .{ "n", "enum" }, .{ "f", "enum" } });
+    // Past 2^53, value equality is exact: ...616 is not ...617.
+    try expectBoth("{\"n\":18446744073709551616}", &schema, &.{.{ "n", "enum" }});
+    // A string is still a type error, not an enum one.
+    try expectBoth("{\"n\":\"7\"}", &schema, &.{.{ "n", "int_type" }});
+    // Exported as numbers; an entry that is no JSON number matches nothing
+    // and is left out.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchema(&schema, &w);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"n":{"type":"integer","enum":[5,7,9,18446744073709551617]},"f":{"type":"number","enum":[0.5,2]}}}
+    , w.buffered());
+    const nullable = [_]Rule{.{ .field = "n", .kind = .int, .allow_null = true, .one_of = &.{"1"} }};
+    w = .fixed(&buf);
+    try writeJsonSchema(&nullable, &w);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"n":{"type":["integer","null"],"enum":[1,null]}}}
+    , w.buffered());
+    try expectBoth("{\"n\":null}", &nullable, &.{});
+}
+
+test "unique: items pairwise distinct by JSON equality (uniqueItems, go-playground unique)" {
+    const schema = [_]Rule{
+        .{ .field = "a", .kind = .array, .unique = true },
+        .{ .field = "t", .kind = .array, .unique = true, .items = &.{ .field = "", .kind = .string, .min_len = 2 } },
+    };
+    try expectBoth("{\"a\":[]}", &schema, &.{});
+    try expectBoth("{\"a\":[1,\"1\",true,null,[1],{\"x\":1}]}", &schema, &.{});
+    try expectBoth("{\"a\":[1,2,1.0]}", &schema, &.{.{ "a", "unique_items" }});
+    try expectBoth("{\"a\":[{\"x\":1,\"y\":[2]},{\"y\":[2.0],\"x\":1}]}", &schema, &.{.{ "a", "unique_items" }});
+    try expectBoth("{\"a\":[[1,2],[2,1]]}", &schema, &.{});
+    try expectBoth("{\"a\":[{\"x\":1},{\"x\":1,\"y\":null}]}", &schema, &.{});
+    try expectBoth("{\"a\":[false,false]}", &schema, &.{.{ "a", "unique_items" }});
+    // The item rules still run inside a unique array.
+    try expectBoth("{\"t\":[\"ab\",\"c\",\"ab\"]}", &schema, &.{ .{ "t", "unique_items" }, .{ "t[1]", "string_too_short" } });
+    // The message names the first equal pair: the smallest later index.
+    var r = try validateJson(testing.allocator, "{\"a\":[3,1,2,1,3]}", &schema);
+    defer r.deinit();
+    try testing.expectEqualStrings("Array items should be unique (items 1 and 3 are equal)", r.errors[0].message);
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchema(schema[0..1], &w);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"a":{"type":"array","uniqueItems":true}}}
+    , w.buffered());
+}
+
+test "unique: hash and equality agree at the i128 edge (review 2026-10-24 LOW-1)" {
+    const schema = [_]Rule{.{ .field = "a", .kind = .array, .unique = true }};
+    // -2^127 as an integer and as the float that is exactly it: equal.
+    try expectBoth("{\"a\":[-170141183460469231731687303715884105728,-1.7014118346046924e38]}", &schema, &.{.{ "a", "unique_items" }});
+    // 2^127-1 (an i128) and 2^127 (past it): different, though one f64.
+    try expectBoth("{\"a\":[170141183460469231731687303715884105727,170141183460469231731687303715884105728]}", &schema, &.{});
+    try expectBoth("{\"a\":[-170141183460469231731687303715884105728,-170141183460469231731687303715884105729]}", &schema, &.{});
+    // `numberOrder` itself (also behind the cross-field comparisons).
+    const big: Value = .{ .number_string = "170141183460469231731687303715884105728" };
+    try testing.expectEqual(std.math.Order.lt, numberOrder(.{ .number_string = "170141183460469231731687303715884105727" }, big).?);
+    try testing.expectEqual(std.math.Order.gt, numberOrder(big, .{ .float = 1.0e38 }).?);
+    try testing.expectEqual(std.math.Order.gt, numberOrder(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105729" }).?);
+}
+
+test "case tables: sorted, disjoint runs whose stride divides their span; Go's verdicts beyond Latin-1" {
+    inline for (.{ &case_tables.changes_when_lowered, &case_tables.changes_when_uppered }) |t| {
+        for (t, 0..) |r, i| {
+            try testing.expect(r.stride > 0 and r.lo <= r.hi and (r.hi - r.lo) % r.stride == 0);
+            if (i > 0) try testing.expect(t[i - 1].hi < r.lo);
+            try testing.expect(caseTableHas(t, r.lo) and caseTableHas(t, r.hi));
+            if (r.stride > 1) try testing.expect(!caseTableHas(t, r.lo + 1));
+        }
+    }
+    // Cyrillic, Greek, Armenian, Deseret (4-byte UTF-8), titlecase.
+    try testing.expect(validateFormat(.lowercase, "дом ω ա \u{10428}"));
+    try testing.expect(!validateFormat(.lowercase, "Дом"));
+    try testing.expect(validateFormat(.uppercase, "ДОМ Ω Ա \u{10400}"));
+    try testing.expect(!validateFormat(.uppercase, "ДОм"));
+    try testing.expect(!validateFormat(.lowercase, "\u{1C5}") and !validateFormat(.uppercase, "\u{1C5}"));
+    // Caseless scripts and symbols are both.
+    try testing.expect(validateFormat(.lowercase, "漢字 123 !") and validateFormat(.uppercase, "漢字 123 !"));
+}
+
+// ── pinned by the 2026-10-24 (wave 8) mutation audit ────────────────────────
+// Each assertion below kills a mutant of the new code that survived the rest
+// of the suite (report: ~/CML/20261024-wave8/validate-mut.report.md).
+
+test "mutation wave 8: case tables -- ASCII upper in a lowercase string, the last run of each table" {
+    try testing.expect(!validateFormat(.lowercase, "Z") and !validateFormat(.lowercase, "aZ"));
+    try testing.expect(!validateFormat(.uppercase, "z") and !validateFormat(.uppercase, "Az"));
+    try testing.expect(!validateFormat(.lowercase, "\u{1E900}")); // Adlam capital
+    try testing.expect(!validateFormat(.uppercase, "\u{1E922}")); // Adlam small
+    try testing.expect(validateFormat(.lowercase, "\u{1E922}") and validateFormat(.uppercase, "\u{1E900}"));
+}
+
+test "mutation wave 8: uri brackets only around an authority's IP-literal host" {
+    const yes = [_][]const u8{ "http://[V1.x]", "http://[va.x]", "http://[v1.a:b]", "http://[::1]:", "//[::1]/a" };
+    const no = [_][]const u8{
+        "a_b:x",            "a:x/[::1]",  "http://[::1]/[", "http://[::1]/]", "http://[@x::1]",   "http://[::1]x",
+        "http://[::1]:80a", "http://[]/", "http://[v.a]",   "http://[v1.]",   "http://[1.2.3.4]", "http://[::1%25eth0]/",
+    };
+    for (yes) |u| if (!validateFormat(.uri_reference, u)) {
+        std.debug.print("uri_reference should accept {s}\n", .{u});
+        return error.TestExpectedEqual;
+    };
+    for (yes[0..4]) |u| try testing.expect(validateFormat(.uri, u));
+    for (no) |u| if (validateFormat(.uri, u)) {
+        std.debug.print("uri should refuse {s}\n", .{u});
+        return error.TestExpectedEqual;
+    };
+}
+
+test "mutation wave 8: one_of on numbers -- entry grammar, spellings, export, one error under .any" {
+    const schema = [_]Rule{
+        .{ .field = "n", .kind = .int, .one_of = &.{ "+5", "0x5", "-", "1E2", "1.", "1e", "5x" } },
+        .{ .field = "f", .kind = .float, .one_of = &.{"5e-1"} },
+        .{ .field = "c", .one_of = &.{"red"} },
+    };
+    try expectBoth("{\"n\":100,\"f\":0.5}", &schema, &.{});
+    try expectBoth("{\"n\":5}", &schema, &.{.{ "n", "enum" }}); // `+5` and `0x5` are no JSON numbers
+    try expectBoth("{\"n\":1}", &schema, &.{.{ "n", "enum" }}); // nor are `1.` and `1e`
+    try expectBoth("{\"c\":6}", &schema, &.{.{ "c", "enum" }}); // ONE error, not one per branch
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchema(&schema, &w);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"n":{"type":"integer","enum":[1E2]},"f":{"type":"number","enum":[5e-1]},"c":{"enum":["red"]}}}
+    , w.buffered());
+    for ([_][]const u8{ "0", "-0", "1.5", "1e5", "1E+5", "-2.5e-3" }) |t| try testing.expect(isJsonNumberText(t));
+    for ([_][]const u8{ "", "-", "+1", "01", "1.", ".5", "1e", "1e+", "5x", "0x5", "--1" }) |t| try testing.expect(!isJsonNumberText(t));
+}
+
+test "mutation wave 8: unique -- spellings of one number, objects with disjoint keys" {
+    const schema = [_]Rule{.{ .field = "a", .kind = .array, .unique = true }};
+    try expectBoth("{\"a\":[1000000,1e6]}", &schema, &.{.{ "a", "unique_items" }});
+    try expectBoth("{\"a\":[{\"x\":1},{\"y\":1}]}", &schema, &.{});
+    try expectBoth("{\"a\":[{\"x\":1},{\"x\":2}]}", &schema, &.{});
+}
+
+test "mutation wave 8: jsonEqual on objects needs every key in both; a hand-built unparseable number gets only its type error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var x: std.json.ObjectMap = .empty;
+    try x.put(a, "x", .{ .integer = 1 });
+    var y: std.json.ObjectMap = .empty;
+    try y.put(a, "y", .{ .integer = 1 });
+    try testing.expect(!jsonEqual(.{ .object = x }, .{ .object = y }));
+    try testing.expect(jsonEqual(.{ .object = x }, .{ .object = x }));
+    // `.number_string = "abc"` only from a hand-built Value: one error, no `enum` beside it.
+    var r = try validateValue(testing.allocator, .{ .object = obj: {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "n", .{ .number_string = "abc" });
+        break :obj o;
+    } }, &.{.{ .field = "n", .kind = .int, .one_of = &.{"5"} }});
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try testing.expectEqualStrings("int_type", r.errors[0].code);
+}
+
+test "mutation wave 8: unique -- the hash separates what differs, so comparisons stay few" {
+    // Each shape differs in exactly one hashed component: member values,
+    // member keys, array items. A hash that dropped that component would put
+    // all 2,000 items in one run and make ~2 million comparisons.
+    const shapes = [_][]const u8{ "{{\"k\":{d}}}", "{{\"k{d}\":0}}", "[{d}]", "{{\"k\":0,\"v\":{d}}}" };
+    inline for (shapes) |shape| {
+        var body: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer body.deinit();
+        try body.writer.writeAll("{\"a\":[");
+        for (0..2000) |i| {
+            if (i != 0) try body.writer.writeByte(',');
+            try body.writer.print(shape, .{i});
+        }
+        try body.writer.writeAll("]}");
+        const schema = [_]Rule{.{ .field = "a", .kind = .array, .unique = true }};
+        duplicate_comparisons = 0;
+        var r = try validateJson(testing.allocator, body.written(), &schema);
+        defer r.deinit();
+        try testing.expect(r.ok());
+        try testing.expect(duplicate_comparisons < 16);
+    }
+}
+
+test "unique: 10,000 distinct items cost n log n, not n^2" {
+    var body: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"a\":[");
+    for (0..10_000) |i| try body.writer.print("{s}{d}", .{ if (i == 0) "" else ",", i });
+    try body.writer.writeAll(",9999]}");
+    const schema = [_]Rule{.{ .field = "a", .kind = .array, .unique = true }};
+    duplicate_comparisons = 0;
+    var r = try validateJsonLimited(testing.allocator, body.written(), &schema, .{ .max_array_elements = 10_001 });
+    defer r.deinit();
+    try testing.expect(duplicate_comparisons < 16);
+    try testing.expectEqual(@as(usize, 1), r.errors.len);
+    try testing.expectEqualStrings("Array items should be unique (items 9999 and 10000 are equal)", r.errors[0].message);
+}
+
+test "unique on a typed slice: the compiled path gives up, the walker materializes, all paths agree" {
+    const T = struct {
+        tags: []const []const u8,
+        pub const validate_rules: []const Rule = &.{.{ .field = "tags", .kind = .array, .unique = true }};
+    };
+    comptime std.debug.assert(!compiles(T, rootActives(T)));
+    try expectTypedAgrees(T, "{\"tags\":[\"a\",\"b\"]}");
+    try expectTypedAgrees(T, "{\"tags\":[\"a\",\"b\",\"a\"]}");
+}
+
 test "Limits.max_errors lowers the cap on every limited path, and never to zero" {
     const schema = [_]Rule{.{ .field = "a", .kind = .array, .items = &.{ .field = "", .kind = .string } }};
     const body = "{\"a\":[1,2,3,4,5,6,7,8,9,10]}";
@@ -7526,7 +8031,7 @@ test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
     fz.resetReach();
-    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness, compiledHarness }, .{ "json", "streaming", "format", "cross", "compiled" }) |h, name| {
+    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness, compiledHarness, uniqueHarness }, .{ "json", "streaming", "format", "cross", "compiled", "unique" }) |h, name| {
         for (0..500) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -7585,6 +8090,12 @@ test {
 // See query_oracle_test.zig / tools/query_oracle.py.
 test {
     _ = @import("query_oracle_test.zig");
+}
+
+// ── external anchor: go-playground's own verdicts on its formats ───────────
+// See go_format_test.zig / tools/format_oracle.py.
+test {
+    _ = @import("go_format_test.zig");
 }
 
 test "a rule that forgot its kind is not a no-op: .any constrains the value" {
@@ -8839,6 +9350,74 @@ fn fuzzCrossAgrees(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz driver: VALIDATE_FUZZ (cross)" {
     try fuzz_driver.run(crossHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "cross" });
+}
+
+// ── fuzz: `unique` == a quadratic model ────────────────────────────────────
+//
+// `firstDuplicate` sorts by a structural hash and compares only equal-hash
+// neighbours; the model compares every pair with `jsonEqual`. The atoms are
+// chosen to collide under JSON equality in many spellings (`1`, `1.0`, `1e0`,
+// `-0`/`0`, member order, integers past 2^53), so a hash that disagrees with
+// `jsonEqual` shows up as a missed or a wrong pair.
+
+const unique_atoms = [_][]const u8{
+    "1",                                       "1.0",                                     "1e0",                                      "10e-1",                                    "-0",                     "0",                     "0.0",                 "2",
+    "\"a\"",                                   "\"b\"",                                   "\"1\"",                                    "true",                                     "false",                  "null",                  "[]",                  "{}",
+    "[1]",                                     "[1.0]",                                   "[1,2]",                                    "[2,1]",                                    "[[1]]",                  "[[1e0]]",               "{\"x\":1,\"y\":[2]}", "{\"y\":[2.0],\"x\":1}",
+    "{\"x\":1}",                               "{\"x\":null}",                            "18446744073709551617",                     "18446744073709551616",                     "1e400",                  "1E400",                 "9007199254740993",    "9007199254740992",
+    // the i128 edge (review 2026-10-24 LOW-1)
+    "170141183460469231731687303715884105727", "170141183460469231731687303715884105728", "-170141183460469231731687303715884105728", "-170141183460469231731687303715884105729", "-1.7014118346046924e38", "1.7014118346046923e38",
+};
+
+const unique_schema = [_]Rule{.{ .field = "a", .kind = .array, .unique = true }};
+
+fn uniqueHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("{\"a\":[");
+    const n = src.valueRangeAtMost(u8, 0, 12);
+    for (0..n) |i| {
+        if (i != 0) try w.writeByte(',');
+        try w.writeAll(unique_atoms[src.valueRangeAtMost(u8, 0, unique_atoms.len - 1)]);
+    }
+    try w.writeAll("]}");
+    const body = w.buffered();
+    try expectSchemaAgrees(body, &unique_schema);
+
+    var parsed = try std.json.parseFromSlice(Value, testing.allocator, body[5 .. body.len - 1], .{});
+    defer parsed.deinit();
+    const items = parsed.value.array.items;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const got = try firstDuplicate(arena.allocator(), items);
+    var want: ?[2]usize = null;
+    outer: for (items, 0..) |y, j| for (items[0..j], 0..) |x, i| if (jsonEqual(x, y)) {
+        want = .{ i, j };
+        break :outer;
+    };
+    if (want == null) {
+        try testing.expectEqual(@as(?[2]usize, null), got);
+        fz.mark(.unique_none);
+    } else {
+        try testing.expectEqual(want, got);
+        fz.mark(.unique_dup);
+    }
+}
+
+fn fuzzUniqueAgrees(_: void, smith: *std.testing.Smith) !void {
+    var raw: [64]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = raw[0..n] } };
+    try uniqueHarness(fz.ScriptSource, &src, testing.allocator);
+}
+
+test "fuzz: unique agrees with a quadratic model" {
+    try testing.fuzz({}, fuzzUniqueAgrees, .{});
+}
+
+test "fuzz driver: VALIDATE_FUZZ (unique)" {
+    try fuzz_driver.run(uniqueHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "unique" });
 }
 
 // ── fuzz: the compiled typed path == the walker's ───────────────────────────

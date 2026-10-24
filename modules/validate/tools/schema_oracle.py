@@ -61,8 +61,9 @@ NUM_TOKENS = ['0', '-0', '1', '2', '3', '5', '-1', '-5', '10', '11', '1.0', '2.5
 # away 2026-10-24: the export ends a pattern with `(?![\s\S])`, which every
 # engine reads as the end of the text.)
 CLASSES = {
-    'F64_PRECISION': 'an integer beyond 2^53 against a bound: python compares exactly, ajv in doubles; '
-                     'the module holds an integer to its bound exactly (since 2026-10-24) -- python decides',
+    'F64_PRECISION': 'an integer beyond 2^53 against a bound or an enum entry: python compares exactly, ajv in '
+                     'doubles; the module holds an integer to its bound and its entries exactly (since 2026-10-24) '
+                     '-- python decides',
     'F64_OVERFLOW': 'a number beyond f64 (`1e400`) as an integer: ajv calls Infinity an integer '
                     '(`Infinity % 1` is NaN, which its check reads as no fraction); python and the module '
                     'refuse a non-finite value as an integer -- python decides',
@@ -92,6 +93,16 @@ CRAFTED = [
     ([{'field': 's', 'kind': 'string', 'max_bytes': 3}], ['{"s":"éé"}', '{"s":"abc"}']),
     ([{'field': 's', 'kind': 'string', 'pattern': ('charset', '¢ü')}], ['{"s":"â"}', '{"s":"ü¢ü"}', '{"s":"ü¼"}']),
     ([{'field': 's', 'kind': 'string'}], ['{"s":"\\ud800"}', '{"s":"\\uD83D\\uDE00"}']),
+    # 2026-10-24: `unique` (uniqueItems) and `one_of` on a number.
+    ([{'field': 'a', 'kind': 'array', 'unique': True}],
+     ['{"a":[]}', '{"a":[1,1.0]}', '{"a":[1,"1",true,null,0,false]}', '{"a":[{"x":1,"y":2},{"y":2,"x":1}]}',
+      '{"a":[[1],[1.0]]}', '{"a":[[1,2],[2,1]]}', '{"a":[{"x":[1,{"y":null}]},{"x":[1,{"y":0}]}]}',
+      '{"a":["a","b","a"]}', '{"a":[1e2,100]}', '{"a":[-0,0]}']),
+    ([{'field': 'a', 'kind': 'any', 'unique': True}], ['{"a":[2,2]}', '{"a":"aa"}', '{"a":{"x":1}}']),
+    ([{'field': 'n', 'kind': 'int', 'one_of': ['5', '7', '18446744073709551617']}],
+     ['{"n":7}', '{"n":7.0}', '{"n":6}', '{"n":18446744073709551617}', '{"n":18446744073709551616}', '{"n":"7"}']),
+    ([{'field': 'f', 'kind': 'float', 'allow_null': True, 'one_of': ['0.5', '2']}],
+     ['{"f":null}', '{"f":2.0}', '{"f":2}', '{"f":0.25}', '{"f":"0.5"}']),
 ]
 
 
@@ -172,7 +183,7 @@ def znum(x):
 
 def zrule(r):
     parts = ['.field = ' + zstr(r['field']), '.kind = .' + r['kind']]
-    for key in ('required', 'allow_null'):
+    for key in ('required', 'allow_null', 'unique'):
         if r.get(key):
             parts.append('.%s = true' % key)
     for key in ('min', 'max'):
@@ -233,16 +244,20 @@ def rule_schema(r):
         s['maxLength'] = max_chars
     if arrays and 'max_len' in r:
         s['maxItems'] = r['max_len']
+    if arrays and r.get('unique'):
+        s['uniqueItems'] = True
     if 'min_bytes' in r:
         s['x-minBytes'] = r['min_bytes']
     if 'max_bytes' in r:
         s['x-maxBytes'] = r['max_bytes']
     literal = r['pattern'][1] if r.get('pattern', ('',))[0] == 'literal' else None
+    # On an int/float rule the entries are number texts, exported as numbers.
+    entry = (lambda a: json.loads(a)) if k in ('int', 'float') else (lambda a: a)
     if r.get('allow_null') and ('one_of' in r or literal is not None):
-        allowed = [a for a in r['one_of'] if literal is None or a == literal] if 'one_of' in r else [literal]
+        allowed = [entry(a) for a in r['one_of'] if literal is None or a == literal] if 'one_of' in r else [literal]
         s['enum'] = allowed + [None]
     elif 'one_of' in r:
-        s['enum'] = list(r['one_of'])
+        s['enum'] = [entry(a) for a in r['one_of']]
     if 'pattern' in r:
         how, text = r['pattern']
         if how == 'literal':
@@ -450,7 +465,8 @@ def decide(rules, schema, doc, py, js):
     if py != js:
         if has_nonfinite(inst):
             want, cls = py, 'F64_OVERFLOW'
-        elif jsonschema.Draft202012Validator(schema).is_valid(json.loads(doc, parse_int=float)) == js:
+        elif jsonschema.Draft202012Validator(json.loads(json.dumps(schema), parse_int=float)).is_valid(
+                json.loads(doc, parse_int=float)) == js:
             want, cls = py, 'F64_PRECISION'
         else:
             return None, 'UNDECIDED'

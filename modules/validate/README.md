@@ -138,7 +138,8 @@ body answers **413**. `Query` + `Body`/`TypedBody` stack on one route — the
 | `min_len` / `max_len` | string (**code points**) | `string_too_short` / `string_too_long` |
 | `min_bytes` / `max_bytes` | string (**encoded bytes**) | `string_bytes_too_short` / `string_bytes_too_long` |
 | `min_len` / `max_len` | array (items) | `too_short` / `too_long` |
-| `one_of` | string | `enum` |
+| `one_of` | string (by text); int, float (number texts, by value) | `enum` |
+| `unique` | array (items pairwise distinct, JSON equality: `1` = `1.0`) | `unique_items` |
 | `pattern` (literal/prefix/suffix/charset) | string | `string_pattern_mismatch` |
 | `custom` predicate | any (after type gate) | rule-supplied (default `custom`) |
 | `fields` | object (nested rules, paths `a.b`) | — |

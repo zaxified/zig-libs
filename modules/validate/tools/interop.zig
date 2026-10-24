@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Re-takes validate's two differential oracles and compares (`--check`) or
+//! Re-takes validate's three differential oracles and compares (`--check`) or
 //! rewrites (default) their committed vectors, which `test-validate` replays:
 //!  - `tools/schema_oracle.py`  python-jsonschema + ajv 8 (under bun) verdicts
 //!                              on generated rule sets' JSON Schema exports
@@ -8,6 +8,8 @@
 //!  - `tools/query_oracle.py`   query decoding by Python, Go `net/url` and
 //!                              WHATWG `URLSearchParams`; value coercion
 //!                              judged by pydantic → `src/query_oracle_vectors.zig`
+//!  - `tools/format_oracle.py`  go-playground/validator v10.30.5's own format
+//!                              verdicts (`tools/go_formats`) → `src/go_format_vectors.zig`
 //! Each vectors file names the peers' versions, so `--check` against another
 //! release reports it stale: re-take, read the diff, re-judge the classes
 //! (tools/README.md).
@@ -34,6 +36,11 @@ const schema: Oracle = .{
     .name = "schema (jsonschema + ajv)",
     .script = "modules/validate/tools/schema_oracle.py",
     .vectors = "modules/validate/src/schema_oracle_vectors.zig",
+};
+const formats: Oracle = .{
+    .name = "formats (go-playground)",
+    .script = "modules/validate/tools/format_oracle.py",
+    .vectors = "modules/validate/src/go_format_vectors.zig",
 };
 const query: Oracle = .{
     .name = "query (pydantic, net/url, URLSearchParams)",
@@ -63,7 +70,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         check = true;
     }
 
-    // Go (query_oracle's go_query): the pinned toolchain, offline.
+    // Go (query_oracle's go_query, format_oracle's go_formats): the pinned
+    // toolchain, offline.
     var env = try init.environ.createMap(arena);
     try env.put("GOTOOLCHAIN", "go1.26.0");
     try env.put("GOPROXY", "off");
@@ -77,12 +85,12 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     };
 
     var failed = false;
-    inline for (.{ .{ schema, "python3" }, .{ query, "" } }) |o| {
+    inline for (.{ .{ schema, "python3" }, .{ query, "" }, .{ formats, "python3" } }) |o| {
         const python: []const u8 = if (o[1].len != 0) o[1] else query_python;
         if (!try run(io, &env, o[0], python, check)) failed = true;
     }
     if (failed) return 1;
-    std.debug.print("interop-validate: both oracles {s}\n", .{if (check) "fresh" else "re-taken"});
+    std.debug.print("interop-validate: all three oracles {s}\n", .{if (check) "fresh" else "re-taken"});
     return 0;
 }
 
