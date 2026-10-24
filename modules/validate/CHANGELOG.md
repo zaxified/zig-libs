@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE** (performance): `parseIntoLeaky` answers a typed body through a decoder generated from `T` and its rules (`parseCompiled`) whenever the type allows it: same values, same errors in the same order, the old one-pass/multi-pass paths for anything it does not answer exactly. 3–3.5× less validation cost: `bench-validate` worst vs fastest 3.87× → 1.08× jprochazk/garde 0.23.0 (`nested`), `invalid` 2.02× → 0.89×. New `compiled` fuzz harness (`VALIDATE_FUZZ`) pins it against the walker; mutation run over the new code 20/23 killed, 3 equivalent (card: 140/154 with the earlier 120/131). Independent review: no wrong-answer finding; review fixes (escaped strings in skipped members, OOM at the end check, branch quota) and an allocation-failure test are in.
 - **2026-10-24** — **Fix** (review 2026-10-24, grade-1 wave 6):
   - **Exact integer comparisons:** an integer is held to `min`/`max` exactly (`9007199254740993` passed `max = 9007199254740992` as f64). Cross-field comparisons are exact for integers past i64 and against floats (`18446744073709551615` `eq_field` `18446744073709551614` passed).
   - **Export:** a suffix or charset `pattern` ends with `(?![\s\S])` instead of `$`, which Python `re`, PCRE, Java and .NET let match before a final newline. `required_if`/`required_unless` entries naming one sibling with two values are both exported (the second was dropped).

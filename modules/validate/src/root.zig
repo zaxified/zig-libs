@@ -2577,14 +2577,18 @@ pub fn LeakyResult(comptime T: type) type {
 
 /// `parseIntoLimited` without the value tree: the same rules (`rulesFor(T)`
 /// plus `T.validate_rules`), the same error codes and messages, validated
-/// and decoded in one tokenization (`parseOnePass`; an invalid document may
-/// take a second look, `parseMultiPass`), with strings borrowed from
+/// and decoded in one tokenization (`parseCompiled` where `T` allows it,
+/// else `parseOnePass`; an invalid document may take a second look,
+/// `parseMultiPass`), with strings borrowed from
 /// `body`. Memory is of the order of the body, not a
 /// multiple of it, so `arena` can be a fixed per-request buffer. Pass an
 /// arena-like allocator: the decoded `T` is never freed piecemeal (the
 /// `Leaky` convention of `std.json`). Errors come in document order.
 pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
     const extra: []const Rule = comptime typedExtra(T);
+    if (comptime compiles(T, rootActives(T))) {
+        if (try parseCompiled(T, arena, body, limits)) |r| return r;
+    }
     if (try parseOnePass(T, arena, body, limits, extra)) |r| return r;
     return parseMultiPass(T, arena, body, limits, extra);
 }
@@ -2653,6 +2657,481 @@ fn parseMultiPass(comptime T: type, arena: Allocator, body: []const u8, limits: 
     };
     return .{ .ok = value };
 }
+
+// ── the compiled typed path ─────────────────────────────────────────────────
+//
+// `parseOnePass` interprets: every token goes through `Walker.feed`, which
+// matches keys against both rule sets at run time and calls `checkRule` on
+// rules it only knows as data. For a typed `T` all of that is known at
+// compile time -- which rules apply to which field of which struct -- so
+// `parseCompiled` is a decoder generated from `T` and its two rule sets: it
+// drives the scanner itself (std's own decoding for every scalar, through
+// `OneToken`), and at each value runs exactly the checks the walker would,
+// in the walker's order, with `checkRule` inlined on a comptime rule (its
+// option tests fold away). Reporting is the walker's own: the same `use` /
+// `path` / `finish`, so the errors, their order, the cap and the second set's
+// deduplication are the walker's by construction.
+//
+// It answers only documents it can answer exactly like `parseOnePass`; on
+// anything else -- a syntax or decode error, a limit, a duplicate key, an
+// escaped key, a value of a shape the type cannot hold -- it gives up (null)
+// and `parseOnePass`/`parseMultiPass` answer as before. A differential fuzz
+// target pins both: same verdict, same errors in the same order, equal values.
+
+/// One rule applying to the value being decoded, as `Walker`'s `Active`, but
+/// known at compile time.
+const CActive = struct { rule: *const Rule, pass: u1 };
+
+/// One rule set over an object's members (`Walker.Fields` at compile time).
+const CSet = struct { rules: []const Rule, pass: u1 };
+
+fn rootActives(comptime T: type) []const CActive {
+    comptime {
+        const Roots = struct {
+            const schema = rootRuleFor(T);
+            const extra = objectRoot(typedExtra(T));
+        };
+        if (typedExtra(T).len == 0) return &.{.{ .rule = &Roots.schema, .pass = 0 }};
+        return &.{ .{ .rule = &Roots.schema, .pass = 0 }, .{ .rule = &Roots.extra, .pass = 1 } };
+    }
+}
+
+/// The rule sets an object value is held to: `Walker.open`'s, the rules that
+/// pass the container gate and have `fields`.
+fn objectSets(comptime actives: []const CActive) []const CSet {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var sets: []const CSet = &.{};
+        for (actives) |a| {
+            if (a.rule.kind != .any and a.rule.kind != .object) continue;
+            const rules = a.rule.fields orelse continue;
+            sets = sets ++ &[_]CSet{.{ .rules = rules, .pass = a.pass }};
+        }
+        return sets;
+    }
+}
+
+/// The rules for member `name`: `Walker.key`'s, set by set, rule by rule.
+fn memberActives(comptime sets: []const CSet, comptime name: []const u8) []const CActive {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const CActive = &.{};
+        for (sets) |set| {
+            for (set.rules) |*r| {
+                if (std.mem.eql(u8, r.field, name)) out = out ++ &[_]CActive{.{ .rule = r, .pass = set.pass }};
+            }
+        }
+        return out;
+    }
+}
+
+/// The rules an array's length is held to (`Walker.open`'s `gated`).
+fn arrayGated(comptime actives: []const CActive) []const CActive {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const CActive = &.{};
+        for (actives) |a| {
+            if (a.rule.kind == .any or a.rule.kind == .array) out = out ++ &[_]CActive{a};
+        }
+        return out;
+    }
+}
+
+/// The rules for every element (`Walker.open`'s `children` of an array).
+fn itemActives(comptime actives: []const CActive) []const CActive {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        var out: []const CActive = &.{};
+        for (arrayGated(actives)) |a| {
+            if (a.rule.items) |r| out = out ++ &[_]CActive{.{ .rule = r, .pass = a.pass }};
+        }
+        return out;
+    }
+}
+
+fn memberIndex(comptime T: type, comptime name: []const u8) ?usize {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        for (@typeInfo(T).@"struct".field_names, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) return i;
+        }
+        return null;
+    }
+}
+
+/// A type std's decoder reads from exactly one scalar token.
+fn scalarType(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .float => true,
+        .@"enum" => !std.meta.hasFn(T, "jsonParse"),
+        .pointer => |p| p.size == .slice and p.child == u8 and p.attrs.@"const" and p.sentinel() == null,
+        .array => |a| a.child == u8 and a.sentinel() == null,
+        .optional => |o| scalarType(o.child),
+        else => false,
+    };
+}
+
+/// Whether `parseCompiled` handles a `T` value held to `actives`: scalars,
+/// structs, slices and optionals of them, with no `cross` rule anywhere and
+/// no `custom` one on a container (those need the walker's captures and
+/// materialized subtrees),
+/// and every rule naming a member `T` has (a rule for a member the decoder
+/// skips is the walker's job).
+fn compiles(comptime T: type, comptime actives: []const CActive) bool {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        for (actives) |a| if (a.rule.cross.len != 0) return false;
+        // `checkRule` runs a scalar's `custom` as the walker does; a
+        // container's needs the walker's materialized subtree.
+        if (scalarType(T)) return true;
+        for (actives) |a| if (a.rule.custom != null) return false;
+        switch (@typeInfo(T)) {
+            .optional => |o| return compiles(o.child, actives),
+            .@"struct" => |s| {
+                if (s.is_tuple or std.meta.hasFn(T, "jsonParse")) return false;
+                if (s.field_names.len > 64) return false;
+                for (s.field_attrs) |fa| if (fa.@"comptime") return false;
+                const sets = objectSets(actives);
+                for (sets) |set| {
+                    for (set.rules) |r| if (memberIndex(T, r.field) == null) return false;
+                }
+                for (s.field_names, s.field_types) |n, ft| {
+                    if (!compiles(ft, memberActives(sets, n))) return false;
+                }
+                return true;
+            },
+            .pointer => |p| {
+                if (p.size != .slice or p.child == u8 or p.sentinel() != null) return false;
+                return compiles(p.child, itemActives(actives));
+            },
+            else => return false,
+        }
+    }
+}
+
+/// See the section comment. Null: not answered here.
+fn parseCompiled(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!?LeakyResult(T) {
+    var scratch_buf: [2048]u8 align(16) = undefined; // as `parseOnePass`'s
+    var fallback = std.heap.BufferFirstAllocator.init(&scratch_buf, arena);
+    const scratch = fallback.allocator();
+    var b = Builder.initCapped(arena, limits.max_errors);
+    // Only the reporting half of the walker is used: `use`, `path`, `gate`,
+    // `finish`. Its frames stay empty.
+    var w: Walker = undefined;
+    w.startRoot(scratch, body.len, &b, comptime rootRuleFor(T), comptime typedExtra(T), null);
+    defer w.deinit();
+    var c: Compiled = .{
+        .scanner = .initCompleteInput(scratch, body),
+        .w = &w,
+        .limit = .{ .gpa = scratch, .limits = limits, .frames = .empty },
+        .arena = arena,
+        .scratch = scratch,
+    };
+    defer c.deinit();
+    const value = c.value(T, null, comptime rootActives(T)) catch |err| {
+        b.abort();
+        return if (err == error.OutOfMemory) error.OutOfMemory else null;
+    };
+    const end = c.scanner.next() catch |err| switch (err) {
+        error.OutOfMemory => {
+            b.abort();
+            return error.OutOfMemory;
+        },
+        else => .object_end,
+    };
+    if (end != .end_of_document) {
+        b.abort();
+        return null;
+    }
+    w.done = true;
+    w.finish() catch |err| {
+        b.abort();
+        return err;
+    };
+    var report = b.finish();
+    if (!report.ok()) return .{ .invalid = report };
+    report.deinit();
+    return .{ .ok = value };
+}
+
+/// The decoder `parseCompiled` runs. `error.GiveUp`: the document is not
+/// answered here (see the section comment).
+const Compiled = struct {
+    scanner: std.json.Scanner,
+    w: *Walker,
+    limit: LimitScan,
+    arena: Allocator,
+    /// Transient memory: the scanner's stack, a skipped member's escaped
+    /// strings.
+    scratch: Allocator,
+
+    const DecodeError = Allocator.Error || error{GiveUp};
+
+    /// What std's decoder is given for every scalar (`parseOnePass`'s options).
+    const options: std.json.ParseOptions = .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+        .max_value_len = std.math.maxInt(usize),
+    };
+
+    fn deinit(c: *Compiled) void {
+        c.limit.frames.deinit(c.limit.gpa);
+        c.scanner.deinit();
+    }
+
+    fn peek(c: *Compiled) DecodeError!std.json.TokenType {
+        return c.scanner.peekNextTokenType() catch error.GiveUp;
+    }
+
+    fn next(c: *Compiled) DecodeError!std.json.Token {
+        return c.scanner.next() catch |err| if (err == error.OutOfMemory) error.OutOfMemory else error.GiveUp;
+    }
+
+    // The walker's limit hooks (`Walker.limitBegin` ..), here unconditional.
+    fn limitBegin(c: *Compiled) DecodeError!void {
+        var is_value: bool = undefined;
+        if (try c.limit.begin(&is_value) != null) return error.GiveUp;
+    }
+
+    fn limitEnter(c: *Compiled, kind: ContainerKind) DecodeError!void {
+        if (try c.limit.enter(kind) != null) return error.GiveUp;
+    }
+
+    fn limitClose(c: *Compiled) void {
+        _ = c.limit.frames.pop();
+        c.limit.complete();
+    }
+
+    fn value(c: *Compiled, comptime T: type, seg: ?*Seg, comptime actives: []const CActive) DecodeError!T {
+        if (comptime scalarType(T)) return c.scalar(T, seg, actives);
+        switch (@typeInfo(T)) {
+            .optional => |o| {
+                if (try c.peek() == .null) {
+                    _ = try c.scalar(?void, seg, actives);
+                    return null;
+                }
+                return try c.value(o.child, seg, actives);
+            },
+            .@"struct" => return c.object(T, seg, actives),
+            .pointer => |p| return c.array(p.child, seg, actives),
+            else => comptime unreachable, // see `compiles`
+        }
+    }
+
+    /// `Walker.check` on a comptime rule.
+    inline fn check(c: *Compiled, seg: ?*Seg, v: Value, comptime a: CActive) Allocator.Error!void {
+        const w = c.w;
+        w.use(a.pass);
+        if (w.b.full()) return;
+        const mark = w.b.list.items.len;
+        try @call(.always_inline, checkRule, .{ w.b, "", v, a.rule });
+        if (w.b.list.items.len == mark) return;
+        const p = try w.path(seg);
+        for (w.b.list.items[mark..]) |*e| e.path = p;
+    }
+
+    /// One scalar: the walker's checks on it, then std's decoding of it.
+    fn scalar(c: *Compiled, comptime T: type, seg: ?*Seg, comptime actives: []const CActive) DecodeError!T {
+        switch (try c.peek()) {
+            .object_begin, .array_begin => return error.GiveUp, // the type holds no container
+            else => {},
+        }
+        const token = c.scanner.nextAllocMax(c.arena, .alloc_if_needed, c.scanner.input.len) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.GiveUp;
+        try c.limitBegin();
+        const v: Value = switch (token) {
+            .string, .allocated_string => |s| .{ .string = s },
+            .number, .allocated_number => |n| Value.parseFromNumberSlice(n),
+            .true => .{ .bool = true },
+            .false => .{ .bool = false },
+            .null => .null,
+            else => unreachable, // `nextAllocMax` gives whole scalars
+        };
+        inline for (actives) |a| try c.check(seg, v, a);
+        c.limit.complete();
+        if (T == ?void) {
+            return null; // a null for an optional container
+        } else {
+            var src: OneToken = .{ .token = token };
+            return std.json.innerParse(T, c.arena, &src, options) catch |err|
+                if (err == error.OutOfMemory) error.OutOfMemory else error.GiveUp;
+        }
+    }
+
+    /// `Walker.open`/`key`/`closeObject` over a struct, and std's struct
+    /// decoding (`ignore_unknown_fields`, defaults, a missing member without
+    /// one gives up as std's `MissingField` does).
+    fn object(c: *Compiled, comptime T: type, seg: ?*Seg, comptime actives: []const CActive) DecodeError!T {
+        if (try c.next() != .object_begin) return error.GiveUp;
+        try c.limitEnter(.object);
+        inline for (actives) |a| _ = try c.w.gate(seg, .{ .rule = a.rule, .pass = a.pass }, .object);
+        const sets = comptime objectSets(actives);
+        const info = @typeInfo(T).@"struct";
+        var r: T = undefined;
+        var seen: [info.field_names.len]bool = @splat(false);
+        // Keys no member has: kept to refuse a repeated one, as the walker
+        // refuses every duplicate (std's decoder skips unknown keys unchecked).
+        var unknown: [16][]const u8 = undefined;
+        var n_unknown: usize = 0;
+        while (true) {
+            const key = switch (try c.next()) {
+                .object_end => break,
+                .string => |k| k,
+                else => return error.GiveUp, // an escaped key comes in parts
+            };
+            try c.limitBegin();
+            inline for (info.field_names, info.field_types, 0..) |name, FT, i| {
+                if (std.mem.eql(u8, name, key)) {
+                    if (seen[i]) return error.GiveUp;
+                    seen[i] = true;
+                    var child: Seg = .{ .parent = seg, .field = name };
+                    @field(r, name) = try c.value(FT, &child, comptime memberActives(sets, name));
+                    break;
+                }
+            } else {
+                for (unknown[0..n_unknown]) |u| if (std.mem.eql(u8, u, key)) return error.GiveUp;
+                if (n_unknown == unknown.len) return error.GiveUp;
+                unknown[n_unknown] = key;
+                n_unknown += 1;
+                try c.skip();
+            }
+        }
+        inline for (sets) |set| {
+            inline for (set.rules) |rule| {
+                if (rule.required and !seen[comptime memberIndex(T, rule.field).?]) {
+                    c.w.use(set.pass);
+                    if (!c.w.b.full()) {
+                        var missing: Seg = .{ .parent = seg, .field = rule.field };
+                        try c.w.b.append(try c.w.path(&missing), "missing", "Field required");
+                    }
+                }
+            }
+        }
+        inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, FT, fa, i| {
+            if (!seen[i]) @field(r, name) = fa.defaultValue(FT) orelse return error.GiveUp;
+        }
+        c.limitClose();
+        return r;
+    }
+
+    /// `Walker.open`/`closeArray` over a slice, and std's slice decoding.
+    fn array(c: *Compiled, comptime E: type, seg: ?*Seg, comptime actives: []const CActive) DecodeError![]E {
+        if (try c.next() != .array_begin) return error.GiveUp;
+        try c.limitEnter(.array);
+        inline for (actives) |a| _ = try c.w.gate(seg, .{ .rule = a.rule, .pass = a.pass }, .array);
+        var list: std.array_list.Managed(E) = .init(c.arena);
+        while (try c.peek() != .array_end) {
+            var child: Seg = .{ .parent = seg, .index = list.items.len, .is_index = true };
+            try list.ensureUnusedCapacity(1);
+            list.appendAssumeCapacity(try c.value(E, &child, comptime itemActives(actives)));
+        }
+        _ = try c.next();
+        const count = list.items.len;
+        inline for (comptime arrayGated(actives)) |a| {
+            c.w.use(a.pass);
+            if (!c.w.b.full()) {
+                if (a.rule.min_len) |m| if (count < m)
+                    try c.w.b.appendf(try c.w.path(seg), "too_short", "Array should have at least {d} items", .{m});
+                if (a.rule.max_len) |m| if (count > m)
+                    try c.w.b.appendf(try c.w.path(seg), "too_long", "Array should have at most {d} items", .{m});
+            }
+        }
+        c.limitClose();
+        return list.toOwnedSlice();
+    }
+
+    /// Skip an unknown member's value with the walker's bookkeeping: the
+    /// limits, and a duplicate key at any depth inside it gives up.
+    fn skip(c: *Compiled) DecodeError!void {
+        var keys: [32][]const u8 = undefined;
+        var n_keys: usize = 0;
+        // Per open container: where its keys start (objects), or none.
+        var marks: [16]?usize = undefined;
+        var depth: usize = 0;
+        while (true) {
+            // Whole tokens, as the walker gets them: an escaped string is
+            // one `allocated_string` (in `scratch`, freed at once) instead
+            // of a run of partials.
+            const token = c.scanner.nextAllocMax(c.scratch, .alloc_if_needed, c.scanner.input.len) catch |err|
+                return if (err == error.OutOfMemory) error.OutOfMemory else error.GiveUp;
+            defer freeToken(c.scratch, token);
+            switch (token) {
+                .object_begin, .array_begin => {
+                    try c.limitEnter(if (token == .object_begin) .object else .array);
+                    if (depth == marks.len) return error.GiveUp;
+                    marks[depth] = if (token == .object_begin) n_keys else null;
+                    depth += 1;
+                },
+                .object_end, .array_end => {
+                    depth -= 1;
+                    if (marks[depth]) |m| n_keys = m;
+                    c.limitClose();
+                },
+                .string, .allocated_string => |s| {
+                    var is_value: bool = undefined;
+                    if (try c.limit.begin(&is_value) != null) return error.GiveUp;
+                    if (is_value) {
+                        c.limit.complete();
+                    } else {
+                        if (token == .allocated_string) return error.GiveUp; // a key that would have to outlive its token
+                        const from = marks[depth - 1].?;
+                        for (keys[from..n_keys]) |k| if (std.mem.eql(u8, k, s)) return error.GiveUp;
+                        if (n_keys == keys.len) return error.GiveUp;
+                        keys[n_keys] = s;
+                        n_keys += 1;
+                    }
+                },
+                .number, .allocated_number, .true, .false, .null => {
+                    try c.limitBegin();
+                    c.limit.complete();
+                },
+                else => unreachable, // whole tokens only
+            }
+            if (depth == 0) return;
+        }
+    }
+};
+
+/// The one-token source `Compiled.scalar` hands std's decoder: the scalar it
+/// has already read, as the scanner would give it.
+const OneToken = struct {
+    token: ?std.json.Token,
+
+    pub const NextError = std.json.Scanner.NextError;
+    pub const PeekError = std.json.Scanner.PeekError;
+    pub const AllocError = std.json.Scanner.AllocError;
+
+    /// Never an `allocated_*` variant: the decoder would free it, and the
+    /// value may keep it.
+    fn take(s: *OneToken) std.json.Token {
+        const t = s.token.?;
+        s.token = null;
+        return switch (t) {
+            .allocated_string => |x| .{ .string = x },
+            .allocated_number => |x| .{ .number = x },
+            else => t,
+        };
+    }
+
+    pub fn peekNextTokenType(s: *OneToken) PeekError!std.json.TokenType {
+        return switch (s.token.?) {
+            .string, .allocated_string => .string,
+            .number, .allocated_number => .number,
+            .true => .true,
+            .false => .false,
+            .null => .null,
+            else => unreachable,
+        };
+    }
+
+    pub fn next(s: *OneToken) NextError!std.json.Token {
+        return s.take();
+    }
+
+    pub fn nextAllocMax(s: *OneToken, _: Allocator, _: std.json.AllocWhen, _: usize) AllocError!std.json.Token {
+        return s.take();
+    }
+};
 
 /// `validateJsonLimited` without the value tree (see `parseIntoLeaky`). Any
 /// allocator; every temporary is freed before return, and the Report owns
@@ -7047,7 +7526,7 @@ test "fuzz driver: VALIDATE_FUZZ (json, streaming, format)" {
 
 test "fuzz harnesses: 500 seeds each in every test run, and they get everywhere" {
     fz.resetReach();
-    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness }, .{ "json", "streaming", "format", "cross" }) |h, name| {
+    inline for (.{ jsonHarness, streamingHarness, formatHarness, crossHarness, compiledHarness }, .{ "json", "streaming", "format", "cross", "compiled" }) |h, name| {
         for (0..500) |seed| {
             var prng = std.Random.DefaultPrng.init(seed);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };
@@ -8360,6 +8839,348 @@ fn fuzzCrossAgrees(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz driver: VALIDATE_FUZZ (cross)" {
     try fuzz_driver.run(crossHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "cross" });
+}
+
+// ── fuzz: the compiled typed path == the walker's ───────────────────────────
+
+const CompiledItem = struct {
+    sku: []const u8,
+    qty: u16 = 1,
+    price: ?f64 = null,
+    color: StreamColor = .red,
+};
+
+/// Every shape `parseCompiled` handles: nested structs (one optional, one
+/// with a default), a slice of structs, an optional slice of strings, a
+/// fixed `[4]u8`, enums, defaults, and a second rule set that names members
+/// with and without a default as required, holds lengths, bounds, formats,
+/// a pattern, and `.any` rules with bounds and with `one_of`.
+const CompiledOrder = struct {
+    id: []const u8,
+    owner: ?struct { name: []const u8, email: ?[]const u8 = null } = null,
+    items: []const CompiledItem = &.{},
+    tags: ?[]const []const u8 = null,
+    note: [4]u8 = "none".*,
+    level: i8 = 0,
+    /// Held to rules of the wrong container kind, and to `one_of` under
+    /// `.any`: the container gate's own errors.
+    extra: ?CompiledItem = null,
+    extra_list: ?[]const u16 = null,
+
+    pub const validate_rules: []const Rule = &.{
+        .{ .field = "id", .kind = .string, .min_len = 1, .max_len = 8 },
+        .{ .field = "owner", .kind = .object, .required = true, .fields = &.{
+            .{ .field = "name", .kind = .string, .min_len = 2 },
+            .{ .field = "email", .kind = .string, .format = .email, .required = true },
+        } },
+        .{ .field = "items", .kind = .array, .min_len = 1, .max_len = 4, .items = &.{ .field = "", .kind = .object, .fields = &.{
+            .{ .field = "sku", .kind = .string, .min_len = 3, .max_len = 8, .pattern = .{ .prefix = "S" } },
+            .{ .field = "qty", .kind = .int, .min = 1, .max = 100 },
+            .{ .field = "price", .kind = .float, .min = 0 },
+        } } },
+        .{ .field = "tags", .kind = .array, .max_len = 3, .items = &.{ .field = "", .kind = .string, .min_len = 1 } },
+        .{ .field = "level", .min = -5, .max = 5 },
+        .{ .field = "note", .one_of = &.{ "abcd", "\u{e9}\u{e9}", "none" } },
+        .{ .field = "id", .kind = .string, .pattern = .{ .prefix = "o" } },
+        .{ .field = "extra", .kind = .array },
+        .{ .field = "extra", .one_of = &.{"x"} },
+        .{ .field = "extra_list", .kind = .object },
+        .{ .field = "extra_list", .one_of = &.{"x"}, .max_len = 1 },
+    };
+};
+
+comptime {
+    // The harness proves nothing about a type the compiled path declines.
+    std.debug.assert(compiles(CompiledOrder, rootActives(CompiledOrder)));
+    std.debug.assert(compiles(FuzzTyped, rootActives(FuzzTyped)));
+    std.debug.assert(compiles([]const CompiledItem, rootActives([]const CompiledItem)));
+}
+
+const Outcome = enum { not_compiled, gave_up, ok, invalid };
+
+/// When `parseCompiled` answers `body`, require exactly the answer of the
+/// path it stands in for (`parseOnePass`, else `parseMultiPass`): equal
+/// values, or the same errors IN THE SAME ORDER.
+fn expectCompiledAgrees(comptime T: type, body: []const u8, limits: Limits) !Outcome {
+    if (comptime !compiles(T, rootActives(T))) return .not_compiled;
+    const extra: []const Rule = comptime typedExtra(T);
+    var c_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer c_arena.deinit();
+    const got = try parseCompiled(T, c_arena.allocator(), body, limits) orelse return .gave_up;
+    var r_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer r_arena.deinit();
+    const want = try parseOnePass(T, r_arena.allocator(), body, limits, extra) orelse
+        try parseMultiPass(T, r_arena.allocator(), body, limits, extra);
+    switch (want) {
+        .ok => |v| {
+            if (got != .ok) {
+                std.debug.print("\nwalker ok, compiled invalid:\n", .{});
+                for (got.invalid.errors) |e| std.debug.print("  {s} {s} {s}\n", .{ e.path, e.code, e.message });
+                return error.TestExpectedEqual;
+            }
+            try testing.expectEqualDeep(v, got.ok);
+            return .ok;
+        },
+        .invalid => |r| {
+            if (got != .invalid) {
+                std.debug.print("\nwalker invalid ({d} errors, first {s} {s}), compiled ok\n", .{ r.errors.len, r.errors[0].path, r.errors[0].code });
+                return error.TestExpectedEqual;
+            }
+            const e = got.invalid.errors;
+            if (e.len != r.errors.len) {
+                std.debug.print("\nwalker {d} errors, compiled {d}\n", .{ r.errors.len, e.len });
+                for (r.errors) |x| std.debug.print("  walker   {s} {s} {s}\n", .{ x.path, x.code, x.message });
+                for (e) |x| std.debug.print("  compiled {s} {s} {s}\n", .{ x.path, x.code, x.message });
+                return error.TestExpectedEqual;
+            }
+            for (r.errors, e) |x, y| {
+                try testing.expectEqualStrings(x.path, y.path);
+                try testing.expectEqualStrings(x.code, y.code);
+                try testing.expectEqualStrings(x.message, y.message);
+            }
+            return .invalid;
+        },
+    }
+}
+
+/// Values a member may get instead of the one its type wants: every JSON
+/// type, numbers std's decoder reads into an int (`1.0`, `1e2`, `"5"`) or
+/// refuses (`1.5`, `70000`), escapes, and containers with a duplicate key
+/// at depth.
+const compiled_junk = [_][]const u8{
+    "1",    "-1",                "1.0",                                   "1e2",          "70000",                                       "1.5", "\"5\"",
+    "\"\"", "\"x\\u0041\"",      "true",                                  "false",        "null",                                        "[]",  "[1,\"a\"]",
+    "{}",   "{\"a\":1,\"a\":2}", "{\"b\":{\"c\":[1,{\"d\":1,\"d\":2}]}}", "\"S\\u00e9\"", "{\"b\":{\"c\":[1,{\"d\":1,\"e\":\"\\n\"}]}}", "-0",  "\"order-1\"",
+};
+
+/// The valid body (`g.valid`) takes the first value of every pool.
+fn pick(comptime S: type, src: *S, pool: []const []const u8) []const u8 {
+    if (gen_valid) return pool[0];
+    return pool[src.index(pool.len)];
+}
+
+/// Mostly from `decodes` (values std's decoder reads into the member's type,
+/// many of them against a rule), rarely from `breaks` (values it refuses).
+fn pick2(comptime S: type, src: *S, decodes: []const []const u8, breaks: []const []const u8) []const u8 {
+    if (!gen_valid and breaks.len != 0 and src.index(16) == 0) return pick(S, src, breaks);
+    return pick(S, src, decodes);
+}
+
+/// Most of the time a value of the right shape (but not always a valid
+/// one), else junk.
+fn genCompiledValue(comptime S: type, src: *S, w: *std.Io.Writer, member: []const u8, depth: u8) std.Io.Writer.Error!void {
+    if (!gen_valid and (src.index(30) == 0 or depth > 3)) return w.writeAll(pick(S, src, &compiled_junk));
+    const eql = std.mem.eql;
+    if (eql(u8, member, "id")) return w.writeAll(pick(S, src, &.{ "\"o1\"", "\"order-12\"", "\"\"", "\"x\"", "\"o\\u0031\"", "\"ordering-too-long\"" }));
+    if (eql(u8, member, "note")) return w.writeAll(pick2(S, src, &.{ "\"abcd\"", "\"\\u00e9\\u00e9\"" }, &.{ "\"abc\"", "\"abcde\"" }));
+    if (eql(u8, member, "level")) return w.writeAll(pick2(S, src, &.{ "1", "2", "\"1\"", "-128", "127", "6", "1.0" }, &.{ "128", "1.5" }));
+    if (eql(u8, member, "sku")) return w.writeAll(pick(S, src, &.{ "\"S100\"", "\"SK\"", "\"X100\"", "\"S1234567890\"", "\"S\\u00e91\"", "\"S\\u00e9\"" }));
+    if (eql(u8, member, "qty")) return w.writeAll(pick2(S, src, &.{ "1", "100", "0", "101", "65535", "2.0", "\"7\"", "1e2" }, &.{ "65536", "-1" }));
+    if (eql(u8, member, "price")) return w.writeAll(pick(S, src, &.{ "0", "1.5", "-0.5", "1e300", "null", "\"2.5\"", "3" }));
+    if (eql(u8, member, "color")) return w.writeAll(pick2(S, src, &.{ "\"red\"", "\"blue\"", "1" }, &.{ "\"pink\"", "7" }));
+    if (eql(u8, member, "name")) return w.writeAll(pick(S, src, &.{ "\"Grace\"", "\"G\"", "\"\"" }));
+    if (eql(u8, member, "email")) return w.writeAll(pick(S, src, &.{ "\"g@example.com\"", "\"nope\"", "null" }));
+    if (eql(u8, member, "owner")) {
+        if (!gen_valid and src.index(6) == 0) return w.writeAll(pick2(S, src, &.{"null"}, &.{ "false", "[]" }));
+        return genCompiledObject(S, src, w, &.{ "name", "email" }, depth + 1);
+    }
+    if (eql(u8, member, "item") or eql(u8, member, "extra")) return genCompiledObject(S, src, w, &.{ "sku", "qty", "price", "color" }, depth + 1);
+    if (eql(u8, member, "extra_list")) return w.writeAll(pick(S, src, &.{ "[]", "[1]", "[1,2]", "null" }));
+    if (eql(u8, member, "items") or eql(u8, member, "tags")) {
+        if (eql(u8, member, "tags") and !gen_valid and src.index(6) == 0) return w.writeAll("null");
+        try w.writeByte('[');
+        const n = if (gen_valid) 1 + src.index(3) else src.index(6);
+        for (0..n) |i| {
+            if (i != 0) try w.writeByte(',');
+            if (eql(u8, member, "items"))
+                try genCompiledValue(S, src, w, "item", depth + 1)
+            else
+                try w.writeAll(pick2(S, src, &.{ "\"t\"", "\"\"", "\"t\\u0032\"" }, &.{"2"}));
+        }
+        return w.writeByte(']');
+    }
+    return w.writeAll(pick(S, src, &compiled_junk));
+}
+
+/// An object over `members`, each present or not, starting at a drawn one;
+/// now and then one quirk: an unknown member, a repeated one, or a member
+/// under an escaped key.
+fn genCompiledObject(comptime S: type, src: *S, w: *std.Io.Writer, members: []const []const u8, depth: u8) std.Io.Writer.Error!void {
+    try w.writeByte('{');
+    var first = true;
+    const start = src.index(members.len);
+    const quirk = src.index(members.len + 1);
+    for (0..members.len) |k| {
+        const m = members[(start + k) % members.len];
+        const rare = std.mem.startsWith(u8, m, "extra");
+        if (if (rare) !gen_valid and src.index(4) == 0 else gen_valid or src.index(8) != 0) {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("\"{s}\":", .{m});
+            try genCompiledValue(S, src, w, m, depth);
+        }
+        if (gen_valid or k != quirk or src.index(3) != 0) continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        switch (src.index(3)) {
+            0 => {
+                // an unknown member, once or twice
+                const name = pick(S, src, &.{ "\"x\":", "\"meta\":" });
+                try w.writeAll(name);
+                try w.writeAll(pick(S, src, &compiled_junk));
+                if (src.index(2) == 0) {
+                    try w.writeByte(',');
+                    try w.writeAll(pick(S, src, &.{ "\"x\":", "\"meta\":" }));
+                    try w.writeAll(pick(S, src, &compiled_junk));
+                }
+            },
+            1 => {
+                try w.print("\"{s}\":", .{m});
+                try genCompiledValue(S, src, w, m, depth);
+            },
+            else => {
+                try w.print("\"\\u{x:0>4}{s}\":", .{ @as(u16, m[0]), m[1..] });
+                try genCompiledValue(S, src, w, m, depth);
+            },
+        }
+    }
+    try w.writeByte('}');
+}
+
+/// Set by `compiledHarness` for one body in eight: a document every rule
+/// accepts, so the `ok` arm is reached at all. (The harness runs one input
+/// at a time.)
+var gen_valid = false;
+
+fn genCompiledLimits(comptime S: type, src: *S) Limits {
+    if (src.index(3) != 0) return .{};
+    return .{
+        .max_depth = 1 + src.index(4),
+        .max_array_elements = 1 + src.index(5),
+        .max_object_members = 1 + src.index(6),
+        .max_total_nodes = 5 + src.index(60),
+        .max_errors = 1 + src.index(4),
+    };
+}
+
+fn compiledHarness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    gen_valid = src.index(8) == 0;
+    defer gen_valid = false;
+    const as_array = src.index(4) == 0;
+    if (as_array) {
+        w.writeByte('[') catch {};
+        const n = src.index(4);
+        for (0..n) |i| {
+            if (i != 0) w.writeByte(',') catch {};
+            genCompiledValue(S, src, &w, "item", 1) catch {};
+        }
+        w.writeByte(']') catch {};
+    } else {
+        genCompiledObject(S, src, &w, &.{ "id", "owner", "items", "tags", "note", "level", "extra", "extra_list" }, 0) catch {};
+    }
+    var body = w.buffered();
+    switch (if (gen_valid) 2 else src.index(12)) {
+        0 => body = body[0..src.index(body.len + 1)], // truncated
+        1 => {
+            w.writeAll(pick(S, src, &.{ " ", "x", "{}", " 1" })) catch {};
+            body = w.buffered();
+        },
+        else => {},
+    }
+    const limits = if (gen_valid) Limits{} else genCompiledLimits(S, src);
+    const outcome = if (as_array)
+        try expectCompiledAgrees([]const CompiledItem, body, limits)
+    else
+        try expectCompiledAgrees(CompiledOrder, body, limits);
+    fz.mark(switch (outcome) {
+        .not_compiled => unreachable, // the comptime asserts above
+        .gave_up => .compiled_gave_up,
+        .ok => .compiled_ok,
+        .invalid => .compiled_invalid,
+    });
+}
+
+test "fuzz driver: VALIDATE_FUZZ (compiled)" {
+    try fuzz_driver.run(compiledHarness, .{ .prefix = "VALIDATE_FUZZ", .name = "compiled" });
+}
+
+test "compiled path: which typed bodies it takes, and that it answers them" {
+    // A scalar's `custom` is `checkRule`'s; a container's, `cross`, a rule
+    // for a member the type lacks, a fixed-length array of structs: the
+    // walker's.
+    try testing.expect(comptime compiles(StreamUser, rootActives(StreamUser)) == false); // `history` has a custom
+    const yes = struct {
+        fn f(_: ?*anyopaque, _: Value) bool {
+            return true;
+        }
+    }.f;
+    const ScalarCustom = struct {
+        a: i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "a", .custom = .{ .check = yes } }};
+    };
+    const WithCustom = struct {
+        a: []const i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "a", .custom = .{ .check = yes } }};
+    };
+    try testing.expect(comptime compiles(ScalarCustom, rootActives(ScalarCustom)));
+    const WithCross = struct {
+        a: i64,
+        b: i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "b", .cross = &.{.{ .op = .gt_field, .other = "a" }} }};
+    };
+    const Phantom = struct {
+        a: i64,
+        pub const validate_rules: []const Rule = &.{.{ .field = "zz", .required = true }};
+    };
+    try testing.expect(!comptime compiles(WithCustom, rootActives(WithCustom)));
+    try testing.expect(!comptime compiles(WithCross, rootActives(WithCross)));
+    try testing.expect(!comptime compiles(Phantom, rootActives(Phantom)));
+    try testing.expect(!comptime compiles([2]BatchRow, rootActives([2]BatchRow)));
+
+    const good = "{\"id\":\"o1\",\"owner\":{\"name\":\"Grace\",\"email\":\"g@example.com\"},\"items\":[{\"sku\":\"S100\",\"qty\":3,\"price\":1.5}],\"level\":1}";
+    try testing.expectEqual(Outcome.ok, try expectCompiledAgrees(CompiledOrder, good, .{}));
+    const bad = "{\"id\":\"x\",\"owner\":{\"name\":\"G\"},\"items\":[{\"sku\":\"X1\",\"qty\":0},{\"sku\":\"S100\",\"qty\":\"7\"}],\"level\":3}";
+    try testing.expectEqual(Outcome.invalid, try expectCompiledAgrees(CompiledOrder, bad, .{}));
+    // The container gate's errors: a kind that is not the container's, and
+    // `one_of` under `.any` meeting a container.
+    try testing.expectEqual(Outcome.invalid, try expectCompiledAgrees(CompiledOrder, "{\"id\":\"o1\",\"owner\":null,\"extra\":{\"sku\":\"S100\"},\"extra_list\":[1,2]}", .{}));
+    // Given up, answered by the walker: an escaped key, a duplicate inside
+    // an unknown member, a limit, trailing data.
+    try testing.expectEqual(Outcome.gave_up, try expectCompiledAgrees(CompiledOrder, "{\"\\u0069d\":\"o1\"}", .{}));
+    try testing.expectEqual(Outcome.gave_up, try expectCompiledAgrees(CompiledOrder, "{\"id\":\"o1\",\"x\":{\"a\":1,\"a\":2}}", .{}));
+    try testing.expectEqual(Outcome.gave_up, try expectCompiledAgrees(CompiledOrder, "{\"id\":\"o1\",\"x\":1,\"x\":2}", .{}));
+    try testing.expectEqual(Outcome.gave_up, try expectCompiledAgrees(CompiledOrder, good, .{ .max_depth = 2 }));
+    try testing.expectEqual(Outcome.gave_up, try expectCompiledAgrees(CompiledOrder, "{\"id\":\"o1\"} 1", .{}));
+}
+
+test "compiled path: an allocation failure is OutOfMemory, never another answer" {
+    // Its own fail_index loop: `checkAllAllocationFailures` over an arena
+    // reports NondeterministicMemoryUsage.
+    const bodies = [_][]const u8{
+        "{\"id\":\"o1\",\"owner\":{\"name\":\"Grace\",\"email\":\"g@example.com\"},\"items\":[{\"sku\":\"S\\u00e91\",\"qty\":3}],\"x\":{\"y\":[\"a\\nb\",{\"z\":1}]}}",
+        "{\"id\":\"x\",\"owner\":{\"name\":\"G\"},\"items\":[{\"sku\":\"X1\",\"qty\":0},{\"sku\":\"S100\",\"qty\":\"7\"}],\"level\":9}",
+    };
+    for (bodies) |body| {
+        const want = try expectCompiledAgrees(CompiledOrder, body, .{});
+        try testing.expect(want == .ok or want == .invalid);
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+            var arena = std.heap.ArenaAllocator.init(fa.allocator());
+            defer arena.deinit();
+            const got = parseCompiled(CompiledOrder, arena.allocator(), body, .{}) catch |err| {
+                try testing.expectEqual(error.OutOfMemory, err);
+                continue;
+            };
+            try testing.expect(got != null);
+            try testing.expectEqual(want == .ok, got.? == .ok);
+            if (!fa.has_induced_failure) break;
+        }
+        try testing.expect(i > 0);
+    }
 }
 
 test "fuzz: the cross corpus reaches cross-field violations" {

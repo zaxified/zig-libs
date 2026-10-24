@@ -7,13 +7,14 @@
 //!
 //! Driver: `VALIDATE_FUZZ=<runs>[,<first seed>]` (testkit's fuzz driver; `_MS`,
 //! `_SEEDFILE`, `_INPUT`, `_ONLY` as documented there). Harness names: `json`,
-//! `streaming`, `format`, `cross` (cross-field rules + array roots, tree == streaming).
+//! `streaming`, `format`, `cross` (cross-field rules + array roots, tree == streaming),
+//! `compiled` (the compiled typed path == the walker's, errors in the same order).
 
 const std = @import("std");
 const testkit = @import("testkit");
 const fuzz_driver = testkit.fuzz.driver;
 
-pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations };
+pub const Label = enum { json_invalid, json_violations, streaming_agreed, format_accepted, format_rejected, cross_agreed, cross_violations, compiled_ok, compiled_invalid, compiled_gave_up };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 
 pub fn mark(l: Label) void {
