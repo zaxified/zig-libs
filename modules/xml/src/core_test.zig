@@ -12,7 +12,7 @@ const std = @import("std");
 const testing = std.testing;
 const xml = @import("root.zig");
 const cv = @import("core_vectors.zig");
-const xmlconf = @import("xmlconf_vectors.zig");
+const wf = @import("wf_vectors.zig");
 
 /// The recipe's dump format (see `tools/gen_core_vectors.py`).
 pub fn dump(a: std.mem.Allocator, out: *std.ArrayList(u8), el: *const xml.Element) !void {
@@ -150,49 +150,66 @@ test "entities: limits are exact (depth and total bytes, derived by hand)" {
     try testing.expectError(error.DoctypeForbidden, xml.parse(a, three, .{}));
 }
 
-test "entities: the xmlconf accept vectors under .internal_entities" {
-    // Every W3C accept vector parses, or fails ONLY with the documented
-    // text-only limitation (markup in a replacement text). Counts pinned.
-    const a = testing.allocator;
-    var parsed: usize = 0;
-    var markup: usize = 0;
-    for (xmlconf.accept_vectors) |v| {
-        if (xml.parse(a, v.content, .{ .doctype = .internal_entities })) |d| {
-            var doc = d;
-            doc.deinit();
-            parsed += 1;
-        } else |e| {
-            if (e != error.UnsupportedEntity) {
-                std.debug.print("{s}: {t}\n", .{ v.id, e });
-                return e;
-            }
-            markup += 1;
-        }
-    }
-    try testing.expectEqual(xmlconf.accept_vectors.len, parsed + markup);
-    // Three vectors put markup in an entity's replacement text — the
-    // documented text-only limit; the rest (102) expand and parse.
-    try testing.expectEqual(@as(usize, 3), markup);
+/// The own well-formedness vectors libxml2 accepts and this module accepts
+/// the same way (no recorded deviation).
+fn isAccept(c: wf.Case) bool {
+    return c.lxml != null and c.ours == null;
 }
 
-test "writer round trip: every xmlconf accept vector reads back to the same infoset" {
+fn wfOptions(c: wf.Case) xml.Options {
+    return .{ .doctype = switch (c.mode) {
+        .none, .ignore => .ignore,
+        .entities => .internal_entities,
+    } };
+}
+
+test "entities: the wf accept vectors under .internal_entities" {
+    // Every accepted vector parses with internal entities on, and reads back
+    // as libxml2's DUMP (the no-op subsets declare nothing; the entity vectors
+    // expand). Documents with a DOCTYPE and no declarations are the same
+    // under .ignore and .internal_entities.
     const a = testing.allocator;
-    for (xmlconf.accept_vectors) |v| {
-        var doc = xml.parse(a, v.content, .{ .doctype = .ignore }) catch continue;
+    var parsed: usize = 0;
+    for (wf.cases) |c| {
+        if (!isAccept(c)) continue;
+        var doc = xml.parse(a, c.input, .{ .doctype = .internal_entities }) catch |e| {
+            std.debug.print("{s}: {t}\n", .{ c.id, e });
+            return e;
+        };
+        defer doc.deinit();
+        const got = try dumpDoc(a, &doc);
+        defer a.free(got);
+        testing.expectEqualStrings(c.lxml.?, got) catch |e| {
+            std.debug.print("{s}\n", .{c.id});
+            return e;
+        };
+        parsed += 1;
+    }
+    try testing.expect(parsed > 200);
+}
+
+test "writer round trip: every wf accept vector reads back to the same infoset" {
+    const a = testing.allocator;
+    for (wf.cases) |c| {
+        if (!isAccept(c)) continue;
+        var doc = xml.parse(a, c.input, wfOptions(c)) catch |e| {
+            std.debug.print("{s}: {t}\n", .{ c.id, e });
+            return e;
+        };
         defer doc.deinit();
         const before = try dumpDoc(a, &doc);
         defer a.free(before);
         const text = try serialize(a, &doc);
         defer a.free(text);
         var again = xml.parse(a, text, .{}) catch |e| {
-            std.debug.print("{s}: {t}\n{s}\n", .{ v.id, e, text });
+            std.debug.print("{s}: {t}\n{s}\n", .{ c.id, e, text });
             return e;
         };
         defer again.deinit();
         const after = try dumpDoc(a, &again);
         defer a.free(after);
         testing.expectEqualStrings(before, after) catch |e| {
-            std.debug.print("{s}\n", .{v.id});
+            std.debug.print("{s}\n", .{c.id});
             return e;
         };
     }

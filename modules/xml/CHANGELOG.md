@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE (tests, tools and licence only):** the vendored slice of
+  the W3C XML Conformance Test Suite (130 files, `src/testdata/xmlconf/`) is **removed**: its files
+  carry notices that grant no right to redistribute them, and this repository is MIT. Replaced by
+  (a) **own inputs** — `src/wf_vectors.zig`, 491 documents (245 not well-formed, 246 well-formed)
+  written for the XML 1.0 productions and Namespaces 1.0 constraints, recipe
+  `tools/gen_wf_vectors.py`; the expected verdicts and infosets are libxml2's (through lxml, black box),
+  run by `src/wf_test.zig`, `core_test.zig` (`.internal_entities` and writer round trip), and
+  `tools/writer_oracle.py`; and (b) a **fetch-at-test-time runner** for the real suite —
+  `tools/xmlconf_fetch.sh` (sha256-pinned download into the gitignored `tools/xmlconf-suite/`) and
+  `tools/xmlconf_run.zig` (hand-run; first run 2026-10-24: 883 pass, 1 known disagreement
+  `x-rmt-008b` — XML 1.0 5th ed. allows version `1.7`, this module refuses every version but 1.0 —
+  and 0 unexpected, including the previously excluded `xmltest` sub-suite). `NOTICE` no longer lists
+  third-party test text. **Measured differences from libxml2, recorded not fixed** (`ours` in the
+  recipe): `doctype = .ignore` accepts a second, misplaced (after the root, inside the root), nameless
+  or `]`-without-`[` DOCTYPE; `xmlns="http://www.w3.org/XML/1998/namespace"` is accepted; CR (CR LF or
+  lone CR) is kept inside a CDATA section where XML 1.0 §2.11 and libxml2 normalize it to LF.
+
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.
 
 - **2026-10-04** — **mvp → core** (reference: libxml2 2.15 / libexpat 2.8).
@@ -114,7 +131,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     reservation), F9 "M16" above, and F10 (`.ignore` DOCTYPE skip mishandles
     a literal `>` inside a quoted external identifier). No behaviour
     change; SPEC.md now says what the parser actually does.
-- **2026-09-09** — Docs: `src/xmlconf_vectors.zig` carried two NOTICE pointers and both were
+- **2026-09-09** — Docs: the (since removed) vendored xmlconf vector file carried two NOTICE pointers and both were
   wrong. `../../NOTICE` resolves to `modules/NOTICE`, which has never existed; and the second
   one described the root file as "the root-level attribution index", which it stopped being on
   2026-09-06. `../NOTICE` is now the whole answer. No code or data changed.
@@ -155,7 +172,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-08-06** — Security audit: three findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Verified: Genuine
   external oracle — the vendored W3C XML Conformance Test Suite
-  (`src/testdata/xmlconf/`, driven by `src/xmlconf_test.zig`): 25 `not-wf` reject
-  vectors + 105.
+  (then in `src/testdata/xmlconf/`, since removed, see 2026-10-24): 25 `not-wf`
+  reject vectors + 105.
 - **2026-07-21** — New module: namespace-aware, security-hardened XML 1.0 parser →
   C14N-ready infoset tree.

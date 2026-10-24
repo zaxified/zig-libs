@@ -24,15 +24,16 @@
 // ⚠ `ratio` reports PEAK LIVE bytes, not cumulative. A cumulative counter
 // cannot see simultaneity, and the bound that matters is the high-water mark.
 //
-// ⚠ NO ACCESS TO THE xmlconf VECTOR LIST, DELIBERATELY. The audit's probe had
-// `vectors` and `dump` commands reading `xmlconf_vectors.zig` directly. That
-// cannot be rebuilt as a separate module: `root.zig` already reaches that file
-// through `xmlconf_test.zig`, and Zig refuses a file that belongs to two
-// modules ("file exists in modules 'xmlvectors' and 'xml'"). The only way back
-// would be to add public API to the module so a TOOL can see its fixtures --
-// and a verification instrument must not reshape the thing it verifies. The
-// loss is small: `xmlconf_test.zig` already drives all 130 vectors in-tree,
-// both directions, with a canary test pinning the counts.
+// ⚠ NO ACCESS TO THE TEST VECTOR LIST, DELIBERATELY. The audit's probe had
+// `vectors` and `dump` commands reading the vector file directly. That cannot
+// be rebuilt as a separate module: `root.zig` already reaches the vectors
+// through `wf_test.zig`, and Zig refuses a file that belongs to two modules
+// ("file exists in modules 'xmlvectors' and 'xml'"). The only way back would
+// be to add public API to the module so a TOOL can see its fixtures -- and a
+// verification instrument must not reshape the thing it verifies. The loss is
+// small: `wf_test.zig` already drives every vector in-tree, both directions.
+// `file <path> [ignore|entities]` takes the verdict of one document under the
+// three doctype policies; `gen_wf_vectors.py --files DIR` writes the inputs.
 //
 // WHAT IT NEEDS: the live module, nothing else.
 //
@@ -152,9 +153,10 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, cmd, "file")) {
         const path = args[2];
         const ignore = args.len > 3 and std.mem.eql(u8, args[3], "ignore");
+        const entities = args.len > 3 and std.mem.eql(u8, args[3], "entities");
         const src = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 28));
         defer gpa.free(src);
-        const opts: xml.Options = .{ .doctype = if (ignore) .ignore else .reject };
+        const opts: xml.Options = .{ .doctype = if (entities) .internal_entities else if (ignore) .ignore else .reject };
         std.debug.print("{s}\n", .{verdict(gpa, src, opts)});
         return;
     }

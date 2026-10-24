@@ -71,10 +71,10 @@ Options: `max_depth`, `max_attributes`, `max_name_len`, `doctype`
 - **Model after:** W3C XML 1.0 (5th ed.) + Namespaces in XML 1.0; OWASP XXE
   prevention guidance.
 
-Provenance: original work of the zig-libs authors (MIT) — for the CODE. The
-test data is a separate matter: this module vendors a slice of the W3C XML
-Conformance Test Suite, which carries required attribution, so see
-[`NOTICE`](NOTICE) beside this file, which is where the obligation lives.
+Provenance: original work of the zig-libs authors (MIT). The test inputs are
+the authors' own too; the expected verdicts come from libxml2 (through lxml)
+used as a black-box oracle. The W3C XML Conformance Test Suite is not shipped:
+it is downloaded on demand (`tools/xmlconf_fetch.sh`). See [`NOTICE`](NOTICE).
 
 ## Input encodings, internal entities, writing (2026-10-04)
 
@@ -114,14 +114,15 @@ ISO-8859-1 and US-ASCII. Canonicalization and signature verification themselves 
 
 `zig build test-xml` — green in Debug and `-Doptimize=ReleaseFast`.
 Composition: W3C-pattern well-formed docs (namespaces / mixed content / entities
-/ spans), W3C-pattern not-well-formed rejections (modeled on xmlconf `not-wf/sa`
-+ Namespaces error cases), and security tests (XXE, billion-laughs, depth,
+/ spans), W3C-pattern not-well-formed rejections (the same defect classes as the
+W3C `not-wf` suite, plus Namespaces error cases), and security tests (XXE, billion-laughs, depth,
 attribute count, duplicate ID, invalid UTF-8) each with a positive control.
 `zig fmt --check modules/xml` clean.
 
 2026-10-04: `core_test.zig` replays libxml2's (lxml's) reading of 27 encoding
 and entity cases (`core_vectors.zig`, recipe `tools/gen_core_vectors.py`) and
-round-trips every xmlconf accept vector through the writer; `fuzz_test.zig` is
+round-trips every accepted own well-formedness vector (`wf_vectors.zig`, 491
+inputs with libxml2's verdicts) through the writer; `fuzz_test.zig` is
 a deterministic fuzz driver (`XML_FUZZ=<runs>[,<seed>]`); `tools/writer_oracle.*`
 hands the writer's output to libxml2 and compares canonical forms (119 of 119
 documents equal).

@@ -252,8 +252,8 @@ agree, only the module needed to change).
   expanded at declaration, general references at use) and §3.3.3 in attribute values (white
   space from replacement text becomes a space; `<` is refused). Only text-only replacements: a
   `<` in content replacement is `UnsupportedEntity` — markup from an entity would need the parser
-  re-entered with spans that point nowhere in the source (3 of the 105 xmlconf accept vectors
-  hit this). **Bounds:** recursion ≤ `max_entity_depth` (and ≤ 16 by the chain array), a name
+  re-entered with spans that point nowhere in the source (an entity whose replacement
+  contains markup is `UnsupportedEntity`; libxml2 expands it). **Bounds:** recursion ≤ `max_entity_depth` (and ≤ 16 by the chain array), a name
   already on the chain is `EntityLoop`, and one budget, `max_entity_expansion`, is charged a unit
   per byte produced AND per reference expanded — the self-review found that bytes alone let
   ten levels of ten references to `""` run 10^10 expansions for free.
@@ -273,8 +273,8 @@ Green in Debug and ReleaseFast (UB-checked). Composition:
   namespace default/prefixed/scoping/shadowing/resolution, mixed content with
   comments + PIs + CDATA + byte-span round-trip, entity + numeric-ref decoding,
   attribute-value normalization, ID lookup, inherited namespace axis.
-- **W3C-pattern not-well-formed** (modeled on the xmlconf `not-wf/sa` +
-  Namespaces error cases): mismatched/overlapping/unclosed tags, duplicate
+- **W3C-pattern not-well-formed** (the same defect classes as the W3C
+  `not-wf` suite plus Namespaces error cases, as own inputs): mismatched/overlapping/unclosed tags, duplicate
   attribute, undeclared entity, undeclared prefix, prefix-undeclaration,
   invalid name, out-of-range char ref, bad comment, multiple/absent roots,
   top-level text.
@@ -289,17 +289,26 @@ Green in Debug and ReleaseFast (UB-checked). Composition:
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/xmlconf_test.zig runs 130 cases of the W3C XML Conformance Test Suite (src/testdata/xmlconf) through parse; the slice is LICENCE-FILTERED (xmltest excluded on licence grounds, so the suite's largest section is absent) and src/xmlconf_test.zig carries a known_disagreements list -- paths outside the vendored slice remain self-graded
+**What the tests actually contain.** `src/wf_test.zig` runs 491 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 246 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). Eight deliberate deviations are recorded in the recipe (`ours`): five places where `doctype = .ignore` skips a misplaced or malformed DOCTYPE that libxml2 refuses, `xmlns="<XML namespace>"` accepted, and CR kept inside CDATA sections (libxml2 normalizes line ends there). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (2026-10-24: 883 pass, 1 known disagreement, 0 unexpected; see `tools/README.md`).
 
-**How it got there.** The anchoring work landed. DONE 6cc02e8: 130 xmlconf cases, FIVE real bugs; xmltest excluded on licence grounds
+**How it got there.** Until 2026-10-24 a licence-filtered slice of the W3C suite was vendored (130 cases, FIVE real bugs found in it, DONE 6cc02e8); it was replaced because its files carry no redistribution licence.
 
 ## Backlog / deferred
 
 **2026-10-04:** writer, non-UTF-8 input and internal entities are **done** (see the 2026-10-04 section); still
 deferred, with the reason:
 
+- **Leniencies against libxml2, found 2026-10-24 by the own-input vectors** (recorded as `OURS` in
+  `tools/gen_wf_vectors.py`, pinned by `wf_test.zig`, not yet fixed): (1) under `doctype = .ignore` a
+  second, misplaced, nameless or `]`-without-`[` DOCTYPE is accepted; (2) `xmlns` bound to the XML
+  namespace URI as the default namespace is accepted; (3) a CR (CR LF or lone) inside a CDATA section
+  is kept, where XML 1.0 §2.11 normalizes it to LF — this one changes the infoset that `xmldsig`/C14N
+  digest, so it is first. Fixing each flips its `OURS` entry. Real suite: XML 1.0 5th-edition
+  version numbers (`1.7`, `x-rmt-008b`) are refused (`UnsupportedVersion`), the runner's one known
+  disagreement.
+
 - **Streaming (pull/SAX) reader** — a resumable tokenizer is a second parser with its own conformance surface; the
-  tree parser is the one xmlconf anchors, and every consumer in the collection (`xmldsig`, `saml`, `xmlenc`,
+  tree parser is the one the libxml2-anchored vectors cover, and every consumer in the collection (`xmldsig`, `saml`, `xmlenc`,
   `netconf`, `iec61850`) needs the tree. Next step when a consumer needs it.
 - **Entities with markup in their replacement text** — needs the parser re-entered on replacement text, with spans
   that cannot index the source; libxml2/expat do it; no consumer needs it.
