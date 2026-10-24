@@ -1,0 +1,23 @@
+[package]
+name = "requestid_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-requestid`
+# (modules/requestid/tools/bench.zig): tower-http's SetRequestIdLayer +
+# PropagateRequestIdLayer, pinned exactly, with only the `request-id` feature;
+# httparse stands in for Go's http.ReadRequest.
+[dependencies]
+tower-http = { version = "=0.7.1", default-features = false, features = ["request-id"] }
+tower-layer = "=0.3.3"
+tower-service = "=0.3.3"
+http = "=1.5.0"
+httparse = "=1.10.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

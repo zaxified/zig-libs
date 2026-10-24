@@ -31,8 +31,8 @@
 //!
 //! ## Memory / concurrency
 //!
-//! An adopted ID borrows the request head (stable for the response). A
-//! generated ID lives in thread-local storage (the server is
+//! An adopted ID is copied, and a generated one written, into thread-local
+//! storage (the server is
 //! task-per-connection: one request at a time per thread, so the buffer is
 //! valid until the response is flushed and only reused by the *next* request
 //! on that thread). `current()` reads that thread-local, so it is meaningful
@@ -72,6 +72,9 @@ pub const max_adopt_len = 200;
 
 pub const Options = struct {
     /// The correlation header read and written. Default `X-Request-Id`.
+    /// Must be an RFC 9110 token and not a framing header (`Content-Length`,
+    /// `Transfer-Encoding`) — `middleware()` panics otherwise, because every
+    /// echo would fail and every request with it.
     header_name: []const u8 = default_header,
     /// Adopt a valid incoming header value instead of always generating.
     trust_incoming: bool = true,
@@ -89,8 +92,10 @@ pub const Options = struct {
 /// `run` writes into `buf` (thread-local, reused by the next request on the
 /// thread) and returns the ID as a sub-slice of it. The result must pass
 /// `isAdoptable` — the same shape an incoming ID needs, so `current()` stays
-/// safe for an unescaped log sink and the echo cannot fail (`http` refuses a
-/// header value with CR/LF, which would fail the request). A result that
+/// safe for an unescaped log sink and the echo never fails on the value
+/// (`http` refuses a header value with CR/LF, which would fail the request;
+/// a response header table an outer middleware already filled still fails it,
+/// like any other header). A result that
 /// does not (empty, bad byte, not inside `buf`) is discarded and the
 /// built-in generator is used instead.
 pub const Generator = struct {
@@ -103,7 +108,10 @@ pub const Generator = struct {
 pub const RequestId = struct {
     options: Options = .{},
 
+    /// `ri` must outlive the router. Panics (in every build mode) on a
+    /// `header_name` the echo could never set — see `Options.header_name`.
     pub fn middleware(ri: *const RequestId) router.Middleware {
+        if (!isUsableHeaderName(ri.options.header_name)) @panic("requestid: Options.header_name is not a usable header name");
         return .{ .state = @constCast(ri), .run = middlewareRun };
     }
 };
@@ -113,8 +121,14 @@ pub const RequestId = struct {
 threadlocal var id_buf: [max_adopt_len]u8 = undefined;
 threadlocal var current_id: []const u8 = &.{};
 
-/// The current request's ID, or null if no `RequestId` middleware has run on
-/// this thread yet. Call it from the connection thread during the request.
+/// The ID the `RequestId` middleware last assigned on this thread, or null if
+/// it has not run on this thread yet. It stays set after the request (an
+/// access log registered *outside* the middleware reads it once the chain
+/// returns) until the next request the middleware runs for, so a request
+/// that bypasses the middleware sees the previous one's ID: register it
+/// first. The bytes are always this thread's own copy — before 2026-10-24 an
+/// adopted ID pointed into the request head, which the next request on the
+/// connection overwrites.
 pub fn current() ?[]const u8 {
     return if (current_id.len == 0) null else current_id;
 }
@@ -125,7 +139,10 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     const id: []const u8 = blk: {
         if (ri.options.trust_incoming) {
             if (ctx.req.header(ri.options.header_name)) |incoming| {
-                if (isAdoptable(incoming)) break :blk incoming; // stable: request head
+                if (isAdoptable(incoming)) { // ≤ max_adopt_len = id_buf.len
+                    @memcpy(id_buf[0..incoming.len], incoming);
+                    break :blk id_buf[0..incoming.len];
+                }
             }
         }
         if (ri.options.generator) |g| {
@@ -137,6 +154,19 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
     if (ri.options.echo) try ctx.res.setHeader(ri.options.header_name, id);
     return next.run(ctx);
+}
+
+/// An RFC 9110 `token` that `http` will set as an ordinary header: the
+/// framing headers it treats specially (Content-Length is parsed as a number,
+/// Transfer-Encoding is dropped) would make every echo fail or vanish.
+fn isUsableHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return !std.ascii.eqlIgnoreCase(name, "content-length") and
+        !std.ascii.eqlIgnoreCase(name, "transfer-encoding");
 }
 
 /// The generator's ID when it honours the `Generator` contract, else null.
@@ -180,7 +210,9 @@ pub fn isAdoptable(v: []const u8) bool {
 /// per-process prefix · 16 hex of a process-wide sequence number. Unique
 /// within the process for 2^64 calls, from any number of threads; across
 /// processes (restarts, replicas) the prefix makes a clash improbable, not
-/// impossible. No allocation and no OS-entropy call (see module doc).
+/// impossible. A `fork()` child inherits the prefix AND the counter if the
+/// parent generated an ID before forking, so parent and child then repeat
+/// each other's IDs — a pre-fork server must not generate before it forks. No allocation and no OS-entropy call (see module doc).
 ///
 /// `pub` for explicit-state servers (see `isAdoptable`); safe from a fiber,
 /// unlike `current()`: it touches only process-wide atomics and the
@@ -299,9 +331,14 @@ test "generateInto: no duplicate across many threads (the 2026-09-30 survey gap)
     defer testing.allocator.free(ids);
     var go: std.atomic.Value(bool) = .init(false);
     var threads: [n_threads]std.Thread = undefined;
+    // Every thread races the FIRST prefix computation too (mutation
+    // 2026-10-24: a cmpxchg loser returning its own value survived, the
+    // prefix having been cached by an earlier test).
+    prefix_cache.store(0, .monotonic);
     for (&threads, ids) |*th, *out| th.* = try std.Thread.spawn(.{}, T.run, .{ &go, out });
     go.store(true, .release);
     for (threads) |th| th.join();
+    for (ids) |*per| for (per) |*id| try testing.expectEqualStrings(ids[0][0][0..16], id[0..16]);
 
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(testing.allocator);
@@ -475,7 +512,10 @@ test "regenerates when the incoming ID is malformed (spaces) or trust is off" {
         var buf: [1024]u8 = undefined;
         const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
             "X-Request-Id: edge-xyz\r\nConnection: close\r\n\r\n", &buf);
-        try testing.expect(!std.mem.eql(u8, "edge-xyz", headerValue(got, "X-Request-Id").?));
+        const hdr = headerValue(got, "X-Request-Id").?;
+        try testing.expectEqual(@as(usize, generated_len), hdr.len); // a generated one, not just "not edge-xyz"
+        for (hdr) |c| try testing.expect(std.ascii.isHex(c));
+        try testing.expectEqualStrings(hdr, bodyOf(got));
     }
 }
 
@@ -503,6 +543,51 @@ test "custom header name" {
     const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
         "X-Correlation-Id: trace-42\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqualStrings("trace-42", headerValue(got, "X-Correlation-Id").?);
+    try testing.expectEqualStrings("trace-42", bodyOf(got)); // adopted through the custom name
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "X-Request-Id"));
+}
+
+test "header_name: tokens only, framing headers refused (middleware() panics on them)" {
+    // Review 2026-10-24: a non-token name or Content-Length made every echo
+    // fail (http parses Content-Length as a number), Transfer-Encoding was
+    // dropped silently.
+    try testing.expect(isUsableHeaderName(default_header));
+    try testing.expect(isUsableHeaderName("x-correlation-id"));
+    try testing.expect(isUsableHeaderName("X!#$%&'*+-.^_`|~9"));
+    try testing.expect(!isUsableHeaderName(""));
+    try testing.expect(!isUsableHeaderName("X Request"));
+    try testing.expect(!isUsableHeaderName("X-Id:"));
+    try testing.expect(!isUsableHeaderName("X-Id\r\n"));
+    try testing.expect(!isUsableHeaderName("Content-Length"));
+    try testing.expect(!isUsableHeaderName("transfer-ENCODING"));
+}
+
+test "an adopted ID is this thread's copy, still current() for an outer middleware after the chain" {
+    // Review 2026-10-24: `current()` returned a slice of the request head,
+    // which the next request on the connection overwrites. An access log
+    // registered outside the middleware reads it after `next.run`.
+    const Outer = struct {
+        var seen: [max_adopt_len]u8 = undefined;
+        var seen_len: usize = 0;
+        fn run(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+            try next.run(ctx);
+            const id = current().?;
+            @memcpy(seen[0..id.len], id);
+            seen_len = id.len;
+        }
+    };
+    var ri = RequestId{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = null, .run = Outer.run });
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: edge-abc\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expectEqualStrings("edge-abc", Outer.seen[0..Outer.seen_len]);
+    const id = current().?; // runWire's head buffer is gone; this must not point into it
+    try testing.expectEqual(@intFromPtr(&id_buf), @intFromPtr(id.ptr));
+    try testing.expectEqualStrings("edge-abc", id);
 }
 
 /// Test generator: "<prefix>-<n>" with a per-instance counter in `context`.
@@ -548,6 +633,25 @@ test "generator: a custom scheme is used, echoed and seen by current(); incoming
     got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: edge-7\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqualStrings("edge-7", headerValue(got, "X-Request-Id").?);
     try testing.expectEqual(@as(u32, 2), gen.n);
+}
+
+test "customId: a result must lie inside buf at both ends (the whole of buf is fine)" {
+    // Mutation 2026-10-24: `<` for `<=` on the end bound and dropping the end
+    // bound survived -- no generator filled buf or ran past it. `big` holds
+    // `buf` in its middle so the overrunning results are real memory.
+    var big: [3 * max_adopt_len]u8 = @splat('a');
+    const buf: *[max_adopt_len]u8 = big[max_adopt_len..][0..max_adopt_len];
+    const Ret = struct {
+        fn run(context: ?*anyopaque, _: *[max_adopt_len]u8) []const u8 {
+            return @as(*const []const u8, @ptrCast(@alignCast(context.?))).*;
+        }
+    };
+    var whole: []const u8 = buf;
+    var past_end: []const u8 = big[max_adopt_len + 100 ..][0..max_adopt_len];
+    var before_start: []const u8 = big[max_adopt_len - 1 ..][0..10];
+    try testing.expectEqual(@intFromPtr(buf), @intFromPtr(customId(.{ .context = @ptrCast(&whole), .run = Ret.run }, buf).?.ptr));
+    try testing.expectEqual(@as(?[]const u8, null), customId(.{ .context = @ptrCast(&past_end), .run = Ret.run }, buf));
+    try testing.expectEqual(@as(?[]const u8, null), customId(.{ .context = @ptrCast(&before_start), .run = Ret.run }, buf));
 }
 
 test "generator: a result breaking the contract falls back to the built-in id" {
