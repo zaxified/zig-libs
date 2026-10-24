@@ -44,7 +44,9 @@
 //! That is format VERSION 1. Version 2 (the default writer since 2026-10-04)
 //! is described in the "Format version 2" section further down: it keeps the
 //! magic and the `version` field at the same offsets (so one `Header.load`
-//! dispatches on it) and changes the rest. Readers accept both.
+//! dispatches on it) and changes the rest. Version 3 (the default writer
+//! since 2026-10-24, "Format version 3") changes only version 2's node.
+//! Readers accept all three.
 
 const std = @import("std");
 
@@ -55,6 +57,16 @@ pub const format_version: u16 = 1;
 /// Version 2 — path-compressed, children before parents, footer metadata. See
 /// the "Format version 2" section. What `Builder.freeze` writes by default.
 pub const format_version_2: u16 = 2;
+/// Version 3 — version 2 with each node's edge labels contiguous ahead of the
+/// child offsets. See the "Format version 3" section. What `Builder.freeze`
+/// writes by default since 2026-10-24.
+pub const format_version_3: u16 = 3;
+
+/// Versions 2 and 3 share the front, the footer and everything but the node's
+/// edge block.
+pub fn hasFooter(version: u16) bool {
+    return version == format_version_2 or version == format_version_3;
+}
 pub const endian_marker: u16 = 0x0102;
 pub const header_size: usize = 36;
 
@@ -121,13 +133,13 @@ pub const Header = struct {
     /// keeps traversal safe. Use `verifyBody` (via `loadVerified` in query.zig)
     /// for a full integrity check of an untrusted file.
     ///
-    /// Dispatches on the `version` field (same offset in every version): 2 is
-    /// read by `loadV2`, everything else by the version-1 rules below, which
+    /// Dispatches on the `version` field (same offset in every version): 2 and
+    /// 3 are read by `loadV2`, everything else by the version-1 rules below, which
     /// report any version other than 1 as `UnsupportedVersion` once the v1
     /// header CRC holds.
     pub fn load(buf: []const u8) LoadError!Header {
         if (buf.len >= 6 and std.mem.eql(u8, buf[0..4], magic) and
-            std.mem.readInt(u16, buf[4..6], .little) == format_version_2)
+            hasFooter(std.mem.readInt(u16, buf[4..6], .little)))
             return loadV2(buf);
         if (buf.len < header_size) return error.Truncated;
         if (!std.mem.eql(u8, buf[0..4], magic)) return error.BadMagic;
@@ -167,7 +179,7 @@ pub const Header = struct {
         const start = self.regionStart();
         const end = start + @as(usize, self.node_region_len);
         if (buf.len < end) return error.Truncated;
-        const want = if (self.version == format_version_2)
+        const want = if (hasFooter(self.version))
             std.mem.readInt(u32, buf[end + 16 ..][0..4], .little)
         else
             std.mem.readInt(u32, buf[28..32], .little);
@@ -176,12 +188,12 @@ pub const Header = struct {
 
     /// Absolute offset of the first node-region byte.
     pub fn regionStart(self: Header) usize {
-        return if (self.version == format_version_2) v2_front_size else header_size;
+        return if (hasFooter(self.version)) v2_front_size else header_size;
     }
 
-    /// v2 only: whether edges carry the `before` counts.
+    /// v2/v3 only: whether edges carry the `before` counts.
     pub fn hasOrdinals(self: Header) bool {
-        return self.version == format_version_2 and self.flags & v2_flag_ordinals != 0;
+        return hasFooter(self.version) and self.flags & v2_flag_ordinals != 0;
     }
 
     /// Version-2 header: the 12-byte front plus the 24-byte footer, which must
@@ -208,7 +220,7 @@ pub const Header = struct {
         if (root_offset < v2_front_size or root_offset >= v2_front_size + @as(usize, node_region_len))
             return error.MalformedRoot;
         return .{
-            .version = format_version_2,
+            .version = std.mem.readInt(u16, buf[4..6], .little),
             .flags = flags,
             .node_region_len = node_region_len,
             .key_count = std.mem.readInt(u64, foot[8..16], .little),
@@ -279,6 +291,11 @@ pub const v2_flag_ordinals: u32 = 0x1;
 pub const v2_known_flags: u32 = v2_flag_ordinals;
 pub const v2_edges_bit: u8 = 0x02;
 pub const v2_known_node_flags: u8 = terminal_bit | v2_edges_bit;
+/// v3: bits 2-3 of a node's flags hold the byte width of its child distances
+/// minus one.
+pub const v3_width_shift: u3 = 2;
+pub const v3_width_mask: u8 = 0x0C;
+pub const v3_known_node_flags: u8 = v2_known_node_flags | v3_width_mask;
 pub const max_tail: usize = 255;
 pub const edge_size_ordinals: usize = 9; // label + child_offset + before
 
@@ -338,6 +355,184 @@ pub fn nodeAtV2(buf: []const u8, off: u32, ordinals: bool) DecodeError!NodeView 
     };
 }
 
+// ── Format version 3 ─────────────────────────────────────────────────────────
+//
+// Version 2 stores each edge as `{ label, child_offset [, before] }`, so an
+// exact lookup binary-searches labels 5 (or 9) bytes apart: on a 26-edge node
+// that is three cache lines, each probe a load that depends on the previous
+// one, plus the strictly-ascending check over the same strided bytes on every
+// decode. `perf` put 40 % of a lookup on the first touch of a child node and
+// ~30 % on that check and the search (2026-10-23, Performance in SPEC.md).
+// Version 3 keeps the version-2 front, footer, path compression and post-order
+// and changes only the node: the edge count and the labels come right after
+// the two leading bytes, so the labels share the node's first cache line, are
+// matched and order-checked 16 at a time with compares, and the one child
+// offset needed is a single load at a computed position. Child offsets are
+// stored as the distance back from the node (children come first), in the
+// fewest bytes that hold the node's largest distance: a node low in the trie
+// points a few hundred bytes back, so its offsets take 1-2 bytes instead of
+// 4 and more nodes fit a cache line.
+//
+//   Node:
+//     u8  flags       bit0 = terminal, bit1 = has edges, bits 2-3 = width - 1
+//                     of a child distance (0 without edges); other bits 0
+//     u8  tail_len
+//     — present IFF has edges: —
+//     u8  edge_count - 1
+//     edge_count × u8 label, strictly ascending
+//     —
+//     tail_len bytes of tail
+//     u32 value             present IFF terminal
+//     — present IFF has edges: —
+//     u32 subtree_best
+//     edge_count × child distance, `width` bytes LE: the child is at this
+//                     node's offset minus it (≥ 1, child offset ≥ 12)
+//     edge_count × u32 before         IFF the ordinals flag is set
+//
+// The header flags, the footer and every other rule are version 2's.
+
+/// Decode + fully bounds-check the version-3 node at `off` (see the layout
+/// above). Same contract as `nodeAtV2`.
+pub fn nodeAtV3(buf: []const u8, off: u32, ordinals: bool) DecodeError!NodeView {
+    if (off < v2_front_size or @as(usize, off) + 2 > buf.len) return error.Corrupt;
+    var p: usize = off;
+    const flags = buf[p];
+    if (flags & ~v3_known_node_flags != 0) return error.Corrupt;
+    const terminal = (flags & terminal_bit) != 0;
+    const has_edges = (flags & v2_edges_bit) != 0;
+    if (!has_edges and flags & v3_width_mask != 0) return error.Corrupt;
+    const width: usize = ((flags & v3_width_mask) >> v3_width_shift) + 1;
+    const tail_len: usize = buf[p + 1];
+    p += 2;
+
+    var edge_count: u16 = 0;
+    var labels_at: usize = p;
+    if (has_edges) {
+        if (p + 1 > buf.len) return error.Corrupt;
+        edge_count = @as(u16, buf[p]) + 1;
+        labels_at = p + 1;
+        p = labels_at + edge_count;
+        if (p > buf.len) return error.Corrupt;
+        if (!strictlyAscendingIn(buf, labels_at, edge_count)) return error.Corrupt;
+    }
+
+    if (p + tail_len > buf.len) return error.Corrupt;
+    const tail = buf[p .. p + tail_len];
+    p += tail_len;
+
+    var value: u32 = 0;
+    if (terminal) {
+        if (p + value_size > buf.len) return error.Corrupt;
+        value = std.mem.readInt(u32, buf[p..][0..4], .little);
+        p += value_size;
+    }
+
+    var best = value;
+    var before_at: usize = 0;
+    if (has_edges) {
+        const per_edge: usize = width + if (ordinals) @as(usize, 4) else 0;
+        if (p + best_size + per_edge * @as(usize, edge_count) > buf.len) return error.Corrupt;
+        best = std.mem.readInt(u32, buf[p..][0..4], .little);
+        p += best_size;
+        if (ordinals) before_at = p + width * @as(usize, edge_count);
+    }
+    return .{
+        .buf = buf,
+        .offset = off,
+        .terminal = terminal,
+        .value = value,
+        .subtree_best = best,
+        .edge_count = edge_count,
+        .edges_at = p,
+        .version = format_version_3,
+        .tail = tail,
+        .edge_stride = if (ordinals) edge_size_ordinals else edge_size,
+        .labels_at = labels_at,
+        .before_at = before_at,
+        .child_width = @intCast(width),
+    };
+}
+
+/// `nodeAtV2` or `nodeAtV3`, by the buffer's `version` (2 or 3).
+pub fn nodeAtFooter(buf: []const u8, off: u32, version: u16, ordinals: bool) DecodeError!NodeView {
+    return if (version == format_version_3) nodeAtV3(buf, off, ordinals) else nodeAtV2(buf, off, ordinals);
+}
+
+/// The `width`-byte little-endian child distance at `at` (already bounds-
+/// checked). One word load when four bytes are inside `buf`.
+pub fn readDistance(buf: []const u8, at: usize, width: usize) u32 {
+    if (at + 4 <= buf.len) {
+        const word = std.mem.readInt(u32, buf[at..][0..4], .little);
+        return if (width == 4) word else word & ((@as(u32, 1) << @intCast(8 * width)) - 1);
+    }
+    var d: u32 = 0;
+    for (0..width) |k| d |= @as(u32, buf[at + k]) << @intCast(8 * k);
+    return d;
+}
+
+/// Every byte strictly greater than the one before it. 16 pairs per step: a
+/// 26-edge node is two overlapping steps instead of 25 dependent compares.
+pub fn strictlyAscending(labels: []const u8) bool {
+    const n = labels.len;
+    if (n < 17) {
+        var i: usize = 1;
+        while (i < n) : (i += 1) if (labels[i] <= labels[i - 1]) return false;
+        return true;
+    }
+    const V = @Vector(16, u8);
+    var i: usize = 0;
+    while (true) {
+        const a: V = labels[i..][0..16].*;
+        const b: V = labels[i + 1 ..][0..16].*;
+        if (@reduce(.Or, b <= a)) return false;
+        if (i + 17 == n) return true;
+        i = @min(i + 16, n - 17);
+    }
+}
+
+/// `strictlyAscending(buf[at..][0..n])`. A short run (most nodes have a
+/// handful of edges) is one masked 16-byte step when 17 bytes from `at` lie
+/// inside `buf` -- the bytes past the run belong to the node and are masked
+/// off -- instead of a loop whose exit is a branch miss per node.
+pub fn strictlyAscendingIn(buf: []const u8, at: usize, n: usize) bool {
+    if (n <= 16 and at + 17 <= buf.len) {
+        const V = @Vector(16, u8);
+        const a: V = buf[at..][0..16].*;
+        const b: V = buf[at + 1 ..][0..16].*;
+        const bad: u16 = @bitCast(b <= a);
+        const live: u16 = @truncate((@as(u32, 1) << @intCast(n -| 1)) - 1);
+        return bad & live == 0;
+    }
+    return strictlyAscending(buf[at..][0..n]);
+}
+
+/// Index of `label` in the strictly ascending `buf[at..][0..n]`, or null: 16
+/// compares per step over the contiguous v3 labels instead of a binary search
+/// whose every probe waits for the one before. Short runs as in
+/// `strictlyAscendingIn`.
+pub fn findLabelIn(buf: []const u8, at: usize, n: usize, label: u8) ?usize {
+    const V = @Vector(16, u8);
+    const want: V = @splat(label);
+    if (n <= 16 and at + 16 <= buf.len) {
+        const v: V = buf[at..][0..16].*;
+        const live: u16 = @truncate((@as(u32, 1) << @intCast(n)) - 1);
+        const hit: u16 = @as(u16, @bitCast(v == want)) & live;
+        return if (hit != 0) @ctz(hit) else null;
+    }
+    if (n < 16) {
+        for (buf[at..][0..n], 0..) |c, i| if (c == label) return i;
+        return null;
+    }
+    var i: usize = 0;
+    while (true) {
+        const v: V = buf[at + i ..][0..16].*;
+        const hit: u16 = @bitCast(v == want);
+        if (hit != 0) return i + @ctz(hit);
+        if (i + 16 == n) return null;
+        i = @min(i + 16, n - 16);
+    }
+}
+
 // ── Node decoding (bounds-checked; runs against untrusted buffers) ───────────
 
 /// A validated, borrowed view onto one node in the frozen buffer. Produced only
@@ -346,13 +541,14 @@ pub fn nodeAtV2(buf: []const u8, off: u32, ordinals: bool) DecodeError!NodeView 
 pub const NodeView = struct {
     buf: []const u8,
     /// This node's own absolute offset — the anchor for the child-offset
-    /// invariant (strictly greater than it in v1, strictly smaller in v2).
+    /// invariant (strictly greater than it in v1, strictly smaller in v2/v3).
     offset: u32,
     terminal: bool,
     value: u32,
     subtree_best: u32,
     edge_count: u16,
-    /// Absolute offset of the first edge record.
+    /// Absolute offset of the first edge record (v1, v2), or of the first
+    /// child distance (v3).
     edges_at: usize,
     /// Format version the node was decoded as; `follow` decodes the child the
     /// same way and checks the direction that version promises.
@@ -364,11 +560,17 @@ pub const NodeView = struct {
     /// Bytes per edge record: `edge_size` (5), or `edge_size_ordinals` (9)
     /// in a v2 buffer built with ordinals.
     edge_stride: usize = edge_size,
+    /// v3 only: absolute offset of the contiguous labels; `edges_at` is then
+    /// the first child offset and `before_at` the first `before` (ordinals).
+    labels_at: usize = 0,
+    before_at: usize = 0,
+    /// v3 only: bytes per child distance.
+    child_width: u8 = 4,
 
     pub const Edge = struct {
         label: u8,
         child: u32,
-        /// v2 with ordinals only (0 otherwise): the number of stored keys in
+        /// v2/v3 with ordinals only (0 otherwise): the number of stored keys in
         /// the subtrees of the edges BEFORE this one under the same node.
         before: u32 = 0,
     };
@@ -376,6 +578,16 @@ pub const NodeView = struct {
     /// Edge `i` (0..edge_count). Bounds already validated by `nodeAt`.
     pub fn edge(self: NodeView, i: usize) Edge {
         std.debug.assert(i < self.edge_count);
+        if (self.version == format_version_3) return .{
+            .label = self.buf[self.labels_at + i],
+            // A zero or too-long distance wraps to an offset at or past this
+            // node, which `follow` refuses.
+            .child = self.offset -% readDistance(self.buf, self.edges_at + self.child_width * i, self.child_width),
+            .before = if (self.edge_stride == edge_size_ordinals)
+                std.mem.readInt(u32, self.buf[self.before_at + 4 * i ..][0..4], .little)
+            else
+                0,
+        };
         const o = self.edges_at + i * self.edge_stride;
         return .{
             .label = self.buf[o],
@@ -394,6 +606,10 @@ pub const NodeView = struct {
 
     /// Binary-search this node's (label-sorted) edges for `label`.
     pub fn findEdge(self: NodeView, label: u8) ?Edge {
+        if (self.version == format_version_3) {
+            const i = findLabelIn(self.buf, self.labels_at, self.edge_count, label) orelse return null;
+            return self.edge(i);
+        }
         var lo: usize = 0;
         var hi: usize = self.edge_count;
         while (lo < hi) {
@@ -479,6 +695,10 @@ pub fn nodeAt(buf: []const u8, off: u32) DecodeError!NodeView {
 /// bounds the number of nodes any traversal can visit (offsets strictly
 /// increase, buffer is finite) and thus rules out infinite loops.
 pub fn follow(parent: NodeView, child: u32) DecodeError!NodeView {
+    if (parent.version == format_version_3) {
+        if (child >= parent.offset) return error.Corrupt;
+        return nodeAtV3(parent.buf, child, parent.hasOrdinals());
+    }
     if (parent.version == format_version_2) {
         if (child >= parent.offset) return error.Corrupt;
         return nodeAtV2(parent.buf, child, parent.hasOrdinals());
@@ -646,4 +866,59 @@ test "follow enforces the strictly-increasing child-offset invariant" {
     // A child pointing back at (or before) the parent is corruption.
     try testing.expectError(error.Corrupt, follow(n, n.offset));
     try testing.expectError(error.Corrupt, follow(n, n.offset - 1));
+}
+
+test "v3 vector helpers agree with scalar loops at every length and buffer edge" {
+    // `strictlyAscendingIn` / `findLabelIn` take a masked 16-byte window when
+    // 16/17 bytes from `at` lie inside the buffer, overlapping windows past 16,
+    // and a scalar loop otherwise. Each run length 0..256 is placed so that its
+    // end, `at + 16` and `at + 17` fall just inside, on, and past the buffer
+    // end, with a violation at every pair and a duplicate at each window seam.
+    var store: [600]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x7e1e);
+    const r = prng.random();
+    var n: usize = 0;
+    while (n <= 256) : (n += 1) {
+        for ([_]usize{ 0, 1, 2, 17, 40 }) |slack| {
+            const len = 300 + slack; // buffer end; the run ends `slack` before it
+            const at = len - slack - n;
+            const buf = store[0..len];
+            r.bytes(buf);
+            // A strictly ascending run over 0..255 (any n ≤ 256 labels).
+            var labels: [256]u8 = undefined;
+            for (labels[0..n], 0..) |*l, i| l.* = @intCast(if (n <= 1) i else (i * 255) / (n - 1));
+            @memcpy(buf[at..][0..n], labels[0..n]);
+            try testing.expect(strictlyAscendingIn(buf, at, n));
+            for (0..256) |want| {
+                const scalar: ?usize = for (labels[0..n], 0..) |l, i| {
+                    if (l == want) break i;
+                } else null;
+                try testing.expectEqual(scalar, findLabelIn(buf, at, n, @intCast(want)));
+            }
+            // One violation (a duplicate of the previous label) at each pair.
+            var k: usize = 1;
+            while (k < n) : (k += 1) {
+                const keep = buf[at + k];
+                buf[at + k] = buf[at + k - 1];
+                try testing.expect(!strictlyAscendingIn(buf, at, n));
+                buf[at + k] = keep;
+            }
+            try testing.expect(strictlyAscendingIn(buf, at, n));
+        }
+    }
+}
+
+test "readDistance: every width, inside and at the end of the buffer" {
+    var buf: [16]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @intCast(0x10 + i);
+    for (1..5) |w| {
+        // Inside: a word load masked to `w` bytes.
+        const want_in: u32 = @truncate(std.mem.readInt(u32, buf[3..7], .little) & if (w == 4) @as(u64, 0xffff_ffff) else (@as(u64, 1) << @intCast(8 * w)) - 1);
+        try testing.expectEqual(want_in, readDistance(&buf, 3, w));
+        // At the end: fewer than four bytes left, so the byte loop.
+        const at = buf.len - w;
+        var want_end: u32 = 0;
+        for (0..w) |k| want_end |= @as(u32, buf[at + k]) << @intCast(8 * k);
+        try testing.expectEqual(want_end, readDistance(&buf, at, w));
+    }
 }

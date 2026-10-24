@@ -351,7 +351,15 @@ fn differentialRound(seed: u64, count: usize, fmt: FreezeOptions) !void {
     }
 }
 
-const all_formats = [_]FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } };
+/// v1, v2 and v3 (the `.v2` writer's default), each v2-family with and
+/// without ordinals.
+const all_formats = [_]FreezeOptions{
+    .v1,
+    .{ .v2 = .{} },
+    .{ .v2 = .{ .ordinals = true } },
+    .{ .v2 = .{ .version = .v2 } },
+    .{ .v2 = .{ .version = .v2, .ordinals = true } },
+};
 
 fn rankBefore(av: u32, ak: []const u8, bv: u32, bk: []const u8) bool {
     if (av != bv) return av > bv;
@@ -546,7 +554,7 @@ test "search prunes on canMatch and stops feeding bytes on willAlwaysMatch (budg
         const k = try std.mem.print(&kbuf, "{s}{d:0>6}", .{ if (i % 2 == 0) "k0" else "x", i });
         try b.insert(k, @intCast(i));
     }
-    for ([_]FreezeOptions{ .v1, .{ .v2 = .{} } }) |fmt| {
+    for ([_]FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .version = .v2 } } }) |fmt| {
         const buf = try b.freezeWith(testing.allocator, fmt);
         defer testing.allocator.free(buf);
         const f = try Frozen.load(buf);
@@ -1364,7 +1372,10 @@ fn sweepV2(base: []const u8, seeds: u64, reach: *SweepReach) !void {
 }
 
 test "format 2: seeded corrupt-buffer sweep never panics, and reaches the walk" {
-    for ([_]FreezeOptions{ .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } }) |fmt| {
+    for ([_]FreezeOptions{
+        .{ .v2 = .{} },                 .{ .v2 = .{ .ordinals = true } },
+        .{ .v2 = .{ .version = .v2 } }, .{ .v2 = .{ .version = .v2, .ordinals = true } },
+    }) |fmt| {
         const base = try freezeFromPairsWith(testing.allocator, testing.allocator, &.{
             .{ .key = "praha", .value = 1 },                                  .{ .key = "prahasever", .value = 2 },
             .{ .key = "plzen", .value = 3 },                                  .{ .key = "brno", .value = 4 },
@@ -1460,9 +1471,9 @@ test "format 2: each load and decode check refuses its own damage" {
     // One targeted damage per check (mutation 2026-10-04: the seeded sweep
     // never asserts WHICH error, so dropping any single check below survived
     // it). Each case re-seals what it does not mean to break.
-    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+    const base = try builder.freezeFromPairsWith(testing.allocator, testing.allocator, &.{
         .{ .key = "ab", .value = 1 }, .{ .key = "ac", .value = 2 },
-    });
+    }, .{ .v2 = .{ .version = .v2 } });
     defer testing.allocator.free(base);
     // Layout (hand-checked like the stream golden): @12 "ab" leaf (6 bytes),
     // @18 "ac" leaf (6), @24 node "a" (two edges, so not merged; 17 bytes),
@@ -1522,6 +1533,91 @@ test "format 2: each load and decode check refuses its own damage" {
 
     // Positive control: the untouched buffer answers.
     try testing.expectEqual(@as(?u32, 1), try (try Frozen.loadVerified(base)).lookup("ab"));
+}
+
+/// `lookup` (its own version-3 walk) and a prefix walk (the shared node
+/// decoder) both refuse `buf`.
+fn expectBothRefuse(buf: []const u8) !void {
+    const f = try Frozen.load(buf);
+    try testing.expectError(error.Corrupt, f.lookup("ab"));
+    try testing.expectError(error.Corrupt, f.prefixIterator(testing.allocator, "ab"));
+}
+
+test "format 3: each node check refuses its own damage, in lookup and in the shared decoder" {
+    // The version-3 counterpart of the test above, for the node checks (the
+    // header and footer checks are shared). `lookup` walks v3 with its own
+    // copy of `nodeAtV3`'s checks, so each damage goes through both.
+    const base = try freezeFromPairs(testing.allocator, testing.allocator, &.{
+        .{ .key = "ab", .value = 1 }, .{ .key = "ac", .value = 2 },
+    });
+    defer testing.allocator.free(base);
+    // Layout (stream.zig's v3 golden): @12 "ab" leaf (6 bytes), @18 "ac"
+    // leaf (6), @24 node "a" (flags, tail_len, n-1, 'b', 'c', best, two
+    // 1-byte distances: 11 bytes), @35 root (flags, tail_len, n-1, 'a',
+    // best, distance @43: 9 bytes); region 32 bytes.
+    const h = try format.Header.load(base);
+    try testing.expectEqual(format.format_version_3, h.version);
+    try testing.expectEqual(@as(u32, 32), h.node_region_len);
+    try testing.expectEqual(@as(u32, 35), h.root_offset);
+    var buf: [128]u8 = undefined;
+    const n = base.len;
+
+    // An unknown node flag bit on the root, sealed.
+    @memcpy(buf[0..n], base);
+    buf[35] |= 0x10;
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // A distance width on a node without edges (leaf "ab"), sealed. Only
+    // the walk that reaches the leaf sees it.
+    @memcpy(buf[0..n], base);
+    buf[12] |= 0x04;
+    resealV2(buf[0..n]);
+    try testing.expectError(error.Corrupt, (try Frozen.load(buf[0..n])).lookup("ab"));
+    try testing.expectEqual(@as(?u32, 2), try (try Frozen.load(buf[0..n])).lookup("ac"));
+
+    // Labels out of order under node "a" ('c' before 'b'), sealed.
+    @memcpy(buf[0..n], base);
+    std.mem.swap(u8, &buf[27], &buf[28]);
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // A distance of 0 (the root's edge back to the root itself), sealed.
+    @memcpy(buf[0..n], base);
+    buf[43] = 0;
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // A distance past the start of the buffer, sealed.
+    @memcpy(buf[0..n], base);
+    buf[43] = 200;
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // A distance into the front header (child @5), sealed.
+    @memcpy(buf[0..n], base);
+    buf[43] = 30;
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // A wrong distance width: node "a" claims 4 bytes, so its 1-byte
+    // distances and the root's bytes after them read as distances far past
+    // the node's own offset, sealed.
+    @memcpy(buf[0..n], base);
+    buf[24] |= 0x0C;
+    resealV2(buf[0..n]);
+    try expectBothRefuse(buf[0..n]);
+
+    // Positive control: the untouched buffer answers through both paths.
+    const f = try Frozen.loadVerified(base);
+    try testing.expectEqual(@as(?u32, 1), try f.lookup("ab"));
+    try testing.expectEqual(@as(?u32, 2), try f.lookup("ac"));
+    var it = try f.prefixIterator(testing.allocator, "a");
+    defer it.deinit();
+    var seen: usize = 0;
+    var kb: [8]u8 = undefined;
+    while (try it.next(&kb)) |_| seen += 1;
+    try testing.expectEqual(@as(usize, 2), seen);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

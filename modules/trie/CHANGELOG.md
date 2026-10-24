@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Format:** the writer's default is frozen format **version 3**: version 2
+  with each node's edge count and labels ahead of its tail and value, and its children as
+  1–4-byte distances back from the node (width in node flag bits 2–3) instead of `u32`
+  offsets. Readers read versions 1, 2 and 3; a reader built before this entry reads only 1
+  and 2, so write with `StreamOptions.version = .v2` (or `FreezeOptions{ .v2 = .{ .version =
+  .v2 } }`) for one. **Performance:** `lookup` walks version 3 in its own loop (the node
+  checks of `format.nodeAtV3`, no node view per step) with 16-byte label match and order
+  check: `bench-trie` exact lookup hit 1.61× → 1.07× and miss 2.13× → 1.35× darts-clone,
+  index 23.1 → 19.5 B/key. P stays 2 (the miss row is over 1.25×). **Tests:** v3 goldens,
+  a v3 damage test through `lookup` and the shared decoder, a differential sweep holding
+  `lookup` to the decoder walk on 6 000 damaged buffers (a mutant without the label-order
+  check fails it), an oracle test for the vector helpers at every length and buffer edge,
+  and the format lists of the existing differentials now cover v2 explicitly.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the all-module `strRepeat` rewrite (`571bf09e`) is reverted here: this module's calls are small (seconds of Sema at most), and the change would have made its fresh audit's `src` hash stale for nothing.
 
 - **2026-10-23** — **Behaviour:** `error.KeyTooLong` from `PrefixIterator.next` /

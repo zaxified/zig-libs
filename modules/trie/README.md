@@ -22,8 +22,12 @@ completion.
 - **Deps:** none (`std` only).
 
 > **Status: implemented (scope core since 2026-10-04).** Build → freeze →
-> zero-copy load → query is complete and tested. Frozen format **version 2**
-> (path-compressed, written by a streaming builder) is the default: the RÚIAN
+> zero-copy load → query is complete and tested. Frozen format **version 3**
+> (2026-10-24: version 2 with each node's labels together and its children as
+> short distances — exact lookup 1.3–1.6× faster than version 2 and the index
+> 16 % smaller on the benchmark keys; `StreamOptions.version = .v2` still writes
+> version 2 for an older reader) is the default. Version 2
+> (path-compressed, written by a streaming builder) took the RÚIAN
 > address index went from 397 MB to 70 MB (140 → 24.6 B/key) and `topN` got 4×
 > faster; version-1 files still load. A naive sorted-slice oracle differential (randomized, over
 > adversarial key sets — prefix-of-another, duplicates, single-byte, very long,

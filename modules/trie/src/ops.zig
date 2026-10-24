@@ -256,7 +256,7 @@ test "the four operations over three indexes, by hand (v1, v2, v2 + ordinals)" {
     const a = [_]builder.Pair{ .{ .key = "a", .value = 1 }, .{ .key = "b", .value = 2 }, .{ .key = "c", .value = 3 }, .{ .key = "d", .value = 4 } };
     const b = [_]builder.Pair{ .{ .key = "b", .value = 20 }, .{ .key = "c", .value = 30 }, .{ .key = "e", .value = 50 } };
     const c = [_]builder.Pair{ .{ .key = "c", .value = 300 }, .{ .key = "d", .value = 400 }, .{ .key = "e", .value = 500 }, .{ .key = "f", .value = 600 } };
-    const fmts = [_]builder.FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } } };
+    const fmts = [_]builder.FreezeOptions{ .v1, .{ .v2 = .{} }, .{ .v2 = .{ .ordinals = true } }, .{ .v2 = .{ .version = .v2 } } };
     for (fmts) |fmt| {
         const ba = try buildSet(&a, fmt);
         defer testing.allocator.free(ba);

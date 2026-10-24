@@ -29,6 +29,12 @@ pub const Options = struct {
     /// Store the per-edge `before` counts (format flag bit 0), which
     /// `Frozen.ordinal` / `Frozen.keyAt` need. Costs 4 bytes per edge.
     ordinals: bool = false,
+    /// The node layout to write. Version 3 (the default since 2026-10-24)
+    /// keeps a node's labels together for a faster exact lookup; version 2
+    /// is for a reader built against a module older than that.
+    version: Version = .v3,
+
+    pub const Version = enum { v2, v3 };
 };
 
 pub const Error = error{
@@ -84,7 +90,13 @@ const Frame = struct {
 
 /// Largest encoded v2 node: flags, tail_len, tail, value, best, count, 256
 /// edges with `before`.
-const max_node_bytes = 2 + format.max_tail + 4 + 4 + 1 + 256 * format.edge_size_ordinals;
+const max_node_bytes = @max(
+    // v2: flags, tail_len, tail, value, best, edge_count - 1, edges
+    2 + format.max_tail + 4 + 4 + 1 + 256 * format.edge_size_ordinals,
+    // v3: flags, tail_len, edge_count - 1, labels, tail, value, best,
+    // 4-byte distances, befores
+    2 + 1 + 256 + format.max_tail + 4 + 4 + 256 * 4 + 256 * 4,
+);
 
 pub const SortedBuilder = struct {
     gpa: Allocator,
@@ -105,7 +117,11 @@ pub const SortedBuilder = struct {
     pub fn init(gpa: Allocator, w: *std.Io.Writer, opts: Options) Error!SortedBuilder {
         var self: SortedBuilder = .{ .gpa = gpa, .w = w, .opts = opts };
         @memcpy(self.front[0..4], format.magic);
-        std.mem.writeInt(u16, self.front[4..6], format.format_version_2, .little);
+        const version = switch (opts.version) {
+            .v2 => format.format_version_2,
+            .v3 => format.format_version_3,
+        };
+        std.mem.writeInt(u16, self.front[4..6], version, .little);
         std.mem.writeInt(u16, self.front[6..8], format.endian_marker, .little);
         std.mem.writeInt(u32, self.front[8..12], if (opts.ordinals) format.v2_flag_ordinals else 0, .little);
         try self.frames.append(gpa, .{});
@@ -241,6 +257,19 @@ pub const SortedBuilder = struct {
         }
 
         const b = &self.scratch;
+        const p = switch (self.opts.version) {
+            .v2 => try self.encodeV2(h, best),
+            .v3 => try self.encodeV3(h, best, offset),
+        };
+        self.crc.update(b[0..p]);
+        try self.w.writeAll(b[0..p]);
+        self.pos += p;
+        return .{ .offset = offset, .best = best, .count = count };
+    }
+
+    /// `h` as a version-2 node into `scratch`; returns its length.
+    fn encodeV2(self: *SortedBuilder, h: *const Held, best: u32) Error!usize {
+        const b = &self.scratch;
         var p: usize = 0;
         const has_edges = h.edges.items.len > 0;
         b[p] = (if (h.terminal) format.terminal_bit else 0) | (if (has_edges) format.v2_edges_bit else 0);
@@ -272,10 +301,63 @@ pub const SortedBuilder = struct {
                 before += e.count;
             }
         }
-        self.crc.update(b[0..p]);
-        try self.w.writeAll(b[0..p]);
-        self.pos += p;
-        return .{ .offset = offset, .best = best, .count = count };
+        return p;
+    }
+
+    /// `h` as a version-3 node into `scratch`; returns its length.
+    fn encodeV3(self: *SortedBuilder, h: *const Held, best: u32, offset: u32) Error!usize {
+        const b = &self.scratch;
+        var p: usize = 0;
+        const has_edges = h.edges.items.len > 0;
+        // Children are written first, so every distance is ≥ 1.
+        var far: u32 = 0;
+        for (h.edges.items) |e| far = @max(far, offset - e.offset);
+        const width: usize = if (far < 1 << 8) 1 else if (far < 1 << 16) 2 else if (far < 1 << 24) 3 else 4;
+        // Version 3 node: flags, tail_len, [edge_count - 1, labels], tail,
+        // [value], [best, child offsets, [befores]] (format.zig).
+        b[p] = (if (h.terminal) format.terminal_bit else 0) |
+            (if (has_edges) format.v2_edges_bit | (@as(u8, @intCast(width - 1)) << format.v3_width_shift) else 0);
+        b[p + 1] = @intCast(h.tail_len);
+        p += 2;
+        if (has_edges) {
+            std.debug.assert(h.edges.items.len <= 256);
+            b[p] = @intCast(h.edges.items.len - 1);
+            p += 1;
+            for (h.edges.items) |e| {
+                b[p] = e.label;
+                p += 1;
+            }
+        }
+        @memcpy(b[p..][0..h.tail_len], h.tail[0..h.tail_len]);
+        p += h.tail_len;
+        if (h.terminal) {
+            std.mem.writeInt(u32, b[p..][0..4], h.value, .little);
+            p += 4;
+        }
+        if (has_edges) {
+            std.mem.writeInt(u32, b[p..][0..4], best, .little);
+            p += 4;
+            for (h.edges.items) |e| {
+                var d = offset - e.offset;
+                for (0..width) |k| {
+                    b[p + k] = @truncate(d);
+                    d >>= 8;
+                }
+                p += width;
+            }
+            if (self.opts.ordinals) {
+                // `before` counts keys under EARLIER edges only; the node's own
+                // terminal (which sorts before all of them) is added by the reader.
+                var before: u64 = 0;
+                for (h.edges.items) |e| {
+                    if (before > std.math.maxInt(u32)) return error.TooLarge;
+                    std.mem.writeInt(u32, b[p..][0..4], @intCast(before), .little);
+                    p += 4;
+                    before += e.count;
+                }
+            }
+        }
+        return p;
     }
 };
 
@@ -299,10 +381,10 @@ test "a single key becomes one leaf under the root, its whole suffix in the tail
     const buf = try buildSorted(&.{"hello"}, .{});
     defer testing.allocator.free(buf);
     const h = try format.Header.load(buf);
-    try testing.expectEqual(format.format_version_2, h.version);
+    try testing.expectEqual(format.format_version_3, h.version);
     try testing.expectEqual(@as(u64, 1), h.key_count);
     const region = buf[0 .. format.v2_front_size + h.node_region_len];
-    const root = try format.nodeAtV2(region, h.root_offset, false);
+    const root = try format.nodeAtFooter(region, h.root_offset, h.version, false);
     try testing.expectEqual(@as(u16, 1), root.edge_count);
     try testing.expectEqualStrings("", root.tail);
     const e = root.edge(0);
@@ -311,8 +393,9 @@ test "a single key becomes one leaf under the root, its whole suffix in the tail
     try testing.expectEqualStrings("ello", leaf.tail);
     try testing.expect(leaf.terminal);
     try testing.expectEqual(@as(u32, 1), leaf.value);
-    // Root: flags, tail_len, best, count, 1 edge = 2+4+1+5; leaf: 2+4+4.
-    try testing.expectEqual(@as(u32, 12 + 10), h.node_region_len);
+    // v3 root: flags, tail_len, count, 1 label, best, a 1-byte distance =
+    // 2+1+1+4+1; leaf: flags, tail_len, "ello", value = 2+4+4.
+    try testing.expectEqual(@as(u32, 9 + 10), h.node_region_len);
     try h.verifyBody(buf);
 }
 
@@ -323,7 +406,7 @@ test "a terminal node is never merged into its child, and the root never into an
     defer testing.allocator.free(buf);
     const h = try format.Header.load(buf);
     const region = buf[0 .. format.v2_front_size + h.node_region_len];
-    const root = try format.nodeAtV2(region, h.root_offset, false);
+    const root = try format.nodeAtFooter(region, h.root_offset, h.version, false);
     try testing.expect(!root.terminal);
     const a = try format.follow(root, root.findEdge('a').?.child);
     try testing.expect(a.terminal);
@@ -342,7 +425,7 @@ test "a chain longer than max_tail keeps a node every 256 bytes" {
     defer testing.allocator.free(buf);
     const h = try format.Header.load(buf);
     const region = buf[0 .. format.v2_front_size + h.node_region_len];
-    var node = try format.nodeAtV2(region, h.root_offset, false);
+    var node = try format.nodeAtFooter(region, h.root_offset, h.version, false);
     var consumed: usize = 0;
     var nodes: usize = 0;
     while (node.edge_count > 0) {
@@ -373,9 +456,65 @@ test "unsorted input is refused; an equal key overwrites" {
     // The later value is the one stored (mutation 2026-10-04: dropping the
     // overwrite survived while only the key count was checked).
     const region = out.written()[0 .. format.v2_front_size + h.node_region_len];
-    const root = try format.nodeAtV2(region, h.root_offset, false);
+    const root = try format.nodeAtFooter(region, h.root_offset, h.version, false);
     const b = try format.follow(root, root.findEdge('b').?.child);
     try testing.expectEqual(@as(u32, 7), b.value);
+}
+
+test "golden: the exact v3 bytes for a, ab, acx, acy" {
+    // Hand-derived from the version-3 layout in format.zig, not from the
+    // writer: the same nodes in the same order as the v2 golden below, each
+    // with its labels ahead of its tail and value, and its children as
+    // 1-byte distances back from the node.
+    const buf = try buildSorted(&.{ "a", "ab", "acx", "acy" }, .{});
+    defer testing.allocator.free(buf);
+    const region = [_]u8{
+        // @12 "ab": terminal leaf, value 2
+        0x01, 0x00, 2,    0,    0,   0,
+        // @18 "acx": terminal leaf, value 3
+        0x01, 0x00, 3,    0,    0,   0,
+        // @24 "acy": terminal leaf, value 4
+        0x01, 0x00, 4,    0,    0,   0,
+        // @30 "ac": edges, width 1; 2 edges 'x' 'y'; best 4; 'x' → 30-12, 'y' → 30-6
+        0x02, 0x00, 1,    'x',  'y', 4,
+        0,    0,    0,    12,   6,
+        // @41 "a": terminal + edges; 'b' 'c'; value 1; best 4; 'b' → 41-29, 'c' → 41-11
+          0x03,
+        0x00, 1,    'b',  'c',  1,   0,
+        0,    0,    4,    0,    0,   0,
+        29,   11,
+        // @56 root: edges; 'a'; best 4; 'a' → 56-15
+          0x02, 0x00, 0,   'a',
+        4,    0,    0,    0,    15,
+    };
+    try testing.expectEqualSlices(u8, "ZTR1\x03\x00\x02\x01\x00\x00\x00\x00", buf[0..12]);
+    try testing.expectEqualSlices(u8, &region, buf[12 .. 12 + region.len]);
+    const foot = buf[12 + region.len ..];
+    try testing.expectEqual(@as(usize, 24), foot.len);
+    try testing.expectEqual(@as(u32, region.len), std.mem.readInt(u32, foot[0..4], .little));
+    try testing.expectEqual(@as(u32, 56), std.mem.readInt(u32, foot[4..8], .little)); // root last
+    try testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, foot[8..16], .little));
+    try testing.expectEqual(std.hash.Crc32.hash(&region), std.mem.readInt(u32, foot[16..20], .little));
+}
+
+test "v3: a child distance wider than one byte" {
+    // 300 keys under "a" put the first child of node "a" more than 255
+    // bytes back: that node needs 2-byte distances, and every key answers.
+    var keys: [300][4]u8 = undefined;
+    var list: [300][]const u8 = undefined;
+    for (&keys, &list, 0..) |*k, *l, i| {
+        k.* = .{ 'a', 'a' + @as(u8, @intCast(i / 26 / 26 % 26)), 'a' + @as(u8, @intCast(i / 26 % 26)), 'a' + @as(u8, @intCast(i % 26)) };
+        l.* = k;
+    }
+    const buf = try buildSorted(&list, .{});
+    defer testing.allocator.free(buf);
+    const h = try format.Header.load(buf);
+    const region = buf[0 .. format.v2_front_size + h.node_region_len];
+    const root = try format.nodeAtFooter(region, h.root_offset, h.version, false);
+    const a = try format.follow(root, root.findEdge('a').?.child);
+    try testing.expect(a.child_width >= 2);
+    const f = try @import("query.zig").Frozen.load(buf);
+    for (list, 0..) |k, i| try testing.expectEqual(@as(?u32, @intCast(i + 1)), try f.lookup(k));
 }
 
 test "golden: the exact v2 bytes for a, ab, acx, acy" {
@@ -386,7 +525,7 @@ test "golden: the exact v2 bytes for a, ab, acx, acy" {
     // "a" at finish. (Mutation 2026-10-04: letting a terminal parent HOLD its
     // child moved "ab" after "acy" — still a valid index, so only the layout
     // shows it.)
-    const buf = try buildSorted(&.{ "a", "ab", "acx", "acy" }, .{});
+    const buf = try buildSorted(&.{ "a", "ab", "acx", "acy" }, .{ .version = .v2 });
     defer testing.allocator.free(buf);
     const region = [_]u8{
         // @12 "ab": terminal leaf, value 2
@@ -428,7 +567,7 @@ test "ordinals: `before` counts keys under earlier edges only" {
     const h = try format.Header.load(buf);
     try testing.expect(h.hasOrdinals());
     const region = buf[0 .. format.v2_front_size + h.node_region_len];
-    const root = try format.nodeAtV2(region, h.root_offset, true);
+    const root = try format.nodeAtFooter(region, h.root_offset, h.version, true);
     try testing.expectEqual(@as(u16, 3), root.edge_count);
     try testing.expectEqual(@as(u32, 0), root.edge(0).before);
     try testing.expectEqual(@as(u32, 1), root.edge(1).before);

@@ -438,7 +438,7 @@ test "freezeTo walks keys in sorted order whatever the insert order" {
     const buf = try b.freeze(testing.allocator);
     defer testing.allocator.free(buf);
     const h = try format.Header.load(buf);
-    try testing.expectEqual(format.format_version_2, h.version);
+    try testing.expectEqual(format.format_version_3, h.version);
     try testing.expectEqual(@as(u64, keys.len), h.key_count);
     // Insert again after a freeze (lists were relinked) and freeze again.
     try b.insert("alpha", 99);
