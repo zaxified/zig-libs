@@ -13,7 +13,9 @@ instead of the raw `FsStorage`.
 Provenance: original work of the zig-libs authors (MIT). LMDB's mmap'd pages and
 Postgres' `shared_buffers` are named as conceptual analogues of the
 buffer-pool *pattern*; neither was consulted as an implementation, so no
-`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0).
+`NOTICE` entry is required (root [`NOTICE`](../../NOTICE) §0). `tools/scan_probe`
+runs SQLite (public domain) as a black-box oracle through Python's `sqlite3`;
+it commits no data, its numbers are produced at run time by our own tooling.
 
 ## Usage
 
