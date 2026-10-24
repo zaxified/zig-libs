@@ -229,9 +229,9 @@ out of scope** (a future ADOPT dependency; TODO in the module doc; use
 `Pattern.matcher`). A JSON array root needs `validateJsonRoot` or a
 `[]const T` body (the field-rule schema describes objects). The go-playground
 tag list (~170) is not matched one-for-one — see SPEC *Where we are behind*.
-`min`/`max` cannot express 54+-bit
-integer bounds exactly. Duplicate JSON object keys resolve per std.json
-(last wins) before validation sees the value.
+`min`/`max` are f64, so a bound past 2^53 is the nearest double (`maxInt(i64)` is 2^63); an
+integer VALUE is compared with it exactly (since 2026-10-24). A duplicate JSON object key, at
+any depth, refuses the whole body (`json_invalid`) on both paths -- never "last wins".
 
 ## Verification
 

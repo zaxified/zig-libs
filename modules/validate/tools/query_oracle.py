@@ -47,8 +47,10 @@ CLASSES = {
     'INT_FRACTION': 'pydantic takes `5.0` as an int (a zero fraction); Go\'s strconv and Python\'s `int()` refuse '
                     'it, and so does the module, whose typed query decodes ints with an integer parser -- Go and '
                     'Python decide',
-    'F64_PRECISION': 'an integer past 2^53 against a bound: pydantic compares exactly, the module in doubles '
-                     '(`Rule.min`/`max` are f64, documented) -- the double comparison decides',
+    'F64_PRECISION': 'an integer past 2^53 against a bound the module holds as f64 (`Rule.min`/`max`): '
+                     'I64_MAX and U64_MAX round up to 2^63 and 2^64; the module compares the integer exactly '
+                     'with that double (since 2026-10-24; before, in doubles), pydantic with the exact bound -- '
+                     'the exact comparison with the f64 bound decides',
     'GO_DROPS_BAD_ESCAPE': "Go's ParseQuery drops a pair with a malformed escape (`%zz`, `%4`, a lone `%`); "
                            'Python and WHATWG keep it literally, and so does the module (documented: lenient, '
                            'like most parsers) -- Python and WHATWG decide',
@@ -147,9 +149,12 @@ def coerce_want(rule, raw, py_ok, py_code, go, builtin):
     if k == 'int' and py_ok and go is False and builtin is False:
         return False, 'int_parsing', 'INT_FRACTION'
     if k == 'int' and py_code in ('greater_than_equal', 'less_than_equal'):
-        n = float(int(raw.decode()))
-        if float(rule.get('min', -math.inf)) <= n <= float(rule.get('max', math.inf)):
+        n = int(raw.decode())  # Python compares int with float exactly
+        lo, hi = float(rule.get('min', -math.inf)), float(rule.get('max', math.inf))
+        if lo <= n <= hi:
             return True, '', 'F64_PRECISION'
+        if float(n) >= lo and float(n) <= hi:  # passes only in doubles: pydantic and the module refuse
+            return py_ok, py_code, 'F64_PRECISION'
     return py_ok, py_code, ''
 
 

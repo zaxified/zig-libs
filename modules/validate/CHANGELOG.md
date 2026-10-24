@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Fix** (review 2026-10-24, grade-1 wave 6):
+  - **Exact integer comparisons:** an integer is held to `min`/`max` exactly (`9007199254740993` passed `max = 9007199254740992` as f64). Cross-field comparisons are exact for integers past i64 and against floats (`18446744073709551615` `eq_field` `18446744073709551614` passed).
+  - **Export:** a suffix or charset `pattern` ends with `(?![\s\S])` instead of `$`, which Python `re`, PCRE, Java and .NET let match before a final newline. `required_if`/`required_unless` entries naming one sibling with two values are both exported (the second was dropped).
+  - **Smaller fixes:** an `.any` rule on a hand-built unparseable `number_string` reports a type error instead of reaching `unreachable`. Duplicate keys in a large object are found through a set on the streaming path instead of a quadratic scan. `parseIntoLeaky` decodes a `[:0]const u8` field (it did not compile).
+  - **Consumer-visible:** exported patterns change text, and integer bounds past 2^53 now refuse what they used to pass.
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** mutation audit 120/131, 11 equivalent, 14 tests added (section "pinned by the 2026-10-24 mutation audit"). Card: fastest 3.97× garde on `nested` (P stays 2; see Backlog).
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` re-takes both oracles (`zig build interop-validate [-- --check]`). Their `F64_PRECISION` class is decided by the exact comparison now, and `PY_DOLLAR` is gone. `tools/rust_fast_bench` (garde 0.23.0, validator 0.21.0) adds the fastest-in-the-field side to `bench-validate`. README: duplicate keys are refused, not "last wins".
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

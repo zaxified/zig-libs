@@ -132,7 +132,7 @@ pub const coerce = [_]Coerce{
     .{ .rule = 2, .value = "9223372036854775807", .py = true, .py_code = "", .go = true, .builtin = true, .want = true, .want_code = "", .class = "" },
     .{ .rule = 2, .value = "9223372036854775808", .py = false, .py_code = "less_than_equal", .go = true, .builtin = true, .want = true, .want_code = "", .class = "F64_PRECISION" },
     .{ .rule = 2, .value = "-9223372036854775808", .py = true, .py_code = "", .go = true, .builtin = true, .want = true, .want_code = "", .class = "" },
-    .{ .rule = 2, .value = "-9223372036854775809", .py = false, .py_code = "greater_than_equal", .go = true, .builtin = true, .want = true, .want_code = "", .class = "F64_PRECISION" },
+    .{ .rule = 2, .value = "-9223372036854775809", .py = false, .py_code = "greater_than_equal", .go = true, .builtin = true, .want = false, .want_code = "greater_than_equal", .class = "F64_PRECISION" },
     .{ .rule = 2, .value = "18446744073709551615", .py = false, .py_code = "less_than_equal", .go = true, .builtin = true, .want = false, .want_code = "less_than_equal", .class = "" },
     .{ .rule = 2, .value = "18446744073709551616", .py = false, .py_code = "less_than_equal", .go = true, .builtin = true, .want = false, .want_code = "less_than_equal", .class = "" },
     .{ .rule = 2, .value = "", .py = false, .py_code = "int_parsing", .go = false, .builtin = false, .want = false, .want_code = "int_parsing", .class = "" },

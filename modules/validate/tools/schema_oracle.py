@@ -55,13 +55,14 @@ NUM_TOKENS = ['0', '-0', '1', '2', '3', '5', '-1', '-5', '10', '11', '1.0', '2.5
               '100000000000000000000000', '-100000000000000000000000', '1e400', '1.5e300']
 
 # Classes: why a case's `want` is not simply the two validators' common answer.
-# The first three decide a case the validators split on; the last two are the
+# The first two decide a case the validators split on; the last two are the
 # module's documented departures from its own exported schema, applied on top.
+# (PY_DOLLAR -- python's `re` letting `$` match before a final newline -- went
+# away 2026-10-24: the export ends a pattern with `(?![\s\S])`, which every
+# engine reads as the end of the text.)
 CLASSES = {
-    'PY_DOLLAR': "python's `re` lets `$` match before a final newline; ECMA-262 (which 2020-12 "
-                 "names for `pattern`) does not -- ajv decides",
-    'F64_PRECISION': 'an integer beyond 2^53 against a bound: python compares exactly, ajv in doubles, '
-                     'and so does the module (`Rule.min`/`max` are f64, documented) -- ajv decides',
+    'F64_PRECISION': 'an integer beyond 2^53 against a bound: python compares exactly, ajv in doubles; '
+                     'the module holds an integer to its bound exactly (since 2026-10-24) -- python decides',
     'F64_OVERFLOW': 'a number beyond f64 (`1e400`) as an integer: ajv calls Infinity an integer '
                     '(`Infinity % 1` is NaN, which its check reads as no fraction); python and the module '
                     'refuse a non-finite value as an integer -- python decides',
@@ -193,6 +194,9 @@ def zrule(r):
 
 # ── the export, as documented above `writeJsonSchema` ────────────────────────
 
+END = '(?![\\s\\S])'  # the end of the text in every regex dialect (not `$`)
+
+
 def regex(lead, text, tail, cls):
     special = '\\]^-[' if cls else '\\^$.|?*+()[]{}/'
     return lead + ''.join('\\' + c if c in special else c for c in text) + tail
@@ -247,9 +251,9 @@ def rule_schema(r):
         elif how == 'prefix':
             s['pattern'] = regex('^', text, '', False)
         elif how == 'suffix':
-            s['pattern'] = regex('', text, '$', False)
+            s['pattern'] = regex('', text, END, False)
         else:
-            s['pattern'] = regex('^[', text, ']*$', True)
+            s['pattern'] = regex('^[', text, ']*' + END, True)
     if k in ('object', 'any') and 'fields' in r:
         fields_members(s, r['fields'])
     if k in ('array', 'any') and 'items' in r:
@@ -394,19 +398,6 @@ def ajv_verdicts(cases):
     return ver, res
 
 
-def strict_dollar_validator():
-    """Draft 2020-12 with `pattern` read as ECMA-262 reads `$` (end of input only)."""
-    import re
-
-    def pattern(validator, patrn, instance, schema):
-        if validator.is_type(instance, 'string') and not re.search(patrn.replace('$', '\\Z'), instance):
-            yield jsonschema.ValidationError('%r does not match %r' % (instance, patrn))
-    return jsonschema.validators.extend(jsonschema.Draft202012Validator, {'pattern': pattern})
-
-
-STRICT = strict_dollar_validator()
-
-
 def has_surrogate(v):
     if isinstance(v, str):
         return any(0xD800 <= ord(c) <= 0xDFFF for c in v)
@@ -457,12 +448,10 @@ def decide(rules, schema, doc, py, js):
     cls = ''
     want = py
     if py != js:
-        if STRICT(schema).is_valid(inst) == js:
-            want, cls = js, 'PY_DOLLAR'
-        elif has_nonfinite(inst):
+        if has_nonfinite(inst):
             want, cls = py, 'F64_OVERFLOW'
         elif jsonschema.Draft202012Validator(schema).is_valid(json.loads(doc, parse_int=float)) == js:
-            want, cls = js, 'F64_PRECISION'
+            want, cls = py, 'F64_PRECISION'
         else:
             return None, 'UNDECIDED'
     if want and not bytes_ok(rules, inst):

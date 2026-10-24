@@ -854,10 +854,39 @@ const ObjectLookup = struct {
     }
 };
 
-/// Order of two numeric values, null when either is not a number. Two
-/// integers compare exactly, anything else as f64.
+/// An integer-valued number exactly: an `.integer`, or a `.number_string`
+/// of plain integer digits that fits i128 (every u64 does). Null otherwise.
+fn exactInt(v: Value) ?i128 {
+    return switch (v) {
+        .integer => |i| i,
+        .number_string => |s| std.fmt.parseInt(i128, s, 10) catch null,
+        else => null,
+    };
+}
+
+/// Order of the integer `a` against the float `f`, exactly (no rounding of
+/// `a` to f64); null for NaN.
+fn intFloatOrder(a: i128, f: f64) ?std.math.Order {
+    if (std.math.isNan(f)) return null;
+    if (f >= 0x1p127) return .lt;
+    if (f < -0x1p127) return .gt;
+    const fl = @floor(f);
+    const b: i128 = @intFromFloat(fl);
+    if (a != b) return std.math.order(a, b);
+    return if (fl == f) .eq else .lt;
+}
+
+/// Order of two numeric values, null when either is not a number. Integers
+/// -- past i64 too, as digits -- compare exactly with each other and with a
+/// float (review 2026-10-24 M2: `18446744073709551615` and
+/// `18446744073709551614` were equal as f64); anything else as f64.
 fn numberOrder(x: Value, y: Value) ?std.math.Order {
-    if (x == .integer and y == .integer) return std.math.order(x.integer, y.integer);
+    if (exactInt(x)) |a| {
+        if (exactInt(y)) |b| return std.math.order(a, b);
+        if (y == .float) return intFloatOrder(a, y.float);
+    } else if (exactInt(y)) |b| if (x == .float) {
+        return if (intFloatOrder(b, x.float)) |o| o.invert() else null;
+    };
     const fx = switch (x) {
         .integer, .float, .number_string => numValue(x) orelse return null,
         else => return null,
@@ -1121,14 +1150,22 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 // ⛔ `n < m` / `n > m` are both false for NaN: query `x=nan`
                 // passed `min = 0, max = 100` (pydantic refuses it;
                 // `query_oracle_test.zig`, 2026-10-06). JSON cannot spell NaN.
-                if (rule.min) |m| if (!(n >= m))
-                    try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
-                if (rule.max) |m| if (!(n <= m))
-                    try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
+                // An integer is held to the bound exactly (review 2026-10-24
+                // M8: `9007199254740993` passed `max = 9007199254740992` as
+                // f64); a null order (NaN) fails both.
+                if (rule.min) |m| if (boundOrder(v, n, m)) |o| {
+                    if (o == .lt) try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
+                } else try b.appendf(path, "greater_than_equal", "Input should be greater than or equal to {d}", .{m});
+                if (rule.max) |m| if (boundOrder(v, n, m)) |o| {
+                    if (o == .gt) try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
+                } else try b.appendf(path, "less_than_equal", "Input should be less than or equal to {d}", .{m});
             } else {
                 // A value that survived the type gate but whose numeric text
                 // cannot be parsed fails CLOSED — never silently treated as 0.
-                try appendTypeError(b, path, rule.kind);
+                // `effective`, not `rule.kind`: an `.any` rule has no type
+                // of its own (review 2026-10-24 M1: a hand-built
+                // `.number_string` reached `appendTypeError(.any)`).
+                try appendTypeError(b, path, effective);
             }
         },
         .string => {
@@ -1230,6 +1267,13 @@ fn appendTypeError(b: *Builder, path: []const u8, kind: Kind) Allocator.Error!vo
 /// can fail closed instead of silently substituting 0. Well-formed but
 /// out-of-range number strings still saturate to ±inf, which orders correctly
 /// against finite bounds.
+/// Order of `v` (numeric value `n`) against the bound `m`; null for NaN.
+fn boundOrder(v: Value, n: f64, m: f64) ?std.math.Order {
+    if (exactInt(v)) |a| return intFloatOrder(a, m);
+    if (std.math.isNan(n) or std.math.isNan(m)) return null;
+    return std.math.order(n, m);
+}
+
 fn numValue(v: Value) ?f64 {
     return switch (v) {
         .integer => |i| @floatFromInt(i),
@@ -2813,6 +2857,9 @@ const Walker = struct {
         expect_key: bool = true,
         /// Objects: the key just read repeats one of this object's.
         dup: bool = false,
+        /// Objects past `key_set_from` keys: this object's keys, so a
+        /// duplicate check is one lookup, not a scan of every key before.
+        key_set: std.StringHashMapUnmanaged(void) = .empty,
         /// Arrays: the rules that passed the gate (lengths are settled at the end).
         gated: std.ArrayList(Active) = .empty,
         /// The rules for the value at the current position: the matched
@@ -2867,6 +2914,7 @@ const Walker = struct {
             f.sets.deinit(w.gpa);
             f.gated.deinit(w.gpa);
             f.children.deinit(w.gpa);
+            f.key_set.deinit(w.gpa);
             w.gpa.destroy(f);
         }
         w.frames.deinit(w.gpa);
@@ -3119,6 +3167,7 @@ const Walker = struct {
         f.expect_key = true;
         f.dup = false;
         f.key_mark = w.keys.items.len;
+        f.key_set.clearRetainingCapacity();
         w.capsClear(f);
         w.depth += 1;
         switch (kind) {
@@ -3142,6 +3191,9 @@ const Walker = struct {
         }
     }
 
+    /// Keys of one object after which duplicates are found by a set.
+    const key_set_from = 32;
+
     fn key(w: *Walker, f: *Frame, name: []const u8, allocated: bool) WalkError!void {
         try w.limitBegin();
         // An allocated key belongs to whoever drives the scanner, and a
@@ -3152,8 +3204,18 @@ const Walker = struct {
             return err;
         };
         f.dup = false;
-        for (w.keys.items[f.key_mark .. w.keys.items.len - 1]) |prev| {
-            if (std.mem.eql(u8, prev.name, k.name)) f.dup = true;
+        // A scan while the object is small; past `key_set_from` keys a set,
+        // or one object of N keys cost N²/2 comparisons -- seconds of CPU at
+        // a raised `max_object_members` (review 2026-10-24 M7). The tree
+        // path's ObjectMap was never quadratic.
+        const before = w.keys.items[f.key_mark .. w.keys.items.len - 1];
+        if (before.len < key_set_from) {
+            for (before) |prev| {
+                if (std.mem.eql(u8, prev.name, k.name)) f.dup = true;
+            }
+        } else {
+            if (f.key_set.count() == 0) for (before) |prev| try f.key_set.put(w.gpa, prev.name, {});
+            if ((try f.key_set.getOrPut(w.gpa, k.name)).found_existing) f.dup = true;
         }
         f.children.clearRetainingCapacity();
         f.child = .{ .parent = f.seg };
@@ -3411,7 +3473,14 @@ const TokenTap = struct {
     }
 
     pub fn allocNextIntoArrayList(t: *TokenTap, value_list: *std.array_list.Managed(u8), when: std.json.AllocWhen) AllocIntoArrayListError!?[]const u8 {
-        const token = try t.nextAllocMax(t.w.gpa, .alloc_if_needed, t.scanner.input.len);
+        return t.allocNextIntoArrayListMax(value_list, when, t.scanner.input.len);
+    }
+
+    /// What std's decoder calls for a sentinel-terminated slice field
+    /// (`[:0]const u8`); without it such a `T` did not compile (review
+    /// 2026-10-24 L10).
+    pub fn allocNextIntoArrayListMax(t: *TokenTap, value_list: *std.array_list.Managed(u8), when: std.json.AllocWhen, max_value_len: usize) AllocIntoArrayListError!?[]const u8 {
+        const token = try t.nextAllocMax(t.w.gpa, .alloc_if_needed, max_value_len);
         defer freeToken(t.w.gpa, token);
         const s = switch (token) {
             .string, .allocated_string => |s| s,
@@ -3568,6 +3637,17 @@ fn namedBefore(r: *const Rule, j: usize, op: CrossOp, other: []const u8) bool {
     return false;
 }
 
+/// Is `r.cross[j]` repeated -- same `op`, sibling AND value -- earlier in
+/// `r.cross`? `required_if`/`required_unless` entries differ by their value:
+/// `required_unless = [{status,"a"},{status,"b"}]` is two alternatives, and
+/// deduplicating by the sibling alone exported only the first (review
+/// 2026-10-24 M6: `{"status":"b"}` exempt here, required by the schema).
+fn sameBefore(r: *const Rule, j: usize) bool {
+    const e = r.cross[j];
+    for (r.cross[0..j]) |c| if (c.op == e.op and std.mem.eql(u8, c.other, e.other) and std.mem.eql(u8, c.value, e.value)) return true;
+    return false;
+}
+
 /// The schema of "member `other` holds `text`" (see `slotHolds`): typed from
 /// the sibling's own rule when there is one, else every JSON value that
 /// would hold.
@@ -3675,7 +3755,7 @@ fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.
             try s.objectField("allOf");
             try s.beginArray();
             for (r.cross, 0..) |c, j| {
-                if (c.op != .required_if or namedBefore(r, j, .required_if, c.other)) continue;
+                if (c.op != .required_if or sameBefore(r, j)) continue;
                 try writeHoldsEntry(s, rules, c);
             }
             try s.endArray();
@@ -3691,7 +3771,7 @@ fn writeCrossMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.
             try s.beginArray();
             try writeRequiredField(s, r.field);
             for (r.cross, 0..) |c, j| {
-                if (c.op != .required_unless or namedBefore(r, j, .required_unless, c.other)) continue;
+                if (c.op != .required_unless or sameBefore(r, j)) continue;
                 try writeHoldsEntry(s, rules, c);
             }
             try s.endArray();
@@ -3807,13 +3887,18 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
             try s.objectField("pattern");
             try writeRegex(s, "^", pre, "", false);
         },
+        // The end of the string is `(?![\s\S])`, not `$`: Python `re`,
+        // PCRE, Java and .NET let `$` match before a final "\n", so a
+        // consumer of the schema on those engines accepted `"abc\n"` where
+        // the module refuses it (review 2026-10-24 M5). ECMA-262 and every
+        // one of those read the lookahead the same way.
         .suffix => |suf| {
             try s.objectField("pattern");
-            try writeRegex(s, "", suf, "$", false);
+            try writeRegex(s, "", suf, end_of_text, false);
         },
         .charset => |set| {
             try s.objectField("pattern");
-            try writeRegex(s, "^[", set, "]*$", true);
+            try writeRegex(s, "^[", set, "]*" ++ end_of_text, true);
         },
         .matcher => |m| {
             try s.objectField("pattern");
@@ -3857,6 +3942,9 @@ fn writeNumber(s: *std.json.Stringify, x: f64) std.Io.Writer.Error!void {
 
 /// `lead ++ escape(text) ++ tail` as one JSON string: `text` taken literally
 /// by an ECMA-262 regex, inside a character class when `class` is set.
+/// The end of the text in every regex dialect (see the `.suffix` export).
+const end_of_text = "(?![\\s\\S])";
+
 fn writeRegex(s: *std.json.Stringify, lead: []const u8, text: []const u8, tail: []const u8, class: bool) std.Io.Writer.Error!void {
     var buf: [512]u8 = undefined;
     var n: usize = 0;
@@ -5695,6 +5783,16 @@ test "one pass: every document that decodes is answered in one tokenization, the
     try testing.expectEqualStrings("too_deep", r.invalid.errors[0].code);
 }
 
+test "streaming: a sentinel-terminated string field decodes (review 2026-10-24 L10)" {
+    const T = struct { s: [:0]const u8, t: []const u8 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try parseIntoLeaky(T, arena.allocator(), "{\"s\":\"a\\u0062c\",\"t\":\"d\"}", .{});
+    try testing.expectEqualStrings("abc", r.ok.s);
+    try testing.expectEqual(@as(u8, 0), r.ok.s.ptr[3]);
+    try testing.expectEqualStrings("d", r.ok.t);
+}
+
 test "streaming: runtime schema agrees with validateJson" {
     const schema = [_]Rule{
         .{ .field = "a", .kind = .any, .min_len = 2, .max = 3, .format = .email },
@@ -5785,7 +5883,7 @@ test "writeJsonSchemaFor: golden, checked against an independent JSON Schema imp
     var w: std.Io.Writer = .fixed(&buf);
     try writeJsonSchemaFor(T, &w);
     try testing.expectEqualStrings(
-        \\{"allOf":[{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,"maximum":255},"score":{"type":["number","null"]},"color":{"type":"string","enum":["red","green"]},"tags":{"type":"array","items":{"type":"string"}},"code":{"type":"string","minLength":1,"maxLength":3,"x-minBytes":3,"x-maxBytes":3},"addr":{"type":["object","null"],"properties":{"city":{"type":"string"},"zip":{"type":["string","null"]}},"required":["city"]}},"required":["name","age"]},{"properties":{"name":{"type":"string","minLength":2,"maxLength":5,"pattern":"^a\\.b"},"tags":{"type":"array","maxItems":2,"items":{"type":"string","pattern":"^[xy\\-\\]]*$"}},"email":{"type":"string","format":"email"},"misc":{"minLength":2,"minItems":2},"lit":{"type":"string","const":"q"},"suf":{"type":"string","pattern":"\\$z$"},"when":{"type":"string","format":"date"}}}]}
+        \\{"allOf":[{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,"maximum":255},"score":{"type":["number","null"]},"color":{"type":"string","enum":["red","green"]},"tags":{"type":"array","items":{"type":"string"}},"code":{"type":"string","minLength":1,"maxLength":3,"x-minBytes":3,"x-maxBytes":3},"addr":{"type":["object","null"],"properties":{"city":{"type":"string"},"zip":{"type":["string","null"]}},"required":["city"]}},"required":["name","age"]},{"properties":{"name":{"type":"string","minLength":2,"maxLength":5,"pattern":"^a\\.b"},"tags":{"type":"array","maxItems":2,"items":{"type":"string","pattern":"^[xy\\-\\]]*(?![\\s\\S])"}},"email":{"type":"string","format":"email"},"misc":{"minLength":2,"minItems":2},"lit":{"type":"string","const":"q"},"suf":{"type":"string","pattern":"\\$z(?![\\s\\S])"},"when":{"type":"string","format":"date"}}}]}
     , w.buffered());
 }
 
@@ -7315,6 +7413,59 @@ test "cross: eq_field — a password and its confirmation (baked_in.go isEqField
     try expectBoth("{\"password\":\"a\",\"confirm\":\"a\",\"confirm\":\"b\"}", &pw_schema, &.{.{ "", "json_invalid" }});
 }
 
+test "streaming: a duplicate key in a large object is found by the key set, escaped or not, at any depth (review 2026-10-24 M7)" {
+    const gpa = testing.allocator;
+    const s = [_]Rule{.{ .field = "k3", .kind = .int }};
+    // `dup`: which key (by index) is repeated at the end; null = none.
+    for ([_]?usize{ null, 0, 31, 32, 33, 199 }) |dup| for ([_]bool{ false, true }) |nested| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        if (nested) try body.appendSlice(gpa, "{\"outer\":");
+        try body.append(gpa, '{');
+        for (0..200) |i| {
+            if (i != 0) try body.append(gpa, ',');
+            try body.print(gpa, "\"k{d}\":{d}", .{ i, i });
+        }
+        // The repeat spelled with an escape: an allocated key on the streaming side.
+        if (dup) |d| try body.print(gpa, ",\"\\u006b{d}\":0", .{d});
+        try body.append(gpa, '}');
+        if (nested) try body.append(gpa, '}');
+        const want: []const [2][]const u8 = if (dup != null) &.{.{ "", "json_invalid" }} else &.{};
+        try expectBoth(body.items, &s, want);
+    };
+}
+
+test "cross: integers compare exactly past 2^53 and past i64, also against a float (review 2026-10-24 M2)" {
+    const eq = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
+    const gt = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .gt_field, .other = "b" }} }, .{ .field = "b" } };
+    // Equal as f64; not equal as integers.
+    try expectBoth("{\"a\":18446744073709551615,\"b\":18446744073709551614}", &eq, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":9007199254740993,\"b\":9007199254740992}", &eq, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":9007199254740993,\"b\":9007199254740992.0}", &eq, &.{.{ "a", "field_mismatch" }});
+    try expectBoth("{\"a\":18446744073709551615,\"b\":18446744073709551615}", &eq, &.{});
+    try expectBoth("{\"a\":5,\"b\":5.0}", &eq, &.{});
+    try expectBoth("{\"a\":18446744073709551615,\"b\":18446744073709551614}", &gt, &.{});
+    try expectBoth("{\"a\":9007199254740993,\"b\":9007199254740992.5}", &gt, &.{});
+    try expectBoth("{\"a\":-3,\"b\":-2.5}", &gt, &.{.{ "a", "greater_than_field" }});
+}
+
+test "min/max: an integer is held to the bound exactly (review 2026-10-24 M8)" {
+    const s = [_]Rule{.{ .field = "n", .kind = .int, .min = -9007199254740992, .max = 9007199254740992 }};
+    try expectBoth("{\"n\":9007199254740992}", &s, &.{});
+    try expectBoth("{\"n\":9007199254740993}", &s, &.{.{ "n", "less_than_equal" }});
+    try expectBoth("{\"n\":-9007199254740993}", &s, &.{.{ "n", "greater_than_equal" }});
+    try expectBoth("{\"n\":18446744073709551616}", &s, &.{.{ "n", "less_than_equal" }});
+}
+
+test "an .any rule with a hand-built unparseable number_string is a type error, not unreachable (review 2026-10-24 M1)" {
+    var obj: std.json.ObjectMap = .empty;
+    defer obj.deinit(testing.allocator);
+    try obj.put(testing.allocator, "x", .{ .number_string = "abc" });
+    var r = try validateValue(testing.allocator, .{ .object = obj }, &.{.{ .field = "x", .min = 0 }});
+    defer r.deinit();
+    try expectError(&r, "x", "int_type");
+}
+
 test "cross: eq_field on containers and null — never equal; null is not compared" {
     const any_schema = [_]Rule{
         .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
@@ -7617,6 +7768,19 @@ test "cross: the schema export — required_with is dependentRequired, the other
     , &.{
         .{ .field = "c", .cross = &.{.{ .op = .required_if, .other = "n", .value = "5" }} },
     });
+    // Two values for one sibling are two entries (review 2026-10-24 M6: the
+    // second was dropped, so `{"role":"auditor"}` was exempt here and
+    // required by the schema); an exact repeat stays one.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"role":{"type":"string"},"reason":{"type":"string"}},"allOf":[{"anyOf":[{"required":["reason"]},{"properties":{"role":{"const":"admin"}},"required":["role"]},{"properties":{"role":{"const":"auditor"}},"required":["role"]}]}]}
+    , &.{
+        .{ .field = "role", .kind = .string },
+        .{ .field = "reason", .kind = .string, .cross = &.{
+            .{ .op = .required_unless, .other = "role", .value = "admin" },
+            .{ .op = .required_unless, .other = "role", .value = "auditor" },
+            .{ .op = .required_unless, .other = "role", .value = "admin" },
+        } },
+    });
     // The comparison ops have no 2020-12 form: nothing is exported for them.
     try expectJsonEq(
         \\{"type":"object","properties":{"a":{},"b":{}}}
@@ -7624,6 +7788,210 @@ test "cross: the schema export — required_with is dependentRequired, the other
         .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
         .{ .field = "b" },
     });
+}
+
+// ── tests: pinned by the 2026-10-24 mutation audit ──────────────────────────
+//
+// Each one names the mutation that survived the suite without it.
+
+test "min/max: an integer at the i128 edges is ordered exactly against a bound of ±2^127 (intFloatOrder)" {
+    // 2^127 is outside i128: every i128 is below it. A bound AT 2^127 takes
+    // the range branch; converting it instead overflows (`>=` -> `>` panicked).
+    const min = [_]Rule{.{ .field = "n", .kind = .int, .min = 0x1p127 }};
+    try expectBoth("{\"n\":5}", &min, &.{.{ "n", "greater_than_equal" }});
+    try expectBoth("{\"n\":170141183460469231731687303715884105727}", &min, &.{.{ "n", "greater_than_equal" }});
+    // -2^127 is i128's minimum: equal to it, not above (`<` -> `<=` said greater).
+    const max = [_]Rule{.{ .field = "n", .kind = .int, .max = -0x1p127 }};
+    try expectBoth("{\"n\":-170141183460469231731687303715884105728}", &max, &.{});
+    try expectBoth("{\"n\":-170141183460469231731687303715884105727}", &max, &.{.{ "n", "less_than_equal" }});
+}
+
+test "cross: a float field is ordered exactly against an integer sibling (numberOrder float-vs-integer)" {
+    const lt = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .lt_field, .other = "b" }} }, .{ .field = "b" } };
+    // 2^53 + 1 is not representable: as doubles the two are equal.
+    try expectBoth("{\"a\":9007199254740992.0,\"b\":9007199254740993}", &lt, &.{});
+    try expectBoth("{\"a\":9007199254740992.0,\"b\":9007199254740992}", &lt, &.{.{ "a", "less_than_field" }});
+}
+
+test "cross: lt_field is strict, and an .any rule does not compare a null" {
+    const lt = [_]Rule{ .{ .field = "a", .kind = .int, .cross = &.{.{ .op = .lt_field, .other = "b" }} }, .{ .field = "b", .kind = .int } };
+    try expectBoth("{\"a\":3,\"b\":4}", &lt, &.{});
+    try expectBoth("{\"a\":3,\"b\":3}", &lt, &.{.{ "a", "less_than_field" }});
+    // A null is not compared whatever the rule's kind (crossGated: an .any
+    // rule must not skip that check).
+    const any = [_]Rule{
+        .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} },
+        .{ .field = "b" },
+    };
+    try expectBoth("{\"a\":null,\"b\":2}", &any, &.{});
+}
+
+test "cross: date-times order as instants — fraction digits padded, offset sign and minutes, versus a plain string" {
+    const eq = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .eq_field, .other = "b" }} }, .{ .field = "b" } };
+    // .5 and .50 are one fraction (padded with zeros, not with anything else).
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00.5Z\",\"b\":\"2026-01-01T00:00:00.50Z\"}", &eq, &.{});
+    // A negative offset is behind UTC; the minutes of an offset count.
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00-05:00\",\"b\":\"2026-01-01T05:00:00Z\"}", &eq, &.{});
+    try expectBoth("{\"a\":\"2026-01-01T05:30:00+05:30\",\"b\":\"2026-01-01T00:00:00Z\"}", &eq, &.{});
+    // One date-time and one other string: ordered by length, not as instants.
+    const gt = [_]Rule{ .{ .field = "a", .cross = &.{.{ .op = .gt_field, .other = "b" }} }, .{ .field = "b" } };
+    try expectBoth("{\"a\":\"2026-01-01T00:00:00Z\",\"b\":\"xyz\"}", &gt, &.{});
+    try expectBoth("{\"a\":\"xyz\",\"b\":\"2026-01-01T00:00:00Z\"}", &gt, &.{.{ "a", "greater_than_field" }});
+}
+
+test "cross: required_if on a numeric sibling holds only for the equal number (slotHolds)" {
+    const s = [_]Rule{
+        .{ .field = "n" },
+        .{ .field = "c", .cross = &.{.{ .op = .required_if, .other = "n", .value = "5" }} },
+    };
+    try expectBoth("{\"n\":4}", &s, &.{});
+    try expectBoth("{\"n\":5}", &s, &.{.{ "c", "missing" }});
+    try expectBoth("{\"n\":6}", &s, &.{});
+}
+
+test "format email: a local part of 64 characters is valid, 65 is not (isEmail)" {
+    const l64: [64]u8 = @splat('a');
+    const l65: [65]u8 = @splat('a');
+    const ok = l64 ++ "@b.co";
+    const bad = l65 ++ "@b.co";
+    try expectFormat(.email, &.{ok}, &.{bad});
+}
+
+test "format uuid: the fourth hyphen is checked too (isUuid)" {
+    try expectFormat(
+        .uuid,
+        &.{"12345678-1234-1234-1234-123456789012"},
+        &.{ "12345678-1234-1234-1234x123456789012", "12345678-1234-1234-123x-123456789012" },
+    );
+}
+
+test "query: a hexadecimal float is float_parsing in either case of the prefix (coerceFloat)" {
+    const schema = [_]Rule{ .{ .field = "x", .kind = .float }, .{ .field = "y", .kind = .float } };
+    var r = try validateQuery(testing.allocator, "x=0X10&y=0x10", &schema);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.errors.len);
+    try expectError(&r, "x", "float_parsing");
+    try expectError(&r, "y", "float_parsing");
+}
+
+test "streaming: a frame reused by a sibling object starts with an empty key set (Walker.open)" {
+    // Two sibling objects of 40 distinct keys, the same in both: the second
+    // reuses the first's frame, and a key set left over from it would call
+    // every key from the 33rd on a repeat.
+    const gpa = testing.allocator;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    try body.append(gpa, '{');
+    for ([_][]const u8{ "p", "q" }, 0..) |name, n| {
+        if (n != 0) try body.append(gpa, ',');
+        try body.print(gpa, "\"{s}\":{{", .{name});
+        for (0..40) |i| {
+            if (i != 0) try body.append(gpa, ',');
+            try body.print(gpa, "\"k{d}\":{d}", .{ i, i });
+        }
+        try body.append(gpa, '}');
+    }
+    try body.append(gpa, '}');
+    try expectBoth(body.items, &.{.{ .field = "k3", .kind = .int }}, &.{});
+}
+
+test "streaming limits: the one-pass walker counts every member, whatever its value is (Walker.key / limitComplete / limitClose)" {
+    const T = struct { a: i64 = 0 };
+    const extra: []const Rule = comptime typedExtra(T);
+    // Three members against a limit of two: the walker refuses (null) and
+    // the multi-pass path reports. Scalars, objects and arrays as values.
+    for ([_][]const u8{
+        "{\"a\":1,\"b\":2,\"c\":3}",
+        "{\"a\":1,\"b\":{},\"c\":{}}",
+        "{\"a\":1,\"b\":[],\"c\":[]}",
+    }) |body| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        try testing.expect(try parseOnePass(T, arena.allocator(), body, .{ .max_object_members = 2 }, extra) == null);
+        try testing.expect(!try expectOnePassAgrees(T, body, .{ .max_object_members = 2 }));
+    }
+    // Two members are within it.
+    try testing.expect(try expectOnePassAgrees(T, "{\"a\":1,\"b\":{}}", .{ .max_object_members = 2 }));
+    // Values count as nodes, one each, beside the object itself: 4 here.
+    try testing.expect(!try expectOnePassAgrees(T, "{\"a\":1,\"b\":2,\"c\":3}", .{ .max_total_nodes = 3 }));
+    try testing.expect(try expectOnePassAgrees(T, "{\"a\":1,\"b\":2,\"c\":3}", .{ .max_total_nodes = 4 }));
+}
+
+fn expectExportHas(rules: []const Rule, needle: []const u8) !void {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeJsonSchema(rules, &aw.writer);
+    if (std.mem.find(u8, aw.written(), needle) == null) {
+        std.debug.print("\nexport lacks: {s}\nexport is:    {s}\n", .{ needle, aw.written() });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "export: a charset escapes '[' and ']' inside the class, and the end of text is the lookahead (writeRegex)" {
+    try expectExportHas(
+        &.{.{ .field = "f", .kind = .string, .pattern = .{ .charset = "[a]" } }},
+        \\"pattern":"^[\\[a\\]]*(?![\\s\\S])"
+        ,
+    );
+}
+
+test "export: a suffix fits the regex buffer up to 501 bytes, a longer one is stated as .* (writeRegex)" {
+    var a501: [501]u8 = @splat('a');
+    var a502: [502]u8 = @splat('a');
+    const fits = try std.fmt.allocPrint(testing.allocator, "\"pattern\":\"{s}(?![\\\\s\\\\S])\"", .{&a501});
+    defer testing.allocator.free(fits);
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .pattern = .{ .suffix = &a501 } }}, fits);
+    try expectExportHas(&.{.{ .field = "f", .kind = .string, .pattern = .{ .suffix = &a502 } }}, "\"pattern\":\".*\"");
+}
+
+test "export: one presence entry per distinct (op, sibling, value) — repeats and other ops are not dropped or doubled (sameBefore, namedBefore)" {
+    // An entry of another op for the same sibling and value is not a repeat.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"role":{"type":"string"},"reason":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"role":{"const":"admin"}},"required":["role"]}]},"then":{"required":["reason"]}},{"anyOf":[{"required":["reason"]},{"properties":{"role":{"const":"admin"}},"required":["role"]}]}]}
+    , &.{
+        .{ .field = "role", .kind = .string },
+        .{ .field = "reason", .kind = .string, .cross = &.{
+            .{ .op = .required_unless, .other = "role", .value = "admin" },
+            .{ .op = .required_if, .other = "role", .value = "admin" },
+        } },
+    });
+    // An exact repeat of required_if stays one.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"mode":{"type":"string"},"card":{"type":"string"}},"allOf":[{"if":{"allOf":[{"properties":{"mode":{"const":"card"}},"required":["mode"]}]},"then":{"required":["card"]}}]}
+    , &.{
+        .{ .field = "mode", .kind = .string },
+        .{ .field = "card", .kind = .string, .cross = &.{
+            .{ .op = .required_if, .other = "mode", .value = "card" },
+            .{ .op = .required_if, .other = "mode", .value = "card" },
+        } },
+    });
+    // And of required_without.
+    try expectJsonEq(
+        \\{"type":"object","properties":{"email":{"type":"string"},"phone":{"type":"string"}},"allOf":[{"anyOf":[{"required":["email"]},{"required":["phone"]}]}]}
+    , &.{
+        .{ .field = "email", .kind = .string, .cross = &.{
+            .{ .op = .required_without, .other = "phone" },
+            .{ .op = .required_without, .other = "phone" },
+        } },
+        .{ .field = "phone", .kind = .string },
+    });
+}
+
+test "export: dependentRequired lists a field once, with two rules for it or two entries in one rule" {
+    // Two rules for `phone`, both requiring it with `email`.
+    try expectExportHas(&.{
+        .{ .field = "email", .kind = .string },
+        .{ .field = "phone", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "email" }} },
+        .{ .field = "phone", .kind = .string, .cross = &.{.{ .op = .required_with, .other = "email" }} },
+    }, "\"dependentRequired\":{\"email\":[\"phone\"]}");
+    // One rule naming `email` twice.
+    try expectExportHas(&.{
+        .{ .field = "email", .kind = .string },
+        .{ .field = "phone", .kind = .string, .cross = &.{
+            .{ .op = .required_with, .other = "email" },
+            .{ .op = .required_with, .other = "email" },
+        } },
+    }, "\"dependentRequired\":{\"email\":[\"phone\"]}");
 }
 
 // ── tests: a JSON array as the document root ────────────────────────────────

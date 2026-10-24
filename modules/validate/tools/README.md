@@ -26,13 +26,14 @@ auto-installs from the cache when no `node_modules` is in reach) and the Python
 **What the replay holds** (2026-10-05, Python 3.14, jsonschema 4.19.2, ajv 8.20.0): 313
 rule sets, 2051 documents. The rule set's exported schema must equal the frozen one as a
 JSON value; `validateJson` and `validateJsonStreaming` must agree with each other and
-answer `want`: the two validators' common verdict (1964 cases), or the verdict a class in
-`CLASSES` decided — `PY_DOLLAR` (Python's `$` matches before a final newline; ECMA-262,
-which 2020-12 names for `pattern`, does not), `F64_PRECISION` (bounds past 2^53: Python
-exact, ajv and the module in doubles), `F64_OVERFLOW` (`1e400` as an integer: ajv's
+answer `want`: the two validators' common verdict (1966 cases, re-taken 2026-10-24), or the
+verdict a class in `CLASSES` decided — `F64_PRECISION` (bounds past 2^53: Python and the
+module exact, ajv in doubles), `F64_OVERFLOW` (`1e400` as an integer: ajv's
 `Infinity % 1` check calls it one), `BYTES` (byte bounds the schema can only annotate),
 `LONE_SURROGATE` (std.json refuses an unpaired surrogate escape). Every class must decide
-at least one case.
+at least one case. (`PY_DOLLAR`, Python's `$` matching before a final newline, is gone
+since 2026-10-24: the export ends a pattern with `(?![\s\S])`, the end of the text in every
+regex dialect, so both validators agree.)
 
 `format` is left out (anchored on the JSON-Schema-Test-Suite by
 `json_schema_format_test.zig`); `custom` and `Pattern.matcher` are code with no schema form.
