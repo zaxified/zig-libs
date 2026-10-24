@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the example handles the new `error.InvalidHeaderValue` in its exhaustive `init` error switches (it did not compile since the grade-1 commit; `modtest` does not build examples, `check-examples` does).
 - **2026-10-24** — **Behaviour change:** `SecurityHeaders.init` returns the new
   `InitError.InvalidHeaderValue` for a CR/LF/NUL in any value, in every build mode (was a Debug-only assert,
   so a ReleaseFast build failed every request instead), and `InvalidExtraHeaderName` for an `extra` named
