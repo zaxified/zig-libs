@@ -8,8 +8,8 @@
 //! - `TokenBucket` — the bare algorithm (Go `golang.org/x/time/rate`
 //!   semantics: float token balance, lazy refill, burst cap). No clock, no
 //!   locking, no allocation — the caller passes `now_ns`.
-//! - `Limiter` — per-key buckets in a bounded store (`max_keys` cap with LRU
-//!   eviction + idle TTL), internally synchronized, clock injected via
+//! - `Limiter` — per-key buckets in a bounded store (`max_keys` cap with
+//!   second-chance eviction, the CLOCK approximation of LRU, + idle TTL), internally synchronized, clock injected via
 //!   `Options.clock` (defaults to the OS monotonic clock; the algorithm
 //!   itself never reads a wall clock).
 //! - `Limiter.middleware()` — a `router.Middleware`: allowed requests flow
@@ -226,22 +226,35 @@ pub const TokenBucket = struct {
     /// `n == 0` passes unless reservations hold the balance below zero.
     pub fn allowNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32) Decision {
         std.debug.assert(cfg.rate_per_s > 0 and cfg.burst >= 1);
+        const allowed = b.takeNAt(cfg, now_ns, n);
+        return decision(cfg, n, allowed, b.tokens);
+    }
+
+    /// The state change of `allowNAt`: advance, then take `n` tokens or none.
+    fn takeNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32) bool {
         b.advanceAt(cfg, now_ns);
-        const burst_f: f64 = @floatFromInt(cfg.burst);
         const n_f: f64 = @floatFromInt(n);
         const allowed = n <= cfg.burst and b.tokens >= n_f;
         if (allowed) {
             b.tokens -= n_f;
             b.last_event_ns = now_ns;
         }
+        return allowed;
+    }
+
+    /// The report of `allowNAt` from the balance it left (`tokens`) — pure,
+    /// so `Limiter` computes it after releasing its lock.
+    fn decision(cfg: Config, n: u32, allowed: bool, tokens: f64) Decision {
+        const burst_f: f64 = @floatFromInt(cfg.burst);
+        const n_f: f64 = @floatFromInt(n);
         return .{
             .allowed = allowed,
             .retry_after_ms = if (allowed) 0 else if (n > cfg.burst)
                 std.math.maxInt(u64)
             else
-                ceilMs((n_f - b.tokens) / cfg.rate_per_s),
-            .remaining = wholeTokens(b.tokens),
-            .reset_after_ms = ceilMs((burst_f - b.tokens) / cfg.rate_per_s),
+                ceilMs((n_f - tokens) / cfg.rate_per_s),
+            .remaining = wholeTokens(tokens),
+            .reset_after_ms = ceilMs((burst_f - tokens) / cfg.rate_per_s),
             .limit = cfg.burst,
         };
     }
@@ -298,8 +311,10 @@ pub const TokenBucket = struct {
     /// directly before switching to a new config (see the type doc).
     pub fn advanceAt(b: *TokenBucket, cfg: Config, now_ns: u64) void {
         if (now_ns > b.updated_ns) {
-            const elapsed_s = @as(f64, @floatFromInt(now_ns - b.updated_ns)) / ns_per_s_f;
-            b.tokens += elapsed_s * cfg.rate_per_s;
+            // rate per ns first: that division depends on the config only,
+            // so it runs beside the bucket's loads instead of after them.
+            const per_ns = cfg.rate_per_s / ns_per_s_f;
+            b.tokens += @as(f64, @floatFromInt(now_ns - b.updated_ns)) * per_ns;
             b.updated_ns = now_ns;
         }
         b.tokens = @min(b.tokens, @as(f64, @floatFromInt(cfg.burst)));
@@ -310,9 +325,38 @@ pub const TokenBucket = struct {
     fn idleSince(b: TokenBucket) u64 {
         return @max(b.updated_ns, b.last_event_ns);
     }
+
+    /// How long an empty bucket takes to refill to `cfg.burst`, rounded up,
+    /// saturating. From `idleSince` on the balance is ≥ 0 (a reservation's
+    /// time to act is when its tokens have accrued), so a bucket idle this
+    /// long is full.
+    fn refillNs(cfg: Config) u64 {
+        return durationNs(@floatFromInt(cfg.burst), cfg.rate_per_s) +| 1;
+    }
 };
 
 const ns_per_s_f: f64 = @floatFromInt(std.time.ns_per_s);
+
+/// A usable refill rate: positive and finite (NaN fails both).
+pub fn validRate(r: f64) bool {
+    return r > 0 and std.math.isFinite(r);
+}
+
+/// Why `Limiter.init` refuses `options` (it panics with this), or null.
+pub fn optionsError(options: Options) ?[]const u8 {
+    if (configError(options.rate_per_s, options.burst)) |msg| return msg;
+    if (options.max_keys < 1) return "ratelimit: max_keys must be >= 1";
+    if (options.max_key_len < 1) return "ratelimit: max_key_len must be >= 1";
+    if (options.v6_key_bits > 128) return "ratelimit: v6_key_bits must be <= 128";
+    return null;
+}
+
+/// Why a rate/burst (null = unchanged) is refused, or null.
+fn configError(rate_per_s: ?f64, burst: ?u32) ?[]const u8 {
+    if (rate_per_s) |r| if (!validRate(r)) return "ratelimit: rate_per_s must be > 0 and finite";
+    if (burst) |b| if (b < 1) return "ratelimit: burst must be >= 1";
+    return null;
+}
 
 /// floor(tokens) as a count, 0 for a negative balance.
 fn wholeTokens(tokens: f64) u32 {
@@ -365,7 +409,11 @@ pub const KeySource = union(enum) {
     /// socket peer address, else `fallback_key`.
     forwarded_ip,
     /// Value of this request header (e.g. an API key). Requests without the
-    /// header fall back to the `forwarded_ip` chain.
+    /// header fall back to the `forwarded_ip` chain. ⚠ Only behind
+    /// something that rejects invalid values first (an auth middleware
+    /// ahead of this one): taken as it is, the header is chosen by the
+    /// client, and a new value per request is a new full bucket — a bypass,
+    /// and a way to flush other keys out of the table (review 2026-10-24).
     header: []const u8,
     /// Fully custom extraction.
     custom: KeyFn,
@@ -385,9 +433,12 @@ pub const Options = struct {
     rate_per_s: f64,
     /// Per-key burst capacity. Must be ≥ 1.
     burst: u32,
-    /// At most this many distinct keys tracked (memory bound); beyond it the
-    /// least-recently-used key is evicted — an evicted key seen again starts
-    /// over with a full bucket. Must be ≥ 1.
+    /// At most this many distinct keys tracked (memory bound); beyond it a
+    /// key is evicted by second chance (CLOCK, an LRU approximation): the
+    /// oldest key not used since the eviction hand last passed it, so a key
+    /// used about once per `max_keys` new keys stays, as under LRU, and keys
+    /// a flood never reuses go first. An evicted key seen again starts over
+    /// with a full bucket. Must be ≥ 1.
     max_keys: usize = 4096,
     /// At most this many bytes of a key are stored/looked-up; a longer key is
     /// truncated to this prefix before it ever reaches the map. Bounds
@@ -398,10 +449,21 @@ pub const Options = struct {
     /// deliberately collide into one bucket — a coarser key, not a bypass.
     /// Must be ≥ 1.
     max_key_len: usize = 128,
-    /// Idle expiry: a key untouched this long is dropped (swept from the LRU
-    /// tail when new keys arrive) or reset to a full bucket on its next hit.
+    /// The `forwarded_ip` key (and the `header` source's fallback to it) of
+    /// an IPv6 client is its first `v6_key_bits` bits: one end site
+    /// usually holds a whole /64 and can rotate through it, so a per-address
+    /// key would hand each new address a fresh bucket. 128 keys every
+    /// address apart. IPv4 is always the whole address. Same default as
+    /// `ConnectionLimiter.Options.unlisted_v6_bits`.
+    v6_key_bits: u8 = 64,
+    /// Idle expiry: a key untouched this long is dropped (swept from the
+    /// eviction hand's end when new keys arrive) or reset to a full bucket on its next hit.
+    /// Never shorter than the time an empty bucket takes to refill
+    /// (`burst / rate_per_s`), so expiry admits nothing the bucket would not
+    /// have: with 5/hour the effective TTL is an hour, whatever is set here.
     /// 0 disables. Memory stays bounded by `max_keys` either way — the TTL
-    /// only releases idle keys' memory early.
+    /// only releases idle keys' memory early. Eviction at `max_keys` is the
+    /// exception: an evicted key comes back full.
     ttl_ms: u64 = 10 * std.time.ms_per_min,
     /// Time source — inject a fake for deterministic tests. The algorithm
     /// never reads a wall clock on its own.
@@ -421,15 +483,15 @@ pub const Options = struct {
     key: KeySource,
 };
 
-/// Per-key token buckets in a bounded LRU store.
+/// Per-key token buckets in a bounded store (second-chance eviction).
 ///
 /// Thread-safety: internally synchronized — all public calls may race from
 /// any number of threads (the middleware runs on `http.Server`'s
 /// per-connection threads). The lock is a spinlock (`std.atomic.Mutex` +
 /// `spinLoopHint`, the std SmpAllocator pattern — Zig 0.16 std has no
-/// io-less blocking mutex); the critical section is a hash lookup plus an
-/// O(1) LRU relink, with a gpa alloc/free only when a key is inserted or
-/// evicted. Do not hold across it anything of your own.
+/// io-less blocking mutex); the critical section is a hash lookup and the
+/// bucket update (the key is hashed before it, the `Decision` computed
+/// after it), with a gpa alloc/free only when a key is inserted or evicted. Do not hold across it anything of your own.
 ///
 /// Failure policy: `allow` is infallible — if tracking a *new* key fails on
 /// allocator exhaustion the request is allowed untracked (fail-open: a
@@ -439,31 +501,84 @@ pub const Limiter = struct {
     gpa: Allocator,
     options: Options,
     lock: std.atomic.Mutex = .unlocked,
-    /// Keyed by `Entry.key` (gpa-owned copies).
-    map: std.StringHashMapUnmanaged(*Entry) = .empty,
-    /// Front = most recently used; evictions pop the back.
+    /// The entries themselves, hashed and compared by `Entry.key` (a copy
+    /// inside the entry's own allocation): a set of pointers, so a probe
+    /// reads one dense 8-byte slot and then the entry it names.
+    map: std.HashMapUnmanaged(*Entry, void, EntryContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// The idle expiry in force: `ttl_ms`, raised to the refill time of the
+    /// config in force; 0 = none. Recomputed with the config.
+    idle_ns: u64 = 0,
+    /// The eviction hand's queue: new keys and rotated ones at the front,
+    /// the hand at the back (see `victimLocked`).
     lru: std.DoublyLinkedList = .{},
 
     const Entry = struct {
         node: std.DoublyLinkedList.Node = .{},
         key: []u8,
         bucket: TokenBucket,
+        /// Used since the eviction hand last passed it (second chance).
+        referenced: bool = false,
     };
 
+    /// `std.StringHashMap`'s key hash, inlined.
+    const KeyContext = struct {
+        pub fn hash(_: KeyContext, k: []const u8) u64 {
+            return @call(.always_inline, std.hash.Wyhash.hash, .{ 0, k });
+        }
+    };
+
+    /// The map's own context: an entry hashes as its key; two entries are
+    /// equal only when they are the same entry (keys are unique in the map).
+    const EntryContext = struct {
+        pub fn hash(_: EntryContext, e: *Entry) u64 {
+            return KeyContext.hash(.{}, e.key);
+        }
+        pub fn eql(_: EntryContext, a: *Entry, b: *Entry) bool {
+            return a == b;
+        }
+    };
+
+    /// Key compare the hot path inlines: client keys (addresses, short API
+    /// keys) are 8–16 bytes, two overlapping word loads apiece.
+    inline fn keyEql(a: []const u8, b: []const u8) bool {
+        if (a.len != b.len) return false;
+        if (a.len >= 8 and a.len <= 16) {
+            const r = std.mem.readInt;
+            return r(u64, a[0..8], .little) == r(u64, b[0..8], .little) and
+                r(u64, a[a.len - 8 ..][0..8], .little) == r(u64, b[b.len - 8 ..][0..8], .little);
+        }
+        return std.mem.eql(u8, a, b);
+    }
+
+    /// Looks an entry up by its key, with a hash computed earlier (outside
+    /// the lock).
+    const HashedKey = struct {
+        h: u64,
+        pub fn hash(k: HashedKey, _: []const u8) u64 {
+            return k.h;
+        }
+        pub inline fn eql(_: HashedKey, key: []const u8, e: *Entry) bool {
+            return keyEql(key, e.key);
+        }
+    };
+
+    fn idleNs(options: Options) u64 {
+        if (options.ttl_ms == 0) return 0;
+        const cfg: TokenBucket.Config = .{ .rate_per_s = options.rate_per_s, .burst = options.burst };
+        return @max(options.ttl_ms *| std.time.ns_per_ms, TokenBucket.refillNs(cfg));
+    }
+
+    /// Panics on an invalid `options` in every build mode: a NaN or zero
+    /// rate would otherwise deny or admit everything silently in a release
+    /// build (review 2026-10-24).
     pub fn init(gpa: Allocator, options: Options) Limiter {
-        std.debug.assert(options.rate_per_s > 0 and std.math.isFinite(options.rate_per_s));
-        std.debug.assert(options.burst >= 1);
-        std.debug.assert(options.max_keys >= 1);
-        std.debug.assert(options.max_key_len >= 1);
-        return .{ .gpa = gpa, .options = options };
+        if (optionsError(options)) |msg| @panic(msg);
+        return .{ .gpa = gpa, .options = options, .idle_ns = idleNs(options) };
     }
 
     pub fn deinit(l: *Limiter) void {
-        var it = l.map.valueIterator();
-        while (it.next()) |e| {
-            l.gpa.free(e.*.key);
-            l.gpa.destroy(e.*);
-        }
+        var it = l.map.keyIterator();
+        while (it.next()) |e| l.freeEntry(e.*);
         l.map.deinit(l.gpa);
         l.* = undefined;
     }
@@ -489,14 +604,27 @@ pub const Limiter = struct {
 
     /// `allowN` at an explicit instant.
     pub fn allowNAt(l: *Limiter, raw_key: []const u8, n: u32, now_ns: u64) Decision {
-        lockSpin(&l.lock);
-        defer l.lock.unlock();
-        const b = l.bucketLocked(raw_key, now_ns) orelse {
+        // Only the state change runs under the lock: the key is hashed
+        // before it and the report (divisions, rounding) computed after it.
+        const key = l.storedKey(raw_key);
+        const h = KeyContext.hash(.{}, key);
+        var cfg: TokenBucket.Config = undefined;
+        var allowed: bool = undefined;
+        var tokens: f64 = undefined;
+        {
+            lockSpin(&l.lock);
+            defer l.lock.unlock();
+            cfg = l.config();
             // OOM → fail open (documented): decide on a fresh bucket.
-            var fresh: TokenBucket = .full(l.config(), now_ns);
-            return fresh.allowNAt(l.config(), now_ns, n);
-        };
-        return b.allowNAt(l.config(), now_ns, n);
+            var fresh: TokenBucket = undefined;
+            const b = l.bucketLockedHashed(key, h, now_ns) orelse blk: {
+                fresh = .full(cfg, now_ns);
+                break :blk &fresh;
+            };
+            allowed = b.takeNAt(cfg, now_ns, n);
+            tokens = b.tokens;
+        }
+        return TokenBucket.decision(cfg, n, allowed, tokens);
     }
 
     pub const WaitError = error{
@@ -521,7 +649,9 @@ pub const Limiter = struct {
     /// stranger.
     ///
     /// The delay is computed on `Options.clock` and slept on `io`'s awake
-    /// clock; with the default monotonic clock they agree.
+    /// clock; with the default monotonic clock they agree. Fail-open like
+    /// `allow`: when tracking a new key fails on allocation it returns at
+    /// once, unpaced.
     pub fn waitN(l: *Limiter, io: std.Io, key: []const u8, n: u32, max_wait_ns: u64) WaitError!void {
         const now_ns = l.options.clock.now();
         const r: Reservation = blk: {
@@ -553,15 +683,15 @@ pub const Limiter = struct {
 
     /// `setRate`/`setBurst` at an explicit instant; null keeps a value.
     pub fn setConfigAt(l: *Limiter, rate_per_s: ?f64, burst: ?u32, now_ns: u64) void {
-        if (rate_per_s) |r| std.debug.assert(r > 0 and std.math.isFinite(r));
-        if (burst) |b| std.debug.assert(b >= 1);
+        if (configError(rate_per_s, burst)) |msg| @panic(msg);
         lockSpin(&l.lock);
         defer l.lock.unlock();
         const old = l.config();
-        var it = l.map.valueIterator();
+        var it = l.map.keyIterator();
         while (it.next()) |e| e.*.bucket.advanceAt(old, now_ns);
         if (rate_per_s) |r| l.options.rate_per_s = r;
         if (burst) |b| l.options.burst = b;
+        l.idle_ns = idleNs(l.options);
     }
 
     /// The rate and burst in force (x/time/rate `Limit`/`Burst`).
@@ -577,47 +707,60 @@ pub const Limiter = struct {
     }
 
     /// The key's bucket, created (full) or reset by the idle TTL as needed,
-    /// moved to the LRU front. Null only when tracking a new key failed on
+    /// marked used for the eviction hand. Null only when tracking a new key failed on
     /// allocation. Caller holds the lock.
     fn bucketLocked(l: *Limiter, raw_key: []const u8, now_ns: u64) ?*TokenBucket {
-        const cfg = l.config();
-        const ttl_ns = l.options.ttl_ms *| std.time.ns_per_ms;
-        // Cap the stored/looked-up key length (F3 hardening — see
-        // `Options.max_key_len`) before it ever reaches the map.
-        const key = raw_key[0..@min(raw_key.len, l.options.max_key_len)];
+        const key = l.storedKey(raw_key);
+        return l.bucketLockedHashed(key, KeyContext.hash(.{}, key), now_ns);
+    }
 
-        if (l.map.get(key)) |e| {
+    /// Cap the stored/looked-up key length (F3 hardening — see
+    /// `Options.max_key_len`) before it ever reaches the map. `max_key_len`
+    /// never changes, so this needs no lock.
+    fn storedKey(l: *const Limiter, raw_key: []const u8) []const u8 {
+        return raw_key[0..@min(raw_key.len, l.options.max_key_len)];
+    }
+
+    /// `bucketLocked` for a key already capped by `storedKey`, with its
+    /// `KeyContext` hash `h`.
+    fn bucketLockedHashed(l: *Limiter, key: []const u8, h: u64, now_ns: u64) ?*TokenBucket {
+        const cfg = l.config();
+        // A key may expire only once its bucket would be full anyway: a TTL
+        // shorter than the refill time (5/hour with a 10 min TTL) would hand
+        // an idle key a fresh burst early -- over-admission (review
+        // 2026-10-24). So the effective TTL is at least `refillNs`.
+        const ttl_ns = l.idle_ns;
+        if (l.map.getKeyAdapted(key, HashedKey{ .h = h })) |e| {
             // Idle-expired keys start over with a full bucket (the bucket
-            // would have refilled to full long ago anyway; this also resets
+            // has refilled to full by then -- see `ttl_ns`; this also resets
             // `updated_ns` so the entry stops looking expired). A pending
             // reservation keeps a key busy until its time to act.
             if (ttl_ns != 0 and now_ns -| e.bucket.idleSince() > ttl_ns)
                 e.bucket = .full(cfg, now_ns);
-            l.lru.remove(&e.node);
-            l.lru.prepend(&e.node);
+            // Second chance instead of an LRU relink: a hit writes one flag
+            // in the entry it already updates, not three other entries'
+            // links (exact LRU cost ~20 % of a keyed decision, 2026-10-24).
+            e.referenced = true;
             return &e.bucket;
         }
 
-        // New key. First sweep idle-expired keys off the LRU tail (releases
-        // idle memory without a timer thread), then enforce the cap.
+        // New key. First sweep idle-expired keys off the tail (releases idle
+        // memory without a timer thread): an expired tail goes, a live one
+        // used since the hand last passed it is rotated to the front with
+        // its flag cleared, a live unused one stops the sweep. At most one
+        // pass over the table. Then enforce the cap.
         if (ttl_ns != 0) {
-            while (l.lru.last) |tail| {
-                // `Entry.bucket.updated_ns` (u64) gives `Entry` a stricter
-                // alignment than `std.DoublyLinkedList.Node` alone requires
-                // on a 32-bit target; `@fieldParentPtr` can't prove the
-                // recovered `*Entry` meets it from `tail`'s declared type.
-                // `@alignCast` is safe (not a truncation risk) because every
-                // `Entry` is allocated via `gpa.create(Entry)`, which always
-                // returns `Entry`-aligned storage with `node` at offset 0 —
-                // the same idiom used throughout http/ipcbus/zipstream/
-                // aaa-gate for identical intrusive lists.
-                const e: *Entry = @alignCast(@fieldParentPtr("node", tail));
-                if (now_ns -| e.bucket.idleSince() <= ttl_ns) break;
-                l.removeEntry(e);
+            var budget = l.map.count();
+            while (budget > 0) : (budget -= 1) {
+                const e = entryOf(l.lru.last orelse break);
+                if (now_ns -| e.bucket.idleSince() > ttl_ns) {
+                    l.removeEntry(e);
+                } else if (e.referenced) {
+                    l.secondChance(e);
+                } else break;
             }
         }
-        if (l.map.count() >= l.options.max_keys)
-            l.removeEntry(@alignCast(@fieldParentPtr("node", l.lru.last.?)));
+        if (l.map.count() >= l.options.max_keys) l.removeEntry(l.victimLocked());
 
         const e = l.insert(key, .full(cfg, now_ns)) catch return null; // OOM → fail open (documented)
         return &e.bucket;
@@ -630,22 +773,62 @@ pub const Limiter = struct {
         return l.map.count();
     }
 
+    /// One allocation per key: the `Entry`, its key bytes right behind it,
+    /// so a lookup's key compare and the bucket it then updates share a
+    /// cache line or two instead of three separate places.
     fn insert(l: *Limiter, key: []const u8, bucket: TokenBucket) Allocator.Error!*Entry {
-        const e = try l.gpa.create(Entry);
-        errdefer l.gpa.destroy(e);
-        e.* = .{ .key = try l.gpa.dupe(u8, key), .bucket = bucket };
-        errdefer l.gpa.free(e.key);
-        try l.map.put(l.gpa, e.key, e);
+        const bytes = try l.gpa.alignedAlloc(u8, .of(Entry), @sizeOf(Entry) + key.len);
+        errdefer l.gpa.free(bytes);
+        const e: *Entry = @ptrCast(bytes.ptr);
+        const key_copy = bytes[@sizeOf(Entry)..];
+        @memcpy(key_copy, key);
+        e.* = .{ .key = key_copy, .bucket = bucket };
+        try l.map.put(l.gpa, e, {});
         l.lru.prepend(&e.node);
         return e;
     }
 
+    /// The entry owning a list node. `Entry.bucket.updated_ns` (u64) gives
+    /// `Entry` a stricter alignment than `std.DoublyLinkedList.Node` alone
+    /// requires on a 32-bit target; `@fieldParentPtr` can't prove the
+    /// recovered `*Entry` meets it from the node's declared type.
+    /// `@alignCast` is safe because every `Entry` is allocated
+    /// `Entry`-aligned (`insert`) with `node` at offset 0 — the same idiom
+    /// used throughout http/ipcbus/zipstream/aaa-gate for intrusive lists.
+    fn entryOf(node: *std.DoublyLinkedList.Node) *Entry {
+        return @alignCast(@fieldParentPtr("node", node));
+    }
+
+    /// Clear the entry's flag and move it to the front: the hand passes it.
+    fn secondChance(l: *Limiter, e: *Entry) void {
+        e.referenced = false;
+        l.lru.remove(&e.node);
+        l.lru.prepend(&e.node);
+    }
+
+    /// The entry to evict at the cap (CLOCK / second chance): the tail
+    /// unless it was used since the hand last passed it, in which case it
+    /// is rotated to the front and the next one is looked at. Ends within
+    /// one pass: every rotation clears a flag. Caller holds the lock; the
+    /// table is not empty.
+    fn victimLocked(l: *Limiter) *Entry {
+        while (true) {
+            const e = entryOf(l.lru.last.?);
+            if (!e.referenced) return e;
+            l.secondChance(e);
+        }
+    }
+
+    fn freeEntry(l: *Limiter, e: *Entry) void {
+        const bytes: [*]align(@alignOf(Entry)) u8 = @ptrCast(e);
+        l.gpa.free(bytes[0 .. @sizeOf(Entry) + e.key.len]);
+    }
+
     fn removeEntry(l: *Limiter, e: *Entry) void {
-        const removed = l.map.remove(e.key);
+        const removed = l.map.remove(e);
         std.debug.assert(removed);
         l.lru.remove(&e.node);
-        l.gpa.free(e.key);
-        l.gpa.destroy(e);
+        l.freeEntry(e);
     }
 
     // ── the middleware ──────────────────────────────────────────────────
@@ -702,16 +885,32 @@ fn ceilDivMsToS(ms: u64) u64 {
 
 fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) []const u8 {
     switch (l.options.key) {
-        .forwarded_ip => return clientKey(ctx.req, peer_buf),
+        .forwarded_ip => return ipKey(clientKey(ctx.req, peer_buf), l.options.v6_key_bits, peer_buf),
         .header => |name| {
             if (ctx.req.header(name)) |v| {
                 const trimmed = std.mem.trim(u8, v, " \t");
                 if (trimmed.len != 0) return trimmed;
             }
-            return clientKey(ctx.req, peer_buf);
+            return ipKey(clientKey(ctx.req, peer_buf), l.options.v6_key_bits, peer_buf);
         },
         .custom => |k| return k.keyFor(k.ctx, ctx, peer_buf),
     }
+}
+
+/// The bucket key for a client address: parsed, IPv4-mapped unified with
+/// IPv4, and an IPv6 address cut to its first `v6_bits` (so one host's
+/// /64 is one bucket, not 2^64 -- review 2026-10-24), rendered canonically
+/// into `buf` (`::1` and `0:0:0:0:0:0:0:1` are one key). Text that is not
+/// an address (a forwarded value naming something else) stays the key
+/// as it is. `text` may point into `buf`: it is parsed before `buf` is
+/// written.
+fn ipKey(text: []const u8, v6_bits: u8, buf: *[peer_key_len_max]u8) []const u8 {
+    const ip = (netaddr.parseIp(text) orelse return text).unmap();
+    const keyed: netaddr.Ip = switch (ip) {
+        .v4 => ip,
+        .v6 => (netaddr.Prefix{ .addr = ip, .bits = v6_bits }).masked().addr,
+    };
+    return netaddr.formatIp(keyed, buf);
 }
 
 /// The client key per the module's trust policy (see the module doc):
@@ -760,6 +959,7 @@ test {
     // "18/18 tests passed" while all 8 connection-limiter tests silently
     // did not exist — a whole file's worth of green that was never run.
     _ = @import("conn.zig");
+    _ = @import("model_fuzz_test.zig");
 }
 
 test "TokenBucket: burst allowed, then throttled with exact retry_after" {
@@ -1058,8 +1258,8 @@ test "Limiter: max_key_len truncates over-long keys instead of storing them whol
 
 test "Limiter: TTL resets idle keys and sweeps their memory" {
     var tc: TestClock = .{};
-    // Refill is negligible (0.01/s) so a passing `allow` after the idle gap
-    // can only come from the TTL reset, not from refill.
+    // 0.01/s, burst 2: an empty bucket needs 200 s to refill, far past the
+    // 1 s TTL -- the effective TTL is the refill time.
     var l = Limiter.init(testing.allocator, .{
         .rate_per_s = 0.01,
         .burst = 2,
@@ -1074,16 +1274,44 @@ test "Limiter: TTL resets idle keys and sweeps their memory" {
     try testing.expect(!l.allow("a").allowed); // drained
     _ = l.allow("b");
 
-    tc.advanceMs(1500); // both idle past the 1s TTL
+    tc.advanceMs(1500); // past the configured TTL, not the refill time
+    // Negative control 2026-10-24: with the bare `ttl_ms` the drained key
+    // reset to a full bucket here (a fresh burst every TTL, review M1).
+    try testing.expect(!l.allow("a").allowed);
+    try testing.expect(l.allow("c").allowed);
+    try testing.expectEqual(@as(usize, 3), l.keyCount()); // b not swept yet
 
-    // Hit on an expired key: state resets to a full bucket.
+    tc.advanceMs(201 * std.time.ms_per_s); // idle past the refill time
+    // Hit on an expired key: a full bucket, which refill alone gives too.
     const d = l.allow("a");
     try testing.expect(d.allowed);
     try testing.expectEqual(@as(u32, 1), d.remaining);
 
-    // Insert of a new key sweeps the expired b off the LRU tail.
-    try testing.expect(l.allow("c").allowed);
-    try testing.expectEqual(@as(usize, 2), l.keyCount()); // a + c; b swept
+    // Insert of a new key sweeps the expired b and c off the LRU tail.
+    try testing.expect(l.allow("d").allowed);
+    try testing.expectEqual(@as(usize, 2), l.keyCount()); // a + d
+}
+
+test "Limiter: a slow limit is not reset by the idle TTL (5/hour, 10 min TTL)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{
+        .rate_per_s = 5.0 / 3600.0,
+        .burst = 5,
+        .clock = tc.clock(),
+        .key = .forwarded_ip,
+    });
+    defer l.deinit();
+    for (0..5) |_| try testing.expect(l.allow("u").allowed);
+    tc.advanceMs(10 * std.time.ms_per_min + 1); // the default TTL, plus 1 ms
+    // 10 min refills 0.83 tokens: refused, whether the key is hit ...
+    try testing.expect(!l.allow("u").allowed);
+    // ... or a new key's sweep reaches it first.
+    tc.advanceMs(10 * std.time.ms_per_min + 1);
+    try testing.expect(l.allow("other").allowed);
+    try testing.expectEqual(@as(usize, 2), l.keyCount());
+    const d = l.allow("u");
+    try testing.expect(d.allowed); // 1.67 tokens by now: one passes
+    try testing.expectEqual(@as(u32, 0), d.remaining);
 }
 
 test "Limiter: fail-open when the allocator is exhausted" {
@@ -1278,15 +1506,17 @@ test "Limiter: a pending reservation keeps its key from idle reset" {
     var clk: TestClock = .{};
     var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.001, .burst = 1, .ttl_ms = 1000, .clock = clk.clock(), .key = .forwarded_ip });
     defer l.deinit();
-    // Take the token, then reserve one more: due in 1000 s (> ttl).
+    // Take the token, then reserve two more one at a time: the last is due
+    // in 2000 s, past both the TTL and the 1000 s refill time.
     try testing.expect(l.allow("k").allowed);
     {
         lockSpin(&l.lock);
         defer l.lock.unlock();
         const b = l.bucketLocked("k", clk.ns).?;
         try testing.expect(b.reserveNAt(l.config(), clk.ns, 1, std.math.maxInt(u64)).ok);
+        try testing.expect(b.reserveNAt(l.config(), clk.ns, 1, std.math.maxInt(u64)).ok);
     }
-    clk.advanceMs(5000); // past the TTL, long before the reservation is due
+    clk.advanceMs(1500 * std.time.ms_per_s); // past TTL and refill time, before the reservation is due
     // Negative control 2026-10-11: with `updated_ns` instead of
     // `idleSince()` the key reset to a full bucket here and admitted.
     try testing.expect(!l.allow("k").allowed);
@@ -1491,6 +1721,41 @@ test "middleware: socket peer address is the fallback key (port-insensitive, v4-
     try testing.expectEqual(@as(usize, 3), l.keyCount()); // 10.0.0.1, 10.0.0.2, 9.9.9.9
 }
 
+test "middleware: an IPv6 client is keyed by its /64, spellings unified (review 2026-10-24)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &buf), "200");
+    // Another address in the same /64 (rotation) is the same bucket ...
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:2:ffff:ffff:ffff:ffff\r\n"), &buf), "429");
+    // ... so is the expanded, upper-case spelling of the first one ...
+    try expectStatus(runWire(&rl.r, wire("X-Real-IP: 2001:0DB8:0001:0002:0:0:0:1\r\n"), &buf), "429");
+    // ... and the next /64 is not.
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2001:db8:1:3::1\r\n"), &buf), "200");
+    // IPv4 stays the whole address; a v4-mapped spelling is the same client.
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 192.0.2.1\r\n"), &buf), "200");
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: ::ffff:192.0.2.1\r\n"), &buf), "429");
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 192.0.2.2\r\n"), &buf), "200");
+    // Text that is not an address is its own key, unchanged.
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: unknown\r\n"), &buf), "200");
+    try testing.expectEqual(@as(usize, 5), l.keyCount());
+
+    // v6_key_bits = 128 keys every address apart.
+    var l128 = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip, .v6_key_bits = 128 });
+    defer l128.deinit();
+    var rl128 = try RouterUnderLimit.init(&l128);
+    defer rl128.deinit();
+    rl128.start();
+    try expectStatus(runWire(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &buf), "200");
+    try expectStatus(runWire(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::2\r\n"), &buf), "200");
+    try expectStatus(runWire(&rl128.r, wire("X-Forwarded-For: 2001:db8:1:2::1\r\n"), &buf), "429");
+}
+
 test "middleware: API-key header as the key, with forwarded-IP fallback" {
     var tc: TestClock = .{};
     var l = Limiter.init(testing.allocator, .{
@@ -1536,6 +1801,143 @@ test "middleware: custom key function" {
     // Keyed by path: two clients on /t share one bucket.
     try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 1.1.1.1\r\n"), &buf), "200");
     try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 2.2.2.2\r\n"), &buf), "429");
+}
+
+test "optionsError: each refused Limiter option, and a valid one" {
+    const ok: Options = .{ .rate_per_s = 1, .burst = 1, .key = .forwarded_ip };
+    try testing.expect(optionsError(ok) == null);
+    var o = ok;
+    o.rate_per_s = 0;
+    try testing.expectEqualStrings("ratelimit: rate_per_s must be > 0 and finite", optionsError(o).?);
+    o = ok;
+    o.rate_per_s = std.math.nan(f64);
+    try testing.expect(optionsError(o) != null);
+    o = ok;
+    o.burst = 0;
+    try testing.expectEqualStrings("ratelimit: burst must be >= 1", optionsError(o).?);
+    o = ok;
+    o.max_keys = 0;
+    try testing.expectEqualStrings("ratelimit: max_keys must be >= 1", optionsError(o).?);
+    o = ok;
+    o.max_key_len = 0;
+    try testing.expectEqualStrings("ratelimit: max_key_len must be >= 1", optionsError(o).?);
+    o = ok;
+    o.v6_key_bits = 129;
+    try testing.expectEqualStrings("ratelimit: v6_key_bits must be <= 128", optionsError(o).?);
+    o.v6_key_bits = 128;
+    try testing.expect(optionsError(o) == null);
+    // setConfigAt's checks: null keeps a value and is never refused.
+    try testing.expect(configError(null, null) == null);
+    try testing.expect(configError(2.5, 3) == null);
+    try testing.expect(configError(-1, null) != null);
+    try testing.expect(configError(null, 0) != null);
+}
+
+test "validRate: only positive finite rates (mutation survivor 2026-10-24)" {
+    try testing.expect(validRate(0.001));
+    try testing.expect(validRate(1e300));
+    try testing.expect(!validRate(0));
+    try testing.expect(!validRate(-1));
+    try testing.expect(!validRate(std.math.nan(f64)));
+    try testing.expect(!validRate(std.math.inf(f64)));
+    try testing.expect(!validRate(-std.math.inf(f64)));
+}
+
+test "middleware: XFF with three elements keys on the rightmost, not the second (mutation survivor)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 1.1.1.1, 2.2.2.2, 3.3.3.3\r\n"), &buf), "200");
+    // Same rightmost, different prefix: same bucket.
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 9.9.9.9, 8.8.8.8, 3.3.3.3\r\n"), &buf), "429");
+    // A client whose second element equals the first request's second element
+    // but whose rightmost differs is a different client.
+    try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 1.1.1.1, 2.2.2.2, 4.4.4.4\r\n"), &buf), "200");
+    try testing.expectEqual(@as(usize, 2), l.keyCount());
+}
+
+test "middleware: 429 Retry-After and RateLimit-Reset round UP to whole seconds (mutation survivor)" {
+    var tc: TestClock = .{};
+    // 0.4/s, burst 3: an empty bucket frees a token in 2.5 s and is full in 7.5 s.
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.4, .burst = 3, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    for (0..3) |_| try expectStatus(runWire(&rl.r, wire(""), &buf), "200");
+    const got = runWire(&rl.r, wire(""), &buf);
+    try expectStatus(got, "429");
+    try expectHeaderLine(got, "Retry-After: 3");
+    try expectHeaderLine(got, "RateLimit-Limit: 3");
+    try expectHeaderLine(got, "RateLimit-Reset: 8");
+}
+
+fn keyByClientKey(_: ?*anyopaque, ctx: *router.Ctx, buf: *[peer_key_len_max]u8) []const u8 {
+    return clientKey(ctx.req, buf);
+}
+
+test "clientKey: a v4-mapped socket peer is the plain IPv4 text, before any ipKey step (mutation survivor)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{
+        .rate_per_s = 0.01,
+        .burst = 1,
+        .clock = tc.clock(),
+        .key = .{ .custom = .{ .keyFor = keyByClientKey } },
+    });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    const ip = std.Io.net.IpAddress;
+    const plain: ip = ip.parseIp4("10.0.0.1", 1) catch unreachable;
+    const mapped: ip = ip.parseIp6("::ffff:10.0.0.1", 2) catch unreachable;
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, plain), "200");
+    try expectStatus(runWirePeer(&rl.r, wire(""), &buf, mapped), "429");
+    try testing.expectEqual(@as(usize, 1), l.keyCount());
+}
+
+test "middleware: API-key header value is trimmed of surrounding blanks (mutation survivor)" {
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 0.01, .burst = 1, .clock = tc.clock(), .key = .{ .header = "X-Api-Key" } });
+    defer l.deinit();
+    var rl = try RouterUnderLimit.init(&l);
+    defer rl.deinit();
+    rl.start();
+    var buf: [1024]u8 = undefined;
+
+    try expectStatus(runWire(&rl.r, wire("X-Api-Key: alpha\r\n"), &buf), "200");
+    try expectStatus(runWire(&rl.r, wire("X-Api-Key: \t alpha \t \r\n"), &buf), "429");
+    try testing.expectEqual(@as(usize, 1), l.keyCount());
+}
+
+test "Limiter: keys sharing their first 8 bytes stay distinct (two-word key compare, mutation survivor)" {
+    // 12-byte keys take the 8..16 byte fast path of `keyEql`, whose two word
+    // loads overlap: only the second one tells these keys apart. With ~3000
+    // of them, probe-chain fingerprint collisions are certain; a compare that
+    // looked at the first word only would merge colliding keys.
+    var tc: TestClock = .{};
+    var l = Limiter.init(testing.allocator, .{ .rate_per_s = 1, .burst = 1, .max_keys = 4000, .ttl_ms = 0, .clock = tc.clock(), .key = .forwarded_ip });
+    defer l.deinit();
+    var buf: [12]u8 = undefined;
+    for (0..3000) |i| {
+        const k = std.mem.print(&buf, "abcdefgh{d:0>4}", .{i}) catch unreachable;
+        try testing.expect(l.allow(k).allowed);
+    }
+    try testing.expectEqual(@as(usize, 3000), l.keyCount());
+    // Every key is now empty: a second visit is denied, not a fresh bucket.
+    for (0..3000) |i| {
+        const k = std.mem.print(&buf, "abcdefgh{d:0>4}", .{i}) catch unreachable;
+        try testing.expect(!l.allow(k).allowed);
+    }
 }
 
 // ── tests: in-process integration (router + http.Server + http.Client) ──────

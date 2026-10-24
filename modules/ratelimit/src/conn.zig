@@ -135,6 +135,21 @@ pub const Options = struct {
 /// handful of masked compares) plus, for unlisted peers, one hash lookup.
 /// Deliberately not an LPM trie: this runs once per *connection*, next to a
 /// TCP handshake, and configuration is a hand-written user list.
+/// Why `ConnectionLimiter.init` refuses `options` (it panics with this), or
+/// null.
+pub fn optionsError(options: Options) ?[]const u8 {
+    if (!rl.validRate(options.rate_per_s)) return "ratelimit: rate_per_s must be > 0 and finite";
+    if (options.burst < 1) return "ratelimit: burst must be >= 1";
+    if (options.unlisted_v4_bits > 32) return "ratelimit: unlisted_v4_bits must be <= 32";
+    if (options.unlisted_v6_bits > 128) return "ratelimit: unlisted_v6_bits must be <= 128";
+    for (options.users) |u| {
+        if (u.prefixes.len < 1) return "ratelimit: a user needs at least one prefix";
+        if (u.rate_per_s) |r| if (!rl.validRate(r)) return "ratelimit: a user's rate_per_s must be > 0 and finite";
+        if (u.burst) |b| if (b < 1) return "ratelimit: a user's burst must be >= 1";
+    }
+    return null;
+}
+
 pub const ConnectionLimiter = struct {
     gpa: Allocator,
     options: Options,
@@ -151,15 +166,8 @@ pub const ConnectionLimiter = struct {
     const key_len_max = 17;
 
     pub fn init(gpa: Allocator, options: Options) Allocator.Error!ConnectionLimiter {
-        std.debug.assert(options.rate_per_s > 0 and std.math.isFinite(options.rate_per_s));
-        std.debug.assert(options.burst >= 1);
-        std.debug.assert(options.unlisted_v4_bits <= 32);
-        std.debug.assert(options.unlisted_v6_bits <= 128);
-        for (options.users) |u| {
-            std.debug.assert(u.prefixes.len >= 1);
-            std.debug.assert(u.rate_per_s == null or (u.rate_per_s.? > 0 and std.math.isFinite(u.rate_per_s.?)));
-            std.debug.assert(u.burst == null or u.burst.? >= 1);
-        }
+        // Checked in every build mode, as `Limiter.init` (review 2026-10-24).
+        if (optionsError(options)) |msg| @panic(msg);
 
         const buckets = try gpa.alloc(TokenBucket, options.users.len);
         const now = options.clock.now();
@@ -316,6 +324,33 @@ fn pfx(text: []const u8) netaddr.Prefix {
 
 fn addr(text: []const u8) netaddr.Ip {
     return netaddr.parseIp(text).?;
+}
+
+test "optionsError: each refused ConnectionLimiter option, and a valid one" {
+    const p = [_]netaddr.Prefix{netaddr.parsePrefix("10.0.0.0/8").?};
+    const ok: Options = .{ .users = &.{.{ .name = "u", .prefixes = &p, .rate_per_s = 2, .burst = 3 }} };
+    try std.testing.expect(optionsError(ok) == null);
+    try std.testing.expect(optionsError(.{}) == null); // the defaults
+    var o = ok;
+    o.rate_per_s = std.math.inf(f64);
+    try std.testing.expectEqualStrings("ratelimit: rate_per_s must be > 0 and finite", optionsError(o).?);
+    o = ok;
+    o.burst = 0;
+    try std.testing.expectEqualStrings("ratelimit: burst must be >= 1", optionsError(o).?);
+    o = ok;
+    o.unlisted_v4_bits = 33;
+    try std.testing.expectEqualStrings("ratelimit: unlisted_v4_bits must be <= 32", optionsError(o).?);
+    o.unlisted_v4_bits = 32;
+    try std.testing.expect(optionsError(o) == null);
+    o.unlisted_v6_bits = 129;
+    try std.testing.expectEqualStrings("ratelimit: unlisted_v6_bits must be <= 128", optionsError(o).?);
+    o = ok;
+    o.users = &.{.{ .name = "none", .prefixes = &.{} }};
+    try std.testing.expectEqualStrings("ratelimit: a user needs at least one prefix", optionsError(o).?);
+    o.users = &.{.{ .name = "r", .prefixes = &p, .rate_per_s = 0 }};
+    try std.testing.expectEqualStrings("ratelimit: a user's rate_per_s must be > 0 and finite", optionsError(o).?);
+    o.users = &.{.{ .name = "b", .prefixes = &p, .burst = 0 }};
+    try std.testing.expectEqualStrings("ratelimit: a user's burst must be >= 1", optionsError(o).?);
 }
 
 test "ConnectionLimiter: two addresses of one user share one bucket" {

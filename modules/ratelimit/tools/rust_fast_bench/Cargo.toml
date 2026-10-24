@@ -1,0 +1,22 @@
+[package]
+name = "ratelimit_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-ratelimit`
+# (modules/ratelimit/tools/bench.zig): governor's GCRA limiter, pinned exactly,
+# without default features, with `no_std` (hashbrown + foldhash) -- a direct
+# limiter and the keyed HashMap store
+# behind its spinlock (`spinning_top`), the same shape as this module's
+# Limiter; the clock is a plain cell behind governor's `Clock` trait, injected
+# like ours (see src/main.rs).
+[dependencies]
+governor = { version = "=0.10.4", default-features = false, features = ["no_std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

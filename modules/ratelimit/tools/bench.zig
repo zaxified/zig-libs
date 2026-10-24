@@ -27,6 +27,16 @@
 //! best of five); per workload the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. Ratios are ours/Go by wall time; the verdict
 //! is the WORST ratio. Arguments filter workloads.
+//!
+//! "Fastest in the field": `tools/rust_fast_bench` (governor 0.10.4, GCRA,
+//! feature `no_std`: a direct limiter, and the keyed HashMap store behind a
+//! spinlock -- governor keeps every key forever: no cap, no LRU-like
+//! eviction, no idle expiry) is timed the same way over the same sequence,
+//! with the clock injected through its `Clock` trait. GCRA admits what a
+//! token bucket of the same rate and burst admits, so its count must agree
+//! too. `BENCH_FAST=0` skips it (needs cargo and the pinned crates in
+//! ~/.cargo/registry). The card's fastest figure is ours / the faster of
+//! {x/time/rate, governor} per row, worst over the rows.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -41,6 +51,11 @@ const ref_card = "golang.org/x/time v0.15.0 rate";
 const net_base: ?[]const u8 = null;
 const info_only = [_][]const u8{};
 const names = [_][]const u8{ "bucket", "keyed" };
+
+const fast_rs_manifest = "modules/ratelimit/tools/rust_fast_bench/Cargo.toml";
+const fast_rs_exe = "modules/ratelimit/tools/rust_fast_bench/target/release/ratelimit_fast_bench";
+const fast_name = "governor";
+const fast_card = "governor 0.10.4";
 const N = 4096;
 const n_keys = 1024;
 const bucket_cfg: ratelimit.TokenBucket.Config = .{ .rate_per_s = 20000, .burst = 50 };
@@ -116,11 +131,17 @@ pub fn main(init: std.process.Init) !u8 {
     var d: Data = try setup(arena, io, dir);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_fast) try rustBuild(arena, io);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<22} {s:>11} {s:>11} {s:>8} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "gross", "net", "spr us", "spr ref" });
+    if (use_fast) try w.print("{s:<22} {s:>11} {s:>9}  vs the faster (who)\n", .{ "", fast_name ++ " ns", "ours/best" });
     try w.flush();
+    var worst_fast: f64 = 0;
+    var worst_fast_row: []const u8 = "";
+    var worst_fast_who: []const u8 = "";
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
@@ -135,8 +156,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var fast: bench.Side = .{};
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (use_fast) fast.add(try bench.foreign(arena, io, bench_name, fast_rs_exe, abs, name, null));
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const gross = ours.best_ns / go.best_ns;
@@ -163,6 +186,23 @@ pub fn main(init: std.process.Init) !u8 {
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
         try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        if (use_fast) {
+            max_spread = @max(max_spread, fast.spread(false));
+            try w.print("{s:<22} {d:>11.0}", .{ "", fast.best_ns });
+            if (fast.count != ours.count) {
+                mismatch = true;
+                try w.print(" ({s}: {d} != ours {d})", .{ fast_name, fast.count, ours.count });
+            }
+            const fast_wins = fast.best_ns < go.best_ns;
+            const ratio_fast = ours.best_ns / @min(fast.best_ns, go.best_ns);
+            const who: []const u8 = if (fast_wins) fast_card else ref_card;
+            if (!info and ratio_fast > worst_fast) {
+                worst_fast = ratio_fast;
+                worst_fast_row = name;
+                worst_fast_who = who;
+            }
+            try w.print(" {d:>9.3}  ({s})\n", .{ ratio_fast, who });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -172,8 +212,28 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_fast) try w.print("worst vs fastest = {d:.2} (row {s}, {s})\n", .{ worst_fast, worst_fast_row, worst_fast_who });
+    if (filters.len == 0) {
+        if (use_fast)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_fast_who })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
+}
+
+/// `cargo build --release --offline` of tools/rust_fast_bench.
+fn rustBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips this side\n", .{ bench_name, e });
+        return error.CargoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CargoBuildFailed;
+    }
 }

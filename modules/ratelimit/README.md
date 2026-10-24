@@ -9,8 +9,8 @@ zero globals.
   balance, lazy refill, burst cap, denials consume nothing) + nginx
   `limit_req`'s keyed-store shape.
 - **Platform:** any. **Role:** util. **Concurrency:** threadsafe — the
-  `Limiter` is internally synchronized (a spinlock around a hash lookup +
-  O(1) LRU relink; Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only, `Io.Mutex.lock` needs an `Io`) — this is the
+  `Limiter` is internally synchronized (a spinlock around a hash lookup and
+  the bucket update; Zig 0.17 std has no io-less blocking mutex (`std.atomic.Mutex` is try-lock only, `Io.Mutex.lock` needs an `Io`) — this is the
   std `SmpAllocator` pattern). The bare `TokenBucket` is single-owner.
 - **Deps:** `router`, `http`, `netaddr` (peer-IP key formatting).
 
@@ -23,7 +23,7 @@ Authors) and nginx `limit_req` (BSD-2-Clause). DATA: `src/xrate_vectors.zig` and
 | Layer | What | I/O, clock, locking |
 |---|---|---|
 | `TokenBucket` | the bare algorithm | none — caller passes `now_ns` |
-| `Limiter` | per-key buckets, bounded LRU store | injected `Clock`, internal lock |
+| `Limiter` | per-key buckets, bounded store (second-chance eviction) | injected `Clock`, internal lock |
 | `Limiter.middleware()` | `router.Middleware`, 429 + `Retry-After` | key from request headers / socket peer |
 | `ConnectionLimiter` | new **connections** per **user**, for `on_connect` | injected `Clock`, internal lock |
 
@@ -40,7 +40,7 @@ const router = @import("router");
 var limiter = ratelimit.Limiter.init(gpa, .{
     .rate_per_s = 5, // sustained tokens/second per key
     .burst = 10, // bucket capacity per key
-    .max_keys = 4096, // memory bound: LRU-evicted beyond
+    .max_keys = 4096, // memory bound: second-chance eviction beyond
     .ttl_ms = 10 * std.time.ms_per_min, // idle keys dropped/reset
     // No default (deliberately — see "Client-key trust policy" in root.zig):
     // pick `.forwarded_ip` only behind a trusted reverse proxy that always
@@ -78,9 +78,14 @@ sequences (`src/xrate_ops_vectors.zig`). Two deliberate differences: a second
 `cancelAt` of one reservation is a no-op (x/time/rate restores the tokens
 again), and `waitN` cancelled through `io` keeps the tokens taken.
 
-The keyed store is bounded: at most `max_keys` entries, least-recently-used
-evicted first (an evicted key seen again starts over with a full bucket),
-plus an idle TTL that releases memory early and resets long-idle keys.
+The keyed store is bounded: at most `max_keys` entries, evicted by second
+chance (CLOCK, the usual LRU approximation: a hit only marks the key, the
+eviction hand skips — and unmarks — a key used since its last pass), so a
+flood of never-reused keys goes first; an evicted key seen again starts over
+with a full bucket. An idle TTL releases memory early; it is never shorter
+than the time an empty bucket needs to refill (`burst / rate_per_s`), so an
+expired key was full anyway and expiry admits nothing extra. IPv6 clients
+are keyed by their /64 (`v6_key_bits`), addresses in canonical form.
 `allow` is infallible — on allocator exhaustion a *new* key is admitted
 untracked (fail-open: the limiter must not turn OOM into an outage).
 
@@ -185,7 +190,7 @@ var server = http.Server.init(io, gpa, .{
   (`unlisted_v6_bits`), the standard single-host allocation, so rotating
   inside one — the free case — is a single bucket. Unlisted v4 keys per
   address (`unlisted_v4_bits = 32`).
-- **The table is bounded** at `max_unlisted_keys` (LRU + idle TTL). **What
+- **The table is bounded** at `max_unlisted_keys` (second-chance eviction + idle TTL). **What
   an attacker gets, plainly:** with a /48 they still hold 2^16 distinct /64s
   and can churn the unlisted table, evicting *other unlisted* keys — an
   evicted key restarts full, so a flood can hand other strangers up to
@@ -220,7 +225,7 @@ unlisted addresses limited and isolated from one another, rotation inside a
 /64 collapsing to one bucket, and a 4096-/64 flood leaving the table bounded
 and a listed user's drained bucket untouched — all on an injected clock, no
 sleeps. Plus offline deterministic tests (bucket math, refill
-and `retry_after` exactness, per-key isolation, LRU eviction + TTL sweep, an
+and `retry_after` exactness, per-key isolation, second-chance eviction + TTL sweep, an
 8-thread over-admission race check, fail-open OOM), middleware goldens over
 the socket-free `http.Server.serveStream` (429 wire bytes, XFF/X-Real-IP/
 API-key/custom key extraction, spoof resistance, peer-address fallback —
