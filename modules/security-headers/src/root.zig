@@ -76,15 +76,17 @@
 //! Placement: register it **first** (outermost, before other middleware and
 //! all routes — chi's rule) so short-circuit responses from inner middleware
 //! (ratelimit 429, throttle 503, auth 401) and the router's 404/405
-//! fallbacks carry the headers too. Known limitation: when a handler
-//! *errors*, `http.Server` resets the response to build its automatic 500,
-//! which drops all previously set headers — the plain 500 carries no
-//! security headers (same for the server's own 431/414/413 replies, which
-//! bypass the router entirely).
+//! fallbacks carry the headers too. When a handler *errors*, `http.Server`
+//! resets the response to build its automatic 500, dropping what the
+//! middleware set; the server's own 400/431/414/413 replies bypass the
+//! router entirely. Those replies carry the headers only through
+//! `http.Server.Options.error_headers`, fed from `staticHeaders` — so only
+//! for a comptime `Options` (a runtime-built `SecurityHeaders` has no static
+//! list to hand over).
 //!
 //! Header values are emitted verbatim onto the wire: caller-supplied
-//! strings must outlive the middleware and must not contain CR/LF (checked
-//! with a Debug assert at `init`).
+//! strings must outlive the middleware and must not contain CR/LF/NUL
+//! (`init` returns `error.InvalidHeaderValue`, in every build mode).
 //!
 //! Header byte budget: `http.Server.ResponseWriter` copies every header's
 //! name and value into a fixed-size per-response buffer, so `apply` (and
@@ -314,7 +316,18 @@ pub const SecurityHeaders = struct {
         /// loudly at config time instead of silently at request time. The
         /// comptime sibling `applyStatic` already rejects the same input
         /// with a `@compileError`.
+        ///
+        /// Also returned (2026-10-24) for a name `http` treats as a framing
+        /// header — `Content-Length`, `Transfer-Encoding`, `Trailer`,
+        /// `Connection` (any case): `setHeader` would not emit them but act
+        /// on them (close every connection, declare a body length, fail every
+        /// request on a non-number), and `applyStatic` already refuses them.
         InvalidExtraHeaderName,
+        /// A header VALUE (a named knob or an `extra` value) holds CR, LF or
+        /// NUL, which `http` refuses at `setHeader` time on every request.
+        /// Checked in every build mode since 2026-10-24 (was a Debug-only
+        /// assert, so a ReleaseFast build failed each request instead).
+        InvalidHeaderValue,
         /// `hsts.preload` is set but `max_age_s` < `hsts_preload_min_age_s` or
         /// `include_subdomains` is off — hstspreload.org would reject the
         /// site and helmet throws. (`applyStatic` reports it at compile time.)
@@ -336,28 +349,24 @@ pub const SecurityHeaders = struct {
 
     /// Precompute the header set. `SecurityHeaders.init(.{})` = the secure
     /// defaults. Caller-supplied strings are borrowed (must outlive the
-    /// returned value) and must not contain CR/LF/NUL (Debug-asserted).
+    /// returned value) and must not contain CR/LF/NUL (`InvalidHeaderValue`).
     /// Fails with `InitError.HeaderBudgetExceeded` when this configuration's
     /// own headers cannot possibly fit `http`'s per-response header budget
     /// — see `InitError` for why that is checked here rather than left to
     /// surface as a request-time failure.
     pub fn init(options: Options) InitError!SecurityHeaders {
-        if (std.debug.runtime_safety) {
-            if (options.content_security_policy) |v| assertValueClean(v);
-            if (options.content_security_policy_report_only) |v| assertValueClean(v);
-            if (options.x_frame_options) |v| assertValueClean(v);
-            if (options.referrer_policy) |v| assertValueClean(v);
-            if (options.permissions_policy) |v| assertValueClean(v);
-            if (options.cross_origin_opener_policy) |v| assertValueClean(v);
-            if (options.cross_origin_resource_policy) |v| assertValueClean(v);
-            if (options.cross_origin_embedder_policy) |v| assertValueClean(v);
-            if (options.x_dns_prefetch_control) |v| assertValueClean(v);
-            if (options.x_permitted_cross_domain_policies) |v| assertValueClean(v);
-            if (options.server) |v| assertValueClean(v);
-            for (options.extra) |h| assertValueClean(h.value);
-        }
+        const named = [_]?[]const u8{
+            options.content_security_policy,      options.content_security_policy_report_only,
+            options.x_frame_options,              options.referrer_policy,
+            options.permissions_policy,           options.cross_origin_opener_policy,
+            options.cross_origin_resource_policy, options.cross_origin_embedder_policy,
+            options.x_dns_prefetch_control,       options.x_permitted_cross_domain_policies,
+            options.server,
+        };
+        for (named) |o| if (o) |v| if (!valueClean(v)) return error.InvalidHeaderValue;
         for (options.extra) |h| {
-            if (!validFieldName(h.name)) return error.InvalidExtraHeaderName;
+            if (!validFieldName(h.name) or isFramingHeader(h.name)) return error.InvalidExtraHeaderName;
+            if (!valueClean(h.value)) return error.InvalidHeaderValue;
         }
         if (options.hsts) |h| {
             if (!h.preloadValid()) return error.InvalidHstsPreload;
@@ -529,6 +538,10 @@ pub const CspNonceError = csp.Error || http.Server.ResponseWriter.SetHeaderError
 /// (`setHeader` copies it) -- a stack buffer is fine; nothing allocates.
 /// Replaces a policy of the same name set earlier (e.g. by `apply`).
 /// The caller keeps `nonce` for the HTML (`nonce.slice()`).
+/// Budget: `http` does not reclaim a replaced header's bytes, so replacing a
+/// configured `content_security_policy` spends the policy twice out of the
+/// per-response `header_copy_bytes` (4 KiB) — `init`'s check covers `apply`
+/// alone. With a large static policy, configure none and set it only here.
 pub fn applyCspWithNonce(
     res: *http.Server.ResponseWriter,
     spec: csp.Spec,
@@ -564,8 +577,18 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
 /// Header values go onto the wire verbatim — refuse response-splitting
 /// characters in configuration (Debug builds only).
-fn assertValueClean(v: []const u8) void {
-    for (v) |c| std.debug.assert(c != '\r' and c != '\n' and c != 0);
+fn valueClean(v: []const u8) bool {
+    for (v) |c| if (c == '\r' or c == '\n' or c == 0) return false;
+    return true;
+}
+
+/// The names `http.Server.ResponseWriter.setHeader` acts on instead of
+/// emitting (its `setHeaderStatic` refuses them at compile time).
+fn isFramingHeader(name: []const u8) bool {
+    for ([_][]const u8{ "content-length", "transfer-encoding", "trailer", "connection" }) |f| {
+        if (std.ascii.eqlIgnoreCase(name, f)) return true;
+    }
+    return false;
 }
 
 // ── tests (offline — through http.Server.serveStream, no socket) ────────────
@@ -1373,7 +1396,27 @@ test "external anchor: RFC 6797 6.2's own max-age=31536000 example matches our d
 
     var buf: [2048]u8 = undefined;
     const got = runWire(&r, wire("/t"), &buf);
-    try testing.expect(std.mem.find(u8, got, "Strict-Transport-Security: max-age=31536000") != null);
+    try testing.expect(std.mem.find(u8, got, "Strict-Transport-Security: max-age=31536000;") != null);
+}
+
+test "init: CR/LF/NUL in any value and framing names in extra are refused in every build mode" {
+    // Review 2026-10-24: values were checked by a Debug assert only, and
+    // `extra` took Connection/Content-Length, which http acts on instead of
+    // emitting (every connection closed / a declared body length).
+    // Every named value knob, one at a time (mutation 2026-10-24: two of
+    // them could lose their check unnoticed while the test poisoned three).
+    inline for (.{ "content_security_policy", "content_security_policy_report_only", "x_frame_options", "referrer_policy", "permissions_policy", "cross_origin_opener_policy", "cross_origin_resource_policy", "cross_origin_embedder_policy", "x_dns_prefetch_control", "x_permitted_cross_domain_policies", "server" }) |field| {
+        for ([_][]const u8{ "a\r\nX: y", "a\nb", "a\x00b" }) |bad| {
+            var o: Options = .{};
+            @field(o, field) = bad;
+            try testing.expectError(error.InvalidHeaderValue, SecurityHeaders.init(o));
+        }
+    }
+    try testing.expectError(error.InvalidHeaderValue, SecurityHeaders.init(.{ .extra = &.{.{ .name = "X-A", .value = "1\r" }} }));
+    for ([_][]const u8{ "Connection", "content-length", "Transfer-Encoding", "TRAILER" }) |n| {
+        try testing.expectError(error.InvalidExtraHeaderName, SecurityHeaders.init(.{ .extra = &.{.{ .name = n, .value = "close" }} }));
+    }
+    _ = try SecurityHeaders.init(.{ .extra = &.{.{ .name = "X-Connection-Id", .value = "ok" }} });
 }
 
 test "external anchor: OWASP Secure Headers Project's own example lines match our defaults byte-exact" {

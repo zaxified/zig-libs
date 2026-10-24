@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Behaviour change:** `SecurityHeaders.init` returns the new
+  `InitError.InvalidHeaderValue` for a CR/LF/NUL in any value, in every build mode (was a Debug-only assert,
+  so a ReleaseFast build failed every request instead), and `InvalidExtraHeaderName` for an `extra` named
+  `Connection`, `Content-Length`, `Transfer-Encoding` or `Trailer` (`http` acts on those instead of emitting
+  them; `applyStatic` already refused them). Docs: server error replies carry the headers through
+  `error_headers` + `staticHeaders`; the nonce replace's double header-budget cost. Tools: a gofiber/fiber
+  v3.6.1 helmet side in the bench (`tools/go_fast_bench`, `BENCH_FAST=0` skips; a row the contender cannot
+  run is judged against the reference) and `tools/lead_probe` (unrolled/secure ships an invalid HSTS preload
+  and corrupts a `%` in a nonce policy). Grade 1.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (test). No behaviour change.

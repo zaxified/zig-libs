@@ -477,6 +477,19 @@ test "renderNonce: nonce appended to the named directives only; missing directiv
     try testing.expectEqualStrings(helmet_default_csp, try renderNonce(.{}, &nonce, &.{}, &buf));
 }
 
+test "renderNonce: a '%' in a source is copied, never read as a format directive" {
+    // unrolled/secure v1.17.0 passes the whole policy to fmt.Sprintf when it
+    // carries $NONCE, so `a%20b` arrives as `a%!b(MISSING)` (tools/lead_probe).
+    const nonce = Nonce.fromBytes(&(@as([16]u8, @splat(0))));
+    const zero_nonce = strRepeat("A", 22);
+    var buf: [256]u8 = undefined;
+    const spec: Spec = .{ .use_defaults = false, .directives = &.{
+        .{ .name = .script_src, .values = &.{"https://cdn.example/a%20b"} },
+        .{ .name = .img_src, .values = &.{"https://img.example/100%"} },
+    } };
+    try testing.expectEqualStrings("script-src https://cdn.example/a%20b 'nonce-" ++ zero_nonce ++ "';img-src https://img.example/100%", try renderNonce(spec, &nonce, &.{.script_src}, &buf));
+}
+
 // ── audit 2026-10-18: runtime-path tests asked for by mutation survivors ────
 // (the comptime `build` tests above exercise the same core at compile time;
 // these pin the rules through the run-time entry points `render` /
