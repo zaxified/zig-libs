@@ -299,19 +299,29 @@ pub const TraceState = struct {
     /// first, then from the right. The result may be empty (no member fits,
     /// or the list is empty) — send no header then.
     pub fn write(ts: *const TraceState, buf: []u8) []const u8 {
+        return ts.writeKeeping(buf, false);
+    }
+
+    /// `write`, but with `keep_first` the first member is left out only if
+    /// it does not fit on its own — the middleware's own `state_entry`
+    /// (just put in front) is never the one dropped for a long carried
+    /// member (review 2026-10-24).
+    pub fn writeKeeping(ts: *const TraceState, buf: []u8, keep_first: bool) []const u8 {
         var keep: [max_members]bool = @splat(true);
         var total: usize = 0;
         for (ts.members(), 0..) |m, i| total += memberLen(m) + @intFromBool(i != 0);
         // Long members first, right to left, then any from the right.
         for ([_]bool{ true, false }) |long_only| {
             var i: usize = ts.len;
-            while (total > buf.len and i > 0) {
+            const stop: usize = @intFromBool(keep_first);
+            while (total > buf.len and i > stop) {
                 i -= 1;
                 if (!keep[i] or (long_only and memberLen(ts.members_buf[i]) <= 128)) continue;
                 keep[i] = false;
                 total -|= memberLen(ts.members_buf[i]) + 1; // its comma (or the next one's); 0 once none is left
             }
         }
+        if (total > buf.len) keep[0] = false; // only a kept first member is left, and it is too long
         var w: std.Io.Writer = .fixed(buf);
         var first = true;
         for (ts.members(), keep[0..ts.len]) |m, k| {
@@ -385,13 +395,21 @@ threadlocal var entry_value_buf: [max_value_len]u8 = undefined;
 /// The current hop's trace context, or null if no `TraceContext` middleware has
 /// run on this thread yet. Call it from the connection thread during the
 /// request. The trace-id is the whole-trace identity; the parent-id is this
-/// hop's span-id.
+/// hop's span-id. Like `requestid.current()` it stays set after the request
+/// (an access log registered outside the middleware reads it once the chain
+/// returns) until the next request the middleware runs for: a request that
+/// bypasses the middleware sees the previous one's context, so register it
+/// first. Thread-local storage assumes the server's task-per-connection
+/// model on `Io.Threaded` (one request at a time per thread); an `Io` that
+/// interleaves two requests' tasks on one thread would mix their contexts.
 pub fn current() ?TraceParent {
     return current_ctx;
 }
 
 /// The outgoing `tracestate` of this request (normalized, with our
-/// `state_entry` in front), if any.
+/// `state_entry` in front), if any. The slice is this thread's buffer: valid
+/// until the middleware runs for the next request on the thread — copy it
+/// to keep it.
 pub fn currentState() ?[]const u8 {
     return current_state;
 }
@@ -429,16 +447,20 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // multiple header fields" text depends on this. A combined value that
     // fails the member grammar is dropped whole.
     var list: TraceState = .{};
+    var own_first = false;
     if (incoming != null) {
         if (combinedHeader(ctx.req, opt.tracestate_header, &state_buf)) |raw| {
             list = TraceState.parse(raw) catch .{};
         }
     }
     if (opt.state_entry) |e| {
-        if (e.value(e.context, hop, &entry_value_buf)) |v| list.put(e.key, v) catch {};
+        if (e.value(e.context, hop, &entry_value_buf)) |v| {
+            list.put(e.key, v) catch {};
+            own_first = list.len != 0 and std.mem.eql(u8, list.members_buf[0].key, e.key);
+        }
     }
     current_state = blk: {
-        const out = list.write(&state_out_buf);
+        const out = list.writeKeeping(&state_out_buf, own_first);
         break :blk if (out.len == 0) null else out;
     };
 
@@ -446,9 +468,11 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         // Plain local: `setHeader` copies the bytes (`ResponseWriter.header_buf`),
         // so this buffer only has to outlive the call, not the response. It was
         // a `threadlocal` until 2026-08-12 for the latter reason.
+        // Best effort: a header table already filled by other middleware
+        // must not turn tracing into a failed request (review 2026-10-24).
         var out_buf: [TraceParent.header_len]u8 = undefined;
-        try ctx.res.setHeader(opt.traceparent_header, hop.write(&out_buf));
-        if (current_state) |ts| try ctx.res.setHeader(opt.tracestate_header, ts);
+        ctx.res.setHeader(opt.traceparent_header, hop.write(&out_buf)) catch {};
+        if (current_state) |ts| ctx.res.setHeader(opt.tracestate_header, ts) catch {};
     }
     return next.run(ctx);
 }
@@ -1026,6 +1050,26 @@ test "TraceState.write truncates whole members: over 128 characters first, then 
     try testing.expectEqualStrings("", ts.write(&none));
 }
 
+test "TraceState.writeKeeping never drops the first (own) member for a carried one" {
+    var ts: TraceState = .{};
+    const own = strRepeat("y", 140); // over 128: first in line for the long pass
+    try ts.put("b", "1");
+    try ts.put("me", own); // me=…,b=1 (143 + 1 + 3 = 147)
+    var buf: [145]u8 = undefined;
+    // Plain write drops the long member first -- here our own.
+    try testing.expectEqualStrings("b=1", ts.write(&buf));
+    // Keeping the first: the carried member goes instead.
+    const kept = ts.writeKeeping(&buf, true);
+    try testing.expectEqual(@as(usize, 143), kept.len);
+    try testing.expect(std.mem.startsWith(u8, kept, "me=yyy"));
+    // Both fit: nothing dropped either way.
+    var big: [147]u8 = undefined;
+    try testing.expectEqual(@as(usize, 147), ts.writeKeeping(&big, true).len);
+    // The first alone does not fit: nothing is written (no overflow).
+    var small: [100]u8 = undefined;
+    try testing.expectEqualStrings("", ts.writeKeeping(&small, true));
+}
+
 /// Test `StateEntry`: "<span-id hex>" so the test can see the hop it got.
 fn spanValue(_: ?*anyopaque, hop: TraceParent, buf: *[max_value_len]u8) ?[]const u8 {
     return std.mem.print(buf, "{x}", .{&hop.parent_id}) catch unreachable;
@@ -1293,6 +1337,265 @@ test "TraceContext echo: traceparent header survives the caller's dead frame" {
     try testing.expect(std.mem.find(u8, wire, "traceparent: " ++ sample ++ "\r\n") != null);
     // …and not one byte of the clobber pattern anywhere on it.
     try testing.expect(std.mem.find(u8, wire, "#") == null);
+}
+
+/// Handler that renders `currentState()` into the body (`<none>` when null).
+fn hEchoState(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.writeAll(currentState() orelse "<none>");
+}
+
+fn valueNull(_: ?*anyopaque, _: TraceParent, _: *[max_value_len]u8) ?[]const u8 {
+    return null;
+}
+fn valueFromContext(context: ?*anyopaque, _: TraceParent, buf: *[max_value_len]u8) ?[]const u8 {
+    const n: *const u8 = @ptrCast(@alignCast(context.?));
+    @memset(buf[0..n.*], 'c');
+    return buf[0..n.*];
+}
+fn valueLong200(_: ?*anyopaque, _: TraceParent, buf: *[max_value_len]u8) ?[]const u8 {
+    @memset(buf[0..200], 'o');
+    return buf[0..200];
+}
+
+/// Fills the response header table before `TraceContext` (registered after
+/// it) can echo: the context carries how many headers to set.
+fn fillHeaders(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const n: *const usize = @ptrCast(@alignCast(state.?));
+    for (0..n.*) |i| {
+        var nb: [8]u8 = undefined;
+        try ctx.res.setHeader(try std.mem.print(&nb, "x-{d}", .{i}), "1");
+    }
+    return next.run(ctx);
+}
+
+test "sampled() reads bit 0 only; isValidValue refuses 0x1F" {
+    const base = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-";
+    try testing.expect((try TraceParent.parse(base ++ "03")).sampled());
+    try testing.expect((try TraceParent.parse(base ++ "ff")).sampled());
+    try testing.expect(!(try TraceParent.parse(base ++ "02")).sampled());
+    try testing.expect(!(try TraceParent.parse(base ++ "00")).sampled());
+    try testing.expect(!isValidValue("a\x1fb"));
+    try testing.expect(isValidValue("a b"));
+}
+
+test "TraceState.delete: first, middle and last member of a longer list" {
+    var ts = try TraceState.parse("a=1,b=2,c=3,d=4");
+    var buf: [64]u8 = undefined;
+    try testing.expect(ts.delete("b"));
+    try testing.expectEqualStrings("a=1,c=3,d=4", ts.write(&buf));
+    try testing.expect(ts.delete("d"));
+    try testing.expectEqualStrings("a=1,c=3", ts.write(&buf));
+    var ts2 = try TraceState.parse("a=1,b=2,c=3,d=4,e=5");
+    try testing.expect(ts2.delete("a"));
+    try testing.expectEqualStrings("b=2,c=3,d=4,e=5", ts2.write(&buf));
+    try testing.expectEqual(@as(usize, 4), ts2.members().len);
+    // put of an existing key on a FULL list keeps every other member.
+    var full: TraceState = .{};
+    var keys: [max_members][4]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        _ = std.mem.print(k, "k{d:0>3}", .{i}) catch unreachable;
+        try full.put(k, "v");
+    }
+    try full.put("k005", "new"); // an existing key: moved to the front, nothing lost
+    try testing.expectEqual(@as(usize, max_members), full.members().len);
+    try testing.expectEqualStrings("k005", full.members()[0].key);
+    try testing.expectEqualStrings("k000", full.members()[max_members - 1].key);
+}
+
+test "key/value length boundaries: 256 accepted, 257 refused" {
+    try testing.expect(isValidKey(strRepeat("k", 256)));
+    try testing.expect(!isValidKey(strRepeat("k", 257)));
+    try testing.expect(isValidValue(strRepeat("v", 256)));
+    try testing.expect(!isValidValue(strRepeat("v", 257)));
+    try testing.expect(isValidKey("t@s"));
+    try testing.expect(isValidKey("0x"));
+}
+
+test "TraceState.writeKeeping: a member of exactly 128 is not long, 129 is" {
+    var buf: [136]u8 = undefined;
+    // x=1 (3) + m (L) + z=1 (3) + two commas = L + 8.
+    {
+        var ts: TraceState = .{};
+        try ts.put("z", "1");
+        try ts.put("m", strRepeat("v", 126)); // "m=" + 126 = 128
+        try ts.put("x", "1");
+        // total 136 > 135: 128 is NOT long, so the right-most (z) goes.
+        const got = ts.write(buf[0..135]);
+        try testing.expectEqual(@as(usize, 132), got.len);
+        try testing.expect(std.mem.startsWith(u8, got, "x=1,m=vv"));
+    }
+    {
+        var ts: TraceState = .{};
+        try ts.put("z", "1");
+        try ts.put("m", strRepeat("v", 127)); // 129: long, goes first
+        try ts.put("x", "1");
+        try testing.expectEqualStrings("x=1,z=1", ts.write(buf[0..136]));
+    }
+}
+
+test "combinedHeader: two tracestate instances, 512 exactly kept / 513 dropped (separator counted)" {
+    var tc = TraceContext{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(tc.middleware());
+    try r.get("/", hEchoCurrent);
+    var req_buf: [4096]u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    const a = "k1=" ++ strRepeat("a", 253); // 256
+    {
+        const b = "k2=" ++ strRepeat("b", 252); // 255: 256 + 1 + 255 = 512
+        const req = try std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++
+            "\r\ntracestate: {s}\r\nTraceState: {s}\r\nConnection: close\r\n\r\n", .{ a, b });
+        const got = runWire(&r, req, &buf);
+        try testing.expectEqualStrings(a ++ "," ++ b, headerValue(got, "tracestate").?);
+    }
+    {
+        const b = "k2=" ++ strRepeat("b", 253); // 256: 513 with the comma
+        const req = try std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++
+            "\r\ntracestate: {s}\r\ntracestate: {s}\r\nConnection: close\r\n\r\n", .{ a, b });
+        const got = runWire(&r, req, &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+    }
+}
+
+test "middleware: custom (mixed-case) header names; unsampled stays 00; defaults not used" {
+    var tc = TraceContext{ .options = .{ .traceparent_header = "X-Trace-Parent", .tracestate_header = "X-Trace-State" } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(tc.middleware());
+    try r.get("/", hEchoCurrent);
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "x-TRACE-parent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00\r\n" ++
+        "X-trace-STATE: rojo=1\r\n" ++
+        "traceparent: " ++ sample ++ "\r\nConnection: close\r\n\r\n", &buf);
+    const hdr = headerValue(got, "x-trace-parent").?;
+    try testing.expectEqualStrings(sample_trace, hdr[3..35]); // continued the custom-named one
+    try testing.expectEqualStrings("00", hdr[53..55]); // unsampled stays unsampled
+    try testing.expectEqualStrings("rojo=1", headerValue(got, "x-trace-state").?);
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "traceparent"));
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+}
+
+test "middleware: currentState(), state_entry null / invalid key / context, no state" {
+    var buf: [1024]u8 = undefined;
+    const carried = "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++ "\r\ntracestate: rojo=1\r\nConnection: close\r\n\r\n";
+    // value returns null: the carried list goes out untouched.
+    {
+        var tc = TraceContext{ .options = .{ .state_entry = .{ .key = "zl", .value = valueNull } } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoState);
+        const got = runWire(&r, carried, &buf);
+        try testing.expectEqualStrings("rojo=1", headerValue(got, "tracestate").?);
+        try testing.expectEqualStrings("rojo=1", bodyOf(got));
+    }
+    // invalid key: never added.
+    {
+        var tc = TraceContext{ .options = .{ .state_entry = .{ .key = "BAD", .value = valueLong200 } } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoState);
+        const got = runWire(&r, carried, &buf);
+        try testing.expectEqualStrings("rojo=1", headerValue(got, "tracestate").?);
+        try testing.expectEqualStrings("rojo=1", bodyOf(got));
+    }
+    // the context pointer reaches the value callback.
+    {
+        var n: u8 = 7;
+        var tc = TraceContext{ .options = .{ .state_entry = .{ .key = "zl", .context = &n, .value = valueFromContext } } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoState);
+        const got = runWire(&r, carried, &buf);
+        try testing.expectEqualStrings("zl=ccccccc,rojo=1", headerValue(got, "tracestate").?);
+        try testing.expectEqualStrings("zl=ccccccc,rojo=1", bodyOf(got));
+    }
+    // nothing to carry, no entry: no header and currentState() == null.
+    {
+        var tc = TraceContext{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoState);
+        const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++ "\r\nConnection: close\r\n\r\n", &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+        try testing.expectEqualStrings("<none>", bodyOf(got));
+        try testing.expectEqual(@as(?[]const u8, null), currentState());
+    }
+    // echo=false: no headers, but currentState() carries the list.
+    {
+        var tc = TraceContext{ .options = .{ .echo = false } };
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(tc.middleware());
+        try r.get("/", hEchoState);
+        const got = runWire(&r, carried, &buf);
+        try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+        try testing.expectEqualStrings("rojo=1", bodyOf(got));
+    }
+}
+
+test "middleware: our own long member survives an overflowing carried list" {
+    var tc = TraceContext{ .options = .{ .state_entry = .{ .key = "zl", .value = valueLong200 } } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(tc.middleware());
+    try r.get("/", hEchoState);
+    // Four carried members of 125 characters (short: under 128): 503 with
+    // commas. Our 203-character member in front makes 707 > 512.
+    const m = strRepeat("v", 122);
+    var req_buf: [4096]u8 = undefined;
+    const req = try std.mem.print(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++
+        "\r\ntracestate: k1={s},k2={s},k3={s},k4={s}\r\nConnection: close\r\n\r\n", .{ m, m, m, m });
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, req, &buf);
+    const ts = try TraceState.parse(headerValue(got, "tracestate").?);
+    try testing.expectEqual(@as(usize, 3), ts.members().len); // zl, k1, k2 -- k4 and k3 went from the right
+    try testing.expectEqualStrings("zl", ts.members()[0].key);
+    try testing.expectEqualStrings("k2", ts.members()[2].key);
+}
+
+test "middleware: a full response header table does not fail the request (echo is best effort)" {
+    var fill: usize = 32;
+    var tc = TraceContext{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = &fill, .run = fillHeaders });
+    try r.use(tc.middleware());
+    try r.get("/", hEchoCurrent);
+    var buf: [4096]u8 = undefined;
+    const req = "GET / HTTP/1.1\r\nHost: t\r\ntraceparent: " ++ sample ++ "\r\ntracestate: rojo=1\r\nConnection: close\r\n\r\n";
+    // Table full: neither header fits, the request still succeeds.
+    var got = runWire(&r, req, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "traceparent"));
+    try testing.expectEqual(@as(usize, TraceParent.header_len), bodyOf(got).len);
+    // One slot left: traceparent fits, tracestate does not.
+    fill = 31;
+    got = runWire(&r, req, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expect(headerValue(got, "traceparent") != null);
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+}
+
+test "generated ids: exact function of the sequence and the prefix; the zero image is remapped" {
+    const prefix = processPrefix();
+    const saved = next_seq.load(.monotonic);
+    defer next_seq.store(saved +% 1000, .monotonic);
+    next_seq.store(1000, .monotonic);
+    const sp = newSpanId();
+    try testing.expectEqual(mix64(1000 +% prefix), std.mem.readInt(u64, &sp, .big));
+    const tid = newTraceId();
+    try testing.expectEqual(prefix, std.mem.readInt(u64, tid[0..8], .big));
+    try testing.expectEqual(mix64(1001 +% prefix), std.mem.readInt(u64, tid[8..16], .big));
+    // mix64(0) == 0: the sequence value that maps to the invalid all-zero id.
+    next_seq.store(0 -% prefix, .monotonic);
+    const z = newSpanId();
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, &z, .big));
 }
 
 // See w3c_conformance_test.zig / w3c_vectors.zig / NOTICE.
