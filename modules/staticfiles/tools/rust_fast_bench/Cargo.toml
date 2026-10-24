@@ -1,0 +1,27 @@
+[package]
+name = "staticfiles_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-staticfiles`
+# (modules/staticfiles/tools/bench.zig): tower-http's `ServeDir` driven as a
+# tower `Service` in-process on a current-thread tokio runtime (`rt` + `fs`
+# only, no `macros`), pinned exactly; httparse stands in for Go's
+# http.ReadRequest.
+[dependencies]
+tower-http = { version = "=0.7.1", default-features = false, features = ["fs"] }
+tower-service = "=0.3.3"
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "fs"] }
+http = "=1.5.0"
+http-body = "=1.1.0"
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+httparse = "=1.10.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

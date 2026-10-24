@@ -508,11 +508,7 @@ fn openWithinRootAs(root: Dir, io: Io, rel: []const u8, opts: Options, want_dir:
     // a directory target into `error.IsDir` (cheaply on Windows, one fstat
     // elsewhere) instead of handing back a directory fd. A request that named
     // a directory goes straight to the directory branch.
-    const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else parent.openFile(io, leaf, .{
-        .follow_symlinks = follow,
-        .allow_directory = false,
-        .resolve_beneath = true,
-    });
+    const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else openServable(parent, io, leaf, follow);
     const file = leaf_file catch |e| switch (e) {
         error.IsDir => {
             // A directory: descend into it and serve its index.
@@ -557,11 +553,7 @@ fn openWithinRootAs(root: Dir, io: Io, rel: []const u8, opts: Options, want_dir:
 /// `opts.follow_symlinks` is on (A1 F1).
 fn openIndex(dir: Dir, root: Dir, io: Io, opts: Options) ResolveError!Opened {
     if (opts.index.len == 0) return error.IsDir;
-    var f = dir.openFile(io, opts.index, .{
-        .follow_symlinks = opts.follow_symlinks,
-        .allow_directory = false,
-        .resolve_beneath = true,
-    }) catch |e| switch (e) {
+    var f = openServable(dir, io, opts.index, opts.follow_symlinks) catch |e| switch (e) {
         error.FileNotFound, error.IsDir => return error.IsDir,
         else => return mapOpenError(e),
     };
@@ -636,6 +628,38 @@ fn verifyContainedDir(root: Dir, io: Io, d: Dir) error{Escaped}!void {
 fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
     const st = parent.statFile(io, seg, .{ .follow_symlinks = false }) catch return false;
     return st.kind == .sym_link;
+}
+
+/// `openFile` of a name to serve, refusing a FIFO, device or socket BEFORE
+/// the open (review 2026-10-24 M3): a blocking `open(O_RDONLY)` of a FIFO
+/// with no writer never returns, so one request per FIFO pinned a connection
+/// thread forever, and the `st.kind != .file` check after the open never ran.
+/// std 0.17 has no `O_NONBLOCK` open on Linux (`lock_nonblocking` only sets
+/// it on BSD lock opens), hence the stat first. Stat and open are two steps:
+/// whoever can swap a FIFO in between can write the root anyway, and the
+/// callers' fstat after the open stays the check of what was opened.
+/// `error.AccessDenied` for a non-regular, non-directory name (→ 403, as
+/// that fstat check answers). The stat's answer is used, not repeated: a
+/// missing name is `error.FileNotFound` and a directory `error.IsDir` at
+/// once (what the open would say, without its open + fstat + close); any
+/// other stat failure leaves the verdict to the open.
+fn openServable(dir: Dir, io: Io, name: []const u8, follow: bool) Io.File.OpenError!Io.File {
+    // A name over NAME_MAX goes straight to the open, which maps it to 404
+    // (the stat path is not where this module learns that, see A1 F13).
+    if (name.len <= 255) if (dir.statFile(io, name, .{ .follow_symlinks = follow })) |st| switch (st.kind) {
+        .file, .sym_link => {},
+        .directory => return error.IsDir,
+        else => return error.AccessDenied,
+    } else |e| switch (e) {
+        error.FileNotFound => return error.FileNotFound,
+        error.NotDir => return error.NotDir,
+        else => {},
+    };
+    return dir.openFile(io, name, .{
+        .follow_symlinks = follow,
+        .allow_directory = false,
+        .resolve_beneath = true,
+    });
 }
 
 fn mapOpenError(e: anyerror) error{ NotFound, Forbidden, IoError } {
@@ -722,7 +746,16 @@ pub const Handler = struct {
             error.NotFound => blk: {
                 // Would be a 404: the SPA fallback, if configured and asked for.
                 const fb = h.options.fallback orelse return sendStatus(rw, 404);
-                if (!wantsFallback(req, h.options.serve_dotfiles)) return sendStatus(rw, 404);
+                if (!fallbackPath(req, h.options.serve_dotfiles)) return sendStatus(rw, 404);
+                // From here the answer depends on `Accept`, and the 404 says
+                // so as the fallback's 200 does: without it a shared cache
+                // keeps one client's 404 for a later navigation to the same
+                // URL (review 2026-10-24 L6).
+                if (!acceptsHtml(req)) {
+                    try sendStatus(rw, 404);
+                    rw.setHeader("Vary", "Accept") catch {};
+                    return;
+                }
                 via_directory = false;
                 const r = h.resolveForServe(fb, &via_directory) catch return sendStatus(rw, 404);
                 switch (r) {
@@ -816,9 +849,14 @@ pub const Handler = struct {
         const sep: []const u8 = if (via_directory and rel.len != 0) "/" else "";
         const leaf: []const u8 = if (via_directory) opened.mimeName() else "";
         var avail = [codings.len]bool{ pc.br, pc.zstd, pc.gzip };
+        // No index: a DIRECTORY named like a variant (`app.js.br/`) is not
+        // one, rather than its index.html served as Brotli (review
+        // 2026-10-24 L7).
+        var vopts = h.options;
+        vopts.index = "";
         while (pickCoding(ae, avail)) |c| {
             const path = std.mem.print(&path_buf, "{s}{s}{s}{s}", .{ rel, sep, leaf, codings[c].suffix }) catch return null;
-            if (openWithinRoot(h.root, h.io, path, h.options)) |o| {
+            if (openWithinRoot(h.root, h.io, path, vopts)) |o| {
                 return .{ .opened = o, .coding = c };
             } else |_| avail[c] = false;
         }
@@ -935,7 +973,7 @@ pub const Handler = struct {
         var length: u64 = total;
         var rbuf: [http.range.default_max_ranges]http.range.ResolvedRange = undefined;
         const applied = if (http.conditional.ifRangeAllows(req, .{ .etag = etag, .last_modified = mtime_s }))
-            http.range.apply(req, rw, total, &rbuf) catch return sendStatus(rw, 500)
+            http.range.apply(req, rw, total, &rbuf) catch return failUnsafeResponse(rw)
         else
             http.range.Applied{ .outcome = .no_range, .ranges = &.{} };
 
@@ -1068,11 +1106,7 @@ pub const Handler = struct {
 
         // A request that named a directory (`/a.txt/`) never opens the leaf
         // as a file -- see `namesDirectory`.
-        const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else parent.openFile(h.io, leaf, .{
-            .follow_symlinks = follow,
-            .allow_directory = false,
-            .resolve_beneath = true,
-        });
+        const leaf_file: Io.File.OpenError!Io.File = if (want_dir) error.IsDir else openServable(parent, h.io, leaf, follow);
         const file = leaf_file catch |e| switch (e) {
             error.IsDir => {
                 via_directory.* = true;
@@ -1215,10 +1249,17 @@ fn sendStatus(rw: *http.Server.ResponseWriter, status: u16) Writer.Error!void {
 /// wrong place.
 fn redirectTrailingSlash(req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
     var buf: [max_path_bytes + 1 + max_path_bytes]u8 = undefined;
+    // The leading `/` run collapsed to one (review 2026-10-24 M1): empty
+    // segments are dropped, so `//docs` names the directory `docs`, but
+    // `Location: //docs/` is a protocol-relative URL -- an open redirect to
+    // the host `docs` (Go answers with a relative Location, nginx merges
+    // slashes first).
+    var path = req.path;
+    while (path.len > 1 and path[0] == '/' and path[1] == '/') path = path[1..];
     const location = (if (req.query.len != 0)
-        std.mem.print(&buf, "{s}/?{s}", .{ req.path, req.query })
+        std.mem.print(&buf, "{s}/?{s}", .{ path, req.query })
     else
-        std.mem.print(&buf, "{s}/", .{req.path})) catch return failUnsafeResponse(rw);
+        std.mem.print(&buf, "{s}/", .{path})) catch return failUnsafeResponse(rw);
     rw.setStatus(301);
     rw.setHeader("Location", location) catch return failUnsafeResponse(rw);
     setContentLength(rw, 0);
@@ -1301,17 +1342,26 @@ fn buildVariantETag(buf: *[etag_max + 5]u8, size: u64, mtime_s: i64, weak: bool,
         std.mem.print(buf, "\"{x}-{x}-{s}\"", .{ size, m, token })) catch unreachable;
 }
 
-/// Is `req` one the SPA fallback answers (`Options.fallback`)? Its last path
-/// segment has no `.` -- a missing asset is a 404, never HTML -- and its
-/// `Accept` lists `text/html`. (Only reached for a path that already
-/// sanitized and resolved to nothing.)
-fn wantsFallback(req: *const http.Server.Request, allow_dotfiles: bool) bool {
+/// Is `req`'s path one the SPA fallback (`Options.fallback`) may answer? Its
+/// last segment has no `.` -- a missing asset is a 404, never HTML. (Only
+/// reached for a path that already sanitized and resolved to nothing.)
+fn fallbackPath(req: *const http.Server.Request, allow_dotfiles: bool) bool {
     var buf: [max_path_bytes]u8 = undefined;
     const rel = sanitizePath(req.path, &buf, .{ .allow_dotfiles = allow_dotfiles }) catch return false;
     const leaf = rel[(mem.findScalarLast(u8, rel, '/') orelse 0)..];
-    if (mem.findScalar(u8, leaf, '.') != null) return false;
-    const accept = req.header("accept") orelse return false;
-    return std.ascii.findIgnoreCase(accept, "text/html") != null;
+    return mem.findScalar(u8, leaf, '.') == null;
+}
+
+/// Does `req`'s `Accept` list `text/html` with a non-zero weight? (Not
+/// `*/*`: an API client's catch-all is not a navigation; `text/html;q=0`
+/// refuses HTML, review 2026-10-24 L10.)
+fn acceptsHtml(req: *const http.Server.Request) bool {
+    const header = req.header("accept") orelse return false;
+    var it = http.conneg.accept(header);
+    while (it.next()) |mr| {
+        if (std.ascii.eqlIgnoreCase(mr.type, "text") and std.ascii.eqlIgnoreCase(mr.subtype, "html") and mr.weight > 0) return true;
+    }
+    return false;
 }
 
 // ── Snapshot: a root opened once, served without opening anything ───────────
@@ -1328,8 +1378,10 @@ pub const Precompressed = struct {
 pub const SnapshotOptions = struct {
     /// The rules `Handler` applies -- index, dotfiles, validators,
     /// `Cache-Control`, MIME, the trailing-slash redirect. A snapshot never
-    /// follows a symlink and never lists a directory: `follow_symlinks` or
-    /// `directory_listing` set is `error.Unsupported`.
+    /// follows a symlink, never lists a directory and has no SPA fallback:
+    /// `follow_symlinks`, `directory_listing` or `fallback` set is
+    /// `error.Unsupported` (a fallback used to be ignored silently -- a
+    /// broken SPA deploy with nothing said, review 2026-10-24 L8).
     serve: Options = .{},
     precompressed: Precompressed = .{},
     /// Most regular files held -- one open descriptor each. A larger tree is
@@ -1419,7 +1471,7 @@ pub const Snapshot = struct {
     /// mtime) is unchanged: its descriptor, stat and tag, with no open and no
     /// read. On failure every taken-over descriptor is handed back to `prev`.
     fn build(gpa: std.mem.Allocator, io: Io, root: Dir, opts: SnapshotOptions, prev: ?*Snapshot) SnapshotError!Snapshot {
-        if (opts.serve.follow_symlinks or opts.serve.directory_listing) return error.Unsupported;
+        if (opts.serve.follow_symlinks or opts.serve.directory_listing or opts.serve.fallback != null) return error.Unsupported;
         var s: Snapshot = .{ .gpa = gpa, .options = opts, .arena = .init(gpa) };
         errdefer s.abandon(io, prev);
         try s.paths.put(gpa, "", .{ .dir = null });
@@ -1666,6 +1718,14 @@ pub const LiveOptions = struct {
     /// rescan is one `getdents` per directory and one `fstatat` per file; a
     /// file whose inode, size or mtime moved is reopened and rehashed.
     rescan_ms: u32 = 2000,
+    /// At most this many replaced generations wait to be freed (0 is read as
+    /// 1). Generations are freed oldest first, so one slow download holding
+    /// an old generation pins every later one, each with its path table and
+    /// the descriptors of the files it replaced. At the cap a rescan builds
+    /// and publishes nothing (`Outcome.held_back`): the current generation
+    /// keeps serving, and the change is picked up by the first rescan after
+    /// the oldest hold is released.
+    max_retired: u32 = 16,
     /// Told after every rescan, on the thread that ran it (`start`'s, or
     /// `reload`'s caller) -- to log a published generation or a failure.
     observer: ?Observer = null,
@@ -1681,6 +1741,9 @@ pub const LiveOptions = struct {
         /// A new generation is being served: its number (the first is 1)
         /// and how many of its files were opened and hashed anew.
         published: struct { generation: u64, fresh: usize },
+        /// `max_retired` replaced generations are still held: nothing was
+        /// scanned or published; the current generation stays.
+        held_back: struct { retired: usize },
         /// The rescan failed; the current generation stays.
         failed: SnapshotError,
     };
@@ -1721,6 +1784,9 @@ pub const LiveOptions = struct {
 /// must be one the sandbox covers -- start it after sandboxing.
 /// Test-only seam in `Live.acquire`; see the test that sets it.
 var test_acquire_pause: if (@import("builtin").is_test) ?*const fn () void else void =
+    if (@import("builtin").is_test) null else {};
+/// Test-only seam in `Live.acquire`, between reading `side` and counting.
+var test_acquire_side_pause: if (@import("builtin").is_test) ?*const fn () void else void =
     if (@import("builtin").is_test) null else {};
 
 pub const Live = struct {
@@ -1774,8 +1840,20 @@ pub const Live = struct {
 
     /// The generation requests are served from now. Pair with `release`.
     pub fn acquire(l: *Live) *Gen {
-        const side = l.side.load(.seq_cst);
-        _ = l.readers[side].fetchAdd(1, .seq_cst);
+        // Counted on a side that is still current AFTER the count: a reader
+        // that read `side`, stalled across a whole publish and only then
+        // counted itself on the old side would be invisible to the next
+        // publisher, which waits on the other side -- and that one frees
+        // the generation this reader is about to hold (review 2026-10-24 M2).
+        // Seen again after the increment, `side` proves the publisher that
+        // flips it next reads the count first.
+        const side = while (true) {
+            const s = l.side.load(.seq_cst);
+            if (@import("builtin").is_test) if (test_acquire_side_pause) |pause| pause();
+            _ = l.readers[s].fetchAdd(1, .seq_cst);
+            if (l.side.load(.seq_cst) == s) break s;
+            _ = l.readers[s].fetchSub(1, .seq_cst);
+        };
         const g = l.current.load(.seq_cst);
         // Test-only: a request stopped exactly where a publisher that did not
         // wait for it would free the generation it just read.
@@ -1800,15 +1878,18 @@ pub const Live = struct {
     /// a time (`start`'s thread, or the owner when it runs none). `io` must
     /// be one that may block -- this opens, stats and reads files.
     pub fn reload(l: *Live, io: Io) SnapshotError!bool {
-        const published = l.rescan(io) catch |e| {
+        const step = l.rescan(io) catch |e| {
             l.tell(.{ .failed = e });
             return e;
         };
-        if (published) |fresh| {
-            l.tell(.{ .published = .{ .generation = l.generations.load(.monotonic), .fresh = fresh } });
-            return true;
+        switch (step) {
+            .published => |fresh| {
+                l.tell(.{ .published = .{ .generation = l.generations.load(.monotonic), .fresh = fresh } });
+                return true;
+            },
+            .held_back => |retired| l.tell(.{ .held_back = .{ .retired = retired } }),
+            .unchanged => l.tell(.unchanged),
         }
-        l.tell(.unchanged);
         return false;
     }
 
@@ -1817,9 +1898,19 @@ pub const Live = struct {
         o.rescanned(o.ctx, outcome);
     }
 
-    /// `reload` without the report: the new generation's fresh-file count,
-    /// or null when nothing changed.
-    fn rescan(l: *Live, io: Io) SnapshotError!?usize {
+    const Step = union(enum) {
+        unchanged,
+        /// The retired generations still waiting, at the cap.
+        held_back: usize,
+        /// The new generation's fresh-file count.
+        published: usize,
+    };
+
+    /// `reload` without the report.
+    fn rescan(l: *Live, io: Io) SnapshotError!Step {
+        l.reclaim(io);
+        if (l.retired.items.len >= @max(1, l.options.max_retired))
+            return .{ .held_back = l.retired.items.len };
         defer l.reclaim(io);
         const prev = l.current.load(.seq_cst);
         var next = Snapshot.build(l.gpa, io, l.root, l.options.snapshot, &prev.snap) catch |e| {
@@ -1828,7 +1919,7 @@ pub const Live = struct {
         };
         if (next.sameAs(&prev.snap)) {
             next.abandon(io, &prev.snap);
-            return null;
+            return .unchanged;
         }
         const g = l.gpa.create(Gen) catch {
             next.abandon(io, &prev.snap);
@@ -1842,7 +1933,7 @@ pub const Live = struct {
         };
         l.publish(g);
         _ = l.generations.fetchAdd(1, .monotonic);
-        return g.snap.fresh;
+        return .{ .published = g.snap.fresh };
     }
 
     /// Make `g` current. Afterwards no request can take the old generation:
@@ -1972,6 +2063,14 @@ test "sanitizePath: traversal + injection vectors all rejected" {
     }
     try testing.expectError(error.Traversal, sanitizePath("/../secret.txt", &buf, .{ .allow_dotfiles = true }));
     try testing.expectError(error.Traversal, sanitizePath("/a/../../b", &buf, .{ .allow_dotfiles = true }));
+}
+
+test "sanitizePath: a decoded path that does not fit `out` is TooLong, one that exactly fits is not" {
+    var small: [4]u8 = undefined;
+    try testing.expectEqualStrings("abcd", try sanitizePath("abcd", &small, .{}));
+    try testing.expectEqualStrings("abcd", try sanitizePath("%61bcd", &small, .{}));
+    try testing.expectError(error.TooLong, sanitizePath("abcde", &small, .{}));
+    try testing.expectError(error.TooLong, sanitizePath("%61bcde", &small, .{}));
 }
 
 test "sanitizePath: absolute-looking input cannot escape" {
@@ -2581,6 +2680,29 @@ test "serve: directory request serves index.html" {
     try testing.expect(mem.find(u8, bare, "Location: /sub/\r\n") != null);
 }
 
+test "serve: the trailing-slash redirect never points at another host (`//sub` → `/sub/`, review 2026-10-24 M1)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var out: [4096]u8 = undefined;
+    var out_snap: [4096]u8 = undefined;
+    var h = Handler.init(testing.io, fx.root, .{});
+    var snap = try Snapshot.open(testing.allocator, testing.io, fx.root, .{ .fingerprint = false });
+    defer snap.deinit(testing.io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+    const cases = [_]struct { path: []const u8, want: []const u8 }{
+        .{ .path = "//sub", .want = "Location: /sub/\r\n" },
+        .{ .path = "///sub", .want = "Location: /sub/\r\n" },
+        .{ .path = "//sub/dir?x=1", .want = "Location: /sub/dir/?x=1\r\n" },
+        .{ .path = "/%2f/sub", .want = "Location: /%2f/sub/\r\n" },
+    };
+    for (cases) |c| {
+        for ([_][]const u8{ get(&h, c.path, &out), snapGet(&ctx, c.path, "", &out_snap) }) |resp| {
+            try testing.expectEqual(@as(u16, 301), statusOf(resp));
+            try testing.expect(mem.find(u8, resp, c.want) != null);
+        }
+    }
+}
+
 test "serve: a directory URL missing its trailing slash redirects to the canonical one (A1 F17)" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -2723,6 +2845,40 @@ test "serve: a FIFO in the root is refused (403), not opened and blocked on (A1 
     // Positive control: an actual regular file next to it still serves 200
     // — the FIFO fixture did not disturb ordinary resolution.
     try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out)));
+}
+
+test "serve: a FIFO with no writer -- as the file, the index or a precompressed sibling -- is never opened (review 2026-10-24 M3)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    // No end held: a blocking open of any of these would never return.
+    for ([_][:0]const u8{ "lonely", "hello.txt.br" }) |name| {
+        if (linux.errno(linux.mknodat(fx.root.handle, name, linux.S.IFIFO | 0o644, 0)) != .SUCCESS) return error.SkipZigTest;
+    }
+    try fx.root.createDirPath(testing.io, "fifodir");
+    if (linux.errno(linux.mknodat(fx.root.handle, "fifodir/index.html", linux.S.IFIFO | 0o644, 0)) != .SUCCESS) return error.SkipZigTest;
+
+    var h = Handler.init(testing.io, fx.root, .{ .precompressed = .{} });
+    var out: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 403), statusOf(get(&h, "/lonely", &out)));
+    try testing.expectEqual(@as(u16, 403), statusOf(get(&h, "/fifodir/", &out)));
+    // The `.br` sibling is not a variant: the identity file is served.
+    const resp = sendReq(&h, "GET", "/hello.txt", "Accept-Encoding: br\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Encoding") == null);
+}
+
+test "serve: a directory named like a precompressed variant is not one (review 2026-10-24 L7)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    try fx.root.createDirPath(testing.io, "hello.txt.gz");
+    try fx.root.writeFile(testing.io, .{ .sub_path = "hello.txt.gz/index.html", .data = "<h1>not gzip</h1>" });
+    var h = Handler.init(testing.io, fx.root, .{ .precompressed = .{} });
+    var out: [4096]u8 = undefined;
+    const resp = sendReq(&h, "GET", "/hello.txt", "Accept-Encoding: gzip\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "Content-Encoding") == null);
+    try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
 test "serve: a directory-listing request opens its target directory once, not twice (A1 F11)" {
@@ -2938,6 +3094,205 @@ test "serve: verifyContained's prefix check covers the FULL root path, not just 
     const resp = get(&h, "/escape3", &out);
     try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
     try testing.expect(mem.find(u8, resp, "DECOY-LEAK") == null);
+}
+
+var test_long_path_len: usize = 0;
+
+/// A middleware that rewrites `req.path` to `test_long_path_len` bytes of
+/// `/aaa...`: the server itself stops a path at `max_normalized_path`, so a
+/// path past `max_path_bytes` reaches `serve` only from a caller that
+/// rewrites it (a mount prefix, say).
+fn longPathHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+    var long: [max_path_bytes + 1]u8 = undefined;
+    @memset(&long, 'a');
+    long[0] = '/';
+    req.path = long[0..test_long_path_len];
+    const h: *const Handler = @ptrCast(@alignCast(req.context orelse return error.NoStaticFilesContext));
+    return h.serve(req, rw);
+}
+
+test "serve: a path that decodes past max_path_bytes answers 414; one that fits is looked up (404)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    const wire = "GET /x HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    defer test_long_path_len = 0;
+    var out: [4096]u8 = undefined;
+
+    test_long_path_len = max_path_bytes;
+    try testing.expectEqual(@as(u16, 404), statusOf(runVia(longPathHandler, &h, wire, &out)));
+    test_long_path_len = max_path_bytes + 1;
+    try testing.expectEqual(@as(u16, 414), statusOf(runVia(longPathHandler, &h, wire, &out)));
+}
+
+test "serve: an open that fails for the machine's reason, not the request's, answers 500 (descriptor limit)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out))); // positive control
+
+    // The lowest free descriptor number is what the next open would get; a
+    // soft limit at that number makes it EMFILE (`ProcessFdQuotaExceeded`),
+    // which `mapOpenError` files under "I/O error", not "forbidden".
+    const old = try std.posix.getrlimit(.NOFILE);
+    const probe = linux.dup(2);
+    if (linux.errno(probe) != .SUCCESS) return error.SkipZigTest;
+    _ = linux.close(@intCast(probe));
+    std.posix.setrlimit(.NOFILE, .{ .cur = probe, .max = old.max }) catch return error.SkipZigTest;
+    defer std.posix.setrlimit(.NOFILE, old) catch {};
+    try testing.expectEqual(@as(u16, 500), statusOf(get(&h, "/hello.txt", &out)));
+}
+
+test "openWithinRoot: an unsanitized `..` is refused at layer 2, in a directory part and as the leaf (A1 F3)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const io = testing.io;
+    // `secret.txt` and the tmp directory itself sit one level above the root.
+    for ([_][]const u8{ "../secret.txt", "sub/../../secret.txt", "..", "sub/.." }) |rel| {
+        try testing.expectError(error.Forbidden, openWithinRoot(fx.root, io, rel, .{}));
+    }
+}
+
+test "openWithinRoot: a dangling symlinked directory is NotFound under follow_symlinks, Forbidden without (A1 F16)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.symLink(io, "../nowhere", "dangling", .{});
+
+    // Following it finds nothing there: an ordinary miss, not a refused link.
+    try testing.expectError(error.NotFound, openWithinRoot(root, io, "dangling/x.txt", .{ .follow_symlinks = true }));
+    try testing.expectError(error.Forbidden, openWithinRoot(root, io, "dangling/x.txt", .{}));
+}
+
+test "serve: a symlink to a directory, asked for without the trailing slash, is refused (403) in no-follow mode" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
+    var out: [4096]u8 = undefined;
+    for ([_][]const u8{ "/linkdir", "/linklist" }) |p| {
+        const resp = get(&h, p, &out);
+        try testing.expectEqual(@as(u16, 403), statusOf(resp));
+        try testing.expect(mem.find(u8, resp, "LEAK") == null);
+        try testing.expectError(error.Forbidden, resolveFile(fx.root, testing.io, p, .{}));
+    }
+}
+
+test "serve: follow_symlinks listings stay contained -- a link to the parent, to an equal-length sibling or to a prefix sibling is refused" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    // "roo2" is as long as "root"; "rootBAD" has "root" as a string prefix.
+    // None has an index, so each is the directory-LISTING route (F1's 4th shape).
+    var same = try tmp.dir.createDirPathOpen(io, "roo2", .{});
+    defer same.close(io);
+    try same.writeFile(io, .{ .sub_path = "leak-same.txt", .data = "x" });
+    var pref = try tmp.dir.createDirPathOpen(io, "rootBAD", .{});
+    defer pref.close(io);
+    try pref.writeFile(io, .{ .sub_path = "leak-pref.txt", .data = "x" });
+    var plain = try root.createDirPathOpen(io, "plain", .{});
+    defer plain.close(io);
+    try plain.writeFile(io, .{ .sub_path = "inner.txt", .data = "x" });
+    try root.symLink(io, "..", "up", .{});
+    try root.symLink(io, "../roo2", "same", .{});
+    try root.symLink(io, "../rootBAD", "pref", .{});
+    try root.symLink(io, "plain", "inner", .{});
+
+    var h = Handler.init(io, root, .{ .follow_symlinks = true, .directory_listing = true });
+    var out: [4096]u8 = undefined;
+    for ([_][]const u8{ "/up/", "/same/", "/pref/" }) |p| {
+        const resp = get(&h, p, &out);
+        try testing.expectEqual(@as(u16, 403), statusOf(resp));
+        try testing.expect(mem.find(u8, resp, "leak-") == null);
+    }
+    // Positive control: a listing inside the root, directly and through a link.
+    for ([_][]const u8{ "/plain/", "/inner/" }) |p| {
+        const resp = get(&h, p, &out);
+        try testing.expectEqual(@as(u16, 200), statusOf(resp));
+        try testing.expect(mem.find(u8, resp, "inner.txt") != null);
+    }
+}
+
+test "serve: a 416 carries no body" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    const resp = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 416), statusOf(resp));
+    try testing.expectEqual(@as(usize, 0), bodyOf(resp).len);
+    try testing.expect(mem.find(u8, resp, "hello world") == null);
+}
+
+test "serve: a Range whose Content-Range cannot be written answers 500, not a 206 without it" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    const wire = "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n";
+    var out: [8192]u8 = undefined;
+    const ok = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(ok));
+    try testing.expect(mem.find(u8, ok, "Content-Range: bytes 0-4/11\r\n") != null);
+
+    test_preset_content_type = true;
+    test_fill_table = true;
+    defer {
+        test_preset_content_type = false;
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out2: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out2);
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "hello") == null);
+}
+
+test "serve: a Vary that cannot be written answers 500, not a 200 a shared cache would mix up" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .precompressed = .{} });
+    const wire = "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    var out: [8192]u8 = undefined;
+    const ok = runVia(tablePressureHandler, &h, wire, &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    try testing.expect(mem.find(u8, ok, "Vary: Accept-Encoding\r\n") != null);
+
+    test_preset_content_type = true; // so Content-Type is a replace and cannot be what fails
+    test_fill_table = true;
+    defer {
+        test_preset_content_type = false;
+        test_fill_table = false;
+        test_fill_error = null;
+    }
+    var out2: [8192]u8 = undefined;
+    const resp = runVia(tablePressureHandler, &h, wire, &out2);
+    try testing.expectEqual(@as(anyerror, error.TooManyHeaders), test_fill_error.?);
+    try testing.expectEqual(@as(u16, 500), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "hello world") == null);
+}
+
+test "serve: a file past the 64 KiB stream chunk arrives whole, every chunk from its own offset" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    const data = try testing.allocator.alloc(u8, 150_000);
+    defer testing.allocator.free(data);
+    for (data, 0..) |*b, i| b.* = @intCast((i * 7 + i / 251) % 256);
+    try root.writeFile(io, .{ .sub_path = "big.bin", .data = data });
+    var h = Handler.init(io, root, .{});
+    const out = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(out);
+    const resp = get(&h, "/big.bin", out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.eql(u8, data, bodyOf(resp)));
 }
 
 test "serve: 304 on matching If-None-Match / If-Modified-Since" {
@@ -3723,6 +4078,7 @@ test "Snapshot.open refuses what it would not serve right: symlink following, li
     const gpa = testing.allocator;
     try testing.expectError(error.Unsupported, Snapshot.open(gpa, io, root, .{ .serve = .{ .follow_symlinks = true } }));
     try testing.expectError(error.Unsupported, Snapshot.open(gpa, io, root, .{ .serve = .{ .directory_listing = true } }));
+    try testing.expectError(error.Unsupported, Snapshot.open(gpa, io, root, .{ .serve = .{ .fallback = "index.html" } }));
     try testing.expectError(error.TooManyFiles, Snapshot.open(gpa, io, root, .{ .max_files = 1 }));
     try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, root, .{ .max_depth = 1 }));
     var ok = try Snapshot.open(gpa, io, root, .{ .max_files = 2, .max_depth = 2 });
@@ -3977,6 +4333,47 @@ test "Live: descriptors handed on are closed once, by the last holder, oldest ge
     try testing.expectEqual(before, try fds.count());
 }
 
+test "Live: one held generation pins at most max_retired; past it the change waits for the release" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "edit.txt", "E0" }});
+    const Log = struct {
+        last: LiveOptions.Outcome = .unchanged,
+        fn rescanned(ctx: ?*anyopaque, o: LiveOptions.Outcome) void {
+            const log: *@This() = @ptrCast(@alignCast(ctx.?));
+            log.last = o;
+        }
+    };
+    var log: Log = .{};
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .max_retired = 2, .observer = .{ .ctx = &log, .rescanned = Log.rescanned } });
+    defer live.deinit(io);
+    var b: [4096]u8 = undefined;
+    const g1 = live.acquire(); // a slow download on generation 1
+    const bodies = [_][]const u8{ "E1", "E2", "E3" };
+    for (bodies, 0..) |body, i| {
+        // Replaced by rename: an in-place write would change the bytes the
+        // current generation's descriptor reads too.
+        try tmp.dir.writeFile(io, .{ .sub_path = "edit.next", .data = body });
+        try Dir.rename(tmp.dir, "edit.next", root, "edit.txt", io);
+        try bumpMtime(root, "edit.txt", @intCast(10 * (i + 1)));
+        try testing.expectEqual(i < 2, try live.reload(io));
+    }
+    // Two published, the third held back: generations 1 and 2 retired, 3 served.
+    try testing.expectEqual(@as(usize, 2), live.retired.items.len);
+    try testing.expectEqual(@as(usize, 2), log.last.held_back.retired);
+    try testing.expectEqual(@as(u64, 3), live.generations.load(.monotonic));
+    try testing.expectEqualStrings("E2", bodyOf(liveGet(&live, "/edit.txt", &b)));
+    live.release(g1);
+    // Freed oldest first, then the waiting edit is published.
+    try testing.expect(try live.reload(io));
+    try testing.expectEqualStrings("E3", bodyOf(liveGet(&live, "/edit.txt", &b)));
+    try testing.expectEqual(@as(usize, 0), live.retired.items.len);
+}
+
 test "Live: a failed rescan keeps serving the current generation, every descriptor intact" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -4205,6 +4602,169 @@ test "Live: publishing waits for a request caught between reading the generation
     try testing.expectEqualStrings("new", bodyOf(liveGet(&live, "/a.txt", &b)));
 }
 
+/// For the test below: a second gate, at `acquire`'s first seam.
+const SideGate = struct {
+    var paused = std.atomic.Value(bool).init(false);
+    var go = std.atomic.Value(bool).init(false);
+    fn pause() void {
+        paused.store(true, .seq_cst);
+        while (!go.load(.seq_cst)) std.Thread.yield() catch {};
+    }
+};
+
+test "Live: a request that read the side before one publish and counts itself after it is still waited for by the next (review 2026-10-24 M2)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "v0" }});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+
+    SideGate.paused.store(false, .seq_cst);
+    SideGate.go.store(false, .seq_cst);
+    PauseGate.paused.store(false, .seq_cst);
+    PauseGate.go.store(false, .seq_cst);
+    test_acquire_side_pause = SideGate.pause;
+    defer test_acquire_side_pause = null;
+    defer test_acquire_pause = null;
+    const Req = struct {
+        live: *Live,
+        body: [16]u8 = undefined,
+        len: usize = 0,
+        fn go(q: *@This()) void {
+            const g = q.live.acquire();
+            defer q.live.release(g);
+            var buf: [4096]u8 = undefined;
+            var ctx: SnapshotCtx = .{ .snap = &g.snap };
+            const body = bodyOf(snapGet(&ctx, "/a.txt", "", &buf));
+            @memcpy(q.body[0..body.len], body);
+            q.len = body.len;
+        }
+    };
+    const edit = struct {
+        fn to(t: *testing.TmpDir, r: Dir, body: []const u8) !void {
+            try t.dir.writeFile(testing.io, .{ .sub_path = "a.next", .data = body });
+            try Dir.rename(t.dir, "a.next", r, "a.txt", testing.io);
+        }
+    };
+    var req: Req = .{ .live = &live };
+    const t = try std.Thread.spawn(.{}, Req.go, .{&req});
+    // 1. The request has read `side` and not counted itself yet: a whole
+    //    publish runs past it (nobody to wait for).
+    while (!SideGate.paused.load(.seq_cst)) std.Thread.yield() catch {};
+    try edit.to(&tmp, root, "v1");
+    try testing.expect(try live.reload(io));
+    // 2. It counts itself now -- on a side that is no longer current -- and
+    //    takes the current generation (v1) without a hold yet.
+    test_acquire_side_pause = null;
+    test_acquire_pause = PauseGate.pause;
+    SideGate.go.store(true, .seq_cst);
+    while (!PauseGate.paused.load(.seq_cst)) std.Thread.yield() catch {};
+    // 3. The next publish must wait for it, or it frees v1 under the request.
+    const Releaser = struct {
+        fn go() void {
+            std.Io.sleep(testing.io, .fromMilliseconds(150), .awake) catch {};
+            PauseGate.go.store(true, .seq_cst);
+        }
+    };
+    const rel = try std.Thread.spawn(.{}, Releaser.go, .{});
+    try edit.to(&tmp, root, "v2");
+    test_acquire_pause = null;
+    try testing.expect(try live.reload(io));
+    try testing.expect(PauseGate.go.load(.seq_cst));
+    rel.join();
+    t.join();
+    try testing.expectEqualStrings("v1", req.body[0..req.len]);
+    // The retry took back the count it had put on the stale side: a leaked one
+    // would make a later publish wait for it forever.
+    try testing.expectEqual(@as(u32, 0), live.readers[0].load(.seq_cst));
+    try testing.expectEqual(@as(u32, 0), live.readers[1].load(.seq_cst));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("v2", bodyOf(liveGet(&live, "/a.txt", &b)));
+}
+
+test "Snapshot: a file whose only sibling is the Brotli one is negotiated (every variant slot counts, not just the last)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "app.js", "console.log(1)" }, .{ "app.js.br", "BR-BYTES" } });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+
+    var b: [4096]u8 = undefined;
+    const br = snapGet(&ctx, "/app.js", "Accept-Encoding: br\r\n", &b);
+    try testing.expectEqual(@as(u16, 200), statusOf(br));
+    try testing.expectEqualStrings("br", headerOf(br, "content-encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", headerOf(br, "vary").?);
+    try testing.expectEqualStrings("BR-BYTES", bodyOf(br));
+    var b2: [4096]u8 = undefined;
+    const plain = snapGet(&ctx, "/app.js", "", &b2);
+    try testing.expectEqualStrings("Accept-Encoding", headerOf(plain, "vary").?);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(plain));
+}
+
+test "Live: a removed empty directory is a change (no file moved, none added)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    _ = try root.createDirPathOpen(io, "empty", .{});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+    var b: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 403), statusOf(liveGet(&live, "/empty/", &b)));
+    try root.deleteDir(io, "empty");
+    try testing.expect(try live.reload(io));
+    try testing.expectEqual(@as(u16, 404), statusOf(liveGet(&live, "/empty/", &b)));
+}
+
+test "Live: a file rewritten in place to another size, inode and mtime kept, is still seen (the size tells them apart)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "AAAA" }});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+    const old = try root.statFile(io, "a.txt", .{});
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "BBBBBB" }); // truncates and writes the same inode
+    const f = try root.openFile(io, "a.txt", .{ .mode = .read_write });
+    try f.setTimestamps(io, .{ .access_timestamp = .{ .new = old.mtime }, .modify_timestamp = .{ .new = old.mtime } });
+    f.close(io);
+    const now = try root.statFile(io, "a.txt", .{});
+    try testing.expectEqual(old.inode, now.inode);
+    try testing.expect(std.meta.eql(old.mtime, now.mtime));
+    try testing.expect(old.size != now.size);
+    try testing.expect(try live.reload(io));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("BBBBBB", bodyOf(liveGet(&live, "/a.txt", &b)));
+}
+
+test "Live: max_retired = 0 is read as 1 -- with nothing retired a change is still published" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "one" }});
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .max_retired = 0 });
+    defer live.deinit(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.next", .data = "two!" });
+    try Dir.rename(tmp.dir, "a.next", root, "a.txt", io);
+    try testing.expect(try live.reload(io));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("two!", bodyOf(liveGet(&live, "/a.txt", &b)));
+}
+
 test "Live observer: told unchanged, published (with the generation and fresh files), failed" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -4344,6 +4904,24 @@ test "fallback: an unknown extension-less path under an HTML Accept serves the f
     const via_dir = sendReq(&h_root, "GET", "/app/route", html_accept, &b6);
     try testing.expectEqual(@as(u16, 200), statusOf(via_dir));
     try testing.expectEqualStrings("<h1>home</h1>", bodyOf(via_dir));
+}
+
+test "fallback: its 404 to another Accept says Vary: Accept; text/html;q=0 is not a navigation (review 2026-10-24 L6, L10)" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var h = Handler.init(testing.io, f.root, .{ .fallback = "index.html" });
+    var b: [4096]u8 = undefined;
+    const json = sendReq(&h, "GET", "/app/route", "Accept: application/json\r\n", &b);
+    try testing.expectEqual(@as(u16, 404), statusOf(json));
+    try testing.expectEqualStrings("Accept", headerOf(json, "vary").?);
+    const refused = sendReq(&h, "GET", "/app/route", "Accept: text/html;q=0, */*\r\n", &b);
+    try testing.expectEqual(@as(u16, 404), statusOf(refused));
+    try testing.expectEqualStrings("Accept", headerOf(refused, "vary").?);
+    // The same answer to every Accept: no Vary.
+    try testing.expect(headerOf(sendReq(&h, "GET", "/missing.js", html_accept, &b), "vary") == null);
+    var h_off = Handler.init(testing.io, f.root, .{});
+    try testing.expect(headerOf(sendReq(&h_off, "GET", "/app/route", "", &b), "vary") == null);
+    try testing.expectEqual(@as(u16, 200), statusOf(sendReq(&h, "GET", "/app/route", "Accept: TEXT/HTML;q=0.1\r\n", &b)));
 }
 
 test "fallback: never for an extension, another method, another Accept, a refused path, an existing file, or a fallback that is not there" {

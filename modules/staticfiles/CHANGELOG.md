@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **SECURITY / Fix** (review 2026-10-24, grade-1 wave 6):
+  - **Open redirect:** the trailing-slash 301 copied the raw path, so `GET //docs` (a directory `docs`) answered `Location: //docs/` — a protocol-relative URL to the host `docs`. The leading `/` run is collapsed to one (`Handler` and `Snapshot`/`Live`).
+  - **Use-after-free in `Live`:** a request that read the reader side, stalled across one whole publish and only then counted itself was invisible to the next publisher, which freed the generation the request was about to hold. `acquire` re-reads the side after counting and retries.
+  - **FIFO hang:** a FIFO (or device/socket) in the root as the file, the index or a precompressed sibling blocked a connection thread in `open(2)` forever when nobody wrote to it. Non-regular names are now refused (403) by a `stat` before the open. The same `stat` answers a missing name (404) and a directory without the open, so the miss path is cheaper than before.
+  - **Smaller fixes:** a directory named like a variant (`app.js.br/`) is no longer served as one. The SPA fallback's 404 to a non-HTML `Accept` now carries `Vary: Accept`, and `text/html;q=0` no longer counts as a navigation. A failed `range.apply` answers a clean 500 instead of one carrying the representation headers.
+  - **Consumer-visible:** `SnapshotOptions.serve.fallback` set is `error.Unsupported` (it was ignored silently).
+- **2026-10-24** — **Added:** `LiveOptions.max_retired` (default 16) and `Outcome.held_back` (decided 2026-10-20 in the audit backlog). One slow download no longer pins an unbounded chain of generations. At the cap a rescan publishes nothing and the change waits for the release. **Consumer-visible:** a new `Outcome` variant, so an exhaustive `switch` on it needs a prong.
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** `tools/interop.zig` re-takes the Go oracle (`zig build interop-staticfiles [-- --check]`). `tools/rust_fast_bench` (tower-http 0.7.1 `ServeDir`) adds the fastest-in-the-field side to `bench-staticfiles`. Card: ref 0.11–0.55× Go 1.26.8, fastest ref.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: owner decisions on the audit 2026-10-19 open questions recorded (fix accepted, not yet done).
