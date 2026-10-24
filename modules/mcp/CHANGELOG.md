@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **SECURITY:** a tool whose input schema has `uniqueItems` could be crashed by a
+  client: the item equality test recursed without a depth bound (two equal 200k-deep arrays, under
+  1 MB, overflowed the stack) and its budget was charged per pair, not per node (1e9 compares inside
+  the budget). Now one budget step per node compared and a `depth` failure past `max_depth`; also
+  for `const`/`enum`.
+- **2026-10-24** — Review fixes: `prompts/get` read the catalog entry after the handler ran (a
+  handler that adds or removes prompts made it dangle); the template loop of `resources/read` kept
+  slices a template handler could free; `tools/call` with non-object `arguments` reached a tool with
+  no input schema (now -32602); `notifyListChanged` wrote its line in pieces; an escaped
+  `x-mcp-header` key skipped `header_annotations`. **BREAKING (error set):** `RequestCheckError` and
+  the `send*Request` errors gain `error.InvalidTemperature` (a non-finite temperature was written as
+  invalid JSON).
+- **2026-10-24** — `tools/list` writes each schema's canonical bytes computed once at `addTool`
+  (it re-parsed every schema on every list): 5× faster on a 20-tool list. `zig build bench-mcp`
+  also times rmcp 3.7.0 (`tools/rs_field`): 0.44× it. `tools/interop.zig` re-takes the Python SDK
+  oracle (`zig build interop-mcp [-- --check]`, `drive.py --check`). Card: grade 2 → 1.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-20** — Fixes from an independent review of today's S2 work.

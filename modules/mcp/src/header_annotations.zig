@@ -46,7 +46,10 @@ pub const max_chain = 32;
 /// annotation is not parsed at all; a schema that is not JSON is not judged
 /// here (`tools/list` already reports it).
 pub fn validate(gpa: std.mem.Allocator, input_schema: []const u8) Error!void {
-    if (std.mem.find(u8, input_schema, "x-mcp-header") == null) return;
+    // The cheap pre-check works on the raw text, so it must also let through
+    // any schema with an escape: `"x-mcp-header"` spelled with `\u` escapes
+    // is the same key once parsed, and skipped every rule (review 2026-10-24).
+    if (std.mem.find(u8, input_schema, "x-mcp-header") == null and std.mem.findScalar(u8, input_schema, '\\') == null) return;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -191,6 +194,13 @@ test "types: number, object, array, missing, a type list" {
         ,
         \\{"properties":{"a":{"type":["string","null"],"x-mcp-header":"A"}}}
     }) |c| try testing.expectError(error.HeaderAnnotationInvalidType, check(c));
+}
+
+test "an escaped key is still the annotation (review 2026-10-24)" {
+    // `\u0078` is `x`: the raw-text pre-check used to skip this schema.
+    try std.testing.expectError(error.HeaderAnnotationInvalidType, validate(std.testing.allocator,
+        \\{"type":"object","properties":{"a":{"\u0078-mcp-header":"X-A"}}}
+    ));
 }
 
 test "data keywords are not schemas" {

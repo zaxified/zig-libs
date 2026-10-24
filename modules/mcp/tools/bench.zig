@@ -43,6 +43,13 @@
 //! alternate for BENCH_ROUNDS (default 3) rounds, each keeping its best.
 //! Ratios are ours/reference by wall time (the Go side counts no cycles); the
 //! verdict is the WORST ratio. Arguments filter workloads.
+//!
+//! The fastest in the field is timed beside it: `tools/rs_field`, the official
+//! Rust SDK rmcp 3.7.0 (pinned with its Cargo.lock; `cargo build --release
+//! --offline`, `BENCH_FAST=0` skips it), over the same session bytes and with
+//! the same count. rmcp has no schema validation on this path, so its echo
+//! row validates nothing (see its header). The card's `fastest` figure is
+//! ours / min(Go, rmcp) per workload, worst over the workloads.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -53,6 +60,8 @@ const work_dir = ".zig-cache/bench-mcp";
 const go_dir = "modules/mcp/tools/go_bench";
 const ref_short = "ref";
 const ref_card = "modelcontextprotocol/go-sdk v1.8.0";
+const fast_rs_manifest = "modules/mcp/tools/rs_field/Cargo.toml";
+const fast_rs_exe = "modules/mcp/tools/rs_field/target/release/mcp_rs_field";
 
 const names = [_][]const u8{ "tools_call_echo", "tools_list_20", "resources_read", "prompts_get", "initialize_only" };
 const n_req = 64;
@@ -162,21 +171,27 @@ pub fn main(init: std.process.Init) !u8 {
     const d: Data = try setup(arena, io, dir);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_fast) rustBuild(arena, io) catch return 1;
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<18} {s:>12} {s:>12} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "/ref", "spr us", "spr ref" });
     try w.flush();
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
+    var rs_banner: []const u8 = "";
     for (names, 0..) |name, wi| {
         if (!bench.selected(name, filters)) continue;
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var rs: bench.Side = .{};
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (use_fast) rs.add(try bench.foreign(arena, io, bench_name, fast_rs_exe, abs, name, &rs_banner));
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const ratio = ours.best_ns / go.best_ns;
@@ -186,8 +201,16 @@ pub fn main(init: std.process.Init) !u8 {
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
         try w.print("{s:<18} {d:>12.0} {d:>12.0} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, ratio, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same) "" else " ≠ " ++ ref_short });
+        if (use_fast) {
+            const rs_same = rs.count == go.count;
+            mismatch = mismatch or !rs_same;
+            max_spread = @max(max_spread, rs.spread(false));
+            worst_fast = @max(worst_fast, ours.best_ns / @min(go.best_ns, rs.best_ns));
+            try w.print("{s:<18} {s:>12} {d:>12.0} {d:>8.3} {s:>7} {d:>6.1}%  rmcp{s}\n", .{ "", "", rs.best_ns, ours.best_ns / rs.best_ns, "", 100 * rs.spread(false), if (rs_same) "" else " ≠ " ++ ref_short });
+        }
         try w.flush();
     }
+    if (rs_banner.len > 0) try w.print("field: {s}\n", .{std.mem.trim(u8, rs_banner, " \n")});
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (mismatch) {
         try w.writeAll(bench_name ++ ": FAILED -- a result count differs from the reference's; the timing means nothing until it agrees\n");
@@ -195,8 +218,28 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_fast) try w.print("worst ours/fastest = {d:.2}\n", .{worst_fast});
+    if (filters.len == 0) {
+        if (use_fast)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× rmcp 3.7.0 (Rust) (measured <today>)\n", .{ best, worst, ref_card, worst_fast })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
+}
+
+/// `cargo build --release --offline` of tools/rs_field.
+fn rustBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips this side\n", .{ bench_name, e });
+        return error.CargoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CargoBuildFailed;
+    }
 }

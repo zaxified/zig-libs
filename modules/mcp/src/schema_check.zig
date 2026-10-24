@@ -367,8 +367,25 @@ fn numIsInteger(n: Num) bool {
     };
 }
 
+/// Why an equality test stopped without an answer.
+const EqlStop = error{
+    /// The step budget ran out (one step per node compared).
+    Budget,
+    /// Both values nest deeper than `max_depth`.
+    TooDeep,
+};
+
 /// JSON equality: numbers by value, objects regardless of member order.
-fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
+/// Charges one budget step per node pair and stops at `max_depth`: the
+/// values are the client's, and `uniqueItems` compares them with no schema
+/// bounding their depth or size. Unbounded, two equal-shaped 200k-deep
+/// arrays (under 1 MB on the wire) overflowed the stack, and 500 items of
+/// 10k elements cost 1e9 compares inside a budget charged per pair
+/// (review 2026-10-24).
+fn jsonEql(budget: *Budget, a: std.json.Value, b: std.json.Value, depth: u32) EqlStop!bool {
+    if (budget.left == 0) return error.Budget;
+    budget.left -= 1;
+    if (depth > max_depth) return error.TooDeep;
     if (toNum(a)) |x| {
         const y = toNum(b) orelse return false;
         return numOrder(x, y) == .eq;
@@ -379,7 +396,7 @@ fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
         .string => |x| return b == .string and std.mem.eql(u8, x, b.string),
         .array => |x| {
             if (b != .array or x.items.len != b.array.items.len) return false;
-            for (x.items, b.array.items) |p, q| if (!jsonEql(p, q)) return false;
+            for (x.items, b.array.items) |p, q| if (!try jsonEql(budget, p, q, depth + 1)) return false;
             return true;
         },
         .object => |x| {
@@ -387,7 +404,7 @@ fn jsonEql(a: std.json.Value, b: std.json.Value) bool {
             var it = x.iterator();
             while (it.next()) |e| {
                 const other = b.object.get(e.key_ptr.*) orelse return false;
-                if (!jsonEql(e.value_ptr.*, other)) return false;
+                if (!try jsonEql(budget, e.value_ptr.*, other, depth + 1)) return false;
             }
             return true;
         },
@@ -468,6 +485,15 @@ const Checker = struct {
         return null;
     }
 
+    /// `jsonEql` under this check's budget; a stop is the failure it reports.
+    fn eql(c: Checker, a: std.json.Value, b: std.json.Value, path: ?*const Path, depth: u32) error{OutOfMemory}!union(enum) { same: bool, failure: Failure } {
+        const same = jsonEql(c.budget, a, b, depth) catch |e| return .{ .failure = switch (e) {
+            error.Budget => (try c.spend(1, path)).?,
+            error.TooDeep => (try c.fail(path, "depth", "nesting deeper than {d} levels", .{@as(u32, max_depth)})).?,
+        } };
+        return .{ .same = same };
+    }
+
     fn apply(c: Checker, schema: std.json.Value, inst: std.json.Value, path: ?*const Path, depth: u32, refs: u32) error{OutOfMemory}!?Failure {
         if (try c.spend(1, path)) |f| return f;
         if (depth > max_depth) return c.fail(path, "depth", "nesting deeper than {d} levels", .{@as(u32, max_depth)});
@@ -504,15 +530,21 @@ const Checker = struct {
         if (o.get("enum")) |e| {
             if (e == .array) {
                 var found = false;
-                for (e.array.items) |x| if (jsonEql(x, inst)) {
-                    found = true;
-                    break;
+                for (e.array.items) |x| switch (try c.eql(x, inst, path, depth)) {
+                    .failure => |f| return f,
+                    .same => |same| if (same) {
+                        found = true;
+                        break;
+                    },
                 };
                 if (!found) return c.fail(path, "enum", "value is not one of the allowed values", .{});
             }
         }
         if (o.get("const")) |k| {
-            if (!jsonEql(k, inst)) return c.fail(path, "const", "value does not equal the required constant", .{});
+            switch (try c.eql(k, inst, path, depth)) {
+                .failure => |f| return f,
+                .same => |same| if (!same) return c.fail(path, "const", "value does not equal the required constant", .{}),
+            }
         }
         if (toNum(inst)) |n| {
             if (try c.numeric(o, n, path)) |f| return f;
@@ -573,9 +605,10 @@ const Checker = struct {
                 // array of a million items ends in the budget, not a hang.
                 if (try c.spend(i, path)) |f| return f;
                 for (items[0..i]) |b| {
-                    if (jsonEql(a, b)) {
-                        const here: Path = .{ .parent = path, .seg = .{ .index = i } };
-                        return c.fail(&here, "uniqueItems", "item is a duplicate of an earlier item", .{});
+                    const here: Path = .{ .parent = path, .seg = .{ .index = i } };
+                    switch (try c.eql(a, b, &here, depth + 1)) {
+                        .failure => |f| return f,
+                        .same => |same| if (same) return c.fail(&here, "uniqueItems", "item is a duplicate of an earlier item", .{}),
                     }
                 }
             }
@@ -946,6 +979,47 @@ test "uniqueItems: a long array spends the budget instead of hanging (review 202
     // A short one is checked in full.
     const small = try std.json.parseFromSliceLeaky(std.json.Value, a, "[1,2,3,2]", .{});
     try testing.expectEqualStrings("uniqueItems", (try s.validate(a, small)).?.keyword);
+}
+
+test "uniqueItems over deep or large items: a failure, never a stack overflow or 1e9 compares (review 2026-10-24)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const sv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"uniqueItems\":true}", .{});
+    const s = try Schema.compile(a, sv);
+
+    // Two equal-shaped 200k-deep arrays: std.json builds them iteratively; the
+    // equality test used to recurse once per level.
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.append(a, '[');
+    for (0..2) |k| {
+        if (k > 0) try deep.append(a, ',');
+        try deep.appendNTimes(a, '[', 200_000);
+        try deep.appendNTimes(a, ']', 200_000);
+    }
+    try deep.append(a, ']');
+    const dv = try std.json.parseFromSliceLeaky(std.json.Value, a, deep.items, .{});
+    try testing.expectEqualStrings("depth", (try s.validate(a, dv)).?.keyword);
+
+    // 300 items of 5000 elements differing only in the last: the budget was
+    // charged per pair, not per element compared.
+    var wide: std.ArrayList(u8) = .empty;
+    try wide.append(a, '[');
+    for (0..300) |k| {
+        if (k > 0) try wide.append(a, ',');
+        try wide.append(a, '[');
+        for (0..4999) |_| try wide.appendSlice(a, "1,");
+        try wide.print(a, "{d}]", .{k});
+    }
+    try wide.append(a, ']');
+    const wv = try std.json.parseFromSliceLeaky(std.json.Value, a, wide.items, .{});
+    try testing.expectEqualStrings("budget", (try s.validate(a, wv)).?.keyword);
+
+    // `const`/`enum` share the bound.
+    const cv = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"const\":[[[1]]]}", .{});
+    const cs = try Schema.compile(a, cv);
+    try testing.expect((try cs.validate(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "[[[1]]]", .{}))) == null);
+    try testing.expectEqualStrings("const", (try cs.validate(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "[[[2]]]", .{}))).?.keyword);
 }
 
 test "deeply nested instance is a failure, not a stack overflow" {

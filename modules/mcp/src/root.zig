@@ -1517,6 +1517,7 @@ pub const SendError = error{
     NoMessages,
     InvalidMaxTokens,
     InvalidPriority,
+    InvalidTemperature,
     InvalidUrl,
     EmptyMessage,
     MissingElicitationId,
@@ -1825,6 +1826,7 @@ pub const RequestCheckError = error{
     NoMessages,
     InvalidMaxTokens,
     InvalidPriority,
+    InvalidTemperature,
     InvalidUrl,
     EmptyMessage,
     MissingElicitationId,
@@ -1840,6 +1842,10 @@ fn checkSamplingRequest(caps: ClientCapabilities, req: SamplingRequest) RequestC
             if (!(p >= 0.0) or !(p <= 1.0)) return error.InvalidPriority; // NaN too
         }
     }
+    // `std.json.Stringify` writes +-inf bare (`inf`, not JSON) and NaN as a
+    // string: either way the request line is not what the client expects
+    // (review 2026-10-24).
+    if (req.temperature) |t| if (!std.math.isFinite(t)) return error.InvalidTemperature;
 }
 
 fn checkElicitationRequest(arena: std.mem.Allocator, caps: ClientCapabilities, req: ElicitationRequest) RequestCheckError!void {
@@ -2287,6 +2293,13 @@ const ToolCheck = struct {
     arena: *std.heap.ArenaAllocator,
     input: ?schema_check.Schema,
     output: ?schema_check.Schema,
+    /// The schemas as `tools/list` writes them -- the literal parsed and
+    /// re-serialized -- computed once here instead of on every list (that
+    /// re-parse was 95 % of a 20-tool `tools/list`, 2026-10-24). Null when the
+    /// literal is not JSON: `buildToolsList` then parses it as before and
+    /// fails where it always did.
+    input_json: ?[]const u8,
+    output_json: ?[]const u8,
 
     fn init(gpa: std.mem.Allocator, tool: Tool) error{OutOfMemory}!ToolCheck {
         const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -2299,7 +2312,19 @@ const ToolCheck = struct {
             .arena = arena,
             .input = try compileText(arena.allocator(), tool.input_schema),
             .output = try compileText(arena.allocator(), tool.output_schema),
+            .input_json = try canonicalText(arena.allocator(), tool.input_schema),
+            .output_json = try canonicalText(arena.allocator(), tool.output_schema),
         };
+    }
+
+    /// `writeRawJson`'s bytes for `text`, or null when `text` is empty or not JSON.
+    fn canonicalText(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]const u8 {
+        if (text.len == 0) return null;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        return try std.json.Stringify.valueAlloc(arena, v, .{});
     }
 
     fn deinit(self: ToolCheck, gpa: std.mem.Allocator) void {
@@ -4604,7 +4629,12 @@ pub const Server = struct {
         for (self.peers.items) |p| {
             if (!p.initialized) continue;
             const w = sink.writerFor(sink.ctx, p.peer) orelse continue;
-            w.print("{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\"}}\n", .{method}) catch continue;
+            // One write of the whole line, as `notifyResourceUpdated` does: a
+            // failure between pieces of a `print` left a fragment ahead of
+            // the next message (review 2026-10-24).
+            var line_buf: [128]u8 = undefined;
+            const line = std.mem.print(&line_buf, "{{\"jsonrpc\":\"2.0\",\"method\":\"{s}\"}}\n", .{method}) catch unreachable;
+            w.writeAll(line) catch continue;
             w.flush() catch continue;
             sent += 1;
         }
@@ -4862,7 +4892,7 @@ pub const Server = struct {
     fn buildToolsList(self: *const Server, arena: std.mem.Allocator, jw: *std.json.Stringify, start: usize, end: usize) !void {
         try jw.objectField("tools");
         try jw.beginArray();
-        for (self.tools.items[start..end]) |t| {
+        for (self.tools.items[start..end], self.tool_checks.items[start..end]) |t, check| {
             try jw.beginObject();
             try jw.objectField("name");
             try jw.write(t.name);
@@ -4870,10 +4900,10 @@ pub const Server = struct {
             try jw.objectField("description");
             try jw.write(t.description);
             try jw.objectField("inputSchema");
-            try writeRawJson(arena, jw, t.input_schema);
+            if (check.input_json) |j| try jw.print("{s}", .{j}) else try writeRawJson(arena, jw, t.input_schema);
             if (t.output_schema.len != 0) {
                 try jw.objectField("outputSchema");
-                try writeRawJson(arena, jw, t.output_schema);
+                if (check.output_json) |j| try jw.print("{s}", .{j}) else try writeRawJson(arena, jw, t.output_schema);
             }
             if (t.annotations) |a| try writeToolAnnotations(jw, a);
             try writeMetaField(arena, jw, t.meta_json);
@@ -4956,6 +4986,10 @@ pub const Server = struct {
         const check = &self.tool_checks.items[tool_index];
 
         const args: std.json.Value = params.object.get("arguments") orelse .null;
+        // `arguments` is an object in every schema revision. Anything else
+        // reached a tool with no compiled input schema as `args`, where
+        // `lookupArg` reads every argument as absent (review 2026-10-24).
+        if (args != .null and args != .object) return sendError(arena, out, id, error_code.invalid_params, "Invalid arguments");
 
         // The SDKs' convention (TS `tools.md` "Send arguments the schema
         // rejects"): arguments that fail `inputSchema` never reach the handler,
@@ -5124,7 +5158,13 @@ pub const Server = struct {
         };
         const found = blk: {
             if (self.findResource(req.uri)) |r| break :blk r.handler(r.ctx, &req);
-            for (self.resource_templates.items, self.template_parsed.items) |*t, parsed| {
+            // Indexed, re-read every round: a template handler may add or
+            // remove templates, and slices captured once would then be freed
+            // or shifted under the loop (review 2026-10-24).
+            var k: usize = 0;
+            while (k < self.resource_templates.items.len) : (k += 1) {
+                const t = self.resource_templates.items[k];
+                const parsed = self.template_parsed.items[k];
                 const handler = t.handler orelse continue;
                 req.vars = if (parsed) |pt| try pt.match(arena, req.uri) else null;
                 if (handler(t.ctx, &req) or req.protocol_error != null) break :blk true;
@@ -5241,7 +5281,13 @@ pub const Server = struct {
             .modern = modern_req,
             .meta = req_meta,
         };
-        const ok = prompt.handler(prompt.ctx, &req);
+        // A copy, taken before the handler runs: `prompt` points into
+        // `self.prompts`, which a handler that calls `addPrompt` (reallocates)
+        // or `removePrompt` (shifts) invalidates -- the use-after-free the
+        // tools path already guards against (review 2026-10-24). The slices
+        // inside are the application's and outlive the server.
+        const entry = prompt.*;
+        const ok = entry.handler(entry.ctx, &req);
         if (req.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (req.input.inputRequired()) return self.sendInputRequired(arena, out, id, &req.input);
         if (!ok) {
@@ -5250,7 +5296,7 @@ pub const Server = struct {
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
-        buildPromptResult(&jw, prompt, &req, &self.info, modern) catch return error.OutOfMemory;
+        buildPromptResult(&jw, &entry, &req, &self.info, modern) catch return error.OutOfMemory;
         try sendResultRaw(arena, out, id, aw.written());
     }
 
@@ -6150,6 +6196,41 @@ fn searchTool(_: ?*anyopaque, call: *ToolCall) bool {
     return false;
 }
 
+test "tools/call: session output must be an object; output past the step budget passes unchecked (mutation 2026-10-24)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{
+        .name = "search",
+        .description = "",
+        .input_schema = "{\"type\":\"object\",\"properties\":{\"out\":{\"type\":\"string\"}}}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"xs\":{\"type\":\"array\",\"uniqueItems\":true}}}",
+        .handler = searchTool,
+    });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"out":"[1]"}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"Output validation error: the tool declares an outputSchema but its output is not a JSON object"}],"isError":true}}
+        \\
+    );
+    // 3000 items are 4.5e6 pairwise compares, past the 1e6 budget: the
+    // server's own output is not refused for being too big to check (M4).
+    var big: std.ArrayList(u8) = .empty;
+    defer big.deinit(testing.allocator);
+    try big.appendSlice(testing.allocator, "{\"xs\":[");
+    for (0..3000) |k| try big.print(testing.allocator, "{s}{d}", .{ if (k == 0) "" else ",", k });
+    try big.appendSlice(testing.allocator, "]}");
+    var esc: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer esc.deinit();
+    try std.json.Stringify.value(big.items, .{}, &esc.writer);
+    const line = try std.fmt.allocPrint(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"search\",\"arguments\":{{\"out\":{s}}}}}}}", .{esc.written()});
+    defer testing.allocator.free(line);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(line, &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"isError\":false") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "structuredContent") != null);
+}
+
 test "tools/call: arguments and structured output are checked against the tool's schemas" {
     var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
     defer s.deinit();
@@ -6518,6 +6599,23 @@ const TestSink = struct {
     }
 };
 
+test "push: subscription limits -- a listen id over 128 bytes, a subscribe uri over the cap (mutation 2026-10-24)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.push = true;
+    const long_id: [130]u8 = @splat('i');
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":\"" ++ long_id ++ "\",\"method\":\"subscriptions/listen\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientInfo\":{\"name\":\"c\",\"version\":\"1\"},\"io.modelcontextprotocol/clientCapabilities\":{}},\"notifications\":{}}}", "{\"jsonrpc\":\"2.0\",\"id\":\"" ++ long_id ++ "\",\"error\":{\"code\":-32602,\"message\":\"Request id too long for a subscription\"}}\n");
+    const long_uri: [max_subscription_uri_len + 1]u8 = @splat('u');
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ long_uri ++ "\"}}",
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Subscription uri too long"}}
+        \\
+    );
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ long_uri[1..] ++ "\"}}",
+        \\{"jsonrpc":"2.0","id":2,"result":{}}
+        \\
+    );
+}
+
 test "push: session list_changed + resources/subscribe, byte-identical to the spec's examples" {
     var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
     defer s.deinit();
@@ -6685,6 +6783,67 @@ fn pageTool(_: ?*anyopaque, _: *ToolCall) bool {
     return false;
 }
 
+fn growingPrompt(_: ?*anyopaque, req: *PromptRequest) bool {
+    const server = req.server.?;
+    _ = server.removePrompt("grow");
+    inline for (.{ "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9" }) |n| {
+        server.addPrompt(.{ .name = n, .handler = imagePrompt }) catch {};
+    }
+    req.message(.user, "hi");
+    return true;
+}
+
+test "dynamic catalog: a prompt that changes the catalog mid-get answers from a copy (review 2026-10-24)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addPrompt(.{ .name = "grow", .description = "Grows the catalog.", .handler = growingPrompt });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"grow"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"result":{"description":"Grows the catalog.","messages":[{"role":"user","content":{"type":"text","text":"hi"}}]}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 9), s.prompts.items.len);
+}
+
+fn growingTemplate(_: ?*anyopaque, req: *ResourceRequest) bool {
+    const server = req.server.?;
+    inline for (.{ "t://g1/{x}", "t://g2/{x}", "t://g3/{x}", "t://g4/{x}", "t://g5/{x}", "t://g6/{x}", "t://g7/{x}", "t://g8/{x}", "t://g9/{x}" }) |u| {
+        server.addResourceTemplate(.{ .uri_template = u, .name = "g", .handler = decliningTemplate }) catch {};
+    }
+    return false;
+}
+
+fn decliningTemplate(_: ?*anyopaque, _: *ResourceRequest) bool {
+    return false;
+}
+
+test "dynamic catalog: a template handler that grows the catalog mid-read (review 2026-10-24)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addResourceTemplate(.{ .uri_template = "t://a/{x}", .name = "a", .handler = growingTemplate });
+    try s.addResourceTemplate(.{ .uri_template = "t://b/{x}", .name = "b", .handler = decliningTemplate });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"t://c/1"}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32002,"message":"Resource not found"}}
+        \\
+    );
+    try testing.expectEqual(@as(usize, 11), s.resource_templates.items.len);
+}
+
+test "tools/call: arguments that are not an object are -32602 (review 2026-10-24)" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "p", .description = "", .input_schema = "", .handler = pageTool });
+    inline for (.{ "\"x\"", "[1]", "5", "true" }) |bad| {
+        try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"p\",\"arguments\":" ++ bad ++ "}}",
+            \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid arguments"}}
+            \\
+        );
+    }
+}
+
 test "pagination: page_size pages the list, nextCursor until the last page, then none" {
     var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
     defer s.deinit();
@@ -6708,6 +6867,13 @@ test "pagination: page_size pages the list, nextCursor until the last page, then
         \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"cursor":"dDo0"}}
     ,
         \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"e","description":"","inputSchema":{}}]}}
+        \\
+    );
+    // One past the end is not a position this server minted (mutation 2026-10-24).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{"cursor":"dDo2"}}
+    ,
+        \\{"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"Invalid cursor"}}
         \\
     );
     // The end position itself is a valid (empty) page; a null cursor is none.
@@ -7370,6 +7536,23 @@ test "prompts/get: renders messages with arguments substituted + ctx threading" 
     try testing.expectEqual(@as(u32, 2), lib.gets);
 }
 
+test "lead: prompts/get without a required argument is -32602, the handler never runs" {
+    // The card's `**Ahead:**` line. prompts.mdx "Error Handling": servers
+    // SHOULD answer "Missing required arguments" with -32602. The Go SDK
+    // v1.8.0 calls the handler with the argument absent and returns what it
+    // renders ("Hello, !"; probe `tools/go_lead`, 2026-10-24).
+    var lib = TestLibrary{};
+    var s = try libraryServer(&lib);
+    defer s.deinit();
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"prompts/get","params":{"name":"greet","arguments":{}}}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Missing required argument"}}
+        \\
+    );
+    try testing.expectEqual(@as(u32, 0), lib.gets);
+}
+
 test "prompts/get: validation errors -> -32602; handler failure -> -32603" {
     var lib = TestLibrary{};
     var s = try libraryServer(&lib);
@@ -7960,6 +8143,22 @@ test "sampling: refused unless the client declared the capability" {
     _ = try ok.sendSamplingRequest(&sink.writer, req, .{});
     try testing.expect(sink.written().len != 0);
     try testing.expectEqual(@as(usize, 1), ok.pendingCount());
+}
+
+test "sampling: a non-finite temperature is refused, not written as invalid JSON (review 2026-10-24)" {
+    var sink: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer sink.deinit();
+    var s = try serverWithCaps("{\"sampling\":{}}");
+    defer s.deinit();
+    for ([_]f64{ std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64) }) |t| {
+        const req = SamplingRequest{
+            .messages = &.{.{ .role = .user, .content = .{ .text = "hi" } }},
+            .max_tokens = 100,
+            .temperature = t,
+        };
+        try testing.expectError(error.InvalidTemperature, s.sendSamplingRequest(&sink.writer, req, .{}));
+    }
+    try testing.expectEqualStrings("", sink.written());
 }
 
 test "sampling: request line is byte-identical to the spec's createMessage example" {

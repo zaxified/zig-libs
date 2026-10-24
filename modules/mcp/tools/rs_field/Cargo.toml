@@ -1,0 +1,20 @@
+[package]
+name = "mcp_rs_field"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-mcp`
+# (modules/mcp/tools/bench.zig): the official Rust MCP SDK, rmcp, pinned
+# exactly, with only the server core and the async byte-stream transport.
+[dependencies]
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-async-rw"] }
+tokio = { version = "=1.54.1", features = ["rt", "rt-multi-thread", "io-util", "sync", "time"] }
+serde_json = "=1.0.154"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]
