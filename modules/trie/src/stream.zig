@@ -304,6 +304,11 @@ pub const SortedBuilder = struct {
         return p;
     }
 
+    /// Bytes a version-3 child distance of `far` takes: the fewest that hold it.
+    fn distanceWidth(far: u32) usize {
+        return if (far < 1 << 8) 1 else if (far < 1 << 16) 2 else if (far < 1 << 24) 3 else 4;
+    }
+
     /// `h` as a version-3 node into `scratch`; returns its length.
     fn encodeV3(self: *SortedBuilder, h: *const Held, best: u32, offset: u32) Error!usize {
         const b = &self.scratch;
@@ -312,7 +317,7 @@ pub const SortedBuilder = struct {
         // Children are written first, so every distance is ≥ 1.
         var far: u32 = 0;
         for (h.edges.items) |e| far = @max(far, offset - e.offset);
-        const width: usize = if (far < 1 << 8) 1 else if (far < 1 << 16) 2 else if (far < 1 << 24) 3 else 4;
+        const width = distanceWidth(far);
         // Version 3 node: flags, tail_len, [edge_count - 1, labels], tail,
         // [value], [best, child offsets, [befores]] (format.zig).
         b[p] = (if (h.terminal) format.terminal_bit else 0) |
@@ -495,6 +500,21 @@ test "golden: the exact v3 bytes for a, ab, acx, acy" {
     try testing.expectEqual(@as(u32, 56), std.mem.readInt(u32, foot[4..8], .little)); // root last
     try testing.expectEqual(@as(u64, 4), std.mem.readInt(u64, foot[8..16], .little));
     try testing.expectEqual(std.hash.Crc32.hash(&region), std.mem.readInt(u32, foot[16..20], .little));
+}
+
+test "v3: a child distance takes the fewest bytes that hold it, at every width boundary" {
+    // Mutation 2026-10-24: `<=` at the 2^16 boundary and width 4 where 3 does
+    // survived the index tests -- a too-wide distance is still a valid index,
+    // and no test trie reaches 64 KiB back.
+    const w = SortedBuilder.distanceWidth;
+    try testing.expectEqual(@as(usize, 1), w(1));
+    try testing.expectEqual(@as(usize, 1), w(0xff));
+    try testing.expectEqual(@as(usize, 2), w(0x100));
+    try testing.expectEqual(@as(usize, 2), w(0xffff));
+    try testing.expectEqual(@as(usize, 3), w(0x1_0000));
+    try testing.expectEqual(@as(usize, 3), w(0xff_ffff));
+    try testing.expectEqual(@as(usize, 4), w(0x100_0000));
+    try testing.expectEqual(@as(usize, 4), w(std.math.maxInt(u32)));
 }
 
 test "v3: a child distance wider than one byte" {

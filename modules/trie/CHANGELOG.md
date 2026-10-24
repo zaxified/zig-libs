@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** mutation audit of the format-version-3 code (38/38); the v3 writer's distance width is now the pure `distanceWidth` (same choice), tests for it at every boundary and for tails differing only in their first or last byte.
+
 - **2026-10-24** — **Format:** the writer's default is frozen format **version 3**: version 2
   with each node's edge count and labels ahead of its tail and value, and its children as
   1–4-byte distances back from the node (width in node flag bits 2–3) instead of `u32`

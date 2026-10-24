@@ -1468,6 +1468,27 @@ test "rootNode refuses a v2 root carrying a tail" {
     try testing.expectEqual(@as(?u32, 7), try g.lookup(""));
 }
 
+test "v3 lookup: a tail that differs from the key in its first or last byte only is a miss, at every tail length" {
+    // Mutation 2026-10-24: `eqlShort` comparing only the first word of a 4..16
+    // byte tail survived every other test (their tails differ early).
+    var key: [24]u8 = undefined;
+    var probe: [24]u8 = undefined;
+    for (1..24) |len| {
+        for (key[0..len], 0..) |*c, j| c.* = 'a' + @as(u8, @intCast(j % 26));
+        const pairs = [_]builder.Pair{ .{ .key = key[0..len], .value = 7 }, .{ .key = "z", .value = 9 } };
+        const buf = try buildWith(&pairs, .{ .v2 = .{} });
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        try testing.expectEqual(@as(?u32, 7), try f.lookup(key[0..len]));
+        for ([_]usize{ 1, len - 1 }) |at| { // first tail byte (after the edge label), last byte
+            if (at == 0 or at >= len) continue;
+            @memcpy(probe[0..len], key[0..len]);
+            probe[at] ^= 0x20;
+            try testing.expectEqual(@as(?u32, null), try f.lookup(probe[0..len]));
+        }
+    }
+}
+
 test "v3 lookup agrees with the shared decoder walk on every damaged buffer" {
     // `lookupV3` repeats `format.nodeAtV3`'s checks in its own loop; a check
     // it dropped, reordered or got wrong shows up here as a different answer
