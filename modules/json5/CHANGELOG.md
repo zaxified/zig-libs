@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — The test-build counter `direct_taken` is private; read it with the new `directTaken()`. A `pub var` broke `check-testonly` (its probe walks every public declaration at comptime). No behaviour change; the audit's source hash is carried over this visibility change.
+
 - **2026-10-24** — `parseFromSlice(std.json.Value, ...)` is 1.7× faster: a single-pass reader takes the
   documents it is sure of straight into the `Value` and hands every other one (all errors among them)
   to the unchanged two-stage path, so values and errors are what they were (differential fuzz + every

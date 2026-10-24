@@ -194,9 +194,9 @@ pub fn valueEql(a: std.json.Value, b: std.json.Value) bool {
 /// error, whether or not the single-pass reader takes the document: a
 /// `diagnostic` always sends it down the two-stage path, which is the oracle.
 pub fn checkDirect(gpa: std.mem.Allocator, text: []const u8, opts: json5.ParseOptions) !void {
-    const before = json5.direct_taken.load(.monotonic);
+    const before = json5.directTaken();
     const got = json5.parseFromSlice(std.json.Value, gpa, text, opts);
-    const took = json5.direct_taken.load(.monotonic) != before;
+    const took = json5.directTaken() != before;
     defer if (got) |p| p.deinit() else |_| {};
     var d: json5.Diagnostic = .{};
     var slow_opts = opts;

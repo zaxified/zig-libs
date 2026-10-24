@@ -218,8 +218,15 @@ fn parseValueDirect(alloc: std.mem.Allocator, input: []const u8, opts: ParseOpti
 
 /// Test builds only: how many documents `parseValueDirect` has taken, so the
 /// differential harness can tell its two paths apart. Always 0 otherwise.
-/// Atomic: a consumer's test binary may parse from several threads.
-pub var direct_taken: std.atomic.Value(usize) = .init(0);
+/// Atomic: a consumer's test binary may parse from several threads. Private
+/// behind `directTaken`: a `pub var` is not a comptime-known declaration, and
+/// `check-testonly`'s probe walks every public one (red 2026-10-24).
+var direct_taken: std.atomic.Value(usize) = .init(0);
+
+/// See `direct_taken`.
+pub fn directTaken() usize {
+    return direct_taken.load(.monotonic);
+}
 
 /// The single-pass reader behind `parseValueDirect`: JSON5 source straight
 /// into a `std.json.Value`, built exactly as `preprocessWithOptions` followed
@@ -2991,15 +2998,15 @@ test "single-pass reader: takes the common JSON5 shapes, and nothing with a diag
         "[[[], {}], [{a: [{}]}]]",
     };
     for (docs) |doc| {
-        const before = direct_taken.load(.monotonic);
+        const before = directTaken();
         try fz.checkDirect(gpa, doc, .{});
-        try std.testing.expect(direct_taken.load(.monotonic) == before + 1);
+        try std.testing.expect(directTaken() == before + 1);
     }
     var d: Diagnostic = .{};
-    const before = direct_taken.load(.monotonic);
+    const before = directTaken();
     const p = try parseFromSlice(std.json.Value, gpa, docs[0], .{ .diagnostic = &d });
     p.deinit();
-    try std.testing.expectEqual(before, direct_taken.load(.monotonic));
+    try std.testing.expectEqual(before, directTaken());
 }
 
 test "single-pass reader: max_value_len, parse_numbers and duplicate keys as std.json has them" {
