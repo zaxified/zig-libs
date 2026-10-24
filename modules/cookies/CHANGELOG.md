@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Faster `SetCookie.write`** (847 → 529–540 ns for the bench's 8 specs, 1.59× →
+  1.11–1.13× valyala/fasthttp): the line is filled in place in the writer's buffer when an upper
+  bound of it fits (else written part by part, as before), validation runs in its own out-of-line
+  function, and name, value and Path are checked 16 bytes at a time. Same accepts, refusals and
+  bytes; nothing is written on a `WriteError`. Tests: every byte at every position of 15–33-byte
+  fields, every buffer size around the line, a writer already holding bytes. **Card: grade 1**
+  (P1): Sonnet review (no HIGH/MED; its two test gaps closed), 18 mutants of the new code all killed.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the all-module `strRepeat` rewrite (`571bf09e`) is reverted here: this module's calls are small (seconds of Sema at most), and the change would have made its fresh audit's `src` hash stale for nothing.
 
 - **2026-10-23** — valyala/fasthttp 1.76.0 joins the fastest-in-the-field figure (its go-brrr

@@ -196,6 +196,115 @@ pub const SetCookie = struct {
     /// the caller's writer propagate as `std.Io.Writer.Error` (WriteFailed).
     pub fn write(sc: SetCookie, w: *std.Io.Writer) (WriteError || std.Io.Writer.Error)!void {
         // 1. Validate before writing any bytes.
+        try sc.check();
+
+        // 2. Write: name=value, then attributes in RFC 6265 §4.1 order.
+        var digits: [20]u8 = undefined;
+        var di: usize = digits.len;
+        if (sc.max_age) |a| {
+            // Not `w.print`: the generic formatter was a measurable part of a
+            // whole `write` (bench-cookies `build`, 2026-10-23).
+            var m: u64 = @abs(a);
+            while (true) {
+                di -= 1;
+                digits[di] = '0' + @as(u8, @intCast(m % 10));
+                m /= 10;
+                if (m == 0) break;
+            }
+            if (a < 0) {
+                di -= 1;
+                digits[di] = '-';
+            }
+        }
+        // An upper bound, one add per field: the exact sum over the optional
+        // parts came out as a vectorized bit-unpacking block costing more
+        // than the copies (bench-cookies `build`, 2026-10-24).
+        const bound = sc.name.len + sc.value.len + optLen(sc.path) + optLen(sc.domain) +
+            optLen(sc.expires) + digits.len + max_attribute_text;
+        if (w.unusedCapacityLen() < bound) return sc.writeParts(w, digits[di..]);
+        // The line fits the writer's buffer: fill it in place, one copy per
+        // part, instead of a `writeAll` call per part (half of a `write`,
+        // bench-cookies `build`, 2026-10-24).
+        const out = w.unusedCapacitySlice();
+        var i: usize = 0;
+        put(out, &i, sc.name);
+        put(out, &i, "=");
+        put(out, &i, sc.value);
+        if (sc.path) |p| {
+            put(out, &i, "; Path=");
+            put(out, &i, p);
+        }
+        if (sc.domain) |d| {
+            put(out, &i, "; Domain=");
+            put(out, &i, d);
+        }
+        if (sc.max_age != null) {
+            put(out, &i, "; Max-Age=");
+            put(out, &i, digits[di..]);
+        }
+        if (sc.expires) |e| {
+            put(out, &i, "; Expires=");
+            put(out, &i, e);
+        }
+        if (sc.secure) put(out, &i, "; Secure");
+        if (sc.http_only) put(out, &i, "; HttpOnly");
+        if (sc.same_site) |ss| {
+            put(out, &i, "; SameSite=");
+            put(out, &i, ss.token());
+        }
+        w.advance(i);
+    }
+
+    /// Every byte `write` adds around the fields: `=`, the attribute names,
+    /// `Secure`, `HttpOnly` and the longest `SameSite` token.
+    const max_attribute_text = "=".len + "; Path=".len + "; Domain=".len + "; Max-Age=".len +
+        "; Expires=".len + "; Secure".len + "; HttpOnly".len + "; SameSite=Strict".len;
+
+    fn optLen(s: ?[]const u8) usize {
+        return if (s) |x| x.len else 0;
+    }
+
+    inline fn put(out: []u8, i: *usize, s: []const u8) void {
+        @memcpy(out[i.*..][0..s.len], s);
+        i.* += s.len;
+    }
+
+    /// `write`'s path when the line may not fit the writer's buffer: part by
+    /// part through the writer. Out of line so it does not bloat the fast
+    /// path (inlined beside it, it tripled the loop's code, 2026-10-24).
+    noinline fn writeParts(sc: SetCookie, w: *std.Io.Writer, max_age: []const u8) std.Io.Writer.Error!void {
+        try w.writeAll(sc.name);
+        try w.writeByte('=');
+        try w.writeAll(sc.value);
+        if (sc.path) |p| {
+            try w.writeAll("; Path=");
+            try w.writeAll(p);
+        }
+        if (sc.domain) |d| {
+            try w.writeAll("; Domain=");
+            try w.writeAll(d);
+        }
+        if (sc.max_age != null) {
+            try w.writeAll("; Max-Age=");
+            try w.writeAll(max_age);
+        }
+        if (sc.expires) |e| {
+            try w.writeAll("; Expires=");
+            try w.writeAll(e);
+        }
+        if (sc.secure) try w.writeAll("; Secure");
+        if (sc.http_only) try w.writeAll("; HttpOnly");
+        if (sc.same_site) |ss| {
+            try w.writeAll("; SameSite=");
+            try w.writeAll(ss.token());
+        }
+    }
+
+    /// Everything `write` refuses. Out of line: inlined into `write`, LLVM
+    /// merged the attribute checks with the copies into a vectorized block
+    /// that unpacked a mask bit by bit, a fifth of a whole `write`
+    /// (bench-cookies `build`, 2026-10-24).
+    noinline fn check(sc: SetCookie) WriteError!void {
         //
         // ⛔ Anchored on headless Chrome + Go's net/http
         // (`setcookie_oracle_test.zig`, 2026-10-06), which found the writer
@@ -209,7 +318,7 @@ pub const SetCookie = struct {
         // without regard to case. A quoted value (`"x"`), which the grammar
         // allows, was refused.
         if (sc.name.len == 0) return error.InvalidCookie;
-        if (anyBad(&bad_token, sc.name)) return error.InvalidCookie;
+        if (anyOutside(token_class, sc.name)) return error.InvalidCookie;
         // Do NOT auto-quote a bad value — reject it (injection guard).
         if (!isCookieValue(sc.value)) return error.InvalidCookie;
         if (sc.name.len + sc.value.len > max_name_value_bytes) return error.InvalidCookie;
@@ -229,45 +338,6 @@ pub const SetCookie = struct {
             const path_is_root = sc.path != null and std.mem.eql(u8, sc.path.?, "/");
             if (!sc.secure or sc.domain != null or !path_is_root)
                 return error.CookiePrefixViolation;
-        }
-
-        // 2. Write: name=value, then attributes in RFC 6265 §4.1 order.
-        try w.writeAll(sc.name);
-        try w.writeByte('=');
-        try w.writeAll(sc.value);
-        if (sc.path) |p| {
-            try w.writeAll("; Path=");
-            try w.writeAll(p);
-        }
-        if (sc.domain) |d| {
-            try w.writeAll("; Domain=");
-            try w.writeAll(d);
-        }
-        if (sc.max_age) |a| {
-            // Not `w.print`: the generic formatter was a measurable part of a
-            // whole `write` (bench-cookies `build`, 2026-10-23).
-            var digits: [20]u8 = undefined;
-            var i: usize = digits.len;
-            var m: u64 = @abs(a);
-            while (true) {
-                i -= 1;
-                digits[i] = '0' + @as(u8, @intCast(m % 10));
-                m /= 10;
-                if (m == 0) break;
-            }
-            try w.writeAll("; Max-Age=");
-            if (a < 0) try w.writeByte('-');
-            try w.writeAll(digits[i..]);
-        }
-        if (sc.expires) |e| {
-            try w.writeAll("; Expires=");
-            try w.writeAll(e);
-        }
-        if (sc.secure) try w.writeAll("; Secure");
-        if (sc.http_only) try w.writeAll("; HttpOnly");
-        if (sc.same_site) |ss| {
-            try w.writeAll("; SameSite=");
-            try w.writeAll(ss.token());
         }
     }
 
@@ -299,6 +369,32 @@ pub const SetCookie = struct {
         var acc: u8 = 0;
         for (s) |c| acc |= table[c];
         return acc != 0;
+    }
+
+    /// A byte class as `lo..hi` minus a few bytes, which is what the token,
+    /// cookie-octet and path classes are. `anyOutside` checks it 16 bytes at
+    /// a time by compares, the last block overlapping the one before; the
+    /// table loop is a load and an OR per byte (bench-cookies `build`,
+    /// 2026-10-24: -5 % of a whole `write`).
+    const Class = struct { lo: u8, hi: u8, not: []const u8, table: *const [256]u8 };
+    const token_class: Class = .{ .lo = 0x21, .hi = 0x7e, .not = "()<>@,;:\\\"/[]?={}", .table = &bad_token };
+    const octet_class: Class = .{ .lo = 0x21, .hi = 0x7e, .not = "\",;\\", .table = &bad_octet };
+    const path_class: Class = .{ .lo = 0x20, .hi = 0x7e, .not = ";", .table = &bad_path };
+
+    fn anyOutside(comptime class: Class, s: []const u8) bool {
+        const V = @Vector(16, u8);
+        if (s.len < 16) return anyBad(class.table, s);
+        var bad: @Vector(16, bool) = @splat(false);
+        var i: usize = 0;
+        while (true) {
+            const v: V = s[i..][0..16].*;
+            // `v - lo > hi - lo` (wrapping) = outside `lo..hi`.
+            bad = bad | (v -% @as(V, @splat(class.lo)) > @as(V, @splat(class.hi - class.lo)));
+            inline for (class.not) |c| bad = bad | (v == @as(V, @splat(c)));
+            if (i + 16 == s.len) break;
+            i = @min(i + 16, s.len - 16);
+        }
+        return @reduce(.Or, bad);
     }
 
     /// RFC 6265bis av-octet as `isPathValue` takes it: printable ASCII and SP, no `;`.
@@ -333,7 +429,7 @@ pub const SetCookie = struct {
     /// two DQUOTEs (the quotes are part of the value a browser stores).
     fn isCookieValue(v: []const u8) bool {
         const inner = if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v[1 .. v.len - 1] else v;
-        return !anyBad(&bad_octet, inner);
+        return !anyOutside(octet_class, inner);
     }
 
     /// RFC 6265bis §5.6: a user agent ignores an attribute whose value is
@@ -347,7 +443,7 @@ pub const SetCookie = struct {
     /// ASCII and SP, no `;`), at most 1024 bytes.
     fn isPathValue(p: []const u8) bool {
         if (p.len == 0 or p[0] != '/' or p.len > max_attribute_value_bytes) return false;
-        return !anyBad(&bad_path, p);
+        return !anyOutside(path_class, p);
     }
 
     /// Domain: a host name -- dot-separated labels of letters, digits, `-`
@@ -1089,6 +1185,71 @@ test "SetCookie.write: name, value, Path and Domain byte sets, pinned byte by by
         const host = std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.';
         try testing.expectEqual(host, try writeAccepts(.{ .name = "n", .value = "v", .domain = &.{ 'a', c, 'b', '.', 'c', 'o', 'm' } }));
     }
+}
+
+test "SetCookie.write: byte sets hold at every position of a long field" {
+    // From 16 bytes up the name, value and Path classes are checked in
+    // 16-byte blocks, the last one overlapping (`anyOutside`): every byte at
+    // every position of fields of 15, 16, 17 and 33 bytes (the table; one
+    // block; two that overlap by 15; three, the last overlapping by 15). Same
+    // RFC sets as the test above.
+    var field: [33]u8 = undefined;
+    for ([_]usize{ 15, 16, 17, 33 }) |len| for (0..len) |pos| for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        const f = field[0..len];
+        @memset(f, 'a');
+        f[pos] = c;
+        const tchar = std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "!#$%&'*+-.^_`|~", c) != null;
+        try testing.expectEqual(tchar, try writeAccepts(.{ .name = f, .value = "v" }));
+        const octet = c == 0x21 or (c >= 0x23 and c <= 0x2b) or (c >= 0x2d and c <= 0x3a) or
+            (c >= 0x3c and c <= 0x5b) or (c >= 0x5d and c <= 0x7e);
+        try testing.expectEqual(octet, try writeAccepts(.{ .name = "n", .value = f }));
+        if (pos == 0) continue;
+        f[0] = '/';
+        const av = c >= 0x20 and c <= 0x7e and c != ';';
+        try testing.expectEqual(av, try writeAccepts(.{ .name = "n", .value = "v", .path = f }));
+    };
+    // A quoted value is checked without its quotes, here on the block path.
+    try testing.expect(try writeAccepts(.{ .name = "n", .value = "\"" ++ strRepeat("a", 20) ++ "\"" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"," ++ strRepeat("a", 19) ++ "\"" }));
+    try testing.expect(!try writeAccepts(.{ .name = "n", .value = "\"" ++ strRepeat("a", 19) ++ ",\"" }));
+}
+
+test "SetCookie.write: in-place and part-by-part writes give the same line" {
+    // `write` fills the buffer in place only when an upper bound of the line
+    // fits, else it writes part by part. Every buffer size around the line's
+    // length: the line exactly when it fits, BufferTooSmall otherwise (a
+    // bound below the real length would write past the end -- a panic in a
+    // safe build). The longest Max-Age and every attribute.
+    const sc: SetCookie = .{
+        .name = "__Host-id",
+        .value = "\"abc\"",
+        .path = "/",
+        .max_age = std.math.minInt(i64),
+        .expires = "Wed, 09 Jun 2021 10:18:14 GMT",
+        .secure = true,
+        .http_only = true,
+        .same_site = .strict,
+    };
+    const want = "__Host-id=\"abc\"; Path=/; Max-Age=-9223372036854775808; Expires=Wed, 09 Jun 2021 10:18:14 GMT; Secure; HttpOnly; SameSite=Strict";
+    var buf: [want.len + 128]u8 = undefined;
+    for (want.len - 1..buf.len + 1) |n| {
+        if (n < want.len) {
+            try testing.expectError(error.BufferTooSmall, sc.bufPrint(buf[0..n]));
+        } else try testing.expectEqualStrings(want, try sc.bufPrint(buf[0..n]));
+    }
+    // A writer that already holds bytes keeps them, on either path.
+    for ([_]usize{ want.len + 1, buf.len }) |n| {
+        var w: std.Io.Writer = .fixed(buf[0..n]);
+        try w.writeAll("X");
+        try sc.write(&w);
+        try testing.expectEqualStrings("X" ++ want, w.buffered());
+    }
+    var grow: std.Io.Writer.Allocating = try .initCapacity(testing.allocator, 1);
+    defer grow.deinit();
+    try sc.write(&grow.writer);
+    try sc.write(&grow.writer);
+    try testing.expectEqualStrings(want ++ want, grow.written());
 }
 
 test "SetCookie.write: quoted values, only a balanced pair is stripped" {
