@@ -179,60 +179,65 @@ pub const Frozen = struct {
     /// order but no node view built and copied per step (2026-10-24: a lookup
     /// was ~1 500 instructions for two cache misses, a fifth of them copying
     /// the view).
+    ///
+    /// The bounds checks are one per node: every field ends before the
+    /// node's last child distance (or its value, without edges), so `end >
+    /// len` fails exactly when one of `nodeAtV3`'s checks would, with the
+    /// same `error.Corrupt`; a node adds at most ~1.3 KiB to an offset below
+    /// 2^32, so no sum wraps on a 64-bit target. The root's empty tail is
+    /// checked before the walk (guarded by `off + 2 <= len`; the loop
+    /// re-checks the bounds) instead of on every step: any root it fails is
+    /// corrupt either way. A miss went from ~1 060 to ~880 instructions and
+    /// 13 % fewer cycles (2026-10-24).
     fn lookupV3(self: Frozen, key: []const u8) QueryError!?u32 {
         const buf = self.buf;
+        const len = buf.len;
         const before_bytes: usize = if (self.header.hasOrdinals()) 4 else 0;
         var off: usize = self.header.root_offset;
+        if (off + 2 <= len and buf[off + 1] != 0) return error.Corrupt; // a root has no incoming edge
         var i: usize = 0;
-        var root = true;
         while (true) {
-            if (off < format.v2_front_size or off + 2 > buf.len) return error.Corrupt;
+            if (off < format.v2_front_size or off + 2 > len) return error.Corrupt;
             // A many-edge node keeps its child offsets in its second cache
             // line: start that miss alongside the first one.
-            @prefetch(buf.ptr + @min(off + 64, buf.len - 1), .{});
+            @prefetch(buf.ptr + @min(off + 64, len - 1), .{});
             const flags = buf[off];
             if (flags & ~format.v3_known_node_flags != 0) return error.Corrupt;
             const tail_len: usize = buf[off + 1];
-            var p = off + 2;
-            var n: usize = 0;
-            var labels_at = p;
-            const has_edges = flags & format.v2_edges_bit != 0;
-            if (!has_edges and flags & format.v3_width_mask != 0) return error.Corrupt;
-            const width: usize = ((flags & format.v3_width_mask) >> format.v3_width_shift) + 1;
-            if (has_edges) {
-                if (p + 1 > buf.len) return error.Corrupt;
-                n = @as(usize, buf[p]) + 1;
-                labels_at = p + 1;
-                p = labels_at + n;
-                if (p > buf.len) return error.Corrupt;
-                if (!format.strictlyAscendingIn(buf, labels_at, n)) return error.Corrupt;
-            }
-            if (p + tail_len > buf.len) return error.Corrupt;
-            const tail_at = p;
-            p += tail_len;
             const terminal = flags & format.terminal_bit != 0;
-            if (terminal) {
-                if (p + format.value_size > buf.len) return error.Corrupt;
-                p += format.value_size;
+            const value_bytes: usize = if (terminal) format.value_size else 0;
+            if (flags & format.v2_edges_bit == 0) {
+                if (flags & format.v3_width_mask != 0) return error.Corrupt;
+                const tail_at = off + 2;
+                if (tail_at + tail_len + value_bytes > len) return error.Corrupt;
+                if (key.len - i != tail_len or !eqlShort(buf[tail_at..][0..tail_len], key[i..][0..tail_len])) return null;
+                if (!terminal) return null;
+                return std.mem.readInt(u32, buf[tail_at + tail_len ..][0..4], .little);
             }
-            if (has_edges and p + format.best_size + (width + before_bytes) * n > buf.len) return error.Corrupt;
+            if (off + 3 > len) return error.Corrupt;
+            const n: usize = @as(usize, buf[off + 2]) + 1;
+            const width: usize = ((flags & format.v3_width_mask) >> format.v3_width_shift) + 1;
+            const labels_at = off + 3;
+            const tail_at = labels_at + n;
+            const value_at = tail_at + tail_len;
+            const dist_at = value_at + value_bytes + format.best_size;
+            if (dist_at + (width + before_bytes) * n > len) return error.Corrupt;
+            if (!format.strictlyAscendingIn(buf, labels_at, n)) return error.Corrupt;
             // The node is now fully checked, as `nodeAtV3` would have.
-            if (root) {
-                if (tail_len != 0) return error.Corrupt; // a root has no incoming edge
-                root = false;
-            } else {
-                if (key.len - i < tail_len or !eqlShort(buf[tail_at..][0..tail_len], key[i..][0..tail_len])) return null;
-                i += tail_len;
-            }
+            if (key.len - i < tail_len or !eqlShort(buf[tail_at..][0..tail_len], key[i..][0..tail_len])) return null;
+            i += tail_len;
             if (i == key.len) {
                 if (!terminal) return null;
-                return std.mem.readInt(u32, buf[p - format.value_size ..][0..4], .little);
+                return std.mem.readInt(u32, buf[value_at..][0..4], .little);
             }
-            if (!has_edges) return null;
             const e = format.findLabelIn(buf, labels_at, n, key[i]) orelse return null;
-            const d = format.readDistance(buf, p + format.best_size + width * e, width);
+            const d = format.readDistance(buf, dist_at + width * e, width);
             if (d == 0 or d > off) return error.Corrupt;
             off -= d;
+            // Children are written before their parent, so the node just
+            // reached has its own children in the bytes right below it: start
+            // that line now, while its first line is still on the way.
+            @prefetch(buf.ptr + (off -| 64), .{});
             i += 1;
         }
     }
@@ -1542,5 +1547,87 @@ test "v3 lookup agrees with the shared decoder walk on every damaged buffer" {
         // damage. A harness whose damage never reached a walk shows 0 here.
         try testing.expect(loaded == 3000);
         try testing.expect(refused > 3000);
+    }
+}
+
+test "v3 lookup agrees with the shared decoder walk on 26-edge nodes, every truncation and damage" {
+    // The sweep above has nodes of at most four edges; the 32-lane label
+    // match and order check (17..32 edges) and the single end-of-node bound
+    // are held to `lookupBySeek` here (review + mutation 2026-10-24: the
+    // node-start bounds survived without a node ending exactly at `len`).
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| testing.allocator.free(k);
+        keys.deinit(testing.allocator);
+    }
+    // Root: 26 letters; "m": 26 letters, each with a short tail and two leaves.
+    for (0..26) |a| {
+        const c: u8 = 'a' + @as(u8, @intCast(a));
+        if (c == 'm') {
+            for (0..26) |b| {
+                try keys.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "m{c}xy", .{'a' + @as(u8, @intCast(b))}));
+                try keys.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "m{c}xy/1", .{'a' + @as(u8, @intCast(b))}));
+                try keys.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "m{c}xy/2", .{'a' + @as(u8, @intCast(b))}));
+            }
+        } else try keys.append(testing.allocator, try std.fmt.allocPrint(testing.allocator, "{c}-tail", .{c}));
+    }
+    const extra = [_][]const u8{ "", "`", "{", "m", "m`", "m{", "mzxy/3", "mzxy/", "mzx", "maxy/12", "z-tail!", "q-tai" };
+    for ([_]bool{ false, true }) |ordinals| {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        {
+            var sb = try @import("stream.zig").SortedBuilder.init(testing.allocator, &out.writer, .{ .ordinals = ordinals });
+            defer sb.deinit();
+            for (keys.items, 0..) |k, i| try sb.insert(k, @intCast(i + 1));
+            try sb.finish();
+        }
+        const base = out.written();
+        const f = try Frozen.load(base);
+        for (keys.items, 0..) |k, i| try testing.expectEqual(@as(?u32, @intCast(i + 1)), try f.lookup(k));
+        for (extra) |k| try testing.expectEqual(try f.lookupBySeek(k), try f.lookup(k));
+
+        // Every truncation of the region, root kept: nodes end past `len`,
+        // exactly at it, and start one or two bytes before it.
+        var k: usize = 0;
+        while (k <= f.buf.len) : (k += 1) {
+            const t: Frozen = .{ .buf = f.buf[0..k], .header = f.header };
+            for ([_][]const []const u8{ keys.items, &extra }) |set| for (set) |p| {
+                if (t.lookupBySeek(p)) |v| {
+                    try testing.expectEqual(v, try t.lookup(p));
+                } else |e| try testing.expectError(e, t.lookup(p));
+            };
+        }
+
+        // Damage, re-sealed as in the sweep above.
+        const buf = try testing.allocator.dupe(u8, base);
+        defer testing.allocator.free(buf);
+        var refused: usize = 0;
+        var seed: u64 = 0;
+        while (seed < 1000) : (seed += 1) {
+            var prng = std.Random.DefaultPrng.init(seed);
+            const r = prng.random();
+            @memcpy(buf, base);
+            for (0..r.intRangeAtMost(usize, 1, 4)) |_| {
+                const at = r.intRangeLessThan(usize, format.v2_front_size, buf.len - format.v2_footer_size);
+                buf[at] = if (r.boolean()) r.int(u8) else buf[at] ^ (@as(u8, 1) << r.int(u3));
+            }
+            const foot = buf[buf.len - format.v2_footer_size ..];
+            std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(buf[format.v2_front_size .. buf.len - format.v2_footer_size]), .little);
+            var c = std.hash.Crc32.init();
+            c.update(buf[0..format.v2_front_size]);
+            c.update(foot[0..20]);
+            std.mem.writeInt(u32, foot[20..24], c.final(), .little);
+            const d = try Frozen.load(buf);
+            for ([_][]const []const u8{ keys.items, &extra }) |set| for (set) |p| {
+                if (d.lookupBySeek(p)) |v| {
+                    try testing.expectEqual(v, try d.lookup(p));
+                } else |e| {
+                    refused += 1;
+                    try testing.expectError(e, d.lookup(p));
+                }
+            };
+        }
+        // Reach (measured 2026-10-24): damage meets the walks.
+        try testing.expect(refused > 1000);
     }
 }

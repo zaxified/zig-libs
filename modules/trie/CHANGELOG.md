@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Performance:** `lookup` over format version 3 checks each node's bounds once
+  (at its end) instead of field by field, handles the root's empty tail before the walk and a
+  node without edges in its own branch, and prefetches the line below the node it moves to
+  (its children, written before it); `format.findLabelIn` / `strictlyAscendingIn` match and
+  order-check a run of 17..32 labels with one masked 32-byte compare (the "found in the
+  first 16?" branch was three quarters of a miss lookup's branch misses). A miss lookup:
+  ~1 060 → ~880 instructions; `bench-trie` exact lookup miss 1.35× → 1.15× and hit 1.08× →
+  1.02× darts-clone 0.32h — P1. Same answers and errors on every buffer. **Tests:** a
+  differential over 26-edge nodes, every truncation of the node region and 1 000 damaged
+  buffers (lookup vs the decoder walk); the vector-helper oracle at every slack 0..40.
+  **Audit:** independent review (no finding against the code; its two test gaps closed by the
+  test above) + 25-mutant run over the changed code (24 killed, 1 equivalent).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** mutation audit of the format-version-3 code (38/38); the v3 writer's distance width is now the pure `distanceWidth` (same choice), tests for it at every boundary and for tails differing only in their first or last byte.
 
 - **2026-10-24** — **Format:** the writer's default is frozen format **version 3**: version 2

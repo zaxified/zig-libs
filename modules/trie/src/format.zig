@@ -493,8 +493,17 @@ pub fn strictlyAscending(labels: []const u8) bool {
 /// `strictlyAscending(buf[at..][0..n])`. A short run (most nodes have a
 /// handful of edges) is one masked 16-byte step when 17 bytes from `at` lie
 /// inside `buf` -- the bytes past the run belong to the node and are masked
-/// off -- instead of a loop whose exit is a branch miss per node.
+/// off -- instead of a loop whose exit is a branch miss per node; a run of
+/// up to 32 (a letter level: 26) is one masked 32-byte step the same way.
 pub fn strictlyAscendingIn(buf: []const u8, at: usize, n: usize) bool {
+    if (n > 16 and n <= 32 and at + 33 <= buf.len) {
+        const W = @Vector(32, u8);
+        const a: W = buf[at..][0..32].*;
+        const b: W = buf[at + 1 ..][0..32].*;
+        const bad: u32 = @bitCast(b <= a);
+        const live: u32 = @truncate((@as(u64, 1) << @intCast(n - 1)) - 1);
+        return bad & live == 0;
+    }
     if (n <= 16 and at + 17 <= buf.len) {
         const V = @Vector(16, u8);
         const a: V = buf[at..][0..16].*;
@@ -509,10 +518,19 @@ pub fn strictlyAscendingIn(buf: []const u8, at: usize, n: usize) bool {
 /// Index of `label` in the strictly ascending `buf[at..][0..n]`, or null: 16
 /// compares per step over the contiguous v3 labels instead of a binary search
 /// whose every probe waits for the one before. Short runs as in
-/// `strictlyAscendingIn`.
+/// `strictlyAscendingIn`; a run of 17..32 is one masked 32-byte compare, not
+/// two 16-byte steps whose "found in the first?" branch is a coin toss
+/// (three quarters of a miss lookup's branch misses, 2026-10-24).
 pub fn findLabelIn(buf: []const u8, at: usize, n: usize, label: u8) ?usize {
     const V = @Vector(16, u8);
     const want: V = @splat(label);
+    if (n > 16 and n <= 32 and at + 32 <= buf.len) {
+        const W = @Vector(32, u8);
+        const v: W = buf[at..][0..32].*;
+        const live: u32 = @truncate((@as(u64, 1) << @intCast(n)) - 1);
+        const hit: u32 = @as(u32, @bitCast(v == @as(W, @splat(label)))) & live;
+        return if (hit != 0) @ctz(hit) else null;
+    }
     if (n <= 16 and at + 16 <= buf.len) {
         const v: V = buf[at..][0..16].*;
         const live: u16 = @truncate((@as(u32, 1) << @intCast(n)) - 1);
@@ -870,16 +888,18 @@ test "follow enforces the strictly-increasing child-offset invariant" {
 
 test "v3 vector helpers agree with scalar loops at every length and buffer edge" {
     // `strictlyAscendingIn` / `findLabelIn` take a masked 16-byte window when
-    // 16/17 bytes from `at` lie inside the buffer, overlapping windows past 16,
-    // and a scalar loop otherwise. Each run length 0..256 is placed so that its
-    // end, `at + 16` and `at + 17` fall just inside, on, and past the buffer
-    // end, with a violation at every pair and a duplicate at each window seam.
+    // 16/17 bytes from `at` lie inside the buffer, a masked 32-byte window for
+    // runs of 17..32 when 32/33 bytes do, overlapping windows past that, and a
+    // scalar loop otherwise. Each run length 0..256 is placed at every slack
+    // 0..40 so that its end, `at + 16`, `at + 17`, `at + 32` and `at + 33`
+    // fall just inside, on, and past the buffer end, with a violation at every
+    // pair and a duplicate at each window seam.
     var store: [600]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0x7e1e);
     const r = prng.random();
     var n: usize = 0;
     while (n <= 256) : (n += 1) {
-        for ([_]usize{ 0, 1, 2, 17, 40 }) |slack| {
+        for (0..41) |slack| {
             const len = 300 + slack; // buffer end; the run ends `slack` before it
             const at = len - slack - n;
             const buf = store[0..len];
