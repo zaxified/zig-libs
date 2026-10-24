@@ -87,8 +87,6 @@ pub const Check = struct {
     ctx: ?*anyopaque = null,
 };
 
-/// Probe configuration + the middleware over it. Immutable after construction;
-/// share one instance freely across the router's connection threads.
 /// The startup probe (`Health.startup`). The flag is the application's, not
 /// `Health`'s, so the config stays immutable -- a `Health` may live in
 /// read-only memory -- and one flag can feed several servers. Set it once,
@@ -99,6 +97,8 @@ pub const Startup = struct {
     started: *const std.atomic.Value(bool),
 };
 
+/// Probe configuration + the middleware over it. Immutable after construction;
+/// share one instance freely across the router's connection threads.
 pub const Health = struct {
     /// Readiness checks — ALL must pass for a 200. Empty ⇒ readiness always
     /// 200 (a liveness-equivalent readiness, the default).
@@ -123,11 +123,22 @@ pub const Health = struct {
     /// is unchanged either way — Kubernetes only reads that.
     detail: bool = true,
 
+    /// `h`, `h.checks` and `h.startup.started` must outlive the router.
+    /// Panics (in every build mode) when two probes share a path: one of them
+    /// would silently never answer.
     pub fn middleware(h: *const Health) router.Middleware {
+        if (!h.pathsDistinct()) @panic("health: live_path, ready_path and startup.path must differ");
         return .{ .state = @constCast(h), .run = middlewareRun };
     }
 
-    /// Which probe this request is, if any.
+    fn pathsDistinct(h: *const Health) bool {
+        if (std.mem.eql(u8, h.live_path, h.ready_path)) return false;
+        const st = h.startup orelse return true;
+        return !std.mem.eql(u8, st.path, h.live_path) and !std.mem.eql(u8, st.path, h.ready_path);
+    }
+
+    /// Which probe this request is, if any. The three paths must differ (as
+    /// `middleware()` enforces); with a shared path one probe never answers.
     ///
     /// For a server that routes itself. `middleware` is the answer when there
     /// is a `router` to hang it on; a server without one -- a single-purpose
@@ -191,7 +202,9 @@ fn respondStartup(h: *const Health, res: *http.Server.ResponseWriter) anyerror!v
 
 /// The JSON `details` object lists at most this many checks (their pass bits
 /// are kept on the stack; every check still runs once and still counts for the
-/// status). Far past any real service's dependency count.
+/// status). Far past any real service's dependency count. The ones past it are
+/// summed up in one last `"(N more)"` entry, `down` when any of them failed —
+/// before 2026-10-24 they were left out, so a 503 could list only `up` checks.
 const json_max_checks = 256;
 
 /// Write `s` as a JSON string literal. Quote, backslash and control bytes are
@@ -221,10 +234,13 @@ fn respondReadyJson(h: *const Health, res: *http.Server.ResponseWriter) anyerror
     // before any body byte leaves the buffer.
     var passed: [json_max_checks / 64]u64 = @splat(0);
     var all_ok = true;
+    var unlisted_ok = true;
     for (h.checks, 0..) |c, i| {
         const ok = c.checkFn(c.ctx);
         if (!ok) all_ok = false;
-        if (ok and i < json_max_checks) passed[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+        if (i >= json_max_checks) {
+            if (!ok) unlisted_ok = false;
+        } else if (ok) passed[i / 64] |= @as(u64, 1) << @intCast(i % 64);
     }
     res.setStatus(if (all_ok) 200 else 503);
     try setProbeHeaders(h, res);
@@ -237,6 +253,10 @@ fn respondReadyJson(h: *const Health, res: *http.Server.ResponseWriter) anyerror
             try writeJsonString(w, c.name);
             const ok = (passed[i / 64] >> @intCast(i % 64)) & 1 != 0;
             try w.writeAll(if (ok) ":{\"status\":\"up\"}" else ":{\"status\":\"down\"}");
+        }
+        if (h.checks.len > json_max_checks) {
+            try w.print(",\"({d} more)\"", .{h.checks.len - json_max_checks});
+            try w.writeAll(if (unlisted_ok) ":{\"status\":\"up\"}" else ":{\"status\":\"down\"}");
         }
         try w.writeByte('}');
     }
@@ -716,9 +736,59 @@ test "json body: byte goldens for up, down, detail off, liveness and startup" {
     try testing.expectEqualStrings("{\"status\":\"up\"}", bodyOf(runWire(&r2, wire("/readyz"), &buf)));
 }
 
+fn alwaysUp(_: ?*anyopaque) bool {
+    return true;
+}
+
+fn expectContentType(got: []const u8, json: bool) !void {
+    const want = if (json) "Content-Type: application/json; charset=utf-8\r\n" else "Content-Type: text/plain\r\n";
+    try testing.expect(std.mem.find(u8, got, want) != null);
+}
+
+test "pathsDistinct: two probes on one path are refused (middleware() panics on it)" {
+    var started: std.atomic.Value(bool) = .init(true);
+    try testing.expect((Health{}).pathsDistinct());
+    try testing.expect((Health{ .startup = .{ .started = &started } }).pathsDistinct());
+    try testing.expect(!(Health{ .ready_path = "/healthz" }).pathsDistinct());
+    try testing.expect(!(Health{ .startup = .{ .path = "/readyz", .started = &started } }).pathsDistinct());
+    try testing.expect(!(Health{ .startup = .{ .path = "/healthz", .started = &started } }).pathsDistinct());
+}
+
+test "json body: checks past json_max_checks are summed in one last entry, down if any failed" {
+    // Review 2026-10-24: with 258 checks and only the last one down, the body
+    // was a 503 whose `details` listed 256 `up` checks and nothing else.
+    var checks: [json_max_checks + 2]Check = @splat(.{ .name = "c", .checkFn = alwaysUp });
+    var h = Health{ .checks = &checks, .json = true };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(h.middleware());
+    var buf: [16384]u8 = undefined;
+    const tail_up = ",\"c\":{\"status\":\"up\"},\"(2 more)\":{\"status\":\"up\"}}}";
+    const tail_down = ",\"c\":{\"status\":\"up\"},\"(2 more)\":{\"status\":\"down\"}}}";
+
+    const up = runWireWide(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.startsWith(u8, up, "HTTP/1.1 200"));
+    try testing.expect(std.mem.endsWith(u8, bodyOf(up), tail_up));
+
+    checks[json_max_checks + 1].checkFn = alwaysDown;
+    const down = runWireWide(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.startsWith(u8, down, "HTTP/1.1 503"));
+    try testing.expect(std.mem.endsWith(u8, bodyOf(down), tail_down));
+    try testing.expectEqual(@as(usize, json_max_checks), std.mem.count(u8, bodyOf(down), "\"c\":{\"status\":\"up\"}"));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, bodyOf(down), .{ .duplicate_field_behavior = .use_last }); // every check is "c"
+    parsed.deinit();
+
+    // Exactly json_max_checks: every check listed, no summary entry
+    // (mutation 2026-10-24: `>=` for `>` added a "(0 more)").
+    h.checks = checks[0..json_max_checks];
+    const full = runWireWide(&r, wire("/readyz"), &buf);
+    try testing.expect(std.mem.endsWith(u8, bodyOf(full), ",\"c\":{\"status\":\"up\"}}}"));
+    try testing.expect(std.mem.find(u8, bodyOf(full), "more)") == null);
+}
+
 test "json body: check names are escaped, invalid UTF-8 stays valid JSON, router-free respond agrees" {
     var checks = [_]Check{
-        .{ .name = "a\"b\\c\n\x01\x7f", .checkFn = alwaysDown },
+        .{ .name = "a\"b\\c\n\x01\x7f\r\t", .checkFn = alwaysDown }, // \r \t: mutation 2026-10-24
         .{ .name = "caf\xc3\xa9", .checkFn = alwaysDown }, // valid UTF-8 kept raw
         .{ .name = "bad\xff", .checkFn = alwaysDown }, // invalid: byte escaped
     };
@@ -727,7 +797,7 @@ test "json body: check names are escaped, invalid UTF-8 stays valid JSON, router
     defer r.deinit();
     try r.use(h.middleware());
     var buf: [1024]u8 = undefined;
-    const want = "{\"status\":\"down\",\"details\":{\"a\\\"b\\\\c\\n\\u0001\\u007f\":{\"status\":\"down\"},\"caf\xc3\xa9\":{\"status\":\"down\"},\"bad\\u00ff\":{\"status\":\"down\"}}}";
+    const want = "{\"status\":\"down\",\"details\":{\"a\\\"b\\\\c\\n\\u0001\\u007f\\r\\t\":{\"status\":\"down\"},\"caf\xc3\xa9\":{\"status\":\"down\"},\"bad\\u00ff\":{\"status\":\"down\"}}}";
     const through = runWire(&r, wire("/readyz"), &buf);
     try testing.expectEqualStrings(want, bodyOf(through));
 
@@ -866,12 +936,13 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
             try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
             try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
             if (!is_head) try testing.expectEqualStrings(if (json) "{\"status\":\"up\"}" else "OK\n", body);
-            if (json) try testing.expect(std.mem.find(u8, got, "Content-Type: application/json; charset=utf-8") != null);
+            try expectContentType(got, json);
             for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 0), s.calls);
         } else if (is_get_head and on_startup) {
             if (started) reach_startup_up += 1 else reach_startup_down += 1;
             try testing.expect(std.mem.startsWith(u8, got, if (started) "HTTP/1.1 200" else "HTTP/1.1 503"));
             try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
+            try expectContentType(got, json);
             if (!is_head) {
                 const want: []const u8 = if (json)
                     (if (started) "{\"status\":\"up\"}" else "{\"status\":\"down\"}")
@@ -957,6 +1028,7 @@ test "model-fuzz: probes, pass-through, detail budget and call counts vs. a naiv
                 }
             }
             try testing.expect(std.mem.find(u8, got, "Cache-Control: no-store") != null);
+            try expectContentType(got, json);
             for (states[0..n_checks]) |s| try testing.expectEqual(@as(u32, 1), s.calls);
         } else {
             reach_passthrough += 1;
