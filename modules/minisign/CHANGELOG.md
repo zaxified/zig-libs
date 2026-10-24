@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-20** — `Blake2b512`: a row-vectorized BLAKE2b-512 (four `@Vector(4, u64)` rows,
   byte-shuffle rotations; AVX2 on x86_64, std's elsewhere) for streaming `signFileDigest` /
   `verifyFileDigest` input, used by `signMessage`/`verifyMessage`'s prehash too. Byte-identical to

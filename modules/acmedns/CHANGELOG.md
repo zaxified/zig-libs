@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — **Constant time:** `basicAuth` (the httpreq password in the `Authorization` header) encodes with `b64ct` instead of `std.base64` (new dep). Output unchanged.
 - **2026-10-17** — Interop: `findZone` of a name the authoritative-only peer REFUSEs expects `ResolverFailed` (the 2026-10-16 review made REFUSED/SERVFAIL "could not find out"); the program is now run by the interop lane through `tools/interop.sh`. Tooling only.
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `writeRequestObject` reflects with `@typeInfo(T).@"struct".field_names/field_types`; test `ReadCueIo` uses `vtable.operate`; the `max_response_bytes` exact-count test moved one byte down (`L-1` refused / `L` accepted) because `http` `readAllAlloc(max)` now accepts exactly `max` (documented limit "over max" is unchanged).

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-19** — AES-GCM in tests, probes and docs moved from `std.crypto.aead.aes_gcm` to the zig-libs `aesgcm` module (new dep; Zig 0.17 #36256). `Protection(Aead)` is generic and unchanged; std AEAD types still work. Same bytes on the wire.
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the repo-wide codemod (all `@bitCast` sites audited; aesgcm's are x86-64-only, so LE memory order is unchanged).
 - **2026-10-10** — tests: deterministic fuzz driver `QUIC_CRYPTO_FUZZ` (`src/fuzz_test.zig`). `quic-hp-remove` (arbitrary packet / offset / mask through `headerprot.remove`, every pn_len and the refusal counted), `quic-hp-roundtrip` (AES-128 / AES-256 / ChaCha20 mask: `remove` after `apply` restores every octet; another sample or key does not), `quic-protection` (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305: a sealed packet opens; a flipped header / ciphertext / tag bit, other packet number, key, iv, truncation or random bytes is refused), `quic-initial-retry` (v1 and v2 Initial secrets and packet keys per DCID, the key-update chain, Retry Integrity Tag genuine-verified / flipped, wrong ODCID, wrong version refused). 200,000-run verdicts clean. No code change.

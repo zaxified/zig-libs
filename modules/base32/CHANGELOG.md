@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-18** — Docs: the module doc comment and `SPEC.md` (scope line, "what it is not", Constant-time contract, Backlog) still said "Not constant-time" / "table lookup"; they now describe the 2026-10-10 arithmetic implementation. No code change.
 - **2026-10-10** — Constant time: new `src/ctgrind_harness.zig` (targets `encode`, `decode`, ReleaseFast), since base32 carries the TOTP/HOTP secret of `otpauth://` URIs. `encode` taints the data (both alphabets, padded/unpadded, upper/lower case): 0 in-file contexts. `decode` taints the encoded text (padding required/optional, case-insensitive, one rejected input): 5, which are the per-character `=` test (whose outcome the public length fixes for canonical text) and the validity verdict taken once at the end.

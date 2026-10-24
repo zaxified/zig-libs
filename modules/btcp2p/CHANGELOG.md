@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-10** — tests: deterministic fuzz driver `BTCP2P_FUZZ` over the existing harnesses (header, block, relay, varbytes, addr, reject, netaddr, version, inventory, locator, headers, envelope); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 41 of 41 killed, 0 equivalent; 6 tests added (command
   printable-range edges and a 12-byte command, `MAX_PAYLOAD_LENGTH` edge on decode and refusal

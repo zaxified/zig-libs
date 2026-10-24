@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `max_body_bytes` boundary: 0.17 `allocRemaining(.limited(n))` accepts exactly n bytes, which is the documented limit ("a body larger than this is 413"), so the call is unchanged; new test pins n bytes read (401 bad MAC) and n+1 -> 413.
 - **2026-10-18** — **Constant time:** `decodeSecret` / `decodeSigningKey` / `encodeSecret` (`whsec_`/`whsk_` keys) run on `b64ct` instead of `std.base64` (new dep). The padded/unpadded choice no longer branches on the key's last character: a length that is a multiple of 4 uses the padded codec (which also takes an unpadded text), any other the unpadded one. Accepted and refused texts are unchanged; MAC and signature decoding (public data) stays on std.
 - **2026-10-09** — tests: deterministic fuzz driver `WEBHOOKSIG_FUZZ` over the existing harnesses (`verify`, plus a genuine signature (every digest, encoding and prefix) accepted and a flipped digit, prefix, body, secret or truncation refused).

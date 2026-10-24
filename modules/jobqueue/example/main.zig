@@ -284,12 +284,14 @@ pub fn main() !void {
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime text: []const u8, comptime n: usize) *const [text.len * n:0]u8 {
+    // One @splat + @bitCast, not a loop: a comptime loop writing into an
+    // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
+    // binary spent ~5 min in Sema on these, 2026-10-24).
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * (text.len + 4) + 1000);
-        var buf: [text.len * n:0]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * text.len ..][0..text.len], text);
-        const rep_final = buf;
-        break :blk rep_final;
+        const unit: [text.len]u8 = text[0..text.len].*;
+        const grid: [n][text.len]u8 = @splat(unit);
+        const flat: [text.len * n]u8 = @bitCast(grid);
+        break :blk (flat ++ [_:0]u8{})[0 .. text.len * n :0].*;
     };
     return &rep_result;
 }

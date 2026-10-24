@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length.
 - **2026-10-10** — tests: deterministic fuzz driver `QR_FUZZ` over the encode, decode, damage and sequence harnesses (generic over their choice source; verdicts at a `.scale` share for the slow ones). The damage harness now also requires that net damage of at most two modules is always recovered. No code change.
 - **2026-09-11** — **DOC FIX (SPEC.md only, no code change):** A1/qr.md's open "post-Forney"

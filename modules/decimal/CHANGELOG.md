@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-20** — NOTICE header is "provenance note" (no third-party condition remains after the decTest removal). Documentation only.
 - **2026-10-20** — Tests: all IBM test-suite material removed (owner ruling: the "General Decimal Arithmetic
   Testcases" are Copyright IBM, all rights reserved, no licence grant, not compatible with the MIT model;

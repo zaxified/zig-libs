@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed).
 - **2026-10-10** — tests: deterministic fuzz driver `PSBT_FUZZ`: the existing generator harness (`parse` / byte-exact `serialize` / `decodeWitnessStack` / `finalize` / `extract`) now also runs under the driver as `psbt-parse` (with well-formed witness stacks half the time), plus `psbt-damage` (a generated PSBT with 0-3 octets damaged and maybe truncated: never a panic, an accepted one re-serializes byte-exact and `combine` with itself is idempotent). ReleaseSafe, clean.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: BIP370 (PSBTv2) reads "not yet — see Backlog" instead of "out of scope", matching the Backlog item.

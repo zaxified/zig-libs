@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0 (`tools/bench.zig`: `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase`). No library behaviour change.
 - **2026-10-11** — Parity with scs v2.9.0 (new `src/values.zig`, `tools/bench.zig`, `tools/go_bench/`): (1) key/value + flash layer on `Session` — `putValue`/`getValue`/`removeValue`/`popValue`/`valueIterator`/`clearValues` over the data blob (tagged `0xA1`, unique keys in insertion order; raw `setData` mixed in gives `error.Malformed`, never a wrong value); (2) `Options.persist_cookie` (default `true` = unchanged bytes) and `Session.rememberMe` — the flag lives in bit 63 of the record's `created_ns`, the timestamp is now the low 63 bits sign-extended, so any clock within ±2^62 ns round-trips and old records read as "off"; (3) `Store.VTable.iterate` (optional), `KvStore` implements it, `Manager.iterate` + `IterateAction` for logout-everywhere (`.destroy` goes through `Store.delete`, so the CAS guarantee holds; `RamcacheStore` → `error.Unsupported`); (4) `Options.hash_id_in_store` (default `false`) keys the store by SHA-256(id), raw 32 bytes. Tests: values unit + random-operation model, three cookie shapes byte for byte, flag round trip over both stores, iterate, hashed keys; fuzz harness for the blob decoder in the `SESSIONS_FUZZ` driver. New `zig build bench-sessions` against scs + memstore.
 

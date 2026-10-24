@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-10** — tests: deterministic fuzz driver `DEVLINK_FUZZ` over the existing harnesses (region + chunk assembler, param, resource, dev + info, port, health, notification); reach labels count real outcomes. No code or API change.
 - **2026-10-05** — Mutation run: 29 of 40 killed, 2 equivalent; 5 tests added
   and 1 extended (top-level snapshot ids past `max_snapshots`, an empty chunk

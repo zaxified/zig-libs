@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. No source change beyond the mechanical codemod.
 - **2026-10-10** — tests: deterministic fuzz driver `DNSSEC_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harnesses: `wire-decodeUncompressedName`, `keys-decodePublicKey`, `nsec-nsecProveDenial`, `nsec3-proveDenial`, `rdata`, plus a new `oracle-validate` (a real ldns-signed RRset validates Secure; a flipped signature bit and any signature truncation validate Bogus; damaged RRSIG/DNSKEY wire never panics). Verdict: 200,000 runs each, ReleaseSafe, clean; `oracle-validate` at its scale (40,000 runs, RSA/ECDSA verification at ~340/s).
 - **2026-10-02** — **BREAKING (no known consumer): the private base32hex is gone;

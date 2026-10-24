@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 
 - **2026-10-18** — **Fix (big-endian):** ChaCha20 keystream byte-reversed on big-endian targets under Zig 0.17. `blockWords` still byte-swapped the word vector before the vector -> bytes `@bitCast`, which 0.17 defines as little-endian on every target, so the swap now double-swapped. Swap removed. s390x (qemu, ReleaseSafe) modtest 27/55 -> 49/55 (6 skipped), as on 0.16; little-endian targets unchanged.

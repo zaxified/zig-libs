@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (a non-inline call made the `++` result a dangling stack temporary).
 - **2026-10-10** — tests: deterministic fuzz driver `BBS_FUZZ` over the three decoders (`bbs-signature`, `bbs-public-key`, `bbs-proof`; what decodes also re-encodes to the same octets) plus two new oracles, `bbs-sign-verify` (SHA-256 and SHAKE-256 suites: a signature this module issued verifies; a flipped octet, another message, another header and another key do not) and `bbs-proof-verify` (random disclosed subsets of three messages: the proof verifies; a flipped octet, another disclosed message and another presentation header do not). No change in `src/` outside tests.
 - **2026-10-09** — **Fix: the small dead-stack burns left up to 63 bytes unzeroed.** With 32-byte

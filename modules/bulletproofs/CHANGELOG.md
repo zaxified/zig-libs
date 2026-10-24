@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Ported to Zig 0.17.0. Test only: `IntegerBitSet(N).initEmpty()` -> `.empty`. Examples/tools ported to Zig 0.17.0 (dalek proof emitter passes `io` to `prove`/`proveMultiple` (pre-existing drift)).
 
 - **2026-10-10** — tests: deterministic fuzz driver `BULLETPROOFS_FUZZ` (testkit) over range-proof and inner-product-proof decoders (canonical re-encode; a decodable damaged proof does not verify) and prove/verify (wrong commitment, wrong domain, flipped bit and out-of-range value refused). No change to the library code.

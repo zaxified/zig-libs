@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-19** — **Fix:** `unixToParts` (and so `unixNsToParts`, `toUtc`) no longer traps/UB on extreme `i64` instants: the seconds-of-day product `day * 86400` overflowed for `minInt(i64)`, and the year `@intCast` to `i32` overflowed for any instant beyond ~±6.7e16 s; the year now saturates at the `i32` range. In-range results are unchanged (S7 audit).
 
 - **2026-10-11** — Scope core → parity (chrono 0.4, Go `time`). New: `parseRfc2822`/`bufRfc2822`/

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0 (no source change needed beyond the codemod).
 - **2026-10-10** — tests: deterministic fuzz driver `WEBAUTHN_FUZZ` (`src/fuzz_test.zig`) over the six W3C §16 ceremonies. `webauthn-assertion`: `verifyAssertion` accepts the genuine vector and refuses a damaged authenticatorData, clientDataJSON, signature or credential public key (0-3 octets, truncation). `webauthn-registration`: `verifyRegistration` accepts the genuine vector; damage to the clientDataJSON is refused wherever the statement signs its hash, damage to the attestationObject wherever the statement signs the authData (self attestation: every octet; `x5c` formats: the authData; `none` and the certificate carried in `x5c` are lenient by design and only required not to crash). 200,000-run verdicts clean. No code change.
 - **2026-10-10** — docs: ct axis recorded as n/a: the module is a WebAuthn relying-party verifier. Signatures, credential public keys, authenticator data, client data and the challenge (sent to the client in clear) are all public, and no private or MAC key is held. The signature checks are the `p256`/`rsa`/std primitives' (code review).

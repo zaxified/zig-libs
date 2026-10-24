@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** A128GCM/A256GCM and A128GCMKW/A256GCMKW now runs on the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (std AES-GCM is 2.6x slower on Zig 0.17, #36256). Same bytes on the wire; new dependency `aesgcm` in `meta.deps`. Bulk path not re-measured yet.
 - **2026-10-19** — **Fix (Zig 0.17.0 optimized builds only):** a JSON-integer header field (`p2c`) in 2147483648..4294967295 was narrowed with `std.math.cast(u32, i64)`, which zig 0.17.0 lowers to `trunc nsw` (poison for the upper half of u32), so a consumer's iteration bound on it could be folded away. Now narrowed non-negative i64 → u64 → u32. Same accepted values as before.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).

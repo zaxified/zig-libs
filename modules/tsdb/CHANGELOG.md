@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-20** — `Db.seriesIds(specs, out)`: resolve many series at once, registering the missing ones in
   ONE transaction (a first scrape of 1000 new series was 1000 commits of two fsyncs each); duplicates share
   an id, all or nothing under `max_series`. `zig build bench-tsdb` (`tools/bench.zig` + `tools/tsink_bench`,

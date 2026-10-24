@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-20** — **NO CONSUMER-VISIBLE CHANGE:** SPEC Backlog: owner decisions on the audit 2026-10-19 open questions recorded (fix accepted, not yet done).
 
 - **2026-10-19** — **Fix:** `Snapshot` with `fingerprint = false` tagged a precompressed variant with its bare size+mtime tag, so a `.br`/`.gz` sibling equal to the identity file in size and mtime shared its validator and a conditional request could answer 304 across codings; the variant's tag now carries the coding token, as `Handler`'s always did. (Default `fingerprint = true` was unaffected: content hashes differ.)

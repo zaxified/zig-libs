@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-19** — AES-GCM (`AESGCM` cipher, spec §4.2) now comes from the zig-libs `aesgcm` module instead of `std.crypto.aead.aes_gcm` (new dep; Zig 0.17 #36256). `Suite` still accepts std's `Aes256Gcm` identically; vectors and the stack probe run on `aesgcm`. Same bytes on the wire.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 

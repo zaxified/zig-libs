@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. comptime `strRepeat` helper: larger `@setEvalBranchQuota` (0.17 counts more branches per iteration).
 - **2026-10-10** — tests: deterministic fuzz driver `QRSCAN_FUZZ` over the scan and damaged-symbol harnesses (generic over their choice source) plus a roundtrip oracle (a pristine rendering of an issued symbol at any scale and ECC level is found, sampled module for module and decoded to its text); a damaged symbol that decodes must decode to the original text. No code change.
 - **2026-10-06** — **NO CONSUMER-VISIBLE CHANGE:** SPEC consistency: anchor oracle REDERIVED -> MIXED (the zxing-cpp differential in `tools/oracle.py` is an external anchor for the image-to-text path; `zig build test` stays re-derived); tilt figures in Compared with / Backlog / README now cite the measured 25–30° differential alongside the in-repo sweep.

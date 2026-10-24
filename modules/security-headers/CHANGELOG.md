@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (test). No behaviour change.
 
 - **2026-10-18** — tests: mutation audit of the helmet-parity code (83/85, 2 equivalent). New: run-time CSP builder tests (override/remove order, flags and `sandbox`, `report-to`/`report-uri` tokens, exact-fit buffers, empty directive with a nonce, `NONE` case), every RFC 9110 token character in an `extra` name, and `applyStatic == apply` for every optional header and HSTS flag combination.

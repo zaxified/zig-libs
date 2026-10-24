@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-22** — **NO CONSUMER-VISIBLE CHANGE:** Docs: `bench-rsa` re-measured on a quiet host on Zig 0.17 — worst 1.088× OpenSSL (`signbl_2048`), P2 holds.
 - **2026-10-19** — **Fix:** `Blinding.cached` served one key's pair to the same key with `p` and `q` swapped (audit O3-1). `SecretKey` keeps the primes in the order given and the cached pair is reduced mod `p` and mod `q` separately, but `BlindingCache` matched keys by the public `n` and `e` only — so after `fromPrimes(p, q)`, a `fromPrimes(q, p)` key (or a PKCS#1 file written the other way round) on the same cache failed every op with `error.FaultDetected` (the F3 check; no wrong output) until the 32-op refresh, then the first key did. The cache now also records `p` (secret, wiped by `deinit`) and compares it branch-free, folded into the one existing key-match verdict. Test: the 2048-bit KAT key in both prime orders alternating on one cache signs the KAT signature on every op. ctgrind `crtcache`: the key-match verdict now depends on `p` (expected +1 attributed context, re-pin pending).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).

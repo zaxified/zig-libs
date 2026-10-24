@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `std.ascii.indexOfIgnoreCase` -> `findIgnoreCase` (bench tool). No behaviour change.
 
 - **2026-10-11** — `tracestate` is parsed by the W3C member grammar (new `TraceState`: `parse`/`get`/`put`/`delete`/`write`/`members`; `isValidKey`, `isValidValue`, `max_members`, `max_key_len`, `max_value_len`): a list that fails the grammar or holds more than 32 members is dropped whole (was: carried if every byte was printable), optional whitespace and empty members are dropped, a key's later duplicates are dropped (the left one kept), the outgoing value is re-serialized `k=v,k=v`. New `Options.state_entry` (`StateEntry`): this service's own member, put in front (replacing its old one) and on new traces. Over 512 characters out: whole members left out, over-128-character ones first. Generated trace-/span-ids come from a process-wide atomic sequence with a per-process prefix (was: monotonic ns · thread-address nonce · per-thread counter, which could repeat across connection threads). W3C conformance: the 8 STRICT_LEVEL 2 vectors are asserted now (69 of 73); OpenTelemetry Go oracle divergences 27 → 12. Bench 0.55–0.67× otel (was 0.35–0.47×; the grammar check costs).

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-20** — **Fix:** RS256/384/512 and PS256/384/512 verification read the RSA modulus through a dangling pointer (`rsaKey` took the `Key` by value and returned a pointer into that parameter), so optimized builds refused valid tokens — our own and golang-jwt's — depending on code layout (found by `bench-jwt`'s interop check on Zig 0.17, ReleaseFast and ReleaseSafe; Debug passed). `rsaKey` now takes `*const Key`. Since 2026-10-13 (`0517cb9b`).
 
 - **2026-10-19** — **Fix:** `HttpFetcher` (discovery and JWKS fetches) refuses a redirect from an `https://` URL to `http://`; the https-only key-source check covered only the configured URL, a redirect bypassed it. Test: `refuseSchemeDowngrade` truth table.

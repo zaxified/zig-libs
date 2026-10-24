@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (dangling-temporary fix).
 - **2026-10-10** — tests: deterministic fuzz driver `LNINVOICE_FUZZ`: `lninvoice-bech32-decode`, `lninvoice-bolt11-decode` and `lninvoice-bolt12` over the existing script harnesses (generic over their choice source; driver draws a corpus entry with 0-3 octets damaged), plus two oracles: `lninvoice-bech32-roundtrip` (encode -> decode returns the input, upper-case too, one replaced symbol refused, no-checksum pair round-trips) and `lninvoice-bolt11-sign` (a random key signs a random invoice through `encode`; `decode` returns the signer, amount and fields; a replaced character and a truncation are refused; a signed-region quintet replaced with the checksum recomputed is refused or recovers a different key). No source change.
 - **2026-10-10** — docs: ct axis recorded as n/a. The only secret is the node signing key. `bolt11.encode` (`.private_key`) and `bolt12.signMerkle` hand it by pointer straight to `k256`'s recoverable ECDSA and `bip340.sign`, both measured by their own ctgrind rows; no lninvoice code reads the key. Everything else (invoice fields, the payment secret carried in the invoice, signatures, node ids) is public (code review).

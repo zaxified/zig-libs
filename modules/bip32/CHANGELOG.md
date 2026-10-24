@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE (ReleaseSmall dead-stack fix, partial):** the private `pubkeyFromPriv` takes the key by pointer; by value, with nothing inlined in ReleaseSmall, `neuter` left the master key in its own frame above every burn. ⚠ ReleaseSmall still reports the master CHAIN CODE once per `neuter`, 166 B below the call — the copy of the returned `ExtendedPubKey` (whose `chain_code` the caller receives anyway); open, see SPEC Backlog. ReleaseFast/ReleaseSafe/Debug unchanged and green.
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (dangling-temporary fix).
 - **2026-10-18** — constant time on the xprv paths: `serializePriv`/`parseExtended` use `bech32.base58.checkEncodeSecret`/`checkDecodeSecret` (xpub parsing too), `parseExtended` declassifies the public header before branching on it and checks the private scalar with a constant-time `scalarInRange` (was std `rejectNonCanonical` + `std.mem.allEqual`). Same results and errors. New ctgrind target `xprv` (serialize + parse, scalar tainted): 12 in-file contexts before, 0 after.

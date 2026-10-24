@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-10** — tests: deterministic fuzz driver `DRAND_FUZZ` over the existing harnesses (`drand-parse`, `drand-verify`, `drand-verify-chained`), now generic over their choice source, with reach labels (genuine accepted / damaged refused at parse / damaged refused at verify). No code change in `src/` outside tests.
 - **2026-10-06** — **BEHAVIOURAL (stricter only on hand-built points), API ADDED:** both schemes
   now verify through `bls12_381.scheme`: new `QuicknetSuite` (= `MinSigBasic`) and `ChainedSuite`

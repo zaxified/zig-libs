@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-18** — Ported to Zig 0.17.0. `strRepeat` helper is now `inline fn` (dangling-temporary fix).
 - **2026-10-18** — ctgrind target `wif` (new `src/ctgrind_harness.zig`): private key through `wifEncode` → `wifDecode`, 0 in-file contexts; the pre-2026-10-18 early-exit range check gives 6 (negative control). Pinned in `scripts/checks/ctgrind-expected.tsv`. Tool only, no API change.
 - **2026-10-18** — constant time on the WIF paths: `wifEncode`/`wifDecode` use `bech32.base58.checkEncodeSecret`/`checkDecodeSecret`, the version byte and compression flag are declassified as public metadata, and `keyInRange` is a borrow-and-mask comparison (was `std.mem.eql` + `std.mem.order`, early exit on the key). Same results and errors; `wifEncode`'s `out` must now hold 51 (uncompressed) / 52 (compressed) bytes, which every WIF needs anyway.

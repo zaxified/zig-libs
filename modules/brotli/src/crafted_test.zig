@@ -979,12 +979,14 @@ test "crafted: a command header that needs a second refill near the end of the i
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
 inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n:0]u8 {
+    // One @splat + @bitCast, not a loop: a comptime loop writing into an
+    // array var costs O(n^2) in Sema (40 000 bytes: 8.7 s; http's test
+    // binary spent ~5 min in Sema on these, 2026-10-24).
     const rep_result = comptime blk: {
-        @setEvalBranchQuota(n * (s.len + 4) + 1000);
-        var buf: [s.len * n:0]u8 = undefined;
-        for (0..n) |i| @memcpy(buf[i * s.len ..][0..s.len], s);
-        const rep_final = buf;
-        break :blk rep_final;
+        const unit: [s.len]u8 = s[0..s.len].*;
+        const grid: [n][s.len]u8 = @splat(unit);
+        const flat: [s.len * n]u8 = @bitCast(grid);
+        break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
 }

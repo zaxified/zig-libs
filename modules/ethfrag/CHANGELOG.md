@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
+
 - **2026-10-10** — tests: deterministic fuzz driver `ETHFRAG_FUZZ` over the existing harnesses (now generic over their choice source; the driver draws a corpus entry with 0-3 octets damaged, maybe truncated) with an in-suite reach test per harness. Harness: `reassembler`. Verdict: 200,000 runs, ReleaseSafe, clean.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the fuzz harness gained a
   burst step kind so coverage-guided fuzzing reaches the
