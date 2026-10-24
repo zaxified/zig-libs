@@ -204,6 +204,15 @@ route in Backlog.
 - **P1 again (2026-10-23):** `build` is 1.59× valyala/fasthttp 1.76.0. Route to try: size the
   line first, then write into one slice with `@memcpy` per part instead of many small
   `std.Io.Writer.writeAll` calls; keep validation (it is the lead over fasthttp and cookie-rs).
+  **Tried 2026-10-24, not enough — not committed.** Standalone A/B harness (the bench's 8 specs, hidden
+  from the optimizer, JCC-mitigated builds with `-mbranches-within-32B-boundaries`; unmitigated runs
+  swung ±15 % by layout alone): sizing the line and copying into one `writableSlice` (literals as
+  immediate stores, small parts as overlapping word copies) = −4–5 % cycles; 16-byte compare
+  validation for long values ≈ 0; validation removed ENTIRELY = −12 %. P1 needs −23 % on the row
+  (856 vs 529 ns); about a quarter of the row is the shared checksum loop. So neither route reaches
+  P1 alone; a real attempt needs a cheaper whole `write` (fewer optional branches, Max-Age digits)
+  plus cheaper validation, measured the same way. Inlining the part-by-part fallback beside the fast
+  path tripled the loop's code (13 KiB, front-end bound) — keep any fallback `noinline`.
 
 - **From the 2026-10-23 review (LOW, not defects of a documented promise):** `writeCookiesAt`
   sends at most 256 matching cookies, the first 256 in storage order rather than the most specific
