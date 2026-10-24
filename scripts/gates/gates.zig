@@ -3393,6 +3393,10 @@ fn scanShippedForCopyleft(b: *Build, io: std.Io, dir_path: []const u8, depth: u8
         switch (entry.kind) {
             .directory => {
                 if (containsName(&.{ "zig-out", ".zig-cache", "zig-pkg" }, entry.name)) continue;
+                // A cargo build tree beside its Cargo.toml (`tools/*/target/`,
+                // gitignored): local build output, never shipped; its .rlib
+                // files are past the read limit (rs_field benches, 2026-10-24).
+                if (std.mem.eql(u8, entry.name, "target")) if (dir.access(io, "Cargo.toml", .{})) |_| continue else |_| {};
                 scanShippedForCopyleft(b, io, path, depth + 1, failed);
             },
             .file => {
