@@ -100,11 +100,6 @@ OURS = {
     "r-dt-in-content": "accept",     # DOCTYPE inside the root element
     "r-dt-no-name": "accept",        # <!DOCTYPE> with no name
     "r-dt-bad-subset-open": "accept",  # <!DOCTYPE a ]> (] without [)
-    # XML 1.0 2.11 normalizes line ends in the whole entity, CDATA sections included;
-    # libxml2 does, this module keeps the CR of a CR LF / lone CR inside a CDATA section.
-    # Recorded as the infoset this module produces ("infoset:" + its DUMP).
-    "a-chr-crlf-cdata": "infoset:<{}a>T[780d0a79]</>",
-    "a-cd-cr": "infoset:<{}a>T[610d620d0a63]</>",
 }
 
 cases = []  # (id, sections, desc, bytes, mode)

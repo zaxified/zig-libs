@@ -92,7 +92,8 @@ pub const Pi = struct {
 
 /// One child node, tagged by kind, in document order. Text nodes carry the
 /// entity-expanded, line-ending-normalized character content; CDATA carries
-/// verbatim content (no entity expansion) but is otherwise a text node for
+/// verbatim content (no entity expansion, line ends normalized like every
+/// other part of the document, XML 1.0 §2.11) but is otherwise a text node for
 /// C14N purposes. Comments and PIs are preserved so both with-comments and
 /// without-comments C14N modes are expressible.
 pub const Child = struct {
@@ -1272,9 +1273,13 @@ const Parser = struct {
             if (std.mem.eql(u8, self.src[self.i .. self.i + 3], "]]>")) {
                 const body = self.src[body_start..self.i];
                 try self.validateChars(body);
+                // XML 1.0 §2.11 normalizes line ends in the whole entity, CDATA
+                // sections included (libxml2 does too); keeping the CR changed the
+                // infoset xmldsig's C14N digests.
+                const normalized = try normalizeLineEndings(self.a, body);
                 self.i += 3;
                 var top = &self.stack.items[self.stack.items.len - 1];
-                try top.children.append(self.a, .{ .content = .{ .cdata = body }, .span = .{ .start = start, .end = self.i } });
+                try top.children.append(self.a, .{ .content = .{ .cdata = normalized }, .span = .{ .start = start, .end = self.i } });
                 return;
             }
         }
@@ -2436,6 +2441,15 @@ test "not-wf: line-ending normalization (XML 2.11) in character data" {
     var doc = try parse(testing.allocator, "<a>x\r\ny\rz</a>", .{});
     defer doc.deinit();
     try testing.expectEqualStrings("x\ny\nz", doc.root.children[0].content.text);
+}
+
+test "line-ending normalization (XML 2.11) inside CDATA sections, as libxml2 does" {
+    // Kept the CR until 2026-10-24 (an `OURS` leniency in gen_wf_vectors.py);
+    // C14N then digested a different infoset than libxml2-based verifiers.
+    var doc = try parse(testing.allocator, "<a><![CDATA[a\rb\r\nc]]><![CDATA[\r]]></a>", .{});
+    defer doc.deinit();
+    try testing.expectEqualStrings("a\nb\nc", doc.root.children[0].content.cdata);
+    try testing.expectEqualStrings("\n", doc.root.children[1].content.cdata);
 }
 
 test "wf/not-wf: Name characters follow the actual XML NameStartChar/NameChar grammar, not >= 0x80" {

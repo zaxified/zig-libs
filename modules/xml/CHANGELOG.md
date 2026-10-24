@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — **Behaviour change (fix):** a CR (CR LF or lone CR) inside a CDATA section is now
+  normalized to LF like everywhere else in the document (XML 1.0 §2.11), so `Child.content.cdata` and
+  the C14N that `xmldsig` digests from it match libxml2. Before, the CR was kept (one of the three
+  leniencies recorded the same day); `xmldsig` already normalized when canonicalizing, so its digests
+  do not change — a consumer reading `.cdata` directly does see LF now.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE (tests, tools and licence only):** the vendored slice of
   the W3C XML Conformance Test Suite (130 files, `src/testdata/xmlconf/`) is **removed**: its files
   carry notices that grant no right to redistribute them, and this repository is MIT. Replaced by

@@ -289,7 +289,7 @@ Green in Debug and ReleaseFast (UB-checked). Composition:
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** `src/wf_test.zig` runs 491 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 246 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). Eight deliberate deviations are recorded in the recipe (`ours`): five places where `doctype = .ignore` skips a misplaced or malformed DOCTYPE that libxml2 refuses, `xmlns="<XML namespace>"` accepted, and CR kept inside CDATA sections (libxml2 normalizes line ends there). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (2026-10-24: 883 pass, 1 known disagreement, 0 unexpected; see `tools/README.md`).
+**What the tests actually contain.** `src/wf_test.zig` runs 491 OWN inputs (`src/wf_vectors.zig`, 245 not-well-formed + 246 well-formed, written for the XML 1.0 productions and the Namespaces 1.0 constraints; recipe `tools/gen_wf_vectors.py`) through `parse`; the verdict for each, and the infoset of each accepted one, is libxml2's (through lxml, as a black box). Six deliberate deviations are recorded in the recipe (`ours`): five places where `doctype = .ignore` skips a misplaced or malformed DOCTYPE that libxml2 refuses, and `xmlns="<XML namespace>"` accepted (CR inside CDATA sections, the third finding, was fixed 2026-10-24). `core_test.zig` replays the accepted ones through `.internal_entities` and the writer. The W3C suite is not in the repository (its files grant no right to redistribute): `tools/xmlconf_fetch.sh` downloads it, sha256-pinned, into a gitignored directory and `tools/xmlconf_run.zig` runs it by hand (2026-10-24: 883 pass, 1 known disagreement, 0 unexpected; see `tools/README.md`).
 
 **How it got there.** Until 2026-10-24 a licence-filtered slice of the W3C suite was vendored (130 cases, FIVE real bugs found in it, DONE 6cc02e8); it was replaced because its files carry no redistribution licence.
 
@@ -301,9 +301,8 @@ deferred, with the reason:
 - **Leniencies against libxml2, found 2026-10-24 by the own-input vectors** (recorded as `OURS` in
   `tools/gen_wf_vectors.py`, pinned by `wf_test.zig`, not yet fixed): (1) under `doctype = .ignore` a
   second, misplaced, nameless or `]`-without-`[` DOCTYPE is accepted; (2) `xmlns` bound to the XML
-  namespace URI as the default namespace is accepted; (3) a CR (CR LF or lone) inside a CDATA section
-  is kept, where XML 1.0 §2.11 normalizes it to LF — this one changes the infoset that `xmldsig`/C14N
-  digest, so it is first. Fixing each flips its `OURS` entry. Real suite: XML 1.0 5th-edition
+  namespace URI as the default namespace is accepted. ((3), CR kept inside CDATA, fixed 2026-10-24.)
+  Fixing each flips its `OURS` entry. Real suite: XML 1.0 5th-edition
   version numbers (`1.7`, `x-rmt-008b`) are refused (`UnsupportedVersion`), the runner's one known
   disagreement.
 
