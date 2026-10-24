@@ -30,6 +30,12 @@
 //! BENCH_ROUNDS (default 3) rounds, each keeping its best; ratios are
 //! ours/reference by wall time; the verdict is the worst. Arguments filter
 //! workloads.
+//!
+//! The fastest in the field is timed beside it: `tools/rs_field` (the json5
+//! crate 1.3.1 and json-five 0.3.1, pinned exactly, into `serde_json::Value`;
+//! `cargo build --release --offline`, `BENCH_FAST=0` skips it), over the same
+//! files and with the same `count`. The card's `fastest` figure is ours / the
+//! faster of the two per workload, worst over the workloads.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -39,6 +45,9 @@ const bench_name = "bench-json5";
 const work_dir = ".zig-cache/bench-json5";
 const ref_script = "modules/json5/tools/bench_ref.js";
 const ref_short = "ref";
+const fast_rs_manifest = "modules/json5/tools/rs_field/Cargo.toml";
+const fast_rs_exe = "modules/json5/tools/rs_field/target/release/json5_rs_field";
+const fast_contenders = [_][]const u8{ "json5", "json-five" };
 const gpa = std.heap.smp_allocator;
 
 const Kind = enum { parse, preprocess };
@@ -320,6 +329,9 @@ pub fn main(init: std.process.Init) !u8 {
         break :blk std.mem.trim(u8, r.stdout, " \n");
     };
 
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_fast) rustBuild(arena, io) catch return 1;
+
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
@@ -327,17 +339,23 @@ pub fn main(init: std.process.Init) !u8 {
     try w.print("{s:<24} {s:>13} {s:>13} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "/ref", "spr us", "spr ref" });
     try w.flush();
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
     var banner: []const u8 = "";
+    var fast_banners: [fast_contenders.len][]const u8 = @splat("");
     for (works, 0..) |wk, wi| {
         if (!selected(wk.name, filters)) continue;
         var ours: bench.Side = .{};
         var ref: bench.Side = .{};
+        var fast: [fast_contenders.len]bench.Side = @splat(.{});
         const has_ref = wk.kind == .parse;
         for (0..rounds) |_| {
             if (has_ref) ref.add(try bench.foreignArgv(arena, io, bench_name, &.{ "bun", ref_script, abs, wk.name }, wk.name, &banner));
+            if (has_ref and use_fast) for (fast_contenders, &fast, &fast_banners) |c, *side, *fb| {
+                side.add(try bench.foreignArgv(arena, io, bench_name, &.{ fast_rs_exe, abs, wk.name, c }, wk.name, fb));
+            };
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         max_spread = @max(max_spread, ours.spread(false));
@@ -354,18 +372,50 @@ pub fn main(init: std.process.Init) !u8 {
         mismatch = mismatch or !same;
         try w.print("{s:<24} {d:>13.0} {d:>13.0} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ wk.name, ours.best_ns, ref.best_ns, ratio, 100 * ours.spread(false), 100 * ref.spread(false), ours.count, if (same) "" else " ≠ ref (ref count printed below)" });
         if (!same) try w.print("  ref count {d}\n", .{ref.count});
+        if (use_fast) {
+            var fastest: f64 = std.math.inf(f64);
+            for (fast_contenders, fast) |c, side| {
+                fastest = @min(fastest, side.best_ns);
+                max_spread = @max(max_spread, side.spread(false));
+                const fsame = side.count == ref.count;
+                mismatch = mismatch or !fsame;
+                try w.print("{s:<24} {s:>13} {d:>13.0} {d:>8.3} {s:>7} {d:>6.1}%  {s}{s}\n", .{ "", "", side.best_ns, ours.best_ns / side.best_ns, "", 100 * side.spread(false), c, if (fsame) "" else " ≠ ref" });
+            }
+            worst_fast = @max(worst_fast, ours.best_ns / fastest);
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time; largest spread {d:.1}%{s}\n", .{ rounds, 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     if (banner.len > 0) try w.print("reference: {s}\n", .{std.mem.trim(u8, banner, " \n")});
+    for (fast_banners) |fb| if (fb.len > 0) try w.print("field: {s}\n", .{std.mem.trim(u8, fb, " \n")});
     if (mismatch) {
         try w.writeAll(bench_name ++ ": FAILED -- a result count differs from the reference's; the timing means nothing until it agrees\n");
         try w.flush();
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× json5/json5 2.2.3 (bun {s}) · fastest ? (measured <today>)\n", .{ best, worst, bun_ver });
+    if (use_fast) try w.print("worst ours/fastest = {d:.2}\n", .{worst_fast});
+    if (filters.len == 0) {
+        if (use_fast)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× json5/json5 2.2.3 (bun {s}) · fastest {d:.2}× the json5 crate 1.3.1 / json-five 0.3.1 (Rust) (measured <today>)\n", .{ best, worst, bun_ver, worst_fast })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× json5/json5 2.2.3 (bun {s}) · fastest ? (measured <today>)\n", .{ best, worst, bun_ver });
+    }
     try w.flush();
     return 0;
+}
+
+/// `cargo build --release --offline` of tools/rs_field.
+fn rustBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips this side\n", .{ bench_name, e });
+        return error.CargoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CargoBuildFailed;
+    }
 }

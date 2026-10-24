@@ -11,14 +11,15 @@
 //! layout when indented.
 //!
 //! Not supported (a compile error, or documented below): untagged unions,
-//! `jsonStringify` hooks (ignored), many-item pointers without a sentinel,
-//! cyclic data (the reference throws; here the recursion is the caller's
-//! problem). String bytes are written as they are, UTF-8 is not validated.
+//! `jsonStringify` hooks (ignored), many-item pointers without a sentinel.
+//! Nesting deeper than `Options.max_depth` -- cyclic data among it -- is
+//! `error.NestingTooDeep` (the reference throws too). String bytes are written
+//! as they are, UTF-8 is not validated.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
 
-pub const Error = Writer.Error;
+pub const Error = Writer.Error || error{NestingTooDeep};
 
 /// The longest indent the reference allows (`Math.min(10, space)`).
 pub const max_indent = 10;
@@ -49,6 +50,12 @@ pub const Options = struct {
     /// Trailing comma after the last member/element when indented (reference:
     /// yes). Never written in the compact form.
     trailing_commas: bool = true,
+    /// Containers nested deeper than this are `error.NestingTooDeep`. The
+    /// writer recurses once per level; `parseFromSlice` builds a
+    /// `std.json.Value` of any depth without recursing, so a hostile
+    /// `[[[[…` that parses would otherwise overflow the stack here
+    /// (review 2026-10-24).
+    max_depth: usize = 1000,
 };
 
 /// Write a `std.json.Value` tree as JSON5. `.number_string` is written
@@ -203,6 +210,7 @@ const Ser = struct {
     }
 
     fn open(self: *Ser, ch: u8) Error!void {
+        if (self.level >= self.o.max_depth) return error.NestingTooDeep;
         try self.w.writeByte(ch);
         self.level += 1;
     }
@@ -453,6 +461,35 @@ fn same(a: std.json.Value, b: std.json.Value) bool {
         },
         else => unreachable,
     }
+}
+
+test "nesting deeper than max_depth is an error, not a stack overflow" {
+    // Review 2026-10-24: `parseFromSlice` builds a `std.json.Value` of any
+    // depth without recursing; this writer recurses once per level.
+    const root = @import("root.zig");
+    const gpa = std.testing.allocator;
+    const open_: [100_000]u8 = @splat('[');
+    const close_: [100_000]u8 = @splat(']');
+    const deep = try std.mem.concat(gpa, u8, &.{ &open_, &close_ });
+    defer gpa.free(deep);
+    const v = try root.parseFromSlice(std.json.Value, gpa, deep, .{});
+    defer v.deinit();
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try std.testing.expectError(error.NestingTooDeep, writeValue(&aw.writer, v.value, .{}));
+    // The limit is the deepest container allowed, exactly.
+    const three = try root.parseFromSlice(std.json.Value, gpa, "[[[]]]", .{});
+    defer three.deinit();
+    aw.clearRetainingCapacity();
+    try writeValue(&aw.writer, three.value, .{ .max_depth = 3 });
+    try std.testing.expectEqualStrings("[[[]]]", aw.written());
+    try std.testing.expectError(error.NestingTooDeep, writeValue(&aw.writer, three.value, .{ .max_depth = 2 }));
+    // Within the limit it writes as before.
+    const v2 = try root.parseFromSlice(std.json.Value, gpa, deep[100_000 - 500 .. 100_000 + 500], .{});
+    defer v2.deinit();
+    aw.clearRetainingCapacity();
+    try writeValue(&aw.writer, v2.value, .{});
+    try std.testing.expectEqual(@as(usize, 1000), aw.written().len);
 }
 
 test "goldens from the reference json5 2.2.3" {

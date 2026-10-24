@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-24** — `parseFromSlice(std.json.Value, ...)` is 1.7× faster: a single-pass reader takes the
+  documents it is sure of straight into the `Value` and hands every other one (all errors among them)
+  to the unchanged two-stage path, so values and errors are what they were (differential fuzz + every
+  corpus document). `preprocess` itself 1.9× faster (bulk string/whitespace copies, a reserved output
+  buffer, the recovery prefix computed only when needed). `zig build bench-json5` now also times the
+  Rust json5 1.3.1 and json-five 0.3.1 crates (`tools/rs_field`): 0.68× the faster. `tools/interop.zig`
+  re-takes the reference oracle (`zig build interop-json5 [-- --check]`). Card: grade 2 → 1.
+- **2026-10-24** — Review fixes: `preprocessAnnotated` freed queued messages twice, and leaked one,
+  when an allocation failed; `SourceMap` kept the points of a removed trailing comma, so positions
+  just after `}`/`]` mapped into the removed gap; recovery messages could carry raw control bytes or
+  half a UTF-8 character (invalid JSON); the annotated missing-colon message did not cap the key; an
+  unquoted key's `\u` escape took a sign (`\u+041`). `parseFromSlice` now also honours a diagnostic
+  set in `ParseOptions.json5` and leaves it untouched on `error.OutOfMemory`.
+- **2026-10-24** — **BREAKING (stringify error set):** `stringify.Error` gains `error.NestingTooDeep`
+  past the new `Options.max_depth` (default 1000). A `std.json.Value` of any depth parses without
+  recursion; writing a hostile `[[[[…` overflowed the stack.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-20** — `zig build bench-json5` (`tools/bench.zig` + `tools/bench_ref.js`, json5 2.2.3 under

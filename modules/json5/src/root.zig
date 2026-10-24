@@ -89,14 +89,21 @@ pub const SourceMap = struct {
     }
 
     fn record(self: *SourceMap, alloc: std.mem.Allocator, out: usize, src: usize) !void {
-        if (self.points.items.len != 0) {
+        while (self.points.items.len != 0) {
             const last = &self.points.items[self.points.items.len - 1];
+            if (last.out < out) break;
             // Nothing emitted since: the token about to emit at `out` is the
             // one an error there belongs to.
             if (last.out == out) {
                 last.src = src;
                 return;
             }
+            // Output past `out` was taken back (a trailing comma and the
+            // space after it, removed before `}`/`]`): its points go too.
+            // They used to stay, and the binary search in `sourceOffset`,
+            // which needs points sorted by `out`, mapped the bytes after the
+            // closer into the removed gap (review 2026-10-24).
+            _ = self.points.pop();
         }
         try self.points.append(alloc, .{ .out = out, .src = src });
     }
@@ -105,7 +112,9 @@ pub const SourceMap = struct {
     /// how far into that token's output `out` lies — exact inside text copied
     /// verbatim (most tokens), the token's start where the preprocessor
     /// rewrote it (a quoted key, a converted number), never past the next
-    /// token's start.
+    /// token's start. Inside a string whose escapes changed length (`\x41`,
+    /// `\v`, a line continuation) a position after them can be off by the
+    /// difference. A map is filled by one call; pass an empty one.
     pub fn sourceOffset(self: *const SourceMap, out: usize) usize {
         const pts = self.points.items;
         if (pts.len == 0) return out;
@@ -124,14 +133,22 @@ pub const SourceMap = struct {
 };
 
 /// How `parseFromSlice` reads the document: the JSON5 options (non-finite
-/// numbers) and the `std.json` ones (duplicate keys, unknown fields, depth
-/// via `max_value_len`), plus where to put a failure's position.
+/// numbers) and the `std.json` ones (duplicate keys, unknown fields, the
+/// longest string or number via `max_value_len`), plus where to put a
+/// failure's position. There is no depth limit: into a `std.json.Value` the
+/// parse is iterative (std's and this module's alike), so depth costs heap,
+/// not stack.
 pub const ParseOptions = struct {
+    /// `json5.diagnostic` is used when `diagnostic` below is null;
+    /// `json5.source_map` is filled when neither is set (with one,
+    /// `parseFromSlice` keeps its own map).
     json5: Options = .{},
     json: std.json.ParseOptions = .{},
-    /// Filled on any failure — the preprocessor's own (as before) and, now,
-    /// `std.json`'s: line, col and offset in the JSON5 SOURCE, the error's name
-    /// as `message`.
+    /// Filled on any failure but running out of memory — the preprocessor's
+    /// own and `std.json`'s: line, col and offset in the JSON5 SOURCE, the
+    /// error's name as `message`. Setting it (or `json5.source_map`) also
+    /// turns off the single-pass `std.json.Value` reader: positions come
+    /// from the two-stage path.
     diagnostic: ?*Diagnostic = null,
 };
 
@@ -142,11 +159,22 @@ pub const ParseOptions = struct {
 /// source — not in the intermediate JSON, which is what `std.json` alone
 /// would report.
 pub fn parseFromSlice(comptime T: type, alloc: std.mem.Allocator, input: []const u8, opts: ParseOptions) !std.json.Parsed(T) {
+    // Into a `std.json.Value`, a single pass reads the documents it is sure of
+    // straight from the source; anything else -- every error among them --
+    // takes the two-stage path below, so what is refused, and how, is
+    // decided there alone (see `ValueReader`).
+    // Either place for the diagnostic counts; `opts.diagnostic` wins. Only
+    // `opts.diagnostic` used to, and one set in `opts.json5` was silently
+    // dropped (review 2026-10-24).
+    const diagnostic = opts.diagnostic orelse opts.json5.diagnostic;
+    if (T == std.json.Value and diagnostic == null and opts.json5.source_map == null) {
+        if (try parseValueDirect(alloc, input, opts)) |parsed| return parsed;
+    }
     var map: SourceMap = .{};
     defer map.deinit(alloc);
     var o5 = opts.json5;
-    o5.diagnostic = opts.diagnostic;
-    if (opts.diagnostic != null) o5.source_map = &map;
+    o5.diagnostic = diagnostic;
+    if (diagnostic != null) o5.source_map = &map;
     const text = try preprocessWithOptions(alloc, input, o5);
     defer alloc.free(text);
 
@@ -157,13 +185,370 @@ pub fn parseFromSlice(comptime T: type, alloc: std.mem.Allocator, input: []const
     var jo = opts.json;
     jo.allocate = .alloc_always;
     return std.json.parseFromTokenSource(T, alloc, &scanner, jo) catch |e| {
-        if (opts.diagnostic) |d| {
+        // Running out of memory has no position in the document.
+        if (e == error.OutOfMemory) return e;
+        if (diagnostic) |d| {
             const off = @min(map.sourceOffset(@intCast(diag.getByteOffset())), input.len);
             const lc = lineCol(input, off);
             d.* = .{ .line = lc.line, .col = lc.col, .offset = off, .len = 0, .message = @errorName(e) };
         }
         return e;
     };
+}
+
+/// `parseFromSlice(std.json.Value, ...)` in one pass, or null: then the
+/// caller runs the two-stage path, which gives the same value or the error.
+fn parseValueDirect(alloc: std.mem.Allocator, input: []const u8, opts: ParseOptions) !?std.json.Parsed(std.json.Value) {
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    errdefer alloc.destroy(arena);
+    arena.* = .init(alloc);
+    errdefer arena.deinit();
+    var o5 = opts.json5;
+    o5.diagnostic = null;
+    o5.source_map = null;
+    var r: ValueReader = .{ .in = input, .arena = arena.allocator(), .o5 = o5, .jo = opts.json };
+    if (try r.document()) |v| {
+        if (@import("builtin").is_test) _ = direct_taken.fetchAdd(1, .monotonic);
+        return .{ .arena = arena, .value = v };
+    }
+    arena.deinit();
+    alloc.destroy(arena);
+    return null;
+}
+
+/// Test builds only: how many documents `parseValueDirect` has taken, so the
+/// differential harness can tell its two paths apart. Always 0 otherwise.
+/// Atomic: a consumer's test binary may parse from several threads.
+pub var direct_taken: std.atomic.Value(usize) = .init(0);
+
+/// The single-pass reader behind `parseValueDirect`: JSON5 source straight
+/// into a `std.json.Value`, built exactly as `preprocessWithOptions` followed
+/// by `std.json`'s `Value.jsonParse` would build it (same number rules via
+/// `Value.parseFromNumberSlice` over the JSON text `emitNumber` writes, same
+/// `getOrPut` duplicate-key handling, strings always copied, the same escape
+/// decoding). It never decides a refusal: on anything it does not take --
+/// a syntax error, `Infinity`/`NaN`, a surrogate escape, invalid UTF-8, the
+/// preprocessor's key recovery, a value over `max_value_len` -- it answers
+/// null and the two-stage path decides. The differential fuzz harness
+/// (`fuzz_test.zig`, `directHarness`) holds it to that.
+const ValueReader = struct {
+    in: []const u8,
+    i: usize = 0,
+    arena: std.mem.Allocator,
+    o5: Options,
+    jo: std.json.ParseOptions,
+    /// Decoded string / normalized number text, reused.
+    scratch: std.ArrayList(u8) = .empty,
+
+    const Value = std.json.Value;
+    /// Not a decision: the two-stage path takes over.
+    const Fallback = error{Fallback};
+    const Error = Fallback || std.mem.Allocator.Error;
+
+    fn document(r: *ValueReader) std.mem.Allocator.Error!?Value {
+        return r.run() catch |e| switch (e) {
+            error.Fallback => null,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    }
+
+    fn run(r: *ValueReader) Error!Value {
+        // Same stack grammar as `Value.jsonParse`: (.array | .object .string)*.
+        var stack = std.json.Array.init(r.arena);
+        try r.skip();
+        outer: while (true) {
+            var v: Value = switch (try r.peek()) {
+                '{' => blk: {
+                    r.i += 1;
+                    try r.skip();
+                    if (try r.peek() == '}') {
+                        r.i += 1;
+                        break :blk .{ .object = .empty };
+                    }
+                    try stack.append(.{ .object = .empty });
+                    try stack.append(.{ .string = try r.key() });
+                    continue :outer;
+                },
+                '[' => blk: {
+                    r.i += 1;
+                    try r.skip();
+                    if (try r.peek() == ']') {
+                        r.i += 1;
+                        break :blk .{ .array = std.json.Array.init(r.arena) };
+                    }
+                    try stack.append(.{ .array = std.json.Array.init(r.arena) });
+                    continue :outer;
+                },
+                '"', '\'' => .{ .string = try r.string() },
+                '0'...'9', '-', '+', '.' => try r.number(),
+                't' => try r.literal("true", .{ .bool = true }),
+                'f' => try r.literal("false", .{ .bool = false }),
+                'n' => try r.literal("null", .null),
+                else => return error.Fallback,
+            };
+            // A complete value: attach it, closing every container it completes.
+            while (true) {
+                try r.skip();
+                if (stack.items.len == 0) {
+                    if (r.i != r.in.len) return error.Fallback;
+                    return v;
+                }
+                switch (stack.items[stack.items.len - 1]) {
+                    .array => |*a| {
+                        try a.append(v);
+                        if (!try r.separator(']')) continue :outer;
+                        v = stack.pop().?;
+                    },
+                    .string => |k| {
+                        _ = stack.pop();
+                        const obj = &stack.items[stack.items.len - 1].object;
+                        const gop = try obj.getOrPut(r.arena, k);
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = v;
+                        } else switch (r.jo.duplicate_field_behavior) {
+                            .use_first => {},
+                            .@"error" => return error.Fallback,
+                            .use_last => gop.value_ptr.* = v,
+                        }
+                        if (!try r.separator('}')) {
+                            try stack.append(.{ .string = try r.key() });
+                            continue :outer;
+                        }
+                        v = stack.pop().?;
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+    }
+
+    fn peek(r: *ValueReader) Fallback!u8 {
+        if (r.i >= r.in.len) return error.Fallback;
+        return r.in[r.i];
+    }
+
+    /// After a member: `close` (consumed, true), or `,` and then either a
+    /// trailing comma's `close` (true) or the next member's start (false).
+    fn separator(r: *ValueReader, close: u8) Error!bool {
+        const c = try r.peek();
+        r.i += 1;
+        if (c == close) return true;
+        if (c != ',') return error.Fallback;
+        try r.skip();
+        if (try r.peek() == close) {
+            r.i += 1;
+            return true;
+        }
+        return false;
+    }
+
+    /// Past whitespace -- JSON's and JSON5's -- and comments. An unterminated
+    /// `/*` is the two-stage path's to refuse.
+    fn skip(r: *ValueReader) Fallback!void {
+        const in = r.in;
+        var i = r.i;
+        while (i < in.len) {
+            const c = in[i];
+            if (isWs(c)) {
+                i += 1;
+            } else if (c == '/' and i + 1 < in.len and in[i + 1] == '/') {
+                i += 2;
+                while (i < in.len and in[i] != '\n' and in[i] != '\r' and !isLsPs(in, i)) i += 1;
+            } else if (c == '/' and i + 1 < in.len and in[i + 1] == '*') {
+                const end = std.mem.findPos(u8, in, i + 2, "*/") orelse return error.Fallback;
+                i = end + 2;
+            } else {
+                const w = json5WsLen(in, i);
+                if (w == 0) break;
+                i += w;
+            }
+        }
+        r.i = i;
+    }
+
+    fn literal(r: *ValueReader, comptime word: []const u8, v: Value) Fallback!Value {
+        if (!std.mem.startsWith(u8, r.in[r.i..], word)) return error.Fallback;
+        r.i += word.len;
+        return v;
+    }
+
+    /// The number at `r.i` as `emitNumber` rewrites it, then as `std.json`
+    /// reads that text -- if it is a JSON number at all.
+    fn number(r: *ValueReader) Error!Value {
+        r.scratch.clearRetainingCapacity();
+        var lines: LineCounter = .{};
+        r.i = emitNumber(r.arena, &r.scratch, r.in, r.i, r.o5, true, &lines) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.Fallback,
+        };
+        const text = r.scratch.items;
+        if (!isJsonNumber(text)) return error.Fallback;
+        if (r.jo.max_value_len) |max| if (text.len > max) return error.Fallback;
+        if (r.jo.parse_numbers) switch (Value.parseFromNumberSlice(text)) {
+            .number_string => {},
+            else => |v| return v,
+        };
+        return .{ .number_string = try r.arena.dupe(u8, text) };
+    }
+
+    /// A quoted string (either quote) at `r.i`, decoded into a fresh copy.
+    fn string(r: *ValueReader) Error![]const u8 {
+        const in = r.in;
+        const q = in[r.i];
+        var i = r.i + 1;
+        const out = &r.scratch;
+        out.clearRetainingCapacity();
+        while (true) {
+            const run_len = if (q == '"') plainRunLen(in[i..], '"') else plainRunLen(in[i..], '\'');
+            try out.appendSlice(r.arena, in[i..][0..run_len]);
+            i += run_len;
+            if (i >= in.len) return error.Fallback;
+            const b = in[i];
+            if (b == q) {
+                i += 1;
+                break;
+            }
+            if (b == '"') { // in a single-quoted string: content
+                try out.append(r.arena, b);
+                i += 1;
+                continue;
+            }
+            if (b < 0x20) { // raw LF/CR: unterminated; any other control is content
+                if (b == '\n' or b == '\r') return error.Fallback;
+                try out.append(r.arena, b);
+                i += 1;
+                continue;
+            }
+            // `\`
+            if (i + 1 >= in.len) return error.Fallback;
+            const lt = lineTerminatorLen(in, i + 1);
+            if (lt > 0) { // line continuation
+                i += 1 + lt;
+                continue;
+            }
+            const e = in[i + 1];
+            i += 2;
+            switch (e) {
+                'b' => try out.append(r.arena, 0x08),
+                'f' => try out.append(r.arena, 0x0C),
+                'n' => try out.append(r.arena, '\n'),
+                'r' => try out.append(r.arena, '\r'),
+                't' => try out.append(r.arena, '\t'),
+                'v' => try out.append(r.arena, 0x0B),
+                '0' => {
+                    if (i < in.len and std.ascii.isDigit(in[i])) return error.Fallback;
+                    try out.append(r.arena, 0);
+                },
+                '1'...'9' => return error.Fallback,
+                'x' => {
+                    const cp = hexValue(in, i, 2) orelse return error.Fallback;
+                    i += 2;
+                    try appendCodepoint(out, r.arena, cp);
+                },
+                'u' => {
+                    const cp = hexValue(in, i, 4) orelse return error.Fallback;
+                    i += 4;
+                    // Surrogates (paired or not) are `std.json`'s to judge.
+                    if (cp >= 0xD800 and cp <= 0xDFFF) return error.Fallback;
+                    try appendCodepoint(out, r.arena, cp);
+                },
+                // `"` `'` `\` `/` and every NonEscapeCharacter: itself (the
+                // rest of a multi-byte character follows as plain bytes).
+                else => try out.append(r.arena, e),
+            }
+        }
+        if (!std.unicode.utf8ValidateSlice(out.items)) return error.Fallback;
+        if (r.jo.max_value_len) |max| if (out.items.len > max) return error.Fallback;
+        r.i = i;
+        return r.arena.dupe(u8, out.items);
+    }
+
+    /// An object key at `r.i`, then its `:` (consumed), whitespace skipped
+    /// on both sides. A key the preprocessor would route into `$err_trace`
+    /// recovery is not taken.
+    fn key(r: *ValueReader) Error![]const u8 {
+        const in = r.in;
+        const k = switch (try r.peek()) {
+            '"', '\'' => try r.string(),
+            else => blk: {
+                const start = r.i;
+                if (identUnitLen(in, start, true) == 0) return error.Fallback;
+                var i = start;
+                while (i < in.len) {
+                    if (i != start and isIdentByte(in[i])) {
+                        i += 1;
+                        continue;
+                    }
+                    const n = identUnitLen(in, i, i == start);
+                    if (n == 0) break;
+                    i += n;
+                }
+                const out = &r.scratch;
+                out.clearRetainingCapacity();
+                var j = start;
+                while (j < i) {
+                    if (in[j] == '\\') { // `\uXXXX`, a non-surrogate (identUnitLen)
+                        const cp = hexValue(in, j + 2, 4) orelse return error.Fallback;
+                        try appendCodepoint(out, r.arena, cp);
+                        j += 6;
+                    } else {
+                        try out.append(r.arena, in[j]);
+                        j += 1;
+                    }
+                }
+                if (!std.unicode.utf8ValidateSlice(out.items)) return error.Fallback;
+                if (r.jo.max_value_len) |max| if (out.items.len > max) return error.Fallback;
+                r.i = i;
+                break :blk try r.arena.dupe(u8, out.items);
+            },
+        };
+        try r.skip();
+        if (try r.peek() != ':') return error.Fallback;
+        r.i += 1;
+        try r.skip();
+        return k;
+    }
+};
+
+/// `n` hex digits at `in[at..]` (strict: no sign), or null.
+fn hexValue(in: []const u8, at: usize, comptime n: usize) ?u21 {
+    if (at + n > in.len) return null;
+    var v: u21 = 0;
+    for (in[at..][0..n]) |h| v = v * 16 + (std.fmt.charToDigit(h, 16) catch return null);
+    return v;
+}
+
+fn appendCodepoint(out: *std.ArrayList(u8), alloc: std.mem.Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(cp, &buf) catch unreachable; // callers exclude surrogates
+    try out.appendSlice(alloc, buf[0..n]);
+}
+
+/// RFC 8259 §6 `number`, the whole of `s`: what `std.json`'s scanner takes
+/// as one number token.
+fn isJsonNumber(s: []const u8) bool {
+    var i: usize = 0;
+    if (i < s.len and s[i] == '-') i += 1;
+    if (i >= s.len) return false;
+    if (s[i] == '0') {
+        i += 1;
+    } else if (s[i] >= '1' and s[i] <= '9') {
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+    } else return false;
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        const f = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == f) return false;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        const f = i;
+        while (i < s.len and std.ascii.isDigit(s[i])) i += 1;
+        if (i == f) return false;
+    }
+    return i == s.len;
 }
 
 fn lineCol(input: []const u8, off: usize) struct { line: usize, col: usize } {
@@ -186,11 +571,17 @@ pub fn preprocess(alloc: std.mem.Allocator, input: []const u8) ![]u8 {
 
 /// `preprocess` with `Options`.
 pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, options: Options) ![]u8 {
-    const prefix = try diagnosticPrefix(alloc, input, "$err_trace_");
-    defer alloc.free(prefix);
+    // Needed only once recovery emits an entry: computing it scans the whole
+    // input, which a document without errors should not pay for.
+    var prefix: ?[]u8 = null;
+    defer if (prefix) |p| alloc.free(p);
     var lines: LineCounter = .{};
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
+    // The output is the input give or take a few bytes per token (quoted keys,
+    // `.5` -> `0.5`); reserving it up front keeps the per-byte appends below
+    // off the growth path (a capacity check per byte was 16 % of a 1 MB parse).
+    try out.ensureTotalCapacity(alloc, input.len + input.len / 16 + 64);
     // nest tracks the current container context ("{" or "[") per depth level.
     // This is needed to set key_pos correctly after a comma: inside an object
     // the next token is a key; inside an array it's a value.
@@ -204,12 +595,31 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
         const c = input[i];
         if (options.source_map) |sm| try sm.record(alloc, out.items.len, i);
 
+        // ── JSON whitespace — copied through, a run at a time ───────────────
+        // Every branch below would copy it unchanged one byte per iteration
+        // (the key-position recovery skips it, `isWs`); one source-map point
+        // per run maps each of its bytes exactly as one per byte did.
+        if (isWs(c)) {
+            var e = i + 1;
+            while (e < input.len and isWs(input[e])) e += 1;
+            try pushSlice(&out, alloc, input[i..e]);
+            i = e;
+            continue;
+        }
+
         // ── double-quoted string — copy verbatim ────────────────────────────
         if (c == '"') {
             key_pos = false;
-            try out.append(alloc, c);
+            try push(&out, alloc, c);
             i += 1;
             while (i < input.len) {
+                // Bytes that need no decision come over as one slice.
+                const run = plainRunLen(input[i..], '"');
+                if (run > 0) {
+                    try pushSlice(&out, alloc, input[i..][0..run]);
+                    i += run;
+                    if (i >= input.len) break;
+                }
                 const sc = input[i];
                 if (sc == '\\' and i + 1 < input.len) {
                     // JSON5 line continuation: backslash + line terminator
@@ -234,9 +644,15 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
         // ── single-quoted string — convert to double-quoted ─────────────────
         if (c == '\'') {
             key_pos = false;
-            try out.append(alloc, '"');
+            try push(&out, alloc, '"');
             i += 1;
             while (i < input.len) {
+                const run = plainRunLen(input[i..], '\'');
+                if (run > 0) {
+                    try pushSlice(&out, alloc, input[i..][0..run]);
+                    i += run;
+                    if (i >= input.len) break;
+                }
                 const sc = input[i];
                 i += 1;
                 if (sc == '\\' and i < input.len) {
@@ -249,7 +665,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                 } else if (sc == '"') {
                     try out.appendSlice(alloc, "\\\""); // escape " inside
                 } else if (sc == '\'') {
-                    try out.append(alloc, '"'); // the closing quote, only when the input has one
+                    try push(&out, alloc, '"'); // the closing quote, only when the input has one
                     break;
                 } else {
                     try appendStringByte(&out, alloc, sc);
@@ -312,7 +728,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                 // `[1/*c*/2]` became `[12]`, turning a must-reject input into
                 // a valid document with a fabricated value
                 // (W2 re-audit 2026-09-02, `json5` F6).
-                try out.append(alloc, ' ');
+                try push(&out, alloc, ' ');
                 continue;
             }
         }
@@ -323,7 +739,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
         if (c == 0x0B or c == 0x0C or c >= 0x80) {
             const wl = json5WsLen(input, i);
             if (wl > 0) {
-                try out.append(alloc, ' ');
+                try push(&out, alloc, ' ');
                 i += wl;
                 continue;
             }
@@ -342,38 +758,38 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
             '{' => {
                 try nest.append(alloc, '{');
                 key_pos = true;
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             '}' => {
                 _ = nest.pop();
                 key_pos = false;
                 removeTrailingComma(&out);
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             '[' => {
                 try nest.append(alloc, '[');
                 key_pos = false;
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             ']' => {
                 _ = nest.pop();
                 key_pos = false;
                 removeTrailingComma(&out);
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             ':' => {
                 key_pos = false;
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             ',' => {
                 // after a comma inside an object, the next token is a key
                 key_pos = nest.items.len > 0 and nest.items[nest.items.len - 1] == '{';
-                try out.append(alloc, c);
+                try push(&out, alloc, c);
                 i += 1;
             },
             // ── unquoted identifier in key position ─────────────────────────
@@ -381,6 +797,13 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                 if (key_pos and identUnitLen(input, i, true) > 0) {
                     const key_start = i;
                     while (i < input.len) {
+                        // ASCII letters, digits, `_`, `$` after the first
+                        // unit: what `identUnitLen` answers 1 for, without
+                        // the call.
+                        if (i != key_start and isIdentByte(input[i])) {
+                            i += 1;
+                            continue;
+                        }
                         const n = identUnitLen(input, i, i == key_start);
                         if (n == 0) break;
                         i += n;
@@ -394,9 +817,9 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                     const j = skipJson5WsAndComments(input, i);
                     if (j >= input.len or input[j] == ':') {
                         // Normal path: output quoted key
-                        try out.append(alloc, '"');
-                        try out.appendSlice(alloc, input[key_start..i]);
-                        try out.append(alloc, '"');
+                        try push(&out, alloc, '"');
+                        try pushSlice(&out, alloc, input[key_start..i]);
+                        try push(&out, alloc, '"');
                         key_pos = false;
                     } else {
                         // Error recovery: junk before ':' (e.g. space inside unquoted key).
@@ -416,7 +839,8 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         const colon = findKeyColon(input, j);
                         const err_line = lines.at(input, key_start);
                         err_counter += 1;
-                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, err_counter });
+                        if (prefix == null) prefix = try diagnosticPrefix(alloc, input, "$err_trace_");
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix.?, err_counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         if (colon >= input.len or input[colon] != ':') {
@@ -465,7 +889,8 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         const val_end = skipValue(input, skip_from);
                         const raw = trimForMessage(input[bad_start..val_end]);
                         err_counter += 1;
-                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix, err_counter });
+                        if (prefix == null) prefix = try diagnosticPrefix(alloc, input, "$err_trace_");
+                        const head = try alloc.print("\"{s}{d}\": ", .{ prefix.?, err_counter });
                         defer alloc.free(head);
                         try out.appendSlice(alloc, head);
                         const msg = try alloc.print("'{s}' --> key is not an identifier this module accepts, at line {d}", .{ raw, line });
@@ -475,7 +900,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
                         key_pos = false;
                         continue;
                     }
-                    try out.append(alloc, c);
+                    try push(&out, alloc, c);
                     i += 1;
                 }
             },
@@ -506,9 +931,13 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
     // does `std.json` now that it is left open (the reference JSON5 oracle,
     // 2026-10-05). `preprocessAnnotated` applies the same rule, so the two
     // still agree on whether the result parses.
+    // End of input is a position too: `std.json`'s UnexpectedEndOfInput
+    // points at the output's end, which must not map into a trailing comma
+    // the last closer removed (review 2026-10-24).
+    if (options.source_map) |sm| try sm.record(alloc, out.items.len, input.len);
     if (err_counter > 0) while (nest.items.len > 0) {
         removeTrailingComma(&out);
-        try out.append(alloc, if (nest.items[nest.items.len - 1] == '{') @as(u8, '}') else @as(u8, ']'));
+        try push(&out, alloc, if (nest.items[nest.items.len - 1] == '{') @as(u8, '}') else @as(u8, ']'));
         _ = nest.pop();
     };
 
@@ -585,7 +1014,9 @@ fn identUnitLen(input: []const u8, i: usize, start: bool) usize {
     if (std.ascii.isDigit(c)) return if (start) 0 else 1;
     if (c == '\\') {
         if (i + 6 > input.len or input[i + 1] != 'u') return 0;
-        const cp = std.fmt.parseInt(u16, input[i + 2 .. i + 6], 16) catch return 0;
+        // Strict hex: `parseInt` also took a sign, so `\u+041` passed as an
+        // identifier unit (review 2026-10-24).
+        const cp = hexValue(input, i + 2, 4) orelse return 0;
         if (cp < 0x80) {
             const b: u8 = @intCast(cp);
             const ok = std.ascii.isAlphabetic(b) or b == '_' or b == '$' or (!start and std.ascii.isDigit(b));
@@ -899,7 +1330,7 @@ fn skipJson5Ws(input: []const u8, from: usize) usize {
 /// they are not content but an unterminated string, which must stay a
 /// rejection (the callers' line-continuation and recovery logic handles them).
 fn appendStringByte(out: *std.ArrayList(u8), alloc: std.mem.Allocator, b: u8) !void {
-    if (b >= 0x20 or b == '\n' or b == '\r') return out.append(alloc, b);
+    if (b >= 0x20 or b == '\n' or b == '\r') return push(out, alloc, b);
     switch (b) {
         '\t' => try out.appendSlice(alloc, "\\t"),
         0x08 => try out.appendSlice(alloc, "\\b"),
@@ -969,7 +1400,12 @@ pub const message_fragment_max = 30;
 
 fn trimForMessage(raw: []const u8) []const u8 {
     const t = std.mem.trim(u8, raw, " \t\r\n");
-    return if (t.len > message_fragment_max) t[0..message_fragment_max] else t;
+    if (t.len <= message_fragment_max) return t;
+    // Never inside a UTF-8 sequence: half a character in a message is
+    // invalid UTF-8, which `std.json` refuses (review 2026-10-24).
+    var end: usize = message_fragment_max;
+    while (end > 0 and t[end] & 0xC0 == 0x80) end -= 1;
+    return t[0..end];
 }
 
 /// A diagnostic key prefix that provably does not occur in `input`.
@@ -1164,6 +1600,13 @@ fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u
         '\n' => try out.appendSlice(alloc, "\\n"),
         '\r' => try out.appendSlice(alloc, "\\r"),
         '\t' => try out.appendSlice(alloc, "\\t"),
+        // Every other control byte too: a raw one (a form feed or a U+0001
+        // copied out of the source into a recovery message) made the
+        // "recovered" document invalid JSON (review 2026-10-24).
+        0...0x08, 0x0B, 0x0C, 0x0E...0x1F => {
+            var buf: [6]u8 = undefined;
+            try out.appendSlice(alloc, std.mem.print(&buf, "\\u{x:0>4}", .{ch}) catch unreachable);
+        },
         else => try out.append(alloc, ch),
     };
     try out.append(alloc, '"');
@@ -1178,6 +1621,43 @@ pub const AnnotatedResult = struct {
 
 fn isWs(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// `out.append` with the capacity check inlined: `preprocessWithOptions`
+/// reserves the output up front, so the call to the growth path is the rare
+/// case rather than one per emitted byte.
+inline fn push(out: *std.ArrayList(u8), alloc: std.mem.Allocator, c: u8) !void {
+    if (out.items.len < out.capacity) return out.appendAssumeCapacity(c);
+    return out.append(alloc, c);
+}
+
+/// `out.appendSlice`, likewise with the capacity check inlined.
+inline fn pushSlice(out: *std.ArrayList(u8), alloc: std.mem.Allocator, b: []const u8) !void {
+    if (out.capacity - out.items.len >= b.len) return out.appendSliceAssumeCapacity(b);
+    return out.appendSlice(alloc, b);
+}
+
+/// Length of the prefix of a string body `s` that `appendStringByte` would
+/// copy unchanged and that ends nothing: no `quote`, no `"` (a single-quoted
+/// body escapes it), no `\` and no control byte. 32-byte vector compares,
+/// scalar tail (csvstream `findAny` idiom).
+fn plainRunLen(s: []const u8, comptime quote: u8) usize {
+    const lanes = 32;
+    const V = @Vector(lanes, u8);
+    var i: usize = 0;
+    while (i + lanes <= s.len) : (i += lanes) {
+        const v: V = s[i..][0..lanes].*;
+        var bits: u32 = @bitCast(v < @as(V, @splat(0x20)));
+        bits |= @as(u32, @bitCast(v == @as(V, @splat('"'))));
+        bits |= @as(u32, @bitCast(v == @as(V, @splat('\\'))));
+        if (quote != '"') bits |= @as(u32, @bitCast(v == @as(V, @splat(quote))));
+        if (bits != 0) return i + @ctz(bits);
+    }
+    while (i < s.len) : (i += 1) {
+        const b = s[i];
+        if (b < 0x20 or b == '"' or b == '\\' or b == quote) return i;
+    }
+    return i;
 }
 
 fn whitespaceKind(slice: []const u8) []const u8 {
@@ -1218,7 +1698,12 @@ fn flushValueErrs(
     counter: *u32,
     prefix: []const u8,
 ) !void {
-    for (errs.items) |msg| {
+    // Each message leaves the list as it is freed: freeing them all and
+    // clearing only at the end left the freed ones listed when an allocation
+    // failed part-way, and the caller's cleanup freed them a second time
+    // (review 2026-10-24).
+    while (errs.items.len > 0) {
+        const msg = errs.items[0];
         try out.appendSlice(alloc, ", ");
         counter.* += 1;
         const head = try alloc.print("\"{s}{d}\": ", .{ prefix, counter.* });
@@ -1226,8 +1711,8 @@ fn flushValueErrs(
         try out.appendSlice(alloc, head);
         try appendJsonStr(out, alloc, msg);
         alloc.free(msg);
+        _ = errs.orderedRemove(0);
     }
-    errs.clearRetainingCapacity();
 }
 
 fn dropValueErrs(alloc: std.mem.Allocator, errs: *std.ArrayList([]u8)) void {
@@ -1310,7 +1795,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     try out.append(alloc, '"');
                     closed = true;
                     const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
-                    try pending_value_errs.append(alloc, msg);
+                    pending_value_errs.append(alloc, msg) catch |e| {
+                        alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                        return e;
+                    };
                     i = skipValue(input, i);
                     break;
                 }
@@ -1350,7 +1838,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
                 const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
-                try pending_value_errs.append(alloc, msg);
+                pending_value_errs.append(alloc, msg) catch |e| {
+                    alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                    return e;
+                };
             }
             continue;
         }
@@ -1379,7 +1870,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                     try out.append(alloc, '"');
                     closed = true;
                     const msg = try alloc.print("unterminated string at line {d}", .{lines.at(input, str_start)});
-                    try pending_value_errs.append(alloc, msg);
+                    pending_value_errs.append(alloc, msg) catch |e| {
+                        alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                        return e;
+                    };
                     i = skipValue(input, i);
                     break;
                 }
@@ -1419,7 +1913,10 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 if (!isInObject(nest.items)) continue;
                 try out.append(alloc, '"');
                 const msg = try alloc.print("unterminated string at end of input (line {d})", .{lines.at(input, str_start)});
-                try pending_value_errs.append(alloc, msg);
+                pending_value_errs.append(alloc, msg) catch |e| {
+                    alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                    return e;
+                };
             }
             continue;
         }
@@ -1525,6 +2022,13 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                 if (key_pos and identUnitLen(input, i, true) > 0) {
                     const key_start = i;
                     while (i < input.len) {
+                        // ASCII letters, digits, `_`, `$` after the first
+                        // unit: what `identUnitLen` answers 1 for, without
+                        // the call.
+                        if (i != key_start and isIdentByte(input[i])) {
+                            i += 1;
+                            continue;
+                        }
                         const n = identUnitLen(input, i, i == key_start);
                         if (n == 0) break;
                         i += n;
@@ -1552,7 +2056,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             const after_full = std.mem.trim(u8, input[j..skip_end], " \t\r\n");
                             const after = trimForMessage(after_full);
                             const msg = try alloc.print("{s} {s} --> missing colon after key at line {d}", .{
-                                input[key_start..i], after, err_line,
+                                trimForMessage(input[key_start..i]), after, err_line,
                             });
                             defer alloc.free(msg);
                             try appendJsonStr(&out, alloc, msg);
@@ -1672,9 +2176,12 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
                             try out.append(alloc, '"');
                             const err_line = lines.at(input, start);
                             const msg = try alloc.print("'{s}' --> invalid literal in value position at line {d}", .{
-                                ident, err_line,
+                                trimForMessage(ident), err_line,
                             });
-                            try pending_value_errs.append(alloc, msg);
+                            pending_value_errs.append(alloc, msg) catch |e| {
+                                alloc.free(msg); // not queued: nobody else frees it (2026-10-24)
+                                return e;
+                            };
                         }
                     }
                 } else {
@@ -2221,6 +2728,17 @@ fn fuzzPreprocessAnnotated(_: void, smith: *std.testing.Smith) !void {
     try fz.annotatedHarness(fz.ScriptSource, &src, std.testing.allocator);
 }
 
+test "fuzz: the single-pass Value reader agrees with the two-stage path" {
+    try std.testing.fuzz({}, fuzzDirect, .{});
+}
+
+fn fuzzDirect(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    var src: fz.ScriptSource = .{ .cur = .{ .bytes = buf[0..len] } };
+    try fz.directHarness(fz.ScriptSource, &src, std.testing.allocator);
+}
+
 // The harness bodies (generic over their source) and the driver tests live in
 // `fuzz_test.zig`.
 const fz = @import("fuzz_test.zig");
@@ -2288,6 +2806,329 @@ test "SourceMap: verbatim stretches map exactly, rewritten ones to the token sta
     const ok = std.mem.find(u8, out, "\"key\"").?;
     const sk = std.mem.find(u8, src, "key").?;
     try std.testing.expect(map.sourceOffset(ok) >= sk and map.sourceOffset(ok) < sk + 3);
+}
+
+test "SourceMap: a removed trailing comma takes its points with it" {
+    // Review 2026-10-24: the comma and the spaces after it were recorded,
+    // then removed before `]`; the points stayed, unsorted, and every output
+    // byte in the next few after the closer mapped into the removed gap.
+    const gpa = std.testing.allocator;
+    var map: SourceMap = .{};
+    defer map.deinit(gpa);
+    const src = "[[1,   ], x]";
+    const out = try preprocessWithOptions(gpa, src, .{ .source_map = &map });
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("[[1], x]", out);
+    for (map.points.items[1..], map.points.items[0 .. map.points.items.len - 1]) |p, prev|
+        try std.testing.expect(p.out > prev.out);
+    // The inner `]` keeps the point of the comma it replaced -- right after
+    // the last element, where std.json's "just past the value" offsets land
+    // (the S2 R1 test); everything after it is its own source byte.
+    try std.testing.expectEqual(@as(usize, 3), map.sourceOffset(3));
+    try std.testing.expectEqual(@as(usize, 8), map.sourceOffset(4));
+    try std.testing.expectEqual(@as(usize, 9), map.sourceOffset(5));
+    try std.testing.expectEqual(@as(usize, 10), map.sourceOffset(6));
+
+    // The same through `parseFromSlice`: a bad token after a pretty-printed
+    // trailing comma is reported on its own line.
+    var d: Diagnostic = .{};
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "[\n  [1,\n  ],\n  x]", .{ .diagnostic = &d }));
+    try std.testing.expectEqual(@as(usize, 4), d.line);
+}
+
+test "SourceMap: end of input maps to the end, past a removed trailing comma" {
+    const gpa = std.testing.allocator;
+    var d: Diagnostic = .{};
+    const src = "[[1,   ]";
+    try std.testing.expectError(error.UnexpectedEndOfInput, parseFromSlice(std.json.Value, gpa, src, .{ .diagnostic = &d }));
+    try std.testing.expectEqual(src.len, d.offset);
+}
+
+test "parseFromSlice: a source map given in json5 options is filled" {
+    const gpa = std.testing.allocator;
+    var map: SourceMap = .{};
+    defer map.deinit(gpa);
+    const p = try parseFromSlice(std.json.Value, gpa, "{a: 1}", .{ .json5 = .{ .source_map = &map } });
+    defer p.deinit();
+    try std.testing.expect(map.points.items.len > 0);
+}
+
+test "parseFromSlice: a diagnostic given in json5 options counts; out of memory fills none" {
+    const gpa = std.testing.allocator;
+    var d: Diagnostic = .{};
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "{a: 1\n b}", .{ .json5 = .{ .diagnostic = &d } }));
+    try std.testing.expectEqual(@as(usize, 2), d.line);
+
+    // Every allocation failing in turn -- the preprocessor's and std.json's.
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        var fa: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = n });
+        var d2: Diagnostic = .{};
+        const p = parseFromSlice(std.json.Value, fa.allocator(), "{a: [1, 2, 3], b: 'a long string value'}", .{ .diagnostic = &d2 }) catch |e| {
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            try std.testing.expectEqual(@as(usize, 0), d2.line);
+            try std.testing.expectEqualStrings("", d2.message);
+            continue;
+        };
+        p.deinit();
+        if (!fa.has_induced_failure) break;
+    }
+}
+
+fn annotatedAndFree(alloc: std.mem.Allocator, input: []const u8) !void {
+    const r = try preprocessAnnotated(alloc, input);
+    alloc.free(r.out);
+}
+
+fn preprocessAndFree(alloc: std.mem.Allocator, input: []const u8) !void {
+    const r = preprocess(alloc, input) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return,
+    };
+    alloc.free(r);
+}
+
+fn parseValueAndFree(alloc: std.mem.Allocator, input: []const u8) !void {
+    const r = parseFromSlice(std.json.Value, alloc, input, .{}) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return,
+    };
+    r.deinit();
+}
+
+test "annotated: queued value errors are not freed twice when an allocation fails" {
+    // Review 2026-10-24: `flushValueErrs` freed each message but cleared the
+    // list only after the loop; an allocation failing part-way left freed
+    // messages listed for the caller's cleanup to free again.
+    const inputs = [_][]const u8{
+        "{a: foo bar baz}",
+        "{a: 'x\n, b: \"y\n, c: 1}",
+        "{a: \"unterminated",
+        "{a b: 1, c d: 2, 'k': [1, 2,], e: 0x10, f: .5}",
+    };
+    for (inputs) |in| {
+        try failEveryAllocation(annotatedAndFree, in);
+        try failEveryAllocation(preprocessAndFree, in);
+        try failEveryAllocation(parseValueAndFree, in);
+    }
+    // The single-pass reader's own allocations (it takes this one).
+    try failEveryAllocation(parseValueAndFree, "{a: [1, 'two', {b: null}], c: 0x1F, 'd\\x41': -.5,}");
+}
+
+/// `f` with its n-th allocation failing, for every n: out of memory or
+/// success, never a leak (`testing.allocator`) or a crash. Not
+/// `checkAllAllocationFailures`, which wants the same allocation count on
+/// every run: an `ArenaAllocator` retries a failed node allocation at the
+/// minimum size, and `Allocator.print` grows by `remap`, which succeeds in
+/// place or not depending on what earlier tests left on the heap.
+fn failEveryAllocation(comptime f: fn (std.mem.Allocator, []const u8) anyerror!void, input: []const u8) !void {
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        var fa: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = n });
+        f(fa.allocator(), input) catch |e| {
+            try std.testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        if (!fa.has_induced_failure) return;
+    }
+}
+
+test "recovery messages stay valid JSON: control bytes escaped, never half a character" {
+    // Review 2026-10-24: a form feed or U+0001 copied from the source into a
+    // `$err_trace` / `$err_` message went out raw, and a 30-byte cut could
+    // split a UTF-8 sequence; either made the recovered document invalid.
+    const gpa = std.testing.allocator;
+    const e20: [40]u8 = @bitCast(@as([20][2]u8, @splat("é".*)));
+    const inputs = [_][]const u8{
+        "{a b: 1\x0c}",
+        "{a b: \x01}",
+        "{a b: '" ++ e20 ++ "'}",
+        "{" ++ e20 ++ " x: 1}",
+    };
+    for (inputs) |in| {
+        const plain = try preprocess(gpa, in);
+        defer gpa.free(plain);
+        try std.testing.expect(fz.jsonParses(gpa, plain));
+        const ann = try preprocessAnnotated(gpa, in);
+        defer gpa.free(ann.out);
+        try std.testing.expect(fz.jsonParses(gpa, ann.out));
+    }
+}
+
+test "annotated: a missing-colon message caps the key too" {
+    // Review 2026-10-24: the plain entry point capped it, the annotated one
+    // printed a 200 KB key into its "compact" message.
+    const gpa = std.testing.allocator;
+    const ks: [5000]u8 = @splat('k');
+    const in = "{" ++ ks ++ " \"x\"}";
+    const r = try preprocessAnnotated(gpa, in);
+    defer gpa.free(r.out);
+    try std.testing.expect(r.out.len < 300);
+}
+
+test "an unquoted key's \\u escape takes four hex digits, no sign" {
+    // Review 2026-10-24: `parseInt` accepted `\u+041` as an identifier unit.
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(@as(usize, 0), identUnitLen("\\u+041", 0, true));
+    try std.testing.expectEqual(@as(usize, 6), identUnitLen("\\u0041", 0, true));
+    const r = try preprocess(gpa, "{\\u+041: 1}");
+    defer gpa.free(r);
+    try std.testing.expect(std.mem.find(u8, r, "$err_trace_") != null);
+}
+
+test "single-pass reader: takes the common JSON5 shapes, and nothing with a diagnostic" {
+    // Agreement alone cannot tell a reader that declines everything from one
+    // that works: the two-stage path answers either way. These must be TAKEN.
+    const gpa = std.testing.allocator;
+    const docs = [_][]const u8{
+        "{a: 1, 'b': [true, false, null], \"c\": {},}",
+        "[1, -2, 3.5, .5, 5., +1, 0x1F, -0xff, 1e3, 9223372036854775808, 1e400]",
+        "// c\n/* d */{\x0b\x0c\xc2\xa0\xef\xbb\xbf\xe2\x80\xa8a\t:\r\n1}",
+        "'\\n\\t\\v\\0\\x41\\xe9\\u00e9\\q\\'\\\"\\/\\\\'",
+        "\"line \\\ncontinued \\\r\\nand \\\xe2\x80\xa8done\"",
+        "{\\u0061b\xc3\xa9: 1, $_x: 2, ab\xe2\x80\x8c: 3}",
+        "['tab\there', 'ctl\x01', 'dq \" in sq', \"sq ' in dq\", '\xe2\x80\xa8']",
+        "[[[], {}], [{a: [{}]}]]",
+    };
+    for (docs) |doc| {
+        const before = direct_taken.load(.monotonic);
+        try fz.checkDirect(gpa, doc, .{});
+        try std.testing.expect(direct_taken.load(.monotonic) == before + 1);
+    }
+    var d: Diagnostic = .{};
+    const before = direct_taken.load(.monotonic);
+    const p = try parseFromSlice(std.json.Value, gpa, docs[0], .{ .diagnostic = &d });
+    p.deinit();
+    try std.testing.expectEqual(before, direct_taken.load(.monotonic));
+}
+
+test "single-pass reader: max_value_len, parse_numbers and duplicate keys as std.json has them" {
+    const gpa = std.testing.allocator;
+    const docs = [_][]const u8{
+        "{a: 'abcd', b: 12345, c: 'ab'}",
+        "{a: 1, a: 2, b: {c: 3, c: 4}}",
+        "[0x10, 1.5, -0, 1e400, 12345678901234567890]",
+        "{abcdef: 1}",
+        "['abcd', 'ab']",
+    };
+    for (docs) |doc| {
+        for ([_]?usize{ null, 2, 4, 5 }) |max| {
+            for ([_]bool{ true, false }) |pn| {
+                for ([_]@FieldType(std.json.ParseOptions, "duplicate_field_behavior"){ .use_first, .use_last, .@"error" }) |dup| {
+                    var o: ParseOptions = .{};
+                    o.json.max_value_len = max;
+                    o.json.parse_numbers = pn;
+                    o.json.duplicate_field_behavior = dup;
+                    try fz.checkDirect(gpa, doc, o);
+                }
+            }
+        }
+    }
+    // And the values themselves, not only agreement.
+    var o: ParseOptions = .{};
+    o.json.duplicate_field_behavior = .use_first;
+    o.json.parse_numbers = false;
+    const p = try parseFromSlice(std.json.Value, gpa, "{a: 1, a: 0x10}", o);
+    defer p.deinit();
+    try std.testing.expectEqualStrings("1", p.value.object.get("a").?.number_string);
+}
+
+test "strings past one 32-byte vector: every byte that needs a decision is found" {
+    // `plainRunLen` compares 32 bytes at a time and finishes the tail byte by
+    // byte; put each special byte beyond the first vector, in both paths.
+    const gpa = std.testing.allocator;
+    const pad: [40]u8 = @splat('p');
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "'" ++ pad ++ "\t" ++ pad ++ "'", .want = pad ++ "\t" ++ pad },
+        .{ .src = "'" ++ pad ++ "\\x41" ++ pad ++ "'", .want = pad ++ "A" ++ pad },
+        .{ .src = "'" ++ pad ++ "\"" ++ pad ++ "'", .want = pad ++ "\"" ++ pad },
+        .{ .src = "\"" ++ pad ++ "'" ++ pad ++ "\"", .want = pad ++ "'" ++ pad },
+        .{ .src = "\"" ++ pad ++ "\x01" ++ pad ++ "\"", .want = pad ++ "\x01" ++ pad },
+        .{ .src = "'" ++ pad ++ "\x1f'", .want = pad ++ "\x1f" },
+        .{ .src = "'" ++ pad ++ "\\\\'", .want = pad ++ "\\" },
+    };
+    for (cases) |c| {
+        const p = try parseFromSlice(std.json.Value, gpa, c.src, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings(c.want, p.value.string);
+        var d: Diagnostic = .{};
+        const q = try parseFromSlice(std.json.Value, gpa, c.src, .{ .diagnostic = &d });
+        defer q.deinit();
+        try std.testing.expectEqualStrings(c.want, q.value.string);
+    }
+    // An unterminated one stays refused through the vector loop.
+    try std.testing.expectError(error.UnexpectedEndOfInput, parseFromSlice(std.json.Value, gpa, "'" ++ pad ++ pad, .{}));
+}
+
+test "push and pushSlice grow exactly at the end of the capacity" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try out.ensureTotalCapacityPrecise(gpa, 4);
+    try pushSlice(&out, gpa, "abc");
+    try pushSlice(&out, gpa, "de"); // 1 byte left, 2 needed
+    try push(&out, gpa, 'f');
+    out.shrinkAndFree(gpa, out.items.len);
+    try push(&out, gpa, 'g'); // none left
+    try std.testing.expectEqualStrings("abcdefg", out.items);
+}
+
+test "preprocess: output well past the reserved size" {
+    // The reservation is input + 1/16; one-letter keys grow by 2 bytes in 6.
+    const gpa = std.testing.allocator;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    var want: std.ArrayList(u8) = .empty;
+    defer want.deinit(gpa);
+    try src.append(gpa, '{');
+    try want.append(gpa, '{');
+    for (0..2000) |k| {
+        // The run of spaces goes out through `pushSlice` while the quotes go
+        // through `push`, so some run lands on the end of the capacity.
+        const sep = if (k == 0) "" else ",         ";
+        try src.print(gpa, "{s}k{d}:1", .{ sep, k % 10 });
+        try want.print(gpa, "{s}\"k{d}\":1", .{ sep, k % 10 });
+    }
+    try src.append(gpa, '}');
+    try want.append(gpa, '}');
+    const out = try preprocess(gpa, src.items);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings(want.items, out);
+}
+
+// ── leads over the field (the card's `**Ahead:**` line) ─────────────────────
+// Probed 2026-10-24 by `tools/rs_field/src/bin/lead.rs` against the json5
+// crate 1.3.1 (the fastest JSON5 reader measured, `zig build bench-json5`) and
+// json-five 0.3.1; json5/json5 2.2.3 (the reference) agrees with every
+// expectation below.
+
+test "lead: a truncated block comment is refused (the json5 crate 1.3.1 accepts it)" {
+    // The crate's comment skipper stops at end of input without an error, so
+    // a config cut off inside a comment reads as complete.
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "{a: 1} /* unterminated", .{}));
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "[1, 2] /*", .{}));
+}
+
+test "lead: `\\8` and `\\9` are no escapes (the json5 crate 1.3.1 reads `\\9` as `9`)" {
+    // ES5.1 §7.8.4: a DecimalDigit is not a NonEscapeCharacter. The crate's
+    // `'1'..'9'` range excludes `9`.
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "'\\9'", .{}));
+    try std.testing.expectError(error.SyntaxError, parseFromSlice(std.json.Value, gpa, "'\\8'", .{}));
+}
+
+test "lead: an integer past 128 bits is a number (both Rust crates refuse it)" {
+    // JSON5 numbers are IEEE 754 doubles; the json5 crate and json-five say
+    // "number too large" / "Invalid integer literal".
+    const gpa = std.testing.allocator;
+    const big = "123456789012345678901234567890123456789012";
+    const v = try parseFromSlice(std.json.Value, gpa, big, .{});
+    defer v.deinit();
+    try std.testing.expectEqualStrings(big, v.value.number_string);
+    const f = try parseFromSlice(f64, gpa, big, .{});
+    defer f.deinit();
+    try std.testing.expectEqual(@as(f64, 1.2345678901234568e41), f.value);
 }
 
 test {
