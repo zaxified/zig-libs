@@ -1,0 +1,17 @@
+[package]
+name = "rust_fast_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_core = { version = "=1.0.228", default-features = false, features = ["std"] }
+serde_json = { version = "=1.0.150", default-features = false, features = ["std"] }
+
+# Keep this out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Fix (A1 review):** Combined (and `LogFormat`) no longer hex-escape `]` in quoted fields: `/q?a[]=1` is logged as sent, as Apache logs it (it came out as `/q?a[\x5d=1`); `]` stays escaped inside `[%t]`. `%h` escapes space, `"`, `[` and `]` like `%u` and is `-` when empty (a hand-built `remote_addr` with a space shifted every later field; an empty one left the slot blank). An HTTP/2 request is logged as `HTTP/2.0` (was `HTTP/1.1`). `Logger` on a handler error: a chunked body over `max_body_bytes` is logged as the 413 the server answers (was 500) with `%b` `-`; after the head went out, the status and bytes that were sent. New `writeClfHost`/`writeClfTime`. Mutation tests (sweeps, `LogFormat`, middleware, sink capture) and the U+FFFD lead test. **Card:** grade 1 — fastest JSON writer measured (0.89× phuslu/log), scope ahead, fresh audit.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** tools ported to Zig 0.17.0 (compile only): `tools/interop.zig`: `dupeZ` -> `dupeSentinel`, `Ast.parse` takes `.{ .mode = .zig }`.

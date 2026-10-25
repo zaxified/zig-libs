@@ -1861,6 +1861,7 @@ const Session = struct {
             .method = method_tok.?,
             .target = target,
             .http1_0 = false,
+            .http2 = true,
             .header_block = block.written(),
             .host = authority,
             // Buffered: the exact total, already known. Streaming: whatever

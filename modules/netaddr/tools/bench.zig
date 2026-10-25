@@ -251,12 +251,16 @@ pub fn main(init: std.process.Init) !u8 {
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var mismatch = false;
-    for (workloads) |wl| {
+    var ours_ns: [workloads.len]f64 = undefined;
+    var go_ns: [workloads.len]f64 = undefined;
+    for (workloads, &ours_ns, &go_ns) |wl, *on, *gn| {
         const ours = timeIt(io, &in, wl.f);
+        on.* = ours.ns;
         const theirs = go_rows.get(wl.name) orelse {
             std.debug.print("bench-netaddr: Go reported nothing for {s}\n", .{wl.name});
             return 1;
         };
+        gn.* = theirs.ns;
         const ratio = ours.ns / theirs.ns;
         worst = @max(worst, ratio);
         best = @min(best, ratio);
@@ -271,7 +275,88 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/go = {d:.2} (best {d:.2})\n", .{ worst, best });
-    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go net/netip + netipx · fastest ? (measured <today>)\n", .{ best, worst });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (!use_fast) {
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go net/netip + netipx · fastest ? (measured <today>)\n", .{ best, worst });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: every row against the fastest contender ----
+    // (Go itself included: a row with no other contender is led by it).
+    try w.flush();
+    const field = runField(arena, io, init.environ_map, abs) catch return 1;
+    try w.print("\nfastest in the field (rust_fast_bench: Rust std, ipnet 2.12.1, glibc via FFI; Go = the reference)\n", .{});
+    try w.print("{s:<16} {s:<24} {s:>12} {s:>12} {s:>7}\n", .{ "workload", "fastest", "its ns/op", "ours ns/op", "ours/it" });
+    var worst_fast: f64 = 0;
+    var worst_row: []const u8 = "";
+    for (workloads, ours_ns, go_ns) |wl, on, gn| {
+        var who: []const u8 = "Go net/netip + netipx";
+        var its = gn;
+        for (field) |row| {
+            if (!std.mem.eql(u8, row.workload, wl.name)) continue;
+            const want = go_rows.get(wl.name).?.count;
+            if (row.count != want) {
+                try w.print("bench-netaddr: FAILED -- {s} / {s} counted {d}, Go {d}\n", .{ wl.name, row.contender, row.count, want });
+                try w.flush();
+                return 1;
+            }
+            if (row.ns < its) {
+                its = row.ns;
+                who = row.contender;
+            }
+        }
+        const r = on / its;
+        if (r > worst_fast) {
+            worst_fast = r;
+            worst_row = wl.name;
+        }
+        try w.print("{s:<16} {s:<24} {d:>12.1} {d:>12.1} {d:>7.2}\n", .{ wl.name, who, its, on, r });
+    }
+    try w.print("\nworst ours/fastest = {d:.2} ({s})\n", .{ worst_fast, worst_row });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go net/netip + netipx · fastest {d:.2}× (measured <today>)\n", .{ best, worst, worst_fast });
     try w.flush();
     return 0;
+}
+
+const rust_manifest = "modules/netaddr/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+const FieldRow = struct { workload: []const u8, contender: []const u8, ns: f64, count: usize };
+
+/// Build the Rust side offline (the one crate, ipnet, comes from the cargo
+/// registry after `cargo fetch`; Cargo.lock is committed) and run it over the
+/// same inputs. BENCH_FAST=0 skips it, so no cargo is needed then.
+fn runField(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, abs: []const u8) ![]FieldRow {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("bench-netaddr: building the Rust side ...\n", .{});
+    const b = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("bench-netaddr: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{e});
+        return e;
+    };
+    if (b.term != .exited or b.term.exited != 0) {
+        std.debug.print("bench-netaddr: cargo build failed:\n{s}\n", .{b.stderr});
+        return error.RustBuildFailed;
+    }
+    const r = try std.process.run(arena, io, .{ .argv = &.{ rust_exe, abs } });
+    if (r.term != .exited or r.term.exited != 0) {
+        std.debug.print("bench-netaddr: rust_fast_bench failed:\n{s}\n", .{r.stderr});
+        return error.RustBenchFailed;
+    }
+    var rows: std.ArrayList(FieldRow) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, r.stdout, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, '\t');
+        const workload = f.next() orelse continue;
+        const contender = f.next() orelse return error.BadRustOutput;
+        const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadRustOutput);
+        const count = try std.fmt.parseInt(usize, f.next() orelse return error.BadRustOutput, 10);
+        try rows.append(arena, .{ .workload = workload, .contender = contender, .ns = ns, .count = count });
+    }
+    return rows.items;
 }

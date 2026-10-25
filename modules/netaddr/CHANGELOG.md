@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Faster, same answers:** `ipToInt`/`ipFromInt` go through two `u64` halves instead of a `u128` `@bitCast` (Zig 0.17 lowers that to a per-byte loop, #36256): sort 1.05→0.63× Go, `Prefix.contains` 0.84→0.48×. `parseIp` parses a dotted quad from its first octet on with a branch-free `octetAt` (131→90 cycles per address; agrees with the old parser on 42M inputs). `bench-netaddr` also times the field (`tools/rust_fast_bench`: Rust std, ipnet 2.12.1, glibc). 9 audit tests from the mutation run. **Card:** scope ahead (RFC 6724 selection, netipx `RemoveFreePrefix` invalid answers), audited over the current source; performance stays P2: `sort_mixed` is 2.21× Rust `sort_unstable`, the std sort's gap, until a zig-libs `sort` module.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

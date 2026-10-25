@@ -792,3 +792,73 @@ test "Sink F4: the flusher hands off to a waiter instead of writing everyone's l
     try f4AssertIdle(&access);
     try testing.expectEqual(fills + 2, gate.newlines.load(.seq_cst));
 }
+
+// ── audit 2026-10-25 (axis A1): what reaches the writer, and when ──────────
+
+/// A buffered writer that records every byte its drain receives. The 8 KiB
+/// buffer keeps a line in the writer until somebody calls `flush`, so a test
+/// can tell "written" from "written and flushed".
+const Capture = struct {
+    interface: std.Io.Writer,
+    store: [64 * 1024]u8 = undefined,
+    len: usize = 0,
+    buf: [8192]u8 = undefined,
+
+    fn init(c: *Capture) void {
+        c.* = .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} } };
+        c.interface.buffer = &c.buf;
+    }
+
+    fn push(c: *Capture, s: []const u8) void {
+        @memcpy(c.store[c.len..][0..s.len], s);
+        c.len += s.len;
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const c: *Capture = @alignCast(@fieldParentPtr("interface", w));
+        c.push(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            c.push(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| c.push(last);
+        return n + last.len * splat;
+    }
+};
+
+test "Sink: a line is on the writer, flushed, when log returns -- unsynchronized, batched, and oversize" {
+    // The writer has an 8 KiB buffer and nothing but `flush` empties it, so a
+    // dropped flush shows as bytes missing from the capture.
+    const short: Entry = .{ .timestamp_ns = 1, .method = "GET", .target = "/short", .status = 200 };
+    var long_target: [5001]u8 = undefined; // a JSON Lines record longer than the 4 KiB batch
+    @memset(&long_target, 'a');
+    long_target[0] = '/';
+    const long: Entry = .{ .timestamp_ns = 2, .method = "GET", .target = &long_target, .status = 200 };
+
+    for ([_]bool{ false, true }) |synchronized| {
+        var cap: Capture = undefined;
+        cap.init();
+        var sink = Sink.init(&cap.interface, .{ .synchronized = synchronized });
+        var want: [8192]u8 = undefined;
+        var ww: std.Io.Writer = .fixed(&want);
+
+        sink.log(short);
+        try write(short, .json_lines, &ww);
+        try testing.expectEqualStrings(ww.buffered(), cap.store[0..cap.len]);
+
+        const before = ww.end;
+        sink.log(long);
+        try write(long, .json_lines, &ww);
+        try testing.expectEqualStrings(ww.buffered()[before..], cap.store[before..cap.len]);
+        try testing.expectEqual(@as(usize, 0), cap.interface.end); // nothing left behind in the writer
+
+        sink.log(short);
+        try write(short, .json_lines, &ww);
+        try testing.expectEqualStrings(ww.buffered(), cap.store[0..cap.len]);
+        try testing.expectEqual(@as(usize, 0), cap.interface.end);
+        if (synchronized) try f4AssertIdle(&sink);
+    }
+}

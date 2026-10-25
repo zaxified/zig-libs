@@ -39,10 +39,13 @@
 //! ## Errors
 //!
 //! A handler error is re-raised unchanged (`http.Server` answers it). The line
-//! is written either way; on an error the status logged is 500, the status
-//! `http.Server` sends when nothing was sent yet (if the handler had already
-//! sent a different status, the log still says 500 -- the connection is
-//! closing anyway).
+//! is written either way. When nothing was sent yet, the status logged is the
+//! one `http.Server` answers with -- 413 for a body over `max_body_bytes`, 500
+//! otherwise -- and `%b` is `-` (that error body is not written yet). One
+//! case is still logged as 500: a gzip body that inflated past
+//! `max_decompressed_request_bytes`, which the server answers 413 but does not
+//! expose to a middleware. When the head was already sent, the line keeps the
+//! status and the body bytes that went out; the server closes the connection.
 
 const std = @import("std");
 const router = @import("router");
@@ -114,7 +117,14 @@ pub const Logger = struct {
             .user = if (l.user) |f| f(ctx) else null,
             .extra = if (l.extra_fn) |f| f(ctx, &extra_buf) else &.{},
         });
-        if (std.meta.isError(result)) entry.status = 500;
+        if (std.meta.isError(result) and !ctx.res.sent_head) {
+            // What `http.Server` answers in place of the handler: 413 for a
+            // body over `max_body_bytes`, else 500. Its error body is not
+            // written yet, so its size is unknown here.
+            const over_cap = ctx.req.body.* == .capped and ctx.req.body.capped.exceeded;
+            entry.status = if (over_cap) 413 else 500;
+            entry.response_bytes = null;
+        }
         l.sink.log(entry);
         return result;
     }
@@ -138,6 +148,10 @@ const FakeClock = struct {
 };
 
 fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
+    return runWireCapped(r, bytes, out_buf, null);
+}
+
+fn runWireCapped(r: *router.Router, bytes: []const u8, out_buf: []u8, max_body_bytes: ?u64) []const u8 {
     var in: std.Io.Reader = .fixed(bytes);
     var out: std.Io.Writer = .fixed(out_buf);
     var head_buf: [2048]u8 = undefined;
@@ -148,6 +162,7 @@ fn runWire(r: *router.Router, bytes: []const u8, out_buf: []u8) []const u8 {
         .handler = r.handler(),
         .context = r,
         .server_name = null,
+        .max_body_bytes = max_body_bytes,
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
@@ -244,6 +259,53 @@ test "Logger: a handler error is re-raised to the server (500) and logged as 500
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, sw.buffered(), "\n"));
 }
 
+fn hDrain(ctx: *router.Ctx) anyerror!void {
+    _ = try ctx.req.reader().discardRemaining();
+}
+
+fn hFailAfterHead(ctx: *router.Ctx) anyerror!void {
+    ctx.res.setStatus(202);
+    try ctx.res.writeAll("part");
+    try ctx.res.flush();
+    return error.Boom;
+}
+
+test "Logger: a chunked body over max_body_bytes is logged as the server's 413, with no size" {
+    var clock: FakeClock = .{ .t = 0, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    var sink = root.Sink.init(&sw, .{ .format = .logfmt });
+    var logger: Logger = .{ .sink = &sink, .clock = .{ .context = &clock, .now_ns = FakeClock.now } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.post("/up", hDrain);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWireCapped(&r, "POST /up HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n14\r\n01234567890123456789\r\n0\r\n\r\n", &buf, 8);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 413"));
+    try testing.expect(std.mem.find(u8, sw.buffered(), " status=413 ") != null);
+    try testing.expect(std.mem.find(u8, sw.buffered(), "response_bytes") == null);
+}
+
+test "Logger: an error after the head went out keeps the status and bytes that were sent" {
+    var clock: FakeClock = .{ .t = 0, .step = 10 };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    var sink = root.Sink.init(&sw, .{ .format = .logfmt });
+    var logger: Logger = .{ .sink = &sink, .clock = .{ .context = &clock, .now_ns = FakeClock.now } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hFailAfterHead);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, get_req, &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 202"));
+    try testing.expect(std.mem.find(u8, sw.buffered(), " status=202 ") != null);
+    try testing.expect(std.mem.find(u8, sw.buffered(), " response_bytes=4 ") != null);
+}
+
 test "Logger: a clock that runs backwards logs latency as absent, not a wrapped number" {
     var clock: FakeClock = .{ .t = 100, .step = -50 };
     var sink_buf: [1024]u8 = undefined;
@@ -298,4 +360,44 @@ test "Logger: keep decides per request after the chain -- a skipped request writ
     try testing.expect(std.mem.find(u8, text, "\"GET /down HTTP/1.1\" 503") != null);
     try testing.expect(std.mem.find(u8, text, "\"GET /fail HTTP/1.1\" 500") != null);
     try testing.expect(std.mem.find(u8, text, "/ok") == null);
+}
+
+// ── audit 2026-10-25 (axis A1) ───────────────────────────────────────────
+
+fn traceFn(_: *const router.Ctx) ?[]const u8 {
+    return "TRACE";
+}
+
+fn spanFn(_: *const router.Ctx) ?[]const u8 {
+    return "SPAN";
+}
+
+fn userFn(_: *const router.Ctx) ?[]const u8 {
+    return "alice";
+}
+
+test "Logger: trace_id, span_id and user come from their own functions; a zero latency is logged as 0, not absent" {
+    var clock: FakeClock = .{ .t = 5, .step = 0 }; // both readings equal
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    var sink = root.Sink.init(&sw, .{ .format = .logfmt });
+    var logger: Logger = .{
+        .sink = &sink,
+        .clock = .{ .context = &clock, .now_ns = FakeClock.now },
+        .trace_id = traceFn,
+        .span_id = spanFn,
+        .user = userFn,
+    };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hOk);
+
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    const line = sw.buffered();
+    try testing.expect(std.mem.find(u8, line, " user=alice ") != null);
+    try testing.expect(std.mem.find(u8, line, " latency_ns=0 ") != null);
+    try testing.expect(std.mem.find(u8, line, " trace_id=TRACE span_id=SPAN\n") != null);
+    try testing.expect(std.mem.find(u8, line, "request_id") == null);
 }

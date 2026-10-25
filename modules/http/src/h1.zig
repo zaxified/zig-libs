@@ -628,6 +628,9 @@ pub const RequestHead = struct {
     target: []const u8,
     /// True for `HTTP/1.0` (no persistent connection unless keep-alive).
     http1_0: bool,
+    /// True when the request came over HTTP/2 (`http1_0` is then false);
+    /// set by the h2 server, never by the h1 parser.
+    http2: bool = false,
     /// Raw header lines (request line excluded), for `header`/`iterate`.
     header_block: []const u8,
     /// The `Host` header value; null if absent (required by HTTP/1.1).

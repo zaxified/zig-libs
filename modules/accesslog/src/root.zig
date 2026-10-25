@@ -561,7 +561,9 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// Combined delimiter in it -- space, `"`, `[`, `]` -- is hex-escaped (a raw
 /// space would shift every later field, a quote or bracket would give a
 /// reader a false start of `"%r"` or `[%t]`), and an empty user is written
-/// `""`, as Apache does. `%b` is `-` when `response_bytes` is null, the
+/// `""`, as Apache does. `%h` (`hostOnly(remote_addr)`) is unquoted too and
+/// gets the same delimiters escaped; it is `-` when absent or empty. Inside
+/// `[%t]` a `]` in `time_formatted` is hex-escaped. `%b` is `-` when `response_bytes` is null, the
 /// decimal count otherwise (0 prints as `0`, matching real servers).
 /// Referer/User-Agent print the literal `"-"` when absent, matching
 /// `mod_log_config`'s own behavior for a missing header on a quoted field.
@@ -574,11 +576,11 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// second line — the record stays exactly one line no matter what the
 /// caller's method/target/protocol/referer/user-agent/remote_addr contain.
 pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (entry.remote_addr) |a| try writeClfEscaped(w, hostOnly(a)) else try w.writeByte('-');
+    try writeClfHost(w, entry.remote_addr);
     try w.writeAll(" - ");
     try writeClfUser(w, entry.user);
     try w.writeAll(" [");
-    if (entry.time_formatted) |t| try writeClfEscaped(w, t) else try w.print("{d}", .{entry.timestamp_ns});
+    try writeClfTime(w, entry);
     try w.writeAll("] \"");
     try writeClfEscaped(w, entry.method);
     try w.writeByte(' ');
@@ -599,11 +601,33 @@ pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
 pub fn writeClfUser(w: *std.Io.Writer, user: ?[]const u8) std.Io.Writer.Error!void {
     const u = user orelse return w.writeByte('-');
     if (u.len == 0) try w.writeAll("\"\"");
-    for (u) |c| {
-        switch (c) {
-            ' ', '"', '[', ']' => try w.print("\\x{x:0>2}", .{c}),
-            else => try writeClfEscaped(w, &.{c}),
-        }
+    try writeClfUnquoted(w, u, " \"[]");
+}
+
+/// Combined's `%h`: `hostOnly(addr)`, `-` when that is absent or empty (as
+/// Apache), else with the same delimiters as `%u` hex-escaped -- a
+/// hand-built `remote_addr` holding a space must not shift the fields after
+/// it. Shared with `LogFormat`.
+pub fn writeClfHost(w: *std.Io.Writer, addr: ?[]const u8) std.Io.Writer.Error!void {
+    const h = hostOnly(addr orelse "");
+    if (h.len == 0) return w.writeByte('-');
+    try writeClfUnquoted(w, h, " \"[]");
+}
+
+/// What goes between Combined's `[` and `]` (`%t`): `time_formatted` with
+/// `]` hex-escaped as well, or the raw nanosecond timestamp. Shared with
+/// `LogFormat`.
+pub fn writeClfTime(w: *std.Io.Writer, entry: Entry) std.Io.Writer.Error!void {
+    if (entry.time_formatted) |t| try writeClfUnquoted(w, t, "]") else try w.print("{d}", .{entry.timestamp_ns});
+}
+
+/// An unquoted Combined slot: the Combined escaper, plus every byte in
+/// `delims` hex-escaped (not backslash-escaped: a literal `\]` still holds
+/// the raw `]` a bracket-matching reader looks for), so no value can close
+/// its slot early.
+fn writeClfUnquoted(w: *std.Io.Writer, s: []const u8, comptime delims: []const u8) std.Io.Writer.Error!void {
+    for (s) |c| {
+        if (std.mem.findScalar(u8, delims, c) != null) try w.print("\\x{x:0>2}", .{c}) else try writeClfEscaped(w, &.{c});
     }
 }
 
@@ -629,23 +653,16 @@ pub fn hostOnly(addr: []const u8) []const u8 {
     return addr;
 }
 
-/// The Combined escaper (`ap_escape_logitem` rule + `]`); shared with `LogFormat`.
+/// The Combined escaper (`ap_escape_logitem`'s rule), for the quoted fields;
+/// the unquoted slots add their own delimiters (`writeClfUnquoted`). Shared
+/// with `LogFormat`.
 pub fn writeClfEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     for (s) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
         '\\' => try w.writeAll("\\\\"),
-        // `]` is not a control byte and Apache's own `ap_escape_logitem`
-        // does not escape it either — but it is the one non-control byte
-        // that is also a delimiter here: `time_formatted` sits inside the
-        // unquoted `[%t]` bracket, and this module's SPEC promises "no
-        // value, however crafted, can close its delimiter early" for every
-        // Combined field. A hand-built `Entry` whose `time_formatted`
-        // contains `]` could otherwise splice fabricated content between
-        // the real brackets (`entryFromRequest` can never produce this —
-        // see SPEC.md's threat model). Hex-escaped like the control bytes
-        // below, not backslash-escaped: a literal `\]` still contains the
-        // raw `]` byte a bracket-matching reader looks for.
-        ']' => try w.print("\\x{x:0>2}", .{c}),
+        // `]` is not escaped here: inside quotes it closes nothing, and
+        // Apache keeps it (`/q?a[]=1` stays as sent). Only `[%t]` needs it
+        // (`writeClfTime`; until 2026-10-25 every field hex-escaped it).
         0x00...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{c}),
         else => try w.writeByte(c),
     };
@@ -707,7 +724,7 @@ pub fn entryFromRequest(
         .time_formatted = opts.time_formatted,
         .method = req.methodName(),
         .target = req.target,
-        .protocol = if (req.head.http1_0) "HTTP/1.0" else "HTTP/1.1",
+        .protocol = if (req.head.http2) "HTTP/2.0" else if (req.head.http1_0) "HTTP/1.0" else "HTTP/1.1",
         .status = res.status,
         .request_bytes = opts.request_bytes orelse req.head.content_length,
         .response_bytes = responseBytesOf(res),
@@ -1107,6 +1124,45 @@ fn testRequest(head_block: []const u8, target: []const u8, http1_0: bool, body: 
         .context = null,
         .peer = peer,
     };
+}
+
+test "entryFromRequest: an HTTP/2 request is logged as HTTP/2.0, as Apache logs it" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    var req = testRequest("", "/", false, &body, null);
+    req.head.http2 = true;
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var addr_buf: [64]u8 = undefined;
+    try testing.expectEqualStrings("HTTP/2.0", entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 0 }).protocol);
+}
+
+test "Combined: a ] in a quoted field is kept, the unquoted %h escapes its delimiters and is - when empty" {
+    // Review 2026-10-25: `]` was hex-escaped in every field (`/q?a[]=1` came
+    // out as `/q?a[\x5d=1`), and a space in a hand-built `remote_addr`
+    // shifted every later field.
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var e: Entry = .{
+        .timestamp_ns = 0,
+        .time_formatted = "T]",
+        .method = "GET",
+        .target = "/q?a[]=1",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .remote_addr = "1.2.3.4 - - [x]",
+        .user_agent = "UA [en]",
+    };
+    try writeCombined(e, &w);
+    try testing.expectEqualStrings("1.2.3.4\\x20-\\x20-\\x20\\x5bx\\x5d - - [T\\x5d] \"GET /q?a[]=1 HTTP/1.1\" 200 - \"-\" \"UA [en]\"\n", w.buffered());
+    for ([_][]const u8{ "", ":80", "[]" }) |a| {
+        w = .fixed(&buf);
+        e.remote_addr = a;
+        try writeCombined(e, &w);
+        try testing.expect(std.mem.startsWith(u8, w.buffered(), "- - - ["));
+    }
 }
 
 test "entryFromRequest: pulls method/target/protocol/status/UA/referer/peer/content-length" {
@@ -2309,6 +2365,7 @@ test "writeJsonLines: target reads back as Python's decode('utf-8', 'replace') (
 // See json_oracle_test.zig / tools/interop.zig / tools/json_oracle.py.
 test {
     _ = @import("json_oracle_test.zig");
+    _ = @import("lead_test.zig");
 }
 
 // ── Entry.extra ──────────────────────────────────────────────────────────
@@ -2516,6 +2573,187 @@ test "LogFormat: Common Log Format golden, and a fixed %{key}x line over extra" 
     const ex = comptime LogFormat.comptimeParse("%{tenant}x %D");
     try ex.write(e, &w);
     try testing.expectEqualStrings("ac\\\"me 1500\n", w.buffered());
+}
+
+// ── audit 2026-10-25 (axis A1): sweeps that pin every byte class of the escapers ──
+
+test "isValidExtraKey: exactly [A-Za-z0-9_.-] over every byte value, alone and inside a longer key" {
+    // Reference is the grammar in the `Field` doc, written as a predicate over
+    // `std.ascii`, not the switch under test. A boundary neighbour of every
+    // range ('@' '[' '`' '{' '/' ':' '}') is in the sweep.
+    for (0..256) |b| {
+        const c: u8 = @intCast(b);
+        const want = std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+        try testing.expectEqual(want, isValidExtraKey(&.{c}));
+        try testing.expectEqual(want, isValidExtraKey(&.{ 'a', 'b', c, 'd' }));
+    }
+    try testing.expect(!isValidExtraKey(""));
+    try testing.expect(isValidExtraKey("key"));
+}
+
+test "extraValue: the first of two equal keys wins, and the match is exact (case-sensitive)" {
+    const ex = [_]Field{
+        .{ .key = "k", .value = "first" },
+        .{ .key = "k", .value = "second" },
+        .{ .key = "Tenant", .value = "T" },
+    };
+    try testing.expectEqualStrings("first", extraValue(&ex, "k").?);
+    try testing.expectEqualStrings("T", extraValue(&ex, "Tenant").?);
+    try testing.expect(extraValue(&ex, "tenant") == null);
+    try testing.expect(extraValue(&ex, "nope") == null);
+    try testing.expect(extraValue(&.{}, "k") == null);
+}
+
+test "escapers: every ASCII byte as a lone value and between letters -- JSON, logfmt, Combined, Combined %u" {
+    // One expectation per byte class, derived from the SPEC tables (not from
+    // the switch arms): JSON RFC 8259 §7, logfmt "Log-injection escaping",
+    // `ap_escape_logitem` + `]` for Combined.
+    for (0..128) |b| {
+        const c: u8 = @intCast(b);
+        const ctl = c < 0x20 or c == 0x7F;
+        for ([_][]const u8{ "", "a", "ab" }) |pre| {
+            var vbuf: [8]u8 = undefined;
+            const v = try std.fmt.bufPrint(&vbuf, "{s}{c}b", .{ pre, c });
+            var exp_buf: [48]u8 = undefined;
+            var out_buf: [64]u8 = undefined;
+
+            // JSON string
+            const ej = blk: {
+                const body = switch (c) {
+                    '"' => try std.fmt.bufPrint(&exp_buf, "\\\"", .{}),
+                    '\\' => try std.fmt.bufPrint(&exp_buf, "\\\\", .{}),
+                    0x08 => try std.fmt.bufPrint(&exp_buf, "\\b", .{}),
+                    0x09 => try std.fmt.bufPrint(&exp_buf, "\\t", .{}),
+                    0x0A => try std.fmt.bufPrint(&exp_buf, "\\n", .{}),
+                    0x0C => try std.fmt.bufPrint(&exp_buf, "\\f", .{}),
+                    0x0D => try std.fmt.bufPrint(&exp_buf, "\\r", .{}),
+                    else => if (c < 0x20)
+                        try std.fmt.bufPrint(&exp_buf, "\\u00{x:0>2}", .{c})
+                    else
+                        try std.fmt.bufPrint(&exp_buf, "{c}", .{c}),
+                };
+                var full: [64]u8 = undefined;
+                break :blk try std.fmt.bufPrint(&full, "\"{s}{s}b\"", .{ pre, body });
+            };
+            var jw: std.Io.Writer = .fixed(&out_buf);
+            try writeJsonString(&jw, v);
+            try testing.expectEqualStrings(ej, jw.buffered());
+
+            // logfmt value
+            const quote = ctl or c == ' ' or c == '"' or c == '=' or c == '\\';
+            const body_l = switch (c) {
+                '"' => try std.fmt.bufPrint(&exp_buf, "\\\"", .{}),
+                '\\' => try std.fmt.bufPrint(&exp_buf, "\\\\", .{}),
+                '\n' => try std.fmt.bufPrint(&exp_buf, "\\n", .{}),
+                '\r' => try std.fmt.bufPrint(&exp_buf, "\\r", .{}),
+                '\t' => try std.fmt.bufPrint(&exp_buf, "\\t", .{}),
+                else => if (ctl)
+                    try std.fmt.bufPrint(&exp_buf, "\\u00{x:0>2}", .{c})
+                else
+                    try std.fmt.bufPrint(&exp_buf, "{c}", .{c}),
+            };
+            var full_l: [64]u8 = undefined;
+            const el = if (quote)
+                try std.fmt.bufPrint(&full_l, "\"{s}{s}b\"", .{ pre, body_l })
+            else
+                try std.fmt.bufPrint(&full_l, "{s}{c}b", .{ pre, c });
+            var lw: std.Io.Writer = .fixed(&out_buf);
+            try writeLogfmtValue(&lw, v);
+            try testing.expectEqualStrings(el, lw.buffered());
+
+            // Combined escaper
+            const body_c = switch (c) {
+                '"' => try std.fmt.bufPrint(&exp_buf, "\\\"", .{}),
+                '\\' => try std.fmt.bufPrint(&exp_buf, "\\\\", .{}),
+                else => if (ctl)
+                    try std.fmt.bufPrint(&exp_buf, "\\x{x:0>2}", .{c})
+                else
+                    try std.fmt.bufPrint(&exp_buf, "{c}", .{c}),
+            };
+            var full_c: [64]u8 = undefined;
+            const ec = try std.fmt.bufPrint(&full_c, "{s}{s}b", .{ pre, body_c });
+            var cw: std.Io.Writer = .fixed(&out_buf);
+            try writeClfEscaped(&cw, v);
+            try testing.expectEqualStrings(ec, cw.buffered());
+
+            // Combined %u: the Combined escaper plus space, '"', '[' and ']' hex-escaped
+            const body_u = if (c == ' ' or c == '"' or c == '[' or c == ']')
+                try std.fmt.bufPrint(&exp_buf, "\\x{x:0>2}", .{c})
+            else
+                body_c;
+            var full_u: [64]u8 = undefined;
+            const eu = try std.fmt.bufPrint(&full_u, "{s}{s}b", .{ pre, body_u });
+            var uw: std.Io.Writer = .fixed(&out_buf);
+            try writeClfUser(&uw, v);
+            try testing.expectEqualStrings(eu, uw.buffered());
+        }
+    }
+    // Non-ASCII bytes are byte-oriented in logfmt/Combined (SPEC "Encoding contract").
+    for (0x80..256) |b| {
+        const c: u8 = @intCast(b);
+        var out_buf: [16]u8 = undefined;
+        var lw: std.Io.Writer = .fixed(&out_buf);
+        try writeLogfmtValue(&lw, &.{ 'a', c, 'b' });
+        try testing.expectEqualSlices(u8, &.{ 'a', c, 'b' }, lw.buffered());
+        var cw: std.Io.Writer = .fixed(&out_buf);
+        try writeClfEscaped(&cw, &.{ 'a', c, 'b' });
+        try testing.expectEqualSlices(u8, &.{ 'a', c, 'b' }, cw.buffered());
+    }
+}
+
+test "hostOnly: port stripped from host:port and [v6]:port, bare IPv6 and malformed input left alone" {
+    const cases = [_][2][]const u8{
+        .{ "192.0.2.1:54321", "192.0.2.1" },
+        .{ "192.0.2.1", "192.0.2.1" },
+        .{ "[::1]:8080", "::1" },
+        .{ "[::1]", "::1" },
+        .{ "[2001:db8::1]:443", "2001:db8::1" },
+        .{ "::1", "::1" },
+        .{ "fe80::1", "fe80::1" },
+        .{ "2001:db8::1", "2001:db8::1" },
+        .{ "a:b:c", "a:b:c" },
+        .{ "[::1", "[::1" }, // unterminated bracket: kept whole, escaped later
+        .{ "[", "[" },
+        .{ "[]", "" },
+        .{ "host:", "host" },
+        .{ ":80", "" },
+        .{ "", "" },
+    };
+    for (cases) |c| try testing.expectEqualStrings(c[1], hostOnly(c[0]));
+}
+
+test "writeClfUser: a user holding [ and ] gets both hex-escaped, lower-case hex" {
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeClfUser(&w, "x[y]z \"q\"");
+    try testing.expectEqualStrings("x\\x5by\\x5dz\\x20\\x22q\\x22", w.buffered());
+}
+
+test "entryFromRequest: request_id, trace_id, span_id and user each land in their own field" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = testRequest("", "/", false, &body, null);
+    var out_buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(200);
+    var addr_buf: [64]u8 = undefined;
+    const e = entryFromRequest(&req, &res, &addr_buf, .{
+        .timestamp_ns = 1,
+        .time_formatted = "T",
+        .request_id = "rid",
+        .trace_id = "tid",
+        .span_id = "sid",
+        .user = "usr",
+    });
+    try testing.expectEqualStrings("rid", e.request_id.?);
+    try testing.expectEqualStrings("tid", e.trace_id.?);
+    try testing.expectEqualStrings("sid", e.span_id.?);
+    try testing.expectEqualStrings("usr", e.user.?);
+    try testing.expectEqualStrings("T", e.time_formatted.?);
+    // Content-Length 42 from the head is the default; the override wins; null stays null.
+    try testing.expectEqual(@as(?u64, 42), e.request_bytes);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

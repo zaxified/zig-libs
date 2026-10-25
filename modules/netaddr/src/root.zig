@@ -291,7 +291,13 @@ pub const Ip = union(enum) {
 /// before calling.
 pub fn parseIp(text: []const u8) ?Ip {
     // The first separator decides the family, so each literal is scanned by
-    // one parser only (an IPv6 literal used to be tried as IPv4 first).
+    // one parser only (an IPv6 literal used to be tried as IPv4 first). Fast
+    // path: a decimal octet and a '.' -- a dotted quad, parsed on from there
+    // without scanning its first octet twice.
+    var i: usize = 0;
+    if (octetAt(text, &i)) |first| {
+        if (i < text.len and text[i] == '.') return if (ip4From(text, i, first)) |q| .{ .v4 = q } else null;
+    }
     for (text) |c| switch (c) {
         '.' => return if (parseIp4(text)) |q| .{ .v4 = q } else null,
         ':' => return if (parseIp6(text)) |b| .{ .v6 = b } else null,
@@ -303,27 +309,48 @@ pub fn parseIp(text: []const u8) ?Ip {
 /// Parse a dotted-quad IPv4 literal. Strict, matching Go `netip.ParseAddr`:
 /// exactly four decimal octets 0–255, no leading zeros, nothing else.
 pub fn parseIp4(text: []const u8) ?[4]u8 {
+    var i: usize = 0;
+    const first = octetAt(text, &i) orelse return null;
+    return ip4From(text, i, first);
+}
+
+/// The rest of a dotted quad after its first octet, `text[i]` being the
+/// first '.'.
+inline fn ip4From(text: []const u8, start: usize, first: u8) ?[4]u8 {
     var out: [4]u8 = undefined;
-    var k: usize = 0;
-    var octet: u16 = 0;
-    var digits: u8 = 0;
-    for (text) |c| {
-        if (c >= '0' and c <= '9') {
-            if (digits == 1 and octet == 0) return null; // no leading zeros
-            octet = octet * 10 + (c - '0');
-            if (octet > 255) return null; // also caps an octet at three digits
-            digits += 1;
-        } else if (c == '.') {
-            if (digits == 0 or k == 3) return null;
-            out[k] = @intCast(octet);
-            k += 1;
-            octet = 0;
-            digits = 0;
-        } else return null;
+    out[0] = first;
+    var i = start;
+    inline for (1..4) |k| {
+        if (i >= text.len or text[i] != '.') return null;
+        i += 1;
+        out[k] = octetAt(text, &i) orelse return null;
     }
-    if (digits == 0 or k != 3) return null;
-    out[3] = @intCast(octet);
+    if (i != text.len) return null;
     return out;
+}
+
+/// The byte at `k`, or 0 (not a digit) past the end.
+inline fn byteAt(text: []const u8, k: usize) u8 {
+    return if (k < text.len) text[k] else 0;
+}
+
+/// One decimal octet at `text[i.*..]`, advancing `i`: one to three digits,
+/// 0–255, no leading zero. Branch-free in the digit count -- on random
+/// addresses a per-digit branch mispredicted about once per octet. A fourth
+/// digit is refused by the caller, which wants a '.' or the end next.
+inline fn octetAt(text: []const u8, i: *usize) ?u8 {
+    const j = i.*;
+    const a = byteAt(text, j) -% '0';
+    const b = byteAt(text, j + 1) -% '0';
+    const c = byteAt(text, j + 2) -% '0';
+    if (a > 9) return null;
+    const two = b <= 9;
+    const three = two and c <= 9;
+    const v1 = @as(u16, a) * 10 + b;
+    const v = if (three) v1 * 10 + c else if (two) v1 else a;
+    if (v > 255 or (two and a == 0)) return null; // also refuses a leading zero
+    i.* = j + 1 + @intFromBool(two) + @intFromBool(three);
+    return @intCast(v);
 }
 
 /// Parse an IPv6 literal (RFC 4291 §2.2): full form, `::` compression, and an
@@ -797,10 +824,13 @@ fn widthOf(ip: Ip) u8 {
 }
 
 /// The address value as an unsigned integer in the low `widthOf(ip)` bits.
+/// A v6 address goes through two u64 halves: Zig 0.17 lowers `readInt(u128)` /
+/// `writeInt(u128)` to a per-byte loop (#36256), ~8x the instructions on every
+/// compare, contains and set operation.
 fn ipToInt(ip: Ip) u128 {
     return switch (ip) {
         .v4 => |q| std.mem.readInt(u32, &q, .big),
-        .v6 => |b| std.mem.readInt(u128, &b, .big),
+        .v6 => |b| @as(u128, std.mem.readInt(u64, b[0..8], .big)) << 64 | std.mem.readInt(u64, b[8..16], .big),
     };
 }
 
@@ -813,7 +843,8 @@ fn ipFromInt(fam: IpFamily, value: u128) Ip {
         },
         .v6 => {
             var b: [16]u8 = undefined;
-            std.mem.writeInt(u128, &b, value, .big);
+            std.mem.writeInt(u64, b[0..8], @truncate(value >> 64), .big);
+            std.mem.writeInt(u64, b[8..16], @truncate(value), .big);
             return .{ .v6 = b };
         },
     }
@@ -1982,6 +2013,7 @@ test {
     _ = @import("netip_api_test.zig");
     _ = @import("netip_oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("audit_test.zig");
 }
 
 test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {

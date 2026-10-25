@@ -196,12 +196,12 @@ pub const LogFormat = struct {
     pub fn write(f: *const LogFormat, entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         for (f.items[0..f.len]) |item| switch (item.kind) {
             .literal => try w.writeAll(item.text),
-            .host => if (entry.remote_addr) |a| try root.writeClfEscaped(w, root.hostOnly(a)) else try w.writeByte('-'),
+            .host => try root.writeClfHost(w, entry.remote_addr),
             .logname => try w.writeByte('-'),
             .user => try root.writeClfUser(w, entry.user),
             .time => {
                 try w.writeByte('[');
-                if (entry.time_formatted) |t| try root.writeClfEscaped(w, t) else try w.print("{d}", .{entry.timestamp_ns});
+                try root.writeClfTime(w, entry);
                 try w.writeByte(']');
             },
             .request_line => {
@@ -312,6 +312,88 @@ test "LogFormat: a crafted value cannot add a line or leave its quotes" {
     const out = try render(&f, e, &buf);
     try testing.expectEqualStrings("\"r\\\" 200\\x0d\\x0aforged\" \"v\\\"\\x00\" \"/p\\x0a\"\n", out);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+}
+
+// ── audit 2026-10-25 (axis A1): every directive and the parser's edges, parsed at run time ──
+
+fn expectLine(template: []const u8, e: Entry, want: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const f = try LogFormat.parse(template);
+    try testing.expectEqualStrings(want, try render(&f, e, &buf));
+}
+
+test "LogFormat: each directive alone between literals, exact bytes (run-time parse)" {
+    var e = sample;
+    try expectLine("<%h>", e, "<2001:db8::1>\n");
+    try expectLine("<%l>", e, "<->\n");
+    try expectLine("<%u>", e, "<->\n");
+    try expectLine("<%t>", e, "<[22/Jul/2026:10:00:00 +0000]>\n");
+    try expectLine("<%r>", e, "<POST /a/b?x=1&y=2 HTTP/1.0>\n");
+    try expectLine("<%s>", e, "<201>\n");
+    try expectLine("<%>s>", e, "<201>\n");
+    try expectLine("%>ss", e, "201s\n"); // the 's' of '%>s' is consumed, the next one is a literal
+    try expectLine("<%b>", e, "<0>\n");
+    try expectLine("<%B>", e, "<0>\n");
+    try expectLine("<%D>", e, "<2345678>\n");
+    try expectLine("<%T>", e, "<2>\n");
+    try expectLine("<%m>", e, "<POST>\n");
+    try expectLine("<%U>", e, "</a/b>\n");
+    try expectLine("<%q>", e, "<?x=1&y=2>\n");
+    try expectLine("<%H>", e, "<HTTP/1.0>\n");
+    try expectLine("<%%>", e, "<%>\n");
+    try expectLine("%%%%", e, "%%\n");
+    try expectLine("<%{Referer}i>", e, "<->\n");
+    try expectLine("<%{User-Agent}i>", e, "<ua>\n");
+    try expectLine("<%{referer}i|%{USER-AGENT}i>", e, "<-|ua>\n"); // names are case-insensitive
+    try expectLine("<%{tenant}x>", e, "<acme>\n");
+    try expectLine("<%{Tenant}x>", e, "<->\n"); // %{key}x is an exact match
+    try expectLine("x %s y", e, "x 201 y\n"); // trailing literal kept
+    try expectLine("\xc3\xa9 %s", e, "\xc3\xa9 201\n"); // non-ASCII literal text is the operator's
+    try expectLine("", e, "\n");
+
+    e.user = "bob";
+    e.referer = "http://r/";
+    e.time_formatted = null;
+    e.remote_addr = null;
+    e.response_bytes = null;
+    e.latency_ns = null;
+    e.extra = &.{ .{ .key = "k", .value = "first" }, .{ .key = "k", .value = "second" } };
+    try expectLine("<%u|%{Referer}i|%{User-Agent}i>", e, "<bob|http://r/|ua>\n");
+    try expectLine("<%t|%h|%b|%B|%D|%T>", e, "<[7]|-|-|0|-|->\n");
+    try expectLine("<%{k}x>", e, "<first>\n"); // the first of two equal keys
+}
+
+test "LogFormat: parse edges -- control bytes in the literal, directive tails, item bound" {
+    const E = LogFormat.Error;
+    // Every control byte is refused in the literal text, DEL too; space and non-ASCII are not.
+    for (0..256) |b| {
+        const c: u8 = @intCast(b);
+        const t = [_]u8{ 'a', c, 'b' };
+        if (c < 0x20 or c == 0x7F) {
+            try testing.expectError(E.ControlByteInLiteral, LogFormat.parse(&t));
+        } else if (c != '%') {
+            _ = try LogFormat.parse(&t);
+        }
+    }
+    // A control byte in the literal AFTER a directive is still caught.
+    try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("%h\x1f"));
+    try testing.expectError(E.ControlByteInLiteral, LogFormat.parse("%{tenant}x\n"));
+    // Directive tails: exactly the letter after '}' is consumed.
+    var buf: [128]u8 = undefined;
+    const f = try LogFormat.parse("%{Referer}ix%{tenant}xy");
+    try testing.expectEqualStrings("-x" ++ "acme" ++ "y\n", try render(&f, sample, &buf));
+    try testing.expectError(E.UnterminatedDirective, LogFormat.parse("%{tenant}"));
+    try testing.expectError(E.UnterminatedDirective, LogFormat.parse("%{"));
+    try testing.expectError(E.UnknownDirective, LogFormat.parse("%{tenant}y"));
+    try testing.expectError(E.UnknownDirective, LogFormat.parse("%>z"));
+    try testing.expectError(E.EmptyName, LogFormat.parse("%{}x"));
+    try testing.expectError(E.ResponseHeadersUnavailable, LogFormat.parse("%{Referer}o"));
+    try testing.expectError(E.UnsupportedHeader, LogFormat.parse("%{Referer2}i"));
+    try testing.expectError(E.BadExtraKey, LogFormat.parse("%{a=b}x"));
+    // Literal runs count as items: 32 (literal + directive) pairs fit, a 33rd does not.
+    _ = try LogFormat.parse(strRepeat("a%h", LogFormat.max_items / 2));
+    try testing.expectError(E.TooManyItems, LogFormat.parse(strRepeat("a%h", LogFormat.max_items / 2) ++ "z"));
+    _ = try LogFormat.parse(strRepeat("%h", LogFormat.max_items - 1) ++ "z");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

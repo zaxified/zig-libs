@@ -404,6 +404,12 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **A middleware cannot see that a gzip request body crossed `max_decompressed_request_bytes`**
+  *(2026-10-25, from the accesslog review)* — the serving loop answers that 413 from its own
+  local `GunzipBody.exceeded` (`Request.decoded` points at its reader, the flag stays private), so `accesslog.Logger` logs 500
+  for it (a chunked body over `max_body_bytes` it does read: `body.capped.exceeded`). Ideal API:
+  `Request.bodyOverCap() bool`, true in both cases, so a middleware logs what the server answers.
+
 - **Threaded h2: a worker's `.close` does not wake the connection's blocking read** *(audit
   2026-10-19 S10-1, low; owner decision 2026-10-20: FIX — Go closes the connection after GOAWAY
   instead of waiting on the peer)*. In Dispatcher mode a worker returning `.close` (e.g. 413 over

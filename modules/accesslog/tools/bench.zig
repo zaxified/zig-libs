@@ -39,7 +39,7 @@ const bench_name = "bench-accesslog";
 const work_dir = ".zig-cache/bench-accesslog";
 const go_dir = "modules/accesslog/tools/go_bench";
 const ref_short = "Go";
-const ref_card = "Go 1.26.0 encoding/json + log/slog + go-logfmt v0.6.1";
+const ref_card = "Go 1.26.8 encoding/json + log/slog + go-logfmt v0.6.1";
 
 const net_base: ?[]const u8 = null;
 const info_only = [_][]const u8{};
@@ -124,6 +124,7 @@ pub fn main(init: std.process.Init) !u8 {
     var mismatch = false;
     var base_ours: f64 = 0;
     var base_ref: f64 = 0;
+    var logfmt_ratio: f64 = 0;
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
@@ -157,6 +158,7 @@ pub fn main(init: std.process.Init) !u8 {
             worst = @max(worst, ratio);
             best = @min(best, ratio);
         }
+        if (std.mem.eql(u8, name, "logfmt")) logfmt_ratio = ratio;
         max_spread = @max(max_spread, @max(ours.spread(false), go.spread(false)));
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
@@ -170,8 +172,86 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (filters.len > 0 or !use_fast) {
+        if (filters.len == 0)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: JSON Lines against the fastest loggers ----
+    // logfmt has no faster library than go-logfmt (the reference row above;
+    // phuslu/log's LogfmtFormatter re-parses its own JSON line), so only the
+    // JSON row meets new contenders; the verdict is the worst of the JSON
+    // ratio and logfmt's ratio to go-logfmt.
+    try w.flush();
+    const fast_go = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = fast_go_dir, .abs = abs, .out = "go_fast_bench" });
+    try rustBuild(arena, io, init.environ_map);
+    try w.print("\nfastest in the field -- json_encoding, {d} rounds, ours re-timed beside each\n", .{rounds});
+    try w.print("{s:<22} {s:>11} {s:>11} {s:>8}  count\n", .{ "contender", "its ns", "ours ns", "ours/it" });
+    var json_fast_ratio: f64 = 0;
+    var fastest_label: []const u8 = "";
+    for (fast) |c| {
+        var ours: bench.Side = .{};
+        var it: bench.Side = .{};
+        for (0..rounds) |_| {
+            it.add(if (c.who) |who|
+                try bench.foreignArgv(arena, io, bench_name, &.{ fast_go, abs, who }, "json_encoding", null)
+            else
+                try bench.foreignArgv(arena, io, bench_name, &.{ rust_exe, abs }, "json_encoding", null));
+            ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, 0 }, true));
+        }
+        const r = ours.best_ns / it.best_ns;
+        if (r > json_fast_ratio) {
+            json_fast_ratio = r;
+            fastest_label = c.label;
+        }
+        const same = it.count == ours.count;
+        mismatch = mismatch or !same;
+        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3}  {d}{s}\n", .{ c.label, it.best_ns, ours.best_ns, r, it.count, if (same) "" else " ≠ ours" });
+        try w.flush();
+    }
+    if (mismatch) {
+        try w.writeAll(bench_name ++ ": FAILED -- a contender's byte count differs from ours; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    const worst_fast = @max(json_fast_ratio, logfmt_ratio);
+    try w.print("\nfastest JSON contender: {s} (ours/it {d:.2}); logfmt vs go-logfmt {d:.2}\nworst ours/fastest = {d:.2}\n", .{ fastest_label, json_fast_ratio, logfmt_ratio, worst_fast });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× (measured <today>)\n", .{ best, worst, ref_card, worst_fast });
     try w.flush();
     return 0;
+}
+
+/// A fast contender: the Go program (`who` = its second argument) or the Rust one.
+const Fast = struct { label: []const u8, who: ?[]const u8 };
+const fast = [_]Fast{
+    .{ .label = "zerolog v1.35.1", .who = "zerolog" },
+    .{ .label = "zap v1.28.0", .who = "zap" },
+    .{ .label = "phuslu/log v1.0.138", .who = "phuslu" },
+    .{ .label = "serde_json 1.0.150", .who = null },
+};
+const fast_go_dir = "modules/accesslog/tools/go_fast_bench";
+const rust_manifest = "modules/accesslog/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+/// Build the Rust side once, offline (the crates are in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
 }

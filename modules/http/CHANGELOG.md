@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Added:** `h1.RequestHead.http2` (default false), set by the h2 server, so a handler or middleware can tell an HTTP/2 request from an HTTP/1.1 one (`accesslog` logs `HTTP/2.0` from it). Additive; no behaviour change.
+
 - **2026-10-25** — **Added:** `ResponseWriter.HeaderValue` (a header value checked once for CR/LF/NUL) and `ResponseWriter.setHeaderBorrowed(comptime name, value)` — `setHeaderStatic` for a run-time value the caller keeps alive until the response ends: no per-response check, no copy into `header_buf` (first user: `aaa-gate`'s 401 challenge and media type). **Faster, same bytes:** `writeHead` writes each header line with four `writeAll`s instead of `print`, and `validHeaderValue` checks 16 bytes at a time. Tests: borrowed replace/no-copy/HeadersSent, every bad byte at every position of lengths 0..40.
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `strRepeat` helper (22 copies, the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²). The test binary's Sema went from 323 s to 13 s; the bytes produced are the same (814/834 tests, 20 skip, as before).
