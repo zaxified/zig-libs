@@ -55,6 +55,12 @@
 //! `{"message":"Unauthorized"}` via `encoding/json`, no challenge for KeyAuth).
 //! Result count = sum of status codes, so a policy that diverges shows up as
 //! a count mismatch before any timing is read.
+//! FASTEST IN THE FIELD (2026-10-25): after the echo rows the same rows run
+//! against gofiber/fiber v2 and v3 (`tools/go_fast_bench`, fasthttp-based)
+//! and tower-http 0.7.1 `ValidateRequestHeaderLayer` with the same hashed
+//! validator (`tools/rust_fast_bench`), each net of its own `_plain` twin and
+//! with ours re-timed in the same rounds; the verdict is the worst row's
+//! ours/fastest. BENCH_FAST=0 skips it (no cargo needed then).
 //! Each side times the same way (double the batch until it takes over 100 ms,
 //! best of five); the sides alternate for BENCH_ROUNDS (default 3) rounds, each
 //! keeping its best. Ratios are ours/echo by wall time; the verdict is the WORST
@@ -94,6 +100,11 @@ const Data = struct {
 };
 
 fn hOk(ctx: *router.Ctx) anyerror!void {
+    // A Content-Type like every foreign twin (echo `c.String`, fiber
+    // `SendString`, gin `c.String`, tower's `Inner`): without it the net of
+    // a 401 row also counted one header line the others pay on both sides
+    // (2026-10-25).
+    try ctx.res.setHeaderStatic("Content-Type", "text/plain; charset=utf-8");
     try ctx.res.writeAll("ok");
 }
 
@@ -223,6 +234,27 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
 
+    // `--profile <row> [seconds [gated|plain]]`: one row of ours alone (the
+    // gated side, then its plain twin, or just one), no foreign side -- the
+    // loop to put under `perf`.
+    if (args.len > 2 and std.mem.eql(u8, args[1], "--profile")) {
+        const wi = for (names, 0..) |name, i| {
+            if (std.mem.eql(u8, name, args[2])) break i;
+        } else return error.UnknownRow;
+        const secs = if (args.len > 3) try std.fmt.parseFloat(f64, args[3]) else 3.0;
+        const only: ?[]const u8 = if (args.len > 4) args[4] else null;
+        for ([_]bool{ false, true }) |plain| {
+            if (only) |o| if (std.mem.eql(u8, o, if (plain) "gated" else "plain")) continue;
+            const row = bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi, plain }, true);
+            const reps: usize = @intFromFloat(secs * 1e9 / row.ns);
+            var sum: u64 = 0;
+            for (0..reps) |_| sum +%= once(&d, wi, plain);
+            std.mem.doNotOptimizeAway(sum);
+            std.debug.print("{s}{s} {d:.0} ns/op\n", .{ args[2], if (plain) "_plain" else "", row.ns });
+        }
+        return 0;
+    }
+
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
@@ -281,8 +313,113 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (!use_fast) {
+        if (filters.len == 0)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: the same rows, net, against each contender ----
+    try w.flush();
+    const fast_go = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = fast_go_dir, .abs = abs, .out = "go_fast_bench" });
+    try rustBuild(arena, io, init.environ_map);
+    try w.print("\nfastest in the field -- net per row (with - _plain), {d} rounds, ours re-timed beside them\n", .{rounds});
+    try w.print("{s:<18} {s:<26} {s:>10} {s:>10} {s:>8}\n", .{ "workload", "contender", "its net", "ours net", "ours/it" });
+    var worst_fast: f64 = 0;
+    var worst_row: []const u8 = "";
+    var worst_who: []const u8 = "";
+    var fast_mismatch = false;
+    for (names, 0..) |name, wi| {
+        if (filters.len > 0) {
+            var hit = false;
+            for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
+            if (!hit) continue;
+        }
+        const plain_name = try arena.print("{s}_plain", .{name});
+        var ours: bench.Side = .{};
+        var ours_p: bench.Side = .{};
+        var theirs: [fast.len]bench.Side = @splat(.{});
+        var theirs_p: [fast.len]bench.Side = @splat(.{});
+        for (0..rounds) |_| {
+            ours_p.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi, true }, true));
+            ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi, false }, true));
+            for (fast, 0..) |c, ci| {
+                theirs_p[ci].add(try fastRun(arena, io, c, fast_go, abs, plain_name));
+                theirs[ci].add(try fastRun(arena, io, c, fast_go, abs, name));
+            }
+        }
+        const ours_net = ours.best_ns - ours_p.best_ns;
+        var row_fastest = std.math.inf(f64);
+        var row_who: []const u8 = "";
+        for (fast, 0..) |c, ci| {
+            const net = theirs[ci].best_ns - theirs_p[ci].best_ns;
+            const same = theirs[ci].count == ours.count;
+            fast_mismatch = fast_mismatch or !same;
+            try w.print("{s:<18} {s:<26} {d:>10.0} {d:>10.0} {d:>8.3}{s}\n", .{ name, c.label, net, ours_net, ours_net / net, if (same) "" else "  count != ours" });
+            if (net < row_fastest) {
+                row_fastest = net;
+                row_who = c.label;
+            }
+        }
+        const ratio = ours_net / row_fastest;
+        if (ratio > worst_fast) {
+            worst_fast = ratio;
+            worst_row = name;
+            worst_who = row_who;
+        }
+        try w.flush();
+    }
+    if (fast_mismatch) {
+        try w.writeAll(bench_name ++ ": FAILED -- a contender's status sum differs from ours; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    try w.print("\nworst ours/fastest = {d:.2} (row {s}, {s})\n", .{ worst_fast, worst_row, worst_who });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured 2026-10-17)\n", .{ best, worst, ref_card });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} (net, row {s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_who, worst_row });
     try w.flush();
     return 0;
+}
+
+/// A fast contender: a Go program (`who` = its first argument) or the Rust one.
+const Fast = struct { label: []const u8, who: ?[]const u8 };
+/// Verdict kind only (hashed validator, every digest compared); the raw-key
+/// and built-in `==` variants of `go_fast_bench`/`rust_fast_bench` are info,
+/// run by hand (tools/README.md).
+const fast = [_]Fast{
+    .{ .label = "fiber v2.52.16", .who = "fiber2" },
+    .{ .label = "fiber v3.6.1", .who = "fiber3" },
+    .{ .label = "tower-http 0.7.1", .who = null },
+};
+const fast_go_dir = "modules/aaa-gate/tools/go_fast_bench";
+const rust_manifest = "modules/aaa-gate/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+fn fastRun(arena: std.mem.Allocator, io: std.Io, c: Fast, go_exe: []const u8, abs: []const u8, name: []const u8) !bench.Row {
+    return if (c.who) |who|
+        bench.foreignArgv(arena, io, bench_name, &.{ go_exe, who, abs, name }, name, null)
+    else
+        bench.foreignArgv(arena, io, bench_name, &.{ rust_exe, abs, name }, name, null);
+}
+
+/// Build the Rust side once, offline (the crates are in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
 }

@@ -119,6 +119,7 @@ const testkit = @import("testkit");
 const builtin = @import("builtin");
 const router = @import("router");
 const http = @import("http");
+const HeaderValue = http.Server.ResponseWriter.HeaderValue;
 const b64ct = @import("b64ct");
 const cookies = @import("cookies");
 const burn = @import("burn.zig");
@@ -282,13 +283,13 @@ pub const ApiKeyVerifyFn = *const fn (ctx: ?*anyopaque, presented_key: []const u
 /// Called on the serving thread, after the static token set misses, and
 /// outside the gate's lock — so it may take its own locks. `ctx` is
 /// `Options.token_verify_ctx` verbatim.
+pub const TokenVerifyFn = *const fn (ctx: ?*anyopaque, presented_token: []const u8) bool;
+
 /// Caller-supplied Basic verifier for a dynamic user store. Receives the
 /// presented user and password verbatim; **must** compare in constant time
 /// (see `secretEqual`), never `std.mem.eql`. Called after the static set
 /// misses, outside the gate's lock. `ctx` is `Options.basic_verify_ctx`.
 pub const BasicVerifyFn = *const fn (ctx: ?*anyopaque, user: []const u8, password: []const u8) bool;
-
-pub const TokenVerifyFn = *const fn (ctx: ?*anyopaque, presented_token: []const u8) bool;
 
 /// Constant-time equality for secret material (compares fixed-size
 /// SHA-256 digests via `std.crypto.timing_safe.eql`, so neither content
@@ -552,6 +553,12 @@ pub const Gate = struct {
     /// nothing per request.
     deny_body: []const u8 = default_deny_body,
     deny_content_type: []const u8 = default_deny_content_type,
+    /// `challenge` and `deny_content_type` checked once by `init`, lent to
+    /// every 401 (`setHeaderBorrowed`); null = not checked (an invalid
+    /// value, or a gate not built by `init`) -- then the deny path checks
+    /// it per request, and an invalid one fails as `setHeader` would.
+    challenge_value: ?HeaderValue = null,
+    deny_content_type_value: ?HeaderValue = null,
     /// Route-exemption predicate, or null when nothing is exempt.
     exempt: ?ExemptFn = null,
     /// Bearer-token verifier callback (dynamic store) + its ctx.
@@ -607,6 +614,9 @@ pub const Gate = struct {
         var basics: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer basics.deinit(gpa);
         for (options.basic_users) |u| {
+            // Same contract as `addBasicUser`: a `:` in the user would let this
+            // stored pair match a different (user, password) split.
+            std.debug.assert(std.mem.findScalar(u8, u.user, ':') == null and u.password.len != 0);
             const fp = basicFingerprint(u.user, u.password);
             if (!containsFp(basics.items, fp)) try basics.append(gpa, fp);
         }
@@ -641,6 +651,8 @@ pub const Gate = struct {
             .challenge = challenge,
             .deny_body = deny_body,
             .deny_content_type = deny_content_type,
+            .challenge_value = HeaderValue.init(challenge) catch null,
+            .deny_content_type_value = HeaderValue.init(deny_content_type) catch null,
             .token_verify = options.token_verify,
             .token_verify_ctx = options.token_verify_ctx,
             .api_key_verify = options.api_key_verify,
@@ -698,6 +710,11 @@ pub const Gate = struct {
     pub fn verify(g: *Gate, presented: ?[]const u8) Verdict {
         const has_verify = g.token_verify != null;
         const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
+        // Nothing presented: only an empty set with no verifier and
+        // `allow_when_unconfigured` admits it (`.ok_open`); everything else
+        // is `.denied` whatever the set holds -- decided without the lock
+        // (both inputs are fixed at `init`).
+        if (presented == null and (has_verify or !g.allow_when_unconfigured)) return .denied;
         {
             lockSpin(&g.lock);
             defer g.lock.unlock();
@@ -727,6 +744,11 @@ pub const Gate = struct {
     pub fn verifyApiKey(g: *Gate, presented: ?[]const u8) Verdict {
         const has_verify = g.api_key_verify != null;
         const fp: ?[Sha256.digest_length]u8 = if (presented) |p| fingerprint(p) else null;
+        // Nothing presented: only an empty set with no verifier and
+        // `allow_when_unconfigured` admits it (`.ok_open`); everything else
+        // is `.denied` whatever the set holds -- decided without the lock
+        // (both inputs are fixed at `init`).
+        if (presented == null and (has_verify or !g.allow_when_unconfigured)) return .denied;
         {
             lockSpin(&g.lock);
             defer g.lock.unlock();
@@ -756,6 +778,11 @@ pub const Gate = struct {
     pub fn verifyBasic(g: *Gate, presented: ?BasicCredentials) Verdict {
         const has_verify = g.basic_verify != null;
         const fp: ?[Sha256.digest_length]u8 = if (presented) |c| basicFingerprint(c.user, c.password) else null;
+        // Nothing presented: only an empty set with no verifier and
+        // `allow_when_unconfigured` admits it (`.ok_open`); everything else
+        // is `.denied` whatever the set holds -- decided without the lock
+        // (both inputs are fixed at `init`).
+        if (presented == null and (has_verify or !g.allow_when_unconfigured)) return .denied;
         {
             lockSpin(&g.lock);
             defer g.lock.unlock();
@@ -815,6 +842,10 @@ pub const Gate = struct {
     /// Add an API key to the valid set (rotation, mirrors `addToken`).
     /// Idempotent; `key` is hashed, not retained; must be non-empty.
     pub fn addApiKey(g: *Gate, key: []const u8) error{OutOfMemory}!void {
+        return burn.run(burn.hash_burn, error{OutOfMemory}!void, addApiKeyBody, .{ g, key });
+    }
+
+    fn addApiKeyBody(g: *Gate, key: []const u8) error{OutOfMemory}!void {
         std.debug.assert(key.len != 0);
         const fp = fingerprint(key);
         lockSpin(&g.lock);
@@ -826,6 +857,10 @@ pub const Gate = struct {
     /// Remove an API key from the valid set (mirrors `removeToken`; no-op
     /// when absent).
     pub fn removeApiKey(g: *Gate, key: []const u8) void {
+        burn.run(burn.hash_burn, void, removeApiKeyBody, .{ g, key });
+    }
+
+    fn removeApiKeyBody(g: *Gate, key: []const u8) void {
         const fp = fingerprint(key);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -862,8 +897,10 @@ pub const Gate = struct {
     }
 
     /// Remove a token from the valid set (no-op when absent). Removing
-    /// the last token reopens the plane — see the open-plane note (unless
-    /// a `token_verify` callback is configured, which keeps it closed).
+    /// the last token leaves the static set empty: the gate then denies
+    /// everything (fail closed) unless `allow_when_unconfigured` is set, in
+    /// which case it becomes the open plane — see the open-plane note. A
+    /// `token_verify` callback keeps the plane closed either way.
     pub fn removeToken(g: *Gate, token: []const u8) void {
         burn.run(burn.hash_burn, void, removeTokenBody, .{ g, token });
     }
@@ -1121,6 +1158,40 @@ fn bearerToken(req: *const http.Server.Request) ?[]const u8 {
     return bearerTokenOf(req.header("authorization") orelse return null);
 }
 
+/// Whether a credential field the gate reads appears on more than one line.
+/// `Authorization` (and an API-key header) is a singleton field (RFC 9110
+/// §5.3): two lines are a malformed request, and a proxy in front may read
+/// the other one than we do -- so such a request is DENIED, whatever either
+/// line holds (fiber v3 refuses it too; before 2026-10-25 the first line
+/// decided, so a valid first line admitted any second one). Only a present
+/// field is looked at twice: the second lookup scans the block after the
+/// first line, so a request without the field pays nothing.
+fn repeatedField(req: *const http.Server.Request, name: []const u8) bool {
+    const first = req.header(name) orelse return false;
+    const block = req.head.header_block;
+    const start = @intFromPtr(block.ptr);
+    const at = @intFromPtr(first.ptr) + first.len;
+    if (at < start or at > start + block.len) return false; // not a slice of the block
+    return http.h1.blockHeader(block[at - start ..], name) != null;
+}
+
+/// `repeatedField` over every credential field `g`'s mode reads.
+fn repeatedCredential(g: *const Gate, req: *const http.Server.Request) bool {
+    const reads_authorization = switch (g.auth_mode) {
+        .bearer, .basic, .any, .either => true,
+        .api_key => false,
+    };
+    if (reads_authorization and repeatedField(req, "authorization")) return true;
+    const reads_keys = switch (g.auth_mode) {
+        .api_key, .any, .either => true,
+        .bearer, .basic => false,
+    };
+    if (reads_keys) for (g.key_sources) |src| {
+        if (src.kind == .header and repeatedField(req, src.name)) return true;
+    };
+    return false;
+}
+
 /// The bearer token in a raw `Authorization` header value, or null when it
 /// uses another scheme or is malformed (never panics — any byte sequence
 /// maps to a token or to null). Pure and string-level on purpose: the
@@ -1309,6 +1380,7 @@ fn formatV4(bytes: [4]u8, buf: *[client_key_len_max]u8) []const u8 {
 /// both credentials are valid (documented precedence); the plane is open
 /// only when no credential is configured for the active mode(s).
 fn authorize(g: *Gate, req: *const http.Server.Request) ?Identity.Scheme {
+    if (repeatedCredential(g, req)) return null;
     var cred_buf: [basic_credentials_max]u8 = undefined;
     defer std.crypto.secureZero(u8, &cred_buf);
     switch (g.auth_mode) {
@@ -1370,10 +1442,11 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
 
     const scheme = authorize(g, ctx.req) orelse {
         // Denied: 401, chain short-circuited. Header values and the body
-        // are gate-owned stable memory, so no early end() is needed.
+        // are gate-owned stable memory, so no early end() is needed -- and
+        // the values are lent to the response, not copied into it.
         ctx.res.setStatus(401);
-        try ctx.res.setHeader("WWW-Authenticate", g.challenge);
-        try ctx.res.setHeader("Content-Type", g.deny_content_type);
+        try ctx.res.setHeaderBorrowed("WWW-Authenticate", g.challenge_value orelse try HeaderValue.init(g.challenge));
+        try ctx.res.setHeaderBorrowed("Content-Type", g.deny_content_type_value orelse try HeaderValue.init(g.deny_content_type));
         try ctx.res.writeAll(g.deny_body);
         auditDenied(g, ctx);
         return;
@@ -3937,8 +4010,257 @@ test "middleware: ctx.data is restored when the gate returns (an outer middlewar
     try testing.expect(seen_none);
 }
 
+// ── tests added by the 2026-10-25 grade-1 audit (each kills a surviving mutant) ──
+
+test "Clock.monotonic: nanoseconds of CLOCK_MONOTONIC, not milliseconds" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = Clock.monotonic.now();
+    var ts: std.posix.timespec = undefined;
+    try testing.expect(std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) == .SUCCESS);
+    const b = @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    try testing.expect(b >= a);
+    try testing.expect(b - a < std.time.ns_per_s);
+}
+
+fn basicCtxVerify(ctx: ?*anyopaque, user: []const u8, password: []const u8) bool {
+    const want: *const []const u8 = @ptrCast(@alignCast(ctx.?));
+    return secretEqual(user, want.*) and secretEqual(password, "pw");
+}
+
+test "verifyBasic: basic_verify receives basic_verify_ctx verbatim" {
+    const want: []const u8 = "from-ctx";
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_verify = basicCtxVerify,
+        .basic_verify_ctx = @ptrCast(@constCast(&want)),
+    });
+    defer g.deinit();
+    try testing.expectEqual(Gate.Verdict.ok_basic, g.verifyBasic(.{ .user = "from-ctx", .password = "pw" }));
+    try testing.expectEqual(Gate.Verdict.denied, g.verifyBasic(.{ .user = "other", .password = "pw" }));
+}
+
+test "throttle: a clock stepping backwards counts as no time passing — suppresses, never underflows" {
+    var tc: TestClock = .{};
+    var g = try Gate.init(testing.allocator, .{ .token = "t", .throttle_window_ms = 1_000, .clock = tc.clock() });
+    defer g.deinit();
+    tc.ns = 10 * std.time.ns_per_s;
+    try testing.expectEqual(@as(?u64, 0), g.deniedDecision("k"));
+    tc.ns = 5 * std.time.ns_per_s; // behind the admitted instant
+    try testing.expectEqual(@as(?u64, null), g.deniedDecision("k"));
+    tc.ns = 10 * std.time.ns_per_s + 1_000 * std.time.ns_per_ms;
+    try testing.expectEqual(@as(?u64, 1), g.deniedDecision("k"));
+}
+
+test "basicCredentialsOf: a credential without a colon is wiped from the caller's buffer" {
+    var out: [32]u8 = @splat(0xAA);
+    try testing.expectEqual(@as(?BasicCredentials, null), basicCredentialsOf("Basic bm9jb2xvbg==", &out)); // "nocolon"
+    for (out[0.."nocolon".len]) |c| try testing.expectEqual(@as(u8, 0), c);
+}
+
+test "queryValue: a pair without '=' is skipped, the search goes on" {
+    try testing.expectEqualStrings("v", queryValue("flag&k=v", "k").?);
+    try testing.expectEqualStrings("v", queryValue("a=1&&flag&k=v&k=w", "k").?);
+    try testing.expectEqual(@as(?[]const u8, null), queryValue("flag&kk=v", "k"));
+}
+
+test "headerKey: the value is trimmed first, the prefix is stripped exactly (no byte of it stays)" {
+    try testing.expectEqualStrings("secret", headerKey("  K=secret \t", "K=").?);
+    try testing.expectEqualStrings("secret", headerKey("k=secret", "K=").?);
+    try testing.expectEqualStrings("secret", headerKey("secret", "").?);
+    try testing.expectEqual(@as(?[]const u8, null), headerKey("secret", "K="));
+    try testing.expectEqual(@as(?[]const u8, null), headerKey(null, "K="));
+}
+
+test "formatPeerKey: ::ff:a.b.c.d (b[10] = 0, b[11] = 0xff) is not IPv4-mapped" {
+    var buf: [client_key_len_max]u8 = undefined;
+    const ip = std.Io.net.IpAddress;
+    try testing.expectEqualStrings("0000:0000:0000:0000:0000:00ff:0102:0304", formatPeerKey(ip.parseIp6("::ff:102:304", 1) catch unreachable, &buf));
+}
+
+fn hAnyOpen(ctx: *router.Ctx) anyerror!void {
+    const id = identityOf(ctx) orelse return error.NoIdentity;
+    try testing.expectEqual(Identity.Scheme.open, id.scheme);
+    try ctx.res.writeAll("open-plane");
+}
+
+test "middleware .any / .either: nothing configured + allow_when_unconfigured admits as the .open identity" {
+    inline for (.{ AuthMode.any, AuthMode.either }) |mode| {
+        var g = try Gate.init(testing.allocator, .{ .auth_mode = mode, .allow_when_unconfigured = true });
+        defer g.deinit();
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.use(g.middleware());
+        try r.get("/t", hAnyOpen);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, wire("GET", "/t", ""), &buf);
+        try expectStatus(got, "200");
+        try testing.expectEqualStrings("open-plane", bodyOf(got));
+    }
+}
+
 test {
     _ = @import("model_test.zig");
+}
+
+// ── lead tests (2026-10-25): header-confusion behaviour pinned over the wire ──
+// The `**Ahead:**` line of the maturity card cites these by name; the same
+// cases run against labstack/echo v5.4.0, gofiber/fiber v2.52.16 / v3.6.1 and
+// gin v1.12.0 in the field report (modules/aaa-gate/tools/go_fast_bench,
+// ~/CML/20261025-wave10/aaa-field.report.md).
+
+test "lead: Bearer scheme is case-insensitive and tolerates runs of spaces; a tab or a suffixed token does not admit" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+    // RFC 9110 11.1: auth-scheme is case-insensitive; RFC 7235 2.1 `1*SP` separates it.
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: bearer s3cr3t\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: BEARER s3cr3t\r\n"), &buf), "200");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer    s3cr3t\r\n"), &buf), "200");
+    // not admitted: HTAB between scheme and token, the token with a suffix or a
+    // prefix, no separator, a different scheme
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer\ts3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3tx\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer xs3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearers3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Token s3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer \r\n"), &buf), "401");
+}
+
+test "lead: two Authorization headers (or two API-key headers) are denied, whatever either line holds" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+    // valid first, wrong second: denied (before 2026-10-25 the first decided and this was a 200)
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nAuthorization: Bearer wrong\r\n"), &buf), "401");
+    // two valid lines: still denied -- the field is a singleton
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nauthorization: Bearer s3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: Bearer wrong\r\nX-Other: 1\r\nAuthorization: Bearer s3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "Authorization: \r\nAuthorization: Bearer s3cr3t\r\n"), &buf), "401");
+    // one line: admitted
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "X-Other: 1\r\nAuthorization: Bearer s3cr3t\r\n"), &buf), "200");
+
+    var gk = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "k3y" });
+    defer gk.deinit();
+    var grk = try GatedRouter.init(&gk, null);
+    defer grk.deinit();
+    try expectStatus(runWire(&grk.r, wire("GET", "/t", "X-Api-Key: k3y\r\n"), &buf), "200");
+    try expectStatus(runWire(&grk.r, wire("GET", "/t", "X-Api-Key: k3y\r\nX-Api-Key: k3y\r\n"), &buf), "401");
+    // an api_key gate does not read Authorization: two of them do not matter there
+    try expectStatus(runWire(&grk.r, wire("GET", "/t", "X-Api-Key: k3y\r\nAuthorization: a\r\nAuthorization: b\r\n"), &buf), "200");
+}
+
+test "lead: a bearer token in the query string or in X-Api-Key is not a bearer credential" {
+    var g = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });
+    defer g.deinit();
+    var gr = try GatedRouter.init(&g, null);
+    defer gr.deinit();
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?access_token=s3cr3t", ""), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?api_key=s3cr3t", ""), &buf), "401");
+    try expectStatus(runWire(&gr.r, wire("GET", "/t", "X-Api-Key: s3cr3t\r\n"), &buf), "401");
+    // header wrong + query right: the header is what is read, and it is wrong
+    try expectStatus(runWire(&gr.r, wire("GET", "/t?access_token=s3cr3t", "Authorization: Bearer wrong\r\n"), &buf), "401");
+}
+
+test "lead: Basic over the wire — scheme case, spaces, a colon in the password, unpadded base64, two headers denied" {
+    var g = try Gate.init(testing.allocator, .{
+        .auth_mode = .basic,
+        .basic_users = &.{
+            .{ .user = "alice", .password = "s3cret" },
+            .{ .user = "bob", .password = "pw:with:colon" },
+        },
+    });
+    defer g.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(g.middleware());
+    try r.get("/t", hBasicIdentity);
+    var buf: [1024]u8 = undefined;
+    // alice:s3cret = YWxpY2U6czNjcmV0, bob:pw:with:colon = Ym9iOnB3OndpdGg6Y29sb24=
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: basic YWxpY2U6czNjcmV0\r\n"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic   YWxpY2U6czNjcmV0\r\n"), &buf), "200");
+    // RFC 7617 2: the password may hold colons, the user may not
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic Ym9iOnB3OndpdGg6Y29sb24=\r\n"), &buf), "200");
+    // not admitted: HTAB separator, unpadded base64, trailing junk, another user's password
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic\tYWxpY2U6czNjcmV0\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic Ym9iOnB3OndpdGg6Y29sb24\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0x\r\n"), &buf), "401");
+    // bob's password under alice's name (base64 of alice:pw:with:colon)
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6cHc6d2l0aDpjb2xvbg==\r\n"), &buf), "401");
+    // two headers: denied, whichever is valid
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YWxpY2U6czNjcmV0\r\nAuthorization: Basic eDp5\r\n"), &buf), "401");
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic eDp5\r\nAuthorization: Basic YWxpY2U6czNjcmV0\r\n"), &buf), "401");
+}
+
+test "repeated credential fields: only the fields the mode reads count, and a longer name is not a repeat" {
+    var buf: [1024]u8 = undefined;
+    // `.either`: both Authorization and X-Api-Key are read
+    var ge = try Gate.init(testing.allocator, .{ .auth_mode = .either, .token = "s3cr3t", .api_key = "k3y" });
+    defer ge.deinit();
+    var gre = try GatedRouter.init(&ge, null);
+    defer gre.deinit();
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nAuthorization: Bearer s3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "X-Api-Key: k3y\r\nX-Api-Key: k3y\r\n"), &buf), "401");
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nX-Api-Key: k3y\r\nX-Api-Key: k3y\r\n"), &buf), "401");
+    // a header whose name merely starts with the credential field is another field
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nAuthorization-Extra: 1\r\n"), &buf), "200");
+    try expectStatus(runWire(&gre.r, wire("GET", "/t", "X-Api-Key: k3y\r\nX-Api-Key-Extra: 1\r\n"), &buf), "200");
+    // `.any`
+    var ga = try Gate.init(testing.allocator, .{ .auth_mode = .any, .token = "s3cr3t", .api_key = "k3y", .basic_users = &.{.{ .user = "a", .password = "b" }} });
+    defer ga.deinit();
+    var gra = try GatedRouter.init(&ga, null);
+    defer gra.deinit();
+    try expectStatus(runWire(&gra.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nAuthorization: Bearer s3cr3t\r\n"), &buf), "401");
+    try expectStatus(runWire(&gra.r, wire("GET", "/t", "X-Api-Key: k3y\r\nX-Api-Key: k3y\r\n"), &buf), "401");
+    try expectStatus(runWire(&gra.r, wire("GET", "/t", "X-Api-Key: k3y\r\n"), &buf), "200");
+    // `.bearer` does not read X-Api-Key; `.basic` neither
+    var gb = try Gate.init(testing.allocator, .{ .token = "s3cr3t" });
+    defer gb.deinit();
+    var grb = try GatedRouter.init(&gb, null);
+    defer grb.deinit();
+    try expectStatus(runWire(&grb.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\nX-Api-Key: 1\r\nX-Api-Key: 2\r\n"), &buf), "200");
+    var gs = try Gate.init(testing.allocator, .{ .auth_mode = .basic, .basic_users = &.{.{ .user = "a", .password = "b" }} });
+    defer gs.deinit();
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(gs.middleware());
+    try r.get("/t", hBasicIdentity);
+    try expectStatus(runWire(&r, wire("GET", "/t", "Authorization: Basic YTpi\r\nX-Api-Key: 1\r\nX-Api-Key: 2\r\n"), &buf), "200");
+    // a custom (non-default) header source is the one checked
+    var gc = try Gate.init(testing.allocator, .{ .auth_mode = .api_key, .api_key = "k3y", .api_key_sources = &.{ .{ .kind = .header, .name = "X-Company-Key" }, .{ .kind = .query, .name = "k" } } });
+    defer gc.deinit();
+    var grc = try GatedRouter.init(&gc, null);
+    defer grc.deinit();
+    try expectStatus(runWire(&grc.r, wire("GET", "/t", "X-Company-Key: k3y\r\n"), &buf), "200");
+    try expectStatus(runWire(&grc.r, wire("GET", "/t", "X-Company-Key: k3y\r\nX-Company-Key: k3y\r\n"), &buf), "401");
+    try expectStatus(runWire(&grc.r, wire("GET", "/t?k=k3y&k=zz", ""), &buf), "200");
+}
+
+test "deny path: a challenge or content type that is not a legal header value fails the request (500), never reaches the wire" {
+    var buf: [1024]u8 = undefined;
+    var g1 = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .realm = "a\r\nSet-Cookie: x=1" });
+    defer g1.deinit();
+    var gr1 = try GatedRouter.init(&g1, null);
+    defer gr1.deinit();
+    const got1 = runWire(&gr1.r, wire("GET", "/t", ""), &buf);
+    try expectStatus(got1, "500");
+    try testing.expect(std.mem.find(u8, got1, "Set-Cookie") == null);
+    var g2 = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .deny_content_type = "text/plain\r\nX-Injected: 1" });
+    defer g2.deinit();
+    var gr2 = try GatedRouter.init(&g2, null);
+    defer gr2.deinit();
+    const got2 = runWire(&gr2.r, wire("GET", "/t", ""), &buf);
+    try expectStatus(got2, "500");
+    try testing.expect(std.mem.find(u8, got2, "X-Injected") == null);
+    // a valid request is unaffected
+    try expectStatus(runWire(&gr2.r, wire("GET", "/t", "Authorization: Bearer s3cr3t\r\n"), &buf), "200");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Fix (A1 audit):** the virtual trailing-slash segment the redirect probe appends no longer costs a level of `max_path_segments`: a legal 256-segment route `"/a"×255 ++ "/"` lost its redirect from `"/a"×255` (`Router` and `Static.trailingSlashVariant`). 11 tests from the mutation run, among them a `Static`-against-`Router` differential on paths past the 64-byte `Scan` window. **Card:** grade 1 — fastest in the field (0.68–0.82× matchit), audited over the current source.
+
+- **2026-10-25** — **Faster lookup, same answers:** `Static.match` is 0.82× matchit (Rust, the fastest router measured; was 2.15×) and the runtime `Router` gains too: each comptime node is its own generated function, the path's '/' positions are found once as a bitmask (`Scan`) instead of a byte scan per level, and no node array is copied per call. The matching algorithm is still one (`matchStep`), shared by both; tests unchanged plus a `Scan` test over every path length 0..140. `bench-router -- --plain-only [s]` runs our lookup alone (for `perf`).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — **Card:** the fastest router in the field measured: `bench-router` also times httprouter, echo, bunrouter (Go) and matchit (Rust) on the plain subset of its table. Ours is ahead of every Go router (0.87×) and 2.15× behind matchit, so the performance axis stays P2. No code change.

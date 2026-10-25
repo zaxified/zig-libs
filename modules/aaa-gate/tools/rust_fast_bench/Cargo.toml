@@ -1,0 +1,22 @@
+[package]
+name = "rust_fast_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tower-http = { version = "=0.7.1", default-features = false, features = ["validate-request", "auth"] }
+tower-layer = "=0.3.3"
+tower-service = "=0.3.3"
+http = "=1.5.0"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+base64 = "=0.22.1"
+
+# Keep this out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

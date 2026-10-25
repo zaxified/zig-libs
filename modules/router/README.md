@@ -273,8 +273,9 @@ ASCII case-insensitive, port and one trailing dot ignored, an IPv6 literal keeps
 
 For a server whose routes are known when it is built, `router.Static(routes, .{})` builds the
 same trie at compile time and answers with a route index instead of running a handler: no
-allocator, no hash map, no `Ctx`, no middleware. The matcher is the one `Router` uses (`matchIn`,
-generic over how a node is stored), so precedence, backtracking, HEAD→GET, the F4 pruning and the
+allocator, no hash map, no `Ctx`, no middleware. The matcher is the one `Router` uses (`matchStep`,
+generic over how a node is stored; for `Static` every node becomes its own function with its
+literals compared in place, the fastest lookup measured in the field — see SPEC § Performance), so precedence, backtracking, HEAD→GET, the F4 pruning and the
 F5 `Allow` union are identical — a differential test holds the two to the same answers on
 generated tables. Every error `Router.add` returns at startup is a `@compileError` here.
 

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **SECURITY (hardening, consumer-visible):** a request carrying a credential field the gate reads on more than one line — two `Authorization` lines, or two lines of an API-key header — is DENIED (401), whatever either line holds. Before, the first line decided, so a valid first line admitted any second one; a proxy in front reading the other line authenticates something else than the gate does. `Authorization` is a singleton field (RFC 9110 §5.3); fiber v3 refuses the same. A mode that does not read the field ignores its repetition (an `.api_key` gate and two `Authorization` lines). Tests: `lead: two Authorization headers (or two API-key headers) are denied …`, the Basic wire test.
+
+- **2026-10-25** — **Faster deny path, same answers:** a request with no credential is denied without taking the credential lock when the answer cannot depend on the set (a verifier configured, or `allow_when_unconfigured` off); the 401's challenge and media type are checked once at `init` and lent to every response (`http` `setHeaderBorrowed`), not checked and copied per request. `no_credential` 401: 0.97–1.17× tower-http 0.7.1 net (was 2.67× with http's own speed-ups the same day).
+
+- **2026-10-25** — **Fixes from the A1 audit:** `addApiKey`/`removeApiKey` run under the dead-stack burn like the token and Basic entry points; `init` asserts the Basic contract `addBasicUser` asserts (no `:` in the user, a non-empty password — else `a:b`/`c` matched the pair `a`/`b:c`); `removeToken`'s doc no longer claims removing the last token reopens the plane (it does not, fail-closed). 8 tests from the mutation run, 4 `lead:` tests pinning the Authorization syntax against RFC 9110/7235/7617.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

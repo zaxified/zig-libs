@@ -262,6 +262,19 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     plain_requests = plain_buf[0..n_plain];
+    // `--plain-only [seconds]`: our plain-subset lookup alone, no foreign
+    // side -- the loop to put under `perf` (default 3 s).
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--plain-only")) {
+        const secs = if (args.len > 2) try std.fmt.parseFloat(f64, args[2]) else 3.0;
+        const row = timeIt(io, .{}, lookupPlain);
+        const reps: usize = @intFromFloat(secs * 1e9 / row.ns);
+        var found: usize = 0;
+        for (0..reps) |_| found +%= lookupPlain();
+        std.mem.doNotOptimizeAway(found);
+        std.debug.print("ours (plain) {d:.1} ns/op, count {d}\n", .{ row.ns, row.count });
+        return 0;
+    }
     list.clearRetainingCapacity();
     for (plain_routes) |r| try list.writer.print("{s}\t{s}\n", .{ r.m.token(), r.p });
     try dir.writeFile(io, .{ .sub_path = "routes_plain.tsv", .data = list.written() });

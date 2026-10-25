@@ -1481,7 +1481,8 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
     const table = comptime buildStatic(routes);
     return struct {
         pub const route_count = routes.len;
-        const tree: StaticTree = .{ .nodes = table };
+        const Tree = StaticTree(table);
+        const tree: Tree = .{};
 
         /// Match `path` (origin-form) for `method`. `params` receives the
         /// captures of the matched route; they are slices of `path`.
@@ -1492,16 +1493,16 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
             var allow: AllowSet = .empty;
             switch (options.method_precedence) {
                 .backtrack => {
-                    if (matchIn(tree, 0, rest, false, params, 0, segmentsRemaining(rest, false), method, &allow)) |n|
+                    if (matchAt(Tree, Tree.root, rest, false, params, 0, Scan.init(rest, false), method, &allow)) |n|
                         return .{ .found = tree.routeFor(n, method).? };
                     if (allow.count() != 0) return .{ .method_not_allowed = .{ .bits = allow } };
                     return .not_found;
                 },
                 .first_match => {
-                    const n = matchIn(tree, 0, rest, false, params, 0, segmentsRemaining(rest, false), null, &allow) orelse
+                    const n = matchAt(Tree, Tree.root, rest, false, params, 0, Scan.init(rest, false), null, &allow) orelse
                         return .not_found;
                     if (tree.routeFor(n, method)) |i| return .{ .found = i };
-                    return .{ .method_not_allowed = .{ .bits = table[n].allow_bits } };
+                    return .{ .method_not_allowed = .{ .bits = n.allow_bits } };
                 },
             }
         }
@@ -1518,11 +1519,11 @@ pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOpti
             var unused: AllowSet = .empty;
             if (path.len > 1 and path[path.len - 1] == '/') {
                 const alt = path[1 .. path.len - 1];
-                const n = matchIn(tree, 0, alt, false, &probe, 0, segmentsRemaining(alt, false), null, &unused) orelse return null;
+                const n = matchAt(Tree, Tree.root, alt, false, &probe, 0, Scan.init(alt, false), null, &unused) orelse return null;
                 return if (tree.serves(n, method)) .drop_slash else null;
             }
             const rest = path[1..];
-            const n = matchIn(tree, 0, rest, true, &probe, 0, segmentsRemaining(rest, true), null, &unused) orelse return null;
+            const n = matchAt(Tree, Tree.root, rest, true, &probe, 0, Scan.init(rest, true), null, &unused) orelse return null;
             return if (tree.serves(n, method)) .add_slash else null;
         }
     };
@@ -1545,49 +1546,84 @@ const StaticEdge = struct { seg: []const u8, child: u32 };
 /// An in-segment pattern child (`text` = the pattern segment).
 const StaticPatEdge = struct { text: []const u8, regexes: []const ?regex.Regex, child: u32 };
 
-/// The comptime table as `matchIn` sees it: a `Ref` is an index.
-const StaticTree = struct {
-    nodes: []const StaticNode,
+/// The comptime table as `matchStep` sees it: a `Ref` points at a node of
+/// the table, and every node `matchStep` walks is comptime-known -- each node
+/// is its own `matchAt` instance, so the static children become literal
+/// compares and the absent edges vanish (`is_comptime`). A pointer, not an
+/// index: `?*const` comes back in a register, a `?u32` through memory (two
+/// narrow stores read back as one wide load, a store-forwarding stall after
+/// every level). `routeFor`/`serves` also take a run-time `Ref`: what a match
+/// returned.
+fn StaticTree(comptime nodes: []const StaticNode) type {
+    return struct {
+        const T = @This();
+        pub const Ref = *const StaticNode;
+        pub const Edge = struct { name: []const u8, ref: Ref };
+        pub const is_comptime = true;
+        pub const root: Ref = &nodes[0];
 
-    pub const Ref = u32;
-    pub const Edge = struct { name: []const u8, ref: Ref };
-
-    inline fn static(t: StaticTree, n: Ref, seg: []const u8) ?Ref {
-        for (t.nodes[n].statics) |e| {
-            if (std.mem.eql(u8, e.seg, seg)) return e.child;
+        inline fn at(_: T, comptime i: u32) Ref {
+            return &nodes[i];
         }
-        return null;
+        inline fn statics(_: T, comptime n: Ref) []const StaticEdge {
+            return n.statics;
+        }
+        inline fn patterns(_: T, comptime n: Ref) []const StaticPatEdge {
+            return n.patterns;
+        }
+        inline fn patChild(_: T, comptime e: StaticPatEdge) Ref {
+            return &nodes[e.child];
+        }
+        inline fn param(_: T, comptime n: Ref) ?Edge {
+            const e = n.param orelse return null;
+            return .{ .name = e.seg, .ref = &nodes[e.child] };
+        }
+        inline fn wildcard(_: T, comptime n: Ref) ?Edge {
+            const e = n.wildcard orelse return null;
+            return .{ .name = e.seg, .ref = &nodes[e.child] };
+        }
+        inline fn routeFor(_: T, n: Ref, m: http.Method) ?usize {
+            // By pointer: a copy of the array is a 184-byte stack copy per call.
+            const rs = &n.routes;
+            if (rs[@backingInt(m)]) |i| return i;
+            if (m == .head) if (rs[@backingInt(http.Method.get)]) |i| return i;
+            return null;
+        }
+        inline fn serves(t: T, n: Ref, m: http.Method) bool {
+            return t.routeFor(n, m) != null;
+        }
+        inline fn allowBits(_: T, comptime n: Ref) AllowSet {
+            return n.allow_bits;
+        }
+        inline fn minReach(_: T, comptime n: Ref) u32 {
+            return n.min_reach;
+        }
+        inline fn paramChild(_: T, comptime n: Ref) Ref {
+            return &nodes[n.param.?.child];
+        }
+        inline fn wildcardChild(_: T, comptime n: Ref) Ref {
+            return &nodes[n.wildcard.?.child];
+        }
+        inline fn descend(_: T, comptime child: Ref, rest: ?[]const u8, extra: bool, params: *Params, depth: u32, scan: Scan, method: ?http.Method, allow: *AllowSet) ?Ref {
+            return matchAt(T, child, rest, extra, params, depth, scan, method, allow);
+        }
+    };
+}
+
+/// One comptime node's matcher (see `StaticTree`).
+fn matchAt(comptime T: type, comptime n: T.Ref, rest: ?[]const u8, extra: bool, params: *Params, depth: u32, scan: Scan, method: ?http.Method, allow: *AllowSet) ?T.Ref {
+    return matchStep(T{}, n, rest, extra, params, depth, scan, method, allow);
+}
+
+/// `seg == lit` for a comptime literal: a length check, then byte compares
+/// LLVM merges into word loads (no `mem.eql` call per sibling).
+inline fn eqlLit(seg: []const u8, comptime lit: []const u8) bool {
+    if (seg.len != lit.len) return false;
+    inline for (lit, 0..) |c, i| {
+        if (seg[i] != c) return false;
     }
-    inline fn patterns(t: StaticTree, n: Ref) []const StaticPatEdge {
-        return t.nodes[n].patterns;
-    }
-    inline fn patChild(_: StaticTree, e: StaticPatEdge) Ref {
-        return e.child;
-    }
-    inline fn param(t: StaticTree, n: Ref) ?Edge {
-        const e = t.nodes[n].param orelse return null;
-        return .{ .name = e.seg, .ref = e.child };
-    }
-    inline fn wildcard(t: StaticTree, n: Ref) ?Edge {
-        const e = t.nodes[n].wildcard orelse return null;
-        return .{ .name = e.seg, .ref = e.child };
-    }
-    inline fn routeFor(t: StaticTree, n: Ref, m: http.Method) ?usize {
-        const rs = t.nodes[n].routes;
-        if (rs[@backingInt(m)]) |i| return i;
-        if (m == .head) if (rs[@backingInt(http.Method.get)]) |i| return i;
-        return null;
-    }
-    inline fn serves(t: StaticTree, n: Ref, m: http.Method) bool {
-        return t.routeFor(n, m) != null;
-    }
-    inline fn allowBits(t: StaticTree, n: Ref) AllowSet {
-        return t.nodes[n].allow_bits;
-    }
-    inline fn minReach(t: StaticTree, n: Ref) u32 {
-        return t.nodes[n].min_reach;
-    }
-};
+    return true;
+}
 
 /// Build the table, refusing at compile time what `Router.add` refuses at
 /// startup. Mirrors `Router.insert` step for step; the differential test
@@ -2152,7 +2188,7 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
     var unused_allow: AllowSet = .empty;
-    return matchIn(runtime_tree, node, rest, extra, params, 0, segmentsRemaining(rest, extra), null, &unused_allow);
+    return matchIn(node, rest, extra, params, 0, Scan.init(rest, extra), null, &unused_allow);
 }
 
 /// `matchRec`'s `MethodPrecedence.backtrack` twin (audit finding
@@ -2166,32 +2202,85 @@ fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) 
 /// exists, just not for this method" (405/auto-OPTIONS); empty means a
 /// genuine 404.
 fn matchRecMethod(node: *const Node, rest: ?[]const u8, params: *Params, method: http.Method, allow: *AllowSet) ?*const Node {
-    return matchIn(runtime_tree, node, rest, false, params, 0, segmentsRemaining(rest, false), method, allow);
+    return matchIn(node, rest, false, params, 0, Scan.init(rest, false), method, allow);
 }
 
-/// Total segment count `rest`/`extra` still represent — computed ONCE per
-/// top-level `matchRec` call (not per recursion level, which would turn an
-/// O(1)-per-level count into an O(depth) rescan and reintroduce an O(depth²)
-/// cost of its own). `matchIn` threads the result down, decrementing
-/// by exactly one per segment consumed (see its own doc comment, F4).
-fn segmentsRemaining(rest: ?[]const u8, extra: bool) u32 {
-    var n: u32 = if (extra) 1 else 0;
-    if (rest) |r| {
-        n += 1;
-        for (r) |c| {
-            if (c == '/') n += 1;
+/// What `matchStep` knows about the slashes of the remainder it is handed —
+/// computed ONCE per top-level match (`init`; not per recursion level, which
+/// would turn an O(1)-per-level count into an O(depth) rescan and
+/// reintroduce an O(depth²) cost of its own) and shifted by one segment per
+/// level (`after`). `remaining` is the total segment count `rest`/`extra`
+/// still represent (F4, see `Node.min_reach`); `bits` marks the '/' bytes
+/// among the first `known` bytes of the remainder, so a segment's end is one
+/// `@ctz` rather than a byte scan per level. Past the first 64 bytes of a
+/// path the end falls back to `findScalar`.
+const Scan = struct {
+    remaining: u32,
+    known: u32,
+    bits: u64,
+
+    fn init(rest: ?[]const u8, extra: bool) Scan {
+        var s: Scan = .{ .remaining = if (extra) 1 else 0, .known = 0, .bits = 0 };
+        const r = rest orelse return s;
+        s.remaining += 1;
+        const head = r[0..@min(r.len, 64)];
+        // Whole chunks, then one chunk overlapping the end (a byte seen twice
+        // sets the same bit), so no byte loop for anything 4 bytes or longer.
+        if (head.len >= 16) {
+            var i: usize = 0;
+            while (i + 16 <= head.len) : (i += 16) s.bits |= slashMask(16, head, i);
+            s.bits |= slashMask(16, head, head.len - 16);
+        } else if (head.len >= 8) {
+            s.bits = slashMask(8, head, 0) | slashMask(8, head, head.len - 8);
+        } else if (head.len >= 4) {
+            s.bits = slashMask(4, head, 0) | slashMask(4, head, head.len - 4);
+        } else {
+            for (head, 0..) |c, i| s.bits |= @as(u64, @intFromBool(c == '/')) << @intCast(i);
         }
+        s.known = @intCast(head.len);
+        s.remaining += @popCount(s.bits);
+        for (r[head.len..]) |c| {
+            if (c == '/') s.remaining += 1;
+        }
+        return s;
     }
-    return n;
-}
 
-/// The runtime trie as `matchIn` sees it: a `Ref` is a node pointer.
+    /// Bit i set for each '/' in `head[at..][0..w]`, shifted to bit `at + i`.
+    inline fn slashMask(comptime w: usize, head: []const u8, at: usize) u64 {
+        const V = @Vector(w, u8);
+        const v: V = head[at..][0..w].*;
+        const m: @Int(.unsigned, w) = @bitCast(v == @as(V, @splat('/')));
+        return @as(u64, m) << @intCast(at);
+    }
+
+    /// The index of the first '/' in `r`, the remainder this scan describes.
+    inline fn slash(s: Scan, r: []const u8) ?usize {
+        if (s.bits != 0) return @ctz(s.bits);
+        if (s.known >= r.len) return null;
+        const j = std.mem.findScalar(u8, r[s.known..], '/') orelse return null;
+        return s.known + j;
+    }
+
+    /// The scan of what follows a segment of `len` bytes and its '/' (or of
+    /// nothing, when it was the last segment).
+    inline fn after(s: Scan, len: usize) Scan {
+        const step = len + 1;
+        return .{
+            .remaining = s.remaining - 1,
+            .known = if (step >= s.known) 0 else s.known - @as(u32, @intCast(step)),
+            .bits = if (step >= 64) 0 else s.bits >> @intCast(step),
+        };
+    }
+};
+
+/// The runtime trie as `matchStep` sees it: a `Ref` is a node pointer.
 ///
-/// ⭐ `matchIn` is the ONE matching algorithm in this module. The runtime
+/// ⭐ `matchStep` is the ONE matching algorithm in this module. The runtime
 /// `Router` and the comptime `Static` table differ only in how a node is
-/// stored -- a heap `Node` with a hash map of static children here, a flat
-/// comptime array addressed by index there -- and each supplies these few
-/// accessors. Precedence, backtracking, the F4 `min_reach` pruning and the
+/// stored -- a heap `Node` with a hash map of static children here, a
+/// comptime-known node per generated function there (`StaticTree`, which
+/// unrolls the sibling loops) -- and each supplies these few accessors and
+/// `descend`. Precedence, backtracking, the F4 `min_reach` pruning and the
 /// F5 Allow union exist once, so the two cannot drift.
 const RuntimeTree = struct {
     pub const Ref = *const Node;
@@ -2223,19 +2312,34 @@ const RuntimeTree = struct {
     inline fn minReach(_: RuntimeTree, n: Ref) u32 {
         return n.min_reach;
     }
+    inline fn paramChild(_: RuntimeTree, n: Ref) Ref {
+        return n.param.?.node;
+    }
+    inline fn wildcardChild(_: RuntimeTree, n: Ref) Ref {
+        return n.wildcard.?.node;
+    }
+    inline fn descend(_: RuntimeTree, child: Ref, rest: ?[]const u8, extra: bool, params: *Params, depth: u32, scan: Scan, method: ?http.Method, allow: *AllowSet) ?Ref {
+        return matchIn(child, rest, extra, params, depth, scan, method, allow);
+    }
 };
 const runtime_tree: RuntimeTree = .{};
 
-/// The matcher. `tree` supplies the node accessors (see `RuntimeTree`);
+/// One runtime node's matcher.
+fn matchIn(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params, depth: u32, scan: Scan, method: ?http.Method, allow: *AllowSet) ?*const Node {
+    return matchStep(runtime_tree, node, rest, extra, params, depth, scan, method, allow);
+}
+
+/// The matcher, one level of it. `tree` supplies the node accessors (see
+/// `RuntimeTree`, `StaticTree`) and `descend`, the recursion into a child;
 /// `node` is where this level starts.
-fn matchIn(
+inline fn matchStep(
     tree: anytype,
     node: @TypeOf(tree).Ref,
     rest: ?[]const u8,
     extra: bool,
     params: *Params,
     depth: u32,
-    remaining: u32,
+    scan: Scan,
     // null = `MethodPrecedence.first_match`: a candidate matches as soon as
     // it has ANY endpoint (`matchRec`'s historical contract, still used by
     // `tryRedirect`'s own path-shape probe, which checks the method itself
@@ -2252,10 +2356,14 @@ fn matchIn(
     if (depth > max_path_segments) return null;
     const r = rest orelse {
         // The virtual "" segment `extra` appends has not been consumed yet
-        // here -- `segmentsRemaining` already counted it, so `remaining` is
-        // passed through UNCHANGED; it is decremented below, the same as any
+        // here -- `Scan.init` already counted it, so `scan` is passed
+        // through UNCHANGED; its count is decremented below, the same as any
         // other segment, once this call re-enters with `rest = ""`.
-        if (extra) return matchIn(tree, node, "", false, params, depth + 1, remaining, method, allow);
+        // `depth` stays: the virtual segment is not a real one, so it must not
+        // cost a level of the `max_path_segments` budget (a route of exactly
+        // that depth would lose its trailing-slash redirect). Recursion is
+        // still bounded: `extra` is false from here on.
+        if (extra) return tree.descend(node, "", false, params, depth, scan, method, allow);
         const bits = tree.allowBits(node);
         if (method) |m| {
             if (tree.serves(node, m)) return node;
@@ -2266,49 +2374,78 @@ fn matchIn(
     };
     var seg = r;
     var next: ?[]const u8 = null;
-    if (std.mem.findScalar(u8, r, '/')) |i| {
+    if (scan.slash(r)) |i| {
         seg = r[0..i];
         next = r[i + 1 ..];
     }
     // F4 (A1/router.md): `seg` is about to be consumed, so every subtree
-    // reached from here has exactly `remaining - 1` segments left to work
-    // with -- computed once, shared by the static AND param checks below.
-    const remaining_after_seg = remaining - 1;
-    if (tree.static(node, seg)) |child| {
-        if (tree.minReach(child) <= remaining_after_seg) {
-            if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
+    // reached from here has exactly `scan.remaining - 1` segments left to
+    // work with -- computed once, shared by the static AND param checks below.
+    const scan_after = scan.after(seg.len);
+    const remaining_after_seg = scan_after.remaining;
+    // The comptime tree unrolls the two sibling loops (each child is its own
+    // `matchAt`); the bodies are the same.
+    const unrolled = @hasDecl(@TypeOf(tree), "is_comptime");
+    if (unrolled) {
+        statics: inline for (tree.statics(node)) |e| {
+            if (eqlLit(seg, e.seg)) {
+                if (tree.minReach(tree.at(e.child)) <= remaining_after_seg) {
+                    if (tree.descend(tree.at(e.child), next, extra, params, depth + 1, scan_after, method, allow)) |n| return n;
+                }
+                break :statics;
+            }
+        }
+        inline for (tree.patterns(node)) |pe| {
+            if (tryPattern(tree, pe, seg, next, extra, params, depth, scan_after, method, allow)) |n| return n;
+        }
+    } else {
+        if (tree.static(node, seg)) |child| {
+            if (tree.minReach(child) <= remaining_after_seg) {
+                if (tree.descend(child, next, extra, params, depth + 1, scan_after, method, allow)) |n| return n;
+            }
+        }
+        for (tree.patterns(node)) |pe| {
+            if (tryPattern(tree, pe, seg, next, extra, params, depth, scan_after, method, allow)) |n| return n;
         }
     }
-    for (tree.patterns(node)) |pe| {
-        const child = tree.patChild(pe);
-        if (tree.minReach(child) > remaining_after_seg) continue;
-        const saved = params.len;
-        if (matchSegPattern(pe.text, pe.regexes, seg, params)) {
-            if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
-        }
-        params.len = saved;
-    }
+    // The child is re-read from the node, not from the capture: a capture is
+    // never comptime-known, the node of the comptime tree is.
     if (seg.len != 0) if (tree.param(node)) |p| {
-        if (tree.minReach(p.ref) <= remaining_after_seg) {
+        const child = tree.paramChild(node);
+        if (tree.minReach(child) <= remaining_after_seg) {
             const saved = params.len;
             params.push(p.name, seg);
-            if (matchIn(tree, p.ref, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
+            if (tree.descend(child, next, extra, params, depth + 1, scan_after, method, allow)) |n| return n;
             params.len = saved;
         }
     };
     if (tree.wildcard(node)) |wc| {
-        const bits = tree.allowBits(wc.ref);
+        const child = tree.wildcardChild(node);
+        const bits = tree.allowBits(child);
         if (method) |m| {
-            if (tree.serves(wc.ref, m)) {
+            if (tree.serves(child, m)) {
                 params.push(wc.name, r);
-                return wc.ref;
+                return child;
             }
             if (bits.count() != 0) allow.setUnion(bits);
         } else if (bits.count() != 0) {
             params.push(wc.name, r);
-            return wc.ref;
+            return child;
         }
     }
+    return null;
+}
+
+/// `matchStep`'s in-segment pattern sibling: its captures stay only when
+/// the remainder matches too.
+inline fn tryPattern(tree: anytype, pe: anytype, seg: []const u8, next: ?[]const u8, extra: bool, params: *Params, depth: u32, scan_after: Scan, method: ?http.Method, allow: *AllowSet) ?@TypeOf(tree).Ref {
+    const child = tree.patChild(pe);
+    if (tree.minReach(child) > scan_after.remaining) return null;
+    const saved = params.len;
+    if (matchSegPattern(pe.text, pe.regexes, seg, params)) {
+        if (tree.descend(child, next, extra, params, depth + 1, scan_after, method, allow)) |n| return n;
+    }
+    params.len = saved;
     return null;
 }
 
@@ -3882,7 +4019,7 @@ test "M2.2 differential: Static answers exactly as the runtime Router, generated
 /// target before the router sees it.
 fn dispatchRawGet(r: *Router, comptime target: []const u8, out_buf: []u8) ![]const u8 {
     var in: Reader = .fixed("GET " ++ target ++ " HTTP/1.1\r\nHost: t\r\n\r\n");
-    var head_buf: [512]u8 = undefined;
+    var head_buf: [1024]u8 = undefined;
     const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
     var body_scratch: [64]u8 = undefined;
     var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
@@ -4551,6 +4688,384 @@ test "review L2/L3: deeper than max_path_segments is refused; Host junk after ] 
     try testing.expectEqual(@as(?*Router, null), hr.routerFor("[::1]evil"));
     try testing.expectEqual(@as(?*Router, null), hr.routerFor("a.example.com:xyz"));
     try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("a.example.com:443"));
+}
+
+test "Scan: segment count and every segment end agree with a byte scan, all lengths 0..140" {
+    // The chunk paths (4, 8, 16 bytes overlapping the end), the 64-byte
+    // window and the `findScalar` fallback past it.
+    var prng: std.Random.DefaultPrng = .init(0x5ca9);
+    const rnd = prng.random();
+    var buf: [140]u8 = undefined;
+    for (0..buf.len + 1) |len| {
+        for (0..40) |_| {
+            const r = buf[0..len];
+            const density = rnd.intRangeAtMost(u8, 1, 8);
+            for (r) |*c| c.* = if (rnd.uintLessThan(u8, density) == 0) '/' else 'a';
+            for ([_]bool{ false, true }) |extra| {
+                var scan = Scan.init(r, extra);
+                try testing.expectEqual(@as(u32, @intCast(1 + std.mem.count(u8, r, "/"))) + @intFromBool(extra), scan.remaining);
+                var rest: []const u8 = r;
+                while (true) {
+                    const want = std.mem.findScalar(u8, rest, '/');
+                    try testing.expectEqual(want, scan.slash(rest));
+                    const cut = want orelse break;
+                    scan = scan.after(cut);
+                    rest = rest[cut + 1 ..];
+                    try testing.expectEqual(@as(u32, @intCast(1 + std.mem.count(u8, rest, "/"))) + @intFromBool(extra), scan.remaining);
+                }
+            }
+        }
+    }
+    try testing.expectEqual(@as(u32, 0), Scan.init(null, false).remaining);
+    try testing.expectEqual(@as(u32, 1), Scan.init(null, true).remaining);
+}
+
+test "extra: the virtual trailing-slash segment costs no depth - a route at max_path_segments keeps its redirect (Router and Static)" {
+    // "/a" x 255 + "/" is 256 segments: the deepest legal route. GET of its
+    // slashless form probes it with the virtual "" segment, which used to be
+    // charged one level of the depth budget -- 257 > max_path_segments, no redirect.
+    const pat: []const u8 = strRepeat("/a", max_path_segments - 1) ++ "/";
+    const bare = strRepeat("/a", max_path_segments - 1);
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get(pat, hRoot);
+    var buf: [2048]u8 = undefined;
+    const out = try dispatchRawGet(&r, bare, &buf);
+    try testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 301 "));
+    try testing.expect(std.mem.find(u8, out, "Location: " ++ bare ++ "/\r\n") != null);
+
+    const S = Static(&.{.{ .method = .get, .pattern = pat }}, .{});
+    try testing.expectEqual(S.SlashVariant.add_slash, S.trailingSlashVariant(.get, bare).?);
+    var p: Params = .{};
+    try testing.expectEqual(Match{ .found = 0 }, S.match(.get, pat, &p));
+}
+
+// ── audit 2026-10-25: tests asked for by mutation survivors ─────────────────
+
+test "Scan: a 63-byte segment (step 64), slashes at bytes 61..65 (the window edge)" {
+    var buf: [80]u8 = undefined;
+    for (61..66) |first| {
+        @memset(&buf, 'a');
+        buf[first] = '/';
+        buf[first + 8] = '/';
+        const r: []const u8 = &buf;
+        var scan = Scan.init(r, false);
+        try testing.expectEqual(@as(u32, 3), scan.remaining);
+        try testing.expectEqual(@as(?usize, first), scan.slash(r));
+        scan = scan.after(first);
+        const rest = r[first + 1 ..];
+        try testing.expectEqual(@as(u32, 2), scan.remaining);
+        try testing.expectEqual(@as(?usize, 7), scan.slash(rest));
+        scan = scan.after(7);
+        try testing.expectEqual(@as(u32, 1), scan.remaining);
+        try testing.expectEqual(@as(?usize, null), scan.slash(rest[8..]));
+    }
+}
+
+test "trailing-slash probe reaches a route through :param and in-segment pattern children" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/u/:id/", hRoot);
+    try r.post("/u/:id/", hRoot);
+    try r.get("/f/{n}.{e}/", hRoot);
+    var buf: [1024]u8 = undefined;
+
+    const got = runWire(&r, wire("GET", "/u/5"), &buf);
+    try expectStatus(got, "301");
+    try expectHeaderLine(got, "Location: /u/5/");
+    try expectStatus(runWire(&r, wire("HEAD", "/u/5"), &buf), "301");
+    try expectStatus(runWire(&r, wire("POST", "/u/5"), &buf), "308");
+    const got2 = runWire(&r, wire("GET", "/f/a.b"), &buf);
+    try expectStatus(got2, "301");
+    try expectHeaderLine(got2, "Location: /f/a.b/");
+
+    const S = Static(&.{
+        .{ .method = .get, .pattern = "/u/:id/" },
+        .{ .method = .get, .pattern = "/f/{n}.{e}/" },
+    }, .{});
+    try testing.expectEqual(S.SlashVariant.add_slash, S.trailingSlashVariant(.get, "/u/5").?);
+    try testing.expectEqual(S.SlashVariant.add_slash, S.trailingSlashVariant(.get, "/f/a.b").?);
+}
+
+test "Static: params reset per call, a path not starting with '/' matches nothing, trailingSlashVariant edge inputs" {
+    const S = Static(&static_demo, .{});
+    var p: Params = .{};
+    p.push("zz", "stale");
+    try testing.expectEqual(Match{ .found = 0 }, S.match(.get, "/users/new", &p));
+    try testing.expectEqual(@as(usize, 0), p.len);
+    try testing.expectEqual(Match.not_found, S.match(.get, "Xusers/42", &p));
+    try testing.expectEqual(Match.not_found, S.match(.get, "users/42", &p));
+    try testing.expectEqual(@as(?S.SlashVariant, null), S.trailingSlashVariant(.get, "Xdir"));
+    try testing.expectEqual(@as(?S.SlashVariant, null), S.trailingSlashVariant(.get, "/"));
+    // "/users" exists (POST), "/users/" with PUT would redirect nowhere useful.
+    try testing.expectEqual(@as(?S.SlashVariant, null), S.trailingSlashVariant(.put, "/users/"));
+    // The first_match posture too.
+    const F = Static(&static_demo, .{ .method_precedence = .first_match });
+    var q: Params = .{};
+    const m = F.match(.put, "/users", &q);
+    try testing.expect(m == .method_not_allowed);
+    try testing.expect(m.method_not_allowed.has(.post));
+    try testing.expect(!m.method_not_allowed.has(.get));
+}
+
+test "first_match: a wildcard captures the whole remainder (Router and Static)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.method_precedence = .first_match;
+    try r.get("/static/*path", hWildPath);
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("w=css/a.css", bodyOf(runWire(&r, wire("GET", "/static/css/a.css"), &buf)));
+    const S = Static(&static_demo, .{ .method_precedence = .first_match });
+    var p: Params = .{};
+    try testing.expectEqual(Match{ .found = 4 }, S.match(.get, "/static/css/a.css", &p));
+    try testing.expectEqualStrings("css/a.css", p.get("path").?);
+}
+
+test "fallback scoping: a group without routes scopes nothing; deeper nesting beats a later flat group; a root mount does not beat a prefixed group; a capture needs a non-empty segment" {
+    var trace: Trace = .{};
+    var buf: [1024]u8 = undefined;
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &trace;
+        const empty = try r.group("/empty");
+        try empty.use(.{ .run = mwG });
+        try r.get("/x", hTrace);
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/empty/foo"), &buf), "404");
+        try testing.expectEqualStrings("", trace.get());
+    }
+    {
+        // Both groups have prefix /a/b (two segments); the nested one is
+        // shallower in the list but deeper in the tree, the flat one comes later.
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &trace;
+        const ga = try r.group("/a");
+        const gab = try ga.group("/b");
+        try gab.use(.{ .run = mwV });
+        try gab.get("/ok", hTrace);
+        const gc = try r.group("/a/b");
+        try gc.use(.{ .run = mwG });
+        try gc.get("/ok2", hTrace);
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/a/b/missing"), &buf), "404");
+        try testing.expectEqualStrings("Vv", trace.get());
+    }
+    {
+        var sub = Router.init(testing.allocator);
+        defer sub.deinit();
+        try sub.use(.{ .run = mwV });
+        try sub.get("/z", hTrace);
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &trace;
+        const api = try r.group("/api");
+        try api.use(.{ .run = mwG });
+        try api.get("/y", hTrace);
+        try r.mount("/", &sub);
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/api/missing"), &buf), "404");
+        try testing.expectEqualStrings("Gg", trace.get());
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/elsewhere"), &buf), "404");
+        try testing.expectEqualStrings("Vv", trace.get());
+    }
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &trace;
+        const t = try r.group("/t/:id");
+        try t.use(.{ .run = mwG });
+        try t.get("/x", hTrace);
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/t/"), &buf), "404");
+        try testing.expectEqualStrings("", trace.get());
+        trace = .{};
+        try expectStatus(runWire(&r, wire("GET", "/t/5/zz"), &buf), "404");
+        try testing.expectEqualStrings("Gg", trace.get());
+    }
+}
+
+test "an inline group's not_found is ignored for a group nested in it; a mounted sub-router's group overrides travel" {
+    var buf: [1024]u8 = undefined;
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        const inl = try r.with(&.{});
+        inl.not_found = hNfCustom;
+        const g = try inl.group("/p");
+        try g.get("/x", hRoot);
+        try testing.expectEqualStrings("Not Found\n", bodyOf(runWire(&r, wire("GET", "/p/zzz"), &buf)));
+    }
+    {
+        var sub = Router.init(testing.allocator);
+        defer sub.deinit();
+        const sg = try sub.group("/g");
+        sg.not_found = hNfCustom;
+        sg.method_not_allowed = hMnaCustom;
+        try sg.get("/x", hRoot);
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        try r.mount("/m", &sub);
+        try testing.expectEqualStrings("custom-nf", bodyOf(runWire(&r, wire("GET", "/m/g/nope"), &buf)));
+        try testing.expectEqualStrings("custom-mna", bodyOf(runWire(&r, wire("POST", "/m/g/x"), &buf)));
+    }
+}
+
+test "insert re-checks the full prefixed pattern: wildcard prefix, empty interior segment, repeated capture, capture cap" {
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        const g = try r.group("/f/*p");
+        try testing.expectError(error.InvalidPattern, g.get("/x", hRoot));
+    }
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        const g = try r.group("/a//b");
+        try testing.expectError(error.InvalidPattern, g.get("/x", hRoot));
+    }
+    {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        const g = try r.group("/:a");
+        try testing.expectError(error.DuplicateParamName, g.get("/:a", hRoot));
+    }
+    {
+        // Exactly max_params captures: accepted, whole or split over a prefix.
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        try r.get("/:a/:b/:c/:d/:e/:f/:g/:h", hRoot);
+        var r2 = Router.init(testing.allocator);
+        defer r2.deinit();
+        const g8 = try r2.group("/:r1/:r2/:r3/:r4");
+        try g8.get("/:s1/:s2/:s3/:s4", hRoot);
+        var r3 = Router.init(testing.allocator);
+        defer r3.deinit();
+        const g9 = try r3.group("/:p1/:p2/:p3/:p4/:p5");
+        try testing.expectError(error.TooManyParams, g9.get("/:q1/:q2/:q3/:q4", hRoot));
+    }
+}
+
+test "samePatternShape: a pattern and the same pattern plus one more capture are different shapes; ':' inside a constraint" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x/{a}-", hRoot);
+    try r.get("/x/{a}-{b}", hRoot);
+    var buf: [1024]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/x/p-q"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/x/p-"), &buf), "200");
+    // A constrained and an unconstrained capture are different shapes too.
+    try r.get("/c/{a:[0-9]+}.x", hRoot);
+    try r.get("/c/{a}.x", hRoot);
+    // The name ends at the FIRST ':'; a ':' inside the regexp stays in it.
+    try r.get("/k/{k:[a-b:]+}", hRoot);
+    try expectStatus(runWire(&r, wire("GET", "/k/a:b"), &buf), "200");
+    try expectStatus(runWire(&r, wire("GET", "/k/c"), &buf), "404");
+    try testing.expectError(error.InvalidPattern, validatePattern("/{a{b}}"));
+}
+
+test "HostRouter: '[]' is no host, a trailing dot is dropped when mapping, tab-padded Host, exact and wildcard may share a spelling; normalizeHost/isPort edges" {
+    var hr = HostRouter.init(testing.allocator);
+    defer hr.deinit();
+    var ra = Router.init(testing.allocator);
+    defer ra.deinit();
+    var rb = Router.init(testing.allocator);
+    defer rb.deinit();
+    try testing.expectError(error.InvalidHost, hr.map("[]", &ra));
+    try hr.map("example.com.", &ra);
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("example.com"));
+    try testing.expectEqual(@as(?*Router, &ra), hr.routerFor("\texample.com\t"));
+    try hr.map(".example.com", &ra);
+    try hr.map("*.example.com", &rb);
+    try testing.expectEqualStrings("a:b", normalizeHost("a:b:80"));
+    try testing.expectEqualStrings(".", normalizeHost("."));
+    try testing.expectEqualStrings("a:", normalizeHost("a:"));
+    try testing.expectEqualStrings("[::1]80", normalizeHost("[::1]80"));
+    try testing.expect(!isPort(":"));
+    try testing.expect(isPort(":8"));
+}
+
+const long_routes = [_]StaticRoute{
+    .{ .method = .get, .pattern = "/" ++ strRepeat("a", 62) ++ "/:p" },
+    .{ .method = .post, .pattern = "/" ++ strRepeat("a", 62) ++ "/:p" },
+    .{ .method = .get, .pattern = "/" ++ strRepeat("b", 63) ++ "/:p/z/" },
+    .{ .method = .get, .pattern = "/" ++ strRepeat("c", 64) ++ "/*w" },
+    .{ .method = .put, .pattern = "/:p/" ++ strRepeat("d", 70) },
+    .{ .method = .get, .pattern = "/q/{n}.{e}/" ++ strRepeat("e", 61) },
+};
+
+test "Static and Router agree on long paths (segments around the 64-byte window) and on the trailing-slash probe" {
+    const pool = [_][]const u8{
+        strRepeat("a", 62), strRepeat("b", 63), strRepeat("c", 64), strRepeat("d", 70), strRepeat("e", 61),
+        "v",                strRepeat("v", 70), "n.e",              "z",                "",
+        "q",                "w",
+    };
+    const methods = [_]http.Method{ .get, .post, .head, .put, .delete };
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    for (long_routes) |rt| try r.add(rt.method, rt.pattern, hRoot);
+    var hits: usize = 0;
+    inline for (.{ MethodPrecedence.backtrack, MethodPrecedence.first_match }) |prec| {
+        const S = Static(&long_routes, .{ .method_precedence = prec });
+        var prng: std.Random.DefaultPrng = .init(0x10a6);
+        const rng = prng.random();
+        var buf: [1024]u8 = undefined;
+        for (0..6000) |_| {
+            var w: std.Io.Writer = .fixed(&buf);
+            for (0..1 + rng.uintLessThan(usize, 4)) |_| {
+                w.writeByte('/') catch unreachable;
+                w.writeAll(pool[rng.uintLessThan(usize, pool.len)]) catch unreachable;
+            }
+            const path = w.buffered();
+            for (methods) |m| {
+                var ps: Params = .{};
+                const got = S.match(m, path, &ps);
+                var pr: Params = .{};
+                var allow_bits: AllowSet = .empty;
+                var want: ?[]const u8 = null;
+                switch (prec) {
+                    .backtrack => if (matchRecMethod(&r.root, path[1..], &pr, m, &allow_bits)) |n| {
+                        want = endpointFor(n, m).?.pattern;
+                    },
+                    .first_match => if (matchRec(&r.root, path[1..], false, &pr)) |n| {
+                        if (endpointFor(n, m)) |ep| want = ep.pattern else allow_bits = n.allow_bits;
+                    },
+                }
+                errdefer std.debug.print("long: {s} {s} ({s})\n", .{ @tagName(m), path, @tagName(prec) });
+                if (want) |wp| {
+                    try testing.expect(got == .found);
+                    try testing.expectEqualStrings(wp, long_routes[got.found].pattern);
+                    try testing.expectEqual(pr.len, ps.len);
+                    for (pr.entries[0..pr.len], ps.entries[0..ps.len]) |a, b| {
+                        try testing.expectEqualStrings(a.name, b.name);
+                        try testing.expectEqualStrings(a.value, b.value);
+                    }
+                    hits += 1;
+                } else if (allow_bits.count() != 0) {
+                    try testing.expect(got == .method_not_allowed);
+                    try testing.expectEqual(allow_bits, got.method_not_allowed.bits);
+                } else {
+                    try testing.expectEqual(Match.not_found, got);
+                }
+
+                // The trailing-slash probe, as `Router.tryRedirect` runs it.
+                var probe: Params = .{};
+                const want_variant: ?S.SlashVariant = blk: {
+                    if (path.len > 1 and path[path.len - 1] == '/') {
+                        const n = matchRec(&r.root, path[1 .. path.len - 1], false, &probe) orelse break :blk null;
+                        break :blk if (endpointFor(n, m) != null) .drop_slash else null;
+                    }
+                    const n = matchRec(&r.root, path[1..], true, &probe) orelse break :blk null;
+                    break :blk if (endpointFor(n, m) != null) .add_slash else null;
+                };
+                try testing.expectEqual(want_variant, S.trailingSlashVariant(m, path));
+            }
+        }
+    }
+    // A table nothing matches would pass vacuously.
+    try testing.expect(hits > 50);
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
