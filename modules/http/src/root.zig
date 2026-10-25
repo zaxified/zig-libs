@@ -614,6 +614,7 @@ test {
     _ = conneg_oracle;
     _ = problem_oracle;
     _ = sse_oracle;
+    _ = @import("audit_test.zig");
 }
 
 /// LIVE third-party interop (response trailers vs real curl/nghttp2) — tests

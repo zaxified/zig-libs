@@ -79,7 +79,10 @@ pub const TimeClaims = struct {
 pub fn checkTimes(t: TimeClaims, opts: root.Options) root.ValidateError!void {
     const leeway: i64 = opts.leeway_s;
     if (t.exp) |exp| {
-        if (exp +| leeway < opts.now_s) return error.Expired;
+        // RFC 7519 §4.1.4: the current time MUST be before `exp`, so the
+        // token is dead AT `exp` (+ leeway), not one second later
+        // (`interop-jwt` case exp-equals-now; golang-jwt agrees).
+        if (exp +| leeway <= opts.now_s) return error.Expired;
     } else if (opts.require_exp) {
         return error.MissingExp;
     }
@@ -311,7 +314,7 @@ pub fn VerifiedCache(comptime Value: type) type {
                 if (e.set_id != 0 and std.mem.eql(u8, &e.digest, &digest)) return i;
             }
             for (&b.entries, 0..) |*e, i| if (e.set_id == 0) return i;
-            for (&b.entries, 0..) |*e, i| if (e.dead_after < now_s) return i;
+            for (&b.entries, 0..) |*e, i| if (e.dead_after <= now_s) return i;
             var i: usize = b.hand;
             while (true) : (i = (i + 1) % ways) {
                 const e = &b.entries[i];
@@ -483,14 +486,15 @@ test "VerifiedCache: exp crossing while cached -- the hit refuses exactly as a f
     var d: Deriver = .{};
     _ = try cache.verifyJwks(testing.allocator, token, &set, policy(900), &d);
 
-    // Leeway 60: 1060 is the last second a fresh verify accepts.
-    try testing.expect((try cache.lookup(token, &set, policy(1060))) != null);
-    try testing.expectError(error.Expired, root.parseVerifyJwks(testing.allocator, token, set, policy(1061)));
-    try testing.expectError(error.Expired, cache.lookup(token, &set, policy(1061)));
+    // Leeway 60: 1059 is the last second a fresh verify accepts (RFC 7519
+    // §4.1.4: now must be before exp + leeway).
+    try testing.expect((try cache.lookup(token, &set, policy(1059))) != null);
+    try testing.expectError(error.Expired, root.parseVerifyJwks(testing.allocator, token, set, policy(1060)));
+    try testing.expectError(error.Expired, cache.lookup(token, &set, policy(1060)));
     // Evicted: even a clock stepped back finds nothing now.
     try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, policy(900)));
     // Through the one-call path the refusal is the same, and nothing is stored.
-    try testing.expectError(error.Expired, cache.verifyJwks(testing.allocator, token, &set, policy(1061), &d));
+    try testing.expectError(error.Expired, cache.verifyJwks(testing.allocator, token, &set, policy(1060), &d));
     try testing.expectEqual(@as(?TestValue, null), try cache.lookup(token, &set, policy(900)));
 }
 

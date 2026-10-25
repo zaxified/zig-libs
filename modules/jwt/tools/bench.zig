@@ -32,6 +32,13 @@
 //! side has no cycle counter, so ratios are by wall time. Before timing
 //! anything golang-jwt must accept our token for every algorithm and we must
 //! accept its. Arguments filter workloads by substring.
+//!
+//! The fastest in the field (since 2026-10-25): `tools/rust_fast_bench`,
+//! Keats/jsonwebtoken 9.3.1 over ring 0.17.14 (pinned by its Cargo.lock,
+//! built `--offline`, so the crates must already be in cargo's cache), timed
+//! as the `alt` side of every workload but ES512 (jsonwebtoken 9 has none).
+//! It verifies a token it signed itself with the same checks; its EC and
+//! Ed25519 keys are its own (see its header). `BENCH_FAST=0` skips it.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -46,6 +53,8 @@ const claims_json =
     \\{"aud":"api.example.com","exp":4102444800,"iat":1700000000,"iss":"https://issuer.example.com","nbf":1700000000,"scope":"read write","sub":"user-1234567890"}
 ;
 const algs = [_][]const u8{ "hs256", "es256", "es384", "es512", "eddsa", "rs256", "ps256" };
+const fast_rs_manifest = "modules/jwt/tools/rust_fast_bench/Cargo.toml";
+const fast_rs_exe = "modules/jwt/tools/rust_fast_bench/target/release/jwt_fast_bench";
 
 /// RFC 7520 §3.4 (Figure 4), base64url.
 const rsa_n = "n4EPtAOCc9AlkeQHPzHStgAbgs7bTZLwUBZdR8_KuKPEHLd4rHVTeT-O-XV2jRojdNhxJWTDvNd7nqQ0VEiZQHz_" ++ "AJmSCpMaJMRBSFKrKb2wqVwGU_NsYOYL-QtiWN2lbzcEe6XC0dApr5ydQLrHqkHHig3RBordaZ6Aj-oBHqFEHYpP" ++ "e7Tpe-OfVfHd1E6cS6M1FZcD1NNLYD5lFHpPI9bTwJlsde3uhGqC0ZCuEHg8lhzwOHrtIQbS0FVbb9k3-tVTU4fg" ++ "_3L_vniUFAKwuCLqKnS2BYwdq_mzSnbLY7h_qixoR7jig3__kRhuaxwUkRz5iaiQkqgc5gHdrNP5zw";
@@ -171,6 +180,9 @@ pub fn main(init: std.process.Init) !u8 {
         parsed.deinit();
     }
 
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_fast) try rustBuild(arena, io);
+
     var ws: std.ArrayList(Work) = .empty;
     for (algs, 0..) |a, i| for ([_]bool{ false, true }) |verify| {
         const op = if (verify) "verify" else "sign";
@@ -178,16 +190,38 @@ pub fn main(init: std.process.Init) !u8 {
             .name = try arena.print("{s}_{s}", .{ a, op }),
             .op = .{ .alg = i, .verify = verify },
             .ref = try arena.print("go.{s}_{s}", .{ a, op }),
+            .alt = if (use_fast and !std.mem.eql(u8, a, "es512")) try arena.print("rs.{s}_{s}", .{ a, op }) else null,
+            .alt_exe = 1,
         });
     };
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, fast_rs_exe }, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
     try w.print("reference: {s}\nworst ours/golang-jwt = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× golang-jwt v5.3.1 (Go <version>) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+    if (s.worst_fast) |f| try w.print("fastest: {s}\nworst ours/min(golang-jwt, jsonwebtoken) = {d:.3}\n", .{ std.mem.trimEnd(u8, s.alt_banner, "\n"), f });
+    if (filters.len == 0) {
+        if (s.worst_fast) |f|
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× golang-jwt v5.3.1 (Go <version>) · fastest {d:.2}× jsonwebtoken 9.3.1 (measured <today>)\n", .{ s.best_ref, s.worst_ref, f })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× golang-jwt v5.3.1 (Go <version>) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+    }
     try w.flush();
     return 0;
+}
+
+/// `cargo build --release --offline` of tools/rust_fast_bench.
+fn rustBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips this side\n", .{ bench_name, e });
+        return error.CargoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CargoBuildFailed;
+    }
 }

@@ -926,13 +926,20 @@ pub const ChunkedReader = struct {
                     c.state = if (size == 0) .trailers else .{ .body = size };
                 },
                 .body => |remaining| {
+                    // A zero limit moves nothing; `in.stream` would answer it
+                    // with EndOfStream (a fixed source: a false truncation)
+                    // or 0 (a socket: the loop below spun forever).
+                    if (limit == .nothing) return 0;
                     const n = streamBuffered(c.in, w, limit.min(.limited64(remaining))) catch |err| switch (err) {
                         error.EndOfStream => return c.fail(.truncated_body),
                         error.ReadFailed, error.WriteFailed => |e| return e,
                     };
                     const left = remaining - n;
                     c.state = if (left == 0) .body_crlf else .{ .body = left };
-                    if (n != 0) return n;
+                    // Returned even when 0 (nothing moved): looping here
+                    // instead spun on a source that answers a read with 0
+                    // (audit 2026-10-25 L1).
+                    return n;
                 },
                 .body_crlf => {
                     // Nothing is wanted of this line but that it be empty, so

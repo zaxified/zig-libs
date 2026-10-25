@@ -1,0 +1,21 @@
+[package]
+name = "jwt_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-jwt`
+# (modules/jwt/tools/bench.zig): Keats/jsonwebtoken over ring, pinned exactly,
+# default features off (no PEM: keys go in as DER). ring directly too, for
+# key generation; it is the crate jsonwebtoken 9 signs with anyway.
+[dependencies]
+jsonwebtoken = { version = "=9.3.1", default-features = false }
+ring = "=0.17.14"
+serde_json = "=1.0.150"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

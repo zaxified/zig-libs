@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Fix:** `h1.ChunkedReader` answers a zero-limit read (`stream(w, .nothing)`) with 0. It called the connection reader with that limit, which a fixed source answered with EndOfStream (reported as a truncated body) and a source returning 0 left spinning forever inside the chunk body (audit 2026-10-25 L1; std's own callers never pass a zero limit, so no wire input reached it). Test: "audit h1: a zero-limit read of a chunked body returns 0 instead of spinning (L1)".
+
+- **2026-10-25** — **NO CONSUMER-VISIBLE CHANGE (tools):** `bench-http` gains hyper 1.11.0's HTTP/1.1 server connection as the fastest-in-the-field side (`tools/rust_fast_bench`, the same wire and handlers over an in-memory stream; `BENCH_FAST=0` skips).
+
 - **2026-10-25** — **Added:** `h1.RequestHead.http2` (default false), set by the h2 server, so a handler or middleware can tell an HTTP/2 request from an HTTP/1.1 one (`accesslog` logs `HTTP/2.0` from it). Additive; no behaviour change.
 
 - **2026-10-25** — **Added:** `ResponseWriter.HeaderValue` (a header value checked once for CR/LF/NUL) and `ResponseWriter.setHeaderBorrowed(comptime name, value)` — `setHeaderStatic` for a run-time value the caller keeps alive until the response ends: no per-response check, no copy into `header_buf` (first user: `aaa-gate`'s 401 challenge and media type). **Faster, same bytes:** `writeHead` writes each header line with four `writeAll`s instead of `print`, and `validHeaderValue` checks 16 bytes at a time. Tests: borrowed replace/no-copy/HeadersSent, every bad byte at every position of lengths 0..40.

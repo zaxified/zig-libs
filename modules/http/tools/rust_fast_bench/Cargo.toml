@@ -1,0 +1,21 @@
+[package]
+name = "http_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-http`
+# (modules/http/tools/bench.zig): hyper's HTTP/1.1 server connection
+# (hyperium/hyper, the server under axum and most of Rust's web stack),
+# pinned exactly, driven over an in-memory stream with no runtime.
+[dependencies]
+hyper = { version = "=1.11.0", default-features = false, features = ["server", "http1"] }
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

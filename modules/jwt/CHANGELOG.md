@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Fix (consumer-visible, one second):** a token was accepted at exactly `exp + leeway`; RFC 7519 §4.1.4 requires the current time to be *before* `exp`, and golang-jwt refuses it there. `validateClaims`, `VerifiedCache` hits and every entry point built on them now return `Expired` at `now == exp + leeway` (found by the new `interop-jwt`, case exp-equals-now). Four tests moved one second. Also `encodeJson` reports an allocation failure inside its claims check as `OutOfMemory` (it said `InvalidClaims`; audit F6).
+
+- **2026-10-25** — **Faster EdDSA verification, same verdicts:** `verify`'s EdDSA arm runs `ed25519.zig` — std's checks and cofactored equation, over a width-5/width-7 wNAF double-scalar multiplication on ref10's point representations — instead of `std.crypto.sign.Ed25519.Signature.verify` (bench-jwt: 79.7 → 67.1 µs per token, 1.44× → 1.21× jsonwebtoken/ring). Held to std on valid, corrupted, torsion-shifted and small-order inputs (tests in `ed25519.zig`). Also `encodeJson` builds the header on the stack and `parse` sizes its arena once (HS256 sign 2.69 → 2.35 µs).
+
+- **2026-10-25** — **Added (tools):** `zig build interop-jwt` — golang-jwt v5.3.1 judges 81 tokens (every algorithm both ways, alg none/confusion, crit, exp/nbf edges, claim types, base64url padding and unused bits, ECDSA/EdDSA/RSA signature encodings) and each verdict is compared with `parseAndVerify`'s; `--write` freezes the table into `src/go_oracle_vectors.zig`, replayed by `test-jwt`. `bench-jwt` gains Keats/jsonwebtoken 9.3.1 as the fastest-in-the-field side (`tools/rust_fast_bench`, `BENCH_FAST=0` skips).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-20** — **Fix:** RS256/384/512 and PS256/384/512 verification read the RSA modulus through a dangling pointer (`rsaKey` took the `Key` by value and returned a pointer into that parameter), so optimized builds refused valid tokens — our own and golang-jwt's — depending on code layout (found by `bench-jwt`'s interop check on Zig 0.17, ReleaseFast and ReleaseSafe; Debug passed). `rsaKey` now takes `*const Key`. Since 2026-10-13 (`0517cb9b`).

@@ -247,7 +247,8 @@ pub const ParseError = error{
 
 /// Errors from `validateClaims` (RFC 7519 §4.1 semantics).
 pub const ValidateError = error{
-    /// `exp` (+ leeway) is in the past.
+    /// `exp` (+ leeway) is now or in the past (RFC 7519 §4.1.4: the current
+    /// time must be before it).
     Expired,
     /// `nbf` (− leeway) is in the future.
     NotYetValid,
@@ -515,6 +516,12 @@ pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
     arena_state.* = .init(gpa);
     errdefer arena_state.deinit();
     const arena = arena_state.allocator();
+    // One chunk for the whole parse (decoded segments, the signing input,
+    // the JSON trees) instead of the arena's growing run of small ones; a
+    // failure here only means the arena grows as it would have.
+    if (arena.alloc(u8, 2 * token.len + 1024)) |_| {
+        _ = arena_state.reset(.retain_capacity);
+    } else |_| {}
 
     const header_json = try decodeSegment(arena, header_b64);
     const payload_json = try decodeSegment(arena, payload_b64);
@@ -655,8 +662,9 @@ pub const rsa = @import("rsa");
 /// per-request hot path) runs on the asm-accelerated `p256` module: the key
 /// type is a byte-exact drop-in for `std.crypto.sign.ecdsa.EcdsaP256Sha256`,
 /// and verification routes through p256's combined 2-base vartime verify
-/// (`verifyEs256Fast` below), ~2.7× faster than std. Ed25519 stays on std
-/// (EdDSA signing goes through ct25519's comb in `encode.zig`).
+/// (`verifyEs256Fast` below), ~2.7× faster than std. Ed25519 verification
+/// keeps std's types and accept set over this module's own ladder
+/// (`ed25519.zig`); EdDSA signing goes through ct25519's comb in `encode.zig`.
 pub const EcdsaP256Sha256 = p256_mod.EcdsaP256Sha256;
 /// ES384 (ECDSA P-384 + SHA-384): the `p384` module's type has std's
 /// `EcdsaP384Sha384` surface. Moved off std 2026-10-13: std's P-384 signed
@@ -669,6 +677,9 @@ pub const EcdsaP384Sha384 = p384_mod.EcdsaP384Sha384;
 /// type has std's `Ecdsa` surface (raw 132-byte `R‖S` via `toBytes`/`fromBytes`).
 pub const EcdsaP521Sha512 = p521_mod.EcdsaP521Sha512;
 pub const Ed25519 = std.crypto.sign.Ed25519;
+/// EdDSA verification with std's accept set over a wNAF double-scalar
+/// multiplication (2026-10-25: std's verify was 1.44× ring's).
+const ed25519_mod = @import("ed25519.zig");
 /// ML-DSA (FIPS 204) parameter sets, as RFC 9964 names them for JOSE. Pure
 /// std: measured on the audit host (2026-08-22, ReleaseFast) std's ML-DSA-65
 /// verify costs 57 us against OpenSSL 3.5.5's 255 us on the same machine, so
@@ -870,8 +881,8 @@ pub fn verify(parsed: *const ParsedToken, key: Key) VerifyError!void {
             .ed25519 => |pk| {
                 if (parsed.signature.len != Ed25519.Signature.encoded_length)
                     return error.BadSignature;
-                const sig: Ed25519.Signature = .fromBytes(parsed.signature[0..Ed25519.Signature.encoded_length].*);
-                sig.verify(parsed.signing_input, pk) catch return error.BadSignature;
+                // std's accept set, faster ladder (ed25519.zig).
+                try ed25519_mod.verify(parsed.signature[0..Ed25519.Signature.encoded_length].*, parsed.signing_input, pk);
             },
             else => return error.AlgKeyMismatch,
         },
@@ -3869,8 +3880,11 @@ test "validateClaims: expired, and leeway lets a just-expired token pass" {
     }));
     // Just expired but inside the leeway window.
     try validateClaims(parsed.claims, .{ .now_s = 1030, .leeway_s = 60, .issuer = .any, .audience = .any });
-    // Exactly at the edge (exp + leeway == now) is still acceptable.
-    try validateClaims(parsed.claims, .{ .now_s = 1060, .leeway_s = 60, .issuer = .any, .audience = .any });
+    // One second before the edge is acceptable; exactly at it (exp + leeway
+    // == now) is expired -- RFC 7519 §4.1.4: the current time MUST be before
+    // `exp` (golang-jwt draws the same line; `interop-jwt` exp-equals-now).
+    try validateClaims(parsed.claims, .{ .now_s = 1059, .leeway_s = 60, .issuer = .any, .audience = .any });
+    try testing.expectError(error.Expired, validateClaims(parsed.claims, .{ .now_s = 1060, .leeway_s = 60, .issuer = .any, .audience = .any }));
     // Zero leeway: one second past exp fails.
     try testing.expectError(error.Expired, validateClaims(parsed.claims, .{
         .now_s = 1001,
@@ -4787,6 +4801,9 @@ test {
     _ = @import("cache.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("go_oracle_test.zig");
+    _ = @import("ed25519.zig");
+    _ = @import("audit_test.zig");
 }
 
 test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {
@@ -8699,14 +8716,14 @@ test "IdTokenOptions.leeway_s: the default clock-skew window is exactly 60 s (bl
     // These two cases sit either side of the boundary, so the default cannot
     // be widened OR narrowed without this test going red.
 
-    // exp = 940 with now = 1000 → expired by exactly 60 s → still inside the
-    // default leeway.
+    // exp = 941 with now = 1000 → expired by 59 s → still inside the default
+    // leeway.
     {
         var buf: [512]u8 = undefined;
         const token = buildIdToken(
             &buf,
             "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
-                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+                "\"exp\":941,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
         );
         var accepted = try acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
             .now_s = 1000,
@@ -8716,13 +8733,14 @@ test "IdTokenOptions.leeway_s: the default clock-skew window is exactly 60 s (bl
         });
         accepted.deinit();
     }
-    // exp = 939 → expired by 61 s → one second outside it.
+    // exp = 940 → expired by exactly 60 s → at the edge, so outside it
+    // (RFC 7519 §4.1.4: now must be BEFORE exp + leeway).
     {
         var buf: [512]u8 = undefined;
         const token = buildIdToken(
             &buf,
             "{\"iss\":\"" ++ id_token_issuer ++ "\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
-                "\"exp\":939,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
         );
         try testing.expectError(error.Expired, acceptIdToken(gpa, token, .{ .hmac = id_token_secret }, .{
             .now_s = 1000,
@@ -8753,7 +8771,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
     var provider = Provider.init(gpa, stub.fetcher(), .{ .issuer = "https://issuer.example" });
     defer provider.deinit();
 
-    // exp = 940, now = 1000 → 60 s stale → accepted under the default.
+    // exp = 941, now = 1000 → 59 s stale → accepted under the default.
     {
         var buf: [512]u8 = undefined;
         const si = signingInputInto(
@@ -8761,7 +8779,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
             \\{"alg":"EdDSA","kid":"op-key"}
         ,
             "{\"iss\":\"https://issuer.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
-                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+                "\"exp\":941,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
         );
         const sig = (try kp.sign(si, null)).toBytes();
         var accepted = try acceptIdTokenProvider(&provider, gpa, finishToken(&buf, si.len, &sig), 1000, .{
@@ -8770,7 +8788,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
         });
         accepted.deinit();
     }
-    // exp = 939 → 61 s stale → rejected.
+    // exp = 940 → 60 s stale, at the edge → rejected.
     {
         var buf: [512]u8 = undefined;
         const si = signingInputInto(
@@ -8778,7 +8796,7 @@ test "IdTokenProviderOptions.leeway_s: the default clock-skew window is exactly 
             \\{"alg":"EdDSA","kid":"op-key"}
         ,
             "{\"iss\":\"https://issuer.example\",\"aud\":\"" ++ id_token_client_id ++ "\"," ++
-                "\"exp\":939,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
+                "\"exp\":940,\"nonce\":\"" ++ id_token_nonce ++ "\"}",
         );
         const sig = (try kp.sign(si, null)).toBytes();
         try testing.expectError(error.Expired, acceptIdTokenProvider(&provider, gpa, finishToken(&buf, si.len, &sig), 1000, .{

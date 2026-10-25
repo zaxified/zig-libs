@@ -168,16 +168,24 @@ pub fn encode(gpa: std.mem.Allocator, claims: anytype, key: SigningKey, opts: En
 /// `error.InvalidClaims`. The caller owns the result.
 // secret-api-ok: SigningKey is a union of BORROWED slices / pointers (a by-value copy copies a pointer); the signature primitive runs in `sign` under its burn
 pub fn encodeJson(gpa: std.mem.Allocator, claims_json: []const u8, key: SigningKey, opts: EncodeOptions) EncodeError![]u8 {
-    if (!isOneObject(gpa, claims_json)) return error.InvalidClaims;
+    if (!(try isOneObject(gpa, claims_json))) return error.InvalidClaims;
     try checkKey(key);
 
     const Header = struct { alg: []const u8, typ: ?[]const u8, kid: ?[]const u8 };
-    const header = std.json.Stringify.valueAlloc(gpa, Header{
-        .alg = @tagName(key.alg()),
-        .typ = opts.typ,
-        .kid = opts.kid,
-    }, .{ .emit_null_optional_fields = false }) catch return error.OutOfMemory;
-    defer gpa.free(header);
+    const header_value: Header = .{ .alg = @tagName(key.alg()), .typ = opts.typ, .kid = opts.kid };
+    const header_opts: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    // Into the stack when it fits (every header without a long `kid` or
+    // `typ`), the heap otherwise: one allocation fewer per token.
+    var header_stack: [256]u8 = undefined;
+    var header_w: std.Io.Writer = .fixed(&header_stack);
+    var header_heap: ?[]u8 = null;
+    defer if (header_heap) |h| gpa.free(h);
+    const header: []const u8 = if (std.json.Stringify.value(header_value, header_opts, &header_w)) |_|
+        header_w.buffered()
+    else |_| blk: {
+        header_heap = std.json.Stringify.valueAlloc(gpa, header_value, header_opts) catch return error.OutOfMemory;
+        break :blk header_heap.?;
+    };
 
     // signing input = b64(header) '.' b64(payload); the signature follows.
     const input_len = b64.calcSize(header.len) + 1 + b64.calcSize(claims_json.len);
@@ -343,10 +351,15 @@ fn put(buf: []u8, bytes: []const u8) []const u8 {
     return buf[0..bytes.len];
 }
 
-fn isOneObject(gpa: std.mem.Allocator, json: []const u8) bool {
+/// An allocation failure of the validator is `OutOfMemory`, not "not one
+/// object" (audit 2026-10-25 F6).
+fn isOneObject(gpa: std.mem.Allocator, json: []const u8) std.mem.Allocator.Error!bool {
     const trimmed = std.mem.trim(u8, json, " \t\r\n");
     if (trimmed.len == 0 or trimmed[0] != '{') return false;
-    return std.json.validate(gpa, json) catch false;
+    // The scanner's nesting stack: on the stack for any sane depth.
+    var stack: [512]u8 = undefined;
+    var bfa: std.heap.BufferFirstAllocator = .init(&stack, gpa);
+    return std.json.validate(bfa.allocator(), json);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
