@@ -15,8 +15,10 @@
 //! bytes with byte i = (id + i) % 251. Both sides store in a fresh file under
 //! `.zig-cache/bench-kvtree/`, deleted after each row. One op:
 //!   get_hit        20000 point gets, permuted order, one snapshot / View per
-//!                  op; the value is copied out (ours: allocate + free per get;
-//!                  bbolt: copy of its mmap slice into a reused buffer)
+//!                  op; the value is borrowed and copied into a reused buffer
+//!                  on every side (ours `Snapshot.getRef`, bbolt its mmap
+//!                  slice, LMDB `mdb_get`; until 2026-10-25 ours allocated a
+//!                  copy and freed it per get)
 //!   scan           full ordered scan of the N keys (cursor first/next)
 //!   put_txn_1k     one transaction of 1000 puts of NEW keys + commit, store
 //!                  holding N keys already (fsync on both sides: kvtree always,
@@ -27,13 +29,15 @@
 //!                  a baseline of the language runtimes, INFO ONLY
 //! bbolt has no keys outside a bucket, so its rows all use bucket "b"; ours
 //! use the root tree except bucket_get. Storage shape, the production one on
-//! each side: bbolt reads its mmap, resident in the OS page cache after the
-//! preload; ours opens the store on a `pagecache.PageCache` in front of
-//! `kv.FsStorage` with a budget that holds the whole file
-//! (`cache_pages`), so a resident page is lent to the descent with no
-//! syscall and no copy (`Storage.preadRef`). Writes go through it too
-//! (write-through, same fsyncs). Until 2026-10-11 ours preaded every page
-//! through bare `kv.FsStorage`: get_hit 4.67x, scan 3.32x.
+//! each side: bbolt and LMDB read their mmap, resident in the OS page cache
+//! after the preload; ours opens the store on `kv.FsStorage.initMmap` (owner,
+//! 2026-10-25), which lends pages out of a mapping with no syscall and no copy
+//! (`Storage.preadRef`); writes are pwrites with the same fsyncs. History:
+//! bare `kv.FsStorage` (a pread per page) until 2026-10-11 -- get_hit 4.67x,
+//! scan 3.32x bbolt; then a `pagecache.PageCache` holding the whole file in
+//! front of it -- gets 0.77-0.80x bbolt but 1.12-1.15x LMDB, scan 0.97-1.12x
+//! bbolt (a cache lookup, frequency note and pin per leaf).
+//! `BENCH_PAGECACHE=1` measures that shape again.
 //! Result count = hits + value bytes read (gets, scan), puts + value bytes
 //! written (write rows); it does not depend on how many ops a side ran.
 //! Each side times the same way (double the batch until it takes over 100 ms,
@@ -41,6 +45,14 @@
 //! keeping its best, each round on a freshly loaded store. Ratios are
 //! ours/bbolt by wall time; the verdict is the WORST ratio over the rows except
 //! map_baseline. Arguments filter workloads.
+//!
+//! A second foreign side, tools/lmdb_bench (LMDB through the host's
+//! liblmdb.so.0, `build.sh`: one gcc call, no LMDB source), is timed the same
+//! way for every row but map_baseline -- the "fastest in the field" of the
+//! card: LMDB is the C original of the design. Its rows use the unnamed main
+//! database (bucket_get = get_hit there) and commit with an fsync like ours.
+//! The card's fastest figure is ours / min(bbolt, LMDB) per row, worst over the
+//! timed rows. `BENCH_LMDB=0` skips it.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -50,6 +62,9 @@ const pagecache = @import("pagecache");
 const bench_name = "bench-kvtree";
 const work_dir = ".zig-cache/bench-kvtree";
 const go_dir = "modules/kvtree/tools/go_bench";
+const lmdb_build = "modules/kvtree/tools/lmdb_bench/build.sh";
+const lmdb_exe = "modules/kvtree/tools/lmdb_bench/target/lmdb_bench";
+const lmdb_card = "LMDB 0.9.31";
 const ref_short = "bbolt";
 const ref_card = "go.etcd.io/bbolt v1.5.0";
 
@@ -67,6 +82,10 @@ const seed = 0x6b767472;
 const cache_pages = 8192;
 
 const gpa = std.heap.smp_allocator;
+
+/// `BENCH_PAGECACHE=1`: the store on a `pagecache.PageCache` over plain
+/// `FsStorage` (the production shape until 2026-10-25) instead of mmap reads.
+var shape_pagecache = false;
 
 const Data = struct {
     perm: []u32,
@@ -156,20 +175,16 @@ fn onceGet(l: *Live, bucket: bool) u64 {
     var snap = l.db.snapshot() catch @panic("snapshot");
     defer snap.release();
     var sum: u64 = 0;
-    if (bucket) {
-        const bk = (snap.bucket("b") catch @panic("bucket")) orelse @panic("no bucket");
-        for (0..get_n) |i| {
-            const v = (bk.get(gpa, l.d.keys[l.d.perm[i]]) catch @panic("get")) orelse continue;
-            sum += 1 + v.len;
-            gpa.free(v);
-        }
-    } else {
-        for (0..get_n) |i| {
-            const v = (snap.get(gpa, l.d.keys[l.d.perm[i]]) catch @panic("get")) orelse continue;
-            sum += 1 + v.len;
-            gpa.free(v);
-        }
+    var out: [val_len]u8 = undefined;
+    const bk = if (bucket) (snap.bucket("b") catch @panic("bucket")) orelse @panic("no bucket") else null;
+    for (0..get_n) |i| {
+        const key = l.d.keys[l.d.perm[i]];
+        var r = (if (bk) |b| b.getRef(key) else snap.getRef(key)) catch @panic("getRef") orelse continue;
+        @memcpy(out[0..r.bytes.len], r.bytes);
+        sum += 1 + r.bytes.len;
+        r.release();
     }
+    std.mem.doNotOptimizeAway(&out);
     return sum;
 }
 
@@ -239,17 +254,30 @@ fn oursRow(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, d: *const Data
     dir.deleteFile(io, file) catch {};
     dir.deleteFile(io, lock) catch {};
     const fs = try arena.create(kvtree.FsStorage);
-    fs.* = kvtree.FsStorage.init(io, dir);
+    fs.* = if (shape_pagecache) kvtree.FsStorage.init(io, dir) else kvtree.FsStorage.initMmap(io, dir);
     const pc = try arena.create(pagecache.PageCache);
     pc.* = pagecache.PageCache.init(gpa, fs.storage(), .{ .max_pages = cache_pages });
     defer pc.deinit();
-    var l: Live = .{ .d = d, .db = try kvtree.Db.open(gpa, pc.storage(), file, .{}) };
+    const store = if (shape_pagecache) pc.storage() else fs.storage();
+    var l: Live = .{ .d = d, .db = try kvtree.Db.open(gpa, store, file, .{}) };
     try preload(&l, w == 4);
     const row = bench.timeIt(io, .{ .fd = null }, once, .{ d, &l, w }, true);
     l.db.close();
     dir.deleteFile(io, file) catch {};
     dir.deleteFile(io, lock) catch {};
     return row;
+}
+
+fn lmdbBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the LMDB side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{ .argv = &.{ "bash", lmdb_build } }) catch |e| {
+        std.debug.print("{s}: could not run {s} ({t}) -- BENCH_LMDB=0 skips the LMDB side\n", .{ bench_name, lmdb_build, e });
+        return error.LmdbBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: LMDB build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.LmdbBuildFailed;
+    }
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -263,20 +291,26 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(arena);
     const filters = if (args.len > 1) args[1..] else &[_][:0]const u8{};
     const rounds: usize = if (init.environ_map.get("BENCH_ROUNDS")) |r| try std.fmt.parseInt(usize, r, 10) else 3;
+    shape_pagecache = if (init.environ_map.get("BENCH_PAGECACHE")) |v| std.mem.eql(u8, v, "1") else false;
 
     const d: Data = try setupData(arena);
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_lmdb = if (init.environ_map.get("BENCH_LMDB")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (use_lmdb) try lmdbBuild(arena, io);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<22} {s:>11} {s:>11} {s:>8} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "gross", "net", "spr us", "spr ref" });
+    if (use_lmdb) try w.print("{s:<22} {s:>11} {s:>11} {s:>8}  vs fastest (who)\n", .{ "", "lmdb ns", "spr lmdb", "ours/best" });
     try w.flush();
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
     var base_ours: f64 = 0;
+    var worst_fast: f64 = 0;
+    var worst_fast_row: []const u8 = "";
     var base_ref: f64 = 0;
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
@@ -284,10 +318,15 @@ pub fn main(init: std.process.Init) !u8 {
             for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
+        const info_row = for (info_only) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else false;
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var lmdb: bench.Side = .{};
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (use_lmdb and !info_row) lmdb.add(try bench.foreign(arena, io, bench_name, lmdb_exe, abs, name, null));
             ours.add(try oursRow(arena, io, dir, &d, wi));
         }
         const gross = ours.best_ns / go.best_ns;
@@ -303,17 +342,25 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         const ratio = if (net_base != null and !std.math.isNan(net)) net else gross;
-        const info = for (info_only) |n| {
-            if (std.mem.eql(u8, n, name)) break true;
-        } else false;
+        const info = info_row;
         if (!info) {
             worst = @max(worst, ratio);
             best = @min(best, ratio);
         }
         max_spread = @max(max_spread, @max(ours.spread(false), go.spread(false)));
-        const same = ours.count == go.count;
+        const same = ours.count == go.count and (!use_lmdb or info or lmdb.count == ours.count);
         mismatch = mismatch or !same;
-        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ a foreign side's count" });
+        if (use_lmdb and !info) {
+            max_spread = @max(max_spread, lmdb.spread(false));
+            const fastest_ns = @min(go.best_ns, lmdb.best_ns);
+            const ratio_fast = ours.best_ns / fastest_ns;
+            if (ratio_fast > worst_fast) {
+                worst_fast = ratio_fast;
+                worst_fast_row = name;
+            }
+            try w.print("{s:<22} {d:>11.0} {d:>10.1}% {d:>8.3}  ({s})\n", .{ "", lmdb.best_ns, 100 * lmdb.spread(false), ratio_fast, if (lmdb.best_ns < go.best_ns) "lmdb" else ref_short });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -323,8 +370,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_lmdb) try w.print("worst vs fastest = {d:.2} (row {s})\n", .{ worst_fast, worst_fast_row });
+    if (filters.len == 0) {
+        if (use_lmdb)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} / bbolt ({s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, lmdb_card, worst_fast_row })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
 }

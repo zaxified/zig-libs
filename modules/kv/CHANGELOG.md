@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Grade 1.** `FsStorage.initMmap` (Linux): reads are lent out of a read-only shared mapping of each file (`Storage.preadRef`), mapped with room past its end so a growing log is not remapped per read; `get` reads a record in ONE access (a borrow, else one `pread` of the whole record) instead of three. `get_hit` 0.92× → 0.14× rosedb and 1.00× prologic/bitcask; `iterator` sorts its key snapshot with `pdq` and a word-wise compare (std's stable sort was 45 % of a scan): scan 0.89× → 0.17× rosedb. `bench-kv` now also times prologic/bitcask v1.0.2 and nutsdb v1.1.0 (`HintKeyAndRAMIdxMode`), the Bitcask-model field: fastest 1.13× (scan, prologic/bitcask). New `tools/lead_probe`: a read-only open beside a live writer (no one else in the field has one) and a garbage tail that never makes the store unopenable (rosedb panics in `Open`). **Fix:** `merge` read `Options.clock` with no expiring key (the clock contract says it does not). Audit: full review and mutation run (138 mutants), 27 tests added.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** Deprecated std names replaced by their Zig 0.17 spellings (`mem.indexOf*` -> `mem.find*`, `fmt.bufPrint` -> `mem.print`, `fmt.allocPrint(a, …)` -> `a.print(…)`, `bufPrintSentinel` -> `mem.printSentinel`, `@intFromEnum` -> `@backingInt`); the old names are aliases, so behaviour is identical.

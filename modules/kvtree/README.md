@@ -115,12 +115,16 @@ try db.copyTo(store, "app.kvt.bak");
 Production wires `kvtree.FsStorage` over a real directory; tests use
 `kvtree.SimStorage` (re-exported from `kv`) for deterministic crash simulation.
 
-**For read speed, put a `pagecache.PageCache` in front of the `FsStorage`**
-(`Db.open(gpa, pc.storage(), ...)`): a resident page is then lent to a `get`
-with no syscall and no copy, the way bbolt reads its mmap. Bare `FsStorage`
-`pread`s every page of every descent — about 4× slower gets than bbolt; with
-the cache holding the file, gets are on par (see SPEC.md, Performance). The
-cache is write-through, so durability and the fsync order do not change.
+**For read speed, open the store on `kvtree.FsStorage.initMmap`** (Linux;
+`Db.open(gpa, fs.storage(), ...)`): pages are then lent out of a read-only
+mapping of the file with no syscall and no copy, the way bbolt and LMDB read
+theirs -- gets about 0.85x LMDB, scans faster than bbolt and LMDB (SPEC.md,
+Performance). Writes stay pwrites with the same fsyncs. Bare `FsStorage.init`
+`pread`s every page of every descent (about 4x slower gets). The caveat of
+every mmap store applies: a file truncated by someone else below a page in use
+is a SIGBUS -- the store's lock keeps other writers out. A
+`pagecache.PageCache` in front of plain `FsStorage` is the shape for a bounded
+RAM budget (it lends resident pages too, at a cache lookup per page).
 
 ## Verify
 

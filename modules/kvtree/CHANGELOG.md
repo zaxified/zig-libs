@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Grade 1.** The production shape for read speed is now `kv.FsStorage.initMmap` (pages lent out of a mapping of the file, as bbolt and LMDB read; a `pagecache` in front of plain `FsStorage` stays the bounded-RAM shape — README). The in-node binary search prefetches the next probes' cells. `Snapshot.getRef` (zero-copy get in a snapshot). `bench-kvtree` also times LMDB 0.9.31, the fastest in the field: gets 0.90×, scan 0.43× LMDB and 0.79× bbolt, commits ≤ 1.12× LMDB (gets were 1.47× LMDB on the pagecache). New `tools/corrupt_probe`: on 6 000 damaged files kvtree never crashed (plain and mmap reads), bbolt panicked 234 times, LMDB crashed 292 times. **Fix:** recovery adopted a leaf whose slot directory was unsorted or held a key twice (`leafViewSafe` now checks the order, as `branchViewSafe` did) — lookups in such a leaf missed present keys. Audit: full review and mutation run (118 mutants), 19 tests added.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — Tests: a tree of near-page-sized keys (300..4000 bytes, down to the longest that fits inline) splits, reads, deletes and reopens consistently (audit 2026-10-19; no defect found, the case was unpinned). No behaviour change.

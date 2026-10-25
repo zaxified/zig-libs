@@ -154,8 +154,6 @@ pub const Db = struct {
     /// Handle of the held `<path>.lock` sidecar, or null with
     /// `Options.lock == .none`. Closing it releases the advisory lock.
     lock_file: ?kv.Storage.Handle,
-    /// txn_id to stamp the next commit with (monotonic).
-    next_txn: u64,
     /// Open read snapshots' pinned txn_ids — their minimum is the oldest reader
     /// the reclaim gate must respect. Kept sorted-insert-free; min computed on
     /// demand (open-snapshot counts are tiny in the embedded model).
@@ -275,7 +273,6 @@ pub const Db = struct {
             .path = try gpa.dupe(u8, path),
             .lock_path = lock_path,
             .lock_file = lock_file,
-            .next_txn = meta_rec.txn_id + 1,
             .open_snapshots = .empty,
             .shrink_min_pages = options.shrink_min_pages,
             .commit_scratch = .init(gpa),
@@ -605,7 +602,6 @@ pub const Txn = struct {
             return e;
         };
         self.db.meta_rec = new_meta;
-        self.db.next_txn = new_meta.txn_id + 1;
     }
 
     pub fn rollback(self: *Txn) void {
@@ -955,6 +951,14 @@ pub const Snapshot = struct {
 
     pub fn get(self: *Snapshot, gpa: Allocator, key: []const u8) GetError!?[]u8 {
         return lookup(&self.db.pager, self.root, gpa, key);
+    }
+
+    /// `Db.getRef` in this version: the value borrowed from the store, no
+    /// copy. The snapshot's pin keeps its pages; release the ref before the
+    /// snapshot.
+    pub fn getRef(self: *Snapshot, key: []const u8) GetRefError!?ValueRef {
+        if (!self.db.pager.store.canLend()) return error.CannotLend;
+        return lookupRef(&self.db.pager, self.root, key);
     }
 
     pub fn cursor(self: *Snapshot) Allocator.Error!Cursor {
@@ -2592,6 +2596,92 @@ const LendingSim = struct {
     }
 };
 
+test "mmap FsStorage: snapshots held across commits that free, reuse and give back pages (model)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs = kv.FsStorage.initMmap(testing.io, tmp.dir);
+    fs.mmap_reserve = 16 * page_size; // remaps as the file grows
+    var db = try Db.open(testing.allocator, fs.storage(), "m.kvt", .{});
+    var model: std.AutoHashMapUnmanaged(u16, u32) = .empty;
+    defer model.deinit(testing.allocator);
+    var prng = std.Random.DefaultPrng.init(0x6d6d6170);
+    const r = prng.random();
+    var val: [200]u8 = undefined;
+    // An old snapshot and the model of what it must keep seeing: a lent page
+    // shows the file's live bytes, so a page rewritten under a reader of it
+    // (recycled too early, or a kept branch not dropped) shows here.
+    var held: ?Snapshot = null;
+    defer if (held) |*h| h.release();
+    var held_model: std.AutoHashMapUnmanaged(u16, u32) = .empty;
+    defer held_model.deinit(testing.allocator);
+    for (0..80) |round| {
+        var tx = try db.begin();
+        // Mostly deletes in some rounds: whole subtrees die, the file's tail
+        // is given back, freed pages are reused by later rounds.
+        const del_heavy = round % 7 == 3;
+        for (0..r.intRangeAtMost(usize, 1, 120)) |_| {
+            const k: u16 = r.uintLessThan(u16, 1500);
+            var kb: [8]u8 = undefined;
+            const key = try std.mem.print(&kb, "k{d:0>5}", .{k});
+            if (del_heavy or r.uintLessThan(u8, 5) == 0) {
+                try tx.del(key);
+                _ = model.remove(k);
+            } else {
+                const gen: u32 = @intCast(round + 1);
+                @memset(&val, @truncate(gen));
+                std.mem.writeInt(u32, val[0..4], gen, .little);
+                try tx.put(key, &val);
+                try model.put(testing.allocator, k, gen);
+            }
+        }
+        try tx.commit();
+        if (round % 10 == 0) {
+            if (held) |*h| h.release();
+            held = try db.snapshot();
+            held_model.clearRetainingCapacity();
+            var it = model.iterator();
+            while (it.next()) |e| try held_model.put(testing.allocator, e.key_ptr.*, e.value_ptr.*);
+        }
+        for (0..40) |_| {
+            const k: u16 = r.uintLessThan(u16, 1500);
+            var kb: [8]u8 = undefined;
+            const key = try std.mem.print(&kb, "k{d:0>5}", .{k});
+            for ([_]bool{ false, true }) |old| {
+                const want = if (old) held_model.get(k) else model.get(k);
+                var got = if (old) try held.?.getRef(key) else try db.getRef(key);
+                defer if (got) |*g| g.release();
+                try testing.expectEqual(want != null, got != null);
+                if (want) |w| try testing.expectEqual(w, std.mem.readInt(u32, got.?.bytes[0..4], .little));
+            }
+        }
+    }
+    // The held snapshot's whole version, by cursor (borrowed leaf frames).
+    var cur = try held.?.cursor();
+    var n: usize = 0;
+    try cur.first();
+    while (try cur.next()) |e| : (n += 1) {
+        const k = try std.fmt.parseInt(u16, e.key[1..], 10);
+        try testing.expectEqual(held_model.get(k).?, std.mem.readInt(u32, e.val[0..4], .little));
+    }
+    cur.deinit();
+    try testing.expectEqual(held_model.count(), n);
+    held.?.release();
+    held = null;
+    db.close();
+    // Reopened: the current version, by get.
+    db = try Db.open(testing.allocator, fs.storage(), "m.kvt", .{});
+    defer db.close();
+    var it = model.iterator();
+    while (it.next()) |e| {
+        var kb: [8]u8 = undefined;
+        const key = try std.mem.print(&kb, "k{d:0>5}", .{e.key_ptr.*});
+        var got = (try db.getRef(key)).?;
+        defer got.release();
+        try testing.expectEqual(e.value_ptr.*, std.mem.readInt(u32, got.bytes[0..4], .little));
+    }
+}
+
 test "overflow values: getRef lends an inline value and refuses an overflow one (get reads it)" {
     var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
     defer ls.sim.deinit();
@@ -2611,6 +2701,26 @@ test "overflow values: getRef lends an inline value and refuses an overflow one 
     try expectGet(&db, "o", big);
     // The leaf page lent for the refused lookup was released (testing.allocator
     // reports a leak otherwise).
+}
+
+test "Snapshot.getRef lends the snapshot's version, not a later commit's" {
+    var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
+    defer ls.sim.deinit();
+    ls.sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, ls.storage(), "s.kvt", .{});
+    defer db.close();
+    try db.put("k", "old");
+    var snap = try db.snapshot();
+    defer snap.release();
+    try db.put("k", "new");
+    try db.put("j", "later");
+    var r = (try snap.getRef("k")).?;
+    try testing.expectEqualStrings("old", r.bytes);
+    r.release();
+    try testing.expect((try snap.getRef("j")) == null);
+    var now = (try db.getRef("k")).?;
+    try testing.expectEqualStrings("new", now.bytes);
+    now.release();
 }
 
 // ── merging underfull nodes ─────────────────────────────────────────────────
@@ -3726,4 +3836,375 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── audit 2026-10-25 (mutation survivors): corruption guards and boundaries ──
+
+/// Byte offset in the file of the `cell_off`-th byte after the cell of `key`
+/// in the leaf page `page_id` (`cell_off` 0 = the cell's key length field).
+fn cellOffset(db: *Db, page_id: PageId, key: []const u8) !usize {
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(page_id, &page);
+    const leaf = format.Leaf.init(&page);
+    const s = leaf.search(key);
+    try testing.expect(s.found);
+    const o = std.mem.readInt(u16, page[8 + 2 * @as(usize, s.index) ..][0..2], .little);
+    return @as(usize, page_id) * page_size + o;
+}
+
+/// Overwrite the u32 at `off` of the file `path`.
+fn pokeU32(sim: *kv.SimStorage, path: []const u8, off: usize, v: u32) void {
+    std.mem.writeInt(u32, sim.fileContent(path).?[off..][0..4], v, .little);
+}
+
+test "references into the uncommitted tail are Corrupt: an overflow chain on read and on overwrite, a bucket tree on delete" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+    // One byte past inline: a single overflow page holds it.
+    const v = try filled(testing.allocator, maxInline("v") + 1, 7);
+    defer testing.allocator.free(v);
+    try db.put("v", v);
+    {
+        var txn = try db.begin();
+        const b = try txn.createBucket("b");
+        try b.put("k", "1");
+        try txn.commit();
+    }
+    // Two valid-looking pages BEYOND the high water, inside the file: an
+    // overflow page and an empty leaf. Only the bound keeps a reference from
+    // following them.
+    const tail: PageId = @intCast(db.meta_rec.high_water);
+    var page: [page_size]u8 = undefined;
+    format.encodeOverflow(&page, 0, v);
+    try db.pager.writePage(tail, &page);
+    format.encodeEmptyLeaf(&page);
+    try db.pager.writePage(tail + 1, &page);
+    const root = db.meta_rec.root;
+    pokeU32(&sim, "t.kvt", try cellOffset(&db, root, "v") + 6 + 1, tail);
+    pokeU32(&sim, "t.kvt", try cellOffset(&db, root, "b") + 6 + 1, tail + 1);
+
+    try testing.expectError(error.Corrupt, db.get(testing.allocator, "v")); // readOverflow
+    try testing.expectError(error.Corrupt, db.put("v", "new")); // freeOverflow
+    try testing.expectEqual(db.meta_rec.high_water, db.pager.high_water);
+    {
+        var txn = try db.begin();
+        try txn.deleteBucket("b");
+        try testing.expectError(error.Corrupt, txn.commit()); // freeSubtree
+    }
+    try testing.expect(!db.poisoned);
+    try testing.expectEqual(db.meta_rec.high_water, db.pager.high_water);
+}
+
+test "a bucket tree that loops back on itself is Corrupt when it is freed, not an endless walk" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "t.kvt", .{});
+    defer db.close();
+    {
+        var txn = try db.begin();
+        const b = try txn.createBucket("b");
+        _ = try b.createBucket("n");
+        try txn.commit();
+    }
+    const broot = (try lookupCell(&db.pager, db.meta_rec.root, "b")).bucket.root;
+    // `b`'s leaf holds the cell of `n`: point its tree at `b`'s own root.
+    pokeU32(&sim, "t.kvt", try cellOffset(&db, broot, "n") + 6 + 1, broot);
+    var txn = try db.begin();
+    try txn.deleteBucket("b");
+    try testing.expectError(error.Corrupt, txn.commit());
+    try testing.expect(!db.poisoned);
+}
+
+test "recovery refuses a bucket cell that points back into the tree or past the high water, and adopts the version before" {
+    for ([_]bool{ false, true }) |loop| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var cell: usize = undefined;
+        var target: PageId = undefined;
+        {
+            var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+            defer db.close();
+            var txn = try db.begin();
+            const b = try txn.createBucket("b");
+            try b.put("k", "v");
+            try txn.commit();
+            try db.put("z", "newest");
+            // An empty leaf past the high water, inside the file.
+            var page: [page_size]u8 = undefined;
+            format.encodeEmptyLeaf(&page);
+            const tail: PageId = @intCast(db.meta_rec.high_water);
+            try db.pager.writePage(tail, &page);
+            target = if (loop) db.meta_rec.root else tail;
+            cell = try cellOffset(&db, db.meta_rec.root, "b") + 6 + 1;
+        }
+        pokeU32(&sim, "c.kvt", cell, target);
+        var db = try Db.open(testing.allocator, sim.storage(), "c.kvt", .{});
+        defer db.close();
+        try expectGet(&db, "z", null); // the newest version was refused
+        var snap = try db.snapshot();
+        defer snap.release();
+        try expectBucketGet((try snap.bucket("b")).?, "k", "v");
+    }
+}
+
+test "a freelist chain that loops back on itself is a refused commit, not an endless read" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "f.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    for (0..8) |i| try db.put("k", if (i % 2 == 0) "a" else "b");
+    const head = db.meta_rec.free_root;
+    try testing.expect(head != 0);
+    // The page's `next` pointer (bytes 2..6) names the page itself.
+    pokeU32(&sim, "f.kvt", @as(usize, head) * page_size + 2, head);
+    try testing.expectError(error.Storage, db.put("k", "c"));
+    try testing.expect(!db.poisoned);
+}
+
+test "recovery refuses a meta whose free count is not what its freelist chain holds" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var newest: format.Meta = undefined;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{ .shrink_min_pages = 0 });
+        defer db.close();
+        for (0..8) |i| try db.put("k", if (i % 2 == 0) "a" else "b");
+        newest = db.meta_rec;
+        try testing.expect(newest.free_root != 0 and newest.free_count > 0);
+    }
+    // Re-seal the newest meta (CRC and all) with a count one too high.
+    var bad = newest;
+    bad.free_count += 1;
+    var page: [page_size]u8 = undefined;
+    bad.encode(&page);
+    const bytes = sim.fileContent("m.kvt").?;
+    for ([_]PageId{ format.meta_page_a, format.meta_page_b }) |slot| {
+        const m = format.Meta.decode(bytes[@as(usize, slot) * page_size ..][0..page_size]).?;
+        if (m.txn_id == newest.txn_id) @memcpy(bytes[@as(usize, slot) * page_size ..][0..page_size], &page);
+    }
+    var db = try Db.open(testing.allocator, sim.storage(), "m.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    try testing.expectEqual(newest.txn_id - 1, db.meta_rec.txn_id);
+}
+
+test "a refused commit hands back the pages it grew: the pager is at the committed high water again" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "r.kvt", .{});
+    defer db.close();
+    {
+        var txn = try db.begin();
+        const b = try txn.createBucket("b");
+        try b.put("k", "1");
+        try txn.commit();
+    }
+    // The bucket's own tree is rewritten (pages grown) before the plain delete
+    // of its name is found to collide with it.
+    var txn = try db.begin();
+    const b = (try txn.bucket("b")).?;
+    var big: [1500]u8 = undefined;
+    @memset(&big, 'x');
+    for (0..10) |i| {
+        var kb: [8]u8 = undefined;
+        try b.put(try std.mem.print(&kb, "k{d}", .{i}), &big);
+    }
+    try txn.del("b");
+    const before = db.meta_rec;
+    try testing.expectError(error.IncompatibleValue, txn.commit());
+    try testing.expectEqual(before.txn_id, db.meta_rec.txn_id);
+    try testing.expectEqual(before.high_water, db.pager.high_water);
+    try db.put("after", "1");
+    try testing.expect(db.pager.high_water <= before.high_water + 4);
+}
+
+test "a bucket whose sequence alone changed keeps its tree: the same root page" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "q.kvt", .{});
+    defer db.close();
+    {
+        var txn = try db.begin();
+        const b = try txn.createBucket("b");
+        try b.put("k", "1");
+        try txn.commit();
+    }
+    const h0 = (try lookupCell(&db.pager, db.meta_rec.root, "b")).bucket;
+    {
+        var txn = try db.begin();
+        _ = try (try txn.bucket("b")).?.nextSequence();
+        try txn.commit();
+    }
+    const h1 = (try lookupCell(&db.pager, db.meta_rec.root, "b")).bucket;
+    try testing.expectEqual(h0.root, h1.root);
+    try testing.expectEqual(h0.seq + 1, h1.seq);
+}
+
+test "a file of one page, even one holding a valid meta, is not a kvtree store" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    {
+        var db = try Db.open(testing.allocator, sim.storage(), "o.kvt", .{});
+        defer db.close();
+        try db.put("a", "1");
+    }
+    const s = sim.storage();
+    const h = try s.open("o.kvt", .open_or_create);
+    try s.truncate(h, page_size);
+    s.close(h);
+    try testing.expectError(error.NotAKvtreeFile, Db.open(testing.allocator, sim.storage(), "o.kvt", .{}));
+}
+
+test "a file longer than its meta says (the tail was just given back) reopens with the pager at the meta's high water" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{ .shrink_min_pages = 2 });
+    defer db.close();
+    try fillThenShrink(&db, 200, 140);
+    // One commit at a time until the one that gives the tail back: the file is
+    // shortened only by the commit after it.
+    const peak = db.meta_rec.high_water;
+    var rounds: usize = 0;
+    while (db.meta_rec.high_water >= peak and rounds < 10) : (rounds += 1) try touch(&db, 1);
+    try testing.expect(rounds < 10);
+    try testing.expect(fileBytes(&sim, "g.kvt") > db.meta_rec.high_water * page_size);
+    db.close();
+    db = try Db.open(testing.allocator, sim.storage(), "g.kvt", .{ .shrink_min_pages = 2 });
+    try testing.expectEqual(db.meta_rec.high_water, db.pager.high_water);
+    _ = try checkTreeShape(&db);
+}
+
+test "a free tail of exactly shrink_min_pages goes; one page fewer stays" {
+    for ([_]u32{ 3, 4 }) |min| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.allow_overwrite = true;
+        var db = try Db.open(testing.allocator, sim.storage(), "q.kvt", .{ .shrink_min_pages = min });
+        defer db.close();
+        try fillThenShrink(&db, 200, 140);
+        const hw = db.meta_rec.high_water;
+        try touch(&db, 6);
+        // The free tail here is three pages (see the test above).
+        if (min == 3) {
+            try testing.expect(db.meta_rec.high_water + 3 <= hw);
+        } else {
+            try testing.expect(db.meta_rec.high_water >= hw);
+        }
+        _ = try checkTreeShape(&db);
+    }
+}
+
+test "getRef of a bucket's name finds nothing, as get does" {
+    var ls: LendingSim = .{ .sim = kv.SimStorage.init(testing.allocator) };
+    defer ls.sim.deinit();
+    ls.sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, ls.storage(), "l.kvt", .{});
+    defer db.close();
+    {
+        var txn = try db.begin();
+        _ = try txn.createBucket("b");
+        try txn.put("p", "plain");
+        try txn.commit();
+    }
+    try testing.expect((try db.getRef("b")) == null);
+    try expectGet(&db, "b", null);
+    var r = (try db.getRef("p")).?;
+    try testing.expectEqualStrings("plain", r.bytes);
+    r.release();
+}
+
+test "buckets: deleting a bucket kills the handles of every level below it, not only its children's" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "d.kvt", .{});
+    defer db.close();
+    var txn = try db.begin();
+    const a = try txn.createBucket("a");
+    const c = try a.createBucket("c");
+    const g = try c.createBucket("g");
+    const h = try g.createBucket("h");
+    try txn.deleteBucket("a");
+    for ([_]Bucket{ a, c, g, h }) |x| {
+        try testing.expectError(error.BucketNotFound, x.put("k", "v"));
+        try testing.expectError(error.BucketNotFound, x.sequence());
+    }
+    try txn.commit();
+    var snap = try db.snapshot();
+    defer snap.release();
+    try testing.expect((try snap.bucket("a")) == null);
+}
+
+test "copyTo writes both meta slots, the same meta at txn 0" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    try db.put("a", "1");
+    try db.copyTo(sim.storage(), "c.kvt");
+    const bytes = sim.fileContent("c.kvt").?;
+    const a = format.Meta.decode(bytes[0..page_size]).?;
+    const b = format.Meta.decode(bytes[page_size..][0..page_size]).?;
+    try testing.expectEqual(@as(u64, 0), a.txn_id);
+    try testing.expectEqual(a, b);
+}
+
+test "a commit rewrites only the path it touches: every other child of the root keeps its page" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "s.kvt", .{});
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        var txn = try db.begin();
+        for (0..300) |id| try txn.put(longKey(try arena.allocator().create([long_key_len]u8), id), "v");
+        try txn.commit();
+    }
+    var before: [page_size]u8 = undefined;
+    var after: [page_size]u8 = undefined;
+    try db.pager.readPage(db.meta_rec.root, &before);
+    try testing.expectEqual(format.NodeKind.branch, format.kindOf(&before).?);
+    const n = format.Branch.init(&before).count();
+    try testing.expect(n >= 2);
+    var kb: [long_key_len]u8 = undefined;
+    try db.put(longKey(&kb, 150), "changed");
+    try db.pager.readPage(db.meta_rec.root, &after);
+    try testing.expectEqual(format.NodeKind.branch, format.kindOf(&after).?);
+    try testing.expectEqual(n, format.Branch.init(&after).count());
+    var moved: usize = 0;
+    for (0..@as(usize, n) + 1) |i| {
+        if (format.Branch.init(&before).childAtIndex(i) != format.Branch.init(&after).childAtIndex(i)) moved += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), moved);
+}
+
+test "an empty transaction commits nothing: the meta, the txn id and the file stay as they were" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "e.kvt", .{});
+    defer db.close();
+    try db.put("a", "1");
+    const before = db.meta_rec;
+    const bytes = try testing.allocator.dupe(u8, sim.fileContent("e.kvt").?);
+    defer testing.allocator.free(bytes);
+    var txn = try db.begin();
+    try txn.commit();
+    try testing.expectEqual(before, db.meta_rec);
+    try testing.expectEqualSlices(u8, bytes, sim.fileContent("e.kvt").?);
+    try db.put("b", "2");
+    try testing.expectEqual(before.txn_id + 1, db.meta_rec.txn_id);
 }

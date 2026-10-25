@@ -5,11 +5,10 @@
 //! This is pure, allocator-explicit, I/O-free code: it turns page-sized byte
 //! buffers into typed views (`Meta`, `Leaf`, `Branch`) and back, does the
 //! in-node binary search, and performs the classic B-tree node mutations —
-//! insert, delete and split. None of it is the Fable core: node split is
-//! textbook, deterministic, and unit-tested here directly (see the tests at
-//! the bottom). (Deletes remove the key in place; there is no merge/rebalance
-//! yet — underflowed and empty leaves simply persist, a documented backlog
-//! item, never a correctness issue.) The correctness-critical parts —
+//! insert, delete and split. Node split is textbook, deterministic, and
+//! unit-tested here directly (see the tests at the bottom); `underflows` tells
+//! the commit (`core.mergeUnderfull`) when a node is to be merged with a
+//! sibling or dropped. The correctness-critical parts —
 //! *when* a commit's dirty pages become durable and *which* meta page a crash
 //! recovery adopts, and *when* a freed page may be recycled without a live
 //! reader still seeing it — live in `core.zig`.
@@ -480,13 +479,16 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
 /// module's stated "I/O faults" threat model.
 ///
 /// A leaf cell is `(key_len: u16, val_len: u32, key, val)`, so the check is
-/// `branchViewSafe`'s plus the value bytes. Lengths are widened to `usize`
-/// before they are added, so the bound cannot be defeated by wrapping.
+/// `branchViewSafe`'s plus the value bytes, keys strictly ascending included
+/// (a shuffled slot directory would make `binarySearch` miss present keys).
+/// Lengths are widened to `usize` before they are added, so the bound cannot
+/// be defeated by wrapping.
 pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
     if (page[0] != @backingInt(NodeKind.leaf)) return null;
     const count: usize = nodeCount(page);
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
+    var prev_key: ?[]const u8 = null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const o = slotOffset(page, i);
@@ -501,6 +503,9 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
         if (raw & ovf_flag == 0 and raw & bucket_flag != 0 and raw != bucket_flag | bucket_hdr_len) return null;
         const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
         if (o + 6 + @as(usize, klen) + vlen > page_size) return null;
+        const key = page[o + 6 ..][0..klen];
+        if (prev_key) |p| if (orderKeys(p, key) != .lt) return null;
+        prev_key = key;
     }
     return Leaf.init(page);
 }
@@ -528,8 +533,25 @@ pub fn orderKeys(a: []const u8, b: []const u8) std.math.Order {
 fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
     var lo: usize = 0;
     var hi: usize = view.count();
+    // Prefetch only over a slot directory that fits its page: a damaged
+    // count must not send the prefetch where the search itself never reads.
+    const may_prefetch = comptime (V == Leaf or V == Branch);
+    const dir_fits = hdr_len + hi * slot_len <= page_size;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
+        // A probe's first touch of its cell is a cache miss, and each probe
+        // waited for the one before it (perf 2026-10-25: 35 % of a resident
+        // get on one load). The next probe is the middle of one half or the
+        // other; asking for both cells now overlaps the misses. The slot
+        // directory itself is a line or two, warm after the first probe. A
+        // page's offsets are clamped: a prefetch must not fault on a damaged
+        // slot that the search itself never reads.
+        if (may_prefetch and dir_fits) {
+            const a = lo + (mid - lo) / 2;
+            const b = mid + 1 + (hi - mid - 1) / 2;
+            if (a < mid) @prefetch(&view.page[@min(slotOffset(view.page, a), page_size - 1)], .{});
+            if (b < hi) @prefetch(&view.page[@min(slotOffset(view.page, b), page_size - 1)], .{});
+        }
         const cmp = orderKeys(view.keyAt(mid), key);
         switch (cmp) {
             .lt => lo = mid + 1,
@@ -1129,6 +1151,26 @@ test "branch split leaves the promoted separator out of the balance" {
     try testing.expectEqual(@as(usize, 1), sp.right.cells.items.len);
 }
 
+test "leafViewSafe rejects a structurally in-bounds but unsorted slot directory" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var b = LeafBuilder.init(arena_state.allocator());
+    try b.put("b", "1");
+    try b.put("m", "2");
+    var page: [page_size]u8 = undefined;
+    b.encode(&page);
+    try testing.expect(leafViewSafe(&page) != null); // ascending: accepted
+    // Swap the slot-directory entries only: in bounds, but "m" before "b".
+    const slot0 = page[hdr_len .. hdr_len + slot_len][0..slot_len].*;
+    const slot1 = page[hdr_len + slot_len .. hdr_len + 2 * slot_len][0..slot_len].*;
+    @memcpy(page[hdr_len .. hdr_len + slot_len], &slot1);
+    @memcpy(page[hdr_len + slot_len .. hdr_len + 2 * slot_len], &slot0);
+    try testing.expect(leafViewSafe(&page) == null);
+    // A duplicate key is no leaf either.
+    @memcpy(page[hdr_len .. hdr_len + slot_len], &slot0);
+    try testing.expect(leafViewSafe(&page) == null);
+}
+
 test "leafViewSafe rejects an overflow reference of length zero" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1170,4 +1212,86 @@ test "orderKeys is std.mem.order: every length pair to 19, a difference at every
             b[pos] = fill;
         };
     };
+}
+
+test "leafViewSafe rejects a bucket cell whose length is no header and a slot that points into the directory" {
+    var page: [page_size]u8 = undefined;
+    // `bucket_hdr_len` is the one length a bucket cell may carry.
+    const hdr: [bucket_hdr_len]u8 = @splat(0);
+    encodeLeaf(&page, &.{.{ .key = "b", .val = &hdr, .bucket = true }});
+    try testing.expect(leafViewSafe(&page) != null);
+    const o = slotOffset(&page, 0);
+    for ([_]u32{ 5, bucket_hdr_len + 1, 0 }) |len| {
+        var bad = page;
+        std.mem.writeInt(u32, bad[o + 2 .. o + 6][0..4], bucket_flag | len, .little);
+        try testing.expect(leafViewSafe(&bad) == null);
+    }
+    // A cell that starts inside the slot directory (offset 9 of a one-slot
+    // leaf is its second byte) is no cell, however well it fits the page: the
+    // directory's end is the bound, not the header's.
+    encodeLeaf(&page, &.{.{ .key = "k", .val = "v" }});
+    try testing.expect(leafViewSafe(&page) != null);
+    std.mem.writeInt(u16, page[hdr_len .. hdr_len + 2][0..2], hdr_len + 1, .little);
+    try testing.expect(leafViewSafe(&page) == null);
+}
+
+test "the quarter-page underflow line and the overflow-reference key limit are exact" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // header 8 + slot 2 + cell (6 + key + value) = 1024 is NOT under a quarter.
+    const key = "12345678";
+    const val = try a.alloc(u8, page_size / 4 - hdr_len - slot_len - 6 - key.len);
+    @memset(val, 'v');
+    var lb = LeafBuilder.init(a);
+    try lb.put(key, val);
+    try testing.expectEqual(page_size / 4, lb.byteSize());
+    try testing.expect(!lb.underflows());
+    _ = lb.del(key);
+    try lb.put(key, val[1..]);
+    try testing.expect(lb.underflows());
+
+    const sep = try a.alloc(u8, page_size / 4 - hdr_len - slot_len - 6);
+    @memset(sep, 's');
+    var bb = BranchBuilder.init(a, 2);
+    try bb.cells.append(a, .{ .sep = sep, .child = 3 });
+    try testing.expectEqual(page_size / 4, bb.byteSize());
+    try testing.expect(!bb.underflows());
+    bb.cells.items[0].sep = sep[1..];
+    try testing.expect(bb.underflows());
+
+    // A key whose cell with a 4-byte reference exactly fills an empty leaf.
+    const klen = page_size - hdr_len - slot_len - 6 - ovf_ref_len;
+    try testing.expect(fitsOverflowRef(klen));
+    try testing.expect(!fitsOverflowRef(klen + 1));
+}
+
+test "an overflow value of 2^30 bytes or more is not a bucket: the length's second bit is only a flag on inline cells" {
+    var page: [page_size]u8 = undefined;
+    const ref = [_]u8{ 7, 0, 0, 0 };
+    const len: u32 = bucket_flag | 1; // 0x4000_0001, a legal overflow length
+    encodeLeaf(&page, &.{.{ .key = "k", .val = &ref, .ovf_len = len }});
+    const leaf = leafViewSafe(&page).?;
+    try testing.expect(!leaf.isBucket(0));
+    try testing.expectEqual(@as(?u32, len), leaf.ovfLen(0));
+    try testing.expectEqual(@as(usize, ovf_ref_len), leaf.valAt(0).len);
+    const e = leaf.entryAt(0);
+    try testing.expect(!e.bucket);
+    try testing.expectEqual(@as(?u32, len), e.ovf_len);
+    try testing.expectEqualSlices(u8, &ref, e.val);
+}
+
+test "binarySearch: the prefetch of the probes it never makes cannot fault, whatever the slots there say" {
+    var page: [page_size]u8 = undefined;
+    encodeLeaf(&page, &.{
+        .{ .key = "a", .val = "1" }, .{ .key = "b", .val = "2" }, .{ .key = "c", .val = "3" },
+        .{ .key = "d", .val = "4" }, .{ .key = "e", .val = "5" },
+    });
+    // The first probe is slot 2; slots 1 and 4 are the middles of its two
+    // halves, which a search for "c" never reads. A slot that points past the
+    // page there must not be followed by the prefetch.
+    for ([_]usize{ 1, 4 }) |i| std.mem.writeInt(u16, page[hdr_len + i * slot_len ..][0..2], 0xFFFF, .little);
+    const s = Leaf.init(&page).search("c");
+    try testing.expect(s.found);
+    try testing.expectEqual(@as(u16, 2), s.index);
 }

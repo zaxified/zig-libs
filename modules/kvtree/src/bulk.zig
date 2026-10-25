@@ -324,3 +324,20 @@ test "a key not above the one before it is Corrupt: a copy does not carry a tree
     try std.testing.expectError(error.Corrupt, l.add("a", "2"));
     try l.add("c", "3");
 }
+
+test "a bucket not above the key before it is Corrupt too, and a plain key not above a bucket" {
+    var sim = kv.SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    const s = sim.storage();
+    const h = try s.open("b", .create_truncate);
+    defer s.close(h);
+    var pager = Pager.init(s, h, 0);
+    var l = Loader.init(std.testing.allocator, &pager);
+    defer l.deinit();
+    const hdr: format.BucketHdr = .{ .root = 2, .seq = 0 };
+    try l.addBucket("b", hdr);
+    try std.testing.expectError(error.Corrupt, l.addBucket("b", hdr));
+    try std.testing.expectError(error.Corrupt, l.addBucket("a", hdr));
+    try std.testing.expectError(error.Corrupt, l.add("b", "1"));
+    try l.addBucket("c", hdr);
+}

@@ -39,12 +39,15 @@ const kv = @import("kv");
 // Production: FsStorage over a real directory (std.Io).
 var threaded = std.Io.Threaded.init(gpa, .{});
 defer threaded.deinit();
-var fs_store = kv.FsStorage.init(threaded.io(), dir); // dir: std.Io.Dir
+var fs_store = kv.FsStorage.initMmap(threaded.io(), dir); // dir: std.Io.Dir; mmap reads (Linux)
 var db = try kv.Db.open(gpa, fs_store.storage(), "app.kv", .{});
 defer db.close();
 
 try db.put("key", "value");        // durable (fsync'd) when this returns (default policy)
 const v = try db.get(gpa, "key");  // ?[]u8, caller frees; error.Corrupt never serves bad bytes
+// `FsStorage.initMmap` reads values out of a mapping of the log, no syscall per
+// get (0.14x rosedb's get); `FsStorage.init` preads instead. Same files, same
+// durability -- writes go through pwrite either way.
 
 // Allocation-free read into a reused buffer (same locking + CRC check):
 var buf: [4096]u8 = undefined;

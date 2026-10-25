@@ -31,9 +31,20 @@
 //!                 rebuild the in-memory index, both sides
 //!   map_baseline  std.StringHashMap get vs Go map get over the same keys:
 //!                 a baseline of the language runtimes, INFO ONLY
-//! Storage shape: both read values back from their log files with a pread per
-//! get (`kv.FsStorage`; rosedb's WAL, no block cache), and both CRC-check
-//! what they read (ours `read_verify`, the default).
+//! Storage shape: ours reads values back from the log through mmap
+//! (`kv.FsStorage.initMmap`, since 2026-10-25; until then a pread per get, 3
+//! per get with `read_verify` -- get_hit 0.92x rosedb then, 0.14x now), rosedb
+//! with a pread per get (its WAL, no block cache); both CRC-check what they
+//! read (ours `read_verify`, the default).
+//!
+//! The rest of the field, Bitcask-model stores (keys in RAM, values in the
+//! log -- the owner's definition, 2026-10-25), is timed the same way for the
+//! card's `fastest` figure: prologic/bitcask v1.0.2 (`tools/bitcask_bench`,
+//! mmap reads of sealed files) and nutsdb v1.1.0 in `HintKeyAndRAMIdxMode`
+//! (`tools/nutsdb_bench`). Fastest = ours / min(rosedb, bitcask, nutsdb) per
+//! row, worst over the timed rows. Their sources were swept before the first
+//! build (cgo, unsafe, exec, net, init; recorded in SPEC.md § Performance).
+//! `BENCH_FIELD=0` skips them.
 //! Result count = hits + value bytes read (gets, scan), puts + value bytes
 //! written (write rows), keys indexed (open). Each side times the same way
 //! (double the batch until it takes over 100 ms, best of five); the sides
@@ -49,6 +60,12 @@ const fastmem = @import("fastmem");
 const bench_name = "bench-kv";
 const work_dir = ".zig-cache/bench-kv";
 const go_dir = "modules/kv/tools/go_bench";
+/// The rest of the field (Bitcask model, owner 2026-10-25): sides timed like
+/// the reference, for the card's `fastest` ratio. `BENCH_FIELD=0` skips them.
+const field = [_]struct { short: []const u8, dir: []const u8, card: []const u8 }{
+    .{ .short = "bitcask", .dir = "modules/kv/tools/bitcask_bench", .card = "prologic/bitcask v1.0.2" },
+    .{ .short = "nutsdb", .dir = "modules/kv/tools/nutsdb_bench", .card = "nutsdb v1.1.0" },
+};
 const ref_short = "rosedb";
 const ref_card = "github.com/rosedblabs/rosedb/v2 v2.4.0";
 
@@ -216,7 +233,7 @@ fn oursRow(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, d: *const Data
     dir.deleteFile(io, file) catch {};
     dir.deleteFile(io, lock) catch {};
     const fs = try arena.create(kv.FsStorage);
-    fs.* = kv.FsStorage.init(io, dir);
+    fs.* = kv.FsStorage.initMmap(io, dir);
     const options: kv.Options = .{ .sync = .none };
     var l: Live = .{ .d = d, .db = try kv.Db.open(gpa, fs.storage(), file, options), .store = fs.storage(), .file = file, .options = options };
     try preload(&l);
@@ -250,10 +267,19 @@ pub fn main(init: std.process.Init) !u8 {
     _ = .{fastmem};
 
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_field = if (init.environ_map.get("BENCH_FIELD")) |v| !std.mem.eql(u8, v, "0") else true;
+    var field_exe: [field.len][]const u8 = undefined;
+    if (use_field) for (field, &field_exe) |f, *e| {
+        // `goBuild` names its binary `<abs>/go_bench`: one directory each.
+        const sub = try std.fmt.allocPrint(arena, "{s}/{s}", .{ work_dir, f.short });
+        try cwd.createDirPath(io, sub);
+        e.* = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = f.dir, .abs = try cwd.realPathFileAlloc(io, sub, arena) });
+    };
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<22} {s:>11} {s:>11} {s:>8} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "gross", "net", "spr us", "spr ref" });
+    if (use_field) try w.print("{s:<22} {s:>11} {s:>11} {s:>8}  vs fastest (who)\n", .{ "", field[0].short ++ " ns", field[1].short ++ " ns", "ours/best" });
     try w.flush();
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
@@ -261,16 +287,23 @@ pub fn main(init: std.process.Init) !u8 {
     var mismatch = false;
     var base_ours: f64 = 0;
     var base_ref: f64 = 0;
+    var worst_fast: f64 = 0;
+    var worst_fast_row: []const u8 = "";
     for (names, 0..) |name, wi| {
         if (filters.len > 0) {
             var hit = false;
             for (filters) |f| hit = hit or std.mem.find(u8, name, f) != null;
             if (!hit) continue;
         }
+        const info_row = for (info_only) |n| {
+            if (std.mem.eql(u8, n, name)) break true;
+        } else false;
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var others: [field.len]bench.Side = @splat(.{});
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (use_field and !info_row) for (field_exe, &others) |e, *o| o.add(try bench.foreign(arena, io, bench_name, e, abs, name, null));
             ours.add(try oursRow(arena, io, dir, &d, wi));
         }
         const gross = ours.best_ns / go.best_ns;
@@ -286,17 +319,35 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         const ratio = if (net_base != null and !std.math.isNan(net)) net else gross;
-        const info = for (info_only) |n| {
-            if (std.mem.eql(u8, n, name)) break true;
-        } else false;
+        const info = info_row;
         if (!info) {
             worst = @max(worst, ratio);
             best = @min(best, ratio);
         }
         max_spread = @max(max_spread, @max(ours.spread(false), go.spread(false)));
-        const same = ours.count == go.count;
+        var same = ours.count == go.count;
+        if (use_field and !info) for (others) |o| {
+            same = same and o.count == ours.count;
+        };
         mismatch = mismatch or !same;
-        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ a foreign side's count" });
+        if (use_field and !info) {
+            var fastest_ns = go.best_ns;
+            var who: []const u8 = ref_short;
+            for (field, others) |f, o| {
+                max_spread = @max(max_spread, o.spread(false));
+                if (o.best_ns < fastest_ns) {
+                    fastest_ns = o.best_ns;
+                    who = f.short;
+                }
+            }
+            const ratio_fast = ours.best_ns / fastest_ns;
+            if (ratio_fast > worst_fast) {
+                worst_fast = ratio_fast;
+                worst_fast_row = name;
+            }
+            try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3}  ({s})\n", .{ "", others[0].best_ns, others[1].best_ns, ratio_fast, who });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -306,8 +357,13 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_field) try w.print("worst vs fastest = {d:.2} (row {s})\n", .{ worst_fast, worst_fast_row });
+    if (filters.len == 0) {
+        if (use_field)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} / {s} / rosedb ({s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, field[0].card, field[1].card, worst_fast_row })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
 }
