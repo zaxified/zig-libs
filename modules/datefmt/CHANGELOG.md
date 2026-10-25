@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Fix (consumer-visible for dates before 0000-03-01 and at the integer edges):** the civil core was one day off for every date before 0000-03-01 (Hinnant's truncating-division era adjustment applied under `@divFloor`; `0000-01-01` round-tripped to `0000-01-02`), which reached `partsToUnix`/`unixToParts`, `addDays`, `isoWeek`, weekday tokens and `toUtc`. Fixed; also `addYears`/`addMonths`/`addDays`/`diffInMonths`/`epochDayToYmd` saturate instead of trapping at the integer edges, an out-of-month day (`{3, 0}`) extrapolates instead of trapping, `nthWeekdayOfMonth` returns null for |n| > 5. **Behaviour change:** `endOfDay`/`endOfMonth`/`endOfYear` now carry `.nanosecond = 999_999_999` (was 0, which put the end before a fractional input). Grade 1: model fuzz against the Fliegel–Van Flandern JDN formula (`DATEFMT_FUZZ`), fresh audit, the field measured (`tools/rust_fast_bench`: httpdate, humantime, chrono, jiff), grammar lead pinned in `src/lead_test.zig`.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **Fix:** `unixToParts` (and so `unixNsToParts`, `toUtc`) no longer traps/UB on extreme `i64` instants: the seconds-of-day product `day * 86400` overflowed for `minInt(i64)`, and the year `@intCast` to `i32` overflowed for any instant beyond ~±6.7e16 s; the year now saturates at the `i32` range. In-range results are unchanged (S7 audit).

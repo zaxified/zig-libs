@@ -47,6 +47,19 @@
 //! six rows. Each side times the same way (double the batch until it takes over
 //! 100 ms, best of five); the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. Arguments filter workloads.
+//!
+//! Then the fastest in the field (`BENCH_FAST=0` skips it): the Rust caches of
+//! `tools/rust_fast_bench` -- quick_cache 0.6.24 and moka 0.12.16 (a Caffeine
+//! port), pinned by its Cargo.lock, built offline -- on the same six rows, ours
+//! re-timed beside each. Their values are `Arc<[u8]>`, so a hit is a refcount
+//! bump where ours copies 64 bytes out (in their favour, not corrected for). A
+//! row's ratio is ours / its fastest contender among otter (the reference row
+//! above), quick_cache and moka; the verdict is the worst row. quick_cache
+//! shards its 10 000-entry cap and evicts a few of the 8 000 preloaded keys of
+//! the get rows on its own (about six), so its counts there may differ from
+//! ours by under 0.1 %; that is printed and allowed, a larger difference
+//! fails. Needs cargo and the crates in the registry (`cargo fetch
+//! --manifest-path modules/ramcache/tools/rust_fast_bench/Cargo.toml`).
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -364,8 +377,99 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (filters.len > 0 or !use_fast) {
+        if (filters.len == 0)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: the Rust caches on the same rows ----
+    try w.flush();
+    try rustBuild(arena, io, init.environ_map);
+    try w.print("\nfastest in the field -- {d} rounds, ours re-timed beside each contender\n", .{rounds});
+    try w.print("{s:<14} {s:<12} {s:>10} {s:>10} {s:>8}  count\n", .{ "workload", "contender", "its ns/op", "ours ns/op", "ours/it" });
+    var worst_fast: f64 = 0;
+    var worst_row: []const u8 = "";
+    var worst_who: []const u8 = "";
+    for (names[0 .. names.len - 1], 0..) |name, wi| { // not map_baseline
+        // otter is the first contender: the reference rows above, re-timed here
+        // beside ours like the others.
+        var row_ratio: f64 = 0;
+        var row_who: []const u8 = "";
+        for (fast) |who| {
+            // quick_cache has no TTL: no ttl_get_hit row (its program prints `n/a`).
+            if (std.mem.eql(u8, who, "quick_cache") and std.mem.eql(u8, name, "ttl_get_hit")) {
+                try w.print("{s:<14} {s:<12} {s:>10}\n", .{ name, who, "n/a" });
+                continue;
+            }
+            var ours: bench.Side = .{};
+            var it: bench.Side = .{};
+            for (0..rounds) |_| {
+                it.add(if (std.mem.eql(u8, who, ref_short))
+                    try bench.foreign(arena, io, bench_name, exe, abs, name, null)
+                else
+                    try bench.foreignArgv(arena, io, bench_name, &.{ rust_exe, abs, who, name }, name, null));
+                var r = bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true);
+                r.count += extra(&d, wi);
+                ours.add(r);
+            }
+            const ops: f64 = @floatFromInt(pass_ops[wi]);
+            const r = ours.best_ns / it.best_ns;
+            if (r > row_ratio) {
+                row_ratio = r;
+                row_who = who;
+            }
+            const cmp = for (count_info) |n| {
+                if (std.mem.eql(u8, n, name)) break false;
+            } else true;
+            const diff = @abs(@as(f64, @floatFromInt(it.count)) - @as(f64, @floatFromInt(ours.count)));
+            const near = diff <= @as(f64, @floatFromInt(ours.count)) * 0.001;
+            const exact = it.count == ours.count;
+            const ok = !cmp or exact or (std.mem.eql(u8, who, "quick_cache") and near);
+            mismatch = mismatch or !ok;
+            try w.print("{s:<14} {s:<12} {d:>10.1} {d:>10.1} {d:>8.3}  {d}{s}\n", .{ name, who, it.best_ns / ops, ours.best_ns / ops, r, it.count, if (!cmp) "  (hit total, not compared)" else if (exact) "" else if (ok) "  (quick_cache's own early evictions, < 0.1 %)" else " ≠ ours" });
+            try w.flush();
+        }
+        if (row_ratio > worst_fast) {
+            worst_fast = row_ratio;
+            worst_row = name;
+            worst_who = row_who;
+        }
+    }
+    if (mismatch) {
+        try w.writeAll(bench_name ++ ": FAILED -- a contender's result count differs from ours; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    try w.print("\nworst ours/fastest = {d:.2} ({s} vs {s})\n", .{ worst_fast, worst_row, worst_who });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} ({s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_who, worst_row });
     try w.flush();
     return 0;
+}
+
+/// The field: otter (the Go reference program) and the Rust caches.
+const fast = [_][]const u8{ ref_short, "quick_cache", "moka" };
+const rust_manifest = "modules/ramcache/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+/// Build the Rust side once, offline (the crates are in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
 }

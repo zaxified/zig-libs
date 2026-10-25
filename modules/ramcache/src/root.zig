@@ -206,6 +206,12 @@ pub const Options = struct {
     /// `Cache.climbIfDue`. The step is `int(0.0625 x max_entries)` entries
     /// first, so a cache under ~16 entries never moves its window.
     adaptive_window: bool = false,
+    /// Seed of the one key hash (`Cache.keyFor`) the map, the frequency sketch
+    /// and `Sharded`'s shard choice share. `Sharded` sets it to its own
+    /// per-instance seed (see `Sharded.seed`); a standalone `Cache` keeps this
+    /// fixed default, so its behaviour is reproducible run to run. Until
+    /// 2026-10-25 the map hashed with std's unseeded `hashString`.
+    hash_seed: u64 = 0x2545F4914F6CDD1D,
 };
 
 /// Why `getOrLoad` produced no value. `OutOfMemory` is the allocator failing
@@ -252,7 +258,6 @@ const FrequencySketch = struct {
 
     const depth = 4;
     const words_per_block = 8;
-    const hash_seed: u64 = 0x2545F4914F6CDD1D;
 
     fn init(alloc: std.mem.Allocator, capacity: usize) !FrequencySketch {
         // 8 × capacity counter columns of `depth` counters each (power of
@@ -282,15 +287,23 @@ const FrequencySketch = struct {
         alloc.free(self.doorkeeper);
     }
 
-    /// One pass over the key, the second hash re-mixed from the first
-    /// (splitmix64's finalizer), as Caffeine re-spreads one hash. Was two
-    /// full Wyhash passes.
-    fn hashPair(key: []const u8) [2]u64 {
-        const h0 = std.hash.Wyhash.hash(hash_seed, key);
-        var z = h0 +% 0x9E3779B97F4A7C15;
+    /// Both sketch hashes re-mixed from the key's one hash (`Cache.Key.hash`,
+    /// the map's own), as Caffeine re-spreads one hash: no pass over the key
+    /// bytes here at all. Re-mixed twice rather than used as is, so the
+    /// doorkeeper bit and the block do not reuse the bits that pick the map
+    /// slot and the shard. Until 2026-10-25 the sketch ran its own Wyhash
+    /// pass (and before 2026-10-11 two).
+    fn hashPair(key_hash: u64) [2]u64 {
+        const a = mix64(key_hash);
+        return .{ a, mix64(a) };
+    }
+
+    /// splitmix64's finalizer.
+    fn mix64(x: u64) u64 {
+        var z = x +% 0x9E3779B97F4A7C15;
         z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
         z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
-        return .{ h0, z ^ (z >> 31) };
+        return z ^ (z >> 31);
     }
 
     /// Word index and nibble shift of the key's counter `i` (< depth).
@@ -302,8 +315,8 @@ const FrequencySketch = struct {
     }
 
     /// Record one access of `key`. O(1), allocation-free.
-    fn record(self: *FrequencySketch, key: []const u8) void {
-        const h = hashPair(key);
+    fn record(self: *FrequencySketch, key_hash: u64) void {
+        const h = hashPair(key_hash);
         self.samples += 1;
         const dk_idx: usize = @intCast(h[0] & (self.dk_bits - 1));
         const dk_mask = @as(u64, 1) << @intCast(dk_idx & 63);
@@ -322,8 +335,8 @@ const FrequencySketch = struct {
 
     /// Estimated recent frequency of `key` (never underestimates within the
     /// CMS error bounds; capped at 15 + 1 doorkeeper bit).
-    fn estimate(self: *const FrequencySketch, key: []const u8) u64 {
-        const h = hashPair(key);
+    fn estimate(self: *const FrequencySketch, key_hash: u64) u64 {
+        const h = hashPair(key_hash);
         var min: u64 = 15;
         for (0..depth) |i| {
             const word, const shift = self.slot(h, i);
@@ -382,6 +395,11 @@ pub const Cache = struct {
         /// Length of the trailing key bytes, for `destroyNode` (`key` is
         /// emptied when the node is doomed, the allocation is not).
         key_len: usize,
+        /// The key's hash under `Options.hash_seed` (`Cache.keyFor`), computed
+        /// once when the key arrives: the map, the sketch and (in `Sharded`)
+        /// the shard choice all read it, and a rehash or an admission contest
+        /// never passes over the key bytes again.
+        hash: u64,
         /// The entry's fields. `entry.node` points back here, so code holding
         /// an `*Entry` reaches its links without another lookup.
         entry: Entry,
@@ -483,28 +501,54 @@ pub const Cache = struct {
         node: *Node,
     };
 
-    /// The map hashes and compares a node by its key bytes.
+    /// Key bytes and their hash under this cache's `Options.hash_seed` —
+    /// `Cache.keyFor` makes one. The `*Key` methods take it so a caller that
+    /// already hashed the key (`Sharded`, which picks the shard from the same
+    /// hash) does not pay a second pass over the bytes. A `Key` whose `hash`
+    /// is not `keyFor(bytes).hash` breaks the map's lookups: never build one by
+    /// hand except from that hash.
+    pub const Key = struct {
+        bytes: []const u8,
+        hash: u64,
+    };
+
+    /// The `Key` of `bytes` for this cache: one Wyhash pass under
+    /// `Options.hash_seed`.
+    pub fn keyFor(self: *const Cache, bytes: []const u8) Key {
+        return .{ .bytes = bytes, .hash = std.hash.Wyhash.hash(self.options.hash_seed, bytes) };
+    }
+
+    fn keyOf(n: *const Node) Key {
+        return .{ .bytes = n.key, .hash = n.hash };
+    }
+
+    /// The map hashes a node by its stored hash and compares its key bytes.
     const NodeContext = struct {
         pub fn hash(_: NodeContext, n: *Node) u64 {
-            return std.hash_map.hashString(n.key);
+            return n.hash;
         }
         pub fn eql(_: NodeContext, a: *Node, b: *Node) bool {
             return std.mem.eql(u8, a.key, b.key);
         }
     };
 
-    /// Looks a node up by a caller's key bytes.
+    /// Looks a node up by a caller's `Key`.
     const KeyAdapter = struct {
-        pub fn hash(_: KeyAdapter, k: []const u8) u64 {
-            return std.hash_map.hashString(k);
+        pub fn hash(_: KeyAdapter, k: Key) u64 {
+            return k.hash;
         }
-        pub fn eql(_: KeyAdapter, k: []const u8, n: *Node) bool {
-            return std.mem.eql(u8, k, n.key);
+        pub fn eql(_: KeyAdapter, k: Key, n: *Node) bool {
+            return std.mem.eql(u8, k.bytes, n.key);
         }
     };
 
     alloc: std.mem.Allocator,
-    map: std.HashMapUnmanaged(*Node, void, NodeContext, std.hash_map.default_max_load_percentage) = .empty,
+    /// Kept at most half full (std's default is 80 %): a miss probes until a
+    /// free slot, and at 80 % those runs were the part of a miss that was
+    /// ours to cut -- get_miss 37.1 → 34.2 ns, put_evict 258 → 197 ns,
+    /// zipf_mixed 145 → 131 ns (`bench-ramcache`, 2026-10-25), for ~7 bytes
+    /// more per entry (a slot is a pointer plus a metadata byte).
+    map: std.HashMapUnmanaged(*Node, void, NodeContext, 50) = .empty,
     bytes: usize = 0,
     options: Options,
     stats: Stats = .{},
@@ -616,8 +660,13 @@ pub const Cache = struct {
     /// The returned slice borrows the cache's storage: valid until this key is
     /// replaced, evicted, or the cache is cleared.
     pub fn get(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?[]const u8 {
+        return self.getKey(self.keyFor(key), now_ns, cur_gen);
+    }
+
+    /// `get` for a key already hashed (`keyFor`).
+    pub fn getKey(self: *Cache, k: Key, now_ns: i64, cur_gen: u64) ?[]const u8 {
         self.climbIfDue();
-        const e = self.lookupFilled(key) orelse {
+        const e = self.lookupFilled(k) orelse {
             self.stats.misses += 1;
             self.noteOutcome(false);
             return null;
@@ -628,10 +677,10 @@ pub const Cache = struct {
             self.stats.expired += 1;
             self.stats.misses += 1;
             self.noteOutcome(false);
-            _ = self.dropKey(key);
+            _ = self.dropKey(k);
             return null;
         }
-        self.noteAccess(key);
+        self.noteAccess(k.hash);
         self.noteOutcome(true);
         self.touchIdle(e, now_ns);
         // A borrowed node is out of the queues entirely (Node.pins), so it
@@ -661,8 +710,14 @@ pub const Cache = struct {
     /// are always evicted first). Silently no-ops on OOM (a cache miss is
     /// never fatal).
     pub fn put(self: *Cache, key: []const u8, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
-        self.noteAccess(key);
-        if (self.entryOf(key)) |e| replace: {
+        self.putKey(self.keyFor(key), value, now_ns, ttl_ns, gen);
+    }
+
+    /// `put` for a key already hashed (`keyFor`).
+    pub fn putKey(self: *Cache, k: Key, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
+        const key = k.bytes;
+        self.noteAccess(k.hash);
+        if (self.entryOf(k)) |e| replace: {
             if (value.len > self.options.max_bytes) {
                 // Same single-item ceiling a fresh insert enforces below. It
                 // has to be checked HERE too: without it an update-only
@@ -677,7 +732,7 @@ pub const Cache = struct {
                 // key simply becomes absent, so the next `get` misses and the
                 // caller refetches. Reason is `.evicted`, not `.replaced` —
                 // nothing took the entry's place.
-                _ = self.dropKey(key);
+                _ = self.dropKey(k);
                 return;
             }
             if (e.node.pins > 0) {
@@ -688,7 +743,7 @@ pub const Cache = struct {
                 // So do neither: park the old value with its borrower (it
                 // leaves the map immediately, so it can never be served again)
                 // and fall through to insert the new value as a fresh entry.
-                self.doomEntry(key, .replaced);
+                self.doomEntry(k, .replaced);
                 break :replace;
             }
             // replace value in place, keep the stored key.
@@ -701,7 +756,7 @@ pub const Cache = struct {
             // would then be pre-write bytes served as a hit, forever. Absent
             // is a miss; stale is corruption. Drop the key instead.
             const vdup = self.alloc.dupe(u8, value) catch {
-                _ = self.dropKey(key);
+                _ = self.dropKey(k);
                 return;
             };
             self.fireOnEvict(e.node, key, e.value, e.dirty, .replaced);
@@ -734,7 +789,7 @@ pub const Cache = struct {
         }
         if (value.len > self.options.max_bytes) return; // never cache an item larger than the whole cache
         const vdup = self.alloc.dupe(u8, value) catch return;
-        const node = self.createNode(key) orelse {
+        const node = self.createNode(k) orelse {
             self.alloc.free(vdup);
             return;
         };
@@ -803,9 +858,10 @@ pub const Cache = struct {
         gen: u64,
         loader: Loader,
     ) LoadError![]u8 {
-        if (self.get(key, now_ns, cur_gen)) |v| return gpa.dupe(u8, v);
+        const k = self.keyFor(key);
+        if (self.getKey(k, now_ns, cur_gen)) |v| return gpa.dupe(u8, v);
         const loaded = try loader.load(loader.ctx, gpa, key);
-        self.put(key, loaded, now_ns, ttl_ns, gen);
+        self.putKey(k, loaded, now_ns, ttl_ns, gen);
         return loaded;
     }
 
@@ -856,7 +912,7 @@ pub const Cache = struct {
     /// `true` and still makes it immediately unfindable; the value bytes are
     /// handed to the borrower and freed by the last `release` instead of here.
     pub fn remove(self: *Cache, key: []const u8) bool {
-        return self.dropKey(key);
+        return self.dropKey(self.keyFor(key));
     }
 
     /// Remove every resident entry whose key starts with `prefix`; returns how
@@ -882,7 +938,7 @@ pub const Cache = struct {
     /// scans.
     pub fn removeMatching(self: *Cache, prefix: []const u8) usize {
         var removed: usize = 0;
-        var batch: [remove_batch][]const u8 = undefined;
+        var batch: [remove_batch]Key = undefined;
         while (true) {
             var n: usize = 0;
             var it = self.map.keyIterator();
@@ -890,7 +946,7 @@ pub const Cache = struct {
                 const k = np.*.key;
                 if (k.len < prefix.len) continue;
                 if (!std.mem.eql(u8, k[0..prefix.len], prefix)) continue;
-                batch[n] = k;
+                batch[n] = keyOf(np.*);
                 n += 1;
                 if (n == batch.len) break;
             }
@@ -954,8 +1010,9 @@ pub const Cache = struct {
     /// has no region membership to move. It does refresh the entry's tick, so
     /// `release` re-files it as recently used.
     pub fn pin(self: *Cache, key: []const u8, now_ns: i64, cur_gen: u64) ?Borrow {
+        const k = self.keyFor(key);
         self.climbIfDue();
-        const e = self.lookupFilled(key) orelse {
+        const e = self.lookupFilled(k) orelse {
             self.stats.misses += 1;
             self.noteOutcome(false);
             return null;
@@ -966,7 +1023,7 @@ pub const Cache = struct {
             self.stats.expired += 1;
             self.stats.misses += 1;
             self.noteOutcome(false);
-            _ = self.dropKey(key);
+            _ = self.dropKey(k);
             return null;
         }
         const value = e.value;
@@ -975,7 +1032,7 @@ pub const Cache = struct {
             self.noteOutcome(false);
             return null;
         }
-        self.noteAccess(key);
+        self.noteAccess(k.hash);
         self.noteOutcome(true);
         // The node just left the expiry heap (`pinEntry`), so only the stamp
         // moves; `release` files it again under the deadline this implies.
@@ -1009,7 +1066,8 @@ pub const Cache = struct {
     /// would be an invisible loss: the caller is told to use the copying path
     /// and has no way to learn that its previous value went with the refusal.
     pub fn reserve(self: *Cache, key: []const u8, len: usize, now_ns: i64, ttl_ns: i64, gen: u64) ?Fill {
-        self.noteAccess(key);
+        const k = self.keyFor(key);
+        self.noteAccess(k.hash);
         if (len > self.options.max_bytes) return null;
         // Every fallible step runs FIRST, before anything is mutated: the
         // parking slot, the map slot, and the three allocations. That is what
@@ -1021,15 +1079,15 @@ pub const Cache = struct {
         self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return null;
         self.map.ensureUnusedCapacity(self.alloc, 1) catch return null;
         const vbuf = self.alloc.alloc(u8, len) catch return null;
-        const node = self.createNode(key) orelse {
+        const node = self.createNode(k) orelse {
             self.alloc.free(vbuf);
             return null;
         };
         // Nothing below this line can fail.
-        if (self.entryOf(key)) |e| {
+        if (self.entryOf(k)) |e| {
             // Same reasoning as `put`: an existing entry is either freed or,
             // if borrowed, parked — never left findable with old bytes.
-            if (e.node.pins > 0) self.doomEntry(key, .replaced) else _ = self.dropKeyReason(key, .replaced);
+            if (e.node.pins > 0) self.doomEntry(k, .replaced) else _ = self.dropKeyReason(k, .replaced);
         }
         // Born borrowed, so out of the queue until `release` appends it.
         node.pins = 1;
@@ -1109,11 +1167,11 @@ pub const Cache = struct {
             // the single-owner path below fires none. (`parkNode` empties
             // `n.key`, but the bytes live in the node, which outlives the
             // call, so the slice passed here stays readable throughout.)
-            self.doomEntry(n.key, null);
+            self.doomEntry(keyOf(n), null);
             self.release(.{ .bytes = f.bytes, .node = n });
             return;
         }
-        const removed = self.map.removeAdapted(n.key, KeyAdapter{});
+        const removed = self.map.removeAdapted(keyOf(n), KeyAdapter{});
         std.debug.assert(removed);
         self.removals +|= 1;
         switch (n.region) {
@@ -1147,7 +1205,7 @@ pub const Cache = struct {
             self.syncStats();
             return;
         }
-        if (builtin.mode == .debug) std.debug.assert(self.entryOf(n.key).?.node == n);
+        if (builtin.mode == .debug) std.debug.assert(self.entryOf(keyOf(n)).?.node == n);
         // Back in at the tail: the borrow was a use, so the entry is the
         // region's most recent one (Caffeine has no borrows; this is the
         // order its read of the same entry would leave).
@@ -1165,7 +1223,7 @@ pub const Cache = struct {
     /// map entry", never "nobody is reading anything for this key";
     /// `Stats.pinned` is the count that still includes doomed entries.
     pub fn isPinned(self: *Cache, key: []const u8) bool {
-        const e = self.entryOf(key) orelse return false;
+        const e = self.entryOf(self.keyFor(key)) orelse return false;
         return e.node.pins > 0;
     }
 
@@ -1176,9 +1234,13 @@ pub const Cache = struct {
     /// sketch, or TTL/generation freshness — a diagnostic for a write-behind
     /// coordinator, not a substitute for `get`. `false` for an absent key
     /// (indistinguishable here from "clean"; use `get` if that distinction
-    /// matters).
+    /// matters), and for an uncommitted reservation, which is a miss here as
+    /// for `get`, `pin` and `drainDirty` (until 2026-10-25 the three dirty
+    /// calls reached it: a flusher's ack of the value a `reserve` was about
+    /// to replace marked the replacement clean, so it was never written
+    /// behind, and `markCleanIf` compared uninitialized bytes).
     pub fn isDirty(self: *Cache, key: []const u8) bool {
-        const e = self.entryOf(key) orelse return false;
+        const e = self.lookupFilled(self.keyFor(key)) orelse return false;
         return e.dirty;
     }
 
@@ -1189,7 +1251,7 @@ pub const Cache = struct {
     /// that race. Side-effect-free otherwise (no stats/promotion/sketch
     /// touch).
     pub fn markClean(self: *Cache, key: []const u8) bool {
-        const e = self.entryOf(key) orelse return false;
+        const e = self.lookupFilled(self.keyFor(key)) orelse return false;
         e.dirty = false;
         return true;
     }
@@ -1201,7 +1263,7 @@ pub const Cache = struct {
     /// hit, refresh recency, feed the sketch and lazily drop a stale entry.
     /// `false` if `key` is absent or its value differs.
     pub fn markCleanIf(self: *Cache, key: []const u8, flushed: []const u8) bool {
-        const e = self.entryOf(key) orelse return false;
+        const e = self.lookupFilled(self.keyFor(key)) orelse return false;
         if (!std.mem.eql(u8, e.value, flushed)) return false;
         e.dirty = false;
         return true;
@@ -1228,25 +1290,25 @@ pub const Cache = struct {
 
     /// The entry for `key` if it holds a value -- a reservation that has not
     /// been `commit`ted yet does not (see `reserve`), and reads as a miss.
-    fn lookupFilled(self: *Cache, key: []const u8) ?*Entry {
-        const n = self.map.getKeyAdapted(key, KeyAdapter{}) orelse return null;
+    fn lookupFilled(self: *Cache, k: Key) ?*Entry {
+        const n = self.map.getKeyAdapted(k, KeyAdapter{}) orelse return null;
         return if (n.filled) &n.entry else null;
     }
 
     /// The map entry for `key`, filled or not.
-    fn entryOf(self: *Cache, key: []const u8) ?*Entry {
-        const n = self.map.getKeyAdapted(key, KeyAdapter{}) orelse return null;
+    fn entryOf(self: *Cache, k: Key) ?*Entry {
+        const n = self.map.getKeyAdapted(k, KeyAdapter{}) orelse return null;
         return &n.entry;
     }
 
     /// One allocation: the node, then `key`'s bytes. `entry` is left for the
     /// caller to fill before the node is published in the map.
-    fn createNode(self: *Cache, key: []const u8) ?*Node {
-        const mem = self.alloc.alignedAlloc(u8, .of(Node), @sizeOf(Node) + key.len) catch return null;
+    fn createNode(self: *Cache, k: Key) ?*Node {
+        const mem = self.alloc.alignedAlloc(u8, .of(Node), @sizeOf(Node) + k.bytes.len) catch return null;
         const n: *Node = @ptrCast(mem.ptr);
         const kbytes = mem[@sizeOf(Node)..];
-        @memcpy(kbytes, key);
-        n.* = .{ .key = kbytes, .key_len = key.len, .entry = undefined, .tick = 0 };
+        @memcpy(kbytes, k.bytes);
+        n.* = .{ .key = kbytes, .key_len = k.bytes.len, .hash = k.hash, .entry = undefined, .tick = 0 };
         return n;
     }
 
@@ -1274,9 +1336,10 @@ pub const Cache = struct {
         return main * 4 / 5;
     }
 
-    /// Lazily create the frequency sketch, then record one access of `key`.
-    /// On sketch OOM the cache degrades to plain LRU (gate always admits).
-    fn noteAccess(self: *Cache, key: []const u8) void {
+    /// Lazily create the frequency sketch, then record one access of the key
+    /// whose hash is `key_hash`. On sketch OOM the cache degrades to plain
+    /// LRU (gate always admits).
+    fn noteAccess(self: *Cache, key_hash: u64) void {
         if (self.sketch == null and !self.sketch_failed) {
             if (FrequencySketch.init(self.alloc, self.options.max_entries)) |s| {
                 self.sketch = s;
@@ -1284,26 +1347,26 @@ pub const Cache = struct {
                 self.sketch_failed = true;
             }
         }
-        if (self.sketch) |*s| s.record(key);
+        if (self.sketch) |*s| s.record(key_hash);
     }
 
     /// Returns `true` if `key` was present and removed, `false` if it was
     /// already absent — so callers that need to know (`remove`) and callers
     /// that don't (lazy TTL/generation drop, `evictStep`) share one path.
-    fn dropKey(self: *Cache, key: []const u8) bool {
-        return self.dropKeyReason(key, .evicted);
+    fn dropKey(self: *Cache, k: Key) bool {
+        return self.dropKeyReason(k, .evicted);
     }
 
-    fn dropKeyReason(self: *Cache, key: []const u8, reason: EvictReason) bool {
-        if (self.entryOf(key)) |e| {
+    fn dropKeyReason(self: *Cache, k: Key, reason: EvictReason) bool {
+        if (self.entryOf(k)) |e| {
             if (e.node.pins > 0) {
                 // Borrowed: unlink it (no stale hit can follow) but leave the
                 // bytes alive for the borrower — see `doomEntry`.
-                self.doomEntry(key, reason);
+                self.doomEntry(k, reason);
                 return true;
             }
         }
-        const found = if (self.map.fetchRemoveAdapted(key, KeyAdapter{})) |kv| blk: {
+        const found = if (self.map.fetchRemoveAdapted(k, KeyAdapter{})) |kv| blk: {
             const n = kv.key;
             self.removals +|= 1;
             self.lruRemove(n.region, n);
@@ -1351,8 +1414,8 @@ pub const Cache = struct {
     /// gone for lookup purposes the instant this returns — a doomed page can
     /// never be served again — while the outstanding borrow keeps reading the
     /// snapshot it was given.
-    fn doomEntry(self: *Cache, key: []const u8, reason: ?EvictReason) void {
-        const n = self.map.fetchRemoveAdapted(key, KeyAdapter{}).?.key;
+    fn doomEntry(self: *Cache, k: Key, reason: ?EvictReason) void {
+        const n = self.map.fetchRemoveAdapted(k, KeyAdapter{}).?.key;
         self.removals +|= 1;
         std.debug.assert(n.pins > 0);
         // A `null` reason means "unlink it, but tell nobody" — `discard`'s
@@ -1537,8 +1600,8 @@ pub const Cache = struct {
     /// (`now - last access > idle_ttl_ns`). Strict `>` on both, so an entry is
     /// still fresh at exactly its TTL, matching the heap's `now > deadline`.
     fn timeExpired(self: *const Cache, e: *const Entry, now_ns: i64) bool {
-        if (e.ttl_ns > 0 and (now_ns - e.inserted_ns) > e.ttl_ns) return true;
-        return self.options.idle_ttl_ns > 0 and (now_ns - e.last_access_ns) > self.options.idle_ttl_ns;
+        if (e.ttl_ns > 0 and (now_ns -| e.inserted_ns) > e.ttl_ns) return true;
+        return self.options.idle_ttl_ns > 0 and (now_ns -| e.last_access_ns) > self.options.idle_ttl_ns;
     }
 
     /// A hit at `now_ns`: refresh the idle stamp and, when idle expiry is on,
@@ -1573,8 +1636,8 @@ pub const Cache = struct {
 
     /// Key of the least-recently-used entry within `region`, or null.
     /// O(1): the queue head. Was a full-map scan.
-    fn regionLruKey(self: *Cache, region: Region) ?[]const u8 {
-        return (self.regionLru(region) orelse return null).key;
+    fn regionLruKey(self: *Cache, region: Region) ?Key {
+        return keyOf(self.regionLru(region) orelse return null);
     }
 
     /// The node behind `regionLruKey`, for moves that need no map entry.
@@ -1588,12 +1651,12 @@ pub const Cache = struct {
     /// evicted before any frequency logic runs). O(1): the expiry heap's root
     /// is the soonest deadline, so if it has not passed, none has. Was a
     /// full-map scan on every single insert, TTLs in use or not.
-    fn findExpiredKey(self: *Cache, now_ns: i64) ?[]const u8 {
+    fn findExpiredKey(self: *Cache, now_ns: i64) ?Key {
         if (self.exp.items.len == 0) return null;
         self.maintenance_visits += 1;
         const first = self.exp.items[0];
         // Same predicate as the scan it replaces: `(now - inserted) > ttl`.
-        return if (now_ns > first.deadline) first.key else null;
+        return if (now_ns > first.deadline) keyOf(first) else null;
     }
 
     /// Restore all W-TinyLFU invariants after an insert: global entry/byte
@@ -1751,10 +1814,10 @@ pub const Cache = struct {
     /// deterministic ~1/128 coin so a rotating population cannot stall
     /// forever; cold candidates (one-hit wonders) are always rejected, which
     /// is what makes the cache scan-resistant.
-    fn admit(self: *Cache, cand: []const u8, victim: []const u8) bool {
+    fn admit(self: *Cache, cand: Key, victim: Key) bool {
         const s = if (self.sketch) |*sk| sk else return true; // no sketch → plain LRU
-        const cf = s.estimate(cand);
-        const vf = s.estimate(victim);
+        const cf = s.estimate(cand.hash);
+        const vf = s.estimate(victim.hash);
         if (cf > vf) return true;
         if (cf >= 6) {
             self.prng = self.prng *% 6364136223846793005 +% 1442695040888963407;
@@ -1838,6 +1901,7 @@ pub const Cache = struct {
 // file's tests into the test binary.
 test {
     _ = @import("sharded.zig");
+    _ = @import("audit_test.zig");
 }
 
 const testing = std.testing;
@@ -1989,9 +2053,9 @@ test "eviction takes an expired entry before the LRU one" {
     // CONTROL: check residency directly, BEFORE any `get`. `get("exp", 100, …)`
     // returns null for an expired entry whether or not it was evicted (it drops
     // it lazily), so a `get`-based assertion alone cannot fail here.
-    try testing.expect(!c.map.containsAdapted("exp", Cache.KeyAdapter{})); // physically gone, not just stale
-    try testing.expect(c.map.containsAdapted("lru", Cache.KeyAdapter{}));
-    try testing.expect(c.map.containsAdapted("new", Cache.KeyAdapter{}));
+    try testing.expect(!(c.entryOf(c.keyFor("exp")) != null)); // physically gone, not just stale
+    try testing.expect((c.entryOf(c.keyFor("lru")) != null));
+    try testing.expect((c.entryOf(c.keyFor("new")) != null));
     // CONTROL: it left via the expired-first branch, not the frequency contest.
     // Without this the test passes even with expired-first removed: "exp" is
     // also the window-LRU candidate and loses the admission gate anyway, so the
@@ -2269,12 +2333,126 @@ const SeamHarness = struct {
     /// Outstanding read borrows. A script that pins more than this simply
     /// releases the extras at once — it never drops one on the floor.
     borrows: [8]?Cache.Borrow = @splat(null),
+    /// What each outstanding borrow must keep reading, slot for slot.
+    snaps: [8]Snap = undefined,
     fill: ?Cache.Fill = null,
+    /// The independent model (below): per key of `key_pool`, what the
+    /// contract says the cache may hold.
+    model: [key_pool.len]?ModelEntry = @splat(null),
+    /// Key of `fill`, and whether its reservation is still the map's entry
+    /// for that key (a put/remove/clear on the key dooms it).
+    fill_key: usize = 0,
+    fill_live: bool = false,
     now: i64 = 0,
     /// `Options.idle_ttl_ns` of the cache under test. Non-zero also switches
     /// time to advance by 1..136 ns per step instead of a flat 10, so a key's
     /// silence lands both below and above the idle limit.
     idle_ns: i64 = 0,
+
+    /// The reference model: a per-key record of the contract, written from
+    /// the doc comments of `get`/`put`/`pin`/`reserve`/`remove`/`clear` and
+    /// `Options.idle_ttl_ns`, not from the implementation. It does not know
+    /// the eviction policy, so it lets the cache drop an unborrowed entry
+    /// only where eviction may run (`put`, `reserve`) and learns the drop;
+    /// everything else is exact. After every step `reconcile` compares it
+    /// with the map key by key (presence, bytes, TTL, stamps) and `step`
+    /// compares every lookup result, so a phantom value, a resurrected key,
+    /// a lost live entry, an evicted borrow or a wrong expiry instant fails.
+    const ModelEntry = struct {
+        len: usize,
+        /// The value is `'z' ** len` (a committed reservation) rather than
+        /// `payload[0..len]`.
+        zs: bool,
+        inserted: i64,
+        ttl: i64,
+        last: i64,
+        /// False while it is an uncommitted reservation (a miss for lookups).
+        filled: bool,
+        /// Outstanding borrows of THIS entry (a live `fill` counts).
+        pins: u32,
+
+        fn bytesEql(m: ModelEntry, v: []const u8) bool {
+            if (v.len != m.len) return false;
+            for (v, 0..) |b, i| if (b != (if (m.zs) 'z' else payload[i])) return false;
+            return true;
+        }
+    };
+
+    /// A borrow's expected bytes, and whether it borrows the key's current
+    /// model entry (so its release unpins that entry) or a doomed one.
+    const Snap = struct {
+        key: usize,
+        bytes: [payload.len]u8,
+        len: usize,
+        current: bool,
+    };
+
+    fn expired(self: *const SeamHarness, m: ModelEntry) bool {
+        if (m.ttl > 0 and self.now - m.inserted > m.ttl) return true;
+        return self.idle_ns > 0 and self.now - m.last > self.idle_ns;
+    }
+
+    /// The key's model entry is gone (removed, replaced, cleared, dropped as
+    /// expired): its borrows now read a doomed value, and a live reservation
+    /// of it is doomed too.
+    fn forget(self: *SeamHarness, ki: usize) void {
+        self.model[ki] = null;
+        for (self.borrows, &self.snaps) |b, *sn| if (b != null and sn.key == ki) {
+            sn.current = false;
+        };
+        if (self.fill != null and self.fill_key == ki) self.fill_live = false;
+    }
+
+    /// Compare the model with the map after an operation. `may_evict` is true
+    /// for the operations that run eviction; only those may lose an
+    /// unborrowed entry the model still holds.
+    fn reconcile(self: *SeamHarness, may_evict: bool) !void {
+        for (key_pool, 0..) |kb, ki| {
+            const e = self.c.entryOf(self.c.keyFor(kb));
+            const m = self.model[ki] orelse {
+                if (e != null) return error.ModelPhantomEntry;
+                continue;
+            };
+            const got = e orelse {
+                if (!may_evict or m.pins > 0) return error.ModelLostEntry;
+                self.forget(ki);
+                continue;
+            };
+            if (got.node.filled != m.filled) return error.ModelFilledDiffers;
+            if (m.filled and !m.bytesEql(got.value)) return error.ModelValueDiffers;
+            if (got.value.len != m.len) return error.ModelValueDiffers;
+            if (got.inserted_ns != m.inserted or got.ttl_ns != m.ttl) return error.ModelStampDiffers;
+            if (got.last_access_ns != m.last) return error.ModelIdleStampDiffers;
+        }
+        // Every outstanding borrow still reads exactly what it was given.
+        for (self.borrows, self.snaps) |b, sn| if (b) |bw| {
+            if (!std.mem.eql(u8, bw.bytes, sn.bytes[0..sn.len])) return error.ModelBorrowBytesChanged;
+        };
+        // After an eviction pass with nothing borrowed or reserved, the caps
+        // hold. (Only then: a `release` never evicts, so a cache that pins
+        // held over its cap stays there until the next `put`.)
+        var pinned = false;
+        for (self.model) |mo| if (mo) |m| {
+            pinned = pinned or m.pins > 0;
+        };
+        if (may_evict and !pinned and self.fill == null) {
+            if (self.c.map.count() > self.c.options.max_entries) return error.ModelOverEntryCap;
+            if (self.c.bytes > self.c.options.max_bytes) return error.ModelOverByteCap;
+        }
+    }
+
+    /// The model's view of a lookup at `now`: the value if it must hit,
+    /// null if it must miss. Drops an expired entry, as the lookup does.
+    fn expectLookup(self: *SeamHarness, ki: usize) ?ModelEntry {
+        const m = self.model[ki] orelse return null;
+        if (!m.filled) return null; // an uncommitted reservation is a miss, and stays
+        if (self.expired(m)) {
+            self.forget(ki);
+            return null;
+        }
+        self.model[ki].?.last = self.now;
+        return self.model[ki].?;
+    }
 
     /// Deliberately tiny caps: three entries and 24 bytes mean real eviction
     /// pressure within a handful of operations, which is where the borrow
@@ -2298,14 +2476,19 @@ const SeamHarness = struct {
         self.c.deinit();
     }
 
-    fn store(self: *SeamHarness, b: Cache.Borrow) void {
-        for (&self.borrows) |*slot| {
+    /// Keep `b` with what it must keep reading; a full table releases it at
+    /// once (and the model unpins).
+    fn store(self: *SeamHarness, b: Cache.Borrow, ki: usize, current: bool) void {
+        for (&self.borrows, &self.snaps) |*slot, *sn| {
             if (slot.* == null) {
                 slot.* = b;
+                sn.* = .{ .key = ki, .bytes = undefined, .len = b.bytes.len, .current = current };
+                @memcpy(sn.bytes[0..b.bytes.len], b.bytes);
                 return;
             }
         }
         self.c.release(b);
+        if (current) self.model[ki].?.pins -= 1;
     }
 
     fn takeBorrow(self: *SeamHarness, which: usize) ?Cache.Borrow {
@@ -2313,6 +2496,8 @@ const SeamHarness = struct {
             const idx = (which + i) % self.borrows.len;
             if (self.borrows[idx]) |b| {
                 self.borrows[idx] = null;
+                const sn = self.snaps[idx];
+                if (sn.current) self.model[sn.key].?.pins -= 1;
                 return b;
             }
         }
@@ -2324,47 +2509,92 @@ const SeamHarness = struct {
     /// value length. A length of zero everywhere would make the byte-accounting
     /// invariant below true for the wrong reason.
     fn step(self: *SeamHarness, op: u8, arg: u8) !void {
-        const k = key_pool[arg % key_pool.len];
+        const ki = arg % key_pool.len;
+        const k = key_pool[ki];
         const len = (arg >> 4) % (payload.len + 1);
         const ttl: i64 = if (arg & 8 != 0) 50 else 0;
         self.now += if (self.idle_ns > 0) 1 + @as(i64, op >> 4) * 9 else 10;
         // Reach: a lookup about to find an entry that only IDLENESS has expired
         // (silent for > idle_ns, still inside its write TTL).
         if (self.idle_ns > 0 and (op % op_count == op_get or op % op_count == op_pin)) {
-            if (self.c.entryOf(k)) |e| {
+            if (self.c.entryOf(self.c.keyFor(k))) |e| {
                 const ttl_dead = e.ttl_ns > 0 and (self.now - e.inserted_ns) > e.ttl_ns;
                 if (e.node.filled and !ttl_dead and (self.now - e.last_access_ns) > self.idle_ns) mark(.idled);
             }
         }
+        var may_evict = false;
         switch (op % op_count) {
-            op_put => self.c.put(k, payload[0..len], self.now, ttl, 0),
-            op_get => _ = self.c.get(k, self.now, 0),
-            op_pin => if (self.c.pin(k, self.now, 0)) |b| {
-                mark(.pinned);
-                self.store(b);
+            op_put => {
+                self.c.put(k, payload[0..len], self.now, ttl, 0);
+                // In place when unborrowed and filled; otherwise the old
+                // entry is doomed and a fresh one inserted. Either way the
+                // key's model entry is the new value, which admission may
+                // still turn away (`may_evict`).
+                self.forget(ki);
+                self.model[ki] = .{ .len = len, .zs = false, .inserted = self.now, .ttl = ttl, .last = self.now, .filled = true, .pins = 0 };
+                may_evict = true;
+            },
+            op_get => {
+                const want = self.expectLookup(ki);
+                const got = self.c.get(k, self.now, 0);
+                if (want) |m| {
+                    if (!m.bytesEql(got orelse return error.ModelMissedLiveEntry)) return error.ModelValueDiffers;
+                } else if (got != null) return error.ModelHitOnDeadEntry;
+            },
+            op_pin => {
+                const want = self.expectLookup(ki);
+                const got = self.c.pin(k, self.now, 0);
+                if (want) |m| {
+                    const b = got orelse return error.ModelMissedLiveEntry;
+                    if (!m.bytesEql(b.bytes)) return error.ModelValueDiffers;
+                    mark(.pinned);
+                    self.model[ki].?.pins += 1;
+                    self.store(b, ki, true);
+                } else if (got) |b| {
+                    self.c.release(b);
+                    return error.ModelHitOnDeadEntry;
+                }
             },
             op_reserve => if (self.fill == null) {
-                if (self.c.reserve(k, len, self.now, ttl, 0)) |f| self.fill = f;
+                const f = self.c.reserve(k, len, self.now, ttl, 0) orelse return error.ModelReserveRefused;
+                self.forget(ki);
+                self.model[ki] = .{ .len = len, .zs = true, .inserted = self.now, .ttl = ttl, .last = self.now, .filled = false, .pins = 1 };
+                self.fill = f;
+                self.fill_key = ki;
+                self.fill_live = true;
+                may_evict = true;
             },
             op_commit => if (self.fill) |f| {
                 @memset(f.bytes, 'z');
                 mark(.committed);
-                self.store(self.c.commit(f));
+                const live = self.fill_live;
+                if (live) self.model[self.fill_key].?.filled = true;
                 self.fill = null;
+                self.fill_live = false;
+                self.store(self.c.commit(f), self.fill_key, live);
             },
             op_discard => if (self.fill) |f| {
                 self.c.discard(f);
+                if (self.fill_live) self.model[self.fill_key] = null;
                 self.fill = null;
+                self.fill_live = false;
             },
             op_release => if (self.takeBorrow(arg)) |b| {
                 mark(.released);
                 self.c.release(b);
             },
-            op_remove => _ = self.c.remove(k),
-            op_clear => self.c.clear(),
+            op_remove => {
+                _ = self.c.remove(k);
+                self.forget(ki);
+            },
+            op_clear => {
+                self.c.clear();
+                for (0..key_pool.len) |i| self.forget(i);
+            },
             else => unreachable,
         }
         if (self.c.doomed.items.len > 0) mark(.parked);
+        try self.reconcile(may_evict);
         try self.check();
     }
 
@@ -2932,7 +3162,7 @@ fn expectRegionQueuesAgree(c: *Cache) !void {
         var it_n = q.head;
         while (it_n) |n| : (it_n = n.next) {
             try testing.expect(n.queued);
-            const e = c.entryOf(n.key) orelse return error.QueueHoldsAnUnmappedNode;
+            const e = c.entryOf(Cache.keyOf(n)) orelse return error.QueueHoldsAnUnmappedNode;
             try testing.expectEqual(@as(usize, r), @backingInt(e.node.region));
             walked += 1;
         }
@@ -2961,18 +3191,18 @@ test "borrow: release re-files the entry into its OWN region queue, from every r
     try expectRegionQueuesAgree(&c);
 
     // .window — the newest insert, still in the admission window.
-    try testing.expectEqual(Cache.Region.window, c.entryOf("c").?.node.region);
+    try testing.expectEqual(Cache.Region.window, c.entryOf(c.keyFor("c")).?.node.region);
     c.release(c.pin("c", 0, 0).?);
     try expectRegionQueuesAgree(&c);
 
     // .probation — demoted out of the window by `maintain`.
-    try testing.expectEqual(Cache.Region.probation, c.entryOf("a").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf(c.keyFor("a")).?.node.region);
     c.release(c.pin("a", 0, 0).?);
     try expectRegionQueuesAgree(&c);
 
     // .protected — promoted by the SLRU re-reference rule in `get`.
     _ = c.get("b", 0, 0).?;
-    try testing.expectEqual(Cache.Region.protected, c.entryOf("b").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf(c.keyFor("b")).?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
     c.release(c.pin("b", 0, 0).?);
     try expectRegionQueuesAgree(&c);
@@ -2993,7 +3223,7 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     c.put("win", "W", 0, 0, 0);
 
     _ = c.get("old", 0, 0).?; // probation → protected
-    try testing.expectEqual(Cache.Region.protected, c.entryOf("old").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf(c.keyFor("old")).?.node.region);
     try testing.expectEqual(@as(usize, 1), c.protected_count);
 
     c.release(c.pin("old", 0, 0).?); // the borrow under test
@@ -3007,8 +3237,8 @@ test "borrow: a released protected entry keeps its SLRU standing, so demotion ta
     // that just earned its place. Note both entries are still resident either
     // way, and both counters still partition the map either way — only *which*
     // entry was demoted differs.
-    try testing.expectEqual(Cache.Region.protected, c.entryOf("new").?.node.region);
-    try testing.expectEqual(Cache.Region.probation, c.entryOf("old").?.node.region);
+    try testing.expectEqual(Cache.Region.protected, c.entryOf(c.keyFor("new")).?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf(c.keyFor("old")).?.node.region);
     try expectRegionQueuesAgree(&c);
 }
 
@@ -3022,15 +3252,15 @@ test "borrow: a released probation entry is still the region's eviction candidat
     c.put("lru", "L", 0, 0, 0);
     c.put("mru", "M", 0, 0, 0);
     c.put("win", "W", 0, 0, 0);
-    try testing.expectEqual(Cache.Region.probation, c.entryOf("lru").?.node.region);
-    try testing.expectEqual(Cache.Region.probation, c.entryOf("mru").?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf(c.keyFor("lru")).?.node.region);
+    try testing.expectEqual(Cache.Region.probation, c.entryOf(c.keyFor("mru")).?.node.region);
 
     c.release(c.pin("lru", 0, 0).?); // the borrow under test
 
     // The pin refreshed "lru"'s tick, so re-write the neighbour to put the
     // ordering back: "lru" is the probation LRU again, hence the victim.
     c.put("mru", "M2", 0, 0, 0);
-    try testing.expect(c.entryOf("lru").?.node.tick < c.entryOf("mru").?.node.tick);
+    try testing.expect(c.entryOf(c.keyFor("lru")).?.node.tick < c.entryOf(c.keyFor("mru")).?.node.tick);
 
     // Borrow the sole window entry so the window heap is empty. That takes the
     // admission gate out of the eviction path entirely: with no candidate,
@@ -3233,8 +3463,8 @@ test "remove: drops exactly the named key, leaves siblings untouched, no-ops on 
     try testing.expectEqual(@as(usize, 3), c.bytes);
 
     try testing.expect(c.remove("a")); // present → true, removed
-    try testing.expect(!c.map.containsAdapted("a", Cache.KeyAdapter{})); // physically gone
-    try testing.expect(c.map.containsAdapted("b", Cache.KeyAdapter{})); // sibling untouched
+    try testing.expect(!(c.entryOf(c.keyFor("a")) != null)); // physically gone
+    try testing.expect((c.entryOf(c.keyFor("b")) != null)); // sibling untouched
     try testing.expectEqual(@as(usize, 1), c.stats.entries);
     try testing.expectEqual(@as(usize, 2), c.bytes); // only "b"'s 2 bytes remain
     try testing.expect(c.get("a", 1, 0) == null); // truly gone, not just stale
@@ -3394,51 +3624,87 @@ test "with on_evict unset, eviction/replace/clear behave exactly as before (no c
 
 // ── W-TinyLFU: frequency sketch ─────────────────────────────────────────────
 
+/// A key's sketch input as a standalone `Cache` hashes it (`Cache.keyFor`).
+fn sketchHash(bytes: []const u8) u64 {
+    return std.hash.Wyhash.hash((Options{ .max_bytes = 0, .max_entries = 0 }).hash_seed, bytes);
+}
+
+test "one hash: a shard's keys still spread over its map slots and its doorkeeper" {
+    // `Sharded` picks the shard from bits 32+ of the key hash and passes the
+    // same hash to the shard's map (low bits = slot, top 7 = fingerprint) and
+    // sketch (re-mixed). Picking the shard from the low bits, or feeding the
+    // sketch the hash without the re-mix, would leave every key of shard 0
+    // with the same low 4 bits of map slot / doorkeeper index.
+    var sc = try Sharded.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 4096, .shards = 16 });
+    defer sc.deinit();
+    var slot_seen: [16]bool = @splat(false);
+    var dk_seen: [16]bool = @splat(false);
+    var fp_seen: [16]bool = @splat(false);
+    var block_seen: [16]bool = @splat(false);
+    var kbuf: [16]u8 = undefined;
+    var in_shard: usize = 0;
+    var i: usize = 0;
+    while (i < 4096) : (i += 1) {
+        const k = std.mem.print(&kbuf, "key{d}", .{i}) catch unreachable;
+        if (sc.shardIndex(k) != 0) continue;
+        in_shard += 1;
+        const h = sc.shards[0].cache.keyFor(k).hash;
+        slot_seen[@intCast(h & 15)] = true;
+        fp_seen[@intCast(h >> 60)] = true;
+        const hp = FrequencySketch.hashPair(h);
+        dk_seen[@intCast(hp[0] & 15)] = true;
+        block_seen[@intCast((hp[0] >> 32) & 15)] = true; // the sketch block reads bits 32+, as the shard does
+
+    }
+    try testing.expect(in_shard > 128);
+    for (slot_seen, dk_seen, fp_seen, block_seen) |s, d, f, b| try testing.expect(s and d and f and b);
+}
+
 test "sketch: estimate tracks repeated records exactly for a lone key" {
     var s = try FrequencySketch.init(testing.allocator, 64);
     defer s.deinit(testing.allocator);
-    try testing.expectEqual(@as(u64, 0), s.estimate("x")); // never seen
+    try testing.expectEqual(@as(u64, 0), s.estimate(sketchHash("x"))); // never seen
     var i: usize = 0;
-    while (i < 5) : (i += 1) s.record("x");
+    while (i < 5) : (i += 1) s.record(sketchHash("x"));
     // doorkeeper absorbs the 1st record, CMS holds the other 4 → exactly 5
-    try testing.expectEqual(@as(u64, 5), s.estimate("x"));
-    try testing.expectEqual(@as(u64, 0), s.estimate("y")); // untouched key stays 0
+    try testing.expectEqual(@as(u64, 5), s.estimate(sketchHash("x")));
+    try testing.expectEqual(@as(u64, 0), s.estimate(sketchHash("y"))); // untouched key stays 0
 }
 
 test "sketch: CMS never underestimates under collision load" {
     var s = try FrequencySketch.init(testing.allocator, 64);
     defer s.deinit(testing.allocator);
     var i: usize = 0;
-    while (i < 7) : (i += 1) s.record("hot");
+    while (i < 7) : (i += 1) s.record(sketchHash("hot"));
     // hammer many other keys — collisions may only inflate, never deflate
     var kbuf: [16]u8 = undefined;
     var k: usize = 0;
     while (k < 40) : (k += 1) {
         const key = std.mem.print(&kbuf, "other{d}", .{k}) catch unreachable;
-        s.record(key);
+        s.record(sketchHash(key));
     }
-    try testing.expect(s.estimate("hot") >= 7);
+    try testing.expect(s.estimate(sketchHash("hot")) >= 7);
 }
 
 test "sketch: counters saturate at 15 (+1 doorkeeper)" {
     var s = try FrequencySketch.init(testing.allocator, 64);
     defer s.deinit(testing.allocator);
     var i: usize = 0;
-    while (i < 100) : (i += 1) s.record("x");
-    try testing.expectEqual(@as(u64, 16), s.estimate("x"));
+    while (i < 100) : (i += 1) s.record(sketchHash("x"));
+    try testing.expectEqual(@as(u64, 16), s.estimate(sketchHash("x")));
 }
 
 test "sketch: aging halves counters and clears the doorkeeper" {
     var s = try FrequencySketch.init(testing.allocator, 64);
     defer s.deinit(testing.allocator);
     var i: usize = 0;
-    while (i < 9) : (i += 1) s.record("x"); // doorkeeper 1 + CMS 8 → estimate 9
-    try testing.expectEqual(@as(u64, 9), s.estimate("x"));
+    while (i < 9) : (i += 1) s.record(sketchHash("x")); // doorkeeper 1 + CMS 8 → estimate 9
+    try testing.expectEqual(@as(u64, 9), s.estimate(sketchHash("x")));
     s.samples = s.sample_limit; // force the next record to trigger a reset
-    s.record("y");
+    s.record(sketchHash("y"));
     // CMS 8 halved → 4; doorkeeper cleared (its +1 is gone)
-    try testing.expectEqual(@as(u64, 4), s.estimate("x"));
-    try testing.expectEqual(@as(u64, 0), s.estimate("y")); // swept with the reset
+    try testing.expectEqual(@as(u64, 4), s.estimate(sketchHash("x")));
+    try testing.expectEqual(@as(u64, 0), s.estimate(sketchHash("y"))); // swept with the reset
     try testing.expect(s.samples < s.sample_limit); // sample window restarted
 }
 
@@ -3556,11 +3822,11 @@ test "expired-first eviction still finds the expired entry among many live ones"
     // Over the entry cap at t = 100: the expired one must go, not an LRU one.
     c.put("newcomer", "y", 100, 0, 0);
 
-    try testing.expect(!c.map.containsAdapted("doomed", Cache.KeyAdapter{}));
-    try testing.expect(c.map.containsAdapted("newcomer", Cache.KeyAdapter{}));
+    try testing.expect(!(c.entryOf(c.keyFor("doomed")) != null));
+    try testing.expect((c.entryOf(c.keyFor("newcomer")) != null));
     var zero_key: [8]u8 = undefined;
     std.mem.writeInt(u64, &zero_key, 0, .little);
-    try testing.expect(c.map.containsAdapted(&zero_key, Cache.KeyAdapter{})); // the true LRU survived
+    try testing.expect((c.entryOf(c.keyFor(&zero_key)) != null)); // the true LRU survived
     try testing.expectEqual(@as(u64, 0), c.stats.rejections);
     try testing.expectEqual(@as(u64, 0), c.stats.admissions);
     try testing.expectEqual(@as(u64, 1), c.stats.evictions);
@@ -3714,29 +3980,29 @@ test "admit: a frequency tie is broken by a ~1/128 coin, and only for candidates
     // wins a tie via a deterministic ~1/128 coin"; cold candidates never do.
     var c = testCache(1 << 20, 16);
     defer c.deinit();
-    c.noteAccess("init"); // creates the sketch
+    c.noteAccess(c.keyFor("init").hash); // creates the sketch
     const s = &c.sketch.?;
     var i: usize = 0;
     while (i < 6) : (i += 1) {
-        s.record("warm-cand");
-        s.record("warm-vict");
+        s.record(sketchHash("warm-cand"));
+        s.record(sketchHash("warm-vict"));
     }
     i = 0;
     while (i < 5) : (i += 1) {
-        s.record("cool-cand");
-        s.record("cool-vict");
+        s.record(sketchHash("cool-cand"));
+        s.record(sketchHash("cool-vict"));
     }
-    try testing.expectEqual(@as(u64, 6), s.estimate("warm-cand"));
-    try testing.expectEqual(@as(u64, 6), s.estimate("warm-vict"));
-    try testing.expectEqual(@as(u64, 5), s.estimate("cool-cand"));
-    try testing.expectEqual(@as(u64, 5), s.estimate("cool-vict"));
+    try testing.expectEqual(@as(u64, 6), s.estimate(sketchHash("warm-cand")));
+    try testing.expectEqual(@as(u64, 6), s.estimate(sketchHash("warm-vict")));
+    try testing.expectEqual(@as(u64, 5), s.estimate(sketchHash("cool-cand")));
+    try testing.expectEqual(@as(u64, 5), s.estimate(sketchHash("cool-vict")));
 
     var warm_wins: usize = 0;
     var cool_wins: usize = 0;
     i = 0;
     while (i < 64_000) : (i += 1) {
-        if (c.admit("warm-cand", "warm-vict")) warm_wins += 1;
-        if (c.admit("cool-cand", "cool-vict")) cool_wins += 1;
+        if (c.admit(c.keyFor("warm-cand"), c.keyFor("warm-vict"))) warm_wins += 1;
+        if (c.admit(c.keyFor("cool-cand"), c.keyFor("cool-vict"))) cool_wins += 1;
     }
     try testing.expectEqual(@as(usize, 0), cool_wins);
     // Expected 64000 / 128 = 500, sd ~22: a 1/64 or 1/256 coin lands far outside.
@@ -3794,11 +4060,16 @@ test "eviction terminates even when the chosen victim key is not in the map (pro
     c.put("a", "1", 0, 0, 0);
     c.put("b", "2", 0, 0, 0); // a -> probation, b stays in the window
     c.options.max_entries = 1;
-    const node = c.entryOf("b").?.node;
+    const node = c.entryOf(c.keyFor("b")).?.node;
     const real_key = node.key;
+    const real_hash = node.hash;
+    // Both halves of the key: the map finds a node by its stored hash, then
+    // compares bytes, so an emptied key alone would still match itself.
     node.key = &.{};
+    node.hash = ~real_hash;
     c.maintain(0);
     node.key = real_key;
+    node.hash = real_hash;
     try testing.expectEqual(@as(usize, 2), c.map.count()); // nothing was removable
 }
 
@@ -3922,9 +4193,9 @@ test "idle ttl: eviction takes an idle-expired entry before the frequency contes
     // idle-aware expiry the contest is b (candidate) against a (victim): a tie,
     // so b is rejected and a survives.
     c.put("c", "3", 120, 0, 0);
-    try testing.expect(!c.map.containsAdapted("a", Cache.KeyAdapter{}));
-    try testing.expect(c.map.containsAdapted("b", Cache.KeyAdapter{}));
-    try testing.expect(c.map.containsAdapted("c", Cache.KeyAdapter{}));
+    try testing.expect(!(c.entryOf(c.keyFor("a")) != null));
+    try testing.expect((c.entryOf(c.keyFor("b")) != null));
+    try testing.expect((c.entryOf(c.keyFor("c")) != null));
     try testing.expectEqual(@as(u64, 0), c.stats.rejections);
     try testing.expectEqual(@as(u64, 0), c.stats.admissions);
     try testing.expectEqual(@as(u64, 1), c.stats.evictions);
@@ -3941,8 +4212,8 @@ test "idle ttl: a hit moves the entry's place in the expiry heap, so the NEXT on
     // At 150 only b is idle-expired. RED if the hit left a's old deadline in
     // the heap: a would be the root and would be evicted instead.
     c.put("c", "3", 150, 0, 0);
-    try testing.expect(c.map.containsAdapted("a", Cache.KeyAdapter{}));
-    try testing.expect(!c.map.containsAdapted("b", Cache.KeyAdapter{}));
+    try testing.expect((c.entryOf(c.keyFor("a")) != null));
+    try testing.expect(!(c.entryOf(c.keyFor("b")) != null));
 }
 
 test "idle ttl: pin counts as an access and release re-files the entry under the new deadline" {
@@ -3953,7 +4224,7 @@ test "idle ttl: pin counts as an access and release re-files the entry under the
     try expectExpiryAgrees(&c); // borrowed: not in the heap
     c.release(b);
     try expectExpiryAgrees(&c); // back, at 90 + 100
-    try testing.expectEqual(@as(i64, 190), c.entryOf("k").?.node.deadline);
+    try testing.expectEqual(@as(i64, 190), c.entryOf(c.keyFor("k")).?.node.deadline);
     try testing.expect(c.get("k", 180, 0) != null); // 90 since the pin; 180 since the write
     // And a borrow held across the deadline does not make the entry immortal:
     const b2 = c.pin("k", 200, 0).?;
@@ -3968,7 +4239,7 @@ test "idle ttl: off by default, and a non-positive value is off exactly like def
         c.put("k", "v", 0, 0, 0);
         try testing.expect(c.get("k", 1 << 50, 0) != null);
         try testing.expectEqual(@as(u64, 0), c.stats.expired);
-        try testing.expectEqual(Cache.Node.not_queued, c.entryOf("k").?.node.exp_idx);
+        try testing.expectEqual(Cache.Node.not_queued, c.entryOf(c.keyFor("k")).?.node.exp_idx);
     }
 }
 

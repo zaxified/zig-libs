@@ -117,21 +117,32 @@ pub const DateParts = struct {
 // ---------------------------------------------------------------------------
 
 /// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian Y/M/D.
-/// Negative for dates before the epoch. Valid for any month in 1..12.
+/// Negative for dates before the epoch. Valid for any month in 1..12; a day
+/// outside the month (0, 32) extrapolates linearly instead of trapping.
+///
+/// Hinnant's `era` is written for truncating division (`y - 399` when
+/// negative); with a flooring division it is just `@divFloor(y, 400)`. Until
+/// 2026-10-25 the two were combined, which put every date before
+/// 0000-03-01 one era-step off (audit D1: 0000-01-01 came back as 01-02).
 pub fn ymdToEpochDay(year: i32, month: u32, day: u32) i64 {
     const y: i64 = if (month <= 2) @as(i64, year) - 1 else year;
-    const era: i64 = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe: u64 = @intCast(y - era * 400); // [0, 399]
-    const m_idx: u64 = if (month > 2) month - 3 else month + 9;
-    const doy: u64 = (153 * m_idx + 2) / 5 + day - 1; // [0, 365]
-    const doe: u64 = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    return era * 146097 + @as(i64, @intCast(doe)) - 719468;
+    const era: i64 = @divFloor(y, 400);
+    const yoe: i64 = y - era * 400; // [0, 399]
+    const m_idx: i64 = if (month > 2) @as(i64, month) - 3 else @as(i64, month) + 9;
+    const doy: i64 = @divFloor(153 * m_idx + 2, 5) + @as(i64, day) - 1; // [0, 365] for a valid date
+    const doe: i64 = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy; // [0, 146096]
+    return era * 146097 + doe - 719468;
 }
+
+/// `epochDayToYmd`'s input range: a day count past this is beyond any year
+/// `DateParts` holds (2^31 years ≈ 7.8e11 days), so it saturates here and the
+/// arithmetic below cannot overflow.
+const epoch_day_limit: i64 = 1 << 40;
 
 /// Inverse of `ymdToEpochDay`: civil Y/M/D for a (possibly negative) epoch day.
 pub fn epochDayToYmd(epoch_day: i64) DateParts {
-    const z: i64 = epoch_day + 719468;
-    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const z: i64 = std.math.clamp(epoch_day, -epoch_day_limit, epoch_day_limit) + 719468;
+    const era: i64 = @divFloor(z, 146097);
     const doe: u64 = @intCast(z - era * 146097); // [0, 146096]
     const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
     const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
@@ -1067,7 +1078,7 @@ fn putDec(out: []u8, n: usize, v: u32, comptime min_width: u8) usize {
 
 /// Add `n` calendar days, preserving the time of day (incl. the fraction).
 pub fn addDays(parts: DateParts, n: i64) DateParts {
-    var r = epochDayToYmd(ymdToEpochDay(parts.year, parts.month, parts.day) + n);
+    var r = epochDayToYmd(ymdToEpochDay(parts.year, parts.month, parts.day) +| n);
     r.hour = parts.hour;
     r.minute = parts.minute;
     r.second = parts.second;
@@ -1078,8 +1089,15 @@ pub fn addDays(parts: DateParts, n: i64) DateParts {
 /// Add `n` months, clamping the day to the new month's length
 /// (Jan 31 + 1 month → Feb 28/29). Preserves the time of day.
 pub fn addMonths(parts: DateParts, n: i32) DateParts {
-    const total = @as(i32, @intCast(parts.month)) - 1 + n;
-    const new_year = parts.year + @divFloor(total, 12);
+    return addMonthsWide(parts, n);
+}
+
+/// `addMonths` over i64, so `addYears`' `n * 12` and a month count near the
+/// i32 edge cannot overflow; the year saturates at the i32 range, as
+/// `epochDayToYmd` does.
+fn addMonthsWide(parts: DateParts, n: i64) DateParts {
+    const total = @as(i64, parts.month) - 1 + n;
+    const new_year: i32 = @intCast(std.math.clamp(@as(i64, parts.year) + @divFloor(total, 12), std.math.minInt(i32), std.math.maxInt(i32)));
     const new_month: u32 = @intCast(@mod(total, 12) + 1);
     const clamped_day = @min(parts.day, daysInMonth(new_year, new_month));
     return .{
@@ -1094,7 +1112,7 @@ pub fn addMonths(parts: DateParts, n: i32) DateParts {
 }
 
 pub fn addYears(parts: DateParts, n: i32) DateParts {
-    return addMonths(parts, n * 12);
+    return addMonthsWide(parts, @as(i64, n) * 12);
 }
 
 /// Whole calendar days from `b` to `a` (positive when `a` is later).
@@ -1102,10 +1120,11 @@ pub fn diffInDays(a: DateParts, b: DateParts) i64 {
     return ymdToEpochDay(a.year, a.month, a.day) - ymdToEpochDay(b.year, b.month, b.day);
 }
 
-/// Whole calendar months from `b` to `a` (ignores day-of-month).
+/// Whole calendar months from `b` to `a` (ignores day-of-month). Saturates
+/// at the i32 range (|years| over ~178 million apart).
 pub fn diffInMonths(a: DateParts, b: DateParts) i32 {
-    return (a.year * 12 + @as(i32, @intCast(a.month))) -
-        (b.year * 12 + @as(i32, @intCast(b.month)));
+    const d = (@as(i64, a.year) * 12 + a.month) - (@as(i64, b.year) * 12 + b.month);
+    return @intCast(std.math.clamp(d, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
 pub fn diffInYears(a: DateParts, b: DateParts) i32 {
@@ -1115,14 +1134,17 @@ pub fn diffInYears(a: DateParts, b: DateParts) i32 {
 pub fn startOfDay(parts: DateParts) DateParts {
     return .{ .year = parts.year, .month = parts.month, .day = parts.day };
 }
+/// The last representable instant of the day: 23:59:59.999999999, so it is
+/// never earlier than any time on that day (until 2026-10-25 the fraction
+/// was 0, and `endOfDay(23:59:59.5)` came before its input).
 pub fn endOfDay(parts: DateParts) DateParts {
-    return .{ .year = parts.year, .month = parts.month, .day = parts.day, .hour = 23, .minute = 59, .second = 59 };
+    return .{ .year = parts.year, .month = parts.month, .day = parts.day, .hour = 23, .minute = 59, .second = 59, .nanosecond = 999_999_999 };
 }
 pub fn startOfMonth(parts: DateParts) DateParts {
     return .{ .year = parts.year, .month = parts.month, .day = 1 };
 }
 pub fn endOfMonth(parts: DateParts) DateParts {
-    return .{ .year = parts.year, .month = parts.month, .day = daysInMonth(parts.year, parts.month), .hour = 23, .minute = 59, .second = 59 };
+    return .{ .year = parts.year, .month = parts.month, .day = daysInMonth(parts.year, parts.month), .hour = 23, .minute = 59, .second = 59, .nanosecond = 999_999_999 };
 }
 /// Date of the `n`-th occurrence of ISO weekday `weekday` (Mon=1 … Sun=7) in
 /// `year`/`month`. Positive `n` counts from the start (`1` = first); negative
@@ -1136,7 +1158,7 @@ pub fn endOfMonth(parts: DateParts) DateParts {
 pub fn nthWeekdayOfMonth(year: i32, month: i32, weekday: i32, n: i32) ?DateParts {
     if (month < 1 or month > 12) return null;
     if (weekday < 1 or weekday > 7) return null;
-    if (n == 0) return null;
+    if (n == 0 or n > 5 or n < -5) return null; // no month holds a 6th of any weekday
     const m: u32 = @intCast(month);
     const dim: i32 = @intCast(daysInMonth(year, m));
 
@@ -1158,7 +1180,7 @@ pub fn startOfYear(parts: DateParts) DateParts {
     return .{ .year = parts.year, .month = 1, .day = 1 };
 }
 pub fn endOfYear(parts: DateParts) DateParts {
-    return .{ .year = parts.year, .month = 12, .day = 31, .hour = 23, .minute = 59, .second = 59 };
+    return .{ .year = parts.year, .month = 12, .day = 31, .hour = 23, .minute = 59, .second = 59, .nanosecond = 999_999_999 };
 }
 
 // ---------------------------------------------------------------------------
@@ -2912,6 +2934,9 @@ test "unixToParts: any i64 instant saturates the year instead of trapping" {
 
 test {
     _ = @import("go_oracle_test.zig");
+    _ = @import("audit_test.zig");
+    _ = @import("lead_test.zig");
+    _ = @import("model_fuzz_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

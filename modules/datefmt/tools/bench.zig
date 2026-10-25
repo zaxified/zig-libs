@@ -38,13 +38,21 @@
 //! the parsed instants) must agree or the run fails. Ratios are ours/Go by
 //! wall time; the verdict is the WORST ratio. Arguments filter workloads.
 //! Both sides allocate their output string (ours via `smp_allocator`, Go's GC).
+//!
+//! Then the fastest in the field (`BENCH_FAST=0` skips it): the Rust date
+//! crates of `tools/rust_fast_bench` (httpdate, humantime, chrono, jiff; pinned
+//! by its Cargo.lock, built offline) per TASK, each against our fastest API for
+//! that task (the canned functions, a compiled `Layout`), ours re-timed beside
+//! each contender. A task's ratio is ours / its fastest contender; the verdict
+//! is the worst task. Needs cargo and the crates in the registry
+//! (`cargo fetch --manifest-path modules/datefmt/tools/rust_fast_bench/Cargo.toml`).
 
 const std = @import("std");
 const bench = @import("testkit").bench;
 const datefmt = @import("datefmt");
 
 const ref_short = "Go";
-const ref_card = "Go 1.26.0 time";
+const ref_card = "Go 1.26.8 time";
 const bench_name = "bench-datefmt";
 const work_dir = ".zig-cache/bench-datefmt";
 const go_dir = "modules/datefmt/tools/go_bench";
@@ -222,8 +230,90 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (filters.len > 0 or !use_fast) {
+        if (filters.len == 0)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: per task, our fastest API against the Rust crates ----
+    try w.flush();
+    try rustBuild(arena, io, init.environ_map);
+    try w.print("\nfastest in the field -- {d} rounds, ours re-timed beside each contender\n", .{rounds});
+    try w.print("{s:<20} {s:<11} {s:>9} {s:>9} {s:>8}  count\n", .{ "task (ours)", "contender", "its ns", "ours ns", "ours/it" });
+    var worst_fast: f64 = 0;
+    var worst_task: []const u8 = "";
+    var worst_who: []const u8 = "";
+    for (tasks) |t| {
+        var task_ratio: f64 = 0; // against the task's fastest contender = the largest ratio
+        var task_who: []const u8 = "";
+        for (t.who) |who| {
+            var ours: bench.Side = .{};
+            var it: bench.Side = .{};
+            for (0..rounds) |_| {
+                it.add(try bench.foreignArgv(arena, io, bench_name, &.{ rust_exe, abs, who, t.name }, t.name, null));
+                ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, t.ours }, true));
+            }
+            const r = ours.best_ns / it.best_ns;
+            if (r > task_ratio) {
+                task_ratio = r;
+                task_who = who;
+            }
+            const same = it.count == ours.count;
+            mismatch = mismatch or !same;
+            try w.print("{s:<20} {s:<11} {d:>9.0} {d:>9.0} {d:>8.3}  {d}{s}\n", .{ t.name, who, it.best_ns, ours.best_ns, r, it.count, if (same) "" else " ≠ ours" });
+            try w.flush();
+        }
+        if (task_ratio > worst_fast) {
+            worst_fast = task_ratio;
+            worst_task = t.name;
+            worst_who = task_who;
+        }
+    }
+    if (mismatch) {
+        try w.writeAll(bench_name ++ ": FAILED -- a contender's result count differs from ours; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    try w.print("\nworst ours/fastest = {d:.2} ({s} vs {s})\n", .{ worst_fast, worst_task, worst_who });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} ({s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_who, worst_task });
     try w.flush();
     return 0;
+}
+
+/// A task of the fastest-in-the-field section: `ours` is the index (in
+/// `names`) of our fastest API for it; `who` the Rust contenders that have one.
+const Task = struct { name: []const u8, ours: usize, who: []const []const u8 };
+const tasks = [_]Task{
+    .{ .name = "fmt_imf", .ours = 9, .who = &.{ "httpdate", "chrono", "jiff" } }, // fmt_imf_canned
+    .{ .name = "fmt_rfc3339", .ours = 1, .who = &.{ "humantime", "chrono", "jiff" } },
+    .{ .name = "fmt_tokens", .ours = 6, .who = &.{ "chrono", "jiff" } }, // fmt_rfc3339_layout
+    .{ .name = "parse_imf", .ours = 10, .who = &.{ "httpdate", "chrono", "jiff" } }, // parse_imf_canned
+    .{ .name = "parse_tokens", .ours = 7, .who = &.{ "chrono", "jiff" } }, // parse_imf_layout
+    .{ .name = "parse_rfc3339", .ours = 3, .who = &.{ "humantime", "chrono", "jiff" } },
+    .{ .name = "parse_rfc3339_frac", .ours = 4, .who = &.{ "chrono", "jiff" } },
+};
+const rust_manifest = "modules/datefmt/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+/// Build the Rust side once, offline (the crates are in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
 }

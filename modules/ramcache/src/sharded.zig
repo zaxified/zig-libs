@@ -93,10 +93,16 @@
 //!     so no shard gets a zero cap (see `init`). Ask for more shards than
 //!     `max_entries` and you get fewer shards, not empty ones.
 //!
-//! The shard hash uses a Wyhash seed distinct from the frequency sketch's. If
-//! it did not, every key in a shard would share the low bits of the sketch's
-//! hash, collapsing the doorkeeper's index space to 1/N of its range and
-//! systematically inflating collisions inside each shard.
+//! One hash per key per operation (2026-10-25; was three to five): the shard
+//! is picked from bits 32 and up of the key's `Cache.Key` hash under this
+//! instance's seed, and the same hash goes on into the shard's map and
+//! sketch. The bits are disjoint by construction: the map indexes its slots
+//! with the low bits (a shard's map stays below 2^32 slots) and keeps the
+//! top 7 as fingerprints, and the sketch re-mixes the hash (`hashPair`)
+//! before taking any bit. Taking the shard from the low bits instead would
+//! confine each shard's keys to 1/N of its map's slots; seeding the shard
+//! hash and the sketch hash alike without the re-mix would confine them to
+//! 1/N of the doorkeeper's index space. A test pins both spreads.
 //!
 //! ## Adversarial key distribution — a liveness problem, not a hashing one
 //!
@@ -377,11 +383,9 @@ pub const Sharded = struct {
         value: []const u8 = &.{},
     };
 
-    /// Base seed, distinct from `FrequencySketch`'s (`0` and
-    /// `0x2545F4914F6CDD1D`). See the module doc: sharing one of those would
-    /// confine each shard's keys to 1/N of the doorkeeper index space. This is
-    /// only the *base* — the live seed is this mixed with per-instance
-    /// entropy by `deriveSeed`.
+    /// Base seed, distinct from a standalone `Cache`'s default
+    /// (`Options.hash_seed`, `0x2545F4914F6CDD1D`). This is only the *base* —
+    /// the live seed is this mixed with per-instance entropy by `deriveSeed`.
     const shard_seed_base: u64 = 0x9AE16A3B2F90404F;
 
     /// Process-wide instance counter, so two caches built back to back get
@@ -417,8 +421,10 @@ pub const Sharded = struct {
     alloc: Allocator,
     shards: []Shard,
     mask: u64,
-    /// This instance's shard-hash seed — `Options.shard_seed` verbatim when
-    /// given, otherwise `deriveSeed`'s per-instance value.
+    /// This instance's key-hash seed — `Options.shard_seed` verbatim when
+    /// given, otherwise `deriveSeed`'s per-instance value. Every shard's
+    /// `Cache` hashes with it too (`Options.hash_seed`), so the one hash that
+    /// picks the shard is the one the shard's map and sketch use.
     seed: u64,
     /// The per-shard caps actually handed to each `Cache` — exposed because
     /// they, not `Options`, are what eviction enforces.
@@ -446,6 +452,7 @@ pub const Sharded = struct {
         const per_entries = options.max_entries / n;
 
         const shards = try alloc.alloc(Shard, n);
+        const seed = options.shard_seed orelse deriveSeed(@intFromPtr(shards.ptr));
         for (shards) |*s| s.* = .{ .cache = Cache.init(alloc, .{
             .max_bytes = per_bytes,
             .max_entries = per_entries,
@@ -454,12 +461,13 @@ pub const Sharded = struct {
             .on_evict_ctx = options.on_evict_ctx,
             .idle_ttl_ns = options.idle_ttl_ns,
             .adaptive_window = options.adaptive_window,
+            .hash_seed = seed,
         }) };
         return .{
             .alloc = alloc,
             .shards = shards,
             .mask = n - 1,
-            .seed = options.shard_seed orelse deriveSeed(@intFromPtr(shards.ptr)),
+            .seed = seed,
             .per_shard_max_bytes = per_bytes,
             .per_shard_max_entries = per_entries,
         };
@@ -482,7 +490,18 @@ pub const Sharded = struct {
     /// Public because a skewed key distribution is a real operational
     /// question, and `shardStats` is how you answer it.
     pub fn shardIndex(self: *const Sharded, key: []const u8) usize {
-        return @intCast(std.hash.Wyhash.hash(self.seed, key) & self.mask);
+        return self.shardOf(self.keyFor(key).hash);
+    }
+
+    /// `key` hashed once, as every shard's `Cache.keyFor` would hash it.
+    fn keyFor(self: *const Sharded, key: []const u8) Cache.Key {
+        return .{ .bytes = key, .hash = std.hash.Wyhash.hash(self.seed, key) };
+    }
+
+    /// The shard of a key hash: bits 32 and up (see the module doc for why
+    /// not the low ones).
+    fn shardOf(self: *const Sharded, hash: u64) usize {
+        return @intCast((hash >> 32) & self.mask);
     }
 
     /// Number of shards actually allocated (may be less than `Options.shards`
@@ -504,10 +523,11 @@ pub const Sharded = struct {
     ///
     /// Deliberately NOT returning a borrowed slice — see the module doc.
     pub fn getBuf(self: *Sharded, key: []const u8, now_ns: i64, cur_gen: u64, buf: []u8) GetResult {
-        const s = &self.shards[self.shardIndex(key)];
+        const k = self.keyFor(key);
+        const s = &self.shards[self.shardOf(k.hash)];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
-        const borrowed = s.cache.get(key, now_ns, cur_gen) orelse return .miss;
+        const borrowed = s.cache.getKey(k, now_ns, cur_gen) orelse return .miss;
         if (borrowed.len > buf.len) return .{ .buffer_too_small = borrowed.len };
         // Test-only probe, fired from *inside* the critical section with the
         // shard's own lock in hand. It exists because "the lock is still held
@@ -529,10 +549,11 @@ pub const Sharded = struct {
     /// rather than degraded to a miss, because losing a value that IS cached
     /// is worth telling the caller about.
     pub fn get(self: *Sharded, key: []const u8, now_ns: i64, cur_gen: u64) Allocator.Error!?[]u8 {
-        const s = &self.shards[self.shardIndex(key)];
+        const k = self.keyFor(key);
+        const s = &self.shards[self.shardOf(k.hash)];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
-        const borrowed = s.cache.get(key, now_ns, cur_gen) orelse return null;
+        const borrowed = s.cache.getKey(k, now_ns, cur_gen) orelse return null;
         return try self.alloc.dupe(u8, borrowed);
     }
 
@@ -579,9 +600,10 @@ pub const Sharded = struct {
         gen: u64,
         loader: Loader,
     ) LoadError![]u8 {
-        const s = &self.shards[self.shardIndex(key)];
+        const k = self.keyFor(key);
+        const s = &self.shards[self.shardOf(k.hash)];
         lockAcquire(&s.lock);
-        if (s.cache.get(key, now_ns, cur_gen)) |hit| {
+        if (s.cache.getKey(k, now_ns, cur_gen)) |hit| {
             defer s.lock.unlock();
             return gpa.dupe(u8, hit);
         }
@@ -607,7 +629,7 @@ pub const Sharded = struct {
 
         lockAcquire(&s.lock);
         if (loaded) |v| {
-            s.cache.put(key, v, now_ns, ttl_ns, gen);
+            s.cache.putKey(k, v, now_ns, ttl_ns, gen);
             flight.value = v;
         } else |e| {
             flight.err = e;
@@ -634,18 +656,20 @@ pub const Sharded = struct {
     /// TTL-only, silent no-op on OOM) — except that the size ceiling is the
     /// *per-shard* byte cap, and eviction pressure is that shard's alone.
     pub fn put(self: *Sharded, key: []const u8, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
-        const s = &self.shards[self.shardIndex(key)];
+        const k = self.keyFor(key);
+        const s = &self.shards[self.shardOf(k.hash)];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
-        s.cache.put(key, value, now_ns, ttl_ns, gen);
+        s.cache.putKey(k, value, now_ns, ttl_ns, gen);
     }
 
     /// `put` with `Options.default_ttl_ns` as the TTL.
     pub fn putDefault(self: *Sharded, key: []const u8, value: []const u8, now_ns: i64, gen: u64) void {
-        const s = &self.shards[self.shardIndex(key)];
+        const k = self.keyFor(key);
+        const s = &self.shards[self.shardOf(k.hash)];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
-        s.cache.putDefault(key, value, now_ns, gen);
+        s.cache.putKey(k, value, now_ns, s.cache.options.default_ttl_ns, gen);
     }
 
     /// Drop every entry, shard by shard. **Not atomic across shards** — see
@@ -949,12 +973,14 @@ test "the DELIVERED defaults: 16 shards, and the caps divided by 16" {
     try testing.expectEqual(@as(usize, 65536), sc.per_shard_max_bytes); // 1 MiB / 16
 }
 
-test "the shard seed: pinned base, distinct from the sketch's, freshly derived per instance" {
-    // (a) The delivered base, as a literal. Its whole job is to be a value the
-    //     frequency sketch does not use — `hashPair` seeds with
-    //     `0x2545F4914F6CDD1D` (with `0` too until 2026-10-11) — because
-    //     sharing one confines a shard's keys to 1/N of the doorkeeper index
-    //     space.
+test "the shard seed: pinned base, distinct from a Cache's default, freshly derived per instance" {
+    // (a) The delivered base, as a literal, distinct from a standalone
+    //     `Cache`'s default `hash_seed` (`0x2545F4914F6CDD1D`). Until
+    //     2026-10-25 the sketch hashed with that constant and the shard with
+    //     this one, so the distinction kept a shard's keys from sharing
+    //     doorkeeper bits; the one shared hash now gets the same spread from
+    //     disjoint bits (`shardOf`, `hashPair`), pinned in root.zig's
+    //     "one hash" test.
     try testing.expectEqual(@as(u64, 0x9AE16A3B2F90404F), Sharded.shard_seed_base);
     try testing.expect(Sharded.shard_seed_base != 0);
     try testing.expect(Sharded.shard_seed_base != 0x2545F4914F6CDD1D);

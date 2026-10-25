@@ -1,0 +1,19 @@
+[package]
+name = "rust_fast_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+httpdate = { version = "=1.0.3", default-features = false }
+humantime = { version = "=2.4.0", default-features = false }
+chrono = { version = "=0.4.45", default-features = false, features = ["alloc", "std"] }
+jiff = { version = "0.2", default-features = false, features = ["alloc", "std"] }
+
+# Keep this out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3

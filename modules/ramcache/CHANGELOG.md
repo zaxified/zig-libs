@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Additive API, one fix (below):** one seeded key hash per operation (was three to five): new `Cache.Key`, `Cache.keyFor`, `Cache.getKey`/`putKey` (the hashed forms `Sharded` uses), `Options.hash_seed` (`Sharded` sets its per-instance seed; a standalone `Cache` keeps a fixed default); the in-shard map is seeded (was std's unseeded `hashString`) and is kept at most half full. Against HEAD: get_hit 81.7 → 77.2 ns, get_miss 36.8 → 34.2, put_evict 314 → 198, zipf_mixed 158 → 131. **Fix (consumer-visible):** `isDirty`/`markClean`/`markCleanIf` treat an uncommitted reservation as absent (they reached it: a flusher's ack could mark a `reserve`'s replacement clean so it was never written behind); `timeExpired` saturates at the far ends of the clock. The seam fuzz harness now checks every step against an independent model of the contract; `tools/rust_fast_bench` (quick_cache, moka) joins `bench-ramcache`.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — Performance: `removeMatching` collects up to 512 matches per scan of the map and removes them, instead of re-scanning after every removal — `ceil(matches / 512)` scans, was one per match (a 1 GiB fully resident `pagecache` file close was ~10^10 steps). Same result, still allocation-free and infallible.

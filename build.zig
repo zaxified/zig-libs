@@ -297,7 +297,7 @@ pub const module_list = [_]Module{
     .{ .name = "finstats", .libs = &.{"storage"}, .deps = &.{"dataset"} },
     .{ .name = "filestore", .libs = &.{"storage"} },
     .{ .name = "framing", .libs = &.{ "format", "os" }, .test_deps = &.{"testkit"} },
-    .{ .name = "datefmt", .libs = &.{"format"} },
+    .{ .name = "datefmt", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "diagnostics", .libs = &.{"os"} },
     .{ .name = "json5", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "ini", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
