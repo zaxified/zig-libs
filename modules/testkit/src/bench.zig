@@ -168,8 +168,11 @@ pub const GoBuild = struct {
     /// The Go package, relative to the repository root
     /// (`modules/<m>/tools/go_bench`).
     dir: []const u8,
-    /// The work directory, absolute; the binary is `<abs>/go_bench`.
+    /// The work directory, absolute; the binary is `<abs>/<out>`.
     abs: []const u8,
+    /// The binary's name in `abs` (a second Go program beside the reference
+    /// needs its own).
+    out: []const u8 = "go_bench",
     /// `GOTOOLCHAIN`: `local`, or an exact `go1.N.M` that must then already
     /// be installed (the network is off).
     toolchain: []const u8 = "local",
@@ -182,7 +185,7 @@ pub fn goBuild(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, env
     try env.put("GOTOOLCHAIN", opts.toolchain);
     try env.put("GOPROXY", "off");
     try env.put("GOFLAGS", "-mod=readonly");
-    const exe = try arena.print("{s}/go_bench", .{opts.abs});
+    const exe = try arena.print("{s}/{s}", .{ opts.abs, opts.out });
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
     const res = std.process.run(arena, io, .{
         .argv = &.{ opts.exe, "build", "-o", exe, "." },

@@ -376,13 +376,93 @@ fn findHeader(block: []const u8, name: []const u8) ?[]const u8 {
     // compare and the value trim run only on a length-matching candidate.
     // (A shorter real name puts its ':' or the SP after it inside the
     // compared window, where `name` -- a token -- can never match it.)
+    //
+    // The lines are the ones `splitScalar(block, '\n')` yields, found 64
+    // bytes at a time: one vector pass marks the window's '\n' bytes, each
+    // line end is a `@ctz` (a `findScalar` per line was most of a lookup,
+    // 2026-10-25). `findHeaderBySplit` is the reference the tests hold it to.
+    var start: usize = 0;
+    var base: usize = 0;
+    while (base < block.len) {
+        const w = @min(64, block.len - base);
+        var mask = newlineMask(block[base..][0..w]);
+        while (mask != 0) : (mask &= mask - 1) {
+            const end = base + @ctz(mask);
+            if (lineValue(block[start..end], name)) |v| return v;
+            start = end + 1;
+        }
+        base += w;
+    }
+    return lineValue(block[start..], name);
+}
+
+/// `findHeader`'s per-line test (see there).
+inline fn lineValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    if (raw.len <= name.len or raw[name.len] != ':') return null;
+    if (!std.ascii.eqlIgnoreCase(raw[0..name.len], name)) return null;
+    return std.mem.trim(u8, trimLineEnd(raw)[name.len + 1 ..], " \t");
+}
+
+/// Bit i set for each '\n' in `win` (at most 64 bytes): whole 16-byte
+/// chunks, then one chunk overlapping the end (a byte seen twice sets the
+/// same bit), so no byte loop for a window of 4 bytes or more.
+fn newlineMask(win: []const u8) u64 {
+    var m: u64 = 0;
+    if (win.len >= 16) {
+        var i: usize = 0;
+        while (i + 16 <= win.len) : (i += 16) m |= byteMask(16, win, i);
+        m |= byteMask(16, win, win.len - 16);
+    } else if (win.len >= 8) {
+        m = byteMask(8, win, 0) | byteMask(8, win, win.len - 8);
+    } else if (win.len >= 4) {
+        m = byteMask(4, win, 0) | byteMask(4, win, win.len - 4);
+    } else {
+        for (win, 0..) |c, i| m |= @as(u64, @intFromBool(c == '\n')) << @intCast(i);
+    }
+    return m;
+}
+
+inline fn byteMask(comptime w: usize, win: []const u8, at: usize) u64 {
+    const V = @Vector(w, u8);
+    const v: V = win[at..][0..w].*;
+    const bits: @Int(.unsigned, w) = @bitCast(v == @as(V, @splat('\n')));
+    return @as(u64, bits) << @intCast(at);
+}
+
+/// The plain form of `findHeader`, the reference its test compares against.
+fn findHeaderBySplit(block: []const u8, name: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, block, '\n');
     while (lines.next()) |raw| {
-        if (raw.len <= name.len or raw[name.len] != ':') continue;
-        if (!std.ascii.eqlIgnoreCase(raw[0..name.len], name)) continue;
-        return std.mem.trim(u8, trimLineEnd(raw)[name.len + 1 ..], " \t");
+        if (lineValue(raw, name)) |v| return v;
     }
     return null;
+}
+
+test "findHeader agrees with the split-per-line form on random blocks of every length 0..300" {
+    var prng: std.Random.DefaultPrng = .init(0x4ead);
+    const rnd = prng.random();
+    const names = [_][]const u8{ "a", "host", "authorization", "x-k", "content-length" };
+    var buf: [300]u8 = undefined;
+    const alphabet = "aAhHoOsStT:\n\r \t-xk";
+    for (0..buf.len + 1) |len| {
+        for (0..30) |_| {
+            for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
+            // Plant a real line now and then, so matches are exercised too.
+            if (len > 20 and rnd.boolean()) {
+                const at = rnd.uintLessThan(usize, len - 20);
+                @memcpy(buf[at..][0..10], "\nHost: v\r\n");
+            }
+            for (names) |n| {
+                const want = findHeaderBySplit(buf[0..len], n);
+                const got = findHeader(buf[0..len], n);
+                try std.testing.expectEqual(want == null, got == null);
+                if (want) |wv| {
+                    try std.testing.expectEqual(wv.ptr, got.?.ptr);
+                    try std.testing.expectEqual(wv.len, got.?.len);
+                }
+            }
+        }
+    }
 }
 
 /// First value of field `name` (case-insensitive) in a raw CRLF header/

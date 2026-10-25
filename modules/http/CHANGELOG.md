@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **Added:** `ResponseWriter.HeaderValue` (a header value checked once for CR/LF/NUL) and `ResponseWriter.setHeaderBorrowed(comptime name, value)` — `setHeaderStatic` for a run-time value the caller keeps alive until the response ends: no per-response check, no copy into `header_buf` (first user: `aaa-gate`'s 401 challenge and media type). **Faster, same bytes:** `writeHead` writes each header line with four `writeAll`s instead of `print`, and `validHeaderValue` checks 16 bytes at a time. Tests: borrowed replace/no-copy/HeadersSent, every bad byte at every position of lengths 0..40.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the test-only `strRepeat` helper (22 copies, the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²). The test binary's Sema went from 323 s to 13 s; the bytes produced are the same (814/834 tests, 20 skip, as before).
 
 - **2026-10-23** — **Added:** `Response.readAllAllocTimeout(gpa, max_len, timeout_ms)` — `readAllAlloc` under a deadline (`error.Timeout`), enforced like the client's other budgets (a concurrent task canceled at the deadline; unbounded without concurrency). For a caller that cannot let a peer that sent its head and stalls park the thread — `total_timeout_ms` ends with the head by design (first user: `acme`). Test against a peer that sends a head and goes silent.

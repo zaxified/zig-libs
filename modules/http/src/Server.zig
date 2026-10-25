@@ -3516,6 +3516,41 @@ pub const ResponseWriter = struct {
                     @compileError("setHeaderStatic: \"" ++ name ++ "\" is a managed header — use setHeader");
             }
         }
+        return rw.storeHeader(name, value);
+    }
+
+    /// A header value checked once (no CR, LF or NUL, as `setHeader`
+    /// checks), to be lent to many responses through `setHeaderBorrowed`.
+    pub const HeaderValue = struct {
+        bytes: []const u8,
+
+        pub fn init(value: []const u8) error{InvalidHeader}!HeaderValue {
+            if (!validHeaderValue(value)) return error.InvalidHeader;
+            return .{ .bytes = value };
+        }
+    };
+
+    /// `setHeaderStatic` for a value known only at run time -- a
+    /// middleware's configured challenge, say: the value was validated once
+    /// (`HeaderValue.init`), the caller keeps its bytes alive and unchanged
+    /// until the response is finished, and it is stored as the caller's
+    /// slice -- not checked again, not copied into `header_buf`. The name is
+    /// comptime, checked as `setHeaderStatic` checks it.
+    pub fn setHeaderBorrowed(rw: *ResponseWriter, comptime name: []const u8, value: HeaderValue) error{ HeadersSent, TooManyHeaders }!void {
+        comptime {
+            if (!validHeaderName(name))
+                @compileError("setHeaderBorrowed: header name is not an RFC 9110 token: \"" ++ name ++ "\"");
+            for ([_][]const u8{ "content-length", "transfer-encoding", "trailer", "connection" }) |managed| {
+                if (std.ascii.eqlIgnoreCase(name, managed))
+                    @compileError("setHeaderBorrowed: \"" ++ name ++ "\" is a managed header — use setHeader");
+            }
+        }
+        return rw.storeHeader(name, value.bytes);
+    }
+
+    /// The table insert of `setHeaderStatic`/`setHeaderBorrowed`: replace by
+    /// name, else append; the slices are stored as given.
+    fn storeHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) error{ HeadersSent, TooManyHeaders }!void {
         if (rw.sent_head) return error.HeadersSent;
         for (rw.headers[0..rw.headers_len]) |*hd| {
             if (std.ascii.eqlIgnoreCase(hd.name, name)) {
@@ -4394,7 +4429,12 @@ pub const ResponseWriter = struct {
                 try out.print("{s}: W/{s}\r\n", .{ hd.name, hd.value });
                 continue;
             }
-            try out.print("{s}: {s}\r\n", .{ hd.name, hd.value });
+            // Four writes, not `print`: the format machinery was most of the
+            // cost of a header line (aaa-gate's 401, 2026-10-25).
+            try out.writeAll(hd.name);
+            try out.writeAll(": ");
+            try out.writeAll(hd.value);
+            try out.writeAll("\r\n");
         }
         if (!saw_date) if (rw.date) |d| try out.print("Date: {s}\r\n", .{d});
         if (!saw_server) if (rw.server_name) |sn| try out.print("Server: {s}\r\n", .{sn});
@@ -4609,7 +4649,16 @@ fn validHeaderName(name: []const u8) bool {
 /// bytes a reflected value would use to inject headers or split the
 /// response). Everything else (including obs-text) is passed through.
 fn validHeaderValue(value: []const u8) bool {
-    for (value) |c| if (c == '\r' or c == '\n' or c == 0) return false;
+    // 16 bytes at a time, then the tail (a byte loop was a per-request cost
+    // for every fixed header a middleware sets, 2026-10-25).
+    const V = @Vector(16, u8);
+    var i: usize = 0;
+    while (i + 16 <= value.len) : (i += 16) {
+        const v: V = value[i..][0..16].*;
+        const bad = (v == @as(V, @splat('\r'))) | (v == @as(V, @splat('\n'))) | (v == @as(V, @splat(0)));
+        if (@reduce(.Or, bad)) return false;
+    }
+    for (value[i..]) |c| if (c == '\r' or c == '\n' or c == 0) return false;
     return true;
 }
 
@@ -5827,6 +5876,42 @@ test "ResponseWriter: setHeaderStatic — replace both ways, no header_buf spend
         "Content-Length: 0\r\n" ++
         "\r\n", out.buffered());
     try testing.expectError(error.HeadersSent, rw.setHeaderStatic("X-Late", "1"));
+}
+
+test "ResponseWriter: setHeaderBorrowed — HeaderValue checked once, lent not copied, replaces like setHeaderStatic" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    var held: [24]u8 = "Bearer realm=\"api\"".* ++ @as([6]u8, @splat(' '));
+    const v = try ResponseWriter.HeaderValue.init(held[0..18]);
+    try rw.setHeader("www-authenticate", "old");
+    try rw.setHeaderBorrowed("WWW-Authenticate", v); // replaces the dynamic one
+    try testing.expectEqual(@as(usize, "www-authenticate".len + "old".len), rw.header_buf_len); // nothing more copied
+    try rw.end();
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "WWW-Authenticate: Bearer realm=\"api\"\r\n" ++
+        "Content-Length: 0\r\n" ++
+        "\r\n", out.buffered());
+    try testing.expectError(error.HeadersSent, rw.setHeaderBorrowed("X-Late", v));
+}
+
+test "validHeaderValue / HeaderValue.init: CR, LF and NUL refused at every position and length 0..40" {
+    // The 16-byte vector chunks and the byte tail both see every bad byte.
+    var buf: [40]u8 = undefined;
+    for (0..buf.len + 1) |len| {
+        @memset(buf[0..len], 'a');
+        try testing.expect(validHeaderValue(buf[0..len]));
+        for (0..len) |at| {
+            for ("\r\n\x00") |bad| {
+                buf[at] = bad;
+                try testing.expect(!validHeaderValue(buf[0..len]));
+                try testing.expectError(error.InvalidHeader, ResponseWriter.HeaderValue.init(buf[0..len]));
+                buf[at] = 'a';
+            }
+        }
+    }
 }
 
 test "ResponseWriter: setHeaderStatic hits the same table limit as setHeader" {
