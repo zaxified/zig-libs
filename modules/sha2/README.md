@@ -1,6 +1,7 @@
 # sha2
 
-**SHA-224, SHA-256, SHA-384 and SHA-512 (FIPS 180-4)**, a drop-in for
+**SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 (FIPS
+180-4)**, plus std's truncations `Sha256T192`/`Sha512T224`/`Sha512T256`, a drop-in for
 `std.crypto.hash.sha2` that is faster wherever a message is hashed in runs of
 two or more blocks (from 128 bytes for SHA-256, 256 for SHA-384/512): 1.24–1.40×
 std from 1 KiB up on an AVX2 CPU without SHA-NI (below). The types have std's
@@ -48,12 +49,18 @@ CPU model to get the SIMD schedule.
 **Where the gain is, and where it is not.** The speed-up comes from computing
 the message schedules of up to 8 SHA-256 blocks (4 SHA-512 blocks) together,
 so it applies to `update` calls that carry two or more whole blocks. A lone
-block — a short message, the padding block of `final`, each of HMAC's key-pad
-blocks — runs the scalar rounds at std's speed: on this CPU the rounds are
-bound by instruction count, not by the schedule. Short messages are therefore
-no slower than std, and not faster either.
+block is a short message, the padding block of `final`, or one of HMAC's
+key-pad blocks. For SHA-224/256 it gets a one-block vector schedule, about
+5 % faster than std (775 vs 819 cycles per block in a dependent chain). For
+SHA-384/512 it runs std's scalar form at std's speed.
 
 ## Speed
+
+Against OpenSSL 3.5.5 (`zig build bench-sha2`, by cycles, 2026-10-25):
+0.50–0.88× OpenSSL's EVP calls for messages up to 256 bytes. HMAC over a
+256-byte message is 0.67–0.69× OpenSSL's `HMAC()`. Bulk from 16 KiB up is
+1.11–1.15×, because OpenSSL's hand-written rounds retire the same
+instructions at a higher rate (SPEC.md § Speed). Against std:
 
 MB/s, best of 5, ReleaseFast, one-shot `hash`, on the development notebook
 (2026-09-29, i7-7920HQ Kaby Lake: AVX2, BMI2, no SHA-NI; a loaded machine,

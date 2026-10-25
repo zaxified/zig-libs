@@ -3,7 +3,8 @@
 //! sha2 — SHA-224/256/384/512 (FIPS 180-4), a faster drop-in for
 //! `std.crypto.hash.sha2`.
 //!
-//! `Sha224`, `Sha256`, `Sha384` and `Sha512` have the declarations of their
+//! `Sha224`, `Sha256`, `Sha384`, `Sha512`, `Sha512_224`, `Sha512_256`,
+//! `Sha256T192`, `Sha512T224` and `Sha512T256` have the declarations of their
 //! std namesakes — `block_length`, `digest_length`, `Options`, `init`,
 //! `update`, `peek`, `final`, `finalResult`, `hash` — so a consumer swaps the
 //! type and nothing else, and `std.crypto.auth.hmac.Hmac(sha2.Sha256)` /
@@ -34,8 +35,9 @@
 //!   instructions (x86-64 SHA-NI + AVX2, arm64 `sha2`): compression is handed
 //!   to std, which is faster than anything here on such a CPU.
 //! - `.simd` — the multi-block schedule above, on x86-64 with AVX2 under the
-//!   LLVM backend. Runs of two or more whole blocks take it; a lone block
-//!   (and the padding block of `final`) takes the scalar path.
+//!   LLVM backend. Runs of two or more whole blocks take it. A lone block
+//!   (and the padding block of `final`) takes `compressOne`, a four-word
+//!   vector schedule, for SHA-224/256, and the scalar path for SHA-384/512.
 //! - `.scalar` — everything else: the same rounds with the schedule computed
 //!   inline, 16 words at a time. Pure Zig, every target and backend.
 //!
@@ -46,7 +48,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .doc = "SHA-224/256/384/512 (FIPS 180-4) — drop-in for std.crypto.hash.sha2 (also under std's Hmac/Hkdf); an AVX2 multi-block message schedule makes runs of 2+ blocks 1.24–1.40× std on x86-64 without SHA-NI, std's own SHA-NI/ARMv8 path where the target has it.",
+    .doc = "SHA-224/256/384/512 and SHA-512/224, /256 (FIPS 180-4) — drop-in for std.crypto.hash.sha2 (also under std's Hmac/Hkdf); an AVX2 multi-block message schedule makes runs of 2+ blocks 1.24–1.40× std on x86-64 without SHA-NI, std's own SHA-NI/ARMv8 path where the target has it.",
     .platform_note = "any (AVX2 SIMD schedule on x86-64 + portable scalar fallback)",
     .targets = .{.linux64},
     .platform = .any,
@@ -62,6 +64,15 @@ pub const Sha224 = Sha2(u32, iv224, 224);
 pub const Sha256 = Sha2(u32, iv256, 256);
 pub const Sha384 = Sha2(u64, iv384, 384);
 pub const Sha512 = Sha2(u64, iv512, 512);
+/// SHA-512/224 and SHA-512/256 (FIPS 180-4 §6.7): SHA-512 under the initial
+/// values of §5.3.6, truncated. Not the same digest as `Sha512T224`/`T256`.
+pub const Sha512_224 = Sha2(u64, sha512tIv(224), 224);
+pub const Sha512_256 = Sha2(u64, sha512tIv(256), 256);
+/// std's plain truncations (no own initial values): the leftmost bits of the
+/// SHA-256 / SHA-512 digest, with std's names.
+pub const Sha256T192 = Sha2(u32, iv256, 192);
+pub const Sha512T224 = Sha2(u64, iv512, 224);
+pub const Sha512T256 = Sha2(u64, iv512, 256);
 
 /// How the compression function runs. Fixed at compile time per word size.
 pub const Backend = enum {
@@ -76,7 +87,7 @@ pub const Backend = enum {
 
 fn Sha2(comptime Word: type, comptime iv: [8]Word, comptime digest_bits: comptime_int) type {
     const E = Engine(Word);
-    comptime std.debug.assert(digest_bits % @bitSizeOf(Word) == 0);
+    comptime std.debug.assert(digest_bits % 8 == 0 and digest_bits <= 8 * @bitSizeOf(Word));
     return struct {
         const Self = @This();
         /// Bytes per compression block: 64 for SHA-224/256, 128 for SHA-384/512.
@@ -163,6 +174,13 @@ fn Sha2(comptime Word: type, comptime iv: [8]Word, comptime digest_bits: comptim
             const n_words = digest_length / @sizeOf(Word);
             inline for (0..n_words) |j| {
                 std.mem.writeInt(Word, out[j * @sizeOf(Word) ..][0..@sizeOf(Word)], d.s[j], .big);
+            }
+            // SHA-512/224 and SHA-512T224 end inside a word: its leading bytes.
+            const tail = digest_length % @sizeOf(Word);
+            if (tail != 0) {
+                var last: [@sizeOf(Word)]u8 = undefined;
+                std.mem.writeInt(Word, &last, d.s[n_words], .big);
+                out[n_words * @sizeOf(Word) ..].* = last[0..tail].*;
             }
         }
 
@@ -262,6 +280,25 @@ const iv224 = blk: {
     for (&v, iv384) |*x, y| x.* = @truncate(y);
     break :blk v;
 };
+
+/// FIPS 180-4 §5.3.6: the initial values of SHA-512/t are the SHA-512 digest
+/// of the ASCII string "SHA-512/t", computed under SHA-512's initial values
+/// each XORed with 0xa5a5a5a5a5a5a5a5.
+fn sha512tIv(comptime t: comptime_int) [8]u64 {
+    comptime std.debug.assert(t != 384 and t < 512);
+    return comptime blk: {
+        @setEvalBranchQuota(200_000);
+        var gen: [8]u64 = iv512;
+        for (&gen) |*x| x.* ^= 0xa5a5a5a5a5a5a5a5;
+        var d = Sha2(u64, gen, 512).init(.{});
+        d.update(std.fmt.comptimePrint("SHA-512/{d}", .{t}));
+        var out: [64]u8 = undefined;
+        d.final(&out);
+        var v: [8]u64 = undefined;
+        for (&v, 0..) |*x, i| x.* = std.mem.readInt(u64, out[i * 8 ..][0..8], .big);
+        break :blk v;
+    };
+}
 
 // ── the compression engine, generic over the word size ─────────────────────
 
@@ -485,7 +522,78 @@ fn Engine(comptime Word: type) type {
                 for (0..n) |j| roundsFromTable(s, table, j);
                 p = p[n * block_len ..];
             }
-            if (p.len != 0) compressScalar(s, p[0..block_len]);
+            if (p.len != 0) {
+                // SHA-512's lone block is faster scalar (968 vs 1007 cycles in a
+                // dependent chain, Kaby Lake, 2026-10-25); SHA-256's is not
+                // (819 vs 775).
+                if (Word == u32) compressOne(s, p[0..block_len]) else compressScalar(s, p[0..block_len]);
+            }
+        }
+
+        // ── one block, schedule four words per vector ─────────────────────
+        //
+        // A lone block (a short message, `final`'s padding block, HMAC's key
+        // pads) has no neighbours to share a schedule with. Intel's
+        // single-buffer form: words t..t+3 of ONE block in one vector, the
+        // next four computed while the scalar rounds consume the current
+        // four, so the schedule runs on the vector ports beside the rounds
+        // instead of in the scalar instruction stream. σ1 reaches back only
+        // two words, so the new vector's upper half depends on its lower
+        // half: σ1 is applied twice, to words t−2, t−1 (lanes 0, 1) and then
+        // to the fresh t, t+1 (lanes 2, 3).
+
+        const V4 = @Vector(4, Word);
+        const Shift4 = @Vector(4, Shift);
+
+        inline fn rotr4(x: V4, comptime n: comptime_int) V4 {
+            return (x >> @as(Shift4, @splat(n))) | (x << @as(Shift4, @splat(bits - n)));
+        }
+
+        inline fn sigma0x4(x: V4) V4 {
+            return rotr4(x, small0[0]) ^ rotr4(x, small0[1]) ^ (x >> @as(Shift4, @splat(small0[2])));
+        }
+
+        inline fn sigma1x4(x: V4) V4 {
+            return rotr4(x, small1[0]) ^ rotr4(x, small1[1]) ^ (x >> @as(Shift4, @splat(small1[2])));
+        }
+
+        /// `K` in groups of four, as vectors.
+        const K4: [rounds / 4]V4 = blk: {
+            var k: [rounds / 4]V4 = undefined;
+            for (&k, 0..) |*x, g| x.* = K[4 * g ..][0..4].*;
+            break :blk k;
+        };
+
+        /// Words t..t+3 from the sixteen before them, `x0` = W[t−16..t−13]
+        /// up to `x3` = W[t−4..t−1].
+        inline fn schedule4(x0: V4, x1: V4, x2: V4, x3: V4) V4 {
+            const w15 = @shuffle(Word, x0, x1, @Vector(4, i32){ 1, 2, 3, ~@as(i32, 0) }); // W[t−15..t−12]
+            const w7 = @shuffle(Word, x2, x3, @Vector(4, i32){ 1, 2, 3, ~@as(i32, 0) }); // W[t−7..t−4]
+            const part = x0 +% sigma0x4(w15) +% w7;
+            const prev2 = @shuffle(Word, x3, undefined, @Vector(4, i32){ 2, 3, 2, 3 }); // W[t−2], W[t−1]
+            const low = part +% sigma1x4(prev2); // lanes 0, 1 final: W[t], W[t+1]
+            const fresh = @shuffle(Word, low, undefined, @Vector(4, i32){ 0, 1, 0, 1 });
+            const high = part +% sigma1x4(fresh); // lanes 2, 3 final: W[t+2], W[t+3]
+            return @shuffle(Word, low, high, @Vector(4, i32){ 0, 1, ~@as(i32, 2), ~@as(i32, 3) });
+        }
+
+        fn compressOne(s: *[8]Word, block: *const [block_len]u8) void {
+            var x: [4]V4 = undefined;
+            inline for (0..4) |i| {
+                const src: *align(1) const V4 = @ptrCast(block[i * 4 * bytes ..][0 .. 4 * bytes]);
+                const raw = src.*;
+                x[i] = if (builtin.cpu.arch.endian() == .little) @byteSwap(raw) else raw;
+            }
+            var v = s.*;
+            var bc = v[1] ^ v[2];
+            inline for (0..rounds / 4) |g| {
+                const wk: [4]Word = x[g % 4] +% K4[g];
+                if (g + 4 < rounds / 4) {
+                    x[g % 4] = schedule4(x[g % 4], x[(g + 1) % 4], x[(g + 2) % 4], x[(g + 3) % 4]);
+                }
+                inline for (0..4) |i| round(&v, &bc, 4 * g + i, wk[i]);
+            }
+            inline for (s, v) |*y, z| y.* +%= z;
         }
     };
 }
@@ -532,7 +640,11 @@ fn WordOf(comptime H: type) type {
 }
 
 fn StdOf(comptime H: type) type {
-    return if (H == Sha224) std.crypto.hash.sha2.Sha224 else if (H == Sha256) std.crypto.hash.sha2.Sha256 else if (H == Sha384) std.crypto.hash.sha2.Sha384 else std.crypto.hash.sha2.Sha512;
+    const S = std.crypto.hash.sha2;
+    inline for (all_hashes, .{ S.Sha224, S.Sha256, S.Sha384, S.Sha512, S.Sha512_224, S.Sha512_256, S.Sha256T192, S.Sha512T224, S.Sha512T256 }) |ours, theirs| {
+        if (H == ours) return theirs;
+    }
+    unreachable;
 }
 
 const m448 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
@@ -545,6 +657,18 @@ const Kat = struct { msg: []const u8, hex: []const u8 };
 /// the NIST SHAVS / FIPS 180-2 appendix; values cross-checked against CPython's
 /// `hashlib` (OpenSSL) on 2026-09-29.
 fn kats(comptime H: type) [4]Kat {
+    if (H == Sha512_224) return .{
+        .{ .msg = "", .hex = "6ed0dd02806fa89e25de060c19d3ac86cabb87d6a0ddd05c333b84f4" },
+        .{ .msg = "abc", .hex = "4634270f707b6a54daae7530460842e20e37ed265ceee9a43e8924aa" },
+        .{ .msg = m448, .hex = "e5302d6d54bb242275d1e7622d68df6eb02dedd13f564c13dbda2174" },
+        .{ .msg = m896, .hex = "23fec5bb94d60b23308192640b0c453335d664734fe40e7268674af9" },
+    };
+    if (H == Sha512_256) return .{
+        .{ .msg = "", .hex = "c672b8d1ef56ed28ab87c3622c5114069bdd3ad7b8f9737498d0c01ecef0967a" },
+        .{ .msg = "abc", .hex = "53048e2681941ef99b2e29b76b4c7dabe4c2d0c634fc6d46e0e2f13107e7af23" },
+        .{ .msg = m448, .hex = "bde8e1f9f19bb9fd3406c90ec6bc47bd36d8ada9f11880dbc8a22a7078b6a461" },
+        .{ .msg = m896, .hex = "3928e184fb8690f840da3988121d31be65cb9d3ef83ee6146feac861e19b563a" },
+    };
     return switch (H.digest_length * 8) {
         224 => .{
             .{ .msg = "", .hex = "d14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f" },
@@ -575,6 +699,8 @@ fn kats(comptime H: type) [4]Kat {
 }
 
 fn millionA(comptime H: type) []const u8 {
+    if (H == Sha512_224) return "37ab331d76f0d36de422bd0edeb22a28accd487b7a8453ae965dd287";
+    if (H == Sha512_256) return "9a59a052930187a97038cae692f30708aa6491923ef5194394dc68d56c74fb21";
     return switch (H.digest_length * 8) {
         224 => "20794655980c91d8bbb4c1ea97618a4bf03f42581948b2ee4ee7ad67",
         256 => "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
@@ -584,7 +710,11 @@ fn millionA(comptime H: type) []const u8 {
     };
 }
 
-const all_hashes = .{ Sha224, Sha256, Sha384, Sha512 };
+/// Every type with its own known answers (FIPS 180-4 / NIST examples,
+/// cross-checked against CPython's `hashlib`).
+const fips_hashes = .{ Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256 };
+/// Every public type; each has a std twin of the same name.
+const all_hashes = .{ Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256, Sha256T192, Sha512T224, Sha512T256 };
 
 test "derived constants match FIPS 180-4" {
     const E32 = Engine(u32);
@@ -605,6 +735,13 @@ test "derived constants match FIPS 180-4" {
     try testing.expectEqual(@as(u64, 0x47b5481dbefa4fa4), iv384[7]);
     try testing.expectEqual(@as(u64, 0x6a09e667f3bcc908), iv512[0]);
     try testing.expectEqual(@as(u64, 0x5be0cd19137e2179), iv512[7]);
+    // §5.3.6.1 / §5.3.6.2, generated by the IV generation function.
+    const iv512_224 = sha512tIv(224);
+    try testing.expectEqual(@as(u64, 0x8c3d37c819544da2), iv512_224[0]);
+    try testing.expectEqual(@as(u64, 0x1112e6ad91d692a1), iv512_224[7]);
+    const iv512_256 = sha512tIv(256);
+    try testing.expectEqual(@as(u64, 0x22312194fc2bf72c), iv512_256[0]);
+    try testing.expectEqual(@as(u64, 0x0eb72ddc81c52ca2), iv512_256[7]);
 }
 
 test "std-compatible declarations" {
@@ -645,7 +782,7 @@ test "the default backend on this target" {
 
 test "FIPS 180-4 known answers, every backend" {
     defer test_hooks.forced = null;
-    inline for (all_hashes) |H| {
+    inline for (fips_hashes) |H| {
         for (backendsFor(WordOf(H))) |b| {
             test_hooks.forced = b;
             for (kats(H)) |k| {
@@ -667,7 +804,7 @@ test "one million 'a', every backend" {
     // path carry it.
     var chunk: [1000]u8 = undefined;
     @memset(&chunk, 'a');
-    inline for (all_hashes) |H| {
+    inline for (fips_hashes) |H| {
         for (backendsFor(WordOf(H))) |b| {
             test_hooks.forced = b;
             var d = H.init(.{});
