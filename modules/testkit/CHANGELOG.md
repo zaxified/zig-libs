@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **CONSUMER-VISIBLE (additive):** `testkit.child` is public: run a function in a forked child and get how it ended (exit code, signal, hang at the limit) -- how a test asserts a panic. First user: workerpool's "wait() from a job panics" test.
+
 - **2026-10-25** — **Added:** `bench.GoBuild.out` (default `"go_bench"`, the old fixed name): the binary's name in the work directory, so a bench can build a second Go program beside its reference (first user: `bench-aaa-gate`'s fast contenders).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

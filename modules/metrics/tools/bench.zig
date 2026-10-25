@@ -43,6 +43,14 @@
 //! 100 ms, best of five); the sides alternate for BENCH_ROUNDS (default 3)
 //! rounds, each keeping its best. Ratios are ours/Go by wall time; the verdict
 //! is the WORST ratio. Arguments filter workloads.
+//!
+//! Fastest in the field (skipped with arguments or BENCH_FAST=0): the four
+//! instrument rows (counter_inc, observe, counter_vec, scrape) against
+//! VictoriaMetrics/metrics v1.44.1 (`tools/go_fast_bench`) and
+//! prometheus-client 0.25.1 (`tools/rust_fast_bench`, needs cargo and the
+//! crates fetched), each in its own idiom; `scrape` there counts sample
+//! lines, not bytes. The card's `fastest` is the worst row's ratio to its
+//! faster contender.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -280,8 +288,107 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    if (filters.len > 0 or !use_fast) {
+        if (filters.len == 0)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+        try w.flush();
+        return 0;
+    }
+
+    // ---- fastest in the field: the instrument rows against the contenders ----
+    // serve_* stay reference-only: neither contender ships request
+    // middleware. Per row the verdict is ours over the faster contender;
+    // the card's `fastest` is the worst row.
+    try w.flush();
+    const fast_go = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = fast_go_dir, .abs = abs, .out = "go_fast_bench" });
+    try rustBuild(arena, io, init.environ_map);
+    try w.print("\nfastest in the field -- {d} rounds, ours re-timed beside each\n", .{rounds});
+    try w.print("{s:<14} {s:<26} {s:>11} {s:>11} {s:>8}  count\n", .{ "workload", "contender", "its ns", "ours ns", "ours/it" });
+    var worst_fast: f64 = 0;
+    var worst_row: []const u8 = "";
+    var worst_who: []const u8 = "";
+    for (fast_rows) |wi| {
+        var row_ratio: f64 = 0;
+        var row_who: []const u8 = "";
+        for (fast) |c| {
+            var ours: bench.Side = .{};
+            var it: bench.Side = .{};
+            for (0..rounds) |_| {
+                it.add(try bench.foreignArgv(arena, io, bench_name, &.{ if (c.go) fast_go else rust_exe, abs, names[wi] }, names[wi], null));
+                ours.add(bench.timeIt(io, .{ .fd = null }, onceFast, .{ &d, wi }, true));
+            }
+            const r = ours.best_ns / it.best_ns;
+            if (r > row_ratio) {
+                row_ratio = r;
+                row_who = c.label;
+            }
+            const same = it.count == ours.count;
+            mismatch = mismatch or !same;
+            try w.print("{s:<14} {s:<26} {d:>11.0} {d:>11.0} {d:>8.3}  {d}{s}\n", .{ names[wi], c.label, it.best_ns, ours.best_ns, r, it.count, if (same) "" else " ≠ ours" });
+            try w.flush();
+        }
+        if (row_ratio > worst_fast) {
+            worst_fast = row_ratio;
+            worst_row = names[wi];
+            worst_who = row_who;
+        }
+    }
+    if (mismatch) {
+        try w.writeAll(bench_name ++ ": FAILED -- a contender's count differs from ours; the timing means nothing until it agrees\n");
+        try w.flush();
+        return 1;
+    }
+    try w.print("\nworst ours/fastest = {d:.2} ({s}, {s})\n", .{ worst_fast, worst_row, worst_who });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} ({s}) (measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_who, worst_row });
     try w.flush();
     return 0;
+}
+
+/// `once`, except that `scrape` returns the number of sample lines: the
+/// contenders format floats and order series differently, so a byte sum
+/// cannot agree across libraries, while the 195 samples must.
+fn onceFast(d: *const Data, w: usize) u64 {
+    if (w != 3) return once(d, w);
+    var out: std.Io.Writer = .fixed(d.scrape_buf);
+    d.scrape_reg.writeText(&out) catch unreachable;
+    var n: u64 = 0;
+    var start = true;
+    for (out.buffered()) |c| {
+        if (start and c != '#' and c != '\n') n += 1;
+        start = c == '\n';
+    }
+    return n;
+}
+
+/// The rows (indices into `names`) the contenders run.
+const fast_rows = [_]usize{ 0, 1, 2, 3 };
+/// A contender: the Go program (VictoriaMetrics) or the Rust one (client_rust).
+const Fast = struct { label: []const u8, go: bool };
+const fast = [_]Fast{
+    .{ .label = "VictoriaMetrics/metrics v1.44.1", .go = true },
+    .{ .label = "prometheus-client 0.25.1", .go = false },
+};
+const fast_go_dir = "modules/metrics/tools/go_fast_bench";
+const rust_manifest = "modules/metrics/tools/rust_fast_bench/Cargo.toml";
+const rust_target = work_dir ++ "/rust-target";
+const rust_exe = rust_target ++ "/release/rust_fast_bench";
+
+/// Build the Rust side once, offline (the crates are in the cargo registry
+/// after `cargo fetch`; Cargo.lock is committed).
+fn rustBuild(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map) !void {
+    var env = try environ.clone(arena);
+    try env.put("CARGO_NET_OFFLINE", "true");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--locked", "--manifest-path", rust_manifest, "--target-dir", rust_target },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the contenders\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
 }

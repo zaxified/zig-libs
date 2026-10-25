@@ -229,7 +229,7 @@ pub const module_list = [_]Module{
     .{ .name = "liveness-hyst", .libs = &.{"net"}, .deps = &.{ "netsim", "latency-stats" } },
     .{ .name = "loopix", .libs = &.{"net"}, .deps = &.{ "netsim", "sphinx" }, .test_deps = &.{"testkit"} },
     .{ .name = "lockfree", .libs = &.{"net"} },
-    .{ .name = "workerpool", .libs = &.{"net"}, .deps = &.{"lockfree"} },
+    .{ .name = "workerpool", .libs = &.{"net"}, .deps = &.{"lockfree"}, .test_deps = &.{"testkit"} },
     .{ .name = "shardstore", .libs = &.{"net"}, .deps = &.{"kvtree"} },
     .{ .name = "writebehind", .libs = &.{"net"}, .deps = &.{ "ramcache", "workerpool", "jobqueue", "kvtree" } },
     .{ .name = "pagecache", .libs = &.{"net"}, .deps = &.{ "kvtree", "ramcache" } },

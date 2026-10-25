@@ -702,21 +702,57 @@ const Child = struct {
     }
 };
 
-/// Hash of a label-value tuple: each value length-prefixed, so ("ab","c")
-/// and ("a","bc") differ.
+/// Hash of a label-value tuple: one-shot Wyhash per value, chained through
+/// the seed, which also takes the value's length, so ("ab","c") and
+/// ("a","bc") differ. The streaming `Wyhash.init`/`update` form cost 43 %
+/// of `Vec.with` (buffer copies for short values; 2026-10-25 profile).
 fn hashValues(values: []const []const u8) u64 {
-    var h = std.hash.Wyhash.init(0);
-    for (values) |v| {
-        h.update(std.mem.asBytes(&v.len));
-        h.update(v);
-    }
-    return h.final();
+    var h: u64 = 0;
+    for (values) |v| h = std.hash.Wyhash.hash(h +% v.len, v);
+    return h;
 }
 
 fn eqlValues(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
-    for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    for (a, b) |x, y| if (!eqlShort(x, y)) return false;
     return true;
+}
+
+/// `std.mem.eql` for the short strings label values are: overlapping word
+/// loads instead of an out-of-line call (it was 18 % of `Vec.with`).
+inline fn eqlShort(x: []const u8, y: []const u8) bool {
+    const n = x.len;
+    if (n != y.len) return false;
+    if (n == 0 or x.ptr == y.ptr) return true;
+    if (n < 4) {
+        return x[0] == y[0] and x[n >> 1] == y[n >> 1] and x[n - 1] == y[n - 1];
+    }
+    if (n < 8) {
+        const lo = std.mem.readInt(u32, x[0..4], .little) ^ std.mem.readInt(u32, y[0..4], .little);
+        const hi = std.mem.readInt(u32, x[n - 4 ..][0..4], .little) ^ std.mem.readInt(u32, y[n - 4 ..][0..4], .little);
+        return lo | hi == 0;
+    }
+    var i: usize = 0;
+    while (i + 8 < n) : (i += 8) {
+        if (std.mem.readInt(u64, x[i..][0..8], .little) != std.mem.readInt(u64, y[i..][0..8], .little)) return false;
+    }
+    return std.mem.readInt(u64, x[n - 8 ..][0..8], .little) == std.mem.readInt(u64, y[n - 8 ..][0..8], .little);
+}
+
+test "eqlShort: every length 0..24, a difference at every position" {
+    var a: [24]u8 = undefined;
+    var b: [24]u8 = undefined;
+    for (0..25) |n| {
+        for (a[0..n], 0..) |*c, i| c.* = @intCast('a' + i % 26);
+        @memcpy(b[0..n], a[0..n]);
+        try std.testing.expect(eqlShort(a[0..n], b[0..n]));
+        for (0..n) |pos| {
+            b[pos] ^= 0x20;
+            try std.testing.expect(!eqlShort(a[0..n], b[0..n]));
+            b[pos] ^= 0x20;
+        }
+        if (n > 0) try std.testing.expect(!eqlShort(a[0..n], b[0 .. n - 1]));
+    }
 }
 
 /// `Family.index` context: children keyed by their own label values.
@@ -1102,8 +1138,13 @@ pub const Registry = struct {
                     break :blk2 o;
                 } else .{},
             };
-            try r.families.append(a, f);
-            try r.family_index.put(a, f.name, f);
+            // Both containers reserved before either changes (audit M2,
+            // 2026-10-25): a list entry without its index entry would let a
+            // retry register a second family of the same name.
+            try r.families.ensureUnusedCapacity(a, 1);
+            try r.family_index.ensureUnusedCapacity(a, 1);
+            r.families.appendAssumeCapacity(f);
+            r.family_index.putAssumeCapacity(f.name, f);
             break :blk f;
         };
 
@@ -1257,11 +1298,23 @@ pub const Registry = struct {
     /// are conventionally well under this; the alternative is an
     /// allocation on every histogram registration to guard a case this
     /// module has never seen.
+    /// The sample-name suffixes a family of `kind` writes besides its name.
+    fn derivedSuffixes(kind: Kind) ?[]const []const u8 {
+        return switch (kind) {
+            .histogram => &.{ "_bucket", "_sum", "_count" },
+            .summary => &.{ "_sum", "_count" },
+            else => null,
+        };
+    }
+
     fn checkSuffixCollisionLocked(r: *Registry, name: []const u8, kind: Kind) RegisterError!void {
+        // A summary derives `_sum`/`_count` too (audit M1, 2026-10-25: a
+        // summary beside a `<name>_count` counter was accepted, and the
+        // scrape then carried a duplicate sample Prometheus refuses).
         const suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
-        if (kind == .histogram) {
+        if (derivedSuffixes(kind)) |own| {
             var buf: [256]u8 = undefined;
-            for (suffixes) |suf| {
+            for (own) |suf| {
                 const derived = std.mem.print(&buf, "{s}{s}", .{ name, suf }) catch continue;
                 if (r.family_index.contains(derived)) return error.NameCollision;
             }
@@ -1270,7 +1323,8 @@ pub const Registry = struct {
             if (!std.mem.endsWith(u8, name, suf)) continue;
             const base = name[0 .. name.len - suf.len];
             if (r.family_index.get(base)) |f| {
-                if (f.kind == .histogram) return error.NameCollision;
+                const theirs = derivedSuffixes(f.kind) orelse continue;
+                for (theirs) |t| if (std.mem.eql(u8, t, suf)) return error.NameCollision;
             }
         }
     }
@@ -5049,6 +5103,8 @@ test {
     _ = summary_mod;
     _ = @import("go_oracle_test.zig");
     _ = @import("go_register_test.zig");
+    _ = @import("lead_test.zig");
+    _ = @import("audit_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

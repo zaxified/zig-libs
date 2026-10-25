@@ -8,8 +8,9 @@ substrate for the P2 write-behind data-layer coordinator (DL5), which submits
 "flush this dirty entry to the sink" jobs to run off the request path.
 
 Clean lifecycle: `init` → `submit` / `Submitter.submit` → `drain` (graceful) or
-`shutdownNow` (abrupt) → `deinit`. Idle workers sleep on an `std.Io` futex (no
-busy-spin); the pool owns its threads; misuse returns typed errors, never
+`shutdownNow` (abrupt) → `deinit`. Idle workers sleep on an `std.Io` futex after a
+short bounded spin (`Options.spin_ns`, 50 µs by default; 0 parks at once);
+the pool owns its threads; misuse returns typed errors, never
 panics.
 
 ```zig

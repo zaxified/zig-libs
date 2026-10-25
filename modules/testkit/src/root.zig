@@ -57,7 +57,7 @@ test {
     _ = stackprobe;
     _ = bench;
     _ = guard;
-    _ = @import("child.zig");
+    _ = child;
     _ = @import("shrink.zig");
     _ = @import("fault.zig");
     _ = @import("fuzz_test.zig");
@@ -81,6 +81,9 @@ pub const bench = @import("bench.zig");
 /// Memory between two unreadable pages: a harness input whose overread
 /// faults instead of passing unseen.
 pub const guard = @import("guard.zig");
+/// Run a function in a forked child and say how it ended (exit code, signal,
+/// or a hang at the limit): how a test asserts a panic or a deadlock.
+pub const child = @import("child.zig");
 
 pub const expectHex = @import("golden.zig").expectHex;
 pub const expectBytes = @import("golden.zig").expectBytes;

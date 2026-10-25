@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **CONSUMER-VISIBLE:** `Options.spin_ns` defaults to 50 µs (was 0): a worker that finds the queue empty, and now also a `wait` caller that finds the pool busy, keep looking for up to 50 µs before they park (owner's decision; an idle pool spends 50 µs of CPU per worker after its last job, then sleeps). With it the pool is faster than rayon-core, threadpool and ants on every bench row; `.spin_ns = 0` restores the old behaviour. **Fixes:** a job submitted after `pause()` returned could still start (`pause` now waits for a worker between its pause check and its dequeue); a `wait` that saw a submit in flight stayed parked on an idle pool when that submit failed with `SubmitFailed` (the rollback now wakes waiters). Grade 1: model-fuzz harness (`src/model_fuzz_test.zig`, `WORKERPOOL_FUZZ`), the field measured (`tools/rust_fast_bench`, `tools/go_fast_bench`), the audit's tests (`src/audit_test.zig`, `src/lead_test.zig`). Needs `testkit` for its tests.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
 
 - **2026-10-14** — **The queue is now `lockfree.SegQueue(Job)`** (was `lockfree.MpmcQueue` over EBR

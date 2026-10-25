@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **CONSUMER-VISIBLE:** registering a summary beside a family named `<name>_sum` or `<name>_count` (either order) now fails with `error.NameCollision`, as a histogram already did; before, both were accepted and the scrape carried a duplicate sample Prometheus rejects (audit M1). A registration that runs out of memory half-way no longer leaves a family that a retry would duplicate (M2). `CounterVec`/`GaugeVec`/`HistogramVec.with` is about 2× faster (one-shot label hash, word-wise value compare). Grade 1: the field measured (VictoriaMetrics/metrics, prometheus/client_rust; `tools/go_fast_bench`, `tools/rust_fast_bench`), a correctness lead pinned (`src/lead_test.zig`, `tools/go_field_probe`), audit tests (`src/audit_test.zig`).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** test `delete/with racing concurrent scrapes` gives each churn thread its own family. Two threads deleting and incrementing the SAME series broke `delete`'s documented contract (a pointer from `with` must not be used after its series is deleted) — a write after free in the test itself, first caught by Zig 0.17's SafeAllocator (CI 39187640489, ReleaseFast). The library code is unchanged; the delete-vs-scrape race the test exists for is still exercised (2 churners incl. `reset`, 2 scrapers).

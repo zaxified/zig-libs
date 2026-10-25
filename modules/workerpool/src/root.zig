@@ -104,8 +104,12 @@ pub const Options = struct {
     /// buys anything over `submit` — both enqueue lock-free since the queue
     /// needs no per-thread participant — and is kept for source compatibility.
     max_submitters: usize = 0,
-    /// How long a worker that found the queue empty keeps looking before it
-    /// parks, in nanoseconds. 0 (the default) parks at once, as before.
+    /// How long a worker that found the queue empty -- and a `wait` caller
+    /// that found the pool busy -- keeps looking before it parks, in
+    /// nanoseconds. 0 parks at once. Default 50 µs (owner, 2026-10-25; was 0):
+    /// rayon and the Go runtime spin by default too, and without it the pool
+    /// measured 2-12x slower than rayon-core, threadpool and ants (pingpong
+    /// 11.9x ants), with it faster than each on every bench row.
     ///
     /// With short jobs a worker otherwise parks between every two, and every
     /// submit then pays a `futexWake` and every job a park -- two futex
@@ -114,7 +118,7 @@ pub const Options = struct {
     /// the job without entering the kernel. The spin always ends in the same
     /// park as before: an idle pool costs `spin_ns` of CPU per worker after
     /// its last job, then nothing.
-    spin_ns: u64 = 0,
+    spin_ns: u64 = 50 * std.time.ns_per_us,
     /// Upper bound on jobs that are submitted and not yet started
     /// (`queuedCount`). 0 (the default) = unbounded, as before. When set,
     /// `submit`/`Submitter.submit` refuse with `error.QueueFull` instead of
@@ -162,6 +166,10 @@ const JobQueue = lockfree.SegQueue(Job, .{});
 const Worker = struct {
     pool: *WorkerPool,
     thread: std.Thread = undefined,
+    /// Set while this worker is between its `paused` check and its pop
+    /// (`takeJob`); `pause` waits for it to clear. On its own cache line:
+    /// every take writes it.
+    taking: std.atomic.Value(bool) align(std.atomic.cache_line) = .init(false),
 };
 
 // ── the pool ─────────────────────────────────────────────────────────────────
@@ -232,6 +240,12 @@ pub const WorkerPool = struct {
     /// waiter is registered, and after a shutdown. Waiters park on a
     /// snapshot of it (same compare-at-entry argument as `notify`).
     done_gen: std.atomic.Value(u32) = .init(0),
+    /// `wait` callers that may be asleep in the kernel on `done_gen` (the
+    /// `idle` discipline for waiters): incremented right before the park,
+    /// decremented right after. A completion bumps `done_gen` for any
+    /// registered waiter but issues the `futexWake` only when this is
+    /// nonzero, so a waiter that is spinning costs the workers no syscall.
+    parked_waiters: std.atomic.Value(usize) = .init(0),
 
     /// Build and start the pool. Returns a heap-owned `*WorkerPool` so worker
     /// threads can hold a stable back-pointer (a by-value pool would move on
@@ -321,10 +335,23 @@ pub const WorkerPool = struct {
     /// queue at the instant of the call counts as running and finishes it.
     /// `drain` and `shutdownNow` override a pause. `wait` on a paused pool
     /// with queued jobs blocks until `resume` (as the reference's
-    /// `thpool_wait` would). Does not block and wakes nobody: a parked
-    /// worker notices the flag when it next wakes.
+    /// `thpool_wait` would). Wakes nobody: a parked worker notices the flag
+    /// when it next wakes. Blocks only while a worker is between its pause
+    /// check and its dequeue (a few instructions), so that once this returns
+    /// no job submitted afterwards can start: the worker sets `taking` before
+    /// it reads `paused`, this sets `paused` before it reads `taking` (both
+    /// seq_cst), so one of the two sees the other. (Audit 2026-10-25: without
+    /// it a worker that had checked the flag just before the call could still
+    /// dequeue and start a job submitted after it returned.)
     pub fn pause(self: *WorkerPool) void {
         self.paused.store(true, .seq_cst);
+        for (self.workers) |*w| {
+            var turn: u32 = 0;
+            while (w.taking.load(.seq_cst)) : (turn +%= 1) {
+                // A worker preempted inside its window: give it the core.
+                if (turn % 1024 == 1023) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
+            }
+        }
     }
 
     /// Undo `pause` and wake every parked worker. Idempotent.
@@ -357,12 +384,17 @@ pub const WorkerPool = struct {
     /// Lost-wakeup argument: the waiter registers (`waiters`) BEFORE it
     /// snapshots `done_gen` and checks the counts; a worker increments
     /// `completed` BEFORE it reads `waiters` (both seq_cst). So a completion
-    /// the check missed necessarily sees the registration, bumps `done_gen`,
-    /// and the park on the stale snapshot returns at once.
+    /// the check missed necessarily sees the registration; the one among
+    /// them that brings `completed` up to the `submitted` it then reads bumps
+    /// `done_gen`, and the park on the stale snapshot returns at once. A
+    /// completion that does not reach it leaves a job outstanding whose own
+    /// completion will (`submitted` only falls on a `SubmitFailed` rollback,
+    /// which wakes by itself).
     pub fn wait(self: *WorkerPool) bool {
         if (current_pool == self) @panic("workerpool: wait() called from a job of the same pool (would deadlock)");
         _ = self.waiters.fetchAdd(1, .seq_cst);
         defer _ = self.waiters.fetchSub(1, .seq_cst);
+        var spun = false;
         while (true) {
             const gen = self.done_gen.load(.seq_cst);
             if (self.completed.load(.seq_cst) == self.submitted.load(.seq_cst)) return true;
@@ -370,11 +402,22 @@ pub const WorkerPool = struct {
                 .running, .draining => {},
                 .stopping_now, .stopped => return false,
             }
+            // `Options.spin_ns` holds for the waiter too, once per call: watch
+            // the completion generation for a while before parking, so a short
+            // job's waiter does not pay a park and a wake (pingpong 1.57 → see
+            // SPEC). Only once: a long wait over a stream of completions would
+            // otherwise never park and burn a core (review 2026-10-25).
+            if (self.spin_ns != 0 and !spun) {
+                spun = true;
+                if (self.spinUntilChanged(&self.done_gen, gen)) continue;
+            }
             // Test seam -- see `wait_seam`.
             if (builtin.is_test) {
                 if (wait_seam.load(.seq_cst)) |f| f();
             }
+            _ = self.parked_waiters.fetchAdd(1, .seq_cst);
             self.io.futexWaitUncancelable(u32, &self.done_gen.raw, gen);
+            _ = self.parked_waiters.fetchSub(1, .seq_cst);
         }
     }
 
@@ -481,8 +524,12 @@ pub const WorkerPool = struct {
         // before it was submitted; a failed push leaves the queue unchanged.
         _ = self.submitted.fetchAdd(1, .monotonic);
         self.queue.push(job) catch {
-            _ = self.submitted.fetchSub(1, .monotonic);
+            // seq_cst + the `waiters` load: a `wait` that saw this job counted
+            // and parked must be released by its withdrawal (audit 2026-10-25:
+            // it otherwise slept on an idle pool until some other job ended).
+            _ = self.submitted.fetchSub(1, .seq_cst);
             self.releaseSlot();
+            if (self.waiters.load(.seq_cst) > 0) self.wakeWaiters();
             return error.SubmitFailed;
         };
 
@@ -517,11 +564,28 @@ pub const WorkerPool = struct {
 
     /// Worker-side dequeue: the job is counted as started before its slot is
     /// released, so `queued + working` never dips below the true count.
-    fn takeJob(self: *WorkerPool) ?Job {
+    /// Null while paused (and running): see `pause` for the `taking` handshake.
+    fn takeJob(self: *WorkerPool, w: *Worker) ?Job {
+        w.taking.store(true, .seq_cst);
+        defer w.taking.store(false, .release);
+        if (self.paused.load(.seq_cst) and self.state.load(.seq_cst) == .running) return null;
         const job = self.queue.pop() orelse return null;
         _ = self.started.fetchAdd(1, .seq_cst);
         self.releaseSlot();
         return job;
+    }
+
+    /// `Options.spin_ns`: watch `gen_word` for up to `spin_ns`; true when it
+    /// moved off `seen` (the caller re-evaluates instead of parking).
+    fn spinUntilChanged(self: *WorkerPool, gen_word: *const std.atomic.Value(u32), seen: u32) bool {
+        const until = std.Io.Timestamp.now(self.io, .awake).nanoseconds + self.spin_ns;
+        var turn: u32 = 0;
+        while (true) : (turn +%= 1) {
+            if (gen_word.load(.seq_cst) != seen) return true;
+            std.atomic.spinLoopHint();
+            // The clock every 64 turns: a vDSO call, cheap, not free.
+            if (turn % 64 == 63 and std.Io.Timestamp.now(self.io, .awake).nanoseconds >= until) return false;
+        }
     }
 
     /// Bump the generation and wake every parked worker. Called after a state
@@ -542,8 +606,19 @@ pub const WorkerPool = struct {
         job.func(job.ctx);
         // seq_cst, not monotonic: `wait`'s lost-wakeup argument needs this
         // increment ordered before the `waiters` load below.
-        _ = self.completed.fetchAdd(1, .seq_cst);
-        if (self.waiters.load(.seq_cst) > 0) self.wakeWaiters();
+        const done = self.completed.fetchAdd(1, .seq_cst) + 1;
+        // Only the completion that makes the pool idle can end a `wait`, so
+        // only it wakes (a long wait over a stream of jobs no longer takes a
+        // wake per job). A later submit's completion makes its own check; a
+        // `SubmitFailed` rollback and a shutdown wake by themselves.
+        if (self.waiters.load(.seq_cst) > 0 and done == self.submitted.load(.seq_cst)) {
+            // Bump first, then look for a sleeper: a waiter that counts itself
+            // parked after this load parks on a generation this bump already
+            // moved, and its futex compare returns at once (the `idle` F4
+            // argument).
+            _ = self.done_gen.fetchAdd(1, .seq_cst);
+            if (self.parked_waiters.load(.seq_cst) > 0) self.io.futexWake(u32, &self.done_gen.raw, std.math.maxInt(u32));
+        }
     }
 
     /// Take any jobs still in the queue without running them, counting them
@@ -611,6 +686,14 @@ var wait_seam: std.atomic.Value(?*const fn () void) = .init(null);
 /// sleeping through it. Same rules as `park_seam`.
 var pause_seam: std.atomic.Value(?*const fn () void) = .init(null);
 
+/// **Test-only seam BEFORE the pause branch's `notify` snapshot**: a worker
+/// has seen the flag set and not yet taken the generation it will park on. A
+/// `resume` or a shutdown landing here bumps the generation BEFORE the
+/// snapshot, so only the re-check of the flag and the state after it keeps
+/// the park from sleeping through it (audit 2026-10-25, mutants 744/752).
+/// Same rules as `park_seam`.
+var pause_snapshot_seam: std.atomic.Value(?*const fn () void) = .init(null);
+
 /// The pool whose worker the current thread is, if any — how `wait` detects
 /// being called from one of its own jobs.
 threadlocal var current_pool: ?*const WorkerPool = null;
@@ -632,6 +715,10 @@ fn workerRun(w: *Worker) void {
         // both the state and the flag, so a `resume` / shutdown that lands in
         // between bumped the generation and makes the wait return at once.
         if (st == .running and self.paused.load(.seq_cst)) {
+            // Test seam -- see `pause_snapshot_seam`.
+            if (builtin.is_test) {
+                if (pause_snapshot_seam.load(.seq_cst)) |f| f();
+            }
             const gen = self.notify.load(.seq_cst);
             if (self.state.load(.seq_cst) == .running and self.paused.load(.seq_cst)) {
                 // Test seam -- see `pause_seam`.
@@ -645,7 +732,7 @@ fn workerRun(w: *Worker) void {
             continue;
         }
 
-        if (self.takeJob()) |job| {
+        if (self.takeJob(w)) |job| {
             self.runJob(job);
             continue;
         }
@@ -656,17 +743,7 @@ fn workerRun(w: *Worker) void {
         // counted in `idle`, so a submit meanwhile bumps `notify` and skips
         // the wake; the bump is what this watches (one shared load per turn,
         // not a dequeue attempt that contends with the other workers).
-        if (self.spin_ns != 0) {
-            const seen = self.notify.load(.seq_cst);
-            const until = std.Io.Timestamp.now(self.io, .awake).nanoseconds + self.spin_ns;
-            var turn: u32 = 0;
-            while (true) : (turn +%= 1) {
-                if (self.notify.load(.seq_cst) != seen) continue :outer;
-                std.atomic.spinLoopHint();
-                // The clock every 64 turns: a vDSO call, cheap, not free.
-                if (turn % 64 == 63 and std.Io.Timestamp.now(self.io, .awake).nanoseconds >= until) break;
-            }
-        }
+        if (self.spin_ns != 0 and self.spinUntilChanged(&self.notify, self.notify.load(.seq_cst))) continue :outer;
 
         // Test seam -- see `snapshot_seam`.
         if (builtin.is_test) {
@@ -676,7 +753,7 @@ fn workerRun(w: *Worker) void {
         // then re-check the queue and state, so any submit/shutdown that raced
         // in between bumped the generation and makes the wait return at once.
         const gen = self.notify.load(.seq_cst);
-        if (self.takeJob()) |job| {
+        if (self.takeJob(w)) |job| {
             self.runJob(job);
             continue;
         }
@@ -2085,6 +2162,94 @@ test "TEETH: a resume inside the pause window is not slept through (snapshot pre
     try testing.expect(!pool.isPaused());
 }
 
+/// `pause_snapshot_seam` hooks: armed (0) they run once (1), from the worker.
+const SnapshotSeam = struct {
+    pool: ?*WorkerPool = null,
+    armed: std.atomic.Value(u32) = .init(1),
+    /// For the drain variant: set by the hook, then the hook waits until the
+    /// main thread's `drain` has moved the state and bumped the generation.
+    reached: std.atomic.Value(bool) = .init(false),
+};
+var snapshot_seam_ctx: std.atomic.Value(?*SnapshotSeam) = .init(null);
+
+fn resumeBeforePauseSnapshot() void {
+    const ctx = snapshot_seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.armed.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    ctx.pool.?.@"resume"();
+}
+
+fn drainBeforePauseSnapshot() void {
+    const ctx = snapshot_seam_ctx.load(.seq_cst) orelse return;
+    if (ctx.armed.cmpxchgStrong(0, 1, .seq_cst, .seq_cst) != null) return;
+    const pool = ctx.pool.?;
+    const gen = pool.notify.load(.seq_cst);
+    ctx.reached.store(true, .seq_cst);
+    while (pool.state.load(.seq_cst) == .running or pool.notify.load(.seq_cst) == gen) std.atomic.spinLoopHint();
+}
+
+fn drainThread(pool: *WorkerPool) void {
+    pool.drain();
+}
+
+test "TEETH: a resume before the pause branch's snapshot is seen by its flag re-check" {
+    // The resume's generation bump lands before the snapshot: a re-check that
+    // ignored the flag would park on the new generation with the job queued,
+    // and nothing would wake it -- the watchdog fires.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var ctx: SnapshotSeam = .{};
+    snapshot_seam_ctx.store(&ctx, .seq_cst);
+    defer snapshot_seam_ctx.store(null, .seq_cst);
+    pause_snapshot_seam.store(resumeBeforePauseSnapshot, .seq_cst);
+    defer pause_snapshot_seam.store(null, .seq_cst);
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .spin_ns = 0 });
+    defer pool.deinit();
+    ctx.pool = pool;
+    sleepMsIo(io, 20); // the worker is parked on the empty queue
+    pool.pause();
+    var c = Counter{};
+    ctx.armed.store(0, .seq_cst);
+    try pool.submit(.{ .func = incr, .ctx = &c }); // wakes it; it finds the pause
+    while (c.n.load(.seq_cst) == 0) sleepMsIo(io, 1);
+    try testing.expectEqual(@as(u32, 1), ctx.armed.load(.seq_cst));
+}
+
+test "TEETH: a drain before the pause branch's snapshot is seen by its state re-check" {
+    // `drain`'s bump lands before the snapshot, the flag is still set: a
+    // re-check that ignored the state would park for good and `drain` would
+    // never join the worker -- the watchdog fires.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
+    try wd.start();
+    defer wd.finish();
+
+    var ctx: SnapshotSeam = .{};
+    snapshot_seam_ctx.store(&ctx, .seq_cst);
+    defer snapshot_seam_ctx.store(null, .seq_cst);
+    pause_snapshot_seam.store(drainBeforePauseSnapshot, .seq_cst);
+    defer pause_snapshot_seam.store(null, .seq_cst);
+
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .spin_ns = 0 });
+    defer pool.deinit();
+    ctx.pool = pool;
+    sleepMsIo(io, 20);
+    pool.pause();
+    ctx.armed.store(0, .seq_cst);
+    pool.wakeAll(); // a spurious wake: the worker goes round into the pause branch
+    while (!ctx.reached.load(.seq_cst)) std.atomic.spinLoopHint();
+    const t = try std.Thread.spawn(.{}, drainThread, .{pool});
+    t.join();
+    try testing.expect(pool.state.load(.seq_cst) == .stopped);
+}
+
 // ── workingCount ─────────────────────────────────────────────────────────────
 
 test "workingCount: N blocking jobs on N workers = N, back to 0 after" {
@@ -2277,4 +2442,10 @@ test "max_queued: 8 producers hammering a bound of 3 never overshoot it; every a
     try testing.expect(h.refused.load(.seq_cst) > 0); // the bound was actually hit
     try testing.expectEqual(@as(usize, 0), pool.queuedCount());
     try testing.expect(pool.queue.isEmpty());
+}
+
+test {
+    _ = @import("audit_test.zig");
+    _ = @import("model_fuzz_test.zig");
+    _ = @import("lead_test.zig");
 }
