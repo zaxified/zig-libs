@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-25** — **BREAKING (consumer-visible):** `verify` — so `parseAndVerify`, JWKS `oct` keys, `Provider`, `Guard`, `acceptIdToken*` — refuses an HMAC secret shorter than the hash output (32/48/64 bytes for HS256/384/512) with `InvalidKey`, as `encode` already did (RFC 7518 §3.2; owner decision on audit F3). Before, any non-empty secret verified. Test fixtures with short secrets were lengthened.
+
 - **2026-10-25** — **Fix (consumer-visible, one second):** a token was accepted at exactly `exp + leeway`; RFC 7519 §4.1.4 requires the current time to be *before* `exp`, and golang-jwt refuses it there. `validateClaims`, `VerifiedCache` hits and every entry point built on them now return `Expired` at `now == exp + leeway` (found by the new `interop-jwt`, case exp-equals-now). Four tests moved one second. Also `encodeJson` reports an allocation failure inside its claims check as `OutOfMemory` (it said `InvalidClaims`; audit F6).
 
 - **2026-10-25** — **Faster EdDSA verification, same verdicts:** `verify`'s EdDSA arm runs `ed25519.zig` — std's checks and cofactored equation, over a width-5/width-7 wNAF double-scalar multiplication on ref10's point representations — instead of `std.crypto.sign.Ed25519.Signature.verify` (bench-jwt: 79.7 → 67.1 µs per token, 1.44× → 1.21× jsonwebtoken/ring). Held to std on valid, corrupted, torsion-shifted and small-order inputs (tests in `ed25519.zig`). Also `encodeJson` builds the header on the stack and `parse` sizes its arena once (HS256 sign 2.69 → 2.35 µs).

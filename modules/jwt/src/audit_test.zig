@@ -21,7 +21,7 @@ const JWKS_URL = "https://issuer.example/jwks";
 
 // Findings: flip a flag to true when the fix lands, and the pinned test then
 // asserts the fixed behaviour instead.
-const f3_fixed = false; // verify() accepts a 1-byte HMAC secret (sign refuses < hash size)
+const f3_fixed = true; // verify() accepts a 1-byte HMAC secret (sign refuses < hash size)
 
 const f6_fixed = true; // encodeJson reports an OOM inside the claims validator as InvalidClaims (fix: isOneObject returns an error union, encodeJson propagates OutOfMemory)
 

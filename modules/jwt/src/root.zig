@@ -969,8 +969,11 @@ fn verifyHmac(comptime Mac: type, parsed: *const ParsedToken, key: Key) VerifyEr
         .hmac => |s| s,
         else => return error.AlgKeyMismatch,
     };
-    // An empty secret would make every attacker-computable MAC "valid".
-    if (secret.len == 0) return error.InvalidKey;
+    // RFC 7518 §3.2: "A key of the same size as the hash output ... or
+    // larger MUST be used" -- the floor `encode` already applied, now on the
+    // verify side too (owner, 2026-10-25, audit F3). An empty secret, the
+    // old floor, made every attacker-computable MAC "valid".
+    if (secret.len < Mac.mac_length) return error.InvalidKey;
     // Length is public information — checking it early leaks nothing.
     if (parsed.signature.len != Mac.mac_length) return error.BadSignature;
     // The keyed HMAC state (key ⊕ ipad / opad, the hash states derived from
@@ -4029,7 +4032,7 @@ test "SECURITY: mandatory audience — a token for a sibling service is rejected
     // the validator WITHOUT a choice, so the cross-service token cannot slip
     // through by omission.
     const gpa = testing.allocator;
-    const secret = "mandatory-audience-secret";
+    const secret = "mandatory-audience-secret-xxxxxxxxxxxxxx";
     var buf: [512]u8 = undefined;
     const si = signingInputInto(&buf,
         \\{"alg":"HS256"}
@@ -4445,7 +4448,7 @@ test "SECURITY: a cryptographically VALID token carrying `crit` is still rejecte
     // producer explicitly said "do not process this without understanding
     // my extension" (RFC 8725 §3.3).
     const gpa = testing.allocator;
-    const secret = "crit-test-secret";
+    const secret = "crit-test-secret-xxxxxxxxxxxxxxxxxxxxxxx";
     var buf: [512]u8 = undefined;
     const si = signingInputInto(&buf,
         \\{"alg":"HS256","http://example.com/UNDEFINED":true,"crit":["http://example.com/UNDEFINED"]}
@@ -4566,7 +4569,7 @@ test "verify: RFC 7515 A.1 HS256 known-answer token" {
     try verify(&parsed, key);
 
     // Wrong secret → BadSignature.
-    try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "wrong-secret" }));
+    try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "wrong-secret-xxxxxxxxxxxxxxxxxxxxxxxxxxx" }));
 
     // One flipped signature byte → BadSignature (flip a mid-signature base64
     // char so the segment stays valid base64url).
@@ -4652,7 +4655,7 @@ test "verify: RFC 8037 A.4 Ed25519 known-answer signature" {
 }
 
 test "verify: HS384/HS512 round-trip, cross-length rejection" {
-    const secret = "another-shared-secret-of-decent-length";
+    const secret = "another-shared-secret-of-decent-length-long-enough-for-hs512-xxx";
 
     inline for (.{
         .{ hmac_sha2.HmacSha384, "HS384" },
@@ -4670,7 +4673,7 @@ test "verify: HS384/HS512 round-trip, cross-length rejection" {
         var parsed = try parse(testing.allocator, token);
         defer parsed.deinit();
         try verify(&parsed, .{ .hmac = secret });
-        try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "not-it" }));
+        try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = "not-it-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" }));
         // Empty HMAC secret is never usable.
         try testing.expectError(error.InvalidKey, verify(&parsed, .{ .hmac = "" }));
     }
@@ -5176,7 +5179,7 @@ test "Key constructors: invalid key bytes → InvalidKey, never a panic" {
 
 test "parseAndVerify: end-to-end happy path and each failure stage" {
     const gpa = testing.allocator;
-    const secret = "shared-secret-for-the-e2e-test";
+    const secret = "shared-secret-for-the-e2e-test-xxxxxxxxx";
 
     var buf: [512]u8 = undefined;
     const si = signingInputInto(&buf,
@@ -5204,7 +5207,7 @@ test "parseAndVerify: end-to-end happy path and each failure stage" {
     try testing.expectError(error.BadSignature, parseAndVerify(
         gpa,
         token,
-        .{ .hmac = "wrong" },
+        .{ .hmac = "wrong-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" },
         .{ .now_s = 1000, .issuer = .any, .audience = .any },
     ));
     // Wrong key type → AlgKeyMismatch.
@@ -5584,7 +5587,7 @@ test "parseAndVerify: RS256 end-to-end" {
 const rfc7515_a3_x_b64 = "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU";
 const rfc7515_a3_y_b64 = "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0";
 
-const test_jwks_hmac_secret = "jwks-multi-key-shared-secret";
+const test_jwks_hmac_secret = "jwks-multi-key-shared-secret-xxxxxxxxxxx";
 
 fn testEs256KeyPair() !EcdsaP256Sha256.KeyPair {
     return EcdsaP256Sha256.KeyPair.generateDeterministic(
@@ -8445,7 +8448,7 @@ test "parseTokenEndpointResponse: 200 ok, 400/401 error, other status refused" {
 
 const id_token_issuer = "https://issuer.example";
 const id_token_client_id = "my-client-id";
-const id_token_secret = "id-token-hmac-secret";
+const id_token_secret = "id-token-hmac-secret-xxxxxxxxxxxxxxxxxxx";
 const id_token_nonce = "nonce-1234567890abcdef";
 
 /// Build an HS256-signed ID Token from a payload template (test-only —
@@ -9048,8 +9051,8 @@ test "SECURITY: a valid signature with a byte appended is BadSignature, every al
     const si = "eyJhbGciOiJ4In0.eyJleHAiOjEwMDB9";
 
     var mac: [32]u8 = undefined;
-    hmac_sha2.HmacSha256.create(&mac, si, "suffix-secret");
-    try expectExactSigLength(.HS256, si, &mac, .{ .hmac = "suffix-secret" });
+    hmac_sha2.HmacSha256.create(&mac, si, "suffix-secret-padded-to-the-hs256-floor-x");
+    try expectExactSigLength(.HS256, si, &mac, .{ .hmac = "suffix-secret-padded-to-the-hs256-floor-x" });
 
     const es256 = try testEs256KeyPair();
     const es256_sig = (try es256.sign(si, null)).toBytes();

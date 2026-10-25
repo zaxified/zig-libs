@@ -8,7 +8,7 @@
 
 **Ahead:** correctness — six tokens golang-jwt v5.3.1 accepts and this module refuses, each on an RFC rule: a `crit` naming an extension the recipient does not process, a `crit` naming a registered parameter, an empty `crit` (RFC 7515 §4.1.11), a signature and a payload segment whose unused base64url bits are set (RFC 7515 §2 with RFC 4648 §3.5: two strings for one token), and duplicate claim names (RFC 7519 §4: reject or take the last; golang-jwt takes the last, this module rejects); out of 81 rows `zig build interop-jwt` judges against golang-jwt, the other 75 agree (test `lead: crit, non-canonical base64url and duplicate claims -- golang-jwt v5.3.1 accepts six tokens this module refuses`, `src/go_oracle_vectors.zig`) (measured 2026-10-25)
 
-**Audit:** review 2026-10-25 · mutation 2026-10-25 (439/474, 35 eq) · src 911eb42035eb5643
+**Audit:** review 2026-10-25 · mutation 2026-10-25 (441/476, 35 eq) · src f37ec981f9e6fe3e
 
 **Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, JWT_FUZZ) · ct 2026-10-13 (ctgrind: HMAC secrets HS256/384/512 sign + verify accept/reject, ES256/ES384/ES512/EdDSA signing keys, RS256/PS256 rsa secret members tainted; hmac 0 in-file, ec 9 in-file = ES256 8 delegated p256/std signer contexts (9 until 2026-10-13, when p256's `rejectIdentity` went from two jumps to one) (ES384 via p384 and ES512 via p521: 0) + 1 jwt-own `rejectIdentity` on R in the EdDSA signer, rsa 3 in-file = the rsa module's F3 fault-check verdict, one per signature, plus PS256's blinding redraw verdict (rsa, since 2026-10-14); itemised in scripts/checks/ctgrind-expected.tsv)
 
@@ -413,11 +413,15 @@ Worst row 0.99× → P2.
 
 ## Backlog / deferred
 
-- **HMAC key floor on the verify side (audit 2026-10-25 F3, LOW, owner's call)** — `encode`
-  refuses an HS256/384/512 secret shorter than the hash output (RFC 7518 §3.2 "MUST"), but
-  `verify` (and an `oct` JWK) accepts any non-empty secret, down to one byte — as golang-jwt and
-  jsonwebtoken do. Enforcing the floor in `verify` would break deployments verifying with short
-  development secrets; pinned by `audit_test.zig` (`f3_fixed = false`).
+- ~~**HMAC key floor on the verify side (audit 2026-10-25 F3)**~~ — DONE 2026-10-25 (owner: enforce):
+  `verify` (so every entry point, `oct` JWKs included) refuses an HS256/384/512 secret shorter
+  than the hash output with `InvalidKey`, the floor `encode` already had (RFC 7518 §3.2 "MUST").
+  golang-jwt and jsonwebtoken accept any length. Pinned by `audit_test.zig` (`f3_fixed = true`).
+- **HS256 sign is 1.32× jsonwebtoken (P2, owner accepted TEMPORARILY 2026-10-25)** — the last
+  axis below grade 1. `bench-jwt` 2026-10-25: hs256_sign 2.28 vs 1.72 µs, hs256_verify 1.23×;
+  58 % of our sign is SHA-256 compression (std, no SHA-NI on the bench host) against ring's
+  assembly. Routes: the `sha2` module's SIMD message schedule (≈ 1.1× on these 4-block inputs;
+  `sha2` is grade 3 and would have to reach ≤ 2 first) or a faster single-block round function.
 - ~~**ES384 is P4 (bench 2026-10-13: sign 4.2×, verify 2.8× golang-jwt)**~~ — DONE 2026-10-13: ES384
   runs on the `p384` module (0.52× sign, 0.59× verify); the card is measured again. ~~(a) EdDSA sign
   1.6–1.7×~~ — DONE 2026-10-13 (`ct25519.mulBase`, 0.73×). ~~(b) ES256 verify 1.4×~~ — 0.96× on
