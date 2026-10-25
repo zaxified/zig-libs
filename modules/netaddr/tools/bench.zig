@@ -19,6 +19,10 @@
 
 const std = @import("std");
 const netaddr = @import("netaddr");
+// `sort_mixed` sorts with zig-libs `sort` (ipnsort), the sort a Zig user
+// reaches for here; std's pdq/block are 2.2-2.6x slower on this key and
+// measure std, not netaddr (owner 2026-10-25).
+const sort = @import("sort");
 
 const n_inputs = 1000;
 const n_set = 200;
@@ -150,7 +154,7 @@ fn lessThan(_: void, a: netaddr.Ip, b: netaddr.Ip) bool {
 fn sortMixed(in: *const Inputs) usize {
     var scratch: [n_inputs]netaddr.Ip = undefined;
     @memcpy(&scratch, in.mixed);
-    std.mem.sort(netaddr.Ip, &scratch, {}, lessThan);
+    sort.unstable(netaddr.Ip, &scratch, {}, lessThan);
     // Where the first v6 address landed: v4 sorts before v6.
     for (scratch, 0..) |ip, i| if (ip == .v6) return i;
     return scratch.len;

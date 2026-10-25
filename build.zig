@@ -143,7 +143,7 @@ pub const module_list = [_]Module{
     // Test-only harness. Consumers reach it through `test_deps`, never `deps`.
     .{ .name = "testkit", .libs = &.{"os"} },
     .{ .name = "fastmem", .libs = &.{"os"} },
-    .{ .name = "netaddr", .libs = &.{ "net", "web" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "netaddr", .libs = &.{ "net", "web" }, .test_deps = &.{"testkit"}, .bench_deps = &.{"sort"}, .loopback = true },
     // `workerpool` is a TEST-only dep: `h2_server.Options.dispatcher` is an
     // injectable seam (a function pointer + a context pointer), so the
     // published `http` module implements no pool at all — deliberately, since
@@ -243,6 +243,7 @@ pub const module_list = [_]Module{
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },
     .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "trie", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
+    .{ .name = "sort", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "fuzzysearch", .libs = &.{"storage"}, .deps = &.{"trie"}, .test_deps = &.{"testkit"} },
     .{ .name = "regex", .libs = &.{ "format", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "geoindex", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },

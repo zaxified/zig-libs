@@ -1,0 +1,16 @@
+[package]
+name = "rust_bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# std only: no crates to fetch or review.
+[dependencies]
+
+# Keep this out of any enclosing workspace.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
