@@ -24,7 +24,14 @@ const root = @import("root.zig");
 const burn = @import("burn.zig");
 const ct25519 = @import("ct25519");
 
-const hmac_sha2 = std.crypto.auth.hmac.sha2;
+/// HMAC-SHA-2 over the `sha2` module: std's `Hmac` construction, sha2's
+/// compression (faster than std's on x86-64 without SHA-NI, the same bytes).
+const hmac_sha2 = struct {
+    const H = @import("sha2");
+    pub const HmacSha256 = std.crypto.auth.hmac.Hmac(H.Sha256);
+    pub const HmacSha384 = std.crypto.auth.hmac.Hmac(H.Sha384);
+    pub const HmacSha512 = std.crypto.auth.hmac.Hmac(H.Sha512);
+};
 const b64 = std.base64.url_safe_no_pad.Encoder;
 
 /// A signing key. The variant IS the algorithm: `encode` writes the `alg`

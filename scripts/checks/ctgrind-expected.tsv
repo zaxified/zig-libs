@@ -1718,7 +1718,7 @@ acme	ReleaseFast	anykey	1	5	6c6c7cd38158c704	7dff1d27c302259e
 # (timing_safe.eql in verifyHmac) yields a tainted verdict that reaches only the
 # harness printer (67 witness); no branch or load of root.zig / encode.zig takes
 # the secret. Needs no declassification: the verdict is public by design.
-jwt	ReleaseFast	hmac	1	0	4170116c42f7e7c3	82c3cf6208c0b9d8
+jwt	ReleaseFast	hmac	1	0	9e7afaa8f4490f28	82c3cf6208c0b9d8
 # ec 10 = ES256 9 + EdDSA 1. Every ES context carries encode.zig:274
 # (signEc) in its stack, so the pattern attributes the DELEGATED signer to jwt,
 # exactly as acme's p256 contexts; none is a branch in jwt's own code and p256 /
@@ -1735,7 +1735,7 @@ jwt	ReleaseFast	hmac	1	0	4170116c42f7e7c3	82c3cf6208c0b9d8
 #   Left as is (std's basePoint.mul has the same refusal); FINDING for the
 #   coordinator, not fixed here.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-jwt	ReleaseFast	ec	1	9	4170116c42f7e7c3	6c14c21a4454880c
+jwt	ReleaseFast	ec	1	9	9e7afaa8f4490f28	6c14c21a4454880c
 # rsa 2 = RS256 1 + PS256 1: rsa/src/root.zig:954 privateOpCrtPtr, the F3
 # Bellcore fault-check verdict `if (!eql(m^e, c)) return error.FaultDetected`
 # (the rsa module's own `crt` row, 2, documents the same verdict). Delegated to
@@ -1745,7 +1745,7 @@ jwt	ReleaseFast	ec	1	9	4170116c42f7e7c3	6c14c21a4454880c
 # blinding verdict (root.zig:906 makeBlinding): since CRT-domain blinding the
 # r⁻¹ checks run mod the secret p, q, folded into ONE branch-once verdict that
 # is false only for r ≡ 0 mod p or q (~2^-1023) and only causes a redraw.
-jwt	ReleaseFast	rsa	1	3	4170116c42f7e7c3	f2bee89c3c58cdaf
+jwt	ReleaseFast	rsa	1	3	9e7afaa8f4490f28	f2bee89c3c58cdaf
 # minisign (2026-10-20). Every in-file context is std's, attributed because a
 # minisign frame (root.zig edSignBody / sealSecretKeyBody / openSecretKeyBody)
 # is on its stack; read from --stacks, none is a minisign branch on a secret

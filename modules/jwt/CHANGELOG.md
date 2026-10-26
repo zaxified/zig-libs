@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — HS256/HS384/HS512 compute std's `Hmac` over the `sha2` module (new dependency) instead of `std.crypto.hash.sha2`. The bytes are the same (RFC 7515/7520 vectors, 81-row golang-jwt oracle). On an x86-64 CPU without SHA-NI it is faster: hs256_sign 1.32× → 1.05× jsonwebtoken, hs256_verify 1.23× → 1.07×. Card: fastest 1.21× (P1). No API change.
+
 - **2026-10-25** — **BREAKING (consumer-visible):** `verify` — so `parseAndVerify`, JWKS `oct` keys, `Provider`, `Guard`, `acceptIdToken*` — refuses an HMAC secret shorter than the hash output (32/48/64 bytes for HS256/384/512) with `InvalidKey`, as `encode` already did (RFC 7518 §3.2; owner decision on audit F3). Before, any non-empty secret verified. Test fixtures with short secrets were lengthened.
 
 - **2026-10-25** — **Fix (consumer-visible, one second):** a token was accepted at exactly `exp + leeway`; RFC 7519 §4.1.4 requires the current time to be *before* `exp`, and golang-jwt refuses it there. `validateClaims`, `VerifiedCache` hits and every entry point built on them now return `Expired` at `now == exp + leeway` (found by the new `interop-jwt`, case exp-equals-now). Four tests moved one second. Also `encodeJson` reports an allocation failure inside its claims check as `OutOfMemory` (it said `InvalidClaims`; audit F6).

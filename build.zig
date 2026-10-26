@@ -272,7 +272,7 @@ pub const module_list = [_]Module{
     .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "l2disco", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "upstream", .libs = &.{"web"}, .deps = &.{ "resilience", "probe" } },
-    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct" }, .test_deps = &.{"testkit"}, .loopback = true },
+    .{ .name = "jwt", .libs = &.{"web"}, .deps = &.{ "http", "router", "p256", "p384", "p521", "rsa", "ct25519", "b64ct", "sha2" }, .test_deps = &.{"testkit"}, .loopback = true },
     .{ .name = "rbac", .libs = &.{"web"} },
     .{ .name = "xml", .libs = &.{ "web", "net" }, .test_deps = &.{"testkit"} },
     .{ .name = "xmldsig", .libs = &.{"web"}, .deps = &.{ "xml", "rsa", "p256" }, .test_deps = &.{"testkit"} },
