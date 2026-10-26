@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** live oracle `tools/interop.zig` (`zig build interop-zstd`): libzstd 1.5.7 built from the pinned checkout, in-process behind `tools/c_oracle/zoracle.c`, compared with this module on generated inputs — one-shot and streaming compression (same bytes), valid and damaged frames through both decoders (same output or same error code), dictionary training. Seeds 1–5 agree; the only listed divergence is the documented error-code choice on damaged frames with a dictionary.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — **Fix (performance):** `dstream.Reader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
