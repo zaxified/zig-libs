@@ -148,6 +148,45 @@ pub const IterateError = der.Element.ParseError || error{CertificateFieldHasWron
 /// `findExtensions` returns), yielding each `Extension ::= SEQUENCE {
 /// extnID OBJECT IDENTIFIER, critical BOOLEAN DEFAULT FALSE, extnValue
 /// OCTET STRING }` (RFC 5280 §4.2).
+/// `std.crypto.Certificate.parseExtensionId`'s answer for an OID's content
+/// octets, without its `StaticStringMap` lookup on the common `2.5.29.x`
+/// ones: the lookup ran for every extension on every walk, several walks per
+/// certificate, and was 6 % of a chain verification (2026-10-26). The longer
+/// OIDs std knows still go through its map. Pinned to std by a test over
+/// every three-octet OID under 2.5.
+pub fn extensionId(oid: []const u8) ?Certificate.ExtensionId {
+    if (oid.len == 3 and oid[0] == 0x55) {
+        if (oid[1] == 0x04) return if (oid[2] == 0x03) .commonName else null;
+        if (oid[1] != 0x1d) return null;
+        return switch (oid[2]) {
+            0x01, 0x23 => .authority_key_identifier,
+            0x07, 0x11 => .subject_alt_name,
+            0x0a, 0x13 => .basic_constraints,
+            0x0e => .subject_key_identifier,
+            0x0f => .key_usage,
+            0x10 => .private_key_usage_period,
+            0x12 => .issuer_alt_name,
+            0x14 => .crl_number,
+            0x1f => .crl_distribution_points,
+            0x20 => .certificate_policies,
+            0x25 => .ext_key_usage,
+            else => null,
+        };
+    }
+    return Certificate.ExtensionId.map.get(oid);
+}
+
+test "extensionId: the same answer as std's ExtensionId map" {
+    for (0..256) |b1| for (0..256) |b2| {
+        const oid = [_]u8{ 0x55, @intCast(b1), @intCast(b2) };
+        try std.testing.expectEqual(Certificate.ExtensionId.map.get(&oid), extensionId(&oid));
+    };
+    for (Certificate.ExtensionId.map.keys(), Certificate.ExtensionId.map.values()) |k, v| {
+        try std.testing.expectEqual(@as(?Certificate.ExtensionId, v), extensionId(k));
+    }
+    try std.testing.expectEqual(@as(?Certificate.ExtensionId, null), extensionId(&.{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x02 }));
+}
+
 pub const ExtensionIterator = struct {
     bytes: []const u8,
     pos: u32,
@@ -160,10 +199,8 @@ pub const ExtensionIterator = struct {
 
         const oid_elem = try parseElement(it.bytes, extension.slice.start);
         const oid_bytes = it.bytes[oid_elem.slice.start..oid_elem.slice.end];
-        const id = Certificate.parseExtensionId(it.bytes, oid_elem) catch |err| switch (err) {
-            error.CertificateHasUnrecognizedObjectId => null,
-            error.CertificateFieldHasWrongDataType => |e| return e,
-        };
+        if (oid_elem.identifier.tag != .object_identifier) return error.CertificateFieldHasWrongDataType;
+        const id = extensionId(oid_bytes);
 
         const after_oid = try parseElement(it.bytes, oid_elem.slice.end);
         var critical = false;

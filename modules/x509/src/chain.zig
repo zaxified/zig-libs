@@ -286,9 +286,11 @@ pub fn verifyChain(
 ) VerifyChainError!VerifiedChain {
     if (chain.len == 0) return error.EmptyChain;
 
-    const path = try buildPath(gpa, chain, trust_anchors, opts);
+    var memo: Memo = .{};
+    var checks: u32 = 0;
+    const path = try buildPathMemo(gpa, chain, trust_anchors, opts, &checks, &memo);
     defer gpa.free(path);
-    return checkBuiltPath(gpa, path, opts);
+    return checkBuiltPath(gpa, path, opts, &memo);
 }
 
 /// `verifyChain`'s result plus the path it verified — Go's `Verify` returns
@@ -316,16 +318,18 @@ pub fn verifyChainPath(
 ) VerifyChainError!VerifiedPath {
     if (chain.len == 0) return error.EmptyChain;
 
-    const path = try buildPath(gpa, chain, trust_anchors, opts);
+    var memo: Memo = .{};
+    var checks: u32 = 0;
+    const path = try buildPathMemo(gpa, chain, trust_anchors, opts, &checks, &memo);
     defer gpa.free(path);
-    const summary = try checkBuiltPath(gpa, path, opts);
+    const summary = try checkBuiltPath(gpa, path, opts, &memo);
     const certs = try gpa.alloc(CertDer, path.len);
     for (path, certs) |entry, *c| c.* = entry.der;
     return .{ .summary = summary, .certs = certs };
 }
 
 /// The passes `verifyChain` runs once `buildPath` has a path (see there).
-fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options) VerifyChainError!VerifiedChain {
+fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options, memo: *Memo) VerifyChainError!VerifiedChain {
     // RFC 5280 §4.2 / §6.1.4 (o): no repeated extension, no critical one
     // this module would silently not enforce. The CAs were checked as
     // candidates in `acceptCandidate`, so a bad one could be backtracked over.
@@ -338,7 +342,7 @@ fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options
     for (path[1..]) |entry| {
         const bc = try findBasicConstraints(entry.der);
         try checkPathLength(bc.path_len_constraint, non_self_issued_below);
-        const shape = try parseShape(.{ .buffer = entry.der, .index = 0 });
+        const shape = try memo.shape(entry.der);
         if (!std.mem.eql(u8, shape.subject, shape.issuer)) non_self_issued_below += 1;
     }
 
@@ -356,7 +360,7 @@ fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options
         while (i > 0) {
             i -= 1;
             const entry = path[i];
-            const shape = try parseShape(.{ .buffer = entry.der, .index = 0 });
+            const shape = try memo.shape(entry.der);
             const san = try findSan(entry.der);
             try checkNameConstraintsBudget(permitted.items, excluded.items, shape.subject, san, &budget);
             if (i != 0) {
@@ -398,12 +402,11 @@ fn checkBuiltPath(gpa: std.mem.Allocator, path: []const PathEntry, opts: Options
         }
     }
 
-    const leaf_cert: Certificate = .{ .buffer = path[0].der, .index = 0 };
-    const leaf_shape = try parseShape(leaf_cert);
+    const leaf_shape = try memo.shape(path[0].der);
     // Own walk of the SAN, the same for every leaf algorithm (std cannot
     // parse PSS/ML-DSA/SLH-DSA leaves) and without std's commonName fallback.
     if (opts.expected_host) |host| try hostname.verify(path[0].der, host);
-    const leaf_parsed: ?Certificate.Parsed = leaf_cert.parse() catch |err| switch (err) {
+    const leaf_parsed: ?Certificate.Parsed = memo.parse(path[0].der) catch |err| switch (err) {
         error.CertificateHasUnrecognizedObjectId => null,
         else => |e| return e,
     };
@@ -483,6 +486,19 @@ fn buildPathCounted(
     opts: Options,
     checks: *u32,
 ) VerifyChainError![]PathEntry {
+    var memo: Memo = .{};
+    return buildPathMemo(gpa, chain, trust_anchors, opts, checks, &memo);
+}
+
+/// `buildPathCounted` filling `memo`, which `checkBuiltPath` then reads.
+fn buildPathMemo(
+    gpa: std.mem.Allocator,
+    chain: []const CertDer,
+    trust_anchors: []const CertDer,
+    opts: Options,
+    checks: *u32,
+    memo: *Memo,
+) VerifyChainError![]PathEntry {
     if (chain.len == 0) return error.EmptyChain;
     // The chain is the peer's: nothing in it reaches std's parser (which
     // `verifyLink` and `verifyChain` call) or this module's walks before
@@ -507,8 +523,8 @@ fn buildPathCounted(
     used_chain[0] = true; // the leaf itself is never its own issuer candidate
 
     try path.append(gpa, .{ .der = chain[0], .anchor_index = null });
-    const leaf_shape = try parseShape(.{ .buffer = chain[0], .index = 0 });
-    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, chain[0], leaf_shape, used_chain, 0, &path, checks);
+    const leaf_shape = try memo.shape(chain[0]);
+    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, chain[0], leaf_shape, used_chain, 0, &path, checks, memo);
 
     return try path.toOwnedSlice(gpa);
 }
@@ -535,6 +551,7 @@ fn findIssuerAndVerify(
     depth: u32,
     path: *std.ArrayList(PathEntry),
     checks: *u32,
+    memo: *Memo,
 ) VerifyChainError!void {
     var candidates: std.ArrayList(Candidate) = .empty;
     defer candidates.deinit(gpa);
@@ -543,7 +560,7 @@ fn findIssuerAndVerify(
 
     for (chain, 0..) |c_der, i| {
         if (used_chain[i]) continue;
-        const shape = parseShape(.{ .buffer = c_der, .index = 0 }) catch continue;
+        const shape = memo.shape(c_der) catch continue;
         if (!std.mem.eql(u8, shape.subject, cur_shape.issuer)) continue;
         if (cur_aki) |aki| {
             if (findSki(c_der) catch null) |ski| {
@@ -553,7 +570,7 @@ fn findIssuerAndVerify(
         try candidates.append(gpa, .{ .der = c_der, .is_anchor = false, .anchor_index = 0, .chain_index = i });
     }
     for (trust_anchors, 0..) |a_der, i| {
-        const shape = parseShape(.{ .buffer = a_der, .index = 0 }) catch continue;
+        const shape = memo.shape(a_der) catch continue;
         if (!std.mem.eql(u8, shape.subject, cur_shape.issuer)) continue;
         if (cur_aki) |aki| {
             if (findSki(a_der) catch null) |ski| {
@@ -566,11 +583,11 @@ fn findIssuerAndVerify(
     if (candidates.items.len == 0) return error.NoTrustedPath;
 
     if (candidates.items.len == 1) {
-        return acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path, checks);
+        return acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, candidates.items[0], used_chain, depth, path, checks, memo);
     }
 
     for (candidates.items) |cand| {
-        if (acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, cand, used_chain, depth, path, checks)) {
+        if (acceptCandidate(gpa, chain, trust_anchors, opts, cur_der, cand, used_chain, depth, path, checks, memo)) {
             return;
         } else |_| {}
     }
@@ -594,11 +611,12 @@ fn acceptCandidate(
     depth: u32,
     path: *std.ArrayList(PathEntry),
     checks: *u32,
+    memo: *Memo,
 ) VerifyChainError!void {
     // Bounded work on a peer-supplied chain (`max_signature_checks`).
     if (checks.* >= max_signature_checks) return error.ChainTooLong;
     checks.* += 1;
-    try verifyLink(cur_der, cand.der, opts.now_sec, opts.allow_sha1_signatures);
+    try verifyLink(cur_der, cand.der, opts.now_sec, opts.allow_sha1_signatures, memo);
     // A v1 certificate cannot carry basicConstraints; as a trust anchor it is
     // the caller's configuration, and Go and OpenSSL both trust one (probe
     // O-roots, 2026-10-11). A v3 anchor must still be a CA.
@@ -607,7 +625,7 @@ fn acceptCandidate(
     if (cand.is_anchor and opts.check_anchor_validity) {
         // Every other certificate's window is checked as the subject of its
         // link (`verifyLink`); the anchor is never a subject, so it is here.
-        const anchor_shape = try parseShape(.{ .buffer = cand.der, .index = 0 });
+        const anchor_shape = try memo.shape(cand.der);
         if (opts.now_sec < anchor_shape.not_before) return error.CertificateNotYetValid;
         if (opts.now_sec > anchor_shape.not_after) return error.CertificateExpired;
     }
@@ -628,8 +646,8 @@ fn acceptCandidate(
     const next_depth = depth + 1;
     if (next_depth > opts.max_intermediates) return error.ChainTooLong;
 
-    const next_shape = try parseShape(.{ .buffer = cand.der, .index = 0 });
-    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, cand.der, next_shape, used_chain, next_depth, path, checks);
+    const next_shape = try memo.shape(cand.der);
+    try findIssuerAndVerify(gpa, chain, trust_anchors, opts, cand.der, next_shape, used_chain, next_depth, path, checks, memo);
 }
 
 /// One certificate's revocation verdict under `rev` (rules on `Revocation`):
@@ -702,8 +720,8 @@ fn checkIsCaSigner(cand_der: CertDer) VerifyChainError!void {
 /// chain where an intermediate is PSS-signed by the root but itself signs
 /// the leaf with a std-supported algorithm, the leaf link needs exactly
 /// this fallback).
-fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64, allow_sha1: bool) VerifyChainError!void {
-    const subject_shape = try parseShape(.{ .buffer = subject_der, .index = 0 });
+fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64, allow_sha1: bool, memo: *Memo) VerifyChainError!void {
+    const subject_shape = try memo.shape(subject_der);
     if (!allow_sha1 and try signedWithSha1(subject_shape)) return error.WeakSignatureAlgorithm;
 
     if (algorithm.MlDsa.map.get(subject_shape.sig_alg_oid) != null) {
@@ -715,7 +733,7 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64, allow_sha
     }
 
     if (Certificate.AlgorithmCategory.map.get(subject_shape.sig_alg_oid) == .rsassa_pss) {
-        const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
+        const issuer_shape = try memo.shape(issuer_der);
         const issuer_pub_key = try rsa.PublicKey.fromDer(issuer_shape.spki);
         return verifyPssLink(subject_der, issuer_pub_key, now_sec);
     }
@@ -724,16 +742,15 @@ fn verifyLink(subject_der: CertDer, issuer_der: CertDer, now_sec: i64, allow_sha
     // `Parsed.verify` refuses it (`CertificateSignatureNamedCurveUnsupported`),
     // so this link is checked here, through the `p521` module.
     {
-        const issuer_shape = try parseShape(.{ .buffer = issuer_der, .index = 0 });
+        const issuer_shape = try memo.shape(issuer_der);
         if (isP521(issuer_shape.pub_key_algo)) return verifyP521Link(subject_shape, issuer_der, issuer_shape, now_sec);
     }
 
-    const subject_cert: Certificate = .{ .buffer = subject_der, .index = 0 };
-    const subject_parsed = try subject_cert.parse();
+    const subject_parsed = try memo.parse(subject_der);
 
     const issuer_cert: Certificate = .{ .buffer = issuer_der, .index = 0 };
-    const issuer_parsed = issuer_cert.parse() catch |err| switch (err) {
-        error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, try parseShape(issuer_cert)),
+    const issuer_parsed = memo.parse(issuer_der) catch |err| switch (err) {
+        error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, try memo.shape(issuer_der)),
         else => |e| return e,
     };
 
@@ -1227,6 +1244,50 @@ fn expectTag(e: der.Element, byte: u8) Certificate.ParseError!void {
 
 const tag_sequence: u8 = 0x30;
 const tag_bit_string: u8 = 0x03;
+
+/// `parseShape` and std's `Certificate.parse` results for the certificates
+/// one `verifyChain` call looks at, keyed by the DER slice (the same slice
+/// of `chain` / `trust_anchors` every time). A link parsed its issuer and the
+/// next link the same certificate as subject again, and the leaf was parsed
+/// once more for `VerifiedChain.leaf` (2026-10-26: 5 std parses for a
+/// three-certificate chain, now 3). Failures are not kept; past `cap`
+/// certificates it parses without keeping.
+const Memo = struct {
+    const cap = 12;
+    ders: [cap]CertDer = undefined,
+    shapes: [cap]?Shape = undefined,
+    parsed: [cap]?Certificate.Parsed = undefined,
+    len: usize = 0,
+
+    fn slot(m: *Memo, cert_der: CertDer) ?usize {
+        for (m.ders[0..m.len], 0..) |d, i| {
+            if (d.ptr == cert_der.ptr and d.len == cert_der.len) return i;
+        }
+        if (m.len == cap) return null;
+        m.ders[m.len] = cert_der;
+        m.shapes[m.len] = null;
+        m.parsed[m.len] = null;
+        m.len += 1;
+        return m.len - 1;
+    }
+
+    fn shape(m: *Memo, cert_der: CertDer) Certificate.ParseError!Shape {
+        const i = m.slot(cert_der) orelse return parseShape(.{ .buffer = cert_der, .index = 0 });
+        if (m.shapes[i]) |s| return s;
+        const s = try parseShape(.{ .buffer = cert_der, .index = 0 });
+        m.shapes[i] = s;
+        return s;
+    }
+
+    fn parse(m: *Memo, cert_der: CertDer) Certificate.ParseError!Certificate.Parsed {
+        const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
+        const i = m.slot(cert_der) orelse return cert.parse();
+        if (m.parsed[i]) |p| return p;
+        const p = try cert.parse();
+        m.parsed[i] = p;
+        return p;
+    }
+};
 
 fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const bytes = cert.buffer;

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** faster chain verification, same verdicts. One `verifyChain` / `verifyChainPath` call parses each certificate once (a per-call memo of `parseShape` and std's `Certificate.parse`: 5 std parses of a three-certificate chain became 3), and `extensions.ExtensionIterator` names an extension without std's `StaticStringMap` lookup (`extensions.extensionId`, pinned to std's map by a test over every three-octet OID under 2.5). bench-x509 RSA-2048 chain 71 → 65 µs, mixed 72 → 65 µs (1.33–1.35× rustls-webpki, was 1.49–1.51×).
+
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** the fastest in the field is rustls-webpki 0.103.15 over ring 0.17.14 (`tools/rust_fast_bench`, built `--offline`; source read before the first build), now the default alt side of `zig build bench-x509` (`BENCH_ALT=openssl` keeps the OpenSSL side). Measured 2026-10-26: ours 1.17× webpki on the ECDSA P-256 chain and 1.49–1.51× on the RSA-2048 and mixed chains (0.70–0.78× Go), so the card's P axis is 2 and the grade 2 — the entry below claimed grade 1 against the wrong fastest side.
 
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** `zig build bench-x509` also times OpenSSL's `X509_verify_cert` (`tools/c_bench/foreign_bench.c`, system libcrypto through `zig cc`; the same chains, host and sslserver purpose, root store built once), the fastest-in-the-field side. Measured 2026-10-26: ours 0.68–0.76× Go 1.26.8; OpenSSL 3.5.5 is 1.3–1.4× slower than Go on every chain, so Go stays the fastest and ours is 0.76× of it. Card P1, grade 1.
