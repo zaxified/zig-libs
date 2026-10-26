@@ -260,6 +260,76 @@ fn runCase(env: *Env, c: *const Case) !Outcome {
     return connectOnce(env, c, &bundle, &cache, auth);
 }
 
+/// One open connection whose server line has not been read yet.
+const Conn = struct {
+    stream: std.Io.net.Stream,
+    net_in: [Client.min_buffer_len]u8 = undefined,
+    net_out: [Client.min_buffer_len]u8 = undefined,
+    tls_in: [Client.min_buffer_len]u8 = undefined,
+    tls_out: [Client.min_buffer_len]u8 = undefined,
+    sr: std.Io.net.Stream.Reader = undefined,
+    sw: std.Io.net.Stream.Writer = undefined,
+    client: Client = undefined,
+
+    fn open(c: *Conn, env: *Env, port: u16, bundle: *std.crypto.Certificate.Bundle, cache: *Client.SessionCache) !void {
+        const io = env.io;
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", port);
+        c.stream = try addr.connect(io, .{ .mode = .stream });
+        c.sr = c.stream.reader(io, &c.net_in);
+        c.sw = c.stream.writer(io, &c.net_out);
+        var entropy: [Client.Options.entropy_len]u8 = undefined;
+        io.random(&entropy);
+        try Client.initInto(&c.client, &c.sr.interface, &c.sw.interface, .{
+            .host = .{ .explicit = "srv.interop.test" },
+            .ca = .{ .bundle = .{ .gpa = env.arena, .io = io, .lock = &env.lock, .bundle = bundle } },
+            .read_buffer = &c.tls_in,
+            .write_buffer = &c.tls_out,
+            .entropy = &entropy,
+            .realtime_now = std.Io.Clock.real.now(io),
+            .session_cache = cache,
+        });
+    }
+
+    /// Read the server's line (any NewSessionTicket before it is stored).
+    fn line(c: *Conn) ![]const u8 {
+        return c.client.reader.takeDelimiterExclusive('\n');
+    }
+
+    fn close(c: *Conn, io: std.Io) void {
+        c.stream.close(io);
+    }
+};
+
+/// Not a Go comparison but this client's own cache under Go's concurrent
+/// server: two connections A and B resume from the same entry, B's tickets
+/// are read first, then A's; a third connection must still resume. Until
+/// 2026-10-26 (review F3) A's ticket was stored with a PSK derived from B's
+/// resumption secret (the entry's, overwritten by B's Finished), so the third
+/// connection offered a wrong binder and Go's server ended it.
+fn interleavedResumption(env: *Env, c: *const Case) ![]const u8 {
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    try bundle.addCertsFromFilePath(env.arena, env.io, std.Io.Clock.real.now(env.io), env.dir, try env.arena.print("{s}.pem", .{c.root}));
+    var entries: [2]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    const conns = try env.arena.alloc(Conn, 4);
+    for (conns) |*k| k.* = .{ .stream = undefined };
+    try conns[0].open(env, c.port, &bundle, &cache);
+    _ = try conns[0].line();
+    conns[0].close(env.io);
+    try conns[1].open(env, c.port, &bundle, &cache);
+    try conns[2].open(env, c.port, &bundle, &cache);
+    if (!conns[1].client.did_resume or !conns[2].client.did_resume) return "A or B did not resume";
+    _ = try conns[2].line();
+    _ = try conns[1].line();
+    conns[1].close(env.io);
+    conns[2].close(env.io);
+    try conns[3].open(env, c.port, &bundle, &cache);
+    defer conns[3].close(env.io);
+    const l = conns[3].line() catch |e| return env.arena.print("third connection: {t}", .{e});
+    if (!conns[3].client.did_resume) return "third connection did not resume";
+    return env.arena.dupe(u8, l);
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
@@ -365,6 +435,19 @@ pub fn main(init: std.process.Init) !u8 {
         });
         if (surprise) |s| try w.print("SURPRISE {s} ({t}): {s}\n", .{ c.id, c.expect, s });
     }
+    // The interleaved-resumption check, on the plain TLS 1.3 resumption case.
+    for (cases) |*c| if (std.mem.eql(u8, c.id, "resume-13") and (filters.len == 0 or std.mem.find(u8, "resume-13-interleaved", filters[0]) != null)) {
+        const r = interleavedResumption(&env, c) catch |e| @errorName(e);
+        const ok = std.mem.startsWith(u8, r, "v=");
+        const fam = try families.getOrPut(arena, "resume");
+        if (!fam.found_existing) fam.value_ptr.* = .{};
+        inline for (.{ fam.value_ptr, &total }) |t| {
+            t.cases += 1;
+            if (!ok) t.surprises += 1;
+        }
+        try tsv.writer.print("resume-13-interleaved\tresume\town\t-\t{s}\t{s}\t-\n", .{ if (ok) "ok" else r, if (ok) "as expected" else "SURPRISE" });
+        if (!ok) try w.print("SURPRISE resume-13-interleaved (own): {s}\n", .{r});
+    };
     try dir.writeFile(io, .{ .sub_path = "verdicts.tsv", .data = tsv.written() });
 
     try w.print("\nGo {s} crypto/tls, {d} cases\n", .{ go_version, total.cases });

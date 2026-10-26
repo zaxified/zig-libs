@@ -130,6 +130,10 @@ const Templates = struct {
     aiv: [12]u8 = undefined,
     f12: [4096]u8 = undefined,
     f12_len: usize = 0,
+    /// The plain flight's transcript before the ServerHello, and its ServerHello.
+    th0: Sha256 = undefined,
+    server_hello: [128]u8 = undefined,
+    server_hello_len: usize = 0,
 };
 var tm: Templates = .{};
 var tm_ready = false;
@@ -157,6 +161,18 @@ const Outcome = struct {
     written: u64 = 0,
 };
 
+/// Per-test changes to the client's options (reset by each test that sets
+/// them; the fuzz harness and the templates run with the defaults).
+const Override = struct {
+    key_share: ?[]const tls.NamedGroup = null,
+    groups: ?[]const tls.NamedGroup = null,
+    min_version: tls.ProtocolVersion = .tls_1_2,
+    alpn: []const []const u8 = &.{},
+    host: ?[]const u8 = null,
+    cache: ?*Client.SessionCache = null,
+};
+var ov: Override = .{};
+
 /// `Client.initInto` over `input` with the fixed entropy; on success the
 /// application stream is read to its end (`close_notify`).
 fn runClient(input: []const u8, out_copy: ?*Writer) Outcome {
@@ -176,7 +192,7 @@ fn runClientHook(input: []const u8, out_copy: ?*Writer, hook: ?*const fn () void
     // damaged flights too.
     info = .init(&info_storage);
     const opts: Client.Options = .{
-        .host = .no_verification,
+        .host = if (ov.host) |h| .{ .explicit = h } else .no_verification,
         .ca = .no_verification,
         .write_buffer = &write_buf,
         .read_buffer = &read_buf,
@@ -184,6 +200,11 @@ fn runClientHook(input: []const u8, out_copy: ?*Writer, hook: ?*const fn () void
         .realtime_now = .{ .nanoseconds = 0 },
         .connection_info = &info,
         .client_auth_select = .{ .select = selectNone },
+        .groups = ov.groups orelse &Client.default_groups,
+        .key_share_groups = ov.key_share orelse &Client.default_key_share_groups,
+        .min_version = ov.min_version,
+        .alpn_protocols = ov.alpn,
+        .session_cache = ov.cache,
     };
     var o: Outcome = .{};
     if (Client.initInto(&sink, &reader, w, opts)) |_| {
@@ -243,7 +264,6 @@ fn ensureTemplates() !void {
     const client_hello = hello_copy.buffered();
     tm.hello_len = client_hello.len;
     const session_echo = tm.entropy[32..64];
-    const client_rand = tm.entropy[0..32];
     const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
     const srv_sk: [32]u8 = @as([32]u8, @splat(0x5c));
     const srv_pub = X25519.recoverPublicKey(srv_sk);
@@ -276,7 +296,10 @@ fn ensureTemplates() !void {
     cur_nrecords = &tm.f13_nrecords;
     var th0 = Sha256.init(.{});
     th0.update(client_hello[tls.record_header_len..]);
-    tm.f13_len = try buildFlight13(&tm.f13, "", th0, server_hello, srv_sk, client_x25519.public_key);
+    tm.f13_len = try buildFlight13(&tm.f13, "", th0, server_hello, srv_sk, client_x25519.public_key, .{});
+    tm.th0 = th0;
+    tm.server_hello_len = server_hello.len;
+    @memcpy(tm.server_hello[0..server_hello.len], server_hello);
 
     // The same after a cookie HRR: the client's two hellos, then the flight
     // over message_hash(CH1) ‖ HRR ‖ CH2.
@@ -318,27 +341,50 @@ fn ensureTemplates() !void {
         cur_nrecords = &tm.f13h_nrecords;
         tm.f13h_records[0] = 0;
         tm.f13h_nrecords = 1;
-        tm.f13h_len = try buildFlight13(&tm.f13h, hrr_record, thh, server_hello, srv_sk, client_x25519.public_key);
+        tm.f13h_len = try buildFlight13(&tm.f13h, hrr_record, thh, server_hello, srv_sk, client_x25519.public_key, .{});
         cur_records = &tm.f13_records;
         cur_nrecords = &tm.f13_nrecords;
     }
 
     // ── TLS 1.2 (plaintext until the server's Finished, which never comes) ──
+    tm_ready = true;
+    tm.f12_len = try buildFlight12(&tm.f12, .{});
+}
+
+/// A TLS 1.2 server flight (ServerHello, Certificate, ServerKeyExchange,
+/// ServerHelloDone), with the variations the regression tests need.
+const V12 = struct {
+    random: [32]u8 = @splat(0x77),
+    /// ServerHello extensions block content (without its length); none if "".
+    sh_exts: []const u8 = "",
+    /// A CertificateStatus after the Certificate.
+    cert_status: bool = false,
+    /// A CertificateRequest (ecdsa_sign, ecdsa_secp256r1_sha256) before ServerHelloDone.
+    cert_request: bool = false,
+};
+
+fn buildFlight12(out: []u8, v: V12) !usize {
     var body: [2048]u8 = undefined;
     const der = server_cert_der;
+    const client_rand = tm.entropy[0..32];
+    const srv_pub = X25519.recoverPublicKey(@as([32]u8, @splat(0x5c)));
     const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
     var sig_der: [Es256.Signature.der_encoded_length_max]u8 = undefined;
-    var w12 = Writer.fixed(&tm.f12);
+    var w12 = Writer.fixed(out);
     var m12: [1024]u8 = undefined;
     var bw = Writer.fixed(&body);
     bw.writeInt(u16, 0x0303, .big) catch unreachable;
-    bw.writeAll(&server_rand) catch unreachable;
+    bw.writeAll(&v.random) catch unreachable;
     bw.writeByte(0) catch unreachable; // no session id
     // The certificate's key is P-256, so the suite is ECDHE_ECDSA (RFC 8422
     // §5.3; the client checks the pairing since 2026-10-13 -- std accepted
     // ECDHE_RSA here).
     bw.writeInt(u16, @backingInt(tls.CipherSuite.ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), .big) catch unreachable;
     bw.writeByte(0) catch unreachable;
+    if (v.sh_exts.len > 0) {
+        bw.writeInt(u16, @intCast(v.sh_exts.len), .big) catch unreachable;
+        bw.writeAll(v.sh_exts) catch unreachable;
+    }
     putPlain(&w12, hsMsg(&m12, .server_hello, body[0..bw.end]));
 
     bw = Writer.fixed(&body);
@@ -346,6 +392,7 @@ fn ensureTemplates() !void {
     bw.writeInt(u24, @intCast(der.len), .big) catch unreachable;
     bw.writeAll(der) catch unreachable;
     putPlain(&w12, hsMsg(&m12, .certificate, body[0..bw.end]));
+    if (v.cert_status) putPlain(&w12, hsMsg(&m12, @fromBackingInt(22), &.{ 1, 0, 0, 2, 0x30, 0x00 }));
 
     var params: [3 + 1 + 32]u8 = undefined;
     params[0] = 3;
@@ -354,7 +401,7 @@ fn ensureTemplates() !void {
     params[4..][0..32].* = srv_pub;
     var to_sign: [32 + 32 + params.len]u8 = undefined;
     to_sign[0..32].* = client_rand.*;
-    to_sign[32..64].* = server_rand;
+    to_sign[32..64].* = v.random;
     to_sign[64..].* = params;
     const sig12 = (try kp.sign(&to_sign, null)).toDer(&sig_der);
     bw = Writer.fixed(&body);
@@ -363,16 +410,25 @@ fn ensureTemplates() !void {
     bw.writeInt(u16, @intCast(sig12.len), .big) catch unreachable;
     bw.writeAll(sig12) catch unreachable;
     putPlain(&w12, hsMsg(&m12, .server_key_exchange, body[0..bw.end]));
+    // certificate_types [ecdsa_sign], signature algorithms [0x0403], no CAs
+    if (v.cert_request) putPlain(&w12, hsMsg(&m12, .certificate_request, &.{ 1, 64, 0, 2, 4, 3, 0, 0 }));
     putPlain(&w12, hsMsg(&m12, .server_hello_done, ""));
-    tm.f12_len = w12.end;
-    tm_ready = true;
+    return w12.end;
 }
 
 /// The TLS 1.3 server flight after `prefix` (records already sent) over the
 /// transcript `th0` (everything before the ServerHello): ServerHello, CCS,
 /// EncryptedExtensions, Certificate, CertificateVerify, Finished, then the
 /// application stream. Returns its length in `out`.
-fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []const u8, srv_sk: [32]u8, client_x25519_pub: [32]u8) !usize {
+/// Deliberately broken flights for the regression tests (audit 2026-10-26).
+const V13 = struct {
+    /// The server Finished's verify_data off by one bit (still encrypted right).
+    bad_finished: bool = false,
+    /// A CertificateRequest after the Certificate (RFC 8446 §4.3.2: before it).
+    cr_after_cert: bool = false,
+};
+
+fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []const u8, srv_sk: [32]u8, client_x25519_pub: [32]u8, v: V13) !usize {
     var th = th0;
     th.update(server_hello);
     const hello_hash = th.peek();
@@ -405,6 +461,14 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     const cert = hsMsg(&buf, .certificate, body[0 .. 7 + der.len + 2]);
     th.update(cert);
     putEncrypted(&w13, key, iv, 1, .handshake, cert);
+    var seq: u64 = 2;
+    if (v.cr_after_cert) {
+        // context "", signature_algorithms [ecdsa_secp256r1_sha256]
+        const cr = hsMsg(&buf, .certificate_request, &.{ 0, 0, 8, 0, 13, 0, 4, 0, 2, 4, 3 });
+        th.update(cr);
+        putEncrypted(&w13, key, iv, seq, .handshake, cr);
+        seq += 1;
+    }
 
     const kp = try Es256.KeyPair.fromSecretKey(try Es256.SecretKey.fromBytes(server_key_der[7..39].*));
     const signed = strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00";
@@ -418,12 +482,14 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     @memcpy(body[4..][0..sig.len], sig);
     const cv = hsMsg(&buf, .certificate_verify, body[0 .. 4 + sig.len]);
     th.update(cv);
-    putEncrypted(&w13, key, iv, 2, .handshake, cv);
+    putEncrypted(&w13, key, iv, seq, .handshake, cv);
+    seq += 1;
 
     const fin_key = tls.hkdfExpandLabel(Hkdf, s_ts, "finished", "", HmacSha256.key_length);
-    const verify_data = tls.hmac(HmacSha256, &th.peek(), fin_key);
+    var verify_data = tls.hmac(HmacSha256, &th.peek(), fin_key);
+    if (v.bad_finished) verify_data[0] ^= 0x01;
     const fin = hsMsg(&buf, .finished, &verify_data);
-    putEncrypted(&w13, key, iv, 3, .handshake, fin);
+    putEncrypted(&w13, key, iv, seq, .handshake, fin);
     th.update(fin);
 
     // The application stream: "ping", a KeyUpdate (nothing requested), "pong"
@@ -433,7 +499,7 @@ fn buildFlight13(out: []u8, prefix: []const u8, th0: Sha256, server_hello: []con
     const s_ap = tls.hkdfExpandLabel(Hkdf, master, "s ap traffic", &th.peek(), 32);
     const akey = tls.hkdfExpandLabel(Hkdf, s_ap, "key", "", 16);
     const aiv = tls.hkdfExpandLabel(Hkdf, s_ap, "iv", "", 12);
-    if (prefix.len == 0) { // the plain flight's keys, not the HRR variant's
+    if (prefix.len == 0 and !tm_ready) { // the plain template's keys, not the HRR or a broken variant's
         tm.akey = akey;
         tm.aiv = aiv;
     }
@@ -577,6 +643,227 @@ test "the genuine flights: TLS 1.3 is accepted and read to close_notify, TLS 1.2
     const o12 = runClient(tm.f12[0..tm.f12_len], null);
     try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), o12.init_err);
     try testing.expect(o12.written > tm.hello_len);
+}
+
+// ── audit 2026-10-26: the server-message checks no test reached ─────────
+// (each found as a surviving mutant; its number in the comment)
+
+/// `msg` as one plaintext handshake record into `buf`.
+fn plainRecord(buf: []u8, msg: []const u8) []const u8 {
+    var w = Writer.fixed(buf);
+    putPlain(&w, msg);
+    return buf[0..w.end];
+}
+
+/// The template TLS 1.3 ServerHello with `suite` and `extra` appended to its
+/// extensions (the length fields patched).
+fn serverHello13(buf: []u8, suite: tls.CipherSuite, extra: []const u8) []const u8 {
+    const sh = tm.server_hello[0..tm.server_hello_len];
+    @memcpy(buf[0..sh.len], sh);
+    @memcpy(buf[sh.len..][0..extra.len], extra);
+    const n = sh.len + extra.len;
+    // msg type(1) len(3) version(2) random(32) sid(33): suite at 71, compression 73, ext len 74.
+    std.mem.writeInt(u16, buf[71..73], @backingInt(suite), .big);
+    std.mem.writeInt(u24, buf[1..4], @intCast(n - 4), .big);
+    std.mem.writeInt(u16, buf[74..76], @intCast(n - 76), .big);
+    return buf[0..n];
+}
+
+fn scratchRecords() void {
+    const S = struct {
+        var records: [12]usize = undefined;
+        var n: usize = 0;
+    };
+    S.n = 0;
+    cur_records = &S.records;
+    cur_nrecords = &S.n;
+}
+
+fn restoreRecords() void {
+    cur_records = &tm.f13_records;
+    cur_nrecords = &tm.f13_nrecords;
+}
+
+test "a TLS 1.3 server Finished with wrong verify_data is refused (audit mutant 59)" {
+    // Damage inside the AEAD fails earlier; this flight is encrypted right
+    // and only the HMAC is off.
+    try ensureTemplates();
+    scratchRecords();
+    defer restoreRecords();
+    var flight: [4096]u8 = undefined;
+    const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
+    const n = try buildFlight13(&flight, "", tm.th0, tm.server_hello[0..tm.server_hello_len], @splat(0x5c), client_x25519.public_key, .{ .bad_finished = true });
+    try testing.expectEqual(@as(?anyerror, error.TlsDecryptError), runClient(flight[0..n], null).init_err);
+}
+
+test "a TLS 1.3 CertificateRequest after the Certificate is unexpected_message (audit mutant 62)" {
+    try ensureTemplates();
+    scratchRecords();
+    defer restoreRecords();
+    var flight: [4096]u8 = undefined;
+    const client_x25519 = X25519.KeyPair.generateDeterministic(tm.entropy[208..240].*);
+    const n = try buildFlight13(&flight, "", tm.th0, tm.server_hello[0..tm.server_hello_len], @splat(0x5c), client_x25519.public_key, .{ .cr_after_cert = true });
+    try testing.expectEqual(@as(?anyerror, error.TlsUnexpectedMessage), runClient(flight[0..n], null).init_err);
+}
+
+test "a HelloRetryRequest naming a TLS 1.2 suite is illegal_parameter (audit mutant 29)" {
+    try ensureTemplates();
+    var rec: [300]u8 = undefined;
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(hrr(&rec, .ECDHE_ECDSA_WITH_AES_128_GCM_SHA256), null).init_err);
+    // The same HRR with a TLS 1.3 suite is taken (the client answers, then
+    // runs out of input): the refusal above is the suite's.
+    try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), runClient(hrr(&rec, .AES_128_GCM_SHA256), null).init_err);
+}
+
+/// A HelloRetryRequest record (supported_versions 1.3 and a cookie) naming `suite`.
+fn hrr(buf: []u8, suite: tls.CipherSuite) []const u8 {
+    var w = Writer.fixed(buf);
+    var body: [128]u8 = undefined;
+    var bw = Writer.fixed(&body);
+    bw.writeInt(u16, 0x0303, .big) catch unreachable;
+    bw.writeAll(&tls.hello_retry_request_sequence) catch unreachable;
+    bw.writeByte(32) catch unreachable;
+    bw.writeAll(tm.entropy[32..64]) catch unreachable;
+    bw.writeInt(u16, @backingInt(suite), .big) catch unreachable;
+    bw.writeByte(0) catch unreachable;
+    bw.writeAll(&.{ 0, 14, 0, 43, 0, 2, 3, 4, 0, 44, 0, 4, 0, 2, 0xab, 0xcd }) catch unreachable;
+    var m: [160]u8 = undefined;
+    putPlain(&w, hsMsg(&m, .server_hello, body[0..bw.end]));
+    return buf[0..w.end];
+}
+
+test "a ServerHello pre_shared_key with no PSK offered is illegal_parameter (audit mutant 53)" {
+    try ensureTemplates();
+    var sh_buf: [256]u8 = undefined;
+    var rec: [300]u8 = undefined;
+    const msg = serverHello13(&sh_buf, .AES_128_GCM_SHA256, &.{ 0, 41, 0, 2, 0, 0 });
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(plainRecord(&rec, msg), null).init_err);
+}
+
+test "an accepted PSK whose suite hash is not the ticket's is illegal_parameter (audit mutant 54)" {
+    // RFC 8446 §4.2.11: the server must pick a suite of the PSK's hash.
+    try ensureTemplates();
+    var entries: [1]Client.ClientSession = undefined;
+    var cache: Client.SessionCache = .init(&entries, null);
+    defer cache.deinit();
+    const e = cache.reserve("psk.test").?;
+    e.hash = .sha384;
+    e.psk = @splat(0x11);
+    @memcpy(e.ticket_buf[0..4], "tkt!");
+    e.ticket_len = 4;
+    e.ticket_lifetime_s = 3600;
+    e.received_ms = 0;
+    e.usable = true;
+    ov = .{ .host = "psk.test", .cache = &cache };
+    defer ov = .{};
+    var sh_buf: [256]u8 = undefined;
+    var rec: [300]u8 = undefined;
+    // selected_identity 0 under AES_128_GCM_SHA256 (SHA-256) for a SHA-384 ticket.
+    const msg = serverHello13(&sh_buf, .AES_128_GCM_SHA256, &.{ 0, 41, 0, 2, 0, 0 });
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(plainRecord(&rec, msg), null).init_err);
+}
+
+test "TLS 1.2: both downgrade sentinels in the ServerHello random are refused by a TLS 1.3 client (audit mutants 32, 33)" {
+    try ensureTemplates();
+    var flight: [4096]u8 = undefined;
+    inline for (.{ "DOWNGRD\x00", "DOWNGRD\x01" }) |tail| {
+        var r: [32]u8 = @splat(0x77);
+        @memcpy(r[24..32], tail);
+        const n = try buildFlight12(&flight, .{ .random = r });
+        try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(flight[0..n], null).init_err);
+    }
+    // ... and the genuine random goes past the ServerHello.
+    try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), runClient(tm.f12[0..tm.f12_len], null).init_err);
+}
+
+test "TLS 1.2 ServerHello to a client offering only TLS 1.3 is illegal_parameter (audit mutant 30)" {
+    try ensureTemplates();
+    ov = .{ .min_version = .tls_1_3 };
+    defer ov = .{};
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(tm.f12[0..tm.f12_len], null).init_err);
+}
+
+test "TLS 1.2 ServerKeyExchange with a group the client did not list is illegal_parameter (audit mutant 34)" {
+    try ensureTemplates();
+    ov = .{ .groups = &.{.secp256r1}, .key_share = &.{.secp256r1} };
+    defer ov = .{};
+    // The template's ServerKeyExchange is X25519.
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(tm.f12[0..tm.f12_len], null).init_err);
+}
+
+test "TLS 1.2 ServerHello with the ALPN extension twice is illegal_parameter (audit mutant 35)" {
+    try ensureTemplates();
+    ov = .{ .alpn = &.{"h2"} };
+    defer ov = .{};
+    var flight: [4096]u8 = undefined;
+    const alpn = [_]u8{ 0, 16, 0, 5, 0, 3, 2, 'h', '2' };
+    const once = try buildFlight12(&flight, .{ .sh_exts = &alpn });
+    try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), runClient(flight[0..once], null).init_err);
+    const twice = try buildFlight12(&flight, .{ .sh_exts = &(alpn ++ alpn) });
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), runClient(flight[0..twice], null).init_err);
+}
+
+test "TLS 1.2 CertificateStatus without the ServerHello's status_request is unexpected_message (audit mutant 48)" {
+    try ensureTemplates();
+    var flight: [4096]u8 = undefined;
+    const n = try buildFlight12(&flight, .{ .cert_status = true });
+    try testing.expectEqual(@as(?anyerror, error.TlsUnexpectedMessage), runClient(flight[0..n], null).init_err);
+}
+
+test "TLS 1.2 CertificateRequest with no credential: an empty Certificate, no CertificateVerify (audit mutants 45, 46)" {
+    try ensureTemplates();
+    var flight: [4096]u8 = undefined;
+    const n = try buildFlight12(&flight, .{ .cert_request = true });
+    var copy: Writer = undefined;
+    const o = runClient(flight[0..n], &copy);
+    try testing.expectEqual(@as(?anyerror, error.TlsConnectionTruncated), o.init_err);
+    const sent = copy.buffered()[tm.hello_len..];
+    // Certificate (empty list) in its own record, then ClientKeyExchange: no
+    // CertificateVerify (type 15) anywhere in the plaintext the client sent.
+    try testing.expect(std.mem.find(u8, sent, "\x0b\x00\x00\x03\x00\x00\x00") != null);
+    var i: usize = 0;
+    while (i + 5 <= sent.len) {
+        const len = std.mem.readInt(u16, sent[i + 3 ..][0..2], .big);
+        if (sent[i] == @backingInt(tls.ContentType.handshake)) try testing.expect(sent[i + 5] != 15);
+        if (sent[i] == @backingInt(tls.ContentType.change_cipher_spec)) break;
+        i += 5 + len;
+    }
+}
+
+test "a host name over 255 bytes is HostNameInvalid before anything is written (review F5, 2026-10-26)" {
+    // It reached `hello.write(...) catch unreachable` (a panic) once the
+    // hello buffer ran out, and an `@intCast` to u16 beyond 64 KiB.
+    const long: [256]u8 = @splat('a');
+    var reader = Reader.fixed(&in_buf);
+    reader.end = 0;
+    var w = Writer.fixed(&out_buf);
+    const opts: Client.Options = .{
+        .host = .{ .explicit = &long },
+        .ca = .no_verification,
+        .write_buffer = &write_buf,
+        .read_buffer = &read_buf,
+        .entropy = &tm.entropy,
+        .realtime_now = .{ .nanoseconds = 0 },
+    };
+    try testing.expectError(error.HostNameInvalid, Client.initInto(&sink, &reader, &w, opts));
+    try testing.expectEqual(@as(usize, 0), w.end);
+    var ok_reader = Reader.fixed(&in_buf);
+    ok_reader.end = 0;
+    var w2 = Writer.fixed(&out_buf);
+    var opts255 = opts;
+    opts255.host = .{ .explicit = long[0..255] };
+    try testing.expect(Client.initInto(&sink, &ok_reader, &w2, opts255) != error.HostNameInvalid);
+}
+
+test "a ServerHello key_share for a group we sent no share for is illegal_parameter, even X25519 inside the hybrid (review F4, 2026-10-26)" {
+    // With only the X25519MLKEM768 share sent, the X25519 key pair still
+    // exists (it is the hybrid's second half), and a ServerHello choosing
+    // plain X25519 was accepted -- RFC 8446 §4.2.8 wants illegal_parameter.
+    try ensureTemplates();
+    ov = .{ .key_share = &.{.x25519_ml_kem768} };
+    defer ov = .{};
+    const o = runClient(tm.f13[0..tm.f13_len], null);
+    try testing.expectEqual(@as(?anyerror, error.TlsIllegalParameter), o.init_err);
 }
 
 test "a short or all-zero application record ends the read with an error, not an underflow (std bugs, TLSCLIENT_FUZZ 2026-10-13)" {

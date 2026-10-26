@@ -182,6 +182,79 @@ test "malformed DER never reaches std's parser" {
     for (cases) |d| try testing.expectError(error.TlsCertificateNotVerified, checkWellFormed(d));
 }
 
+test "a chain of exactly max_chain_len certificates is judged, one more is refused (audit 2026-10-26, mutant 16)" {
+    // leaf, intermediate and eight stray copies of the root: the anchor comes
+    // from the bundle, so the strays change nothing and the chain verifies.
+    var bundle = try rootBundle(testing.allocator);
+    defer bundle.deinit(testing.allocator);
+    var c: Chain = .{};
+    const base = try c.of(&.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem"), @embedFile("testdata/root.pem") });
+    var chain: [max_chain_len + 1][]const u8 = undefined;
+    chain[0] = base[0];
+    chain[1] = base[1];
+    for (chain[2..]) |*d| d.* = base[2];
+    try verifyAgainstBundle(chain[0..max_chain_len], &bundle, now);
+    try testing.expectError(error.TlsCertificateNotVerified, verifyAgainstBundle(chain[0 .. max_chain_len + 1], &bundle, now));
+    try testing.expectError(error.TlsCertificateNotVerified, verifyAgainstBundle(chain[0..0], &bundle, now));
+}
+
+test "every anchor the chain names is offered, not only the first (audit 2026-10-26, mutant 17)" {
+    // The bundle holds the root and a decoy with the intermediate's subject
+    // but a broken public key. The leaf's issuer name finds the decoy first;
+    // the intermediate's finds the root, which is the anchor the path ends in.
+    const gpa = testing.allocator;
+    var bundle = try rootBundle(gpa);
+    defer bundle.deinit(gpa);
+    var c: Chain = .{};
+    const chain = try c.of(&.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") });
+    var decoy_buf: [4096]u8 = undefined;
+    const decoy = decoy_buf[0..chain[1].len];
+    @memcpy(decoy, chain[1]);
+    const parsed = try (Certificate{ .buffer = decoy, .index = 0 }).parse();
+    const key_end = parsed.pub_key_slice.end;
+    decoy[key_end - 1] ^= 0x01; // the last octet of the point: off the curve
+    const start: u32 = @intCast(bundle.bytes.items.len);
+    try bundle.bytes.appendSlice(gpa, decoy);
+    try bundle.parseCert(gpa, start, 0);
+    try verifyAgainstBundle(chain, &bundle, now);
+}
+
+test "checkWellFormed refuses a certificate std's parser would read past (audit 2026-10-26, mutant 20)" {
+    // leaf.pem with its signatureValue cut off and the outer length fixed:
+    // well-formed DER (`validateCertificate` accepts it), but std's `parse`
+    // reads the signature header at the end of the buffer.
+    // `validateForStdParse` refuses it.
+    var pem_buf: [4096]u8 = undefined;
+    const der = try pemToDer(@embedFile("testdata/leaf.pem"), &pem_buf);
+    try checkWellFormed(der);
+    const Hdr = struct {
+        content: usize,
+        end: usize,
+        fn at(d: []const u8, off: usize) !@This() {
+            var i = off + 1;
+            var len: usize = d[i];
+            i += 1;
+            if (len & 0x80 != 0) {
+                const k = len & 0x7f;
+                len = 0;
+                for (d[i..][0..k]) |b| len = (len << 8) | b;
+                i += k;
+            }
+            return .{ .content = i, .end = i + len };
+        }
+    };
+    const outer = try Hdr.at(der, 0);
+    const tbs = try Hdr.at(der, outer.content);
+    const sig_alg = try Hdr.at(der, tbs.end);
+    const body = der[outer.content..sig_alg.end];
+    var cut: [4096 + 4]u8 = undefined;
+    cut[0..4].* = .{ 0x30, 0x82, @intCast(body.len >> 8), @truncate(body.len) };
+    @memcpy(cut[4..][0..body.len], body);
+    try testing.expectError(error.TlsCertificateNotVerified, checkWellFormed(cut[0 .. 4 + body.len]));
+    // The x509 guard the mutant would fall back to lets it through.
+    try x509.safe.validateCertificate(cut[0 .. 4 + body.len]);
+}
+
 // ── fuzz: a server's Certificate message is attacker bytes ──────────────────
 
 /// Split `input` into certificates the way a fuzzer can steer: each one is a

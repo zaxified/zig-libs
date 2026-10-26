@@ -1334,7 +1334,9 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # 2026-10-26 (later) — ecdsa_secp521r1_sha512 offered + ECDSA verify by the key's
 # curve: counts unchanged (kex 15, cv 30); the kex output pin moved because the
 # ClientHello (one more signature scheme) and so the transcript and secrets did.
-tlsclient	ReleaseFast	kex	1	15	26885c287c03054e	69d580a9d811f34f
+# 2026-10-26 (audit) — rsa_pkcs1_sha1 no longer offered + review fixes: counts
+# unchanged (kex 15, cv 30); kex output pin moved with the ClientHello again.
+tlsclient	ReleaseFast	kex	1	15	4f803b69e2052825	c72177e1594131b1
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1347,7 +1349,7 @@ tlsclient	ReleaseFast	kex	1	15	26885c287c03054e	69d580a9d811f34f
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	34e1381e05733787	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	c2156a9584600a06	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

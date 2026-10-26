@@ -34,9 +34,10 @@ pub const max_ticket_len = 2048;
 pub const max_cookie_len = 2048;
 
 /// std's signature_algorithms list, in std's order, plus
-/// ecdsa_secp521r1_sha512 (zig-libs tlsclient, 2026-10-26: the P-521 server
-/// keys Go's client verifies; std's list lacked it, so a P-521-only TLS 1.3
-/// server had no scheme to sign with).
+/// ecdsa_secp521r1_sha512 and without rsa_pkcs1_sha1 (zig-libs tlsclient,
+/// 2026-10-26, Go's handshake list: the P-521 server keys Go's client
+/// verifies -- std's list lacked it, so a P-521-only TLS 1.3 server had no
+/// scheme to sign with; SHA-1 handshake signatures are refused, RFC 9155).
 pub const signature_algorithms = [_]tls.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
@@ -50,7 +51,6 @@ pub const signature_algorithms = [_]tls.SignatureScheme{
     .rsa_pss_pss_sha256,
     .rsa_pss_pss_sha384,
     .rsa_pss_pss_sha512,
-    .rsa_pkcs1_sha1,
     .ed25519,
 };
 

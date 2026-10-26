@@ -1137,7 +1137,7 @@ fn findExt(hello: []const u8, at: usize, typ: u16) !struct { at: usize, len: usi
     return error.TestExtensionMissing;
 }
 
-test "std profile: with std's groups and shares the ClientHello is std's, plus the three ECDHE_ECDSA suites and ecdsa_secp521r1_sha512" {
+test "std profile: with std's groups and shares the ClientHello is std's, plus the three ECDHE_ECDSA suites and Go's handshake signature schemes" {
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
     const ours = try clientHello(Client, &a, &.{});
@@ -1154,26 +1154,37 @@ test "std profile: with std's groups and shares the ClientHello is std's, plus t
     const ecdsa = [_]u16{ 0xC02B, 0xC02C, 0xCCA9 };
     for (0..3) |i| try testing.expect(std.mem.findScalar(u16, &ecdsa, std.mem.readInt(u16, ours[ins + 2 * i ..][0..2], .big)) != null);
     // ... the compression methods the same, and in the extensions only
-    // signature_algorithms differs: ecdsa_secp521r1_sha512 (0x0603) after
-    // ecdsa_secp384r1_sha384 (0x0503), 2026-10-26.
+    // signature_algorithms differs (2026-10-26, Go's handshake list):
+    // ecdsa_secp521r1_sha512 (0x0603) after ecdsa_secp384r1_sha384 (0x0503),
+    // rsa_pkcs1_sha1 (0x0201) gone -- the same length.
     try testing.expectEqualSlices(u8, theirs[ins..][0..2], ours[ins + 6 ..][0..2]);
     const ext_t = ins + 2;
     const ext_o = ins + 6 + 2;
-    try testing.expectEqual(std.mem.readInt(u16, theirs[ext_t..][0..2], .big) + 2, std.mem.readInt(u16, ours[ext_o..][0..2], .big));
+    try testing.expectEqual(std.mem.readInt(u16, theirs[ext_t..][0..2], .big), std.mem.readInt(u16, ours[ext_o..][0..2], .big));
     const sig_t = try findExt(theirs, ext_t, 0x000d);
     const sig_o = try findExt(ours, ext_o, 0x000d);
     try testing.expectEqual(sig_t.at - ext_t, sig_o.at - ext_o);
-    try testing.expectEqual(sig_t.len + 2, sig_o.len);
+    try testing.expectEqual(sig_t.len, sig_o.len);
     const list_t = theirs[sig_t.at + 6 .. sig_t.at + sig_t.len];
     const list_o = ours[sig_o.at + 6 .. sig_o.at + sig_o.len];
-    try testing.expectEqualSlices(u8, list_t[0..4], list_o[0..4]); // 0x0403 0x0503
-    try testing.expectEqualSlices(u8, "\x06\x03", list_o[4..6]);
-    try testing.expectEqualSlices(u8, list_t[4..], list_o[6..]);
+    var want: [64]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < list_t.len) : (i += 2) {
+        if (std.mem.eql(u8, list_t[i..][0..2], "\x02\x01")) continue;
+        @memcpy(want[n..][0..2], list_t[i..][0..2]);
+        n += 2;
+        if (std.mem.eql(u8, list_t[i..][0..2], "\x05\x03")) {
+            @memcpy(want[n..][0..2], "\x06\x03");
+            n += 2;
+        }
+    }
+    try testing.expectEqualSlices(u8, want[0..n], list_o);
     try testing.expectEqualSlices(u8, theirs[ext_t + 2 .. sig_t.at], ours[ext_o + 2 .. sig_o.at]);
     try testing.expectEqualSlices(u8, theirs[sig_t.at + sig_t.len ..], ours[sig_o.at + sig_o.len ..]);
-    // ... and the length fields in front grown by 6 + 2.
-    try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 8, std.mem.readInt(u16, ours[3..5], .big));
-    try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 8, std.mem.readInt(u24, ours[6..9], .big));
+    // ... and the length fields in front grown by 6.
+    try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 6, std.mem.readInt(u16, ours[3..5], .big));
+    try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 6, std.mem.readInt(u24, ours[6..9], .big));
     try testing.expectEqualSlices(u8, theirs[9..cs], ours[9..cs]);
     try testing.expectEqualSlices(u8, theirs[cs + 2 .. ins], ours[cs + 2 .. ins]);
 }

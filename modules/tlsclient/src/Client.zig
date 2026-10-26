@@ -636,6 +636,9 @@ pub const InitError = error{
     /// `groups` empty, a group not in `supported_groups` or listed twice, or
     /// a `key_share_groups` entry not in `groups`.
     GroupsInvalid,
+    /// `host` over 255 bytes (RFC 6066 §3: a HostName is at most 2^8 - 1
+    /// in practice, DNS names 253): it would not fit the ClientHello.
+    HostNameInvalid,
     /// `connection_info.storage` cannot hold the peer's certificates, OCSP
     /// response and SCTs.
     ConnectionInfoTooSmall,
@@ -682,6 +685,9 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
         .no_verification => "",
         .explicit => |host| host,
     };
+    // zig-libs tlsclient: a caller-supplied name too long for the hello
+    // reached `catch unreachable` / an `@intCast` (review F5, 2026-10-26).
+    if (host.len > 255) return error.HostNameInvalid;
 
     const client_hello_rand = options.entropy[0..32].*;
     var key_seq: u64 = 0;
@@ -725,7 +731,13 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     if (options.session_cache) |cache| if (host.len != 0 and options.max_version == .tls_1_3) {
         cache.acquire();
         defer cache.release();
-        if (cache.find(host)) |e| if (e.fresh(now_ms)) {
+        // zig-libs tlsclient: a session is resumed only under the
+        // verification it was made with, or with none now -- one made with
+        // `.no_verification` or `.self_signed` is not resumed under a bundle
+        // (Go: a session without verified chains is not resumed by a verifying
+        // config). A cache shared by different bundles is still one trust
+        // domain (review F2, 2026-10-26; see SessionCache).
+        if (cache.find(host)) |e| if (e.fresh(now_ms) and resumableUnder(e, options.ca)) {
             offer = .{ .entry = e, .generation = e.generation, .hash = e.hash, .psk = e.psk, .ticket_len = e.ticket_len, .age = tlsresume.replay.obfuscateAge(@intCast(now_ms - e.received_ms), e.ticket_age_add) };
             @memcpy(offer.?.ticket_buf[0..e.ticket_len], e.ticket());
         };
@@ -1022,6 +1034,12 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         try extd.ensure(key_size);
                                         // After an HRR the server must use the group it asked for.
                                         if (hrr_group) |g| if (g != named_group) return error.TlsIllegalParameter;
+                                        // zig-libs tlsclient: otherwise one we sent a share for
+                                        // (RFC 8446 §4.2.8) -- the X25519 key pair also exists for
+                                        // the hybrid share, so `exchange` alone accepted an
+                                        // unoffered X25519 (review F4, 2026-10-26).
+                                        if (hrr_group == null and mem.findScalar(tls.NamedGroup, share_groups, named_group) == null)
+                                            return error.TlsIllegalParameter;
                                         try key_share.exchange(named_group, extd.slice(key_size));
                                         sh_group = named_group;
                                     },
@@ -1718,15 +1736,20 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                                         defer crypto.secureZero(u8, &res);
                                         cache.acquire();
                                         defer cache.release();
-                                        const reuse = if (psk_accepted and offer.?.entry.generation == offer.?.generation) offer.?.entry else null;
-                                        if (reuse orelse cache.reserve(host)) |e| {
+                                        const reuse = psk_accepted and offer.?.entry.generation == offer.?.generation;
+                                        // zig-libs tlsclient: a new generation on reuse too: this
+                                        // connection's secret replaces the entry's, so tickets an
+                                        // older connection on the same entry receives later would
+                                        // be derived from the wrong secret (review F3, 2026-10-26).
+                                        if (cache.reserve(host)) |e| {
                                             e.hash = hashKind(P.Hash.digest_length);
                                             @memcpy(e.resumption_secret[0..res.len], &res);
-                                            if (reuse == null) {
+                                            if (!reuse) {
                                                 // A full handshake: the old ticket (another secret) is gone.
                                                 e.usable = false;
                                                 e.ticket_len = 0;
                                                 e.leaf_not_after_s = leaf_not_after;
+                                                e.verification = verificationOf(options.ca);
                                                 if (!psk_accepted) _ = e.setChain(saved_chain[0..saved_chain_len]);
                                             }
                                             session_entry = e;
@@ -1966,6 +1989,38 @@ fn copyKeptChain(ci: *ConnectionInfo, cache: *SessionCache, entry: *ClientSessio
         ci.peer_certificates_buf[ci.peer_certificates_len] = try ci.keep(der);
         ci.peer_certificates_len += 1;
     }
+}
+
+/// Whether `e`, made under its own verification, may be resumed by a
+/// connection verifying with `ca` (review F2, 2026-10-26).
+fn resumableUnder(e: *const ClientSession, ca: @FieldType(Options, "ca")) bool {
+    return ca == .no_verification or e.verification == verificationOf(ca);
+}
+
+test "resumableUnder: a session made without verification is not resumed under a bundle (Go's rule)" {
+    var lock: std.Io.RwLock = .init;
+    var bundle: Certificate.Bundle = .empty;
+    const with_bundle: @FieldType(Options, "ca") = .{ .bundle = .{ .gpa = std.testing.allocator, .io = std.testing.io, .lock = &lock, .bundle = &bundle } };
+    var e: ClientSession = .{};
+    e.verification = .no_verification;
+    try std.testing.expect(!resumableUnder(&e, with_bundle));
+    try std.testing.expect(!resumableUnder(&e, .self_signed));
+    try std.testing.expect(resumableUnder(&e, .no_verification));
+    e.verification = .self_signed;
+    try std.testing.expect(!resumableUnder(&e, with_bundle));
+    try std.testing.expect(resumableUnder(&e, .self_signed));
+    e.verification = .bundle;
+    try std.testing.expect(resumableUnder(&e, with_bundle));
+    try std.testing.expect(!resumableUnder(&e, .self_signed));
+    try std.testing.expect(resumableUnder(&e, .no_verification));
+}
+
+fn verificationOf(ca: @FieldType(Options, "ca")) session.Verification {
+    return switch (ca) {
+        .no_verification => .no_verification,
+        .self_signed => .self_signed,
+        .bundle => .bundle,
+    };
 }
 
 /// A NewSessionTicket (RFC 8446 §4.6.1) into the cache entry this
@@ -3197,6 +3252,14 @@ const CertificatePublicKey = struct {
         try sigd.ensure(sig_len);
         const encoded_sig = sigd.slice(sig_len);
 
+        // zig-libs tlsclient: Go's policy (and RFC 8446 §4.2.3 for 1.3): no
+        // PKCS#1 v1.5 or SHA-1 handshake signature in TLS 1.3, no SHA-1 in
+        // TLS 1.2 (Go 1.25+, RFC 9155). std accepted both (review F1).
+        switch (scheme) {
+            .rsa_pkcs1_sha1, .ecdsa_sha1 => return error.TlsBadSignatureScheme,
+            .rsa_pkcs1_sha256, .rsa_pkcs1_sha384, .rsa_pkcs1_sha512 => if (version == .tls_1_3) return error.TlsBadSignatureScheme,
+            else => {},
+        }
         if (cert_pub_key.algo != @as(Certificate.AlgorithmCategory, switch (scheme) {
             .ecdsa_secp256r1_sha256,
             .ecdsa_secp384r1_sha384,
@@ -3594,10 +3657,94 @@ test "server signature: a genuine P-256 / P-384 / RSA-PSS / PKCS#1 signature ver
         try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pss_rsae_sha256, pss[0..127], &parts));
         var v15_buf: [128]u8 = undefined;
         const v15 = try rsa.signPkcs1v15(&kp.secret_key, Sha256, content, &v15_buf);
-        try testServerSignature(&key, .rsa_pkcs1_sha256, v15, &parts);
+        // PKCS#1 v1.5 is TLS 1.2's only (RFC 8446 §4.2.3; review F1, 2026-10-26).
+        try testServerSignatureIn(.tls_1_2, &key, .rsa_pkcs1_sha256, v15, &parts);
+        try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignatureIn(.tls_1_3, &key, .rsa_pkcs1_sha256, v15, &parts));
+        // SHA-1 in neither (Go 1.25+, RFC 9155), even a genuine signature.
+        var sha1_buf: [128]u8 = undefined;
+        const v15_sha1 = try rsa.signPkcs1v15(&kp.secret_key, crypto.hash.Sha1, content, &sha1_buf);
+        inline for (.{ tls.ProtocolVersion.tls_1_2, tls.ProtocolVersion.tls_1_3 }) |v|
+            try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignatureIn(v, &key, .rsa_pkcs1_sha1, v15_sha1, &parts));
         v15[5] ^= 0x01;
-        try std.testing.expectError(error.InvalidSignature, testServerSignature(&key, .rsa_pkcs1_sha256, v15, &parts));
+        try std.testing.expectError(error.InvalidSignature, testServerSignatureIn(.tls_1_2, &key, .rsa_pkcs1_sha256, v15, &parts));
     }
+}
+
+test "server signature: a scheme of another key category than the key is TlsBadSignatureScheme (audit 2026-10-26, mutant 63)" {
+    // An ECDSA P-256 key offered an RSA-PSS or an Ed25519 signature must be
+    // refused up front, not handed to a verifier of the wrong kind.
+    const kp = try crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.generateDeterministic(@as([32]u8, @splat(0x31)));
+    var key: CertificatePublicKey = undefined;
+    try key.init(.X9_62_id_ecPublicKey, &kp.public_key.toUncompressedSec1());
+    const sig = @as([64]u8, @splat(0x11));
+    const parts = [_][]const u8{"content"};
+    try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignature(&key, .rsa_pss_rsae_sha256, &sig, &parts));
+    try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignatureIn(.tls_1_2, &key, .rsa_pkcs1_sha256, &sig, &parts));
+    try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignature(&key, .ed25519, &sig, &parts));
+}
+
+test "ConnectionInfo.keep: an exact fit is accepted, one byte more is not (audit 2026-10-26, mutant 47)" {
+    var storage: [4]u8 = undefined;
+    var ci: ConnectionInfo = .init(&storage);
+    try std.testing.expectEqualStrings("ab", try ci.keep("ab"));
+    try std.testing.expectEqualStrings("cd", try ci.keep("cd")); // fills the storage exactly
+    try std.testing.expectError(error.ConnectionInfoTooSmall, ci.keep("e"));
+    ci.reset();
+    try std.testing.expectEqualStrings("abcd", try ci.keep("abcd"));
+}
+
+test "ClientAuth.PrivateKey.fits: Ed25519 signs in TLS 1.3 only (audit 2026-10-26, mutant 39)" {
+    const key: ClientAuth.PrivateKey = .{ .ed25519 = @as([32]u8, @splat(7)) };
+    try std.testing.expect(key.fits(.ed25519, .tls_1_3));
+    try std.testing.expect(!key.fits(.ed25519, .tls_1_2));
+}
+
+test "CertRequest.choose: a credential with no certificate answers with an empty Certificate (audit 2026-10-26, mutant 37)" {
+    const key: ClientAuth.PrivateKey = .{ .ed25519 = @as([32]u8, @splat(7)) };
+    var options: Options = undefined;
+    options.client_auth_select = null;
+    options.client_auth = .{ .certificate_chain = &.{}, .key = &key };
+    var req: CertRequest = .{};
+    req.schemes[0] = .ed25519;
+    req.schemes_len = 1;
+    req.choose(&options, .tls_1_3, &.{});
+    try std.testing.expect(!req.scheme_ok);
+    // The same key with a certificate does fit.
+    const chain = [_][]const u8{"\x30\x00"};
+    options.client_auth = .{ .certificate_chain = &chain, .key = &key };
+    var req2: CertRequest = .{};
+    req2.schemes[0] = .ed25519;
+    req2.schemes_len = 1;
+    req2.choose(&options, .tls_1_3, &.{});
+    try std.testing.expect(req2.scheme_ok);
+}
+
+test "storeTicket: a NewSessionTicket for an entry another connection has taken is ignored (audit 2026-10-26, mutant 56)" {
+    var entries: [1]ClientSession = undefined;
+    var cache: SessionCache = .init(&entries, null);
+    const entry = cache.reserve("a.test:443").?;
+    var body_buf: [64]u8 = undefined;
+    const body = try tlsresume.ticket.NewSessionTicket.encode(.{
+        .ticket_lifetime = 100,
+        .ticket_age_add = 7,
+        .ticket_nonce = "",
+        .ticket = "tkt",
+    }, &body_buf);
+    var c: Client = undefined;
+    c.session_cache = &cache;
+    c.session_entry = entry;
+    c.handshake_time_ms = 5_000;
+    // Another connection reserved the key since: our generation is stale.
+    c.session_generation = entry.generation - 1;
+    storeTicket(&c, body);
+    try std.testing.expect(!entry.usable);
+    try std.testing.expectEqual(@as(u16, 0), entry.ticket_len);
+    // Our own generation: stored.
+    c.session_generation = entry.generation;
+    storeTicket(&c, body);
+    try std.testing.expect(entry.usable);
+    try std.testing.expectEqualStrings("tkt", entry.ticket());
+    try std.testing.expectEqual(@as(i64, 5_000), entry.received_ms);
 }
 
 test "client Certificate echoes the request context (RFC 8446 §4.4.2)" {

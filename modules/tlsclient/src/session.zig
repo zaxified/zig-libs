@@ -32,6 +32,9 @@ pub const max_key_len = 255;
 
 pub const HashKind = enum { sha256, sha384, sha512 };
 
+/// The tag of `Client.Options.ca`.
+pub const Verification = enum { no_verification, self_signed, bundle };
+
 pub const ClientSession = struct {
     key_buf: [max_key_len]u8 = undefined,
     key_len: u8 = 0,
@@ -49,6 +52,9 @@ pub const ClientSession = struct {
     ticket_lifetime_s: u32 = 0,
     /// When the ticket arrived (milliseconds of the wall clock).
     received_ms: i64 = 0,
+    /// How the full handshake verified the server (`Options.ca`'s tag); a
+    /// session is offered only under the same, or under `.no_verification`.
+    verification: Verification = .no_verification,
     /// The leaf's notAfter (seconds); a session past it is not resumed.
     leaf_not_after_s: i64 = std.math.maxInt(i64),
     chain_buf: [max_chain_bytes]u8 = undefined,
@@ -210,4 +216,27 @@ test "ClientSession: fresh within the lifetime and before the leaf expires; chai
     const big = @as([max_chain_bytes + 1]u8, @splat(0));
     try testing.expect(!s.setChain(&.{&big}));
     try testing.expectEqual(@as(u8, 0), s.chain_count);
+}
+
+test "ClientSession: an entry without a ticket is never fresh, however young (audit 2026-10-26, mutant 12)" {
+    // `usable` is false until a NewSessionTicket arrives; a reserved entry
+    // holding only a key must not be offered, even when the lifetime and
+    // the leaf expiry would allow it.
+    var s: ClientSession = .{ .usable = false, .ticket_lifetime_s = 10, .received_ms = 1_000_000 };
+    try testing.expect(!s.fresh(1_000_000));
+    s.usable = true;
+    try testing.expect(s.fresh(1_000_000));
+}
+
+test "ClientSession.setChain: exactly max_chain_bytes fits, one more does not (audit 2026-10-26, mutant 13)" {
+    var s: ClientSession = .{};
+    const exact = @as([max_chain_bytes]u8, @splat(0x42));
+    try testing.expect(s.setChain(&.{&exact}));
+    try testing.expectEqual(@as(u8, 1), s.chain_count);
+    var out: [max_chain_len][]const u8 = undefined;
+    const ch = s.chain(&out);
+    try testing.expectEqual(@as(usize, max_chain_bytes), ch[0].len);
+    // The budget is shared across certificates: 1 + (max - 1) fits.
+    try testing.expect(s.setChain(&.{ exact[0..1], exact[0 .. max_chain_bytes - 1] }));
+    try testing.expect(!s.setChain(&.{ exact[0..2], exact[0 .. max_chain_bytes - 1] }));
 }
