@@ -31,6 +31,21 @@
 //! move with the clock), else by wall time. Before timing anything OpenSSL's
 //! digest and HMAC of every workload must equal ours byte for byte. Arguments
 //! filter workloads by substring (no card line then).
+//!
+//! The card's numbers come from a JCC-mitigated build (the Kaby Lake erratum,
+//! `modules/sort/tools/README.md`), two-stage because Zig has no `-mllvm`
+//! passthrough. sha2's module assembly leaves AT&T syntax in force (see
+//! `src/root.zig`), so Intel is restated after its end marker:
+//!
+//!     OPT=$(ls .zig-cache/o/*/options.zig | head -1)
+//!     zig build-exe -OReleaseFast -fllvm --dep sha2 --dep testkit -Mroot=modules/sha2/tools/bench.zig \
+//!       -OReleaseFast -Msha2=modules/sha2/src/root.zig \
+//!       -OReleaseFast --dep zl_options -Mtestkit=modules/testkit/src/root.zig -Mzl_options=$OPT \
+//!       --cache-dir .zig-cache -fno-emit-bin -femit-asm=.zig-cache/jcc/bench-sha2.s --name bench-sha2-jcc
+//!     sed -i '/# end of zl_sha2 assembly/a .intel_syntax noprefix' .zig-cache/jcc/bench-sha2.s
+//!     zig build-exe -OReleaseFast -cflags -mbranches-within-32B-boundaries -- .zig-cache/jcc/bench-sha2.s \
+//!       --cache-dir .zig-cache -femit-bin=.zig-cache/jcc/bench-sha2-jcc
+//!     BENCH_ROUNDS=5 .zig-cache/jcc/bench-sha2-jcc
 
 const std = @import("std");
 const bench = @import("testkit").bench;

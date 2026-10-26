@@ -1,24 +1,27 @@
 # sha2
 
 **SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224 and SHA-512/256 (FIPS
-180-4)**, plus std's truncations `Sha256T192`/`Sha512T224`/`Sha512T256`, a drop-in for
-`std.crypto.hash.sha2` that is faster wherever a message is hashed in runs of
-two or more blocks (from 128 bytes for SHA-256, 256 for SHA-384/512): 1.24–1.40×
-std from 1 KiB up on an AVX2 CPU without SHA-NI (below). The types have std's
-declarations — `block_length`, `digest_length`, `Options`, `init`, `update`,
-`peek`, `final`, `finalResult`, `hash` — so a consumer changes the type and
-nothing else, including under std's generic `Hmac` and `Hkdf`.
+180-4)**, plus std's truncations `Sha256T192`/`Sha512T224`/`Sha512T256`, a
+drop-in for `std.crypto.hash.sha2`. On x86-64 it runs CRYPTOGAMS' SHA-NI or
+AVX2 block functions, the ones OpenSSL ships, chosen at run time. On an AVX2
+CPU without SHA-NI that gives 0.40–0.99× OpenSSL on every size, and 1.4–1.6× std. The
+types have std's declarations — `block_length`, `digest_length`, `Options`,
+`init`, `update`, `peek`, `final`, `finalResult`, `hash` — so a consumer
+changes the type and nothing else, including under std's generic `Hmac` and
+`Hkdf`.
 
 - **Status:** gap — std's SHA-2 computes the message schedule with scalar code
   (on x86-64 without SHA-NI), which on the development notebook put it at
   1.48× behind OpenSSL for both SHA-256 and SHA-384; qap's TLS handshake lane
   spent 15.9 % of its CPU in SHA-2 rounds.
-- **Model after:** FIPS 180-4; the vectorized message schedule of Intel's
-  "Fast SHA-256 Implementations on Intel Architecture Processors" (Guilford et
-  al., 2012) and Gulley et al.'s SHA-512 counterpart, applied across blocks.
-- **Platform:** any (the SIMD schedule on x86-64 with AVX2, a portable scalar
-  path everywhere else). **Role:** util. **Concurrency:** reentrant.
-  **Allocation:** none.
+- **Model after:** FIPS 180-4; CRYPTOGAMS `sha512-x86_64.pl` (Andy Polyakov,
+  the AVX2 code path, used as is: see [`NOTICE`](NOTICE)); for the pure-Zig
+  engine, the vectorized message schedule of Intel's "Fast SHA-256
+  Implementations on Intel Architecture Processors" (Guilford et al., 2012)
+  and Gulley et al.'s SHA-512 counterpart, applied across blocks.
+- **Platform:** any (CRYPTOGAMS SHA-NI/AVX2 on x86-64 ELF, chosen at run time; the
+  Zig SIMD schedule on other AVX2 targets; a portable scalar path everywhere
+  else). **Role:** util. **Concurrency:** reentrant. **Allocation:** none.
 
 ```zig
 const sha2 = @import("sha2");
@@ -35,61 +38,51 @@ const d384 = h.finalResult();
 const HmacSha256 = std.crypto.auth.hmac.Hmac(sha2.Sha256);
 const HkdfSha384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.Hmac(sha2.Sha384));
 
-_ = sha2.Sha256.backend();                      // .simd / .scalar / .stdlib
+_ = sha2.Sha256.backend();                      // .stdlib / .cryptogams_shani / .cryptogams_avx2 / .simd / .scalar
 ```
 
-**Which path runs is fixed at compile time** by the target: `.simd` on x86-64
-with AVX2 (built with LLVM), `.stdlib` for SHA-224/256 where std itself uses
-SHA hardware instructions (x86-64 SHA-NI, ARMv8 `sha2`) — there std is the
-faster one and this module hands it the blocks — and `.scalar` anywhere else.
-A build for baseline x86-64 therefore takes the scalar path even on an AVX2
-CPU; build with `-mcpu=native` (the default for a native build) or name the
-CPU model to get the SIMD schedule.
-
-**Where the gain is, and where it is not.** The speed-up comes from computing
-the message schedules of up to 8 SHA-256 blocks (4 SHA-512 blocks) together,
-so it applies to `update` calls that carry two or more whole blocks. A lone
-block is a short message, the padding block of `final`, or one of HMAC's
-key-pad blocks. For SHA-224/256 it gets a one-block vector schedule, about
-5 % faster than std (775 vs 819 cycles per block in a dependent chain). For
-SHA-384/512 it runs std's scalar form at std's speed.
+**Which path runs.** `.stdlib` for SHA-224/256 where the build target has
+SHA hardware instructions (x86-64 SHA-NI, ARMv8 `sha2`). There std is the
+faster one, and this module hands it the blocks. Otherwise, on x86-64 ELF
+built with LLVM, the CPU decides (CPUID, checked once): `.cryptogams_shani`
+for SHA-224/256 when it has SHA-NI, `.cryptogams_avx2` when it has AVX2,
+BMI1 and BMI2. A build for baseline x86-64 therefore gets the fast paths
+too. The SHA-NI path is verified under QEMU emulation; its speed has not
+been measured here, because this machine has no SHA-NI. `.simd`, the pure-Zig multi-block schedule, runs on other x86-64
+targets built for an AVX2 model, and `.scalar` runs anywhere else.
 
 ## Speed
 
-Against OpenSSL 3.5.5 (`zig build bench-sha2`, by cycles, 2026-10-25):
-0.50–0.88× OpenSSL's EVP calls for messages up to 256 bytes. HMAC over a
-256-byte message is 0.67–0.69× OpenSSL's `HMAC()`. Bulk from 16 KiB up is
-1.11–1.15×, because OpenSSL's hand-written rounds retire the same
-instructions at a higher rate (SPEC.md § Speed). Against std:
+Against OpenSSL 3.5.5 (`zig build bench-sha2`, by cycles, 2026-10-26,
+i7-7920HQ Kaby Lake): SHA-256 0.49 / 0.68 / 0.88 / 0.97 / 0.99× at
+64 B / 256 B / 1 KiB / 16 KiB / 1 MiB; SHA-384/512 0.40–0.99×; HMAC over a
+256-byte message 0.52–0.54× OpenSSL's `HMAC()`. Bulk converges on 1.0
+because the block function is OpenSSL's own. The short-message lead is
+EVP's per-call overhead. Against std on the same machine, MB/s, best of 5,
+`src/bench.zig`:
 
-MB/s, best of 5, ReleaseFast, one-shot `hash`, on the development notebook
-(2026-09-29, i7-7920HQ Kaby Lake: AVX2, BMI2, no SHA-NI; a loaded machine,
-so read the ratios). `scalar` is this module's fallback forced on the same
-CPU. Re-measure with `src/bench.zig` (its header has the command).
+| hash | bytes | std | sha2 | × std |
+|---|---:|---:|---:|---:|
+| SHA-256 | 64 | 132 | 190 | 1.44 |
+| SHA-256 | 1 KiB | 257 | 413 | 1.61 |
+| SHA-256 | 16 KiB | 273 | 445 | 1.63 |
+| SHA-256 | 1 MiB | 272 | 443 | 1.63 |
+| SHA-384 | 64 | 203 | 262 | 1.29 |
+| SHA-384 | 1 KiB | 389 | 564 | 1.45 |
+| SHA-384 | 16 KiB | 434 | 671 | 1.54 |
+| SHA-384 | 1 MiB | 438 | 659 | 1.50 |
 
-| hash | bytes | std | sha2 | × std | scalar |
-|---|---:|---:|---:|---:|---:|
-| SHA-256 | 64 | 134 | 136 | 1.01 | 138 |
-| SHA-256 | 1 KiB | 270 | 369 | 1.37 | 270 |
-| SHA-256 | 16 KiB | 290 | 405 | 1.40 | 290 |
-| SHA-256 | 1 MiB | 294 | 403 | 1.37 | 299 |
-| SHA-384 | 64 | 205 | 215 | 1.05 | 217 |
-| SHA-384 | 1 KiB | 403 | 502 | 1.24 | 402 |
-| SHA-384 | 16 KiB | 456 | 589 | 1.29 | 459 |
-| SHA-384 | 1 MiB | 450 | 597 | 1.33 | 470 |
+SPEC.md § Speed has the per-block cycle counts and why our own Zig rounds
+did not reach this.
 
-A second run the same day gave 1.03 / 1.39 / 1.37 / 1.41 (SHA-256) and
-1.13 / 1.30 / 1.26 / 1.35 (SHA-384) — run-to-run noise is about ±5 %. SHA-384
-at exactly 1 KiB is 8 message blocks plus a lone padding block, which caps it
-near 1.25–1.3×. For scale, OpenSSL on the same machine: SHA-256 418 MB/s,
-SHA-384 640 MB/s.
-
-Provenance: original work of the zig-libs authors (MIT), clean-room from FIPS
-180-4 and the published algorithm descriptions named above; the round and IV
-constants are derived in the source from their definitions (cube and square
-roots of primes) and checked against the standard's tables. No third-party
-source was ported or translated, so no `NOTICE` entry is required (root
-[`NOTICE`](../../NOTICE) §0). DATA: `tools/count.tsv` holds instruction counts
+Provenance: `src/asm/*.s` is third-party code. It is CRYPTOGAMS' SHA-NI and
+AVX2 SHA-2 assembly (Andy Polyakov), under its BSD-style licence, with the conditions
+and every change listed in [`NOTICE`](NOTICE), and it is regenerated by
+`tools/gen_cryptogams.sh` from a pinned commit. Everything else is original
+work of the zig-libs authors (MIT), clean-room from FIPS 180-4 and the
+published algorithm descriptions named above. The round and IV constants of
+the Zig engine are derived in the source from their definitions (cube and
+square roots of primes) and checked against the standard's tables. DATA: `tools/count.tsv` holds instruction counts
 per operation measured on this machine by our own tooling
 (`scripts/count-insns`, valgrind as the counter) — generated data, no
 third-party corpus.

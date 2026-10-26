@@ -1,0 +1,76 @@
+sha2 — third-party attribution
+
+This file carries a CONDITION. `src/asm/sha256-cryptogams.s` and
+`src/asm/sha512-cryptogams.s` are generated from CRYPTOGAMS
+(https://github.com/dot-asm/cryptogams, `x86_64/sha512-x86_64.pl` at commit
+4acc4a308eab6049d1cf1c7ba61b353a36ce0e2d), written by Andy Polyakov. The
+recipe that generates them is `tools/gen_cryptogams.sh`. CRYPTOGAMS'
+BSD-style licence requires that its copyright notice, conditions and
+disclaimer be retained in source and reproduced in binary distributions.
+They are reproduced in full below, and a binary distribution that includes
+this module reproduces this file.
+
+**Copyleft:** NONE-SHIPPED — CRYPTOGAMS offers the GPL only as an
+ALTERNATIVE to its BSD-style terms ("ALTERNATIVELY, ... may be distributed
+under the terms of the GNU General Public License"). This module takes the
+BSD-style terms. Nothing in it is distributed under the GPL.
+
+Everything else in the module (`src/root.zig`, the scalar, SIMD and dispatch
+code, the tests and tools) is original work of the zig-libs authors under the
+repository's MIT licence.
+
+CHANGES made to the CRYPTOGAMS output (2026-10-26), all by the recipe:
+  - only the AVX2 block functions, SHA-256's SHA-extension function and
+    the constant tables are kept. The run-time dispatcher (which reads
+    OpenSSL's `OPENSSL_ia32cap_P`), the SSSE3, AVX and XOP paths and SHA-512's
+    SHA512-extension path are dropped;
+  - the functions are renamed `zl_sha2_sha256_avx2`, `zl_sha2_sha256_shaext`
+    and `zl_sha2_sha512_avx2` and made `.weak` + `.hidden`, and every local
+    label gets the prefix
+    `.Lzl_sha256_` / `.Lzl_sha512_`, as do the tables;
+  - the `.note.gnu.property` section is dropped, and a `.align 64` is
+    restated before each table (upstream it precedes the table's `.type`
+    line);
+  - a four-line provenance header is added to each file.
+The instructions themselves are unchanged.
+
+====================================================================
+CRYPTOGAMS licence (LICENSE at the commit above, verbatim)
+====================================================================
+
+Copyright (c) 2006, CRYPTOGAMS by <appro@openssl.org>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+      *	Redistributions of source code must retain copyright notices,
+	this list of conditions and the following disclaimer.
+
+      *	Redistributions in binary form must reproduce the above
+	copyright notice, this list of conditions and the following
+	disclaimer in the documentation and/or other materials
+	provided with the distribution.
+
+      *	Neither the name of the CRYPTOGAMS nor the names of its
+	copyright holder and contributors may be used to endorse or
+	promote products derived from this software without specific
+	prior written permission.
+
+ALTERNATIVELY, provided that this notice is retained in full, this
+product may be distributed under the terms of the GNU General Public
+License (GPL), in which case the provisions of the GPL apply INSTEAD OF
+those given above.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

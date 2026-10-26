@@ -29,11 +29,16 @@
 //! ((a ^ b) & (b ^ c)) ^ b`, whose `b ^ c` is the previous round's `a ^ b`,
 //! and `Ch(e,f,g) = (e & f) ^ (~e & g)`, two independent halves.
 //!
-//! Dispatch is at compile time (`backend()`):
+//! Dispatch (`backend()`), first match wins:
 //!
 //! - `.stdlib` — SHA-256/224 on a target where std itself uses SHA hardware
 //!   instructions (x86-64 SHA-NI + AVX2, arm64 `sha2`): compression is handed
 //!   to std, which is faster than anything here on such a CPU.
+//! - `.cryptogams_shani` / `.cryptogams_avx2` — CRYPTOGAMS' block functions
+//!   (`src/asm/`, Andy Polyakov's perlasm, the code OpenSSL ships; licence in
+//!   NOTICE), on x86-64 ELF under LLVM, when CPUID reports SHA-NI + SSSE3
+//!   (SHA-256/224) or AVX2 + BMI1 + BMI2 at run time. Our own Zig rounds
+//!   measured 3.0 IPC against the AVX2 code's 3.5 (SPEC § Speed).
 //! - `.simd` — the multi-block schedule above, on x86-64 with AVX2 under the
 //!   LLVM backend. Runs of two or more whole blocks take it. A lone block
 //!   (and the padding block of `final`) takes `compressOne`, a four-word
@@ -48,13 +53,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .doc = "SHA-224/256/384/512 and SHA-512/224, /256 (FIPS 180-4) — drop-in for std.crypto.hash.sha2 (also under std's Hmac/Hkdf); an AVX2 multi-block message schedule makes runs of 2+ blocks 1.24–1.40× std on x86-64 without SHA-NI, std's own SHA-NI/ARMv8 path where the target has it.",
-    .platform_note = "any (AVX2 SIMD schedule on x86-64 + portable scalar fallback)",
+    .doc = "SHA-224/256/384/512 and SHA-512/224, /256 (FIPS 180-4) — drop-in for std.crypto.hash.sha2 (also under std's Hmac/Hkdf); on x86-64 without SHA-NI, CRYPTOGAMS' AVX2 assembly chosen at run time (0.40–0.99× OpenSSL, 1.4–1.6× std), std's own SHA-NI/ARMv8 path where the target has it.",
+    .platform_note = "any (CRYPTOGAMS AVX2 on x86-64 ELF, run-time CPUID; Zig AVX2 SIMD schedule elsewhere on x86-64; portable scalar fallback)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,
     .concurrency = .reentrant,
-    .model_after = "FIPS 180-4; Intel \"Fast SHA-256 Implementations on Intel Architecture Processors\" (2012) and Gulley et al. SHA-512 (vectorized message schedule)",
+    .model_after = "FIPS 180-4; CRYPTOGAMS sha512-x86_64.pl (AVX2 path, used as is); Intel \"Fast SHA-256 Implementations on Intel Architecture Processors\" (2012) and Gulley et al. SHA-512 (vectorized message schedule)",
     .deps = .{},
 };
 
@@ -74,11 +79,21 @@ pub const Sha256T192 = Sha2(u32, iv256, 192);
 pub const Sha512T224 = Sha2(u64, iv512, 224);
 pub const Sha512T256 = Sha2(u64, iv512, 256);
 
-/// How the compression function runs. Fixed at compile time per word size.
+/// How the compression function runs, per word size. Fixed at compile time,
+/// except the two `.cryptogams_*` paths, chosen at run time when the CPU has
+/// them.
 pub const Backend = enum {
     /// Handed to std's compression, because std has SHA hardware
     /// instructions for this target (SHA-256/224 only).
     stdlib,
+    /// CRYPTOGAMS' SHA-extension block function (`src/asm/`, Andy
+    /// Polyakov's perlasm; see NOTICE), SHA-256/224 only: x86-64 ELF under
+    /// LLVM, on a CPU with SHA-NI and SSSE3, detected at run time, so a
+    /// baseline-x86-64 build gets it too.
+    cryptogams_shani,
+    /// CRYPTOGAMS' AVX2 block functions: x86-64 ELF under LLVM, on a CPU
+    /// with AVX2, BMI1 and BMI2, detected at run time.
+    cryptogams_avx2,
     /// Multi-block SIMD message schedule + scalar rounds (x86-64 AVX2, LLVM).
     simd,
     /// Scalar rounds with the schedule computed inline. Any target.
@@ -192,7 +207,7 @@ fn Sha2(comptime Word: type, comptime iv: [8]Word, comptime digest_bits: comptim
 
         /// The backend this type's compression runs on (fixed per target).
         pub fn backend() Backend {
-            return E.default_backend;
+            return E.defaultBackend();
         }
     };
 }
@@ -210,9 +225,123 @@ pub const test_hooks = if (builtin.is_test) struct {
         return switch (b) {
             .stdlib, .scalar => true,
             .simd => Engine(Word).simd_compiled,
+            .cryptogams_shani => Word == u32 and cpuRuns(.shani),
+            .cryptogams_avx2 => cpuRuns(.avx2),
         };
     }
 } else struct {};
+
+// ── CRYPTOGAMS assembly, chosen at run time ─────────────────────────────────
+
+/// CRYPTOGAMS' block functions are assembled (by LLVM, from module-level
+/// assembly) for any x86-64 ELF target, whatever CPU model the build names;
+/// whether each runs is `cpuRuns()`. They follow the SysV ABI and use ELF
+/// directives, hence `ofmt == .elf` (which also rules out Windows). Not under
+/// the self-hosted backends: those are for the edit loop only.
+const cryptogams_compiled = builtin.zig_backend == .stage2_llvm and
+    builtin.cpu.arch == .x86_64 and builtin.target.ofmt == .elf and
+    @sizeOf(usize) == 8; // not the x32 ABI: the code does 64-bit pointer arithmetic
+
+comptime {
+    if (cryptogams_compiled) {
+        // perlasm writes AT&T syntax, which is what an object build parses
+        // module assembly as. `-femit-asm` prints Intel syntax and parses
+        // this text in that dialect, so the text names its own. It does not
+        // switch back at the end: in an object build that would hand Intel
+        // to any module-level assembly after it. A re-assembled `-femit-asm`
+        // file needs `.intel_syntax noprefix` inserted after the end marker
+        // instead (`tools/bench.zig`'s header has the recipe).
+        asm (".att_syntax prefix\n" ++ @embedFile("asm/sha256-cryptogams.s") ++
+                "\n" ++ @embedFile("asm/sha512-cryptogams.s") ++ "\n# end of zl_sha2 assembly\n");
+    }
+}
+
+/// `blocks` ≥ 1 whole blocks at `data` into `state` (CRYPTOGAMS'
+/// `sha{256,512}_block_data_order_{avx2,shaext}`, renamed; the state is the
+/// eight words, as in OpenSSL's context). Each runs at least one block.
+extern fn zl_sha2_sha256_avx2(state: *[8]u32, data: [*]const u8, blocks: usize) callconv(.c) void;
+extern fn zl_sha2_sha256_shaext(state: *[8]u32, data: [*]const u8, blocks: usize) callconv(.c) void;
+extern fn zl_sha2_sha512_avx2(state: *[8]u64, data: [*]const u8, blocks: usize) callconv(.c) void;
+
+/// Blocks per call into the assembly (see `compressBlocks`).
+const cryptogams_max_blocks = 1 << 20;
+
+/// What the CPU (and its OS) runs, for the two assembly paths.
+const CpuPaths = packed struct(u8) {
+    /// Set once detection ran (so 0 means "not yet").
+    known: bool = false,
+    /// `.cryptogams_avx2`: AVX, AVX2, BMI1 and BMI2 (`rorx`, `andn`), and
+    /// YMM state enabled by the OS (XCR0 bits 1 and 2).
+    avx2: bool = false,
+    /// `.cryptogams_shani`: the SHA extensions and SSSE3 (`palignr`,
+    /// `pshufb`; the SHA instructions themselves work on XMM registers).
+    shani: bool = false,
+    _: u5 = 0,
+};
+
+/// Detection is idempotent, so two threads racing to fill it store the same
+/// value.
+var cpu_paths: std.atomic.Value(u8) = .init(0);
+
+fn cpuRuns(comptime which: enum { avx2, shani }) bool {
+    if (!cryptogams_compiled) return false;
+    switch (which) {
+        .avx2 => if (comptime builtin.cpu.hasAll(.x86, &.{ .avx2, .bmi, .bmi2 })) return true,
+        .shani => if (comptime builtin.cpu.hasAll(.x86, &.{ .sha, .ssse3 })) return true,
+    }
+    var paths: CpuPaths = @bitCast(cpu_paths.load(.monotonic));
+    if (!paths.known) {
+        paths = detectCpuPaths();
+        cpu_paths.store(@bitCast(paths), .monotonic);
+    }
+    return switch (which) {
+        .avx2 => paths.avx2,
+        .shani => paths.shani,
+    };
+}
+
+fn cpuid(leaf: u32, sub: u32) [4]u32 {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [_] "={eax}" (eax),
+          [_] "={ebx}" (ebx),
+          [_] "={ecx}" (ecx),
+          [_] "={edx}" (edx),
+        : [_] "{eax}" (leaf),
+          [_] "{ecx}" (sub),
+    );
+    return .{ eax, ebx, ecx, edx };
+}
+
+fn detectCpuPaths() CpuPaths {
+    var out: CpuPaths = .{ .known = true };
+    if (builtin.cpu.arch != .x86_64) return out;
+    if (cpuid(0, 0)[0] < 7) return out;
+    const l1 = cpuid(1, 0);
+    const ssse3 = (l1[2] >> 9) & 1 == 1; // CPUID.01H:ECX.SSSE3[bit 9]
+    const osxsave = (l1[2] >> 27) & 1 == 1; // .OSXSAVE[bit 27]
+    const avx = (l1[2] >> 28) & 1 == 1; // .AVX[bit 28]
+    const ebx = cpuid(7, 0)[1];
+    const bmi1 = (ebx >> 3) & 1 == 1; // CPUID.(EAX=07H,ECX=0):EBX.BMI1[bit 3]
+    const avx2 = (ebx >> 5) & 1 == 1; // .AVX2[bit 5]
+    const bmi2 = (ebx >> 8) & 1 == 1; // .BMI2[bit 8]
+    const sha = (ebx >> 29) & 1 == 1; // .SHA[bit 29]
+    out.shani = sha and ssse3;
+    if (osxsave and avx and avx2 and bmi1 and bmi2) {
+        var xcr0_lo: u32 = undefined;
+        var xcr0_hi: u32 = undefined;
+        asm volatile ("xgetbv"
+            : [_] "={eax}" (xcr0_lo),
+              [_] "={edx}" (xcr0_hi),
+            : [_] "{ecx}" (@as(u32, 0)),
+        );
+        out.avx2 = xcr0_lo & 0b110 == 0b110; // XMM and YMM state
+    }
+    return out;
+}
 
 // ── constants (FIPS 180-4 §4.2.2, §4.2.3, §5.3), derived, not transcribed ───
 
@@ -335,7 +464,12 @@ fn Engine(comptime Word: type) type {
             else => false,
         };
 
-        const default_backend: Backend = if (std_has_hw) .stdlib else if (simd_compiled) .simd else .scalar;
+        fn defaultBackend() Backend {
+            if (std_has_hw) return .stdlib;
+            if (Word == u32 and cpuRuns(.shani)) return .cryptogams_shani;
+            if (cpuRuns(.avx2)) return .cryptogams_avx2;
+            return if (simd_compiled) .simd else .scalar;
+        }
 
         const StdHash = if (Word == u32) std.crypto.hash.sha2.Sha256 else std.crypto.hash.sha2.Sha512;
 
@@ -344,7 +478,7 @@ fn Engine(comptime Word: type) type {
             if (builtin.is_test) {
                 if (test_hooks.forced) |f| return f;
             }
-            return default_backend;
+            return defaultBackend();
         }
 
         /// Compress `data` (a whole number of blocks) into `s`.
@@ -360,6 +494,29 @@ fn Engine(comptime Word: type) type {
                     s.* = h.s;
                 },
                 .simd => if (simd_compiled) compressSimd(s, data) else unreachable,
+                .cryptogams_shani, .cryptogams_avx2 => |b| if (cryptogams_compiled) {
+                    // The assembly runs at least one block, whatever `n` says,
+                    // so `n == 0` never reaches it. SHA-256's tests "input
+                    // pointer == end pointer" in 32 bits (upstream: `$a4` is
+                    // `$T1`, `%r12d`), so a call whose remaining input is a
+                    // multiple of 4 GiB stops early with a wrong digest
+                    // (reproduced 2026-10-26: 2^26 + 1 blocks). Calls of at
+                    // most 2^20 blocks (64 MiB) never get there.
+                    var p = data;
+                    while (p.len != 0) {
+                        // `usize`, not the peer type: `@min` with a constant
+                        // narrows to `u21`, and `n * block_len` then wraps.
+                        const n: usize = @min(p.len / block_len, cryptogams_max_blocks);
+                        if (Word == u64) {
+                            zl_sha2_sha512_avx2(s, p.ptr, n);
+                        } else if (b == .cryptogams_shani) {
+                            zl_sha2_sha256_shaext(s, p.ptr, n);
+                        } else {
+                            zl_sha2_sha256_avx2(s, p.ptr, n);
+                        }
+                        p = p[n * block_len ..];
+                    }
+                } else unreachable,
                 .scalar => {
                     var p = data;
                     while (p.len != 0) : (p = p[block_len..]) compressScalar(s, p[0..block_len]);
@@ -615,24 +772,29 @@ fn unhex(comptime n: usize, hex: []const u8) [n]u8 {
 }
 
 /// Every backend this build can run, for the Word size of `H`.
-fn backendAvailableAnyWord(comptime b: Backend) bool {
+fn backendAvailableAnyWord(b: Backend) bool {
     return std.mem.findScalar(Backend, backendsFor(u32), b) != null or
         std.mem.findScalar(Backend, backendsFor(u64), b) != null;
 }
 
+/// Every backend this build can run on this CPU (`.cryptogams_*` is a run-time
+/// question, so the list is built at run time).
 fn backendsFor(comptime Word: type) []const Backend {
-    return comptime blk: {
-        var buf: [3]Backend = undefined;
+    const S = struct {
+        var buf: [@typeInfo(Backend).@"enum".field_names.len]Backend = undefined;
         var n: usize = 0;
-        for ([_]Backend{ .stdlib, .simd, .scalar }) |b| {
+        var done = false;
+    };
+    if (!S.done) {
+        for ([_]Backend{ .stdlib, .cryptogams_shani, .cryptogams_avx2, .simd, .scalar }) |b| {
             if (test_hooks.available(Word, b)) {
-                buf[n] = b;
-                n += 1;
+                S.buf[S.n] = b;
+                S.n += 1;
             }
         }
-        const out = buf;
-        break :blk out[0..n];
-    };
+        S.done = true;
+    }
+    return S.buf[0..S.n];
 }
 
 fn WordOf(comptime H: type) type {
@@ -763,20 +925,28 @@ test "std-compatible declarations" {
 }
 
 test "the default backend on this target" {
-    // On an x86-64 AVX2 build under LLVM without SHA-NI (the development
-    // machine), the fast path must be the one taken — a dispatch regression
-    // that silently fell back to scalar would otherwise pass every KAT.
-    const expect32: Backend = if (Engine(u32).std_has_hw) .stdlib else if (Engine(u32).simd_compiled) .simd else .scalar;
+    // On an x86-64 ELF build under LLVM, on a CPU with AVX2 + BMI1/2 and
+    // without SHA-NI (the development machine), the CRYPTOGAMS path must be
+    // the one taken: a dispatch regression that silently fell back would
+    // otherwise pass every KAT.
+    const cg = cpuRuns(.avx2);
+    const expect32: Backend = if (Engine(u32).std_has_hw) .stdlib else if (cpuRuns(.shani)) .cryptogams_shani else if (cg) .cryptogams_avx2 else if (Engine(u32).simd_compiled) .simd else .scalar;
     try testing.expectEqual(expect32, Sha256.backend());
     try testing.expectEqual(Sha256.backend(), Sha224.backend());
-    const expect64: Backend = if (Engine(u64).simd_compiled) .simd else .scalar;
+    const expect64: Backend = if (cg) .cryptogams_avx2 else if (Engine(u64).simd_compiled) .simd else .scalar;
     try testing.expectEqual(expect64, Sha512.backend());
     try testing.expectEqual(Sha512.backend(), Sha384.backend());
-    if (builtin.cpu.arch == .x86_64 and builtin.cpu.has(.x86, .avx2) and
-        !builtin.cpu.has(.x86, .sha) and builtin.zig_backend == .stage2_llvm)
-    {
-        try testing.expectEqual(Backend.simd, Sha256.backend());
-        try testing.expectEqual(Backend.simd, Sha384.backend());
+    // Re-derived from CPUID, not from the cache the dispatch reads.
+    if (cryptogams_compiled) {
+        const fresh = detectCpuPaths();
+        if (fresh.avx2) try testing.expectEqual(Backend.cryptogams_avx2, Sha384.backend());
+        if (!Engine(u32).std_has_hw) {
+            if (fresh.shani) {
+                try testing.expectEqual(Backend.cryptogams_shani, Sha256.backend());
+            } else if (fresh.avx2) {
+                try testing.expectEqual(Backend.cryptogams_avx2, Sha256.backend());
+            }
+        }
     }
 }
 
@@ -924,6 +1094,88 @@ test "every lane count of the SIMD batch, at every offset" {
     }
 }
 
+test "no read outside the input: whole-block runs against guard pages, every backend" {
+    // Whole blocks are compressed straight from the caller's slice, so a
+    // backend that loads past the last block (or before the first) faults
+    // here instead of agreeing with std on bytes it should not have read.
+    // CRYPTOGAMS' AVX2 code schedules two blocks per pass; for an odd count
+    // its second lane reads its own stack, never the input's neighbour.
+    defer test_hooks.forced = null;
+    const G = @import("testkit").guard.Guarded(20 * 128);
+    inline for (.{ Sha256, Sha512 }) |H| {
+        const S = StdOf(H);
+        for (backendsFor(WordOf(H))) |b| {
+            test_hooks.forced = b;
+            for (1..18) |nb| {
+                for ([_]bool{ true, false }) |at_tail| {
+                    const m = if (at_tail) G.tail(nb * H.block_length) else G.head(nb * H.block_length);
+                    for (m, 0..) |*x, i| x.* = @truncate(i *% 167 +% nb);
+                    var want: [H.digest_length]u8 = undefined;
+                    S.hash(m, &want, .{});
+                    var got: [H.digest_length]u8 = undefined;
+                    H.hash(m, &got, .{});
+                    testing.expectEqualSlices(u8, &want, &got) catch |e| {
+                        std.debug.print("backend {t}, digest {d}, blocks {d}, tail {}\n", .{ b, H.digest_length, nb, at_tail });
+                        return e;
+                    };
+                }
+            }
+        }
+    }
+}
+
+test "long runs: past 32768 blocks, and across the 2^20-block call limit" {
+    // Untouched anonymous pages read as zeros without resident memory.
+    defer test_hooks.forced = null;
+    const big = (cryptogams_max_blocks + 3) * 128;
+    const m = try std.posix.mmap(null, big, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(m);
+    inline for (.{ Sha256, Sha512 }) |H| {
+        for (backendsFor(WordOf(H))) |b| {
+            // The slow backends only for the short run: Debug std over
+            // 64+ MiB would dominate the suite.
+            const fast = b == .cryptogams_shani or b == .cryptogams_avx2 or b == .stdlib;
+            test_hooks.forced = b;
+            // 40 000 blocks: the block count times the block size no longer
+            // fits the 21-bit type a careless `@min` gives it.
+            const short = m[0 .. 40_000 * H.block_length];
+            var want: [H.digest_length]u8 = undefined;
+            StdOf(H).hash(short, &want, .{});
+            var got: [H.digest_length]u8 = undefined;
+            H.hash(short, &got, .{});
+            try testing.expectEqualSlices(u8, &want, &got);
+            if (!fast) continue;
+            // 2^20 + 3 blocks in one `update` (two calls into the assembly)
+            // against the same bytes fed in 1 MiB pieces.
+            const long = m[0 .. (cryptogams_max_blocks + 3) * H.block_length];
+            var one: [H.digest_length]u8 = undefined;
+            H.hash(long, &one, .{});
+            var d = H.init(.{});
+            var off: usize = 0;
+            while (off < long.len) : (off += 1 << 20) d.update(long[off..@min(long.len, off + (1 << 20))]);
+            try testing.expectEqualSlices(u8, &d.finalResult(), &one);
+        }
+    }
+}
+
+test "4 GiB + 64 bytes in one update (opt-in: SHA2_BIG=1, ReleaseFast)" {
+    // CRYPTOGAMS' SHA-256 compares its loop end in 32 bits; without the
+    // chunking in `compressBlocks` this digest was wrong (2026-10-26).
+    // Untouched anonymous pages read as zeros without resident memory.
+    if (std.testing.environ.getPosix("SHA2_BIG") == null) return error.SkipZigTest;
+    if (!cpuRuns(.avx2)) return error.SkipZigTest;
+    defer test_hooks.forced = null;
+    const len = ((1 << 26) + 1) * 64;
+    const m = try std.posix.mmap(null, len, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(m);
+    var want: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(m, &want, .{});
+    test_hooks.forced = .cryptogams_avx2;
+    var got: [32]u8 = undefined;
+    Sha256.hash(m, &got, .{});
+    try testing.expectEqualSlices(u8, &want, &got);
+}
+
 test "byte-at-a-time and peek" {
     defer test_hooks.forced = null;
     var msg: [300]u8 = undefined;
@@ -955,7 +1207,7 @@ test "comptime evaluation" {
 
 const fuzz_driver = @import("testkit").fuzz.driver;
 
-const AgreeMark = enum { stdlib, simd, scalar, boundary, multi_cut, peek_checked, oneshot_checked, empty };
+const AgreeMark = enum { stdlib, cryptogams_shani, cryptogams_avx2, simd, scalar, boundary, multi_cut, peek_checked, oneshot_checked, empty };
 var agree_counts: [@typeInfo(AgreeMark).@"enum".field_names.len]usize = @splat(0);
 fn markAgree(comptime l: AgreeMark) void {
     agree_counts[@backingInt(l)] += 1;
@@ -986,7 +1238,7 @@ test "fuzz harness: sha2-agree, 300 seeds, reaches every outcome" {
         // A backend label is reachable only where that backend is compiled
         // (`.simd` is x86-64 AVX2 only; the arm64 lane never has it).
         const absent = switch (m) {
-            inline .stdlib, .simd, .scalar => |b| comptime !(backendAvailableAnyWord(@field(Backend, @tagName(b)))),
+            inline .stdlib, .cryptogams_shani, .cryptogams_avx2, .simd, .scalar => |b| !backendAvailableAnyWord(@field(Backend, @tagName(b))),
             else => false,
         };
         if (absent) continue;
@@ -1051,6 +1303,8 @@ fn fuzzAgree(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
             test_hooks.forced = b;
             switch (b) {
                 .stdlib => markAgree(.stdlib),
+                .cryptogams_shani => markAgree(.cryptogams_shani),
+                .cryptogams_avx2 => markAgree(.cryptogams_avx2),
                 .simd => markAgree(.simd),
                 .scalar => markAgree(.scalar),
             }
