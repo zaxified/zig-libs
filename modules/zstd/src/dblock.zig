@@ -748,7 +748,9 @@ const decode_ahead = 8;
 /// Z34): level 19 0.94x the plain loop's cycles (webster 0.75, mr 0.79,
 /// dickens 0.87), level 3 unchanged; prefetching every block costs 18 % at
 /// level 3. The predefined table says nothing about the block's offsets
-/// (it lists codes to 28) and never selects it.
+/// (it lists codes to 28) and never selects it. Re-measured 2026-10-27 over the assembly
+/// sequence loop against "never" and shares 12--32: still the best
+/// (SPEC.md, 2026-10-27).
 const prefetch_offset_bits = 22;
 const prefetch_min_share = 7;
 

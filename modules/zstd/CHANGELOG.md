@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Docs:** two speed leads measured and dropped (the prefetching sequence loop's rule re-measured over the assembly loop; libzstd's cmov address select in the double-fast match finder): findings in SPEC.md. No code change.
 - **2026-10-26** — **Performance:** the assembly sequence loop copies literals and matches 32 bytes per round (libzstd's `ZSTD_wildcopy`), and its head is 64-byte aligned: branch mispredicts on xml now equal libzstd's, xml decoding −4 % cycles. Same bytes, same errors; no API change.
 
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** live oracle `tools/interop.zig` (`zig build interop-zstd`): libzstd 1.5.7 built from the pinned checkout, in-process behind `tools/c_oracle/zoracle.c`, compared with this module on generated inputs — one-shot and streaming compression (same bytes), valid and damaged frames through both decoders (same output or same error code), dictionary training. Seeds 1–5 agree; the only listed divergence is the documented error-code choice on damaged frames with a dictionary.

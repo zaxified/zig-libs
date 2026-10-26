@@ -1016,7 +1016,10 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
 
             hl1 = w.hash(ip1, h_bits_l, 8);
 
-            // idxl0 > 0 && idxl0 >= prefixLowestIndex
+            // idxl0 > 0 && idxl0 >= prefixLowestIndex. libzstd selects the
+            // address with a cmov (ZSTD_selectAddr) to keep the window test off
+            // the predictor; here that cost 1-7 % on 3 of 4 files (SPEC.md,
+            // 2026-10-27), so both checks stay branches.
             if (idxl0 >= prefix_lowest_index and w.read64(matchl0) == w.read64(ip)) {
                 m_length = w.count(ip + 8, matchl0 + 8, iend) + 8;
                 offset = @intCast(ip - matchl0);
