@@ -4700,6 +4700,25 @@ test "verify: HS384/HS512 round-trip, cross-length rejection" {
     try testing.expectError(error.BadSignature, verify(&parsed, .{ .hmac = secret }));
 }
 
+test "HMAC key floor: exactly the hash size per algorithm, on both sides (RFC 7518 §3.2)" {
+    // Pins the boundary itself: one byte short is refused by sign and verify,
+    // the hash size works -- per algorithm, so a single 32-byte floor or an
+    // off-by-one cannot pass (delta audit 2026-10-26).
+    const gpa = testing.allocator;
+    const key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    inline for (.{ .{ "hs256", 32 }, .{ "hs384", 48 }, .{ "hs512", 64 } }) |case| {
+        const n = case[1];
+        const short = @unionInit(SigningKey, case[0], key[0 .. n - 1]);
+        try testing.expectError(error.InvalidKey, encodeJson(gpa, "{}", short, .{}));
+        const token = try encodeJson(gpa, "{}", @unionInit(SigningKey, case[0], key[0..n]), .{});
+        defer gpa.free(token);
+        var parsed = try parse(gpa, token);
+        defer parsed.deinit();
+        try verify(&parsed, .{ .hmac = key[0..n] });
+        try testing.expectError(error.InvalidKey, verify(&parsed, .{ .hmac = key[0 .. n - 1] }));
+    }
+}
+
 test "verify: ES256/ES384 generated round-trip, tampering" {
     inline for (.{
         .{ EcdsaP256Sha256, "ES256", Alg.ES256 },

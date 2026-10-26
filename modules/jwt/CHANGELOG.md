@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — Delta audit of the HS* move to `sha2` and the verify-side key floor (A2 → A1, grade 1). 11 mutants, all killed (452/487, 35 eq overall). New test pins the floor at exactly the hash size for HS256/384/512 on both sides (a single 32-byte floor and an off-by-one survived before). The stack probe now also looks for the ipad/opad message schedule (`W`, `W + K`), which the CRYPTOGAMS assembly spills: it finds it when the burn is skipped or 512 B deep, and none with the shipped 4 KiB (2 KiB still passes). No API change.
+
 - **2026-10-26** — HS256/HS384/HS512 compute std's `Hmac` over the `sha2` module (new dependency) instead of `std.crypto.hash.sha2`. The bytes are the same (RFC 7515/7520 vectors, 81-row golang-jwt oracle). On an x86-64 CPU without SHA-NI it is faster: hs256_sign 1.32× → 1.05× jsonwebtoken, hs256_verify 1.23× → 1.07×. Card: fastest 1.21× (P1). No API change.
 
 - **2026-10-25** — **BREAKING (consumer-visible):** `verify` — so `parseAndVerify`, JWKS `oct` keys, `Provider`, `Guard`, `acceptIdToken*` — refuses an HMAC secret shorter than the hash output (32/48/64 bytes for HS256/384/512) with `InvalidKey`, as `encode` already did (RFC 7518 §3.2; owner decision on audit F3). Before, any non-empty secret verified. Test fixtures with short secrets were lengthened.

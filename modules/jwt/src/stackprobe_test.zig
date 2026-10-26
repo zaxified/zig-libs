@@ -427,6 +427,72 @@ fn hmacNeedles(comptime Hash: type, n: *Needles, secret: []const u8) void {
     var ho = Hash.init(.{});
     ho.update(&op);
     stateImages(n, "ostate", ho.s);
+    scheduleImages(Hash, n, "ipad schedule", &ip);
+    scheduleImages(Hash, n, "opad schedule", &op);
+}
+
+/// The message schedule of one secret-derived block, `W[t]` and `W[t] + K[t]`
+/// as native words. Since HS* runs over the `sha2` module (2026-10-26), its
+/// CRYPTOGAMS assembly spills `W + K` to the stack (the AVX2 paths, four
+/// SHA-256 or two SHA-512 consecutive words per 16 bytes); a scalar round
+/// loop may spill `W`. Neither image is the block or a state.
+fn scheduleImages(comptime Hash: type, n: *Needles, name: []const u8, block: *const [Hash.block_length]u8) void {
+    const Word = if (Hash.block_length == 64) u32 else u64;
+    const rounds = if (Word == u32) 64 else 80;
+    const s0: [3]u6 = if (Word == u32) .{ 7, 18, 3 } else .{ 1, 8, 7 };
+    const s1: [3]u6 = if (Word == u32) .{ 17, 19, 10 } else .{ 19, 61, 6 };
+    const bytes = @sizeOf(Word);
+    var w: [rounds]Word = undefined;
+    for (0..16) |t| w[t] = std.mem.readInt(Word, block[t * bytes ..][0..bytes], .big);
+    for (16..rounds) |t| {
+        const a = w[t - 15];
+        const b = w[t - 2];
+        const sig0 = std.math.rotr(Word, a, s0[0]) ^ std.math.rotr(Word, a, s0[1]) ^ (a >> @intCast(s0[2]));
+        const sig1 = std.math.rotr(Word, b, s1[0]) ^ std.math.rotr(Word, b, s1[1]) ^ (b >> @intCast(s1[2]));
+        w[t] = sig1 +% w[t - 7] +% sig0 +% w[t - 16];
+    }
+    n.addImage(name, std.mem.asBytes(&w));
+    var wk: [rounds]Word = undefined;
+    var p: u64 = 1;
+    for (&wk, w) |*x, wt| {
+        p = nextPrime(p);
+        x.* = wt +% roundConstant(Word, p);
+    }
+    n.addImage(name, std.mem.asBytes(&wk));
+}
+
+fn nextPrime(after: u64) u64 {
+    var c = after + 1;
+    while (true) : (c += 1) {
+        var d: u64 = 2;
+        while (d * d <= c and c % d != 0) d += 1;
+        if (d * d > c) return c;
+    }
+}
+
+/// FIPS 180-4 §4.2: the first `@bitSizeOf(Word)` bits of the fractional part
+/// of the cube root of the prime `p` = floor(cbrt(p << 3w)) mod 2^w.
+fn roundConstant(comptime Word: type, p: u64) Word {
+    const w = @bitSizeOf(Word);
+    const target = @as(u256, p) << (3 * w);
+    var lo: u256 = 0;
+    var hi: u256 = @as(u256, 1) << (w + 4);
+    while (hi - lo > 1) {
+        const mid = lo + (hi - lo) / 2;
+        if (mid * mid * mid <= target) lo = mid else hi = mid;
+    }
+    return @truncate(lo);
+}
+
+test "scheduleImages: the derived round constants match FIPS 180-4" {
+    // A wrong needle would blind the probe without failing it.
+    try std.testing.expectEqual(@as(u32, 0x428a2f98), roundConstant(u32, 2));
+    try std.testing.expectEqual(@as(u32, 0xc67178f2), roundConstant(u32, 311));
+    try std.testing.expectEqual(@as(u64, 0x428a2f98d728ae22), roundConstant(u64, 2));
+    try std.testing.expectEqual(@as(u64, 0x6c44198c4a475817), roundConstant(u64, 409));
+    var p: u64 = 1;
+    for (0..80) |_| p = nextPrime(p);
+    try std.testing.expectEqual(@as(u64, 409), p);
 }
 
 fn stateImages(n: *Needles, name: []const u8, s: anytype) void {

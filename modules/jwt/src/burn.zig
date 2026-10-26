@@ -35,7 +35,10 @@ pub inline fn run(comptime n: usize, comptime R: type, comptime f: anytype, args
 
 /// HS256/384/512 signing and verification: the keyed HMAC body (key ⊕ ipad /
 /// opad, the two hash states, the MAC) dirtied 2.4 KiB at most in ReleaseFast
-/// (2026-10-09; SHA-512 the deepest).
+/// (2026-10-09; SHA-512 the deepest). Over the `sha2` module's CRYPTOGAMS
+/// AVX2 assembly, which spills `W + K` of the ipad/opad blocks, the stack
+/// probe passes with a 2 KiB burn and fails with 512 B (delta audit
+/// 2026-10-26, HS512 sign and verify): 4 KiB keeps a 2x margin.
 pub const hmac_burn = 4 * 1024;
 
 /// ES256 / ES384 / Ed25519 signing: the body dirtied 9.6 KiB (ES256, through
