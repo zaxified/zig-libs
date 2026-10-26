@@ -53,3 +53,26 @@ python-websockets' bare `ServerProtocol` has no origin policy of its own to chec
 The other 9 rows are unaffected. Not re-run for this change (no python/go environment
 available); re-running would now report 9/10, with this row's comment in
 `verify_response_probe.zig` explaining why.
+
+## The live oracle: `interop.zig` + `go_oracle/` (2026-10-26)
+
+`zig build interop-websocket` (a program, not a test; `check-interop` compiles it) builds
+`go_oracle` — github.com/coder/websocket v1.8.15 and github.com/gorilla/websocket v1.5.3 through
+their public APIs, pinned by `go_oracle/go.mod`/`go.sum`, `GOPROXY=off` — and runs three families
+over loopback: this module's client against both Go servers, both Go clients against this
+module's server (`http.Server` + `respondUpgraded` + `Conn`, 16 KiB buffers), and fixed raw
+handshakes and frames sent to all three servers. Expectations are `agree`, `stricter` (the
+card's `**Ahead:**` rows) or `differs` (documented); anything else is a SURPRISE and exit 1.
+Verdicts: `.zig-cache/interop-websocket/verdicts.tsv`.
+
+`-- --capture` rewrites `src/testdata/interop/*.bin`: the bytes the Go libraries sent after the
+handshake in the scenarios without 1 MiB of plain payload, replayed hermetically by
+`src/interop_replay_test.zig`.
+
+## Fastest in the field: `go_bench/gorilla/`, `rust_fast_bench/` (2026-10-26)
+
+`zig build bench-websocket` also times gorilla/websocket v1.5.3 (`go_bench/gorilla`, same module
+cache) and denoland/fastwebsockets 0.10.0 + snapview/tungstenite 0.30.0 (`rust_fast_bench`,
+`cargo build --release --offline`, versions pinned with `=`, `Cargo.lock` committed; their
+dependency closure was read before the first build — build scripts, proc macros, the code paths
+run). `BENCH_FAST=0` skips these three sides.

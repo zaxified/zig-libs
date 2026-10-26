@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **`conn.Conn` reads a frame larger than its reader's buffer.** An uncompressed
+  text/binary/continuation payload that does not fit goes straight into `message_buf` (64 KiB
+  steps, unmasked and UTF-8-checked as it arrives); before, it was `FrameExceedsBuffer` (1009), so
+  behind `http.Server`'s 16 KiB default buffer every larger frame was refused. New public
+  `Connection.directPayload`, `Connection.receiveFrame`, `Connection.discardMessage` (additive).
+  **Behaviour changes:** `Conn.readMessage` now returns the same error again after a protocol
+  error (and after a transport error that cut a frame read straight in) — new field `Conn.sticky`;
+  such a frame over the buffer fails with its own error (`MessageTooLarge`, `InvalidFragmentation`,
+  `TooManyFragments`, …) instead of `FrameExceedsBuffer`; `writeRequest` refuses `extra_headers`
+  naming a field it writes itself (`InvalidRequestField`); a text continuation over
+  `max_fragments` is `TooManyFragments` however it was chopped (it could be `InvalidUtf8`).
+  Live oracle `zig build interop-websocket` (coder + gorilla, 136 rows), replayed captures in
+  `src/interop_replay_test.zig`; fastest-in-field bench sides (gorilla, fastwebsockets,
+  tungstenite).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC: std's `flate.Decompress.tossBitsShort` defect is fixed in 0.17.0 (workaround kept); memset note labelled as a 0.16 measurement.

@@ -5,7 +5,8 @@
 //! harness bodies and the driver tests live beside the corpora they share:
 //! `handshake.zig` (`response`, `response-mutated`, `request`, `request-mutated`),
 //! `frame.zig` (`frame`, `close`), `connection.zig` (`connection`) and
-//! `deflate.zig` (`extensions`, `inflate`, `deflate-connection`). A
+//! `deflate.zig` (`extensions`, `inflate`, `deflate-connection`), `conn.zig`
+//! (`conn-direct`). A
 //! `-mutated` twin takes one corpus seed and flips a few octets, because
 //! random octets never parse as an HTTP head.
 //!
@@ -40,6 +41,9 @@ pub const Label = enum {
     inflate_invalid,
     deflate_conn_message,
     deflate_conn_refused,
+    conn_direct_frame,
+    conn_stream_ended,
+    conn_stream_failed,
 };
 var reach: [@typeInfo(Label).@"enum".field_names.len]usize = @splat(0);
 

@@ -179,6 +179,8 @@ The other run (same day, spreads ≤ 20 %): ours/musl 0.41–1.05, worst again
 - ~~1 MiB 1.17–1.36× slower than musl and glibc~~ — DONE 2026-10-10: `rep stosq` past 192 KiB, now 0.90–1.02× both (§ Algorithm).
 - **Performance P2 → P1** *(bench 2026-10-10)*: glibc is 1.45–1.62× faster at 256 B (P1 needs `fastest ≤ 1.25`), and 4 KiB aligned is 1.05× musl (P1 needs ≤ 1.0). glibc's AVX2 variant stores 64 bytes per step; a second middle loop of two vectors per iteration for 128 B–4 KiB is the first thing to measure.
 
+- **`memcpy` export** *(2026-10-26, from `websocket`'s fastest-in-field bench)*: a libc-free executable copies with compiler_rt's `memcpy`; in `bench-websocket` read_binary_64k it is 58 % of the time (copying 256 KiB of frames) and the row is 1.19× fastwebsockets, whose binary copies with glibc's. A `memcpy` beside `memset` in `exportSymbols` — measured against glibc on 64 KiB–1 MiB copies first — is the candidate.
+
 ## Open
 
 - **TRIGGERED on Zig 0.17.0 (2026-10-18):** `lib/compiler_rt.zig` `memset` is now

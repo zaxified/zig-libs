@@ -341,15 +341,7 @@ pub const Connection = struct {
     /// decision the caller makes from the returned error/close-code, same as
     /// everywhere else in this module.
     pub fn receive(self: *Connection, buf: []u8) Error!Result {
-        errdefer {
-            self.fragment_opcode = null;
-            self.message_len = 0;
-            self.fragment_count = 0;
-            self.text_utf8 = .{};
-            self.partial_text = .{};
-            self.compressed_len = 0;
-            self.fragment_compressed = false;
-        }
+        errdefer self.discardMessage();
         const parse_opts: frame.ParseOptions = .{ .allow_rsv1 = self.compressed_buf != null };
         const parsed = switch (try frame.parseFrameWith(buf, self.role, self.max_frame_size, parse_opts)) {
             .need_more => {
@@ -358,6 +350,83 @@ pub const Connection = struct {
             },
             .frame => |f| f,
         };
+        return self.process(parsed);
+    }
+
+    /// Where a data frame's payload may be read straight to, instead of
+    /// behind its header in the caller's buffer: `conn.Conn` does this for
+    /// a frame its reader's buffer cannot hold whole (2026-10-26) -- one copy
+    /// from the transport into `message_buf`, no buffer shuffling, and no
+    /// buffer of `max_frame_size` needed. `h` comes from `frame.parseHeaderWith`
+    /// with this connection's role, `max_frame_size` and RSV1 option, so every
+    /// header check has been made.
+    ///
+    /// A frame the state machine refuses whatever its payload is fails here,
+    /// with the error and in the order `receive` would give once the whole
+    /// frame had arrived (review F3, 2026-10-26: before, such a frame over
+    /// the reader's buffer was `FrameExceedsBuffer`, close 1009, where a
+    /// buffered one is 1002): data after a close (`TooManyFramesAfterClose`
+    /// / `DataAfterClose`), a frame out of sequence (`InvalidFragmentation`),
+    /// one fragment too many (`TooManyFragments`), a payload that does not
+    /// fit the rest of `message_buf` (`MessageTooLarge`). Null for a frame
+    /// that takes another path: a control frame, a compressed frame or a
+    /// continuation of a compressed message (those collect in
+    /// `compressed_buf`).
+    ///
+    /// `utf8` is the validator state the payload continues (a fresh one for a
+    /// text frame, the message's own for a continuation of a text message;
+    /// null for binary): feeding it the payload as it arrives fails a bad
+    /// byte at the chunk it came in, as `checkPartialText` does for a buffered
+    /// frame. `receiveFrame` validates the whole payload again regardless.
+    pub fn directPayload(self: *const Connection, h: frame.Header) Error!?DirectPayload {
+        if (h.opcode.isControl()) return null;
+        if (self.close_received) {
+            if (self.frames_after_close + 1 > self.max_frames_after_close) return error.TooManyFramesAfterClose;
+            return error.DataAfterClose;
+        }
+        const at: usize, const utf8: ?IncrementalUtf8 = switch (h.opcode) {
+            .text, .binary => blk: {
+                if (self.fragment_opcode != null) return error.InvalidFragmentation;
+                if (h.rsv1) return null;
+                break :blk .{ 0, if (h.opcode == .text) IncrementalUtf8{} else null };
+            },
+            .continuation => blk: {
+                const start = self.fragment_opcode orelse return error.InvalidFragmentation;
+                if (self.fragment_count + 1 > self.max_fragments) return error.TooManyFragments;
+                if (self.fragment_compressed) return null;
+                break :blk .{ self.message_len, if (start == .text) self.text_utf8 else null };
+            },
+            else => unreachable,
+        };
+        if (h.payload_len > self.message_buf.len - at) return error.MessageTooLarge;
+        return .{ .dest = self.message_buf[at..][0..@intCast(h.payload_len)], .utf8 = utf8 };
+    }
+
+    pub const DirectPayload = struct { dest: []u8, utf8: ?IncrementalUtf8 };
+
+    /// `receive` for a frame whose header was checked by `parseHeaderWith`
+    /// and whose payload -- exactly `payload_len` bytes, unmasked -- the
+    /// caller read into `directPayload`'s `dest`. Every check `receive` makes
+    /// after parsing is made here; `Result.consumed` is `parsed.consumed`.
+    pub fn receiveFrame(self: *Connection, parsed: frame.Frame) Error!Result {
+        errdefer self.discardMessage();
+        return self.process(parsed);
+    }
+
+    /// W3-websocket-F7: an error discards the message in progress (see
+    /// `receive`). Public for a caller that fails a frame itself, between
+    /// `directPayload` and `receiveFrame` (`conn.Conn`, review F1).
+    pub fn discardMessage(self: *Connection) void {
+        self.fragment_opcode = null;
+        self.message_len = 0;
+        self.fragment_count = 0;
+        self.text_utf8 = .{};
+        self.partial_text = .{};
+        self.compressed_len = 0;
+        self.fragment_compressed = false;
+    }
+
+    fn process(self: *Connection, parsed: frame.Frame) Error!Result {
         self.partial_text = .{};
 
         // F9 remainder: bound frames of ANY kind (control included) once
@@ -408,6 +477,11 @@ pub const Connection = struct {
                     const payload = try self.inflateMessage(start_opcode);
                     return .{ .event = .{ .message = .{ .opcode = start_opcode, .payload = payload } }, .consumed = parsed.consumed };
                 }
+                // The size first, as for a one-frame message: a fragment
+                // that cannot fit is `MessageTooLarge` whatever its bytes
+                // and however it arrived (`checkPartialText` leaves it
+                // alone; 2026-10-26, found by `conn-direct`).
+                if (self.message_len + parsed.payload.len > self.message_buf.len) return error.MessageTooLarge;
                 // Fed BEFORE `appendFragment`, so an invalid byte anywhere in
                 // THIS fragment's payload fails this call -- the whole point
                 // of "fail-fast across fragments" -- rather than after the
@@ -473,6 +547,9 @@ pub const Connection = struct {
                 self.fragment_opcode = parsed.opcode;
                 self.fragment_count = 1;
                 self.message_len = 0;
+                // The size before the bytes, as everywhere (see the
+                // continuation branch).
+                if (parsed.payload.len > self.message_buf.len) return error.MessageTooLarge;
                 if (parsed.opcode == .text) {
                     self.text_utf8 = .{};
                     try self.text_utf8.feed(parsed.payload);
@@ -508,9 +585,18 @@ pub const Connection = struct {
         // Compressed bytes are not text; the message is checked once it is
         // decompressed.
         if (h.rsv1 or (h.opcode == .continuation and self.fragment_compressed)) return;
+        const room = switch (h.opcode) {
+            .continuation => self.message_buf.len -| self.message_len,
+            else => self.message_buf.len,
+        };
+        // A frame that cannot fit fails as `MessageTooLarge` once complete,
+        // whatever its bytes (2026-10-26, found by `conn-direct`).
+        if (h.payload_len > room) return;
         const start: IncrementalUtf8 = switch (h.opcode) {
             .text => if (self.fragment_opcode == null) .{} else return,
-            .continuation => if (self.fragment_opcode == .text) self.text_utf8 else return,
+            // One fragment too many fails as `TooManyFragments` once it is
+            // complete, whatever its bytes: the chop must not change that.
+            .continuation => if (self.fragment_opcode == .text and self.fragment_count + 1 <= self.max_fragments) self.text_utf8 else return,
             else => return,
         };
         // `parseFrame` said `.need_more` with the whole header present, so
@@ -567,7 +653,10 @@ pub const Connection = struct {
 
     fn appendFragment(self: *Connection, payload: []const u8) Error!void {
         if (self.message_len + payload.len > self.message_buf.len) return error.MessageTooLarge;
-        @memcpy(self.message_buf[self.message_len..][0..payload.len], payload);
+        const dest = self.message_buf[self.message_len..][0..payload.len];
+        // A payload read straight into place (`directPayload`) is not copied
+        // onto itself.
+        if (dest.ptr != payload.ptr) @memcpy(dest, payload);
         self.message_len += payload.len;
     }
 
@@ -579,6 +668,57 @@ pub const Connection = struct {
 };
 
 // ── tests ────────────────────────────────────────────────────────────────
+
+test "directPayload: refuses what receive would, in receive's order; null only for control and compressed frames" {
+    var buf: [64]u8 = undefined;
+    var c: Connection = .init(.server, &buf, 1 << 20);
+    const h = struct {
+        fn of(op: frame.Opcode, len: u64, rsv1: bool) frame.Header {
+            return .{ .fin = true, .opcode = op, .rsv1 = rsv1, .mask_key = .{ 1, 2, 3, 4 }, .len = 6, .payload_len = len };
+        }
+    }.of;
+    // A fresh text frame: slot at 0, a fresh validator; binary: none.
+    const t = (try c.directPayload(h(.text, 10, false))).?;
+    try testing.expectEqual(@intFromPtr(&buf), @intFromPtr(t.dest.ptr));
+    try testing.expectEqual(@as(usize, 10), t.dest.len);
+    try testing.expect(t.utf8 != null);
+    try testing.expect((try c.directPayload(h(.binary, 64, false))).?.utf8 == null);
+    try testing.expectError(error.MessageTooLarge, c.directPayload(h(.binary, 65, false)));
+    try testing.expectEqual(@as(?Connection.DirectPayload, null), try c.directPayload(h(.ping, 5, false)));
+    try testing.expectEqual(@as(?Connection.DirectPayload, null), try c.directPayload(h(.text, 5, true)));
+    try testing.expectError(error.InvalidFragmentation, c.directPayload(h(.continuation, 5, false)));
+    // A new message starts at 0 whatever a finished one left in message_len.
+    c.message_len = 20;
+    try testing.expectEqual(@intFromPtr(&buf), @intFromPtr((try c.directPayload(h(.binary, 64, false))).?.dest.ptr));
+    // Mid-message: the slot follows the message and the message's UTF-8
+    // state carries on; a new start is refused.
+    c.fragment_opcode = .text;
+    c.fragment_count = 1;
+    try c.text_utf8.feed("\xc5"); // half a code point pending
+    const k = (try c.directPayload(h(.continuation, 44, false))).?;
+    try testing.expectEqual(@intFromPtr(&buf) + 20, @intFromPtr(k.dest.ptr));
+    var carried = k.utf8.?;
+    try carried.feed("\xbe");
+    try carried.finish();
+    var fresh: IncrementalUtf8 = .{};
+    try testing.expectError(error.InvalidUtf8, fresh.feed("\xbe"));
+    try testing.expectError(error.MessageTooLarge, c.directPayload(h(.continuation, 45, false)));
+    try testing.expectError(error.InvalidFragmentation, c.directPayload(h(.binary, 5, false)));
+    c.fragment_count = c.max_fragments - 1;
+    try testing.expect((try c.directPayload(h(.continuation, 5, false))) != null);
+    c.fragment_count = c.max_fragments;
+    try testing.expectError(error.TooManyFragments, c.directPayload(h(.continuation, 5, false)));
+    c.fragment_count = 1;
+    c.fragment_compressed = true;
+    try testing.expectEqual(@as(?Connection.DirectPayload, null), try c.directPayload(h(.continuation, 5, false)));
+    // After a close: data is refused, past the frame budget as such.
+    c.close_received = true;
+    try testing.expectError(error.DataAfterClose, c.directPayload(h(.binary, 5, false)));
+    c.frames_after_close = c.max_frames_after_close - 1;
+    try testing.expectError(error.DataAfterClose, c.directPayload(h(.binary, 5, false)));
+    c.frames_after_close = c.max_frames_after_close;
+    try testing.expectError(error.TooManyFramesAfterClose, c.directPayload(h(.binary, 5, false)));
+}
 
 const testing = std.testing;
 

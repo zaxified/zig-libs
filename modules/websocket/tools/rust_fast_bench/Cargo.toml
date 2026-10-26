@@ -1,0 +1,22 @@
+[package]
+name = "ws_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" sides of `zig build bench-websocket`
+# (modules/websocket/tools/bench.zig): denoland/fastwebsockets (the usual
+# "fastest Rust WebSocket" claim, async) and snapview/tungstenite (sync, the
+# most used), both pinned exactly, both as a server over an in-memory stream.
+# No handshake/upgrade features: the frame layer only.
+[dependencies]
+fastwebsockets = { version = "=0.10.0", default-features = true }
+tungstenite = { version = "=0.30.0", default-features = false }
+tokio = { version = "=1.54.1", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

@@ -75,4 +75,6 @@ test {
     _ = deflate;
     _ = conn;
     _ = @import("proxy_e2e.zig");
+    _ = @import("interop_replay_test.zig");
+    _ = @import("audit_test.zig");
 }

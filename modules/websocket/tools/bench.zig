@@ -13,9 +13,15 @@
 //! Both sides are a server on an in-memory connection: reads come from a
 //! buffer holding the client's frames, writes go to a discarding writer
 //! (ours: `Connection.receive` over a copy of the wire -- the copy stands for
-//! the read from the socket that coder's bufio reader does; coder: `Accept`
-//! over a `net.Conn` whose reads cycle over the same bytes). No socket in
-//! either number.
+//! the read from the socket that coder's bufio reader does, and is how qap
+//! reads, an accumulator in front of `Connection`; coder: `Accept` over a
+//! `net.Conn` whose reads cycle over the same bytes). No socket in either
+//! number. Measured 2026-10-26 and NOT the card's number: `conn.Conn` over a
+//! `std.Io.Reader` with a 128 KiB buffer cycling over the wire takes
+//! read_binary_64k to 1.44x fastwebsockets (this harness: 1.19-1.25x) --
+//! the reader's greedy fills leave every other 64 KiB frame half in the
+//! buffer, copied a second time; fastwebsockets reserves payload + 14 bytes
+//! and reads exactly one frame (SPEC "Performance").
 //!   read_text_small       16 masked text messages of ~64 B (JSON)
 //!   read_text_fragmented  4 text messages of 4 KiB, 4 fragments each
 //!   read_binary_64k       4 binary messages of 64 KiB
@@ -35,6 +41,24 @@
 //! keeping its best. Ratios are ours/coder by wall time; the verdict is the
 //! WORST ratio. Arguments filter workloads. The program installs `fastmem`'s
 //! memset (see the comptime block below).
+//!
+//! The fastest in the field (since 2026-10-26), every serious candidate
+//! measured on the same wire bytes, same count, in the same rounds:
+//!   gorilla/websocket v1.5.3        (`tools/go_bench/gorilla`; the most used
+//!                                    Go library; permessage-deflate yes,
+//!                                    UTF-8 validation no)
+//!   denoland/fastwebsockets 0.10.0  (`tools/rust_fast_bench`; the usual
+//!                                    "fastest" claim; async, driven by a
+//!                                    no-op-waker poll; no permessage-deflate,
+//!                                    UTF-8 yes)
+//!   snapview/tungstenite 0.30.0     (same crate; sync, the most used Rust
+//!                                    one; no permessage-deflate, UTF-8 yes)
+//! A side that cannot do a workload (no permessage-deflate) prints n/a for it
+//! and is not in that row's `fastest`. `fastest` is the best of coder, gorilla
+//! and the Rust sides; `/fast` is ours / fastest. `BENCH_FAST=0` skips the
+//! three added sides. NOT measured: uWebSockets (C++; it would need a pinned
+//! checkout of uWebSockets + uSockets + a C++ driver feeding its
+//! WebSocketProtocol parser over an in-memory buffer -- no socket loop).
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -56,12 +80,29 @@ const Connection = websocket.connection.Connection;
 const bench_name = "bench-websocket";
 const work_dir = ".zig-cache/bench-websocket";
 const go_dir = "modules/websocket/tools/go_bench";
+const gorilla_dir = "modules/websocket/tools/go_bench/gorilla";
+const rs_manifest = "modules/websocket/tools/rust_fast_bench/Cargo.toml";
+const rs_exe = "modules/websocket/tools/rust_fast_bench/target/release/ws_fast_bench";
 const ref_short = "coder";
 const ref_card = "coder/websocket v1.8.15";
 
 const net_base: ?[]const u8 = null;
 const info_only = [_][]const u8{};
 const names = [_][]const u8{ "read_text_small", "read_text_fragmented", "read_binary_64k", "read_deflate", "write_text_small", "write_binary_64k", "write_deflate" };
+
+/// The sides added for "fastest in the field" (besides the reference).
+const Alt = struct {
+    label: []const u8,
+    /// First extra argument of the Rust program; null for the Go program.
+    rust_lib: ?[]const u8,
+    /// Can it do the permessage-deflate workloads?
+    deflate: bool,
+};
+const alts = [_]Alt{
+    .{ .label = "gorilla 1.5.3", .rust_lib = null, .deflate = true },
+    .{ .label = "fastwebsockets 0.10.0", .rust_lib = "fastwebsockets", .deflate = false },
+    .{ .label = "tungstenite 0.30.0", .rust_lib = "tungstenite", .deflate = false },
+};
 
 const mask_key: [4]u8 = .{ 0x37, 0xfa, 0x21, 0x3d };
 
@@ -71,12 +112,12 @@ const Data = struct {
     /// write_*: the messages to send.
     payloads: [names.len][]const []const u8,
     msgs: [names.len]usize,
-    scratch: []u8,
     msg_buf: []u8,
     cbuf: []u8,
     window: *deflate.Window,
     compressor: *deflate.Compressor,
     comp_out: []u8,
+    scratch: []u8,
 };
 
 fn isRead(w: usize) bool {
@@ -211,12 +252,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     var d: Data = try setup(arena, io, dir);
     const exe = try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = go_dir, .abs = abs });
+    const use_fast = if (init.environ_map.get("BENCH_FAST")) |v| !std.mem.eql(u8, v, "0") else true;
+    const gorilla_exe = if (use_fast) try bench.goBuild(arena, io, bench_name, init.environ_map, .{ .exe = "go", .dir = gorilla_dir, .abs = abs, .out = "go_bench_gorilla" }) else "";
+    if (use_fast) try rustBuild(arena, io);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
     try w.print("{s:<22} {s:>11} {s:>11} {s:>8} {s:>8} {s:>7} {s:>7}  count\n", .{ "workload", "ours ns", ref_short ++ " ns", "gross", "net", "spr us", "spr ref" });
     try w.flush();
     var worst: f64 = 0;
+    var worst_fast: f64 = 0;
+    var worst_fast_name: []const u8 = "";
     var best: f64 = std.math.inf(f64);
     var max_spread: f64 = 0;
     var mismatch = false;
@@ -230,8 +276,18 @@ pub fn main(init: std.process.Init) !u8 {
         }
         var ours: bench.Side = .{};
         var go: bench.Side = .{};
+        var alt_sides: [alts.len]bench.Side = @splat(.{});
+        const deflating = std.mem.endsWith(u8, name, "_deflate");
         for (0..rounds) |_| {
             go.add(try bench.foreign(arena, io, bench_name, exe, abs, name, null));
+            if (use_fast) for (alts, 0..) |alt, ai| {
+                if (deflating and !alt.deflate) continue;
+                const argv: []const []const u8 = if (alt.rust_lib) |lib|
+                    &.{ rs_exe, abs, name, lib }
+                else
+                    &.{ gorilla_exe, abs, name };
+                alt_sides[ai].add(try bench.foreignArgv(arena, io, bench_name, argv, name, null));
+            };
             ours.add(bench.timeIt(io, .{ .fd = null }, once, .{ &d, wi }, true));
         }
         const gross = ours.best_ns / go.best_ns;
@@ -258,6 +314,30 @@ pub fn main(init: std.process.Init) !u8 {
         const same = ours.count == go.count;
         mismatch = mismatch or !same;
         try w.print("{s:<22} {d:>11.0} {d:>11.0} {d:>8.3} {d:>8.3} {d:>6.1}% {d:>6.1}%  {d}{s}\n", .{ name, ours.best_ns, go.best_ns, gross, net, 100 * ours.spread(false), 100 * go.spread(false), ours.count, if (same and !info) "" else if (same) "  (info only, not in the verdict)" else " ≠ " ++ ref_short });
+        if (use_fast) {
+            var fastest_ns = go.best_ns;
+            var fastest_name: []const u8 = ref_short;
+            for (alts, alt_sides) |alt, side| {
+                if (deflating and !alt.deflate) {
+                    try w.print("  {s:<20} {s:>11} {s:>8}\n", .{ alt.label, "n/a", "n/a" });
+                    continue;
+                }
+                const same_alt = side.count == ours.count;
+                mismatch = mismatch or !same_alt;
+                max_spread = @max(max_spread, side.spread(false));
+                if (side.best_ns < fastest_ns) {
+                    fastest_ns = side.best_ns;
+                    fastest_name = alt.label;
+                }
+                try w.print("  {s:<20} {d:>11.0} {d:>8.3} {d:>6.1}%{s}\n", .{ alt.label, side.best_ns, ours.best_ns / side.best_ns, 100 * side.spread(false), if (same_alt) "" else " (count differs)" });
+            }
+            const fast = ours.best_ns / fastest_ns;
+            if (!info and fast > worst_fast) {
+                worst_fast = fast;
+                worst_fast_name = fastest_name;
+            }
+            try w.print("  {s:<20} {d:>11.0} {d:>8.3}  <- fastest in this row: ours/fastest\n", .{ fastest_name, fastest_ns, fast });
+        }
         try w.flush();
     }
     try w.print("rounds: {d}; ratios by wall time{s}; largest spread {d:.1}%{s}\n", .{ rounds, if (net_base != null) " (verdict = net of the " ++ net_base.? ++ " workload)" else "", 100 * max_spread, if (max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
@@ -267,8 +347,28 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("\nworst ours/{s} = {d:.2} (best {d:.2})\n", .{ ref_short, worst, best });
-    if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    if (use_fast) try w.print("worst ours/fastest = {d:.2} (fastest of that row: {s})\n", .{ worst_fast, worst_fast_name });
+    if (filters.len == 0) {
+        if (use_fast)
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest {d:.2}× {s} (field: coder, gorilla, fastwebsockets, tungstenite; measured <today>)\n", .{ best, worst, ref_card, worst_fast, worst_fast_name })
+        else
+            try w.print("card: **Performance:** ref {d:.2}–{d:.2}× {s} · fastest ? (measured <today>)\n", .{ best, worst, ref_card });
+    }
     try w.flush();
     return 0;
+}
+
+/// `cargo build --release --offline` of tools/rust_fast_bench.
+fn rustBuild(arena: std.mem.Allocator, io: std.Io) !void {
+    std.debug.print("{s}: building the Rust sides ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", rs_manifest },
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- BENCH_FAST=0 skips the added sides\n", .{ bench_name, e });
+        return error.CargoBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.CargoBuildFailed;
+    }
 }

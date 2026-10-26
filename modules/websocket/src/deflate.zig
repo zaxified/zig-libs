@@ -458,6 +458,20 @@ test "inflate: RFC 7692 7.2.3.4 BFINAL block, its trailing 0x00 accepted, other 
     try testing.expectError(error.InvalidCompressedData, inflateBytes(&.{ 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x41 }, &out));
 }
 
+test "inflate: the BFINAL block and its trailing 0x00 are accepted whatever room compressed_buf leaves after them (review F8)" {
+    // The decoder is fed through `ZeroPadded`, which may zero-fill the same
+    // buffer; the trailing-byte check reads it afterwards.
+    const msg = [_]u8{ 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00 };
+    var window: Window = undefined;
+    var out: [64]u8 = undefined;
+    for (0..16) |extra| {
+        var buf: [msg.len + inflate_tail.len + 16]u8 = undefined;
+        @memcpy(buf[0..msg.len], &msg);
+        const room = buf[0 .. msg.len + inflate_tail.len + extra];
+        try testing.expectEqualStrings("Hello", try inflate(room, msg.len, &out, &window));
+    }
+}
+
 test "inflate: RFC 7692 7.2.3.5 two blocks in one message" {
     var out: [64]u8 = undefined;
     try testing.expectEqualStrings("Hello", try inflateBytes(&.{ 0xf2, 0x48, 0x05, 0x00, 0x00, 0x00, 0xff, 0xff, 0xca, 0xc9, 0xc9, 0x07, 0x00 }, &out));

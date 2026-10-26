@@ -444,6 +444,10 @@ pub const ClientRequestOptions = struct {
 /// class of check the server side of the sibling module already has.
 /// Checked before anything is written, so a rejected call never puts a
 /// partially-built request on the wire.
+/// The fields `writeRequest` writes itself; `extra_headers` may not repeat
+/// them.
+const reserved_request_fields = [_][]const u8{ "host", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version", "sec-websocket-protocol", "sec-websocket-extensions" };
+
 fn validRequestFields(options: ClientRequestOptions) bool {
     if (!h1.isValidHost(options.host)) return false;
     if (!h1.isValidRequestTarget(options.target)) return false;
@@ -452,6 +456,10 @@ fn validRequestFields(options: ClientRequestOptions) bool {
     for (options.extra_headers) |h| {
         if (!h1.isToken(h.name)) return false;
         if (!h1.isValidFieldValue(h.value)) return false;
+        // Review F9 (2026-10-26): a field `writeRequest` writes itself would
+        // go out twice -- a request this module's own server refuses as
+        // `DuplicateHeader`, and an intermediary may read either copy.
+        for (reserved_request_fields) |r| if (std.ascii.eqlIgnoreCase(h.name, r)) return false;
     }
     return true;
 }
@@ -934,6 +942,15 @@ test "writeRequest: rejects CR/LF/NUL injection in every field" {
     {
         var w: std.Io.Writer = .fixed(&buf);
         try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .extra_headers = &.{.{ .name = "Cookie\r\nX-Injected", .value = "1" }} }));
+    }
+    // extra_headers naming a field writeRequest writes itself (review F9).
+    for ([_][]const u8{ "Host", "sec-websocket-key", "Sec-WebSocket-Version", "UPGRADE", "Connection", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions" }) |name| {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .extra_headers = &.{.{ .name = name, .value = "x" }} }));
+    }
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .extra_headers = &.{.{ .name = "Origin", .value = "http://h" }} });
     }
     // extra_headers value: the exact attack from the audit report.
     {
