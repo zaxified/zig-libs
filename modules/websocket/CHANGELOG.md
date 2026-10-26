@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: `bench-websocket` re-measured after `fastmem` began exporting `memcpy` (installed by every bench driver): read_binary_64k 1.19× → 1.12× fastwebsockets; card updated.
 - **2026-10-26** — **`conn.Conn` reads a frame larger than its reader's buffer.** An uncompressed
   text/binary/continuation payload that does not fit goes straight into `message_buf` (64 KiB
   steps, unmasked and UTF-8-checked as it arrives); before, it was `FrameExceedsBuffer` (1009), so

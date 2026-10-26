@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! fastmem — a vectorised `memset` for binaries that link no libc.
+//! fastmem — a vectorised `memset` and `memcpy` for binaries that link no libc.
+//!
+//! (The history below is `memset`'s, on Zig 0.16. `memcpy` came on 0.17,
+//! where compiler_rt's copies one element at a time with no string move:
+//! 1.2–2.3× glibc's, and 58 % of a 64 KiB websocket frame read.)
 //!
 //! Without libc, every `@memset` whose length is not known at compile time,
 //! and every `std.crypto.secureZero`, ends in compiler_rt's `memset`, which in
@@ -29,14 +33,14 @@
 //! symbol would interpose libc's own `memset`, which is already vectorised
 //! and tuned per CPU, and replace it with this one.
 //!
-//! `set` is the same code without the export, for a caller that wants the
-//! speed at one site and nothing global.
+//! `set` and `copy` are the same code without the export, for a caller that
+//! wants the speed at one site and nothing global.
 //!
 //! ## Why the stores are volatile
 //!
-//! This is a `memset`. LLVM recognises a store loop as the memset idiom and
-//! turns it into a call to `memset` — which, once this function IS `memset`,
-//! is itself: infinite recursion. Volatile stores are never recognised, and
+//! This is a `memset`. LLVM recognises a store loop as the memset idiom (and a
+//! load/store loop as the memcpy one) and turns it into a call to `memset` —
+//! which, once this function IS `memset`, is itself: infinite recursion. Volatile stores are never recognised, and
 //! cost nothing here, because every store is one full vector the loop was
 //! going to issue anyway.
 
@@ -44,8 +48,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const meta = .{
-    .doc = "Vectorised memset (32-byte stores, overlapping head/tail; rep stosq past L2 on x86-64) that an executable without libc can export to replace compiler_rt's byte-at-a-time one for every caller, std included; opt-in.",
-    .platform_note = "any (portable @Vector code, plus a rep-stosq path for large lengths on x86-64; the export refuses libc-linked builds)",
+    .doc = "Vectorised memset and memcpy (32-byte vectors, overlapping head/tail; rep stosq past L2 / rep movsb from 16 KiB on x86-64) that an executable without libc can export to replace compiler_rt's for every caller, std included; opt-in.",
+    .platform_note = "any (portable @Vector code, plus rep-stosq / rep-movsb paths for large lengths on x86-64; the export refuses libc-linked builds)",
     .targets = .{.linux64},
     .platform = .any,
     .role = .util,
@@ -59,8 +63,19 @@ pub const meta = .{
 /// Store `c` into `dest[0..len]`.
 pub fn set(dest: [*]u8, c: u8, len: usize) void {
     if (len < 32) return setSmall(dest, c, len);
-    if (use_stos and len >= stos_min) return setLarge(dest, c, len);
     const v: V = @splat(c);
+    // Up to 8 vectors: the first k and the last k, overlapping in the middle,
+    // no loop and no alignment arithmetic.
+    inline for (.{ 1, 2, 4 }) |k| {
+        if (len <= 2 * k * 32) {
+            inline for (0..k) |j| {
+                store(V, dest + 32 * j, v);
+                store(V, dest + len - 32 * (k - j), v);
+            }
+            return;
+        }
+    }
+    if (use_stos and len >= stos_min) return setLarge(dest, c, len);
     // Unaligned first and last vectors, overlapping the aligned middle; the
     // middle then starts at the first aligned address after `dest`.
     store(V, dest, v);
@@ -68,11 +83,16 @@ pub fn set(dest: [*]u8, c: u8, len: usize) void {
     const start = @intFromPtr(dest);
     const first = std.mem.alignForward(usize, start + 1, 32);
     const end = start + len - 32; // the tail store covers from here
+    // Four stores per iteration: 37 against 44 ns for a 4 KiB clear with one
+    // (disposable probe, 2026-10-26), level from 16 KiB up.
     var p = first;
-    while (p < end) : (p += 32) {
-        const w: *volatile V = @ptrFromInt(p);
-        w.* = v;
+    while (p + 128 <= end) : (p += 128) {
+        storeAligned(@ptrFromInt(p), v);
+        storeAligned(@ptrFromInt(p + 32), v);
+        storeAligned(@ptrFromInt(p + 64), v);
+        storeAligned(@ptrFromInt(p + 96), v);
     }
+    while (p < end) : (p += 32) storeAligned(@ptrFromInt(p), v);
 }
 
 /// The C `memset`, over `set`.
@@ -81,12 +101,60 @@ pub fn memset(dest: ?[*]u8, c: c_int, len: usize) callconv(.c) ?[*]u8 {
     return dest;
 }
 
-/// Export `memset` as a strong symbol, replacing compiler_rt's weak one for
-/// the whole binary. Call it from a `comptime` block in the EXECUTABLE's root
-/// file — never from a library (see the module doc).
+/// Copy `src[0..len]` to `dest[0..len]`; the ranges must not overlap.
+pub fn copy(noalias dest: [*]u8, noalias src: [*]const u8, len: usize) void {
+    if (len < 32) return copySmall(dest, src, len);
+    // Up to 8 vectors: the first k and the last k, overlapping in the middle,
+    // no loop and no alignment arithmetic.
+    inline for (.{ 1, 2, 4 }) |k| {
+        if (len <= 2 * k * 32) {
+            var v: [2 * k]V = undefined;
+            inline for (0..k) |j| {
+                v[j] = load(V, src + 32 * j);
+                v[k + j] = load(V, src + len - 32 * (k - j));
+            }
+            inline for (0..k) |j| {
+                store(V, dest + 32 * j, v[j]);
+                store(V, dest + len - 32 * (k - j), v[k + j]);
+            }
+            return;
+        }
+    }
+    if (use_movs and len >= movs_min) return copyLarge(dest, src, len);
+    // Unaligned first and last vectors, loaded before anything is stored, and
+    // 32-aligned destination stores in between, four per iteration.
+    const head = load(V, src);
+    const tail = load(V, src + len - 32);
+    const end = len - 32; // the tail store covers from here
+    var i: usize = 32 - (@intFromPtr(dest) & 31);
+    while (i + 128 <= end) : (i += 128) {
+        const a = load(V, src + i);
+        const b = load(V, src + i + 32);
+        const c = load(V, src + i + 64);
+        const d = load(V, src + i + 96);
+        storeAligned(dest + i, a);
+        storeAligned(dest + i + 32, b);
+        storeAligned(dest + i + 64, c);
+        storeAligned(dest + i + 96, d);
+    }
+    while (i < end) : (i += 32) storeAligned(dest + i, load(V, src + i));
+    store(V, dest, head);
+    store(V, dest + end, tail);
+}
+
+/// The C `memcpy`, over `copy`.
+pub fn memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, len: usize) callconv(.c) ?[*]u8 {
+    if (len != 0) copy(dest.?, src.?, len);
+    return dest;
+}
+
+/// Export `memset` and `memcpy` as strong symbols, replacing compiler_rt's
+/// weak ones for the whole binary. Call it from a `comptime` block in the
+/// EXECUTABLE's root file — never from a library (see the module doc).
 pub fn exportSymbols() void {
-    if (builtin.link_libc) @compileError("fastmem.exportSymbols: this build links libc, whose memset is already vectorised; exporting would interpose it");
+    if (builtin.link_libc) @compileError("fastmem.exportSymbols: this build links libc, whose memset and memcpy are already vectorised; exporting would interpose them");
     @export(&memset, .{ .name = "memset", .linkage = .strong });
+    @export(&memcpy, .{ .name = "memcpy", .linkage = .strong });
 }
 
 // ── implementation ──────────────────────────────────────────────────────────
@@ -129,6 +197,66 @@ noinline fn setLarge(dest: [*]u8, c: u8, len: usize) void {
 inline fn store(comptime T: type, p: [*]u8, v: T) void {
     const w: *align(1) volatile T = @ptrCast(p);
     w.* = v;
+}
+
+inline fn storeAligned(p: [*]u8, v: V) void {
+    const w: *volatile V = @ptrCast(@alignCast(p));
+    w.* = v;
+}
+
+inline fn load(comptime T: type, p: [*]const u8) T {
+    const r: *align(1) const T = @ptrCast(p);
+    return r.*;
+}
+
+/// From this length up `copy` moves the middle by `rep movsb` instead of the
+/// vector loop. Measured 2026-10-26 on an i7-7920HQ (ERMS, no FSRM;
+/// disposable probe, destination offsets 0/5/37, source 3× that): at 8 KiB the
+/// loop is 0.60-0.88× the string move, at 16 KiB the string move is 0.79-0.88×
+/// the loop and stays level with or ahead of it up to 2 MiB (0.75-0.95× from
+/// 256 KiB, where the loop's stores pay a read-for-ownership per line).
+const movs_min = 16 * 1024;
+
+const use_movs = use_stos;
+
+/// `copy` for `len >= movs_min` on x86-64: two unaligned vectors for the
+/// first 64 bytes, `rep movsb` from the first 64-aligned destination address
+/// after `dest` up to the tail vector, and the tail vector. Aligning the
+/// destination is what makes the string move fast at every source offset
+/// (unaligned, it was 1.5× slower at 16 KiB). `noinline` and reached by a tail
+/// call, for the same reason as `setLarge`.
+noinline fn copyLarge(noalias dest: [*]u8, noalias src: [*]const u8, len: usize) void {
+    const h0 = load(V, src);
+    const h1 = load(V, src + 32);
+    const tail = load(V, src + len - 32);
+    const skew = 64 - (@intFromPtr(dest) & 63);
+    var d = dest + skew;
+    var s = src + skew;
+    var n = len - 32 - skew;
+    asm volatile ("rep movsb"
+        : [d] "+{rdi}" (d),
+          [s] "+{rsi}" (s),
+          [n] "+{rcx}" (n),
+        :
+        : .{ .memory = true });
+    store(V, dest, h0);
+    store(V, dest + 32, h1);
+    store(V, dest + len - 32, tail);
+}
+
+/// Below one vector: the first and the last word of the widest width that
+/// fits, both loaded before either is stored.
+fn copySmall(d: [*]u8, s: [*]const u8, n: usize) void {
+    inline for (.{ @Vector(16, u8), u64, u32, u16 }) |T| {
+        if (n >= @sizeOf(T)) {
+            const a = load(T, s);
+            const b = load(T, s + n - @sizeOf(T));
+            store(T, d, a);
+            store(T, d + n - @sizeOf(T), b);
+            return;
+        }
+    }
+    if (n == 1) store(u8, d, s[0]);
 }
 
 /// Below one vector: two overlapping stores of the largest width that fits,
@@ -213,6 +341,67 @@ test "set: the rep-stosq path writes exactly its range" {
     }
 }
 
+/// Copy `len` bytes between two fresh canvases at the given offsets and check
+/// every byte of the destination canvas: the range equals the source, the
+/// rest is untouched, and the source is unchanged.
+fn expectCopy(dst: []u8, src: []u8, d_off: usize, s_off: usize, len: usize) !void {
+    for (src, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    for (dst, 0..) |*b, i| b.* = @truncate(i *% 13 +% 3);
+    copy(dst[d_off..].ptr, src[s_off..].ptr, len);
+    for (dst, 0..) |b, i| {
+        const want: u8 = if (i >= d_off and i < d_off + len) src[i - d_off + s_off] else @truncate(i *% 13 +% 3);
+        if (b != want) {
+            std.debug.print("d_off={d} s_off={d} len={d} i={d}: got {x}, want {x}\n", .{ d_off, s_off, len, i, b, want });
+            return error.TestUnexpectedResult;
+        }
+    }
+    for (src, 0..) |b, i| try testing.expectEqual(@as(u8, @truncate(i *% 31 +% 7)), b);
+}
+
+test "copy: every length 0..300 at every destination offset 0..63 writes exactly its range" {
+    var dst: [512]u8 align(64) = undefined;
+    var src: [512]u8 align(64) = undefined;
+    for ([_]usize{ 0, 1, 5, 17, 32, 63 }) |s_off| {
+        for (0..64) |d_off| {
+            for (0..301) |len| try expectCopy(&dst, &src, d_off, s_off, len);
+        }
+    }
+}
+
+test "copy: page-scale lengths, the unrolled vector loop and its remainder" {
+    const dst = try testing.allocator.alignedAlloc(u8, .@"64", 3 * 4096 + 128);
+    defer testing.allocator.free(dst);
+    const src = try testing.allocator.alignedAlloc(u8, .@"64", 3 * 4096 + 128);
+    defer testing.allocator.free(src);
+    for ([_]usize{ 4095, 4096, 4097, 4127, 4159, 8191, 12289 }) |len| {
+        for ([_]usize{ 0, 1, 31, 33 }) |d_off| {
+            for ([_]usize{ 0, 7, 64 }) |s_off| try expectCopy(dst, src, d_off, s_off, len);
+        }
+    }
+}
+
+test "copy: the rep-movsb path writes exactly its range" {
+    // Lengths at and around `movs_min` and well past it, at destination
+    // offsets that put the 64-byte skew at both ends of its range (1 and 64).
+    const dst = try testing.allocator.alignedAlloc(u8, .@"64", 3 * movs_min + 256);
+    defer testing.allocator.free(dst);
+    const src = try testing.allocator.alignedAlloc(u8, .@"64", 3 * movs_min + 256);
+    defer testing.allocator.free(src);
+    for ([_]usize{ movs_min - 1, movs_min, movs_min + 1, movs_min + 63, movs_min + 2000, 3 * movs_min }) |len| {
+        for ([_]usize{ 0, 1, 5, 32, 63, 64 }) |d_off| {
+            for ([_]usize{ 0, 3, 70 }) |s_off| try expectCopy(dst, src, d_off, s_off, len);
+        }
+    }
+}
+
+test "memcpy: C semantics -- returns dest, len 0 accepts null and touches nothing" {
+    var a: [40]u8 = @splat(1);
+    const b: [40]u8 = @splat(2);
+    try testing.expectEqual(@as(?[*]u8, &a), memcpy(&a, &b, 40));
+    for (a) |x| try testing.expectEqual(@as(u8, 2), x);
+    try testing.expectEqual(@as(?[*]u8, null), memcpy(null, null, 0));
+}
+
 test "memset: C semantics -- returns dest, takes the low byte of c, len 0 touches nothing" {
     var a: [40]u8 = @splat(1);
     try testing.expectEqual(@as(?[*]u8, &a), memset(&a, 0x1FF, 40)); // low byte 0xFF
@@ -239,10 +428,15 @@ test "the export took effect: the linked `memset` is this module's" {
     comptime exportSymbols();
     const linked = @extern(*const fn (?[*]u8, c_int, usize) callconv(.c) ?[*]u8, .{ .name = "memset" });
     try testing.expectEqual(@intFromPtr(&memset), @intFromPtr(linked));
-    // And a runtime-length @memset goes through it with the right result.
+    const linked_cpy = @extern(*const fn (?[*]u8, ?[*]const u8, usize) callconv(.c) ?[*]u8, .{ .name = "memcpy" });
+    try testing.expectEqual(@intFromPtr(&memcpy), @intFromPtr(linked_cpy));
+    // And a runtime-length @memset / @memcpy goes through them with the right result.
     var buf: [100]u8 = @splat(3);
     var n: usize = 77;
     _ = &n;
     @memset(buf[5..][0..n], 9);
     for (buf, 0..) |b, i| try testing.expectEqual(@as(u8, if (i >= 5 and i < 82) 9 else 3), b);
+    var dst: [100]u8 = @splat(1);
+    @memcpy(dst[2..][0..n], buf[4..][0..n]);
+    for (dst, 0..) |b, i| try testing.expectEqual(if (i >= 2 and i < 79) buf[i + 2] else 1, b);
 }
