@@ -2,12 +2,16 @@
 
 //! Comparative benchmark: `x509` against Go's `crypto/x509` (the reference;
 //! Go 1.26 standard library only), the program behind the `**Performance:**`
-//! line of the maturity card (CONVENTIONS.md §9, kept instrument kind 3).
+//! line of the maturity card (CONVENTIONS.md §9, kept instrument kind 3),
+//! with OpenSSL's `X509_verify_cert` as the fastest in the field
+//! (`tools/c_bench/foreign_bench.c`).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-x509` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26.0
-//! (`GOTOOLCHAIN=local`, `GOPROXY=off`; stdlib only, `tools/go_bench`) and
-//! no C compiler. Run from the repository root.
+//! (`GOTOOLCHAIN=local`, `GOPROXY=off`; stdlib only, `tools/go_bench`), `zig`
+//! on PATH (it builds the C side with `zig cc -O3 -march=native`) and the
+//! system OpenSSL 3 (`libcrypto.so.3`, path below or `LIBCRYPTO_SO`; no
+//! headers needed). Run from the repository root.
 //!
 //! The Go side generates three chains into `.zig-cache/bench-x509/` (fresh
 //! keys each run; ten-year certificates, SAN `bench.example.test`, serverAuth):
@@ -24,8 +28,12 @@
 //! pool, and `Certificate.Verify` against a root pool built once with the same
 //! hostname and EKU requirements. Ours re-parses the trust anchor on every
 //! call (its API takes DER) where Go's pool holds a parsed root: that favours
-//! Go by one certificate parse. The count is the verified path length from
-//! leaf to root (3) on both sides.
+//! Go by one certificate parse. OpenSSL's side has the same shape:
+//! `d2i_X509` of leaf and intermediate, a fresh untrusted stack and
+//! `X509_STORE_CTX`, and `X509_verify_cert` against a store holding the root
+//! parsed once, with the time, `X509_VERIFY_PARAM_set1_host` and the
+//! sslserver purpose. The count is the verified path length from leaf to root
+//! (3) on every side.
 //!
 //! Method (`testkit.bench`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
@@ -45,6 +53,8 @@ const work_dir = ".zig-cache/bench-x509";
 const go_dir = "modules/x509/tools/go_bench";
 const host = "bench.example.test";
 const kinds = [_][]const u8{ "ecdsa256", "rsa2048", "mixed" };
+const c_src = "modules/x509/tools/c_bench/foreign_bench.c";
+const default_so = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
 
 const Op = struct { kind: usize };
 
@@ -113,19 +123,24 @@ pub fn main(init: std.process.Init) !u8 {
         } else |_| {}
     }
 
+    const so = init.environ_map.get("LIBCRYPTO_SO") orelse default_so;
+    const cexe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, c_src, &.{so});
+    // The same chains verify under OpenSSL, and a wrong host is refused there too.
+    try bench.foreignOnce(arena, io, bench_name, cexe, abs, "check");
+
     var ws: std.ArrayList(Work) = .empty;
     for (kinds, 0..) |k, i| {
         const name = try arena.print("verify_{s}", .{k});
-        try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name });
+        try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name, .alt = name, .ref_exe = 0, .alt_exe = 1 });
     }
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/Go = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, cexe }, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
+    try w.print("reference: {s}\nalt: {s}\nworst ours/Go = {d:.3} (best {d:.3}); worst ours/fastest = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/x509 (chain verify) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/x509 (chain verify) · fastest {d:.2}× (the faster of Go and OpenSSL <version> X509_verify_cert per workload) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
     try w.flush();
     return 0;
 }
