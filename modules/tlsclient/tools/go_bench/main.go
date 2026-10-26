@@ -7,7 +7,8 @@
 //	go_bench <dir> serve               generates two chains (ecdsa256: ECDSA
 //	                                   P-256 root, intermediate, leaf; rsa2048:
 //	                                   RSA-2048 throughout), listens on two
-//	                                   loopback ports, writes root_<kind>.pem
+//	                                   loopback ports, writes root_<kind>.pem,
+//	                                   root_<kind>.der (for the rustls side)
 //	                                   and port_<kind>.txt into <dir>, prints
 //	                                   READY, then answers handshakes until
 //	                                   killed. Default crypto/tls server
@@ -122,6 +123,9 @@ func serve(dir string) {
 		cert, rootDER := chain(kind)
 		pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER})
 		if err := os.WriteFile(filepath.Join(dir, "root_"+kind+".pem"), pemBytes, 0o644); err != nil {
+			die(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "root_"+kind+".der"), rootDER, 0o644); err != nil {
 			die(err)
 		}
 		ln, err := net.Listen("tcp", "127.0.0.1:0")

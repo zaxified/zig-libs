@@ -15,6 +15,7 @@ const x509 = @import("x509");
 const p256 = @import("p256");
 const p384 = @import("p384");
 const p521 = @import("p521");
+const ct25519 = @import("ct25519");
 const hello = @import("hello.zig");
 const session = @import("session.zig");
 const tlsresume = @import("tlsresume");
@@ -198,13 +199,14 @@ pub const Options = struct {
     /// the wire. The server's choice is `Client.alpn_protocol`; a choice not
     /// offered is `error.TlsIllegalParameter`. Borrowed for the connection.
     alpn_protocols: []const []const u8 = &.{},
-    /// A client certificate for a TLS 1.3 server that sends a
-    /// CertificateRequest. Null (the default): such a request is
-    /// `error.TlsUnexpectedMessage`, as in std. Set: the chain is sent and
-    /// signed for with `key`; when the request's signature_algorithms do not
-    /// include `key`'s scheme, an empty Certificate is sent (RFC 8446
-    /// §4.4.2.3) and the server decides. TLS 1.2 client authentication is
-    /// not implemented (a TLS 1.2 CertificateRequest stays an error).
+    /// A client certificate for a server that sends a CertificateRequest
+    /// (TLS 1.3 and 1.2). Null (the default): an empty Certificate is sent
+    /// and the server decides, as Go's client does (std's, and this
+    /// module's before 2026-10-26, failed with `error.TlsUnexpectedMessage`).
+    /// Set: the chain is sent and signed for with `key`; when the request's
+    /// signature_algorithms (or, in TLS 1.2, its certificate_types) do not
+    /// fit `key`, an empty Certificate is sent (RFC 8446 §4.4.2.3) and the
+    /// server decides.
     client_auth: ?ClientAuth = null,
     /// Choose the client certificate per request (Go `GetClientCertificate`):
     /// called with the request's signature schemes and acceptable CA names;
@@ -1389,11 +1391,14 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
 
                         cert_buf_index += 1;
                     },
-                    // zig-libs tlsclient: client authentication. Without
-                    // `client_auth`, or in TLS 1.2, this is std's
-                    // TlsUnexpectedMessage.
+                    // zig-libs tlsclient: client authentication. Without a
+                    // credential the answer is an empty Certificate (`choose`
+                    // picks none), as Go's client sends -- std (and this
+                    // client until 2026-10-26) failed the handshake with
+                    // TlsUnexpectedMessage, so a server that only REQUESTS a
+                    // certificate was unreachable (`tools/interop.zig`).
                     .certificate_request => {
-                        if (!auth_configured or cert_request != null) return error.TlsUnexpectedMessage;
+                        if (cert_request != null) return error.TlsUnexpectedMessage;
                         switch (tls_version) {
                             .tls_1_3 => if (cipher_state != .handshake or handshake_state != .certificate) return error.TlsUnexpectedMessage,
                             // TLS 1.2: after ServerKeyExchange, before ServerHelloDone.
@@ -1460,7 +1465,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         else
                             main_cert_pub_key.algo == .rsaEncryption or main_cert_pub_key.algo == .rsassa_pss;
                         if (!key_ok) return error.TlsBadSignatureScheme;
-                        try main_cert_pub_key.verifySignature(&hsd, &.{ &client_hello_rand, &server_hello_rand, hsd.buf[0..hsd.idx] });
+                        try main_cert_pub_key.verifySignature(.tls_1_2, &hsd, &.{ &client_hello_rand, &server_hello_rand, hsd.buf[0..hsd.idx] });
                         // zig-libs tlsclient: one of our groups (and not the
                         // TLS 1.3-only hybrid); its key pair is made now.
                         if (named_group == .x25519_ml_kem768 or
@@ -1618,7 +1623,7 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
                         }
                         switch (handshake_cipher) {
                             inline else => |*p| {
-                                try main_cert_pub_key.verifySignature(&hsd, &.{
+                                try main_cert_pub_key.verifySignature(.tls_1_3, &hsd, &.{
                                     strRepeat(" ", 64) ++ "TLS 1.3, server CertificateVerify\x00",
                                     &p.transcript_hash.peek(),
                                 });
@@ -2873,7 +2878,10 @@ const KeyShare = struct {
     secp256r1_kp: crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair,
     secp384r1_kp: p384.EcdsaP384Sha384.KeyPair,
     secp521r1_kp: p521.EcdsaP521Sha512.KeyPair,
-    x25519_kp: crypto.dh.X25519.KeyPair,
+    /// zig-libs tlsclient: `ct25519`'s X25519 (std's bytes and shape): the
+    /// public key from a fixed-base comb, the shared secret on a MULX/ADX
+    /// ladder -- std's two Montgomery ladders were ~18 % of the client's CPU.
+    x25519_kp: ct25519.X25519.KeyPair,
     /// zig-libs tlsclient: each share's wire encoding, made once at
     /// generation. The ClientHello (and a TLS 1.2 ClientKeyExchange) used to
     /// re-encode the NIST keys, a field inversion each -- on std's slow P-256
@@ -2934,7 +2942,7 @@ const KeyShare = struct {
                 ks.have_ml_kem = true;
             },
             .x25519 => if (!ks.have_x25519) {
-                ks.x25519_kp = .generateDeterministic(ks.seed[144..176].*);
+                try ct25519.X25519.KeyPair.generateDeterministicInto(&ks.x25519_kp, ks.seed[144..176]);
                 ks.have_x25519 = true;
             },
             // zig-libs tlsclient: std's key pairs, byte for byte, with the
@@ -3004,7 +3012,7 @@ const KeyShare = struct {
 
                 const hsk = ks.ml_kem768_kp.secret_key.decaps(server_pub_key[0..hksl]) catch
                     return error.TlsDecryptFailure;
-                const xsk = crypto.dh.X25519.scalarmult(ks.x25519_kp.secret_key, server_pub_key[hksl..xksl].*) catch
+                const xsk = ct25519.X25519.scalarmult(ks.x25519_kp.secret_key, server_pub_key[hksl..xksl].*) catch
                     return error.TlsDecryptFailure;
                 @memcpy(ks.sk_buf[0..hsk.len], &hsk);
                 @memcpy(ks.sk_buf[hsk.len..][0..xsk.len], &xsk);
@@ -3040,7 +3048,7 @@ const KeyShare = struct {
             .x25519 => {
                 const ksl = crypto.dh.X25519.public_length;
                 if (server_pub_key.len != ksl) return error.TlsIllegalParameter;
-                const sk = crypto.dh.X25519.scalarmult(ks.x25519_kp.secret_key, server_pub_key[0..ksl].*) catch
+                const sk = ct25519.X25519.scalarmult(ks.x25519_kp.secret_key, server_pub_key[0..ksl].*) catch
                     return error.TlsDecryptFailure;
                 @memcpy(ks.sk_buf[0..sk.len], &sk);
                 ks.sk_len = sk.len;
@@ -3111,6 +3119,32 @@ fn SchemeHash(comptime scheme: tls.SignatureScheme) type {
     };
 }
 
+/// The curve of an ECDSA server key, by its SEC1 encoding's length
+/// (uncompressed or compressed); the three TLS curves differ in all four.
+const EcCurve = enum {
+    p256,
+    p384,
+    p521,
+
+    fn ofSec1(sec1: []const u8) ?EcCurve {
+        return switch (sec1.len) {
+            65, 33 => .p256,
+            97, 49 => .p384,
+            133, 67 => .p521,
+            else => null,
+        };
+    }
+
+    fn ofScheme(comptime scheme: tls.SignatureScheme) EcCurve {
+        return switch (scheme) {
+            .ecdsa_secp256r1_sha256 => .p256,
+            .ecdsa_secp384r1_sha384 => .p384,
+            .ecdsa_secp521r1_sha512 => .p521,
+            else => @compileError("bad scheme"),
+        };
+    }
+};
+
 const CertificatePublicKey = struct {
     algo: Certificate.AlgorithmCategory,
     buf: [600]u8,
@@ -3134,6 +3168,8 @@ const CertificatePublicKey = struct {
         crypto.errors.NonCanonicalError ||
         SchemeEcdsa(.ecdsa_secp256r1_sha256).Signature.VerifyError ||
         SchemeEcdsa(.ecdsa_secp384r1_sha384).Signature.VerifyError ||
+        p384.Ecdsa(crypto.hash.sha2.Sha512).Signature.VerifyError ||
+        p521.Ecdsa(crypto.hash.sha2.Sha512).Signature.VerifyError ||
         // rsa
         error{TlsBadRsaSignatureBitCount} ||
         Certificate.rsa.PublicKey.ParseDerError ||
@@ -3149,6 +3185,7 @@ const CertificatePublicKey = struct {
 
     fn verifySignature(
         cert_pub_key: *const CertificatePublicKey,
+        version: tls.ProtocolVersion,
         sigd: *tls.Decoder,
         msg: []const []const u8,
     ) VerifyError!void {
@@ -3163,6 +3200,7 @@ const CertificatePublicKey = struct {
         if (cert_pub_key.algo != @as(Certificate.AlgorithmCategory, switch (scheme) {
             .ecdsa_secp256r1_sha256,
             .ecdsa_secp384r1_sha384,
+            .ecdsa_secp521r1_sha512,
             => .X9_62_id_ecPublicKey,
             .rsa_pkcs1_sha256,
             .rsa_pkcs1_sha384,
@@ -3196,29 +3234,43 @@ const CertificatePublicKey = struct {
         const signed = signed_buf[0..signed_len];
 
         switch (scheme) {
-            // zig-libs tlsclient: P-256 through the `p256` module (std's
-            // portable P-256 verify cost ~6× Go's per handshake). The
-            // signature and key are still decoded by std, so a malformed one
-            // fails exactly as before; only the verification equation moved.
-            .ecdsa_secp256r1_sha256 => {
-                const Ecdsa = SchemeEcdsa(.ecdsa_secp256r1_sha256);
-                const sig = try Ecdsa.Signature.fromDer(encoded_sig);
-                _ = try Ecdsa.PublicKey.fromSec1(pub_key);
-                var digest: [32]u8 = undefined;
-                crypto.hash.sha2.Sha256.hash(signed, &digest, .{});
-                if (!p256.sign.ecdsaVerifyDigest(pub_key, &digest, sig.toBytes()))
-                    return error.SignatureVerificationFailed;
-            },
-            // zig-libs tlsclient: P-384 through the `p384` module (std's
-            // generic P-384 verify, 2026-10-13). Decoding stays std's, as for
-            // P-256 above, so a malformed signature or key fails as before.
-            .ecdsa_secp384r1_sha384 => {
-                const Ecdsa = SchemeEcdsa(.ecdsa_secp384r1_sha384);
-                const sig = try Ecdsa.Signature.fromDer(encoded_sig);
-                _ = try Ecdsa.PublicKey.fromSec1(pub_key);
-                const P384Ecdsa = p384.EcdsaP384Sha384;
-                const key = try P384Ecdsa.PublicKey.fromSec1(pub_key);
-                try P384Ecdsa.Signature.fromBytes(sig.toBytes()).verify(signed, key);
+            // zig-libs tlsclient: ECDSA through the `p256`, `p384` and `p521`
+            // modules (std's portable verifiers cost ~6× Go's per handshake;
+            // std has no P-521). The curve is the KEY's. In TLS 1.3 the scheme
+            // names curve and hash together and must match the key (RFC 8446
+            // §4.2.3); in TLS 1.2 it names only the hash, and an ECDSA key of
+            // any curve signs with it (RFC 5246 §7.4.1.4.1, RFC 8422 §5.10) --
+            // std read every TLS 1.2 ECDSA signature as the scheme's curve, so
+            // a P-384 or P-521 server certificate failed with InvalidEncoding
+            // (Go's server signs ServerKeyExchange with ecdsa_secp256r1_sha256
+            // from a P-384 key; found by `tools/interop.zig`, 2026-10-26).
+            inline .ecdsa_secp256r1_sha256,
+            .ecdsa_secp384r1_sha384,
+            .ecdsa_secp521r1_sha512,
+            => |comptime_scheme| {
+                const H = SchemeHash(comptime_scheme);
+                const curve = EcCurve.ofSec1(pub_key) orelse return error.InvalidEncoding;
+                if (version == .tls_1_3 and curve != comptime EcCurve.ofScheme(comptime_scheme)) return error.TlsBadSignatureScheme;
+                var digest: [H.digest_length]u8 = undefined;
+                H.hash(signed, &digest, .{});
+                switch (curve) {
+                    // Signature and key decoded by std, as before p256 took
+                    // the equation; p256 truncates a longer digest to the
+                    // leftmost 256 bits (FIPS 186-5 §6.4.2).
+                    .p256 => {
+                        const Ecdsa = SchemeEcdsa(.ecdsa_secp256r1_sha256);
+                        const sig = try Ecdsa.Signature.fromDer(encoded_sig);
+                        _ = try Ecdsa.PublicKey.fromSec1(pub_key);
+                        if (!p256.sign.ecdsaVerifyDigest(pub_key, &digest, sig.toBytes()))
+                            return error.SignatureVerificationFailed;
+                    },
+                    inline .p384, .p521 => |c| {
+                        const E = if (c == .p384) p384.Ecdsa(H) else p521.Ecdsa(H);
+                        const sig = try E.Signature.fromDer(encoded_sig);
+                        const key = try E.PublicKey.fromSec1(pub_key);
+                        try sig.verifyPrehashed(digest, key);
+                    },
+                }
             },
             inline .rsa_pkcs1_sha256,
             .rsa_pkcs1_sha384,
@@ -3441,12 +3493,51 @@ test "CertificateVerify: the RFC 8446 §4.4.3 content, verified with the public 
 /// `scheme || u16 length || signature` as a server's CertificateVerify body,
 /// decoded by `verifySignature` over the content `parts`.
 fn testServerSignature(key: *const CertificatePublicKey, scheme: tls.SignatureScheme, sig: []const u8, parts: []const []const u8) CertificatePublicKey.VerifyError!void {
+    return testServerSignatureIn(.tls_1_3, key, scheme, sig, parts);
+}
+
+fn testServerSignatureIn(version: tls.ProtocolVersion, key: *const CertificatePublicKey, scheme: tls.SignatureScheme, sig: []const u8, parts: []const []const u8) CertificatePublicKey.VerifyError!void {
     var buf: [600]u8 = undefined;
     mem.writeInt(u16, buf[0..2], @backingInt(scheme), .big);
     mem.writeInt(u16, buf[2..4], @intCast(sig.len), .big);
     @memcpy(buf[4..][0..sig.len], sig);
     var d: tls.Decoder = .fromTheirSlice(buf[0 .. 4 + sig.len]);
-    return key.verifySignature(&d, parts);
+    return key.verifySignature(version, &d, parts);
+}
+
+test "server signature: TLS 1.2 ECDSA schemes name the hash, the key names the curve; TLS 1.3 binds both" {
+    // Go's server signs a TLS 1.2 ServerKeyExchange from a P-384 or P-521 key
+    // with ecdsa_secp256r1_sha256 (= ECDSA with SHA-256 in TLS 1.2, RFC 5246
+    // §7.4.1.4.1); std read it as a P-256 signature and failed with
+    // InvalidEncoding (tools/interop.zig, 2026-10-26). Signed by std (P-256,
+    // P-384) and by p521 (std has no P-521; Go's server covers it live).
+    const five_c: [32]u8 = @splat(0x5c);
+    const parts = [_][]const u8{ "client random+server random", &five_c };
+    const content = "client random+server random" ++ five_c;
+    const Sha256 = crypto.hash.sha2.Sha256;
+    const Sha384 = crypto.hash.sha2.Sha384;
+    inline for (.{
+        .{ crypto.sign.ecdsa.Ecdsa(crypto.ecc.P384, Sha256), tls.SignatureScheme.ecdsa_secp256r1_sha256, tls.SignatureScheme.ecdsa_secp384r1_sha384 },
+        .{ crypto.sign.ecdsa.Ecdsa(crypto.ecc.P256, Sha384), tls.SignatureScheme.ecdsa_secp384r1_sha384, tls.SignatureScheme.ecdsa_secp256r1_sha256 },
+        .{ p521.Ecdsa(Sha256), tls.SignatureScheme.ecdsa_secp256r1_sha256, tls.SignatureScheme.ecdsa_secp521r1_sha512 },
+        .{ p521.Ecdsa(crypto.hash.sha2.Sha512), tls.SignatureScheme.ecdsa_secp521r1_sha512, tls.SignatureScheme.ecdsa_secp521r1_sha512 },
+    }) |case| {
+        const E = case[0];
+        const scheme = case[1];
+        const native = case[2];
+        const kp = try E.KeyPair.generateDeterministic(@as([E.KeyPair.seed_length]u8, @splat(0x42)));
+        var key: CertificatePublicKey = undefined;
+        try key.init(.X9_62_id_ecPublicKey, &kp.public_key.toUncompressedSec1());
+        var der_buf: [E.Signature.der_encoded_length_max]u8 = undefined;
+        const sig = (try kp.sign(content, null)).toDer(&der_buf);
+        try testServerSignatureIn(.tls_1_2, &key, scheme, sig, &parts);
+        try std.testing.expectError(error.SignatureVerificationFailed, testServerSignatureIn(.tls_1_2, &key, scheme, sig, &.{ "other", &five_c }));
+        // TLS 1.3: only the scheme of the key's own curve.
+        if (scheme == native)
+            try testServerSignatureIn(.tls_1_3, &key, scheme, sig, &parts)
+        else
+            try std.testing.expectError(error.TlsBadSignatureScheme, testServerSignatureIn(.tls_1_3, &key, scheme, sig, &parts));
+    }
 }
 
 test "server signature: a genuine P-256 / P-384 / RSA-PSS / PKCS#1 signature verifies, a damaged one does not" {

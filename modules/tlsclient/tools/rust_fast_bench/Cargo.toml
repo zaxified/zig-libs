@@ -1,0 +1,24 @@
+[package]
+name = "tlsclient_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-tlsclient`
+# (modules/tlsclient/tools/bench.zig): a rustls 0.23.43 (Apache-2.0 OR ISC OR
+# MIT) CLIENT over aws-lc-rs 1.18.0, pinned exactly -- the same crates as
+# tlsserver's `tools/rust_bench` (Cargo.lock copied from there). Features: the
+# aws-lc-rs provider, std, and rustls' default `prefer-post-quantum`
+# (X25519MLKEM768 first, as Go's and this module's default offer); no TLS 1.2,
+# no `ring`.
+[dependencies]
+rustls = { version = "=0.23.43", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["aws-lc-sys"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

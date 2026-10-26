@@ -54,8 +54,16 @@ X25519, P-256, P-384, P-521 with shares for the first two (a server wanting
 another asks with a HelloRetryRequest), OCSP and SCTs requested, TLS 1.2
 extended master secret and renegotiation_info offered, host names matched
 against SANs only (RFC 9525; an IP host against iPAddress SANs, sent without
-SNI). std's ClientHello stays reachable: `.groups = &tls.Client.std_groups,
-.key_share_groups = &tls.Client.std_groups` plus the four request flags off.
+SNI), a server's request for a client certificate answered with an empty
+Certificate when none is configured (std fails the handshake), and server
+keys on P-256, P-384 and P-521 verified with any ECDSA hash in TLS 1.2.
+std's ClientHello stays reachable: `.groups = &tls.Client.std_groups,
+.key_share_groups = &tls.Client.std_groups` plus the four request flags off
+(it differs from std's only by the three ECDHE_ECDSA suites and
+ecdsa_secp521r1_sha512).
+
+The behaviour is checked live against Go's: `zig build interop-tlsclient`
+runs 90 cases against Go's crypto/tls server and compares with Go's client.
 
 ```zig
 var storage: [16 * 1024]u8 = undefined;

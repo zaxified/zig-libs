@@ -1326,7 +1326,15 @@ noise	ReleaseFast	transport	1	6	1ac1ca9403f799f9	b4443cf65f6c3849
 # and Ed25519 internals; the 14 std P-384 signer contexts are gone. The cv
 # result changed: p384's P-384 signature is RFC 6979 exact, not std's bytes.
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
-tlsclient	ReleaseFast	kex	1	17	057a749537bcbdd7	18dc5af726922286
+# 2026-10-26 — X25519 onto `ct25519` (comb public key, MULX/ADX ladder): kex 17 -> 15.
+# --stacks by innermost frame: the two std X25519 ladder identity contexts gone,
+# zero ct25519/src frames; left = ML-KEM sampleUniformRejection 12 + P-256/P-384
+# scalar fromBytes range 2 (keygen.deterministicSecret) + p256 comb 1 (+ the
+# harness's printHex witness 2). cv unchanged (30), digest only (Client.zig).
+# 2026-10-26 (later) — ecdsa_secp521r1_sha512 offered + ECDSA verify by the key's
+# curve: counts unchanged (kex 15, cv 30); the kex output pin moved because the
+# ClientHello (one more signature scheme) and so the transcript and secrets did.
+tlsclient	ReleaseFast	kex	1	15	26885c287c03054e	69d580a9d811f34f
 # 2026-10-13 (S2 R6) — cv 18 -> 32: the harness also signs a TLS 1.2
 # handshake-messages digest (`.digest` input) with the P-256 and P-384 keys
 # under ECDSA+SHA384. The 14 new contexts are std's Ecdsa(P256, Sha384)
@@ -1339,7 +1347,7 @@ tlsclient	ReleaseFast	kex	1	17	057a749537bcbdd7	18dc5af726922286
 # its two contexts (`fromBytes`/`sign` in ed25519.zig under generateDeterministic/sign); the ECDSA
 # P-256/P-384 contexts are the same sites with `pcMul16 < mul` now the top frame (attribution).
 # No new site (normalised --stacks diff vs B0).
-tlsclient	ReleaseFast	cv	1	30	5913dd9dfbab52a1	a92e71f50313cf2b
+tlsclient	ReleaseFast	cv	1	30	34e1381e05733787	a92e71f50313cf2b
 # dtls (2026-10-10) — hs: in-memory PSK handshake (AES-128-GCM), the PSK
 # tainted on both sides; app: after an untainted handshake both directions'
 # record keys (key, IV, sn mask key) tainted, send/recv both ways under

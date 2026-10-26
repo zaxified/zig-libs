@@ -47,6 +47,12 @@
 //! Before timing anything a handshake with the right name must succeed and
 //! one with a wrong name must fail on our side. Arguments filter workloads by
 //! substring (no card line then).
+//!
+//! The fastest in the field: a rustls 0.23.43 client over aws-lc-rs 1.18.0
+//! (`tools/rust_fast_bench`, `cargo build --release --offline` with those
+//! crates in cargo's cache; the same crates tlsserver's bench uses), against
+//! the same Go server, counted the same way. It must pass its own `check`
+//! (right name accepted with TLS 1.3, wrong name refused) before timing.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -57,6 +63,8 @@ const Client = tlsclient.Client;
 const bench_name = "bench-tlsclient";
 const work_dir = ".zig-cache/bench-tlsclient";
 const go_dir = "modules/tlsclient/tools/go_bench";
+const fast_rs_manifest = "modules/tlsclient/tools/rust_fast_bench/Cargo.toml";
+const fast_rs_exe = "modules/tlsclient/tools/rust_fast_bench/target/release/tlsclient_fast_bench";
 const host = "bench.example.test";
 const kinds = [_][]const u8{ "ecdsa256", "rsa2048" };
 
@@ -173,19 +181,34 @@ pub fn main(init: std.process.Init) !u8 {
         } else |_| {}
     }
 
+    std.debug.print("{s}: building the rustls side ...\n", .{bench_name});
+    const fast = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the benchmark needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (fast.term != .exited or fast.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, fast.stderr });
+        return 1;
+    }
+    const alt_exe = try cwd.realPathFileAlloc(io, fast_rs_exe, arena);
+    try bench.foreignOnce(arena, io, bench_name, alt_exe, abs, "check");
+
     var ws: std.ArrayList(Work) = .empty;
     for (kinds, 0..) |k, i| {
         const name = try arena.print("handshake_{s}", .{k});
-        try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name });
+        try ws.append(arena, .{ .name = name, .op = .{ .kind = i }, .ref = name, .alt = name, .ref_exe = 0, .alt_exe = 1 });
     }
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/Go = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, alt_exe }, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
+    try w.print("reference: {s}\nalt: {s}\nworst ours/Go = {d:.3} (best {d:.3}); worst ours/fastest = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/tls client (handshake, client CPU) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/tls client (handshake, client CPU) · fastest {d:.2}× (the faster of Go and {s} per workload) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0, std.mem.trimEnd(u8, s.alt_banner, "\n") });
     try w.flush();
     return 0;
 }

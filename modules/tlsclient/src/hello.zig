@@ -33,10 +33,14 @@ pub const max_ticket_len = 2048;
 /// The longest HelloRetryRequest cookie echoed.
 pub const max_cookie_len = 2048;
 
-/// std's signature_algorithms list, in std's order.
+/// std's signature_algorithms list, in std's order, plus
+/// ecdsa_secp521r1_sha512 (zig-libs tlsclient, 2026-10-26: the P-521 server
+/// keys Go's client verifies; std's list lacked it, so a P-521-only TLS 1.3
+/// server had no scheme to sign with).
 pub const signature_algorithms = [_]tls.SignatureScheme{
     .ecdsa_secp256r1_sha256,
     .ecdsa_secp384r1_sha384,
+    .ecdsa_secp521r1_sha512,
     .rsa_pkcs1_sha256,
     .rsa_pkcs1_sha384,
     .rsa_pkcs1_sha512,

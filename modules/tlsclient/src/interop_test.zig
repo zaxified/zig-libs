@@ -406,16 +406,25 @@ test "interop: a CertificateRequest without our scheme gets an empty Certificate
     }
 }
 
-test "interop: defaults are std's -- a CertificateRequest without client_auth fails as in std" {
+test "interop: a CertificateRequest without client_auth gets an empty Certificate (Go's client); std's fails" {
+    // Until 2026-10-26 this client failed as std's does (TlsUnexpectedMessage),
+    // so a server that only REQUESTS a certificate (`-verify`, Go's
+    // RequestClientCert) was unreachable; `tools/interop.zig` found it.
     const io = testing.io;
     var tmp = try setUp(io);
     defer tmp.cleanup();
     var bundle = try rootBundle(io, tmp.dir);
     defer bundle.deinit(testing.allocator);
-    inline for (.{ Client, std.crypto.tls.Client }) |C| {
+    inline for (.{ .{ Client, Outcome.handshake_ok }, .{ std.crypto.tls.Client, Outcome.other_error } }) |c| {
         var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-verify", "1", "-CAfile", "client-ca.pem" });
         defer srv.stop(io);
-        try testing.expectEqual(Outcome.other_error, try handshake(C, io, srv.port, "good.example.test", &bundle));
+        try testing.expectEqual(c[1], try handshake(c[0], io, srv.port, "good.example.test", &bundle));
+    }
+    {
+        var srv = try Server.startWith(io, tmp.dir, "leaf.pem", "leaf.key.pem", "inter.pem", &.{ "-verify", "1", "-CAfile", "client-ca.pem", "-rev" });
+        defer srv.stop(io);
+        const s = try session(io, srv.port, &bundle, .{});
+        try testing.expectEqualStrings("olleh", s.echo[0..s.echo_len]);
     }
 }
 
@@ -1113,7 +1122,22 @@ fn clientHello(comptime C: type, out: []u8, alpn: []const []const u8) ![]const u
     return w.buffered();
 }
 
-test "std profile: with std's groups and shares the ClientHello is std's, plus the three ECDHE_ECDSA suites" {
+/// The extension of type `typ` in a ClientHello whose extensions block (its
+/// u16 length first) starts at `at`: offset of its type field and its whole
+/// length (4 + body).
+fn findExt(hello: []const u8, at: usize, typ: u16) !struct { at: usize, len: usize } {
+    const total = std.mem.readInt(u16, hello[at..][0..2], .big);
+    var i = at + 2;
+    while (i < at + 2 + total) {
+        const t = std.mem.readInt(u16, hello[i..][0..2], .big);
+        const n = std.mem.readInt(u16, hello[i + 2 ..][0..2], .big);
+        if (t == typ) return .{ .at = i, .len = 4 + n };
+        i += 4 + n;
+    }
+    return error.TestExtensionMissing;
+}
+
+test "std profile: with std's groups and shares the ClientHello is std's, plus the three ECDHE_ECDSA suites and ecdsa_secp521r1_sha512" {
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
     const ours = try clientHello(Client, &a, &.{});
@@ -1127,12 +1151,29 @@ test "std profile: with std's groups and shares the ClientHello is std's, plus t
     // Ours = std's with 6 bytes of suites inserted after std's last suite
     // (which ones depends on AES hardware, as std's order does) ...
     const ins = cs + 2 + n_std;
-    try testing.expectEqualSlices(u8, theirs[ins..], ours[ins + 6 ..]);
     const ecdsa = [_]u16{ 0xC02B, 0xC02C, 0xCCA9 };
     for (0..3) |i| try testing.expect(std.mem.findScalar(u16, &ecdsa, std.mem.readInt(u16, ours[ins + 2 * i ..][0..2], .big)) != null);
-    // ... and the three length fields in front of it grown by 6.
-    try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 6, std.mem.readInt(u16, ours[3..5], .big));
-    try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 6, std.mem.readInt(u24, ours[6..9], .big));
+    // ... the compression methods the same, and in the extensions only
+    // signature_algorithms differs: ecdsa_secp521r1_sha512 (0x0603) after
+    // ecdsa_secp384r1_sha384 (0x0503), 2026-10-26.
+    try testing.expectEqualSlices(u8, theirs[ins..][0..2], ours[ins + 6 ..][0..2]);
+    const ext_t = ins + 2;
+    const ext_o = ins + 6 + 2;
+    try testing.expectEqual(std.mem.readInt(u16, theirs[ext_t..][0..2], .big) + 2, std.mem.readInt(u16, ours[ext_o..][0..2], .big));
+    const sig_t = try findExt(theirs, ext_t, 0x000d);
+    const sig_o = try findExt(ours, ext_o, 0x000d);
+    try testing.expectEqual(sig_t.at - ext_t, sig_o.at - ext_o);
+    try testing.expectEqual(sig_t.len + 2, sig_o.len);
+    const list_t = theirs[sig_t.at + 6 .. sig_t.at + sig_t.len];
+    const list_o = ours[sig_o.at + 6 .. sig_o.at + sig_o.len];
+    try testing.expectEqualSlices(u8, list_t[0..4], list_o[0..4]); // 0x0403 0x0503
+    try testing.expectEqualSlices(u8, "\x06\x03", list_o[4..6]);
+    try testing.expectEqualSlices(u8, list_t[4..], list_o[6..]);
+    try testing.expectEqualSlices(u8, theirs[ext_t + 2 .. sig_t.at], ours[ext_o + 2 .. sig_o.at]);
+    try testing.expectEqualSlices(u8, theirs[sig_t.at + sig_t.len ..], ours[sig_o.at + sig_o.len ..]);
+    // ... and the length fields in front grown by 6 + 2.
+    try testing.expectEqual(std.mem.readInt(u16, theirs[3..5], .big) + 8, std.mem.readInt(u16, ours[3..5], .big));
+    try testing.expectEqual(std.mem.readInt(u24, theirs[6..9], .big) + 8, std.mem.readInt(u24, ours[6..9], .big));
     try testing.expectEqualSlices(u8, theirs[9..cs], ours[9..cs]);
     try testing.expectEqualSlices(u8, theirs[cs + 2 .. ins], ours[cs + 2 .. ins]);
 }
