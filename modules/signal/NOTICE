@@ -104,37 +104,33 @@ translated or vendored into this repository, `build.zig.zon` gains no
 dependency, and the modified checkout is never redistributed; what is
 recorded are numeric HMAC/HKDF outputs of a PUBLIC specification for fixed
 inputs, each equally derivable from the spec text plus any HMAC/HKDF
-implementation. This is the same posture, for the same reason, under which
-this module already carries libsignal's XEdDSA known-answer vector below.
+implementation: libsignal's output over our inputs, the root `NOTICE` §0
+oracle case. (The XEdDSA known answer below no longer comes from libsignal.)
 Note that the "No GPL/LGPL/AGPL source was consulted or copied" line above
 has, since the XEdDSA pass, meant "copied" — reading was already disclosed
 there and is disclosed here.
 
-For XEdDSA, `src/kat_test.zig` embeds the known-answer vector from
-libsignal's own test suite (`test_curve25519_signature` in
-libsignal-protocol-c's `tests/test_curve25519.c`, GPLv3; the identical
-bytes ship in libsignal-protocol-java): one private key, its public key,
-one 33-byte message, and one 64-byte signature. These are NUMERIC FACTS
-(a keypair and a signature over a fixed message), not copyrightable
-expression — no libsignal code was ported, copied, or adapted. During
-the XEdDSA implementation pass, libsignal's Rust `curve25519.rs`
-(AGPL-3.0) and the C test file above were READ solely to (a) source that
-vector and (b) establish the FACT — stated verbatim in the Rust file's
-own doc comment — that deployed libsignal deviates from the XEdDSA paper
-by carrying the signer's Edwards sign bit in the top bit of `s` instead
-of forcing sign 0. This module's implementation itself was written from
-the specification text (already fully transcribed into `xeddsa.zig`'s
-doc comments during the scaffold pass, before any libsignal source was
-looked at). `xeddsa.zig` now ships BOTH conventions as distinct, explicit
-call sites: top-level `sign`/`verify` implement the PAPER's convention
-unchanged, and the `xeddsa.libsignal` namespace implements the deployed
-variant identified above — see `xeddsa.zig`'s module doc comment and
-`SPEC.md`. Both `sign`s are additionally cross-checked (`sign` against
-`std.crypto.sign.Ed25519`'s independent verifier, MIT, part of Zig; the
-`libsignal.sign`/`verify` pair against each other and against the
-libsignal vector) — no libsignal code was ported into either
-implementation; only the numeric vector and the documented sign-bit fact
-were taken from it.
+For XEdDSA, `src/kat_test.zig` uses `src/xeddsa_kat_vector.zig`, generated
+by `tools/gen_xeddsa_kat.py` (MIT, Python standard library only) over our
+own key, message and nonce, signed in both variants by that independent
+oracle. Until 2026-10-26 the file embedded instead the known-answer vector
+from libsignal's own test suite (`test_curve25519_signature` in
+libsignal-protocol-c's `tests/test_curve25519.c`, GPLv3); it was removed
+because copyleft-licensed data may not live in this repository (root
+`NOTICE` §1), and nothing of it remains. During the XEdDSA implementation
+pass, libsignal's Rust `curve25519.rs` (AGPL-3.0) and that C test file were
+READ solely to (a) source that vector and (b) establish the FACT — stated
+verbatim in the Rust file's own doc comment — that deployed libsignal
+deviates from the XEdDSA paper by carrying the signer's Edwards sign bit in
+the top bit of `s` instead of forcing sign 0. This module's implementation
+itself was written from the specification text (already fully transcribed
+into `xeddsa.zig`'s doc comments during the scaffold pass, before any
+libsignal source was looked at). `xeddsa.zig` ships BOTH conventions as
+distinct, explicit call sites: top-level `sign`/`verify` implement the
+PAPER's convention unchanged, and the `xeddsa.libsignal` namespace
+implements the deployed variant identified above — see `xeddsa.zig`'s
+module doc comment and `SPEC.md`. No libsignal code was ported into either
+implementation; only the documented sign-bit fact was taken from it.
 
 What was taken from libsignal, and how that was checked
 --------------------------------------------------------
@@ -146,7 +142,7 @@ interoperability and numeric test data — never code:
     variant; the specification forces sign 0 instead);
   - libsignal's application-defined `KDF_RK` info string, used only by the
     interop tests (this module's own constant is different);
-  - numeric test vectors (the XEdDSA known-answer vector; the KDF outputs in
+  - numeric test vectors (the KDF outputs in
     `src/interop_vectors.zig`, produced by our own driver
     `tools/libsignal_dump.rs`, which calls libsignal and prints what it
     returns — it checks results the specification already fixes).

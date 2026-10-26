@@ -37,10 +37,10 @@ variant (signer's Edwards sign bit forced to 0); `xeddsa.libsignal.sign`/
 `xeddsa.libsignal.verify` are deployed libsignal's variant (natural-sign
 key, sign bit smuggled in `s`'s top bit), for a caller that needs to
 interoperate with real Signal clients/servers. The two are
-wire-incompatible for ~half of all keys, and `src/kat_test.zig` pins
-libsignal's own test vector — whose key is itself sign-1 — as an external
-anchor accepted byte-exactly by `xeddsa.libsignal.verify` and rejected by
-the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
+wire-incompatible for ~half of all keys, and `src/kat_test.zig` pins a
+known answer from an independent Python oracle — whose key is sign-1 —
+reproduced byte for byte by both signers, accepted by
+`xeddsa.libsignal.verify` and rejected by the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
 
 | File | Contents |
 |---|---|
@@ -50,7 +50,7 @@ the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
 | `src/ratchet.zig` | Double Ratchet `State` (`initAlice`/`initBob`/`encrypt`/`decrypt`), `Header`/`Message` + header codec, `KDF_RK`/`KDF_CK`, DH + symmetric-key ratchets, `max_skip`-bounded skipped-key store, transactional decrypt; full-session / out-of-order / MAX_SKIP / tamper tests |
 | `src/pqxdh.zig` | PQXDH (Part 3): `KemPreKey`, `PreKeyBundle`/`InitialMessage`, the four-DH + ML-KEM-1024 + HKDF agreement (`initiateUnverified`/`respond`), fail-closed `initiate`, `generateKemPreKey`; **no wire codec** — a caller transmitting a PQXDH bundle writes their own |
 | `src/interop_vectors.zig` | The Double Ratchet's `KDF_CK`/`KDF_RK` vectors captured from libsignal, and PQXDH's KDF-chain vectors from `tools/pqxdh-kdf-check.py` — see each block's doc comment for which is which and what class of anchor it is |
-| `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; the libsignal known-answer vector as an external anchor exercised against BOTH variants (`xeddsa.libsignal.verify` byte-exact accept + 64-tamper rejection, `xeddsa.verify` reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
+| `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; an independent-oracle known answer exercised against BOTH variants (both signers byte-exact, `xeddsa.libsignal.verify` accept + 64-tamper rejection, `xeddsa.verify` reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
 
 ## Import
 

@@ -41,8 +41,8 @@
 //! deployed libsignal's documented deviation instead (natural-sign key,
 //! sign bit smuggled in `s`'s top bit) — a caller names one or the other
 //! explicitly, there is no default. See `xeddsa.zig`'s module doc comment
-//! for the variant note and `src/kat_test.zig` for how the libsignal
-//! known-answer vector anchors BOTH.
+//! for the variant note and `src/kat_test.zig` for how an independent
+//! oracle's known answer anchors BOTH.
 //!
 //! Consumer: an end-to-end-encrypted messaging application — a client
 //! fetches a recipient's `PreKeyBundle` from a directory/coordination

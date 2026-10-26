@@ -40,9 +40,8 @@
 //! `xeddsa.sign`/`xeddsa.verify` or `xeddsa.libsignal.sign`/
 //! `xeddsa.libsignal.verify`, so which wire format is in play is always
 //! visible at the call site — see `kat_test.zig`, which pins BOTH
-//! variants against libsignal's own published test vector (whose key is
-//! itself a natural-sign-1 key, the exact case the spec variant cannot
-//! handle). See `SPEC.md` for the threat-model caveat (key reuse across
+//! variants against an independent oracle's known answer (whose key is a
+//! natural-sign-1 key, the exact case the spec variant cannot handle). See `SPEC.md` for the threat-model caveat (key reuse across
 //! DH and signing contexts) this scheme deliberately accepts.
 //!
 //! Constant-time posture: `sign` handles the secret scalar exclusively
@@ -525,8 +524,8 @@ test "sign-0 convention agrees end-to-end: verify's recovered A == sign's forced
 }
 
 test "libsignal variant round-trips (self-consistency, both sign-bit branches) and s carries the natural sign bit" {
-    // In-house re-derivation, not an external anchor (the libsignal KAT
-    // vector's sign-1 anchor lives in kat_test.zig): confirms
+    // In-house re-derivation, not an external anchor (the KAT's sign-1
+    // anchor lives in kat_test.zig): confirms
     // naturalKeyPair's UNFORCED public point is exactly what
     // libsignal.sign/verify agree on, for both sign-bit branches, and
     // that the smuggled bit in s[63] matches the signer's natural sign.
