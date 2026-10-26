@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — Audit of the `memcpy` source (independent review + 46-mutant
+  schemata run: 40 killed, 6 equivalent, no defect). `copy`'s 32–256 B arm no
+  longer keeps its vectors in an `undefined` array (safe builds could fill it
+  through a `memset` call); the `rep` paths require 64-bit pointers (x32 ABI).
+  New tests: seeded model-fuzz of `set` and `copy` against the C definition,
+  PROT_NONE guard pages around source and destination, negative `c`. No API
+  change.
 - **2026-10-26** — New: `copy` and the C `memcpy`, and `exportSymbols` now
   exports `memcpy` too (a consumer that already calls it gets the faster copy on
   its next build). Against Zig 0.17.0's compiler_rt `memcpy` 1.1–2.0× faster,

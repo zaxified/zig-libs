@@ -106,16 +106,16 @@ pub fn copy(noalias dest: [*]u8, noalias src: [*]const u8, len: usize) void {
     if (len < 32) return copySmall(dest, src, len);
     // Up to 8 vectors: the first k and the last k, overlapping in the middle,
     // no loop and no alignment arithmetic.
+    // Each pair is loaded and stored before the next: the ranges do not overlap
+    // (`noalias`), so nothing a store writes is read later -- and no array of
+    // vectors, which safe builds would fill with 0xAA through a `memset` call.
     inline for (.{ 1, 2, 4 }) |k| {
         if (len <= 2 * k * 32) {
-            var v: [2 * k]V = undefined;
             inline for (0..k) |j| {
-                v[j] = load(V, src + 32 * j);
-                v[k + j] = load(V, src + len - 32 * (k - j));
-            }
-            inline for (0..k) |j| {
-                store(V, dest + 32 * j, v[j]);
-                store(V, dest + len - 32 * (k - j), v[k + j]);
+                const head = load(V, src + 32 * j);
+                const tail = load(V, src + len - 32 * (k - j));
+                store(V, dest + 32 * j, head);
+                store(V, dest + len - 32 * (k - j), tail);
             }
             return;
         }
@@ -170,7 +170,9 @@ const stos_min = 192 * 1024;
 
 // Not under the C backend: it would have to spell the register constraints
 // in C, and nothing there is measured.
-const use_stos = builtin.cpu.arch == .x86_64 and builtin.zig_backend != .stage2_c;
+// 64-bit pointers only: under the x32 ABI the register constraints would take a
+// 32-bit pointer.
+const use_stos = builtin.cpu.arch == .x86_64 and @sizeOf(usize) == 8 and builtin.zig_backend != .stage2_c;
 
 /// `set` for `len >= stos_min` on x86-64: the same unaligned head and tail
 /// vectors, and the 32-aligned middle by `rep stosq`. The last qword ends at
@@ -394,6 +396,83 @@ test "copy: the rep-movsb path writes exactly its range" {
     }
 }
 
+/// Length for one model-fuzz case, drawn arm by arm so that every arm of `set`
+/// and `copy` is hit as often as the others: below one vector, each overlap
+/// width k = 1, 2, 4, the vector loop, the string-move range (`copy`), and for
+/// `set` past `stos_min`.
+fn fuzzLen(rnd: std.Random, arm: usize) usize {
+    return switch (arm) {
+        0 => rnd.uintLessThan(usize, 32),
+        1 => 32 + rnd.uintLessThan(usize, 33), // 32..64
+        2 => 65 + rnd.uintLessThan(usize, 64), // 65..128
+        3 => 129 + rnd.uintLessThan(usize, 128), // 129..256
+        4 => 257 + rnd.uintLessThan(usize, movs_min - 257), // the loop
+        5 => movs_min + rnd.uintLessThan(usize, 3 * movs_min), // rep movsb
+        else => stos_min + rnd.uintLessThan(usize, 4096), // rep stosq
+    };
+}
+
+const fuzz_guard = 128;
+
+fn guardByte(i: usize) u8 {
+    return @truncate((i *% 0x9E3779B1) >> 13);
+}
+
+/// Model-fuzz: seeded random lengths (per arm), destination and source offsets
+/// 0..127, fill byte and contents; every byte of the range compared with the
+/// definition (C11 7.24.2.1 / 7.24.6.1) and `fuzz_guard` bytes on either side
+/// checked untouched. The model is per-position reads, never a copy loop: in
+/// a test binary that runs the export test, a copy loop would be this module.
+fn modelFuzz(comptime op: enum { set, copy }, seed: u64, cases: usize) !void {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const max_len = if (op == .set) stos_min + 4096 else 4 * movs_min;
+    const cap = max_len + 128 + 2 * fuzz_guard;
+    const dst = try testing.allocator.alignedAlloc(u8, .@"64", cap);
+    defer testing.allocator.free(dst);
+    const src = try testing.allocator.alignedAlloc(u8, .@"64", cap);
+    defer testing.allocator.free(src);
+    const arms: usize = if (op == .set) 7 else 6;
+    var hits: [7]usize = @splat(0);
+    for (0..cases) |case| {
+        // The string-store arm costs ~200 KiB per case: one case in sixteen.
+        var arm = rnd.uintLessThan(usize, arms);
+        if (arm == 6 and rnd.uintLessThan(u8, 16) != 0) arm = 4;
+        const len = fuzzLen(rnd, arm);
+        const d_off = fuzz_guard + rnd.uintLessThan(usize, 128);
+        const s_off = rnd.uintLessThan(usize, 128);
+        const c = rnd.int(u8);
+        for (dst[d_off - fuzz_guard .. d_off + len + fuzz_guard], d_off - fuzz_guard..) |*b, i| b.* = guardByte(i);
+        if (op == .copy) rnd.bytes(src[s_off..][0..len]);
+        switch (op) {
+            .set => set(dst[d_off..].ptr, c, len),
+            .copy => copy(dst[d_off..].ptr, src[s_off..].ptr, len),
+        }
+        for (dst[d_off - fuzz_guard .. d_off + len + fuzz_guard], d_off - fuzz_guard..) |b, i| {
+            const inside = i >= d_off and i < d_off + len;
+            const want: u8 = if (!inside) guardByte(i) else switch (op) {
+                .set => c,
+                .copy => src[s_off + i - d_off],
+            };
+            if (b != want) {
+                std.debug.print("fastmem model-fuzz {s}: seed=0x{x} case={d} arm={d} len={d} d_off={d} s_off={d} i={d}: got {x}, want {x}\n", .{ @tagName(op), seed, case, arm, len, d_off - fuzz_guard, s_off, i, b, want });
+                return error.TestUnexpectedResult;
+            }
+        }
+        hits[arm] += 1;
+    }
+    // Reach: every arm ran.
+    for (hits[0..arms]) |h| try testing.expect(h > 0);
+}
+
+test "model-fuzz: set matches the memset definition on random lengths, offsets and fill bytes" {
+    try modelFuzz(.set, 0x666173746d656d31, 3000);
+}
+
+test "model-fuzz: copy matches the memcpy definition on random lengths, offsets and contents" {
+    try modelFuzz(.copy, 0x666173746d656d32, 3000);
+}
+
 test "memcpy: C semantics -- returns dest, len 0 accepts null and touches nothing" {
     var a: [40]u8 = @splat(1);
     const b: [40]u8 = @splat(2);
@@ -408,6 +487,45 @@ test "memset: C semantics -- returns dest, takes the low byte of c, len 0 touche
     for (a) |b| try testing.expectEqual(@as(u8, 0xFF), b);
     try testing.expectEqual(@as(?[*]u8, &a), memset(&a, 0, 0));
     for (a) |b| try testing.expectEqual(@as(u8, 0xFF), b);
+    // A negative `c` is converted to unsigned char too: -1 -> 0xFF, -129 -> 0x7F.
+    for ([_]c_int{ -1, -129 }, [_]u8{ 0xFF, 0x7F }) |c, want| {
+        _ = memset(&a, c, 40);
+        for (a) |b| try testing.expectEqual(want, b);
+    }
+}
+
+test "copy, set: no access outside the range, against PROT_NONE pages on both sides" {
+    // [guard page][data pages][guard page]: a buffer placed flush against
+    // either guard faults on any load or store one byte outside it. Covers
+    // over-reads of `src`, which the guard-byte checks elsewhere cannot see.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const page = std.heap.page_size_min;
+    const data_len = std.mem.alignForward(usize, stos_min + 4096, page);
+    const map = try std.posix.mmap(null, data_len + 2 * page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(map);
+    try testing.expectEqual(@as(usize, 0), std.os.linux.mprotect(map.ptr, page, .{}));
+    try testing.expectEqual(@as(usize, 0), std.os.linux.mprotect(map.ptr + page + data_len, page, .{}));
+    const data = map[page..][0..data_len];
+    const other = try testing.allocator.alignedAlloc(u8, .@"64", data_len);
+    defer testing.allocator.free(other);
+    for (data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const lens = [_]usize{ 0, 1, 2, 3, 4, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4095, movs_min - 1, movs_min, movs_min + 1, 3 * movs_min + 5 };
+    for (lens) |len| {
+        for ([_]usize{ 0, data_len - len }) |at| {
+            // `src` flush against a guard.
+            copy(other.ptr, data.ptr + at, len);
+            for (other[0..len], 0..) |b, i| try testing.expectEqual(data[at + i], b);
+            // `dest` flush against a guard.
+            copy(data.ptr + at, other.ptr, len);
+            set(data.ptr + at, 0x3C, len);
+            for (data[at..][0..len]) |b| try testing.expectEqual(@as(u8, 0x3C), b);
+            for (data[at..][0..len], at..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        }
+    }
+    // `set` past `stos_min`, flush against both guards.
+    for ([_]usize{ stos_min, stos_min + 1, stos_min + 33 }) |len| {
+        for ([_]usize{ 0, data_len - len }) |at| set(data.ptr + at, 0x5A, len);
+    }
 }
 
 test "memset: len 0 accepts a null dest and dereferences nothing" {
