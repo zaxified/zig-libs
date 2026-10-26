@@ -24,7 +24,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
-| [ethereum/go-ethereum](https://github.com/ethereum/go-ethereum) (`core/vm` precompiles, `crypto/bn256`) — **reference** for EIP-196/197 | Go | LGPL-3.0 (repo; library part; source not read, its conformance vectors are the ones this module runs) | 51.4k | v1.17.6 (2026-09-23) | Defines what `ecAdd`/`ecMul`/`ecPairing` must return; the module is byte-exact against its `precompiles/*.json` vectors (per SPEC). |
+| [ethereum/go-ethereum](https://github.com/ethereum/go-ethereum) (`core/vm` precompiles, `crypto/bn256`) — **reference** for EIP-196/197 | Go | LGPL-3.0 (repo; library part; source not read; its conformance vectors were used until 2026-10-26 and removed for their licence) | 51.4k | v1.17.6 (2026-09-23) | Defines what `ecAdd`/`ecMul`/`ecPairing` must return; its `getData` padding behaviour is the reference for `padTo`. |
 | [Consensys/gnark-crypto](https://github.com/Consensys/gnark-crypto) `ecc/bn254` | Go | Apache-2.0 | 600 | v0.21.0 (2026-08-10) | The broad toolkit for BN254: groups, pairing, MSM, FFT, hash-to-curve, compressed serialization, KZG *(inferred, README not read)*; pairs with the gnark prover. |
 | [arkworks-rs/algebra](https://github.com/arkworks-rs/algebra) (`ark-bn254`) | Rust | Apache-2.0 (API; the arkworks crates are dual MIT/Apache, *inferred*) | 889 | pushed 2026-09-30 (latest tag v0.3.0, 2021) | Generic algebra traits; BN254 curve, compressed and uncompressed serialization, MSM *(inferred)*. |
 | [paritytech/bn](https://github.com/paritytech/bn) (`substrate-bn`) | Rust | Apache-2.0 | 36 | pushed 2024-01-18 | The EVM-precompile-oriented pure-Rust BN254 (add, mul, pairing, Groth16-style use); little maintenance *(inferred)*. |
@@ -32,7 +32,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | [ethereum/py_ecc](https://github.com/ethereum/py_ecc) | Python | MIT | 231 | v3.0.0 (2020-05-12), pushed 2025-12-17 | Not a competitor: the oracle this module's pairing KATs were generated from. |
 | Zig `std.crypto` | Zig | MIT | — | Zig 0.16.0 | No pairing-friendly curves. A GitHub search for BN254 in Zig found nothing. |
 
-**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against geth's own conformance vectors and a real snarkjs proof; constant-time scalar multiplication. **Where we are behind:** no compressed point encoding (EIP-196/197 have none; arkworks/gnark users expect one), no public MSM, no Groth16 prover, no hash-to-curve (→ Backlog).
+**Where we are ahead:** the only Zig BN254; the three EVM precompile entry points and a Groth16 verifier in one pure-Zig package, verified against an independent Python oracle over our own inputs and a snarkjs proof; constant-time scalar multiplication. **Where we are behind:** no compressed point encoding (EIP-196/197 have none; arkworks/gnark users expect one), no public MSM, no Groth16 prover, no hash-to-curve (→ Backlog).
 
 ## Purpose
 
@@ -431,9 +431,8 @@ to derive why the check is needed or how to build it.
 **Calldata padding.** EIP-196's own spec text ("Note about the change in
 the way points and outputs are represented") and go-ethereum's
 `core/vm/contracts.go` `getData(input, start, size)` helper (the de
-facto interoperable behavior every mainnet client matches, confirmed
-directly by several of the official `bn256Add.json` vectors below, e.g.
-`cdetrio3`/`cdetrio5`) together specify: calldata shorter than a
+facto interoperable behavior every mainnet client matches; read as a
+behaviour reference only) together specify: calldata shorter than a
 precompile's fixed input width is RIGHT-PADDED with zero bytes; calldata
 longer is TRUNCATED (only the needed prefix is read, any trailing bytes
 ignored). `padTo` (`precompiles.zig`) reproduces this with a single
@@ -469,49 +468,46 @@ caller's job.
 
 ## Part 5 — KAT sourcing
 
-Unlike Part 4 (no numeric worked example exists in EIP-196/197's spec
-text itself, forcing a `py_ecc`-computed oracle), Part 5's KAT vectors
-did not need to be generated at all: `ethereum/go-ethereum`'s own
-`core/vm/testdata/precompiles/bn256Add.json` / `bn256ScalarMul.json` /
-`bn256Pairing.json` (fetched directly from `raw.githubusercontent.com`,
-2026-07-15 — NOT hand-transcribed) are the authoritative, widely-shared
-precompile conformance vectors most mainnet clients (go-ethereum,
-besu, erigon, reth, nethermind) test against — a STRONGER provenance
-than Part 4's `py_ecc` oracle, since these are the actual EVM
-ecosystem's shared ground truth, not merely one independent
-implementation's output. All 49 vectors across the three files
-(16 `ecAdd`, 19 `ecMul`, 14 `ecPairing`) are embedded verbatim in
-`precompiles.zig`'s tests and checked byte-exact — see `NOTICE`'s item 5
-for the provenance/licensing accounting.
+`src/precompile_vectors.zig`, generated by `tools/gen_precompile_vectors.py`
+(`python3 modules/bn254/tools/gen_precompile_vectors.py >
+modules/bn254/src/precompile_vectors.zig`; fixed seed, a rerun reproduces
+the file byte for byte). The inputs are our own: fixed-seed scalars times
+the EIP-196/197 generators. The expected `ecAdd`/`ecMul` outputs come from
+the generator's own affine BN254 arithmetic, written from the curve
+equations with the Python standard library only — a second implementation
+that shares no code with the Zig tower. `ecPairing` needs no pairing in
+Python: a TRUE vector is `n-1` random pairs `(a_i·G1, b_i·G2)` closed by
+`(-(Σ a_i·b_i)·G1, G2)`, whose product is 1 by bilinearity; a FALSE vector
+doubles that closing point, leaving a non-trivial power of `e(G1, G2)`
+(non-degeneracy).
 
-**Coverage the vector set provides "for free"**, without any
-self-constructed input needed:
-- `ecAdd`'s short-input zero-padding (`cdetrio2`/`cdetrio3`/`cdetrio4`
-  [empty input] /`cdetrio8`) and long-input truncation
-  (`cdetrio5`/`cdetrio7`/`cdetrio10`/`cdetrio12`/`cdetrio14`) regimes,
-  with REAL calldata exercising `padTo`'s equivalence argument above,
-  not just the trivial `padTo`-of-empty-input case.
-- `ecMul`'s scalar handling across small (`9`, `1`), maximal
-  (`0xffff...ff`, wider than `r`), and exactly-`r`-ish (`cdetrio2`,
-  scalar `= r-1`) magnitudes, plus `zeroScalar` (`[0]P = O`).
-- `ecPairing`'s BOTH branches from OFFICIAL vectors, satisfying the task
-  brief's "true AND false" requirement without any self-constructed
-  pairing input: `jeff1`-`jeff5`, `empty_data` (`k=0`), `two_point_match
-  _2/3/4`, `ten_point_match_1/2/3` are official TRUE vectors;
-  `jeff6` and `one_point` (`e(G1,G2) != 1`, a single non-trivial pair)
-  are official FALSE vectors. `empty_data` independently confirms the
-  `k=0 -> true` empty-product rule this file's `ecPairingCheck` doc
-  comment states.
+Until 2026-10-26 these KATs were go-ethereum's
+`core/vm/testdata/precompiles/bn256*.json` tables (LGPL-3.0), embedded
+verbatim. They were removed because copyleft-licensed data may not live in
+this repository (root `NOTICE` §1); see `NOTICE` item 5.
 
-**What the official vector set does NOT cover, and how this module
+**Coverage:**
+- `ecAdd`: two distinct points, doubling, `P + (-P) = O`, infinity on
+  either side, the generator doubled; short calldata right-padded (`empty`,
+  `short_64_one_point`, `short_96_zero_tail`) and long calldata truncated
+  (`long_trailing_bytes`).
+- `ecMul`: scalars `0`, `1`, `r-1`, `r`, `r+1`, `2^256-1` (wider than `r`)
+  and a random one; the point at infinity; short calldata (`empty`,
+  `short_64_no_scalar`, `short_80_half_scalar` — the right-padded scalar is
+  `s·2^128`) and long calldata (`long_trailing_bytes`).
+- `ecPairing`: TRUE — `empty` (`k=0`), `two_pairs_balanced`,
+  `ten_pairs_balanced` (1920 octets), an infinity `G1` or `G2` operand, a
+  balanced set plus an infinity pair; FALSE — `one_pair_generators`,
+  `two_pairs_unbalanced`, `ten_pairs_unbalanced`.
+
+**What the KAT set does NOT cover, and how this module
 covers it instead** (both self-constructed, both clearly labeled as
 such — self-consistency checks against this module's OWN prior test
 constructions, not independent oracles):
 - **The mandatory `G2` subgroup-check firing inside the precompile
-  path.** No go-ethereum vector exercises an on-curve-but-outside-
+  path.** No KAT vector exercises an on-curve-but-outside-
   subgroup `G2` operand (real-world calldata from a functioning client
-  never produces one; the official test suite is a conformance suite,
-  not an adversarial-input fuzz corpus). `precompiles.zig`'s own test
+  never produces one, and the generator only builds subgroup points). `precompiles.zig`'s own test
   ("ecPairingCheck: on-twist-but-not-in-subgroup G2 operand is
   rejected") reuses the EXACT non-subgroup point `g2.zig`'s Part 3 test
   already constructed and independently verified in Python (`x = u`,
@@ -525,9 +521,8 @@ constructions, not independent oracles):
   rests on (see above) — it is exercised, not merely asserted in a
   comment.
 - **`ecPairing`'s `error.BadLength` precondition** (length not a
-  multiple of 192) — no official vector is malformed this way (all 14
-  `bn256Pairing.json` inputs are exact multiples of 192: `0, 192, 384,
-  576, 1920`), so `precompiles.zig` adds a direct self-constructed test
+  multiple of 192) — no KAT vector is malformed this way (every
+  pairing input is an exact multiple of 192), so `precompiles.zig` adds a direct self-constructed test
   (lengths `100` and `191`) confirming the rejection.
 - **`ecAdd`/`ecPairing` coordinate `>= p` and off-curve-point rejection**
   — covered by adapting `g1.zig`'s own already-independently-verified
@@ -560,8 +555,8 @@ one of which matches the standard snarkjs/Ethereum-verifier convention),
 and (3) wire the `IC[0] + Σ pub[i]·IC[i]` accumulation correctly. All
 three were CONFIRMED against a byte-exact, independently-computed KAT
 (below), not merely asserted — see `groth16.zig`'s own "KAT provenance"
-doc comment for the `py_ecc` cross-check that pinned the sign
-convention specifically.
+doc comment, and the "negated A" tamper test that shows the other sign
+fails.
 
 **The verification equation** — `e(A,B) == e(α,β)·e(vk_x,γ)·e(C,δ)`,
 checked as the single product `e(-A,B)·e(α,β)·e(vk_x,γ)·e(C,δ) == 1` via
@@ -588,86 +583,29 @@ FALSE"/"rejected" rather than distinguishing them.
 
 ### Part 6 — KAT provenance
 
-The positive vector (a proof that verifies TRUE) is a REAL,
-independently-sourced snarkjs-produced Groth16/BN254 proof, NOT
-self-generated by this module or its author (a self-made proof would
-only prove self-consistency, not correctness against an independent
-implementation — the task's own explicit non-goal for the positive
-vector). Source: the Dark Forest v0.3 game's "move" circuit (a
-proof-of-visibility zk-SNARK; Dark Forest is a well-known, widely-cited
-production zkSNARK dApp from the Ethereum zk community),
-`github.com/darkforest-eth/darkforest-v0.3`, path `circuits/move/`,
-commit `1c83685e22e0463d5481c83e21616745b3204c9c` (fetched 2026-07-15):
-`verification_key.json` (`nPublic: 5`, 6 `IC` points), `proof.json`
-(`pi_a`/`pi_b`/`pi_c`), `public.json` (5 public-input integers).
+The positive vector is a snarkjs-produced Groth16/BN254 proof over a
+circuit of our own: the `groth16` module's fixture `t.circom`
+(`out <== a*b*c + a`, `a` public), whose `vk.json`/`proof.json`/
+`public.json` live in `groth16/src/testdata/snarkjs/` (`nPublic: 2`, 3
+`IC` points). snarkjs and circom (GPL-3.0) were run as black boxes by
+`groth16/tools/snarkjs/gen.sh`, and snarkjs's own `groth16 verify` printed
+OK on this proof; only their output over our circuit and witness is kept
+(root `NOTICE` §0). The proof is not produced by this module, so it still
+checks `verify` against an independent prover. The values are copied from
+the JSON files by script.
 
-**Field-name vintage, not a different protocol.** The JSON's field names
-(`vk_alfa_1`/`vk_beta_2`/`vk_gamma_2`/`vk_delta_2`/`IC`,
-`"protocol": "groth"`) are an EARLY snarkjs naming convention (before the
-protocol string was renamed to `"groth16"`) for the SAME construction
-this file implements — confirmed structurally (the `vk_alfabeta_12`
--shaped verifying key and the `IC`-indexed public-input commitment
-exactly match `groth16.zig`'s own "verification equation" doc comment)
-AND numerically (below), not merely assumed from the naming.
+**Coordinate ordering — the snarkjs footgun.** `vk.json`/`proof.json`'s
+`Fp2` values (`vk_beta_2`, `vk_gamma_2`, `vk_delta_2`, `pi_b`) are nested
+`[c0, c1]` arrays in MATH order (real part first). `groth16.zig`'s
+`fp2FromDecimal` reads index 0 as `c0` and index 1 as `c1` DIRECTLY — the
+OPPOSITE of `g2.zig`'s EIP-197 byte-codec order (`c1||c0`,
+imaginary-first). A swapped reading lands off the twist, which `verify`'s
+own `isOnCurve`/`subgroupCheck` guards turn into `false`.
 
-**Independently re-verified with `py_ecc` before being trusted as this
-file's KAT** — a THIRD implementation, sharing no code with either
-this module's own Zig field/pairing tower or snarkjs/circom's prover, so
-it cannot share a bug with either side:
-- A standalone Python script (venv-installed `py_ecc`, 2026-07-15)
-  parsed the three JSON files, confirmed `vk_alfa_1`/`vk_beta_2`/
-  `vk_gamma_2`/`vk_delta_2`/every `IC` entry AND the proof's `A`/`B`/`C`
-  are each on their respective curve (`py_ecc.bn128.is_on_curve`).
-- Computed `vk_x = IC[0] + Σ pub[i]·IC[i]` with `py_ecc`'s own EC
-  arithmetic (`multiply`/`add`), confirmed on-curve.
-- Confirmed `pairing(B, A) == pairing(beta, alpha) * pairing(gamma,
-  vk_x) * pairing(delta, C)` (the two-sided form) AND the single-product
-  form `pairing(B, -A) * pairing(beta, alpha) * pairing(gamma, vk_x) *
-  pairing(delta, C) == FQ12.one()` — i.e. the EXACT sign convention
-  (negate `A`, not `C`/`vk_x`) `groth16.zig`'s `verify` implements,
-  confirmed to be the one that makes THIS specific real proof verify
-  TRUE (py_ecc's `pairing(Q, P)` computes `e(P, Q)`, so this is
-  literally `e(-A,B)·e(α,β)·e(vk_x,γ)·e(C,δ) == 1` in this module's own
-  `e(P,Q)` convention).
-- Confirmed every tamper case `groth16.zig`'s tests exercise fails the
-  equation in Python FIRST: `A.x+1`/`C.y+1`/`B.x.c0+1` each land
-  OFF-curve (`py_ecc.is_on_curve` false, `py_ecc`'s own pairing raises on
-  such input — mirroring this file's `isOnCurve`/`subgroupCheck`
-  rejection path); negating `A` or `C` (an ON-curve, well-formed but
-  WRONG point) makes the pairing PRODUCT `!= FQ12.one()`; `pub[0]+1`
-  (still `< r`, a valid `Fr` value) changes `vk_x` and likewise breaks
-  the product.
-
-**Coordinate ordering — the snarkjs footgun, confirmed not merely
-assumed.** `verification_key.json`/`proof.json`'s `Fp2` values
-(`vk_beta_2`, `vk_gamma_2`, `vk_delta_2`, `pi_b`) are nested `[c0, c1]`
-arrays in MATH order (real part first). `groth16.zig`'s `fp2FromDecimal`
-reads the JSON's index-0 element as `c0` and index-1 as `c1` DIRECTLY —
-the OPPOSITE of `g2.zig`'s EIP-197 byte-codec order (`c1||c0`,
-imaginary-first). The Python cross-check above used the identical
-`(c0, c1)` = `(arr[0], arr[1])` reading (`FQ2([c0, c1])`, `py_ecc`'s own
-convention) and got a proof that verifies TRUE; swapping the reading to
-`(c1, c0)` was tried during KAT development and confirmed the footgun is
-real (not hypothetical): every swapped-order `Fp2` value (`beta`,
-`gamma`, `delta`, `B`) landed OFF the twist entirely
-(`py_ecc.is_on_curve` false for all four) rather than merely producing a
-wrong-but-plausible point — a wrong `c0`/`c1` reading fails loudly here,
-which is exactly why this module's OWN `isOnCurve`/`subgroupCheck`
-guards inside `verify` are load-bearing, not redundant. See
-`groth16.zig`'s module doc comment for the full ordering discussion.
-
-**Provenance/licensing**: `darkforest-eth/darkforest-v0.3` carries no
-explicit OSS license file (GitHub reports the repository license as
-`NOASSERTION`). The three embedded JSON files are NUMERIC PROOF/KEY DATA
-— elliptic-curve point coordinates and field elements, the deterministic
-output of running the Groth16 protocol over a specific circuit/witness —
-the same "public numeric conformance data, not copyrightable expression"
-category this file's own "Part 5 — KAT sourcing" section and `NOTICE`
-item 5 already treat `ethereum/go-ethereum`'s (LGPL-3.0) precompile test
-vectors as; listed in `NOTICE` out of the same caution, not because this
-data is source code or creative expression. No darkforest-v0.3 SOURCE
-(circuit or application code) was read or ported — only the three
-already-computed JSON data files were fetched.
+Until 2026-10-26 this KAT was a proof copied from
+`darkforest-eth/darkforest-v0.3` (no licence). It was removed because data
+without an MIT-compatible grant may not live in this repository; see
+`NOTICE` item 6.
 
 ## Verification performed
 
@@ -995,8 +933,8 @@ role.
   EVM precompiles" above.
 - Part 6 (Groth16 zk-SNARK verifier over the pairing): **done** —
   `groth16.zig`'s `VerifyingKey`/`Proof`/`verify`, byte/semantically
-  exact against a REAL snarkjs-produced Groth16/BN254 proof
-  (darkforest-v0.3's "move" circuit). See "Part 6 — Groth16 verifier"
+  exact against a snarkjs-produced Groth16/BN254 proof over our own
+  circuit (`groth16/src/testdata/snarkjs`). See "Part 6 — Groth16 verifier"
   below.
 - ~~Persistent Montgomery storage / precomputed Frobenius-coefficient
   tables~~ — **both shipped** (`1892c814`/`a1d72299` and `8644b485`);

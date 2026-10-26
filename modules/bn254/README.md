@@ -20,17 +20,16 @@ BN-specific exact-`d` hard-part addition chain), and `pairing`/
 `multiMillerLoop`/`pairingCheck` — all real and tested, byte-exact
 against `ethereum/py_ecc`; the EVM precompile entry points
 themselves (Part 5): `ecAdd`/`ecMul`/`ecPairing` (`0x06`/`0x07`/`0x08`)
-— pure ABI composition over Parts 1-4, byte-exact against the OFFICIAL
-`ethereum/go-ethereum` `core/vm/testdata/precompiles/*.json`
-conformance vectors; and now a Groth16 zk-SNARK proof VERIFIER (Part 6,
+— pure ABI composition over Parts 1-4, byte-exact against KAT vectors
+over our own inputs from an independent Python oracle
+(`tools/gen_precompile_vectors.py`); and now a Groth16 zk-SNARK proof VERIFIER (Part 6,
 `groth16.zig`): `VerifyingKey`/`Proof`/`verify` — pure composition over
 Parts 1-4 (a `G1` multi-scalar accumulation plus one `pairingCheck`),
-verified against a REAL, independently-sourced snarkjs-produced
-Groth16/BN254 proof (darkforest-v0.3's "move" circuit) — the real proof
-verifies TRUE, six independent tamper cases each verify FALSE. Every
+verified against a snarkjs-produced Groth16/BN254 proof over our own
+circuit — the proof verifies TRUE, six independent tamper cases each verify FALSE. Every
 field/curve constant independently verified (see `SPEC.md`), byte-exact
-KAT coverage against independently-computed AND (Parts 5-6)
-independently-SOURCED reference vectors, all passing in Debug AND
+KAT coverage against independently-computed vectors (Parts 5-6: an
+independent Python oracle and an independent prover), all passing in Debug AND
 ReleaseFast.
 
 This module was built by careful, verified ADAPTATION of the sibling
@@ -158,16 +157,8 @@ Design record + cited sources: see [SPEC.md](SPEC.md). Parts 1-3 needed
 no `NOTICE` entry (public spec + mathematical constants only). Part 4
 added one — [NOTICE](NOTICE) — covering `ethereum/py_ecc`'s use as a
 numeric KAT oracle and the basis-conversion methodology (see `SPEC.md`'s
-"Part 4 — KAT generation"). Part 5 extends the same `NOTICE` with a
-5th entry for `ethereum/go-ethereum`'s precompile test-vector JSON
-files: EIP-196/197 conformance DATA (public-standard input/output
-vectors, not copyrightable expression under merger doctrine — the same
-category Parts 1-4's `py_ecc`-sourced constants already fall into),
-listed out of caution since the vectors are literal fetched file
-contents rather than independently-recomputed values; no go-ethereum
-SOURCE was read or ported. Part 6 extends `NOTICE` with a 6th entry for
-`darkforest-eth/darkforest-v0.3`'s "move"-circuit Groth16 proof (the
-positive KAT vector) — same "public numeric conformance data" category,
-plus `py_ecc` again (2nd use) as an independent cross-check of the
-verification equation's sign convention; see `SPEC.md`'s "Part 6 — KAT
-provenance".
+"Part 4 — KAT generation"). `NOTICE` items 5 and 6 record
+go-ethereum (a behaviour reference for calldata padding) and the
+third-party KAT data Parts 5 and 6 used until 2026-10-26, removed for
+its licence; the KATs are now our own (see `SPEC.md`'s "Part 5 — KAT
+sourcing" and "Part 6 — KAT provenance").

@@ -26,10 +26,9 @@
 //! py_ecc KAT vectors — runs); and now `ecAdd`/`ecMul`/`ecPairing`
 //! themselves (Part 5, `precompiles.zig`) — pure composition over Parts
 //! 1-4 (calldata padding/truncation, point decode, group op, re-encode),
-//! byte-exact against the OFFICIAL `ethereum/go-ethereum`
-//! `core/vm/testdata/precompiles/*.json` conformance vectors (49 vectors
-//! across all three precompiles, both the `ecPairing` true AND false
-//! paths). This module was built by careful, verified ADAPTATION of
+//! byte-exact against KAT vectors over our own inputs from an independent
+//! Python oracle (`tools/gen_precompile_vectors.py`; both the `ecPairing`
+//! true AND false paths). This module was built by careful, verified ADAPTATION of
 //! the sibling `bls12_381` module (`std.crypto.ff`-backed `Fr`; `Fp` has
 //! since moved to this module's own hand-written CIOS/SOS Montgomery
 //! arithmetic, see `fp.zig`) — same tower-arithmetic formula shapes from

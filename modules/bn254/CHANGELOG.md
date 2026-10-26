@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE (licence clean-up of the tests):** the precompile KATs no longer embed go-ethereum's `bn256*.json` tables (LGPL-3.0); `src/precompile_vectors.zig` is generated over our own inputs by `tools/gen_precompile_vectors.py` (independent affine BN254 arithmetic, pairing truth by bilinearity). The Groth16 KAT no longer embeds the unlicensed darkforest-v0.3 proof; it uses the snarkjs proof over `groth16`'s own test circuit. NOTICE items 5–6 rewritten.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-10** — tests: deterministic fuzz driver `BN254_FUZZ` (testkit) over ecAdd/ecMul/ecPairing on damaged genuine calldata (results canonical) and the group laws (distributivity, order wrap, inverse, bilinearity of the pairing check). No change to the library code.
