@@ -15,6 +15,10 @@ const hostname = @import("hostname.zig");
 const extensions = @import("extensions.zig");
 
 const corpus = @embedFile("data/s2/corpus.bin");
+/// The lead rows of `tools/interop.zig` (`-- --write`): chains Go 1.26
+/// accepts and this module refuses, or Go refuses as an unhandled critical
+/// extension and this module processes. Version 3 of the corpus format.
+const leads = @embedFile("data/s2/leads.bin");
 
 /// Where we disagree with Go on purpose, with the reason.
 const deliberate = [_]struct { id: []const u8, why: []const u8 }{
@@ -55,6 +59,9 @@ const Case = struct {
     policies: [16][]const u8,
     n_policies: usize,
     go_ok: bool,
+    /// Version 3 only: 1 = we refuse what Go accepts, 2 = Go refuses a
+    /// critical extension we process; 0 in versions 1 and 2.
+    expect: u8,
     roots: [8][]const u8,
     n_roots: usize,
     /// Leaf first, then the intermediates.
@@ -75,11 +82,15 @@ const Corpus = struct {
     left: u32,
 
     fn open() !Corpus {
-        var r: Reader = .{ .b = corpus };
+        return openBlob(corpus);
+    }
+
+    fn openBlob(blob: []const u8) !Corpus {
+        var r: Reader = .{ .b = blob };
         const magic = r.bytes(8);
         if (!std.mem.eql(u8, magic[0..7], "X509S2\x00")) return error.BadCorpus;
         const version = magic[7];
-        if (version != 1 and version != 2) return error.BadCorpus;
+        if (version < 1 or version > 3) return error.BadCorpus;
         const count = r.int(u32);
         return .{ .r = r, .version = version, .left = count };
     }
@@ -97,6 +108,7 @@ const Corpus = struct {
         c.n_policies = if (cp.version >= 2) r.int(u8) else 0;
         for (c.policies[0..c.n_policies]) |*p| p.* = r.bytes(r.int(u8));
         c.go_ok = r.int(u8) == 1;
+        c.expect = if (cp.version >= 3) r.int(u8) else 0;
         c.n_roots = r.int(u8);
         const n_inters = r.int(u8);
         for (c.roots[0..c.n_roots]) |*x| x.* = r.der();
@@ -248,4 +260,37 @@ test "usages_any_of: Go KeyUsages semantics on corpus chains" {
     try verifyWith("eku-lserver-iclient-kclient+server", .{ .usages_any_of = &[_]extensions.Purpose{.any_extended_key_usage} });
     // No usage asked and no required_eku: no EKU check at all (our default, not Go's).
     try verifyWith("eku-lserver-iclient-kclient+server", .{ .usages_any_of = &[_]extensions.Purpose{} });
+}
+
+test "lead: directoryName constraints and an empty extendedKeyUsage -- Go 1.26 accepts chains this module refuses" {
+    // Go 1.26.8 verdicts, frozen by `zig build interop-x509 -- --write`.
+    // stricter (1): Go accepts, we refuse -- RFC 5280 §4.2.1.10 / §6.1.3 (b)(c)
+    // directoryName subtrees on the subject and on SAN directoryNames (Go does
+    // not process them), and §4.2.1.12 `SIZE (1..MAX)` on extendedKeyUsage (Go
+    // reads an empty one as no restriction). processes (2): a critical
+    // nameConstraints with a directoryName subtree, which Go refuses as an
+    // unhandled critical extension and we process.
+    const gpa = std.testing.allocator;
+    var cp = try Corpus.openBlob(leads);
+    try std.testing.expectEqual(@as(u8, 3), cp.version);
+    var n: usize = 0;
+    while (cp.next()) |c| : (n += 1) {
+        var usages: [3]extensions.Purpose = undefined;
+        const ours_ok = if (chain.verifyChain(gpa, c.chainCerts(), c.anchors(), goOptions(&c, &usages))) |_| true else |_| false;
+        switch (c.expect) {
+            1 => {
+                try std.testing.expect(c.go_ok);
+                if (ours_ok) std.debug.print("  {s}: ours accepts, the lead is gone\n", .{c.id});
+                try std.testing.expect(!ours_ok);
+            },
+            2 => {
+                try std.testing.expect(!c.go_ok);
+                if (!ours_ok) std.debug.print("  {s}: ours refuses a chain it should process\n", .{c.id});
+                try std.testing.expect(ours_ok);
+            },
+            else => return error.BadCorpus,
+        }
+    }
+    try std.testing.expectEqual(leads.len, cp.r.i);
+    try std.testing.expectEqual(@as(usize, 15), n);
 }

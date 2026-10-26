@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** live Go oracle `tools/interop.zig` (`zig build interop-x509`): the S2 corpus judged again by the Go on PATH, plus 1,544 generated cases (name constraints, hostnames, validity boundaries, EKU/pathLen, directoryName, empty EKU); 0 surprises against go1.26.8 over five seeds. Its 15 lead rows are frozen in `src/data/s2/leads.bin` and replayed by a new test. `tools/go_oracle` takes the case file as an argument and its `go.mod` now says `go 1.26` (Go 1.26 GODEBUG defaults). Card: E1, scope ahead (S1).
+
 - **2026-10-22** — **Added:** `parseSpki` (`safe.parseSpki`): a bare DER SubjectPublicKeyInfo
   — an RFC 7250 raw public key, a PEM `PUBLIC KEY` body — parsed to the same `Spki` `spkiOf`
   returns for a certificate's (exactly one well-formed TLV). `spkiOf` now shares that walk

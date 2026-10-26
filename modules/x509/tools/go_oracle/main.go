@@ -12,7 +12,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"runtime"
 	"time"
 )
 
@@ -138,8 +140,21 @@ func run(c Case) Result {
 	return r
 }
 
+// Cases come from stdin, or from the file named by the first argument
+// (tools/interop.zig); the Go version goes to stderr.
 func main() {
-	sc := bufio.NewScanner(os.Stdin)
+	var in io.Reader = os.Stdin
+	if len(os.Args) > 1 {
+		f, err := os.Open(os.Args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		defer f.Close()
+		in = f
+	}
+	fmt.Fprintln(os.Stderr, runtime.Version())
+	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 1<<20), 1<<26)
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
