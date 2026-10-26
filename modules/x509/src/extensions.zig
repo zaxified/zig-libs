@@ -287,9 +287,15 @@ pub fn parseBasicConstraints(value: []const u8) ParseBasicConstraintsError!Basic
 
 fn parseSmallUint(bytes: []const u8, elem: der.Element) ParseBasicConstraintsError!u32 {
     const int_bytes = bytes[elem.slice.start..elem.slice.end];
-    if (int_bytes.len == 0 or int_bytes.len > 5) return error.CertificateFieldHasInvalidLength;
+    // INTEGER (0..MAX): a set top bit is a negative value. Past one sign
+    // octet, more than four octets do not fit; until 2026-10-26 a fifth
+    // octet shifted the top one out (01 00 00 00 00 read as 0) and 0x80 read
+    // as 128 (audit 2026-10-26).
+    if (int_bytes.len == 0 or int_bytes[0] & 0x80 != 0) return error.CertificateFieldHasInvalidLength;
+    const magnitude = if (int_bytes.len > 1 and int_bytes[0] == 0) int_bytes[1..] else int_bytes;
+    if (magnitude.len > 4) return error.CertificateFieldHasInvalidLength;
     var acc: u32 = 0;
-    for (int_bytes) |b| acc = (acc << 8) | b;
+    for (magnitude) |b| acc = (acc << 8) | b;
     return acc;
 }
 

@@ -193,6 +193,9 @@ test "verifySan: DNS host needs a dNSName, IP host an iPAddress; CN never consul
     try verifySan(&san, "2001:0db8::0001");
     try testing.expectError(error.CertificateHostMismatch, verifySan(&san, "www.example.com"));
     try testing.expectError(error.CertificateHostMismatch, verifySan(&san, "192.0.2.2"));
+    // An IPv6 host whose last four octets spell the IPv4 SAN is not it
+    // unless it is the IPv4-mapped form.
+    try testing.expectError(error.CertificateHostMismatch, verifySan(&san, "2001:db8::c000:201"));
     // The dNSName "example.com" is not an address and an address is not a name.
     const ip_as_dns = [_]u8{ 0x30, 0x0b, 0x82, 0x09 } ++ "192.0.2.1".*;
     try testing.expectError(error.CertificateHostMismatch, verifySan(&ip_as_dns, "192.0.2.1"));

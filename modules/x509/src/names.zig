@@ -741,4 +741,9 @@ test "GeneralNameIterator: SAN with dNSName, rfc822Name, iPAddress" {
     // A universal-class element is not a GeneralName.
     var bad = try GeneralNameIterator.init(&.{ 0x30, 0x03, 0x04, 0x01, 0x00 });
     try testing.expectError(error.CertificateFieldHasWrongDataType, bad.next());
+    // A context tag past [8] is no GeneralName CHOICE either.
+    var tag9 = try GeneralNameIterator.init(&.{ 0x30, 0x03, 0x89, 0x01, 0x00 });
+    try testing.expectError(error.CertificateFieldHasWrongDataType, tag9.next());
+    // Bytes after the GeneralNames SEQUENCE.
+    try testing.expectError(error.CertificateFieldHasInvalidLength, GeneralNameIterator.init(&.{ 0x30, 0x03, 0x82, 0x01, 'a', 0x00 }));
 }

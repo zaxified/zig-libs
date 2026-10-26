@@ -1014,3 +1014,150 @@ test "SLH-DSA: expiry and not-yet-valid are checked on the SLH-DSA path too" {
         chain_mod.verifySlhDsaLink(slh.leaf_sha2, slh.inter_sha2, now_after),
     );
 }
+
+// ── audit 2026-10-26: tests the mutation run asked for ─────────────────────
+
+const certgen = @import("certgen_test.zig");
+const crl_mod = @import("crl.zig");
+
+/// root → [inters…] → leaf, all P-256; `root_exts` etc. default to a plain CA / a leaf for example.com.
+const TestChain = struct {
+    roots: [1][]const u8,
+    presented: [4][]const u8,
+    n: usize,
+
+    fn chainCerts(c: *const TestChain) []const []const u8 {
+        return c.presented[0..c.n];
+    }
+};
+
+fn testChain(g: *certgen.Gen, o: struct {
+    root_exts: ?[]const []const u8 = null,
+    n_inters: usize = 1,
+    leaf_validity: [2]i64 = .{ certgen.t_nb, certgen.t_na },
+    leaf_sig_alg: ?[]const u8 = null,
+}) !TestChain {
+    std.debug.assert(o.n_inters >= 1 and o.n_inters <= 3);
+    const keys = [_]certgen.Ecdsa.KeyPair{ certgen.key(0x61), certgen.key(0x62), certgen.key(0x63), certgen.key(0x64), certgen.key(0x65) };
+    const dns = [_][]const u8{ try g.name("Test Root"), try g.name("Test Inter 1"), try g.name("Test Inter 2"), try g.name("Test Inter 3") };
+    const ca: []const []const u8 = &.{ try g.extCa(null), try g.extKuCa() };
+    var c: TestChain = undefined;
+    c.roots[0] = try g.cert(.{ .subject = dns[0], .issuer = dns[0], .key = &keys[0], .signer = &keys[0], .exts = o.root_exts orelse ca });
+    // presented: leaf, then the intermediates from the leaf's issuer up.
+    for (1..o.n_inters + 1) |k| {
+        c.presented[1 + o.n_inters - k] = try g.cert(.{ .subject = dns[k], .issuer = dns[k - 1], .key = &keys[k], .signer = &keys[k - 1], .exts = ca });
+    }
+    c.presented[0] = try g.cert(.{
+        .subject = try g.name("leaf"),
+        .issuer = dns[o.n_inters],
+        .key = &keys[4],
+        .signer = &keys[o.n_inters],
+        .exts = &.{ try g.extSanDns("example.com"), try g.extKuLeaf() },
+        .nb = o.leaf_validity[0],
+        .na = o.leaf_validity[1],
+        .sig_alg = o.leaf_sig_alg,
+    });
+    c.n = 1 + o.n_inters;
+    return c;
+}
+
+test "audit 2026-10-26: a trust anchor's own nameConstraints apply to the path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const plain = try testChain(&g, .{});
+    _ = try chain_mod.verifyChain(testing.allocator, plain.chainCerts(), &plain.roots, .{ .now_sec = certgen.t_now });
+    const constrained = try testChain(&g, .{ .root_exts = &.{ try g.extCa(null), try g.extKuCa(), try g.extNcExcludedDns("example.com") } });
+    try testing.expectError(error.NameConstraintViolated, chain_mod.verifyChain(testing.allocator, constrained.chainCerts(), &constrained.roots, .{ .now_sec = certgen.t_now }));
+}
+
+test "audit 2026-10-26: notBefore and notAfter are inclusive, to the second" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const nb = certgen.t_now - 1000;
+    const na = certgen.t_now + 1000;
+    const c = try testChain(&g, .{ .leaf_validity = .{ nb, na } });
+    for ([_]i64{ nb, na }) |t| _ = try chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = t });
+    try testing.expectError(error.CertificateNotYetValid, chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = nb - 1 }));
+    try testing.expectError(error.CertificateExpired, chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = na + 1 }));
+}
+
+test "audit 2026-10-26: max_intermediates bounds the path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const c = try testChain(&g, .{ .n_inters = 2 });
+    _ = try chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = certgen.t_now, .max_intermediates = 2 });
+    try testing.expectError(error.ChainTooLong, chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = certgen.t_now, .max_intermediates = 1 }));
+}
+
+test "audit 2026-10-26: RSASSA-PSS over SHA-1 is a SHA-1 signature" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    // RSASSA-PSS { hashAlgorithm [0] sha1, maskGenAlgorithm [1] mgf1(sha1) }.
+    const sha1 = try g.seq(&.{try g.tlv(0x06, &.{&.{ 0x2b, 0x0e, 0x03, 0x02, 0x1a }})});
+    const mgf1 = try g.seq(&.{ try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x08 }}), sha1 });
+    const pss_sha1 = try g.seq(&.{
+        try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a }}),
+        try g.seq(&.{ try g.tlv(0xa0, &.{sha1}), try g.tlv(0xa1, &.{mgf1}) }),
+    });
+    const c = try testChain(&g, .{ .leaf_sig_alg = pss_sha1 });
+    try testing.expectError(error.WeakSignatureAlgorithm, chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = certgen.t_now }));
+    // Allowed, the link is judged on its signature instead (an ECDSA one under a PSS label).
+    if (chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = certgen.t_now, .allow_sha1_signatures = true })) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expect(err != error.WeakSignatureAlgorithm);
+}
+
+test "audit 2026-10-26: basicConstraints with an explicit cA FALSE is not a CA" {
+    const bc = try extensions.parseBasicConstraints(&.{ 0x30, 0x03, 0x01, 0x01, 0x00 });
+    try testing.expect(!bc.is_ca);
+    try testing.expect((try extensions.parseBasicConstraints(&.{ 0x30, 0x03, 0x01, 0x01, 0xff })).is_ca);
+}
+
+test "audit 2026-10-26: pathLenConstraint is a non-negative INTEGER that fits u32" {
+    const pl = struct {
+        fn get(int: []const u8) !?u32 {
+            var buf: [16]u8 = undefined;
+            buf[0] = 0x30;
+            buf[1] = @intCast(5 + int.len);
+            @memcpy(buf[2..5], &[_]u8{ 0x01, 0x01, 0xff });
+            buf[5] = 0x02;
+            buf[6] = @intCast(int.len);
+            @memcpy(buf[7..][0..int.len], int);
+            return (try extensions.parseBasicConstraints(buf[0 .. 7 + int.len])).path_len_constraint;
+        }
+    };
+    try testing.expectEqual(@as(?u32, 0), try pl.get(&.{0x00}));
+    try testing.expectEqual(@as(?u32, 127), try pl.get(&.{0x7f}));
+    try testing.expectEqual(@as(?u32, 128), try pl.get(&.{ 0x00, 0x80 }));
+    try testing.expectEqual(@as(?u32, 0xffff_ffff), try pl.get(&.{ 0x00, 0xff, 0xff, 0xff, 0xff }));
+    // Negative, and wider than u32 (read as 0 before the fix: the top byte fell off).
+    try testing.expectError(error.CertificateFieldHasInvalidLength, pl.get(&.{0x80}));
+    try testing.expectError(error.CertificateFieldHasInvalidLength, pl.get(&.{0xff}));
+    try testing.expectError(error.CertificateFieldHasInvalidLength, pl.get(&.{ 0x01, 0x00, 0x00, 0x00, 0x00 }));
+}
+
+test "audit 2026-10-26: an empty extendedKeyUsage grants no purpose" {
+    try testing.expect(!try extensions.hasPurpose(&.{ 0x30, 0x00 }, .server_auth));
+    try testing.expectError(error.ExtendedKeyUsageMismatch, chain_mod.checkExtendedKeyUsage(&.{null}, &.{ 0x30, 0x00 }, .server_auth));
+}
+
+test "audit 2026-10-26: a CRL entry's serial matches however minimally it is encoded" {
+    // revokedCertificates content: one entry, serial 00 05 (non-minimal), revoked 2025-01-01.
+    const entries = [_]u8{ 0x30, 0x13, 0x02, 0x02, 0x00, 0x05, 0x17, 0x0d } ++ "250101000000Z".*;
+    const c: crl_mod.Crl = .{
+        .der_bytes = &entries,
+        .signed = undefined,
+        .issuer = "",
+        .this_update = 0,
+        .next_update = null,
+        .entries = .{ .start = 0, .end = entries.len },
+        .entry_count = 1,
+    };
+    try testing.expect(c.find(&.{0x05}) != null);
+    try testing.expect(c.find(&.{ 0x00, 0x05 }) != null);
+    try testing.expect(c.find(&.{0x06}) == null);
+}
