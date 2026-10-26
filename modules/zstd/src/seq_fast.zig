@@ -21,7 +21,7 @@
 //!
 //! What it executes, it executes as the Zig loop does: the same bit reads,
 //! the same repeat-offset updates, and the same bytes in `out[..op]`. Its
-//! copies write at most 15 bytes past a sequence's end (the Zig wildcopy:
+//! copies write at most 31 bytes past a sequence's end (the Zig wildcopy:
 //! up to 32), inside the same `wildcopy_overlength` margin; those bytes are
 //! scratch that the next sequence overwrites, as in libzstd.
 
@@ -128,6 +128,10 @@ fn runX86(a: *FastSeq) void {
         \\ movq 104(%%rdi), %%r14
         \\ movq 120(%%rdi), %%r15
         \\ movq 80(%%rdi), %%rbx
+        // the loop's head on a 64-byte line: its branches then sit at the
+        // same offsets from the 32-byte grid in every build (Kaby Lake's JCC
+        // erratum moves a loop 5 % by layout alone)
+        \\ .p2align 6
         \\ 20:
         \\ cmpq $1, 144(%%rdi)
         \\ jbe 21f
@@ -280,7 +284,7 @@ fn runX86(a: *FastSeq) void {
         \\ subq 136(%%rdi), %%rcx
         \\ cmpq %%rcx, %%rdx
         \\ ja 26f
-        // literals: 32 bytes at once (the margins cover them), then 16 at a time
+        // literals: 32 bytes at once (the margins cover them), then 32 at a time
         \\ movdqu (%%r14), %%xmm0
         \\ movdqu 16(%%r14), %%xmm1
         \\ movdqu %%xmm0, (%%r15)
@@ -294,9 +298,12 @@ fn runX86(a: *FastSeq) void {
         \\ subq %%rdx, %%rsi
         \\ cmpq $16, %%rdx
         \\ jb 9f
-        // match, offset >= 16: 16 bytes, then 16 at a time while short of ml
-        // (no blind second load: on a long offset it may be a cache line of
-        // its own, and a miss)
+        // match, offset >= 16: 16 bytes, then 32 at a time while short of ml
+        // (no blind second load before the length test: on a long offset it
+        // may be a cache line of its own, and a miss). 32 per round as
+        // libzstd's ZSTD_wildcopy: half the rounds, and the loop's exit
+        // mispredicts as rarely as libzstd's (xml d3: 4.25M -> 3.61M, libzstd
+        // 3.63M, -4 % cycles)
         \\ movdqu (%%rsi), %%xmm0
         \\ movdqu %%xmm0, (%%r15)
         \\ cmpq $16, 160(%%rdi)
@@ -307,8 +314,10 @@ fn runX86(a: *FastSeq) void {
         \\ movl $32, %%ecx
         \\ 5:
         \\ movdqu (%%r14,%%rcx), %%xmm0
+        \\ movdqu 16(%%r14,%%rcx), %%xmm1
         \\ movdqu %%xmm0, (%%r15,%%rcx)
-        \\ addq $16, %%rcx
+        \\ movdqu %%xmm1, 16(%%r15,%%rcx)
+        \\ addq $32, %%rcx
         \\ cmpq %%rax, %%rcx
         \\ jb 5b
         \\ jmp 7b
@@ -317,7 +326,9 @@ fn runX86(a: *FastSeq) void {
         \\ 10:
         \\ movdqu (%%rsi,%%rcx), %%xmm0
         \\ movdqu %%xmm0, (%%r15,%%rcx)
-        \\ addq $16, %%rcx
+        \\ movdqu 16(%%rsi,%%rcx), %%xmm1
+        \\ movdqu %%xmm1, 16(%%r15,%%rcx)
+        \\ addq $32, %%rcx
         \\ cmpq 160(%%rdi), %%rcx
         \\ jb 10b
         \\ addq 160(%%rdi), %%r15
