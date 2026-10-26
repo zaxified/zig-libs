@@ -68,7 +68,8 @@
 //! Linux-syscall-note — the message/attribute constants and their layouts are
 //! the kernel's OS ABI, not copyrightable interface code). The `ethtool`
 //! binary was used **only as a black-box capture oracle** under `strace`; no
-//! `ethtool` source was read or ported. See `NOTICE`.
+//! `ethtool` source was read or ported. A black-box oracle needs no
+//! module `NOTICE` (root `NOTICE` §0).
 
 const std = @import("std");
 const builtin = @import("builtin");

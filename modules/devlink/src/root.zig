@@ -83,7 +83,8 @@
 //! WITH Linux-syscall-note — the command/attribute constants and their layouts
 //! are the kernel's OS ABI, not copyrightable interface code). The `devlink`
 //! binary from iproute2 was used **only as a black-box capture oracle** under
-//! `strace`; no iproute2 source was read or ported. See `NOTICE`.
+//! `strace`; no iproute2 source was read or ported. A black-box oracle needs no
+//! module `NOTICE` (root `NOTICE` §0).
 
 const std = @import("std");
 const builtin = @import("builtin");
