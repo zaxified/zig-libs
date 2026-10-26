@@ -122,6 +122,9 @@ pub fn depthFor(policy: RotationPolicy) usize {
 /// `Connection`).
 pub fn StekRing(comptime depth: usize) type {
     comptime std.debug.assert(depth >= 1);
+    // Key ids are one octet: a deeper ring would hold two live keys under
+    // one id once `maybeRotate`'s `+% 1` wraps (audit 2026-10-26 F5).
+    if (depth > 256) @compileError("StekRing: depth over 256 -- key ids are u8 (shorten lifetime_s or lengthen period_s)");
     return struct {
         const Self = @This();
 
@@ -145,9 +148,11 @@ pub fn StekRing(comptime depth: usize) type {
         /// (`id`) are entirely caller-supplied — this function does no
         /// randomness generation and no uniqueness checking of `id` beyond
         /// what the ring's fixed slots naturally enforce (a colliding id
-        /// silently shadows whichever older slot shared it; callers should
-        /// pick ids that don't collide across the live rotation window,
-        /// e.g. a monotonic counter mod 256).
+        /// shadows the older slot that shared it: `findKey` returns the
+        /// newest key with an id, so the active key always opens what it
+        /// sealed; callers should still pick ids that don't collide across
+        /// the live rotation window, e.g. a monotonic counter mod 256, as
+        /// `maybeRotate` does).
         pub fn rotate(self: *Self, id: u8, key: *const [key_length]u8, now_s: i64) void {
             const slot = self.count % depth;
             // Wipe the key being evicted before it is overwritten.
@@ -171,8 +176,9 @@ pub fn StekRing(comptime depth: usize) type {
         /// `+% 1` (0 for an empty ring), so the caller only supplies key
         /// bytes from its CSPRNG. Keeping the previous keys until
         /// `policy.lifetime_s` is the grace period Go (7 days) and rustls give
-        /// tickets issued just before a rotation. Ids wrap mod 256; with
-        /// `depth` far below 256 live keys never collide.
+        /// tickets issued just before a rotation. Ids wrap mod 256; a ring
+        /// holds at most 256 keys (`StekRing` refuses a deeper one), so live
+        /// keys never collide.
         // secret-api-ok: the key is borrowed and handed straight to `rotate`, which copies it into the ring slot; no copy lands in this frame
         pub fn maybeRotate(self: *Self, policy: RotationPolicy, key: *const [key_length]u8, now_s: i64) bool {
             const rotated = self.needsRotation(policy, now_s);
@@ -213,11 +219,26 @@ pub fn StekRing(comptime depth: usize) type {
         /// caller should treat the ticket as unusable and fall back to a
         /// full (non-resumed) handshake, not an error condition.
         /// A pointer into the ring, like `activeKey` (BREAKING 2026-10-09).
+        /// With two keys under one id (a caller's `rotate`), the newest.
         pub fn findKey(self: *const Self, id: u8) ?*const Stek {
-            for (&self.keys) |*maybe| {
-                if (maybe.*) |*k| if (k.id == id) return k;
+            // Newest first: the active slot, then backwards in rotation order.
+            for (0..depth) |back| {
+                const i = (self.active + depth - back) % depth;
+                if (self.keys[i]) |*k| if (k.id == id) return k;
             }
             return null;
+        }
+
+        /// Wipe and clear every key (shutdown, or a suspected STEK leak:
+        /// nothing sealed before opens again). `StekRing` is a plain value:
+        /// a copy of it is a copy of the keys, so keep one and pass pointers.
+        pub fn wipe(self: *Self) void {
+            for (&self.keys) |*maybe| {
+                if (maybe.*) |*k| std.crypto.secureZero(u8, &k.key);
+                maybe.* = null;
+            }
+            self.active = 0;
+            self.count = 0;
         }
 
         /// AEAD-seal `plaintext` (the engine's serialized session state —
@@ -226,7 +247,12 @@ pub fn StekRing(comptime depth: usize) type {
         /// `activeKey()`. `nonce` MUST be fresh for every call under the
         /// same key (RFC 8446 §4.6.1 does not mandate a scheme; AEAD nonce
         /// reuse under GCM is catastrophic — see SPEC.md's threat model) —
-        /// the caller's CSPRNG supplies it, this module owns no RNG.
+        /// the caller's CSPRNG supplies it, this module owns no RNG. Random
+        /// 96-bit nonces stay safe for about 2^32 seals per key (NIST SP
+        /// 800-38D §8.3); `RotationPolicy.period_s` bounds the seals per key.
+        /// The AAD is the key id alone: whatever is sealed under one ring
+        /// opens as any of it — keep one ring per purpose (not TLS 1.2 and
+        /// TLS 1.3 tickets in one), or tag the plaintext yourself.
         /// Writes `key_id_length + nonce_length + plaintext.len +
         /// tag_length` bytes into `out` (see `overhead`) and returns that
         /// slice. `out` must not alias `plaintext`.
@@ -522,4 +548,138 @@ test "depthFor: a ring of that depth keeps every key the policy accepts" {
     for ([_]u8{ 1, 2, 3 }) |id| try testing.expect(ring.findKey(id) != null);
     _ = ring.maybeRotate(policy, &key, 399); // not due: 399 - 300 < 100
     try testing.expect(ring.findKey(1) != null); // installed 100, alive until 400
+}
+
+test "a full 256-deep ring past the u8 id wrap: every live key opens what it sealed (audit 2026-10-26 F5)" {
+    const Ring256 = StekRing(256);
+    var ring: Ring256 = .init();
+    const policy: RotationPolicy = .{ .period_s = 1, .lifetime_s = 255 };
+    try testing.expectEqual(@as(usize, 256), depthFor(policy));
+    var blobs: [300][64]u8 = undefined;
+    var lens: [300]usize = undefined;
+    for (0..300) |i| {
+        const key: [key_length]u8 = @splat(@truncate(i));
+        try testing.expect(ring.maybeRotate(policy, &key, @intCast(i)));
+        lens[i] = (try ring.seal("state", @splat(@truncate(i)), &blobs[i])).len;
+        // Live: keys younger than lifetime_s (the last 255). Each opens its
+        // own tickets, ids 0..255 and wrapped alike.
+        var out: [16]u8 = undefined;
+        const lo = if (i >= 254) i - 254 else 0;
+        for (lo..i + 1) |j| try testing.expectEqualStrings("state", try ring.openAt(blobs[j][0..lens[j]], @intCast(i), policy, &out));
+    }
+}
+
+test "findKey: two keys under one id -- the newest wins, so the active key opens its own tickets (audit 2026-10-26 F5)" {
+    var ring = DefaultRing.init();
+    ring.rotate(7, &(@as([key_length]u8, @splat(0x01))), 0);
+    ring.rotate(7, &(@as([key_length]u8, @splat(0x02))), 1);
+    var buf: [64]u8 = undefined;
+    const blob = try ring.seal("s", @splat(0), &buf);
+    var out: [8]u8 = undefined;
+    try testing.expectEqualStrings("s", try ring.open(blob, &out));
+    try testing.expectEqual(@as(u8, 0x02), ring.findKey(7).?.key[0]);
+}
+
+test "wipe: every key zeroed and gone, nothing opens (audit 2026-10-26 F7)" {
+    var ring = DefaultRing.init();
+    ring.rotate(1, &(@as([key_length]u8, @splat(0xAA))), 0);
+    ring.rotate(2, &(@as([key_length]u8, @splat(0xBB))), 1);
+    var buf: [64]u8 = undefined;
+    const blob = try ring.seal("s", @splat(0), &buf);
+    const k0: *const [key_length]u8 = &ring.keys[0].?.key;
+    const k1: *const [key_length]u8 = &ring.keys[1].?.key;
+    ring.wipe();
+    try testing.expect(std.mem.allEqual(u8, k0, 0) and std.mem.allEqual(u8, k1, 0));
+    for (ring.keys) |k| try testing.expect(k == null);
+    try testing.expect(ring.activeKey() == null);
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.UnknownKeyId, ring.open(blob, &out));
+    try testing.expectError(error.NoActiveKey, ring.seal("s", @splat(0), &buf));
+}
+
+// ── audit 2026-10-26: tests asked for by mutation survivors ──────────────────
+
+/// True if `needle` occurs anywhere in the ring's own bytes (keys included).
+fn ringHolds(ring: *const DefaultRing, needle: *const [key_length]u8) bool {
+    return std.mem.indexOf(u8, std.mem.asBytes(ring), needle) != null;
+}
+
+test "seal/open: exact-size buffers fit, one byte less is BufferTooSmall (audit 2026-10-26 mutation)" {
+    var ring = DefaultRing.init();
+    ring.rotate(5, &(@as([key_length]u8, @splat(0x42))), 0);
+    const nonce = @as([nonce_length]u8, @splat(0x11));
+    var exact: [3 + overhead]u8 = undefined;
+    const blob = try ring.seal("abc", nonce, &exact);
+    var short: [2 + overhead]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, ring.seal("abc", nonce, &short));
+    var out3: [3]u8 = undefined;
+    try testing.expectEqualStrings("abc", try ring.open(blob, &out3));
+    var out2: [2]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, ring.open(blob, &out2));
+}
+
+test "seal/open/openAt: an empty plaintext is a legal blob of exactly `overhead` bytes (audit 2026-10-26 mutation)" {
+    var ring = DefaultRing.init();
+    ring.rotate(5, &(@as([key_length]u8, @splat(0x42))), 0);
+    var buf: [overhead]u8 = undefined;
+    const blob = try ring.seal("", @splat(0x22), &buf);
+    try testing.expectEqual(overhead, blob.len);
+    var out: [0]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try ring.open(blob, &out)).len);
+    try testing.expectEqual(@as(usize, 0), (try ring.openAt(blob, 10, .{}, &out)).len);
+}
+
+test "openAt: a blob shorter than `overhead` is Malformed, empty or with an unknown key id (audit 2026-10-26 mutation)" {
+    var ring = DefaultRing.init();
+    ring.rotate(5, &(@as([key_length]u8, @splat(0x42))), 0);
+    var out: [8]u8 = undefined;
+    try testing.expectError(error.Malformed, ring.openAt("", 10, .{}, &out));
+    try testing.expectError(error.Malformed, ring.openAt(&[_]u8{0xEE}, 10, .{}, &out));
+    try testing.expectError(error.Malformed, ring.openAt(&[_]u8{ 5, 1, 2 }, 10, .{}, &out));
+}
+
+test "findKey: with duplicate ids the newest wins even when the active key has another id (audit 2026-10-26 mutation)" {
+    var ring = DefaultRing.init();
+    ring.rotate(7, &(@as([key_length]u8, @splat(0x01))), 0);
+    ring.rotate(7, &(@as([key_length]u8, @splat(0x02))), 1);
+    ring.rotate(8, &(@as([key_length]u8, @splat(0x03))), 2);
+    try testing.expectEqual(@as(u8, 0x02), ring.findKey(7).?.key[0]);
+    try testing.expectEqual(@as(u8, 0x03), ring.findKey(8).?.key[0]);
+}
+
+test "depthFor: rounds the number of periods up when the lifetime is not a multiple (audit 2026-10-26 mutation)" {
+    // A runtime call: a comptime call would never see a mutant.
+    var policy: RotationPolicy = .{ .period_s = 4, .lifetime_s = 10 };
+    try testing.expectEqual(@as(usize, 4), depthFor(policy)); // ceil(10 / 4) + 1
+    policy.lifetime_s = 8;
+    try testing.expectEqual(@as(usize, 3), depthFor(policy));
+}
+
+test "wipe: no key byte is left in the ring's memory and the ring is as new again (audit 2026-10-26 mutation)" {
+    const a: [key_length]u8 = @splat(0xA5);
+    const b: [key_length]u8 = @splat(0xB6);
+    var ring = DefaultRing.init();
+    ring.rotate(1, &a, 0);
+    ring.rotate(2, &b, 1);
+    try testing.expect(ringHolds(&ring, &a) and ringHolds(&ring, &b)); // control: the scan sees keys
+    ring.wipe();
+    try testing.expect(!ringHolds(&ring, &a) and !ringHolds(&ring, &b));
+    try testing.expectEqual(@as(usize, 0), ring.active);
+    try testing.expectEqual(@as(usize, 0), ring.count);
+    // The first key installed afterwards takes slot 0 again.
+    ring.rotate(3, &a, 5);
+    try testing.expect(ring.keys[0] != null and ring.keys[0].?.id == 3);
+}
+
+test "expire: the expired key's bytes are zeroed in the ring's memory, not only unlinked (audit 2026-10-26 mutation)" {
+    const a: [key_length]u8 = @splat(0xA5);
+    const b: [key_length]u8 = @splat(0xB6);
+    var ring = DefaultRing.init();
+    ring.rotate(1, &a, 0);
+    ring.rotate(2, &b, 100);
+    try testing.expect(ringHolds(&ring, &a)); // control
+    ring.expire(.{ .period_s = 10, .lifetime_s = 50 }, 100);
+    try testing.expect(ring.findKey(1) == null);
+    try testing.expect(!ringHolds(&ring, &a));
+    try testing.expect(ringHolds(&ring, &b)); // the active key stays
 }

@@ -20,7 +20,8 @@
 //! ReleaseFast); `zig build check-interop` compiles it. Needs `zig` on PATH (it
 //! builds `tools/c_bench/foreign_bench.c` with `zig cc -O3 -march=native`) and
 //! the system OpenSSL 3 (`libcrypto.so.3`, path below or `LIBCRYPTO_SO`; no
-//! headers needed). Run from the repository root.
+//! headers needed) and `cargo` (offline, for the third side below). Run from
+//! the repository root.
 //!
 //! Workloads (a server's per-connection resumption work):
 //!   seal_128 / seal_512   `StekRing.seal` of a 128- / 512-byte session state
@@ -39,6 +40,12 @@
 //! move with the clock), else by wall time. Before timing anything OpenSSL's
 //! sealed blobs and binder must equal ours byte for byte. Arguments filter
 //! workloads by substring (no card line then).
+//!
+//! The fastest in the field: the same recipe over aws-lc-rs 1.18.0, the crypto
+//! rustls 0.23.43 uses by default (`tools/rust_fast_bench`, `cargo build
+//! --release --offline` with the crates in cargo's cache; same protocol and
+//! counting as the C side). Its sealed blobs and binder must equal ours byte
+//! for byte too before timing; the ratio is ours / the faster of the two.
 
 const std = @import("std");
 const bench = @import("testkit").bench;
@@ -48,6 +55,8 @@ const tlsresume = @import("tlsresume");
 const bench_name = "bench-tlsresume";
 const work_dir = ".zig-cache/bench-tlsresume";
 const default_so = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
+const fast_rs_manifest = "modules/tlsresume/tools/rust_fast_bench/Cargo.toml";
+const fast_rs_exe = "modules/tlsresume/tools/rust_fast_bench/target/release/tlsresume_fast_bench";
 const lens = [_]usize{ 128, 512 };
 const Hkdf = std.crypto.kdf.hkdf.HkdfSha256;
 const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -152,20 +161,48 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
 
+    std.debug.print("{s}: building the aws-lc-rs side ...\n", .{bench_name});
+    const fast = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest },
+        .environ_map = init.environ_map,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the benchmark needs it\n", .{ bench_name, e });
+        return 1;
+    };
+    if (fast.term != .exited or fast.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, fast.stderr });
+        return 1;
+    }
+    const alt_exe = try cwd.realPathFileAlloc(io, fast_rs_exe, arena);
+    try bench.foreignOnce(arena, io, bench_name, alt_exe, abs, "interop");
+    for (lens, 0..) |n, i| {
+        const theirs = try dir.readFileAlloc(io, try arena.print("aws_seal_{d}.bin", .{n}), arena, .limited(1 << 16));
+        if (!std.mem.eql(u8, theirs, ctx.blobs[i])) {
+            std.debug.print("{s}: FAILED -- aws-lc-rs's sealed {d}-byte ticket differs from ours\n", .{ bench_name, n });
+            return 1;
+        }
+    }
+    const aws_binder = try dir.readFileAlloc(io, "aws_binder.bin", arena, .limited(64));
+    if (!std.mem.eql(u8, aws_binder, &ctx.binder_out)) {
+        std.debug.print("{s}: FAILED -- aws-lc-rs's PSK binder differs from ours\n", .{bench_name});
+        return 1;
+    }
+    std.debug.print("{s}: byte-equality with OpenSSL and aws-lc-rs: ok\n", .{bench_name});
+
     var ws: std.ArrayList(Work) = .empty;
     for (lens, 0..) |n, i| inline for (.{ Kind.seal, Kind.open }) |k| {
         const name = try arena.print("{s}_{d}", .{ @tagName(k), n });
-        try ws.append(arena, .{ .name = name, .op = .{ .kind = k, .len_index = i }, .ref = name });
+        try ws.append(arena, .{ .name = name, .op = .{ .kind = k, .len_index = i }, .ref = name, .alt = name, .ref_exe = 0, .alt_exe = 1 });
     };
-    try ws.append(arena, .{ .name = "binder", .op = .{ .kind = .binder, .len_index = 0 }, .ref = "binder" });
+    try ws.append(arena, .{ .name = "binder", .op = .{ .kind = .binder, .len_index = 0 }, .ref = "binder", .alt = "binder", .ref_exe = 0, .alt_exe = 1 });
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, alt_exe }, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
+    try w.print("reference: {s}\nalt: {s}\nworst ours/OpenSSL = {d:.3} (best {d:.3}); worst ours/fastest = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> EVP (same recipe: AES-256-GCM ticket seal/open, HKDF/HMAC-SHA256 binder chain) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× OpenSSL <version> EVP · fastest {d:.2}× {s} (rustls's provider) (same recipe: AES-256-GCM ticket seal/open, HKDF/HMAC-SHA256 binder chain; measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0, std.mem.trimEnd(u8, s.alt_banner, "\n") });
     try w.flush();
     return 0;
 }

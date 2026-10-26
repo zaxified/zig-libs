@@ -110,6 +110,7 @@ test {
     _ = ticket12;
     _ = cache;
     _ = @import("stackprobe_test.zig");
+    _ = @import("interop_replay_test.zig");
 }
 
 test "meta.deps is exactly {aesgcm} (the ticket AEAD; else std only)" {

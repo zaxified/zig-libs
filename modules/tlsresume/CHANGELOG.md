@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — Audit (review + mutation) fixes. `select.selectPsk`: with a strike register the
+  freshness window applied is at most half the register's window (`strikeFreshnessCap`), also when
+  none was passed — before, a ClientHello replayed after the register forgot it passed a freshness
+  window as long as the register's, or none (F1); `identities.len != binders.len` is
+  `error.BinderMismatch` instead of a panic on client-chosen counts (F2); a ticket opened and not
+  selected is wiped from `open_scratch`, the selected one is the caller's to wipe (documented) (F3).
+  **BREAKING:** `ticket.NewSessionTicket.encode` returns the new `error.InvalidField` for a
+  `ticket_lifetime` over 7 days (`ticket.max_ticket_lifetime_s`), a nonce over 255 bytes, an empty or
+  over-long ticket, an over-long extension or block, or an extension type twice; `decode` refuses an
+  extension type twice (RFC 8446 §4.2) (F4, F10). `StekRing`: depth over 256 is a compile error (u8
+  key ids), `findKey` returns the newest key with an id, new `wipe()` (F5, F7). Documented: one ring per
+  purpose / hash (F6), GCM nonce budget, strike-register scan cost, cache id entropy.
+- **2026-10-26** — Live oracle `tools/interop.zig` (`zig build interop-tlsresume`, `tlsserver` as the
+  engine through the new `interop_deps`): OpenSSL 3.5 `s_client` and Go 1.26's crypto/tls
+  (`tools/go_peer`) resume, take 0-RTT, get refused on replay, age skew, an expired STEK and a spent
+  stateful ticket; Go's TLS 1.2 client against OpenSSL's and Go's TLS 1.2 servers through `ticket12`.
+  Captures (`src/interop_vectors.zig`) replayed by `interop_replay_test.zig`. Bench: aws-lc-rs 1.18.0
+  side (`tools/rust_fast_bench`, the fastest in the field).
+
 - **2026-10-20** — **BREAKING:** `select.selectPsk` gains a `filter: ?select.Filter` parameter
   (the engine's own checks on its fields behind the `SessionState` prefix — suite, SNI, its
   lifetime — run before the binder), `freshness_window_ms` becomes `?u32` (null: the reported

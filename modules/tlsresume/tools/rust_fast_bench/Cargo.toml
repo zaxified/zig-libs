@@ -1,0 +1,23 @@
+[package]
+name = "tlsresume_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-tlsresume`
+# (modules/tlsresume/tools/bench.zig): the same recipe as the OpenSSL EVP side
+# (AES-256-GCM ticket seal/open, HKDF/HMAC-SHA256 binder chain) over
+# aws-lc-rs 1.18.0 (Apache-2.0 OR ISC), the crypto provider rustls 0.23.43 uses
+# by default. Neither rustls nor OpenSSL has a standalone resumption API, so the
+# primitives are what is compared. Pinned exactly; Cargo.lock copied from
+# tlsclient's `tools/rust_fast_bench` (cargo prunes what is unused).
+[dependencies]
+aws-lc-rs = { version = "=1.18.0", default-features = false, features = ["aws-lc-sys"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]

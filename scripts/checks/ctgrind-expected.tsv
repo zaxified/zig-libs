@@ -1655,7 +1655,7 @@ p384	ReleaseFast	vartime	1	>=1	8182168cc51eb45a	38cf29c815d8f1f4
 # on a tainted PSK: 0. select.selectPsk is deliberately not a row: tainting the
 # STEK taints the nonce length / issue time inside the unsealed plaintext and
 # the row would pin that artefact (47 contexts measured; see the harness doc).
-tlsresume	ReleaseFast	stek	1	2	02a42cf7060f0771	d08464d6d9f54d25
+tlsresume	ReleaseFast	stek	1	2	157a2cf1508ddbde	d08464d6d9f54d25
 tlsresume	ReleaseFast	psk	1	0	d6669b6ec28b5079	eacdeeff2d24e2c4
 tlsresume	ReleaseFast	early	1	0	7925e34b53e391de	042b8c43588c7881
 # acme (2026-10-13) — the P-256 account / certificate private key (only the scalar

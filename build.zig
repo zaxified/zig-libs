@@ -31,6 +31,12 @@ pub const Module = struct {
     /// can be neither a dep nor a test dep. Never in the module, its tests or
     /// `module-graph`: the bench is run by hand, by no lane.
     bench_deps: []const []const u8 = &.{},
+    /// Modules ONLY its interop program (`tools/interop.zig`) imports, beside
+    /// `deps` and `test_deps` -- e.g. `tlsresume`'s live oracle needs a TLS
+    /// engine around it, and the engine (`tlsserver`) depends on `tlsresume`.
+    /// Same reach as `bench_deps`: never the module, its tests or
+    /// `module-graph`; `check-interop` compiles it.
+    interop_deps: []const []const u8 = &.{},
     /// This module ships `example/main.zig`: a consumer binary built by
     /// `zig build check-examples` against the PUBLISHED module — `deps` only,
     /// no `test_deps`, no reach into anything the module does not export.
@@ -341,7 +347,7 @@ pub const module_list = [_]Module{
     .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{ "x509", "p256", "p384", "p521", "rsa", "tlsresume", "ct25519" }, .test_deps = &.{"testkit"}, .loopback = true }, // x509: RFC 5280 chain verification + DER guard
     .{ .name = "tls13", .libs = &.{"crypto"}, .deps = &.{ "rsa", "ct25519", "p256", "p384", "p521" }, .test_deps = &.{"testkit"} }, // shared TLS 1.3 core of dtls and (planned) tlsserver
     .{ .name = "tlsserver", .libs = &.{ "crypto", "net" }, .deps = &.{ "tls13", "aesgcm", "chachapoly", "netaddr", "x509", "rsa", "b64ct", "tlsresume", "p521", "hpke" }, .test_deps = &.{ "testkit", "tlsclient" }, .bench_deps = &.{"tlsclient"} }, // TLS 1.3 server (rustls scope incl. QUIC mode)
-    .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"} },
+    .{ .name = "tlsresume", .libs = &.{"crypto"}, .deps = &.{"aesgcm"}, .test_deps = &.{"testkit"}, .interop_deps = &.{"tlsserver"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{ "chachapoly", "aesgcm" }, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },
     .{ .name = "bip340", .libs = &.{"crypto"}, .deps = &.{"k256"}, .test_deps = &.{"testkit"} },
@@ -703,6 +709,7 @@ pub fn build(b: *std.Build) void {
             interop_mod.addImport(m.name, mod);
             for (m.deps) |dep| interop_mod.addImport(dep, mods.get(dep).?);
             for (m.test_deps) |dep| interop_mod.addImport(dep, mods.get(dep).?);
+            for (m.interop_deps) |dep| interop_mod.addImport(dep, mods.get(dep).?);
 
             const interop_exe = b.addExecutable(.{
                 .name = b.fmt("interop-{s}", .{m.name}),

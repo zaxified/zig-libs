@@ -33,7 +33,13 @@ const replay = @import("replay.zig");
 /// The fixed prefix this module expects inside an opened STEK ticket
 /// plaintext (see the module doc comment). `rms_len` is the resumption
 /// master secret / PSK length for the negotiated cipher suite's hash (32
-/// for SHA-256, 48 for SHA-384 — matches `Hkdf.prk_length`).
+/// for SHA-256, 48 for SHA-384 — matches `Hkdf.prk_length`). The prefix
+/// does not record `rms_len`: a SHA-384 state opened by a SHA-256
+/// `selectPsk` (one ring for both hashes) mis-slices, so put the suite or
+/// hash in the tail and reject a foreign one in the `Filter` (`tlsserver`
+/// does), or keep a ring per hash. Without that, such a ticket may parse
+/// and end in `error.BinderMismatch` instead of a full handshake
+/// (audit 2026-10-26 F6).
 pub fn SessionState(comptime rms_len: usize) type {
     return struct {
         const Self = @This();
@@ -108,6 +114,14 @@ pub fn SessionState(comptime rms_len: usize) type {
 /// RFC 8446 §4.6.1: a server MUST NOT use a `ticket_lifetime` above 604800 s
 /// (7 days). `selectPsk` skips any session older than this.
 pub const max_ticket_lifetime_ms: i64 = 604_800 * 1000;
+
+/// The largest freshness window `selectPsk` applies with a strike register
+/// of window `window_ms`: half of it, so the two together refuse every
+/// replay of an accepted ClientHello.
+pub fn strikeFreshnessCap(window_ms: i64) u32 {
+    if (window_ms <= 0) return 0;
+    return @intCast(@min(@divFloor(window_ms, 2), std.math.maxInt(u32)));
+}
 
 pub const SelectError = error{
     /// No offered identity unsealed and passed the checks. The engine should
@@ -204,15 +218,23 @@ pub fn Selection(comptime rms_len: usize) type {
 ///
 /// `error.NoAcceptableIdentity` if no offered identity passes all checks
 /// (the engine should fall back to a full handshake, not fail the
-/// connection); `error.BinderMismatch` is fatal (see step 5).
+/// connection); `error.BinderMismatch` is fatal (see step 5), and so is
+/// `identities.len != binders.len` (both counts come from the ClientHello).
 /// `open_scratch` backs the unsealed plaintext (see
 /// `stek.StekRing.open`'s `out` buffer) — sized by the caller for the
 /// largest session-state record it seals; the returned
-/// `session.ticket_nonce` slice points into it.
+/// `session.ticket_nonce` slice points into it. Every ticket opened and
+/// not selected is wiped there; the selected one (it holds the resumption
+/// master secret) stays for `session` to point into, and the caller wipes
+/// it (`std.crypto.secureZero(u8, open_scratch)`) once done with `session`.
 ///
 /// `strike` is optional because RFC 8446 §8 only MANDATES anti-replay for
 /// 0-RTT/early-data acceptance; a server that accepts a resumption PSK
-/// multiple times (no early data) may pass `null`.
+/// multiple times (no early data) may pass `null`. With a `strike`, the
+/// freshness window applied is at most `strikeFreshnessCap(strike.window_ms)`
+/// (half the register's window) — also when `freshness_window_ms` is null —
+/// so a replay the register has forgotten is too old to pass freshness
+/// (audit 2026-10-26 F1).
 pub fn selectPsk(
     comptime Hkdf: type,
     comptime Hmac: type,
@@ -252,13 +274,29 @@ fn selectBody(
     filter: ?Filter,
     open_scratch: []u8,
 ) SelectError!void {
-    // RFC 8446 §4.2.11.2: binders align 1:1 with identities; a mismatch is
-    // an engine-side parsing bug, not attacker-reachable input shape.
-    std.debug.assert(identities.len == binders.len);
+    // RFC 8446 §4.2.11: binders align 1:1 with identities. The counts come
+    // from the client: a mismatch is a malformed ClientHello, fatal like a
+    // binder that does not verify (an engine that checks the counts itself
+    // reports illegal_parameter first).
+    if (identities.len != binders.len) return error.BinderMismatch;
+
+    // With a strike register the freshness window is at most half its
+    // window: a ClientHello replayed later than the register remembers it is
+    // then too old to pass freshness (accepted at t0 with |reported - elapsed|
+    // <= W, a replay at t0 + d passes only for d <= 2W <= window_ms) — also
+    // when the caller passed no window at all.
+    const freshness_ms: ?u32 = if (strike) |register|
+        @min(freshness_window_ms orelse std.math.maxInt(u32), strikeFreshnessCap(register.window_ms))
+    else
+        freshness_window_ms;
 
     for (identities, binders, 0..) |identity, binder, i| {
         // 1. Unseal — not this server's live ticket? Try the next one.
         const plaintext = ring.openAt(identity.ticket, @divFloor(now_ms, 1000), policy, open_scratch) catch continue;
+        // The plaintext holds the resumption master secret: wiped unless
+        // this identity is selected (the caller wipes it then, see above).
+        var selected = false;
+        defer if (!selected) std.crypto.secureZero(u8, plaintext);
 
         // 2. Parse the canonical session-state prefix.
         const session = SessionState(Hkdf.prk_length).parse(plaintext) catch continue;
@@ -271,7 +309,7 @@ fn selectBody(
         // so a session that outlived every ticket lifetime never resumes.
         if (elapsed_ms < 0 or elapsed_ms > std.math.maxInt(u32)) continue;
         if (elapsed_ms > max_ticket_lifetime_ms) continue;
-        if (freshness_window_ms) |window| {
+        if (freshness_ms) |window| {
             const reported_age_ms = replay.deobfuscateAge(identity.obfuscated_ticket_age, session.ticket_age_add);
             if (!replay.withinFreshnessWindow(reported_age_ms, @intCast(elapsed_ms), window)) continue;
         }
@@ -305,6 +343,7 @@ fn selectBody(
         }
 
         out.* = .{ .selected_index = i, .psk = derived_psk, .session = session };
+        selected = true;
         return;
     }
     return error.NoAcceptableIdentity;
@@ -919,4 +958,153 @@ test "selectPsk: the filter sees the engine's tail and the age; refusing skips w
     bad[0] ^= 1;
     try testing.expectError(error.NoAcceptableIdentity, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &ring, .{}, &.{id}, &.{bad}, &empty_hash, &ch_hash, 7_000, null, null, .{ .ctx = &no, .accept = F.accept }, &scratch));
     try testing.expect(no.seen_len == 2);
+}
+
+/// One ticket under key 1 (0x42..), issued at `issued_at_ms` with
+/// `ticket_age_add`, for the audit 2026-10-26 tests below.
+const AuditFixture = struct {
+    const rms: [32]u8 = @splat(0xAB);
+    const nonce = [_]u8{ 0x00, 0x07 };
+    const issued_at_ms: i64 = 1_000_000;
+    const age_add: u32 = 0x1234_5678;
+
+    ring: stek.DefaultRing = .init(),
+    blob_buf: [160]u8 = undefined,
+    ticket: []const u8 = undefined,
+    empty_hash: [32]u8 = undefined,
+    ch_hash: [32]u8 = undefined,
+    binder: [32]u8 = undefined,
+
+    fn init(fx: *AuditFixture) !void {
+        fx.* = .{};
+        fx.ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+        const state = SessionState(32){ .resumption_master_secret = rms, .ticket_nonce = &nonce, .issued_at_ms = issued_at_ms, .ticket_age_add = age_add };
+        var plaintext_buf: [128]u8 = undefined;
+        fx.ticket = try fx.ring.seal(try state.serialize(&plaintext_buf), @splat(0x01), &fx.blob_buf);
+        fx.empty_hash = sha256Of("");
+        fx.ch_hash = sha256Of("audit ClientHello");
+        fx.binder = clientBinder(&rms, &nonce, &fx.empty_hash, &fx.ch_hash);
+    }
+
+    /// The identity a client sends `reported_age_ms` after issue.
+    fn identity(fx: *const AuditFixture, reported_age_ms: u32) OfferedIdentity {
+        return .{ .ticket = fx.ticket, .obfuscated_ticket_age = replay.obfuscateAge(reported_age_ms, age_add) };
+    }
+};
+
+test "selectPsk: a strike register caps freshness at half its window, so a replay it forgot is still refused (audit 2026-10-26 F1)" {
+    var fx: AuditFixture = undefined;
+    try fx.init();
+    var scratch: [256]u8 = undefined;
+    const window: i64 = 10_000;
+    // The client's clock runs 5 s ahead: reported age = elapsed + 5 000.
+    const first_ms = AuditFixture.issued_at_ms + 1_000;
+    const id = fx.identity(1_000 + 5_000);
+    // Both windows W: freshness is applied at W/2 — 5 000 still passes ...
+    {
+        var strike: replay.StrikeRegister = .init(testing.allocator, 8, window);
+        defer strike.deinit();
+        _ = try selectV(&fx.ring, .{}, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms, 10_000, &strike, &scratch);
+        // ... the same ClientHello again once the register forgot it (> W
+        // later): with freshness W it would pass (|5 000 - 10 001| <= W).
+        try testing.expectError(error.NoAcceptableIdentity, selectV(&fx.ring, .{}, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms + window + 1, 10_000, &strike, &scratch));
+    }
+    // No freshness window given with a strike register: W/2 applies.
+    {
+        var strike: replay.StrikeRegister = .init(testing.allocator, 8, window);
+        defer strike.deinit();
+        const exact = fx.identity(1_000);
+        _ = try selectV(&fx.ring, .{}, &.{exact}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms, null, &strike, &scratch);
+        try testing.expectError(error.NoAcceptableIdentity, selectV(&fx.ring, .{}, &.{exact}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms + window + 1, null, &strike, &scratch));
+        // Within W/2 of the server's age a fresh register takes it: the cap
+        // is a bound, not a refusal.
+        var strike2: replay.StrikeRegister = .init(testing.allocator, 8, window);
+        defer strike2.deinit();
+        _ = try selectV(&fx.ring, .{}, &.{exact}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms + 5_000, null, &strike2, &scratch);
+        var strike3: replay.StrikeRegister = .init(testing.allocator, 8, window);
+        defer strike3.deinit();
+        try testing.expectError(error.NoAcceptableIdentity, selectV(&fx.ring, .{}, &.{exact}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms + 5_001, null, &strike3, &scratch));
+    }
+    // Without a register nothing is capped: freshness is the caller's.
+    _ = try selectV(&fx.ring, .{}, &.{id}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, first_ms + window + 1, 10_000, null, &scratch);
+    try testing.expectEqual(@as(u32, 0), strikeFreshnessCap(-5));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), strikeFreshnessCap(std.math.maxInt(i64)));
+}
+
+test "selectPsk: identities and binders of different counts are BinderMismatch, not a panic (audit 2026-10-26 F2)" {
+    var fx: AuditFixture = undefined;
+    try fx.init();
+    var scratch: [256]u8 = undefined;
+    var sel: Selection(32) = undefined;
+    const id = fx.identity(1_000);
+    try testing.expectError(error.BinderMismatch, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &fx.ring, .{}, &.{ id, id }, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, AuditFixture.issued_at_ms + 1_000, null, null, null, &scratch));
+    try testing.expectError(error.BinderMismatch, selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &fx.ring, .{}, &.{id}, &.{ fx.binder, fx.binder }, &fx.empty_hash, &fx.ch_hash, AuditFixture.issued_at_ms + 1_000, null, null, null, &scratch));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&sel), 0));
+}
+
+test "selectPsk: an opened ticket not selected is wiped from open_scratch (audit 2026-10-26 F3)" {
+    var fx: AuditFixture = undefined;
+    try fx.init();
+    var scratch: [256]u8 = undefined;
+    const now = AuditFixture.issued_at_ms + 1_000;
+    const id = fx.identity(1_000);
+    // Skipped after opening (the freshness check fails).
+    @memset(&scratch, 0xEE);
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&fx.ring, .{}, &.{fx.identity(900_000)}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, now, 1_000, null, &scratch));
+    const plain_len = SessionState(32).wireLen(AuditFixture.nonce.len);
+    try testing.expect(std.mem.allEqual(u8, scratch[0..plain_len], 0));
+    // A binder that does not verify.
+    @memset(&scratch, 0xEE);
+    var bad = fx.binder;
+    bad[3] ^= 0x10;
+    try testing.expectError(error.BinderMismatch, selectV(&fx.ring, .{}, &.{id}, &.{bad}, &fx.empty_hash, &fx.ch_hash, now, null, null, &scratch));
+    try testing.expect(std.mem.allEqual(u8, scratch[0..plain_len], 0));
+    // Two identities, the first skipped: only the selected plaintext stays.
+    @memset(&scratch, 0xEE);
+    var sel: Selection(32) = undefined;
+    try selectPsk(HkdfSha256, HmacSha256, stek.DefaultRing, &sel, &fx.ring, .{}, &.{ fx.identity(900_000), id }, &.{ fx.binder, fx.binder }, &fx.empty_hash, &fx.ch_hash, now, 1_000, null, null, &scratch);
+    try testing.expectEqual(@as(usize, 1), sel.selected_index);
+    try testing.expectEqualSlices(u8, &AuditFixture.rms, scratch[0..32]);
+    try testing.expectEqualSlices(u8, &AuditFixture.nonce, sel.session.ticket_nonce);
+}
+
+// ── audit 2026-10-26: tests asked for by mutation survivors ──────────────────
+
+test "SessionState.serialize: an exact-size buffer fits, one byte less is BufferTooSmall (audit 2026-10-26 mutation)" {
+    const S = SessionState(32);
+    const nonce = [_]u8{ 1, 2 };
+    const state = S{ .resumption_master_secret = @splat(0x11), .ticket_nonce = &nonce, .issued_at_ms = 5, .ticket_age_add = 6 };
+    var buf: [64]u8 = undefined;
+    const need = S.wireLen(nonce.len);
+    try testing.expectEqual(need, (try state.serialize(buf[0..need])).len);
+    try testing.expectError(error.BufferTooSmall, state.serialize(buf[0 .. need - 1]));
+}
+
+test "selectPsk: an identity that opens but does not parse is skipped, the next one is still tried (audit 2026-10-26 mutation)" {
+    var fx: AuditFixture = undefined;
+    try fx.init();
+    var junk_buf: [64]u8 = undefined;
+    const junk = try fx.ring.seal("too short for a session", @splat(0x09), &junk_buf);
+    var scratch: [256]u8 = undefined;
+    const bad: OfferedIdentity = .{ .ticket = junk, .obfuscated_ticket_age = 0 };
+    const sel = try selectV(&fx.ring, .{}, &.{ bad, fx.identity(1_000) }, &.{ fx.binder, fx.binder }, &fx.empty_hash, &fx.ch_hash, AuditFixture.issued_at_ms + 1_000, null, null, &scratch);
+    try testing.expectEqual(@as(usize, 1), sel.selected_index);
+}
+
+test "selectPsk: with a strike register the caller's own smaller freshness window still applies (audit 2026-10-26 mutation)" {
+    var fx: AuditFixture = undefined;
+    try fx.init();
+    var scratch: [256]u8 = undefined;
+    const now = AuditFixture.issued_at_ms + 1_000; // elapsed 1000 ms
+    {
+        // Reported age off by 2000 ms: outside the caller's 1000 ms window, inside half the register's.
+        var strike: replay.StrikeRegister = .init(testing.allocator, 8, 100_000);
+        defer strike.deinit();
+        try testing.expectError(error.NoAcceptableIdentity, selectV(&fx.ring, .{}, &.{fx.identity(3_000)}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, now, 1_000, &strike, &scratch));
+    }
+    {
+        var strike: replay.StrikeRegister = .init(testing.allocator, 8, 100_000);
+        defer strike.deinit();
+        _ = try selectV(&fx.ring, .{}, &.{fx.identity(1_500)}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, now, 1_000, &strike, &scratch);
+    }
 }

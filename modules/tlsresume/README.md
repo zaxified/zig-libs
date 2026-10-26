@@ -99,6 +99,7 @@ tlsresume.select.selectPsk(
     now_ms,
     freshness_window_ms, // ?u32: null = the reported ticket age is not checked (no early data)
     &strike, // ?*replay.StrikeRegister; null only if you never accept early data
+             // (with one, freshness is capped at half its window)
     filter, // ?select.Filter: the engine's own checks on its fields (suite, SNI, lifetime)
     &open_scratch,
 ) catch |err| switch (err) {
@@ -142,7 +143,13 @@ RFC 8448 §3 NewSessionTicket bytes; the full §4 resumption chain
 (PSK/early-secret/binder-key/binder) byte-exact; the §4 0-RTT early-data
 chain ("c e traffic"/"e exp master"/key/iv) byte-exact — including opening
 the trace's real encrypted early-data record and a seal/open round-trip;
-STEK seal/open; strike-register replay policy; `selectPsk` end-to-end.
+STEK seal/open; strike-register replay policy; `selectPsk` end-to-end;
+real OpenSSL and Go resuming ClientHellos (and a 0-RTT record) replayed
+through `selectPsk`/`EarlyDataContext`.
+
+```sh
+zig build interop-tlsresume   # live: OpenSSL s_client + Go against tlsserver on these parts
+```
 
 ## Provenance
 

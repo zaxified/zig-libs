@@ -22,11 +22,11 @@
 //!
 //! - An identifier seen within the last `window_ms` is a replay: reject.
 //! - An identifier whose record has aged past `window_ms` is treated as
-//!   fresh again (its slot is reusable) — safe because entries older than
-//!   the freshness window are exactly the ones `withinFreshnessWindow`
-//!   already rejects upstream (a replayed ClientHello carries the ORIGINAL
-//!   `obfuscated_ticket_age`, so its reported age falls ever further behind
-//!   the server-measured age as time passes).
+//!   fresh again (its slot is reusable) — safe only while `window_ms` is at
+//!   least twice the freshness window (`select.selectPsk` caps it so): a
+//!   replayed ClientHello carries the ORIGINAL `obfuscated_ticket_age`, so
+//!   its reported age falls ever further behind the server-measured age,
+//!   and `withinFreshnessWindow` refuses it after at most twice its window.
 //! - Memory is hard-bounded at `capacity` entries (RFC 8446 §8 warns that
 //!   anti-replay state must not itself become a DoS vector): when full,
 //!   expired entries are evicted; if none are expired, the NEW identifier
@@ -81,10 +81,13 @@ pub const StrikeRegisterError = error{OutOfMemory};
 pub const StrikeRegister = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
-    /// How long a seen identifier stays "hot" (rejected as a replay).
-    /// Should be >= the freshness window the caller passes to
-    /// `withinFreshnessWindow`/`selectPsk` — entries older than that are
-    /// already unusable via the freshness check, so evicting them is safe.
+    /// How long a seen identifier stays "hot" (rejected as a replay). An
+    /// entry may age out only once freshness refuses its replay: a
+    /// ClientHello accepted with `|reported - elapsed| <= W` passes
+    /// freshness again for up to 2W, so this must be at least twice the
+    /// freshness window. `select.selectPsk` enforces it (it applies at most
+    /// `select.strikeFreshnessCap(window_ms)` = half, also when given no
+    /// window); a caller of `withinFreshnessWindow` on its own must keep it.
     window_ms: i64,
     /// Seen identifiers (keys are owned copies, freed on eviction/deinit)
     /// -> the `now_ms` at which each was first seen.
@@ -106,7 +109,10 @@ pub const StrikeRegister = struct {
     /// `false` if this is a replay (reject) or if the register is full of
     /// still-live entries (fail-closed; the engine falls back to a full
     /// handshake). `now_ms` is the caller's clock reading, monotone
-    /// non-decreasing across calls.
+    /// non-decreasing across calls. A new identifier on a full register
+    /// scans and evicts the expired entries first: O(capacity) per call
+    /// while full of live ones (only verified binders reach it through
+    /// `selectPsk`; size the capacity to the early-data rate per window).
     pub fn checkAndMark(self: *StrikeRegister, ticket_id: []const u8, now_ms: i64) StrikeRegisterError!bool {
         if (self.seen.getPtr(ticket_id)) |first_seen_ms| {
             if (now_ms - first_seen_ms.* <= self.window_ms) return false; // replay

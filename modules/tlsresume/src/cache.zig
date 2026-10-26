@@ -84,7 +84,12 @@ pub fn SessionCache(comptime max_id_len: usize, comptime max_state_len: usize) t
 
         /// Store `state` under `id`, replacing an existing entry with that id
         /// (the replacement becomes the newest). When full, the oldest entry
-        /// (insertion order) is evicted and wiped; capacity never fails.
+        /// (insertion order) is evicted and wiped; capacity never fails. With
+        /// a clock that never steps back the oldest is also the first to
+        /// expire, so a live entry goes only when none has expired. `id` is a bearer secret
+        /// the caller draws from a CSPRNG (16 bytes or more): the cache
+        /// takes any length, an empty one included. Ages are `now_s -
+        /// stored_at_s`: a clock stepped back keeps entries alive longer.
         pub fn put(self: *Self, id: []const u8, state: []const u8, now_s: i64) error{ IdTooLong, StateTooLarge }!void {
             if (id.len > max_id_len) return error.IdTooLong;
             if (state.len > max_state_len) return error.StateTooLarge;
@@ -241,4 +246,65 @@ test "ids of different length with equal prefix do not collide; empty id works" 
     try testing.expectEqualSlices(u8, "1", c.get("ab", 1, &out).?);
     try testing.expectEqualSlices(u8, "2", c.get("ab\x00", 1, &out).?);
     try testing.expectEqualSlices(u8, "3", c.get("", 1, &out).?);
+}
+
+// ── audit 2026-10-26: tests asked for by mutation survivors ──────────────────
+
+test "put: an id of exactly max_id_len and a state of exactly max_state_len are accepted (audit 2026-10-26 mutation)" {
+    var c = try C.init(testing.allocator, 2, 100);
+    defer c.deinit();
+    var out: [16]u8 = undefined;
+    try c.put("12345678", "0123456789abcdef", 0);
+    try testing.expectEqualSlices(u8, "0123456789abcdef", c.get("12345678", 1, &out).?);
+}
+
+test "get/take: an out buffer of exactly the state length is enough, one byte less keeps the entry (audit 2026-10-26 mutation)" {
+    var c = try C.init(testing.allocator, 2, 100);
+    defer c.deinit();
+    try c.put("id", "state-a", 0);
+    var exact: [7]u8 = undefined;
+    var short: [6]u8 = undefined;
+    try testing.expect(c.get("id", 1, &short) == null);
+    try testing.expect(c.take("id", 1, &short) == null);
+    try testing.expectEqualSlices(u8, "state-a", c.get("id", 1, &exact).?);
+    try testing.expectEqualSlices(u8, "state-a", c.take("id", 1, &exact).?);
+    try testing.expectEqual(@as(usize, 0), c.count());
+}
+
+test "expired entry: removed once, the count stays right on a second look and the slot is reusable (audit 2026-10-26 mutation)" {
+    var c = try C.init(testing.allocator, 1, 100);
+    defer c.deinit();
+    var out: [16]u8 = undefined;
+    try c.put("a", "s", 0);
+    try testing.expect(c.get("a", 100, &out) == null);
+    try testing.expectEqual(@as(usize, 0), c.count());
+    try testing.expect(c.get("a", 100, &out) == null);
+    try testing.expectEqual(@as(usize, 0), c.count());
+    try c.put("b", "t", 101);
+    try testing.expectEqual(@as(usize, 1), c.count());
+    try testing.expectEqualSlices(u8, "t", c.get("b", 102, &out).?);
+}
+
+test "remove: the entry is gone for get, not only uncounted (audit 2026-10-26 mutation)" {
+    var c = try C.init(testing.allocator, 2, 100);
+    defer c.deinit();
+    var out: [16]u8 = undefined;
+    try c.put("a", "s", 0);
+    c.remove("a");
+    try testing.expect(c.get("a", 1, &out) == null);
+    try testing.expectEqual(@as(usize, 0), c.count());
+}
+
+test "put: replacing an entry wipes what the longer old state left behind (audit 2026-10-26 mutation)" {
+    var c = try C.init(testing.allocator, 2, 100);
+    defer c.deinit();
+    try c.put("abcdefgh", "0123456789abcdef", 0);
+    try c.put("abcdefgh", "xy", 1);
+    var seen: usize = 0;
+    for (c.entries) |e| {
+        if (!e.used) continue;
+        seen += 1;
+        try testing.expect(std.mem.allEqual(u8, e.state[2..], 0));
+    }
+    try testing.expectEqual(@as(usize, 1), seen);
 }

@@ -43,6 +43,9 @@ const std = @import("std");
 /// tickets issued off this connection).
 pub const early_data_extension_type: u16 = 42;
 
+/// RFC 8446 §4.6.1: servers MUST NOT use a `ticket_lifetime` over 7 days.
+pub const max_ticket_lifetime_s: u32 = 604800;
+
 /// One `Extension` (RFC 8446 §4) — generic type + opaque data. Only
 /// `early_data` is interpreted by name in this module (`maxEarlyDataSize`);
 /// any other extension type round-trips as opaque bytes.
@@ -51,7 +54,13 @@ pub const Extension = struct {
     data: []const u8,
 };
 
-pub const EncodeError = error{BufferTooSmall};
+pub const EncodeError = error{
+    BufferTooSmall,
+    /// A field the wire cannot carry or RFC 8446 §4.6.1 forbids: a
+    /// `ticket_lifetime` over 604800 s, a nonce over 255 bytes, an empty
+    /// ticket or one over 65535 bytes, an extension block over 65535 bytes.
+    InvalidField,
+};
 pub const DecodeError = error{Malformed};
 
 pub const NewSessionTicket = struct {
@@ -62,11 +71,22 @@ pub const NewSessionTicket = struct {
     extensions: []const Extension = &.{},
 
     /// Encode the NewSessionTicket BODY (no handshake-message header) into
-    /// `out`. Returns the written slice, or `error.BufferTooSmall`.
+    /// `out`. Returns the written slice, `error.InvalidField` for a value
+    /// the message cannot carry (see `EncodeError`), or
+    /// `error.BufferTooSmall`.
     pub fn encode(self: NewSessionTicket, out: []u8) EncodeError![]u8 {
+        if (self.ticket_lifetime > max_ticket_lifetime_s) return error.InvalidField;
+        if (self.ticket_nonce.len > std.math.maxInt(u8)) return error.InvalidField;
+        if (self.ticket.len == 0 or self.ticket.len > std.math.maxInt(u16)) return error.InvalidField;
         // 4 (lifetime) + 4 (age_add) + 1+nonce + 2+ticket + 2+extensions.
         var ext_len: usize = 0;
-        for (self.extensions) |e| ext_len += 2 + 2 + e.data.len;
+        for (self.extensions, 0..) |e, i| {
+            if (e.data.len > std.math.maxInt(u16)) return error.InvalidField;
+            // RFC 8446 §4.2: no extension type twice in one message.
+            for (self.extensions[0..i]) |seen| if (seen.ext_type == e.ext_type) return error.InvalidField;
+            ext_len += 2 + 2 + e.data.len;
+        }
+        if (ext_len > std.math.maxInt(u16)) return error.InvalidField;
         const total = 4 + 4 + 1 + self.ticket_nonce.len + 2 + self.ticket.len + 2 + ext_len;
         if (out.len < total) return error.BufferTooSmall;
 
@@ -146,6 +166,8 @@ pub const NewSessionTicket = struct {
             r += 2;
             if (ext_end - r < data_len) return error.Malformed;
             if (n_ext >= ext_buf.len) return error.Malformed;
+            // RFC 8446 §4.2: no extension type twice in one message.
+            for (ext_buf[0..n_ext]) |seen| if (seen.ext_type == ext_type) return error.Malformed;
             ext_buf[n_ext] = .{ .ext_type = ext_type, .data = bytes[r..][0..data_len] };
             n_ext += 1;
             r += data_len;
@@ -304,6 +326,40 @@ test "encode: BufferTooSmall on an undersized destination" {
     try testing.expectError(error.BufferTooSmall, nst.encode(&tiny));
 }
 
+test "encode: InvalidField for what the wire cannot carry or RFC 8446 forbids (audit 2026-10-26 F4)" {
+    const big = try testing.allocator.alloc(u8, 1 << 17);
+    defer testing.allocator.free(big);
+    @memset(big, 0x5a);
+    const ok: NewSessionTicket = .{ .ticket_lifetime = max_ticket_lifetime_s, .ticket_age_add = 0, .ticket_nonce = big[0..255], .ticket = big[0..65535] };
+    const wide = try testing.allocator.alloc(u8, 1 << 17);
+    defer testing.allocator.free(wide);
+    _ = try ok.encode(wide);
+    var out: [128]u8 = undefined;
+    const cases = [_]NewSessionTicket{
+        .{ .ticket_lifetime = max_ticket_lifetime_s + 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t" },
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = big[0..256], .ticket = "t" },
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "" },
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = big[0..65536] },
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = 7, .data = big[0..65536] }} },
+        // Two extensions that fit alone but not together in the u16 block.
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{ .{ .ext_type = 7, .data = big[0..40000] }, .{ .ext_type = 8, .data = big[0..40000] } } },
+        .{ .ticket_lifetime = 1, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{ .{ .ext_type = 42, .data = "\x00\x00\x40\x00" }, .{ .ext_type = 42, .data = "\x00\x00\x00\x00" } } },
+    };
+    for (cases) |c| try testing.expectError(error.InvalidField, c.encode(&out));
+}
+
+test "decode: an extension type twice is Malformed (RFC 8446 §4.2; audit 2026-10-26 F10)" {
+    var ext_buf: [4]Extension = undefined;
+    // lifetime, age_add, empty nonce, ticket "t", two early_data extensions.
+    const twice = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 1, 't', 0, 16 } ++
+        [_]u8{ 0, 42, 0, 4, 0, 0, 0x40, 0 } ++ [_]u8{ 0, 42, 0, 4, 0, 0, 0, 0 };
+    try testing.expectError(error.Malformed, NewSessionTicket.decode(&twice, &ext_buf));
+    // The same message with distinct types decodes.
+    var distinct = twice;
+    distinct[23] = 43;
+    _ = try NewSessionTicket.decode(&distinct, &ext_buf);
+}
+
 // ── fuzz: NewSessionTicket.decode never panics on arbitrary bytes ─────────
 //
 // `decode` is the client-side parser for a handshake message the SERVER
@@ -350,12 +406,8 @@ const TicketCorpus = struct {
         var n: usize = 0;
 
         // 0: the all-zero minimum — the ONLY input this target ever ran.
-        const minimal = try (NewSessionTicket{
-            .ticket_lifetime = 0,
-            .ticket_age_add = 0,
-            .ticket_nonce = "",
-            .ticket = "",
-        }).encode(&scratch);
+        // (`encode` refuses the empty ticket, so it is spelled out.)
+        const minimal: []const u8 = &(@as([9]u8, @splat(0)) ++ [_]u8{ 0, 0, 0, 0 });
         self.entries[n] = kit.seedInto(&self.stores[n], minimal);
         n += 1;
 
@@ -398,7 +450,8 @@ const TicketCorpus = struct {
 
         // 3: eight extensions — `ext_buf` is `[8]Extension`, so this is the
         //    boundary at which the caller's buffer is exactly full.
-        const many = @as([8]Extension, @splat(.{ .ext_type = 1, .data = "z" }));
+        var many: [8]Extension = undefined;
+        for (&many, 0..) |*e, i| e.* = .{ .ext_type = @intCast(i + 1), .data = "z" };
         {
             const e = try (NewSessionTicket{
                 .ticket_lifetime = 1,
@@ -412,7 +465,8 @@ const TicketCorpus = struct {
         }
 
         // 4: nine — one past it.
-        const too_many = @as([9]Extension, @splat(.{ .ext_type = 1, .data = "z" }));
+        var too_many: [9]Extension = undefined;
+        for (&too_many, 0..) |*e, i| e.* = .{ .ext_type = @intCast(i + 1), .data = "z" };
         {
             const e = try (NewSessionTicket{
                 .ticket_lifetime = 1,
@@ -535,9 +589,11 @@ fn ticketHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!v
     const ticket_len = 1 + rnd.uintAtMost(usize, 39);
     var exts: [8]Extension = undefined;
     const n_ext = rnd.uintAtMost(usize, exts.len);
-    for (exts[0..n_ext]) |*e| e.* = .{ .ext_type = rnd.int(u16), .data = pool[0..rnd.uintAtMost(usize, 6)] };
+    // Distinct types (RFC 8446 §4.2): a random base, then consecutive.
+    const base = rnd.int(u16);
+    for (exts[0..n_ext], 0..) |*e, i| e.* = .{ .ext_type = base +% @as(u16, @intCast(i)), .data = pool[0..rnd.uintAtMost(usize, 6)] };
     const nst = NewSessionTicket{
-        .ticket_lifetime = rnd.int(u32),
+        .ticket_lifetime = rnd.uintAtMost(u32, max_ticket_lifetime_s),
         .ticket_age_add = rnd.int(u32),
         .ticket_nonce = pool[0..nonce_len],
         .ticket = pool[nonce_len..][0..ticket_len],
@@ -635,4 +691,39 @@ test "maxEarlyDataSize: only an early_data extension carrying exactly a uint32" 
     try testing.expectEqual(@as(?u32, null), short.maxEarlyDataSize());
     const good: NewSessionTicket = .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = early_data_extension_type, .data = &four }} };
     try testing.expectEqual(@as(?u32, 0x4000), good.maxEarlyDataSize());
+}
+
+// ── audit 2026-10-26: tests asked for by mutation survivors ──────────────────
+
+test "encode: an exact-size destination fits, one byte less is BufferTooSmall (audit 2026-10-26 mutation)" {
+    const nst = NewSessionTicket{ .ticket_lifetime = 1, .ticket_age_add = 2, .ticket_nonce = "n", .ticket = "ticket-bytes" };
+    var big: [64]u8 = undefined;
+    const need = (try nst.encode(&big)).len;
+    var exact: [64]u8 = undefined;
+    try testing.expectEqual(need, (try nst.encode(exact[0..need])).len);
+    try testing.expectError(error.BufferTooSmall, nst.encode(exact[0 .. need - 1]));
+}
+
+test "encode/decode: an extension block of exactly 65535 bytes is carried, one byte more is InvalidField (audit 2026-10-26 mutation)" {
+    const data = try testing.allocator.alloc(u8, 65532);
+    defer testing.allocator.free(data);
+    @memset(data, 0x33);
+    const out = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(out);
+    // 4 (type + length) + 65531 = 65535: the largest block the u16 length holds.
+    const fits = [_]Extension{.{ .ext_type = 7, .data = data[0..65531] }};
+    const nst = NewSessionTicket{ .ticket_lifetime = 1, .ticket_age_add = 2, .ticket_nonce = "", .ticket = "t", .extensions = &fits };
+    const wire = try nst.encode(out);
+    var ext_buf: [1]Extension = undefined;
+    const back = try NewSessionTicket.decode(wire, &ext_buf);
+    try testing.expectEqual(@as(usize, 65531), back.extensions[0].data.len);
+    const over = [_]Extension{.{ .ext_type = 7, .data = data[0..65532] }};
+    const too_big = NewSessionTicket{ .ticket_lifetime = 1, .ticket_age_add = 2, .ticket_nonce = "", .ticket = "t", .extensions = &over };
+    try testing.expectError(error.InvalidField, too_big.encode(out));
+}
+
+test "maxEarlyDataSize: an early_data extension longer than a uint32 is not a size (audit 2026-10-26 mutation)" {
+    const five = [_]u8{ 0, 0, 0x40, 0, 0 };
+    const long: NewSessionTicket = .{ .ticket_lifetime = 0, .ticket_age_add = 0, .ticket_nonce = "", .ticket = "t", .extensions = &.{.{ .ext_type = early_data_extension_type, .data = &five }} };
+    try testing.expectEqual(@as(?u32, null), long.maxEarlyDataSize());
 }
