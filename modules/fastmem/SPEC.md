@@ -6,11 +6,11 @@
 
 **Scope:** parity — musl libc `memset` and `memcpy` (MIT) (surveyed 2026-09-30; `memcpy` added 2026-10-26)
 
-**Audit:** review 2026-10-26 · mutation 2026-10-26 (40/46, 6 eq) · src f2c467db53fb8b19
+**Audit:** review 2026-10-26 · mutation 2026-10-26 (40/46, 6 eq) · src ac29a71ee71ac309
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07)
 
-**Performance:** ref 0.09–1.05× musl 1.2.5 memset/memcpy · fastest 0.56–1.09× glibc 2.43 memset/memcpy (measured 2026-10-26)
+**Performance:** ref 0.10–1.01× musl 1.2.5 memset/memcpy · fastest 0.57–1.08× glibc 2.43 memset/memcpy (measured 2026-10-26)
 
 **Evidence:** model-fuzz — 3000 seeded cases each for `set` and `copy` (length drawn per arm: small, overlap k = 1/2/4, vector loop, `rep movsb`, `rep stosq`; destination and source offsets 0..127; random fill byte and contents) compared byte by byte with the C11 definition, 128-byte guards checked untouched, every arm reached; plus exhaustive length 0..300 x offset 0..63 and PROT_NONE guard pages on both sides of source and destination
 
@@ -53,7 +53,7 @@ has its own vector loop); add them when a profile shows one.
   byte, and aligned 32-byte stores (four per iteration) from the first 32-aligned address after the
   start up to the start of the last vector. Every byte in range is written at
   least once, none outside it.
-- `len ≥ 192 KiB` on x86-64: the same head and tail vectors, and the aligned
+- `len ≥ 32 KiB` (`stos_min`; 192 KiB until 2026-10-26) on x86-64: the same head and tail vectors, and the aligned
   middle by `rep stosq` (8-byte pattern, `⌈(end − first) / 8⌉` qwords: the last
   one ends at most 7 bytes past the tail vector's start, inside the range). Past
   L2 a vector store pays a read-for-ownership of its line; the fast-string
@@ -132,7 +132,9 @@ library loaded into it.
   put the 64-byte skew at 1 and at 64. Every byte of the destination canvas is
   checked (inside: the source byte; outside: untouched), and the source is
   checked unchanged. `memcpy(null, null, 0)` returns null and touches nothing.
-- Model-fuzz (`modelFuzz`): see `**Evidence:**`. On its own it kills every
+- Model-fuzz (`modelFuzz`): see `**Evidence:**`. Buffer sizes follow the larger
+  of the two thresholds, so moving either one keeps every arm reachable (moving
+  `stos_min` below `4·movs_min` overran the canvas before that). On its own it kills every
   non-equivalent mutant of `set`/`copy` in the 2026-10-26 run; what it does not
   reach are the C wrappers (guard, return value, conversion of `c`) and pure
   over-reads, which the tests above and below cover.
@@ -200,7 +202,8 @@ the runner's own `memcpy`). 46 mutants over:
 - the C wrappers' guard, return value and conversion of `c`;
 - a pure over-read.
 
-**40 killed, 6 equivalent, 0 unexplained.** The 6 equivalent mutants each move one
+**40 killed, 6 equivalent, 0 unexplained.** Re-run after `stos_min` moved to
+32 KiB, over the source on the card: the same 40/46, the same six equivalent. The 6 equivalent mutants each move one
 boundary into the neighbouring arm, which writes the same bytes:
 
 - 2 / 24: `len < 2·k·32` in place of `<=` for `set` / `copy`, so length 64k takes
@@ -244,10 +247,10 @@ binary-wide `memset` runs before the test runner has an environment).
 
 ## What is deliberately not done
 
-- String stores below 192 KiB: `rep stosq` is level with the vector loop from 4 KiB
-  up while the buffer fits L2 (measured above), and costs its startup below that.
-  The threshold is one machine's L2; a CPU with a larger L2 would move it, and
-  there is no per-CPU dispatch to follow it.
+- String stores below 32 KiB: `rep stosq` is level with the four-store loop at
+  16 KiB and costs its startup below that (1 KiB: 15.6 against 9.3 ns, probe
+  2026-10-26). The threshold is one machine's L1d; a CPU with a different cache
+  would move it, and there is no per-CPU dispatch to follow it.
 - Non-temporal stores for huge buffers: no caller clears more than a few hundred
   KiB at a time. The same for copies: glibc switches to non-temporal stores
   somewhere between 2 and 4 MiB on this host and is 1.4–1.6× faster than `copy`
@@ -294,8 +297,19 @@ overlap-arm rewrite) is what the card carries: ref 0.09–1.05×, fastest
 day, `set_64k_a` was 1.02–1.10× musl and `cpy_64k_a` 0.99–1.06×. That is
 systematic, not noise: a 64 KiB aligned buffer is out of L1 and in L2, and
 musl moves it with `rep stosq` / `rep movsq` while `set` runs its vector loop
-(`setLarge` starts at 192 KiB). P1 (ref ≤ 1.0) needs a code change there (§
-Backlog), not a quieter host. → P2.
+(`setLarge` started at 192 KiB).
+
+**Then `rep stosq` from 32 KiB** (`stos_min` 192 → 32 KiB, 2026-10-26, 22:05). The
+probe against the four-store loop gave 0.77–0.82× at 32 KiB, level at 64 KiB and
+0.88–0.97× from 96 to 160 KiB. `bench-fastmem` after it (load 1.75–2.5) is what
+the card carries: ref 0.10–1.01×, fastest 0.57–1.08×. `set_64k_a` came out 1.01×
+(1035.70 against musl's 1028.78 ns), `cpy_64k_a` 1.00, `cpy_1m_a` and `cpy_1m_u`
+1.00.
+
+At 64 KiB aligned both sides now run the same string store, and the string
+store and the loop are level there, so the row sits at hardware parity. A
+re-run might land under 1.0 by chance; that would grade noise, so the card keeps
+this run. → P2.
 
 Earlier, memset only:
 
@@ -333,7 +347,7 @@ The other run (same day, spreads ≤ 20 %): ours/musl 0.41–1.05, worst again
 ## Backlog / deferred
 
 - ~~1 MiB 1.17–1.36× slower than musl and glibc~~ — DONE 2026-10-10: `rep stosq` past 192 KiB, now 0.90–1.02× both (§ Algorithm).
-- **Performance P2 → P1** *(bench 2026-10-10, updated 2026-10-26)*: ~~glibc 1.45–1.62× at 256 B, 4 KiB aligned 1.05× musl~~ — DONE 2026-10-26 (the overlap arm and the four-store loop: 1.10× and 0.81×). Left: the 64 KiB aligned rows, 1.02–1.10× musl `memset` and 0.99–1.06× musl `memcpy` over four runs. Candidates, to measure first: `rep stosq` from 32 KiB, which was 970 against 1036 ns for the loop at 64 KiB aligned in the 2026-10-26 probe (the 2026-10-10 probe had it at 0.95–1.07× between 4 and 192 KiB); for `copy`, `rep movsq` in place of `rep movsb` when source and destination share their alignment mod 8.
+- **Performance P2 → P1** *(bench 2026-10-10, updated 2026-10-26)*: ~~glibc 1.45–1.62× at 256 B, 4 KiB aligned 1.05× musl~~ — DONE 2026-10-26 (the overlap arm and the four-store loop: 1.10× and 0.81×). ~~`rep stosq` from 32 KiB~~ — DONE 2026-10-26 (32–160 KiB 3–23 % faster). Left: the 64 KiB aligned rows at 1.00–1.01× musl, which is hardware parity (§ Performance). Not taken: `rep movsq` for `copy` (probe 2026-10-26: 3–8 % faster at 1 MiB, 5–10 % slower at 64 KiB unaligned).
 - **No-libcall guard (review LOW-2, 2026-10-26).** Nothing checks that the
   compiled `set`, `copy`, `setLarge`, `copyLarge`, `setSmall` and `copySmall`
   contain no `call memset` or `call memcpy`. A dropped `volatile` would turn a

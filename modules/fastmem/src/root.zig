@@ -161,12 +161,14 @@ pub fn exportSymbols() void {
 
 const V = @Vector(32, u8);
 
-/// Above this length the middle is stored by `rep stosq` instead of the
-/// vector loop. Measured 2026-10-11 on an i7-7920HQ (256 KiB L2): the string
-/// store is 0.95-1.07x the loop from 4 KiB to 192 KiB and 0.75-0.84x from
-/// 256 KiB up, where the buffer leaves L2 and the loop's stores each pay a
-/// read-for-ownership the fast-string protocol skips.
-const stos_min = 192 * 1024;
+/// From this length up the middle is stored by `rep stosq` instead of the
+/// vector loop. Measured on an i7-7920HQ (32 KiB L1d, 256 KiB L2): from
+/// 256 KiB up the string store is 0.75-0.84x the loop (2026-10-11), where the
+/// loop's stores each pay a read-for-ownership the fast-string protocol skips;
+/// against the four-store loop (2026-10-26) it is 0.77-0.82x at 32 KiB,
+/// level at 64 KiB and 0.88-0.97x from 96 to 160 KiB -- once the buffer is
+/// out of L1. At 16 KiB the two are level.
+const stos_min = 32 * 1024;
 
 // Not under the C backend: it would have to spell the register constraints
 // in C, and nothing there is measured.
@@ -426,7 +428,7 @@ fn guardByte(i: usize) u8 {
 fn modelFuzz(comptime op: enum { set, copy }, seed: u64, cases: usize) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    const max_len = if (op == .set) stos_min + 4096 else 4 * movs_min;
+    const max_len = @max(stos_min + 4096, 4 * movs_min); // the longest arm, whatever the thresholds
     const cap = max_len + 128 + 2 * fuzz_guard;
     const dst = try testing.allocator.alignedAlloc(u8, .@"64", cap);
     defer testing.allocator.free(dst);
@@ -500,7 +502,7 @@ test "copy, set: no access outside the range, against PROT_NONE pages on both si
     // over-reads of `src`, which the guard-byte checks elsewhere cannot see.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const page = std.heap.page_size_min;
-    const data_len = std.mem.alignForward(usize, stos_min + 4096, page);
+    const data_len = std.mem.alignForward(usize, @max(stos_min + 4096, 3 * movs_min + 5), page);
     const map = try std.posix.mmap(null, data_len + 2 * page, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
     defer std.posix.munmap(map);
     try testing.expectEqual(@as(usize, 0), std.os.linux.mprotect(map.ptr, page, .{}));

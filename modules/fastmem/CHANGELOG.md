@@ -12,6 +12,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   New tests: seeded model-fuzz of `set` and `copy` against the C definition,
   PROT_NONE guard pages around source and destination, negative `c`. No API
   change.
+- **2026-10-26** — `set` uses `rep stosq` from 32 KiB instead of 192 KiB on
+  x86-64: 32 KiB clears 18–23 % faster, 96–160 KiB 3–12 %, 64 KiB level. No API
+  change.
 - **2026-10-26** — New: `copy` and the C `memcpy`, and `exportSymbols` now
   exports `memcpy` too (a consumer that already calls it gets the faster copy on
   its next build). Against Zig 0.17.0's compiler_rt `memcpy` 1.1–2.0× faster,

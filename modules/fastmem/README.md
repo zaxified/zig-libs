@@ -14,7 +14,7 @@ whose compiler_rt `memset` stored one byte per iteration, `memset` was 20–27×
   § Performance). The speed table below is the 0.16 measurement.
 - **Model after:** musl's and Go's runtime `memclr`: full-width vector stores
   with overlapping unaligned first and last vectors; `rep stosq` for the middle
-  of clears past 192 KiB on x86-64 (level with musl and glibc at 1 MiB). `memcpy`
+  of clears from 32 KiB on x86-64 (level with musl and glibc at 1 MiB). `memcpy`
   the same way (up to 256 B with no loop at all), with `rep movsb` to a 64-aligned
   destination from 16 KiB on x86-64.
 - **Platform:** any (portable `@Vector` code). **Role:** util.
