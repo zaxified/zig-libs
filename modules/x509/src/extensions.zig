@@ -187,6 +187,13 @@ test "extensionId: the same answer as std's ExtensionId map" {
     try std.testing.expectEqual(@as(?Certificate.ExtensionId, null), extensionId(&.{ 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x02 }));
 }
 
+test "ExtensionIterator: an extnID that is not an OBJECT IDENTIFIER is refused" {
+    // Extension { extnID OCTET STRING 55 1d 13, extnValue OCTET STRING { SEQUENCE {} } }.
+    const bytes = [_]u8{ 0x30, 0x09, 0x04, 0x03, 0x55, 0x1d, 0x13, 0x04, 0x02, 0x30, 0x00 };
+    var it: ExtensionIterator = .{ .bytes = &bytes, .pos = 0, .end = bytes.len };
+    try std.testing.expectError(error.CertificateFieldHasWrongDataType, it.next());
+}
+
 pub const ExtensionIterator = struct {
     bytes: []const u8,
     pos: u32,

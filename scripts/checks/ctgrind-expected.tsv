@@ -440,9 +440,9 @@ k256	ReleaseFast	ecdsa	1	10	9f24c2c22313da6e	8ff4812d21149442
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	3a9d8b6915dcc409	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	3a9d8b6915dcc409	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	3a9d8b6915dcc409	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	df7f55b675e8531a	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	df7f55b675e8531a	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	df7f55b675e8531a	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -451,7 +451,7 @@ montint	ReleaseFast	asmcore	1	0	3a9d8b6915dcc409	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	526df7cce588262e	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	727e98413bc301d3	efbe5c72b7a484c2
 # Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
 # rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
 # `cmov` (ff.zig:359, `ct.select` per table entry, unswitched into a jump) under
@@ -466,7 +466,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	d119905673d7d9aa	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	94880a83bb6a5346	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	dafe6cbd62820782	e3c458c38b8cf4a8
@@ -483,8 +483,8 @@ p256	ReleaseFast	sign	1	<=12	dedec99b1fbbb20e	af4baed5c5134f3f
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	2a8013f8d4927d7d	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	2a8013f8d4927d7d	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	d9d4ca764e8d6b3f	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	d9d4ca764e8d6b3f	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -495,8 +495,8 @@ rsa	ReleaseFast	noncrt	1	0	2a8013f8d4927d7d	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig:1128) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig:1200 draw, 1290 F3 twice).
-rsa	ReleaseFast	crtbl	1	2	2a8013f8d4927d7d	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	2a8013f8d4927d7d	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	d9d4ca764e8d6b3f	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	d9d4ca764e8d6b3f	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -508,7 +508,7 @@ rsa	ReleaseFast	crtcache	1	4	2a8013f8d4927d7d	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	2a8013f8d4927d7d	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	d9d4ca764e8d6b3f	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).

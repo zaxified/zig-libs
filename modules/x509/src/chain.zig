@@ -1255,8 +1255,8 @@ const tag_bit_string: u8 = 0x03;
 const Memo = struct {
     const cap = 12;
     ders: [cap]CertDer = undefined,
-    shapes: [cap]?Shape = undefined,
-    parsed: [cap]?Certificate.Parsed = undefined,
+    shapes: [cap]?Shape = @splat(null),
+    parsed: [cap]?Certificate.Parsed = @splat(null),
     len: usize = 0,
 
     fn slot(m: *Memo, cert_der: CertDer) ?usize {
@@ -1265,8 +1265,6 @@ const Memo = struct {
         }
         if (m.len == cap) return null;
         m.ders[m.len] = cert_der;
-        m.shapes[m.len] = null;
-        m.parsed[m.len] = null;
         m.len += 1;
         return m.len - 1;
     }

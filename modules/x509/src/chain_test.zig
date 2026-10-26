@@ -1161,3 +1161,14 @@ test "audit 2026-10-26: a CRL entry's serial matches however minimally it is enc
     try testing.expect(c.find(&.{ 0x00, 0x05 }) != null);
     try testing.expect(c.find(&.{0x06}) == null);
 }
+
+test "audit 2026-10-26: VerifiedChain.leaf is the leaf's own parse" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const c = try testChain(&g, .{});
+    const v = try chain_mod.verifyChain(testing.allocator, c.chainCerts(), &c.roots, .{ .now_sec = certgen.t_now });
+    try testing.expectEqual(c.presented[0].ptr, v.leaf.?.certificate.buffer.ptr);
+    try testing.expectEqual(c.presented[0].ptr, v.leaf_der.ptr);
+    try testing.expectEqualStrings("leaf", v.leaf.?.commonName());
+}

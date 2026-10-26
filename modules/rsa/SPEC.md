@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-12 · mutation 2026-10-18 (97/107, 10 eq) · src 07bcec7d9ab8850c
 
-**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-03 (ctgrind)
+**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-26 (ctgrind)
 
 **Performance:** ref 0.84–1.08× OpenSSL 3.5.5 · fastest ? (measured 2026-10-18; `.cached` blinding 1.02–1.03× at 2048)
 

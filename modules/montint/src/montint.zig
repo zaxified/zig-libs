@@ -218,17 +218,23 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         // operation and dominated it (measured 2026-09-08: 606 us of setup for
         // a 36 us verify, 2048-bit modulus).
         //
-        // So the second half is a ladder instead. Writing f(k) = 2^k mod m,
-        // `montMul(f(a), f(b)) = f(a + b - 64L)`, hence for x = f(64L + d):
+        // So the second half came from fewer, dearer steps. Writing
+        // f(k) = 2^k mod m, `montMul(f(a), f(b)) = f(a + b - 64L)`, hence for
+        // x = f(64L + d) (the Montgomery form of 2^d):
         //
-        //     montMul(x, x)  ->  f(64L + 2d)     d doubles
+        //     montSqr(x)     ->  f(64L + 2d)     d doubles
         //     doubleMod(x)   ->  f(64L + d + 1)  d increments
         //
-        // which is square-and-add over the bits of 64L: ~log2(64L) Montgomery
-        // multiplications where there were 64L doublings. The bit pattern
-        // driving it is 64·L, a COMPTIME constant — the work depends on `L`
-        // alone and never on the modulus, so this stays constant-time in `m`,
-        // which matters because `rsa` calls this on the secret CRT primes.
+        // From x = R mod m (d = 0), L doublings give d = L and six squarings
+        // d = 64·L: x = R² mod m. ring's `One::newRR` makes the same choice
+        // (t = the limb count): a doubling is a pass over L limbs, a
+        // squaring ~L² products, so 32 doublings + 6 squarings at 2048 bits
+        // cost less than the square-and-add ladder over the bits of 64·L it
+        // replaced (2026-10-26: 1 doubling + 11 `montMul(x, x)`; ~25 % of an
+        // `x509` RSA-2048 link was this setup). Both counts are COMPTIME —
+        // the work depends on `L` alone and never on the modulus, so this
+        // stays constant-time in `m`, which matters because `rsa` calls it
+        // on the secret CRT primes.
         //
         // `start` is a bit position with `2^start < m` (0 always qualifies;
         // `bits(m) − 1` is the highest, the public-length shortcut of
@@ -242,23 +248,8 @@ pub fn Modint(comptime max_bits: comptime_int) type {
             while (i < 64 * L) : (i += 1) self.doubleMod(&acc);
             self.one_mont = acc;
 
-            // Ladder the remaining 64·L into the exponent. `started` only
-            // skips leading no-op squarings — montMul(R, R) = R·R·R⁻¹ = R — so
-            // it is an optimisation, not a correctness condition. Verified by
-            // mutation on 2026-09-08: removing it leaves the differential below
-            // GREEN (an equivalent mutant), while shortening the ladder by one
-            // bit turns 14 checks red.
-            const e: u64 = 64 * L;
-            var bit: usize = 63 - @clz(e);
-            var started = false;
-            while (true) : (bit -= 1) {
-                if (started) acc = self.montMul(&acc, &acc);
-                if ((e >> @intCast(bit)) & 1 == 1) {
-                    self.doubleMod(&acc);
-                    started = true;
-                }
-                if (bit == 0) break;
-            }
+            for (0..L) |_| self.doubleMod(&acc);
+            for (0..6) |_| acc = self.montSqr(&acc);
             self.r2 = acc;
         }
 
@@ -1336,7 +1327,7 @@ test "fromElemUncheckedBits: the same constants as starting from 1, for every bi
 test "R2 ladder agrees with the doubling reference, bit for bit, on every slot" {
     var prng = std.Random.DefaultPrng.init(0x5EED_2026);
     const rnd = prng.random();
-    inline for (.{ 4, 8, 16, 24, 32 }) |L| {
+    inline for (.{ 1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 128 }) |L| {
         const M = Modint(L * 64);
         var trial: usize = 0;
         while (trial < 24) : (trial += 1) {

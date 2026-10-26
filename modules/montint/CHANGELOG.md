@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** `R² mod m` (every `Modint` / `DynModint` construction) is built from `R mod m` by L doublings and six `montSqr` steps (ring's `One::newRR` choice) instead of the square-and-add ladder over the bits of 64·L with `montMul(x, x)` (1 doubling + 11 multiplies at 2048 bits). Same constants bit for bit (the doubling-reference test now covers L = 1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 128); step counts still depend on L alone, so the derivation stays constant-time in the modulus. A public RSA-2048 key setup is about a third cheaper; `x509`'s RSA-2048 chain verification went 65 → 56 µs.
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
