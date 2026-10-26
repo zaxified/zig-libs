@@ -362,15 +362,17 @@ test "checkNameConstraints: iPAddress CIDR containment" {
     try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&permitted, &excluded, "dn", &out_of_range));
 }
 
+/// One single-valued RDN: SET { SEQUENCE { OID 2.5.4.<attr>, <str_tag> value } }.
+fn testRdn(comptime attr: u8, comptime str_tag: u8, comptime v: []const u8) [11 + v.len]u8 {
+    return [_]u8{ 0x31, 9 + v.len, 0x30, 7 + v.len, 0x06, 0x03, 0x55, 0x04, attr, str_tag, v.len } ++ v[0..v.len].*;
+}
+
 test "checkNameConstraints: directoryName RDN-sequence prefix containment" {
-    // `dnMatchesPrefix` matches generic DER elements one at a time (the
-    // encoded byte span of each successive "RDN" must be identical) — it
-    // doesn't need real X.501 AttributeTypeAndValue structure to exercise
-    // the prefix-containment algorithm itself, so plain OCTET STRING
-    // elements stand in for RDNs here.
-    const rdn_org = [_]u8{ 0x04, 3, 'O', 'r', 'g' }; // one "RDN": "Org"
-    const rdn_sub = [_]u8{ 0x04, 3, 'S', 'u', 'b' }; // another: "Sub"
-    const rdn_other = [_]u8{ 0x04, 5, 'O', 't', 'h', 'e', 'r' };
+    // Until 2026-10-26 OCTET STRINGs stood in for RDNs here; an element that
+    // is not an RDN (a SET) is now unreadable and fails closed.
+    const rdn_org = testRdn(0x0a, 0x0c, "Org"); // O=Org
+    const rdn_sub = testRdn(0x0b, 0x0c, "Sub"); // OU=Sub
+    const rdn_other = testRdn(0x0a, 0x0c, "Other"); // O=Other
 
     const base = rdn_org; // base DN = [Org]
     const name_prefixed = rdn_org ++ rdn_sub; // name DN = [Org, Sub] -> base is a strict prefix
@@ -449,6 +451,44 @@ test "checkNameConstraints: a real directoryName constraint ([4] EXPLICIT Name) 
     // An empty Name as the base admits every name.
     const empty_base = [_]u8{ 0x30, 0x04, 0xa4, 0x02, 0x30, 0x00 };
     try chain_mod.checkNameConstraints(&[_][]const u8{&empty_base}, &none, &subj_evil, "");
+}
+
+test "checkNameConstraints: directoryName values compare as RFC 5280 §7.1 prepared strings; unreadable ones fail closed (audit 2026-10-26, F1/F2)" {
+    // Negative control (byte comparison, the code before the fix): every
+    // spelling below passed the excluded O=Evil Org.
+    const rdn_evil = testRdn(0x0a, 0x0c, "Evil Org");
+    const name_evil = [_]u8{ 0x30, rdn_evil.len } ++ rdn_evil;
+    const gn_evil = [_]u8{ 0xa4, name_evil.len } ++ name_evil;
+    const subtree_evil = [_]u8{ 0x30, gn_evil.len } ++ gn_evil;
+    const set = [_][]const u8{&subtree_evil};
+    const none = [_][]const u8{};
+    const rdn_cn = testRdn(0x03, 0x0c, "leaf");
+    const spellings = [_][]const u8{
+        &(testRdn(0x0a, 0x0c, "evil org") ++ rdn_cn), // case
+        &(testRdn(0x0a, 0x0c, "  Evil   Org ") ++ rdn_cn), // white space
+        &(testRdn(0x0a, 0x13, "Evil Org") ++ rdn_cn), // PrintableString
+        &(testRdn(0x0a, 0x14, "EVIL ORG") ++ rdn_cn), // TeletexString
+        &(testRdn(0x0a, 0x1e, "\x00E\x00v\x00i\x00l\x00 \x00O\x00r\x00g") ++ rdn_cn), // BMPString
+    };
+    for (spellings) |subject| {
+        try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &set, subject, ""));
+        // The same reading admits it under a permitted O=Evil Org.
+        try chain_mod.checkNameConstraints(&set, &none, subject, "");
+    }
+    // A different name is still outside.
+    try chain_mod.checkNameConstraints(&none, &set, &(testRdn(0x0a, 0x0c, "Evil Orgs") ++ rdn_cn), "");
+    // Unreadable: invalid UTF-8, a PrintableString byte >= 0x80, an RDN that is
+    // not a SET. Excluded rejects, permitted does not admit (F2: excluded let
+    // them through).
+    const unreadable = [_][]const u8{
+        &(testRdn(0x0a, 0x0c, "Evil\xffOrg") ++ rdn_cn),
+        &(testRdn(0x0a, 0x13, "Evil\xe9Org") ++ rdn_cn),
+        &([_]u8{ 0x30, 0x0c, 0x30, 0x0a, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x0c, 0x03, 'O', 'r', 'g' } ++ rdn_cn),
+    };
+    for (unreadable) |subject| {
+        try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&none, &set, subject, ""));
+        try testing.expectError(error.NameConstraintViolated, chain_mod.checkNameConstraints(&set, &none, subject, ""));
+    }
 }
 
 // ── checkExtendedKeyUsage ──────────────────────────────────────────────────

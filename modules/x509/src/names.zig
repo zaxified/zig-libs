@@ -125,7 +125,7 @@ pub fn match(tag: Tag, name: []const u8, base: []const u8) Match {
         .dNSName => matchDns(name, base),
         .rfc822Name => matchRfc822(name, base),
         .uniformResourceIdentifier => matchUri(name, base),
-        .directoryName => fromBool(matchDirectory(rdnSequence(name), rdnSequence(base))),
+        .directoryName => matchDirectory(rdnSequence(name), rdnSequence(base)),
         .iPAddress => matchIp(name, base),
         else => .unsupported,
     };
@@ -320,25 +320,224 @@ fn rdnSequence(v: []const u8) []const u8 {
     return v[e.slice.start..e.slice.end];
 }
 
-/// directoryName: the constraint's RDNSequence must be an element-wise
-/// prefix of the name's (whole encoded RDNs compared, so a match cannot end
-/// inside one).
-pub fn matchDirectory(name: []const u8, base: []const u8) bool {
-    if (base.len == 0) return true;
+/// directoryName: the constraint's RDNSequence must be a prefix of the
+/// name's, RDN by RDN (a match cannot end inside one), each pair compared by
+/// `rdnEql`. `unsupported` when either side cannot be read, so an excluded
+/// subtree rejects it.
+///
+/// Until 2026-10-26 the RDNs were compared byte for byte: a subordinate CA
+/// under an excluded `O=Evil Org` could issue `O=evil org`, `O=Evil  Org` or
+/// the same text as a PrintableString instead of a UTF8String, and pass
+/// (audit 2026-10-26, F1); an unreadable name or base counted as outside, so
+/// an excluded subtree let it through (F2).
+pub fn matchDirectory(name: []const u8, base: []const u8) Match {
+    if (base.len == 0) return .inside;
+    if (name.len > std.math.maxInt(u32) or base.len > std.math.maxInt(u32)) return .unsupported;
     var name_pos: u32 = 0;
     var base_pos: u32 = 0;
-    const name_end: u32 = @intCast(name.len);
-    const base_end: u32 = @intCast(base.len);
-    while (base_pos < base_end) {
-        const base_elem = extensions.parseElement(base, base_pos) catch return false;
-        if (name_pos >= name_end) return false;
-        const name_elem = extensions.parseElement(name, name_pos) catch return false;
-        if (!std.mem.eql(u8, base[base_pos..base_elem.slice.end], name[name_pos..name_elem.slice.end])) return false;
-        base_pos = base_elem.slice.end;
-        name_pos = name_elem.slice.end;
+    while (base_pos < base.len) {
+        const base_rdn = rdnAt(base, base_pos) orelse return .unsupported;
+        if (name_pos >= name.len) return .outside;
+        const name_rdn = rdnAt(name, name_pos) orelse return .unsupported;
+        switch (rdnEql(name[name_rdn.start..name_rdn.end], base[base_rdn.start..base_rdn.end])) {
+            .equal => {},
+            .different => return .outside,
+            .unreadable => return .unsupported,
+        }
+        base_pos = base_rdn.end;
+        name_pos = name_rdn.end;
     }
-    return true;
+    return .inside;
 }
+
+/// The content of the RDN (a SET) at `pos`, or null when it is not one.
+fn rdnAt(seq: []const u8, pos: u32) ?struct { start: u32, end: u32 } {
+    const e = extensions.parseElement(seq, pos) catch return null;
+    if (@as(u8, @bitCast(e.identifier)) != 0x31) return null;
+    return .{ .start = e.slice.start, .end = e.slice.end };
+}
+
+const Eql = enum { equal, different, unreadable };
+
+/// Two RDNs (SET contents) are equal when they hold the same number of
+/// AttributeTypeAndValues and every one of `b`'s has an equal one in `a`
+/// (`atvEql`; a SET is unordered, and canonical forms need not sort as the
+/// DER encodings do).
+fn rdnEql(a: []const u8, b: []const u8) Eql {
+    const n_a = countAtvs(a) orelse return .unreadable;
+    const n_b = countAtvs(b) orelse return .unreadable;
+    if (n_a != n_b) return .different;
+    var b_pos: u32 = 0;
+    while (b_pos < b.len) {
+        const b_atv = extensions.parseElement(b, b_pos) catch return .unreadable;
+        b_pos = b_atv.slice.end;
+        var found = false;
+        var a_pos: u32 = 0;
+        while (a_pos < a.len) {
+            const a_atv = extensions.parseElement(a, a_pos) catch return .unreadable;
+            a_pos = a_atv.slice.end;
+            switch (atvEql(a[a_atv.slice.start..a_atv.slice.end], b[b_atv.slice.start..b_atv.slice.end])) {
+                .equal => found = true,
+                .different => {},
+                .unreadable => return .unreadable,
+            }
+        }
+        if (!found) return .different;
+    }
+    return .equal;
+}
+
+/// AttributeTypeAndValues in an RDN, each a SEQUENCE; null if any is not.
+fn countAtvs(rdn: []const u8) ?usize {
+    var n: usize = 0;
+    var pos: u32 = 0;
+    while (pos < rdn.len) : (n += 1) {
+        const e = extensions.parseElement(rdn, pos) catch return null;
+        if (@as(u8, @bitCast(e.identifier)) != 0x30) return null;
+        pos = e.slice.end;
+    }
+    return n;
+}
+
+/// One AttributeTypeAndValue (SEQUENCE content) against another: the same
+/// type OID, and values equal as `valueEql` reads them.
+fn atvEql(a: []const u8, b: []const u8) Eql {
+    const ta, const va = splitAtv(a) orelse return .unreadable;
+    const tb, const vb = splitAtv(b) orelse return .unreadable;
+    if (!std.mem.eql(u8, ta, tb)) return .different;
+    return valueEql(va, vb);
+}
+
+/// The type OID (whole TLV) and the value (whole TLV) of an ATV.
+fn splitAtv(atv: []const u8) ?struct { []const u8, []const u8 } {
+    const t = extensions.parseElement(atv, 0) catch return null;
+    if (@as(u8, @bitCast(t.identifier)) != 0x06 or t.slice.end >= atv.len) return null;
+    const v = extensions.parseElement(atv, t.slice.end) catch return null;
+    if (v.slice.end != atv.len) return null;
+    return .{ atv[0..t.slice.end], atv[t.slice.end..] };
+}
+
+/// RFC 5280 §7.1: two directory string values match after string
+/// preparation. Implemented as OpenSSL canonicalises names for its own
+/// name-constraint check (`x509_name_canon`): every directory string type is
+/// read as Unicode (UTF8String, PrintableString, IA5String, VisibleString,
+/// TeletexString as Latin-1, BMPString, UniversalString), leading and
+/// trailing white space dropped, inner runs of it one space, ASCII letters
+/// folded to lower case — so the string type and those spellings no longer
+/// tell two names apart. Not done: RFC 4518's full Unicode case folding and
+/// normalisation (a non-ASCII letter in another case still differs, as in
+/// OpenSSL). Any other value type compares as encoded.
+fn valueEql(a: []const u8, b: []const u8) Eql {
+    const ea = extensions.parseElement(a, 0) catch return .unreadable;
+    const eb = extensions.parseElement(b, 0) catch return .unreadable;
+    const tag_a: u8 = @bitCast(ea.identifier);
+    const tag_b: u8 = @bitCast(eb.identifier);
+    if (!isDirectoryString(tag_a) or !isDirectoryString(tag_b)) return if (std.mem.eql(u8, a, b)) .equal else .different;
+    var x: Canonical = .{ .tag = tag_a, .bytes = a[ea.slice.start..ea.slice.end] };
+    var y: Canonical = .{ .tag = tag_b, .bytes = b[eb.slice.start..eb.slice.end] };
+    while (true) {
+        const p = x.next() catch return .unreadable;
+        const q = y.next() catch return .unreadable;
+        if (p == null or q == null) {
+            if (p != null or q != null) {
+                // Read the longer one to its end: an encoding error there
+                // still makes the pair unreadable, not merely different.
+                while (x.next() catch return .unreadable) |_| {}
+                while (y.next() catch return .unreadable) |_| {}
+                return .different;
+            }
+            return .equal;
+        }
+        if (p.? != q.?) {
+            while (x.next() catch return .unreadable) |_| {}
+            while (y.next() catch return .unreadable) |_| {}
+            return .different;
+        }
+    }
+}
+
+fn isDirectoryString(tag: u8) bool {
+    return switch (tag) {
+        0x0c, 0x13, 0x14, 0x16, 0x1a, 0x1c, 0x1e => true,
+        else => false,
+    };
+}
+
+/// The code points of a directory string, prepared as `valueEql` says.
+const Canonical = struct {
+    tag: u8,
+    bytes: []const u8,
+    i: usize = 0,
+    started: bool = false,
+    space: bool = false,
+    held: ?u21 = null,
+
+    const Error = error{Unreadable};
+
+    fn next(c: *Canonical) Error!?u21 {
+        if (c.held) |cp| {
+            c.held = null;
+            return cp;
+        }
+        while (try c.decode()) |cp| {
+            if (isSpace(cp)) {
+                if (c.started) c.space = true;
+                continue;
+            }
+            c.started = true;
+            const folded = if (cp >= 'A' and cp <= 'Z') cp + ('a' - 'A') else cp;
+            if (c.space) {
+                c.space = false;
+                c.held = folded;
+                return ' ';
+            }
+            return folded;
+        }
+        return null;
+    }
+
+    fn isSpace(cp: u21) bool {
+        return cp == ' ' or (cp >= 0x09 and cp <= 0x0d);
+    }
+
+    fn decode(c: *Canonical) Error!?u21 {
+        if (c.i >= c.bytes.len) return null;
+        const rest = c.bytes[c.i..];
+        switch (c.tag) {
+            0x0c => {
+                const n = std.unicode.utf8ByteSequenceLength(rest[0]) catch return error.Unreadable;
+                if (n > rest.len) return error.Unreadable;
+                const cp = std.unicode.utf8Decode(rest[0..n]) catch return error.Unreadable;
+                c.i += n;
+                return cp;
+            },
+            0x13, 0x16, 0x1a => {
+                if (rest[0] >= 0x80) return error.Unreadable;
+                c.i += 1;
+                return rest[0];
+            },
+            0x14 => {
+                c.i += 1;
+                return rest[0];
+            },
+            0x1e => {
+                if (rest.len < 2) return error.Unreadable;
+                const cp = std.mem.readInt(u16, rest[0..2], .big);
+                if (cp >= 0xd800 and cp <= 0xdfff) return error.Unreadable;
+                c.i += 2;
+                return cp;
+            },
+            0x1c => {
+                if (rest.len < 4) return error.Unreadable;
+                const cp = std.mem.readInt(u32, rest[0..4], .big);
+                if (cp > 0x10ffff or (cp >= 0xd800 and cp <= 0xdfff)) return error.Unreadable;
+                c.i += 4;
+                return @intCast(cp);
+            },
+            else => unreachable,
+        }
+    }
+};
 
 /// Dotted-quad IPv4, four decimal parts 0–255 without leading zeros (as Go's
 /// `net.ParseIP` since 1.17: `010.0.0.1` is not an address). The `netaddr`
@@ -461,6 +660,53 @@ test "parseIp4 / parseIp6" {
     try testing.expect(parseIp6("1:2:3:4:5:6:7") == null);
     try testing.expect(parseIp6("fe80::1%eth0") == null);
     try testing.expect(parseIp6("[::1]") == null);
+}
+
+/// SET { SEQUENCE { OID 2.5.4.<attr>, <str_tag> value } }.
+fn rdnFor(comptime attr: u8, comptime str_tag: u8, comptime v: []const u8) [11 + v.len]u8 {
+    return [_]u8{ 0x31, 9 + v.len, 0x30, 7 + v.len, 0x06, 0x03, 0x55, 0x04, attr, str_tag, v.len } ++ v[0..v.len].*;
+}
+
+test "matchDirectory: RDN prefix, prepared string comparison, unreadable is unsupported" {
+    const o = rdnFor(0x0a, 0x0c, "Evil Org");
+    const cn = rdnFor(0x03, 0x0c, "leaf");
+    try testing.expectEqual(Match.inside, matchDirectory(&(o ++ cn), &o));
+    try testing.expectEqual(Match.inside, matchDirectory(&(o ++ cn), &(o ++ cn)));
+    try testing.expectEqual(Match.outside, matchDirectory(&o, &(o ++ cn)));
+    try testing.expectEqual(Match.outside, matchDirectory(&(cn ++ o), &o));
+    try testing.expectEqual(Match.inside, matchDirectory(&o, ""));
+    // Spellings of the same value.
+    try testing.expectEqual(Match.inside, matchDirectory(&rdnFor(0x0a, 0x13, "EVIL ORG"), &o));
+    try testing.expectEqual(Match.inside, matchDirectory(&rdnFor(0x0a, 0x16, "\tevil\n org "), &o));
+    try testing.expectEqual(Match.inside, matchDirectory(&rdnFor(0x0a, 0x1c, "\x00\x00\x00E\x00\x00\x00v\x00\x00\x00i\x00\x00\x00l\x00\x00\x00 \x00\x00\x00O\x00\x00\x00r\x00\x00\x00g"), &o));
+    // Not the same value: another word, another attribute type, inner space
+    // removed, a non-ASCII letter in another case (no Unicode folding).
+    try testing.expectEqual(Match.outside, matchDirectory(&rdnFor(0x0a, 0x0c, "Evil Orgs"), &o));
+    try testing.expectEqual(Match.outside, matchDirectory(&rdnFor(0x0b, 0x0c, "Evil Org"), &o));
+    try testing.expectEqual(Match.outside, matchDirectory(&rdnFor(0x0a, 0x0c, "EvilOrg"), &o));
+    try testing.expectEqual(Match.outside, matchDirectory(&rdnFor(0x0a, 0x0c, "\xc3\xa9"), &rdnFor(0x0a, 0x0c, "\xc3\x89")));
+    // A non-string value compares as encoded.
+    const int_rdn = [_]u8{ 0x31, 0x0a, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04, 0x0a, 0x02, 0x01, 0x05 };
+    try testing.expectEqual(Match.inside, matchDirectory(&int_rdn, &int_rdn));
+    try testing.expectEqual(Match.outside, matchDirectory(&int_rdn, &rdnFor(0x0a, 0x0c, "\x05")));
+    // A multi-valued RDN is a set: order does not matter, count does.
+    const atv_o = o[2..];
+    const atv_ou = rdnFor(0x0b, 0x0c, "Unit")[2..];
+    const mv_a = [_]u8{ 0x31, atv_o.len + atv_ou.len } ++ atv_o.* ++ atv_ou.*;
+    const mv_b = [_]u8{ 0x31, atv_o.len + atv_ou.len } ++ atv_ou.* ++ atv_o.*;
+    try testing.expectEqual(Match.inside, matchDirectory(&mv_a, &mv_b));
+    try testing.expectEqual(Match.outside, matchDirectory(&mv_a, &o));
+    // Unreadable on either side.
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x0c, "Evil\xffOrg"), &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&o, &rdnFor(0x0a, 0x0c, "Evil\xffOrg")));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x13, "Evil\x80"), &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x1e, "abc"), &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x1e, "\xd8\x00"), &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x1c, "\x00\x11\x00\x00"), &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(o[0 .. o.len - 1], &o));
+    try testing.expectEqual(Match.unsupported, matchDirectory(&o, o[2..]));
+    // Different, but unreadable past the difference: still unsupported.
+    try testing.expectEqual(Match.unsupported, matchDirectory(&rdnFor(0x0a, 0x0c, "Xvil Org\xff"), &o));
 }
 
 test "GeneralNameIterator: SAN with dNSName, rfc822Name, iPAddress" {

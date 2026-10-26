@@ -165,7 +165,10 @@ decision requires, per RFC 5280 — and `verifyChain` implements all of it:
 - Name-constraint matching (§6.1.4 (g), §4.2.1.10) — `names.zig`, one rule
   per `GeneralName` type (dNSName/rfc822Name/URI host by the shared domain
   rule, directoryName RDN prefix — both sides as RDN sequences, a `[4] Name`
-  unwrapped, since 2026-10-19 —, iPAddress CIDR) applied to the accumulated
+  unwrapped, since 2026-10-19; attribute values compared as RFC 5280 §7.1
+  prepared strings (string type, ASCII case and white-space runs do not tell
+  two values apart — OpenSSL's canonical form; no Unicode case folding), an
+  unreadable name or base `unsupported`, since 2026-10-26 —, iPAddress CIDR) applied to the accumulated
   permitted/excluded subtrees from every CA in the path, under a comparison
   budget — `checkNameConstraints`. Excluded subtrees are a union; permitted
   subtrees INTERSECT (§6.1.4 (g)(1), as Go): each CA's permitted set that
