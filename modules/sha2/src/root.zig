@@ -950,6 +950,19 @@ test "the default backend on this target" {
     }
 }
 
+test "CPU detection agrees with std's native detection" {
+    // The test above re-derives its expectation from `detectCpuPaths`
+    // itself, so a wrong CPUID bit there passes it (and on a CPU without
+    // SHA-NI the SHA-NI path is merely skipped). std reads CPUID and XCR0 on
+    // its own; the feature sets each path needs are the ones `CpuPaths` names.
+    if (!cryptogams_compiled) return error.SkipZigTest;
+    const native = try std.zig.system.resolveTargetQuery(testing.io, .{});
+    const got = detectCpuPaths();
+    try testing.expect(got.known);
+    try testing.expectEqual(native.cpu.hasAll(.x86, &.{ .avx, .avx2, .bmi, .bmi2 }), got.avx2);
+    try testing.expectEqual(native.cpu.hasAll(.x86, &.{ .sha, .ssse3 }), got.shani);
+}
+
 test "FIPS 180-4 known answers, every backend" {
     defer test_hooks.forced = null;
     inline for (fips_hashes) |H| {

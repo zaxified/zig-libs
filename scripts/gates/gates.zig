@@ -2659,10 +2659,12 @@ fn todayDay(io: std.Io) i64 {
     return @divFloor(std.Io.Clock.real.now(io).toSeconds(), 86400);
 }
 
-/// A fingerprint of the module's Zig sources -- code AND tests, since a
-/// mutation score is a statement about both. Not cryptographic: it only has to
-/// change when the audited text changes. Data files under `src/` are left out
-/// on purpose: re-taking an interop transcript is not a change the audit read.
+/// A fingerprint of the module's Zig and assembly sources -- code AND tests,
+/// since a mutation score is a statement about both. Not cryptographic: it only
+/// has to change when the audited text changes. Assembly counts as code: sha2's
+/// `src/asm/*.s` is `@embedFile`d and runs, and a regenerated file must make
+/// the audit stale. Data files under `src/` are left out on purpose: re-taking
+/// an interop transcript is not a change the audit read.
 fn moduleSrcHash(b: *Build, io: std.Io, name: []const u8) ?[]const u8 {
     var dir = b.build_root.handle.openDir(io, b.fmt("modules/{s}/src", .{name}), .{ .iterate = true }) catch |err| {
         std.log.err("module '{s}': cannot open modules/{s}/src to fingerprint it: {t}", .{ name, name, err });
@@ -2676,7 +2678,9 @@ fn moduleSrcHash(b: *Build, io: std.Io, name: []const u8) ?[]const u8 {
         std.log.err("module '{s}': cannot walk modules/{s}/src: {t}", .{ name, name, err });
         return null;
     }) |e| {
-        if (e.kind != .file or !std.mem.endsWith(u8, e.basename, ".zig")) continue;
+        const code = std.mem.endsWith(u8, e.basename, ".zig") or
+            std.mem.endsWith(u8, e.basename, ".s") or std.mem.endsWith(u8, e.basename, ".S");
+        if (e.kind != .file or !code) continue;
         paths.append(b.allocator, b.dupe(e.path)) catch @panic("OOM");
     }
     std.mem.sort([]const u8, paths.items, {}, struct {
