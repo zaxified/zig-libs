@@ -7,10 +7,9 @@
 //! whole layer is golden-testable against bytes captured from real
 //! `iproute2` — see `goldens.zig`.
 //!
-//! The `TCA_OPTIONS` nest is written **without** `NLA_F_NESTED`, matching
-//! iproute2's `addattr_nest` (the kernel's validators ignore the bit; sending
-//! it would make every request differ from `tc`'s by one bit and defeat
-//! byte-exact goldens).
+//! The `TCA_OPTIONS` nest is written **without** `NLA_F_NESTED` (the
+//! kernel's validators ignore the bit; sending it would make every request
+//! differ from the captured ones by one bit and defeat byte-exact goldens).
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -23,8 +23,9 @@
 //!
 //! or, for the `tc actions del|get` reference form, `TCA_ACT_KIND` +
 //! `TCA_ACT_INDEX`. Note the asymmetry with `TCA_OPTIONS` on a qdisc:
-//! iproute2 nests `TCA_ACT_OPTIONS` **with** `NLA_F_NESTED` but writes the
-//! ordinal and the outer list nest bare. Both are reproduced byte for byte.
+//! `TCA_ACT_OPTIONS` is sent **with** `NLA_F_NESTED`, the ordinal and the
+//! outer list nest without it. The kernel accepts either; the goldens pin
+//! this form.
 //!
 //! Every kind's options begin with the same `struct tc_gen` prologue —
 //! `index`, `capab`, `action`, `refcnt`, `bindcnt` — where `action` is the
@@ -35,9 +36,10 @@
 //! between `action` and `refcnt` (see `Police`).
 //!
 //! Rates and bursts reuse `ratespec.zig` — the same psched arithmetic htb and
-//! tbf use — so a `police` burst is `tc_calc_xmittime(rate, bytes)` and its
-//! rate tables are computed from the **clamped** 32-bit rate exactly as `tc`
-//! does, with the true rate carried in `TCA_POLICE_RATE64`.
+//! tbf use. A `police` burst is the transmit time of `burst` bytes at the
+//! full rate, and — unlike htb and tbf — its rate tables also come from the
+//! full 64-bit rate; only the ratespec's 32-bit `rate` field is clamped to
+//! `~0U`, with the true rate carried in `TCA_POLICE_RATE64`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -730,9 +732,8 @@ fn appendPoliceOptions(
     var rtab: [ratespec.rate_table_entries]u32 = undefined;
     var ptab: [ratespec.rate_table_entries]u32 = undefined;
     // **Unlike htb and tbf**, police computes its tables from the *full*
-    // 64-bit rate: iproute2's m_police.c calls `tc_calc_rtable_64`, while
-    // q_htb.c/q_tbf.c call the 32-bit `tc_calc_rtable` and so bake the ~0U
-    // clamp into their tables. The `rate 40gbit` goldens pin the difference —
+    // 64-bit rate, where those two bake the ~0U clamp into their tables.
+    // The `rate 40gbit` goldens pin the difference —
     // their last table entry is 7, not the 8 the clamped rate would give.
     ratespec.calcRateTable(ps, &rate_spec, &rtab, p.cell_log, p.mtu, p.linklayer, p.rate);
     const burst_ticks = ps.calcXmitTime(p.rate, p.burst);
@@ -779,7 +780,8 @@ fn appendSkbeditOptions(
 ) EncodeError!void {
     const gen: Gen = .{ .index = s.index, .action = s.action };
     try appendAttr(gpa, list, TCA_SKBEDIT.PARMS, &gen.encode());
-    // Emission order mirrors iproute2's m_skbedit.c.
+    // Attribute order does not matter to the kernel; this one is fixed so the
+    // requests stay byte-identical to the goldens.
     if (s.queue_mapping) |q| try codec.appendAttrU16(gpa, list, TCA_SKBEDIT.QUEUE_MAPPING, q);
     if (s.priority) |h| try codec.appendAttrU32(gpa, list, TCA_SKBEDIT.PRIORITY, h.raw);
     if (s.mark) |m| try codec.appendAttrU32(gpa, list, TCA_SKBEDIT.MARK, m);
@@ -825,8 +827,8 @@ pub fn appendActionList(
         const ordinal: u16 = @intCast(i + 1);
         const entry = try codec.nestBegin(gpa, list, ordinal);
         try appendKind(gpa, list, a.kind());
-        // iproute2 nests TCA_ACT_OPTIONS *with* NLA_F_NESTED (unlike the
-        // qdisc-level TCA_OPTIONS, which it writes bare).
+        // TCA_ACT_OPTIONS carries NLA_F_NESTED (the qdisc-level TCA_OPTIONS
+        // does not); see the module doc comment.
         const opts = try codec.nestBegin(gpa, list, TCA_ACT.OPTIONS | codec.NLA_F_NESTED);
         try a.appendOptions(gpa, list, ps);
         codec.nestEnd(list, opts) catch return error.OptionsTooLong;

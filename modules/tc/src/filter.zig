@@ -92,9 +92,8 @@ pub const TC_U32 = struct {
 pub const tc_u32_sel_len = 16;
 /// `sizeof(struct tc_u32_key)`: mask, val, off, offmask.
 pub const tc_u32_key_len = 16;
-/// The kernel's cap on keys in one selector (`TC_U32_MAXDEPTH`-independent —
-/// `sel.nkeys` is a u8).
-pub const u32_max_keys = 128;
+/// The most keys one selector can carry: `tc_u32_sel.nkeys` is a `u8`.
+pub const u32_max_keys = std.math.maxInt(u8);
 
 /// One 32-bit masked match. `val` and `mask` are stored **as they appear in
 /// the packet** (network byte order) and `val` is always pre-masked, matching
@@ -213,8 +212,8 @@ fn appendU32Options(
     ps: Psched,
 ) EncodeError!void {
     if (u.keys.len > u32_max_keys) return error.TooManyKeys;
-    // Emission order mirrors iproute2's f_u32.c: everything parsed from the
-    // command line first (the classid, then the action list), then the
+    // Emission order matches the `tc` binary's requests (the goldens pin it):
+    // everything given on the command line first (the classid, then the action list), then the
     // selector — which is why `flowid X:Y action …` puts CLASSID before ACT.
     if (u.classid) |c| try codec.appendAttrU32(gpa, list, TCA_U32.CLASSID, c.raw);
     try action.appendActionList(gpa, list, TCA_U32.ACT, u.actions, ps);
@@ -325,8 +324,7 @@ pub const Flower = struct {
     dst_port: ?u16 = null,
     /// `classid X:Y`.
     classid: ?Handle = null,
-    /// `TCA_FLOWER_FLAGS` (skip_hw / skip_sw); `tc` always emits it, so this
-    /// module does too.
+    /// `TCA_FLOWER_FLAGS` (skip_hw / skip_sw); always sent, 0 by default.
     flags: u32 = 0,
     /// `action …` — the action list run on a match, emitted as the nested
     /// `TCA_FLOWER_ACT` (after `classid`, before `FLAGS`/`KEY_ETH_TYPE`).
@@ -409,10 +407,10 @@ fn appendFlowerOptions(
         if (portAttrs(proto) == null) return error.PortWithoutProto;
     }
 
-    // Emission order: iproute2 emits key attributes in command-line order and
-    // finishes with FLAGS then ETH_TYPE. This module fixes the key order
-    // (proto, src, dst, ports, classid) so a request is reproducible; the
-    // goldens use the matching `tc` argument order.
+    // Emission order is this module's own fixed order (keys as proto, src,
+    // dst, ports; then classid, the action list, FLAGS and ETH_TYPE), so a
+    // request is reproducible; the kernel does not care, and the goldens use
+    // the matching `tc` argument order.
     if (f.ip_proto) |p| try appendBytes(gpa, list, TCA_FLOWER.KEY_IP_PROTO, &[_]u8{p});
     if (f.ipv4_src) |p| {
         const mask = U32Key.prefixMask4(@intCast(@min(p.prefix_len, 32)));
@@ -799,7 +797,7 @@ test "u32 rejects an oversized key list" {
     // F5 in A1/tc.md: pin the shipped limit literally before deriving
     // `many`'s length from the same symbol (see the equivalent action.zig
     // pins for `max_actions`/`max_cookie_len`/`max_actions_decoded`).
-    try testing.expectEqual(@as(usize, 128), u32_max_keys);
+    try testing.expectEqual(@as(usize, 255), u32_max_keys);
 
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;

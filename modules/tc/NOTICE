@@ -28,8 +28,10 @@ classful/filter work does.
 
 iproute2 (**GPL-2.0-or-later**) — `tc/tc_core.c` (`tc_calc_xmittime`,
 `tc_calc_rtable`, `tc_core_init`), `tc/q_htb.c`, `tc/q_tbf.c`,
-`tc/q_fq_codel.c`, `tc/f_u32.c`, `tc/tc_class.c`, `tc/tc_filter.c` and
-`lib/utils.c` (`__get_hz`) were consulted as a BEHAVIOUR reference for the
+`tc/q_fq_codel.c`, `tc/q_cake.c`, `tc/f_u32.c`, `tc/f_flower.c`, `tc/tc_class.c`,
+`tc/tc_filter.c`, `tc/m_action.c`, `tc/m_gact.c`, `tc/m_mirred.c`,
+`tc/m_police.c`, `tc/m_skbedit.c`, `tc/m_vlan.c` and `lib/utils.c`
+(`__get_hz`) were consulted as a BEHAVIOUR reference for the
 psched rate-table arithmetic, the default burst/buffer formulas, attribute
 emission order and the client-side dump-filter rules.
 
@@ -37,3 +39,15 @@ No source was copied: the algorithms are re-derived and re-expressed (the rate
 tables are evaluated exactly in u128 rather than iproute2's platform-dependent
 double), and the byte-exact goldens captured from a real `tc` binary are the
 independent check that the behaviour matches.
+
+Provenance review (2026-10-26). Two isolated reviewers read every file above except `q_cake.c` (its only
+trace here was an attribute order, now pinned by the goldens alone)
+side by side with this module and returned verdicts only, so the person who
+edited the module never saw iproute2 source. No translated code body was
+found. They did find one comment quoting iproute2 verbatim (htb's default
+burst), comments that restated iproute2 functions as pseudo-code or named
+them as the origin of our helpers, and the u32 key cap of 128, which matched
+an iproute2 choice and not the UAPI. All of these were rewritten or
+re-derived from the UAPI the same day (the cap is now 255, the width of
+`tc_u32_sel.nkeys`). What remains in common is behaviour that the goldens pin
+byte for byte: arithmetic, defaults and attribute order.

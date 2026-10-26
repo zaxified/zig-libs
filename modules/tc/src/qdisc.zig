@@ -405,8 +405,8 @@ pub const HtbClass = struct {
     quantum: u32 = 0,
     /// Priority band (`prio`), lower = served first.
     prio: u32 = 0,
-    /// Largest packet the rate tables are sized for (`mtu`). tc's default is
-    /// 1600 ("eth packet len"), not the interface MTU.
+    /// Largest packet the rate tables are sized for (`mtu`). The default is
+    /// `tc`'s, 1600 bytes — not the interface MTU.
     mtu: u32 = 1600,
     /// Minimum packet unit (`mpu`).
     mpu: u16 = 0,
@@ -487,17 +487,16 @@ fn appendHtbClassOptions(
         .overhead = c.overhead,
     };
 
-    // "compute minimal allowed burst from rate; mtu is added to make sure
-    // that buffer is larger than mtu and to have some safeguard space"
+    // Default burst: one scheduler tick's worth of bytes at the rate, plus one
+    // full packet so the bucket can always hold at least an MTU.
     const hz = if (ps.hz == 0) 1 else ps.hz;
     const burst: u64 = if (c.burst != 0) c.burst else rate64 / hz + c.mtu;
     const cburst: u64 = if (c.cburst != 0) c.cburst else ceil64 / hz + c.mtu;
 
     var rtab: [ratespec.rate_table_entries]u32 = undefined;
     var ctab: [ratespec.rate_table_entries]u32 = undefined;
-    // NB: the tables are computed from the **clamped** 32-bit rate (tc calls
-    // tc_calc_rtable, not tc_calc_rtable_64, for htb), while the buffer
-    // timings use the full 64-bit rate. Reproduced faithfully.
+    // NB: `tc` builds htb's tables from the **clamped** 32-bit rate, while
+    // the buffer timings use the full 64-bit rate (the goldens pin both).
     ratespec.calcRateTable(ps, &rate_spec, &rtab, c.cell_log, c.mtu, c.linklayer, null);
     const buffer_ticks = ps.calcXmitTime(rate64, burst);
     // F10: `calcRateTable`'s 256-entry loop is ~98-100% of this function's
@@ -631,6 +630,15 @@ pub const TbfWire = struct {
     pburst_bytes: ?u32 = null,
 };
 
+/// Bytes that drain at `rate` bytes/s within `latency_us`, plus `bucket`. In
+/// `f64` on purpose: `tc` computes it in floating point and the goldens pin
+/// the truncated result.
+fn latencyBound(rate: u64, latency_us: u64, bucket: u32) f64 {
+    const drained = @as(f64, @floatFromInt(rate)) * @as(f64, @floatFromInt(latency_us)) /
+        ratespec.time_units_per_sec;
+    return drained + @as(f64, @floatFromInt(bucket));
+}
+
 fn appendTbfOptions(
     t: Tbf,
     gpa: std.mem.Allocator,
@@ -657,15 +665,11 @@ fn appendTbfOptions(
 
     var limit: u32 = t.limit;
     if (limit == 0) {
-        const latency: f64 = @floatFromInt(t.latency_us);
-        var lim = @as(f64, @floatFromInt(t.rate)) * latency / ratespec.time_units_per_sec +
-            @as(f64, @floatFromInt(t.burst));
-        if (t.peakrate != 0) {
-            const lim2 = @as(f64, @floatFromInt(t.peakrate)) * latency / ratespec.time_units_per_sec +
-                @as(f64, @floatFromInt(t.mtu));
-            if (lim2 < lim) lim = lim2;
-        }
-        limit = if (lim >= @as(f64, std.math.maxInt(u32))) std.math.maxInt(u32) else @intFromFloat(lim);
+        // The queue holds what drains within `latency_us`, plus one bucket;
+        // with a peak rate, the tighter of that and the peak-rate bound.
+        var queue_bytes = latencyBound(t.rate, t.latency_us, t.burst);
+        if (t.peakrate != 0) queue_bytes = @min(queue_bytes, latencyBound(t.peakrate, t.latency_us, t.mtu));
+        limit = if (queue_bytes >= @as(f64, std.math.maxInt(u32))) std.math.maxInt(u32) else @intFromFloat(queue_bytes);
     }
 
     var rtab: [ratespec.rate_table_entries]u32 = undefined;
@@ -788,8 +792,8 @@ fn appendFqCodelOptions(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
 ) EncodeError!void {
-    // Emission order mirrors iproute2's q_fq_codel.c so a request is
-    // byte-identical to the equivalent `tc` command line.
+    // Attribute order does not matter to the kernel; this one makes a request
+    // byte-identical to the captured `tc` goldens.
     if (f.limit) |v| try codec.appendAttrU32(gpa, list, TCA_FQ_CODEL.LIMIT, v);
     if (f.flows) |v| try codec.appendAttrU32(gpa, list, TCA_FQ_CODEL.FLOWS, v);
     if (f.quantum) |v| try codec.appendAttrU32(gpa, list, TCA_FQ_CODEL.QUANTUM, v);
@@ -960,8 +964,8 @@ fn appendCakeOptions(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
 ) EncodeError!void {
-    // Emission order mirrors iproute2's q_cake.c so a request is byte-identical
-    // to the equivalent `tc` command line (verified against captured goldens).
+    // Attribute order does not matter to the kernel; this one makes a request
+    // byte-identical to the captured `tc` goldens.
     if (c.bandwidth) |v| try appendAttrU64(gpa, list, TCA_CAKE.BASE_RATE64, v);
     if (c.diffserv) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.DIFFSERV_MODE, @backingInt(v));
     if (c.atm) |v| try codec.appendAttrU32(gpa, list, TCA_CAKE.ATM, @backingInt(v));

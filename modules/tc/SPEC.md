@@ -266,7 +266,7 @@ does not read the tables, this has no behavioural effect.
 Other faithfully mirrored iproute2 quirks:
 
 - htb's default burst is `rate / hz + mtu` **bytes**, then converted to ticks; its `mtu`
-  default is 1600 ("eth packet len"), not the interface MTU.
+  default is 1600 bytes, not the interface MTU.
 - htb computes its rate tables from the **clamped 32-bit** `tc_ratespec.rate` (it calls
   `tc_calc_rtable`, not `tc_calc_rtable_64`) while timing `buffer`/`cbuffer` with the full
   64-bit rate. tbf instead times its `buffer` with the clamped rate. Both are reproduced.

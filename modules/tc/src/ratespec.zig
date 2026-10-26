@@ -23,7 +23,7 @@ const native_endian = builtin.cpu.arch.endian();
 /// `TIME_UNITS_PER_SEC` — iproute2 expresses "time" in microseconds.
 pub const time_units_per_sec: f64 = 1_000_000;
 
-/// `enum link_layer` (iproute2 `tc/tc_core.h`); the low 4 bits land in
+/// Link-layer selector; the low 4 bits land in
 /// `tc_ratespec.linklayer`.
 pub const LinkLayer = enum(u8) {
     unspec = 0,
@@ -66,20 +66,18 @@ pub const Psched = struct {
     /// on every mainstream Linux build).
     pub const fallback: Psched = .{ .tick_num = 1, .tick_den = 1, .hz = 100 };
 
-    /// Derive the calibration from the four hex words of `/proc/net/psched`,
-    /// mirroring iproute2's `tc_core_init` + `__get_hz`:
-    ///
-    /// ```text
-    /// if (clock_res == 1000000000) t2us = us2t;   // ns-resolution compat hack
-    /// clock_factor = clock_res / 1e6
-    /// tick_in_usec = t2us / us2t * clock_factor
-    /// hz           = (clock_res == 1000000) ? tfsc : 100
-    /// ```
+    /// Derive the calibration from the four hex words of `/proc/net/psched`.
+    /// One microsecond is worth `(t2us / us2t) · (clock_res / 10^6)` ticks,
+    /// kept as the fraction `t2us · clock_res / (us2t · 10^6)`. A clock
+    /// resolution of exactly one nanosecond is the one special case: there the
+    /// ticks-to-microseconds word is not meaningful and the ratio collapses to
+    /// `clock_res / 10^6`. The scheduler frequency is the fourth word only on a
+    /// microsecond-resolution clock; anywhere else it is the classic 100 Hz.
     pub fn fromFields(t2us_in: u32, us2t: u32, clock_res: u32, tfsc: u32) Psched {
         if (us2t == 0 or clock_res == 0) return fallback;
         var t2us = t2us_in;
-        // The kernel advertises a tick multiplier of 1000 for nanosecond
-        // resolution, which really means 1.
+        // Nanosecond clock: ignore the advertised ticks-to-microseconds word
+        // by making the t2us/us2t quotient exactly one.
         if (clock_res == 1_000_000_000) t2us = us2t;
         if (t2us == 0) return fallback;
         return .{
@@ -125,17 +123,17 @@ pub const Psched = struct {
         return parse(buf[0..n]) orelse fallback;
     }
 
-    /// iproute2 `tc_core_time2tick`: microseconds → psched ticks.
+    /// Microseconds → psched ticks.
     pub fn time2tick(ps: Psched, time_usec: f64) f64 {
         return time_usec * ps.tickInUsec();
     }
 
-    /// iproute2 `tc_core_tick2time`: psched ticks → microseconds.
+    /// Psched ticks → microseconds.
     pub fn tick2time(ps: Psched, ticks: f64) f64 {
         return ticks / ps.tickInUsec();
     }
 
-    /// iproute2 `tc_calc_xmittime`: the time (in psched ticks) it takes to
+    /// Transmit time: the time (in psched ticks) it takes to
     /// send `size` bytes at `rate` bytes/second, **rounded up**, saturating
     /// at `UINT_MAX`.
     ///
@@ -160,7 +158,7 @@ pub const Psched = struct {
         return @intCast(ticks);
     }
 
-    /// iproute2 `tc_calc_xmitsize`: the inverse — how many bytes fit in
+    /// Transmit size, the inverse of `calcXmitTime`: how many bytes fit in
     /// `ticks` at `rate` bytes/second (rounded down). Used when decoding a
     /// dumped buffer/burst back into bytes.
     ///
@@ -231,18 +229,15 @@ pub const rate_table_entries = 256;
 /// Wire size of one rate table.
 pub const rate_table_len = rate_table_entries * 4;
 
-/// iproute2 `tc_adjust_size`: raise a size to `mpu` and apply the link
-/// layer's framing tax.
-fn adjustSize(sz_in: u32, mpu: u32, linklayer: LinkLayer) u32 {
-    const sz = @max(sz_in, mpu);
-    return switch (linklayer) {
-        .atm => blk: {
-            var cells = sz / atm_cell_payload;
-            if (sz % atm_cell_payload > 0) cells += 1;
-            break :blk cells * atm_cell_size;
-        },
-        else => sz,
-    };
+/// The size the link actually bills for a `size`-byte packet: never less
+/// than `mpu`, and on ATM every started 48-byte payload costs a whole
+/// 53-byte cell.
+fn billedSize(size: u32, mpu: u32, linklayer: LinkLayer) u32 {
+    const floored = @max(size, mpu);
+    if (linklayer != .atm) return floored;
+    // Cannot fail: the divisor is a non-zero constant.
+    const cells = std.math.divCeil(u32, floored, atm_cell_payload) catch unreachable;
+    return cells * atm_cell_size;
 }
 
 /// Largest legal `cell_log`/`ccell_log`/`pcell_log`: `calcRateTable` shifts
@@ -259,7 +254,7 @@ pub const max_cell_log: u8 = 23;
 /// one: the smallest shift for which `mtu >> cell_log` fits a 256-entry
 /// table. `mtu == 0` means "use iproute2's 2047 default". Capped at
 /// `max_cell_log` — without the cap, `mtu` in `[2^31, 2^32)` derives
-/// `cell_log = 24` and the rate table's `raw` shift silently overflows
+/// `cell_log = 24` and the rate table's cell-size shift silently overflows
 /// `u32` (F7: `RTAB[255]` comes out `0`, not the largest entry in the
 /// table). iproute2 has the same signed-overflow bug here (`tc_core.c`
 /// uses a signed `int`), so this is a deliberate divergence, not a
@@ -287,7 +282,8 @@ pub fn checkCellLog(v: ?u8) error{InvalidCellLog}!void {
     }
 }
 
-/// iproute2 `tc_calc_rtable`: fill a 256-entry transmit-time table and patch
+/// Fill a 256-entry transmit-time table (entry `i` is the time to send
+/// `(i + 1) << cell_log` bytes) and patch
 /// `spec`'s `cell_log`/`cell_align`/`linklayer` to match. `rate_override`
 /// lets a caller compute the table from a rate other than `spec.rate` — htb
 /// and tbf deliberately use the **clamped 32-bit** `spec.rate` even when the
@@ -304,9 +300,8 @@ pub fn calcRateTable(
     const cell_log = cell_log_override orelse deriveCellLog(mtu);
     const bps: u64 = rate_override orelse spec.rate;
     for (table, 0..) |*e, i| {
-        const raw: u32 = @as(u32, @intCast(i + 1)) << @intCast(cell_log);
-        const sz = adjustSize(raw, spec.mpu, linklayer);
-        e.* = ps.calcXmitTime(bps, sz);
+        const cell_bytes: u32 = @as(u32, @intCast(i + 1)) << @intCast(cell_log);
+        e.* = ps.calcXmitTime(bps, billedSize(cell_bytes, spec.mpu, linklayer));
     }
     spec.cell_align = -1;
     spec.cell_log = cell_log;
@@ -342,8 +337,8 @@ test "Psched.parse accepts the /proc/net/psched text form" {
     try testing.expectEqual(@as(?Psched, null), Psched.parse("1 2 3"));
 }
 
-test "Psched.fromFields applies the nanosecond-resolution compat hack" {
-    // clock_res == 1e9 → the advertised t2us is bogus and equals us2t.
+test "Psched.fromFields treats a nanosecond clock specially" {
+    // clock_res == 1e9 → the t2us word is ignored (quotient forced to one).
     const ps = Psched.fromFields(1000, 1, 1_000_000_000, 0);
     try testing.expectEqual(@as(f64, 1000), ps.tickInUsec()); // 1/1 * 1e9/1e6
     try testing.expectEqual(@as(u64, 100), ps.hz); // clock_res != 1e6 → HZ
@@ -351,7 +346,7 @@ test "Psched.fromFields applies the nanosecond-resolution compat hack" {
     try testing.expectEqual(Psched.fallback.tickInUsec(), Psched.fromFields(1, 0, 0, 0).tickInUsec());
 }
 
-test "calcXmitTime rounds up, exactly like tc_calc_xmittime" {
+test "calcXmitTime rounds up" {
     const ps = golden_psched;
     // 8 bytes at 125000 B/s = 64 µs = 1000 ticks, exact.
     try testing.expectEqual(@as(u32, 1000), ps.calcXmitTime(125_000, 8));
@@ -446,11 +441,11 @@ test "calcRateTable reproduces tc's tables for the captured rates" {
 
 test "ATM link layer applies the SAR cell tax" {
     // 48-byte payload cells framed into 53-byte cells: 8 B → 1 cell → 53 B.
-    try testing.expectEqual(@as(u32, 53), adjustSize(8, 0, .atm));
-    try testing.expectEqual(@as(u32, 53), adjustSize(48, 0, .atm));
-    try testing.expectEqual(@as(u32, 106), adjustSize(49, 0, .atm));
-    try testing.expectEqual(@as(u32, 8), adjustSize(8, 0, .ethernet));
-    try testing.expectEqual(@as(u32, 64), adjustSize(8, 64, .ethernet)); // mpu floor
+    try testing.expectEqual(@as(u32, 53), billedSize(8, 0, .atm));
+    try testing.expectEqual(@as(u32, 53), billedSize(48, 0, .atm));
+    try testing.expectEqual(@as(u32, 106), billedSize(49, 0, .atm));
+    try testing.expectEqual(@as(u32, 8), billedSize(8, 0, .ethernet));
+    try testing.expectEqual(@as(u32, 64), billedSize(8, 64, .ethernet)); // mpu floor
 }
 
 test "RateSpec encode/decode round-trip and byte layout" {

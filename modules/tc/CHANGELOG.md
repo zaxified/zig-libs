@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-26** — **`u32_max_keys` is 255** (was 128): the limit is now derived from the UAPI (`tc_u32_sel.nkeys` is a `u8`), not an arbitrary cap; selectors with 129–255 keys are accepted. Provenance clean-up after two isolated reviews against iproute2 (see NOTICE): a verbatim iproute2 comment, pseudo-code of iproute2 functions and function-name attributions removed from comments; private `adjustSize` → `billedSize` (`std.math.divCeil`), tbf's latency limit computed by a `latencyBound` helper (same floating-point result). Wire bytes unchanged; goldens pass.
+
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** `zig fmt` (0.17) rewrote `@intFromEnum`/`@enumFromInt` to `@backingInt`/`@fromBackingInt` in sources and tests; same values, same behaviour.
 - **2026-10-18** — Ported to Zig 0.17.0. `optionalsSet` iterates `field_names`/`field_types`. Also: comptime `strRepeat` helper quota raised.
 - **2026-10-10** — tests: deterministic fuzz driver `TC_FUZZ` over the existing harnesses (action, options, filter, dump); reach labels count real outcomes. No code or API change.
