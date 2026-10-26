@@ -2,16 +2,21 @@
 
 //! Comparative benchmark: `x509` against Go's `crypto/x509` (the reference;
 //! Go 1.26 standard library only), the program behind the `**Performance:**`
-//! line of the maturity card (CONVENTIONS.md §9, kept instrument kind 3),
-//! with OpenSSL's `X509_verify_cert` as the fastest in the field
-//! (`tools/c_bench/foreign_bench.c`).
+//! line of the maturity card (CONVENTIONS.md §9, kept instrument kind 3).
+//! The fastest in the field: rustls-webpki 0.103.15 over ring 0.17
+//! (`tools/rust_fast_bench`, the default `BENCH_ALT=webpki`). OpenSSL's
+//! `X509_verify_cert` (`tools/c_bench/foreign_bench.c`, `BENCH_ALT=openssl`)
+//! was measured too and is slower than Go here (2026-10-26: 1.3–1.4×), so it
+//! is not the fastest; it stays selectable.
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-x509` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26.0
-//! (`GOTOOLCHAIN=local`, `GOPROXY=off`; stdlib only, `tools/go_bench`), `zig`
-//! on PATH (it builds the C side with `zig cc -O3 -march=native`) and the
-//! system OpenSSL 3 (`libcrypto.so.3`, path below or `LIBCRYPTO_SO`; no
-//! headers needed). Run from the repository root.
+//! (`GOTOOLCHAIN=local`, `GOPROXY=off`; stdlib only, `tools/go_bench`), and
+//! for the alt side either `cargo` with rustls-webpki 0.103.15,
+//! rustls-pki-types 1.15.1 and ring 0.17.14 in cargo's cache (built
+//! `--offline`), or `zig` on PATH (it builds the C side with `zig cc -O3
+//! -march=native`) and the system OpenSSL 3 (`libcrypto.so.3`, path below or
+//! `LIBCRYPTO_SO`; no headers needed). Run from the repository root.
 //!
 //! The Go side generates three chains into `.zig-cache/bench-x509/` (fresh
 //! keys each run; ten-year certificates, SAN `bench.example.test`, serverAuth):
@@ -32,8 +37,11 @@
 //! `d2i_X509` of leaf and intermediate, a fresh untrusted stack and
 //! `X509_STORE_CTX`, and `X509_verify_cert` against a store holding the root
 //! parsed once, with the time, `X509_VERIFY_PARAM_set1_host` and the
-//! sslserver purpose. The count is the verified path length from leaf to root
-//! (3) on every side.
+//! sslserver purpose. webpki's: `EndEntityCert::try_from` of the leaf,
+//! `verify_for_usage` (every algorithm webpki has over ring, the intermediate
+//! as presented, the anchor extracted once from the root, serverAuth) and
+//! `verify_is_valid_for_subject_name`. The count is the verified path length
+//! from leaf to root (3) on every side.
 //!
 //! Method (`testkit.bench`): each side doubles its batch until it
 //! takes over 100 ms and keeps the best of five; per workload the sides
@@ -55,6 +63,8 @@ const host = "bench.example.test";
 const kinds = [_][]const u8{ "ecdsa256", "rsa2048", "mixed" };
 const c_src = "modules/x509/tools/c_bench/foreign_bench.c";
 const default_so = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
+const fast_rs_manifest = "modules/x509/tools/rust_fast_bench/Cargo.toml";
+const fast_rs_exe = "modules/x509/tools/rust_fast_bench/target/release/x509_fast_bench";
 
 const Op = struct { kind: usize };
 
@@ -123,10 +133,18 @@ pub fn main(init: std.process.Init) !u8 {
         } else |_| {}
     }
 
-    const so = init.environ_map.get("LIBCRYPTO_SO") orelse default_so;
-    const cexe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, c_src, &.{so});
-    // The same chains verify under OpenSSL, and a wrong host is refused there too.
-    try bench.foreignOnce(arena, io, bench_name, cexe, abs, "check");
+    const alt_name = init.environ_map.get("BENCH_ALT") orelse "webpki";
+    const alt_exe = if (std.mem.eql(u8, alt_name, "webpki")) blk: {
+        try runOk(arena, io, &env, &.{ "cargo", "build", "--release", "--offline", "--quiet", "--manifest-path", fast_rs_manifest }, null);
+        break :blk try cwd.realPathFileAlloc(io, fast_rs_exe, arena);
+    } else if (std.mem.eql(u8, alt_name, "openssl"))
+        try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, c_src, &.{init.environ_map.get("LIBCRYPTO_SO") orelse default_so})
+    else {
+        std.debug.print("{s}: BENCH_ALT={s} -- webpki or openssl\n", .{ bench_name, alt_name });
+        return 2;
+    };
+    // The same chains verify on the alt side, and a wrong host is refused there too.
+    try bench.foreignOnce(arena, io, bench_name, alt_exe, abs, "check");
 
     var ws: std.ArrayList(Work) = .empty;
     for (kinds, 0..) |k, i| {
@@ -137,10 +155,10 @@ pub fn main(init: std.process.Init) !u8 {
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, cexe }, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ exe, alt_exe }, .abs = abs, .filters = filters, .rounds = rounds }, ctx, once, ws.items, w);
     try w.print("reference: {s}\nalt: {s}\nworst ours/Go = {d:.3} (best {d:.3}); worst ours/fastest = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/x509 (chain verify) · fastest {d:.2}× (the faster of Go and OpenSSL <version> X509_verify_cert per workload) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0 });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go <version> crypto/x509 (chain verify) · fastest {d:.2}× (the faster of Go and {s} per workload) (measured <today>)\n", .{ s.best_ref, s.worst_ref, s.worst_fast orelse 0, std.mem.trimEnd(u8, s.alt_banner, "\n") });
     try w.flush();
     return 0;
 }
@@ -151,11 +169,11 @@ fn runOk(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.M
         .environ_map = env,
         .cwd = if (cwd_path) |p| .{ .path = p } else .inherit,
     }) catch |e| {
-        std.debug.print("{s}: could not run {s} ({t}) -- the benchmark needs Go\n", .{ bench_name, argv[0], e });
-        return error.GoFailed;
+        std.debug.print("{s}: could not run {s} ({t}) -- the benchmark needs Go and cargo or zig cc\n", .{ bench_name, argv[0], e });
+        return error.ForeignFailed;
     };
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: {s} failed:\n{s}\n", .{ bench_name, argv[0], res.stderr });
-        return error.GoFailed;
+        return error.ForeignFailed;
     }
 }

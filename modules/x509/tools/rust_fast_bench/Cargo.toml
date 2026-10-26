@@ -1,0 +1,20 @@
+[package]
+name = "x509_fast_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# "Fastest in the field" side of `zig build bench-x509`
+# (modules/x509/tools/bench.zig): rustls-webpki over ring, pinned exactly,
+# default features off (no aws-lc-rs: ring only).
+[dependencies]
+rustls-webpki = { version = "=0.103.15", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
+ring = { version = "=0.17.14", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# Not part of any enclosing Cargo workspace.
+[workspace]
