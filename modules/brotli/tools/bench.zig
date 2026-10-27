@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! Comparative benchmark: `brotli` against google/brotli's C library (the
-//! reference, libbrotlienc / libbrotlidec), the program behind the
+//! Comparative benchmark: `brotli` against dropbox/rust-brotli 9.1.1 (the
+//! reference, `tools/foreign_rust`) and google/brotli's C library (the
+//! fastest, libbrotlienc / libbrotlidec), the program behind the
 //! `**Performance:**` line of the maturity card (CONVENTIONS.md §9, kept
-//! instrument kind 3).
+//! instrument kind 3). Until 2026-10-27 google/brotli was both; the owner
+//! split the roles: the reference and the fastest are two implementations.
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-brotli` runs it (always
-//! ReleaseFast); `zig build check-interop` compiles it. Needs `zig` on PATH (it
+//! ReleaseFast); `zig build check-interop` compiles it. Needs `cargo` (the
+//! crates in `tools/foreign_rust/Cargo.lock`, fetched once) and `zig` on PATH (it
 //! builds `tools/c_bench/foreign_bench.c` with `zig cc -O3 -march=native`) and
 //! the system google/brotli (`libbrotlienc.so.1`, `libbrotlidec.so.1`,
 //! `libbrotlicommon.so.1`, headers in /usr/include/brotli; paths below or
@@ -135,6 +138,27 @@ fn once(x: *Ctx) usize {
 
 const words = [_][]const u8{ "order", "customer", "invoice", "shipment", "warehouse", "payment", "refund", "account", "status", "pending", "active", "archived", "north", "south", "east", "west", "premium", "standard", "express", "ground" };
 
+/// `cargo build --release --locked --offline` of `tools/foreign_rust`, for
+/// the host CPU like our side; with `-Djcc-safe` padded like it, too.
+fn buildRust(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, jcc_safe: bool) ![]const u8 {
+    var env = try environ.clone(arena);
+    const target_dir = if (jcc_safe) ".zig-cache/foreign_rust-jcc" else ".zig-cache/foreign_rust";
+    try env.put("RUSTFLAGS", if (jcc_safe) "-C target-cpu=native -C llvm-args=-x86-branches-within-32B-boundaries" else "-C target-cpu=native");
+    std.debug.print("{s}: building the Rust side ...\n", .{bench_name});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", "modules/brotli/tools/foreign_rust/Cargo.toml", "--target-dir", target_dir },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("{s}: could not run cargo ({t}) -- the reference is rust-brotli\n", .{ bench_name, e });
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s}: cargo build failed:\n{s}\n", .{ bench_name, res.stderr });
+        return error.RustBuildFailed;
+    }
+    return try arena.print("{s}/release/foreign_rust", .{target_dir});
+}
+
 fn genJson(arena: std.mem.Allocator, r: std.Random) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
     const w = &out.writer;
@@ -215,6 +239,13 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("{s}: reference library {s}{s}\n", .{ bench_name, lib_dir, if (jcc_safe) " (both sides padded against the JCC erratum)" else "" });
     const exe = try bench.buildForeign(arena, io, bench_name, cc, abs, "modules/brotli/tools/c_bench/foreign_bench.c", &libs);
 
+    // The reference since 2026-10-27 is dropbox/rust-brotli (owner: the
+    // reference and the fastest are two implementations, and google/brotli
+    // is the fastest -- it stays, as `alt`). Built offline from the pinned
+    // `tools/foreign_rust/Cargo.lock`; its crates were read before the first
+    // build (no build scripts, no proc macros).
+    const rs_exe = try buildRust(arena, io, init.environ_map, jcc_safe);
+
     // Reference streams (quality 9) and every quality's size, then interop.
     const prep = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, "prep" } });
     if (prep.term != .exited or prep.term.exited != 0) {
@@ -265,18 +296,22 @@ pub fn main(init: std.process.Init) !u8 {
         for (efforts) |effort| {
             const name = try arena.print("c_{s}_{s}", .{ @tagName(effort), n });
             const ref = try arena.print("c{d}_{s}", .{ effort.quality(), n });
-            try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = effort, .payload = i }, .ref = ref });
+            try ws.append(arena, .{ .name = name, .op = .{ .decompress = false, .effort = effort, .payload = i }, .ref = ref, .alt = ref, .ref_exe = 0, .alt_exe = 1 });
         }
         const name = try arena.print("d_{s}", .{n});
-        try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .q6, .payload = i }, .ref = name });
+        try ws.append(arena, .{ .name = name, .op = .{ .decompress = true, .effort = .q6, .payload = i }, .ref = name, .alt = name, .ref_exe = 0, .alt_exe = 1 });
         const aname = try arena.print("d_{s}_alloc", .{n});
-        try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .q6, .payload = i, .alloc = true }, .ref = name, .info = true });
+        try ws.append(arena, .{ .name = aname, .op = .{ .decompress = true, .effort = .q6, .payload = i, .alloc = true }, .ref = name, .alt = name, .ref_exe = 0, .alt_exe = 1, .info = true });
     }
 
-    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
-    try w.print("reference: {s}\nworst ours/google-brotli = {d:.3} (best {d:.3})\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref });
+    const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{ rs_exe, exe }, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
+    try w.print("reference: {s}\nfastest: {s}\nworst ours/rust-brotli = {d:.3} (best {d:.3}), worst ours/fastest = {d:.3}\n", .{
+        std.mem.trimEnd(u8, s.banner, "\n"), std.mem.trimEnd(u8, s.alt_banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0,
+    });
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× google/brotli <version> (C, one-shot) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× dropbox/rust-brotli 9.1.1 · fastest {d:.2}× google/brotli 1.2.0 (C, one-shot{s}) (measured <today>)\n", .{
+            s.best_ref, s.worst_ref, s.worst_fast orelse 0, if (jcc_safe) ", built from source; both sides JCC-padded" else "",
+        });
     try w.flush();
     return 0;
 }

@@ -1,0 +1,14 @@
+[package]
+name = "foreign_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+brotli = { version = "=9.1.1", default-features = false, features = ["std"] }
+# The one-shot decode (`brotli_decode`) is not re-exported by `brotli`.
+brotli-decompressor = { version = "=6.2.0", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
