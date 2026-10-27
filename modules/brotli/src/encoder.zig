@@ -5017,13 +5017,29 @@ const Q0Block = struct {
 
 /// google's `emit_commands`: the commands of `in[input..][0..block_size]`,
 /// from `next_emit.*` on. Null when the rest goes out as an insert; else
-/// where the meta-block so far is to be stored instead.
-fn q0Commands(b: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, next_emit: *usize) ?usize {
+/// where the meta-block so far is to be stored instead. `table_bits` is the
+/// table's size as a constant (google instantiates the loop per size, too:
+/// the shift is an immediate and one register more stays free), or 0 for
+/// `x.shift` at run time.
+fn q0Commands(comptime table_bits: u6, b_io: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, next_emit_io: *usize) ?usize {
+    // The bit writer, `next_emit` and `x`'s fields in locals whose address
+    // never leaves this function (the same instructions as through the
+    // pointers, 2026-10-27, but the bench's layout came out 3-5 % faster).
+    var bits = b_io.*;
+    defer b_io.* = bits;
+    const b = &bits;
+    var emit = next_emit_io.*;
+    defer next_emit_io.* = emit;
+    const next_emit = &emit;
     const in = x.in;
     const table = x.table;
-    const shift = x.shift;
+    const shift: u6 = if (table_bits != 0) @intCast(64 - @as(u7, table_bits)) else x.shift;
     const c = x.codes;
     const h = x.histo;
+    const lit = x.lit;
+    const max_distance = x.max_distance;
+    const metablock_start = x.metablock_start;
+    const literal_ratio = x.literal_ratio;
     if (block_size < q0_input_margin) return null;
     const ip_end = input + block_size;
     const len_limit = @min(block_size - q0_min_match, x.input_size - q0_input_margin);
@@ -5055,7 +5071,7 @@ fn q0Commands(b: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, ne
                 table[hash] = @intCast(ip);
                 if (q0IsMatch(in, ip, candidate)) break;
             }
-            if (ip - candidate <= x.max_distance) break;
+            if (ip - candidate <= max_distance) break;
         }
 
         // Step 2: the match and the literals before it.
@@ -5067,14 +5083,14 @@ fn q0Commands(b: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, ne
             ip += matched;
             if (insert < 6210) {
                 q0InsertLen(b, c, h, insert);
-            } else if (next_emit.* - x.metablock_start <= insert / 50 and x.literal_ratio > 980) {
+            } else if (next_emit.* - metablock_start <= insert / 50 and literal_ratio > 980) {
                 // google `ShouldUseUncompressedMode`: barely compressed so far
                 // and a long insert of poorly coded literals.
                 return base;
             } else {
                 q0LongInsertLen(b, c, h, insert);
             }
-            q0Literals(b, x.lit, in[next_emit.*..base]);
+            q0Literals(b, lit, in[next_emit.*..base]);
             if (distance == last_distance) {
                 b.sym(c, h, 64);
             } else {
@@ -5090,7 +5106,7 @@ fn q0Commands(b: *Q0Bits, x: *const Q0Block, input: usize, block_size: usize, ne
         while (q0IsMatch(in, ip, candidate)) {
             const base = ip;
             const matched = q0_min_match + Matcher.matchLen(in, candidate + q0_min_match, ip + q0_min_match, ip_end - ip - q0_min_match);
-            if (ip - candidate > x.max_distance) break;
+            if (ip - candidate > max_distance) break;
             ip += matched;
             last_distance = base - candidate;
             q0CopyLen(b, c, h, matched);
@@ -5148,7 +5164,11 @@ fn writeQ0(gpa: std.mem.Allocator, w: *BitWriter, in: []const u8, table_all: []u
         // At most 16 bits a byte (google reserves the same).
         try w.room(2 * block_size + 64);
         var b = Q0Bits.open(w);
-        if (q0Commands(&b, &x, input, block_size, &next_emit)) |base| {
+        const stored_at = switch (64 - @as(u7, x.shift)) {
+            inline 9, 11, 13, 15 => |k| q0Commands(k, &b, &x, input, block_size, &next_emit),
+            else => q0Commands(0, &b, &x, input, block_size, &next_emit),
+        };
+        if (stored_at) |base| {
             b.close(w);
             w.rollback(header);
             try writeStoreBlock(w, in[x.metablock_start..base]);

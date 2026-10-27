@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Performance:** `.q0`'s command loop is instantiated per hash-table size (9/11/13/15 bits, as google's `BrotliCompressFragmentFastImpl*`): 3–5 % fewer instructions; bench `c_q0_*` 0.92–1.06× google (was 0.99–1.09×; part of it layout). Output byte-identical. No API change.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — **Fix (performance):** `Decompressor` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
