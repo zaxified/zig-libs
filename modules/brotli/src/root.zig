@@ -137,6 +137,8 @@ test {
     _ = @import("prepared_dictionary.zig");
     _ = @import("shared_dictionary.zig");
     _ = @import("crafted_test.zig");
+    _ = @import("audit_decoder_test.zig");
+    _ = @import("audit_encoder_test.zig");
     _ = @import("block_split.zig");
     _ = @import("greedy_split.zig");
     _ = @import("dictionary_hash.zig");

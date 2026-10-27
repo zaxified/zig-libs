@@ -1398,7 +1398,10 @@ const ListSink = struct {
         return s.reserve(n, br);
     }
     /// As `SliceSink.tailPtr`: within the capacity `reserve` made.
-    inline fn tailPtr(s: *ListSink) [*]u8 {
+    // `pub`: `hotCommands` asks `@hasDecl(Sink, "tailPtr")`, which since
+    // Zig 0.17 sees only `pub` declarations — without it the checkless
+    // literal loop was dead code (mutation run, 2026-10-27).
+    pub inline fn tailPtr(s: *ListSink) [*]u8 {
         return s.list.items.ptr + s.list.items.len;
     }
     inline fn advance(s: *ListSink, n: usize) void {
@@ -1490,7 +1493,10 @@ const SliceSink = struct {
     }
     /// Where the next output byte goes: a run of literals `reserve` made
     /// room for is written there, then `advance`d over.
-    inline fn tailPtr(s: *SliceSink) [*]u8 {
+    // `pub`: `hotCommands` asks `@hasDecl(Sink, "tailPtr")`, which since
+    // Zig 0.17 sees only `pub` declarations — without it the checkless
+    // literal loop was dead code (mutation run, 2026-10-27).
+    pub inline fn tailPtr(s: *SliceSink) [*]u8 {
         return s.buf.ptr + s.len;
     }
     inline fn advance(s: *SliceSink, n: usize) void {
