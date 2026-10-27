@@ -464,6 +464,20 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const use_llvm: ?bool = if (selfhosted) null else true;
 
+    // `-Djcc-safe` — the bench programs assembled with the Intel JCC-erratum
+    // padding (`-mbranches-within-32B-boundaries`), in two stages: the Zig
+    // code to assembly, then assembled and linked with the flag. On a
+    // Skylake-family host a branch on a 32-byte boundary runs from the legacy
+    // decoder, so two builds with the same instructions differed 5 % in
+    // `bench-brotli` (2026-10-27) -- a ratio within that of 1.0 says nothing
+    // until both sides are padded (owner 2026-10-27; `~/CML/zig-017/jcc`).
+    // The run gets `BENCH_JCC_SAFE=1` so the bench pads its foreign side too.
+    const jcc_safe = b.option(
+        bool,
+        "jcc-safe",
+        "Bench programs padded against the Intel JCC erratum (both sides; for ratios near 1.0)",
+    ) orelse false;
+
     // `-Dtest-filter=<substring>` — compile only the tests whose name contains
     // one of these. Added for `scripts/fuzz-sweep.sh`: `--fuzz` puts every fuzz
     // test of a module in ONE process, so the first harness to crash takes the
@@ -797,13 +811,21 @@ pub fn build(b: *std.Build) void {
             // the timing/ratio skeleton 38 benches had copied by hand.
             if (!std.mem.eql(u8, m.name, "testkit")) bench_mod.addImport("testkit", fastModuleGraph(b, target, &fast_mods, "testkit"));
 
-            const bench_exe = b.addExecutable(.{
+            const bench_exe = if (!jcc_safe) b.addExecutable(.{
                 .name = b.fmt("bench-{s}", .{m.name}),
                 .root_module = bench_mod,
                 .use_llvm = true,
-            });
+            }) else blk: {
+                // Stage 1 is never installed or run: only its assembly is
+                // asked for, so it is one codegen with no binary.
+                const stage1 = b.addExecutable(.{ .name = b.fmt("bench-{s}-asm", .{m.name}), .root_module = bench_mod, .use_llvm = true });
+                const linked = b.createModule(.{ .target = target, .optimize = .fast });
+                linked.addCSourceFile(.{ .file = stage1.getEmittedAsm(), .flags = &.{"-mbranches-within-32B-boundaries"}, .language = .assembly });
+                break :blk b.addExecutable(.{ .name = b.fmt("bench-{s}", .{m.name}), .root_module = linked, .use_llvm = true });
+            };
             const bench_run = b.addRunArtifact(bench_exe);
             bench_run.has_side_effects = true;
+            if (jcc_safe) bench_run.setEnvironmentVariable("BENCH_JCC_SAFE", "1");
             bench_run.addPassthruArgs();
             b.step(
                 b.fmt("bench-{s}", .{m.name}),

@@ -194,12 +194,26 @@ pub fn main(init: std.process.Init) !u8 {
         try dir.writeFile(io, .{ .sub_path = try arena.print("{s}.bin", .{n}), .data = ctx.inputs[i] });
 
     const lib_dir = init.environ_map.get("LIBBROTLI_DIR") orelse default_lib_dir;
+    // `zig build bench-brotli -Djcc-safe`: our side is padded against the
+    // Intel JCC erratum, so the reference must be too -- a library built
+    // from source with the same flag (`tools/c_bench/build_libbrotli.sh`),
+    // never the distribution's.
+    const jcc_safe = init.environ_map.get("BENCH_JCC_SAFE") != null;
+    if (jcc_safe and init.environ_map.get("LIBBROTLI_DIR") == null) {
+        std.debug.print("{s}: -Djcc-safe needs LIBBROTLI_DIR = a google/brotli built with the same padding (tools/c_bench/build_libbrotli.sh)\n", .{bench_name});
+        return 1;
+    }
     const libs = [_][]const u8{
         try arena.print("{s}/libbrotlienc.so.1", .{lib_dir}),
         try arena.print("{s}/libbrotlidec.so.1", .{lib_dir}),
         try arena.print("{s}/libbrotlicommon.so.1", .{lib_dir}),
+        // Load what was linked: without it the run took the system library
+        // whatever LIBBROTLI_DIR said (2026-10-27).
+        try arena.print("-Wl,-rpath,{s}", .{lib_dir}),
     };
-    const exe = try bench.buildForeign(arena, io, bench_name, &.{ "zig", "cc" }, abs, "modules/brotli/tools/c_bench/foreign_bench.c", &libs);
+    const cc: []const []const u8 = if (jcc_safe) &.{ "zig", "cc", "-mbranches-within-32B-boundaries" } else &.{ "zig", "cc" };
+    std.debug.print("{s}: reference library {s}{s}\n", .{ bench_name, lib_dir, if (jcc_safe) " (both sides padded against the JCC erratum)" else "" });
+    const exe = try bench.buildForeign(arena, io, bench_name, cc, abs, "modules/brotli/tools/c_bench/foreign_bench.c", &libs);
 
     // Reference streams (quality 9) and every quality's size, then interop.
     const prep = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, "prep" } });
