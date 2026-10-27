@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: MIT
 
-//! Comparative benchmark: `regex` against Go's `regexp` (the reference), the
-//! program behind the `**Performance:**` line of the maturity card
-//! (CONVENTIONS.md §9, kept instrument kind 3).
+//! Comparative benchmark: `regex` against Go's `regexp` (the reference) and
+//! Rust's `regex` crate (the fastest candidate in the field), the program
+//! behind the `**Performance:**` line of the maturity card (CONVENTIONS.md §9,
+//! kept instrument kind 3).
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build bench-regex` runs it (always
 //! ReleaseFast); `zig build check-interop` compiles it. Needs go 1.26.0
-//! (standard library only, `GOPROXY=off`) on PATH. Run from the repository root.
+//! (standard library only, `GOPROXY=off`) and `cargo` (the crates in
+//! `tools/rust_regex/Cargo.lock`, built `--offline`) on PATH. Run from the
+//! repository root.
 //!
 //!   zig build bench-regex               # every workload
 //!   zig build bench-regex -- cz_        # workloads whose name contains `cz_`
@@ -252,25 +255,31 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("bench-regex: go_bench failed:\n{s}\n", .{go.stderr});
         return 1;
     }
-    const GoRow = struct { ns: f64, count: usize };
-    var go_rows: std.StringHashMapUnmanaged(GoRow) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, go.stdout, '\n');
-    while (lines.next()) |line| {
-        var f = std.mem.tokenizeScalar(u8, line, '\t');
-        const name = f.next() orelse continue;
-        const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadGoOutput);
-        const count = try std.fmt.parseInt(usize, f.next() orelse return error.BadGoOutput, 10);
-        try go_rows.put(arena, name, .{ .ns = ns, .count = count });
+    const go_rows = try parseRows(arena, go.stdout);
+
+    const jcc_safe = init.environ_map.get("BENCH_JCC_SAFE") != null;
+    const rs_exe = buildRust(arena, io, init.environ_map, jcc_safe) catch return 1;
+    std.debug.print("bench-regex: Rust regex ...\n", .{});
+    const rs = std.process.run(arena, io, .{ .argv = &.{ rs_exe, abs } }) catch |e| {
+        std.debug.print("bench-regex: could not run {s} ({t})\n", .{ rs_exe, e });
+        return 1;
+    };
+    if (rs.term != .exited or rs.term.exited != 0) {
+        std.debug.print("bench-regex: rust_regex failed:\n{s}\n", .{rs.stderr});
+        return 1;
     }
+    const rs_rows = try parseRows(arena, rs.stdout);
 
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
     const w = &stdout.interface;
-    try w.print("{s:<12} {s:>14} {s:>14} {s:>7}  count\n", .{ "workload", "ours ns/op", "go ns/op", "ours/go" });
+    try w.print("{s:<12} {s:>14} {s:>14} {s:>14} {s:>7} {s:>8}  count\n", .{ "workload", "ours ns/op", "go ns/op", "rust ns/op", "ours/go", "ours/rs" });
     try w.flush();
 
     var worst: f64 = 0;
     var best: f64 = std.math.inf(f64);
+    var worst_rs: f64 = 0;
+    var best_rs: f64 = std.math.inf(f64);
     var mismatch = false;
     for (workloads) |wl| {
         if (only) |o| if (std.mem.find(u8, wl.name, o) == null) continue;
@@ -287,21 +296,73 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("bench-regex: Go reported nothing for {s}\n", .{wl.name});
             return 1;
         };
+        const fastest = rs_rows.get(wl.name) orelse {
+            std.debug.print("bench-regex: Rust reported nothing for {s}\n", .{wl.name});
+            return 1;
+        };
         const ratio = ours.ns / theirs.ns;
         worst = @max(worst, ratio);
         best = @min(best, ratio);
-        const same = ours.count == theirs.count;
-        if (!same) mismatch = true;
-        try w.print("{s:<12} {d:>14.1} {d:>14.1} {d:>7.2}  {d}{s}\n", .{ wl.name, ours.ns, theirs.ns, ratio, ours.count, if (same) "" else " ≠ Go" });
+        const ratio_rs = ours.ns / fastest.ns;
+        worst_rs = @max(worst_rs, ratio_rs);
+        best_rs = @min(best_rs, ratio_rs);
+        const same_go = ours.count == theirs.count;
+        const same_rs = ours.count == fastest.count;
+        if (!same_go or !same_rs) mismatch = true;
+        try w.print("{s:<12} {d:>14.1} {d:>14.1} {d:>14.1} {d:>7.2} {d:>8.2}  {d}{s}{s}\n", .{
+            wl.name,    ours.ns, theirs.ns, fastest.ns, ratio, ratio_rs,
+            ours.count,
+            if (same_go) "" else " ≠ Go",
+            if (same_rs) "" else " ≠ Rust",
+        });
         try w.flush();
     }
     if (mismatch) {
-        try w.writeAll("bench-regex: FAILED -- a result count differs from Go's; the timing means nothing until it agrees\n");
+        try w.writeAll("bench-regex: FAILED -- a result count differs from Go's or Rust's; the timing means nothing until it agrees\n");
         try w.flush();
         return 1;
     }
-    try w.print("\nworst ours/go = {d:.2} (best {d:.2})\n", .{ worst, best });
-    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go regexp go1.26 · fastest ? (measured <today>)\n", .{ best, worst });
+    try w.print("\nworst ours/go = {d:.2} (best {d:.2}), worst ours/rust = {d:.2} (best {d:.2})\n", .{ worst, best, worst_rs, best_rs });
+    try w.print("card: **Performance:** ref {d:.2}–{d:.2}× Go regexp go1.26 · fastest {d:.2}–{d:.2}× Rust regex 1.13.1 (measured <today>{s})\n", .{
+        best, worst, best_rs, worst_rs, if (jcc_safe) "; JCC-padded, Go side unpadded" else "",
+    });
     try w.flush();
     return 0;
+}
+
+const Row = struct { ns: f64, count: usize };
+
+/// `name \t ns/op \t count` lines, the format both foreign sides print.
+fn parseRows(arena: std.mem.Allocator, out: []const u8) !std.StringHashMapUnmanaged(Row) {
+    var rows: std.StringHashMapUnmanaged(Row) = .empty;
+    var lines = std.mem.tokenizeScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        var f = std.mem.tokenizeScalar(u8, line, '\t');
+        const name = f.next() orelse continue;
+        const ns = try std.fmt.parseFloat(f64, f.next() orelse return error.BadForeignOutput);
+        const count = try std.fmt.parseInt(usize, f.next() orelse return error.BadForeignOutput, 10);
+        try rows.put(arena, name, .{ .ns = ns, .count = count });
+    }
+    return rows;
+}
+
+/// `cargo build --release --locked --offline` of `tools/rust_regex`, for the
+/// host CPU like our side.
+fn buildRust(arena: std.mem.Allocator, io: std.Io, environ: *const std.process.Environ.Map, jcc_safe: bool) ![]const u8 {
+    var env = try environ.clone(arena);
+    const target_dir = if (jcc_safe) ".zig-cache/rust_regex-jcc" else ".zig-cache/rust_regex";
+    try env.put("RUSTFLAGS", if (jcc_safe) "-C target-cpu=native -C llvm-args=-x86-branches-within-32B-boundaries" else "-C target-cpu=native");
+    std.debug.print("bench-regex: building the Rust side ...\n", .{});
+    const res = std.process.run(arena, io, .{
+        .argv = &.{ "cargo", "build", "--release", "--locked", "--offline", "--quiet", "--manifest-path", "modules/regex/tools/rust_regex/Cargo.toml", "--target-dir", target_dir },
+        .environ_map = &env,
+    }) catch |e| {
+        std.debug.print("bench-regex: could not run cargo ({t}) -- the fastest candidate is Rust regex\n", .{e});
+        return error.RustBuildFailed;
+    };
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("bench-regex: cargo build failed:\n{s}\n", .{res.stderr});
+        return error.RustBuildFailed;
+    }
+    return try arena.print("{s}/release/rust_regex_bench", .{target_dir});
 }

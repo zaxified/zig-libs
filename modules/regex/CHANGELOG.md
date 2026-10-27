@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **NO CONSUMER-VISIBLE CHANGE:** `bench-regex` also times Rust's `regex` 1.13.1 (`tools/rust_regex`, pinned `Cargo.lock`, built `--offline`) as the fastest candidate in the field; its result counts must agree too. Card: ref 0.03–0.72× Go, fastest 0.04–152258.86× Rust — end-anchored searches (`…$`) are the gap (Rust runs a reverse DFA from the end of the text).
+
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-19** — **Fix:** (audit S1) POSIX syntax allows a repetition of a repetition
