@@ -8,6 +8,8 @@
 //!   - no crash, no hang, no leak (compile is `compile`-or-error; the
 //!     driver's DebugAllocator sees the Matcher and the Regex freed);
 //!   - `isMatch` ⇔ `Matcher.find` finds a match; `fullMatch` ⇒ `isMatch`;
+//!   - with a literal prefix set (`Prefilter.teddy`): `isMatch` and `find`
+//!     from every position as without the prefilter;
 //!   - `captures` group 0 is `find`'s span; every group span lies inside it
 //!     and inside the input, start ≤ end;
 //!   - the iterator yields non-overlapping spans in increasing order, its
@@ -57,7 +59,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -252,6 +254,21 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (re.prefilter.end_anchored and re.insts.len <= dfa_max_insts) {
         hit(.end_anchored);
         if (any) hit(.end_anchored_match);
+    }
+    if (re.prefilter.teddy != null) {
+        // A prefix set that misses a match skips it in every entry point
+        // alike: only the program without the prefilter tells.
+        hit(.teddy);
+        if (input.len >= 34) hit(.teddy_long);
+        if (any) hit(.teddy_match);
+        var bare = re;
+        bare.prefilter = .{};
+        if (bare.isMatch(input) != any) return error.TeddySkippedAMatch;
+        var bm = try regex.Matcher.init(gpa, &bare);
+        defer bm.deinit();
+        for (0..input.len + 1) |from| {
+            if (!std.meta.eql(bm.find(input, from), m.find(input, from))) return error.TeddySkippedAMatch;
+        }
     }
     if (re.fullMatch(input)) {
         hit(.full);

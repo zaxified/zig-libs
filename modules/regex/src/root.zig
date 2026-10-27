@@ -29,6 +29,7 @@
 const std = @import("std");
 const syntax = @import("syntax.zig");
 const replace = @import("replace.zig");
+const teddy = @import("teddy.zig");
 
 pub const meta = .{
     .doc = "RE2-syntax regular expressions at parity with Go regexp — linear time, comptime compile, alloc-free match",
@@ -144,7 +145,14 @@ pub const Regex = struct {
             done += 1;
         }
         const source = try gpa.dupe(u8, pattern);
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = analyze(insts, ranges), .longest = opts.isLongest(), .source = source };
+        errdefer gpa.free(source);
+        var pf = analyze(insts, ranges);
+        if (buildTeddy(&pf, insts, ranges)) |t| {
+            const tp = try gpa.create(teddy.Teddy);
+            tp.* = t;
+            pf.teddy = tp;
+        }
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -154,6 +162,7 @@ pub const Regex = struct {
             for (re.names) |n| gpa.free(n);
             gpa.free(re.names);
             gpa.free(re.source);
+            if (re.prefilter.teddy) |t| gpa.destroy(@constCast(t));
         }
         re.* = undefined;
     }
@@ -421,13 +430,13 @@ pub const Regex = struct {
         var pos: usize = 0;
         var prev: ?u21 = null;
         cur.clear(words);
-        const pf = re.prefilter;
+        const pf = &re.prefilter;
         while (true) {
             if (!full and cur.n == 0) {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != 0) return false;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
-                    pos = text.skip(&pf, pos) orelse return false;
+                    pos = text.skip(pf, pos) orelse return false;
                     prev = text.before(pos);
                     // `seen` still holds the closure walked where the threads
                     // died (an assertion that failed there, say): stale here.
@@ -597,7 +606,13 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = analyze(&insts, &ranges), .longest = opts.isLongest(), .source = pattern };
+        var pf = analyze(&insts, &ranges);
+        if (buildTeddy(&pf, &insts, &ranges)) |t| {
+            const final_teddy = t;
+            pf.teddy = &final_teddy;
+        }
+        const final_pf = pf;
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern };
     }
 }
 
@@ -778,10 +793,15 @@ pub const Prefilter = struct {
     /// (`Regex.literalPrefix`), up to 16; used from two bytes on.
     lit: [16]u8 = undefined,
     lit_len: u8 = 0,
+    /// Without such a literal: the literal prefixes every match begins with
+    /// (two bytes or more, at most `teddy.max_pats`), searched for together.
+    /// Out of line (~400 B, most patterns have none): owned like the tables.
+    teddy: ?*const teddy.Teddy = null,
 
     /// The first position at or after `pos` whose byte may start a match.
     fn next(pf: *const Prefilter, input: []const u8, pos: usize) ?usize {
         if (pf.lit_len >= 2) return findLiteral(input, pos, pf.lit[0..pf.lit_len]);
+        if (pf.teddy) |t| return t.find(input, pos);
         if (pf.single) |c| return std.mem.findScalarPos(u8, input, pos, c);
         const set = pf.first.?;
         var i = pos;
@@ -894,6 +914,13 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
         }
     }
     return pf;
+}
+
+/// The `Prefilter.teddy` for a program `analyze` gave `pf`, or null: only
+/// where a match can start anywhere and no literal prefix is searched for.
+fn buildTeddy(pf: *const Prefilter, insts: []const Inst, ranges: []const Range) ?teddy.Teddy {
+    if (pf.anchored or pf.first == null or pf.lit_len >= 2) return null;
+    return .build(insts, ranges);
 }
 
 /// Does every path to the match pass a `\z`? Follows the empty transitions
@@ -1465,13 +1492,13 @@ pub const Matcher = struct {
         var matched = false;
         var pos = from;
         var prev = text.before(from);
-        const pf = re.prefilter;
+        const pf = &re.prefilter;
         while (true) {
             if (!matched and cur.n == 0 and !full) {
                 // No thread alive: a match can only start where the prefilter allows.
                 if (pf.anchored and pos != from) break;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
-                    pos = text.skip(&pf, pos) orelse break;
+                    pos = text.skip(pf, pos) orelse break;
                     prev = text.before(pos);
                     // As in `runSetOn`: `seen` is from where the threads died.
                     cur.clear();
@@ -2370,6 +2397,7 @@ test "invalid UTF-8 in the input reads as U+FFFD, one byte" {
 
 test {
     _ = syntax;
+    _ = teddy;
     _ = @import("go_oracle_test.zig");
     _ = @import("fuzz_test.zig");
 }
@@ -2471,6 +2499,89 @@ test "prefilter: anchoring and first bytes worked out from the program" {
     try expectFind("é", "\xc3\xc3\xa9", "é");
     try expectFind("#([0-9]+)", "a#b#12", "#12");
     try expectFind("^a", "ba", null);
+}
+
+test "prefilter: the literal prefixes of every match, searched for together (Teddy)" {
+    const Case = struct { p: []const u8, n: ?u8, masks: u8 = 0 };
+    for ([_]Case{
+        .{ .p = "ABCD|CDEF|EFGH|GHIJ|IJKL|KLMN|MNOP|OPQR|QRST|STUV|UVWX|WXYZ", .n = 12, .masks = 3 },
+        .{ .p = "(?i)abc", .n = 8, .masks = 3 },
+        .{ .p = "(?i)abcdefghij", .n = 16, .masks = 3 }, // 2^8 at eight bytes: cut to four
+        .{ .p = "[ab][cd][ef][gh][ij][kl]", .n = 16, .masks = 3 },
+        .{ .p = "foo\\d|bar\\d", .n = 2, .masks = 3 },
+        .{ .p = "é|ü", .n = 2, .masks = 2 },
+        .{ .p = "ab|abcd|cd", .n = 2, .masks = 2 }, // `abcd` is covered by `ab`
+        .{ .p = "(ab|cd)(?m:^)x|\\bef", .n = 3, .masks = 2 }, // assertions passed
+        .{ .p = "a|bc", .n = null }, // one byte
+        .{ .p = "ab|c\\d", .n = null }, // `c`, then a class of ten
+        .{ .p = "x*y|zz", .n = null }, // `y`
+        .{ .p = "ab|.c", .n = null },
+        .{ .p = "ab|cd|", .n = null }, // can be empty
+        .{ .p = "ab|c\\x{fffd}", .n = null }, // U+FFFD also reads an invalid byte
+        .{ .p = "abc|abd", .n = null }, // the literal `ab` instead
+        .{ .p = "^ab|^cd", .n = null }, // anchored
+    }) |c| {
+        errdefer std.debug.print("/{s}/\n", .{c.p});
+        var re = try Regex.compile(testing.allocator, c.p);
+        defer re.deinit(testing.allocator);
+        if (c.n) |n| {
+            const t = re.prefilter.teddy orelse return error.NoTeddy;
+            try testing.expectEqual(n, t.n);
+            try testing.expectEqual(c.masks, t.masks);
+        } else try testing.expect(re.prefilter.teddy == null);
+    }
+    // Also at compile time.
+    const ct = comptime comptimeCompile("ABCD|CDEF|EFGH");
+    try testing.expectEqual(@as(u8, 3), ct.prefilter.teddy.?.n);
+}
+
+test "Teddy.find agrees with a scan for the first prefix, over and past the 32-byte lanes" {
+    var prng: std.Random.DefaultPrng = .init(0x7465_6464_79);
+    const rng = prng.random();
+    const alpha = "abcdAB\xc3\xa9";
+    var pat_buf: [256]u8 = undefined;
+    var hay: [200]u8 = undefined;
+    var built: usize = 0;
+    for (0..3000) |_| {
+        // An alternation of literals over a small alphabet, `(?i)` now and then.
+        var w: std.Io.Writer = .fixed(&pat_buf);
+        if (rng.uintLessThan(u8, 4) == 0) try w.writeAll("(?i)");
+        const alts = rng.intRangeAtMost(usize, 1, 14);
+        for (0..alts) |k| {
+            if (k != 0) try w.writeByte('|');
+            for (0..rng.intRangeAtMost(usize, 2, 5)) |_| try w.writeByte("abcdAB"[rng.uintLessThan(usize, 6)]);
+        }
+        var re = try Regex.compile(testing.allocator, w.buffered());
+        defer re.deinit(testing.allocator);
+        const t = re.prefilter.teddy orelse continue;
+        built += 1;
+        const hl = rng.uintLessThan(usize, hay.len + 1);
+        for (hay[0..hl]) |*b| b.* = alpha[rng.uintLessThan(usize, alpha.len)];
+        const in = hay[0..hl];
+        const from = rng.uintLessThan(usize, hl + 1);
+        const want: ?usize = for (from..in.len) |i| {
+            const hit = for (t.pats[0..t.n], t.lens[0..t.n]) |*p, l| {
+                if (std.mem.startsWith(u8, in[i..], p[0..l])) break true;
+            } else false;
+            if (hit) break i;
+        } else null;
+        errdefer std.debug.print("/{s}/ from {d} in \"{f}\"\n", .{ w.buffered(), from, std.zig.fmtString(in) });
+        try testing.expectEqual(want, t.find(in, from));
+        // The prefilter only skips: the same program without it agrees.
+        var bare = re;
+        bare.prefilter = .{};
+        try testing.expectEqual(bare.isMatch(in), re.isMatch(in));
+        var m = try Matcher.init(testing.allocator, &re);
+        defer m.deinit();
+        var bm = try Matcher.init(testing.allocator, &bare);
+        defer bm.deinit();
+        try testing.expectEqual(bm.find(in, from), m.find(in, from));
+        var it = m.iterator(in);
+        var bit = bm.iterator(in);
+        while (bit.next()) |s| try testing.expectEqual(s, it.next().?);
+        try testing.expect(it.next() == null);
+    }
+    try testing.expect(built > 2000); // one alternative or a common literal: no Teddy
 }
 
 test "findLiteral agrees with std.mem.findPos" {

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Faster:** a pattern every match of which begins with one of a few literal prefixes and no common literal (`ABCD|CDEF|…|WXYZ`, `(?i)abc`, `foo\d|bar\d`) skips to the next place one of them occurs with Teddy (SIMD nibble tables over the first 2–3 bytes, up to 32 prefixes of up to 8 bytes; `src/teddy.zig`). Twelve four-letter alternatives over 1 MiB with no match: 5.4 ms → 0.12 ms (36× → 0.9× Rust's `regex`); `(?i)žluť\w*` find-all over 1 MiB of Czech: 5.2 → 2.9 ms. Same answers (tested against the program without the prefilter, the fuzz harness compares the two on every such pattern). `Prefilter` gains the field `teddy`.
+
 - **2026-10-27** — **Faster:** before reading an end-anchored text backwards, `isMatch` compares its last bytes with those every match ends with (up to 16 ASCII code points, one or two bytes each: a literal suffix, or its cases under `(?i)`). A 1 MiB text ending in the last ten letters of `ABCDEFGHIJKLMNOPQRSTUVWXYZ$`: 1.2 µs → 11 ns.
 
 - **2026-10-27** — **Faster:** `isMatch` of a pattern every match of which ends at the end of the text (`…$`, `…\z`, not also `^…`) reads the text backwards from its end with the lazy DFA, after a one-byte check that the text's last byte can end a match. Go's `regexp` benchmark shapes over 1 MiB (`easy0`, `easy1`, `medium`, `hard`, `icase`): 60 µs–3.2 ms → 4 ns; a text whose last ten bytes fit: 1.2 µs. Same answers (tested against the NFA and `Matcher.find`, fuzzed with a quarter of the patterns end-anchored).

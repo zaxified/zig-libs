@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean x2 (REGEX_FUZZ)) · ct n/a — regex engine (keyword review, 2026-10-07)
 
-**Performance:** ref 0.00–0.82× Go regexp go1.26 · fastest 0.04–35.95× Rust regex 1.13.1 (measured 2026-10-27)
+**Performance:** ref 0.00–0.79× Go regexp go1.26 · fastest 0.04–4.12× Rust regex 1.13.1 (measured 2026-10-27)
 
 **Known defects:** none recorded
 
@@ -116,7 +116,17 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   by a 32-byte first-and-last-byte vector scan when it has two bytes or more — never one holding
   U+FFFD, which an invalid byte also matches; `first` = the UTF-8 lead bytes of every class reachable
   without consuming (none when the match can be empty, a `.` is reachable, or a class holds U+FFFD
-  — an invalid byte reads as U+FFFD and could start mid-sequence). Consulted only while no thread
+  — an invalid byte reads as U+FFFD and could start mid-sequence); `teddy` (2026-10-27), when
+  there is no such literal and the match can start anywhere = the literal prefixes every match
+  begins with (`src/teddy.zig`): a walk of every path from the start through assertions, a class
+  of up to 4 code points forking it, ending at 8 bytes, a larger class, `.` or the match — none
+  when a path ends empty or at a class holding U+FFFD; cut to 4, 3, 2 bytes while over 32
+  prefixes; none under two bytes. Searched for with Teddy (Hyperscan's SIMD literal search, as
+  the Rust `aho-corasick` crate documents it; no source ported): the sorted prefixes in 8
+  buckets, per byte position (2–3, up to the shortest prefix) two 16-entry nibble tables of
+  bucket bits, 32 positions per step (`vpshufb` with AVX2, a select tree elsewhere), each
+  candidate checked against its buckets' prefixes in full. Out of line (`?*const`, ~400 B):
+  most programs have none. Consulted only while no thread
   is alive, so it changes where the search looks, never which match it finds; a skip lands on an
   ASCII or lead byte, which always begins a code point the VM would decode.
 - **`x*` over an `x` that can match empty compiles as `(x+)?`**, so one empty pass through `x`
@@ -277,9 +287,10 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
   (literal suffix, `(?i)` pairs) answers the common shapes in nanoseconds; a class near the end
   (`[A-Z]+XYZ$` on a text ending `…XYZ`) still runs the DFA. Precomputing each instruction's
   follow set at compile time would cut the per-state cost; it costs ~2 KiB per `Regex`.
-- **A prefilter for literal alternations** *(2026-10-27, bench `hard1` 33–37× Rust)* — Rust's
-  Teddy (SIMD over the first bytes of every alternative) / Aho-Corasick; here the first-byte set
-  only.
+- **Teddy past 32 prefixes, and on NEON** *(2026-10-27, after `Prefilter.teddy`)* — Rust's slim
+  Teddy takes 64 patterns and its fat variant 16 buckets; past 32 here the prefixes are cut
+  shorter, and with fewer than two bytes the first-byte set is used. Non-x86 targets look the
+  nibbles up by a select tree (AArch64 has `tbl`), unmeasured.
 - **Intel JCC erratum in the prefilter scan** *(2026-10-19, `~/CML/zig-017/jcc/REPORT.md` Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
 - **A DFA for searches with positions** *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
   night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
