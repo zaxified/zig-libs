@@ -2530,6 +2530,15 @@ test "prefilter: the literal prefixes of every match, searched for together (Ted
             try testing.expectEqual(c.masks, t.masks);
         } else try testing.expect(re.prefilter.teddy == null);
     }
+    // A surrogate is never read, an invalid sequence reads as U+FFFD.
+    try expectFind("[\\x{D7FF}\\x{D800}]x|yz", "\xed\xa0\x80x", null);
+    try expectFind("[\\x{D7FF}\\x{D800}]x|yz", "a\u{d7ff}x", "\u{d7ff}x");
+    // A walk past its budget at eight bytes fits when cut shorter.
+    {
+        var re = try Regex.compile(testing.allocator, "(?i)[ab][cd][ef][gh][ij][kl][mn][op]|zz");
+        defer re.deinit(testing.allocator);
+        try testing.expect(re.prefilter.teddy != null);
+    }
     // Also at compile time.
     const ct = comptime comptimeCompile("ABCD|CDEF|EFGH");
     try testing.expectEqual(@as(u8, 3), ct.prefilter.teddy.?.n);

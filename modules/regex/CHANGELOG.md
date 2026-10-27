@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Faster:** the literal-prefix walk behind Teddy tries a shorter cut when it runs out of its step or stack budget, instead of giving up (`(?i)[ab][cd]…[op]|zz` now gets two-byte prefixes). From the review of the Teddy commit; also a test that a class holding a surrogate never matches the bytes `ED A0 80`.
+
 - **2026-10-27** — **Faster:** a pattern every match of which begins with one of a few literal prefixes and no common literal (`ABCD|CDEF|…|WXYZ`, `(?i)abc`, `foo\d|bar\d`) skips to the next place one of them occurs with Teddy (SIMD nibble tables over the first 2–3 bytes, up to 32 prefixes of up to 8 bytes; `src/teddy.zig`). Twelve four-letter alternatives over 1 MiB with no match: 5.4 ms → 0.12 ms (36× → 0.9× Rust's `regex`); `(?i)žluť\w*` find-all over 1 MiB of Czech: 5.2 → 2.9 ms. Same answers (tested against the program without the prefilter, the fuzz harness compares the two on every such pattern). `Prefilter` gains the field `teddy`.
 
 - **2026-10-27** — **Faster:** before reading an end-anchored text backwards, `isMatch` compares its last bytes with those every match ends with (up to 16 ASCII code points, one or two bytes each: a literal suffix, or its cases under `(?i)`). A 1 MiB text ending in the last ten letters of `ABCDEFGHIJKLMNOPQRSTUVWXYZ$`: 1.2 µs → 11 ns.

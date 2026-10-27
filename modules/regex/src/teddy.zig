@@ -165,6 +165,7 @@ const Entry = struct { pc: u16, len: u8, buf: [max_len]u8 };
 /// Walk every path from the start, collecting the bytes of the code points
 /// it must read, until `cap` bytes, a larger class, `.`, or the match.
 /// Assertions are passed (a superset of where matches start is enough).
+/// Past the walk's budget: `.too_many`, so a shorter cut is tried.
 fn collect(insts: []const Inst, ranges: []const Range, cap: u8, set: *Set) Outcome {
     var stack: [64]Entry = undefined;
     stack[0] = .{ .pc = 0, .len = 0, .buf = undefined };
@@ -172,8 +173,9 @@ fn collect(insts: []const Inst, ranges: []const Range, cap: u8, set: *Set) Outco
     var steps: usize = 0;
     while (sp != 0) {
         steps += 1;
-        // An empty loop (`(?:\b)*`) would walk forever; a big fan-out is not worth it.
-        if (steps > 4096) return .none;
+        // An empty loop (`(?:\b)*`) would walk forever; a big fan-out may
+        // still fit when cut shorter.
+        if (steps > 4096) return .too_many;
         sp -= 1;
         var e = stack[sp];
         switch (insts[e.pc]) {
@@ -183,7 +185,7 @@ fn collect(insts: []const Inst, ranges: []const Range, cap: u8, set: *Set) Outco
                 sp += 1;
             },
             .split => |sx| {
-                if (sp + 2 > stack.len) return .none;
+                if (sp + 2 > stack.len) return .too_many;
                 e.pc = sx.y;
                 stack[sp] = e;
                 e.pc = sx.x;
@@ -223,7 +225,7 @@ fn collect(insts: []const Inst, ranges: []const Range, cap: u8, set: *Set) Outco
                             if (ne.len == cap) {
                                 if (emit(set, &ne)) |o| return o;
                             } else {
-                                if (sp == stack.len) return .none;
+                                if (sp == stack.len) return .too_many;
                                 stack[sp] = ne;
                                 sp += 1;
                             }
