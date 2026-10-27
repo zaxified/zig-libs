@@ -10,8 +10,9 @@
 //! `u64` per draw). The seed is first run once with the tape recording; then
 //! candidate tapes — blocks deleted, blocks zeroed, single entries lowered —
 //! are run against the same harness, and a candidate is kept when it ends
-//! **the same way**: the same error, the same signal (a panic or a fault), a
-//! leak, or a hang. Smaller entries are simpler inputs (shorter slices, lower
+//! **the same way**: the same error, the same signal (a panic is SIGABRT,
+//! a fault its own signal: the children run without Zig's segfault
+//! handler, which would turn every fault into an abort), a leak, or a hang. Smaller entries are simpler inputs (shorter slices, lower
 //! ranged values, earlier enum tags), so the result is a short tape of small
 //! numbers, and its replay prints which draw got which value.
 //!
@@ -71,7 +72,9 @@ fn Children(comptime harness: anytype) type {
         /// One harness run in this (child) process; the exit code says how
         /// it ended, the shared header says what it consumed and which error.
         fn runOne(sh: *Shared, rng: *Rng) u8 {
-            var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init; // global-alloc-ok: the shrinker's leak detector around one forked harness run
+            // `.safety = true`: without it (the default in ReleaseFast) `deinit`
+            // looks for no leak and a leaking seed reads as a pass.
+            var da: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .safety = true }) = .init; // global-alloc-ok: the shrinker's leak detector around one forked harness run
             var code: u8 = code_pass;
             harness(Rng, rng, da.allocator()) catch |e| {
                 const n = @min(@errorName(e).len, sh.err_name.len);
@@ -83,7 +86,23 @@ fn Children(comptime harness: anytype) type {
             return code;
         }
 
+        /// A fault (SIGSEGV, SIGILL, SIGBUS, SIGFPE) kills the child with
+        /// its own signal. Zig's default handler prints a trace and then
+        /// aborts, so every fault would end as SIGABRT, like a panic, and a
+        /// trap candidate would count as the panic it was meant to shrink
+        /// (mutation run 2026-10-27). Only the traced replay keeps the
+        /// handler: its trace is the point of it.
+        fn defaultFaultSignals() void {
+            const act: std.posix.Sigaction = .{
+                .handler = .{ .handler = std.posix.SIG.DFL },
+                .mask = std.posix.sigemptyset(),
+                .flags = 0,
+            };
+            std.debug.updateSegfaultHandler(&act);
+        }
+
         fn record(sh: *Shared, seed: u64) u8 {
+            defaultFaultSignals();
             var prng = std.Random.DefaultPrng.init(seed);
             sh.tape = .{ .mode = .record, .buf = &sh.log, .spans = &sh.spans };
             var rng: Rng = .{ .r = prng.random(), .tape = &sh.tape };
@@ -92,6 +111,7 @@ fn Children(comptime harness: anytype) type {
         }
 
         fn replay(sh: *Shared, trace: bool) u8 {
+            if (!trace) defaultFaultSignals();
             var prng = std.Random.DefaultPrng.init(0);
             sh.tape = .{ .mode = .replay, .buf = &sh.log, .len = @intCast(sh.len), .trace = trace, .spans = &sh.spans };
             var rng: Rng = .{ .r = prng.random(), .tape = &sh.tape };
@@ -465,11 +485,13 @@ test "shrink: a panic shrinks too (the child dies, the shrink does not)" {
     try testing.expectEqualSlices(u64, &.{ 777, 3 }, r.tape);
 }
 
-/// Two different errors: `Target` from 500 up, `Other` at 0 — the smaller
-/// input, which a shrinker that ignores the error name would walk into.
+/// Two different errors: `Target` from 500 up, `Shadow` at 0 — the smaller
+/// input, which a shrinker that ignores the error name would walk into. The
+/// names are the same length, so a comparison of lengths alone does not
+/// tell them apart (mutation run 2026-10-27).
 fn twoErrors(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     const v = src.valueRangeAtMost(u32, 0, 1000);
-    if (v == 0) return error.Other;
+    if (v == 0) return error.Shadow;
     if (v >= 500) return error.Target;
 }
 
@@ -485,6 +507,170 @@ test "shrink: a candidate that fails with a different error is not taken" {
     defer testing.allocator.free(r.tape);
     try testing.expectEqualSlices(u64, &.{500}, r.tape);
     try testing.expectError(error.Target, replayHere(twoErrors, testing.allocator, r.tape, false));
+}
+
+/// The first seed whose first ranged draw (0..1000) is at least 500.
+fn seedFrom500() u64 {
+    var seed: u64 = 0;
+    while (true) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: Rng = .{ .r = prng.random() };
+        if (rng.valueRangeAtMost(u32, 0, 1000) >= 500) return seed;
+    }
+}
+
+/// A panic (SIGABRT) from 500 up, a trap (SIGILL) at 0.
+fn twoSignals(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const v = src.valueRangeAtMost(u32, 0, 1000);
+    if (v == 0) @trap();
+    if (v >= 500) @panic("planted");
+}
+
+test "shrink: a candidate that dies of a different signal is not taken" {
+    if (!child.supported) return error.SkipZigTest;
+    const r = try shrink(twoSignals, testing.allocator, .{ .name = "sig", .seed = seedFrom500(), .limit_ms = 5000, .report = false });
+    defer testing.allocator.free(r.tape);
+    try testing.expectEqual(@as(u32, @backingInt(linux.SIG.ABRT)), r.outcome.signaled);
+    try testing.expectEqualSlices(u64, &.{500}, r.tape);
+}
+
+/// Leaks from 500 up; no failure below.
+fn leaky(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    const v = src.valueRangeAtMost(u32, 0, 1000);
+    if (v >= 500) _ = try gpa.alloc(u8, 8);
+}
+
+test "shrink: a leak is an outcome, and shrinks to the smallest leaking input" {
+    if (!child.supported) return error.SkipZigTest;
+    const r = try shrink(leaky, testing.allocator, .{ .name = "leak", .seed = seedFrom500(), .limit_ms = 5000, .report = false });
+    defer testing.allocator.free(r.tape);
+    try testing.expect(r.outcome.eql(.{ .exited = code_leak }));
+    try testing.expectEqualSlices(u64, &.{500}, r.tape);
+}
+
+/// Hangs from 500 up; passes below.
+fn hangs(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const v = src.valueRangeAtMost(u32, 0, 1000);
+    if (v >= 500) while (true) std.atomic.spinLoopHint();
+}
+
+test "shrink: a hang is an outcome, and a passing candidate is not one" {
+    if (!child.supported) return error.SkipZigTest;
+    const r = try shrink(hangs, testing.allocator, .{ .name = "hang", .seed = seedFrom500(), .limit_ms = 500, .report = false });
+    defer testing.allocator.free(r.tape);
+    try testing.expect(r.outcome == .hang);
+    try testing.expectEqualSlices(u64, &.{500}, r.tape);
+}
+
+/// A slice, then a byte that fails at 0x42: the slice must go as one piece
+/// (its length and its bytes together), or the byte moves into it.
+fn sliceThenByte(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var buf: [16]u8 = undefined;
+    _ = src.slice(&buf);
+    if (src.value(u8) == 0x42) return error.Found;
+}
+
+test "shrink: a slice is cut whole, length and bytes together" {
+    if (!child.supported) return error.SkipZigTest;
+    // Several slice lengths: a power of two can also go by a block delete
+    // after its bytes were zeroed (mutation run 2026-10-27), others only whole.
+    var found: usize = 0;
+    var odd_len = false;
+    var seed: u64 = 0;
+    while (found < 8) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: Rng = .{ .r = prng.random() };
+        var buf: [16]u8 = undefined;
+        const n = rng.slice(&buf);
+        if (n < 5 or rng.value(u8) != 0x42) continue;
+        found += 1;
+        if (!std.math.isPowerOfTwo(n)) odd_len = true;
+        const r = try shrink(sliceThenByte, testing.allocator, .{ .name = "cut", .seed = seed, .limit_ms = 5000, .report = false });
+        defer testing.allocator.free(r.tape);
+        try testing.expectEqualSlices(u64, &.{ 0, 0x42 }, r.tape);
+    }
+    try testing.expect(odd_len);
+}
+
+/// Four draws 0..9; fails when the first is 5 and the second or the fourth
+/// is 7. From `5 y z 7` only deleting the two middle entries together, at
+/// offset 1, reaches `5 7`.
+fn fourDraws(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const x = src.valueRangeAtMost(u8, 0, 9);
+    const y = src.valueRangeAtMost(u8, 0, 9);
+    _ = src.valueRangeAtMost(u8, 0, 9);
+    const w = src.valueRangeAtMost(u8, 0, 9);
+    if (x == 5 and (y == 7 or w == 7)) return error.Found;
+}
+
+test "shrink: a block is deleted at any offset, not only at multiples of its size" {
+    if (!child.supported) return error.SkipZigTest;
+    var seed: u64 = 0;
+    while (true) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: Rng = .{ .r = prng.random() };
+        var d: [4]u8 = undefined;
+        for (&d) |*v| v.* = rng.valueRangeAtMost(u8, 0, 9);
+        // `5 y z 7` with y and z below 7 and y not 5: no single delete, no
+        // aligned block delete, no zeroing and no lowering (which cannot
+        // reach 7 from below) makes it shorter.
+        if (d[0] == 5 and d[3] == 7 and d[1] < 7 and d[1] != 5 and d[2] < 7) break;
+    }
+    const r = try shrink(fourDraws, testing.allocator, .{ .name = "block", .seed = seed, .limit_ms = 5000, .report = false });
+    defer testing.allocator.free(r.tape);
+    try testing.expectEqualSlices(u64, &.{ 5, 7 }, r.tape);
+}
+
+test "Tape: recording fills the buffer to the last entry before it overflows" {
+    var buf: [4]u64 = undefined;
+    var t: Tape = .{ .mode = .record, .buf = &buf };
+    var prng = std.Random.DefaultPrng.init(1);
+    var rng: Rng = .{ .r = prng.random(), .tape = &t };
+    for (0..4) |_| _ = rng.value(u8);
+    try testing.expect(!t.overflow);
+    try testing.expectEqual(@as(usize, 4), t.len);
+    _ = rng.value(u8);
+    try testing.expect(t.overflow);
+    try testing.expectEqual(@as(usize, 4), t.len);
+}
+
+/// The slippage property of `tools/slip.sh`, the same in all three tools: a
+/// byte string fails `Deep` when it is at least 16 long and sums to 1500 or
+/// more, and `Shallow` when it starts with a zero — the bug a shrinker
+/// walks into by zeroing the first byte of a `Deep` input.
+fn twoBugsCheck(b: []const u8) error{ Shallow, Deep }!void {
+    if (b.len >= 2 and b[0] == 0) return error.Shallow;
+    if (b.len < 16) return;
+    var sum: u32 = 0;
+    for (b) |x| sum += x;
+    if (sum >= 1500) return error.Deep;
+}
+
+fn twoBugs(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    var buf: [64]u8 = undefined;
+    const n = src.slice(&buf);
+    return twoBugsCheck(buf[0..n]);
+}
+
+test "lead: a Deep input shrinks to a Deep input, never to the Shallow bug next to it (20 seeds)" {
+    if (!child.supported) return error.SkipZigTest;
+    var shrunk: usize = 0;
+    var seed: u64 = 0;
+    while (shrunk < 20 and seed < 1000) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: Rng = .{ .r = prng.random() };
+        twoBugs(Rng, &rng, testing.allocator) catch |e| if (e == error.Deep) {
+            // A budget no loaded machine runs out of: a shrink cut short
+            // would end above 16 bytes and read as a lost lead.
+            const r = try shrink(twoBugs, testing.allocator, .{ .name = "slip", .seed = seed, .limit_ms = 5000, .budget_ms = 600_000, .report = false });
+            defer testing.allocator.free(r.tape);
+            try testing.expectError(error.Deep, replayHere(twoBugs, testing.allocator, r.tape, false));
+            // The shortest Deep input: 16 bytes.
+            try testing.expectEqual(@as(u64, 16), r.tape[0]);
+            shrunk += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 20), shrunk);
 }
 
 /// Fails only the first time it runs in any process of the shrink: the

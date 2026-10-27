@@ -58,3 +58,35 @@ num-traits via autocfg, zerocopy) that only run `rustc --version`/`-vV`,
 compile autocfg's probes into `OUT_DIR` and read the crate's own
 `Cargo.toml`. proptest's file writes (failure persistence, `fork`) are off:
 `failure_persistence: None`, `default-features = false`.
+
+## Shrink slippage against proptest and libFuzzer
+
+`slip.sh` (run from the repository root; needs cargo, clang with libFuzzer,
+python3) asks the foreign shrinkers the question the test
+`lead: a Deep input shrinks to a Deep input …` (`src/shrink.zig`) asks ours:
+given an input that fails with a deep bug, does the shrunk input still fail
+with it, or with the shallow bug next to it (`twoBugsCheck`: deep = at least
+16 bytes summing to 1500 or more, shallow = a leading zero byte)?
+
+| dir / file | side |
+|---|---|
+| `proptest_rust/src/bin/slip.rs` | proptest 1.11.0 `TestRunner::run`, default `Config` (no persistence), seeds 0..20 |
+| `libfuzzer_c/slip.c` | libFuzzer `-minimize_crash=1` from a random deep input per seed: plain, ASan, ASan + `dedup_token_length=3`, `=10`; deep = `abort()`, shallow = `__builtin_trap()` |
+
+**Measured 2026-10-27** (20 seeds each; ours: 20/20 deep, 16 bytes):
+
+| tool | reported failure | length |
+|---|---|--:|
+| proptest 1.11.0 | shallow 20/20 | 16 |
+| libFuzzer 21.1.8, plain / ASan / ASan `dedup_token_length=3` | shallow 20/20 | 2 |
+| libFuzzer 21.1.8, ASan `dedup_token_length=10` | deep 20/20 (stops at the first slip) | 16–24 |
+
+Why, from their source: proptest's `shrink` (`test_runner/runner.rs`)
+takes any `Fail` as the new current case (1.12.0's `shrink`, read on GitHub at tag v1.12.0, is the same); libFuzzer's `MinimizeCrashInput`
+(`FuzzerDriver.cpp`) stops only when the `DEDUP_TOKEN:` lines of the old and
+the new crash differ, a line only a sanitizer prints, built from the first
+`dedup_token_length` frames — for a signal those are libFuzzer's own
+`__sanitizer_print_stack_trace--PrintStackTrace--CrashCallback`. Each libFuzzer
+crash sleeps about 0.6 s in its handler, so the script runs the seeds side by
+side (about 5 min under `hw run`). Scratch in `.zig-cache/slip`.
+
