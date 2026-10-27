@@ -88,6 +88,10 @@ pub const Report = struct {
     burn_len: usize = 0,
     /// How deep the call reached at all (first non-paint byte from below).
     dirty_depth: usize = 0,
+    /// Non-empty secrets that gave no needle window: shorter than the window,
+    /// or no window with enough distinct bytes. The needle check is blind to
+    /// them; only the residue check still covers them.
+    unprobed_secrets: usize = 0,
 
     fn add(self: *Report, o: Report) void {
         self.needle_hits += o.needle_hits;
@@ -394,10 +398,21 @@ pub fn Probe(comptime cfg: Config) type {
             for (0..cfg.repeats) |_| {
                 measureOnce(Call.call);
                 resetNeedles();
-                for (secrets) |s| addImage(s);
+                var unprobed: usize = 0;
+                for (secrets) |s| {
+                    const before = n_win;
+                    addImage(s);
+                    if (s.len != 0 and n_win == before and !overflow) unprobed += 1;
+                }
                 sortNeedles();
                 total.add(analyse());
+                total.unprobed_secrets = unprobed;
             }
+            // Not an error (yet): 287 files call `run`, and which of them pass
+            // a short or low-entropy secret is unmeasured. A silent pass of
+            // the needle check is the defect; saying so is the first step.
+            if (total.unprobed_secrets != 0 and !expect.quiet)
+                std.debug.print("STACKPROBE {s}: {d} secret(s) too short or too uniform for a {d}-byte needle window; the needle check cannot see them\n", .{ label, total.unprobed_secrets, W });
             if (overflow) {
                 std.debug.print("\n=== STACKPROBE {s}: more than {d} needle windows — raise max_windows\n", .{ label, cfg.max_windows });
                 return error.TooManyNeedles;
@@ -452,6 +467,15 @@ fn goodEntry(secret: *const [48]u8, out: *[32]u8) void {
 
 fn unburnedEntry(secret: *const [48]u8, out: *[32]u8) void {
     @call(.never_inline, derive, .{ secret, out });
+}
+
+test "stackprobe: a secret too short for a needle window is counted, not silently passed" {
+    try skipUnlessOptimized();
+    std.crypto.hash.sha2.Sha384.hash("testkit stackprobe short", &t_secret, .{});
+    const r = try T.run("short secret", goodEntry, .{ &t_secret, &t_out }, &.{ t_secret[0..8], &t_out }, .{ .quiet = true });
+    try std.testing.expectEqual(@as(usize, 1), r.unprobed_secrets);
+    const full = try T.run("full secret", goodEntry, .{ &t_secret, &t_out }, &.{ &t_secret, &t_out }, .{ .quiet = true });
+    try std.testing.expectEqual(@as(usize, 0), full.unprobed_secrets);
 }
 
 test "stackprobe: a burned entry is clean, an unburned one is caught" {

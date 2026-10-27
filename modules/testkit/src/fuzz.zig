@@ -68,7 +68,7 @@ const fault = @import("fault.zig");
 ///     }
 pub fn seed(comptime frame: []const u8) []const u8 {
     return &struct {
-        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(frame.len))) ++ frame[0..frame.len].*;
     }.bytes;
 }
 
@@ -86,7 +86,7 @@ pub fn seedHex(comptime h: []const u8) []const u8 {
             _ = std.fmt.hexToBytes(&out, h) catch @compileError("bad hex seed: " ++ h);
             break :blk out;
         };
-        const bytes = std.mem.toBytes(@as(u32, @intCast(frame.len))) ++ frame;
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, @intCast(frame.len))) ++ frame;
     }.bytes;
 }
 
@@ -183,7 +183,14 @@ pub const ScriptSource = struct {
     pub fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
         comptime std.debug.assert(@bitSizeOf(T) <= 64);
         std.debug.assert(at_least <= at_most);
-        const span: u64 = @intCast(@as(i128, at_most) - @as(i128, at_least));
+        // In the unsigned image of T, signed values with the sign bit flipped
+        // so that order is kept. Not `@intCast` of an i128 difference: a
+        // signed-to-narrower-unsigned cast is the Zig 0.17 #37131 `trunc nsw`
+        // class, poison in an optimized build for a span of 2^63 or more.
+        const U = @Int(.unsigned, @bitSizeOf(T));
+        const flip: U = if (@typeInfo(T).int.signedness == .signed) @as(U, 1) << (@bitSizeOf(T) - 1) else 0;
+        const lo: U = @as(U, @bitCast(at_least)) ^ flip;
+        const span: u64 = (@as(U, @bitCast(at_most)) ^ flip) - lo;
         var x: u64 = 0;
         var cover: u64 = 0;
         while (cover < span) {
@@ -191,7 +198,7 @@ pub const ScriptSource = struct {
             cover = (cover << 8) | 0xff;
         }
         const off: u64 = if (span == std.math.maxInt(u64)) x else x % (span + 1);
-        return @intCast(@as(i128, at_least) + off);
+        return @bitCast((lo + @as(U, @intCast(off))) ^ flip);
     }
 
     pub fn value(self: *ScriptSource, comptime T: type) T {
@@ -252,6 +259,23 @@ test "ScriptSource: ranged draws come from the script, not the range minimum" {
     try std.testing.expectEqual(@as(i8, -3), neg.valueRangeAtMost(i8, -5, 5)); // -5 + 200 % 11
 }
 
+test "ScriptSource: ranged draws over a span of 2^63 or more stay exact" {
+    const max = std.math.maxInt(u64);
+    const ones: [8]u8 = @splat(0xff);
+    const zeros: [8]u8 = @splat(0);
+    var a: ScriptSource = .init(&ones);
+    try std.testing.expectEqual(@as(u64, max), a.valueRangeAtMost(u64, 0, max));
+    var b: ScriptSource = .init(&zeros);
+    try std.testing.expectEqual(@as(u64, 1 << 63), b.valueRangeAtMost(u64, 1 << 63, max));
+    var c: ScriptSource = .init(&ones);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), c.valueRangeAtMost(i64, std.math.minInt(i64), std.math.maxInt(i64)));
+    var d: ScriptSource = .init(&zeros);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), d.valueRangeAtMost(i64, std.math.minInt(i64), std.math.maxInt(i64)));
+    // 0x80 then seven zeros: 2^63 above the minimum is 0.
+    var e: ScriptSource = .init(&.{ 0x80, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expectEqual(@as(i64, 0), e.valueRangeAtMost(i64, std.math.minInt(i64), std.math.maxInt(i64)));
+}
+
 // ── the anchor: what Smith reads back ────────────────────────────────────────
 //
 // These are not round-trips of this file against itself. Each drives the real
@@ -287,6 +311,10 @@ test "seedInto: the runtime form reads back the same" {
     var buf: [16]u8 = undefined;
     const n = smith.slice(&buf);
     try std.testing.expectEqualStrings("hello", buf[0..n]);
+    // Byte for byte the comptime form: Smith clamps a too-long length to the
+    // input it has, so the read-back above passes a wrong prefix as well
+    // (mutation run 2026-10-27).
+    try std.testing.expectEqualSlices(u8, seed("hello"), s);
 }
 
 test "the empty seed is a seed, and it is distinguishable from no seed" {

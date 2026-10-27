@@ -112,7 +112,12 @@ pub fn timeIt(io: std.Io, cyc: Cycles, comptime once: anytype, args: anytype, wa
     for (0..5) |_| {
         const t = std.Io.Clock.Timestamp.now(io, .awake);
         const c0 = cyc.read();
-        for (0..n) |_| count = @call(.auto, once, args);
+        // Kept observable per call, as in the doubling loop: a pure `once`
+        // whose result is only overwritten could be hoisted out of the loop.
+        for (0..n) |_| {
+            count = @call(.auto, once, args);
+            std.mem.doNotOptimizeAway(count);
+        }
         best_cycles = @min(best_cycles, cyc.read() - c0);
         best = @min(best, t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
     }

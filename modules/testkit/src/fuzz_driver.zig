@@ -370,8 +370,15 @@ fn watchdog() void {
         _ = linux.nanosleep(&req, null);
         const limit = current_limit.load(.acquire);
         if (hung(dog_busy.load(.acquire), dog_gen.load(.acquire), &seen, &since, nowNs(), limit)) {
-            std.debug.print("HANG {s} seed={d} (over {d} ms)\n", .{ current_name, current_seed.load(.acquire), limit / std.time.ns_per_ms });
-            printShrinkHint(current_seed.load(.acquire));
+            // A raw write, not `std.debug.print`: a harness hung inside a
+            // print holds the stderr lock, and the watchdog would wait on it
+            // forever instead of reporting the hang.
+            const seed = current_seed.load(.acquire);
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "HANG {s} seed={d} (over {d} ms)\n  smallest input: {s}_SHRINK={d} {s}_ONLY={s}\n", .{
+                current_name, seed, limit / std.time.ns_per_ms, current_prefix, seed, current_prefix, current_name,
+            }) catch "HANG (message too long)\n";
+            _ = linux.write(2, msg.ptr, msg.len);
             std.process.exit(124);
         }
     }
@@ -413,6 +420,20 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         try out.appendSlice(gpa, buf[0..n]);
     }
     return out.toOwnedSlice(gpa);
+}
+
+/// Run `harness` once over the saved `--fuzz` input at `path`; its length.
+/// The whole file: one `read` into a fixed buffer replayed a saved input over
+/// 64 KiB (or a short read) cut short, and printed `ok` for an input that was
+/// never run (review 2026-10-27).
+fn replayInput(comptime harness: anytype, gpa: std.mem.Allocator, path: []const u8) !usize {
+    const input = try readFile(gpa, path);
+    defer gpa.free(input);
+    enter(0);
+    var smith: std.testing.Smith = .{ .in = input };
+    try harness(std.testing.Smith, &smith, gpa);
+    leave();
+    return input.len;
 }
 
 /// Run `harness` over seeds as the environment says, or skip.
@@ -489,16 +510,8 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
     }
 
     if (env(&kb, opts.prefix, "_INPUT")) |path| {
-        const fd = openZ(path, .{ .ACCMODE = .RDONLY }, 0) orelse return error.FileNotFound;
-        defer _ = linux.close(fd);
-        var buf: [1 << 16]u8 = undefined;
-        const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return error.InputOutput;
         try armWatchdog(opts.name, limit_ms);
-        enter(0);
-        var smith: std.testing.Smith = .{ .in = buf[0..n] };
-        try harness(std.testing.Smith, &smith, gpa);
-        leave();
+        const n = try replayInput(harness, gpa, path);
         std.debug.print("REPLAY {s} ok ({d} bytes)\n", .{ opts.name, n });
         return;
     }
@@ -687,8 +700,10 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
     };
     var batch_seeds: usize = 0;
     var batch_bytes: usize = 0;
-    var seed = first;
-    while (seed < first + runs) : (seed += 1) {
+    // By count, not `seed < first + runs`: that sum overflows for a range
+    // ending at the top of u64, which ReleaseFast wraps into zero seeds run.
+    for (0..runs) |i| {
+        const seed = first +% i;
         var prng = std.Random.DefaultPrng.init(seed);
         var rng: Rng = .{ .r = prng.random() };
         if (seed_file) |*sf| sf.set(seed);
@@ -723,11 +738,11 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
             batch = null;
         }
         // The clock, for the progress line, every 1024 seeds only.
-        if (report and (seed - first) % 1024 == 1023) {
+        if (report and i % 1024 == 1023) {
             const now = nowNs();
             if (now - last_report > std.time.ns_per_s) {
                 last_report = now;
-                const done = seed + 1 - first;
+                const done = i + 1;
                 std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, done * std.time.ns_per_s / (now - t0) });
             }
         }
@@ -1008,4 +1023,40 @@ test "selected: _ONLY picks harnesses by substring" {
 test "a generic harness runs under Smith too" {
     var smith: std.testing.Smith = .{ .in = &.{ 20, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3 } };
     try sample(std.testing.Smith, &smith, testing.allocator);
+}
+
+var replay_seen: usize = 0;
+
+fn lengthOf(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    replay_seen = src.in.?.len;
+}
+
+test "_INPUT replay: an input over 64 KiB is replayed whole" {
+    if (!supported) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const big = try testing.allocator.alloc(u8, 100_000);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate(i);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "input", .data = big });
+    var pb: [128]u8 = undefined;
+    const path = try std.mem.print(&pb, ".zig-cache/tmp/{s}/input", .{&tmp.sub_path});
+    replay_seen = 0;
+    try testing.expectEqual(big.len, try replayInput(lengthOf, testing.allocator, path));
+    try testing.expectEqual(big.len, replay_seen);
+}
+
+var top_seeds: [4]u64 = undefined;
+var top_n: usize = 0;
+
+fn topRecorder(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    _ = src;
+    top_seeds[top_n] = current_seed.load(.acquire);
+    top_n += 1;
+}
+
+test "runSeeds: a range ending at the top of u64 runs every seed" {
+    top_n = 0;
+    try runSeedsReporting(topRecorder, "top", .{ .runs = 2, .first = std.math.maxInt(u64) - 1 }, testing.allocator, null, false);
+    try testing.expectEqualSlices(u64, &.{ std.math.maxInt(u64) - 1, std.math.maxInt(u64) }, top_seeds[0..top_n]);
 }

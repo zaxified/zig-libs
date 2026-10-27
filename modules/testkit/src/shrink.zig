@@ -118,7 +118,9 @@ pub const Result = struct {
     candidates: usize,
 };
 
-/// Shrink `opts.seed` of `harness`. `error.SeedPasses` when it does not fail.
+/// Shrink `opts.seed` of `harness`. `error.SeedPasses` when it does not fail,
+/// `error.NotReproducible` when its recorded choices, replayed, do not fail
+/// the same way (the harness depends on something besides its draws).
 pub fn shrink(comptime harness: anytype, gpa: std.mem.Allocator, opts: Options) !Result {
     const K = Children(harness);
     const sh = try mapShared();
@@ -146,6 +148,11 @@ pub fn shrink(comptime harness: anytype, gpa: std.mem.Allocator, opts: Options) 
     errdefer gpa.free(s.cur);
     defer s.spans.deinit(gpa);
     try s.takeSpans();
+    // The recorded tape must end the same way when REPLAYED, or every
+    // candidate is judged against an outcome replay cannot produce and the
+    // "smallest input" printed at the end is no reproducer (a harness that
+    // reads addresses or the clock; review 2026-10-27).
+    if (!try s.tryTape(s.cur)) return error.NotReproducible;
     const from = s.cur.len;
     if (opts.report) std.debug.print("SHRINK {s} seed={d}: {f} after {d} choices\n", .{ opts.name, opts.seed, fmtOutcome(target, s.target_err), from });
 
@@ -456,6 +463,47 @@ test "shrink: a panic shrinks too (the child dies, the shrink does not)" {
     defer testing.allocator.free(r.tape);
     try testing.expect(r.outcome == .signaled);
     try testing.expectEqualSlices(u64, &.{ 777, 3 }, r.tape);
+}
+
+/// Two different errors: `Target` from 500 up, `Other` at 0 — the smaller
+/// input, which a shrinker that ignores the error name would walk into.
+fn twoErrors(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    const v = src.valueRangeAtMost(u32, 0, 1000);
+    if (v == 0) return error.Other;
+    if (v >= 500) return error.Target;
+}
+
+test "shrink: a candidate that fails with a different error is not taken" {
+    if (!child.supported) return error.SkipZigTest;
+    var seed: u64 = 0;
+    while (true) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        var rng: Rng = .{ .r = prng.random() };
+        if (rng.valueRangeAtMost(u32, 0, 1000) >= 500) break;
+    }
+    const r = try shrink(twoErrors, testing.allocator, .{ .name = "two", .seed = seed, .limit_ms = 5000, .report = false });
+    defer testing.allocator.free(r.tape);
+    try testing.expectEqualSlices(u64, &.{500}, r.tape);
+    try testing.expectError(error.Target, replayHere(twoErrors, testing.allocator, r.tape, false));
+}
+
+/// Fails only the first time it runs in any process of the shrink: the
+/// counter lives in a shared mapping the forked children inherit, so the
+/// recording fails and every replay passes.
+var first_run: ?*std.atomic.Value(u32) = null;
+
+fn onceOnly(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
+    _ = src.value(u8);
+    if (first_run.?.fetchAdd(1, .monotonic) == 0) return error.FirstRun;
+}
+
+test "shrink: a seed whose replay does not fail the same way is refused" {
+    if (!child.supported) return error.SkipZigTest;
+    const m = try std.posix.mmap(null, std.heap.page_size_min, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED, .ANONYMOUS = true }, -1, 0);
+    defer std.posix.munmap(m);
+    first_run = @ptrCast(@alignCast(m.ptr));
+    first_run.?.* = .init(0);
+    try testing.expectError(error.NotReproducible, shrink(onceOnly, testing.allocator, .{ .name = "once", .seed = 0, .limit_ms = 5000, .report = false }));
 }
 
 test "shrink: a passing seed is refused" {
