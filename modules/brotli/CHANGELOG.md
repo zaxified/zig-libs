@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Maturity:** grade 2 → **3** (S3 P3): the bench's reference is now google/brotli built from source at -O2 (owner: like for like), not Ubuntu's hardened, frame-pointer `libbrotli1`; the encoder rows were 1.0–1.09× the distribution build and are up to 1.30× the clean one. No code change.
 - **2026-10-27** — **Performance (measurement):** `zig build bench-brotli -Djcc-safe` pads both sides against the Intel JCC erratum (needs `LIBBROTLI_DIR` from `tools/c_bench/build_libbrotli.sh`); the foreign side now loads the library it linked (rpath; before, `LIBBROTLI_DIR` changed only the link). No module change.
 - **2026-10-27** — **Performance:** `.q0`'s command loop is instantiated per hash-table size (9/11/13/15 bits, as google's `BrotliCompressFragmentFastImpl*`): 3–5 % fewer instructions; bench `c_q0_*` 0.92–1.06× google (was 0.99–1.09×; part of it layout). Output byte-identical. No API change.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
