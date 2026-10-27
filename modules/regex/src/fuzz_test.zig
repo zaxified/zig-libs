@@ -17,8 +17,9 @@
 //!     no span splitting a code point, and it ends;
 //!   - a literal-only pattern (no metacharacter drawn) matches exactly where
 //!     `std.mem.find` finds it — a reference that shares no code;
-//!   - the two engines agree: the backtracker (short texts) and the Pike VM
-//!     (`pike_only`) give the same match and groups;
+//!   - the engines agree: the backtracker (short texts) and the Pike VM
+//!     (`pike_only`) give the same match and groups; `find`'s DFA gives the
+//!     Pike VM's span for every pattern's anchored twin `^(?:…)`;
 //!   - the reader front end agrees with the slice one (one byte per read);
 //!   - leftmost-longest starts where leftmost-first does and ends no earlier;
 //!   - `replaceAll(.., "$0")` gives the input back; `replaceAllLiteral(.., "")`
@@ -59,7 +60,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -302,6 +303,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if ((n == 0) != (found == null)) return error.IteratorDisagreesWithFind;
 
     try crossChecks(gpa, &re, &m, input, found);
+    try anchoredTwin(gpa, pattern, posix, input);
     if (posix) hit(.posix);
     if (!g.asserts and input.len <= input_buf.len) try longestReference(gpa, &re, input);
 
@@ -326,6 +328,7 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     const stride: usize = if (input.len > 32) 37 else 1;
     var from: usize = 0;
     while (from <= input.len) : (from += stride) {
+        if (!std.meta.eql(m.find(input, from), pm.find(input, from))) return error.FindDisagreesWithPike;
         const f1 = m.captures(input, from, g1[0..ng]);
         const f2 = pm.captures(input, from, g2[0..ng]);
         if (f1 != f2) return error.EnginesDisagree;
@@ -401,6 +404,35 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
         var qre = try regex.Regex.compile(gpa, q);
         defer qre.deinit(gpa);
         if (!qre.fullMatch(input)) return error.QuoteMetaDoesNotMatch;
+    }
+}
+
+/// The pattern anchored at the start, `^(?:…)`: `Matcher.find` runs such a
+/// program on its DFA (`FindDfa`), against the Pike VM from every start. A
+/// twin, not a share of the drawn patterns: the grammar alone rarely draws an
+/// anchored pattern that matches, and a new draw would move every seed.
+fn anchoredTwin(gpa: std.mem.Allocator, pattern: []const u8, posix: bool, input: []const u8) anyerror!void {
+    var buf: [300]u8 = undefined;
+    const twin = std.fmt.bufPrint(&buf, "{s}{s})", .{ if (posix) "^(" else "^(?:", pattern }) catch return;
+    var re = regex.Regex.compileOptions(gpa, twin, .{ .syntax = if (posix) .posix else .perl }) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        return; // `a)(b` and the like: the twin does not parse
+    };
+    defer re.deinit(gpa);
+    if (!re.prefilter.anchored or re.longest or re.insts.len > dfa_max_insts) return;
+    hit(.dfa_find);
+    var m = try regex.Matcher.init(gpa, &re);
+    defer m.deinit();
+    var pm = try regex.Matcher.init(gpa, &re);
+    defer pm.deinit();
+    pm.pike_only = true;
+    const stride: usize = if (input.len > 32) 37 else 1;
+    var from: usize = 0;
+    while (from <= input.len) : (from += stride) {
+        const got = m.find(input, from);
+        errdefer std.debug.print("regex fuzz: anchored twin \"{f}\" from {d}\n", .{ std.zig.fmtString(twin), from });
+        if (!std.meta.eql(got, pm.find(input, from))) return error.DfaFindDisagreesWithPike;
+        if (got != null) hit(.dfa_find_match);
     }
 }
 

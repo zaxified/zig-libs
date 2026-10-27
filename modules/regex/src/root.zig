@@ -762,6 +762,203 @@ const RevDfa = struct {
     }
 };
 
+/// `Matcher.find`'s lazy DFA: the end of the leftmost-first match, without
+/// captures (Rust's `regex` and RE2 search the same way). A state is the
+/// ordered list of instructions to follow from a position (threads in
+/// priority order, as the Pike VM keeps them), what the code point before it
+/// was as far as an assertion can tell, and whether a thread may still start
+/// there. A step follows the empty transitions in the Pike VM's order, and a
+/// match among them cuts every later thread: the leftmost-first cut. Kept in
+/// the `Matcher` across calls, so a transition on an ASCII byte is worked out
+/// once per `Matcher`; a full table is emptied and refilled.
+const FindDfa = struct {
+    const max_states = 256;
+    const Accept = enum(u8) { unknown, no, yes };
+    const State = struct { off: u32, len: u16, ctx: Dfa.Ctx, restart: bool, eoi: Accept = .unknown };
+    /// The outcome of one step: the next state's list and whether a match
+    /// ends before the code point.
+    const Step = struct { n: usize, matched: bool };
+
+    gpa: std.mem.Allocator,
+    /// The program has assertions: without, every context is one state.
+    asserts: bool,
+    states: std.ArrayList(State) = .empty,
+    /// `trans[s][c]`: 0 not worked out yet, otherwise (next state + 1) << 1,
+    /// bit 0 set when a match ends before `c`.
+    trans: std.ArrayList([128]u16) = .empty,
+    /// The states' lists, one after another.
+    pcs: std.ArrayList(u16) = .empty,
+    /// Open addressing: state + 1, 0 empty.
+    table: [2 * max_states]u16 = @splat(0),
+    /// Times the table was emptied (tests).
+    flushes: usize = 0,
+
+    fn init(gpa: std.mem.Allocator, re: *const Regex) FindDfa {
+        const asserts = for (re.insts) |inst| {
+            if (inst == .assert) break true;
+        } else false;
+        return .{ .gpa = gpa, .asserts = asserts };
+    }
+
+    fn deinit(d: *FindDfa) void {
+        d.states.deinit(d.gpa);
+        d.trans.deinit(d.gpa);
+        d.pcs.deinit(d.gpa);
+    }
+
+    /// The end of the leftmost-first match from `from`, which is 0 for an
+    /// anchored program (`anchored`: no thread starts later).
+    fn run(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, anchored: bool) std.mem.Allocator.Error!?usize {
+        const seed = [1]u16{0};
+        var s = (try d.intern(if (anchored) &seed else &.{}, d.ctxOf(runeBefore(input, from)), !anchored)).id;
+        var end: ?usize = null;
+        var pos = from;
+        while (true) {
+            const st = d.states.items[s];
+            if (st.len == 0 and !st.restart) return end; // no thread left
+            if (pos == input.len) {
+                if (d.accepts(re, s)) end = pos;
+                return end;
+            }
+            const c = input[pos];
+            if (c < 0x80) {
+                const t = d.trans.items[s][c];
+                if (t != 0) {
+                    if (t & 1 != 0) end = pos;
+                    s = (t >> 1) - 1;
+                    pos += 1;
+                    continue;
+                }
+            }
+            const here = decode(input, pos);
+            var next: [Dfa.max_insts]u16 = undefined;
+            const r = d.step(re, s, here.cp.?, &next);
+            if (r.matched) end = pos;
+            const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), st.restart and !r.matched);
+            if (c < 0x80 and !ns.flushed) d.trans.items[s][c] = (@as(u16, ns.id) + 1) << 1 | @intFromBool(r.matched);
+            s = ns.id;
+            pos += here.w;
+        }
+    }
+
+    fn ctxOf(d: *const FindDfa, cp: ?u21) Dfa.Ctx {
+        return if (d.asserts) .of(cp) else .other;
+    }
+
+    /// One step from state `s` over `cp` (see the type's comment); the next
+    /// list goes to `out`.
+    fn step(d: *const FindDfa, re: *const Regex, s: u16, cp: u21, out: *[Dfa.max_insts]u16) Step {
+        const st = d.states.items[s];
+        var seen: Dfa.Set = .{ 0, 0 };
+        var n: usize = 0;
+        const list = d.pcs.items[st.off..][0..st.len];
+        for (0..list.len + @intFromBool(st.restart)) |i| {
+            const pc0: u16 = if (i < list.len) list[i] else 0; // a thread starting here comes last
+            if (closure(re, &seen, pc0, st.ctx.rep(), cp, cp, out, &n)) return .{ .n = n, .matched = true };
+        }
+        return .{ .n = n, .matched = false };
+    }
+
+    /// Does state `s` reach the match at the end of the text?
+    fn accepts(d: *FindDfa, re: *const Regex, s: u16) bool {
+        const st = &d.states.items[s];
+        if (st.eoi == .unknown) {
+            var seen: Dfa.Set = .{ 0, 0 };
+            var n: usize = 0;
+            var out: [Dfa.max_insts]u16 = undefined;
+            var found = false;
+            const list = d.pcs.items[st.off..][0..st.len];
+            for (0..list.len + @intFromBool(st.restart)) |i| {
+                const pc0: u16 = if (i < list.len) list[i] else 0;
+                if (closure(re, &seen, pc0, st.ctx.rep(), null, 0, &out, &n)) {
+                    found = true;
+                    break;
+                }
+            }
+            st.eoi = if (found) .yes else .no;
+        }
+        return st.eoi == .yes;
+    }
+
+    /// Follow the empty transitions from `pc0` at a position between `prev`
+    /// and `next`, in `Matcher.addThread`'s order, skipping what `seen`
+    /// holds: a consuming instruction that takes `cp` (none when `next` is
+    /// null) appends the one after it to `out`; true at the match.
+    fn closure(re: *const Regex, seen: *Dfa.Set, pc0: u16, prev: ?u21, next: ?u21, cp: u21, out: *[Dfa.max_insts]u16, n: *usize) bool {
+        var stack: [2 * Dfa.max_insts + 1]u16 = undefined;
+        stack[0] = pc0;
+        var sp: usize = 1;
+        while (sp != 0) {
+            sp -= 1;
+            const pc = stack[sp];
+            const bit = @as(u64, 1) << @truncate(pc);
+            if (seen[pc >> 6] & bit != 0) continue;
+            seen[pc >> 6] |= bit;
+            switch (re.insts[pc]) {
+                .jmp => |t| {
+                    stack[sp] = t;
+                    sp += 1;
+                },
+                .split => |sx| {
+                    stack[sp] = sx.y;
+                    stack[sp + 1] = sx.x;
+                    sp += 2;
+                },
+                .save => {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .assert => |a| if (assertHolds(a, prev, next)) {
+                    stack[sp] = pc + 1;
+                    sp += 1;
+                },
+                .match => return true,
+                .rune, .any, .any_not_nl => if (next != null and re.consumes(pc, cp)) {
+                    out[n.*] = pc + 1;
+                    n.* += 1;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn hash(list: []const u16, ctx: Dfa.Ctx, restart: bool) u32 {
+        var h: u32 = 0x811c9dc5 ^ (@as(u32, @backingInt(ctx)) << 1 | @intFromBool(restart));
+        for (list) |pc| h = (h ^ pc) *% 0x01000193;
+        return h ^ (h >> 15);
+    }
+
+    /// The state for (`list`, `ctx`, `restart`), added if new; `flushed`:
+    /// the table was full and emptied first, every earlier id is gone.
+    fn intern(d: *FindDfa, list: []const u16, ctx: Dfa.Ctx, restart: bool) std.mem.Allocator.Error!struct { id: u16, flushed: bool } {
+        const mask = d.table.len - 1;
+        var i = hash(list, ctx, restart) & mask;
+        while (d.table[i] != 0) : (i = (i + 1) & mask) {
+            const id = d.table[i] - 1;
+            const st = d.states.items[id];
+            if (st.ctx == ctx and st.restart == restart and std.mem.eql(u16, d.pcs.items[st.off..][0..st.len], list)) return .{ .id = id, .flushed = false };
+        }
+        var flushed = false;
+        if (d.states.items.len == max_states) {
+            d.states.clearRetainingCapacity();
+            d.trans.clearRetainingCapacity();
+            d.pcs.clearRetainingCapacity();
+            d.table = @splat(0);
+            d.flushes += 1;
+            flushed = true;
+            i = hash(list, ctx, restart) & mask;
+        }
+        const id: u16 = @intCast(d.states.items.len);
+        try d.states.ensureUnusedCapacity(d.gpa, 1);
+        try d.trans.ensureUnusedCapacity(d.gpa, 1);
+        try d.pcs.appendSlice(d.gpa, list);
+        d.states.appendAssumeCapacity(.{ .off = @intCast(d.pcs.items.len - list.len), .len = @intCast(list.len), .ctx = ctx, .restart = restart });
+        d.trans.appendAssumeCapacity(@splat(0));
+        d.table[i] = id + 1;
+        return .{ .id = id, .flushed = flushed };
+    }
+};
+
 /// Table capacities `Regex.compile` tries first, on the stack: every pattern
 /// short of a large counted repetition or a big case-folded class fits.
 const small_capacity: syntax.Capacity = .{ .insts = 256, .ranges = 256, .nodes = 256 };
@@ -1166,6 +1363,8 @@ pub const Matcher = struct {
     /// Positions the backtracker's bit budget covers for this program
     /// (worked out once: the division was 4 % of a short search).
     bt_width: usize,
+    /// `find`'s DFA, made on first use.
+    dfa: ?*FindDfa = null,
     /// Tests only: always the Pike VM, to compare the two engines.
     pike_only: bool = false,
 
@@ -1236,6 +1435,10 @@ pub const Matcher = struct {
     }
 
     pub fn deinit(m: *Matcher) void {
+        if (m.dfa) |d| {
+            d.deinit();
+            m.gpa.destroy(d);
+        }
         m.bt_visited.deinit(m.gpa);
         m.bt_jobs.deinit(m.gpa);
         m.gpa.free(m.block);
@@ -1245,8 +1448,30 @@ pub const Matcher = struct {
     /// Leftmost-first match starting the search at `from` (the text before
     /// `from` still counts for `^`/`\b`), or null.
     pub fn find(m: *Matcher, input: []const u8, from: usize) ?Span {
-        if (from > input.len or !m.run(input, from, false)) return null;
+        if (from > input.len) return null;
+        if (m.findEnd(input, from)) |end| {
+            m.best[0] = from;
+            m.best[1] = end orelse return null;
+            return .{ .start = from, .end = m.best[1] };
+        }
+        if (!m.run(input, from, false)) return null;
         return .{ .start = m.best[0], .end = m.best[1] };
+    }
+
+    /// `find` by the DFA (`FindDfa`): the match's end, none, or null when
+    /// the DFA does not apply (the start must be known: an anchored
+    /// program) or cannot get its memory.
+    fn findEnd(m: *Matcher, input: []const u8, from: usize) ??usize {
+        const re = m.re;
+        if (m.pike_only or re.longest or !re.prefilter.anchored or re.insts.len > Dfa.max_insts) return null;
+        if (from != 0) return @as(?usize, null); // `\A` holds at 0 only
+        const d = m.dfa orelse blk: {
+            const d = m.gpa.create(FindDfa) catch return null;
+            d.* = .init(m.gpa, re);
+            m.dfa = d;
+            break :blk d;
+        };
+        return d.run(re, input, from, true) catch null;
     }
 
     /// Like `find`, filling `out[i]` with group i's span (null: the group
@@ -1982,6 +2207,60 @@ test "reader front end (Go's MatchReader, FindReaderIndex): constant memory, rea
     var fbuf: [8]u8 = undefined;
     var failing: std.Io.Reader = .{ .vtable = &.{ .stream = Failing.stream }, .buffer = &fbuf, .seek = 0, .end = 0 };
     try testing.expectError(error.ReadFailed, re.isMatchReader(&failing));
+}
+
+test "find's DFA (anchored programs) agrees with the Pike VM, across calls and past a full table" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x6466);
+    const rng = prng.random();
+    const patterns = [_][]const u8{
+        "^[a-z]+",         "^(a|ab)(c|bcd)(d*)", "^a*?b",  "^(?:ab|a)(?:c|bcd)?", "\\Aab|\\Ab\\b",
+        "^\\w+\\b",
+        "^é+[^a]",
+        "^$",              "^x*",                "^.*\\z", "^(a|b)*a(a|b){8}",    "^(?s).+?d",
+        "^[^\\n]*\\n",     "^a{2,5}?b?",
+        "^(?i)ÉA+",
+        "^(?:a\\B|b\\b)+",
+    };
+    var buf: [600]u8 = undefined;
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        try testing.expect(re.prefilter.anchored);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        // Short texts and long ones; every prefix of the short ones. One
+        // Matcher throughout: the cached transitions carry over.
+        for (0..300) |round| {
+            const len = if (round % 10 == 0) 200 + rng.uintLessThan(usize, 400) else rng.uintLessThan(usize, 12);
+            var n: usize = 0;
+            while (n < len) {
+                const piece = ([_][]const u8{ "a", "b", "c", "d", " ", "\n", "é", "É", "_" })[rng.uintLessThan(usize, 9)];
+                if (n + piece.len > len) break;
+                @memcpy(buf[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            const text = buf[0..n];
+            var cut = if (n > 12) n else 0;
+            while (cut <= n) : (cut += 1) {
+                const t = text[0..cut];
+                errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(t) });
+                try testing.expectEqual(pm.find(t, 0), m.find(t, 0));
+                if (t.len != 0) try testing.expectEqual(pm.find(t, 1), m.find(t, 1));
+            }
+        }
+        try testing.expect(m.dfa != null);
+        // 2^9 subsets of the last nine letters: more states than the table holds.
+        if (std.mem.eql(u8, p, "^(a|b)*a(a|b){8}")) {
+            var long: [4000]u8 = undefined;
+            for (&long) |*c| c.* = "ab"[rng.uintLessThan(usize, 2)];
+            try testing.expectEqual(pm.find(&long, 0), m.find(&long, 0));
+            try testing.expect(m.dfa.?.flushes > 0);
+        }
+    }
 }
 
 test "the backtracker and the Pike VM agree on long texts, past the bit budget and the job cap" {

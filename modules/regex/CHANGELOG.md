@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Faster:** `Matcher.find` and the iterator (without captures) run a pattern anchored at the start (`^…`, `\A…`) on a lazy DFA kept in the `Matcher`: states are the Pike VM's thread lists in priority order, a match cuts the later ones (leftmost-first), and a transition on an ASCII byte is worked out once per `Matcher` (up to 256 states, then the table is emptied and refilled). `^[a-z]+` find-all over `hello world 123`: 115 → 60 ns (2.4× → 1.2× Rust's `regex`). Same spans (tested against the Pike VM, also past a full table; the fuzz harness checks every pattern's anchored twin `^(?:…)`). A `Matcher` that ran such a search holds the table until `deinit`.
+
 - **2026-10-28** — **Faster:** short searches with positions. A pattern anchored at the start (`^…`, `\A…`) settles a search from any later position without running (an iterator's call after the first match); the backtracker pushes its pending branches without an out-of-line `append` and without building a tagged union on the stack (a failed store forward per push), and works out its bit budget per program once, at `Matcher.init`. `^[a-z]+` find-all over `hello world 123`: 182 → 115 ns (3.9× → 2.4× Rust's `regex`); `INV-([0-9]{4}-[0-9]{4})` captures over 85 KiB: 199 → 140 µs. No API change.
 
 - **2026-10-27** — **Faster:** the literal-prefix walk behind Teddy tries a shorter cut when it runs out of its step or stack budget, instead of giving up (`(?i)[ab][cd]…[op]|zz` now gets two-byte prefixes). From the review of the Teddy commit; also a test that a class holding a surrogate never matches the bytes `ED A0 80`.
