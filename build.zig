@@ -823,9 +823,18 @@ pub fn build(b: *std.Build) void {
                 linked.addCSourceFile(.{ .file = stage1.getEmittedAsm(), .flags = &.{"-mbranches-within-32B-boundaries"}, .language = .assembly });
                 break :blk b.addExecutable(.{ .name = b.fmt("bench-{s}", .{m.name}), .root_module = linked, .use_llvm = true });
             };
-            const bench_run = b.addRunArtifact(bench_exe);
+            // `BENCH_JCC_SAFE` through `env`, not `setEnvironmentVariable`: that
+            // clones the CONFIGURE-time environment into the cached graph, so
+            // under `-Djcc-safe` every bench saw `BENCH_ROUNDS`, `LIBBROTLI_DIR`,
+            // … as they were when build.zig last ran (2026-10-27: `BENCH_ROUNDS=5`
+            // ran 3 rounds). A Run step with no map of its own inherits the
+            // maker's environment.
+            const bench_run = if (jcc_safe) blk: {
+                const r = b.addSystemCommand(&.{ "env", "BENCH_JCC_SAFE=1" });
+                r.addArtifactArg(bench_exe);
+                break :blk r;
+            } else b.addRunArtifact(bench_exe);
             bench_run.has_side_effects = true;
-            if (jcc_safe) bench_run.setEnvironmentVariable("BENCH_JCC_SAFE", "1");
             bench_run.addPassthruArgs();
             b.step(
                 b.fmt("bench-{s}", .{m.name}),
