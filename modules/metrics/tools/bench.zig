@@ -65,7 +65,7 @@ const ref_short = "Go";
 const ref_card = "prometheus/client_golang v1.24.1";
 
 const net_base: ?[]const u8 = "serve_plain";
-const net_prefix = "serve_";
+pub const net_prefix = "serve_";
 const info_only = [_][]const u8{"serve_plain"};
 const names = [_][]const u8{ "counter_inc", "observe", "counter_vec", "scrape", "serve_plain", "serve_metrics" };
 const n_obs = 4096;

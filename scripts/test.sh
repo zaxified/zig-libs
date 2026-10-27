@@ -1824,6 +1824,12 @@ phase_checks_fast_tail() {
     step "check-catalog" zig build check-catalog
     step "check-build-options" ./scripts/checks/check-build-options.py
 
+    # Zig 0.17's `@hasDecl` sees only `pub` declarations, so a probe for an
+    # optional capability goes quietly false when the capability is private:
+    # brotli's and lzma's fast paths were dead that way from the migration to
+    # § FC (2026-10-27), with every test green. ~1.8 s, pure Python.
+    step "check-hasdecl-pub" ./scripts/checks/check-hasdecl-pub.py
+
     # The root NOTICE stopped listing modules on 2026-09-06: a module's
     # third-party obligation is discharged in the module's own NOTICE, and the
     # root file answers one question only -- is the library as a whole still
