@@ -254,6 +254,12 @@ pub const Regex = struct {
                 const c = input[input.len - 1];
                 if (set[c >> 6] & (@as(u64, 1) << @truncate(c)) == 0) return false;
             }
+            const pf = &re.prefilter;
+            if (input.len < pf.tail_len) return false;
+            for (pf.tail[0..pf.tail_len], 1..) |pair, i| {
+                const c = input[input.len - i];
+                if (c != pair[0] and c != pair[1]) return false;
+            }
             if (re.runRevDfa(input)) |found| return found;
         }
         if (re.runDfa(input, full)) |found| return found;
@@ -758,6 +764,11 @@ pub const Prefilter = struct {
     /// With `end_anchored`: the last byte of every match is in this set (as
     /// `first`); null when a match can be empty, or end with any byte.
     last: ?[4]u64 = null,
+    /// With `end_anchored`: every match ends with `tail_len` ASCII code
+    /// points, the i-th from the end one of the two bytes `tail[i]` (the same
+    /// byte twice for a literal; `(?i)` gives the two cases).
+    tail: [16][2]u8 = undefined,
+    tail_len: u8 = 0,
     /// The first byte of every match is in this set (bit b of word b/64);
     /// null when a match can be empty, or start with any byte.
     first: ?[4]u64 = null,
@@ -867,7 +878,10 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
     }
     pf.anchored = !unanchored;
     pf.end_anchored = !pf.anchored and endAnchored(insts);
-    if (pf.end_anchored) pf.last = lastBytes(insts, ranges);
+    if (pf.end_anchored) {
+        pf.last = lastBytes(insts, ranges);
+        if (pf.last != null) pf.tail_len = tailBytes(insts, ranges, &pf.tail);
+    }
     pf.lit_len = @intCast(replace.prefixInto(insts, ranges, &pf.lit));
     if (!any_first) {
         pf.first = set;
@@ -986,6 +1000,98 @@ fn lastBytes(insts: []const Inst, ranges: []const Range) ?[4]u64 {
         }
     }
     return set;
+}
+
+/// Fill `tail` (see `Prefilter.tail`) and return its length, for a program
+/// with no empty match whose matches all end at the end of the text. Level k
+/// holds the consuming instructions that can take the k-th code point from
+/// the end of a match: level 1 those followed by the match, level k+1 those
+/// followed by a member of level k (every assertion passable). It stops at
+/// a level with a non-ASCII member or more than two bytes, and after a level
+/// the start reaches (a match may be that short).
+fn tailBytes(insts: []const Inst, ranges: []const Range, tail: *[16][2]u8) u8 {
+    if (insts.len > Dfa.max_insts) return 0;
+    // What follows each consuming instruction without consuming input: the
+    // consuming instructions and the match (pc 0's own entry: the start).
+    var follow: [Dfa.max_insts]Dfa.Set = undefined;
+    for (insts, 0..) |inst, pc| {
+        follow[pc] = switch (inst) {
+            .rune, .any, .any_not_nl => closureOf(insts, @intCast(pc + 1)),
+            else => .{ 0, 0 },
+        };
+    }
+    const start = closureOf(insts, 0);
+    var level: Dfa.Set = .{ 0, 0 };
+    for (insts, 0..) |inst, pc| if (inst == .match) {
+        level[pc >> 6] |= @as(u64, 1) << @truncate(pc);
+    };
+    var n: u8 = 0;
+    while (n < tail.len) {
+        var next: Dfa.Set = .{ 0, 0 };
+        for (insts, 0..) |_, pc| {
+            if (follow[pc][0] & level[0] != 0 or follow[pc][1] & level[1] != 0) next[pc >> 6] |= @as(u64, 1) << @truncate(pc);
+        }
+        level = next;
+        var bytes: [2]u8 = undefined;
+        var nb: usize = 0;
+        for (insts, 0..) |inst, pc| {
+            if (level[pc >> 6] & (@as(u64, 1) << @truncate(pc)) == 0) continue;
+            const r = switch (inst) {
+                .rune => |r| r,
+                else => return n,
+            };
+            for (ranges[r.start..][0..r.len]) |rg| {
+                if (rg.hi >= 0x80) return n;
+                var c: u32 = rg.lo;
+                while (c <= rg.hi) : (c += 1) {
+                    const b: u8 = @intCast(c);
+                    if (std.mem.findScalar(u8, bytes[0..nb], b) != null) continue;
+                    if (nb == 2) return n;
+                    bytes[nb] = b;
+                    nb += 1;
+                }
+            }
+        }
+        if (nb == 0) return n;
+        tail[n] = .{ bytes[0], bytes[nb - 1] };
+        n += 1;
+        if (start[0] & level[0] != 0 or start[1] & level[1] != 0) return n;
+    }
+    return n;
+}
+
+/// The consuming instructions and the match that follow `pc0` without
+/// consuming input (every assertion passable), as a `Dfa.Set`.
+fn closureOf(insts: []const Inst, pc0: u16) Dfa.Set {
+    var seen: Dfa.Set = .{ 0, 0 };
+    var out: Dfa.Set = .{ 0, 0 };
+    var stack: [2 * Dfa.max_insts + 1]u16 = undefined;
+    var sp: usize = 1;
+    stack[0] = pc0;
+    while (sp != 0) {
+        sp -= 1;
+        const pc = stack[sp];
+        const bit = @as(u64, 1) << @truncate(pc);
+        if (seen[pc >> 6] & bit != 0) continue;
+        seen[pc >> 6] |= bit;
+        switch (insts[pc]) {
+            .jmp => |t| {
+                stack[sp] = t;
+                sp += 1;
+            },
+            .split => |sx| {
+                stack[sp] = sx.y;
+                stack[sp + 1] = sx.x;
+                sp += 2;
+            },
+            .save, .assert => {
+                stack[sp] = pc + 1;
+                sp += 1;
+            },
+            .match, .rune, .any, .any_not_nl => out[pc >> 6] |= bit,
+        }
+    }
+    return out;
 }
 
 /// Add the first bytes of the UTF-8 encodings of `r` to `set`.
@@ -1961,6 +2067,20 @@ test "end-anchored patterns: which ones, and the backward DFA agrees with the NF
         defer re.deinit(gpa);
         errdefer std.debug.print("/{s}/\n", .{case[0]});
         try testing.expectEqual(case[1], re.prefilter.last);
+    }
+    // The tail: each level from the end, its one or two bytes.
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "ABCZ$", "ZZCCBBAA" },     .{ "(?i)ab$", "BbAa" },    .{ "x[ab]$", "abxx" },
+        .{ "[abc]$", "" },            .{ "a+$", "aa" },
+        .{ "č$", "" },
+        .{ "\\d{3}$", "" },           .{ "(?:ab|cb)$", "bbac" }, .{ "a\\bb$", "bbaa" },
+        .{ "Q[ -~]*XYZ$", "ZZYYXX" },
+    }) |case| {
+        var re = try Regex.compile(gpa, case[0]);
+        defer re.deinit(gpa);
+        errdefer std.debug.print("/{s}/\n", .{case[0]});
+        const pf = &re.prefilter;
+        try testing.expectEqualSlices(u8, case[1], std.mem.sliceAsBytes(pf.tail[0..pf.tail_len]));
     }
 
     var prng: std.Random.DefaultPrng = .init(0x726576);

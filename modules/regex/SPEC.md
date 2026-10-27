@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean x2 (REGEX_FUZZ)) · ct n/a — regex engine (keyword review, 2026-10-07)
 
-**Performance:** ref 0.00–0.84× Go regexp go1.26 · fastest 0.04–35.63× Rust regex 1.13.1 (measured 2026-10-27)
+**Performance:** ref 0.00–0.82× Go regexp go1.26 · fastest 0.04–35.95× Rust regex 1.13.1 (measured 2026-10-27)
 
 **Known defects:** none recorded
 
@@ -146,7 +146,9 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   backwards exactly as forwards (a valid sequence wherever it stands, else one byte of U+FFFD —
   a lead byte is never inside another sequence; tested against the forward cut). Before it, the
   last byte of the text must be one a match can end with (`Prefilter.last`; none when a match can
-  be empty or end with any byte): a text whose tail cannot end a match costs one lookup.
+  be empty or end with any byte), and its last bytes those every match ends with, as far as each
+  level from the end holds one or two ASCII bytes (`Prefilter.tail`, up to 16: a literal suffix,
+  or its two cases under `(?i)`): a text whose tail cannot end a match costs a few compares.
 - **The backtracker** (leftmost-first only): `Matcher` searches depth-first with one visited bit
   per (position, instruction), so every state is explored once — linear, like the VM — and
   carries one set of captures instead of a copy per thread (short-string submatches 4–11× faster
@@ -269,11 +271,12 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
 
 ## Backlog / deferred
 
-- **The backward search's per-call cost** *(2026-10-27, bench `easy0_tail` 1.2 µs vs Rust 38 ns)* —
-  when the last byte fits, each new state costs a closure per consuming instruction (~100 ns), and
-  the table starts empty on every call (no allocator, no cache between calls). Rust compares the
-  literal suffix every match ends with first; the same here (`literalPrefix` mirrored, or a
-  per-position byte-pair sequence for `(?i)`) would make `…LITERAL$` constant time again.
+- **The backward search's per-call cost** *(2026-10-27)* — when the tail filter passes, each new
+  backward state costs a closure per consuming instruction (~100 ns) and the table starts empty on
+  every call (no allocator, no cache between calls): ~1.2 µs for ten states. The `tail` filter
+  (literal suffix, `(?i)` pairs) answers the common shapes in nanoseconds; a class near the end
+  (`[A-Z]+XYZ$` on a text ending `…XYZ`) still runs the DFA. Precomputing each instruction's
+  follow set at compile time would cut the per-state cost; it costs ~2 KiB per `Regex`.
 - **A prefilter for literal alternations** *(2026-10-27, bench `hard1` 33–37× Rust)* — Rust's
   Teddy (SIMD over the first bytes of every alternative) / Aho-Corasick; here the first-byte set
   only.
