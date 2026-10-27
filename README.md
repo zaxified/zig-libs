@@ -696,7 +696,7 @@ way to recognise it.
 | [`mcp-http`](modules/mcp-http/README.md) | 3 (S,E,A,P) | MCP Streamable HTTP transport (2026-07-28 stateless + 2025-06-18 sessions) — `POST /mcp` with JSON or live SSE, header/body validation, Origin (DNS-rebind) guard. | any | router, http, mcp |
 | [`pollworker`](modules/pollworker/README.md) | 4 (S) | Single-owner `poll(2)` loop plus a lock-free fork/exec job table, for offloading blocking work off the loop thread. | **linux** | — |
 | [`procrun`](modules/procrun/README.md) | 2 (S,E,A,P) | Subprocess runner — reap-race-tolerant wait, deadlock-free capped stdio capture, timeout, streaming, and cancel. | any | argsafe |
-| [`sandbox`](modules/sandbox/README.md) | 2 (A,P) | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
+| [`sandbox`](modules/sandbox/README.md) | 2 (P) | Process self-hardening for an internet-facing server — privilege drop, `setrlimit`/no core dumps, Landlock fs allow-list, seccomp-bpf. | **linux** | — |
 | [`testkit`](modules/testkit/README.md) | 2 (S,A,P) | Test-only shared harness — deterministic fuzz driver with shrinking and drawn faults, dead-stack probe, guard-page buffers, bench comparison driver, hex KAT decoding, golden byte diff, skip conventions; wired via build.zig test_deps, absent from consumer imports | any | — |
 | [`uci`](modules/uci/README.md) | 3 (S,P) | OpenWRT UCI config parser + serializer + typed model, with stable round-trip. | any | — |
 

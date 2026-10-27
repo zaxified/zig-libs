@@ -43,8 +43,14 @@
 //! try sandbox.disableCoreDumps();
 //! // Bounding set FIRST — it needs CAP_SETPCAP, which the uid drop below
 //! // takes away (after setuid to a non-root uid every capability is gone).
-//! sandbox.dropCapabilityBoundingSet() catch {};
+//! sandbox.dropCapabilityBoundingSet() catch |err| switch (err) {
+//!     // Not root: there is no bounding set to drain that this process could
+//!     // use, and no-new-privs (above) already stops execve() from adding to it.
+//!     error.PermissionDenied => {},
+//!     else => return err,
+//! };
 //! try sandbox.dropPrivileges(.{ .uid = 65534, .gid = 65534 });
+//! try sandbox.setNotDumpable(); // after the drop, which resets it
 //!
 //! // Landlock: `init()` handles EVERY filesystem right the kernel knows
 //! // (deny-by-default), and `allowPath` grants what a tree may be used for.
@@ -113,9 +119,49 @@ pub const DropError = error{
     /// process is not privileged enough to change to the target ids).
     SetIdFailed,
     /// The calls "succeeded" but a read-back shows the ids did not actually
-    /// change to the requested values. Treat as fatal — never keep running.
+    /// change to the requested values, or (target uid non-zero) a capability
+    /// is still effective or permitted -- e.g. under `SECBIT_KEEP_CAPS` /
+    /// `SECBIT_NO_SETUID_FIXUP`, where `setuid` keeps `CAP_SETUID` and the
+    /// process could go back to uid 0. Treat as fatal — never keep running.
     DropNotEffective,
+    /// The process has more than one thread (`/proc/self/status`). The ids
+    /// are per THREAD in the kernel and these are the raw syscalls (no libc
+    /// broadcast), so the drop would change the calling thread only and leave
+    /// every other thread with its old ids. Drop before spawning threads.
+    /// Nothing was changed.
+    MultipleThreads,
 };
+
+/// The number of threads of this process, from `/proc/self/status`; null when
+/// that cannot be read (no `/proc` in a chroot, for instance).
+fn threadCount() ?u32 {
+    const rc = linux.open("/proc/self/status", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    var buf: [8192]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = linux.read(fd, buf[len..].ptr, buf.len - len);
+        if (linux.errno(n) != .SUCCESS) return null;
+        if (n == 0) break;
+        len += n;
+    }
+    const key = "\nThreads:";
+    const at = std.mem.indexOf(u8, buf[0..len], key) orelse return null;
+    const rest = std.mem.trimStart(u8, buf[at + key.len .. len], " \t");
+    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
+    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+}
+
+/// True when the calling thread holds no effective and no permitted capability.
+fn noCapabilities() bool {
+    var hdr: linux.cap_user_header_t = .{ .version = linux_capability_version_3, .pid = 0 };
+    var data: [2]linux.cap_user_data_t = undefined;
+    if (linux.errno(linux.capget(&hdr, &data[0])) != .SUCCESS) return false;
+    for (data) |d| if (d.effective != 0 or d.permitted != 0) return false;
+    return true;
+}
 
 /// Permanently drop to `creds`, in the only safe order:
 ///   `setgroups([]) → setgid(gid) → setuid(uid)`.
@@ -125,13 +171,22 @@ pub const DropError = error{
 /// read-back that the drop is TOTAL: real, effective AND saved uid/gid
 /// (`getresuid`/`getresgid` — the saved id is exactly what `seteuid(2)`
 /// climbs back up through, so checking only real+effective left the door it
-/// guards untested), and that the supplementary group list is empty
+/// guards untested), that the supplementary group list is empty
 /// (`getgroups` — `setgroups` returning success is not the same as the list
-/// being empty). Any mismatch is `error.DropNotEffective`: a partial or
-/// spoofed drop is fatal, never tolerated. Call `noNewPrivs()` first if you
-/// also want execve() locked, and drop the capability bounding set BEFORE
-/// this call — it needs `CAP_SETPCAP`, which a non-root uid no longer holds.
+/// being empty), and, for a non-root target, that no capability is left
+/// effective or permitted (`capget`). Any mismatch is `error.DropNotEffective`:
+/// a partial or spoofed drop is fatal, never tolerated. Call `noNewPrivs()`
+/// first if you also want execve() locked, and drop the capability bounding
+/// set BEFORE this call — it needs `CAP_SETPCAP`, which a non-root uid no
+/// longer holds.
+///
+/// Single-threaded callers only: ids are per thread, so a process with a
+/// second thread gets `error.MultipleThreads` and nothing changes. When
+/// `/proc` is not mounted the thread count is unknown and the drop goes ahead
+/// -- the caller then answers for it.
 pub fn dropPrivileges(creds: Credentials) DropError!void {
+    if (threadCount()) |n| if (n > 1) return error.MultipleThreads;
+
     // 1. Clear supplementary groups — must happen while still privileged.
     const no_groups = [_]linux.gid_t{};
     if (linux.errno(linux.setgroups(0, &no_groups)) != .SUCCESS) return error.SetIdFailed;
@@ -157,6 +212,7 @@ pub fn dropPrivileges(creds: Credentials) DropError!void {
     // getgroups(0, NULL) returns the number of supplementary groups.
     const ngroups = linux.getgroups(0, null);
     if (linux.errno(ngroups) != .SUCCESS or ngroups != 0) return error.DropNotEffective;
+    if (creds.uid != 0 and !noCapabilities()) return error.DropNotEffective;
 }
 
 pub const CapabilityError = error{
@@ -177,6 +233,8 @@ const cap_probe_ceiling = 64;
 /// with a permitted-cap set on a later execve), so draining it is belt-and-
 /// braces on top of a uid drop + no-new-privs. Requires `CAP_SETPCAP`; a
 /// non-privileged caller gets `error.PermissionDenied` and should skip it.
+/// The bounding set is per THREAD: threads that exist already keep theirs
+/// (new ones inherit the caller's), so call this before spawning any.
 pub fn dropCapabilityBoundingSet() CapabilityError!void {
     var cap: usize = 0;
     while (cap < cap_probe_ceiling) : (cap += 1) {
@@ -197,7 +255,8 @@ const linux_capability_version_3: u32 = 0x20080522;
 /// thread via `capset(2)` (UAPI v3, two 32-bit words for caps 0..63). This
 /// removes caps the process currently *holds*, complementing the bounding-set
 /// drop (which only limits what could be regained). Requires privilege to be a
-/// no-op-or-error rather than a silent partial clear.
+/// no-op-or-error rather than a silent partial clear. The calling thread only
+/// (capabilities are per thread): call it before spawning any.
 pub fn clearCapabilities() CapabilityError!void {
     var hdr = extern struct { version: u32, pid: c_int }{
         .version = linux_capability_version_3,
@@ -232,11 +291,27 @@ pub fn setLimit(resource: linux.rlimit_resource, soft: linux.rlim_t, hard: linux
     if (linux.errno(linux.setrlimit(resource, &rl)) != .SUCCESS) return error.SetrlimitFailed;
 }
 
-/// RLIMIT_CORE = 0. Disables core dumps entirely — a crash of a server holding
-/// private keys / session secrets in memory must not be able to write them to a
-/// world- or admin-readable core file.
+/// RLIMIT_CORE = 0: the kernel writes no core FILE for this process. Not the
+/// whole story -- with a piped `core_pattern` (`|/usr/lib/systemd/
+/// systemd-coredump`, apport) the handler still runs on a crash and is not
+/// bound by this limit (core(5)); `setNotDumpable` is what keeps the memory
+/// out of it, and away from same-uid `ptrace` and `/proc/<pid>/mem`.
 pub fn disableCoreDumps() RlimitError!void {
     return setLimit(.CORE, 0, 0);
+}
+
+pub const DumpableError = error{PrctlFailed};
+
+/// `prctl(PR_SET_DUMPABLE, 0)`: no core dump through any `core_pattern`
+/// (piped handlers included), and another process of the same uid can no
+/// longer `ptrace` this one or read its `/proc/<pid>/mem` -- what keeps a
+/// compromised sibling worker from reading this one's keys. The kernel
+/// resets the flag on an execve() and whenever the effective or filesystem
+/// ids change -- to `fs.suid_dumpable`, which apport-enabled systems set to 2
+/// (prctl(2)) -- so call it AFTER `dropPrivileges`.
+pub fn setNotDumpable() DumpableError!void {
+    const rc = linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.PrctlFailed;
 }
 
 /// RLIMIT_NOFILE — cap the highest file-descriptor number the process can open.
@@ -421,7 +496,7 @@ pub const Ruleset = struct {
         scoped: u64 = 0,
 
         /// Every right and scope this module knows: files, TCP bind/connect,
-        /// abstract UNIX sockets, signals.
+        /// abstract UNIX sockets, signals (not those of ABI 9+, see `access.all`).
         pub const everything: Handled = .{ .fs = access.all, .net = access_net.all, .scoped = scope.all };
     };
 
@@ -456,8 +531,13 @@ pub const Ruleset = struct {
         /// restricts rights that are handled; a right left out of the
         /// handled mask stays unrestricted everywhere, which is why the
         /// `read_only`/`read_write` unions are for `allowPath`, never for
-        /// the ruleset itself.
+        /// the ruleset itself. Rights added after ABI 8 (ABI 9's
+        /// `RESOLVE_UNIX`, …) are not in it and stay unrestricted on a kernel
+        /// that has them (SPEC.md, Backlog).
         pub const all: u64 = (1 << 16) - 1;
+        /// The rights a rule on a FILE (not a directory) may carry
+        /// (UAPI `ACCESS_FILE`); the rest only make sense beneath a directory.
+        pub const file: u64 = execute | write_file | read_file | truncate | ioctl_dev;
     };
 
     /// Bits of `access` a given ABI version understands. Passing a bit the ABI
@@ -520,7 +600,7 @@ pub const Ruleset = struct {
     /// unrestricted rather than failing, and the clamped masks are left in
     /// `handled`, `handled_net` and `scoped` for the caller to log or refuse.
     /// `initWith(.everything)` is the strictest shape; then grant with
-    /// `allowPath` and `allowPort`.
+    /// `allowPath` and `allowPort`. `initExact` refuses the degradation.
     pub fn initWith(h: Handled) LandlockError!Ruleset {
         const abi = try landlockAbiVersion();
         const attr = RulesetAttr{
@@ -548,9 +628,26 @@ pub const Ruleset = struct {
         };
     }
 
+    /// `initWith`, but every requested right and scope must be enforced: a
+    /// kernel whose ABI lacks any of them is `error.PartiallySupported` (and
+    /// no ruleset is left open), never a quieter sandbox than the one asked
+    /// for. For a service that must not start half-confined.
+    pub fn initExact(h: Handled) (LandlockError || error{PartiallySupported})!Ruleset {
+        var r = try initWith(h);
+        if (r.handled != h.fs or r.handled_net != h.net or r.scoped != h.scoped) {
+            r.deinit();
+            return error.PartiallySupported;
+        }
+        return r;
+    }
+
     /// Allow `allowed_access` on everything beneath `path` (a directory or a
     /// single file). The access is clamped to the ruleset's handled set — you
-    /// cannot allow a right the ruleset does not deny in the first place.
+    /// cannot allow a right the ruleset does not deny in the first place —
+    /// and, for a file, to `access.file` (the kernel refuses a file rule with
+    /// directory rights, so `access.read_only` on a file grants `read_file`).
+    /// When nothing is left the call is a no-op, as `allowPort`'s: the path
+    /// stays denied for every handled right.
     pub fn allowPath(self: *Ruleset, path: [*:0]const u8, allowed_access: u64) LandlockError!void {
         // O_PATH|O_CLOEXEC: we only need a handle to name the tree, not to
         // read it. O_NOFOLLOW: the rule must attach to what the configuration
@@ -567,8 +664,11 @@ pub const Ruleset = struct {
         if (linux.errno(linux.statx(parent_fd, "", at_empty_path, .{ .TYPE = true }, &st)) != .SUCCESS) return error.PathOpenFailed;
         if (linux.S.ISLNK(st.mode)) return error.PathIsSymlink;
 
+        const scope_mask: u64 = if (linux.S.ISDIR(st.mode)) std.math.maxInt(u64) else access.file;
+        const allowed = allowed_access & self.handled & scope_mask;
+        if (allowed == 0) return;
         const attr = PathBeneathAttr{
-            .allowed_access = allowed_access & self.handled,
+            .allowed_access = allowed,
             .parent_fd = parent_fd,
         };
         const rc = sys_landlock_add_rule(self.fd, landlock_rule_path_beneath, &attr, 0);
@@ -817,8 +917,9 @@ pub const seccomp = struct {
         /// `.allow` as the deny action of `build`/`buildWx`, or as `buildWx`'s
         /// W^X action — a filter whose deny case allows is a no-op.
         InvalidAction,
-        /// A `Rule` with more than `max_rule_conditions` conditions, or an
-        /// `ArgCmp.arg` above 5.
+        /// A `Rule` with more than `max_rule_conditions` conditions, an
+        /// `ArgCmp.arg` above 5, or a `.u32` condition whose `value`/`mask`
+        /// does not fit 32 bits.
         InvalidRule,
         /// More than `max_rules` rules.
         TooManyRules,
@@ -865,7 +966,9 @@ pub const seccomp = struct {
     /// `SECCOMP_GET_ACTION_AVAIL`, which needs no privilege and changes
     /// nothing. Callers — and this module's own tests — use it to decide UP
     /// FRONT whether a filter can exist; a failing `install` after this said
-    /// yes is then a real failure, never something to skip past.
+    /// yes is then a real failure, never something to skip past. The probe
+    /// exists since Linux 4.14: on 3.17--4.13 filters work but this says
+    /// false -- the module's floor is 4.14 (also for `.kill_process`, `.log`).
     pub fn available() bool {
         const action: u32 = ret_kill_process;
         const rc = linux.syscall3(.seccomp, seccomp_get_action_avail, 0, @intFromPtr(&action));
@@ -873,10 +976,13 @@ pub const seccomp = struct {
     }
 
     pub const InstallError = error{
-        /// prctl(PR_SET_SECCOMP) returned an error. Almost always: no
-        /// PR_SET_NO_NEW_PRIVS and no CAP_SYS_ADMIN (EACCES), or the kernel
-        /// lacks CONFIG_SECCOMP_FILTER (EINVAL).
+        /// The kernel refused the filter for another reason: an empty or
+        /// over-long program, a program it rejects (EINVAL), no
+        /// CONFIG_SECCOMP_FILTER, out of memory.
         SeccompFailed,
+        /// EACCES: neither `PR_SET_NO_NEW_PRIVS` (call `noNewPrivs()` first)
+        /// nor `CAP_SYS_ADMIN`.
+        NoNewPrivsRequired,
     };
 
     /// Build a classic-BPF program that ALLOWS exactly the syscalls in `allowed`
@@ -945,7 +1051,11 @@ pub const seccomp = struct {
             0,
             0,
         );
-        if (linux.errno(rc) != .SUCCESS) return error.SeccompFailed;
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .ACCES => return error.NoNewPrivsRequired,
+            else => return error.SeccompFailed,
+        }
     }
 
     pub const TsyncError = error{
@@ -962,7 +1072,11 @@ pub const seccomp = struct {
         /// `(-4096, 0)` as an error, so a positive tid reads as `.SUCCESS` to
         /// a caller that reuses `install`'s plain error check — that
         /// mis-check is exactly the bug this variant exists to prevent.
+        /// The filter is then installed on NO thread, the caller's included.
         ThreadSyncFailed,
+        /// EACCES: the calling thread has neither `PR_SET_NO_NEW_PRIVS` nor
+        /// `CAP_SYS_ADMIN`.
+        NoNewPrivsRequired,
     };
 
     /// Install `prog` via the `seccomp(2)` syscall (not `prctl`) with
@@ -982,7 +1096,11 @@ pub const seccomp = struct {
             linux.SECCOMP.FILTER_FLAG.TSYNC,
             @intFromPtr(&fprog),
         );
-        if (linux.errno(rc) != .SUCCESS) return error.SeccompFailed;
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .ACCES => return error.NoNewPrivsRequired,
+            else => return error.SeccompFailed,
+        }
         // See ThreadSyncFailed: a nonzero-but-not-decoded-as-errno return
         // here is the tid of the first thread whose sync failed, not proof
         // of success.
@@ -1030,6 +1148,12 @@ pub const seccomp = struct {
         // process identity / exit
         "getpid",          "gettid",       "getuid",          "getgid",
         "geteuid",         "getegid",      "exit",            "exit_group",
+        // ⚠ Reaches other processes: any tgid of the same uid (a sibling
+        // worker, a supervisor) can be signalled, SIGKILL included -- the
+        // list keeps it because `abort`/`raise` and thread cancellation use
+        // it on the caller's own threads. Narrow it with `buildRules`
+        // (`arg = 0, .eq, .u32, value = getpid()`), or add Landlock's
+        // `scope.signal` for processes outside the domain (review 2026-10-27).
         "tgkill",
         // Audit S11: calls a libc or language runtime makes on its own, which
         // killed a process under this list. Each checked for grant: none
@@ -1242,6 +1366,9 @@ pub const seccomp = struct {
         op: Op,
         width: Width,
         value: u64,
+        /// `.u32` reads 32 bits, so `value` (and a `mask` other than the
+        /// all-ones default) must fit them: a wider one is `error.InvalidRule`,
+        /// not silently cut (`value = 1 << 32` would otherwise match 0).
         /// For `masked_eq`: the condition is `(arg & mask) == (value & mask)`
         /// -- bits of `value` outside `mask` are ignored, as libseccomp's
         /// `SCMP_CMP_MASKED_EQ` ignores them. Ignored by the other operators.
@@ -1444,7 +1571,11 @@ pub const seccomp = struct {
         for (rules) |r| {
             try validateAction(r.action);
             if (r.when.len > max_rule_conditions) return error.InvalidRule;
-            for (r.when) |c| if (c.arg > 5) return error.InvalidRule;
+            for (r.when) |c| {
+                if (c.arg > 5) return error.InvalidRule;
+                if (c.width == .u32 and (c.value >> 32 != 0 or (c.mask != std.math.maxInt(u64) and c.mask >> 32 != 0)))
+                    return error.InvalidRule;
+            }
         }
     }
 
@@ -1490,27 +1621,35 @@ pub const seccomp = struct {
                 return p.starts.len - 1;
             }
 
-            /// A group = per rule: conditions + `ret`, then one `ret default`.
+            /// A group = per rule: conditions + `ret`, then one `ret default`
+            /// unless the last rule has no conditions (nothing falls past it).
             fn groupLen(p: Self, g: usize) usize {
-                var n: usize = 1;
+                var n: usize = @intFromBool(p.groupFallsThrough(g));
                 for (p.order[p.starts[g]..p.starts[g + 1]]) |ri| n += ruleLen(p.rules[ri]) - 2;
                 return n;
             }
 
-            /// Leaf = `jeq nr; ja default; group`; node = `jge pivot; ja right`.
+            fn groupFallsThrough(p: Self, g: usize) bool {
+                return p.rules[p.order[p.starts[g + 1] - 1]].when.len != 0;
+            }
+
+            /// Leaf = `jeq nr; ret default; group`. Node = `jge pivot` whose
+            /// `jt` skips the left half when that fits a `u8`, else
+            /// `jge pivot; ja right`.
             fn nodeLen(p: Self, lo: usize, hi: usize) usize {
                 if (hi - lo == 1) return 2 + p.groupLen(lo);
                 const mid = (lo + hi) / 2;
-                return 2 + p.nodeLen(lo, mid) + p.nodeLen(mid, hi);
+                const left = p.nodeLen(lo, mid);
+                return @as(usize, if (left <= 255) 1 else 2) + left + p.nodeLen(mid, hi);
             }
 
-            fn emit(p: Self, list: *std.ArrayList(SockFilter), lo: usize, hi: usize, default_at: usize, default_word: u32) void {
+            fn emit(p: Self, list: *std.ArrayList(SockFilter), lo: usize, hi: usize, default_word: u32) void {
                 const ja = bpf.jmp | bpf.ja;
                 if (hi - lo == 1) {
                     const first = p.rules[p.order[p.starts[lo]]];
-                    // Match: skip the `ja`, run the group. Else: to the default.
+                    // Match: skip the `ret`, run the group. Else: the default.
                     list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nrOf(first), 1, 0));
-                    list.appendAssumeCapacity(bpf.stmt(ja, @intCast(default_at - (list.items.len + 1))));
+                    list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
                     for (p.order[p.starts[lo]..p.starts[lo + 1]]) |ri| {
                         const r = p.rules[ri];
                         const next_rule = list.items.len + ruleLen(r) - 2;
@@ -1518,48 +1657,65 @@ pub const seccomp = struct {
                         list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
                         std.debug.assert(list.items.len == next_rule);
                     }
-                    list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
+                    if (p.groupFallsThrough(lo)) list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
                     return;
                 }
                 const mid = (lo + hi) / 2;
                 const pivot = nrOf(p.rules[p.order[p.starts[mid]]]);
-                // nr >= pivot: take the `ja` to the right half; else skip it
-                // and fall into the left half laid out right behind.
-                list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, pivot, 0, 1));
-                list.appendAssumeCapacity(bpf.stmt(ja, @intCast(p.nodeLen(lo, mid))));
-                p.emit(list, lo, mid, default_at, default_word);
-                p.emit(list, mid, hi, default_at, default_word);
+                // nr >= pivot: over the left half (laid out right behind) to
+                // the right one -- by `jt` when it reaches, else by a `ja`.
+                const left = p.nodeLen(lo, mid);
+                if (left <= 255) {
+                    list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, pivot, @intCast(left), 0));
+                } else {
+                    list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, pivot, 0, 1));
+                    list.appendAssumeCapacity(bpf.stmt(ja, @intCast(left)));
+                }
+                p.emit(list, lo, mid, default_word);
+                p.emit(list, mid, hi, default_word);
             }
         };
     }
 
     /// Instructions of one architecture's rule block (`plan` set iff tree).
-    fn blockLen(comptime R: type, rules: []const R, plan: ?Plan(R)) usize {
-        if (plan) |p| return if (p.groups() == 0) 1 else 2 + p.nodeLen(0, p.groups());
+    /// `nr_loaded`: the accumulator already holds `nr` on entry (the x32
+    /// guard just loaded it).
+    fn blockLen(comptime R: type, rules: []const R, plan: ?Plan(R), nr_loaded: bool) usize {
+        if (plan) |p| return if (p.groups() == 0) 1 else @as(usize, 1) + @intFromBool(!nr_loaded) + p.nodeLen(0, p.groups());
         var n: usize = 1; // the default leaf
-        for (rules) |r| n += ruleLen(r);
+        var loaded = nr_loaded;
+        for (rules) |r| {
+            n += ruleLen(r) - @intFromBool(loaded);
+            loaded = r.when.len == 0;
+        }
         return n;
     }
 
-    fn emitBlock(comptime R: type, list: *std.ArrayList(SockFilter), rules: []const R, plan: ?Plan(R), default_action: Action) void {
+    fn emitBlock(comptime R: type, list: *std.ArrayList(SockFilter), rules: []const R, plan: ?Plan(R), default_action: Action, nr_loaded: bool) void {
         const default_word = actionWord(default_action);
         if (plan) |p| {
             if (p.groups() != 0) {
-                const default_at = list.items.len + 1 + p.nodeLen(0, p.groups());
-                list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
-                p.emit(list, 0, p.groups(), default_at, default_word);
-                std.debug.assert(list.items.len == default_at);
+                const end = list.items.len + @intFromBool(!nr_loaded) + p.nodeLen(0, p.groups());
+                if (!nr_loaded) list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+                p.emit(list, 0, p.groups(), default_word);
+                std.debug.assert(list.items.len == end);
             }
-        } else for (rules) |r| {
-            const start = list.items.len;
-            const next_rule = start + ruleLen(r);
-            // Conditions clobber the accumulator, so every rule reloads nr.
-            list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
-            const to_next: u8 = @intCast(next_rule - (list.items.len + 1));
-            list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nrOf(r), 0, to_next));
-            for (r.when) |c| emitCond(list, c, next_rule);
-            list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
-            std.debug.assert(list.items.len == next_rule);
+        } else {
+            var loaded = nr_loaded;
+            for (rules) |r| {
+                const start = list.items.len;
+                const next_rule = start + ruleLen(r) - @intFromBool(loaded);
+                // Conditions clobber the accumulator: a rule after one with
+                // conditions reloads nr (its failing compare jumps here); after
+                // one without, the accumulator still holds it.
+                if (!loaded) list.appendAssumeCapacity(bpf.stmt(bpf.ld | bpf.w | bpf.abs, off_nr));
+                loaded = r.when.len == 0;
+                const to_next: u8 = @intCast(next_rule - (list.items.len + 1));
+                list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, nrOf(r), 0, to_next));
+                for (r.when) |c| emitCond(list, c, next_rule);
+                list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, actionWord(r.action)));
+                std.debug.assert(list.items.len == next_rule);
+            }
         }
         list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, default_word));
     }
@@ -1575,7 +1731,7 @@ pub const seccomp = struct {
     ///
     ///   arch guard                     ; as in `build` — always KILL
     ///   [x86-64] nr ≥ X32 bit → KILL   ; see `x32_syscall_bit`
-    ///   per rule:  ld nr; jeq sysno (else next rule);
+    ///   per rule:  ld nr (unless the accumulator still holds it); jeq sysno (else next rule);
     ///              each condition (else next rule); ret action
     ///   ret default_action
     ///
@@ -1615,8 +1771,8 @@ pub const seccomp = struct {
         const compat_plan: ?Plan(CompatRule) = if (tree and opts.i386 != null) try Plan(CompatRule).init(gpa, compat_rules) else null;
         defer if (compat_plan) |p| p.deinit(gpa);
 
-        const native_len = x32_guard_len + blockLen(Rule, rules, native_plan);
-        const compat_len = if (opts.i386 != null) blockLen(CompatRule, compat_rules, compat_plan) else 0;
+        const native_len = x32_guard_len + blockLen(Rule, rules, native_plan, x32_guard_len != 0);
+        const compat_len = if (opts.i386 != null) blockLen(CompatRule, compat_rules, compat_plan, false) else 0;
         const total: usize = if (opts.i386 == null) 3 + native_len else 3 + native_len + 2 + compat_len + 1;
         if (total > max_program_len) return error.ProgramTooLong;
 
@@ -1636,12 +1792,12 @@ pub const seccomp = struct {
             list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jge | bpf.k, x32_syscall_bit, 0, 1));
             list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
         }
-        emitBlock(Rule, &list, rules, native_plan, default_action);
+        emitBlock(Rule, &list, rules, native_plan, default_action, x32_guard_len != 0);
         if (opts.i386 != null) {
             // The accumulator still holds `arch`: `ja` does not touch it.
             list.appendAssumeCapacity(bpf.jump(bpf.jmp | bpf.jeq | bpf.k, audit_arch_i386, 1, 0));
             list.appendAssumeCapacity(bpf.stmt(bpf.jmp | bpf.ja, @intCast(compat_len)));
-            emitBlock(CompatRule, &list, compat_rules, compat_plan, default_action);
+            emitBlock(CompatRule, &list, compat_rules, compat_plan, default_action, false);
             list.appendAssumeCapacity(bpf.stmt(bpf.ret | bpf.k, ret_kill_process));
         }
         std.debug.assert(list.items.len == total);
@@ -1992,13 +2148,20 @@ fn genRules(comptime R: type, r: std.Random, out: []R, conds: []seccomp.ArgCmp, 
     var used: usize = 0;
     for (out) |*rule| {
         const n_conds = r.uintLessThan(usize, seccomp.max_rule_conditions + 1);
-        for (conds[used..][0..n_conds]) |*c| c.* = .{
-            .arg = @intCast(r.uintLessThan(u8, 6)),
-            .op = ops[r.uintLessThan(usize, ops.len)],
-            .width = if (r.boolean()) .u32 else .u64,
-            .value = pickValue(r),
-            .mask = pickValue(r),
-        };
+        for (conds[used..][0..n_conds]) |*c| {
+            c.* = .{
+                .arg = @intCast(r.uintLessThan(u8, 6)),
+                .op = ops[r.uintLessThan(usize, ops.len)],
+                .width = if (r.boolean()) .u32 else .u64,
+                .value = pickValue(r),
+                .mask = pickValue(r),
+            };
+            // `.u32` data must fit 32 bits (`error.InvalidRule` otherwise).
+            if (c.width == .u32) {
+                c.value &= 0xffff_ffff;
+                c.mask &= 0xffff_ffff;
+            }
+        }
         rule.* = .{
             .sysno = sysnos[r.uintLessThan(usize, sysnos.len)],
             .when = conds[used..][0..n_conds],
@@ -2105,7 +2268,9 @@ test "seccomp.buildRulesWith: long lists (jumps past 255), duplicate numbers, tr
     while (round < 60) : (round += 1) {
         const n = 1 + r.uintLessThan(usize, 200);
         for (rules[0..n], 0..) |*rule, i| {
-            conds[i] = .{ .arg = @intCast(r.uintLessThan(u8, 6)), .op = .ge, .width = if (r.boolean()) .u32 else .u64, .value = pickValue(r) };
+            const w: seccomp.Width = if (r.boolean()) .u32 else .u64;
+            const v = pickValue(r);
+            conds[i] = .{ .arg = @intCast(r.uintLessThan(u8, 6)), .op = .ge, .width = w, .value = if (w == .u32) v & 0xffff_ffff else v };
             rule.* = .{
                 .sysno = all[r.uintLessThan(usize, all.len)],
                 .when = if (r.boolean()) conds[i..][0..1] else &.{},
@@ -2167,8 +2332,10 @@ test "seccomp.buildRulesWith: the tree reaches a rule in O(log n) instructions; 
         worst_lin = @max(worst_lin, s_lin);
         worst_tree = @max(worst_tree, s_tree);
     }
-    try testing.expect(worst_lin > 500); // 2 per rule scanned
-    try testing.expect(worst_tree <= 2 * 8 + 12); // log2(256) levels of jge+ja, guards, leaf
+    try testing.expect(worst_lin > 250); // 1 per rule scanned (rules without conditions share the nr load)
+    // Guards (arch 2, x32 2), the root's `jge`+`ja` (its left half is 511
+    // instructions, past a `u8`), 7 more levels of one `jge`, leaf `jeq` + `ret`.
+    try testing.expect(worst_tree <= 15);
     try testing.expect(tree.len <= seccomp.max_program_len);
 }
 
@@ -2185,21 +2352,23 @@ test "seccomp.buildRulesWith: structure of the two-architecture guard" {
     const ld = bpf.ld | bpf.w | bpf.abs;
     const jeq = bpf.jmp | bpf.jeq | bpf.k;
     const ja = bpf.jmp | bpf.ja;
-    // native block = x32 guard (3) + 1 rule (3) + default (1) = 7
+    // native block = x32 guard (3) + 1 rule (2: the guard left nr loaded) + default (1) = 6
     try testing.expectEqual(bpf.stmt(ld, seccomp.off_arch), prog[0]);
     try testing.expectEqual(bpf.jump(jeq, audit_arch, 1, 0), prog[1]);
-    try testing.expectEqual(bpf.stmt(ja, 7), prog[2]);
+    try testing.expectEqual(bpf.stmt(ja, 6), prog[2]);
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[5]); // x32 guard
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[7]);
-    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[9]); // native default
-    // i386 block = 2 rules (3 + 3) + default (1) = 7; no x32 guard in it.
-    try testing.expectEqual(bpf.jump(jeq, seccomp.audit_arch_i386, 1, 0), prog[10]);
-    try testing.expectEqual(bpf.stmt(ja, 7), prog[11]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(X86.getpid)), 0, 1), prog[13]);
-    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_thread), prog[17]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[6]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[8]); // native default
+    // i386 block = 2 rules (ld + 2, then 2 sharing the load) + default (1) = 6; no x32 guard in it.
+    try testing.expectEqual(bpf.jump(jeq, seccomp.audit_arch_i386, 1, 0), prog[9]);
+    try testing.expectEqual(bpf.stmt(ja, 6), prog[10]);
+    try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[11]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(X86.getpid)), 0, 1), prog[12]);
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(X86.write)), 0, 1), prog[14]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_thread), prog[15]);
     // ...and one KILL for every other arch, at the end.
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[prog.len - 1]);
-    try testing.expectEqual(@as(usize, 20), prog.len);
+    try testing.expectEqual(@as(usize, 18), prog.len);
 }
 
 test "seccomp.buildRules: structure — arch guard, x32 guard, one self-contained block per rule, default leaf" {
@@ -2223,18 +2392,22 @@ test "seccomp.buildRules: structure — arch guard, x32 guard, one self-containe
         try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[5]);
         i = 6;
     }
-    // Rule 0: number only — ld nr; jeq getpid (else skip 1); ret allow.
-    try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[i + 1]);
-    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow), prog[i + 2]);
-    i += 3;
-    // Rule 1: ld nr; jeq socket (else skip 3); ld arg0 LOW word only; jeq 1 (else skip 1); ret errno.
-    try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
-    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.socket)), 0, 3), prog[i + 1]);
-    try testing.expectEqual(bpf.stmt(ld, seccomp.argHalves("arg0").lo), prog[i + 2]);
-    try testing.expectEqual(bpf.jump(jeq, 1, 0, 1), prog[i + 3]);
-    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | 1), prog[i + 4]);
-    i += 5;
+    // Rule 0: number only — [ld nr, unless the x32 guard left it in the
+    // accumulator]; jeq getpid (else skip 1); ret allow.
+    if (builtin.cpu.arch != .x86_64) {
+        try testing.expectEqual(bpf.stmt(ld, seccomp.off_nr), prog[i]);
+        i += 1;
+    }
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.getpid)), 0, 1), prog[i]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow), prog[i + 1]);
+    i += 2;
+    // Rule 1: no reload (rule 0 had no conditions); jeq socket (else skip 3);
+    // ld arg0 LOW word only; jeq 1 (else skip 1); ret errno.
+    try testing.expectEqual(bpf.jump(jeq, @intCast(@backingInt(linux.SYS.socket)), 0, 3), prog[i]);
+    try testing.expectEqual(bpf.stmt(ld, seccomp.argHalves("arg0").lo), prog[i + 1]);
+    try testing.expectEqual(bpf.jump(jeq, 1, 0, 1), prog[i + 2]);
+    try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | 1), prog[i + 3]);
+    i += 4;
     try testing.expectEqual(bpf.stmt(bpf.ret | bpf.k, seccomp.ret_kill_process), prog[i]);
     try testing.expectEqual(i + 1, prog.len);
 }
@@ -2244,6 +2417,12 @@ test "seccomp.buildRules / build: refused inputs" {
     const six: [7]seccomp.ArgCmp = @splat(.{ .arg = 0, .op = .eq, .width = .u32, .value = 0 });
     try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &six }}, .kill_process));
     try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &.{.{ .arg = 6, .op = .eq, .width = .u32, .value = 0 }} }}, .kill_process));
+    // A `.u32` condition with data past 32 bits; the all-ones default mask and
+    // the widest fitting value are fine.
+    try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &.{.{ .arg = 0, .op = .eq, .width = .u32, .value = 1 << 32 }} }}, .kill_process));
+    try testing.expectError(error.InvalidRule, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &.{.{ .arg = 0, .op = .masked_eq, .width = .u32, .value = 0, .mask = 0x1_0000_0000 }} }}, .kill_process));
+    const fits = try seccomp.buildRules(gpa, &.{.{ .sysno = .read, .when = &.{.{ .arg = 0, .op = .masked_eq, .width = .u32, .value = 0xffff_ffff }} }}, .kill_process);
+    gpa.free(fits);
     try testing.expectError(error.InvalidErrno, seccomp.buildRules(gpa, &.{.{ .sysno = .read, .action = .{ .errno = 0 } }}, .kill_process));
     try testing.expectError(error.InvalidErrno, seccomp.buildRules(gpa, &.{}, .{ .errno = 4096 }));
     const many: [seccomp.max_rules + 1]seccomp.Rule = @splat(.{ .sysno = .read });
@@ -2352,8 +2531,22 @@ fn childSeccompControl() void {
 // error.SkipZigTest` turned a broken `install` (or a no-op `noNewPrivs`) into
 // a green suite: a mutation that disabled Landlock entirely left "15 pass /
 // 3 skip", exit 0.
+/// Skip gates are written here with raw syscalls, NOT with the module's own
+/// probes (`seccomp.available`, `landlockAbiVersion`): a regression in a probe
+/// would otherwise skip every test that could notice it, green (review
+/// 2026-10-27, the same class as audit S5).
 fn requireSeccompFilter() !void {
-    if (!seccomp.available()) return error.SkipZigTest; // no CONFIG_SECCOMP_FILTER / seccomp(2)
+    const action: u32 = linux.SECCOMP.RET.KILL_PROCESS;
+    const rc = linux.syscall3(.seccomp, 2, 0, @intFromPtr(&action)); // SECCOMP_GET_ACTION_AVAIL
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest; // no CONFIG_SECCOMP_FILTER / seccomp(2)
+}
+
+/// The Landlock ABI by a raw `landlock_create_ruleset(NULL, 0, VERSION)`, or a
+/// skip when the kernel has none.
+fn requireLandlock() !i32 {
+    const rc = linux.syscall3(.landlock_create_ruleset, 0, 0, 1);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest; // pre-5.13 / disabled
+    return @intCast(@as(isize, @bitCast(rc)));
 }
 
 test "seccomp.available agrees with a real install attempt" {
@@ -2679,6 +2872,7 @@ fn childTsyncKill() void {
     seccomp.installTsync(g_tsync_kill_prog) catch |e| switch (e) {
         error.SeccompFailed => linux.exit(102),
         error.ThreadSyncFailed => linux.exit(103),
+        error.NoNewPrivsRequired => linux.exit(104),
     };
     _ = linux.getpid(); // not on the list → SIGSYS kills the process
     linux.exit(0); // unreachable if the filter works
@@ -2689,6 +2883,7 @@ fn childTsyncControl() void {
     seccomp.installTsync(g_tsync_allow_prog) catch |e| switch (e) {
         error.SeccompFailed => linux.exit(102),
         error.ThreadSyncFailed => linux.exit(103),
+        error.NoNewPrivsRequired => linux.exit(104),
     };
     _ = linux.getpid(); // allowed → runs fine
     linux.exit(7);
@@ -2776,6 +2971,7 @@ fn childTsyncPropagation() void {
     seccomp.installTsync(g_tsync_prop_prog) catch |e| switch (e) {
         error.SeccompFailed => linux.exit(102),
         error.ThreadSyncFailed => linux.exit(103),
+        error.NoNewPrivsRequired => linux.exit(104),
     };
     release.store(true, .release);
     worker.join(); // only returns if the worker survived getpid() (no propagation)
@@ -2839,6 +3035,7 @@ fn childTsyncCollision() void {
     } else |e| switch (e) {
         error.ThreadSyncFailed => linux.exit(0), // correctly detected
         error.SeccompFailed => linux.exit(201),
+        error.NoNewPrivsRequired => linux.exit(202),
     }
 }
 
@@ -3082,7 +3279,7 @@ const LandlockFixture = struct {
     /// /etc/passwd, or no writable /tmp are all "the mechanism/fixture is not
     /// here" — a child later failing is the module failing.
     fn setup(f: *LandlockFixture) !void {
-        _ = landlockAbiVersion() catch return error.SkipZigTest; // pre-5.13 / disabled
+        _ = try requireLandlock(); // pre-5.13 / disabled
         if (openReadonly(ll_forbidden_file) != .SUCCESS) return error.SkipZigTest; // no /etc/passwd
         const pid = linux.getpid();
         f.dir = try std.mem.printSentinel(&f.dir_buf, "/tmp/zig_sandbox_ll_{d}", .{pid}, 0);
@@ -3147,7 +3344,7 @@ test "landlock: init() + allowPath(read_write) still permits creating a file in 
 }
 
 test "landlock: initHandling(read_only) is the explicit, weaker form — access.all is what init() handles" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     var narrow = try Ruleset.initHandling(Ruleset.access.read_only);
     defer narrow.deinit();
     try testing.expectEqual(Ruleset.access.read_only, narrow.handled);
@@ -3162,7 +3359,7 @@ test "landlock: initHandling(read_only) is the explicit, weaker form — access.
 }
 
 test "landlock: allowPath refuses a symlink by name instead of granting its target (audit S10)" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     var link_buf: [64]u8 = undefined;
     const link_z = try std.mem.printSentinel(&link_buf, "/tmp/zig_sandbox_ll_{d}_link", .{linux.getpid()}, 0);
     _ = linux.unlink(link_z.ptr);
@@ -3330,7 +3527,7 @@ fn childLandlockNetControl() void {
 }
 
 test "landlock net (ABI 4): bind/connect only on granted TCP ports; EACCES, not EADDRINUSE, on a busy denied port" {
-    if ((landlockAbiVersion() catch return error.SkipZigTest) < 4) return error.SkipZigTest;
+    if ((try requireLandlock()) < 4) return error.SkipZigTest;
     const a = listenLoopback(&g_ll_port_allowed) orelse return error.SkipZigTest;
     defer _ = linux.close(a);
     const t = listenLoopback(&g_ll_port_taken) orelse return error.SkipZigTest;
@@ -3340,7 +3537,7 @@ test "landlock net (ABI 4): bind/connect only on granted TCP ports; EACCES, not 
 }
 
 test "landlock: initWith of only what this ABI lacks is NotSupported, not an empty ruleset (review S1)" {
-    const abi = landlockAbiVersion() catch return error.SkipZigTest;
+    const abi = try requireLandlock();
     // A bit above every known one stands in for "newer than this kernel".
     try testing.expectError(error.NotSupported, Ruleset.initWith(.{ .fs = 1 << 40 }));
     if (abi < 4) try testing.expectError(error.NotSupported, Ruleset.initWith(.{ .fs = 0, .net = Ruleset.access_net.all }));
@@ -3349,7 +3546,7 @@ test "landlock: initWith of only what this ABI lacks is NotSupported, not an emp
 }
 
 test "landlock net: allowPort is a no-op when the ruleset does not handle network rights" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     var rs = try Ruleset.init();
     defer rs.deinit();
     try testing.expectEqual(@as(u64, 0), rs.handled_net);
@@ -3388,7 +3585,7 @@ fn childScopeSignalOff() void {
 }
 
 test "landlock scope (ABI 6): signal — the domain cannot signal its parent, control can" {
-    if ((landlockAbiVersion() catch return error.SkipZigTest) < 6) return error.SkipZigTest;
+    if ((try requireLandlock()) < 6) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeSignalOff)).status);
     try testing.expectEqual(@as(u32, 0), (try runInChild(childScopeSignalOn)).status);
 }
@@ -3422,7 +3619,7 @@ fn childScopeAbstractOff() void {
 }
 
 test "landlock scope (ABI 6): abstract UNIX socket — no connect to a listener outside the domain, control can" {
-    if ((landlockAbiVersion() catch return error.SkipZigTest) < 6) return error.SkipZigTest;
+    if ((try requireLandlock()) < 6) return error.SkipZigTest;
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
     if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
     const fd: i32 = @intCast(@as(isize, @bitCast(rc)));
@@ -3462,6 +3659,10 @@ fn childRlimitCannotRaise() void {
     // capabilities first; the property under test is then the one documented.
     if (linux.geteuid() == 0) clearCapabilities() catch linux.exit(72);
     limitOpenFiles(64) catch linux.exit(70); // lowers the hard limit to 64
+    // Both halves are the cap: a hard limit above it would let the soft one
+    // climb back (mutation 2026-10-27: `n + 1` survived the raise below).
+    var rl: linux.rlimit = undefined;
+    if (linux.errno(linux.getrlimit(.NOFILE, &rl)) != .SUCCESS or rl.cur != 64 or rl.max != 64) linux.exit(73);
     // A non-privileged process must NOT be able to raise the hard limit back up.
     setLimit(.NOFILE, 4096, 4096) catch linux.exit(0); // expected: EPERM → success
     linux.exit(71); // raise succeeded → limit not really enforced
@@ -3601,8 +3802,29 @@ fn childInstallSeesPrctlFailure() void {
     if (!rawInstallSeccomp(&pre)) linux.exit(102);
     seccomp.install(&allow_all_prog) catch |e| switch (e) {
         error.SeccompFailed => linux.exit(0),
+        error.NoNewPrivsRequired => linux.exit(2),
     };
     linux.exit(1); // reported success for a prctl the kernel refused
+}
+
+/// EACCES from the kernel is the missing-no-new-privs case, by name.
+fn childInstallSeesEacces() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre_prctl = errnoOneSyscall(.prctl, .ACCES);
+    const pre_seccomp = errnoOneSyscall(.seccomp, .ACCES);
+    // Two pre-filters, one per install path, each installed by seccomp(2).
+    if (!rawInstallSeccomp(&pre_prctl)) linux.exit(102);
+    seccomp.install(&allow_all_prog) catch |e| switch (e) {
+        error.NoNewPrivsRequired => {},
+        error.SeccompFailed => linux.exit(2),
+    };
+    // prctl is refused now; seccomp(2) still installs the second one.
+    if (!rawInstallSeccomp(&pre_seccomp)) linux.exit(103);
+    seccomp.installTsync(&allow_all_prog) catch |e| switch (e) {
+        error.NoNewPrivsRequired => linux.exit(0),
+        else => linux.exit(4),
+    };
+    linux.exit(1);
 }
 
 fn childInstallTsyncSeesSeccompFailure() void {
@@ -3612,6 +3834,7 @@ fn childInstallTsyncSeesSeccompFailure() void {
     seccomp.installTsync(&allow_all_prog) catch |e| switch (e) {
         error.SeccompFailed => linux.exit(0),
         error.ThreadSyncFailed => linux.exit(2), // a plain -errno misread as a tid
+        error.NoNewPrivsRequired => linux.exit(3),
     };
     linux.exit(1);
 }
@@ -3622,6 +3845,7 @@ test "seccomp.install / installTsync: a syscall the kernel refuses surfaces as S
     try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallControl)).status);
     try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallSeesPrctlFailure)).status);
     try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallTsyncSeesSeccompFailure)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallSeesEacces)).status);
 }
 
 var g_inj_errno: E = .NOSYS;
@@ -3666,7 +3890,7 @@ test "landlock: ENOSYS / EOPNOTSUPP from the version query map to NotSupported /
 test "landlock: ENOSYS / EOPNOTSUPP from the ruleset creation itself map the same way — initHandling's own copy (audit S18)" {
     try requireSeccompFilter();
     // Past the version query means a kernel whose Landlock actually answers.
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     for ([_]E{ .NOSYS, .OPNOTSUPP }) |errno| {
         g_inj_errno = errno;
         try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockCreateUnderErrno)).status);
@@ -3817,7 +4041,7 @@ test "seccomp.actionAvailable: agrees with available(), and strips the errno dat
 }
 
 test "landlock initWith: bits the ABI does not know are clamped away, never handed to the kernel (kills the clamp mutants)" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     // Bit 20 (fs), bit 5 (net, scope) exist in no ABI: unclamped they make
     // landlock_create_ruleset fail with EINVAL.
     var rs = try Ruleset.initWith(.{
@@ -3837,11 +4061,180 @@ fn childRestrictWithoutNoNewPrivs() void {
 }
 
 test "landlock restrictSelf without no-new-privs reports NoNewPrivsRequired, not a generic failure" {
-    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    _ = try requireLandlock();
     if (linux.getuid() == 0) return error.SkipZigTest; // CAP_SYS_ADMIN would allow it
     const res = try runInChild(childRestrictWithoutNoNewPrivs);
     if (res.exitedWith(77)) return error.SkipZigTest; // the harness already runs under no-new-privs
     try testing.expect(res.exitedWith(0));
+}
+
+// ── review 2026-10-27: what the findings asked for ───────────────────────────
+
+fn childDropWithThread() void {
+    const t = std.Thread.spawn(.{}, struct {
+        fn run() void {
+            // Park until the process exits.
+            while (true) _ = linux.pause();
+        }
+    }.run, .{}) catch linux.exit_group(80);
+    t.detach();
+    // exit_group, not exit: `exit` ends this thread only, and the parked one
+    // would keep the child alive.
+    dropPrivileges(.{ .uid = 65534, .gid = 65534 }) catch |e| linux.exit_group(if (e == error.MultipleThreads) 0 else 1);
+    linux.exit_group(2);
+}
+
+test "dropPrivileges: a second thread is MultipleThreads before anything changes (ids are per thread)" {
+    if (threadCount() == null) return error.SkipZigTest; // no /proc
+    const res = try runInChild(childDropWithThread);
+    try testing.expectEqual(@as(u32, 0), res.status);
+}
+
+fn childUnprivilegedDrops() void {
+    // Not root: the first id call is refused, and the bounding set cannot be drained.
+    dropPrivileges(.{ .uid = 65534, .gid = 65534 }) catch |e| {
+        if (e != error.SetIdFailed) linux.exit(1);
+        dropCapabilityBoundingSet() catch |e2| linux.exit(if (e2 == error.PermissionDenied) 0 else 3);
+        linux.exit(4);
+    };
+    linux.exit(2);
+}
+
+test "dropPrivileges / dropCapabilityBoundingSet unprivileged: SetIdFailed and PermissionDenied, typed" {
+    if (linux.getuid() == 0) return error.SkipZigTest; // root succeeds instead (the VM lane covers it)
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childUnprivilegedDrops)).status);
+}
+
+fn childNotDumpable() void {
+    setNotDumpable() catch linux.exit(1);
+    const rc = linux.prctl(@backingInt(linux.PR.GET_DUMPABLE), 0, 0, 0, 0);
+    linux.exit(if (rc == 0) 0 else 2);
+}
+
+test "setNotDumpable: PR_GET_DUMPABLE reads 0 afterwards" {
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childNotDumpable)).status);
+}
+
+test "Ruleset.accessMaskForAbi: each right appears at its ABI and not before" {
+    const A = Ruleset.access;
+    try testing.expectEqual(@as(u64, (1 << 13) - 1), Ruleset.accessMaskForAbi(1));
+    try testing.expect(Ruleset.accessMaskForAbi(1) & A.refer == 0);
+    try testing.expect(Ruleset.accessMaskForAbi(2) & A.refer != 0);
+    try testing.expect(Ruleset.accessMaskForAbi(2) & A.truncate == 0);
+    try testing.expect(Ruleset.accessMaskForAbi(3) & A.truncate != 0);
+    try testing.expect(Ruleset.accessMaskForAbi(4) & A.ioctl_dev == 0);
+    try testing.expect(Ruleset.accessMaskForAbi(5) & A.ioctl_dev != 0);
+    try testing.expectEqual(A.all, Ruleset.accessMaskForAbi(8));
+    try testing.expectEqual(@as(u64, 0), Ruleset.netMaskForAbi(3));
+    try testing.expectEqual(Ruleset.access_net.all, Ruleset.netMaskForAbi(4));
+    try testing.expectEqual(@as(u64, 0), Ruleset.scopeMaskForAbi(5));
+    try testing.expectEqual(Ruleset.scope.all, Ruleset.scopeMaskForAbi(6));
+}
+
+test "Ruleset.initExact: a request the ABI cannot honour in full is PartiallySupported" {
+    _ = try requireLandlock();
+    // Bit 20 is no right of any ABI this module knows: `initWith` drops it.
+    try testing.expectError(error.PartiallySupported, Ruleset.initExact(.{ .fs = Ruleset.access.read_file | (1 << 20) }));
+    var exact = try Ruleset.initExact(.{ .fs = Ruleset.access.read_file });
+    exact.deinit();
+}
+
+fn childLandlockFileRule() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    var rs = Ruleset.init() catch linux.exit(80);
+    // A FILE with directory rights in the union: refused by the kernel
+    // before 2026-10-27 (EINVAL -> RulesetFailed), now `read_file` only.
+    rs.allowPath(g_ll_allowed_file.ptr, Ruleset.access.read_only) catch linux.exit(1);
+    // A ruleset handling only write_file, asked for read_only: nothing is
+    // left after the clamp -> a no-op, not RulesetFailed (kernel ENOMSG).
+    var narrow = Ruleset.initHandling(Ruleset.access.write_file) catch linux.exit(81);
+    narrow.allowPath(g_ll_allowed_file.ptr, Ruleset.access.read_only) catch linux.exit(2);
+    narrow.deinit();
+    rs.restrictSelf() catch linux.exit(3);
+    if (openReadonly(g_ll_allowed_file.ptr) != .SUCCESS) linux.exit(4);
+    if (openReadonly(ll_forbidden_file.ptr) != .ACCES) linux.exit(5);
+    linux.exit(0);
+}
+
+test "landlock allowPath: a single file takes access.read_only (file rights only), an empty clamp is a no-op" {
+    var f: LandlockFixture = .{};
+    try f.setup();
+    defer f.teardown();
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockFileRule)).status);
+}
+
+fn childRulesU64Order() void {
+    noNewPrivs() catch linux.exit(82);
+    seccomp.install(g_rules_prog) catch linux.exit(83);
+    // arg0 > 0x1_0000_0000 (64-bit): decided by the high word, then the low one.
+    if (linux.errno(linux.syscall6(.getppid, 0x1_0000_0001, 0, 0, 0, 0, 0)) != .NOENT) linux.exit(10); // hi equal, lo greater
+    if (linux.errno(linux.syscall6(.getppid, 0x2_0000_0000, 0, 0, 0, 0, 0)) != .NOENT) linux.exit(11); // hi greater, lo smaller
+    if (linux.errno(linux.syscall6(.getppid, 0x1_0000_0000, 0, 0, 0, 0, 0)) != .SUCCESS) linux.exit(12); // equal
+    if (linux.errno(linux.syscall6(.getppid, 0xffff_ffff, 0, 0, 0, 0, 0)) != .SUCCESS) linux.exit(13); // hi smaller, lo greater
+    linux.exit(0);
+}
+
+test "seccomp.buildRules on the kernel: a .u64 order compare decides on the high word first" {
+    try requireSeccompFilter();
+    const prog = try seccomp.buildRules(testing.allocator, &.{
+        .{ .sysno = .getppid, .when = &.{.{ .arg = 0, .op = .gt, .width = .u64, .value = 0x1_0000_0000 }}, .action = .{ .errno = @backingInt(E.NOENT) } },
+    }, .allow);
+    defer testing.allocator.free(prog);
+    g_rules_prog = prog;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childRulesU64Order)).status);
+}
+
+test "seccomp.buildRulesWith: a program of exactly max_program_len (4096) builds, one more rule does not" {
+    const gpa = testing.allocator;
+    // A rule with six `.u32` conditions costs 15 (ld nr, jeq, 6 x (ld, jeq),
+    // ret); an unconditional rule after it 3 (ld nr, jeq, ret), after another
+    // unconditional one 2. Fill with the heavy ones, then pad to the byte.
+    const conds: [6]seccomp.ArgCmp = @splat(.{ .arg = 0, .op = .eq, .width = .u32, .value = 1 });
+    var rules: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read, .when = &conds });
+    var n: usize = 1;
+    var len: usize = 0;
+    while (true) : (n += 1) {
+        const p = try seccomp.buildRulesWith(gpa, rules[0..n], .kill_process, .{});
+        defer gpa.free(p);
+        len = p.len;
+        if (len + 15 + 3 > seccomp.max_program_len) break;
+    }
+    // The padding reaches 3 + 2k: an even remainder drops one heavy rule.
+    if ((seccomp.max_program_len - len) % 2 == 0) {
+        n -= 1;
+        len -= 15;
+    }
+    rules[n] = .{ .sysno = .write };
+    n += 1;
+    len += 3;
+    while (len < seccomp.max_program_len) : (n += 1) {
+        rules[n] = .{ .sysno = .write };
+        len += 2;
+    }
+    const exact = try seccomp.buildRulesWith(gpa, rules[0..n], .kill_process, .{});
+    defer gpa.free(exact);
+    try testing.expectEqual(seccomp.max_program_len, exact.len);
+    rules[n] = .{ .sysno = .write };
+    try testing.expectError(error.ProgramTooLong, seccomp.buildRulesWith(gpa, rules[0 .. n + 1], .kill_process, .{}));
+}
+
+test "seccomp.buildRulesWith: CompatRule validation and the program-length cap under .tree and .i386" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const bad_errno = [_]seccomp.CompatRule{.{ .sysno = .getpid, .action = .{ .errno = 0 } }};
+    try testing.expectError(error.InvalidErrno, seccomp.buildRulesWith(gpa, &.{}, .kill_process, .{ .i386 = &bad_errno }));
+    const bad_arg = [_]seccomp.CompatRule{.{ .sysno = .getpid, .when = &.{.{ .arg = 6, .op = .eq, .width = .u32, .value = 0 }} }};
+    try testing.expectError(error.InvalidRule, seccomp.buildRulesWith(gpa, &.{}, .kill_process, .{ .i386 = &bad_arg }));
+    var many: [seccomp.max_rules + 1]seccomp.CompatRule = @splat(.{ .sysno = .getpid });
+    try testing.expectError(error.TooManyRules, seccomp.buildRulesWith(gpa, &.{}, .kill_process, .{ .i386 = &many }));
+    // 512 rules of six 64-bit `masked_eq` conditions: far past 4096, both layouts, with i386 too.
+    const heavy: [6]seccomp.ArgCmp = @splat(.{ .arg = 1, .op = .masked_eq, .width = .u64, .value = 7, .mask = 7 });
+    const rules: [seccomp.max_rules]seccomp.Rule = @splat(.{ .sysno = .read, .when = &heavy });
+    const rules32: [seccomp.max_rules]seccomp.CompatRule = @splat(.{ .sysno = .getpid, .when = &heavy });
+    for ([_]seccomp.Dispatch{ .linear, .tree }) |d| {
+        try testing.expectError(error.ProgramTooLong, seccomp.buildRulesWith(gpa, &rules, .kill_process, .{ .dispatch = d }));
+        try testing.expectError(error.ProgramTooLong, seccomp.buildRulesWith(gpa, rules[0..1], .kill_process, .{ .dispatch = d, .i386 = &rules32 }));
+    }
 }
 
 // Dark-tests aggregator (CONVENTIONS.md §6 step 3): single-file module, but

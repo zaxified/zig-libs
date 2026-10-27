@@ -447,6 +447,11 @@ fn randomCond(rand: std.Random, arg: u3) seccomp.ArgCmp {
         // Mostly a value inside the mask (the useful shape); sometimes not.
         if (rand.uintLessThan(u8, 4) != 0) c.value &= c.mask;
     }
+    // `.u32` data must fit 32 bits (`error.InvalidRule` otherwise).
+    if (c.width == .u32) {
+        c.value &= 0xffff_ffff;
+        c.mask &= 0xffff_ffff;
+    }
     return c;
 }
 
