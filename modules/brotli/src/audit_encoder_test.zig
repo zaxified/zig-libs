@@ -234,7 +234,36 @@ fn expectPin(what: []const u8, got: [64]u8, want: []const u8) !void {
     }
 }
 
-test "A1 m4: the loop's end at ip == ip_limit after a copy (byte pin)" {
+test "A1 m4b: a copy ending at ip_limit takes no further copy there" {
+    // '#', "VWXYZ" (probed at position 1, so in the table), 120 distinct
+    // bytes U five times, "VWXYZ", 11 more bytes: n = 622, ip_limit = n - 16
+    // = 606. The copy of U (distance 120) ends at 606 exactly; there the real
+    // loop stops and writes the last 16 bytes as literals. `ip > ip_limit`
+    // goes on, finds "VWXYZ" at position 1 and writes one more copy: other
+    // bytes. (U repeats so the block is compressed -- a stored block would
+    // hide the difference.)
+    const gpa = testing.allocator;
+    const l = 120;
+    const reps = 5;
+    var in: [1 + 5 + reps * l + 5 + 11]u8 = undefined;
+    in[0] = '#';
+    @memcpy(in[1..6], "VWXYZ");
+    for (0..reps * l) |i| in[6 + i] = @intCast(0x80 + i % l);
+    @memcpy(in[6 + reps * l ..][0..5], "VWXYZ");
+    for (0..11) |i| in[11 + reps * l + i] = @intCast(0x30 + i);
+    const out = try encoder.compressWith(gpa, &in, .{ .effort = .q0 });
+    defer gpa.free(out);
+    try testing.expect(out.len * 2 < in.len); // compressed, not stored
+    const back = try decoder.decompress(gpa, out, .{});
+    defer gpa.free(back);
+    try testing.expectEqualSlices(u8, &in, back);
+    var sum: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(out, &sum, .{});
+    // Today's bytes (2026-10-27).
+    try expectPin("m4b", hex(sum), "c02e8f71f8d0d2a412085e5362fa79014351e55c08a51adee53c06be6287cfc9");
+}
+
+test "A1 q0 byte pin: periodic inputs ending near ip_limit" {
     // Pins today's `.q0` bytes of eight inputs of 394 bytes (compared as one
     // SHA-256 of the eight streams, each also round-tripped); google/brotli's
     // decoder blessing covers `.q0` through the interop shapes. The input

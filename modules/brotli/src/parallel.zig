@@ -235,6 +235,21 @@ test "parallel: one job is compressWith's bytes" {
     }
 }
 
+test "parallel: an input exactly one job long is compressWith's bytes" {
+    // The boundary of `input.len <= job_size` (mutation run 2026-10-27: no
+    // test had an input of exactly one job).
+    const gpa = testing.allocator;
+    const input = try mixed(gpa, 50_000);
+    defer gpa.free(input);
+    inline for (all_efforts) |e| {
+        const want = try encoder.compressWith(gpa, input, .{ .effort = e });
+        defer gpa.free(want);
+        const got = try compressJobs(gpa, testing.io, input, .{ .effort = e }, input.len, 4);
+        defer gpa.free(got);
+        try testing.expectEqualSlices(u8, want, got);
+    }
+}
+
 test "parallel: jobs of any size round-trip at every level, window, mode" {
     const gpa = testing.allocator;
     const input = try mixed(gpa, 90_000);
