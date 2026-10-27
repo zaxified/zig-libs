@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Performance (fix):** `FastSrc.peek` is `pub` again in effect: `normSel` asks `@hasDecl(@TypeOf(src.*), "peek")`, which since Zig 0.17 sees only `pub` declarations, so the branch-free refill had been dead code since the 0.17 migration (same class as brotli's `tailPtr`, found the same day). No API change.
 - **2026-10-23** — **Fix (performance):** `DecompressReader` refills its buffer on small reads. Zig 0.17's `defaultReadVec` streams straight into the caller's slice once the buffer has been filled to its end, so every later small `readSlice*` re-entered the decoder for that many octets. Regression test with a negative control. No API change.
 
 - **2026-10-20** — Independent review (no HIGH): `compressBound` now holds for raw LZMA1 and `.lzma`

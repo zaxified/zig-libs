@@ -129,7 +129,10 @@ const FastSrc = struct {
     /// The next unread byte; `fast_need` bytes are readable per symbol (the
     /// caller checks before each one).
     p: [*]const u8,
-    inline fn peek(s: *const FastSrc) u8 {
+    // `pub`: `normSel` asks `@hasDecl(@TypeOf(src.*), "peek")`, which since
+    // Zig 0.17 sees only `pub` declarations — without it the branch-free
+    // refill was dead code (found 2026-10-27 beside brotli's `tailPtr`).
+    pub inline fn peek(s: *const FastSrc) u8 {
         return s.p[0];
     }
     inline fn next(s: *FastSrc) error{}!u8 {
