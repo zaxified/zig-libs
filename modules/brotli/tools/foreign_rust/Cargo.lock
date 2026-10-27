@@ -42,6 +42,7 @@ dependencies = [
 name = "foreign_rust"
 version = "0.1.0"
 dependencies = [
+ "alloc-stdlib",
  "brotli",
  "brotli-decompressor",
 ]

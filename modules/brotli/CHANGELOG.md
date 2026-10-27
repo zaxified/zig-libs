@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Maturity:** S1 (lead: `parallel.compress` bytes independent of the worker count; rust-brotli's depend on its thread count) and P1 (ref 0.42–0.91× rust-brotli, fastest 1.16× google/brotli; Go measured, slower). `tools/foreign_rust` gained `multi<N>`. No module change.
 - **2026-10-27** — **Performance:** `.q0` hashes the four positions after a copy from four loads instead of one shifted four ways (LLVM took the shifts apart byte by byte): html −10 % cycles, text −8 %; `c_q0_html` 1.27× → 1.14× google/brotli (padded, from source). Output byte-identical. No API change.
 - **2026-10-27** — **Performance (measurement):** `bench-brotli`'s reference is dropbox/rust-brotli 9.1.1 (`tools/foreign_rust`, pinned `Cargo.lock`); google/brotli is the fastest (owner: two roles, two implementations). Under `-Djcc-safe`: ref 0.42–0.93×, fastest 1.27× (`c_q0_html`). No module change.
 - **2026-10-27** — **Performance (measurement):** `zig build bench-brotli -Djcc-safe` pads both sides against the Intel JCC erratum (needs `LIBBROTLI_DIR` from `tools/c_bench/build_libbrotli.sh`); the foreign side now loads the library it linked (rpath; before, `LIBBROTLI_DIR` changed only the link). No module change.

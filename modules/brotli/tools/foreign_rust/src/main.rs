@@ -76,6 +76,29 @@ fn main() {
     if a.len() != 3 { eprintln!("usage: foreign_rust <work dir> <workload>"); std::process::exit(2); }
     eprintln!("dropbox/rust-brotli 9.1.1");
     let w = a[2].as_str();
+    if let Some(threads) = w.strip_prefix("multi") {
+        // `multi<N> <file>`: compress_multi over N threads, quality 9, lgwin
+        // 22; prints the size and an FNV-1a hash of the stream (the S1 row:
+        // do the bytes depend on N?).
+        let input = std::fs::read(&a[1]).unwrap();
+        let n: usize = threads.parse().expect("threads");
+        let mut params = brotli::enc::BrotliEncoderParams::default();
+        params.quality = 9;
+        params.lgwin = 22;
+        let mut alloc: Vec<_> = (0..n)
+            .map(|_| brotli::enc::threading::SendAlloc::new(StandardAlloc::default(), brotli::enc::UnionHasher::Uninit))
+            .collect();
+        let mut out = vec![0u8; brotli::enc::BrotliEncoderMaxCompressedSizeMulti(input.len(), n)];
+        let mut owned = brotli::enc::threading::Owned::new(alloc_stdlib::heap_alloc::WrapBox::from(input.clone()));
+        let size = brotli::enc::compress_multi(&params, &mut owned, &mut out, &mut alloc[..]).expect("compress_multi");
+        let mut back = vec![0u8; input.len() + 1];
+        let info = brotli_decompressor::brotli_decode(&out[..size], &mut back);
+        if info.decoded_size != input.len() || back[..input.len()] != input[..] { eprintln!("round trip failed"); std::process::exit(1); }
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in &out[..size] { h = (h ^ b as u64).wrapping_mul(0x100000001b3); }
+        println!("rust-brotli threads={n} size={size} fnv={h:016x}");
+        return;
+    }
     let (pay, q) = if let Some(rest) = w.strip_prefix('c') {
         let (qs, p) = rest.split_once('_').expect("workload");
         (p, Some(qs.parse::<u32>().expect("quality")))

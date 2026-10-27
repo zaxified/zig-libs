@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 brotli = { version = "=9.1.1", default-features = false, features = ["std"] }
 # The one-shot decode (`brotli_decode`) is not re-exported by `brotli`.
+# `WrapBox` for compress_multi's input.
+alloc-stdlib = "=0.3.0"
 brotli-decompressor = { version = "=6.2.0", default-features = false, features = ["std"] }
 
 [profile.release]
