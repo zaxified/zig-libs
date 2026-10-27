@@ -47,6 +47,9 @@ const workloads = [_]Workload{
     .{ .name = "hard", .mode = .match, .pattern = "[ -~]*ABCDEFGHIJKLMNOPQRSTUVWXYZ$", .text = .{ .file = "rnd" } },
     .{ .name = "hard1", .mode = .match, .pattern = "ABCD|CDEF|EFGH|GHIJ|IJKL|KLMN|MNOP|OPQR|QRST|STUV|UVWX|WXYZ", .text = .{ .file = "rnd" } },
     .{ .name = "icase", .mode = .match, .pattern = "(?i)abcdefghijklmnopqrstuvwxyz$", .text = .{ .file = "rnd" } },
+    // The same, the text ending in the pattern's last ten letters: the last
+    // byte fits, so the search has to read backwards before it fails.
+    .{ .name = "easy0_tail", .mode = .match, .pattern = "ABCDEFGHIJKLMNOPQRSTUVWXYZ$", .text = .{ .file = "rndz" } },
     // Searches with positions.
     .{ .name = "inv_sub", .mode = .findallsub, .pattern = "INV-([0-9]{4}-[0-9]{4})", .text = .{ .file = "inv" } },
     .{ .name = "inv_all", .mode = .findall, .pattern = "INV-[0-9]{4}-[0-9]{4}", .text = .{ .file = "inv" } },
@@ -213,8 +216,12 @@ pub fn main(init: std.process.Init) !u8 {
     var dir = try cwd.openDir(io, work_dir, .{});
     defer dir.close(io);
 
-    const texts = .{ .rnd = try genRnd(arena), .inv = try genInv(arena), .cz = try genCz(arena) };
+    const rnd = try genRnd(arena);
+    const rndz = try arena.dupe(u8, rnd);
+    @memcpy(rndz[rndz.len - 10 ..], "QRSTUVWXYZ");
+    const texts = .{ .rnd = rnd, .rndz = rndz, .inv = try genInv(arena), .cz = try genCz(arena) };
     try dir.writeFile(io, .{ .sub_path = "rnd.txt", .data = texts.rnd });
+    try dir.writeFile(io, .{ .sub_path = "rndz.txt", .data = texts.rndz });
     try dir.writeFile(io, .{ .sub_path = "inv.txt", .data = texts.inv });
     try dir.writeFile(io, .{ .sub_path = "cz.txt", .data = texts.cz });
 
@@ -284,7 +291,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (workloads) |wl| {
         if (only) |o| if (std.mem.find(u8, wl.name, o) == null) continue;
         const s: []const u8 = switch (wl.text) {
-            .file => |f| if (std.mem.eql(u8, f, "rnd")) texts.rnd else if (std.mem.eql(u8, f, "inv")) texts.inv else texts.cz,
+            .file => |f| if (std.mem.eql(u8, f, "rnd")) texts.rnd else if (std.mem.eql(u8, f, "rndz")) texts.rndz else if (std.mem.eql(u8, f, "inv")) texts.inv else texts.cz,
             .literal => |l| l,
         };
         var re = try regex.Regex.compile(gpa_fast, wl.pattern);

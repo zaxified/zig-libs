@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Faster:** `isMatch` of a pattern every match of which ends at the end of the text (`…$`, `…\z`, not also `^…`) reads the text backwards from its end with the lazy DFA, after a one-byte check that the text's last byte can end a match. Go's `regexp` benchmark shapes over 1 MiB (`easy0`, `easy1`, `medium`, `hard`, `icase`): 60 µs–3.2 ms → 4 ns; a text whose last ten bytes fit: 1.2 µs. Same answers (tested against the NFA and `Matcher.find`, fuzzed with a quarter of the patterns end-anchored).
+
 - **2026-10-27** — **NO CONSUMER-VISIBLE CHANGE:** `bench-regex` also times Rust's `regex` 1.13.1 (`tools/rust_regex`, pinned `Cargo.lock`, built `--offline`) as the fastest candidate in the field; its result counts must agree too. Card: ref 0.03–0.72× Go, fastest 0.04–152258.86× Rust — end-anchored searches (`…$`) are the gap (Rust runs a reverse DFA from the end of the text).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.

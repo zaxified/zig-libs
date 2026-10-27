@@ -57,7 +57,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -192,6 +192,18 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         g.put(body[0..n]);
         g.put(")|q{130}");
     }
+    // A share anchored at the end: `isMatch` reads those backwards from the
+    // end of the text (`runRevDfa`), the grammar alone rarely gets there.
+    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.len != 0) {
+        var body: [256]u8 = undefined;
+        const n = g.len;
+        @memcpy(body[0..n], g.buf[0..n]);
+        g.len = 0;
+        g.meta(if (posix) "(" else "(?:");
+        g.put(body[0..n]);
+        g.asserts = true;
+        g.put(")$");
+    }
     // A share of the patterns is damaged byte-wise: the parser's error paths.
     if (src.valueRangeAtMost(u8, 0, 4) == 0 and g.len != 0) {
         g.literal_only = false;
@@ -237,6 +249,10 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     const any = re.isMatch(input);
     const found = m.find(input, 0);
     if (any != (found != null)) return error.IsMatchDisagreesWithFind;
+    if (re.prefilter.end_anchored and re.insts.len <= dfa_max_insts) {
+        hit(.end_anchored);
+        if (any) hit(.end_anchored_match);
+    }
     if (re.fullMatch(input)) {
         hit(.full);
         if (!any) return error.FullMatchWithoutMatch;

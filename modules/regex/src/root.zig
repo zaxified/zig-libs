@@ -248,6 +248,14 @@ pub const Regex = struct {
     }
 
     fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+        if (!full and re.prefilter.end_anchored) {
+            if (re.prefilter.last) |set| {
+                if (input.len == 0) return false;
+                const c = input[input.len - 1];
+                if (set[c >> 6] & (@as(u64, 1) << @truncate(c)) == 0) return false;
+            }
+            if (re.runRevDfa(input)) |found| return found;
+        }
         if (re.runDfa(input, full)) |found| return found;
         var t: SliceText = .{ .input = input };
         return re.runSetOn(&t, full);
@@ -306,6 +314,92 @@ pub const Regex = struct {
             pos += here.w;
             s = ns;
         }
+    }
+
+    /// `isMatch` for a pattern every match of which ends at the end of the
+    /// text (`Prefilter.end_anchored`): a lazy DFA run backwards from the end,
+    /// so a text whose tail cannot end a match is rejected without reading
+    /// the rest (RE2's and Rust's reverse anchored search). A state is the
+    /// set of consuming instructions from which the text after the position
+    /// can be read to the match, and what the code point after the position
+    /// is, as far as an assertion can tell. The search succeeds at the first
+    /// position (going back) where the start reaches a member of that set.
+    /// Null for a program too large for the DFA.
+    noinline fn runRevDfa(re: *const Regex, input: []const u8) ?bool {
+        if (re.insts.len > Dfa.max_insts) return null;
+        var d: RevDfa = undefined;
+        d.n = 0;
+        var end: Dfa.Set = .{ 0, 0 };
+        for (re.insts, 0..) |inst, pc| if (inst == .match) {
+            end[pc >> 6] |= @as(u64, 1) << @truncate(pc);
+        };
+        var s = d.add(end, .start);
+        var pos = input.len;
+        while (true) {
+            if (re.revAccepts(&d, s, runeBefore(input, pos))) return true;
+            if (pos == 0) return false;
+            const here = decodeBefore(input, pos);
+            const c = input[pos - 1];
+            const ascii = here.w == 1 and c < 0x80;
+            if (ascii) {
+                const t = d.trans[s][c];
+                if (t != 0) {
+                    if (t == 1) return false; // no set member left
+                    s = t - 2;
+                    pos -= 1;
+                    continue;
+                }
+            }
+            const prev = re.revStep(d.keys[s], d.ctxs[s], here.cp.?);
+            var cache = ascii;
+            if (prev[0] == 0 and prev[1] == 0) {
+                if (cache) d.trans[s][c] = 1;
+                return false;
+            }
+            const ctx: Dfa.Ctx = .of(here.cp);
+            const ps = d.find(prev, ctx) orelse blk: {
+                if (d.n == RevDfa.max_states) {
+                    // Full: start over; the current state is not needed again.
+                    d.n = 0;
+                    cache = false;
+                }
+                break :blk d.add(prev, ctx);
+            };
+            if (cache) d.trans[s][c] = ps + 2;
+            pos -= here.w;
+            s = ps;
+        }
+    }
+
+    /// One backward step from set `k` (`ctx`: the code point after the
+    /// position) over `cp`, the code point before it: the consuming
+    /// instructions that take `cp` to a state reaching a member of `k`.
+    fn revStep(re: *const Regex, k: Dfa.Set, ctx: Dfa.Ctx, cp: u21) Dfa.Set {
+        var out: Dfa.Set = .{ 0, 0 };
+        for (re.insts, 0..) |_, i| {
+            const pc: u16 = @intCast(i);
+            if (!re.consumes(pc, cp)) continue;
+            var one: Dfa.Set = .{ 0, 0 };
+            one[(pc + 1) >> 6] |= @as(u64, 1) << @truncate(pc + 1);
+            var matched: bool = undefined;
+            const cl = re.dfaClosure(one, cp, ctx.rep(), &matched);
+            if (cl[0] & k[0] != 0 or cl[1] & k[1] != 0) out[pc >> 6] |= @as(u64, 1) << @truncate(pc);
+        }
+        return out;
+    }
+
+    /// Does the start, at a position after `prev`, reach a member of state
+    /// `s`'s set? Cached per state and class of `prev`.
+    fn revAccepts(re: *const Regex, d: *RevDfa, s: u8, prev: ?u21) bool {
+        const pc = Dfa.Ctx.of(prev);
+        const slot = &d.accepts[s][@backingInt(pc)];
+        if (slot.* == .unknown) {
+            var matched: bool = undefined;
+            const cl = re.dfaClosure(.{ 1, 0 }, pc.rep(), d.ctxs[s].rep(), &matched);
+            const k = d.keys[s];
+            slot.* = if (cl[0] & k[0] != 0 or cl[1] & k[1] != 0) .yes else .no;
+        }
+        return slot.* == .yes;
     }
 
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
@@ -613,6 +707,40 @@ const Dfa = struct {
     }
 };
 
+/// `Regex.runRevDfa`'s scratch, on the stack (~4.7 KiB): `Dfa`'s table, a
+/// state's context being the code point AFTER its position, plus whether the
+/// start reaches the state's set, per class of the code point before.
+const RevDfa = struct {
+    const max_states = Dfa.max_states;
+    const Accept = enum(u8) { unknown, no, yes };
+
+    keys: [max_states]Dfa.Set,
+    ctxs: [max_states]Dfa.Ctx,
+    accepts: [max_states][4]Accept,
+    n: u8,
+    /// `trans[s][c]`: 0 not worked out yet, 1 the set is empty, otherwise
+    /// the state before `c` + 2.
+    trans: [max_states][128]u8,
+
+    fn find(d: *const RevDfa, k: Dfa.Set, ctx: Dfa.Ctx) ?u8 {
+        for (d.keys[0..d.n], d.ctxs[0..d.n], 0..) |key, c, i| {
+            if (key[0] == k[0] and key[1] == k[1] and c == ctx) return @intCast(i);
+        }
+        return null;
+    }
+
+    /// Add a state (the table has room).
+    fn add(d: *RevDfa, k: Dfa.Set, ctx: Dfa.Ctx) u8 {
+        const i = d.n;
+        d.keys[i] = k;
+        d.ctxs[i] = ctx;
+        d.accepts[i] = @splat(.unknown);
+        @memset(&d.trans[i], 0);
+        d.n += 1;
+        return i;
+    }
+};
+
 /// Table capacities `Regex.compile` tries first, on the stack: every pattern
 /// short of a large counted repetition or a big case-folded class fits.
 const small_capacity: syntax.Capacity = .{ .insts = 256, .ranges = 256, .nodes = 256 };
@@ -623,6 +751,13 @@ const small_capacity: syntax.Capacity = .{ .insts = 256, .ranges = 256, .nodes =
 pub const Prefilter = struct {
     /// Every match starts at the start of the text (each path passes `\A`).
     anchored: bool = false,
+    /// Every match ends at the end of the text (each path to the match
+    /// passes `\z`), and not every one starts at its start: `isMatch` reads
+    /// the text backwards from its end (`Regex.runRevDfa`).
+    end_anchored: bool = false,
+    /// With `end_anchored`: the last byte of every match is in this set (as
+    /// `first`); null when a match can be empty, or end with any byte.
+    last: ?[4]u64 = null,
     /// The first byte of every match is in this set (bit b of word b/64);
     /// null when a match can be empty, or start with any byte.
     first: ?[4]u64 = null,
@@ -731,6 +866,8 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
         }
     }
     pf.anchored = !unanchored;
+    pf.end_anchored = !pf.anchored and endAnchored(insts);
+    if (pf.end_anchored) pf.last = lastBytes(insts, ranges);
     pf.lit_len = @intCast(replace.prefixInto(insts, ranges, &pf.lit));
     if (!any_first) {
         pf.first = set;
@@ -743,6 +880,112 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
         }
     }
     return pf;
+}
+
+/// Does every path to the match pass a `\z`? Follows the empty transitions
+/// from the start and from after every consuming instruction, with `\z` as a
+/// wall and every other assertion passable.
+fn endAnchored(insts: []const Inst) bool {
+    var seen: std.StaticBitSet(max_insts) = .empty;
+    // The start and every consuming instruction, then two per instruction walked.
+    var stack: [3 * max_insts + 1]u16 = undefined;
+    var sp: usize = 1;
+    stack[0] = 0;
+    for (insts, 0..) |inst, pc| switch (inst) {
+        .rune, .any, .any_not_nl => {
+            stack[sp] = @intCast(pc + 1);
+            sp += 1;
+        },
+        else => {},
+    };
+    while (sp != 0) {
+        sp -= 1;
+        const pc = stack[sp];
+        if (seen.isSet(pc)) continue;
+        seen.set(pc);
+        switch (insts[pc]) {
+            .jmp => |t| {
+                stack[sp] = t;
+                sp += 1;
+            },
+            .split => |sx| {
+                stack[sp] = sx.y;
+                stack[sp + 1] = sx.x;
+                sp += 2;
+            },
+            .save => {
+                stack[sp] = pc + 1;
+                sp += 1;
+            },
+            .assert => |a| if (a != .end_text) {
+                stack[sp] = pc + 1;
+                sp += 1;
+            },
+            .match => return false,
+            .rune, .any, .any_not_nl => {},
+        }
+    }
+    return true;
+}
+
+/// Does the match follow `pc0` without consuming input (every assertion
+/// passable)?
+fn reachesMatch(insts: []const Inst, pc0: u16) bool {
+    var seen: std.StaticBitSet(max_insts) = .empty;
+    var stack: [2 * max_insts]u16 = undefined;
+    var sp: usize = 1;
+    stack[0] = pc0;
+    while (sp != 0) {
+        sp -= 1;
+        const pc = stack[sp];
+        if (seen.isSet(pc)) continue;
+        seen.set(pc);
+        switch (insts[pc]) {
+            .jmp => |t| {
+                stack[sp] = t;
+                sp += 1;
+            },
+            .split => |sx| {
+                stack[sp] = sx.y;
+                stack[sp + 1] = sx.x;
+                sp += 2;
+            },
+            .save, .assert => {
+                stack[sp] = pc + 1;
+                sp += 1;
+            },
+            .match => return true,
+            .rune, .any, .any_not_nl => {},
+        }
+    }
+    return false;
+}
+
+/// The bytes a match can end with: the last byte of the UTF-8 encoding of
+/// every code point a consuming instruction followed by the match takes —
+/// a continuation byte for any past ASCII, and any byte from 0x80 when
+/// U+FFFD is among them (an invalid byte reads as it). Null when a match can
+/// be empty or end with any byte.
+fn lastBytes(insts: []const Inst, ranges: []const Range) ?[4]u64 {
+    if (reachesMatch(insts, 0)) return null;
+    var set: [4]u64 = .{ 0, 0, 0, 0 };
+    for (insts, 0..) |inst, pc| {
+        switch (inst) {
+            .rune, .any, .any_not_nl => {},
+            else => continue,
+        }
+        if (!reachesMatch(insts, @intCast(pc + 1))) continue;
+        switch (inst) {
+            .rune => |r| for (ranges[r.start..][0..r.len]) |rg| {
+                var c: u32 = rg.lo;
+                while (c <= @min(rg.hi, 0x7f)) : (c += 1) set[c >> 6] |= @as(u64, 1) << @truncate(c);
+                if (rg.hi >= 0x80) set[2] = ~@as(u64, 0); // 0x80..0xbf
+                if (rg.lo <= 0xfffd and 0xfffd <= rg.hi) set[3] = ~@as(u64, 0);
+            },
+            else => return null,
+        }
+    }
+    return set;
 }
 
 /// Add the first bytes of the UTF-8 encodings of `r` to `set`.
@@ -1321,6 +1564,20 @@ fn decode(input: []const u8, i: usize) Decoded {
     return .{ .cp = cp, .w = len };
 }
 
+/// The code point that ends at `i` (`i > 0`), as `decode` reads the text
+/// from the start: a valid sequence is one code point wherever it stands (a
+/// lead byte is never inside another), anything else is U+FFFD, one byte.
+fn decodeBefore(input: []const u8, i: usize) Decoded {
+    const c = input[i - 1];
+    if (c < 0x80) return .{ .cp = c, .w = 1 };
+    var back: usize = 2;
+    while (back <= @min(4, i)) : (back += 1) {
+        const d = decode(input[0..i], i - back);
+        if (d.w == back) return d;
+    }
+    return .{ .cp = 0xfffd, .w = 1 };
+}
+
 /// What the assertions need of the text just before `i`: null at the start,
 /// the byte when it is ASCII, and U+FFFD for any non-ASCII code point — the
 /// assertions look only at ASCII (`\n` for `(?m)^`, ASCII word characters
@@ -1673,6 +1930,100 @@ test "Pike VM: a prefilter skip starts with a fresh closure" {
     const s2 = pm.find(in, 0).?;
     try testing.expectEqual(@as(usize, 4), s2.start);
     try testing.expectEqual(@as(usize, 6), s2.end);
+}
+
+test "end-anchored patterns: which ones, and the backward DFA agrees with the NFA" {
+    const gpa = testing.allocator;
+    // Which programs read backwards: every path to the match through `\z`,
+    // and not anchored at the start too.
+    for ([_]struct { []const u8, bool }{
+        .{ "a$", true },     .{ "a\\z", true },     .{ "(?:a|bc)+$", true }, .{ "(a$)", true },
+        .{ "a$|b$", true },  .{ "a*$", true },      .{ "a$b", false },       .{ "a$|b", false },
+        .{ "^a$", false },   .{ "\\Aa$|b$", true }, .{ "(?m)a$", false },    .{ "a", false },
+        .{ "a\\zb", false }, .{ "(?:a$)?", false }, .{ "\\bx\\b$", true },
+    }) |case| {
+        var re = try Regex.compile(gpa, case[0]);
+        defer re.deinit(gpa);
+        errdefer std.debug.print("/{s}/\n", .{case[0]});
+        try testing.expectEqual(case[1], re.prefilter.end_anchored);
+    }
+    // The last-byte set: none when a match can be empty or end anywhere.
+    for ([_]struct { []const u8, ?[4]u64 }{
+        .{ "ab$", .{ 0, @as(u64, 1) << ('b' - 64), 0, 0 } },
+        .{ "(?i)z$", .{ 0, (@as(u64, 1) << ('z' - 64)) | (@as(u64, 1) << ('Z' - 64)), 0, 0 } },
+        .{ "č$", .{ 0, 0, ~@as(u64, 0), 0 } },
+        .{ "[^a]$", .{ ~@as(u64, 0), ~(@as(u64, 1) << ('a' - 64)), ~@as(u64, 0), ~@as(u64, 0) } },
+        .{ "a*$", null },
+        .{ "a.$", null },
+        .{ "\\x{FFFD}$", .{ 0, 0, ~@as(u64, 0), ~@as(u64, 0) } },
+    }) |case| {
+        var re = try Regex.compile(gpa, case[0]);
+        defer re.deinit(gpa);
+        errdefer std.debug.print("/{s}/\n", .{case[0]});
+        try testing.expectEqual(case[1], re.prefilter.last);
+    }
+
+    var prng: std.Random.DefaultPrng = .init(0x726576);
+    const rng = prng.random();
+    // `[ab]{5}a(a|b)*$` needs 2^6 states backwards, twice the table. The
+    // pieces include a truncated `€`, a lone continuation and a lone lead
+    // byte: the backward decoder must cut the text as the forward one does.
+    const patterns = [_][]const u8{
+        "[ab]{5}a(?:a|b)*$", "ab$",             "(?:a|b)*$",    "\\ba[ab]*\\b$",
+        "\\B[ab]č$",
+        "(?i)[áa]b$",
+        "[^ab\\n]a{2}$",
+        "(?:a|€|č)+$",
+        "\\pL$",             "(?:\\n|^)b$",     "(?m)^a[ab]*$", ".$",
+        "(?s).{3}$",         "a$|b$",           "\\Aab|ba$",    "\\x{FFFD}$",
+        "[^a]$",             "(?:ab|a)(?:b)?$", "a$b",          "\\b$",
+    };
+    const pieces = [_][]const u8{ "a", "a", "b", "b", "\n", "č", "€", "\xe2\x82", "\x82", "\xc3", " ", "Á", "\xff" };
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        try testing.expect(re.insts.len <= Dfa.max_insts);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        for (0..400) |round| {
+            var text: [600]u8 = undefined;
+            var len: usize = 0;
+            const n = rng.uintLessThan(usize, if (round < 200) 16 else 400);
+            while (len < n) {
+                const piece = pieces[rng.uintLessThan(usize, pieces.len)];
+                @memcpy(text[len..][0..piece.len], piece);
+                len += piece.len;
+            }
+            const in = text[0..len];
+            var r: std.Io.Reader = .fixed(in);
+            const nfa = try re.isMatchReader(&r);
+            errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(in) });
+            try testing.expectEqual(nfa, m.find(in, 0) != null);
+            try testing.expectEqual(nfa, re.isMatch(in));
+            if (re.prefilter.end_anchored) try testing.expectEqual(nfa, re.runRevDfa(in).?);
+        }
+    }
+    // The backward decoder cuts every text as the forward one does.
+    for (0..2000) |_| {
+        var text: [40]u8 = undefined;
+        for (&text) |*c| c.* = ([_]u8{ 'a', 0x82, 0xac, 0xe2, 0xc3, 0xa1, 0xf0, 0x9f, 0x98, 0x80, 0xff, 0xed, 0xa0 })[rng.uintLessThan(u8, 13)];
+        var cuts: [41]usize = undefined;
+        var nc: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += decode(&text, i).w) {
+            cuts[nc] = i;
+            nc += 1;
+        }
+        var e: usize = text.len;
+        while (e > 0) {
+            const d = decodeBefore(&text, e);
+            e -= d.w;
+            nc -= 1;
+            try testing.expectEqual(cuts[nc], e);
+            try testing.expectEqual(decode(&text, e).cp, d.cp);
+        }
+        try testing.expectEqual(0, nc);
+    }
 }
 
 test "the lazy DFA agrees with the NFA: more states than its table, assertions, non-ASCII" {

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz 2026-10-07 (200,000 runs clean x2 (REGEX_FUZZ)) · ct n/a — regex engine (keyword review, 2026-10-07)
 
-**Performance:** ref 0.03–0.72× Go regexp go1.26 · fastest 0.04–152258.86× Rust regex 1.13.1 (measured 2026-10-27)
+**Performance:** ref 0.00–0.84× Go regexp go1.26 · fastest 0.04–35.63× Rust regex 1.13.1 (measured 2026-10-27)
 
 **Known defects:** none recorded
 
@@ -137,6 +137,16 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   table is emptied and refilled (each step then costs what an NFA step does — still linear).
   The state holding only the start uses the prefilter's skip. Larger programs and the reader
   front end run the NFA set simulation (`runSetOn`).
+- **Backwards from the end** (`isMatch`, 2026-10-27): when every path to the match passes `\z`
+  and not every one starts with `\A` (`Prefilter.end_anchored`), every match ends at the end of
+  the text, so the lazy DFA runs from there towards the start (RE2's and Rust's reverse anchored
+  search). A state is the set of consuming instructions from which the rest of the text reads to
+  the match, plus the class of the code point after the position; it succeeds where the start's
+  closure (with the code point before known) meets that set. The text is cut into code points
+  backwards exactly as forwards (a valid sequence wherever it stands, else one byte of U+FFFD —
+  a lead byte is never inside another sequence; tested against the forward cut). Before it, the
+  last byte of the text must be one a match can end with (`Prefilter.last`; none when a match can
+  be empty or end with any byte): a text whose tail cannot end a match costs one lookup.
 - **The backtracker** (leftmost-first only): `Matcher` searches depth-first with one visited bit
   per (position, instruction), so every state is explored once — linear, like the VM — and
   carries one set of captures instead of a copy per thread (short-string submatches 4–11× faster
@@ -259,6 +269,14 @@ matches where `std.mem.indexOf` does), driver `REGEX_FUZZ`.
 
 ## Backlog / deferred
 
+- **The backward search's per-call cost** *(2026-10-27, bench `easy0_tail` 1.2 µs vs Rust 38 ns)* —
+  when the last byte fits, each new state costs a closure per consuming instruction (~100 ns), and
+  the table starts empty on every call (no allocator, no cache between calls). Rust compares the
+  literal suffix every match ends with first; the same here (`literalPrefix` mirrored, or a
+  per-position byte-pair sequence for `(?i)`) would make `…LITERAL$` constant time again.
+- **A prefilter for literal alternations** *(2026-10-27, bench `hard1` 33–37× Rust)* — Rust's
+  Teddy (SIMD over the first bytes of every alternative) / Aho-Corasick; here the first-byte set
+  only.
 - **Intel JCC erratum in the prefilter scan** *(2026-10-19, `~/CML/zig-017/jcc/REPORT.md` Q4)* — `Prefilter.next`'s `cmp;jne` back-edge (31–40 % of `isMatch` samples) and a loop in `runDfa` cross a 32-byte boundary in the current layout: mitigated build 0.825–0.856× the cycles (mite 492–537 M → 11–37 M uops). Layout luck, moves with any edit. Fix (user-approved 2026-10-19): the scan loop in inline asm behind `.p2align 5`, or at least `asm volatile(".p2align 5")` as the FIRST statement of the loop body (never before the loop); re-check with `jcc-scan.py` after each compiler bump.
 - **A DFA for searches with positions** *(survey 2026-10-07; the `isMatch` DFA done 2026-10-07
   night)* — RE2's and Rust's forward + reverse DFA to find a match's span before the
