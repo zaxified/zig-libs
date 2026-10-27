@@ -38,6 +38,20 @@
 //! for context: a ratio of totals close to 1 can hide a large ratio of the
 //! filter's own cost.
 //!
+//! What the card GRADES per syscall (owner 2026-10-27) is not those wall-time
+//! rows -- the filter is ~4 ns of a ~550 ns syscall and the rows swing by up to
+//! 16 % between runs -- but the BPF instructions the kernel executes: every
+//! program's cost for each allowed syscall (mean, worst) and for a denied one,
+//! counted by `cbpf.zig` (the oracle's interpreter). Programs: ours
+//! (`buildDefault`, and `buildRulesWith` `.tree`), libseccomp's two layouts
+//! (exported by the C side), and the other builders in the field,
+//! go-seccomp-bpf v1.6.0 and seccompiler 0.5.0 (`tools/foreign_steps/`, built
+//! with the host's `go` / `cargo` when present -- their sources were read
+//! before the first build, 2026-10-27). `ref` = ours `buildDefault` against
+//! libseccomp's default layout, `fastest` = ours at its best layout against
+//! the cheapest program measured, each the worst of the three ratios. The
+//! `build` row (filter compile time) keeps its place in the `ref` range.
+//!
 //! Method (`testkit.bench`, with one addition for the `sys_` rows
 //! -- `ours_foreign`): each side doubles its batch until it takes over 100 ms
 //! and keeps the best of five; per workload the sides alternate for
@@ -50,6 +64,7 @@ const bench = @import("testkit").bench;
 const Work = bench.Work(Op);
 const builtin = @import("builtin");
 const sandbox = @import("sandbox");
+const cbpf = @import("cbpf.zig");
 
 const bench_name = "bench-sandbox";
 const work_dir = ".zig-cache/bench-sandbox";
@@ -107,6 +122,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     }
     try w.print("{s}ours: {d} instructions, {d} syscalls\n", .{ info.stdout, prog.len, list.len });
+    var names: std.Io.Writer.Allocating = .init(arena);
+    for (list) |sys| try names.writer.print("{t}\n", .{sys});
+    try dir.writeFile(io, .{ .sub_path = "names.txt", .data = names.written() });
+    const steps = try stepsTable(arena, io, dir, abs, w);
     // Unfiltered baseline for context (not part of any ratio).
     for (probes) |p| {
         var banner: []const u8 = undefined;
@@ -130,8 +149,107 @@ pub fn main(init: std.process.Init) !u8 {
 
     const s = try bench.drive(io, arena, .{ .name = bench_name, .exes = &.{exe}, .abs = abs, .filters = filters, .rounds = rounds }, &ctx, once, ws.items, w);
     try w.print("reference: {s}\nworst ours/libseccomp = {d:.3} (best {d:.3}); worst vs the faster of the two layouts = {d:.3}\n", .{ std.mem.trimEnd(u8, s.banner, "\n"), s.worst_ref, s.best_ref, s.worst_fast orelse 0 });
+    try w.print("the sys_ rows are context, not graded: the syscall itself dominates them (see the unfiltered lines)\n", .{});
     if (filters.len == 0)
-        try w.print("card: **Performance:** ref {d:.2}–{d:.2}× libseccomp <version> (default layout) · fastest ? (measured <today>)\n", .{ s.best_ref, s.worst_ref });
+        try w.print("card: **Performance:** ref {d:.3}–{d:.2}× libseccomp <version> (filter build; BPF instructions per syscall, default layouts) · fastest {d:.2}× {s} (BPF instructions per syscall) (measured <today>)\n", .{ s.best_ref, @max(steps.ref, s.best_ref), steps.fastest, steps.fastest_name });
     try w.flush();
     return 0;
+}
+
+// ── the graded per-syscall cost: BPF instructions executed ─────────────────
+
+const Cost = struct {
+    mean: f64,
+    worst: f64,
+    denied: f64,
+
+    /// The worst of the three ratios a/b.
+    fn ratio(a: Cost, b: Cost) f64 {
+        return @max(a.mean / b.mean, @max(a.worst / b.worst, a.denied / b.denied));
+    }
+};
+
+/// Instructions `prog` runs for each syscall of the list (all must be
+/// allowed) and for one denied number past them all.
+fn cost(prog: []const cbpf.Insn) !Cost {
+    const list = sandbox.seccomp.default_allowlist;
+    var sum: usize = 0;
+    var worst: usize = 0;
+    for (list) |sys| {
+        var n: usize = 0;
+        const d: cbpf.Data = .{ .nr = @intCast(@backingInt(sys)), .arch = cbpf.audit_arch_x86_64, .args = @splat(0) };
+        if (try cbpf.runCounting(prog, d, &n) != 0x7fff_0000) return error.NotAllowed;
+        sum += n;
+        worst = @max(worst, n);
+    }
+    var n: usize = 0;
+    const den: cbpf.Data = .{ .nr = 1023, .arch = cbpf.audit_arch_x86_64, .args = @splat(0) };
+    if (try cbpf.runCounting(prog, den, &n) == 0x7fff_0000) return error.DeniedAllowed;
+    return .{ .mean = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(list.len)), .worst = @floatFromInt(worst), .denied = @floatFromInt(n) };
+}
+
+const Steps = struct { ref: f64, fastest: f64, fastest_name: []const u8 };
+
+/// Builds the Go and Rust builders' programs when their toolchains are here
+/// (`tools/foreign_steps/`; a missing toolchain drops that row, said so),
+/// counts every program's cost per syscall and prints the table. `ref`: ours
+/// (`buildDefault`) against libseccomp's default layout; `fastest`: ours at
+/// its best layout against the cheapest program in the field.
+fn stepsTable(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, abs: []const u8, w: *std.Io.Writer) !Steps {
+    const Row = struct { name: []const u8, cost: Cost, len: usize, ours: bool };
+    var rows: std.ArrayList(Row) = .empty;
+    const list = sandbox.seccomp.default_allowlist;
+    var rules: std.ArrayList(sandbox.seccomp.Rule) = .empty;
+    for (list) |sys| try rules.append(arena, .{ .sysno = sys });
+    const ours_default = try sandbox.seccomp.buildDefault(arena, .kill_process);
+    const ours_tree = try sandbox.seccomp.buildRulesWith(arena, rules.items, .kill_process, .{ .dispatch = .tree });
+    try rows.append(arena, .{ .name = "ours buildDefault", .cost = try cost(ours_default), .len = ours_default.len, .ours = true });
+    try rows.append(arena, .{ .name = "ours rules .tree", .cost = try cost(ours_tree), .len = ours_tree.len, .ours = true });
+    for ([_][]const u8{ "lib_default.bpf", "lib_tree.bpf" }, [_][]const u8{ "libseccomp default", "libseccomp optimize 2" }) |file, name| {
+        const raw = try dir.readFileAlloc(io, file, arena, .limited(1 << 20));
+        const p = try cbpf.parseProgram(arena, raw);
+        try rows.append(arena, .{ .name = name, .cost = try cost(p), .len = p.len, .ours = false });
+    }
+    const Foreign = struct { name: []const u8, build: []const []const u8, run: []const u8, input: []const u8 };
+    const go_exe = try std.fmt.allocPrint(arena, "{s}/go_steps", .{abs});
+    const rs_dir = try std.fmt.allocPrint(arena, "{s}/cargo", .{abs});
+    const rs_exe = try std.fmt.allocPrint(arena, "{s}/release/foreign_steps", .{rs_dir});
+    const foreign = [_]Foreign{
+        .{ .name = "go-seccomp-bpf v1.6.0", .build = &.{ "env", "GOTOOLCHAIN=local", "go", "-C", "modules/sandbox/tools/foreign_steps/go", "build", "-o", go_exe, "." }, .run = go_exe, .input = "names.txt" },
+        .{ .name = "seccompiler 0.5.0", .build = &.{ "cargo", "build", "--quiet", "--release", "--locked", "--manifest-path", "modules/sandbox/tools/foreign_steps/rust/Cargo.toml", "--target-dir", rs_dir }, .run = rs_exe, .input = "allow.txt" },
+    };
+    for (foreign) |f| {
+        const b = std.process.run(arena, io, .{ .argv = f.build }) catch |e| {
+            try w.print("steps: {s} not measured (build: {t})\n", .{ f.name, e });
+            continue;
+        };
+        if (b.term != .exited or b.term.exited != 0) {
+            try w.print("steps: {s} not measured (build failed)\n{s}\n", .{ f.name, b.stderr });
+            continue;
+        }
+        const out_name = try std.fmt.allocPrint(arena, "{s}.bpf", .{f.name[0..2]});
+        const in_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ abs, f.input });
+        const out_path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ abs, out_name });
+        const r = try std.process.run(arena, io, .{ .argv = &.{ f.run, in_path, out_path } });
+        if (r.term != .exited or r.term.exited != 0) {
+            try w.print("steps: {s} not measured (run failed)\n{s}\n", .{ f.name, r.stderr });
+            continue;
+        }
+        const p = try cbpf.parseProgram(arena, try dir.readFileAlloc(io, out_name, arena, .limited(1 << 20)));
+        try rows.append(arena, .{ .name = f.name, .cost = try cost(p), .len = p.len, .ours = false });
+    }
+    try w.print("BPF instructions per syscall (the default allow-list, {d} syscalls; a classic-BPF interpreter with the kernel checker's rules):\n", .{list.len});
+    try w.print("  {s:<24} {s:>6} {s:>8} {s:>6} {s:>7}\n", .{ "program", "length", "allowed", "worst", "denied" });
+    for (rows.items) |r| try w.print("  {s:<24} {d:>6} {d:>8.1} {d:>6.0} {d:>7.0}\n", .{ r.name, r.len, r.cost.mean, r.cost.worst, r.cost.denied });
+    var best_ours: ?Row = null;
+    var best_field: ?Row = null;
+    for (rows.items) |r| {
+        const slot = if (r.ours) &best_ours else &best_field;
+        if (slot.* == null or r.cost.mean < slot.*.?.cost.mean) slot.* = r;
+    }
+    const ref = Cost.ratio(rows.items[0].cost, rows.items[2].cost);
+    const fastest = Cost.ratio(best_ours.?.cost, best_field.?.cost);
+    try w.print("steps: ours buildDefault / libseccomp default = {d:.3}; {s} / fastest ({s}) = {d:.3} (worst of allowed mean, worst, denied)\n", .{ ref, best_ours.?.name, best_field.?.name, fastest });
+    try w.flush();
+    return .{ .ref = ref, .fastest = fastest, .fastest_name = best_field.?.name };
 }

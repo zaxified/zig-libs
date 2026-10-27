@@ -16,7 +16,9 @@
 //                    (read of /dev/null, epoll_wait with timeout 0, futex
 //                    wake, gettid) -- user and kernel time, wall clock:
 //                    seccomp runs in the kernel. @none: no filter (baseline).
-//   info             prints the program length of each libseccomp variant.
+//   info             prints the program length of each libseccomp variant and
+//                    writes both programs (lib_default.bpf, lib_tree.bpf) for the
+//                    Zig side to count the instructions a syscall costs in each.
 // Prints one line: name, ns/op, user-mode cycles/op (0: not counted for the
 // sys_ rows), count. A filter is irreversible, so each sys_ run is its own
 // process; everything it needs afterwards (write, exit_group, clock_gettime,
@@ -137,12 +139,13 @@ static size_t build_op(void) {
     return (size_t)nr_count;
 }
 
-static size_t prog_len(int optimize) {
+static size_t export_prog(int optimize, const char *name) {
     scmp_filter_ctx c = make_ctx(optimize);
     static char buf[1 << 16];
     size_t len = sizeof buf;
-    seccomp_export_bpf_mem(c, buf, &len);
+    if (seccomp_export_bpf_mem(c, buf, &len) != 0) { fprintf(stderr, "export_bpf_mem failed\n"); exit(1); }
     seccomp_release(c);
+    spit(name, buf, len);
     return len / sizeof(struct sock_filter);
 }
 
@@ -166,7 +169,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "libseccomp %d.%d.%d\n", SCMP_VER_MAJOR, SCMP_VER_MINOR, SCMP_VER_MICRO);
     load_allow();
     if (strcmp(w, "info") == 0) {
-        printf("libseccomp program length: default %zu, optimize=2 (binary tree) %zu, %d syscalls\n", prog_len(0), prog_len(2), nr_count);
+        printf("libseccomp program length: default %zu, optimize=2 (binary tree) %zu, %d syscalls\n", export_prog(0, "lib_default.bpf"), export_prog(2, "lib_tree.bpf"), nr_count);
         return 0;
     }
     if (strcmp(w, "build") == 0) { cycles_open(); bench(w, build_op); return 0; }
