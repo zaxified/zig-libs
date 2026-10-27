@@ -1242,8 +1242,9 @@ pub const seccomp = struct {
         op: Op,
         width: Width,
         value: u64,
-        /// For `masked_eq`: the condition is `(arg & mask) == value`. Ignored
-        /// by the other operators.
+        /// For `masked_eq`: the condition is `(arg & mask) == (value & mask)`
+        /// -- bits of `value` outside `mask` are ignored, as libseccomp's
+        /// `SCMP_CMP_MASKED_EQ` ignores them. Ignored by the other operators.
         mask: u64 = std.math.maxInt(u64),
     };
 
@@ -2922,6 +2923,37 @@ test "seccomp.buildRules on the kernel (x86-64): a deny-list kills x32-numbered 
     g_rules_prog = prog;
     const res = try runInChild(childRulesX32);
     try testing.expect(res.killedBy(.SYS));
+}
+
+fn childRulesOverlap() void {
+    noNewPrivs() catch linux.exit(82);
+    seccomp.install(g_rules_prog) catch linux.exit(83);
+    // getppid ignores its arguments, so any values are safe to pass.
+    // Only the second rule matches: a2 in [1064063461, 0xffffffff), a3 small.
+    if (linux.errno(linux.syscall6(.getppid, 10, 0xffff_ffff, 1064063461, 0xffff_fffe, 0, 5)) != .NOENT) linux.exit(10);
+    // The first rule matches.
+    if (linux.errno(linux.syscall6(.getppid, 0, 0, 0xffff_ffff, 0, 0, 0)) != .NOENT) linux.exit(11);
+    // Neither: a2 below both bounds; and a2 in range with a3 at the bound.
+    if (linux.errno(linux.syscall6(.getppid, 0, 0, 1064063460, 0, 0, 0)) != .SUCCESS) linux.exit(12);
+    if (linux.errno(linux.syscall6(.getppid, 0, 0, 1064063461, 0xffff_ffff, 0, 0)) != .SUCCESS) linux.exit(13);
+    linux.exit(0);
+}
+
+test "seccomp.buildRules on the kernel: two conditional rules of one syscall on the same argument both hold (libseccomp 2.6.0 drops the second)" {
+    // Found by tools/interop.zig against libseccomp 2.6.0: added there, the
+    // second rule is missing from `seccomp_export_pfc`, and the kernel lets
+    // the first call below through (SPEC.md, 2026-10-27).
+    try requireSeccompFilter();
+    const prog = try seccomp.buildRules(testing.allocator, &.{
+        .{ .sysno = .getppid, .when = &.{.{ .arg = 2, .op = .ge, .width = .u32, .value = 0xffff_ffff }}, .action = .{ .errno = @backingInt(E.NOENT) } },
+        .{ .sysno = .getppid, .when = &.{
+            .{ .arg = 2, .op = .ge, .width = .u32, .value = 1064063461 },
+            .{ .arg = 3, .op = .lt, .width = .u32, .value = 0xffff_ffff },
+        }, .action = .{ .errno = @backingInt(E.NOENT) } },
+    }, .allow);
+    defer testing.allocator.free(prog);
+    g_rules_prog = prog;
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childRulesOverlap)).status);
 }
 
 fn childRulesLog() void {

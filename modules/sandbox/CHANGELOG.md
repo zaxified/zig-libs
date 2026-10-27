@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-27** — **Evidence:** live libseccomp oracle `tools/interop.zig` (+ `tools/c_oracle/soracle.c`); found two libseccomp 2.6.0/2.6.1 defects with several conditional rules on one syscall, recorded as leads, and a kernel test for the dropped-rule shape. **Docs:** `ArgCmp.mask` states `(arg & mask) == (value & mask)`, as the code does. No API change.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC note on the unbuildable `linux.AUDIT.ARCH` re-checked against the 0.17.0 std (still unbuildable).
 
 - **2026-10-18** — Ported to Zig 0.17.0. `bufPrintZ` -> `bufPrintSentinel(.., 0)`; `waitpid` status is `i32`; std 0.17 spells syscall 262 on x86-64 `newfstatat` (was `fstatat64`), the default allow-list test now expects that name and `fstatat64` as the filtered one.
