@@ -41,7 +41,9 @@ pub fn main() !void {
     // see this branch succeed instead.
     sandbox.dropPrivileges(.{ .uid = 65534, .gid = 65534 }) catch |err| switch (err) {
         error.SetIdFailed => std.debug.print("privilege drop skipped: not running as root\n", .{}),
-        error.DropNotEffective => return err,
+        // ids are per thread: dropping them with a second thread alive would
+        // leave that thread privileged, so the call refuses instead.
+        error.DropNotEffective, error.MultipleThreads => return err,
     };
 
     // Step 3: rlimits. A crash must not spill secrets to a core file, and an
