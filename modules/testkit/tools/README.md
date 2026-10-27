@@ -38,3 +38,23 @@ what `FINDINGS` recorded when it named this class-C anchor.
 
 Needs: Python 3, stdlib only (no third-party package, so no licence to
 check).
+
+## The bench's foreign sides
+
+`bench.zig` (kind 3, `zig build bench-testkit -Djcc-safe`) builds and runs
+two foreign programs over the same hex property; the method and the figures
+are in the module README § Performance.
+
+| dir | what | built by `bench.zig` as |
+|---|---|---|
+| `proptest_rust/` | the reference: proptest 1.11.0's `TestRunner`, 10 000 cases per op | `cargo build --release --locked --offline` into `.zig-cache/proptest_rust[-jcc]` |
+| `libfuzzer_c/` | the fastest candidate: libFuzzer in-process via `LLVMFuzzerRunDriver`, timed from its callback | `clang -fsanitize=fuzzer-no-link` + `libclang_rt.fuzzer_no_main` into `.zig-cache/bench-testkit/foreign_bench` |
+
+`proptest_rust/Cargo.lock` pins the crates. On Linux 14 are built, each
+offering MIT (zerocopy: BSD-2-Clause OR Apache-2.0 OR MIT; the rest MIT OR
+Apache-2.0). They were read before the first build
+(2026-10-27): no proc macro; four build scripts (getrandom, libc,
+num-traits via autocfg, zerocopy) that only run `rustc --version`/`-vV`,
+compile autocfg's probes into `OUT_DIR` and read the crate's own
+`Cargo.toml`. proptest's file writes (failure persistence, `fork`) are off:
+`failure_persistence: None`, `default-features = false`.
