@@ -1699,9 +1699,11 @@ pub const StreamError = BrotliError || error{ ReadFailed, WriteFailed };
 /// Output reaches `out` at the end of every meta-block and whenever the window
 /// fills; `out` is flushed at the end. Returns the number of bytes written.
 ///
-/// `in` must have a non-empty buffer. Up to 8 bytes after the stream may be
-/// consumed from it (the bit reader reads ahead), so a Brotli stream followed
-/// by other data on the same reader is not supported. `options` is enforced
+/// `in` must have a non-empty buffer. The bytes after the stream stay in
+/// `in` when its buffer holds at least 16 bytes (the bit reader's read-ahead
+/// is given back), so a stream followed by other data — another stream —
+/// reads on from there; with a smaller buffer up to 8 of them may be
+/// consumed. `options` is enforced
 /// as in `decompress`, but the ratio bound is measured against the input
 /// consumed *so far* (the stream's length is unknown): a stream whose output
 /// runs ahead of its input by more than `max_ratio` past `min_output_floor`

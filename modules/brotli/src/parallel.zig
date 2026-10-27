@@ -61,7 +61,8 @@ pub const Error = std.mem.Allocator.Error || std.Io.Cancelable;
 
 /// `compressWith(gpa, input, opts)` on up to `par.threads` workers. Caller
 /// owns the result.
-pub fn compress(gpa: std.mem.Allocator, io: std.Io, input: []const u8, opts: CompressOptions, par: ParallelOptions) Error![]u8 {
+pub fn compress(gpa: std.mem.Allocator, io: std.Io, input: []const u8, opts_in: CompressOptions, par: ParallelOptions) Error![]u8 {
+    const opts = opts_in.sanitized();
     if (opts.dictionary.len != 0 or opts.prepared_dictionary != null) return encoder.compressWith(gpa, input, opts);
     const threads = par.threads orelse (std.Thread.getCpuCount() catch 1);
     const job = par.job_size orelse jobSize(encoder.windowBits(input.len, opts));

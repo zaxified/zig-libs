@@ -721,6 +721,7 @@ ordinary stream.
 
 ## Backlog / deferred
 
+- **One-shot input of 4 GiB or more (review 2026-10-27)** — `compressWith`/`compressInto`/`Compressor` store absolute positions as `u32` in the `.q1`–`.q11` match finders (`Matcher.insert`, `FastMatcher.insert`, `FragMatcher.insert`, `buildFrag`; the `dropped_pos` sentinel is `maxInt(u32)`): a safe build panics on the cast, ReleaseFast only loses matches. Documented on `compressWith`; `StreamWriter` and `parallel.compress` are not affected (positions relative). Fix when a consumer needs it: rebase positions per window as `StreamWriter` does.
 - **Zig 0.17: a wide `@bitCast` on a possibly hot path** *(2026-10-19, `~/CML/zig-017/bitcast-scan/REPORT.md`)* — 0.17 lowers a `@bitCast` between `[N]u8` (N > 8) and a wider-element type (here: `u128`) to a per-byte loop (~8x the instructions; codeberg ziglang/zig #36256): `copy16` (per match copy in the decoder). Measure first (cycles + instructions 0.16 vs 0.17, or the cast's share in a profile); fix only if it shows: load/store through `*align(1) uN` + `std.mem.nativeToBig`/`bigToNative` (identical bytes, 8 instructions).
 
 - **Build option: encoder quality cap** (design 2026-10-17, mechanism and checklist in CONVENTIONS §4.2; measure first — HTTPS sizeprobe or `nm -S --size-sort` on a consumer binary — and add a knob only for a measured gain of roughly ≥ 100 KB or a consumer request). The 122,784-byte RFC 7932 dictionary (src/dictionary.zig:13) is

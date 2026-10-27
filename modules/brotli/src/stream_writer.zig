@@ -59,6 +59,15 @@ pub const StreamOptions = struct {
     /// As `CompressOptions.mode`.
     mode: encoder.Mode = .generic,
 
+    /// `block_size` and `window_bits` clamped into their ranges, as
+    /// `CompressOptions.sanitized` (`init` and `reset` apply it).
+    fn sanitized(o: StreamOptions) StreamOptions {
+        var r = o;
+        r.block_size = std.math.clamp(o.block_size, 1, encoder.compressed_block_size);
+        r.window_bits = std.math.clamp(o.window_bits, encoder.min_window_bits, encoder.max_large_window_bits);
+        return r;
+    }
+
     fn tableSize(o: StreamOptions) usize {
         return encoder.tableSize(o.size_hint orelse @as(usize, 1) << o.window_bits, o.window_bits);
     }
@@ -97,8 +106,9 @@ pub const StreamWriter = struct {
 
     /// `buffer` must be nonempty and outlive the writer. `gpa` holds the
     /// history and the match finder's table.
-    pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: StreamOptions) std.mem.Allocator.Error!StreamWriter {
+    pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts_in: StreamOptions) std.mem.Allocator.Error!StreamWriter {
         std.debug.assert(buffer.len != 0);
+        const opts = opts_in.sanitized();
         var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize(), opts.size_hint orelse 0);
         errdefer core.deinit();
         core.keep_temp = true;
@@ -165,7 +175,8 @@ pub const StreamWriter = struct {
     /// are kept while big enough (`Core.reinit`). A stream not yet finished
     /// is abandoned. On an error the writer is unusable until another
     /// successful `reset`.
-    pub fn reset(sw: *StreamWriter, output: *Writer, opts: StreamOptions) std.mem.Allocator.Error!void {
+    pub fn reset(sw: *StreamWriter, output: *Writer, opts_in: StreamOptions) std.mem.Allocator.Error!void {
+        const opts = opts_in.sanitized();
         try sw.core.reinit(opts.effort, opts.block_size, opts.window_bits, opts.tableSize(), opts.size_hint orelse 0);
         sw.opts = opts;
         sw.hist.clearRetainingCapacity();

@@ -5689,7 +5689,8 @@ pub const Effort = enum(u4) {
 
 pub const CompressOptions = struct {
     effort: Effort = .default,
-    /// Input bytes per meta-block (1..1 MiB). Each block gets its own codes:
+    /// Input bytes per meta-block (1..1 MiB; outside, clamped into it, as
+    /// google/brotli clamps its window). Each block gets its own codes:
     /// smaller blocks adapt to changing data but pay more headers.
     block_size: usize = default_block_size,
     /// log2 of the window (`min_window_bits`..`max_window_bits`): how far
@@ -5697,6 +5698,7 @@ pub const CompressOptions = struct {
     /// 16 for an input of up to 65 520 bytes, else 21. Above
     /// `max_window_bits`, to `max_large_window_bits`: a large-window stream
     /// (RFC 9841 §6), for decoders that ask for one — not a web `br` body.
+    /// Outside `min_window_bits`..`max_large_window_bits`: clamped into it.
     window_bits: ?u5 = null,
     /// A raw prefix dictionary (RFC 9841 §3.2; RFC 9842 `dcb`): bytes copies
     /// may come from as if they preceded the input; the decoder needs the
@@ -5715,6 +5717,17 @@ pub const CompressOptions = struct {
     mode: Mode = .generic,
 
     pub const default_block_size = compressed_block_size;
+
+    /// `block_size` and `window_bits` clamped into their ranges (google
+    /// `SanitizeParams` clamps `lgwin`): every entry point takes its options
+    /// through this, so no value of either field can hang (`block_size` 0
+    /// looped forever) or write a header no decoder reads (2026-10-27).
+    pub fn sanitized(o: CompressOptions) CompressOptions {
+        var r = o;
+        r.block_size = std.math.clamp(o.block_size, 1, compressed_block_size);
+        if (o.window_bits) |w| r.window_bits = std.math.clamp(w, min_window_bits, max_large_window_bits);
+        return r;
+    }
 };
 
 /// google/brotli's `BrotliEncoderMode`, with its effect: `.font` (WOFF 2.0
@@ -5738,8 +5751,11 @@ pub const max_large_window_bits = 30;
 const max_metadata_block = 1 << 24;
 pub const max_window_bits = 24;
 
-/// `compress` with options.
-pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
+/// `compress` with options. The input is below 4 GiB: the match finders
+/// keep positions as `u32` (a larger one panics in a safe build); for more,
+/// `StreamWriter` or `parallel.compress`, whose positions are relative.
+pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts_in: CompressOptions) std.mem.Allocator.Error![]u8 {
+    const opts = opts_in.sanitized();
     var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     try oneShot(&core, input, opts);
@@ -5769,7 +5785,8 @@ pub const CompressIntoError = std.mem.Allocator.Error || error{
 /// block's prefix codes). The stream is the one `compressWith` gives; it
 /// fails only when that does not fit — `maxCompressedSize` is always
 /// enough.
-pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
+pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts_in: CompressOptions) CompressIntoError![]u8 {
+    const opts = opts_in.sanitized();
     var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     return oneShotInto(&core, out, input, opts);
@@ -5804,14 +5821,16 @@ pub const Compressor = struct {
     /// buffer grown anew each call walks the allocator's size classes, and
     /// Zig 0.16's `smp_allocator` can grow without bound on such walks —
     /// std defect, ziglang/zig #36969; see `Core.temp`).
-    pub fn compress(c: *Compressor, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error![]u8 {
+    pub fn compress(c: *Compressor, input: []const u8, opts_in: CompressOptions) std.mem.Allocator.Error![]u8 {
+        const opts = opts_in.sanitized();
         const core = try c.ready(input.len, opts);
         try oneShot(core, input, opts);
         return c.gpa.dupe(u8, core.w.buf.items);
     }
 
     /// `compressInto(gpa, out, input, opts)`.
-    pub fn compressInto(c: *Compressor, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
+    pub fn compressInto(c: *Compressor, out: []u8, input: []const u8, opts_in: CompressOptions) CompressIntoError![]u8 {
+        const opts = opts_in.sanitized();
         const core = try c.ready(input.len, opts);
         // `out` stands in for the kept buffer for this call.
         const own = core.w.buf;
@@ -5846,7 +5865,8 @@ fn oneShotInto(core: *Core, out: []u8, input: []const u8, opts: CompressOptions)
 /// of `n` bytes: every block stored, plus the final empty meta-block (a
 /// compressed block is kept only when it is shorter than stored). Exact:
 /// incompressible input reaches it.
-pub fn maxCompressedSize(n: usize, opts: CompressOptions) usize {
+pub fn maxCompressedSize(n: usize, opts_in: CompressOptions) usize {
+    const opts = opts_in.sanitized();
     const wbits: u5 = opts.window_bits orelse if (n > 65520) 21 else 16;
     var bits: usize = if (wbits > max_window_bits) 14 else if (wbits == 16) 1 else if (wbits >= 18) 4 else 7;
     var off: usize = 0;
@@ -7110,6 +7130,31 @@ test "compressInto: the stream compressWith gives, in exactly its length; a byte
             try testing.expectEqualSlices(u8, want, try compressInto(gpa, buf, input, opts));
             try testing.expectEqualSlices(u8, want, try compressInto(gpa, buf[0..want.len], input, opts));
             try testing.expectError(error.OutputTooLarge, compressInto(gpa, buf[0 .. want.len - 1], input, opts));
+        }
+    }
+}
+
+test "options out of range are clamped, not a hang or a bad header (block_size 0, window_bits 0..31)" {
+    // Review 2026-10-27: `block_size = 0` looped forever in `maxCompressedSize`
+    // and in the one-shot block loop (a debug assert only), and a window
+    // outside 10..30 wrote a header no decoder accepts.
+    const gpa = testing.allocator;
+    const decoder = @import("decoder.zig");
+    const line = "abcabcabcabc the quick brown fox jumps over the lazy dog ";
+    const input = line ++ line ++ line ++ line ++ line ++ line ++ line ++ line;
+    try testing.expect(maxCompressedSize(input.len, .{ .block_size = 0 }) >= maxCompressedSize(input.len, .{ .block_size = 1 }));
+    for ([_]usize{ 0, 1, compressed_block_size + 1, std.math.maxInt(usize) }) |bs| {
+        for ([_]?u5{ null, 0, 9, 10, 24, 30, 31 }) |wb| {
+            const o: CompressOptions = .{ .effort = .q0, .block_size = bs, .window_bits = wb };
+            for ([_]Effort{ .q0, .q1, .q6 }) |e| {
+                var oe = o;
+                oe.effort = e;
+                const out = try compressWith(gpa, input, oe);
+                defer gpa.free(out);
+                const back = try decoder.decompress(gpa, out, .{ .large_window = true });
+                defer gpa.free(back);
+                try testing.expectEqualSlices(u8, input, back);
+            }
         }
     }
 }
