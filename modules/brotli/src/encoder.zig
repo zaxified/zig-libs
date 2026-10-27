@@ -4981,10 +4981,6 @@ inline fn q0Hash(in: []const u8, p: usize, shift: u6) u32 {
     return @truncate(((v << 24) *% 0x1e35a7bd) >> shift);
 }
 
-inline fn q0HashAt(v: u64, comptime offset: u6, shift: u6) u32 {
-    return @truncate((((v >> (8 * offset)) << 24) *% 0x1e35a7bd) >> shift);
-}
-
 inline fn q0IsMatch(in: []const u8, p1: usize, p2: usize) bool {
     return std.mem.readInt(u32, in[p1..][0..4], .little) == std.mem.readInt(u32, in[p2..][0..4], .little) and in[p1 + 4] == in[p2 + 4];
 }
@@ -4992,11 +4988,12 @@ inline fn q0IsMatch(in: []const u8, p1: usize, p2: usize) bool {
 /// The positions inside a copy that ends at `ip` go into the table, and the
 /// candidate for `ip` comes out of it.
 inline fn q0AfterCopy(in: []const u8, table: []u32, ip: usize, shift: u6) usize {
-    const v = std.mem.readInt(u64, in[ip - 3 ..][0..8], .little);
-    const cur = q0HashAt(v, 3, shift);
-    table[q0HashAt(v, 0, shift)] = @intCast(ip - 3);
-    table[q0HashAt(v, 1, shift)] = @intCast(ip - 2);
-    table[q0HashAt(v, 2, shift)] = @intCast(ip - 1);
+    // A load per position, not google's one load shifted four ways: LLVM
+    // took those shifts apart byte by byte (2026-10-27).
+    const cur = q0Hash(in, ip, shift);
+    table[q0Hash(in, ip - 3, shift)] = @intCast(ip - 3);
+    table[q0Hash(in, ip - 2, shift)] = @intCast(ip - 2);
+    table[q0Hash(in, ip - 1, shift)] = @intCast(ip - 1);
     const candidate: usize = table[cur];
     table[cur] = @intCast(ip);
     return candidate;
