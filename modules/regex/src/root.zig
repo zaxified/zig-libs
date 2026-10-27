@@ -1163,10 +1163,17 @@ pub const Matcher = struct {
     /// stack of pending branches and capture restores.
     bt_visited: std.ArrayList(u64) = .empty,
     bt_jobs: std.ArrayList(Job) = .empty,
+    /// Positions the backtracker's bit budget covers for this program
+    /// (worked out once: the division was 4 % of a short search).
+    bt_width: usize,
     /// Tests only: always the Pike VM, to compare the two engines.
     pike_only: bool = false,
 
-    const Job = union(enum) { explore: struct { pc: u16, pos: usize }, restore: struct { slot: u16, val: usize } };
+    /// Explore `pc` at `pos`, or (`restore`) put `pos` back into capture
+    /// slot `pc`. A plain struct, not a tagged union: a union built on the
+    /// stack wrote its tag as a byte and copied it out as a word, a failed
+    /// store forward on every push (measured: 19 % of a short search).
+    const Job = struct { pos: usize, pc: u16, restore: bool };
 
     /// The backtracker runs when (positions × instructions) fits this many
     /// bits (Go's limit too): a short text, where it beats the Pike VM's
@@ -1204,7 +1211,7 @@ pub const Matcher = struct {
             wordsFor(Entry, 3 * n) + 2 * wordsFor(usize, k);
         const block = try gpa.alloc(usize, words);
         var rest = block;
-        var m: Matcher = .{ .gpa = gpa, .re = re, .k = k, .block = block, .lists = undefined, .stack = undefined, .tmp = undefined, .best = undefined };
+        var m: Matcher = .{ .gpa = gpa, .re = re, .k = k, .block = block, .lists = undefined, .stack = undefined, .tmp = undefined, .best = undefined, .bt_width = max_backtrack_bits / n };
         for (&m.lists) |*l| {
             l.* = .{ .caps = take(usize, &rest, n * k), .pcs = take(u16, &rest, n), .seen = take(u32, &rest, n) };
             @memset(l.seen, 0);
@@ -1323,6 +1330,9 @@ pub const Matcher = struct {
     /// nothing; later threads of the same start may still find a longer one,
     /// and threads that started later are dropped.
     fn run(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
+        // Every match starts where `\A` holds, at 0 only: an iterator's call
+        // after the first match is settled here, not by a search.
+        if (m.re.prefilter.anchored and from != 0) return false;
         var start = from;
         if (!full and !m.pike_only and !m.re.longest) switch (m.backtrack(input, from)) {
             .found => return true,
@@ -1352,7 +1362,7 @@ pub const Matcher = struct {
     fn backtrack(m: *Matcher, input: []const u8, from: usize) Backtracked {
         const re = m.re;
         const n = re.insts.len;
-        const width = @min(input.len - from + 1, max_backtrack_bits / n);
+        const width = @min(input.len - from + 1, m.bt_width);
         if (width < 2) return .{ .pike = from };
         const words = (width * n + 63) / 64;
         if (m.bt_visited.items.len < words) {
@@ -1402,21 +1412,15 @@ pub const Matcher = struct {
         const n = re.insts.len;
         const visited = m.bt_visited.items;
         @memset(m.tmp, nil);
-        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = 0, .pos = start } }) catch return .pike;
+        m.pushJob(0, start, false) catch return .pike;
         const limit = max_backtrack_jobs;
         while (m.bt_jobs.pop()) |job| {
-            var pc: u16 = undefined;
-            var pos: usize = undefined;
-            switch (job) {
-                .restore => |r| {
-                    m.tmp[r.slot] = r.val;
-                    continue;
-                },
-                .explore => |e| {
-                    pc = e.pc;
-                    pos = e.pos;
-                },
+            if (job.restore) {
+                m.tmp[job.pc] = job.pos;
+                continue;
             }
+            var pc = job.pc;
+            var pos = job.pos;
             while (true) {
                 if (pos - win.base >= win.width) return .pike;
                 const bit = (pos - win.base) * n + pc;
@@ -1439,14 +1443,14 @@ pub const Matcher = struct {
                     },
                     .split => |sp| {
                         if (m.bt_jobs.items.len >= limit) return .pike;
-                        m.bt_jobs.append(m.gpa, .{ .explore = .{ .pc = sp.y, .pos = pos } }) catch return .pike;
+                        m.pushJob(sp.y, pos, false) catch return .pike;
                         pc = sp.x;
                     },
                     .jmp => |t| pc = t,
                     .save => |slot| {
                         if (slot < m.k) {
                             if (m.bt_jobs.items.len >= limit) return .pike;
-                            m.bt_jobs.append(m.gpa, .{ .restore = .{ .slot = slot, .val = m.tmp[slot] } }) catch return .pike;
+                            m.pushJob(slot, m.tmp[slot], true) catch return .pike;
                             m.tmp[slot] = pos;
                         }
                         pc += 1;
@@ -1459,6 +1463,21 @@ pub const Matcher = struct {
             }
         }
         return .none;
+    }
+
+    /// `bt_jobs.append` with the common case inline: the job fits the
+    /// capacity already there (measured: the out-of-line `append` was 28 % of
+    /// a short anchored search).
+    inline fn pushJob(m: *Matcher, pc: u16, pos: usize, restore: bool) std.mem.Allocator.Error!void {
+        if (m.bt_jobs.items.len == m.bt_jobs.capacity) try m.growJobs();
+        const j = m.bt_jobs.addOneAssumeCapacity();
+        j.pos = pos;
+        j.pc = pc;
+        j.restore = restore;
+    }
+
+    noinline fn growJobs(m: *Matcher) std.mem.Allocator.Error!void {
+        try m.bt_jobs.ensureUnusedCapacity(m.gpa, 1);
     }
 
     /// Go's `FindReaderIndex`: the leftmost match in what `r` yields, as byte
