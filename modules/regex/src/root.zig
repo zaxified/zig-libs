@@ -1619,10 +1619,14 @@ pub const Matcher = struct {
     /// Positions the backtracker's bit budget covers for this program
     /// (worked out once: the division was 4 % of a short search).
     bt_width: usize,
-    /// `find`'s DFA, made on first use.
+    /// `find`'s DFA, made once `vm_read` reaches `dfa_after`.
     dfa: ?*FindDfa = null,
+    /// Bytes of text `find` handed to the VMs before the DFA was made.
+    vm_read: usize = 0,
     /// Tests only: always the Pike VM, to compare the two engines.
     pike_only: bool = false,
+    /// Tests only: the DFA from the first `find`, however short the text.
+    dfa_eager: bool = false,
 
     /// Explore `pc` at `pos`, or (`restore`) put `pos` back into capture
     /// slot `pc`. A plain struct, not a tagged union: a union built on the
@@ -1715,6 +1719,8 @@ pub const Matcher = struct {
         return .{ .start = m.best[0], .end = m.best[1] };
     }
 
+    const dfa_after = 1024;
+
     /// `find` by the DFAs (`FindDfa`): the match, none, or null when the
     /// DFA does not apply or cannot get its memory.
     fn findDfa(m: *Matcher, input: []const u8, from: usize) ??Span {
@@ -1726,6 +1732,12 @@ pub const Matcher = struct {
         // `start`, reading backwards, would read the whole sequence.
         if (!anchored and from < input.len and input[from] & 0xc0 == 0x80) return null;
         const d = m.dfa orelse blk: {
+            // A fresh DFA works out every transition it takes; over a short
+            // text that costs more than the backtracker (measured: a
+            // compile-and-find of 37 bytes 1.0 → 1.8 µs). Made once the
+            // `Matcher` has been handed enough text for it to pay off.
+            m.vm_read +|= input.len - from;
+            if (m.vm_read < dfa_after and !m.dfa_eager) return null;
             const d = m.gpa.create(FindDfa) catch return null;
             d.* = .init(m.gpa, re);
             m.dfa = d;
@@ -2515,6 +2527,7 @@ test "find's DFA (anchored programs) agrees with the Pike VM, across calls and p
         try testing.expect(re.prefilter.anchored);
         var m = try Matcher.init(gpa, &re);
         defer m.deinit();
+        m.dfa_eager = true;
         var pm = try Matcher.init(gpa, &re);
         defer pm.deinit();
         pm.pike_only = true;
@@ -2549,6 +2562,19 @@ test "find's DFA (anchored programs) agrees with the Pike VM, across calls and p
     }
 }
 
+test "find makes its DFA only once the Matcher was handed enough text" {
+    var re = try Regex.compile(testing.allocator, "[a-z]+");
+    defer re.deinit(testing.allocator);
+    var m = try Matcher.init(testing.allocator, &re);
+    defer m.deinit();
+    try testing.expectEqual(Span{ .start = 4, .end = 7 }, m.find("12, abc", 0).?);
+    try testing.expect(m.dfa == null); // a short one-shot search stays on the VMs
+    const long = strRepeat("1 ", 600) ++ "xyz";
+    try testing.expectEqual(Span{ .start = 1200, .end = 1203 }, m.find(long, 0).?);
+    try testing.expect(m.dfa != null);
+    try testing.expectEqual(Span{ .start = 4, .end = 7 }, m.find("12, abc", 0).?);
+}
+
 test "find's DFAs (unanchored: forward for the end, backward for the start) agree with the Pike VM" {
     const gpa = testing.allocator;
     var prng: std.Random.DefaultPrng = .init(0x7266);
@@ -2573,6 +2599,7 @@ test "find's DFAs (unanchored: forward for the end, backward for the start) agre
         try testing.expect(!re.prefilter.anchored);
         var m = try Matcher.init(gpa, &re);
         defer m.deinit();
+        m.dfa_eager = true;
         var pm = try Matcher.init(gpa, &re);
         defer pm.deinit();
         pm.pike_only = true;

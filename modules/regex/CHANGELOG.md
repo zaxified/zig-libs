@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Faster:** a `Matcher` makes its find DFA only once it has been handed 1 KiB of text to search (or one text that long): a fresh DFA works out every transition it takes, which over a short text cost more than the backtracker. A compile-and-find of 37 bytes is back from 1.8 µs to ~1.0–1.2 µs (what it was before the DFA). `Matcher` gains the field `vm_read` and the test switch `dfa_eager`.
+
 - **2026-10-28** — **Faster:** when every match starts where a fast prefilter points (a literal prefix, one byte, Teddy), `find` reads forwards from each such place in turn, anchored, and the first one with a match is the leftmost-first match: no backward pass (RE2's search from a literal prefix). Tries that fail may read no more than twice the text they moved past (plus 256 bytes), then one unanchored pass takes over, so `A[^Z]*Z` over `AAAA…` stays linear. `INV-[0-9]{4}-[0-9]{4}` find-all over 85 KiB: 93 → 60 µs (1.6× → 1.05× Rust's `regex`, JCC-padded builds).
 
 - **2026-10-28** — **Faster:** the literal search behind the prefilter tests two 32-byte blocks at a time. `ABC` find-all over 1 MiB of noise: 51–57 → 42–44 µs (1.5× → 1.05× Rust's `regex`, JCC-padded builds).

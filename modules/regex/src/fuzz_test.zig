@@ -248,6 +248,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     if (re.insts.len > dfa_max_insts) hit(.big);
     var m = try regex.Matcher.init(gpa, &re);
     defer m.deinit();
+    m.dfa_eager = true; // short inputs: the DFA would not be made yet
 
     const any = re.isMatch(input);
     const found = m.find(input, 0);
@@ -423,6 +424,7 @@ fn anchoredTwin(gpa: std.mem.Allocator, pattern: []const u8, posix: bool, input:
     hit(.dfa_find);
     var m = try regex.Matcher.init(gpa, &re);
     defer m.deinit();
+    m.dfa_eager = true;
     var pm = try regex.Matcher.init(gpa, &re);
     defer pm.deinit();
     pm.pike_only = true;
