@@ -781,6 +781,12 @@ const FindDfa = struct {
     /// ends before the code point.
     const Step = struct { n: usize, matched: bool };
     const wide_slots = 1024;
+    /// As `trans`, direct-mapped by state and code point (a collision only
+    /// costs the step again); `rev` as `rev.trans` encodes them.
+    const WideCaches = struct {
+        fwd: [wide_slots]Wide = @splat(.empty),
+        rev: [wide_slots]Wide = @splat(.empty),
+    };
     /// `key`: (state + 1) << 21 | code point, 0 empty.
     const Wide = struct {
         key: u32,
@@ -800,9 +806,10 @@ const FindDfa = struct {
     /// The program has assertions: without, every context is one state.
     asserts: bool,
     states: std.ArrayList(State) = .empty,
-    /// `trans[s][c]`: 0 not worked out yet, otherwise (next state + 1) << 2,
-    /// bit 1 set when that state has no thread, bit 0 when a match ends
-    /// before `c`.
+    /// `trans[s + 1][c]` (row 0 unused): 0 not worked out yet, otherwise
+    /// (next state + 1) << 7 — the offset of its row, so the next lookup
+    /// needs no multiply (Rust's premultiplied ids) — bit 1 set when that
+    /// state has no thread, bit 0 when a match ends before `c`.
     trans: std.ArrayList([128]u16) = .empty,
     /// The states' lists, one after another.
     pcs: std.ArrayList(u16) = .empty,
@@ -810,11 +817,12 @@ const FindDfa = struct {
     table: [2 * max_states]u16 = @splat(0),
     /// `idleAt`'s states per context, + 1 (0 not made yet).
     idle: [4]u16 = @splat(0),
-    /// Transitions on code points past ASCII, as `trans` (direct-mapped by
-    /// state and code point; a collision only costs the step again).
-    wide: [wide_slots]Wide = @splat(.empty),
-    /// The same for `rev` (its transitions as `rev.trans` encodes them).
-    rev_wide: [wide_slots]Wide = @splat(.empty),
+    /// Transitions on code points past ASCII (`Wide`), made on the first
+    /// such code point: a `Matcher` for one ASCII search does not pay for
+    /// them (measured: 3× a short compile-and-match).
+    wide: ?*WideCaches = null,
+    /// `rev`'s first state (the match) per context after the end, + 1.
+    rev_start: [4]u8 = @splat(0),
     /// Times the table was emptied (tests).
     flushes: usize = 0,
     /// The backward DFA for the start (`start`), kept across calls too.
@@ -842,10 +850,12 @@ const FindDfa = struct {
     fn start(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, end: usize) usize {
         const r = &d.rev;
         const end_ctx: Dfa.Ctx = if (d.asserts) .of(decode(input, end).cp) else .other;
-        var s = r.find(d.match_set, end_ctx) orelse blk: {
+        const first = &d.rev_start[@backingInt(end_ctx)];
+        if (first.* == 0) {
             if (r.n == RevDfa.max_states) d.revFlush();
-            break :blk r.add(d.match_set, end_ctx);
-        };
+            first.* = r.add(d.match_set, end_ctx) + 1;
+        }
+        var s = first.* - 1;
         var pos = end;
         var best = end;
         while (true) {
@@ -870,8 +880,9 @@ const FindDfa = struct {
             }
             const here: Decoded = if (ascii) .{ .cp = c, .w = 1 } else decodeBefore(input, pos);
             const key = Wide.keyOf(s, here.cp.?);
-            if (!ascii) {
-                const w = d.rev_wide[Wide.slot(key)];
+            if (!ascii) wide: {
+                const caches = d.wideCaches() catch break :wide;
+                const w = caches.rev[Wide.slot(key)];
                 if (w.key == key) {
                     const t: u8 = @intCast(w.val);
                     if (t & rev_accept != 0) best = pos;
@@ -907,13 +918,16 @@ const FindDfa = struct {
     /// Remember `rev`'s transition from `s` over the code point before the
     /// position: `c` its last byte, `key` the code point past ASCII.
     fn revCache(d: *FindDfa, s: u8, c: u8, key: u32, t: u8) void {
-        if (c < 0x80) d.rev.trans[s][c] = t else d.rev_wide[Wide.slot(key)] = .{ .key = key, .val = t };
+        if (c < 0x80) {
+            d.rev.trans[s][c] = t;
+        } else if (d.wide) |w| w.rev[Wide.slot(key)] = .{ .key = key, .val = t };
     }
 
     /// `rev` is full: empty it, and what remembers its states.
     fn revFlush(d: *FindDfa) void {
         d.rev.n = 0;
-        d.rev_wide = @splat(.empty);
+        if (d.wide) |w| w.rev = @splat(.empty);
+        d.rev_start = @splat(0);
     }
 
     /// In `rev`'s transitions (which `runRevDfa` encodes without it, up to
@@ -932,6 +946,7 @@ const FindDfa = struct {
     }
 
     fn deinit(d: *FindDfa) void {
+        if (d.wide) |w| d.gpa.destroy(w);
         d.states.deinit(d.gpa);
         d.trans.deinit(d.gpa);
         d.pcs.deinit(d.gpa);
@@ -957,29 +972,31 @@ const FindDfa = struct {
             }
             // Cached ASCII transitions until one leads to a state with no
             // thread (bit 1): that one is looked at above.
-            while (pos < input.len) {
+            const flat: [*]const u16 = @ptrCast(d.trans.items.ptr);
+            var row = (@as(usize, s) + 1) << 7;
+            const stopped = while (pos < input.len) {
                 const c = input[pos];
-                if (c >= 0x80) break;
-                const t = d.trans.items[s][c];
-                if (t == 0) break;
+                if (c >= 0x80) break false;
+                const t = flat[row + c];
+                if (t == 0) break false;
                 if (t & 1 != 0) end = pos;
-                s = (t >> 2) - 1;
+                row = t & ~@as(u16, 0x7f);
                 pos += 1;
-                if (t & 2 != 0) break;
+                if (t & 2 != 0) break true;
             } else {
-                if (d.accepts(re, s)) end = pos;
+                if (d.accepts(re, @intCast((row >> 7) - 1))) end = pos;
                 return end;
-            }
-            if (pos == input.len) continue; // stopped at a state with no thread
+            };
+            s = @intCast((row >> 7) - 1);
+            if (stopped) continue;
             const c = input[pos];
-            if (c < 0x80 and d.trans.items[s][c] != 0) continue; // the same
             const here = decode(input, pos);
             const key = Wide.keyOf(s, here.cp.?);
             if (c >= 0x80) {
-                const w = d.wide[Wide.slot(key)];
+                const w = (try d.wideCaches()).fwd[Wide.slot(key)];
                 if (w.key == key) {
                     if (w.val & 1 != 0) end = pos;
-                    s = (w.val >> 2) - 1;
+                    s = (w.val >> 7) - 1;
                     pos += here.w;
                     continue;
                 }
@@ -990,8 +1007,8 @@ const FindDfa = struct {
             if (r.matched) end = pos;
             const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), restart and !r.matched);
             if (!ns.flushed) {
-                const t = (@as(u16, ns.id) + 1) << 2 | @as(u16, @intFromBool(r.n == 0)) << 1 | @intFromBool(r.matched);
-                if (c < 0x80) d.trans.items[s][c] = t else d.wide[Wide.slot(key)] = .{ .key = key, .val = t };
+                const t = (@as(u16, ns.id) + 1) << 7 | @as(u16, @intFromBool(r.n == 0)) << 1 | @intFromBool(r.matched);
+                if (c < 0x80) d.trans.items[s + 1][c] = t else d.wide.?.fwd[Wide.slot(key)] = .{ .key = key, .val = t };
             }
             s = ns.id;
             pos += here.w;
@@ -1005,6 +1022,14 @@ const FindDfa = struct {
         const slot = &d.idle[@backingInt(ctx)];
         if (slot.* == 0) slot.* = (try d.intern(&.{}, ctx, true)).id + 1;
         return slot.* - 1;
+    }
+
+    fn wideCaches(d: *FindDfa) std.mem.Allocator.Error!*WideCaches {
+        if (d.wide) |w| return w;
+        const w = try d.gpa.create(WideCaches);
+        w.* = .{};
+        d.wide = w;
+        return w;
     }
 
     /// `ctxOf` the code point before `pos`, decoded only when it matters.
@@ -1116,16 +1141,18 @@ const FindDfa = struct {
             d.pcs.clearRetainingCapacity();
             d.table = @splat(0);
             d.idle = @splat(0);
-            d.wide = @splat(.empty);
+            if (d.wide) |w| w.fwd = @splat(.empty);
             d.flushes += 1;
             flushed = true;
             i = hash(list, ctx, restart) & mask;
         }
         const id: u16 = @intCast(d.states.items.len);
+        comptime std.debug.assert(max_states << 7 <= std.math.maxInt(u16));
         try d.states.ensureUnusedCapacity(d.gpa, 1);
-        try d.trans.ensureUnusedCapacity(d.gpa, 1);
+        try d.trans.ensureUnusedCapacity(d.gpa, 2);
         try d.pcs.appendSlice(d.gpa, list);
         d.states.appendAssumeCapacity(.{ .off = @intCast(d.pcs.items.len - list.len), .len = @intCast(list.len), .ctx = ctx, .restart = restart });
+        if (d.trans.items.len == 0) d.trans.appendAssumeCapacity(@splat(0)); // row 0
         d.trans.appendAssumeCapacity(@splat(0));
         d.table[i] = id + 1;
         return .{ .id = id, .flushed = flushed };
@@ -2113,6 +2140,10 @@ fn decode(input: []const u8, i: usize) Decoded {
     if (i >= input.len) return .{ .cp = null, .w = 0 };
     const c = input[i];
     if (c < 0x80) return .{ .cp = c, .w = 1 };
+    // Two bytes (Latin, Greek, Cyrillic, …) inline: `utf8Decode` is a call,
+    // a quarter of a find-all over Czech text. C2..DF: no overlong form.
+    if (c >= 0xc2 and c <= 0xdf and i + 1 < input.len and input[i + 1] & 0xc0 == 0x80)
+        return .{ .cp = @as(u21, c & 0x1f) << 6 | (input[i + 1] & 0x3f), .w = 2 };
     const len = std.unicode.utf8ByteSequenceLength(c) catch return .{ .cp = 0xfffd, .w = 1 };
     if (i + len > input.len) return .{ .cp = 0xfffd, .w = 1 };
     const cp = std.unicode.utf8Decode(input[i..][0..len]) catch return .{ .cp = 0xfffd, .w = 1 };
@@ -2125,6 +2156,9 @@ fn decode(input: []const u8, i: usize) Decoded {
 fn decodeBefore(input: []const u8, i: usize) Decoded {
     const c = input[i - 1];
     if (c < 0x80) return .{ .cp = c, .w = 1 };
+    // Two bytes inline, as `decode`.
+    if (c & 0xc0 == 0x80 and i >= 2 and input[i - 2] >= 0xc2 and input[i - 2] <= 0xdf)
+        return .{ .cp = @as(u21, input[i - 2] & 0x1f) << 6 | (c & 0x3f), .w = 2 };
     var back: usize = 2;
     while (back <= @min(4, i)) : (back += 1) {
         const d = decode(input[0..i], i - back);
