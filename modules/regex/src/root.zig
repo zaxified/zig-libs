@@ -2416,7 +2416,9 @@ pub const Matcher = struct {
             }
         }
         const end = (d.run(re, input, from, false, &reach, &track) catch return null) orelse return false;
-        const start = if (d.track and track.clean and track.origin != FindDfa.no_end) track.origin else d.start(re, input, from, end) catch return null;
+        const tracked = d.track and track.clean and track.origin != FindDfa.no_end;
+        if (tracked) d.tracked += 1; // weighed against the joins, as in `span`
+        const start = if (tracked) track.origin else d.start(re, input, from, end) catch return null;
         const found = op.run(re, input, start, m.tmp, m.best, &reach);
         std.debug.assert(found and m.best[1] == end);
         return true;
