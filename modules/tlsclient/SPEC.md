@@ -14,7 +14,7 @@
 
 **Known defects:** none recorded
 
-**Downstream consumer:** no
+**Downstream consumer:** yes
 
 ## Compared with
 

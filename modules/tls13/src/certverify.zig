@@ -652,6 +652,7 @@ fn signEcdsaP521(sk: *const EcdsaP521.SecretKey, content: []const u8, random: ?s
     defer std.crypto.secureZero(u8, std.mem.asBytes(&key_pair.secret_key));
     EcdsaP521.KeyPair.fromSecretKeyInto(&key_pair, sk) catch return error.KeyMismatch;
     var noise_buf: [EcdsaP521.noise_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &noise_buf);
     const noise: ?[EcdsaP521.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
         break :blk noise_buf;
@@ -724,6 +725,7 @@ fn signEd25519(sk: *const Ed25519.SecretKey, content: []const u8, random: ?std.R
     const key_pair = Ed25519.KeyPair.generateDeterministic(sk.seed()) catch return error.KeyMismatch;
     if (!std.crypto.timing_safe.eql([32]u8, key_pair.public_key.toBytes(), sk.publicKeyBytes())) return error.KeyMismatch;
     var noise_buf: [Ed25519.noise_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &noise_buf);
     const noise: ?[Ed25519.noise_length]u8 = if (random) |rnd| blk: {
         rnd.bytes(&noise_buf);
         break :blk noise_buf;
@@ -1103,4 +1105,39 @@ test "ML-DSA: a key of another parameter set is KeyMismatch both ways" {
     try testing.expectError(error.KeyMismatch, verify(.mldsa65, .{ .mldsa44 = &pk_bytes }, .server, &th, out[0..3309]));
     try testing.expect(canSign(.{ .mldsa44 = &kp.secret_key }, .mldsa44));
     try testing.expect(!canSign(.{ .mldsa44 = &kp.secret_key }, .mldsa87));
+}
+
+test "verify: Ed25519 is cofactorless (verifyStrict) -- a signature whose R carries a torsion part is refused" {
+    // R' = r·B + T with T the order-2 point (0, -1), S = r + H(R' || A || m)·a.
+    // The cofactored equation [8][S]B = [8]R' + [8][k]A holds ([8]T is the
+    // identity), so std's plain `verify` accepts it; the cofactorless
+    // [S]B = R' + [k]A does not. RFC 8032 §5.1.7 leaves the choice open; this
+    // module pins the strict one (see `verifyEd25519`).
+    const Curve = std.crypto.ecc.Edwards25519;
+    const Sha512 = std.crypto.hash.sha2.Sha512;
+    const seed: [32]u8 = @splat(0x42);
+    const kp = try Ed25519.KeyPair.generateDeterministic(seed);
+    var expanded: [64]u8 = undefined;
+    Sha512.hash(&seed, &expanded, .{});
+    var a = expanded[0..32].*;
+    Curve.scalar.clamp(&a);
+    const r = Curve.scalar.reduce64(@as([64]u8, @splat(0x17)));
+    var t_bytes: [32]u8 = @splat(0xff);
+    t_bytes[0] = 0xec;
+    t_bytes[31] = 0x7f;
+    const t = try Curve.fromBytes(t_bytes);
+    const r_point = (try Curve.basePoint.mul(r)).add(t);
+    const r_bytes = r_point.toBytes();
+    const content = "torsion in R";
+    var h = Sha512.init(.{});
+    h.update(&r_bytes);
+    h.update(&kp.public_key.toBytes());
+    h.update(content);
+    var hram: [64]u8 = undefined;
+    h.final(&hram);
+    const s = Curve.scalar.mulAdd(Curve.scalar.reduce64(hram), a, r);
+    const sig = r_bytes ++ s;
+    // The vector is meaningful: the cofactored check accepts it.
+    try Ed25519.Signature.fromBytes(sig).verify(content, kp.public_key);
+    try testing.expectError(error.InvalidSignature, verifyContent(.ed25519, .{ .ed25519 = kp.public_key }, content, &sig));
 }

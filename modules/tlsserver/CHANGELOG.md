@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — Card: `Downstream consumer: yes` (qap, since 2026-10-19). `exportKeyingMaterial` follows `tls13`'s, which now returns its bound errors (the same `LabelTooLong`/`OutputTooLong` this one already checked).
+
 - **2026-10-23** — **Tests:** the re-audit after the frame change (15/16 mutants, 1 equivalent):
   a read's frame from `handshake` down to the reader stays under 4 KiB (optimized builds), a
   full reader buffer under `max_record_len` is refused in every mode, and a failing or missing

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — Card: `Downstream consumer: yes` — qap imports it (it has since the TLS move of 2026-10-19; the card was not updated).
+
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the speed work: the parse memo's slots start `null` (they were `undefined` and reset on use), tests that `VerifiedChain.leaf` is the leaf's own parse and that an extnID which is not an OBJECT IDENTIFIER is refused. Card A1, grade 1.
 
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** `montint` builds `R² mod m` in fewer steps (see its changelog); bench-x509 RSA-2048 chain 65 → 56 µs, mixed 65 → 55 µs: 1.09–1.18× rustls-webpki, 0.55–0.72× Go. Card P1.

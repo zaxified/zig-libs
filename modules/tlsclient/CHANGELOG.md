@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — Card: `Downstream consumer: yes` — qap imports it (it has since the TLS move of 2026-10-19; the card was not updated).
+
 - **2026-10-26** — **Fix (security, Go's rule):** a TLS 1.3 session made without certificate verification (`ca = .no_verification` or `.self_signed`) was resumed by a later connection verifying with a bundle through a shared `SessionCache` -- a resumption skips the Certificate, so a man in the middle of the first connection could impersonate the server on the second. A session is now resumed only under the verification it was made with, or with none (Go: a session without verified chains is not resumed by a verifying config). A cache shared between different bundles is still one trust domain (documented). Test "resumableUnder: …". Found by the audit's review (F2).
 
 - **2026-10-26** — **Fix:** two connections resuming from the same cache entry at once (a shared cache under load) could store the earlier one's NewSessionTicket with a PSK derived from the later one's resumption secret; the next resumption offered a wrong binder and the server ended it (`TlsAlert`, decrypt_error), until a full handshake. A resumed connection now takes a new generation of the entry, so only the last one's tickets are stored. Regression check in `tools/interop.zig` (`resume-13-interleaved`, against Go's concurrent server); negative control: the inverse mutant fails it. Found by the review (F3).

@@ -44,7 +44,9 @@ pub const dtls13 = Schedule(dtls13_prefix);
 /// `HkdfLabel` structure — `uint16 length; opaque label<7..255>; opaque
 /// context<0..255>` — where `label = prefix ++ label_body`, then runs
 /// HKDF-Expand into `out`. `Hkdf` is e.g. `std.crypto.kdf.hkdf.HkdfSha256`.
-/// `out` may alias `secret`.
+/// `out` may alias `secret`. Panics when `prefix.len + label.len` or
+/// `context.len` is over 255 (the `HkdfLabel` vectors' bound) — true of
+/// every function here that takes a label or a context.
 pub fn expandLabel(
     comptime Hkdf: type,
     comptime prefix: []const u8,
@@ -66,8 +68,7 @@ fn expandLabelBody(
     label: []const u8,
     context: []const u8,
 ) void {
-    std.debug.assert(prefix.len + label.len <= 255);
-    std.debug.assert(context.len <= 255);
+    checkLabelBounds(prefix.len, label.len, context.len);
 
     var info_buf: [2 + 1 + 255 + 1 + 255]u8 = undefined;
     std.mem.writeInt(u16, info_buf[0..2], @intCast(len), .big);
@@ -95,8 +96,8 @@ fn expandLabelSliceBody(
     label: []const u8,
     context: []const u8,
 ) void {
-    std.debug.assert(prefix.len + label.len <= 255);
-    std.debug.assert(context.len <= 255);
+    checkLabelBounds(prefix.len, label.len, context.len);
+    // `exportKeyingMaterial`, its one caller, refuses a longer `out`.
     std.debug.assert(out.len <= 255 * Hkdf.prk_length);
 
     var info_buf: [2 + 1 + 255 + 1 + 255]u8 = undefined;
@@ -113,6 +114,16 @@ fn expandLabelSliceBody(
     i += context.len;
 
     Hkdf.expand(out, info_buf[0..i], secret.*);
+}
+
+/// RFC 8446 §7.1 `HkdfLabel`'s bounds, checked in every build mode: a label
+/// (prefix included) or a context over 255 octets. No wire field can carry
+/// one (each is a `<0..255>` vector, a transcript hash is at most 48 octets),
+/// so only a caller's bug gets here, and it is a panic with a message rather
+/// than an out-of-bounds write in ReleaseFast (CONVENTIONS.md §8).
+fn checkLabelBounds(prefix_len: usize, label_len: usize, context_len: usize) void {
+    if (prefix_len + label_len > 255) @panic("tls13: HKDF-Expand-Label label over 255 octets, prefix included");
+    if (context_len > 255) @panic("tls13: HKDF-Expand-Label context over 255 octets");
 }
 
 /// The hash under an HKDF instance (`std.crypto.kdf.hkdf.Hkdf(Hmac)` names
@@ -160,8 +171,7 @@ fn Prk(comptime Hkdf: type) type {
         /// HMAC(secret, HkdfLabel || 0x01)`.
         fn expandLabel(self: *const Self, comptime prefix: []const u8, comptime len: usize, out: *[len]u8, label: []const u8, context: []const u8) void {
             comptime std.debug.assert(len <= Hash.digest_length);
-            std.debug.assert(prefix.len + label.len <= 255);
-            std.debug.assert(context.len <= 255);
+            checkLabelBounds(prefix.len, label.len, context.len);
 
             var info_buf: [2 + 1 + 255 + 1 + 255 + 1]u8 = undefined;
             std.mem.writeInt(u16, info_buf[0..2], @intCast(len), .big);
@@ -517,8 +527,9 @@ pub fn Schedule(comptime prefix: []const u8) type {
         /// HKDF-Expand-Label(Derive-Secret(exporter_master_secret, label,
         /// ""), "exporter", Hash(context_value), key_length)` into `out`
         /// (`key_length` = `out.len`). No context and an empty one are the
-        /// same value (§7.5). `Hash` is the suite's hash (`Hkdf`'s); the
-        /// caller checks `label.len <= max_exporter_label_len` and
+        /// same value (§7.5). `Hash` is the suite's hash (`Hkdf`'s). The
+        /// label and the length are the application's choice, so their
+        /// bounds are errors: `label.len <= max_exporter_label_len`,
         /// `out.len <= maxExporterLen(Hkdf)`.
         pub fn exportKeyingMaterial(
             comptime Hash: type,
@@ -527,9 +538,18 @@ pub fn Schedule(comptime prefix: []const u8) type {
             exporter_master_secret: *const [Hkdf.prk_length]u8,
             label: []const u8,
             context: []const u8,
-        ) void {
+        ) ExportError!void {
+            if (label.len > max_exporter_label_len) return error.LabelTooLong;
+            if (out.len > maxExporterLen(Hkdf)) return error.OutputTooLong;
             burn.run(burn.ks_burn, void, exportKeyingMaterialBody, .{ Hash, Hkdf, prefix, out, exporter_master_secret, label, context });
         }
+
+        pub const ExportError = error{
+            /// Over `max_exporter_label_len` octets.
+            LabelTooLong,
+            /// Over `maxExporterLen(Hkdf)` octets.
+            OutputTooLong,
+        };
 
         /// The longest exporter label: `HkdfLabel.label` holds at most 255
         /// octets, the prefix included.
@@ -554,7 +574,8 @@ pub fn Schedule(comptime prefix: []const u8) type {
 
         /// RFC 8446 §4.6.1: the PSK a NewSessionTicket stands for,
         /// `HKDF-Expand-Label(resumption_master_secret, "resumption",
-        /// ticket_nonce, Hash.length)`.
+        /// ticket_nonce, Hash.length)`. `ticket_nonce` is the wire's
+        /// `<0..255>` field; a longer one panics (`expandLabel`).
         pub fn deriveResumptionPsk(
             comptime Hkdf: type,
             out: *[Hkdf.prk_length]u8,
@@ -967,28 +988,35 @@ test "tls13 instance: RFC 8446 §7.5 exporter over the RFC 8448 §3 exporter mas
     const T = tls13;
     const ems = hexTo(32, "fe22f881176eda18eb8f44529e6792c50c9a3f89452f68d8ae311b4309d3cf50");
     var out32: [32]u8 = undefined;
-    T.exportKeyingMaterial(Sha256, HkdfSha256, &out32, &ems, "label", "context");
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, &out32, &ems, "label", "context");
     try testing.expectEqualSlices(u8, &hexTo(32, "ce26b14a53672bf3c0bc3dfe540cc9aaa8475f17cf8572d0607358d96622d48e"), &out32);
     var out1: [1]u8 = undefined;
-    T.exportKeyingMaterial(Sha256, HkdfSha256, &out1, &ems, "label", "");
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, &out1, &ems, "label", "");
     try testing.expectEqualSlices(u8, &.{0x9f}, &out1);
     // More than one HKDF block.
     var out100: [100]u8 = undefined;
-    T.exportKeyingMaterial(Sha256, HkdfSha256, &out100, &ems, "EXPERIMENTAL-tls13", "");
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, &out100, &ems, "EXPERIMENTAL-tls13", "");
     try testing.expectEqualSlices(u8, &hexTo(100, "e8e2618df14a30cbf3a78bfeb92011228591fca61783912f8751a3f75876a8b32285e020e9ed31d103ed15500a5e5f48ebbc65166456e048193c50e3a4f9540b75ff51c55aab153ac20fbc3fa5dbd249e64a16db75bd626c79698fbeee1719ff186b0f4f"), &out100);
     // Over 255 octets: the u16 length's high octet is not zero.
     var out300: [300]u8 = undefined;
-    T.exportKeyingMaterial(Sha256, HkdfSha256, &out300, &ems, "label", "context");
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, &out300, &ems, "label", "context");
     try testing.expectEqualSlices(u8, &hexTo(300, "bf78979912d435a84b161b70455589a5fe53e6c34f1d4af0afbcbda8380db0857440b151d0653225473f8435eac81f272863d30ce7fb8be2fa1e2ef3458e61a2e8aeac91a0a54dadddfb5a1ce906ba694a64f69b05a373f9f8c96d8de20072686dcf08016f2b88c5b91251650818a0cb310233b11849e63f3b85962ceb4b8242bc87b71e080dc9c4223bdaf3d72330a5b97aafc6141665c53242a7502ed2cc6b74784c9b323c32ef7e827615a2142e9644309e2dc650722fa55e5dc842486c744baeea99ccb254c20c82a7c8d7a7f0c1ad510c1dfa550341f3c8fb2aae3252c0cc8875cd9f6bda36578fff8f94bcec0987a3f37fd6fbbf3583d143d8ae70398050583bbd5bf2c1f2872b6528fa50ae26a700cec7cff7ecb6b9c69bb68b434d236213fa29202e14576cb0bbb6"), &out300);
     // SHA-384 (an arbitrary secret, octets 0..47).
     var ems384: [48]u8 = undefined;
     for (&ems384, 0..) |*b, i| b.* = @intCast(i);
     var out48: [48]u8 = undefined;
     const Hkdf384 = std.crypto.kdf.hkdf.Hkdf(std.crypto.auth.hmac.sha2.HmacSha384);
-    T.exportKeyingMaterial(std.crypto.hash.sha2.Sha384, Hkdf384, &out48, &ems384, "label", "context");
+    try T.exportKeyingMaterial(std.crypto.hash.sha2.Sha384, Hkdf384, &out48, &ems384, "label", "context");
     try testing.expectEqualSlices(u8, &hexTo(48, "20bb6c7843de066107923ee40ab8b407c25203da8c2dff6566e83350fb34e41de88f237f66325b77e4b88f8ce340066d"), &out48);
     try testing.expectEqual(249, T.max_exporter_label_len);
     try testing.expectEqual(8160, T.maxExporterLen(HkdfSha256));
+    // The bounds are the application's to hit, so they are errors.
+    var big: [8161]u8 = undefined;
+    try testing.expectError(error.OutputTooLong, T.exportKeyingMaterial(Sha256, HkdfSha256, &big, &ems, "label", ""));
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, big[0..8160], &ems, "label", "");
+    const long_label: [250]u8 = @splat('a');
+    try testing.expectError(error.LabelTooLong, T.exportKeyingMaterial(Sha256, HkdfSha256, &out32, &ems, &long_label, ""));
+    try T.exportKeyingMaterial(Sha256, HkdfSha256, &out32, &ems, long_label[0..249], "");
 }
 
 test "tls13 instance: RFC 8448 §4 binder end to end through resumptionBinderKey + pskBinder" {

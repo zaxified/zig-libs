@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Changed** (no consumer-reachable panic, CONVENTIONS.md §8): `exportKeyingMaterial` returns `ExportError` (`LabelTooLong`, `OutputTooLong`) instead of leaving the bounds to the caller — past `maxExporterLen` the HKDF counter wrapped silently in ReleaseFast. The `HkdfLabel` bounds (label with prefix, context: 255 octets) are a checked panic in every mode instead of an assert (an out-of-bounds stack write in ReleaseFast); so is a transcript message over the u24 length (it wrapped). `kex`: an error leaves `SharedSecret.len`, `public_len` at 0, so `slice()` stays in bounds. Wipes: the hybrid keygen's expanded ML-KEM-768 secret key, the Ed25519/P-521 signing noise. Audit recorded: review (no correctness finding against RFC 8446), mutation 50/51 (one equivalent); new tests for a share one octet long per curve, the exporter bounds, and Ed25519's cofactorless verify (a torsion component in R).
+
 - **2026-10-22** — **Added:** `certverify.verifyContent` — `verify` over content the caller
   built (RFC 9345's delegated credential signature); `verify` now calls it. KAT: Ed25519.
 

@@ -35,7 +35,8 @@ pub fn Transcript(comptime Hash: type) type {
         /// Commits one handshake message to the running transcript: `msg_type
         /// (1 byte) || length (u24, big-endian) || body`. `length` is always
         /// `body.len` here — the transcript never sees DTLS-specific header
-        /// fields (see the file doc comment).
+        /// fields (see the file doc comment). Panics when `body.len` is over
+        /// the u24 length field (2^24 - 1).
         pub fn append(self: *Self, msg_type: u8, body: []const u8) void {
             var hdr: [4]u8 = undefined;
             writeHeader(&hdr, msg_type, body.len);
@@ -51,6 +52,7 @@ pub fn Transcript(comptime Hash: type) type {
         /// binders): `Truncate()` removes the binders list's bytes from the
         /// hash input, but the header's declared length still reflects the
         /// complete message, matching what the peer's transcript will contain.
+        /// Panics when `full_len` is over 2^24 - 1, as `append`.
         pub fn wouldBeHash(self: Self, msg_type: u8, full_len: usize, partial_body: []const u8) [digest_length]u8 {
             var copy = self.hasher;
             var hdr: [4]u8 = undefined;
@@ -102,6 +104,9 @@ pub fn Transcript(comptime Hash: type) type {
 pub const message_hash_type: u8 = 254;
 
 fn writeHeader(out: *[4]u8, msg_type: u8, len: usize) void {
+    // The wire's u24; a longer message is no handshake message, and a wrapped
+    // length would be a silently wrong transcript.
+    if (len > 0xFF_FFFF) @panic("tls13: transcript message over 2^24 - 1 octets");
     out[0] = msg_type;
     out[1] = @truncate(len >> 16);
     out[2] = @truncate(len >> 8);

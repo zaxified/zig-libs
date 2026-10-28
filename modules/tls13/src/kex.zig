@@ -218,13 +218,18 @@ pub fn generate(group: u16, random: std.Random, out: *KeyPair) Error!void {
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, generateBody, .{ group, random, out }),
         else => {
             std.crypto.secureZero(u8, &out.secret);
+            out.group = group;
+            out.public_len = 0;
             return error.MissingKeyShare;
         },
     };
 }
 
 fn generateBody(group: u16, random: std.Random, out: *KeyPair) Error!void {
-    errdefer std.crypto.secureZero(u8, &out.secret);
+    errdefer {
+        std.crypto.secureZero(u8, &out.secret);
+        out.public_len = 0;
+    }
     out.group = group;
     out.public_len = 0;
     switch (group) {
@@ -301,13 +306,18 @@ pub fn sharedSecret(group: u16, secret: []const u8, peer_share: []const u8, out:
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, sharedSecretBody, .{ group, secret, peer_share, out }),
         else => {
             std.crypto.secureZero(u8, &out.bytes);
+            out.len = 0;
             return error.MissingKeyShare;
         },
     };
 }
 
 fn sharedSecretBody(group: u16, secret: []const u8, peer_share: []const u8, out: *SharedSecret) Error!void {
-    errdefer std.crypto.secureZero(u8, &out.bytes);
+    // An error leaves an empty secret: `slice()` stays in bounds.
+    errdefer {
+        std.crypto.secureZero(u8, &out.bytes);
+        out.len = 0;
+    }
     switch (group) {
         x25519_group => {
             if (secret.len < 32) return error.KeyExchangeFailed;
@@ -353,13 +363,20 @@ pub fn serverExchange(group: u16, peer_share: []const u8, random: std.Random, ou
         mlkem1024_group => burn.run(burn.kex_mlkem1024_burn, Error!void, serverExchangeBody, .{ group, peer_share, random, out }),
         else => {
             std.crypto.secureZero(u8, &out.shared.bytes);
+            out.group = group;
+            out.public_len = 0;
+            out.shared.len = 0;
             return error.MissingKeyShare;
         },
     };
 }
 
 fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, out: *ServerExchange) Error!void {
-    errdefer std.crypto.secureZero(u8, &out.shared.bytes);
+    errdefer {
+        std.crypto.secureZero(u8, &out.shared.bytes);
+        out.public_len = 0;
+        out.shared.len = 0;
+    }
     out.group = group;
     switch (group) {
         x25519_group, secp256r1_group, secp384r1_group => {
@@ -385,10 +402,11 @@ fn serverExchangeBody(group: u16, peer_share: []const u8, random: std.Random, ou
 noinline fn hybridGenerate(random: std.Random, out: *KeyPair) Error!void {
     var kem_seed: [MlKem768.seed_length]u8 = undefined;
     random.bytes(&kem_seed);
-    const kem_kp = MlKem768.KeyPair.generateDeterministic(kem_seed) catch {
+    var kem_kp = MlKem768.KeyPair.generateDeterministic(kem_seed) catch {
         std.crypto.secureZero(u8, &kem_seed);
         return error.KeyExchangeFailed;
     };
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp.secret_key));
     out.secret[0..MlKem768.seed_length].* = kem_seed;
     std.crypto.secureZero(u8, &kem_seed);
     const x_secret = out.secret[MlKem768.seed_length..][0..32];
@@ -719,4 +737,26 @@ test "mlkem1024: both sides agree, the secret is ML-KEM's own, garbage is a type
     // The hybrid's share lengths are not ML-KEM-1024's (both directions).
     try testing.expectError(error.MissingKeyShare, sharedSecret(mlkem1024_group, &kp.secret, &(@as([hybrid_server_share_len]u8, @splat(0xAA))), &ss));
     try testing.expectError(error.KeyExchangeFailed, sharedSecret(mlkem1024_group, kp.secret[0..32], ex.public[0..ex.public_len], &ss));
+}
+
+test "sharedSecret: a share one octet long for its curve is MissingKeyShare, and an error leaves an empty secret" {
+    const a_scalar = hx(48, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30");
+    var ss: SharedSecret = .{ .bytes = @splat(0xAB), .len = 64 };
+    inline for (.{ .{ x25519_group, 32 }, .{ secp256r1_group, 65 }, .{ secp384r1_group, 97 } }) |c| {
+        var long_share: [c[1] + 1]u8 = @splat(0);
+        long_share[0] = 0x04;
+        ss.len = 64;
+        try testing.expectError(error.MissingKeyShare, sharedSecret(c[0], &a_scalar, &long_share, &ss));
+        try testing.expectEqual(@as(usize, 0), ss.slice().len);
+    }
+    ss.len = 64;
+    try testing.expectError(error.MissingKeyShare, sharedSecret(0x001e, &a_scalar, &a_scalar, &ss));
+    try testing.expectEqual(@as(usize, 0), ss.slice().len);
+    var csprng = std.Random.DefaultCsprng.init(@as([32]u8, @splat(0x33)));
+    var ex: ServerExchange = undefined;
+    ex.public_len = 99;
+    ex.shared.len = 64;
+    try testing.expectError(error.MissingKeyShare, serverExchange(secp384r1_group, &(@as([98]u8, @splat(4))), csprng.random(), &ex));
+    try testing.expectEqual(@as(usize, 0), ex.public_len);
+    try testing.expectEqual(@as(usize, 0), ex.shared.slice().len);
 }

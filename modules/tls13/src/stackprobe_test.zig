@@ -92,8 +92,8 @@ const PKs = sp.Probe(.{ .window = 64 * 1024 });
 var exporter_secret: [48]u8 = @splat(0x2f);
 var exported: [100]u8 = undefined;
 
-fn exportIt() void {
-    ks.exportKeyingMaterial(Sha384, Hkdf384, &exported, &exporter_secret, "EXPERIMENTAL-probe", "ctx");
+fn exportIt() ks.ExportError!void {
+    try ks.exportKeyingMaterial(Sha384, Hkdf384, &exported, &exporter_secret, "EXPERIMENTAL-probe", "ctx");
 }
 
 test "STACKPROBE: no exporter secret residue after exportKeyingMaterial" {

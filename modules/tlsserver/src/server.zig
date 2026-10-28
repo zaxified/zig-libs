@@ -2192,8 +2192,8 @@ pub const Server = struct {
         if (label.len > max_exporter_label_len) return error.LabelTooLong;
         if (out.len > maxExporterLen(self.suite)) return error.OutputTooLong;
         switch (self.suite) {
-            .aes_256_gcm_sha384 => ks.exportKeyingMaterial(S384.Hash, S384.Hkdf, out, &self.exporter_master_secret, label, context),
-            else => ks.exportKeyingMaterial(S256.Hash, S256.Hkdf, out, self.exporter_master_secret[0..32], label, context),
+            .aes_256_gcm_sha384 => try ks.exportKeyingMaterial(S384.Hash, S384.Hkdf, out, &self.exporter_master_secret, label, context),
+            else => try ks.exportKeyingMaterial(S256.Hash, S256.Hkdf, out, self.exporter_master_secret[0..32], label, context),
         }
     }
 
