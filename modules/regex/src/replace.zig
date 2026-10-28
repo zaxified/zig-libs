@@ -251,14 +251,14 @@ pub fn prefixInto(insts: []const syntax.Inst, ranges: []const syntax.Range, buf:
 
 /// `literalPrefix` over a program, writing through `sink.put` (false: stop).
 fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: anytype) !bool {
-    var cur: std.StaticBitSet(root.max_insts) = .empty;
-    var nxt: std.StaticBitSet(root.max_insts) = .empty;
+    var cur: std.StaticBitSet(4 * root.max_insts) = .empty;
+    var nxt: std.StaticBitSet(4 * root.max_insts) = .empty;
     var complete = true;
     var stopped = false;
     // At the start: `\A` may be passed.
     reach(insts, &cur, 0, true, &complete, &stopped);
     var steps: usize = 0;
-    while (!stopped and steps <= root.max_insts) : (steps += 1) {
+    while (!stopped and steps <= 4 * root.max_insts) : (steps += 1) {
         var single: ?u21 = null;
         var ended = false;
         var it = cur.iterator(.{});
@@ -293,7 +293,7 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
         nxt = .empty;
         var it3 = cur.iterator(.{});
         while (it3.next()) |pc| reach(insts, &nxt, @intCast(pc + 1), false, &complete, &stopped);
-        std.mem.swap(std.StaticBitSet(root.max_insts), &cur, &nxt);
+        std.mem.swap(std.StaticBitSet(4 * root.max_insts), &cur, &nxt);
     }
     return false;
 }
@@ -301,9 +301,9 @@ fn walkPrefix(insts: []const syntax.Inst, ranges: []const syntax.Range, sink: an
 /// Add to `set` the consuming states and the match reachable from `pc0`
 /// without consuming. An assertion stops the prefix (`stopped`), except `\A`
 /// at the start, which only makes it incomplete.
-fn reach(insts: []const syntax.Inst, set: *std.StaticBitSet(root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
-    var seen: std.StaticBitSet(root.max_insts) = .empty;
-    var stack: [2 * root.max_insts]u16 = undefined;
+fn reach(insts: []const syntax.Inst, set: *std.StaticBitSet(4 * root.max_insts), pc0: u16, at_start: bool, complete: *bool, stopped: *bool) void {
+    var seen: std.StaticBitSet(4 * root.max_insts) = .empty;
+    var stack: [8 * root.max_insts]u16 = undefined;
     var sp: usize = 1;
     stack[0] = pc0;
     while (sp != 0) {

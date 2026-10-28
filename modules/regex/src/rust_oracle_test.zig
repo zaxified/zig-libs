@@ -10,8 +10,8 @@
 //! (`find_iter`). No Rust at test time.
 //!
 //! Listed divergences, each counted:
-//!  - CAPACITY: past `max_insts`, `max_ranges`, `max_depth` or a count of
-//!    1000, where the crate's limit is its compiled size (10 MiB).
+//!  - CAPACITY: past the heap builder's 65,534 instructions or 65,535
+//!    ranges, or 64 groups, where the crate's limit is its compiled size.
 //!  - SHORTEST: `shortestMatch` is always the earliest end of any match;
 //!    the crate's `shortest_match` is whatever end its engine of the moment
 //!    sees first (documented as such) — the leftmost-first match's end when
@@ -28,7 +28,7 @@ const regex = @import("root.zig");
 const v = @import("rust_vectors.zig");
 
 /// SIZE_LIMIT above: refused by the crate, compiled here.
-const size_limit = [_][]const u8{ "\\w{250}", "\\w{500}", "\\w{1000}", "\\pL{1000}", "[\\w]{1000}", "(?:\\w{100}){10}" };
+const size_limit = [_][]const u8{ "\\w{250}", "\\w{500}", "\\w{1000}", "\\pL{1000}", "[\\w]{1000}", "(?:\\w{100}){10}", "\\w{10000}", "(\\w{10}){100}", "\\d{10000}" };
 
 fn sizeLimited(pattern: []const u8) bool {
     for (size_limit) |s| if (std.mem.eql(u8, s, pattern)) return true;
@@ -68,11 +68,11 @@ fn spansAgree(m: *regex.Matcher, c: v.Case, groups: []?regex.Span) bool {
 }
 
 test "rust oracle: the crate's answers to the Rust grammar" {
-    try replay(&v.patterns, false, 6, 19);
+    try replay(&v.patterns, false, 9, 5);
 }
 
 test "rust oracle: bytes mode (regex::bytes)" {
-    try replay(&v.bytes_patterns, true, 0, 1);
+    try replay(&v.bytes_patterns, true, 0, 0);
 }
 
 fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capacity: usize) !void {
@@ -113,10 +113,10 @@ fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capa
         const groups = out[0..re.names.len];
         for (p.cases) |c| {
             t.cases += 1;
-            const is = re.isMatch(c.input);
-            const full = re.fullMatch(c.input);
+            const is = try re.isMatchAlloc(testing.allocator, c.input);
+            const full = try re.fullMatchAlloc(testing.allocator, c.input);
             const spans = spansAgree(&m, c, groups);
-            const short: i32 = if (re.shortestMatch(c.input)) |e| @intCast(e) else -1;
+            const short: i32 = if (try re.shortestMatchAlloc(testing.allocator, c.input)) |e| @intCast(e) else -1;
             if (short != c.shortest and short >= 0 and c.shortest >= 0 and short < c.shortest) {
                 t.shortest_earlier += 1;
             } else if (short != c.shortest) {
@@ -186,5 +186,5 @@ test "rust oracle: RegexSet" {
     }
     try testing.expect(cases > 1000);
     try testing.expectEqual(@as(usize, 0), bad);
-    try testing.expectEqual(@as(usize, 1), capacity);
+    try testing.expectEqual(@as(usize, 0), capacity);
 }

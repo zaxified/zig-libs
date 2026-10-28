@@ -30,6 +30,13 @@ pub const max_nodes = 2048;
 pub const max_groups = 64;
 /// `{n,m}`: n, m ≤ 1000 (Go's documented limit).
 pub const max_repeat = 1000;
+/// The Rust grammar's bound on a count and on nested counts' product: the
+/// crate has none but its compiled size; this keeps the work of compiling an
+/// empty body bounded (a body that emits code meets `big_capacity` first).
+pub const max_repeat_rust = 100_000;
+/// The capacities of the largest builder (on the heap): a program of up to
+/// 65,534 instructions (indices are `u16`, 65,535 is "none").
+pub const big_capacity: Capacity = .{ .insts = 65535, .ranges = 65535, .nodes = 65535 };
 /// Nesting of groups and repetitions. Go goes deeper; 250 keeps the
 /// recursive parser and compiler within a 512 KiB thread stack even in a
 /// Debug build (a compile of untrusted patterns runs on whatever thread the
@@ -980,9 +987,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     const inner = try b.node(b.nodes[operand]);
                     b.nodes[inner].next = none;
                     b.nodes[operand] = .{ .kind = .repeat, .a = rep.min, .b = rep.max, .flag = rep.greedy, .counted = rep.counted, .child = inner, .next = b.nodes[operand].next };
-                    // Not a Rust limit (its bound is the compiled size); keeps
-                    // the compiler's work bounded as for Go.
-                    if (rep.counted and b.repeatSize(operand) > max_repeat) return error.InvalidRepeatSize;
+                    if (rep.counted and b.repeatSize(operand) > max_repeat_rust) return error.InvalidRepeatSize;
                     repeated = true;
                     last_h += 1;
                     max_h = @max(max_h, last_h);
@@ -1039,8 +1044,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     r.greedy = false;
                 }
                 if (hi != null and hi.? < min) return error.InvalidRepeatSize;
-                // Past 1000: Go's limit, kept (Rust's is the compiled size).
-                if (min > max_repeat or (hi != null and hi.? > max_repeat)) return error.InvalidRepeatSize;
+                if (min > max_repeat_rust or (hi != null and hi.? > max_repeat_rust)) return error.InvalidRepeatSize;
                 r.min = min;
                 r.max = hi orelse inf;
             }
@@ -1050,13 +1054,13 @@ pub fn BuilderOf(comptime cap: Capacity) type {
 
         /// Decimal digits with whitespace around them (always, as regex-syntax's
         /// `parse_decimal`; between the digits only with `(?x)`). Null for none;
-        /// values saturate past `max_repeat`.
+        /// values saturate past `max_repeat_rust`.
         fn rustDecimal(b: *Self, flags: Flags) ?u32 {
             while (!b.eof() and isRustSpaceAt(b.src, b.pos)) _ = b.nextRune();
             var v: u32 = 0;
             var any = false;
             while (!b.eof() and std.ascii.isDigit(b.peek())) {
-                v = @min(v * 10 + (b.peek() - '0'), max_repeat + 1);
+                v = @min(v * 10 + (b.peek() - '0'), max_repeat_rust + 1);
                 any = true;
                 _ = b.rustBump(flags);
             }

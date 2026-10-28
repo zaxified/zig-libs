@@ -24,11 +24,11 @@
 //!    complete depends on its one-pass engine. Both are prefixes every match
 //!    begins with; ours always extends Go's and is never complete where Go's
 //!    is not.
-//!  - CAPACITY: a pattern whose program needs more than `max_insts` (1024)
-//!    instructions, or that nests deeper than `max_depth` (250), compiles in
-//!    Go; here `error.PatternTooLarge` / `error.NestingDepth` — the price of
-//!    matching in fixed stack scratch with no allocator, and of a recursive
-//!    parser that fits a small thread stack.
+//!  - CAPACITY: a pattern that nests deeper than `max_depth` (250) compiles
+//!    in Go; here `error.NestingDepth` — the price of a recursive parser that
+//!    fits a small thread stack. (A program past `max_insts` compiles on the
+//!    heap; `isMatch` keeps to the stack up to `4 * max_insts`, the replay
+//!    stays under it.)
 
 const std = @import("std");
 const testing = std.testing;
@@ -279,6 +279,6 @@ test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     try testing.expectEqual(@as(usize, 0), t.bad);
     try testing.expectEqual(@as(usize, 46), t.go_defect);
     try testing.expect(t.api > 10_000); // the API answers are reached
-    try testing.expectEqual(@as(usize, 5), t.literal_prefix);
-    try testing.expectEqual(@as(usize, 5), t.capacity); // 4 Perl + `((a{0}){100}){10}` in POSIX: 2,000 saves
+    try testing.expectEqual(@as(usize, 6), t.literal_prefix);
+    try testing.expectEqual(@as(usize, 1), t.capacity); // nesting past 250 (programs past 1024 instructions compile on the heap since 2026-10-28)
 }

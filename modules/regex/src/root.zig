@@ -127,9 +127,18 @@ pub const Regex = struct {
     pub fn compileOptions(gpa: std.mem.Allocator, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
         var small: syntax.BuilderOf(small_capacity) = undefined;
         if (compileWith(gpa, &small, pattern, opts)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
-        const b = try gpa.create(syntax.Builder);
-        defer gpa.destroy(b);
-        return compileWith(gpa, b, pattern, opts);
+        {
+            const b = try gpa.create(syntax.Builder);
+            defer gpa.destroy(b);
+            if (compileWith(gpa, b, pattern, opts)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
+        }
+        // Past `max_insts` (or the other documented tables): a program of up
+        // to 65,534 instructions, compiled in ~2 MiB of heap scratch. Its
+        // `isMatch` keeps to the stack up to `4 * max_insts`; past that the
+        // `*Alloc` variants. The DFAs and the prefilter step aside.
+        const big = try gpa.create(syntax.BuilderOf(syntax.big_capacity));
+        defer gpa.destroy(big);
+        return compileWith(gpa, big, pattern, opts);
     }
 
     /// `compile` with the caller's `Builder` (~80 KiB of compile scratch, any
@@ -163,9 +172,12 @@ pub const Regex = struct {
         }
         const source = try gpa.dupe(u8, pattern);
         errdefer gpa.free(source);
-        // Bytes mode: no prefilter (its sets are of code points' bytes).
-        var pf: Prefilter = if (bytes) .{} else analyze(insts, ranges);
-        if (!bytes) if (buildTeddy(&pf, insts, ranges)) |t| {
+        // Bytes mode: no prefilter (its sets are of code points' bytes); a
+        // program past `max_insts`: none either (the analysis's scratch is
+        // sized for that).
+        const plain = !bytes and insts.len <= max_insts;
+        var pf: Prefilter = if (plain) analyze(insts, ranges) else .{};
+        if (plain) if (buildTeddy(&pf, insts, ranges)) |t| {
             const tp = try gpa.create(teddy.Teddy);
             tp.* = t;
             pf.teddy = tp;
@@ -198,25 +210,69 @@ pub const Regex = struct {
     }
 
     /// Does the pattern match anywhere in `input`? (Go's `MatchString`.)
-    /// No allocator; scratch on the stack, bounded by `max_insts`.
+    /// No allocator; scratch on the stack: a program of up to `max_insts`
+    /// instructions as always, up to `4 * max_insts` in ~33 KiB of it (bytes
+    /// mode: `max_insts`). A larger program (a pattern past `max_insts`,
+    /// compiled on the heap) panics here: use `isMatchAlloc`.
     pub fn isMatch(re: *const Regex, input: []const u8) bool {
         return re.runSet(input, false);
     }
 
     /// Does the pattern match all of `input`? (Go: `^(?:re)$` without `(?m)`.)
     /// Any way through the pattern counts, not only the leftmost-first one.
+    /// Scratch as `isMatch`.
+    pub fn fullMatch(re: *const Regex, input: []const u8) bool {
+        return re.runSet(input, true);
+    }
+
     /// Where the first match to be found ends — the earliest end of any
     /// match, not the leftmost-first one's (Rust's `shortest_match`); null
     /// when nothing matches. Cheaper than a search with positions: no start
-    /// is worked out. Runs on the set VM.
+    /// is worked out. Runs on the set VM; scratch as `isMatch`.
     pub fn shortestMatch(re: *const Regex, input: []const u8) ?usize {
         if (re.bytes) return re.runSetBytesEnd(input, false);
         var t: SliceText = .{ .input = input };
         return re.runSetEnd(&t, false);
     }
 
-    pub fn fullMatch(re: *const Regex, input: []const u8) bool {
-        return re.runSet(input, true);
+    /// `isMatch` for a program of any size: scratch from `gpa` when it is
+    /// past what `isMatch` keeps on the stack.
+    pub fn isMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
+        return (try re.endAlloc(gpa, input, false)) != null;
+    }
+
+    /// `fullMatch` for a program of any size (see `isMatchAlloc`).
+    pub fn fullMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
+        return (try re.endAlloc(gpa, input, true)) != null;
+    }
+
+    /// `shortestMatch` for a program of any size (see `isMatchAlloc`).
+    pub fn shortestMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!?usize {
+        return re.endAlloc(gpa, input, false);
+    }
+
+    fn endAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, full: bool) std.mem.Allocator.Error!?usize {
+        const fits = re.insts.len <= @as(usize, if (re.bytes) max_insts else 4 * max_insts);
+        if (fits) {
+            if (full) return if (re.runSet(input, true)) input.len else null;
+            return re.shortestMatch(input);
+        }
+        const n = re.insts.len;
+        if (re.bytes) {
+            var sets: [2]ByteSet = undefined;
+            const block = try ByteSet.alloc(gpa, &sets, n);
+            defer gpa.free(block);
+            const stack = try gpa.alloc(u16, 2 * n);
+            defer gpa.free(stack);
+            return re.bytesLoop(input, full, &sets[0], &sets[1], stack);
+        }
+        var sets: [2]HeapSet = undefined;
+        const block = try HeapSet.alloc(gpa, &sets, n);
+        defer gpa.free(block);
+        const stack = try gpa.alloc(u16, 2 * n);
+        defer gpa.free(stack);
+        var t: SliceText = .{ .input = input };
+        return re.setLoop(&t, full, &sets[0], &sets[1], stack);
     }
 
     /// Go's `Expand`: `template` with `$1`, `${name}`, `$$` replaced from a
@@ -228,8 +284,9 @@ pub const Regex = struct {
     /// Go's `LiteralPrefix`: writes the literal text every match begins with;
     /// true when that text is the whole pattern.
     pub fn literalPrefix(re: *const Regex, w: *std.Io.Writer) std.Io.Writer.Error!bool {
-        // Bytes mode: its byte classes are no text; the empty prefix holds.
-        if (re.bytes) return false;
+        // Bytes mode: its byte classes are no text; a program past
+        // `4 * max_insts`: past the walk's scratch. The empty prefix holds.
+        if (re.bytes or re.insts.len > 4 * max_insts) return false;
         return replace.literalPrefix(re, w);
     }
 
@@ -468,13 +525,28 @@ pub const Regex = struct {
     /// `runSetOn`, giving where the first match to be seen ends (the
     /// earliest end of any match), or null.
     noinline fn runSetEnd(re: *const Regex, text: anytype, full: bool) ?usize {
+        if (re.insts.len > max_insts) return re.runSetEndWide(text, full);
         // `undefined`, not `.{}`: a default-initialised StateSet is written
         // whole (~2 KiB each) on every call — measured as 85 % of `isMatch`.
         var lists: [2]StateSet = undefined;
-        const words = (re.insts.len + 63) / 64;
         var stack: [2 * max_insts]u16 = undefined;
-        var cur: *StateSet = &lists[0];
-        var nxt: *StateSet = &lists[1];
+        return re.setLoop(text, full, &lists[0], &lists[1], &stack);
+    }
+
+    /// `runSetEnd` for a program past `max_insts`: up to `4 * max_insts` on
+    /// the stack, else a panic (the caller should have used `isMatchAlloc`).
+    noinline fn runSetEndWide(re: *const Regex, text: anytype, full: bool) ?usize {
+        if (re.insts.len > 4 * max_insts) @panic("regex: a program this large needs isMatchAlloc / fullMatchAlloc / shortestMatchAlloc");
+        var lists: [2]StateSetOf(4 * max_insts) = undefined;
+        var stack: [8 * max_insts]u16 = undefined;
+        return re.setLoop(text, full, &lists[0], &lists[1], &stack);
+    }
+
+    /// The set VM's loop over sets `cur0`/`nxt0` (fixed or heap).
+    inline fn setLoop(re: *const Regex, text: anytype, full: bool, cur0: anytype, nxt0: @TypeOf(cur0), stack: []u16) ?usize {
+        const words = (re.insts.len + 63) / 64;
+        var cur = cur0;
+        var nxt = nxt0;
         var pos: usize = 0;
         var prev: ?u21 = null;
         cur.clear(words);
@@ -492,7 +564,7 @@ pub const Regex = struct {
                 }
             }
             const here = text.at(pos);
-            if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, &stack);
+            if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, stack);
             // No thread left: anchored, nothing can start later; unanchored,
             // the next position starts a new one.
             if (cur.n == 0 and (full or here.cp == null)) return null;
@@ -502,13 +574,13 @@ pub const Regex = struct {
                 switch (re.insts[pc]) {
                     .match => if (!full or here.cp == null) return pos,
                     else => if (here.cp) |cp| if (re.consumes(pc, cp))
-                        re.closureSet(nxt, pc + 1, cp, after.cp, &stack),
+                        re.closureSet(nxt, pc + 1, cp, after.cp, stack),
                 }
             }
             if (here.cp == null) return null;
             pos += here.w;
             prev = here.cp;
-            std.mem.swap(*StateSet, &cur, &nxt);
+            std.mem.swap(@TypeOf(cur), &cur, &nxt);
         }
     }
 
@@ -593,7 +665,7 @@ pub const Regex = struct {
 
     /// Add `pc0` and every state reachable from it without consuming input,
     /// at a position between `prev` and `next`.
-    fn closureSet(re: *const Regex, set: anytype, pc0: u16, prev: ?u21, next: ?u21, stack: *[2 * max_insts]u16) void {
+    fn closureSet(re: *const Regex, set: anytype, pc0: u16, prev: ?u21, next: ?u21, stack: []u16) void {
         var sp: usize = 0;
         stack[sp] = pc0;
         sp += 1;
@@ -622,7 +694,7 @@ pub const Regex = struct {
                 },
                 .rune, .any, .any_not_nl, .match => {
                     set.pcs[set.n] = pc;
-                    if (@TypeOf(set) == *ByteSet) set.rem[set.n] = 0;
+                    if (@hasField(@TypeOf(set.*), "rem")) set.rem[set.n] = 0;
                     set.n += 1;
                 },
             }
@@ -656,21 +728,27 @@ pub const Regex = struct {
     }
 
     noinline fn runSetBytesEnd(re: *const Regex, input: []const u8, full: bool) ?usize {
-        var lists: [2]ByteSet = undefined;
+        if (re.insts.len > max_insts) @panic("regex: a bytes-mode program this large needs isMatchAlloc / fullMatchAlloc / shortestMatchAlloc");
+        var storage: ByteSet.Fixed = undefined;
+        var sets = storage.sets();
         var stack: [2 * max_insts]u16 = undefined;
-        var cur: *ByteSet = &lists[0];
-        var nxt: *ByteSet = &lists[1];
+        return re.bytesLoop(input, full, &sets[0], &sets[1], &stack);
+    }
+
+    fn bytesLoop(re: *const Regex, input: []const u8, full: bool, cur0: *ByteSet, nxt0: *ByteSet, stack: []u16) ?usize {
+        var cur = cur0;
+        var nxt = nxt0;
         cur.clear();
         var pos: usize = 0;
         while (true) {
             const at_end = pos >= input.len;
-            if (!full or pos == 0) re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), &stack);
+            if (!full or pos == 0) re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), stack);
             if (cur.n == 0 and (full or at_end)) return null;
             nxt.clear();
             const q = pos + 1;
             for (cur.pcs[0..cur.n], cur.rem[0..cur.n]) |pc, rem| {
                 if (rem != 0) {
-                    if (rem == 1) re.closureSet(nxt, pc, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc, rem - 1);
+                    if (rem == 1) re.closureSet(nxt, pc, bytesBefore(input, q), bytesAt(input, q), stack) else nxt.pending(pc, rem - 1);
                     continue;
                 }
                 if (re.insts[pc] == .match) {
@@ -678,7 +756,7 @@ pub const Regex = struct {
                     continue;
                 }
                 const w = re.consumeBytes(pc, input, pos) orelse continue;
-                if (w == 1) re.closureSet(nxt, pc + 1, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc + 1, @intCast(w - 1));
+                if (w == 1) re.closureSet(nxt, pc + 1, bytesBefore(input, q), bytesAt(input, q), stack) else nxt.pending(pc + 1, @intCast(w - 1));
             }
             if (at_end) return null;
             pos = q;
@@ -701,7 +779,8 @@ pub const Regex = struct {
 /// compiled one by one and joined into one program — a chain of splits, one
 /// branch per pattern, each keeping its own `match` — which a set of threads
 /// runs once over the text, unanchored. No positions: ask a `Regex` for
-/// those. The program is bounded by `max_insts` like one pattern's.
+/// those. The joined program is bounded by `4 * max_insts` (bytes mode:
+/// `max_insts`): its scratch is on the stack.
 pub const RegexSet = struct {
     insts: []const Inst,
     ranges: []const Range,
@@ -725,7 +804,9 @@ pub const RegexSet = struct {
             n_insts += re.insts.len;
             n_ranges += re.ranges.len;
         }
-        if (n_insts > max_insts) return error.PatternTooLarge;
+        // Its runs keep their scratch on the stack (as `Regex.isMatch`).
+        const bytes = !opts.utf8 and opts.syntax == .rust;
+        if (n_insts > @as(usize, if (bytes) max_insts else 4 * max_insts)) return error.PatternTooLarge;
         const insts = try gpa.alloc(Inst, n_insts);
         errdefer gpa.free(insts);
         const ranges = try gpa.alloc(Range, n_ranges);
@@ -756,7 +837,7 @@ pub const RegexSet = struct {
             at += @intCast(re.insts.len);
             rat += @intCast(re.ranges.len);
         }
-        return .{ .insts = insts, .ranges = ranges, .ends = ends, .bytes = !opts.utf8 and opts.syntax == .rust };
+        return .{ .insts = insts, .ranges = ranges, .ends = ends, .bytes = bytes };
     }
 
     pub fn deinit(set: *RegexSet, gpa: std.mem.Allocator) void {
@@ -810,36 +891,46 @@ pub const RegexSet = struct {
         const re = set.view();
         var found: usize = 0;
         if (set.bytes) return set.runBytes(&re, input, out, &found) or found != 0;
+        if (re.insts.len > max_insts) {
+            var wide: [2]StateSetOf(4 * max_insts) = undefined;
+            var stack: [8 * max_insts]u16 = undefined;
+            return set.runLoop(&re, input, out, &found, &wide[0], &wide[1], &stack);
+        }
         var lists: [2]StateSet = undefined;
         var stack: [2 * max_insts]u16 = undefined;
+        return set.runLoop(&re, input, out, &found, &lists[0], &lists[1], &stack);
+    }
+
+    inline fn runLoop(set: *const RegexSet, re: *const Regex, input: []const u8, out: ?[]bool, found: *usize, cur0: anytype, nxt0: @TypeOf(cur0), stack: []u16) bool {
         const words = (re.insts.len + 63) / 64;
-        var cur: *StateSet = &lists[0];
-        var nxt: *StateSet = &lists[1];
+        var cur = cur0;
+        var nxt = nxt0;
         cur.clear(words);
         var pos: usize = 0;
         var prev: ?u21 = null;
         while (true) {
             const here = decode(input, pos);
-            re.closureSet(cur, 0, prev, here.cp, &stack);
+            re.closureSet(cur, 0, prev, here.cp, stack);
             nxt.clear(words);
             const after = if (here.cp != null) decode(input, pos + here.w) else here;
             for (cur.pcs[0..cur.n]) |pc| {
                 switch (re.insts[pc]) {
-                    .match => if (set.hit(out, &found, pc)) return true,
+                    .match => if (set.hit(out, found, pc)) return true,
                     else => if (here.cp) |cp| if (re.consumes(pc, cp))
-                        re.closureSet(nxt, pc + 1, cp, after.cp, &stack),
+                        re.closureSet(nxt, pc + 1, cp, after.cp, stack),
                 }
             }
-            if (here.cp == null) return found != 0;
+            if (here.cp == null) return found.* != 0;
             pos += here.w;
             prev = here.cp;
-            std.mem.swap(*StateSet, &cur, &nxt);
+            std.mem.swap(@TypeOf(cur), &cur, &nxt);
         }
     }
 
     /// `run` in bytes mode, as `Regex.runSetBytes`.
     noinline fn runBytes(set: *const RegexSet, re: *const Regex, input: []const u8, out: ?[]bool, found: *usize) bool {
-        var lists: [2]ByteSet = undefined;
+        var storage: ByteSet.Fixed = undefined;
+        var lists = storage.sets();
         var stack: [2 * max_insts]u16 = undefined;
         var cur: *ByteSet = &lists[0];
         var nxt: *ByteSet = &lists[1];
@@ -928,21 +1019,69 @@ pub fn matches(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) (
     return re.isMatch(input);
 }
 
-/// `StateSet` for bytes mode: also threads inside a UTF-8 sequence, `rem`
-/// bytes from its end (1..3), each (instruction, rem) once.
+/// A bit set over slices of words (the heap sets').
+const SliceBits = struct {
+    masks: []u64,
+
+    fn isSet(b: SliceBits, i: usize) bool {
+        return b.masks[i >> 6] & (@as(u64, 1) << @truncate(i)) != 0;
+    }
+
+    fn set(b: SliceBits, i: usize) void {
+        b.masks[i >> 6] |= @as(u64, 1) << @truncate(i);
+    }
+};
+
+/// The set VM's threads in bytes mode: also those inside a UTF-8 sequence,
+/// `rem` bytes from its end (1..3), each (instruction, rem) once. Slices,
+/// over `Fixed` (a program of up to `max_insts`, on the stack) or the heap.
 const ByteSet = struct {
-    pcs: [4 * max_insts]u16,
-    rem: [4 * max_insts]u8,
-    n: u16,
-    seen: std.StaticBitSet(4 * max_insts),
+    pcs: []u16,
+    rem: []u8,
+    n: u32 = 0,
+    seen: SliceBits,
+    /// Instructions per `rem` row of `seen`.
+    stride: usize,
+
+    const Fixed = struct {
+        pcs: [2][4 * max_insts]u16,
+        rem: [2][4 * max_insts]u8,
+        masks: [2][4 * max_insts / 64]u64,
+
+        fn sets(f: *Fixed) [2]ByteSet {
+            var out: [2]ByteSet = undefined;
+            for (&out, 0..) |*b, i| b.* = .{ .pcs = &f.pcs[i], .rem = &f.rem[i], .seen = .{ .masks = &f.masks[i] }, .stride = max_insts };
+            return out;
+        }
+    };
+
+    /// Two sets for a program of `n` instructions, in one allocation (returned
+    /// for the caller to free).
+    fn alloc(gpa: std.mem.Allocator, out: *[2]ByteSet, n: usize) std.mem.Allocator.Error![]u64 {
+        const words_seen = (4 * n + 63) / 64;
+        const words_pcs = (4 * n * 2 + 7) / 8;
+        const words_rem = (4 * n + 7) / 8;
+        const per = words_seen + words_pcs + words_rem;
+        const block = try gpa.alloc(u64, 2 * per);
+        for (out, 0..) |*b, i| {
+            const part = block[i * per ..][0..per];
+            b.* = .{
+                .seen = .{ .masks = part[0..words_seen] },
+                .pcs = @as([*]u16, @ptrCast(part[words_seen..].ptr))[0 .. 4 * n],
+                .rem = @as([*]u8, @ptrCast(part[words_seen + words_pcs ..].ptr))[0 .. 4 * n],
+                .stride = n,
+            };
+        }
+        return block;
+    }
 
     fn clear(s: *ByteSet) void {
         s.n = 0;
-        @memset(&s.seen.masks, 0);
+        @memset(s.seen.masks, 0);
     }
 
     fn pending(s: *ByteSet, pc: u16, rem: u8) void {
-        const key = @as(usize, rem) * max_insts + pc;
+        const key = @as(usize, rem) * s.stride + pc;
         if (s.seen.isSet(key)) return;
         s.seen.set(key);
         s.pcs[s.n] = pc;
@@ -951,14 +1090,42 @@ const ByteSet = struct {
     }
 };
 
-const StateSet = struct {
-    pcs: [max_insts]u16,
-    n: u16,
-    seen: std.StaticBitSet(max_insts),
+const StateSet = StateSetOf(max_insts);
 
-    /// Empty the set; only the first `words` of `seen` (the program's
-    /// length) are ever looked at.
-    fn clear(s: *StateSet, words: usize) void {
+fn StateSetOf(comptime cap: usize) type {
+    return struct {
+        pcs: [cap]u16,
+        n: u16,
+        seen: std.StaticBitSet(cap),
+
+        /// Empty the set; only the first `words` of `seen` (the program's
+        /// length) are ever looked at.
+        fn clear(s: *@This(), words: usize) void {
+            s.n = 0;
+            @memset(s.seen.masks[0..words], 0);
+        }
+    };
+}
+
+/// `StateSet` on the heap, for a program of any size (`isMatchAlloc`).
+const HeapSet = struct {
+    pcs: []u16,
+    n: u16 = 0,
+    seen: SliceBits,
+
+    fn alloc(gpa: std.mem.Allocator, out: *[2]HeapSet, n: usize) std.mem.Allocator.Error![]u64 {
+        const words_seen = (n + 63) / 64;
+        const words_pcs = (2 * n + 7) / 8;
+        const per = words_seen + words_pcs;
+        const block = try gpa.alloc(u64, 2 * per);
+        for (out, 0..) |*h, i| {
+            const part = block[i * per ..][0..per];
+            h.* = .{ .seen = .{ .masks = part[0..words_seen] }, .pcs = @as([*]u16, @ptrCast(part[words_seen..].ptr))[0..n] };
+        }
+        return block;
+    }
+
+    fn clear(s: *HeapSet, words: usize) void {
         s.n = 0;
         @memset(s.seen.masks[0..words], 0);
     }
@@ -4729,7 +4896,30 @@ test "compile: a pattern past the stack builder's capacity takes the full one" {
     defer re.deinit(testing.allocator);
     try testing.expect(re.insts.len > small_capacity.insts);
     try testing.expect(re.fullMatch(strRepeat("a", 600)));
-    try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, "a{1000}b{1000}"));
+}
+
+test "compile: a pattern past max_insts compiles on the heap and matches" {
+    var re = try Regex.compile(testing.allocator, "a{1000}b{1000}");
+    defer re.deinit(testing.allocator);
+    try testing.expect(re.insts.len > max_insts);
+    const text = strRepeat("a", 1000) ++ strRepeat("b", 1000);
+    // Up to 4 * max_insts: the stack variants; any size: the `*Alloc` ones.
+    try testing.expect(re.fullMatch(text));
+    try testing.expect(!re.isMatch(text[1..]));
+    try testing.expect(try re.fullMatchAlloc(testing.allocator, text));
+    try testing.expectEqual(@as(?usize, 2001), try re.shortestMatchAlloc(testing.allocator, "x" ++ text));
+    try testing.expectEqual(@as(?usize, null), try re.shortestMatchAlloc(testing.allocator, "x" ++ text[1..]));
+    var m = try Matcher.init(testing.allocator, &re);
+    defer m.deinit();
+    try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 2001 }), m.find("x" ++ text, 0));
+    // Past what `isMatch` keeps on the stack: only `isMatchAlloc`.
+    var huge = try Regex.compile(testing.allocator, "a{1000}b{1000}c{1000}d{1000}e{1000}");
+    defer huge.deinit(testing.allocator);
+    try testing.expect(huge.insts.len > 4 * max_insts);
+    const all = strRepeat("a", 1000) ++ strRepeat("b", 1000) ++ strRepeat("c", 1000) ++ strRepeat("d", 1000) ++ strRepeat("e", 1000);
+    try testing.expect(try huge.isMatchAlloc(testing.allocator, "x" ++ all));
+    try testing.expect(!try huge.isMatchAlloc(testing.allocator, all[1..]));
+    try testing.expect(try huge.fullMatchAlloc(testing.allocator, all));
 }
 
 test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {
