@@ -505,13 +505,13 @@ fn buildPathMemo(
     // x509's own guard has seen it. Without this a malformed intermediate
     // made std index far out of bounds (fuzz driver, 2026-10-10: a safety
     // panic in `Certificate.parse` via `verifyLink`; an out-of-bounds read in
-    // ReleaseFast). Trust anchors are the caller's own configuration.
+    // ReleaseFast). Trust anchors get the same guard before std parses
+    // them (`Memo.parse`): an anchor file is configuration, not always the
+    // caller's own (no-panic sweep 2026-10-28 F1).
     for (chain) |cert_der| {
         if (cert_der.len > safe.max_pq_certificate_len) return error.CertificateFieldHasInvalidLength;
-        safe.validateForStdParse(cert_der) catch |err| return switch (err) {
-            error.EmptyBitString => error.CertificateHasInvalidBitString,
-            else => error.CertificateFieldHasInvalidLength,
-        };
+        try guardStdParse(cert_der);
+        memo.markGuarded(cert_der);
     }
 
     var path: std.ArrayList(PathEntry) = .empty;
@@ -1006,7 +1006,8 @@ pub fn verifySlhDsaLink(
 
 /// A signed structure with the certificate's outer shape — `SEQUENCE { tbs,
 /// signatureAlgorithm, signatureValue }` — that is not a certificate: a CRL
-/// (RFC 5280 §5.1). Offsets are into `buffer`.
+/// (RFC 5280 §5.1). Offsets are into `buffer`. Build it with `crl.parse`:
+/// `verifySignedBy` slices `buffer` with these offsets unchecked.
 pub const SignedData = struct {
     buffer: []const u8,
     /// The `tbs…` TLV (tag+length+content): what was signed.
@@ -1121,6 +1122,8 @@ pub fn verifySignedBy(data: SignedData, issuer_der: CertDer) VerifyChainError!vo
         .validity = .{ .not_before = 0, .not_after = std.math.maxInt(u64) },
         .version = .v3,
     };
+    // `issuer_der` is the caller's, maybe a peer's intermediate (sweep F2).
+    try guardStdParse(issuer_der);
     const issuer_parsed = issuer_cert.parse() catch |err| switch (err) {
         error.CertificateHasUnrecognizedObjectId => try partialIssuerParsed(issuer_cert, issuer_shape),
         else => |e| return e,
@@ -1257,6 +1260,8 @@ const Memo = struct {
     ders: [cap]CertDer = undefined,
     shapes: [cap]?Shape = @splat(null),
     parsed: [cap]?Certificate.Parsed = @splat(null),
+    /// Passed `guardStdParse` already (the chain, at the top of `buildPath`).
+    guarded: [cap]bool = @splat(false),
     len: usize = 0,
 
     fn slot(m: *Memo, cert_der: CertDer) ?usize {
@@ -1277,15 +1282,36 @@ const Memo = struct {
         return s;
     }
 
+    fn markGuarded(m: *Memo, cert_der: CertDer) void {
+        if (m.slot(cert_der)) |i| m.guarded[i] = true;
+    }
+
+    /// std's `Certificate.parse`, never on DER `guardStdParse` has not seen.
     fn parse(m: *Memo, cert_der: CertDer) Certificate.ParseError!Certificate.Parsed {
         const cert: Certificate = .{ .buffer = cert_der, .index = 0 };
-        const i = m.slot(cert_der) orelse return cert.parse();
+        const i = m.slot(cert_der) orelse {
+            try guardStdParse(cert_der);
+            return cert.parse();
+        };
         if (m.parsed[i]) |p| return p;
+        if (!m.guarded[i]) {
+            try guardStdParse(cert_der);
+            m.guarded[i] = true;
+        }
         const p = try cert.parse();
         m.parsed[i] = p;
         return p;
     }
 };
+
+/// `safe.validateForStdParse` in std's error vocabulary: std's
+/// `Certificate.parse` indexes past the buffer on DER this has not checked.
+fn guardStdParse(cert_der: CertDer) Certificate.ParseError!void {
+    safe.validateForStdParse(cert_der) catch |err| return switch (err) {
+        error.EmptyBitString => error.CertificateHasInvalidBitString,
+        else => error.CertificateFieldHasInvalidLength,
+    };
+}
 
 fn parseShape(cert: Certificate) Certificate.ParseError!Shape {
     const bytes = cert.buffer;

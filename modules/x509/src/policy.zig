@@ -25,7 +25,8 @@ pub const Error = error{
     /// inhibitAnyPolicy extension that does not decode, repeats a policy (Go
     /// refuses that at parse), or maps to or from anyPolicy (§4.2.1.5).
     CertificatePolicyInvalid,
-    /// The policy graph outgrew `Options.max_graph_edges`.
+    /// The policy graph outgrew `Options.max_graph_edges`, or building it
+    /// took more than `Options.max_steps`.
     PolicyGraphTooLarge,
 } || std.mem.Allocator.Error || extensions.FindExtensionsError || extensions.IterateError;
 
@@ -47,6 +48,11 @@ pub const Options = struct {
     /// most 64 KiB, so policies and mappings per level are bounded, but edges
     /// between two levels are their product.
     max_graph_edges: u32 = 100_000,
+    /// Cap on the scanning work behind the graph (nodes visited per policy,
+    /// mappings per issuer-domain policy, parents per link). Without it a CA
+    /// certificate with a few thousand policies or mappings costs work cubic
+    /// in their count while adding few edges (no-panic sweep 2026-10-28 F5).
+    max_steps: u64 = 10_000_000,
 };
 
 pub const oid_any_policy = [_]u8{ 0x55, 0x1d, 0x20, 0x00 };
@@ -119,6 +125,7 @@ pub fn check(gpa: std.mem.Allocator, path: []const []const u8, opts: Options) Er
     var policy_mapping: u64 = if (opts.inhibit_mapping) 0 else n + 1;
     var inhibit_any: u64 = if (opts.inhibit_any) 0 else n + 1;
     var edges: u32 = 0;
+    var steps: u64 = 0;
 
     // §6.1.2 (a): one anyPolicy node. `prev` is the level of certificate i-1.
     var prev: Level = .{};
@@ -138,14 +145,16 @@ pub fn check(gpa: std.mem.Allocator, path: []const []const u8, opts: Options) Er
                 // (d)(1)(i): children of every node expecting `p` ...
                 var matched = false;
                 for (prev.nodes.items, 0..) |pn, pi| {
+                    try spend(&steps, 1 + pn.expected.len, opts);
                     if (!alive(pn) or !contains(pn.expected, p)) continue;
                     matched = true;
-                    try link(a, &cur, p, @intCast(pi), &edges, opts);
+                    try link(a, &cur, p, @intCast(pi), &edges, &steps, opts);
                 }
                 // (d)(1)(ii): ... else of the anyPolicy node.
                 if (!matched) for (prev.nodes.items, 0..) |pn, pi| {
+                    try spend(&steps, 1, opts);
                     if (!alive(pn) or !isAny(pn.policy)) continue;
-                    try link(a, &cur, p, @intCast(pi), &edges, opts);
+                    try link(a, &cur, p, @intCast(pi), &edges, &steps, opts);
                 };
             }
             // (d)(2): anyPolicy stands in for every expected policy of a
@@ -153,10 +162,11 @@ pub fn check(gpa: std.mem.Allocator, path: []const []const u8, opts: Options) Er
             if (cp.has_any and (inhibit_any > 0 or (i < n and cp.self_issued))) {
                 const from_d1 = cur.nodes.items.len;
                 for (prev.nodes.items, 0..) |pn, pi| {
+                    try spend(&steps, 1 + pn.expected.len, opts);
                     if (!alive(pn)) continue;
                     for (pn.expected) |e| {
                         if (cur.find(e)) |ci| if (ci < from_d1) continue;
-                        try link(a, &cur, e, @intCast(pi), &edges, opts);
+                        try link(a, &cur, e, @intCast(pi), &edges, &steps, opts);
                     }
                 }
             }
@@ -178,9 +188,15 @@ pub fn check(gpa: std.mem.Allocator, path: []const []const u8, opts: Options) Er
         }
 
         // §6.1.4 (a), (b): mappings rewrite the expected sets of this level.
-        if (!graph_null) for (cp.mappings) |m| {
+        if (!graph_null) for (cp.mappings, 0..) |m, mi| {
             if (policy_mapping > 0) {
-                const mapped = try mappedSet(a, cp.mappings, m[0]);
+                // One rewrite per issuer-domain policy: a later mapping from
+                // the same one was folded into `mapped` already.
+                try spend(&steps, mi, opts);
+                if (for (cp.mappings[0..mi]) |e| {
+                    if (std.mem.eql(u8, e[0], m[0])) break true;
+                } else false) continue;
+                const mapped = try mappedSet(a, cp.mappings, m[0], &steps, opts);
                 if (prev.find(m[0])) |ni| {
                     prev.nodes.items[ni].expected = mapped;
                 } else if (prev.find(&oid_any_policy)) |ai| {
@@ -253,24 +269,32 @@ fn contains(set: []const []const u8, p: []const u8) bool {
 }
 
 fn charge(edges: *u32, opts: Options) error{PolicyGraphTooLarge}!void {
-    edges.* += 1;
+    edges.* +|= 1;
     if (edges.* > opts.max_graph_edges) return error.PolicyGraphTooLarge;
 }
 
 /// Adds `parent` to the node for `policy` in `level`, creating the node with
 /// expected set {policy}.
-fn link(a: std.mem.Allocator, level: *Level, policy: []const u8, parent: u32, edges: *u32, opts: Options) !void {
+fn link(a: std.mem.Allocator, level: *Level, policy: []const u8, parent: u32, edges: *u32, steps: *u64, opts: Options) !void {
     try charge(edges, opts);
     const ni = level.find(policy) orelse try level.add(a, policy, try a.dupe([]const u8, &.{policy}));
     const parents = &level.nodes.items[ni].parents;
+    try spend(steps, parents.items.len, opts);
     for (parents.items) |p| if (p == parent) return;
     try parents.append(a, parent);
 }
 
-fn mappedSet(a: std.mem.Allocator, mappings: []const [2][]const u8, issuer_p: []const u8) ![]const []const u8 {
+fn spend(steps: *u64, n: u64, opts: Options) error{PolicyGraphTooLarge}!void {
+    steps.* +|= n;
+    if (steps.* > opts.max_steps) return error.PolicyGraphTooLarge;
+}
+
+fn mappedSet(a: std.mem.Allocator, mappings: []const [2][]const u8, issuer_p: []const u8, steps: *u64, opts: Options) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (mappings) |m| {
+        try spend(steps, 1, opts);
         if (!std.mem.eql(u8, m[0], issuer_p)) continue;
+        try spend(steps, out.items.len, opts);
         if (!contains(out.items, m[1])) try out.append(a, m[1]);
     }
     return out.items;

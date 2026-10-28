@@ -1172,3 +1172,68 @@ test "audit 2026-10-26: VerifiedChain.leaf is the leaf's own parse" {
     try testing.expectEqual(c.presented[0].ptr, v.leaf_der.ptr);
     try testing.expectEqualStrings("leaf", v.leaf.?.commonName());
 }
+
+const policy_mod = @import("policy.zig");
+
+test "no-panic sweep 2026-10-28 F1: a trust anchor std cannot read is an error, not a panic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    // An RSA key whose RSAPublicKey header promises 266 octets and holds 5:
+    // std's `rsa.PublicKey.parseDer` reads the exponent's header past the
+    // key (an index panic, or an out-of-bounds read in ReleaseFast). The
+    // chain was guarded against this since 2026-10-10; anchors were not.
+    const rsa_oid = try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }});
+    const spki = try g.seq(&.{ try g.seq(&.{ rsa_oid, try g.tlv(0x05, &.{}) }), try g.tlv(0x03, &.{&.{ 0x00, 0x30, 0x82, 0x01, 0x0a, 0x02, 0x82, 0x01, 0x01, 0x00 }}) });
+    const root_name = try g.name("RSA Root");
+    const root = try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k, .signer = &k, .spki = spki, .exts = &.{ try g.extCa(null), try g.extKuCa() } });
+    // sha256WithRSAEncryption: the link goes to the RSA path, which reads the
+    // anchor's key before the (ECDSA) signature bytes.
+    const sha256_rsa = try g.seq(&.{ try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b }}), try g.tlv(0x05, &.{}) });
+    const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = root_name, .key = &k, .signer = &k, .sig_alg = sha256_rsa, .exts = &.{ try g.extSanDns("example.com"), try g.extKuLeaf() } });
+    try testing.expectError(error.CertificateFieldHasInvalidLength, chain_mod.verifyChain(testing.allocator, &.{leaf}, &.{root}, .{ .now_sec = certgen.t_now }));
+}
+
+test "no-panic sweep 2026-10-28 F3: more than max_extensions extensions is refused, the limit itself is not" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const c = try testChain(&g, .{});
+    const k_inter = certgen.key(0x62);
+    const k_leaf = certgen.key(0x65);
+    const max = @import("extensions.zig").max_extensions;
+    for ([_]usize{ max, max + 1 }) |n| {
+        var exts: std.ArrayList([]const u8) = .empty;
+        try exts.appendSlice(g.a, &.{ try g.extSanDns("example.com"), try g.extKuLeaf() });
+        // Distinct private OIDs 1.3.6.1.4.1.99999.<i>, non-critical.
+        var i: usize = 0;
+        while (exts.items.len < n) : (i += 1) {
+            try exts.append(g.a, try g.extension(&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, @intCast(i & 0x7f), @intCast(i >> 7) }, false, &.{ 0x05, 0x00 }));
+        }
+        const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = try g.name("Test Inter 1"), .key = &k_leaf, .signer = &k_inter, .exts = exts.items });
+        const r = chain_mod.verifyChain(testing.allocator, &.{ leaf, c.presented[1] }, &c.roots, .{ .now_sec = certgen.t_now });
+        if (n == max) _ = try r else try testing.expectError(error.CertificateFieldHasInvalidLength, r);
+    }
+}
+
+test "no-panic sweep 2026-10-28 F5: thousands of policyMappings cost bounded work, max_steps refuses past it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    const p_oid = try g.tlv(0x06, &.{&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x01 }});
+    const policies = try g.extension(&.{ 0x55, 0x1d, 0x20 }, false, try g.seq(&.{try g.seq(&.{p_oid})}));
+    // 2,000 mappings P -> Q_i: before, every one rebuilt the mapped set of P,
+    // O(M^3) compares (8e9) and O(M^2) arena memory.
+    var maps: std.ArrayList([]const u8) = .empty;
+    for (0..2000) |i| {
+        const q = try g.tlv(0x06, &.{&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, 0x02, @intCast(0x80 | (i >> 7)), @intCast(i & 0x7f) }});
+        try maps.append(g.a, try g.seq(&.{ p_oid, q }));
+    }
+    const mappings = try g.extension(&.{ 0x55, 0x1d, 0x21 }, false, try g.seq(maps.items));
+    const ca = try g.cert(.{ .subject = try g.name("CA"), .issuer = try g.name("Root"), .key = &k, .signer = &k, .exts = &.{ try g.extCa(null), policies, mappings } });
+    const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = try g.name("CA"), .key = &k, .signer = &k, .exts = &.{policies} });
+    try policy_mod.check(testing.allocator, &.{ ca, leaf }, .{});
+    try testing.expectError(error.PolicyGraphTooLarge, policy_mod.check(testing.allocator, &.{ ca, leaf }, .{ .max_steps = 100_000 }));
+}

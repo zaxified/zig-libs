@@ -63,7 +63,9 @@ pub fn parseElement(bytes: []const u8, index: u32) der.Element.ParseError!der.El
         for (bytes[idx + 2 ..][0..len_size]) |b| length = (length << 8) | b;
         end = idx + 2 + len_size + length;
     }
-    if (end > bytes.len) return error.CertificateFieldHasInvalidLength;
+    // std's offsets are u32: an element ending past 4 GiB (a buffer that
+    // large) would wrap there too.
+    if (end > bytes.len or end > std.math.maxInt(u32)) return error.CertificateFieldHasInvalidLength;
     const elem = try der.Element.parse(bytes, index);
     if (elem.slice.start > elem.slice.end or elem.slice.end > bytes.len) {
         return error.CertificateFieldHasInvalidLength;
@@ -239,6 +241,14 @@ pub fn iterate(extensions_slice: der.Element.Slice, cert: Certificate) Extension
 
 pub const HygieneError = error{ UnhandledCriticalExtension, DuplicateExtension };
 
+/// The most extensions `checkHygiene` (so `chain.verifyChain`) accepts in one
+/// certificate. The duplicate check is quadratic, and a 64 KiB certificate
+/// holds about 9,000 seven-byte extensions, some 44 million element parses
+/// per candidate issuer, and a path tries up to 100 candidates (no-panic
+/// sweep 2026-10-28 F3).
+/// Go has no limit; certificates in use carry a few dozen at most.
+pub const max_extensions = 128;
+
 /// Extensions `chain.verifyChain` acts on, or may ignore without changing
 /// the verdict, and therefore accepts when marked critical. OID content bytes.
 /// Not here although understood: subjectKeyIdentifier and
@@ -263,15 +273,22 @@ pub const handled_critical_oids = [_][]const u8{
 /// critical OID that is neither in `handled_critical_oids` nor in `extra_ok`
 /// is `UnhandledCriticalExtension` (§4.2: a system "MUST reject the
 /// certificate if it encounters a critical extension it does not recognize").
+/// More than `max_extensions` extensions is `CertificateFieldHasInvalidLength`.
 pub fn checkHygiene(
     cert: Certificate,
     extra_ok: []const []const u8,
 ) (FindExtensionsError || IterateError || HygieneError)!void {
     const exts = (try findExtensions(cert)) orelse return;
+    var count_it = iterate(exts, cert);
+    var n: usize = 0;
+    while (try count_it.next()) |_| {
+        n += 1;
+        if (n > max_extensions) return error.CertificateFieldHasInvalidLength;
+    }
     var it = iterate(exts, cert);
     while (try it.next()) |entry| {
-        // Quadratic in the extension count, without allocation; a certificate
-        // is at most 64 KiB, so a few thousand extensions at worst.
+        // Quadratic in the extension count, without allocation, bounded by
+        // `max_extensions`.
         var later = it;
         while (try later.next()) |other| {
             if (std.mem.eql(u8, entry.oid, other.oid)) return error.DuplicateExtension;
@@ -597,7 +614,8 @@ pub const SubtreeIterator = struct {
 };
 
 pub fn subtreeIterator(subtrees: []const u8) SubtreeIterator {
-    return .{ .bytes = subtrees, .pos = 0, .end = @intCast(subtrees.len) };
+    // Past 4 GiB no element parses anyway (`parseElement`'s u32 offsets).
+    return .{ .bytes = subtrees, .pos = 0, .end = @intCast(@min(subtrees.len, std.math.maxInt(u32))) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

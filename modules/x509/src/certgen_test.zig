@@ -115,13 +115,15 @@ pub const Gen = struct {
         /// The whole AlgorithmIdentifier, in place of ecdsa-with-SHA256 (the
         /// signature is still ECDSA P-256 over SHA-256).
         sig_alg: ?[]const u8 = null,
+        /// The whole SubjectPublicKeyInfo, in place of `key`'s.
+        spki: ?[]const u8 = null,
     };
 
     pub fn cert(g: *Gen, s: Spec) ![]const u8 {
         g.serial += 1;
         const alg = s.sig_alg orelse try g.seq(&.{try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02 }})});
         const point = s.key.public_key.toUncompressedSec1();
-        const spki = try g.seq(&.{
+        const spki = if (s.spki) |given| given else try g.seq(&.{
             try g.seq(&.{
                 try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 }}),
                 try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }}),
