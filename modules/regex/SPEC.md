@@ -324,6 +324,23 @@ single timings swing 5–10 % with layout and load.
 
 ## Backlog / deferred
 
+- **The Rust grammar's assertions in the DFAs** *(2026-10-28)* — a program with a Unicode `\b`
+  (the Rust grammar's default), `\<`/`\>`, the half boundaries or CRLF lines runs on the
+  backtracker and the Pike VM only (`Regex.vm_only`): `\b\w+\b` written for `.rust` is far slower
+  than the same pattern in `.perl`. Rust keeps its lazy DFA and quits on a byte past ASCII; here the
+  DFA contexts would need a Unicode-word class (start/word/other/newline/CR) and a quit to the VMs.
+  Same for bytes mode (`Options.utf8 = false`), which has no prefilter either.
+- **Unicode tables cost every consumer 89 KB** *(2026-10-28)* — the grammar is chosen at run time,
+  so `unicode16_tables.zig` (every property the Rust grammar names) is linked even into a program
+  that only ever compiles `.perl` patterns (the Go-generated tables were 11 KB). A build option or
+  a comptime-known grammar could leave the Rust-only properties out.
+- **`RegexSet` past `4 * max_insts`, readers in bytes mode** *(2026-10-28)* — a set's joined program
+  must fit the stack tier (no `*Alloc` variants yet); `isMatchReader`/`findReader` assert
+  `!bytes`.
+- **RE2's anchored search at a position** *(survey 2026-10-28, R12)* — `RE2::Match(…, ANCHOR_START)`
+  and regex-automata's `Input::anchored`; `Matcher.find(input, from)` is unanchored from `from`.
+  `regex` 1.13's own API has none.
+
 - **A full forward table can stop caching two-byte steps** *(review 2026-10-28, LOW, perf only)* —
   when `FindDfa` holds `limit` states and the next state already exists, `intern` does not empty
   the table, but `midAfter` has no room: every two-byte code point from that state is stepped
