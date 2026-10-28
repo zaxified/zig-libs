@@ -1249,6 +1249,20 @@ fn findLiteral(input: []const u8, pos: usize, lit: []const u8) ?usize {
     const first_v: V = @splat(lit[0]);
     const last_v: V = @splat(lit[last]);
     var i = pos;
+    // Two blocks per test: a candidate is rare, the loop is the cost.
+    while (i + last + 64 <= input.len) : (i += 64) {
+        const a0: V = input[i..][0..32].*;
+        const b0: V = input[i + last ..][0..32].*;
+        const a1: V = input[i + 32 ..][0..32].*;
+        const b1: V = input[i + 32 + last ..][0..32].*;
+        const m0 = @as(u32, @bitCast(a0 == first_v)) & @as(u32, @bitCast(b0 == last_v));
+        const m1 = @as(u32, @bitCast(a1 == first_v)) & @as(u32, @bitCast(b1 == last_v));
+        var mask = @as(u64, m1) << 32 | m0;
+        while (mask != 0) : (mask &= mask - 1) {
+            const at = i + @ctz(mask);
+            if (std.mem.eql(u8, input[at + 1 ..][0 .. last - 1], lit[1..last])) return at;
+        }
+    }
     while (i + last + 32 <= input.len) : (i += 32) {
         const a: V = input[i..][0..32].*;
         const b: V = input[i + last ..][0..32].*;

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Faster:** the literal search behind the prefilter tests two 32-byte blocks at a time. `ABC` find-all over 1 MiB of noise: 51–57 → 42–44 µs (1.5× → 1.05× Rust's `regex`, JCC-padded builds).
+
 - **2026-10-28** — **Faster:** with no thread alive, the find DFA jumps ahead with the prefilter only when that is a fast scan (a literal, one byte, Teddy) or the next code point is past ASCII and cannot start a match; over short ASCII gaps it keeps reading its own cached transitions. The context assertions need comes from a byte table. JCC-padded builds, ours/Rust's `regex`: `[A-Z]+` 1.34 → 1.25×, `\p{L}+` 1.52 → 1.27×, `\b\w+\b` 1.76 → 1.26×, `[0-9]+` 1.56 → 1.23× (1 MiB each).
 
 - **2026-10-28** — **Faster:** two-byte UTF-8 sequences are decoded inline (forwards and backwards; `std.unicode.utf8Decode` was a call, a quarter of a find-all over Czech text); the forward DFA's transitions hold the next state's row offset (no multiply between two lookups); the backward DFA's first state is remembered per context; the caches for code points past ASCII are made on the first such code point (a `Matcher` for one ASCII search does not pay for them). Find-all over 1 MiB of Czech, Greek and Cyrillic (JCC-padded builds): `\p{L}+` 16.3 → 9.9 ms (1.5× Rust's `regex`), `(?i)žluť\w*` 2.6 → 1.9 ms (1.1×); `INV-[0-9]{4}-[0-9]{4}` over 85 KiB 119 → 101 µs.
