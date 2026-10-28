@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Faster:** when every match starts where a fast prefilter points (a literal prefix, one byte, Teddy), `find` reads forwards from each such place in turn, anchored, and the first one with a match is the leftmost-first match: no backward pass (RE2's search from a literal prefix). Tries that fail may read no more than twice the text they moved past (plus 256 bytes), then one unanchored pass takes over, so `A[^Z]*Z` over `AAAA…` stays linear. `INV-[0-9]{4}-[0-9]{4}` find-all over 85 KiB: 93 → 60 µs (1.6× → 1.05× Rust's `regex`, JCC-padded builds).
+
 - **2026-10-28** — **Faster:** the literal search behind the prefilter tests two 32-byte blocks at a time. `ABC` find-all over 1 MiB of noise: 51–57 → 42–44 µs (1.5× → 1.05× Rust's `regex`, JCC-padded builds).
 
 - **2026-10-28** — **Faster:** with no thread alive, the find DFA jumps ahead with the prefilter only when that is a fast scan (a literal, one byte, Teddy) or the next code point is past ASCII and cannot start a match; over short ASCII gaps it keeps reading its own cached transitions. The context assertions need comes from a byte table. JCC-padded builds, ours/Rust's `regex`: `[A-Z]+` 1.34 → 1.25×, `\p{L}+` 1.52 → 1.27×, `\b\w+\b` 1.76 → 1.26×, `[0-9]+` 1.56 → 1.23× (1 MiB each).

@@ -822,6 +822,8 @@ const FindDfa = struct {
     table: [2 * max_states]u16 = @splat(0),
     /// `idleAt`'s states per context, + 1 (0 not made yet).
     idle: [4]u16 = @splat(0),
+    /// `anchoredAt`'s, the same way.
+    anchored: [4]u16 = @splat(0),
     /// Transitions on code points past ASCII (`Wide`), made on the first
     /// such code point: a `Matcher` for one ASCII search does not pay for
     /// them (measured: 3× a short compile-and-match).
@@ -961,12 +963,14 @@ const FindDfa = struct {
 
     /// The end of the leftmost-first match from `from`, which is 0 for an
     /// anchored program (`anchored`: no thread starts later).
-    fn run(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, anchored: bool) std.mem.Allocator.Error!?usize {
-        const seed = [1]u16{0};
-        // Unanchored, the first state is the idle one (remembered per context).
-        var s = if (anchored) (try d.intern(&seed, d.ctxBefore(input, from), false)).id else try d.idleAt(input, from);
+    /// `reach`: where the search stopped reading.
+    fn run(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, anchored: bool, reach: *usize) std.mem.Allocator.Error!?usize {
+        // The first state, remembered per context: the idle one, or a
+        // thread at the start alone.
+        var s = if (anchored) try d.anchoredAt(input, from) else try d.idleAt(input, from);
         var end: ?usize = null;
         var pos = from;
+        defer reach.* = pos;
         const pf = &re.prefilter;
         while (true) {
             const st = d.states.items[s];
@@ -1050,6 +1054,14 @@ const FindDfa = struct {
         w.* = .{};
         d.wide = w;
         return w;
+    }
+
+    /// The state with a thread at the start alone at `pos`, per context.
+    fn anchoredAt(d: *FindDfa, input: []const u8, pos: usize) std.mem.Allocator.Error!u16 {
+        const ctx = d.ctxBefore(input, pos);
+        const slot = &d.anchored[@backingInt(ctx)];
+        if (slot.* == 0) slot.* = (try d.intern(&.{0}, ctx, false)).id + 1;
+        return slot.* - 1;
     }
 
     /// `ctxOf` the code point before `pos`, decoded only when it matters.
@@ -1170,6 +1182,7 @@ const FindDfa = struct {
             d.pcs.clearRetainingCapacity();
             d.table = @splat(0);
             d.idle = @splat(0);
+            d.anchored = @splat(0);
             if (d.wide) |w| w.fwd = @splat(.empty);
             d.flushes += 1;
             flushed = true;
@@ -1718,7 +1731,25 @@ pub const Matcher = struct {
             m.dfa = d;
             break :blk d;
         };
-        const end = (d.run(re, input, from, anchored) catch return null) orelse return @as(?Span, null);
+        var reach: usize = undefined;
+        if (!anchored and d.skip_idle) {
+            // Every match starts where the (fast) prefilter points: the
+            // first such place with a match, read forwards from there, is
+            // the leftmost-first match, and no backward pass is needed
+            // (RE2's search from a literal prefix). The failed tries may
+            // read no more than twice the text they moved past, with slack
+            // (`A[^Z]*Z` over `AAAA…` would be quadratic); past that, one
+            // unanchored pass.
+            var pos = from;
+            var spent: usize = 0;
+            while (spent <= 2 * (pos - from) + 256) {
+                const p = re.prefilter.next(input, pos) orelse return @as(?Span, null);
+                if (d.run(re, input, p, true, &reach) catch return null) |e| return .{ .start = p, .end = e };
+                spent += reach - p;
+                pos = p + 1;
+            }
+        }
+        const end = (d.run(re, input, from, anchored, &reach) catch return null) orelse return @as(?Span, null);
         return .{ .start = if (anchored) from else d.start(re, input, from, end), .end = end };
     }
 
@@ -2532,6 +2563,7 @@ test "find's DFAs (unanchored: forward for the end, backward for the start) agre
         "é+|a+",
         "(?:ab|a)(?:c|bcd)", "[^ \\n]+ ", "d\\z",
         "(?s).{3}\\n",
+        "a(?s:.)*Ω\\z",
     };
     const text = try gpa.alloc(u8, 3000);
     defer gpa.free(text);
