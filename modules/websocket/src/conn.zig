@@ -87,8 +87,10 @@ pub const Conn = struct {
     /// and a retry reads on.
     sticky: ?ReadError = null,
 
+    /// A `.client` needs `opts.mask_random` (every client frame is masked,
+    /// RFC 6455 §5.3); without one this is a checked panic.
     pub fn init(role: frame.Role, reader: *std.Io.Reader, writer: *std.Io.Writer, message_buf: []u8, opts: Options) Conn {
-        std.debug.assert(role == .server or opts.mask_random != null);
+        if (role == .client and opts.mask_random == null) @panic("websocket.Conn.init: a client needs opts.mask_random (RFC 6455 §5.3 masking)");
         var c: Conn = .{
             .reader = reader,
             .writer = writer,
@@ -227,9 +229,10 @@ pub const Conn = struct {
 
     /// Send one text or binary message: compressed when deflate is on, the
     /// message is at least `min_size` and it shrinks; masked on the client.
-    /// Flushes the writer.
+    /// Flushes the writer. Any other opcode is a checked panic: control
+    /// frames go through `ping` and `close`.
     pub fn writeMessage(c: *Conn, opcode: frame.Opcode, payload: []const u8) WriteError!void {
-        std.debug.assert(opcode == .text or opcode == .binary);
+        if (opcode != .text and opcode != .binary) @panic("websocket.Conn.writeMessage: opcode must be .text or .binary (ping and close have their own calls)");
         if (c.opts.deflate) |d| if (payload.len >= d.min_size) {
             if (d.compressor.compressMessage(payload, d.out_buf, d.level)) |z| {
                 try frame.writeFrame(c.writer, .{ .opcode = opcode, .payload = z, .mask_key = c.maskKey(), .compressed = true });
@@ -248,6 +251,8 @@ pub const Conn = struct {
     /// Start the closing handshake (§7.1.2): send a close frame. Then keep
     /// calling `readMessage` until it returns `error.Closed` (the peer's
     /// answer) before closing the transport. `reason` at most 123 bytes.
+    /// `code` goes out as given: one outside `frame.isValidCloseCode` (0,
+    /// 1005, 1006, 1015 …) makes a conforming peer fail the connection.
     pub fn close(c: *Conn, code: u16, reason: []const u8) (WriteError || error{ReasonTooLong})!void {
         if (c.conn.close_sent) return;
         var body: [125]u8 = undefined;

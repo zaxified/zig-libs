@@ -341,7 +341,8 @@ const ZeroPadded = struct {
 
 /// Decompress one message. `buf[0..len]` holds the compressed payload as it
 /// arrived (all fragments, concatenated); `buf` must have
-/// `inflate_tail.len` bytes of room after it, which this overwrites. The
+/// `inflate_tail.len` bytes of room after it, which this overwrites (a
+/// checked panic otherwise). The
 /// plain message goes to `out` and is returned as a prefix of it; `out.len`
 /// is the cap, and a message of exactly that size fits.
 ///
@@ -356,7 +357,7 @@ const ZeroPadded = struct {
 /// reading and ignore them; a payload whose bytes a decoder silently skips
 /// is the kind two implementations disagree on).
 pub fn inflate(buf: []u8, len: usize, out: []u8, window: *Window) InflateError![]u8 {
-    std.debug.assert(buf.len >= len + inflate_tail.len);
+    if (len > buf.len or buf.len - len < inflate_tail.len) @panic("websocket.deflate.inflate: buf needs len + inflate_tail.len bytes");
     if (len == 0) return out[0..0];
     @memcpy(buf[len..][0..inflate_tail.len], &inflate_tail);
     const input = buf[0 .. len + inflate_tail.len];

@@ -251,9 +251,9 @@ pub const Connection = struct {
     /// Turn on permessage-deflate receiving after the handshake agreed on it
     /// (`ServerAccept.deflate` / `ClientVerifyResult.deflate` non-null). See
     /// `compressed_buf` for what `buf` holds and bounds; it must be longer
-    /// than `deflate.inflate_tail.len`.
+    /// than `deflate.inflate_tail.len` (a checked panic otherwise).
     pub fn enableDeflate(self: *Connection, buf: []u8, window: *deflate.Window) void {
-        std.debug.assert(buf.len > deflate.inflate_tail.len);
+        if (buf.len <= deflate.inflate_tail.len) @panic("websocket.Connection.enableDeflate: buf must be longer than deflate.inflate_tail.len");
         self.compressed_buf = buf;
         self.inflate_window = window;
     }
@@ -381,7 +381,7 @@ pub const Connection = struct {
     pub fn directPayload(self: *const Connection, h: frame.Header) Error!?DirectPayload {
         if (h.opcode.isControl()) return null;
         if (self.close_received) {
-            if (self.frames_after_close + 1 > self.max_frames_after_close) return error.TooManyFramesAfterClose;
+            if (self.frames_after_close +| 1 > self.max_frames_after_close) return error.TooManyFramesAfterClose;
             return error.DataAfterClose;
         }
         const at: usize, const utf8: ?IncrementalUtf8 = switch (h.opcode) {
@@ -392,7 +392,7 @@ pub const Connection = struct {
             },
             .continuation => blk: {
                 const start = self.fragment_opcode orelse return error.InvalidFragmentation;
-                if (self.fragment_count + 1 > self.max_fragments) return error.TooManyFragments;
+                if (self.fragment_count +| 1 > self.max_fragments) return error.TooManyFragments;
                 if (self.fragment_compressed) return null;
                 break :blk .{ self.message_len, if (start == .text) self.text_utf8 else null };
             },
@@ -437,7 +437,7 @@ pub const Connection = struct {
         // close) is not itself counted -- `self.close_received` is still
         // false when it arrives here.
         if (self.close_received) {
-            self.frames_after_close += 1;
+            self.frames_after_close +|= 1; // saturates: a cap of maxInt(u32) must not wrap the count
             if (self.frames_after_close > self.max_frames_after_close) return error.TooManyFramesAfterClose;
         }
 
@@ -466,7 +466,7 @@ pub const Connection = struct {
         switch (parsed.opcode) {
             .continuation => {
                 const start_opcode = self.fragment_opcode orelse return error.InvalidFragmentation;
-                self.fragment_count += 1;
+                self.fragment_count +|= 1;
                 if (self.fragment_count > self.max_fragments) return error.TooManyFragments;
                 if (self.fragment_compressed) {
                     try self.appendCompressed(parsed.payload);
@@ -630,7 +630,10 @@ pub const Connection = struct {
     }
 
     fn appendCompressed(self: *Connection, payload: []const u8) Error!void {
-        const cbuf = self.compressed_buf.?;
+        // `receiveFrame` takes a frame the caller parsed: RSV1 there without
+        // `enableDeflate` is the peer's protocol error, not a null unwrap.
+        if (self.inflate_window == null) return error.ReservedRsvBits;
+        const cbuf = self.compressed_buf orelse return error.ReservedRsvBits;
         if (self.compressed_len + payload.len + deflate.inflate_tail.len > cbuf.len) return error.MessageTooLarge;
         @memcpy(cbuf[self.compressed_len..][0..payload.len], payload);
         self.compressed_len += payload.len;
@@ -2054,4 +2057,43 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "no-panic sweep 2026-10-28: receiveFrame with RSV1 but no enableDeflate is ReservedRsvBits" {
+    var msg: [64]u8 = undefined;
+    var c: Connection = .init(.client, &msg, 1 << 20);
+    // The caller parsed with `allow_rsv1` although deflate is off.
+    var wire = [_]u8{ 0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 };
+    const parsed = (try frame.parseFrameWith(&wire, .client, 1 << 20, .{ .allow_rsv1 = true })).frame;
+    try testing.expect(parsed.rsv1);
+    try testing.expectError(error.ReservedRsvBits, c.receiveFrame(parsed));
+    // Half-enabled by field writes (buffer, no window): the same.
+    var cbuf: [64]u8 = undefined;
+    c.compressed_buf = &cbuf;
+    try testing.expectError(error.ReservedRsvBits, c.receiveFrame(parsed));
+    c.compressed_buf = null;
+    c.inflate_window = &test_window;
+    try testing.expectError(error.ReservedRsvBits, c.receiveFrame(parsed));
+}
+
+test "no-panic sweep 2026-10-28: a cap of maxInt(u32) saturates the fragment and after-close counts" {
+    var msg: [64]u8 = undefined;
+    var c: Connection = .init(.client, &msg, 1 << 20);
+    c.max_fragments = std.math.maxInt(u32);
+    var first = [_]u8{ 0x01, 0x01, 'a' };
+    _ = try c.receive(&first);
+    c.fragment_count = std.math.maxInt(u32); // as after 2^32 - 1 continuations
+    var cont = [_]u8{ 0x00, 0x01, 'b' };
+    try testing.expect((try c.receive(&cont)).event == .frame_consumed);
+    try testing.expectEqual(std.math.maxInt(u32), c.fragment_count);
+    _ = try c.directPayload(.{ .fin = false, .opcode = .continuation, .mask_key = null, .len = 2, .payload_len = 1 });
+
+    var d: Connection = .init(.client, &msg, 1 << 20);
+    d.max_frames_after_close = std.math.maxInt(u32);
+    var close = [_]u8{ 0x88, 0x02, 0x03, 0xe8 };
+    _ = try d.receive(&close);
+    d.frames_after_close = std.math.maxInt(u32);
+    var late = [_]u8{ 0x82, 0x00 };
+    try testing.expectError(error.DataAfterClose, d.receive(&late));
+    try testing.expectError(error.DataAfterClose, d.directPayload(.{ .fin = true, .opcode = .binary, .mask_key = null, .len = 2, .payload_len = 0 }));
 }

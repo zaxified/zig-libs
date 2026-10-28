@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 6 mutants over the changed code (the RSV1 guards, the saturating counters), all killed. The four checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 258/270, 12 eq. Card A1 again.
+
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (sweep of every pub entry point, `~/CML/20261028-panic-sweep/websocket-sweep.report.md`; no peer-reachable one found). Caller-contract checks that were `std.debug.assert` (UB in ReleaseFast) are checked panics with a message: `Conn.init` of a client without `mask_random`, `Conn.writeMessage` with a control or continuation opcode, `deflate.inflate` with `buf` shorter than `len + inflate_tail.len`, `Connection.enableDeflate` with a buffer not longer than `inflate_tail.len`. `Connection.receiveFrame` of a frame the caller parsed with `allow_rsv1` while deflate is off returns `error.ReservedRsvBits` (it unwrapped a null `compressed_buf`). `max_fragments` / `max_frames_after_close` of `maxInt(u32)` no longer wrap their counters. `Conn.close` documents that an invalid close code goes out as given. Tests.
+
 - **2026-10-26** — **NO CONSUMER-VISIBLE CHANGE:** SPEC: `bench-websocket` re-measured after `fastmem` began exporting `memcpy` (installed by every bench driver): read_binary_64k 1.19× → 1.12× fastwebsockets; card updated.
 - **2026-10-26** — **`conn.Conn` reads a frame larger than its reader's buffer.** An uncompressed
   text/binary/continuation payload that does not fit goes straight into `message_buf` (64 KiB
