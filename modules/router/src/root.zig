@@ -616,10 +616,15 @@ pub const Router = struct {
         // both work from `req.target` directly (not from `req.path`, which a
         // caller driving `Router` without `http.Server` in front never had
         // normalized in the first place — audit finding router-F3).
+        // `req.path` may be pointed into `normalize_buf` below: give the
+        // caller back what it passed in, so nothing read after `dispatch`
+        // returns sees a dead frame (no-panic sweep 2026-10-28, R-2).
+        const caller_path = req.path;
+        defer req.path = caller_path;
         var normalize_buf: [normalize_buf_len]u8 = undefined;
         switch (r.normalize_path) {
             .remove_dot_segments => {
-                const raw = rawPath(req.target);
+                const raw = originPath(req);
                 http.Server.checkOriginPath(raw) catch return r.runFallback(req, rw, r.bad_request);
                 req.path = if (http.Server.pathHasDotSegments(raw))
                     http.Server.normalizePathInto(&normalize_buf, raw)
@@ -627,12 +632,16 @@ pub const Router = struct {
                     raw;
             },
             .reject_non_canonical => {
-                const raw = rawPath(req.target);
+                const raw = originPath(req);
                 http.Server.checkOriginPath(raw) catch return r.runFallback(req, rw, r.bad_request);
                 if (http.Server.pathHasDotSegments(raw))
                     return r.runFallback(req, rw, r.bad_request);
             },
-            .off => req.path = rawPath(req.target),
+            .off => {
+                req.path = originPath(req);
+                if (req.path.len == 0 or req.path[0] != '/')
+                    return r.runFallback(req, rw, r.not_found);
+            },
         }
 
         var params: Params = .{};
@@ -1415,7 +1424,8 @@ fn isPort(s: []const u8) bool {
 }
 
 fn hostAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
-    const hr: *HostRouter = @ptrCast(@alignCast(req.context.?));
+    const hr: *HostRouter = @ptrCast(@alignCast(req.context orelse
+        @panic("router: HostRouter.handler() needs the server context set to the HostRouter")));
     return hr.dispatch(req, rw);
 }
 
@@ -2066,8 +2076,18 @@ pub fn rawPath(target: []const u8) []const u8 {
     return target;
 }
 
+/// The raw path `dispatch` routes on: `rawPath(req.target)` for an
+/// origin-form target. Any other form (absolute-form `http://h/x`, RFC 9112
+/// §3.2.2) has no raw path to recover, so the server's own `req.path` is
+/// used -- `rawPath` of it routed `ttp://h/x` (no-panic sweep 2026-10-28, R-1).
+fn originPath(req: *const http.Server.Request) []const u8 {
+    if (req.target.len != 0 and req.target[0] == '/') return rawPath(req.target);
+    return req.path;
+}
+
 fn serverAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
-    const r: *Router = @ptrCast(@alignCast(req.context.?));
+    const r: *Router = @ptrCast(@alignCast(req.context orelse
+        @panic("router: Router.handler() needs the server context set to the Router")));
     return r.dispatch(req, rw);
 }
 
@@ -5080,4 +5100,54 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "no-panic sweep R-1: an absolute-form target routes by its path, in every normalize_path posture" {
+    for ([_]NormalizePath{ .remove_dot_segments, .reject_non_canonical, .off }) |np| {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        r.normalize_path = np;
+        try r.get("/users/:id", hUser);
+        var buf: [1024]u8 = undefined;
+        const got = runWire(&r, wire("GET", "http://t/users/7"), &buf);
+        try expectStatus(got, "200");
+        try testing.expectEqualStrings("user=7", bodyOf(got));
+    }
+}
+
+fn hPathEcho(ctx: *Ctx) anyerror!void {
+    try ctx.res.writeAll(ctx.req.path);
+}
+
+test "no-panic sweep R-2: dispatch hands req.path back as the caller passed it" {
+    const W = struct {
+        var same_ptr: ?bool = null;
+        fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+            const before = req.path;
+            const rr: *Router = @ptrCast(@alignCast(req.context.?));
+            try rr.dispatch(req, rw);
+            same_ptr = req.path.ptr == before.ptr and req.path.len == before.len;
+        }
+    };
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/b", hPathEcho);
+    var in: Reader = .fixed(wire("GET", "/a/../b"));
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [2048]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [512]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    http.Server.serveStream(.{ .handler = W.handle, .context = &r, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    // The handler saw the normalized path; the caller got its own back
+    // (dispatch had pointed it into its own, dead, normalize buffer).
+    try expectStatus(out.buffered(), "200");
+    try testing.expectEqualStrings("/b", bodyOf(out.buffered()));
+    try testing.expectEqual(@as(?bool, true), W.same_ptr);
 }
