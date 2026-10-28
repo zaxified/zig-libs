@@ -74,6 +74,10 @@ const Inst = syntax.Inst;
 const Range = syntax.Range;
 const Assert = syntax.Assert;
 
+/// The reader front end's errors: the reader failed before the answer was
+/// settled, or the `Regex` is in bytes mode (slices only).
+pub const ReaderError = error{ ReadFailed, BytesMode };
+
 /// A match: `input[start..end]`.
 pub const Span = struct {
     start: usize,
@@ -133,10 +137,12 @@ pub const Regex = struct {
             if (compileWith(gpa, b, pattern, opts)) |re| return re else |e| if (e != error.PatternTooLarge) return e;
         }
         // Past `max_insts` (or the other documented tables): a program of up
-        // to 65,534 instructions, compiled in ~2 MiB of heap scratch. Its
-        // `isMatch` keeps to the stack up to `4 * max_insts`; past that the
-        // `*Alloc` variants. The DFAs and the prefilter step aside.
-        const big = try gpa.create(syntax.BuilderOf(syntax.big_capacity));
+        // to `4 * max_insts` instructions (bytes mode: `max_insts`), compiled
+        // in ~2 MiB of heap scratch — what `isMatch` and its kin still run on
+        // the stack. Past that `error.PatternTooLarge`: a pattern that
+        // compiles can be matched by every entry point, never a panic or an
+        // unbounded `Matcher` later. The DFAs and the prefilter step aside.
+        const big = try gpa.create(syntax.BuilderOf(syntax.large_capacity));
         defer gpa.destroy(big);
         return compileWith(gpa, big, pattern, opts);
     }
@@ -156,6 +162,9 @@ pub const Regex = struct {
     fn compileWith(gpa: std.mem.Allocator, b: anytype, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
         try b.compileSyntaxBytes(pattern, opts.syntax, !opts.utf8);
         const bytes = b.bytes;
+        // Bytes mode's set VM keeps a sequence position per thread: its stack
+        // scratch holds `max_insts`.
+        if (bytes and b.ninsts > max_insts) return error.PatternTooLarge;
         const insts = try gpa.dupe(Inst, b.insts[0..b.ninsts]);
         errdefer gpa.free(insts);
         const ranges = try gpa.dupe(Range, b.ranges[0..b.nranges]);
@@ -210,10 +219,9 @@ pub const Regex = struct {
     }
 
     /// Does the pattern match anywhere in `input`? (Go's `MatchString`.)
-    /// No allocator; scratch on the stack: a program of up to `max_insts`
-    /// instructions as always, up to `4 * max_insts` in ~33 KiB of it (bytes
-    /// mode: `max_insts`). A larger program (a pattern past `max_insts`,
-    /// compiled on the heap) panics here: use `isMatchAlloc`.
+    /// No allocator; scratch on the stack: ~6 KiB for a program of up to
+    /// `max_insts` instructions, ~33 KiB up to `4 * max_insts` (the largest
+    /// `compile` makes).
     pub fn isMatch(re: *const Regex, input: []const u8) bool {
         return re.runSet(input, false);
     }
@@ -235,46 +243,6 @@ pub const Regex = struct {
         return re.runSetEnd(&t, false);
     }
 
-    /// `isMatch` for a program of any size: scratch from `gpa` when it is
-    /// past what `isMatch` keeps on the stack.
-    pub fn isMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
-        return (try re.endAlloc(gpa, input, false)) != null;
-    }
-
-    /// `fullMatch` for a program of any size (see `isMatchAlloc`).
-    pub fn fullMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!bool {
-        return (try re.endAlloc(gpa, input, true)) != null;
-    }
-
-    /// `shortestMatch` for a program of any size (see `isMatchAlloc`).
-    pub fn shortestMatchAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error!?usize {
-        return re.endAlloc(gpa, input, false);
-    }
-
-    fn endAlloc(re: *const Regex, gpa: std.mem.Allocator, input: []const u8, full: bool) std.mem.Allocator.Error!?usize {
-        const fits = re.insts.len <= @as(usize, if (re.bytes) max_insts else 4 * max_insts);
-        if (fits) {
-            if (full) return if (re.runSet(input, true)) input.len else null;
-            return re.shortestMatch(input);
-        }
-        const n = re.insts.len;
-        if (re.bytes) {
-            var sets: [2]ByteSet = undefined;
-            const block = try ByteSet.alloc(gpa, &sets, n);
-            defer gpa.free(block);
-            const stack = try gpa.alloc(u16, 2 * n);
-            defer gpa.free(stack);
-            return re.bytesLoop(input, full, &sets[0], &sets[1], stack);
-        }
-        var sets: [2]HeapSet = undefined;
-        const block = try HeapSet.alloc(gpa, &sets, n);
-        defer gpa.free(block);
-        const stack = try gpa.alloc(u16, 2 * n);
-        defer gpa.free(stack);
-        var t: SliceText = .{ .input = input };
-        return re.setLoop(&t, full, &sets[0], &sets[1], stack);
-    }
-
     /// Go's `Expand`: `template` with `$1`, `${name}`, `$$` replaced from a
     /// match's `groups` (as `Matcher.captures` fills them) in `input`.
     pub fn expand(re: *const Regex, w: *std.Io.Writer, template: []const u8, input: []const u8, groups: []const ?Span) std.Io.Writer.Error!void {
@@ -284,9 +252,8 @@ pub const Regex = struct {
     /// Go's `LiteralPrefix`: writes the literal text every match begins with;
     /// true when that text is the whole pattern.
     pub fn literalPrefix(re: *const Regex, w: *std.Io.Writer) std.Io.Writer.Error!bool {
-        // Bytes mode: its byte classes are no text; a program past
-        // `4 * max_insts`: past the walk's scratch. The empty prefix holds.
-        if (re.bytes or re.insts.len > 4 * max_insts) return false;
+        // Bytes mode: its byte classes are no text. The empty prefix holds.
+        if (re.bytes) return false;
         return replace.literalPrefix(re, w);
     }
 
@@ -334,11 +301,10 @@ pub const Regex = struct {
     /// Go's `MatchReader`: does the pattern match anywhere in what `r`
     /// yields? Reads code point by code point, no further than it must (at
     /// most three code points past the end of a match); no allocator,
-    /// constant memory. `r`'s buffer must hold at least 4 bytes (one UTF-8 sequence).
-    /// Its scratch is on the stack, as `isMatch`'s: a program past
-    /// `4 * max_insts` (compiled on the heap) panics here.
-    pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) error{ReadFailed}!bool {
-        std.debug.assert(!re.bytes); // bytes mode: slices only
+    /// constant memory, any buffer size. A bytes-mode `Regex` has no reader
+    /// front end: `error.BytesMode`.
+    pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) ReaderError!bool {
+        if (re.bytes) return error.BytesMode;
         var t: ReaderText = .init(r);
         const found = re.runSetOn(&t, false);
         // A failure after the answer was settled does not change it.
@@ -535,10 +501,10 @@ pub const Regex = struct {
         return re.setLoop(text, full, &lists[0], &lists[1], &stack);
     }
 
-    /// `runSetEnd` for a program past `max_insts`: up to `4 * max_insts` on
-    /// the stack, else a panic (the caller should have used `isMatchAlloc`).
+    /// `runSetEnd` for a program past `max_insts`: up to `4 * max_insts`
+    /// (the largest `compile` makes), on the stack.
     noinline fn runSetEndWide(re: *const Regex, text: anytype, full: bool) ?usize {
-        if (re.insts.len > 4 * max_insts) @panic("regex: a program this large needs isMatchAlloc / fullMatchAlloc / shortestMatchAlloc");
+        std.debug.assert(re.insts.len <= 4 * max_insts);
         var lists: [2]StateSetOf(4 * max_insts) = undefined;
         var stack: [8 * max_insts]u16 = undefined;
         return re.setLoop(text, full, &lists[0], &lists[1], &stack);
@@ -730,7 +696,7 @@ pub const Regex = struct {
     }
 
     noinline fn runSetBytesEnd(re: *const Regex, input: []const u8, full: bool) ?usize {
-        if (re.insts.len > max_insts) @panic("regex: a bytes-mode program this large needs isMatchAlloc / fullMatchAlloc / shortestMatchAlloc");
+        std.debug.assert(re.insts.len <= max_insts); // what `compile` makes in bytes mode
         var storage: ByteSet.Fixed = undefined;
         var sets = storage.sets();
         var stack: [2 * max_insts]u16 = undefined;
@@ -790,6 +756,10 @@ pub const RegexSet = struct {
     ends: []const u16,
     /// Compiled with `Options.utf8 = false`.
     bytes: bool,
+
+    /// Every pattern takes at least one instruction of the joined program,
+    /// which `compile` bounds by `4 * max_insts`.
+    pub const max_patterns = 4 * max_insts;
 
     /// Compile `patterns` with `opts` (one bad pattern fails the set, with
     /// its error). The set owns its tables; `deinit` frees them.
@@ -860,12 +830,19 @@ pub const RegexSet = struct {
         return set.run(input, null);
     }
 
-    /// Which patterns match `input`: `out[i]` for pattern `i` (`out.len` is
-    /// the pattern count). Whether any did.
+    /// Which patterns match `input`: `out[i]` for pattern `i`, for as many
+    /// patterns as `out` holds (an entry past the pattern count is false).
+    /// Whether any pattern did, reported in `out` or not.
     pub fn matches(set: *const RegexSet, input: []const u8, out: []bool) bool {
-        std.debug.assert(out.len == set.ends.len);
         @memset(out, false);
-        return set.run(input, out);
+        // Fewer slots than patterns: the run reports into its own table.
+        var all: [max_patterns]bool = undefined;
+        const n = set.ends.len;
+        if (out.len >= n) return set.run(input, out[0..n]);
+        @memset(all[0..n], false);
+        const any = set.run(input, all[0..n]);
+        @memcpy(out, all[0..out.len]);
+        return any;
     }
 
     /// The joined program as a `Regex`, for its thread machinery.
@@ -1024,12 +1001,10 @@ pub fn quoteMetaAlloc(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocato
 pub fn matches(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) (Error || std.mem.Allocator.Error)!bool {
     var re = try Regex.compile(gpa, pattern);
     defer re.deinit(gpa);
-    // Any size: a pattern past `4 * max_insts` compiles (heap tier), and
-    // `isMatch` would panic on it (review 2026-10-28).
-    return re.isMatchAlloc(gpa, input);
+    return re.isMatch(input);
 }
 
-/// A bit set over slices of words (the heap sets').
+/// A bit set over a slice of words.
 const SliceBits = struct {
     masks: []u64,
 
@@ -1043,8 +1018,8 @@ const SliceBits = struct {
 };
 
 /// The set VM's threads in bytes mode: also those inside a UTF-8 sequence,
-/// `rem` bytes from its end (1..3), each (instruction, rem) once. Slices,
-/// over `Fixed` (a program of up to `max_insts`, on the stack) or the heap.
+/// `rem` bytes from its end (1..3), each (instruction, rem) once, over
+/// `Fixed` (a program of up to `max_insts`, on the stack).
 const ByteSet = struct {
     pcs: []u16,
     rem: []u8,
@@ -1064,26 +1039,6 @@ const ByteSet = struct {
             return out;
         }
     };
-
-    /// Two sets for a program of `n` instructions, in one allocation (returned
-    /// for the caller to free).
-    fn alloc(gpa: std.mem.Allocator, out: *[2]ByteSet, n: usize) std.mem.Allocator.Error![]u64 {
-        const words_seen = (4 * n + 63) / 64;
-        const words_pcs = (4 * n * 2 + 7) / 8;
-        const words_rem = (4 * n + 7) / 8;
-        const per = words_seen + words_pcs + words_rem;
-        const block = try gpa.alloc(u64, 2 * per);
-        for (out, 0..) |*b, i| {
-            const part = block[i * per ..][0..per];
-            b.* = .{
-                .seen = .{ .masks = part[0..words_seen] },
-                .pcs = @as([*]u16, @ptrCast(part[words_seen..].ptr))[0 .. 4 * n],
-                .rem = @as([*]u8, @ptrCast(part[words_seen + words_pcs ..].ptr))[0 .. 4 * n],
-                .stride = n,
-            };
-        }
-        return block;
-    }
 
     fn clear(s: *ByteSet) void {
         s.n = 0;
@@ -1116,30 +1071,6 @@ fn StateSetOf(comptime cap: usize) type {
         }
     };
 }
-
-/// `StateSet` on the heap, for a program of any size (`isMatchAlloc`).
-const HeapSet = struct {
-    pcs: []u16,
-    n: u16 = 0,
-    seen: SliceBits,
-
-    fn alloc(gpa: std.mem.Allocator, out: *[2]HeapSet, n: usize) std.mem.Allocator.Error![]u64 {
-        const words_seen = (n + 63) / 64;
-        const words_pcs = (2 * n + 7) / 8;
-        const per = words_seen + words_pcs;
-        const block = try gpa.alloc(u64, 2 * per);
-        for (out, 0..) |*h, i| {
-            const part = block[i * per ..][0..per];
-            h.* = .{ .seen = .{ .masks = part[0..words_seen] }, .pcs = @as([*]u16, @ptrCast(part[words_seen..].ptr))[0..n] };
-        }
-        return block;
-    }
-
-    fn clear(s: *HeapSet, words: usize) void {
-        s.n = 0;
-        @memset(s.seen.masks[0..words], 0);
-    }
-};
 
 /// `Regex.runDfa`'s scratch, on the stack (~4.7 KiB): up to `max_states`
 /// states of a program of up to `max_insts` instructions, and their
@@ -3224,10 +3155,10 @@ pub const Matcher = struct {
 
     /// Go's `FindReaderIndex`: the leftmost match in what `r` yields, as byte
     /// offsets from where `r` stood. Reads no further than it must (at most
-    /// three code points past the match's end); constant memory. `r`'s buffer must
-    /// hold at least 4 bytes.
-    pub fn findReader(m: *Matcher, r: *std.Io.Reader) error{ReadFailed}!?Span {
-        std.debug.assert(!m.re.bytes); // bytes mode: slices only
+    /// three code points past the match's end); constant memory, any buffer
+    /// size. A bytes-mode `Regex`: `error.BytesMode`.
+    pub fn findReader(m: *Matcher, r: *std.Io.Reader) ReaderError!?Span {
+        if (m.re.bytes) return error.BytesMode;
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -3237,8 +3168,8 @@ pub const Matcher = struct {
 
     /// Go's `FindReaderSubmatchIndex`: `findReader` that also fills `out` as
     /// `captures` does.
-    pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) error{ReadFailed}!bool {
-        std.debug.assert(!m.re.bytes); // bytes mode: slices only
+    pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) ReaderError!bool {
+        if (m.re.bytes) return error.BytesMode;
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -3400,6 +3331,10 @@ const ReaderText = struct {
     win: [2]Decoded = undefined,
     /// The reader failed; the VM saw the end of the text there.
     failed: bool = false,
+    /// Bytes taken from `r` but not yet read (the tail of an invalid
+    /// sequence): kept here, not peeked, so `r`'s buffer may be any size.
+    held: [3]u8 = undefined,
+    held_n: u8 = 0,
 
     /// No skipping ahead: the bytes between would have to be read anyway.
     const can_skip = false;
@@ -3434,22 +3369,51 @@ const ReaderText = struct {
     /// bytes after its first stay unread.
     fn read(t: *ReaderText) Decoded {
         const bad: Decoded = .{ .cp = 0xfffd, .w = 1 };
-        const c = t.r.takeByte() catch |e| {
-            if (e == error.ReadFailed) t.failed = true;
-            return .{ .cp = null, .w = 0 };
-        };
+        const c = t.byte() orelse return .{ .cp = null, .w = 0 };
         if (c < 0x80) return .{ .cp = c, .w = 1 };
         const len = std.unicode.utf8ByteSequenceLength(c) catch return bad;
-        const rest = t.r.peek(len - 1) catch |e| {
-            if (e == error.ReadFailed) t.failed = true;
-            return bad;
-        };
         var buf: [4]u8 = undefined;
         buf[0] = c;
-        @memcpy(buf[1..len], rest);
-        const cp = std.unicode.utf8Decode(buf[0..len]) catch return bad;
-        t.r.toss(len - 1);
-        return .{ .cp = cp, .w = len };
+        if (t.held_n == 0 and t.r.buffer.len >= 4) {
+            // The rest peeked: an invalid sequence leaves it in `r` unread.
+            const rest = t.r.peek(len - 1) catch |e| {
+                if (e == error.ReadFailed) t.failed = true;
+                return bad;
+            };
+            @memcpy(buf[1..len], rest);
+            const v = std.unicode.utf8Decode(buf[0..len]) catch return bad;
+            t.r.toss(len - 1);
+            return .{ .cp = v, .w = len };
+        }
+        // A buffer too small to peek a sequence: taken byte by byte.
+        var got: usize = 1;
+        while (got < len) : (got += 1) buf[got] = t.byte() orelse break;
+        const cp = if (got == len) std.unicode.utf8Decode(buf[0..len]) catch null else null;
+        if (cp == null) {
+            // Only the first byte is read: the rest go back, ahead of any
+            // still held.
+            const back = buf[1..got];
+            std.mem.copyBackwards(u8, t.held[back.len..][0..t.held_n], t.held[0..t.held_n]);
+            @memcpy(t.held[0..back.len], back);
+            t.held_n += @intCast(back.len);
+            return bad;
+        }
+        return .{ .cp = cp.?, .w = len };
+    }
+
+    /// The next byte: a held one first, then `r`'s; null at its end (or on a
+    /// failure, which `failed` records).
+    fn byte(t: *ReaderText) ?u8 {
+        if (t.held_n != 0) {
+            const c = t.held[0];
+            t.held_n -= 1;
+            std.mem.copyForwards(u8, t.held[0..t.held_n], t.held[1..][0..t.held_n]);
+            return c;
+        }
+        return t.r.takeByte() catch |e| {
+            if (e == error.ReadFailed) t.failed = true;
+            return null;
+        };
     }
 };
 
@@ -4947,30 +4911,66 @@ test "compile: a pattern past the stack builder's capacity takes the full one" {
     try testing.expect(re.fullMatch(strRepeat("a", 600)));
 }
 
-test "compile: a pattern past max_insts compiles on the heap and matches" {
+test "compile: past max_insts on the heap, past 4 * max_insts refused — never a panic later" {
     var re = try Regex.compile(testing.allocator, "a{1000}b{1000}");
     defer re.deinit(testing.allocator);
     try testing.expect(re.insts.len > max_insts);
     const text = strRepeat("a", 1000) ++ strRepeat("b", 1000);
-    // Up to 4 * max_insts: the stack variants; any size: the `*Alloc` ones.
     try testing.expect(re.fullMatch(text));
     try testing.expect(!re.isMatch(text[1..]));
-    try testing.expect(try re.fullMatchAlloc(testing.allocator, text));
-    try testing.expectEqual(@as(?usize, 2001), try re.shortestMatchAlloc(testing.allocator, "x" ++ text));
-    try testing.expectEqual(@as(?usize, null), try re.shortestMatchAlloc(testing.allocator, "x" ++ text[1..]));
+    try testing.expectEqual(@as(?usize, 2001), re.shortestMatch("x" ++ text));
     var m = try Matcher.init(testing.allocator, &re);
     defer m.deinit();
     try testing.expectEqual(@as(?Span, .{ .start = 1, .end = 2001 }), m.find("x" ++ text, 0));
-    // Past what `isMatch` keeps on the stack: only `isMatchAlloc`.
-    var huge = try Regex.compile(testing.allocator, "a{1000}b{1000}c{1000}d{1000}e{1000}");
-    defer huge.deinit(testing.allocator);
-    try testing.expect(huge.insts.len > 4 * max_insts);
-    const all = strRepeat("a", 1000) ++ strRepeat("b", 1000) ++ strRepeat("c", 1000) ++ strRepeat("d", 1000) ++ strRepeat("e", 1000);
-    try testing.expect(try huge.isMatchAlloc(testing.allocator, "x" ++ all));
-    try testing.expect(!try huge.isMatchAlloc(testing.allocator, all[1..]));
-    try testing.expect(try huge.fullMatchAlloc(testing.allocator, all));
-    // `matches` compiles and matches any size (it panicked: review 2026-10-28).
-    try testing.expect(!try matches(testing.allocator, "a{1000}b{1000}c{1000}d{1000}e{1000}", "x"));
+    // Past what `isMatch` runs on the stack: refused at compile time (it
+    // compiled and then panicked in `isMatch`, 2026-10-28).
+    const huge = "a{1000}b{1000}c{1000}d{1000}e{1000}";
+    try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, huge));
+    try testing.expectError(error.PatternTooLarge, matches(testing.allocator, huge, "x"));
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "\\w{100000}", .{ .syntax = .rust }));
+    // Bytes mode: its set VM holds `max_insts`.
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "a{1000}b{100}", .{ .syntax = .rust, .utf8 = false }));
+}
+
+test "no misuse panics: a bytes Regex through a reader, a short or long RegexSet out, a 1-byte reader buffer" {
+    const gpa = testing.allocator;
+    var br = try Regex.compileOptions(gpa, "a", .{ .syntax = .rust, .utf8 = false });
+    defer br.deinit(gpa);
+    var buf: [8]u8 = undefined;
+    var r: std.Io.Reader = .fixed("a");
+    try testing.expectError(error.BytesMode, br.isMatchReader(&r));
+    var bm = try Matcher.init(gpa, &br);
+    defer bm.deinit();
+    try testing.expectError(error.BytesMode, bm.findReader(&r));
+    var g: [1]?Span = undefined;
+    try testing.expectError(error.BytesMode, bm.capturesReader(&r, &g));
+
+    var set = try RegexSet.compile(gpa, &.{ "a", "b", "c" }, .{});
+    defer set.deinit(gpa);
+    var short: [1]bool = undefined;
+    try testing.expect(set.matches("xc", &short)); // pattern 2 matched, not reported
+    try testing.expect(!short[0]);
+    var long: [5]bool = @splat(true);
+    try testing.expect(set.matches("ab", &long));
+    try testing.expectEqualSlices(bool, &.{ true, true, false, false, false }, &long);
+    var none: [0]bool = .{};
+    try testing.expect(!set.matches("x", &none));
+
+    // A reader buffer of one byte, multi-byte and invalid sequences.
+    var re = try Regex.compile(gpa, "é\\x{fffd}b|ž");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    for ([_]struct { []const u8, ?Span }{
+        .{ "xé\xc3b", .{ .start = 1, .end = 5 } },
+        .{ "\xe2\x82ž", .{ .start = 2, .end = 4 } },
+        .{ "é\xc3", null },
+    }) |c| {
+        var tr: std.testing.Reader = .init(buf[0..1], &.{.{ .buffer = c[0] }});
+        try testing.expectEqual(c[1], try m.findReader(&tr.interface));
+        var tr2: std.testing.Reader = .init(buf[0..1], &.{.{ .buffer = c[0] }});
+        try testing.expectEqual(c[1] != null, try re.isMatchReader(&tr2.interface));
+    }
 }
 
 test "RegexSet: a joined range table past a u16 is refused, not wrapped" {
@@ -5001,7 +5001,7 @@ test "findAnchored / capturesAnchored: a match that starts at from, in every eng
         .{ "\\b{start}\\w+", .{ .syntax = .rust }, "é žluť", 3, .{ .start = 3, .end = 9 } },
         .{ "(?-u:\\xff)a", .{ .syntax = .rust, .utf8 = false }, "a\xffa\xffa", 1, .{ .start = 1, .end = 3 } },
         .{ "(?-u:\\xff)a", .{ .syntax = .rust, .utf8 = false }, "a\xffa\xffa", 2, null },
-        .{ "a{1000}b{1000}|x", .{}, "yx", 1, .{ .start = 1, .end = 2 } }, // heap tier
+        .{ "a{1000}b{1000}|x", .{}, "yx", 1, .{ .start = 1, .end = 2 } }, // compiled on the heap
     }) |c| {
         var re = try Regex.compileOptions(gpa, c[0], c[1]);
         defer re.deinit(gpa);

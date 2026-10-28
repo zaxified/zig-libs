@@ -95,7 +95,6 @@ _ = set.matches(text, &which);
 | `matches(gpa, p, in)` | `regexp.MatchString` | compile |
 | `shortestMatch(in)` | Rust `shortest_match` | no |
 | `Matcher.findAnchored(in, from)` / `capturesAnchored(in, from, out)` | RE2 `ANCHOR_START` | no |
-| `isMatchAlloc` / `fullMatchAlloc` / `shortestMatchAlloc(gpa, in)` | — (any program size) | past `4 * max_insts` |
 | `RegexSet.compile(gpa, ps, opts)`, `isMatch`, `matches(in, out)` | Rust `RegexSet`, RE2 `RE2::Set` | the tables / no |
 | `source` | `String()` | no |
 | `groupCount`, `groupIndex(name)`, `names` | `NumSubexp`, `SubexpIndex`, `SubexpNames` | no |
@@ -136,18 +135,21 @@ matches an invalid byte; an empty match may fall inside a code point; slices onl
 
 ## Limits
 
-A pattern within `max_insts` (1024) instructions, 4096 class ranges and 2048 AST nodes compiles in
-stack or full-`Builder` scratch and matches without an allocator. A larger one compiles on the heap
-(~2 MiB of scratch) into a program of up to 65,534 instructions, which the backtracker and the VMs
-run (the DFAs and the prefilter step aside): `isMatch`/`fullMatch`/`shortestMatch` and
-`isMatchReader` keep their scratch on the stack up to `4 * max_insts` (~33 KiB; bytes mode
-`max_insts`) and **panic past it** — use `isMatchAlloc`/`fullMatchAlloc`/`shortestMatchAlloc`
-for patterns you do not control; a `Matcher` for such a program is sized by it (up to hundreds of
-MiB with many groups). Always: at most 63 groups; nesting at most `max_depth` (250); a counted
+**Whatever compiles can be used through every entry point without a panic, and in bounded
+memory** — a limit is an error at compile time, safe for patterns an attacker writes. A pattern
+within `max_insts` (1024) instructions, 4096 class ranges and 2048 AST nodes compiles in stack or
+full-`Builder` scratch; up to `4 * max_insts` (4096; bytes mode `max_insts`) it compiles on the
+heap (~2 MiB of scratch, freed), the DFAs and the prefilter stepping aside. Matching never needs
+more: `isMatch`/`fullMatch`/`shortestMatch` take ~6 KiB of stack, ~33 KiB for the largest
+programs; a `Matcher` at most ~8 MiB (4096 instructions × 64 groups). Past that,
+`error.PatternTooLarge` (Go and Rust compile larger programs: the oracles' CAPACITY rows). Always:
+at most 63 groups; nesting at most `max_depth` (250); a counted
 repetition at most `{1000}` (Rust grammar `{100000}`) and nested counts multiply to at most 1000
 (Go's rule). Past one: `error.NestingDepth` / `error.InvalidRepeatSize` / `error.PatternTooLarge`
 at compile time — never a truncated program, never a compile that runs away. A `RegexSet` joins up
-to `4 * max_insts` instructions and 65,535 class ranges. Compiling the deepest accepted pattern
+to `4 * max_insts` instructions and 65,535 class ranges; `matches` fills as many slots as it is
+given. The reader functions work with any buffer size; on a bytes-mode `Regex` they return
+`error.BytesMode`. Compiling the deepest accepted pattern
 fits a 512 KiB thread stack in Debug. A `Matcher` keeps a
 pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 

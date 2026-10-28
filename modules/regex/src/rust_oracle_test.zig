@@ -10,8 +10,9 @@
 //! (`find_iter`). No Rust at test time.
 //!
 //! Listed divergences, each counted:
-//!  - CAPACITY: past the heap builder's 65,534 instructions or 65,535
-//!    ranges, or 64 groups, where the crate's limit is its compiled size.
+//!  - CAPACITY: past `4 * max_insts` instructions (bytes mode `max_insts`),
+//!    65,535 ranges or 64 groups, where the crate's limit is its compiled
+//!    size.
 //!  - SHORTEST: `shortestMatch` is always the earliest end of any match;
 //!    the crate's `shortest_match` is whatever end its engine of the moment
 //!    sees first (documented as such) — the leftmost-first match's end when
@@ -20,7 +21,8 @@
 //!  - SIZE_LIMIT: the other way round — a Unicode class repeated a few
 //!    hundred times (`\w{250}`) passes the crate's 10 MiB NFA limit, a UTF-8
 //!    automaton per copy; here a class is one instruction per copy, and the
-//!    pattern compiles.
+//!    pattern compiles (up to `4 * max_insts`: `\w{10000}`, `\d{10000}` are
+//!    refused here too).
 
 const std = @import("std");
 const testing = std.testing;
@@ -68,7 +70,7 @@ fn spansAgree(m: *regex.Matcher, c: v.Case, groups: []?regex.Span) bool {
 }
 
 test "rust oracle: the crate's answers to the Rust grammar" {
-    try replay(&v.patterns, false, 9, 5);
+    try replay(&v.patterns, false, 7, 16);
 }
 
 test "rust oracle: bytes mode (regex::bytes)" {
@@ -113,10 +115,10 @@ fn replay(set: []const v.Pattern, bytes: bool, want_size_limit: usize, want_capa
         const groups = out[0..re.names.len];
         for (p.cases) |c| {
             t.cases += 1;
-            const is = try re.isMatchAlloc(testing.allocator, c.input);
-            const full = try re.fullMatchAlloc(testing.allocator, c.input);
+            const is = re.isMatch(c.input);
+            const full = re.fullMatch(c.input);
             const spans = spansAgree(&m, c, groups);
-            const short: i32 = if (try re.shortestMatchAlloc(testing.allocator, c.input)) |e| @intCast(e) else -1;
+            const short: i32 = if (re.shortestMatch(c.input)) |e| @intCast(e) else -1;
             if (short != c.shortest and short >= 0 and c.shortest >= 0 and short < c.shortest) {
                 t.shortest_earlier += 1;
             } else if (short != c.shortest) {

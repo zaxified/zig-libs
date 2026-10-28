@@ -30,11 +30,13 @@ pub const max_groups = 64;
 pub const max_repeat = 1000;
 /// The Rust grammar's bound on a count and on nested counts' product: the
 /// crate has none but its compiled size; this keeps the work of compiling an
-/// empty body bounded (a body that emits code meets `big_capacity` first).
+/// empty body bounded (a body that emits code meets `large_capacity` first).
 pub const max_repeat_rust = 100_000;
 /// The capacities of the largest builder (on the heap): a program of up to
-/// 65,534 instructions (indices are `u16`, 65,535 is "none").
-pub const big_capacity: Capacity = .{ .insts = 65535, .ranges = 65535, .nodes = 65535 };
+/// `4 * max_insts` instructions — what every matching entry point still runs
+/// in stack scratch, so no compiled pattern can make one fail later; the
+/// range and node tables to their `u16` indices.
+pub const large_capacity: Capacity = .{ .insts = 4 * max_insts, .ranges = 65535, .nodes = 65535 };
 /// Nesting of groups and repetitions. Go goes deeper; 250 keeps the
 /// recursive parser and compiler within a 512 KiB thread stack even in a
 /// Debug build (a compile of untrusted patterns runs on whatever thread the

@@ -81,7 +81,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, heap_alloc, shortest, shortest_ref, anchored_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, too_large, shortest, shortest_ref, anchored_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -326,22 +326,17 @@ fn genAlt(comptime S: type, src: *S, g: *Gen, depth: u32, mode: Mode) void {
     }
 }
 
-/// What `isMatch` and its kin keep on the stack (past it they panic).
-fn onStack(re: *const regex.Regex) bool {
+/// What `compile` may make: every entry point runs it in stack scratch.
+fn withinStack(re: *const regex.Regex) bool {
     return re.insts.len <= @as(usize, if (re.bytes) regex.max_insts else 4 * regex.max_insts);
 }
 
-/// `isMatch`, held to `isMatchAlloc`; `isMatchAlloc` alone past the stack.
-fn isMatchOf(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
-    const heap = try re.isMatchAlloc(gpa, input);
-    if (onStack(re) and re.isMatch(input) != heap) return error.IsMatchAllocDisagrees;
-    return heap;
+fn isMatchOf(_: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
+    return re.isMatch(input);
 }
 
-fn fullMatchOf(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
-    const heap = try re.fullMatchAlloc(gpa, input);
-    if (onStack(re) and re.fullMatch(input) != heap) return error.FullMatchAllocDisagrees;
-    return heap;
+fn fullMatchOf(_: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
+    return re.fullMatch(input);
 }
 
 fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
@@ -385,7 +380,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         g.wrap(p, p, "");
     }
     // A share past `max_insts` (compiled on the heap), some of it past
-    // `4 * max_insts` (`isMatch` panics there: the `*Alloc` variants).
+    // `4 * max_insts` (refused: `error.PatternTooLarge`, never a panic later).
     if (!posix and src.valueRangeAtMost(u8, 0, 15) == 0 and g.primary(mode).len != 0) {
         g.wrap("(?:", "(?:", pick(S, src, []const u8, &.{ ")|q{1000}q{100}", ")|q{1000}q{1000}", ")|q{1000}q{1000}q{1000}", ")|q{1000}q{1000}q{1000}q{1000}q{500}" }));
     }
@@ -436,6 +431,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if (e == error.OutOfMemory) return e;
         hit(.refused);
         if (posix) hit(.posix_refused);
+        if (e == error.PatternTooLarge) hit(.too_large);
         try refusedTwins(gpa, &g, mode, e);
         return;
     };
@@ -454,7 +450,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // O(text × program) per start: the short input only.
     if (re.insts.len > regex.max_insts) input = input[0..@min(input.len, il)];
     if (re.insts.len > regex.max_insts) hit(.heap);
-    if (!onStack(&re)) hit(.heap_alloc);
+    if (!withinStack(&re)) return error.CompiledPastTheStack;
     var m = try regex.Matcher.init(gpa, &re);
     defer m.deinit();
     m.dfa_eager = true; // short inputs: the DFA would not be made yet
@@ -701,12 +697,19 @@ fn setCheck(comptime S: type, src: *S, gpa: std.mem.Allocator, mode: Mode, main:
     if (bad != null) return error.SetTookABadPattern;
     if (too_large) return error.SetPastItsTables;
     hit(.set);
-    var out: [161]bool = undefined;
-    const any = set.matches(input, out[0..n]);
+    var out: [163]bool = undefined;
+    // `out` shorter or longer than the set now and then: as many as it holds.
+    const olen = switch (src.valueRangeAtMost(u8, 0, 5)) {
+        0 => n - 1,
+        1 => n + 2,
+        else => n,
+    };
+    const any = set.matches(input, out[0..olen]);
+    if (olen > n) for (out[n..olen]) |o| if (o) return error.SetReportsPastItsPatterns;
     var want_any = false;
-    for (res[0..n], out[0..n]) |*r, o| {
+    for (res[0..n], 0..) |*r, i| {
         const want = try isMatchOf(gpa, r, input);
-        if (want != o) return error.SetDisagreesWithPattern;
+        if (i < olen and want != out[i]) return error.SetDisagreesWithPattern;
         want_any = want_any or want;
     }
     if (any != want_any or set.isMatch(input) != want_any) return error.SetAnyDisagrees;
@@ -759,20 +762,23 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
         if (found != null) hit(.onepass_match);
     }
 
-    // Bytes mode: slices only.
-    if (!re.bytes) {
+    // The reader front end, through a 4-byte buffer (peeked sequences) and a
+    // 1-byte one (held bytes); bytes mode: refused with an error.
+    for ([_]usize{ 4, 1 }) |bl| {
         var rbuf: [4]u8 = undefined;
-        var tr: std.testing.Reader = .init(&rbuf, &.{.{ .buffer = input }});
+        var tr: std.testing.Reader = .init(rbuf[0..bl], &.{.{ .buffer = input }});
         tr.artificial_limit = .limited(1);
+        if (re.bytes) {
+            if (m.capturesReader(&tr.interface, g1[0..ng])) |_| return error.BytesReaderAccepted else |e| if (e != error.BytesMode) return e;
+            break;
+        }
         const rf = try m.capturesReader(&tr.interface, g1[0..ng]);
         if (rf != (found != null)) return error.ReaderDisagrees;
         if (rf and (g1[0].?.start != found.?.start or g1[0].?.end != found.?.end)) return error.ReaderDisagreesOnSpan;
-        if (onStack(re)) {
-            var rbuf2: [4]u8 = undefined;
-            var tr2: std.testing.Reader = .init(&rbuf2, &.{.{ .buffer = input }});
-            tr2.artificial_limit = .limited(1);
-            if (try re.isMatchReader(&tr2.interface) != (found != null)) return error.ReaderMatchDisagrees;
-        }
+        var rbuf2: [4]u8 = undefined;
+        var tr2: std.testing.Reader = .init(rbuf2[0..bl], &.{.{ .buffer = input }});
+        tr2.artificial_limit = .limited(1);
+        if (try re.isMatchReader(&tr2.interface) != (found != null)) return error.ReaderMatchDisagrees;
     }
 
     if (!re.longest) {
@@ -835,8 +841,8 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
 
 /// `shortestMatch` (see the file comment).
 fn shortestChecks(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8, found: ?regex.Span, asserts: bool) anyerror!void {
-    const end = try re.shortestMatchAlloc(gpa, input);
-    if (onStack(re) and !std.meta.eql(re.shortestMatch(input), end)) return error.ShortestAllocDisagrees;
+    _ = gpa;
+    const end = re.shortestMatch(input);
     if ((end == null) != (found == null)) return error.ShortestDisagreesWithFind;
     const e = end orelse return;
     hit(.shortest);
