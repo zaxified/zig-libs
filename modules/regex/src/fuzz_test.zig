@@ -25,7 +25,11 @@
 //!   - `replaceAll(.., "$0")` gives the input back; `replaceAllLiteral(.., "")`
 //!     removes exactly the iterator's spans; split pieces are disjoint from
 //!     the matches; every match begins with `literalPrefix`, and a complete
-//!     prefix is matched in full; `quoteMeta(input)` matches the input exactly.
+//!     prefix is matched in full; `quoteMeta(input)` matches the input exactly;
+//!   - `shortestMatch` is null exactly when nothing matches, lies inside
+//!     `find`'s span, and — for patterns without assertions — is the
+//!     earliest end of any substring `fullMatch` takes; the `*Alloc`
+//!     variants answer as the stack ones.
 //!
 //! A third of the patterns is drawn from a POSIX ERE grammar of its own
 //! (bracket expressions with `[:class:]`, intervals, stacked repetitions
@@ -36,6 +40,21 @@
 //! full, and the longest such substring, by `fullMatch` (the DFA) over every
 //! pair of code-point boundaries. Only for patterns without assertions, whose
 //! meaning does not depend on the text around a substring.
+//!
+//! The Rust grammar (`Options.syntax = .rust`) and bytes mode (`utf8 =
+//! false`) are drawn too, and every atom is written in both grammars with
+//! the same meaning (Go's `\d` is Rust's `[0-9]`, Rust's `[a-c&&b-d]` is
+//! Go's `[b-c]`, `(?x: a b )` is `(?:ab)`): while no atom only one grammar
+//! can say was drawn, the `.perl` and `.rust` programs must give the same
+//! matches and groups from every position. A bytes-mode pattern that
+//! `&str` also takes gives, on valid UTF-8, `&str`'s match — or an earlier
+//! empty one inside a code point, which only bytes mode may report. A third
+//! of the drawn patterns also runs in a `RegexSet` with up to three others
+//! (now and then with a hundred large classes, past what a set's range
+//! table holds): a set reports exactly the patterns whose own `isMatch`
+//! holds, and refuses exactly when one of them, or its size, is refused. A
+//! share is padded past `max_insts` (compiled on the heap) and past
+//! `4 * max_insts` (the `*Alloc` entry points only).
 //!
 //! The Go oracle (`go_oracle_test.zig`) is what holds the answers to Go's;
 //! this holds the engine to itself over far more shapes. Planted mutants
@@ -60,7 +79,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, heap_alloc, shortest, shortest_ref };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -71,50 +90,189 @@ fn hit(comptime l: Label) void {
     reach[@backingInt(l)] += 1;
 }
 
+const Mode = enum { perl, posix, rust, bytes };
+
+fn optionsFor(mode: Mode) regex.Options {
+    return switch (mode) {
+        .perl => .{},
+        .posix => .{ .syntax = .posix },
+        .rust => .{ .syntax = .rust },
+        .bytes => .{ .syntax = .rust, .utf8 = false },
+    };
+}
+
+/// One atom in both grammars: Go's (`.perl`) text and Rust's, saying the
+/// same; null where that grammar cannot say it.
+const Pair = struct { ?[]const u8, ?[]const u8 };
+
+const literals = [_][]const u8{ "a", "b", "c", "é", "1", " ", "-", "\u{212a}", "ſ" };
+const classes = [_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[[:alpha:]]", "[^[:digit:]\\n]", "\\pL", "\\p{Greek}", "\\PN", "[\\p{Lu}a]", "(?i)\\p{Ll}" };
+/// Go's Perl classes are ASCII and case-folded under `(?i)`; Rust's are
+/// Unicode and never folded — a bracket class says Go's in Rust.
+const perl_classes = [_]Pair{
+    .{ "\\d", "[0-9]" },         .{ "\\w", "[0-9A-Za-z_]" },  .{ "\\s", "[\\t\\n\\f\\r ]" },
+    .{ "\\D", "[^0-9]" },        .{ "\\W", "[^0-9A-Za-z_]" }, .{ "\\S", "[^\\t\\n\\f\\r ]" },
+    .{ "\\.", "\\." },           .{ "\\x{e9}", "\\x{e9}" },   .{ "\\Qa.\\E", "a\\." },
+    .{ "[\\d]", "[[:digit:]]" },
+};
+const assertions = [_]Pair{
+    .{ "^", "^" }, .{ "$", "$" }, .{ "\\b", "(?-u:\\b)" }, .{ "\\B", "(?-u:\\B)" }, .{ "\\A", "\\A" }, .{ "\\z", "\\z" },
+};
+const flag_groups = [_][]const u8{ "(?i)", "(?m)", "(?s)", "(?U)", "(?-i)" };
+/// Rust syntax: with Go's twin where Go can say it.
+const rust_atoms = [_]Pair{
+    .{ "[b-c]", "[a-c&&b-d]" },   .{ "[ac]", "[a-c--b]" },                  .{ "[ad]", "[a-c~~b-d]" },
+    .{ "\\p{Nd}", "[\\w&&\\d]" }, .{ "[d-zD-Z]", "[[:alpha:]--[a-cA-C]]" },
+    .{ "é", "\\u{e9}" },
+    .{ "é", "\\u00E9" },
+    .{ "\\p{Lu}", "\\p{gc=Lu}" }, .{ "\\p{Greek}", "\\p{sc:Greek}" },       .{ "\\P{Greek}", "\\p{sc!=Greek}" },
+    .{ "(?:ab)", "(?x: a b )" },  .{ "(?:a b)", "(?x:a\\ b)" },             .{ "(?:ab)", "(?x:a#c\nb)" },
+    .{ "[ab]", "[a[b]]" },        .{ "[^ab]", "[^a[b]]" },                  .{ null, "\\d" },
+    .{ null, "\\w" },             .{ null, "\\s" },                         .{ null, "\\W" },
+    .{ null, "\\p{scx=Greek}" },  .{ null, "\\p{Alphabetic}" },             .{ null, "[\\p{Greek}&&\\p{Ll}]" },
+    .{ null, "[\\w--a]" },        .{ null, "(?R:.)" },                      .{ null, "(?-u:\\w)" },
+    .{ null, "\\p{Emoji}" },
+};
+const rust_assertions = [_][]const u8{ "\\b", "\\B", "\\<", "\\>", "\\b{start}", "\\b{end}", "\\b{start-half}", "\\b{end-half}", "(?-u:\\<)", "(?-u:\\b{end-half})", "(?Rm:^)", "(?Rm:$)" };
+const rust_flags = [_][]const u8{ "(?R)", "(?x)", "(?-u)", "(?u)", "(?ix)", "(?i-u)", "(?mR)" };
+/// Bytes mode only: `&str` refuses each.
+const byte_atoms = [_][]const u8{ "(?-u:\\xff)", "(?-u:.)", "(?-u)[\\x80-\\xff]", "(?-u:\\W)", "(?s-u:.)", "(?-u:[^a])", "(?-u:\\xC3)" };
+const quantifiers = [_]Pair{
+    .{ "*", "*" },       .{ "+", "+" },   .{ "?", "?" },   .{ "{2}", "{ 2 }" },     .{ "{0,2}", "{0,2}" },
+    .{ "{1,}", "{1,}" }, .{ "*?", "*?" }, .{ "+?", "+?" }, .{ "{1,3}?", "{1,3}?" },
+};
+
 const Gen = struct {
-    buf: [256]u8 = undefined,
+    /// Go's text (and POSIX's), Rust's text: they say the same while
+    /// `perl_ok` and `rust_ok` hold.
+    buf: [512]u8 = undefined,
     len: usize = 0,
+    rbuf: [512]u8 = undefined,
+    rlen: usize = 0,
+    perl_ok: bool = true,
+    rust_ok: bool = true,
+    /// A construct `&str` refuses was drawn (or the text was damaged).
+    bytes_only: bool = false,
     literal_only: bool = true,
     /// An assertion (`^ $ \b …`) was drawn: no substring reference.
     asserts: bool = false,
     groups: usize = 0,
 
+    fn append(buf: []u8, len: *usize, s: []const u8) bool {
+        if (len.* + s.len > buf.len) return false;
+        @memcpy(buf[len.*..][0..s.len], s);
+        len.* += s.len;
+        return true;
+    }
+
+    fn put2(g: *Gen, perl: ?[]const u8, rust: ?[]const u8) void {
+        if (perl) |s| {
+            if (!append(&g.buf, &g.len, s)) g.perl_ok = false;
+        } else g.perl_ok = false;
+        if (rust) |s| {
+            if (!append(&g.rbuf, &g.rlen, s)) g.rust_ok = false;
+        } else g.rust_ok = false;
+    }
+
     fn put(g: *Gen, s: []const u8) void {
-        const n = @min(s.len, g.buf.len - g.len);
-        @memcpy(g.buf[g.len..][0..n], s[0..n]);
-        g.len += n;
+        g.put2(s, s);
     }
 
     fn meta(g: *Gen, s: []const u8) void {
         g.literal_only = false;
         g.put(s);
     }
+
+    fn meta2(g: *Gen, perl: ?[]const u8, rust: ?[]const u8) void {
+        g.literal_only = false;
+        g.put2(perl, rust);
+    }
+
+    fn primary(g: *Gen, mode: Mode) []u8 {
+        return switch (mode) {
+            .perl, .posix => g.buf[0..g.len],
+            .rust, .bytes => g.rbuf[0..g.rlen],
+        };
+    }
+
+    /// `open ++ what was drawn ++ close`, in both texts.
+    fn wrap(g: *Gen, open: []const u8, ropen: []const u8, close: []const u8) void {
+        var body: [512]u8 = undefined;
+        var rbody: [512]u8 = undefined;
+        const n = g.len;
+        const rn = g.rlen;
+        @memcpy(body[0..n], g.buf[0..n]);
+        @memcpy(rbody[0..rn], g.rbuf[0..rn]);
+        g.len = 0;
+        g.rlen = 0;
+        g.meta2(open, ropen);
+        if (!append(&g.buf, &g.len, body[0..n])) g.perl_ok = false;
+        if (!append(&g.rbuf, &g.rlen, rbody[0..rn])) g.rust_ok = false;
+        g.put(close);
+    }
 };
 
-fn genAtom(comptime S: type, src: *S, g: *Gen, depth: u32) void {
-    switch (src.valueRangeAtMost(u8, 0, if (depth < 2) 13 else 7)) {
-        0, 1, 2 => g.put(([_][]const u8{ "a", "b", "c", "é", "1", " ", "-" })[src.index(7)]),
+fn pick(comptime S: type, src: *S, comptime T: type, table: []const T) T {
+    return table[src.index(table.len)];
+}
+
+fn genAtom(comptime S: type, src: *S, g: *Gen, depth: u32, mode: Mode) void {
+    const rust = mode == .rust or mode == .bytes;
+    switch (src.valueRangeAtMost(u8, 0, if (depth < 2) 15 else 11)) {
+        0, 1, 2 => g.put(pick(S, src, []const u8, &literals)),
         3 => g.meta("."),
-        4 => g.meta(([_][]const u8{ "[ab]", "[^a]", "[a-c]", "[é1-2]", "[]a]", "[a-]", "[[:alpha:]]", "[^[:digit:]\\n]", "\\pL", "\\p{Greek}", "\\PN", "[\\p{Lu}a]", "(?i)\\p{Ll}" })[src.index(13)]),
-        5 => g.meta(([_][]const u8{ "\\d", "\\w", "\\s", "\\D", "\\W", "\\S", "\\.", "\\x{e9}", "\\Qa.\\E" })[src.index(9)]),
+        4 => g.meta(pick(S, src, []const u8, &classes)),
+        5 => {
+            const p = pick(S, src, Pair, &perl_classes);
+            g.meta2(p[0], p[1]);
+        },
         6 => {
             g.asserts = true;
-            g.meta(([_][]const u8{ "^", "$", "\\b", "\\B", "\\A", "\\z" })[src.index(6)]);
+            const p = pick(S, src, Pair, &assertions);
+            g.meta2(p[0], p[1]);
         },
         7 => {
             // A flag group takes no repetition of its own.
-            g.meta(([_][]const u8{ "(?i)", "(?m)", "(?s)", "(?U)", "(?-i)" })[src.index(5)]);
+            g.meta(pick(S, src, []const u8, &flag_groups));
             return;
         },
+        8, 9 => if (rust) {
+            const p = pick(S, src, Pair, &rust_atoms);
+            g.meta2(p[0], p[1]);
+        } else g.put(pick(S, src, []const u8, &literals)),
+        10 => if (rust) {
+            if (src.value(bool)) {
+                g.asserts = true;
+                g.meta2(null, pick(S, src, []const u8, &rust_assertions));
+            } else {
+                g.meta2(null, pick(S, src, []const u8, &rust_flags));
+                return;
+            }
+        } else g.meta("."),
+        11 => if (mode == .bytes) {
+            g.bytes_only = true;
+            g.meta2(null, pick(S, src, []const u8, &byte_atoms));
+        } else g.meta(pick(S, src, []const u8, &classes)),
         else => {
-            g.meta(([_][]const u8{ "(", "(?:", "(?i:", "(?P<n>" })[src.index(4)]);
+            const k = src.index(4);
+            if (k == 3) {
+                // Names stay unique: Rust refuses a repeated one.
+                var pn: [16]u8 = undefined;
+                var rn: [16]u8 = undefined;
+                const perl = std.fmt.bufPrint(&pn, "(?P<n{d}>", .{g.groups}) catch unreachable;
+                const r = std.fmt.bufPrint(&rn, "{s}<n{d}>", .{ if (src.value(bool)) "(?P" else "(?", g.groups }) catch unreachable;
+                g.meta2(perl, r);
+            } else g.meta(([_][]const u8{ "(", "(?:", "(?i:" })[k]);
             g.groups += 1;
-            genAlt(S, src, g, depth + 1);
+            genAlt(S, src, g, depth + 1, mode);
             g.put(")");
         },
     }
     if (src.valueRangeAtMost(u8, 0, 3) == 0) {
-        g.meta(([_][]const u8{ "*", "+", "?", "{2}", "{0,2}", "{1,}", "*?", "+?", "{1,3}?" })[src.index(9)]);
+        const q = pick(S, src, Pair, &quantifiers);
+        g.meta2(q[0], q[1]);
+        // Rust repeats a repetition (`a*+`); Go refuses it.
+        if (rust and src.valueRangeAtMost(u8, 0, 7) == 0) g.meta2(null, pick(S, src, []const u8, &.{ "+", "{2}", "*" }));
     }
 }
 
@@ -159,17 +317,41 @@ fn genAltPosix(comptime S: type, src: *S, g: *Gen, depth: u32) void {
 /// One to three alternatives of one to four atoms. A loop, not recursion:
 /// a source that keeps answering the minimum (Smith outside `--fuzz`) must
 /// still end.
-fn genAlt(comptime S: type, src: *S, g: *Gen, depth: u32) void {
+fn genAlt(comptime S: type, src: *S, g: *Gen, depth: u32, mode: Mode) void {
     for (0..src.valueRangeAtMost(u8, 1, 3), 0..) |_, i| {
         if (i != 0) g.meta("|");
-        for (0..src.valueRangeAtMost(u8, 1, 3)) |_| genAtom(S, src, g, depth);
+        for (0..src.valueRangeAtMost(u8, 1, 3)) |_| genAtom(S, src, g, depth, mode);
     }
+}
+
+/// What `isMatch` and its kin keep on the stack (past it they panic).
+fn onStack(re: *const regex.Regex) bool {
+    return re.insts.len <= @as(usize, if (re.bytes) regex.max_insts else 4 * regex.max_insts);
+}
+
+/// `isMatch`, held to `isMatchAlloc`; `isMatchAlloc` alone past the stack.
+fn isMatchOf(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
+    const heap = try re.isMatchAlloc(gpa, input);
+    if (onStack(re) and re.isMatch(input) != heap) return error.IsMatchAllocDisagrees;
+    return heap;
+}
+
+fn fullMatchOf(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8) !bool {
+    const heap = try re.fullMatchAlloc(gpa, input);
+    if (onStack(re) and re.fullMatch(input) != heap) return error.FullMatchAllocDisagrees;
+    return heap;
 }
 
 fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var g: Gen = .{};
-    const posix = src.valueRangeAtMost(u8, 0, 2) == 0;
-    if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0);
+    const mode: Mode = switch (src.valueRangeAtMost(u8, 0, 8)) {
+        0, 1 => .posix,
+        2, 3, 4 => .perl,
+        5, 6 => .rust,
+        else => .bytes,
+    };
+    const posix = mode == .posix;
+    if (posix) genAltPosix(S, src, &g, 0) else genAlt(S, src, &g, 0, mode);
     // A share padded past the lazy DFA's size with a dead alternative (`q` is
     // not in the input alphabet): the same language, but `isMatch` runs the
     // NFA set simulation (bxp 2026-10-19: a stale closure after a prefilter
@@ -178,49 +360,57 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     // both from the start and after a consumed code point (`a?\b`): when the
     // threads die there it has been visited, failing — the shape of that
     // bug, about one in 10^6 of the plain grammar (0 of 200 000 padded seeds).
-    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.len != 0) {
-        var body: [256]u8 = undefined;
-        const n = g.len;
-        @memcpy(body[0..n], g.buf[0..n]);
-        g.len = 0;
-        g.meta(if (posix) "(" else "(?:");
+    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.primary(mode).len != 0) {
         if (src.value(bool)) {
             g.asserts = true;
             if (posix) {
-                g.put(([_][]const u8{ "a?^", "a*$", "[a1]*^" })[src.index(3)]);
+                const p = pick(S, src, []const u8, &.{ "(a?^", "(a*$", "([a1]*^" });
+                g.wrap(p, p, ")|q{130}");
             } else {
-                g.put(([_][]const u8{ "a?\\b", "a*\\b", "[a1]?\\B", "\\w*\\b", "(?m:a?^)", "a*$" })[src.index(6)]);
+                const p = pick(S, src, Pair, &.{
+                    .{ "(?:a?\\b", "(?:a?(?-u:\\b)" },       .{ "(?:a*\\b", "(?:a*(?-u:\\b)" },
+                    .{ "(?:[a1]?\\B", "(?:[a1]?(?-u:\\B)" }, .{ "(?:\\w*\\b", "(?:[0-9A-Za-z_]*(?-u:\\b)" },
+                    .{ "(?:(?m:a?^)", "(?:(?m:a?^)" },       .{ "(?:a*$", "(?:a*$" },
+                });
+                g.wrap(p[0].?, p[1].?, ")|q{130}");
             }
-        }
-        g.put(body[0..n]);
-        g.put(")|q{130}");
+        } else g.wrap(if (posix) "(" else "(?:", "(?:", ")|q{130}");
+    }
+    // A share behind a set of literal prefixes: `Prefilter.teddy` (the plain
+    // grammar draws one about once in 40 patterns).
+    if (!posix and src.valueRangeAtMost(u8, 0, 7) == 0) {
+        const p = pick(S, src, []const u8, &.{ "(?:ab|ca)", "(?:ab|ba|c1)", "(?:é|ab|-)", "(?:a|b)", "(?:1a|1b|1c|é1)" });
+        g.wrap(p, p, "");
+    }
+    // A share past `max_insts` (compiled on the heap), some of it past
+    // `4 * max_insts` (`isMatch` panics there: the `*Alloc` variants).
+    if (!posix and src.valueRangeAtMost(u8, 0, 15) == 0 and g.primary(mode).len != 0) {
+        g.wrap("(?:", "(?:", pick(S, src, []const u8, &.{ ")|q{1000}q{100}", ")|q{1000}q{1000}", ")|q{1000}q{1000}q{1000}", ")|q{1000}q{1000}q{1000}q{1000}q{500}" }));
     }
     // A share anchored at the end: `isMatch` reads those backwards from the
     // end of the text (`runRevDfa`), the grammar alone rarely gets there.
-    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.len != 0) {
-        var body: [256]u8 = undefined;
-        const n = g.len;
-        @memcpy(body[0..n], g.buf[0..n]);
-        g.len = 0;
-        g.meta(if (posix) "(" else "(?:");
-        g.put(body[0..n]);
+    if (src.valueRangeAtMost(u8, 0, 3) == 0 and g.primary(mode).len != 0) {
         g.asserts = true;
-        g.put(")$");
+        g.wrap(if (posix) "(" else "(?:", "(?:", ")$");
     }
     // A share of the patterns is damaged byte-wise: the parser's error paths.
-    if (src.valueRangeAtMost(u8, 0, 4) == 0 and g.len != 0) {
+    if (src.valueRangeAtMost(u8, 0, 4) == 0 and g.primary(mode).len != 0) {
         g.literal_only = false;
         g.asserts = true; // `ab` damaged to `\b`: whatever it now says
+        g.perl_ok = false;
+        g.rust_ok = false;
+        g.bytes_only = true;
+        const text = g.primary(mode);
         for (0..src.valueRangeAtMost(u8, 1, 3)) |_| {
-            g.buf[src.index(g.len)] = ([_]u8{ '(', ')', '[', ']', '{', '}', '\\', '*', '|', 0xff, ':', '?' })[src.index(12)];
+            text[src.index(text.len)] = ([_]u8{ '(', ')', '[', ']', '{', '}', '\\', '*', '|', 0xff, ':', '?' })[src.index(12)];
         }
     }
-    const pattern = g.buf[0..g.len];
+    const pattern = g.primary(mode);
 
     var input_buf: [24]u8 = undefined;
     var il: usize = 0;
     for (0..src.valueRangeAtMost(u8, 0, 10)) |_| {
-        const piece = ([_][]const u8{ "a", "b", "c", "1", " ", "\n", "é", "É", "-", "_", "\xff", "ab", "Ω", "ω" })[src.index(14)];
+        const piece = ([_][]const u8{ "a", "b", "c", "1", " ", "\n", "é", "É", "-", "_", "\xff", "ab", "Ω", "ω", "\r", "\u{212a}", "ſ" })[src.index(17)];
         if (il + piece.len > input_buf.len) break;
         @memcpy(input_buf[il..][0..piece.len], piece);
         il += piece.len;
@@ -236,21 +426,38 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     }
 
     // Printed only when a check fails, for the replay.
-    errdefer std.debug.print("regex fuzz: {s} \"{f}\" on \"{f}\"\n", .{ if (posix) "posix" else "perl", std.zig.fmtString(pattern), std.zig.fmtString(input) });
-    var re = regex.Regex.compileOptions(gpa, pattern, .{ .syntax = if (posix) .posix else .perl }) catch |e| {
+    errdefer std.debug.print("regex fuzz: {t} \"{f}\" on \"{f}\"\n", .{ mode, std.zig.fmtString(pattern), std.zig.fmtString(input) });
+    if (!posix and src.valueRangeAtMost(u8, 0, 2) == 0) try setCheck(S, src, gpa, mode, pattern, input);
+
+    const opts = optionsFor(mode);
+    var re = regex.Regex.compileOptions(gpa, pattern, opts) catch |e| {
         if (e == error.OutOfMemory) return e;
         hit(.refused);
         if (posix) hit(.posix_refused);
+        try refusedTwins(gpa, &g, mode, e);
         return;
     };
     defer re.deinit(gpa);
     hit(.compiled);
+    switch (mode) {
+        .rust => {
+            hit(.rust);
+            if (re.vm_only) hit(.rust_vm_only);
+        },
+        .bytes => hit(.bytes),
+        else => {},
+    }
     if (re.insts.len > dfa_max_insts) hit(.big);
+    // A heap program (up to 65,534 instructions, `(…){1000}`) on the VMs is
+    // O(text × program) per start: the short input only.
+    if (re.insts.len > regex.max_insts) input = input[0..@min(input.len, il)];
+    if (re.insts.len > regex.max_insts) hit(.heap);
+    if (!onStack(&re)) hit(.heap_alloc);
     var m = try regex.Matcher.init(gpa, &re);
     defer m.deinit();
     m.dfa_eager = true; // short inputs: the DFA would not be made yet
 
-    const any = re.isMatch(input);
+    const any = try isMatchOf(gpa, &re, input);
     const found = m.find(input, 0);
     if (any != (found != null)) return error.IsMatchDisagreesWithFind;
     if (re.prefilter.end_anchored and re.insts.len <= dfa_max_insts) {
@@ -272,7 +479,7 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
             if (!std.meta.eql(bm.find(input, from), m.find(input, from))) return error.TeddySkippedAMatch;
         }
     }
-    if (re.fullMatch(input)) {
+    if (try fullMatchOf(gpa, &re, input)) {
         hit(.full);
         if (!any) return error.FullMatchWithoutMatch;
     }
@@ -297,16 +504,17 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         // Go's FindAll: an empty match right where the previous one ended is
         // skipped.
         if (n != 0 and s.start == s.end and s.start == prev_end) return error.IteratorEmptyNextToPrevious;
-        if (!onBoundary(input, s.start) or !onBoundary(input, s.end)) return error.SpanSplitsACodePoint;
+        if (!onBoundary(input, s.start, re.bytes) or !onBoundary(input, s.end, re.bytes)) return error.SpanSplitsACodePoint;
         prev_end = s.end;
         if (n > input.len + 1) return error.IteratorDoesNotEnd;
     }
     if ((n == 0) != (found == null)) return error.IteratorDisagreesWithFind;
 
     try crossChecks(gpa, &re, &m, input, found);
-    try anchoredTwin(gpa, pattern, posix, input);
+    try shortestChecks(gpa, &re, input, found, g.asserts);
+    try anchoredTwin(gpa, pattern, mode, input);
     if (posix) hit(.posix);
-    if (!g.asserts and input.len <= input_buf.len) try longestReference(gpa, &re, input);
+    if (!g.asserts and input.len <= input_buf.len and re.insts.len <= regex.max_insts) try longestReference(gpa, &re, input);
 
     if (g.literal_only and !posix) {
         hit(.literal);
@@ -314,6 +522,193 @@ fn harness(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
         if ((want != null) != any) return error.LiteralReferenceDisagrees;
         if (want) |w| if (found.?.start != w or found.?.end != w + pattern.len) return error.LiteralReferenceSpan;
     }
+
+    switch (mode) {
+        .perl => if (g.rust_ok) try syntaxTwin(gpa, &re, g.rbuf[0..g.rlen], .{ .syntax = .rust }, input),
+        .rust => if (g.perl_ok) try syntaxTwin(gpa, &re, g.buf[0..g.len], .{}, input),
+        .bytes => if (!g.bytes_only and std.unicode.utf8ValidateSlice(input)) try bytesTwin(gpa, &re, pattern, input),
+        .posix => {},
+    }
+}
+
+/// Limits the two grammars count differently (Rust's nest height counts
+/// concatenations): a twin refused for one of these says nothing.
+fn isLimit(e: anyerror) bool {
+    return e == error.NestingDepth or e == error.PatternTooLarge;
+}
+
+/// The drawn pattern was refused: its twin must be refused too.
+fn refusedTwins(gpa: std.mem.Allocator, g: *Gen, mode: Mode, e: anyerror) anyerror!void {
+    if (isLimit(e)) return;
+    const ok = switch (mode) {
+        .perl => g.rust_ok,
+        .rust => g.perl_ok,
+        .bytes => !g.bytes_only,
+        .posix => false,
+    };
+    if (!ok) return;
+    const twin = if (mode == .rust) g.buf[0..g.len] else g.rbuf[0..g.rlen];
+    const opts: regex.Options = if (mode == .rust) .{} else .{ .syntax = .rust };
+    var tw = regex.Regex.compileOptions(gpa, twin, opts) catch |te| {
+        if (te == error.OutOfMemory) return te;
+        return;
+    };
+    tw.deinit(gpa);
+    std.debug.print("regex fuzz: refused with {t}, twin \"{f}\" compiles\n", .{ e, std.zig.fmtString(twin) });
+    return error.TwinTakesWhatIsRefused;
+}
+
+/// The same pattern in the other grammar: the same answers everywhere.
+fn syntaxTwin(gpa: std.mem.Allocator, re: *const regex.Regex, twin: []const u8, opts: regex.Options, input: []const u8) anyerror!void {
+    errdefer std.debug.print("regex fuzz: twin {t} \"{f}\"\n", .{ opts.syntax, std.zig.fmtString(twin) });
+    var tw = regex.Regex.compileOptions(gpa, twin, opts) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        if (isLimit(e)) return;
+        return error.TwinRefused;
+    };
+    defer tw.deinit(gpa);
+    hit(.twin);
+    if (tw.names.len != re.names.len) return error.TwinGroupCount;
+    if (try isMatchOf(gpa, &tw, input) != try isMatchOf(gpa, re, input)) return error.TwinIsMatch;
+    if (try fullMatchOf(gpa, &tw, input) != try fullMatchOf(gpa, re, input)) return error.TwinFullMatch;
+    var a = try regex.Matcher.init(gpa, re);
+    defer a.deinit();
+    var b = try regex.Matcher.init(gpa, &tw);
+    defer b.deinit();
+    const ng = re.names.len;
+    var g1: [regex.max_groups]?regex.Span = undefined;
+    var g2: [regex.max_groups]?regex.Span = undefined;
+    const stride: usize = if (input.len > 32) 37 else 1;
+    var from: usize = 0;
+    while (from <= input.len) : (from += stride) {
+        if (!onBoundary(input, from, false)) continue;
+        const f1 = a.captures(input, from, g1[0..ng]);
+        if (f1 != b.captures(input, from, g2[0..ng])) return error.TwinFind;
+        if (f1) {
+            hit(.twin_match);
+            for (g1[0..ng], g2[0..ng]) |x, y| if (!std.meta.eql(x, y)) return error.TwinGroups;
+        }
+    }
+    var ia = a.iterator(input);
+    var ib = b.iterator(input);
+    while (true) {
+        const x = ia.next();
+        if (!std.meta.eql(x, ib.next())) return error.TwinIterator;
+        if (x == null) break;
+    }
+}
+
+/// A bytes-mode pattern that `&str` takes too, on valid UTF-8: `&str`'s
+/// match, or an earlier empty one inside a code point.
+fn bytesTwin(gpa: std.mem.Allocator, re: *const regex.Regex, pattern: []const u8, input: []const u8) anyerror!void {
+    var sre = regex.Regex.compileOptions(gpa, pattern, .{ .syntax = .rust }) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        // `(?-u)` then `.`: only bytes mode can say it.
+        if (e == error.InvalidUtf8 or isLimit(e)) return;
+        return error.StrRefusesWhatBytesTakes;
+    };
+    defer sre.deinit(gpa);
+    hit(.bytes_twin);
+    if (try fullMatchOf(gpa, &sre, input) != try fullMatchOf(gpa, re, input)) return error.BytesFullMatch;
+    var bm = try regex.Matcher.init(gpa, re);
+    defer bm.deinit();
+    var sm = try regex.Matcher.init(gpa, &sre);
+    defer sm.deinit();
+    const stride: usize = if (input.len > 32) 37 else 1;
+    var from: usize = 0;
+    while (from <= input.len) : (from += stride) {
+        if (!onBoundary(input, from, false)) continue;
+        const b = bm.find(input, from);
+        const s = sm.find(input, from);
+        errdefer std.debug.print("regex fuzz: bytes {any} str {any} from {d}\n", .{ b, s, from });
+        if (b) |x| {
+            hit(.bytes_twin_match);
+            if (!onBoundary(input, x.start, false) or !onBoundary(input, x.end, false)) {
+                if (x.start != x.end) return error.BytesSplitsACodePoint;
+                if (s) |y| if (y.start <= x.start) return error.BytesEmptyNotEarlier;
+            } else if (!std.meta.eql(b, s)) return error.BytesDisagreesWithStr;
+        } else if (s != null) return error.BytesMissesStrMatch;
+    }
+}
+
+/// The drawn pattern among up to three others (or a hundred large classes)
+/// in a `RegexSet`: each pattern's own `isMatch`, refused as its parts are.
+fn setCheck(comptime S: type, src: *S, gpa: std.mem.Allocator, mode: Mode, main: []const u8, input: []const u8) anyerror!void {
+    const opts = optionsFor(mode);
+    var gens: [3]Gen = undefined;
+    var pats: [161][]const u8 = undefined;
+    var n: usize = 0;
+    if (src.valueRangeAtMost(u8, 0, 15) == 0) {
+        // Each class some hundreds of ranges: the set's table past a u16.
+        hit(.set_big);
+        const c = pick(S, src, []const u8, &.{ "\\pL", "[\\pL\\pN]", "\\PL", "\\p{L}\\p{N}" });
+        for (0..src.valueRangeAtMost(u8, 60, 159)) |_| {
+            pats[n] = c;
+            n += 1;
+        }
+        pats[n] = main;
+        n += 1;
+    } else {
+        const at = src.valueRangeAtMost(u8, 0, 3);
+        var drawn: usize = 0;
+        for (0..4) |i| {
+            if (i == at) {
+                pats[n] = main;
+            } else if (src.value(bool)) {
+                gens[drawn] = .{};
+                genAlt(S, src, &gens[drawn], 0, mode);
+                pats[n] = gens[drawn].primary(mode);
+                drawn += 1;
+            } else continue;
+            n += 1;
+        }
+    }
+    errdefer for (pats[0..@min(n, 5)]) |p| std.debug.print("regex fuzz: set pattern \"{f}\"\n", .{std.zig.fmtString(p)});
+    var res: [161]regex.Regex = undefined;
+    var done: usize = 0;
+    defer for (res[0..done]) |*r| r.deinit(gpa);
+    var bad: ?anyerror = null;
+    var insts: usize = n - 1;
+    var ranges: usize = 0;
+    for (pats[0..n]) |p| {
+        res[done] = regex.Regex.compileOptions(gpa, p, opts) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            bad = e;
+            break;
+        };
+        insts += res[done].insts.len;
+        ranges += res[done].ranges.len;
+        done += 1;
+    }
+    const cap: usize = if (mode == .bytes) regex.max_insts else 4 * regex.max_insts;
+    const too_large = insts > cap or ranges > std.math.maxInt(u16);
+    var set = regex.RegexSet.compile(gpa, pats[0..n], opts) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        // Refused as soon as the patterns before a bad one are too large.
+        if (e == error.PatternTooLarge and too_large) {
+            hit(.set_too_large);
+            return;
+        }
+        if (bad) |b| {
+            if (b != e) return error.SetErrorIsNotItsPatterns;
+            return;
+        }
+        return error.SetRefusedItsPatterns;
+    };
+    defer set.deinit(gpa);
+    if (bad != null) return error.SetTookABadPattern;
+    if (too_large) return error.SetPastItsTables;
+    hit(.set);
+    var out: [161]bool = undefined;
+    const any = set.matches(input, out[0..n]);
+    var want_any = false;
+    for (res[0..n], out[0..n]) |*r, o| {
+        const want = try isMatchOf(gpa, r, input);
+        if (want != o) return error.SetDisagreesWithPattern;
+        want_any = want_any or want;
+    }
+    if (any != want_any or set.isMatch(input) != want_any) return error.SetAnyDisagrees;
+    if (any) hit(.set_match);
 }
 
 /// The engine-against-engine and API invariants (see the file comment).
@@ -345,16 +740,21 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
         if (found != null) hit(.onepass_match);
     }
 
-    var rbuf: [4]u8 = undefined;
-    var tr: std.testing.Reader = .init(&rbuf, &.{.{ .buffer = input }});
-    tr.artificial_limit = .limited(1);
-    const rf = try m.capturesReader(&tr.interface, g1[0..ng]);
-    if (rf != (found != null)) return error.ReaderDisagrees;
-    if (rf and (g1[0].?.start != found.?.start or g1[0].?.end != found.?.end)) return error.ReaderDisagreesOnSpan;
-    var rbuf2: [4]u8 = undefined;
-    var tr2: std.testing.Reader = .init(&rbuf2, &.{.{ .buffer = input }});
-    tr2.artificial_limit = .limited(1);
-    if (try re.isMatchReader(&tr2.interface) != (found != null)) return error.ReaderMatchDisagrees;
+    // Bytes mode: slices only.
+    if (!re.bytes) {
+        var rbuf: [4]u8 = undefined;
+        var tr: std.testing.Reader = .init(&rbuf, &.{.{ .buffer = input }});
+        tr.artificial_limit = .limited(1);
+        const rf = try m.capturesReader(&tr.interface, g1[0..ng]);
+        if (rf != (found != null)) return error.ReaderDisagrees;
+        if (rf and (g1[0].?.start != found.?.start or g1[0].?.end != found.?.end)) return error.ReaderDisagreesOnSpan;
+        if (onStack(re)) {
+            var rbuf2: [4]u8 = undefined;
+            var tr2: std.testing.Reader = .init(&rbuf2, &.{.{ .buffer = input }});
+            tr2.artificial_limit = .limited(1);
+            if (try re.isMatchReader(&tr2.interface) != (found != null)) return error.ReaderMatchDisagrees;
+        }
+    }
 
     if (!re.longest) {
         var lre = re.*;
@@ -403,7 +803,7 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     const complete = try re.literalPrefix(&out.writer);
     const prefix = out.written();
     for (spans[0..ns]) |x| if (!std.mem.startsWith(u8, input[x.start..], prefix)) return error.MatchWithoutLiteralPrefix;
-    if (complete and !re.fullMatch(prefix)) return error.CompletePrefixNotMatched;
+    if (complete and !try fullMatchOf(gpa, re, prefix)) return error.CompletePrefixNotMatched;
 
     if (std.unicode.utf8ValidateSlice(input)) {
         const q = try regex.quoteMetaAlloc(gpa, input);
@@ -414,14 +814,41 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
     }
 }
 
+/// `shortestMatch` (see the file comment).
+fn shortestChecks(gpa: std.mem.Allocator, re: *const regex.Regex, input: []const u8, found: ?regex.Span, asserts: bool) anyerror!void {
+    const end = try re.shortestMatchAlloc(gpa, input);
+    if (onStack(re) and !std.meta.eql(re.shortestMatch(input), end)) return error.ShortestAllocDisagrees;
+    if ((end == null) != (found == null)) return error.ShortestDisagreesWithFind;
+    const e = end orelse return;
+    hit(.shortest);
+    if (e < found.?.start or e > found.?.end) return error.ShortestOutsideFind;
+    if (asserts or input.len > 24 or re.insts.len > regex.max_insts) return;
+    hit(.shortest_ref);
+    var want: ?usize = null;
+    ends: for (0..input.len + 1) |to| {
+        if (!onBoundary(input, to, re.bytes)) continue;
+        for (0..to + 1) |s| {
+            if (!onBoundary(input, s, re.bytes)) continue;
+            if (re.fullMatch(input[s..to])) {
+                want = to;
+                break :ends;
+            }
+        }
+    }
+    if (want != e) {
+        std.debug.print("regex fuzz: shortest {d}, earliest end {?d}\n", .{ e, want });
+        return error.ShortestReference;
+    }
+}
+
 /// The pattern anchored at the start, `^(?:…)`: `Matcher.find` runs such a
 /// program on its DFA (`FindDfa`), against the Pike VM from every start. A
 /// twin, not a share of the drawn patterns: the grammar alone rarely draws an
 /// anchored pattern that matches, and a new draw would move every seed.
-fn anchoredTwin(gpa: std.mem.Allocator, pattern: []const u8, posix: bool, input: []const u8) anyerror!void {
-    var buf: [300]u8 = undefined;
-    const twin = std.fmt.bufPrint(&buf, "{s}{s})", .{ if (posix) "^(" else "^(?:", pattern }) catch return;
-    var re = regex.Regex.compileOptions(gpa, twin, .{ .syntax = if (posix) .posix else .perl }) catch |e| {
+fn anchoredTwin(gpa: std.mem.Allocator, pattern: []const u8, mode: Mode, input: []const u8) anyerror!void {
+    var buf: [600]u8 = undefined;
+    const twin = std.fmt.bufPrint(&buf, "{s}{s})", .{ if (mode == .posix) "^(" else "^(?:", pattern }) catch return;
+    var re = regex.Regex.compileOptions(gpa, twin, optionsFor(mode)) catch |e| {
         if (e == error.OutOfMemory) return e;
         return; // `a)(b` and the like: the twin does not parse
     };
@@ -455,11 +882,11 @@ fn longestReference(gpa: std.mem.Allocator, re: *const regex.Regex, input: []con
     var want: ?regex.Span = null;
     var s: usize = 0;
     while (s <= input.len and want == null) : (s += 1) {
-        if (!onBoundary(input, s)) continue;
+        if (!onBoundary(input, s, re.bytes)) continue;
         var e = input.len + 1;
         while (e > s) {
             e -= 1;
-            if (!onBoundary(input, e)) continue;
+            if (!onBoundary(input, e, re.bytes)) continue;
             if (re.fullMatch(input[s..e])) {
                 want = .{ .start = s, .end = e };
                 break;
@@ -471,10 +898,11 @@ fn longestReference(gpa: std.mem.Allocator, re: *const regex.Regex, input: []con
     if (got) |x| if (x.start != want.?.start or x.end != want.?.end) return error.LongestReferenceSpan;
 }
 
-/// Not inside a UTF-8 sequence: the inputs hold only ASCII, `é`/`É` and a
-/// lone 0xff, so a continuation byte is always the middle of `é`/`É`.
-fn onBoundary(input: []const u8, i: usize) bool {
-    return i == input.len or input[i] & 0xc0 != 0x80;
+/// Not inside a UTF-8 sequence (bytes mode: every position is one). The
+/// inputs hold valid UTF-8 and a lone 0xff, so a continuation byte is always
+/// the middle of a sequence.
+fn onBoundary(input: []const u8, i: usize, bytes: bool) bool {
+    return bytes or i == input.len or input[i] & 0xc0 != 0x80;
 }
 
 /// `testing.fuzz`'s source: the bytes come FIRST, in one `slice` draw, and

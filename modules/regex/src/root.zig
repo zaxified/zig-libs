@@ -335,6 +335,8 @@ pub const Regex = struct {
     /// yields? Reads code point by code point, no further than it must (at
     /// most three code points past the end of a match); no allocator,
     /// constant memory. `r`'s buffer must hold at least 4 bytes (one UTF-8 sequence).
+    /// Its scratch is on the stack, as `isMatch`'s: a program past
+    /// `4 * max_insts` (compiled on the heap) panics here.
     pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) error{ReadFailed}!bool {
         std.debug.assert(!re.bytes); // bytes mode: slices only
         var t: ReaderText = .init(r);
@@ -798,15 +800,21 @@ pub const RegexSet = struct {
         defer for (res[0..done]) |*re| re.deinit(gpa);
         var n_insts: usize = patterns.len -| 1; // the splits
         var n_ranges: usize = 0;
+        // Its runs keep their scratch on the stack (as `Regex.isMatch`):
+        // refused as soon as the patterns so far are past it, not after
+        // compiling every one (review 2026-10-28).
+        const bytes = !opts.utf8 and opts.syntax == .rust;
+        const cap: usize = if (bytes) max_insts else 4 * max_insts;
         for (patterns, res) |pat, *re| {
             re.* = try Regex.compileOptions(gpa, pat, opts);
             done += 1;
             n_insts += re.insts.len;
             n_ranges += re.ranges.len;
+            if (n_insts > cap) return error.PatternTooLarge;
         }
-        // Its runs keep their scratch on the stack (as `Regex.isMatch`).
-        const bytes = !opts.utf8 and opts.syntax == .rust;
-        if (n_insts > @as(usize, if (bytes) max_insts else 4 * max_insts)) return error.PatternTooLarge;
+        // A `rune` instruction indexes the joined range table with a u16:
+        // a hundred `\pL` patterns are past it.
+        if (n_ranges > std.math.maxInt(u16)) return error.PatternTooLarge;
         const insts = try gpa.alloc(Inst, n_insts);
         errdefer gpa.free(insts);
         const ranges = try gpa.alloc(Range, n_ranges);
@@ -1016,7 +1024,9 @@ pub fn quoteMetaAlloc(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocato
 pub fn matches(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) (Error || std.mem.Allocator.Error)!bool {
     var re = try Regex.compile(gpa, pattern);
     defer re.deinit(gpa);
-    return re.isMatch(input);
+    // Any size: a pattern past `4 * max_insts` compiles (heap tier), and
+    // `isMatch` would panic on it (review 2026-10-28).
+    return re.isMatchAlloc(gpa, input);
 }
 
 /// A bit set over slices of words (the heap sets').
@@ -3220,6 +3230,11 @@ pub const Matcher = struct {
         var matched = false;
         var pos = from;
         var prev = text.before(from);
+        // Started inside a UTF-8 sequence: its tail is read byte by byte
+        // (U+FFFD each), but an assertion after one of those bytes sees the
+        // text before it — as the backtracker and bytes mode do — up to the
+        // sequence's end, where the two first differ (`\b` after `é`).
+        const sync = if (@TypeOf(text.*).can_skip) seqEnd(text.input, from) else from;
         const pf = &re.prefilter;
         while (true) {
             if (!matched and cur.n == 0 and !full) {
@@ -3240,6 +3255,7 @@ pub const Matcher = struct {
             if (cur.n == 0 and (matched or here.cp == null)) break;
             nxt.clear();
             const after = if (here.cp != null) text.at(pos + here.w) else here;
+            const next_prev = if (pos + here.w <= sync) text.before(pos + here.w) else here.cp;
             var i: usize = 0;
             while (i < cur.n) : (i += 1) {
                 const pc = cur.pcs[i];
@@ -3264,13 +3280,13 @@ pub const Matcher = struct {
                     },
                     else => if (here.cp) |cp| if (re.consumes(pc, cp)) {
                         @memcpy(m.tmp, caps);
-                        m.addThread(nxt, pc + 1, pos + here.w, cp, after.cp);
+                        m.addThread(nxt, pc + 1, pos + here.w, next_prev, after.cp);
                     },
                 }
             }
             if (here.cp == null) break;
             pos += here.w;
-            prev = here.cp;
+            prev = next_prev;
             std.mem.swap(*List, &cur, &nxt);
         }
         return matched;
@@ -3451,6 +3467,14 @@ fn decodeBefore(input: []const u8, i: usize) Decoded {
 /// else the code point that ends there (U+FFFD for an invalid sequence).
 /// The Go grammar's assertions look at ASCII only; the Rust grammar's
 /// Unicode word boundaries need the whole code point.
+/// Past the continuation bytes at `i` (at most three): where the UTF-8
+/// sequence `i` lies inside ends; `i` itself on a boundary.
+fn seqEnd(input: []const u8, i: usize) usize {
+    var e = i;
+    while (e < input.len and e < i + 3 and input[e] & 0xc0 == 0x80) e += 1;
+    return e;
+}
+
 fn runeBefore(input: []const u8, i: usize) ?u21 {
     if (i == 0) return null;
     const c = input[i - 1];
@@ -4920,6 +4944,82 @@ test "compile: a pattern past max_insts compiles on the heap and matches" {
     try testing.expect(try huge.isMatchAlloc(testing.allocator, "x" ++ all));
     try testing.expect(!try huge.isMatchAlloc(testing.allocator, all[1..]));
     try testing.expect(try huge.fullMatchAlloc(testing.allocator, all));
+    // `matches` compiles and matches any size (it panicked: review 2026-10-28).
+    try testing.expect(!try matches(testing.allocator, "a{1000}b{1000}c{1000}d{1000}e{1000}", "x"));
+}
+
+test "RegexSet: a joined range table past a u16 is refused, not wrapped" {
+    // Fuzz 2026-10-28: 160 × `\pL` summed the range offsets in a u16 — a
+    // panic in safe builds, rune instructions reading the wrong ranges in
+    // ReleaseFast.
+    const pats: [160][]const u8 = @splat("\\pL");
+    try testing.expectError(error.PatternTooLarge, RegexSet.compile(testing.allocator, &pats, .{}));
+    var set = try RegexSet.compile(testing.allocator, pats[0..60], .{});
+    defer set.deinit(testing.allocator);
+    var out: [60]bool = undefined;
+    try testing.expect(set.matches("1é", &out));
+    try testing.expect(!set.isMatch("1 2"));
+}
+
+test "Rust nest height counts a concatenation; bytes-mode classes reach raw bytes" {
+    // Mutation 2026-10-28: both survived the oracle replays.
+    const gpa = testing.allocator;
+    const open = strRepeat("(?:", 250);
+    const close = strRepeat(")", 250);
+    var one = try Regex.compileOptions(gpa, open ++ "a" ++ close, .{ .syntax = .rust });
+    one.deinit(gpa);
+    try testing.expectError(error.NestingDepth, Regex.compileOptions(gpa, open ++ "ab" ++ close, .{ .syntax = .rust }));
+
+    var hi = try Regex.compileOptions(gpa, "(?-u)[\\x80-\\xff]{2}", .{ .syntax = .rust, .utf8 = false });
+    defer hi.deinit(gpa);
+    try testing.expect(hi.fullMatch("\xff\x80"));
+    try testing.expect(hi.fullMatch("é")); // its two bytes, not the code point
+    try testing.expect(!hi.fullMatch("\xffa"));
+
+    // `(?-u)`: CRLF mode keeps `\r` out of a byte `.`; `(?i)` folds ASCII
+    // letters only (no Kelvin sign for `k`).
+    var dot = try Regex.compileOptions(gpa, "(?R-u:.)", .{ .syntax = .rust, .utf8 = false });
+    defer dot.deinit(gpa);
+    try testing.expect(dot.fullMatch("\xff"));
+    try testing.expect(!dot.fullMatch("\r"));
+    var k = try Regex.compileOptions(gpa, "(?i-u)k", .{ .syntax = .rust });
+    defer k.deinit(gpa);
+    try testing.expect(k.fullMatch("K"));
+    try testing.expect(!k.fullMatch("\u{212a}"));
+}
+
+test "Rust class set operations under (?i) fold both sides first" {
+    // Fuzz 2026-10-28: the folded left side was left unsorted, and the
+    // symmetric difference came out as the union.
+    const Case = struct { []const u8, []const u8, []const u8 };
+    for ([_]Case{
+        .{ "(?i)[a-c~~b-d]", "aAdD", "bBcC" },
+        .{ "(?i)[a-c&&b-d]", "bBcC", "aAdD" },
+        .{ "(?i)[a-c--b]", "aAcC", "bBdD" },
+        .{ "(?i)[[:alpha:]--[a-c]]", "dDzZ\u{212a}", "aAcC1" },
+    }) |c| {
+        var re = try Regex.compileOptions(testing.allocator, c[0], .{ .syntax = .rust });
+        defer re.deinit(testing.allocator);
+        var it = std.unicode.Utf8View.initUnchecked(c[1]).iterator();
+        while (it.nextCodepointSlice()) |s| try testing.expect(re.fullMatch(s));
+        it = std.unicode.Utf8View.initUnchecked(c[2]).iterator();
+        while (it.nextCodepointSlice()) |s| try testing.expect(!re.fullMatch(s));
+    }
+}
+
+test "find from inside a code point: a Unicode assertion sees the text, in every engine" {
+    // Fuzz 2026-10-28: the Pike VM took the U+FFFD it read for the byte at
+    // 1 as the code point before 2; the backtracker reads `é` there.
+    var re = try Regex.compileOptions(testing.allocator, "a|.\\b", .{ .syntax = .rust });
+    defer re.deinit(testing.allocator);
+    for ([_]bool{ false, true }) |pike| {
+        var m = try Matcher.init(testing.allocator, &re);
+        defer m.deinit();
+        m.pike_only = pike;
+        try testing.expectEqual(@as(?Span, .{ .start = 2, .end = 4 }), m.find("éé", 1));
+        try testing.expectEqual(@as(?Span, .{ .start = 3, .end = 4 }), m.find("éé", 3));
+        try testing.expectEqual(@as(?Span, .{ .start = 4, .end = 6 }), m.find("ééé", 1));
+    }
 }
 
 test "deep nesting compiles (or is refused) on a 512 KiB thread stack" {

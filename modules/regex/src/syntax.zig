@@ -1552,13 +1552,20 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 for (0..lhs_len) |i| try b.addRange(b.ranges[start + i]);
                 try b.rustFold(flags, copy);
                 const folded_len = b.nranges - copy;
-                // Layout now: lhs | rhs | folded lhs. Rebuild lhs' | rhs.
+                // Layout now: lhs | rhs | folded lhs. Rebuild lhs' | rhs, lhs'
+                // sorted and merged again: the fold appended its orbits after
+                // it (`[a-c]` → `a-c A-C`), and `appendSetOp` sweeps both
+                // sides in order (fuzz 2026-10-28: `(?i)[a-c~~b-d]` lost
+                // `A-C` and came out as the union).
                 const tmp = b.nranges;
                 for (0..rhs_len) |i| try b.addRange(b.ranges[rhs_start + i]);
                 std.mem.copyForwards(Range, b.ranges[start..][0..folded_len], b.ranges[copy..][0..folded_len]);
-                std.mem.copyForwards(Range, b.ranges[start + folded_len ..][0..rhs_len], b.ranges[tmp..][0..rhs_len]);
-                b.nranges = start + folded_len + rhs_len;
-                operand.* = start + folded_len;
+                b.nranges = start + folded_len;
+                b.normalizeFrom(start);
+                const lhs_end = b.nranges;
+                std.mem.copyForwards(Range, b.ranges[lhs_end..][0..rhs_len], b.ranges[tmp..][0..rhs_len]);
+                b.nranges = lhs_end + rhs_len;
+                operand.* = lhs_end;
             }
             b.normalizeFrom(operand.*);
             const lhs = b.ranges[start..operand.*];
