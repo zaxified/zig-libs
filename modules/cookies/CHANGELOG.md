@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 2 mutants over the changed code, 2 killed, 0 equivalent. Survivors of the first run became tests. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 141/146, 5 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent sweep of every pub entry point, `~/CML/20261028-panic-sweep/cookies-sessions-sweep.report.md`; no peer-reachable one found). `percentDecode` with `out` shorter than `in` and `private.seal`/`sealTimedNonce` with a `value` inside `out` were `std.debug.assert`s (UB in ReleaseFast) and are checked panics with a message. `Jar.setCookieAt` refuses a cookie whose default path (from the request URL, no `Path` attribute) is longer than `max_attribute_bytes`, so a stored cookie never costs more than the caps say. Test.
 
 - **2026-10-24** — **Faster `SetCookie.write`** (847 → 529–540 ns for the bench's 8 specs, 1.59× →

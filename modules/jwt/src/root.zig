@@ -4467,6 +4467,18 @@ test "parse: a token over max_token_len is MalformedToken; a crit list over 16 e
     try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf, w.buffered(),
         \\{"iss":"joe"}
     )));
+    // Exactly 16 entries pass the cap and fail only as not understood.
+    w = .fixed(&hdr_buf);
+    try w.writeAll("{\"alg\":\"HS256\"");
+    i = 0;
+    while (i < 16) : (i += 1) try w.print(",\"x{d}\":1", .{i});
+    try w.writeAll(",\"crit\":[");
+    i = 0;
+    while (i < 16) : (i += 1) try w.print("{s}\"x{d}\"", .{ if (i == 0) "" else ",", i });
+    try w.writeAll("]}");
+    try testing.expectError(error.UnsupportedCritHeader, parse(gpa, buildToken(&buf, w.buffered(),
+        \\{"iss":"joe"}
+    )));
 }
 
 test "Claims: claim/claimStr/scopeGranted are total on a non-object raw" {
@@ -7127,6 +7139,28 @@ test "Provider: a failed refresh is not retried inside min_refresh_interval_s" {
     try testing.expectEqual(@as(usize, 2), flaky.calls);
     try testing.expectError(error.JwksFetchFailed, p2.verify(gpa, rfc7515_a2_token, base + 430, opts));
     try testing.expectEqual(@as(usize, 3), flaky.calls);
+
+    // A success clears the failure: the next TTL expiry refetches at once,
+    // even inside min_refresh_interval_s of that success.
+    var mend: ScriptFetcher = .{ .script = &.{
+        .{ .url = test_jwks_url, .status = 500, .body = "" },
+        .{ .url = test_jwks_url, .body = rfc_set },
+    } };
+    var p3 = Provider.init(gpa, mend.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 10,
+        .min_refresh_interval_s = 30,
+    });
+    defer p3.deinit();
+    try testing.expect(std.meta.isError(p3.verify(gpa, rfc7515_a2_token, base, opts)));
+    try testing.expectEqual(@as(usize, 1), mend.calls);
+    var v3 = try p3.verify(gpa, rfc7515_a2_token, base + 30, opts);
+    v3.deinit();
+    try testing.expectEqual(@as(usize, 2), mend.calls);
+    // TTL (10 s) over, 11 s after the last attempt: refetch (the script is
+    // exhausted, so it fails -- the call count is the claim).
+    try testing.expectError(error.JwksFetchFailed, p3.verify(gpa, rfc7515_a2_token, base + 41, opts));
+    try testing.expectEqual(@as(usize, 3), mend.calls);
 }
 
 test "HttpFetcher compiles (never dialed in tests)" {

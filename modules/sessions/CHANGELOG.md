@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: its independent review plus 4 mutants over the changed code, 4 killed, 0 equivalent. Survivors of the first run became tests. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 60/64, 4 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent sweep of every pub entry point, `~/CML/20261028-panic-sweep/cookies-sessions-sweep.report.md`). A stored record at the last generation (`maxInt(u64)`, readable back from a `KvStore` file) made the next save overflow `expected + 1`; `put` on both stores now loses its CAS instead. `Manager.init` returns the new `error.InvalidCookieOptions` for options whose session cookie cannot be written (an invalid `cookie_name`/`cookie_path`/`cookie_domain`, `SameSite=None` without `Secure`, a line over 512 bytes) -- every cookie used to be dropped silently at request time. `Manager.persist` of a `Session` whose `id_len`/`data_len` the caller wrote past their buffers is a checked panic (was an out-of-bounds `@memcpy` in ReleaseFast). Tests.
 
 - **2026-10-24** — **SECURITY (fix):** `RamcacheStore.delete` wrote a tombstone at "current

@@ -3997,18 +3997,21 @@ test "diagnostic prefix stays short whatever runs of '_' the input holds (no-pan
     try src.appendNTimes(gpa, '_', 64 * 1024);
     try src.appendSlice(gpa, "1\": 0, \"$err_");
     try src.appendNTimes(gpa, '_', 64 * 1024);
-    try src.appendSlice(gpa, "1\": 0");
+    try src.appendSlice(gpa, "1\": 0, \"$err_trace_x\": 0");
     for (0..64) |_| try src.appendSlice(gpa, ", a b: 1");
     try src.appendSlice(gpa, "}");
     const out = try preprocess(gpa, src.items);
     defer gpa.free(out);
     try std.testing.expect(out.len < 2 * src.items.len);
     try std.testing.expect(jsonParses(gpa, out));
+    // No run is a colliding one (the long ones are far past √(2·len), the
+    // `$err_trace_x` one is not followed by a digit), so the bare base is used.
+    try std.testing.expect(std.mem.find(u8, out, "\"$err_trace_1\": ") != null);
     const r = try preprocessAnnotated(gpa, src.items);
     defer gpa.free(r.out);
     try std.testing.expect(r.out.len < 2 * src.items.len);
     // Still collision-free: the input's own keys keep their values.
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 2 + 64), parsed.value.object.count());
+    try std.testing.expectEqual(@as(usize, 3 + 64), parsed.value.object.count());
 }

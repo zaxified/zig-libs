@@ -1740,6 +1740,18 @@ test "Store.put: the last generation cannot be bumped, on either store -- the sa
     for ([_]Store{ env.store.store(), kenv.store.store() }) |st| {
         try testing.expectEqual(@as(?Generation, null), st.put(id, &rec, std.math.maxInt(Generation)));
     }
+    // A record that IS at the last generation (a KvStore reads it back from
+    // disk): the save loses, and the record stays as it was -- a wrapped
+    // bump would have written generation 0, "no live record".
+    const max = std.math.maxInt(Generation);
+    try testing.expectEqual(@as(?Generation, max), env.store.writeCas(id, &rec, 0, max));
+    try testing.expectEqual(@as(?Generation, max), kenv.store.writeCas(id, &rec, 0, max));
+    for ([_]Store{ env.store.store(), kenv.store.store() }) |st| {
+        try testing.expectEqual(@as(?Generation, null), st.put(id, &rec, max));
+        const l = (try st.get(testing.allocator, id)).?;
+        defer testing.allocator.free(l.record);
+        try testing.expectEqual(max, l.generation);
+    }
 }
 
 test "KvStore: sessions survive a restart of the store" {
@@ -1943,6 +1955,12 @@ test "Manager.init refuses cookie options no Set-Cookie can carry" {
     try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .same_site = .none, .allow_insecure_cookie = true }));
     const long_name: [600]u8 = @splat('n');
     try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .cookie_name = &long_name }));
+    // The dry run carries the longest id: a name that fits alone but not with
+    // the 64 hex digits of the id is refused too.
+    const fits_alone: [400]u8 = @splat('n');
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .cookie_name = &fits_alone }));
+    const fits: [300]u8 = @splat('n');
+    _ = try Manager.init(testing.allocator, st, .{ .io = io, .cookie_name = &fits });
     _ = try Manager.init(testing.allocator, st, .{ .io = io, .same_site = .none });
 }
 

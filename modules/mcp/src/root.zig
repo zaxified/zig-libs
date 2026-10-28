@@ -12474,3 +12474,42 @@ test "sweep 2026-10-28 M-3: a registered schema or _meta literal nested too deep
         \\
     );
 }
+
+test "sweep 2026-10-28 M-3: a registered schema deeper than max_json_depth but within max_literal_depth still lists" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // The peer cap (128) must not reach caller literals: schema_check compiles
+    // up to 256 levels, so such a tool must still appear in tools/list.
+    var deep: std.ArrayList(u8) = .empty;
+    try deep.appendSlice(a, "{\"type\":\"object\",\"x\":");
+    for (0..max_json_depth + 10) |_| try deep.append(a, '[');
+    for (0..max_json_depth + 10) |_| try deep.append(a, ']');
+    try deep.append(a, '}');
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "d", .description = "", .input_schema = deep.items, .handler = pageTool });
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try s.handleMessage(
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    , &aw.writer);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"error\"") == null);
+    try testing.expect(std.mem.find(u8, aw.written(), "\"name\":\"d\"") != null);
+}
+
+test "sweep 2026-10-28 M-3: brackets inside a string do not count toward max_json_depth" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var msg: std.ArrayList(u8) = .empty;
+    try msg.appendSlice(a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"s\":\"");
+    for (0..2 * max_json_depth) |_| try msg.appendSlice(a, "[{");
+    try msg.appendSlice(a, "\\\"[\"}}");
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try expectResponse(&s, msg.items,
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+        \\
+    );
+}
