@@ -351,3 +351,85 @@ test "audit: RFC 6724 corners - unusable pairs, policy row edges, selection ties
         try testing.expectEqual(@as(?usize, 0), na.selectSource(&cands, ip("2001:db8::1")));
     }
 }
+
+// ── no-panic sweep 2026-10-28 ───────────────────────────────────────────────
+
+/// Three 64-address regions the builder model covers: low v4, the top of v4
+/// and the top of v6 (where `to + 1` would overflow).
+const sweep_regions = [_]struct { fam: std.meta.Tag(Ip), base: u128 }{
+    .{ .fam = .v4, .base = 0x0A00_0000 },
+    .{ .fam = .v4, .base = std.math.maxInt(u32) - 63 },
+    .{ .fam = .v6, .base = std.math.maxInt(u128) - 63 },
+};
+
+fn sweepIp(region: usize, off: u128) Ip {
+    const r = sweep_regions[region];
+    const v = r.base + off;
+    return switch (r.fam) {
+        .v4 => blk: {
+            var b: [4]u8 = undefined;
+            std.mem.writeInt(u32, &b, @intCast(v), .big);
+            break :blk .{ .v4 = b };
+        },
+        .v6 => blk: {
+            var b: [16]u8 = undefined;
+            std.mem.writeInt(u128, &b, v, .big);
+            break :blk .{ .v6 = b };
+        },
+    };
+}
+
+test "no-panic sweep N-4: any interleaving of adds and removes matches a per-address model" {
+    for (0..300) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        var model: [3]u64 = @splat(0);
+        var b: na.IpSetBuilder = .empty;
+        defer b.deinit(gpa);
+        const n_ops = rand.uintLessThan(usize, 48);
+        for (0..n_ops) |_| {
+            const region = rand.uintLessThan(usize, 3);
+            const lo = rand.uintLessThan(u7, 64);
+            const hi = lo + rand.uintLessThan(u7, 64 - lo);
+            const mask: u64 = (if (hi == 63) ~@as(u64, 0) else (@as(u64, 1) << @intCast(hi + 1)) - 1) &
+                ~((@as(u64, 1) << @intCast(lo)) - 1);
+            const add = rand.boolean();
+            const r: IpRange = .{ .from = sweepIp(region, lo), .to = sweepIp(region, hi) };
+            var effect = mask;
+            switch (rand.uintLessThan(u8, 4)) {
+                0 => if (add) try b.addRange(gpa, r) else try b.removeRange(gpa, r),
+                1 => {
+                    effect = @as(u64, 1) << @intCast(lo);
+                    if (add) try b.add(gpa, r.from) else try b.remove(gpa, r.from);
+                },
+                2 => {
+                    var s = try setOf(&.{r});
+                    defer s.deinit(gpa);
+                    if (add) try b.addSet(gpa, s) else try b.removeSet(gpa, s);
+                },
+                else => {
+                    // A mid-way read resolves everything pending so far.
+                    var s = try b.toSet(gpa);
+                    s.deinit(gpa);
+                    continue;
+                },
+            }
+            if (add) model[region] |= effect else model[region] &= ~effect;
+        }
+        var s = try b.toSet(gpa);
+        defer s.deinit(gpa);
+        for (0..3) |region| for (0..64) |off| {
+            const want = model[region] >> @intCast(off) & 1 == 1;
+            try testing.expectEqual(want, s.contains(sweepIp(region, off)));
+        };
+        // Normalised: sorted, disjoint, never adjacent within a family.
+        var i: usize = 1;
+        while (i < s.rangeCount()) : (i += 1) {
+            const prev = s.rangeAt(i - 1);
+            const cur = s.rangeAt(i);
+            if (std.meta.activeTag(prev.to) != std.meta.activeTag(cur.from)) continue;
+            const next_after_prev = prev.to.next() orelse return error.TestUnexpectedResult;
+            try testing.expect(next_after_prev.compare(cur.from) == .lt);
+        }
+    }
+}

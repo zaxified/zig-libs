@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent review of every pub entry point, `~/CML/20261028-panic-sweep/netaddr-sweep.report.md`). `IpSetBuilder`: once an add follows a pending removal the rest is logged and resolved in one sweep, O(n log n) — it applied the removals on every switch, O(n) each, quadratic for an alternating list from untrusted input (model test against a per-address bitmask). `Zone.slice` clamps a hand-set `len`, `AddrIterator.next` ends on a hand-built `cur > last`, `IpSet.rangeAt` checks its index in every build mode; `Zone` documents that any byte survives a round trip.
 - **2026-10-25** — **Performance:** `bench-netaddr`'s `sort_mixed` sorts with the new zig-libs
   `sort` module (`.bench_deps`; ipnsort, the sort a Zig user now reaches for) instead of
   `std.mem.sort`: 2.21× → 0.88× Rust `sort_unstable`. The card's worst row against the fastest

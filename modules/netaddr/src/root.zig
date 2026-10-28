@@ -570,6 +570,8 @@ pub const max_zone_len = 31;
 
 /// An IPv6 zone (`eth0`, `3`): any non-empty text up to `max_zone_len`
 /// bytes, opaque as in Go — not resolved, not checked against interfaces.
+/// Any byte is accepted (CR, LF, NUL, `]`) and formatting writes it back
+/// verbatim: escape a parsed zone before it reaches a log line or a header.
 pub const Zone = struct {
     len: u8 = 0,
     buf: [max_zone_len]u8 = @splat(0),
@@ -585,8 +587,10 @@ pub const Zone = struct {
         return z;
     }
 
+    /// `len` is a pub field: a hand-set one past `max_zone_len` reads as
+    /// the whole buffer, never past it (no-panic sweep 2026-10-28, N-1).
     pub fn slice(z: *const Zone) []const u8 {
-        return z.buf[0..z.len];
+        return z.buf[0..@min(z.len, max_zone_len)];
     }
 
     pub fn isNone(z: Zone) bool {
@@ -1184,7 +1188,9 @@ pub const AddrIterator = struct {
     pub fn next(it: *AddrIterator) ?Ip {
         if (it.done) return null;
         const ip = ipFromInt(it.family, it.cur);
-        if (it.cur == it.last) it.done = true else it.cur += 1;
+        // `>=`: a hand-built `cur` past `last` ends instead of overflowing
+        // (no-panic sweep 2026-10-28, N-3).
+        if (it.cur >= it.last) it.done = true else it.cur += 1;
         return ip;
     }
 };
@@ -1323,8 +1329,10 @@ pub const IpSet = struct {
         return s.spans.len;
     }
 
-    /// The `i`-th maximal range (`i < rangeCount()`), in set order.
+    /// The `i`-th maximal range (`i < rangeCount()`, checked in every build
+    /// mode — no-panic sweep 2026-10-28, N-2), in set order.
     pub fn rangeAt(s: IpSet, i: usize) IpRange {
+        if (i >= s.spans.len) @panic("netaddr: IpSet.rangeAt index past rangeCount()");
         const k = s.spans[i];
         return .{ .from = ipFromInt(k.fam, k.from), .to = ipFromInt(k.fam, k.to) };
     }
@@ -1458,14 +1466,15 @@ fn spanEndsBefore(x: RangeKey, y: RangeKey) bool {
 
 /// Builds an `IpSet` (netipx `IPSetBuilder`). Adds and removes apply in
 /// call order — a removal affects only what was added before it — and
-/// inputs may overlap in any way. Operations are batched: adds are
-/// collected and normalised (sort + merge, O(n log n)) when a removal,
-/// `complement`, `intersect` or `toSet` needs the current membership. Each
-/// switch from removing back to adding applies the pending removals (O(n)),
-/// so a caller that alternates single adds and removes pays O(n) per
-/// switch — group the adds, then the removes, where the order allows.
-/// `IpSetBuilder.empty` is the empty builder; `deinit` frees it, and it
-/// stays usable after `toSet`.
+/// inputs may overlap in any way. Operations are batched and resolved when
+/// `complement`, `intersect` or `toSet` needs the current membership, in
+/// O(n log n) for n operations whatever their order: adds followed by
+/// removes are a sort, merge and subtract; once an add follows a pending
+/// removal, the rest is logged in call order and resolved in one sweep
+/// (netipx applies the pending removals on every such switch instead, O(n)
+/// each — quadratic for an alternating list read from untrusted input;
+/// no-panic sweep 2026-10-28, N-4). `IpSetBuilder.empty` is the empty
+/// builder; `deinit` frees it, and it stays usable after `toSet`.
 ///
 /// Errors are returned at the call, not accumulated as netipx does: the
 /// only invalid input is a malformed `IpRange` (`InvalidRange`), and a
@@ -1476,6 +1485,11 @@ pub const IpSetBuilder = struct {
     out: std.ArrayList(RangeKey) = .empty,
     /// `in` is sorted, disjoint and non-adjacent.
     normal: bool = true,
+    /// Operations after an add followed a pending removal, in call order;
+    /// they apply after `out` is subtracted from `in` (see `resolveLog`).
+    log: std.ArrayList(LogOp) = .empty,
+
+    const LogOp = struct { key: RangeKey, add: bool };
 
     pub const empty: IpSetBuilder = .{};
     pub const Error = error{ OutOfMemory, InvalidRange };
@@ -1483,6 +1497,7 @@ pub const IpSetBuilder = struct {
     pub fn deinit(b: *IpSetBuilder, gpa: std.mem.Allocator) void {
         b.in.deinit(gpa);
         b.out.deinit(gpa);
+        b.log.deinit(gpa);
         b.* = .empty;
     }
 
@@ -1491,6 +1506,7 @@ pub const IpSetBuilder = struct {
         errdefer c.deinit(gpa);
         try c.in.appendSlice(gpa, b.in.items);
         try c.out.appendSlice(gpa, b.out.items);
+        try c.log.appendSlice(gpa, b.log.items);
         return c;
     }
 
@@ -1507,24 +1523,25 @@ pub const IpSetBuilder = struct {
     }
 
     pub fn addSet(b: *IpSetBuilder, gpa: std.mem.Allocator, s: IpSet) error{OutOfMemory}!void {
-        if (b.out.items.len != 0) try b.flush(gpa);
+        if (b.logging()) return b.logSpans(gpa, s.spans, true);
         try b.in.appendSlice(gpa, s.spans);
         b.normal = false;
     }
 
     pub fn remove(b: *IpSetBuilder, gpa: std.mem.Allocator, ip: Ip) error{OutOfMemory}!void {
-        try b.out.append(gpa, keyOfIp(ip));
+        try b.removeKey(gpa, keyOfIp(ip));
     }
 
     pub fn removePrefix(b: *IpSetBuilder, gpa: std.mem.Allocator, p: Prefix) error{OutOfMemory}!void {
-        try b.out.append(gpa, keyOfPrefix(p));
+        try b.removeKey(gpa, keyOfPrefix(p));
     }
 
     pub fn removeRange(b: *IpSetBuilder, gpa: std.mem.Allocator, r: IpRange) Error!void {
-        try b.out.append(gpa, try keyOfRange(r));
+        try b.removeKey(gpa, try keyOfRange(r));
     }
 
     pub fn removeSet(b: *IpSetBuilder, gpa: std.mem.Allocator, s: IpSet) error{OutOfMemory}!void {
+        if (b.log.items.len != 0) return b.logSpans(gpa, s.spans, false);
         try b.out.appendSlice(gpa, s.spans);
     }
 
@@ -1570,27 +1587,121 @@ pub const IpSetBuilder = struct {
         return .{ .spans = try gpa.dupe(RangeKey, b.in.items) };
     }
 
+    /// A pending removal must apply to what was added before it only: an
+    /// add after one goes to the log, and so does everything after that.
+    fn logging(b: *const IpSetBuilder) bool {
+        return b.out.items.len != 0 or b.log.items.len != 0;
+    }
+
     fn addKey(b: *IpSetBuilder, gpa: std.mem.Allocator, k: RangeKey) error{OutOfMemory}!void {
-        // A pending removal must apply to what was added before it only.
-        if (b.out.items.len != 0) try b.flush(gpa);
+        if (b.logging()) return b.log.append(gpa, .{ .key = k, .add = true });
         try b.in.append(gpa, k);
         b.normal = false;
     }
 
-    /// Normalise `in`, then apply and clear the pending removals.
+    fn removeKey(b: *IpSetBuilder, gpa: std.mem.Allocator, k: RangeKey) error{OutOfMemory}!void {
+        if (b.log.items.len != 0) return b.log.append(gpa, .{ .key = k, .add = false });
+        try b.out.append(gpa, k);
+    }
+
+    fn logSpans(b: *IpSetBuilder, gpa: std.mem.Allocator, spans: []const RangeKey, adds: bool) error{OutOfMemory}!void {
+        try b.log.ensureUnusedCapacity(gpa, spans.len);
+        for (spans) |k| b.log.appendAssumeCapacity(.{ .key = k, .add = adds });
+    }
+
+    /// Normalise `in`, apply and clear the pending removals, then the log.
     fn flush(b: *IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!void {
         if (!b.normal) {
             normalizeSpans(&b.in);
             b.normal = true;
         }
-        if (b.out.items.len == 0) return;
-        normalizeSpans(&b.out);
+        if (b.out.items.len != 0) {
+            normalizeSpans(&b.out);
+            var next: std.ArrayList(RangeKey) = .empty;
+            errdefer next.deinit(gpa);
+            try subtractSpans(gpa, &next, b.in.items, b.out.items);
+            b.in.deinit(gpa);
+            b.in = next;
+            b.out.clearRetainingCapacity();
+        }
+        if (b.log.items.len != 0) {
+            try b.resolveLog(gpa);
+            b.log.clearRetainingCapacity();
+        }
+    }
+
+    /// Apply the log to the normalised `in` in one sweep, O(n log n): every
+    /// address takes the kind of the LAST operation covering it (a span of
+    /// `in` counts as an add older than every logged one), none = absent.
+    /// Each operation is a start and an end event; walking the events in
+    /// address order with a max-heap of the live operations' indexes
+    /// (ended ones dropped lazily when they surface) gives that kind for
+    /// every stretch between two consecutive event addresses.
+    fn resolveLog(b: *IpSetBuilder, gpa: std.mem.Allocator) error{OutOfMemory}!void {
+        const base = b.in.items.len;
+        const total = base + b.log.items.len;
+        const Event = struct {
+            fam: IpFamily,
+            /// `from`, or `to + 1` for an end (the family maximum + 1 fits).
+            pos: u129,
+            op: usize,
+            start: bool,
+            fn less(_: void, x: @This(), y: @This()) bool {
+                if (x.fam != y.fam) return @backingInt(x.fam) < @backingInt(y.fam);
+                return x.pos < y.pos;
+            }
+        };
+        const events = try gpa.alloc(Event, 2 * total);
+        defer gpa.free(events);
+        for (0..total) |i| {
+            const k = if (i < base) b.in.items[i] else b.log.items[i - base].key;
+            events[2 * i] = .{ .fam = k.fam, .pos = k.from, .op = i, .start = true };
+            events[2 * i + 1] = .{ .fam = k.fam, .pos = @as(u129, k.to) + 1, .op = i, .start = false };
+        }
+        std.sort.pdq(Event, events, {}, Event.less);
+
+        var ended = try std.DynamicBitSetUnmanaged.initEmpty(gpa, total);
+        defer ended.deinit(gpa);
+        const Heap = std.PriorityQueue(usize, void, struct {
+            fn latestFirst(_: void, x: usize, y: usize) std.math.Order {
+                return std.math.order(y, x);
+            }
+        }.latestFirst);
+        var live: Heap = .empty;
+        defer live.deinit(gpa);
         var next: std.ArrayList(RangeKey) = .empty;
         errdefer next.deinit(gpa);
-        try subtractSpans(gpa, &next, b.in.items, b.out.items);
+
+        var i: usize = 0;
+        while (i < events.len) {
+            const fam = events[i].fam;
+            const pos = events[i].pos;
+            while (i < events.len and events[i].fam == fam and events[i].pos == pos) : (i += 1) {
+                const e = events[i];
+                if (e.start) try live.push(gpa, e.op) else ended.set(e.op);
+            }
+            while (live.peek()) |top| {
+                if (!ended.isSet(top)) break;
+                _ = live.pop();
+            }
+            const top = live.peek() orelse continue;
+            if (top >= base and !b.log.items[top - base].add) continue;
+            // A live operation ends later in this family, so the next event
+            // exists, is in `fam`, and lies past `pos`.
+            const from: u128 = @intCast(pos);
+            const to: u128 = @intCast(events[i].pos - 1);
+            if (next.items.len != 0) {
+                const last = &next.items[next.items.len - 1];
+                // `last.to < from`, so `last.to + 1` does not overflow.
+                if (last.fam == fam and last.to + 1 == from) {
+                    last.to = to;
+                    continue;
+                }
+            }
+            try next.append(gpa, .{ .fam = fam, .from = from, .to = to });
+        }
         b.in.deinit(gpa);
         b.in = next;
-        b.out.clearRetainingCapacity();
     }
 };
 
