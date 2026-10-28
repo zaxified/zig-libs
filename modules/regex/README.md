@@ -3,13 +3,16 @@
 RE2-syntax regular expressions in linear time, at parity with Go's `regexp`: its Perl and POSIX
 grammars (Unicode classes `\p{…}` included), leftmost-first and leftmost-longest matching, and its
 API — find, submatches, find-all, replace with `$1`/`${name}` templates, split, quote, literal
-prefix, matching from a `std.Io.Reader`. A Pike VM over a Thompson NFA, a bit-state backtracker
+prefix, matching from a `std.Io.Reader`. Opt-in, the grammar of Rust's `regex` 1.13 (Unicode
+`\w \d \s \b`, `(?x)`, `(?R)`, class set operations, every Unicode property), its bytes mode
+(haystacks that are not UTF-8), `RegexSet` and `shortestMatch`. A Pike VM over a Thompson NFA, a bit-state backtracker
 for short matches, a lazy DFA for yes/no; each visits a (position, instruction) at most once
 per step, so no pattern and no
 input can make a match explode: safe for patterns and text an attacker controls. Compiling at
 comptime needs no allocator, and `isMatch`/`fullMatch` need none either.
 
-- **Model after:** Go `regexp` (RE2 syntax and semantics); anchored on it as a differential oracle.
+- **Model after:** Go `regexp` (RE2 syntax and semantics); anchored on it as a differential oracle,
+  and on Rust's `regex` 1.13.1 for `Options.syntax = .rust` the same way.
 - **Platform:** any. **Role:** util. **Concurrency:** reentrant — a compiled `Regex` is
   immutable and shared freely; a `Matcher` (submatch scratch) is one per thread.
 - **Deps:** none.
@@ -62,6 +65,13 @@ defer px.deinit(gpa);
 
 // From a reader, in constant memory (Go's MatchReader / FindReaderIndex).
 const hit = try re.isMatchReader(&file_reader.interface);
+
+// Rust's grammar; its bytes mode (`regex::bytes`); many patterns in one pass.
+var ru = try regex.Regex.compileOptions(gpa, "(?x) \\b{start} \\w+ (?<n>\\d+)", .{ .syntax = .rust });
+var raw = try regex.Regex.compileOptions(gpa, "(?-u:\\xff)[a-z]+", .{ .syntax = .rust, .utf8 = false });
+var set = try regex.RegexSet.compile(gpa, &.{ "foo\\d+", "bar" }, .{});
+var which: [2]bool = undefined;
+_ = set.matches(text, &which);
 ```
 
 | Call | Go | Allocates |
@@ -83,6 +93,9 @@ const hit = try re.isMatchReader(&file_reader.interface);
 | `literalPrefix(w)` | `LiteralPrefix` | no |
 | `isMatchReader(r)`, `Matcher.findReader(r)` / `capturesReader(r, out)` | `MatchReader`, `FindReaderIndex` / `FindReaderSubmatchIndex` | no |
 | `matches(gpa, p, in)` | `regexp.MatchString` | compile |
+| `shortestMatch(in)` | Rust `shortest_match` | no |
+| `isMatchAlloc` / `fullMatchAlloc` / `shortestMatchAlloc(gpa, in)` | — (any program size) | past `4 * max_insts` |
+| `RegexSet.compile(gpa, ps, opts)`, `isMatch`, `matches(in, out)` | Rust `RegexSet`, RE2 `RE2::Set` | the tables / no |
 | `source` | `String()` | no |
 | `groupCount`, `groupIndex(name)`, `names` | `NumSubexp`, `SubexpIndex`, `SubexpNames` | no |
 
@@ -91,7 +104,7 @@ const hit = try re.isMatchReader(&file_reader.interface);
 Go's `regexp/syntax` (`Perl` flags): literals and `.`; classes `[abc]`, `[^a-z]`, `[[:alpha:]]`
 and `[[:^alpha:]]`, `\d \D \s \S \w \W` (ASCII, as RE2); groups `(…)`, `(?:…)`, `(?P<name>…)`,
 `(?<name>…)`; `|`; Unicode classes `\pL`, `\p{Greek}`, `\PL`, `\p{^Lu}` — every general
-category, its long alias (`\p{Letter}`) and script of Unicode 15.0, plus `Any`, `ASCII`,
+category, its long alias (`\p{Letter}`) and script of Unicode 16.0, plus `Any`, `ASCII`,
 `Assigned`, names matched loosely (`\p{lowercase letter}` = `\p{Ll}`), as Go 1.25+; `* + ? {n} {n,} {n,m}` (n, m ≤ 1000) and their lazy `?` forms; flags
 `(?i) (?m) (?s) (?U)`, `(?i-s)`, scoped `(?i:…)`; `^ $ \A \z \b \B`; escapes `\a \f \t \n \r \v`,
 octal `\123`, `\x7F`, `\x{10FFFF}`, `\Q…\E`, and any punctuation. Without `(?m)`, `$` is the end
@@ -101,7 +114,8 @@ byte reads as U+FFFD, one byte wide.
 Not here, by design (RE2 leaves them out to keep linear time): backreferences, lookaround,
 atomic groups, possessive quantifiers, recursion. `(?i)` matches a code point's whole simple
 case-folding orbit, as Go: `(?i)é` matches `É`, `(?i)k` the Kelvin sign, `(?i)θ` all of `θ ϑ Θ ϴ`
-(Unicode 15.0, Go 1.26's tables); full folding (`ß` ↔ `ss`) is not RE2's and not here. `\d \s \w`
+(Unicode 16.0; Go 1.26's tables are 15.0, so a code point 16.0 assigned is the oracle's listed
+UNICODE_VERSION divergence); full folding (`ß` ↔ `ss`) is not RE2's and not here. `\d \s \w`
 and `\b` stay ASCII, as RE2. Go 1.26 refuses the 46 script names with an underscore or inner
 capital (`\p{Old_Persian}`, `\p{SignWriting}`) against its own documentation; here they work.
 
@@ -109,15 +123,31 @@ capital (`\p{Old_Persian}`, `\p{SignWriting}`) against its own documentation; he
 `(?…)`; `^`/`$` match at line breaks; a negated class never matches `\n`; a repetition may repeat
 a repetition (`a*?` is `(a*)?`); leftmost-longest.
 
+**Rust** (`Options{ .syntax = .rust }`, Rust's `regex` 1.13 on a `&str`): flags `i m s R U u x`
+with `u` on (Unicode `\d \s \w \b`; `(?-u)` for ASCII), `(?x)` whitespace and `#` comments,
+CRLF lines `(?mR)`, `\< \> \b{start} \b{end} \b{start-half} \b{end-half}`, `\u`/`\U` escapes,
+nested classes and set operations `[a-z&&[^aeiou]]`, `--`, `~~`, every property the crate knows
+(`\p{scx=Greek}`, `\p{Alphabetic}`, `\p{Emoji}`, `\p{Age=6.0}`, the break properties), counts up
+to 100,000, Unicode group names. Its `\<`, `\b{…}` and `&&` read differently in Go, hence a
+grammar of its own (`.perl` stays Go's). **Bytes mode** (`.utf8 = false`, Rust's
+`regex::bytes`): `(?-u:\xNN)`, `(?-u).` and `(?-u)` classes match raw bytes; a Unicode class never
+matches an invalid byte; an empty match may fall inside a code point; slices only (no `Reader`).
+
 ## Limits
 
-A program holds at most `max_insts` (1024) instructions, 4096 class ranges and 63 groups; groups
-and repetitions nest at most `max_depth` (250) deep; a counted repetition is at most `{1000}` and
-nested counted repetitions multiply to at most 1000 (Go's rule). A pattern past one is
-`error.PatternTooLarge` / `error.NestingDepth` / `error.InvalidRepeatSize` at compile time — never
-a truncated program, never a compile that runs away. Go accepts larger programs and deeper
-nesting (the oracle's CAPACITY divergence). Compiling the deepest accepted pattern fits a
-512 KiB thread stack in Debug; `isMatch`/`fullMatch` take ~6 KiB of stack. A `Matcher` keeps a
+A pattern within `max_insts` (1024) instructions, 4096 class ranges and 2048 AST nodes compiles in
+stack or full-`Builder` scratch and matches without an allocator. A larger one compiles on the heap
+(~2 MiB of scratch) into a program of up to 65,534 instructions, which the backtracker and the VMs
+run (the DFAs and the prefilter step aside): `isMatch`/`fullMatch`/`shortestMatch` and
+`isMatchReader` keep their scratch on the stack up to `4 * max_insts` (~33 KiB; bytes mode
+`max_insts`) and **panic past it** — use `isMatchAlloc`/`fullMatchAlloc`/`shortestMatchAlloc`
+for patterns you do not control; a `Matcher` for such a program is sized by it (up to hundreds of
+MiB with many groups). Always: at most 63 groups; nesting at most `max_depth` (250); a counted
+repetition at most `{1000}` (Rust grammar `{100000}`) and nested counts multiply to at most 1000
+(Go's rule). Past one: `error.NestingDepth` / `error.InvalidRepeatSize` / `error.PatternTooLarge`
+at compile time — never a truncated program, never a compile that runs away. A `RegexSet` joins up
+to `4 * max_insts` instructions and 65,535 class ranges. Compiling the deepest accepted pattern
+fits a 512 KiB thread stack in Debug. A `Matcher` keeps a
 pointer to its `Regex`: do not move the `Regex` while a `Matcher` uses it.
 
 ## Performance
@@ -157,14 +187,18 @@ call, ~11× on precompiled find-all (SPEC "Compared with").
   match, full match, submatch indices, all matches, the same after `Longest()`, through a slice
   and a one-byte-per-read reader; ReplaceAll / Literal / Func, Split, FindAllSubmatch and
   LiteralPrefix on 460 patterns; QuoteMeta of every ASCII byte. Listed divergences, pinned:
-  GO_DEFECT, LITERAL_PREFIX, CAPACITY (SPEC "Anchoring").
-- The Unicode tables are checked against Go's for every code point when generated.
-- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`, 200,000 runs clean, a third
-  in a POSIX grammar of its own) hold the engines to each other: the DFA and the NFA, the
+  GO_DEFECT, LITERAL_PREFIX, CAPACITY, UNICODE_VERSION (SPEC "Anchoring").
+- Rust `regex` 1.13.1 the same way (`tools/rust_regex_oracle`, `src/rust_oracle_test.zig`): 2,374
+  patterns and 619 bytes-mode ones, 89 sets, ~62,000 cases — all equal but the pinned SIZE_LIMIT,
+  CAPACITY and SHORTEST rows.
+- The Unicode tables are checked against Rust's `regex-syntax` for every code point when generated.
+- A deterministic robustness driver and a fuzz harness (`REGEX_FUZZ`, 240,000 runs clean; Go,
+  POSIX, Rust and bytes grammars) hold the engines to each other: the DFA and the NFA, the
   backtracker and the Pike VM give the same groups at every start, the reader the slice's
-  answer; leftmost-longest equals an independent substring reference; the prefilter only skips;
-  `replaceAll("$0")` is the identity.
-- Three rounds of independent review and mutation testing (SPEC "Verification").
+  answer; every pattern its twin written in the other grammar; bytes mode `&str`'s answer;
+  a `RegexSet` each pattern's `isMatch`; leftmost-longest and `shortestMatch` independent
+  substring references; the prefilter only skips; `replaceAll("$0")` is the identity.
+- Four rounds of independent review and mutation testing (SPEC "Verification").
 - The exponential-backtracking classic `(a+)+$` on `a…ab` (5,000 bytes) is instant.
 
 `zig build test-regex`
