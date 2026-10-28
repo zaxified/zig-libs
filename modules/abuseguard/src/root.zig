@@ -533,6 +533,10 @@ pub const Guard = struct {
         if (deny == null) if (g.options.max_conns_per_ip) |max| {
             if (e.active_conns >= max) deny = .per_ip_cap;
         };
+        // With no per-key cap the counter's own width is the cap (`reconcile`
+        // can set any u32): refused even in a dry run, which cannot count
+        // one more.
+        if (e.active_conns == std.math.maxInt(u32)) return deny orelse .per_ip_cap;
         if (deny) |d| {
             if (!dry) return d;
             g.dryRunReject(ip, d, pending);
@@ -1207,7 +1211,7 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 // ── the server hooks ────────────────────────────────────────────────────────
 
 fn onConnectHook(ctx: ?*anyopaque, peer: net.IpAddress) http.Server.ConnDecision {
-    const g: *Guard = @ptrCast(@alignCast(ctx.?));
+    const g: *Guard = @ptrCast(@alignCast(ctx orelse @panic("abuseguard: onConnect() wired without onConnectCtx()")));
     return switch (g.admit(ipOf(peer))) {
         .admitted, .admitted_untracked => .accept,
         .banned, .greylisted, .per_ip_cap, .total_cap, .store_full => .reject,
@@ -1217,7 +1221,7 @@ fn onConnectHook(ctx: ?*anyopaque, peer: net.IpAddress) http.Server.ConnDecision
 fn onConnStateHook(ctx: ?*anyopaque, peer: ?net.IpAddress, state: http.Server.ConnState) void {
     if (state != .closed) return;
     const p = peer orelse return; // socket-free stream: never admitted
-    const g: *Guard = @ptrCast(@alignCast(ctx.?));
+    const g: *Guard = @ptrCast(@alignCast(ctx orelse @panic("abuseguard: onConnState() wired without onConnStateCtx()")));
     g.connClosed(ipOf(p));
 }
 
@@ -1682,6 +1686,24 @@ test "global cap: total_cap rejections, release re-admits, no entry churn" {
     g.connClosed(mkIp("10.1.0.1"));
     g.connClosed(mkIp("10.1.0.3"));
     try testing.expectEqual(@as(usize, 0), g.totalConns());
+}
+
+test "reconcile to maxInt(u32) with no per-IP cap: admit refuses instead of overflowing (sweep AG-2)" {
+    var tc: TestClock = .{};
+    for ([_]bool{ false, true }) |dry| {
+        var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
+        defer g.deinit();
+        const ip = mkIp("192.0.2.60");
+        try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+        g.reconcile(ip, std.math.maxInt(u32));
+        const total = g.totalConns();
+        try testing.expectEqual(AdmitVerdict.per_ip_cap, g.admit(ip));
+        try testing.expectEqual(std.math.maxInt(u32), g.connCount(ip));
+        try testing.expectEqual(total, g.totalConns());
+        // One below the width admits again.
+        g.connClosed(ip);
+        try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+    }
 }
 
 test "reconcile: releases leaked per-IP slots and corrects the global counter" {

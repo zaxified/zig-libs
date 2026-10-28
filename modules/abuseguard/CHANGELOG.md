@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** `admit` answers `.per_ip_cap` at `maxInt(u32)` live connections of one key — with `max_conns_per_ip = null` a `reconcile(ip, maxInt(u32))` followed by `admit` overflowed the counter (wrapped to 0 in ReleaseFast); the `http.Server` hooks panic with a message when wired without their context (was a null unwrap, UB in ReleaseFast). Report `~/CML/20261028-panic-sweep/abuseguard-sweep.report.md`.
+
 - **2026-10-23** — **BREAKING:** `Guard.ban` and `Guard.greylist` return `error{StoreFull}!void` — a key the full store cannot track used to lose the ban silently. Fixed: eviction at capacity is O(1) (three LRU lists: idle, idle banned, live) — it walked every live and banned entry under the lock; an overfull `restore` keeps the most recently touched bans (records applied last to first); `init` checks its `Options` in every build mode (`@panic`, were debug-only asserts). Behavioural: closing a key's last connection counts as a touch for the LRU; `snapshot` lists ranges, then idle banned keys, live keys, other idle keys. Grade 1 (lead vs nginx `limit_conn`, `tools/nginx_probe`).
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that Zig has no io-less blocking mutex / `std.Thread` primitives re-checked against the 0.17.0 std (still true).
