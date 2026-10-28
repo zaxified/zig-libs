@@ -143,6 +143,12 @@ pub const Options = struct {
     /// Default false (a directory then answers 403). When on, every entry name
     /// is HTML-escaped (no markup / log injection).
     directory_listing: bool = false,
+    /// Most directory entries a listing walks (dotfiles that are skipped
+    /// count: they are still read). Past it the listing ends with a
+    /// `[listing truncated]` line instead of growing with the directory.
+    /// An I/O error before the first entry answers 500; after it the
+    /// listing simply ends.
+    max_listing_entries: usize = 10_000,
     /// `Cache-Control` header value emitted verbatim on 200/206 (e.g.
     /// `"public, max-age=3600"` or `"public, max-age=31536000, immutable"`);
     /// null omits it. Must be caller-owned / static (stored, not copied).
@@ -1012,10 +1018,20 @@ pub const Handler = struct {
             return failUnsafeResponse(rw);
         if (req.method == .head) return;
 
+        var it = dh.dir.iterate();
+        // The first read before anything is written: a failing directory is
+        // a 500, not an empty listing that looks like a real one.
+        var pending = it.next(h.io) catch return failUnsafeResponse(rw);
         const w = rw.writer();
         try w.writeAll("<!DOCTYPE html>\n<meta charset=\"utf-8\">\n<title>Index</title>\n<ul>\n");
-        var it = dh.dir.iterate();
-        while (it.next(h.io) catch null) |entry| {
+        var visited: usize = 0;
+        // A later read error ends the listing where it is.
+        while (pending) |entry| : (pending = it.next(h.io) catch null) {
+            if (visited >= h.options.max_listing_entries) {
+                try w.writeAll("<li>[listing truncated]</li>\n");
+                break;
+            }
+            visited += 1;
             if (!h.options.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
             try w.writeAll("<li>");
             // Defense against markup / log injection via crafted filenames;
@@ -1389,6 +1405,15 @@ pub const SnapshotOptions = struct {
     max_files: usize = 4096,
     /// Deepest directory nesting walked; deeper is `error.TooDeep`.
     max_depth: usize = 32,
+    /// Most directories held (each is a path-table entry, and a rescan reads
+    /// each one). More is `error.TooManyFiles`: a tree of millions of empty
+    /// directories is bounded like one of millions of files.
+    max_dirs: usize = 4096,
+    /// Files larger than this keep `Handler`'s size+mtime tag instead of a
+    /// content tag, so one huge file cannot make `open` (or every `Live`
+    /// rescan that sees it change) read gigabytes. A file is hashed up to the
+    /// size it had when opened, never past it.
+    max_fingerprint_bytes: u64 = 64 * 1024 * 1024,
     /// Tag every file by its content: SHA-256 of its bytes, read once when
     /// the file enters the snapshot, as a STRONG `ETag` (`"` + the first 128
     /// bits in hex + `"`). A content tag changes exactly when the bytes do --
@@ -1457,6 +1482,8 @@ pub const Snapshot = struct {
     paths: std.StringHashMapUnmanaged(Node) = .empty,
     /// Files opened (and hashed) by this build rather than taken over.
     fresh: usize = 0,
+    /// Directories entered by this build.
+    dirs: usize = 0,
 
     const Node = union(enum) { file: u32, dir: ?u32 };
 
@@ -1551,7 +1578,7 @@ pub const Snapshot = struct {
     }
 
     fn add(s: *Snapshot, rel: []const u8, opened: Opened, tag: [tag_len]u8, from: ?u32) SnapshotError!void {
-        const id: u32 = @intCast(s.files.items.len);
+        const id = std.math.cast(u32, s.files.items.len) orelse return error.TooManyFiles;
         try s.files.ensureUnusedCapacity(s.gpa, 1);
         try s.tags.ensureUnusedCapacity(s.gpa, 1);
         try s.owned.ensureUnusedCapacity(s.gpa, 1);
@@ -1595,7 +1622,7 @@ pub const Snapshot = struct {
                         error.IoError => return error.IoError,
                     };
                     var tag: [tag_len]u8 = @splat(0);
-                    if (s.options.fingerprint) contentTag(io, opened.file, &tag) catch {
+                    if (s.options.fingerprint and opened.stat.size <= s.options.max_fingerprint_bytes) contentTag(io, opened.file, opened.stat.size, &tag) catch {
                         opened.close(io);
                         return error.IoError;
                     };
@@ -1607,6 +1634,8 @@ pub const Snapshot = struct {
                 },
                 .directory => {
                     if (depth + 1 > s.options.max_depth) return error.TooDeep;
+                    if (s.dirs >= s.options.max_dirs) return error.TooManyFiles;
+                    s.dirs += 1;
                     var sub = dir.openDir(io, entry.name, .{ .follow_symlinks = false, .iterate = true }) catch |e| switch (e) {
                         error.FileNotFound, error.NotDir, error.SymLinkLoop => continue, // changed under the walk
                         else => return error.IoError,
@@ -1622,16 +1651,19 @@ pub const Snapshot = struct {
     }
 
     /// SHA-256 of the whole file, as `"` + the first 128 bits in hex + `"`.
-    fn contentTag(io: Io, file: File, out: *[tag_len]u8) !void {
+    /// Reads at most `size` bytes (the size the file had when opened): a file
+    /// that keeps growing is not read forever.
+    fn contentTag(io: Io, file: File, size: u64, out: *[tag_len]u8) !void {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         var buf: [64 * 1024]u8 = undefined;
         var off: u64 = 0;
-        while (true) {
-            const n = try file.readPositionalAll(io, &buf, off);
+        while (off < size) {
+            const want: usize = @intCast(@min(buf.len, size - off));
+            const n = try file.readPositionalAll(io, buf[0..want], off);
             if (n == 0) break;
             h.update(buf[0..n]);
             off += n;
-            if (n < buf.len) break;
+            if (n < want) break;
         }
         const digest = h.finalResult();
         out[0] = '"';
@@ -1695,7 +1727,8 @@ pub const Snapshot = struct {
     }
 
     fn tagOf(s: *const Snapshot, id: u32) ?[]const u8 {
-        return if (s.options.fingerprint) &s.tags.items[id] else null;
+        // A zero first byte: no content tag (file over `max_fingerprint_bytes`).
+        return if (s.options.fingerprint and s.tags.items[id][0] == '"') &s.tags.items[id] else null;
     }
 
     /// The `codings` index of the variant this request prefers to identity,
@@ -1725,6 +1758,12 @@ pub const LiveOptions = struct {
     /// and publishes nothing (`Outcome.held_back`): the current generation
     /// keeps serving, and the change is picked up by the first rescan after
     /// the oldest hold is released.
+    ///
+    /// Descriptor budget: a generation holds one descriptor per file, and up
+    /// to `max_retired + 1` generations are alive at once (each file replaced
+    /// since keeps its old descriptor), so up to `(max_retired + 1) *
+    /// snapshot.max_files` descriptors can be open together. Keep that under
+    /// `RLIMIT_NOFILE`, with room for the connections.
     max_retired: u32 = 16,
     /// Told after every rescan, on the thread that ran it (`start`'s, or
     /// `reload`'s caller) -- to log a published generation or a failure.
@@ -1863,8 +1902,10 @@ pub const Live = struct {
         return g;
     }
 
+    /// Panics (`staticfiles: ...`) on a `release` without its `acquire`.
     pub fn release(_: *Live, g: *Gen) void {
-        _ = g.holds.fetchSub(1, .seq_cst);
+        // Caller contract: one `release` per `acquire`.
+        if (g.holds.fetchSub(1, .seq_cst) == 0) @panic("staticfiles: Live.release without a matching acquire");
     }
 
     /// `Snapshot.serve` on the current generation, held for the answer.
@@ -1958,8 +1999,9 @@ pub const Live = struct {
 
     /// Rescan every `options.rescan_ms` on a thread of its own, until `stop`.
     /// `io` must be one a plain thread may block on (`std.Io.Threaded`'s).
+    /// Panics (`staticfiles: ...`) when the thread already runs.
     pub fn start(l: *Live, io: Io) std.Thread.SpawnError!void {
-        std.debug.assert(l.thread == null);
+        if (l.thread != null) @panic("staticfiles: Live.start called while the rescan thread already runs");
         l.stopping.store(false, .seq_cst);
         l.thread = try std.Thread.spawn(.{}, run, .{ l, io });
     }
@@ -1976,7 +2018,7 @@ pub const Live = struct {
         var waited: u32 = 0;
         while (!l.stopping.load(.seq_cst)) {
             io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
-            waited += step_ms;
+            waited +|= step_ms;
             if (waited < l.options.rescan_ms) continue;
             waited = 0;
             _ = l.reload(io) catch {};
@@ -4083,6 +4125,59 @@ test "Snapshot.open refuses what it would not serve right: symlink following, li
     try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, root, .{ .max_depth = 1 }));
     var ok = try Snapshot.open(gpa, io, root, .{ .max_files = 2, .max_depth = 2 });
     ok.deinit(io);
+}
+
+test "Snapshot: more directories than max_dirs is TooManyFiles, empty ones included (sweep 2026-10-28 F-2)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    for ([_][]const u8{ "d1", "d2", "d3" }) |d| _ = try root.createDirPathOpen(io, d, .{});
+    const gpa = testing.allocator;
+    try testing.expectError(error.TooManyFiles, Snapshot.open(gpa, io, root, .{ .max_dirs = 2 }));
+    var ok = try Snapshot.open(gpa, io, root, .{ .max_dirs = 3 });
+    ok.deinit(io);
+}
+
+test "Snapshot: a file over max_fingerprint_bytes keeps the size+mtime tag, a smaller one the content tag (sweep 2026-10-28 F-1)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "big.txt", .data = "0123456789" });
+    try root.writeFile(io, .{ .sub_path = "small.txt", .data = "0123" });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{ .max_fingerprint_bytes = 4 });
+    defer snap.deinit(io);
+    try testing.expect(snap.tagOf(snap.paths.get("big.txt").?.file) == null);
+    try testing.expect(snap.tagOf(snap.paths.get("small.txt").?.file) != null);
+}
+
+test "serve: a listing stops at max_listing_entries with a truncation line (sweep 2026-10-28 F-3)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const io = testing.io;
+    _ = try fx.root.createDirPathOpen(io, "many", .{});
+    for (0..5) |i| {
+        var nb: [16]u8 = undefined;
+        const n = try std.fmt.bufPrint(&nb, "many/f{d}.txt", .{i});
+        try fx.root.writeFile(io, .{ .sub_path = n, .data = "x" });
+    }
+    var out: [8192]u8 = undefined;
+    var h = Handler.init(io, fx.root, .{ .directory_listing = true, .max_listing_entries = 3 });
+    const resp = get(&h, "/many/", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.find(u8, resp, "[listing truncated]") != null);
+    var n_li: usize = 0;
+    var from: usize = 0;
+    while (mem.find(u8, resp[from..], "<li>f")) |i| : (from += i + 1) n_li += 1;
+    try testing.expectEqual(@as(usize, 3), n_li);
+
+    var h_all = Handler.init(io, fx.root, .{ .directory_listing = true });
+    const all = get(&h_all, "/many/", &out);
+    try testing.expect(mem.find(u8, all, "[listing truncated]") == null);
+    try testing.expect(mem.find(u8, all, "<li>f4.txt</li>") != null);
 }
 
 test "Snapshot: a file the walk cannot open is left out, not an error; deinit closes every descriptor" {
