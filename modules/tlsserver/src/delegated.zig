@@ -147,11 +147,13 @@ pub fn hasDelegationUsage(leaf_der: []const u8) bool {
 /// `algorithm`. For tools and tests; the leaf's key is the CA customer's.
 // secret-api-ok: `leaf_key` is a union of pointers; `certverify.signContent` burns its own frames.
 pub fn issue(out: []u8, leaf_der: []const u8, leaf_key: certverify.SecretKey, algorithm: u16, spki: []const u8, scheme: u16, valid_time: u32, random: ?std.Random) ![]u8 {
+    // The credential's SPKI length is a u24 on the wire.
+    if (spki.len > std.math.maxInt(u24)) return error.ValueTooLong;
     const cred_len = 4 + 2 + 3 + spki.len;
     if (out.len < cred_len + 4 + certverify.maxSignatureLen(@fromBackingInt(algorithm))) return error.BufferTooSmall;
     std.mem.writeInt(u32, out[0..4], valid_time, .big);
     std.mem.writeInt(u16, out[4..6], scheme, .big);
-    std.mem.writeInt(u24, out[6..9], @intCast(spki.len), .big);
+    std.mem.writeInt(u24, out[6..9], @intCast(spki.len), .big); // checked above
     @memcpy(out[9..][0..spki.len], spki);
     std.mem.writeInt(u16, out[cred_len..][0..2], algorithm, .big);
     var mbuf: [64 + context_string.len + 1 + max_leaf_len + 9 + 1024 + 2]u8 = undefined;
@@ -230,4 +232,12 @@ test "check: valid for exactly 7 days is taken, a second more is not; only ECDSA
     const fine = try issue(&raw, &leaf, key, 0x0403, spki, 0x0807, 60, null);
     _ = try check(fine, &leaf);
     try testing.expectError(error.BadSignature, check(fine, "another leaf"));
+}
+
+test "issue: an SPKI over 2^24 - 1 octets is ValueTooLong, not a cast panic" {
+    const big = try testing.allocator.alloc(u8, (1 << 24));
+    defer testing.allocator.free(big);
+    var out: [16]u8 = undefined;
+    // Refused before the key or the buffer is looked at.
+    try testing.expectError(error.ValueTooLong, issue(&out, "", undefined, 0x0804, big, 0x0804, 1, null));
 }

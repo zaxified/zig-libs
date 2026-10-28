@@ -118,8 +118,12 @@ pub const Connection = struct {
         output: *std.Io.Writer,
         joiner_buf: []u8,
     ) Connection {
-        std.debug.assert(input.buffer.len >= record.max_record_len);
-        std.debug.assert(output.end == 0);
+        // An `input` buffer under `record.max_record_len` is refused at
+        // `handshake`/`read` (`ReadFailed`), not here.
+        // The records are built from the start of the writer's buffer: octets
+        // already in it would be overwritten, so a non-empty writer is a
+        // caller error, checked in every mode.
+        if (output.end != 0) @panic("tlsserver: Connection.init: output writer must be empty");
         return .{ .server = .init(config, joiner_buf, output.buffer), .input = input, .output = output };
     }
 

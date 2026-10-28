@@ -229,6 +229,7 @@ pub fn configList(out: []u8, configs: []const []const u8) error{BufferTooSmall}!
 /// `retry_configs`: the keys marked `retry`, as an `ECHConfigList`.
 // secret-api-ok: copies the public configs only, never a private key.
 pub fn retryConfigs(out: []u8, e: *const Ech) error{BufferTooSmall}![]u8 {
+    if (out.len < 2) return error.BufferTooSmall;
     var n: usize = 0;
     for (e.keys) |k| {
         if (!k.retry) continue;
@@ -499,6 +500,17 @@ test "configs: make, parse, list; check refuses a key that is not the config's" 
     const list = try configList(&lb, &.{ cfg, cfg });
     try testing.expectEqual(@as(usize, 2 + 2 * cfg.len), list.len);
     try testing.expectEqualSlices(u8, list, try retryConfigs(&lb, &.{ .keys = &.{ .{ .config = cfg, .private_key = &kp.secret_key }, .{ .config = "x", .private_key = &kp.secret_key, .retry = false }, .{ .config = cfg, .private_key = &kp.secret_key } } }));
+}
+
+test "retryConfigs: no retry key and a buffer under 2 octets is an error, not a panic" {
+    const key: [32]u8 = @splat(1);
+    const e: Ech = .{ .keys = &.{.{ .config = "x", .private_key = &key, .retry = false }} };
+    var empty: [0]u8 = undefined;
+    var one: [1]u8 = undefined;
+    try testing.expectError(error.BufferTooSmall, retryConfigs(&empty, &e));
+    try testing.expectError(error.BufferTooSmall, retryConfigs(&one, &e));
+    var two: [2]u8 = undefined;
+    try testing.expectEqualSlices(u8, &.{ 0, 0 }, try retryConfigs(&two, &e));
 }
 
 test "parseOffer: outer, inner, other types" {

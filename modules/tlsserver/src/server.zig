@@ -309,7 +309,7 @@ pub const CertifiedKey = struct {
             if (c.algorithm == 0 or c.data.len == 0 or c.data.len > std.math.maxInt(u24) - (2 + 3 + 3)) return error.CompressedLength;
             const len = self.certificateBodyLen(c.staples) orelse return error.CompressedStale;
             if (c.uncompressed_len != len) return error.CompressedStale;
-            if (c.digest) |d| if (!std.mem.eql(u8, &d, &self.certificateDigest(c.staples).?)) return error.CompressedStale;
+            if (c.digest) |d| if (!std.mem.eql(u8, &d, &(self.certificateDigest(c.staples) orelse return error.CompressedStale))) return error.CompressedStale;
         }
     }
 
@@ -352,16 +352,17 @@ pub const CertifiedKey = struct {
 
     /// SHA-256 of `uncompressedCertificate(…, staples)` without the buffer:
     /// for `CompressedCertificate.digest`. Null: a staple the key does not
-    /// hold. Call `check` first (it bounds the lengths).
+    /// hold, or a length that does not fit its wire field (what `check`
+    /// refuses; total without it).
     pub fn certificateDigest(self: *const CertifiedKey, staples: Staples) ?[32]u8 {
         const body = self.certificateBodyLen(staples) orelse return null;
         var h: Sha256 = .init(.{});
         var be: [4]u8 = undefined;
         h.update(&.{0}); // certificate_request_context: empty
-        std.mem.writeInt(u24, be[0..3], @intCast(body - 1 - 3), .big);
+        std.mem.writeInt(u24, be[0..3], std.math.cast(u24, body - 1 - 3) orelse return null, .big);
         h.update(be[0..3]);
         for (self.chain, 0..) |der, i| {
-            std.mem.writeInt(u24, be[0..3], @intCast(der.len), .big);
+            std.mem.writeInt(u24, be[0..3], std.math.cast(u24, der.len) orelse return null, .big);
             h.update(be[0..3]);
             h.update(der);
             const ocsp = if (i == 0 and staples.ocsp) self.ocspStaple().? else null;
@@ -371,29 +372,29 @@ pub const CertifiedKey = struct {
             if (dc) |d| exts += 4 + d.len;
             if (ocsp) |o| exts += 4 + 1 + 3 + o.len;
             if (sct) |l| exts += 4 + l.len;
-            std.mem.writeInt(u16, be[0..2], @intCast(exts), .big);
+            std.mem.writeInt(u16, be[0..2], std.math.cast(u16, exts) orelse return null, .big);
             h.update(be[0..2]);
             if (dc) |d| {
                 std.mem.writeInt(u16, be[0..2], delegated.ext_delegated_credential, .big);
                 h.update(be[0..2]);
-                std.mem.writeInt(u16, be[0..2], @intCast(d.len), .big);
+                std.mem.writeInt(u16, be[0..2], std.math.cast(u16, d.len) orelse return null, .big);
                 h.update(be[0..2]);
                 h.update(d);
             }
             if (ocsp) |o| {
                 std.mem.writeInt(u16, be[0..2], 5, .big); // status_request
                 h.update(be[0..2]);
-                std.mem.writeInt(u16, be[0..2], @intCast(1 + 3 + o.len), .big);
+                std.mem.writeInt(u16, be[0..2], std.math.cast(u16, 1 + 3 + o.len) orelse return null, .big);
                 h.update(be[0..2]);
                 h.update(&.{1}); // ocsp
-                std.mem.writeInt(u24, be[0..3], @intCast(o.len), .big);
+                std.mem.writeInt(u24, be[0..3], std.math.cast(u24, o.len) orelse return null, .big);
                 h.update(be[0..3]);
                 h.update(o);
             }
             if (sct) |l| {
                 std.mem.writeInt(u16, be[0..2], 18, .big); // signed_certificate_timestamp
                 h.update(be[0..2]);
-                std.mem.writeInt(u16, be[0..2], @intCast(l.len), .big);
+                std.mem.writeInt(u16, be[0..2], std.math.cast(u16, l.len) orelse return null, .big);
                 h.update(be[0..2]);
                 h.update(l);
             }
@@ -1098,7 +1099,7 @@ const Resumable = struct {
         if (w.need_peer and f.peer == null) return false;
         if (f.peer != null and f.peer_raw != w.peer_raw) return false;
         if (f.quic != w.quic) return false;
-        if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms - f.peer_auth_ms > w.lifetime_ms)) return false;
+        if (f.peer != null and (f.peer_auth_ms > w.now_ms or w.now_ms -| f.peer_auth_ms > w.lifetime_ms)) return false;
         w.peer = f.peer;
         w.peer_scheme = f.peer_scheme;
         w.peer_auth_ms = f.peer_auth_ms;
@@ -1497,8 +1498,10 @@ pub const Server = struct {
     /// `feed`. Tickets are sealed and opened in it; their secrets are wiped
     /// as soon as that is done, the leaf (not a secret) stays — also after
     /// `deinit`: a pooled buffer holds the last client's certificate.
+    /// Call before the first `feed`: calling it later is a programmer error
+    /// and panics (checked, in every build mode).
     pub fn setPeerBuffer(self: *Server, buf: []u8) void {
-        std.debug.assert(self.state == .client_hello);
+        if (self.state != .client_hello) @panic("tlsserver: setPeerBuffer after the first feed");
         self.peer_buf = buf;
     }
 
@@ -1506,9 +1509,10 @@ pub const Server = struct {
     /// decrypted and rebuilt in, `ech.bufferLen(Ech.max_client_hello_len)`
     /// octets, the caller's until `deinit` (it holds the inner ClientHello,
     /// not a secret). Without it every offer is declined. Set before the
-    /// first `feed`.
+    /// first `feed`: calling it later is a programmer error and panics
+    /// (checked, in every build mode).
     pub fn setEchBuffer(self: *Server, buf: []u8) void {
-        std.debug.assert(self.state == .client_hello);
+        if (self.state != .client_hello) @panic("tlsserver: setEchBuffer after the first feed");
         self.ech_buf = buf;
     }
 
@@ -2036,7 +2040,11 @@ pub const Server = struct {
         s.server_cert_type = if (sct == 0xff) null else sct;
         s.client_cert_type = if (cct == 0xff) null else cct;
         const limit = get.int(&r, u24);
-        s.peer_record_limit = if (limit == 0) null else @intCast(limit);
+        // `serialize` writes 0 or a limit a client may send (RFC 8449: 64..65535).
+        s.peer_record_limit = if (limit == 0) null else blk: {
+            if (limit < min_record_size_limit) return error.BadBlob;
+            break :blk std.math.cast(u16, limit) orelse return error.BadBlob;
+        };
         s.early_reason = std.enums.fromInt(EarlyDataReason, get.int(&r, u8)) orelse return error.BadBlob;
         if (get.int(&r, u8) != 0) if (s.config.dynamic_records) |d| {
             s.dyn_sent = d.boost_after;
@@ -2160,8 +2168,9 @@ pub const Server = struct {
     /// most 255 octets; rustls `set_resumption_data`), typically the
     /// transport parameters 0-RTT must be checked against. Set before the
     /// client's Finished (the tickets are issued then); borrowed until.
-    pub fn setQuicResumptionData(self: *Server, data: []const u8) void {
-        std.debug.assert(data.len <= 255);
+    /// `error.ResumptionDataTooLong` for more than 255 octets (nothing set).
+    pub fn setQuicResumptionData(self: *Server, data: []const u8) error{ResumptionDataTooLong}!void {
+        if (data.len > 255) return error.ResumptionDataTooLong;
         self.quic_resumption_data = data;
     }
 
@@ -2310,10 +2319,12 @@ pub const Server = struct {
     /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn commitWrite(self: *Server, n: usize) Error!void {
         if (self.config.quic != null) return error.WrongTransport;
-        self.closeWriteSlot(n);
+        // `n` past the slot (or the record limit) seals nothing: the slot is
+        // closed whole (its octets are wiped by `deinit`), the call fails.
+        const fits = self.closeWriteSlot(n);
         if (n == 0) return;
         if (!self.canWrite() or self.write_closed) return error.Closed;
-        std.debug.assert(n <= self.out.max_fragment);
+        if (!fits or n > self.out.max_fragment) return error.OutputFull;
         self.out.commit(.application_data, n) catch |err| {
             // Not sealed: the plaintext does not wait for `deinit` to go.
             zeroize(self.out.buf[self.out.len..]);
@@ -2353,15 +2364,20 @@ pub const Server = struct {
     /// secret-api-ok: reads `config`'s flags (quic, dynamic_records) only; the ECH private keys behind `config.ech` are never followed here, and records are sealed under `Outbound`'s own burns.
     pub fn abandonWrite(self: *Server, n: usize) void {
         if (self.config.quic != null) return;
-        self.closeWriteSlot(n);
+        // An `n` past the slot is clamped to it: nothing is sealed, `deinit`
+        // wipes at most the slot.
+        _ = self.closeWriteSlot(n);
     }
 
-    /// The open slot's first `n` octets hold data; it is closed.
-    fn closeWriteSlot(self: *Server, n: usize) void {
-        if (self.write_slot_end == 0) return;
-        std.debug.assert(n <= self.write_slot_end - self.write_slot_start);
-        self.out.touch(self.write_slot_start + n);
+    /// The open slot's first `n` octets hold data; it is closed. False when
+    /// `n` exceeds the slot: the whole slot is then marked as written (so
+    /// `deinit` wipes it) and the caller must not seal it.
+    fn closeWriteSlot(self: *Server, n: usize) bool {
+        if (self.write_slot_end == 0) return true;
+        const room = self.write_slot_end - self.write_slot_start;
+        self.out.touch(self.write_slot_start + @min(n, room));
         self.write_slot_end = 0;
+        return n <= room;
     }
 
     /// Turn the send key over now (RFC 8446 §4.6.3), asking the client to
@@ -2540,13 +2556,18 @@ pub const Server = struct {
 
     /// The client's share for `group`, if any, after checking every share:
     /// one per group, each for a group in supported_groups. Out of line:
-    /// its 8 KiB bitset of the groups seen (any u16 may come) would deepen
+    /// its two 8 KiB bitsets (groups seen, groups listed) (any u16 may come) would deepen
     /// `onClientHello`'s frame, and every secret-holding frame below it,
     /// past `burn.handshake_burn` (stack probe, 2026-10-21). Public data
     /// only, so its own frame needs no burn.
     noinline fn findShare(shares_in: hello.KeyShareIter, gs: hello.U16Iter, group: u16) Error!?[]const u8 {
         var shares = shares_in;
         var seen: std.StaticBitSet(1 << 16) = .empty;
+        // One pass over supported_groups, then O(1) per share (a per-share
+        // scan of the list was O(shares x groups) per hello).
+        var listed: std.StaticBitSet(1 << 16) = .empty;
+        var gi = gs;
+        while (gi.next()) |g| listed.set(g);
         var share: ?[]const u8 = null;
         while (shares.next()) |e| {
             if (seen.isSet(e.group)) return error.IllegalParameter;
@@ -2558,7 +2579,7 @@ pub const Server = struct {
             // supported_groups alone are let through: JDK 11 lists sect*
             // and secp256k1 beside TLS 1.3 (BoGo `Server-JDK11-*`), so the
             // stricter tlsfuzzer `test-tls13-obsolete-curves` would cut it off.
-            if (!gs.contains(e.group) or isObsoleteGroup(e.group)) return error.IllegalParameter;
+            if (!listed.isSet(e.group) or isObsoleteGroup(e.group)) return error.IllegalParameter;
             if (e.group == group) share = e.key_exchange;
         }
         return share;
@@ -2952,7 +2973,7 @@ pub const Server = struct {
         }
         @memcpy(psk_out[0..L], &sel.psk);
         const reported_ms = ids[sel.selected_index].obfuscated_ticket_age -% sel.session.ticket_age_add;
-        self.age_skew_s = @as(i64, reported_ms / 1000) - @divTrunc(now_ms - sel.session.issued_at_ms, 1000);
+        self.age_skew_s = @as(i64, reported_ms / 1000) - @divTrunc(now_ms -| sel.session.issued_at_ms, 1000);
         // The ticket's client certificate (in `scratch`, which `selectPsk`
         // last opened the taken ticket into). Kept even if the psk modes
         // then refuse the resumption: `peer_authenticated` decides.
@@ -6381,6 +6402,69 @@ test "deserialize: the peer buffer must hold the head and the client's certifica
     defer s.deinit();
     try testing.expectEqual(@as(u16, 10), s.peer_len);
     try testing.expect(s.isConnected());
+}
+
+test "findShare: many shares and groups pick the same share; duplicates, unlisted and obsolete groups are refused" {
+    const be = std.mem.nativeToBig;
+    var groups: [400]u16 = undefined;
+    var gbuf: [800]u8 = undefined;
+    var sbuf: [400 * 5]u8 = undefined;
+    // Groups 0x4000.. listed in reverse; shares for all of them, 1 octet each.
+    for (&groups, 0..) |*g, i| g.* = @intCast(0x4000 + (399 - i));
+    for (groups, 0..) |g, i| std.mem.writeInt(u16, gbuf[i * 2 ..][0..2], g, .big);
+    var at: usize = 0;
+    for (0..400) |i| {
+        const g: u16 = @intCast(0x4000 + i);
+        sbuf[at..][0..2].* = std.mem.toBytes(be(u16, g));
+        sbuf[at + 2 ..][0..2].* = std.mem.toBytes(be(u16, 1));
+        sbuf[at + 4] = @truncate(i);
+        at += 5;
+    }
+    const gs: hello.U16Iter = .{ .rest = &gbuf };
+    const shares: hello.KeyShareIter = .{ .rest = sbuf[0..at] };
+    const got = (try Server.findShare(shares, gs, 0x4000 + 123)).?;
+    try testing.expectEqualSlices(u8, &.{123}, got);
+    try testing.expectEqual(@as(?[]const u8, null), try Server.findShare(shares, gs, 0x5000));
+    // Duplicate group, one share for a group not listed, an obsolete one.
+    const dup = [_]u8{ 0x40, 0x00, 0, 1, 1, 0x40, 0x00, 0, 1, 2 };
+    try testing.expectError(error.IllegalParameter, Server.findShare(.{ .rest = &dup }, gs, 0x4000));
+    const unlisted = [_]u8{ 0x60, 0x00, 0, 1, 1 };
+    try testing.expectError(error.IllegalParameter, Server.findShare(.{ .rest = &unlisted }, gs, 0x4000));
+    const obsolete = [_]u8{ 0x00, 0x05, 0, 1, 1 };
+    const og = [_]u8{ 0x00, 0x05 };
+    try testing.expectError(error.IllegalParameter, Server.findShare(.{ .rest = &obsolete }, .{ .rest = &og }, 0x4000));
+}
+
+test "setQuicResumptionData: 255 octets are accepted, 256 are an error" {
+    var prng = std.Random.DefaultPrng.init(1);
+    const quic: Quic = .{ .transport_parameters = "TP" };
+    const cfg: Config = .{ .certificate = .{ .fixed = testKey() }, .random = prng.random(), .alpn_protocols = &.{"h3"}, .quic = &quic };
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    var s: Server = .init(&cfg, &joiner, &out);
+    defer s.deinit();
+    const data: [256]u8 = @splat(7);
+    try s.setQuicResumptionData(data[0..255]);
+    try testing.expectEqual(@as(usize, 255), s.quic_resumption_data.len);
+    try testing.expectError(error.ResumptionDataTooLong, s.setQuicResumptionData(&data));
+    try testing.expectEqual(@as(usize, 255), s.quic_resumption_data.len);
+}
+
+test "commitWrite past the slot is OutputFull and seals nothing; abandonWrite clamps" {
+    const p = try createPeerWith(.{});
+    defer p.destroy();
+    const slot = try p.s.writeSlot();
+    @memset(slot, 'x');
+    try testing.expectError(error.OutputFull, p.s.commitWrite(slot.len + 1));
+    try testing.expectEqual(@as(usize, 0), p.s.pendingOutput().len);
+    // The slot is closed; a fresh one can be taken and given up with a huge n.
+    _ = try p.s.writeSlot();
+    p.s.abandonWrite(std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 0), p.s.pendingOutput().len);
+    const again = try p.s.writeSlot();
+    @memset(again, 'y');
+    try p.s.commitWrite(1);
+    try testing.expect(p.s.pendingOutput().len > 0);
 }
 
 test "dynamic records: full once boost_after octets are out (exactly boost_after included); a zero segment_len still moves" {

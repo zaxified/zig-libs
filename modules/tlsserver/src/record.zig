@@ -266,7 +266,8 @@ pub const Protection = struct {
     }
 
     fn sealBody(self: *Protection, buf: []u8, content_len: usize, content_type: ContentType, pad: usize) SealError![]u8 {
-        const inner_len = content_len + 1 + pad;
+        // Saturating: a huge `pad` or `content_len` is an overflow, not a wrap.
+        const inner_len = content_len +| 1 +| pad;
         if (inner_len > max_inner_len) return error.RecordOverflow;
         const ct_len = inner_len + tag_len;
         if (buf.len < header_len + ct_len) return error.BufferTooSmall;
@@ -588,4 +589,13 @@ test "parseHeader / writeHeader" {
     try testing.expectEqual(ContentType.handshake, p.content_type);
     try testing.expectEqual(@as(u16, 0x0303), p.legacy_version);
     try testing.expectEqual(@as(u16, 0x1234), p.length);
+}
+
+test "seal: a huge pad or content_len is RecordOverflow, not an arithmetic panic" {
+    var p: Protection = undefined;
+    try p.init(.aes_128_gcm_sha256, &@as([32]u8, @splat(1)));
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.RecordOverflow, p.seal(&buf, 1, .handshake, std.math.maxInt(usize)));
+    try std.testing.expectError(error.RecordOverflow, p.seal(&buf, std.math.maxInt(usize), .handshake, 0));
+    try std.testing.expectEqual(@as(u64, 0), p.seq);
 }

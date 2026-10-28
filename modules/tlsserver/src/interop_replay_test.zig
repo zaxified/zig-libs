@@ -240,7 +240,7 @@ const Harness = struct {
         h.conn = .init(&h.cfg, &h.reader, &h.sink.writer, h.joiner);
         h.conn.server.setPeerBuffer(h.peer);
         h.conn.server.setEchBuffer(h.ech_buf);
-        if (v.quic) h.conn.server.setQuicResumptionData(&vectors.quic_server_tp);
+        if (v.quic) try h.conn.server.setQuicResumptionData(&vectors.quic_server_tp);
         return h;
     }
 

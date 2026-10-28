@@ -125,10 +125,11 @@ pub const CertKeyPair = struct {
     }
 
     fn fromPemDelegatedBody(out: *CertKeyPair, gpa: std.mem.Allocator, chain_pem: []const u8, key_pem: []const u8, delegated_credential: []const u8) Error!void {
-        const c = delegated.parse(delegated_credential) catch return error.MalformedKey;
-        const spki = x509.parseSpki(c.spki) catch return error.MalformedKey;
+        // First, so that every error path leaves `out` in the documented state.
         out.* = .{ .der = &.{}, .chain = &.{}, .key = .{ .ed25519 = undefined } };
         errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+        const c = delegated.parse(delegated_credential) catch return error.MalformedKey;
+        const spki = x509.parseSpki(c.spki) catch return error.MalformedKey;
         try loadChain(out, gpa, chain_pem);
         errdefer {
             gpa.free(out.chain);
@@ -737,4 +738,13 @@ test "ML-DSA: a seed-form key with anything after the seed is MalformedKey" {
         var pair: CertKeyPair = undefined;
         try testing.expectError(error.MalformedKey, CertKeyPair.fromPem(&pair, testing.allocator, c.cert_pem, pem));
     };
+}
+
+test "fromPemDelegated: an early error (bad credential) leaves out zeroed and deinit-safe" {
+    const c = key_vectors.cases[0];
+    var pair: CertKeyPair = undefined;
+    @memset(std.mem.asBytes(&pair), 0xaa);
+    try testing.expectError(error.MalformedKey, CertKeyPair.fromPemDelegated(&pair, testing.allocator, c.cert_pem, c.key_pem, "junk"));
+    try testing.expect(std.mem.allEqual(u8, std.mem.asBytes(&pair), 0));
+    pair.deinit(testing.allocator);
 }

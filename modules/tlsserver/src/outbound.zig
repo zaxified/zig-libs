@@ -67,6 +67,12 @@ pub const Outbound = struct {
         return .{ .buf = buf };
     }
 
+    /// `max_fragment` clamped to [1, 2^14]: the field is public, and 0 or
+    /// more than a record holds must not reach a division or `seal`.
+    fn fragLen(self: *const Outbound) usize {
+        return std.math.clamp(@as(usize, self.max_fragment), 1, record.max_plaintext_len);
+    }
+
     /// Overhead one record adds to its content.
     fn overhead(self: *const Outbound) usize {
         return if (self.protected) header_len + 1 + record.tag_len else header_len;
@@ -80,7 +86,7 @@ pub const Outbound = struct {
         if (free <= header_len) return self.buf[self.buf.len..];
         // Content n needs n + ceil(n / max_fragment) * overhead; reserve
         // for the worst case of the free space.
-        const per = @as(usize, self.max_fragment) + self.overhead();
+        const per = self.fragLen() + self.overhead();
         const records = (free + per - 1) / per;
         const usable = free -| records * self.overhead();
         return self.buf[self.len + header_len ..][0..usable];
@@ -100,7 +106,7 @@ pub const Outbound = struct {
             self.quic_lens[self.quic_level] += n;
             return;
         }
-        const max: usize = self.max_fragment;
+        const max: usize = self.fragLen();
         const o = self.overhead();
         const k = if (n == 0) 1 else (n + max - 1) / max;
         const keep: usize = if (content_type == .alert) 0 else alert_reserve;
@@ -167,11 +173,10 @@ pub const Outbound = struct {
             // From the lowest level with octets pending, within it (never
             // past it, whatever the caller asks).
             const p = self.quicPending() orelse return;
-            std.debug.assert(n <= p.data.len);
             n = @min(n, p.data.len);
             self.quic_lens[p.level] -= n;
         }
-        std.debug.assert(n <= self.len);
+        n = @min(n, self.len);
         std.mem.copyForwards(u8, self.buf[0 .. self.len - n], self.buf[n..self.len]);
         self.len -= n;
     }
@@ -370,4 +375,37 @@ test "wipe zeroes every octet any path wrote, a failed commit's content and a to
     o.touch(@intFromPtr(s3.ptr) - @intFromPtr(&b) + 77);
     o.wipe();
     for (b) |x| try testing.expectEqual(@as(u8, 0), x);
+}
+
+test "discard clamps to what is pending, plain and QUIC" {
+    var b: [256]u8 = undefined;
+    var o: Outbound = .init(&b);
+    try o.write(.handshake, "abc");
+    o.discard(o.len + 1);
+    try testing.expectEqual(@as(usize, 0), o.len);
+    try o.write(.handshake, "abc");
+    o.discard(std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 0), o.len);
+
+    var q: Outbound = .init(&b);
+    q.quic = true;
+    try q.write(.handshake, "abcd");
+    q.discard(std.math.maxInt(usize));
+    try testing.expectEqual(@as(usize, 0), q.len);
+    try testing.expect(q.quicPending() == null);
+    try q.write(.handshake, "abcd");
+    q.discard(5);
+    try testing.expectEqual(@as(usize, 0), q.len);
+}
+
+test "max_fragment 0 and above 2^14 are clamped, not a panic" {
+    var b: [3 * record.max_record_len]u8 = undefined;
+    inline for (.{ 0, 32768 }) |mf| {
+        var o: Outbound = .init(&b);
+        o.max_fragment = mf;
+        const s = o.slot();
+        @memset(s[0..40], 'x');
+        try o.commit(.handshake, 40);
+        try testing.expect(o.len > 0);
+    }
 }

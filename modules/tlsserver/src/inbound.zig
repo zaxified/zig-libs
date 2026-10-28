@@ -80,13 +80,15 @@ pub const Joiner = struct {
         return 4 + max_message + record.max_plaintext_len;
     }
 
+    /// A `buf` shorter than `bufferLen(0)` is accepted but useless: it
+    /// refuses every non-empty message (`maxMessage` is 0) and any push that
+    /// does not fit, with `error.HandshakeTooLarge`.
     pub fn init(buf: []u8) Joiner {
-        std.debug.assert(buf.len >= bufferLen(0));
         return .{ .buf = buf };
     }
 
     pub fn maxMessage(self: *const Joiner) usize {
-        return self.buf.len - bufferLen(0);
+        return self.buf.len -| bufferLen(0);
     }
 
     /// No octet held: neither a partial message nor an undelivered one.
@@ -97,7 +99,6 @@ pub const Joiner = struct {
     /// Append one record's handshake content (≤ 2^14 octets). Call only
     /// when `next` has returned null: every complete message delivered.
     pub fn push(self: *Joiner, fragment: []const u8) JoinError!void {
-        std.debug.assert(fragment.len <= record.max_plaintext_len);
         const held = self.end - self.start;
         if (self.start != 0) {
             std.mem.copyForwards(u8, self.buf[0..held], self.buf[self.start..self.end]);
@@ -106,7 +107,8 @@ pub const Joiner = struct {
         }
         // What is held is less than one whole message, and that message is
         // within the cap (`next` checked its header), so a fragment fits.
-        std.debug.assert(held < 4 + self.maxMessage());
+        // (Not so with a buffer under `bufferLen(0)`: refuse then.)
+        if (fragment.len > self.buf.len - held) return error.HandshakeTooLarge;
         @memcpy(self.buf[held..][0..fragment.len], fragment);
         self.end = held + fragment.len;
         self.dirty = @max(self.dirty, self.end);
@@ -819,4 +821,17 @@ test "joiner: a message over the cap is refused from its header alone" {
     m[3] = 100;
     s.plain(.handshake, &m);
     try expectHandshake(try in2.next(s.bytes()), 1, m[4..]);
+}
+
+test "Joiner with a too-small buffer refuses instead of writing out of bounds" {
+    var tiny: [8]u8 = undefined;
+    var j: Joiner = .init(&tiny);
+    try testing.expectEqual(@as(usize, 0), j.maxMessage());
+    try testing.expectError(error.HandshakeTooLarge, j.push(&@as([9]u8, @splat(0))));
+    try j.push(&.{ 1, 0, 0, 1 });
+    try testing.expectError(error.HandshakeTooLarge, j.next());
+    var empty: [0]u8 = .{};
+    var j0: Joiner = .init(&empty);
+    try testing.expectError(error.HandshakeTooLarge, j0.push("x"));
+    try testing.expect((try j0.next()) == null);
 }

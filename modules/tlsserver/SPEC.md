@@ -10,7 +10,7 @@
 
 **Audit:** review 2026-10-22 · mutation 2026-10-23 (15/16, 1 eq) · src 581c2c366e89c392
 
-**Hardening:** fuzz 2026-10-22 (after the grade-1 features, ReleaseSafe driver, 4 jobs: `tlsserver-ech` 1,000,000 runs clean, new — the inner hello rebuilt from a model, every fault refused with its error; `tlsserver-hello` 4,000,000, `tlsserver-server` 160,000 (ECH recordings included), `tlsserver-keyupdate` 400,000 (its model fixed: an empty record no longer refills the budget), `tlsserver-quic` 800,000, `tlsserver-record` 8,000,000, `tlsserver-inbound` 1,200,000, `tlsserver-keys` 400,000, `tlsserver-clientauth` 1,200,000, all clean; earlier: `tlsserver-quic`, 800,000 runs, clean, TLSSERVER_FUZZ: recorded Go QUICClient sessions whole, in pieces, flipped, at a wrong level, cut short; reach 8/8 in 400 seeds; `tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-22 (ctgrind, target `ech` added: the recorded Go ECH sessions with the ECH private key tainted, 384 in-file contexts all on the decrypted inner hello, none on the key; hs/app/ticket unchanged 28/8/77; earlier the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 77 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records)
+**Hardening:** fuzz 2026-10-22 (after the grade-1 features, ReleaseSafe driver, 4 jobs: `tlsserver-ech` 1,000,000 runs clean, new — the inner hello rebuilt from a model, every fault refused with its error; `tlsserver-hello` 4,000,000, `tlsserver-server` 160,000 (ECH recordings included), `tlsserver-keyupdate` 400,000 (its model fixed: an empty record no longer refills the budget), `tlsserver-quic` 800,000, `tlsserver-record` 8,000,000, `tlsserver-inbound` 1,200,000, `tlsserver-keys` 400,000, `tlsserver-clientauth` 1,200,000, all clean; earlier: `tlsserver-quic`, 800,000 runs, clean, TLSSERVER_FUZZ: recorded Go QUICClient sessions whole, in pieces, flipped, at a wrong level, cut short; reach 8/8 in 400 seeds; `tlsserver-record`, 12,000,000-run budget, clean, TLSSERVER_FUZZ; 5 planted mutants all caught; `tlsserver-inbound`, 1,200,000 runs, clean, 5 planted mutants caught; `tlsserver-hello`, 4,000,000 runs, clean, 6 planted mutants caught; `tlsserver-server`, 160,000 runs, clean, 5 planted mutants caught) · ct 2026-10-22 (ctgrind, target `ech` added: the recorded Go ECH sessions with the ECH private key tainted, 384 in-file contexts all on the decrypted inner hello, none on the key; hs/app/ticket unchanged 28/8/77; earlier the ClientHello to the first flight with the randomness and certificate key tainted, record seal/open per suite with the traffic secret tainted, ticket issue + resumption with the STEK tainted; `hs` 28 / `app` 8 / `ticket` 77 in-file, none a branch on a key — signing/kex verdicts below `tls13`/`p256`/std, AEAD/binder/Finished verdicts, the padding scan and the parse of decrypted tickets and records) · panic 2026-10-28 (independent sweep of every pub entry point: ECH retry-config buffer, `findShare` linear, caller-contract asserts made total or errors; hello 300,000 + server 30,000 driver runs clean after it)
 
 **Performance:** ref 0.44–0.93× OpenSSL 3.5.5 libssl (server side only, replayed sessions: full handshake ECDSA P-256 / RSA-2048 over X25519 and P-256 over X25519MLKEM768, resumption, AES-256-GCM 16 KiB records sent and received) · fastest 1.02× worst vs the faster of OpenSSL and rustls 0.23.43 + aws-lc-rs 1.18.0 (sending a 16 KiB record; every other row ≤ 0.99) (measured 2026-10-22)
 
@@ -1089,6 +1089,18 @@ renewal's server handshake timed, as on the other sides. The one row at parity, 
 records (the per-record 4 KiB burn).
 
 ## Backlog / deferred
+
+- **`Config.check()`** (no-panic sweep 2026-10-28, F13): a config the server accepts but cannot
+  serve fails per handshake with `InternalError` — a group `kex` does not compute (an HRR for it
+  first), an empty `ClientAuth.schemes`, `Quic.transport_parameters` or `authorities` over 64 KiB,
+  a `compressed_certificates` mismatch. One up-front check would refuse them at `init`.
+- **Stack requirement of a handshake** (sweep F16): hybrid/ML-KEM kex plus the burns is ~250 KiB
+  and more; state it for fiber and thread-pool users (`tls13` has the same backlog item).
+- **`Connection.reader()` and std's delimiter helpers** (sweep F15): on a fresh connection
+  `takeDelimiterInclusive` returns `StreamTooLong` through std's failing-writer path (no panic);
+  document or prefill.
+- **Clock arithmetic in `tlsresume`** (sweep F14): `now_ms - session.issued_at_ms` traps on an
+  extreme caller clock; `tlsserver`'s own two subtractions saturate now.
 
 - **Review leftovers (2026-10-21, LOW/INFO, kept):** `signature_algorithms` required (and
   `handshake_failure` without it) even on a ClientHello that resumes; the second ClientHello

@@ -2684,7 +2684,7 @@ fn fuzzQuic(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
     var peer: [server_mod.peerBufferLen(clientauth.default_max_leaf_len)]u8 = undefined;
     var server: server_mod.Server = .init(&cfg, joiner, outb);
     server.setPeerBuffer(&peer);
-    server.setQuicResumptionData(&interop.quic_server_tp);
+    try server.setQuicResumptionData(&interop.quic_server_tp);
     defer server.deinit();
 
     // The recording's frames, a copy to damage.
