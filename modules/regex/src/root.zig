@@ -762,8 +762,10 @@ const RevDfa = struct {
     }
 };
 
-/// `Matcher.find`'s lazy DFA: the end of the leftmost-first match, without
-/// captures (Rust's `regex` and RE2 search the same way). A state is the
+/// `Matcher.find`'s lazy DFAs: the end of the leftmost-first match, without
+/// captures, then (unless the program is anchored) its start by `rev`, run
+/// backwards from the end (Rust's `regex` and RE2 search the same way). A
+/// forward state is the
 /// ordered list of instructions to follow from a position (threads in
 /// priority order, as the Pike VM keeps them), what the code point before it
 /// was as far as an assertion can tell, and whether a thread may still start
@@ -778,26 +780,155 @@ const FindDfa = struct {
     /// The outcome of one step: the next state's list and whether a match
     /// ends before the code point.
     const Step = struct { n: usize, matched: bool };
+    const wide_slots = 1024;
+    /// `key`: (state + 1) << 21 | code point, 0 empty.
+    const Wide = struct {
+        key: u32,
+        val: u16,
+        const empty: Wide = .{ .key = 0, .val = 0 };
+
+        fn keyOf(s: u16, cp: u21) u32 {
+            return (@as(u32, s) + 1) << 21 | cp;
+        }
+
+        fn slot(key: u32) usize {
+            return (key *% 0x9e3779b1) >> comptime (32 - std.math.log2_int(usize, wide_slots));
+        }
+    };
 
     gpa: std.mem.Allocator,
     /// The program has assertions: without, every context is one state.
     asserts: bool,
     states: std.ArrayList(State) = .empty,
-    /// `trans[s][c]`: 0 not worked out yet, otherwise (next state + 1) << 1,
-    /// bit 0 set when a match ends before `c`.
+    /// `trans[s][c]`: 0 not worked out yet, otherwise (next state + 1) << 2,
+    /// bit 1 set when that state has no thread, bit 0 when a match ends
+    /// before `c`.
     trans: std.ArrayList([128]u16) = .empty,
     /// The states' lists, one after another.
     pcs: std.ArrayList(u16) = .empty,
     /// Open addressing: state + 1, 0 empty.
     table: [2 * max_states]u16 = @splat(0),
+    /// `idleAt`'s states per context, + 1 (0 not made yet).
+    idle: [4]u16 = @splat(0),
+    /// Transitions on code points past ASCII, as `trans` (direct-mapped by
+    /// state and code point; a collision only costs the step again).
+    wide: [wide_slots]Wide = @splat(.empty),
+    /// The same for `rev` (its transitions as `rev.trans` encodes them).
+    rev_wide: [wide_slots]Wide = @splat(.empty),
     /// Times the table was emptied (tests).
     flushes: usize = 0,
+    /// The backward DFA for the start (`start`), kept across calls too.
+    rev: RevDfa,
+    /// The match instructions: `rev`'s first set.
+    match_set: Dfa.Set,
 
     fn init(gpa: std.mem.Allocator, re: *const Regex) FindDfa {
-        const asserts = for (re.insts) |inst| {
-            if (inst == .assert) break true;
-        } else false;
-        return .{ .gpa = gpa, .asserts = asserts };
+        var asserts = false;
+        var match_set: Dfa.Set = .{ 0, 0 };
+        for (re.insts, 0..) |inst, pc| switch (inst) {
+            .assert => asserts = true,
+            .match => match_set[pc >> 6] |= @as(u64, 1) << @truncate(pc),
+            else => {},
+        };
+        var d: FindDfa = .{ .gpa = gpa, .asserts = asserts, .rev = undefined, .match_set = match_set };
+        d.rev.n = 0;
+        return d;
+    }
+
+    /// The start of the leftmost-first match from `from` that ends at
+    /// `end`: the leftmost position from which some way through the program
+    /// reads exactly to `end` (no match begins further left, so that is the
+    /// one). Read backwards from `end` until no way is left.
+    fn start(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, end: usize) usize {
+        const r = &d.rev;
+        const end_ctx: Dfa.Ctx = if (d.asserts) .of(decode(input, end).cp) else .other;
+        var s = r.find(d.match_set, end_ctx) orelse blk: {
+            if (r.n == RevDfa.max_states) d.revFlush();
+            break :blk r.add(d.match_set, end_ctx);
+        };
+        var pos = end;
+        var best = end;
+        while (true) {
+            if (pos == from) {
+                if (d.revAccepts(re, s, d.ctxBefore(input, pos))) best = pos;
+                return best;
+            }
+            // The code point before `pos`: what the start would see before
+            // it, and what the step reads.
+            const c = input[pos - 1];
+            const ascii = c < 0x80;
+            if (ascii) {
+                // `rev_accept`: the start reaches the state's set after `c`.
+                const t = r.trans[s][c];
+                if (t != 0) {
+                    if (t & rev_accept != 0) best = pos;
+                    if (t & ~rev_accept == 1) return best; // no way left
+                    s = (t & ~rev_accept) - 2;
+                    pos -= 1;
+                    continue;
+                }
+            }
+            const here: Decoded = if (ascii) .{ .cp = c, .w = 1 } else decodeBefore(input, pos);
+            const key = Wide.keyOf(s, here.cp.?);
+            if (!ascii) {
+                const w = d.rev_wide[Wide.slot(key)];
+                if (w.key == key) {
+                    const t: u8 = @intCast(w.val);
+                    if (t & rev_accept != 0) best = pos;
+                    if (t & ~rev_accept == 1) return best;
+                    s = (t & ~rev_accept) - 2;
+                    pos -= here.w;
+                    continue;
+                }
+            }
+            const ctx = d.ctxOf(here.cp);
+            const acc = d.revAccepts(re, s, ctx);
+            if (acc) best = pos;
+            const acc_bit: u8 = if (acc) rev_accept else 0;
+            const prev = re.revStep(r.keys[s], r.ctxs[s], here.cp.?);
+            if (prev[0] == 0 and prev[1] == 0) {
+                d.revCache(s, c, key, 1 | acc_bit);
+                return best;
+            }
+            var cache = true;
+            const ps = r.find(prev, ctx) orelse blk: {
+                if (r.n == RevDfa.max_states) {
+                    d.revFlush();
+                    cache = false;
+                }
+                break :blk r.add(prev, ctx);
+            };
+            if (cache) d.revCache(s, c, key, (ps + 2) | acc_bit);
+            pos -= here.w;
+            s = ps;
+        }
+    }
+
+    /// Remember `rev`'s transition from `s` over the code point before the
+    /// position: `c` its last byte, `key` the code point past ASCII.
+    fn revCache(d: *FindDfa, s: u8, c: u8, key: u32, t: u8) void {
+        if (c < 0x80) d.rev.trans[s][c] = t else d.rev_wide[Wide.slot(key)] = .{ .key = key, .val = t };
+    }
+
+    /// `rev` is full: empty it, and what remembers its states.
+    fn revFlush(d: *FindDfa) void {
+        d.rev.n = 0;
+        d.rev_wide = @splat(.empty);
+    }
+
+    /// In `rev`'s transitions (which `runRevDfa` encodes without it, up to
+    /// `RevDfa.max_states + 1`): the start reaches the state's set after `c`.
+    const rev_accept: u8 = 0x80;
+    comptime {
+        std.debug.assert(RevDfa.max_states + 2 < rev_accept);
+    }
+
+    /// `Regex.revAccepts` with the cached answer inline, and the class of
+    /// the code point before the position already worked out.
+    inline fn revAccepts(d: *FindDfa, re: *const Regex, s: u8, ctx: Dfa.Ctx) bool {
+        const a = d.rev.accepts[s][@backingInt(ctx)];
+        if (a != .unknown) return a == .yes;
+        return re.revAccepts(&d.rev, s, ctx.rep());
     }
 
     fn deinit(d: *FindDfa) void {
@@ -810,35 +941,75 @@ const FindDfa = struct {
     /// anchored program (`anchored`: no thread starts later).
     fn run(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, anchored: bool) std.mem.Allocator.Error!?usize {
         const seed = [1]u16{0};
-        var s = (try d.intern(if (anchored) &seed else &.{}, d.ctxOf(runeBefore(input, from)), !anchored)).id;
+        var s = (try d.intern(if (anchored) &seed else &.{}, d.ctxBefore(input, from), !anchored)).id;
         var end: ?usize = null;
         var pos = from;
+        const pf = &re.prefilter;
         while (true) {
             const st = d.states.items[s];
-            if (st.len == 0 and !st.restart) return end; // no thread left
-            if (pos == input.len) {
+            if (st.len == 0) {
+                if (!st.restart) return end; // no thread left
+                if (pf.first != null) {
+                    // No thread alive, none matched yet: jump to where one can start.
+                    pos = pf.next(input, pos) orelse return null;
+                    s = try d.idleAt(input, pos);
+                }
+            }
+            // Cached ASCII transitions until one leads to a state with no
+            // thread (bit 1): that one is looked at above.
+            while (pos < input.len) {
+                const c = input[pos];
+                if (c >= 0x80) break;
+                const t = d.trans.items[s][c];
+                if (t == 0) break;
+                if (t & 1 != 0) end = pos;
+                s = (t >> 2) - 1;
+                pos += 1;
+                if (t & 2 != 0) break;
+            } else {
                 if (d.accepts(re, s)) end = pos;
                 return end;
             }
+            if (pos == input.len) continue; // stopped at a state with no thread
             const c = input[pos];
-            if (c < 0x80) {
-                const t = d.trans.items[s][c];
-                if (t != 0) {
-                    if (t & 1 != 0) end = pos;
-                    s = (t >> 1) - 1;
-                    pos += 1;
+            if (c < 0x80 and d.trans.items[s][c] != 0) continue; // the same
+            const here = decode(input, pos);
+            const key = Wide.keyOf(s, here.cp.?);
+            if (c >= 0x80) {
+                const w = d.wide[Wide.slot(key)];
+                if (w.key == key) {
+                    if (w.val & 1 != 0) end = pos;
+                    s = (w.val >> 2) - 1;
+                    pos += here.w;
                     continue;
                 }
             }
-            const here = decode(input, pos);
+            const restart = d.states.items[s].restart;
             var next: [Dfa.max_insts]u16 = undefined;
             const r = d.step(re, s, here.cp.?, &next);
             if (r.matched) end = pos;
-            const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), st.restart and !r.matched);
-            if (c < 0x80 and !ns.flushed) d.trans.items[s][c] = (@as(u16, ns.id) + 1) << 1 | @intFromBool(r.matched);
+            const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), restart and !r.matched);
+            if (!ns.flushed) {
+                const t = (@as(u16, ns.id) + 1) << 2 | @as(u16, @intFromBool(r.n == 0)) << 1 | @intFromBool(r.matched);
+                if (c < 0x80) d.trans.items[s][c] = t else d.wide[Wide.slot(key)] = .{ .key = key, .val = t };
+            }
             s = ns.id;
             pos += here.w;
         }
+    }
+
+    /// The state with no thread and a start pending at `pos`, one per
+    /// context, remembered (the prefilter lands there once per match).
+    fn idleAt(d: *FindDfa, input: []const u8, pos: usize) std.mem.Allocator.Error!u16 {
+        const ctx = d.ctxBefore(input, pos);
+        const slot = &d.idle[@backingInt(ctx)];
+        if (slot.* == 0) slot.* = (try d.intern(&.{}, ctx, true)).id + 1;
+        return slot.* - 1;
+    }
+
+    /// `ctxOf` the code point before `pos`, decoded only when it matters.
+    fn ctxBefore(d: *const FindDfa, input: []const u8, pos: usize) Dfa.Ctx {
+        return if (d.asserts) .of(runeBefore(input, pos)) else .other;
     }
 
     fn ctxOf(d: *const FindDfa, cp: ?u21) Dfa.Ctx {
@@ -944,6 +1115,8 @@ const FindDfa = struct {
             d.trans.clearRetainingCapacity();
             d.pcs.clearRetainingCapacity();
             d.table = @splat(0);
+            d.idle = @splat(0);
+            d.wide = @splat(.empty);
             d.flushes += 1;
             flushed = true;
             i = hash(list, ctx, restart) & mask;
@@ -1449,29 +1622,34 @@ pub const Matcher = struct {
     /// `from` still counts for `^`/`\b`), or null.
     pub fn find(m: *Matcher, input: []const u8, from: usize) ?Span {
         if (from > input.len) return null;
-        if (m.findEnd(input, from)) |end| {
-            m.best[0] = from;
-            m.best[1] = end orelse return null;
-            return .{ .start = from, .end = m.best[1] };
+        if (m.findDfa(input, from)) |found| {
+            const span = found orelse return null;
+            m.best[0] = span.start;
+            m.best[1] = span.end;
+            return span;
         }
         if (!m.run(input, from, false)) return null;
         return .{ .start = m.best[0], .end = m.best[1] };
     }
 
-    /// `find` by the DFA (`FindDfa`): the match's end, none, or null when
-    /// the DFA does not apply (the start must be known: an anchored
-    /// program) or cannot get its memory.
-    fn findEnd(m: *Matcher, input: []const u8, from: usize) ??usize {
+    /// `find` by the DFAs (`FindDfa`): the match, none, or null when the
+    /// DFA does not apply or cannot get its memory.
+    fn findDfa(m: *Matcher, input: []const u8, from: usize) ??Span {
         const re = m.re;
-        if (m.pike_only or re.longest or !re.prefilter.anchored or re.insts.len > Dfa.max_insts) return null;
-        if (from != 0) return @as(?usize, null); // `\A` holds at 0 only
+        if (m.pike_only or re.longest or re.insts.len > Dfa.max_insts) return null;
+        const anchored = re.prefilter.anchored;
+        if (anchored and from != 0) return @as(?Span, null); // `\A` holds at 0 only
+        // Inside a UTF-8 sequence the VMs read from `from` on, byte by byte;
+        // `start`, reading backwards, would read the whole sequence.
+        if (!anchored and from < input.len and input[from] & 0xc0 == 0x80) return null;
         const d = m.dfa orelse blk: {
             const d = m.gpa.create(FindDfa) catch return null;
             d.* = .init(m.gpa, re);
             m.dfa = d;
             break :blk d;
         };
-        return d.run(re, input, from, true) catch null;
+        const end = (d.run(re, input, from, anchored) catch return null) orelse return @as(?Span, null);
+        return .{ .start = if (anchored) from else d.start(re, input, from, end), .end = end };
     }
 
     /// Like `find`, filling `out[i]` with group i's span (null: the group
@@ -2260,6 +2438,58 @@ test "find's DFA (anchored programs) agrees with the Pike VM, across calls and p
             try testing.expectEqual(pm.find(&long, 0), m.find(&long, 0));
             try testing.expect(m.dfa.?.flushes > 0);
         }
+    }
+}
+
+test "find's DFAs (unanchored: forward for the end, backward for the start) agree with the Pike VM" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x7266);
+    const rng = prng.random();
+    const patterns = [_][]const u8{
+        "[a-z]+",            "\\p{L}+",   "\\b\\w+\\b",
+        "(?i)éa\\w*",
+        "a(b|bc)d?",         "c|ab|b",    "(a|b)*a(a|b){6}",
+        "[ab]{2,9}?c",
+        "\\B.é",
+        "(?m)^\\w+$",        "x*",        ".",
+        "é+|a+",
+        "(?:ab|a)(?:c|bcd)", "[^ \\n]+ ", "d\\z",
+        "(?s).{3}\\n",
+    };
+    const text = try gpa.alloc(u8, 3000);
+    defer gpa.free(text);
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        try testing.expect(!re.prefilter.anchored);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        for (0..20) |round| {
+            var n: usize = 0;
+            const len = if (round % 4 == 0) text.len - 4 else rng.uintLessThan(usize, 40);
+            while (n < len) {
+                const piece = ([_][]const u8{ "a", "b", "c", "d", " ", "\n", "é", "É", "_", "Ω" })[rng.uintLessThan(usize, 10)];
+                @memcpy(text[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            const t = text[0..n];
+            errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(t) });
+            var it = m.iterator(t);
+            var pit = pm.iterator(t);
+            while (true) {
+                const a = it.next();
+                try testing.expectEqual(pit.next(), a);
+                if (a == null) break;
+            }
+            var from: usize = 0;
+            while (from <= t.len) : (from += if (t.len > 64) 7 else 1) {
+                try testing.expectEqual(pm.find(t, from), m.find(t, from));
+            }
+        }
+        try testing.expect(m.dfa != null);
     }
 }
 
