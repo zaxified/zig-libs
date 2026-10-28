@@ -128,6 +128,9 @@ pub const Error = error{
     /// so it is refused here, before anything is framed. Same rule as
     /// `Client.Error.InvalidHeader` on the h1 side.
     InvalidHeader,
+    /// A buffered response body crossed `Options.max_response_body_bytes`;
+    /// the stream was reset (CANCEL). Other streams are unaffected.
+    BodyTooLarge,
     WriteFailed,
     OutOfMemory,
 };
@@ -153,6 +156,13 @@ pub const Options = struct {
     /// as it reaches h1. The slice is borrowed, not copied: it must outlive
     /// the session.
     user_agent: ?[]const u8 = null,
+    /// Cap on a body `awaitResponse` buffers: a stream whose body crosses it
+    /// is reset (CANCEL) and the call fails with `error.BodyTooLarge`. The
+    /// server decides the size and §6.9 credit is returned as the body is
+    /// consumed, so without a cap a hostile or broken server grows the
+    /// buffer until OOM. null = unlimited. `readBody` streams and is not
+    /// subject to it.
+    max_response_body_bytes: ?u64 = 64 << 20,
 };
 
 /// The request *head* — everything `openStream` needs. `RequestOptions`
@@ -317,6 +327,8 @@ pub const Session = struct {
     /// `Options.user_agent`, borrowed: the default `user-agent` for every
     /// request this session opens.
     user_agent: ?[]const u8 = null,
+    /// `Options.max_response_body_bytes`.
+    max_response_body_bytes: ?u64 = null,
 
     pub const Goaway = struct { last_stream_id: u31, code: h2.ErrorCode };
 
@@ -335,6 +347,7 @@ pub const Session = struct {
                 .max_unproductive_frames = options.max_unproductive_frames,
             }),
             .user_agent = options.user_agent,
+            .max_response_body_bytes = options.max_response_body_bytes,
         };
         errdefer s.deinit();
         try s.conn.sendPreface(&s.wire);
@@ -464,6 +477,9 @@ pub const Session = struct {
         const sid = s.conn.startStream(&s.wire, fields.items, end_stream) catch |err|
             switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                // The 31-bit id space is used up: like a GOAWAY, no new
+                // streams here, while the in-flight ones finish (§5.1.1).
+                error.StreamIdsExhausted => return error.GoawayReceived,
                 // A freshly opened client stream is always writable.
                 else => return s.fail(error.ProtocolError),
             };
@@ -617,7 +633,7 @@ pub const Session = struct {
         // 0 is reserved for "the body is complete", so an empty sink is a
         // caller bug rather than a very short read (same convention as
         // `h2.Connection.sendWindowUpdate`'s non-zero increment).
-        std.debug.assert(buf.len != 0);
+        if (buf.len == 0) @panic("http.h2_client.Session.readBody: buf must be non-empty");
         // A response is HEADERS-then-DATA (§8.1), so body octets are never
         // handed over before the head they belong to. That is free against a
         // conforming peer and load-bearing against one that is not: this
@@ -696,6 +712,12 @@ pub const Session = struct {
     /// simply consumes everything), then take ownership of the accumulated
     /// bytes and the trailers.
     pub fn awaitResponse(s: *Session, stream_id: u31) Error!Response {
+        return s.awaitResponseCapped(stream_id, s.max_response_body_bytes);
+    }
+
+    /// `awaitResponse` with this call's own body cap in place of
+    /// `Options.max_response_body_bytes` (null = unlimited).
+    pub fn awaitResponseCapped(s: *Session, stream_id: u31, max_body: ?u64) Error!Response {
         const head = try s.awaitHead(stream_id);
         const status = head.status;
         // Consume in place: the per-stream buffer *is* the accumulator, so
@@ -703,10 +725,19 @@ pub const Session = struct {
         // grants the window credit back.
         while (try s.waitBody(stream_id)) {
             const p = s.streams.getPtr(stream_id).?;
+            if (max_body) |cap| if (p.body.items.len > cap) {
+                s.cancel(stream_id, .cancel);
+                return error.BodyTooLarge;
+            };
             const n = p.unread().len;
             p.read_pos += n;
             s.grantConsumed(stream_id, n);
         }
+        // The last DATA (END_STREAM) lands without another loop turn.
+        if (max_body) |cap| if (s.streams.getPtr(stream_id).?.body.items.len > cap) {
+            s.release(stream_id);
+            return error.BodyTooLarge;
+        };
         var pending = s.streams.fetchOrderedRemove(stream_id).?.value;
         errdefer pending.deinit(s.gpa);
         const headers = pending.headers.?;
@@ -1359,6 +1390,48 @@ test "h2 client: response spanning many DATA frames replenishes flow control (of
     );
     // …and the staged WINDOW_UPDATEs landed in the transport.
     try testing.expect(out.buffered().len > 0);
+}
+
+test "h2 client: a buffered body over max_response_body_bytes is BodyTooLarge, the stream reset" {
+    // The server sizes the body and credit is returned on consumption, so the
+    // cap is the only bound on what `awaitResponse` buffers.
+    const gpa = testing.allocator;
+    const chunk = strRepeat("0123456789abcdef", 64); // 1024 B
+    for ([_]bool{ false, true }) |ends_in_one| {
+        var in: Reader = .fixed("");
+        var out_buf: [8192]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var s: Session = try .init(gpa, &in, &out, .{ .max_response_body_bytes = 4 * 1024 });
+        defer s.deinit();
+        const sid = try s.request(.get, "/big", .{ .authority = "t" });
+        var srv: ScriptedServer = try .init(out.buffered());
+        defer srv.deinit();
+        try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+        if (ends_in_one) {
+            // One frame, END_STREAM: crosses the cap with no loop turn left.
+            try srv.conn.sendData(&srv.wire, sid, chunk ++ chunk ++ chunk ++ chunk ++ chunk, true);
+        } else {
+            for (0..8) |i| try srv.conn.sendData(&srv.wire, sid, chunk, i == 7);
+        }
+        in = .fixed(srv.wire.items);
+        try testing.expectError(error.BodyTooLarge, s.awaitResponse(sid));
+        try testing.expectError(error.UnknownStream, s.awaitResponse(sid));
+    }
+    // A per-call cap overrides the session's.
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    const sid = try s.request(.get, "/big", .{ .authority = "t" });
+    var srv: ScriptedServer = try .init(out.buffered());
+    defer srv.deinit();
+    try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+    for (0..4) |i| try srv.conn.sendData(&srv.wire, sid, chunk, i == 3);
+    in = .fixed(srv.wire.items);
+    var res = try s.awaitResponseCapped(sid, 4 * 1024);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 4 * 1024), res.body.len);
 }
 
 // ── the incremental surface ─────────────────────────────────────────────────

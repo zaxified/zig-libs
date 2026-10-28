@@ -164,6 +164,7 @@ fn resolvePath(req_path: []const u8, location: []const u8, out: []u8, scratch: [
 /// before it, drop `..` at the start of a rooted path; `.` for an empty
 /// result. `out` must hold `in.len + 1` bytes.
 pub fn cleanPath(in: []const u8, out: []u8) []u8 {
+    if (out.len < in.len +| 1) @panic("http.cleanPath: out must hold in.len + 1 bytes");
     if (in.len == 0) {
         out[0] = '.';
         return out[0..1];

@@ -171,8 +171,8 @@ pub fn initCompress(
         for (fields, expected) |f, e| if (!std.mem.eql(u8, f, e))
             @compileError("gzip.initCompress: std's flate.Compress field '" ++ f ++ "' is new or moved; update the copy");
     }
-    std.debug.assert(output.buffer.len > 8);
-    std.debug.assert(buffer.len >= flate.max_window_len);
+    if (output.buffer.len <= 8) @panic("http.gzip.initCompress: output needs a buffer of more than 8 bytes");
+    if (buffer.len < flate.max_window_len) @panic("http.gzip.initCompress: buffer must hold flate.max_window_len");
     try output.writeAll(container.header());
     c.writer = .{ .buffer = buffer, .vtable = compress_vtable };
     c.history_len = 0;

@@ -411,14 +411,16 @@ pub const ProxyHandler = struct {
     config: Config,
 
     pub fn init(config: Config) ProxyHandler {
-        std.debug.assert((config.backend != null) != (config.selector != null));
+        if ((config.backend != null) == (config.selector != null))
+            @panic("http.proxy.ProxyHandler.init: set exactly one of backend and selector");
         return .{ .config = config };
     }
 
     /// `Server.Handler` entry point — recovers the `*ProxyHandler` from
     /// `Request.context` (set `Server.Options.context` to `&handler`).
     pub fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-        const self: *ProxyHandler = @ptrCast(@alignCast(req.context.?));
+        const ctx = req.context orelse @panic("http.proxy.ProxyHandler.handler: set Server.Options.context to &handler");
+        const self: *ProxyHandler = @ptrCast(@alignCast(ctx));
         return self.forward(req, rw);
     }
 
@@ -496,6 +498,10 @@ pub const ProxyHandler = struct {
         defer res.deinit();
 
         // ── relay status + response headers ─────────────────────────────
+        // The backend's three digits are not necessarily a status (000–099,
+        // 600–999): relaying one would hand the client a response it cannot
+        // classify. 1xx other than 101 never gets here (the client consumes it).
+        if (res.status != 101 and !finalStatus(res.status)) return self.relayFailed(rw, req);
         rw.setStatus(res.status);
         relayHead(rw, res.head) catch return self.relayFailed(rw, req);
         if (res.status == 101) return self.relayUpgrade(rw, req, &res, upgrade, &via_buf);
@@ -633,10 +639,13 @@ pub const ProxyHandler = struct {
             .scheme = if (backend.protocol == .h2) "https" else "http",
             .headers = pr.headers.slice(),
             .body = body_buf,
+            .max_response_body_bytes = self.config.h2_max_body_bytes,
         }) catch |err| return self.onH2Error(rw, req, err);
         defer res.deinit(gpa);
 
         // ── relay status + response headers ─────────────────────────────
+        // h2 has no 101 (RFC 9113 §8.6) and a final head is never 1xx.
+        if (!finalStatus(res.status)) return self.relayFailed(rw, req);
         rw.setStatus(res.status);
         for (res.headers.fields, 0..) |f, at| {
             if (f.name.len != 0 and f.name[0] == ':') continue; // pseudo-headers (:status)
@@ -661,6 +670,11 @@ pub const ProxyHandler = struct {
             else => 502, // Bad Gateway (dial/protocol/reset/goaway/…)
         };
         return self.fail(rw, req, err, status);
+    }
+
+    /// A final response status a client can classify (RFC 9110 §15).
+    fn finalStatus(status: u16) bool {
+        return status >= 200 and status <= 599;
     }
 
     fn pickBackend(self: *ProxyHandler, req: *Server.Request) ?Backend {

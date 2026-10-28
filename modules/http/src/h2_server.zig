@@ -225,18 +225,14 @@ pub const Options = struct {
     /// times `max_body_bytes` at once (150 MB at the shipped defaults of
     /// 100 streams × 1 MiB) — the connection-wide total is what actually
     /// matches an h1 connection's single-body-at-a-time memory shape for
-    /// the SAME configured number. null = unlimited — this struct is the
-    /// low-level, socket-free codec layer (parity with
-    /// `Server.StreamOptions`, which defaults the same field to null for
-    /// the same reason: a plain-codec/BYO-TLS caller composing this
-    /// directly should not be silently capped). A `Server`-owned h2c
-    /// connection (`Options.enable_h2c`) does NOT get this default — see
-    /// `Server.Options.max_body_bytes`'s doc: `connMain` forwards the
-    /// hardened `1 << 20` (or whatever the caller set) into this field, so
-    /// h1 and h2 are capped identically when driven through `Server`. Only
-    /// a caller invoking `serve`/`serveStream` here directly (BYO-TLS) sees
-    /// this null default.
-    max_body_bytes: ?u64 = null,
+    /// the SAME configured number. Defaults to `Server.Options`'
+    /// hardened `1 << 20`: unlike h1's `StreamOptions` (null default,
+    /// where the handler streams the body), a buffered h2 body is held in
+    /// memory, so an unlimited default let any peer of a BYO-TLS
+    /// `serve`/`serveStream` grow it until OOM (no-panic sweep 2026-10-28).
+    /// null = unlimited, an explicit choice. A `Server`-owned h2c connection
+    /// gets `Server.Options.max_body_bytes` forwarded by `connMain`.
+    max_body_bytes: ?u64 = 1 << 20,
     /// `ResponseWriter` body-buffer size (h1 parity; framing is re-derived
     /// here so it only affects gzip's buffered-vs-streaming decision).
     response_buffer_size: usize = 4 * 1024,
@@ -597,7 +593,7 @@ fn connOptions(opts: Options) h2.Connection.Options {
 
 /// Everything in a response head is held to RFC 9113 §8.2.1, and almost all of
 /// it is guaranteed before it gets here: header names and values reach the
-/// framer through `setHeader`, which rejects CR/LF/NUL at set time and is the
+/// framer through `setHeader`, which rejects CR/LF/NUL/control bytes at set time and is the
 /// only way into the table, and the rest are literals or generated (the date,
 /// the content-length digits).
 ///
@@ -1997,6 +1993,17 @@ const Session = struct {
             null;
         var chunk_buf: [64]u8 = undefined;
         const compression_on = s.opts.compression != null and s.opts.gzip_scratch != null;
+        const accept_gzip = compression_on and gzip.acceptsGzip(head.header("accept-encoding"));
+        // Dispatched handlers run concurrently on one connection, so the
+        // connection's one `gzip_scratch` would be shared between streams (a
+        // data race on the deflate state): each such stream that compresses
+        // gets its own from the stream's arena instead.
+        const gzip_scratch: ?*gzip.Scratch = if (!accept_gzip)
+            null
+        else if (s.opts.dispatcher != null)
+            arena.create(gzip.Scratch) catch return .close
+        else
+            s.opts.gzip_scratch;
         // The handler writes an ordinary HTTP/1.1 response, as it always
         // has — into the re-framer instead of into memory. Everything
         // `ResponseWriter` gives an h1 handler (gzip, ranges, conditional
@@ -2016,9 +2023,8 @@ const Session = struct {
             .date = date,
             .server_name = s.opts.server_name,
             .compression = if (compression_on) s.opts.compression else null,
-            .gzip_scratch = if (compression_on) s.opts.gzip_scratch else null,
-            .accept_gzip = compression_on and
-                gzip.acceptsGzip(head.header("accept-encoding")),
+            .gzip_scratch = gzip_scratch,
+            .accept_gzip = accept_gzip,
             .encoder_provider = if (compression_on and s.opts.encoder_provider != null) &s.opts.encoder_provider.? else null,
             .accept_encoding = head.header("accept-encoding"),
             // The head crosses as fields: it never becomes HTTP/1.1 text, and
@@ -2294,7 +2300,7 @@ const Framer = struct {
         //   * names: `setHeader` is the only way into the header table and
         //     rejects anything that is not a token; `ResponseWriter.lowerName`
         //     lowercases what it hands over. The rest are literals in this file.
-        //   * values: `setHeader` rejects CR/LF/NUL at set time, `checkedOptions`
+        //   * values: `setHeader` rejects CR/LF/NUL/control bytes at set time, `checkedOptions`
         //     holds `server_name` once per connection, and the others are
         //     generated here (the date, the content-length digits).
         //
@@ -4416,7 +4422,7 @@ test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
 // ── response trailers (RFC 9113 §8.1) ───────────────────────────────────────
 
 test "h2: a server_name that cannot go on the wire is dropped once, not sent and not fatal" {
-    // `setHeader` rejects CR/LF/NUL at set time and is the only way into the
+    // `setHeader` rejects CR/LF/NUL/control bytes at set time and is the only way into the
     // header table, so nothing a HANDLER sets can arrive malformed.
     // `server_name` comes straight from the caller and never goes through it --
     // and it used to be checked anyway, by accident, because the head was
@@ -4441,6 +4447,34 @@ test "h2: a server_name that cannot go on the wire is dropped once, not sent and
     // Neither the banner nor anything the CRLF could have framed out of it.
     try testing.expect(c.header("server") == null);
     try testing.expect(c.header("x-injected") == null);
+}
+
+fn reflectControlByteHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    // What a handler reflecting a decoded `?q=a%01b` / `%7f` would pass.
+    for ([_][]const u8{ "a\x01b", "a\x7fb", "\x1f" }) |v| {
+        try testing.expectError(error.InvalidHeader, rw.setHeader("X-Query", v));
+    }
+    try rw.setHeader("X-Query", "a\tb");
+    try rw.writeAll("ok");
+}
+
+test "h2: a control byte a handler reflects is refused by setHeader, not asserted on by the framer" {
+    // setHeader used to refuse only CR/LF/NUL, while the h2 framer asserts the
+    // full RFC 9110 §5.5 predicate: a reflected 0x01 panicked in ReleaseSafe.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = reflectControlByteHandler }, &out_buf);
+
+    const c = peer.resps.getPtr(sid) orelse return error.NoResponse;
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("a\tb", c.header("x-query").?);
+    try testing.expectEqualStrings("ok", c.body.items);
 }
 
 test "h2: an uppercase field name from the handler reaches the wire lowercased (§8.2.1)" {
@@ -6370,6 +6404,74 @@ test "dispatcher: concurrent responses keep the HPACK dynamic table coherent" {
         const val: []const u8 = &val_buf;
         try testing.expectEqualStrings(val, c.header(name) orelse return error.HeaderLost);
         try testing.expectEqualStrings(val[0..8], c.body.items);
+    }
+}
+
+const GzipProbe = struct {
+    io: std.Io,
+    arrived: std.atomic.Value(u32) = .init(0),
+    const half = 4096;
+
+    /// Every stream compresses at once: half its body, a rendezvous with all
+    /// the others mid-body, then the rest. One deflate state shared between
+    /// them would interleave and the peer could not inflate the bodies.
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *GzipProbe = @ptrCast(@alignCast(req.context.?));
+        var buf: [half]u8 = undefined;
+        @memset(&buf, req.path[req.path.len - 1]);
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.writeAll(&buf);
+        try rw.flush();
+        _ = p.arrived.fetchAdd(1, .acq_rel);
+        try awaitCount(p.io, &p.arrived, table_streams);
+        try rw.writeAll(&buf);
+    }
+};
+
+test "dispatcher: concurrent gzip responses each get their own deflate state" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    var sids: [table_streams]u31 = undefined;
+    var paths: [table_streams][4]u8 = undefined;
+    for (&sids, &paths, 0..) |*sid, *path, i| {
+        path.* = .{ '/', 'g', 'z', @intCast('a' + i) };
+        const fields = fieldsFor("GET", path) ++ [_]hpack.Field{.{ .name = "accept-encoding", .value = "gzip" }};
+        sid.* = try peer.conn.startStream(&peer.wire, &fields, true);
+    }
+
+    const scratch = try gpa.create(gzip.Scratch);
+    defer gpa.destroy(scratch);
+    var probe: GzipProbe = .{ .io = io };
+    var pd = try PoolDispatcher.init(gpa, io, table_streams, table_streams);
+    defer pd.deinit();
+
+    const out_buf = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(out_buf);
+    try runOffline(&peer, .{
+        .handler = GzipProbe.handler,
+        .context = &probe,
+        .dispatcher = pd.iface(table_streams),
+        .compression = .{ .min_size = 1 },
+        .gzip_scratch = scratch,
+    }, out_buf);
+
+    for (sids, 0..) |sid, i| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        try testing.expectEqualStrings("gzip", c.header("content-encoding") orelse return error.NotCompressed);
+        var in: std.Io.Reader = .fixed(c.body.items);
+        var window: [std.compress.flate.max_window_len]u8 = undefined;
+        var d: std.compress.flate.Decompress = .init(&in, .gzip, &window);
+        const plain = try d.reader.allocRemaining(gpa, .limited(4 * GzipProbe.half));
+        defer gpa.free(plain);
+        try testing.expectEqual(@as(usize, 2 * GzipProbe.half), plain.len);
+        for (plain) |ch| try testing.expectEqual(@as(u8, @intCast('a' + i)), ch);
     }
 }
 

@@ -63,7 +63,7 @@ pub const BufferPool = struct {
     /// `max_idle_slabs` bounds how many freed slabs are retained for reuse
     /// (0 disables retention — every release frees, every acquire allocs).
     pub fn init(gpa: Allocator, slab_size: usize, max_idle_slabs: usize) BufferPool {
-        std.debug.assert(slab_size != 0);
+        if (slab_size == 0) @panic("http.BufferPool.init: slab_size must be > 0");
         return .{ .gpa = gpa, .slab_size = slab_size, .max_idle_slabs = max_idle_slabs };
     }
 

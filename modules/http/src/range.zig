@@ -217,8 +217,10 @@ pub const ResolvedRange = struct {
     total: u64,
 
     /// Number of bytes in `[start, end]` (always ≥ 1 for a satisfiable range).
+    /// Saturating, so a hand-built range with `end < start` or `end = maxInt`
+    /// is not UB (`writeBody` still refuses one that `data` cannot back).
     pub fn len(self: ResolvedRange) u64 {
-        return self.end - self.start + 1;
+        return (self.end -| self.start) +| 1;
     }
 
     /// Write the `Content-Range` header VALUE for a satisfiable range —
@@ -465,19 +467,21 @@ pub const MultipartRanges = struct {
     /// `Content-Range` header lines + blank line + the range bytes + trailing
     /// CRLF, plus the closing delimiter.
     pub fn bodyLen(self: MultipartRanges, ranges: []const ResolvedRange) u64 {
+        // Saturating, like `applyBounded`'s sum: `ResolvedRange` is a pub
+        // struct, so its lengths are not bounded by any representation.
         var total: u64 = 0;
         for (ranges) |r| {
             // "--" boundary CRLF
-            total += 2 + self.boundary.len + 2;
+            total +|= 2 + self.boundary.len + 2;
             // "Content-Type: " content_type CRLF
-            total += 14 + self.content_type.len + 2;
+            total +|= 14 + self.content_type.len + 2;
             // "Content-Range: " "bytes s-e/total" CRLF
-            total += 15 + contentRangeValueLen(r) + 2;
+            total +|= 15 + contentRangeValueLen(r) + 2;
             // blank CRLF, the range bytes, trailing CRLF
-            total += 2 + r.len() + 2;
+            total +|= 4 +| r.len();
         }
         // "--" boundary "--" CRLF
-        total += 2 + self.boundary.len + 2 + 2;
+        total +|= 2 + self.boundary.len + 2 + 2;
         return total;
     }
 
@@ -522,7 +526,7 @@ pub const MultipartRanges = struct {
         // succeed-fully-or-write-nothing contract, not a partial multipart
         // body followed by an error mid-stream.
         for (ranges) |r| {
-            if (r.end >= data.len) return error.RangeOutOfBounds;
+            if (r.end >= data.len or r.start > r.end) return error.RangeOutOfBounds;
         }
         for (ranges) |r| {
             try self.writePartHeader(w, r);

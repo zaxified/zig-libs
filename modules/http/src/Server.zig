@@ -263,10 +263,17 @@ pub const PooledBuffers = struct {
     /// keep-alive wait outside `serveStep` gets those frame pages back for
     /// free between requests; a slab carries them forever.
     pub fn slabSize(l: PooledBuffers) usize {
-        return l.head_len + l.request_body_len + l.response_body_len + l.chunk_len + l.trailers_len;
+        var total: usize = 0;
+        for ([_]usize{ l.head_len, l.request_body_len, l.response_body_len, l.chunk_len, l.trailers_len }) |n| {
+            total = std.math.add(usize, total, n) catch @panic("http.PooledBuffers: buffer lengths overflow usize");
+        }
+        return total;
     }
 
+    /// Panics (checked) when `pool` serves slabs of another size than
+    /// `slabSize()`: every lent buffer would be sliced out of bounds.
     pub fn provider(self: *PooledBuffers) BuffersProvider {
+        if (self.pool.slab_size != self.slabSize()) @panic("http.PooledBuffers: pool.slab_size != slabSize()");
         return .{ .ctx = self, .acquire = acquireFn, .release = releaseFn };
     }
 
@@ -697,7 +704,12 @@ pub const H2Task = h2s.Task;
 
 /// `io` must support the net + concurrency vtable operations (e.g.
 /// `std.Io.Threaded`). The allocator provides per-connection buffers.
+/// Panics (checked, every build mode) on an `options` no connection could be
+/// served with: a zero `read_buffer_size` (std's reader cannot peek through an
+/// empty buffer) or buffer sizes whose per-connection sum overflows `usize`.
 pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Server {
+    if (options.read_buffer_size == 0) @panic("http.Server.init: Options.read_buffer_size must be > 0");
+    _ = slabSize(&options) orelse @panic("http.Server.init: Options buffer sizes overflow usize");
     return .{
         .io = io,
         .gpa = gpa,
@@ -862,7 +874,7 @@ pub const BindError = error{ BadAddress, ListenFailed, Canceled };
 /// reason: `std.Io.net` reports an `anyerror` here, not an errno, so there
 /// is no numeric code to carry.
 pub fn bind(s: *Server) BindError!void {
-    std.debug.assert(s.listener == null);
+    if (s.listener != null) @panic("http.Server.bind: already bound");
     s.last_bind_error = null;
     const n = @max(1, s.options.accept_threads);
     // The multicore engine needs SO_REUSEPORT on every listener; the kernel
@@ -968,7 +980,7 @@ test "bind: BadAddress carries the underlying parse-error name" {
 /// The address actually bound, with the resolved port — for ephemeral-port
 /// (port 0) setups. Valid after `bind`.
 pub fn boundAddress(s: *const Server) net.IpAddress {
-    return s.listener.?.socket.address;
+    return (s.listener orelse @panic("http.Server.boundAddress: call bind first")).socket.address;
 }
 
 pub const ServeError = error{ AcceptFailed, Canceled };
@@ -979,6 +991,7 @@ pub const ServeError = error{ AcceptFailed, Canceled };
 /// `Options.accept_threads` > 1 this fans the accept work out across N
 /// core-pinned threads (see `serveMulti`).
 pub fn serve(s: *Server) ServeError!void {
+    if (s.listener == null) @panic("http.Server.serve: call bind first");
     // The timeouts' enforcer outlives every connection: the groups are
     // awaited before this defer cancels it. An `Io` with no concurrency to
     // give runs no reaper, and then no timeout applies.
@@ -1116,6 +1129,7 @@ fn pinToCpu(cpu: usize) void {
     const target = cpu % ncpu;
     var set = std.mem.zeroes(std.os.linux.cpu_set_t);
     const bits = @bitSizeOf(usize);
+    if (target / bits >= set.len) return; // beyond cpu_set_t's 1024 CPUs: leave unpinned
     set[target / bits] |= @as(usize, 1) << @intCast(target % bits);
     std.os.linux.sched_setaffinity(0, &set) catch {};
 }
@@ -1231,8 +1245,18 @@ pub fn pathHasDotSegments(path: []const u8) bool {
 /// `removeDotSegments` clamps at root (a leading `..` is dropped, never
 /// escapes). Returns the normalized path, a prefix of `buf`.
 pub fn normalizePathInto(buf: []u8, path: []const u8) []const u8 {
+    if (buf.len < path.len) @panic("http.normalizePathInto: buf shorter than path");
     @memcpy(buf[0..path.len], path);
     return buf[0..http.removeDotSegments(buf[0..path.len])];
+}
+
+/// The per-connection slab `connMain` allocates, or null on `usize` overflow.
+fn slabSize(o: *const Options) ?usize {
+    var total: usize = body_scratch_len + chunk_scratch_len + trailer_scratch_len;
+    for ([_]usize{ o.read_buffer_size, o.write_buffer_size, o.max_header_bytes, o.response_buffer_size }) |n| {
+        total = std.math.add(usize, total, n) catch return null;
+    }
+    return total;
 }
 
 fn connMain(s: *Server, stream: net.Stream) void {
@@ -1266,8 +1290,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
     };
 
     const o = &s.options;
-    const total = o.read_buffer_size + o.write_buffer_size + o.max_header_bytes +
-        o.response_buffer_size + body_scratch_len + chunk_scratch_len + trailer_scratch_len;
+    const total = slabSize(o) orelse return; // refused by `init`; `options` is a pub field
     const slab = s.gpa.alloc(u8, total) catch return; // overloaded: drop the connection
     defer s.gpa.free(slab);
 
@@ -2033,11 +2056,12 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
         //
         // Any failure here -- client hung up between requests, idle timeout
         // -- is a quiet close, as it was when `serveOne` owned this line.
+        checkStreamReader(in);
         _ = in.peekByte() catch break;
         if (opts.control) |c| if (!c.leaveIdle()) break;
 
         if (serveStep(opts, in, out, bufs, req_index) == .close) break;
-        req_index += 1;
+        req_index +|= 1; // saturating: an uncapped connection may outlive 2^32 requests
         fireConnState(&opts, .idle);
     }
     fireConnState(&opts, .closed);
@@ -2060,7 +2084,7 @@ fn serveLoop(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers
 /// while (true) {
 ///     _ = reader.peekByte() catch break;       // park HERE, shallow
 ///     if (http.Server.serveStep(opts, reader, writer, bufs, req_index) == .close) break;
-///     req_index += 1;
+///     req_index +|= 1;
 /// }
 /// ```
 ///
@@ -2075,7 +2099,7 @@ pub fn serveStep(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuf
     // Per-connection request cap: when this request reaches the limit its
     // response is forced to `Connection: close` and the connection ends.
     const cap = opts.max_requests_per_conn;
-    const force_close = cap != 0 and req_index + 1 >= cap;
+    const force_close = cap != 0 and req_index +| 1 >= cap;
 
     // Borrowed for this request and given back after it. The pair brackets
     // exactly the time a request is being served.
@@ -2143,7 +2167,24 @@ const frame_probe = struct {
     }
 };
 
+/// Caller-contract check for the BYO entry points (`serveStream`/`serveStep`,
+/// or what a `buffers_provider` lends): a checked panic in every build mode
+/// instead of the std asserts these buffers would otherwise reach.
+fn checkStreamArgs(opts: StreamOptions, in: *const Reader, bufs: StreamBuffers) void {
+    checkStreamReader(in);
+    if (bufs.request_body.len == 0) @panic("http.serveStream: StreamBuffers.request_body must be non-empty");
+    if (bufs.chunk.len == 0) @panic("http.serveStream: StreamBuffers.chunk must be non-empty");
+    if (opts.compression != null and bufs.gzip != null and bufs.chunk.len < 9)
+        @panic("http.serveStream: StreamBuffers.chunk must be >= 9 bytes with compression");
+}
+
+fn checkStreamReader(in: *const Reader) void {
+    if (in.buffer.len == 0 and in.vtable.rebase == &Reader.defaultRebase)
+        @panic("http.serveStream: `in` needs a non-empty buffer");
+}
+
 fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers, req_index: u32, force_close: bool) ConnDisposition {
+    checkStreamArgs(opts, in, bufs);
     // The wait for this request already happened in `serveLoop`, above the
     // point where working memory is borrowed. See the comment there.
 
@@ -3385,7 +3426,8 @@ pub const ResponseWriter = struct {
     /// second ResponseWriter, 16,400 -> 22,592 B (measured in ReleaseSafe
     /// once the lazy `100 Continue` state was added).
     pub fn initAt(rw: *ResponseWriter, out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) void {
-        std.debug.assert(!opts.accept_gzip or opts.gzip_scratch != null);
+        if (opts.accept_gzip and opts.gzip_scratch == null)
+            @panic("http.ResponseWriter.init: accept_gzip needs gzip_scratch");
         rw.* = .{
             .out = out,
             .chunk_buf = chunk_buf,
@@ -3429,9 +3471,10 @@ pub const ResponseWriter = struct {
     /// header table, so a rejected header can never reach `writeHead` and
     /// thus never the wire; no separate write-time scrub is needed. The
     /// `name` must be a non-empty RFC 9110 token (tchar only); the `value`
-    /// must not contain CR, LF or NUL (the bytes that would inject a header
-    /// or split the response when a handler reflects user input into a
-    /// Location/Set-Cookie/filename header). Both fail with `InvalidHeader`.
+    /// must hold RFC 9110 §5.5 field-value bytes only — no CR, LF, NUL or other
+    /// control byte (CR/LF/NUL would inject a header or split the response when
+    /// a handler reflects user input into a Location/Set-Cookie/filename header;
+    /// any control byte is invalid on h2). Both fail with `InvalidHeader`.
     pub fn setHeader(rw: *ResponseWriter, name: []const u8, value: []const u8) SetHeaderError!void {
         if (rw.sent_head) return error.HeadersSent;
         if (!validHeaderName(name) or !validHeaderValue(value)) return error.InvalidHeader;
@@ -3510,7 +3553,7 @@ pub const ResponseWriter = struct {
             if (!validHeaderName(name))
                 @compileError("setHeaderStatic: header name is not an RFC 9110 token: \"" ++ name ++ "\"");
             if (!validHeaderValue(value))
-                @compileError("setHeaderStatic: header value contains CR/LF/NUL: \"" ++ name ++ "\"");
+                @compileError("setHeaderStatic: header value contains a CR/LF/NUL/control byte: \"" ++ name ++ "\"");
             for ([_][]const u8{ "content-length", "transfer-encoding", "trailer", "connection" }) |managed| {
                 if (std.ascii.eqlIgnoreCase(name, managed))
                     @compileError("setHeaderStatic: \"" ++ name ++ "\" is a managed header — use setHeader");
@@ -3519,8 +3562,8 @@ pub const ResponseWriter = struct {
         return rw.storeHeader(name, value);
     }
 
-    /// A header value checked once (no CR, LF or NUL, as `setHeader`
-    /// checks), to be lent to many responses through `setHeaderBorrowed`.
+    /// A header value checked once (no CR, LF, NUL or control byte,
+    /// as `setHeader` checks), to be lent to many responses through `setHeaderBorrowed`.
     pub const HeaderValue = struct {
         bytes: []const u8,
 
@@ -3611,7 +3654,7 @@ pub const ResponseWriter = struct {
     /// replace-by-name semantics cannot express (only the last would
     /// survive). Each call adds another line; `writeHead` emits every one on
     /// its own `Set-Cookie:` line, in call order. The value gets the same
-    /// response-splitting validation `setHeader` applies (no CR/LF/NUL —
+    /// response-splitting validation `setHeader` applies (no CR/LF/NUL/control byte —
     /// `error.InvalidHeader` otherwise); the name is fixed, so it is always a
     /// valid token. Counts against the same `max_response_headers` budget
     /// (`error.TooManyHeaders`) and is likewise rejected once the head is on
@@ -3746,7 +3789,7 @@ pub const ResponseWriter = struct {
         /// longer be added (`declareTrailers` only).
         HeadersSent,
         /// Not a valid field name (RFC 9110 token), or the value carries
-        /// CR/LF/NUL.
+        /// a CR/LF/NUL/control byte.
         InvalidHeader,
         /// The field is never legal in a trailer section — see
         /// `forbiddenTrailerName` for the list and the reasoning.
@@ -4329,7 +4372,10 @@ pub const ResponseWriter = struct {
             // After the body is in place: `begin` keeps a pointer to the
             // chunked writer.
             rw.body.encoded.plain = enc.begin(enc.ctx, &rw.body.encoded.chunked.writer, plain_len) catch |e| {
+                // `plain` was never set: a handler that swallows this error
+                // and still calls `end` must not drain through it.
                 rw.failed = true;
+                rw.body = .discard;
                 return e;
             };
             return;
@@ -4346,10 +4392,14 @@ pub const ResponseWriter = struct {
         // Emits the 10-byte gzip header — it lands in the chunked encoder's
         // buffer, safely after the response head. The chunked writer must
         // be at its final address by now (the encoder keeps a pointer to it).
-        rw.body.encoded.plain = try scratch.begin(
+        rw.body.encoded.plain = scratch.begin(
             &rw.body.encoded.chunked.writer,
             rw.compression.?.level,
-        );
+        ) catch |e| {
+            rw.failed = true;
+            rw.body = .discard; // as above: `plain` and the deflate state were never set
+            return e;
+        };
     }
 
     /// Terminate a compressed body: enforce a declared length, flush the
@@ -4385,7 +4435,7 @@ pub const ResponseWriter = struct {
     /// that are already lowercase may be literals in read-only memory.
     ///
     /// ⭐ **Values are not re-validated here.** `setHeader` is the single
-    /// mutation path for the header table and rejects CR/LF/NUL at set time, so
+    /// mutation path for the header table and rejects CR/LF/NUL/control bytes at set time, so
     /// nothing a handler set can reach a sink malformed. Fields this writer adds
     /// itself (`server_name` from the caller's options) do not pass through it,
     /// which is why the h2 sink checks them (see `sinkPut`).
@@ -4645,21 +4695,13 @@ fn validHeaderName(name: []const u8) bool {
     return h1.isToken(name);
 }
 
-/// A safe response header value: no CR, LF or NUL (RFC 9110 §5.5 — the
-/// bytes a reflected value would use to inject headers or split the
-/// response). Everything else (including obs-text) is passed through.
+/// A valid response header value: RFC 9110 §5.5 field-value bytes only
+/// (VCHAR / obs-text / SP / HTAB) — the same predicate as the inbound parser
+/// and the h2 framer. Refusing only CR/LF/NUL here let a reflected `%01` or
+/// DEL through `setHeader` on h1 and into the h2 framer's assert (panic in
+/// ReleaseSafe, an RFC 9113 §8.2.1-invalid field in ReleaseFast).
 fn validHeaderValue(value: []const u8) bool {
-    // 16 bytes at a time, then the tail (a byte loop was a per-request cost
-    // for every fixed header a middleware sets, 2026-10-25).
-    const V = @Vector(16, u8);
-    var i: usize = 0;
-    while (i + 16 <= value.len) : (i += 16) {
-        const v: V = value[i..][0..16].*;
-        const bad = (v == @as(V, @splat('\r'))) | (v == @as(V, @splat('\n'))) | (v == @as(V, @splat(0)));
-        if (@reduce(.Or, bad)) return false;
-    }
-    for (value[i..]) |c| if (c == '\r' or c == '\n' or c == 0) return false;
-    return true;
+    return h1.isValidFieldValue(value);
 }
 
 /// Fields that must never appear in a **trailer section** (RFC 9110 §6.5.1,
@@ -5897,14 +5939,14 @@ test "ResponseWriter: setHeaderBorrowed — HeaderValue checked once, lent not c
     try testing.expectError(error.HeadersSent, rw.setHeaderBorrowed("X-Late", v));
 }
 
-test "validHeaderValue / HeaderValue.init: CR, LF and NUL refused at every position and length 0..40" {
+test "validHeaderValue / HeaderValue.init: CR, LF, NUL and control bytes refused at every position and length 0..40" {
     // The 16-byte vector chunks and the byte tail both see every bad byte.
     var buf: [40]u8 = undefined;
     for (0..buf.len + 1) |len| {
         @memset(buf[0..len], 'a');
         try testing.expect(validHeaderValue(buf[0..len]));
         for (0..len) |at| {
-            for ("\r\n\x00") |bad| {
+            for ("\r\n\x00\x01\x1f\x7f") |bad| {
                 buf[at] = bad;
                 try testing.expect(!validHeaderValue(buf[0..len]));
                 try testing.expectError(error.InvalidHeader, ResponseWriter.HeaderValue.init(buf[0..len]));

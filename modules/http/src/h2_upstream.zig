@@ -115,6 +115,9 @@ pub const RequestParts = struct {
     headers: []const http.Header = &.{},
     /// In-memory request body; null/empty → END_STREAM on HEADERS.
     body: ?[]const u8 = null,
+    /// Cap on the buffered response body (`error.BodyTooLarge` over it);
+    /// null = the session's `h2_client.Options.max_response_body_bytes`.
+    max_response_body_bytes: ?u64 = null,
 };
 
 /// Custom dial seam (bring-your-own-TLS). Return a NEW `*Client.H2Session`
@@ -193,6 +196,7 @@ pub const Call = struct {
     entry: *Entry,
     shared: *Shared,
     sid: u31,
+    max_body: ?u64,
 };
 
 pub const Pool = struct {
@@ -270,7 +274,7 @@ pub const Pool = struct {
                 return err2;
             };
         };
-        return .{ .entry = p.entryFor(backend).?, .shared = shared, .sid = sid };
+        return .{ .entry = p.entryFor(backend).?, .shared = shared, .sid = sid, .max_body = parts.max_response_body_bytes };
     }
 
     /// Collect the response for a `Call` (blocks, pumping the shared
@@ -281,7 +285,7 @@ pub const Pool = struct {
         const shared = call.shared;
         const pio = p.io();
         shared.mutex.lockUncancelable(pio);
-        const res = shared.hs.awaitResponse(call.sid);
+        const res = shared.hs.session.awaitResponseCapped(call.sid, call.max_body orelse shared.hs.session.max_response_body_bytes);
         // A connection-scoped death (or a latched GOAWAY) retires the session
         // so the next request re-dials; a lone stream reset does not.
         const broken = shared.hs.session.broken != null or shared.hs.session.goaway != null;

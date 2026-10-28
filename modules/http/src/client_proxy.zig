@@ -128,11 +128,16 @@ pub const Endpoint = struct {
     /// The `Proxy-Authorization` field line, CRLF included, or nothing
     /// without credentials. Go's form: `Basic base64(user ":" password)`,
     /// both percent-decoded, the colon there even with no password.
+    /// An `Endpoint` not produced by `parse` whose `userinfo` is malformed
+    /// (bad percent escape, or longer than the credential limit) panics
+    /// with a message.
     pub fn writeAuthorization(ep: Endpoint, w: *std.Io.Writer) std.Io.Writer.Error!void {
         const userinfo = ep.userinfo orelse return;
         var plain: [max_credentials + 1]u8 = undefined;
         defer std.crypto.secureZero(u8, &plain);
-        const decoded = decodeCredentials(userinfo, plain[0..max_credentials]) catch unreachable; // checked by `parse`
+        // `parse` validated this; a hand-built Endpoint may not have been.
+        const decoded = decodeCredentials(userinfo, plain[0..max_credentials]) catch
+            @panic("http.client_proxy.Endpoint.writeAuthorization: malformed userinfo (not built by parse)");
         var n = decoded.len;
         if (std.mem.findScalar(u8, userinfo, ':') == null) {
             plain[n] = ':';

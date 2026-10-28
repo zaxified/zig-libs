@@ -1149,7 +1149,7 @@ pub const ChunkedWriter = struct {
     payload_len: u64 = 0,
 
     pub fn init(out: *Writer, buffer: []u8) ChunkedWriter {
-        std.debug.assert(buffer.len > 0);
+        if (buffer.len == 0) @panic("http.h1.ChunkedWriter.init: buffer must be non-empty");
         return .{
             .out = out,
             .writer = .{

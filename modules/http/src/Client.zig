@@ -187,6 +187,8 @@ pub const Options = struct {
     max_redirects: u8 = 10,
     tls: TlsOptions = .{},
     /// Plaintext read buffer; also bounds a single response head line.
+    /// Must be >= 1: `Client.init` panics with a message on 0 (std's
+    /// `Reader.fillMore`/`peekGreedy` assert a non-empty buffer).
     read_buffer_size: usize = 16 * 1024,
     /// Plaintext write buffer.
     write_buffer_size: usize = 4 * 1024,
@@ -383,7 +385,8 @@ pub const PoolOptions = struct {
     /// Idle connections kept across ALL origins combined. Default 64:
     /// bounds the client's total idle-FD/memory footprint when it talks to
     /// many distinct backends (a gateway in front of a large fleet), while
-    /// still comfortably covering the common "few backends" case.
+    /// still comfortably covering the common "few backends" case. Must be
+    /// <= 4096: `Client.init` panics with a message above that.
     max_idle_total: u16 = 64,
     /// An idle connection older than this is reaped — checked
     /// opportunistically whenever `acquire` scans the pool, and fully via
@@ -573,6 +576,9 @@ fn methodWire(method: http.Method, method_token: []const u8) []const u8 {
 /// `std.Io.Threaded`). The allocator is used for per-request connection
 /// buffers and the CA bundle.
 pub fn init(io: std.Io, gpa: std.mem.Allocator, options: Options) Client {
+    // Caller contract, checked in every build mode: std's buffered reader
+    // asserts a non-empty buffer (UB in release modes), so 0 never reaches it.
+    if (options.read_buffer_size == 0) @panic("http.Client.init: Options.read_buffer_size must be >= 1");
     return .{
         .io = io,
         .gpa = gpa,
@@ -1356,9 +1362,10 @@ pub const Upload = struct {
 
 /// Open a request whose body is streamed by the caller. `content_length`
 /// null selects chunked transfer-encoding. Redirects are NOT followed
-/// (a streamed body cannot be replayed); `options.body` must be null.
+/// (a streamed body cannot be replayed); `options.body` must be null (a
+/// non-null body panics with a message).
 pub fn requestStreaming(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
-    std.debug.assert(options.body == null);
+    if (options.body != null) @panic("http.Client.requestStreaming: options.body must be null");
     const url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
     try validateMethod(method, options.method_token);
@@ -1426,7 +1433,7 @@ fn writeUploadHead(c: *Client, conn: *Conn, method: http.Method, method_token: [
 /// checked before any dial. No redirect support either way (unchanged from
 /// `requestStreaming`): a streamed body cannot be replayed.
 pub fn requestStreamingPlain(c: *Client, method: http.Method, url_text: []const u8, options: RequestOptions, content_length: ?u64) Error!Upload {
-    std.debug.assert(options.body == null);
+    if (options.body != null) @panic("http.Client.requestStreamingPlain: options.body must be null");
     const url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
@@ -2156,6 +2163,7 @@ const h2glue = struct {
             error.WriteFailed => conn.writeFailure(),
             error.ProtocolError, error.MalformedResponse, error.UnknownStream, error.SendClosed => error.MalformedResponse,
             error.InvalidHeader => error.InvalidHeader,
+            error.BodyTooLarge => error.BodyTooLarge,
             error.OutOfMemory => error.OutOfMemory,
         };
     }
@@ -2357,7 +2365,7 @@ const Pool = struct {
     const max_reap_batch = 4096;
 
     fn init(gpa: std.mem.Allocator, io: std.Io, options: PoolOptions) Pool {
-        std.debug.assert(options.max_idle_total <= max_reap_batch);
+        if (options.max_idle_total > max_reap_batch) @panic("http.Client.Pool.init: PoolOptions.max_idle_total must be <= 4096");
         return .{ .gpa = gpa, .io = io, .options = options };
     }
 
@@ -3366,9 +3374,14 @@ fn writeHead(
     try w.writeAll("\r\n");
 }
 
+/// Most interim (1xx, not 101) response heads accepted before the final one.
+const max_interim_heads = 8;
+
 /// Read + parse the response head, skipping interim 1xx responses
-/// (100-continue etc.; 101 is returned as-is).
+/// (100-continue etc.; 101 is returned as-is). More than `max_interim_heads`
+/// interim heads in a row is `error.MalformedResponse`.
 fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
+    var interim: usize = 0;
     while (true) {
         const block = h1.readHead(conn.plainReader(), conn.head_buf) catch |err| switch (err) {
             error.ReadFailed => return conn.readFailure(),
@@ -3389,7 +3402,11 @@ fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
         // agent must discard (§6.3).
         if (head.has_transfer_encoding and (!head.chunked or head.http1_0))
             return error.MalformedResponse;
-        if (head.status >= 100 and head.status < 200 and head.status != 101) continue;
+        if (head.status >= 100 and head.status < 200 and head.status != 101) {
+            interim += 1;
+            if (interim > max_interim_heads) return error.MalformedResponse;
+            continue;
+        }
         return head;
     }
 }
@@ -3671,6 +3688,30 @@ test "redirect chain on fabricated responses" {
     var hop3: std.Io.Reader = .fixed("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
     const head3 = try h1.ResponseHead.parse(try h1.readHead(&hop3, &head_buf));
     try testing.expectEqual(@as(?http.Method, null), http.redirectMethodFor(head3.status, method2));
+}
+
+fn fakeInterimResponse(buf: []u8, n: usize) ![]const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    for (0..n) |_| try w.writeAll("HTTP/1.1 103 Early Hints\r\nLink: </a>; rel=preload\r\n\r\n");
+    try w.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    return w.buffered();
+}
+
+test "readResponseHead: a bounded run of interim 1xx heads is skipped, an endless one is MalformedResponse" {
+    var head_buf: [512]u8 = undefined;
+    var conn: Conn = undefined;
+    conn.tls_client = null;
+    conn.head_buf = &head_buf;
+    conn.sr = undefined;
+
+    var wire: [1024]u8 = undefined;
+    conn.sr.interface = .fixed(try fakeInterimResponse(&wire, max_interim_heads));
+    const head = try readResponseHead(&conn);
+    try testing.expectEqual(@as(u16, 200), head.status);
+
+    // One more interim head than allowed: refused, not looped over.
+    conn.sr.interface = .fixed(try fakeInterimResponse(&wire, max_interim_heads + 1));
+    try testing.expectError(error.MalformedResponse, readResponseHead(&conn));
 }
 
 test "Options.max_redirects default is 10 (G8) — the cap-on-the-chain mechanism was verified, not this value" {

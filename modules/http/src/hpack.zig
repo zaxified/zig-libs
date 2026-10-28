@@ -62,6 +62,12 @@ pub const DecodeError = error{
 /// Default dynamic-table size, per RFC 7540 SETTINGS_HEADER_TABLE_SIZE.
 pub const default_max_table_size: usize = 4096;
 
+/// Hard ceiling on any dynamic-table maximum (decoder or encoder). A larger
+/// requested value is clamped to this, so neither a caller's setting nor a
+/// peer's SETTINGS_HEADER_TABLE_SIZE can make the table (and the O(n)
+/// oldest-entry eviction) grow without bound. 1 MiB.
+pub const max_table_size_limit: usize = 1 << 20;
+
 /// Default decoder bound on one decoded header list (name + value + 32 per
 /// field, the RFC 7540 SETTINGS_MAX_HEADER_LIST_SIZE accounting).
 pub const default_max_header_list_size: usize = 64 * 1024;
@@ -789,17 +795,18 @@ pub const Decoder = struct {
     pub const Options = struct {
         /// The SETTINGS_HEADER_TABLE_SIZE we advertised to the peer: both
         /// the initial dynamic-table maximum and the ceiling any §6.3 size
-        /// update may set.
+        /// update may set. Clamped to `max_table_size_limit` (1 MiB).
         max_table_size: usize = default_max_table_size,
         /// Maximum decoded header-list size accepted from the peer.
         max_header_list_size: usize = default_max_header_list_size,
     };
 
     pub fn init(gpa: Allocator, options: Options) Decoder {
+        const max_table = @min(options.max_table_size, max_table_size_limit);
         return .{
             .gpa = gpa,
-            .table = .{ .max_size = options.max_table_size },
-            .settings_max_table_size = options.max_table_size,
+            .table = .{ .max_size = max_table },
+            .settings_max_table_size = max_table,
             .max_header_list_size = options.max_header_list_size,
         };
     }
@@ -812,7 +819,9 @@ pub const Decoder = struct {
     /// Lower/raise our advertised SETTINGS_HEADER_TABLE_SIZE. Lowering also
     /// shrinks the live table immediately so memory is bounded even before
     /// the peer acknowledges with a §6.3 update.
-    pub fn setMaxTableSize(d: *Decoder, new_max: usize) void {
+    /// `new_max` is clamped to `max_table_size_limit` (1 MiB).
+    pub fn setMaxTableSize(d: *Decoder, requested_max: usize) void {
+        const new_max = @min(requested_max, max_table_size_limit);
         d.settings_max_table_size = new_max;
         if (new_max < d.table.max_size) d.table.setMaxSize(d.gpa, new_max);
     }
@@ -1045,6 +1054,7 @@ pub const Encoder = struct {
     pub const Options = struct {
         /// Dynamic-table maximum. Must not exceed the peer's
         /// SETTINGS_HEADER_TABLE_SIZE (4096 unless it said otherwise).
+        /// Clamped to `max_table_size_limit` (1 MiB).
         max_table_size: usize = default_max_table_size,
         huffman: HuffmanMode = .auto,
         /// Treat `authorization`, `proxy-authorization` and a `cookie`
@@ -1060,7 +1070,7 @@ pub const Encoder = struct {
     pub fn init(gpa: Allocator, options: Options) Encoder {
         return .{
             .gpa = gpa,
-            .table = .{ .max_size = options.max_table_size, .indexed = true },
+            .table = .{ .max_size = @min(options.max_table_size, max_table_size_limit), .indexed = true },
             .huffman = options.huffman,
             .default_sensitive = options.default_sensitive,
         };
@@ -1075,7 +1085,9 @@ pub const Encoder = struct {
     /// SETTINGS_HEADER_TABLE_SIZE). Takes effect immediately on the table;
     /// the required §6.3 update(s) are emitted at the start of the next
     /// `encodeBlock`.
-    pub fn setMaxTableSize(e: *Encoder, new_max: usize) void {
+    /// `requested_max` is clamped to `max_table_size_limit` (1 MiB).
+    pub fn setMaxTableSize(e: *Encoder, requested_max: usize) void {
+        const new_max = @min(requested_max, max_table_size_limit);
         e.pending_min = @min(e.pending_min orelse new_max, new_max);
         e.pending_final = new_max;
         e.table.setMaxSize(e.gpa, new_max);

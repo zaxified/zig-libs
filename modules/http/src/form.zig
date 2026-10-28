@@ -258,8 +258,14 @@ pub fn parseSource(arena: Allocator, src: Source, limits: Limits) ParseError!For
 fn readBody(arena: Allocator, src: Source, cap: usize) ParseError![]u8 {
     if (src.content_length) |n| {
         if (n > cap) return error.BodyTooLarge;
-        const buf = try arena.alloc(u8, @intCast(n));
-        src.body.get().readSliceAll(buf) catch return error.ReadFailed;
+        // Grown as bytes arrive, not allocated from the declared length: a
+        // peer that declares the cap and sends nothing commits nothing.
+        const buf = src.body.get().allocRemaining(arena, .limited(@intCast(n))) catch |e| return switch (e) {
+            error.StreamTooLong => error.BodyTooLarge,
+            error.ReadFailed => error.ReadFailed,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+        if (buf.len != n) return error.ReadFailed; // short body
         return buf;
     }
     // Zig 0.17: `allocRemaining` allows exactly `limit` bytes (0.16 failed at

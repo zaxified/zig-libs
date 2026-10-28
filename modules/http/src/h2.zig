@@ -181,7 +181,8 @@ pub const FrameHeader = struct {
     stream_id: u31,
 
     pub fn encode(h: FrameHeader) [frame_header_len]u8 {
-        std.debug.assert(h.length <= max_allowed_frame_size);
+        // Caller contract: a payload over 2^24-1 octets cannot be framed.
+        if (h.length > max_allowed_frame_size) @panic("http.h2.FrameHeader.encode: frame length exceeds 2^24-1");
         var out: [frame_header_len]u8 = undefined;
         out[0] = @intCast(h.length >> 16);
         out[1] = @intCast((h.length >> 8) & 0xff);
@@ -218,6 +219,8 @@ pub const Priority = struct {
 /// The defined SETTINGS parameters (§6.5.2) with their initial values.
 /// Unknown parameters received from a peer are ignored (§6.5.2).
 pub const Settings = struct {
+    /// Our decoder's dynamic table is clamped to `hpack.max_table_size_limit`
+    /// (1 MiB) whatever is set here.
     header_table_size: u32 = hpack.default_max_table_size,
     enable_push: bool = true,
     /// null = unlimited (no advertised limit).
@@ -247,7 +250,8 @@ pub const SettingsIterator = struct {
     pub const Entry = struct { id: Settings.Id, value: u32 };
 
     pub fn next(it: *SettingsIterator) ?Entry {
-        if (it.pos >= it.payload.len) return null;
+        // A short tail (payload not a multiple of 6) ends the iteration.
+        if (it.payload.len - @min(it.pos, it.payload.len) < 6) return null;
         const chunk = it.payload[it.pos..][0..6];
         it.pos += 6;
         return .{
@@ -292,12 +296,13 @@ pub const Frame = union(enum) {
 pub const ParseError = error{ ProtocolError, FrameSizeError };
 
 /// Structurally decode + validate one frame payload against its header.
-/// `payload.len` must equal `h.length` (the caller has already framed it).
+/// `payload.len` must equal `h.length` (the caller has already framed it;
+/// a mismatch panics with a message).
 /// Enforces the per-type §6 rules: stream-id zero/nonzero, fixed payload
 /// sizes (FRAME_SIZE_ERROR), padding bounds (PROTOCOL_ERROR), SETTINGS
 /// ACK emptiness, reserved-bit masking in PUSH_PROMISE/GOAWAY/WINDOW_UPDATE.
 pub fn parseFrame(h: FrameHeader, payload: []const u8) ParseError!Frame {
-    std.debug.assert(payload.len == h.length);
+    if (payload.len != h.length) @panic("http.h2.parseFrame: payload.len != header length");
     switch (h.frame_type) {
         .data => {
             if (h.stream_id == 0) return error.ProtocolError;
@@ -633,13 +638,15 @@ pub fn encodeGoaway(
 }
 
 /// WINDOW_UPDATE (§6.9). `stream_id` 0 = the connection window.
+/// `increment` must be > 0 (a zero increment is a PROTOCOL_ERROR on the
+/// wire); 0 panics with a message.
 pub fn encodeWindowUpdate(
     gpa: Allocator,
     out: *std.ArrayList(u8),
     stream_id: u31,
     increment: u31,
 ) Allocator.Error!void {
-    std.debug.assert(increment > 0);
+    if (increment == 0) @panic("http.h2.encodeWindowUpdate: increment must be > 0");
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, increment, .big);
     try encodeRawFrame(gpa, out, .window_update, 0, stream_id, &payload);
@@ -1004,6 +1011,9 @@ pub const Connection = struct {
         /// Connection or stream send window has no room; wait for
         /// WINDOW_UPDATE and retry (§5.2).
         WindowExhausted,
+        /// `startStream`: the 31-bit locally-initiated stream-id space is
+        /// used up (§5.1.1); open a new connection.
+        StreamIdsExhausted,
     } || Allocator.Error;
 
     /// §3.4 connection preface: client magic (client role) + our SETTINGS.
@@ -1015,15 +1025,19 @@ pub const Connection = struct {
 
     /// Open a new locally-initiated stream (client request) and send its
     /// header block. Returns the stream id (§5.1.1: odd, monotonic).
+    /// Fails with `error.StreamIdsExhausted` once the id space is used up.
+    /// Client role only: calling it on a server connection panics.
     pub fn startStream(
         c: *Connection,
         out: *std.ArrayList(u8),
         fields: []const hpack.Field,
         end_stream: bool,
     ) SendError!u31 {
-        std.debug.assert(c.role == .client); // servers respond on peer streams
+        // servers respond on peer streams
+        if (c.role != .client) @panic("http.h2.Connection.startStream: server role cannot open streams");
         const id = c.next_local_stream_id;
-        c.next_local_stream_id += 2;
+        const next = std.math.add(u31, id, 2) catch return error.StreamIdsExhausted;
+        c.next_local_stream_id = next;
         try c.streams.put(c.gpa, id, .{
             .id = id,
             .state = .open,
@@ -1172,7 +1186,9 @@ pub const Connection = struct {
             else => return error.StreamNotWritable,
         }
         const len: i64 = @intCast(data.len);
-        if (len > c.conn_send_window or len > st.send_window) return error.WindowExhausted;
+        // A zero-length frame consumes no window, even when the peer drove
+        // the window to <= 0 via SETTINGS (§6.9.2).
+        if (len > 0 and (len > c.conn_send_window or len > st.send_window)) return error.WindowExhausted;
 
         const max_frag: usize = c.remote_settings.max_frame_size;
         var off: usize = 0;
@@ -1198,19 +1214,23 @@ pub const Connection = struct {
 
     /// Grant the peer `increment` more octets (§6.9); stream_id 0 = the
     /// connection window. Updates our receive accounting to match.
+    /// `increment` must be > 0 and the resulting receive window must stay
+    /// <= 2^31-1 (§6.9.1); otherwise it panics with a message.
     pub fn sendWindowUpdate(
         c: *Connection,
         out: *std.ArrayList(u8),
         stream_id: u31,
         increment: u31,
     ) SendError!void {
-        std.debug.assert(increment > 0);
+        if (increment == 0) @panic("http.h2.Connection.sendWindowUpdate: increment must be > 0");
         if (stream_id == 0) {
+            if (c.conn_recv_window + increment > max_window_size)
+                @panic("http.h2.Connection.sendWindowUpdate: connection window would exceed 2^31-1");
             c.conn_recv_window += increment;
-            std.debug.assert(c.conn_recv_window <= max_window_size);
         } else if (c.streams.getPtr(stream_id)) |st| {
+            if (st.recv_window + increment > max_window_size)
+                @panic("http.h2.Connection.sendWindowUpdate: stream window would exceed 2^31-1");
             st.recv_window += increment;
-            std.debug.assert(st.recv_window <= max_window_size);
         } else if (!c.everExisted(stream_id)) {
             return error.InvalidStream;
         }
@@ -1436,13 +1456,18 @@ pub const Connection = struct {
                     switch (st.state) {
                         .open, .half_closed_local => {},
                         .reserved_remote => st.state = .half_closed_local,
-                        else => return c.fail(.stream, hd.stream_id, error.StreamClosed),
+                        else => {
+                            try c.dropHeaderBlock(hd.stream_id, hd.fragment, hd.end_headers, hd.end_stream);
+                            return c.fail(.stream, hd.stream_id, error.StreamClosed);
+                        },
                     }
                     // On a server a second client HEADERS can only be the
                     // trailer section, and trailers end the stream: without
                     // END_STREAM it is malformed (§8.1) -- a stream error.
-                    if (c.role == .server and st.peer_headers_seen and !hd.end_stream)
+                    if (c.role == .server and st.peer_headers_seen and !hd.end_stream) {
+                        try c.dropHeaderBlock(hd.stream_id, hd.fragment, hd.end_headers, hd.end_stream);
                         return c.fail(.stream, hd.stream_id, error.ProtocolError);
+                    }
                     st.peer_headers_seen = true;
                     // Repeat HEADERS on an existing stream (trailers at
                     // best) are not new work — a trailer flood on one
@@ -1496,8 +1521,10 @@ pub const Connection = struct {
                 }
                 if (hd.priority) |p| {
                     // §5.3.1: a stream cannot depend on itself.
-                    if (p.dependency == hd.stream_id)
+                    if (p.dependency == hd.stream_id) {
+                        try c.dropHeaderBlock(hd.stream_id, hd.fragment, hd.end_headers, hd.end_stream);
                         return c.fail(.stream, hd.stream_id, error.ProtocolError);
+                    }
                     try events.append(c.gpa, .{ .priority = .{
                         .stream_id = hd.stream_id,
                         .priority = p,
@@ -1734,6 +1761,30 @@ pub const Connection = struct {
         var started = a;
         try started.buf.appendSlice(c.gpa, first_fragment);
         c.assembling = started;
+    }
+
+    /// A HEADERS frame is about to be refused with a stream error. Its
+    /// header block must still move the HPACK table both ends share
+    /// (§4.3, RFC 9113), so decode and drop it (END_HEADERS set) or start
+    /// assembling it (CONTINUATIONs follow; `recoverStreamError` retires the
+    /// stream, so `finishHeaderBlock` then decodes and drops it).
+    fn dropHeaderBlock(
+        c: *Connection,
+        stream_id: u31,
+        fragment: []const u8,
+        end_headers: bool,
+        end_stream: bool,
+    ) RecvError!void {
+        if (!end_headers) return c.beginAssembly(.{
+            .kind = .headers,
+            .stream_id = stream_id,
+            .end_stream = end_stream,
+        }, fragment);
+        var list = c.hpack_dec.decodeBlock(fragment) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return c.fail(.connection, stream_id, error.CompressionError),
+        };
+        list.deinit(c.gpa);
     }
 
     /// Run a complete header block through HPACK, apply END_STREAM, emit
@@ -2894,6 +2945,76 @@ test "connection: send-side guards — windows, states, stream ids" {
     const sid2 = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, true);
     try testing.expectEqual(@as(u31, 3), sid2);
     try testing.expectEqual(StreamState.half_closed_local, client.stream(sid2).?.state);
+}
+
+test "connection: startStream refuses to overflow the 31-bit stream-id space" {
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const req: []const hpack.Field = &.{.{ .name = ":method", .value = "GET" }};
+
+    // The last id that still has a successor is handed out; then the space is gone.
+    client.next_local_stream_id = std.math.maxInt(u31) - 2;
+    try testing.expectEqual(@as(u31, std.math.maxInt(u31) - 2), try client.startStream(&out, req, true));
+    try testing.expectError(error.StreamIdsExhausted, client.startStream(&out, req, true));
+    // Nothing was opened or sent for the refused call, and it stays refused.
+    try testing.expectEqual(@as(u31, std.math.maxInt(u31)), client.next_local_stream_id);
+    const sent = out.items.len;
+    try testing.expectError(error.StreamIdsExhausted, client.startStream(&out, req, true));
+    try testing.expectEqual(sent, out.items.len);
+}
+
+test "connection: a zero-length DATA frame passes a non-positive send window" {
+    const gpa = testing.allocator;
+    var client: Connection = .init(gpa, .client, .{});
+    defer client.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const sid = try client.startStream(&out, &.{.{ .name = ":method", .value = "GET" }}, false);
+    // The peer can drive the stream window negative through SETTINGS (§6.9.2).
+    client.streams.getPtr(sid).?.send_window = -5;
+    client.conn_send_window = 0;
+    try testing.expectError(error.WindowExhausted, client.sendData(&out, sid, "x", false));
+    out.clearRetainingCapacity();
+    try client.sendData(&out, sid, "", true);
+    try testing.expectEqual(@as(usize, frame_header_len), out.items.len);
+    try testing.expectEqual(@as(i64, -5), client.stream(sid).?.send_window);
+}
+
+test "connection: a refused HEADERS block still moves the HPACK table (RFC 9113 4.3)" {
+    // A second client HEADERS without END_STREAM is a stream error, but its
+    // block (here: a literal with incremental indexing) is part of the shared
+    // compression context. A later block indexing that entry must decode.
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{});
+    try conn.recv(wire.items, &out, &events);
+    clearEvents(&events);
+
+    wire.clearRetainingCapacity();
+    const literal = [_]u8{ 0x40, 0x03, 'x', '-', 'a', 0x01, 'b' };
+    try encodeHeaders(gpa, &wire, 1, &literal, .{});
+    try testing.expectError(error.ProtocolError, conn.recv(wire.items, &out, &events));
+    try testing.expect(conn.violation.?.scope == .stream);
+    try testing.expect(conn.recoverStreamError() != null);
+
+    wire.clearRetainingCapacity();
+    try encodeHeaders(gpa, &wire, 3, &.{ 0x82, 0xbe }, .{ .end_stream = true });
+    try conn.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    const hd = events.items[0].headers;
+    try testing.expectEqualStrings("x-a", hd.headers.fields[1].name);
+    try testing.expectEqualStrings("b", hd.headers.fields[1].value);
 }
 
 /// Drive `sendData` on `a` and `writeData` on `b` -- two connections in the

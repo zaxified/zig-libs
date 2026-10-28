@@ -593,11 +593,12 @@ fn negotiateLanguageSlow(header: []const u8, tags: []const []const u8) ?Negotiat
 }
 
 /// Subtag count of a language-range for specificity: `*` → 0, otherwise
-/// 1 + the number of `-` separators (`en` → 1, `en-US` → 2).
-fn subtagCount(range: []const u8) u8 {
+/// 1 + the number of `-` separators (`en` → 1, `en-US` → 2). The range is
+/// peer bytes of any length, so the count saturates at `maxInt(i16)`.
+fn subtagCount(range: []const u8) i16 {
     if (std.mem.eql(u8, range, "*")) return 0;
-    const dashes: u8 = @intCast(std.mem.count(u8, range, "-"));
-    return 1 + dashes;
+    const dashes = @min(std.mem.count(u8, range, "-"), std.math.maxInt(i16) - 1);
+    return @intCast(1 + dashes);
 }
 
 // ── Accept-Encoding (RFC 9110 §12.5.3) ───────────────────────────────────────
@@ -1178,10 +1179,21 @@ test "languageMatches: case-insensitive" {
 }
 
 test "subtagCount: * -> 0, en -> 1, en-US -> 2" {
-    try testing.expectEqual(@as(u8, 0), subtagCount("*"));
-    try testing.expectEqual(@as(u8, 1), subtagCount("en"));
-    try testing.expectEqual(@as(u8, 2), subtagCount("en-US"));
-    try testing.expectEqual(@as(u8, 3), subtagCount("en-GB-oxendict"));
+    try testing.expectEqual(@as(i16, 0), subtagCount("*"));
+    try testing.expectEqual(@as(i16, 1), subtagCount("en"));
+    try testing.expectEqual(@as(i16, 2), subtagCount("en-US"));
+    try testing.expectEqual(@as(i16, 3), subtagCount("en-GB-oxendict"));
+}
+
+test "negotiateLanguage: a range with 255+ subtags does not overflow the specificity" {
+    // Peer-sized: one Accept-Language range with 300 `-` separators (header
+    // bytes, not a caller contract) on both the fast and the slow path.
+    const header = "en" ++ @as([300]u8, @splat('-')) ++ ", en;q=0.5";
+    const few = [_][]const u8{"en"};
+    try testing.expectEqual(@as(usize, 0), negotiateLanguage(header, &few).?.index);
+    var many: [33][]const u8 = @splat("de");
+    many[32] = "en";
+    try testing.expectEqual(@as(usize, 32), negotiateLanguage(header, &many).?.index);
 }
 
 test "negotiateLanguage: most specific range wins" {
