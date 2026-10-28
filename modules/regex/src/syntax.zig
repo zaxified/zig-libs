@@ -12,6 +12,8 @@
 
 const std = @import("std");
 const casefold = @import("casefold.zig");
+const casefold16 = @import("casefold16.zig");
+const unicode16 = @import("unicode16_tables.zig");
 const unicode_tables = @import("unicode_tables.zig");
 
 /// Instructions in one program — also what bounds the VM's own scratch.
@@ -78,6 +80,19 @@ pub const Assert = enum(u8) {
     end_line, // $ with (?m)
     word_boundary, // \b (ASCII word characters, as RE2)
     not_word_boundary, // \B
+    // `Syntax.rust` only:
+    begin_line_crlf, // ^ with (?mR): after `\n`, or after `\r` not followed by `\n`
+    end_line_crlf, // $ with (?mR): before `\r`, or before `\n` not preceded by `\r`
+    word_boundary_unicode, // \b (Unicode `\w`)
+    not_word_boundary_unicode, // \B (Unicode `\w`)
+    word_start, // \b{start}, \< with (?-u)
+    word_end, // \b{end}, \> with (?-u)
+    word_start_half, // \b{start-half} with (?-u)
+    word_end_half, // \b{end-half} with (?-u)
+    word_start_unicode, // \b{start}, \<
+    word_end_unicode, // \b{end}, \>
+    word_start_half_unicode, // \b{start-half}
+    word_end_half_unicode, // \b{end-half}
 };
 
 pub const Inst = union(enum) {
@@ -125,6 +140,10 @@ const Flags = struct {
     multi_line: bool = false, // m
     dot_nl: bool = false, // s
     ungreedy: bool = false, // U
+    // `Syntax.rust` only:
+    crlf: bool = false, // R
+    unicode: bool = false, // u (on from the start in the Rust grammar)
+    verbose: bool = false, // x
 };
 
 /// Which grammar a pattern is read in.
@@ -137,6 +156,14 @@ pub const Syntax = enum {
     /// never matches `\n`; a repetition may repeat a repetition (`a**`,
     /// `a{2}{3}`; `a*?` is `(a*)?`, not lazy).
     posix,
+    /// Rust's `regex` 1.13 (`regex-syntax` 0.8): flags `i m s R U u x`, with
+    /// `u` (Unicode `\d \s \w \b`, Unicode case folding) on by default;
+    /// `(?x)` whitespace and `#` comments; class set operations `&& -- ~~`
+    /// and nested classes; `\<`, `\>`, `\b{start}`, `\b{end}`,
+    /// `\b{start-half}`, `\b{end-half}`; `\u`/`\U` escapes; property queries
+    /// `\p{name=value}`. No octal, no `\Q…\E`; `{` always starts a repetition;
+    /// group names are Unicode and may not repeat.
+    rust,
 };
 
 /// Table capacities of a `BuilderOf`. The defaults are the module's
@@ -170,6 +197,12 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         src: []const u8 = "",
         pos: usize = 0,
         posix: bool = false,
+        rust: bool = false,
+        /// Rust grammar: the nesting height of what the last parse function
+        /// read, as regex-syntax's `NestLimiter` counts it (groups,
+        /// repetitions, classes and their unions and set operations, and
+        /// every concatenation or alternation of two or more).
+        rheight: u32 = 0,
         /// Repetitions applied to an operand that already was one (POSIX only:
         /// `a**`, `a{2}{3}`) in this pattern. Each adds a level to the tree
         /// without adding group depth, so they are budgeted (`max_stacked`).
@@ -188,18 +221,36 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             b.ngroups = 1;
             b.pos = 0;
             b.posix = syntax == .posix;
+            b.rust = syntax == .rust;
             b.stacked = 0;
             b.names[0] = "";
             if (!std.unicode.utf8ValidateSlice(pattern)) return error.InvalidUtf8;
             b.src = pattern;
-            var flags: Flags = .{};
+            var flags: Flags = .{ .unicode = b.rust };
             const root = try b.parseAlternate(&flags, 0);
             if (b.pos < b.src.len) return error.UnexpectedParen; // a `)` ended it
+            if (b.rust and b.rheight > max_depth) return error.NestingDepth;
             // save 0; root; save 1; match
             try b.emit(.{ .save = 0 });
             try b.emitNode(root);
             try b.emit(.{ .save = 1 });
             try b.emit(.match);
+            if (b.rust) b.dropVanishedGroups();
+        }
+
+        /// Rust drops what `x{0}` holds, groups included: those past the last
+        /// group left go, those before it stay as unnamed placeholders that
+        /// never take part (regex-automata fills the gaps).
+        fn dropVanishedGroups(b: *Self) void {
+            var seen: [max_groups]bool = @splat(false);
+            for (b.insts[0..b.ninsts]) |inst| {
+                if (inst == .save) seen[inst.save / 2] = true;
+            }
+            var n: u16 = 1;
+            for (1..b.ngroups) |g| {
+                if (seen[g]) n = @intCast(g + 1) else b.names[g] = "";
+            }
+            b.ngroups = n;
         }
 
         // ── parsing ──────────────────────────────────────────────────────────
@@ -232,16 +283,19 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// later alternatives included.
         fn parseAlternate(b: *Self, flags: *Flags, depth: u32) Error!u16 {
             if (depth > max_depth) return error.NestingDepth;
-            const first = try b.parseConcat(flags, depth);
+            const first = if (b.rust) try b.rustConcat(flags, depth) else try b.parseConcat(flags, depth);
             if (b.eof() or b.peek() != '|') return first;
             const alt = try b.node(.{ .kind = .alternate, .child = first });
             var last = first;
+            var height = b.rheight;
             while (!b.eof() and b.peek() == '|') {
                 b.pos += 1;
-                const n = try b.parseConcat(flags, depth);
+                const n = if (b.rust) try b.rustConcat(flags, depth) else try b.parseConcat(flags, depth);
+                height = @max(height, b.rheight);
                 b.nodes[last].next = n;
                 last = n;
             }
+            b.rheight = height + 1;
             return alt;
         }
 
@@ -797,13 +851,19 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// all of them — run by run, never code point by code point (a class over
         /// all of Unicode costs as much as `[a-z]`, also at comptime).
         fn foldFrom(b: *Self, start: u16) Error!void {
+            return b.foldFromWith(casefold, start);
+        }
+
+        /// `foldFrom` over the orbits of table `cf` (`casefold.zig`, Go's, or
+        /// `casefold16.zig`, Rust's).
+        fn foldFromWith(b: *Self, comptime cf: type, start: u16) Error!void {
             var lo = start;
             var hi = b.nranges;
             var step: usize = 1;
-            while (step < casefold.max_orbit and lo < hi) : (step += 1) {
+            while (step < cf.max_orbit and lo < hi) : (step += 1) {
                 const added = b.nranges;
                 var i = lo;
-                while (i < hi) : (i += 1) try b.addFoldImage(b.ranges[i]);
+                while (i < hi) : (i += 1) try b.addFoldImage(cf, b.ranges[i]);
                 b.normalizeFrom(added);
                 lo = added;
                 hi = b.nranges;
@@ -813,11 +873,11 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// Append the orbit successors of the code points in `r` (for an
         /// alternating run, the whole pairs `r` touches — a superset by `r`
         /// itself, which the class holds anyway).
-        fn addFoldImage(b: *Self, r: Range) Error!void {
+        fn addFoldImage(b: *Self, comptime cf: type, r: Range) Error!void {
             // Every code point with a fold, and so every successor, is already in `r`.
-            if (r.lo <= casefold.min_fold and r.hi >= casefold.max_fold) return;
-            const runs = &casefold.runs;
-            var i = firstRunEndingAtOrAfter(r.lo);
+            if (r.lo <= cf.min_fold and r.hi >= cf.max_fold) return;
+            const runs = &cf.runs;
+            var i = firstRunIn(cf, r.lo);
             while (i < runs.len and runs[i].lo <= r.hi) : (i += 1) {
                 const run = runs[i];
                 const a = @max(run.lo, r.lo);
@@ -828,6 +888,770 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     try b.addRange(.{ .lo = @intCast(@as(i32, a) + run.delta), .hi = @intCast(@as(i32, z) + run.delta) });
                 }
             }
+        }
+
+        // ── the Rust grammar (`Syntax.rust`) ─────────────────────────────────
+        //
+        // regex-syntax 0.8's parser and translator as `regex` 1.13 runs them
+        // on a `&str` haystack: `(?-u)` may not make a class that can match a
+        // byte past ASCII. The same nodes as the Go grammar come out, so the
+        // engines are shared.
+
+        /// With `(?x)`: skip whitespace (Unicode White_Space) and `#` comments.
+        fn rustSpace(b: *Self, flags: Flags) void {
+            if (!flags.verbose) return;
+            while (!b.eof()) {
+                if (b.peek() == '#') {
+                    while (!b.eof()) {
+                        const ch = b.peek();
+                        b.pos += 1;
+                        if (ch == '\n') break;
+                    }
+                    continue;
+                }
+                const save = b.pos;
+                if (!isRustSpace(b.nextRune())) {
+                    b.pos = save;
+                    return;
+                }
+            }
+        }
+
+        /// Past the code point at `pos` and any `(?x)` space after it; false
+        /// at the end of the pattern (regex-syntax's `bump_and_bump_space`).
+        fn rustBump(b: *Self, flags: Flags) bool {
+            _ = b.nextRune();
+            b.rustSpace(flags);
+            return !b.eof();
+        }
+
+        /// The code point after the one at `pos`, `(?x)` space skipped, or
+        /// null at the end (`peek_space`). `pos` is unchanged.
+        fn rustPeekSpace(b: *Self, flags: Flags) ?u8 {
+            const save = b.pos;
+            defer b.pos = save;
+            _ = b.nextRune();
+            b.rustSpace(flags);
+            return if (b.eof()) null else b.peek();
+        }
+
+        fn rustConcat(b: *Self, flags: *Flags, depth: u32) Error!u16 {
+            const cat = try b.node(.{ .kind = .concat });
+            var last: u16 = none;
+            // The operand a repetition applies to; none after a flag group
+            // (`(?i)*` is an error in Rust, `a(?i)*` too).
+            var operand: u16 = none;
+            var repeated = false;
+            // Heights: of the last item (a repetition wraps it), of all.
+            var items: u32 = 0;
+            var last_h: u32 = 0;
+            var max_h: u32 = 0;
+            while (true) {
+                b.rustSpace(flags.*);
+                if (b.eof()) break;
+                const c = b.peek();
+                if (c == '|' or c == ')') break;
+                if (c == '*' or c == '+' or c == '?' or c == '{') {
+                    if (operand == none) return error.MissingRepeatArgument;
+                    const rep = try b.rustRepeatOp(flags.*);
+                    if (depth + 1 > max_depth) return error.NestingDepth;
+                    if (repeated) {
+                        // Rust repeats a repetition (`a**`); budgeted as POSIX's.
+                        if (b.stacked == max_stacked) return error.NestingDepth;
+                        b.stacked += 1;
+                    }
+                    const inner = try b.node(b.nodes[operand]);
+                    b.nodes[inner].next = none;
+                    b.nodes[operand] = .{ .kind = .repeat, .a = rep.min, .b = rep.max, .flag = rep.greedy, .counted = rep.counted, .child = inner, .next = b.nodes[operand].next };
+                    // Not a Rust limit (its bound is the compiled size); keeps
+                    // the compiler's work bounded as for Go.
+                    if (rep.counted and b.repeatSize(operand) > max_repeat) return error.InvalidRepeatSize;
+                    repeated = true;
+                    last_h += 1;
+                    max_h = @max(max_h, last_h);
+                    continue;
+                }
+                b.rheight = 0;
+                const got = try b.rustAtom(flags, depth);
+                items += 1; // a flag group is an item of Rust's concatenation too
+                last_h = b.rheight;
+                max_h = @max(max_h, last_h);
+                const n = got orelse {
+                    operand = none;
+                    repeated = false;
+                    continue;
+                };
+                repeated = false;
+                operand = n;
+                last = b.append(cat, last, n);
+            }
+            b.rheight = max_h + @intFromBool(items >= 2);
+            return cat;
+        }
+
+        /// `*`, `+`, `?` or `{…}` at `pos`, consumed. A `{` that is not a valid
+        /// counted repetition is an error (Rust has no literal `{` there).
+        fn rustRepeatOp(b: *Self, flags: Flags) Error!Rep {
+            var r: Rep = .{ .min = 0, .max = inf, .greedy = true };
+            const c = b.peek();
+            if (c != '{') {
+                if (c == '+') r.min = 1;
+                if (c == '?') r.max = 1;
+                b.pos += 1;
+                // No space skipped before the lazy marker here (Rust's `bump`).
+                if (!b.eof() and b.peek() == '?') {
+                    b.pos += 1;
+                    r.greedy = false;
+                }
+            } else {
+                r.counted = true;
+                if (!b.rustBump(flags)) return error.InvalidRepeatSize;
+                const lo = b.rustDecimal(flags);
+                if (b.eof()) return error.InvalidRepeatSize;
+                var hi: ?u32 = lo;
+                if (b.peek() == ',') {
+                    if (!b.rustBump(flags)) return error.InvalidRepeatSize;
+                    hi = if (b.peek() == '}') null else b.rustDecimal(flags) orelse return error.InvalidRepeatSize;
+                }
+                const min = lo orelse return error.InvalidRepeatSize;
+                if (b.eof() or b.peek() != '}') return error.InvalidRepeatSize;
+                b.pos += 1;
+                b.rustSpace(flags);
+                if (!b.eof() and b.peek() == '?') {
+                    b.pos += 1;
+                    r.greedy = false;
+                }
+                if (hi != null and hi.? < min) return error.InvalidRepeatSize;
+                // Past 1000: Go's limit, kept (Rust's is the compiled size).
+                if (min > max_repeat or (hi != null and hi.? > max_repeat)) return error.InvalidRepeatSize;
+                r.min = min;
+                r.max = hi orelse inf;
+            }
+            if (flags.ungreedy) r.greedy = !r.greedy;
+            return r;
+        }
+
+        /// Decimal digits with whitespace around them (always, as regex-syntax's
+        /// `parse_decimal`; between the digits only with `(?x)`). Null for none;
+        /// values saturate past `max_repeat`.
+        fn rustDecimal(b: *Self, flags: Flags) ?u32 {
+            while (!b.eof() and isRustSpaceAt(b.src, b.pos)) _ = b.nextRune();
+            var v: u32 = 0;
+            var any = false;
+            while (!b.eof() and std.ascii.isDigit(b.peek())) {
+                v = @min(v * 10 + (b.peek() - '0'), max_repeat + 1);
+                any = true;
+                _ = b.rustBump(flags);
+            }
+            while (!b.eof() and isRustSpaceAt(b.src, b.pos)) _ = b.rustBump(flags);
+            return if (any) v else null;
+        }
+
+        fn rustAtom(b: *Self, flags: *Flags, depth: u32) Error!?u16 {
+            const f = flags.*;
+            switch (b.peek()) {
+                '(' => return b.rustGroup(flags, depth),
+                '[' => {
+                    const start = b.nranges;
+                    try b.rustClass(f, depth + 1);
+                    return try b.classNode(start);
+                },
+                '.' => {
+                    b.pos += 1;
+                    // `(?-u).` could match a byte past ASCII: not on `&str`.
+                    if (!f.unicode) return error.InvalidUtf8;
+                    if (f.dot_nl) return try b.node(.{ .kind = .any });
+                    if (!f.crlf) return try b.node(.{ .kind = .any_not_nl });
+                    const start = b.nranges;
+                    try b.addRange(.{ .lo = 0, .hi = '\n' - 1 });
+                    try b.addRange(.{ .lo = '\n' + 1, .hi = '\r' - 1 });
+                    try b.addRange(.{ .lo = '\r' + 1, .hi = 0x10ffff });
+                    return try b.classNode(start);
+                },
+                '^' => {
+                    b.pos += 1;
+                    const a: Assert = if (!f.multi_line) .begin_text else if (f.crlf) .begin_line_crlf else .begin_line;
+                    return try b.node(.{ .kind = .assert, .a = @backingInt(a) });
+                },
+                '$' => {
+                    b.pos += 1;
+                    const a: Assert = if (!f.multi_line) .end_text else if (f.crlf) .end_line_crlf else .end_line;
+                    return try b.node(.{ .kind = .assert, .a = @backingInt(a) });
+                },
+                '\\' => switch (try b.rustEscape(f, false)) {
+                    .rune => |cp| return try b.rustLiteral(cp, f),
+                    .class => |cl| return try b.classNode(cl.start),
+                    .assert => |a| return try b.node(.{ .kind = .assert, .a = @backingInt(a) }),
+                    .quoted => unreachable,
+                },
+                else => return try b.rustLiteral(b.nextRune(), f),
+            }
+        }
+
+        /// A literal; with `(?i)` its simple case-folding orbit, or with
+        /// `(?-u)` only the other case of an ASCII letter.
+        fn rustLiteral(b: *Self, cp: u21, flags: Flags) Error!u16 {
+            if (!flags.fold) return b.literal(cp, flags);
+            if (flags.unicode) {
+                // The orbit from Rust's table (a one-code-point class: the
+                // literal node folds by Go's).
+                const start = b.nranges;
+                try b.addRange(.{ .lo = cp, .hi = cp });
+                try b.foldFromWith(casefold16, start);
+                b.normalizeFrom(start);
+                if (b.nranges - start == 1 and b.ranges[start].lo == b.ranges[start].hi) return b.literal(cp, .{});
+                return b.classNode(start);
+            }
+            if (cp >= 0x80 or !std.ascii.isAlphabetic(@intCast(cp))) return b.literal(cp, .{});
+            const start = b.nranges;
+            const c: u8 = @intCast(cp);
+            try b.addRange(.{ .lo = std.ascii.toUpper(c), .hi = std.ascii.toUpper(c) });
+            try b.addRange(.{ .lo = std.ascii.toLower(c), .hi = std.ascii.toLower(c) });
+            return b.classNode(start);
+        }
+
+        fn rustGroup(b: *Self, flags: *Flags, depth: u32) Error!?u16 {
+            b.pos += 1; // (
+            b.rustSpace(flags.*);
+            const rest = b.src[b.pos..];
+            for ([_][]const u8{ "?=", "?!", "?<=", "?<!" }) |p| {
+                if (std.mem.startsWith(u8, rest, p)) return error.InvalidPerlOp;
+            }
+            var inner = flags.*;
+            var name: ?[]const u8 = null;
+            if (std.mem.startsWith(u8, rest, "?P<") or std.mem.startsWith(u8, rest, "?<")) {
+                b.pos += if (rest[1] == 'P') 3 else 2;
+                name = try b.rustCaptureName();
+            } else if (std.mem.startsWith(u8, rest, "?")) {
+                b.pos += 1;
+                if (b.eof()) return error.MissingParen;
+                const any = try b.rustFlags(&inner);
+                const end = b.peek();
+                b.pos += 1;
+                if (end == ')') {
+                    // `(?)`: Rust reads it as a repetition with no operand.
+                    if (!any) return error.MissingRepeatArgument;
+                    flags.* = inner;
+                    return null;
+                }
+                const body = try b.parseAlternate(&inner, depth + 1);
+                if (b.eof() or b.peek() != ')') return error.MissingParen;
+                b.pos += 1;
+                b.rheight += 1;
+                return body;
+            }
+            if (b.ngroups == max_groups) return error.PatternTooLarge;
+            const index = b.ngroups;
+            b.names[index] = name orelse "";
+            b.ngroups += 1;
+            const body = try b.parseAlternate(&inner, depth + 1);
+            if (b.eof() or b.peek() != ')') return error.MissingParen;
+            b.pos += 1;
+            b.rheight += 1;
+            return try b.node(.{ .kind = .capture, .a = index, .child = body });
+        }
+
+        /// A group name up to `>`, consumed with it: an `_` or Alphabetic code
+        /// point first, then `_ . [ ]` or alphanumeric ones; unique.
+        fn rustCaptureName(b: *Self) Error![]const u8 {
+            const start = b.pos;
+            while (true) {
+                if (b.eof()) return error.InvalidNamedCapture;
+                if (b.peek() == '>') break;
+                const first = b.pos == start;
+                const cp = b.nextRune();
+                const ok = cp == '_' or isRustAlphabetic(cp) or
+                    (!first and (cp == '.' or cp == '[' or cp == ']' or isRustNumeric(cp)));
+                if (!ok) return error.InvalidNamedCapture;
+            }
+            const n = b.src[start..b.pos];
+            b.pos += 1; // >
+            if (n.len == 0) return error.InvalidNamedCapture;
+            for (b.names[1..b.ngroups]) |prev| {
+                if (std.mem.eql(u8, prev, n)) return error.InvalidNamedCapture;
+            }
+            return n;
+        }
+
+        /// Flags up to `:` or `)` (left at `pos`) into `inner`; whether any
+        /// flag was named. A flag named twice, a second `-` or a trailing `-`
+        /// is an error.
+        fn rustFlags(b: *Self, inner: *Flags) Error!bool {
+            var seen: u8 = 0;
+            var negate = false;
+            var last_negation = false;
+            var any = false;
+            while (b.peek() != ':' and b.peek() != ')') {
+                const c = b.peek();
+                if (c == '-') {
+                    if (negate) return error.InvalidPerlOp;
+                    negate = true;
+                    last_negation = true;
+                } else {
+                    last_negation = false;
+                    const bit: u8 = switch (c) {
+                        'i' => 1,
+                        'm' => 2,
+                        's' => 4,
+                        'U' => 8,
+                        'u' => 16,
+                        'R' => 32,
+                        'x' => 64,
+                        else => return error.InvalidPerlOp,
+                    };
+                    if (seen & bit != 0) return error.InvalidPerlOp;
+                    seen |= bit;
+                    any = true;
+                    const v = !negate;
+                    switch (c) {
+                        'i' => inner.fold = v,
+                        'm' => inner.multi_line = v,
+                        's' => inner.dot_nl = v,
+                        'U' => inner.ungreedy = v,
+                        'u' => inner.unicode = v,
+                        'R' => inner.crlf = v,
+                        else => inner.verbose = v,
+                    }
+                }
+                b.pos += 1;
+                if (b.eof()) return error.MissingParen;
+            }
+            if (last_negation) return error.InvalidPerlOp;
+            return any or negate;
+        }
+
+        /// One escape after `\` (at `pos`), as regex-syntax's `parse_escape`
+        /// and its translation. `in_class`: inside `[...]`, where an
+        /// assertion is an error.
+        fn rustEscape(b: *Self, flags: Flags, in_class: bool) Error!Escape {
+            b.pos += 1; // backslash
+            if (b.eof()) return error.TrailingBackslash;
+            const c = b.peek();
+            switch (c) {
+                // Octal is off in `regex`; a digit would be a backreference.
+                '0'...'9' => return error.InvalidEscape,
+                'x', 'u', 'U' => {
+                    const h = try b.rustHex(flags);
+                    // `(?-u:\xFF)` is the byte 0xFF: not on `&str`.
+                    if (!flags.unicode and h.byte and h.cp > 0x7f) return error.InvalidUtf8;
+                    return .{ .rune = h.cp };
+                },
+                'p', 'P' => return b.rustUnicodeEscape(flags),
+                'd', 's', 'w', 'D', 'S', 'W' => {
+                    b.pos += 1;
+                    return b.rustPerl(c, flags);
+                },
+                else => {},
+            }
+            if (c >= 0x80) return error.InvalidEscape;
+            b.pos += 1;
+            switch (c) {
+                'a' => return .{ .rune = 0x07 },
+                'f' => return .{ .rune = 0x0c },
+                't' => return .{ .rune = '\t' },
+                'n' => return .{ .rune = '\n' },
+                'r' => return .{ .rune = '\r' },
+                'v' => return .{ .rune = 0x0b },
+                'A', 'z', 'B', '<', '>' => {
+                    if (in_class) return error.InvalidEscape;
+                    const u = flags.unicode;
+                    return .{ .assert = switch (c) {
+                        'A' => .begin_text,
+                        'z' => .end_text,
+                        'B' => if (u) .not_word_boundary_unicode else .not_word_boundary,
+                        '<' => if (u) .word_start_unicode else .word_start,
+                        else => if (u) .word_end_unicode else .word_end,
+                    } };
+                },
+                'b' => {
+                    if (in_class) return error.InvalidEscape;
+                    return .{ .assert = try b.rustWordBoundary(flags) };
+                },
+                else => {
+                    // Any other ASCII byte that is not a letter or digit
+                    // escapes itself (`<` and `>` are assertions above).
+                    if (!std.ascii.isAlphanumeric(c)) return .{ .rune = c };
+                    return error.InvalidEscape;
+                },
+            }
+        }
+
+        /// After `\b`: `{start}`, `{end}`, `{start-half}`, `{end-half}`, or a
+        /// plain boundary (a `{` that is not one of those is left for a
+        /// counted repetition of `\b`).
+        fn rustWordBoundary(b: *Self, flags: Flags) Error!Assert {
+            const u = flags.unicode;
+            const plain: Assert = if (u) .word_boundary_unicode else .word_boundary;
+            if (b.eof() or b.peek() != '{') return plain;
+            const start = b.pos;
+            if (!b.rustBump(flags)) return error.InvalidEscape;
+            if (!isWordBoundaryNameChar(b.peek())) {
+                b.pos = start;
+                return plain;
+            }
+            var buf: [16]u8 = undefined;
+            var n: usize = 0;
+            while (!b.eof() and isWordBoundaryNameChar(b.peek())) {
+                if (n < buf.len) buf[n] = b.peek();
+                n += 1;
+                _ = b.rustBump(flags);
+            }
+            if (b.eof() or b.peek() != '}') return error.InvalidEscape;
+            b.pos += 1;
+            const name = buf[0..@min(n, buf.len)];
+            if (n > buf.len) return error.InvalidEscape;
+            if (std.mem.eql(u8, name, "start")) return if (u) .word_start_unicode else .word_start;
+            if (std.mem.eql(u8, name, "end")) return if (u) .word_end_unicode else .word_end;
+            if (std.mem.eql(u8, name, "start-half")) return if (u) .word_start_half_unicode else .word_start_half;
+            if (std.mem.eql(u8, name, "end-half")) return if (u) .word_end_half_unicode else .word_end_half;
+            return error.InvalidEscape;
+        }
+
+        /// `\x`, `\u`, `\U` at `pos` (the letter): two, four or eight hex
+        /// digits, or any number in braces; `(?x)` space allowed between them.
+        /// `byte`: the two-digit `\xNN` form, which `(?-u)` reads as a byte.
+        fn rustHex(b: *Self, flags: Flags) Error!struct { cp: u21, byte: bool } {
+            const kind = b.peek();
+            if (!b.rustBump(flags)) return error.InvalidEscape;
+            var v: u32 = 0;
+            const braced = b.peek() == '{';
+            if (braced) {
+                var any = false;
+                while (b.rustBump(flags) and b.peek() != '}') {
+                    const d = hexDigit(b.peek()) orelse return error.InvalidEscape;
+                    v = @min(v * 16 + d, 0x110000);
+                    any = true;
+                }
+                if (b.eof()) return error.InvalidEscape;
+                b.pos += 1; // }
+                b.rustSpace(flags);
+                if (!any) return error.InvalidEscape;
+            } else {
+                const digits: usize = switch (kind) {
+                    'x' => 2,
+                    'u' => 4,
+                    else => 8,
+                };
+                for (0..digits) |i| {
+                    if (i > 0 and !b.rustBump(flags)) return error.InvalidEscape;
+                    const d = hexDigit(b.peek()) orelse return error.InvalidEscape;
+                    v = @min(v * 16 + d, 0x110000);
+                }
+                _ = b.rustBump(flags);
+            }
+            // A Rust `char`: no surrogates, nothing past U+10FFFF.
+            if (v > 0x10ffff or (v >= 0xd800 and v <= 0xdfff)) return error.InvalidEscape;
+            return .{ .cp = @intCast(v), .byte = kind == 'x' and !braced };
+        }
+
+        /// `\d \s \w` and their negations (letter consumed): Unicode with
+        /// `u`, else ASCII — whose negation could match a byte past ASCII,
+        /// an error on `&str`. Not case-folded on their own (Rust).
+        fn rustPerl(b: *Self, c: u8, flags: Flags) Error!Escape {
+            const negated = std.ascii.isUpper(c);
+            const start = b.nranges;
+            if (flags.unicode) {
+                switch (std.ascii.toLower(c)) {
+                    'd' => try b.addBase16(unicode16.perl_digit),
+                    's' => try b.addBase16(unicode16.perl_space),
+                    else => try b.addBase16(unicode16.perl_word),
+                }
+            } else {
+                if (negated) return error.InvalidUtf8;
+                const set: []const Range = switch (std.ascii.toLower(c)) {
+                    'd' => &.{.{ .lo = '0', .hi = '9' }},
+                    's' => &.{ .{ .lo = '\t', .hi = '\r' }, .{ .lo = ' ', .hi = ' ' } },
+                    else => &word_ranges,
+                };
+                for (set) |r| try b.addRange(r);
+            }
+            b.normalizeFrom(start);
+            if (negated) try b.negateFrom(start);
+            return .{ .class = .{ .start = start, .len = b.nranges - start } };
+        }
+
+        /// `\p…`/`\P…` at `pos` (the letter): one letter, or a query in braces
+        /// (`Name`, `name=value`, `name:value`, `name!=value`). Case-folded
+        /// with `(?i)`, then negated. Refused under `(?-u)`.
+        fn rustUnicodeEscape(b: *Self, flags: Flags) Error!Escape {
+            var negated = b.peek() == 'P';
+            if (!b.rustBump(flags)) return error.InvalidUnicodeClass;
+            var buf: [max_class_name]u8 = undefined;
+            var n: usize = 0;
+            if (b.peek() == '{') {
+                while (b.rustBump(flags) and b.peek() != '}') {
+                    const s = b.pos;
+                    _ = b.nextRune();
+                    const ch = b.src[s..b.pos];
+                    if (n + ch.len > buf.len) return error.InvalidUnicodeClass;
+                    @memcpy(buf[n..][0..ch.len], ch);
+                    n += ch.len;
+                    b.pos = s;
+                }
+                if (b.eof()) return error.InvalidUnicodeClass;
+                b.pos += 1; // }
+            } else {
+                if (b.peek() == '\\') return error.InvalidUnicodeClass;
+                const s = b.pos;
+                _ = b.rustBump(flags);
+                // The one letter only (spaces after it were skipped).
+                const len = std.unicode.utf8ByteSequenceLength(b.src[s]) catch unreachable;
+                @memcpy(buf[0..len], b.src[s..][0..len]);
+                n = len;
+            }
+            if (!flags.unicode) return error.InvalidUnicodeClass;
+            const query = buf[0..n];
+            const start = b.nranges;
+            if (std.mem.find(u8, query, "!=")) |i| {
+                negated = !negated;
+                try b.addRustProperty(query[0..i], query[i + 2 ..]);
+            } else if (std.mem.findScalar(u8, query, ':')) |i| {
+                try b.addRustProperty(query[0..i], query[i + 1 ..]);
+            } else if (std.mem.findScalar(u8, query, '=')) |i| {
+                try b.addRustProperty(query[0..i], query[i + 1 ..]);
+            } else {
+                var key: [max_class_name]u8 = undefined;
+                try b.addBase16(find16(rustNormalize(query, &key)) orelse return error.InvalidUnicodeClass);
+            }
+            if (flags.fold) try b.foldFromWith(casefold16, start);
+            b.normalizeFrom(start);
+            if (negated) try b.negateFrom(start);
+            return .{ .class = .{ .start = start, .len = b.nranges - start } };
+        }
+
+        /// `name=value`: a property of `unicode16.props` (general category,
+        /// script, script extensions, age, the break properties) and one of
+        /// its values, both normalized as regex-syntax does.
+        fn addRustProperty(b: *Self, name: []const u8, value: []const u8) Error!void {
+            var nbuf: [max_class_name]u8 = undefined;
+            const prop = rustNormalize(name, &nbuf);
+            const id = for (unicode16.props) |p| {
+                if (std.mem.eql(u8, p.name, prop)) break p.id;
+            } else return error.InvalidUnicodeClass;
+            var vbuf: [max_class_name]u8 = undefined;
+            const v = rustNormalize(value, &vbuf);
+            var kbuf: [2 * max_class_name]u8 = undefined;
+            if (id.len + 1 + v.len > kbuf.len) return error.InvalidUnicodeClass;
+            @memcpy(kbuf[0..id.len], id);
+            kbuf[id.len] = '=';
+            @memcpy(kbuf[id.len + 1 ..][0..v.len], v);
+            const key = kbuf[0 .. id.len + 1 + v.len];
+            try b.addBase16(find16(key) orelse return error.InvalidUnicodeClass);
+        }
+
+        /// Append the ranges of `unicode16.bases[base]`.
+        fn addBase16(b: *Self, base: u16) Error!void {
+            var it: Ranges16 = .init(base);
+            while (it.next()) |r| try b.addRange(r);
+        }
+
+        /// `[...]` at `pos`: its ranges appended at the old `nranges`, sorted
+        /// and merged. Rust's order: union binds tighter than `&& -- ~~`
+        /// (left to right, each side case-folded first), then the whole
+        /// class is folded, then negated.
+        fn rustClass(b: *Self, flags: Flags, depth: u32) Error!void {
+            if (depth > max_depth) return error.NestingDepth;
+            const start = b.nranges;
+            if (!b.rustBump(flags)) return error.MissingBracket;
+            var negated = false;
+            if (b.peek() == '^') {
+                negated = true;
+                if (!b.rustBump(flags)) return error.MissingBracket;
+            }
+            // Leading `-`s are members; so is a first `]` (not after a `-`).
+            // Heights (`rheight`): the union being read has `items` members,
+            // the tallest `union_h`; `lhs_h` is the set-operation chain's.
+            var items: u32 = 0;
+            var union_h: u32 = 0;
+            var lhs_h: u32 = 0;
+            var dashes = false;
+            while (b.peek() == '-') {
+                try b.addRange(.{ .lo = '-', .hi = '-' });
+                dashes = true;
+                items += 1;
+                if (!b.rustBump(flags)) return error.MissingBracket;
+            }
+            if (!dashes and b.peek() == ']') {
+                try b.addRange(.{ .lo = ']', .hi = ']' });
+                items += 1;
+                if (!b.rustBump(flags)) return error.MissingBracket;
+            }
+            // ranges[start..operand] is the result so far, ranges[operand..]
+            // the union being read; `op` is the operator between them.
+            var operand = start;
+            var op: u8 = 0;
+            while (true) {
+                b.rustSpace(flags);
+                if (b.eof()) return error.MissingBracket;
+                const c = b.peek();
+                if (c == ']') {
+                    b.pos += 1;
+                    break;
+                }
+                if ((c == '&' or c == '-' or c == '~') and b.pos + 1 < b.src.len and b.src[b.pos + 1] == c) {
+                    b.pos += 2;
+                    try b.rustClassOp(flags, start, &operand, op);
+                    const u = union_h + @intFromBool(items >= 2);
+                    lhs_h = if (op == 0) u else 1 + @max(lhs_h, u);
+                    items = 0;
+                    union_h = 0;
+                    op = c;
+                    continue;
+                }
+                b.rheight = 0;
+                try b.rustClassItem(flags, depth);
+                items += 1;
+                union_h = @max(union_h, b.rheight);
+            }
+            try b.rustClassOp(flags, start, &operand, op);
+            const u = union_h + @intFromBool(items >= 2);
+            b.rheight = 1 + if (op == 0) u else 1 + @max(lhs_h, u);
+            if (flags.fold) try b.rustFold(flags, start);
+            b.normalizeFrom(start);
+            if (negated) {
+                // Over bytes, a negation reaches past ASCII: not on `&str`.
+                if (!flags.unicode) return error.InvalidUtf8;
+                try b.negateFrom(start);
+            }
+        }
+
+        /// Close the operand at `operand.*`: with no operator it joins the
+        /// result; else result `op` operand replaces both.
+        fn rustClassOp(b: *Self, flags: Flags, start: u16, operand: *u16, op: u8) Error!void {
+            if (op == 0) {
+                b.normalizeFrom(start);
+                operand.* = b.nranges;
+                return;
+            }
+            if (flags.fold) {
+                try b.rustFold(flags, operand.*);
+                // Folding the result appends after the operand: fold a copy
+                // of the result past both, then make it the result again.
+                const lhs_len = operand.* - start;
+                const rhs_start = operand.*;
+                const rhs_len = b.nranges - rhs_start;
+                const copy = b.nranges;
+                for (0..lhs_len) |i| try b.addRange(b.ranges[start + i]);
+                try b.rustFold(flags, copy);
+                const folded_len = b.nranges - copy;
+                // Layout now: lhs | rhs | folded lhs. Rebuild lhs' | rhs.
+                const tmp = b.nranges;
+                for (0..rhs_len) |i| try b.addRange(b.ranges[rhs_start + i]);
+                std.mem.copyForwards(Range, b.ranges[start..][0..folded_len], b.ranges[copy..][0..folded_len]);
+                std.mem.copyForwards(Range, b.ranges[start + folded_len ..][0..rhs_len], b.ranges[tmp..][0..rhs_len]);
+                b.nranges = start + folded_len + rhs_len;
+                operand.* = start + folded_len;
+            }
+            b.normalizeFrom(operand.*);
+            const lhs = b.ranges[start..operand.*];
+            const rhs = b.ranges[operand.*..b.nranges];
+            const out = b.nranges;
+            try b.appendSetOp(lhs, rhs, op);
+            const m = b.nranges - out;
+            std.mem.copyForwards(Range, b.ranges[start..][0..m], b.ranges[out..][0..m]);
+            b.nranges = start + m;
+            b.normalizeFrom(start);
+            operand.* = b.nranges;
+        }
+
+        /// Append `x op y` (`&` intersection, `-` difference, `~` symmetric
+        /// difference) of two sorted, merged range lists.
+        fn appendSetOp(b: *Self, x: []const Range, y: []const Range, op: u8) Error!void {
+            var i: usize = 0;
+            var j: usize = 0;
+            var p: u32 = 0;
+            while (p <= 0x10ffff) {
+                while (i < x.len and x[i].hi < p) i += 1;
+                while (j < y.len and y[j].hi < p) j += 1;
+                const in_x = i < x.len and x[i].lo <= p;
+                const in_y = j < y.len and y[j].lo <= p;
+                var end: u32 = 0x10ffff;
+                if (i < x.len) end = @min(end, if (in_x) @as(u32, x[i].hi) else @as(u32, x[i].lo) - 1);
+                if (j < y.len) end = @min(end, if (in_y) @as(u32, y[j].hi) else @as(u32, y[j].lo) - 1);
+                const keep = switch (op) {
+                    '&' => in_x and in_y,
+                    '-' => in_x and !in_y,
+                    else => in_x != in_y,
+                };
+                if (keep) try b.addRange(.{ .lo = @intCast(p), .hi = @intCast(end) });
+                p = end + 1;
+            }
+        }
+
+        /// Case-fold `ranges[start..]`: Unicode orbits, or with `(?-u)` the
+        /// ASCII letters' other case.
+        fn rustFold(b: *Self, flags: Flags, start: u16) Error!void {
+            if (flags.unicode) return b.foldFromWith(casefold16, start);
+            const end = b.nranges;
+            for (start..end) |i| {
+                const r = b.ranges[i];
+                const pairs = [_][2]u21{ .{ 'a', 'A' }, .{ 'A', 'a' } };
+                for (pairs) |p| {
+                    const lo = @max(r.lo, p[0]);
+                    const hi = @min(r.hi, p[0] + 25);
+                    if (lo <= hi) try b.addRange(.{ .lo = lo - p[0] + p[1], .hi = hi - p[0] + p[1] });
+                }
+            }
+        }
+
+        /// One class member: a nested class, `[:name:]`, an escape, or a
+        /// code point — and with `-` after it a range.
+        fn rustClassItem(b: *Self, flags: Flags, depth: u32) Error!void {
+            if (b.peek() == '[') {
+                if (try b.rustAsciiClass(flags)) return;
+                return b.rustClass(flags, depth + 1);
+            }
+            const lo = try b.rustClassPrim(flags);
+            b.rustSpace(flags);
+            if (b.eof()) return error.MissingBracket;
+            const range = b.peek() == '-' and blk: {
+                const nx = b.rustPeekSpace(flags);
+                break :blk nx != ']' and nx != '-';
+            };
+            if (!range) {
+                if (lo) |cp| try b.addRange(.{ .lo = cp, .hi = cp });
+                return;
+            }
+            // A set (`\d`) cannot start a range.
+            const first = lo orelse return error.InvalidCharRange;
+            if (!b.rustBump(flags)) return error.MissingBracket;
+            const hi = try b.rustClassPrim(flags) orelse return error.InvalidCharRange;
+            if (hi < first) return error.InvalidCharRange;
+            try b.addRange(.{ .lo = first, .hi = hi });
+        }
+
+        /// A code point (null after appending an escape's set). Under `(?-u)`
+        /// only ASCII: a class member is a byte there.
+        fn rustClassPrim(b: *Self, flags: Flags) Error!?u21 {
+            const cp: u21 = if (b.peek() == '\\') switch (try b.rustEscape(flags, true)) {
+                .rune => |r| r,
+                .class => return null,
+                else => return error.InvalidEscape,
+            } else b.nextRune();
+            if (!flags.unicode and cp > 0x7f) return error.InvalidUtf8;
+            return cp;
+        }
+
+        /// `[:name:]` / `[:^name:]` at `pos` inside a class; false (nothing
+        /// consumed) when it is not one — then `[` opens a nested class.
+        fn rustAsciiClass(b: *Self, flags: Flags) Error!bool {
+            if (!std.mem.startsWith(u8, b.src[b.pos..], "[:")) return false;
+            const end = std.mem.findPos(u8, b.src, b.pos + 2, ":") orelse return false;
+            if (!std.mem.startsWith(u8, b.src[end..], ":]")) return false;
+            var name = b.src[b.pos + 2 .. end];
+            const negated = name.len != 0 and name[0] == '^';
+            if (negated) name = name[1..];
+            const set: []const Range = posix_classes.get(name) orelse return false;
+            b.pos = end + 2;
+            const start = b.nranges;
+            for (set) |r| try b.addRange(r);
+            // Folded before it is negated (`(?i)[[:^upper:]]` takes no letter).
+            if (flags.fold) try b.rustFold(flags, start);
+            if (negated) {
+                if (!flags.unicode) return error.InvalidUtf8;
+                try b.negateFrom(start);
+            }
+            return true;
         }
 
         // ── compiling ────────────────────────────────────────────────────────
@@ -983,6 +1807,132 @@ pub fn BuilderOf(comptime cap: Capacity) type {
     };
 }
 
+/// Unicode White_Space (Rust's `char::is_whitespace`, the `(?x)` space and
+/// the Unicode `\s`); unchanged since Unicode 6.
+const rust_white_space = [_]Range{
+    .{ .lo = '\t', .hi = '\r' },     .{ .lo = ' ', .hi = ' ' },
+    .{ .lo = 0x85, .hi = 0x85 },     .{ .lo = 0xa0, .hi = 0xa0 },
+    .{ .lo = 0x1680, .hi = 0x1680 }, .{ .lo = 0x2000, .hi = 0x200a },
+    .{ .lo = 0x2028, .hi = 0x2029 }, .{ .lo = 0x202f, .hi = 0x202f },
+    .{ .lo = 0x205f, .hi = 0x205f }, .{ .lo = 0x3000, .hi = 0x3000 },
+};
+
+fn isRustSpace(cp: u21) bool {
+    for (rust_white_space) |r| if (cp >= r.lo and cp <= r.hi) return true;
+    return false;
+}
+
+/// Whether the code point at `s[i]` (valid UTF-8) is White_Space.
+fn isRustSpaceAt(s: []const u8, i: usize) bool {
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch unreachable;
+    return isRustSpace(std.unicode.utf8Decode(s[i..][0..len]) catch unreachable);
+}
+
+/// Rust's `char::is_alphabetic` (the Alphabetic property; Rust's own
+/// Unicode version may differ from regex-syntax's 16.0 — not seen in names).
+fn isRustAlphabetic(cp: u21) bool {
+    if (cp < 0x80) return std.ascii.isAlphabetic(@intCast(cp));
+    return in16(comptime find16("alphabetic").?, cp);
+}
+
+/// Rust's `char::is_numeric` (general category N).
+fn isRustNumeric(cp: u21) bool {
+    if (cp < 0x80) return std.ascii.isDigit(@intCast(cp));
+    return in16(comptime find16("n").?, cp);
+}
+
+/// The ranges of one `unicode16` table, decoded from its varints.
+const Ranges16 = struct {
+    bytes: []const u8,
+    left: u16,
+    i: usize = 0,
+    next_lo: u32 = 0,
+
+    fn init(base: u16) Ranges16 {
+        const t = unicode16.bases[base];
+        return .{ .bytes = unicode16.data[t.offset..][0..t.size], .left = t.count };
+    }
+
+    fn next(it: *Ranges16) ?Range {
+        if (it.left == 0) return null;
+        it.left -= 1;
+        const lo = it.next_lo + readVarint(it.bytes, &it.i);
+        const hi = lo + readVarint(it.bytes, &it.i);
+        it.next_lo = hi + 1;
+        return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
+    }
+};
+
+/// Whether `cp` is in `unicode16.bases[base]` (a walk over its ranges).
+fn in16(base: u16, cp: u21) bool {
+    var it: Ranges16 = .init(base);
+    while (it.next()) |r| {
+        if (cp < r.lo) return false;
+        if (cp <= r.hi) return true;
+    }
+    return false;
+}
+
+/// Rust's Unicode `\w` (`perl_word`, Unicode 16.0), decoded at compile time.
+const perl_word_ranges = blk: {
+    @setEvalBranchQuota(100_000);
+    var out: [unicode16.bases[unicode16.perl_word].count]Range = undefined;
+    var it: Ranges16 = .init(unicode16.perl_word);
+    for (&out) |*r| r.* = it.next().?;
+    break :blk out;
+};
+
+/// Whether `cp` is a word character of the Unicode word boundaries.
+pub fn isPerlWord(cp: u21) bool {
+    const rs = &perl_word_ranges;
+    var lo: usize = 0;
+    var hi: usize = rs.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        if (cp < rs[mid].lo) hi = mid else if (cp > rs[mid].hi) lo = mid + 1 else return true;
+    }
+    return false;
+}
+
+/// The table of a `unicode16` key, by binary search.
+fn find16(key: []const u8) ?u16 {
+    const names = &unicode16.names;
+    var lo: usize = 0;
+    var hi: usize = names.len;
+    while (lo < hi) {
+        const mid = (lo + hi) / 2;
+        switch (std.mem.order(u8, names[mid].name, key)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return names[mid].base,
+        }
+    }
+    return null;
+}
+
+/// regex-syntax's `symbolic_name_normalize`: an `is` prefix (any case)
+/// dropped, ASCII lower-cased, ` `, `_`, `-` and non-ASCII bytes dropped;
+/// `isc` (ISO_Comment) kept. Truncated to `buf` (longer than any key).
+fn rustNormalize(name: []const u8, buf: *[max_class_name]u8) []const u8 {
+    const is = name.len >= 2 and std.ascii.eqlIgnoreCase(name[0..2], "is");
+    var n: usize = 0;
+    for (name[if (is) 2 else 0..]) |c| {
+        if (c == ' ' or c == '_' or c == '-' or c >= 0x80) continue;
+        if (n == buf.len) break;
+        buf[n] = std.ascii.toLower(c);
+        n += 1;
+    }
+    if (is and n == 1 and buf[0] == 'c') {
+        @memcpy(buf[0..3], "isc");
+        n = 3;
+    }
+    return buf[0..n];
+}
+
+fn isWordBoundaryNameChar(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '-';
+}
+
 /// Longer than any Unicode class name in its loose form.
 const max_class_name = 48;
 
@@ -1090,7 +2040,11 @@ fn foldNext(cp: u21) u21 {
 
 /// The index of the first fold run whose `hi` is at least `cp` (binary search).
 fn firstRunEndingAtOrAfter(cp: u21) usize {
-    const runs = &casefold.runs;
+    return firstRunIn(casefold, cp);
+}
+
+fn firstRunIn(comptime cf: type, cp: u21) usize {
+    const runs = &cf.runs;
     var lo: usize = 0;
     var hi: usize = runs.len;
     while (lo < hi) {

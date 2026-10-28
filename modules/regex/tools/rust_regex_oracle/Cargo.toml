@@ -1,0 +1,12 @@
+[package]
+name = "rust_regex_oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Default features: the crate as its users get it (std, perf, unicode).
+regex = "=1.13.1"
+
+[profile.release]
+opt-level = 1

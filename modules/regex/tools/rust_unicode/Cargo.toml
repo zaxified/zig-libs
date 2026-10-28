@@ -1,0 +1,9 @@
+[package]
+name = "rust_unicode"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Default features (unicode, std ...): the crate as `regex` 1.13.1 pulls it.
+regex-syntax = "=0.8.11"

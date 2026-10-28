@@ -97,6 +97,10 @@ pub const Regex = struct {
     /// code point before (`Dfa.Ctx`) only then. Not a prefilter: it changes
     /// what a state is, not what the search may skip.
     asserts: bool = true,
+    /// The program has an assertion only the Rust grammar writes (CRLF lines,
+    /// Unicode or start/end word boundaries): the lazy DFAs and the one-pass
+    /// engine, whose contexts know ASCII only, step aside for the VMs.
+    vm_only: bool = false,
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
     /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
@@ -156,7 +160,7 @@ pub const Regex = struct {
             tp.* = t;
             pf.teddy = tp;
         }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts) };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts), .vm_only = hasRustAsserts(insts) };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -261,6 +265,10 @@ pub const Regex = struct {
     }
 
     fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+        if (re.vm_only) {
+            var t: SliceText = .{ .input = input };
+            return re.runSetOn(&t, full);
+        }
         if (!full and re.prefilter.end_anchored) {
             if (re.prefilter.last) |set| {
                 if (input.len == 0) return false;
@@ -622,7 +630,7 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
             pf.teddy = &final_teddy;
         }
         const final_pf = pf;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts) };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts), .vm_only = hasRustAsserts(&insts) };
     }
 }
 
@@ -1765,6 +1773,13 @@ const OnePass = struct {
     }
 };
 
+fn hasRustAsserts(insts: []const Inst) bool {
+    for (insts) |inst| {
+        if (inst == .assert and @backingInt(inst.assert) > @backingInt(Assert.not_word_boundary)) return true;
+    }
+    return false;
+}
+
 fn hasAsserts(insts: []const Inst) bool {
     for (insts) |inst| {
         if (inst == .assert) return true;
@@ -2313,7 +2328,7 @@ pub const Matcher = struct {
     /// DFA does not apply or cannot get its memory.
     fn findDfa(m: *Matcher, input: []const u8, from: usize) ??Span {
         const re = m.re;
-        if (m.pike_only or re.longest or re.insts.len > Dfa.max_insts) return null;
+        if (m.pike_only or re.vm_only or re.longest or re.insts.len > Dfa.max_insts) return null;
         const anchored = re.prefilter.anchored;
         if (anchored and from != 0) return @as(?Span, null); // `\A` holds at 0 only
         // Inside a UTF-8 sequence the VMs read from `from` on, byte by byte;
@@ -2388,7 +2403,7 @@ pub const Matcher = struct {
     /// captures); otherwise by the DFAs, then the engine from that start.
     fn capturesOnePass(m: *Matcher, input: []const u8, from: usize) ?bool {
         const re = m.re;
-        if (m.pike_only or m.onepass_off or re.longest or re.insts.len > Dfa.max_insts) return null;
+        if (m.pike_only or m.onepass_off or re.vm_only or re.longest or re.insts.len > Dfa.max_insts) return null;
         const anchored = re.prefilter.anchored;
         if (anchored and from != 0) return false;
         // As in `findDfa`: `start` would read a whole UTF-8 sequence backwards.
@@ -2905,18 +2920,29 @@ fn decodeBefore(input: []const u8, i: usize) Decoded {
 }
 
 /// What the assertions need of the text just before `i`: null at the start,
-/// the byte when it is ASCII, and U+FFFD for any non-ASCII code point — the
-/// assertions look only at ASCII (`\n` for `(?m)^`, ASCII word characters
-/// for `\b`, as RE2), so which non-ASCII code point it was never matters.
+/// else the code point that ends there (U+FFFD for an invalid sequence).
+/// The Go grammar's assertions look at ASCII only; the Rust grammar's
+/// Unicode word boundaries need the whole code point.
 fn runeBefore(input: []const u8, i: usize) ?u21 {
     if (i == 0) return null;
     const c = input[i - 1];
-    return if (c < 0x80) c else 0xfffd;
+    if (c < 0x80) return c;
+    return runeBeforeWide(input, i);
+}
+
+noinline fn runeBeforeWide(input: []const u8, i: usize) u21 {
+    return decodeBefore(input, i).cp.?;
 }
 
 fn isWord(cp: ?u21) bool {
     const c = cp orelse return false;
     return c < 0x80 and (std.ascii.isAlphanumeric(@intCast(c)) or c == '_');
+}
+
+fn isUnicodeWord(cp: ?u21) bool {
+    const c = cp orelse return false;
+    if (c < 0x80) return isWord(c);
+    return syntax.isPerlWord(c);
 }
 
 fn assertHolds(a: Assert, prev: ?u21, next: ?u21) bool {
@@ -2927,6 +2953,18 @@ fn assertHolds(a: Assert, prev: ?u21, next: ?u21) bool {
         .end_line => next == null or next.? == '\n',
         .word_boundary => isWord(prev) != isWord(next),
         .not_word_boundary => isWord(prev) == isWord(next),
+        .begin_line_crlf => prev == null or prev.? == '\n' or (prev.? == '\r' and next != '\n'),
+        .end_line_crlf => next == null or next.? == '\r' or (next.? == '\n' and prev != '\r'),
+        .word_boundary_unicode => isUnicodeWord(prev) != isUnicodeWord(next),
+        .not_word_boundary_unicode => isUnicodeWord(prev) == isUnicodeWord(next),
+        .word_start => !isWord(prev) and isWord(next),
+        .word_end => isWord(prev) and !isWord(next),
+        .word_start_half => !isWord(prev),
+        .word_end_half => !isWord(next),
+        .word_start_unicode => !isUnicodeWord(prev) and isUnicodeWord(next),
+        .word_end_unicode => isUnicodeWord(prev) and !isUnicodeWord(next),
+        .word_start_half_unicode => !isUnicodeWord(prev),
+        .word_end_half_unicode => !isUnicodeWord(next),
     };
 }
 
@@ -4079,6 +4117,7 @@ test {
     _ = syntax;
     _ = teddy;
     _ = @import("go_oracle_test.zig");
+    _ = @import("rust_oracle_test.zig");
     _ = @import("fuzz_test.zig");
 }
 

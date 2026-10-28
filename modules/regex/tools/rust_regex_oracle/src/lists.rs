@@ -1,0 +1,1729 @@
+// SPDX-License-Identifier: MIT
+
+// Crafted pattern lists. `CRAFTED_TXT` and `BYTES_TXT` hold one pattern per
+// line, verbatim (no unescaping; blank lines and lines starting with `;;` are
+// skipped). Patterns that need a real control character, leading/trailing
+// space or the empty pattern live in the `*_SPECIAL` arrays.
+
+pub const CRAFTED_TXT: &str = r#"
+;; basics
+a
+abc
+a|b
+a||b
+|a
+a|
+(?:)
+()
+(|)
+a|b|c
+ab|cd
+a(|b)
+a(b|)c
+;; flags
+(?i)abc
+(?i)ABC
+(?i:a)b
+(?-i)a
+(?i-s)a
+(?is)a.b
+(?s-s).+
+(?i-i)a
+(?ii)a
+(?)
+(?-)
+(?i-)
+(?--i)
+(?z)
+(?i
+(?i:a
+(?i)(?-i)a
+(?i)a(?-i:b)c
+(?m)^a$
+(?s).+
+(?-s).+
+(?mi)^a$
+(?m-i)^a$
+(?-m)^a$
+(?sm-iUR)a
+(?iiiii)a
+(?i)(?i)(?i)a
+a(?i)b|c
+(a(?i)b)c
+(?i:(?-i:a))
+(?-i:(?i:a))
+(?i)*
+a(?i)*
+a(?i)+b
+(?x)*
+(?:a(?i)b)+
+;; flag x: whitespace and comments
+(?x)a b c
+(?x) a   b
+(?x)a#c
+(?x)a\ b
+(?x)a\#b
+(?x)a\ \ b
+(?x)\
+(?x)[a b]
+(?x)[a#b]
+(?x)[ ]
+(?x)[ a - z ]
+(?x)[a - z]
+(?x)[ ^a]
+(?x)[^ a]
+(?x)[a\ b]
+(?x)[\w && \d]
+(?x)[\w &&\d]
+(?x)[ [a] [b] ]
+(?x)[[:alpha: ]]
+(?x)[[ :alpha:]]
+(?x)[[:alpha:] ]
+(?x)a{ 2 , 3 }
+a{ 2 , 3 }
+a{2 ,3}
+a{2, 3}
+a{ 2}
+a{2 }
+(?x)a {2,3}
+(?x)a{2,3} ?
+(?x)a +
+(?x)a * ?
+(?x)( ?:a)
+( ?:a)
+(?x)( ?:a)+
+(?x)(? :a)
+(?x)(?P<n a>b)
+(?x)(?P< n>b)
+(?x)(?P <n>b)
+(?x)\p{ L }
+(?x)\p{L }
+(?x)\p {L}
+(?x)\x{ 41 }
+(?x)\x 41
+(?x)\x4 1
+(?x)\u00 41
+(?x)\b{ start }
+(?x)\b {start}
+(?x)\ b
+(?x-x)a b
+(?x: a b )c d
+(?x)a(?-x: )b
+(?x)a(?-x:#)b
+(?x)# only a comment
+(?x)
+(?x)
+(?x:)
+(?x)(?# c)a
+(?x)(?i) a
+(?x) (?i) a
+(?x)(?:a|b) c
+(?x)\Aa b\z
+(?x)[a-z] +
+(?x)a|
+(?x)|a
+(?x) |a
+(?x)a b|c d
+(?xi)a b
+(?x)a   (?-x)b c
+;; flag U (swap greed)
+(?U)a+
+(?U)a+?
+(?U)a*?
+(?U)a??
+(?U)a{2,3}
+(?U)a{2,3}?
+(?U:a+)a+
+(?iU)a+
+(?-U)a+
+(?U)(a*)(a*)
+(?U).*b
+(?U)(?:a|ab)(?:c|bcd)
+(?U)a+b+?c*
+;; flag R (CRLF)
+(?R)^a$
+(?mR)^a$
+(?mR)^$
+(?mR).$
+(?mR)^.
+(?R)(?m)$
+(?R).+
+(?sR).+
+(?R)\r
+(?R)\n
+(?R)[^a]
+(?R)[^a]+
+(?mR)^.*$
+(?mR)^.+$
+(?m)^$
+(?m)$
+(?m)^
+(?R)$
+(?R)^
+(?m-R)^a$
+(?mR-R)^a$
+(?mR)\A.*\z
+(?mR)\b
+(?mR)^\b
+(?m)^.+$
+(?mR).*
+(?mR)a$|^b
+(?mR)(?:^|a)b
+(?mR)[\r\n]
+(?mR)\r$
+(?mR)^\n
+(?R)(?-m)^
+;; flag u
+(?-u:\w)
+(?-u:\w)+
+(?-u:\W)
+(?-u:\d)
+(?-u:\D)
+(?-u:\s)
+(?-u:\S)
+(?-u:\b)
+(?-u:\B)
+(?-u:.)
+(?-u:[a-z])
+(?-u:[^a])
+(?-u:\xFF)
+(?-u:\x41)
+(?-u:\u{41})
+(?-u:é)
+(?-u)\w
+(?-u)\w+\b
+(?-u)\bé
+(?-u)é\b
+(?-u)\b+
+(?-u)\Bé
+(?-u)\W
+(?-u)(?i)k
+(?-u)(?i)s
+(?-u)(?i)ǅ
+(?-u:(?i)k)
+(?u)\w
+(?u:\w)
+(?-u:\w)\w
+\w(?-u:\w)
+(?-u)(?u)\w
+(?-u:(?u:\w))
+(?-u:\pL)
+(?-u:\p{Greek})
+(?-u)\p{L}
+(?-u)[[:alpha:]]
+(?-u)[\w&&\d]
+(?-u)[\W]
+(?-u)[^\W]
+(?-u)[é]
+(?-u)\x{41}
+(?-u)\x{FF}
+(?-u:\x{FF})
+(?-u).
+(?s-u).
+(?-u)[^a]
+(?-u)[^\x00-\x7F]
+(?-u)[\x80-\xFF]
+(?-u)[a-\xFF]
+(?-u)[^\x00-\xFE]
+(?-ui)k
+(?i-u)k
+(?i-u)\u212a
+(?i-u)\xFF
+(?i)\xFF
+(?i)\xDF
+(?i)\x{DF}
+\xFF
+\xff
+[\xFF]
+[^\xFF]
+\x{FF}
+;; Unicode default and word characters
+\w
+\W
+\d
+\D
+\s
+\S
+\b
+\B
+\w+
+\b\w+\b
+\bé
+\Bé
+é\b
+\b.\b
+\b+
+\B*
+\b\b
+\b\B
+\B\b
+[\w]
+[\W]
+[^\w]
+[^\W]
+[\d]
+[^\d]
+[\s]
+[^\s]
+[\w&&\D]
+[\w--\d]
+[\w~~\d]
+(?i)\w
+(?i)\W
+(?i)[^\w]
+(?i)\x{212a}
+(?i)[\x{212a}]
+(?i)\x{17f}
+(?i)k
+(?i)K
+(?i)s
+(?i)[k-l]
+(?i)[^k]
+(?i)\W+
+(?i)[\W]
+(?i)[^\W]
+;; word boundaries
+\b{start}
+\b{end}
+\b{start-half}
+\b{end-half}
+\<
+\>
+\<\w+\>
+\b{start}\w+\b{end}
+\b{start-half}\w
+\w\b{end-half}
+\b{start}+
+\b{end}*
+\b{start}\b{end}
+\b{start-half}\b{end-half}
+(?-u:\b{start})
+(?-u:\b{end-half})
+(?x)\b{ start }
+\b{foo}
+\b{}
+\b{
+\b{start
+\b{ start }
+\b{Start}
+\b{start-half
+\B{start}
+\<\>
+\<*
+a\>
+\<a
+\>\<
+(?m)\b{start}
+(?R)\b{end}
+;; escapes
+\u007F
+\u{7F}
+\U0000007F
+\U{7F}
+\x7F
+\x{7F}
+\x{10FFFF}
+\x{110000}
+\x{D800}
+\x{DFFF}
+\u{D800}
+\U{110000}
+\x{}
+\x{7
+\x7
+\x
+\x{7F
+\u007
+\u00
+\u{}
+\u{7F
+\u{
+\u
+\U0000007
+\U00110000
+\uD800
+\U{10FFFF}
+\u{10FFFF}
+\u{0}
+\x{0}
+\x00
+\u0041
+\x{0041}
+\x{000000041}
+\x{ 41}
+\x{41 }
+\xG1
+\x1G
+\u00zz
+\x{4G}
+\x{+41}
+\x{-41}
+\x{4_1}
+\U000000411
+\X41
+\xAB
+\xe9
+\x{e9}
+\xE9+
+\u00e9
+\u00E9
+\u{e9}
+\u{000000e9}
+\u{0000000e9}
+\x{0000000041}
+\a
+\f
+\t
+\n
+\r
+\v
+\e
+\0
+\00
+\000
+\0000
+\01
+\012
+\012+
+\07
+\08
+\1
+\2
+\9
+\10
+\12
+\1(a)
+(a)\1
+(a)\2
+(a)(b)\2
+(a)\k<1>
+\8
+\18
+\e
+\E
+\Q
+\Qa.b\E
+\Q\E
+\C
+\G
+\K
+\X
+\R
+\h
+\H
+\N
+\y
+\Y
+\Z
+\z
+\A
+\Aa\z
+\Aa\Z
+\Z+
+\_
+\-
+\é
+\
+a\
+(a\)
+\\
+\\\\
+\.
+\.\*\+
+\#
+\&
+\~
+\!
+\@
+\%
+\,
+\;
+\:
+\=
+\'
+\"
+\`
+\
+;; classes
+[a]
+[^a]
+[a-z]
+[z-a]
+[a-]
+[-a]
+[a-c-e]
+[a-c-]
+[-]
+[--]
+[--a]
+[a--]
+[a--b]
+[!--]
+[\-]
+[a\-c]
+[a-b-c]
+[\]]
+[]]
+[]a]
+[^]a]
+[]
+[^]
+[[]
+[a
+[a-
+[a-\d]
+[\d-z]
+[\w-z]
+[a-\w]
+[a-\pL]
+[\pL-z]
+[\d&&\w]
+[\w&&\d]
+[\w--\d]
+[\w~~\d]
+[a-z&&[^aeiou]]
+[a&&b]
+[a&&&b]
+[a&&]
+[&&a]
+[&&]
+[a~~b]
+[~~]
+[~~a]
+[a~~]
+[a~~~b]
+[a-c~~b-d]
+[a-z--m-p]
+[a-z--m-p&&c-x]
+[a-z&&c-x--m-p]
+[a-z--]
+[[a-z]&&[^m-p]]
+[x[^xyz]]
+[^x[^xyz]]
+[[^a]&&[^b]]
+[[a][b]]
+[a[b[c]]]
+[a[]]
+[[]a]
+[[^]a]
+[^[a]]
+[[a]
+[a]]
+[[a]-z]
+[a-[b]]
+[[a]-[b]]
+[\p{L}&&\p{Greek}]
+[\pL&&\p{Greek}]
+[\p{L}--\p{Lu}]
+[\p{L}~~\p{Lu}]
+[\p{Greek}\d]
+[^\p{L}]
+[\P{L}]
+[^\P{L}]
+[\p{^L}]
+[\P{^L}]
+[\p{L}\p{N}]+
+[a^]
+[^^]
+[\^]
+[\^a]
+[\&]
+[\~]
+[a b]
+[\n]
+[\r\n]
+[\\]
+[\d\D]
+[\w\W]
+[\x00-\x{10FFFF}]
+[\x{80}-\x{10FFFF}]
+[^\x00-\x7F]
+[é-ü]
+[é]
+[^é]
+[😀]
+[^😀]
+[a-😀]
+[\x{D7FF}-\x{E000}]
+[\x{D800}]
+[\x{10FFFF}]
+[\0]
+[\a\f\t\n\r\v]
+[\e]
+[\Q]
+[\b]
+[\B]
+[\A]
+[\z]
+[\<]
+[.]
+[*+?]
+[(|)]
+[$^]
+[[:alpha:]]
+[[:^alpha:]]
+[[:alpha:][:digit:]]
+[[:alnum:]]
+[[:ascii:]]
+[[:blank:]]
+[[:cntrl:]]
+[[:digit:]]
+[[:graph:]]
+[[:lower:]]
+[[:print:]]
+[[:punct:]]
+[[:space:]]
+[[:upper:]]
+[[:word:]]
+[[:xdigit:]]
+[[:^word:]]
+[[:^space:]]
+[[:foo:]]
+[[:alpha:]
+[[:alpha]
+[[:alpha:
+[[:]
+[[:]]
+[[::]]
+[[:^:]]
+[[:Alpha:]]
+[[: alpha :]]
+[[:alpha:]-z]
+[a-[:alpha:]]
+[^[:alpha:]]
+[^[:^alpha:]]
+[[:alpha:]&&[:lower:]]
+[[:alpha:]--[:lower:]]
+(?i)[[:upper:]]
+(?i)[[:^upper:]]
+(?i)[[:lower:]]
+(?i)[^[:lower:]]
+(?i)[k]
+(?i)[^k]
+(?i)[a-z]
+(?i)[^a-z]
+(?i)[ǅ]
+(?i)[\p{Lu}]
+(?i)[^\p{Lu}]
+(?i)\p{Lu}
+(?i)\P{Lu}
+(?i)\p{Ll}
+(?i)\p{Lt}
+(?i)[[:lower:]&&[^a]]
+;; unicode properties
+\pL
+\PL
+\pN+
+\p{L}
+\p{^L}
+\P{^L}
+\p{Any}
+\P{Any}
+\p{any}
+\p{ASCII}
+\p{ascii}
+\P{ASCII}
+\p{Assigned}
+\P{Assigned}
+\p{Greek}
+\p{greek}
+\p{GREEK}
+\p{Is_Greek}
+\p{IsGreek}
+\p{Script=Greek}
+\p{Script:Greek}
+\p{script=greek}
+\p{sc=Greek}
+\p{sc:Greek}
+\p{sc=Grek}
+\p{sc=Latn}
+\p{sc=Cyrl}
+\p{sc=Hani}
+\p{sc=Zyyy}
+\p{sc=Zinh}
+\p{sc=Qaai}
+\p{Zyyy}
+\p{Common}
+\p{common}
+\p{Inherited}
+\p{Unknown}
+\p{Zzzz}
+\p{scx=Greek}
+\p{scx:Greek}
+\p{Script_Extensions=Greek}
+\p{script_extensions=greek}
+\p{scx=Grek}
+\p{scx=Common}
+\p{scx=Zyyy}
+\p{scx=Inherited}
+\p{scx=Han}
+\p{scx=Hira}
+\p{scx=Kana}
+\p{scx=Arab}
+\p{scx=Deva}
+\p{scx=Latin}
+\p{scx=Foo}
+\p{scx}
+\p{scx=}
+\p{sc=}
+\p{=Greek}
+\p{Script=}
+\p{Script}
+\p{Foo=Greek}
+\p{Greek=Greek}
+\p{Old Italic}
+\p{Old_Italic}
+\p{old-italic}
+\p{OLD_ITALIC}
+\p{OldItalic}
+\p{oldItalic}
+\p{ Greek}
+\p{Greek }
+\p{G r e e k}
+\p{__Greek__}
+\p{Gr-eek}
+\p{Greek.}
+\p{Greek!}
+\p{}
+\p{^}
+\p{ }
+\p
+\P
+\p{L
+\p{L}u
+\pLu
+\pé
+\p{é}
+\p{
+\p}
+\p^L
+\p{^^L}
+\p{^ L}
+\p{ ^L}
+\pl
+\p{l}
+\p{lu}
+\p{LU}
+\p{Lu}
+\p{lowercase_letter}
+\p{Lowercase_Letter}
+\p{LowercaseLetter}
+\p{lowercaseletter}
+\p{uppercase letter}
+\p{Cased_Letter}
+\p{LC}
+\p{L&}
+\p{L_}
+\p{Ll}+
+\p{Cn}
+\p{Unassigned}
+\p{^Cn}
+\p{C}
+\p{Other}
+\p{Cs}
+\p{Surrogate}
+\p{Co}
+\p{Private_Use}
+\p{digit}
+\p{Digit}
+\p{punct}
+\p{cntrl}
+\p{alpha}
+\p{Alpha}
+\p{space}
+\p{word}
+\p{gc=L}
+\p{gc:L}
+\p{gc=Lu}
+\p{gc=lu}
+\p{gc=Uppercase_Letter}
+\p{General_Category=Lu}
+\p{general_category=uppercaseletter}
+\p{gc=}
+\p{gc=Foo}
+\p{gc=Greek}
+\p{Alphabetic}
+\p{alphabetic}
+\p{alpha}
+\p{Alphabetic=Yes}
+\p{Alphabetic=No}
+\p{Alphabetic=Y}
+\p{Alphabetic=N}
+\p{Alphabetic=true}
+\p{Alphabetic=T}
+\p{Alphabetic=False}
+\p{Alphabetic=Maybe}
+\p{Alphabetic=}
+\p{White_Space}
+\p{white_space}
+\p{WhiteSpace}
+\p{wspace}
+\p{space}
+\p{Emoji}
+\p{emoji}
+\p{Uppercase}
+\p{Upper}
+\p{Lowercase}
+\p{Lower}
+\p{Math}
+\p{Dash}
+\p{Hex_Digit}
+\p{Hex}
+\p{AHex}
+\p{ASCII_Hex_Digit}
+\p{ID_Start}
+\p{IDS}
+\p{XID_Continue}
+\p{XIDC}
+\p{Ideographic}
+\p{Ideo}
+\p{Cased}
+\p{CWL}
+\p{Changes_When_Lowercased}
+\p{Variation_Selector}
+\p{VS}
+\p{Join_Control}
+\p{Join_C}
+\p{Bidi_Mirrored}
+\p{Bidi_M}
+\p{Foo}
+\p{Letter}
+\p{letter}
+\p{Number}
+\p{Mark}
+\p{Combining_Mark}
+\p{Symbol}
+\p{Separator}
+\p{Punctuation}
+\p{Age=V5_0}
+\p{Age=5.0}
+\p{age:5.0}
+\p{Age=V1_1}
+\p{Age=1.1}
+\p{Age=V6_0}
+\p{Age=v6_0}
+\p{Age=Unassigned}
+\p{Age=NA}
+\p{Age=}
+\p{Age}
+\p{Age=V99_0}
+\p{Age=7}
+\p{Age=7.0.0}
+\p{Block=Greek}
+\p{Blk=Basic_Latin}
+\p{InGreek}
+\p{In_Greek}
+\p{Line_Break=AL}
+\p{lb=AL}
+\p{Grapheme_Cluster_Break=Extend}
+\p{GCB=Extend}
+\p{Word_Break=ALetter}
+\p{WB=ALetter}
+\p{Sentence_Break=Upper}
+\p{SB=Upper}
+\p{East_Asian_Width=W}
+\p{Numeric_Type=Decimal}
+\p{nt=De}
+\p{Bidi_Class=L}
+\p{bc=L}
+\p{ccc=230}
+\p{Canonical_Combining_Class=Above}
+\p{Joining_Type=D}
+\p{Hangul_Syllable_Type=LV}
+\p{Name=SPACE}
+\p{na=SPACE}
+\p{Decomposition_Type=Canonical}
+\p{NFD_Quick_Check=Yes}
+\p{Case_Folding=a}
+\p{Lowercase_Mapping=a}
+\p{Numeric_Value=1}
+\p{nv=1}
+\p{ID_Compat_Math_Start}
+\p{InCB=Linker}
+\p{InCB}
+\p{Indic_Conjunct_Break=Linker}
+\p{Present_In=5.0}
+\p{In=5.0}
+\p{Script_Extensions}
+\p{Greek}+
+\p{Latin}+
+\p{Han}+|\p{Hiragana}+
+\p{Cyrillic}+
+\p{L}\p{N}
+(\p{Lu})(\p{Ll}+)
+^\p{L}*$
+\b\p{L}+\b
+\p{Lu}\p{Ll}\p{Lt}\p{Lm}\p{Lo}\p{Mn}\p{Mc}\p{Me}
+\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}\P{L}
+(?i)\p{Greek}
+(?i)\p{Latin}
+(?i)\p{Cyrillic}+
+(?i)\P{Lu}
+(?i)\p{^Lu}
+(?i)[^\p{Lu}]
+(?i)[^\P{Lu}]
+(?i)\p{Alphabetic}
+(?i)\p{Uppercase}
+(?i)\P{Uppercase}
+(?i)\p{ASCII}
+(?i)\p{Any}
+(?-u)\p{ASCII}
+(?-u)\p{Any}
+(?-u:\p{Any})
+;; groups and capture names
+(a)
+((a))
+(?:a)
+(a)(b)(c)
+((a)|(b))*
+(((((a)))))
+(?P<n>a)
+(?<n>a)
+(?P<n>a)(?<m>b)
+(?P<n>a)(?P<n>b)
+(?<n>a)(?<n>b)
+(?P<n>a)|(?P<n>b)
+(?P<n>a)(?P<n>b)?
+(?P<é>a)
+(?P<名>a)
+(?P<Ωmega>a)
+(?P<ǅ>a)
+(?P<é1>a)
+(?P<a٣>a)
+(?P<٣a>a)
+(?P<n.m>a)
+(?P<n[0]>a)
+(?P<n[>a)
+(?P<n]>a)
+(?P<[n>a)
+(?P<.n>a)
+(?P<n.>a)
+(?P<n-1>a)
+(?P<n 1>a)
+(?P<n:1>a)
+(?P<n$>a)
+(?P<1n>a)
+(?P<_n>a)
+(?P<_>a)
+(?P<n_1>a)
+(?P<n1>a)
+(?P<N>a)
+(?P<>a)
+(?<>a)
+(?<1>a)
+(?<_>a)
+(?<a b>a)
+(?<n.>a)
+(?<n[0]>a)
+(?<é>a)
+(?<n
+(?<n>
+(?<n>a
+(?P<n
+(?P<n>
+(?P<n>a
+(?P<n)a)
+(?P>n)
+(?P=n)a
+(?P=n)
+(?P<n>a)(?P=n)
+(?P<n>a)\k<n>
+(?P<n>a)\g{n}
+(?P<n>a)\g1
+(?P<n>a)(?1)
+(?P<n>a)(?&n)
+(?P<n>a)(?P>n)
+(?'n'a)
+(?<a>)(?<b>)(?<c>)
+(?P<a>x)(?P<b>y)?(?P<c>z)*
+(?P<a>(?P<b>x))
+(?:(?P<a>x)|(?P<b>y))+
+(?P<a>)
+(?P<a>|b)
+(?P<a>*)
+(a)(?P<b>b)(c)(?<d>d)
+;; lookaround, backreferences, other refusals
+(?=a)
+(?!a)
+(?<=a)
+(?<!a)
+a(?=b)
+a(?!b)
+(?<=a)b
+(?>a)
+(?|a|b)
+(?#comment)a
+(?#)
+(?#a
+(?(1)a|b)
+(?R)
+(?0)
+(?1)
+(?+1)
+(?-1)
+(?&n)
+(?C)
+(?^)
+(?^i)a
+(?P)
+(?P<
+(?P=
+(?P>
+(?P!
+(?:
+(?!
+(?<
+(?<=
+(?'
+(?[a])
+(?[
+(*)
+(*FAIL)
+(*UTF8)a
+(*a)
+a++
+a*+
+a?+
+a{2}+
+a**
+a+*
+a*?*
+a??*
+a*??
+a???
+a{2}{3}
+a{2}*
+a{2}?{3}
+(?:a*)*
+(?:a+)+
+(?:a?)+
+(?:a|b)+?
+;; repetition
+a*
+a+
+a?
+a*?
+a+?
+a??
+a{0}
+a{1}
+a{2}
+a{2,}
+a{2,3}
+a{2,3}?
+a{2,}?
+a{0,}
+a{0,0}
+a{0,1}
+a{1,1}
+a{3,2}
+a{,3}
+a{,}
+a{}
+a{
+a{1
+a{1,
+a{1,2
+a{1,2,3}
+a{1;2}
+a{a}
+a{1,a}
+a{+2}
+a{-1}
+a{ 2,3}
+a{2 ,3 }
+a{2, 3 }
+a{ }
+a{ , }
+a{ 2 , }
+a{ , 3}
+a{02}
+a{002,003}
+a{1000}
+a{1001}
+a{10000}
+a{65535}
+a{65536}
+a{99999999999}
+a{4294967295}
+a{4294967296}
+a{1000}{1000}
+(a{100}){100}
+(a{2}){3}
+(a{0}){1000}
+(a{0}){10000}
+(?:a{0}){100000}
+{
+{1}
+{1,2}
+{,}
+}
+{}
+a{1}{
+x{3}y{2,4}
+*
++
+?
+*a
++a
+?a
+a|*
+(*)
+(+)
+(?)
+^*
+^+
+^?
+$*
+$+
+\A*
+\z+
+\b*
+\B?
+(?:)*
+()*
+(|)+
+(^)*
+($)+
+(\b)*
+(\B)+
+(?:$)*a
+(?m:^)*
+.*
+.+
+.?
+.*?
+.+?
+.??
+(?s).*
+(?s).*?
+(?s).+?c
+a.*b
+a.*?b
+x*y*
+(x|xy)z
+(xy|x)z
+a|ab
+ab|a
+(a|ab)(c|bcd)
+(a+)(b+)?
+(a*?)(a*)
+(a*)(a*)
+(a*)+
+(a*)*
+(a|b)*
+(a|b)*c
+(a?)*
+(a?)+?
+(?:a?)*?
+(a+)+$
+(a|b|)+
+(|a|b)+
+(a*)*b
+((a)(b))?
+(a)|b
+a.{2}
+.{2}
+.{3,}
+.{0,5}?
+\w{2}
+\w{2,}
+\d{3}
+\pL{2}
+[ab]{2,3}
+(ab){2}
+(ab)*
+(ab)+
+(ab)?
+(ab)*?
+(?:ab|cd)+
+;; anchors
+^
+$
+^$
+^a
+a$
+^a$
+^^
+$$
+$^
+^*a
+(^|a)b
+(^)(a)
+a|^b
+a|$
+\Aa
+a\z
+\A\z
+\Aabc\z
+^abc$
+(?m)^abc$
+(?m)^$
+(?m)^^
+(?m)$$
+(?m)^a|b$
+(?m)(^b|a$)
+(?m)^.
+(?m).$
+(?m)^
+(?m)$
+(?m:^a)b
+(?m)a(?-m:$)
+(?-m)$
+(?s)^.$
+(?ms)^.$
+;; dot
+.
+(?s).
+(?-s).
+(?s-s).
+(?m).
+(?R).
+(?sR).
+(?s)(?R).
+.+
+(?s).+
+a.b
+a(?s).b
+(?s:a.)b.
+.\n
+\n.
+;; literals and case folding
+é
+É
+(?i)é
+(?i)É
+ǅ
+(?i)ǅ
+(?i)ǆ
+(?i)Ǆ
+(?i)θ
+(?i)ϑ
+(?i)Θ
+(?i)ϴ
+(?i)ß
+(?i)ẞ
+(?i)ſ
+(?i)σ
+(?i)ς
+(?i)Σ
+(?i)ω
+(?i)Ω
+(?i)Ω
+(?i)µ
+(?i)μ
+(?i)Μ
+(?i)straße
+(?i)STRASSE
+(?i)[á-ž]+
+(?i)[A-ZÁ-Ž]+
+(?i)[^é]
+(?i)[\x{0}-\x{10FFFF}]
+(?i)[^\x{0}-\x{10FFFF}]
+(?i)𐐀
+(?i)𐐨
+(?i)😀
+(?i)ⓐ
+(?i)[ⓐ-ⓩ]
+(?i:č)Č
+č(?i)Č
+💩
+💩+
+(?:💩)*
+[💩]
+[^💩]
+💩|a
+.💩
+a💩
+日本語
+\x{1F4A9}
+\u{1F4A9}
+\U0001F4A9
+(?i)\u{1F4A9}
+;; empty matches and multi-byte code points
+\B
+x*
+a*
+(?:)*
+[a&&b]*
+[a&&b]
+(?s).*?
+(?:a|)
+(?m)$
+(?m)^
+\b{start-half}
+\b{end-half}
+\b{start}|\b{end}
+;; nesting and size limits (generated cases follow in code)
+\w{100}
+\w{250}
+\w{500}
+\w{1000}
+\w{10000}
+\w{100}\w{100}
+(\w{10}){10}
+(\w{10}){100}
+\pL{1000}
+\pL{100}
+\p{Greek}{1000}
+\d{1000}
+\d{10000}
+\s{1000}
+[\w]{1000}
+[^a]{1000}
+.{1000}
+.{5000}
+(?s).{5000}
+(?-u:\w){1000}
+(?-u:\w){10000}
+(?-u:.){10000}
+(?-u:\pL){10}
+a{10000}
+[a-z]{10000}
+(?:a{100}){100}
+(?:a{1000}){1000}
+(?:\w{100}){10}
+(a|b|c|d|e|f|g|h|i|j){1000}
+(?i)\w{100}
+(?i)\pL{100}
+(?i)[a-z]{1000}
+"#;
+
+pub const CRAFTED_SPECIAL: &[&str] = &[
+    "",
+    "a\nb",
+    "a\r\nb",
+    "a b",
+    "a ",
+    " a",
+    "\t",
+    "\n",
+    "\r",
+    "\0",
+    "[\0]",
+    "[\n]",
+    "[\r\n]",
+    "\\\n",
+    "\\\r",
+    "\\\t",
+    "\\\0",
+    "\\\u{7f}",
+    "\\\u{a0}",
+    "(?x)a # c\nb",
+    "(?x)a # c\n",
+    "(?x)a # c",
+    "(?x)a # c\r\nb",
+    "(?x)a # c\rb",
+    "(?x)[a #b\n]",
+    "(?x)[a #b]c",
+    "(?x)#\na",
+    "(?x)# a\n# b\nc",
+    "(?x)a\tb\nc\x0bd\x0ce\rf",
+    "(?x)a\u{a0}b",
+    "(?x)a\u{85}b",
+    "(?x)a\u{2003}b",
+    "(?x)a\u{2028}b",
+    "(?x)a\u{200e}b",
+    "(?x)\\\u{a0}",
+    "(?x)a\u{a0}*",
+    "(?x)a{ 2\n,\n3 }",
+    "(?x)(?# a\n)b",
+    "(?x)\\#\n",
+    "(?x)\\\n",
+    "(?x)\\ \n",
+    "(?x)a\\\n",
+    "(?x)(?i)\n a",
+    "(?x)\n",
+    "(?x)\n\n",
+    "(?x: # c\n a ) b",
+    "(?x)a #\n#\n",
+    "(?m)^a\n$",
+    "(?m)^\n$",
+    "(?m)^$\n",
+    "^\n$",
+    "(?s).\n",
+    ".\n",
+    "(?R)\r\n",
+    "(?R)\r\n$",
+    "(?mR)^\r\n$",
+    "(?mR)\r$",
+    "(?mR)\r\n",
+    "(?mR)a\r\n^b",
+    "(?mR)a$\r\n",
+    "\r\n",
+    "$\r\n",
+    "(?m)$\r\n",
+    "(?m)\r$\n",
+    "(?m)^\r\n",
+];
+
+pub const BYTES_TXT: &str = r#"
+;; raw bytes
+(?-u:\xFF)
+(?-u:\xff)+
+(?-u:\xFF)|a
+(?-u:\xFF)*
+(?-u:\xFF)+
+(?-u)\xFF
+(?-u)\xff
+(?-u)\x80
+(?-u:\x80)
+(?-u:\x80)+
+(?-u:[\x80-\xFF])
+(?-u:[\x80-\xFF])+
+(?-u:[^\x00-\x7F])
+(?-u:[^\x00-\x7F])+
+(?-u)[\x80-\xFF]
+(?-u)[^\x00-\x7F]
+(?-u)[\x00-\xFF]
+(?-u)[\x7f-\x80]
+(?-u)[a-\xFF]
+(?-u)[\xff-\xff]
+(?-u)[^\xff]
+(?-u)[^\xff]+
+(?-u)[^\x00-\xFE]
+(?-u)[^\x00-\xFF]
+(?-u)[\x00-\xFF&&[^\x80-\xFF]]
+(?-u)[a&&\xFF]
+(?-u)[\xFF&&\xFF]
+(?-u)\x00
+(?-u)\x00+
+\x00
+\x00+
+(?-u:\xC3\xA9)
+(?-u:\xC3)(?-u:\xA9)
+(?-u:\xC3)
+(?-u:\xA9)
+(?-u:[\xC3])
+(?-u:\xE2\x82)
+(?-u:\xE2)+
+(?-u:\xF0\x9F\x92\xA9)
+(?-u:\xF0\x9F\x92)
+(?-u:\xED\xA0\x80)
+(?-u:\xC0\x80)
+(?-u:\xF4\x90\x80\x80)
+(?-u:\xFF\xFE)
+(?-u:\xFE\xFF)
+(?-u:a\xFFb)
+(?-u:\xFF)(a)
+(\xFF)
+(?-u:(\xFF))
+(?-u)(a|\xFF)+
+(?-u:\xFF|a)*
+(?-u)(?:\xFF|\x80)+
+(?-u)(?P<n>\xFF)
+(?-u)(\xFF)?a
+(?-u)\xFF$
+(?-u)^\xFF
+(?-u)\xFF\b
+(?-u)\b\xFF
+(?-u)\B\xFF
+;; unicode forms of the same escapes
+\xFF
+\xff
+\xFF+
+\x80
+\x80+
+\xC3
+\xC3\xA9
+\xE9
+\x{FF}
+\u{FF}
+\u00FF
+\U000000FF
+\x{10FFFF}
+[\xFF]
+[^\xFF]
+[\x80-\xFF]
+[\x{80}-\x{FF}]
+[^\x00-\x7F]
+[^\x00-\x7F]+
+[a-\xFF]
+(?i)\xFF
+(?i)\xFF+
+(?i)\xE9
+(?i)\xDF
+(?-u)\u{FF}
+(?-u)\u{41}
+(?-u:\u{FF})
+(?-u)\x{FF}
+(?-u)\x{100}
+(?-u)é
+(?-u:é)
+(?-u)é+
+(?-u)[é]
+(?-u)[^é]
+(?-u)[^é]+
+(?-u)💩
+(?-u)💩+
+(?-u:💩)
+é
+é+
+💩
+💩+
+[é]
+[^é]
+[^é]+
+(?i)é
+(?i-u)é
+(?i-u)\xE9
+;; dot and negated classes
+(?-u).
+(?-u).+
+(?-u).*
+(?-u).+?
+(?-u).*?
+(?-u).{2}
+(?-u)^.{2}$
+(?-u)^.+$
+(?-u)^.*$
+(?-u)(?m)^.+$
+(?-u)(?m)^.*$
+(?s-u).
+(?s-u).+
+(?s-u).{3}
+(?s-u)\A.*\z
+(?s-u)\A.+\z
+(?s-u)^.$
+(?s-u)(?m)^.$
+(?s-u:.)(?s-u:.)
+(?-u:.)(?-u:.)
+(?-u:.)
+(?-u:.)+
+(?-u:.)*
+(?-u:.)?
+(?-u:.){2}
+(?-u:.)a
+a(?-u:.)
+(?-u:.)\b
+.
+.+
+.*
+.+?
+.*?
+.{2}
+.{3}
+(?s).
+(?s).+
+(?s).{3}
+(?s)\A.*\z
+(?s)\A.+\z
+\A.*\z
+(?m)^.+$
+(?m)^.*$
+(?R)(?m)^.$
+(?mR)^.+$
+(?mR)\r$
+(?-u)[^a]
+(?-u)[^a]+
+(?-u)[^a]*
+(?-u)[^a]{2}
+(?-u)[^\n]
+(?-u)[^\n]+
+(?-u)[^a-z]
+(?-u)[^a-z]+
+(?-u:[^a])
+(?-u:[^a])+
+[^a]
+[^a]+
+[^a]*
+[^\n]+
+[^a-z]+
+(?s)[^a]+
+(?-u:[^\x80-\xFF])+
+(?-u:[^\x00-\x7F\xFF])
+;; classes of shorthand and boundaries
+(?-u:\W)
+(?-u:\W)+
+(?-u:\W)*
+(?-u:\D)
+(?-u:\D)+
+(?-u:\S)
+(?-u:\S)+
+(?-u:\w)
+(?-u:\w)+
+(?-u:\d)
+(?-u:\d)+
+(?-u:\s)
+(?-u:\s)+
+(?-u:\b)
+(?-u:\B)
+(?-u:\b)+
+(?-u:\B)+
+(?-u:\bfoo\b)
+(?-u:\Bo\B)
+(?-u:\b{start})
+(?-u:\b{end})
+(?-u:\b{start-half})
+(?-u:\b{end-half})
+(?-u)\W
+(?-u)\W+
+(?-u)\D+
+(?-u)\S+
+(?-u)\w+
+(?-u)\w+\b
+(?-u)\b\w+
+(?-u)\b\w+\b
+(?-u)\B
+(?-u)\b
+(?-u)\b{start}
+(?-u)\b{end}
+(?-u)\b{start-half}
+(?-u)\b{end-half}
+(?-u)\<\w+\>
+(?-u)[\w]
+(?-u)[\W]
+(?-u)[\W]+
+(?-u)[^\w]
+(?-u)[^\W]
+(?-u)[^\w]+
+(?-u)[^\d]+
+(?-u)[\s\S]
+(?-u)[\s\S]+
+(?-u)[\d\D]
+(?-u)[\w&&\d]
+(?-u)(?i)k
+(?-u)(?i)K
+(?-u)(?i)s
+(?-u)(?i)\w
+(?i-u)\w
+(?i-u)\W
+(?i-u)[^k]
+(?i-u)[^k]+
+(?i-u:k)
+\b
+\B
+\b+
+\B+
+\b{start}
+\b{end}
+\b{start-half}
+\b{end-half}
+\w
+\w+
+\W
+\W+
+\W*
+\D+
+\S+
+\s+
+\d+
+\b\w+\b
+\B\w
+[\w]+
+[\W]+
+[^\w]+
+\w+\b
+\b\w+
+;; unicode classes over invalid UTF-8
+\p{L}
+\p{L}+
+\P{L}
+\P{L}+
+\PL+
+\pL+
+[^\p{L}]
+[^\p{L}]+
+\p{Greek}
+\p{Greek}+
+\P{Greek}+
+\p{Any}
+\P{Any}
+\p{Any}+
+\p{ASCII}
+\p{ASCII}+
+\P{ASCII}+
+\p{Assigned}+
+\p{Lu}
+\p{Ll}+
+\p{Emoji}
+\p{Emoji}+
+\p{White_Space}+
+\p{Alphabetic}+
+\p{scx=Greek}+
+\p{N}
+\p{Nd}+
+\d
+\d+
+\D+
+\s
+\S
+\S+
+[\d\D]
+[\d\D]+
+[\s\S]
+[\s\S]+
+\p{Any}\p{Any}
+(\p{Any})+
+(?-u)\p{L}
+(?-u)\p{ASCII}
+(?-u)\p{Any}
+(?-u:\pL)
+(?-u:\p{Any})
+(?-u)\d
+(?-u)\d+
+(?-u)\s
+(?-u)\s+
+(?-u)\S+
+;; empties, anchors, captures
+a*
+a*?
+(?:)
+(?:)*
+x*
+\A
+\z
+\A\z
+^
+$
+(?m)^
+(?m)$
+(?m)^$
+(?R)(?m)^
+(?R)(?m)$
+(?R)(?m)^$
+\A.*\z
+\Aa
+a\z
+(a)|(b)
+(a)(b)?(\xFF)?
+(?-u)(a)(b)?(\xFF)?
+(?-u)(a|\xFF)(a|\xFF)?
+(?P<x>a)(?P<y>\xFF)?
+(?-u)(?P<x>a)(?P<y>\xFF)?
+(a*)(b*)
+(?-u:(a*)(\xFF*))
+(?-u)(.)(.)?
+(?s-u)(.)(.)?
+(.)(.)?
+(?s)(.)(.)?
+(\b)
+(\B)
+((?-u:\b))
+"#;
+
+pub const BYTES_SPECIAL: &[&str] = &[
+    "",
+    "(?-u)\n",
+    "(?-u)\\\n",
+    "(?-u)[\n]",
+    "(?-u)[^\n]",
+    "(?-u)\0",
+    "(?-u)[\0-\u{7f}]",
+    "(?-u)[^\0-\u{7f}]",
+    "(?-u)a\r\nb",
+    "(?mR-u)^.$",
+    "(?mR-u)^.+$",
+    "(?mR-u)\r$",
+    "(?mR)^\r\n$",
+    "(?mR-u)^\n",
+    "(?mR-u)\r\n",
+    "(?mR-u)a$\r\n",
+    "(?x-u)\\xFF # c\n",
+    "(?x-u) \\xFF  a",
+    "(?x)\u{a0}a",
+    "(?-u)\u{a0}",
+    "(?-u:\u{a0})",
+    "\u{7f}",
+    "(?-u)\u{7f}",
+];
