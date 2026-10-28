@@ -5026,7 +5026,8 @@ test "findAnchored / capturesAnchored: a match that starts at from, in every eng
     defer m.deinit();
     m.dfa_eager = true;
     var g: [3]?Span = undefined;
-    try testing.expect(!m.capturesAnchored("ab-12 cd-34", 1, &g) or g[0].?.start == 1);
+    try testing.expect(m.capturesAnchored("ab-12 cd-34", 1, &g));
+    try testing.expectEqual(Span{ .start = 1, .end = 5 }, g[0].?);
     try testing.expect(m.capturesAnchored("ab-12 cd-34", 6, &g));
     try testing.expectEqual(Span{ .start = 9, .end = 11 }, g[2].?);
     try testing.expect(!m.capturesAnchored("ab-12 cd-34", 5, &g));
