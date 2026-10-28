@@ -595,7 +595,7 @@ pub fn preprocessWithOptions(alloc: std.mem.Allocator, input: []const u8, option
     var nest: std.ArrayList(u8) = .empty; // '{' or '[' per nesting level
     defer nest.deinit(alloc);
     var key_pos = false; // true when next identifier is an object key
-    var err_counter: u32 = 0;
+    var err_counter: usize = 0;
     var i: usize = 0;
 
     while (i < input.len) {
@@ -1426,20 +1426,29 @@ fn trimForMessage(raw: []const u8) []const u8 {
 /// recovered error into `error.DuplicateField`. Either way the caller is
 /// misled (W2 re-audit 2026-09-02, `json5` F9).
 ///
-/// The guarantee is by construction, not by hope: find the longest run of `_`
-/// that follows `base` anywhere in the input, and use one more.
+/// The guarantee is by construction, not by hope: an injected key is `base`,
+/// k underscores, then a decimal counter, so it can only collide with an
+/// input that holds `base` + exactly k underscores + a digit. Use the smallest
+/// k no such run has. Runs that follow distinct occurrences of `base` (which
+/// starts with `$`) are disjoint, so the k values present up to K cost the
+/// input at least K²/2 bytes: k ≤ √(2·len), and the prefix copied into every
+/// recovered entry stays small whatever the input holds. (It used to be one
+/// more than the LONGEST run, so a single 500 KB run of `_` made every
+/// diagnostic key 500 KB -- quadratic output; no-panic sweep 2026-10-28, J-1.)
+/// Absent from the input entirely, the base is used unchanged.
 fn diagnosticPrefix(alloc: std.mem.Allocator, input: []const u8, comptime base: []const u8) ![]u8 {
-    var extra: usize = 0;
+    const bound = std.math.sqrt(2 * input.len) + 2;
+    const taken = try alloc.alloc(bool, bound);
+    defer alloc.free(taken);
+    @memset(taken, false);
     var at: usize = 0;
     while (std.mem.findPos(u8, input, at, base)) |found| : (at = found + 1) {
         var k: usize = found + base.len;
         while (k < input.len and input[k] == '_') : (k += 1) {}
-        // One more underscore than the longest run that already follows the
-        // base anywhere in the input. Absent from the input entirely, the
-        // base is used unchanged — the common case pays nothing.
-        const need = (k - (found + base.len)) + 1;
-        if (need > extra) extra = need;
+        const run = k - (found + base.len);
+        if (run < bound and k < input.len and std.ascii.isDigit(input[k])) taken[run] = true;
     }
+    const extra = std.mem.findScalar(bool, taken, false).?; // bound > √(2·len) + 1
     const out = try alloc.alloc(u8, base.len + extra);
     @memcpy(out[0..base.len], base);
     @memset(out[base.len..], '_');
@@ -1539,7 +1548,7 @@ const LineCounter = struct {
 /// `depth` so that a comma inside `{a: {b: 1, c: 2}}` doesn't stop too early.
 fn skipValue(input: []const u8, start: usize) usize {
     var i = start;
-    var depth: i32 = 0;
+    var depth: usize = 0;
     // The quote that OPENED the current string, not merely "in a string".
     // Treating `'` and `"` as interchangeable meant an apostrophe inside a
     // double-quoted value closed it and the next `"` re-opened one, so the
@@ -1623,7 +1632,7 @@ fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u
 
 pub const AnnotatedResult = struct {
     out: []u8,
-    next_id: u32, // first unused id; the caller continues numbering from here
+    next_id: usize, // first unused id; the caller continues numbering from here
 };
 
 fn isWs(c: u8) bool {
@@ -1702,7 +1711,7 @@ fn flushValueErrs(
     out: *std.ArrayList(u8),
     alloc: std.mem.Allocator,
     errs: *std.ArrayList([]u8),
-    counter: *u32,
+    counter: *usize,
     prefix: []const u8,
 ) !void {
     // Each message leaves the list as it is freed: freeing them all and
@@ -1769,7 +1778,7 @@ pub fn preprocessAnnotatedWithOptions(alloc: std.mem.Allocator, input: []const u
     }
     // counter is the shared $err_<N> sequence. It is returned as next_id so
     // the caller can continue numbering without collisions.
-    var counter: u32 = 0;
+    var counter: usize = 0;
     var key_pos = false;
     var i: usize = 0;
 
@@ -3619,10 +3628,10 @@ test "non-finite numbers: the annotated entry passes them through, so recovery n
         try std.testing.expect(std.mem.find(u8, r.out, "$err") == null);
         try std.testing.expect(!jsonParses(alloc, r.out));
     }
-    try std.testing.expectEqual(@as(u32, 1), (try annotatedNextId(alloc, "[NaN]")));
+    try std.testing.expectEqual(@as(usize, 1), (try annotatedNextId(alloc, "[NaN]")));
 }
 
-fn annotatedNextId(alloc: std.mem.Allocator, src: []const u8) !u32 {
+fn annotatedNextId(alloc: std.mem.Allocator, src: []const u8) !usize {
     const r = try preprocessAnnotated(alloc, src);
     defer alloc.free(r.out);
     return r.next_id;
@@ -3976,4 +3985,30 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "diagnostic prefix stays short whatever runs of '_' the input holds (no-panic sweep J-1)" {
+    const gpa = std.testing.allocator;
+    // A 64 KiB run of '_' after the base, then 64 malformed keys: the prefix
+    // used to be one longer than that run and was copied into every entry.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "{\"$err_trace_");
+    try src.appendNTimes(gpa, '_', 64 * 1024);
+    try src.appendSlice(gpa, "1\": 0, \"$err_");
+    try src.appendNTimes(gpa, '_', 64 * 1024);
+    try src.appendSlice(gpa, "1\": 0");
+    for (0..64) |_| try src.appendSlice(gpa, ", a b: 1");
+    try src.appendSlice(gpa, "}");
+    const out = try preprocess(gpa, src.items);
+    defer gpa.free(out);
+    try std.testing.expect(out.len < 2 * src.items.len);
+    try std.testing.expect(jsonParses(gpa, out));
+    const r = try preprocessAnnotated(gpa, src.items);
+    defer gpa.free(r.out);
+    try std.testing.expect(r.out.len < 2 * src.items.len);
+    // Still collision-free: the input's own keys keep their values.
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, out, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2 + 64), parsed.value.object.count());
 }

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic, UB or data-driven blow-up (coordinator pass + independent review, `~/CML/20261028-panic-sweep/json5-sweep.report.md`). The collision-free diagnostic key prefix was one `_` longer than the LONGEST run of `_` after `$err_trace_` / `$err_` anywhere in the input and was copied into every recovered entry, so one 500 KB run of `_` plus many malformed keys made the output quadratic in the input (100 KB in, ~600 MB out); it is now the shortest run no input key can collide with, at most √(2·len) underscores. Error-recovery counters no longer overflow on huge inputs (`skipValue` depth was `i32`, the diagnostic counters `u32`); **`AnnotatedResult.next_id` is `usize`** (was `u32`). Test.
+
 - **2026-10-24** — The test-build counter `direct_taken` is private; read it with the new `directTaken()`. A `pub var` broke `check-testonly` (its probe walks every public declaration at comptime). No behaviour change; the audit's source hash is carried over this visibility change.
 
 - **2026-10-24** — `parseFromSlice(std.json.Value, ...)` is 1.7× faster: a single-pass reader takes the
