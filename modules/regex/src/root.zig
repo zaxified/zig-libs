@@ -93,6 +93,10 @@ pub const Regex = struct {
     longest: bool = false,
     /// The pattern it was compiled from (Go's `String()`); owned like the tables.
     source: []const u8 = "",
+    /// The program has an assertion: the DFAs tell positions apart by the
+    /// code point before (`Dfa.Ctx`) only then. Not a prefilter: it changes
+    /// what a state is, not what the search may skip.
+    asserts: bool = true,
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
     /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
@@ -152,7 +156,7 @@ pub const Regex = struct {
             tp.* = t;
             pf.teddy = tp;
         }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts) };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -269,7 +273,7 @@ pub const Regex = struct {
                 const c = input[input.len - i];
                 if (c != pair[0] and c != pair[1]) return false;
             }
-            if (re.runRevDfa(input)) |found| return found;
+            if (re.runRevDfa(input, RevDfa.max_states)) |found| return found;
         }
         if (re.runDfa(input, full)) |found| return found;
         var t: SliceText = .{ .input = input };
@@ -290,13 +294,13 @@ pub const Regex = struct {
         const restart = !full and !pf.anchored;
         const skip = restart and pf.first != null;
         const start: Dfa.Set = .{ 1, 0 };
-        var s = d.intern(start, .start, restart);
+        var s = d.intern(start, .ofIf(re.asserts, null), restart);
         var pos: usize = 0;
         while (true) {
             if (skip and d.idle[s]) {
                 // No thread alive: jump to where a match can start.
                 pos = pf.next(input, pos) orelse return false;
-                s = d.intern(start, .of(runeBefore(input, pos)), restart);
+                s = d.intern(start, .ofIf(re.asserts, runeBefore(input, pos)), restart);
             }
             if (pos == input.len) return re.dfaAccepts(d.keys[s], d.ctxs[s]);
             const c = input[pos];
@@ -315,7 +319,7 @@ pub const Regex = struct {
                 return true;
             };
             if (next[0] == 0 and next[1] == 0) return false; // no thread left
-            const ctx: Dfa.Ctx = .of(here.cp);
+            const ctx: Dfa.Ctx = .ofIf(re.asserts, here.cp);
             var cache = c < 0x80;
             const ns = d.find(next, ctx) orelse blk: {
                 if (d.n == Dfa.max_states) {
@@ -339,8 +343,10 @@ pub const Regex = struct {
     /// can be read to the match, and what the code point after the position
     /// is, as far as an assertion can tell. The search succeeds at the first
     /// position (going back) where the start reaches a member of that set.
-    /// Null for a program too large for the DFA.
-    noinline fn runRevDfa(re: *const Regex, input: []const u8) ?bool {
+    /// Null for a program too large for the DFA. `limit`: the states kept
+    /// before the table is emptied (`RevDfa.max_states`; tests: fewer).
+    noinline fn runRevDfa(re: *const Regex, input: []const u8, comptime limit: u8) ?bool {
+        comptime std.debug.assert(limit >= 1 and limit <= RevDfa.max_states);
         if (re.insts.len > Dfa.max_insts) return null;
         var d: RevDfa = undefined;
         d.n = 0;
@@ -348,10 +354,11 @@ pub const Regex = struct {
         for (re.insts, 0..) |inst, pc| if (inst == .match) {
             end[pc >> 6] |= @as(u64, 1) << @truncate(pc);
         };
-        var s = d.add(end, .start);
+        const asserts = re.asserts;
+        var s = d.add(end, .ofIf(asserts, null));
         var pos = input.len;
         while (true) {
-            if (re.revAccepts(&d, s, runeBefore(input, pos))) return true;
+            if (re.revAccepts(&d, s, if (asserts) runeBefore(input, pos) else ' ')) return true;
             if (pos == 0) return false;
             const here = decodeBefore(input, pos);
             const c = input[pos - 1];
@@ -371,9 +378,9 @@ pub const Regex = struct {
                 if (cache) d.trans[s][c] = 1;
                 return false;
             }
-            const ctx: Dfa.Ctx = .of(here.cp);
+            const ctx: Dfa.Ctx = .ofIf(asserts, here.cp);
             const ps = d.find(prev, ctx) orelse blk: {
-                if (d.n == RevDfa.max_states) {
+                if (d.n == limit) {
                     // Full: start over; the current state is not needed again.
                     d.n = 0;
                     cache = false;
@@ -612,7 +619,7 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
             pf.teddy = &final_teddy;
         }
         const final_pf = pf;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts) };
     }
 }
 
@@ -681,6 +688,12 @@ const Dfa = struct {
             const c = cp orelse return .start;
             if (c == '\n') return .newline;
             return if (isWord(c)) .word else .other;
+        }
+
+        /// `of`, for a program with assertions; without, every position is
+        /// one context (one state where there would be four).
+        fn ofIf(asserts: bool, cp: ?u21) Ctx {
+            return if (asserts) .of(cp) else .other;
         }
 
         /// A code point of this class, as `assertHolds` sees it.
@@ -838,16 +851,13 @@ const FindDfa = struct {
     match_set: Dfa.Set,
 
     fn init(gpa: std.mem.Allocator, re: *const Regex) FindDfa {
-        var asserts = false;
         var match_set: Dfa.Set = .{ 0, 0 };
-        for (re.insts, 0..) |inst, pc| switch (inst) {
-            .assert => asserts = true,
-            .match => match_set[pc >> 6] |= @as(u64, 1) << @truncate(pc),
-            else => {},
+        for (re.insts, 0..) |inst, pc| if (inst == .match) {
+            match_set[pc >> 6] |= @as(u64, 1) << @truncate(pc);
         };
         const pf = &re.prefilter;
         const skip_idle = pf.first != null and (pf.lit_len >= 2 or pf.teddy != null or pf.single != null);
-        var d: FindDfa = .{ .gpa = gpa, .asserts = asserts, .skip_idle = skip_idle, .rev = undefined, .match_set = match_set };
+        var d: FindDfa = .{ .gpa = gpa, .asserts = re.asserts, .skip_idle = skip_idle, .rev = undefined, .match_set = match_set };
         d.rev.n = 0;
         return d;
     }
@@ -1473,6 +1483,13 @@ const OnePass = struct {
         return true;
     }
 };
+
+fn hasAsserts(insts: []const Inst) bool {
+    for (insts) |inst| {
+        if (inst == .assert) return true;
+    }
+    return false;
+}
 
 /// Table capacities `Regex.compile` tries first, on the stack: every pattern
 /// short of a large counted repetition or a big case-folded class fits.
@@ -3059,6 +3076,130 @@ test "find's DFAs (unanchored: forward for the end, backward for the start) agre
     }
 }
 
+test "the DFAs past the backward table, many contexts and the candidate budget; Teddy and one-pass edge cases" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x7276);
+    const rng = prng.random();
+    // Backward sets (an `a` at each offset up to six back) past
+    // `RevDfa.max_states`, over ASCII and past it: `start` and `runRevDfa`
+    // empty their table while reading.
+    const patterns = [_][]const u8{
+        "[a-dé]{6}a[a-dé]*",
+        // `start` must begin each read at the match's own set: a stale
+        // first state from before a flush need not read the `_`.
+        "[a-dé]{6}a[a-dé]*_",
+        "_[a-dé]{6}a[a-dé]*\\z",
+        "\\b[a-d]{1,3}\\b(?:[ _][a-d]{1,3}\\b){1,5}",
+    };
+    const pieces = [_][]const u8{ "a", "b", "c", "d", "é", "a", "b", "c", "d", "é", " ", "_", "z" };
+    const text = try gpa.alloc(u8, 4000);
+    defer gpa.free(text);
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        m.dfa_eager = true;
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        for (0..30) |round| {
+            var n: usize = 0;
+            const len = if (round % 3 == 0) text.len - 4 else rng.uintLessThan(usize, 200);
+            // Separators rarely in odd rounds: long runs for the backward reads.
+            const np: usize = if (round % 2 == 1) pieces.len - 3 else pieces.len;
+            const sep_odds: usize = if (round % 2 == 1) 400 else 40;
+            while (n < len) {
+                const piece = pieces[if (rng.uintLessThan(usize, sep_odds) == 0) pieces.len - 1 - rng.uintLessThan(usize, 3) else rng.uintLessThan(usize, np)];
+                @memcpy(text[n..][0..piece.len], piece);
+                n += piece.len;
+            }
+            const t = text[0..n];
+            errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(t) });
+            try testing.expectEqual(pm.find(t, 0) != null, re.isMatch(t));
+            var it = m.iterator(t);
+            var pit = pm.iterator(t);
+            while (true) {
+                const a = it.next();
+                try testing.expectEqual(pit.next(), a);
+                if (a == null) break;
+            }
+            var from: usize = 0;
+            while (from <= t.len) : (from += 13) {
+                try testing.expectEqual(pm.find(t, from), m.find(t, from));
+            }
+        }
+    }
+
+    // Each case through the DFAs and the one-pass engine (`dfa_eager`),
+    // and the Pike VM: the same match and groups.
+    const Case = struct { []const u8, []const u8, ?Span };
+    var long: [400]u8 = undefined;
+    // The first candidate reads 300 bytes and fails: past the candidate
+    // budget, one unanchored pass, whose skip to "AB" lands after `x` —
+    // `\b` must see the `x`, not the `!` the threads died at.
+    const lead_len = 2 + 300 + 1;
+    @memset(long[0..lead_len], 'c');
+    long[0..2].* = "AB".*;
+    long[lead_len - 1] = '!';
+    long[lead_len..][0..6].* = "xABccZ".*;
+    const cases = [_]Case{
+        .{ "\\bAB[^Z!]*Z", long[0 .. lead_len + 6], null },
+        // Candidate "xy" at 0 reads to 3 and fails; candidate "9x" at 2,
+        // before where that read stopped, matches.
+        .{ "xy([0-9]+)c|(9x)yd", "xy9xyd", .{ .start = 2, .end = 6 } },
+        // A branch starts with a class too large for Teddy: no Teddy at all.
+        .{ "[c-z]x|ab", "zx", .{ .start = 0, .end = 2 } },
+        .{ "[c-z]x|ab", "-ab", .{ .start = 1, .end = 3 } },
+    };
+    var ga: [4]?Span = undefined;
+    var gb: [4]?Span = undefined;
+    for (cases) |cs| {
+        const p, const t, const want = cs;
+        errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(t) });
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        const ng = re.names.len;
+        try testing.expectEqual(want != null, re.isMatch(t));
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        m.dfa_eager = true;
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        try testing.expectEqual(want, m.find(t, 0));
+        try testing.expectEqual(want, pm.find(t, 0));
+        try testing.expectEqual(want != null, m.captures(t, 0, ga[0..ng]));
+        try testing.expectEqual(want != null, pm.captures(t, 0, gb[0..ng]));
+        if (want != null) try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
+    }
+}
+
+test "FindDfa.intern: one state per (list, context, restart), wherever their probes meet" {
+    const gpa = testing.allocator;
+    var re = try Regex.compile(gpa, "\\ba");
+    defer re.deinit(gpa);
+    var d: FindDfa = .init(gpa, &re);
+    defer d.deinit();
+    // 60 lists × 4 contexts = 240 states in a 512-slot table: probes of
+    // states that differ in their context alone cross for sure.
+    const ctxs = [_]Dfa.Ctx{ .start, .newline, .word, .other };
+    var ids: [60][4]u16 = undefined;
+    for (0..60) |i| {
+        const list = [_]u16{ @intCast(i), @intCast(i * 7 % 13) };
+        for (ctxs, 0..) |ctx, j| {
+            const r = try d.intern(&list, ctx, false);
+            try testing.expect(!r.flushed);
+            ids[i][j] = r.id;
+        }
+    }
+    try testing.expectEqual(@as(usize, 240), d.states.items.len);
+    for (0..60) |i| {
+        const list = [_]u16{ @intCast(i), @intCast(i * 7 % 13) };
+        for (ctxs, 0..) |ctx, j| try testing.expectEqual(ids[i][j], (try d.intern(&list, ctx, false)).id);
+    }
+}
+
 test "the backtracker and the Pike VM agree on long texts, past the bit budget and the job cap" {
     const gpa = testing.allocator;
     var prng: std.Random.DefaultPrng = .init(0x6274);
@@ -3243,7 +3384,29 @@ test "end-anchored patterns: which ones, and the backward DFA agrees with the NF
             errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(in) });
             try testing.expectEqual(nfa, m.find(in, 0) != null);
             try testing.expectEqual(nfa, re.isMatch(in));
-            if (re.prefilter.end_anchored) try testing.expectEqual(nfa, re.runRevDfa(in).?);
+            if (re.prefilter.end_anchored) {
+                try testing.expectEqual(nfa, re.runRevDfa(in, RevDfa.max_states).?);
+                // A table of two: emptied at nearly every step, in either state.
+                try testing.expectEqual(nfa, re.runRevDfa(in, 2).?);
+            }
+        }
+    }
+    // Long reads back that only a `_` ends: with a table of two, the flush
+    // also comes in state 0, whose row it refills first.
+    {
+        var re = try Regex.compile(gpa, "_[ab]{3}a[ab]*$");
+        defer re.deinit(gpa);
+        for (0..2000) |_| {
+            var text: [60]u8 = undefined;
+            const n = 1 + rng.uintLessThan(usize, text.len);
+            text[0] = '_';
+            for (text[1..n]) |*c| c.* = "ab_"[rng.uintLessThan(usize, if (rng.uintLessThan(u8, 8) == 0) 3 else 2)];
+            const in = text[0..n];
+            var r: std.Io.Reader = .fixed(in);
+            const nfa = try re.isMatchReader(&r);
+            errdefer std.debug.print("\"{s}\"\n", .{in});
+            try testing.expectEqual(nfa, re.runRevDfa(in, 2).?);
+            try testing.expectEqual(nfa, re.isMatch(in));
         }
     }
     // The backward decoder cuts every text as the forward one does.
