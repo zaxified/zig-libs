@@ -83,12 +83,16 @@ pub const Span = struct {
     start: usize,
     end: usize,
 
+    /// The matched text — of the `input` the span was found in.
     pub fn slice(s: Span, input: []const u8) []const u8 {
         return input[s.start..s.end];
     }
 };
 
-/// A compiled pattern. Immutable; safe to share across threads.
+/// A compiled pattern. Immutable; safe to share across threads. Its fields
+/// are `compile`'s to set and the caller's to read: only `longest` may be
+/// changed (before the `Regex` is shared). A `Regex` with other fields
+/// written by hand is outside the module's no-panic guarantee.
 pub const Regex = struct {
     insts: []const Inst,
     ranges: []const Range,
@@ -3410,6 +3414,17 @@ const ReaderText = struct {
             std.mem.copyForwards(u8, t.held[0..t.held_n], t.held[1..][0..t.held_n]);
             return c;
         }
+        if (t.r.buffer.len == 0) {
+            // An unbuffered reader: `takeByte` would assert on its buffer;
+            // `stream` is the one operation every reader has.
+            var one: [1]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&one);
+            t.r.streamExact(&w, 1) catch |e| {
+                if (e == error.ReadFailed) t.failed = true;
+                return null;
+            };
+            return one[0];
+        }
         return t.r.takeByte() catch |e| {
             if (e == error.ReadFailed) t.failed = true;
             return null;
@@ -4928,6 +4943,9 @@ test "compile: past max_insts on the heap, past 4 * max_insts refused — never 
     try testing.expectError(error.PatternTooLarge, Regex.compile(testing.allocator, huge));
     try testing.expectError(error.PatternTooLarge, matches(testing.allocator, huge, "x"));
     try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "\\w{100000}", .{ .syntax = .rust }));
+    // Empty bodies repeated: the compile's work is budgeted.
+    const empties = "(?:" ++ strRepeat("(?:)", 30000) ++ "){100000}";
+    try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, empties, .{ .syntax = .rust }));
     // Bytes mode: its set VM holds `max_insts`.
     try testing.expectError(error.PatternTooLarge, Regex.compileOptions(testing.allocator, "a{1000}b{100}", .{ .syntax = .rust, .utf8 = false }));
 }
@@ -4955,6 +4973,26 @@ test "no misuse panics: a bytes Regex through a reader, a short or long RegexSet
     try testing.expectEqualSlices(bool, &.{ true, true, false, false, false }, &long);
     var none: [0]bool = .{};
     try testing.expect(!set.matches("x", &none));
+
+    // An unbuffered reader (no buffer at all).
+    const Unbuffered = struct {
+        src: []const u8,
+        interface: std.Io.Reader = .{ .vtable = &.{ .stream = stream }, .buffer = &.{}, .seek = 0, .end = 0 },
+        fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @fieldParentPtr("interface", io_r);
+            if (self.src.len == 0) return error.EndOfStream;
+            if (limit.toInt()) |l| if (l == 0) return 0;
+            const n = try w.write(self.src[0..1]);
+            self.src = self.src[n..];
+            return n;
+        }
+    };
+    var ure = try Regex.compile(gpa, "ž\\x{fffd}b");
+    defer ure.deinit(gpa);
+    var ur: Unbuffered = .{ .src = "xž\xc3b" };
+    try testing.expect(try ure.isMatchReader(&ur.interface));
+    var ur2: Unbuffered = .{ .src = "xž\xc3" };
+    try testing.expect(!try ure.isMatchReader(&ur2.interface));
 
     // A reader buffer of one byte, multi-byte and invalid sequences.
     var re = try Regex.compile(gpa, "é\\x{fffd}b|ž");

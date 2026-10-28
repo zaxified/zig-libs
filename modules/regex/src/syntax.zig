@@ -37,6 +37,10 @@ pub const max_repeat_rust = 100_000;
 /// in stack scratch, so no compiled pattern can make one fail later; the
 /// range and node tables to their `u16` indices.
 pub const large_capacity: Capacity = .{ .insts = 4 * max_insts, .ranges = 65535, .nodes = 65535 };
+/// `emitNode` calls in one compile: far past any program the builders hold
+/// (Go's nested-count rule caps it at ~2M), short of a compile that runs for
+/// seconds on empty repeated bodies (~16M steps, tens of milliseconds).
+pub const max_emit_work = 1 << 24;
 /// Nesting of groups and repetitions. Go goes deeper; 250 keeps the
 /// recursive parser and compiler within a 512 KiB thread stack even in a
 /// Debug build (a compile of untrusted patterns runs on whatever thread the
@@ -220,6 +224,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// `a**`, `a{2}{3}`) in this pattern. Each adds a level to the tree
         /// without adding group depth, so they are budgeted (`max_stacked`).
         stacked: u16 = 0,
+        /// `emitNode` calls of this compile, against `max_emit_work`.
+        work: u32 = 0,
 
         pub fn compile(b: *Self, pattern: []const u8) Error!void {
             return b.compileSyntax(pattern, .perl);
@@ -244,6 +250,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             b.posix = syntax == .posix;
             b.rust = syntax == .rust;
             b.stacked = 0;
+            b.work = 0;
             b.names[0] = "";
             if (!std.unicode.utf8ValidateSlice(pattern)) return error.InvalidUtf8;
             b.src = pattern;
@@ -1733,6 +1740,12 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         }
 
         fn emitNode(b: *Self, n: u16) Error!void {
+            // Copies of a body that emits nothing (`(?:(?:)(?:)…){100000}`)
+            // meet no instruction capacity: the walk itself is budgeted, so a
+            // compile's time is bounded whatever the pattern (audit
+            // 2026-10-28).
+            b.work += 1;
+            if (b.work > max_emit_work) return error.PatternTooLarge;
             const nd = b.nodes[n];
             switch (nd.kind) {
                 .empty => {},
