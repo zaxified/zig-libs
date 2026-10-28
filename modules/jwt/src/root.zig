@@ -215,8 +215,8 @@ pub const meta = .{
 /// Errors from `parse`. Every malformed-token shape maps to one of these —
 /// parsing never panics on arbitrary bytes.
 pub const ParseError = error{
-    /// Not exactly three dot-separated segments, or an empty header/payload
-    /// segment.
+    /// Not exactly three dot-separated segments, an empty header/payload
+    /// segment, or longer than `max_token_len`.
     MalformedToken,
     /// A segment is not valid base64url-without-padding (RFC 7515 §2).
     InvalidBase64,
@@ -354,6 +354,11 @@ fn isUnderstoodCritHeader(name: []const u8) bool {
     return false;
 }
 
+/// Longest `crit` list `parse` accepts (`error.InvalidCrit` beyond it). No
+/// extension header is understood, so any non-empty list is rejected anyway;
+/// the cap only bounds the duplicate scan's work.
+const max_crit_entries: usize = 16;
+
 /// RFC 7515 §4.1.11 `crit`: parse the list, enforce every syntactic rule the
 /// RFC states, then fail closed on any name this implementation does not
 /// understand. Called from `parse`, so **every** entry point (offline verify,
@@ -367,6 +372,9 @@ fn extractCrit(arena: std.mem.Allocator, obj: std.json.ObjectMap) ParseError!?[]
     const items = v.array.items;
     // … "MUST NOT be empty" (nor may producers emit an empty entry).
     if (items.len == 0) return error.InvalidCrit;
+    // No crit name is understood, so a list longer than any legitimate one
+    // is invalid; this also bounds the O(n²) duplicate scan below.
+    if (items.len > max_crit_entries) return error.InvalidCrit;
 
     const out = try arena.alloc([]const u8, items.len);
     for (items, 0..) |item, i| {
@@ -432,6 +440,8 @@ pub const Claims = struct {
 
     /// Any claim by name, as a JSON value; null when absent.
     pub fn claim(self: Claims, name: []const u8) ?std.json.Value {
+        // Total: a hand-built `Claims` whose `raw` is not an object has no claims.
+        if (self.raw != .object) return null;
         return self.raw.object.get(name);
     }
 
@@ -487,6 +497,14 @@ pub const ParsedToken = struct {
     }
 };
 
+/// Longest compact token `parse` accepts (16 KiB); longer input is
+/// `error.MalformedToken` before anything is allocated. Real tokens are
+/// well under 4 KiB; auth0/jose and every API gateway cap the header at
+/// roughly 8-16 KiB anyway (Go's golang-jwt has no cap), and without one a
+/// single request makes `parse` allocate and decode work proportional to
+/// an attacker-chosen size.
+pub const max_token_len: usize = 16 * 1024;
+
 /// Parse a compact-serialization JWS/JWT (RFC 7515 §3.1:
 /// `BASE64URL(header) '.' BASE64URL(payload) '.' BASE64URL(signature)`).
 ///
@@ -501,6 +519,7 @@ pub const ParsedToken = struct {
 /// critical is rejected — never parsed-and-ignored — so no downstream path
 /// can accept it.
 pub fn parse(gpa: std.mem.Allocator, token: []const u8) ParseError!ParsedToken {
+    if (token.len > max_token_len) return error.MalformedToken;
     // Split into exactly three segments (an unsecured JWT's third segment
     // is legitimately empty, so only header/payload must be non-empty).
     const dot1 = std.mem.findScalar(u8, token, '.') orelse return error.MalformedToken;
@@ -1909,9 +1928,13 @@ pub const RefreshError = error{
 ///   fetch); `ProviderOptions.interval_clock = .boot` measures the
 ///   intervals on a clock that never steps, and leaves `now_s` to the
 ///   claims alone.
-/// - Fail closed: a failed TTL/rotation refresh surfaces as its typed error
-///   instead of silently serving stale keys forever. (P6 middleware can
-///   layer a serve-stale policy on top if wanted.)
+/// - Fail closed: a failed lazy-load/TTL/rotation refresh surfaces as its
+///   typed error instead of silently serving stale keys (a rotated-out key
+///   must stop verifying even while the issuer is down; P6 middleware can
+///   layer a serve-stale policy on top if wanted). It is NOT retried until
+///   `min_refresh_interval_s` has passed: every `verify` in that window
+///   returns the same error without touching the network, so a down issuer
+///   is not dialled once per request.
 /// - NOT thread-safe (`refresh` swaps the set) — one Provider per thread, or
 ///   external synchronization. Everything else in the module stays reentrant.
 pub const Provider = struct {
@@ -1929,6 +1952,10 @@ pub const Provider = struct {
     /// When a refresh was last *attempted*, success or failure — the
     /// `min_refresh_interval_s` reference point. Same timeline.
     last_attempt_s: ?i64 = null,
+    /// Why the last refresh attempt failed; null after a success (and
+    /// after an `OutOfMemory`, which is transient and retried at once).
+    /// While set, `verify` does not retry before `min_refresh_interval_s`.
+    last_refresh_err: ?RefreshError = null,
 
     pub const ProviderOptions = struct {
         /// OIDC issuer URL — JWKS located via discovery. Exactly one of
@@ -1939,9 +1966,12 @@ pub const Provider = struct {
         jwks_uri: ?[]const u8 = null,
         /// How long a fetched JWKS is served before `verify` re-fetches.
         ttl_s: u32 = 300,
-        /// Floor between two rotation-driven refresh *attempts* (unknown
-        /// `kid`), measured from the last attempt of any kind. Lazy-load and
-        /// TTL refreshes are not gated — they are already bounded by `ttl_s`.
+        /// Floor between two refresh *attempts*, measured from the last
+        /// attempt of any kind. Gates rotation-driven refreshes (unknown
+        /// `kid`) and the retry after a FAILED lazy-load/TTL refresh: inside
+        /// the window `verify` keeps returning that refresh's error without
+        /// touching the network. Successful lazy-load and TTL refreshes are
+        /// bounded by `ttl_s` alone.
         min_refresh_interval_s: u32 = 30,
         /// Accept `http://` issuer / JWKS URLs (see `KeySourceOptions`).
         /// Off: a plain-HTTP key source fails every refresh with
@@ -1997,8 +2027,11 @@ pub const Provider = struct {
         IssuerNotConfigured,
     };
 
+    /// Caller contract: `options.issuer` or `options.jwks_uri` must be set;
+    /// neither is a programming error and panics with a message.
     pub fn init(gpa: std.mem.Allocator, fetcher: Fetcher, options: ProviderOptions) Provider {
-        std.debug.assert(options.issuer != null or options.jwks_uri != null);
+        if (options.issuer == null and options.jwks_uri == null)
+            @panic("jwt.Provider.init: neither issuer nor jwks_uri configured");
         return .{ .gpa = gpa, .fetcher = fetcher, .options = options };
     }
 
@@ -2017,11 +2050,23 @@ pub const Provider = struct {
     /// rate-limiting whether it succeeds or fails; the old set stays in
     /// place on failure.
     pub fn refresh(p: *Provider, now_s: i64) RefreshError!void {
+        p.refreshInner(now_s) catch |err| {
+            p.last_refresh_err = if (err == error.OutOfMemory) null else err;
+            return err;
+        };
+        p.last_refresh_err = null;
+    }
+
+    fn refreshInner(p: *Provider, now_s: i64) RefreshError!void {
         const at = p.intervalNow(now_s);
         p.last_attempt_s = at;
         const jwks_uri = p.options.jwks_uri orelse blk: {
             if (p.metadata == null) {
-                p.metadata = discoverWith(p.gpa, p.fetcher, p.options.issuer.?, p.keySourceOptions()) catch |err|
+                // `init` guarantees issuer when jwks_uri is null; `options` is
+                // public though, so check rather than `.?`.
+                const issuer = p.options.issuer orelse
+                    @panic("jwt.Provider: neither issuer nor jwks_uri configured");
+                p.metadata = discoverWith(p.gpa, p.fetcher, issuer, p.keySourceOptions()) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.InsecureKeySource => return error.InsecureKeySource,
@@ -2055,6 +2100,9 @@ pub const Provider = struct {
         claim_opts: ClaimOptions,
     ) Error!ParsedToken {
         if (p.jwks == null or intervalPassed(p.fetched_at_s, p.intervalNow(now_s), p.options.ttl_s)) {
+            // The last attempt failed: no network until the window is over,
+            // and no stale keys either -- the same error (fail closed).
+            if (p.last_refresh_err) |failed| if (!p.refreshAllowed(now_s)) return failed;
             try p.refresh(now_s);
         }
 
@@ -2365,7 +2413,10 @@ pub const ResourceServer = struct {
     challenge_scope: ?[]const u8,
 
     pub const Options = struct {
-        /// The verifier backing the guard. Must outlive the Router.
+        /// The verifier backing the guard. Must outlive the Router. A
+        /// `Provider` refreshes (mutates) its key set, so under a threaded
+        /// server `lock` below MUST be a real mutex; `.none` is only for a
+        /// single-threaded server.
         provider: *Provider,
         /// Claim policy handed to `Provider.verify`. REQUIRED — no default:
         /// `Provider.ClaimOptions.audience` must be set (`.required = "…"` to
@@ -2776,7 +2827,9 @@ pub const Guard = struct {
 
     pub const Options = struct {
         /// The verifier backing the guard. Must outlive every request.
-        /// Exactly one of `provider` and `jwks` is set.
+        /// Exactly one of `provider` and `jwks` is set. A `Provider` mutates
+        /// its key set on refresh and is not thread-safe: if `authenticate`
+        /// runs on several threads, `lock` below MUST be a real mutex.
         provider: ?*Provider = null,
         /// A static key set instead of a `Provider` (2026-09-28, requested
         /// by qap): a resource server whose keys come from its own
@@ -4378,6 +4431,49 @@ test "SECURITY: RFC 7515 §4.1.11 `crit` — an unsupported critical header fail
     ));
     defer ok.deinit();
     try testing.expectEqual(@as(?[]const []const u8, null), ok.header.crit);
+}
+
+test "parse: a token over max_token_len is MalformedToken; a crit list over 16 entries is InvalidCrit" {
+    const gpa = testing.allocator;
+
+    // One byte over the cap: refused up front. (Without the cap this input
+    // would fail later as InvalidBase64/InvalidJson, not MalformedToken.)
+    const big = try gpa.alloc(u8, max_token_len + 1);
+    defer gpa.free(big);
+    @memset(big, 'A');
+    big[max_token_len - 2] = '.';
+    big[max_token_len - 1] = 'B';
+    big[max_token_len] = '.';
+    try testing.expectError(error.MalformedToken, parse(gpa, big));
+    // At the cap the length check passes (the content is still garbage).
+    if (parse(gpa, big[1..])) |*ok| {
+        var t = ok.*;
+        t.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expect(err != error.MalformedToken);
+
+    // 17 well-formed distinct crit names would otherwise reach
+    // UnsupportedCritHeader after the quadratic duplicate scan.
+    var hdr_buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&hdr_buf);
+    try w.writeAll("{\"alg\":\"HS256\"");
+    var i: usize = 0;
+    while (i < 17) : (i += 1) try w.print(",\"x{d}\":1", .{i});
+    try w.writeAll(",\"crit\":[");
+    i = 0;
+    while (i < 17) : (i += 1) try w.print("{s}\"x{d}\"", .{ if (i == 0) "" else ",", i });
+    try w.writeAll("]}");
+    var buf: [1024]u8 = undefined;
+    try testing.expectError(error.InvalidCrit, parse(gpa, buildToken(&buf, w.buffered(),
+        \\{"iss":"joe"}
+    )));
+}
+
+test "Claims: claim/claimStr/scopeGranted are total on a non-object raw" {
+    const c: Claims = .{ .raw = .null };
+    try testing.expectEqual(@as(?std.json.Value, null), c.claim("scope"));
+    try testing.expectEqual(@as(?[]const u8, null), c.claimStr("scope"));
+    try testing.expect(!scopeGranted(c, "read"));
 }
 
 test "RFC 7515 §4.1.11 `crit`: every degenerate form the RFC calls out is rejected" {
@@ -6984,6 +7080,53 @@ test "Provider: refresh failures are typed, old keys survive a failed refresh" {
     var verified = try p3.verify(gpa, rfc7515_a2_token, 1300819000, .{ .issuer = .any, .audience = .any });
     verified.deinit();
     try testing.expectEqual(@as(usize, 2), flaky.calls);
+}
+
+test "Provider: a failed refresh is not retried inside min_refresh_interval_s" {
+    const gpa = testing.allocator;
+    const opts: Provider.ClaimOptions = .{ .issuer = .any, .audience = .any };
+
+    // First load fails: every verify in the window returns that error and
+    // makes NO further fetch; after the window one new attempt is made.
+    var dead: ScriptFetcher = .{ .script = &.{} };
+    var p1 = Provider.init(gpa, dead.fetcher(), .{ .jwks_uri = test_jwks_url, .min_refresh_interval_s = 30 });
+    defer p1.deinit();
+    try testing.expectError(error.JwksFetchFailed, p1.verify(gpa, rfc7515_a2_token, 1000, opts));
+    try testing.expectEqual(@as(usize, 1), dead.calls);
+    var t: i64 = 1001;
+    while (t < 1030) : (t += 7) {
+        try testing.expectError(error.JwksFetchFailed, p1.verify(gpa, rfc7515_a2_token, t, opts));
+    }
+    try testing.expectEqual(@as(usize, 1), dead.calls);
+    try testing.expectError(error.JwksFetchFailed, p1.verify(gpa, rfc7515_a2_token, 1030, opts));
+    try testing.expectEqual(@as(usize, 2), dead.calls);
+
+    // TTL expiry with a set present and the issuer down: the first verify
+    // surfaces the error, later ones inside the window return it too without
+    // fetching and without falling back to the stale set (fail closed), and
+    // the window's end retries.
+    const rfc_set = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"a2\"," ++
+        "\"n\":\"" ++ rfc7515_a2_n_b64 ++ "\",\"e\":\"" ++ rfc7515_a2_e_b64 ++ "\"}]}";
+    var flaky: ScriptFetcher = .{ .script = &.{.{ .url = test_jwks_url, .body = rfc_set }} };
+    var p2 = Provider.init(gpa, flaky.fetcher(), .{
+        .jwks_uri = test_jwks_url,
+        .ttl_s = 300,
+        .min_refresh_interval_s = 30,
+    });
+    defer p2.deinit();
+    const base: i64 = 1300819000;
+    var v0 = try p2.verify(gpa, rfc7515_a2_token, base, opts);
+    v0.deinit();
+    try testing.expectEqual(@as(usize, 1), flaky.calls);
+    try testing.expectError(error.JwksFetchFailed, p2.verify(gpa, rfc7515_a2_token, base + 400, opts));
+    try testing.expectEqual(@as(usize, 2), flaky.calls);
+    var i: i64 = 1;
+    while (i <= 5) : (i += 1) {
+        try testing.expectError(error.JwksFetchFailed, p2.verify(gpa, rfc7515_a2_token, base + 400 + i * 5, opts));
+    }
+    try testing.expectEqual(@as(usize, 2), flaky.calls);
+    try testing.expectError(error.JwksFetchFailed, p2.verify(gpa, rfc7515_a2_token, base + 430, opts));
+    try testing.expectEqual(@as(usize, 3), flaky.calls);
 }
 
 test "HttpFetcher compiles (never dialed in tests)" {

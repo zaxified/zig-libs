@@ -159,7 +159,8 @@ pub fn VerifiedCache(comptime Value: type) type {
 
         /// Free the table. The derived values are wiped first (they may name
         /// a principal, and the freed block goes back to the allocator), and
-        /// so is the MAC key.
+        /// so is the MAC key. Using the cache afterwards is a caller bug and
+        /// panics with `jwt.VerifiedCache: used after deinit`.
         pub fn deinit(self: *Self) void {
             std.crypto.secureZero(u8, &self.mac_key);
             std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.buckets));
@@ -251,6 +252,9 @@ pub fn VerifiedCache(comptime Value: type) type {
 
         fn bucketOf(self: *Self, digest: *const [digest_len]u8) *Bucket {
             const h = std.mem.readInt(u64, digest[0..8], .little);
+            // Caller contract: no use after `deinit` (buckets.len == 0 would
+            // make the mask below wrap to an out-of-bounds index).
+            if (self.buckets.len == 0) @panic("jwt.VerifiedCache: used after deinit");
             return &self.buckets[@intCast(h & (self.buckets.len - 1))];
         }
 
