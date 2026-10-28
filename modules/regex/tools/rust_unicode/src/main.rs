@@ -155,15 +155,16 @@ struct Model {
     skipped: usize,
 }
 
-fn go_names(dir: &str) -> HashSet<String> {
-    let s = std::fs::read_to_string(format!("{dir}/unicode_tables.zig")).unwrap_or_else(|e| die(format!("{dir}/unicode_tables.zig: {e}")));
+/// The names Go's grammar accepts: `go_names.txt` beside Cargo.toml (frozen
+/// from Go 1.26's `unicode` when the Go-generated tables were retired).
+fn go_names(_dir: &str) -> HashSet<String> {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/go_names.txt");
+    let s = std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("{path}: {e}")));
     let mut out = HashSet::new();
     for l in s.lines() {
-        if let Some(i) = l.find(".name = \"") {
-            let r = &l[i + 9..];
-            if let Some(j) = r.find('"') {
-                out.insert(r[..j].to_string());
-            }
+        let l = l.trim();
+        if !l.is_empty() && !l.starts_with('#') {
+            out.insert(l.to_string());
         }
     }
     if out.len() < 150 {

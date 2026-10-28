@@ -15,8 +15,7 @@
 //!    163), in every spelling, although its documentation names
 //!    `unicode.Scripts` as the classes and its 1.25 release notes promise TR18
 //!    loose matching for script names. Here they compile, matched loosely like
-//!    every other name; their tables were checked against Go's
-//!    `unicode.Scripts` for every code point (`tools/go_unicode`).
+//!    every other name (Unicode 16.0 tables, `tools/rust_unicode`).
 //!  - LITERAL_PREFIX: `literalPrefix` follows every path and extends the
 //!    prefix through a choice whose branches all agree (`Aa+a` → `Aaa`, Go
 //!    `Aa`), and past a leading `\A` whatever follows; Go's stops at its
@@ -24,6 +23,10 @@
 //!    complete depends on its one-pass engine. Both are prefixes every match
 //!    begins with; ours always extends Go's and is never complete where Go's
 //!    is not.
+//!  - UNICODE_VERSION: the classes are Unicode 16.0's (`unicode16_tables.zig`,
+//!    shared with the Rust grammar), Go 1.26's are 15.0: an input holding a
+//!    code point 16.0 assigned (`\p{Kawi}` on U+11F5A) matches here, not in
+//!    Go. Pinned by count.
 //!  - CAPACITY: a pattern that nests deeper than `max_depth` (250) compiles
 //!    in Go; here `error.NestingDepth` — the price of a recursive parser that
 //!    fits a small thread stack. (A program past `max_insts` compiles on the
@@ -35,7 +38,17 @@ const testing = std.testing;
 const regex = @import("root.zig");
 const v = @import("go_vectors.zig");
 
-const Tally = struct { patterns: usize = 0, cases: usize = 0, matched: usize = 0, capacity: usize = 0, go_defect: usize = 0, longest_differs: usize = 0, api: usize = 0, literal_prefix: usize = 0, bad: usize = 0 };
+/// UNICODE_VERSION above: code points the inputs hold that Unicode 16.0
+/// assigned after Go's 15.0 (U+1B7F BALINESE, U+11F5A KAWI, U+1FBCB in
+/// Symbols for Legacy Computing Supplement's block of So).
+fn newIn16(input: []const u8) bool {
+    for ([_][]const u8{ "\u{1b7f}", "\u{11f5a}", "\u{1fbcb}" }) |cp| {
+        if (std.mem.find(u8, input, cp) != null) return true;
+    }
+    return false;
+}
+
+const Tally = struct { unicode_version: usize = 0, patterns: usize = 0, cases: usize = 0, matched: usize = 0, capacity: usize = 0, go_defect: usize = 0, longest_differs: usize = 0, api: usize = 0, literal_prefix: usize = 0, bad: usize = 0 };
 
 /// `\p{Name}` with a script name Go 1.26 cannot look up (GO_DEFECT above):
 /// one with an underscore or a capital past its first letter.
@@ -127,7 +140,9 @@ fn replay(set: []const v.Pattern, mode: Mode, t: *Tally) !void {
                     std.debug.print("  (Longest)\n", .{});
                 }
             }
-            if (!ok) {
+            if (!ok and newIn16(c.input)) {
+                t.unicode_version += 1;
+            } else if (!ok) {
                 t.bad += 1;
                 if (t.bad <= 40) std.debug.print("{t} /{s}/ on \"{f}\": go match={} full={} sub={any} all={any} lsub={any}; ours match={} full={} sub={any}\n", .{
                     mode,                p.pattern,             std.zig.fmtString(c.input), c.match, c.full, c.sub, c.all, c.lsub,
@@ -280,5 +295,6 @@ test "go oracle: crafted syntax cases and random patterns answer as Go regexp" {
     try testing.expectEqual(@as(usize, 46), t.go_defect);
     try testing.expect(t.api > 10_000); // the API answers are reached
     try testing.expectEqual(@as(usize, 6), t.literal_prefix);
+    try testing.expectEqual(@as(usize, 6), t.unicode_version);
     try testing.expectEqual(@as(usize, 1), t.capacity); // nesting past 250 (programs past 1024 instructions compile on the heap since 2026-10-28)
 }

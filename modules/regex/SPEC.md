@@ -91,15 +91,16 @@ cached); a search that reports positions or groups runs a backtracker or a Pike 
   same ranges as an earlier one in the pattern points at those (`\p{L}` is ~700 ranges). `(?i)` folds each
   class member *before* its own negation and the class's `^` after that (Go's order:
   `(?i)\W` excludes U+017F and U+212A, which fold into `\w`).
-- **Case folding is Unicode's simple folding as orbits** (`casefold.zig`, generated from Go's
-  `unicode.SimpleFold`): 366 runs, each mapping a code point to its orbit successor by a constant
+- **Case folding is Unicode's simple folding as orbits** (`casefold16.zig`, Unicode 16.0,
+  generated from Rust's `regex-syntax` by `tools/rust_unicode`): 379 runs, each mapping a code point to its orbit successor by a constant
   delta or as alternating upper/lower pairs. A class folds run by run — the successors of a range
   are ranges — taken `max_orbit - 1` (3) times, so even `(?i)[\x{0}-\x{10FFFF}]` costs a few
   hundred ranges and compiles at comptime; a literal walks its orbit directly.
-- **Unicode classes** (`unicode_tables.zig`, generated from Go's `unicode`): the 30 two-letter
-  categories and 163 scripts are stored as LEB128-varint ranges (11 KB); every other name
-  (`L`, `LC`, `Letter`, …) is a list of those, checked by the generator against Go's table for
-  every code point. A name is looked up in its loose form (ASCII case, spaces, `_`, `-` dropped);
+- **Unicode classes** (`unicode16_tables.zig`, Unicode 16.0, generated from Rust's `regex-syntax`
+  by `tools/rust_unicode` and checked against it for every code point): every class the Rust grammar
+  names (categories, scripts, script extensions, binary properties, age, break properties) as
+  LEB128-varint ranges (89 KB); the Go grammar accepts the names Go lists
+  (`tools/rust_unicode/go_names.txt`). A name is looked up in its loose form (ASCII case, spaces, `_`, `-` dropped);
   `Any`, `ASCII` and `Assigned` (the complement of `Cn`) are computed. Folded and negated in
   Go's order, like a Perl class.
 - **POSIX syntax** (`Syntax.posix`, Go's `CompilePOSIX`): the Perl escapes, `\p`, `\Q`, the
@@ -399,8 +400,8 @@ box over ~280 crafted syntax cases, every Unicode class name with the code point
 `FindStringSubmatchIndex` and `FindAllStringIndex` — again after `Longest()` — plus, for 460
 patterns, `ReplaceAllString` (31 templates), `ReplaceAllLiteralString`, `ReplaceAllStringFunc`,
 `Split`, `FindAllStringSubmatchIndex` and `LiteralPrefix`, and `QuoteMeta` of every ASCII byte.
-`tools/go_unicode` and `tools/go_casefold` derive the tables from Go's `unicode` and check them
-for every code point. `src/go_oracle_test.zig` requires every answer, through a slice and through
+`tools/rust_unicode` derives the Unicode tables from Rust's `regex-syntax` and checks them for every
+code point. `src/go_oracle_test.zig` requires every answer, through a slice and through
 a one-byte-per-read reader; the listed divergences are counted and pinned — GO_DEFECT (46: the
 multi-word script names Go refuses), LITERAL_PREFIX (5: ours extends Go's), CAPACITY (5: past
 1024 instructions or 250 levels). On the interop lane via `zig build interop-regex -- --check`.
