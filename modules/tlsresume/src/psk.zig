@@ -49,13 +49,20 @@
 const std = @import("std");
 const burn = @import("burn.zig");
 
+// HKDF-Expand-Label's context is `opaque context<0..255>` (RFC 8446 §7.1);
+// std's `hkdfExpandLabel` `@intCast`s its length (UB in ReleaseFast).
+fn checkContext(context: []const u8) void {
+    if (context.len > 255) @panic("tlsresume: HKDF-Expand-Label context over 255 bytes (RFC 8446 7.1)");
+}
+
 // Dead-stack shape (CONVENTIONS §2.1.1): secrets in by `*const`, secret
 // results out through `out` (first parameter after the comptime types),
 // every entry point's body under `burn.run`.
 
 /// RFC 8446 §7.1 / §4.6.1: `PSK = HKDF-Expand-Label(resumption_master_secret,
 /// "resumption", ticket_nonce, Hash.length)`. `ticket_nonce` is the value
-/// carried in the NewSessionTicket (`ticket.NewSessionTicket.ticket_nonce`).
+/// carried in the NewSessionTicket (`ticket.NewSessionTicket.ticket_nonce`);
+/// over 255 bytes it panics (`ticket_nonce<0..255>`, as `decode` enforces).
 pub fn derivePsk(
     comptime Hkdf: type,
     comptime len: usize,
@@ -73,6 +80,7 @@ fn derivePskBody(
     resumption_master_secret: *const [Hkdf.prk_length]u8,
     ticket_nonce: []const u8,
 ) void {
+    checkContext(ticket_nonce);
     out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, resumption_master_secret.*, "resumption", ticket_nonce, len);
 }
 
@@ -94,7 +102,8 @@ fn earlySecretBody(comptime Hkdf: type, out: *[Hkdf.prk_length]u8, psk: []const 
 /// binder"`; this module only ever derives the resumption path, since it
 /// exists to fill DTLS's/this collection's declared resumption gap — see
 /// `dtls`'s SPEC.md "out of scope: session resumption".) `empty_transcript_hash`
-/// is `Hash("")` — the hash of the empty message list.
+/// is `Hash("")` — the hash of the empty message list (a digest; over 255
+/// bytes it panics).
 pub fn binderKey(
     comptime Hkdf: type,
     out: *[Hkdf.prk_length]u8,
@@ -112,6 +121,7 @@ fn binderKeyBody(
 ) void {
     // Derive-Secret(early_secret, "res binder", "") = HKDF-Expand-Label(
     // early_secret, "res binder", Transcript-Hash(""), Hash.length).
+    checkContext(empty_transcript_hash);
     out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret.*, "res binder", empty_transcript_hash, Hkdf.prk_length);
 }
 

@@ -40,10 +40,10 @@ pub fn SessionCache(comptime max_id_len: usize, comptime max_state_len: usize) t
         next_seq: u64 = 0,
         used_count: usize = 0,
 
-        /// Allocate `capacity` (>= 1) entries. An entry is valid while
-        /// `now_s - stored_at_s < timeout_s`.
+        /// Allocate `capacity` entries. An entry is valid while
+        /// `now_s - stored_at_s < timeout_s`. Capacity 0 is a disabled
+        /// cache: `put` stores nothing, every lookup misses.
         pub fn init(gpa: std.mem.Allocator, capacity: usize, timeout_s: i64) !Self {
-            std.debug.assert(capacity >= 1);
             const entries = try gpa.alloc(Entry, capacity);
             for (entries) |*e| e.* = .{};
             return .{ .entries = entries, .gpa = gpa, .timeout_s = timeout_s };
@@ -79,7 +79,8 @@ pub fn SessionCache(comptime max_id_len: usize, comptime max_state_len: usize) t
         }
 
         fn expired(self: *const Self, e: *const Entry, now_s: i64) bool {
-            return now_s - e.stored_at_s >= self.timeout_s;
+            // i128: any pair of caller clock values, no overflow.
+            return @as(i128, now_s) - e.stored_at_s >= self.timeout_s;
         }
 
         /// Store `state` under `id`, replacing an existing entry with that id
@@ -103,7 +104,7 @@ pub fn SessionCache(comptime max_id_len: usize, comptime max_state_len: usize) t
                     }
                     if (oldest == null or e.seq < oldest.?.seq) oldest = e;
                 }
-                if (slot == null) slot = oldest;
+                if (slot == null) slot = oldest orelse return; // capacity 0
                 if (!slot.?.used) self.used_count += 1;
             }
             const e = slot.?;
@@ -307,4 +308,23 @@ test "put: replacing an entry wipes what the longer old state left behind (audit
         try testing.expect(std.mem.allEqual(u8, e.state[2..], 0));
     }
     try testing.expectEqual(@as(usize, 1), seen);
+}
+
+test "capacity 0 is a disabled cache: put stores nothing, lookups miss (panic sweep 2026-10-28)" {
+    var c = try C.init(testing.allocator, 0, 100);
+    defer c.deinit();
+    var out: [16]u8 = undefined;
+    try c.put("id", "state", 0);
+    try testing.expectEqual(@as(usize, 0), c.count());
+    try testing.expect(c.get("id", 0, &out) == null);
+}
+
+test "extreme clock values age without overflow (panic sweep 2026-10-28)" {
+    var c = try C.init(testing.allocator, 2, 100);
+    defer c.deinit();
+    var out: [16]u8 = undefined;
+    try c.put("a", "1", std.math.maxInt(i64));
+    try testing.expect(c.get("a", std.math.minInt(i64), &out) != null); // stepped back: still alive
+    try c.put("b", "2", std.math.minInt(i64));
+    try testing.expect(c.get("b", std.math.maxInt(i64), &out) == null); // expired
 }

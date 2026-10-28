@@ -57,7 +57,11 @@ pub fn SessionState(comptime rms_len: usize) type {
         ticket_age_add: u32,
 
         pub const ParseError = error{Malformed};
-        pub const SerializeError = error{BufferTooSmall};
+        pub const SerializeError = error{
+            BufferTooSmall,
+            /// `ticket_nonce` over 255 bytes (RFC 8446 §4.6.1: `ticket_nonce<0..255>`).
+            NonceTooLong,
+        };
 
         /// `rms_len + 1 + ticket_nonce.len + 8 + 4` — the exact byte count
         /// `serialize` writes for a given `ticket_nonce` length.
@@ -66,6 +70,7 @@ pub fn SessionState(comptime rms_len: usize) type {
         }
 
         pub fn serialize(self: Self, out: []u8) SerializeError![]u8 {
+            if (self.ticket_nonce.len > std.math.maxInt(u8)) return error.NonceTooLong;
             const total = wireLen(self.ticket_nonce.len);
             if (out.len < total) return error.BufferTooSmall;
             var w: usize = 0;
@@ -222,7 +227,8 @@ pub fn Selection(comptime rms_len: usize) type {
 /// `identities.len != binders.len` (both counts come from the ClientHello).
 /// `open_scratch` backs the unsealed plaintext (see
 /// `stek.StekRing.open`'s `out` buffer) — sized by the caller for the
-/// largest session-state record it seals; the returned
+/// largest session-state record it seals (smaller, and a ticket that does
+/// not fit is skipped like an unknown one: no error, no resumption); the returned
 /// `session.ticket_nonce` slice points into it. Every ticket opened and
 /// not selected is wiped there; the selected one (it holds the resumption
 /// master secret) stays for `session` to point into, and the caller wipes
@@ -303,7 +309,9 @@ fn selectBody(
 
         // 3. Freshness (RFC 8446 §4.2.11.1): the client's reported age must
         // track the server's own elapsed-time measurement.
-        const elapsed_ms = now_ms - session.issued_at_ms;
+        // Checked: `now_ms` is the caller's, and a state sealed under another
+        // hash's layout mis-slices into an arbitrary `issued_at_ms`.
+        const elapsed_ms = std.math.sub(i64, now_ms, session.issued_at_ms) catch continue;
         // The u32 bound is the `@intCast` below; the 7-day cap is RFC 8446
         // §4.6.1 (`ticket_lifetime` MUST NOT exceed 604800 s), enforced here
         // so a session that outlived every ticket lifetime never resumes.
@@ -1107,4 +1115,45 @@ test "selectPsk: with a strike register the caller's own smaller freshness windo
         defer strike.deinit();
         _ = try selectV(&fx.ring, .{}, &.{fx.identity(1_500)}, &.{fx.binder}, &fx.empty_hash, &fx.ch_hash, now, 1_000, &strike, &scratch);
     }
+}
+
+test "SessionState.serialize: a nonce over 255 bytes is NonceTooLong, not a cast (panic sweep 2026-10-28)" {
+    const long = @as([256]u8, @splat(7));
+    const s = SessionState(32){
+        .resumption_master_secret = @as([32]u8, @splat(0)),
+        .ticket_nonce = &long,
+        .issued_at_ms = 0,
+        .ticket_age_add = 0,
+    };
+    var buf: [512]u8 = undefined;
+    try testing.expectError(error.NonceTooLong, s.serialize(&buf));
+    try testing.expectEqual(SessionState(32).wireLen(255), (try (SessionState(32){
+        .resumption_master_secret = s.resumption_master_secret,
+        .ticket_nonce = long[0..255],
+        .issued_at_ms = 0,
+        .ticket_age_add = 0,
+    }).serialize(&buf)).len);
+}
+
+test "selectPsk: an issued_at_ms the clock cannot subtract skips the identity (panic sweep 2026-10-28)" {
+    var ring = stek.DefaultRing.init();
+    ring.rotate(1, &(@as([stek.key_length]u8, @splat(0x42))), 0);
+    const rms = @as([32]u8, @splat(0xAB));
+    const nonce = [_]u8{0x01};
+    const state = SessionState(32){
+        .resumption_master_secret = rms,
+        .ticket_nonce = &nonce,
+        .issued_at_ms = std.math.minInt(i64),
+        .ticket_age_add = 0,
+    };
+    var pt: [128]u8 = undefined;
+    var blob: [160]u8 = undefined;
+    const ticket = try ring.seal(try state.serialize(&pt), @as([stek.nonce_length]u8, @splat(0x01)), &blob);
+    const empty_hash = sha256Of("");
+    const ch_hash = sha256Of("ClientHello");
+    const binder = clientBinder(&rms, &nonce, &empty_hash, &ch_hash);
+    var scratch: [128]u8 = undefined;
+    // now_ms - minInt overflows i64; the policy's lifetime keeps the key live.
+    const policy: stek.RotationPolicy = .{ .lifetime_s = std.math.maxInt(i64) };
+    try testing.expectError(error.NoAcceptableIdentity, selectV(&ring, policy, &.{.{ .ticket = ticket, .obfuscated_ticket_age = 0 }}, &.{binder}, &empty_hash, &ch_hash, 1_000, null, null, &scratch));
 }

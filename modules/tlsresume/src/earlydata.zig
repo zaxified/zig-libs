@@ -64,6 +64,12 @@
 const std = @import("std");
 const pskmod = @import("psk.zig");
 const burn = @import("burn.zig");
+
+// HKDF-Expand-Label's context is `opaque context<0..255>` (RFC 8446 §7.1);
+// std's `hkdfExpandLabel` `@intCast`s its length (UB in ReleaseFast).
+fn checkContext(context: []const u8) void {
+    if (context.len > 255) @panic("tlsresume: HKDF-Expand-Label context over 255 bytes (RFC 8446 7.1)");
+}
 const aesgcm = @import("aesgcm");
 
 // Dead-stack shape (CONVENTIONS §2.1.1): secrets in by `*const`, secret
@@ -88,7 +94,8 @@ pub fn clientEarlyTrafficSecret(
 /// RFC 8446 §7.1: `early_exporter_master_secret = Derive-Secret(early_secret,
 /// "e exp master", ClientHello)` — the exporter secret available during the
 /// 0-RTT phase (RFC 8446 §7.5 early exporters). Same complete-ClientHello
-/// transcript-hash context as `clientEarlyTrafficSecret`.
+/// transcript-hash context as `clientEarlyTrafficSecret`. Both panic on a
+/// transcript hash over 255 bytes (no TLS digest comes close).
 pub fn earlyExporterMasterSecret(
     comptime Hkdf: type,
     out: *[Hkdf.prk_length]u8,
@@ -107,6 +114,7 @@ fn deriveSecretBody(
     early_secret: *const [Hkdf.prk_length]u8,
     client_hello_transcript_hash: []const u8,
 ) void {
+    checkContext(client_hello_transcript_hash);
     out.* = std.crypto.tls.hkdfExpandLabel(Hkdf, early_secret.*, label, client_hello_transcript_hash, Hkdf.prk_length);
 }
 

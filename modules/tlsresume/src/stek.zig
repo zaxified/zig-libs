@@ -106,10 +106,13 @@ pub const RotationPolicy = struct {
 /// one key per `period_s` across `lifetime_s`, plus the active one. 8 for the
 /// Go defaults — `DefaultRing` (3) evicts a key after about two periods, well
 /// before its lifetime ends. Comptime-usable: `StekRing(depthFor(.{}))`.
+/// Panics (a compile error at comptime) unless `period_s > 0` and
+/// `lifetime_s >= 0`.
 pub fn depthFor(policy: RotationPolicy) usize {
-    std.debug.assert(policy.period_s > 0 and policy.lifetime_s >= 0);
-    const periods = std.math.divCeil(i64, policy.lifetime_s, policy.period_s) catch unreachable;
-    return @intCast(periods + 1);
+    if (policy.period_s <= 0 or policy.lifetime_s < 0) @panic("tlsresume.depthFor: needs period_s > 0 and lifetime_s >= 0");
+    const periods = @divFloor(policy.lifetime_s - 1, policy.period_s) + 1; // divCeil, lifetime_s >= 0
+    const n = std.math.cast(usize, periods) orelse @panic("tlsresume.depthFor: depth over usize");
+    return std.math.add(usize, n, 1) catch @panic("tlsresume.depthFor: depth over usize");
 }
 
 /// An N-deep ring of STEKs. `depth` bounds live keys the server accepts for
@@ -127,6 +130,9 @@ pub fn StekRing(comptime depth: usize) type {
     if (depth > 256) @compileError("StekRing: depth over 256 -- key ids are u8 (shorten lifetime_s or lengthen period_s)");
     return struct {
         const Self = @This();
+
+        // The fields are the ring's own state: change them only through the
+        // methods (an `active` of `depth` or more indexes past `keys`).
 
         /// Fixed-size slots, oldest-first; `null` = never installed.
         keys: [depth]?Stek = @as([depth]?Stek, @splat(null)),
@@ -168,7 +174,7 @@ pub fn StekRing(comptime depth: usize) type {
         /// a fixed period (the `RotationPolicy` default).
         pub fn needsRotation(self: *const Self, policy: RotationPolicy, now_s: i64) bool {
             const k = self.activeKey() orelse return true;
-            return now_s - k.installed_at_s >= policy.period_s;
+            return @as(i128, now_s) - k.installed_at_s >= policy.period_s;
         }
 
         /// Calls `rotate(id, key, now_s)` iff `needsRotation`, then `expire`.
@@ -198,12 +204,18 @@ pub fn StekRing(comptime depth: usize) type {
             for (&self.keys, 0..) |*maybe, i| {
                 if (i == self.active) continue;
                 if (maybe.*) |*k| {
-                    if (k.installed_at_s + policy.lifetime_s <= now_s) {
+                    if (pastLifetime(k, policy, now_s)) {
                         std.crypto.secureZero(u8, &k.key);
                         maybe.* = null;
                     }
                 }
             }
+        }
+
+        // i128: a `lifetime_s` of maxInt(i64) ("never") and any clock value
+        // add without overflow.
+        fn pastLifetime(k: *const Stek, policy: RotationPolicy, now_s: i64) bool {
+            return @as(i128, k.installed_at_s) + policy.lifetime_s <= now_s;
         }
 
         /// The current encrypt-with key, or `null` if `rotate` was never
@@ -309,7 +321,7 @@ pub fn StekRing(comptime depth: usize) type {
         pub fn openAt(self: *const Self, blob: []const u8, now_s: i64, policy: RotationPolicy, out: []u8) OpenError![]u8 {
             if (blob.len < overhead) return error.Malformed;
             const key = self.findKey(blob[0]) orelse return error.UnknownKeyId;
-            if (key.installed_at_s + policy.lifetime_s <= now_s) return error.UnknownKeyId;
+            if (pastLifetime(key, policy, now_s)) return error.UnknownKeyId;
             return self.open(blob, out);
         }
 
@@ -682,4 +694,35 @@ test "expire: the expired key's bytes are zeroed in the ring's memory, not only 
     try testing.expect(ring.findKey(1) == null);
     try testing.expect(!ringHolds(&ring, &a));
     try testing.expect(ringHolds(&ring, &b)); // the active key stays
+}
+
+test "a lifetime of maxInt(i64) and extreme clocks: no overflow, the key never expires (panic sweep 2026-10-28)" {
+    var ring = DefaultRing.init();
+    var policy = RotationPolicy{ .period_s = 100, .lifetime_s = std.math.maxInt(i64) };
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    ring.rotate(1, &(@as([key_length]u8, @splat(1))), 1000);
+    var blob_buf: [64]u8 = undefined;
+    var out_buf: [64]u8 = undefined;
+    const blob = try ring.seal("state", @as([nonce_length]u8, @splat(9)), &blob_buf);
+    ring.rotate(2, &(@as([key_length]u8, @splat(2))), 1100);
+    ring.expire(policy, max);
+    try testing.expectEqualSlices(u8, "state", try ring.openAt(blob, max, policy, &out_buf));
+    try testing.expect(ring.needsRotation(policy, max));
+    try testing.expect(!ring.needsRotation(policy, min));
+    // The other end: a key installed at maxInt seconds, asked at minInt.
+    policy.lifetime_s = 0;
+    var far = DefaultRing.init();
+    far.rotate(3, &(@as([key_length]u8, @splat(3))), max);
+    try testing.expect(!far.needsRotation(policy, min));
+    try testing.expectError(error.UnknownKeyId, far.openAt(blob, min + 1, policy, &out_buf));
+}
+
+test "depthFor: lifetime 0 is depth 1, the largest i64 lifetime does not overflow (panic sweep 2026-10-28)" {
+    var policy: RotationPolicy = .{ .period_s = 1, .lifetime_s = 0 };
+    try testing.expectEqual(@as(usize, 1), depthFor(policy));
+    policy.lifetime_s = std.math.maxInt(i64);
+    try testing.expectEqual(@as(usize, std.math.maxInt(i64)) + 1, depthFor(policy));
+    policy.period_s = std.math.maxInt(i64);
+    try testing.expectEqual(@as(usize, 2), depthFor(policy));
 }

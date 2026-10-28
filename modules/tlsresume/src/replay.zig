@@ -78,6 +78,10 @@ pub const StrikeRegisterError = error{OutOfMemory};
 /// anti-replay state become a DoS vector itself) — see the module doc
 /// comment for the full accept/reject/eviction policy and why every failure
 /// mode is fail-safe (rejects resumption, never falsely accepts).
+/// Memory is about `capacity` times the identifier length: the register
+/// keeps its own copy of each one, so a caller marking untrusted ids bounds
+/// their length (`selectPsk` marks a ticket, at most 64 KiB, and only after
+/// its binder verified).
 pub const StrikeRegister = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
@@ -115,7 +119,7 @@ pub const StrikeRegister = struct {
     /// `selectPsk`; size the capacity to the early-data rate per window).
     pub fn checkAndMark(self: *StrikeRegister, ticket_id: []const u8, now_ms: i64) StrikeRegisterError!bool {
         if (self.seen.getPtr(ticket_id)) |first_seen_ms| {
-            if (now_ms - first_seen_ms.* <= self.window_ms) return false; // replay
+            if (@as(i128, now_ms) - first_seen_ms.* <= self.window_ms) return false; // replay
             // Aged out: the freshness check upstream already rejects a
             // ClientHello this old, so re-arming the slot is safe.
             first_seen_ms.* = now_ms;
@@ -143,7 +147,7 @@ pub const StrikeRegister = struct {
         defer expired.deinit(self.allocator);
         var it = self.seen.iterator();
         while (it.next()) |entry| {
-            if (now_ms - entry.value_ptr.* > self.window_ms) {
+            if (@as(i128, now_ms) - entry.value_ptr.* > self.window_ms) {
                 try expired.append(self.allocator, entry.key_ptr.*);
             }
         }
@@ -251,4 +255,13 @@ test "StrikeRegister: the window is inclusive, a re-armed slot starts a new wind
     try testing.expect(try one.checkAndMark("x", 0));
     try testing.expect(!(try one.checkAndMark("y", 10))); // "x" still live at age 10: full
     try testing.expect(try one.checkAndMark("y", 11)); // "x" evictable at age 11
+}
+
+test "StrikeRegister: extreme clock values compare without overflow (panic sweep 2026-10-28)" {
+    var reg = StrikeRegister.init(testing.allocator, 1, 10_000);
+    defer reg.deinit();
+    try testing.expect(try reg.checkAndMark("a", std.math.minInt(i64)));
+    try testing.expect(try reg.checkAndMark("b", std.math.maxInt(i64))); // full: "a" evicted
+    try testing.expect(!try reg.checkAndMark("b", std.math.minInt(i64))); // stepped back: still hot
+    try testing.expect(!try reg.checkAndMark("a", std.math.maxInt(i64) - 20_000)); // full of live "b"
 }
