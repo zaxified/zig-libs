@@ -16,6 +16,10 @@ const casefold16 = @import("casefold16.zig");
 const unicode16 = @import("unicode16_tables.zig");
 const unicode_tables = @import("unicode_tables.zig");
 
+/// Where bytes-mode instructions keep a raw byte past ASCII: `byte_base + b`,
+/// past every code point (a range is all bytes or all code points).
+pub const byte_base: u21 = 0x110000;
+
 /// Instructions in one program — also what bounds the VM's own scratch.
 pub const max_insts = 1024;
 /// Character-class ranges, all classes of one pattern together.
@@ -198,6 +202,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         pos: usize = 0,
         posix: bool = false,
         rust: bool = false,
+        /// Rust grammar on bytes (`regex::bytes`): `(?-u)` may match any byte.
+        bytes: bool = false,
         /// Rust grammar: the nesting height of what the last parse function
         /// read, as regex-syntax's `NestLimiter` counts it (groups,
         /// repetitions, classes and their unions and set operations, and
@@ -213,6 +219,14 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         }
 
         pub fn compileSyntax(b: *Self, pattern: []const u8, syntax: Syntax) Error!void {
+            return b.compileSyntaxBytes(pattern, syntax, false);
+        }
+
+        /// `compileSyntax`; `bytes` (Rust grammar only): for a haystack that
+        /// need not be UTF-8, where `(?-u)` classes, `.` and `\xNN` match raw
+        /// bytes. Such a byte past ASCII is stored as `byte_base + b`.
+        pub fn compileSyntaxBytes(b: *Self, pattern: []const u8, syntax: Syntax, bytes: bool) Error!void {
+            b.bytes = bytes and syntax == .rust;
             // Reset the counters only: `b.* = .{}` would write all ~80 KiB of
             // tables on every compile (measured: most of a short pattern's cost).
             b.ninsts = 0;
@@ -544,6 +558,8 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             assert: Assert,
             /// `\Q...\E`: literal text.
             quoted: []const u8,
+            /// Rust grammar, bytes mode: `(?-u:\xNN)`, one raw byte.
+            byte: u8,
         };
 
         fn parseEscape(b: *Self, flags: Flags) Error!u16 {
@@ -551,6 +567,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 .rune => |cp| return b.literal(cp, flags),
                 .class => |cl| return b.classNode(cl.start),
                 .assert => |a| return b.node(.{ .kind = .assert, .a = @backingInt(a) }),
+                .byte => unreachable, // the Rust grammar only
                 .quoted => |text| {
                     // A concat of literals (the enclosing concat takes it as one operand).
                     const cat = try b.node(.{ .kind = .concat, .flag = true }); // flag: spliced by parseConcat
@@ -1054,12 +1071,25 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 '[' => {
                     const start = b.nranges;
                     try b.rustClass(f, depth + 1);
+                    if (!f.unicode) try b.mapBytes(start);
                     return try b.classNode(start);
                 },
                 '.' => {
                     b.pos += 1;
-                    // `(?-u).` could match a byte past ASCII: not on `&str`.
-                    if (!f.unicode) return error.InvalidUtf8;
+                    if (!f.unicode) {
+                        // Any byte: not on `&str`.
+                        if (!b.bytes) return error.InvalidUtf8;
+                        const start = b.nranges;
+                        if (f.dot_nl) {
+                            try b.addRange(.{ .lo = 0, .hi = 0xff });
+                        } else {
+                            try b.addRange(.{ .lo = '\n', .hi = '\n' });
+                            if (f.crlf) try b.addRange(.{ .lo = '\r', .hi = '\r' });
+                            try b.negateBytesFrom(start);
+                        }
+                        try b.mapBytes(start);
+                        return try b.classNode(start);
+                    }
                     if (f.dot_nl) return try b.node(.{ .kind = .any });
                     if (!f.crlf) return try b.node(.{ .kind = .any_not_nl });
                     const start = b.nranges;
@@ -1080,7 +1110,11 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 },
                 '\\' => switch (try b.rustEscape(f, false)) {
                     .rune => |cp| return try b.rustLiteral(cp, f),
-                    .class => |cl| return try b.classNode(cl.start),
+                    .byte => |c| return try b.rustLiteral(if (c < 0x80) c else byte_base + @as(u21, c), f),
+                    .class => |cl| {
+                        if (!f.unicode) try b.mapBytes(cl.start);
+                        return try b.classNode(cl.start);
+                    },
                     .assert => |a| return try b.node(.{ .kind = .assert, .a = @backingInt(a) }),
                     .quoted => unreachable,
                 },
@@ -1233,7 +1267,10 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 'x', 'u', 'U' => {
                     const h = try b.rustHex(flags);
                     // `(?-u:\xFF)` is the byte 0xFF: not on `&str`.
-                    if (!flags.unicode and h.byte and h.cp > 0x7f) return error.InvalidUtf8;
+                    if (!flags.unicode and h.byte and h.cp > 0x7f) {
+                        if (!b.bytes) return error.InvalidUtf8;
+                        return .{ .byte = @intCast(h.cp) };
+                    }
                     return .{ .rune = h.cp };
                 },
                 'p', 'P' => return b.rustUnicodeEscape(flags),
@@ -1357,13 +1394,17 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                     else => try b.addBase16(unicode16.perl_word),
                 }
             } else {
-                if (negated) return error.InvalidUtf8;
+                if (negated and !b.bytes) return error.InvalidUtf8;
                 const set: []const Range = switch (std.ascii.toLower(c)) {
                     'd' => &.{.{ .lo = '0', .hi = '9' }},
                     's' => &.{ .{ .lo = '\t', .hi = '\r' }, .{ .lo = ' ', .hi = ' ' } },
                     else => &word_ranges,
                 };
                 for (set) |r| try b.addRange(r);
+                // Over bytes (bytes mode): the caller maps past ASCII.
+                b.normalizeFrom(start);
+                if (negated) try b.negateBytesFrom(start);
+                return .{ .class = .{ .start = start, .len = b.nranges - start } };
             }
             b.normalizeFrom(start);
             if (negated) try b.negateFrom(start);
@@ -1509,9 +1550,10 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             if (flags.fold) try b.rustFold(flags, start);
             b.normalizeFrom(start);
             if (negated) {
+                if (flags.unicode) return b.negateFrom(start);
                 // Over bytes, a negation reaches past ASCII: not on `&str`.
-                if (!flags.unicode) return error.InvalidUtf8;
-                try b.negateFrom(start);
+                if (!b.bytes) return error.InvalidUtf8;
+                try b.negateBytesFrom(start);
             }
         }
 
@@ -1625,6 +1667,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         fn rustClassPrim(b: *Self, flags: Flags) Error!?u21 {
             const cp: u21 = if (b.peek() == '\\') switch (try b.rustEscape(flags, true)) {
                 .rune => |r| r,
+                .byte => |c| return c, // a byte class member (bytes mode)
                 .class => return null,
                 else => return error.InvalidEscape,
             } else b.nextRune();
@@ -1648,10 +1691,48 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             // Folded before it is negated (`(?i)[[:^upper:]]` takes no letter).
             if (flags.fold) try b.rustFold(flags, start);
             if (negated) {
-                if (!flags.unicode) return error.InvalidUtf8;
-                try b.negateFrom(start);
+                if (flags.unicode) {
+                    try b.negateFrom(start);
+                } else {
+                    if (!b.bytes) return error.InvalidUtf8;
+                    try b.negateBytesFrom(start);
+                }
             }
             return true;
+        }
+
+        /// Complement `ranges[start..]` over the bytes 0..255 (a `(?-u)`
+        /// class in bytes mode, before `mapBytes`).
+        fn negateBytesFrom(b: *Self, start: u16) Error!void {
+            b.normalizeFrom(start);
+            try b.negateFrom(start);
+            // Cut the complement at 0xff.
+            var out = start;
+            for (start..b.nranges) |i| {
+                const r = b.ranges[i];
+                if (r.lo > 0xff) continue;
+                b.ranges[out] = .{ .lo = r.lo, .hi = @min(r.hi, 0xff) };
+                out += 1;
+            }
+            b.nranges = out;
+        }
+
+        /// A byte class's ranges (0..255) as instruction ranges: ASCII as is,
+        /// the bytes past it at `byte_base + b` — never a code point.
+        fn mapBytes(b: *Self, start: u16) Error!void {
+            var i = start;
+            const end = b.nranges;
+            while (i < end) : (i += 1) {
+                const r = b.ranges[i];
+                if (r.lo >= 0x80) {
+                    b.ranges[i] = .{ .lo = byte_base + r.lo, .hi = byte_base + r.hi };
+                } else if (r.hi >= 0x80) {
+                    b.ranges[i].hi = 0x7f;
+                    // Split; `normalizeFrom` sorts the new part in.
+                    try b.addRange(.{ .lo = byte_base + 0x80, .hi = byte_base + r.hi });
+                }
+            }
+            b.normalizeFrom(start);
         }
 
         // ── compiling ────────────────────────────────────────────────────────

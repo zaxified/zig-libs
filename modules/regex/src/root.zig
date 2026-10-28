@@ -54,6 +54,12 @@ pub const Options = struct {
     /// leftmost-first would find first. Null: what the syntax implies — off
     /// for `.perl`, on for `.posix` (Go's `CompilePOSIX`).
     longest: ?bool = null,
+    /// Rust grammar only: false reads the haystack as bytes that need not be
+    /// UTF-8, as Rust's `regex::bytes::Regex` — `(?-u)` classes, `(?-u).`
+    /// and `(?-u:\xNN)` match raw bytes, a Unicode class never matches an
+    /// invalid byte, and an empty match may fall inside a code point. Such a
+    /// `Regex` runs on the VMs only, and not through the `Reader` functions.
+    utf8: bool = true,
 
     fn isLongest(o: Options) bool {
         return o.longest orelse (o.syntax == .posix);
@@ -101,6 +107,8 @@ pub const Regex = struct {
     /// Unicode or start/end word boundaries): the lazy DFAs and the one-pass
     /// engine, whose contexts know ASCII only, step aside for the VMs.
     vm_only: bool = false,
+    /// Compiled with `Options.utf8 = false` (bytes mode).
+    bytes: bool = false,
 
     /// Compile at run time. The result owns its tables; `deinit` frees them.
     /// A pattern that fits `small_capacity` compiles in ~9 KiB of stack
@@ -137,7 +145,8 @@ pub const Regex = struct {
     }
 
     fn compileWith(gpa: std.mem.Allocator, b: anytype, pattern: []const u8, opts: Options) (Error || std.mem.Allocator.Error)!Regex {
-        try b.compileSyntax(pattern, opts.syntax);
+        try b.compileSyntaxBytes(pattern, opts.syntax, !opts.utf8);
+        const bytes = b.bytes;
         const insts = try gpa.dupe(Inst, b.insts[0..b.ninsts]);
         errdefer gpa.free(insts);
         const ranges = try gpa.dupe(Range, b.ranges[0..b.nranges]);
@@ -154,13 +163,14 @@ pub const Regex = struct {
         }
         const source = try gpa.dupe(u8, pattern);
         errdefer gpa.free(source);
-        var pf = analyze(insts, ranges);
-        if (buildTeddy(&pf, insts, ranges)) |t| {
+        // Bytes mode: no prefilter (its sets are of code points' bytes).
+        var pf: Prefilter = if (bytes) .{} else analyze(insts, ranges);
+        if (!bytes) if (buildTeddy(&pf, insts, ranges)) |t| {
             const tp = try gpa.create(teddy.Teddy);
             tp.* = t;
             pf.teddy = tp;
-        }
-        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts), .vm_only = hasRustAsserts(insts) };
+        };
+        return .{ .insts = insts, .ranges = ranges, .names = names, .owned = true, .prefilter = pf, .longest = opts.isLongest(), .source = source, .asserts = hasAsserts(insts), .vm_only = bytes or hasRustAsserts(insts), .bytes = bytes };
     }
 
     pub fn deinit(re: *Regex, gpa: std.mem.Allocator) void {
@@ -195,6 +205,16 @@ pub const Regex = struct {
 
     /// Does the pattern match all of `input`? (Go: `^(?:re)$` without `(?m)`.)
     /// Any way through the pattern counts, not only the leftmost-first one.
+    /// Where the first match to be found ends — the earliest end of any
+    /// match, not the leftmost-first one's (Rust's `shortest_match`); null
+    /// when nothing matches. Cheaper than a search with positions: no start
+    /// is worked out. Runs on the set VM.
+    pub fn shortestMatch(re: *const Regex, input: []const u8) ?usize {
+        if (re.bytes) return re.runSetBytesEnd(input, false);
+        var t: SliceText = .{ .input = input };
+        return re.runSetEnd(&t, false);
+    }
+
     pub fn fullMatch(re: *const Regex, input: []const u8) bool {
         return re.runSet(input, true);
     }
@@ -208,6 +228,8 @@ pub const Regex = struct {
     /// Go's `LiteralPrefix`: writes the literal text every match begins with;
     /// true when that text is the whole pattern.
     pub fn literalPrefix(re: *const Regex, w: *std.Io.Writer) std.Io.Writer.Error!bool {
+        // Bytes mode: its byte classes are no text; the empty prefix holds.
+        if (re.bytes) return false;
         return replace.literalPrefix(re, w);
     }
 
@@ -257,6 +279,7 @@ pub const Regex = struct {
     /// most three code points past the end of a match); no allocator,
     /// constant memory. `r`'s buffer must hold at least 4 bytes (one UTF-8 sequence).
     pub fn isMatchReader(re: *const Regex, r: *std.Io.Reader) error{ReadFailed}!bool {
+        std.debug.assert(!re.bytes); // bytes mode: slices only
         var t: ReaderText = .init(r);
         const found = re.runSetOn(&t, false);
         // A failure after the answer was settled does not change it.
@@ -265,6 +288,7 @@ pub const Regex = struct {
     }
 
     fn runSet(re: *const Regex, input: []const u8, full: bool) bool {
+        if (re.bytes) return re.runSetBytes(input, full);
         if (re.vm_only) {
             var t: SliceText = .{ .input = input };
             return re.runSetOn(&t, full);
@@ -437,7 +461,13 @@ pub const Regex = struct {
 
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
     /// never by a caller's frame that inlined it.
-    noinline fn runSetOn(re: *const Regex, text: anytype, full: bool) bool {
+    inline fn runSetOn(re: *const Regex, text: anytype, full: bool) bool {
+        return re.runSetEnd(text, full) != null;
+    }
+
+    /// `runSetOn`, giving where the first match to be seen ends (the
+    /// earliest end of any match), or null.
+    noinline fn runSetEnd(re: *const Regex, text: anytype, full: bool) ?usize {
         // `undefined`, not `.{}`: a default-initialised StateSet is written
         // whole (~2 KiB each) on every call — measured as 85 % of `isMatch`.
         var lists: [2]StateSet = undefined;
@@ -452,9 +482,9 @@ pub const Regex = struct {
         while (true) {
             if (!full and cur.n == 0) {
                 // No thread alive: a match can only start where the prefilter allows.
-                if (pf.anchored and pos != 0) return false;
+                if (pf.anchored and pos != 0) return null;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
-                    pos = text.skip(pf, pos) orelse return false;
+                    pos = text.skip(pf, pos) orelse return null;
                     prev = text.before(pos);
                     // `seen` still holds the closure walked where the threads
                     // died (an assertion that failed there, say): stale here.
@@ -465,17 +495,17 @@ pub const Regex = struct {
             if ((!full and (!pf.anchored or pos == 0)) or pos == 0) re.closureSet(cur, 0, prev, here.cp, &stack);
             // No thread left: anchored, nothing can start later; unanchored,
             // the next position starts a new one.
-            if (cur.n == 0 and (full or here.cp == null)) return false;
+            if (cur.n == 0 and (full or here.cp == null)) return null;
             nxt.clear(words);
             const after = if (here.cp != null) text.at(pos + here.w) else here;
             for (cur.pcs[0..cur.n]) |pc| {
                 switch (re.insts[pc]) {
-                    .match => if (!full or here.cp == null) return true,
+                    .match => if (!full or here.cp == null) return pos,
                     else => if (here.cp) |cp| if (re.consumes(pc, cp))
                         re.closureSet(nxt, pc + 1, cp, after.cp, &stack),
                 }
             }
-            if (here.cp == null) return false;
+            if (here.cp == null) return null;
             pos += here.w;
             prev = here.cp;
             std.mem.swap(*StateSet, &cur, &nxt);
@@ -563,7 +593,7 @@ pub const Regex = struct {
 
     /// Add `pc0` and every state reachable from it without consuming input,
     /// at a position between `prev` and `next`.
-    fn closureSet(re: *const Regex, set: *StateSet, pc0: u16, prev: ?u21, next: ?u21, stack: *[2 * max_insts]u16) void {
+    fn closureSet(re: *const Regex, set: anytype, pc0: u16, prev: ?u21, next: ?u21, stack: *[2 * max_insts]u16) void {
         var sp: usize = 0;
         stack[sp] = pc0;
         sp += 1;
@@ -592,9 +622,67 @@ pub const Regex = struct {
                 },
                 .rune, .any, .any_not_nl, .match => {
                     set.pcs[set.n] = pc;
+                    if (@TypeOf(set) == *ByteSet) set.rem[set.n] = 0;
                     set.n += 1;
                 },
             }
+        }
+    }
+
+    /// Bytes mode: how many bytes instruction `pc` takes at `pos`, or null.
+    /// A byte class (one with a range past `byte_base`) takes one raw byte;
+    /// anything else one valid UTF-8 sequence (never an invalid byte).
+    fn consumeBytes(re: *const Regex, pc: u16, input: []const u8, pos: usize) ?usize {
+        if (pos >= input.len) return null;
+        const c = input[pos];
+        if (re.insts[pc] == .rune) {
+            const r = re.insts[pc].rune;
+            const rs = re.ranges[r.start..][0..r.len];
+            if (rs.len != 0 and rs[rs.len - 1].hi >= syntax.byte_base) {
+                const key: u21 = if (c < 0x80) c else syntax.byte_base + @as(u21, c);
+                return if (inRanges(rs, key)) 1 else null;
+            }
+        }
+        const d = decode(input, pos);
+        if (d.w == 1 and c >= 0x80) return null; // invalid UTF-8
+        return if (re.consumes(pc, d.cp.?)) d.w else null;
+    }
+
+    /// `runSet` in bytes mode: one step per byte; a thread that took a
+    /// sequence of `w` bytes waits `w - 1` steps (`rem`) before its closure,
+    /// as the states inside a UTF-8 automaton would.
+    fn runSetBytes(re: *const Regex, input: []const u8, full: bool) bool {
+        return re.runSetBytesEnd(input, full) != null;
+    }
+
+    noinline fn runSetBytesEnd(re: *const Regex, input: []const u8, full: bool) ?usize {
+        var lists: [2]ByteSet = undefined;
+        var stack: [2 * max_insts]u16 = undefined;
+        var cur: *ByteSet = &lists[0];
+        var nxt: *ByteSet = &lists[1];
+        cur.clear();
+        var pos: usize = 0;
+        while (true) {
+            const at_end = pos >= input.len;
+            if (!full or pos == 0) re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), &stack);
+            if (cur.n == 0 and (full or at_end)) return null;
+            nxt.clear();
+            const q = pos + 1;
+            for (cur.pcs[0..cur.n], cur.rem[0..cur.n]) |pc, rem| {
+                if (rem != 0) {
+                    if (rem == 1) re.closureSet(nxt, pc, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc, rem - 1);
+                    continue;
+                }
+                if (re.insts[pc] == .match) {
+                    if (!full or at_end) return pos;
+                    continue;
+                }
+                const w = re.consumeBytes(pc, input, pos) orelse continue;
+                if (w == 1) re.closureSet(nxt, pc + 1, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc + 1, @intCast(w - 1));
+            }
+            if (at_end) return null;
+            pos = q;
+            std.mem.swap(*ByteSet, &cur, &nxt);
         }
     }
 
@@ -608,6 +696,179 @@ pub const Regex = struct {
     }
 };
 
+/// Many patterns, one pass over the text: which of them match, each on its
+/// own and anywhere (Rust's `RegexSet`, RE2's `RE2::Set`). The patterns are
+/// compiled one by one and joined into one program — a chain of splits, one
+/// branch per pattern, each keeping its own `match` — which a set of threads
+/// runs once over the text, unanchored. No positions: ask a `Regex` for
+/// those. The program is bounded by `max_insts` like one pattern's.
+pub const RegexSet = struct {
+    insts: []const Inst,
+    ranges: []const Range,
+    /// The `match` instruction of each pattern, ascending.
+    ends: []const u16,
+    /// Compiled with `Options.utf8 = false`.
+    bytes: bool,
+
+    /// Compile `patterns` with `opts` (one bad pattern fails the set, with
+    /// its error). The set owns its tables; `deinit` frees them.
+    pub fn compile(gpa: std.mem.Allocator, patterns: []const []const u8, opts: Options) (Error || std.mem.Allocator.Error)!RegexSet {
+        const res = try gpa.alloc(Regex, patterns.len);
+        defer gpa.free(res);
+        var done: usize = 0;
+        defer for (res[0..done]) |*re| re.deinit(gpa);
+        var n_insts: usize = patterns.len -| 1; // the splits
+        var n_ranges: usize = 0;
+        for (patterns, res) |pat, *re| {
+            re.* = try Regex.compileOptions(gpa, pat, opts);
+            done += 1;
+            n_insts += re.insts.len;
+            n_ranges += re.ranges.len;
+        }
+        if (n_insts > max_insts) return error.PatternTooLarge;
+        const insts = try gpa.alloc(Inst, n_insts);
+        errdefer gpa.free(insts);
+        const ranges = try gpa.alloc(Range, n_ranges);
+        errdefer gpa.free(ranges);
+        const ends = try gpa.alloc(u16, patterns.len);
+        errdefer gpa.free(ends);
+        var at: u16 = @intCast(patterns.len -| 1);
+        var rat: u16 = 0;
+        for (res, 0..) |*re, i| {
+            if (i + 1 < res.len) {
+                // Split i: pattern i, else the next split (or the last pattern).
+                const next: u16 = if (i + 2 < res.len) @intCast(i + 1) else at + @as(u16, @intCast(re.insts.len));
+                insts[i] = .{ .split = .{ .x = at, .y = next } };
+            }
+            for (re.insts, 0..) |inst, pc| {
+                insts[at + pc] = switch (inst) {
+                    .jmp => |t| .{ .jmp = t + at },
+                    .split => |sp| .{ .split = .{ .x = sp.x + at, .y = sp.y + at } },
+                    .rune => |r| .{ .rune = .{ .start = r.start + rat, .len = r.len } },
+                    .match => blk: {
+                        ends[i] = at + @as(u16, @intCast(pc));
+                        break :blk .match;
+                    },
+                    else => inst,
+                };
+            }
+            @memcpy(ranges[rat..][0..re.ranges.len], re.ranges);
+            at += @intCast(re.insts.len);
+            rat += @intCast(re.ranges.len);
+        }
+        return .{ .insts = insts, .ranges = ranges, .ends = ends, .bytes = !opts.utf8 and opts.syntax == .rust };
+    }
+
+    pub fn deinit(set: *RegexSet, gpa: std.mem.Allocator) void {
+        gpa.free(set.insts);
+        gpa.free(set.ranges);
+        gpa.free(set.ends);
+        set.* = undefined;
+    }
+
+    /// Does any pattern match `input`?
+    pub fn isMatch(set: *const RegexSet, input: []const u8) bool {
+        return set.run(input, null);
+    }
+
+    /// Which patterns match `input`: `out[i]` for pattern `i` (`out.len` is
+    /// the pattern count). Whether any did.
+    pub fn matches(set: *const RegexSet, input: []const u8, out: []bool) bool {
+        std.debug.assert(out.len == set.ends.len);
+        @memset(out, false);
+        return set.run(input, out);
+    }
+
+    /// The joined program as a `Regex`, for its thread machinery.
+    fn view(set: *const RegexSet) Regex {
+        return .{ .insts = set.insts, .ranges = set.ranges, .names = &.{}, .bytes = set.bytes, .vm_only = true };
+    }
+
+    /// Which pattern `pc` (a `match`) ends.
+    fn patternOf(set: *const RegexSet, pc: u16) usize {
+        return std.sort.lowerBound(u16, set.ends, pc, struct {
+            fn order(a: u16, b: u16) std.math.Order {
+                return std.math.order(a, b);
+            }
+        }.order);
+    }
+
+    /// Mark the pattern that `pc` ends; true when the run can stop (any
+    /// match will do, or every pattern has matched).
+    fn hit(set: *const RegexSet, out: ?[]bool, found: *usize, pc: u16) bool {
+        const o = out orelse return true;
+        const p = set.patternOf(pc);
+        if (!o[p]) {
+            o[p] = true;
+            found.* += 1;
+        }
+        return found.* == o.len;
+    }
+
+    fn run(set: *const RegexSet, input: []const u8, out: ?[]bool) bool {
+        if (set.ends.len == 0) return false;
+        const re = set.view();
+        var found: usize = 0;
+        if (set.bytes) return set.runBytes(&re, input, out, &found) or found != 0;
+        var lists: [2]StateSet = undefined;
+        var stack: [2 * max_insts]u16 = undefined;
+        const words = (re.insts.len + 63) / 64;
+        var cur: *StateSet = &lists[0];
+        var nxt: *StateSet = &lists[1];
+        cur.clear(words);
+        var pos: usize = 0;
+        var prev: ?u21 = null;
+        while (true) {
+            const here = decode(input, pos);
+            re.closureSet(cur, 0, prev, here.cp, &stack);
+            nxt.clear(words);
+            const after = if (here.cp != null) decode(input, pos + here.w) else here;
+            for (cur.pcs[0..cur.n]) |pc| {
+                switch (re.insts[pc]) {
+                    .match => if (set.hit(out, &found, pc)) return true,
+                    else => if (here.cp) |cp| if (re.consumes(pc, cp))
+                        re.closureSet(nxt, pc + 1, cp, after.cp, &stack),
+                }
+            }
+            if (here.cp == null) return found != 0;
+            pos += here.w;
+            prev = here.cp;
+            std.mem.swap(*StateSet, &cur, &nxt);
+        }
+    }
+
+    /// `run` in bytes mode, as `Regex.runSetBytes`.
+    noinline fn runBytes(set: *const RegexSet, re: *const Regex, input: []const u8, out: ?[]bool, found: *usize) bool {
+        var lists: [2]ByteSet = undefined;
+        var stack: [2 * max_insts]u16 = undefined;
+        var cur: *ByteSet = &lists[0];
+        var nxt: *ByteSet = &lists[1];
+        cur.clear();
+        var pos: usize = 0;
+        while (true) {
+            const at_end = pos >= input.len;
+            re.closureSet(cur, 0, bytesBefore(input, pos), bytesAt(input, pos), &stack);
+            nxt.clear();
+            const q = pos + 1;
+            for (cur.pcs[0..cur.n], cur.rem[0..cur.n]) |pc, rem| {
+                if (rem != 0) {
+                    if (rem == 1) re.closureSet(nxt, pc, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc, rem - 1);
+                    continue;
+                }
+                if (re.insts[pc] == .match) {
+                    if (set.hit(out, found, pc)) return true;
+                    continue;
+                }
+                const w = re.consumeBytes(pc, input, pos) orelse continue;
+                if (w == 1) re.closureSet(nxt, pc + 1, bytesBefore(input, q), bytesAt(input, q), &stack) else nxt.pending(pc + 1, @intCast(w - 1));
+            }
+            if (at_end) return false;
+            pos = q;
+            std.mem.swap(*ByteSet, &cur, &nxt);
+        }
+    }
+};
+
 /// Compile `pattern` at compile time; a bad pattern is a compile error.
 pub fn comptimeCompile(comptime pattern: []const u8) Regex {
     return comptimeCompileOptions(pattern, .{});
@@ -618,19 +879,20 @@ pub fn comptimeCompileOptions(comptime pattern: []const u8, comptime opts: Optio
     comptime {
         @setEvalBranchQuota(2_000_000);
         var b: syntax.Builder = .{};
-        b.compileSyntax(pattern, opts.syntax) catch |e| @compileError("regex: \"" ++ pattern ++ "\": " ++ @errorName(e));
+        b.compileSyntaxBytes(pattern, opts.syntax, !opts.utf8) catch |e| @compileError("regex: \"" ++ pattern ++ "\": " ++ @errorName(e));
+        const bytes = b.bytes;
         const insts = b.insts[0..b.ninsts].*;
         const ranges = b.ranges[0..b.nranges].*;
         var names: [b.ngroups][]const u8 = undefined;
         for (&names, b.names[0..b.ngroups]) |*slot, n| slot.* = n;
         const final_names = names;
-        var pf = analyze(&insts, &ranges);
-        if (buildTeddy(&pf, &insts, &ranges)) |t| {
+        var pf: Prefilter = if (bytes) .{} else analyze(&insts, &ranges);
+        if (!bytes) if (buildTeddy(&pf, &insts, &ranges)) |t| {
             const final_teddy = t;
             pf.teddy = &final_teddy;
-        }
+        };
         const final_pf = pf;
-        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts), .vm_only = hasRustAsserts(&insts) };
+        return .{ .insts = &insts, .ranges = &ranges, .names = &final_names, .prefilter = final_pf, .longest = opts.isLongest(), .source = pattern, .asserts = hasAsserts(&insts), .vm_only = bytes or hasRustAsserts(&insts), .bytes = bytes };
     }
 }
 
@@ -665,6 +927,29 @@ pub fn matches(gpa: std.mem.Allocator, pattern: []const u8, input: []const u8) (
     defer re.deinit(gpa);
     return re.isMatch(input);
 }
+
+/// `StateSet` for bytes mode: also threads inside a UTF-8 sequence, `rem`
+/// bytes from its end (1..3), each (instruction, rem) once.
+const ByteSet = struct {
+    pcs: [4 * max_insts]u16,
+    rem: [4 * max_insts]u8,
+    n: u16,
+    seen: std.StaticBitSet(4 * max_insts),
+
+    fn clear(s: *ByteSet) void {
+        s.n = 0;
+        @memset(&s.seen.masks, 0);
+    }
+
+    fn pending(s: *ByteSet, pc: u16, rem: u8) void {
+        const key = @as(usize, rem) * max_insts + pc;
+        if (s.seen.isSet(key)) return;
+        s.seen.set(key);
+        s.pcs[s.n] = pc;
+        s.rem[s.n] = rem;
+        s.n += 1;
+    }
+};
 
 const StateSet = struct {
     pcs: [max_insts]u16,
@@ -2245,6 +2530,9 @@ pub const Matcher = struct {
         pcs: []u16,
         caps: []usize,
         seen: []u32,
+        /// Bytes mode: bytes left of the sequence the thread is inside (0: at
+        /// a boundary); 1..3 entries are keyed in `seen` past the first `n`.
+        rem: []u8,
         gen: u32 = 0,
         n: usize = 0,
 
@@ -2265,13 +2553,15 @@ pub const Matcher = struct {
     pub fn init(gpa: std.mem.Allocator, re: *const Regex) std.mem.Allocator.Error!Matcher {
         const n = re.insts.len;
         const k = re.names.len * 2;
-        const words = 2 * (wordsFor(usize, n * k) + wordsFor(u16, n) + wordsFor(u32, n)) +
+        // Bytes mode: also the threads inside a sequence, (pc, 1..3).
+        const cap = if (re.bytes) 4 * n else n;
+        const words = 2 * (wordsFor(usize, cap * k) + wordsFor(u16, cap) + wordsFor(u32, cap) + wordsFor(u8, cap)) +
             wordsFor(Entry, 3 * n) + 2 * wordsFor(usize, k);
         const block = try gpa.alloc(usize, words);
         var rest = block;
         var m: Matcher = .{ .gpa = gpa, .re = re, .k = k, .block = block, .lists = undefined, .stack = undefined, .tmp = undefined, .best = undefined, .bt_width = max_backtrack_bits / n };
         for (&m.lists) |*l| {
-            l.* = .{ .caps = take(usize, &rest, n * k), .pcs = take(u16, &rest, n), .seen = take(u32, &rest, n) };
+            l.* = .{ .caps = take(usize, &rest, cap * k), .pcs = take(u16, &rest, cap), .seen = take(u32, &rest, cap), .rem = take(u8, &rest, cap) };
             @memset(l.seen, 0);
         }
         m.stack = take(Entry, &rest, 3 * n);
@@ -2497,7 +2787,8 @@ pub const Matcher = struct {
                 var accept = true;
                 if (s.start == s.end) {
                     if (it.prev_end != null and s.start == it.prev_end.?) accept = false;
-                    it.pos = if (s.end < it.input.len) s.end + decode(it.input, s.end).w else it.input.len + 1;
+                    const w = if (it.m.re.bytes) 1 else decode(it.input, s.end).w;
+                    it.pos = if (s.end < it.input.len) s.end + w else it.input.len + 1;
                 } else it.pos = s.end;
                 it.prev_end = s.end;
                 if (accept) return s;
@@ -2521,8 +2812,70 @@ pub const Matcher = struct {
             .none => return false,
             .pike => |at| start = at,
         };
+        if (m.re.bytes) return m.runOnBytes(input, start, full);
         var t: SliceText = .{ .input = input };
         return m.runOn(&t, start, full);
+    }
+
+    /// `runOn` in bytes mode: one step per byte; a thread that took a
+    /// sequence of `w` bytes keeps its place in the list for `w - 1` steps
+    /// (`List.rem`) before its closure — the states inside a UTF-8
+    /// automaton, so priorities stay as Rust's byte NFA has them.
+    fn runOnBytes(m: *Matcher, input: []const u8, from: usize, full: bool) bool {
+        const re = m.re;
+        var cur = &m.lists[0];
+        var nxt = &m.lists[1];
+        cur.clear();
+        var matched = false;
+        var pos = from;
+        while (true) {
+            const at_end = pos >= input.len;
+            if (!matched and (!full or pos == from)) {
+                @memset(m.tmp, nil);
+                m.addThread(cur, 0, pos, bytesBefore(input, pos), bytesAt(input, pos));
+            }
+            if (cur.n == 0 and (matched or at_end or full)) break;
+            nxt.clear();
+            const q = pos + 1;
+            var i: usize = 0;
+            while (i < cur.n) : (i += 1) {
+                const pc = cur.pcs[i];
+                const rem = cur.rem[i];
+                const caps = cur.caps[i * m.k ..][0..m.k];
+                if (re.longest and matched and caps[0] > m.best[0]) continue; // started later
+                if (rem != 0) {
+                    @memcpy(m.tmp, caps);
+                    if (rem == 1) m.addThread(nxt, pc, q, bytesBefore(input, q), bytesAt(input, q)) else m.addPending(nxt, pc, rem - 1);
+                    continue;
+                }
+                if (re.insts[pc] == .match) {
+                    if (full and !at_end) continue;
+                    @memcpy(m.best, caps);
+                    m.best[1] = pos;
+                    matched = true;
+                    if (re.longest) continue;
+                    break; // cut the lower-priority threads
+                }
+                const w = re.consumeBytes(pc, input, pos) orelse continue;
+                @memcpy(m.tmp, caps);
+                if (w == 1) m.addThread(nxt, pc + 1, q, bytesBefore(input, q), bytesAt(input, q)) else m.addPending(nxt, pc + 1, @intCast(w - 1));
+            }
+            if (at_end) break;
+            pos = q;
+            std.mem.swap(*List, &cur, &nxt);
+        }
+        return matched;
+    }
+
+    /// A thread `rem` bytes before the end of a sequence, with `m.tmp`'s captures.
+    fn addPending(m: *Matcher, list: *List, pc: u16, rem: u8) void {
+        const key = @as(usize, rem) * m.re.insts.len + pc;
+        if (list.seen[key] == list.gen) return;
+        list.seen[key] = list.gen;
+        list.pcs[list.n] = pc;
+        list.rem[list.n] = rem;
+        @memcpy(list.caps[list.n * m.k ..][0..m.k], m.tmp);
+        list.n += 1;
     }
 
     /// What `backtrack` settled: a match, none, or no answer — the Pike VM
@@ -2572,7 +2925,7 @@ pub const Matcher = struct {
                 .none => {},
             }
             if (start >= input.len) return .none;
-            start += decode(input, start).w;
+            start += if (re.bytes) 1 else decode(input, start).w;
         }
     }
 
@@ -2617,10 +2970,14 @@ pub const Matcher = struct {
                         return .found;
                     },
                     .rune, .any, .any_not_nl => {
-                        const d = decode(input, pos);
-                        const cp = d.cp orelse break;
-                        if (!re.consumes(pc, cp)) break;
-                        pos += d.w;
+                        if (re.bytes) {
+                            pos += re.consumeBytes(pc, input, pos) orelse break;
+                        } else {
+                            const d = decode(input, pos);
+                            const cp = d.cp orelse break;
+                            if (!re.consumes(pc, cp)) break;
+                            pos += d.w;
+                        }
                         pc += 1;
                     },
                     .split => |sp| {
@@ -2638,7 +2995,8 @@ pub const Matcher = struct {
                         pc += 1;
                     },
                     .assert => |a| {
-                        if (!assertHolds(a, runeBefore(input, pos), decode(input, pos).cp)) break;
+                        const holds = if (re.bytes) assertHolds(a, bytesBefore(input, pos), bytesAt(input, pos)) else assertHolds(a, runeBefore(input, pos), decode(input, pos).cp);
+                        if (!holds) break;
                         pc += 1;
                     },
                 }
@@ -2667,6 +3025,7 @@ pub const Matcher = struct {
     /// three code points past the match's end); constant memory. `r`'s buffer must
     /// hold at least 4 bytes.
     pub fn findReader(m: *Matcher, r: *std.Io.Reader) error{ReadFailed}!?Span {
+        std.debug.assert(!m.re.bytes); // bytes mode: slices only
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -2677,6 +3036,7 @@ pub const Matcher = struct {
     /// Go's `FindReaderSubmatchIndex`: `findReader` that also fills `out` as
     /// `captures` does.
     pub fn capturesReader(m: *Matcher, r: *std.Io.Reader, out: []?Span) error{ReadFailed}!bool {
+        std.debug.assert(!m.re.bytes); // bytes mode: slices only
         var t: ReaderText = .init(r);
         const found = m.runOn(&t, 0, false);
         if (t.failed and !found) return error.ReadFailed;
@@ -2790,6 +3150,7 @@ pub const Matcher = struct {
                         },
                         .rune, .any, .any_not_nl, .match => {
                             list.pcs[list.n] = pc;
+                            list.rem[list.n] = 0;
                             @memcpy(list.caps[list.n * m.k ..][0..m.k], m.tmp);
                             list.n += 1;
                         },
@@ -2939,9 +3300,45 @@ fn isWord(cp: ?u21) bool {
     return c < 0x80 and (std.ascii.isAlphanumeric(@intCast(c)) or c == '_');
 }
 
+/// Bytes mode: what the assertions see before `i`, as regex-automata's
+/// `utf8::decode_last`: back over at most three continuation bytes, then
+/// decode from there — a code point that ends before `i` counts
+/// (`"σ\x80"` reads σ, a word character, before its end). `invalid` when
+/// that decode fails.
+fn bytesBefore(input: []const u8, i: usize) ?u21 {
+    if (i == 0) return null;
+    var start = i - 1;
+    const limit = i -| 4;
+    while (start > limit and input[start] & 0xc0 == 0x80) start -= 1;
+    const d = decode(input[0..i], start);
+    if (d.w == 1 and input[start] >= 0x80) return invalid;
+    // The ASCII assertions read the byte at `i - 1` itself: past ASCII, no
+    // word byte — though `decode_last` may have read an ASCII one before it.
+    const cp = d.cp.?;
+    if (cp < 0x80 and input[i - 1] >= 0x80) return ascii_shadow + cp;
+    return cp;
+}
+
+/// `ascii_shadow + c`: the Unicode assertions see ASCII `c`, the ASCII ones
+/// a byte past ASCII (bytes mode, `bytesBefore`).
+const ascii_shadow: u21 = syntax.byte_base + 0x100;
+
+/// Bytes mode: the code point at `i` for the assertions (`invalid` for an
+/// invalid byte), null at the end.
+fn bytesAt(input: []const u8, i: usize) ?u21 {
+    const d = decode(input, i);
+    const cp = d.cp orelse return null;
+    return if (d.w == 1 and input[i] >= 0x80) invalid else cp;
+}
+
+/// An invalid byte next to a position (bytes mode): no word character, and
+/// Rust's `\B` and half boundaries do not hold beside it.
+const invalid: u21 = syntax.byte_base;
+
 fn isUnicodeWord(cp: ?u21) bool {
     const c = cp orelse return false;
     if (c < 0x80) return isWord(c);
+    if (c >= ascii_shadow and c < ascii_shadow + 0x80) return isWord(c - ascii_shadow);
     return syntax.isPerlWord(c);
 }
 
@@ -2956,15 +3353,15 @@ fn assertHolds(a: Assert, prev: ?u21, next: ?u21) bool {
         .begin_line_crlf => prev == null or prev.? == '\n' or (prev.? == '\r' and next != '\n'),
         .end_line_crlf => next == null or next.? == '\r' or (next.? == '\n' and prev != '\r'),
         .word_boundary_unicode => isUnicodeWord(prev) != isUnicodeWord(next),
-        .not_word_boundary_unicode => isUnicodeWord(prev) == isUnicodeWord(next),
+        .not_word_boundary_unicode => prev != invalid and next != invalid and isUnicodeWord(prev) == isUnicodeWord(next),
         .word_start => !isWord(prev) and isWord(next),
         .word_end => isWord(prev) and !isWord(next),
         .word_start_half => !isWord(prev),
         .word_end_half => !isWord(next),
         .word_start_unicode => !isUnicodeWord(prev) and isUnicodeWord(next),
         .word_end_unicode => isUnicodeWord(prev) and !isUnicodeWord(next),
-        .word_start_half_unicode => !isUnicodeWord(prev),
-        .word_end_half_unicode => !isUnicodeWord(next),
+        .word_start_half_unicode => prev != invalid and !isUnicodeWord(prev),
+        .word_end_half_unicode => next != invalid and !isUnicodeWord(next),
     };
 }
 
