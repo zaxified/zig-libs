@@ -2288,3 +2288,82 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: proxy finalStatus bounds" {
+    try testing.expect(!ProxyHandler.finalStatus(0));
+    try testing.expect(!ProxyHandler.finalStatus(100));
+    try testing.expect(!ProxyHandler.finalStatus(101));
+    try testing.expect(!ProxyHandler.finalStatus(199));
+    try testing.expect(ProxyHandler.finalStatus(200));
+    try testing.expect(ProxyHandler.finalStatus(599));
+    try testing.expect(!ProxyHandler.finalStatus(600));
+    try testing.expect(!ProxyHandler.finalStatus(999));
+}
+
+fn reAuditStatusOrigin(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/600")) {
+        rw.setStatus(600);
+        try rw.writeAll("x");
+    } else if (std.mem.eql(u8, req.path, "/big")) {
+        try rw.writeAll(strRepeat("a", 1000));
+    } else {
+        try rw.writeAll("ok");
+    }
+}
+
+/// One GET through a proxy in front of `reAuditStatusOrigin`; the proxy's
+/// answer status (0 when the request itself failed).
+fn reAuditProxyGet(use_h2: bool, h2_cap: usize, path: []const u8) !u16 {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var backend = Server.init(io, gpa, .{ .handler = reAuditStatusOrigin, .enable_h2c = use_h2 });
+    defer backend.deinit();
+    backend.bind() catch |err| return testkit.loopbackSkip("backend bind failed ({t})", .{err});
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{&backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const backend_port = backend.boundAddress().getPort();
+
+    var proxy_client = Client.init(io, gpa, .{});
+    defer proxy_client.deinit();
+    var up = http.h2_upstream.Pool.init(gpa, .{ .client = &proxy_client });
+    defer up.deinit();
+    var ph = ProxyHandler.init(.{
+        .client = &proxy_client,
+        .h2_upstream = if (use_h2) &up else null,
+        .h2_max_body_bytes = h2_cap,
+        .backend = .{ .host = "127.0.0.1", .port = backend_port, .protocol = if (use_h2) .h2c else .http1 },
+    });
+    var proxy = Server.init(io, gpa, .{ .handler = ProxyHandler.handler, .context = &ph });
+    defer proxy.deinit();
+    proxy.bind() catch |err| return testkit.loopbackSkip("proxy bind failed ({t})", .{err});
+    const pt = try std.Thread.spawn(.{}, serveWrap, .{&proxy});
+    defer pt.join();
+    defer proxy.shutdown();
+
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}{s}", .{ proxy.boundAddress().getPort(), path });
+    var res = client.request(.get, url, .{}) catch return 0;
+    defer res.deinit();
+    return res.status;
+}
+
+test "re-audit 2026-10-28: proxy h1 backend answering status 600 is a 502, not relayed" {
+    try testing.expectEqual(@as(u16, 200), try reAuditProxyGet(false, 1 << 20, "/ok"));
+    try testing.expectEqual(@as(u16, 502), try reAuditProxyGet(false, 1 << 20, "/600"));
+}
+
+test "re-audit 2026-10-28: proxy h2 backend answering status 600 is a 502, not relayed" {
+    try testing.expectEqual(@as(u16, 200), try reAuditProxyGet(true, 1 << 20, "/ok"));
+    try testing.expectEqual(@as(u16, 502), try reAuditProxyGet(true, 1 << 20, "/600"));
+}
+
+test "re-audit 2026-10-28: proxy h2 response body is capped by Config.h2_max_body_bytes" {
+    try testing.expectEqual(@as(u16, 200), try reAuditProxyGet(true, 1 << 20, "/big"));
+    try testing.expectEqual(@as(u16, 502), try reAuditProxyGet(true, 16, "/big"));
+}

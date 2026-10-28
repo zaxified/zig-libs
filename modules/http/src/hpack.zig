@@ -2438,3 +2438,37 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: hpack: Decoder table-size ceiling is clamped to max_table_size_limit" {
+    const gpa = testing.allocator;
+    var d = Decoder.init(gpa, .{ .max_table_size = std.math.maxInt(usize) });
+    defer d.deinit();
+    try testing.expectEqual(max_table_size_limit, d.table.max_size);
+    try testing.expectEqual(max_table_size_limit, d.settings_max_table_size);
+
+    d.setMaxTableSize(1024);
+    try testing.expectEqual(@as(usize, 1024), d.settings_max_table_size);
+    // One past the limit (boundary), then far past it.
+    d.setMaxTableSize(max_table_size_limit + 1);
+    try testing.expectEqual(max_table_size_limit, d.settings_max_table_size);
+    d.setMaxTableSize(1024);
+    d.setMaxTableSize(std.math.maxInt(usize));
+    try testing.expectEqual(max_table_size_limit, d.settings_max_table_size);
+    // Exactly the limit is kept.
+    d.setMaxTableSize(1024);
+    d.setMaxTableSize(max_table_size_limit);
+    try testing.expectEqual(max_table_size_limit, d.settings_max_table_size);
+}
+
+test "re-audit 2026-10-28: hpack: Encoder table size is clamped to max_table_size_limit" {
+    const gpa = testing.allocator;
+    var e = Encoder.init(gpa, .{ .max_table_size = std.math.maxInt(usize) });
+    defer e.deinit();
+    try testing.expectEqual(max_table_size_limit, e.table.max_size);
+
+    e.setMaxTableSize(1024);
+    try testing.expectEqual(@as(usize, 1024), e.table.max_size);
+    e.setMaxTableSize(std.math.maxInt(usize));
+    try testing.expectEqual(max_table_size_limit, e.table.max_size);
+    try testing.expectEqual(@as(?usize, max_table_size_limit), e.pending_final);
+}

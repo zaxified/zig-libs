@@ -9789,3 +9789,88 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: slabSize is null on usize overflow, never a wrapped small size" {
+    const ok: Options = .{ .handler = testHandler };
+    try testing.expect(slabSize(&ok) != null);
+    var big = ok;
+    big.read_buffer_size = std.math.maxInt(usize);
+    big.write_buffer_size = 1;
+    try testing.expectEqual(@as(?usize, null), slabSize(&big));
+}
+
+test "re-audit 2026-10-28: serveStep with req_index = maxInt(u32) saturates and closes at the cap" {
+    var in: Reader = .fixed("GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    const bufs: StreamBuffers = .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    };
+    const opts: StreamOptions = .{ .handler = testHandler, .server_name = "test", .now = null, .max_requests_per_conn = 5 };
+    try testing.expectEqual(ConnDisposition.close, serveStep(opts, &in, &out, bufs, std.math.maxInt(u32)));
+}
+
+test "re-audit 2026-10-28: a failed Encoder begin leaves the body discarding, not draining into an unset writer" {
+    var t: TestEncoder = .{ .fail_begin = true };
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t.encoder(),
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.interface.writeAll("hello, encoder");
+    try testing.expectError(error.WriteFailed, rw.end());
+    // A handler that swallowed the error keeps writing: the bytes go nowhere.
+    try rw.interface.writeAll(&@as([300]u8, @splat(0x7a)));
+    try rw.interface.flush();
+    try testing.expect(rw.connectionMustClose());
+}
+
+test "re-audit 2026-10-28: a failed gzip begin leaves the body discarding, not draining into an unset writer" {
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    const payload = "hello, gzip body";
+    // Sizing run: where the head ends.
+    var head_len: usize = 0;
+    {
+        var out_buf: [1024]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var chunk_buf: [9]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = .{ .min_size = 4 },
+            .gzip_scratch = scratch,
+            .accept_gzip = true,
+        });
+        try rw.setHeader("Content-Type", "text/plain");
+        try rw.interface.writeAll(payload);
+        try rw.end();
+        head_len = std.mem.find(u8, out.buffered(), "\r\n\r\n").? + 4;
+    }
+    // Room for the head only: the 10-byte gzip header cannot be written.
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(out_buf[0..head_len]);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [9]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .gzip_scratch = scratch,
+        .accept_gzip = true,
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.interface.writeAll(payload);
+    try testing.expectError(error.WriteFailed, rw.end());
+    try rw.interface.writeAll(&@as([300]u8, @splat(0x7a)));
+    try rw.interface.flush();
+    try testing.expect(rw.connectionMustClose());
+}

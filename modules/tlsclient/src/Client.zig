@@ -4099,3 +4099,23 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: end: close_notify goes out on a minimal output; a too-small output is WriteFailed, not an assert" {
+    var in_buf: [0]u8 = undefined;
+    var input: Reader = .fixed(&in_buf);
+    var buf: [64]u8 = undefined;
+    {
+        var out_buf: [min_buffer_len]u8 = undefined;
+        var dw: Writer.Discarding = .init(&out_buf);
+        var c = testAppClient(&input, &dw.writer, &buf, &.{});
+        try c.end();
+        // 5-byte header, the 2-byte alert, its inner type and the 16-byte tag.
+        try std.testing.expectEqual(@as(u64, 5 + 2 + 1 + 16), dw.fullCount());
+    }
+    {
+        var small: [64]u8 = undefined;
+        var dw: Writer.Discarding = .init(&small);
+        var c = testAppClient(&input, &dw.writer, &buf, &.{});
+        try std.testing.expectError(error.WriteFailed, c.end());
+    }
+}

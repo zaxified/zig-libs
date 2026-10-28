@@ -626,3 +626,16 @@ fn fuzzForm(comptime S: type, src: *S, gpa: Allocator) anyerror!void {
     if (f.files.len != 0) Mark.mark(.files);
     if (f.post.len == 0) Mark.mark(.query_only) else if ((sel >> 2) & 3 == 1) Mark.mark(.urlencoded) else Mark.mark(.multipart);
 }
+
+test "re-audit 2026-10-28: form readBody: a body longer than its declared length is BodyTooLarge" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var r: std.Io.Reader = .fixed("a=1234567");
+    try testing.expectError(error.BodyTooLarge, parseSource(arena.allocator(), .{
+        .method = .post,
+        .content_type = urlencoded_type,
+        .query = "",
+        .body = .{ .reader = &r },
+        .content_length = 3,
+    }, .{ .max_urlencoded_bytes = 100 }));
+}

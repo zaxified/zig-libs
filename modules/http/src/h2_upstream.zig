@@ -749,3 +749,52 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: h2_upstream: a per-call max_response_body_bytes caps the proxied response" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const backend = try h2Backend(io);
+    defer testing.allocator.destroy(backend);
+    defer backend.deinit();
+    const bt = try std.Thread.spawn(.{}, serveWrap, .{backend});
+    defer bt.join();
+    defer backend.shutdown();
+    const port = backend.boundAddress().getPort();
+
+    // The session's own cap is the (large) default; only the per-call cap
+    // can refuse this 8 KiB echo.
+    var client = Client.init(io, gpa, .{});
+    defer client.deinit();
+    var pool = Pool.init(gpa, .{ .client = &client });
+    defer pool.deinit();
+    const be: Backend = .{ .host = "127.0.0.1", .port = port };
+    const payload = strRepeat("abcdefgh", 1024); // 8 KiB
+
+    if (pool.roundtrip(be, .{
+        .method = .post,
+        .path = "/echo",
+        .authority = "backend",
+        .body = payload,
+        .max_response_body_bytes = 1024,
+    })) |r| {
+        var res = r;
+        res.deinit(gpa);
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.BodyTooLarge => {},
+        else => return testkit.loopbackSkip("loopback h2c capped roundtrip failed ({t})", .{err}),
+    }
+
+    // The cap is per call: the same pool serves an uncapped call after it.
+    var res = pool.roundtrip(be, .{
+        .method = .post,
+        .path = "/echo",
+        .authority = "backend",
+        .body = payload,
+    }) catch |err| return testkit.loopbackSkip("loopback h2c roundtrip failed ({t})", .{err});
+    defer res.deinit(gpa);
+    try testing.expectEqual(payload.len, res.body.len);
+}

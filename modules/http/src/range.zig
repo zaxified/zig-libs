@@ -1349,3 +1349,22 @@ test "apply: golden 206 multipart/byteranges for two ranges" {
     defer testing.allocator.free(expected);
     try testing.expectEqualStrings(expected, got);
 }
+
+test "re-audit 2026-10-28: range hand-built extremes do not overflow" {
+    const max = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u64, 1), (ResolvedRange{ .start = 5, .end = 2, .total = 10 }).len());
+    try testing.expectEqual(@as(u64, max), (ResolvedRange{ .start = 0, .end = max, .total = max }).len());
+    const huge = ResolvedRange{ .start = 0, .end = max, .total = max };
+    const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+    // One range saturates the byte sum; the second hits the saturated total
+    // again at the boundary-line add.
+    try testing.expectEqual(@as(u64, max), mp.bodyLen(&.{ huge, huge }));
+}
+
+test "re-audit 2026-10-28: range writeBody refuses an inverted range" {
+    const mp = MultipartRanges{ .boundary = "SEP", .content_type = "text/plain" };
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try testing.expectError(error.RangeOutOfBounds, mp.writeBody(&w, &.{.{ .start = 3, .end = 1, .total = 10 }}, "0123456789"));
+    try testing.expectEqual(@as(usize, 0), w.end);
+}

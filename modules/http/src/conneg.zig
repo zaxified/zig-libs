@@ -1515,3 +1515,9 @@ test "Werkzeug oracle findings: quoted commas, range parameters, */subtype" {
     // `*/html` is not a media-range: skipped, so text/plain wins.
     try testing.expectEqualStrings("text/plain", negotiate("*/html, text/plain;q=0.5", &.{ "text/html", "text/plain" }).?.media_type);
 }
+
+test "re-audit 2026-10-28: conneg subtagCount saturates below the i16 range" {
+    const dashes: [40000]u8 = @splat(0x2d);
+    try testing.expectEqual(@as(i16, std.math.maxInt(i16)), subtagCount(&dashes));
+    try testing.expectEqual(@as(i16, 3), subtagCount("en-US-x"));
+}

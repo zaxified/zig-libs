@@ -3863,3 +3863,101 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: SettingsIterator stops at a short tail instead of slicing past it" {
+    // One whole pair plus a 3-octet tail: the second call must end the
+    // iteration (a `pos >= len` guard would slice 6 octets out of 3).
+    const payload = [_]u8{ 0, 3, 0, 0, 0, 7, 0, 4, 0 };
+    var it: SettingsIterator = .{ .payload = &payload };
+    const first = it.next().?;
+    try testing.expectEqual(Settings.Id.max_concurrent_streams, first.id);
+    try testing.expectEqual(@as(u32, 7), first.value);
+    try testing.expect(it.next() == null);
+    try testing.expect(it.next() == null);
+}
+
+/// Feed a refused client HEADERS (`bad`), recover the stream error, then
+/// require that a later block indexing the entry the refused block added
+/// (dynamic index 62) still decodes.
+fn expectRefusedBlockMovedTable(conn: *Connection, bad: []const u8, bad_err: anyerror) !void {
+    const gpa = testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+
+    try testing.expectError(bad_err, conn.recv(bad, &out, &events));
+    try testing.expect(conn.violation.?.scope == .stream);
+    try testing.expect(conn.recoverStreamError() != null);
+    clearEvents(&events);
+    // Drain anything buffered behind the bad frame (CONTINUATION).
+    try conn.recv(&.{}, &out, &events);
+    clearEvents(&events);
+
+    try encodeHeaders(gpa, &wire, 7, &.{ 0x82, 0xbe }, .{ .end_stream = true });
+    try conn.recv(wire.items, &out, &events);
+    try testing.expectEqual(@as(usize, 1), events.items.len);
+    const hd = events.items[0].headers;
+    try testing.expectEqualStrings("x-a", hd.headers.fields[1].name);
+    try testing.expectEqualStrings("b", hd.headers.fields[1].value);
+}
+
+test "re-audit 2026-10-28: HEADERS on a half-closed-remote stream still moves the HPACK table" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    try conn.recv(wire.items, &out, &events);
+    clearEvents(&events);
+
+    wire.clearRetainingCapacity();
+    const literal = [_]u8{ 0x40, 0x03, 'x', '-', 'a', 0x01, 'b' };
+    try encodeHeaders(gpa, &wire, 1, &literal, .{ .end_stream = true });
+    try expectRefusedBlockMovedTable(&conn, wire.items, error.StreamClosed);
+}
+
+test "re-audit 2026-10-28: HEADERS with a self-dependent PRIORITY still moves the HPACK table" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    const literal = [_]u8{ 0x40, 0x03, 'x', '-', 'a', 0x01, 'b' };
+    try encodeHeaders(gpa, &wire, 3, &literal, .{
+        .end_stream = true,
+        .priority = .{ .exclusive = false, .dependency = 3, .weight = 15 },
+    });
+    try expectRefusedBlockMovedTable(&conn, wire.items, error.ProtocolError);
+}
+
+test "re-audit 2026-10-28: a refused HEADERS split over CONTINUATION still moves the HPACK table" {
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    var events: std.ArrayList(Event) = .empty;
+    defer freeEvents(&events);
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+
+    try encodeHeaders(gpa, &wire, 1, &.{0x82}, .{ .end_stream = true });
+    try conn.recv(wire.items, &out, &events);
+    clearEvents(&events);
+
+    // The literal is cut in the middle of its name: decoding the first
+    // fragment alone would be a COMPRESSION_ERROR (connection scope).
+    wire.clearRetainingCapacity();
+    try encodeHeaders(gpa, &wire, 1, &.{ 0x40, 0x03, 'x', '-' }, .{ .end_stream = true, .end_headers = false });
+    try encodeContinuation(gpa, &wire, 1, &.{ 'a', 0x01, 'b' }, true);
+    try expectRefusedBlockMovedTable(&conn, wire.items, error.StreamClosed);
+}

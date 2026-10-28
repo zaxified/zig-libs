@@ -7942,3 +7942,9 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: h2 mapError keeps BodyTooLarge as BodyTooLarge" {
+    // The BodyTooLarge arm touches no connection state, hence the unset `conn`.
+    const e = h2glue.mapError(undefined, error.BodyTooLarge);
+    try testing.expect(e == error.BodyTooLarge);
+}

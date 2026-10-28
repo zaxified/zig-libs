@@ -1237,3 +1237,81 @@ test "no-panic sweep 2026-10-28 F5: thousands of policyMappings cost bounded wor
     try policy_mod.check(testing.allocator, &.{ ca, leaf }, .{});
     try testing.expectError(error.PolicyGraphTooLarge, policy_mod.check(testing.allocator, &.{ ca, leaf }, .{ .max_steps = 100_000 }));
 }
+
+test "re-audit 2026-10-28: the policy work budget is charged at every scan, max_steps is inclusive" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    const any = try g.tlv(0x06, &.{&.{ 0x55, 0x1d, 0x20, 0x00 }});
+    var oid: [5][]const u8 = undefined; // P Q R X Y under 1.3.6.1.4.1.99999
+    for (&oid, 0..) |*o, i| o.* = try g.tlv(0x06, &.{&.{ 0x2b, 0x06, 0x01, 0x04, 0x01, 0x86, 0x8d, 0x1f, @intCast(0x10 + i) }});
+    const P, const Q, const R, const X, const Y = oid;
+    const policies = struct {
+        fn ext(gen: *certgen.Gen, ps: []const []const u8) ![]const u8 {
+            var infos: std.ArrayList([]const u8) = .empty;
+            for (ps) |p| try infos.append(gen.a, try gen.seq(&.{p}));
+            return gen.extension(&.{ 0x55, 0x1d, 0x20 }, false, try gen.seq(infos.items));
+        }
+    }.ext;
+    // CA 1: P, Q and anyPolicy; P maps to Q and R (twice to Q: the dedup
+    // scans), so P's node expects {Q, R} and Q's node {Q}.
+    const maps = try g.extension(&.{ 0x55, 0x1d, 0x21 }, false, try g.seq(&.{
+        try g.seq(&.{ P, Q }), try g.seq(&.{ P, R }), try g.seq(&.{ P, Q }),
+    }));
+    const ca1 = try g.cert(.{ .subject = try g.name("CA 1"), .issuer = try g.name("Root"), .key = &k, .signer = &k, .exts = &.{ try g.extCa(null), try policies(&g, &.{ P, Q, any }), maps } });
+    // CA 2: Q (two parents: (d)(1)(i) and a second link), X (no parent
+    // expects it: (d)(1)(ii) through anyPolicy) and anyPolicy ((d)(2)).
+    const ca2 = try g.cert(.{ .subject = try g.name("CA 2"), .issuer = try g.name("CA 1"), .key = &k, .signer = &k, .exts = &.{ try g.extCa(null), try policies(&g, &.{ Q, X, any }) } });
+    const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = try g.name("CA 2"), .key = &k, .signer = &k, .exts = &.{try policies(&g, &.{ Q, R, Y })} });
+    const path: []const []const u8 = &.{ ca1, ca2, leaf };
+    // The exact cost of this path; every spend site adds to it, so dropping
+    // or re-pricing one moves it (measured, then pinned).
+    const cost = 70;
+    try policy_mod.check(testing.allocator, path, .{ .max_steps = cost });
+    try testing.expectError(error.PolicyGraphTooLarge, policy_mod.check(testing.allocator, path, .{ .max_steps = cost - 1 }));
+}
+
+test "re-audit 2026-10-28: verifySignedBy guards an issuer std cannot read" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    // F1's anchor: an RSAPublicKey header promising 266 octets over 5.
+    const rsa_oid = try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }});
+    const spki = try g.seq(&.{ try g.seq(&.{ rsa_oid, try g.tlv(0x05, &.{}) }), try g.tlv(0x03, &.{&.{ 0x00, 0x30, 0x82, 0x01, 0x0a, 0x02, 0x82, 0x01, 0x01, 0x00 }}) });
+    const root_name = try g.name("RSA Root");
+    const issuer = try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k, .signer = &k, .spki = spki, .exts = &.{ try g.extCa(null), try g.extKuCa() } });
+    const empty: std.crypto.Certificate.der.Element.Slice = .{ .start = 0, .end = 0 };
+    try testing.expectError(error.CertificateFieldHasInvalidLength, chain_mod.verifySignedBy(.{
+        .buffer = issuer,
+        .message_slice = empty,
+        .signature_slice = empty,
+        .sig_alg_oid = &.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b },
+        .sig_alg_params = null,
+        .issuer_slice = empty,
+    }, issuer));
+}
+
+test "re-audit 2026-10-28: an unreadable anchor past the full parse memo is still guarded" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var g: certgen.Gen = .{ .a = arena.allocator() };
+    const k = certgen.key(0x61);
+    const rsa_oid = try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 }});
+    const spki = try g.seq(&.{ try g.seq(&.{ rsa_oid, try g.tlv(0x05, &.{}) }), try g.tlv(0x03, &.{&.{ 0x00, 0x30, 0x82, 0x01, 0x0a, 0x02, 0x82, 0x01, 0x01, 0x00 }}) });
+    const root_name = try g.name("RSA Root");
+    const sha256_rsa = try g.seq(&.{ try g.tlv(0x06, &.{&.{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b }}), try g.tlv(0x05, &.{}) });
+    const leaf = try g.cert(.{ .subject = try g.name("leaf"), .issuer = root_name, .key = &k, .signer = &k, .sig_alg = sha256_rsa, .exts = &.{ try g.extSanDns("example.com"), try g.extKuLeaf() } });
+    // Twelve readable anchors of the same name (EC keys: each link fails on
+    // the algorithm) fill the memo, so the bad one is parsed un-memoised.
+    var roots: std.ArrayList([]const u8) = .empty;
+    for (0..12) |i| {
+        const dk = certgen.key(@intCast(0x70 + i));
+        try roots.append(g.a, try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &dk, .signer = &dk, .exts = &.{ try g.extCa(null), try g.extKuCa() } }));
+    }
+    try roots.append(g.a, try g.cert(.{ .subject = root_name, .issuer = root_name, .key = &k, .signer = &k, .spki = spki, .exts = &.{ try g.extCa(null), try g.extKuCa() } }));
+    // With several candidates a failed one is skipped, so the guard's error
+    // surfaces as NoTrustedPath; without the guard std's parse panics.
+    try testing.expectError(error.NoTrustedPath, chain_mod.verifyChain(testing.allocator, &.{leaf}, roots.items, .{ .now_sec = certgen.t_now }));
+}

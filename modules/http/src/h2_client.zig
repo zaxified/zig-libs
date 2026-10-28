@@ -1970,3 +1970,59 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+test "re-audit 2026-10-28: h2 client: an exhausted stream-id space is GoawayReceived, the session stays usable" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [8192]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var s: Session = try .init(gpa, &in, &out, .{});
+    defer s.deinit();
+    s.conn.next_local_stream_id = std.math.maxInt(u31);
+    try testing.expectError(error.GoawayReceived, s.request(.get, "/x", .{ .authority = "t" }));
+    // Not a protocol failure: the session is not latched broken.
+    try testing.expect(s.broken == null);
+    try testing.expectError(error.GoawayReceived, s.request(.get, "/y", .{ .authority = "t" }));
+    try testing.expect(s.broken == null);
+}
+
+test "re-audit 2026-10-28: h2 client: a body over the cap is cancelled with RST_STREAM at the cap, not drained" {
+    // Only the in-loop cap check sends RST_STREAM(CANCEL) for the stream
+    // (a later check would just release it): the peer must see the reset.
+    const gpa = testing.allocator;
+    const chunk = strRepeat("0123456789abcdef", 64); // 1024 B
+    for ([_]bool{ false, true }) |ends_in_one| {
+        var in: Reader = .fixed("");
+        var out_buf: [8192]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var s: Session = try .init(gpa, &in, &out, .{ .max_response_body_bytes = 4 * 1024 });
+        defer s.deinit();
+        const sid = try s.request(.get, "/big", .{ .authority = "t" });
+        const sent = out.buffered().len;
+        var srv: ScriptedServer = try .init(out.buffered());
+        defer srv.deinit();
+        try srv.conn.sendHeaders(&srv.wire, sid, &ok_fields, false);
+        if (ends_in_one) {
+            try srv.conn.sendData(&srv.wire, sid, chunk ++ chunk ++ chunk ++ chunk ++ chunk, true);
+        } else {
+            for (0..8) |i| try srv.conn.sendData(&srv.wire, sid, chunk, i == 7);
+        }
+        in = .fixed(srv.wire.items);
+        try testing.expectError(error.BodyTooLarge, s.awaitResponse(sid));
+
+        var reply: std.ArrayList(u8) = .empty;
+        defer reply.deinit(gpa);
+        for (srv.events.items) |*ev| ev.deinit(gpa);
+        srv.events.clearRetainingCapacity();
+        try srv.conn.recv(out.buffered()[sent..], &reply, &srv.events);
+        var saw_reset = false;
+        for (srv.events.items) |ev| switch (ev) {
+            .stream_reset => |r| if (r.stream_id == sid) {
+                saw_reset = true;
+                try testing.expectEqual(h2.ErrorCode.cancel, r.code);
+            },
+            else => {},
+        };
+        try testing.expect(saw_reset);
+    }
+}

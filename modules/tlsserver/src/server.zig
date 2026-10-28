@@ -7074,3 +7074,87 @@ test "serialize without a peer buffer (no client authentication): no client leaf
     try testing.expect(m.isConnected());
     try testing.expectEqual(null, m.peerCertificate());
 }
+
+test "re-audit 2026-10-28: certificateDigest is null, not a cast panic, for lengths past their wire fields" {
+    // A delegated credential of 65535 octets: the leaf's extensions (4 + 65535) overflow a u16.
+    const dc = try testing.allocator.alloc(u8, std.math.maxInt(u16));
+    defer testing.allocator.free(dc);
+    @memset(dc, 0);
+    var ck = testKey().*;
+    ck.delegated_credential = dc;
+    try testing.expectEqual(null, ck.certificateDigest(.{}));
+    // A DER that fits a u24 on its own but whose body (+ 5 octets of framing) does not.
+    const der = try testing.allocator.alloc(u8, (1 << 24) - 3);
+    defer testing.allocator.free(der);
+    @memset(der, 0);
+    var ck2 = testKey().*;
+    ck2.chain = &.{der};
+    try testing.expectEqual(null, ck2.certificateDigest(.{}));
+}
+
+test "re-audit 2026-10-28: Resumable.accepts: a client proof in the far past saturates instead of overflowing" {
+    var buf: [TicketFields.head_max + 8192 + 1 + TicketFields.tail_len]u8 = undefined;
+    var need: Resumable = .{ .suite = 0x1301, .sni = null, .lifetime_ms = 1000, .need_peer = true, .max_peer = 8192 };
+    const t = testTicketFields(&buf, .{ .sni = null, .alpn = null, .peer = "LEAF", .peer_auth_ms = -1, .suite = 0x1301 });
+    need.now_ms = std.math.maxInt(i64);
+    try testing.expect(!need.accepts(t, 0));
+}
+
+test "re-audit 2026-10-28: deserialize: the client's record limit must be 64..65535" {
+    const p = try createPeerWith(.{ .extract = true });
+    defer p.destroy();
+    var blob: [Server.serializedLen(0)]u8 = undefined;
+    const context = "ctx";
+    const sealed = try p.s.serialize(&blob, &move_key, context);
+    const limit_at = Server.blob_fixed - 5 - fingerprint.ja4_len - 3;
+    var joiner: [inbound.Joiner.bufferLen(inbound.default_max_message)]u8 = undefined;
+    var out: [32 * 1024]u8 = undefined;
+    var peer: [64]u8 = undefined;
+    for ([_]struct { limit: u24, ok: bool }{
+        .{ .limit = 63, .ok = false },
+        .{ .limit = 64, .ok = true },
+        .{ .limit = 65535, .ok = true },
+        .{ .limit = 65536, .ok = false },
+        .{ .limit = 0xffffff, .ok = false },
+    }) |c| {
+        var copy: [Server.serializedLen(0)]u8 = undefined;
+        @memcpy(&copy, sealed);
+        var ad: [Server.blob_ad.len + 1 + Server.max_blob_context_len]u8 = undefined;
+        const pt = copy[13 .. copy.len - 16];
+        try aesgcm.Aes256Gcm.decryptInto(pt, pt, sealed[sealed.len - 16 ..][0..16].*, Server.blobAd(&ad, context), sealed[1..13].*, &move_key);
+        std.mem.writeInt(u24, pt[limit_at..][0..3], c.limit, .big);
+        aesgcm.Aes256Gcm.encryptInto(pt, copy[13 + pt.len ..][0..16], pt, Server.blobAd(&ad, context), copy[1..13].*, &move_key);
+        var s: Server = undefined;
+        if (c.ok) {
+            try Server.deserialize(&s, &p.cfg, &joiner, &out, &peer, &copy, &move_key, context);
+            defer s.deinit();
+            try testing.expectEqual(@as(?u16, @intCast(c.limit)), s.peer_record_limit);
+        } else {
+            try testing.expectError(error.BadBlob, Server.deserialize(&s, &p.cfg, &joiner, &out, &peer, &copy, &move_key, context));
+        }
+    }
+}
+
+test "re-audit 2026-10-28: commitWrite: past a dynamic-record slot, and without a slot" {
+    // The slot is 100 octets while the record limit is the full fragment: 150 is past the slot only.
+    const p = try createPeerWith(.{ .dynamic = .{ .segment_len = 100, .boost_after = 1_000_000 } });
+    defer p.destroy();
+    const slot = try p.s.writeSlot();
+    try testing.expectEqual(@as(usize, 100), slot.len);
+    @memset(slot, 'x');
+    try testing.expectError(error.OutputFull, p.s.commitWrite(150));
+    try testing.expectEqual(@as(usize, 0), p.s.pendingOutput().len);
+
+    const q = try createPeerWith(.{});
+    defer q.destroy();
+    const s = try q.s.writeSlot();
+    @memset(s, 'x');
+    try q.s.commitWrite(1);
+    const one = q.s.pendingOutput().len;
+    // No slot open: nothing to be past, a short commit goes through ...
+    try q.s.commitWrite(1);
+    try testing.expectEqual(one * 2, q.s.pendingOutput().len);
+    // ... and one past the record limit is OutputFull, sealing nothing.
+    try testing.expectError(error.OutputFull, q.s.commitWrite(@as(usize, q.s.out.max_fragment) + 1));
+    try testing.expectEqual(one * 2, q.s.pendingOutput().len);
+}

@@ -835,3 +835,14 @@ test "Joiner with a too-small buffer refuses instead of writing out of bounds" {
     try testing.expectError(error.HandshakeTooLarge, j0.push("x"));
     try testing.expect((try j0.next()) == null);
 }
+
+test "re-audit 2026-10-28: Joiner.push takes a fragment that exactly fills the buffer" {
+    var tiny: [8]u8 = undefined;
+    var j: Joiner = .init(&tiny);
+    try j.push(&@as([8]u8, @splat(1)));
+    try testing.expect(!j.isEmpty());
+    // One octet more is refused (the boundary is `>`, not `>=`).
+    var j2: Joiner = .init(&tiny);
+    try j2.push(&@as([7]u8, @splat(1)));
+    try testing.expectError(error.HandshakeTooLarge, j2.push(&.{ 2, 3 }));
+}

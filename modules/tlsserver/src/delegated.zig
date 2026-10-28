@@ -241,3 +241,11 @@ test "issue: an SPKI over 2^24 - 1 octets is ValueTooLong, not a cast panic" {
     // Refused before the key or the buffer is looked at.
     try testing.expectError(error.ValueTooLong, issue(&out, "", undefined, 0x0804, big, 0x0804, 1, null));
 }
+
+test "re-audit 2026-10-28: issue: an SPKI of exactly 2^24 - 1 octets passes the length guard" {
+    const big = try testing.allocator.alloc(u8, (1 << 24) - 1);
+    defer testing.allocator.free(big);
+    var out: [16]u8 = undefined;
+    // Not ValueTooLong: the u24 holds it; only the small buffer refuses.
+    try testing.expectError(error.BufferTooSmall, issue(&out, "", undefined, 0x0804, big, 0x0804, 1, null));
+}
