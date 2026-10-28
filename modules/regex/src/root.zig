@@ -805,6 +805,11 @@ const FindDfa = struct {
     gpa: std.mem.Allocator,
     /// The program has assertions: without, every context is one state.
     asserts: bool,
+    /// With no thread alive, jump ahead with the prefilter: only when it is
+    /// a fast scan (a literal, one byte, Teddy). A byte set is scanned byte
+    /// by byte, slower than the DFA's own cached transitions over the gap
+    /// (measured: 12 % of `\b\w+\b` over Czech text).
+    skip_idle: bool,
     states: std.ArrayList(State) = .empty,
     /// `trans[s + 1][c]` (row 0 unused): 0 not worked out yet, otherwise
     /// (next state + 1) << 7 — the offset of its row, so the next lookup
@@ -838,7 +843,9 @@ const FindDfa = struct {
             .match => match_set[pc >> 6] |= @as(u64, 1) << @truncate(pc),
             else => {},
         };
-        var d: FindDfa = .{ .gpa = gpa, .asserts = asserts, .rev = undefined, .match_set = match_set };
+        const pf = &re.prefilter;
+        const skip_idle = pf.first != null and (pf.lit_len >= 2 or pf.teddy != null or pf.single != null);
+        var d: FindDfa = .{ .gpa = gpa, .asserts = asserts, .skip_idle = skip_idle, .rev = undefined, .match_set = match_set };
         d.rev.n = 0;
         return d;
     }
@@ -956,7 +963,8 @@ const FindDfa = struct {
     /// anchored program (`anchored`: no thread starts later).
     fn run(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, anchored: bool) std.mem.Allocator.Error!?usize {
         const seed = [1]u16{0};
-        var s = (try d.intern(if (anchored) &seed else &.{}, d.ctxBefore(input, from), !anchored)).id;
+        // Unanchored, the first state is the idle one (remembered per context).
+        var s = if (anchored) (try d.intern(&seed, d.ctxBefore(input, from), false)).id else try d.idleAt(input, from);
         var end: ?usize = null;
         var pos = from;
         const pf = &re.prefilter;
@@ -964,14 +972,14 @@ const FindDfa = struct {
             const st = d.states.items[s];
             if (st.len == 0) {
                 if (!st.restart) return end; // no thread left
-                if (pf.first != null) {
+                if (d.skip_idle) {
                     // No thread alive, none matched yet: jump to where one can start.
                     pos = pf.next(input, pos) orelse return null;
                     s = try d.idleAt(input, pos);
                 }
             }
-            // Cached ASCII transitions until one leads to a state with no
-            // thread (bit 1): that one is looked at above.
+            // Cached ASCII transitions until one leads to a state the loop
+            // above must see (bit 1: no thread left, or idle with `skip_idle`).
             const flat: [*]const u16 = @ptrCast(d.trans.items.ptr);
             var row = (@as(usize, s) + 1) << 7;
             const stopped = while (pos < input.len) {
@@ -990,6 +998,16 @@ const FindDfa = struct {
             s = @intCast((row >> 7) - 1);
             if (stopped) continue;
             const c = input[pos];
+            const idle = d.states.items[s].len == 0 and d.states.items[s].restart;
+            const no_start = if (pf.first) |set| set[c >> 6] & (@as(u64, 1) << @truncate(c)) == 0 else false;
+            if (c >= 0x80 and idle and no_start) {
+                // Idle at a code point past ASCII that cannot start a match:
+                // the byte-set scan is faster than decoding each one (Czech
+                // text between `[0-9]+` matches); it moves past `pos`.
+                pos = pf.next(input, pos) orelse return null;
+                s = try d.idleAt(input, pos);
+                continue;
+            }
             const here = decode(input, pos);
             const key = Wide.keyOf(s, here.cp.?);
             if (c >= 0x80) {
@@ -1005,9 +1023,11 @@ const FindDfa = struct {
             var next: [Dfa.max_insts]u16 = undefined;
             const r = d.step(re, s, here.cp.?, &next);
             if (r.matched) end = pos;
-            const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), restart and !r.matched);
+            const ns_restart = restart and !r.matched;
+            const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), ns_restart);
             if (!ns.flushed) {
-                const t = (@as(u16, ns.id) + 1) << 7 | @as(u16, @intFromBool(r.n == 0)) << 1 | @intFromBool(r.matched);
+                const stop = r.n == 0 and (!ns_restart or d.skip_idle);
+                const t = (@as(u16, ns.id) + 1) << 7 | @as(u16, @intFromBool(stop)) << 1 | @intFromBool(r.matched);
                 if (c < 0x80) d.trans.items[s + 1][c] = t else d.wide.?.fwd[Wide.slot(key)] = .{ .key = key, .val = t };
             }
             s = ns.id;
@@ -1034,8 +1054,17 @@ const FindDfa = struct {
 
     /// `ctxOf` the code point before `pos`, decoded only when it matters.
     fn ctxBefore(d: *const FindDfa, input: []const u8, pos: usize) Dfa.Ctx {
-        return if (d.asserts) .of(runeBefore(input, pos)) else .other;
+        if (!d.asserts) return .other;
+        return if (pos == 0) .start else byte_ctx[input[pos - 1]];
     }
+
+    /// `Dfa.Ctx.of` the code point a byte ends (past ASCII: not a word
+    /// character, as `runeBefore` reads it), without branches.
+    const byte_ctx: [256]Dfa.Ctx = blk: {
+        var t: [256]Dfa.Ctx = undefined;
+        for (&t, 0..) |*x, c| x.* = .of(if (c < 0x80) c else 0xfffd);
+        break :blk t;
+    };
 
     fn ctxOf(d: *const FindDfa, cp: ?u21) Dfa.Ctx {
         return if (d.asserts) .of(cp) else .other;
