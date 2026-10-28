@@ -536,10 +536,11 @@ pub fn percentEncode(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!v
 }
 
 /// Decode `%XX` (either hex case) into `out` (at least `in.len` bytes; the
-/// result is never longer). A `%` not followed by two hex digits is kept
-/// literally, as cookie-rs (`percent_decode`) and browsers do.
+/// result is never longer -- a shorter `out` is a checked panic). A `%` not
+/// followed by two hex digits is kept literally, as cookie-rs
+/// (`percent_decode`) and browsers do.
 pub fn percentDecode(out: []u8, in: []const u8) []u8 {
-    std.debug.assert(out.len >= in.len);
+    if (out.len < in.len) @panic("cookies.percentDecode: out shorter than in");
     var o: usize = 0;
     var i: usize = 0;
     while (i < in.len) {

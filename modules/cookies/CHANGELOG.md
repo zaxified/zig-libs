@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent sweep of every pub entry point, `~/CML/20261028-panic-sweep/cookies-sessions-sweep.report.md`; no peer-reachable one found). `percentDecode` with `out` shorter than `in` and `private.seal`/`sealTimedNonce` with a `value` inside `out` were `std.debug.assert`s (UB in ReleaseFast) and are checked panics with a message. `Jar.setCookieAt` refuses a cookie whose default path (from the request URL, no `Path` attribute) is longer than `max_attribute_bytes`, so a stored cookie never costs more than the caps say. Test.
+
 - **2026-10-24** — **Faster `SetCookie.write`** (847 → 529–540 ns for the bench's 8 specs, 1.59× →
   1.11–1.13× valyala/fasthttp): the line is filled in place in the writer's buffer when an upper
   bound of it fits (else written part by part, as before), validation runs in its own out-of-line

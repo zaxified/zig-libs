@@ -303,6 +303,10 @@ pub const Jar = struct {
         }
         // §5.3 step 7.
         const path = sc.path orelse defaultPath(url.path);
+        // The Path attribute is capped at `max_attribute_bytes`; a default
+        // path from a longer request URL is refused too, so no stored cookie
+        // costs more than the caps say (no-panic sweep 2026-10-28, C-3).
+        if (path.len > max_attribute_bytes) return;
         // §5.3 step 3: Max-Age wins over Expires.
         const expiry: ?i64 = if (sc.max_age) |ma|
             (if (ma <= 0) std.math.minInt(i64) else std.math.add(i64, now, ma) catch std.math.maxInt(i64))
@@ -731,6 +735,23 @@ test "domainMatch, pathMatch, defaultPath" {
 }
 
 // ── audit 2026-10-23: tests asked for by mutation survivors ──────────────────
+
+test "a default path longer than max_attribute_bytes is refused, as a long Path attribute is ignored" {
+    var j = Jar.init(testing.allocator, undefined, .{});
+    defer j.deinit();
+    // "http://h.test" ++ "/" ++ n×'a' ++ "/x": the default path is "/" ++ n×'a'.
+    const prefix = "http://h.test/";
+    var ok: [prefix.len + (max_attribute_bytes - 1) + 2]u8 = @splat('a');
+    @memcpy(ok[0..prefix.len], prefix);
+    @memcpy(ok[ok.len - 2 ..], "/x");
+    try j.setCookieAt(u(&ok), "k=1", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+    var long: [prefix.len + max_attribute_bytes + 2]u8 = @splat('a');
+    @memcpy(long[0..prefix.len], prefix);
+    @memcpy(long[long.len - 2 ..], "/x");
+    try j.setCookieAt(u(&long), "k=2", t0);
+    try testing.expectEqual(@as(usize, 1), j.count());
+}
 
 test "SetCookie.parse: size boundaries, TAB, saturating Max-Age" {
     // An attribute value: 1024 bytes are kept, 1025 are ignored.

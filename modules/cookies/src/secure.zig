@@ -310,7 +310,8 @@ pub const private = struct {
     /// `out[0..len(value.len)]` ← base64(nonce ‖ AES-256-GCM(value, ad = name)
     /// ‖ tag). `nonce` must never repeat under one key: use `sealRandom`
     /// unless the caller has a nonce source of its own (tests, vectors).
-    /// `value` is any bytes; cookie-rs's `PrivateJar` opens only UTF-8.
+    /// `value` is any bytes; cookie-rs's `PrivateJar` opens only UTF-8. It
+    /// must not overlap `out` (a checked panic).
     pub fn seal(key: *const Key, name: []const u8, value: []const u8, nonce: [nonce_len]u8, out: []u8) SignError![]const u8 {
         const enc_len = len(value.len);
         if (out.len < enc_len) return error.NoSpaceLeft;
@@ -357,7 +358,7 @@ pub const private = struct {
         const m_len = issued_len + value.len;
         const r = overhead + m_len;
         const raw = out[out.len - r ..];
-        std.debug.assert(!overlaps(raw, value));
+        if (overlaps(raw, value)) @panic("cookies.private: value must not overlap out");
         raw[0..nonce_len].* = nonce;
         // The plaintext is assembled where the ciphertext goes and encrypted
         // in place (`c == m` is allowed).
@@ -402,7 +403,7 @@ pub const private = struct {
         const raw = out[out.len - r ..];
         // The ciphertext may not overlap the plaintext from after it; a
         // caller sealing a value that lives inside `out` is not supported.
-        std.debug.assert(!overlaps(raw, value));
+        if (overlaps(raw, value)) @panic("cookies.private: value must not overlap out");
         raw[0..nonce_len].* = nonce;
         const ct = raw[nonce_len..][0..value.len];
         const tag = raw[nonce_len + value.len ..][0..tag_len];
