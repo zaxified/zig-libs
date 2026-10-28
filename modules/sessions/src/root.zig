@@ -376,7 +376,11 @@ pub const RamcacheStore = struct {
 
     fn putImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation {
         const self: *RamcacheStore = @ptrCast(@alignCast(ptr));
-        return self.writeCas(id, record, expected, expected + 1);
+        // `expected` comes from a stored record (a `KvStore` reads it back
+        // from disk): the last generation cannot be bumped, so the save
+        // loses its CAS instead of overflowing (no-panic sweep 2026-10-28, S-1).
+        const next = std.math.add(Generation, expected, 1) catch return null;
+        return self.writeCas(id, record, expected, next);
     }
 
     fn touchImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) bool {
@@ -513,7 +517,11 @@ pub const KvStore = struct {
 
     fn putImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) ?Generation {
         const self: *KvStore = @ptrCast(@alignCast(ptr));
-        return self.writeCas(id, record, expected, expected + 1);
+        // `expected` comes from a stored record (a `KvStore` reads it back
+        // from disk): the last generation cannot be bumped, so the save
+        // loses its CAS instead of overflowing (no-panic sweep 2026-10-28, S-1).
+        const next = std.math.add(Generation, expected, 1) catch return null;
+        return self.writeCas(id, record, expected, next);
     }
 
     fn touchImpl(ptr: *anyopaque, id: []const u8, record: []const u8, expected: Generation) bool {
@@ -590,7 +598,9 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 /// only; `ctx.data` points at it and is restored afterwards. A handler reads
 /// it via `sessionOf(ctx)`.
 pub const Session = struct {
-    /// Hex-encoded session id, backing storage.
+    /// Hex-encoded session id, backing storage. `id_len` / `data_len` are
+    /// read-only to the caller (set them through the API): `persist` refuses
+    /// one past its buffer with a checked panic.
     id_buf: [2 * max_id_bytes]u8 = undefined,
     id_len: usize = 0,
     /// When this session was first created (ns, injected clock).
@@ -856,6 +866,12 @@ pub const Manager = struct {
         /// `max_id_bytes` (overflows the id buffers).
         InvalidIdBytes,
         EmptyCookieName,
+        /// The session cookie these options describe cannot be written:
+        /// `cookie_name`, `cookie_path` or `cookie_domain` holds a byte a
+        /// Set-Cookie may not carry, `SameSite=None` without `Secure`, or
+        /// the whole line is longer than the 512 bytes `save` formats it in.
+        /// Refused here rather than dropping every cookie at request time.
+        InvalidCookieOptions,
         /// `Clock.monotonic` over a store whose records outlive the process:
         /// after a reboot every stored timestamp would lie in the "future"
         /// and no session would reach its timeouts. Use `Clock.realtime`.
@@ -868,6 +884,21 @@ pub const Manager = struct {
         if (options.cookie_name.len == 0) return error.EmptyCookieName;
         if (store.vtable.persistent and options.clock.nowFn == Clock.monotonic.nowFn)
             return error.MonotonicClockWithPersistentStore;
+        // Dry run of `writeCookie`'s longest line: the longest id, the
+        // longest Max-Age (no-panic sweep 2026-10-28, S-2).
+        const longest_id: [2 * max_id_bytes]u8 = @splat('0');
+        const probe: cookies.SetCookie = .{
+            .name = options.cookie_name,
+            .value = longest_id[0 .. 2 * options.id_bytes],
+            .path = options.cookie_path,
+            .domain = options.cookie_domain,
+            .max_age = std.math.minInt(i64),
+            .secure = options.secure and !options.allow_insecure_cookie,
+            .http_only = true,
+            .same_site = options.same_site,
+        };
+        var probe_buf: [cookie_line_max]u8 = undefined;
+        _ = probe.bufPrint(&probe_buf) catch return error.InvalidCookieOptions;
         return .{
             .store = store,
             .gpa = gpa,
@@ -1020,6 +1051,8 @@ pub const Manager = struct {
     /// without a `ResponseWriter`; a handler may also call it to force a
     /// mid-request persist and observe whether it won the race.
     pub fn persist(m: *const Manager, s: *Session) bool {
+        if (s.id_len > s.id_buf.len or s.data_len > max_session_bytes)
+            @panic("sessions.Manager.persist: Session.id_len/data_len written past their buffers");
         s.last_seen_ns = m.clock.now();
         var buf: [record_header_len + max_session_bytes]u8 = undefined;
         std.mem.writeInt(u64, buf[0..8], encodeCreated(s.created_ns, s.remember), .little);
@@ -1151,6 +1184,10 @@ pub const Manager = struct {
         out.id_len = m.id_bytes * 2;
     }
 
+    /// `writeCookie`'s buffer; `init` refuses options whose cookie does
+    /// not fit it.
+    const cookie_line_max = 512;
+
     fn writeCookie(m: *const Manager, res: *http.Server.ResponseWriter, value: []const u8, max_age: ?i64) void {
         const sc: cookies.SetCookie = .{
             .name = m.cookie_name,
@@ -1165,7 +1202,7 @@ pub const Manager = struct {
         // addSetCookie copies the bytes into the writer's own header_buf
         // before returning, so this local only has to outlive the call.
         // Sized for name + 2*max_id_bytes hex + every attribute.
-        var cookie_buf: [512]u8 = undefined;
+        var cookie_buf: [cookie_line_max]u8 = undefined;
         const v = sc.bufPrint(&cookie_buf) catch return; // too long / invalid → skip
         // Best-effort across the WHOLE of `SetHeaderError`, not just the
         // `HeadersSent` this comment used to name — `addSetCookie` also
@@ -1691,6 +1728,20 @@ const KvEnv = struct {
     }
 };
 
+test "Store.put: the last generation cannot be bumped, on either store -- the save loses its CAS" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var kenv: KvEnv = undefined;
+    try kenv.init();
+    defer kenv.deinit();
+    const rec: [record_header_len]u8 = @splat(0);
+    const id = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    for ([_]Store{ env.store.store(), kenv.store.store() }) |st| {
+        try testing.expectEqual(@as(?Generation, null), st.put(id, &rec, std.math.maxInt(Generation)));
+    }
+}
+
 test "KvStore: sessions survive a restart of the store" {
     var env: KvEnv = undefined;
     try env.init();
@@ -1879,6 +1930,20 @@ test "Manager.init refuses the monotonic clock over a persistent store" {
     defer cache.deinit();
     var rs: RamcacheStore = .{ .cache = &cache };
     _ = try Manager.init(testing.allocator, rs.store(), .{ .io = testing.io });
+}
+
+test "Manager.init refuses cookie options no Set-Cookie can carry" {
+    var cache = newCache();
+    defer cache.deinit();
+    var rs: RamcacheStore = .{ .cache = &cache };
+    const st = rs.store();
+    const io = testing.io;
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .cookie_name = "a b" }));
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .cookie_path = "/x;y" }));
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .same_site = .none, .allow_insecure_cookie = true }));
+    const long_name: [600]u8 = @splat('n');
+    try testing.expectError(error.InvalidCookieOptions, Manager.init(testing.allocator, st, .{ .io = io, .cookie_name = &long_name }));
+    _ = try Manager.init(testing.allocator, st, .{ .io = io, .same_site = .none });
 }
 
 test "Clock.realtime is wall time: nanoseconds since the Unix epoch" {

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent sweep of every pub entry point, `~/CML/20261028-panic-sweep/cookies-sessions-sweep.report.md`). A stored record at the last generation (`maxInt(u64)`, readable back from a `KvStore` file) made the next save overflow `expected + 1`; `put` on both stores now loses its CAS instead. `Manager.init` returns the new `error.InvalidCookieOptions` for options whose session cookie cannot be written (an invalid `cookie_name`/`cookie_path`/`cookie_domain`, `SameSite=None` without `Secure`, a line over 512 bytes) -- every cookie used to be dropped silently at request time. `Manager.persist` of a `Session` whose `id_len`/`data_len` the caller wrote past their buffers is a checked panic (was an out-of-bounds `@memcpy` in ReleaseFast). Tests.
+
 - **2026-10-24** — **SECURITY (fix):** `RamcacheStore.delete` wrote a tombstone at "current
   generation + 1"; when the cache had already evicted the live record that was generation 1 again, and
   a concurrent request's stale save expecting 1 brought a logged-out session back. `delete` now removes
