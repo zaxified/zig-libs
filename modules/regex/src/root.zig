@@ -2688,6 +2688,9 @@ pub const Matcher = struct {
     /// Tests only: `captures` never by the one-pass engine (to test the
     /// backtracker on long texts).
     onepass_off: bool = false,
+    /// Set for the call by `findAnchored`/`capturesAnchored`: a match must
+    /// start at `from`.
+    anchor: bool = false,
 
     /// Explore `pc` at `pos`, or (`restore`) put `pos` back into capture
     /// slot `pc`. A plain struct, not a tagged union: a union built on the
@@ -2795,7 +2798,7 @@ pub const Matcher = struct {
     /// DFA does not apply or cannot get its memory.
     fn findDfa(m: *Matcher, input: []const u8, from: usize) ??Span {
         const re = m.re;
-        if (m.pike_only or re.vm_only or re.longest or re.insts.len > Dfa.max_insts) return null;
+        if (m.pike_only or m.anchor or re.vm_only or re.longest or re.insts.len > Dfa.max_insts) return null;
         const anchored = re.prefilter.anchored;
         if (anchored and from != 0) return @as(?Span, null); // `\A` holds at 0 only
         // Inside a UTF-8 sequence the VMs read from `from` on, byte by byte;
@@ -2853,6 +2856,25 @@ pub const Matcher = struct {
         return d;
     }
 
+    /// `find` for a match that starts at `from` exactly, or null — RE2's
+    /// `ANCHOR_START`, regex-automata's `Input::anchored` (a search, unlike
+    /// `^`, that leaves the pattern alone and the text before `from` in
+    /// view of the assertions). Among the matches starting there, the one
+    /// `find` would report.
+    pub fn findAnchored(m: *Matcher, input: []const u8, from: usize) ?Span {
+        m.anchor = true;
+        defer m.anchor = false;
+        return m.find(input, from);
+    }
+
+    /// `captures` for a match that starts at `from` exactly (see
+    /// `findAnchored`).
+    pub fn capturesAnchored(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
+        m.anchor = true;
+        defer m.anchor = false;
+        return m.captures(input, from, out);
+    }
+
     /// Like `find`, filling `out[i]` with group i's span (null: the group
     /// took no part); `out` may be shorter or longer than the group count.
     pub fn captures(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
@@ -2885,6 +2907,7 @@ pub const Matcher = struct {
         var reach: usize = undefined;
         var track: FindDfa.Track = .{};
         if (anchored) return op.run(re, input, 0, m.tmp, m.best, &reach);
+        if (m.anchor) return op.run(re, input, from, m.tmp, m.best, &reach);
         const d = m.dfa orelse m.makeDfa() orelse return null;
         if (d.skip_idle) {
             // `findDfa`'s search from each candidate, with its budget.
@@ -3007,11 +3030,11 @@ pub const Matcher = struct {
         var pos = from;
         while (true) {
             const at_end = pos >= input.len;
-            if (!matched and (!full or pos == from)) {
+            if (!matched and ((!full and !m.anchor) or pos == from)) {
                 @memset(m.tmp, nil);
                 m.addThread(cur, 0, pos, bytesBefore(input, pos), bytesAt(input, pos));
             }
-            if (cur.n == 0 and (matched or at_end or full)) break;
+            if (cur.n == 0 and (matched or at_end or full or m.anchor)) break;
             nxt.clear();
             const q = pos + 1;
             var i: usize = 0;
@@ -3089,9 +3112,11 @@ pub const Matcher = struct {
         }
         const pf = &re.prefilter;
         var start = from;
+        const anchor = pf.anchored or m.anchor;
         while (true) {
-            if (pf.anchored and start != from) return .none;
+            if (anchor and start != from) return .none;
             if (pf.first != null) start = pf.next(input, start) orelse return .none;
+            if (m.anchor and start != from) return .none;
             if (start > win.hi) {
                 win.clear(m.bt_visited.items, n);
                 win = .{ .base = start, .width = width, .hi = start };
@@ -3239,7 +3264,7 @@ pub const Matcher = struct {
         while (true) {
             if (!matched and cur.n == 0 and !full) {
                 // No thread alive: a match can only start where the prefilter allows.
-                if (pf.anchored and pos != from) break;
+                if ((pf.anchored or m.anchor) and pos != from) break;
                 if (@TypeOf(text.*).can_skip and pf.first != null) {
                     pos = text.skip(pf, pos) orelse break;
                     prev = text.before(pos);
@@ -3248,7 +3273,7 @@ pub const Matcher = struct {
                 }
             }
             const here = text.at(pos);
-            if (!matched and (!pf.anchored or pos == from)) {
+            if (!matched and (!(pf.anchored or m.anchor) or pos == from)) {
                 @memset(m.tmp, nil);
                 m.addThread(cur, 0, pos, prev, here.cp);
             }
@@ -4959,6 +4984,52 @@ test "RegexSet: a joined range table past a u16 is refused, not wrapped" {
     var out: [60]bool = undefined;
     try testing.expect(set.matches("1é", &out));
     try testing.expect(!set.isMatch("1 2"));
+}
+
+test "findAnchored / capturesAnchored: a match that starts at from, in every engine" {
+    const gpa = testing.allocator;
+    const Case = struct { []const u8, Options, []const u8, usize, ?Span };
+    for ([_]Case{
+        .{ "b+", .{}, "abbb", 0, null },
+        .{ "b+", .{}, "abbb", 1, .{ .start = 1, .end = 4 } },
+        .{ "b+", .{}, "abbb", 2, .{ .start = 2, .end = 4 } },
+        .{ "b+|a", .{}, "xab", 0, null }, // `find` would report 1..2
+        // The text before `from` stays in view: no word boundary inside "bb".
+        .{ "\\bb", .{}, "abb", 2, null },
+        .{ "\\bb", .{}, "a b", 2, .{ .start = 2, .end = 3 } },
+        .{ "(?i)ab|a", .{ .longest = true }, "xAB", 1, .{ .start = 1, .end = 3 } },
+        .{ "\\b{start}\\w+", .{ .syntax = .rust }, "é žluť", 3, .{ .start = 3, .end = 9 } },
+        .{ "(?-u:\\xff)a", .{ .syntax = .rust, .utf8 = false }, "a\xffa\xffa", 1, .{ .start = 1, .end = 3 } },
+        .{ "(?-u:\\xff)a", .{ .syntax = .rust, .utf8 = false }, "a\xffa\xffa", 2, null },
+        .{ "a{1000}b{1000}|x", .{}, "yx", 1, .{ .start = 1, .end = 2 } }, // heap tier
+    }) |c| {
+        var re = try Regex.compileOptions(gpa, c[0], c[1]);
+        defer re.deinit(gpa);
+        for ([_]bool{ false, true }) |pike| {
+            var m = try Matcher.init(gpa, &re);
+            defer m.deinit();
+            m.pike_only = pike;
+            m.dfa_eager = true;
+            errdefer std.debug.print("/{s}/ from {d} pike {}\n", .{ c[0], c[3], pike });
+            try testing.expectEqual(c[4], m.findAnchored(c[2], c[3]));
+            var out: [2]?Span = undefined;
+            try testing.expectEqual(c[4] != null, m.capturesAnchored(c[2], c[3], &out));
+            if (c[4]) |want| try testing.expectEqual(want, out[0].?);
+            // The anchor is for the call only.
+            try testing.expectEqual(re.isMatch(c[2]), m.find(c[2], 0) != null);
+        }
+    }
+    // A one-pass program: `capturesAnchored` runs the one-pass engine at `from`.
+    var op = try Regex.compile(gpa, "([a-z]+)-([0-9]+)");
+    defer op.deinit(gpa);
+    var m = try Matcher.init(gpa, &op);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var g: [3]?Span = undefined;
+    try testing.expect(!m.capturesAnchored("ab-12 cd-34", 1, &g) or g[0].?.start == 1);
+    try testing.expect(m.capturesAnchored("ab-12 cd-34", 6, &g));
+    try testing.expectEqual(Span{ .start = 9, .end = 11 }, g[2].?);
+    try testing.expect(!m.capturesAnchored("ab-12 cd-34", 5, &g));
 }
 
 test "Rust nest height counts a concatenation; bytes-mode classes reach raw bytes" {

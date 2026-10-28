@@ -94,6 +94,7 @@ _ = set.matches(text, &which);
 | `isMatchReader(r)`, `Matcher.findReader(r)` / `capturesReader(r, out)` | `MatchReader`, `FindReaderIndex` / `FindReaderSubmatchIndex` | no |
 | `matches(gpa, p, in)` | `regexp.MatchString` | compile |
 | `shortestMatch(in)` | Rust `shortest_match` | no |
+| `Matcher.findAnchored(in, from)` / `capturesAnchored(in, from, out)` | RE2 `ANCHOR_START` | no |
 | `isMatchAlloc` / `fullMatchAlloc` / `shortestMatchAlloc(gpa, in)` | — (any program size) | past `4 * max_insts` |
 | `RegexSet.compile(gpa, ps, opts)`, `isMatch`, `matches(in, out)` | Rust `RegexSet`, RE2 `RE2::Set` | the tables / no |
 | `source` | `String()` | no |

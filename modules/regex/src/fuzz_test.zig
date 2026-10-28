@@ -26,6 +26,8 @@
 //!     removes exactly the iterator's spans; split pieces are disjoint from
 //!     the matches; every match begins with `literalPrefix`, and a complete
 //!     prefix is matched in full; `quoteMeta(input)` matches the input exactly;
+//!   - `findAnchored`/`capturesAnchored` from every start: `find`'s match
+//!     when it starts there, else none (the Pike VM alike);
 //!   - `shortestMatch` is null exactly when nothing matches, lies inside
 //!     `find`'s span, and — for patterns without assertions — is the
 //!     earliest end of any substring `fullMatch` takes; the `*Alloc`
@@ -79,7 +81,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, heap_alloc, shortest, shortest_ref };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match, rust, rust_vm_only, bytes, twin, twin_match, bytes_twin, bytes_twin_match, set, set_match, set_big, set_too_large, heap, heap_alloc, shortest, shortest_ref, anchored_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -733,6 +735,23 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
             if (a) |x| if (x.start != b.?.start or x.end != b.?.end) return error.EnginesDisagreeOnGroups;
         };
     }
+    // An anchored search: `find`'s match when it starts at `from`, else none;
+    // the same in the Pike VM, and `capturesAnchored` with `captures`' groups.
+    from = 0;
+    while (from <= input.len) : (from += stride) {
+        const f = m.find(input, from);
+        const want: ?regex.Span = if (f != null and f.?.start == from) f else null;
+        const got = m.findAnchored(input, from);
+        errdefer std.debug.print("regex fuzz: anchored from {d}: {any}, want {any}\n", .{ from, got, want });
+        if (!std.meta.eql(got, want)) return error.AnchoredDisagreesWithFind;
+        if (!std.meta.eql(pm.findAnchored(input, from), want)) return error.AnchoredPikeDisagrees;
+        if (want != null) {
+            hit(.anchored_match);
+            if (!m.capturesAnchored(input, from, g1[0..ng]) or !m.captures(input, from, g2[0..ng])) return error.AnchoredCapturesMissing;
+            for (g1[0..ng], g2[0..ng]) |x, y| if (!std.meta.eql(x, y)) return error.AnchoredCapturesDisagree;
+        } else if (m.capturesAnchored(input, from, g1[0..ng])) return error.AnchoredCapturesFound;
+    }
+
     // `m` is `dfa_eager`: its `captures` went by the one-pass engine when the
     // program is one-pass.
     if (m.onepass != null) {
