@@ -114,9 +114,12 @@ pub const Header = struct {
 
     /// Encode a header into the first `header_size` bytes of `buf` (which must
     /// be at least that long) and compute both CRCs. `body` is the already-laid
-    /// node region that immediately follows the header in `buf`.
+    /// node region that immediately follows the header in `buf`. Always writes
+    /// the version-1 layout, whatever `self.version` says. A `buf` shorter than
+    /// `header_size` is a caller bug: it panics.
     pub fn encode(self: Header, buf: []u8, body: []const u8) void {
-        std.debug.assert(buf.len >= header_size);
+        // (no-panic sweep 2026-10-28, T-9) a checked panic, not a debug-only assert.
+        if (buf.len < header_size) @panic("trie: Header.encode buffer shorter than header_size");
         @memcpy(buf[0..4], magic);
         std.mem.writeInt(u16, buf[4..6], self.version, .little);
         std.mem.writeInt(u16, buf[6..8], endian_marker, .little);
@@ -178,7 +181,11 @@ pub const Header = struct {
     pub fn verifyBody(self: Header, buf: []const u8) LoadError!void {
         const start = self.regionStart();
         const end = start + @as(usize, self.node_region_len);
-        if (buf.len < end) return error.Truncated;
+        // (no-panic sweep 2026-10-28, T-1) v2/v3 read the CRC from the footer, so
+        // the buffer must hold the footer too; `Frozen.buf` (cut to the node
+        // region) is therefore `Truncated` here, not a slice past its end.
+        const footer: usize = if (hasFooter(self.version)) v2_footer_size else 0;
+        if (buf.len < end + footer) return error.Truncated;
         const want = if (hasFooter(self.version))
             std.mem.readInt(u32, buf[end + 16 ..][0..4], .little)
         else
@@ -593,9 +600,12 @@ pub const NodeView = struct {
         before: u32 = 0,
     };
 
-    /// Edge `i` (0..edge_count). Bounds already validated by `nodeAt`.
+    /// Edge `i` (0..edge_count). Bounds already validated by `nodeAt`, so the
+    /// view must come from `nodeAt` / `follow` (a hand-built or stale view can
+    /// read out of range). `i >= edge_count` is a caller bug: it panics.
     pub fn edge(self: NodeView, i: usize) Edge {
-        std.debug.assert(i < self.edge_count);
+        // (no-panic sweep 2026-10-28, T-10) a checked panic, not a debug-only assert.
+        if (i >= self.edge_count) @panic("trie: NodeView.edge index past edge_count");
         if (self.version == format_version_3) return .{
             .label = self.buf[self.labels_at + i],
             // A zero or too-long distance wraps to an offset at or past this

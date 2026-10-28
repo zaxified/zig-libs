@@ -55,7 +55,24 @@ const query = @import("query.zig");
 const stream = @import("stream.zig");
 const ops = @import("ops.zig");
 pub const automaton = @import("automaton.zig");
-pub const format = @import("format.zig");
+/// The wire-format pieces a consumer needs to walk a frozen buffer itself (as
+/// `fuzzysearch` does): the header, the node decoder and the error sets. The
+/// byte-level helpers (`readDistance`, `findLabelIn`, `nodeAtV2`, ...) stay
+/// internal; their callers pre-validate offsets, so exposing them would hand
+/// out functions that panic on arguments a consumer can easily get wrong.
+/// (no-panic sweep 2026-10-28, T-7/T-8/T-9.)
+pub const format = struct {
+    const impl = @import("format.zig");
+    pub const DecodeError = impl.DecodeError;
+    pub const LoadError = impl.LoadError;
+    pub const format_version = impl.format_version;
+    pub const header_size = impl.header_size;
+    pub const Header = impl.Header;
+    pub const NodeView = impl.NodeView;
+    pub const nodeAt = impl.nodeAt;
+    pub const follow = impl.follow;
+};
+const wire = @import("format.zig"); // the full set, for this file's tests
 
 // ── public API ──────────────────────────────────────────────────────────────
 
@@ -1311,14 +1328,14 @@ test "corpus: the mutation scripts actually damage the index, and reach the trav
 // ran on damaged nodes and stayed in bounds".
 
 fn resealV2(buf: []u8) void {
-    if (buf.len < format.v2_front_size + format.v2_footer_size) return;
-    const foot = buf[buf.len - format.v2_footer_size ..];
+    if (buf.len < wire.v2_front_size + wire.v2_footer_size) return;
+    const foot = buf[buf.len - wire.v2_footer_size ..];
     const region = std.mem.readInt(u32, foot[0..4], .little);
-    const end = @min(buf.len - format.v2_footer_size, format.v2_front_size + @as(usize, region));
-    if (end >= format.v2_front_size)
-        std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(buf[format.v2_front_size..end]), .little);
+    const end = @min(buf.len - wire.v2_footer_size, wire.v2_front_size + @as(usize, region));
+    if (end >= wire.v2_front_size)
+        std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(buf[wire.v2_front_size..end]), .little);
     var c = std.hash.Crc32.init();
-    c.update(buf[0..format.v2_front_size]);
+    c.update(buf[0..wire.v2_front_size]);
     c.update(foot[0..20]);
     std.mem.writeInt(u32, foot[20..24], c.final(), .little);
 }
@@ -1556,7 +1573,7 @@ test "format 3: each node check refuses its own damage, in lookup and in the sha
     // 1-byte distances: 11 bytes), @35 root (flags, tail_len, n-1, 'a',
     // best, distance @43: 9 bytes); region 32 bytes.
     const h = try format.Header.load(base);
-    try testing.expectEqual(format.format_version_3, h.version);
+    try testing.expectEqual(wire.format_version_3, h.version);
     try testing.expectEqual(@as(u32, 32), h.node_region_len);
     try testing.expectEqual(@as(u32, 35), h.root_offset);
     var buf: [128]u8 = undefined;

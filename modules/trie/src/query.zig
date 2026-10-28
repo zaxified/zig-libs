@@ -30,6 +30,15 @@ const format = @import("format.zig");
 const automaton = @import("automaton.zig");
 
 pub const LoadError = format.LoadError;
+// The implicit work cap of the "unbounded" (`max_visited == 0`) forms. A tree
+// buffer (every node has exactly one parent, which `follow`'s monotone offsets
+// and the builders guarantee for self-built buffers) has fewer nodes than
+// bytes, and a walk follows each node's edge once, so it never decodes
+// `buf.len` nodes. A hostile buffer in which edges share children (a DAG: a
+// buffer under 1 KB can enumerate 2^60 keys, A1/trie.md F1) hits the cap and is
+// `error.Corrupt`. An explicit caller cap keeps `TooComplex` / truncation.
+// (no-panic sweep 2026-10-28, T-2.)
+
 pub const QueryError = format.DecodeError || error{ KeyTooLong, TooComplex };
 /// `ordinal` / `keyAt` on a buffer without the per-edge counts (any v1
 /// buffer, or a v2 buffer frozen without `ordinals`).
@@ -41,8 +50,9 @@ pub const QueryOptions = struct {
     /// truncated result. This is the DoS guard: a one-character prefix over
     /// millions of keys cannot walk the whole set — it stops here. Choose it to
     /// bound worst-case latency; `subtree_best` pruning means well-ranked
-    /// queries usually finish far under budget. 0 means "unbounded" (do not use
-    /// on untrusted prefixes).
+    /// queries usually finish far under budget. 0 means "bounded by the buffer
+    /// only": at most `buf.len` nodes, beyond which the buffer is not a tree
+    /// and `topN` returns `error.Corrupt` (see the "implicit work cap" note above `QueryError`).
     max_visited: usize = 50_000,
     /// Pagination cursor: when set, only completions ranked strictly AFTER
     /// this one are considered — pass the last item of the previous page to
@@ -111,6 +121,10 @@ pub const Frozen = struct {
         return f;
     }
 
+    /// The key count the header claims. It is NOT validated against the nodes
+    /// (no checksum binds it to the real number of keys, and `load` does not
+    /// scan): never size an allocation from it on an untrusted buffer.
+    /// (no-panic sweep 2026-10-28, T-11.)
     pub fn keyCount(self: Frozen) u64 {
         return self.header.key_count;
     }
@@ -267,6 +281,10 @@ pub const Frozen = struct {
 
     /// Top-N completions under `prefix`, ranked best-first, into the caller's
     /// `results` and `key_buf`. See `topNInto` for the full contract.
+    ///
+    /// Stack: one call uses about 0.46 MB of the caller's stack (a `max_depth`
+    /// frame array and two `max_depth` byte arrays), whatever the input. Do not
+    /// call it from a thread with a small stack (no-panic sweep 2026-10-28, T-4).
     pub fn topN(
         self: Frozen,
         prefix: []const u8,
@@ -282,11 +300,13 @@ pub const Frozen = struct {
     /// effectively free); the frozen index itself is never copied. Call
     /// `deinit` when done.
     ///
-    /// ⚠ Unbounded: nothing in the v1 wire format forbids two edges from
-    /// pointing at the same child (v2 likewise), so a buffer that is not
-    /// self-built (or otherwise trusted) can encode far more keys than its size
-    /// suggests — a buffer under 1 KB can be built to enumerate 2^60 keys
-    /// (A1/trie.md F1). Over an untrusted buffer, use `prefixIteratorBounded`.
+    /// ⚠ Bounded only by the buffer: nothing in the wire format forbids two
+    /// edges from pointing at the same child, so a buffer that is not self-built
+    /// can encode far more keys than its size suggests — a buffer under 1 KB can
+    /// be built to enumerate 2^60 keys (A1/trie.md F1). Since the no-panic sweep
+    /// (2026-10-28, T-2) the walk stops with `error.Corrupt` after `buf.len`
+    /// node decodes (a tree buffer needs fewer); that is a safety net, not a
+    /// latency bound — over an untrusted buffer use `prefixIteratorBounded`.
     pub fn prefixIterator(self: Frozen, gpa: Allocator, prefix: []const u8) (QueryError || Allocator.Error)!PrefixIterator {
         return PrefixIterator.init(gpa, self, prefix, 0);
     }
@@ -308,8 +328,8 @@ pub const Frozen = struct {
     /// Iterate every key in `r` in lexicographic order (BurntSushi/fst's
     /// `range`). Positioning on `r.lo` costs O(lo.len) node decodes; after
     /// that each key costs what `prefixIterator` pays. `max_visited` bounds
-    /// the whole iteration like `prefixIteratorBounded` (0 = unbounded, for
-    /// self-built buffers only). For "the next page after key K", use
+    /// the whole iteration like `prefixIteratorBounded` (0 = bounded by the
+    /// buffer only: `error.Corrupt` after `buf.len` decodes, as `prefixIterator`). For "the next page after key K", use
     /// `.{ .lo = K, .lo_inclusive = false }`.
     pub fn range(
         self: Frozen,
@@ -326,8 +346,8 @@ pub const Frozen = struct {
     /// path — also in the middle of a v2 compressed edge — and once
     /// `aut.willAlwaysMatch` holds no further byte is fed below that point.
     /// `max_visited` is the node budget over the iterator's whole lifetime
-    /// (0 = unbounded, for self-built buffers only, as `prefixIteratorBounded`
-    /// warns): when it is spent `next` returns `error.TooComplex` and
+    /// (0 = bounded by the buffer only: `error.Corrupt` after `buf.len` decodes,
+    /// as `prefixIterator` says): when it is spent `next` returns `error.TooComplex` and
     /// `truncated()` is true. `aut` is borrowed and must outlive the iterator.
     /// A key longer than the `key_buf` given to `next`, or than `max_depth`,
     /// is `error.KeyTooLong`.
@@ -550,6 +570,8 @@ fn topNInto(
                 status = .truncated_budget;
                 break :outer;
             }
+            // (no-panic sweep 2026-10-28, T-2) implicit cap, see the "implicit work cap" note above `QueryError`.
+            if (opts.max_visited == 0 and visited >= self.buf.len) return error.Corrupt;
             visited += 1;
             const child = try format.follow(top.node, e.child);
 
@@ -591,7 +613,8 @@ pub const PrefixIterator = struct {
     /// Exclusive upper bound (owned), null when open.
     hi: ?[]u8 = null,
     /// Node-decode budget for this iterator's whole lifetime. 0 (used by
-    /// `Frozen.prefixIterator`) means unbounded — see `prefixIteratorBounded`.
+    /// `Frozen.prefixIterator`) means bounded by the buffer only: `error.Corrupt`
+    /// after `frozen.buf.len` decodes (the "implicit work cap" note above `QueryError`).
     max_visited: usize = 0,
     /// Nodes decoded (edges followed) so far.
     visited: usize = 0,
@@ -736,6 +759,12 @@ pub const PrefixIterator = struct {
                 const e = top.node.edge(top.edge_idx);
                 top.edge_idx += 1;
                 if (self.hard_stop or (self.max_visited != 0 and self.visited >= self.max_visited)) return error.TooComplex;
+                if (self.max_visited == 0 and self.visited >= self.frozen.buf.len) {
+                    // (no-panic sweep 2026-10-28, T-2) more decodes than bytes:
+                    // the buffer is not a tree. Finish the iterator.
+                    self.stack.clearRetainingCapacity();
+                    return error.Corrupt;
+                }
                 self.visited += 1;
                 const child = try format.follow(top.node, e.child);
                 const mark = self.path.items.len;
@@ -850,6 +879,11 @@ pub fn SearchIterator(comptime A: type) type {
                     self.spent = true;
                     self.stack.clearRetainingCapacity();
                     return error.TooComplex;
+                }
+                if (self.max_visited == 0 and self.visited >= self.frozen.buf.len) {
+                    // (no-panic sweep 2026-10-28, T-2) see the "implicit work cap" note above `QueryError`.
+                    self.stack.clearRetainingCapacity();
+                    return error.Corrupt;
                 }
                 self.visited += 1;
                 const child = try format.follow(top.node, e.child);
@@ -1082,6 +1116,7 @@ test "topN: a reconstructed key crossing max_depth is KeyTooLong via the path_le
     // the short remaining suffix — isolating the `path_len` check.
     var b = try builder.Builder.init(testing.allocator);
     defer b.deinit();
+    b.max_key_len = max_depth + 10; // T-3: the builder refuses such keys by default
     const prefix_len = max_depth - 5;
     var long_key: [prefix_len + 10]u8 = undefined;
     @memset(long_key[0..prefix_len], 'a');
@@ -1105,6 +1140,7 @@ test "topN (v2): a key whose compressed edge would cross max_depth is KeyTooLong
     // one byte past it. The check is `path_len + 1 + tail.len > max_depth`.
     var b = try builder.Builder.init(testing.allocator);
     defer b.deinit();
+    b.max_key_len = max_depth + 1; // T-3: the builder refuses such keys by default
     var k1: [max_depth]u8 = undefined;
     @memset(&k1, 'a');
     k1[max_depth - 5] = 'b';
@@ -1222,15 +1258,20 @@ test "prefixIteratorBounded aborts a DAG-shaped buffer long before draining it" 
     defer testing.allocator.free(buf);
     const f = try Frozen.load(buf);
 
-    // RED: `prefixIterator` (the only entry point before this fix) has no
-    // way to stop early — it decodes every one of the 2^k paths.
+    // The bare `prefixIterator` has no caller budget, but since the no-panic
+    // sweep (2026-10-28, T-2) it is bounded by the buffer: a tree buffer needs
+    // fewer decodes than it has bytes, so more than `buf.len` of them is
+    // `error.Corrupt`. (It used to drain all 2^20 keys here.)
     {
         var it = try f.prefixIterator(testing.allocator, "");
         defer it.deinit();
         var kb: [k]u8 = undefined;
         var n: usize = 0;
-        while (try it.next(&kb)) |_| n += 1;
-        try testing.expectEqual(@as(usize, 1) << 20, n); // all 2^20 keys, no early stop
+        while (it.next(&kb) catch |err| blk: {
+            try testing.expectEqual(error.Corrupt, err);
+            break :blk null;
+        }) |_| n += 1;
+        try testing.expect(n < buf.len);
     }
 
     // GREEN: the SAME buffer, through `prefixIteratorBounded` with a budget
@@ -1254,6 +1295,155 @@ test "prefixIteratorBounded aborts a DAG-shaped buffer long before draining it" 
         }
         try testing.expect(saw_too_complex);
         try testing.expect(n <= budget);
+    }
+}
+
+/// Hand-build a version-3 buffer of `k` chained nodes, each with two edges
+/// ('a', 'b') to the SAME child, ending in one terminal leaf: `2^k` paths in
+/// `6 + 11k + 36` bytes. Every best is 1, so `topN` prunes nothing.
+fn buildChainDagV3(allocator: std.mem.Allocator, k: usize) ![]u8 {
+    const leaf_len = 6;
+    const node_len = 11;
+    const region_len = leaf_len + node_len * k;
+    const buf = try allocator.alloc(u8, format.v2_front_size + region_len + format.v2_footer_size);
+    errdefer allocator.free(buf);
+    @memset(buf, 0);
+    @memcpy(buf[0..4], format.magic);
+    std.mem.writeInt(u16, buf[4..6], format.format_version_3, .little);
+    std.mem.writeInt(u16, buf[6..8], format.endian_marker, .little);
+    // Leaf: terminal, no tail, value 1.
+    var off: usize = format.v2_front_size;
+    buf[off] = format.terminal_bit;
+    std.mem.writeInt(u32, buf[off + 2 ..][0..4], 1, .little);
+    var child_dist: u8 = leaf_len;
+    off += leaf_len;
+    var root_off: usize = 0;
+    for (0..k) |_| {
+        // flags (edges, width 1), tail_len 0, edge_count - 1, labels, best, 2 distances.
+        buf[off] = format.v2_edges_bit;
+        buf[off + 2] = 1;
+        buf[off + 3] = 'a';
+        buf[off + 4] = 'b';
+        std.mem.writeInt(u32, buf[off + 5 ..][0..4], 1, .little);
+        buf[off + 9] = child_dist;
+        buf[off + 10] = child_dist;
+        child_dist = node_len;
+        root_off = off;
+        off += node_len;
+    }
+    const foot = buf[off..];
+    std.mem.writeInt(u32, foot[0..4], @intCast(region_len), .little);
+    std.mem.writeInt(u32, foot[4..8], @intCast(root_off), .little);
+    std.mem.writeInt(u64, foot[8..16], 1, .little);
+    std.mem.writeInt(u32, foot[16..20], std.hash.Crc32.hash(buf[format.v2_front_size..off]), .little);
+    var c = std.hash.Crc32.init();
+    c.update(buf[0..format.v2_front_size]);
+    c.update(foot[0..20]);
+    std.mem.writeInt(u32, foot[20..24], c.final(), .little);
+    return buf;
+}
+
+test "a DAG-shaped v3 buffer ends in Corrupt, not a 2^40 walk, in every unbounded form" {
+    // (no-panic sweep 2026-10-28, T-2) 40 chained nodes, two edges each to the
+    // same child: `load` accepts it (it never scans), and the walk would visit
+    // 2^40 nodes. With `max_visited == 0` the implicit cap (buf.len decodes)
+    // stops it; an explicit cap keeps its own `TooComplex` / truncation.
+    const k: usize = 40;
+    const buf = try buildChainDagV3(testing.allocator, k);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.loadVerified(buf);
+    var kb: [64]u8 = undefined;
+
+    // prefixIterator, and the iterator is finished after the error.
+    {
+        var it = try f.prefixIterator(testing.allocator, "");
+        defer it.deinit();
+        var n: usize = 0;
+        while (it.next(&kb) catch |err| blk: {
+            try testing.expectEqual(error.Corrupt, err);
+            break :blk null;
+        }) |_| n += 1;
+        try testing.expect(n < buf.len);
+        try testing.expectEqual(@as(?Completion, null), try it.next(&kb));
+    }
+    // range, unbounded.
+    {
+        var it = try f.range(testing.allocator, .{}, 0);
+        defer it.deinit();
+        try testing.expectError(error.Corrupt, drain(&it, &kb));
+    }
+    // search with an always-matching automaton, unbounded.
+    {
+        const aut = automaton.AlwaysMatch{};
+        var it = try f.search(testing.allocator, automaton.AlwaysMatch, &aut, 0);
+        defer it.deinit();
+        var n: usize = 0;
+        while (it.next(&kb) catch |err| blk: {
+            try testing.expectEqual(error.Corrupt, err);
+            break :blk null;
+        }) |_| n += 1;
+        try testing.expect(n < buf.len);
+    }
+    // topN, unbounded.
+    {
+        var results: [4]Completion = undefined;
+        var topkb: [4 * 64]u8 = undefined; // a 40-byte key must fit one slot
+        try testing.expectError(error.Corrupt, f.topN("", &results, &topkb, .{ .max_visited = 0 }));
+    }
+    // An explicit cap keeps today's behaviour.
+    {
+        var it = try f.prefixIteratorBounded(testing.allocator, "", 1000);
+        defer it.deinit();
+        try testing.expectError(error.TooComplex, drain(&it, &kb));
+        const aut = automaton.AlwaysMatch{};
+        var sit = try f.search(testing.allocator, automaton.AlwaysMatch, &aut, 1000);
+        defer sit.deinit();
+        const err = while (true) {
+            _ = sit.next(&kb) catch |e| break e;
+        };
+        try testing.expectEqual(error.TooComplex, err);
+        try testing.expect(sit.truncated());
+    }
+}
+
+fn drain(it: *PrefixIterator, kb: []u8) !void {
+    while (try it.next(kb)) |_| {}
+}
+
+test "a legitimate tree buffer never reaches the implicit cap, even densely branching" {
+    // (no-panic sweep 2026-10-28, T-2) soundness of `buf.len` as the cap: every
+    // key of a dense set, drained unbounded, in every format.
+    var pairs: [26 * 26]builder.Pair = undefined;
+    var keys: [26 * 26][2]u8 = undefined;
+    for (&pairs, &keys, 0..) |*p, *key, i| {
+        key.* = .{ 'a' + @as(u8, @intCast(i / 26)), 'a' + @as(u8, @intCast(i % 26)) };
+        p.* = .{ .key = key, .value = @intCast(i) };
+    }
+    for (all_formats) |fmt| {
+        const buf = try buildWith(&pairs, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        var it = try f.prefixIterator(testing.allocator, "");
+        defer it.deinit();
+        var kb: [8]u8 = undefined;
+        var n: usize = 0;
+        while (try it.next(&kb)) |_| n += 1;
+        try testing.expectEqual(pairs.len, n);
+    }
+}
+
+test "Header.verifyBody refuses a buffer cut before the v2/v3 footer instead of slicing past it" {
+    // (no-panic sweep 2026-10-28, T-1) `Frozen.buf` ends at the node region, so
+    // `f.header.verifyBody(f.buf)` used to index past the slice for v2/v3.
+    for ([_]builder.FreezeOptions{ .{ .v2 = .{ .version = .v2 } }, .{ .v2 = .{} }, .v1 }) |fmt| {
+        const buf = try buildWith(&.{ .{ .key = "ab", .value = 1 }, .{ .key = "ac", .value = 2 } }, fmt);
+        defer testing.allocator.free(buf);
+        const f = try Frozen.load(buf);
+        if (format.hasFooter(f.header.version)) {
+            try testing.expectError(error.Truncated, f.header.verifyBody(f.buf));
+            try testing.expectError(error.Truncated, f.header.verifyBody(buf[0 .. buf.len - 1]));
+        }
+        try f.header.verifyBody(buf);
     }
 }
 

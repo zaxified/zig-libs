@@ -18,6 +18,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 const stream = @import("stream.zig");
+const max_depth = @import("query.zig").max_depth;
 
 /// Which frozen format `freezeWith` writes. Version 2 is the default and the
 /// recommended one (path-compressed, several times smaller); version 1 exists
@@ -35,10 +36,15 @@ pub const BuildError = error{
     /// checked here too — before the `@intCast`s below rather than after
     /// (A1/trie.md F4: they narrowed silently, UB in ReleaseFast).
     TooLarge,
+    /// The key is longer than `max_depth` (4096) bytes, the deepest path the
+    /// query side walks. (no-panic sweep 2026-10-28, T-3.)
+    KeyTooLong,
 };
 
 pub const FreezeError = error{
     OutOfMemory,
+    /// `freezeFromPairs*` only: a pair's key is longer than `max_depth` (4096).
+    KeyTooLong,
     /// The serialized node region would exceed the u32 offset space (~4 GiB).
     /// Far beyond the intended millions-of-keys workload; reported, never
     /// silently truncated.
@@ -100,6 +106,11 @@ pub const Builder = struct {
     nodes: std.ArrayListUnmanaged(Node),
     edges: std.ArrayListUnmanaged(Edge),
     key_count: u64 = 0,
+    /// Longest key `insert` accepts. Leave it alone: raising it past
+    /// `max_depth` only lets keys in that every query refuses with
+    /// `KeyTooLong`; it exists so the tests of that refusal can build such keys
+    /// (no-panic sweep 2026-10-28, T-3).
+    max_key_len: usize = max_depth,
 
     pub fn init(gpa: Allocator) BuildError!Builder {
         var nodes: std.ArrayListUnmanaged(Node) = .empty;
@@ -131,7 +142,12 @@ pub const Builder = struct {
 
     /// Insert or overwrite `key` → `value`. Arbitrary bytes; the empty key is
     /// allowed (it marks the root terminal). Last write wins for duplicates.
+    /// A key longer than `max_depth` (4096 bytes) is `error.KeyTooLong` and
+    /// changes nothing: the build costs ~28 B per key byte, and no query could
+    /// walk such a key anyway.
     pub fn insert(self: *Builder, key: []const u8, value: u32) BuildError!void {
+        // (no-panic sweep 2026-10-28, T-3) bound the memory one caller key can cost.
+        if (key.len > self.max_key_len) return error.KeyTooLong;
         var cur: u32 = 0; // root
         for (key) |b| {
             const found = self.findChildEdge(cur, b);
@@ -177,8 +193,12 @@ pub const Builder = struct {
                     // The allocating writer fails only when it cannot grow.
                     error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
                     error.TooLarge => error.TooLarge,
+                    // Unreachable through `insert` (it refuses such keys), kept
+                    // as an error rather than `unreachable` (T-3).
+                    error.KeyTooLong => error.KeyTooLong,
                     // Keys come out of the trie in order, once each, before
-                    // `finish`.
+                    // `finish`; the builder never errors before `finish`
+                    // (T-6 `Finished` after a failure) as `catch` returns at once.
                     error.Unsorted, error.Finished => unreachable,
                 };
                 return out.toOwnedSlice();
@@ -194,6 +214,7 @@ pub const Builder = struct {
         self.sortEdges();
         var sb = try stream.SortedBuilder.init(self.gpa, w, opts);
         defer sb.deinit();
+        sb.max_key_len = self.max_key_len;
         var path: std.ArrayListUnmanaged(u8) = .empty;
         defer path.deinit(self.gpa);
         // One cursor per depth: the next edge to descend at that depth.
@@ -348,8 +369,8 @@ pub fn freezeFromPairs(gpa: Allocator, out_gpa: Allocator, pairs: []const Pair) 
 pub fn freezeFromPairsWith(gpa: Allocator, out_gpa: Allocator, pairs: []const Pair, opts: FreezeOptions) FreezeError![]u8 {
     var b = Builder.init(gpa) catch return error.OutOfMemory;
     defer b.deinit();
-    // `insert`'s BuildError is now `{OutOfMemory, TooLarge}` — both are
-    // already members of FreezeError, so propagate rather than collapse (the
+    // `insert`'s BuildError is `{OutOfMemory, TooLarge, KeyTooLong}` — all are
+    // members of FreezeError, so propagate rather than collapse (the
     // old `catch return error.OutOfMemory` would have relabelled TooLarge).
     for (pairs) |pr| b.insert(pr.key, pr.value) catch |err| return err;
     return b.freezeWith(out_gpa, opts);
@@ -425,6 +446,23 @@ test "freeze then load: header key_count and root offset are consistent" {
     const root = try format.nodeAt(buf, h.root_offset);
     try testing.expect(root.terminal);
     try testing.expectEqual(@as(u32, 42), root.value);
+}
+
+test "Builder.insert refuses a key longer than max_depth and keeps the builder usable" {
+    // (no-panic sweep 2026-10-28, T-3)
+    var b = try Builder.init(testing.allocator);
+    defer b.deinit();
+    const long = try testing.allocator.alloc(u8, max_depth + 1);
+    defer testing.allocator.free(long);
+    @memset(long, 'x');
+    try testing.expectError(error.KeyTooLong, b.insert(long, 1));
+    try testing.expectEqual(@as(usize, 1), b.nodes.items.len); // nothing was added
+    try b.insert(long[0..max_depth], 2); // exactly max_depth is fine
+    try b.insert("ok", 3);
+    try testing.expectError(error.KeyTooLong, freezeFromPairs(testing.allocator, testing.allocator, &.{.{ .key = long, .value = 1 }}));
+    const buf = try b.freeze(testing.allocator);
+    defer testing.allocator.free(buf);
+    try testing.expectEqual(@as(u64, 2), (try format.Header.load(buf)).key_count);
 }
 
 test "freezeTo walks keys in sorted order whatever the insert order" {

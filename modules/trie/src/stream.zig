@@ -24,6 +24,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
+const max_depth = @import("query.zig").max_depth;
 
 pub const Options = struct {
     /// Store the per-edge `before` counts (format flag bit 0), which
@@ -47,8 +48,12 @@ pub const Error = error{
     TooLarge,
     /// The underlying writer failed.
     WriteFailed,
-    /// `insert` after `finish`.
+    /// `insert` or `finish` after `finish`, or after `insert` failed (the
+    /// builder is poisoned, see `SortedBuilder.insert`).
     Finished,
+    /// A key longer than `max_depth` (4096 bytes): the builder holds ~350 B
+    /// per key byte. (no-panic sweep 2026-10-28, T-3.)
+    KeyTooLong,
 };
 
 /// A written child as its parent's edge needs it.
@@ -106,7 +111,13 @@ pub const SortedBuilder = struct {
     last: std.ArrayListUnmanaged(u8) = .empty,
     started: bool = false,
     finished: bool = false,
+    /// An `insert` failed after it had started changing state: every later
+    /// `insert` / `finish` is `error.Finished` (no-panic sweep 2026-10-28, T-6).
+    failed: bool = false,
     key_count: u64 = 0,
+    /// Longest key `insert` accepts; same remark as `Builder.max_key_len`
+    /// (set from it by `Builder.freezeTo`).
+    max_key_len: usize = max_depth,
     /// Absolute offset of the next byte written.
     pos: u64 = format.v2_front_size,
     crc: std.hash.Crc32 = .init(),
@@ -138,9 +149,15 @@ pub const SortedBuilder = struct {
     }
 
     /// Add `key` → `value`. Keys must arrive in ascending bytewise order; an
-    /// equal key overwrites the previous value.
+    /// equal key overwrites the previous value. A key longer than `max_depth`
+    /// (4096 bytes) is `error.KeyTooLong`, and `error.Unsorted` likewise leaves
+    /// the builder untouched and usable. Any other error (`OutOfMemory`,
+    /// `WriteFailed`, `TooLarge`) may leave it half-updated, so it POISONS the
+    /// builder: every later `insert` and `finish` returns `error.Finished`.
     pub fn insert(self: *SortedBuilder, key: []const u8, value: u32) Error!void {
-        if (self.finished) return error.Finished;
+        if (self.finished or self.failed) return error.Finished;
+        // (no-panic sweep 2026-10-28, T-3) before any state changes.
+        if (key.len > self.max_key_len) return error.KeyTooLong;
         var common: usize = 0;
         if (self.started) {
             switch (std.mem.order(u8, key, self.last.items)) {
@@ -151,10 +168,14 @@ pub const SortedBuilder = struct {
                 },
                 .gt => {},
             }
+            // (T-6) past the last state-free return: a failure from here on
+            // can leave `frames` and `last` disagreeing.
+            errdefer self.failed = true;
             common = std.mem.findDiff(u8, key, self.last.items) orelse key.len;
             var d = self.last.items.len;
             while (d > common) : (d -= 1) try self.close(d);
         }
+        errdefer self.failed = true; // (T-6) also covers the first key
         while (self.frames.items.len < key.len + 1) try self.frames.append(self.gpa, .{});
         const f = &self.frames.items[key.len];
         f.terminal = true;
@@ -166,9 +187,10 @@ pub const SortedBuilder = struct {
     }
 
     /// Close every open node, write the root and the footer, and flush `w`.
-    /// The builder accepts no further keys.
+    /// The builder accepts no further keys. After a failed `insert` it returns
+    /// `error.Finished` and writes nothing.
     pub fn finish(self: *SortedBuilder) Error!void {
-        if (self.finished) return error.Finished;
+        if (self.finished or self.failed) return error.Finished;
         self.finished = true;
         var d = self.last.items.len;
         while (d > 0) : (d -= 1) try self.close(d);
@@ -600,4 +622,40 @@ test "the empty index is a single empty root" {
     try testing.expectEqual(@as(usize, 12 + 2 + 24), buf.len);
     const h = try format.Header.load(buf);
     try testing.expectEqual(@as(u64, 0), h.key_count);
+}
+
+test "KeyTooLong: a key longer than max_depth is refused and changes nothing" {
+    // (no-panic sweep 2026-10-28, T-3)
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var sb = try SortedBuilder.init(testing.allocator, &out.writer, .{});
+    defer sb.deinit();
+    const long = try testing.allocator.alloc(u8, max_depth + 1);
+    defer testing.allocator.free(long);
+    @memset(long, 'x');
+    try testing.expectError(error.KeyTooLong, sb.insert(long, 1));
+    try testing.expectEqual(@as(usize, 1), sb.frames.items.len);
+    try sb.insert(long[0..max_depth], 2); // exactly max_depth is accepted
+    try testing.expectError(error.KeyTooLong, sb.insert(long, 3));
+    try sb.finish(); // still usable
+    try testing.expectEqual(@as(u64, 1), (try format.Header.load(out.written())).key_count);
+}
+
+test "an insert that fails poisons the builder; Unsorted does not" {
+    // (no-panic sweep 2026-10-28, T-6) A FailingAllocator that lets init and
+    // the first keys through, then fails: later calls must be `Finished`.
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var sb = try SortedBuilder.init(fa.allocator(), &out.writer, .{});
+    defer sb.deinit();
+    try sb.insert("ab", 1);
+    try testing.expectError(error.Unsorted, sb.insert("aa", 2));
+    try sb.insert("ac", 3); // Unsorted left it usable
+    fa.fail_index = fa.alloc_index; // the next allocation fails
+    var long: [64]u8 = undefined;
+    @memset(&long, 'z'); // needs new frames: allocates
+    try testing.expectError(error.OutOfMemory, sb.insert(&long, 4));
+    try testing.expectError(error.Finished, sb.insert("zzzzzz", 5));
+    try testing.expectError(error.Finished, sb.finish());
 }

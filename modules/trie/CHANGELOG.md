@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent review of every pub entry point, `~/CML/20261028-panic-sweep/trie-sweep.report.md`). The `max_visited == 0` forms (`prefixIterator`, `range`, `search`, `topN`, `opIterator`) stop with `error.Corrupt` after `buf.len` node decodes — a sub-1 KB DAG-shaped buffer `load` accepts enumerated 2^40+ keys; `Builder`/`SortedBuilder.insert` refuse a key past `max_key_len` (default `max_depth`, new `error.KeyTooLong`; ~350 B of frames per key byte); a `SortedBuilder` whose `insert` failed returns `Finished`; `Header.verifyBody` refuses a buffer cut before the footer; `trie.format` re-exports only what consumers use; `Header.encode` and `NodeView.edge` check their arguments in every build mode.
 - **2026-10-24** — **Performance:** `lookup` over format version 3 checks each node's bounds once
   (at its end) instead of field by field, handles the root's empty tail before the walk and a
   node without edges in its own branch, and prefetches the line below the node it moves to

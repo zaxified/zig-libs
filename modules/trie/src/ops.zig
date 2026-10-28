@@ -51,8 +51,8 @@ pub const max_indexes: usize = 64;
 pub const OpError = QueryError || Allocator.Error || error{ValuesBufferTooSmall};
 
 /// Start `op` over `indexes`. `max_visited` is the TOTAL node budget across all
-/// inputs (0 = unbounded, for self-built buffers only — the same warning as
-/// `Frozen.prefixIteratorBounded`); when it is spent `next` returns
+/// inputs (0 = bounded by each buffer only: `error.Corrupt` after as many node
+/// decodes as the input has bytes, see `Frozen.prefixIterator`); when it is spent `next` returns
 /// `error.TooComplex` and `truncated()` is true. `indexes.len` 0 yields
 /// nothing; more than `max_indexes` (64) is `error.TooManyIndexes`. `indexes`
 /// is copied; the buffers behind it must outlive the iterator.
