@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: MIT
 
-// Generates `src/unicode16_tables.zig` and `src/casefold16.zig`: the Unicode
-// classes and the simple case folding that Rust's `regex` 1.13.1 answers by
-// (crate `regex-syntax` 0.8.11, Unicode 16.0.0), taken as a black box through
-// its public API: every class is what `\p{<query>}` (or `\w \s \d`, or
-// `(?i)[\x{C}]` for the fold orbit of a code point) parses to. The crate's
-// private tables are never read as Rust; only the *names* it knows (the
-// alias lists in `src/unicode_tables/property_names.rs` and
-// `property_values.rs`, plain data) are scanned at run time, from the crate
-// directory given on the command line, to know what to ask. The data are
-// Unicode's; the encoding and this code are ours.
+// Writes `unicode16_tables.zig` and `casefold16.zig` into a directory: the
+// Unicode classes and the simple case folding that Rust's `regex` 1.13.1
+// answers by (crate `regex-syntax` 0.8.11, Unicode 16.0.0), taken as a black
+// box through its public API: every class is what `\p{<query>}` (or `\w \s
+// \d`, or `(?i)[\x{C}]` for the fold orbit of a code point) parses to. The
+// module's own tables come from the UCD (`tools/ucd_unicode/gen.py`, Unicode
+// 17.0); this is the oracle for that generator's rules: run on UCD 16.0.0 it
+// must give these files byte for byte (`gen.py --compare-with <dir>`; the
+// interop lane does both). The crate's private tables are never read as Rust;
+// only the *names* it knows (the alias lists in
+// `src/unicode_tables/property_names.rs` and `property_values.rs`, plain data)
+// are scanned at run time, from the crate directory given on the command
+// line, to know what to ask. The data are Unicode's; the encoding and this
+// code are ours.
 //
 //   cd modules/regex/tools/rust_unicode
 //   cargo build --release --offline
-//   target/release/rust_unicode --crate ~/.cargo/registry/src/*/regex-syntax-0.8.11 -out ../../src
-//   target/release/rust_unicode --crate ~/.cargo/registry/src/*/regex-syntax-0.8.11 -check ../../src
+//   target/release/rust_unicode --crate ~/.cargo/registry/src/*/regex-syntax-0.8.11 -out <dir>
 //
-// Needs `zig` on PATH (the output goes through `zig fmt --stdin`) and, for the
-// `go` flags, `<dir>/unicode_tables.zig` (the Go-generated file).
+// Needs `zig` on PATH (the output goes through `zig fmt --stdin`).
 use regex_syntax::hir::{Class, Hir, HirKind};
 use regex_syntax::{Parser, ParserBuilder};
 use std::collections::{BTreeMap, HashMap, HashSet};

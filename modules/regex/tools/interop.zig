@@ -4,28 +4,41 @@
 //! (default) the committed ones, which `test-regex` uses:
 //!  - `tools/go_regexp_oracle`   Go `regexp`, black box → `src/go_vectors.zig`
 //!  - `tools/rust_regex_oracle`  Rust `regex`, black box → `src/rust_vectors.zig`
-//!  - `tools/rust_unicode`       Rust `regex-syntax` → `src/unicode16_tables.zig`,
-//!                               `src/casefold16.zig`
+//!  - `tools/ucd_unicode`        the UCD 17.0.0 → `src/unicode_tables.zig`,
+//!                               `src/casefold.zig`
+//!  - and the rules that generator applies, against Rust `regex-syntax`:
+//!    `tools/rust_unicode` writes the crate's tables (UCD 16.0.0) into
+//!    `.zig-cache/regex-rust-unicode/`, and the generator run on UCD 16.0.0
+//!    must give them byte for byte (`--compare-with`).
 //! The checks ignore the `// GENERATED …` line: a runner with another Go
 //! patch release passes when every answer agrees.
 //!
 //! THIS IS A PROGRAM, NOT A TEST. `zig build interop-regex` runs it and
 //! `zig build check-interop` compiles it. Needs go 1.26.0 (standard library
 //! only; `GOPROXY=off`), cargo with the pinned crates in its registry
-//! (`--offline`; `regex` 1.13.1 and its four dependencies, read 2026-10-27)
-//! and `zig` on PATH; no network. Run from the repository root.
+//! (`--offline`; `regex` 1.13.1 and its four dependencies, read 2026-10-27),
+//! python3, the UCD 16.0.0 and 17.0.0 in `tools/ucd_unicode/data/` (fetched
+//! once by `tools/ucd_unicode/fetch.sh`) and `zig` on PATH; no network. Run
+//! from the repository root.
 //!
 //!   zig build interop-regex              # re-take, rewrite the files
 //!   zig build interop-regex -- --check   # re-take, compare with the committed files
 
 const std = @import("std");
 
-const Kind = enum { go, cargo };
-const Tool = struct { name: []const u8, kind: Kind, dir: []const u8, target: []const u8, crate_arg: bool = false };
+const Kind = enum { go, cargo, python };
+/// `mode`: `.target` takes `-out`/`-check` by `--check`; `.scratch` always
+/// writes (`-out`, a directory under `.zig-cache`); `.compare` passes
+/// `--compare-with`.
+const Mode = enum { target, scratch, compare };
+const Tool = struct { name: []const u8, kind: Kind, dir: []const u8, target: []const u8, crate_arg: bool = false, mode: Mode = .target, pre: []const []const u8 = &.{} };
+const rust_tables = "../../../../.zig-cache/regex-rust-unicode";
 const tools = [_]Tool{
     .{ .name = "Go regexp oracle", .kind = .go, .dir = "modules/regex/tools/go_regexp_oracle", .target = "../../src/go_vectors.zig" },
     .{ .name = "Rust regex oracle", .kind = .cargo, .dir = "modules/regex/tools/rust_regex_oracle", .target = "../../src/rust_vectors.zig" },
-    .{ .name = "Rust Unicode tables", .kind = .cargo, .dir = "modules/regex/tools/rust_unicode", .target = "../../src", .crate_arg = true },
+    .{ .name = "Rust Unicode tables (UCD 16.0.0, the crate)", .kind = .cargo, .dir = "modules/regex/tools/rust_unicode", .target = rust_tables, .crate_arg = true, .mode = .scratch },
+    .{ .name = "UCD generator rules vs regex-syntax (UCD 16.0.0)", .kind = .python, .dir = "modules/regex/tools/ucd_unicode", .target = rust_tables, .mode = .compare, .pre = &.{ "--ucd", "data/16.0.0" } },
+    .{ .name = "Unicode tables (UCD 17.0.0)", .kind = .python, .dir = "modules/regex/tools/ucd_unicode", .target = "../../src", .pre = &.{ "--ucd", "data/17.0.0" } },
 };
 
 /// The registry copy of regex-syntax 0.8.11 (`rust_unicode` reads its alias
@@ -78,9 +91,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         switch (t.kind) {
             .go => try argv.appendSlice(arena, &.{ "go", "run", "." }),
             .cargo => try argv.appendSlice(arena, &.{ "cargo", "run", "--release", "--offline", "--quiet", "--" }),
+            .python => try argv.appendSlice(arena, &.{ "python3", "gen.py" }),
         }
         if (t.crate_arg) try argv.appendSlice(arena, &.{ "--crate", try regexSyntaxDir(arena, io, &env) });
-        try argv.appendSlice(arena, &.{ if (check) "-check" else "-out", t.target });
+        try argv.appendSlice(arena, t.pre);
+        switch (t.mode) {
+            .target => try argv.appendSlice(arena, &.{ if (check) "-check" else "-out", t.target }),
+            .scratch => {
+                try std.Io.Dir.cwd().createDirPath(io, ".zig-cache/regex-rust-unicode");
+                try argv.appendSlice(arena, &.{ "-out", t.target });
+            },
+            .compare => try argv.appendSlice(arena, &.{ "--compare-with", t.target }),
+        }
         var child = std.process.spawn(io, .{
             .argv = argv.items,
             .environ_map = &env,

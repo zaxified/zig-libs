@@ -11,8 +11,8 @@
 //! never a truncated program.
 
 const std = @import("std");
-const casefold16 = @import("casefold16.zig");
-const unicode16 = @import("unicode16_tables.zig");
+const casefold = @import("casefold.zig");
+const tables = @import("unicode_tables.zig");
 
 /// Where bytes-mode instructions keep a raw byte past ASCII: `byte_base + b`,
 /// past every code point (a range is all bytes or all code points).
@@ -708,16 +708,16 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// loosely (Unicode TR18: ASCII case ignored, spaces, `_` and `-`
         /// dropped — what Go 1.25+ documents): a name Go lists (`Any`,
         /// `ASCII`, `Assigned`, the general categories and their aliases, the
-        /// scripts), with its Unicode 16.0 class from `unicode16_tables.zig`.
+        /// scripts), with its class from `unicode_tables.zig` (Unicode 17.0).
         fn addUnicodeClass(b: *Self, name: []const u8) Error!void {
             var buf: [max_class_name]u8 = undefined;
             const key = looseName(name, &buf) orelse return error.InvalidUnicodeClass;
             // Rust's tables have no surrogates (a `char` is never one); Go
             // lists them. The same in every Unicode version.
             if (std.mem.eql(u8, key, "cs") or std.mem.eql(u8, key, "surrogate")) return b.addRange(.{ .lo = 0xd800, .hi = 0xdfff });
-            const entry = findName16(key) orelse return error.InvalidUnicodeClass;
+            const entry = findEntry(key) orelse return error.InvalidUnicodeClass;
             if (!entry.go) return error.InvalidUnicodeClass;
-            try b.addBase16(entry.base);
+            try b.addBase(entry.base);
         }
 
         fn addRange(b: *Self, r: Range) Error!void {
@@ -850,14 +850,14 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         }
 
         /// Add the case variants of `ranges[start..]`: every code point of each
-        /// one's simple case-folding orbit (`casefold16.zig`, Unicode's
+        /// one's simple case-folding orbit (`casefold.zig`, Unicode's
         /// CaseFolding.txt as Go walks it), so `(?i)é` takes `É` and `(?i)k`
         /// takes U+212A KELVIN SIGN. An orbit has at most `max_orbit` members, so
         /// taking the successors of what was added `max_orbit - 1` times reaches
         /// all of them — run by run, never code point by code point (a class over
         /// all of Unicode costs as much as `[a-z]`, also at comptime).
         fn foldFrom(b: *Self, start: u16) Error!void {
-            return b.foldFromWith(casefold16, start);
+            return b.foldFromWith(casefold, start);
         }
 
         /// `foldFrom` over the orbits of table `cf`.
@@ -1365,9 +1365,9 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             const start = b.nranges;
             if (flags.unicode) {
                 switch (std.ascii.toLower(c)) {
-                    'd' => try b.addBase16(unicode16.perl_digit),
-                    's' => try b.addBase16(unicode16.perl_space),
-                    else => try b.addBase16(unicode16.perl_word),
+                    'd' => try b.addBase(tables.perl_digit),
+                    's' => try b.addBase(tables.perl_space),
+                    else => try b.addBase(tables.perl_word),
                 }
             } else {
                 if (negated and !b.bytes) return error.InvalidUtf8;
@@ -1428,21 +1428,21 @@ pub fn BuilderOf(comptime cap: Capacity) type {
                 try b.addRustProperty(query[0..i], query[i + 1 ..]);
             } else {
                 var key: [max_class_name]u8 = undefined;
-                try b.addBase16(find16(rustNormalize(query, &key)) orelse return error.InvalidUnicodeClass);
+                try b.addBase(findName(rustNormalize(query, &key)) orelse return error.InvalidUnicodeClass);
             }
-            if (flags.fold) try b.foldFromWith(casefold16, start);
+            if (flags.fold) try b.foldFromWith(casefold, start);
             b.normalizeFrom(start);
             if (negated) try b.negateFrom(start);
             return .{ .class = .{ .start = start, .len = b.nranges - start } };
         }
 
-        /// `name=value`: a property of `unicode16.props` (general category,
+        /// `name=value`: a property of `tables.props` (general category,
         /// script, script extensions, age, the break properties) and one of
         /// its values, both normalized as regex-syntax does.
         fn addRustProperty(b: *Self, name: []const u8, value: []const u8) Error!void {
             var nbuf: [max_class_name]u8 = undefined;
             const prop = rustNormalize(name, &nbuf);
-            const id = for (unicode16.props) |p| {
+            const id = for (tables.props) |p| {
                 if (std.mem.eql(u8, p.name, prop)) break p.id;
             } else return error.InvalidUnicodeClass;
             var vbuf: [max_class_name]u8 = undefined;
@@ -1453,12 +1453,12 @@ pub fn BuilderOf(comptime cap: Capacity) type {
             kbuf[id.len] = '=';
             @memcpy(kbuf[id.len + 1 ..][0..v.len], v);
             const key = kbuf[0 .. id.len + 1 + v.len];
-            try b.addBase16(find16(key) orelse return error.InvalidUnicodeClass);
+            try b.addBase(findName(key) orelse return error.InvalidUnicodeClass);
         }
 
-        /// Append the ranges of `unicode16.bases[base]`.
-        fn addBase16(b: *Self, base: u16) Error!void {
-            var it: Ranges16 = .init(base);
+        /// Append the ranges of `tables.bases[base]`.
+        fn addBase(b: *Self, base: u16) Error!void {
+            var it: TableRanges = .init(base);
             while (it.next()) |r| try b.addRange(r);
         }
 
@@ -1606,7 +1606,7 @@ pub fn BuilderOf(comptime cap: Capacity) type {
         /// Case-fold `ranges[start..]`: Unicode orbits, or with `(?-u)` the
         /// ASCII letters' other case.
         fn rustFold(b: *Self, flags: Flags, start: u16) Error!void {
-            if (flags.unicode) return b.foldFromWith(casefold16, start);
+            if (flags.unicode) return b.foldFromWith(casefold, start);
             const end = b.nranges;
             for (start..end) |i| {
                 const r = b.ranges[i];
@@ -1893,31 +1893,31 @@ fn isRustSpaceAt(s: []const u8, i: usize) bool {
 }
 
 /// Rust's `char::is_alphabetic` (the Alphabetic property; Rust's own
-/// Unicode version may differ from regex-syntax's 16.0 — not seen in names).
+/// Unicode version may differ from the tables' 17.0 — not seen in names).
 fn isRustAlphabetic(cp: u21) bool {
     if (cp < 0x80) return std.ascii.isAlphabetic(@intCast(cp));
-    return in16(comptime find16("alphabetic").?, cp);
+    return inTable(comptime findName("alphabetic").?, cp);
 }
 
 /// Rust's `char::is_numeric` (general category N).
 fn isRustNumeric(cp: u21) bool {
     if (cp < 0x80) return std.ascii.isDigit(@intCast(cp));
-    return in16(comptime find16("n").?, cp);
+    return inTable(comptime findName("n").?, cp);
 }
 
-/// The ranges of one `unicode16` table, decoded from its varints.
-const Ranges16 = struct {
+/// The ranges of one `tables` table, decoded from its varints.
+const TableRanges = struct {
     bytes: []const u8,
     left: u16,
     i: usize = 0,
     next_lo: u32 = 0,
 
-    fn init(base: u16) Ranges16 {
-        const t = unicode16.bases[base];
-        return .{ .bytes = unicode16.data[t.offset..][0..t.size], .left = t.count };
+    fn init(base: u16) TableRanges {
+        const t = tables.bases[base];
+        return .{ .bytes = tables.data[t.offset..][0..t.size], .left = t.count };
     }
 
-    fn next(it: *Ranges16) ?Range {
+    fn next(it: *TableRanges) ?Range {
         if (it.left == 0) return null;
         it.left -= 1;
         const lo = it.next_lo + readVarint(it.bytes, &it.i);
@@ -1927,9 +1927,9 @@ const Ranges16 = struct {
     }
 };
 
-/// Whether `cp` is in `unicode16.bases[base]` (a walk over its ranges).
-fn in16(base: u16, cp: u21) bool {
-    var it: Ranges16 = .init(base);
+/// Whether `cp` is in `tables.bases[base]` (a walk over its ranges).
+fn inTable(base: u16, cp: u21) bool {
+    var it: TableRanges = .init(base);
     while (it.next()) |r| {
         if (cp < r.lo) return false;
         if (cp <= r.hi) return true;
@@ -1937,11 +1937,11 @@ fn in16(base: u16, cp: u21) bool {
     return false;
 }
 
-/// Rust's Unicode `\w` (`perl_word`, Unicode 16.0), decoded at compile time.
+/// Unicode `\w` (`perl_word`), decoded at compile time.
 const perl_word_ranges = blk: {
     @setEvalBranchQuota(100_000);
-    var out: [unicode16.bases[unicode16.perl_word].count]Range = undefined;
-    var it: Ranges16 = .init(unicode16.perl_word);
+    var out: [tables.bases[tables.perl_word].count]Range = undefined;
+    var it: TableRanges = .init(tables.perl_word);
     for (&out) |*r| r.* = it.next().?;
     break :blk out;
 };
@@ -1958,14 +1958,14 @@ pub fn isPerlWord(cp: u21) bool {
     return false;
 }
 
-/// The table of a `unicode16` key.
-fn find16(key: []const u8) ?u16 {
-    return if (findName16(key)) |e| e.base else null;
+/// The table of a `tables` key.
+fn findName(key: []const u8) ?u16 {
+    return if (findEntry(key)) |e| e.base else null;
 }
 
-/// The entry of a `unicode16` key, by binary search.
-fn findName16(key: []const u8) ?unicode16.Name {
-    const names = &unicode16.names;
+/// The entry of a `tables` key, by binary search.
+fn findEntry(key: []const u8) ?tables.Name {
+    const names = &tables.names;
     var lo: usize = 0;
     var hi: usize = names.len;
     while (lo < hi) {
@@ -2019,9 +2019,9 @@ fn looseName(name: []const u8, buf: *[max_class_name]u8) ?[]const u8 {
 }
 
 /// Whether `cp` is in the Unicode class of key `key` (one of
-/// `unicode16_tables.names`) — a walk over its stored ranges.
+/// `unicode_tables.names`) — a walk over its stored ranges.
 pub fn unicodeClassContains(comptime key: []const u8, cp: u21) bool {
-    return in16(comptime find16(key).?, cp);
+    return inTable(comptime findName(key).?, cp);
 }
 
 /// One LEB128 varint at `bytes[i.*..]` (the generator writes at most three bytes).
@@ -2054,7 +2054,7 @@ fn hexDigit(c: u8) ?u32 {
 /// Whether case-insensitive matching changes what `cp` matches.
 fn hasFold(cp: u21) bool {
     const i = firstRunEndingAtOrAfter(cp);
-    return i < casefold16.runs.len and casefold16.runs[i].lo <= cp;
+    return i < casefold.runs.len and casefold.runs[i].lo <= cp;
 }
 
 /// Sort ranges by their low end: insertion for the usual handful, pdq for a
@@ -2071,15 +2071,15 @@ fn sortRanges(rs: []Range) void {
 /// The successor of `cp` in its case-folding orbit (`cp` itself: none).
 fn foldNext(cp: u21) u21 {
     const i = firstRunEndingAtOrAfter(cp);
-    if (i == casefold16.runs.len or casefold16.runs[i].lo > cp) return cp;
-    const run = casefold16.runs[i];
+    if (i == casefold.runs.len or casefold.runs[i].lo > cp) return cp;
+    const run = casefold.runs[i];
     if (run.alt) return if ((cp - run.lo) & 1 == 0) cp + 1 else cp - 1;
     return @intCast(@as(i32, cp) + run.delta);
 }
 
 /// The index of the first fold run whose `hi` is at least `cp` (binary search).
 fn firstRunEndingAtOrAfter(cp: u21) usize {
-    return firstRunIn(casefold16, cp);
+    return firstRunIn(casefold, cp);
 }
 
 fn firstRunIn(comptime cf: type, cp: u21) usize {

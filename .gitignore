@@ -26,6 +26,10 @@ example-apps/*/.zig-cache/
 example-apps/*/zig-out/
 example-apps/*/zig-pkg/
 
+# The Unicode Character Database regex's table generator reads
+# (modules/regex/tools/ucd_unicode/fetch.sh): ~50 MB per version, re-fetchable.
+modules/regex/tools/ucd_unicode/data/
+
 # Python bytecode from scripts/*.py
 __pycache__/
 *.pyc
