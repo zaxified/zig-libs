@@ -1201,6 +1201,279 @@ const FindDfa = struct {
     }
 };
 
+/// `captures` for a one-pass program (RE2's and Rust's one-pass engine):
+/// one where, read anchored, the next code point always picks at most one
+/// way on. Then the search is one thread whose captures are written in
+/// place — no per-thread copies (Pike VM), no visited bits or pending
+/// branches (backtracker). A root is where the thread stands before reading
+/// (instruction 0, or just after a consuming one); its closure, in priority
+/// order, gives the ways out (`Edge`: the consuming instruction, the slots
+/// set and the assertions passed on the way) and the match, if one is on the
+/// way. One-pass: the ways out of each root consume disjoint sets. A way
+/// below the match is cut (leftmost-first); a match below a way is pending —
+/// the thread goes on, and the last match passed is the answer when it dies.
+const OnePass = struct {
+    /// Slots the engine carries (16 groups): a step's fit one word.
+    const max_slots = 32;
+    const match_bit = 56;
+    /// A way out, as `step` packs it: the root it leads to as the offset of
+    /// its `trans` row (bits 0–15, root × 128: the next lookup takes no
+    /// shift or multiply, the loop's dependency chain is the load alone;
+    /// never 0, no edge leads back to the start), the slots set on the way
+    /// (16–47), the assertions passed (48–53, by `Assert` value), and bit
+    /// `match_bit` when a match is on the way from that root (the loop reads
+    /// the root only then). 0: none.
+    const Edge = struct { slots: u32, next: u16, pc: u16, asserts: u8, step: u64 = 0 };
+    const Root = struct {
+        /// Its edges: `edges[first..][0..len]`.
+        first: u16,
+        len: u16,
+        /// A match is on the way: the slots and assertions on the way to it.
+        has_match: bool,
+        match_asserts: u8,
+        match_slots: u32,
+    };
+    const Match = struct { slots: u32, asserts: u8 };
+
+    gpa: std.mem.Allocator,
+    roots: std.ArrayList(Root),
+    /// Per root, per ASCII byte: the step that reads it (one load per byte:
+    /// the step is the whole transition, as Rust's one-pass table).
+    trans: std.ArrayList([128]u64),
+    edges: std.ArrayList(Edge),
+
+    /// The engine for `re`, or null: not one-pass, or no memory.
+    fn make(gpa: std.mem.Allocator, re: *const Regex) ?*OnePass {
+        const n = re.insts.len;
+        const k = re.names.len * 2;
+        if (n > Dfa.max_insts or k > max_slots) return null;
+        var roots: std.ArrayList(Root) = .empty;
+        var edges: std.ArrayList(Edge) = .empty;
+        var trans: std.ArrayList([128]u64) = .empty;
+        var root_pcs: [Dfa.max_insts + 1]u16 = undefined;
+        // pc → its root + 1 (0: none yet).
+        var root_of: [Dfa.max_insts + 1]u16 = @splat(0);
+        const ok = blk: {
+            root_pcs[0] = 0;
+            root_of[0] = 1;
+            var nroots: usize = 1;
+            var r: usize = 0;
+            while (r < nroots) : (r += 1) {
+                const first = edges.items.len;
+                const match = closure(re, root_pcs[r], k, gpa, &edges) catch break :blk false;
+                const out = edges.items[first..];
+                for (out, 0..) |*e, i| {
+                    for (out[0..i]) |o| if (overlap(re, o.pc, e.pc)) break :blk false;
+                    const next = e.pc + 1;
+                    if (root_of[next] == 0) {
+                        root_pcs[nroots] = next;
+                        nroots += 1;
+                        root_of[next] = @intCast(nroots);
+                    }
+                    e.next = root_of[next] - 1;
+                }
+                const mt: Match = match orelse .{ .slots = 0, .asserts = 0 };
+                roots.append(gpa, .{
+                    .first = @intCast(first),
+                    .len = @intCast(out.len),
+                    .has_match = match != null,
+                    .match_asserts = mt.asserts,
+                    .match_slots = mt.slots,
+                }) catch break :blk false;
+            }
+            // The steps, once every root's match is known.
+            for (edges.items) |*e| {
+                const m: u64 = @intFromBool(roots.items[e.next].has_match);
+                e.step = m << match_bit | @as(u64, e.asserts) << 48 | @as(u64, e.slots) << 16 | @as(u64, e.next) << 7;
+            }
+            trans.ensureTotalCapacityPrecise(gpa, roots.items.len) catch break :blk false;
+            for (roots.items) |root| {
+                const row = trans.addOneAssumeCapacity();
+                row.* = @splat(0);
+                for (row, 0..) |*slot, c| for (edges.items[root.first..][0..root.len]) |e| {
+                    if (re.consumes(e.pc, @intCast(c))) slot.* = e.step;
+                };
+            }
+            break :blk true;
+        };
+        const op: ?*OnePass = if (ok) gpa.create(OnePass) catch null else null;
+        const p = op orelse {
+            roots.deinit(gpa);
+            edges.deinit(gpa);
+            trans.deinit(gpa);
+            return null;
+        };
+        p.* = .{ .gpa = gpa, .roots = roots, .trans = trans, .edges = edges };
+        return p;
+    }
+
+    const NotOnePass = error{NotOnePass} || std.mem.Allocator.Error;
+
+    /// Append the edges out of `pc0` to `edges`, in priority order (the Pike
+    /// VM's `addThread` walk); return the match, when one is on the way. A
+    /// state first reached past an assertion, then again, is not one-pass:
+    /// whether the first way gets there depends on the text, and when it
+    /// does not, the second way does. So is a way below a match past an
+    /// assertion: whether the match cuts it depends on the text.
+    fn closure(re: *const Regex, pc0: u16, k: usize, gpa: std.mem.Allocator, edges: *std.ArrayList(Edge)) NotOnePass!?Match {
+        const Item = struct { pc: u16, slots: u32, asserts: u8 };
+        // 0 unseen, 1 seen, 2 seen past an assertion.
+        var seen: [Dfa.max_insts]u8 = @splat(0);
+        var stack: [2 * Dfa.max_insts]Item = undefined;
+        var sp: usize = 1;
+        stack[0] = .{ .pc = pc0, .slots = 0, .asserts = 0 };
+        var match: ?Match = null;
+        while (sp != 0) {
+            sp -= 1;
+            var it = stack[sp];
+            if (seen[it.pc] != 0) {
+                if (seen[it.pc] == 2) return error.NotOnePass;
+                continue;
+            }
+            seen[it.pc] = if (it.asserts != 0) 2 else 1;
+            switch (re.insts[it.pc]) {
+                .jmp => |t| {
+                    it.pc = t;
+                    stack[sp] = it;
+                    sp += 1;
+                },
+                .split => |s| {
+                    stack[sp] = .{ .pc = s.y, .slots = it.slots, .asserts = it.asserts };
+                    stack[sp + 1] = .{ .pc = s.x, .slots = it.slots, .asserts = it.asserts };
+                    sp += 2;
+                },
+                .save => |slot| {
+                    if (slot < k) it.slots |= @as(u32, 1) << @intCast(slot);
+                    it.pc += 1;
+                    stack[sp] = it;
+                    sp += 1;
+                },
+                .assert => |a| {
+                    it.asserts |= @as(u8, 1) << @intCast(@backingInt(a));
+                    it.pc += 1;
+                    stack[sp] = it;
+                    sp += 1;
+                },
+                .match => match = .{ .slots = it.slots, .asserts = it.asserts },
+                .rune, .any, .any_not_nl => if (match) |mt| {
+                    if (mt.asserts != 0) return error.NotOnePass;
+                } else {
+                    try edges.append(gpa, .{ .slots = it.slots, .next = undefined, .pc = it.pc, .asserts = it.asserts });
+                },
+            }
+        }
+        return match;
+    }
+
+    /// Whether some code point is read by both `a` and `b`.
+    fn overlap(re: *const Regex, a: u16, b: u16) bool {
+        const ra = re.insts[a];
+        const rb = re.insts[b];
+        if (ra == .any or rb == .any) return true;
+        if (ra == .any_not_nl and rb == .any_not_nl) return true;
+        if (ra == .any_not_nl) return !onlyNewline(re, rb.rune);
+        if (rb == .any_not_nl) return !onlyNewline(re, ra.rune);
+        const x = re.ranges[ra.rune.start..][0..ra.rune.len];
+        const y = re.ranges[rb.rune.start..][0..rb.rune.len];
+        var i: usize = 0;
+        var j: usize = 0;
+        while (i < x.len and j < y.len) {
+            if (x[i].hi < y[j].lo) {
+                i += 1;
+            } else if (y[j].hi < x[i].lo) {
+                j += 1;
+            } else return true;
+        }
+        return false;
+    }
+
+    fn onlyNewline(re: *const Regex, r: @FieldType(Inst, "rune")) bool {
+        const rs = re.ranges[r.start..][0..r.len];
+        return rs.len == 1 and rs[0].lo == '\n' and rs[0].hi == '\n';
+    }
+
+    fn deinit(op: *OnePass) void {
+        op.roots.deinit(op.gpa);
+        op.trans.deinit(op.gpa);
+        op.edges.deinit(op.gpa);
+    }
+
+    /// The leftmost-first match starting at `at`, its slots into `best`
+    /// (`caps` scratch); `reach` set to where the reading stopped.
+    fn run(op: *const OnePass, re: *const Regex, input: []const u8, at: usize, caps: []usize, best: []usize, reach: *usize) bool {
+        // The slots written in `caps`, and in `best` by the last match: no
+        // clearing and copying of the whole slices (with a length known only
+        // at run time, each a `compiler_rt` call).
+        var set: u32 = 0;
+        var best_set: u32 = 0;
+        const roots = op.roots.items;
+        const trans: [*]const u64 = @ptrCast(op.trans.items.ptr);
+        // The root's `trans` row offset (root × 128).
+        var r: usize = 0;
+        var pos = at;
+        var matched = false;
+        var has_match = roots[0].has_match;
+        // Few values live across the loop (measured: with the code point
+        // before kept in one, the loop spilled to the stack): what an
+        // assertion needs is read from the text when one is passed.
+        while (true) {
+            if (has_match) {
+                const root = roots[r >> 7];
+                if (root.match_asserts == 0 or holdAll(root.match_asserts, runeBefore(input, pos), decode(input, pos).cp)) {
+                    var cs = set;
+                    while (cs != 0) : (cs &= cs - 1) best[@ctz(cs)] = caps[@ctz(cs)];
+                    setSlots(best, root.match_slots, pos);
+                    best_set = set | root.match_slots;
+                    matched = true;
+                    if (root.len == 0) break;
+                }
+            }
+            if (pos >= input.len) break;
+            const c = input[pos];
+            var w: usize = 1;
+            var step: u64 = undefined;
+            if (c < 0x80) {
+                step = trans[r + c];
+                if (step == 0) break;
+            } else {
+                const d = decode(input, pos);
+                w = d.w;
+                const root = roots[r >> 7];
+                step = for (op.edges.items[root.first..][0..root.len]) |edge| {
+                    if (re.consumes(edge.pc, d.cp.?)) break edge.step;
+                } else break;
+            }
+            const asserts: u8 = @truncate(step >> 48);
+            if (asserts != 0 and !holdAll(asserts, runeBefore(input, pos), decode(input, pos).cp)) break;
+            const slots: u32 = @truncate(step >> 16);
+            setSlots(caps, slots, pos);
+            set |= slots;
+            pos += w;
+            r = @as(u16, @truncate(step));
+            has_match = step >> match_bit != 0;
+        }
+        reach.* = pos;
+        if (matched) {
+            var unset = ~best_set & ((@as(u64, 1) << @intCast(best.len)) - 1);
+            while (unset != 0) : (unset &= unset - 1) best[@ctz(unset)] = nil;
+        }
+        return matched;
+    }
+
+    inline fn setSlots(caps: []usize, slots: u32, pos: usize) void {
+        var s = slots;
+        while (s != 0) : (s &= s - 1) caps[@ctz(s)] = pos;
+    }
+
+    fn holdAll(asserts: u8, prev: ?u21, next: ?u21) bool {
+        var s = asserts;
+        while (s != 0) : (s &= s - 1) {
+            if (!assertHolds(@fromBackingInt(@intCast(@ctz(s))), prev, next)) return false;
+        }
+        return true;
+    }
+};
+
 /// Table capacities `Regex.compile` tries first, on the stack: every pattern
 /// short of a large counted repetition or a big case-folded class fits.
 const small_capacity: syntax.Capacity = .{ .insts = 256, .ranges = 256, .nodes = 256 };
@@ -1627,6 +1900,13 @@ pub const Matcher = struct {
     pike_only: bool = false,
     /// Tests only: the DFA from the first `find`, however short the text.
     dfa_eager: bool = false,
+    /// `captures`' one-pass engine, made with the DFA (when the program is
+    /// one-pass); `onepass_tried` once that was worked out.
+    onepass: ?*OnePass = null,
+    onepass_tried: bool = false,
+    /// Tests only: `captures` never by the one-pass engine (to test the
+    /// backtracker on long texts).
+    onepass_off: bool = false,
 
     /// Explore `pc` at `pos`, or (`restore`) put `pos` back into capture
     /// slot `pc`. A plain struct, not a tagged union: a union built on the
@@ -1699,6 +1979,10 @@ pub const Matcher = struct {
             d.deinit();
             m.gpa.destroy(d);
         }
+        if (m.onepass) |op| {
+            op.deinit();
+            m.gpa.destroy(op);
+        }
         m.bt_visited.deinit(m.gpa);
         m.bt_jobs.deinit(m.gpa);
         m.gpa.free(m.block);
@@ -1736,12 +2020,8 @@ pub const Matcher = struct {
             // text that costs more than the backtracker (measured: a
             // compile-and-find of 37 bytes 1.0 → 1.8 µs). Made once the
             // `Matcher` has been handed enough text for it to pay off.
-            m.vm_read +|= input.len - from;
-            if (m.vm_read < dfa_after and !m.dfa_eager) return null;
-            const d = m.gpa.create(FindDfa) catch return null;
-            d.* = .init(m.gpa, re);
-            m.dfa = d;
-            break :blk d;
+            if (!m.warm(input, from)) return null;
+            break :blk m.makeDfa() orelse return null;
         };
         var reach: usize = undefined;
         if (!anchored and d.skip_idle) {
@@ -1765,11 +2045,67 @@ pub const Matcher = struct {
         return .{ .start = if (anchored) from else d.start(re, input, from, end), .end = end };
     }
 
+    /// Whether the `Matcher` has been handed enough text for the DFA (and
+    /// the one-pass engine) to pay off, counting this search's.
+    fn warm(m: *Matcher, input: []const u8, from: usize) bool {
+        m.vm_read +|= input.len - from;
+        return m.vm_read >= dfa_after or m.dfa_eager;
+    }
+
+    fn makeDfa(m: *Matcher) ?*FindDfa {
+        const d = m.gpa.create(FindDfa) catch return null;
+        d.* = .init(m.gpa, m.re);
+        m.dfa = d;
+        return d;
+    }
+
     /// Like `find`, filling `out[i]` with group i's span (null: the group
     /// took no part); `out` may be shorter or longer than the group count.
     pub fn captures(m: *Matcher, input: []const u8, from: usize, out: []?Span) bool {
-        if (from > input.len or !m.run(input, from, false)) return false;
+        if (from > input.len) return false;
+        const found = m.capturesOnePass(input, from) orelse m.run(input, from, false);
+        if (!found) return false;
         m.fillCaptures(out);
+        return true;
+    }
+
+    /// `captures` by the one-pass engine (`OnePass`), the match's slots in
+    /// `best`: whether there is one, or null when the engine does not apply.
+    /// The start comes as `findDfa` finds it: from each candidate of a fast
+    /// prefilter, read anchored (the engine does it in the same pass as the
+    /// captures); otherwise by the DFAs, then the engine from that start.
+    fn capturesOnePass(m: *Matcher, input: []const u8, from: usize) ?bool {
+        const re = m.re;
+        if (m.pike_only or m.onepass_off or re.longest or re.insts.len > Dfa.max_insts) return null;
+        const anchored = re.prefilter.anchored;
+        if (anchored and from != 0) return false;
+        // As in `findDfa`: `start` would read a whole UTF-8 sequence backwards.
+        if (!anchored and from < input.len and input[from] & 0xc0 == 0x80) return null;
+        const op = m.onepass orelse blk: {
+            if (m.onepass_tried) return null;
+            if (m.dfa == null and !m.warm(input, from)) return null;
+            m.onepass_tried = true;
+            m.onepass = OnePass.make(m.gpa, re);
+            break :blk m.onepass orelse return null;
+        };
+        var reach: usize = undefined;
+        if (anchored) return op.run(re, input, 0, m.tmp, m.best, &reach);
+        const d = m.dfa orelse m.makeDfa() orelse return null;
+        if (d.skip_idle) {
+            // `findDfa`'s search from each candidate, with its budget.
+            var pos = from;
+            var spent: usize = 0;
+            while (spent <= 2 * (pos - from) + 256) {
+                const p = re.prefilter.next(input, pos) orelse return false;
+                if (op.run(re, input, p, m.tmp, m.best, &reach)) return true;
+                spent += reach - p;
+                pos = p + 1;
+            }
+        }
+        const end = (d.run(re, input, from, false, &reach) catch return null) orelse return false;
+        const start = d.start(re, input, from, end);
+        const found = op.run(re, input, start, m.tmp, m.best, &reach);
+        std.debug.assert(found and m.best[1] == end);
         return true;
     }
 
@@ -2575,6 +2911,100 @@ test "find makes its DFA only once the Matcher was handed enough text" {
     try testing.expectEqual(Span{ .start = 4, .end = 7 }, m.find("12, abc", 0).?);
 }
 
+test "captures by the one-pass engine agree with the Pike VM" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x6f70);
+    const rng = prng.random();
+    // The pattern, and whether it is one-pass (null: either).
+    const cases = [_]struct { []const u8, ?bool }{
+        .{ "INV-([0-9]{4}-[0-9]{4})", true },
+        .{ "(a+)(b*)c", true },
+        .{ "(\\w+)@(\\w+)\\.com", true },
+        .{ "\\b(\\w+)\\b", true },
+        .{ "^(\\d+)-(\\d+)$", true },
+        .{ "(?m)^(\\w+)$", true },
+        .{ "x*", true },
+        .{ "(é+)(ž|a)", true },
+        .{ "(?i)(žluť)ou", true },
+        .{ "(a)|b", true },
+        .{ "(?s)(.)(.)", true },
+        .{ "([^ ]+) (.*)", true },
+        .{ "(\\d+)?x", true },
+        // A way below the match is cut: over "b", the empty match.
+        .{ "(a?)|(b)", true },
+        // The match past `$` holds only at the end: "1-2x" has none.
+        .{ "(\\d+)-(\\d+)$", true },
+        // From each candidate of the prefilter: `\b` decides, not the DFA.
+        .{ "\\bab(c)", true },
+        .{ "(a|ab)(c|bcd)", false },
+        .{ "a*a", false },
+        .{ "a|(ab)", false },
+        .{ "(a?)(a)", false },
+        .{ "a$|ab", false },
+        // `a` is reached past `\b`, then again: where `\b` fails, the second way.
+        .{ "(\\b|)(a)", false },
+        // Whether the match past `$` cuts `b` depends on the text.
+        .{ "(a)(?:$|b)", false },
+        .{ "(a*)*b", null },
+        .{ "a\\B(b)", null },
+        .{ "(?:(a)|b)*?c", null },
+        .{ "(\\b|x)(a)", null },
+    };
+    const pieces = [_][]const u8{ "a", "b", "c", "d", " ", "\n", "é", "ž", "Ž", "_", "x", "-", "1", "2", "@", ".com", "INV-", "ou", "\xff", "\xc3" };
+    // Texts each case meets for sure, besides the random ones.
+    const fixed = [_][]const u8{ "1-2", "1-2x", "12-345\n", "ab", "b", "a b", "_a", "xa", " a", "INV-1234-5678", "x@y.com", "žluťou", "ééž", "xabc abc" };
+    var text: [3000]u8 = undefined;
+    var ga: [8]?Span = undefined;
+    var gb: [8]?Span = undefined;
+    for (cases) |cs| {
+        const p = cs[0];
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        const ng = re.names.len;
+        var m = try Matcher.init(gpa, &re);
+        defer m.deinit();
+        m.dfa_eager = true;
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        for (0..60 + fixed.len) |round| {
+            var n: usize = 0;
+            if (round >= 60) {
+                const f = fixed[round - 60];
+                @memcpy(text[0..f.len], f);
+                n = f.len;
+            } else {
+                const len = if (round % 6 == 0) text.len - 8 else rng.uintLessThan(usize, 30);
+                while (n < len) {
+                    const piece = pieces[rng.uintLessThan(usize, pieces.len)];
+                    @memcpy(text[n..][0..piece.len], piece);
+                    n += piece.len;
+                }
+            }
+            const t = text[0..n];
+            errdefer std.debug.print("/{s}/ on \"{f}\"\n", .{ p, std.zig.fmtString(t) });
+            var it = m.iterator(t);
+            var pit = pm.iterator(t);
+            while (true) {
+                const s1 = it.nextCaptures(ga[0..ng]);
+                try testing.expectEqual(pit.nextCaptures(gb[0..ng]), s1);
+                if (s1 == null) break;
+                try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
+            }
+            var from: usize = 0;
+            while (from <= t.len) : (from += if (t.len > 64) 7 else 1) {
+                errdefer std.debug.print("from {d}\n", .{from});
+                const f1 = m.captures(t, from, ga[0..ng]);
+                try testing.expectEqual(pm.captures(t, from, gb[0..ng]), f1);
+                if (f1) try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
+            }
+        }
+        errdefer std.debug.print("/{s}/ one-pass: {}\n", .{ p, m.onepass != null });
+        try testing.expect(m.onepass_tried);
+        if (cs[1]) |want| try testing.expectEqual(want, m.onepass != null);
+    }
+}
+
 test "find's DFAs (unanchored: forward for the end, backward for the start) agree with the Pike VM" {
     const gpa = testing.allocator;
     var prng: std.Random.DefaultPrng = .init(0x7266);
@@ -2644,6 +3074,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
         defer re.deinit(gpa);
         var m = try Matcher.init(gpa, &re);
         defer m.deinit();
+        m.onepass_off = true;
         var pm = try Matcher.init(gpa, &re);
         defer pm.deinit();
         pm.pike_only = true;
@@ -2683,6 +3114,7 @@ test "the backtracker and the Pike VM agree on long texts, past the bit budget a
     try testing.expect(deep.insts.len * long.len < Matcher.max_backtrack_bits); // the bits fit,
     var dm = try Matcher.init(gpa, &deep);
     defer dm.deinit();
+    dm.onepass_off = true;
     var dg: [2]?Span = undefined;
     try testing.expect(dm.captures(long, 0, &dg));
     try testing.expect(dm.bt_jobs.capacity >= Matcher.max_backtrack_jobs); // the jobs did not

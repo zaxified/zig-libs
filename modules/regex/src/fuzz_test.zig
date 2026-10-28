@@ -60,7 +60,7 @@ const fuzz_driver = testkit.fuzz.driver;
 
 /// Reach labels: the driver's `hit` (printed by `REGEX_FUZZ` runs) and a
 /// local count the in-suite test checks.
-const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match };
+const Label = enum { refused, compiled, full, matched, group, literal, posix, posix_refused, longest_ref, big, end_anchored, end_anchored_match, teddy, teddy_long, teddy_match, dfa_find, dfa_find_match, onepass, onepass_match };
 
 /// `Dfa.max_insts` in root.zig: a longer program is matched by `runSetOn`.
 const dfa_max_insts = 128;
@@ -337,6 +337,12 @@ fn crossChecks(gpa: std.mem.Allocator, re: *const regex.Regex, m: *regex.Matcher
             if ((a == null) != (b == null)) return error.EnginesDisagreeOnGroups;
             if (a) |x| if (x.start != b.?.start or x.end != b.?.end) return error.EnginesDisagreeOnGroups;
         };
+    }
+    // `m` is `dfa_eager`: its `captures` went by the one-pass engine when the
+    // program is one-pass.
+    if (m.onepass != null) {
+        hit(.onepass);
+        if (found != null) hit(.onepass_match);
     }
 
     var rbuf: [4]u8 = undefined;
