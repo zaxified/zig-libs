@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic, stack overflow or UB left
+  that a peer or caller input could drive (independent sweep of every pub entry point,
+  `~/CML/20261028-panic-sweep/mcp-sweep.report.md`). New `pub const max_json_depth = 128` and
+  `pub fn jsonDepthOk`: a string-aware bracket-depth pre-scan runs before every parse of JSON text the
+  module did not write. An inbound message nested deeper is `-32700 Parse error` (it was parsed into
+  ~1 GB of Values for a 16 MiB line of `[`); a custom method's output nested deeper is `-32603`
+  `Method result is not a JSON object` (the re-serialization recursed once per level); a tool output
+  over the cap fails `outputSchema` validation. A registered schema / `_meta` literal or elicitation
+  schema is bounded by `max_literal_depth` (`schema_check`'s 256, so every schema it compiles still
+  lists); deeper counts as "not JSON" (`tools/list` -32603, `error.SchemaNotJson`,
+  `error.InvalidMeta`). `schema_check`: failures inside discarded `anyOf`/`oneOf`/`not`/`if` branches build no
+  pointer or message (the arena grew by branches x path length). `page_size` of `maxInt(usize)` no
+  longer overflows `start + page_size`; `StateSeal.seal` saturates the expiry for any `now_sec` and
+  returns `error.OutOfMemory` for a field of 4 GiB or more (`open` answers `StateInvalid`). A
+  `writeErrorLine` / `writeResultLine` id that is not a JSON-RPC identifier (array, object, bool,
+  non-finite float) is written as `null`, and `cancelInflight` ignores one. A non-finite
+  `Annotations.priority` is omitted instead of written as invalid JSON. Tests.
 - **2026-10-24** — **SECURITY:** a tool whose input schema has `uniqueItems` could be crashed by a
   client: the item equality test recursed without a depth bound (two equal 200k-deep arrays, under
   1 MB, overflowed the stack) and its budget was charged per pair, not per node (1e9 compares inside

@@ -383,8 +383,9 @@ pub fn negotiateVersion(requested: ?[]const u8) []const u8 {
 /// Write one JSON-RPC error response as a single line: `{"jsonrpc":"2.0",
 /// "id":<id>,"error":{"code":<code>,"message":<msg>}}\n`. The id is
 /// re-serialized verbatim from its parsed Value (an integer stays an integer,
-/// a string keeps its quotes); null/absent => `null`. The message is properly
-/// JSON-escaped.
+/// a string keeps its quotes); null/absent => `null`; a value that is not a
+/// JSON-RPC identifier (array, object, bool, non-finite float) is also written
+/// as `null`, never serialized. The message is properly JSON-escaped.
 pub fn writeErrorLine(w: *std.Io.Writer, id: ?std.json.Value, code: i32, message: []const u8) std.Io.Writer.Error!void {
     try w.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeId(w, id);
@@ -411,19 +412,76 @@ pub fn writeResultLine(w: *std.Io.Writer, id: ?std.json.Value, raw_result_json: 
 /// value if included". `.number_string` is a Number that `std.json` left
 /// unparsed (it appears when `parse_numbers` is off), so it counts. Everything
 /// else — object, array, bool — is not an identifier.
+///
+/// A non-finite float (`1e999` parses to inf) has no JSON spelling, so it is
+/// not an identifier either (no-panic sweep 2026-10-28 M-6).
 fn conformingId(v: std.json.Value) bool {
     return switch (v) {
-        .string, .integer, .float, .number_string, .null => true,
+        .string, .integer, .number_string, .null => true,
+        .float => |f| std.math.isFinite(f),
         .object, .array, .bool => false,
     };
 }
 
+/// Only an identifier shape is ever echoed: anything else (an array/object, a
+/// non-finite float) is written as `null`, JSON-RPC 2.0 section 5's "id could
+/// not be determined". Never a recursive serialization of a caller/peer Value.
 fn writeId(w: *std.Io.Writer, id: ?std.json.Value) std.Io.Writer.Error!void {
-    if (id) |v| {
-        try std.json.Stringify.value(v, .{}, w);
-    } else {
-        try w.writeAll("null");
+    if (id) |v| if (conformingId(v)) return std.json.Stringify.value(v, .{}, w);
+    try w.writeAll("null");
+}
+
+/// Deepest `[`/`{` nesting the module parses or re-serializes from JSON text a
+/// peer controls: inbound messages, handler and tool output.
+/// `std.json.Stringify` recurses once per level, so unbounded depth is a stack
+/// overflow, and a deep parse costs heap per level. 128 is far above anything
+/// MCP uses (the spec's deepest payloads nest < 10); deeper text is treated as
+/// unparsable (-32700 inbound, -32603 for output).
+pub const max_json_depth: usize = 128;
+
+/// The same bound for literals the CALLER registers (tool schemas, `_meta`,
+/// elicitation schemas): `schema_check`'s compile cap, so every schema it
+/// compiles is also listable; deeper is treated as not JSON, as before.
+pub const max_literal_depth: usize = schema_check.max_depth;
+
+/// True when `text` nests at most `max_json_depth` arrays/objects.
+pub fn jsonDepthOk(text: []const u8) bool {
+    return jsonDepthWithin(text, max_json_depth);
+}
+
+fn literalDepthOk(text: []const u8) bool {
+    return jsonDepthWithin(text, max_literal_depth);
+}
+
+/// True when `text` nests at most `limit` arrays/objects. String-aware
+/// (brackets inside strings are ignored, backslash escapes honoured), O(n), no
+/// allocation; it does not validate the JSON, the parser still does.
+fn jsonDepthWithin(text: []const u8, limit: usize) bool {
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    for (text) |c| {
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[', '{' => {
+                depth += 1;
+                if (depth > limit) return false;
+            },
+            ']', '}' => depth -|= 1,
+            else => {},
+        }
     }
+    return true;
 }
 
 /// Write `data`, skipping raw \n and \r so a multi-line raw JSON literal
@@ -1192,6 +1250,7 @@ pub const SchemaError = error{
 /// 2025-11-25; this function is version-agnostic and accepts the union, so a
 /// server targeting an older client should not build one.
 pub fn validateElicitationSchema(arena: std.mem.Allocator, schema_text: []const u8) SchemaError!void {
+    if (!literalDepthOk(schema_text)) return error.SchemaNotJson;
     const root_v = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.SchemaNotJson,
@@ -2180,7 +2239,13 @@ pub const StateSeal = struct {
     };
 
     pub fn seal(self: *const StateSeal, arena: std.mem.Allocator, b: Binding, payload: []const u8, now_sec: i64, ttl_sec: u32) error{OutOfMemory}![]const u8 {
-        const expiry: u64 = @intCast(@max(0, now_sec) + ttl_sec);
+        // Saturating: `now_sec` near maxInt(i64) must not overflow (UB in
+        // ReleaseFast); the sum is >= 0, so the bit cast is the value.
+        const expiry: u64 = @bitCast(@max(@as(i64, 0), now_sec) +| @as(i64, ttl_sec));
+        // A field the MAC cannot length-prefix (>= 4 GiB) cannot be sealed.
+        if (payload.len > std.math.maxInt(u32) or b.method.len > std.math.maxInt(u32) or
+            b.target.len > std.math.maxInt(u32) or b.principal.len > std.math.maxInt(u32) or
+            b.extra.len > std.math.maxInt(u32)) return error.OutOfMemory;
         const raw = try arena.alloc(u8, header_len + payload.len);
         raw[0] = version;
         std.mem.writeInt(u64, raw[1..9], expiry, .big);
@@ -2202,6 +2267,10 @@ pub const StateSeal = struct {
         dec.decode(raw, token) catch return error.StateInvalid;
         if (raw[0] != version) return error.StateInvalid;
         var want: [Hmac.mac_length]u8 = undefined;
+        // A field >= 4 GiB is never one this seal produced.
+        if (raw.len > std.math.maxInt(u32) or b.method.len > std.math.maxInt(u32) or
+            b.target.len > std.math.maxInt(u32) or b.principal.len > std.math.maxInt(u32) or
+            b.extra.len > std.math.maxInt(u32)) return error.StateInvalid;
         self.mac(&want, b, raw[0..9], raw[header_len..]);
         if (!std.crypto.timing_safe.eql([Hmac.mac_length]u8, want, raw[9..header_len].*)) return error.StateInvalid;
         const expiry = std.mem.readInt(u64, raw[1..9], .big);
@@ -2216,7 +2285,8 @@ pub const StateSeal = struct {
         // Length-prefixed, so no two different bindings share an encoding.
         for ([_][]const u8{ b.method, b.target, b.principal, b.extra, payload }) |field| {
             var len: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len, @intCast(field.len), .big);
+            // seal/open refuse a field this long before calling (checked there).
+            std.mem.writeInt(u32, &len, @truncate(field.len), .big);
             h.update(&len);
             h.update(field);
         }
@@ -2319,7 +2389,7 @@ const ToolCheck = struct {
 
     /// `writeRawJson`'s bytes for `text`, or null when `text` is empty or not JSON.
     fn canonicalText(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?[]const u8 {
-        if (text.len == 0) return null;
+        if (text.len == 0 or !literalDepthOk(text)) return null;
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
@@ -2333,7 +2403,7 @@ const ToolCheck = struct {
     }
 
     fn compileText(arena: std.mem.Allocator, text: []const u8) error{OutOfMemory}!?schema_check.Schema {
-        if (text.len == 0) return null;
+        if (text.len == 0 or !literalDepthOk(text)) return null;
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return null,
@@ -2351,6 +2421,7 @@ const ToolCheck = struct {
 /// failure too, not a quiet text-only result. On the session path
 /// `structuredContent` is an object; a 2026-07-28 call takes any JSON value.
 fn outputFailure(arena: std.mem.Allocator, schema: *const schema_check.Schema, text: []const u8, modern: bool) error{OutOfMemory}!?[]const u8 {
+    if (!jsonDepthOk(text)) return "Output validation error: the tool declares an outputSchema but its output is not JSON";
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return "Output validation error: the tool declares an outputSchema but its output is not JSON",
@@ -3165,10 +3236,12 @@ fn writeAnnotations(jw: *std.json.Stringify, a: Annotations) std.Io.Writer.Error
         for (a.audience) |r| try jw.write(@tagName(r));
         try jw.endArray();
     }
-    if (a.priority) |pr| {
+    // NaN / inf have no JSON spelling: omitted rather than written as an
+    // invalid line (no-panic sweep 2026-10-28 M-10).
+    if (a.priority) |pr| if (std.math.isFinite(pr)) {
         try jw.objectField("priority");
         try jw.write(pr);
-    }
+    };
     if (a.last_modified) |lm| {
         try jw.objectField("lastModified");
         try jw.write(lm);
@@ -3458,6 +3531,7 @@ fn base64Alloc(arena: std.mem.Allocator, bytes: []const u8) ?[]const u8 {
 /// not one JSON object.
 fn writeMetaField(arena: std.mem.Allocator, jw: *std.json.Stringify, meta_json: []const u8) !void {
     if (meta_json.len == 0) return;
+    if (!literalDepthOk(meta_json)) return error.InvalidMeta;
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, meta_json, .{});
     if (v != .object) return error.InvalidMeta;
     try jw.objectField("_meta");
@@ -3780,6 +3854,9 @@ pub const Server = struct {
     /// response stream of a 2026-07-28 request. Returns whether a call was
     /// found.
     pub fn cancelInflight(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        // An array/object/non-finite id was never issued (and would recurse in
+        // the serializer): nothing to cancel.
+        if (!conformingId(request_id)) return false;
         var buf: [128]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         std.json.Stringify.value(request_id, .{}, &w) catch return false;
@@ -3894,6 +3971,9 @@ pub const Server = struct {
         if (req.protocol_error) |pe| return sendProtocolError(arena, out, id, pe);
         if (!ok) return sendError(arena, out, id, error_code.internal_error, "Method failed");
         const text = if (buf.items.len == 0) "{}" else buf.items;
+        // Handler output is re-serialized recursively: bound its nesting first
+        // (no-panic sweep 2026-10-28 M-2).
+        if (!jsonDepthOk(text)) return sendError(arena, out, id, error_code.internal_error, "Method result is not a JSON object");
         const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return sendError(arena, out, id, error_code.internal_error, "Method result is not a JSON object"),
@@ -4238,6 +4318,9 @@ pub const Server = struct {
         const input = std.mem.trim(u8, msg, " \t\r\n");
         if (input.len == 0) return;
 
+        // Before the parse: a 16 MiB line of `[` would otherwise build ~1 GB of
+        // Values, and a deep echo overflows the serializer (M-3).
+        if (!jsonDepthOk(input)) return sendError(arena, out, null, error_code.parse_error, "Parse error");
         const root = std.json.parseFromSliceLeaky(std.json.Value, arena, input, .{}) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return sendError(arena, out, null, error_code.parse_error, "Parse error"),
@@ -4580,6 +4663,9 @@ pub const Server = struct {
     /// Drop the open `subscriptions/listen` of `peer` whose id is
     /// `request_id` (the client cancelled it). Whether one was found.
     fn cancelListen(self: *Server, peer: u64, request_id: std.json.Value) bool {
+        // An array/object/non-finite id was never issued (and would recurse in
+        // the serializer): nothing to cancel.
+        if (!conformingId(request_id)) return false;
         var buf: [128]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         std.json.Stringify.value(request_id, .{}, &w) catch return false;
@@ -4936,7 +5022,7 @@ pub const Server = struct {
                 return sendError(arena, out, id, error_code.invalid_params, "Invalid cursor"),
             else => return sendError(arena, out, id, error_code.invalid_params, "Invalid cursor"),
         };
-        const end = if (self.page_size == 0) len else @min(len, start + self.page_size);
+        const end = if (self.page_size == 0) len else @min(len, start +| self.page_size);
 
         var aw: std.Io.Writer.Allocating = .init(arena);
         var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
@@ -5593,6 +5679,7 @@ fn buildToolResultLine(gpa: std.mem.Allocator, w: *std.Io.Writer, id: ?std.json.
 /// and `write` it, so it is validated and re-serialized in the same stream
 /// (keeping `jw`'s object/array state consistent).
 fn writeRawJson(arena: std.mem.Allocator, jw: *std.json.Stringify, raw: []const u8) !void {
+    if (!literalDepthOk(raw)) return error.SyntaxError;
     const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{});
     try jw.write(v);
 }
@@ -12230,4 +12317,160 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── no-panic sweep 2026-10-28 ───────────────────────────────────────────────
+
+/// `{"jsonrpc":"2.0","id":1,"method":<method>,"params":{"a":[[…]]}}` whose
+/// total bracket depth is exactly `depth` (outer object + params object + arrays).
+fn deepMessage(a: std.mem.Allocator, method: []const u8, depth: usize) ![]u8 {
+    var b: std.ArrayList(u8) = .empty;
+    try b.print(a, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"{s}\",\"params\":{{\"a\":", .{method});
+    for (0..depth - 2) |_| try b.append(a, '[');
+    for (0..depth - 2) |_| try b.append(a, ']');
+    try b.appendSlice(a, "}}");
+    return b.toOwnedSlice(a);
+}
+
+fn deepEchoMethod(_: ?*anyopaque, req: *MethodRequest) bool {
+    // Prints its own deep JSON (the handler output, not the peer's message).
+    req.write("{\"a\":");
+    for (0..max_json_depth) |_| req.write("[");
+    for (0..max_json_depth) |_| req.write("]");
+    req.write("}");
+    return true;
+}
+
+test "sweep 2026-10-28 M-3: message nesting over max_json_depth is a parse error, at the cap it is handled" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var s = testServer(null);
+    defer s.deinit();
+    try expectResponse(&s, try deepMessage(a, "ping", max_json_depth),
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+        \\
+    );
+    try expectResponse(&s, try deepMessage(a, "ping", max_json_depth + 1),
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+        \\
+    );
+    // Brackets inside strings (with escaped quotes) do not count.
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{\"a\":\"[[[[\\\"[[[[\"}}",
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+        \\
+    );
+    // A megabyte of `[`: refused by the scan, not parsed.
+    const bomb = try a.alloc(u8, 1 << 20);
+    @memset(bomb, '[');
+    try expectResponse(&s, bomb,
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}
+        \\
+    );
+}
+
+test "sweep 2026-10-28 M-2: a custom method whose own output nests too deep is -32603" {
+    var s = testServer(null);
+    defer s.deinit();
+    try s.addMethod(.{ .name = "acme/deep", .handler = deepEchoMethod });
+    // The handler prints depth max_json_depth + 1 (object + arrays).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"acme/deep"}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"Method result is not a JSON object"}}
+        \\
+    );
+}
+
+test "sweep 2026-10-28 M-4: page_size = maxInt does not overflow start + page_size" {
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    s.page_size = std.math.maxInt(usize);
+    inline for (.{ "a", "b", "c" }) |n| {
+        try s.addTool(.{ .name = n, .description = "", .input_schema = "{}", .handler = pageTool });
+    }
+    // "dDoy" is the cursor for position 2 (see the pagination test).
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"cursor":"dDoy"}}
+    ,
+        \\{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"c","description":"","inputSchema":{}}]}}
+        \\
+    );
+}
+
+test "sweep 2026-10-28 M-5: StateSeal.seal saturates the expiry instead of overflowing" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const seal: StateSeal = .{ .key = @splat(7) };
+    const b: StateSeal.Binding = .{ .method = "tools/call", .target = "pay" };
+    const now = std.math.maxInt(i64);
+    const tok = try seal.seal(arena, b, "x", now, std.math.maxInt(u32));
+    // Valid now; expired once the clock reaches the saturated expiry.
+    try testing.expectEqualStrings("x", try seal.open(arena, b, tok, 1000));
+    try testing.expectError(error.StateExpired, seal.open(arena, b, tok, now));
+    // A negative clock reads as 0 (as before).
+    _ = try seal.seal(arena, b, "x", std.math.minInt(i64), 5);
+}
+
+test "sweep 2026-10-28 M-6: a non-finite float id is non-conforming and never echoed" {
+    var s = testServer(null);
+    defer s.deinit();
+    // Inbound, `std.json` keeps 1e999 as a number_string (valid JSON, echoed
+    // verbatim); a non-finite `.float` only comes from a caller-built Value.
+    try testing.expect(!conformingId(.{ .float = std.math.inf(f64) }));
+    try testing.expect(!conformingId(.{ .float = std.math.nan(f64) }));
+    try testing.expect(conformingId(.{ .float = 1.5 }));
+    try expectResponse(&s, "{\"jsonrpc\":\"2.0\",\"id\":1e999,\"method\":\"ping\"}",
+        \\{"jsonrpc":"2.0","id":1e999,"result":{}}
+        \\
+    );
+    // The public encoders write null for anything that is not an identifier.
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try writeErrorLine(&aw.writer, .{ .float = std.math.inf(f64) }, -32600, "x");
+    const parsed_arr = try std.json.parseFromSlice(std.json.Value, testing.allocator, "[1]", .{});
+    defer parsed_arr.deinit();
+    try writeResultLine(&aw.writer, parsed_arr.value, "{}");
+    try testing.expectEqualStrings(
+        \\{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"x"}}
+        \\{"jsonrpc":"2.0","id":null,"result":{}}
+        \\
+    , aw.written());
+    try testing.expect(!s.cancelInflight(0, .{ .float = std.math.nan(f64) }));
+    try testing.expect(!s.cancelInflight(0, parsed_arr.value));
+}
+
+test "sweep 2026-10-28 M-10: a non-finite annotation priority is omitted, not written as invalid JSON" {
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var jw: std.json.Stringify = .{ .writer = &aw.writer, .options = .{} };
+    try jw.beginObject();
+    try writeAnnotations(&jw, .{ .priority = std.math.nan(f64), .audience = &.{.user} });
+    try jw.endObject();
+    try testing.expectEqualStrings("{\"annotations\":{\"audience\":[\"user\"]}}", aw.written());
+    aw.clearRetainingCapacity();
+    jw = .{ .writer = &aw.writer, .options = .{} };
+    try jw.beginObject();
+    try writeAnnotations(&jw, .{ .priority = std.math.inf(f64) });
+    try jw.endObject();
+    try testing.expectEqualStrings("{\"annotations\":{}}", aw.written());
+}
+
+test "sweep 2026-10-28 M-3: a registered schema or _meta literal nested too deep is 'not JSON' (-32603 on list)" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var deep: std.ArrayList(u8) = .empty;
+    for (0..max_literal_depth + 1) |_| try deep.append(a, '[');
+    for (0..max_literal_depth + 1) |_| try deep.append(a, ']');
+    var s = Server.init(testing.allocator, .{ .name = "t", .version = "0" });
+    defer s.deinit();
+    try s.addTool(.{ .name = "d", .description = "", .input_schema = deep.items, .handler = pageTool });
+    try expectResponse(&s,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+    ,
+        \\{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"failed to build tools/list"}}
+        \\
+    );
 }

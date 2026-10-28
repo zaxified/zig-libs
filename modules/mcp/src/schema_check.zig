@@ -465,8 +465,20 @@ const Checker = struct {
     arena: std.mem.Allocator,
     root: std.json.Value,
     budget: *Budget,
+    /// Inside a branch whose failure is thrown away (anyOf / oneOf / not / the
+    /// `if` condition) only "it failed" matters, so `fail` builds no pointer or
+    /// message: the arena grows with the number of REPORTED failures, not with
+    /// branches x path length (no-panic sweep 2026-10-28 M-1).
+    quiet: bool = false,
+
+    fn quieted(c: Checker) Checker {
+        var q = c;
+        q.quiet = true;
+        return q;
+    }
 
     fn fail(c: Checker, path: ?*const Path, keyword: []const u8, comptime fmt: []const u8, args: anytype) error{OutOfMemory}!?Failure {
+        if (c.quiet) return Failure{ .pointer = "", .keyword = keyword, .message = "" };
         return Failure{
             .pointer = try pointerOf(c.arena, path),
             .keyword = keyword,
@@ -674,10 +686,11 @@ const Checker = struct {
                 if (try c.apply(sub, inst, path, depth + 1, refs)) |f| return f;
             }
         };
+        const q = c.quieted();
         if (o.get("anyOf")) |l| if (l == .array) {
             var any = false;
             for (l.array.items) |sub| {
-                if (try c.apply(sub, inst, path, depth + 1, refs) == null) {
+                if (try q.apply(sub, inst, path, depth + 1, refs) == null) {
                     any = true;
                     break;
                 }
@@ -687,18 +700,18 @@ const Checker = struct {
         if (o.get("oneOf")) |l| if (l == .array) {
             var matched: usize = 0;
             for (l.array.items) |sub| {
-                if (try c.apply(sub, inst, path, depth + 1, refs) == null) matched += 1;
+                if (try q.apply(sub, inst, path, depth + 1, refs) == null) matched += 1;
             }
             if (matched == 0) return c.fail(path, "oneOf", "value matches none of the oneOf schemas", .{});
             if (matched > 1) return c.fail(path, "oneOf", "value matches {d} of the oneOf schemas, exactly one required", .{matched});
         };
         if (o.get("not")) |sub| {
-            if (try c.apply(sub, inst, path, depth + 1, refs) == null) {
+            if (try q.apply(sub, inst, path, depth + 1, refs) == null) {
                 return c.fail(path, "not", "value matches the schema it must not match", .{});
             }
         }
         if (o.get("if")) |cond| {
-            const branch = if (try c.apply(cond, inst, path, depth + 1, refs) == null) o.get("then") else o.get("else");
+            const branch = if (try q.apply(cond, inst, path, depth + 1, refs) == null) o.get("then") else o.get("else");
             if (branch) |b| {
                 if (try c.apply(b, inst, path, depth + 1, refs)) |f| return f;
             }
@@ -1070,4 +1083,43 @@ fn nested(a: std.mem.Allocator, depth: usize, _: bool) !std.json.Value {
     try text.appendSlice(a, "{}");
     for (0..depth) |_| try text.append(a, '}');
     return std.json.parseFromSliceLeaky(std.json.Value, a, text.items, .{});
+}
+
+test "sweep 2026-10-28 M-1: discarded anyOf/oneOf/not/if failures build no pointer strings" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const key = try a.alloc(u8, 64 * 1024);
+    @memset(key, 'k');
+    // 20 branches each failing at `/<64 KiB key>`, in every discarding keyword.
+    var branches: std.ArrayList(u8) = .empty;
+    for (0..20) |i| {
+        if (i != 0) try branches.append(a, ',');
+        try branches.print(a, "{{\"properties\":{{\"{s}\":{{\"type\":\"string\"}}}}}}", .{key});
+    }
+    const inst_text = try std.fmt.allocPrint(a, "{{\"{s}\":1}}", .{key});
+    const inst = try std.json.parseFromSliceLeaky(std.json.Value, a, inst_text, .{});
+    for ([_][]const u8{ "anyOf", "oneOf" }) |kw| {
+        const schema_text = try std.fmt.allocPrint(a, "{{\"{s}\":[{s}]}}", .{ kw, branches.items });
+        var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer scratch.deinit();
+        const sv = try std.json.parseFromSliceLeaky(std.json.Value, scratch.allocator(), schema_text, .{});
+        const s = try Schema.compile(scratch.allocator(), sv);
+        var out: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer out.deinit();
+        const f = (try s.validate(out.allocator(), inst)).?;
+        try testing.expectEqualStrings(kw, f.keyword);
+        try testing.expectEqualStrings("", f.pointer);
+        try testing.expect(out.queryCapacity() < 16 * 1024);
+    }
+    // `not` and `if`: one discarded branch each; the verdicts are unchanged.
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const not_text = try std.fmt.allocPrint(a, "{{\"not\":{{\"properties\":{{\"{s}\":{{\"type\":\"integer\"}}}}}}}}", .{key});
+    const ns = try Schema.compile(a, try std.json.parseFromSliceLeaky(std.json.Value, a, not_text, .{}));
+    try testing.expectEqualStrings("not", (try ns.validate(out.allocator(), inst)).?.keyword);
+    const if_text = try std.fmt.allocPrint(a, "{{\"if\":{{\"properties\":{{\"{s}\":{{\"type\":\"string\"}}}}}},\"else\":{{\"required\":[\"zz\"]}}}}", .{key});
+    const is = try Schema.compile(a, try std.json.parseFromSliceLeaky(std.json.Value, a, if_text, .{}));
+    try testing.expectEqualStrings("required", (try is.validate(out.allocator(), inst)).?.keyword);
+    try testing.expect(out.queryCapacity() < 16 * 1024);
 }
