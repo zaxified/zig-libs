@@ -141,7 +141,7 @@ var tm_ready = false;
 var in_buf: [Client.min_buffer_len]u8 = undefined;
 var read_buf: [Client.min_buffer_len]u8 = undefined;
 var write_buf: [Client.min_buffer_len]u8 = undefined;
-var out_buf: [8192]u8 = undefined;
+var out_buf: [Client.min_buffer_len]u8 = undefined; // a Discarding output must hold a record (init: BufferTooSmall)
 var sink: Client = undefined;
 var info_storage: [16 * 1024]u8 = undefined;
 var info: Client.ConnectionInfo = undefined;
@@ -939,8 +939,12 @@ test "a handshake record shorter than a message header or empty is a decode_erro
     // beyond the (zero-length) slice; 3 octets read cleartext[1..][0..3].
     try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{}));
     try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0 }));
-    // A second message with a truncated header after a valid KeyUpdate.
-    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x18, 0, 0, 1, 0, 0x18, 0 }));
+    // A second message with a truncated header after a (here empty, so
+    // ignored) NewSessionTicket.
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsDecodeError), try postHandshakeRecordError(&.{ 0x04, 0, 0, 0, 0x18, 0 }));
+    // Anything after a KeyUpdate in its record: RFC 8446 §5.1, messages do
+    // not span a key change (no-panic sweep 2026-10-28, F8).
+    try testing.expectEqual(@as(?Client.ReadError, error.TlsUnexpectedMessage), try postHandshakeRecordError(&.{ 0x18, 0, 0, 1, 0, 0x18, 0 }));
 }
 
 fn makeTls12() void {

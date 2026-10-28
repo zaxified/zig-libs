@@ -109,7 +109,9 @@ pub const ClientSession = struct {
     /// Whether the ticket may be offered at `now_ms` (lifetime, leaf expiry).
     pub fn fresh(s: *const ClientSession, now_ms: i64) bool {
         if (!s.usable) return false;
-        const age_ms = now_ms - s.received_ms;
+        // Checked: an extreme caller clock against a stored `received_ms`
+        // overflowed the subtraction (no-panic sweep 2026-10-28).
+        const age_ms = std.math.sub(i64, now_ms, s.received_ms) catch return false;
         if (age_ms < 0 or age_ms >= @as(i64, s.ticket_lifetime_s) * 1000) return false;
         return @divFloor(now_ms, 1000) < s.leaf_not_after_s;
     }
@@ -181,6 +183,15 @@ pub const SessionCache = struct {
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "ClientSession.fresh: an extreme clock is not fresh, not an overflow (sweep 2026-10-28)" {
+    var s: ClientSession = .{ .usable = true, .ticket_lifetime_s = max_lifetime_s, .received_ms = -1 };
+    try testing.expect(!s.fresh(std.math.maxInt(i64)));
+    s.received_ms = 1;
+    try testing.expect(!s.fresh(std.math.minInt(i64)));
+    s.received_ms = 0;
+    try testing.expect(s.fresh(1));
+}
 
 test "SessionCache: one entry per key, the oldest replaced, generations move" {
     var storage: [2]ClientSession = undefined;

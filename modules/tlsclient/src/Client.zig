@@ -43,7 +43,8 @@ const array = tls.array;
 /// The encrypted stream from the server to the client. Bytes are pulled from
 /// here via `reader`.
 ///
-/// The buffer is asserted to have capacity at least `min_buffer_len`.
+/// Its buffer must hold at least `min_buffer_len` bytes (`init`:
+/// `error.BufferTooSmall`).
 input: *Reader,
 /// Decrypted stream from the server to the client.
 reader: Reader,
@@ -51,7 +52,8 @@ reader: Reader,
 /// The encrypted stream from the client to the server. Bytes are pushed here
 /// via `writer`.
 ///
-/// The buffer is asserted to have capacity at least `min_buffer_len`.
+/// Its buffer must hold at least `min_buffer_len` bytes, or grow to it on
+/// rebase as `Writer.Allocating` does (`init`: `error.BufferTooSmall`).
 output: *Writer,
 /// The plaintext stream from the client to the server.
 writer: Writer,
@@ -163,7 +165,13 @@ pub const Options = struct {
             bundle: *Certificate.Bundle,
         },
     },
+    /// Plaintext buffered before it is sealed into records (any size).
     write_buffer: []u8,
+    /// Decrypted plaintext: at least `tls.max_ciphertext_len` bytes, so the
+    /// largest record fits (`init`: `error.BufferTooSmall`). A `peek`/`fill`
+    /// of more than `read_buffer.len - tls.max_ciphertext_len` bytes may meet
+    /// a record with no room left: `error.ReadFailed`, `read_err`
+    /// `TlsRecordOverflow`.
     read_buffer: []u8,
     /// Cryptographically secure random bytes. The pointer is not captured; data is only
     /// read during `init`.
@@ -258,7 +266,9 @@ pub const Options = struct {
     /// as a PSK (psk_dhe_ke: a fresh ECDHE still runs; no 0-RTT). Needs
     /// `host = .explicit` (the cache key). A resumed handshake has no
     /// Certificate message; the session view shows the chain kept with the
-    /// ticket.
+    /// ticket. Borrowed for the connection: the cache must outlive every
+    /// `Client` made with it (NewSessionTickets are stored into it while
+    /// reading), and clients on several threads need its `lock`.
     session_cache: ?*SessionCache = null,
 
     pub const entropy_len = 240;
@@ -646,13 +656,22 @@ pub const InitError = error{
     ConnectionInfoRequired,
     /// `verify_connection` refused the server.
     TlsConnectionRejected,
+    /// `realtime_now` past what an i64 of milliseconds holds (about 292
+    /// million years either side of 1970).
+    RealtimeInvalid,
 } || std.Io.Writer.Error || std.Io.Reader.ShortError || std.Io.Cancelable;
 
 /// Initiates a TLS handshake and establishes a TLSv1.2 or TLSv1.3 session.
 ///
 /// `host` is only borrowed during this function call.
 ///
-/// `input` is asserted to have buffer capacity at least `min_buffer_len`.
+/// `input` and `output` need buffer capacity of at least `min_buffer_len`
+/// (see the fields); a smaller one is `error.BufferTooSmall`.
+///
+/// Stack: the handshake runs about 296 KiB deep and the dead-stack burn then
+/// zeroes 384 KiB below the caller (`burn.init_burn`), so the calling thread
+/// needs roughly 400 KiB of free stack; a smaller one (a fibre, a thread
+/// spawned with a small `stack_size`) overflows it.
 ///
 /// std's shape, kept for drop-in use. The returned `Client` holds the
 /// application traffic secrets and keys, and returning it by value leaves a
@@ -680,7 +699,14 @@ fn initIntoBody(out: *Client, input: *Reader, output: *Writer, options: Options)
 }
 
 fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client {
-    assert(input.buffer.len >= min_buffer_len);
+    // zig-libs tlsclient: std asserted the input capacity (UB in
+    // ReleaseFast) and met a too-small output only at the first record
+    // (no-panic sweep 2026-10-28).
+    if (input.buffer.len < min_buffer_len or outputTooSmall(output)) return error.BufferTooSmall;
+    // A record's plaintext is decrypted into `read_buffer`: one that cannot
+    // hold the largest failed every big enough record with TlsRecordOverflow,
+    // an empty one also tripped std Reader asserts (sweep 2026-10-28, F6).
+    if (options.read_buffer.len < max_ciphertext_len) return error.BufferTooSmall;
     const host = switch (options.host) {
         .no_verification => "",
         .explicit => |host| host,
@@ -726,7 +752,10 @@ fn initBody(input: *Reader, output: *Writer, options: Options) InitError!Client 
     };
     // zig-libs tlsclient: TLS 1.3 resumption -- a fresh ticket for this
     // host is offered as a PSK (copied out under the cache lock).
-    const now_ms: i64 = @intCast(@divFloor(options.realtime_now.nanoseconds, std.time.ns_per_ms));
+    // zig-libs tlsclient: a caller's clock outside i64 milliseconds failed
+    // this cast, and std's `Timestamp.toSeconds` in the chain checks
+    // (no-panic sweep 2026-10-28).
+    const now_ms: i64 = std.math.cast(i64, @divFloor(options.realtime_now.nanoseconds, std.time.ns_per_ms)) orelse return error.RealtimeInvalid;
     var offer: ?ResumeOffer = null;
     if (options.session_cache) |cache| if (host.len != 0 and options.max_version == .tls_1_3) {
         cache.acquire();
@@ -2472,10 +2501,26 @@ fn writeHandshakeRecords(comptime P: type, output: *Writer, parts: []const []con
     crypto.secureZero(u8, all[0..n]);
 }
 
+/// zig-libs tlsclient: room in `output` for at least one full record. std's
+/// `writableSliceGreedy` asserts the capacity after a rebase that cannot grow
+/// the buffer (`defaultRebase`, e.g. a socket writer), so an `output` with a
+/// buffer under `min_buffer_len` was a panic, UB in ReleaseFast; it is
+/// `error.WriteFailed` here (`init` refuses it up front as BufferTooSmall).
+fn outputSlice(output: *Writer) Writer.Error![]u8 {
+    if (outputTooSmall(output)) return error.WriteFailed;
+    return output.writableSliceGreedy(min_buffer_len);
+}
+
+/// An `output` whose buffer can never hold a full record: too small and not
+/// grown by its rebase (a growing writer, `Writer.Allocating`, is fine).
+fn outputTooSmall(output: *const Writer) bool {
+    return output.buffer.len < min_buffer_len and output.vtable.rebase == &Writer.defaultRebase;
+}
+
 fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
     const c: *Client = @alignCast(@fieldParentPtr("writer", w));
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+    const ciphertext_buf = try outputSlice(output);
     var ciphertext_end: usize = 0;
     var total_clear: usize = 0;
     done: {
@@ -2505,12 +2550,11 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
 }
 
 fn flush(w: *Writer) Writer.Error!void {
-    const c: *Client = @alignCast(@fieldParentPtr("writer", w));
-    const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
-    const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
-    output.advance(prepared.ciphertext_end);
-    w.end = 0;
+    // zig-libs tlsclient: every buffered byte, record by record. std sealed
+    // what fit `output`'s free space once and then cleared the buffer, so a
+    // `write_buffer` larger than that lost the rest without an error (no-panic
+    // sweep 2026-10-28).
+    while (w.end != 0) _ = try drain(w, &.{""}, 1);
 }
 
 /// Sends a `close_notify` alert, which is necessary for the server to
@@ -2519,7 +2563,7 @@ fn flush(w: *Writer) Writer.Error!void {
 pub fn end(c: *Client) Writer.Error!void {
     try flush(&c.writer);
     const output = c.output;
-    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+    const ciphertext_buf = try outputSlice(output);
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
     output.advance(prepared.ciphertext_end);
 }
@@ -2833,6 +2877,12 @@ fn readIndirect(c: *Client) Reader.Error!usize {
                         // Both before any key or sequence number is switched.
                         if (c.tls_version != .tls_1_3) return failRead(c, error.TlsUnexpectedMessage);
                         if (handshake.len != 1) return failRead(c, error.TlsDecodeError);
+                        // zig-libs tlsclient: RFC 8446 §5.1 -- handshake messages
+                        // MUST NOT span a key change, so a KeyUpdate ends its
+                        // record (unexpected_message; Go refuses it too). It
+                        // also bounds the work: a 16 KiB record held ~3,270
+                        // KeyUpdates, three HKDF expansions each (sweep F8).
+                        if (next_handshake_i != cleartext.len) return failRead(c, error.TlsUnexpectedMessage);
                         switch (c.application_cipher) {
                             inline else => |*p| {
                                 const pv = &p.tls_1_3;
@@ -3794,6 +3844,142 @@ test "writeHandshakeRecords: over 2^14 - 1 bytes splits into records with sequen
     }
     try std.testing.expectEqual(@as(u64, 2), seq);
     try std.testing.expectEqualSlices(u8, &payload, got[0..n]);
+}
+
+/// A TLS 1.3 client past its handshake (AES-128-GCM, fixed keys) writing
+/// into `output` from `write_buffer` and decrypting into `read_buffer`.
+fn testAppClient(input: *Reader, output: *Writer, write_buffer: []u8, read_buffer: []u8) Client {
+    return .{
+        .input = input,
+        .reader = .{ .buffer = read_buffer, .vtable = &.{ .stream = stream, .readVec = readVec }, .seek = 0, .end = 0 },
+        .output = output,
+        .writer = .{ .buffer = write_buffer, .vtable = &.{ .drain = drain, .flush = flush } },
+        .tls_version = .tls_1_3,
+        .read_seq = 0,
+        .write_seq = 0,
+        .received_close_notify = false,
+        .allow_truncation_attacks = false,
+        .application_cipher = .{ .AES_128_GCM_SHA256 = .{ .tls_1_3 = .{
+            .client_secret = @splat(1),
+            .server_secret = @splat(2),
+            .client_key = @splat(3),
+            .server_key = @splat(4),
+            .client_iv = @splat(5),
+            .server_iv = @splat(6),
+        } } },
+        .ssl_key_log = null,
+    };
+}
+
+test "flush: a write_buffer larger than output's room goes out whole (sweep 2026-10-28)" {
+    // `output` drains to nowhere and holds one record at a time, as a
+    // socket writer with a `min_buffer_len` buffer does. std sealed one
+    // record on flush and dropped the rest of the 40,000 bytes.
+    var in_buf: [0]u8 = undefined;
+    var input: Reader = .fixed(&in_buf);
+    var out_buf: [min_buffer_len]u8 = undefined;
+    var dw: Writer.Discarding = .init(&out_buf);
+    var write_buf: [64 * 1024]u8 = undefined;
+    var c = testAppClient(&input, &dw.writer, &write_buf, &.{});
+    const payload: [40_000]u8 = @splat('x');
+    try c.writer.writeAll(&payload);
+    try c.writer.flush();
+    // Every plaintext byte went out: each record adds a 5-byte header, the
+    // inner content type and a 16-byte tag (records also fill the room left
+    // after a full one, so there are more than the minimal three).
+    try std.testing.expectEqual(@as(usize, 0), c.writer.end);
+    try std.testing.expect(c.write_seq >= 3);
+    try std.testing.expectEqual(@as(u64, payload.len + c.write_seq * (5 + 1 + 16)), dw.fullCount());
+}
+
+test "init: input or output buffer under min_buffer_len is BufferTooSmall, not an assert (sweep 2026-10-28)" {
+    var entropy: [Options.entropy_len]u8 = @splat(7);
+    var small: [64]u8 = undefined;
+    var big_in: [min_buffer_len]u8 = undefined;
+    var big_out: [min_buffer_len]u8 = undefined;
+    var buf: [64]u8 = undefined;
+    var rbuf: [max_ciphertext_len]u8 = undefined;
+    const opts: Options = .{ .host = .no_verification, .ca = .no_verification, .write_buffer = &buf, .read_buffer = &rbuf, .entropy = &entropy, .realtime_now = .zero };
+    {
+        var input: Reader = .fixed(&small);
+        var dw: Writer.Discarding = .init(&big_out);
+        try std.testing.expectError(error.BufferTooSmall, init(&input, &dw.writer, opts));
+    }
+    {
+        // A socket-like writer (its rebase drains, never grows) with a small
+        // buffer; std's greedy slice asserted on it at the first record.
+        var input: Reader = .fixed(&big_in);
+        var dw: Writer.Discarding = .init(&small);
+        try std.testing.expectError(error.BufferTooSmall, init(&input, &dw.writer, opts));
+        // The same writer after init: WriteFailed, not an assert.
+        var c = testAppClient(&input, &dw.writer, &buf, &.{});
+        try c.writer.writeAll("hi");
+        try std.testing.expectError(error.WriteFailed, c.writer.flush());
+    }
+    {
+        // A read_buffer one byte short of the largest record's plaintext.
+        var input: Reader = .fixed(&big_in);
+        var dw: Writer.Discarding = .init(&big_out);
+        var o = opts;
+        o.read_buffer = rbuf[0 .. rbuf.len - 1];
+        try std.testing.expectError(error.BufferTooSmall, init(&input, &dw.writer, o));
+        o.read_buffer = &.{};
+        try std.testing.expectError(error.BufferTooSmall, init(&input, &dw.writer, o));
+    }
+    {
+        // A growing writer starts empty and is fine; the handshake then
+        // fails on the empty input, past the buffer checks.
+        var input: Reader = .fixed(&big_in);
+        input.end = 0;
+        var aw: Writer.Allocating = .init(std.testing.allocator);
+        defer aw.deinit();
+        try std.testing.expectError(error.TlsConnectionTruncated, init(&input, &aw.writer, opts));
+    }
+}
+
+test "KeyUpdate: one ends its record; a message after it in the same record is unexpected_message (RFC 8446 §5.1, sweep 2026-10-28)" {
+    const A = crypto.aead.aes_gcm.Aes128Gcm;
+    const ku = [_]u8{ @backingInt(tls.HandshakeType.key_update), 0, 0, 1, 0 };
+    for ([_]usize{ 1, 2 }) |count| {
+        // One record from the server (key 4.., iv 6.., sequence 0) holding
+        // `count` KeyUpdates.
+        var inner: [2 * ku.len + 1]u8 = undefined;
+        for (0..count) |i| @memcpy(inner[i * ku.len ..][0..ku.len], &ku);
+        inner[count * ku.len] = @backingInt(tls.ContentType.handshake);
+        const pt = inner[0 .. count * ku.len + 1];
+        var rec: [5 + inner.len + A.tag_length]u8 = undefined;
+        rec[0..5].* = .{ @backingInt(tls.ContentType.application_data), 3, 3, 0, @intCast(pt.len + A.tag_length) };
+        A.encrypt(rec[5..][0..pt.len], rec[5 + pt.len ..][0..A.tag_length], pt, rec[0..5], @splat(6), @splat(4));
+        var input: Reader = .fixed(rec[0 .. 5 + pt.len + A.tag_length]);
+        var out_buf: [min_buffer_len]u8 = undefined;
+        var dw: Writer.Discarding = .init(&out_buf);
+        var read_buf: [max_ciphertext_len]u8 = undefined;
+        var c = testAppClient(&input, &dw.writer, &.{}, &read_buf);
+        const key_before = c.application_cipher.AES_128_GCM_SHA256.tls_1_3.server_key;
+        if (count == 1) {
+            try std.testing.expectEqual(@as(usize, 0), try readIndirect(&c));
+            try std.testing.expect(!mem.eql(u8, &key_before, &c.application_cipher.AES_128_GCM_SHA256.tls_1_3.server_key));
+        } else {
+            try std.testing.expectError(error.ReadFailed, readIndirect(&c));
+            try std.testing.expectEqual(@as(?ReadError, error.TlsUnexpectedMessage), c.read_err);
+            // Refused before any key was switched.
+            try std.testing.expectEqualSlices(u8, &key_before, &c.application_cipher.AES_128_GCM_SHA256.tls_1_3.server_key);
+        }
+    }
+}
+
+test "init: a realtime_now outside i64 milliseconds is RealtimeInvalid (sweep 2026-10-28)" {
+    var entropy: [Options.entropy_len]u8 = @splat(7);
+    var in_buf: [min_buffer_len]u8 = undefined;
+    var input: Reader = .fixed(&in_buf);
+    var out_buf: [min_buffer_len]u8 = undefined;
+    var dw: Writer.Discarding = .init(&out_buf);
+    var buf: [64]u8 = undefined;
+    var rbuf: [max_ciphertext_len]u8 = undefined;
+    for ([_]i96{ std.math.maxInt(i96), std.math.minInt(i96) }) |ns| {
+        const opts: Options = .{ .host = .no_verification, .ca = .no_verification, .write_buffer = &buf, .read_buffer = &rbuf, .entropy = &entropy, .realtime_now = .{ .nanoseconds = ns } };
+        try std.testing.expectError(error.RealtimeInvalid, init(&input, &dw.writer, opts));
+    }
 }
 
 test "encryptedExtensionsAlpn: one answer, or none; twice is refused" {
