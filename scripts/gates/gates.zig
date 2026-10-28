@@ -1090,12 +1090,19 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
             .measured => |p| if (p.day < toolchain_day) "re-measure due" else "current",
             else => "-",
         };
-        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
-            g.cell(b),       m.name,
-            g.profile,       if (g.limits.len > 0) g.limits else "-",
-            scope_line,      audit_line,
-            mat.current_src, fresh,
-            perf_toolchain,  if (mat.consumer) "consumer" else "-",
+        // See `Maturity.panic`.
+        const panic_sweep = switch (mat.panic) {
+            .dated => "swept",
+            .na => "n/a",
+            else => if (g.n <= 2) "panic sweep due" else "-",
+        };
+        lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
+            g.cell(b),                             m.name,
+            g.profile,                             if (g.limits.len > 0) g.limits else "-",
+            scope_line,                            audit_line,
+            mat.current_src,                       fresh,
+            perf_toolchain,                        panic_sweep,
+            if (mat.consumer) "consumer" else "-",
         }) }) catch @panic("OOM");
     }
     if (failed) return step.fail("maturity-report: a module's maturity card is missing or malformed (logged above)", .{});
@@ -1107,7 +1114,7 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
     }.lt);
     var buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
-    try stdout.interface.writeAll("grade\tmodule\tprofile\tlimited by\tscope\taudit\tsrc now\tsrc fresh\tP toolchain\tconsumer\n");
+    try stdout.interface.writeAll("grade\tmodule\tprofile\tlimited by\tscope\taudit\tsrc now\tsrc fresh\tP toolchain\tpanic sweep\tconsumer\n");
     for (lines.items) |l| try stdout.interface.writeAll(l.text);
     try stdout.interface.flush();
 }
@@ -2549,6 +2556,14 @@ const Maturity = struct {
     current_src: []const u8,
     fuzz: Hardening,
     ct: Hardening,
+    /// The no-panic sweep (owner, 2026-10-28): every pub entry point checked
+    /// that data and limits surface as errors (accepted means it works, in
+    /// bounded memory and time) and that no caller-contract check is an
+    /// `assert`/`unreachable` (UB in ReleaseFast). `.none` = not swept yet.
+    /// A condition of grade 1-2, queued: `maturity-report` lists it as
+    /// `panic sweep due` and it does not cap the grade until every grade 1-2
+    /// module is swept.
+    panic: Hardening,
     perf: Perf,
     /// Class C/D only (no outside truth exists, so the anchor's oracle is `n/a`).
     evidence_cd: ?EvidenceCD,
@@ -2886,15 +2901,23 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
     }
 
     const hard_line = maturityLine(name, path, src, "**Hardening:** ") orelse return null;
-    const hard_usage = "expected `fuzz <YYYY-MM-DD [(…)]|?|none|n/a — why> · ct <YYYY-MM-DD [(…)]|?|none|n/a — why>`";
+    const hard_usage = "expected `fuzz <YYYY-MM-DD [(…)]|?|none|n/a — why> · ct <YYYY-MM-DD [(…)]|?|none|n/a — why> [· panic <YYYY-MM-DD [(…)]|n/a — why>]`";
     const ct_at = std.mem.find(u8, hard_line, " · ct ");
     if (!std.mem.startsWith(u8, hard_line, "fuzz ") or ct_at == null) {
         std.log.err("module '{s}': {s} `**Hardening:** {s}` -- {s}", .{ name, path, hard_line, hard_usage });
         return null;
     }
+    // The optional third item, `panic`, is the no-panic sweep (see
+    // `Maturity.panic`); it closes the `ct` value when present.
+    const panic_at = std.mem.findPos(u8, hard_line, ct_at.?, " · panic ");
     const fuzz = parseHardening(hard_line["fuzz ".len..ct_at.?]);
-    const ct = parseHardening(hard_line[ct_at.? + " · ct ".len ..]);
-    if (fuzz == null or ct == null) {
+    const ct = parseHardening(hard_line[ct_at.? + " · ct ".len .. panic_at orelse hard_line.len]);
+    const panic_sweep: ?Hardening = if (panic_at) |at| parseHardening(hard_line[at + " · panic ".len ..]) else .none;
+    if (panic_sweep) |p| if (p == .unknown) {
+        std.log.err("module '{s}': {s} `**Hardening:**` -- `panic ?` is not a sweep record: give its date, or leave the item out until it runs", .{ name, path });
+        return null;
+    };
+    if (fuzz == null or ct == null or panic_sweep == null) {
         std.log.err("module '{s}': {s} `**Hardening:** {s}` -- {s}", .{ name, path, hard_line, hard_usage });
         return null;
     }
@@ -2973,6 +2996,7 @@ fn moduleMaturity(b: *Build, io: std.Io, name: []const u8) ?Maturity {
         .current_src = moduleSrcHash(b, io, name) orelse return null,
         .fuzz = fuzz.?,
         .ct = ct.?,
+        .panic = panic_sweep.?,
         .perf = perf,
         .evidence_cd = evidence_cd,
         .live_oracle = live,

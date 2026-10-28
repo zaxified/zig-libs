@@ -68,6 +68,12 @@
                  `?` (done, not recorded), `none`, or `n/a — <why>` (refused for
                  fuzz when the module has a harness). 1 = every applicable item
                  dated · 3 = some · 4 = none · all n/a = no cap.
+                 Optional third item `panic <YYYY-MM-DD [(…)]|n/a — <why>>`: the
+                 no-panic sweep (CONVENTIONS.md §8) — data and limits are errors
+                 at the API boundary, a caller-contract check is never an
+                 `assert`/`unreachable`. Required for grade 1–2 once every such
+                 module is swept; until then `maturity-report` lists the missing
+                 ones as `panic sweep due` and the grade is unaffected.
      Performance (P) — worst-workload time ratios, ours/theirs, lower is better:
                  `ref <x>× <impl> · fastest <y>× <impl> (measured YYYY-MM-DD)`;
                  `fastest ?` when the fastest in the field is not measured,

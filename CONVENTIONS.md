@@ -956,6 +956,23 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   a big feature landed — except where v2 made age mechanical: the audit's source hash, the
   lead's measurement date and the survey date. `zig build maturity-report` is the
   maintainer's list for the rest, worst first.
+  **No consumer-reachable panic (owner, 2026-10-28) — a condition of grade 1–2.** A consumer
+  must not be able to end their application in a panic, UB or OOM through a module, in any
+  setting the API accepts. Four classes: (1) **data and limits** (untrusted bytes, patterns,
+  sizes read from a header) are always an error at the API boundary, and whatever the API
+  accepted works through every entry point in bounded memory and time — regex refuses an
+  oversize program at `compile` rather than panic in `isMatch`; (2) **caller-contract
+  violations** (index out of range, short scratch, empty buffer, conflicting options) are never
+  UB: the function is made total where that costs nothing, otherwise a checked `@panic` with a
+  message, documented — never `std.debug.assert`/`unreachable` on a value the caller passes,
+  which is UB in ReleaseFast; (3) **internal invariants** stay `assert`/`unreachable`, covered
+  by fuzz and mutation; (4) **OOM** already surfaces as `error.OutOfMemory`, so the risk is
+  data-driven unbounded growth, which is class 1. An error for every bad argument is NOT the
+  rule: a caller cannot handle its own bug, writes `catch unreachable`, and is back at UB. The
+  sweep (every pub entry point, every `@intCast`/`unreachable`/`assert` on a consumer path, by
+  an independent reviewer) is recorded as `· panic <date>` on the Hardening line. Rolled out as
+  a queue: `maturity-report` lists `panic sweep due`; the grade is capped only once every
+  grade 1–2 module is swept.
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.
