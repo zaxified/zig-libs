@@ -226,7 +226,10 @@ pub const ConnectionLimiter = struct {
     /// `Options.on_connect` with `Options.on_connect_ctx = &limiter`.
     /// Rejection closes the socket without a byte written or a task spawned.
     pub fn onConnect(ctx: ?*anyopaque, peer: std.Io.net.IpAddress) http.Server.ConnDecision {
-        const cl: *ConnectionLimiter = @ptrCast(@alignCast(ctx.?));
+        // `on_connect_ctx` left null (no-panic sweep 2026-10-28, RL-2): `.?`
+        // was UB in ReleaseFast.
+        const cl: *ConnectionLimiter = @ptrCast(@alignCast(ctx orelse
+            @panic("ratelimit: onConnect needs Options.on_connect_ctx = &the ConnectionLimiter")));
         const ip: netaddr.Ip = switch (peer) {
             .ip4 => |a| .{ .v4 = a.bytes },
             .ip6 => |a| .{ .v6 = a.bytes },

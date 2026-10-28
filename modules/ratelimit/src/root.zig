@@ -203,9 +203,10 @@ pub const TokenBucket = struct {
     last_event_ns: u64 = 0,
 
     pub const Config = struct {
-        /// Sustained refill, tokens per second. Must be > 0 and finite.
+        /// Sustained refill, tokens per second. Must be > 0 and finite
+        /// (`allowNAt`/`reserveNAt` panic otherwise, in every build mode).
         rate_per_s: f64,
-        /// Bucket capacity — the burst allowance. Must be ≥ 1.
+        /// Bucket capacity — the burst allowance. Must be ≥ 1 (same check).
         burst: u32,
     };
 
@@ -225,7 +226,7 @@ pub const TokenBucket = struct {
     /// `AllowN`): all `n` are taken, or none. `n > burst` can never pass;
     /// `n == 0` passes unless reservations hold the balance below zero.
     pub fn allowNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32) Decision {
-        std.debug.assert(cfg.rate_per_s > 0 and cfg.burst >= 1);
+        checkConfig(cfg);
         const allowed = b.takeNAt(cfg, now_ns, n);
         return decision(cfg, n, allowed, b.tokens);
     }
@@ -266,7 +267,7 @@ pub const TokenBucket = struct {
     /// when `n > burst` or the wait would exceed `max_wait_ns`
     /// (`std.math.maxInt(u64)`: no limit).
     pub fn reserveNAt(b: *TokenBucket, cfg: Config, now_ns: u64, n: u32, max_wait_ns: u64) Reservation {
-        std.debug.assert(cfg.rate_per_s > 0 and cfg.burst >= 1);
+        checkConfig(cfg);
         b.advanceAt(cfg, now_ns);
         if (n > cfg.burst) return .{ .ok = false };
         const left = b.tokens - @as(f64, @floatFromInt(n));
@@ -356,6 +357,13 @@ fn configError(rate_per_s: ?f64, burst: ?u32) ?[]const u8 {
     if (rate_per_s) |r| if (!validRate(r)) return "ratelimit: rate_per_s must be > 0 and finite";
     if (burst) |b| if (b < 1) return "ratelimit: burst must be >= 1";
     return null;
+}
+
+/// The caller's `cfg` checked in every build mode, as `Limiter.init` checks
+/// its options: an `assert` here was UB in ReleaseFast on a config the
+/// caller passes (no-panic sweep 2026-10-28, RL-1).
+fn checkConfig(cfg: TokenBucket.Config) void {
+    if (configError(cfg.rate_per_s, cfg.burst)) |msg| @panic(msg);
 }
 
 /// floor(tokens) as a count, 0 for a negative balance.
@@ -849,7 +857,10 @@ fn lockSpin(m: *std.atomic.Mutex) void {
 }
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
-    const l: *Limiter = @ptrCast(@alignCast(state.?));
+    // A hand-built `router.Middleware` without `state` (no-panic sweep
+    // 2026-10-28, RL-2): `.?` was UB in ReleaseFast.
+    const l: *Limiter = @ptrCast(@alignCast(state orelse
+        @panic("ratelimit: the middleware needs state = the Limiter (use Limiter.middleware())")));
     var peer_buf: [peer_key_len_max]u8 = undefined; // outlives the allow call; the store copies
     const decision = l.allow(keyOf(l, ctx, &peer_buf));
     if (decision.allowed) return next.run(ctx);
