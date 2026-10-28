@@ -122,6 +122,67 @@ pub const Teddy = struct {
     }
 };
 
+/// A set of first bytes (`Prefilter.first`), scanned 32 positions at a time
+/// by Teddy's two nibble tables over one byte ("shufti", from Hyperscan):
+/// the high nibbles whose low-nibble sets are equal share a bucket, at most
+/// eight, so a byte is in the set exactly when `lo[low] & hi[high] != 0`.
+pub const ByteSet = struct {
+    lo: [16]u8,
+    hi: [16]u8,
+
+    /// Null for more than eight distinct low-nibble sets, or without vpshufb
+    /// (the portable lookup is slower than the plain loop it replaces).
+    pub fn build(set: [4]u64) ?ByteSet {
+        if (!has_avx2) return null;
+        var masks: [8]u16 = undefined;
+        var n: u8 = 0;
+        var bs: ByteSet = .{ .lo = @splat(0), .hi = @splat(0) };
+        for (0..16) |h| {
+            var m: u16 = 0;
+            for (0..16) |l| {
+                const c = h << 4 | l;
+                if (set[c >> 6] & (@as(u64, 1) << @intCast(c & 63)) != 0) m |= @as(u16, 1) << @intCast(l);
+            }
+            if (m == 0) continue;
+            const b = for (masks[0..n], 0..) |x, i| {
+                if (x == m) break i;
+            } else blk: {
+                if (n == 8) return null;
+                masks[n] = m;
+                n += 1;
+                break :blk n - 1;
+            };
+            bs.hi[h] = @as(u8, 1) << @intCast(b);
+        }
+        for (masks[0..n], 0..) |m, b| {
+            for (0..16) |l| if (m & (@as(u16, 1) << @intCast(l)) != 0) {
+                bs.lo[l] |= @as(u8, 1) << @intCast(b);
+            };
+        }
+        return bs;
+    }
+
+    /// The first position at or after `pos` whose byte is in the set.
+    pub noinline fn find(bs: *const ByteSet, input: []const u8, pos: usize) ?usize {
+        const lo: V = bs.lo ++ bs.lo;
+        const hi: V = bs.hi ++ bs.hi;
+        const nib: V = @splat(0x0f);
+        const zero: V = @splat(0);
+        var i = pos;
+        while (i + lanes <= input.len) : (i += lanes) {
+            const v: V = input[i..][0..lanes].*;
+            const c = lookup(lo, v & nib) & lookup(hi, v >> @splat(@as(u3, 4)));
+            const mask: u32 = @bitCast(c != zero);
+            if (mask != 0) return i + @ctz(mask);
+        }
+        while (i < input.len) : (i += 1) {
+            const x = input[i];
+            if (bs.lo[x & 0x0f] & bs.hi[x >> 4] != 0) return i;
+        }
+        return null;
+    }
+};
+
 /// `table[idx[i]]` for every lane (`idx` < 16, `table` the 16 entries twice).
 inline fn lookup(table: V, idx: V) V {
     if (has_avx2) {
@@ -310,4 +371,48 @@ test "lookup: vpshufb (where present) and the select tree agree with the table" 
             try testing.expectEqual(tab[x], gb);
         }
     }
+}
+
+test "ByteSet: the nibble tables hold exactly the set, and find agrees with a byte loop" {
+    if (!has_avx2) return error.SkipZigTest;
+    var prng: std.Random.DefaultPrng = .init(0x6279_7465);
+    const rng = prng.random();
+    var text: [300]u8 = undefined;
+    var built: usize = 0;
+    for (0..400) |round| {
+        // Sets of a few bytes, or of a few high nibbles' worth (more than
+        // eight low-nibble sets give no ByteSet).
+        var set: [4]u64 = @splat(0);
+        const k = 1 + rng.uintLessThan(usize, if (round % 2 == 0) 6 else 60);
+        for (0..k) |_| {
+            const c = rng.int(u8);
+            set[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
+        }
+        const bs = ByteSet.build(set) orelse continue;
+        built += 1;
+        for (0..256) |c| {
+            const in = set[c >> 6] & (@as(u64, 1) << @intCast(c & 63)) != 0;
+            try testing.expectEqual(in, bs.lo[c & 0x0f] & bs.hi[c >> 4] != 0);
+        }
+        rng.bytes(&text);
+        // Mostly bytes outside the set, so the hits fall anywhere in a block.
+        for (&text) |*x| if (rng.uintLessThan(u8, 8) != 0 and set[x.* >> 6] & (@as(u64, 1) << @intCast(x.* & 63)) != 0) {
+            x.* = 0;
+            if (set[0] & 1 != 0) x.* = 1;
+        };
+        const len = rng.uintLessThan(usize, text.len + 1);
+        const pos = rng.uintLessThan(usize, len + 1);
+        const want = for (text[pos..len], pos..) |x, i| {
+            if (set[x >> 6] & (@as(u64, 1) << @intCast(x & 63)) != 0) break i;
+        } else null;
+        try testing.expectEqual(want, bs.find(text[0..len], pos));
+    }
+    try testing.expect(built > 100);
+    // Nine high nibbles with nine different low-nibble sets: no ByteSet.
+    var nine: [4]u64 = @splat(0);
+    for (0..9) |h| for (0..h + 1) |l| {
+        const c = h << 4 | l;
+        nine[c >> 6] |= @as(u64, 1) << @intCast(c & 63);
+    };
+    try testing.expectEqual(null, ByteSet.build(nine));
 }

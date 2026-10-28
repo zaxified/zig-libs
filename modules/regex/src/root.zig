@@ -415,13 +415,16 @@ pub const Regex = struct {
     fn revAccepts(re: *const Regex, d: *RevDfa, s: u8, prev: ?u21) bool {
         const pc = Dfa.Ctx.of(prev);
         const slot = &d.accepts[s][@backingInt(pc)];
-        if (slot.* == .unknown) {
-            var matched: bool = undefined;
-            const cl = re.dfaClosure(.{ 1, 0 }, pc.rep(), d.ctxs[s].rep(), &matched);
-            const k = d.keys[s];
-            slot.* = if (cl[0] & k[0] != 0 or cl[1] & k[1] != 0) .yes else .no;
-        }
+        if (slot.* == .unknown) slot.* = if (re.revReaches(d.keys[s], d.ctxs[s], pc)) .yes else .no;
         return slot.* == .yes;
+    }
+
+    /// Does the start, at a position after a code point of class `prev`,
+    /// reach a member of set `k` (`ctx`: the class of the code point after)?
+    fn revReaches(re: *const Regex, k: Dfa.Set, ctx: Dfa.Ctx, prev: Dfa.Ctx) bool {
+        var matched: bool = undefined;
+        const cl = re.dfaClosure(.{ 1, 0 }, prev.rep(), ctx.rep(), &matched);
+        return cl[0] & k[0] != 0 or cl[1] & k[1] != 0;
     }
 
     /// `noinline`: its ~6 KiB of stack scratch is paid only while it runs,
@@ -787,9 +790,13 @@ const RevDfa = struct {
 /// the `Matcher` across calls, so a transition on an ASCII byte is worked out
 /// once per `Matcher`; a full table is emptied and refilled.
 const FindDfa = struct {
-    const max_states = 256;
+    /// Rows are premultiplied by 256 in a `u16` (`trans`).
+    const max_states = 255;
+    const scan_give_up = 32;
     const Accept = enum(u8) { unknown, no, yes };
-    const State = struct { off: u32, len: u16, ctx: Dfa.Ctx, restart: bool, eoi: Accept = .unknown };
+    /// `mid`: 0, or (for a state inside a two-byte UTF-8 sequence, see
+    /// `midAfter`) the state before its lead byte + 1.
+    const State = struct { off: u32, len: u16, ctx: Dfa.Ctx, restart: bool, eoi: Accept = .unknown, mid: u16 = 0 };
     /// The outcome of one step: the next state's list and whether a match
     /// ends before the code point.
     const Step = struct { n: usize, matched: bool };
@@ -825,30 +832,103 @@ const FindDfa = struct {
     skip_idle: bool,
     states: std.ArrayList(State) = .empty,
     /// `trans[s + 1][c]` (row 0 unused): 0 not worked out yet, otherwise
-    /// (next state + 1) << 7 — the offset of its row, so the next lookup
+    /// (next state + 1) << 8 — the offset of its row, so the next lookup
     /// needs no multiply (Rust's premultiplied ids) — bit 1 set when that
-    /// state has no thread, bit 0 when a match ends before `c`.
-    trans: std.ArrayList([128]u16) = .empty,
+    /// state has no thread, bit 0 when a match ends before `c`. Over every
+    /// byte: a two-byte UTF-8 sequence (Latin, Greek, Cyrillic) is two
+    /// lookups through a mid-sequence state (`midAfter`), never a decode.
+    trans: std.ArrayList([256]u16) = .empty,
     /// The states' lists, one after another.
     pcs: std.ArrayList(u16) = .empty,
-    /// Open addressing: state + 1, 0 empty.
-    table: [2 * max_states]u16 = @splat(0),
+    /// Open addressing (a power of two, over twice `max_states`): state + 1, 0 empty.
+    table: [512]u16 = @splat(0),
     /// `idleAt`'s states per context, + 1 (0 not made yet).
     idle: [4]u16 = @splat(0),
     /// `anchoredAt`'s, the same way.
     anchored: [4]u16 = @splat(0),
-    /// Transitions on code points past ASCII (`Wide`), made on the first
-    /// such code point: a `Matcher` for one ASCII search does not pay for
-    /// them (measured: 3× a short compile-and-match).
+    /// Transitions on code points of three and four bytes and on invalid
+    /// bytes (`Wide`), made on the first such code point: a `Matcher` for
+    /// one ASCII search does not pay for them (measured: 3× a short
+    /// compile-and-match).
     wide: ?*WideCaches = null,
     /// `rev`'s first state (the match) per context after the end, + 1.
-    rev_start: [4]u8 = @splat(0),
+    rev_start: [4]u16 = @splat(0),
     /// Times the table was emptied (tests).
     flushes: usize = 0,
+    /// Scans past an idle code point beyond ASCII that moved a block or
+    /// more, minus those that did not; at `-scan_give_up` they stop.
+    scan_score: i32 = 0,
     /// The backward DFA for the start (`start`), kept across calls too.
-    rev: RevDfa,
+    rev: Back = .{},
+    /// The states kept before the table is emptied (tests: fewer), and
+    /// `rev`'s.
+    limit: u16 = max_states,
+    rev_limit: u16 = Back.max_states,
     /// The match instructions: `rev`'s first set.
     match_set: Dfa.Set,
+
+    /// `start`'s backward DFA: `RevDfa`'s states (the set of consuming
+    /// instructions from which the text after the position reads to the
+    /// match), with `trans` rows over every byte as the forward one has,
+    /// and mid-sequence states the same way — reading backwards, the one
+    /// after a continuation byte (`midAfter`).
+    const Back = struct {
+        const max_states = 255;
+        keys: std.ArrayList(Dfa.Set) = .empty,
+        ctxs: std.ArrayList(Dfa.Ctx) = .empty,
+        accepts: std.ArrayList([4]Accept) = .empty,
+        /// As `State.mid`.
+        mids: std.ArrayList(u16) = .empty,
+        /// `trans[s + 1][c]` (row 0 unused), `c` the byte before the
+        /// position: 0 not worked out yet, otherwise (state before `c` + 1)
+        /// << 8, bit 1 set when no way is left (no state), bit 0 when the
+        /// start reaches this state's set at the position.
+        trans: std.ArrayList([256]u16) = .empty,
+
+        fn len(r: *const Back) usize {
+            return r.keys.items.len;
+        }
+
+        fn find(r: *const Back, k: Dfa.Set, ctx: Dfa.Ctx) ?u16 {
+            for (r.keys.items, r.ctxs.items, r.mids.items, 0..) |key, c, mid, i| {
+                if (mid == 0 and key[0] == k[0] and key[1] == k[1] and c == ctx) return @intCast(i);
+            }
+            return null;
+        }
+
+        /// Add a state (the caller checked the room).
+        fn add(r: *Back, gpa: std.mem.Allocator, k: Dfa.Set, ctx: Dfa.Ctx, mid: u16) std.mem.Allocator.Error!u16 {
+            try r.keys.ensureUnusedCapacity(gpa, 1);
+            try r.ctxs.ensureUnusedCapacity(gpa, 1);
+            try r.accepts.ensureUnusedCapacity(gpa, 1);
+            try r.mids.ensureUnusedCapacity(gpa, 1);
+            try r.trans.ensureUnusedCapacity(gpa, 2);
+            const id: u16 = @intCast(r.keys.items.len);
+            r.keys.appendAssumeCapacity(k);
+            r.ctxs.appendAssumeCapacity(ctx);
+            r.accepts.appendAssumeCapacity(@splat(.unknown));
+            r.mids.appendAssumeCapacity(mid);
+            if (r.trans.items.len == 0) r.trans.appendAssumeCapacity(@splat(0)); // row 0
+            r.trans.appendAssumeCapacity(@splat(0));
+            return id;
+        }
+
+        fn clear(r: *Back) void {
+            r.keys.clearRetainingCapacity();
+            r.ctxs.clearRetainingCapacity();
+            r.accepts.clearRetainingCapacity();
+            r.mids.clearRetainingCapacity();
+            r.trans.clearRetainingCapacity();
+        }
+
+        fn deinit(r: *Back, gpa: std.mem.Allocator) void {
+            r.keys.deinit(gpa);
+            r.ctxs.deinit(gpa);
+            r.accepts.deinit(gpa);
+            r.mids.deinit(gpa);
+            r.trans.deinit(gpa);
+        }
+    };
 
     fn init(gpa: std.mem.Allocator, re: *const Regex) FindDfa {
         var match_set: Dfa.Set = .{ 0, 0 };
@@ -857,27 +937,44 @@ const FindDfa = struct {
         };
         const pf = &re.prefilter;
         const skip_idle = pf.first != null and (pf.lit_len >= 2 or pf.teddy != null or pf.single != null);
-        var d: FindDfa = .{ .gpa = gpa, .asserts = re.asserts, .skip_idle = skip_idle, .rev = undefined, .match_set = match_set };
-        d.rev.n = 0;
-        return d;
+        return .{ .gpa = gpa, .asserts = re.asserts, .skip_idle = skip_idle, .match_set = match_set };
     }
 
     /// The start of the leftmost-first match from `from` that ends at
     /// `end`: the leftmost position from which some way through the program
     /// reads exactly to `end` (no match begins further left, so that is the
     /// one). Read backwards from `end` until no way is left.
-    fn start(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, end: usize) usize {
+    fn start(d: *FindDfa, re: *const Regex, input: []const u8, from: usize, end: usize) std.mem.Allocator.Error!usize {
         const r = &d.rev;
         const end_ctx: Dfa.Ctx = if (d.asserts) .of(decode(input, end).cp) else .other;
         const first = &d.rev_start[@backingInt(end_ctx)];
         if (first.* == 0) {
-            if (r.n == RevDfa.max_states) d.revFlush();
-            first.* = r.add(d.match_set, end_ctx) + 1;
+            if (r.len() == d.rev_limit) d.revFlush();
+            first.* = try r.add(d.gpa, d.match_set, end_ctx, 0) + 1;
         }
         var s = first.* - 1;
         var pos = end;
         var best = end;
         while (true) {
+            // Cached transitions over the byte before `pos` until one is not.
+            const flat: [*]const u16 = @ptrCast(r.trans.items.ptr);
+            var row = (@as(usize, s) + 1) << 8;
+            while (pos > from) {
+                const t = flat[row + input[pos - 1]];
+                if (t == 0) break;
+                if (t & 1 != 0) best = pos;
+                if (t & 2 != 0) return best; // no way left
+                row = t & ~@as(u16, 0xff);
+                pos -= 1;
+            }
+            s = @intCast((row >> 8) - 1);
+            const mid = r.mids.items[s];
+            if (mid != 0) {
+                // Read a continuation byte, and the one before it is no lead
+                // worked out yet: back to the code point's end.
+                s = mid - 1;
+                pos += 1;
+            }
             if (pos == from) {
                 if (d.revAccepts(re, s, d.ctxBefore(input, pos))) best = pos;
                 return best;
@@ -885,28 +982,16 @@ const FindDfa = struct {
             // The code point before `pos`: what the start would see before
             // it, and what the step reads.
             const c = input[pos - 1];
-            const ascii = c < 0x80;
-            if (ascii) {
-                // `rev_accept`: the start reaches the state's set after `c`.
-                const t = r.trans[s][c];
-                if (t != 0) {
-                    if (t & rev_accept != 0) best = pos;
-                    if (t & ~rev_accept == 1) return best; // no way left
-                    s = (t & ~rev_accept) - 2;
-                    pos -= 1;
-                    continue;
-                }
-            }
-            const here: Decoded = if (ascii) .{ .cp = c, .w = 1 } else decodeBefore(input, pos);
+            const here: Decoded = if (c < 0x80) .{ .cp = c, .w = 1 } else decodeBefore(input, pos);
             const key = Wide.keyOf(s, here.cp.?);
-            if (!ascii) wide: {
+            const wide = c >= 0x80 and here.w != 2;
+            if (wide) wide: {
                 const caches = d.wideCaches() catch break :wide;
                 const w = caches.rev[Wide.slot(key)];
                 if (w.key == key) {
-                    const t: u8 = @intCast(w.val);
-                    if (t & rev_accept != 0) best = pos;
-                    if (t & ~rev_accept == 1) return best;
-                    s = (t & ~rev_accept) - 2;
+                    if (w.val & 1 != 0) best = pos;
+                    if (w.val & 2 != 0) return best;
+                    s = (w.val >> 8) - 1;
                     pos -= here.w;
                     continue;
                 }
@@ -914,58 +999,65 @@ const FindDfa = struct {
             const ctx = d.ctxOf(here.cp);
             const acc = d.revAccepts(re, s, ctx);
             if (acc) best = pos;
-            const acc_bit: u8 = if (acc) rev_accept else 0;
-            const prev = re.revStep(r.keys[s], r.ctxs[s], here.cp.?);
+            const acc_bit: u16 = @intFromBool(acc);
+            const prev = re.revStep(r.keys.items[s], r.ctxs.items[s], here.cp.?);
             if (prev[0] == 0 and prev[1] == 0) {
-                d.revCache(s, c, key, 1 | acc_bit);
+                try d.revCache(s, input, pos, here, key, 2 | acc_bit);
                 return best;
             }
             var cache = true;
             const ps = r.find(prev, ctx) orelse blk: {
-                if (r.n == RevDfa.max_states) {
+                if (r.len() == d.rev_limit) {
                     d.revFlush();
                     cache = false;
                 }
-                break :blk r.add(prev, ctx);
+                break :blk try r.add(d.gpa, prev, ctx, 0);
             };
-            if (cache) d.revCache(s, c, key, (ps + 2) | acc_bit);
+            if (cache) try d.revCache(s, input, pos, here, key, (ps + 1) << 8 | acc_bit);
             pos -= here.w;
             s = ps;
         }
     }
 
-    /// Remember `rev`'s transition from `s` over the code point before the
-    /// position: `c` its last byte, `key` the code point past ASCII.
-    fn revCache(d: *FindDfa, s: u8, c: u8, key: u32, t: u8) void {
+    /// Remember `rev`'s transition `t` from `s` over `here`, the code point
+    /// before `pos` (`key`: its `Wide` key): one entry for ASCII, two for a
+    /// two-byte sequence (into the mid-sequence state, which takes the
+    /// accept bit, then out of it over the lead byte), `Wide` otherwise.
+    fn revCache(d: *FindDfa, s: u16, input: []const u8, pos: usize, here: Decoded, key: u32, t: u16) std.mem.Allocator.Error!void {
+        const r = &d.rev;
+        const c = input[pos - 1];
         if (c < 0x80) {
-            d.rev.trans[s][c] = t;
+            r.trans.items[s + 1][c] = t;
+        } else if (here.w == 2) {
+            var into = r.trans.items[s + 1][c];
+            if (into == 0) {
+                if (r.len() == d.rev_limit) return; // no room: not cached
+                const mid = try r.add(d.gpa, .{ 0, 0 }, .other, s + 1);
+                into = (mid + 1) << 8 | (t & 1);
+                r.trans.items[s + 1][c] = into;
+            }
+            r.trans.items[into >> 8][input[pos - 2]] = t & ~@as(u16, 1);
         } else if (d.wide) |w| w.rev[Wide.slot(key)] = .{ .key = key, .val = t };
     }
 
     /// `rev` is full: empty it, and what remembers its states.
     fn revFlush(d: *FindDfa) void {
-        d.rev.n = 0;
+        d.rev.clear();
         if (d.wide) |w| w.rev = @splat(.empty);
         d.rev_start = @splat(0);
     }
 
-    /// In `rev`'s transitions (which `runRevDfa` encodes without it, up to
-    /// `RevDfa.max_states + 1`): the start reaches the state's set after `c`.
-    const rev_accept: u8 = 0x80;
-    comptime {
-        std.debug.assert(RevDfa.max_states + 2 < rev_accept);
-    }
-
-    /// `Regex.revAccepts` with the cached answer inline, and the class of
-    /// the code point before the position already worked out.
-    inline fn revAccepts(d: *FindDfa, re: *const Regex, s: u8, ctx: Dfa.Ctx) bool {
-        const a = d.rev.accepts[s][@backingInt(ctx)];
-        if (a != .unknown) return a == .yes;
-        return re.revAccepts(&d.rev, s, ctx.rep());
+    /// `Regex.revReaches` for `rev`'s state `s`, cached, and the class of the
+    /// code point before the position already worked out.
+    inline fn revAccepts(d: *FindDfa, re: *const Regex, s: u16, ctx: Dfa.Ctx) bool {
+        const a = &d.rev.accepts.items[s][@backingInt(ctx)];
+        if (a.* == .unknown) a.* = if (re.revReaches(d.rev.keys.items[s], d.rev.ctxs.items[s], ctx)) .yes else .no;
+        return a.* == .yes;
     }
 
     fn deinit(d: *FindDfa) void {
         if (d.wide) |w| d.gpa.destroy(w);
+        d.rev.deinit(d.gpa);
         d.states.deinit(d.gpa);
         d.trans.deinit(d.gpa);
         d.pcs.deinit(d.gpa);
@@ -992,43 +1084,58 @@ const FindDfa = struct {
                     s = try d.idleAt(input, pos);
                 }
             }
-            // Cached ASCII transitions until one leads to a state the loop
-            // above must see (bit 1: no thread left, or idle with `skip_idle`).
+            // Cached transitions until one leads to a state the loop above
+            // must see (bit 1: no thread left, or idle with `skip_idle`).
             const flat: [*]const u16 = @ptrCast(d.trans.items.ptr);
-            var row = (@as(usize, s) + 1) << 7;
+            var row = (@as(usize, s) + 1) << 8;
             const stopped = while (pos < input.len) {
-                const c = input[pos];
-                if (c >= 0x80) break false;
-                const t = flat[row + c];
+                const t = flat[row + input[pos]];
                 if (t == 0) break false;
                 if (t & 1 != 0) end = pos;
-                row = t & ~@as(u16, 0x7f);
+                row = t & ~@as(u16, 0xff);
                 pos += 1;
                 if (t & 2 != 0) break true;
-            } else {
-                if (d.accepts(re, @intCast((row >> 7) - 1))) end = pos;
-                return end;
+            } else blk: {
+                const last: u16 = @intCast((row >> 8) - 1);
+                if (d.states.items[last].mid == 0) {
+                    if (d.accepts(re, last)) end = pos;
+                    return end;
+                }
+                break :blk false; // a lead byte last: U+FFFD, below
             };
-            s = @intCast((row >> 7) - 1);
+            s = @intCast((row >> 8) - 1);
             if (stopped) continue;
+            const mid = d.states.items[s].mid;
+            if (mid != 0) {
+                // Read a lead byte, and the byte after it is not worked out
+                // yet (or ends no sequence): back to the code point's start.
+                s = mid - 1;
+                pos -= 1;
+            }
             const c = input[pos];
             const idle = d.states.items[s].len == 0 and d.states.items[s].restart;
             const no_start = if (pf.first) |set| set[c >> 6] & (@as(u64, 1) << @truncate(c)) == 0 else false;
-            if (c >= 0x80 and idle and no_start) {
+            if (c >= 0x80 and idle and no_start and d.scan_score > -scan_give_up) {
                 // Idle at a code point past ASCII that cannot start a match:
-                // the byte-set scan is faster than decoding each one (Czech
-                // text between `[0-9]+` matches); it moves past `pos`.
-                pos = pf.next(input, pos) orelse return null;
+                // the scan for a first byte moves past `pos`, over long gaps
+                // faster than the cached steps (Czech text between `[0-9]+`
+                // matches: 0.8 against 1.6 ms). Over short ones the call is
+                // the cost (`\b\w+\b`, where each accented letter ends a
+                // match): once most scans moved less than a block, the
+                // steps over the bytes are cached instead (`midAfter`).
+                const to = pf.next(input, pos) orelse return null;
+                d.scan_score += if (to - pos >= 32) 1 else -1;
+                pos = to;
                 s = try d.idleAt(input, pos);
                 continue;
             }
             const here = decode(input, pos);
             const key = Wide.keyOf(s, here.cp.?);
-            if (c >= 0x80) {
+            if (c >= 0x80 and here.w != 2) {
                 const w = (try d.wideCaches()).fwd[Wide.slot(key)];
                 if (w.key == key) {
                     if (w.val & 1 != 0) end = pos;
-                    s = (w.val >> 7) - 1;
+                    s = (w.val >> 8) - 1;
                     pos += here.w;
                     continue;
                 }
@@ -1041,12 +1148,38 @@ const FindDfa = struct {
             const ns = try d.intern(next[0..r.n], d.ctxOf(here.cp), ns_restart);
             if (!ns.flushed) {
                 const stop = r.n == 0 and (!ns_restart or d.skip_idle);
-                const t = (@as(u16, ns.id) + 1) << 7 | @as(u16, @intFromBool(stop)) << 1 | @intFromBool(r.matched);
-                if (c < 0x80) d.trans.items[s + 1][c] = t else d.wide.?.fwd[Wide.slot(key)] = .{ .key = key, .val = t };
+                const t = (@as(u16, ns.id) + 1) << 8 | @as(u16, @intFromBool(stop)) << 1 | @intFromBool(r.matched);
+                if (c < 0x80) {
+                    d.trans.items[s + 1][c] = t;
+                } else if (here.w == 2) {
+                    // The match bit on the lead byte: whether a match ends
+                    // before a code point past ASCII does not depend on which
+                    // (the assertions see each as U+FFFD, `runeBefore`).
+                    if (try d.midAfter(s, c, r.matched)) |m| d.trans.items[m + 1][input[pos + 1]] = t & ~@as(u16, 1);
+                } else d.wide.?.fwd[Wide.slot(key)] = .{ .key = key, .val = t };
             }
             s = ns.id;
             pos += here.w;
         }
+    }
+
+    /// The mid-sequence state that `s` reaches over the lead byte `c` of a
+    /// two-byte sequence, made if new; null when the table has no room (it
+    /// is emptied only by `intern`, which would lose `s`). Its row holds
+    /// the transitions over the continuation bytes, worked out as they come;
+    /// any other byte, or the end of the text, finds 0 there and `run` reads
+    /// the code point again from `s` (an invalid sequence: U+FFFD).
+    fn midAfter(d: *FindDfa, s: u16, c: u8, matched: bool) std.mem.Allocator.Error!?u16 {
+        const into = d.trans.items[s + 1][c];
+        if (into != 0) return (into >> 8) - 1;
+        if (d.states.items.len == d.limit) return null;
+        try d.states.ensureUnusedCapacity(d.gpa, 1);
+        try d.trans.ensureUnusedCapacity(d.gpa, 1);
+        const id: u16 = @intCast(d.states.items.len);
+        d.states.appendAssumeCapacity(.{ .off = 0, .len = 0, .ctx = .other, .restart = false, .mid = s + 1 });
+        d.trans.appendAssumeCapacity(@splat(0));
+        d.trans.items[s + 1][c] = (id + 1) << 8 | @intFromBool(matched);
+        return id;
     }
 
     /// The state with no thread and a start pending at `pos`, one per
@@ -1186,7 +1319,7 @@ const FindDfa = struct {
             if (st.ctx == ctx and st.restart == restart and std.mem.eql(u16, d.pcs.items[st.off..][0..st.len], list)) return .{ .id = id, .flushed = false };
         }
         var flushed = false;
-        if (d.states.items.len == max_states) {
+        if (d.states.items.len == d.limit) {
             d.states.clearRetainingCapacity();
             d.trans.clearRetainingCapacity();
             d.pcs.clearRetainingCapacity();
@@ -1199,7 +1332,8 @@ const FindDfa = struct {
             i = hash(list, ctx, restart) & mask;
         }
         const id: u16 = @intCast(d.states.items.len);
-        comptime std.debug.assert(max_states << 7 <= std.math.maxInt(u16));
+        comptime std.debug.assert(max_states << 8 <= std.math.maxInt(u16));
+        comptime std.debug.assert(std.math.isPowerOfTwo(d.table.len) and d.table.len > 2 * max_states);
         try d.states.ensureUnusedCapacity(d.gpa, 1);
         try d.trans.ensureUnusedCapacity(d.gpa, 2);
         try d.pcs.appendSlice(d.gpa, list);
@@ -1526,12 +1660,15 @@ pub const Prefilter = struct {
     /// (two bytes or more, at most `teddy.max_pats`), searched for together.
     /// Out of line (~400 B, most patterns have none): owned like the tables.
     teddy: ?*const teddy.Teddy = null,
+    /// `first` as a SIMD scan, when it fits one (`teddy.ByteSet`).
+    bytes: ?teddy.ByteSet = null,
 
     /// The first position at or after `pos` whose byte may start a match.
     fn next(pf: *const Prefilter, input: []const u8, pos: usize) ?usize {
         if (pf.lit_len >= 2) return findLiteral(input, pos, pf.lit[0..pf.lit_len]);
         if (pf.teddy) |t| return t.find(input, pos);
         if (pf.single) |c| return std.mem.findScalarPos(u8, input, pos, c);
+        if (pf.bytes) |*b| return b.find(input, pos);
         const set = pf.first.?;
         var i = pos;
         while (i < input.len) : (i += 1) {
@@ -1648,6 +1785,7 @@ fn analyze(insts: []const Inst, ranges: []const Range) Prefilter {
     pf.lit_len = @intCast(replace.prefixInto(insts, ranges, &pf.lit));
     if (!any_first) {
         pf.first = set;
+        pf.bytes = teddy.ByteSet.build(set);
         var count: usize = 0;
         for (set) |w| count += @popCount(w);
         if (count == 1) {
@@ -1917,6 +2055,8 @@ pub const Matcher = struct {
     pike_only: bool = false,
     /// Tests only: the DFA from the first `find`, however short the text.
     dfa_eager: bool = false,
+    /// Tests only: the DFA's tables a few states large, so they fill.
+    dfa_small: bool = false,
     /// `captures`' one-pass engine, made with the DFA (when the program is
     /// one-pass); `onepass_tried` once that was worked out.
     onepass: ?*OnePass = null,
@@ -2059,7 +2199,7 @@ pub const Matcher = struct {
             }
         }
         const end = (d.run(re, input, from, anchored, &reach) catch return null) orelse return @as(?Span, null);
-        return .{ .start = if (anchored) from else d.start(re, input, from, end), .end = end };
+        return .{ .start = if (anchored) from else (d.start(re, input, from, end) catch return null), .end = end };
     }
 
     /// Whether the `Matcher` has been handed enough text for the DFA (and
@@ -2072,6 +2212,10 @@ pub const Matcher = struct {
     fn makeDfa(m: *Matcher) ?*FindDfa {
         const d = m.gpa.create(FindDfa) catch return null;
         d.* = .init(m.gpa, m.re);
+        if (m.dfa_small) {
+            d.limit = 12;
+            d.rev_limit = 6;
+        }
         m.dfa = d;
         return d;
     }
@@ -2120,7 +2264,7 @@ pub const Matcher = struct {
             }
         }
         const end = (d.run(re, input, from, false, &reach) catch return null) orelse return false;
-        const start = d.start(re, input, from, end);
+        const start = d.start(re, input, from, end) catch return null;
         const found = op.run(re, input, start, m.tmp, m.best, &reach);
         std.debug.assert(found and m.best[1] == end);
         return true;
@@ -3173,6 +3317,92 @@ test "the DFAs past the backward table, many contexts and the candidate budget; 
         try testing.expectEqual(want != null, pm.captures(t, 0, gb[0..ng]));
         if (want != null) try testing.expectEqualSlices(?Span, gb[0..ng], ga[0..ng]);
     }
+}
+
+test "FindDfa over bytes: two-byte sequences through mid-sequence states, the rest and invalid UTF-8 as before" {
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x7574_6638);
+    const rng = prng.random();
+    // A lone lead, a lone continuation byte, a cut three-byte sequence and
+    // a lead before ASCII make U+FFFD, one byte wide; a two-byte sequence
+    // whose lead the forward table knows meets an unknown continuation, and
+    // the backward one a continuation byte after a non-lead (`€`, `😀`).
+    const pieces = [_][]const u8{ "a", "b", "c", "7", " ", "_", "é", "É", "ž", "ť", "\xc3", "\xa9", "\xe2\x82", "€", "😀", "\xdf" };
+    const patterns = [_][]const u8{
+        "\\p{L}+",              "\\b\\w+\\b", "[0-9]+",
+        "(?i)žluť\\w*",
+        ".",                    "[^a]+",
+        "é+",
+        "\\PL+",
+        "(?i)é[a-c]*",
+        "[é€]+",
+        "\\x{FFFD}+",           "a\\b",
+        "[a-cé]{3}a[a-cé]*",
+        "\\Bé|b\\b",
+        "[\\x{80}-\\x{7ff}]+$",
+    };
+    const text = try gpa.alloc(u8, 3000);
+    defer gpa.free(text);
+    var fills: usize = 0;
+    for (patterns) |p| {
+        var re = try Regex.compile(gpa, p);
+        defer re.deinit(gpa);
+        var pm = try Matcher.init(gpa, &re);
+        defer pm.deinit();
+        pm.pike_only = true;
+        // Full-size tables, and tables that fill and empty while reading.
+        for ([_]bool{ false, true }) |small| {
+            var m = try Matcher.init(gpa, &re);
+            defer m.deinit();
+            m.dfa_eager = true;
+            m.dfa_small = small;
+            for (0..24) |round| {
+                const len = if (round % 4 == 0) text.len - 4 else rng.uintLessThan(usize, 120);
+                // Odd rounds: mostly two-byte letters, rarely the rest.
+                const np: usize = if (round % 2 == 1) 10 else pieces.len;
+                var n: usize = 0;
+                while (n < len) {
+                    const piece = pieces[if (round % 2 == 1 and rng.uintLessThan(usize, 50) == 0) rng.uintLessThan(usize, pieces.len) else rng.uintLessThan(usize, np)];
+                    @memcpy(text[n..][0..piece.len], piece);
+                    n += piece.len;
+                }
+                const t = text[0..n];
+                errdefer std.debug.print("/{s}/ small={} on \"{f}\"\n", .{ p, small, std.zig.fmtString(t) });
+                var it = m.iterator(t);
+                var pit = pm.iterator(t);
+                while (true) {
+                    const a = it.next();
+                    try testing.expectEqual(pit.next(), a);
+                    if (a == null) break;
+                }
+                var from: usize = 0;
+                while (from <= t.len) : (from += 7) try testing.expectEqual(pm.find(t, from), m.find(t, from));
+            }
+            if (small) {
+                const d = m.dfa.?;
+                fills += @intFromBool(d.flushes > 0 or d.states.items.len == d.limit);
+            }
+        }
+    }
+    try testing.expect(fills >= 8);
+    // `\b\w+\b` over accented words: each accented letter ends a match and
+    // the scan past it moves a byte or two — it gives up, and the steps over
+    // the two-byte letters are cached instead.
+    var re = try Regex.compile(gpa, "\\b\\w+\\b");
+    defer re.deinit(gpa);
+    var m = try Matcher.init(gpa, &re);
+    defer m.deinit();
+    m.dfa_eager = true;
+    var n: usize = 0;
+    while (n + 8 <= text.len) : (n += 8) text[n..][0..8].* = "ab\xc3\xa9cd\xc5\xbe".*;
+    var it = m.iterator(text[0..n]);
+    var count: usize = 0;
+    while (it.next()) |_| count += 1;
+    try testing.expectEqual(2 * n / 8, count);
+    try testing.expect(m.dfa.?.scan_score <= -FindDfa.scan_give_up);
+    for (m.dfa.?.states.items) |st| {
+        if (st.mid != 0) break;
+    } else return error.TestExpectedMidState;
 }
 
 test "FindDfa.intern: one state per (list, context, restart), wherever their probes meet" {
