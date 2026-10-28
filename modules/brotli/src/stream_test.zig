@@ -674,3 +674,12 @@ test "Decompressor: small reads after the buffer filled are served from a refill
     }
     try testing.expect(buffered * 2 >= reads);
 }
+
+test "no-panic sweep B-4: an unbuffered streaming reader ends the input, never asserts" {
+    const stream = @embedFile("testdata/quickfox.compressed");
+    var calls: [1]std.testing.Reader.Call = .{.{ .buffer = stream }};
+    var tr: std.testing.Reader = .init(&.{}, &calls);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expectError(error.TruncatedInput, brotli.decompressStream(testing.allocator, &tr.interface, &out.writer, .{}));
+}

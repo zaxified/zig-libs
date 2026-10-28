@@ -28,7 +28,8 @@ pub const BitReader = struct {
         return .{ .data = data };
     }
 
-    /// Pull from `r`. Its buffer must be non-empty. Up to 8 bytes past the
+    /// Pull from `r`. With an empty buffer nothing is pulled (the input ends
+    /// at once — see `nextChunk`). Up to 8 bytes past the
     /// end of the Brotli stream may be consumed from it (the accumulator reads
     /// ahead); `finish` gives back what `data` still holds.
     pub fn initStream(r: *std.Io.Reader) BitReader {
@@ -54,6 +55,13 @@ pub const BitReader = struct {
     fn nextChunk(self: *BitReader) bool {
         const r = self.source orelse return false;
         if (self.source_done) return false;
+        // No buffer to refill through: the input ends here. `fillMore` would
+        // rebase to a capacity of 1, which std asserts on for a streaming
+        // reader — UB in ReleaseFast (no-panic sweep 2026-10-28, B-4).
+        if (r.buffer.len == 0) {
+            self.source_done = true;
+            return false;
+        }
         // The last eight bytes taken stay in the source's buffer (when it
         // has room for more besides): the accumulator may hold them unread,
         // and `unreadAhead` gives them back at the end of the stream.

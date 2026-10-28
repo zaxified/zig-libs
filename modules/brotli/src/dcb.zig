@@ -55,11 +55,14 @@ pub fn stream(body: []const u8, dict: []const u8) Error![]const u8 {
     return body[header_len..];
 }
 
-/// `input` as a `dcb` body against `dict` (`opts.dictionary` is set to it).
+/// `input` as a `dcb` body against `dict` (`opts.dictionary` is set to it,
+/// `opts.prepared_dictionary` cleared: the header names `dict`).
 /// Caller owns the result.
 pub fn compress(gpa: std.mem.Allocator, input: []const u8, dict: []const u8, opts: encoder.CompressOptions) std.mem.Allocator.Error![]u8 {
     var o = opts;
     o.dictionary = dict;
+    // A prepared dictionary left in `opts` would be a second one (B-2).
+    o.prepared_dictionary = null;
     const br = try encoder.compressWith(gpa, input, o);
     defer gpa.free(br);
     const out = try gpa.alloc(u8, header_len + br.len);
@@ -142,4 +145,17 @@ test "dcb: another dictionary, another magic, a short body" {
     try testing.expectError(error.NotDcb, decompress(gpa, body[0 .. header_len - 1], "dictionary one", .{}));
     // Header alone: the stream is empty, which is truncated input.
     try testing.expectError(error.TruncatedInput, decompress(gpa, body[0..header_len], "dictionary one", .{}));
+}
+
+test "no-panic sweep B-2: compress with a prepared dictionary left in opts uses `dict`" {
+    const gpa = testing.allocator;
+    const dict = "<html><head><script src=app.v1.js></script></head><body>hello, version one</body></html>";
+    const page = "<html><head><script src=app.v2.js></script></head><body>hello, version two</body></html>";
+    var other = try PreparedDictionary.init(gpa, "a different dictionary entirely");
+    defer other.deinit(gpa);
+    const want = try compress(gpa, page, dict, .{});
+    defer gpa.free(want);
+    const got = try compress(gpa, page, dict, .{ .prepared_dictionary = &other });
+    defer gpa.free(got);
+    try testing.expectEqualSlices(u8, want, got);
 }

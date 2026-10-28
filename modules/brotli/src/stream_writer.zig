@@ -104,10 +104,11 @@ pub const StreamWriter = struct {
 
     const vtable: Writer.VTable = .{ .drain = drain, .flush = flush };
 
-    /// `buffer` must be nonempty and outlive the writer. `gpa` holds the
+    /// `buffer` must outlive the writer; it may be empty (every write then
+    /// goes straight to `drain` — the `assert` that refused it was UB in
+    /// ReleaseFast; no-panic sweep 2026-10-28, B-3). `gpa` holds the
     /// history and the match finder's table.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts_in: StreamOptions) std.mem.Allocator.Error!StreamWriter {
-        std.debug.assert(buffer.len != 0);
         const opts = opts_in.sanitized();
         var core = try Core.init(gpa, opts.effort, opts.block_size, opts.window_bits, opts.tableSize(), opts.size_hint orelse 0);
         errdefer core.deinit();
@@ -138,7 +139,7 @@ pub const StreamWriter = struct {
     fn start(sw: *StreamWriter) std.mem.Allocator.Error!void {
         const gpa = sw.core.gpa;
         const o = sw.opts;
-        std.debug.assert(o.dictionary.len == 0 or o.prepared_dictionary == null);
+        encoder.checkOneDictionary(o.dictionary, o.prepared_dictionary);
         sw.dropDictionary();
         sw.dict_copy.clearRetainingCapacity();
         if (o.prepared_dictionary) |d| {

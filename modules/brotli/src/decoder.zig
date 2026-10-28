@@ -1705,7 +1705,9 @@ pub const StreamError = BrotliError || error{ ReadFailed, WriteFailed };
 /// Output reaches `out` at the end of every meta-block and whenever the window
 /// fills; `out` is flushed at the end. Returns the number of bytes written.
 ///
-/// `in` must have a non-empty buffer. The bytes after the stream stay in
+/// `in` needs a non-empty buffer: the bit reader refills through it, so an
+/// unbuffered reader yields nothing past what it already holds and the
+/// stream ends there (`TruncatedInput`). The bytes after the stream stay in
 /// `in` when its buffer holds at least 16 bytes (the bit reader's read-ahead
 /// is given back), so a stream followed by other data — another stream —
 /// reads on from there; with a smaller buffer up to 8 of them may be
@@ -1755,7 +1757,7 @@ pub const Decompressor = struct {
 
     pub const Error = BrotliError || error{ReadFailed};
 
-    /// `in` must have a non-empty buffer (as for `decompressStream`).
+    /// `in` needs a non-empty buffer (as for `decompressStream`).
     pub fn init(gpa: std.mem.Allocator, in: *std.Io.Reader, buffer: []u8, options: Options) Decompressor {
         return .{
             .reader = .{ .vtable = &.{ .stream = stream, .readVec = refillReadVec }, .buffer = buffer, .seek = 0, .end = 0 },

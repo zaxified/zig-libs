@@ -43,6 +43,13 @@ const CompressOptions = encoder.CompressOptions;
 /// below it a job's output is mostly its own cut.
 pub const min_job_size: usize = 64 << 10;
 
+/// The largest `ParallelOptions.job_size` (a larger one counts as this): a
+/// job and the window before it (at most 2^30) stay under the match
+/// finders' `u32` positions. A 3 GiB job went past them — a cast that
+/// panicked in a safe build, UB in ReleaseFast (no-panic sweep 2026-10-28,
+/// B-6).
+pub const max_job_size: usize = 1 << 30;
+
 pub const ParallelOptions = struct {
     /// Input bytes per job. The output depends on it (more, smaller jobs:
     /// more cuts). Null: twice the window, at least 1 MiB (`jobSize`) —
@@ -53,7 +60,8 @@ pub const ParallelOptions = struct {
     /// *Parallel compression*).
     job_size: ?usize = null,
     /// Workers at most, the calling thread one of them; null: the CPU
-    /// count.
+    /// count. Each holds a match finder's tables (up to 32 MiB at `.q9`):
+    /// memory grows with this, whatever the input.
     threads: ?usize = null,
 };
 
@@ -66,7 +74,7 @@ pub fn compress(gpa: std.mem.Allocator, io: std.Io, input: []const u8, opts_in: 
     if (opts.dictionary.len != 0 or opts.prepared_dictionary != null) return encoder.compressWith(gpa, input, opts);
     const threads = par.threads orelse (std.Thread.getCpuCount() catch 1);
     const job = par.job_size orelse jobSize(encoder.windowBits(input.len, opts));
-    return compressJobs(gpa, io, input, opts, @max(job, min_job_size), @max(threads, 1));
+    return compressJobs(gpa, io, input, opts, std.math.clamp(job, min_job_size, max_job_size), @max(threads, 1));
 }
 
 /// `ParallelOptions.job_size`'s default for a window of `wbits`.

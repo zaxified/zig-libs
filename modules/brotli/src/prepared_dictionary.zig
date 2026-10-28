@@ -31,7 +31,8 @@ const last_bit: u32 = 0x8000_0000;
 const empty_head: u16 = 0xffff;
 
 pub const PreparedDictionary = struct {
-    /// The dictionary, not copied: it must outlive this.
+    /// The dictionary (its last `max_len` bytes when longer), not copied:
+    /// it must outlive this.
     source: []const u8,
     /// SHA-256 of `source`: what a `dcb` body's header names
     /// (`dcb.headerFrom`). Zeros when made with `.digest = false`.
@@ -78,7 +79,15 @@ pub const PreparedDictionary = struct {
             slot_bits += 1;
             volume <<= 1;
         }
-        var d = try initWith(gpa, source, bucket_bits, slot_bits);
+        // Only the last `max_len` bytes are indexed, and `source` becomes
+        // that tail: positions in it fit an item's 31 bits. Indexed from the
+        // whole of a longer one they took bit 31 (`last_bit`) from 2 GiB and
+        // failed their `u32` cast from 4 GiB, UB in ReleaseFast (no-panic
+        // sweep 2026-10-28, B-7). A copy's distance counts back from the
+        // dictionary's end, so the tail gives the distances the whole would
+        // (nothing further back is in reach: the window is at most 2^30).
+        const tail = source[source.len -| max_len..];
+        var d = try initWith(gpa, tail, bucket_bits, slot_bits);
         if (opts.digest) Sha256.hash(source, &d.digest, .{});
         return d;
     }
@@ -87,7 +96,7 @@ pub const PreparedDictionary = struct {
         std.debug.assert(slot_bits <= 16 and slot_bits <= bucket_bits and bucket_bits - slot_bits <= 11);
         const num_slots = @as(usize, 1) << slot_bits;
         const num_buckets = @as(usize, 1) << bucket_bits;
-        const first = source.len -| max_len;
+        const first = 0; // `source` is at most `max_len` (`initOptions`)
 
         // Step 1: every bucket's count, capped. (google links each bucket's
         // positions into a chain here, in an array of 4 bytes per position,

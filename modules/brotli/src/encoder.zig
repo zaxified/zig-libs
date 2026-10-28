@@ -78,6 +78,7 @@ const greedy_split = @import("greedy_split.zig");
 const dictionary_hash = @import("dictionary_hash.zig");
 const PreparedDictionary = @import("prepared_dictionary.zig").PreparedDictionary;
 const BrotliError = @import("errors.zig").BrotliError;
+const StreamWriter = @import("stream_writer.zig").StreamWriter;
 
 // ---------------------------------------------------------------------------
 // Tunables.
@@ -5751,15 +5752,57 @@ pub const max_large_window_bits = 30;
 const max_metadata_block = 1 << 24;
 pub const max_window_bits = 24;
 
-/// `compress` with options. The input is below 4 GiB: the match finders
-/// keep positions as `u32` (a larger one panics in a safe build); for more,
-/// `StreamWriter` or `parallel.compress`, whose positions are relative.
+/// `compress` with options. Any length: the one-shot match finders keep
+/// positions as `u32`, so an input past `one_shot_max` goes through
+/// `StreamWriter`, whose positions are relative to its window — the same
+/// bytes (`compressStreamed`).
 pub fn compressWith(gpa: std.mem.Allocator, input: []const u8, opts_in: CompressOptions) std.mem.Allocator.Error![]u8 {
     const opts = opts_in.sanitized();
+    if (input.len > one_shot_max) {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        errdefer aw.deinit();
+        // `Allocating` fails only on allocation.
+        compressStreamed(gpa, &aw.writer, input, opts) catch return error.OutOfMemory;
+        return aw.toOwnedSlice();
+    }
     var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     try oneShot(&core, input, opts);
     return core.w.buf.toOwnedSlice(gpa);
+}
+
+/// The longest input the one-shot path compresses itself: its match
+/// finders keep positions as `u32`. A cast past it panicked in a safe build
+/// and was UB in ReleaseFast (no-panic sweep 2026-10-28, B-1).
+const one_shot_max: usize = std.math.maxInt(u32);
+
+/// `compressWith(gpa, input, opts)`'s bytes, through a `StreamWriter` to
+/// `output`: a stream without a flush, its window and block size and the
+/// input's length as its size hint, is the one-shot stream (see
+/// stream_writer.zig). `error.WriteFailed` is `output`'s.
+fn compressStreamed(gpa: std.mem.Allocator, output: *std.Io.Writer, input: []const u8, opts: CompressOptions) error{ OutOfMemory, WriteFailed }!void {
+    var sw = try StreamWriter.init(gpa, output, &.{}, .{
+        .effort = opts.effort,
+        .block_size = opts.block_size,
+        .window_bits = windowBits(input.len, opts),
+        .size_hint = input.len,
+        .dictionary = opts.dictionary,
+        .prepared_dictionary = opts.prepared_dictionary,
+        .mode = opts.mode,
+    });
+    defer sw.deinit();
+    sw.writer.writeAll(input) catch return sw.err orelse error.WriteFailed;
+    sw.finish() catch return sw.err orelse error.WriteFailed;
+}
+
+/// `compressStreamed` into `out`, as `compressInto` reports it.
+fn compressStreamedInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts: CompressOptions) CompressIntoError![]u8 {
+    var w: std.Io.Writer = .fixed(out);
+    compressStreamed(gpa, &w, input, opts) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.WriteFailed => error.OutputTooLarge,
+    };
+    return w.buffered();
 }
 
 /// `CompressOptions.window_bits` or its default for an input of `n` bytes.
@@ -5787,6 +5830,7 @@ pub const CompressIntoError = std.mem.Allocator.Error || error{
 /// enough.
 pub fn compressInto(gpa: std.mem.Allocator, out: []u8, input: []const u8, opts_in: CompressOptions) CompressIntoError![]u8 {
     const opts = opts_in.sanitized();
+    if (input.len > one_shot_max) return compressStreamedInto(gpa, out, input, opts);
     var core = try Core.init(gpa, opts.effort, opts.block_size, windowBits(input.len, opts), tableSize(input.len, windowBits(input.len, opts)), input.len);
     defer core.deinit();
     return oneShotInto(&core, out, input, opts);
@@ -5822,6 +5866,7 @@ pub const Compressor = struct {
     /// Zig 0.16's `smp_allocator` can grow without bound on such walks —
     /// std defect, ziglang/zig #36969; see `Core.temp`).
     pub fn compress(c: *Compressor, input: []const u8, opts_in: CompressOptions) std.mem.Allocator.Error![]u8 {
+        if (input.len > one_shot_max) return compressWith(c.gpa, input, opts_in);
         const opts = opts_in.sanitized();
         const core = try c.ready(input.len, opts);
         try oneShot(core, input, opts);
@@ -5830,6 +5875,7 @@ pub const Compressor = struct {
 
     /// `compressInto(gpa, out, input, opts)`.
     pub fn compressInto(c: *Compressor, out: []u8, input: []const u8, opts_in: CompressOptions) CompressIntoError![]u8 {
+        if (input.len > one_shot_max) return compressStreamedInto(c.gpa, out, input, opts_in.sanitized());
         const opts = opts_in.sanitized();
         const core = try c.ready(input.len, opts);
         // `out` stands in for the kept buffer for this call.
@@ -5878,10 +5924,19 @@ pub fn maxCompressedSize(n: usize, opts_in: CompressOptions) usize {
     return (bits + 2 + 7) / 8;
 }
 
+/// `dictionary` and `prepared_dictionary` both set name two dictionaries
+/// for one stream: refused in every build mode (an `assert` was UB in
+/// ReleaseFast, where the prepared one silently won and the decoder, handed
+/// `dictionary`, read garbage; no-panic sweep 2026-10-28, B-2).
+pub fn checkOneDictionary(raw: []const u8, prepared: ?*const PreparedDictionary) void {
+    if (raw.len != 0 and prepared != null)
+        @panic("brotli: set dictionary or prepared_dictionary, not both");
+}
+
 /// The header, every block of `input`, the end — against `opts`'s
 /// dictionary, prepared here when it is raw.
 fn oneShot(core: *Core, input: []const u8, opts: CompressOptions) std.mem.Allocator.Error!void {
-    std.debug.assert(opts.dictionary.len == 0 or opts.prepared_dictionary == null);
+    checkOneDictionary(opts.dictionary, opts.prepared_dictionary);
     var own: ?PreparedDictionary = null;
     defer if (own) |*d| d.deinit(core.gpa);
     if (opts.prepared_dictionary) |d| {
@@ -7847,4 +7902,43 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "no-panic sweep B-1: the streamed path past one_shot_max gives compressWith's bytes" {
+    // `compressWith` hands an input over 4 GiB to `compressStreamed`; a test
+    // cannot allocate that, so this pins the two paths' bytes on inputs it
+    // can, every effort, with and without a dictionary — and through an
+    // empty `StreamWriter` buffer (B-3).
+    const gpa = testing.allocator;
+    const n = 200_000;
+    const input = try gpa.alloc(u8, n);
+    defer gpa.free(input);
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const words = [_][]const u8{ "brotli ", "window ", "stream,", "4 GiB ", "\n", "meta-block " };
+    var i: usize = 0;
+    while (i < n) {
+        const wd = words[prng.random().uintLessThan(usize, words.len)];
+        const k = @min(wd.len, n - i);
+        @memcpy(input[i..][0..k], wd[0..k]);
+        i += k;
+    }
+    const dict = "meta-block window stream brotli";
+    inline for (.{ Effort.q0, .q1, .q4, .q6, .q9, .q11 }) |e| {
+        for ([_]usize{ 0, 1, 1000, n }) |len| {
+            for ([_][]const u8{ "", dict }) |d| {
+                const opts = (CompressOptions{ .effort = e, .dictionary = d }).sanitized();
+                const want = try compressWith(gpa, input[0..len], opts);
+                defer gpa.free(want);
+                var aw: std.Io.Writer.Allocating = .init(gpa);
+                defer aw.deinit();
+                try compressStreamed(gpa, &aw.writer, input[0..len], opts);
+                try testing.expectEqualSlices(u8, want, aw.written());
+                const out = try gpa.alloc(u8, want.len);
+                defer gpa.free(out);
+                try testing.expectEqualSlices(u8, want, try compressStreamedInto(gpa, out, input[0..len], opts));
+                if (want.len != 0)
+                    try testing.expectError(error.OutputTooLarge, compressStreamedInto(gpa, out[0 .. want.len - 1], input[0..len], opts));
+            }
+        }
+    }
 }
