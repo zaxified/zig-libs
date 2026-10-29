@@ -254,7 +254,11 @@ pub const Options = struct {
     /// this, the public knob, said nothing
     /// (W2 re-audit 2026-09-02, `probe` F3).
     timeout_ms: u32 = 1000,
-    /// Repetitions per target (clamped to `[1, max_repetitions]`).
+    /// Repetitions per target (clamped to `[1, max_repetitions]`). Each
+    /// `probeMany` target holds `count` `Result` slots, so the batch allocates
+    /// `targets.len * count * @sizeOf(Result)` bytes up front and makes that
+    /// many connects: both factors are the caller's, the module caps each one
+    /// (`max_targets`, `max_repetitions`) but not their product.
     count: u16 = 1,
     /// Upper bound on connects in flight at once during `probeMany`.
     /// Effectively `max(1, min(max_concurrent, targets, 256))` — 0 does not
@@ -527,9 +531,14 @@ fn runFanout(gpa: Allocator, results: []TargetResult, opts: Options) void {
 /// mirror the repo's proven CLOCK_MONOTONIC pattern). Linux, like the socket.
 fn monoNs() u64 {
     const linux = std.os.linux;
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    // Zeroed and range-checked: a denied call (seccomp) leaves `ts` as it
+    // was, and an `@intCast` of `undefined` is UB in ReleaseFast (blind
+    // review R-probe-2). 0 then reads as "no time passed".
+    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    const sec = std.math.cast(u64, ts.sec) orelse return 0;
+    const nsec = std.math.cast(u64, ts.nsec) orelse return 0;
+    return sec *| std.time.ns_per_s +| nsec;
 }
 
 /// Classify a *successful* connect against the caller's budget. Shared by
@@ -1139,8 +1148,11 @@ pub const PosixConnector = struct {
                 const until_next = next_start -| now;
                 wait_ns = if (wait_ns) |w| @min(w, until_next) else until_next;
             }
+            // Saturating round-up: with a maxInt budget `w` is within a
+            // millisecond of maxInt(u64) whenever the clock reads under 1 ms
+            // (a virtual clock, a time namespace), and a plain `+` overflows.
             const wait_ms: i32 = if (wait_ns) |w|
-                @intCast(@min((w + std.time.ns_per_ms - 1) / std.time.ns_per_ms, @as(u64, std.math.maxInt(i32))))
+                @intCast(@min((w +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms, @as(u64, std.math.maxInt(i32))))
             else
                 -1;
             for (pfds[0..open]) |*pf| pf.revents = 0;
@@ -1943,6 +1955,20 @@ test "race (scripted): a failure while pending starts the next address at once, 
     try testing.expectEqual(@as(u64, 300 * ms), sys.started[2].? - t0); // at the failure, not at 500 ms
     try testing.expectEqual(@as(u64, 10 * ms), r.connect_ns.?);
     try testing.expectEqual(@as(usize, 3), sys.closes); // the black hole too, by the defer
+}
+
+test "race (scripted): a maxInt budget on a clock reading under 1 ms does not overflow the poll timeout (sweep PR-1)" {
+    const ms = FakeSys.ms;
+    // The saturated deadline is maxInt(u64), so the first wait is maxInt(u64) - 0
+    // ns; rounding it up to whole milliseconds with a plain `+` overflowed.
+    var sys: FakeSys = .{ .clock = 0, .plans = &.{
+        .{ .pending = .{ .after_ns = 5 * ms } },
+    } };
+    const addrs = fakeAddrs(1);
+    const r = PosixConnector.connectRaceWith(FakeSys, &sys, &addrs, 1, std.math.maxInt(u64));
+    try testing.expectEqual(Status.up, r.verdict.status);
+    try testing.expectEqual(@as(u64, 5 * ms), r.connect_ns.?);
+    try testing.expectEqual(@as(usize, 1), sys.closes);
 }
 
 test "race (scripted): a failure in the middle of the open set does not lose the attempts after it" {
