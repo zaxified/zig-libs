@@ -586,28 +586,32 @@ pub const Gate = struct {
     throttle: Throttle = .{},
 
     /// Build a gate. Token/realm slices are consumed (hashed / formatted),
-    /// never retained.
+    /// never retained. Panics (`aaa-gate: ...`, in every build mode) on an
+    /// option that breaks its documented contract: `throttle_max_keys` 0, an
+    /// empty token / API key / key-source name / header / query-param name /
+    /// `deny_content_type`, a `realm` with `"`, `\` or a control byte, a Basic
+    /// user with `:` or an empty password.
     pub fn init(gpa: Allocator, options: Options) error{OutOfMemory}!Gate {
-        std.debug.assert(options.throttle_max_keys >= 1);
+        require(options.throttle_max_keys >= 1, "aaa-gate: Options.throttle_max_keys must be >= 1");
         var tokens: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer tokens.deinit(gpa);
         if (options.token) |t| {
-            std.debug.assert(t.len != 0);
+            require(t.len != 0, "aaa-gate: Options.token must be non-empty");
             try tokens.append(gpa, fingerprint(t));
         }
         for (options.extra_tokens) |t| {
-            std.debug.assert(t.len != 0);
+            require(t.len != 0, "aaa-gate: Options.extra_tokens entries must be non-empty");
             const fp = fingerprint(t);
             if (!containsFp(tokens.items, fp)) try tokens.append(gpa, fp);
         }
         var api_keys: std.ArrayList([Sha256.digest_length]u8) = .empty;
         errdefer api_keys.deinit(gpa);
         if (options.api_key) |k| {
-            std.debug.assert(k.len != 0);
+            require(k.len != 0, "aaa-gate: Options.api_key must be non-empty");
             try api_keys.append(gpa, fingerprint(k));
         }
         for (options.extra_api_keys) |k| {
-            std.debug.assert(k.len != 0);
+            require(k.len != 0, "aaa-gate: Options.extra_api_keys entries must be non-empty");
             const fp = fingerprint(k);
             if (!containsFp(api_keys.items, fp)) try api_keys.append(gpa, fp);
         }
@@ -616,25 +620,31 @@ pub const Gate = struct {
         for (options.basic_users) |u| {
             // Same contract as `addBasicUser`: a `:` in the user would let this
             // stored pair match a different (user, password) split.
-            std.debug.assert(std.mem.findScalar(u8, u.user, ':') == null and u.password.len != 0);
+            require(std.mem.findScalar(u8, u.user, ':') == null and u.password.len != 0, "aaa-gate: Options.basic_users: user must not contain ':' and password must be non-empty");
             const fp = basicFingerprint(u.user, u.password);
             if (!containsFp(basics.items, fp)) try basics.append(gpa, fp);
+        }
+        if (options.realm) |r| {
+            // Rendered inside a quoted-string of the challenge: a `"` or `\` would
+            // end or escape it, a CR/LF/NUL/control byte would make every 401 an
+            // error (`HeaderValue.init` fails per request on the deny path).
+            require(std.mem.findAny(u8, r, "\"\\") == null and if (HeaderValue.init(r)) |_| true else |_| false, "aaa-gate: Options.realm must not contain '\"', '\\' or a control byte");
         }
         const challenge = try buildChallenge(gpa, options.auth_mode, options.realm);
         errdefer gpa.free(challenge);
         const key_sources = try buildSources(gpa, &options);
         errdefer freeSources(gpa, key_sources);
-        std.debug.assert(options.api_key_header.len != 0);
+        require(options.api_key_header.len != 0, "aaa-gate: Options.api_key_header must be non-empty");
         const api_key_header = try gpa.dupe(u8, options.api_key_header);
         errdefer gpa.free(api_key_header);
         const api_key_query_param = if (options.api_key_query_param) |q| blk: {
-            std.debug.assert(q.len != 0);
+            require(q.len != 0, "aaa-gate: Options.api_key_query_param must be non-empty when set");
             break :blk try gpa.dupe(u8, q);
         } else null;
         errdefer if (api_key_query_param) |q| gpa.free(q);
         const deny_body = try gpa.dupe(u8, options.deny_body);
         errdefer gpa.free(deny_body);
-        std.debug.assert(options.deny_content_type.len != 0);
+        require(options.deny_content_type.len != 0, "aaa-gate: Options.deny_content_type must be non-empty");
         const deny_content_type = try gpa.dupe(u8, options.deny_content_type);
         return .{
             .gpa = gpa,
@@ -801,13 +811,14 @@ pub const Gate = struct {
     }
 
     /// Add a Basic user (rotation, mirrors `addToken`). Idempotent; hashed,
-    /// not retained. `user` must not contain `:`; `password` non-empty.
+    /// not retained. `user` must not contain `:`; `password` non-empty (a
+    /// violation panics, `aaa-gate: ...`).
     pub fn addBasicUser(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
         return burn.run(burn.hash_burn, error{OutOfMemory}!void, addBasicUserBody, .{ g, user, password });
     }
 
     fn addBasicUserBody(g: *Gate, user: []const u8, password: []const u8) error{OutOfMemory}!void {
-        std.debug.assert(std.mem.findScalar(u8, user, ':') == null and password.len != 0);
+        require(std.mem.findScalar(u8, user, ':') == null and password.len != 0, "aaa-gate: addBasicUser: user must not contain ':' and password must be non-empty");
         const fp = basicFingerprint(user, password);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -840,13 +851,14 @@ pub const Gate = struct {
     }
 
     /// Add an API key to the valid set (rotation, mirrors `addToken`).
-    /// Idempotent; `key` is hashed, not retained; must be non-empty.
+    /// Idempotent; `key` is hashed, not retained; must be non-empty (an empty
+    /// key panics, `aaa-gate: ...`).
     pub fn addApiKey(g: *Gate, key: []const u8) error{OutOfMemory}!void {
         return burn.run(burn.hash_burn, error{OutOfMemory}!void, addApiKeyBody, .{ g, key });
     }
 
     fn addApiKeyBody(g: *Gate, key: []const u8) error{OutOfMemory}!void {
-        std.debug.assert(key.len != 0);
+        require(key.len != 0, "aaa-gate: addApiKey: key must be non-empty");
         const fp = fingerprint(key);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -882,13 +894,13 @@ pub const Gate = struct {
     /// Add a token to the valid set (rotation step 1: add the new token,
     /// migrate clients, then `removeToken` the old). Idempotent — adding
     /// a token that is already valid is a no-op. `token` is hashed, not
-    /// retained; must be non-empty.
+    /// retained; must be non-empty (an empty token panics, `aaa-gate: ...`).
     pub fn addToken(g: *Gate, token: []const u8) error{OutOfMemory}!void {
         return burn.run(burn.hash_burn, error{OutOfMemory}!void, addTokenBody, .{ g, token });
     }
 
     fn addTokenBody(g: *Gate, token: []const u8) error{OutOfMemory}!void {
-        std.debug.assert(token.len != 0);
+        require(token.len != 0, "aaa-gate: addToken: token must be non-empty");
         const fp = fingerprint(token);
         lockSpin(&g.lock);
         defer g.lock.unlock();
@@ -1017,7 +1029,7 @@ fn buildSources(gpa: Allocator, options: *const Options) Allocator.Error![]KeySo
         gpa.free(out);
     }
     for (given) |s| {
-        std.debug.assert(s.name.len != 0);
+        require(s.name.len != 0, "aaa-gate: Options.api_key_sources: name must be non-empty");
         const name = try gpa.dupe(u8, s.name);
         errdefer gpa.free(name);
         const prefix = try gpa.dupe(u8, s.prefix);
@@ -1031,6 +1043,15 @@ fn containsFp(list: []const [Sha256.digest_length]u8, fp: [Sha256.digest_length]
     var found = false;
     for (list) |t| found = std.crypto.timing_safe.eql([Sha256.digest_length]u8, t, fp) or found;
     return found;
+}
+
+/// Caller-contract check, live in every build mode (`std.debug.assert` is
+/// compiled out of ReleaseFast, where a violated option would then be silently
+/// accepted: an empty credential, a `:` in a Basic user). The conditions look
+/// at lengths and at the non-secret user name only, and a failing check never
+/// reaches the hash or the store.
+inline fn require(ok: bool, comptime msg: []const u8) void {
+    if (!ok) @panic(msg);
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -4245,13 +4266,9 @@ test "repeated credential fields: only the fields the mode reads count, and a lo
 
 test "deny path: a challenge or content type that is not a legal header value fails the request (500), never reaches the wire" {
     var buf: [1024]u8 = undefined;
-    var g1 = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .realm = "a\r\nSet-Cookie: x=1" });
-    defer g1.deinit();
-    var gr1 = try GatedRouter.init(&g1, null);
-    defer gr1.deinit();
-    const got1 = runWire(&gr1.r, wire("GET", "/t", ""), &buf);
-    try expectStatus(got1, "500");
-    try testing.expect(std.mem.find(u8, got1, "Set-Cookie") == null);
+    // A `realm` with CR/LF no longer reaches this path: `init` panics on it
+    // (a checked panic cannot be asserted in-process). The content type is not
+    // checked at init beyond non-empty, so the deny-path error stays covered.
     var g2 = try Gate.init(testing.allocator, .{ .token = "s3cr3t", .deny_content_type = "text/plain\r\nX-Injected: 1" });
     defer g2.deinit();
     var gr2 = try GatedRouter.init(&g2, null);
