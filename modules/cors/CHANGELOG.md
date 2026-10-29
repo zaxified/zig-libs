@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE (one test added):** Delta audit of the no-panic sweep: 14 mutants over the changed code (each lent value copied again, the echo catch propagated, `Vary` dropped on a failed echo); 11 killed on the first run, the 3 survivors (Allow-Methods and a configured Allow-Headers list copied) became one test: an outer middleware that leaves 20 bytes of the header-copy store still gets the whole grant on the gated and the wildcard paths. 14/14. Cumulative 69/70, 1 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** a long client-chosen `Origin` (echoed by `.predicate`/`.patterns`) or reflected `Access-Control-Request-Headers` can no longer turn a response into a 500 that skips the handler: values cors owns (methods, header lists, max-age, credentials, `Vary`, configured origins) no longer spend the response's header-copy budget, and an echo that does not fit is treated as not granted (`Vary: Origin` kept) or omitted. **Behavioural for misconfiguration:** an allowed origin / allowed or exposed header with a CR/LF/NUL/control byte panics at `init` in every build mode (was a Debug-only assert). Report `~/CML/20261029-panic-sweep/cors-sweep.report.md`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the all-module `strRepeat` rewrite (`571bf09e`) is reverted here: this module's calls are small (seconds of Sema at most), and the change would have made its fresh audit's `src` hash stale for nothing.
 

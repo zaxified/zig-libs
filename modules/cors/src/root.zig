@@ -3055,3 +3055,68 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+/// An outer middleware that spends the response's header-copy store before
+/// cors runs (a big cookie, a long CSP), leaving `fill_leave` bytes.
+const fill_leave = 20;
+fn fillHeaderStore(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const room = ctx.res.header_buf.len - ctx.res.header_buf_len;
+    const filler: [http.Server.header_copy_bytes]u8 = @splat('f');
+    try ctx.res.setHeader("X-Fill", filler[0 .. room - fill_leave - "X-Fill".len]);
+    return next.run(ctx);
+}
+
+test "what cors owns needs no header-copy room: a full store still gets the whole grant (sweep R2-1)" {
+    // Only a request echo is copied into the response; Methods, a configured
+    // header list, Credentials, Max-Age, Vary, Expose and a configured origin
+    // are lent. So an outer middleware that left 20 bytes of the store still
+    // gets every CORS header, on the gated paths and the wildcard one.
+    var buf: [9000]u8 = undefined;
+    const gated: Options = .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{ .get, .post, .delete },
+        .allowed_headers = .{ .list = &.{"X-Alpha"} },
+        .exposed_headers = &.{"X-Total"},
+        .allow_credentials = true,
+        .max_age_s = 600,
+    };
+    const wildcard: Options = .{
+        .allowed_origins = .any,
+        .allow_unconditional_wildcard = true,
+        .allowed_methods = &.{ .get, .post, .delete },
+        .allowed_headers = .{ .list = &.{"X-Alpha"} },
+        .exposed_headers = &.{"X-Total"},
+        .max_age_s = 600,
+    };
+    for ([_]Options{ gated, wildcard }) |opts| {
+        var c: Cors = try .init(testing.allocator, opts);
+        defer c.deinit();
+        var flag: Flag = .{};
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        r.state = &flag;
+        try r.use(.{ .run = fillHeaderStore });
+        try r.use(c.middleware());
+        try r.get("/t", hOk);
+
+        const pre = runWireBigHead(r.handler(), &r, wire("OPTIONS", "/t", "Origin: https://app.example\r\n" ++
+            "Access-Control-Request-Method: DELETE\r\nAccess-Control-Request-Headers: x-alpha\r\n"), &buf);
+        try expectStatus(pre, "204");
+        try testing.expect(std.mem.find(u8, pre, "\r\nAccess-Control-Allow-Origin: ") != null);
+        try testing.expect(std.mem.find(u8, pre, "\r\nAccess-Control-Allow-Methods: ") != null);
+        try testing.expect(std.mem.find(u8, pre, "\r\nAccess-Control-Allow-Headers: ") != null);
+        try expectHeaderLine(pre, "Access-Control-Max-Age: 600");
+        if (opts.allow_credentials) try expectHeaderLine(pre, "Access-Control-Allow-Credentials: true");
+
+        flag.hit = false;
+        const actual = runWireBigHead(r.handler(), &r, wire("GET", "/t", "Origin: https://app.example\r\n"), &buf);
+        try expectStatus(actual, "200");
+        try testing.expect(flag.hit);
+        try testing.expect(std.mem.find(u8, actual, "\r\nAccess-Control-Allow-Origin: ") != null);
+        try expectHeaderLine(actual, "Access-Control-Expose-Headers: X-Total");
+        if (opts.allow_credentials) {
+            try expectHeaderLine(actual, "Access-Control-Allow-Credentials: true");
+            try expectHeaderLine(actual, "Vary: Origin");
+        }
+    }
+}
