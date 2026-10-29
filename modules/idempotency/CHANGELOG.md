@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 2 mutants, 2/2 on the first run; cumulative 49/49. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `KvBackend` lease age saturates when the clock jumps across the i64 range (was an overflow; in ReleaseFast a wrapped age could hand a live reservation to a second request); a `Store` with neither `cache` nor `backend` panics with a message on use and `deinit` is total for it; `encode` checks the header-block length before allocating (no leak on that error). Report `~/CML/20261029-panic-sweep/idempotency-sweep.report.md`.
 - **2026-10-23** — Fixed: `Store.respond` records before it writes — a write that failed (the client dropped the connection) skipped the record and the retry ran the side effect again. Added: a replay also carries the response headers the guarded chain set (`Location`, `ETag`, …; transfer headers excluded) — `Store.recordWithHeaders`, `RecordedResponse.headers` / `headerIterator`, `Store.Current.headers_mark`; the record layout gains a block flagged by status bit 15, a record without headers is byte-identical to before (older records and `KvBackend` files decode). Behavioural: the draft's sf-string key (`"abc"`) is parsed (`parseKey`) and equals the bare token; two `Idempotency-Key` field lines answer 400. Grade 1 (lead vs `@node-idempotency/core`, `tools/lead_probe`).
 

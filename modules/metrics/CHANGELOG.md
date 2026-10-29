@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE (one test extended):** Delta audit of the no-panic sweep: 7 mutants, 6 killed on the first run; the survivor (long-name scan without its suffix compare) became a no-false-collision check in the ME-5 test. 7/7, cumulative 473/489, 16 eq. Card A1 again.
 - **2026-10-29** — **Fix (no-panic sweep):** `approxRequestSize` saturates instead of overflowing on a peer-declared `Content-Length` near 2^64 (server without `max_body_bytes`); `Histogram.cumulativeBucket` is total (an index past the last bound is `+Inf`); `Summary.snapshot` fills a short output slice as far as it goes (was a Debug-only assert); a metric name over the 256-byte scratch no longer skips the derived-name collision check; an exemplar with more labels than the 128-rune cap is refused before the O(n²) duplicate scan. Left in Backlog: summary `epsilon = 0` keeps every observation (owner decision). Reports `~/CML/20261029-panic-sweep/metrics-sweep.report.md`, `review-metrics.report.md`.
 - **2026-10-27** — **NO CONSUMER-VISIBLE CHANGE:** `tools/bench.zig` declares `net_prefix` `pub`. Zig 0.17's `@hasDecl` sees only `pub` declarations, so the bench's probe was false and every workload row — not only `serve_*` — was eligible for the network-net ratio. Found by the new repo check `scripts/checks/check-hasdecl-pub.py`.
 

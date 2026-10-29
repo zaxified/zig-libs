@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** the sweep changed tests only; the blind review of 2026-10-29 found no reachable panic, so the review date moves and the mutation record stands. Card A1 again.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE (one test added):** no-panic sweep found nothing reachable; a seeded test pins extreme line/column values, every `RenderOptions` field at its extreme, up to 70 labels and all LSP encodings. Two LOW complexity notes in Backlog. Reports `~/CML/20261029-panic-sweep/diagnostics-sweep.report.md`, `review-diag-health-idem.report.md`.
 - **2026-10-23** — **Card: grade 1** (S1 E1 A1 H– P1): `**Ahead:**` line (codespan-reporting 0.13.1 writes 16
   raw ESC/BEL/U+202E characters of a hostile key name to the terminal, ours none; `interop-diagnostics --lead`),

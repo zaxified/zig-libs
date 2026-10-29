@@ -115,4 +115,13 @@ test "registration: a name too long for the scratch buffer still collides with a
     // The histogram would emit `<base>_sum` as well: a duplicate sample.
     try testing.expectError(error.NameCollision, reg.histogram(base, "h", &.{}, &.{1}));
     try testing.expectError(error.NameCollision, reg.summary(base, "s", &.{}, .{}));
+    // Same length as `<base>_bucket` but another suffix: no collision, the
+    // scan matches the suffix itself, not only the prefix and the length.
+    const other_base = try a.alloc(u8, 300);
+    defer a.free(other_base);
+    @memset(other_base, 'b');
+    const near = try std.mem.concat(a, u8, &.{ other_base, "_xbucke" });
+    defer a.free(near);
+    _ = try reg.counter(near, "c", &.{});
+    _ = try reg.histogram(other_base, "h", &.{}, &.{1});
 }
