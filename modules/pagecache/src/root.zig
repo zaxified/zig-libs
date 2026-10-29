@@ -104,10 +104,14 @@ pub const Options = struct {
     /// Fixed page size in bytes. Only reads/writes that are aligned to and
     /// exactly this many bytes are cached (kvtree always issues those); any
     /// other-shaped access is passed straight through. Defaults to kvtree's
-    /// page size.
+    /// page size. Must be > 0 (`init` panics with "pagecache: page_size must
+    /// be > 0" otherwise).
     page_size: usize = default_page_size,
     /// RAM budget expressed as the maximum number of resident pages. Total
     /// resident value bytes are therefore bounded by `max_pages * page_size`.
+    /// Must be > 0 and `max_pages * page_size` must fit `usize`; `init` panics
+    /// with a "pagecache: ..." message otherwise (a computed
+    /// `cache_bytes / page_size` can be 0: check it before calling).
     max_pages: usize,
     /// Sequential read-ahead depth, in pages. `0` (the default) is the module
     /// exactly as it was: one inner `pread` per missed page. With `k > 0`, a
@@ -115,7 +119,10 @@ pub const Options = struct {
     /// access was page `i - 1` reads pages `i .. i + k` in ONE inner `pread`
     /// (clamped to the file's size and to `max_pages - 1` extra pages) and
     /// keeps the extra pages as ordinary, unpinned, evictable entries. See
-    /// SPEC.md § "Read-ahead" for the safety argument.
+    /// SPEC.md § "Read-ahead" for the safety argument. A miss allocates a
+    /// transient scratch buffer of up to `min(k, max_pages - 1) + 1` pages (at
+    /// most the cache's own byte budget); an allocation failure just skips the
+    /// read-ahead.
     read_ahead_pages: u32 = 0,
 };
 
@@ -288,7 +295,8 @@ pub const PageCache = struct {
     /// There is deliberately no internal fall-back to a copying read: the
     /// point of this path is that a caller can tell whether it engaged.
     ///
-    /// Release with `releasePage` exactly once. Holding a page across other
+    /// Release with `releasePage` exactly once (a second release, or a release
+    /// after `deinit`, cannot be detected: it is undefined behaviour). Holding a page across other
     /// operations on this cache is *safe* (that is what the pin is for) — a
     /// borrowed page is never evicted, and a write to the same page parks the
     /// borrowed bytes rather than overwriting them, so the borrow keeps the
@@ -649,11 +657,26 @@ pub const PageCache = struct {
             // succeeds and never mis-admits), else offer it to the cache.
             self.cache.put(&key, bytes, 0, 0, 0);
         } else {
-            // A sub-page or unaligned write could partially overlap several
-            // resident pages we cannot pick out cheaply; drop every page of
-            // THIS file (shared by all handles open on it). kvtree never
-            // issues such a write, so this is defensive.
-            self.dropFile(fid);
+            // A sub-page or unaligned write partially overlaps the pages
+            // its span touches (shared by all handles open on the file):
+            // drop exactly those. A whole-file `dropFile` here scanned the
+            // entire resident map on every small write (blind review
+            // R-pagecache-1).
+            self.dropSpan(fid, off, bytes.len);
+        }
+    }
+
+    /// Drop the pages of `file` that `[off, off + len)` touches; a span
+    /// wider than `4 * max_pages` sweeps the file by prefix instead.
+    fn dropSpan(self: *PageCache, file: FileId, off: u64, len: usize) void {
+        if (len == 0) return;
+        const first = off / self.page_size;
+        const last = (off +| (len - 1)) / self.page_size;
+        if (last - first >= 4 *| self.max_pages) return self.dropFile(file);
+        var i = first;
+        while (i <= last) : (i += 1) {
+            const key = pageKey(file, i);
+            _ = self.cache.remove(&key);
         }
     }
 
@@ -2558,10 +2581,35 @@ test "narrowed sub-page write: only the written handle's pages are dropped" {
     try fillFile(gpa, st, a, 2, 1);
     try fillFile(gpa, st, b, 2, 9);
     try st.writeAll(a, "Z", 7);
-    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages); // b's two
+    try testing.expectEqual(@as(usize, 3), pc.stats().resident_pages); // b's two + a's untouched page 1
     var buf: [default_page_size]u8 = undefined;
     _ = try st.pread(a, &buf, 0);
     try testing.expectEqual(@as(u8, 'Z'), buf[7]);
+}
+
+test "a sub-page write drops only the pages its span touches, not the whole file (review R-pagecache-1)" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 8 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const h = try st.open("f", .create_truncate);
+    try fillFile(gpa, st, h, 4, 1);
+    try testing.expectEqual(@as(usize, 4), pc.stats().resident_pages);
+    // Straddles pages 1 and 2: both go, 0 and 3 stay.
+    try st.writeAll(h, "XY", 2 * default_page_size - 1);
+    try testing.expectEqual(@as(usize, 2), pc.stats().resident_pages);
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, default_page_size);
+    try testing.expectEqual(@as(u8, 'X'), buf[default_page_size - 1]);
+    _ = try st.pread(h, &buf, 2 * default_page_size);
+    try testing.expectEqual(@as(u8, 'Y'), buf[0]);
+    // An empty write drops nothing.
+    const before = pc.stats().resident_pages;
+    try st.writeAll(h, "", 5);
+    try testing.expectEqual(before, pc.stats().resident_pages);
 }
 
 /// Sequential scan of `n` pages through `st`, returning the concatenation.
@@ -3433,5 +3481,57 @@ test "model-fuzz: PageCache over SimStorage == naive per-file byte model (300 se
             std.debug.print("pagecache model-fuzz: reach class never hit: {s}\n", .{name});
             return error.ReachClassMissed;
         }
+    }
+}
+
+test "every page borrowed: further reads and borrows still answer correctly, over the nominal cap, without spinning (sweep PC-3)" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 2 });
+    defer pc.deinit();
+    const st = pc.storage();
+    const n = 6;
+    const h = try seedPages(gpa, &pc, st, n + 1);
+    var refs: [n]Page = undefined;
+    for (&refs, 0..) |*r, i| {
+        r.* = (try pc.preadRef(h, default_page_size, i * default_page_size)) orelse return error.TestUnexpectedResult;
+    }
+    // All six borrows are resident and pinned: over the nominal cap of 2.
+    try testing.expectEqual(@as(usize, n), pc.stats().borrowed_pages);
+    // A plain read of a new page cannot be admitted (nothing is evictable) but is answered.
+    var buf: [default_page_size]u8 = undefined;
+    _ = try st.pread(h, &buf, n * default_page_size);
+    for (buf) |b| try testing.expectEqual(@as(u8, n + 1), b);
+    for (refs, 0..) |r, i| for (r.bytes) |b| try testing.expectEqual(@as(u8, @truncate(i + 1)), b);
+    for (refs) |r| pc.releasePage(r);
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+    // The next admission restores the cap.
+    _ = try st.pread(h, &buf, n * default_page_size);
+    try testing.expect(pc.stats().resident_pages <= 2);
+}
+
+test "odd page sizes (1 and 7 bytes) with read-ahead: sequential reads are exact, reads at the top of the offset range are misses not overflow (sweep PC-3)" {
+    const gpa = testing.allocator;
+    inline for (.{ 1, 7 }) |ps| {
+        var sim = kv.SimStorage.init(gpa);
+        defer sim.deinit();
+        var pc = PageCache.init(gpa, sim.storage(), .{ .page_size = ps, .max_pages = 3, .read_ahead_pages = 4 });
+        defer pc.deinit();
+        const st = pc.storage();
+        const h = try st.open("odd", .create_truncate);
+        var data: [ps * 20]u8 = undefined;
+        for (&data, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+        try st.writeAll(h, &data, 0);
+        var page: [ps]u8 = undefined;
+        for (0..20) |i| {
+            try testing.expectEqual(@as(usize, ps), try st.pread(h, &page, i * ps));
+            try testing.expectEqualSlices(u8, data[i * ps ..][0..ps], &page);
+        }
+        // Far past the end, and at the very top of the u64 range: empty reads.
+        try testing.expectEqual(@as(usize, 0), try st.pread(h, &page, 1000 * ps));
+        try testing.expectEqual(@as(usize, 0), try st.pread(h, &page, std.math.maxInt(u64) - ps));
+        try testing.expect((try pc.preadRef(h, ps, 1000 * ps)) == null);
+        st.close(h);
     }
 }
