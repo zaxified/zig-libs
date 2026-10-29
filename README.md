@@ -372,7 +372,7 @@ way to recognise it.
 | [`aaa-gate`](modules/aaa-gate/README.md) | 1 | Bearer + API-key (header/query/cookie) + HTTP Basic auth (constant-time) + audit hook + denied-request throttle | any | router, http, b64ct, cookies |
 | [`abuseguard`](modules/abuseguard/README.md) | 2 (A) | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
 | [`accesslog`](modules/accesslog/README.md) | 1 | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
-| [`acme`](modules/acme/README.md) | 1 | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt, b64ct |
+| [`acme`](modules/acme/README.md) | 2 (A) | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt, b64ct |
 | [`acmedns`](modules/acmedns/README.md) | 3 (A) | ACME DNS-01: CNAME delegation, SOA zone walk, propagation check; RFC 2136+TSIG, acme-dns, httpreq, exec publishers | linux (exec publisher: posix process spawn) | acme, dns, http, netaddr, procrun, b64ct |
 | [`aescbc`](modules/aescbc/README.md) | 2 (S,E,A) | AES-CBC (NIST SP800-38A): one-shot, incremental, streaming with six paddings, ciphertext stealing CS1-3; zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | aes192 |
@@ -527,7 +527,7 @@ way to recognise it.
 | [`geoindex`](modules/geoindex/README.md) | 4 (S) | Static spatial index for bbox and nearest-neighbour queries over a large fixed geo-point set — DoS-bounded, zero-copy. | any | — |
 | [`jobqueue`](modules/jobqueue/README.md) | 3 (S,P) | Durable background-job queue over `kv` — lease/retry/dead-letter queue, per-partition FIFO under priority. | posix | kv |
 | [`jsonshape`](modules/jsonshape/README.md) | 3 (S,E,P) | JSON → `dataset` reshaping — dot-path descent and typed column projection (a minimal jq-style subset). | any | dataset |
-| [`kv`](modules/kv/README.md) | 1 | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | — |
+| [`kv`](modules/kv/README.md) | 2 (A) | Crash-consistent embedded KV store, Bitcask-style log, with randomized fuzz-tested crash recovery. | any | — |
 | [`kvtree`](modules/kvtree/README.md) | 1 | Ordered transactional KV store — copy-on-write B-tree (LMDB/BoltDB lineage), MVCC snapshots, crash-safe range scans. | any | kv, crc32 |
 | [`ramcache`](modules/ramcache/README.md) | 2 (S,P) | Bounded in-memory cache — W-TinyLFU admission/eviction, TTL, generation invalidation; sharded thread-safe wrapper. | any | — |
 | [`sort`](modules/sort/README.md) | 2 (A,P) | Fast in-place sorting: Rust's ipnsort as a drop-in for std.sort.pdq. | any (pure Zig, no allocation) | — |

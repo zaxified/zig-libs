@@ -187,6 +187,9 @@ const header_len = 8;
 /// `DataFile.id` of a single-file (version 1/2) store's data file, which is
 /// `<path>` itself. A migrated store calls that file id 0, `<path>.0.data`.
 const legacy_id: u32 = std.math.maxInt(u32);
+/// Largest `next_file_id` a store may hold: file ids stay below `legacy_id`
+/// (that id names the manifest's own path), so `id + 1` never reaches it.
+const max_next_file_id: u32 = legacy_id - 1;
 /// Hint file (`<path>.<id>.hint`, merge outputs only — SPEC § "Hint files"):
 /// "ZKVH" | version u32, entries, then the data-file length it describes u64
 /// and a CRC-32 over everything before it. Entry: op u8 | key_len u32 |
@@ -597,6 +600,10 @@ pub const Storage = struct {
         const f = s.vtable.list orelse return null;
         return f(s.ctx, gpa, prefix);
     }
+    /// Handle contract: every `Handle` passed to a `Storage` method must come
+    /// from this backend's `open` and not yet be closed. `FsStorage` answers
+    /// a closed or out-of-range handle with `error.Unexpected`; other
+    /// backends (and `SimStorage`) may assert.
     pub fn close(s: Storage, h: Handle) void {
         s.vtable.close(s.ctx, h);
     }
@@ -844,6 +851,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// page past the end is ever touched.
         fn vPreadRef(ctx: *anyopaque, h: Storage.Handle, len: usize, off: u64) Storage.Error!?Storage.Ref {
             const self = cast(ctx);
+            _ = try self.fileOf(h);
             const end = std.math.add(u64, off, len) catch return null;
             const m = &self.maps[h];
             const n = m.count.load(.acquire);
@@ -854,7 +862,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         }
 
         fn remapFor(self: *Self, h: Storage.Handle, end: u64, len: usize, off: u64) Storage.Error!?Storage.Ref {
-            const file = self.fileOf(h);
+            const file = try self.fileOf(h);
             const m = &self.maps[h];
             // Under the lock `vTruncate` takes: a length read before a cut
             // must not raise `known` after it.
@@ -933,43 +941,51 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             return @intCast(slot);
         }
 
-        fn fileOf(self: *Self, h: Storage.Handle) std.Io.File {
-            return self.files[h].?;
+        /// The open file of `h`. A handle that is out of range or already
+        /// closed is a caller bug (`Db` never passes one); it is reported as
+        /// `error.Unexpected` instead of faulting, so every `v*` entry point
+        /// below is total. Check this first: it also guards `read_only[h]`
+        /// and `maps[h]`.
+        fn fileOf(self: *Self, h: Storage.Handle) Storage.Error!std.Io.File {
+            if (h >= max_handles) return error.Unexpected;
+            return self.files[h] orelse error.Unexpected;
         }
 
         fn vSize(ctx: *anyopaque, h: Storage.Handle) Storage.Error!u64 {
             const self = cast(ctx);
-            return self.fileOf(h).length(self.io) catch |e| mapErr(e);
+            return (try self.fileOf(h)).length(self.io) catch |e| mapErr(e);
         }
 
         fn vPread(ctx: *anyopaque, h: Storage.Handle, buf: []u8, off: u64) Storage.Error!usize {
             const self = cast(ctx);
-            return self.fileOf(h).readPositionalAll(self.io, buf, off) catch |e| mapErr(e);
+            return (try self.fileOf(h)).readPositionalAll(self.io, buf, off) catch |e| mapErr(e);
         }
 
         fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
             const self = cast(ctx);
+            const file = try self.fileOf(h);
             if (self.read_only[h]) return error.AccessDenied;
-            self.fileOf(h).writePositionalAll(self.io, bytes, off) catch |e| return mapErr(e);
+            file.writePositionalAll(self.io, bytes, off) catch |e| return mapErr(e);
             if (self.mmap_reads) _ = self.maps[h].known.fetchMax(off + bytes.len, .acq_rel);
         }
 
         fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
             const self = cast(ctx);
-            self.fileOf(h).sync(self.io) catch |e| return mapErr(e);
+            (try self.fileOf(h)).sync(self.io) catch |e| return mapErr(e);
         }
 
         fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
             const self = cast(ctx);
+            const file = try self.fileOf(h);
             if (self.read_only[h]) return error.AccessDenied;
-            if (!self.mmap_reads) return self.fileOf(h).setLength(self.io, len) catch |e| mapErr(e);
+            if (!self.mmap_reads) return file.setLength(self.io, len) catch |e| mapErr(e);
             // With the lock a remap takes to raise `known`, and lowering it
             // first: a lend racing the cut must not pass the new end.
             self.table_lock.lockUncancelable(self.io);
             defer self.table_lock.unlock(self.io);
             const m = &self.maps[h];
             m.known.store(@min(len, m.known.load(.acquire)), .release);
-            self.fileOf(h).setLength(self.io, len) catch |e| return mapErr(e);
+            file.setLength(self.io, len) catch |e| return mapErr(e);
             m.known.store(len, .release);
         }
 
@@ -978,8 +994,9 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// `false`, not an error.
         fn vAllocate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
             const self = cast(ctx);
+            const file = try self.fileOf(h);
             if (self.read_only[h]) return error.AccessDenied;
-            const fd = self.fileOf(h).handle;
+            const fd = file.handle;
             const signed_len = std.math.cast(i64, len) orelse return error.NoSpaceLeft;
             while (true) {
                 switch (linux.errno(linux.fallocate(fd, 0, 0, signed_len))) {
@@ -998,8 +1015,9 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// `sync`.
         fn vSyncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
             const self = cast(ctx);
+            const fd = (try self.fileOf(h)).handle;
             while (true) {
-                switch (linux.errno(linux.fdatasync(self.fileOf(h).handle))) {
+                switch (linux.errno(linux.fdatasync(fd))) {
                     .SUCCESS => return,
                     .INTR => continue,
                     .IO => return error.InputOutput,
@@ -1011,6 +1029,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
 
         fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
             const self = cast(ctx);
+            if (h >= max_handles) return; // not a handle of this backend: nothing to close
             const f = blk: {
                 self.table_lock.lockUncancelable(self.io);
                 defer self.table_lock.unlock(self.io);
@@ -1083,13 +1102,13 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         /// instead of parking the thread inside a library call forever.
         fn vTryLockExclusive(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
             const self = cast(ctx);
-            return self.fileOf(h).tryLock(self.io, .exclusive) catch |e| mapErr(e);
+            return (try self.fileOf(h)).tryLock(self.io, .exclusive) catch |e| mapErr(e);
         }
 
         /// `flock(fd, LOCK_SH | LOCK_NB)`, the shared sibling of the above.
         fn vTryLockShared(ctx: *anyopaque, h: Storage.Handle) Storage.Error!bool {
             const self = cast(ctx);
-            return self.fileOf(h).tryLock(self.io, .shared) catch |e| mapErr(e);
+            return (try self.fileOf(h)).tryLock(self.io, .shared) catch |e| mapErr(e);
         }
     };
 }
@@ -1121,7 +1140,14 @@ pub const Options = struct {
     /// first seals it and starts a new one (Bitcask's `max_file_size`); a
     /// record larger than this gets a file of its own. The first rotation of
     /// a single-file store turns it into a multi-file store — see SPEC
-    /// § "Multi-file log".
+    /// § "Multi-file log". Each data file holds a storage handle for as long
+    /// as the store is open (`FsStorage` has `default_max_handles` = 64 in
+    /// all, shared with the lock file and temporaries), so with the 2 GiB
+    /// default a store tops out near 60 files, roughly 120 GiB; the rotation
+    /// that needs the next handle fails with `HandleTableFull` and — a
+    /// rotation changes the namespace — poisons the store until reopen. Size
+    /// the backend (`FsStorageCapacity`) or raise `max_file_size` for stores
+    /// that large.
     max_file_size: u64 = default_max_file_size,
 
     /// Open as a reader of a store another `Db` — in this process or
@@ -1562,6 +1588,9 @@ pub const Db = struct {
         const n_files = std.mem.readInt(u32, buf[12..16], .little);
         const n_obsolete = std.mem.readInt(u32, buf[16..20], .little);
         if (n_files == 0 or (@as(u64, n_files) + n_obsolete) * 4 != body_end - 20) return error.Corrupt;
+        // A foreign counter past the id space would collide with `legacy_id`
+        // (the manifest's own path) or overflow on the next file creation.
+        if (next_id > max_next_file_id) return error.Corrupt;
         const ids = buf[20..][0 .. n_files * 4];
         const obs = buf[20 + n_files * 4 ..][0 .. n_obsolete * 4];
         self.multi = true;
@@ -1575,7 +1604,7 @@ pub const Db = struct {
             // of the store, so delete them (named probes — never a listing).
             while (i < n_obsolete) : (i += 1) _ = try self.deleteDataFile(std.mem.readInt(u32, obs[i * 4 ..][0..4], .little));
             var stray = next_id;
-            while (try self.deleteDataFile(stray)) stray += 1;
+            while (stray < legacy_id and try self.deleteDataFile(stray)) stray += 1;
         }
 
         i = 0;
@@ -1606,6 +1635,12 @@ pub const Db = struct {
             if (!ok or (version != version_plain and version != version_expiry)) {
                 // Every listed file was created and synced, header included,
                 // before a manifest named it.
+                self.store.close(fh);
+                return error.Corrupt;
+            }
+            if (last and version != version_expiry) {
+                // Every data file a multi-file store creates is version 2
+                // (`putExpiring` relies on it for the active file).
                 self.store.close(fh);
                 return error.Corrupt;
             }
@@ -1680,6 +1715,10 @@ pub const Db = struct {
     /// to learn it. Releases the cross-process lock — by closing
     /// the handle that holds it, the same mechanism the kernel applies when
     /// the process dies, so there is no path where a lock outlives its `Db`.
+    ///
+    /// Lifetime contract (not guarded, a violation is use after free): call
+    /// `close` once, and only after every `Iterator` taken from this `Db` has
+    /// been `deinit`ed; the `Db` must not be used afterwards.
     pub fn close(self: *Db) void {
         if (self.unsynced and !self.poisoned) self.store.sync(self.active().handle) catch {};
         self.freeFiles();
@@ -1932,6 +1971,7 @@ pub const Db = struct {
         try self.store.sync(self.active().handle);
         self.markSynced();
 
+        if (self.next_file_id >= max_next_file_id) return error.NoSpaceLeft; // file id space used up
         // Memory first: once the manifest names the new file, nothing may
         // fail to reflect it.
         try self.files.ensureUnusedCapacity(self.gpa, 1);
@@ -2951,6 +2991,7 @@ pub const Db = struct {
     /// are created in the order they are handed out — what lets `open`'s
     /// stray probe stop at the first missing id.
     fn startOutput(self: *Db, outs: *std.ArrayListUnmanaged(*DataFile)) CompactError!void {
+        if (self.next_file_id >= max_next_file_id) return error.NoSpaceLeft; // file id space used up
         try outs.ensureUnusedCapacity(self.gpa, 1);
         try self.pending.ensureUnusedCapacity(self.gpa, 1);
         const df = try self.gpa.create(DataFile);
@@ -3022,7 +3063,11 @@ pub const Db = struct {
         };
         defer self.store.close(h);
         const size = try self.store.size(h);
-        if (size < header_len + 12 or size > std.math.maxInt(u32)) return header_len;
+        // header + data_len + crc is 20 bytes; an entry is `hint_entry_fixed`
+        // + key where its record is at least `rec_fixed` + key, so no hint of
+        // this file's data can exceed twice the data plus the framing. A bigger
+        // one is foreign (or runaway): not read, the data file is replayed.
+        if (size < header_len + 12 or size > 2 * file_size + 20) return header_len;
         const buf = try self.gpa.alloc(u8, @intCast(size));
         defer self.gpa.free(buf);
         try self.store.preadFull(h, buf, 0);
@@ -3049,6 +3094,9 @@ pub const Db = struct {
             if (op != op_put and op != op_del and op != op_put_exp) return header_len;
             if (op == op_del and val_len != 0) return header_len;
             if (op == op_put_exp and df.version < version_expiry) return header_len;
+            // The expiry field must agree with the op, as `replay` requires of a record.
+            const entry_expires = std.mem.readInt(i64, e[17..25], .little);
+            if ((op == op_put_exp) == (entry_expires == no_expiry)) return header_len;
             if (entries.len - i - hint_entry_fixed < key_len) return header_len;
             if (off != next_off) return header_len;
             next_off = off + recordLenExp(op == op_put_exp, key_len, val_len);
@@ -3146,20 +3194,20 @@ pub const Db = struct {
                 // A record larger than the window: stream it in pieces.
                 var crc = std.hash.Crc32.init();
                 crc.update(fixed[4..@intCast(body)]);
+                // Key and value are checked in window-sized pieces first: the
+                // lengths are unverified until the CRC matches, so nothing is
+                // allocated from them before that.
+                var coff: u64 = 0;
+                const kv_len: u64 = @as(u64, key_len) + val_len;
+                while (coff < kv_len) {
+                    const n: usize = @intCast(@min(replay_window, kv_len - coff));
+                    crc.update(try win.view(self.store, df.handle, file_size, off + body + coff, n));
+                    coff += n;
+                }
+                if (crc.final() != stored_crc) break :scan;
                 key = try self.gpa.alloc(u8, key_len);
                 errdefer self.gpa.free(key);
                 try self.store.preadFull(df.handle, key, off + body);
-                crc.update(key);
-                var voff: u64 = 0;
-                while (voff < val_len) {
-                    const n: usize = @intCast(@min(replay_window, val_len - voff));
-                    crc.update(try win.view(self.store, df.handle, file_size, off + body + key_len + voff, n));
-                    voff += n;
-                }
-                if (crc.final() != stored_crc) {
-                    self.gpa.free(key);
-                    break :scan;
-                }
             }
             var key_owned = true;
             defer if (key_owned) self.gpa.free(key);
@@ -6556,6 +6604,157 @@ test "hints: an expiring entry in the hint of a version-1 file is not trusted" {
     defer db.close();
     try testing.expectEqual(@as(usize, 2), db.count());
     try expectGet(&db, "a", "first value, 30 bytes long...");
+}
+
+// ── no-panic sweep (2026-10-29): foreign, CRC-valid or hostile files ──
+
+test "manifest: a next_file_id past the id space is Corrupt, the last one is used up with NoSpaceLeft" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try sixRecordStore(&sim);
+    const opts: Options = .{ .max_file_size = two_records };
+    {
+        // legacy_id is the manifest's own path: the stray probe would delete it.
+        const m = try craftManifest(testing.allocator, legacy_id, &.{ 0, 1, 2 }, &.{}, 0);
+        defer testing.allocator.free(m);
+        try sim.installFile("db", m);
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", opts));
+        try testing.expectEqualSlices(u8, m, sim.fileContent("db").?);
+    }
+    {
+        const m = try craftManifest(testing.allocator, max_next_file_id, &.{ 0, 1, 2 }, &.{}, 0);
+        defer testing.allocator.free(m);
+        try sim.installFile("db", m);
+        var db = try Db.open(testing.allocator, sim.storage(), "db", opts);
+        defer db.close();
+        // The rotation would hand out an id whose successor is legacy_id.
+        try testing.expectError(error.NoSpaceLeft, db.put("zz", v10));
+        try testing.expectEqualSlices(u8, m, sim.fileContent("db").?); // manifest untouched
+    }
+}
+
+test "manifest: a version-1 file as the active file of a multi-file store is Corrupt" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try sixRecordStore(&sim);
+    // Plain records are valid in a v1 file; only the version marks it.
+    sim.fileContent("db.2.data").?[4] = @intCast(version_plain);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = two_records }));
+    // A sealed v1 file stays fine.
+    sim.fileContent("db.2.data").?[4] = @intCast(version_expiry);
+    sim.fileContent("db.0.data").?[4] = @intCast(version_plain);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = two_records });
+    defer db.close();
+    try testing.expectEqual(@as(usize, 6), db.count());
+}
+
+/// A closed store at "db" whose first merge output has a hint; `exp` puts
+/// every key with an expiry. Returns the first output's id.
+fn hintedStore(sim: *SimStorage, mc: *ManualClock, exp: bool) !u32 {
+    const options: Options = .{ .max_file_size = 100, .clock = mc.clock() };
+    var db = try Db.open(testing.allocator, sim.storage(), "db", options);
+    defer db.close();
+    for (0..6) |i| {
+        var k: [4]u8 = undefined;
+        const key = try std.mem.print(&k, "k{d}", .{i});
+        if (exp) try db.putExpiring(key, v30, 50_000) else try db.put(key, v30);
+    }
+    try db.compact();
+    return db.files.items[0].id;
+}
+
+test "hints: a plain put whose expiry field is set is not trusted (expiring count stays consistent)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    const id = try hintedStore(&sim, &mc, false);
+    var hb: [16]u8 = undefined;
+    const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{id});
+    std.mem.writeInt(i64, sim.fileContent(hint_name).?[header_len + 17 ..][0..8], 5, .little);
+    fixHintCrc(&sim, hint_name);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100, .clock = mc.clock() });
+    defer db.close();
+    try expectExpiringConsistent(&db);
+    try expectGet(&db, "k0", v30);
+    try db.put("k0", "again"); // used to underflow `expiring`
+    try db.delete("k1");
+    try expectExpiringConsistent(&db);
+}
+
+test "hints: an expiring put without an expiry is not trusted (it would not be a record)" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var mc: ManualClock = .{ .now_ms = 1_000 };
+    const id = try hintedStore(&sim, &mc, true);
+    var hb: [16]u8 = undefined;
+    const hint_name = try std.mem.print(&hb, "db.{d}.hint", .{id});
+    std.mem.writeInt(i64, sim.fileContent(hint_name).?[header_len + 17 ..][0..8], no_expiry, .little);
+    fixHintCrc(&sim, hint_name);
+    var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 100, .clock = mc.clock() });
+    defer db.close();
+    try expectExpiringConsistent(&db);
+    try expectGet(&db, "k0", v30);
+    try db.compact(); // used to meet a short, CRC-failing copy
+}
+
+test "hints: a hint far larger than its data file is not read" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try sixRecordStore(&sim);
+    const big = try testing.allocator.alloc(u8, 8 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try sim.installFile("db.0.hint", big);
+    // The store gets a budget far below the hint's size: reading it would fail.
+    const arena_buf = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(arena_buf);
+    var fba = std.heap.FixedBufferAllocator.init(arena_buf);
+    var db = try Db.open(fba.allocator(), sim.storage(), "db", .{ .max_file_size = two_records });
+    defer db.close();
+    try testing.expectEqual(@as(usize, 6), db.count());
+}
+
+test "replay: a corrupt record header with a huge key length allocates nothing before its CRC" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const key_len = 1 << 20;
+    const file = try testing.allocator.alloc(u8, header_len + rec_fixed + key_len);
+    defer testing.allocator.free(file);
+    @memset(file, 0);
+    file[0..4].* = file_magic.*;
+    std.mem.writeInt(u32, file[4..8], version_plain, .little);
+    file[header_len + 4] = op_put;
+    std.mem.writeInt(u32, file[header_len + 5 ..][0..4], key_len, .little); // val_len 0: it all fits
+    try sim.installFile("db", file);
+    const arena_buf = try testing.allocator.alloc(u8, 512 << 10);
+    defer testing.allocator.free(arena_buf);
+    var fba = std.heap.FixedBufferAllocator.init(arena_buf);
+    var db = try Db.open(fba.allocator(), sim.storage(), "db", .{});
+    defer db.close();
+    try testing.expectEqual(@as(usize, 0), db.count());
+    try testing.expectEqual(@as(usize, header_len), sim.fileContent("db").?.len); // torn tail cut
+}
+
+test "FsStorage: a closed or out-of-range handle is an error, never a fault" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    inline for (.{ false, true }) |mmap| {
+        var fs = if (mmap) FsStorage.initMmap(testing.io, tmp.dir) else FsStorage.init(testing.io, tmp.dir);
+        const st = fs.storage();
+        const h = try st.open("h.dat", .create_truncate);
+        st.close(h);
+        for ([_]Storage.Handle{ h, default_max_handles, std.math.maxInt(u32) }) |bad| {
+            var b: [1]u8 = undefined;
+            try testing.expectError(error.Unexpected, st.size(bad));
+            try testing.expectError(error.Unexpected, st.pread(bad, &b, 0));
+            try testing.expectError(error.Unexpected, st.writeAll(bad, "x", 0));
+            try testing.expectError(error.Unexpected, st.sync(bad));
+            try testing.expectError(error.Unexpected, st.truncate(bad, 0));
+            try testing.expectError(error.Unexpected, st.tryLockExclusive(bad));
+            if (st.canLend()) try testing.expectError(error.Unexpected, st.preadRef(bad, 1, 0));
+            st.close(bad); // a second close is a no-op
+        }
+    }
 }
 
 test "replay: a CRC-valid tombstone that carries a value is not a record this module writes" {
