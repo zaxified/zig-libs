@@ -4378,51 +4378,68 @@ const TokenTap = struct {
 /// The object schema a rule set describes: `{"type":"object","properties":
 /// {...},"required":[...]}`.
 pub fn writeJsonSchema(rules: []const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    var s: std.json.Stringify = .{ .writer = w };
-    try schemaOfFields(&s, rules, true);
+    var e: Export = .{ .s = .{ .writer = w } };
+    try schemaOfFields(&e, rules, true);
 }
 
 /// The schema of the typed body `T`: `rulesFor(T)`, and -- when `T` declares
 /// `validate_rules` -- `allOf` of that and the extra set, which is what the
 /// typed paths check.
 pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    var s: std.json.Stringify = .{ .writer = w };
+    var e: Export = .{ .s = .{ .writer = w } };
+    const s = &e.s;
     // An array root (`[]const Item`): `{"type":"array","items":{...}}`.
     if (comptime @typeInfo(T) != .@"struct") {
         const root = comptime rootRuleFor(T);
-        try writeRuleSchema(&s, &root);
+        try writeRuleSchema(&e, &root);
     } else if (@hasDecl(T, "validate_rules")) {
         try s.beginObject();
         try s.objectField("allOf");
         try s.beginArray();
-        try schemaOfFields(&s, comptime rulesFor(T), true);
-        try schemaOfFields(&s, T.validate_rules, false);
+        try schemaOfFields(&e, comptime rulesFor(T), true);
+        try schemaOfFields(&e, T.validate_rules, false);
         try s.endArray();
         try s.endObject();
     } else {
-        try schemaOfFields(&s, comptime rulesFor(T), true);
+        try schemaOfFields(&e, comptime rulesFor(T), true);
     }
 }
 
 /// The schema of a root described by one rule (see `validateJsonRoot`): an
 /// array root is `{"type":"array","items":{...},"minItems":...}`.
 pub fn writeJsonSchemaRoot(root: *const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    var s: std.json.Stringify = .{ .writer = w };
-    try writeRuleSchema(&s, root);
+    var e: Export = .{ .s = .{ .writer = w } };
+    try writeRuleSchema(&e, root);
 }
 
-fn schemaOfFields(s: *std.json.Stringify, rules: []const Rule, typed: bool) std.Io.Writer.Error!void {
+/// Most rules one export writes in full; past it, a rule is written as an
+/// `x-truncated` stub, like a rule nested too deep. Rules are inlined, so a
+/// graph that SHARES sub-rules (one rule reached along many paths) is
+/// exported once per path -- exponential in the sharing depth without this
+/// bound (no-panic sweep GJ F1). Generous: a hand-written rule set is
+/// orders of magnitude smaller.
+pub const max_schema_rules = 65536;
+
+/// One export's output and how many rules it has written.
+const Export = struct {
+    s: std.json.Stringify,
+    rules: usize = 0,
+};
+
+fn schemaOfFields(e: *Export, rules: []const Rule, typed: bool) std.Io.Writer.Error!void {
+    const s = &e.s;
     try s.beginObject();
     if (typed) {
         try s.objectField("type");
         try s.write("object");
     }
-    try writeFieldsMembers(s, rules);
+    try writeFieldsMembers(e, rules);
     try s.endObject();
 }
 
 /// `properties` and `required` for a rule set, into an object already open.
-fn writeFieldsMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.Error!void {
+fn writeFieldsMembers(e: *Export, rules: []const Rule) std.Io.Writer.Error!void {
+    const s = &e.s;
     if (rules.len == 0) return;
     try s.objectField("properties");
     try s.beginObject();
@@ -4434,13 +4451,13 @@ fn writeFieldsMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer
             if (std.mem.eql(u8, o.field, r.field)) count += 1;
         }
         if (count == 1) {
-            try writeRuleSchema(s, r);
+            try writeRuleSchema(e, r);
         } else {
             try s.beginObject();
             try s.objectField("allOf");
             try s.beginArray();
             for (rules) |*o| {
-                if (std.mem.eql(u8, o.field, r.field)) try writeRuleSchema(s, o);
+                if (std.mem.eql(u8, o.field, r.field)) try writeRuleSchema(e, o);
             }
             try s.endArray();
             try s.endObject();
@@ -4664,17 +4681,26 @@ fn firstRequiredIndexOf(rules: []const Rule, field: []const u8) usize {
 // (dup-field hop), so stop with room to spare (review GJ F3).
 const max_schema_nesting = 240;
 
-fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!void {
-    // A rule graph that loops back on itself (`.items = &self`) or is nested
-    // past the output's limit: write the cut-off as a schema that says so,
-    // never recurse without end (sweep V-4). The schema is looser there,
-    // never stricter, like the byte bounds below.
-    if (s.indent_level > max_schema_nesting) {
+fn writeRuleSchema(e: *Export, r: *const Rule) std.Io.Writer.Error!void {
+    const s = &e.s;
+    // A rule graph that loops back on itself (`.items = &self`), is nested
+    // past the output's limit or is too large in all: write the cut-off as a
+    // schema that says so, never recurse without end (sweep V-4) or blow up
+    // (GJ F1). The schema is looser there, never stricter, like the byte
+    // bounds below.
+    const cut: ?[]const u8 = if (s.indent_level > max_schema_nesting)
+        "rule nesting too deep to export"
+    else if (e.rules >= max_schema_rules)
+        "rule graph too large to export"
+    else
+        null;
+    if (cut) |why| {
         try s.beginObject();
         try s.objectField("x-truncated");
-        try s.write("rule nesting too deep to export");
+        try s.write(why);
         return s.endObject();
     }
+    e.rules += 1;
     try s.beginObject();
     const type_name: ?[]const u8 = switch (r.kind) {
         .string => "string",
@@ -4795,10 +4821,10 @@ fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!v
         try s.objectField("x-custom");
         try s.write(c.code);
     }
-    if (r.kind == .object or r.kind == .any) if (r.fields) |fields| try writeFieldsMembers(s, fields);
+    if (r.kind == .object or r.kind == .any) if (r.fields) |fields| try writeFieldsMembers(e, fields);
     if (r.kind == .array or r.kind == .any) if (r.items) |item| {
         try s.objectField("items");
-        try writeRuleSchema(s, item);
+        try writeRuleSchema(e, item);
     };
     try s.endObject();
 }
@@ -10014,6 +10040,32 @@ test "exporting a rule graph that loops back on itself terminates (sweep V-4)" {
     defer w3.deinit();
     try writeJsonSchemaRoot(&mid, &w3.writer);
     try testing.expect(std.mem.find(u8, w3.written(), "x-truncated") == null);
+}
+
+/// A rule set of two fields that both share the set one level down: `k` + 1
+/// levels, 2^(k+2) - 2 rules when every path is written out.
+fn sharedRuleSet(comptime k: usize) []const Rule {
+    return &struct {
+        const v: [2]Rule = if (k == 0)
+            .{ .{ .field = "a", .kind = .string }, .{ .field = "b", .kind = .string } }
+        else
+            .{ .{ .field = "a", .kind = .object, .fields = sharedRuleSet(k - 1) }, .{ .field = "b", .kind = .object, .fields = sharedRuleSet(k - 1) } };
+    }.v;
+}
+
+test "exporting a rule graph that shares sub-rules is bounded (sweep GJ F1)" {
+    // 2^19 - 2 rules along every path: ~20 MB inlined, cut at max_schema_rules.
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchema(sharedRuleSet(17), &w.writer);
+    try testing.expect(std.mem.find(u8, w.written(), "rule graph too large to export") != null);
+    try testing.expect(w.written().len < 8 * 1024 * 1024);
+
+    // 2^15 - 2 rules: within the budget, written whole.
+    var w2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w2.deinit();
+    try writeJsonSchema(sharedRuleSet(13), &w2.writer);
+    try testing.expect(std.mem.find(u8, w2.written(), "x-truncated") == null);
 }
 
 test "a float-spelled integer at the edge of a wide int is refused, not decoded by std's panic (sweep V-5)" {
