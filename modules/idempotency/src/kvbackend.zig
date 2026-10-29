@@ -84,7 +84,7 @@ pub const KvBackend = struct {
                 // A lease that ran out hands the key to this request; the
                 // stale holder's `release` then frees it early, which the
                 // lease already allowed.
-                if (lease_ns <= 0 or now - since.* < lease_ns) return .in_flight;
+                if (lease_ns <= 0 or now -| since.* < lease_ns) return .in_flight;
                 since.* = now;
             } else {
                 const owned = try self.gpa.dupe(u8, key);

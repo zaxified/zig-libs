@@ -226,3 +226,19 @@ test "Backend seam through the middleware: lookup, then put before release; repl
     try testing.expectEqual(@as(u32, 1), app.calls);
     try testing.expectEqualStrings("LPRL", lb.log.items);
 }
+
+test "KvBackend: a lease check against a clock that jumped backwards does not overflow (sweep ID-2)" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var clk: Clock = .{};
+    var db = try openDb(&sim, &clk);
+    defer db.close();
+    var kb = KvBackend{ .db = &db, .gpa = testing.allocator };
+    defer kb.deinit();
+    const b = kb.backend();
+    // Reserved at the far end of the clock's range, then asked again at the
+    // other end: `now - since` is minInt - maxInt, which must saturate, not wrap.
+    try testing.expect((try b.vtable.lookupOrReserve(b.ptr, "k", std.math.maxInt(i64), 5, testing.allocator)) == .reserved);
+    try testing.expect((try b.vtable.lookupOrReserve(b.ptr, "k", std.math.minInt(i64), 5, testing.allocator)) == .in_flight);
+    b.vtable.release(b.ptr, "k");
+}

@@ -326,7 +326,13 @@ pub const Store = struct {
     /// Release the in-flight reservation set. Call once when the store is no
     /// longer used. In steady state the set is empty (every reservation is
     /// released when its handler returns); this frees the map's backing.
+    /// Total for a `Store` that was never given a `cache` or `backend` (nothing
+    /// was ever reserved, so there is nothing to free).
     pub fn deinit(store: *Store) void {
+        if (store.cache == null and store.backend == null) {
+            store.* = undefined;
+            return;
+        }
         lockSpin(&store.lock);
         const a = store.alloc();
         var it = store.in_flight.keyIterator();
@@ -375,7 +381,7 @@ pub const Store = struct {
     pub fn begin(store: *Store, key: []const u8, digest: [digest_len]u8, request: ?*const anyopaque, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
         const now = store.clock.now();
         if (store.backend) |b| return store.beginBackend(b, key, digest, request, gpa, now);
-        const cache = store.cache.?;
+        const cache = store.cacheOrPanic();
         lockSpin(&store.lock);
         defer store.lock.unlock();
         if (cache.get(key, now, 0)) |v| {
@@ -452,13 +458,19 @@ pub const Store = struct {
         lockSpin(&store.lock);
         defer store.lock.unlock();
         if (request) |r| _ = store.pending.remove(@intFromPtr(r));
-        if (store.in_flight.fetchRemove(key)) |e| store.cache.?.alloc.free(e.key);
+        if (store.in_flight.fetchRemove(key)) |e| store.cacheOrPanic().alloc.free(e.key);
     }
 
     /// The allocator for the store's own copies: the cache's, or the backend's.
+    /// Panics (every build mode) on a `Store` with neither: it has nowhere to
+    /// keep a record, and the first request would otherwise unwrap null.
     pub fn alloc(store: *const Store) std.mem.Allocator {
         if (store.backend) |b| return b.gpa;
-        return store.cache.?.alloc;
+        return store.cacheOrPanic().alloc;
+    }
+
+    fn cacheOrPanic(store: *const Store) *ramcache.Cache {
+        return store.cache orelse @panic("idempotency: Store needs either `cache` or `backend`");
     }
 
     /// The reservation `request` holds, or null when it holds none (no key,
@@ -533,7 +545,7 @@ pub const Store = struct {
         if (store.backend) |b| return b.vtable.put(b.ptr, key, blob, now, store.ttl_ns);
         lockSpin(&store.lock);
         defer store.lock.unlock();
-        store.cache.?.put(key, blob, now, store.ttl_ns, 0);
+        store.cacheOrPanic().put(key, blob, now, store.ttl_ns, 0);
     }
 };
 
@@ -587,6 +599,7 @@ fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_t
         if (h.name.len > std.math.maxInt(u16) or h.value.len > std.math.maxInt(u16)) return error.InvalidRecord;
         block_len += 4 + h.name.len + h.value.len;
     };
+    const block_len32 = std.math.cast(u32, block_len) orelse return error.InvalidRecord;
     const hdr_part: usize = if (block_len == 0) 0 else 4 + block_len;
     const blob = try gpa.alloc(u8, digest_len + 4 + content_type.len + hdr_part + body.len);
     @memcpy(blob[0..digest_len], &digest);
@@ -595,7 +608,7 @@ fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_t
     @memcpy(blob[digest_len + 4 ..][0..content_type.len], content_type);
     var at = digest_len + 4 + content_type.len;
     if (block_len != 0) {
-        std.mem.writeInt(u32, blob[at..][0..4], std.math.cast(u32, block_len) orelse return error.InvalidRecord, .big);
+        std.mem.writeInt(u32, blob[at..][0..4], block_len32, .big);
         at += 4;
         for (headers) |h| if (replayable(h.name)) {
             std.mem.writeInt(u16, blob[at..][0..2], @intCast(h.name.len), .big);
@@ -1023,6 +1036,12 @@ fn reqKeyBody(comptime method: []const u8, comptime path: []const u8, comptime k
     return method ++ " " ++ path ++ " HTTP/1.1\r\nHost: t\r\nIdempotency-Key: " ++ key ++
         "\r\nContent-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++
         "\r\nConnection: close\r\n\r\n" ++ body;
+}
+
+test "a Store with neither cache nor backend can be deinit-ed (sweep ID-1)" {
+    // Using it panics with a message (`alloc`); retiring it must stay total.
+    var store = Store{};
+    store.deinit();
 }
 
 fn newCache() ramcache.Cache {
