@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the GJ decision fix: 5 mutants on the new header-name check, 5/5 killed on the first run. Card A1 again.
 - **2026-10-29** — **Behaviour change:** `middleware()` panics (every build mode) on an unusable `Options.traceparent_header` / `tracestate_header` — not an RFC 9110 token, a header `http` manages (`Content-Length`, `Transfer-Encoding`, `Trailer`), or both names the same — like `requestid`'s `header_name`. Such a name was accepted before and the echo failed quietly or acted on the framing header (no-panic sweep § GJ TC-1, owner delegated: safe default).
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: the only source change is the seed clock's wrapping arithmetic, not observable by a test (seed material): no mutant scored. Card A1 again.
 - **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GJ) found no data-reachable defect; the monotonic seed clock wraps instead of overflowing; TC-1 (header-name validation) in Backlog.
