@@ -760,3 +760,85 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
     };
     return &rep_result;
 }
+
+// ---------------------------------------------------------------------------
+// No-panic sweep pins (wave GI, 2026-10-29). The sweep found no defect in this
+// module; these tests pin the reasons the entry points are total.
+// ---------------------------------------------------------------------------
+
+test "parse/parseGroupedNumber/locale are total on empty, huge and hostile input, any Options (sweep NP-1)" {
+    const gpa = testing.allocator;
+    const mib = 1 << 20;
+    const nines = try gpa.alloc(u8, mib);
+    defer gpa.free(nines);
+    @memset(nines, '9');
+    const grouped = try gpa.alloc(u8, mib / 5 * 5);
+    defer gpa.free(grouped);
+    for (0..grouped.len / 5) |k| @memcpy(grouped[k * 5 ..][0..5], "1,234");
+    const commas = try gpa.alloc(u8, mib);
+    defer gpa.free(commas);
+    @memset(commas, ',');
+    const arabic = try gpa.alloc(u8, mib / 2 * 2);
+    defer gpa.free(arabic);
+    for (0..arabic.len / 2) |k| @memcpy(arabic[k * 2 ..][0..2], "\u{660}");
+    const parens = try gpa.alloc(u8, mib);
+    defer gpa.free(parens);
+    @memset(parens, '(');
+    const spaces = try gpa.alloc(u8, mib);
+    defer gpa.free(spaces);
+    @memset(spaces, ' ');
+    const noise = try gpa.alloc(u8, mib);
+    defer gpa.free(noise);
+    var prng = std.Random.DefaultPrng.init(0x4e50);
+    prng.random().bytes(noise);
+
+    const small = [_][]const u8{
+        "",         "-",                "+",          "(",        ")",             "()",      "%",              " %",      "-%",
+        "(-1)",     "1-",               "1-%",        "5%-",      "e",             "1e",      "1e+",            "1e99999", "1e-99999",
+        "9e9999",   "9e9999%",          "0e-9999%",   "1e-9999%", ",5",            ".5",      "5.",             "1,",      "1,,2",
+        "1,234,",   "1,234.",           "1\u{A0}234", "\u{2212}", "\u{2212}1,234", "\u{660}", "\u{660}\u{661}", "\xff",    "\xd9",
+        "\xd9\xa0", "\xf4\x90\x80\x80", "1,2,3",
+    };
+    const long = [_][]const u8{ nines, grouped, commas, arabic, parens, spaces, noise };
+
+    const zeros = [_]u21{ '0', 0x660, 0x10FFFF, 0x1FFFFF, 0xD800, 0, 9, 0x1FFFF0 };
+    const seps = [_][]const u8{ ",", ".", " ", "\u{A0}", "-", "(", "%", "e", "0", "\u{660}", "\xff", "ab" };
+    for (zeros) |z| for (seps) |g| for (seps) |d| {
+        var o: Options = .{ .group_sep = g, .decimal_sep = d, .zero = z, .lenient_spaces = true, .require_grouping = false, .trailing_minus = true, .parentheses = true, .exponent = true, .percent = true };
+        for (std.enums.values(Grouping)) |gr| {
+            o.grouping = gr;
+            for (small) |s| _ = parse(s, o);
+            if (z == '0' or z == 0x660) {
+                for (long) |s| _ = parse(s, o);
+            }
+        }
+    };
+    // a megabyte of anything is refused (the 96-byte normalized buffer / the grammar), not scanned twice
+    try testing.expect(parse(nines, .{}) == null);
+    try testing.expect(parse(grouped, .{}) == null);
+    try testing.expect(parse(arabic, localeNative("ar_EG").?) == null);
+    for (small) |s| _ = parseGroupedNumber(s, ',', '.');
+    for (long) |s| {
+        try testing.expect(parseGroupedNumber(s, ',', '.') == null);
+        try testing.expect(parseGroupedNumber(s, '.', ',') == null);
+        try testing.expect(locale(s) == null);
+        try testing.expect(localeNative(s) == null);
+    }
+    // separator bytes that are digits, equal, or non-ASCII are the caller's odd choice, not a crash
+    for ([_]u8{ '0', '5', ',', '.', '-', 0xff, 0 }) |t| for ([_]u8{ '0', '5', ',', '.', '-', 0xff, 0 }) |d| {
+        for (small) |s| _ = parseGroupedNumber(s, t, d);
+    };
+    // `Options.zero` so large that `zero + 9` would overflow a u21 never gets that far: a code point
+    // is at most 0x10FFFF, so `cp < zero` already ended the scan
+    try testing.expect(parse("\u{10FFFF}", .{ .zero = std.math.maxInt(u21) }) == null);
+    try testing.expect(parse("1", .{ .zero = std.math.maxInt(u21) }) == null);
+}
+
+test "locale tables: every row names a numbering system that exists (sweep NP-2)" {
+    for (cldr.rows) |r| {
+        try testing.expect(r.native < cldr.systems.len);
+        try testing.expect(r.group.len != 0 and r.decimal.len != 0 and r.native_group.len != 0 and r.native_decimal.len != 0);
+        const o = localeNative(r.name).?;
+        try testing.expectEqual(cldr.systems[r.native].zero, o.zero);
+    }
+}

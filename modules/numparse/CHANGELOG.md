@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep found no defect; two tests pin empty, 1 MiB and hostile input across the option grid and the range of every CLDR row's native index.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the all-module `strRepeat` rewrite (`571bf09e`) is reverted here: this module's calls are small (seconds of Sema at most), and the change would have made its fresh audit's `src` hash stale for nothing.
 
 - **2026-10-23** — **Card: grade 1** (S1 E1 A1 P1). Speed: 0.11× ICU4C's `DecimalFormat::parse`
