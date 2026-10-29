@@ -991,6 +991,33 @@ test "apply: a peer-sized header copied earlier cannot starve the configured val
     try sh.apply(&rw);
     try rw.end();
     try testing.expect(std.mem.find(u8, out.buffered(), csp_buf) != null);
+
+    // CSP alone (every other header off), so the policy itself is what a
+    // copy would overflow: the lending of THIS value is pinned, not only the
+    // room the default set frees.
+    const only_csp: Options = .{
+        .hsts = null,
+        .x_content_type_options = false,
+        .x_frame_options = null,
+        .referrer_policy = null,
+        .cross_origin_opener_policy = null,
+        .cross_origin_resource_policy = null,
+        .origin_agent_cluster = false,
+        .x_dns_prefetch_control = null,
+        .x_download_options = false,
+        .x_permitted_cross_domain_policies = null,
+        .x_xss_protection = false,
+    };
+    const solo_room = http_header_budget_bytes - "Content-Security-Policy".len;
+    var solo_opts = only_csp;
+    solo_opts.content_security_policy = csp_all[0..solo_room];
+    const solo: SecurityHeaders = try .init(solo_opts);
+    var out2: Writer = .fixed(&out_buf);
+    var rw2: http.Server.ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{});
+    try rw2.setHeader("X-Request-Id", &peer_id);
+    try solo.apply(&rw2);
+    try rw2.end();
+    try testing.expect(std.mem.find(u8, out2.buffered(), csp_all[0..solo_room]) != null);
 }
 
 test "csp_helmet_default: reproduced helmet.js v7 posture, byte-exact through the middleware" {

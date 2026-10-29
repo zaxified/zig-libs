@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 1 mutant over the best-effort echo (budget errors re-propagated): 1/1 killed on the first run. Card A1 again.
 - **2026-10-29** — **Behaviour change (fix):** the response echo of the ID is best effort: when an outer middleware already filled the response header table or header-byte budget, the echo is skipped instead of failing the request with a 500 (`current()` still has the ID). No-panic sweep + blind review (§ GJ).
 - **2026-10-24** — **Behaviour change (fix):** an adopted ID is copied into the thread-local buffer, so
   `current()` never points into a request head the next request overwrites; it keeps the last ID after the
