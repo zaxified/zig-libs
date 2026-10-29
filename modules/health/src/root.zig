@@ -155,6 +155,7 @@ pub const Health = struct {
 
     /// Answer one probe. Byte for byte what `middleware` writes -- both go
     /// through the same two functions, so the two entry points cannot drift.
+    /// `.startup` on a `Health` without `startup` answers 404 (no such probe).
     pub fn respond(h: *const Health, probe: Probe, res: *http.Server.ResponseWriter) anyerror!void {
         return switch (probe) {
             .live => respondLive(h, res),
@@ -191,7 +192,15 @@ fn setProbeHeaders(h: *const Health, res: *http.Server.ResponseWriter) anyerror!
 }
 
 fn respondStartup(h: *const Health, res: *http.Server.ResponseWriter) anyerror!void {
-    const up = h.startup.?.started.load(.acquire);
+    // `respond(.startup)` is public and `Probe` is a plain enum, so a caller can ask for
+    // the startup probe on a `Health` that has none (`probeFor` never yields it then).
+    // Answer 404 -- there is no such probe -- instead of unwrapping null.
+    const st = h.startup orelse {
+        res.setStatus(404);
+        try setProbeHeaders(h, res);
+        return res.writeAll(if (h.json) "{\"status\":\"not configured\"}" else "startup probe not configured\n");
+    };
+    const up = st.started.load(.acquire);
     res.setStatus(if (up) 200 else 503);
     try setProbeHeaders(h, res);
     try res.writeAll(if (h.json)
@@ -404,6 +413,18 @@ test "respond writes what the middleware writes" {
     const live_direct = runWireDirect(wire("/healthz"), &b_buf);
     const live_through = runWire(&r, wire("/healthz"), &a_buf);
     try testing.expectEqualStrings(bodyOf(live_through), bodyOf(live_direct));
+}
+
+test "respond(.startup) without Health.startup answers 404, not a null unwrap (sweep HE-1)" {
+    var h = Health{};
+    var b_buf: [1024]u8 = undefined;
+    direct_health = &h;
+    direct_probe = .startup;
+    const direct = runWireDirect(wire("/startupz"), &b_buf);
+    try testing.expect(std.mem.startsWith(u8, direct, "HTTP/1.1 404"));
+    h.json = true;
+    const j = runWireDirect(wire("/startupz"), &b_buf);
+    try testing.expect(std.mem.startsWith(u8, j, "HTTP/1.1 404"));
 }
 
 // ── tests (offline — through http.Server.serveStream) ───────────────────────

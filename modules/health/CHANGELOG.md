@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **Fix (no-panic sweep):** `Health.respond(.startup, …)` on a `Health` without `startup` answers 404 instead of unwrapping null. Report `~/CML/20261029-panic-sweep/health-sweep.report.md`.
 - **2026-10-24** — **Behaviour change (fix):** with more than 256 readiness checks the JSON `details`
   ends in one `"(N more)": {"status": "up"|"down"}` entry for the unlisted ones (they were left out, so a
   503 could list only passing checks). **Behaviour change:** `Health.middleware()` panics when
