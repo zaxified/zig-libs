@@ -2,7 +2,7 @@
 //! Shrinking a failing seed to a small input that fails the same way.
 //!
 //!     <PREFIX>_SHRINK=<seed>      shrink that seed (with `_ONLY` for one harness)
-//!     <PREFIX>_SHRINK_MS=<ms>     the shrink's budget (default 60000)
+//!     <PREFIX>_SHRINK_MS=<ms>     the shrink's budget (default 60000; 0 = the default)
 //!     <PREFIX>_SHRINK_OUT=<path>  where the smallest choice tape is written
 //!     <PREFIX>_CHOICES=<path>     replay a tape in-process, every draw printed
 //!
@@ -160,7 +160,7 @@ pub fn shrink(comptime harness: anytype, gpa: std.mem.Allocator, opts: Options) 
         .target = target,
         .target_err = target_err[0..target_err_len],
         .limit_ms = opts.limit_ms,
-        .deadline = nowMs() + opts.budget_ms,
+        .deadline = deadlineAfter(nowMs(), opts.budget_ms),
         .cur = try gpa.dupe(u64, sh.log[0..sh.tape.len]),
         .gpa = gpa,
         .replayFn = K.replay,
@@ -394,7 +394,7 @@ fn writeTape(path: []const u8, tape: []const u64) !void {
 }
 
 /// Parse a tape file (one decimal `u64` per line; blank lines and `#`
-/// comments ignored).
+/// comments ignored); `error.TapeTooLong` past `tape_cap` entries.
 pub fn parseTape(gpa: std.mem.Allocator, text: []const u8) ![]u64 {
     var out: std.ArrayList(u64) = .empty;
     errdefer out.deinit(gpa);
@@ -402,6 +402,7 @@ pub fn parseTape(gpa: std.mem.Allocator, text: []const u8) ![]u64 {
     while (lines.next()) |raw| {
         const l = std.mem.trim(u8, raw, " \t\r");
         if (l.len == 0 or l[0] == '#') continue;
+        if (out.items.len >= tape_cap) return error.TapeTooLong;
         try out.append(gpa, try std.fmt.parseInt(u64, l, 10));
     }
     return out.toOwnedSlice(gpa);
@@ -414,6 +415,13 @@ pub fn replayHere(comptime harness: anytype, gpa: std.mem.Allocator, tape: []u64
     var t: Tape = .{ .mode = .replay, .buf = tape, .len = tape.len, .trace = trace };
     var rng: Rng = .{ .r = prng.random(), .tape = &t };
     try harness(Rng, &rng, gpa);
+}
+
+/// `now + budget`, saturating: `<PREFIX>_SHRINK_MS` is environment text, and a
+/// plain sum wraps (ReleaseFast: the budget would read as already spent) or
+/// panics (safe modes).
+fn deadlineAfter(now: u64, budget_ms: u64) u64 {
+    return now +| budget_ms;
 }
 
 fn nowMs() u64 {
@@ -783,4 +791,21 @@ test "parseTape: decimals per line, comments and blanks ignored" {
     defer testing.allocator.free(t);
     try testing.expectEqualSlices(u64, &.{ 10, 5, 66 }, t);
     try testing.expectError(error.InvalidCharacter, parseTape(testing.allocator, "1\nx\n"));
+}
+
+test "deadlineAfter saturates on a huge shrink budget (sweep TK-4)" {
+    try testing.expectEqual(@as(u64, 1500), deadlineAfter(1000, 500));
+    try testing.expectEqual(std.math.maxInt(u64), deadlineAfter(1000, std.math.maxInt(u64)));
+}
+
+test "parseTape: more than tape_cap entries is an error, not an allocation (review R-TK-1)" {
+    const gpa = testing.allocator;
+    const line = "7\n";
+    const text = try gpa.alloc(u8, (tape_cap + 1) * line.len);
+    defer gpa.free(text);
+    for (0..tape_cap + 1) |i| @memcpy(text[i * line.len ..][0..line.len], line);
+    try testing.expectError(error.TapeTooLong, parseTape(gpa, text));
+    const ok = try parseTape(gpa, text[0 .. tape_cap * line.len]);
+    defer gpa.free(ok);
+    try testing.expectEqual(@as(usize, tape_cap), ok.len);
 }

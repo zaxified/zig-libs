@@ -10,11 +10,12 @@
 //!     <PREFIX>=<runs>[,<first seed>]   run, else the test is skipped
 //!                                      (a harness runs `runs / Options.scale`)
 //!     <PREFIX>_ONLY=<substring>        only harnesses whose name contains it
-//!     <PREFIX>_MS=<limit per input>    default 2000
+//!     <PREFIX>_MS=<limit per input>    default 2000 (0 = the default)
 //!     <PREFIX>_SEEDFILE=<path>         the current seed, for a crash
 //!     <PREFIX>_INPUT=<path>            replay one saved `--fuzz` input
 //!     <PREFIX>_SHRINK=<seed>           shrink that seed (see shrink.zig;
-//!                                      `_SHRINK_MS`, `_SHRINK_OUT`)
+//!                                      `_SHRINK_MS` default 60000, 0 = the
+//!                                      default; `_SHRINK_OUT`)
 //!     <PREFIX>_CHOICES=<path>          replay a shrunk choice tape, traced
 //!
 //! A hang is `HANG <name> seed=N` and exit 124 shortly after the limit (the
@@ -67,7 +68,10 @@ pub const Rng = struct {
     r: std.Random,
     tape: ?*Tape = null,
 
+    /// `at_least` must be <= `at_most` (checked panic otherwise; std's own
+    /// `intRangeAtMost` only asserts, which is UB in ReleaseFast).
     pub fn valueRangeAtMost(self: *Rng, comptime T: type, at_least: T, at_most: T) T {
+        if (at_least > at_most) @panic("testkit.Rng: valueRangeAtMost with at_least > at_most");
         const t = self.tape orelse return self.r.intRangeAtMost(T, at_least, at_most);
         const U = @Int(.unsigned, @bitSizeOf(T));
         const lo: U = @bitCast(at_least);
@@ -139,9 +143,11 @@ pub const Rng = struct {
         if (t.trace) traceBytes(t, "bytes", buf);
         t.draws += 1;
     }
+    /// `len` must be > 0 (checked panic otherwise: there is no index into
+    /// nothing, and std's `uintLessThan` only asserts).
     pub fn index(self: *Rng, len: usize) usize {
+        if (len == 0) @panic("testkit.Rng: index(0)");
         const t = self.tape orelse return self.r.uintLessThan(usize, len);
-        std.debug.assert(len > 0);
         const v: usize = switch (t.mode) {
             .record => v: {
                 const v = self.r.uintLessThan(usize, len);
@@ -172,7 +178,8 @@ pub const Rng = struct {
                 break :n n;
             },
             .replay => n: {
-                const n: usize = @intCast(@min(t.get(), buf.len));
+                // `u32` is the return type: a buffer past 4 GiB is filled in part.
+                const n: usize = @intCast(@min(t.get(), buf.len, std.math.maxInt(u32)));
                 for (buf[0..n]) |*b| b.* = @truncate(t.get());
                 break :n n;
             },
@@ -183,7 +190,9 @@ pub const Rng = struct {
         return @intCast(n);
     }
     fn plainSlice(r: std.Random, buf: []u8) u32 {
-        const cap: usize = if (buf.len > 64 and r.boolean()) 64 else buf.len;
+        // `u32` is the return type: a buffer past 4 GiB is filled in part.
+        const room = @min(buf.len, std.math.maxInt(u32));
+        const cap: usize = if (room > 64 and r.boolean()) 64 else room;
         const n = r.uintAtMost(usize, cap);
         r.bytes(buf[0..n]);
         return @intCast(n);
@@ -384,9 +393,22 @@ fn watchdog() void {
     }
 }
 
+/// `<PREFIX>_MS` in nanoseconds, saturating: the value is environment text, and
+/// a plain product wraps (ReleaseFast) or panics (safe modes) from ~1.8e13 ms.
+fn limitNs(limit_ms: u64) u64 {
+    return limit_ms *| std.time.ns_per_ms;
+}
+
+/// Events per second, 0 when no time has passed; saturating (`n` can be large
+/// on a long run of a trivial harness).
+fn perSecond(n: u64, elapsed_ns: u64) u64 {
+    if (elapsed_ns == 0) return n *| 1000;
+    return @intCast(@min(@as(u128, n) * std.time.ns_per_s / elapsed_ns, std.math.maxInt(u64)));
+}
+
 fn armWatchdog(name: []const u8, limit_ms: u64) !void {
     current_name = name;
-    current_limit.store(limit_ms * std.time.ns_per_ms, .release);
+    current_limit.store(limitNs(limit_ms), .release);
     if (dog_running) return;
     const dog = try std.Thread.spawn(.{}, watchdog, .{});
     dog.detach();
@@ -407,7 +429,17 @@ fn openZ(path: []const u8, flags: linux.O, mode: linux.mode_t) ?i32 {
     return if (linux.errno(rc) == .SUCCESS) @intCast(rc) else null;
 }
 
-fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+/// Largest `<PREFIX>_INPUT` file read (a saved `--fuzz` input is a few KiB).
+const input_cap: usize = 64 << 20;
+/// Largest `<PREFIX>_CHOICES` file read: a tape holds at most `tape_cap`
+/// entries, each at most 20 digits and a newline (comments and blank lines
+/// have no bound of their own, so the file is capped, not just the parse).
+const choices_cap: usize = shrinker.tape_cap * 21;
+
+/// The whole file at `path`, `error.FileTooBig` past `cap` bytes (the path is
+/// environment text and may name `/dev/zero` or a huge file); a read
+/// interrupted by a signal is retried.
+fn readFile(gpa: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
     const fd = openZ(path, .{ .ACCMODE = .RDONLY }, 0) orelse return error.FileNotFound;
     defer _ = linux.close(fd);
     var out: std.ArrayList(u8) = .empty;
@@ -415,8 +447,13 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     var buf: [4096]u8 = undefined;
     while (true) {
         const n = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n) != .SUCCESS) return error.InputOutput;
+        switch (linux.errno(n)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return error.InputOutput,
+        }
         if (n == 0) break;
+        if (n > cap - out.items.len) return error.FileTooBig;
         try out.appendSlice(gpa, buf[0..n]);
     }
     return out.toOwnedSlice(gpa);
@@ -427,7 +464,7 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 /// 64 KiB (or a short read) cut short, and printed `ok` for an input that was
 /// never run (review 2026-10-27).
 fn replayInput(comptime harness: anytype, gpa: std.mem.Allocator, path: []const u8) !usize {
-    const input = try readFile(gpa, path);
+    const input = try readFile(gpa, path, input_cap);
     defer gpa.free(input);
     enter(0);
     var smith: std.testing.Smith = .{ .in = input };
@@ -463,12 +500,19 @@ pub fn parseSpec(spec: []const u8, scale: u64) error{ InvalidCharacter, Overflow
     return .{ .runs = runs, .first = first };
 }
 
+/// A `<PREFIX>_MS` / `<PREFIX>_SHRINK_MS` value: unset or `0` is `default_ms`
+/// (a limit of 0 would call every input a hang).
+fn msOrDefault(text: ?[]const u8, default_ms: u64) !u64 {
+    const v = try std.fmt.parseInt(u64, text orelse return default_ms, 10);
+    return if (v == 0) default_ms else v;
+}
+
 fn runHere(comptime harness: anytype, opts: Options) !void {
     var kb: [96]u8 = undefined;
     if (!selected(opts.name, env(&kb, opts.prefix, "_ONLY"))) return error.SkipZigTest;
     current_prefix = opts.prefix;
     current_name = opts.name;
-    const limit_ms = if (env(&kb, opts.prefix, "_MS")) |m| try std.fmt.parseInt(u64, m, 10) else opts.default_limit_ms;
+    const limit_ms = try msOrDefault(env(&kb, opts.prefix, "_MS"), opts.default_limit_ms);
 
     // `.safety = true`: ReleaseFast's default looks for no leak, and the
     // `_CHOICES` replay hands this allocator to the harness.
@@ -477,7 +521,7 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
     defer if (da.deinit() == .leak) @panic("fuzz driver: leak");
 
     if (env(&kb, opts.prefix, "_CHOICES")) |path| {
-        const text = try readFile(gpa, path);
+        const text = try readFile(gpa, path, choices_cap);
         defer gpa.free(text);
         const tape = try shrinker.parseTape(gpa, text);
         defer gpa.free(tape);
@@ -492,7 +536,7 @@ fn runHere(comptime harness: anytype, opts: Options) !void {
 
     if (env(&kb, opts.prefix, "_SHRINK")) |seed_txt| {
         const seed = try std.fmt.parseInt(u64, seed_txt, 10);
-        const budget = if (env(&kb, opts.prefix, "_SHRINK_MS")) |m| try std.fmt.parseInt(u64, m, 10) else 60_000;
+        const budget = try msOrDefault(env(&kb, opts.prefix, "_SHRINK_MS"), 60_000);
         const r = shrinker.shrink(harness, gpa, .{
             .name = opts.name,
             .seed = seed,
@@ -745,13 +789,13 @@ pub fn runSeedsReporting(comptime harness: anytype, name: []const u8, spec: Spec
             if (now - last_report > std.time.ns_per_s) {
                 last_report = now;
                 const done = i + 1;
-                std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, done * std.time.ns_per_s / (now - t0) });
+                std.debug.print("runs {s} {d} of {d} ({d}/s)\n", .{ opts.name, done, runs, perSecond(done, now - t0) });
             }
         }
     }
     const ms = (nowNs() - t0) / std.time.ns_per_ms;
     if (report) {
-        std.debug.print("DONE {s} runs={d} in {d} ms ({d}/s)\n", .{ opts.name, runs, ms, if (ms == 0) runs * 1000 else runs * 1000 / ms });
+        std.debug.print("DONE {s} runs={d} in {d} ms ({d}/s)\n", .{ opts.name, runs, ms, perSecond(runs, ms * std.time.ns_per_ms) });
         reportReach(opts.name);
     } else resetReach();
 }
@@ -1061,4 +1105,124 @@ test "runSeeds: a range ending at the top of u64 runs every seed" {
     top_n = 0;
     try runSeedsReporting(topRecorder, "top", .{ .runs = 2, .first = std.math.maxInt(u64) - 1 }, testing.allocator, null, false);
     try testing.expectEqualSlices(u64, &.{ std.math.maxInt(u64) - 1, std.math.maxInt(u64) }, top_seeds[0..top_n]);
+}
+
+// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+
+test "limitNs saturates instead of overflowing on a huge <PREFIX>_MS (sweep TK-1)" {
+    try testing.expectEqual(@as(u64, 2_000_000_000), limitNs(2000));
+    try testing.expectEqual(std.math.maxInt(u64), limitNs(std.math.maxInt(u64)));
+    try testing.expectEqual(std.math.maxInt(u64), limitNs(std.math.maxInt(u64) / std.time.ns_per_ms + 1));
+}
+
+test "perSecond neither divides by zero nor overflows on long runs (sweep TK-2)" {
+    try testing.expectEqual(@as(u64, 500), perSecond(1000, 2 * std.time.ns_per_s));
+    try testing.expectEqual(@as(u64, 7000), perSecond(7, 0));
+    // 2e10 events in a second: `n * 1e9` wraps u64 (the old inline form).
+    try testing.expectEqual(@as(u64, 20_000_000_000), perSecond(20_000_000_000, std.time.ns_per_s));
+    try testing.expectEqual(std.math.maxInt(u64), perSecond(std.math.maxInt(u64), 1));
+}
+
+fn rngFor0(use_tape: bool, comptime inverted: bool) u8 {
+    var prng = std.Random.DefaultPrng.init(1);
+    var buf: [4]u64 = undefined;
+    var tape: Tape = .{ .mode = .record, .buf = &buf };
+    var rng: Rng = .{ .r = prng.random(), .tape = if (use_tape) &tape else null };
+    if (inverted) std.mem.doNotOptimizeAway(rng.valueRangeAtMost(u8, 9, 3)) else std.mem.doNotOptimizeAway(rng.index(0));
+    return 0;
+}
+fn rngIndex0Plain() u8 {
+    return rngFor0(false, false);
+}
+fn rngIndex0Tape() u8 {
+    return rngFor0(true, false);
+}
+fn rngInvertedPlain() u8 {
+    return rngFor0(false, true);
+}
+fn rngInvertedTape() u8 {
+    return rngFor0(true, true);
+}
+
+fn expectAborts(comptime f: fn () u8) !void {
+    if (!supported) return error.SkipZigTest;
+    const child = @import("child.zig");
+    const out = try child.run(f, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(linux.SIG.ABRT) }));
+}
+
+test "Rng.index(0) is a checked panic, with and without a tape (sweep TK-3)" {
+    try expectAborts(rngIndex0Plain);
+    try expectAborts(rngIndex0Tape);
+}
+
+test "Rng.valueRangeAtMost with at_least > at_most is a checked panic, with and without a tape (sweep TK-3)" {
+    try expectAborts(rngInvertedPlain);
+    try expectAborts(rngInvertedTape);
+}
+
+// ── blind review (2026-10-29) ────────────────────────────────────────────────
+
+fn tmpPath(buf: []u8, tmp: anytype, name: []const u8) ![]const u8 {
+    return std.mem.print(buf, ".zig-cache/tmp/{s}/{s}", .{ &tmp.sub_path, name });
+}
+
+test "readFile: a file over the cap is error.FileTooBig, not a bigger allocation (review R-TK-1)" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = try testing.allocator.alloc(u8, 10_000);
+    defer testing.allocator.free(data);
+    @memset(data, 'x');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f", .data = data });
+    var pb: [128]u8 = undefined;
+    const path = try tmpPath(&pb, tmp, "f");
+    try testing.expectError(error.FileTooBig, readFile(testing.allocator, path, 9_999));
+    const whole = try readFile(testing.allocator, path, 10_000);
+    defer testing.allocator.free(whole);
+    try testing.expectEqual(@as(usize, 10_000), whole.len);
+    // The real caps: a tape's own maximum fits, with room for comments.
+    try testing.expect(choices_cap >= shrinker.tape_cap * 21);
+    try testing.expectEqual(@as(usize, 64 << 20), input_cap);
+}
+
+fn noopHandler(_: linux.SIG) callconv(.c) void {}
+
+const EintrFeeder = struct {
+    main_tid: linux.pid_t,
+    wfd: i32,
+    fn run(f: EintrFeeder) void {
+        const nap: linux.timespec = .{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&nap, null);
+        // The main thread is blocked in `read` on the empty pipe: interrupt it.
+        _ = linux.tgkill(linux.getpid(), f.main_tid, .USR1);
+        _ = linux.nanosleep(&nap, null);
+        _ = linux.write(f.wfd, "abc", 3);
+        _ = linux.close(f.wfd);
+    }
+};
+
+test "readFile: a read interrupted by a signal is retried (review R-TK-1)" {
+    if (!supported) return error.SkipZigTest;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{})) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    // No SA_RESTART: the blocked read must return EINTR.
+    const act: linux.Sigaction = .{ .handler = .{ .handler = noopHandler }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &act, &old);
+    defer _ = linux.sigaction(.USR1, &old, null);
+    const feeder = try std.Thread.spawn(.{}, EintrFeeder.run, .{EintrFeeder{ .main_tid = linux.gettid(), .wfd = fds[1] }});
+    defer feeder.join();
+    var pb: [64]u8 = undefined;
+    const path = try std.mem.print(&pb, "/proc/self/fd/{d}", .{fds[0]});
+    const got = try readFile(testing.allocator, path, 1 << 20);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("abc", got);
+}
+
+test "msOrDefault: unset and 0 are the default, anything else is itself (review R-TK-4)" {
+    try testing.expectEqual(@as(u64, 2000), try msOrDefault(null, 2000));
+    try testing.expectEqual(@as(u64, 2000), try msOrDefault("0", 2000));
+    try testing.expectEqual(@as(u64, 7), try msOrDefault("7", 2000));
+    try testing.expectError(error.InvalidCharacter, msOrDefault("x", 2000));
 }

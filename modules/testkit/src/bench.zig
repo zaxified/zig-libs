@@ -93,6 +93,36 @@ pub const Cycles = struct {
     }
 };
 
+/// Counter delta; 0 when a read failed in between (`Cycles.read` answers 0
+/// for an unreadable counter), never an underflow.
+fn cyclesSince(now: u64, before: u64) u64 {
+    return now -| before;
+}
+
+/// Captured foreign output is one result line and a banner, or a compiler's
+/// diagnostics: this much is plenty, and a foreign program that writes past it
+/// fails the run (`error.StreamTooLong`) instead of filling memory.
+pub const capture_limit: std.Io.Limit = .limited(16 << 20);
+
+/// Longest a foreign compiler / `go build` may run, and a timed foreign run:
+/// a hung child fails the benchmark (`error.Timeout`, the child killed)
+/// instead of blocking it for good.
+pub const build_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(600), .clock = .awake } };
+pub const run_timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } };
+
+/// Every foreign child goes through here: output capped at `capture_limit`
+/// (`error.StreamTooLong`) and a `timeout` (`error.Timeout`).
+fn runCapped(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8, environ_map: ?*const std.process.Environ.Map, cwd: std.process.Child.Cwd, timeout: std.Io.Timeout) !std.process.RunResult {
+    return std.process.run(arena, io, .{
+        .argv = argv,
+        .environ_map = environ_map,
+        .cwd = cwd,
+        .stdout_limit = capture_limit,
+        .stderr_limit = capture_limit,
+        .timeout = timeout,
+    });
+}
+
 /// Time `@call(once, args)`: double the batch until it takes over 100 ms,
 /// then the best of five batches, per op. `count` is what the last call
 /// returned (an output size the sides must agree on). `wall_only` reports no
@@ -118,7 +148,7 @@ pub fn timeIt(io: std.Io, cyc: Cycles, comptime once: anytype, args: anytype, wa
             count = @call(.auto, once, args);
             std.mem.doNotOptimizeAway(count);
         }
-        best_cycles = @min(best_cycles, cyc.read() - c0);
+        best_cycles = @min(best_cycles, cyclesSince(cyc.read(), c0));
         best = @min(best, t.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds);
     }
     const nf: f64 = @floatFromInt(n);
@@ -129,7 +159,8 @@ pub fn timeIt(io: std.Io, cyc: Cycles, comptime once: anytype, args: anytype, wa
 /// Parse one line of a foreign program's output for workload `name`:
 /// `name \t ns/op \t cycles/op \t count`, or `name \t ns/op \t count` from a
 /// side that counts no cycles (the Go stdlib benches); a trailing newline is
-/// allowed.
+/// allowed. `ns` must be finite and positive, `cycles` finite and not
+/// negative (0 = not counted), else `error.BadForeignOutput`.
 pub fn parseForeign(out: []const u8, name: []const u8) error{ BadForeignOutput, InvalidCharacter, Overflow }!Row {
     var fields: [5][]const u8 = undefined;
     var n: usize = 0;
@@ -140,9 +171,15 @@ pub fn parseForeign(out: []const u8, name: []const u8) error{ BadForeignOutput, 
     }
     if (n != 3 and n != 4) return error.BadForeignOutput;
     if (!std.mem.eql(u8, fields[0], name)) return error.BadForeignOutput;
+    const ns = try std.fmt.parseFloat(f64, fields[1]);
+    const cycles: f64 = if (n == 4) try std.fmt.parseFloat(f64, fields[2]) else 0;
+    // `nan` / `inf` / a non-positive time would make every ratio NaN (which
+    // compares as "not slower") or infinite; cycles may be 0 (not counted).
+    if (!std.math.isFinite(ns) or ns <= 0) return error.BadForeignOutput;
+    if (!std.math.isFinite(cycles) or cycles < 0) return error.BadForeignOutput;
     return .{
-        .ns = try std.fmt.parseFloat(f64, fields[1]),
-        .cycles = if (n == 4) try std.fmt.parseFloat(f64, fields[2]) else 0,
+        .ns = ns,
+        .cycles = cycles,
         .count = try std.fmt.parseInt(u64, fields[n - 1], 10),
     };
 }
@@ -157,7 +194,7 @@ pub fn foreign(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, exe
 /// `foreign` with the whole command line given (a side that takes no work
 /// directory).
 pub fn foreignArgv(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, argv: []const []const u8, name: []const u8, banner: ?*[]const u8) !Row {
-    const res = try std.process.run(arena, io, .{ .argv = argv });
+    const res = try runCapped(arena, io, argv, null, .inherit, run_timeout);
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: foreign side failed on {s}:\n{s}\n", .{ bench_name, name, res.stderr });
         return error.ForeignFailed;
@@ -192,11 +229,7 @@ pub fn goBuild(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, env
     try env.put("GOFLAGS", "-mod=readonly");
     const exe = try arena.print("{s}/{s}", .{ opts.abs, opts.out });
     std.debug.print("{s}: building the Go side ...\n", .{bench_name});
-    const res = std.process.run(arena, io, .{
-        .argv = &.{ opts.exe, "build", "-o", exe, "." },
-        .environ_map = &env,
-        .cwd = .{ .path = opts.dir },
-    }) catch |e| {
+    const res = runCapped(arena, io, &.{ opts.exe, "build", "-o", exe, "." }, &env, .{ .path = opts.dir }, build_timeout) catch |e| {
         std.debug.print("{s}: could not run go ({t}) -- the benchmark needs it\n", .{ bench_name, e });
         return error.GoBuildFailed;
     };
@@ -314,6 +347,19 @@ pub const Run = struct {
     rounds: usize = 3,
 };
 
+/// `Run.rounds`, at least 1.
+fn roundsOf(run: Run) usize {
+    return @max(1, run.rounds);
+}
+
+/// `Run.exes[i]`, with the index checked: `Work.ref_exe`/`alt_exe` are the
+/// caller's, and this runs in a ReleaseFast bench program, where an
+/// out-of-range index would be an unchecked read.
+fn exeAt(run: Run, i: usize) []const u8 {
+    if (i >= run.exes.len) @panic("testkit.bench: Work.ref_exe/alt_exe indexes past Run.exes");
+    return run.exes[i];
+}
+
 /// Time every selected workload, print the table to `w`, return the verdict.
 /// `ctx` is a pointer to a struct with an `op` field, which is set to each
 /// workload's `op` before `once(ctx)` is timed.
@@ -321,6 +367,9 @@ pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, compt
     const cyc: Cycles = .open();
     defer cyc.close();
     var s: Summary = .{};
+    // Zero rounds would leave every side at its +inf start and print NaN
+    // ratios as a verdict; one round is the least that measures anything.
+    const rounds = roundsOf(run);
     try w.print("{s:<18} {s:>11} {s:>11} {s:>11} {s:>7} {s:>7} {s:>6} {s:>6} {s:>6}  count\n", .{ "workload", "ours ns", "ref ns", "alt ns", "/ref", "/fast", "spr us", "spr rf", "spr al" });
     try w.flush();
     for (ws) |x| {
@@ -329,13 +378,13 @@ pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, compt
         var ours: Side = .{};
         var ref: Side = .{};
         var alt: Side = .{};
-        for (0..run.rounds) |_| {
-            ref.add(try foreign(arena, io, run.name, run.exes[x.ref_exe], run.abs, x.ref, &s.banner));
+        for (0..rounds) |_| {
+            ref.add(try foreign(arena, io, run.name, exeAt(run, x.ref_exe), run.abs, x.ref, &s.banner));
             if (x.ours_foreign) |n| {
                 var sink_banner: []const u8 = undefined;
-                ours.add(try foreign(arena, io, run.name, run.exes[x.ref_exe], run.abs, n, &sink_banner));
+                ours.add(try foreign(arena, io, run.name, exeAt(run, x.ref_exe), run.abs, n, &sink_banner));
             } else ours.add(timeIt(io, cyc, once, .{ctx}, x.wall_only));
-            if (x.alt) |a| alt.add(try foreign(arena, io, run.name, run.exes[x.alt_exe], run.abs, a, &s.alt_banner));
+            if (x.alt) |a| alt.add(try foreign(arena, io, run.name, exeAt(run, x.alt_exe), run.abs, a, &s.alt_banner));
         }
         var l = score(ours, ref, if (x.alt != null) alt else null, x.info);
         l.fast_only = x.fast_only;
@@ -350,7 +399,7 @@ pub fn drive(io: std.Io, arena: std.mem.Allocator, run: Run, ctx: anytype, compt
         });
         try w.flush();
     }
-    try w.print("rounds: {d}; ratios by {s}; largest spread {d:.1}%{s}\n", .{ run.rounds, if (s.by_cycles) "user-mode cycles" else "wall time", 100 * s.max_spread, if (s.max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
+    try w.print("rounds: {d}; ratios by {s}; largest spread {d:.1}%{s}\n", .{ rounds, if (s.by_cycles) "user-mode cycles" else "wall time", 100 * s.max_spread, if (s.max_spread > 0.05) " (OVER 5 %: noisy run, repeat)" else "" });
     try w.flush();
     if (s.mismatch) {
         std.debug.print("{s}: FAILED -- an output size differs between the sides\n", .{run.name});
@@ -372,7 +421,7 @@ pub fn buildForeign(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8
     try argv.appendSlice(arena, libs);
     try argv.appendSlice(arena, &.{ "-o", exe });
     std.debug.print("{s}: building the foreign side ({s}) ...\n", .{ bench_name, src });
-    const res = try std.process.run(arena, io, .{ .argv = argv.items });
+    const res = try runCapped(arena, io, argv.items, null, .inherit, build_timeout);
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: the C compiler failed:\n{s}\n", .{ bench_name, res.stderr });
         return error.ForeignBuildFailed;
@@ -382,7 +431,7 @@ pub fn buildForeign(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8
 
 /// Run the foreign program once in a non-timing mode (`interop`, `keygen`).
 pub fn foreignOnce(arena: std.mem.Allocator, io: std.Io, bench_name: []const u8, exe: []const u8, abs: []const u8, mode: []const u8) !void {
-    const res = try std.process.run(arena, io, .{ .argv = &.{ exe, abs, mode } });
+    const res = try runCapped(arena, io, &.{ exe, abs, mode }, null, .inherit, run_timeout);
     if (res.term != .exited or res.term.exited != 0) {
         std.debug.print("{s}: foreign side failed in {s}:\n{s}\n", .{ bench_name, mode, res.stderr });
         return error.ForeignFailed;
@@ -505,4 +554,73 @@ test "timeIt: the count is the last op's result, the time per op" {
     try testing.expectEqual(@as(f64, 0), r.cycles);
     try testing.expect(r.ns > 0 and r.ns < 1e6);
     try testing.expect(c.calls > 5);
+}
+
+// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+
+test "cyclesSince never underflows when the counter read failed (sweep TK-8)" {
+    try testing.expectEqual(@as(u64, 7), cyclesSince(10, 3));
+    try testing.expectEqual(@as(u64, 0), cyclesSince(0, 5));
+}
+
+test "roundsOf: zero rounds means one (sweep TK-8)" {
+    try testing.expectEqual(@as(usize, 1), roundsOf(.{ .name = "b", .exes = &.{}, .abs = "/", .rounds = 0 }));
+    try testing.expectEqual(@as(usize, 3), roundsOf(.{ .name = "b", .exes = &.{}, .abs = "/", .rounds = 3 }));
+}
+
+test "exeAt: an index past Run.exes is a checked panic (sweep TK-8)" {
+    const child = @import("child.zig");
+    if (!child.supported) return error.SkipZigTest;
+    const S = struct {
+        fn over() u8 {
+            const r: Run = .{ .name = "b", .exes = &.{"/bin/true"}, .abs = "/" };
+            std.mem.doNotOptimizeAway(exeAt(r, 1).len);
+            return 0;
+        }
+    };
+    const out = try child.run(S.over, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.os.linux.SIG.ABRT) }));
+    const r: Run = .{ .name = "b", .exes = &.{"/bin/true"}, .abs = "/" };
+    try testing.expectEqualStrings("/bin/true", exeAt(r, 0));
+}
+
+test "foreign output past capture_limit fails the run instead of filling memory (sweep TK-8)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // 17 MiB of zeros on stdout from `head`; no network, no temp files.
+    const r = foreignArgv(arena_state.allocator(), testing.io, "bench-test", &.{ "/usr/bin/head", "-c", "17825792", "/dev/zero" }, "x", null);
+    if (r) |_| return error.TestUnexpectedResult else |e| switch (e) {
+        error.StreamTooLong => {},
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    }
+}
+
+test "parseForeign: nan, inf and non-positive times are BadForeignOutput (review R-TK-3)" {
+    for ([_][]const u8{ "x\tnan\t5\t1", "x\tinf\t5\t1", "x\t-1\t5\t1", "x\t0\t5\t1", "x\t3\tnan\t1", "x\t3\t-2\t1", "x\t3\tinf\t1", "x\tnan\t1" }) |line| {
+        try testing.expectError(error.BadForeignOutput, parseForeign(line, "x"));
+    }
+    try testing.expectEqual(Row{ .ns = 3, .cycles = 0, .count = 1 }, try parseForeign("x\t3\t0\t1", "x"));
+}
+
+test "runCapped: output past capture_limit and a child past the timeout both fail (review R-TK-2)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const quick: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(300), .clock = .awake } };
+    // stderr past the limit (the stdout cap is the sweep TK-8 test above).
+    const e1 = runCapped(a, testing.io, &.{ "/bin/sh", "-c", "head -c 17825792 /dev/zero >&2" }, null, .inherit, run_timeout);
+    if (e1) |_| return error.TestUnexpectedResult else |e| switch (e) {
+        error.StreamTooLong => {},
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    }
+    const e2 = runCapped(a, testing.io, &.{ "/bin/sleep", "20" }, null, .inherit, quick);
+    if (e2) |_| return error.TestUnexpectedResult else |e| switch (e) {
+        error.Timeout => {},
+        error.FileNotFound => return error.SkipZigTest,
+        else => return e,
+    }
 }

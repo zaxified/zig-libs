@@ -49,7 +49,7 @@ pub fn Guarded(comptime cap: usize) type {
         /// The last `len` bytes before the guard page: a read or write at
         /// `[len]` faults.
         pub fn tail(len: usize) []u8 {
-            std.debug.assert(len <= cap);
+            if (len > cap) @panic("testkit.guard: tail(len) with len > cap");
             const r = room();
             return r[r.len - len ..];
         }
@@ -57,7 +57,7 @@ pub fn Guarded(comptime cap: usize) type {
         /// The first `len` bytes after the guard page: a read or write at
         /// `[-1]` faults.
         pub fn head(len: usize) []u8 {
-            std.debug.assert(len <= cap);
+            if (len > cap) @panic("testkit.guard: head(len) with len > cap");
             return room()[0..len];
         }
     };
@@ -119,4 +119,28 @@ test "Guarded: the slices have the asked length and the region is reused" {
     try testing.expectEqual(@as(usize, 100), T.head(100).len);
     // head(0) is the body's start, tail(0) its page-rounded end.
     if (supported) try testing.expectEqual(@intFromPtr(T.head(0).ptr) + std.mem.alignForward(usize, 100, std.heap.pageSize()), @intFromPtr(T.tail(0).ptr));
+}
+
+fn tailOver() u8 {
+    std.mem.doNotOptimizeAway(T.tail(101).len);
+    return 0;
+}
+fn headOver() u8 {
+    std.mem.doNotOptimizeAway(T.head(101).len);
+    return 0;
+}
+
+test "tail past cap is a checked panic (sweep TK-6)" {
+    if (!child.supported) return error.SkipZigTest;
+    const out = try child.run(tailOver, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.os.linux.SIG.ABRT) }));
+    // The boundary itself is fine.
+    try testing.expectEqual(@as(usize, 100), T.tail(100).len);
+}
+
+test "head past cap is a checked panic (sweep TK-6)" {
+    if (!child.supported) return error.SkipZigTest;
+    const out = try child.run(headOver, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.os.linux.SIG.ABRT) }));
+    try testing.expectEqual(@as(usize, 0), T.head(0).len);
 }

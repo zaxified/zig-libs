@@ -52,8 +52,12 @@ pub const FaultPlan = struct {
         return p;
     }
 
+    /// Total for any plan a caller writes by hand: `n_chunks` outside 1..8 is
+    /// clamped into it and a zero-size chunk is one byte (a zero-size chunk
+    /// makes no progress, so the stream would spin forever).
     fn chunk(p: *const FaultPlan, k: usize) usize {
-        return p.chunks[k % p.n_chunks];
+        const n = std.math.clamp(@as(usize, p.n_chunks), 1, p.chunks.len);
+        return @max(1, p.chunks[k % n]);
     }
 };
 
@@ -261,4 +265,27 @@ test "failingAllocator: fails the drawn allocation, or none" {
     }
     // About half the seeds inject one.
     try testing.expect(failed > 60 and failed < 140);
+}
+
+test "a hand-written plan with n_chunks 0, 9 or a zero chunk still makes progress (sweep TK-7)" {
+    const plans = [_]FaultPlan{
+        .{ .n_chunks = 0 },
+        .{ .n_chunks = 200, .chunks = .{ 2, 2, 2, 2, 2, 2, 2, 2 } },
+        .{ .n_chunks = 2, .chunks = .{ 0, 0, 0, 0, 0, 0, 0, 0 } },
+    };
+    for (plans) |plan| {
+        var rbuf: [8]u8 = undefined;
+        var r = ChunkedReader.init("hello, world", plan, &rbuf);
+        var got: [32]u8 = undefined;
+        var gw: std.Io.Writer = .fixed(&got);
+        _ = try r.interface.streamRemaining(&gw);
+        try testing.expectEqualStrings("hello, world", gw.buffered());
+
+        var out: [32]u8 = undefined;
+        var wbuf: [8]u8 = undefined;
+        var w = ChunkedWriter.init(&out, plan, &wbuf);
+        try w.interface.writeAll("hello, world");
+        try w.interface.flush();
+        try testing.expectEqualStrings("hello, world", w.written());
+    }
 }

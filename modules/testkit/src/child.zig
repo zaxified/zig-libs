@@ -53,6 +53,31 @@ fn warmDebugInfo() void {
     std.debug.writeCurrentStackTrace(.{}, .{ .writer = &sink.writer, .mode = .no_color }) catch {};
 }
 
+fn realPoll(fds: []linux.pollfd, ms: i32) usize {
+    return linux.poll(fds.ptr, fds.len, ms);
+}
+
+const Wait = enum { ready, timed_out, failed };
+
+/// Poll `fds` until one is ready or `deadline` (ms, monotonic) passes. After
+/// a signal the time LEFT is polled, not the whole limit again, and a limit
+/// past `poll`'s `i32` milliseconds is polled in pieces.
+fn waitReadable(comptime pollFn: anytype, fds: []linux.pollfd, deadline: u64) Wait {
+    while (true) {
+        const left = deadline -| nowMs();
+        const ms: i32 = @intCast(@min(left, std.math.maxInt(i32)));
+        const rc = pollFn(fds, ms);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                if (rc != 0) return .ready;
+                if (nowMs() >= deadline) return .timed_out;
+            },
+            .INTR => {},
+            else => return .failed,
+        }
+    }
+}
+
 /// Fork; the child runs `f(args)` and exits with the `u8` it returns.
 pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFailed }!Outcome {
     warmDebugInfo();
@@ -81,16 +106,13 @@ pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFail
         const pfd: i32 = @intCast(pfd_rc);
         defer _ = linux.close(pfd);
         var fds = [_]linux.pollfd{.{ .fd = pfd, .events = linux.POLL.IN, .revents = 0 }};
-        const ms: i32 = @intCast(@min(opts.limit_ms, std.math.maxInt(i32)));
-        while (true) {
-            const rc = linux.poll(&fds, 1, ms);
-            if (linux.errno(rc) == .INTR) continue;
-            timed_out = linux.errno(rc) == .SUCCESS and rc == 0;
-            break;
-        }
+        const deadline = deadlineAfter(nowMs(), opts.limit_ms);
+        // A poll that fails (not a signal) cannot bound the wait: the child
+        // is killed and reaped below and reported as a hang.
+        timed_out = waitReadable(realPoll, &fds, deadline) != .ready;
     } else {
         // No pidfd (kernel < 5.3): poll the child with WNOHANG.
-        const deadline = nowMs() + opts.limit_ms;
+        const deadline = deadlineAfter(nowMs(), opts.limit_ms);
         while (true) {
             var st: i32 = 0;
             const rc = linux.wait4(pid, &st, linux.W.NOHANG, null);
@@ -118,6 +140,11 @@ pub fn run(f: anytype, args: anytype, opts: Options) error{ ForkFailed, WaitFail
 fn decode(st: u32) Outcome {
     if (linux.W.IFEXITED(st)) return .{ .exited = linux.W.EXITSTATUS(st) };
     return .{ .signaled = @backingInt(linux.W.TERMSIG(st)) };
+}
+
+/// `now + limit`, saturating (`limit_ms` is the caller's; maxInt = "no limit").
+fn deadlineAfter(now: u64, limit_ms: u64) u64 {
+    return now +| limit_ms;
 }
 
 fn nowMs() u64 {
@@ -159,4 +186,45 @@ test "Outcome.eql: same kind and same value only" {
     try testing.expect(!(Outcome{ .exited = 6 }).eql(.{ .signaled = 6 }));
     try testing.expect(!(Outcome{ .signaled = 6 }).eql(.hang));
     try testing.expect((Outcome{ .signaled = 6 }).eql(.{ .signaled = 6 }));
+}
+
+test "deadlineAfter saturates on an unlimited limit_ms (sweep TK-4)" {
+    try testing.expectEqual(@as(u64, 1500), deadlineAfter(1000, 500));
+    try testing.expectEqual(std.math.maxInt(u64), deadlineAfter(1000, std.math.maxInt(u64)));
+}
+
+var fake_calls: u32 = 0;
+var fake_ms: [3]i32 = undefined;
+
+fn eintrThenReady(_: []linux.pollfd, ms: i32) usize {
+    fake_ms[fake_calls] = ms;
+    fake_calls += 1;
+    if (fake_calls == 1) {
+        const nap: linux.timespec = .{ .sec = 0, .nsec = 300 * std.time.ns_per_ms };
+        _ = linux.nanosleep(&nap, null);
+        return @bitCast(-@as(isize, @backingInt(linux.E.INTR)));
+    }
+    return 1;
+}
+
+fn pollFails(_: []linux.pollfd, _: i32) usize {
+    // A retrying waiter would end here (after 3 calls: "ready"), not loop.
+    fake_calls += 1;
+    if (fake_calls > 3) return 1;
+    return @bitCast(-@as(isize, @backingInt(linux.E.INVAL)));
+}
+
+test "waitReadable: after EINTR the time left is polled, not the full limit again (review R-TK-5)" {
+    var fds = [_]linux.pollfd{.{ .fd = 0, .events = linux.POLL.IN, .revents = 0 }};
+    fake_calls = 0;
+    try testing.expectEqual(Wait.ready, waitReadable(eintrThenReady, &fds, nowMs() + 1000));
+    try testing.expectEqual(@as(u32, 2), fake_calls);
+    try testing.expect(fake_ms[0] > 900);
+    try testing.expect(fake_ms[1] < 800);
+}
+
+test "waitReadable: a poll error is a failure, not a retry (review R-TK-5)" {
+    var fds = [_]linux.pollfd{.{ .fd = 0, .events = linux.POLL.IN, .revents = 0 }};
+    fake_calls = 0;
+    try testing.expectEqual(Wait.failed, waitReadable(pollFails, &fds, nowMs() + 1000));
 }

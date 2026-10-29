@@ -96,7 +96,7 @@ pub fn seedHex(comptime h: []const u8) []const u8 {
 /// `out` must hold `4 + frame.len` octets; the returned slice aliases it, so it
 /// has to outlive the `fuzz` call (a `var` in the test body, not in a block).
 pub fn seedInto(out: []u8, frame: []const u8) []const u8 {
-    std.debug.assert(out.len >= 4 + frame.len);
+    if (frame.len > std.math.maxInt(u32) or out.len < 4 + frame.len) @panic("testkit.fuzz.seedInto: out is shorter than 4 + frame.len");
     std.mem.writeInt(u32, out[0..4], @intCast(frame.len), .little);
     @memcpy(out[4..][0..frame.len], frame);
     return out[0 .. 4 + frame.len];
@@ -150,8 +150,11 @@ pub const Cursor = struct {
     /// `at_least`..`at_most` inclusive. `u32` arithmetic throughout, because
     /// `at_most - at_least + 1` overflows a `u8` at the full-width span.
     pub fn ranged(self: *Cursor, at_least: u32, at_most: u32) u32 {
-        std.debug.assert(at_least <= at_most);
-        return at_least + @as(u32, self.byte()) % (at_most - at_least + 1);
+        if (at_least > at_most) @panic("testkit.fuzz.Cursor.ranged: at_least > at_most");
+        // `u64` for the span: 0..maxInt(u32) is 2^32 values, which a `u32`
+        // `at_most - at_least + 1` wraps to 0 (divide by zero).
+        const span: u64 = @as(u64, at_most) - at_least + 1;
+        return at_least + @as(u32, @intCast(@as(u64, self.byte()) % span));
     }
 };
 
@@ -182,7 +185,7 @@ pub const ScriptSource = struct {
 
     pub fn valueRangeAtMost(self: *ScriptSource, comptime T: type, at_least: T, at_most: T) T {
         comptime std.debug.assert(@bitSizeOf(T) <= 64);
-        std.debug.assert(at_least <= at_most);
+        if (at_least > at_most) @panic("testkit.fuzz.ScriptSource: valueRangeAtMost with at_least > at_most");
         // In the unsigned image of T, signed values with the sign bit flipped
         // so that order is kept. Not `@intCast` of an i128 difference: a
         // signed-to-narrower-unsigned cast is the Zig 0.17 #37131 `trunc nsw`
@@ -225,16 +228,22 @@ pub const ScriptSource = struct {
 
     /// `Smith.boolWeighted`: true with odds `true_weight : false_weight`.
     pub fn boolWeighted(self: *ScriptSource, true_weight: u64, false_weight: u64) bool {
-        return self.valueRangeAtMost(u64, 0, true_weight + false_weight - 1) < true_weight;
+        // Saturating: a sum past 2^64 only blurs the odds, and both weights 0
+        // has no odds at all.
+        const total = true_weight +| false_weight;
+        if (total == 0) @panic("testkit.fuzz.ScriptSource.boolWeighted: both weights are 0");
+        return self.valueRangeAtMost(u64, 0, total - 1) < true_weight;
     }
 
     pub fn index(self: *ScriptSource, len: usize) usize {
+        if (len == 0) @panic("testkit.fuzz.ScriptSource.index(0)");
         return self.valueRangeAtMost(usize, 0, len - 1);
     }
 
     pub fn slice(self: *ScriptSource, buf: []u8) u32 {
         const left = self.cur.bytes.len -| self.cur.at;
-        const n = @min(buf.len, left);
+        // `u32` is the return type: a buffer past 4 GiB is filled in part.
+        const n = @min(buf.len, left, std.math.maxInt(u32));
         // `Cursor.byte` cycles, so `at` may already be past the end.
         if (n == 0) return 0;
         @memcpy(buf[0..n], self.cur.bytes[self.cur.at..][0..n]);
@@ -395,4 +404,75 @@ test "a seed survives being handed to a second draw" {
     var buf: [16]u8 = undefined;
     smith.bytes(&buf);
     try std.testing.expectEqual(@as(u16, 42), smith.valueRangeAtMost(u16, 0, 256));
+}
+
+// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+
+test "Cursor.ranged covers the full u32 span without overflow (sweep TK-5)" {
+    // `at_most - at_least + 1` was a u32 sum: 0 at the full width, then a
+    // modulo by zero.
+    var c: Cursor = .{ .bytes = &.{ 200, 7 } };
+    try std.testing.expectEqual(@as(u32, 200), c.ranged(0, std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u32, 7), c.ranged(0, std.math.maxInt(u32)));
+    var d: Cursor = .{ .bytes = &.{9} };
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), d.ranged(std.math.maxInt(u32), std.math.maxInt(u32)));
+}
+
+test "ScriptSource.boolWeighted survives weights that sum past u64 (sweep TK-5)" {
+    var src: ScriptSource = .init(&.{ 0, 0, 0, 0, 0, 0, 0, 1 });
+    // The script is the number 1: below either weight, so true.
+    try std.testing.expect(src.boolWeighted(std.math.maxInt(u64), std.math.maxInt(u64)));
+    var z: ScriptSource = .init(&.{0});
+    try std.testing.expect(!z.boolWeighted(0, 5));
+    try std.testing.expect(z.boolWeighted(5, 0));
+}
+
+const child_mod = @import("child.zig");
+
+fn expectAborts(comptime f: fn () u8) !void {
+    if (!child_mod.supported) return error.SkipZigTest;
+    const out = try child_mod.run(f, .{}, .{ .limit_ms = 5000 });
+    try std.testing.expect(out.eql(.{ .signaled = @backingInt(std.os.linux.SIG.ABRT) }));
+}
+
+fn seedIntoShort() u8 {
+    var out: [3]u8 = undefined;
+    std.mem.doNotOptimizeAway(seedInto(&out, "abc"));
+    return 0;
+}
+fn scriptIndex0() u8 {
+    var s: ScriptSource = .init(&.{1});
+    std.mem.doNotOptimizeAway(s.index(0));
+    return 0;
+}
+fn scriptInverted() u8 {
+    var s: ScriptSource = .init(&.{1});
+    std.mem.doNotOptimizeAway(s.valueRangeAtMost(u8, 5, 1));
+    return 0;
+}
+fn scriptZeroWeights() u8 {
+    var s: ScriptSource = .init(&.{1});
+    std.mem.doNotOptimizeAway(s.boolWeighted(0, 0));
+    return 0;
+}
+fn cursorInverted() u8 {
+    var c: Cursor = .{ .bytes = &.{1} };
+    std.mem.doNotOptimizeAway(c.ranged(5, 1));
+    return 0;
+}
+
+test "seedInto with a short out is a checked panic (sweep TK-5)" {
+    try expectAborts(seedIntoShort);
+}
+test "ScriptSource.index(0) is a checked panic (sweep TK-5)" {
+    try expectAborts(scriptIndex0);
+}
+test "ScriptSource.valueRangeAtMost with at_least > at_most is a checked panic (sweep TK-5)" {
+    try expectAborts(scriptInverted);
+}
+test "ScriptSource.boolWeighted(0, 0) is a checked panic (sweep TK-5)" {
+    try expectAborts(scriptZeroWeights);
+}
+test "Cursor.ranged with at_least > at_most is a checked panic (sweep TK-5)" {
+    try expectAborts(cursorInverted);
 }
