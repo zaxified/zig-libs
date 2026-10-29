@@ -110,7 +110,9 @@ pub const Logger = struct {
         var entry = root.entryFromRequest(ctx.req, ctx.res, &addr_buf, .{
             .timestamp_ns = start,
             .time_formatted = if (l.time_format) |f| f(start, &time_buf) else null,
-            .latency_ns = if (end >= start) @intCast(end - start) else null,
+            // `end -% start`: with a clock spanning minInt..maxInt the plain `end - start`
+            // overflows i64 (sweep AL-1); end >= start makes the wrapped difference the true one in u64.
+            .latency_ns = if (end >= start) @as(u64, @bitCast(end -% start)) else null,
             .request_id = if (l.request_id) |f| f(ctx) else null,
             .trace_id = if (l.trace_id) |f| f(ctx) else null,
             .span_id = if (l.span_id) |f| f(ctx) else null,
@@ -400,4 +402,32 @@ test "Logger: trace_id, span_id and user come from their own functions; a zero l
     try testing.expect(std.mem.find(u8, line, " latency_ns=0 ") != null);
     try testing.expect(std.mem.find(u8, line, " trace_id=TRACE span_id=SPAN\n") != null);
     try testing.expect(std.mem.find(u8, line, "request_id") == null);
+}
+
+const WideClock = struct {
+    vals: [2]i64,
+    i: usize = 0,
+    fn now(c: ?*anyopaque) i64 {
+        const self: *WideClock = @ptrCast(@alignCast(c.?));
+        const v = self.vals[self.i % 2];
+        self.i += 1;
+        return v;
+    }
+};
+
+test "Logger: a clock spanning the whole i64 range does not overflow the latency (sweep AL-1)" {
+    var clock: WideClock = .{ .vals = .{ std.math.minInt(i64), std.math.maxInt(i64) } };
+    var sink_buf: [1024]u8 = undefined;
+    var sw: std.Io.Writer = .fixed(&sink_buf);
+    var sink = root.Sink.init(&sw, .{ .format = .logfmt });
+    var logger: Logger = .{ .sink = &sink, .clock = .{ .context = &clock, .now_ns = WideClock.now } };
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(logger.middleware());
+    try r.get("/items/:id", hOk);
+
+    var buf: [1024]u8 = undefined;
+    _ = runWire(&r, get_req, &buf);
+    // maxInt(i64) - minInt(i64) = 2^64 - 1
+    try testing.expect(std.mem.find(u8, sw.buffered(), " latency_ns=18446744073709551615 ") != null);
 }
