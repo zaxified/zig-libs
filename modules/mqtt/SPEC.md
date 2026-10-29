@@ -563,6 +563,36 @@ fallback).
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
 
+- (GM, 2026-10-29) Global byte caps if a consumer needs them: queued bytes
+  across all sessions/connections (`(max_sessions + max_connections) *
+  max_queued_bytes`), subscription filter bytes (`max_subscriptions_total *
+  max_packet_size`), and an examined-entries envelope for the retained walk at
+  SUBSCRIBE (documented in `Config`; mosquitto has no such caps either).
+- (GM, 2026-10-29) DONE: `Broker.fanout` collapsed matches to owners and
+  gathered Subscription Identifiers with nested scans (owners x matches under
+  the registry lock); now one pass with a pointer-keyed map (review R-MQ-2).
+- (GM review, 2026-10-29) Backlog, each with the review's trigger:
+  - R-MQ-1 follow-up: a bounded per-connection outbox (a slow subscriber is
+    now cut off by `TcpServer.write_timeout_ms`, but a publisher still waits up
+    to that long inside the write).
+  - R-MQ-6: persistent sessions never expire by default (`session_expiry_ms =
+    0`); 1024 anonymous clean_session=0 CONNECTs with unique ids fill
+    `max_sessions` until restart (mosquitto's default too). A safe default or
+    docs.
+  - R-MQ-7: Shared Subscriptions are a flat list (`fanout`, `findShared`,
+    `pickShared`): 65536 distinct `$share/g<i>/...` groups make every PUBLISH
+    and SUBSCRIBE scan them all under the lock. Put groups into the trie.
+  - R-MQ-9: a CONNACK refusal (`claimedByAnother`, session limit) is written
+    while holding `b.mutex`; only a consumer `Transport` that blocks could
+    stall the broker (the stock socket cannot block on a fresh connection).
+  - R-MQ-11: bridges have no hop or loop bound (two bridges between one pair
+    of brokers, a ring, a 3.1.1 remote reordering more than the 32 remembered
+    messages): messages can circulate at link speed. Operator error, as in
+    mosquitto.
+  - R-MQ-12: PBKDF2 login cost: a hostile password file with
+    `max_iterations` 1e7 makes each CONNECT cost seconds; no unauthenticated
+    rate limit (config-time concern).
+
 ## Status
 `gap · any (codec+client pure; TcpTransport uses std.Io.net) · client+codec · single-owner` + deps:
 none (std only) — canonical source is `pub const meta` in src/root.zig.

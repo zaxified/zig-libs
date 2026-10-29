@@ -149,4 +149,5 @@ test {
     _ = bridge;
     _ = @import("bridge_test.zig");
     _ = @import("fuzz_session_test.zig");
+    _ = @import("sweep_session_test.zig");
 }

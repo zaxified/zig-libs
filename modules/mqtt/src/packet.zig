@@ -1790,6 +1790,10 @@ fn decodePublish(r: *BodyReader, flags: u4, v5: bool) DecodeError!Publish {
 const testing = std.testing;
 const testkit = @import("testkit");
 
+test {
+    _ = @import("sweep_wire_test.zig");
+}
+
 test "remaining length: boundary values encode/decode exactly" {
     const cases = [_]struct { value: u32, bytes: []const u8 }{
         .{ .value = 0, .bytes = &.{0x00} },

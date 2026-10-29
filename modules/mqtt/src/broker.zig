@@ -247,7 +247,10 @@ pub const Connection = struct {
     transport: Transport,
     rx_buf: []u8,
     rx_len: usize = 0,
+    /// Consumed prefix of `rx_buf` (`feed` compacts it away).
     rx_consumed: usize = 0,
+    /// Where the packet being handled starts in `rx_buf`.
+    rx_pkt_start: usize = 0,
     /// Sized `max_packet_size + tx_headroom` (FIX B).
     tx_buf: []u8,
     /// Guards `tx_buf`, `pending`, and serializes socket writes to this
@@ -713,6 +716,19 @@ const Owner = union(enum) {
     }
 };
 
+/// `Owner` as a hash key: the owner's address and which kind it is.
+const OwnerKey = struct {
+    addr: usize,
+    is_conn: bool,
+
+    fn of(o: Owner) OwnerKey {
+        return switch (o) {
+            .conn => |c| .{ .addr = @intFromPtr(c), .is_conn = true },
+            .session => |x| .{ .addr = @intFromPtr(x), .is_conn = false },
+        };
+    }
+};
+
 /// A subscriber reference stored in the trie (the filter string is implicit in
 /// the path and owned by the connection or session).
 const SubRef = struct {
@@ -788,6 +804,25 @@ const Node = struct {
 
 const Index = struct {
     root: Node = .{},
+    /// Live non-root trie nodes (`Config.max_subscription_nodes`).
+    nodes: usize = 0,
+
+    /// How many nodes `add(filter)` would create: the levels of `filter`
+    /// (up to a trailing `#`, which lives in its parent) that are not in the
+    /// trie yet. Read-only.
+    fn missingNodes(idx: *const Index, filter: []const u8) usize {
+        var node: ?*const Node = &idx.root;
+        var missing: usize = 0;
+        var it = std.mem.splitScalar(u8, filter, '/');
+        while (it.next()) |level| {
+            if (std.mem.eql(u8, level, "#")) break;
+            if (node) |n| {
+                node = if (std.mem.eql(u8, level, "+")) n.plus else n.children.get(level);
+                if (node == null) missing += 1;
+            } else missing += 1;
+        }
+        return missing;
+    }
 
     fn deinit(idx: *Index, alloc: std.mem.Allocator) void {
         freeNode(alloc, &idx.root, true);
@@ -820,6 +855,7 @@ const Index = struct {
                     const child = try alloc.create(Node);
                     child.* = .{};
                     node.plus = child;
+                    idx.nodes += 1;
                 }
                 node = node.plus.?;
             } else if (node.children.get(level)) |child| {
@@ -831,6 +867,7 @@ const Index = struct {
                 errdefer alloc.destroy(child);
                 child.* = .{};
                 try node.children.put(alloc, key, child);
+                idx.nodes += 1;
                 node = child;
             }
         }
@@ -897,11 +934,11 @@ const Index = struct {
             levels[n] = level;
             n += 1;
         }
-        _ = removeRec(alloc, &idx.root, levels[0..n], owner);
+        _ = removeRec(alloc, &idx.nodes, &idx.root, levels[0..n], owner);
     }
 
     /// Returns whether `node` became empty (and was pruned by the caller).
-    fn removeRec(alloc: std.mem.Allocator, node: *Node, levels: [][]const u8, owner: Owner) bool {
+    fn removeRec(alloc: std.mem.Allocator, nodes: *usize, node: *Node, levels: [][]const u8, owner: Owner) bool {
         if (levels.len == 0) {
             removeRefFrom(&node.subs, owner);
             return node.isEmpty();
@@ -913,7 +950,8 @@ const Index = struct {
         }
         if (std.mem.eql(u8, head, "+")) {
             if (node.plus) |p| {
-                if (removeRec(alloc, p, levels[1..], owner)) {
+                if (removeRec(alloc, nodes, p, levels[1..], owner)) {
+                    nodes.* -= 1; // pruned only when empty: exactly this node
                     freeNode(alloc, p, false);
                     node.plus = null;
                 }
@@ -923,7 +961,8 @@ const Index = struct {
         if (node.children.getEntry(head)) |e| {
             const child = e.value_ptr.*;
             const key = e.key_ptr.*;
-            if (removeRec(alloc, child, levels[1..], owner)) {
+            if (removeRec(alloc, nodes, child, levels[1..], owner)) {
+                nodes.* -= 1; // pruned only when empty: exactly this node
                 _ = node.children.remove(head);
                 alloc.free(key);
                 freeNode(alloc, child, false);
@@ -1137,7 +1176,19 @@ pub const Config = struct {
     max_connections: usize = 1024,
     /// Hard cap on subscriptions across the whole broker; a new filter past
     /// this is refused with SUBACK 0x80 rather than growing unboundedly.
+    /// Counts, not bytes: the filter strings they hold are bounded by this
+    /// times `max_packet_size` (a filter is at most one packet), about three
+    /// copies of each (connection/session list, trie key, group). The trie
+    /// nodes are bounded separately by `max_subscription_nodes`.
     max_subscriptions_total: usize = 65536,
+    /// Hard cap on the nodes of the subscription trie (one per distinct
+    /// filter level; ~250 bytes each with its tables). `max_subscriptions_total`
+    /// alone does not bound memory: a 128-level filter costs ~30 KB of nodes,
+    /// not one packet's worth. A SUBSCRIBE whose filter would take the trie
+    /// past this gets SUBACK 0x97 (5.0) / 0x80 (3.1.1); existing
+    /// subscriptions are unaffected, and nodes freed by UNSUBSCRIBE or a
+    /// session's end are uncounted. Default 1 << 20 (~250 MiB worst case).
+    max_subscription_nodes: usize = 1 << 20,
     /// Hard cap on subscriptions held by one connection.
     max_subscriptions_per_conn: usize = 1024,
     /// Hard cap on distinct retained topics; a genuinely new topic past this
@@ -1188,6 +1239,11 @@ pub const Config = struct {
     /// ordinary use is never truncated; a truncated walk bumps
     /// `Broker.retainedTruncations()`.
     max_retained_deliveries: usize = 8192,
+    /// ⚠ The envelopes bound what a SUBSCRIBE *sends*, not what it *examines*:
+    /// every filter in the packet (at most `max_filters_per_subscribe`, exact
+    /// duplicates walked once) is matched against every retained topic, under
+    /// the registry lock. Cost per SUBSCRIBE: filters x retained topics x
+    /// match length, bounded by `max_retained` and `max_retained_store_bytes`.
     /// Byte envelope on the same walk — the count above does not bound
     /// payload size, and `max_retained` never did either. 16 MiB.
     max_retained_bytes: usize = 16 << 20,
@@ -1211,6 +1267,12 @@ pub const Config = struct {
     max_queued_messages: usize = 1000,
     /// Per session: the bytes (topic + payload) those messages may hold.
     max_queued_bytes: usize = 1 << 20,
+    /// ⚠ Aggregate bound of the two queue limits: they are per session and per
+    /// clean-session connection (its window queue), so the broker as a whole
+    /// may hold up to `(max_sessions + max_connections) * max_queued_bytes`
+    /// (about 2 GiB at the defaults) of messages for subscribers that do not
+    /// acknowledge. Lower them (or `max_sessions` / `max_connections`) to fit
+    /// the machine; there is no global byte cap (mosquitto has none either).
     /// How long an offline session is kept, measured from when its connection
     /// closed (the latest time the broker had been given then: a packet's
     /// `now`, an `expireSessions` or `publishDueWills` call), when the caller
@@ -1859,7 +1921,7 @@ pub const Broker = struct {
             .retain = m.retain,
             .props = try arena.dupe(u8, m.props()),
             .sub_ids = try arena.dupe(u32, m.ids()),
-            .expires_in_ms = if (m.expires_at) |at| @intCast(@max(at - now, 0)) else null,
+            .expires_in_ms = if (m.expires_at) |at| @intCast(@max(at -| now, 0)) else null,
             .packet_id = m.id,
             .released = m.released,
         };
@@ -1882,8 +1944,8 @@ pub const Broker = struct {
                 .payload = try arena.dupe(u8, r.payload),
                 .qos = r.qos,
                 .props = try arena.dupe(u8, r.props),
-                .expires_in_ms = if (r.expires_at) |at| @intCast(@max(at - now, 0)) else null,
-                .age_ms = @intCast(@max(now - r.stored_ms, 0)),
+                .expires_in_ms = if (r.expires_at) |at| @intCast(@max(at -| now, 0)) else null,
+                .age_ms = @intCast(@max(now -| r.stored_ms, 0)),
             });
         }
         return out.toOwnedSlice(arena);
@@ -1918,13 +1980,13 @@ pub const Broker = struct {
             // `storeRetained` stamps instead of the clock (no second scan of
             // the store per item). The store itself is still a flat list: a
             // restore of n items costs O(n^2), under the registry lock.
-            b.restore_stored_ms = now - @as(i64, @intCast(@min(it.age_ms, std.math.maxInt(i62))));
+            b.restore_stored_ms = now -| @as(i64, @intCast(@min(it.age_ms, std.math.maxInt(i62))));
             defer b.restore_stored_ms = null;
             b.storeRetained(.{
                 .topic = it.topic,
                 .payload = it.payload,
                 .props = props,
-                .expires_at = if (it.expires_in_ms) |e| now + @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
+                .expires_at = if (it.expires_in_ms) |e| now +| @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
                 .retain = true,
             }, it.qos) catch return error.OutOfMemory;
         }
@@ -2084,7 +2146,7 @@ pub const Broker = struct {
             .payload_len = ms.payload.len,
             .props_len = ms.props.len,
             .ids_len = ms.sub_ids.len,
-            .expires_at = if (ms.expires_in_ms) |e| now + @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
+            .expires_at = if (ms.expires_in_ms) |e| now +| @as(i64, @intCast(@min(e, std.math.maxInt(i62)))) else null,
             .retain = ms.retain,
             .qos = ms.qos,
             .id = ms.packet_id,
@@ -2225,7 +2287,7 @@ pub const Broker = struct {
                 const ttl_ms: ?u64 = if (x.expiry_s) |e|
                     (if (e == std.math.maxInt(u32)) null else @as(u64, e) * 1000)
                 else if (b.config.session_expiry_ms == 0) null else b.config.session_expiry_ms;
-                if (offline) if (ttl_ms) |ttl| if (now - x.offline_since_ms >= @as(i64, @intCast(@min(ttl, std.math.maxInt(i64))))) {
+                if (offline) if (ttl_ms) |ttl| if (now -| x.offline_since_ms >= @as(i64, @intCast(@min(ttl, std.math.maxInt(i64))))) {
                     if (b.takeDelayedWill(x.clientId())) |w| wills.append(b.allocator, w) catch b.freeDelayedWill(w);
                     b.discardSession(x); // swap-removes index i
                     gone += 1;
@@ -2414,7 +2476,7 @@ pub const Broker = struct {
             .payload = w.payload,
             .props = packet.decodePropertyEntries(w.props, .publish) catch .{},
             .retain = w.retain,
-            .expires_at = if (w.expiry_s) |e| now + @as(i64, e) * 1000 else null,
+            .expires_at = if (w.expiry_s) |e| now +| @as(i64, e) * 1000 else null,
         }, w.qos, now) catch {
             _ = b.will_failures.fetchAdd(1, .monotonic);
         };
@@ -2442,7 +2504,7 @@ pub const Broker = struct {
             .qos = conn.will_qos,
             .retain = conn.will_retain,
             .expiry_s = conn.will_expiry_s,
-            .due_ms = now + @as(i64, conn.will_delay_s) * 1000,
+            .due_ms = now +| @as(i64, conn.will_delay_s) * 1000,
         });
         return true;
     }
@@ -2571,7 +2633,7 @@ pub const Broker = struct {
             if (b.sys_last_ms) |last| {
                 // `now < last`: the caller's clock stepped back; publish
                 // rather than wait for it to catch up.
-                if (now >= last and now - last < @as(i64, @intCast(@min(interval, std.math.maxInt(i64))))) return 0;
+                if (now >= last and now -| last < @as(i64, @intCast(@min(interval, std.math.maxInt(i64))))) return 0;
             }
             b.sys_last_ms = now;
 
@@ -2591,7 +2653,7 @@ pub const Broker = struct {
             }
             const st = &b.stats;
             values = .{
-                @as(u64, @intCast(@divTrunc(@max(now - first, 0), 1000))),
+                @as(u64, @intCast(@divTrunc(@max(now -| first, 0), 1000))),
                 connected,
                 offline,
                 connected + offline,
@@ -2745,7 +2807,7 @@ pub const Broker = struct {
             .payload = payload,
             .props = fwd,
             .retain = o.retain,
-            .expires_at = if (o.message_expiry_s) |e| now + @as(i64, e) * 1000 else null,
+            .expires_at = if (o.message_expiry_s) |e| now +| @as(i64, e) * 1000 else null,
         }, o.qos, now);
     }
 
@@ -2785,19 +2847,23 @@ pub const Broker = struct {
     /// lock.
     pub fn process(b: *Broker, conn: *Connection, now: i64) Error!Disposition {
         while (true) {
-            conn.compact();
+            // `rx_consumed` is the consumed prefix: decode past it instead of
+            // compacting per packet (a memmove of the rest of the buffer for
+            // every packet: quadratic in `max_packet_size`). `feed` compacts.
             // Until the CONNECT, the version is unknown: `.v5` decodes a
             // CONNECT of either level and says which. Any other first packet
             // is read as 3.1.1, to be refused as before (spec 3.1).
-            const first_is_connect = conn.rx_len > 0 and conn.rx_buf[0] >> 4 == @backingInt(packet.PacketType.connect);
+            const pending = conn.rx_buf[conn.rx_consumed..conn.rx_len];
+            const first_is_connect = pending.len > 0 and pending[0] >> 4 == @backingInt(packet.PacketType.connect);
             const version: packet.Version = if (conn.state != .awaiting_connect or conn.auth_state == .connecting) conn.version else if (first_is_connect) .v5 else .v3_1_1;
-            const dec = (packet.decodePacket(conn.rx_buf[0..conn.rx_len], version) catch |e| {
+            const dec = (packet.decodePacket(pending, version) catch |e| {
                 if (e == error.UnsupportedProtocol and first_is_connect and conn.state == .awaiting_connect) {
                     refuseProtocolLevel(conn);
                 }
                 return b.fail(conn, e);
             }) orelse return .keep;
-            conn.rx_consumed = dec.consumed;
+            conn.rx_pkt_start = conn.rx_consumed;
+            conn.rx_consumed += dec.consumed;
             conn.last_packet_ms = now;
             _ = b.stats.bytes_received.fetchAdd(dec.consumed, .monotonic);
             _ = b.stats.messages_received.fetchAdd(1, .monotonic);
@@ -2815,7 +2881,7 @@ pub const Broker = struct {
     /// reads the same way. Any other protocol name may simply be
     /// disconnected (3.1.2-1), and is.
     fn refuseProtocolLevel(conn: *Connection) void {
-        const raw = conn.rx_buf[0..conn.rx_len];
+        const raw = conn.rx_buf[conn.rx_consumed..conn.rx_len];
         var off: usize = 1;
         while (off < raw.len and off < 5 and raw[off] & 0x80 != 0) off += 1;
         off += 1; // the last remaining-length byte
@@ -2857,7 +2923,7 @@ pub const Broker = struct {
     pub fn keepAliveExpired(b: *const Broker, conn: *const Connection, now: i64) bool {
         _ = b;
         if (conn.keep_alive_s == 0) return false;
-        const deadline = conn.last_packet_ms + @as(i64, conn.keep_alive_s) * 1500;
+        const deadline = conn.last_packet_ms +| @as(i64, conn.keep_alive_s) * 1500;
         return now > deadline;
     }
 
@@ -3018,7 +3084,7 @@ pub const Broker = struct {
         // once the hook says `.success` (`ext_done`).
         if (v5 and !conn.ext_done) if (c.properties.authentication_method) |method| {
             if (method.len == 0) return error.ProtocolViolation; // 3.15.2.2.2: a method name
-            const raw = try b.allocator.dupe(u8, conn.rx_buf[0..conn.rx_consumed]);
+            const raw = try b.allocator.dupe(u8, conn.rx_buf[conn.rx_pkt_start..conn.rx_consumed]);
             // ⛔ No errdefer on `raw`: once the connection owns it (below),
             // any error out of `extAuthStep` -- which may already have freed
             // it -- must not free it again (review H1).
@@ -3439,7 +3505,7 @@ pub const Broker = struct {
         while (i < b.retained.items.len) {
             const r = b.retained.items[i];
             if (b.retainedGone(r, now)) {
-                b.clearRetained(r.topic); // swap-removes index i
+                b.removeRetainedAt(i); // swap-removes index i: one pass, not a rescan per item
                 _ = b.messages_expired.fetchAdd(1, .monotonic);
                 continue;
             }
@@ -3471,7 +3537,7 @@ pub const Broker = struct {
         if (r.expires_at) |at| return at <= now;
         const limit = b.config.retain_expiry_interval_ms;
         if (limit == 0 or isSysTopic(r.topic)) return false; // `$SYS` is refreshed by publishSys
-        return now - r.stored_ms >= @as(i64, @intCast(@min(limit, std.math.maxInt(i64))));
+        return now -| r.stored_ms >= @as(i64, @intCast(@min(limit, std.math.maxInt(i64))));
     }
 
     /// A 5.0 Session Expiry Interval held to `Config.session_expiry_ms` when
@@ -3968,6 +4034,10 @@ pub const Broker = struct {
         }
         if (b.subscriptions_total >= b.config.max_subscriptions_total) return .refused;
         if (subs.items.len >= b.config.max_subscriptions_per_conn) return .refused;
+        // Trie nodes are the real memory of a long filter (a Shared
+        // Subscription lives in a flat group list, not in the trie).
+        if ((splitShared(filter) catch unreachable) == null and
+            b.index.nodes +| b.index.missingNodes(filter) > b.config.max_subscription_nodes) return .refused;
         const inner = (splitShared(filter) catch unreachable) orelse filter;
         var level_count: usize = 0;
         var lv = std.mem.splitScalar(u8, inner, '/');
@@ -4111,7 +4181,7 @@ pub const Broker = struct {
                 .payload = pub_pkt.payload,
                 .props = forwardable(pub_pkt.properties),
                 .retain = pub_pkt.retain,
-                .expires_at = if (pub_pkt.properties.message_expiry_interval) |e| now + @as(i64, e) * 1000 else null,
+                .expires_at = if (pub_pkt.properties.message_expiry_interval) |e| now +| @as(i64, e) * 1000 else null,
                 .origin = conn.clientId(),
             }, pub_pkt.qos, now);
             if (matched == 0) reason = .no_matching_subscribers;
@@ -4329,33 +4399,61 @@ pub const Broker = struct {
             // flag kept if any of its subscriptions keeps it (5.0 Retain As
             // Published). A No Local subscription never takes the publisher's
             // own message (3.8.3-3).
+            //
+            // One pass over `matches` with a pointer-keyed map from owner to
+            // its slot: O(matches), not O(owners x matches) under `mutex`
+            // (review R-MQ-2). Owners keep the order of their first match.
             var owners: std.ArrayListUnmanaged(SubRef) = .empty;
             defer owners.deinit(b.allocator);
-            for (matches.items) |ref| {
+            const no_owner = std.math.maxInt(usize);
+            const owner_of = try b.allocator.alloc(usize, matches.items.len);
+            defer b.allocator.free(owner_of);
+            var slot_of: std.AutoHashMapUnmanaged(OwnerKey, usize) = .empty;
+            defer slot_of.deinit(b.allocator);
+            for (matches.items, owner_of) |ref, *slot| {
+                slot.* = no_owner;
                 if (ref.owner == .conn and ref.owner.conn.state != .connected) continue;
                 if (ref.no_local) if (msg.origin) |o| if (std.mem.eql(u8, ownerClientId(ref.owner), o)) continue;
-                for (owners.items) |*o| {
-                    if (o.owner.eql(ref.owner)) {
-                        o.qos = maxQos(o.qos, ref.qos);
-                        o.retain_as_published = o.retain_as_published or ref.retain_as_published;
-                        break;
-                    }
-                } else try owners.append(b.allocator, ref);
+                const gop = try slot_of.getOrPut(b.allocator, OwnerKey.of(ref.owner));
+                if (gop.found_existing) {
+                    const o = &owners.items[gop.value_ptr.*];
+                    o.qos = maxQos(o.qos, ref.qos);
+                    o.retain_as_published = o.retain_as_published or ref.retain_as_published;
+                } else {
+                    gop.value_ptr.* = owners.items.len;
+                    try owners.append(b.allocator, ref);
+                }
+                slot.* = gop.value_ptr.*;
             }
             matched = 0; // counted below: only subscribers that are delivered to
 
             // Each owner's Subscription Identifiers: one copy carries them all
-            // (3.3.4-4). Gathered per owner into one list, a run per target.
+            // (3.3.4-4). Gathered per owner into one list, a run per target:
+            // the matches carrying one are chained per owner (in match order),
+            // then each chain is walked once, a repeated id dropped by a set.
             const spans = try b.allocator.alloc([2]usize, owners.items.len);
             defer b.allocator.free(spans);
-            for (owners.items, spans) |o, *span| {
+            const chain = try b.allocator.alloc(usize, 2 * owners.items.len + matches.items.len);
+            defer b.allocator.free(chain);
+            const head = chain[0..owners.items.len];
+            const tail = chain[owners.items.len..][0..owners.items.len];
+            const next = chain[2 * owners.items.len ..];
+            @memset(head, no_owner);
+            for (matches.items, owner_of, next, 0..) |ref, slot, *nx, k| {
+                nx.* = no_owner;
+                if (slot == no_owner or ref.sub_id == 0) continue;
+                if (head[slot] == no_owner) head[slot] = k else next[tail[slot]] = k;
+                tail[slot] = k;
+            }
+            var seen: std.AutoHashMapUnmanaged(struct { slot: usize, id: u32 }, void) = .empty;
+            defer seen.deinit(b.allocator);
+            for (spans, head, 0..) |*span, h, slot| {
                 span[0] = ids.items.len;
-                for (matches.items) |ref| {
-                    if (ref.sub_id != 0 and ref.owner.eql(o.owner) and
-                        std.mem.findScalar(u32, ids.items[span[0]..], ref.sub_id) == null)
-                    {
-                        try ids.append(b.allocator, ref.sub_id);
-                    }
+                var k = h;
+                while (k != no_owner) : (k = next[k]) {
+                    const id = matches.items[k].sub_id;
+                    if ((try seen.getOrPut(b.allocator, .{ .slot = slot, .id = id })).found_existing) continue;
+                    try ids.append(b.allocator, id);
                 }
                 span[1] = ids.items.len;
             }
@@ -4669,14 +4767,19 @@ pub const Broker = struct {
     fn clearRetained(b: *Broker, topic_name: []const u8) void {
         for (b.retained.items, 0..) |r, i| {
             if (std.mem.eql(u8, r.topic, topic_name)) {
-                b.retained_bytes -= r.bytes();
-                b.allocator.free(r.topic);
-                b.allocator.free(r.payload);
-                b.allocator.free(r.props);
-                _ = b.retained.swapRemove(i);
+                b.removeRetainedAt(i);
                 return;
             }
         }
+    }
+
+    fn removeRetainedAt(b: *Broker, i: usize) void {
+        const r = b.retained.items[i];
+        b.retained_bytes -= r.bytes();
+        b.allocator.free(r.topic);
+        b.allocator.free(r.payload);
+        b.allocator.free(r.props);
+        _ = b.retained.swapRemove(i);
     }
 
     /// Caller holds `mutex`. Drop every subscription this connection holds
@@ -4717,7 +4820,7 @@ fn ackInflight(alloc: std.mem.Allocator, x: *Session, conn: *Connection, id: u16
 
 /// Seconds of a Message Expiry left at `now`, rounded up and at least `floor`.
 fn secondsLeft(at: i64, now: i64, floor: i64) u32 {
-    const left = @divFloor(at - now + 999, 1000);
+    const left = @divFloor((at -| now) +| 999, 1000);
     return @intCast(std.math.clamp(left, floor, std.math.maxInt(u32)));
 }
 
@@ -4875,6 +4978,17 @@ pub const TcpServer = struct {
     /// stream, ~0.5 ms a message on this broker and on Mosquitto alike.
     /// Set it for latency; leave it for fewer, fuller segments.
     tcp_nodelay: bool = false,
+    /// Send deadline (ms): a write to one subscriber that has not completed
+    /// after this long (its TCP window closed: a peer that never reads) has
+    /// its connection shut down, which fails the write and takes the
+    /// existing contained-delivery-failure path (that subscriber is
+    /// disconnected; publishers carry on). Without it one such subscriber
+    /// (`keep_alive` 0, subscribed to `#`) blocks every publisher whose
+    /// message matches it inside the write, holding the connection's
+    /// `tx_lock`. 0 = no deadline. Enforced by the connection's watchdog task
+    /// on the monotonic clock, so it is accurate to about half this value
+    /// (at most one second). A per-connection bounded outbox is SPEC backlog.
+    write_timeout_ms: u32 = 10_000,
 
     /// Standard MQTT port (1883; 8883 is MQTT over TLS).
     pub const default_port = 1883;
@@ -4893,8 +5007,11 @@ pub const TcpServer = struct {
         s.listener = try ip.listen(s.io, .{ .reuse_address = true });
     }
 
+    /// The address `bind` listens on. Calling it before a successful `bind`
+    /// is a caller error: `@panic("mqtt: TcpServer.boundAddress before bind")`.
     pub fn boundAddress(s: *const TcpServer) std.Io.net.IpAddress {
-        return s.listener.?.socket.address;
+        const l = s.listener orelse @panic("mqtt: TcpServer.boundAddress before bind");
+        return l.socket.address;
     }
 
     /// Stop accepting: wakes a blocked `serve`, which drains connection tasks.
@@ -4904,6 +5021,8 @@ pub const TcpServer = struct {
         stream.shutdown(s.io, .both) catch {};
     }
 
+    /// Serve until `shutdown`. Calling it before a successful `bind` is a
+    /// caller error: `@panic("mqtt: TcpServer.serve before bind")`.
     pub fn serve(s: *TcpServer) !void {
         defer s.group.await(s.io) catch {};
         // The broker reads no clock; this task is its upkeep against one:
@@ -4911,12 +5030,21 @@ pub const TcpServer = struct {
         // are published. Without a task for it the server runs, without them.
         var upkeep = try s.io.concurrent(maintain, .{s});
         defer upkeep.cancel(s.io) catch {};
-        const listener = &s.listener.?;
+        const listener = &(s.listener orelse @panic("mqtt: TcpServer.serve before bind"));
+        // A persistent accept error (EMFILE/ENFILE: the open sockets are the
+        // cause) must not spin this thread at 100% CPU: back off from 10 ms
+        // to 1 s, reset by the next success (review R-MQ-4).
+        var backoff_ms: i64 = 10;
         while (true) {
             const stream = listener.accept(s.io) catch |err| switch (err) {
                 error.SocketNotListening => return, // shutdown()
-                else => continue,
+                else => {
+                    s.io.sleep(.fromMilliseconds(backoff_ms), .awake) catch return;
+                    backoff_ms = @min(backoff_ms * 2, 1000);
+                    continue;
+                },
             };
+            backoff_ms = 10;
             s.group.concurrent(s.io, connMain, .{ s, stream }) catch {
                 // A failed spawn must never run the handler inline on this
                 // accept thread — a client that never completes CONNECT
@@ -4944,7 +5072,10 @@ pub const TcpServer = struct {
             const one: c_int = 1;
             std.posix.setsockopt(stream.socket.handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
         }
-        var sock = SocketTransport{ .io = s.io, .stream = stream };
+        // Declared before the connection so it outlives `remove`, which
+        // drains the fan-out writes that report to it.
+        var watch: Watchdog = .{ .io = s.io, .stream = stream, .config = s.broker.config, .write_timeout_ms = s.write_timeout_ms, .start_ms = monoMs(s.io) };
+        var sock = SocketTransport{ .io = s.io, .stream = stream, .watch = &watch };
         const conn = s.broker.accept(sock.transport()) catch return;
         // `remove` drains in-flight fan-out references before returning, so
         // `sock` (this stack frame) outlives every concurrent writer to it.
@@ -4957,7 +5088,6 @@ pub const TcpServer = struct {
         // clock read outside `Io` — so the server also runs under a
         // simulated `Io` (simio's mqtt pilot). It used to poll the socket
         // with a timeout and read the wall clock through `clock_gettime`.
-        var watch: Watchdog = .{ .io = s.io, .stream = stream, .config = s.broker.config, .start_ms = nowMs(s.io) };
         // No unit of concurrency for the watchdog: refuse the connection
         // rather than serve it without its timeouts (same rule as `serve`).
         var watch_task = s.io.concurrent(Watchdog.run, .{&watch}) catch return;
@@ -4973,11 +5103,22 @@ pub const TcpServer = struct {
             sr.interface.fillMore() catch return;
             const n = sr.interface.bufferedLen();
             const now = nowMs(s.io);
-            s.broker.feed(conn, read_buf[0..n]) catch return;
-            const disp = s.broker.process(conn, now) catch return;
-            watch.observe(conn);
-            if (disp == .close) return;
-            if (s.broker.keepAliveExpired(conn, now)) return;
+            // In pieces the receive buffer takes: a partial packet plus a
+            // whole read can exceed it, and a legitimate pipelining client
+            // was dropped for that (`RxBufferFull`).
+            var off: usize = 0;
+            while (off < n) {
+                const room = s.broker.rxRoom(conn);
+                if (room == 0) return; // an incomplete packet as big as the buffer: it can never complete
+                const take = @min(room, n - off);
+                s.broker.feed(conn, read_buf[off..][0..take]) catch return;
+                off += take;
+                const disp = s.broker.process(conn, now) catch return;
+                watch.observe(conn);
+                if (disp == .close) return;
+            }
+            // Keep-alive is the watchdog's (monotonic clock): a wall-clock
+            // check here would drop every connection on a forward clock step.
         }
     }
 };
@@ -4988,6 +5129,12 @@ fn nowMs(io: std.Io) i64 {
     return @intCast(@divFloor(std.Io.Timestamp.now(io, .real).nanoseconds, std.time.ns_per_ms));
 }
 
+/// Monotonic milliseconds through `io`: what the watchdog's deadlines are on,
+/// so a wall-clock step cannot kill (or immortalise) a connection.
+fn monoMs(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Timestamp.now(io, .awake).nanoseconds, std.time.ns_per_ms));
+}
+
 /// Enforces one connection's timeouts from its own task: CONNECT must arrive
 /// within `connect_timeout_ms`, then a packet within 1.5 × keep-alive (spec
 /// 3.1.2.10). The connection's task publishes what it learns under `lock`,
@@ -4996,6 +5143,10 @@ const Watchdog = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
     config: Config,
+    /// `TcpServer.write_timeout_ms`.
+    write_timeout_ms: u32 = 0,
+    /// Monotonic (`monoMs`): every instant in here is, the broker's own
+    /// wall-clock `last_packet_ms` is only used to notice a new packet.
     start_ms: i64,
     // ⛔ A lock, not atomics: `last_packet_ms` is an `i64`, and a 32-bit
     // target (`check-portable`'s `.linux32`, which this module declares) has
@@ -5004,38 +5155,74 @@ const Watchdog = struct {
     lock: std.Io.Mutex = .init,
     connected: bool = false,
     keep_alive_s: u16 = 0,
-    last_packet_ms: i64 = 0,
+    /// The broker's `last_packet_ms` as last seen (a change = a new packet).
+    seen_packet_ms: i64 = std.math.minInt(i64),
+    /// Monotonic instant of the last new packet.
+    last_packet_mono: i64 = 0,
+    /// Monotonic instant the write in progress started; null = none.
+    write_since: ?i64 = null,
 
     fn observe(w: *Watchdog, conn: *const Connection) void {
+        const mono = monoMs(w.io);
         w.lock.lockUncancelable(w.io);
         defer w.lock.unlock(w.io);
         w.keep_alive_s = conn.keep_alive_s;
-        w.last_packet_ms = conn.last_packet_ms;
+        if (conn.last_packet_ms != w.seen_packet_ms) {
+            w.seen_packet_ms = conn.last_packet_ms;
+            w.last_packet_mono = mono;
+        }
         if (conn.state != .awaiting_connect) w.connected = true;
+    }
+
+    fn beginWrite(w: *Watchdog) void {
+        if (w.write_timeout_ms == 0) return;
+        const mono = monoMs(w.io);
+        w.lock.lockUncancelable(w.io);
+        defer w.lock.unlock(w.io);
+        w.write_since = mono;
+    }
+
+    fn endWrite(w: *Watchdog) void {
+        if (w.write_timeout_ms == 0) return;
+        w.lock.lockUncancelable(w.io);
+        defer w.lock.unlock(w.io);
+        w.write_since = null;
     }
 
     /// The instant after which the connection is dead; null = never.
     fn deadline(w: *Watchdog) ?i64 {
         w.lock.lockUncancelable(w.io);
         defer w.lock.unlock(w.io);
-        if (!w.connected) return w.start_ms + @as(i64, w.config.connect_timeout_ms);
+        if (!w.connected) return w.start_ms +| @as(i64, w.config.connect_timeout_ms);
         if (w.keep_alive_s == 0) return null;
-        return w.last_packet_ms + @as(i64, w.keep_alive_s) * 1500;
+        return w.last_packet_mono +| @as(i64, w.keep_alive_s) * 1500;
+    }
+
+    /// The instant after which the write in progress has taken too long.
+    fn writeDeadline(w: *Watchdog) ?i64 {
+        w.lock.lockUncancelable(w.io);
+        defer w.lock.unlock(w.io);
+        const since = w.write_since orelse return null;
+        return since +| @as(i64, w.write_timeout_ms);
     }
 
     fn run(w: *Watchdog) std.Io.Cancelable!void {
+        // How long to sleep at most: a write can start at any moment, so with
+        // a send deadline the watchdog looks again at half of it (<= 1 s).
+        const tick: i64 = if (w.write_timeout_ms == 0) 1000 else std.math.clamp(@as(i64, w.write_timeout_ms) >> 1, 1, 1000);
         while (true) {
-            const now = nowMs(w.io);
-            const d = w.deadline() orelse {
-                // No keep-alive: nothing to enforce until something changes.
-                try w.io.sleep(.fromSeconds(1), .awake);
-                continue;
-            };
-            if (now > d) {
+            const now = monoMs(w.io);
+            const d = w.deadline();
+            const wd = w.writeDeadline();
+            if ((d != null and now > d.?) or (wd != null and now > wd.?)) {
                 w.stream.shutdown(w.io, .both) catch {};
                 return;
             }
-            try w.io.sleep(.fromMilliseconds(d - now + 1), .awake);
+            // No keep-alive: nothing to enforce until something changes.
+            var wait: i64 = if (d) |x| x - now + 1 else 1000;
+            if (wd) |x| wait = @min(wait, x - now + 1);
+            if (w.write_timeout_ms != 0) wait = @min(wait, tick);
+            try w.io.sleep(.fromMilliseconds(wait), .awake);
         }
     }
 };
@@ -5044,6 +5231,8 @@ const Watchdog = struct {
 const SocketTransport = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
+    /// Told when a write starts and ends (`TcpServer.write_timeout_ms`).
+    watch: ?*Watchdog = null,
 
     fn transport(t: *SocketTransport) Transport {
         return .{ .ctx = t, .writeFn = writeFn, .closeFn = closeFn, .io = t.io };
@@ -5051,6 +5240,8 @@ const SocketTransport = struct {
 
     fn writeFn(ctx: *anyopaque, bytes: []const u8) TransportError!void {
         const t: *SocketTransport = @ptrCast(@alignCast(ctx));
+        if (t.watch) |w| w.beginWrite();
+        defer if (t.watch) |w| w.endWrite();
         var wbuf: [512]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
         sw.interface.writeAll(bytes) catch return writeFailure(&sw);
@@ -5140,7 +5331,7 @@ test "the watchdog's deadlines: CONNECT timeout up to maxInt(u32) ms, then 1.5 x
     w.connected = true;
     try testing.expectEqual(@as(?i64, null), w.deadline()); // keep-alive 0: no deadline
     w.keep_alive_s = 10;
-    w.last_packet_ms = 5000;
+    w.last_packet_mono = 5000;
     try testing.expectEqual(@as(?i64, 5000 + 15_000), w.deadline());
 }
 

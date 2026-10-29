@@ -523,10 +523,10 @@ pub const Client = struct {
     pub fn tick(c: *Client, now: u64) Error!void {
         if (c.state != .connected or c.keep_alive_ms == 0) return;
         if (c.awaiting_pingresp) {
-            if (now >= c.ping_sent + c.keep_alive_ms) return error.KeepAliveTimeout;
+            if (now >= c.ping_sent +| c.keep_alive_ms) return error.KeepAliveTimeout;
             return;
         }
-        if (now >= c.last_tx + c.keep_alive_ms) try c.pingreq(now);
+        if (now >= c.last_tx +| c.keep_alive_ms) try c.pingreq(now);
     }
 
     // ── incoming API ────────────────────────────────────────────────────────
@@ -559,9 +559,12 @@ pub const Client = struct {
     /// `packet.reasonForDecodeError`).
     pub fn poll(c: *Client, now: u64) Error!?Event {
         while (true) {
-            c.compact();
-            const dec = (try packet.decodePacket(c.rx_buf[0..c.rx_len], c.version)) orelse return null;
-            c.rx_consumed = dec.consumed;
+            // `rx_consumed` is the consumed prefix: decode past it instead of
+            // compacting per packet (that was a memmove of the whole rest of
+            // the buffer for every packet: quadratic in the buffer size).
+            // `feed` compacts.
+            const dec = (try packet.decodePacket(c.rx_buf[c.rx_consumed..c.rx_len], c.version)) orelse return null;
+            c.rx_consumed += dec.consumed;
             if (try c.handle(now, dec.packet)) |event| return event;
         }
     }

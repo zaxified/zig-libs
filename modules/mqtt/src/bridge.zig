@@ -481,10 +481,17 @@ pub const Bridge = struct {
         while (rounds < 32) : (rounds += 1) {
             var moved = false;
             if (b.up.len > 0) {
-                try b.local.feed(conn, b.up.buf[0..b.up.len]);
-                b.up.len = 0;
+                // Only what the connection's receive buffer takes: a burst
+                // larger than that (a remote sending many messages at once)
+                // used to fail `feed` on every poll, for good. The rest
+                // stays in the pipe for the next round / poll.
+                const n = @min(b.up.len, b.local.rxRoom(conn));
+                if (n == 0) return error.RxBufferFull; // an incomplete packet as big as the buffer
+                try b.local.feed(conn, b.up.buf[0..n]);
+                std.mem.copyForwards(u8, b.up.buf[0..], b.up.buf[n..b.up.len]);
+                b.up.len -= n;
                 moved = true;
-                if (try b.local.process(conn, @intCast(now)) == .close) return error.LocalClosed;
+                if (try b.local.process(conn, std.math.cast(i64, now) orelse std.math.maxInt(i64)) == .close) return error.LocalClosed;
             }
             if (b.down.len > 0) {
                 const n = @min(b.down.len, b.local_client.rxRoom());
@@ -594,7 +601,7 @@ pub const Bridge = struct {
         var o = forwardProps(p);
         if (p.response_topic) |rt| {
             o.response_topic = if (std.mem.startsWith(u8, rt, from)) (join(buf, to, rt[from.len..]) catch null) else null;
-            if (o.response_topic) |mapped| if (mapped.len == 0 or (mapped[0] == '$' and rt[0] != '$')) {
+            if (o.response_topic) |mapped| if (mapped.len == 0 or (mapped[0] == '$' and (rt.len == 0 or rt[0] != '$'))) {
                 o.response_topic = null;
             };
         }
