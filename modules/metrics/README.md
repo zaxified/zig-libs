@@ -107,7 +107,12 @@ Prometheus's index. This is why the middleware:
   is not wired in yet (`router` now exposes `Ctx.matchedPattern()`, so it
   can be); labeling by raw path would be the footgun above.
 
-Instruments cap at `max_labels` (8) label pairs.
+Instruments cap at `max_labels` (8) label pairs. The registry also refuses a
+new series past two limits, so a mistake is an error rather than a leak: a
+label value longer than `max_label_value_len` (4096 B) is
+`error.LabelValueTooLong`, and a family that already holds
+`max_series_per_family` (10 000) series is `error.TooManySeries`. Both are
+`Registry` fields; series that exist keep working, `delete` frees a slot.
 
 ## What the middleware records
 

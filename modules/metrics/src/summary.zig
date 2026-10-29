@@ -44,10 +44,11 @@ const std = @import("std");
 /// error `epsilon` in [0, 1) (the reported value is the φ-quantile for some
 /// φ in `quantile ± epsilon`).
 ///
-/// ⚠ `epsilon = 0` (or a vanishingly small one) disables the CKMS compression:
+/// `epsilon = 0` (or a vanishingly small one) disables the CKMS compression:
 /// the stream then keeps EVERY observation of the window, so memory and the
-/// per-insert cost grow with the observation rate. Use a real tolerance
-/// (0.001 and up) for series fed from request traffic.
+/// per-insert cost grow with the observation rate. This type takes it (the
+/// perks oracle vectors use 0); the registry refuses an epsilon below
+/// `metrics.min_epsilon`.
 pub const Objective = struct { quantile: f64, epsilon: f64 };
 
 pub const Options = struct {
@@ -645,7 +646,7 @@ test "differential vs perks quantile.Stream (client_golang's engine)" {
     }
 }
 
-test "epsilon 0 keeps every observation of the window (documented limit, sweep ME-4)" {
+test "epsilon 0 keeps every observation of the window (why the registry refuses it, sweep ME-4)" {
     var s = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0 }}, .buf_cap = 64 });
     defer s.deinit();
     for (0..2000) |i| s.observe(@floatFromInt(i), 1);
@@ -654,4 +655,14 @@ test "epsilon 0 keeps every observation of the window (documented limit, sweep M
     try testing.expectEqual(@as(u64, 2000), snap.count);
     try testing.expectEqual(@as(usize, 2000), s.streams[s.head].l.items.len);
     try testing.expectEqual(@as(f64, 999), q[0]);
+}
+
+test "epsilon at the registry's minimum keeps the stream bounded (sweep ME-4)" {
+    var s = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.99, .epsilon = 1e-4 }} });
+    defer s.deinit();
+    for (0..200_000) |i| s.observe(@floatFromInt((i *% 2654435761) % 1_000_003), 1);
+    var q: [1]f64 = undefined;
+    _ = s.snapshot(1, &q);
+    // 402 entries measured (2026-10-29); epsilon 0 would keep all 200k.
+    try testing.expect(s.streams[s.head].l.items.len < 2000);
 }

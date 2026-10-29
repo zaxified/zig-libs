@@ -125,3 +125,61 @@ test "registration: a name too long for the scratch buffer still collides with a
     _ = try reg.counter(near, "c", &.{});
     _ = try reg.histogram(other_base, "h", &.{}, &.{1});
 }
+
+test "a new series' label value past max_label_value_len is an error, existing series unaffected (sweep review R1-1)" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    reg.max_label_value_len = 8;
+    const v = try reg.counterVec("req_total", "h", &.{"tenant"});
+    (try v.with(&.{"12345678"})).inc();
+    try testing.expectError(error.LabelValueTooLong, v.with(&.{"123456789"}));
+    try testing.expectEqual(@as(usize, 1), v.family.children.items.len);
+    // A lowered limit refuses only new series.
+    reg.max_label_value_len = 4;
+    try testing.expectEqual(@as(u64, 1), (try v.with(&.{"12345678"})).value());
+    // The labelled getters refuse before touching the registry: no empty
+    // family is left behind.
+    const n = reg.families.items.len;
+    try testing.expectError(error.LabelValueTooLong, reg.counter("other_total", "h", &.{.{ .name = "a", .value = "12345" }}));
+    try testing.expectError(error.LabelValueTooLong, reg.gaugeFunc("g", "h", &.{.{ .name = "a", .value = "12345" }}, null, struct {
+        fn f(_: ?*anyopaque) f64 {
+            return 0;
+        }
+    }.f));
+    try testing.expectEqual(n, reg.families.items.len);
+}
+
+test "a family stops at max_series_per_family; delete frees a slot (sweep review R1-1)" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    reg.max_series_per_family = 3;
+    const v = try reg.counterVec("req_total", "h", &.{"tenant"});
+    for ([_][]const u8{ "a", "b", "c" }) |t| (try v.with(&.{t})).inc();
+    try testing.expectError(error.TooManySeries, v.with(&.{"d"}));
+    try testing.expectError(error.TooManySeries, reg.counter("req_total", "h", &.{.{ .name = "tenant", .value = "d" }}));
+    // Existing series keep working at the cap.
+    (try v.with(&.{"a"})).inc();
+    try testing.expectEqual(@as(u64, 2), (try v.with(&.{"a"})).value());
+    try testing.expect(v.delete(&.{"b"}));
+    (try v.with(&.{"d"})).inc();
+    try testing.expectEqual(@as(usize, 3), v.family.children.items.len);
+
+    const f = struct {
+        fn f(_: ?*anyopaque) f64 {
+            return 0;
+        }
+    }.f;
+    for ([_][]const u8{ "x", "y", "z" }) |t| try reg.gaugeFunc("fn_g", "h", &.{.{ .name = "k", .value = t }}, null, f);
+    try testing.expectError(error.TooManySeries, reg.gaugeFunc("fn_g", "h", &.{.{ .name = "k", .value = "w" }}, null, f));
+}
+
+test "a summary epsilon below min_epsilon is refused at registration (sweep review R1-2, ME-4)" {
+    var reg = metrics.Registry.init(testing.allocator);
+    defer reg.deinit();
+    for ([_]f64{ 0, 1e-12, 0.99e-4 }) |eps| {
+        try testing.expectError(error.InvalidObjectives, reg.summary("s", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.99, .epsilon = eps }} }));
+    }
+    try testing.expectEqual(@as(usize, 0), reg.families.items.len);
+    const s = try reg.summary("s", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.99, .epsilon = metrics.min_epsilon }} });
+    s.observe(1);
+}

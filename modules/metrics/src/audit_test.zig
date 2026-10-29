@@ -112,11 +112,11 @@ test "counterFunc: exactly max_labels labels, a bad name leaves nothing behind" 
     try testing.expectEqual(before, reg.families.items.len);
 }
 
-test "summary registration: quantile 0 and epsilon 0 are legal, a different quantile set is a mismatch" {
+test "summary registration: quantile 0 and epsilon min_epsilon are legal, a different quantile set is a mismatch" {
     var reg = Registry.init(testing.allocator);
     defer reg.deinit();
     _ = try reg.summary("s0", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0, .epsilon = 0.01 }} });
-    _ = try reg.summary("s1", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0 }} });
+    _ = try reg.summary("s1", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = metrics.min_epsilon }} });
     _ = try reg.summary("s2", "h", &.{}, .{ .objectives = &.{.{ .quantile = 1, .epsilon = 0.01 }} });
     _ = try reg.summary("s3", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0.05 }} });
     try testing.expectError(error.ObjectivesMismatch, reg.summary("s3", "h", &.{}, .{ .objectives = &.{.{ .quantile = 0.9, .epsilon = 0.05 }} }));

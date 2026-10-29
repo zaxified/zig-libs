@@ -472,6 +472,17 @@ pub const default_objectives = [_]Objective{
 /// and a query per scrape).
 pub const max_objectives = 16;
 
+/// Smallest objective `epsilon` a registration accepts (deviation:
+/// client_golang takes any). A smaller one all but disables the CKMS
+/// compression, so a series fed from request traffic keeps (nearly) every
+/// observation of its window, with a per-insert cost that grows with it
+/// (no-panic sweep ME-4, owner 2026-10-29: refused, not clamped).
+pub const min_epsilon = 1e-4;
+
+/// Defaults of `Registry.max_label_value_len` / `max_series_per_family`.
+pub const default_max_label_value_len = 4096;
+pub const default_max_series_per_family = 10_000;
+
 /// client_golang `DefBuckets` — latency-in-seconds defaults.
 pub const default_buckets = [_]f64{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 };
 
@@ -645,8 +656,15 @@ pub const RegisterError = error{
     BucketsMismatch,
     /// More than `max_labels` labels.
     TooManyLabels,
+    /// A new series' label value is longer than the registry's
+    /// `max_label_value_len` (series that already exist keep working).
+    LabelValueTooLong,
+    /// The family already holds `max_series_per_family` series; a new
+    /// label-value tuple is refused, existing ones keep working (`delete`
+    /// frees a slot).
+    TooManySeries,
     /// Summary options out of range: a quantile outside [0, 1], an epsilon
-    /// outside [0, 1), a repeated quantile, more than `max_objectives`,
+    /// outside [`min_epsilon`, 1), a repeated quantile, more than `max_objectives`,
     /// `age_buckets`/`buf_cap` 0, or a `max_age_ns` shorter than
     /// `age_buckets` ns.
     InvalidObjectives,
@@ -859,6 +877,16 @@ pub const Registry = struct {
     /// Time source for summaries' sliding windows, captured by each summary
     /// series when it is created — set it before registering summaries.
     clock: Clock = .monotonic,
+    /// Longest label value a NEW series may carry (bytes); longer →
+    /// `error.LabelValueTooLong`. With `max_series_per_family` this bounds
+    /// what a label fed from request data can cost (the cardinality
+    /// footgun, sweep review R1-1): an error at the API boundary instead
+    /// of a registry and a scrape that grow without end.
+    max_label_value_len: usize = default_max_label_value_len,
+    /// Most series one family holds; a new tuple beyond it →
+    /// `error.TooManySeries`. Checked on a lookup miss only, so the series
+    /// that exist keep working.
+    max_series_per_family: usize = default_max_series_per_family,
 
     pub fn init(gpa: Allocator) Registry {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -989,13 +1017,17 @@ pub const Registry = struct {
             values[i] = l.value;
         }
         try validateDescriptor(name, help, kind, names[0..labels.len], &.{}, .{});
-        for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        for (values[0..labels.len]) |v| {
+            if (v.len > r.max_label_value_len) return error.LabelValueTooLong;
+            if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        }
         lockSpin(&r.lock);
         defer r.lock.unlock();
         const fam = try r.familyLocked(name, help, kind, names[0..labels.len], &.{}, .{});
         if (fam.collector != null) return error.AlreadyRegistered;
         if (!fam.funcs and fam.children.items.len != 0) return error.AlreadyRegistered;
         if (fam.index.getKeyAdapted(@as([]const []const u8, values[0..labels.len]), ValuesAdapter{}) != null) return error.AlreadyRegistered;
+        if (fam.children.items.len >= r.max_series_per_family) return error.TooManySeries;
         const gpa = r.arena.child_allocator;
         try fam.children.ensureUnusedCapacity(gpa, 1);
         try fam.index.ensureUnusedCapacityContext(gpa, 1, ChildContext{});
@@ -1104,7 +1136,7 @@ pub const Registry = struct {
             if (sopts.max_age_ns / sopts.age_buckets == 0) return error.InvalidObjectives;
             for (sopts.objectives, 0..) |o, i| {
                 if (!(o.quantile >= 0 and o.quantile <= 1)) return error.InvalidObjectives;
-                if (!(o.epsilon >= 0 and o.epsilon < 1)) return error.InvalidObjectives;
+                if (!(o.epsilon >= min_epsilon and o.epsilon < 1)) return error.InvalidObjectives;
                 for (sopts.objectives[0..i]) |prev| if (prev.quantile == o.quantile) return error.InvalidObjectives;
             }
         }
@@ -1189,7 +1221,10 @@ pub const Registry = struct {
         try validateDescriptor(name, help, kind, names[0..labels.len], buckets, sopts);
         // Checked before the family is touched, so a bad value never leaves
         // a new, empty family registered behind its error.
-        for (values[0..labels.len]) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        for (values[0..labels.len]) |v| {
+            if (v.len > r.max_label_value_len) return error.LabelValueTooLong;
+            if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        }
         lockSpin(&r.lock);
         defer r.lock.unlock();
         const fam = try r.familyLocked(name, help, kind, names[0..labels.len], buckets, sopts);
@@ -1205,7 +1240,7 @@ pub const Registry = struct {
         const gpa = r.arena.child_allocator;
         if (fam.index.getKeyAdapted(values, ValuesAdapter{})) |c| return c;
 
-        for (values) |v| if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        try r.checkNewSeriesLocked(fam, values);
         try fam.children.ensureUnusedCapacity(gpa, 1);
         try fam.index.ensureUnusedCapacityContext(gpa, 1, ChildContext{});
 
@@ -1248,6 +1283,15 @@ pub const Registry = struct {
         fam.children.appendAssumeCapacity(c);
         fam.index.putAssumeCapacityNoClobberContext(c, {}, ChildContext{});
         return c;
+    }
+
+    /// The limits a new series of `fam` must pass. Caller holds `r.lock`.
+    fn checkNewSeriesLocked(r: *const Registry, fam: *const Family, values: []const []const u8) RegisterError!void {
+        for (values) |v| {
+            if (v.len > r.max_label_value_len) return error.LabelValueTooLong;
+            if (!std.unicode.utf8ValidateSlice(v)) return error.InvalidUtf8;
+        }
+        if (fam.children.items.len >= r.max_series_per_family) return error.TooManySeries;
     }
 
     /// Give a removed child back — now, or after the scrapes that may still
@@ -1720,7 +1764,9 @@ pub fn Vec(comptime kind: Kind) type {
         /// The series for `values` (in the family's label-name order),
         /// created on first use (client_golang `GetMetricWithLabelValues`).
         /// `error.LabelMismatch` for a wrong value count,
-        /// `error.InvalidUtf8` for a value that is not UTF-8.
+        /// `error.InvalidUtf8` for a value that is not UTF-8; a new series
+        /// also `error.LabelValueTooLong` / `error.TooManySeries` past the
+        /// registry's limits.
         pub fn with(v: Self, values: []const []const u8) RegisterError!*Metric {
             lockSpin(&v.registry.lock);
             defer v.registry.lock.unlock();
