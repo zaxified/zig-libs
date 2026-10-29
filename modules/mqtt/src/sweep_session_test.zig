@@ -433,7 +433,7 @@ test "trie nodes are counted against max_subscription_nodes (sweep R-MQ-5)" {
 /// `n` connections each subscribed to the same 8 filters, all matching a/b:
 /// time of one PUBLISH to a/b, which must reach each of them once.
 fn fanoutNs(n: usize) anyerror!u64 {
-    var b = Broker.init(testing.allocator, .{ .max_connections = 4096 });
+    var b = Broker.init(testing.allocator, .{ .max_connections = 8192 });
     defer b.deinit();
     const sinks = try testing.allocator.alloc(Counting, n);
     defer testing.allocator.free(sinks);
@@ -460,7 +460,9 @@ fn fanoutNs(n: usize) anyerror!u64 {
 }
 
 test "a PUBLISH to many owners with overlapping filters is linear in the matches (sweep R-MQ-2)" {
-    try expectLinear(fanoutNs, 256);
+    // n = 1024 (4n = 4096): at 256 a per-match owner scan was lost in the
+    // linear work (sweep audit M41).
+    try expectLinear(fanoutNs, 1024);
 }
 
 /// `n` live retained messages, then `n` that all expire together: time of the
@@ -570,4 +572,290 @@ test "a subscriber that never reads does not stall publishers (sweep R-MQ-1)" {
     srv.shutdown();
     serving.await(io);
     try testing.expect(ok);
+}
+
+// ── sweep audit (gm-da-mq): tests for guards the first sweep left unpinned ──
+
+/// A loopback broker with `TcpServer` serving it; `stop` tears it all down.
+const Net = struct {
+    threaded: std.Io.Threaded = undefined,
+    b: Broker = undefined,
+    srv: broker_mod.TcpServer = undefined,
+    serving: std.Io.Future(void) = undefined,
+    io: std.Io = undefined,
+
+    fn start(h: *Net, cfg: broker_mod.Config, write_timeout_ms: u32) !void {
+        h.threaded = std.Io.Threaded.init(testing.allocator, .{});
+        errdefer h.threaded.deinit();
+        h.io = h.threaded.io();
+        h.b = Broker.init(testing.allocator, cfg);
+        errdefer h.b.deinit();
+        h.srv = broker_mod.TcpServer.init(h.io, &h.b);
+        h.srv.write_timeout_ms = write_timeout_ms;
+        h.srv.bind("127.0.0.1", 0) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        h.serving = h.io.concurrent(serveTask, .{&h.srv}) catch |err| {
+            h.srv.deinit();
+            return err;
+        };
+    }
+
+    fn connect(h: *Net) !std.Io.net.Stream {
+        return h.srv.boundAddress().connect(h.io, .{ .mode = .stream }) catch |err| return testkit.loopbackSkip("loopback connect failed ({t})", .{err});
+    }
+
+    fn stop(h: *Net) void {
+        h.srv.shutdown();
+        h.serving.await(h.io);
+        h.srv.deinit();
+        h.b.deinit();
+        h.threaded.deinit();
+    }
+};
+
+/// Reads `r` one byte at a time (its buffer must be 1 byte) until the peer has
+/// closed it, waiting at most `wait_ms` for each byte.
+fn closedWithin(stream: std.Io.net.Stream, r: anytype, wait_ms: i32) bool {
+    for (0..16) |_| {
+        var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&fds, wait_ms) catch 0;
+        if (ready == 0) return false;
+        _ = r.interface.takeArray(1) catch return true;
+    }
+    return false;
+}
+
+test "TcpServer drops a connection whose incomplete packet fills the receive buffer (sweep audit M31)" {
+    const h = try testing.allocator.create(Net);
+    defer testing.allocator.destroy(h);
+    try h.start(.{ .max_packet_size = 256 }, 10_000);
+    defer h.stop();
+    const s = try h.connect();
+    defer s.close(h.io);
+
+    // CONNECT, then a PUBLISH announcing 100 000 bytes of which 400 arrive.
+    var wire: [1024]u8 = undefined;
+    var cbuf: [64]u8 = undefined;
+    const conn_bytes = try packet.encodeConnect(&cbuf, .{ .client_id = "full" });
+    @memcpy(wire[0..conn_bytes.len], conn_bytes);
+    var len = conn_bytes.len;
+    const hdr = [_]u8{ 0x30, 0xA0, 0x8D, 0x06, 0x00, 0x01, 't' };
+    @memcpy(wire[len..][0..hdr.len], &hdr);
+    len += hdr.len;
+    @memset(wire[len..][0..400], 'x');
+    len += 400;
+    var wbuf: [64]u8 = undefined;
+    var w = s.writer(h.io, &wbuf);
+    var rbuf: [1]u8 = undefined;
+    var r = s.reader(h.io, &rbuf);
+    w.interface.writeAll(wire[0..len]) catch {};
+    w.interface.flush() catch {};
+    // Not spinning on a buffer that can never take another byte: closed.
+    try testing.expect(closedWithin(s, &r, 5000));
+}
+
+test "a write that completed does not leave the send deadline armed (sweep audit M33)" {
+    const h = try testing.allocator.create(Net);
+    defer testing.allocator.destroy(h);
+    try h.start(.{}, 200);
+    defer h.stop();
+    const s = try h.connect();
+    defer s.close(h.io);
+
+    var wbuf: [128]u8 = undefined;
+    var w = s.writer(h.io, &wbuf);
+    var rbuf: [16]u8 = undefined;
+    var r = s.reader(h.io, &rbuf);
+    var pk: [64]u8 = undefined;
+    try w.interface.writeAll(try packet.encodeConnect(&pk, .{ .client_id = "idle", .keep_alive_s = 0 }));
+    try w.interface.writeAll(try packet.encodeSubscribe(&pk, 1, &.{.{ .filter = "x/#" }}));
+    try w.interface.flush();
+    _ = try r.interface.takeArray(4); // CONNACK
+    _ = try r.interface.takeArray(5); // SUBACK
+    // Idle for several write deadlines: the connection is healthy, nothing is
+    // being written to it.
+    try h.io.sleep(.fromMilliseconds(900), .awake);
+    try h.b.publishWith("x/y", "hello", .{});
+    var fds = [_]std.posix.pollfd{.{ .fd = s.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    const ready = std.posix.poll(&fds, 5000) catch 0;
+    try testing.expect(ready > 0);
+    const first = try r.interface.takeArray(1);
+    try testing.expectEqual(@as(u8, 0x30), first[0]); // the PUBLISH, not a closed socket
+}
+
+test "keep-alive counts complete packets, not bytes trickling in (sweep audit M55)" {
+    const h = try testing.allocator.create(Net);
+    defer testing.allocator.destroy(h);
+    try h.start(.{}, 10_000);
+    defer h.stop();
+    const s = try h.connect();
+    defer s.close(h.io);
+
+    var wbuf: [64]u8 = undefined;
+    var w = s.writer(h.io, &wbuf);
+    var rbuf: [1]u8 = undefined;
+    var r = s.reader(h.io, &rbuf);
+    var pk: [64]u8 = undefined;
+    try w.interface.writeAll(try packet.encodeConnect(&pk, .{ .client_id = "slow", .keep_alive_s = 1 }));
+    try w.interface.flush();
+    // A PUBLISH (64 bytes announced) that never completes: one byte per 300 ms.
+    const trickle = [_]u8{ 0x30, 0x40, 0x00, 0x01, 't', 'x', 'x', 'x', 'x', 'x' };
+    for (trickle) |byte| {
+        w.interface.writeAll(&.{byte}) catch {};
+        w.interface.flush() catch {};
+        try h.io.sleep(.fromMilliseconds(300), .awake);
+    }
+    // 1.5 x 1 s after the CONNECT (during the trickle) the watchdog closed the
+    // connection. Were the trickle to count, it would close 1.5 s after the
+    // LAST byte (~3 s in): the short wait tells the two apart.
+    try testing.expect(closedWithin(s, &r, 600));
+}
+
+test "trie node budget: exactly full is allowed, '#' and Shared Subscriptions add no node (sweep audit M45/M51/M60)" {
+    var b = Broker.init(testing.allocator, .{ .max_subscription_nodes = 4 });
+    defer b.deinit();
+    var cap: Capture = .{};
+    const conn = try b.accept(cap.transport());
+    var buf: [64]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = "edge" }));
+    _ = try b.process(conn, 0);
+
+    try testing.expectEqual(@as(u8, 0), try subscribeCode(&b, conn, &cap, "a/b/c/d")); // 4 nodes = the budget
+    try testing.expectEqual(@as(u8, 0x80), try subscribeCode(&b, conn, &cap, "a/b/c/d/e")); // 5
+    try testing.expectEqual(@as(u8, 0), try subscribeCode(&b, conn, &cap, "a/b/#")); // '#' lives in its parent
+    try testing.expectEqual(@as(u8, 0), try subscribeCode(&b, conn, &cap, "$share/g/q/r/s/t/u/v")); // flat group list
+}
+
+test "trie node budget: nodes of a pruned '+' level are given back (sweep audit M48)" {
+    var b = Broker.init(testing.allocator, .{ .max_subscription_nodes = 2 });
+    defer b.deinit();
+    var cap: Capture = .{};
+    const conn = try b.accept(cap.transport());
+    var buf: [64]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = "plus" }));
+    _ = try b.process(conn, 0);
+    try testing.expectEqual(@as(u8, 0), try subscribeCode(&b, conn, &cap, "+/+"));
+    var ub: [64]u8 = undefined;
+    try b.feed(conn, try packet.encodeUnsubscribe(&ub, 2, &.{"+/+"}));
+    _ = try b.process(conn, 0);
+    try testing.expectEqual(@as(u8, 0), try subscribeCode(&b, conn, &cap, "+/+")); // not 2 stale + 2 > 2
+}
+
+fn send5(b: *Broker, conn: *broker_mod.Connection, p: packet.Packet, now: i64) !void {
+    var buf: [512]u8 = undefined;
+    try b.feed(conn, try packet.encodePacket(&buf, .v5, p));
+    _ = try b.process(conn, now);
+}
+
+fn connect5(b: *Broker, c: *Capture, id: []const u8, now: i64) !*broker_mod.Connection {
+    const conn = try b.accept(c.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = id, .version = .v5 }));
+    _ = try b.process(conn, now);
+    return conn;
+}
+
+test "overlapping subscriptions of one owner: one Subscription Identifier, retain kept if any asks (sweep audit M58/M39)" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var cap1: Capture = .{};
+    const c1 = try connect5(&b, &cap1, "c1", 0);
+    try send5(&b, c1, .{ .subscribe = .{
+        .packet_id = 1,
+        .filters = &.{ .{ .filter = "a/b", .retain_as_published = true }, .{ .filter = "a/+" } },
+        .properties = .{ .subscription_ids = .{ .items = &.{7} } },
+    } }, 0);
+    // The other way round, so whichever filter the trie yields first, one of
+    // the two owners has a first match without the flag.
+    var cap2: Capture = .{};
+    const c2 = try connect5(&b, &cap2, "c2", 0);
+    try send5(&b, c2, .{ .subscribe = .{
+        .packet_id = 1,
+        .filters = &.{ .{ .filter = "a/b" }, .{ .filter = "a/+", .retain_as_published = true } },
+    } }, 0);
+    try b.publishWith("a/b", "x", .{ .retain = true });
+
+    var ids: usize = 0;
+    for (cap1.last[0 .. cap1.len - 1], cap1.last[1..cap1.len]) |x, y| {
+        if (x == 0x0B and y == 7) ids += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), ids); // id 7 once, not once per matching filter
+    try testing.expectEqual(@as(u8, 0x31), cap1.last[0]); // PUBLISH, retain kept
+    try testing.expectEqual(@as(u8, 0x31), cap2.last[0]);
+}
+
+test "clock arithmetic at the ends of the i64 clock, second round (sweep audit M5/M8/M10/M12/M13/M14/M15/M18/M19/M20)" {
+    const max = std.math.maxInt(i64);
+    const min = std.math.minInt(i64);
+    var buf: [256]u8 = undefined;
+
+    { // restore: now - age; a restored session's message: now + expiry; export: expiry - now
+        var b = Broker.init(testing.allocator, .{});
+        defer b.deinit();
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        try b.restoreRetained(&.{.{ .topic = "r/t", .payload = "x", .qos = .at_most_once, .age_ms = 5 }}, min);
+        try b.restoreSessionWith("q", null, &.{.{ .filter = "q", .qos = .at_least_once }}, 0, .{
+            .queued_messages = &.{.{ .topic = "q", .payload = "x", .qos = .at_least_once, .expires_in_ms = 5 }},
+            .now_ms = max,
+        });
+        const st = try b.sessionStatesWith(arena_state.allocator(), .{ .messages = true, .now = min });
+        try testing.expectEqual(@as(usize, 1), st.len);
+    }
+    { // a retained message stored at the very start, swept at the very end
+        var b = Broker.init(testing.allocator, .{ .retain_expiry_interval_ms = 1000 });
+        defer b.deinit();
+        try b.restoreRetained(&.{.{ .topic = "r/t", .payload = "x", .qos = .at_most_once }}, min);
+        _ = b.expireSessions(max);
+        try testing.expectEqual(@as(u64, 1), b.messagesExpired());
+    }
+    { // $SYS: now - last, now - first
+        var b = Broker.init(testing.allocator, .{ .sys_interval_ms = 1000 });
+        defer b.deinit();
+        _ = b.publishSys(min);
+        _ = b.publishSys(max);
+    }
+    { // Wills at the end of the clock: Message Expiry, and the Will Delay
+        var b = Broker.init(testing.allocator, .{});
+        defer b.deinit();
+        var c1: Counting = .{};
+        const w1 = try b.accept(c1.transport());
+        try b.feed(w1, try packet.encodeConnect(&buf, .{
+            .client_id = "w1",
+            .version = .v5,
+            .will = .{ .topic = "w/t", .message = "m", .properties = .{ .message_expiry_interval = 5 } },
+        }));
+        _ = try b.process(w1, max);
+        b.remove(w1);
+
+        var c2: Counting = .{};
+        const w2 = try b.accept(c2.transport());
+        try b.feed(w2, try packet.encodeConnect(&buf, .{
+            .client_id = "w2",
+            .version = .v5,
+            .clean_session = false,
+            .properties = .{ .session_expiry_interval = 3600 },
+            .will = .{ .topic = "w/t", .message = "m", .properties = .{ .will_delay_interval = 10 } },
+        }));
+        _ = try b.process(w2, max);
+        b.remove(w2);
+    }
+    { // a v5 PUBLISH with a Message Expiry at the end of the clock
+        var b = Broker.init(testing.allocator, .{});
+        defer b.deinit();
+        var cap: Capture = .{};
+        const p5 = try connect5(&b, &cap, "p5", max);
+        try send5(&b, p5, .{ .publish = .{ .topic = "a/b", .payload = "x", .properties = .{ .message_expiry_interval = 5 } } }, max);
+    }
+    { // a retained message that expires at maxInt, delivered at clock 0
+        var b = Broker.init(testing.allocator, .{});
+        defer b.deinit();
+        try b.restoreRetained(&.{.{ .topic = "e/t", .payload = "x", .qos = .at_most_once, .expires_in_ms = 5 }}, max);
+        var cap: Capture = .{};
+        const conn = try b.accept(cap.transport());
+        try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = "e" }));
+        _ = try b.process(conn, 0);
+        try b.feed(conn, try packet.encodeSubscribe(&buf, 1, &.{.{ .filter = "e/#" }}));
+        _ = try b.process(conn, 0);
+        try testing.expect(cap.packets >= 2);
+    }
 }
