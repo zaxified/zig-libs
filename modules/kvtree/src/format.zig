@@ -39,6 +39,26 @@ pub const meta_page_b: PageId = 1;
 /// The first page the allocator may hand out for tree/freelist data.
 pub const first_data_page: PageId = 2;
 
+/// The deepest tree (node levels from the root down to a leaf) any walk of a
+/// file accepts; deeper is `error.Corrupt` -- at open (`core.recover`) and again
+/// at each descent, so a node that rotted into a cycle ends in an error, not a
+/// loop. Derivation: a tree this module writes has at least two children per
+/// branch (a root left with one is collapsed at its commit, a non-root branch
+/// left with one is merged into a sibling), so with at most 2^32 pages it has
+/// at most 32 branch levels above its leaves (`bulk.max_levels`), i.e. 33 node
+/// levels. 40 leaves slack for a single-child chain a commit might park
+/// transiently, and bounds the recursion of a commit (`core.applyRec`: one
+/// 4 KiB page buffer + ~0.3 KiB of locals per level) to about 175 KiB of stack
+/// (estimated from the buffer sizes, not measured).
+pub const max_tree_depth: usize = 40;
+
+/// How many buckets may nest inside one another (the top level's buckets are
+/// level 1). Deeper is `error.BucketTooDeep` from `createBucket` and `Corrupt`
+/// for a file that has it. The recursion over nested buckets (`applyTree`,
+/// `treeOf`, `copyTree`) holds one page buffer or less per level, so 16 levels
+/// stay under ~100 KiB of stack.
+pub const max_bucket_depth: usize = 16;
+
 pub const NodeKind = enum(u8) { leaf = 0, branch = 1 };
 
 const meta_magic = "ZKVT";
@@ -107,8 +127,10 @@ pub const BucketHdr = struct {
         std.mem.writeInt(u64, out[4..12], self.seq, .little);
     }
 
-    pub fn decode(bytes: []const u8) BucketHdr {
-        std.debug.assert(bytes.len == bucket_hdr_len);
+    /// `error.Corrupt` for a value that is not exactly `bucket_hdr_len` bytes:
+    /// the length comes out of a page, so it is data, not an invariant.
+    pub fn decode(bytes: []const u8) error{Corrupt}!BucketHdr {
+        if (bytes.len != bucket_hdr_len) return error.Corrupt;
         return .{
             .root = std.mem.readInt(u32, bytes[0..4], .little),
             .seq = std.mem.readInt(u64, bytes[4..12], .little),
@@ -259,15 +281,68 @@ const slot_len = 2;
 fn nodeKind(page: *const [page_size]u8) NodeKind {
     return @fromBackingInt(@intCast(page[0]));
 }
-fn nodeCount(page: *const [page_size]u8) u16 {
-    return std.mem.readInt(u16, page[2..4], .little);
+
+/// The most slots any node page can hold: a cell is at least 6 bytes and takes
+/// a 2-byte slot, so `count` above this cannot come from a page this format
+/// wrote -- it is rot, and every accessor below says `Corrupt` for it.
+pub const max_node_count: usize = (page_size - hdr_len) / (slot_len + 6);
+/// The longest single cell (and so the longest key, with its 6 header bytes)
+/// an otherwise-empty node can hold. A rotted length above it is `Corrupt`; it
+/// also guarantees a lone cell never overflows its node, which `split` relies on.
+const max_cell_len: usize = page_size - hdr_len - slot_len;
+
+fn nodeCount(page: *const [page_size]u8) error{Corrupt}!u16 {
+    const n = std.mem.readInt(u16, page[2..4], .little);
+    if (n > max_node_count) return error.Corrupt;
+    return n;
 }
 fn nodeLeftmost(page: *const [page_size]u8) PageId {
     return std.mem.readInt(u32, page[4..8], .little);
 }
-fn slotOffset(page: *const [page_size]u8, i: usize) usize {
+
+// SQLite-style point-of-use checking (owner decision 2026-10-29): node pages
+// carry no CRC and `recover` validates them once, at open. A page can rot (or
+// be rewritten by another process) after that, so every offset, length and
+// count read out of a page below is compared against the page bounds where it
+// is used -- one compare per decoded field, no extra pass -- and a bad one is
+// `error.Corrupt`, never a slice out of range.
+fn slotOffset(page: *const [page_size]u8, i: usize) error{Corrupt}!usize {
     const base = hdr_len + i * slot_len;
+    if (base + 2 > page_size) return error.Corrupt;
     return std.mem.readInt(u16, page[base .. base + 2][0..2], .little);
+}
+
+/// A decoded cell header: where the cell starts, its key length and the
+/// second header word (`val_len` of a leaf cell, `right_child` of a branch's).
+const CellHdr = struct { o: usize, klen: usize, raw: u32 };
+
+fn cellHdr(page: *const [page_size]u8, i: usize) error{Corrupt}!CellHdr {
+    const o = try slotOffset(page, i);
+    if (o + 6 > page_size) return error.Corrupt;
+    return .{
+        .o = o,
+        .klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little),
+        .raw = std.mem.readInt(u32, page[o + 2 .. o + 6][0..4], .little),
+    };
+}
+
+/// The key of the cell `c`, bounds-checked.
+fn cellKey(page: *const [page_size]u8, c: CellHdr) error{Corrupt}![]const u8 {
+    if (c.o + 6 + c.klen > page_size or 6 + c.klen > max_cell_len) return error.Corrupt;
+    return page[c.o + 6 ..][0..c.klen];
+}
+
+/// A leaf cell's value length as the page states it (the reference size for
+/// an overflow value), and the `ovf` flag.
+fn leafValLen(raw: u32) usize {
+    return if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
+}
+
+/// The value of leaf cell `c`, bounds-checked together with its key.
+fn leafCellVal(page: *const [page_size]u8, c: CellHdr) error{Corrupt}![]const u8 {
+    const vlen = leafValLen(c.raw);
+    if (c.o + 6 + c.klen + vlen > page_size or 6 + c.klen + vlen > max_cell_len) return error.Corrupt;
+    return page[c.o + 6 + c.klen ..][0..vlen];
 }
 
 /// Bounds-checked dispatch on a page's kind byte: `null` for any byte that is
@@ -306,64 +381,58 @@ pub const Leaf = struct {
         return .{ .page = page };
     }
 
-    pub fn count(self: Leaf) u16 {
+    /// Number of entries; `error.Corrupt` for a count no page can hold.
+    pub fn count(self: Leaf) error{Corrupt}!u16 {
         return nodeCount(self.page);
     }
 
-    pub fn keyAt(self: Leaf, i: usize) []const u8 {
-        const o = slotOffset(self.page, i);
-        const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
-        return self.page[o + 6 ..][0..klen];
+    pub fn keyAt(self: Leaf, i: usize) error{Corrupt}![]const u8 {
+        return cellKey(self.page, try cellHdr(self.page, i));
     }
 
     /// The value of entry `i` -- or, for an overflow value (`ovfLen`), its
     /// `ovf_ref_len`-byte reference; see `entryAt`.
-    pub fn valAt(self: Leaf, i: usize) []const u8 {
-        const o = slotOffset(self.page, i);
-        const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
-        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
-        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
-        return self.page[o + 6 + klen ..][0..vlen];
+    pub fn valAt(self: Leaf, i: usize) error{Corrupt}![]const u8 {
+        return leafCellVal(self.page, try cellHdr(self.page, i));
     }
 
     /// Whether entry `i` is a bucket (its value is a `BucketHdr`).
-    pub fn isBucket(self: Leaf, i: usize) bool {
-        const o = slotOffset(self.page, i);
-        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+    pub fn isBucket(self: Leaf, i: usize) error{Corrupt}!bool {
+        const raw = (try cellHdr(self.page, i)).raw;
         return raw & ovf_flag == 0 and raw & bucket_flag != 0;
     }
 
     /// The length of entry `i`'s value when it lives in overflow pages, else
     /// `null` (the value is `valAt(i)` itself).
-    pub fn ovfLen(self: Leaf, i: usize) ?u32 {
-        const o = slotOffset(self.page, i);
-        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+    pub fn ovfLen(self: Leaf, i: usize) error{Corrupt}!?u32 {
+        const raw = (try cellHdr(self.page, i)).raw;
         return if (raw & ovf_flag != 0) raw & ~ovf_flag else null;
     }
 
     /// The first overflow page of entry `i`, whose `ovfLen` is set.
-    pub fn ovfFirst(self: Leaf, i: usize) PageId {
-        return std.mem.readInt(u32, self.valAt(i)[0..ovf_ref_len], .little);
+    pub fn ovfFirst(self: Leaf, i: usize) error{Corrupt}!PageId {
+        return std.mem.readInt(u32, (try self.valAt(i))[0..ovf_ref_len], .little);
     }
 
     /// Entry `i` in one decode of its cell header — what `keyAt`, `valAt`,
     /// `ovfLen` and `isBucket` would each re-read from the slot directory (a
-    /// cursor's `next` takes every entry this way).
-    pub fn entryAt(self: Leaf, i: usize) Entry {
-        const o = slotOffset(self.page, i);
-        const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
-        const raw = std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
-        const ovf = raw & ovf_flag != 0;
-        const vlen: usize = if (ovf) ovf_ref_len else raw & ~bucket_flag;
+    /// cursor's `next` takes every entry this way). A bucket cell whose value
+    /// is not a `BucketHdr` is `Corrupt` here, so a builder never carries one.
+    pub fn entryAt(self: Leaf, i: usize) error{Corrupt}!Entry {
+        const c = try cellHdr(self.page, i);
+        const ovf = c.raw & ovf_flag != 0;
+        const bucket = !ovf and c.raw & bucket_flag != 0;
+        const val = try leafCellVal(self.page, c);
+        if (bucket and val.len != bucket_hdr_len) return error.Corrupt;
         return .{
-            .key = self.page[o + 6 ..][0..klen],
-            .val = self.page[o + 6 + klen ..][0..vlen],
-            .ovf_len = if (ovf) raw & ~ovf_flag else null,
-            .bucket = !ovf and raw & bucket_flag != 0,
+            .key = try cellKey(self.page, c),
+            .val = val,
+            .ovf_len = if (ovf) c.raw & ~ovf_flag else null,
+            .bucket = bucket,
         };
     }
 
-    pub fn search(self: Leaf, key: []const u8) Search {
+    pub fn search(self: Leaf, key: []const u8) error{Corrupt}!Search {
         return binarySearch(Leaf, self, key);
     }
 };
@@ -382,7 +451,7 @@ pub const Branch = struct {
         return .{ .page = page };
     }
 
-    pub fn count(self: Branch) u16 {
+    pub fn count(self: Branch) error{Corrupt}!u16 {
         return nodeCount(self.page);
     }
 
@@ -391,33 +460,30 @@ pub const Branch = struct {
     }
 
     /// Separator key of cell `i` (0..count-1).
-    pub fn keyAt(self: Branch, i: usize) []const u8 {
-        const o = slotOffset(self.page, i);
-        const klen = std.mem.readInt(u16, self.page[o .. o + 2][0..2], .little);
-        return self.page[o + 6 ..][0..klen];
+    pub fn keyAt(self: Branch, i: usize) error{Corrupt}![]const u8 {
+        return cellKey(self.page, try cellHdr(self.page, i));
     }
 
     /// Right child of cell `i` (0..count-1).
-    pub fn rightChildAt(self: Branch, i: usize) PageId {
-        const o = slotOffset(self.page, i);
-        return std.mem.readInt(u32, self.page[o + 2 .. o + 6][0..4], .little);
+    pub fn rightChildAt(self: Branch, i: usize) error{Corrupt}!PageId {
+        return (try cellHdr(self.page, i)).raw;
     }
 
     /// Child page by ordinal: 0 = leftmost, i (1..count) = cell[i-1].right_child.
     /// There are `count + 1` valid indices (0..count).
-    pub fn childAtIndex(self: Branch, i: usize) PageId {
+    pub fn childAtIndex(self: Branch, i: usize) error{Corrupt}!PageId {
         if (i == 0) return self.leftmost();
         return self.rightChildAt(i - 1);
     }
 
     /// Ordinal of the child to descend into for `key` (0..count).
-    pub fn childIndexFor(self: Branch, key: []const u8) usize {
+    pub fn childIndexFor(self: Branch, key: []const u8) error{Corrupt}!usize {
         // lo = number of separators <= key → child ordinal.
         var lo: usize = 0;
-        var hi: usize = self.count();
+        var hi: usize = try self.count();
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (orderKeys(self.keyAt(mid), key)) {
+            switch (orderKeys(try self.keyAt(mid), key)) {
                 .lt, .eq => lo = mid + 1,
                 .gt => hi = mid,
             }
@@ -427,8 +493,8 @@ pub const Branch = struct {
 
     /// Child page to descend into for `key`. Index 0 = leftmost; index i+1 =
     /// cell[i].right_child.
-    pub fn childFor(self: Branch, key: []const u8) PageId {
-        return self.childAtIndex(self.childIndexFor(key));
+    pub fn childFor(self: Branch, key: []const u8) error{Corrupt}!PageId {
+        return self.childAtIndex(try self.childIndexFor(key));
     }
 };
 
@@ -440,7 +506,7 @@ pub const Branch = struct {
 /// validated committed tree); recovery must reject, never crash.
 pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
     if (page[0] != @backingInt(NodeKind.branch)) return null;
-    const count: usize = nodeCount(page);
+    const count: usize = nodeCount(page) catch return null;
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
     // Separators must be strictly ascending — not just in-bounds. A slot
@@ -453,10 +519,10 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
     var prev_key: ?[]const u8 = null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const o = slotOffset(page, i);
+        const o = slotOffset(page, i) catch return null;
         if (o < dir_end or o + 6 > page_size) return null;
         const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
-        if (o + 6 + @as(usize, klen) > page_size) return null;
+        if (o + 6 + @as(usize, klen) > page_size or 6 + @as(usize, klen) > max_cell_len) return null;
         const key = page[o + 6 ..][0..klen];
         if (prev_key) |p| if (!std.mem.lessThan(u8, p, key)) return null;
         prev_key = key;
@@ -485,13 +551,13 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
 /// be defeated by wrapping.
 pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
     if (page[0] != @backingInt(NodeKind.leaf)) return null;
-    const count: usize = nodeCount(page);
+    const count: usize = nodeCount(page) catch return null;
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
     var prev_key: ?[]const u8 = null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const o = slotOffset(page, i);
+        const o = slotOffset(page, i) catch return null;
         if (o < dir_end or o + 6 > page_size) return null;
         const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
         const raw = std.mem.readInt(u32, page[o + 2 .. o + 6][0..4], .little);
@@ -501,8 +567,8 @@ pub fn leafViewSafe(page: *const [page_size]u8) ?Leaf {
         // A bucket cell's value is a header of exactly one size; any other
         // length under the flag is no cell this format writes.
         if (raw & ovf_flag == 0 and raw & bucket_flag != 0 and raw != bucket_flag | bucket_hdr_len) return null;
-        const vlen: usize = if (raw & ovf_flag != 0) ovf_ref_len else raw & ~bucket_flag;
-        if (o + 6 + @as(usize, klen) + vlen > page_size) return null;
+        const vlen = leafValLen(raw);
+        if (o + 6 + @as(usize, klen) + vlen > page_size or 6 + @as(usize, klen) + vlen > max_cell_len) return null;
         const key = page[o + 6 ..][0..klen];
         if (prev_key) |p| if (orderKeys(p, key) != .lt) return null;
         prev_key = key;
@@ -530,13 +596,12 @@ pub fn orderKeys(a: []const u8, b: []const u8) std.math.Order {
 }
 
 /// Generic ascending binary search over a leaf's/branch's key directory.
-fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
+/// `error.Corrupt` when a probed slot or cell lies outside the page.
+fn binarySearch(comptime V: type, view: V, key: []const u8) error{Corrupt}!Search {
     var lo: usize = 0;
-    var hi: usize = view.count();
-    // Prefetch only over a slot directory that fits its page: a damaged
-    // count must not send the prefetch where the search itself never reads.
+    var hi: usize = try view.count();
+    // Prefetch only for a node type that has the slot directory (both do).
     const may_prefetch = comptime (V == Leaf or V == Branch);
-    const dir_fits = hdr_len + hi * slot_len <= page_size;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
         // A probe's first touch of its cell is a cache miss, and each probe
@@ -545,14 +610,15 @@ fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
         // other; asking for both cells now overlaps the misses. The slot
         // directory itself is a line or two, warm after the first probe. A
         // page's offsets are clamped: a prefetch must not fault on a damaged
-        // slot that the search itself never reads.
-        if (may_prefetch and dir_fits) {
+        // slot that the search itself never reads. (`count` is at most
+        // `max_node_count`, so the directory is inside the page.)
+        if (may_prefetch) {
             const a = lo + (mid - lo) / 2;
             const b = mid + 1 + (hi - mid - 1) / 2;
-            if (a < mid) @prefetch(&view.page[@min(slotOffset(view.page, a), page_size - 1)], .{});
-            if (b < hi) @prefetch(&view.page[@min(slotOffset(view.page, b), page_size - 1)], .{});
+            if (a < mid) @prefetch(&view.page[@min(slotOffset(view.page, a) catch 0, page_size - 1)], .{});
+            if (b < hi) @prefetch(&view.page[@min(slotOffset(view.page, b) catch 0, page_size - 1)], .{});
         }
-        const cmp = orderKeys(view.keyAt(mid), key);
+        const cmp = orderKeys(try view.keyAt(mid), key);
         switch (cmp) {
             .lt => lo = mid + 1,
             .gt => hi = mid,
@@ -583,6 +649,12 @@ pub fn fitsInline(klen: usize, vlen: usize) bool {
 /// Does a key of `klen` fit an otherwise-empty leaf with an overflow reference?
 pub fn fitsOverflowRef(klen: usize) bool {
     return leafCellBytes(klen, ovf_ref_len) + hdr_len + slot_len <= page_size;
+}
+
+/// Can a store hold `(key, value)` at all: inline, or with the value in
+/// overflow pages? The test `Txn.put` applies, and `core.commit` repeats.
+pub fn fitsEntry(klen: usize, vlen: usize) bool {
+    return fitsInline(klen, vlen) or (vlen <= max_value_len and fitsOverflowRef(klen));
 }
 
 /// What an empty node takes (its header), and what one more leaf entry or
@@ -625,12 +697,12 @@ pub const LeafBuilder = struct {
     pub fn fromPage(arena: Allocator, page: *const [page_size]u8) !LeafBuilder {
         var b = LeafBuilder.init(arena);
         const leaf = Leaf.init(page);
-        const n = leaf.count();
+        const n = try leaf.count();
         // One entry more than the page holds: the common case is one insert.
         try b.entries.ensureTotalCapacityPrecise(arena, @as(usize, n) + 1);
         var i: usize = 0;
         while (i < n) : (i += 1)
-            b.entries.appendAssumeCapacity(leaf.entryAt(i));
+            b.entries.appendAssumeCapacity(try leaf.entryAt(i));
         return b;
     }
 
@@ -759,11 +831,11 @@ pub const BranchBuilder = struct {
     pub fn fromPage(arena: Allocator, page: *const [page_size]u8) !BranchBuilder {
         const br = Branch.init(page);
         var b = BranchBuilder.init(arena, br.leftmost());
-        const n = br.count();
+        const n = try br.count();
         try b.cells.ensureTotalCapacityPrecise(arena, @as(usize, n) + 1);
         var i: usize = 0;
         while (i < n) : (i += 1)
-            b.cells.appendAssumeCapacity(.{ .sep = br.keyAt(i), .child = br.rightChildAt(i) });
+            b.cells.appendAssumeCapacity(.{ .sep = try br.keyAt(i), .child = try br.rightChildAt(i) });
         return b;
     }
 
@@ -941,15 +1013,15 @@ test "leaf encode/decode round-trip + binary search (found + insertion point)" {
     var page: [page_size]u8 = undefined;
     b.encode(&page);
     const leaf = Leaf.init(&page);
-    try testing.expectEqual(@as(u16, 3), leaf.count());
+    try testing.expectEqual(@as(u16, 3), (try leaf.count()));
     // sorted: apple, banana, cherry
-    try testing.expectEqualStrings("apple", leaf.keyAt(0));
-    try testing.expectEqualStrings("green", leaf.valAt(0)); // overwrite won
-    try testing.expectEqualStrings("cherry", leaf.keyAt(2));
+    try testing.expectEqualStrings("apple", (try leaf.keyAt(0)));
+    try testing.expectEqualStrings("green", (try leaf.valAt(0))); // overwrite won
+    try testing.expectEqualStrings("cherry", (try leaf.keyAt(2)));
 
-    try testing.expect(leaf.search("banana").found);
-    try testing.expectEqual(@as(u16, 1), leaf.search("banana").index);
-    const miss = leaf.search("blueberry");
+    try testing.expect((try leaf.search("banana")).found);
+    try testing.expectEqual(@as(u16, 1), (try leaf.search("banana")).index);
+    const miss = (try leaf.search("blueberry"));
     try testing.expect(!miss.found);
     try testing.expectEqual(@as(u16, 2), miss.index); // would insert before cherry
 }
@@ -971,7 +1043,7 @@ test "builders borrow: the encoded page reads what the caller's buffers hold at 
     val[0] = 'w'; // still the caller's buffer: the builder holds no copy
     var page: [page_size]u8 = undefined;
     b.encode(&page);
-    try testing.expectEqualStrings("w", Leaf.init(&page).valAt(0));
+    try testing.expectEqualStrings("w", (try Leaf.init(&page).valAt(0)));
 }
 
 test "leaf delete" {
@@ -1022,13 +1094,13 @@ test "branch encode/decode round-trip + childFor routing" {
     var page: [page_size]u8 = undefined;
     b.encode(&page);
     const br = Branch.init(&page);
-    try testing.expectEqual(@as(u16, 2), br.count());
+    try testing.expectEqual(@as(u16, 2), (try br.count()));
     try testing.expectEqual(@as(PageId, 10), br.leftmost());
-    try testing.expectEqual(@as(PageId, 10), br.childFor("a")); // < m → leftmost
-    try testing.expectEqual(@as(PageId, 20), br.childFor("m")); // == m → right of m
-    try testing.expectEqual(@as(PageId, 20), br.childFor("p")); // m<=p<t
-    try testing.expectEqual(@as(PageId, 30), br.childFor("t")); // >= t
-    try testing.expectEqual(@as(PageId, 30), br.childFor("z"));
+    try testing.expectEqual(@as(PageId, 10), (try br.childFor("a"))); // < m → leftmost
+    try testing.expectEqual(@as(PageId, 20), (try br.childFor("m"))); // == m → right of m
+    try testing.expectEqual(@as(PageId, 20), (try br.childFor("p"))); // m<=p<t
+    try testing.expectEqual(@as(PageId, 30), (try br.childFor("t"))); // >= t
+    try testing.expectEqual(@as(PageId, 30), (try br.childFor("z")));
 }
 
 test "branch split promotes the middle separator out of both halves" {
@@ -1180,7 +1252,7 @@ test "leafViewSafe rejects an overflow reference of length zero" {
     var page: [page_size]u8 = undefined;
     b.encode(&page);
     try testing.expect(leafViewSafe(&page) != null);
-    try testing.expectEqual(@as(?u32, 1), Leaf.init(&page).ovfLen(0));
+    try testing.expectEqual(@as(?u32, 1), (try Leaf.init(&page).ovfLen(0)));
     // Clear the length bits, keep the flag: no value anyone wrote.
     const o = std.mem.readInt(u16, page[hdr_len..][0..2], .little);
     std.mem.writeInt(u32, page[o + 2 ..][0..4], ovf_flag, .little);
@@ -1220,7 +1292,7 @@ test "leafViewSafe rejects a bucket cell whose length is no header and a slot th
     const hdr: [bucket_hdr_len]u8 = @splat(0);
     encodeLeaf(&page, &.{.{ .key = "b", .val = &hdr, .bucket = true }});
     try testing.expect(leafViewSafe(&page) != null);
-    const o = slotOffset(&page, 0);
+    const o = try slotOffset(&page, 0);
     for ([_]u32{ 5, bucket_hdr_len + 1, 0 }) |len| {
         var bad = page;
         std.mem.writeInt(u32, bad[o + 2 .. o + 6][0..4], bucket_flag | len, .little);
@@ -1272,10 +1344,10 @@ test "an overflow value of 2^30 bytes or more is not a bucket: the length's seco
     const len: u32 = bucket_flag | 1; // 0x4000_0001, a legal overflow length
     encodeLeaf(&page, &.{.{ .key = "k", .val = &ref, .ovf_len = len }});
     const leaf = leafViewSafe(&page).?;
-    try testing.expect(!leaf.isBucket(0));
-    try testing.expectEqual(@as(?u32, len), leaf.ovfLen(0));
-    try testing.expectEqual(@as(usize, ovf_ref_len), leaf.valAt(0).len);
-    const e = leaf.entryAt(0);
+    try testing.expect(!(try leaf.isBucket(0)));
+    try testing.expectEqual(@as(?u32, len), (try leaf.ovfLen(0)));
+    try testing.expectEqual(@as(usize, ovf_ref_len), (try leaf.valAt(0)).len);
+    const e = (try leaf.entryAt(0));
     try testing.expect(!e.bucket);
     try testing.expectEqual(@as(?u32, len), e.ovf_len);
     try testing.expectEqualSlices(u8, &ref, e.val);
@@ -1291,7 +1363,7 @@ test "binarySearch: the prefetch of the probes it never makes cannot fault, what
     // halves, which a search for "c" never reads. A slot that points past the
     // page there must not be followed by the prefetch.
     for ([_]usize{ 1, 4 }) |i| std.mem.writeInt(u16, page[hdr_len + i * slot_len ..][0..2], 0xFFFF, .little);
-    const s = Leaf.init(&page).search("c");
+    const s = (try Leaf.init(&page).search("c"));
     try testing.expect(s.found);
     try testing.expectEqual(@as(u16, 2), s.index);
 }

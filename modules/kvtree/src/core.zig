@@ -214,6 +214,9 @@ pub fn commit(
     shrink_min_pages: u64,
 ) CommitError!Meta {
     if (tree.isEmpty()) return base; // an empty txn commits nothing
+    // A forged meta can carry any `txn_id`; the counter must not wrap. Refused
+    // before anything is written, so the store is untouched and not poisoned.
+    const new_txn = std.math.add(u64, base.txn_id, 1) catch return error.Corrupt;
 
     // The caller's arena, reset and not freed: see `commit_scratch_retain`.
     defer _ = scratch.reset(.{ .retain_with_limit = commit_scratch_retain });
@@ -246,7 +249,6 @@ pub fn commit(
 
     // COW-apply the whole batch, nested buckets first (see `applyTree`).
     const new_root = try applyTree(&ctx, base.root, tree);
-    const new_txn = base.txn_id + 1;
 
     // Every page in the old freelist chain is dead too (it was rebuilt above
     // into `fl`) — chaining means this can be more than one page.
@@ -359,6 +361,21 @@ const Ctx = struct {
     }
 };
 
+/// `B.fromPage`, with its errors in `CommitError`'s terms.
+fn builderFor(comptime B: type, arena: Allocator, page: *const [page_size]u8) CommitError!B {
+    return B.fromPage(arena, page) catch |e| switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Corrupt => error.Corrupt,
+    };
+}
+
+/// May `id` (read out of a page) name a node or overflow page? Everything a
+/// tree can reference lies in `[first_data_page, high_water)`; the commit's
+/// own growth only raises the upper bound.
+fn nodeIdOk(pager: *const Pager, id: PageId) bool {
+    return id >= format.first_data_page and id < pager.high_water;
+}
+
 fn readForCommit(pager: *Pager, id: PageId, buf: *[page_size]u8) CommitError!void {
     pager.readPage(id, buf) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -445,7 +462,7 @@ fn applyTree(ctx: *Ctx, root: ?PageId, tree: Tree) CommitError!PageId {
     // done and collapsed already.
     ctx.dropped = false;
     var pieces = if (root) |r|
-        try applyRec(ctx, r, ops.items)
+        try applyRec(ctx, r, ops.items, 0)
     else
         try applyLeaf(ctx, format.LeafBuilder.init(ctx.arena), ops.items);
     // An underfull root has no sibling to merge with: it is written as it is.
@@ -470,15 +487,20 @@ fn applyTree(ctx: *Ctx, root: ?PageId, tree: Tree) CommitError!PageId {
     // stays at the same depth. The page given up is either one this commit
     // wrote or a base page this commit makes unreachable; both are dead from
     // the new tree on, which is what `ctx.freed` holds.
-    if (ctx.dropped) while (true) {
-        var rp: [page_size]u8 = undefined;
-        try readForCommit(ctx.pager, new_root, &rp);
-        if ((format.kindOf(&rp) orelse return error.Corrupt) != .branch) break;
-        const br = format.Branch.init(&rp);
-        if (br.count() != 0) break;
-        ctx.freed.append(ctx.arena, new_root) catch return error.OutOfMemory;
-        new_root = br.leftmost();
-    };
+    if (ctx.dropped) {
+        var level: usize = 0;
+        while (true) : (level += 1) {
+            // A chain of single-child branches is bounded like any descent.
+            if (level >= format.max_tree_depth or !nodeIdOk(ctx.pager, new_root)) return error.Corrupt;
+            var rp: [page_size]u8 = undefined;
+            try readForCommit(ctx.pager, new_root, &rp);
+            if ((format.kindOf(&rp) orelse return error.Corrupt) != .branch) break;
+            const br = format.Branch.init(&rp);
+            if ((try br.count()) != 0) break;
+            ctx.freed.append(ctx.arena, new_root) catch return error.OutOfMemory;
+            new_root = br.leftmost();
+        }
+    }
     return new_root;
 }
 
@@ -503,21 +525,23 @@ fn freeSubtree(ctx: *Ctx, root: PageId) CommitError!void {
         switch (format.kindOf(&page) orelse return error.Corrupt) {
             .leaf => {
                 const leaf = format.Leaf.init(&page);
+                const n = try leaf.count();
                 var i: usize = 0;
-                while (i < leaf.count()) : (i += 1) {
-                    if (leaf.ovfLen(i)) |len| {
-                        try freeOverflow(ctx, leaf.ovfFirst(i), len);
-                    } else if (leaf.isBucket(i)) {
-                        const hdr = format.BucketHdr.decode(leaf.valAt(i));
+                while (i < n) : (i += 1) {
+                    if (try leaf.ovfLen(i)) |len| {
+                        try freeOverflow(ctx, try leaf.ovfFirst(i), len);
+                    } else if (try leaf.isBucket(i)) {
+                        const hdr = try format.BucketHdr.decode(try leaf.valAt(i));
                         stack.append(ctx.arena, hdr.root) catch return error.OutOfMemory;
                     }
                 }
             },
             .branch => {
                 const br = format.Branch.init(&page);
+                const n = try br.count();
                 var i: usize = 0;
-                while (i <= br.count()) : (i += 1)
-                    stack.append(ctx.arena, br.childAtIndex(i)) catch return error.OutOfMemory;
+                while (i <= n) : (i += 1)
+                    stack.append(ctx.arena, try br.childAtIndex(i)) catch return error.OutOfMemory;
             },
         }
     }
@@ -535,14 +559,17 @@ fn freeSubtree(ctx: *Ctx, root: PageId) CommitError!void {
 /// used to be the case, and a key range that only moves forward (a time
 /// series: append at the right, retention deletes at the left) never
 /// overwrote those leaves, so deleting old data did not stop the file growing.
-fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
+fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op, depth: usize) CommitError![]const Piece {
+    // Bounds the recursion (and so the stack) whatever the file says; the id
+    // came out of a page, so it is checked before it is read.
+    if (depth >= format.max_tree_depth or !nodeIdOk(ctx.pager, id)) return error.Corrupt;
     var page: [page_size]u8 = undefined;
     try readForCommit(ctx.pager, id, &page);
     ctx.freed.append(ctx.arena, id) catch return error.OutOfMemory;
 
     switch (format.kindOf(&page) orelse return error.Corrupt) {
         .leaf => {
-            const b = format.LeafBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
+            const b = try builderFor(format.LeafBuilder, ctx.arena, &page);
             return applyLeaf(ctx, b, ops);
         },
         .branch => {
@@ -550,7 +577,7 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
             // intermediate builder: every separator the new node keeps is
             // borrowed from `page`, which outlives `finishNodes` below.
             const b = format.Branch.init(&page);
-            const ncells: usize = b.count();
+            const ncells: usize = try b.count();
             // The new node's children, in order: `kids[0].sep` is never read
             // (it becomes `leftmost`), every other kid carries the separator
             // it sits right of.
@@ -564,11 +591,11 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
             var op_i: usize = 0;
             var ci: usize = 0;
             while (ci <= ncells) : (ci += 1) {
-                const child = b.childAtIndex(ci);
-                const sep: []const u8 = if (ci > 0) b.keyAt(ci - 1) else "";
+                const child = try b.childAtIndex(ci);
+                const sep: []const u8 = if (ci > 0) try b.keyAt(ci - 1) else "";
                 const start = op_i;
                 while (op_i < ops.len and
-                    (ci == ncells or std.mem.lessThan(u8, ops[op_i].key, b.keyAt(ci))))
+                    (ci == ncells or std.mem.lessThan(u8, ops[op_i].key, try b.keyAt(ci))))
                     op_i += 1;
                 // An untouched child keeps its page: structural sharing with
                 // the base version is what makes MVCC snapshots cheap.
@@ -581,7 +608,7 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]const Piece {
                 // (under the child's separator) and each further piece
                 // threads its promoted separator in after it (recursive
                 // split, parent-insert half).
-                const sub = try applyRec(ctx, child, ops[start..op_i]);
+                const sub = try applyRec(ctx, child, ops[start..op_i], depth + 1);
                 for (sub, 0..) |p, k| {
                     var kid = p;
                     if (k == 0) kid.sep = sep;
@@ -663,11 +690,11 @@ fn pendingPiece(ctx: *Ctx, node: Node) CommitError![]const Piece {
     const homed: Node = switch (node) {
         .leaf => |l| blk: {
             l.encode(buf);
-            break :blk .{ .leaf = format.LeafBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory };
+            break :blk .{ .leaf = try builderFor(format.LeafBuilder, ctx.arena, buf) };
         },
         .branch => |br| blk: {
             br.encode(buf);
-            break :blk .{ .branch = format.BranchBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory };
+            break :blk .{ .branch = try builderFor(format.BranchBuilder, ctx.arena, buf) };
         },
     };
     const pieces = ctx.arena.alloc(Piece, 1) catch return error.OutOfMemory;
@@ -750,8 +777,8 @@ fn nodeOf(ctx: *Ctx, kid: Piece) CommitError!Node {
     try readForCommit(ctx.pager, kid.id, buf);
     ctx.freed.append(ctx.arena, kid.id) catch return error.OutOfMemory;
     return switch (format.kindOf(buf) orelse return error.Corrupt) {
-        .leaf => .{ .leaf = format.LeafBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory },
-        .branch => .{ .branch = format.BranchBuilder.fromPage(ctx.arena, buf) catch return error.OutOfMemory },
+        .leaf => .{ .leaf = try builderFor(format.LeafBuilder, ctx.arena, buf) },
+        .branch => .{ .branch = try builderFor(format.BranchBuilder, ctx.arena, buf) },
     };
 }
 
@@ -884,27 +911,67 @@ pub fn recover(gpa: Allocator, pager: *Pager) RecoverError!Meta {
     return error.Unrecoverable;
 }
 
+/// One page of `candidateValid`'s tree walk: how deep it is in its tree and how
+/// many buckets enclose that tree.
+const WalkItem = struct { id: PageId, depth: u8, nest: u8 };
+
+/// A bit per page below `high_water`: which pages the walk has claimed.
+const PageSet = struct {
+    words: []u64,
+
+    fn init(gpa: Allocator, high_water: u64) Allocator.Error!PageSet {
+        const w = try gpa.alloc(u64, @intCast((high_water + 63) / 64));
+        @memset(w, 0);
+        return .{ .words = w };
+    }
+
+    fn deinit(self: PageSet, gpa: Allocator) void {
+        gpa.free(self.words);
+    }
+
+    /// Claim `id` (already checked `< high_water`); false if it was claimed.
+    fn claim(self: PageSet, id: PageId) bool {
+        const w = &self.words[id / 64];
+        const bit = @as(u64, 1) << @intCast(id % 64);
+        if (w.* & bit != 0) return false;
+        w.* |= bit;
+        return true;
+    }
+};
+
 /// Semantic in-bounds validation of one structurally-valid meta candidate:
 /// `high_water` within the real file, and every page the meta transitively
 /// references (tree walk + freelist entries) a real data page below
 /// `high_water`. Trusts NOTHING in the referenced pages (bounds-checked
 /// accessors, cycle guard) — a stale meta must be rejectable, not a crash.
+///
+/// Every page may be reached once: a page claimed by two parents (a DAG), a
+/// freelist entry that names a live page or repeats, are rejected -- they
+/// would let a later commit overwrite live data. Depth is capped
+/// (`format.max_tree_depth`, `format.max_bucket_depth`) so a forged chain of
+/// single-child branches or nested buckets cannot make a later commit
+/// recurse without bound.
 fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
     const file_pages = pager.fileSizePages() catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.Storage,
     };
-    if (m.high_water > file_pages) return false;
+    if (!highWaterOk(m.high_water, file_pages)) return false;
     if (!pageIdOk(m.root, m.high_water)) return false;
 
+    var seen = try PageSet.init(gpa, m.high_water);
+    defer seen.deinit(gpa);
+
     var buf: [page_size]u8 = undefined;
-    var stack: std.ArrayList(PageId) = .empty;
+    var stack: std.ArrayList(WalkItem) = .empty;
     defer stack.deinit(gpa);
-    stack.append(gpa, m.root) catch return error.OutOfMemory;
+    stack.append(gpa, .{ .id = m.root, .depth = 0, .nest = 0 }) catch return error.OutOfMemory;
     var visited: u64 = 0;
-    while (stack.pop()) |id| {
+    while (stack.pop()) |item| {
+        const id = item.id;
         visited += 1;
         if (visited > m.high_water) return false; // cycle — not a tree
+        if (!seen.claim(id)) return false; // reached twice — not a tree
         pager.readPage(id, &buf) catch |e| switch (e) {
             error.Corrupt => return false,
             error.OutOfMemory => return error.OutOfMemory,
@@ -918,29 +985,33 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
             // own. See `format.leafViewSafe`.
             @backingInt(format.NodeKind.leaf) => {
                 const leaf = format.leafViewSafe(&buf) orelse return false;
+                const n = leaf.count() catch return false;
                 var i: usize = 0;
-                while (i < leaf.count()) : (i += 1) {
-                    if (leaf.isBucket(i)) {
+                while (i < n) : (i += 1) {
+                    if (leaf.isBucket(i) catch return false) {
                         // A nested tree: walked like the top one, under the
                         // same visit bound (a bucket cell pointing back up
                         // the tree is a cycle like any other).
-                        const sub = format.BucketHdr.decode(leaf.valAt(i)).root;
+                        if (item.nest >= format.max_bucket_depth) return false;
+                        const val = leaf.valAt(i) catch return false;
+                        const sub = (format.BucketHdr.decode(val) catch return false).root;
                         if (!pageIdOk(sub, m.high_water)) return false;
-                        stack.append(gpa, sub) catch return error.OutOfMemory;
+                        stack.append(gpa, .{ .id = sub, .depth = 0, .nest = item.nest + 1 }) catch return error.OutOfMemory;
                         continue;
                     }
-                    const len = leaf.ovfLen(i) orelse continue;
+                    const len = (leaf.ovfLen(i) catch return false) orelse continue;
                     // The chain, trusting nothing: exactly the pages its length
                     // needs, each in bounds and an overflow page, the last one
                     // ending it. Counted into `visited`, so chains that share or
                     // loop through pages still hit the global bound.
                     var ovf_buf: [page_size]u8 = undefined;
-                    var pid = leaf.ovfFirst(i);
+                    var pid = leaf.ovfFirst(i) catch return false;
                     const pages = format.ovfPages(len);
                     for (0..pages) |k| {
                         visited += 1;
                         if (visited > m.high_water) return false;
                         if (!pageIdOk(pid, m.high_water)) return false;
+                        if (!seen.claim(pid)) return false;
                         pager.readPage(pid, &ovf_buf) catch |e| switch (e) {
                             error.Corrupt => return false,
                             error.OutOfMemory => return error.OutOfMemory,
@@ -953,14 +1024,21 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
                 }
             },
             @backingInt(format.NodeKind.branch) => {
+                if (item.depth + 1 >= format.max_tree_depth) return false; // children would be too deep
                 const br = format.branchViewSafe(&buf) orelse return false;
                 if (!pageIdOk(br.leftmost(), m.high_water)) return false;
-                stack.append(gpa, br.leftmost()) catch return error.OutOfMemory;
+                const child_item: WalkItem = .{ .id = undefined, .depth = item.depth + 1, .nest = item.nest };
+                var first_child = child_item;
+                first_child.id = br.leftmost();
+                stack.append(gpa, first_child) catch return error.OutOfMemory;
+                const n = br.count() catch return false;
                 var i: usize = 0;
-                while (i < br.count()) : (i += 1) {
-                    const child = br.rightChildAt(i);
+                while (i < n) : (i += 1) {
+                    const child = br.rightChildAt(i) catch return false;
                     if (!pageIdOk(child, m.high_water)) return false;
-                    stack.append(gpa, child) catch return error.OutOfMemory;
+                    var c = child_item;
+                    c.id = child;
+                    stack.append(gpa, c) catch return error.OutOfMemory;
                 }
             },
             else => return false, // not a node page
@@ -972,7 +1050,9 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
     // in-bounds, its declared count must fit one page, and a cycle (a hostile
     // or torn `next` pointer looping back) must be rejected rather than hang
     // — the exact dual of the tree walk above, over the freelist's own
-    // linked structure.
+    // linked structure. Chain pages and entries are claimed in the same set
+    // as the tree's pages: a free page that is live, or listed twice, is the
+    // overlap this rejects.
     var fid = m.free_root;
     var total: u64 = 0;
     var fl_visited: u64 = 0;
@@ -980,6 +1060,7 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
         fl_visited += 1;
         if (fl_visited > m.high_water) return false; // cycle guard
         if (!pageIdOk(fid, m.high_water)) return false;
+        if (!seen.claim(fid)) return false;
         pager.readPage(fid, &buf) catch |e| switch (e) {
             error.Corrupt => return false,
             error.OutOfMemory => return error.OutOfMemory,
@@ -993,11 +1074,20 @@ fn candidateValid(gpa: Allocator, pager: *Pager, m: Meta) RecoverError!bool {
             const off = Freelist.hdr_bytes + k * Freelist.entry_bytes;
             const id = std.mem.readInt(u32, buf[off .. off + 4][0..4], .little);
             if (!pageIdOk(id, m.high_water)) return false;
+            if (!seen.claim(id)) return false;
         }
         total += n;
         fid = next;
     }
     return total == m.free_count;
+}
+
+/// A meta's `high_water` must lie within the real file, and within the page-id
+/// space: ids are `u32` and the pager grows by handing out `high_water` as the
+/// next id, so a forged value above `maxInt(u32)` (reachable with a sparse
+/// file of 16 TiB) would panic the first allocation.
+fn highWaterOk(high_water: u64, file_pages: u64) bool {
+    return high_water <= file_pages and high_water <= std.math.maxInt(PageId);
 }
 
 fn pageIdOk(id: PageId, high_water: u64) bool {
@@ -1053,6 +1143,14 @@ test "core types + signatures resolve without invoking the stubs" {
     try testing.expect(d == .del);
     try testing.expect(@TypeOf(&commit) != @TypeOf(&recover));
     try testing.expect(@TypeOf(&reclaimGate) == *const fn (u64, u64) bool);
+}
+
+test "kvtree sweep KT-5: a high_water beyond the file or beyond the u32 page-id space is refused" {
+    try testing.expect(highWaterOk(100, 100));
+    try testing.expect(!highWaterOk(101, 100));
+    // A sparse 16+ TiB file: within the file, but ids no longer fit a PageId.
+    try testing.expect(!highWaterOk(@as(u64, 1) << 33, @as(u64, 1) << 40));
+    try testing.expect(highWaterOk(std.math.maxInt(PageId), @as(u64, 1) << 40));
 }
 
 test "reclaimGate: equal-txn reader is safe, strictly-older reader blocks" {
@@ -1506,7 +1604,16 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     // over 10 seeds x 4 data pages. Before the corpus there was ONE run, and
     // its four data pages were all shape 0.
     try testing.expectEqual([4]usize{ 25, 10, 1, 4 }, shapes);
-    // 2 of 10 seeds recover; the other 8 are the refusals named above. The txn
+    // 2026-10-29 (no-panic sweep, KT-6): `candidateValid` now refuses a
+    // freelist that names a live page or lists a page twice. The one seed with
+    // a freelist (txn_id 7) drew fuzzed entry ids that collide, so it is
+    // refused now: 1 adopted (txn_id 5), no freelist walked to the end by this
+    // corpus. The freelist walk's accept path stays covered by every real-Db
+    // test that reopens a store with parked pages (`harness.zig`'s crash
+    // sweeps, `root.zig`'s reopen tests) and its refusals by "kvtree sweep
+    // KT-6" in `root.zig`.
+    //
+    // 2 of 10 seeds recovered before that; the other 8 are the refusals named above. The txn
     // sum pins WHICH two, so a seed that stops being adopted cannot be masked
     // by another one starting to be.
     //
@@ -1520,10 +1627,10 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     // closes. `branch_roots` dropping to 0 is this corpus's only branch-shaped
     // root, so there being none left is the expected shape of the fix, not a
     // gap in the corpus.
-    try testing.expectEqual(@as(usize, 2), adopted);
-    try testing.expectEqual(@as(u64, 5 + 7), txn_total);
+    try testing.expectEqual(@as(usize, 1), adopted);
+    try testing.expectEqual(@as(u64, 5), txn_total);
     try testing.expectEqual(@as(usize, 0), branch_roots);
-    try testing.expectEqual(@as(usize, 1), freelists_walked);
+    try testing.expectEqual(@as(usize, 0), freelists_walked);
 
     // Seed 9's page, spelled out: the claim that `leafViewSafe` is what
     // refuses it, rather than something earlier in the walk. A count of 65 535

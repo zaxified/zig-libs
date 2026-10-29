@@ -139,10 +139,37 @@ pub const BucketError = kv.Storage.Error || error{
     IncompatibleValue,
     /// An empty name, or one too long for a leaf cell.
     InvalidBucketName,
+    /// `createBucket` would nest buckets deeper than `max_bucket_depth`.
+    BucketTooDeep,
+    /// A `put` whose key and value no leaf could ever hold, even with the
+    /// value in overflow pages (see `Txn.put`).
+    EntryTooLarge,
 };
+
+/// How many buckets may nest inside one another (the store's own buckets are
+/// level 1); see `BucketError.BucketTooDeep`.
+pub const max_bucket_depth = format.max_bucket_depth;
 
 // ── Db ─────────────────────────────────────────────────────────────────────
 
+/// The store. Single owner (see `meta.concurrency`).
+///
+/// **Untrusted file.** The file is data: forged, or rotted after `open`. `open`
+/// validates what it adopts (`core.recover`); every later read compares the
+/// offsets, lengths, counts and child ids it takes out of a page against the
+/// page and the version (`format.zig`, "point-of-use checking") and answers
+/// `error.Corrupt`, with a bounded descent (`format.max_tree_depth`). Nothing in
+/// the file can make a call panic, loop or recurse without bound. A page that
+/// rots is detected only when it is read: a store is not re-verified as a whole.
+///
+/// **Stack.** A commit holds one 4 KiB page buffer per tree level while it
+/// recurses (`core.applyRec`), plus about 12 KiB of fixed buffers (`finishNodes`,
+/// `commit`, `lookup`): roughly 4.5 KiB per level + 12 KiB, so about 30 KiB for
+/// a four-level tree and at most about 200 KiB at the 40-level cap a file is
+/// held to. Nested buckets add at most 16 more small frames. Estimated from the
+/// buffer sizes, not measured. A caller on a fiber with a stack smaller than
+/// 64 KiB should size it for this (`Db.get` while a commit is parked on another
+/// fiber, `get`'s own 4 KiB, is the other user).
 pub const Db = struct {
     gpa: Allocator,
     pager: Pager,
@@ -395,7 +422,12 @@ pub const Db = struct {
     /// chain page has an entry count where a node's kind byte belongs.
     ///
     /// Note the cost this makes explicit: a long-lived cursor holds back page
-    /// reclamation for as long as it is open, so close it promptly.
+    /// reclamation for as long as it is open, so close it promptly. The same
+    /// holds for a `Snapshot`; and while one is open every page the writer
+    /// frees stays on the freelist, which each commit then reads and each page
+    /// allocation scans, so a long-lived reader under a steady write load costs
+    /// time per commit that grows with the commits made since (and the file
+    /// grows too). Not measured; the remedy is a short-lived reader.
     pub fn cursor(self: *Db) Allocator.Error!Cursor {
         const pinned = self.meta_rec.txn_id;
         try self.open_snapshots.append(self.gpa, pinned);
@@ -469,7 +501,7 @@ pub const Db = struct {
     /// Lowest txn any open snapshot is pinned to, or "one past current" when
     /// none is open — the `oldest_reader_txn` the reclaim gate is fed.
     fn oldestReader(self: *const Db) u64 {
-        var m: u64 = self.meta_rec.txn_id + 1;
+        var m: u64 = self.meta_rec.txn_id +| 1; // a forged `txn_id` of maxInt must not wrap
         for (self.open_snapshots.items) |t| m = @min(m, t);
         return m;
     }
@@ -529,7 +561,12 @@ pub const Txn = struct {
     /// `Bucket` is an index into it. Empty unless buckets are used.
     buckets: std.ArrayList(BucketState),
 
-    pub fn put(self: *Txn, key: []const u8, val: []const u8) Allocator.Error!void {
+    /// Buffer a put. `error.EntryTooLarge` at once for an entry no leaf can
+    /// hold even with the value in overflow pages (a key of about 4 KiB, or a
+    /// value above 2 GiB), instead of at `commit`, which would fail the whole
+    /// batch.
+    pub fn put(self: *Txn, key: []const u8, val: []const u8) (Allocator.Error || error{EntryTooLarge})!void {
+        if (!format.fitsEntry(key.len, val.len)) return error.EntryTooLarge;
         const a = self.arena.allocator();
         try self.changes.append(self.db.gpa, .{
             .put = .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val) },
@@ -697,9 +734,20 @@ pub const Txn = struct {
         return @intCast(self.buckets.items.len - 1);
     }
 
+    /// Nesting level of a bucket created or opened under `parent` (a
+    /// top-level bucket is 1).
+    fn levelUnder(self: *Txn, parent: u32) usize {
+        var level: usize = 1;
+        var p = parent;
+        while (p != root_parent) : (p = self.buckets.items[p].parent) level += 1;
+        return level;
+    }
+
     fn openIn(self: *Txn, parent: u32, name: []const u8) BucketError!?Bucket {
         try self.live(parent);
         try checkName(name);
+        // No call of this API makes a bucket this deep; a file that has one is rot.
+        if (self.levelUnder(parent) > max_bucket_depth) return error.Corrupt;
         if (self.findState(parent, name)) |i| {
             if (self.buckets.items[i].deleted) return null;
             return .{ .txn = self, .idx = i };
@@ -714,6 +762,7 @@ pub const Txn = struct {
     fn createIn(self: *Txn, parent: u32, name: []const u8, if_not_exists: bool) BucketError!Bucket {
         try self.live(parent);
         try checkName(name);
+        if (self.levelUnder(parent) > max_bucket_depth) return error.BucketTooDeep;
         if (self.findState(parent, name)) |i| {
             const b = &self.buckets.items[i];
             if (!b.deleted) {
@@ -840,6 +889,7 @@ pub const Bucket = struct {
     }
 
     pub fn put(self: Bucket, key: []const u8, val: []const u8) BucketError!void {
+        if (!format.fitsEntry(key.len, val.len)) return error.EntryTooLarge;
         const st = try self.state();
         const a = self.txn.arena.allocator();
         try st.changes.append(self.txn.db.gpa, .{ .put = .{ .key = try a.dupe(u8, key), .val = try a.dupe(u8, val) } });
@@ -948,6 +998,9 @@ pub const Snapshot = struct {
     db: *Db,
     root: PageId,
     txn_id: u64,
+    /// Set by `release`, which is then a no-op: a second release must not
+    /// drop the pin of another reader of the same version.
+    released: bool = false,
 
     pub fn get(self: *Snapshot, gpa: Allocator, key: []const u8) GetError!?[]u8 {
         return lookup(&self.db.pager, self.root, gpa, key);
@@ -989,9 +1042,13 @@ pub const Snapshot = struct {
         return copyVersion(self.db, self.root, dest, path);
     }
 
+    /// Unpin the version. Releasing twice is harmless (the second call does
+    /// nothing); using the snapshot or a cursor/bucket taken from it after
+    /// `release` is not allowed, as before.
     pub fn release(self: *Snapshot) void {
+        if (self.released) return;
+        self.released = true;
         self.db.releaseSnapshot(self.txn_id);
-        self.* = undefined;
     }
 };
 
@@ -1012,7 +1069,7 @@ fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyEr
     var out = Pager.init(dest, h, 0);
     var loader = bulk.Loader.init(db.gpa, &out);
     defer loader.deinit();
-    try copyTree(db, root, &loader);
+    try copyTree(db, root, &loader, 0);
     loader.finish() catch |err| return switch (err) {
         error.EntryTooLarge => unreachable, // `finish` adds no entry
         else => |x| x,
@@ -1025,17 +1082,24 @@ fn copyVersion(db: *Db, root: PageId, dest: kv.Storage, path: []const u8) CopyEr
 /// Every entry of the tree at `root` into `loader`, in key order; a bucket's
 /// tree is loaded first, by a loader of its own over the same pages, and its
 /// cell then refers to the new root.
-fn copyTree(db: *Db, root: PageId, loader: *bulk.Loader) CopyError!void {
+fn copyTree(db: *Db, root: PageId, loader: *bulk.Loader, nest: usize) CopyError!void {
+    // Bounds the recursion; a file this deep never opened (`core.recover`).
+    if (nest > max_bucket_depth) return error.Corrupt;
     var cur = try Cursor.init(db.gpa, &db.pager, root);
     defer cur.deinit();
     try cur.first();
     while (try cur.next()) |e| {
         const added = if (e.bucket) blk: {
-            const hdr = cur.yieldedBucket();
-            var sub = loader.subtree();
+            const hdr = try cur.yieldedBucket();
+            // On the heap: a `Loader` holds 32 levels of builders by value,
+            // and one per nesting level on the stack is what bounded the
+            // depth before.
+            const sub = try db.gpa.create(bulk.Loader);
+            defer db.gpa.destroy(sub);
+            sub.* = loader.subtree();
             defer sub.deinit();
-            try copyTree(db, hdr.root, &sub);
-            const sub_root = loader.adoptSubtree(&sub) catch |err| break :blk err;
+            try copyTree(db, hdr.root, sub, nest + 1);
+            const sub_root = loader.adoptSubtree(sub) catch |err| break :blk err;
             break :blk loader.addBucket(e.key, .{ .root = sub_root, .seq = hdr.seq });
         } else loader.add(e.key, e.val);
         added catch |err| return switch (err) {
@@ -1046,11 +1110,25 @@ fn copyTree(db: *Db, root: PageId, loader: *bulk.Loader) CopyError!void {
     }
 }
 
+/// May `id` (read out of a node or a meta) name a node or overflow page? Every
+/// page a version references lies in `[first_data_page, high_water)`.
+fn nodeIdOk(pager: *const Pager, id: PageId) bool {
+    return id >= format.first_data_page and id < pager.high_water;
+}
+
+/// Can a value of `len` bytes live in the overflow pages this store has? A
+/// rotted length would otherwise ask the allocator for up to 2 GiB first.
+fn ovfLenOk(pager: *const Pager, len: u32) bool {
+    return format.ovfPages(len) <= pager.high_water;
+}
+
 /// `lookup` without the copy: the leaf page stays borrowed from the store and
 /// the value points into it. The caller has checked `canLend`.
 fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef {
     var id = root;
-    while (true) {
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        if (depth >= format.max_tree_depth or !nodeIdOk(pager, id)) return error.Corrupt;
         const ref = (try pager.readPageRef(id)) orelse return error.CannotLend;
         const bytes: *const [page_size]u8 = ref.bytes[0..page_size];
         switch (format.kindOf(bytes) orelse {
@@ -1058,21 +1136,19 @@ fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef
             return error.Corrupt;
         }) {
             .branch => {
-                id = format.Branch.init(bytes).childFor(key);
-                pager.releasePageRef(ref);
+                defer pager.releasePageRef(ref);
+                id = try format.Branch.init(bytes).childFor(key);
             },
             .leaf => {
+                errdefer pager.releasePageRef(ref);
                 const leaf = format.Leaf.init(bytes);
-                const found = leaf.search(key);
-                if (!found.found or leaf.isBucket(found.index)) {
+                const found = try leaf.search(key);
+                if (!found.found or try leaf.isBucket(found.index)) {
                     pager.releasePageRef(ref);
                     return null;
                 }
-                if (leaf.ovfLen(found.index) != null) {
-                    pager.releasePageRef(ref);
-                    return error.CannotLend;
-                }
-                return .{ .bytes = leaf.valAt(found.index), .pager = pager, .ref = ref };
+                if ((try leaf.ovfLen(found.index)) != null) return error.CannotLend; // errdefer releases
+                return .{ .bytes = try leaf.valAt(found.index), .pager = pager, .ref = ref };
             },
         }
     }
@@ -1083,7 +1159,11 @@ fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef
 fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError!?[]u8 {
     var page: [page_size]u8 = undefined;
     var id = root;
-    while (true) {
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        // Bounded and range-checked at the point of use: `id` came out of a
+        // page (the root of the meta, a branch's child), which can rot.
+        if (depth >= format.max_tree_depth or !nodeIdOk(pager, id)) return error.Corrupt;
         // The descent only ever *reads* its pages, and holds exactly one at a
         // time, so it is the one tree path that can take the store's borrow
         // seam when there is one (a `pagecache` in front of the backend): a
@@ -1098,20 +1178,21 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
             break :blk &page;
         };
         switch (format.kindOf(bytes) orelse return error.Corrupt) {
-            .branch => id = format.Branch.init(bytes).childFor(key),
+            .branch => id = try format.Branch.init(bytes).childFor(key),
             .leaf => {
                 const leaf = format.Leaf.init(bytes);
-                const s = leaf.search(key);
+                const s = try leaf.search(key);
                 // A bucket is not a value: `get` of its name finds nothing,
                 // as bbolt's `Get` does.
-                if (!s.found or leaf.isBucket(s.index)) return null;
-                if (leaf.ovfLen(s.index)) |len| {
+                if (!s.found or try leaf.isBucket(s.index)) return null;
+                if (try leaf.ovfLen(s.index)) |len| {
+                    if (!ovfLenOk(pager, len)) return error.Corrupt;
                     const out = try gpa.alloc(u8, len);
                     errdefer gpa.free(out);
-                    try readOverflow(pager, leaf.ovfFirst(s.index), out);
+                    try readOverflow(pager, try leaf.ovfFirst(s.index), out);
                     return out;
                 }
-                return try gpa.dupe(u8, leaf.valAt(s.index));
+                return try gpa.dupe(u8, try leaf.valAt(s.index));
             },
         }
     }
@@ -1123,16 +1204,18 @@ const Cell = union(enum) { none, plain, bucket: format.BucketHdr };
 fn lookupCell(pager: *Pager, root: PageId, key: []const u8) (kv.Storage.Error || error{Corrupt})!Cell {
     var page: [page_size]u8 = undefined;
     var id = root;
-    while (true) {
+    var depth: usize = 0;
+    while (true) : (depth += 1) {
+        if (depth >= format.max_tree_depth or !nodeIdOk(pager, id)) return error.Corrupt;
         try pager.readPage(id, &page);
         switch (format.kindOf(&page) orelse return error.Corrupt) {
-            .branch => id = format.Branch.init(&page).childFor(key),
+            .branch => id = try format.Branch.init(&page).childFor(key),
             .leaf => {
                 const leaf = format.Leaf.init(&page);
-                const s = leaf.search(key);
+                const s = try leaf.search(key);
                 if (!s.found) return .none;
-                if (!leaf.isBucket(s.index)) return .plain;
-                return .{ .bucket = format.BucketHdr.decode(leaf.valAt(s.index)) };
+                if (!(try leaf.isBucket(s.index))) return .plain;
+                return .{ .bucket = try format.BucketHdr.decode(try leaf.valAt(s.index)) };
             },
         }
     }
@@ -1174,6 +1257,12 @@ fn readOverflow(pager: *Pager, first: PageId, out: []u8) (kv.Storage.Error || er
 /// `ListIterator` does — not bbolt's cursor, which stands ON an entry. At either
 /// end the call yields null and the cursor stays where it is, so the other
 /// direction still walks back. A cursor never positioned yields nothing.
+///
+/// **After an error** from `first`, `last`, `seek`, `seekAfter`, `next` or
+/// `prev` (a storage fault, `Corrupt`, `OutOfMemory`) the cursor is unpositioned,
+/// exactly as if it had never been positioned: `next`/`prev` yield null until
+/// the next successful `first`/`last`/`seek`/`seekAfter`. It never keeps a
+/// half-finished descent, so a retry or a loop that carries on is safe.
 pub const Cursor = struct {
     gpa: Allocator,
     pager: *Pager,
@@ -1217,7 +1306,11 @@ pub const Cursor = struct {
         if (self.pin) |p| p.db.releaseSnapshot(p.txn_id);
         self.stack.deinit(self.gpa);
         self.ovf_buf.deinit(self.gpa);
-        self.* = undefined;
+        // Not `undefined`: a second `deinit` is then a no-op instead of a
+        // double free, and a double release of the pin is impossible.
+        self.pin = null;
+        self.stack = .empty;
+        self.ovf_buf = .empty;
     }
 
     /// Position before the first (smallest) key. Like `seek`, this
@@ -1227,6 +1320,7 @@ pub const Cursor = struct {
     /// rather than crashing.
     pub fn first(self: *Cursor) Error!void {
         self.dropFrames(0);
+        errdefer self.dropFrames(0);
         try self.descendLeftmost(self.root);
     }
 
@@ -1234,6 +1328,7 @@ pub const Cursor = struct {
     /// descending order.
     pub fn last(self: *Cursor) Error!void {
         self.dropFrames(0);
+        errdefer self.dropFrames(0);
         try self.descendRightmost(self.root);
     }
 
@@ -1251,6 +1346,7 @@ pub const Cursor = struct {
 
     fn seekGap(self: *Cursor, key: []const u8, after: bool) Error!void {
         self.dropFrames(0);
+        errdefer self.dropFrames(0);
         var id = self.root;
         while (true) {
             const frame, const kind = try self.pushFrame(id);
@@ -1259,12 +1355,12 @@ pub const Cursor = struct {
                     // The child that holds `key`'s place: every key left of
                     // it is < `key`, every key right of it is > `key`.
                     const br = format.Branch.init(frame.bytes());
-                    const ci = br.childIndexFor(key);
+                    const ci = try br.childIndexFor(key);
                     frame.idx = @intCast(ci);
-                    id = br.childAtIndex(ci);
+                    id = try br.childAtIndex(ci);
                 },
                 .leaf => {
-                    const s = format.Leaf.init(frame.bytes()).search(key);
+                    const s = try format.Leaf.init(frame.bytes()).search(key);
                     frame.idx = s.index + @intFromBool(after and s.found);
                     return;
                 },
@@ -1277,7 +1373,7 @@ pub const Cursor = struct {
         while (true) {
             const frame, const kind = try self.pushFrame(id);
             if (kind == .leaf) return;
-            id = format.Branch.init(frame.bytes()).childAtIndex(0);
+            id = try format.Branch.init(frame.bytes()).childAtIndex(0);
         }
     }
 
@@ -1287,11 +1383,11 @@ pub const Cursor = struct {
             const frame, const kind = try self.pushFrame(id);
             // A leaf's gap after its last entry; a branch's last child.
             frame.idx = switch (kind) {
-                .leaf => format.Leaf.init(frame.bytes()).count(),
-                .branch => format.Branch.init(frame.bytes()).count(),
+                .leaf => try format.Leaf.init(frame.bytes()).count(),
+                .branch => try format.Branch.init(frame.bytes()).count(),
             };
             if (kind == .leaf) return;
-            id = format.Branch.init(frame.bytes()).childAtIndex(frame.idx);
+            id = try format.Branch.init(frame.bytes()).childAtIndex(frame.idx);
         }
     }
 
@@ -1300,6 +1396,8 @@ pub const Cursor = struct {
     /// returned pointer is valid until the next push. A page that fails to
     /// read or has no valid kind leaves the stack as it was.
     fn pushFrame(self: *Cursor, id: PageId) Error!struct { *Frame, format.NodeKind } {
+        // The id came out of a page; the depth bound ends a rotted cycle.
+        if (self.stack.items.len >= format.max_tree_depth or !nodeIdOk(self.pager, id)) return error.Corrupt;
         const frame = try self.stack.addOne(self.gpa);
         frame.ref = null;
         frame.id = id;
@@ -1323,10 +1421,11 @@ pub const Cursor = struct {
     /// Returned slices borrow the cursor's leaf buffer — valid until the next
     /// call.
     pub fn next(self: *Cursor) Error!?KV {
+        errdefer self.dropFrames(0);
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             const leaf = format.Leaf.init(top.bytes());
-            if (top.idx < leaf.count()) {
+            if (top.idx < try leaf.count()) {
                 const i = top.idx;
                 top.idx += 1;
                 return try self.entry(leaf, i);
@@ -1339,9 +1438,9 @@ pub const Cursor = struct {
                 lvl -= 1;
                 const anc = &self.stack.items[lvl];
                 const br = format.Branch.init(anc.bytes());
-                if (anc.idx < br.count()) { // children are 0..count
+                if (anc.idx < try br.count()) { // children are 0..count
                     anc.idx += 1;
-                    const child = br.childAtIndex(anc.idx);
+                    const child = try br.childAtIndex(anc.idx);
                     self.dropFrames(lvl + 1);
                     try self.descendLeftmost(child);
                     break; // retry the outer loop against the new leaf
@@ -1354,6 +1453,7 @@ pub const Cursor = struct {
     /// Yield the entry before the cursor and move back over it, or null at
     /// the start. The mirror of `next`, with the same borrowing rule.
     pub fn prev(self: *Cursor) Error!?KV {
+        errdefer self.dropFrames(0);
         while (self.stack.items.len > 0) {
             const top = &self.stack.items[self.stack.items.len - 1];
             const leaf = format.Leaf.init(top.bytes());
@@ -1367,7 +1467,7 @@ pub const Cursor = struct {
                 const anc = &self.stack.items[lvl];
                 if (anc.idx > 0) {
                     anc.idx -= 1;
-                    const child = format.Branch.init(anc.bytes()).childAtIndex(anc.idx);
+                    const child = try format.Branch.init(anc.bytes()).childAtIndex(anc.idx);
                     self.dropFrames(lvl + 1);
                     try self.descendRightmost(child);
                     break;
@@ -1378,19 +1478,20 @@ pub const Cursor = struct {
     }
 
     /// The header of the bucket `next` just yielded (`copyTo`'s walk).
-    fn yieldedBucket(self: *const Cursor) format.BucketHdr {
+    fn yieldedBucket(self: *const Cursor) Error!format.BucketHdr {
         const top = &self.stack.items[self.stack.items.len - 1];
         const leaf = format.Leaf.init(top.bytes());
-        std.debug.assert(leaf.isBucket(top.idx - 1));
-        return format.BucketHdr.decode(leaf.valAt(top.idx - 1));
+        if (!(try leaf.isBucket(top.idx - 1))) return error.Corrupt;
+        return format.BucketHdr.decode(try leaf.valAt(top.idx - 1));
     }
 
     fn entry(self: *Cursor, leaf: format.Leaf, i: usize) Error!KV {
-        const e = leaf.entryAt(i);
+        const e = try leaf.entryAt(i);
         if (e.bucket) return .{ .key = e.key, .val = &.{}, .bucket = true };
         if (e.ovf_len) |len| {
+            if (!ovfLenOk(self.pager, len)) return error.Corrupt;
             try self.ovf_buf.resize(self.gpa, len);
-            try readOverflow(self.pager, leaf.ovfFirst(i), self.ovf_buf.items);
+            try readOverflow(self.pager, try leaf.ovfFirst(i), self.ovf_buf.items);
             return .{ .key = e.key, .val = self.ovf_buf.items };
         }
         return .{ .key = e.key, .val = e.val };
@@ -2082,26 +2183,26 @@ fn walkShape(db: *Db, id: PageId, depth: usize, lo: ?[]const u8, hi: ?[]const u8
     switch (format.kindOf(&page).?) {
         .leaf => {
             const leaf = format.Leaf.init(&page);
-            if (!is_root) try testing.expect(leaf.count() > 0);
+            if (!is_root) try testing.expect((try leaf.count()) > 0);
             if (shape.depth) |d| try testing.expectEqual(d, depth) else shape.depth = depth;
             var i: usize = 0;
-            while (i < leaf.count()) : (i += 1) {
-                const k = leaf.keyAt(i);
+            while (i < try leaf.count()) : (i += 1) {
+                const k = try leaf.keyAt(i);
                 if (lo) |l| try testing.expect(!std.mem.lessThan(u8, k, l));
                 if (hi) |h| try testing.expect(std.mem.lessThan(u8, k, h));
-                if (leaf.isBucket(i)) {
+                if (try leaf.isBucket(i)) {
                     // A nested tree: its own depth, its pages counted here.
                     var sub: TreeShape = .{};
-                    try walkShape(db, format.BucketHdr.decode(leaf.valAt(i)).root, 0, null, null, true, &sub);
+                    try walkShape(db, (try format.BucketHdr.decode(try leaf.valAt(i))).root, 0, null, null, true, &sub);
                     shape.tree_pages += sub.tree_pages;
                     shape.ovf_pages += sub.ovf_pages;
                     shape.keys += sub.keys;
                     shape.buckets += 1 + sub.buckets;
                 }
-                if (leaf.ovfLen(i)) |len| {
+                if (try leaf.ovfLen(i)) |len| {
                     // Exactly the pages the length needs, each an overflow page.
                     var ovf: [page_size]u8 = undefined;
-                    var pid = leaf.ovfFirst(i);
+                    var pid = try leaf.ovfFirst(i);
                     for (0..format.ovfPages(len)) |_| {
                         try db.pager.readPage(pid, &ovf);
                         pid = format.overflowNext(&ovf).?;
@@ -2110,16 +2211,16 @@ fn walkShape(db: *Db, id: PageId, depth: usize, lo: ?[]const u8, hi: ?[]const u8
                     try testing.expectEqual(@as(PageId, 0), pid);
                 }
             }
-            shape.keys += leaf.count();
+            shape.keys += try leaf.count();
         },
         .branch => {
             const br = format.Branch.init(&page);
-            if (is_root) try testing.expect(br.count() > 0);
+            if (is_root) try testing.expect((try br.count()) > 0);
             var i: usize = 0;
-            while (i <= br.count()) : (i += 1) {
-                const clo = if (i == 0) lo else br.keyAt(i - 1);
-                const chi = if (i == br.count()) hi else br.keyAt(i);
-                try walkShape(db, br.childAtIndex(i), depth + 1, clo, chi, false, shape);
+            while (i <= try br.count()) : (i += 1) {
+                const clo = if (i == 0) lo else try br.keyAt(i - 1);
+                const chi = if (i == try br.count()) hi else try br.keyAt(i);
+                try walkShape(db, try br.childAtIndex(i), depth + 1, clo, chi, false, shape);
             }
         },
     }
@@ -2559,8 +2660,8 @@ test "overflow values: a broken chain is Corrupt on read, and recovery refuses a
         var page: [page_size]u8 = undefined;
         try db.pager.readPage(db.meta_rec.root, &page);
         const leaf = format.Leaf.init(&page);
-        const s = leaf.search("v");
-        try db.pager.readPage(leaf.ovfFirst(s.index), &page);
+        const s = try leaf.search("v");
+        try db.pager.readPage(try leaf.ovfFirst(s.index), &page);
         chain_page = format.overflowNext(&page).?; // the second page of three
         // A read that meets a page that is not an overflow page fails closed.
         sim.flipByte("c.kvt", @as(usize, chain_page) * page_size); // kind 2 -> 0x42
@@ -2744,7 +2845,7 @@ fn countFill(db: *Db, id: PageId, is_root: bool, fill: *Fill) !void {
             fill.branches += 1;
             const br = format.Branch.init(&page);
             var i: usize = 0;
-            while (i <= br.count()) : (i += 1) try countFill(db, br.childAtIndex(i), false, fill);
+            while (i <= try br.count()) : (i += 1) try countFill(db, try br.childAtIndex(i), false, fill);
         },
     }
 }
@@ -2975,7 +3076,7 @@ test "overflow values: recovery refuses a chain whose last page is not an overfl
             var page: [page_size]u8 = undefined;
             try db.pager.readPage(db.meta_rec.root, &page);
             const leaf = format.Leaf.init(&page);
-            pages[0] = leaf.ovfFirst(leaf.search("v").index);
+            pages[0] = try leaf.ovfFirst((try leaf.search("v")).index);
             for (1..3) |k| {
                 try db.pager.readPage(pages[k - 1], &page);
                 pages[k] = format.overflowNext(&page).?;
@@ -3181,10 +3282,10 @@ fn checkCompact(db: *Db, id: PageId, is_root: bool) !void {
         .leaf => if (!is_root) try testing.expect(!(try format.LeafBuilder.fromPage(arena.allocator(), &page)).underflows()),
         .branch => {
             const br = format.Branch.init(&page);
-            try testing.expect(br.count() > 0);
+            try testing.expect((try br.count()) > 0);
             if (!is_root) try testing.expect(!(try format.BranchBuilder.fromPage(arena.allocator(), &page)).underflows());
             var i: usize = 0;
-            while (i <= br.count()) : (i += 1) try checkCompact(db, br.childAtIndex(i), false);
+            while (i <= try br.count()) : (i += 1) try checkCompact(db, try br.childAtIndex(i), false);
         },
     }
 }
@@ -3608,8 +3709,8 @@ fn expectSameTree(ra: PageId, pa: *Pager, rb: PageId, pb: *Pager) !void {
         try testing.expectEqualStrings(ea.key, eb.key);
         try testing.expectEqual(ea.bucket, eb.bucket);
         if (ea.bucket) {
-            const ha = ca.yieldedBucket();
-            const hb = cb.yieldedBucket();
+            const ha = try ca.yieldedBucket();
+            const hb = try cb.yieldedBucket();
             try testing.expectEqual(ha.seq, hb.seq);
             try expectSameTree(ha.root, pa, hb.root, pb);
         } else try testing.expectEqualSlices(u8, ea.val, eb.val);
@@ -3642,7 +3743,7 @@ fn observe(a: Allocator, pager: *Pager, root: PageId, seq: u64) !*MBucket {
     while (try cur.next()) |e| {
         const k = try a.dupe(u8, e.key);
         if (e.bucket) {
-            const hdr = cur.yieldedBucket();
+            const hdr = try cur.yieldedBucket();
             try m.subs.put(a, k, try observe(a, pager, hdr.root, hdr.seq));
         } else try m.kvs.put(a, k, try a.dupe(u8, e.val));
     }
@@ -3807,8 +3908,8 @@ test "buckets: recover rejects a version whose bucket cell is corrupt and adopts
             var page: [page_size]u8 = undefined;
             try db.pager.readPage(db.meta_rec.root, &page);
             const leaf = format.Leaf.init(&page);
-            const s = leaf.search("b");
-            try testing.expect(s.found and leaf.isBucket(s.index));
+            const s = try leaf.search("b");
+            try testing.expect(s.found and try leaf.isBucket(s.index));
             const o = std.mem.readInt(u16, page[8 + 2 * @as(usize, s.index) ..][0..2], .little);
             const page_off = @as(usize, db.meta_rec.root) * page_size;
             // val_len's low byte (12 -> 76), or the nested root's high byte (the key is 1 byte).
@@ -3846,7 +3947,7 @@ fn cellOffset(db: *Db, page_id: PageId, key: []const u8) !usize {
     var page: [page_size]u8 = undefined;
     try db.pager.readPage(page_id, &page);
     const leaf = format.Leaf.init(&page);
-    const s = leaf.search(key);
+    const s = try leaf.search(key);
     try testing.expect(s.found);
     const o = std.mem.readInt(u16, page[8 + 2 * @as(usize, s.index) ..][0..2], .little);
     return @as(usize, page_id) * page_size + o;
@@ -4177,16 +4278,16 @@ test "a commit rewrites only the path it touches: every other child of the root 
     var after: [page_size]u8 = undefined;
     try db.pager.readPage(db.meta_rec.root, &before);
     try testing.expectEqual(format.NodeKind.branch, format.kindOf(&before).?);
-    const n = format.Branch.init(&before).count();
+    const n = try format.Branch.init(&before).count();
     try testing.expect(n >= 2);
     var kb: [long_key_len]u8 = undefined;
     try db.put(longKey(&kb, 150), "changed");
     try db.pager.readPage(db.meta_rec.root, &after);
     try testing.expectEqual(format.NodeKind.branch, format.kindOf(&after).?);
-    try testing.expectEqual(n, format.Branch.init(&after).count());
+    try testing.expectEqual(n, try format.Branch.init(&after).count());
     var moved: usize = 0;
     for (0..@as(usize, n) + 1) |i| {
-        if (format.Branch.init(&before).childAtIndex(i) != format.Branch.init(&after).childAtIndex(i)) moved += 1;
+        if ((try format.Branch.init(&before).childAtIndex(i)) != (try format.Branch.init(&after).childAtIndex(i))) moved += 1;
     }
     try testing.expectEqual(@as(usize, 1), moved);
 }
@@ -4207,4 +4308,393 @@ test "an empty transaction commits nothing: the meta, the txn id and the file st
     try testing.expectEqualSlices(u8, bytes, sim.fileContent("e.kvt").?);
     try db.put("b", "2");
     try testing.expectEqual(before.txn_id + 1, db.meta_rec.txn_id);
+}
+
+// ── no-panic sweep 2026-10-29 (KT-1 .. KT-11) ─────────────────────────────────
+//
+// The file is untrusted data: forged at open, or rotted AFTER open (the pages
+// below are rewritten through the live `Pager`, the way media rot or another
+// process would). Every case must end in a typed error, never a panic.
+
+/// `n` keys `k0000..` with 64-byte values, one commit each: with `n = 120` the
+/// tree is a root branch over several leaves.
+fn ktFill(db: *Db, n: usize) !void {
+    var kb: [16]u8 = undefined;
+    const val: [64]u8 = @splat('v');
+    for (0..n) |i| try db.put(try std.mem.print(&kb, "k{d:0>4}", .{i}), &val);
+}
+
+fn ktOpenSim(sim: *kv.SimStorage, path: []const u8) !Db {
+    sim.allow_overwrite = true;
+    return Db.open(testing.allocator, sim.storage(), path, .{});
+}
+
+/// Write `m` into both meta slots of the store behind `pager`.
+fn ktWriteMetas(pager: *Pager, m: format.Meta) !void {
+    var buf: [page_size]u8 = undefined;
+    m.encode(&buf);
+    try pager.writePage(format.meta_page_a, &buf);
+    try pager.writePage(format.meta_page_b, &buf);
+    try pager.sync();
+}
+
+test "kvtree sweep KT-1: a cursor that failed mid-descent is unpositioned, not left on a branch" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt1.kvt");
+    defer db.close();
+    try ktFill(&db, 120);
+
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(db.meta_rec.root, &page);
+    try testing.expectEqual(format.NodeKind.branch, format.kindOf(&page).?);
+    const second_leaf = try format.Branch.init(&page).childAtIndex(1);
+    try db.pager.readPage(second_leaf, &page);
+    try testing.expectEqual(format.NodeKind.leaf, format.kindOf(&page).?);
+    page[0] = 0x7f; // the kind byte rots after open
+    try db.pager.writePage(second_leaf, &page);
+
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    while (true) {
+        const e = cur.next() catch |err| {
+            try testing.expect(err == error.Corrupt);
+            break;
+        };
+        try testing.expect(e != null); // the rotted leaf is met before the end
+    }
+    // Unpositioned now: nothing to yield, and above all no panic.
+    try testing.expect((try cur.next()) == null);
+    try testing.expect((try cur.prev()) == null);
+    // Repositioning works again (`last` lands on a healthy rightmost leaf).
+    try cur.last();
+    try testing.expect((try cur.prev()) != null);
+}
+
+test "kvtree sweep KT-2: lengths and offsets rotted after open are Corrupt on get, cursor and commit" {
+    // 0: a slot offset past the page; 1: a key length past the page; 2: an
+    // inline value length past the page; 3: a count no page can hold.
+    for (0..4) |kind| {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        var db = try ktOpenSim(&sim, "kt2.kvt");
+        defer db.close();
+        try db.put("k1", "v1");
+        try db.put("k2", "v2");
+        try db.put("k3", "v3");
+
+        var page: [page_size]u8 = undefined;
+        const root = db.meta_rec.root;
+        try db.pager.readPage(root, &page);
+        try testing.expectEqual(format.NodeKind.leaf, format.kindOf(&page).?);
+        if (kind == 3) std.mem.writeInt(u16, page[2..4], 0xFFFF, .little);
+        for (0..3) |i| {
+            const slot = 8 + 2 * i;
+            const o = std.mem.readInt(u16, page[slot..][0..2], .little);
+            switch (kind) {
+                0 => std.mem.writeInt(u16, page[slot..][0..2], 0xFFF0, .little),
+                1 => std.mem.writeInt(u16, page[o..][0..2], 0xFFFF, .little),
+                2 => std.mem.writeInt(u32, page[o + 2 ..][0..4], format.bucket_flag - 1, .little),
+                else => {},
+            }
+        }
+        try db.pager.writePage(root, &page);
+
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "k1"));
+        try testing.expectError(error.Corrupt, db.get(testing.allocator, "k3"));
+        var cur = try db.cursor();
+        defer cur.deinit();
+        try cur.first();
+        try testing.expectError(error.Corrupt, cur.next());
+        // (A search reads keys only: a rotted value length is not in its way.)
+        if (kind != 2) try testing.expectError(error.Corrupt, cur.seek("k2"));
+        try testing.expectError(error.Corrupt, db.put("k1", "x"));
+    }
+}
+
+test "kvtree sweep KT-2: a child id outside the version is Corrupt, even when a page is there" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt2b.kvt");
+    defer db.close();
+    try ktFill(&db, 120);
+
+    var page: [page_size]u8 = undefined;
+    const root = db.meta_rec.root;
+    try db.pager.readPage(root, &page);
+    const first_leaf = try format.Branch.init(&page).childAtIndex(0);
+    // A well-formed leaf lies in the file just past the version's end.
+    var stale: [page_size]u8 = undefined;
+    try db.pager.readPage(first_leaf, &stale);
+    const past: PageId = @intCast(db.pager.high_water);
+    try db.pager.writePage(past, &stale);
+    std.mem.writeInt(u32, page[4..8], past, .little); // leftmost -> the stale page
+    try db.pager.writePage(root, &page);
+
+    try testing.expectError(error.Corrupt, db.get(testing.allocator, "k0000"));
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try testing.expectError(error.Corrupt, cur.first());
+}
+
+test "kvtree sweep KT-2/KT-3: a branch that points back up is Corrupt, not an endless descent" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt3.kvt");
+    defer db.close();
+    try ktFill(&db, 120);
+
+    var page: [page_size]u8 = undefined;
+    const root = db.meta_rec.root;
+    try db.pager.readPage(root, &page);
+    const br = format.Branch.init(&page);
+    const n = try br.count();
+    std.mem.writeInt(u32, page[4..8], root, .little); // leftmost = itself
+    for (0..n) |i| {
+        const o = std.mem.readInt(u16, page[8 + 2 * i ..][0..2], .little);
+        std.mem.writeInt(u32, page[o + 2 ..][0..4], root, .little); // every child = itself
+    }
+    try db.pager.writePage(root, &page);
+
+    try testing.expectError(error.Corrupt, db.get(testing.allocator, "k0000"));
+    try testing.expectError(error.Corrupt, db.get(testing.allocator, "k0100"));
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try testing.expectError(error.Corrupt, cur.first());
+    try testing.expectError(error.Corrupt, cur.last());
+    try testing.expectError(error.Corrupt, cur.seek("k0050"));
+    try testing.expect((try cur.next()) == null); // and it stays unpositioned
+    try testing.expectError(error.Corrupt, db.put("k0000", "x"));
+}
+
+/// Forge a store file: `pages` at page 2.., both metas pointing at page 2.
+fn ktForge(sim: *kv.SimStorage, path: []const u8, pages: []const [page_size]u8, version: u32) !void {
+    const h = try sim.storage().open(path, .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    for (pages, 0..) |*pg, i| try p.writePage(@intCast(2 + i), pg);
+    try ktWriteMetas(&p, .{
+        .txn_id = 1,
+        .root = 2,
+        .free_root = 0,
+        .free_count = 0,
+        .high_water = 2 + pages.len,
+        .version = version,
+    });
+}
+
+/// `depth` single-child branches over one empty leaf.
+fn ktChainOfBranches(a: Allocator, depth: usize) ![][page_size]u8 {
+    const pages = try a.alloc([page_size]u8, depth + 1);
+    for (0..depth) |i| {
+        const bb = format.BranchBuilder.init(a, @intCast(3 + i));
+        bb.encode(&pages[i]);
+    }
+    format.encodeEmptyLeaf(&pages[depth]);
+    return pages;
+}
+
+test "kvtree sweep KT-3: a chain of single-child branches deeper than any real tree is Corrupt at open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // The deepest accepted: max_tree_depth node levels (branches + the leaf).
+    {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try ktForge(&sim, "deep_ok.kvt", try ktChainOfBranches(a, format.max_tree_depth - 1), format.format_v2);
+        var db = try Db.open(testing.allocator, sim.storage(), "deep_ok.kvt", .{});
+        defer db.close();
+        try expectGet(&db, "x", null);
+    }
+    // One level more.
+    {
+        var sim = kv.SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        try ktForge(&sim, "deep.kvt", try ktChainOfBranches(a, format.max_tree_depth), format.format_v2);
+        try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "deep.kvt", .{}));
+    }
+}
+
+/// `nested` bucket levels: each tree is one leaf holding one bucket "b" whose
+/// tree is the next page; the last tree is empty.
+fn ktChainOfBuckets(a: Allocator, nested: usize) ![][page_size]u8 {
+    const pages = try a.alloc([page_size]u8, nested + 1);
+    for (0..nested) |i| {
+        var lb = format.LeafBuilder.init(a);
+        const hdr = try a.create([format.bucket_hdr_len]u8);
+        (format.BucketHdr{ .root = @intCast(3 + i), .seq = 0 }).encode(hdr);
+        try lb.putBucket("b", hdr);
+        lb.encode(&pages[i]);
+    }
+    format.encodeEmptyLeaf(&pages[nested]);
+    return pages;
+}
+
+test "kvtree sweep KT-4: the API nests buckets at most max_bucket_depth deep, and the copy of that depth works" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt4.kvt");
+    defer db.close();
+    var txn = try db.begin();
+    var b = try txn.createBucket("b");
+    for (1..max_bucket_depth) |_| b = try b.createBucket("b"); // level 16 is fine
+    try testing.expectError(error.BucketTooDeep, b.createBucket("b"));
+    try testing.expectError(error.BucketTooDeep, b.createBucketIfNotExists("b"));
+    try txn.commit();
+    var snap = try db.snapshot();
+    defer snap.release();
+    try snap.copyTo(sim.storage(), "kt4_copy.kvt");
+}
+
+test "kvtree sweep KT-4: a file with buckets nested deeper than max_bucket_depth is Corrupt at open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    try ktForge(&sim, "ok.kvt", try ktChainOfBuckets(a, max_bucket_depth), format.format_v4);
+    var db = try Db.open(testing.allocator, sim.storage(), "ok.kvt", .{});
+    db.close();
+    try ktForge(&sim, "deep.kvt", try ktChainOfBuckets(a, max_bucket_depth + 1), format.format_v4);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "deep.kvt", .{}));
+}
+
+test "kvtree sweep KT-5: a forged txn_id of maxInt reads fine and refuses a write instead of wrapping" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    {
+        var db = try ktOpenSim(&sim, "kt5.kvt");
+        defer db.close();
+        try db.put("a", "1");
+        var m = db.meta_rec;
+        m.txn_id = std.math.maxInt(u64);
+        try ktWriteMetas(&db.pager, m);
+    }
+    var db = try ktOpenSim(&sim, "kt5.kvt");
+    defer db.close();
+    try testing.expectEqual(std.math.maxInt(u64), db.meta_rec.txn_id);
+    try expectGet(&db, "a", "1");
+    var snap = try db.snapshot(); // the oldest-reader arithmetic sees maxInt too
+    snap.release();
+    try testing.expectError(error.Corrupt, db.put("b", "2"));
+    try expectGet(&db, "b", null);
+}
+
+test "kvtree sweep KT-6: a freelist naming a live page, or one page twice, is Corrupt at open" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt6.kvt");
+    try db.put("a", "1");
+    // A spare page, in the file and below high_water, that nothing references.
+    const spare = db.pager.growOne();
+    var zero: [page_size]u8 = @splat(0);
+    try db.pager.writePage(spare, &zero);
+    const live = db.meta_rec.root;
+
+    const one = [_]PageId{spare};
+    const named_live = [_]PageId{live};
+    const twice = [_]PageId{ spare, spare };
+    const cases = [_]struct { ids: []const PageId, ok: bool }{
+        .{ .ids = &one, .ok = true },
+        .{ .ids = &named_live, .ok = false },
+        .{ .ids = &twice, .ok = false },
+    };
+    for (cases) |c| {
+        var fl: Freelist = .{};
+        defer fl.deinit(testing.allocator);
+        for (c.ids) |id| try fl.push(testing.allocator, id, 1);
+        const head = try fl.writeChain(testing.allocator, &db.pager);
+        var m = db.meta_rec;
+        m.free_root = head;
+        m.free_count = c.ids.len;
+        m.high_water = db.pager.high_water;
+        try ktWriteMetas(&db.pager, m);
+        // (Each case writes its chain on a fresh page, so earlier chains are
+        // just unreferenced pages by now.)
+        var again = Db.open(testing.allocator, sim.storage(), "kt6.kvt", .{ .lock = .none });
+        if (c.ok) {
+            if (again) |*d| d.close() else |e| return e;
+        } else {
+            try testing.expectError(error.Corrupt, again);
+        }
+    }
+    db.close();
+}
+
+test "kvtree sweep KT-8: an entry no leaf can hold is refused by put, not by the commit that carries it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt8.kvt");
+    defer db.close();
+    const huge_key: [5000]u8 = @splat('k');
+    var overflow_val: [10_000]u8 = @splat('x');
+    _ = &overflow_val;
+
+    var txn = try db.begin();
+    try testing.expectError(error.EntryTooLarge, txn.put(&huge_key, "v"));
+    try txn.put("k", "v"); // the batch is still usable
+    try txn.put("big", &overflow_val); // a value in overflow pages is fine
+    var b = try txn.createBucket("bk");
+    try testing.expectError(error.EntryTooLarge, b.put(&huge_key, "v"));
+    try b.put("k", "v");
+    try txn.commit();
+    try expectGet(&db, "k", "v");
+}
+
+test "kvtree sweep KT-11: releasing a snapshot or deinit-ing a cursor twice does not drop another reader's pin" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt11.kvt");
+    defer db.close();
+    try db.put("a", "1");
+
+    var s1 = try db.snapshot();
+    var s2 = try db.snapshot();
+    try testing.expectEqual(@as(usize, 2), db.open_snapshots.items.len);
+    s1.release();
+    s1.release();
+    try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+    s2.release();
+    try testing.expectEqual(@as(usize, 0), db.open_snapshots.items.len);
+
+    var other = try db.snapshot();
+    defer other.release();
+    var c = try db.cursor();
+    c.deinit();
+    c.deinit();
+    try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
+}
+
+test "kvtree sweep KT-6: a page claimed by two parents is Corrupt at open" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    // Page 2: a branch over page 3 twice; page 3: an empty leaf.
+    var pages = try a.alloc([page_size]u8, 2);
+    var bb = format.BranchBuilder.init(a, 3);
+    try bb.insert("m", 3);
+    bb.encode(&pages[0]);
+    format.encodeEmptyLeaf(&pages[1]);
+    try ktForge(&sim, "dag.kvt", pages, format.format_v2);
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "dag.kvt", .{}));
+}
+
+test "kvtree sweep KT-6: a freelist entry that rots to a meta page is refused by the commit that reads it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "kt6b.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    for (0..8) |i| try db.put("k", if (i % 2 == 0) "a" else "b");
+    const head = db.meta_rec.free_root;
+    try testing.expect(head != 0);
+    // The first entry's page id (after count(2) and next(4)) becomes page 0:
+    // handed out, the commit would overwrite a meta page.
+    pokeU32(&sim, "kt6b.kvt", @as(usize, head) * page_size + 6, 0);
+    try testing.expectError(error.Storage, db.put("k", "c"));
+    try testing.expect(!db.poisoned);
 }

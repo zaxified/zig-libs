@@ -101,8 +101,14 @@ pub const Pager = struct {
     /// Grow the file logically by one page and return the fresh id. Mechanical:
     /// the reuse path (pulling from the freelist instead of growing) is
     /// `Freelist.popReusable`, gated behind `core.reclaimGate`.
+    ///
+    /// Checked `@panic("kvtree: page id space exhausted")` once the file has
+    /// 2^32 pages (16 TiB): page ids are `u32` and the commit path has no
+    /// error channel for an allocation. `Db.open` refuses a store whose meta
+    /// claims more than that, so only real growth reaches it.
     pub fn growOne(self: *Pager) PageId {
-        const id: PageId = @intCast(self.high_water);
+        const id: PageId = std.math.cast(PageId, self.high_water) orelse
+            @panic("kvtree: page id space exhausted");
         self.high_water += 1;
         return id;
     }
@@ -217,7 +223,7 @@ pub const Freelist = struct {
     pub fn cutTail(self: *Freelist, gpa: Allocator, high_water: u64, oldest_reader_txn: u64, min_pages: u64) Allocator.Error!u64 {
         if (min_pages == 0 or high_water <= format.first_data_page) return high_water;
         // Cheap exit for the common commit: the last page is live.
-        const last: PageId = @intCast(high_water - 1);
+        const last: PageId = std.math.cast(PageId, high_water - 1) orelse return high_water;
         for (self.ids.items, self.free_txns.items) |id, txn| {
             if (id == last and core.reclaimGate(txn, oldest_reader_txn)) break;
         } else return high_water;
@@ -328,9 +334,12 @@ pub const Freelist = struct {
     /// any set of page ids, contiguous or not — the chain is linked by its
     /// `next` field, and every reader (`readFreelistChain`, and recovery's
     /// `candidateValid`) follows that rather than assuming adjacency.
+    ///
+    /// Caller contract: `pages.len == pagesNeeded()`; anything else is a
+    /// checked `@panic("kvtree: writeChainOn: pages.len != pagesNeeded()")`.
     pub fn writeChainOn(self: *const Freelist, pager: *Pager, pages: []const PageId) StorageError!PageId {
         const n = self.ids.items.len;
-        std.debug.assert(pages.len == self.pagesNeeded());
+        if (pages.len != self.pagesNeeded()) @panic("kvtree: writeChainOn: pages.len != pagesNeeded()");
         if (n == 0) return 0;
 
         var buf: [page_size]u8 = undefined;
@@ -397,9 +406,15 @@ pub fn readFreelistChain(gpa: Allocator, pager: *Pager, head: PageId) ChainReadE
         var k: usize = 0;
         while (k < n) : (k += 1) {
             const base = Freelist.hdr_bytes + k * Freelist.entry_bytes;
+            const entry_id = std.mem.readInt(u32, buf[base .. base + 4][0..4], .little);
+            // A listed page is handed out for overwriting: a meta page or a
+            // page past the file would corrupt the store, so rot that points
+            // there is caught where the entry is read (as `recover` does at
+            // open).
+            if (entry_id < format.first_data_page or entry_id >= pager.high_water) return error.Corrupt;
             try out.fl.push(
                 gpa,
-                std.mem.readInt(u32, buf[base .. base + 4][0..4], .little),
+                entry_id,
                 std.mem.readInt(u64, buf[base + 4 .. base + 12][0..8], .little),
             );
         }
@@ -447,6 +462,8 @@ test "freelist writeChain/readFreelistChain round-trip (well below capacity)" {
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();
     var p = try testPager(&sim);
+    // The entries below name pages past the pager's own end; the reader checks that.
+    p.high_water = 2000;
 
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
@@ -484,6 +501,8 @@ test "freelist chain: exactly at one page's capacity stays a single page" {
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();
     var p = try testPager(&sim);
+    // The entries below name pages past the pager's own end; the reader checks that.
+    p.high_water = 2000;
 
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
@@ -504,6 +523,8 @@ test "freelist chain: ONE OVER capacity forces a second chain page (the overflow
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();
     var p = try testPager(&sim);
+    // The entries below name pages past the pager's own end; the reader checks that.
+    p.high_water = 2000;
 
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
@@ -557,6 +578,7 @@ test "freelist chain: freeing MORE pages than one page holds survives a simulate
     // Simulate reopen: a fresh Pager over the SAME store/handle, as `recover`
     // would build after re-deriving high_water from the durable meta.
     var reopened = Pager.init(sim.storage(), p.handle, high_water_after_write);
+    reopened.high_water = 4000; // the ids above lie past the real end; the reader checks
 
     var back = try readFreelistChain(testing.allocator, &reopened, head);
     defer back.deinit(testing.allocator);
@@ -576,6 +598,7 @@ test "reserveChain recycles a parked page instead of growing, and takes exactly 
     var sim = kv.SimStorage.init(testing.allocator);
     defer sim.deinit();
     var p = try testPager(&sim);
+    p.high_water = 1000; // the parked ids below must be pages the pager has
 
     var fl = Freelist{};
     defer fl.deinit(testing.allocator);
@@ -660,4 +683,13 @@ test "reserveChain spans several chain pages, recycling every one of them" {
     // Every reserved page came out of the list, so none of them is also listed
     // as free in the chain it is about to store.
     for (pages) |id| for (fl.ids.items) |listed| try testing.expect(listed != id);
+}
+
+test "kvtree sweep KT-9: cutTail over a high_water beyond the u32 page-id space gives nothing back, it does not cast-panic" {
+    var fl = Freelist{};
+    defer fl.deinit(testing.allocator);
+    try fl.push(testing.allocator, 5, 1);
+    const hw: u64 = @as(u64, 1) << 33;
+    try testing.expectEqual(hw, try fl.cutTail(testing.allocator, hw, 10, 1));
+    try testing.expectEqual(@as(usize, 1), fl.len());
 }
