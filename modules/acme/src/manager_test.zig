@@ -2372,3 +2372,98 @@ test "on-demand: a name managed while the policy was asked is served from that e
     try expectServes(&m, "od.example", chainOf(fx.od1_crt));
     try testing.expectEqual(@as(usize, 1), fake.calls);
 }
+
+// ── no-panic sweep 2026-10-28 ───────────────────────────────────────────────
+
+test "no-panic A-9: a new on-demand name drops the failed ones whose back-off is over, without maintain" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var policy: Policy = .{};
+    const fails = @as([4]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "no" } }));
+    var fake: FakeIssuer = .{ .script = &fails };
+    var m = f.manager(.{
+        .storage = undefined,
+        .on_demand = .{
+            .ctx = &policy,
+            .allow = Policy.allow,
+            .failure_backoff_s = 300,
+            .rate = .{ .max = 100, .window_s = 0 }, // no limit
+        },
+    });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    for ([_][]const u8{ "a1.example", "a2.example", "a3.example" }) |name| {
+        try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, name));
+    }
+    try testing.expectEqual(@as(usize, 3), m.entries.items.len);
+    // Still within the back-off: nothing is forgotten yet.
+    f.clock.t += 299;
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "a4.example"));
+    try testing.expectEqual(@as(usize, 4), m.entries.items.len);
+    // Past it, the next new name sweeps them all.
+    f.clock.t += 1000;
+    try testing.expectEqual(@as(?Manager.Material, null), try m.certificate(testing.allocator, "a5.example"));
+    try testing.expectEqual(@as(usize, 1), m.entries.items.len);
+}
+
+test "no-panic A-6: max_backoff_s = 0 is floored to one second" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    const fails = @as([2]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "boom" } }));
+    var fake: FakeIssuer = .{ .script = &fails };
+    var m = f.manager(.{ .storage = undefined, .max_backoff_s = 0 });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(i64, 1), f.rec.last_retry_at - f.clock.t);
+}
+
+test "no-panic A-6: lock_poll_s = 0 is floored to one second" {
+    var f: Fixture = undefined;
+    f.init(day0 + day);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{} };
+    var m = f.manager(.{ .storage = undefined, .lock_poll_s = 0 });
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    // Another node holds the lock: look again in a second, not at once.
+    try testing.expect(try f.mem.storage().tryLock("issue/a.example", "node-b", f.clock.t, 900));
+    try testing.expectEqual(f.clock.t + 1, m.maintain());
+}
+
+test "no-panic A-5: a clock at the i64 extremes saturates instead of overflowing" {
+    var f: Fixture = undefined;
+    f.init(std.math.maxInt(i64) - 10);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &@as([2]FakeIssuer.Step, @splat(.{ .fail = .{ .problem = "boom" } })) };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    _ = m.maintain();
+    try testing.expectEqual(@as(usize, 1), f.rec.failed);
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), f.rec.last_retry_at);
+
+    // checkPair at both ends of time: expired / not yet valid, never an overflow.
+    const gpa = testing.allocator;
+    try testing.expectError(error.Expired, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, std.math.maxInt(i64), &.{}));
+    try testing.expectError(error.Expired, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, std.math.minInt(i64), &.{}));
+}
+
+test "no-panic A-10: a chain of more than max_chain_certs certificates is MalformedChain" {
+    const gpa = testing.allocator;
+    const t = day0 + 30 * day;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, fx.a1_crt);
+    try text.append(gpa, '\n');
+    for (0..Client.max_chain_certs - 1) |_| try text.appendSlice(gpa, fx.ca_pem);
+    // Exactly the limit: judged on its merits (not MalformedChain).
+    if (Manager.checkPair(gpa, a_names, text.items, fx.a1_key, t, &.{})) |_| {} else |err| try testing.expect(err != error.MalformedChain);
+    try text.appendSlice(gpa, fx.ca_pem);
+    try testing.expectError(error.MalformedChain, Manager.checkPair(gpa, a_names, text.items, fx.a1_key, t, &.{}));
+}

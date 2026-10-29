@@ -59,30 +59,31 @@ pub const Alg = enum {
     }
 
     /// The JWK `crv` (RFC 7518 §6.2.1.1). EC algorithms only (`isEc`): an RSA
-    /// key has no curve, so asking is a caller bug (`unreachable`).
+    /// key has no curve, so asking is a caller bug (`@panic("acme: ...")`).
     pub fn crv(a: Alg) []const u8 {
         return switch (a) {
             .es256 => "P-256",
             .es384 => "P-384",
             .es512 => "P-521",
-            .rs256 => unreachable, // callers branch on `isEc` first
+            .rs256 => @panic("acme: Alg.crv: RS256 has no curve (check isEc first)"),
         };
     }
 
     /// Octets of one affine coordinate, and of one scalar. EC algorithms only
-    /// (`isEc`).
+    /// (`isEc`); `.rs256` panics (`acme: Alg.coordLen`).
     pub fn coordLen(a: Alg) usize {
         return switch (a) {
             .es256 => 32,
             .es384 => 48,
             .es512 => 66,
-            .rs256 => unreachable, // callers branch on `isEc` first
+            .rs256 => @panic("acme: Alg.coordLen: RS256 has no coordinates (check isEc first)"),
         };
     }
 
     /// Octets of an ECDSA JWS signature, `R ‖ S` (RFC 7518 §3.4). EC
     /// algorithms only (`isEc`): an RS256 signature is as long as the key's
     /// modulus (RFC 7518 §3.3), so it depends on the key, not on the `Alg`.
+    /// `.rs256` panics (`acme: Alg.coordLen`).
     pub fn sigLen(a: Alg) usize {
         return 2 * a.coordLen();
     }
@@ -150,10 +151,11 @@ pub const AnyPublicKey = union(Alg) {
     pub const max_sec1_len = 133;
 
     /// `04 ‖ X ‖ Y` into `buf`; the returned slice is its prefix. EC keys only
-    /// (`alg().isEc()`): an RSA key has no point (`unreachable`).
+    /// (`alg().isEc()`): an RSA key has no point, and `.rs256` panics
+    /// (`acme: AnyPublicKey.uncompressedSec1`).
     pub fn uncompressedSec1(k: AnyPublicKey, buf: *[max_sec1_len]u8) []const u8 {
         switch (k) {
-            .rs256 => unreachable, // callers branch on `isEc` first
+            .rs256 => @panic("acme: AnyPublicKey.uncompressedSec1: an RSA key has no EC point (check isEc first)"),
             inline .es256, .es384, .es512 => |pk| {
                 const s = pk.toUncompressedSec1();
                 @memcpy(buf[0..s.len], &s);
@@ -289,7 +291,7 @@ pub fn generateAnyKeyPair(out: *AnyKeyPair, alg: Alg, io: std.Io) void {
             out.* = .{ .es512 = undefined };
             generateKeyPairUnburned(Es512.KeyPair, &out.es512, io);
         },
-        .rs256 => unreachable, // documented precondition: `alg.isEc()`; see `generateRsaKeyPair`
+        .rs256 => @panic("acme: generateAnyKeyPair: RS256 needs generateRsaKeyPair"),
     }
     burn.stack(burn.key_burn);
 }
@@ -345,8 +347,10 @@ pub fn base64UrlLen(n: usize) usize {
     return b64.Encoder.calcSize(n);
 }
 
-/// Encode into `dest` (must be at least `base64UrlLen(source.len)`).
+/// Encode into `dest` (must be at least `base64UrlLen(source.len)`; a shorter
+/// `dest` panics, `acme: base64UrlEncode`).
 pub fn base64UrlEncode(dest: []u8, source: []const u8) []const u8 {
+    if (dest.len < base64UrlLen(source.len)) @panic("acme: base64UrlEncode: dest shorter than base64UrlLen(source.len)");
     return b64.Encoder.encode(dest, source);
 }
 
@@ -394,7 +398,8 @@ comptime {
 /// byte sequence RFC 7638 hashes. EC: `{"crv","kty":"EC","x","y"}`; RSA (RFC
 /// 7518 §6.3.1): `{"e","kty":"RSA","n"}` with `e` and `n` the unsigned
 /// big-endian bytes without leading zeros. `buf` must hold
-/// `max_canonical_jwk_len` bytes (`canonical_jwk_len` suffices for P-256).
+/// `max_canonical_jwk_len` bytes (`canonical_jwk_len` suffices for P-256); a
+/// shorter `buf` panics (`acme: canonicalJwk`).
 pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
     const pk = anyPublic(public_key);
     if (pk.alg() == .rs256) {
@@ -407,7 +412,7 @@ pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
             buf,
             "{{\"e\":\"{s}\",\"kty\":\"RSA\",\"n\":\"{s}\"}}",
             .{ b64.Encoder.encode(&eb, parts.e), b64.Encoder.encode(&nb, parts.n) },
-        ) catch unreachable; // sized by max_canonical_jwk_len for the largest key rsa accepts
+        ) catch @panic("acme: canonicalJwk: buf shorter than max_canonical_jwk_len");
     }
     var sec1_buf: [AnyPublicKey.max_sec1_len]u8 = undefined;
     const sec1 = pk.uncompressedSec1(&sec1_buf); // 0x04 ‖ X ‖ Y
@@ -420,7 +425,7 @@ pub fn canonicalJwk(buf: []u8, public_key: anytype) []const u8 {
         buf,
         "{{\"crv\":\"{s}\",\"kty\":\"EC\",\"x\":\"{s}\",\"y\":\"{s}\"}}",
         .{ pk.alg().crv(), x, y },
-    ) catch unreachable; // fixed-width fields, buf is sized by the caller
+    ) catch @panic("acme: canonicalJwk: buf shorter than canonical_jwk_len");
 }
 
 /// RFC 7638 thumbprint of an already-canonical JWK byte sequence (any key
@@ -474,7 +479,8 @@ pub fn isValidToken(token: []const u8) bool {
 }
 
 /// `token ++ "." ++ base64url(JWK thumbprint)` (RFC 8555 §8.1). `buf` must
-/// hold `max_key_authorization_len` bytes.
+/// hold `max_key_authorization_len` bytes; a shorter `buf` panics
+/// (`acme: keyAuthorization`).
 pub fn keyAuthorization(
     buf: []u8,
     token: []const u8,
@@ -482,7 +488,7 @@ pub fn keyAuthorization(
 ) KeyAuthorizationError![]const u8 {
     if (!isValidToken(token)) return error.InvalidToken;
     const tp = thumbprintBase64(public_key);
-    return std.mem.print(buf, "{s}.{s}", .{ token, tp }) catch unreachable; // bounded by max_token_len
+    return std.mem.print(buf, "{s}.{s}", .{ token, tp }) catch @panic("acme: keyAuthorization: buf shorter than max_key_authorization_len");
 }
 
 // ── RFC 8737 §3 TLS-ALPN-01 acmeIdentifier ──────────────────────────────────

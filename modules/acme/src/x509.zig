@@ -68,14 +68,14 @@ const oid_ecdsa_sha512 = "\x2a\x86\x48\xce\x3d\x04\x03\x04"; // 1.2.840.10045.4.
 const oid_rsa_encryption = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x01"; // 1.2.840.113549.1.1.1
 const oid_sha256_with_rsa = "\x2a\x86\x48\x86\xf7\x0d\x01\x01\x0b"; // 1.2.840.113549.1.1.11
 
-/// The named-curve OID of an EC algorithm. An RSA key has none (`unreachable`:
-/// every caller is already on the EC side of an `alg == .rs256` branch).
+/// The named-curve OID of an EC algorithm. An RSA key has none: `.rs256`
+/// panics (`acme: curveOid`).
 fn curveOid(alg: Alg) []const u8 {
     return switch (alg) {
         .es256 => oid_p256,
         .es384 => oid_p384,
         .es512 => oid_p521,
-        .rs256 => unreachable,
+        .rs256 => @panic("acme: curveOid: an RSA key has no named curve"),
     };
 }
 

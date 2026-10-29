@@ -164,7 +164,8 @@ pub const ObtainOptions = struct {
     /// Pick the chain whose topmost certificate was issued by this subject
     /// common name, among the default chain and the CA's alternates
     /// (RFC 8555 §7.4.2 `Link: rel="alternate"`). No match → the default
-    /// chain (the certbot and lego behaviour).
+    /// chain (the certbot and lego behaviour). At most `max_alternate_chains`
+    /// (8) alternates are looked at, in the CA's order; the rest are ignored.
     preferred_chain: ?[]const u8 = null,
     /// Extra CSR extensions (`x509.must_staple`, or any other the CA
     /// honours); not with `obtainWithCsr`, whose CSR is the caller's.
@@ -316,6 +317,11 @@ const Directory = struct {
 /// wipes its copy in `deinit`; wipe the caller's own EC pair after this call.
 /// An `rsa.KeyPair` (RS256) is the exception: the client keeps a pointer to
 /// it, so it must outlive the client and stay unwiped until `deinit`.
+///
+/// Not movable or copyable once `challengeResponder()` / `tlsAlpnResponder()`
+/// was taken and wired into a server: the responders' addresses are stored
+/// there (a moved `Client` leaves the server threads with a dangling pointer),
+/// and `deinit` must run only after the server stopped.
 // secret-api-ok: Client holds the account key by design (zeroed in deinit); init is a field-wise construction into the caller's result slot, which IS the caller's Client variable, and takes the key by pointer; an out-form would only move the same bytes.
 pub fn init(
     io: std.Io,
@@ -385,7 +391,9 @@ pub fn lastProblem(c: *const Client) ?[]const u8 {
 /// The HTTP-01 challenge responder to wire into the server that answers
 /// for the ordered domains on port 80: register
 /// `client.challengeResponder().middleware()` on the `router` (before
-/// routes). The order flow populates and cleans its token map.
+/// routes). The order flow populates and cleans its token map. The returned
+/// pointer is into the `Client`, which must not move or be `deinit`ed while the
+/// middleware is in use (see `init`).
 pub fn challengeResponder(c: *Client) *Responder {
     return &c.responder;
 }
@@ -637,8 +645,11 @@ pub const RenewalInfo = struct {
     /// clients to spread over it rather than all renew at the start).
     pub fn pickTime(r: RenewalInfo, random: std.Random) i64 {
         if (r.window_end <= r.window_start) return r.window_start;
-        const span: u64 = @intCast(r.window_end - r.window_start);
-        return r.window_start + @as(i64, @intCast(random.uintLessThan(u64, span + 1)));
+        // Total on any i64 window: the difference of two ordered i64 is exact
+        // as a wrapping u64 (up to 2^64-1), and start + offset <= end fits i64.
+        const span: u64 = @as(u64, @bitCast(r.window_end)) -% @as(u64, @bitCast(r.window_start));
+        const off = random.uintAtMost(u64, span);
+        return @bitCast(@as(u64, @bitCast(r.window_start)) +% off);
     }
 };
 
@@ -1037,7 +1048,7 @@ pub fn newOrder(c: *Client, identifiers: []const []const u8, opts: OrderOptions)
 
     const pr = try c.postJws(a, c.dir.?.new_order, out.written(), .kid);
     if (pr.status != 201) return c.problemError(pr.body, pr.retry_after_s);
-    return loadOrder(c.gpa, pr.location orelse return error.MalformedResponse, pr.body);
+    return loadOrder(c.gpa, pr.location orelse return error.MalformedResponse, pr.body, identifiers.len);
 }
 
 /// The order at `url` (POST-as-GET, RFC 8555 §7.4) — resume an order whose
@@ -1048,8 +1059,12 @@ pub fn fetchOrder(c: *Client, url: []const u8) Error!Order {
     defer arena.deinit();
     const pr = try c.postJws(arena.allocator(), url, "", .kid);
     if (pr.status != 200) return c.problemError(pr.body, pr.retry_after_s);
-    return loadOrder(c.gpa, url, pr.body);
+    return loadOrder(c.gpa, url, pr.body, max_resumed_identifiers);
 }
+
+/// `fetchOrder` does not know how many identifiers the order was placed with:
+/// the most it accepts from the CA (Let's Encrypt allows 100 names).
+const max_resumed_identifiers = 100;
 
 /// Which state `waitOrder` waits for.
 pub const OrderTarget = enum {
@@ -1110,6 +1125,14 @@ pub fn finalize(c: *Client, order: *Order, csr_der: []const u8) Error!void {
     try replaceOrder(c.gpa, order, fpr.body);
 }
 
+/// How many `Link rel="alternate"` chains `downloadChain` looks at (certbot
+/// and lego look at a handful); a CA's longer list is cut here.
+pub const max_alternate_chains = 8;
+
+/// A chain longer than this many certificates is `MalformedResponse` (public
+/// chains have 2-4); keeps `verifyChain` and the PEM walk bounded.
+pub const max_chain_certs = 10;
+
 /// RFC 8555 §7.4.2's media type for a downloaded chain.
 const pem_chain_type = "application/pem-certificate-chain";
 
@@ -1130,15 +1153,20 @@ pub fn downloadChain(c: *Client, order: *const Order, preferred_chain: ?[]const 
     if (preferred_chain) |want| {
         if (!try topIssuerIs(a, pem, want)) {
             for (cpr.alternates) |alt_url| {
+                // Each alternate lives in its own short-lived arena; only the
+                // chosen one is copied into `a`.
+                var alt_arena = std.heap.ArenaAllocator.init(c.gpa);
+                defer alt_arena.deinit();
+                const aa = alt_arena.allocator();
                 // An alternate is optional: whatever goes wrong fetching one
                 // (but memory) keeps the default chain already in hand.
-                const apr = c.postSignedAccept(a, alt_url, "", .kid, &c.account_key, pem_chain_type) catch |err| switch (err) {
+                const apr = c.postSignedAccept(aa, alt_url, "", .kid, &c.account_key, pem_chain_type) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => continue,
                 };
                 if (apr.status != 200) continue;
-                if (try topIssuerIs(a, apr.body, want)) {
-                    pem = apr.body;
+                if (try topIssuerIs(aa, apr.body, want)) {
+                    pem = try a.dupe(u8, apr.body);
                     break;
                 }
             }
@@ -1148,7 +1176,7 @@ pub fn downloadChain(c: *Client, order: *const Order, preferred_chain: ?[]const 
     // cannot occur here; mapping it to 0 keeps the branch fail-closed anyway
     // rather than widening `Error` with a variant no caller can trigger.
     const chain_blocks = x509.pemBlockCount("CERTIFICATE", pem) catch 0;
-    if (chain_blocks == 0) return error.MalformedResponse;
+    if (chain_blocks == 0 or chain_blocks > max_chain_certs) return error.MalformedResponse;
     const not_after = x509.certNotAfter(c.gpa, pem) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedResponse,
@@ -1530,12 +1558,19 @@ fn writeFinalizePayload(js: *std.json.Stringify, csr_b64: []const u8) !void {
 }
 
 /// An `Order` owning a parse of `body`, at `url`.
-fn loadOrder(gpa: Allocator, url: []const u8, body: []const u8) Error!Order {
+/// RFC 8555 §7.1.3 gives an order one authorization per identifier, so the
+/// CA's `authorizations` (and `identifiers`) lists cannot be longer than the
+/// `max_identifiers` we ordered (a wildcard and its base name are two
+/// identifiers and two authorizations); more is `MalformedResponse`, before
+/// the client signs a request per entry.
+fn loadOrder(gpa: Allocator, url: []const u8, body: []const u8, max_identifiers: usize) Error!Order {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
     // `parseOrder`'s strings may point into the body it parsed: keep a copy.
     const info = try parseOrder(a, try a.dupe(u8, body));
+    if (info.authorizations.len > max_identifiers or info.identifiers.len > max_identifiers)
+        return error.MalformedResponse;
     // Allocate before the arena is copied into the result (see
     // `fetchAuthorization`).
     const url_copy = try a.dupe(u8, url);
@@ -1553,7 +1588,8 @@ fn loadOrder(gpa: Allocator, url: []const u8, body: []const u8) Error!Order {
 
 /// Refresh `order` from `body`; on error `order` is unchanged.
 fn replaceOrder(gpa: Allocator, order: *Order, body: []const u8) Error!void {
-    const fresh = try loadOrder(gpa, order.url, body);
+    // The refreshed order cannot grow past what it was created with.
+    const fresh = try loadOrder(gpa, order.url, body, @max(order.authorizations.len, order.identifiers.len));
     order.deinit();
     order.* = fresh;
 }
@@ -2040,6 +2076,7 @@ fn alternateLinks(a: Allocator, head: anytype) Allocator.Error![]const []const u
         if (!std.ascii.eqlIgnoreCase(h.name, "link")) continue;
         var rest = h.value;
         while (std.mem.findScalar(u8, rest, '<')) |lt| {
+            if (out.items.len >= max_alternate_chains) return out.toOwnedSlice(a);
             const gt = std.mem.findScalarPos(u8, rest, lt, '>') orelse break;
             const target = rest[lt + 1 .. gt];
             const params_end = std.mem.findScalarPos(u8, rest, gt, ',') orelse rest.len;
@@ -2984,6 +3021,10 @@ const MockCa = struct {
     /// The alternate chain: its status, and the `Link` target replacing `<cert>/alt`.
     alt_status: u16 = 200,
     alt_link: ?[]const u8 = null,
+    /// How many times the `rel="alternate"` link is repeated in the `Link` header.
+    alt_link_count: u32 = 1,
+    /// The default chain is served this many times over (2 certificates each).
+    chain_copies: u32 = 1,
     /// The `Accept` header of the last verified POST (`last_accept_seen` = present at all).
     last_accept: [64]u8 = undefined,
     last_accept_len: usize = 0,
@@ -3682,15 +3723,15 @@ fn mcCert(ctx: *router.Ctx) anyerror!void {
     try ctx.res.setHeader("Content-Type", "application/pem-certificate-chain");
     if (m.alt_chain) {
         // An unrelated relation first: only `rel="alternate"` is a chain.
-        var buf: [256]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         var target_buf: [128]u8 = undefined;
         const target = m.alt_link orelse try std.mem.print(&target_buf, "{s}/alt", .{m.cert_url});
-        const link = try std.mem.print(&buf, "<{s}>;rel=\"index\", <{s}>;rel=\"alternate\"", .{
-            m.dir_url, target,
-        });
-        try ctx.res.setHeader("Link", link);
+        var lw: std.Io.Writer = .fixed(&buf);
+        try lw.print("<{s}>;rel=\"index\"", .{m.dir_url});
+        for (0..m.alt_link_count) |_| try lw.print(", <{s}>;rel=\"alternate\"", .{target});
+        try ctx.res.setHeader("Link", lw.buffered());
     }
-    try ctx.res.writeAll(x509.test_cert_pem ++ x509.test_root_cert_pem);
+    for (0..m.chain_copies) |_| try ctx.res.writeAll(x509.test_cert_pem ++ x509.test_root_cert_pem);
 }
 
 /// The alternate chain: the leaf alone, so its topmost certificate's issuer
@@ -5982,6 +6023,111 @@ test "downloadChain: an alternate that cannot be fetched, or answers non-200, ke
     defer refused_alt.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 1), lab.mock.alt_fetches);
     try testing.expectEqualStrings(default_chain, refused_alt.chain_pem);
+}
+
+test "no-panic A-2: at most max_alternate_chains alternates are fetched; the default chain stays" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    lab.mock.alt_chain = true;
+    lab.mock.alt_link_count = 3 * max_alternate_chains;
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 120, &account_key);
+    defer c.deinit();
+    // Nothing matches: every alternate looked at is fetched, and no more than the cap.
+    var none = try c.obtainWith(&.{MockCa.domain}, .{ .preferred_chain = "Nobody Root X9" });
+    defer none.deinit(testing.allocator);
+    try testing.expectEqualStrings(x509.test_cert_pem ++ x509.test_root_cert_pem, none.chain_pem);
+    try testing.expectEqual(@as(u32, max_alternate_chains), lab.mock.alt_fetches);
+}
+
+test "no-panic A-1: an order with more authorizations than identifiers is malformed" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 121);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    // newOrder for one identifier, three authorization URLs back.
+    var b: [768]u8 = undefined;
+    const url = lab.mock.authz_url;
+    lab.mock.new_order_body = try std.mem.print(
+        &b,
+        "{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"{s}\"}}],\"authorizations\":[\"{s}\",\"{s}\",\"{s}\"],\"finalize\":\"{s}\"}}",
+        .{ MockCa.domain, url, url, url, lab.mock.finalize_url },
+    );
+    try testing.expectError(error.MalformedResponse, c.newOrder(&.{MockCa.domain}, .{}));
+
+    // A refresh cannot grow the order either.
+    lab.mock.new_order_body = null;
+    var order = try c.newOrder(&.{MockCa.domain}, .{});
+    defer order.deinit();
+    var b2: [768]u8 = undefined;
+    const grown = [_][]const u8{try std.mem.print(
+        &b2,
+        "{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"{s}\"}}],\"authorizations\":[\"{s}\",\"{s}\"],\"finalize\":\"{s}\"}}",
+        .{ MockCa.domain, url, url, lab.mock.finalize_url },
+    )};
+    lab.mock.order_script = &grown;
+    try testing.expectError(error.MalformedResponse, c.waitOrder(&order, .ready));
+    try testing.expectEqual(@as(usize, 1), order.authorizations.len); // unchanged
+}
+
+test "no-panic A-1: loadOrder allows one authorization per identifier, a wildcard and its base name included" {
+    const two = "{\"status\":\"pending\",\"identifiers\":[{\"type\":\"dns\",\"value\":\"*.x.example\"},{\"type\":\"dns\",\"value\":\"x.example\"}]," ++
+        "\"authorizations\":[\"https://ca/a/1\",\"https://ca/a/2\"],\"finalize\":\"https://ca/f\"}";
+    var ok = try loadOrder(testing.allocator, "https://ca/o/1", two, 2);
+    ok.deinit();
+    try testing.expectError(error.MalformedResponse, loadOrder(testing.allocator, "https://ca/o/1", two, 1));
+    const many_ids = "{\"status\":\"pending\",\"identifiers\":[{\"value\":\"a\"},{\"value\":\"b\"},{\"value\":\"c\"}],\"authorizations\":[],\"finalize\":\"f\"}";
+    try testing.expectError(error.MalformedResponse, loadOrder(testing.allocator, "https://ca/o/1", many_ids, 2));
+}
+
+test "no-panic A-10: a chain of more than max_chain_certs certificates is malformed" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var zone: TestZone = .{};
+    var account_key: jws.KeyPair = undefined;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = try w1Client(&lab, &zone, 122, &account_key);
+    defer c.deinit();
+    lab.mock.chain_copies = max_chain_certs / 2; // exactly the limit
+    var at_limit = try c.obtain(&.{MockCa.domain});
+    at_limit.deinit(testing.allocator);
+    lab.mock.chain_copies = max_chain_certs / 2 + 1; // one pair over
+    try testing.expectError(error.MalformedResponse, c.obtain(&.{MockCa.domain}));
+}
+
+test "no-panic A-4: pickTime is total on any i64 window and stays inside it" {
+    var prng = std.Random.DefaultPrng.init(5);
+    const min = std.math.minInt(i64);
+    const max = std.math.maxInt(i64);
+    const windows = [_][2]i64{
+        .{ min, max }, // the span is 2^64 - 1
+        .{ min, 0 },
+        .{ -1, max },
+        .{ max - 1, max },
+        .{ 100, 200 },
+        .{ 7, 7 },
+        .{ 200, 100 }, // inverted: the start
+        .{ max, min },
+    };
+    for (windows) |w| {
+        const info: RenewalInfo = .{ .window_start = w[0], .window_end = w[1], .explanation_url = null, .retry_after_s = null };
+        for (0..64) |_| {
+            const got = info.pickTime(prng.random());
+            if (w[1] <= w[0]) {
+                try testing.expectEqual(w[0], got);
+            } else {
+                try testing.expect(got >= w[0] and got <= w[1]);
+            }
+        }
+    }
 }
 
 test "waitOrder: max_polls polls exactly; ready is not valid; an unknown status is malformed; invalid names the CA's reason" {

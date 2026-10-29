@@ -109,11 +109,13 @@ pub const Options = struct {
     /// How often to re-ask for the ARI window when the CA sends no
     /// `Retry-After` (RFC 9773 §4.3 suggests six hours).
     ari_poll_s: u32 = 6 * 3600,
-    /// Ceiling of the failure back-off (1 min, 2 min, 4 min, …).
+    /// Ceiling of the failure back-off (1 min, 2 min, 4 min, …). Floored to
+    /// 1 s (0 would retry in a busy loop against the CA).
     max_backoff_s: u32 = 6 * 3600,
     /// How long one node's issuance lock lasts; longer than any issuance.
     lock_lease_s: u32 = 15 * 60,
     /// How soon to look again while another node holds the issuance lock.
+    /// Floored to 1 s (0 would poll the storage in a busy loop).
     lock_poll_s: u32 = 60,
     /// This node's lock-owner name (1..32 of `[A-Za-z0-9._@+-]`, else `init`
     /// panics); null: a random one per `Manager`. Must be unique per node:
@@ -565,18 +567,25 @@ fn nextDue(m: *Manager) i64 {
     // A failed on-demand name is kept only for its back-off (to refuse fast);
     // after that it is forgotten, and the next handshake goes through the
     // policy and the rate limit again. Keeps the set bounded.
+    m.sweepIdleOnDemandLocked(t);
+    var next: i64 = std.math.maxInt(i64);
+    for (m.entries.items) |e| if (!e.busy and !idleOnDemand(e)) {
+        next = @min(next, e.dueAt());
+    };
+    // Nothing managed (or all busy elsewhere): look again in an hour.
+    return if (next == std.math.maxInt(i64)) t +| 3600 else next;
+}
+
+/// Forget the failed on-demand entries whose back-off is over (lock held).
+/// `nextDue` runs it, and so does `certificate` before it adds an entry, so
+/// a server that never calls `maintain`/`run` keeps the set bounded too.
+fn sweepIdleOnDemandLocked(m: *Manager, t: i64) void {
     var i = m.entries.items.len;
     while (i > 0) {
         i -= 1;
         const e = m.entries.items[i];
         if (!e.busy and idleOnDemand(e) and t >= e.retry_at) m.dropEntryLocked(e);
     }
-    var next: i64 = std.math.maxInt(i64);
-    for (m.entries.items) |e| if (!e.busy and !idleOnDemand(e)) {
-        next = @min(next, e.dueAt());
-    };
-    // Nothing managed (or all busy elsewhere): look again in an hour.
-    return if (next == std.math.maxInt(i64)) t + 3600 else next;
 }
 
 /// `maintain` forever, sleeping in between (at most an hour at a time, so
@@ -585,7 +594,7 @@ pub fn run(m: *Manager) error{Canceled}!void {
     while (true) {
         m.wake.store(false, .release);
         const next = m.maintain();
-        var wait_s = std.math.clamp(next - m.now(), 0, 3600);
+        var wait_s = std.math.clamp(next -| m.now(), 0, 3600);
         // In one-second steps, so a `manage` or `addIssuer` meanwhile is
         // served within a second rather than at the next due time.
         while (wait_s > 0 and !m.wake.load(.acquire)) : (wait_s -= 1) {
@@ -631,7 +640,7 @@ fn obtain(m: *Manager, e: *Entry, t: i64) void {
     if (!locked) {
         // Another node is issuing; its result lands in storage.
         m.mutex.lockUncancelable(m.io);
-        e.retry_at = t + m.options.lock_poll_s;
+        e.retry_at = t +| @max(m.options.lock_poll_s, 1);
         m.mutex.unlock(m.io);
         return;
     }
@@ -802,7 +811,7 @@ fn ratioRenewAt(not_before: i64, not_after: i64, pct: u8) i64 {
 /// Back-off after `failures` failures: 1 min doubling, capped.
 fn backoffS(failures: u32, cap: u32) i64 {
     const shift: u6 = @intCast(@min(failures -| 1, 20));
-    return @min(@as(i64, 60) << shift, cap);
+    return @min(@as(i64, 60) << shift, @max(cap, 1));
 }
 
 /// Record a failed attempt and schedule the next one from the current time
@@ -823,15 +832,15 @@ fn failed(m: *Manager, e: *Entry, d: *const Diagnostics, fallback: []const u8) v
         wait = @max(wait, @as(i64, @intCast(@min(ra, 365 * std.time.s_per_day))));
         floor = @intCast(@min(ra, std.time.s_per_day));
     }
-    e.retry_at = t + wait;
+    e.retry_at = t +| wait;
     // A valid certificate is retried before it expires, whatever the CA's
     // Retry-After said — but only while that can still help: the cap is the
     // later of "the back-off, at most ten minutes" and "an hour before the
     // end", so an expired certificate keeps the exponential back-off instead
     // of a retry every minute. The Retry-After floor holds even then.
     if (e.cert) |ct| {
-        const cap = @max(t + @min(plain_wait, 600), ct.not_after - 3600);
-        e.retry_at = @max(@min(e.retry_at, cap), t + floor);
+        const cap = @max(t +| @min(plain_wait, 600), ct.not_after - 3600);
+        e.retry_at = @max(@min(e.retry_at, cap), t +| floor);
     }
     const retry_at = e.retry_at;
     const removed = e.removed;
@@ -887,7 +896,7 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
             e.renew_at = std.math.clamp(info.pickTime(m.prng.random()), floor, @max(floor, ct.not_after - 3600));
         }
         const poll: i64 = if (w.retry_after_s) |ra| @intCast(@min(ra, 7 * std.time.s_per_day)) else m.options.ari_poll_s;
-        e.ari_at = t + @max(poll, 60);
+        e.ari_at = t +| @max(poll, 60);
         return;
     }
     m.mutex.lockUncancelable(m.io);
@@ -897,7 +906,7 @@ fn pollAri(m: *Manager, e: *Entry, t: i64) void {
     } else {
         // As on success: the CA's Retry-After (at most a week), a minute at least.
         const poll: i64 = if (retry_after) |ra| @intCast(@min(ra, 7 * std.time.s_per_day)) else m.options.ari_poll_s;
-        e.ari_at = t + @max(poll, 60);
+        e.ari_at = t +| @max(poll, 60);
     }
 }
 
@@ -915,7 +924,13 @@ fn emit(m: *Manager, event: *const Event) void {
 /// obtained now — the call then blocks for the issuance, and concurrent
 /// calls for the same name wait for the same result, at most
 /// `OnDemand.wait_ms` (then they get null) — so a call can block up to that
-/// long, or for the whole issuance when it is the one that started it. (Two allocations per
+/// long, or for the whole issuance when it is the one that started it. A name
+/// whose issuance failed is remembered for its back-off only; every new
+/// on-demand name drops the expired failed ones first, so the set stays
+/// bounded without `maintain`. The whole issuance (key generation, signing,
+/// CSR; `burn` scrubs 8-32 KiB of stack per step) runs on the calling thread:
+/// give a handshake worker at least 128 KiB of stack (an estimate from the
+/// scrub sizes, measured: no). (Two allocations per
 /// call; a server with a certificate store of its own installs from
 /// `Options.on_event` instead and asks here only for on-demand names.)
 pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemory}!?Material {
@@ -970,6 +985,9 @@ pub fn certificate(m: *Manager, gpa: Allocator, sni: []const u8) error{OutOfMemo
     if (!od.allow(od.ctx, name)) return null;
 
     m.mutex.lockUncancelable(m.io);
+    // A server that never runs `maintain` must not accumulate failed names
+    // (one entry per distinct SNI the policy lets through).
+    m.sweepIdleOnDemandLocked(t);
     const allowed = m.limiter.take(t, od.rate);
     m.mutex.unlock(m.io);
     if (!allowed) return null;
@@ -1243,7 +1261,7 @@ pub fn checkPair(
     if (t >= na) return error.Expired;
     // A certificate that starts more than a day ahead of our clock is not
     // one to serve (a little skew is tolerated, see below).
-    if (nb - t > std.time.s_per_day) return error.Expired;
+    if (nb -| t > std.time.s_per_day) return error.Expired;
 
     // A fresh certificate may start a little in the future (clock skew; CAs
     // backdate, not all of them): judge the chain from its own start then.
@@ -1266,7 +1284,8 @@ pub fn checkPair(
     return .{ .not_before = nb, .not_after = na };
 }
 
-/// Every CERTIFICATE block of a PEM text, decoded (arena-owned).
+/// Every CERTIFICATE block of a PEM text, decoded (arena-owned); more than
+/// `Client.max_chain_certs` is `MalformedChain`.
 fn splitPemChain(arena: Allocator, text: []const u8) CheckError![]const []const u8 {
     var list: std.ArrayList([]const u8) = .empty;
     const end_marker = "-----END CERTIFICATE-----";
@@ -1278,6 +1297,8 @@ fn splitPemChain(arena: Allocator, text: []const u8) CheckError![]const []const 
             error.OutOfMemory => return error.OutOfMemory,
             else => return error.MalformedChain,
         };
+        // A hostile CA could hand over thousands of blocks; public chains have 2-4.
+        if (list.items.len >= Client.max_chain_certs) return error.MalformedChain;
         try list.append(arena, der);
         rest = rest[begin + end_rel + end_marker.len ..];
     }
@@ -1501,7 +1522,7 @@ const RateLimiter = struct {
         if (max == 0) return false;
         // The slot we would overwrite holds the max-th most recent event.
         const slot = r.next % max;
-        if (r.ring[slot] != std.math.minInt(i64) and t - r.ring[slot] < rate.window_s) return false;
+        if (r.ring[slot] != std.math.minInt(i64) and t -| r.ring[slot] < rate.window_s) return false;
         r.ring[slot] = t;
         r.next = @intCast((slot + 1) % max);
         return true;
