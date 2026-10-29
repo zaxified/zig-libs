@@ -548,6 +548,16 @@ const Builder = struct {
         try b.append(path, code, try b.a().print(fmt, args));
     }
 
+    /// The `enum` error, its message joined from the allow-list. Once the
+    /// list is full the join is never built: it is the size of the whole
+    /// allow-list, per failing value, and was formatted and dropped for every
+    /// value past the cap (sweep V-2).
+    fn appendEnumError(b: *Builder, path: []const u8, allowed: []const []const u8) Allocator.Error!void {
+        if (b.full()) return;
+        const joined = try std.mem.join(b.a(), ", ", allowed);
+        try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
+    }
+
     fn fieldPath(b: *Builder, prefix: []const u8, field: []const u8) Allocator.Error![]const u8 {
         if (prefix.len == 0) return field; // borrows the schema's string
         return b.a().print("{s}.{s}", .{ prefix, field });
@@ -824,8 +834,13 @@ fn checkValue(b: *Builder, prefix: []const u8, value: Value, rules: []const Rule
         return;
     }
     for (rules) |*rule| {
-        const path = try b.fieldPath(prefix, rule.field);
         const got = value.object.get(rule.field);
+        // An absent field that nothing asks about needs no path. It used to
+        // be rendered into the report arena for every rule of every object,
+        // valid document or not: R optional fields over N small objects
+        // cost N * R path strings (sweep V-1).
+        if (got == null and !rule.required and rule.cross.len == 0) continue;
+        const path = try b.fieldPath(prefix, rule.field);
         if (got) |v| {
             try checkRule(b, path, v, rule);
         } else if (rule.required) {
@@ -1212,8 +1227,7 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
             // while the schema it exported listed the entries as strings and
             // so refused every number.
             if (rule.one_of) |allowed| if (rule.kind != .any and numValue(v) != null and !oneOfNumber(allowed, v)) {
-                const joined = try std.mem.join(b.a(), ", ", allowed);
-                try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
+                try b.appendEnumError(path, allowed);
             };
         },
         .string => {
@@ -1238,10 +1252,7 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
             if (rule.max_bytes) |m| if (s.len > m)
                 try b.appendf(path, "string_bytes_too_long", "String should have at most {d} bytes", .{m});
             if (rule.one_of) |allowed| {
-                if (!containsString(allowed, s)) {
-                    const joined = try std.mem.join(b.a(), ", ", allowed);
-                    try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
-                }
+                if (!containsString(allowed, s)) try b.appendEnumError(path, allowed);
             }
             if (rule.pattern) |p| try checkPattern(b, path, s, p);
             if (rule.format) |f| if (!validateFormat(f, s))
@@ -1253,8 +1264,15 @@ fn checkRule(b: *Builder, path: []const u8, v: Value, rule: *const Rule) Allocat
                 try b.appendf(path, "too_short", "Array should have at least {d} items", .{m});
             if (rule.max_len) |m| if (items.len > m)
                 try b.appendf(path, "too_long", "Array should have at most {d} items", .{m});
-            if (rule.unique) if (try firstDuplicate(b.a(), items)) |d|
-                try b.appendf(path, "unique_items", "Array items should be unique (items {d} and {d} are equal)", .{ d[0], d[1] });
+            if (rule.unique and !b.full()) {
+                // The hashes and sort buffer are scratch: in the report arena
+                // they stayed until `deinit`, once per `unique` array and per
+                // nesting level of them (sweep V-3).
+                var tmp = std.heap.ArenaAllocator.init(b.arena.child_allocator);
+                defer tmp.deinit();
+                if (try firstDuplicate(tmp.allocator(), items)) |d|
+                    try b.appendf(path, "unique_items", "Array items should be unique (items {d} and {d} are equal)", .{ d[0], d[1] });
+            }
             if (rule.items) |item_rule| {
                 for (items, 0..) |item, i| {
                     try checkRule(b, try b.indexPath(path, i), item, item_rule);
@@ -1352,10 +1370,7 @@ fn constrainsNonStrings(rule: *const Rule) bool {
 /// while the schema the module exports for the same rule refused them all
 /// (python-jsonschema and ajv, `schema_oracle_test.zig`, 2026-10-05).
 fn checkNotAString(b: *Builder, path: []const u8, rule: *const Rule) Allocator.Error!void {
-    if (rule.one_of) |allowed| {
-        const joined = try std.mem.join(b.a(), ", ", allowed);
-        try b.appendf(path, "enum", "Input should be one of: {s}", .{joined});
-    }
+    if (rule.one_of) |allowed| try b.appendEnumError(path, allowed);
     if (rule.pattern) |p| if (p == .literal)
         try b.appendf(path, "string_pattern_mismatch", "String should be \"{s}\"", .{p.literal});
 }
@@ -2629,6 +2644,75 @@ pub fn ParseResult(comptime T: type) type {
     };
 }
 
+/// Does `T` hold an integer of at least `min_bits` bits anywhere a JSON number
+/// can land (struct members, optionals, slices, arrays)?
+fn wideInt(comptime T: type, comptime min_bits: u16) bool {
+    comptime {
+        @setEvalBranchQuota(100_000);
+        switch (@typeInfo(T)) {
+            .int => |i| return i.bits >= min_bits,
+            .optional => |o| return wideInt(o.child, min_bits),
+            .pointer => |p| return p.size == .slice and p.child != u8 and wideInt(p.child, min_bits),
+            .array => |a| return a.child != u8 and wideInt(a.child, min_bits),
+            .@"struct" => |st| {
+                if (st.is_tuple or std.meta.hasFn(T, "jsonParse")) return false;
+                for (st.field_types) |ft| if (wideInt(ft, min_bits)) return true;
+                return false;
+            },
+            else => return false,
+        }
+    }
+}
+
+/// May the float `f` become a `T`? It must be integral and inside the type,
+/// compared against the exact powers of two with an EXCLUSIVE upper end
+/// (`@floatFromInt(maxInt(T))` rounds up to 2^bits, and `@intFromFloat` of
+/// that is a safety panic in std's decoder). A 128-bit type stops at 2^127,
+/// which is as far as std's token path (it goes through `i128`) can convert.
+fn floatFitsInt(comptime T: type, f: f64) bool {
+    const info = @typeInfo(T).int;
+    if (!std.math.isFinite(f) or @floor(f) != f) return false;
+    const hi_exp: i32 = if (info.signedness == .signed) @as(i32, info.bits) - 1 else @min(@as(i32, info.bits), 127);
+    const hi = std.math.ldexp(@as(f64, 1), hi_exp);
+    const lo: f64 = if (info.signedness == .signed) -hi else 0;
+    return f >= lo and f < hi;
+}
+
+/// Every float-spelled number `v` holds for an integer of `T` (see
+/// `floatFitsInt`); false when one cannot be decoded.
+fn intEdgesOk(comptime T: type, v: Value) bool {
+    switch (@typeInfo(T)) {
+        .int => return switch (v) {
+            .float => |f| floatFitsInt(T, f),
+            else => true,
+        },
+        .optional => |o| return v == .null or intEdgesOk(o.child, v),
+        .pointer, .array => {
+            const E = if (@typeInfo(T) == .pointer) @typeInfo(T).pointer.child else @typeInfo(T).array.child;
+            if (E == u8 or v != .array) return true;
+            for (v.array.items) |item| if (!intEdgesOk(E, item)) return false;
+            return true;
+        },
+        .@"struct" => |st| {
+            if (v != .object or st.is_tuple or std.meta.hasFn(T, "jsonParse")) return true;
+            inline for (st.field_names, st.field_types) |name, ft| {
+                if (comptime wideInt(ft, 54)) {
+                    if (v.object.get(name)) |fv| if (!intEdgesOk(ft, fv)) return false;
+                }
+            }
+            return true;
+        },
+        else => return true,
+    }
+}
+
+/// `std.json.parseFromValue`, except that a float-spelled integer std would
+/// panic on (`@intFromFloat` past the type, sweep V-5) is `error.Overflow`.
+fn parseValueGuarded(comptime T: type, gpa: Allocator, v: Value) !std.json.Parsed(T) {
+    if (comptime wideInt(T, 54)) if (!intEdgesOk(T, v)) return error.Overflow;
+    return std.json.parseFromValue(T, gpa, v, .{ .ignore_unknown_fields = true });
+}
+
 /// The typed body style: parse `body` as JSON, validate it against the
 /// schema derived from `T` (see `rulesFor`) — plus `T.validate_rules`
 /// (`pub const validate_rules: []const validate.Rule`) when declared, for
@@ -2636,6 +2720,12 @@ pub fn ParseResult(comptime T: type) type {
 /// and decode into `T`. JSON type errors come back as pathed validation
 /// errors, never as parse crashes; unknown fields are ignored (JSON Schema
 /// default). Only allocation errors propagate as Zig errors.
+///
+/// A float-spelled integer (`9.3e18`) for an integer member is accepted only
+/// when it is integral and inside the type, below the exact power of two
+/// (std's decoder panics on `2^63` for an `i64`); for 128-bit members only
+/// below 2^127, the same on `parseIntoLeaky`. Integer-spelled values are
+/// unaffected. A refused one answers `invalid` ("could not be decoded").
 pub fn parseInto(comptime T: type, gpa: Allocator, body: []const u8) Allocator.Error!ParseResult(T) {
     return parseIntoLimited(T, gpa, body, .{});
 }
@@ -2676,9 +2766,7 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
         b.abort();
     }
 
-    const typed = std.json.parseFromValue(T, gpa, parsed.value, .{
-        .ignore_unknown_fields = true,
-    }) catch |err| switch (err) {
+    const typed = parseValueGuarded(T, gpa, parsed.value) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Defensive: validation passed but the decode still refused (e.g. an
         // i64/u64 field outside the f64-expressible bounds the derived schema
@@ -2859,10 +2947,15 @@ pub fn LeakyResult(comptime T: type) type {
 /// `Leaky` convention of `std.json`). Errors come in document order.
 pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
     const extra: []const Rule = comptime typedExtra(T);
-    if (comptime compiles(T, rootActives(T))) {
-        if (try parseCompiled(T, arena, body, limits)) |r| return r;
+    // A 128-bit member: std's token decoder panics on a float-spelled value
+    // past `i128` (sweep V-5), so such a `T` takes the multi-pass path, which
+    // decodes it through the checked `Value` route.
+    if (comptime !wideInt(T, 113)) {
+        if (comptime compiles(T, rootActives(T))) {
+            if (try parseCompiled(T, arena, body, limits)) |r| return r;
+        }
+        if (try parseOnePass(T, arena, body, limits, extra)) |r| return r;
     }
-    if (try parseOnePass(T, arena, body, limits, extra)) |r| return r;
     return parseMultiPass(T, arena, body, limits, extra);
 }
 
@@ -2903,6 +2996,19 @@ fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Li
     return .{ .ok = value };
 }
 
+fn decodeLeaky(comptime T: type, arena: Allocator, body: []const u8) !T {
+    if (comptime wideInt(T, 113)) {
+        const tree = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+        if (!intEdgesOk(T, tree)) return error.Overflow;
+        return std.json.parseFromValueLeaky(T, arena, tree, .{ .ignore_unknown_fields = true });
+    }
+    return std.json.parseFromSliceLeaky(T, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+        .max_value_len = body.len,
+    });
+}
+
 /// Limits, then the streaming validation, then the decode: three
 /// tokenizations. The path every document took before `parseOnePass`, kept
 /// for the ones it hands back, so an invalid document is reported exactly
@@ -2913,11 +3019,7 @@ fn parseMultiPass(comptime T: type, arena: Allocator, body: []const u8, limits: 
         if (!report.ok()) return .{ .invalid = report };
         report.deinit();
     }
-    const value = std.json.parseFromSliceLeaky(T, arena, body, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_if_needed,
-        .max_value_len = body.len,
-    }) catch |err| switch (err) {
+    const value = decodeLeaky(T, arena, body) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Defensive, as in `parseIntoLimited`: valid against the schema, yet
         // the decode refused (a 64-bit integer past what f64 bounds express).
@@ -4554,7 +4656,25 @@ fn firstRequiredIndexOf(rules: []const Rule, field: []const u8) usize {
     unreachable;
 }
 
+/// How deep the exported document may nest before a rule is cut off. The
+/// output's own limit is `std.json.Stringify`'s 256 levels (a safe build
+/// asserts past it), and one rule level adds at most 4 before the next check,
+/// so a rule starting past 252 is not written.
+// Stringify asserts past 256 open levels; a rule step can open up to 4
+// (dup-field hop), so stop with room to spare (review GJ F3).
+const max_schema_nesting = 240;
+
 fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!void {
+    // A rule graph that loops back on itself (`.items = &self`) or is nested
+    // past the output's limit: write the cut-off as a schema that says so,
+    // never recurse without end (sweep V-4). The schema is looser there,
+    // never stricter, like the byte bounds below.
+    if (s.indent_level > max_schema_nesting) {
+        try s.beginObject();
+        try s.objectField("x-truncated");
+        try s.write("rule nesting too deep to export");
+        return s.endObject();
+    }
     try s.beginObject();
     const type_name: ?[]const u8 = switch (r.kind) {
         .string => "string",
@@ -9791,4 +9911,173 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+// ── sweep GJ (no-panic sweep, 2026-10-29) ───────────────────────────────────
+
+/// Bytes the arena of a finished report holds (the capacity it grew to).
+fn reportBytes(r: *const Report) usize {
+    return r.arena.queryCapacity();
+}
+
+test "absent optional fields cost the report arena no path strings (sweep V-1)" {
+    const field_rules = comptime blk: {
+        var r: [40]Rule = undefined;
+        for (&r, 0..) |*x, i| x.* = .{ .field = std.fmt.comptimePrint("field_number_{d}", .{i}), .kind = .string };
+        break :blk r;
+    };
+    const item: Rule = .{ .field = "", .kind = .object, .fields = &field_rules };
+    const schema = [_]Rule{.{ .field = "xs", .kind = .array, .items = &item }};
+
+    var body: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"xs\":[");
+    for (0..5000) |i| try body.writer.writeAll(if (i == 0) "{}" else ",{}");
+    try body.writer.writeAll("]}");
+
+    // 5000 objects x 40 absent fields: 200 000 paths of ~25 bytes (5 MB)
+    // before; the 5000 element paths alone (~60 KB) after.
+    var r = try validateJson(testing.allocator, body.written(), &schema);
+    defer r.deinit();
+    try testing.expect(r.ok());
+    try testing.expect(reportBytes(&r) < 256 * 1024);
+}
+
+test "an enum error past the cap does not join the allow-list (sweep V-2)" {
+    const allowed = comptime blk: {
+        @setEvalBranchQuota(100_000);
+        var a: [100][]const u8 = undefined;
+        for (&a, 0..) |*x, i| x.* = std.fmt.comptimePrint("allowed-value-{d:0>4}", .{i});
+        break :blk a;
+    };
+    var strings: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer strings.deinit();
+    var numbers: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer numbers.deinit();
+    try strings.writer.writeAll("{\"xs\":[");
+    try numbers.writer.writeAll("{\"xs\":[");
+    for (0..5000) |i| {
+        try strings.writer.writeAll(if (i == 0) "\"zz\"" else ",\"zz\"");
+        try numbers.writer.writeAll(if (i == 0) "7" else ",7");
+    }
+    try strings.writer.writeAll("]}");
+    try numbers.writer.writeAll("]}");
+
+    // Each join is ~2 KB; 5000 of them are 10 MB, the one that is kept is not.
+    const limits: Limits = .{ .max_errors = 1 };
+    const kinds = [_]Kind{ .string, .int, .any };
+    for (kinds) |k| {
+        const item: Rule = .{ .field = "", .kind = k, .one_of = &allowed };
+        const schema = [_]Rule{.{ .field = "xs", .kind = .array, .items = &item }};
+        const body = if (k == .string) strings.written() else numbers.written();
+        var r = try validateJsonLimited(testing.allocator, body, &schema, limits);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 1), r.errors.len);
+        try testing.expectEqualStrings("enum", r.errors[0].code);
+        try testing.expect(reportBytes(&r) < 256 * 1024);
+    }
+}
+
+test "unique: the hash scratch is not kept in the report (sweep V-3)" {
+    const schema = [_]Rule{.{ .field = "xs", .kind = .array, .unique = true }};
+    var body: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer body.deinit();
+    try body.writer.writeAll("{\"xs\":[");
+    for (0..5000) |i| try body.writer.print("{s}{{\"a\":{d}}}", .{ if (i == 0) "" else ",", i });
+    try body.writer.writeAll("]}");
+
+    // 5000 hashed objects: a 32-byte sort entry and a member list each, 240 KB.
+    var r = try validateJson(testing.allocator, body.written(), &schema);
+    defer r.deinit();
+    try testing.expect(r.ok());
+    try testing.expect(reportBytes(&r) < 32 * 1024);
+}
+
+const cyclic_items: Rule = .{ .field = "", .kind = .array, .items = &cyclic_items };
+const cyclic_fields: [1]Rule = .{.{ .field = "next", .kind = .object, .fields = &cyclic_fields }};
+
+test "exporting a rule graph that loops back on itself terminates (sweep V-4)" {
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try writeJsonSchemaRoot(&cyclic_items, &w.writer);
+    try testing.expect(std.mem.find(u8, w.written(), "x-truncated") != null);
+
+    var w2: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w2.deinit();
+    try writeJsonSchema(&cyclic_fields, &w2.writer);
+    try testing.expect(std.mem.find(u8, w2.written(), "x-truncated") != null);
+
+    // A rule set nested within the limit is written whole.
+    const leaf: Rule = .{ .field = "", .kind = .string };
+    const mid: Rule = .{ .field = "", .kind = .array, .items = &leaf };
+    var w3: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w3.deinit();
+    try writeJsonSchemaRoot(&mid, &w3.writer);
+    try testing.expect(std.mem.find(u8, w3.written(), "x-truncated") == null);
+}
+
+test "a float-spelled integer at the edge of a wide int is refused, not decoded by std's panic (sweep V-5)" {
+    const arena_t = std.heap.ArenaAllocator;
+    // i64: 2^63-1024 is the largest f64 below 2^63; 2^63 used to panic.
+    const I = struct { n: i64 };
+    inline for (.{
+        .{ "{\"n\":9.223372036854774784e18}", true },
+        .{ "{\"n\":9.223372036854775808e18}", false },
+        .{ "{\"n\":-9.223372036854775808e18}", true },
+        .{ "{\"n\":-9.223372036854777856e18}", false },
+        .{ "{\"n\":9223372036854775807}", true },
+    }) |c| {
+        var r = try parseInto(I, testing.allocator, c[0]);
+        defer r.deinit();
+        try testing.expectEqual(c[1], r == .ok);
+        var ar = arena_t.init(testing.allocator);
+        defer ar.deinit();
+        const l = try parseIntoLeaky(I, ar.allocator(), c[0], .{});
+        try testing.expectEqual(c[1], l == .ok);
+    }
+    const U = struct { n: u64 };
+    inline for (.{
+        .{ "{\"n\":1.8446744073709549568e19}", true },
+        .{ "{\"n\":1.8446744073709551616e19}", false },
+        .{ "{\"n\":18446744073709551615}", true },
+    }) |c| {
+        var r = try parseInto(U, testing.allocator, c[0]);
+        defer r.deinit();
+        try testing.expectEqual(c[1], r == .ok);
+        var ar = arena_t.init(testing.allocator);
+        defer ar.deinit();
+        const l = try parseIntoLeaky(U, ar.allocator(), c[0], .{});
+        try testing.expectEqual(c[1], l == .ok);
+    }
+    // 128 bits: both entry points agree; below 2^127 decodes, from there on it is refused.
+    // u113..u126 bound at 2^N, not 2^127 (review GJ F2).
+    const V = struct { n: u120 };
+    inline for (.{
+        .{ "{\"n\":1.329227995784915872903807060280344576e36}", false }, // 2^120
+        .{ "{\"n\":1.3292279957849157e36}", true }, // largest f64 below 2^120
+    }) |c| {
+        var r = try parseInto(V, testing.allocator, c[0]);
+        defer r.deinit();
+        try testing.expectEqual(c[1], r == .ok);
+        var ar = arena_t.init(testing.allocator);
+        defer ar.deinit();
+        const l = try parseIntoLeaky(V, ar.allocator(), c[0], .{});
+        try testing.expectEqual(c[1], l == .ok);
+    }
+    const W = struct { n: u128, m: ?[]const i128 = null };
+    inline for (.{
+        .{ "{\"n\":1e38}", true },
+        .{ "{\"n\":2e38}", false },
+        .{ "{\"n\":340282366920938463463374607431768211455}", true },
+        .{ "{\"n\":1,\"m\":[1.7014118346046923e38]}", false },
+        .{ "{\"n\":1,\"m\":[-1.7014118346046923e38]}", true },
+    }) |c| {
+        var r = try parseInto(W, testing.allocator, c[0]);
+        defer r.deinit();
+        try testing.expectEqual(c[1], r == .ok);
+        var ar = arena_t.init(testing.allocator);
+        defer ar.deinit();
+        const l = try parseIntoLeaky(W, ar.allocator(), c[0], .{});
+        try testing.expectEqual(c[1], l == .ok);
+    }
 }
