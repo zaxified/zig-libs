@@ -159,7 +159,8 @@ pub fn epochDayToYmd(epoch_day: i64) DateParts {
 
 /// ISO weekday: Monday=1 … Sunday=7. 1970-01-01 (epoch day 0) was Thursday=4.
 pub fn isoWeekday(epoch_day: i64) u32 {
-    return @intCast(@mod(epoch_day + 3, 7) + 1);
+    // `@mod` first: `epoch_day + 3` overflows for epoch_day within 3 of maxInt(i64) (sweep DF-2).
+    return @intCast(@mod(@mod(epoch_day, 7) + 3, 7) + 1);
 }
 
 /// ISO 8601 week date of a civil day: the week-year (the year owning the
@@ -176,7 +177,9 @@ pub fn isoWeek(parts: DateParts) IsoWeek {
     // The Thursday of the same ISO week decides the week-year.
     const thursday = day - @as(i64, isoWeekday(day)) + 4;
     const ty = epochDayToYmd(thursday).year;
-    const week: u32 = @intCast(@divFloor(thursday - ymdToEpochDay(ty, 1, 1), 7) + 1);
+    // `ty` saturates at the i32 range, so for a year near the edge combined with an
+    // out-of-range month/day the quotient leaves u32 (or goes negative): clamp (sweep DF-1).
+    const week: u32 = @intCast(std.math.clamp(@divFloor(thursday - ymdToEpochDay(ty, 1, 1), 7) + 1, 0, std.math.maxInt(u32)));
     return .{ .year = ty, .week = week };
 }
 
@@ -1127,8 +1130,9 @@ pub fn diffInMonths(a: DateParts, b: DateParts) i32 {
     return @intCast(std.math.clamp(d, std.math.minInt(i32), std.math.maxInt(i32)));
 }
 
+/// Saturates at the i32 range, like `diffInMonths`.
 pub fn diffInYears(a: DateParts, b: DateParts) i32 {
-    return a.year - b.year;
+    return a.year -| b.year;
 }
 
 pub fn startOfDay(parts: DateParts) DateParts {
@@ -2951,4 +2955,28 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test "isoWeekday accepts every i64 epoch day (sweep DF-2)" {
+    try testing.expectEqual(isoWeekday(std.math.maxInt(i64) - 6), isoWeekday(std.math.maxInt(i64) - 6 - 7 * 1000));
+    try testing.expect(isoWeekday(std.math.maxInt(i64)) >= 1 and isoWeekday(std.math.maxInt(i64)) <= 7);
+    try testing.expect(isoWeekday(std.math.minInt(i64)) >= 1 and isoWeekday(std.math.minInt(i64)) <= 7);
+    // maxInt(i64) = 9223372036854775807 = 7 * 1317624576693539401 + 0, so it is day 0 mod 7 = Thursday-aligned like epoch day 0.
+    try testing.expectEqual(isoWeekday(0), isoWeekday(std.math.maxInt(i64)));
+}
+
+test "isoWeek with the year at the i32 edge and an out-of-range month does not trap (sweep DF-1)" {
+    const w = isoWeek(.{ .year = std.math.maxInt(i32), .month = std.math.maxInt(u32), .day = 1 });
+    try testing.expect(w.week > 0);
+    const lo = isoWeek(.{ .year = std.math.minInt(i32), .month = 1, .day = 1 });
+    try testing.expect(lo.week <= 53);
+    // And through format.
+    const s = try format(testing.allocator, .{ .year = std.math.maxInt(i32), .month = std.math.maxInt(u32), .day = std.math.maxInt(u32) }, "GGGG-[W]WW");
+    testing.allocator.free(s);
+}
+
+test "diffInYears saturates instead of overflowing (sweep DF-3)" {
+    try testing.expectEqual(@as(i32, std.math.maxInt(i32)), diffInYears(.{ .year = std.math.maxInt(i32) }, .{ .year = -5 }));
+    try testing.expectEqual(@as(i32, std.math.minInt(i32)), diffInYears(.{ .year = std.math.minInt(i32) }, .{ .year = 5 }));
+    try testing.expectEqual(@as(i32, 3), diffInYears(.{ .year = 2026 }, .{ .year = 2023 }));
 }
