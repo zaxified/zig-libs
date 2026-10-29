@@ -43,6 +43,11 @@ const std = @import("std");
 /// One targeted quantile: `quantile` in [0, 1] with an allowed absolute rank
 /// error `epsilon` in [0, 1) (the reported value is the φ-quantile for some
 /// φ in `quantile ± epsilon`).
+///
+/// ⚠ `epsilon = 0` (or a vanishingly small one) disables the CKMS compression:
+/// the stream then keeps EVERY observation of the window, so memory and the
+/// per-insert cost grow with the observation rate. Use a real tolerance
+/// (0.001 and up) for series fed from request traffic.
 pub const Objective = struct { quantile: f64, epsilon: f64 };
 
 pub const Options = struct {
@@ -281,9 +286,9 @@ pub const Summary = struct {
 
     /// Cumulative count and sum, and the window's quantiles:
     /// `out_quantiles[i]` is the value for `objectives[i]`, NaN when the
-    /// window holds no observation. Rotates the window to `now_ns`.
+    /// window holds no observation. Rotates the window to `now_ns`. A short
+    /// `out_quantiles` receives only the first `out_quantiles.len` values.
     pub fn snapshot(s: *Summary, now_ns: u64, out_quantiles: []f64) Snapshot {
-        std.debug.assert(out_quantiles.len >= s.objectives.len);
         lockSpin(&s.lock);
         defer s.lock.unlock();
         if (s.streams.len != 0) {
@@ -291,6 +296,7 @@ pub const Summary = struct {
             s.flushHot(now_ns);
         }
         for (s.objectives, 0..) |o, i| {
+            if (i >= out_quantiles.len) break;
             out_quantiles[i] = if (s.streams.len == 0 or s.streams[s.head].count() == 0)
                 std.math.nan(f64)
             else
@@ -637,4 +643,15 @@ test "differential vs perks quantile.Stream (client_golang's engine)" {
             }
         }
     }
+}
+
+test "epsilon 0 keeps every observation of the window (documented limit, sweep ME-4)" {
+    var s = try Summary.init(testing.allocator, .{ .objectives = &.{.{ .quantile = 0.5, .epsilon = 0 }}, .buf_cap = 64 });
+    defer s.deinit();
+    for (0..2000) |i| s.observe(@floatFromInt(i), 1);
+    var q: [1]f64 = undefined;
+    const snap = s.snapshot(1, &q);
+    try testing.expectEqual(@as(u64, 2000), snap.count);
+    try testing.expectEqual(@as(usize, 2000), s.streams[s.head].l.items.len);
+    try testing.expectEqual(@as(f64, 999), q[0]);
 }

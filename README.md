@@ -379,13 +379,13 @@ way to recognise it.
 | [`brotli`](modules/brotli/README.md) | 1 | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
 | [`cors`](modules/cors/README.md) | 1 | CORS preflight + header injection (secure defaults) | any | router, http |
 | [`grpc`](modules/grpc/README.md) | 4 (S) | gRPC client **and** server over HTTP/2 (over `protobuf`) — no code generation; all four call shapes (unary/streaming/bidi); untrusted declared length never sizes an allocation | any | http, protobuf, b64ct |
-| [`health`](modules/health/README.md) | 1 | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
+| [`health`](modules/health/README.md) | 2 (A) | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
 | [`http`](modules/http/README.md) | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
-| [`idempotency`](modules/idempotency/README.md) | 1 | Idempotency-Key dedup of unsafe retries — middleware + store (ramcache, or a pluggable Backend; durable KvBackend) replaying a recorded response without re-running the handler | any | router, http, ramcache, kv |
+| [`idempotency`](modules/idempotency/README.md) | 2 (A) | Idempotency-Key dedup of unsafe retries — middleware + store (ramcache, or a pluggable Backend; durable KvBackend) replaying a recorded response without re-running the handler | any | router, http, ramcache, kv |
 | [`jwe`](modules/jwe/README.md) | 3 (S,H,P) | JSON Web Encryption (RFC 7516/7518) compact serialization — RSA-OAEP/AxxxKW/ECDH-ES key management + AES-GCM/CBC-HMAC content encryption, AES-128/192/256 throughout (AES-192 via the aes192/aesgcm modules) | any | rsa, p256, aescbc, aeskw, aes192, aesgcm |
 | [`jwt`](modules/jwt/README.md) | 1 | JWT/JWS + OIDC resource-server validator — parse/claims/verify (HS/ES/EdDSA/RSA and post-quantum ML-DSA per RFC 9964, alg-confusion-safe), JWKS-by-kid incl. kty:AKP, OIDC discovery, plus a router Bearer middleware | any | http, router, p256, p384, p521, rsa, ct25519, b64ct, sha2 |
 | [`llmclient`](modules/llmclient/README.md) | 3 (S,E,P) | Anthropic Messages API client (buffered + streaming SSE) over `http` — no third-party SDK | any | http |
-| [`metrics`](modules/metrics/README.md) | 1 | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware with a per-request hook (access logging: `accesslog`) | posix | router, http, procnet |
+| [`metrics`](modules/metrics/README.md) | 2 (A) | Prometheus registry (counter/gauge/histogram) + `/metrics` + request middleware with a per-request hook (access logging: `accesslog`) | posix | router, http, procnet |
 | [`openapi`](modules/openapi/README.md) | 1 | OpenAPI 3.1 spec generated from the route table + `/openapi.json` | any | router, http |
 | [`ratelimit`](modules/ratelimit/README.md) | 1 | Token-bucket per-client rate limit → 429 + Retry-After; per-user connection-rate limit for `on_connect` | any | router, http, netaddr |
 | [`rbac`](modules/rbac/README.md) | 3 (S,P) | Authorization decision engine — NIST RBAC (hierarchical + static SoD) and a depth-bounded ABAC condition-tree evaluator with structural default-deny | any | — |
@@ -687,7 +687,7 @@ way to recognise it.
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
 | [`argsafe`](modules/argsafe/README.md) | 3 (S,E,P) | Allowlist validators + a typed argv builder — neutralizes argument/flag injection into an exec `argv`. | any | — |
-| [`diagnostics`](modules/diagnostics/README.md) | 1 | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
+| [`diagnostics`](modules/diagnostics/README.md) | 2 (A) | LSP-style structured validation-finding collector — severity, dot-path, position, code, suggestion. | any | — |
 | [`diskfree`](modules/diskfree/README.md) | 3 (S,P) | `statfs`/`statfs64` disk-space query (total/free/available, inodes, block size) + `/proc/self/mounts`+`mountinfo` parsers — what's mounted and how full, no `df`/`mount` subprocess | **linux** | — |
 | [`diskusage`](modules/diskusage/README.md) | 3 (S,E,P) | `du`-style tree walk over a raw `statx`/`fstatat` metadata wrapper — apparent size and real allocation in one pass, hard links counted once, one-filesystem boundary | **linux** | — |
 | [`fastmem`](modules/fastmem/README.md) | 2 (S,P) | Vectorised memset and memcpy (32-byte vectors, overlapping head/tail; rep stosq past L2 / rep movsb from 16 KiB on x86-64) that an executable without libc can export to replace compiler_rt's for every caller, std included; opt-in. | any (portable @Vector code, plus rep-stosq / rep-movsb paths for large lengths on x86-64; the export refuses libc-linked builds) | — |

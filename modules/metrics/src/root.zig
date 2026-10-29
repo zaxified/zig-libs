@@ -251,6 +251,10 @@ const Exemplars = struct {
 
 /// Validate and render exemplar labels as OpenMetrics writes them.
 fn renderExemplarLabels(buf: *[exemplar_text_cap]u8, labels: []const Label) ExemplarError![]const u8 {
+    // Every valid name is at least one rune, so more pairs than the rune cap
+    // can never fit; refusing them up front keeps the duplicate scan below
+    // O(cap²) instead of O(labels²).
+    if (labels.len > max_exemplar_runes) return error.InvalidExemplar;
     var runes: usize = 0;
     for (labels, 0..) |l, i| {
         if (!validLabelName(l.name)) return error.InvalidExemplar;
@@ -421,10 +425,12 @@ pub const Histogram = struct {
     }
 
     /// Cumulative count of observations ≤ `upper_bounds[i]` (what the
-    /// `_bucket{le=...}` sample exposes).
+    /// `_bucket{le=...}` sample exposes). Total: an `i` past the last bound
+    /// is the implicit `+Inf` bucket, i.e. every observation.
     pub fn cumulativeBucket(h: *Histogram, i: usize) u64 {
         lockSpin(&h.lock);
         defer h.lock.unlock();
+        if (i >= h.bucket_counts.len) return h.observation_count;
         var acc: u64 = 0;
         for (h.bucket_counts[0 .. i + 1]) |c| acc += c;
         return acc;
@@ -446,7 +452,8 @@ pub const Summary = struct {
     }
 
     /// Cumulative count / sum and the window's quantiles, in the family's
-    /// objective order (ascending quantile).
+    /// objective order (ascending quantile). A short `out_quantiles` gets the
+    /// first `out_quantiles.len` quantiles (never written past its end).
     pub fn snapshot(s: *Summary, out_quantiles: []f64) SummarySnapshot {
         return s.inner.snapshot(s.clock.now(), out_quantiles);
     }
@@ -1291,13 +1298,11 @@ pub const Registry = struct {
     /// `name` not already in `family_index` — an existing family's own
     /// get-or-register re-lookup cannot newly collide with itself.
     ///
-    /// Metric names longer than the scratch buffer skip the "new histogram
-    /// vs. existing derived name" half of the check (the other half, "new
-    /// name vs. existing histogram", has no such limit — it slices `name`
-    /// itself, not a formatted copy). Prometheus/client_golang metric names
-    /// are conventionally well under this; the alternative is an
-    /// allocation on every histogram registration to guard a case this
-    /// module has never seen.
+    /// Metric names longer than the scratch buffer take a linear scan of
+    /// the families for the "new histogram vs. existing derived name" half
+    /// (the other half, "new name vs. existing histogram", slices `name`
+    /// itself and has no such limit). Registration-time only, and only for
+    /// names over 250 bytes.
     /// The sample-name suffixes a family of `kind` writes besides its name.
     fn derivedSuffixes(kind: Kind) ?[]const []const u8 {
         return switch (kind) {
@@ -1315,7 +1320,16 @@ pub const Registry = struct {
         if (derivedSuffixes(kind)) |own| {
             var buf: [256]u8 = undefined;
             for (own) |suf| {
-                const derived = std.mem.print(&buf, "{s}{s}", .{ name, suf }) catch continue;
+                const derived = std.mem.print(&buf, "{s}{s}", .{ name, suf }) catch {
+                    // Too long for the scratch buffer: scan instead of
+                    // skipping the check (a skipped one let a duplicate
+                    // sample through, and Prometheus refuses the whole
+                    // scrape for it).
+                    for (r.families.items) |f| {
+                        if (f.name.len == name.len + suf.len and std.mem.startsWith(u8, f.name, name) and std.mem.endsWith(u8, f.name, suf)) return error.NameCollision;
+                    }
+                    continue;
+                };
                 if (r.family_index.contains(derived)) return error.NameCollision;
             }
         }
@@ -2394,10 +2408,12 @@ pub const RequestMetrics = struct {
 /// header (Go counts `r.Host` separately, same bytes); the protocol counts as
 /// the 8 bytes of `HTTP/1.1` (`HTTP/2.0` is 8 as well).
 pub fn approxRequestSize(req: *const http.Server.Request) u64 {
+    // Saturating: the declared `Content-Length` is peer-chosen and can be
+    // anything up to 2^64-1 when the server has no `max_body_bytes`.
     var n: u64 = req.target.len + req.methodName().len + "HTTP/1.1".len;
     var it = req.iterateHeaders();
-    while (it.next()) |h| n += h.name.len + h.value.len;
-    n += req.head.content_length orelse 0;
+    while (it.next()) |h| n +|= h.name.len + h.value.len;
+    n +|= req.head.content_length orelse 0;
     return n;
 }
 
@@ -5105,6 +5121,7 @@ test {
     _ = @import("go_register_test.zig");
     _ = @import("lead_test.zig");
     _ = @import("audit_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
