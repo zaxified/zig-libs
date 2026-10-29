@@ -354,6 +354,10 @@ pub const StateEntry = struct {
 
 pub const Options = struct {
     /// Header carrying the trace-id chain. Default `traceparent`.
+    /// Both header names must be RFC 9110 tokens, not a header `http`
+    /// manages itself (`Content-Length`, `Transfer-Encoding`, `Trailer`),
+    /// and differ from each other — `middleware()` panics otherwise, because
+    /// the echo could never set them (or would act on the framing).
     traceparent_header: []const u8 = default_traceparent_header,
     /// Vendor state header carried along. Default `tracestate`.
     tracestate_header: []const u8 = default_tracestate_header,
@@ -375,10 +379,28 @@ pub const Options = struct {
 pub const TraceContext = struct {
     options: Options = .{},
 
+    /// `tc` must outlive the router. Panics (in every build mode) on a
+    /// header name the echo could never set — see `Options.traceparent_header`.
     pub fn middleware(tc: *const TraceContext) router.Middleware {
+        const opt = tc.options;
+        if (!isUsableHeaderName(opt.traceparent_header)) @panic("tracecontext: Options.traceparent_header is not a usable header name");
+        if (!isUsableHeaderName(opt.tracestate_header)) @panic("tracecontext: Options.tracestate_header is not a usable header name");
+        if (std.ascii.eqlIgnoreCase(opt.traceparent_header, opt.tracestate_header)) @panic("tracecontext: Options.traceparent_header and tracestate_header are the same header");
         return .{ .state = @constCast(tc), .run = middlewareRun };
     }
 };
+
+/// An RFC 9110 token that `http`'s `setHeader` does not interpret as framing.
+fn isUsableHeaderName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |c| switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => {},
+        else => return false,
+    };
+    return !std.ascii.eqlIgnoreCase(name, "content-length") and
+        !std.ascii.eqlIgnoreCase(name, "transfer-encoding") and
+        !std.ascii.eqlIgnoreCase(name, "trailer");
+}
 
 // Per-connection-thread request-scoped storage (see the module doc).
 threadlocal var current_ctx: ?TraceParent = null;
@@ -1477,6 +1499,22 @@ test "middleware: custom (mixed-case) header names; unsampled stays 00; defaults
     try testing.expectEqualStrings("rojo=1", headerValue(got, "x-trace-state").?);
     try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "traceparent"));
     try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "tracestate"));
+}
+
+test "header names: tokens only, http-managed headers refused (middleware() panics on them)" {
+    // No-panic sweep § GJ TC-1: a non-token or framing name was accepted and
+    // the echo then failed quietly or acted on the framing header.
+    try testing.expect(isUsableHeaderName(default_traceparent_header));
+    try testing.expect(isUsableHeaderName(default_tracestate_header));
+    try testing.expect(isUsableHeaderName("X-Trace-Parent"));
+    try testing.expect(isUsableHeaderName("X!#$%&'*+-.^_`|~9"));
+    try testing.expect(!isUsableHeaderName(""));
+    try testing.expect(!isUsableHeaderName("trace parent"));
+    try testing.expect(!isUsableHeaderName("traceparent:"));
+    try testing.expect(!isUsableHeaderName("traceparent\r\n"));
+    try testing.expect(!isUsableHeaderName("Content-Length"));
+    try testing.expect(!isUsableHeaderName("transfer-ENCODING"));
+    try testing.expect(!isUsableHeaderName("Trailer"));
 }
 
 test "middleware: currentState(), state_entry null / invalid key / context, no state" {
