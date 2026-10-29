@@ -2961,3 +2961,18 @@ test "Ip.isPrivate: RFC 1918 + RFC 4193 ranges and their boundaries" {
     };
     for (no) |t| try std.testing.expect(!parseIp(t).?.isPrivate());
 }
+
+test "resolveLog: a removal as the first logged operation applies (hand-built log)" {
+    // (no-panic sweep 2026-10-28, N-4) the API never logs a removal first
+    // (a removal with an empty log goes to `out`), but `log` is a pub field.
+    var b: IpSetBuilder = .empty;
+    defer b.deinit(std.testing.allocator);
+    const v4 = IpFamily.v4;
+    try b.in.append(std.testing.allocator, .{ .fam = v4, .from = 10, .to = 20 });
+    try b.log.append(std.testing.allocator, .{ .key = .{ .fam = v4, .from = 12, .to = 14 }, .add = false });
+    var s = try b.toSet(std.testing.allocator);
+    defer s.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), s.rangeCount());
+    try std.testing.expectEqual(@as(u128, 11), s.spans[0].to);
+    try std.testing.expectEqual(@as(u128, 15), s.spans[1].from);
+}

@@ -1026,6 +1026,16 @@ test "leaf encode/decode round-trip + binary search (found + insertion point)" {
     try testing.expectEqual(@as(u16, 2), miss.index); // would insert before cherry
 }
 
+test "kvtree sweep KT-2/KT-8: a slot index past the page and a value above max_value_len are refused" {
+    var page: [page_size]u8 = undefined;
+    encodeEmptyLeaf(&page);
+    const leaf = Leaf.init(&page);
+    try testing.expectError(error.Corrupt, leaf.keyAt(2044)); // the slot would start at byte 4096
+    try testing.expectError(error.Corrupt, leaf.keyAt(page_size));
+    try testing.expect(fitsEntry(1, max_value_len)); // an overflow value of the largest size
+    try testing.expect(!fitsEntry(1, max_value_len + 1));
+}
+
 test "zeroPage clears every byte" {
     var page: [page_size]u8 = undefined;
     @memset(&page, 0xA5);

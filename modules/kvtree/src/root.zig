@@ -746,15 +746,19 @@ pub const Txn = struct {
     fn openIn(self: *Txn, parent: u32, name: []const u8) BucketError!?Bucket {
         try self.live(parent);
         try checkName(name);
-        // No call of this API makes a bucket this deep; a file that has one is rot.
-        if (self.levelUnder(parent) > max_bucket_depth) return error.Corrupt;
         if (self.findState(parent, name)) |i| {
             if (self.buckets.items[i].deleted) return null;
             return .{ .txn = self, .idx = i };
         }
         const root = self.baseRootOf(parent) orelse return null;
         switch (try lookupCell(&self.db.pager, root, name)) {
-            .bucket => |hdr| return .{ .txn = self, .idx = try self.addState(parent, name, hdr.root, hdr.seq) },
+            .bucket => |hdr| {
+                // No call of this API makes a bucket this deep; a file that has
+                // one is rot. Checked only once the bucket is found: a missing
+                // name under a legal level-16 bucket is null, not Corrupt.
+                if (self.levelUnder(parent) > max_bucket_depth) return error.Corrupt;
+                return .{ .txn = self, .idx = try self.addState(parent, name, hdr.root, hdr.seq) };
+            },
             .none, .plain => return null,
         }
     }
@@ -4374,8 +4378,9 @@ test "kvtree sweep KT-1: a cursor that failed mid-descent is unpositioned, not l
 
 test "kvtree sweep KT-2: lengths and offsets rotted after open are Corrupt on get, cursor and commit" {
     // 0: a slot offset past the page; 1: a key length past the page; 2: an
-    // inline value length past the page; 3: a count no page can hold.
-    for (0..4) |kind| {
+    // inline value length past the page; 3: a count no page can hold; 4, 5: a key
+    // / value length that fits a cell but not what is left of the page.
+    for (0..6) |kind| {
         var sim = kv.SimStorage.init(testing.allocator);
         defer sim.deinit();
         var db = try ktOpenSim(&sim, "kt2.kvt");
@@ -4396,6 +4401,8 @@ test "kvtree sweep KT-2: lengths and offsets rotted after open are Corrupt on ge
                 0 => std.mem.writeInt(u16, page[slot..][0..2], 0xFFF0, .little),
                 1 => std.mem.writeInt(u16, page[o..][0..2], 0xFFFF, .little),
                 2 => std.mem.writeInt(u32, page[o + 2 ..][0..4], format.bucket_flag - 1, .little),
+                4 => std.mem.writeInt(u16, page[o..][0..2], 3000, .little),
+                5 => std.mem.writeInt(u32, page[o + 2 ..][0..4], 3000, .little),
                 else => {},
             }
         }
@@ -4408,7 +4415,7 @@ test "kvtree sweep KT-2: lengths and offsets rotted after open are Corrupt on ge
         try cur.first();
         try testing.expectError(error.Corrupt, cur.next());
         // (A search reads keys only: a rotted value length is not in its way.)
-        if (kind != 2) try testing.expectError(error.Corrupt, cur.seek("k2"));
+        if (kind != 2 and kind != 5) try testing.expectError(error.Corrupt, cur.seek("k2"));
         try testing.expectError(error.Corrupt, db.put("k1", "x"));
     }
 }
@@ -4436,6 +4443,7 @@ test "kvtree sweep KT-2: a child id outside the version is Corrupt, even when a 
     var cur = try db.cursor();
     defer cur.deinit();
     try testing.expectError(error.Corrupt, cur.first());
+    try testing.expectError(error.Corrupt, db.put("k0000", "x")); // and the commit's descent
 }
 
 test "kvtree sweep KT-2/KT-3: a branch that points back up is Corrupt, not an endless descent" {
@@ -4542,6 +4550,10 @@ test "kvtree sweep KT-4: the API nests buckets at most max_bucket_depth deep, an
     for (1..max_bucket_depth) |_| b = try b.createBucket("b"); // level 16 is fine
     try testing.expectError(error.BucketTooDeep, b.createBucket("b"));
     try testing.expectError(error.BucketTooDeep, b.createBucketIfNotExists("b"));
+    // Opening under the deepest legal bucket is an ordinary miss, not rot.
+    try testing.expectEqual(@as(?Bucket, null), try b.bucket("b"));
+    try b.put("k", "v");
+    try testing.expectEqual(@as(?Bucket, null), try b.bucket("k"));
     try txn.commit();
     var snap = try db.snapshot();
     defer snap.release();
@@ -4576,6 +4588,7 @@ test "kvtree sweep KT-5: a forged txn_id of maxInt reads fine and refuses a writ
     defer db.close();
     try testing.expectEqual(std.math.maxInt(u64), db.meta_rec.txn_id);
     try expectGet(&db, "a", "1");
+    try testing.expectEqual(std.math.maxInt(u64), db.oldestReader()); // one past maxInt saturates, it does not wrap to 0
     var snap = try db.snapshot(); // the oldest-reader arithmetic sees maxInt too
     snap.release();
     try testing.expectError(error.Corrupt, db.put("b", "2"));
@@ -4697,4 +4710,175 @@ test "kvtree sweep KT-6: a freelist entry that rots to a meta page is refused by
     pokeU32(&sim, "kt6b.kvt", @as(usize, head) * page_size + 6, 0);
     try testing.expectError(error.Storage, db.put("k", "c"));
     try testing.expect(!db.poisoned);
+}
+
+test "kvtree sweep KT-2: a bucket cell whose value length rots is Corrupt on open-bucket and on the cursor" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt2c.kvt");
+    defer db.close();
+    var txn = try db.begin();
+    var b = try txn.createBucket("b");
+    try b.put("x", "1");
+    try txn.commit();
+
+    var page: [page_size]u8 = undefined;
+    const root = db.meta_rec.root;
+    try db.pager.readPage(root, &page);
+    try testing.expectEqual(format.NodeKind.leaf, format.kindOf(&page).?);
+    const o = std.mem.readInt(u16, page[8..10], .little);
+    // 13: one byte more than a header; 5: too short to read one at all.
+    for ([_]u32{ 13, 5 }) |len| {
+        std.mem.writeInt(u32, page[o + 2 ..][0..4], format.bucket_flag | len, .little);
+        try db.pager.writePage(root, &page);
+
+        var t = try db.begin();
+        try testing.expectError(error.Corrupt, t.bucket("b"));
+        t.rollback();
+        var cur = try db.cursor();
+        defer cur.deinit();
+        try cur.first();
+        try testing.expectError(error.Corrupt, cur.next());
+    }
+}
+
+test "kvtree sweep KT-2: an overflow length that rots past the file is Corrupt before anything is allocated for it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    // An allocator that cannot give the 2 GiB the rotted length asks for: were
+    // the length not checked first, `get` and the cursor would say
+    // OutOfMemory (with a big allocator, they would only find the chain short).
+    const mem = try testing.allocator.alloc(u8, 16 << 20);
+    defer testing.allocator.free(mem);
+    var fba = std.heap.FixedBufferAllocator.init(mem);
+    var db = try Db.open(fba.allocator(), sim.storage(), "kt2d.kvt", .{});
+    defer db.close();
+    const big: [10_000]u8 = @splat('x');
+    try db.put("a", &big);
+
+    var page: [page_size]u8 = undefined;
+    const root = db.meta_rec.root;
+    try db.pager.readPage(root, &page);
+    const o = std.mem.readInt(u16, page[8..10], .little);
+    try testing.expect((try format.Leaf.init(&page).ovfLen(0)) != null);
+    std.mem.writeInt(u32, page[o + 2 ..][0..4], format.ovf_flag | 0x7fff_ff00, .little);
+    try db.pager.writePage(root, &page);
+
+    try testing.expectError(error.Corrupt, db.get(fba.allocator(), "a"));
+    var cur = try db.cursor();
+    defer cur.deinit();
+    try cur.first();
+    try testing.expectError(error.Corrupt, cur.next());
+}
+
+test "kvtree sweep KT-6: an overflow chain claimed by two values is Corrupt at open" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt6c.kvt");
+    const big: [10_000]u8 = @splat('x');
+    try db.put("a", &big);
+    try db.put("b", &big);
+    var page: [page_size]u8 = undefined;
+    const root = db.meta_rec.root;
+    try db.pager.readPage(root, &page);
+    const leaf = format.Leaf.init(&page);
+    try testing.expectEqual(@as(u16, 2), try leaf.count());
+    // "b" gets the first overflow page of "a" (same length, so the chain fits).
+    const first_a = try leaf.ovfFirst(0);
+    const o = std.mem.readInt(u16, page[10..12], .little);
+    std.mem.writeInt(u32, page[o + 6 + 1 ..][0..4], first_a, .little);
+    try db.pager.writePage(root, &page);
+    try ktWriteMetas(&db.pager, db.meta_rec);
+    db.close();
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "kt6c.kvt", .{}));
+}
+
+test "kvtree sweep KT-6: a freelist whose chain page is a live page is Corrupt at open" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const h = try sim.storage().open("kt6d.kvt", .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    var leaf: [page_size]u8 = undefined;
+    format.encodeEmptyLeaf(&leaf); // read as a freelist page: no entries, no next
+    try p.writePage(2, &leaf);
+    try ktWriteMetas(&p, .{ .txn_id = 1, .root = 2, .free_root = 2, .free_count = 0, .high_water = 3, .version = format.format_v2 });
+    try testing.expectError(error.Corrupt, Db.open(testing.allocator, sim.storage(), "kt6d.kvt", .{}));
+}
+
+test "kvtree sweep KT-6: a freelist entry that rots to a page past the file end is refused by the commit that reads it" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(testing.allocator, sim.storage(), "kt6e.kvt", .{ .shrink_min_pages = 0 });
+    defer db.close();
+    for (0..8) |i| try db.put("k", if (i % 2 == 0) "a" else "b");
+    const head = db.meta_rec.free_root;
+    try testing.expect(head != 0);
+    pokeU32(&sim, "kt6e.kvt", @as(usize, head) * page_size + 6, @intCast(db.pager.high_water + 5));
+    try testing.expectError(error.Storage, db.put("k", "c"));
+    try testing.expect(!db.poisoned);
+}
+
+test "kvtree sweep KT-3: a root collapse over a branch that rotted into a self-loop ends in Corrupt" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    var db = try ktOpenSim(&sim, "kt3b.kvt");
+    defer db.close();
+    try ktFill(&db, 120);
+
+    var page: [page_size]u8 = undefined;
+    try db.pager.readPage(db.meta_rec.root, &page);
+    const br = format.Branch.init(&page);
+    const first_leaf = try br.childAtIndex(0);
+    const second_from = try std.fmt.parseInt(usize, (try br.keyAt(0))[1..], 10);
+    // The first leaf rots into a branch without cells whose only child is itself.
+    const looped = format.BranchBuilder.init(a, first_leaf);
+    looped.encode(&page);
+    try db.pager.writePage(first_leaf, &page);
+
+    // Delete everything from the second leaf on: the root is left with one
+    // child, and the collapse walks down the chain of single-child branches.
+    var txn = try db.begin();
+    var kb: [16]u8 = undefined;
+    for (second_from..120) |i| try txn.del(try std.mem.print(&kb, "k{d:0>4}", .{i}));
+    try testing.expectError(error.Corrupt, txn.commit());
+}
+
+test "kvtree sweep KT-4: buckets that nest deeper than max_bucket_depth after open are Corrupt to copy" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    // The deepest nesting a file may have, and a spare empty leaf after it.
+    const chain = try ktChainOfBuckets(a, max_bucket_depth);
+    const pages = try a.alloc([page_size]u8, chain.len + 1);
+    @memcpy(pages[0..chain.len], chain);
+    format.encodeEmptyLeaf(&pages[chain.len]);
+    try ktForge(&sim, "kt4b.kvt", pages, format.format_v4);
+    var db = try Db.open(testing.allocator, sim.storage(), "kt4b.kvt", .{});
+    defer db.close();
+
+    // After open, the deepest tree grows a bucket (the spare leaf): level 17.
+    var lb = format.LeafBuilder.init(a);
+    const hdr = try a.create([format.bucket_hdr_len]u8);
+    (format.BucketHdr{ .root = @intCast(2 + chain.len), .seq = 0 }).encode(hdr);
+    try lb.putBucket("b", hdr);
+    var page: [page_size]u8 = undefined;
+    lb.encode(&page);
+    try db.pager.writePage(@intCast(1 + chain.len), &page);
+
+    try testing.expectError(error.Corrupt, db.copyTo(sim.storage(), "kt4b_copy.kvt"));
+
+    // A write transaction that walks down to it finds the rot too.
+    var txn = try db.begin();
+    defer txn.rollback();
+    var b = (try txn.bucket("b")).?;
+    for (1..max_bucket_depth) |_| b = (try b.bucket("b")).?;
+    try testing.expectError(error.Corrupt, b.bucket("b"));
 }

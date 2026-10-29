@@ -1706,6 +1706,21 @@ test "reconcile to maxInt(u32) with no per-IP cap: admit refuses instead of over
     }
 }
 
+test "counter at maxInt(u32): an earlier deny verdict wins over per_ip_cap (sweep AG-2)" {
+    var tc: TestClock = .{};
+    for ([_]bool{ false, true }) |dry| {
+        var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = null, .dry_run = dry, .clock = tc.clock() });
+        defer g.deinit();
+        const ip = mkIp("192.0.2.61");
+        try testing.expectEqual(AdmitVerdict.admitted, g.admit(ip));
+        try g.ban(ip);
+        g.reconcile(ip, std.math.maxInt(u32));
+        try testing.expectEqual(std.math.maxInt(u32), g.connCount(ip));
+        try testing.expectEqual(AdmitVerdict.banned, g.admit(ip));
+        try testing.expectEqual(std.math.maxInt(u32), g.connCount(ip));
+    }
+}
+
 test "reconcile: releases leaked per-IP slots and corrects the global counter" {
     var tc: TestClock = .{};
     var g = Guard.init(testing.allocator, .{ .max_conns_per_ip = 5, .clock = tc.clock() });

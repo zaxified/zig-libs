@@ -2454,6 +2454,66 @@ test "no-panic A-5: a clock at the i64 extremes saturates instead of overflowing
     try testing.expectError(error.Expired, Manager.checkPair(gpa, a_names, chainOf(fx.a1_crt), fx.a1_key, std.math.minInt(i64), &.{}));
 }
 
+test "no-panic A-5: a failed renewal of a held certificate and a lock held elsewhere near the i64 maximum saturate" {
+    const max = std.math.maxInt(i64);
+    { // failed(): the cap and the Retry-After floor of a manager that holds a certificate
+        var f: Fixture = undefined;
+        f.init(day0 + 70 * day);
+        defer f.deinit();
+        try f.mem.storage().store("certificates/a.example.pem", comptime (fx.a1_key ++ "\n" ++ chainOf(fx.a1_crt)));
+        const script = [_]FakeIssuer.Step{
+            .{ .fail = .{ .problem = "boom" } },
+            .{ .fail = .{ .problem = "boom", .retry_after_s = 30 } },
+        };
+        var fake: FakeIssuer = .{ .script = &script };
+        var m = f.manager(opts());
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try m.manage(a_names);
+        _ = m.maintain(); // adopts the stored certificate, the renewal fails
+        try testing.expectEqual(@as(usize, 1), f.rec.failed);
+        f.clock.t = max - 10; // the certificate is long expired; 120 s back-off and a 30 s floor overflow
+        _ = m.maintain();
+        try testing.expectEqual(@as(usize, 2), f.rec.failed);
+        try testing.expectEqual(@as(i64, max), f.rec.last_retry_at);
+    }
+    { // obtain(): another node holds the lock, the poll time saturates
+        var f: Fixture = undefined;
+        f.init(max - 10);
+        defer f.deinit();
+        var fake: FakeIssuer = .{ .script = &.{} };
+        var m = f.manager(opts());
+        defer m.deinit();
+        try m.addIssuer(fake.issuer(false));
+        try m.manage(a_names);
+        try testing.expect(try f.mem.storage().tryLock("issue/a.example", "node-b", f.clock.t, 900));
+        try testing.expectEqual(@as(i64, max), m.maintain());
+        try testing.expectEqual(@as(usize, 0), fake.calls);
+    }
+}
+
+test "no-panic A-5: run() with the next due time far ahead of a clock far behind it sleeps, never overflows" {
+    var f: Fixture = undefined;
+    f.init(-10);
+    defer f.deinit();
+    var fake: FakeIssuer = .{ .script = &.{} };
+    var m = f.manager(opts());
+    defer m.deinit();
+    try m.addIssuer(fake.issuer(false));
+    try m.manage(a_names);
+    // The entry waits until just before the end of time: `next - now`
+    // does not fit an i64 (an hour's sleep after the clamp).
+    m.mutex.lockUncancelable(m.io);
+    m.entries.items[0].retry_at = std.math.maxInt(i64) - 1;
+    m.mutex.unlock(m.io);
+    const io = f.threaded.io();
+    var fut = io.async(Manager.run, .{&m});
+    const settle: std.Io.Clock.Duration = .{ .raw = .fromMilliseconds(300), .clock = .awake };
+    try settle.sleep(io);
+    fut.cancel(io) catch {};
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+}
+
 test "no-panic A-10: a chain of more than max_chain_certs certificates is MalformedChain" {
     const gpa = testing.allocator;
     const t = day0 + 30 * day;

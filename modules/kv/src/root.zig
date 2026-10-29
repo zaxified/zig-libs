@@ -6631,6 +6631,32 @@ test "manifest: a next_file_id past the id space is Corrupt, the last one is use
         try testing.expectError(error.NoSpaceLeft, db.put("zz", v10));
         try testing.expectEqualSlices(u8, m, sim.fileContent("db").?); // manifest untouched
     }
+    {
+        // A merge needs a fresh output id as well: none left.
+        const m = try craftManifest(testing.allocator, max_next_file_id, &.{ 0, 1, 2 }, &.{}, 0);
+        defer testing.allocator.free(m);
+        try sim.installFile("db", m);
+        // Room for the whole merge in one output: exactly the last id is wanted.
+        var db = try Db.open(testing.allocator, sim.storage(), "db", .{ .max_file_size = 1 << 20 });
+        defer db.close();
+        try testing.expectError(error.NoSpaceLeft, db.compact());
+        try testing.expectEqualSlices(u8, m, sim.fileContent("db").?);
+        try testing.expectEqual(@as(usize, 6), db.count());
+    }
+    {
+        // A stray file at the last id is deleted, and the probe stops there:
+        // the next id is legacy_id, the manifest's own path.
+        const m = try craftManifest(testing.allocator, max_next_file_id, &.{ 0, 1, 2 }, &.{}, 0);
+        defer testing.allocator.free(m);
+        try sim.installFile("db", m);
+        var nb: [24]u8 = undefined;
+        const stray_name = try std.mem.print(&nb, "db.{d}.data", .{max_next_file_id});
+        try sim.installFile(stray_name, "stray");
+        var db = try Db.open(testing.allocator, sim.storage(), "db", opts);
+        defer db.close();
+        try testing.expect(sim.fileContent(stray_name) == null);
+        try testing.expectEqualSlices(u8, m, sim.fileContent("db").?);
+    }
 }
 
 test "manifest: a version-1 file as the active file of a multi-file store is Corrupt" {
@@ -6750,6 +6776,7 @@ test "FsStorage: a closed or out-of-range handle is an error, never a fault" {
             try testing.expectError(error.Unexpected, st.writeAll(bad, "x", 0));
             try testing.expectError(error.Unexpected, st.sync(bad));
             try testing.expectError(error.Unexpected, st.truncate(bad, 0));
+            if (builtin.os.tag == .linux) try testing.expectError(error.Unexpected, st.allocate(bad, 4096));
             try testing.expectError(error.Unexpected, st.tryLockExclusive(bad));
             if (st.canLend()) try testing.expectError(error.Unexpected, st.preadRef(bad, 1, 0));
             st.close(bad); // a second close is a no-op

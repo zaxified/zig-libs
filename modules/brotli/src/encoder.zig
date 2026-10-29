@@ -7942,3 +7942,45 @@ test "no-panic sweep B-1: the streamed path past one_shot_max gives compressWith
         }
     }
 }
+
+test "no-panic sweep B-1: the streamed path keeps a prepared dictionary and the mode" {
+    // compressStreamed builds its StreamWriter options by hand: a field it
+    // forgets would change the stream only past 4 GiB, where no test goes.
+    const gpa = testing.allocator;
+    const corpus = @import("interop_corpus.zig");
+    const input = try corpus.fontLike(gpa, 40_000, 11);
+    defer gpa.free(input);
+    var pd = try PreparedDictionary.init(gpa, input[20_000..30_000]);
+    defer pd.deinit(gpa);
+    inline for (.{ Effort.q1, Effort.q4, Effort.q6, Effort.q9, Effort.q11 }) |e| {
+        // `sample` lies inside the dictionary source: copies from it exist.
+        const sample = input[20_000..26_000];
+        const variants = [_]CompressOptions{
+            .{ .effort = e, .prepared_dictionary = &pd },
+            .{ .effort = e, .mode = .font },
+            .{ .effort = e, .mode = .font, .prepared_dictionary = &pd },
+        };
+        for (variants) |v| {
+            for ([_][]const u8{ sample, input }) |data| {
+                const opts = v.sanitized();
+                const want = try compressWith(gpa, data, opts);
+                defer gpa.free(want);
+                var aw: std.Io.Writer.Allocating = .init(gpa);
+                defer aw.deinit();
+                try compressStreamed(gpa, &aw.writer, data, opts);
+                try testing.expectEqualSlices(u8, want, aw.written());
+                // The options are not vacuous: dropping them changes the stream.
+                if (opts.prepared_dictionary != null and e != .q11) {
+                    const plain = try compressWith(gpa, data, (CompressOptions{ .effort = e, .mode = opts.mode }).sanitized());
+                    defer gpa.free(plain);
+                    try testing.expect(!std.mem.eql(u8, plain, want));
+                }
+                if (opts.mode == .font and e.quality() >= 4 and e != .q11) {
+                    const plain = try compressWith(gpa, data, (CompressOptions{ .effort = e, .prepared_dictionary = opts.prepared_dictionary }).sanitized());
+                    defer gpa.free(plain);
+                    try testing.expect(!std.mem.eql(u8, plain, want));
+                }
+            }
+        }
+    }
+}

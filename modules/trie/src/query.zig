@@ -1383,12 +1383,20 @@ test "a DAG-shaped v3 buffer ends in Corrupt, not a 2^40 walk, in every unbounde
             break :blk null;
         }) |_| n += 1;
         try testing.expect(n < buf.len);
+        try testing.expectEqual(@as(?Completion, null), try it.next(&kb)); // finished after the error
     }
     // topN, unbounded.
     {
         var results: [4]Completion = undefined;
         var topkb: [4 * 64]u8 = undefined; // a 40-byte key must fit one slot
         try testing.expectError(error.Corrupt, f.topN("", &results, &topkb, .{ .max_visited = 0 }));
+    }
+    // topN with an EXPLICIT cap above buf.len: the budget status, not Corrupt.
+    {
+        var results: [4]Completion = undefined;
+        var topkb: [4 * 64]u8 = undefined;
+        const r = try f.topN("", &results, &topkb, .{ .max_visited = buf.len + 1000 });
+        try testing.expectEqual(TopNStatus.truncated_budget, r.status);
     }
     // An explicit cap keeps today's behaviour.
     {

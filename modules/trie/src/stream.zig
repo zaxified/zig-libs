@@ -659,3 +659,29 @@ test "an insert that fails poisons the builder; Unsorted does not" {
     try testing.expectError(error.Finished, sb.insert("zzzzzz", 5));
     try testing.expectError(error.Finished, sb.finish());
 }
+
+test "an OOM on the very first insert poisons the builder too" {
+    // (no-panic sweep 2026-10-28, T-6) the first key has no earlier state to
+    // protect, but a failed frame append can leave `frames` longer than `last`
+    // says: every later call must be `Finished`. Fail each allocation of the
+    // insert in turn.
+    var j: usize = 0;
+    var failed_any = false;
+    while (j < 8) : (j += 1) {
+        var out: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer out.deinit();
+        var fa = testing.FailingAllocator.init(testing.allocator, .{});
+        var sb = try SortedBuilder.init(fa.allocator(), &out.writer, .{});
+        defer sb.deinit();
+        fa.fail_index = fa.alloc_index + j;
+        sb.insert("abcdefgh", 1) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failed_any = true;
+            try testing.expectError(error.Finished, sb.insert("abcdefgi", 2));
+            try testing.expectError(error.Finished, sb.finish());
+            continue;
+        };
+        sb.finish() catch |err| try testing.expectEqual(error.OutOfMemory, err); // a later allocation may be the one that fails
+    }
+    try testing.expect(failed_any);
+}

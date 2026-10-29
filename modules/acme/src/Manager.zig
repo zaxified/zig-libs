@@ -1531,6 +1531,16 @@ const RateLimiter = struct {
 
 // ── tests of private helpers (the rest are in manager_test.zig) ─────────────
 
+test "no-panic A-5: RateLimiter.take saturates the age of a slot at both ends of time" {
+    const rate: RateLimit = .{ .max = 1, .window_s = 60 };
+    var r: RateLimiter = .{};
+    try std.testing.expect(r.take(-5, rate));
+    // maxInt - (-5) does not fit an i64: far past the window, allowed.
+    try std.testing.expect(r.take(std.math.maxInt(i64), rate));
+    // -5 - maxInt does not fit either: the clock went back, still inside the window.
+    try std.testing.expect(!r.take(-5, rate));
+}
+
 test "ratioRenewAt: exactly ten days renews at half, one second more at two thirds" {
     const day = std.time.s_per_day;
     try std.testing.expectEqual(@as(i64, 5 * day), ratioRenewAt(0, 10 * day, 0));

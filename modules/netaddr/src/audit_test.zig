@@ -433,3 +433,103 @@ test "no-panic sweep N-4: any interleaving of adds and removes matches a per-add
         }
     }
 }
+
+fn tenNet(i: usize) Ip {
+    return .{ .v4 = .{ 10, 0, 0, @intCast(i) } };
+}
+
+test "no-panic sweep N-1: a hand-set Zone.len past max_zone_len reads as the whole buffer" {
+    var z: na.Zone = .{ .len = 200 };
+    @memset(&z.buf, 'z');
+    try testing.expectEqual(@as(usize, na.max_zone_len), z.slice().len);
+    z.len = na.max_zone_len;
+    try testing.expectEqual(@as(usize, na.max_zone_len), z.slice().len);
+}
+
+test "no-panic sweep N-3: a hand-built AddrIterator with cur past last ends after one address" {
+    var it: na.AddrIterator = .{ .family = .v4, .cur = 10, .last = 5 };
+    try testing.expect(it.next() != null);
+    try testing.expectEqual(@as(?Ip, null), it.next());
+    // At the top of the width a `cur` equal to `last` ends too, without overflowing.
+    var top: na.AddrIterator = .{ .family = .v6, .cur = std.math.maxInt(u128), .last = std.math.maxInt(u128) };
+    try testing.expect(top.next() != null);
+    try testing.expectEqual(@as(?Ip, null), top.next());
+}
+
+test "no-panic sweep N-4: clone in logging mode carries the pending log" {
+    var b: na.IpSetBuilder = .empty;
+    defer b.deinit(gpa);
+    try b.addRange(gpa, rng("10.0.0.0", "10.0.0.9"));
+    try b.removeRange(gpa, rng("10.0.0.2", "10.0.0.5"));
+    try b.addRange(gpa, rng("10.0.0.3", "10.0.0.3")); // logged
+    try b.removeRange(gpa, rng("10.0.0.8", "10.0.0.9")); // logged
+    var c = try b.clone(gpa);
+    defer c.deinit(gpa);
+    var sb = try b.toSet(gpa);
+    defer sb.deinit(gpa);
+    var sc = try c.toSet(gpa);
+    defer sc.deinit(gpa);
+    const want = [_]bool{ true, true, false, true, false, false, true, true, false, false };
+    for (want, 0..) |w, i| {
+        const a = tenNet(i);
+        try testing.expectEqual(w, sb.contains(a));
+        try testing.expectEqual(w, sc.contains(a));
+    }
+}
+
+test "no-panic sweep N-4: a flush that fails inside the log sweep leaves the log in force" {
+    // After the OOM the removals are applied and cleared but the log is not:
+    // an add made now still has to go behind the logged removals.
+    var j: usize = 0;
+    var failed_any = false;
+    while (j < 40) : (j += 1) {
+        var b: na.IpSetBuilder = .empty;
+        defer b.deinit(gpa);
+        try b.addRange(gpa, rng("10.0.0.0", "10.0.0.9"));
+        try b.removeRange(gpa, rng("10.0.0.2", "10.0.0.3"));
+        try b.addRange(gpa, rng("10.0.0.2", "10.0.0.2")); // logged
+        try b.removeRange(gpa, rng("10.0.0.5", "10.0.0.6")); // logged
+        var fa = testing.FailingAllocator.init(gpa, .{ .fail_index = j });
+        var finished = false;
+        if (b.toSet(fa.allocator())) |first| {
+            var s = first;
+            s.deinit(fa.allocator());
+            finished = true;
+        } else |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failed_any = true;
+        }
+        if (finished) break;
+        try b.add(gpa, ip("10.0.0.5"));
+        var s = try b.toSet(gpa);
+        defer s.deinit(gpa);
+        // 0-9, minus 2-3, plus 2, minus 5-6, plus 5.
+        const want = [_]bool{ true, true, true, false, true, true, false, true, true, true, false };
+        for (want, 0..) |w, i| {
+            errdefer std.debug.print("  fail_index {d}, offset {d}\n", .{ j, i });
+            try testing.expectEqual(w, s.contains(tenNet(i)));
+        }
+    }
+    try testing.expect(failed_any);
+}
+
+test "no-panic sweep N-4: the log sweep keeps families apart where one ends at the other's start position" {
+    // v4 255.255.255.255 ends at position 2^32, exactly where the v6 span
+    // ::1:0:0 starts: neither the event grouping nor the adjacent merge may
+    // cross the family border.
+    var b: na.IpSetBuilder = .empty;
+    defer b.deinit(gpa);
+    try b.addRange(gpa, rng("255.255.255.254", "255.255.255.255"));
+    try b.addRange(gpa, rng("::1:0:0", "::1:0:3"));
+    try b.removeRange(gpa, rng("255.255.255.254", "255.255.255.254"));
+    try b.addRange(gpa, rng("::1:0:2", "::1:0:9")); // logged
+    var s = try b.toSet(gpa);
+    defer s.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), s.rangeCount());
+    const r0 = s.rangeAt(0);
+    try testing.expect(r0.from.eql(ip("255.255.255.255")) and r0.to.eql(ip("255.255.255.255")));
+    const r1 = s.rangeAt(1);
+    try testing.expect(r1.from.eql(ip("::1:0:0")) and r1.to.eql(ip("::1:0:9")));
+    try testing.expect(!s.contains(ip("255.255.255.254")));
+    try testing.expect(!s.contains(ip("::ffff:ffff"))); // the address before ::1:0:0
+}

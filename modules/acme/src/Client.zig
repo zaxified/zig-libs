@@ -6087,6 +6087,36 @@ test "no-panic A-1: loadOrder allows one authorization per identifier, a wildcar
     try testing.expectError(error.MalformedResponse, loadOrder(testing.allocator, "https://ca/o/1", many_ids, 2));
 }
 
+test "no-panic A-1: fetchOrder accepts max_resumed_identifiers authorizations, one more is malformed" {
+    var lab: Lab = undefined;
+    try lab.start(false);
+    defer lab.stop();
+    var account_key = labKey(jws.Es256, 123);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&account_key));
+    var c = lab.client(&account_key, .{});
+    defer c.deinit();
+
+    // A resumed order's size is unknown: the cap is the CA limit, not a
+    // number the caller passed. The CA serves `n` authorizations.
+    for ([_]usize{ max_resumed_identifiers + 1, max_resumed_identifiers }) |n| {
+        var w: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer w.deinit();
+        try w.writer.print("{{\"status\":\"pending\",\"identifiers\":[{{\"type\":\"dns\",\"value\":\"{s}\"}}],\"authorizations\":[", .{MockCa.domain});
+        for (0..n) |i| try w.writer.print("{s}\"https://ca/authz/{d}\"", .{ if (i == 0) "" else ",", i });
+        try w.writer.print("],\"finalize\":\"{s}\"}}", .{lab.mock.finalize_url});
+        const script = [_][]const u8{w.written()};
+        lab.mock.order_script = &script;
+        lab.mock.order_polls = 0;
+        if (n > max_resumed_identifiers) {
+            try testing.expectError(error.MalformedResponse, c.fetchOrder(lab.mock.order_url));
+        } else {
+            var order = try c.fetchOrder(lab.mock.order_url);
+            defer order.deinit();
+            try testing.expectEqual(@as(usize, max_resumed_identifiers), order.authorizations.len);
+        }
+    }
+}
+
 test "no-panic A-10: a chain of more than max_chain_certs certificates is malformed" {
     var lab: Lab = undefined;
     try lab.start(false);

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep: 30 mutants over the changed code, 27 killed, 1 equivalent (a merge at `last.to == from` cannot occur within one family), 2 not scored (the bounds-checked rangeAt index panics either way). Survivors became tests: a hand-set Zone.len, an AddrIterator past its end, clone in logging mode, OOM inside the log sweep, v4 and v6 spans meeting at 2^32, a removal as the first logged operation. Checked panics are not mutated (a test cannot observe a panic in-process). Cumulative 479/505, 26 eq. Card A1 again.
 - **2026-10-28** — **Fix (no-panic sweep):** no consumer-reachable panic or UB (independent review of every pub entry point, `~/CML/20261028-panic-sweep/netaddr-sweep.report.md`). `IpSetBuilder`: once an add follows a pending removal the rest is logged and resolved in one sweep, O(n log n) — it applied the removals on every switch, O(n) each, quadratic for an alternating list from untrusted input (model test against a per-address bitmask). `Zone.slice` clamps a hand-set `len`, `AddrIterator.next` ends on a hand-built `cur > last`, `IpSet.rangeAt` checks its index in every build mode; `Zone` documents that any byte survives a round trip.
 - **2026-10-25** — **Performance:** `bench-netaddr`'s `sort_mixed` sorts with the new zig-libs
   `sort` module (`.bench_deps`; ipnsort, the sort a Zig user now reaches for) instead of
