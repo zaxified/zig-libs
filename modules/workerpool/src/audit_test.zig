@@ -473,3 +473,96 @@ test "wait() from a job of the same pool panics instead of deadlocking (in a chi
     const out = try child.run(waitFromJobChild, .{}, .{ .limit_ms = 5000 });
     try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
 }
+
+// ── sweep GK (2026-10-29) ────────────────────────────────────────────────────
+
+const OwnJobCall = enum { drain, shutdownNow, deinit };
+
+fn lifecycleFromOwnJob(comptime which: OwnJobCall) type {
+    return struct {
+        fn job(ctx: *anyopaque) void {
+            const pool: *WorkerPool = @ptrCast(@alignCast(ctx));
+            switch (which) {
+                .drain => pool.drain(),
+                .shutdownNow => pool.shutdownNow(),
+                .deinit => pool.deinit(),
+            }
+        }
+        fn childMain() u8 {
+            var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{}); // global-alloc-ok: a forked child, whose leak checks never run
+            const pool = WorkerPool.init(std.heap.smp_allocator, .{ .io = threaded.io(), .n_workers = 1 }) catch return 3; // global-alloc-ok: same child
+            pool.submit(.{ .func = job, .ctx = pool }) catch return 4;
+            _ = pool.wait();
+            return 0;
+        }
+    };
+}
+
+fn expectPanicsFromOwnJob(comptime which: OwnJobCall) !void {
+    // Without the `current_pool` guard the worker joins its own thread: the
+    // child hangs (or asserts) instead of aborting with the checked panic.
+    if (!child.supported) return error.SkipZigTest;
+    const out = try child.run(lifecycleFromOwnJob(which).childMain, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
+}
+
+test "drain from a job of the same pool panics instead of self-joining (sweep WP-1)" {
+    try expectPanicsFromOwnJob(.drain);
+}
+
+test "shutdownNow from a job of the same pool panics instead of self-joining (sweep WP-1)" {
+    try expectPanicsFromOwnJob(.shutdownNow);
+}
+
+test "deinit from a job of the same pool panics instead of freeing the pool under its worker (sweep WP-1)" {
+    try expectPanicsFromOwnJob(.deinit);
+}
+
+fn drainFromJobOnDrainingPoolJob(ctx: *anyopaque) void {
+    const st: *DrainTwice = @ptrCast(@alignCast(ctx));
+    // Wait until the main thread's drain() has moved the pool to `draining`
+    // (our own job keeps it from finishing), then call drain() ourselves.
+    while (st.go.load(.seq_cst) == 0) std.atomic.spinLoopHint();
+    st.pool.drain(); // already draining: must be the old harmless no-op
+    st.returned.store(1, .seq_cst);
+}
+
+const DrainTwice = struct {
+    pool: *WorkerPool,
+    go: std.atomic.Value(u32) = .init(0),
+    returned: std.atomic.Value(u32) = .init(0),
+};
+
+test "drain() from a job of an already draining pool returns normally (review R-WP-1)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = threaded.io(), .n_workers = 1 });
+    defer pool.deinit();
+    var st = DrainTwice{ .pool = pool };
+    try pool.submit(.{ .func = drainFromJobOnDrainingPoolJob, .ctx = &st });
+    const t = try std.Thread.spawn(.{}, struct {
+        fn run(p: *WorkerPool) void {
+            p.drain();
+        }
+    }.run, .{pool});
+    while (pool.state.load(.seq_cst) == .running) std.atomic.spinLoopHint();
+    st.go.store(1, .seq_cst);
+    t.join();
+    try testing.expectEqual(@as(u32, 1), st.returned.load(.seq_cst));
+}
+
+fn doubleDeinitChild() u8 {
+    var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{}); // global-alloc-ok: a forked child, whose leak checks never run
+    const pool = WorkerPool.init(std.heap.smp_allocator, .{ .io = threaded.io(), .n_workers = 1, .max_submitters = 2 }) catch return 3; // global-alloc-ok: same child
+    var s = pool.registerSubmitter() catch return 4;
+    var copy = s;
+    s.deinit();
+    copy.deinit(); // contract violation: must be the checked panic
+    return 0;
+}
+
+test "Submitter.deinit twice panics instead of wrapping the counter (review R-WP-5)" {
+    if (!child.supported) return error.SkipZigTest;
+    const out = try child.run(doubleDeinitChild, .{}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
+}

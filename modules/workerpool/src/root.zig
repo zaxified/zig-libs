@@ -31,12 +31,12 @@
 //! shutdown that raced between the empty-observation and the park bumps the
 //! generation and makes the park return immediately (see `Worker.run`).
 //!
-//! **Backpressure — unbounded by default, never blocking.** The queue grows
-//! on demand, so `submit` never blocks; it fails with a typed error on
-//! allocator exhaustion (`error.SubmitFailed`), after shutdown
-//! (`error.Shutdown`) and, only when `Options.max_queued` is set, with
-//! `error.QueueFull` once that many jobs are queued and not yet started
-//! (SPEC §5). A blocking submit is deferred: a caller retries or sheds.
+//! **Backpressure — bounded by default (1 Mi queued jobs), never blocking.**
+//! The queue grows on demand, so `submit` never blocks; it fails with a typed
+//! error on allocator exhaustion (`error.SubmitFailed`), after shutdown
+//! (`error.Shutdown`) and with `error.QueueFull` once `Options.max_queued`
+//! (default 1 << 20; 0 = explicitly unbounded) jobs are queued and not yet
+//! started (SPEC §5). A blocking submit is deferred: a caller retries or sheds.
 //!
 //! **Pause.** `pause` stops workers from starting new jobs (jobs already
 //! running finish); `resume` lets them go on. Submissions are still accepted
@@ -120,12 +120,17 @@ pub const Options = struct {
     /// its last job, then nothing.
     spin_ns: u64 = 50 * std.time.ns_per_us,
     /// Upper bound on jobs that are submitted and not yet started
-    /// (`queuedCount`). 0 (the default) = unbounded, as before. When set,
+    /// (`queuedCount`). The default is a finite 1 Mi (1 << 20) jobs so that a
+    /// producer outrunning the workers meets `error.QueueFull` instead of
+    /// exhausting memory; 0 is the explicit opt-in for an unbounded queue.
     /// `submit`/`Submitter.submit` refuse with `error.QueueFull` instead of
-    /// queueing past it; no box is allocated and no accounting changes. The
-    /// bound is exact -- concurrent submitters can never overshoot it.
-    max_queued: usize = 0,
+    /// queueing past the bound; no box is allocated and no accounting changes.
+    /// The bound is exact -- concurrent submitters can never overshoot it.
+    max_queued: usize = default_max_queued,
 };
+
+/// Default for `Options.max_queued`: 1 Mi queued jobs.
+pub const default_max_queued: usize = 1 << 20;
 
 pub const InitError = error{
     /// `std.Thread.spawn` failed (resource limit) after some workers were
@@ -142,7 +147,7 @@ pub const SubmitError = error{
     SubmitFailed,
     /// `Options.max_queued` jobs are already queued and not yet started. The
     /// job was NOT enqueued and no accounting changed; retry later or shed.
-    /// Only returned when `max_queued > 0`.
+    /// Not returned when `max_queued = 0` (explicitly unbounded).
     QueueFull,
 };
 
@@ -205,7 +210,7 @@ pub const WorkerPool = struct {
     idle: std.atomic.Value(usize) = .init(0),
     /// `Options.spin_ns`.
     spin_ns: u64 = 0,
-    /// `Options.max_queued` (0 = unbounded).
+    /// `Options.max_queued` (0 = explicitly unbounded).
     max_queued: usize = 0,
     /// BOUNDED pools only (`max_queued > 0`): jobs reserved or queued and not
     /// yet taken by a worker. Incremented at admission by a CAS loop below
@@ -307,7 +312,13 @@ pub const WorkerPool = struct {
     /// Precondition: no thread may call `submit`/`Submitter.submit` concurrently
     /// with `drain` — the caller quiesces its producers first (the usual
     /// thread-pool contract). Idempotent: a second call is a no-op.
+    ///
+    /// **Never call it from a job of the same pool while the pool is running**
+    /// (it would join its own thread); that is detected and panics, as with
+    /// `wait`. On a pool that is already draining/stopping/stopped it is the
+    /// usual harmless no-op, from a job too.
     pub fn drain(self: *WorkerPool) void {
+        self.assertNotOwnJobWouldJoin("drain");
         if (self.state.cmpxchgStrong(.running, .draining, .seq_cst, .seq_cst) != null) return;
         self.wakeAll();
         for (self.workers) |*w| w.thread.join();
@@ -317,8 +328,10 @@ pub const WorkerPool = struct {
     /// Abrupt shutdown: stop accepting new work and let each worker finish only
     /// its current in-flight job, then join. Jobs still queued are NOT run;
     /// they are taken off the queue and counted as dropped. Use when queued work is safe to drop
-    /// (e.g. process teardown). Precondition + idempotency as `drain`.
+    /// (e.g. process teardown). Precondition, idempotency and the
+    /// "panics from a job of a running pool" as `drain`.
     pub fn shutdownNow(self: *WorkerPool) void {
+        self.assertNotOwnJobWouldJoin("shutdownNow");
         if (self.state.cmpxchgStrong(.running, .stopping_now, .seq_cst, .seq_cst) != null) return;
         self.wakeAll();
         for (self.workers) |*w| w.thread.join();
@@ -391,7 +404,7 @@ pub const WorkerPool = struct {
     /// completion will (`submitted` only falls on a `SubmitFailed` rollback,
     /// which wakes by itself).
     pub fn wait(self: *WorkerPool) bool {
-        if (current_pool == self) @panic("workerpool: wait() called from a job of the same pool (would deadlock)");
+        self.assertNotOwnJob("wait");
         _ = self.waiters.fetchAdd(1, .seq_cst);
         defer _ = self.waiters.fetchSub(1, .seq_cst);
         var spun = false;
@@ -423,7 +436,10 @@ pub const WorkerPool = struct {
 
     /// Stop (gracefully, if still running) and release every resource. Safe to
     /// call after `drain`/`shutdownNow`, or directly (then it drains first).
+    /// Like `drain`, panics when called from a job of the same pool (the pool
+    /// would be freed under the running worker).
     pub fn deinit(self: *WorkerPool) void {
+        self.assertNotOwnJob("deinit");
         if (self.state.load(.seq_cst) == .running) self.drain();
         // Defensive: drop anything still queued (nothing after a graceful
         // drain or a `shutdownNow`; a second, empty pass is safe).
@@ -437,9 +453,9 @@ pub const WorkerPool = struct {
 
     /// Submit a job from any thread (zero setup, lock-free).
     ///
-    /// Non-blocking; the queue is unbounded unless `Options.max_queued` is set.
+    /// Non-blocking; the queue is bounded by `Options.max_queued` (default 1 Mi).
     /// Errors: `Shutdown` (pool no longer accepting), `SubmitFailed`
-    /// (allocator exhaustion) or `QueueFull` (only with `max_queued`).
+    /// (allocator exhaustion) or `QueueFull` (`max_queued` reached; never with 0).
     pub fn submit(self: *WorkerPool, job: Job) SubmitError!void {
         return self.enqueueJob(job);
     }
@@ -511,6 +527,18 @@ pub const WorkerPool = struct {
     }
 
     // ── internal machinery ───────────────────────────────────────────────────
+
+    /// Caller-contract guard (class 2): a lifecycle call or `wait` made from a
+    /// job of this very pool would join / wait on the calling thread itself.
+    /// `current_pool` is set by each worker for its whole life, so it is the
+    /// exact "am I one of this pool's workers" test.
+    fn assertNotOwnJobWouldJoin(self: *const WorkerPool, comptime what: []const u8) void {
+        if (self.state.load(.seq_cst) == .running) self.assertNotOwnJob(what);
+    }
+
+    fn assertNotOwnJob(self: *const WorkerPool, comptime what: []const u8) void {
+        if (current_pool == self) @panic("workerpool: " ++ what ++ "() called from a job of the same pool (would deadlock)");
+    }
 
     /// The one enqueue path, from any thread.
     fn enqueueJob(self: *WorkerPool, job: Job) SubmitError!void {
@@ -642,8 +670,15 @@ pub const Submitter = struct {
         return self.pool.enqueueJob(job);
     }
 
+    /// Release the handle. Exactly once per `registerSubmitter`: a second
+    /// `deinit` (e.g. on a copy of the handle) would corrupt the pool's
+    /// submitter count and is detected: it panics.
     pub fn deinit(self: *Submitter) void {
-        _ = self.pool.submitters.fetchSub(1, .seq_cst);
+        var cur = self.pool.submitters.load(.seq_cst);
+        while (true) {
+            if (cur == 0) @panic("workerpool: Submitter.deinit called more often than registerSubmitter (double deinit)");
+            cur = self.pool.submitters.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse break;
+        }
         self.* = undefined;
     }
 };
@@ -2326,11 +2361,11 @@ test "max_queued: 4 accepted on a paused pool, the 5th is QueueFull and changes 
     try testing.expectEqual(@as(u64, 8), c.n.load(.seq_cst));
 }
 
-test "max_queued = 0 is unbounded: a thousand queued jobs behind a pause are all accepted" {
+test "max_queued = 0 is the explicit unbounded opt-in: a thousand queued jobs behind a pause are all accepted" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2 });
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 2, .max_queued = 0 });
     defer pool.deinit();
     var wd = Watchdog{ .io = io, .timeout_ms = 15_000 };
     try wd.start();
@@ -2344,6 +2379,26 @@ test "max_queued = 0 is unbounded: a thousand queued jobs behind a pause are all
     pool.@"resume"();
     try testing.expect(pool.wait());
     try testing.expectEqual(@as(u64, 1000), c.n.load(.seq_cst));
+}
+
+test "default options bound the queue at 1 Mi jobs; QueueFull on the next, 0 stays unbounded (review R-WP-2)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+    defer pool.deinit();
+    var wd = Watchdog{ .io = io, .timeout_ms = 60_000 };
+    try wd.start();
+    defer wd.finish();
+
+    try testing.expectEqual(@as(usize, 1 << 20), default_max_queued);
+    pool.pause();
+    sleepMsIo(io, 20);
+    var c = Counter{};
+    for (0..default_max_queued) |_| try pool.submit(.{ .func = incr, .ctx = &c });
+    try testing.expectError(error.QueueFull, pool.submit(.{ .func = incr, .ctx = &c }));
+    try testing.expectEqual(@as(usize, default_max_queued), pool.queuedCount());
+    pool.shutdownNow(); // the 1 Mi tiny jobs are dropped, not run
 }
 
 test "max_queued: the slot is released on the SubmitFailed rollback" {
