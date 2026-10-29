@@ -282,3 +282,55 @@ test "a local header offset past the end is ZipBadFileOffset even when the sourc
     var er: zs.EntryReader = undefined;
     try testing.expectError(zs.Error.ZipBadFileOffset, er.open(&archive, archive.find("f").?, &window, .{}));
 }
+
+test "a local header offset equal to the source size is ZipBadFileOffset (sweep audit GM-ZS-11)" {
+    const gpa = testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try oneEntryArchive(&aw, "f", "data", .{});
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(gpa, ms.source(), .{});
+    defer archive.deinit();
+    archive.entries.items[0].file_offset = aw.written().len;
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var er: zs.EntryReader = undefined;
+    try testing.expectError(zs.Error.ZipBadFileOffset, er.open(&archive, archive.find("f").?, &window, .{}));
+}
+
+test "deinit after a failed open sees a cleared codec even when the reader held garbage (sweep audit GM-ZS-9)" {
+    const gpa = testing.allocator;
+    const salt: [16]u8 = @splat(3);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    try oneEntryArchive(&aw, "e", "secret", .{ .encryption = .{ .password = "pw", .salt = &salt } });
+    var ms: zs.MemorySource = .{ .bytes = aw.written() };
+    var archive: zs.Archive = undefined;
+    try archive.initSource(gpa, ms.source(), .{});
+    defer archive.deinit();
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var er: zs.EntryReader = undefined;
+    // A stale codec whose close must never run: `open` has to clear it before its first return.
+    const Boom = struct {
+        fn close(_: *anyopaque, _: std.mem.Allocator) void {
+            @panic("stale codec closed by deinit after a failed open");
+        }
+    };
+    var dummy: u8 = 0;
+    er.codec = .{ .reader = undefined, .state = &dummy, .close = Boom.close };
+    defer er.deinit();
+    try testing.expectError(zs.Error.ZipEncryptedEntry, er.open(&archive, archive.find("e").?, &window, .{}));
+}
+
+test "addDirectory writes an unencrypted stored header when asked to encrypt (sweep audit GM-ZS-18)" {
+    const salt: [16]u8 = @splat(3);
+    var aw: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    var w = newWriter(&aw);
+    defer w.deinit();
+    try w.addDirectory("d", .{ .encryption = .{ .password = "pw", .salt = &salt } });
+    const b = aw.written();
+    // local header: flags at 6 (bit 0 = encrypted), method at 8 (99 = AES)
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, b[6..8], .little) & 1);
+    try testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, b[8..10], .little));
+}
