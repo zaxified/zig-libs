@@ -373,7 +373,7 @@ pub const Generator = struct {
         if (info.description) |d| try checkUtf8(d);
         try checkInfoExtrasUtf8(info);
         const registered = try registerSchemas(arena, info.schemas);
-        try checkSchemeNames(info);
+        try checkSchemeNames(arena, info);
 
         // F11 (A1/openapi.md): `info.include` filters BEFORE anything else
         // touches a route -- an excluded route's metadata is never
@@ -542,16 +542,17 @@ const Registered = struct { name: []const u8, value: std.json.Value };
 fn registerSchemas(arena: Allocator, schemas: []const NamedSchema) BuildError![]const Registered {
     var out: std.ArrayList(Registered) = .empty;
     var texts: std.ArrayList([]const u8) = .empty;
+    // name -> index in `out`/`texts` (a linear scan per entry was quadratic in
+    // the registry size).
+    var index: std.StringHashMapUnmanaged(usize) = .empty;
     for (schemas) |s| {
         const value = (try parseSchema(arena, s.schema)) orelse return error.InvalidComponentSchema;
         const norm = try std.json.Stringify.valueAlloc(arena, value, .{});
-        const prior: ?[]const u8 = for (out.items, texts.items) |q, t| {
-            if (std.mem.eql(u8, q.name, s.name)) break t;
-        } else null;
-        if (prior) |t| {
-            if (!std.mem.eql(u8, t, norm)) return error.SchemaConflict;
+        if (index.get(s.name)) |at| {
+            if (!std.mem.eql(u8, texts.items[at], norm)) return error.SchemaConflict;
             continue;
         }
+        try index.put(arena, s.name, out.items.len);
         try out.append(arena, .{ .name = s.name, .value = value });
         try texts.append(arena, norm);
     }
@@ -572,21 +573,52 @@ fn isSchema(v: std.json.Value) bool {
     return v == .object or v == .bool;
 }
 
-/// `text` as a JSON value, null when it is not JSON.
+/// The deepest nesting of `[]` / `{}` accepted in any JSON text this module
+/// takes from its caller (`request_schema`, `Response.schema`, `query_schema`,
+/// `Parameter.schema`, `NamedSchema.schema`, the examples). `std.json.Value`
+/// parses iteratively, but its writer (`Stringify`) recurses and asserts a
+/// depth of 256 in safe builds (an unchecked stack overflow in fast ones), and
+/// the text ends up inside the document a few levels down. Text deeper than
+/// this is "not JSON" to the callers below (`Invalid*Schema` / `InvalidExample`).
+const max_json_depth = 128;
+
+/// Whether no container of `v` is nested more than `limit` deep. Iterative
+/// (explicit stack in `arena`): the value may be as deep as its text is long.
+fn depthWithin(arena: Allocator, v: std.json.Value, limit: usize) Allocator.Error!bool {
+    const Item = struct { v: std.json.Value, depth: usize };
+    var stack: std.ArrayList(Item) = .empty;
+    try stack.append(arena, .{ .v = v, .depth = 0 });
+    while (stack.pop()) |it| {
+        const children: []const std.json.Value = switch (it.v) {
+            .array => |a| a.items,
+            .object => |o| o.values(),
+            else => continue,
+        };
+        if (it.depth + 1 > limit) return false;
+        for (children) |c| {
+            if (c == .array or c == .object) try stack.append(arena, .{ .v = c, .depth = it.depth + 1 });
+        }
+    }
+    return true;
+}
+
+/// `text` as a JSON value, null when it is not JSON (or nests deeper than
+/// `max_json_depth`).
 fn parseText(arena: Allocator, text: []const u8) Allocator.Error!?std.json.Value {
-    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => null,
+        else => return null,
     };
+    if (!try depthWithin(arena, v, max_json_depth)) return null;
+    return v;
 }
 
 /// Security scheme names are unique, `bearerAuth` included when it is on.
-fn checkSchemeNames(info: Info) BuildError!void {
-    for (info.security_schemes, 0..) |s, i| {
+fn checkSchemeNames(arena: Allocator, info: Info) BuildError!void {
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    for (info.security_schemes) |s| {
         if (info.bearer_auth and std.mem.eql(u8, s.name, "bearerAuth")) return error.DuplicateSecurityScheme;
-        for (info.security_schemes[0..i]) |q| {
-            if (std.mem.eql(u8, q.name, s.name)) return error.DuplicateSecurityScheme;
-        }
+        if ((try seen.fetchPut(arena, s.name, {})) != null) return error.DuplicateSecurityScheme;
     }
 }
 
@@ -645,6 +677,21 @@ fn checkParameterUtf8(p: Parameter) BuildError!void {
     try checkUtf8(p.schema);
 }
 
+const RouteKey = struct { method: http.Method, pattern: []const u8 };
+
+const RouteKeyContext = struct {
+    pub fn hash(_: RouteKeyContext, k: RouteKey) u64 {
+        return std.hash.Wyhash.hash(@as(u64, @backingInt(k.method)), k.pattern);
+    }
+    pub fn eql(_: RouteKeyContext, a: RouteKey, b: RouteKey) bool {
+        return a.method == b.method and std.mem.eql(u8, a.pattern, b.pattern);
+    }
+};
+
+fn RouteKeyMap(comptime V: type) type {
+    return std.HashMapUnmanaged(RouteKey, V, RouteKeyContext, std.hash_map.default_max_load_percentage);
+}
+
 /// The `RouteExtra` of each kept route (first matching entry), index-aligned
 /// with `rs`. An entry that matches none of the registered `routes` (before
 /// the `include` filter, so excluding a route does not orphan its entry) is
@@ -655,18 +702,23 @@ fn resolveExtras(
     rs: []const router.Route,
     extras: []const RouteExtra,
 ) BuildError![]const ?*const RouteExtra {
-    for (extras) |*x| {
-        const known = for (routes) |rt| {
-            if (rt.method == x.method and std.mem.eql(u8, rt.pattern, x.pattern)) break true;
-        } else false;
-        if (!known) return error.UnknownRouteExtra;
-    }
     const out = try arena.alloc(?*const RouteExtra, rs.len);
-    for (out, rs) |*slot, rt| {
-        slot.* = for (extras) |*x| {
-            if (rt.method == x.method and std.mem.eql(u8, rt.pattern, x.pattern)) break x;
-        } else null;
+    if (extras.len == 0) {
+        @memset(out, null);
+        return out;
     }
+    // Hash lookups by (method, pattern): scanning `routes` per extra and
+    // `extras` per route was quadratic in the table sizes.
+    var known: RouteKeyMap(void) = .empty;
+    for (routes) |rt| try known.put(arena, .{ .method = rt.method, .pattern = rt.pattern }, {});
+    var first: RouteKeyMap(*const RouteExtra) = .empty;
+    for (extras) |*x| {
+        const key: RouteKey = .{ .method = x.method, .pattern = x.pattern };
+        if (!known.contains(key)) return error.UnknownRouteExtra;
+        const gop = try first.getOrPut(arena, key);
+        if (!gop.found_existing) gop.value_ptr.* = x; // first entry wins
+    }
+    for (out, rs) |*slot, rt| slot.* = first.get(.{ .method = rt.method, .pattern = rt.pattern });
     return out;
 }
 
@@ -1032,17 +1084,27 @@ fn operationIds(
         try bases.put(arena, slot.*, {});
     }
     var taken: std.StringHashMapUnmanaged(void) = .empty;
+    // base -> the next `_<n>` to try. A candidate that was rejected stays
+    // rejected (`bases` and `taken` only grow) and a chosen one is `taken`, so
+    // resuming after the last pick gives the same "smallest free n" as
+    // starting at 2 every time, without the quadratic re-probing when many
+    // routes share one base (`/a/b`, `/a_b`, `/a/b_`... all `get_a_b`).
+    var next_n: std.StringHashMapUnmanaged(usize) = .empty;
     for (groups) |group| {
         inline for (@typeInfo(http.Method).@"enum".field_values) |fv| {
             const method: http.Method = @fromBackingInt(@intCast(fv));
             for (group.items) |i| {
                 if (rs[i].method != method) continue;
                 if (taken.contains(ids[i])) {
-                    var n: usize = 2;
+                    const base = ids[i];
+                    const slot = try next_n.getOrPut(arena, base);
+                    if (!slot.found_existing) slot.value_ptr.* = 2;
+                    var n: usize = slot.value_ptr.*;
                     while (true) : (n += 1) {
-                        const c = try arena.print("{s}_{d}", .{ ids[i], n });
+                        const c = try arena.print("{s}_{d}", .{ base, n });
                         if (!bases.contains(c) and !taken.contains(c)) {
                             ids[i] = c;
+                            slot.value_ptr.* = n + 1;
                             break;
                         }
                     }
@@ -1065,17 +1127,14 @@ fn operationIds(
 /// `Router` caller can reach this anymore (a `buildRoutes` slice still can)
 /// — the re-walk of the earlier captures below stays as defense in depth,
 /// deduping without allocating.
-fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool) Writer.Error!void {
+fn writePathParameters(jw: *std.json.Stringify, arena: Allocator, pattern: []const u8, any: *bool) (Allocator.Error || Writer.Error)!void {
     var it: router.PatternCaptures = .init(pattern);
-    var index: usize = 0;
-    while (it.next()) |name| : (index += 1) {
-        // The captures before this one, re-walked (no capped buffer: a
-        // repeat past its cap went out twice, review 2026-10-23).
-        var prev: router.PatternCaptures = .init(pattern);
-        const dup = for (0..index) |_| {
-            if (std.mem.eql(u8, prev.next().?, name)) break true;
-        } else false;
-        if (dup) continue;
+    // The names seen so far (no capped buffer: a repeat past its cap went out
+    // twice, review 2026-10-23; and no re-walk of the earlier captures per
+    // capture, which was quadratic in a `buildRoutes` pattern's capture count).
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    while (it.next()) |name| {
+        if ((try seen.fetchPut(arena, name, {})) != null) continue;
         try openParameters(jw, any);
         try jw.beginObject();
         try jw.objectField("name");
@@ -1099,7 +1158,7 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool)
 /// are neither.
 fn writeParameters(jw: *std.json.Stringify, arena: Allocator, rt: router.Route, extra: ?*const RouteExtra) (BuildError || Writer.Error)!void {
     var any = false;
-    try writePathParameters(jw, rt.pattern, &any);
+    try writePathParameters(jw, arena, rt.pattern, &any);
     if (rt.doc) |d| if (d.query_schema) |text| try writeQueryParameters(jw, arena, text, &any);
     if (extra) |x| {
         try writeExtraParameters(jw, arena, x.header_parameters, "header", &any);
@@ -1156,10 +1215,7 @@ fn openParameters(jw: *std.json.Stringify, any: *bool) Writer.Error!void {
 /// Duplicate property names within one part cannot occur: the parse
 /// refuses them.
 fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const u8, any: *bool) (BuildError || Writer.Error)!void {
-    const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidQuerySchema,
-    };
+    const schema = (try parseText(arena, text)) orelse return error.InvalidQuerySchema;
     if (schema != .object) return error.InvalidQuerySchema;
     // The schema's own `properties`/`required` count beside its `allOf`
     // parts. They used to be dropped once `allOf` was present (review
@@ -1175,6 +1231,9 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
 
     const Param = struct { name: []const u8, schemas: std.ArrayList(std.json.Value) = .empty, required: bool = false };
     var params: std.ArrayList(Param) = .empty;
+    // name -> index in `params`: a linear scan per property / required name
+    // was quadratic in the number of parameters.
+    var param_index: std.StringHashMapUnmanaged(usize) = .empty;
     for (parts.items) |part| {
         if (part != .object) return error.InvalidQuerySchema;
         // A `$ref` hides the properties it names (not followed here): refused
@@ -1190,7 +1249,7 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
             var it = o.iterator();
             while (it.next()) |e| {
                 if (!isSchema(e.value_ptr.*)) return error.InvalidQuerySchema;
-                const slot = try paramSlot(Param, arena, &params, e.key_ptr.*);
+                const slot = try paramSlot(Param, arena, &params, &param_index, e.key_ptr.*);
                 try slot.schemas.append(arena, e.value_ptr.*);
             }
         }
@@ -1200,10 +1259,8 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
         if (required != .array) return error.InvalidQuerySchema;
         for (required.array.items) |r| {
             if (r != .string) return error.InvalidQuerySchema;
-            const slot = for (params.items) |*q| {
-                if (std.mem.eql(u8, q.name, r.string)) break q;
-            } else return error.InvalidQuerySchema;
-            slot.required = true;
+            const at = param_index.get(r.string) orelse return error.InvalidQuerySchema;
+            params.items[at].required = true;
         }
     }
     for (params.items) |q| {
@@ -1229,10 +1286,16 @@ fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const
 }
 
 /// The entry for parameter `name`, appended when it is new.
-fn paramSlot(comptime P: type, arena: Allocator, params: *std.ArrayList(P), name: []const u8) Allocator.Error!*P {
-    for (params.items) |*q| {
-        if (std.mem.eql(u8, q.name, name)) return q;
-    }
+fn paramSlot(
+    comptime P: type,
+    arena: Allocator,
+    params: *std.ArrayList(P),
+    index: *std.StringHashMapUnmanaged(usize),
+    name: []const u8,
+) Allocator.Error!*P {
+    const gop = try index.getOrPut(arena, name);
+    if (gop.found_existing) return &params.items[gop.value_ptr.*];
+    gop.value_ptr.* = params.items.len;
     try params.append(arena, .{ .name = name });
     return &params.items[params.items.len - 1];
 }
@@ -1605,8 +1668,8 @@ pub fn validateOpenApi31(gpa: Allocator, doc: std.json.Value) ConformanceError!v
         return error.MissingTopLevelContent;
     }
 
-    if (root.get("paths")) |v| try validatePathsObject(v, .paths);
-    if (root.get("webhooks")) |v| try validatePathsObject(v, .webhooks);
+    if (root.get("paths")) |v| try validatePathsObject(gpa, v, .paths);
+    if (root.get("webhooks")) |v| try validatePathsObject(gpa, v, .webhooks);
 
     try validateServers(root.get("servers"));
     const schemes = try validateComponents(root.get("components"));
@@ -1627,7 +1690,7 @@ pub fn validateOpenApi31(gpa: Allocator, doc: std.json.Value) ConformanceError!v
             }
         }
     }
-    try validateRefs(doc, doc);
+    try validateRefs(gpa, doc);
 }
 
 fn validateServers(servers: ?std.json.Value) ConformanceError!void {
@@ -1732,33 +1795,47 @@ fn validateSecurityList(list: ?std.json.Value, schemes: ?std.json.ObjectMap) Con
 /// §8.2.1): a `#/...` inside it points into that resource, not the document,
 /// so it is not followed (openapi-spec-validator accepts
 /// `{"$id":…,"$defs":{"a":…},"$ref":"#/$defs/a"}`, review 2026-10-23).
-fn validateRefs(root: std.json.Value, v: std.json.Value) ConformanceError!void {
-    switch (v) {
+///
+/// Iterative (explicit stack in `gpa`): `root` is a caller-parsed value and
+/// `std.json` parses to any depth, so a recursive walk was a stack overflow
+/// for a document nested ~10^5 deep (sweep OA-1).
+fn validateRefs(gpa: Allocator, root: std.json.Value) ConformanceError!void {
+    var stack: std.ArrayList(std.json.Value) = .empty;
+    defer stack.deinit(gpa);
+    var token_buf: std.ArrayList(u8) = .empty;
+    defer token_buf.deinit(gpa);
+    try stack.append(gpa, root);
+    while (stack.pop()) |v| switch (v) {
         .object => |o| {
-            if (o.get("$id")) |id| if (id == .string) return;
+            if (o.get("$id")) |id| if (id == .string) continue;
             if (o.get("$ref")) |r| {
-                if (r == .string and !refResolves(root, r.string)) return error.DanglingRef;
+                if (r == .string and !try refResolves(gpa, &token_buf, root, r.string)) return error.DanglingRef;
             }
-            for (o.values()) |child| try validateRefs(root, child);
+            for (o.values()) |child| {
+                if (child == .object or child == .array) try stack.append(gpa, child);
+            }
         },
-        .array => |a| for (a.items) |child| try validateRefs(root, child),
+        .array => |a| for (a.items) |child| {
+            if (child == .object or child == .array) try stack.append(gpa, child);
+        },
         else => {},
-    }
+    };
 }
 
 /// Whether the URI fragment `ref` (`#/a/b`) points at an existing value. Only
 /// JSON-Pointer fragments are decided; `#` alone, `#anchor` and references to
-/// other documents are taken as resolving.
-fn refResolves(root: std.json.Value, ref: []const u8) bool {
+/// other documents are taken as resolving. Each token is decoded once into
+/// `token_buf` and looked up by hash (a linear key scan per token made a
+/// document with many refs into one large object quadratic, sweep OA-2).
+fn refResolves(gpa: Allocator, token_buf: *std.ArrayList(u8), root: std.json.Value, ref: []const u8) Allocator.Error!bool {
     if (ref.len < 2 or ref[0] != '#' or ref[1] != '/') return true;
     var cur = root;
     var it = std.mem.splitScalar(u8, ref[2..], '/');
     while (it.next()) |token| {
         switch (cur) {
             .object => |o| {
-                cur = for (o.keys(), o.values()) |k, val| {
-                    if (pointerTokenEql(token, k)) break val;
-                } else return false;
+                const key = try decodePointerToken(gpa, token_buf, token);
+                cur = o.get(key) orelse return false;
             },
             .array => |a| {
                 const idx = std.fmt.parseInt(usize, token, 10) catch return false;
@@ -1771,46 +1848,53 @@ fn refResolves(root: std.json.Value, ref: []const u8) bool {
     return true;
 }
 
-/// A JSON Pointer reference token from a URI fragment against an object key:
-/// `%XX` percent-decoded first (RFC 6901 §6: the fragment is URI-encoded, so
-/// `{`/`}` of a path key arrive as `%7B`/`%7D`), then `~1` is `/` and `~0` is
-/// `~` (§4).
-fn pointerTokenEql(token: []const u8, key: []const u8) bool {
+/// A JSON Pointer reference token from a URI fragment as the object key it
+/// names: `%XX` percent-decoded first (RFC 6901 §6: the fragment is
+/// URI-encoded, so `{`/`}` of a path key arrive as `%7B`/`%7D`), then `~1` is
+/// `/` and `~0` is `~` (§4). A `%` not followed by two hex digits and a `~`
+/// not followed by `0`/`1` stand for themselves. The result (at most
+/// `token.len` bytes) lives in `buf` until its next use.
+fn decodePointerToken(gpa: Allocator, buf: *std.ArrayList(u8), token: []const u8) Allocator.Error![]const u8 {
+    buf.clearRetainingCapacity();
+    try buf.ensureTotalCapacity(gpa, token.len);
     var i: usize = 0;
-    var j: usize = 0;
-    while (i < token.len) : (j += 1) {
-        if (j >= key.len) return false;
+    while (i < token.len) {
         var c = token[i];
         i += 1;
         if (c == '%' and i + 2 <= token.len) {
             if (std.fmt.parseInt(u8, token[i .. i + 2], 16)) |b| {
-                if (key[j] != b) return false;
+                buf.appendAssumeCapacity(b);
                 i += 2;
                 continue;
             } else |_| {}
         }
         if (c == '~' and i < token.len) {
             switch (token[i]) {
-                '0' => c = '~',
-                '1' => c = '/',
+                '0' => {
+                    c = '~';
+                    i += 1;
+                },
+                '1' => {
+                    c = '/';
+                    i += 1;
+                },
                 else => {},
             }
-            if (token[i] == '0' or token[i] == '1') i += 1;
         }
-        if (key[j] != c) return false;
+        buf.appendAssumeCapacity(c); // capacity: one output byte per consumed input byte
     }
-    return j == key.len;
+    return buf.items;
 }
 
 const PathsKind = enum { paths, webhooks };
 
-fn validatePathsObject(paths_val: std.json.Value, comptime kind: PathsKind) ConformanceError!void {
+fn validatePathsObject(gpa: Allocator, paths_val: std.json.Value, comptime kind: PathsKind) ConformanceError!void {
     if (paths_val != .object) return error.InvalidPathItem;
     var it = paths_val.object.iterator();
     while (it.next()) |entry| {
         if (kind == .paths and (entry.key_ptr.len == 0 or entry.key_ptr.*[0] != '/')) return error.InvalidPathKey;
         // A webhook's key is a name, not a templated path.
-        try validatePathItem(entry.value_ptr.*, if (kind == .paths) entry.key_ptr.* else null);
+        try validatePathItem(gpa, entry.value_ptr.*, if (kind == .paths) entry.key_ptr.* else null);
     }
 }
 
@@ -1838,22 +1922,36 @@ const TemplateIterator = struct {
     }
 };
 
-fn templateHas(path: []const u8, name: []const u8) ConformanceError!bool {
-    var it: TemplateIterator = .{ .path = path };
-    while (try it.next()) |v| if (std.mem.eql(u8, v, name)) return true;
-    return false;
-}
-
 const parameter_locations = [_][]const u8{ "query", "header", "path", "cookie" };
 
+const ParamKey = struct { name: []const u8, in: []const u8 };
+
+const ParamKeyContext = struct {
+    pub fn hash(_: ParamKeyContext, k: ParamKey) u64 {
+        return std.hash.Wyhash.hash(std.hash.Wyhash.hash(0, k.in), k.name);
+    }
+    pub fn eql(_: ParamKeyContext, a: ParamKey, b: ParamKey) bool {
+        return std.mem.eql(u8, a.name, b.name) and std.mem.eql(u8, a.in, b.in);
+    }
+};
+
 /// A `parameters` list: each entry well formed, no (name, in) twice, every
-/// path parameter required. A `$ref` entry is not resolved here.
-fn validateParameterList(list_val: std.json.Value) ConformanceError!void {
+/// path parameter required. A `$ref` entry is not resolved here. The
+/// duplicate check is a hash set (a scan of the earlier entries per entry was
+/// quadratic in the list length, sweep OA-3).
+fn validateParameterList(gpa: Allocator, list_val: std.json.Value) ConformanceError!void {
     if (list_val != .array) return error.InvalidParameter;
     const items = list_val.array.items;
-    for (items, 0..) |p, i| {
+    var seen: std.HashMapUnmanaged(ParamKey, void, ParamKeyContext, std.hash_map.default_max_load_percentage) = .empty;
+    defer seen.deinit(gpa);
+    for (items) |p| {
         if (p != .object) return error.InvalidParameter;
-        if (p.object.get("$ref") != null) continue;
+        if (p.object.get("$ref") != null) {
+            // Not validated itself, but it still counts as an earlier entry
+            // for the ones after it when it carries a name and a location.
+            if (paramField(p, "name")) |qn| if (paramField(p, "in")) |qi| try seen.put(gpa, .{ .name = qn, .in = qi }, {});
+            continue;
+        }
         const name = paramField(p, "name") orelse return error.InvalidParameter;
         const in = paramField(p, "in") orelse return error.InvalidParameter;
         if (name.len == 0) return error.InvalidParameter;
@@ -1865,11 +1963,7 @@ fn validateParameterList(list_val: std.json.Value) ConformanceError!void {
             const req = p.object.get("required") orelse return error.OptionalPathParameter;
             if (req != .bool or !req.bool) return error.OptionalPathParameter;
         }
-        for (items[0..i]) |q| {
-            const qn = paramField(q, "name") orelse continue;
-            const qi = paramField(q, "in") orelse continue;
-            if (std.mem.eql(u8, qn, name) and std.mem.eql(u8, qi, in)) return error.DuplicateParameter;
-        }
+        if ((try seen.fetchPut(gpa, .{ .name = name, .in = in }, {})) != null) return error.DuplicateParameter;
     }
 }
 
@@ -1879,37 +1973,46 @@ fn paramField(p: std.json.Value, comptime field: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-/// Whether `list` (a `parameters` array, or null) names a path parameter
-/// `name`; `has_ref` is set when it holds an unresolved `$ref`.
-fn listHasPathParam(list: ?std.json.Value, name: []const u8, has_ref: *bool) bool {
-    const l = list orelse return false;
-    if (l != .array) return false;
+/// The names of `list`'s (a `parameters` array, or null) `in: path`
+/// parameters, added to `names`; `has_ref` is set when it holds an unresolved
+/// `$ref`.
+fn collectPathParams(gpa: Allocator, list: ?std.json.Value, names: *std.StringHashMapUnmanaged(void), has_ref: *bool) Allocator.Error!void {
+    const l = list orelse return;
+    if (l != .array) return;
     for (l.array.items) |p| {
         if (p == .object and p.object.get("$ref") != null) has_ref.* = true;
         const n = paramField(p, "name") orelse continue;
         const in = paramField(p, "in") orelse continue;
-        if (std.mem.eql(u8, in, "path") and std.mem.eql(u8, n, name)) return true;
+        if (std.mem.eql(u8, in, "path")) try names.put(gpa, n, {});
     }
-    return false;
 }
 
 /// The operation's path parameters against its path key's template, both
 /// ways (§4.8.12.1). An unresolved `$ref` in either list leaves the
 /// "unresolved template variable" direction undecided, so it is skipped.
-fn validatePathTemplate(path: []const u8, item_params: ?std.json.Value, op_params: ?std.json.Value) ConformanceError!void {
+/// Both directions are set lookups (a scan of both lists per template
+/// variable, and of the path per parameter, was quadratic, sweep OA-3).
+fn validatePathTemplate(gpa: Allocator, path: []const u8, item_params: ?std.json.Value, op_params: ?std.json.Value) ConformanceError!void {
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    defer declared.deinit(gpa);
     var has_ref = false;
+    try collectPathParams(gpa, op_params, &declared, &has_ref);
+    try collectPathParams(gpa, item_params, &declared, &has_ref);
+    var templated: std.StringHashMapUnmanaged(void) = .empty;
+    defer templated.deinit(gpa);
     var it: TemplateIterator = .{ .path = path };
     while (try it.next()) |v| {
-        if (!listHasPathParam(op_params, v, &has_ref) and !listHasPathParam(item_params, v, &has_ref) and !has_ref)
-            return error.UnresolvedPathParameter;
+        if (!declared.contains(v) and !has_ref) return error.UnresolvedPathParameter;
+        try templated.put(gpa, v, {});
     }
+    // The whole path is now known to be well formed (`it` ran to its end).
     for ([_]?std.json.Value{ item_params, op_params }) |list| {
         const l = list orelse continue;
         if (l != .array) continue;
         for (l.array.items) |p| {
             const n = paramField(p, "name") orelse continue;
             const in = paramField(p, "in") orelse continue;
-            if (std.mem.eql(u8, in, "path") and !try templateHas(path, n)) return error.UndeclaredPathParameter;
+            if (std.mem.eql(u8, in, "path") and !templated.contains(n)) return error.UndeclaredPathParameter;
         }
     }
 }
@@ -1923,10 +2026,10 @@ fn validResponseKey(k: []const u8) bool {
 
 const http_method_keys = [_][]const u8{ "get", "put", "post", "delete", "options", "head", "patch", "trace" };
 
-fn validatePathItem(item_val: std.json.Value, path: ?[]const u8) ConformanceError!void {
+fn validatePathItem(gpa: Allocator, item_val: std.json.Value, path: ?[]const u8) ConformanceError!void {
     if (item_val != .object) return error.InvalidPathItem;
     const item_params = item_val.object.get("parameters");
-    if (item_params) |l| try validateParameterList(l);
+    if (item_params) |l| try validateParameterList(gpa, l);
     var it = item_val.object.iterator();
     while (it.next()) |entry| {
         var is_method = false;
@@ -1941,8 +2044,8 @@ fn validatePathItem(item_val: std.json.Value, path: ?[]const u8) ConformanceErro
         if (!is_method) continue;
         try validateOperation(entry.value_ptr.*);
         const op_params = entry.value_ptr.*.object.get("parameters");
-        if (op_params) |l| try validateParameterList(l);
-        if (path) |p| try validatePathTemplate(p, item_params, op_params);
+        if (op_params) |l| try validateParameterList(gpa, l);
+        if (path) |p| try validatePathTemplate(gpa, p, item_params, op_params);
     }
 }
 
@@ -2958,9 +3061,11 @@ test "generate: writePathParameters dedupes a repeated capture name (F6) — def
     var buf: [512]u8 = undefined;
     var aw: Writer = .fixed(&buf);
     var jw: std.json.Stringify = .{ .writer = &aw, .options = .{} };
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
     try jw.beginObject();
     var any = false;
-    try writePathParameters(&jw, "/a/:id/b/:id", &any);
+    try writePathParameters(&jw, arena_state.allocator(), "/a/:id/b/:id", &any);
     try jw.endArray();
     try jw.endObject();
 
@@ -3213,6 +3318,7 @@ test {
     _ = @import("spec_oracle_test.zig");
     _ = @import("parity_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 // ── review 2026-10-23 (A1 re-audit) ─────────────────────────────────────────
