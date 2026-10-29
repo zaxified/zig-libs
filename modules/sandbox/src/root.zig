@@ -116,7 +116,10 @@ pub const Credentials = struct {
 
 pub const DropError = error{
     /// A setgroups/setgid/setuid call returned an error (typically EPERM — the
-    /// process is not privileged enough to change to the target ids).
+    /// process is not privileged enough to change to the target ids), or an id
+    /// is `maxInt` (the kernel's "unchanged" value; refused before any change).
+    /// Otherwise privileges may be PARTLY dropped (groups cleared, gid changed,
+    /// uid not): treat it as fatal and exit.
     SetIdFailed,
     /// The calls "succeeded" but a read-back shows the ids did not actually
     /// change to the requested values, or (target uid non-zero) a capability
@@ -139,19 +142,47 @@ fn threadCount() ?u32 {
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
     defer _ = linux.close(fd);
-    var buf: [8192]u8 = undefined;
-    var len: usize = 0;
-    while (len < buf.len) {
-        const n = linux.read(fd, buf[len..].ptr, buf.len - len);
-        if (linux.errno(n) != .SUCCESS) return null;
+    return threadCountFd(fd);
+}
+
+/// The `Threads:` value of a `/proc/<pid>/status`-shaped file, read in full
+/// and scanned line by line. The `Groups:` line precedes `Threads:` and is
+/// up to ~390 KB for a process with 65536 supplementary groups, so a fixed
+/// buffer would cut the file before the key and report "unknown", silently
+/// skipping the guard (sweep SB-2). Only the first bytes of each line are
+/// kept, so memory stays constant whatever the file holds, and a key split
+/// across two reads is still seen.
+fn threadCountFd(fd: linux.fd_t) ?u32 {
+    var buf: [4096]u8 = undefined;
+    var line: [32]u8 = undefined; // `Threads:` + a 10-digit count fits
+    var line_len: usize = 0;
+    while (true) {
+        const n = linux.read(fd, &buf, buf.len);
+        switch (linux.errno(n)) {
+            .SUCCESS => {},
+            .INTR => continue, // not "unknown": that would skip the guard (review R-SB-2)
+            else => return null,
+        }
         if (n == 0) break;
-        len += n;
+        for (buf[0..n]) |c| {
+            if (c == '\n') {
+                if (parseThreadsLine(line[0..line_len])) |v| return v;
+                line_len = 0;
+            } else if (line_len < line.len) {
+                line[line_len] = c;
+                line_len += 1;
+            }
+        }
     }
-    const key = "\nThreads:";
-    const at = std.mem.indexOf(u8, buf[0..len], key) orelse return null;
-    const rest = std.mem.trimStart(u8, buf[at + key.len .. len], " \t");
-    const end = std.mem.indexOfScalar(u8, rest, '\n') orelse return null;
-    return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
+    return parseThreadsLine(line[0..line_len]);
+}
+
+/// `Threads:\t<n>` -> n, any other line -> null.
+fn parseThreadsLine(l: []const u8) ?u32 {
+    const key = "Threads:";
+    if (!std.mem.startsWith(u8, l, key)) return null;
+    const rest = std.mem.trim(u8, l[key.len..], " \t");
+    return std.fmt.parseInt(u32, rest, 10) catch null;
 }
 
 /// True when the calling thread holds no effective and no permitted capability.
@@ -186,6 +217,9 @@ fn noCapabilities() bool {
 /// -- the caller then answers for it.
 pub fn dropPrivileges(creds: Credentials) DropError!void {
     if (threadCount()) |n| if (n > 1) return error.MultipleThreads;
+    // -1 means "leave unchanged" to the id syscalls: refuse it before the
+    // first side effect, not halfway through the sequence (review R-SB-1).
+    if (creds.uid == std.math.maxInt(linux.uid_t) or creds.gid == std.math.maxInt(linux.gid_t)) return error.SetIdFailed;
 
     // 1. Clear supplementary groups — must happen while still privileged.
     const no_groups = [_]linux.gid_t{};
@@ -631,7 +665,9 @@ pub const Ruleset = struct {
     /// `initWith`, but every requested right and scope must be enforced: a
     /// kernel whose ABI lacks any of them is `error.PartiallySupported` (and
     /// no ruleset is left open), never a quieter sandbox than the one asked
-    /// for. For a service that must not start half-confined.
+    /// for. For a service that must not start half-confined. A right this
+    /// module does not know (a bit outside `access.all`) also gives
+    /// `PartiallySupported`.
     pub fn initExact(h: Handled) (LandlockError || error{PartiallySupported})!Ruleset {
         var r = try initWith(h);
         if (r.handled != h.fs or r.handled_net != h.net or r.scoped != h.scoped) {
@@ -760,8 +796,14 @@ pub const Ruleset = struct {
 
     /// Close the ruleset fd. Safe (and expected) to call after `restrictSelf` —
     /// enforcement persists once applied; the fd only matters during building.
+    /// Idempotent: the fd is set to -1 afterwards, so a second call (a `defer`
+    /// plus an explicit call) cannot close an unrelated descriptor that reused
+    /// the number. Later `allowPath`/`restrictSelf` report `RulesetFailed`
+    /// (EBADF). A by-value copy of a live `Ruleset` still owns the same fd —
+    /// do not copy one and deinit both.
     pub fn deinit(self: *Ruleset) void {
         _ = linux.close(self.fd);
+        self.fd = -1;
     }
 };
 
@@ -4235,6 +4277,83 @@ test "seccomp.buildRulesWith: CompatRule validation and the program-length cap u
         try testing.expectError(error.ProgramTooLong, seccomp.buildRulesWith(gpa, &rules, .kill_process, .{ .dispatch = d }));
         try testing.expectError(error.ProgramTooLong, seccomp.buildRulesWith(gpa, rules[0..1], .kill_process, .{ .dispatch = d, .i386 = &rules32 }));
     }
+}
+
+fn memfdWith(content: []const u8) !linux.fd_t {
+    const rc = linux.memfd_create("sandbox-sweep", 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    var off: usize = 0;
+    while (off < content.len) {
+        const n = linux.write(fd, content[off..].ptr, content.len - off);
+        if (linux.errno(n) != .SUCCESS) return error.WriteFailed;
+        off += n;
+    }
+    if (linux.errno(linux.lseek(fd, 0, linux.SEEK.SET)) != .SUCCESS) return error.SeekFailed;
+    return fd;
+}
+
+test "threadCount: a Threads: line behind a huge Groups: line, across read chunks and the old 8 KiB edge (sweep SB-2)" {
+    const gpa = testing.allocator;
+    // 40 KB `Groups:` line, as a process with ~6000 supplementary groups has.
+    const big = try gpa.alloc(u8, 40_000);
+    defer gpa.free(big);
+    @memset(big, '7');
+    const content = try std.fmt.allocPrint(gpa, "Name:\tx\nGroups:\t{s}\nThreads:\t3\nSigQ:\t0/1\n", .{big});
+    defer gpa.free(content);
+    const fd = try memfdWith(content);
+    defer _ = linux.close(fd);
+    try testing.expectEqual(@as(?u32, 3), threadCountFd(fd));
+
+    // The key starting at every offset around a 4096 chunk edge and the old
+    // fixed buffer's 8192 edge (so it is split between two reads / cut off).
+    inline for (.{ 4096, 8192 }) |edge| {
+        var at: usize = edge - 10;
+        while (at <= edge + 2) : (at += 1) {
+            const doc = try gpa.alloc(u8, at + 12);
+            defer gpa.free(doc);
+            @memset(doc, 'g');
+            doc[at - 1] = '\n';
+            @memcpy(doc[at..][0..12], "Threads:\t42\n");
+            const f = try memfdWith(doc);
+            defer _ = linux.close(f);
+            try testing.expectEqual(@as(?u32, 42), threadCountFd(f));
+        }
+    }
+}
+
+test "threadCount: only a line that STARTS with the key counts; none, garbage or an unterminated last line" {
+    const cases = [_]struct { doc: []const u8, want: ?u32 }{
+        .{ .doc = "Name:\tThreads:\t9\nThreads:\t2\n", .want = 2 },
+        .{ .doc = "Name:\tThreads:\t9\n", .want = null },
+        .{ .doc = "Threads:\tmany\n", .want = null },
+        .{ .doc = "Threads:\t99999999999\n", .want = null },
+        .{ .doc = "Threads:\t5", .want = 5 },
+        .{ .doc = "", .want = null },
+    };
+    for (cases) |c| {
+        const fd = try memfdWith(c.doc);
+        defer _ = linux.close(fd);
+        try testing.expectEqual(c.want, threadCountFd(fd));
+    }
+    // The live process: at least one thread.
+    try testing.expect((threadCount() orelse 1) >= 1);
+}
+
+test "Ruleset.deinit is idempotent: a second call does not close a descriptor that reused the number (sweep SB-1)" {
+    const rc = linux.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const a: linux.fd_t = @intCast(rc);
+    var r = Ruleset{ .fd = a, .abi = 1, .handled = Ruleset.access.all };
+    r.deinit();
+    // Another owner now holds the same number.
+    try testing.expectEqual(E.SUCCESS, linux.errno(linux.dup3(0, a, 0)));
+    defer _ = linux.close(a);
+    r.deinit();
+    try testing.expectEqual(E.SUCCESS, linux.errno(linux.fcntl(a, linux.F.GETFD, 0)));
+    // And the ruleset is unusable, not silently half-alive.
+    try testing.expectError(error.RulesetFailed, r.allowPath("/dev/null", Ruleset.access.read_file));
 }
 
 // Dark-tests aggregator (CONVENTIONS.md §6 step 3): single-file module, but
