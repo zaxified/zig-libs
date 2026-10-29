@@ -796,3 +796,85 @@ test "random spans: no crash, no raw escape, colour only adds SGR sequences, bou
         try std.testing.expectEqualStrings(plain, stripped.items);
     }
 }
+
+test "extreme positions and options: no overflow, no crash, bounded output (sweep DG-0)" {
+    var prng: std.Random.DefaultPrng = .init(0x5EEB0);
+    const rnd = prng.random();
+    const big = std.math.maxInt(u32);
+    const texts = [_][]const u8{
+        "",
+        "ab\ncd\n",
+        "\tx\xC3\xA9y\r\nline2\n\nline4 \x1b[2J\n",
+        "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\n",
+        "a long line of text that is wider than the narrow terminals below, to be cut around the spans\n\t\t\tshort\xFF\n",
+    };
+    const edge = [_]u32{ 0, 1, 2, 3, 5, 9, 10, 255, 256, 65535, 65536, big - 2, big - 1, big };
+    const pick = struct {
+        fn u(r: std.Random, e: []const u32) u32 {
+            return if (r.boolean()) e[r.uintLessThan(usize, e.len)] else r.uintLessThan(u32, 12);
+        }
+    }.u;
+    var labels: [70]dg.Label = undefined;
+    for (0..3000) |_| {
+        const text = texts[rnd.uintLessThan(usize, texts.len)];
+        var starts_buf: [16]u32 = undefined;
+        var src: [1]dg.Source = .{.{ .file = "f", .text = text }};
+        if (rnd.boolean()) {
+            const n = std.mem.count(u8, text, "\n") + 1;
+            var k: usize = 1;
+            starts_buf[0] = 0;
+            var pos: usize = 0;
+            while (std.mem.findScalarPos(u8, text, pos, '\n')) |nl| : (k += 1) {
+                starts_buf[k] = @intCast(nl + 1);
+                pos = nl + 1;
+            }
+            src[0].line_starts = starts_buf[0..n];
+        }
+        const n = rnd.uintLessThan(usize, labels.len);
+        for (labels[0..n]) |*l| {
+            l.* = .{
+                .line = pick(rnd, &edge),
+                .col = if (rnd.boolean()) pick(rnd, &edge) else null,
+                .end_line = if (rnd.boolean()) pick(rnd, &edge) else null,
+                .end_col = if (rnd.boolean()) pick(rnd, &edge) else null,
+                .message = if (rnd.boolean()) "m" else "a longer message\nthat hangs",
+                .primary = if (rnd.boolean()) rnd.boolean() else null,
+            };
+        }
+        const d: dg.Diagnostic = .{
+            .path = "a.b",
+            .file = if (rnd.boolean()) "f" else null,
+            .line = if (rnd.uintLessThan(u8, 8) == 0) null else pick(rnd, &edge),
+            .col = if (rnd.boolean()) pick(rnd, &edge) else null,
+            .end_line = if (rnd.boolean()) pick(rnd, &edge) else null,
+            .end_col = if (rnd.boolean()) pick(rnd, &edge) else null,
+            .severity = .info,
+            .code = "c",
+            .message = "m",
+            .span_message = "span",
+            .labels = labels[0..n],
+            .fix = .{ .line = pick(rnd, &edge), .col = pick(rnd, &edge), .end_line = pick(rnd, &edge), .end_col = pick(rnd, &edge), .replacement = "r" },
+        };
+        const o: dg.RenderOptions = .{
+            .style = if (rnd.uintLessThan(u8, 5) == 0) .short else .snippet,
+            .sources = &src,
+            .tab_width = rnd.int(u8),
+            .start_context_lines = pick(rnd, &edge),
+            .end_context_lines = pick(rnd, &edge),
+            .before_label_lines = pick(rnd, &edge),
+            .after_label_lines = pick(rnd, &edge),
+            .chars = if (rnd.boolean()) .ascii else .unicode,
+            .term_width = if (rnd.boolean()) null else rnd.int(u16) % 200,
+            .column = if (rnd.boolean()) .byte else .char,
+        };
+        const got = try render(std.testing.allocator, d, o);
+        defer std.testing.allocator.free(got);
+        // Bounded: the source is a few lines, the labels at most 70 and the
+        // tab width at most 255 columns.
+        try std.testing.expect(got.len < 4 << 20);
+
+        var w: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer w.deinit();
+        try dg.writeLsp(&w.writer, d, &src, @fromBackingInt(@intCast(rnd.uintLessThan(u8, 3))), .{});
+    }
+}
