@@ -162,7 +162,7 @@ enabled; rerun: 26 killed. No defect found.
 
 ## Backlog / deferred
 - **Delta audit 2026-10-29 (no-panic sweep § GJ):** 6 mutants (old CR/LF/NUL predicate, slot check dropped, built-in and repeated-extra dedupe dropped, CSP copied instead of lent, every built-in counted): 6/6 killed on the first run; the RID-1 test gained a CSP-only case first, because the default set alone freed enough room to hide a copied CSP. Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GJ):** (a) `init`'s byte check still counts the lent values, so it is now conservative: a CSP larger than the 4 KiB copy budget would work on the wire but is refused — relaxing it changes what `init` accepts (owner). (b) SH-3 (LOW): `csp` `renderImpl` duplicate scans are O(directives × names) over caller lists, uncapped (≤ 26 names make longer lists useless). Reports `~/CML/20261029-panic-sweep/security-headers-sweep.report.md`, `review-rid-sh-tc.report.md`.
+- **No-panic sweep 2026-10-29 (§ GJ):** (a) `init`'s byte check still counts the lent values, so it is now conservative: a CSP larger than the 4 KiB copy budget would work on the wire but is refused. **Decided: stays strict (owner delegated 10-29, safe default)** — a documented opt-out only if a consumer ever needs a > 4 KiB CSP. (b) SH-3 (LOW): `csp` `renderImpl` duplicate scans are O(directives × names) over caller lists, uncapped (≤ 26 names make longer lists useless). Reports `~/CML/20261029-panic-sweep/security-headers-sweep.report.md`, `review-rid-sh-tc.report.md`.
 
 - **Headers on server-generated error replies for a RUNTIME config** *(survey 2026-09-30; comptime
   path done via `http.Server.Options.error_headers` + `staticHeaders`)* — a `SecurityHeaders` built at
