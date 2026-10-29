@@ -177,6 +177,8 @@ output clamped to the declared size, `toUnix` month 0 / second 60 / 2100-02-29 /
 
 ## Backlog / deferred
 
+- (GM review R-ZS-8) `isSafeEntryName` does not reject Windows NTFS alternate data streams (`a:stream`) or reserved device names (`CON`, `NUL`); documented, a Windows extractor must add them. Low; extraction on Windows is untested here.
+
 ### Scope parity gap list (S2 re-survey 2026-10-20)
 
 Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or
@@ -284,6 +286,17 @@ two methods ordinary zip tools and Excel emit, no observed producer needs the re
   Std sites pulled in by every module (all roots): `std/Io/Threaded.zig:2915:62` (D); `std/Progress.zig:615:39` (D); `std/Progress.zig:616:40` (D); `std/math.zig:1077:23` (A); `std/math.zig:1343:32` (C); `std/os/linux.zig:1044:28` (D). Details and risk notes: `~/CML/zig-017/inv017/std-sites.tsv`; module-specific callers of `std.math.cast` are listed in the table above.
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
+
+### No-panic sweep GM (2026-10-29) — open decisions
+
+- **Archive memory is O(archive size), uncapped.** `Archive.init` lists every central-directory record
+  (about 3-4x the 46 header bytes of heap per entry); a hostile multi-GiB archive of empty members costs
+  gigabytes. Bounded by the input, not by an option. Candidate: `Options.max_entries` (default unlimited
+  or generous). Not added: new limit, needs an owner decision.
+- ~~**`extractAll` restores setuid/setgid/sticky bits**~~ DONE 2026-10-29 (§ GM, owner-delegated safe default):
+  masked to 0o777 unless `ExtractOptions.restore_special_bits` (Info-ZIP `unzip -K` semantics).
+- Zstandard window is now `Options.zstd_window_log_max` (default 27 = 128 MiB per open entry, unchanged).
+  lzma (default `max_dict` 64 MiB) and bzip2 (about 4 MiB) stay at their module defaults; no zipstream option.
 
 ## Status
 `extract · any · codec (reader + writer) · reentrant` + deps: none (std only) — canonical source is

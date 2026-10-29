@@ -128,6 +128,9 @@ pub const Codec = struct {
 pub const CodecEntry = struct {
     flags: u16,
     uncompressed_size: u64,
+    /// `Archive.Options.zstd_window_log_max`, for the Zstandard codec (others
+    /// ignore it).
+    window_log_max: u5 = 27,
 };
 
 pub const CodecReader = struct {
@@ -145,7 +148,7 @@ pub const CodecWriter = struct {
 };
 
 /// Zstandard (method 93) through the sibling `zstd` module: frames of any
-/// window up to its default `window_log_max` (128 MiB) are read; written at
+/// window up to `Archive.Options.zstd_window_log_max` (default 27: 128 MiB) are read; written at
 /// the level given (0 = zstd's default, 3), with the content checksum off
 /// (the entry has its CRC-32), as zip2 and libzip write it.
 pub const zstd_codec: Codec = .{
@@ -158,10 +161,10 @@ const ZstdCodec = struct {
     const R = struct { r: zstd.DecompressReader };
     const W = struct { w: zstd.StreamWriter, buf: [4096]u8 };
 
-    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
+    fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, entry: CodecEntry) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
-        s.r = try zstd.DecompressReader.init(gpa, input, &.{}, .{});
+        s.r = try zstd.DecompressReader.init(gpa, input, &.{}, .{ .window_log_max = entry.window_log_max });
         return .{ .reader = &s.r.interface, .state = s, .close = closeReader };
     }
 
@@ -602,6 +605,9 @@ const SourceReader = struct {
 /// A central-directory-parsed ZIP archive. Borrows an already-open `File` (does
 /// not close it); owns the reader buffer, the entry list and the entries' name
 /// storage. Initialise in place — see the lifetime contract above.
+/// Most entries reserved up front from the end record's (untrusted) count.
+const max_initial_entries = 4096;
+
 pub const Archive = struct {
     /// Where the bytes come from; every `EntryReader` reads it at its own
     /// offset, so entries may be read concurrently (`Source` doc).
@@ -628,6 +634,15 @@ pub const Archive = struct {
         /// `.cp437` decodes them as IBM 437, the APPNOTE default (Python
         /// `zipfile`, zip2). ASCII names read the same either way.
         legacy_names: enum { raw, cp437 } = .raw,
+        /// Zstandard entries: refuse a frame whose window exceeds
+        /// 2^`zstd_window_log_max` bytes (the refusal surfaces as
+        /// `error.ReadFailed` from the entry's reader). This is the memory an
+        /// open Zstandard entry can make the decoder allocate -- about that
+        /// many bytes -- from a few header bytes of an untrusted archive, so
+        /// lower it (e.g. 22 = 4 MiB) when many entries are open at once.
+        /// 27 (128 MiB) is libzstd's default; frames written with a larger
+        /// window need it raised.
+        zstd_window_log_max: u5 = 27,
     };
 
     fn codecFor(self: *const Archive, method: u16) ?*const Codec {
@@ -695,11 +710,11 @@ pub const Archive = struct {
         const scratch = try alloc.alloc(u8, 2 * 0xffff);
         defer alloc.free(scratch);
 
-        // One allocation for the whole list: the end record says how many
-        // there are (bounded by what the file can hold — a forged count
-        // must not reserve gigabytes).
+        // Reserve for the end record's count, bounded by what the file can
+        // hold and by `max_initial_entries` (a forged count must not reserve
+        // gigabytes before one record is validated; the list grows after that, sweep R-ZS-5).
         const fit = (size -| dir.start) / @sizeOf(std.zip.CentralDirectoryFileHeader);
-        try self.entries.ensureTotalCapacity(alloc, @intCast(@min(dir.count, fit)));
+        try self.entries.ensureTotalCapacity(alloc, @intCast(@min(dir.count, fit, max_initial_entries)));
         fr.seekTo(dir.start);
         var pos = dir.start;
         var n: u64 = 0;
@@ -732,6 +747,8 @@ pub const Archive = struct {
                 stored = up.name;
                 name_is_utf8 = true;
             };
+            // The Unicode Path extra may have replaced the name: same limit again (sweep R-ZS-6).
+            if (stored.len > std.Io.Dir.max_path_bytes) return Error.ZipNameTooLong;
             const legacy = !name_is_utf8 and options.legacy_names == .cp437 and !isAscii(stored);
             const name = if (legacy) try encoding.decodeToUtf8(name_alloc, stored, .cp437) else try name_alloc.dupe(u8, stored);
             if (legacy) name_is_utf8 = true;
@@ -846,7 +863,8 @@ fn findDirectory(alloc: Allocator, fr: *SourceReader, size: u64) !Directory {
         var rec: [56]u8 = undefined;
         // At its stated offset; else right before the locator (no extensible
         // data), where a prefixed archive's record is.
-        const rec_pos = if (rec_off + 56 <= eocd_pos - 20 and try hasSigAt(fr, rec_off, &std.zip.end_record64_sig))
+        // `rec_off` is the file's u64: `rec_off + 56` could wrap (a panic in safe builds).
+        const rec_pos = if (rec_off <= eocd_pos - 20 - 56 and try hasSigAt(fr, rec_off, &std.zip.end_record64_sig))
             rec_off
         else
             eocd_pos - 20 - 56;
@@ -977,6 +995,10 @@ pub const ExtractOptions = struct {
     /// Restore Unix permission bits / the modification time when the entry
     /// carries them.
     restore_mode: bool = true,
+    /// With `restore_mode`, also restore the setuid, setgid and sticky bits
+    /// (`0o7000`). Off by default, as in Info-ZIP `unzip` (its `-K`): a
+    /// hostile archive extracted by root would otherwise create setuid files.
+    restore_special_bits: bool = false,
     restore_mtime: bool = true,
     password: ?[]const u8 = null,
 };
@@ -1026,10 +1048,14 @@ pub fn extractAll(archive: *Archive, io: std.Io, dir: std.Io.Dir, opts: ExtractO
         var file = try dir.createFile(io, e.name, .{ .exclusive = !opts.overwrite, .truncate = true });
         defer file.close(io);
         var fw = file.writer(io, wbuf);
+        // A failed stream (CRC, AES auth, max_entry, I/O) must not leave attacker-chosen
+        // partial content behind under the entry's name (sweep R-ZS-7).
+        errdefer dir.deleteFile(io, e.name) catch {};
         _ = try er.reader().streamRemaining(&fw.interface);
         try fw.interface.flush();
         if (opts.restore_mode) if (e.mode) |m| {
-            if (@hasDecl(std.Io.File.Permissions, "fromMode")) try file.setPermissions(io, .fromMode(m));
+            const bits = if (opts.restore_special_bits) m else m & 0o777;
+            if (@hasDecl(std.Io.File.Permissions, "fromMode")) try file.setPermissions(io, .fromMode(bits));
         };
         if (opts.restore_mtime) if (e.mtime) |t| {
             try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@as(i96, t) * std.time.ns_per_s) } });
@@ -1052,6 +1078,10 @@ pub fn extractAll(archive: *Archive, io: std.Io, dir: std.Io.Dir, opts: ExtractO
 /// separator (`../x`, `a/../b`, `dir\..\x`). Accepts ordinary relative member
 /// paths (`a.csv`, `sub/b.csv`), including names that merely contain dots
 /// (`a..b`, `...`).
+///
+/// Not checked (a Windows extractor must add them): NTFS alternate data
+/// streams (`a:stream`, only `X:` at the start is rejected) and reserved
+/// device names (`CON`, `NUL`, trailing dots/spaces).
 pub fn isSafeEntryName(name: []const u8) bool {
     if (name.len == 0) return false;
     if (name[0] == '/' or name[0] == '\\') return false; // absolute
@@ -1065,7 +1095,8 @@ pub fn isSafeEntryName(name: []const u8) bool {
 
 /// A streaming reader over one entry's decompressed bytes. Initialise in place
 /// against an `Archive` and a caller-provided decompression `window` buffer
-/// (≥ `std.compress.flate.max_window_len` for deflate). The window must outlive
+/// (≥ `std.compress.flate.max_window_len` for deflate; a shorter one is a
+/// checked panic). The window must outlive
 /// the `EntryReader`. Opening a new `EntryReader` reseeks the shared file
 /// cursor, so a previous one must be finished first.
 ///
@@ -1146,9 +1177,12 @@ pub const EntryReader = struct {
     /// that one; the CRC-32 then fails).
     pub fn open(self: *EntryReader, archive: *Archive, entry: *const Entry, window: []u8, opts: OpenOptions) !void {
         const max_output = opts.max_output;
-        if (entry.encrypted and opts.password == null) return Error.ZipEncryptedEntry;
+        // Set before the first return: a caller may `defer er.deinit()` ahead of a failing `open` (sweep R-ZS-1).
         self.codec = null;
         self.is_aes = false;
+        if (entry.encrypted and opts.password == null) return Error.ZipEncryptedEntry;
+        // An offset past the end is a bad offset, not an I/O error (a file source's pread rejects it with EINVAL) (sweep R-ZS-10).
+        if (entry.file_offset >= archive.source.size) return Error.ZipBadFileOffset;
         self.src_reader = .init(archive.source, &self.src_buf, entry.file_offset);
         const fr = &self.src_reader;
         // A stored entry is its own bytes: a compressed size that differs
@@ -1216,6 +1250,8 @@ pub const EntryReader = struct {
                     .remaining = csize,
                     .interface = .{ .vtable = &PaddedInput.vtable, .buffer = &self.deflate_in_buf, .seek = 0, .end = 0 },
                 };
+                // std asserts this (UB in ReleaseFast); the contract is in the type doc.
+                if (window.len < std.compress.flate.max_window_len) @panic("zipstream: EntryReader window shorter than std.compress.flate.max_window_len");
                 self.decompress = .init(&self.deflate_in.interface, .raw, window);
                 // Clamp the decompressed stream to the declared size. `window`
                 // is already owned by `decompress`, so the Limited reads
@@ -1229,7 +1265,7 @@ pub const EntryReader = struct {
                 const codec = archive.codecFor(entry.method()) orelse return Error.UnsupportedCompressionMethod;
                 self.gpa = archive.alloc;
                 self.codec_in = in.limited(.limited64(csize), &self.codec_in_buf);
-                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface, .{ .flags = entry.flags, .uncompressed_size = entry.uncompressed_size });
+                self.codec = try codec.open_reader.?(codec.context, archive.alloc, &self.codec_in.interface, .{ .flags = entry.flags, .uncompressed_size = entry.uncompressed_size, .window_log_max = archive.options.zstd_window_log_max });
                 self.limited = self.codec.?.reader.limited(.limited64(entry.uncompressed_size), window);
             },
         }
@@ -1403,8 +1439,9 @@ pub const AddEntryOptions = struct {
     /// Entry comment (central directory), at most 65535 bytes.
     comment: []const u8 = "",
     /// Caller extra-field records (each `id u16, len u16, data`), written
-    /// in both headers after the module's own (`UT`, zip64). At most what
-    /// fits the 65535-byte field with them.
+    /// in both headers after the module's own (`UT`, zip64, AES). At most
+    /// 65487 bytes (65535 minus the module's own records at their largest);
+    /// longer is `error.ZipWriteTooLarge`.
     extra: []const u8 = "",
     /// Write the zip64 extra even when the sizes fit (Python `force_zip64`):
     /// needed when a streamed entry may outgrow 4 GiB, harmless otherwise.
@@ -1447,7 +1484,7 @@ fn writeCodec(options: AddEntryOptions) ?*const Codec {
         .bzip2 => &bzip2_codec,
         .lzma => &lzma_codec,
         .xz => &xz_codec,
-        .custom => options.codec orelse unreachable, // `.custom` needs `codec`
+        .custom => options.codec, // `prepare` refuses `.custom` without a writer codec
         else => null,
     };
 }
@@ -1473,7 +1510,13 @@ fn writeCodec(options: AddEntryOptions) ?*const Codec {
 /// before anything that would overflow is written.
 ///
 /// Entry names are gated through `isSafeEntryName` (`ZipUnsafeEntryName`),
-/// so this module can never itself be the source of a zip-slip archive.
+/// so a name can never make this module the source of a zip-slip archive.
+/// Symlink targets are not validated by the writer; `extractAll` refuses
+/// unsafe ones when reading.
+///
+/// Misuse that cannot be reported through the error sets is a checked
+/// `@panic("zipstream: ...")`: adding an entry (or `finish`) after `finish`,
+/// adding while a streamed entry is open, `endEntry` without `beginEntry`.
 ///
 /// Movable, except between `beginEntry` and `endEntry` (the returned writer
 /// points into heap state the writer owns, so even then moving only the
@@ -1581,13 +1624,19 @@ pub const ArchiveWriter = struct {
     };
 
     fn prepare(self: *ArchiveWriter, name: []const u8, method: WriteMethod, options: AddEntryOptions, unix_type: u32) !Header {
-        std.debug.assert(!self.finished);
-        std.debug.assert(self.open == null); // finish the streamed entry first
+        if (self.finished) @panic("zipstream: ArchiveWriter used after finish()");
+        if (self.open != null) @panic("zipstream: ArchiveWriter entry added while a streamed entry is open (call endEntry first)");
+        if (method == .custom) {
+            const c = options.codec orelse return Error.UnsupportedCompressionMethod;
+            if (c.open_writer == null) return Error.UnsupportedCompressionMethod;
+        }
         if (!isSafeEntryName(name)) return Error.ZipUnsafeEntryName;
         if (name.len > std.math.maxInt(u16)) return Error.ZipNameTooLong;
         if (options.comment.len > std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
-        if (options.extra.len > std.math.maxInt(u16) - ut_extra_len - zip64_local_len) return Error.ZipWriteTooLarge;
+        if (options.extra.len > max_caller_extra) return Error.ZipWriteTooLarge;
         if (!self.allow_zip64) {
+            // Before anything is written (sweep R-ZS-4); `beginEntry` repeats it.
+            if (options.force_zip64) return Error.ZipWriteTooLarge;
             if (self.offset > u32_max) return Error.ZipWriteTooLarge;
             if (self.entries.items.len >= std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
         }
@@ -1622,6 +1671,13 @@ pub const ArchiveWriter = struct {
     /// The zip64 extra in a local header: both sizes (APPNOTE 4.5.3: a
     /// local header's zip64 record carries both or neither).
     const zip64_local_len = 4 + 16;
+    /// The most a central header's own records can take: `UT`, the zip64 record
+    /// with all three fields (known only at `finish`), the AES record. The
+    /// caller's `extra` must fit the u16 field next to them (sweep ZS-2: the
+    /// limit used to leave out the AES record and the third zip64 field).
+    const central_own_extra_max = ut_extra_len + (4 + 24) + 11;
+    /// Longest `AddEntryOptions.extra` accepted (`error.ZipWriteTooLarge`).
+    const max_caller_extra = std.math.maxInt(u16) - central_own_extra_max;
 
     fn writeLocal(self: *ArchiveWriter, name: []const u8, h: Header, crc: u32, csize: u64, usize_: u64, zip64: bool, streamed: bool, options: AddEntryOptions) !void {
         const extra_len: u16 = @intCast(@as(usize, if (h.ut != null) ut_extra_len else 0) + @as(usize, if (zip64) zip64_local_len else 0) +
@@ -1738,6 +1794,7 @@ pub const ArchiveWriter = struct {
 
     /// A directory member (`name/`, stored, empty; Unix mode `0o755` unless
     /// `options.mode` says otherwise). The trailing '/' is added if missing.
+    /// A directory has no content to encrypt: `options.encryption` is ignored (sweep R-ZS-3).
     pub fn addDirectory(self: *ArchiveWriter, name: []const u8, options: AddEntryOptions) !void {
         var buf: [std.math.maxInt(u16)]u8 = undefined;
         const dir = if (std.mem.endsWith(u8, name, "/")) name else blk: {
@@ -1748,6 +1805,7 @@ pub const ArchiveWriter = struct {
         };
         var o = options;
         o.method = .store;
+        o.encryption = null;
         const h = try self.prepare(dir, .store, o, 0o040000);
         const off = self.offset;
         try self.writeLocal(dir, h, 0, 0, 0, o.force_zip64, false, o);
@@ -1755,15 +1813,21 @@ pub const ArchiveWriter = struct {
     }
 
     /// A Unix symlink member: its content is `target`, stored, mode
-    /// `S_IFLNK | 0o777` unless `options.mode` says otherwise.
+    /// `S_IFLNK | 0o777` unless `options.mode` says otherwise. `options.encryption`
+    /// is ignored (the target is stored in the clear; sweep R-ZS-3). The writer does
+    /// not validate `target`: `extractAll` refuses unsafe targets on the read side.
     pub fn addSymlink(self: *ArchiveWriter, name: []const u8, target: []const u8, options: AddEntryOptions) !void {
         var o = options;
         o.method = .store;
+        o.encryption = null;
         if (o.mode == null) o.mode = 0o777;
         const h = try self.prepare(name, .store, o, 0o120000);
+        // As `addEntry`: a target past 4 GiB needs the zip64 records.
+        const zip64 = o.force_zip64 or target.len > u32_max;
+        if (zip64 and !self.allow_zip64) return Error.ZipWriteTooLarge;
         const crc = crc32.Crc32.hash(target);
         const off = self.offset;
-        try self.writeLocal(name, h, crc, target.len, target.len, o.force_zip64, false, o);
+        try self.writeLocal(name, h, crc, target.len, target.len, zip64, false, o);
         try self.out.writeAll(target);
         self.offset += target.len;
         try self.record(name, h, crc, target.len, target.len, off, false, o);
@@ -1840,7 +1904,7 @@ pub const ArchiveWriter = struct {
     /// Finish the streamed member: flush the compressor, write the data
     /// descriptor, record the entry.
     pub fn endEntry(self: *ArchiveWriter) !void {
-        const s = self.open orelse unreachable; // no `beginEntry`
+        const s = self.open orelse @panic("zipstream: endEntry() without beginEntry()");
         defer {
             if (s.codec) |c| c.close(c.state, self.alloc);
             self.alloc.destroy(s);
@@ -1878,8 +1942,8 @@ pub const ArchiveWriter = struct {
     /// Call exactly once, after all entries are added. `out` still needs a
     /// final flush by the caller — `finish()` never flushes/closes it.
     pub fn finish(self: *ArchiveWriter) !void {
-        std.debug.assert(!self.finished);
-        std.debug.assert(self.open == null); // `endEntry` first
+        if (self.finished) @panic("zipstream: finish() called twice");
+        if (self.open != null) @panic("zipstream: finish() while a streamed entry is open (call endEntry first)");
         self.finished = true;
         if (self.comment.len > std.math.maxInt(u16)) return Error.ZipWriteTooLarge;
 
@@ -3497,6 +3561,7 @@ test {
     _ = @import("s2_test.zig");
     _ = @import("crypto_test.zig");
     _ = @import("crypto.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
