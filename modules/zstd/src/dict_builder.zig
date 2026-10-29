@@ -166,7 +166,9 @@ pub const Epochs = struct { num: u32, size: u32 };
 /// `COVER_computeEpochs`: split `nb_dmers` into epochs of at least 10·k
 /// d-mers, aiming at `passes` passes over the corpus. `nb_dmers` ≥ 1.
 pub fn computeEpochs(max_dict_size: u32, nb_dmers: u32, k: u32, passes: u32) Epochs {
-    const min_epoch_size = k *% 10;
+    // total for the public helper: nothing to split, or nothing to split by
+    if (nb_dmers == 0 or k == 0 or passes == 0) return .{ .num = 1, .size = nb_dmers };
+    const min_epoch_size = k *| 10;
     var e: Epochs = .{ .num = @max(1, max_dict_size / k / passes), .size = 0 };
     e.size = nb_dmers / e.num;
     if (e.size >= min_epoch_size) {
@@ -296,6 +298,7 @@ pub const ActiveDmers = struct {
     /// `COVER_map_init`'s size for `size` elements: 2^(highbit(size) + 2)
     /// pairs, or null when that is past 2^31 (libzstd's shift overflows).
     pub fn slots(size: u32) ?u64 {
+        if (size == 0) return null;
         const log = 31 - @as(u32, @clz(size)) + 2;
         if (log > 31) return null;
         return @as(u64, 1) << @intCast(log);
@@ -953,7 +956,8 @@ pub const OptimizeParams = struct {
     /// scoring included, below the ceiling.
     memory_limit: usize = default_memory_limit,
     /// `nbThreads`: candidates built and scored at once, each on a thread
-    /// of its own (0 and 1: one, on the calling thread). The result is the
+    /// of its own (0 and 1: one, on the calling thread; above `max_threads`,
+    /// that many). The result is the
     /// same for every count: the candidates are compared in grid order, as
     /// libzstd compares them single-threaded, where libzstd with threads
     /// keeps whichever of two equally good candidates finishes first. Each
@@ -1089,6 +1093,17 @@ const Futex = struct {
         io().futexWake(u32, &word.raw, n);
     }
 };
+
+/// The most worker threads an optimizer starts, whatever `nb_threads` asks
+/// (the result does not depend on the count; this is `ZSTDMT_NBWORKERS_MAX`).
+pub const max_threads = 256;
+
+/// How many slots (and, from 2, threads) an optimizer runs: the requested
+/// count (0 is 1), at most `max_threads` and the candidates of one d.
+pub fn workerThreads(nb_threads: u32, per_d: u64) usize {
+    const threads: u64 = if (builtin.single_threaded) 1 else @min(@max(nb_threads, 1), max_threads);
+    return @intCast(@min(threads, per_d));
+}
 
 /// The optimizers' engine. libzstd with `nbThreads > 1` posts each (k, d)
 /// candidate to a pool and keeps whichever strictly smaller total
@@ -1319,8 +1334,7 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, budget: ?*LimitedAllocato
     var o: O = .{ .gpa = gpa, .budget = budget, .meta = if (budget) |b| b.child else gpa, .scorer = scorer, .grid = grid, .capacity = dict.len, .samples = samples, .notify = n };
     // no more slots than one d has candidates
     const per_d: u64 = 1 + (grid.k_max - grid.k_min) / grid.k_step_size;
-    const threads: u64 = if (builtin.single_threaded) 1 else @max(params.nb_threads, 1);
-    try o.start(@intCast(@min(threads, per_d)));
+    try o.start(workerThreads(params.nb_threads, per_d));
     defer o.stop();
     optimize_slots.store(o.slots.len, .monotonic);
     var best: ?Optimized = null;
@@ -1673,6 +1687,12 @@ pub const SelectParams = struct {
 /// `freeSelection`.
 pub fn selectDict(gpa: Allocator, buffer: []const u8, content_len: usize, samples: Samples, offsets: []const usize, nb_finalize_samples: usize, nb_train_samples: usize, split_point: f64, p: SelectParams) Error!?Selection {
     const capacity = buffer.len;
+    // arguments a scorer got from the optimizer always satisfy these
+    if (content_len > capacity) return error.DstSizeTooSmall;
+    if (nb_finalize_samples > samples.sizes.len or nb_train_samples > samples.sizes.len or offsets.len <= samples.sizes.len) return error.SrcSizeWrong;
+    for (samples.sizes, offsets[0..samples.sizes.len]) |n, o| {
+        if (o > samples.buffer.len or n > samples.buffer.len - o) return error.SrcSizeWrong;
+    }
     const content = buffer[capacity - content_len ..];
     const regression_tolerance = @as(f64, @floatFromInt(p.shrink_max_regression)) / 100.0 + 1.00;
     const zp: zdict.Params = .{ .level = p.level, .dict_id = p.dict_id, .notify = p.notify };

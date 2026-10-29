@@ -731,6 +731,7 @@ test {
     _ = @import("decompress.zig");
     _ = @import("dstream.zig");
     _ = @import("dstream_test.zig");
+    _ = @import("sweep_dec_test.zig");
     _ = @import("seekable_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("decoder_dict_test.zig");
@@ -743,6 +744,7 @@ test {
     _ = @import("dict_builder.zig");
     _ = @import("zdict.zig");
     _ = @import("dict_golden_test.zig");
+    _ = @import("sweep_enc_test.zig");
 }
 
 /// Decode with std. std's own checksum verification is a TODO panic in the

@@ -178,8 +178,8 @@ const base_ofc_freqs = [max_off + 1]u32{
 fn freqFromFse(ct: *const @import("fse.zig").CTable, symbol: usize) u32 {
     const scale_log = 10; // scale to 1K
     const bit_cost = (ct.symbol_tt[symbol].delta_nb_bits +% ((1 << 16) - 1)) >> 16;
-    std.debug.assert(bit_cost < scale_log);
-    return if (bit_cost != 0) @as(u32, 1) << @intCast(scale_log - bit_cost) else 1; // minimum to calculate cost
+    // (a table from a dictionary: not asserted to be within the scale, as above)
+    return if (bit_cost != 0 and bit_cost <= scale_log) @as(u32, 1) << @intCast(scale_log - bit_cost) else 1; // minimum to calculate cost
 }
 
 /// `ZSTD_rescaleFreqs`: on the first block, statistics from the
@@ -202,8 +202,9 @@ fn rescaleFreqs(st: *State, src: []const u8, comptime opt_level: u32) void {
                     const scale_log = 11; // scale to 2K
                     // HUF_getNbBitsFromCTable
                     const bit_cost: u32 = if (lit > sc.huf.table.max_symbol) 0 else sc.huf.table.elt[lit].nb_bits;
-                    std.debug.assert(bit_cost <= scale_log);
-                    f.* = if (bit_cost != 0) @as(u32, 1) << @intCast(scale_log - bit_cost) else 1; // minimum to calculate cost
+                    // (a dictionary's table may have a code longer than the scale: libzstd
+                    // only asserts, and shifts by a negative count; the minimum here)
+                    f.* = if (bit_cost != 0 and bit_cost <= scale_log) @as(u32, 1) << @intCast(scale_log - bit_cost) else 1; // minimum to calculate cost
                     st.lit_sum += f.*;
                 }
             }

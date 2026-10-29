@@ -192,7 +192,9 @@ pub fn readNCount(norm: []i16, max_sv: *u32, table_log: *u32, header: []const u8
         if (previous0) {
             var repeats: u32 = @ctz(~bit_stream | 0x80000000) >> 1;
             while (repeats >= 12) {
-                charnum += 3 * 12;
+                // Saturating: a dictionary of >= 358 MB of repeat codes wraps a u32
+                // (libzstd's wraps silently); saturated is >= max_sv1, the error below.
+                charnum +|= 3 * 12;
                 if (ip + 7 <= iend) {
                     ip += 3;
                 } else {
@@ -203,11 +205,11 @@ pub fn readNCount(norm: []i16, max_sv: *u32, table_log: *u32, header: []const u8
                 bit_stream = readLE32(header, ip) >> @intCast(bit_count);
                 repeats = @ctz(~bit_stream | 0x80000000) >> 1;
             }
-            charnum += 3 * repeats;
+            charnum +|= 3 * repeats;
             bit_stream >>= @intCast(2 * repeats);
             bit_count += @intCast(2 * repeats);
 
-            charnum += bit_stream & 3;
+            charnum +|= bit_stream & 3;
             bit_count += 2;
 
             if (charnum >= max_sv1) break;

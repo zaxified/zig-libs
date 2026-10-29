@@ -653,12 +653,16 @@ inline fn copyFromExt(h: *const History, o_lit_end: usize, seq: *Seq, op: *usize
     const back = seq.offset - (o_lit_end - h.prefix); // bytes before prefix
     if (back > h.ext.len) return error.CorruptionDetected;
     const m = h.ext.len - back;
+    // `ext` may alias `out`: the stream's output ring, once it wrapped, keeps
+    // the older lap as `ext` and writes the new one over it, and a corrupt
+    // offset (beyond the window) can name bytes about to be overwritten. As
+    // libzstd's `ZSTD_memmove`; `@memcpy` panics on overlap in safe builds.
     if (m + seq.match_length <= h.ext.len) {
-        @memcpy(h.out[o_lit_end..][0..seq.match_length], h.ext[m..][0..seq.match_length]);
+        @memmove(h.out[o_lit_end..][0..seq.match_length], h.ext[m..][0..seq.match_length]);
         return true;
     }
     const length1 = h.ext.len - m;
-    @memcpy(h.out[o_lit_end..][0..length1], h.ext[m..][0..length1]);
+    @memmove(h.out[o_lit_end..][0..length1], h.ext[m..][0..length1]);
     op.* = o_lit_end + length1;
     seq.match_length -= length1;
     return false;

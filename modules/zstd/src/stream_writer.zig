@@ -50,7 +50,7 @@ pub const StreamWriter = struct {
 
     const vtable: Writer.VTable = .{ .drain = drain, .flush = flush };
 
-    /// `buffer` must be nonempty. `gpa` holds the stream's workspace
+    /// `buffer` may be empty (the writer is then unbuffered). `gpa` holds the stream's workspace
     /// (allocated at its first call) and a scratch of
     /// `compressBound(128 KB)` bytes for the writer's life.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: stream.Options) InitError!StreamWriter {
@@ -62,11 +62,12 @@ pub const StreamWriter = struct {
         return sw;
     }
 
-    /// `init` with the caller's `scratch` (nonempty, any length; the bytes
+    /// `init` with the caller's `scratch` (nonempty, else a panic; any length; the bytes
     /// do not depend on it) instead of an allocated one; `gpa` holds only
     /// the stream's workspace. Both buffers must outlive the writer.
     pub fn initScratch(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, scratch: []u8, opts: stream.Options) InitError!StreamWriter {
         try checkModes(opts);
+        if (scratch.len == 0) @panic("zstd: StreamWriter scratch must not be empty");
         return fromStream(try .init(gpa, opts), output, buffer, scratch);
     }
 
@@ -76,11 +77,12 @@ pub const StreamWriter = struct {
     /// fails its write with `err` = `error.OutOfMemory`.
     pub fn initStatic(workspace: frame.Workspace, output: *Writer, buffer: []u8, scratch: []u8, opts: stream.Options) InitError!StreamWriter {
         try checkModes(opts);
+        if (scratch.len == 0) @panic("zstd: StreamWriter scratch must not be empty");
         return fromStream(try .initStatic(workspace, opts), output, buffer, scratch);
     }
 
     fn fromStream(s: stream.Stream, output: *Writer, buffer: []u8, scratch: []u8) StreamWriter {
-        std.debug.assert(buffer.len != 0 and scratch.len != 0);
+        std.debug.assert(scratch.len != 0); // checked by both callers; `buffer` may be empty (unbuffered)
         return .{
             .writer = .{ .buffer = buffer, .vtable = &vtable },
             .output = output,

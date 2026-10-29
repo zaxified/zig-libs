@@ -28,6 +28,9 @@ pub const InitError = error{
     OutOfMemory,
 };
 
+/// The size of the buffer a `FrameWriter` makes for itself when given none.
+pub const default_buffer_size = 128 * 1024;
+
 pub const FrameWriter = struct {
     /// The interface. Its buffer is the one passed to `init`: bytes written
     /// here stay in it until they are compressed.
@@ -41,35 +44,43 @@ pub const FrameWriter = struct {
     /// is written to `output`.
     scratch: []u8,
     frames: u64 = 0,
+    /// The buffer the writer allocated for an empty one given to `init`.
+    own_buffer: []u8 = &.{},
     /// Why the last `error.WriteFailed` came from here rather than from
     /// `output` (`Writer.Error` has room for one error only). Null when
     /// `output` failed.
     err: ?frame.Error = null,
 
-    /// `buffer` sets the frame size for a stream written without flushes; it
-    /// must be nonempty. `gpa` holds the frame scratch and the compression
+    /// `buffer` sets the frame size for a stream written without flushes; an
+    /// empty one is replaced by a buffer of `default_buffer_size` bytes the
+    /// writer allocates and frees itself. `gpa` holds the frame scratch and the compression
     /// context's workspace (allocated at the first frame) for the writer's
     /// life.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: Options) InitError!FrameWriter {
-        std.debug.assert(buffer.len != 0);
         if (opts.level > params.max_level) return error.LevelUnsupported;
         try opts.advanced.check();
+        const own: []u8 = if (buffer.len == 0) try gpa.alloc(u8, default_buffer_size) else &.{};
+        errdefer gpa.free(own);
+        const buf = if (buffer.len == 0) own else buffer;
+        const scratch = try gpa.alloc(u8, frame.compressBound(buf.len));
         return .{
+            .own_buffer = own,
             .writer = .{
-                .buffer = buffer,
+                .buffer = buf,
                 .vtable = &.{ .drain = drain, .flush = flush },
             },
             .output = output,
             .gpa = gpa,
             .opts = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced },
             .ctx = .initEmpty(gpa),
-            .scratch = try gpa.alloc(u8, frame.compressBound(buffer.len)),
+            .scratch = scratch,
         };
     }
 
     pub fn deinit(fw: *FrameWriter) void {
         fw.ctx.deinit();
         fw.gpa.free(fw.scratch);
+        fw.gpa.free(fw.own_buffer);
         fw.* = undefined;
     }
 

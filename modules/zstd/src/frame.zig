@@ -971,6 +971,7 @@ pub const Compressor = struct {
     /// `pledged` is known, no checksum, the dictionary ID.
     pub fn copyFrom(comp: *Compressor, src: *const Compressor, pledged: ?u64) (BeginError || error{StageWrong})!void {
         if (src.stage != .init) return error.StageWrong; // Can't copy a ctx that's not in init stage.
+        if (comp == src) return error.StageWrong; // onto itself, its tables would be copied over themselves
         const sc = &src.c;
         var adv: params.Advanced = .{ .content_size = pledged != null, .dict_id_flag = true };
         // Copy only compression parameters related to tables.
@@ -1745,6 +1746,10 @@ pub const Compressor = struct {
             const last_block: u32 = @intFromBool(block.n_seq == seqs.len);
             // discrepancy: Sequences require more literals than present in buffer
             if (block.lit_size > lits.len) return error.ExternalSequencesInvalid;
+            // literals past a block's size cannot be coded (the section's header holds
+            // 18 bits, and the length is a `u32`): the block would end in an error
+            // below anyway, after copying them; libzstd gives `dstSize_tooSmall` there
+            if (block.lit_size > comp.block_size_max) return error.CannotProduceUncompressedBlock;
             c.ss.reset();
             try seqapi.convertBlockSequences(&c.ss, .{ .prev = &c.prev.rep, .next = &c.next.rep }, &c.seq, seqs[0..block.n_seq], c.seq.repcode_resolution);
             seqs = seqs[block.n_seq..];

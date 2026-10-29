@@ -675,10 +675,12 @@ pub const MtCtx = struct {
             // extra for the overlap (if > 0), then one to fill which doesn't
             // overlap with the LDM window.
             const nb_slack_buffers: usize = @as(usize, 2) + @intFromBool(mt.target_prefix_size > 0);
-            const slack_size = mt.target_section_size * nb_slack_buffers;
+            // Checked: on a 32-bit usize a 1 GiB job times a few workers does not fit.
+            const slack_size = std.math.mul(usize, mt.target_section_size, nb_slack_buffers) catch return error.OutOfMemory;
             // Compute the total size, and always have enough slack
-            const sections_size = mt.target_section_size * @max(mt.n_workers, 1);
-            const capacity = @max(window_size, sections_size) + slack_size;
+            const sections_size = std.math.mul(usize, mt.target_section_size, @max(mt.n_workers, 1)) catch return error.OutOfMemory;
+            const capacity = std.math.add(usize, @max(window_size, sections_size), slack_size) catch return error.OutOfMemory;
+            if (capacity > std.math.maxInt(usize) - 64) return error.OutOfMemory;
             if (mt.round.len < capacity) {
                 RawBuf.free(gpa, mt.round_alloc);
                 mt.round_alloc = &.{};

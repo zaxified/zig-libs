@@ -237,6 +237,9 @@ pub const Stream = struct {
         // transparent initialization stage
         if (s.stage == .init) {
             const input_size = input.src.len - input.pos;
+            // input held back by an earlier call is taken back below (`pos -=`):
+            // a `pos` under it breaks the stable-input contract
+            if (s.opts.advanced.stable_in_buffer and input.pos < s.stable_in_not_consumed) return error.StabilityConditionNotRespected;
             const total_input_size = input_size + s.stable_in_not_consumed;
             // input presumed stable across calls, no flush requested, not
             // even one block yet: wait for more, for better parameters

@@ -377,7 +377,9 @@ pub fn findDecompressedSize(src_in: []const u8) Error!?u64 {
 }
 
 /// `ZSTD_decompressionMargin`: how far the end of the compressed data must
-/// lie behind the end of the output for in-place decompression.
+/// lie behind the end of the output for in-place decompression. Computed
+/// as libzstd does, for sizing only: this port's `decompress` does not
+/// decode in place (overlapping buffers are a checked panic).
 pub fn decompressionMargin(src_in: []const u8) Error!usize {
     var src = src_in;
     var margin: usize = 0;
@@ -596,11 +598,16 @@ pub const Decompressor = struct {
         d.block_type = 3;
     }
 
-    /// `ZSTD_checkContinuity`.
+    /// `ZSTD_checkContinuity`. An end of output below the start of the prefix
+    /// (an empty `dst` of some other buffer was the last output decoded, and
+    /// `decompressContinue` took its address as the end) holds no history:
+    /// libzstd subtracts the pointers regardless; here it is not a wrapped
+    /// length.
     fn checkContinuity(d: *Decompressor, dst: []u8) void {
         const a = @intFromPtr(dst.ptr);
-        if (a != d.prev_end_addr and dst.len > 0) {
-            const n = d.prev_end_addr - d.prefix_addr;
+        const broken = d.prev_end_addr < d.prefix_addr;
+        if ((a != d.prev_end_addr or broken) and dst.len > 0) {
+            const n = if (broken) 0 else d.prev_end_addr - d.prefix_addr;
             d.ext = if (n == 0) &.{} else @as([*]const u8, @ptrFromInt(d.prefix_addr))[0..n];
             d.prefix_addr = a;
             d.prev_end_addr = a;
@@ -857,7 +864,9 @@ pub const Decompressor = struct {
 
     /// `ZSTD_decompressDCtx`: decodes every frame in `src` (concatenated
     /// frames and skippable frames allowed) into `dst`. Returns the number
-    /// of bytes written. `dst` and `src` must not overlap.
+    /// of bytes written. `dst` and `src` must not overlap: this port does
+    /// not decode in place (libzstd's in-place mode is Backlog), so an
+    /// overlap is a checked panic rather than an aliased copy.
     ///
     /// With `Options.ddicts` set, libzstd's own one-shot
     /// `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx` resolves ONE
@@ -875,6 +884,10 @@ pub const Decompressor = struct {
     /// `Options.ddict` if set, else the *last* entry of `Options.ddicts`
     /// (mirroring "last ref'd"), else none, fixed for the whole call.
     pub fn decompress(d: *Decompressor, dst: []u8, src: []const u8) Error!usize {
+        if (dst.len != 0 and src.len != 0 and
+            @intFromPtr(dst.ptr) < @intFromPtr(src.ptr) + src.len and
+            @intFromPtr(src.ptr) < @intFromPtr(dst.ptr) + dst.len)
+            @panic("zstd: decompress dst and src overlap (in-place decoding is not supported)");
         try d.options.check();
         var ip: usize = 0;
         var op: usize = 0;
@@ -924,6 +937,9 @@ pub const Decompressor = struct {
         d.checkContinuity(dst);
         switch (d.stage) {
             .get_frame_header_size => {
+                // `expected` is 0 once a frame is over (`begin` before the next
+                // one): an empty `src` is no frame header, not a magic to read.
+                if (src.len < headerPrefixSize(d.options.format)) return error.SrcSizeWrong;
                 if (d.options.format == .zstd1 and isSkippableMagic(readLE32(src, 0))) {
                     @memcpy(d.header_buffer[0..src.len], src);
                     d.expected = skippable_header_size - src.len;
@@ -1002,7 +1018,11 @@ pub const Decompressor = struct {
                 if (r_size > d.fparams.block_size_max) return error.CorruptionDetected;
                 d.decoded_size += r_size;
                 if (d.validate) d.xxh.update(dst[0..r_size]);
-                d.prev_end_addr = @intFromPtr(dst.ptr) + r_size;
+                // A block that wrote nothing moves no history: an empty `dst` may
+                // be any slice of any buffer, and its address, taken as the end of
+                // the output, would make the next `checkContinuity` treat
+                // everything up to there as older segment.
+                if (r_size > 0) d.prev_end_addr = @intFromPtr(dst.ptr) + r_size;
                 if (d.expected > 0) return r_size; // more of this raw block to come
 
                 if (d.stage == .decompress_last_block) {

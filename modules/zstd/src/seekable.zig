@@ -104,11 +104,15 @@ pub const FrameLog = struct {
         if (fl.seek_table_pos < offset + 4) {
             var tmp: [4]u8 = undefined;
             std.mem.writeInt(u32, &tmp, value, .little);
-            const len = @min(out.dst.len - out.pos, offset + 4 - fl.seek_table_pos);
+            // `out.pos` past the end of `dst` (a caller's mistake) is no room,
+            // not a wrapped one
+            const len = @min(out.dst.len -| out.pos, offset + 4 - fl.seek_table_pos);
             const from = fl.seek_table_pos - offset;
-            @memcpy(out.dst[out.pos..][0..len], tmp[from..][0..len]);
-            out.pos += len;
-            fl.seek_table_pos += @intCast(len);
+            if (len > 0) {
+                @memcpy(out.dst[out.pos..][0..len], tmp[from..][0..len]);
+                out.pos += len;
+                fl.seek_table_pos += @intCast(len);
+            }
             if (len < 4) return fl.seekTableSize() - fl.seek_table_pos;
         }
         return null;
@@ -131,7 +135,7 @@ pub const FrameLog = struct {
             }
         }
         if (fl.write32(out, @intCast(fl.entries.items.len), len - footer_size)) |left| return left;
-        if (out.dst.len - out.pos < 1) return len - fl.seek_table_pos;
+        if (out.dst.len -| out.pos < 1) return len - fl.seek_table_pos;
         if (fl.seek_table_pos < len - 4) {
             out.dst[out.pos] = @as(u8, @intFromBool(fl.checksum_flag)) << 7;
             out.pos += 1;
@@ -199,6 +203,7 @@ pub const SeekableStream = struct {
     /// (it may leave some -- present it again) and ends the frame when it
     /// is full; returns how much more input the frame takes.
     pub fn compressStream(s: *SeekableStream, out: *OutBuffer, in: *InBuffer) CompressError!usize {
+        if (in.pos > in.src.len) return error.InvalidBuffer;
         const avail = in.src[in.pos..];
         const in_len = @min(avail.len, s.max_frame_size - s.frame_d_size);
         if (in_len > 0) {
@@ -206,7 +211,7 @@ pub const SeekableStream = struct {
             const prev_out = out.pos;
             const r = s.stream.compressStream2(out, &tmp, .@"continue");
             if (s.log.checksum_flag) s.xxh.update(avail[0..tmp.pos]);
-            s.frame_c_size +%= @intCast(out.pos - prev_out);
+            s.frame_c_size +%= @truncate(out.pos - prev_out); // total: a frame is <= 1 GiB in, so <= ~1 GiB out (never 4 GiB)
             s.frame_d_size += @intCast(tmp.pos);
             in.pos += tmp.pos;
             _ = try r;
@@ -225,7 +230,7 @@ pub const SeekableStream = struct {
         const prev_out = out.pos;
         var empty: InBuffer = .{ .src = &.{} };
         const r = s.stream.compressStream2(out, &empty, .end);
-        s.frame_c_size +%= @intCast(out.pos - prev_out);
+        s.frame_c_size +%= @truncate(out.pos - prev_out); // total: a frame is <= 1 GiB in, so <= ~1 GiB out (never 4 GiB)
         const left = try r;
         if (left != 0) return left;
         const checksum: u32 = if (s.log.checksum_flag) @truncate(s.xxh.final()) else 0;

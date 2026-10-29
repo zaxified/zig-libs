@@ -245,6 +245,9 @@ pub fn transferWithBlockDelim(ss: *SeqStore, reps: Reps, p: *const Params, pos: 
         } else {
             const ll0 = lit_length == 0;
             off_base = finalizeOffBase(in[idx].offset, &rep, ll0);
+            // offset 2^32 - 3 wraps to offBase 0 (no code: `storeSeqOnly` refuses it
+            // below), which `updateRep` must not see: `0 - 1` indexes `rep`
+            if (off_base == 0) return error.ExternalSequencesInvalid;
             updateRep(&rep, off_base, ll0);
         }
         // (libzstd reads past the block here; the sum up to the delimiter
@@ -369,6 +372,8 @@ pub fn transferNoDelim(ss: *SeqStore, reps: Reps, p: *const Params, pos: *Positi
         // Check if this offset can be represented with a repcode
         const ll0 = lit_length == 0;
         const off_base = finalizeOffBase(raw_offset, &rep, ll0);
+        // offBase 0 (offset 2^32 - 3): see `transferWithBlockDelim`
+        if (off_base == 0) return error.ExternalSequencesInvalid;
         updateRep(&rep, off_base, ll0);
 
         // (libzstd reads past the block on lengths wrapped by the cuts

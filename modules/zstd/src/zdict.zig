@@ -240,12 +240,22 @@ pub fn addEntropyTablesFromBuffer(gpa: Allocator, dict: []u8, content_size: usiz
     return @min(dict.len, h_size + content_size);
 }
 
+/// The largest offset code a dictionary of `content_len` bytes needs (its
+/// offsets reach `content_len + 128 KiB`), or null from 2 GiB - 128 KiB up,
+/// where it exceeds `offcode_max_all`. libzstd takes the sum as a `U32`, so
+/// that from 4 GiB - 128 KiB it wraps to a small code and accepts.
+pub fn offcodeMaxFor(content_len: usize) ?u32 {
+    const reach: u64 = @as(u64, content_len) + (128 << 10);
+    if (reach > std.math.maxInt(u32)) return null;
+    const code = fse.highbit32(@intCast(reach));
+    return if (code > offcode_max_all) null else code;
+}
+
 /// `ZDICT_analyzeEntropy`: compress every sample through `content`, count
 /// the literals and the sequences' codes, and write the Huffman table, the
 /// three FSE tables and the repcodes into `dst`. Returns their size.
 fn analyzeEntropy(gpa: Allocator, dst: []u8, level: i32, samples: Samples, content: []const u8, n: Notify) Error!usize {
-    const offcode_max = fse.highbit32(@truncate(content.len + (128 << 10)));
-    if (offcode_max > offcode_max_all) return error.DictionaryCreationFailed; // too large dictionary
+    const offcode_max = offcodeMaxFor(content.len) orelse return error.DictionaryCreationFailed; // too large dictionary
 
     var count_lit: [256]u32 = @splat(1); // any character must be described
     var offcode_count: [offcode_max_all + 1]u32 = @splat(0);
