@@ -228,7 +228,7 @@ pub fn main() !void {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.TooManyTargets => std.debug.print("probeMany with max_targets=1 over 2 targets: TooManyTargets (expected)\n", .{}),
-        error.OutOfMemory => return err,
+        error.TooManyAttempts, error.OutOfMemory => return err,
     }
 
     std.debug.print("OK: all probe example checks passed\n", .{});
