@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** Delta audit of the no-panic sweep (§ GK): 7 mutants over the GK fixes, 4 killed, 3 argued unobservable. Card A1 again.
 - **2026-10-29** — **Behaviour change (fix):** `dropPrivileges` reads all of `/proc/self/status` (was: the first 8 KiB), so a multithreaded process with many supplementary groups — whose `Groups:` line pushes `Threads:` further — now gets `error.MultipleThreads` instead of a silent per-thread drop; an EINTR read is retried, not taken as "unknown". `uid`/`gid` = `maxInt` (the kernel's "unchanged") is refused with `SetIdFailed` before any change; the `SetIdFailed` doc says privileges may otherwise be partly dropped. **Fix:** `Ruleset.deinit` is idempotent (a second call no longer closes a descriptor that reused the number). No-panic sweep + blind review (§ GK).
 - **2026-10-27** — **NO CONSUMER-VISIBLE CHANGE:** the example handles `error.MultipleThreads` from `dropPrivileges` (push CI `check-examples` was red on the exhaustive switch).
 - **2026-10-27** — **Performance (measurement):** `bench-sandbox` grades the per-syscall cost by BPF instructions executed (ours, libseccomp's two layouts, go-seccomp-bpf, seccompiler via `tools/foreign_steps/`); ref 0.99×, fastest 0.95× (libseccomp's tree). The interop oracle's interpreter moved to `tools/cbpf.zig`, shared with the bench. No module change.

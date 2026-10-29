@@ -518,6 +518,46 @@ test "deinit from a job of the same pool panics instead of freeing the pool unde
     try expectPanicsFromOwnJob(.deinit);
 }
 
+const DeinitProbe = struct { pool: *WorkerPool, survived_fd: i32 };
+
+fn deinitFromDrainingJob(ctx: *anyopaque) void {
+    const probe: *DeinitProbe = @ptrCast(@alignCast(ctx));
+    // Wait for the main thread's drain() to move the pool out of `running`,
+    // so deinit's own drain() is skipped and only its own-job guard is left.
+    while (probe.pool.state.load(.seq_cst) == .running) std.atomic.spinLoopHint();
+    probe.pool.deinit();
+    // Only reached when deinit returned (the guard is gone): say so, because
+    // the freed pool then aborts the child anyway, for another reason.
+    _ = std.os.linux.write(probe.survived_fd, "x", 1);
+}
+
+fn deinitFromDrainingJobChild(survived_fd: i32) u8 {
+    var threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{}); // global-alloc-ok: a forked child, whose leak checks never run
+    const pool = WorkerPool.init(std.heap.smp_allocator, .{ .io = threaded.io(), .n_workers = 1 }) catch return 3; // global-alloc-ok: same child
+    var probe = DeinitProbe{ .pool = pool, .survived_fd = survived_fd };
+    pool.submit(.{ .func = deinitFromDrainingJob, .ctx = &probe }) catch return 4;
+    pool.drain();
+    return 0;
+}
+
+test "deinit from a job of an already draining pool still panics (audit WP-5)" {
+    // On a running pool deinit's drain() hits drain's own guard and masks a
+    // missing deinit guard; on a draining pool nothing else stops the pool
+    // from being freed under the worker that runs the job. The freed pool
+    // aborts the child too, so the ABRT alone proves nothing: deinit must
+    // also never have returned.
+    if (!child.supported) return error.SkipZigTest;
+    const linux = std.os.linux;
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .NONBLOCK = true })) != .SUCCESS) return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    const out = try child.run(deinitFromDrainingJobChild, .{fds[1]}, .{ .limit_ms = 5000 });
+    try testing.expect(out.eql(.{ .signaled = @backingInt(std.posix.SIG.ABRT) }));
+    var byte: [1]u8 = undefined;
+    try testing.expect(linux.errno(linux.read(fds[0], &byte, 1)) == .AGAIN);
+}
+
 fn drainFromJobOnDrainingPoolJob(ctx: *anyopaque) void {
     const st: *DrainTwice = @ptrCast(@alignCast(ctx));
     // Wait until the main thread's drain() has moved the pool to `draining`

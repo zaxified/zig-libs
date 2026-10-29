@@ -228,3 +228,16 @@ test "waitReadable: a poll error is a failure, not a retry (review R-TK-5)" {
     fake_calls = 0;
     try testing.expectEqual(Wait.failed, waitReadable(pollFails, &fds, nowMs() + 1000));
 }
+
+fn spuriousZeroThenReady(_: []linux.pollfd, ms: i32) usize {
+    fake_ms[fake_calls] = ms;
+    fake_calls += 1;
+    return if (fake_calls < 3) 0 else 1;
+}
+
+test "waitReadable: a poll that returns 0 before the deadline is polled again, not a timeout (audit TK-13)" {
+    var fds = [_]linux.pollfd{.{ .fd = 0, .events = linux.POLL.IN, .revents = 0 }};
+    fake_calls = 0;
+    try testing.expectEqual(Wait.ready, waitReadable(spuriousZeroThenReady, &fds, nowMs() + 60_000));
+    try testing.expectEqual(@as(u32, 3), fake_calls);
+}

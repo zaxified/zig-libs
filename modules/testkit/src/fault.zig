@@ -289,3 +289,18 @@ test "a hand-written plan with n_chunks 0, 9 or a zero chunk still makes progres
         try testing.expectEqualStrings("hello, world", w.written());
     }
 }
+
+test "FaultPlan.chunk: an index past a hand-written n_chunks of 200 stays in bounds (audit TK-18)" {
+    const plan: FaultPlan = .{ .n_chunks = 200, .chunks = .{ 5, 4, 3, 2, 1, 6, 7, 8 } };
+    // n_chunks is clamped to the 8 slots, so the sizes cycle through them.
+    for (0..600) |k| try testing.expectEqual(@as(usize, plan.chunks[k % 8]), plan.chunk(k));
+    // And over a long stream through a reader: it finishes, in order.
+    var data: [1000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    var rbuf: [8]u8 = undefined;
+    var r = ChunkedReader.init(&data, plan, &rbuf);
+    var got: [1000]u8 = undefined;
+    var gw: std.Io.Writer = .fixed(&got);
+    _ = try r.interface.streamRemaining(&gw);
+    try testing.expectEqualSlices(u8, &data, gw.buffered());
+}
