@@ -602,12 +602,14 @@ fn monoNs() u64 {
             if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
             const freq: u64 = @bitCast(qpf);
             const count: u64 = @bitCast(qpc);
-            return @intCast(@as(u128, count) * std.time.ns_per_s / freq);
+            return @truncate(@as(u128, count) * std.time.ns_per_s / freq);
         },
         else => {
             var ts: std.posix.timespec = undefined;
             if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+            // Seed material only (hashed): wrap like `wallNs` rather than
+            // trap or, in ReleaseFast, overflow (review GJ RID-3 / TC-3).
+            return @as(u64, @bitCast(@as(i64, ts.sec))) *% std.time.ns_per_s +% @as(u64, @bitCast(@as(i64, ts.nsec)));
         },
     }
 }

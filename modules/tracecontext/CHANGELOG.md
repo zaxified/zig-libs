@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GJ) found no data-reachable defect; the monotonic seed clock wraps instead of overflowing; TC-1 (header-name validation) in Backlog.
 - **2026-10-24** — **Behaviour change (fix):** the echo of `traceparent`/`tracestate` on the response is best effort — a response header table already full no longer fails the request. **Behaviour change (fix):** the middleware's own `state_entry` member is never the one dropped when the outgoing `tracestate` overflows 512 bytes (new `TraceState.writeKeeping`; `write` unchanged). Docs: `current()` stays set after the request (as `requestid.current()`) and assumes one request per thread at a time; `currentState()` is the thread's buffer. Tools: `tools/interop.zig` re-takes the OpenTelemetry Go oracle (`zig build interop-tracecontext [-- --check]`); the bench gains an OpenTelemetry Rust side. Tests: mutation run (73/76, 3 equivalent) and the tests it asked for. Grade 1.
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
