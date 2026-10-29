@@ -257,8 +257,8 @@ pub const Options = struct {
     /// Repetitions per target (clamped to `[1, max_repetitions]`). Each
     /// `probeMany` target holds `count` `Result` slots, so the batch allocates
     /// `targets.len * count * @sizeOf(Result)` bytes up front and makes that
-    /// many connects: both factors are the caller's, the module caps each one
-    /// (`max_targets`, `max_repetitions`) but not their product.
+    /// many connects: both factors are the caller's; `max_attempts` caps
+    /// their product.
     count: u16 = 1,
     /// Upper bound on connects in flight at once during `probeMany`.
     /// Effectively `max(1, min(max_concurrent, targets, 256))` — 0 does not
@@ -266,6 +266,11 @@ pub const Options = struct {
     max_concurrent: u32 = 16,
     /// Reject a `probeMany` list longer than this.
     max_targets: usize = 65_536,
+    /// Reject a `probeMany` batch whose `targets.len * count` (after the
+    /// `count` clamp) exceeds this: each attempt is a connect and a `Result`
+    /// slot allocated up front, and the two separate caps alone allowed
+    /// ~268 M of them (sweep PR-2, owner 2026-10-29).
+    max_attempts: usize = 1 << 20,
     /// Optional post-connect application check.
     app_check: ?AppCheck = null,
     /// Pause between the repetitions of ONE target (tcping's `-i`); null
@@ -353,7 +358,7 @@ pub fn workerCount(max_concurrent: u32, targets: usize) usize {
     return @max(1, @min(requested, targets));
 }
 
-pub const ManyError = error{ TooManyTargets, OutOfMemory };
+pub const ManyError = error{ TooManyTargets, TooManyAttempts, OutOfMemory };
 
 fn effectiveCount(opts: Options) u16 {
     return @max(1, @min(opts.count, max_repetitions));
@@ -450,6 +455,7 @@ fn probeInto(r: *TargetResult, opts: Options, stop: *std.atomic.Value(bool)) voi
 pub fn probeMany(gpa: Allocator, targets: []const Target, opts: Options) ManyError![]TargetResult {
     if (targets.len > opts.max_targets) return error.TooManyTargets;
     const count = effectiveCount(opts);
+    if (targets.len > opts.max_attempts / count) return error.TooManyAttempts;
 
     const results = try gpa.alloc(TargetResult, targets.len);
     errdefer gpa.free(results);
@@ -1597,6 +1603,36 @@ test "probeMany rejects an over-long target list" {
     try testing.expectError(error.TooManyTargets, probeMany(testing.allocator, &one, .{
         .connector = fake.connector(),
         .max_targets = 0,
+    }));
+}
+
+test "probeMany rejects a batch whose targets x count exceeds max_attempts (sweep PR-2)" {
+    var scripts = [_]FakeConnector.Script{};
+    var fake: FakeConnector = .{ .scripts = &scripts, .spins = 0 };
+    const four = [_]Target{
+        .{ .host = "x", .port = 1 }, .{ .host = "y", .port = 1 },
+        .{ .host = "z", .port = 1 }, .{ .host = "w", .port = 1 },
+    };
+    try testing.expectError(error.TooManyAttempts, probeMany(testing.allocator, &four, .{
+        .connector = fake.connector(),
+        .count = 3,
+        .max_attempts = 11,
+    }));
+    try testing.expectEqual(@as(usize, 0), fake.total_calls.load(.monotonic));
+    // Exactly at the cap runs: 4 x 3 = 12.
+    const results = try probeMany(testing.allocator, &four, .{
+        .connector = fake.connector(),
+        .count = 3,
+        .max_attempts = 12,
+        .max_concurrent = 1,
+    });
+    freeResults(testing.allocator, results);
+    try testing.expectEqual(@as(usize, 12), fake.total_calls.load(.monotonic));
+    // The clamped count is what counts: 0 means 1 attempt per target.
+    try testing.expectError(error.TooManyAttempts, probeMany(testing.allocator, &four, .{
+        .connector = fake.connector(),
+        .count = 0,
+        .max_attempts = 3,
     }));
 }
 

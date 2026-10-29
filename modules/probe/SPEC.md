@@ -8,9 +8,9 @@
 
 **Ahead:** correctness — the reference's tcp prober resolves a name, keeps ONE address of the preferred family (ip6 by default) and dials only it: blackbox_exporter 0.26.0 reports `localhost:P` down (`probe_success 0` after its 2 s timeout, log `Resolved target address ip=::1` … `dial tcp6 [::1]:P: i/o timeout`) while the service answers on 127.0.0.1:P, the IPv6 path being a black hole (control `127.0.0.1:P`: `probe_success 1`; `tools/blackbox_probe/run.sh`, Ubuntu's 0.26.0-2 package); `PosixConnector` races the resolved addresses RFC 8305 style and reports up, with the winning connect as the RTT (tests "race: a black-holed first address does not starve a listening second one (RFC 8305)", "race: the reported RTT is the winning connect, not the wait behind a black hole") (measured 2026-10-23)
 
-**Audit:** review 2026-10-29 · mutation 2026-10-29 (35/38, 3 eq) · src 60f54a7afd4bc946
+**Audit:** review 2026-10-29 · mutation 2026-10-29 (37/40, 3 eq) · src 41494c559081feab
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: poll-timeout round-up saturates; `monoNs` total on a failed `clock_gettime`)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — TCP/ICMP probing (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: poll-timeout round-up saturates; `monoNs` total on a failed `clock_gettime`; `probeMany` attempts capped by `max_attempts`)
 
 **Performance:** n/a — a TCP probe lasts its round trip and the configured timeout/interval, as with blackbox_exporter's tcp prober; the CPU per probe is not what a user picks it for (2026-10-11)
 
@@ -242,7 +242,7 @@ keeping the RTT on an app-check downgrade fails it ALONE — no earlier test ass
 
 ## Backlog / deferred
 - **Delta audit 2026-10-29 (no-panic sweep § GI):** 1 mutant (the plain `+` back in the poll-timeout round-up): killed. Not scored: `monoNs`'s failed-`clock_gettime` path (no test can make the call fail). Unfiltered ReleaseSafe suite.
-- **No-panic sweep 2026-10-29 (§ GI)** (reports `~/CML/20261029-panic-sweep/probe-sweep.report.md`, `review-pagecache-probe.report.md`): R-probe-1 / PR-2 (MED, OWNER DECISION) `probeMany` caps targets and repetitions but not their product (~268 M connects, ~15 GiB of `Result` slots at the ceilings; documented on `Options.count`) — a cap would add a `ManyError` member; R-probe-3 (LOW) no total-time cap across `LiveConnector`'s OS connect timeout, `interval.ms` and `timeout_ms` (documented knobs).
+- **No-panic sweep 2026-10-29 (§ GI)** (reports `~/CML/20261029-panic-sweep/probe-sweep.report.md`, `review-pagecache-probe.report.md`): R-probe-1 / PR-2 (MED) `probeMany` capped targets and repetitions but not their product (~268 M connects, ~15 GiB of `Result` slots) — closed by `Options.max_attempts` (owner 2026-10-29, `error.TooManyAttempts`); R-probe-3 (LOW) no total-time cap across `LiveConnector`'s OS connect timeout, `interval.ms` and `timeout_ms` (documented knobs).
 Name resolution is not bounded by `timeout_ns` and cannot be by a `poll`-based connector — see the
 threat-model section for what each `Resolve` mode does and does not promise. `LiveConnector`'s
 advisory `timeout_ns` stays advisory: `std.Io.Threaded` panics on a connect timeout, and the fix is
