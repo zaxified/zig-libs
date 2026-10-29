@@ -369,15 +369,15 @@ way to recognise it.
 
 | Module | [Grade](#module-grades) | What it does | Platform | Deps |
 |---|:-:|---|---|---|
-| [`aaa-gate`](modules/aaa-gate/README.md) | 1 | Bearer + API-key (header/query/cookie) + HTTP Basic auth (constant-time) + audit hook + denied-request throttle | any | router, http, b64ct, cookies |
+| [`aaa-gate`](modules/aaa-gate/README.md) | 2 (A) | Bearer + API-key (header/query/cookie) + HTTP Basic auth (constant-time) + audit hook + denied-request throttle | any | router, http, b64ct, cookies |
 | [`abuseguard`](modules/abuseguard/README.md) | 1 | Per-IP + global connection caps, ban/greylist, strike→ban (accept-time) | posix | http, netaddr, router |
-| [`accesslog`](modules/accesslog/README.md) | 1 | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
+| [`accesslog`](modules/accesslog/README.md) | 2 (A) | Structured HTTP access-log formatter — JSON Lines/logfmt/Apache Combined with log-injection escaping (untrusted UA/path/referer can't forge a line); http-request→Entry bridge; thread-safe group-commit `Sink` for one shared log file | any | http, router |
 | [`acme`](modules/acme/README.md) | 1 | Let's Encrypt / ACME v2 (RFC 8555) client + autocert-style Manager — HTTP-01, TLS-ALPN-01, DNS-01 (wildcard), ARI renewal scheduling, storage, on-demand issuance, fleet locks, issuer fallback; EC/RSA keys, EAB, rollover, revocation | any | http, router, entropy, p256, p384, p521, rsa, netaddr, x509, datefmt, b64ct |
 | [`acmedns`](modules/acmedns/README.md) | 3 (A) | ACME DNS-01: CNAME delegation, SOA zone walk, propagation check; RFC 2136+TSIG, acme-dns, httpreq, exec publishers | linux (exec publisher: posix process spawn) | acme, dns, http, netaddr, procrun, b64ct |
 | [`aescbc`](modules/aescbc/README.md) | 2 (S,E,A) | AES-CBC (NIST SP800-38A): one-shot, incremental, streaming with six paddings, ciphertext stealing CS1-3; zero-alloc; padding-oracle caveat — consumers own authenticate-before-unpad | any | — |
 | [`aeskw`](modules/aeskw/README.md) | 3 (S,P) | RFC 3394 AES Key Wrap (AES-128/256 KEK) — constant-time integrity check + scratch zeroization, byte-exact vs RFC 3394 test vectors | any | aes192 |
 | [`brotli`](modules/brotli/README.md) | 1 | Pure-Zig Brotli (RFC 7932) — byte-exact decompressor + a compressing encoder (LZ77 + Huffman, ~2.8x on text); the `Content-Encoding: br` companion to std gzip | any | — |
-| [`cors`](modules/cors/README.md) | 1 | CORS preflight + header injection (secure defaults) | any | router, http |
+| [`cors`](modules/cors/README.md) | 2 (A) | CORS preflight + header injection (secure defaults) | any | router, http |
 | [`grpc`](modules/grpc/README.md) | 4 (S) | gRPC client **and** server over HTTP/2 (over `protobuf`) — no code generation; all four call shapes (unary/streaming/bidi); untrusted declared length never sizes an allocation | any | http, protobuf, b64ct |
 | [`health`](modules/health/README.md) | 1 | Liveness (`/healthz`) + readiness (`/readyz`) probe middleware — 200/503 from registered dependency checks (k8s probe contract) | any | router, http |
 | [`http`](modules/http/README.md) | 1 | HTTP/1.1 client **and** server, hardened for direct exposure (slowloris caps, gzip, multipart, Range, negotiation); also speaks HTTP/2 (h2c/h2 client+server). Not `std.http`. | any | netaddr, datefmt, tlsclient, crc32, b64ct |
@@ -656,7 +656,7 @@ way to recognise it.
 | [`crc32c`](modules/crc32c/README.md) | 2 (S,E,A,P) | CRC-32C (Castagnoli) — SSE4.2 and ARMv8 CRC instructions picked at run time (three interleaved streams), slicing-by-8 fallback; streaming, extend, combine. | any (x86-64 SSE4.2 / arm64 CRC asm + portable fallback) | — |
 | [`csvsafe`](modules/csvsafe/README.md) | 3 (S,E,P) | CSV formula-injection guard: OWASP's `=`/`+`/`-`/`@`/tab/CR cell leads, plus LF, `|` and `%`. | any | — |
 | [`csvstream`](modules/csvstream/README.md) | 2 (S,E,A,P) | Streaming RFC 4180 CSV reader that preserves byte offsets, with bounded memory regardless of file size. | any | — |
-| [`datefmt`](modules/datefmt/README.md) | 1 | Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970. | any | — |
+| [`datefmt`](modules/datefmt/README.md) | 2 (A) | Civil calendar, token-based date/time parse/format, RFC 3339/5322/HTTP dates, Go-style durations and calendar arithmetic, correct before 1970. | any | — |
 | [`encoding`](modules/encoding/README.md) | 2 (S,E,A,P) | Text decoding to and from UTF-8: every WHATWG single-byte code page plus DOS CP437/850/852 and custom pages, UTF-8, UTF-16 and UTF-32 with BOM sniffing, streaming decoder and encoder, caller-buffer API, unmappable modes, fatal mode (WHATWG semantics). | any | — |
 | [`framing`](modules/framing/README.md) | 3 (S,E,P) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
 | [`ini`](modules/ini/README.md) | 3 (S,P) | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |

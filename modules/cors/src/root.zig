@@ -155,7 +155,7 @@ pub const AllowedHeaders = union(enum) {
 };
 
 /// All strings are borrowed and must outlive the `Cors`. Values go onto the
-/// wire verbatim — they must not contain CR/LF/NUL (Debug-asserted at init).
+/// wire verbatim — they must not contain CR/LF/NUL (`Cors.init` panics, `cors: ...`, in every build mode, on an allowed origin, allowed header or exposed header that does).
 pub const Options = struct {
     /// Default `.none`: explicit opt-in (deviation from rs/cors's `*`).
     allowed_origins: Origins = .none,
@@ -243,6 +243,8 @@ pub const InitError = error{
 };
 
 // Digits of maxInt(u32) — the precomputed Access-Control-Max-Age value.
+const HeaderValue = http.Server.ResponseWriter.HeaderValue;
+
 const max_age_digits = std.fmt.count("{d}", .{std.math.maxInt(u32)});
 
 /// Preflight responses vary by all three request inputs that shape them.
@@ -271,7 +273,8 @@ pub const Cors = struct {
 
     /// Validate the configuration and precompute the joined header values
     /// (the only allocations this module ever makes). Configured strings
-    /// are borrowed — they must outlive the returned `Cors`.
+    /// are borrowed — they must outlive the returned `Cors`. Panics (`cors: ...`)
+    /// on a configured origin or header containing CR/LF/NUL/a control byte.
     pub fn init(gpa: Allocator, options: Options) InitError!Cors {
         if (options.allowed_origins == .any and options.allow_credentials)
             return error.CredentialsWithWildcardOrigin;
@@ -321,17 +324,14 @@ pub const Cors = struct {
         if (options.allowed_methods.len == 0)
             return error.EmptyAllowedMethods;
         for (options.allowed_methods) |m| if (m == .other) return error.UnnamedAllowedMethod;
-        if (std.debug.runtime_safety) {
-            switch (options.allowed_origins) {
-                .list => |l| for (l) |o| assertValueClean(o),
-                .patterns => |p| for (p.exact) |o| assertValueClean(o),
-                else => {},
-            }
-            switch (options.allowed_headers) {
-                .list => |l| for (l) |h| assertValueClean(h),
-                .reflect => {},
-            }
-            for (options.exposed_headers) |h| assertValueClean(h);
+        // Configured values go onto the wire without a second check (borrowed,
+        // see `HeaderValue`), so a CR/LF/NUL/control byte is refused here, in
+        // every build mode. Origins are checked one by one, headers through
+        // their joined form below.
+        switch (options.allowed_origins) {
+            .list => |l| for (l) |o| requireValue(o, "cors: an allowed origin contains a CR/LF/NUL/control byte"),
+            .patterns => |p| for (p.exact) |o| requireValue(o, "cors: an allowed origin contains a CR/LF/NUL/control byte"),
+            else => {},
         }
 
         const methods = try joinMethods(gpa, options.allowed_methods);
@@ -346,6 +346,8 @@ pub const Cors = struct {
         else
             try std.mem.join(gpa, ", ", options.exposed_headers);
 
+        requireValue(allow_headers, "cors: an allowed header contains a CR/LF/NUL/control byte");
+        requireValue(expose_headers, "cors: an exposed header contains a CR/LF/NUL/control byte");
         var c: Cors = .{
             .gpa = gpa,
             .options = options,
@@ -451,7 +453,7 @@ pub const Cors = struct {
         if (c.options.allow_unconditional_wildcard) {
             try res.setHeaderStatic("Access-Control-Allow-Origin", "*");
             if (in.acrm == null) return; // bare OPTIONS: nothing more to advertise
-            try res.setHeader("Access-Control-Allow-Methods", c.allow_methods_value);
+            try res.setHeaderBorrowed("Access-Control-Allow-Methods", .{ .bytes = c.allow_methods_value });
             const acrh = in.acrh;
             switch (c.options.allowed_headers) {
                 // Same HeaderBytesExhausted handling as the gated path below
@@ -465,19 +467,19 @@ pub const Cors = struct {
                     };
                 },
                 .list => if (c.allow_headers_value.len != 0)
-                    try res.setHeader("Access-Control-Allow-Headers", c.allow_headers_value),
+                    try res.setHeaderBorrowed("Access-Control-Allow-Headers", .{ .bytes = c.allow_headers_value }),
             }
             // `allow_credentials` is unreachable here — rejected together
             // with `.any` at init (same as `applyActual`).
             try c.privateNetworkGrant(in.pna, res);
             if (c.options.max_age_s != null)
-                try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
+                try res.setHeaderBorrowed("Access-Control-Max-Age", .{ .bytes = c.max_age_buf[0..c.max_age_len] });
             return;
         }
 
         emit: {
             const origin = in.origin orelse break :emit;
-            const acao = c.allowOriginValue(origin) orelse break :emit;
+            const grant = c.grantOrigin(origin) orelse break :emit;
             // The middleware only routes true preflights (ACRM present)
             // here, but a direct `applyPreflight` caller might not honor
             // that contract — an absent ACRM is then a failed preflight
@@ -489,8 +491,13 @@ pub const Cors = struct {
                 if (acrh) |h| if (!c.requestedHeadersAllowed(h)) break :emit;
             }
 
-            try res.setHeader("Access-Control-Allow-Origin", acao);
-            try res.setHeader("Access-Control-Allow-Methods", c.allow_methods_value);
+            // Only a request-derived echo spends the response's copy budget (and
+            // can fail on it): a failed echo is a failed preflight, not a 500, and
+            // `putHeader` leaves the response as it was on that error. Everything
+            // that lives on `Cors` is borrowed or static, so nothing below can
+            // run out of bytes.
+            if (!try setAllowOrigin(res, grant)) break :emit;
+            try res.setHeaderBorrowed("Access-Control-Allow-Methods", .{ .bytes = c.allow_methods_value });
             switch (c.options.allowed_headers) {
                 // Echo the request's own slice — it outlives the response
                 // head (written before the handler scope ends).
@@ -511,13 +518,13 @@ pub const Cors = struct {
                     };
                 },
                 .list => if (c.allow_headers_value.len != 0)
-                    try res.setHeader("Access-Control-Allow-Headers", c.allow_headers_value),
+                    try res.setHeaderBorrowed("Access-Control-Allow-Headers", .{ .bytes = c.allow_headers_value }),
             }
             if (c.options.allow_credentials)
-                try res.setHeader("Access-Control-Allow-Credentials", "true");
+                try res.setHeaderStatic("Access-Control-Allow-Credentials", "true");
             try c.privateNetworkGrant(in.pna, res);
             if (c.options.max_age_s != null)
-                try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
+                try res.setHeaderBorrowed("Access-Control-Max-Age", .{ .bytes = c.max_age_buf[0..c.max_age_len] });
         }
         // Short-circuit: 204, no body — `next` is never called for a
         // preflight, so no downstream handler runs. This used to force an
@@ -564,9 +571,9 @@ pub const Cors = struct {
             // regardless of Origin presence or the method gate.
             // `allow_credentials` is unreachable here — rejected together
             // with `.any` at init — so there is nothing to gate on it either.
-            try res.setHeader("Access-Control-Allow-Origin", "*");
+            try res.setHeaderStatic("Access-Control-Allow-Origin", "*");
             if (c.expose_headers_value.len != 0)
-                try res.setHeader("Access-Control-Expose-Headers", c.expose_headers_value);
+                try res.setHeaderBorrowed("Access-Control-Expose-Headers", .{ .bytes = c.expose_headers_value });
             return;
         }
 
@@ -584,24 +591,28 @@ pub const Cors = struct {
             .none, .any => false,
             .list, .predicate, .patterns => true,
         };
-        const acao = grant: {
+        const grant = grant: {
             const origin = req.header("Origin") orelse break :grant null;
-            const acao = c.allowOriginValue(origin) orelse break :grant null;
+            const g = c.grantOrigin(origin) orelse break :grant null;
             // rs/cors gate: an actual method outside allowed_methods gets no
             // CORS headers either (OPTIONS always passes, see methodTokenAllowed).
             if (!c.methodTokenAllowed(req.methodName())) break :grant null;
-            break :grant acao;
+            break :grant g;
         } orelse {
-            if (varies) try res.setHeader("Vary", "Origin");
+            if (varies) try res.setHeaderStatic("Vary", "Origin");
             return;
         };
 
-        try res.setHeader("Access-Control-Allow-Origin", acao);
-        if (varies) try res.setHeader("Vary", "Origin");
+        if (!try setAllowOrigin(res, grant)) {
+            // Cannot echo: no grant, but the response still varies by Origin.
+            if (varies) try res.setHeaderStatic("Vary", "Origin");
+            return;
+        }
+        if (varies) try res.setHeaderStatic("Vary", "Origin");
         if (c.options.allow_credentials)
-            try res.setHeader("Access-Control-Allow-Credentials", "true");
+            try res.setHeaderStatic("Access-Control-Allow-Credentials", "true");
         if (c.expose_headers_value.len != 0)
-            try res.setHeader("Access-Control-Expose-Headers", c.expose_headers_value);
+            try res.setHeaderBorrowed("Access-Control-Expose-Headers", .{ .bytes = c.expose_headers_value });
     }
 
     // ── the gates — pure, string-level, public ─────────────────────────
@@ -615,19 +626,30 @@ pub const Cors = struct {
     /// origin echoed back. Exact byte compare for `.list` (see module doc).
     /// Pure — `origin` is the raw `Origin` header value.
     pub fn allowOriginValue(c: *const Cors, origin: []const u8) ?[]const u8 {
+        return (c.grantOrigin(origin) orelse return null).value;
+    }
+
+    /// An origin grant: `value` is what goes into `Access-Control-Allow-Origin`.
+    /// `owned` = it is a slice of the configuration (or the static `*`), checked
+    /// at init and valid as long as the `Cors`, so it is lent to the response;
+    /// otherwise it is the request's own Origin and goes through the copying
+    /// `setHeader`.
+    const Grant = struct { value: []const u8, owned: bool };
+
+    fn grantOrigin(c: *const Cors, origin: []const u8) ?Grant {
         return switch (c.options.allowed_origins) {
             .none => null,
-            .any => "*", // .any + credentials is rejected at init
+            .any => .{ .value = "*", .owned = true }, // .any + credentials is rejected at init
             .list => |l| for (l) |o| {
-                if (std.mem.eql(u8, o, origin)) break origin;
+                if (std.mem.eql(u8, o, origin)) break .{ .value = o, .owned = true };
             } else null,
-            .predicate => |p| if (p.allow(p.ctx, origin)) origin else null,
+            .predicate => |p| if (p.allow(p.ctx, origin)) .{ .value = origin, .owned = false } else null,
             .patterns => |p| blk: {
                 for (p.exact) |o| {
-                    if (std.mem.eql(u8, o, origin)) break :blk origin;
+                    if (std.mem.eql(u8, o, origin)) break :blk .{ .value = o, .owned = true };
                 }
                 for (p.subdomains) |pat| {
-                    if (matchSubdomain(pat, origin)) break :blk origin;
+                    if (matchSubdomain(pat, origin)) break :blk .{ .value = origin, .owned = false };
                 }
                 break :blk null;
             },
@@ -689,6 +711,21 @@ pub const Cors = struct {
         return true;
     }
 };
+
+/// Write `Access-Control-Allow-Origin` for a grant. False = a request-derived
+/// echo that the response's header-copy store cannot hold (the caller treats it
+/// as no grant); the response is unchanged then.
+fn setAllowOrigin(res: *http.Server.ResponseWriter, g: Cors.Grant) http.Server.ResponseWriter.SetHeaderError!bool {
+    if (g.owned) {
+        try res.setHeaderBorrowed("Access-Control-Allow-Origin", .{ .bytes = g.value });
+        return true;
+    }
+    res.setHeader("Access-Control-Allow-Origin", g.value) catch |e| switch (e) {
+        error.HeaderBytesExhausted, error.TooManyHeaders => return false,
+        else => return e,
+    };
+    return true;
+}
 
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const c: *const Cors = @ptrCast(@alignCast(state.?));
@@ -905,9 +942,10 @@ fn joinMethods(gpa: Allocator, methods: []const http.Method) Allocator.Error![]c
 }
 
 /// Header values go onto the wire verbatim — refuse response-splitting
-/// characters in configuration (Debug builds only).
-fn assertValueClean(v: []const u8) void {
-    for (v) |ch| std.debug.assert(ch != '\r' and ch != '\n' and ch != 0);
+/// characters in configuration, in every build mode (the same rule as
+/// `HeaderValue.init`, which is what the borrowed values were promised).
+fn requireValue(v: []const u8, comptime msg: []const u8) void {
+    _ = HeaderValue.init(v) catch @panic(msg);
 }
 
 // ── tests (offline — through http.Server.serveStream, no socket) ────────────
@@ -2459,6 +2497,133 @@ test "an un-echoable reflected ACRH stays a 204, it does not become a 500" {
         try expectStatus(got, "204");
         try expectNoHeader(got, "Access-Control-Allow-Headers");
         try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+    }
+}
+
+fn longOriginRequest(buf: []u8, method: []const u8, origin_len: usize, preflight: bool) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.print("{s} /t HTTP/1.1\r\nHost: t\r\nOrigin: https://", .{method}) catch unreachable;
+    w.splatByteAll('a', origin_len - "https://".len - ".example.com".len) catch unreachable;
+    w.writeAll(".example.com\r\n") catch unreachable;
+    if (preflight) w.writeAll("Access-Control-Request-Method: GET\r\n") catch unreachable;
+    w.writeAll("Connection: close\r\n\r\n") catch unreachable;
+    return w.buffered();
+}
+
+fn expectGranted(got: []const u8) !void {
+    try testing.expect(std.mem.find(u8, got, "\r\nAccess-Control-Allow-Origin: https://") != null);
+}
+
+test "a client-chosen Origin that fits is granted with every CORS header, one that cannot be echoed is not (sweep CO-1)" {
+    // `.predicate` and `.patterns` echo the client's own Origin. Its length is
+    // the client's choice and the response's header-copy store (4096) is much
+    // smaller than the head the parser accepts. What `Cors` owns (Vary, Methods,
+    // Credentials, Expose, Max-Age) is lent to the response, so a 4060-byte
+    // origin, which leaves no room for any copy of those, is still granted in
+    // full (4040 on a preflight, where the router's `Allow` took 20 bytes); 4200 does not fit at all and is no grant, never a 500 that also
+    // skips the handler.
+    var buf: [9000]u8 = undefined;
+    var req: [5000]u8 = undefined;
+    for ([_]Origins{
+        .{ .predicate = .{ .allow = allowAnyOrigin } },
+        .{ .patterns = .{ .subdomains = &.{"https://*.example.com"} } },
+    }) |origins| {
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = origins,
+            .allow_credentials = true,
+            .exposed_headers = &.{"X-Total"},
+            .max_age_s = 600,
+        });
+        defer c.deinit();
+        for ([_]usize{ 3000, 4040, 4060, 4200 }) |n| {
+            // The router's own `Allow` copy spends 20 bytes of the store on a
+            // preflight, so 4060 is the last echo that fits an actual response
+            // and 4040 the last that fits a preflight.
+            const fits = n != 4200;
+            const fits_pre = n <= 4040;
+            var flag: Flag = .{};
+            var r = try testRouter(&c, &flag);
+            defer r.deinit();
+            const actual = runWireBigHead(r.handler(), &r, longOriginRequest(&req, "GET", n, false), &buf);
+            try expectStatus(actual, "200");
+            try expectHeaderLine(actual, "Vary: Origin");
+            try testing.expect(flag.hit);
+            if (fits) {
+                try expectGranted(actual);
+                try expectHeaderLine(actual, "Access-Control-Allow-Credentials: true");
+                try expectHeaderLine(actual, "Access-Control-Expose-Headers: X-Total");
+            } else try expectNoHeader(actual, "Access-Control-Allow-Origin");
+            const pre = runWireBigHead(r.handler(), &r, longOriginRequest(&req, "OPTIONS", n, true), &buf);
+            try expectStatus(pre, "204");
+            if (fits_pre) {
+                try expectGranted(pre);
+                try expectHeaderLine(pre, "Access-Control-Allow-Credentials: true");
+                try expectHeaderLine(pre, "Access-Control-Max-Age: 600");
+            } else try expectNoHeader(pre, "Access-Control-Allow-Origin");
+        }
+    }
+}
+
+test "an echo the header store cannot hold is no grant even for a configured origin (sweep CO-1)" {
+    // A configured `.list` entry is lent to the response (not copied), so it
+    // is granted whatever its size; the copying path is what the request echo
+    // above exercises. Here the echo path alone: a `.patterns` match.
+    var buf: [9000]u8 = undefined;
+    var req: [5000]u8 = undefined;
+    var c: Cors = try .init(testing.allocator, .{ .allowed_origins = .{ .patterns = .{ .subdomains = &.{"https://*.example.com"} } } });
+    defer c.deinit();
+    var flag: Flag = .{};
+    var r = try testRouter(&c, &flag);
+    defer r.deinit();
+    const actual = runWireBigHead(r.handler(), &r, longOriginRequest(&req, "GET", 4200, false), &buf);
+    try expectStatus(actual, "200");
+    try expectNoHeader(actual, "Access-Control-Allow-Origin");
+    try testing.expect(flag.hit);
+}
+
+fn longAcrhRequest(buf: []u8, comptime extra: []const u8, acrh_len: usize) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("OPTIONS /t HTTP/1.1\r\nHost: t\r\nOrigin: https://app.example\r\n" ++ extra) catch unreachable;
+    w.writeAll("Access-Control-Request-Method: GET\r\nAccess-Control-Request-Headers: ") catch unreachable;
+    w.splatByteAll('a', acrh_len) catch unreachable;
+    w.writeAll("\r\nConnection: close\r\n\r\n") catch unreachable;
+    return w.buffered();
+}
+
+test "a reflected ACRH that fits leaves the rest of the grant intact: Credentials and Max-Age are not starved (sweep R2-1)" {
+    // A 4030-byte reflected ACRH (copy 28 + 4030, plus the router's 20-byte
+    // `Allow`) fits the 4096-byte store; the Credentials / Max-Age copies after it did not, and the bare `try`
+    // answered 500. They are static / borrowed now.
+    var buf: [9000]u8 = undefined;
+    var req: [5000]u8 = undefined;
+    {
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .{ .list = &.{"https://app.example"} },
+            .allow_credentials = true,
+            .max_age_s = 600,
+        });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWireBigHead(r.handler(), &r, longAcrhRequest(&req, "", 4030), &buf);
+        try expectStatus(got, "204");
+        try expectHeaderLine(got, "Access-Control-Allow-Origin: https://app.example");
+        try expectHeaderLine(got, "Access-Control-Allow-Credentials: true");
+        try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+        try testing.expect(std.mem.find(u8, got, "\r\nAccess-Control-Allow-Headers: aaaa") != null);
+    }
+    { // the unconditional-wildcard preflight, same band
+        var c: Cors = try .init(testing.allocator, .{
+            .allowed_origins = .any,
+            .allow_unconditional_wildcard = true,
+            .max_age_s = 600,
+        });
+        defer c.deinit();
+        var r = try testRouter(&c, null);
+        defer r.deinit();
+        const got = runWireBigHead(r.handler(), &r, longAcrhRequest(&req, "", 4030), &buf);
+        try expectStatus(got, "204");
+        try expectHeaderLine(got, "Access-Control-Max-Age: 600");
     }
 }
 

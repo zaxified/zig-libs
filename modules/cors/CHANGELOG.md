@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **Fix (no-panic sweep):** a long client-chosen `Origin` (echoed by `.predicate`/`.patterns`) or reflected `Access-Control-Request-Headers` can no longer turn a response into a 500 that skips the handler: values cors owns (methods, header lists, max-age, credentials, `Vary`, configured origins) no longer spend the response's header-copy budget, and an echo that does not fit is treated as not granted (`Vary: Origin` kept) or omitted. **Behavioural for misconfiguration:** an allowed origin / allowed or exposed header with a CR/LF/NUL/control byte panics at `init` in every build mode (was a Debug-only assert). Report `~/CML/20261029-panic-sweep/cors-sweep.report.md`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the all-module `strRepeat` rewrite (`571bf09e`) is reverted here: this module's calls are small (seconds of Sema at most), and the change would have made its fresh audit's `src` hash stale for nothing.
 
 - **2026-10-23** — **Card: grade 1** (S1 E1 A1 H1 P1). Audit over the current source (independent
