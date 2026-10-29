@@ -79,7 +79,9 @@ pub const Options = struct {
     /// Adopt a valid incoming header value instead of always generating.
     trust_incoming: bool = true,
     /// Echo the ID back on the response. Off ⇒ the ID is only exposed via
-    /// `current()` (e.g. for logging) and not sent to the client.
+    /// `current()` (e.g. for logging) and not sent to the client. Best
+    /// effort: when the response's header table or header-byte budget is
+    /// already full, the echo is skipped rather than failing the request.
     echo: bool = true,
     /// Produces an ID when none is adopted. Null ⇒ the built-in 32-hex
     /// generator (`generateInto`). See `Generator` for the contract.
@@ -152,7 +154,16 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     };
     current_id = id;
 
-    if (ri.options.echo) try ctx.res.setHeader(ri.options.header_name, id);
+    // Best effort, like tracecontext's echo: the id may be peer-chosen (up
+    // to `max_adopt_len` bytes), so a response whose header table or byte
+    // budget an outer middleware already filled goes out without the echo
+    // instead of failing as a 500; `current()` still has the id (review GJ
+    // RID-1). Other errors cannot happen (name checked by `middleware()`,
+    // id adoptable/generated) and still propagate.
+    if (ri.options.echo) ctx.res.setHeader(ri.options.header_name, id) catch |err| switch (err) {
+        error.TooManyHeaders, error.HeaderBytesExhausted => {},
+        else => return err,
+    };
     return next.run(ctx);
 }
 
@@ -266,12 +277,14 @@ fn monoNs() u64 {
             if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&qpc).toBool()) return 0;
             const freq: u64 = @bitCast(qpf);
             const count: u64 = @bitCast(qpc);
-            return @intCast(@as(u128, count) * std.time.ns_per_s / freq);
+            return @truncate(@as(u128, count) * std.time.ns_per_s / freq);
         },
         else => {
             var ts: std.posix.timespec = undefined;
             if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
-            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+            // Seed material only (hashed): wrap like `wallNs` rather than
+            // trap or, in ReleaseFast, overflow (review GJ RID-3 / TC-3).
+            return @as(u64, @bitCast(@as(i64, ts.sec))) *% std.time.ns_per_s +% @as(u64, @bitCast(@as(i64, ts.nsec)));
         },
     }
 }
@@ -530,6 +543,27 @@ test "echo=false omits the response header but keeps current()" {
     const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &buf);
     try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "X-Request-Id"));
     try testing.expectEqual(@as(usize, generated_len), bodyOf(got).len); // current() still set
+}
+
+fn fillHeaderTable(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
+    const slots = @typeInfo(@FieldType(http.Server.ResponseWriter, "headers")).array.len;
+    inline for (0..slots) |i| try ctx.res.setHeaderStatic(std.fmt.comptimePrint("X-Fill-{d}", .{i}), "1");
+    return next.run(ctx);
+}
+
+test "echo is skipped, not a 500, when an outer middleware filled the header table (review GJ RID-1)" {
+    var ri = RequestId{};
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(.{ .state = null, .run = fillHeaderTable });
+    try r.use(ri.middleware());
+    try r.get("/", hEchoCurrent);
+
+    var buf: [4096]u8 = undefined;
+    const got = runWire(&r, "GET / HTTP/1.1\r\nHost: t\r\nX-Request-Id: peer-1\r\nConnection: close\r\n\r\n", &buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200"));
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(got, "X-Request-Id"));
+    try testing.expectEqualStrings("peer-1", bodyOf(got)); // current() still set
 }
 
 test "custom header name" {
