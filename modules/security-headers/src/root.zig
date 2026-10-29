@@ -88,17 +88,18 @@
 //! strings must outlive the middleware and must not contain CR/LF/NUL
 //! (`init` returns `error.InvalidHeaderValue`, in every build mode).
 //!
-//! Header byte budget: `http.Server.ResponseWriter` copies every header's
-//! name and value into a fixed-size per-response buffer, so `apply` (and
-//! therefore `middleware`) can fail with `error.HeaderBytesExhausted` — see
-//! `SetHeaderError`. Registered first as documented above, this middleware
-//! is the *first* thing to touch that buffer, so whether it fails depends
-//! only on this configuration's own header set, never on what other
-//! middleware adds afterward. `init` checks exactly that condition up
-//! front and fails with `InitError.HeaderBudgetExceeded` — see `InitError`
-//! — so an oversized `content_security_policy` is rejected once, at
-//! startup, in every build mode, rather than 500ing every request from
-//! then on with none of this module's headers on that 500 either.
+//! Header byte budget: `http.Server.ResponseWriter` copies a `setHeader`
+//! name and value into a fixed-size per-response buffer. `apply` copies
+//! only the HSTS value and the `extra` headers there; every other
+//! configured value is lent to the response (`setHeaderBorrowed` /
+//! `setHeaderStatic`), so a large `content_security_policy` cannot be
+//! starved by bytes another middleware copied first (a peer-chosen request
+//! id, say). `apply` can still fail with `error.HeaderBytesExhausted` on the
+//! copied part — see `SetHeaderError`. `init` checks the whole configured
+//! set against the budget (conservatively, lent values included) and fails
+//! with `InitError.HeaderBudgetExceeded` — see `InitError` — so an
+//! oversized configuration is rejected once, at startup, in every build
+//! mode, rather than 500ing every request from then on.
 
 const std = @import("std");
 const testkit = @import("testkit");
@@ -299,6 +300,11 @@ pub const SecurityHeaders = struct {
         /// when trialing a second, comparably large policy) — shrink it,
         /// split it, or grow `http`'s `header_copy_bytes` if the policy is
         /// genuinely required to be that large.
+        ///
+        /// Also returned when the configuration's own distinct header names
+        /// (case-insensitive; an `extra` named like a built-in replaces it)
+        /// outnumber `http`'s response-header table (32 slots): `apply`
+        /// would fail every request with `TooManyHeaders`.
         HeaderBudgetExceeded,
         /// An `Options.extra` entry's NAME is not an RFC 9110 field-name
         /// token, so `http.Server`'s `setHeader` would reject it with
@@ -324,7 +330,8 @@ pub const SecurityHeaders = struct {
         /// request on a non-number), and `applyStatic` already refuses them.
         InvalidExtraHeaderName,
         /// A header VALUE (a named knob or an `extra` value) holds CR, LF or
-        /// NUL, which `http` refuses at `setHeader` time on every request.
+        /// NUL or any other byte `http` refuses in a field value (control bytes,
+        /// DEL; `h1.isValidFieldValue`), which `setHeader` rejects on every request.
         /// Checked in every build mode since 2026-10-24 (was a Debug-only
         /// assert, so a ReleaseFast build failed each request instead).
         InvalidHeaderValue,
@@ -381,6 +388,11 @@ pub const SecurityHeaders = struct {
             sh.hsts_len = w.buffered().len;
         }
         if (appliedHeaderBytes(&sh) > http_header_budget_bytes) return error.HeaderBudgetExceeded;
+        // Slots, not only bytes: more distinct names than the response table
+        // holds would fail every request with `TooManyHeaders` (sweep SH-2).
+        // Only this configuration's own names count; other middleware adds
+        // headers too, so this is a floor, not an exact budget.
+        if (appliedHeaderSlots(&options) > http_header_slots) return error.HeaderBudgetExceeded;
         return sh;
     }
 
@@ -422,32 +434,43 @@ pub const SecurityHeaders = struct {
     /// through the middleware. Values set here are defaults in effect: a
     /// later `setHeader` with the same name replaces them (handler wins).
     ///
+    /// Only the HSTS value and `extra` are copied into `res`'s header-byte
+    /// budget; the other values are lent, so `sh.options`' slices must stay
+    /// alive and unchanged until the response is written (the module doc's
+    /// "must outlive the middleware").
+    ///
     /// Can fail with `error.HeaderBytesExhausted` (part of `SetHeaderError`)
-    /// if `res` doesn't have enough of its header-byte budget left — `sh`
-    /// was already checked at `init` time to fit the budget on its own (see
-    /// `InitError.HeaderBudgetExceeded`), so reaching this error here means
-    /// `res` arrived with some of that budget already spent, i.e. `sh` was
-    /// applied somewhere other than first in the chain against this
-    /// module's own "register it first" contract (see the module doc), or
-    /// `res` is being reused across more than one logical response.
+    /// if `res` doesn't have enough budget left for the copied part, i.e.
+    /// `res` arrived with nearly all of it already spent (`sh` applied after
+    /// other middleware, against the "register it first" contract, or `res`
+    /// reused across responses), and with `error.TooManyHeaders` when `res`'s
+    /// header table is already full.
     pub fn apply(sh: *const SecurityHeaders, res: *http.Server.ResponseWriter) http.Server.ResponseWriter.SetHeaderError!void {
         const o = &sh.options;
+        // Only the HSTS value (it lives in `sh`, which a direct caller may
+        // drop before the response is written) and `extra` (runtime names)
+        // are copied into `res`'s header-byte budget. Every other value is
+        // the caller's configured slice -- checked by `init` with `http`'s
+        // own predicate and documented to outlive the middleware -- lent to
+        // the response, so a peer-chosen header that an earlier middleware
+        // copied (a 200-byte adopted request id) cannot starve this module
+        // into a 500 (review GJ RID-1 / SH-A).
         if (o.hsts != null) try res.setHeader("Strict-Transport-Security", sh.hstsValue());
-        if (o.content_security_policy) |v| try res.setHeader("Content-Security-Policy", v);
-        if (o.content_security_policy_report_only) |v| try res.setHeader("Content-Security-Policy-Report-Only", v);
-        if (o.x_content_type_options) try res.setHeader("X-Content-Type-Options", "nosniff");
-        if (o.x_frame_options) |v| try res.setHeader("X-Frame-Options", v);
-        if (o.referrer_policy) |v| try res.setHeader("Referrer-Policy", v);
-        if (o.permissions_policy) |v| try res.setHeader("Permissions-Policy", v);
-        if (o.cross_origin_opener_policy) |v| try res.setHeader("Cross-Origin-Opener-Policy", v);
-        if (o.cross_origin_resource_policy) |v| try res.setHeader("Cross-Origin-Resource-Policy", v);
-        if (o.cross_origin_embedder_policy) |v| try res.setHeader("Cross-Origin-Embedder-Policy", v);
-        if (o.origin_agent_cluster) try res.setHeader("Origin-Agent-Cluster", "?1");
-        if (o.x_dns_prefetch_control) |v| try res.setHeader("X-DNS-Prefetch-Control", v);
-        if (o.x_download_options) try res.setHeader("X-Download-Options", "noopen");
-        if (o.x_permitted_cross_domain_policies) |v| try res.setHeader("X-Permitted-Cross-Domain-Policies", v);
-        if (o.x_xss_protection) try res.setHeader("X-XSS-Protection", "0");
-        if (o.server) |v| try res.setHeader("Server", v);
+        if (o.content_security_policy) |v| try res.setHeaderBorrowed("Content-Security-Policy", .{ .bytes = v });
+        if (o.content_security_policy_report_only) |v| try res.setHeaderBorrowed("Content-Security-Policy-Report-Only", .{ .bytes = v });
+        if (o.x_content_type_options) try res.setHeaderStatic("X-Content-Type-Options", "nosniff");
+        if (o.x_frame_options) |v| try res.setHeaderBorrowed("X-Frame-Options", .{ .bytes = v });
+        if (o.referrer_policy) |v| try res.setHeaderBorrowed("Referrer-Policy", .{ .bytes = v });
+        if (o.permissions_policy) |v| try res.setHeaderBorrowed("Permissions-Policy", .{ .bytes = v });
+        if (o.cross_origin_opener_policy) |v| try res.setHeaderBorrowed("Cross-Origin-Opener-Policy", .{ .bytes = v });
+        if (o.cross_origin_resource_policy) |v| try res.setHeaderBorrowed("Cross-Origin-Resource-Policy", .{ .bytes = v });
+        if (o.cross_origin_embedder_policy) |v| try res.setHeaderBorrowed("Cross-Origin-Embedder-Policy", .{ .bytes = v });
+        if (o.origin_agent_cluster) try res.setHeaderStatic("Origin-Agent-Cluster", "?1");
+        if (o.x_dns_prefetch_control) |v| try res.setHeaderBorrowed("X-DNS-Prefetch-Control", .{ .bytes = v });
+        if (o.x_download_options) try res.setHeaderStatic("X-Download-Options", "noopen");
+        if (o.x_permitted_cross_domain_policies) |v| try res.setHeaderBorrowed("X-Permitted-Cross-Domain-Policies", .{ .bytes = v });
+        if (o.x_xss_protection) try res.setHeaderStatic("X-XSS-Protection", "0");
+        if (o.server) |v| try res.setHeaderBorrowed("Server", .{ .bytes = v });
         for (o.extra) |h| try res.setHeader(h.name, h.value);
     }
 
@@ -575,11 +598,53 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     return next.run(ctx);
 }
 
-/// Header values go onto the wire verbatim — refuse response-splitting
-/// characters in configuration (Debug builds only).
+/// Header values go onto the wire verbatim — refuse in configuration every
+/// value `http`'s `ResponseWriter.setHeader` would refuse (it applies
+/// `h1.isValidFieldValue`: CR/LF/NUL and also every other control byte, DEL),
+/// in every build mode. Using the very same predicate keeps "init accepted it"
+/// equal to "every response can carry it" (sweep SH-1).
 fn valueClean(v: []const u8) bool {
-    for (v) |c| if (c == '\r' or c == '\n' or c == 0) return false;
-    return true;
+    return http.h1.isValidFieldValue(v);
+}
+
+/// `http.Server.ResponseWriter`'s response-header slot count (its `headers`
+/// table length), read off the field so it follows `http`'s own limit.
+const http_header_slots = @typeInfo(@FieldType(http.Server.ResponseWriter, "headers")).array.len;
+
+/// The distinct response-header names `apply` would put in the table, in
+/// `http`'s slot terms: `setHeader` replaces by case-insensitive name, so an
+/// `extra` entry named like an enabled built-in (or like an earlier extra)
+/// takes no new slot. Returns the count, stopping once it passes
+/// `http_header_slots` (the extras scan is quadratic in `extra.len`, which is
+/// the caller's own config, and is cut off at the limit).
+fn appliedHeaderSlots(o: *const Options) usize {
+    const builtin_names = [_]struct { on: bool, name: []const u8 }{
+        .{ .on = o.hsts != null, .name = "Strict-Transport-Security" },
+        .{ .on = o.content_security_policy != null, .name = "Content-Security-Policy" },
+        .{ .on = o.content_security_policy_report_only != null, .name = "Content-Security-Policy-Report-Only" },
+        .{ .on = o.x_content_type_options, .name = "X-Content-Type-Options" },
+        .{ .on = o.x_frame_options != null, .name = "X-Frame-Options" },
+        .{ .on = o.referrer_policy != null, .name = "Referrer-Policy" },
+        .{ .on = o.permissions_policy != null, .name = "Permissions-Policy" },
+        .{ .on = o.cross_origin_opener_policy != null, .name = "Cross-Origin-Opener-Policy" },
+        .{ .on = o.cross_origin_resource_policy != null, .name = "Cross-Origin-Resource-Policy" },
+        .{ .on = o.cross_origin_embedder_policy != null, .name = "Cross-Origin-Embedder-Policy" },
+        .{ .on = o.origin_agent_cluster, .name = "Origin-Agent-Cluster" },
+        .{ .on = o.x_dns_prefetch_control != null, .name = "X-DNS-Prefetch-Control" },
+        .{ .on = o.x_download_options, .name = "X-Download-Options" },
+        .{ .on = o.x_permitted_cross_domain_policies != null, .name = "X-Permitted-Cross-Domain-Policies" },
+        .{ .on = o.x_xss_protection, .name = "X-XSS-Protection" },
+        .{ .on = o.server != null, .name = "Server" },
+    };
+    var n: usize = 0;
+    for (builtin_names) |b| n += @intFromBool(b.on);
+    next_extra: for (o.extra, 0..) |h, i| {
+        if (n > http_header_slots) break;
+        for (builtin_names) |b| if (b.on and std.ascii.eqlIgnoreCase(b.name, h.name)) continue :next_extra;
+        for (o.extra[0..i]) |prev| if (std.ascii.eqlIgnoreCase(prev.name, h.name)) continue :next_extra;
+        n += 1;
+    }
+    return n;
 }
 
 /// The names `http.Server.ResponseWriter.setHeader` acts on instead of
@@ -866,7 +931,10 @@ test "end-to-end anchor: a config sized to exactly fill http's real header budge
         "X-Download-Options".len + "noopen".len +
         "X-Permitted-Cross-Domain-Policies".len + "none".len +
         "X-XSS-Protection".len + "0".len;
-    const csp_name_bytes = "Content-Security-Policy".len;
+    // Filled through an `extra` header: `apply` copies `extra` (and HSTS)
+    // into the budget, while the other values are lent (`setHeaderBorrowed`,
+    // review GJ RID-1), so only a copied value can anchor the real buffer.
+    const csp_name_bytes = "X-Fill".len;
     const room = http_header_budget_bytes - defaults_bytes - csp_name_bytes;
 
     var csp_buf: [room]u8 = undefined;
@@ -874,7 +942,7 @@ test "end-to-end anchor: a config sized to exactly fill http's real header budge
 
     // `init` accepts a configuration sized to exactly fill the (claimed)
     // budget...
-    const sh: SecurityHeaders = try .init(.{ .content_security_policy = &csp_buf });
+    const sh: SecurityHeaders = try .init(.{ .extra = &.{.{ .name = "X-Fill", .value = &csp_buf }} });
 
     // ...and driven through a REAL `http.Server.ResponseWriter` (buffers
     // sized off the same reflected constant, so this test tracks a future
@@ -892,14 +960,37 @@ test "end-to-end anchor: a config sized to exactly fill http's real header budge
     try rw.end();
     const got = out.buffered();
     try expectHeaderLine(got, "X-Content-Type-Options: nosniff");
-    try testing.expect(std.mem.find(u8, got, "Content-Security-Policy: ") != null);
+    try testing.expect(std.mem.find(u8, got, "X-Fill: ") != null);
     try testing.expect(std.mem.find(u8, got, &csp_buf) != null);
 
     // One byte over: `init` refuses it before a real writer is ever
     // involved.
     var too_big: [room + 1]u8 = undefined;
     @memset(&too_big, 'a');
-    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{ .content_security_policy = &too_big }));
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{ .extra = &.{.{ .name = "X-Fill", .value = &too_big }} }));
+}
+
+test "apply: a peer-sized header copied earlier cannot starve the configured values (review GJ RID-1)" {
+    // requestid registered before this middleware copies an adopted
+    // 200-byte `X-Request-Id` into the response's header-byte budget. A CSP
+    // that init accepted at the budget's edge must still go out: the
+    // configured values are lent, not copied.
+    const defaults_bytes = SecurityHeaders.appliedHeaderBytes(&try SecurityHeaders.init(.{}));
+    const room = http_header_budget_bytes - defaults_bytes - "Content-Security-Policy".len;
+    const csp_all: [http_header_budget_bytes]u8 = @splat('a');
+    const csp_buf = csp_all[0..room];
+    const sh: SecurityHeaders = try .init(.{ .content_security_policy = csp_buf });
+
+    var out_buf: [http_header_budget_bytes + 1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const peer_id: [200]u8 = @splat('r');
+    try rw.setHeader("X-Request-Id", &peer_id);
+    try sh.apply(&rw);
+    try rw.end();
+    try testing.expect(std.mem.find(u8, out.buffered(), csp_buf) != null);
 }
 
 test "csp_helmet_default: reproduced helmet.js v7 posture, byte-exact through the middleware" {
@@ -1470,6 +1561,44 @@ test "extra: emitted by the runtime path and counted against the budget" {
     try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{
         .extra = &.{.{ .name = "X-Big", .value = huge }},
     }));
+}
+
+test "init: control bytes other than CR/LF/NUL in a value are refused (sweep SH-1)" {
+    // http's setHeader refuses every byte outside VCHAR / obs-text / SP / HTAB,
+    // so a value init accepted with \x01 or DEL failed EVERY response.
+    for ([_][]const u8{ "a\x01b", "a\x7fb", "a\x1fb" }) |bad| {
+        try testing.expectError(error.InvalidHeaderValue, SecurityHeaders.init(.{ .server = bad }));
+        try testing.expectError(error.InvalidHeaderValue, SecurityHeaders.init(.{ .extra = &.{.{ .name = "X-A", .value = bad }} }));
+    }
+    // HTAB, obs-text and the empty value stay accepted.
+    _ = try SecurityHeaders.init(.{ .server = "a\tb\xe9" });
+    _ = try SecurityHeaders.init(.{ .server = "" });
+}
+
+test "init: more distinct header names than http's response table holds is refused (sweep SH-2)" {
+    // Defaults take 11 slots. 21 distinct extras = 32 = fits; one more does not.
+    const names = comptime blk: {
+        var arr: [http_header_slots + 1]http.Header = undefined;
+        for (&arr, 0..) |*h, i| h.* = .{ .name = std.fmt.comptimePrint("X-Extra-{d}", .{i}), .value = "1" };
+        break :blk arr;
+    };
+    const own = appliedHeaderSlots(&Options{});
+    try testing.expectEqual(@as(usize, 11), own);
+    _ = try SecurityHeaders.init(.{ .extra = names[0 .. http_header_slots - own] });
+    try testing.expectError(error.HeaderBudgetExceeded, SecurityHeaders.init(.{ .extra = names[0 .. http_header_slots - own + 1] }));
+    // A repeated name, or one equal to an enabled built-in (any case), takes no new slot.
+    var dup: [http_header_slots + 2]http.Header = undefined;
+    @memcpy(dup[0 .. http_header_slots - own], names[0 .. http_header_slots - own]);
+    dup[http_header_slots - own] = names[0];
+    dup[http_header_slots - own + 1] = .{ .name = "x-frame-options", .value = "SAMEORIGIN" };
+    const sh = try SecurityHeaders.init(.{ .extra = dup[0 .. http_header_slots - own + 2] });
+    // ... and the full 32-slot set really goes out without TooManyHeaders.
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try sh.apply(&rw);
 }
 
 test "init rejects an extra header whose NAME is not a field token" {

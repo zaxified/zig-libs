@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **Behaviour change (fix):** `init` refuses a value with any byte `http` refuses in a field value (control bytes, DEL; was only CR/LF/NUL) with `InvalidHeaderValue`, and a configuration with more distinct header names than `http`'s response table with `HeaderBudgetExceeded` — both made every request fail. `apply` lends the configured values to the response (`setHeaderBorrowed`/`setHeaderStatic`) and copies only HSTS and `extra`, so a peer-sized header copied by an earlier middleware cannot starve it into a 500. No-panic sweep + blind review (§ GJ).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the example handles the new `error.InvalidHeaderValue` in its exhaustive `init` error switches (it did not compile since the grade-1 commit; `modtest` does not build examples, `check-examples` does).
 - **2026-10-24** — **Behaviour change:** `SecurityHeaders.init` returns the new
   `InitError.InvalidHeaderValue` for a CR/LF/NUL in any value, in every build mode (was a Debug-only assert,
