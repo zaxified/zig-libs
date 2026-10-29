@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-29** — **NO CONSUMER-VISIBLE CHANGE (one test case added):** Delta audit of the no-panic sweep: 13 schemata mutants over the sweep diff (depth cap and its boundary, depth walk without arrays, validateRefs pushes, `$id` skip, first-entry-wins, operationId counter start, query `required` dedup, parameter/template checks): 12 killed on the first run; the survivor (a `$ref` entry's name/in no longer counted as an earlier parameter) became a case in the OA-3 test. 13/13. Card A1 again.
 - **2026-10-29** — **CONSUMER-VISIBLE (no-panic sweep):** JSON text taken from the caller (request/query/parameter/response/named schemas, examples) nested deeper than 128 is refused with the existing `Invalid*Schema` / `InvalidExample` errors; deeper text overflowed the stack (HIGH, OA-4) and past 256 tripped the JSON writer's assert. `validateOpenApi31` walks `$ref`s iteratively (a 500 000-deep document overflowed the stack, HIGH, OA-1); `$ref` resolution and the checker's parameter and path-template checks are hash lookups instead of quadratic scans (30 000 refs took 49 s, OA-2/3); five generator loops over route tables made linear (OA-5).
 - **2026-10-23** — **BREAKING:** `validateOpenApi31(gpa, doc)` takes a scratch allocator (no
   consumer outside the module calls it); `ConformanceError` gains `DuplicateOperationId` and

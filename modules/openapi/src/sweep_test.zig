@@ -167,6 +167,9 @@ test "validateOpenApi31: duplicate and undeclared path parameters are still foun
         .{ .path = "/x", .params = "[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{}}]", .want = error.UndeclaredPathParameter },
         .{ .path = "/x/{a}/{b}", .params = "[{\"name\":\"a\",\"in\":\"path\",\"required\":true,\"schema\":{}}]", .want = error.UnresolvedPathParameter },
         .{ .path = "/x/{a", .params = "[]", .want = error.InvalidPathKey },
+        // A `$ref` entry carrying `name`/`in` still counts as an earlier
+        // entry, as the pre-sweep scan did (delta audit survivor).
+        .{ .path = "/x", .params = "[{\"$ref\":\"#/paths/~1x/get/parameters/1\",\"name\":\"q\",\"in\":\"query\"},{\"name\":\"q\",\"in\":\"query\",\"schema\":{}}]", .want = error.DuplicateParameter },
     };
     for (cases) |c| {
         const text = try arena.print("{s}\"{s}\":{{\"get\":{{\"responses\":{{\"200\":{{\"description\":\"d\"}}}},\"parameters\":{s}}}}}}}}}", .{ pre, c.path, c.params });
