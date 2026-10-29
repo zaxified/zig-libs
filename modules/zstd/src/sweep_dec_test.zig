@@ -244,3 +244,19 @@ test "decompressContinue: an empty output parked at a higher address adds no his
     @memset(&big, 0xee);
     try std.testing.expectError(error.CorruptionDetected, parkedHigher(100, &big));
 }
+
+test "FrameLog.writeSeekTable: out.pos past the end, once only the footer's tail is left (sweep audit ZD-5b)" {
+    var fl = zstd.seekable.FrameLog.init(false);
+    defer fl.deinit(gpa);
+    try fl.logFrame(gpa, 10, 20, 0);
+    const size = fl.seekTableSize();
+    var big: [64]u8 = undefined;
+    // everything up to the footer's descriptor byte and magic fits: 5 bytes left
+    var first: zstd.OutBuffer = .{ .dst = big[0 .. size - 5] };
+    try std.testing.expectEqual(@as(usize, 5), fl.writeSeekTable(&first));
+    // a caller's `pos` past the end of a buffer is no room, not a wrapped one
+    var bad: zstd.OutBuffer = .{ .dst = big[0..4], .pos = 5 };
+    try std.testing.expectEqual(@as(usize, 5), fl.writeSeekTable(&bad));
+    var last: zstd.OutBuffer = .{ .dst = big[0..5] };
+    try std.testing.expectEqual(@as(usize, 0), fl.writeSeekTable(&last));
+}

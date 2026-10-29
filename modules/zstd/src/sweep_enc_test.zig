@@ -9,6 +9,7 @@ const std = @import("std");
 const zstd = @import("root.zig");
 const dict_builder = @import("dict_builder.zig");
 const stream = @import("stream.zig");
+const huf = @import("huf.zig");
 
 const gpa = std.testing.allocator;
 
@@ -103,6 +104,14 @@ test "computeEpochs and the d-mer map are total (sweep ZE-3)" {
     try std.testing.expect(db.ActiveDmers.slots(1) != null);
 }
 
+test "computeEpochs: 10 * k saturates instead of wrapping (sweep audit ZE-3b)" {
+    // 10 * 429496730 = 2^32 + 4: wrapped, an epoch would need only 4 d-mers
+    // and the 9 epochs of 100 would be taken; saturated, no epoch of 100
+    // reaches 10 * k, so the corpus is one epoch
+    const e = dict_builder.computeEpochs(std.math.maxInt(u32), 900, 429496730, 1);
+    try std.testing.expectEqual(dict_builder.Epochs{ .num = 1, .size = 900 }, e);
+}
+
 test "selectDict refuses arguments that do not fit its samples (sweep ZE-3)" {
     var buf: [4096]u8 = undefined;
     text(&buf, 3);
@@ -119,6 +128,9 @@ test "selectDict refuses arguments that do not fit its samples (sweep ZE-3)" {
     try std.testing.expectError(error.SrcSizeWrong, dict_builder.selectDict(gpa, buf[0..300], 200, samples, offsets[0..5], 5, 5, 1.0, p));
     const bad = [_]usize{ 0, 1000, 2000, 3000, 4001, 4097 };
     try std.testing.expectError(error.SrcSizeWrong, dict_builder.selectDict(gpa, buf[0..300], 200, samples, &bad, 5, 5, 1.0, p));
+    // an offset itself past the buffer (sweep audit ZE-3c): no wrapped `len - o`
+    const far = [_]usize{ 0, 1000, 2000, 3000, 5000, 5096 };
+    try std.testing.expectError(error.SrcSizeWrong, dict_builder.selectDict(gpa, buf[0..300], 200, samples, &far, 5, 5, 1.0, p));
     // and the well-formed call still selects
     if (try dict_builder.selectDict(gpa, buf[0..600], 300, samples, &offsets, 5, 5, 1.0, p)) |sel| dict_builder.freeSelection(gpa, sel);
 }
@@ -467,4 +479,51 @@ test "optimizer threads are capped; the dictionary offset codes are computed wid
     var c: zstd.Compressor = .init(gpa);
     defer c.deinit();
     try std.testing.expectError(error.CannotProduceUncompressedBlock, c.compressSequencesAndLiterals(&dst, &seqs, lits, lits.len, .{ .advanced = .{ .block_delimiters = .explicit } }));
+}
+
+test "FrameWriter.init: its own buffer is freed when the scratch allocation fails (sweep audit ZE-5b)" {
+    var sink: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&sink);
+    // 1st allocation (the own buffer) succeeds, the 2nd (the scratch) does not;
+    // the testing allocator behind it reports a leak of the first
+    var fa: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, zstd.FrameWriter.init(fa.allocator(), &out, &.{}, .{}));
+}
+
+test "a dictionary's Huffman table with a code past the cost scale is compressed with (sweep audit ZE-6b)" {
+    var buf: [60000]u8 = undefined;
+    text(&buf, 13);
+    var sizes: [100]usize = undefined;
+    for (&sizes, 0..) |*s, i| s.* = 400 + (i * 37) % 300;
+    var dict_buf: [4096]u8 = undefined;
+    const dn = try dict_builder.train(gpa, &dict_buf, .{ .buffer = &buf, .sizes = &sizes });
+    // replace the trained dictionary's Huffman table by one that gives every
+    // byte a code, some of 12 bits (`opt` scales the costs to 11 bits)
+    var old: huf.CTable = .{};
+    var zero = true;
+    const old_size = try huf.readCTable(&old, dict_buf[8..dn], &zero);
+    var counts: [256]u32 = undefined;
+    for (&counts, 0..) |*c, i| c.* = if (i < 16) 1 else if (i < 31) 100 else 400;
+    var ct: huf.CTable = .{};
+    _ = try huf.buildCTable(&ct, &counts, 255, 12);
+    var hdr: [300]u8 = undefined;
+    const hn = try huf.writeCTable(&hdr, &ct, 255, 12);
+    var back: huf.CTable = .{};
+    try std.testing.expectEqual(hn, try huf.readCTable(&back, hdr[0..hn], &zero));
+    try std.testing.expect(!zero and back.max_symbol == 255);
+    var deepest: u32 = 0;
+    for (back.elt[0..256]) |e| deepest = @max(deepest, e.nb_bits);
+    try std.testing.expect(deepest > 11);
+    var d: [4096 + 300]u8 = undefined;
+    @memcpy(d[0..8], dict_buf[0..8]);
+    @memcpy(d[8..][0..hn], hdr[0..hn]);
+    const tail = dict_buf[8 + old_size .. dn];
+    @memcpy(d[8 + hn ..][0..tail.len], tail);
+    var input: [3000]u8 = undefined;
+    text(&input, 14);
+    var dst: [8192]u8 = undefined;
+    for ([_]i32{ 16, 19, 22 }) |level| {
+        const n = try zstd.compress(gpa, &dst, &input, .{ .level = level, .dictionary = .{ .raw = .{ .bytes = d[0 .. 8 + hn + tail.len], .content_type = .full } } });
+        try std.testing.expect(n > 0);
+    }
 }
