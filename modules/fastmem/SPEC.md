@@ -6,9 +6,9 @@
 
 **Scope:** parity — musl libc `memset` and `memcpy` (MIT) (surveyed 2026-09-30; `memcpy` added 2026-10-26)
 
-**Audit:** review 2026-10-26 · mutation 2026-10-26 (40/46, 6 eq) · src ac29a71ee71ac309
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (40/49, 9 eq) · src 4a7cc8ead543aad0
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — memcpy/memset (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: exported memcpy/memset trap on a null pointer with a non-zero length instead of `.?` UB, frameless kept (objdump); delta: both forms die by signal, argued eq)
 
 **Performance:** ref 0.10–1.01× musl 1.2.5 memset/memcpy · fastest 0.57–1.08× glibc 2.43 memset/memcpy (measured 2026-10-26)
 

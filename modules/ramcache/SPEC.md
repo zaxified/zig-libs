@@ -6,9 +6,9 @@
 
 **Scope:** parity — Caffeine 3.3.0 (W-TinyLFU) (surveyed 2026-09-30, gaps closed 2026-10-11)
 
-**Audit:** review 2026-10-25 · mutation 2026-10-25 (409/432, 23 eq) · src ac3330a561377621
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (460/486, 26 eq) · src faf78681b4c0e4f0
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAMCA_E_FUZZ) · ct n/a — in-memory cache (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + 2 blind reviews: max_key_len 4096 + max_pinned_bytes (= max_bytes) limits, hook re-entrancy UAF → checked panic, hook get no longer corrupts the window queues or drops stale entries, linear removeMatching, Sharded same-thread getOrLoad re-entry → LoadFailed, callback self-lock → panic, max_shards clamp; delta audit Cache 34/37 + 3 eq, Sharded 17/17)
 
 **Performance:** ref 0.23–1.01× maypok86/otter v2.3.0 · fastest 1.95× quick_cache 0.6.24 (put_evict; get_hit 1.90×, zipf_mixed 1.45×, get_miss 1.41×, put_update 1.31×; moka 0.12.16 slower than ours on every row) (measured 2026-10-25)
 

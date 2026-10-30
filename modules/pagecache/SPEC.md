@@ -8,7 +8,7 @@
 
 **Ahead:** feature — scan resistance: after ONE full sequential scan of a 2000-page file through a 200-page cache, a 100-page hot set costs 0 backend reads here (W-TinyLFU admission via `ramcache`) and 100 of 100 in SQLite 3.46.1, whose pcache1 is LRU (the scan evicts the whole hot set); with a 180-page hot set 2 vs 184 (`tools/scan_probe`, backend reads counted per phase, SQLite side by `strace -e trace=pread64` with `mmap_size=0`) (measured 2026-10-24)
 
-**Audit:** review 2026-10-29 · mutation 2026-10-29 (40/45, 5 eq) · src 066f33b23886ec61
+**Audit:** review 2026-10-30 · mutation 2026-10-30 (41/46, 5 eq) · src 91b2890eb7408e4f
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — page cache (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: `init` option contracts are named panics; a sub-page write drops only the pages it touches; all-borrowed cache documented)
 
