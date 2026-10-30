@@ -197,12 +197,14 @@ pub fn Codec(comptime alphabet: Alphabet, comptime padding: bool) type {
 
         // ── encoding ────────────────────────────────────────────────────────
 
-        /// Length of the encoding of `n` octets. (It exceeds `usize` only
-        /// for an `n` above 3/4 of the address space — no slice that long
-        /// exists.)
+        /// Length of the encoding of `n` octets. It exceeds `usize` only for
+        /// an `n` above 3/4 of the address space, where no slice (and no
+        /// buffer) exists; the result then saturates at `maxInt(usize)`
+        /// instead of wrapping to a small number (sweep B6-1), so `encode`
+        /// still refuses every real `out`.
         pub fn encodedLen(n: usize) usize {
-            if (padding) return n / 3 * 4 + @as(usize, if (n % 3 != 0) 4 else 0);
-            return n / 3 * 4 + (n % 3 * 4 + 2) / 3;
+            if (padding) return n / 3 *| 4 +| @as(usize, if (n % 3 != 0) 4 else 0);
+            return n / 3 *| 4 +| (n % 3 * 4 + 2) / 3;
         }
 
         /// Encodes `src` into the front of `out` and returns the written
@@ -253,7 +255,8 @@ pub fn Codec(comptime alphabet: Alphabet, comptime padding: bool) type {
             checkLineLen(line_len);
             const e = encodedLen(n);
             if (e == 0) return 0;
-            return e + (e + line_len - 1) / line_len * eol.bytes().len;
+            // Saturating, as `encodedLen` (sweep B6-1).
+            return e +| (e +| (line_len - 1)) / line_len *| eol.bytes().len;
         }
 
         fn checkLineLen(comptime line_len: usize) void {
@@ -598,6 +601,7 @@ const testing = std.testing;
 
 test {
     _ = @import("fuzz.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// (ours, std's) codec pairs, in libsodium's variant order.
