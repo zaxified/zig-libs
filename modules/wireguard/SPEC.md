@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-09-07 · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, WIREGUARD_FUZZ) · ct none
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, WIREGUARD_FUZZ) · ct none · panic 2026-10-30 (sweep + 2 blind reviews: second deriveTransportKeys from the wiped chaining key (HIGH, public keys) and role mismatch → checked panics, replayed initiation on a used handshake → AlreadyStarted, CookieChecker.wipe zero-key cookies, response receiver index checked before DH, cookie reply replay, kernel reply loops bounded (TooManyMessages, interrupted dumps restarted), linear peer merge; delta audit 45/45 + 34/34)
 
 **Performance:** ref 0.84–1.35× OpenSSL 3.5.5 ChaCha20-Poly1305 + libsodium 1.0.18 X25519 composition · fastest ? (measured 2026-10-20)
 
