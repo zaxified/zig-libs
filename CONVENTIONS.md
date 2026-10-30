@@ -971,8 +971,8 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   rule: a caller cannot handle its own bug, writes `catch unreachable`, and is back at UB. The
   sweep (every pub entry point, every `@intCast`/`unreachable`/`assert` on a consumer path, by
   an independent reviewer) is recorded as `· panic <date>` on the Hardening line. Rolled out as
-  a queue: `maturity-report` lists `panic sweep due`; the grade is capped only once every
-  grade 1–2 module is swept.
+  a queue; since 2026-10-30 (every grade 1–2 module swept) a module without it is H3 at best,
+  and `maturity-report` lists it as `not swept`.
 - **Catalog consistency is enforced**: `zig build check-catalog` (run by CI) fails when
   `build.zig`'s `module_list`, the `modules/` directory, and the README catalog table
   disagree, or when the README's module count goes stale.

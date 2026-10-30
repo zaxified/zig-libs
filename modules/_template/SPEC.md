@@ -71,9 +71,9 @@
                  Optional third item `panic <YYYY-MM-DD [(…)]|n/a — <why>>`: the
                  no-panic sweep (CONVENTIONS.md §8) — data and limits are errors
                  at the API boundary, a caller-contract check is never an
-                 `assert`/`unreachable`. Required for grade 1–2 once every such
-                 module is swept; until then `maturity-report` lists the missing
-                 ones as `panic sweep due` and the grade is unaffected.
+                 `assert`/`unreachable`. Required for grade 1–2: without it
+                 the H axis is 3 at best, and `maturity-report` lists the
+                 module as `not swept`.
      Performance (P) — worst-workload time ratios, ours/theirs, lower is better:
                  `ref <x>× <impl> · fastest <y>× <impl> (measured YYYY-MM-DD)`;
                  `fastest ?` when the fastest in the field is not measured,

@@ -1094,7 +1094,7 @@ fn printMaturityReport(step: *Step, options: MakeOptions) anyerror!void {
         const panic_sweep = switch (mat.panic) {
             .dated => "swept",
             .na => "n/a",
-            else => if (g.n <= 2) "panic sweep due" else "-",
+            else => "not swept",
         };
         lines.append(b.allocator, .{ .n = g.n, .text = b.fmt("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
             g.cell(b),                             m.name,
@@ -2560,9 +2560,9 @@ const Maturity = struct {
     /// that data and limits surface as errors (accepted means it works, in
     /// bounded memory and time) and that no caller-contract check is an
     /// `assert`/`unreachable` (UB in ReleaseFast). `.none` = not swept yet.
-    /// A condition of grade 1-2, queued: `maturity-report` lists it as
-    /// `panic sweep due` and it does not cap the grade until every grade 1-2
-    /// module is swept.
+    /// A condition of grade 1-2: `.none` caps the H axis at 3 (since
+    /// 2026-10-30, when every grade 1-2 module had been swept).
+    /// `maturity-report` lists such a module as `not swept`.
     panic: Hardening,
     perf: Perf,
     /// Class C/D only (no outside truth exists, so the anchor's oracle is `n/a`).
@@ -3113,8 +3113,12 @@ fn maturityGrade(b: *Build, m: Maturity, today: i64) ?MaturityGrade {
         break :blk .{ .letter = 'A', .n = 1, .why = "audit" };
     };
 
-    // H -- hardening.
+    // H -- hardening. A module with no no-panic sweep recorded is H3 at best
+    // (owner, 2026-10-28; gate on since 2026-10-30, when the queue of grade
+    // 1-2 modules was empty): grade 1-2 promises a consumer cannot crash, OOM
+    // or hang through the module, and only the sweep checks that.
     axes[3] = blk: {
+        if (m.panic == .none) break :blk .{ .letter = 'H', .n = 3, .why = "hardening (no-panic sweep not recorded)" };
         var applicable: u8 = 0;
         var dated: u8 = 0;
         var none: u8 = 0;
