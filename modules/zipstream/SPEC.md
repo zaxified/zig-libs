@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-04 (36/37, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, ZIPSTREAM_FUZZ; the mutated harness writes Store/Deflate/zstd, AES-encrypted and streamed members and opens them with the password) · ct n/a — archive streaming (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, ZIPSTREAM_FUZZ; the mutated harness writes Store/Deflate/zstd, AES-encrypted and streamed members and opens them with the password) · ct n/a — archive streaming (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point + blind review: zip64 locator and extra-field overflows refused, entry reservation capped at 4096, `Archive.Options.zstd_window_log_max` bounds zstd members; `extractAll` no longer restores setuid/setgid/sticky by default and removes a file whose extraction failed)
 
 **Performance:** ref 0.31–1.07× Go archive/zip 1.26.8 (`zig build bench-zipstream`: xlsx-shaped 200 MB deflate extract, 512 MiB stored, central directory of 100 k entries, 10 k small entries, writer and streamed writer 256 MiB deflate and store) (measured 2026-10-20)
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-26 · mutation 2026-09-28 · src ?
 
-**Hardening:** fuzz 2026-10-07 (2,000–40,000 runs clean per target, 6 targets, ZSTD_FUZZ; found the stale raw-block underflow, fixed) · ct n/a — compression only (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-07 (2,000–40,000 runs clean per target, 6 targets, ZSTD_FUZZ; found the stale raw-block underflow, fixed) · ct n/a — compression only (keyword review, 2026-10-07) · panic 2026-10-29 (sweep of every pub entry point, decoder and encoder + dictionaries, + blind review: caller sequence offsets and `stable_in_buffer` positions refused, crafted dictionaries no longer drive negative shifts, ring-wrap copies and zero-byte `decompressContinue` writes stay inside dst; empty writer buffers total; overlapping `decompress` dst/src a checked panic)
 
 **Performance:** ref 0.92–1.06× libzstd 1.5.7 · fastest ?× c4milo/stdx (measured 2026-10-20)
 

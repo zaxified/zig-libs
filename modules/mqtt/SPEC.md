@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-01 · mutation 2026-10-01 (48/48) · src ?
 
-**Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, MQTT_FUZZ: decode ×4, acl-parse, broker-session) · fuzz 2026-10-19 (100,000 runs, new MQTT_FUZZ harness broker-multi: shared client ids, 3.1.1 + 5.0, persistent sessions, delayed Wills, failing subscriber transports) · ct 2026-10-17 (ctgrind: CONNECT password + auth data tainted, `encode` + `decode`, 0 in-file; `acl.Passwords.verify` password tainted, 0 in acl.zig)
+**Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, MQTT_FUZZ: decode ×4, acl-parse, broker-session) · fuzz 2026-10-19 (100,000 runs, new MQTT_FUZZ harness broker-multi: shared client ids, 3.1.1 + 5.0, persistent sessions, delayed Wills, failing subscriber transports) · ct 2026-10-17 (ctgrind: CONNECT password + auth data tainted, `encode` + `decode`, 0 in-file; `acl.Passwords.verify` password tainted, 0 in acl.zig) · panic 2026-10-29 (sweep of every pub entry point, wire + session, + blind review: clock overflows, per-packet compaction and fanout linear; a non-reading subscriber is cut after `TcpServer.write_timeout_ms` (10 s) instead of blocking publishers; `Config.max_subscription_nodes` 1 Mi)
 
 **Performance:** ref 0.72–1.05× Mosquitto 2.1.2 · fastest ? (measured 2026-10-20)
 
