@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (13/14 killed + 1 eq). New test: `sealSecretKey` exactly at the ops/mem caps is accepted (stopped at scrypt's first allocation by a failing allocator).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GP). `openSecretKey` took the scrypt cost (`ops_limit`, `mem_limit`) from the key file uncapped — a hostile file cost hours of CPU or a huge allocation before the password was checked. New `SecretKeyLimits` (defaults: libsodium's `*_SENSITIVE`, which is what minisign writes) and `openSecretKeyLimited`; `openSecretKey` uses the defaults; over the cap → `error.OpsLimitTooLarge` (new) / `error.MemLimitTooLarge`, checked before any work. `sealSecretKey` rejects the same over-cap values (new `SealSecretKeyError`) so it never writes a key `openSecretKey` refuses, and `mem_limit < 1024` is `error.WeakParameters` (was a std assert). An unencrypted secret key whose public half does not match its seed is `error.NonCanonical` in every build mode (std checks it only with runtime safety). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

@@ -89,3 +89,26 @@ test "openSecretKey: a public half that is not the seed's is NonCanonical for a 
         try std.testing.expectError(error.NonCanonical, ms.openSecretKey(gpa, &opened, &bad, null));
     }
 }
+
+test "sealSecretKey: costs exactly at the caps pass the gate, the smallest working mem_limit round-trips (sweep audit GP-MS-1)" {
+    var kp: ms.KeyPair = undefined;
+    ms.KeyPair.generate(&kp, std.testing.io);
+    defer kp.wipe();
+    var out: ms.RawSecretKey = undefined;
+    const salt: [ms.salt_length]u8 = @splat(7);
+    // At the cap the call must get past the gate and reach scrypt's first
+    // allocation, which this allocator refuses (no gigabyte of memory is touched).
+    var fa: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ms.sealSecretKey(fa.allocator(), &out, &kp, "pw", salt, ms.ops_limit_sensitive, 1 << 16));
+    var fb: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, ms.sealSecretKey(fb.allocator(), &out, &kp, "pw", salt, 32768, ms.mem_limit_sensitive));
+    // mem_limit 1024..2047 reaches scrypt with ln = 0, which std refuses as WeakParameters
+    // (the same error the floor check gives); 2048 is the smallest cost that works, and
+    // the key opens again.
+    try std.testing.expectError(error.WeakParameters, ms.sealSecretKey(std.testing.allocator, &out, &kp, "pw", salt, 32768, 1024));
+    try ms.sealSecretKey(std.testing.allocator, &out, &kp, "pw", salt, 32768, 2048);
+    var opened: ms.KeyPair = undefined;
+    try ms.openSecretKey(std.testing.allocator, &opened, &out, "pw");
+    defer opened.wipe();
+    try std.testing.expectEqualSlices(u8, &kp.ed25519.public_key.bytes, &opened.ed25519.public_key.bytes);
+}
