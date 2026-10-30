@@ -423,6 +423,10 @@ pub const FieldCheck = union(enum) {
 /// quote is literal (Go's `LazyQuotes` rule, again matching `splitFields`).
 pub const SpanConfig = struct {
     delimiter: u8 = ',',
+    /// Newlines one quoted field may contain before its quote is stray. The
+    /// look-ahead per stray quote costs up to `min(max_quoted_lines lines,
+    /// max_record_len)` bytes, so a huge value together with a huge record cap
+    /// lets hostile input make every line rescan up to the cap.
     max_quoted_lines: usize = default_max_quoted_lines,
     /// Byte cap on one spanned record. `StreamReader` sets it to its own
     /// `max_record_len`; in memory it defaults to no cap.
@@ -486,7 +490,11 @@ pub const SpanScanner = struct {
     /// look-ahead that lay in the buffer, and when the chunk is cut before that
     /// look-ahead, the re-scan meets the chunk's end still inside the quote and
     /// falls back at EOF — to the same physical line.
-    pub fn scan(self: *SpanScanner, bytes: []const u8, start: usize, at_eof: bool) Scan {
+    ///
+    /// `start` past `bytes.len` is read as `bytes.len` (an empty tail), never a
+    /// slice panic (sweep CS-2).
+    pub fn scan(self: *SpanScanner, bytes: []const u8, start_in: usize, at_eof: bool) Scan {
+        const start = @min(start_in, bytes.len);
         const r = self.scanRaw(bytes, start, at_eof);
         if (r == .record and self.awaiting_header and !r.record.comment) {
             const rec = trimCr(bytes[start..r.record.end]);
@@ -847,7 +855,7 @@ pub const LineIterator = struct {
                 // A comment line: its quotes mean nothing; skip to its end.
                 if (std.mem.findScalarPos(u8, self.bytes, rec_start, '\n')) |nl| {
                     self.pos = nl + 1;
-                    self.line += 1;
+                    self.line +|= 1;
                 } else self.pos = self.bytes.len;
                 continue;
             }
@@ -861,14 +869,14 @@ pub const LineIterator = struct {
             self.pos = end;
             if (nl != null) {
                 self.pos += 1; // consume the newline
-                self.line += 1;
+                self.line +|= 1;
             }
             if (rec.len > 0 and rec[rec.len - 1] == '\r') rec = rec[0 .. rec.len - 1];
             if (rec.len == 0) continue; // skip empty record, try next
-            defer self.record += 1;
+            defer self.record +|= 1;
             return .{
                 .bytes = rec,
-                .byte_offset = self.base_offset + rec_start,
+                .byte_offset = self.base_offset +| rec_start,
                 .unbalanced_quote = unbalanced,
                 .line_number = rec_line,
                 .record_index = self.record,
@@ -885,15 +893,15 @@ pub const LineIterator = struct {
             // `at_eof` is true, so the scan always yields a record.
             const r = scanner.scan(self.bytes, rec_start, true).record;
             self.pos = r.next;
-            if (r.spanned) self.line += std.mem.countScalar(u8, self.bytes[rec_start..r.end], '\n');
-            if (r.next > r.end) self.line += 1; // the terminating '\n'
+            if (r.spanned) self.line +|= std.mem.countScalar(u8, self.bytes[rec_start..r.end], '\n');
+            if (r.next > r.end) self.line +|= 1; // the terminating '\n'
             if (r.comment) continue;
             const rec = trimCr(self.bytes[rec_start..r.end]);
             if (rec.len == 0) continue;
-            defer self.record += 1;
+            defer self.record +|= 1;
             return .{
                 .bytes = rec,
-                .byte_offset = self.base_offset + rec_start,
+                .byte_offset = self.base_offset +| rec_start,
                 .unbalanced_quote = r.unbalanced,
                 .spanned = r.spanned,
                 .line_number = rec_line,

@@ -28,6 +28,9 @@ pub const LineIterator = line.LineIterator;
 /// `error.RecordTooLong` rather than buffering the whole file.
 pub const default_chunk_size: usize = 10 * 1024 * 1024;
 
+/// Size of the read that probes for EOF once the stat size has been consumed.
+const eof_probe_size: usize = 64 * 1024;
+
 /// Returns the index of the LAST '\n' in `bytes`, or null if there is none.
 /// Every '\n' is a record boundary (no multi-line quoted fields — see
 /// `LineIterator`), so this is just the last newline. This is what bounds chunk
@@ -72,6 +75,10 @@ pub const ChunkReader = struct {
     /// complete record as `line.SpanScanner` reads it, not at the last `\n`.
     /// Holds the scanner state as of the start of the unread residual.
     span: ?line.SpanScanner = null,
+    /// Diagnostic: bytes the cut search has looked at, summed over every
+    /// refill (a witness that a record growing over many refills is not
+    /// rescanned quadratically, sweep CS-4).
+    scanned: u64 = 0,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
         return initMax(io, alloc, file, chunk_size, 0);
@@ -181,7 +188,10 @@ pub const ChunkReader = struct {
             self.chunk_start_in_file += self.last_emit_len;
             self.last_emit_len = 0;
         }
+        // Read-size multiplier for refills that found no cut (see below).
+        var grow: usize = 1;
         while (true) {
+            self.scanned +|= self.buffer.items.len;
             if (self.findCut()) |cut| {
                 self.last_emit_len = cut;
                 return self.buffer.items[0..self.last_emit_len];
@@ -199,8 +209,11 @@ pub const ChunkReader = struct {
             // partial record emitted as if it were complete. EOF now comes
             // from a read returning 0, which is the only thing that means it
             // (W2 re-audit 2026-09-02, `csvstream` F6).
+            // Past the stat size the hint is only an EOF probe: it need not be
+            // a whole chunk (a huge `chunk_size` meaning "read it all" then
+            // failed to allocate at EOF, sweep CS-1).
             const hint: u64 = if (self.bytes_read >= self.total_size)
-                self.chunk_size
+                @min(self.chunk_size, eof_probe_size)
             else
                 self.total_size - self.bytes_read;
             // Bound memory on a newline-free input: if we have already buffered a
@@ -208,7 +221,17 @@ pub const ChunkReader = struct {
             // still more file to read, the record is pathological — fail closed
             // instead of growing the buffer to the entire file size.
             if (self.buffer.items.len >= self.max_record_len) return error.RecordTooLong;
-            const want_cap: usize = @intCast(@min(@as(u64, self.chunk_size), hint));
+            const base_cap: usize = @intCast(@min(@as(u64, self.chunk_size), hint));
+            // Every refill that finds no cut rescans the whole residual, so a
+            // record growing over many small reads cost O(M^2 / chunk). From the
+            // second read of one call on, double the read (bounded by what the
+            // record cap still allows, never below the plain read): O(M log M)
+            // total. Records within one chunk take the first, unchanged read
+            // (sweep CS-4).
+            const room = @max(base_cap, self.max_record_len - self.buffer.items.len);
+            const file_room: usize = if (self.bytes_read < self.total_size) @max(base_cap, @as(usize, @intCast(@min(hint, std.math.maxInt(usize))))) else std.math.maxInt(usize);
+            const want_cap: usize = @min(@min(base_cap *| grow, room), file_room);
+            grow *|= 2;
             // Grow geometrically, but never past `capacity_bound`: the buffer
             // holds at most a residual (< max_record_len, or the check above
             // fired) plus one read (<= chunk_size). `ensureUnusedCapacity`
@@ -217,7 +240,10 @@ pub const ChunkReader = struct {
             // (measured 2026-09-17: 15,728,768 B of capacity under a
             // 10,485,760 B cap). The READ sizes are unchanged, so the chunks
             // this returns are byte-for-byte what they were.
-            const need = self.buffer.items.len + want_cap;
+            // Saturating: with `chunk_size` near maxInt the hint after the last
+            // byte is `chunk_size` and the sum wrapped (sweep CS-1); the
+            // allocation below then fails with OutOfMemory instead.
+            const need = self.buffer.items.len +| want_cap;
             if (need > self.buffer.capacity) {
                 const grown = @max(need, self.buffer.capacity +| self.buffer.capacity / 2);
                 try self.buffer.ensureTotalCapacityPrecise(@min(grown, self.capacityBound()));
@@ -289,7 +315,10 @@ pub const StreamReader = struct {
         /// quoted field may contain newlines, bounded — see `line.SpanConfig`.
         quoted_newlines: line.QuotedNewlines = .end_record,
         /// `.span` mode: newlines one quoted field may contain before its
-        /// opening quote is declared stray.
+        /// opening quote is declared stray. The look-ahead per stray quote
+        /// costs up to `min(max_quoted_lines lines, max_record_len)` bytes: a
+        /// huge value with a huge `max_record_len` lets hostile input make every
+        /// line rescan up to the cap.
         max_quoted_lines: usize = line.default_max_quoted_lines,
         /// `.span` mode: the field count a spanned record must have to keep
         /// its span. `.first_record` = the header's.

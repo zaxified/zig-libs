@@ -168,6 +168,10 @@ after the record (bump allocator), long rows failing both arity checks, bytes ap
 
 ## Backlog / deferred
 
+- **Refill rescans, what remains (no-panic sweep GN, 2026-10-30).** `ChunkReader.findCut` rescans the whole unterminated residual after every refill. Since the GN fix review, a refill that finds no cut doubles the next read (up to `max_record_len - len`), so one growing record is scanned O(M log M) instead of `max_record_len^2 / chunk_size`; reads of records within one chunk are unchanged (the pinned chunk boundaries hold). What remains: a stream of many records each just over `chunk_size` still pays a rescan per doubling step, and the lazy mode could remember how much of the residual is known newline-free (`.span` would need the scanner to resume mid-record).
+- **`max_quoted_lines` huge (GN fix review).** The look-ahead per stray quote costs up to `min(max_quoted_lines lines, max_record_len)` bytes, so `max_quoted_lines = 1 << 20` with a file of lines like `"a` and a 10 MiB `max_record_len` rescans up to the record cap for every line. Caller-chosen and documented on the option; a fix would remember "no closer before X" per chunk.
+- **Dialect options are not validated (GN fix review).** `delimiter == quote`, `escape == delimiter`, `delimiter == '\n'`, `quote == '\n'` do not hang or crash (progress is guaranteed) but mis-parse silently. Rejecting them needs a new error in `StreamReader.init`'s set; deferred.
+
 ### Scope parity gap list (S2 re-survey 2026-10-20)
 
 Owner rule (2026-10-16): S2 = every SUBSTANTIAL feature of the leading competitors is present or

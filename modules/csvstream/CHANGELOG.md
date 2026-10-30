@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE:** a refill that finds no record end doubles the next read within the same `nextChunk` call (an unclosed quote with a small `chunk_size` and a large `max_record_len` rescanned ~M²/chunk_size bytes; now O(M log M)); normal chunk boundaries unchanged. The read after the file's stat size asks for at most 64 KiB, so a huge `chunk_size` no longer fails with `OutOfMemory` at EOF. **Fixes (no-panic sweep + blind review, § GN):** `chunk_size` near `maxInt` wrapped the capacity sum; `SpanScanner.scan` with `start` past the end sliced out of range; `LineIterator` counters saturate. New diagnostic field `ChunkReader.scanned`.
 - **2026-10-20** — Review fixes: `nextFieldsOpts` honours a caller `strict = true` and documents which
   options it takes; `WriteOptions.comment` quotes a first field starting with the reader's comment byte;
   docs (`.never` caveats, `fields_per_record` counting, `last` borrow, stale "no escape/SIMD" notes);
