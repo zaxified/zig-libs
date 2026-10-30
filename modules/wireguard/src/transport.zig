@@ -175,15 +175,21 @@ pub fn counterNonce(counter: u64) [noise.Aead.nonce_length]u8 {
 
 /// The plaintext length actually encrypted for a `plaintext_len`-byte packet:
 /// rounded UP to a multiple of 16. `paddedLen(0) == 0` — an empty payload
-/// (a keepalive) is not padded to a full block.
+/// (a keepalive) is not padded to a full block. Total: within 15 of
+/// `maxInt(usize)` the result saturates at `maxInt(usize)` instead of
+/// overflowing (such a length is far above `max_payload` and is rejected by
+/// `seal` before it is used) (sweep WH-3).
 pub fn paddedLen(plaintext_len: usize) usize {
-    return std.mem.alignForward(usize, plaintext_len, pad_multiple);
+    const rem = plaintext_len % pad_multiple;
+    if (rem == 0) return plaintext_len;
+    return plaintext_len +| (pad_multiple - rem);
 }
 
 /// Exact wire size of the message `seal` produces for a `plaintext_len`-byte
-/// packet: header + padded plaintext + tag.
+/// packet: header + padded plaintext + tag. Saturating at `maxInt(usize)`
+/// for absurd lengths (sweep WH-3).
 pub fn sealedLen(plaintext_len: usize) usize {
-    return overhead + paddedLen(plaintext_len);
+    return overhead +| paddedLen(plaintext_len);
 }
 
 /// The two directional transport keys produced by a completed handshake.
@@ -300,6 +306,10 @@ pub fn ReplayWindow(comptime bits: usize) type {
         pub fn commit(self: *Self, counter: u64) void {
             if (counter == std.math.maxInt(u64)) return;
             const n = counter + 1;
+            // A counter that has fallen off the trailing edge would alias the
+            // block of a newer counter and mark it seen; `accepts` says no to
+            // it, so ignore it here too (sweep WH-5).
+            if (n <= self.last and self.last - n > capacity) return;
             if (n > self.last) {
                 const from = self.last >> 6;
                 const to = n >> 6;
@@ -369,6 +379,9 @@ pub const RekeyState = enum {
 /// `now_s`. Saturating: a `now_s` that moved backwards (a clock step, a
 /// caller mixing two time sources) yields 0 rather than wrapping to a
 /// gigantic age, so a bad clock can never make a fresh session look expired.
+/// The flip side: a clock that stays behind `born_s` (or never advances) never
+/// ages the session, so the 180 s reject time does not fire; the caller owns
+/// the clock and must keep it monotonic.
 fn ageSeconds(born_s: u64, now_s: u64) u64 {
     return now_s -| born_s;
 }
@@ -398,6 +411,8 @@ pub const SealError = error{
 /// Sender half of a session: one transport key, the peer's session index, a
 /// monotonic counter and the session's birth time. `single_owner` — one
 /// loop/thread owns it, no lock.
+/// Do not copy a `SendSession` by value and use both copies: each copy has its
+/// own `counter`, so the same nonce would be sealed twice under one key.
 pub const SendSession = struct {
     /// `T_send` from `Handshake.deriveTransportKeys`.
     key: [32]u8,
@@ -434,7 +449,8 @@ pub const SendSession = struct {
 
     /// Seal one plaintext packet into `out` as a complete transport-data
     /// message. `out` must be at least `sealedLen(packet.len)` bytes and must
-    /// NOT overlap `packet`. `now_s` is the caller's current wall-clock time in
+    /// NOT overlap `packet` (an overlap is tolerated nevertheless: the packet is
+    /// moved into place before the header is written). `now_s` is the caller's current wall-clock time in
     /// seconds, on the same clock `init` was given: it enforces
     /// `REJECT_AFTER_TIME` and reports `REKEY_AFTER_TIME`. Zero allocation; the
     /// padding and the AEAD are done in place inside `out`.
@@ -455,10 +471,12 @@ pub const SendSession = struct {
         if (age_s >= reject_after_time_s) return error.SessionExpired;
 
         const counter = self.counter;
-        (Header{ .receiver_index = self.receiver_index, .counter = counter }).encode(out[0..header_len]);
-
+        // Move the packet first (`@memmove`: `packet` may overlap `out`; a
+        // `@memcpy` alias is a safety panic / UB), then write the header, which
+        // may sit over the packet's old bytes (sweep WH-4).
         const ct = out[header_len..][0..ct_len];
-        @memcpy(ct[0..packet.len], packet);
+        @memmove(ct[0..packet.len], packet);
+        (Header{ .receiver_index = self.receiver_index, .counter = counter }).encode(out[0..header_len]);
         @memset(ct[packet.len..], 0); // the pad-to-16 rule, encrypted along with the packet
         // In place (c == m): `chachapoly` documents and tests this, and std's
         // ChaCha20 XOR is in-place-safe too. Empty AAD — the header is not

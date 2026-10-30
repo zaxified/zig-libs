@@ -303,9 +303,11 @@ pub const AllowedIp = struct {
         };
     }
 
-    /// The address bytes (4 or 16).
+    /// The address bytes (4 or 16). Total: a hand-built value with
+    /// `addr_len > 16` yields the whole 16-byte buffer (such a value is
+    /// rejected by `buildSetRequests`, never sent).
     pub fn bytes(ip: *const AllowedIp) []const u8 {
-        return ip.addr[0..ip.addr_len];
+        return ip.addr[0..@min(ip.addr_len, ip.addr.len)];
     }
 
     fn valid(ip: AllowedIp) bool {
@@ -348,8 +350,9 @@ pub const Device = struct {
     fwmark: u32 = 0,
     peers: []Peer = &.{},
 
+    /// Total: a hand-edited `name_len` > 15 is clamped to the buffer.
     pub fn ifname(d: *const Device) []const u8 {
-        return d.name_buf[0..d.name_len];
+        return d.name_buf[0..@min(d.name_len, d.name_buf.len)];
     }
 
     /// Frees the peers and wipes what held keys: the device's private key
@@ -377,6 +380,11 @@ pub const DeviceParser = struct {
     gpa: std.mem.Allocator,
     dev: Device = .{},
     peers: std.ArrayList(Peer) = .empty,
+    /// Allowed-ips of the LAST peer in `peers`, still growing: a peer whose
+    /// allowed-ips span many messages is merged by appending here (amortised),
+    /// not by reallocating its exact-size slice per message (quadratic). Moved
+    /// into `peers.items[last].allowed_ips` (empty until then) by `flushLast`.
+    last_ips: std.ArrayList(AllowedIp) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) DeviceParser {
         return .{ .gpa = gpa };
@@ -384,6 +392,7 @@ pub const DeviceParser = struct {
 
     pub fn deinit(p: *DeviceParser) void {
         for (p.peers.items) |peer| p.gpa.free(peer.allowed_ips);
+        p.last_ips.deinit(p.gpa);
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(p.peers.allocatedSlice()));
         p.peers.deinit(p.gpa);
         std.crypto.secureZero(u8, std.mem.asBytes(&p.dev));
@@ -425,6 +434,8 @@ pub const DeviceParser = struct {
 
     /// Hand over the accumulated Device. The parser is left empty (finish
     /// then deinit is safe); the caller frees the Device with `deinit`.
+    /// If `finish` fails (`OutOfMemory`) the parser is unchanged: it may be
+    /// fed again and finished later, or `deinit`ed.
     ///
     /// The Device comes back BY VALUE (a copy of its private key stays in this
     /// function's dead frame); `finishInto` does not.
@@ -441,9 +452,13 @@ pub const DeviceParser = struct {
     }
 
     fn finishBody(p: *DeviceParser, out: *Device) error{OutOfMemory}!void {
+        // Allocate BEFORE flushing: the flush is what changes the parser, so
+        // a failed `finish` (either step) leaves it exactly as it was.
         // An exact-size block, so the peer table is never `remap`ped in place
         // and the old (key-bearing) block can be wiped before it is freed.
         const peers = try p.gpa.alloc(Peer, p.peers.items.len);
+        errdefer p.gpa.free(peers);
+        try p.flushLast();
         @memcpy(peers, p.peers.items);
         const old = p.peers.allocatedSlice();
         std.crypto.secureZero(u8, std.mem.sliceAsBytes(old));
@@ -455,9 +470,20 @@ pub const DeviceParser = struct {
         p.dev = .{};
     }
 
-    /// `ArrayList.append`, except that growth wipes the block it leaves behind
-    /// (peers carry pre-shared keys).
-    fn appendPeer(p: *DeviceParser, peer: Peer) error{OutOfMemory}!void {
+    /// Hand the pending allowed-ips to the last peer (exact-size slice). On
+    /// failure nothing has changed; afterwards `last_ips` is empty.
+    fn flushLast(p: *DeviceParser) error{OutOfMemory}!void {
+        if (p.last_ips.items.len == 0) return;
+        // Invariant: `last_ips` is non-empty only while a peer exists (it is
+        // filled right after `peers` gets its element) and `flushLast` is the
+        // only place that fills `allowed_ips`, so the slot is still empty.
+        const last = &p.peers.items[p.peers.items.len - 1];
+        last.allowed_ips = try p.last_ips.toOwnedSlice(p.gpa);
+    }
+
+    /// Make room for one more element of `peers`, except that growth wipes the
+    /// block it leaves behind (peers carry pre-shared keys).
+    fn reservePeer(p: *DeviceParser) error{OutOfMemory}!void {
         if (p.peers.items.len == p.peers.capacity) {
             const cap = @max(4, p.peers.capacity * 2);
             const fresh = try p.gpa.alloc(Peer, cap);
@@ -468,7 +494,6 @@ pub const DeviceParser = struct {
             p.peers.items = fresh[0..p.peers.items.len];
             p.peers.capacity = cap;
         }
-        p.peers.appendAssumeCapacity(peer);
     }
 
     fn feedPeer(p: *DeviceParser, entry: codec.Attr, first_in_msg: bool) ParseError!void {
@@ -512,17 +537,17 @@ pub const DeviceParser = struct {
         if (first_in_msg and p.peers.items.len > 0) {
             const last = &p.peers.items[p.peers.items.len - 1];
             if (std.mem.eql(u8, &last.public_key, &peer.public_key)) {
-                const merged = try p.gpa.alloc(AllowedIp, last.allowed_ips.len + ips.items.len);
-                @memcpy(merged[0..last.allowed_ips.len], last.allowed_ips);
-                @memcpy(merged[last.allowed_ips.len..], ips.items);
-                p.gpa.free(last.allowed_ips);
-                last.allowed_ips = merged;
+                try p.last_ips.appendSlice(p.gpa, ips.items);
                 return;
             }
         }
-        peer.allowed_ips = try p.gpa.dupe(AllowedIp, ips.items);
-        errdefer p.gpa.free(peer.allowed_ips);
-        try p.appendPeer(peer);
+        // Reserve first, flush second: the only two steps that can fail leave
+        // the parser unchanged, and the rest cannot fail.
+        try p.reservePeer();
+        try p.flushLast();
+        p.peers.appendAssumeCapacity(peer);
+        p.last_ips = ips; // take ownership (the `defer` above frees the empty list)
+        ips = .empty;
     }
 };
 
@@ -658,6 +683,10 @@ pub const SetRequests = struct {
 /// allowed-ips (never re-sending REPLACE_* flags, which would undo earlier
 /// fragments). `max_msg_len` is a soft ceiling: a single indivisible
 /// attribute group never splits, so one message may exceed it slightly.
+/// Ceiling: an `nlattr` length is a `u16`, so with `max_msg_len` above about
+/// 65 400 bytes a config that needs splitting returns `error.AttrTooLong`
+/// instead of splitting (keep it at or below `default_max_msg_len` unless you
+/// know the config is small).
 ///
 /// The request is built in blocks that are wiped when released (the list
 /// grows by reallocation and would otherwise leave earlier copies of the
@@ -974,6 +1003,11 @@ pub const RequestError = error{
     NotSupported,
     SystemResources,
     Unexpected,
+    /// The reply loop consumed `max_reply_messages` datagrams without reaching
+    /// the end of our exchange (no `NLMSG_DONE`/ACK, a flood of foreign
+    /// datagrams), or the dump was interrupted (`NLM_F_DUMP_INTR`) more than
+    /// `max_dump_restarts` times in a row.
+    TooManyMessages,
 };
 
 pub const GetError = RequestError;
@@ -1029,60 +1063,21 @@ pub const Wireguard = struct {
     }
 
     /// `getDevice`, writing the result to `out` (valid only on success).
+    ///
+    /// Blocks until the kernel ends the dump: there is no receive timeout (a
+    /// kernel peer; see SPEC Backlog). The exchange is bounded in messages
+    /// (`error.TooManyMessages` after 65536 datagrams) and a dump the kernel
+    /// interrupts (`NLM_F_DUMP_INTR`) is restarted at most 3 times.
     pub fn getDeviceInto(wg: *Wireguard, ifname: []const u8, out: *Device) GetError!void {
-        if (ifname.len == 0 or ifname.len >= ifnamsiz) return error.InvalidRequest;
-        const gpa = wg.sock.gpa;
-        const seq = wg.sock.nextSeq();
-
-        var req: std.ArrayList(u8) = .empty;
-        defer req.deinit(gpa);
-        const hdr = try codec.appendHeader(
-            gpa,
-            &req,
-            wg.family_id,
-            codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_DUMP,
-            seq,
-            0,
-        );
-        try genl.appendHeader(gpa, &req, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
-        codec.appendAttrString(gpa, &req, WGDEVICE_A.IFNAME, ifname) catch |err| switch (err) {
-            error.AttrTooLong => unreachable, // len < ifnamsiz, checked
-            error.OutOfMemory => return error.OutOfMemory,
-        };
-        codec.finishHeader(&req, hdr);
-        try wg.sock.send(req.items);
-
-        var parser: DeviceParser = .init(gpa);
-        errdefer parser.deinit();
-        while (true) {
-            const dgram = try wg.sock.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != wg.sock.portid or m.seq != seq) continue;
-                switch (m.type) {
-                    codec.NLMSG_DONE => return parser.finishInto(out),
-                    codec.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        if (code == 0) continue; // stray ACK
-                        return errnoToError(code);
-                    },
-                    codec.NLMSG_NOOP => {},
-                    codec.NLMSG_OVERRUN => return error.SystemResources,
-                    else => {
-                        if (m.type != wg.family_id) continue;
-                        parser.feed(m.payload) catch |err| switch (err) {
-                            error.OutOfMemory => return error.OutOfMemory,
-                            else => return error.MalformedReply,
-                        };
-                    },
-                }
-            }
-        }
+        var t: SockTransport = .{ .s = &wg.sock };
+        return getDeviceOver(&t, wg.sock.gpa, wg.family_id, ifname, out);
     }
 
     /// Apply a configuration (WG_CMD_SET_DEVICE). Needs CAP_NET_ADMIN.
     /// Large configs are split across messages; each message is ACKed by
-    /// the kernel before the next is sent.
+    /// the kernel before the next is sent. Blocks until the kernel answers
+    /// each message (no receive timeout), but never reads more than 65536
+    /// datagrams for one (`error.TooManyMessages`).
     pub fn setDevice(wg: *Wireguard, cfg: Config) SetError!void {
         const gpa = wg.sock.gpa;
         const first_seq = wg.sock.nextSeq();
@@ -1101,19 +1096,144 @@ pub const Wireguard = struct {
     }
 
     fn awaitAck(wg: *Wireguard, seq: u32) RequestError!void {
-        while (true) {
-            const dgram = try wg.sock.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != wg.sock.portid or m.seq != seq) continue;
-                if (m.type != codec.NLMSG_ERROR) continue;
-                const code = m.errorCode() catch return error.MalformedReply;
-                if (code == 0) return; // ACK
-                return errnoToError(code);
+        var t: SockTransport = .{ .s = &wg.sock };
+        return awaitAckOver(&t, seq);
+    }
+};
+
+/// Datagram budget for one exchange — the same bound as genetlink's
+/// `max_reply_messages` and netlink's `max_dump_messages`.
+const max_reply_messages: u32 = 65536;
+
+/// How often a dump interrupted by the kernel (`NLM_F_DUMP_INTR`: the peer
+/// list changed mid-dump) is restarted before giving up.
+const max_dump_restarts: u32 = 3;
+
+/// The slice of `genl.Socket` the exchange loops use; a test substitutes a
+/// scripted transport with the same four methods.
+const SockTransport = struct {
+    s: *genl.Socket,
+
+    fn portId(t: *const SockTransport) u32 {
+        return t.s.portid;
+    }
+    fn nextSeq(t: *SockTransport) u32 {
+        return t.s.nextSeq();
+    }
+    fn send(t: *SockTransport, msg: []const u8) genl.SendError!void {
+        return t.s.send(msg);
+    }
+    fn recvDatagram(t: *SockTransport) genl.RecvError![]const u8 {
+        return t.s.recvDatagram();
+    }
+};
+
+fn getDeviceOver(
+    t: anytype,
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    ifname: []const u8,
+    out: *Device,
+) GetError!void {
+    if (ifname.len == 0 or ifname.len >= ifnamsiz) return error.InvalidRequest;
+    var restarts: u32 = 0;
+    while (true) {
+        if (try dumpOnce(t, gpa, family_id, ifname, out)) return;
+        // NLM_F_DUMP_INTR: what was collected may be inconsistent; discard it
+        // (done by `dumpOnce`) and ask again under a fresh sequence number.
+        restarts += 1;
+        if (restarts > max_dump_restarts) return error.TooManyMessages;
+    }
+}
+
+/// One request/dump round. True = `out` filled; false = interrupted, retry.
+fn dumpOnce(
+    t: anytype,
+    gpa: std.mem.Allocator,
+    family_id: u16,
+    ifname: []const u8,
+    out: *Device,
+) GetError!bool {
+    const seq = t.nextSeq();
+
+    var req: std.ArrayList(u8) = .empty;
+    defer req.deinit(gpa);
+    const hdr = try codec.appendHeader(
+        gpa,
+        &req,
+        family_id,
+        codec.NLM_F_REQUEST | codec.NLM_F_ACK | codec.NLM_F_DUMP,
+        seq,
+        0,
+    );
+    try genl.appendHeader(gpa, &req, WG_CMD.GET_DEVICE, WG_GENL_VERSION);
+    codec.appendAttrString(gpa, &req, WGDEVICE_A.IFNAME, ifname) catch |err| switch (err) {
+        error.AttrTooLong => unreachable, // len < ifnamsiz, checked by the caller
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    codec.finishHeader(&req, hdr);
+    try t.send(req.items);
+
+    var parser: DeviceParser = .init(gpa);
+    defer parser.deinit(); // safe after a successful `finishInto` too
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_reply_messages) return error.TooManyMessages;
+        const dgram = try t.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            switch (codec.classifyDumpMessage(m, t.portId(), seq)) {
+                .skip => {},
+                .restart => return false,
+                .done => {
+                    if (m.type == codec.NLMSG_ERROR) continue; // stray ACK
+                    try parser.finishInto(out);
+                    return true;
+                },
+                .failed => |code| return errnoToError(code),
+                .overrun => return error.SystemResources,
+                .malformed => return error.MalformedReply,
+                .record => {
+                    if (m.type != family_id) continue;
+                    parser.feed(m.payload) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.MalformedReply,
+                    };
+                },
             }
         }
     }
+}
+
+fn awaitAckOver(t: anytype, seq: u32) RequestError!void {
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_reply_messages) return error.TooManyMessages;
+        const dgram = try t.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            if (m.pid != t.portId() or m.seq != seq) continue;
+            if (m.type != codec.NLMSG_ERROR) continue;
+            const code = m.errorCode() catch return error.MalformedReply;
+            if (code == 0) return; // ACK
+            return errnoToError(code);
+        }
+    }
+}
+
+/// Seam for the sweep tests (scripted transports); NOT part of the API.
+pub const test_seam = struct {
+    pub const getDeviceOver = root_getDeviceOver;
+    pub const awaitAckOver = root_awaitAckOver;
+    pub const max_reply_messages = root_max_reply_messages;
+    pub const max_dump_restarts = root_max_dump_restarts;
 };
+const root_getDeviceOver = getDeviceOver;
+const root_awaitAckOver = awaitAckOver;
+const root_max_reply_messages = max_reply_messages;
+const root_max_dump_restarts = max_dump_restarts;
 
 // ── offline tests ───────────────────────────────────────────────────────────
 
@@ -2249,6 +2369,9 @@ test {
     _ = @import("kernel_handshake_replay.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    // No-panic sweep (wave GR): control plane / data plane.
+    _ = @import("sweep_test.zig");
+    _ = @import("sweep_dataplane_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

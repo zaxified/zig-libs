@@ -298,15 +298,26 @@ pub const Handshake = struct {
     /// Which step this attempt has completed — enforces the call order
     /// (`createInitiation` → `consumeResponse` for the initiator,
     /// `consumeInitiation` → `createResponse` for the responder).
-    state: enum { idle, initiation_sent, initiation_consumed, complete } = .idle,
+    state: enum { idle, initiation_sent, initiation_consumed, complete, finished } = .idle,
+
+    /// Which side this attempt plays: set by `createInitiation` (initiator)
+    /// and `consumeInitiation` (responder). `deriveTransportKeys` /
+    /// `transportSession` check their `is_initiator` argument against it, so
+    /// both ends cannot derive the same direction's key (a two-time pad).
+    role: enum { none, initiator, responder } = .none,
 
     pub const InitiationError = error{
         /// `local_ephemeral`/`chaining_key` already set — call once per attempt.
+        /// Also returned after `deriveTransportKeys` (state `.finished`).
         AlreadyStarted,
         /// `remote_static_public` is a low-order/identity X25519 point.
         InvalidPublicKey,
     };
     pub const ConsumeInitiationError = error{
+        /// This `Handshake` already took part in an attempt (`state != .idle`),
+        /// e.g. a replayed initiation reaching a per-peer handshake that has
+        /// consumed one already. Use a fresh `Handshake` per attempt.
+        AlreadyStarted,
         /// mac1 did not match `HASH(LABEL_MAC1 || our_static_public)`.
         InvalidMac1,
         /// The encrypted static key or timestamp failed AEAD authentication
@@ -384,6 +395,7 @@ pub const Handshake = struct {
         now_tai64n: [12]u8,
     ) InitiationError!MessageInitiation {
         if (self.state != .idle) return error.AlreadyStarted;
+        self.role = .initiator;
         if (self.local_ephemeral == null) {
             self.local_ephemeral = @as(Keypair, undefined);
             Keypair.generate(io, &self.local_ephemeral.?);
@@ -457,12 +469,23 @@ pub const Handshake = struct {
     /// — it checks mac1 and mac2 and answers with a `CookieReply` without
     /// constructing a `Handshake` at all, which is the only ordering in which
     /// the cookie layer actually sheds a flood.
+    ///
+    /// One attempt per `Handshake`: a handshake that is not fresh
+    /// (`state != .idle`) answers `error.AlreadyStarted` — reachable from the
+    /// network by replaying a valid initiation at a per-peer handshake, so it
+    /// is an error, not a panic. Use a new `Handshake` per initiation.
+    ///
+    /// Replay protection is the CALLER's: on success `remote_timestamp` holds
+    /// the initiator's TAI64N, and the caller must reject the initiation
+    /// (`error.StaleTimestamp`, which this function never returns) unless
+    /// `timestampNewer(remote_timestamp, last_seen_for_this_peer)`, then store
+    /// it. Without that, a captured initiation can be replayed forever.
     pub fn consumeInitiation(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
         return burn.run(burn.hs_burn, ConsumeInitiationError!void, consumeInitiationBody, .{ self, msg });
     }
 
     fn consumeInitiationBody(self: *Handshake, msg: MessageInitiation) ConsumeInitiationError!void {
-        std.debug.assert(self.state == .idle); // one attempt per Handshake
+        if (self.state != .idle) return error.AlreadyStarted;
 
         // mac1 first — cheap rejection before any DH (keyed with OUR static
         // public key: that is what the initiator derived the mac1 key from).
@@ -522,6 +545,7 @@ pub const Handshake = struct {
         self.remote_ephemeral = msg.unencrypted_ephemeral;
         self.remote_timestamp = ts;
         self.remote_index = msg.sender_index;
+        self.role = .responder;
         self.state = .initiation_consumed;
     }
 
@@ -539,9 +563,11 @@ pub const Handshake = struct {
         switch (self.state) {
             .initiation_consumed => {},
             .idle, .initiation_sent => return error.NoInitiationConsumed,
-            .complete => return error.AlreadyStarted,
+            .complete, .finished => return error.AlreadyStarted,
         }
-        const remote_eph = self.remote_ephemeral.?; // set by consumeInitiation
+        // Set by consumeInitiation; `state` and the field are both public, so a
+        // caller can desynchronise them -> an error, not a panic (sweep WH-6).
+        const remote_eph = self.remote_ephemeral orelse return error.NoInitiationConsumed;
         if (self.local_ephemeral == null) {
             self.local_ephemeral = @as(Keypair, undefined);
             Keypair.generate(io, &self.local_ephemeral.?);
@@ -553,42 +579,50 @@ pub const Handshake = struct {
         msg.sender_index = self.local_index;
         msg.receiver_index = self.remote_index;
 
+        // Work on copies and commit on success only (like `consumeResponse`): a
+        // failing DH must not leave a half-ratcheted chaining key behind (WH-9).
+        var ck = self.chaining_key;
+        var h = self.hash;
+        defer std.crypto.secureZero(u8, &ck);
+
         // e: our ephemeral in the clear.
         msg.unencrypted_ephemeral = eph.public;
-        noise.kdf1(&self.chaining_key, &eph.public);
-        noise.mixHash(&self.hash, &eph.public);
+        noise.kdf1(&ck, &eph.public);
+        noise.mixHash(&h, &eph.public);
 
         // ee: DH(Er, Ei) — chaining-key only, no key output.
         var ee = noise.X25519.scalarmult(eph.private, remote_eph) catch
             return error.InvalidPublicKey;
-        noise.kdf1(&self.chaining_key, &ee);
+        noise.kdf1(&ck, &ee);
         std.crypto.secureZero(u8, &ee);
 
         // se: DH(Er, Si) — chaining-key only.
         var se = noise.X25519.scalarmult(eph.private, self.remote_static_public) catch
             return error.InvalidPublicKey;
-        noise.kdf1(&self.chaining_key, &se);
+        noise.kdf1(&ck, &se);
         std.crypto.secureZero(u8, &se);
 
         // psk2: (ck, tau, k) = KDF3(ck, psk); h = HASH(h || tau).
         var tau: noise.SymmetricKey = undefined;
         var psk_k: noise.SymmetricKey = undefined;
-        noise.kdf3(&self.chaining_key, &self.preshared_key, &tau, &psk_k);
-        noise.mixHash(&self.hash, &tau);
+        noise.kdf3(&ck, &self.preshared_key, &tau, &psk_k);
+        noise.mixHash(&h, &tau);
 
         // Empty-plaintext AEAD — proves agreement on every key derived so far.
         noise.Aead.encrypt(
             msg.encrypted_nothing[0..0],
             msg.encrypted_nothing[0..16],
             "",
-            &self.hash,
+            &h,
             counterNonce(0),
             psk_k,
         );
         std.crypto.secureZero(u8, &tau);
         std.crypto.secureZero(u8, &psk_k);
-        noise.mixHash(&self.hash, &msg.encrypted_nothing);
+        noise.mixHash(&h, &msg.encrypted_nothing);
 
+        self.chaining_key = ck;
+        self.hash = h;
         msg.mac1 = self.computeMac1(std.mem.asBytes(&msg)[0..@offsetOf(MessageResponse, "mac1")]);
         msg.mac2 = self.stampMac2(std.mem.asBytes(&msg)[0..@offsetOf(MessageResponse, "mac2")]);
         self.state = .complete;
@@ -605,7 +639,12 @@ pub const Handshake = struct {
 
     fn consumeResponseBody(self: *Handshake, msg: MessageResponse) ConsumeResponseError!void {
         if (self.state != .initiation_sent) return error.NoPendingInitiation;
-        const eph = self.local_ephemeral.?; // set by createInitiation
+        // Public header fields, checked BEFORE mac1 and any DH: a response that
+        // is not addressed to our pending initiation costs nothing (WH-5).
+        if (msg.type != @backingInt(MessageType.handshake_response) or
+            msg.receiver_index != self.local_index) return error.NoPendingInitiation;
+        // Set by createInitiation; see createResponseBody on public fields (sweep WH-6).
+        const eph = self.local_ephemeral orelse return error.NoPendingInitiation;
 
         // mac1 — keyed with OUR static public key (the responder derived it
         // from ours, since the message is addressed to us).
@@ -672,6 +711,13 @@ pub const Handshake = struct {
     /// Consumes the handshake: the chaining key, transcript hash and the
     /// ephemeral private key are wiped — only the returned keys survive.
     ///
+    /// Caller contract, each a checked panic in every build mode: the
+    /// handshake is complete and not yet consumed (`state == .complete`;
+    /// `@panic("wireguard: deriveTransportKeys before the handshake completed
+    /// or after it was consumed")`), and `is_initiator` matches the role the
+    /// handshake played (`@panic("wireguard: deriveTransportKeys role mismatch")`).
+    /// A second call would derive keys from the wiped, all-zero chaining key.
+    ///
     /// The keys are written to `out`, not returned: transport keys returned by
     /// value are copies in the caller's dead frame.
     pub fn deriveTransportKeys(self: *Handshake, is_initiator: bool, out: *transport.TransportKeys) void {
@@ -679,7 +725,10 @@ pub const Handshake = struct {
     }
 
     fn deriveTransportKeysBody(self: *Handshake, is_initiator: bool, out: *transport.TransportKeys) void {
-        std.debug.assert(self.state == .complete);
+        if (self.state != .complete)
+            @panic("wireguard: deriveTransportKeys before the handshake completed or after it was consumed");
+        if (self.role != @as(@TypeOf(self.role), if (is_initiator) .initiator else .responder))
+            @panic("wireguard: deriveTransportKeys role mismatch");
         // Kdf2(ck, ε) = (T1, T2): kdf2 leaves T1 in the chaining key and
         // writes T2.
         var t2: noise.SymmetricKey = undefined;
@@ -688,6 +737,7 @@ pub const Handshake = struct {
         std.crypto.secureZero(u8, &self.chaining_key);
         std.crypto.secureZero(u8, &self.hash);
         if (self.local_ephemeral) |*kp| std.crypto.secureZero(u8, &kp.private);
+        self.state = .finished;
         out.* = if (is_initiator)
             .{ .send = t1, .recv = t2 }
         else
@@ -701,7 +751,8 @@ pub const Handshake = struct {
     /// `deriveTransportKeys` by hand — it is what makes the send/receive key
     /// and the local/remote index assignment impossible to swap (a swap
     /// round-trips against yourself and fails against every real peer).
-    /// Consumes the handshake exactly as `deriveTransportKeys` does.
+    /// Consumes the handshake exactly as `deriveTransportKeys` does, including
+    /// its checked panic on a handshake that is not complete.
     ///
     /// `now_s` is the caller's clock at the moment the handshake completed —
     /// the session's `born_s`, from which `transport.reject_after_time_s` (180 s)
@@ -754,6 +805,14 @@ pub const Handshake = struct {
         return self.computeMac2(msg_bytes_before_mac2, cookie);
     }
 };
+
+/// `true` iff TAI64N timestamp `a` is strictly newer than `b`. TAI64N is
+/// 8 bytes of seconds then 4 bytes of nanoseconds, both big-endian, so the
+/// order is plain lexicographic byte order. Use it for the per-peer replay
+/// check described at `consumeInitiation`.
+pub fn timestampNewer(a: [12]u8, b: [12]u8) bool {
+    return std.mem.order(u8, &a, &b) == .gt;
+}
 
 // ── cookie / mac2: the under-load DoS mitigation (whitepaper 5.4.7) ────────
 //
@@ -916,10 +975,14 @@ pub const CookieChecker = struct {
         };
     }
 
-    /// Wipe `Rm`. Every cookie issued under it stops verifying.
+    /// Wipe `Rm`. Every cookie issued under it stops verifying. The checker
+    /// stays usable: the next `refresh`/`cookieFor`/`admit` rolls a new `Rm`.
     pub fn wipe(self: *CookieChecker) void {
         std.crypto.secureZero(u8, &self.secret);
-        self.secret_born_s = 0;
+        // Not 0: with `now_s < cookie_secret_lifetime_s` that would count as a
+        // fresh secret and issue cookies under the all-zero key. maxInt makes
+        // every `now_s` "backwards", so the next use re-rolls `Rm` (WH-4).
+        self.secret_born_s = std.math.maxInt(u64);
     }
 
     /// Roll `Rm` once it has lived `cookie_secret_lifetime_s`, which is what
@@ -1152,6 +1215,9 @@ pub const PeerCookie = struct {
         ) catch return error.DecryptionFailed;
         self.cookie = cookie;
         self.cookie_born_s = now_s;
+        // One reply answers one message: a replay of it (or a stale one) must
+        // not refresh `cookie_born_s` (WH-8).
+        self.last_sent_mac1 = null;
     }
 
     /// The cookie to stamp into `Handshake.cookie`, or null once it has aged

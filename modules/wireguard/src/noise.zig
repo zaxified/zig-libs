@@ -225,7 +225,15 @@ pub fn mixKey(ck: *ChainKey, dh_output: []const u8, out: *SymmetricKey) void {
 /// `MAC(key, data) = Keyed-Blake2s(key, data, 16)` (whitepaper sec 5.4) —
 /// the 16-byte output length lives in the BLAKE2s parameter block (see
 /// `Blake2s128` above), so this is NOT a truncated BLAKE2s-256.
+///
+/// Caller contract: `key.len` is 1..32 (BLAKE2s's keyed-mode limit; every
+/// WireGuard key is a fixed 16- or 32-byte array). Anything else is a checked
+/// `@panic("wireguard: keyedMac key must be 1..32 bytes")` in every build
+/// mode: std would index out of bounds past 64 bytes and silently produce a
+/// non-spec MAC for 33..64 (sweep WH-1).
 pub fn keyedMac(key: []const u8, data: []const u8) Mac {
+    if (key.len == 0 or key.len > Blake2s128.key_length_max)
+        @panic("wireguard: keyedMac key must be 1..32 bytes");
     return burn.run(burn.mac_burn, Mac, keyedMacBody, .{ key, data });
 }
 
