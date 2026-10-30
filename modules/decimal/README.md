@@ -112,7 +112,7 @@ Every failure path is explicit — no trap, no silent wrap:
 ## BigDecimal — arbitrary precision
 
 `BigDecimal` (`big.zig`) is a companion type for values whose precision or magnitude `Decimal`'s
-fixed `i128 @ 1e12` can't bound ahead of time: an unbounded `std.math.big.int.Managed` significand
+fixed `i128 @ 1e12` can't bound ahead of time: a `std.math.big.int.Managed` significand (at most `max_coeff_digits` = 200 000 digits, `max_parse_digits` = 100 000 when parsed; std's decimal conversion is quadratic)
 × `10^exponent`. Parse, format, `add`, `sub`, `mul`, `order`/`eql`, `normalize`, and the
 precision-widening branch of `rescale` need no rounding decision (arbitrary precision makes `+ − ×`
 exact). `div` and the precision-*narrowing* branch of `rescale`/`quantize`/`roundToIntegral` route
@@ -168,7 +168,7 @@ var a = try BigDecimal.parse(allocator, "1.23456789012345678901234567890");
 defer a.deinit();
 var b = try BigDecimal.parse(allocator, "2");
 defer b.deinit();
-var sum = try BigDecimal.add(allocator, a, b); // exact — no width limit
+var sum = try BigDecimal.add(allocator, a, b); // exact; error.Overflow if the sum would pass max_coeff_digits (200 000)
 defer sum.deinit();
 const s = try sum.toStringAlloc(allocator);
 defer allocator.free(s);

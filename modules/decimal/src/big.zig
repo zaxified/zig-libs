@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! BigDecimal — arbitrary-precision base-10 decimal: an unbounded significand
-//! (`std.math.big.int.Managed`) × `10^exponent`. Companion to the fixed-scale
+//! BigDecimal — arbitrary-precision base-10 decimal: a wide significand
+//! (`std.math.big.int.Managed`, at most `max_coeff_digits` digits) × `10^exponent`. Companion to the fixed-scale
 //! `Decimal` (root.zig, `i128 @ 1e12`, `DECIMAL(38,12)`-shaped) for values
 //! whose precision or magnitude cannot be bounded ahead of time.
 //!
@@ -83,14 +83,13 @@ pub const BigDecimal = struct {
     };
 
     /// Exponent-arithmetic overflow (the `i32` exponent, or the
-    /// `max_align_shift` safety ceiling below) — **not** a precision limit.
-    /// The significand (`coeff`) is a `Managed` and has no width bound; only
-    /// the base-10 exponent and the alignment-shift safety ceiling are.
+    /// `max_align_shift` safety ceiling below) or a result coefficient wider
+    /// than `max_coeff_digits` -- **not** a precision limit in the GDA sense.
     pub const Error = error{Overflow} || Allocator.Error;
     pub const DivError = Error || error{DivisionByZero};
     /// `InvalidCharacter` = malformed input; `Overflow` = a well-formed
-    /// literal exponent too large to fit `i32` (again: the coefficient
-    /// itself has no width limit — only its base-10 exponent is bounded).
+    /// literal exponent too large to fit `i32`, or more than `max_parse_digits`
+    /// significand digits.
     pub const ParseError = error{ InvalidCharacter, Overflow } || Allocator.Error;
 
     /// Safety ceiling on how large an exponent *difference* this module will
@@ -103,6 +102,31 @@ pub const BigDecimal = struct {
     /// `10^1_000_000` is already a ~415KB integer, far past any real
     /// financial or scientific use of this module.
     pub const max_align_shift: u32 = 1_000_000;
+
+    /// Widest significand `parse` accepts, in digits (leading zeros included):
+    /// `error.Overflow` past it, decided before any allocation. Equal to
+    /// `max_result_digits` -- a number wider than what `sqrt`/`pow` may produce
+    /// is useless here, and `std.math.big.int`'s decimal conversion is
+    /// quadratic, so an unbounded literal is a CPU amplifier (a 10 MB digit
+    /// string takes minutes). A pragmatic guard, not a GDA rule; the exponent
+    /// is limited separately.
+    pub const max_parse_digits: u32 = max_result_digits;
+
+    /// Widest coefficient any operation will PRODUCE, in digits: `error.Overflow`
+    /// past it, decided before the big work (from the operands' bit lengths;
+    /// the exact digit count is taken only within a few digits of the cap).
+    /// `2 * max_parse_digits`, so the product of two widest parsed operands
+    /// still works. It bounds the cost of everything that consumes a
+    /// coefficient: `std.math.big.int`'s decimal conversion is quadratic
+    /// (200_000 digits is about 2.4 s for `toSci`/`toStringAlloc`), and so are
+    /// `precision` and division. Applies to `add`/`sub`, `mul`, `div`,
+    /// `rescale`/`quantize`/`roundToIntegral`, `remainder`, `divideInteger`,
+    /// `remainderNear`, `fromFloat` and `toStringFixed`; `sqrt`, `pow`,
+    /// `divPrec` and the transcendental functions are bounded by
+    /// `max_result_digits` and their precision limits. A pragmatic guard, not
+    /// a GDA rule. Independent of `max_align_shift`, which stays the ceiling
+    /// on a single exponent difference.
+    pub const max_coeff_digits: u32 = 2 * max_parse_digits;
 
     pub fn deinit(self: *BigDecimal) void {
         self.coeff.deinit();
@@ -159,8 +183,8 @@ pub const BigDecimal = struct {
     }
 
     // -----------------------------------------------------------------
-    // Parse / format — no rounding decision, no width limit; fully
-    // implemented. The actual "turn a long digit string into a bignum" /
+    // Parse / format — no rounding decision, width limited by
+    // `max_parse_digits`; fully implemented. The actual "turn a long digit string into a bignum" /
     // "turn a bignum into a long digit string" algorithms are
     // `std.math.big.int.Managed.setString` / `Const.toStringAlloc` — this
     // function's job is only splitting GDA text notation
@@ -170,9 +194,10 @@ pub const BigDecimal = struct {
     // -----------------------------------------------------------------
 
     /// Parse a plain or scientific-notation decimal string into a
-    /// `BigDecimal`. No width limit on the significand (unlike the
-    /// fixed-scale `Decimal.parse`'s 60-digit mantissa cap) — only the
-    /// literal exponent is bounded (`error.Overflow` past ~`i32` range).
+    /// `BigDecimal`. The significand is limited to `max_parse_digits` digits
+    /// (`error.Overflow` past it; far wider than the fixed-scale
+    /// `Decimal.parse`'s 60-digit mantissa cap) and the literal exponent to
+    /// the `i32` range (`error.Overflow` past it).
     pub fn parse(allocator: Allocator, s: []const u8) ParseError!BigDecimal {
         if (s.len == 0) return error.InvalidCharacter;
         var i: usize = 0;
@@ -200,8 +225,10 @@ pub const BigDecimal = struct {
             }
             if (c == 'e' or c == 'E') break;
             if (!std.ascii.isDigit(c)) return error.InvalidCharacter;
-            try digits.append(allocator, c);
             digits_seen += 1;
+            // Width cap before anything is buffered or converted (sweep DC-2).
+            if (digits_seen > max_parse_digits) return error.Overflow;
+            try digits.append(allocator, c);
             if (seen_dot) frac_digits += 1;
         }
         if (digits_seen == 0) return error.InvalidCharacter;
@@ -265,14 +292,26 @@ pub const BigDecimal = struct {
     /// plain `"0"` regardless of `exponent` or its sign bit; `toSci` and
     /// `toStringFixed` show a zero's scale (`0.00`, `0E+2`), and no function
     /// here surfaces a negative zero (see `negate`'s doc comment).
+    ///
+    /// Plain output needing more than `max_align_shift` padding zeros (a huge
+    /// positive exponent, or a tiny fraction such as `1E-2000000000`) is
+    /// refused with `error.OutOfMemory` -- by policy, not a failed allocation
+    /// (sweep DC-1); use `toSci`/`toEng`, which are exponent-sized.
     pub fn toStringAlloc(self: BigDecimal, allocator: Allocator) Allocator.Error![]u8 {
         if (self.isZero()) return allocator.dupe(u8, "0");
+        // The padding guard first where the digit count cannot save the output
+        // (sweep DC-6): no conversion work for a refused value.
+        // For a negative exponent the padding is at least `frac - max possible digits`.
+        if (plainPadding(digitsAtMost(self.coeff.toConst().bitCountAbs()), self.exponent) > max_align_shift)
+            return error.OutOfMemory;
 
         const digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
         defer allocator.free(digits);
         const neg = digits[0] == '-';
         const mag = if (neg) digits[1..] else digits[0..];
         const sign_len: usize = if (neg) 1 else 0;
+
+        if (plainPadding(mag.len, self.exponent) > max_align_shift) return error.OutOfMemory;
 
         if (self.exponent >= 0) {
             const zeros: usize = @intCast(self.exponent);
@@ -337,9 +376,28 @@ pub const BigDecimal = struct {
     /// it never loses information, so this needs no rounding mode).
     pub fn order(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!std.math.Order {
         if (a.exponent == b.exponent) return a.coeff.toConst().order(b.coeff.toConst());
-        var diff = try sub(allocator, a, b);
-        defer diff.deinit();
-        return diff.coeff.toConst().orderAgainstScalar(0);
+        // Signs, then adjusted exponents decide without aligning (sweep DC-5):
+        // `order(1E+2000000, 5)` answers instead of failing the alignment.
+        const sa = a.signum();
+        const sb = b.signum();
+        if (sa != sb) return std.math.order(sa, sb);
+        if (sa == 0) return .eq;
+        const adj_a = adjustedBounds(a);
+        const adj_b = adjustedBounds(b);
+        var by_adj: std.math.Order = .eq;
+        if (adj_a.hi < adj_b.lo) {
+            by_adj = .lt;
+        } else if (adj_a.lo > adj_b.hi) {
+            by_adj = .gt;
+        } else {
+            by_adj = std.math.order(try a.adjusted(allocator), try b.adjusted(allocator));
+        }
+        if (by_adj != .eq) return if (sa < 0) by_adj.invert() else by_adj;
+        // Equal adjusted exponents: the shift is the difference of the digit
+        // counts, so it is within `max_coeff_digits`.
+        var al = try alignPair(allocator, a, b);
+        defer al.deinit();
+        return al.an.toConst().order(al.bn.toConst());
     }
 
     pub fn eql(allocator: Allocator, a: BigDecimal, b: BigDecimal) Error!bool {
@@ -362,19 +420,19 @@ pub const BigDecimal = struct {
                 const sum = sa + sb;
                 return .{ .coeff = try managedFromU256(allocator, @abs(sum), sum < 0), .exponent = a.exponent };
             };
-            return .{ .coeff = try addSigned(allocator, &a.coeff, &b.coeff), .exponent = a.exponent };
+            return .{ .coeff = try addChecked(allocator, &a.coeff, &b.coeff), .exponent = a.exponent };
         }
         const lo_exp = @min(a.exponent, b.exponent);
         if (a.exponent > b.exponent) {
             const shift = try alignShift(a.exponent, lo_exp);
-            var a_scaled = try scaleUp(allocator, &a.coeff, shift);
+            var a_scaled = try scaleUpChecked(allocator, &a.coeff, shift);
             defer a_scaled.deinit();
-            return .{ .coeff = try addSigned(allocator, &a_scaled, &b.coeff), .exponent = lo_exp };
+            return .{ .coeff = try addChecked(allocator, &a_scaled, &b.coeff), .exponent = lo_exp };
         } else {
             const shift = try alignShift(b.exponent, lo_exp);
-            var b_scaled = try scaleUp(allocator, &b.coeff, shift);
+            var b_scaled = try scaleUpChecked(allocator, &b.coeff, shift);
             defer b_scaled.deinit();
-            return .{ .coeff = try addSigned(allocator, &a.coeff, &b_scaled), .exponent = lo_exp };
+            return .{ .coeff = try addChecked(allocator, &a.coeff, &b_scaled), .exponent = lo_exp };
         }
     }
 
@@ -397,9 +455,14 @@ pub const BigDecimal = struct {
             const neg = a.coeff.isPositive() != b.coeff.isPositive();
             return .{ .coeff = try managedFromU256(allocator, std.math.mulWide(u128, ma, mb), neg), .exponent = @intCast(exp64) };
         };
+        // Width cap (sweep DC-6): the product has at least this many digits.
+        if (!a.isZero() and !b.isZero() and
+            digitsAtLeast(a.coeff.toConst().bitCountAbs() + b.coeff.toConst().bitCountAbs() - 1) > max_coeff_digits)
+            return error.Overflow;
         var r = try Managed.initCapacity(allocator, a.coeff.len() + b.coeff.len() + 1);
         errdefer r.deinit();
         try r.mul(&a.coeff, &b.coeff);
+        if (try exceedsWidth(allocator, &r, 0)) return error.Overflow;
         return .{ .coeff = r, .exponent = @intCast(exp64) };
     }
 
@@ -415,20 +478,11 @@ pub const BigDecimal = struct {
         var r = try a.clone();
         errdefer r.coeff.deinit();
         if (r.coeff.eqlZero()) return r;
-
-        var ten = try Managed.initSet(allocator, 10);
-        defer ten.deinit();
-        var q = try Managed.init(allocator);
-        defer q.deinit();
-        var rem = try Managed.init(allocator);
-        defer rem.deinit();
-
-        while (r.exponent < std.math.maxInt(i32)) {
-            try q.divTrunc(&rem, &r.coeff, &ten);
-            if (!rem.eqlZero()) break;
-            r.coeff.swap(&q);
-            r.exponent += 1;
-        }
+        // All trailing zeros at once, never more than the exponent has room
+        // for (sweep DC-7: one pass per zero was quadratic).
+        const room: u64 = @intCast(@as(i64, std.math.maxInt(i32)) - r.exponent);
+        const k = try stripZeros(allocator, &r.coeff, room);
+        r.exponent += @intCast(k); // k <= room
         return r;
     }
 
@@ -448,7 +502,9 @@ pub const BigDecimal = struct {
     /// zero-dividend case.
     pub fn div(allocator: Allocator, a: BigDecimal, b: BigDecimal, target_scale: i32, mode: RoundingMode) DivError!BigDecimal {
         if (b.isZero()) return error.DivisionByZero;
-        if (a.isZero()) return .{ .coeff = try Managed.init(allocator), .exponent = -target_scale };
+        // `-target_scale` overflows i32 at minInt (sweep DC-4).
+        const result_exp: i32 = std.math.cast(i32, -@as(i64, target_scale)) orelse return error.Overflow;
+        if (a.isZero()) return .{ .coeff = try Managed.init(allocator), .exponent = result_exp };
 
         const result_neg = a.coeff.isPositive() != b.coeff.isPositive();
 
@@ -468,12 +524,18 @@ pub const BigDecimal = struct {
 
         if (shift64 >= 0) {
             if (shift64 > max_align_shift) return error.Overflow;
+            // The quotient has at least digits(num) + shift - digits(den) digits
+            // (sweep DC-6): refuse before the multiplication and the division.
+            if (!num.eqlZero() and @as(i64, @intCast(digitsAtLeast(num.toConst().bitCountAbs()))) + shift64 -
+                @as(i64, @intCast(digitsAtMost(den.toConst().bitCountAbs()))) > max_coeff_digits)
+                return error.Overflow;
             var scaled = try scaleUp(allocator, &num, @intCast(shift64));
             defer scaled.deinit();
             var q = try roundedDivMag(allocator, &scaled, &den, result_neg, mode);
             errdefer q.deinit();
+            if (try exceedsWidth(allocator, &q, 0)) return error.Overflow;
             if (result_neg) q.negate();
-            return .{ .coeff = q, .exponent = -target_scale };
+            return .{ .coeff = q, .exponent = result_exp };
         } else {
             const den_shift = -shift64;
             if (den_shift > max_align_shift) return error.Overflow;
@@ -482,7 +544,7 @@ pub const BigDecimal = struct {
             var q = try roundedDivMag(allocator, &num, &scaled_den, result_neg, mode);
             errdefer q.deinit();
             if (result_neg) q.negate();
-            return .{ .coeff = q, .exponent = -target_scale };
+            return .{ .coeff = q, .exponent = result_exp };
         }
     }
 
@@ -500,7 +562,7 @@ pub const BigDecimal = struct {
         }
         if (new_exponent <= a.exponent) {
             const shift = try alignShift(a.exponent, new_exponent);
-            var r = try scaleUp(allocator, &a.coeff, shift);
+            var r = try scaleUpChecked(allocator, &a.coeff, shift);
             errdefer r.deinit();
             return .{ .coeff = r, .exponent = new_exponent };
         }
@@ -653,6 +715,14 @@ pub const BigDecimal = struct {
     /// Only allocation can fail.
     pub fn toFloat(self: BigDecimal, allocator: Allocator) Allocator.Error!f64 {
         if (self.isZero()) return 0.0;
+        {
+            // Out of range from the exponent and the bit length alone, before
+            // any digit string is built (sweep DC-6).
+            const bounds = adjustedBounds(self);
+            const neg0 = !self.coeff.isPositive();
+            if (bounds.lo > 310) return if (neg0) -std.math.inf(f64) else std.math.inf(f64);
+            if (bounds.hi < -326) return std.math.copysign(@as(f64, 0.0), if (neg0) -1.0 else 1.0);
+        }
         const digits = try self.coeff.toConst().toStringAlloc(allocator, 10, .lower);
         defer allocator.free(digits);
         const neg = digits[0] == '-';
@@ -724,12 +794,12 @@ pub const BigDecimal = struct {
         var an = if (a.exponent == lo_exp)
             try a.coeff.clone()
         else
-            try scaleUp(allocator, &a.coeff, try alignShift(a.exponent, lo_exp));
+            try scaleUpChecked(allocator, &a.coeff, try alignShift(a.exponent, lo_exp));
         defer an.deinit();
         var bn = if (b.exponent == lo_exp)
             try b.coeff.clone()
         else
-            try scaleUp(allocator, &b.coeff, try alignShift(b.exponent, lo_exp));
+            try scaleUpChecked(allocator, &b.coeff, try alignShift(b.exponent, lo_exp));
         defer bn.deinit();
 
         var q = try Managed.init(allocator);
@@ -1043,6 +1113,8 @@ pub const BigDecimal = struct {
         const inexact = !r.eqlZero();
         if (inexact) try applyRounding(allocator, &q, &r, &ten_drop, result_neg, mode);
         try foldCarry(allocator, &q, &exp64, prec);
+        // The carry fold adds one to an exponent that may already sit at maxInt(i32) (sweep DC-3).
+        if (exp64 > std.math.maxInt(i32)) return error.Overflow;
         if (result_neg) q.negate();
         return .{ .value = .{ .coeff = q, .exponent = @intCast(exp64) }, .inexact = inexact, .rounded = true };
     }
@@ -1132,17 +1204,9 @@ pub const BigDecimal = struct {
         const exact = r.eqlZero();
         if (exact) {
             // Strip trailing zeros down toward the ideal exponent only.
-            var ten = try Managed.initSet(allocator, 10);
-            defer ten.deinit();
-            var quo = try Managed.init(allocator);
-            defer quo.deinit();
-            var rem = try Managed.init(allocator);
-            defer rem.deinit();
-            while (e < ideal) {
-                try quo.divTrunc(&rem, &q, &ten);
-                if (!rem.eqlZero()) break;
-                q.swap(&quo);
-                e += 1;
+            if (e < ideal) {
+                const k = try stripZeros(allocator, &q, @intCast(ideal - e)); // sweep DC-7
+                e += @intCast(k);
             }
         } else {
             try applyRounding(allocator, &q, &r, divisor, result_neg, mode);
@@ -1609,7 +1673,8 @@ pub const BigDecimal = struct {
     /// `1.500`, `0` at 2 is `0.00`. A negative `places` rounds to
     /// tens/hundreds/… and prints an integer (`1250` at -2, `half_up`: `1300`).
     /// No negative zero (`-0.4` at 0 places is `0`). `error.Overflow` as
-    /// `rescale`.
+    /// `rescale`, and also when the plain text would need more than
+    /// `max_align_shift` padding zeros -- refused by policy, use `toSci`/`toEng`.
     pub fn toStringFixed(self: BigDecimal, allocator: Allocator, places: i32, mode: RoundingMode) Error![]u8 {
         const exp64: i64 = -@as(i64, places);
         if (exp64 > std.math.maxInt(i32)) return error.Overflow;
@@ -1620,6 +1685,9 @@ pub const BigDecimal = struct {
         defer allocator.free(raw);
         const neg = !zero and raw[0] == '-';
         const digits: []const u8 = if (zero) "0" else if (neg) raw[1..] else raw;
+        // Zero padding is bounded like `toStringAlloc`'s (sweep DC-1); a zero
+        // at a positive exponent prints as a bare "0" below.
+        if (!(r.exponent > 0 and zero) and plainPadding(digits.len, r.exponent) > max_align_shift) return error.Overflow;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         if (neg) try out.append(allocator, '-');
@@ -1634,7 +1702,9 @@ pub const BigDecimal = struct {
     /// `std.fmt` integration: `{f}` prints the plain notation of
     /// `toStringAlloc` (zero is `0`; use `toSci` to keep a zero's scale).
     /// Needs memory for the digits, taken from the coefficient's own
-    /// allocator; a failure surfaces as `error.WriteFailed`.
+    /// allocator; a failure surfaces as `error.WriteFailed`, and so does plain
+    /// output needing more than `max_align_shift` padding zeros (refused by
+    /// policy, see `toStringAlloc` -- use `toSci`/`toEng`).
     pub fn format(self: BigDecimal, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         const allocator = self.coeff.allocator;
         const s = self.toStringAlloc(allocator) catch return error.WriteFailed;
@@ -1703,6 +1773,15 @@ pub fn f64Shortest(x: f64) error{NotFinite}!F64Decimal {
     return .{ .neg = neg, .digits = digits, .exp10 = if (digits == 0) 0 else exp - frac_digits };
 }
 
+/// Number of padding zeros plain notation needs for `n_digits` digits at
+/// `exponent`: trailing zeros for a positive exponent, leading fraction zeros
+/// (after `0.`) when the digits are fewer than the fractional places.
+fn plainPadding(n_digits: usize, exponent: i64) u64 {
+    if (exponent >= 0) return @intCast(exponent);
+    const frac: u64 = @intCast(-exponent);
+    return if (frac > n_digits) frac - n_digits else 0;
+}
+
 /// Plain-notation body for an unsigned digit string at `exponent`: digits and
 /// zeros for `exponent >= 0`, otherwise the point inserted (leading `0.` and
 /// zero padding when the digits are fewer than the fractional places).
@@ -1742,12 +1821,12 @@ fn alignPair(allocator: Allocator, a: BigDecimal, b: BigDecimal) BigDecimal.Erro
     var an = if (a.exponent == lo)
         try a.coeff.clone()
     else
-        try scaleUp(allocator, &a.coeff, try alignShift(a.exponent, lo));
+        try scaleUpChecked(allocator, &a.coeff, try alignShift(a.exponent, lo));
     errdefer an.deinit();
     const bn = if (b.exponent == lo)
         try b.coeff.clone()
     else
-        try scaleUp(allocator, &b.coeff, try alignShift(b.exponent, lo));
+        try scaleUpChecked(allocator, &b.coeff, try alignShift(b.exponent, lo));
     return .{ .an = an, .bn = bn, .lo = lo };
 }
 
@@ -1813,6 +1892,110 @@ fn scaleUp(allocator: Allocator, coeff: *const Managed, shift: u32) BigDecimal.E
     errdefer r.deinit();
     try r.mul(coeff, &p);
     return r;
+}
+
+/// Digit-count bounds from a bit length (`bits >= 1`): a magnitude below
+/// `2^bits` has at most `digitsAtMost(bits)` digits, one of at least
+/// `2^(bits-1)` has at least `digitsAtLeast(bits)`. 0.30103 and 0.30102
+/// bracket log10(2) = 0.301029995...
+fn digitsAtMost(bits: u64) u64 {
+    return bits * 30103 / 100_000 + 1;
+}
+
+fn digitsAtLeast(bits: u64) u64 {
+    return (bits - 1) * 30102 / 100_000 + 1;
+}
+
+/// Whether the coefficient `m` followed by `extra` zero digits is wider than
+/// `max_coeff_digits`. Decided from the bit length; the exact digit count is
+/// taken only when the bounds straddle the cap (a window of a few digits).
+fn exceedsWidth(allocator: Allocator, m: *const Managed, extra: u64) Allocator.Error!bool {
+    if (m.eqlZero()) return false;
+    const bits = m.toConst().bitCountAbs();
+    if (digitsAtLeast(bits) + extra > BigDecimal.max_coeff_digits) return true;
+    if (digitsAtMost(bits) + extra <= BigDecimal.max_coeff_digits) return false;
+    return (try digitsOf(allocator, m)) + extra > BigDecimal.max_coeff_digits;
+}
+
+/// `scaleUp` for a result that is handed out: `error.Overflow` when the scaled
+/// coefficient would be wider than `max_coeff_digits` (sweep DC-6). Internal
+/// working integers (sqrt, divPrec, the transcendental functions) are bounded
+/// by their own precision limits and use the unchecked `scaleUp`.
+fn scaleUpChecked(allocator: Allocator, coeff: *const Managed, shift: u32) BigDecimal.Error!Managed {
+    if (try exceedsWidth(allocator, coeff, shift)) return error.Overflow;
+    return scaleUp(allocator, coeff, shift);
+}
+
+/// `addSigned` with the result width capped (a sum of two cap-wide operands can
+/// be one digit wider).
+fn addChecked(allocator: Allocator, a: *const Managed, b: *const Managed) BigDecimal.Error!Managed {
+    var r = try addSigned(allocator, a, b);
+    errdefer r.deinit();
+    if (try exceedsWidth(allocator, &r, 0)) return error.Overflow;
+    return r;
+}
+
+/// Bounds of the adjusted exponent (`exponent + digits - 1`) of a nonzero
+/// value, from the bit length alone (no digit conversion).
+fn adjustedBounds(v: BigDecimal) struct { lo: i64, hi: i64 } {
+    const bits = v.coeff.toConst().bitCountAbs();
+    return .{
+        .lo = @as(i64, v.exponent) + @as(i64, @intCast(digitsAtLeast(bits))) - 1,
+        .hi = @as(i64, v.exponent) + @as(i64, @intCast(digitsAtMost(bits))) - 1,
+    };
+}
+
+/// Divide the nonzero `c` by `10^k` in place for the largest `k <= limit` with
+/// `10^k | c`; returns `k`. Sub-quadratic in the number of zeros (sweep DC-7;
+/// dividing by 10 once per zero was O(zeros * limbs)): if `c = m * 10^k` with
+/// `10 !| m` then `k = min(v2(c), v5(c))`, `v2` is a bit count, and the
+/// largest `j <= v2` with `10^j | c` (that is, `5^j | (c >> j)`) is found by
+/// bisection.
+fn stripZeros(allocator: Allocator, c: *Managed, limit: u64) Allocator.Error!u64 {
+    std.debug.assert(!c.eqlZero()); // callers return early on zero
+    const v2 = c.toConst().ctz(std.math.maxInt(Limb)); // second argument caps the count
+    // 10^k | c also needs k <= digits(c).
+    const hi0: u64 = @min(@as(u64, v2), limit, digitsAtMost(c.toConst().bitCountAbs()));
+    if (hi0 == 0) return 0;
+    const positive = c.isPositive();
+    c.setSign(true);
+    defer c.setSign(positive);
+
+    var best = try Managed.init(allocator); // c / 10^lo
+    defer best.deinit();
+    var q = try Managed.init(allocator);
+    defer q.deinit();
+    var r = try Managed.init(allocator);
+    defer r.deinit();
+    var five = try Managed.initSet(allocator, 5);
+    defer five.deinit();
+    var p5 = try Managed.init(allocator);
+    defer p5.deinit();
+    var sh = try Managed.init(allocator);
+    defer sh.deinit();
+
+    var lo: u64 = 0;
+    var hi: u64 = hi0;
+    var first = true;
+    while (lo < hi) {
+        // The all-zero tail (`10^n`-shaped values) answers on the first test.
+        const mid: u64 = if (first) hi else lo + (hi - lo + 1) / 2;
+        first = false;
+        try p5.pow(&five, @intCast(mid)); // mid <= limit, which callers keep within u32
+        // c / 10^mid = (c >> mid) / 5^mid when exact; shifting first leaves a
+        // small quotient, so the division is linear in the divisor's size.
+        try sh.shiftRight(c, @intCast(mid));
+        try q.divTrunc(&r, &sh, &p5);
+        if (r.eqlZero()) {
+            lo = mid;
+            best.swap(&q);
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if (lo == 0) return 0;
+    c.swap(&best);
+    return lo;
 }
 
 // ---------------------------------------------------------------------------
@@ -2263,9 +2446,15 @@ fn exactPowerCandidate(allocator: Allocator, base: BigDecimal, y: BigDecimal, e:
         defer cand.deinit();
         const cd: u64 = try cand.value.precision(allocator);
         if (cd * @as(u64, @intCast(qn)) > BigDecimal.max_result_digits) continue;
-        var cq = BigDecimal.pow(allocator, cand.value, qn) catch continue;
+        var cq = BigDecimal.pow(allocator, cand.value, qn) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer cq.deinit();
-        var bp = BigDecimal.pow(allocator, base, pn) catch continue;
+        var bp = BigDecimal.pow(allocator, base, pn) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => continue,
+        };
         defer bp.deinit();
         if (pneg) {
             // cand^q * base^|p| == 1
@@ -3004,7 +3193,9 @@ test "add: max_align_shift is exactly 1_000_000, not merely 'the configured valu
     // as literals (1_000_000 / 1_000_001), not `BigDecimal.max_align_shift`,
     // so a change to the constant moves these numbers out from under the
     // test instead of moving with it.
-    var a = try BigDecimal.parse(talloc, "1E1000000"); // exponent = 1_000_000
+    // Zero operands: the alignment ceiling is hit without a nonzero coefficient
+    // that the coefficient width cap (`max_coeff_digits`, sweep DC-6) would refuse.
+    var a = try BigDecimal.parse(talloc, "0E1000000"); // exponent = 1_000_000
     defer a.deinit();
     var b = try BigDecimal.parse(talloc, "1"); // exponent = 0
     defer b.deinit();
@@ -3014,7 +3205,7 @@ test "add: max_align_shift is exactly 1_000_000, not merely 'the configured valu
     var sum = try BigDecimal.add(talloc, a, b);
     defer sum.deinit();
 
-    var a2 = try BigDecimal.parse(talloc, "1E1000001"); // exponent = 1_000_001
+    var a2 = try BigDecimal.parse(talloc, "0E1000001"); // exponent = 1_000_001
     defer a2.deinit();
     // One past the ceiling: refused before any 10^1_000_001 integer is
     // materialised, not silently allowed through.
@@ -3984,7 +4175,8 @@ const seed = @import("testkit").fuzz.seed;
 /// from `parse + format roundtrip`, `parse rejects`, the exponent-range tests
 /// and `arbitrary precision exceeds the fixed-scale Decimal's i128 range`.
 ///
-/// The point of this parser is that it is unbounded in significand width, so
+/// The point of this parser is that its significand is far wider than the
+/// fixed-scale one (up to `max_parse_digits`), so
 /// the corpus carries the long ones deliberately: the 81-character
 /// 40-nines-dot-40-ones literal, and a 200-digit run. Both fit the 256-octet
 /// buffer — ⚠ a seed over it reads back EMPTY, not truncated.
@@ -4175,12 +4367,10 @@ test "div: an alignment shift of exactly max_align_shift is allowed, one more is
     const lim: i32 = @intCast(BigDecimal.max_align_shift);
     var one = dec("1");
     defer one.deinit();
-    // numerator side: shift = target_scale
-    var a = try BigDecimal.div(talloc, one, one, lim, .down);
-    defer a.deinit();
-    try testing.expectEqual(-lim, a.exponent);
-    // 10^1000000 has 3321929 bits (floor(1e6 * log2(10)) + 1); `precision` would be needlessly slow here.
-    try testing.expectEqual(@as(usize, 3_321_929), a.coeff.bitCountAbs());
+    // numerator side: shift = target_scale. A nonzero quotient of that many digits is
+    // past `max_coeff_digits` (sweep DC-6) before the alignment ceiling matters
+    // (the cap boundary itself is tested in sweep_test.zig).
+    try testing.expectError(error.Overflow, BigDecimal.div(talloc, one, one, lim, .down));
     try testing.expectError(error.Overflow, BigDecimal.div(talloc, one, one, lim + 1, .down));
     // divisor side: shift = target_scale + a.exponent - b.exponent = -lim; 1e-lim / 1 -> 0 (.down)
     var tiny = dec("1e-1000000");
@@ -4241,7 +4431,10 @@ test "sqrt: the digit budgets are inclusive and -0 is not a negative operand" {
     defer r.deinit();
     try testing.expectEqual(@as(i32, 49995), r.exponent);
     try testing.expectEqual(@as(i64, 31623), try r.coeff.toConst().toInt(i64));
-    var too_wide = dec("1" ++ strRepeat("0", 100000));
+    // 100001 digits can no longer be parsed (`max_parse_digits`): widen 1 by rescale instead.
+    var one = dec("1");
+    defer one.deinit();
+    var too_wide = try BigDecimal.rescale(talloc, one, -100000, .down);
     defer too_wide.deinit();
     try testing.expectError(error.PrecisionTooLarge, BigDecimal.sqrt(talloc, too_wide, 5, .half_even));
 

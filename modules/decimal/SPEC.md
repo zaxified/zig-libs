@@ -177,9 +177,10 @@ in constant time instead of attempting an astronomical allocation. Round-trippin
 **Known limitations (documented, not bugs):** `toStringAlloc`/`{f}` print plain notation, so a
 huge `exponent` produces a proportionally huge string — `toSci`/`toEng` (since 2026-10-20) are the
 GDA forms and keep a zero's scale (`0.00`, `0E+2`); no signed zero; a `max_align_shift` (1,000,000) ceiling bounds how
-large an exponent *difference* `add`/`sub`/widening-`rescale` will materialise as `10^k`, guarding
-against a hostile/typo'd exponent forcing unbounded allocation — not a General Decimal Arithmetic
-rule, a pragmatic safety cap; no GDA context object — precision is per call
+large an exponent *difference* `add`/`sub`/widening-`rescale` will materialise as `10^k`, and `max_coeff_digits`
+(200,000) bounds any coefficient an operation produces (`error.Overflow`), guarding
+against a hostile/typo'd exponent forcing unbounded allocation or quadratic conversion — not a General Decimal
+Arithmetic rule, pragmatic safety caps; no GDA context object — precision is per call
 (`roundToPrecision`, `divPrec`, since 2026-10-20) returning `{value, inexact, rounded}` instead of a
 flag register.
 
@@ -316,6 +317,27 @@ closed; since 2026-10-20 also non-integer `power`, `exp`/`ln`/`log10` (R7) and s
 ## Status
 `extract · any · util · reentrant` · deps: none (std only) — canonical source is `pub const meta` in
 src/root.zig.
+
+**No-panic sweep GN (2026-10-30).** Width caps, all consts: `BigDecimal.max_parse_digits` (= `max_result_digits`,
+100 000) bounds a parsed significand; `max_coeff_digits` (200 000 = 2 x parse) bounds any coefficient an operation
+PRODUCES (`add`/`sub`, `mul`, `div`, `rescale`/`quantize`, `remainder`, `divideInteger`, `remainderNear`, `fromFloat`,
+`toStringFixed` -> `error.Overflow`, decided from the operands' bit lengths before the big work); plain-notation
+output is capped at `max_align_shift` padding zeros (`toStringAlloc` -> `error.OutOfMemory` by policy,
+`toStringFixed` -> `error.Overflow`). Why: std's decimal conversion, `precision` and division are quadratic
+(200 000 digits is about 2.4 s for `toSci`). `order`/`eql`/`compareTotal`/`min`/`max` compare signs and adjusted
+exponents first, so far-apart exponents answer instead of failing the alignment. `normalize` strips all trailing
+zeros with one bisection on `5^j | (c >> j)` (12 500 zeros: 1.3 ms vs 580 ms for one division by 10 per zero).
+
+- **Backlog:** `max_coeff_digits`/`max_parse_digits` are consts; a sub-quadratic `toString` (divide and
+  conquer) would let them grow; make them options if a consumer needs wider numbers.
+- **Backlog:** `normalize`'s division is still schoolbook (50 000 zeros: 15 ms Debug, 4x zeros costs about 11x);
+  a divide-and-conquer or Hensel exact division would make it linear.
+- **Backlog:** `toFloat` of a value whose digit string is needed (in range, 200 000 digits) still converts all digits
+  (2.4 s); truncating to ~800 digits plus a sticky bit would make it constant.
+- **Backlog:** a policy refusal of plain output is reported as `error.OutOfMemory` (`toStringAlloc`, `format` ->
+  `WriteFailed`); a dedicated `error.TooLarge` is an API change.
+- **Backlog:** Ziv loops measured 2026-10-30 (ReleaseFast): `ln(1 + 1E-1000)` prec 2000 0.68 s, `ln(1 + 1E-4000)`
+  1.07 s to `PrecisionTooLarge`, `power(2.5, 1.5)` prec 2000 0.35 s: within budget, no change.
 
 ## Anchoring
 

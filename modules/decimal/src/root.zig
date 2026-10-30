@@ -462,7 +462,7 @@ pub const Decimal = struct {
     /// Capacity `toStringFixed(buf, places, …)` can need: sign, up to 27
     /// integer digits, and `places` fraction digits with the point.
     pub fn fixedBufLen(places: u32) usize {
-        return 1 + 27 + (if (places > 0) @as(usize, places) + 1 else 0);
+        return (1 + 27) +| (if (places > 0) @as(usize, places) +| 1 else 0);
     }
 
     /// Print rounded to exactly `places` fractional digits with `mode`, trailing
@@ -487,7 +487,9 @@ pub const Decimal = struct {
             tmp[nd] = @intCast('0' + m % 10);
             m /= 10;
         }
-        const need = @intFromBool(negative) + nd + (if (places > 0) 1 + @as(usize, places) else 0);
+        // Exact length (an exactly-fitting buffer works): sign, the `nd - p` integer
+        // digits, the point and `places` fraction digits. Saturating for a 32-bit usize.
+        const need = (@intFromBool(negative) + (nd - p)) +| (if (places > 0) 1 +| @as(usize, places) else 0);
         if (need > buf.len) return error.NoSpaceLeft;
         var i: usize = 0;
         if (negative) {
@@ -518,7 +520,7 @@ pub const Decimal = struct {
     // Bridge to/from the arbitrary-precision `BigDecimal` (big.zig).
     //
     // The two types are a pair — fixed `i128 @ 1e12` for bounded money/ETL
-    // math, unbounded significand × 10^exponent for everything else — and a
+    // math, a wide (capped, `max_coeff_digits`) significand × 10^exponent for everything else — and a
     // consumer has to be able to move a value between them. Both directions
     // live here rather than on `BigDecimal` so the dependency stays one-way
     // (root.zig already imports big.zig; big.zig imports nothing of root's).
@@ -1022,6 +1024,7 @@ test {
     _ = @import("big.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("s2_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 // ---------------------------------------------------------------------------
