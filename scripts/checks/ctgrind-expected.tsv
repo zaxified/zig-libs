@@ -404,10 +404,10 @@ ed448	ReleaseFast	ladder	1	0	bed2422b5f4db24f	43db8426e0d6c6e7
 # context would go and the timing signal would stay -- a prettier measurement of
 # the same defect. See SPEC.md.
 # ⭐ encaps' 0 means something only because the row carries an output pin.
-hqc	ReleaseFast	decaps	1	2	7408c99a0485df58	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	7408c99a0485df58	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	7408c99a0485df58	e91a390cf03fd6ad
-hqc	ReleaseFast	sampler	1	2	decb3883d68990da	b93fa60c89578576
+hqc	ReleaseFast	decaps	1	2	b911a7c4468420c5	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	b911a7c4468420c5	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	b911a7c4468420c5	e91a390cf03fd6ad
+hqc	ReleaseFast	sampler	1	2	abc152dae0e59b20	b93fa60c89578576
 k256	ReleaseFast	field	1	0	b1745f6995d37402	4f13cccddea81376
 # k256, re-pin 2026-09-15, after F5 (1ce3087e: signed-window variable-base
 # mul) and the re-audit fixes in ff305abc.
@@ -440,9 +440,9 @@ k256	ReleaseFast	ecdsa	1	10	9f24c2c22313da6e	8ff4812d21149442
 # `portable` moved from Modint(1024) to Modint(512) (L=8) because L=16 left the
 # portable bodies, so its output pin was re-taken (different modulus, different
 # printed result); the L=16 kernel is measured by `dyn` (2 in-file, unchanged).
-montint	ReleaseFast	small	1	0	df7f55b675e8531a	4e9f8c0b1ac8efe3
-montint	ReleaseFast	portable	1	0	df7f55b675e8531a	a65d399a02be7ebb
-montint	ReleaseFast	asmcore	1	0	df7f55b675e8531a	51c0595ca47bd7cc
+montint	ReleaseFast	small	1	0	6d75b52a3ad1da2f	4e9f8c0b1ac8efe3
+montint	ReleaseFast	portable	1	0	6d75b52a3ad1da2f	a65d399a02be7ebb
+montint	ReleaseFast	asmcore	1	0	6d75b52a3ad1da2f	51c0595ca47bd7cc
 # `field` (2026-10-02): `Field(r)` for the bls12_381 scalar order — the backend of
 # both pairing modules' `Fr`. Operands, exponent and a 64-byte reduce input
 # tainted; the one in-file context is `inv`'s zero check (`NotInvertible`).
@@ -451,7 +451,7 @@ montint	ReleaseFast	asmcore	1	0	df7f55b675e8531a	51c0595ca47bd7cc
 # extra-reduction select, the pow window select, toBytes). If it reads zero,
 # std fixed ff or the instrument went blind; `field`'s 1 means nothing until
 # that is understood.
-montint	ReleaseFast	field	1	1	727e98413bc301d3	efbe5c72b7a484c2
+montint	ReleaseFast	field	1	1	a981833dcff4a4a9	efbe5c72b7a484c2
 # Zig 0.17.0 (2026-10-18): ffcontrol 27 -> 28, still the positive control (>=1). 0.17 std
 # rewrote ff pow's window select: the old `eql` contexts in montgomeryMul/pow (15) became 16 in
 # `cmov` (ff.zig:359, `ct.select` per table entry, unswitched into a jump) under
@@ -466,7 +466,7 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 # against a secret EVEN value, both widths, operands coprime to the modulus so
 # the success path runs (results = Python pow(x, -1, m)); still 2 in-file —
 # the divsteps and the Hensel step add no context, their verdicts are witness.
-montint	ReleaseFast	dyn	1	2	94880a83bb6a5346	880a04f6d911e62c
+montint	ReleaseFast	dyn	1	2	c655b6b5b50ba630	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
 p256	ReleaseFast	comb	1	1	2abc3a382c76c041	e3c458c38b8cf4a8
@@ -1048,8 +1048,8 @@ dkg	ReleaseFast	combine	1	0	89feb80b007daf9a	6407896882d3491c
 # failure reason, and the scan loop contributes 0 contexts, so there is neither.
 # ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
-aescbc	ReleaseFast	pkcs7	1	1	1a3b50fc45e7e9c5	c4046968725e140d
-aescbc	ReleaseFast	xmlenc	1	1	1a3b50fc45e7e9c5	c4046968725e140d
+aescbc	ReleaseFast	pkcs7	1	1	8a356f431db6bc73	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	8a356f431db6bc73	c4046968725e140d
 # 2026-10-16: the three strippers added for RustCrypto parity, same shape. x923
 # and iso7816 end in the same accept/reject branch (1); unpadZero never
 # rejects an aligned buffer, so it has no decision to disclose and measures 0
@@ -1062,9 +1062,9 @@ aescbc	ReleaseFast	xmlenc	1	1	1a3b50fc45e7e9c5	c4046968725e140d
 # stripper). iso7816: LLVM split `if (scan | ~seen)` into two jumps, a path per failure reason --
 # fixed in the source (`rejectIf` asm barrier, all four rejecting strippers; old harness + barrier
 # measured 5/1). All five rows back at 5/1 (zero 4/0), same out_sha.
-aescbc	ReleaseFast	x923	1	1	1a3b50fc45e7e9c5	c4046968725e140d
-aescbc	ReleaseFast	iso7816	1	1	1a3b50fc45e7e9c5	c4046968725e140d
-aescbc	ReleaseFast	zero	1	0	1a3b50fc45e7e9c5	c4046968725e140d
+aescbc	ReleaseFast	x923	1	1	8a356f431db6bc73	c4046968725e140d
+aescbc	ReleaseFast	iso7816	1	1	8a356f431db6bc73	c4046968725e140d
+aescbc	ReleaseFast	zero	1	0	8a356f431db6bc73	c4046968725e140d
 # ── sealedbox: the secret-key text codecs ──────────────────────────────────
 # ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
 # table-driven base64 and hex reached with a SECRET argument: 95 of the 105
@@ -1250,8 +1250,8 @@ groth16	ReleaseFast	zkprove_vt	1	>=10	1dd0722b21fb88ee	928bc8e1cc116243
 # or key fed through hash160 is the case a branch in `compress` would leak.
 # hash: one-shot at 0/1/55/56/64/1000 B + a 3-chunk stream; hash160: std
 # SHA-256 + ours at 33 and 1000 B. All contexts are the hex witness.
-ripemd160	ReleaseFast	hash	1	0	d3af007a21d915ce	247e27e8a7e8ddd7
-ripemd160	ReleaseFast	hash160	1	0	d3af007a21d915ce	dc357526ecc9275d
+ripemd160	ReleaseFast	hash	1	0	6308e2cdf5dbf493	247e27e8a7e8ddd7
+ripemd160	ReleaseFast	hash160	1	0	6308e2cdf5dbf493	dc357526ecc9275d
 # b64ct (2026-10-17) — encode: the octets tainted (every variant at 0-5, 32,
 # 121, 223 B + encodeWrapped 64/LF, 76/CRLF); decode: the encoded text tainted
 # (every variant, same lengths); ignore: a PEM body through decodeIgnoring and
@@ -1259,9 +1259,9 @@ ripemd160	ReleaseFast	hash160	1	0	d3af007a21d915ce	dc357526ecc9275d
 # verdict, skipped-character positions) are the contract's, so 0 in-file; all
 # contexts are the hex witness. Positive controls (reverted): std's tables in
 # sextet / value+values16 -> 204 / 69 / 46 in-file.
-b64ct	ReleaseFast	encode	1	0	2c458bc71832cbad	3838113cd8a91ae8
-b64ct	ReleaseFast	decode	1	0	2c458bc71832cbad	5de320ddef17d055
-b64ct	ReleaseFast	ignore	1	0	2c458bc71832cbad	6dd74893330925a8
+b64ct	ReleaseFast	encode	1	0	5ab29640862e0994	3838113cd8a91ae8
+b64ct	ReleaseFast	decode	1	0	5ab29640862e0994	5de320ddef17d055
+b64ct	ReleaseFast	ignore	1	0	5ab29640862e0994	6dd74893330925a8
 # stun (2026-10-09) — mi: the MESSAGE-INTEGRITY HMAC-SHA1 key tainted through
 # Builder.addMessageIntegrity + verifyMessageIntegrity (valid and tampered);
 # ltkey: the password through longTermKey (MD5). All contexts are the witness.
@@ -1607,9 +1607,9 @@ snmp	ReleaseFast	des	1	256	74cdcb4742558a04	f7e7b8e6152d7073
 # code): 0 in-file. The software key expansion is still std's masked S-box
 # via subWord (std's soft expandKey has the same posture); see
 # modules/aes192/SPEC.md.
-aes192	ReleaseFast	enc	1	0	cd310909053ea367	0c5f76d6ab016242
-aes192	ReleaseFast	dec	1	0	cd310909053ea367	68602ef849690825
-aes192	ReleaseFast	bitsliced	1	0	1777f1b04a5b6b1f	5ea64f081b0ffcbb
+aes192	ReleaseFast	enc	1	0	dbd1c35dca031b13	0c5f76d6ab016242
+aes192	ReleaseFast	dec	1	0	dbd1c35dca031b13	68602ef849690825
+aes192	ReleaseFast	bitsliced	1	0	6b7ed86cce9410b0	5ea64f081b0ffcbb
 # p521 (2026-10-10) — NIST P-521, new module. mul / keygen / sign / ecdh: the
 # secret (scalar, d, seed, ECDH secret) tainted end to end: 0 in-file on all
 # four. The branches the API reveals (range and identity verdicts, r = 0 /
@@ -1625,8 +1625,8 @@ aes192	ReleaseFast	bitsliced	1	0	1777f1b04a5b6b1f	5ea64f081b0ffcbb
 # point — the same point (tests compare SEC1 bytes against the old RCB
 # ladder); `ecdh`/`keygen`/`sign` print affine bytes and did not move.
 p521	ReleaseFast	mul	1	0	a84441a8ca66dc90	7bcb91b4acac23e9
-p521	ReleaseFast	keygen	1	0	761f8d4528a6f6f9	b44de7eb8b02a855
-p521	ReleaseFast	sign	1	0	761f8d4528a6f6f9	b620c1c667ef0084
+p521	ReleaseFast	keygen	1	0	6dffa02d2bb2854a	b44de7eb8b02a855
+p521	ReleaseFast	sign	1	0	6dffa02d2bb2854a	b620c1c667ef0084
 p521	ReleaseFast	ecdh	1	0	a84441a8ca66dc90	a348bd01a2bccfcc
 p521	ReleaseFast	vartime	1	>=1	681f6d30dc32257a	11557f4b46d4c2af
 # p384 (2026-10-13) — NIST P-384, new module (p521's algorithms over a Montgomery
