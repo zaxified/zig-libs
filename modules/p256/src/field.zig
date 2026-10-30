@@ -340,6 +340,10 @@ const fe_order = field_order;
 /// A NIST P-256 base-field element: four full 2^64 little-endian limbs, always
 /// canonical (`value < p`) between operations.
 pub const Fe = struct {
+    /// Montgomery-form limbs, always canonical (< p). An implementation
+    /// detail: construct with `fromBytes`/`fromInt`; a hand-forged value >= p
+    /// breaks the internal reduction invariants (asserts in safe builds, UB in
+    /// ReleaseFast).
     limbs: [4]u64,
 
     pub const encoded_length = 32;

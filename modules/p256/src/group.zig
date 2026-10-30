@@ -54,6 +54,10 @@ const NotSquareError = std.crypto.errors.NotSquareError;
 /// every test in this module (checked 2026-09-18 by deleting it).
 pub var comb_calls_for_testing: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
 
+/// A P-256 point in projective coordinates. The fields are an implementation
+/// detail: construct points with `fromSec1`, `fromAffineCoordinates` or the
+/// scalar multiplications, not by filling `x`, `y`, `z` with unvalidated field
+/// elements.
 pub const P256 = struct {
     x: Fe,
     y: Fe,

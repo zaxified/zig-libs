@@ -511,6 +511,8 @@ grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
 
 ## Backlog
 
+- **Document a minimum stack size (review GP, 2026-10-30).** Every `mul`/`ecdh` burns 16 KiB of dead stack (`burn.mul_burn`) plus its frames (about 30 KiB for one ECDH), sign 8 KiB; no minimum is documented. Measure with the stackprobe tests and publish it in the README/`meta`.
+
 - **Self-hosted Debug does not compile (found 2026-10-22 from qap's test redesign).** `fast_core.zig:81`
   says "No `movabsq` (rejected by the self-hosted assembler)", but `fast_core.zig:560/712/921/924/974`
   and the generated `point_asm.zig:185/211/232` use it; the self-hosted backend also reports "ran out of

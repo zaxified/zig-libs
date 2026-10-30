@@ -77,7 +77,76 @@ pub fn Ecdsa(comptime Hash: type) type {
         pub const noise_length = Std.noise_length;
         pub const SecretKey = Std.SecretKey;
         pub const PublicKey = Std.PublicKey;
-        pub const Signature = Std.Signature;
+        /// std's signature type, for interop (`Signature.toStd`/`fromStd`). ⚠ Its
+        /// `toDer` panics on r = 0 or s = 0; use `Signature.toDer`.
+        pub const StdSignature = Std.Signature;
+
+        /// An ECDSA signature: std's fields and method set, one difference.
+        /// `toDer` is total. std's `toDer` indexes the first byte of the r/s
+        /// magnitude after trimming leading zeros, so a signature with r = 0 or
+        /// s = 0 (which `fromBytes` and `fromDer` accept and verification
+        /// refuses) panics there; here a zero scalar encodes as `02 01 00`.
+        /// Parsing and verification behave exactly as std's.
+        pub const Signature = struct {
+            pub const encoded_length = StdSignature.encoded_length;
+            pub const der_encoded_length_max = StdSignature.der_encoded_length_max;
+            pub const VerifyError = StdSignature.VerifyError;
+            comptime {
+                std.debug.assert(der_encoded_length_max == der_max_len);
+            }
+
+            /// The R component, big-endian.
+            r: [32]u8,
+            /// The S component, big-endian.
+            s: [32]u8,
+
+            pub fn fromStd(sig: StdSignature) Signature {
+                return .{ .r = sig.r, .s = sig.s };
+            }
+
+            pub fn toStd(sig: Signature) StdSignature {
+                return .{ .r = sig.r, .s = sig.s };
+            }
+
+            /// Create a Verifier for incremental verification of a signature.
+            pub fn verifier(sig: Signature, public_key: PublicKey) Verifier.InitError!Verifier {
+                return sig.toStd().verifier(public_key);
+            }
+
+            /// Verify the signature against a message and public key.
+            pub fn verify(sig: Signature, msg: []const u8, public_key: PublicKey) VerifyError!void {
+                return sig.toStd().verify(msg, public_key);
+            }
+
+            /// Verify the signature against a message already hashed with `Hash`.
+            pub fn verifyPrehashed(sig: Signature, msg_hash: [Hash.digest_length]u8, public_key: PublicKey) VerifyError!void {
+                return sig.toStd().verifyPrehashed(msg_hash, public_key);
+            }
+
+            /// The raw signature (r, s), big-endian.
+            pub fn toBytes(sig: Signature) [encoded_length]u8 {
+                return sig.r ++ sig.s;
+            }
+
+            /// A signature from a raw (r, s) encoding. ECDSA is big-endian.
+            pub fn fromBytes(bytes: [encoded_length]u8) Signature {
+                return .{ .r = bytes[0..32].*, .s = bytes[32..64].* };
+            }
+
+            /// Encode as DER; total, for every r and s. The slice is at most
+            /// `der_encoded_length_max` bytes.
+            pub fn toDer(sig: Signature, buf: *[der_encoded_length_max]u8) []u8 {
+                const der = rawToDer(sig.toBytes(), buf);
+                return buf[0..der.len];
+            }
+
+            /// Parse a DER signature with std's parser, so std's verdicts: LENIENT
+            /// (accepts r = 0, s = 0 and non-minimal INTEGERs; verification rejects
+            /// zero). For strict DER use `p256.sign.derToRaw`.
+            pub fn fromDer(der: []const u8) std.crypto.errors.EncodingError!Signature {
+                return fromStd(try StdSignature.fromDer(der));
+            }
+        };
         pub const Verifier = Std.Verifier;
 
         const StdSignError = std.crypto.errors.IdentityElementError || std.crypto.errors.NonCanonicalError;
@@ -98,7 +167,7 @@ pub fn Ecdsa(comptime Hash: type) type {
             }
 
             noinline fn finalizeUnburned(self: *Signer) StdSignError!Signature {
-                const r = self.inner.finalize();
+                const r: StdSignError!Signature = if (self.inner.finalize()) |sig| Signature.fromStd(sig) else |e| e;
                 std.crypto.secureZero(u8, std.mem.asBytes(&self.inner));
                 return r;
             }
@@ -210,7 +279,7 @@ pub fn Ecdsa(comptime Hash: type) type {
             }
 
             noinline fn signUnburned(key_pair: *const KeyPair, msg: []const u8, noise: ?*const [noise_length]u8) StdSignError!Signature {
-                return toStd(key_pair).sign(msg, if (noise) |n| n.* else null);
+                return Signature.fromStd(try toStd(key_pair).sign(msg, if (noise) |n| n.* else null));
             }
 
             /// Sign a message already hashed with SHA-256.
@@ -221,7 +290,7 @@ pub fn Ecdsa(comptime Hash: type) type {
             }
 
             noinline fn signPrehashedUnburned(key_pair: *const KeyPair, msg_hash: *const [Hash.digest_length]u8, noise: ?*const [noise_length]u8) StdSignError!Signature {
-                return toStd(key_pair).signPrehashed(msg_hash.*, if (noise) |n| n.* else null);
+                return Signature.fromStd(try toStd(key_pair).signPrehashed(msg_hash.*, if (noise) |n| n.* else null));
             }
 
             /// An incremental signer over this key pair.
@@ -282,7 +351,7 @@ pub fn Ecdsa(comptime Hash: type) type {
             // the base point stands in for the public half it never reads
             // (a test pins the signatures to `KeyPair.sign`'s).
             const kp: Std.KeyPair = .{ .public_key = .{ .p = P256.basePoint }, .secret_key = secret_key.* };
-            out.* = try kp.sign(msg, if (noise) |n| n.* else null);
+            out.* = Signature.fromStd(try kp.sign(msg, if (noise) |n| n.* else null));
         }
     };
 }
@@ -368,6 +437,9 @@ pub const der_max_len = 2 + 2 * (2 + 33);
 /// Decode a DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` into
 /// raw `r || s` (32 bytes each, big-endian). Returns null for anything that is
 /// not valid DER for this type, including encodings that are legal BER.
+/// STRICT, unlike `Ecdsa(..).Signature.fromDer` (std's parser, lenient: it
+/// accepts non-minimal INTEGERs such as `02 04 00 00 00 01`); use this one
+/// when a signature must have a single encoding.
 ///
 /// Rejected on purpose, each one a way to mint a second encoding of the same
 /// signature: a non-minimal length octet, a leading `0x00` that is not needed
@@ -590,6 +662,10 @@ pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) boo
 pub fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: []const u8, sig_rs: [64]u8) bool {
     if (digest.len == 0) return false;
     const Q = P256.fromSec1(pubkey_sec1) catch return false;
+    // `fromSec1` accepts the identity encodings (`00`, `04 00..00`); with Q = O
+    // anyone can forge (pick s, r = x(e*s^-1 * G)), so refuse it here instead of
+    // relying on `mulDoubleBasePublic` to do it.
+    Q.rejectIdentity() catch return false;
     const r = Scalar.fromBytes(sig_rs[0..32].*, .big) catch return false;
     const s = Scalar.fromBytes(sig_rs[32..64].*, .big) catch return false;
     if (r.isZero() or s.isZero()) return false;

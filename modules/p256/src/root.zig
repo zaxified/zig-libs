@@ -115,6 +115,7 @@ test {
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "meta.model_after names nistz256 and the std oracle" {
