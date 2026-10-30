@@ -71,9 +71,11 @@ pub fn Stable(comptime T: type, comptime Ctx: type, comptime lessThanFn: fn (Ctx
             if (@sizeOf(T) == 0) return;
             if (scratch.len < minScratchLen(v.len)) @panic("sort.stableBuffer: scratch shorter than sort.stableScratchLen(items.len)");
             // The partition and the merges assume the two never overlap.
+            // An empty `v` owns no bytes, so it cannot overlap anything even
+            // when its pointer lies inside `scratch` (sweep REV-sort-1).
             const v_lo = @intFromPtr(v.ptr);
             const s_lo = @intFromPtr(scratch.ptr);
-            if (s_lo < v_lo + v.len * @sizeOf(T) and v_lo < s_lo + scratch.len * @sizeOf(T)) @panic("sort.stableBuffer: scratch overlaps items");
+            if (v.len != 0 and s_lo < v_lo + v.len * @sizeOf(T) and v_lo < s_lo + scratch.len * @sizeOf(T)) @panic("sort.stableBuffer: scratch overlaps items");
             if (v.len < 2) return;
             if (v.len <= max_len_always_insertion) {
                 S.insertionSortShiftLeft(v.ptr, v.len, 1, ctx);

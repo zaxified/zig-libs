@@ -334,3 +334,13 @@ test "unstable survives an adversary that exhausts the quicksort budget" {
 test "stable survives an adversary that exhausts the quicksort budget" {
     for ([_]usize{ 300, 4000 }) |n| try checkAdversarial(true, n);
 }
+
+test "stableBuffer accepts an empty items slice that lies inside the scratch (sweep REV-sort-1)" {
+    const gpa = testing.allocator;
+    const buf = try gpa.alloc(u32, 64);
+    defer gpa.free(buf);
+    // `buf[10..10]` owns no bytes: it overlaps nothing, wherever its pointer is.
+    try testing.expectEqual(@as(u32, 1000), try forked(callStableBuffer, .{ buf[10..10], buf[0..] }));
+    // A non-empty items slice inside the scratch is still refused.
+    try testing.expectEqual(abort_signal, try forked(callStableBuffer, .{ buf[10..12], buf[0..] }));
+}

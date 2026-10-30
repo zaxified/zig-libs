@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `stableBuffer`'s overlap check no longer panics on an empty `items` whose pointer lies inside `scratch`; the example checks with `must()` instead of `std.debug.assert` (compiled out in ReleaseFast). Test in `src/audit_test.zig`.
 - **2026-10-25** — New module: fast in-place sorting, ported from Rust 1.93.1's
   `core::slice::sort` — `unstable` (ipnsort, a drop-in for `std.sort.pdq`),
   `stable` / `stableBuffer` (driftsort, allocating like Rust or on caller
