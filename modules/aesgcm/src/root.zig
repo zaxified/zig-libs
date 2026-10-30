@@ -215,13 +215,13 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
             }
 
             /// `c` ← AES-GCM encryption of `m`, `tag` ← its tag over `ad`
-            /// and `c`. Asserts `c.len == m.len` and `m.len ≤ 2^36 − 32`.
+            /// and `c`. Panics (`aesgcm: ...`, in every build mode) unless
+            /// `c.len == m.len` and `m.len ≤ 2^36 − 32`.
             /// `c` may be `m` itself (in place), or start before it inside
             /// the same buffer (`c.ptr < m.ptr`); it must not start after
             /// it and overlap.
             pub fn encrypt(ctx: *const Context, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {
-                assert(c.len == m.len);
-                assert(m.len <= max_message_len);
+                checkSealLens(c.len, m.len);
                 switch (ctx.impl) {
                     .generic => |*g| g.seal(c, tag, m, ad, npub),
                     .aesni => |*k| if (x86_asm) k.seal(tl, nl, c, tag, m, ad, npub) else unreachable,
@@ -230,13 +230,14 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
 
             /// `m` ← decryption of `c` if `tag` authenticates `ad` and `c`
             /// under this key and `npub`; else `error.AuthenticationFailed`
-            /// with every byte of `m` zeroed. Asserts `c.len == m.len`. `m`
+            /// with every byte of `m` zeroed — also for a `c` longer than
+            /// 2^36 − 32 bytes, which no message can be. Panics (`aesgcm:
+            /// ...`, in every build mode) unless `c.len == m.len`. `m`
             /// may be `c` itself (in place) or start before it inside the
             /// same buffer — a record decrypted over its own header; on
             /// failure the overlapped ciphertext is gone too.
             pub fn decrypt(ctx: *const Context, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) AuthenticationError!void {
-                assert(c.len == m.len);
-                assert(m.len <= max_message_len);
+                if (!checkOpenLens(m, c.len)) return error.AuthenticationFailed;
                 switch (ctx.impl) {
                     .generic => |*g| return g.open(m, c, tag, ad, npub),
                     .aesni => |*k| if (x86_asm) return k.open(tl, nl, m, c, tag, ad, npub) else unreachable,
@@ -288,8 +289,7 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
         }
 
         fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) void {
-            assert(c.len == m.len);
-            assert(m.len <= max_message_len);
+            checkSealLens(c.len, m.len);
             switch (backend()) {
                 .generic => if (StdGcm == void) {
                     var g = Generic.init(key.*);
@@ -316,8 +316,7 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
         }
 
         fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, key: *const [key_length]u8) AuthenticationError!void {
-            assert(c.len == m.len);
-            assert(m.len <= max_message_len);
+            if (!checkOpenLens(m, c.len)) return error.AuthenticationFailed;
             switch (backend()) {
                 .generic => if (StdGcm == void) {
                     var g = Generic.init(key.*);
@@ -440,10 +439,58 @@ fn AesGcmImpl(comptime key_bits: u16, comptime nl: usize, comptime tl: usize) ty
     };
 }
 
-/// SP 800-38D §5.2.1.1: plaintext up to 2^39 − 256 bits; with a 96-bit IV
-/// the 32-bit counter starts at 2, so 2^32 − 2 blocks. The same bound std
-/// asserts.
-const max_message_len = 16 * ((1 << 32) - 2);
+/// The longest message (bytes) one nonce may protect: SP 800-38D §5.2.1.1
+/// allows 2^39 − 256 bits of plaintext; with a 96-bit IV the 32-bit counter
+/// starts at 2, so 2^32 − 2 blocks. The same bound std asserts. `encrypt`
+/// panics above it and `decrypt` refuses (`AuthenticationFailed`); other nonce
+/// lengths use the same, conservative, limit.
+pub const max_message_len = 16 * ((1 << 32) - 2);
+
+const LenVerdict = enum { ok, mismatch, too_long };
+
+/// The length contract of `encrypt`/`decrypt`, as a pure function (so a test
+/// can reach the > 64 GiB case without 64 GiB).
+fn lenVerdict(out_len: usize, in_len: usize) LenVerdict {
+    if (out_len != in_len) return .mismatch;
+    if (in_len > max_message_len) return .too_long;
+    return .ok;
+}
+
+/// `encrypt`'s length contract, checked in every build mode (a bare `assert`
+/// is undefined behaviour in ReleaseFast, and the counter would wrap).
+fn checkSealLens(c_len: usize, m_len: usize) void {
+    switch (lenVerdict(c_len, m_len)) {
+        .ok => {},
+        .mismatch => @panic("aesgcm: output length differs from input length"),
+        .too_long => @panic("aesgcm: message longer than 2^36 - 32 bytes"),
+    }
+}
+
+/// `decrypt`'s refusal for a verdict: a mismatch is the caller's bug (panic),
+/// a ciphertext beyond the GCM limit cannot be authentic (`m` is zeroed and
+/// true returned). False: go on.
+fn refuseOpen(m: []u8, v: LenVerdict) bool {
+    switch (v) {
+        .ok => return false,
+        .mismatch => @panic("aesgcm: output length differs from input length"),
+        .too_long => {
+            crypto.secureZero(u8, m);
+            return true;
+        },
+    }
+}
+
+/// False when `decrypt` must return `AuthenticationFailed`.
+fn checkOpenLens(m: []u8, c_len: usize) bool {
+    return !refuseOpen(m, lenVerdict(m.len, c_len));
+}
+
+/// Test-only access to the length-contract internals (empty outside tests).
+pub const test_hooks = if (builtin.is_test) struct {
+    pub const Verdict = LenVerdict;
+    pub const verdict = lenVerdict;
+    pub const refuse = refuseOpen;
+} else struct {};
 
 /// How many GHASH key powers a message with these lengths touches: the
 /// widest aggregated group, at most eight blocks — for a short message the
@@ -1882,4 +1929,5 @@ fn agreeHarness(comptime S: type, smith: *S, gpa: std.mem.Allocator) anyerror!vo
 
 test {
     _ = @import("stackprobe_test.zig");
+    _ = @import("sweep_test.zig");
 }

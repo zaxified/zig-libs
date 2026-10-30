@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). The length contract of `encrypt`/`decrypt` (stateless and `Context`) was `std.debug.assert` (out-of-bounds write or a wrapped 32-bit GCM counter in ReleaseFast) and is now a checked panic in every build mode for `c.len != m.len` and for encrypting more than 2^36 − 32 bytes; decrypting a ciphertext longer than that zeroes `m` and returns `error.AuthenticationFailed` (no message can be that long). `max_message_len` is public and documented. Tests: `src/sweep_test.zig`.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 
 - **2026-10-18** — Zig 0.17 codegen: LLVM 22 lowers a byte-array <-> wider-lane vector `@bitCast` byte by byte; `load`/`store` (16-byte block <-> `@Vector(2, u64)`) now goes through `@Vector(n, u8)` and a vector -> vector `@bitCast` (one vector move, same little-endian-logical meaning on every target). Spelling only: no new branch or index, no API change.
