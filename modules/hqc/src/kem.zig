@@ -75,6 +75,8 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         /// external randomness (what the reference draws via two
         /// consecutive `prng_get_bytes` calls: `m` then `salt`).
         pub const coins_bytes = security_bytes + params.salt_bytes;
+        /// Peak stack of the three entry points (their burn buffer), see `keypair`.
+        pub const stack_bytes = burns.decaps;
 
         pub const EncapsKey = [ek_bytes]u8;
         pub const DecapsKey = [dk_bytes]u8;
@@ -110,6 +112,13 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///
         /// The key pair is written to `out`; the body runs one frame down and
         /// the stack it dirtied is zeroed after it (`burn.zig`).
+        ///
+        /// **Stack:** keypair/encaps/decaps use stack proportional to the
+        /// parameter set, up to `stack_bytes` (the dead-stack burn buffer is
+        /// the peak: 128 / 256 / 384 KiB for decaps of HQC-128 / 192 / 256,
+        /// plus the caller's frames). Run them on a thread with at least
+        /// `stack_bytes + 64 KiB`; a 128 KiB musl default thread stack is
+        /// not enough.
         pub fn keypair(out: *KeyPair, seed_kem: *const [params.seed_bytes]u8) void {
             burn.run(burns.keypair, void, keypairBody, .{ out, seed_kem });
         }

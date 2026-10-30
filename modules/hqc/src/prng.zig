@@ -178,7 +178,15 @@ pub fn barrettReduce(x: u32, comptime n: u32, comptime mu: u64) u32 {
 /// word to n bits. This is `vect_set_random` in the reference — used for
 /// the public generator vector h. KAT-verified: kat_vectors.zig's
 /// `hqc128_keygen` fixture reproduces the reference's `h` exactly.
+pub const sample_vect_msg = "hqc.prng: sampleVect output shorter than ceil(n/64) words";
+
+/// `out` must hold at least `ceil(n/64)` words; a shorter one is a checked
+/// panic in every optimize mode (it wrote past `out` in ReleaseFast).
 pub fn sampleVect(xof: *Xof, comptime n: u32, out: []u64) void {
+    // n % 64 == 0 would put the top-word index at `out[n / 64]`, one past
+    // the `ceil(n/64)` words the guard below checks (and mask nothing).
+    comptime if (n % 64 == 0) @compileError("hqc.prng: sampleVect needs n % 64 != 0");
+    if (out.len < (n + 63) / 64) @panic(sample_vect_msg);
     const n_bytes = (n + 7) / 8;
     const bytes = std.mem.sliceAsBytes(out);
     @memset(bytes, 0);
@@ -211,6 +219,10 @@ pub fn sampleFixedWeightRejection(
     comptime weight: u16,
     support: *[weight]u32,
 ) void {
+    // `weight > n` can never find enough distinct values (endless loop);
+    // `threshold == 0` accepts no draw at all (endless loop).
+    comptime if (weight > n) @compileError("hqc.prng: sampleFixedWeightRejection needs weight <= n");
+    comptime if (threshold == 0) @compileError("hqc.prng: sampleFixedWeightRejection needs threshold != 0");
     const buf_len = 3 * @as(usize, weight);
     var buf: [buf_len]u8 = undefined;
     var j: usize = buf_len; // force an immediate refill on first draw
@@ -259,6 +271,8 @@ pub fn sampleFixedWeightBiased(
     comptime weight: u16,
     support: *[weight]u32,
 ) void {
+    // `n - idx` below would wrap for idx >= n.
+    comptime if (weight > n) @compileError("hqc.prng: sampleFixedWeightBiased needs weight <= n");
     var raw: [4 * weight]u8 = undefined;
     xof.getBytes(&raw);
     for (support, 0..) |*s, idx| {

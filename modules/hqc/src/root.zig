@@ -152,4 +152,5 @@ test {
     _ = @import("bench.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
+    _ = @import("sweep_test.zig");
 }

@@ -648,6 +648,7 @@ value, not a crash, and different from the real shared secret).
 
 ## Backlog / deferred
 
+- **Comptime guards of the parameter helpers (no-panic sweep GT, 2026-10-30).** `gf2x.Ring(n)` and `prng.sampleVect` are `@compileError`s for `n % 64 == 0` (every real HQC `n` is prime); `sampleFixedWeightRejection` / `sampleFixedWeightBiased` are `@compileError`s for `weight > n`, and the rejection one for `threshold == 0` (each would loop forever or wrap). Only a custom `params.Params` reaches them; the real sets compile, so no runtime test is possible or needed.
 - **Close the gap to the authors' AVX2 lane (2.3–3.4× slower)** *(measured 2026-10-07, `zig build bench-hqc`)*. Against the `ref` lane we are 14–25× faster, against `x86_64/avx256` 2.28–3.39× slower for keygen/encaps/decaps of all three sets. Likely sources: the GF(2)[x] multiply (CLMUL here, AVX2 in the authors' lane) and the RS/RM decoder vectorisation; profile before choosing. Pure Zig, fits CONVENTIONS §2.
 - **Follow the standard once NIST publishes HQC (draft FIPS)** *(survey 2026-09-30)*.
   Upstream `next-release` already differs from `v5.0.0` in sampler and GF(2^8)

@@ -189,8 +189,12 @@ fn clmulKar(comptime len: usize, r: *[2 * len]u64, a: *const [len]u64, b: *const
 /// always kept zero (the "canonical" invariant every function here
 /// maintains and, for `add`/`mul`, assumes of its inputs).
 pub fn Ring(comptime n: u32) type {
+    // n % 64 == 0 makes `top_mask` 0 (maskTop would clear the whole top word).
+    comptime if (n % 64 == 0) @compileError("hqc.gf2x: Ring needs n % 64 != 0");
     return struct {
         pub const bit_len = n;
+        pub const bit_range_msg = "hqc.gf2x: bit position out of range (>= n)";
+        pub const to_bytes_msg = "hqc.gf2x: toBytes output shorter than n_bytes";
         pub const words = (n + 63) / 64;
         pub const n_bytes = (n + 7) / 8;
         /// Mask for the top (partially-used) word: keeps only bits
@@ -209,15 +213,16 @@ pub fn Ring(comptime n: u32) type {
             v[words - 1] &= top_mask;
         }
 
-        /// Set bit `pos` (0 <= pos < n).
+        /// Set bit `pos` (0 <= pos < n); any other `pos` is a checked panic
+        /// in every optimize mode (it used to write past `v` in ReleaseFast).
         pub fn setBit(v: *Elem, pos: u32) void {
-            std.debug.assert(pos < n);
+            if (pos >= n) @panic(bit_range_msg);
             v[pos / 64] |= @as(u64, 1) << @intCast(pos % 64);
         }
 
-        /// Read bit `pos` (0 <= pos < n).
+        /// Read bit `pos` (0 <= pos < n); any other `pos` is a checked panic.
         pub fn getBit(v: Elem, pos: u32) u1 {
-            std.debug.assert(pos < n);
+            if (pos >= n) @panic(bit_range_msg);
             return @intCast((v[pos / 64] >> @intCast(pos % 64)) & 1);
         }
 
@@ -257,9 +262,11 @@ pub fn Ring(comptime n: u32) type {
         }
 
         /// Serialize to exactly n_bytes bytes (LSB-first, see module
-        /// doc). `out.len` must be >= n_bytes.
+        /// doc). `out.len` must be >= n_bytes; a shorter `out` is a checked
+        /// panic in every optimize mode (the `@memcpy` slice was unchecked in
+        /// ReleaseFast: an out-of-bounds write).
         pub fn toBytes(a: Elem, out: []u8) void {
-            std.debug.assert(out.len >= n_bytes);
+            if (out.len < n_bytes) @panic(to_bytes_msg);
             const src = std.mem.sliceAsBytes(a[0..]);
             @memcpy(out[0..n_bytes], src[0..n_bytes]);
         }
@@ -267,9 +274,11 @@ pub fn Ring(comptime n: u32) type {
         /// Zero every bit at position >= n1n2 (spec §3.5's `Truncate`:
         /// "discards the n' most-significant bits, keeps the n' least
         /// significant" — here n' = n1n2, applied to a full n-bit Elem).
-        /// Matches the reference's `vect_truncate` word-for-word.
+        /// Matches the reference's `vect_truncate` word-for-word. Total: a
+        /// `n1n2 >= n` keeps every bit (an `Elem` is canonical, bits >= n are
+        /// zero), where it used to index past `v` in ReleaseFast.
         pub fn truncate(v: *Elem, n1n2: u32) void {
-            std.debug.assert(n1n2 <= n);
+            if (n1n2 >= n) return;
             const full_words = n1n2 / 64;
             const rem_bits = n1n2 % 64;
             var start = full_words;

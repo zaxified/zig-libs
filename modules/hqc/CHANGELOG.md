@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GT). Caller-contract asserts in `gf2x.Ring.toBytes`/`setBit`/`getBit` and `prng.sampleVect` are checked panics; `Ring.truncate` is total; comptime guards reject custom parameter sets with `n % 64 == 0`, `weight > n` or `threshold == 0`. Docs: `keypair`/`encaps`/`decaps` need up to `stack_bytes` (128/256/384 KiB) of stack. Tests: `src/sweep_test.zig`.
 - **2026-10-09** — **BREAKING:** dead-stack rule (CONVENTIONS §2.1.1). `Pke.keygen(out: *KeyPair, seed)` returns its pair through `out` (was `keygen(seed) KeyPair`; `kem.keypair` is the only in-tree caller and zeroes its copy); it runs under the KEM-keypair-sized burn. `prng.Xof.init` and `prng.hashI` now run under a 4 KiB burn (`burn.prng_burn`). New `src/stackprobe2_test.zig` probes the three.
 
 - **2026-10-09** — **BREAKING, HIGH: HQC-KEM left its secrets on the dead stack.** New
