@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GU). `Stream.maxUpdateLen`, `paddedLenPkcs7` and `paddedLenZero` saturate instead of wrapping for a size near `maxInt(usize)` (pad functions then answer `BufferTooSmall`); the `pad*` functions accept `out` overlapping `msg` (in-place padding panicked in `@memcpy`, UB in ReleaseFast). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements about std AES (128/256 only, no CBC) and the two std software-backend defects re-checked against the 0.17.0 std (both defects are still there).

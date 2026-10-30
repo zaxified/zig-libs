@@ -473,7 +473,9 @@ fn Stream(comptime Aes: type, comptime padding: Padding, comptime dir: enum { en
 
         /// Octets the next `update(in)` writes for an `in` of `in_len`.
         pub fn maxUpdateLen(self: *const Self, in_len: usize) usize {
-            const avail = self.tail_len + in_len;
+            // Saturating: `in_len` is a bare number, not a slice length, so a
+            // caller's size arithmetic may hand in anything (sweep AC-1).
+            const avail = self.tail_len +| in_len;
             if (!hold) return avail / block_len * block_len;
             return if (avail == 0) 0 else (avail - 1) / block_len * block_len;
         }
@@ -562,8 +564,23 @@ fn Stream(comptime Aes: type, comptime padding: Padding, comptime dir: enum { en
 
 /// PKCS#7-padded length for a `msg_len`-byte message. Always adds between 1
 /// and `block_len` bytes (never zero).
+///
+/// Saturates at `maxInt(usize)` instead of wrapping for a `msg_len` within
+/// 16 of it: no buffer can be that long, so the pad functions answer
+/// `BufferTooSmall` and an allocation fails (sweep AC-2).
 pub fn paddedLenPkcs7(msg_len: usize) usize {
-    return msg_len + (block_len - msg_len % block_len);
+    return msg_len +| (block_len - msg_len % block_len);
+}
+
+/// `msg` to the front of `out`, which may be `msg`'s own storage (in-place
+/// padding: `out` and `msg` start at the same address, or `out` is shifted
+/// either way). A plain `@memcpy` panics on any overlap (sweep AC-3).
+fn placeMsg(out: []u8, msg: []const u8) void {
+    const dst = out[0..msg.len];
+    if (@intFromPtr(dst.ptr) <= @intFromPtr(msg.ptr))
+        std.mem.copyForwards(u8, dst, msg)
+    else
+        std.mem.copyBackwards(u8, dst, msg);
 }
 
 /// Write `msg` followed by PKCS#7 padding into `out`. `out` must be at least
@@ -571,7 +588,7 @@ pub fn paddedLenPkcs7(msg_len: usize) usize {
 pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
     const padded_len = paddedLenPkcs7(msg.len);
     if (out.len < padded_len) return error.BufferTooSmall;
-    @memcpy(out[0..msg.len], msg);
+    placeMsg(out, msg);
     const pad: u8 = @intCast(padded_len - msg.len);
     @memset(out[msg.len..padded_len], pad);
     return padded_len;
@@ -688,7 +705,7 @@ pub const paddedLen = paddedLenPkcs7;
 pub fn padAnsiX923(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
     const padded_len = paddedLen(msg.len);
     if (out.len < padded_len) return error.BufferTooSmall;
-    @memcpy(out[0..msg.len], msg);
+    placeMsg(out, msg);
     @memset(out[msg.len .. padded_len - 1], 0);
     out[padded_len - 1] = @intCast(padded_len - msg.len);
     return padded_len;
@@ -716,7 +733,7 @@ pub fn unpadAnsiX923(buf: []const u8) PaddingError!usize {
 pub fn padIso10126(msg: []const u8, out: []u8, random: std.Random) error{BufferTooSmall}!usize {
     const padded_len = paddedLen(msg.len);
     if (out.len < padded_len) return error.BufferTooSmall;
-    @memcpy(out[0..msg.len], msg);
+    placeMsg(out, msg);
     random.bytes(out[msg.len .. padded_len - 1]);
     out[padded_len - 1] = @intCast(padded_len - msg.len);
     return padded_len;
@@ -730,7 +747,7 @@ pub const unpadIso10126 = unpadXmlEnc;
 pub fn padIso7816(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
     const padded_len = paddedLen(msg.len);
     if (out.len < padded_len) return error.BufferTooSmall;
-    @memcpy(out[0..msg.len], msg);
+    placeMsg(out, msg);
     out[msg.len] = 0x80;
     @memset(out[msg.len + 1 .. padded_len], 0);
     return padded_len;
@@ -761,13 +778,15 @@ pub fn unpadIso7816(buf: []const u8) PaddingError!usize {
 /// Zero padding: zeros up to the next block boundary, nothing when `msg` is
 /// already aligned (RustCrypto `ZeroPadding`).
 pub fn paddedLenZero(msg_len: usize) usize {
-    return std.mem.alignForward(usize, msg_len, block_len);
+    const r = msg_len % block_len;
+    if (r == 0) return msg_len;
+    return msg_len +| (block_len - r); // saturating, see `paddedLenPkcs7`
 }
 
 pub fn padZero(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
     const padded_len = paddedLenZero(msg.len);
     if (out.len < padded_len) return error.BufferTooSmall;
-    @memcpy(out[0..msg.len], msg);
+    placeMsg(out, msg);
     @memset(out[msg.len..padded_len], 0);
     return padded_len;
 }
@@ -1439,6 +1458,7 @@ test "ISO 10126 and zero padding" {
 test {
     _ = @import("stackprobe_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.
