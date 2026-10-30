@@ -121,3 +121,25 @@ test "maxPssSaltLen / emsaPssEncode with extreme bit counts do not overflow (swe
     var em: [64]u8 = undefined;
     try std.testing.expectError(error.EncodedMessageTooShort, rsa.emsaPssEncode(Sha256, "m", "", std.math.maxInt(usize), &em));
 }
+
+test "fromPrimes accepts a four-byte public exponent below 2^32 (sweep audit GP-RS-1)" {
+    var kp = try testKey();
+    defer kp.secret_key.deinit();
+    var pb: [64]u8 = undefined;
+    var qb: [64]u8 = undefined;
+    const p = primeBytes(kp.secret_key.p, &pb);
+    const q = primeBytes(kp.secret_key.q, &qb);
+    // Odd 32-bit values; an e sharing a factor with lambda(n) is refused for that
+    // reason alone, so try a few. The key is fixed, so the outcome is deterministic.
+    var accepted: usize = 0;
+    for ([_]u32{ 0xFFFF_FFFF, 0x8000_0001, 0x1000_0001, 0x1234_5679, 0xCAFE_BABF, 0x0100_0003 }) |e| {
+        var eb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &eb, e, .big);
+        var sk: rsa.SecretKey = undefined;
+        if (rsa.SecretKey.fromPrimes(&sk, p, q, &eb)) {
+            accepted += 1;
+            sk.deinit();
+        } else |err| try std.testing.expectEqual(error.InvalidPrivateKey, err);
+    }
+    try std.testing.expect(accepted >= 1);
+}
