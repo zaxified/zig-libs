@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GT) found nothing to fix (`der_encoded_length_max` = 104 already covers 48×0xff); pin tests for DER parse, SEC1 decode and ECDH edges in `src/sweep_test.zig`.
 - **2026-10-21** — **Added:** `Ecdsa(Hash).signWithSecretKey(out, secret_key, msg, noise)`: the
   RFC 6979 signature from the secret scalar alone (no `d·G`), equal to `KeyPair.sign`'s on the
   RFC 6979 A.2.6 vectors; `error.NonCanonical` / `error.IdentityElement` as `fromSecretKey`.
