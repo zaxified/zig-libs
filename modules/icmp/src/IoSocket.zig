@@ -65,7 +65,8 @@ pub fn sendTo(self: *const IoSocket, dest: net.IpAddress, packet: []const u8) So
 /// Every reply already received, without waiting, into `b`'s slots: the
 /// shape of `Socket.recvBatch`.
 pub fn recvBatch(self: *const IoSocket, b: *Socket.RecvBatch) error{SlabTooSmall}![]const Socket.RecvInfo {
-    if (b.slab.len < Socket.batch_max * b.slot_size) return error.SlabTooSmall;
+    const need = std.math.mul(usize, Socket.batch_max, b.slot_size) catch return error.SlabTooSmall; // sweep IC-10
+    if (b.slab.len < need) return error.SlabTooSmall;
     const now: std.Io.Timeout = .{ .duration = .{ .raw = .zero, .clock = .awake } };
     var n: usize = 0;
     while (n < Socket.batch_max) : (n += 1) {

@@ -109,6 +109,14 @@ netlink/wireguard/l2disco/procnet — a deliberate scope decision, not a gap).
 
   Plan: wait for Zig 0.17.1; then fix panic/critical sites (reach A/B first) via u64 (`trunc nuw`) or a module helper; inventory method: ~/CML/zig-017/inv017/summary.md
 
+**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons (report: `~/CML/20261029-panic-sweep/icmp-sweep.report.md`):
+- `Pinger.stats(id)` / `targetAddr(id)` with an id `addTarget*` never returned: now a documented checked panic; the message path cannot be asserted in-process.
+- `drainErrQueue`'s `icmp_errors +|= 1` (same saturation as IC-5) has no test: it needs a real `MSG_ERRQUEUE` entry.
+- `waitReadable` converts up to 292 years of wait into `timespec.sec` with `@intCast`: only a 32-bit target (i32 sec) can trip it; no test possible on 64-bit.
+- `Socket.parseControl` / `recvErr`: `off + cmsg.len` could overflow for a lying `cmsg_len`; the data is kernel-generated (SO_TIMESTAMPNS, TTL, ...), not reachable from the network. Left as is.
+- A fast, honest responder can exhaust the 65536 sequence slots with answered-but-unpurged slots (`SequenceSpaceExhausted` from `run`) even with `max_inflight` far below the cap; the error is clean, the cap is a design choice (purge on reply would need a heap with removal).
+- `timeout_q` keeps answered events until their time: with a huge `timeout_ns` in `.loop` mode it grows with the probes sent.
+
 ## Status
 `extract · linux · client · single_owner` · deps: `seqmap`, `netaddr` — canonical source is `pub
 const meta` in src/root.zig.

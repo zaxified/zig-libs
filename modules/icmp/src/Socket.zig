@@ -298,7 +298,7 @@ fn buildPktinfo(self: *const Socket, control: *align(@alignOf(linux.cmsghdr)) [6
     switch (self.family) {
         .v4 => {
             const info: linux.in_pktinfo = .{
-                .ifindex = @intCast(self.oiface_index),
+                .ifindex = @bitCast(self.oiface_index), // sweep IC-8: >= 2^31 is ENODEV, not a cast panic
                 .spec_dst = self.pktinfo_src4,
                 .addr = 0,
             };
@@ -308,7 +308,7 @@ fn buildPktinfo(self: *const Socket, control: *align(@alignOf(linux.cmsghdr)) [6
         .v6 => {
             const info: linux.in6_pktinfo = .{
                 .addr = @splat(0),
-                .ifindex = @intCast(self.oiface_index),
+                .ifindex = @bitCast(self.oiface_index), // sweep IC-8: >= 2^31 is ENODEV, not a cast panic
             };
             cmsg.* = .{ .len = hdr_len + @sizeOf(linux.in6_pktinfo), .level = linux.SOL.IPV6, .type = linux.IPV6.PKTINFO };
             @memcpy(control[hdr_len..][0..@sizeOf(linux.in6_pktinfo)], std.mem.asBytes(&info));
@@ -532,7 +532,10 @@ pub const RecvBatch = struct {
 /// writes past the end of the slab, because both operands are runtime
 /// values the type system cannot relate.
 pub fn recvBatch(self: *const Socket, b: *RecvBatch) error{SlabTooSmall}![]const RecvInfo {
-    if (b.slab.len < batch_max * b.slot_size) return error.SlabTooSmall;
+    // sweep IC-10: `batch_max * slot_size` wrapped for a huge slot_size and
+    // let the kernel write past the slab.
+    const need = std.math.mul(usize, batch_max, b.slot_size) catch return error.SlabTooSmall;
+    if (b.slab.len < need) return error.SlabTooSmall;
     for (0..batch_max) |i| {
         b.iovs[i] = .{ .base = b.slab.ptr + i * b.slot_size, .len = b.slot_size };
         b.msgs[i] = .{

@@ -85,6 +85,7 @@ pub const Config = struct {
     /// probe, spreading load across the cycle. 0 = off.
     jitter_ns: u64 = 0,
     /// Hard cap on outstanding probes. Must be < 65536 (sequence space).
+    /// 0 is treated as 1 (sweep IC-1: it used to leave `run` spinning).
     max_inflight: u32 = 4096,
     /// Minimum gap between sends into the same subnet (/24 IPv4, /64 IPv6).
     /// 0 = off.
@@ -191,7 +192,9 @@ pub const Stats = struct {
     }
 
     pub fn lost(s: Stats) u32 {
-        return s.sent - s.recv;
+        // sweep IC-6: saturating; `Stats` is a public plain struct, a caller
+        // may hold one with recv > sent.
+        return s.sent -| s.recv;
     }
 
     pub fn lossPermille(s: Stats) u32 {
@@ -320,8 +323,9 @@ pub const Addr = union(echo.Family) {
 const Target = struct {
     addr: Addr,
     stats: Stats = .{},
-    /// Probes handed to sendto (including failed sends).
-    attempts: u16 = 0,
+    /// Probes handed to sendto (including failed sends). sweep D6: u32, a u16
+    /// wrapped after the 65536th send and `retries = 65535` never ended.
+    attempts: u32 = 0,
     /// Probes currently awaiting reply or timeout.
     pending: u16 = 0,
     /// Current probe timeout (grows with backoff in .alive mode).
@@ -335,11 +339,19 @@ const Event = struct {
     probe: u16,
     /// Sequence number, used by timeout events to validate against seqmap.
     seq: u16 = 0,
+    /// sweep IC-3: a ping event deferred by subnet pacing already owns a
+    /// slot in its bucket's schedule (`Pinger.subnet_tail`).
+    reserved: bool = false,
 };
 
 fn eventBefore(_: void, a: Event, b: Event) std.math.Order {
     return std.math.order(a.time, b.time);
 }
+
+const Waiters = struct {
+    items: std.ArrayList(Event) = .empty,
+    head: usize = 0,
+};
 
 const EventQueue = std.PriorityQueue(Event, void, eventBefore);
 
@@ -445,6 +457,11 @@ pub const Pinger = struct {
     last_send_ns: i64 = 0,
     inflight: u32 = 0,
     subnet_last: std.AutoHashMapUnmanaged(u64, i64) = .empty,
+    /// sweep IC-3: per busy bucket, the events waiting behind its head. A
+    /// bucket has an entry exactly while one `reserved` head event of it sits
+    /// in `ping_q`; the rest wait here instead of being re-deferred (and
+    /// re-heapified) at every send, which was O(N^2) for N targets in a bucket.
+    subnet_wait: std.AutoHashMapUnmanaged(u64, Waiters) = .empty,
     prng: std.Random.DefaultPrng,
     /// Socket.batch_max packet slots for batched sends (slot 0 doubles as
     /// the single-send buffer).
@@ -515,6 +532,8 @@ pub const Pinger = struct {
         self.timeout_q.deinit(self.gpa);
         self.seqmap.deinit(self.gpa);
         self.subnet_last.deinit(self.gpa);
+        self.clearSubnetWait();
+        self.subnet_wait.deinit(self.gpa);
         self.gpa.free(self.send_slab);
         self.gpa.free(self.recv_batch.slab);
         self.* = undefined;
@@ -550,11 +569,17 @@ pub const Pinger = struct {
         return self.targets.items.len;
     }
 
+    /// Panics (`icmp: target id out of range`) for an id `addTarget*` never
+    /// returned.
     pub fn stats(self: *const Pinger, id: TargetId) Stats {
+        if (id >= self.targets.items.len) @panic("icmp: target id out of range");
         return self.targets.items[id].stats;
     }
 
+    /// Panics (`icmp: target id out of range`) for an id `addTarget*` never
+    /// returned.
     pub fn targetAddr(self: *const Pinger, id: TargetId) Addr {
+        if (id >= self.targets.items.len) @panic("icmp: target id out of range");
         return self.targets.items[id].addr;
     }
 
@@ -612,6 +637,12 @@ pub const Pinger = struct {
         };
     }
 
+    /// Push a scheduling event. Cannot fail: `prepare` reserved room for one
+    /// event per target and there is at most one per target (see there).
+    fn pushPing(self: *Pinger, ev: Event) void {
+        self.ping_q.push(self.gpa, ev) catch unreachable; // invariant of `prepare`
+    }
+
     fn socketFor(self: *Pinger, fam: echo.Family) *Sock {
         return switch (fam) {
             .v4 => &self.sock4.?,
@@ -628,6 +659,14 @@ pub const Pinger = struct {
     /// run(); use it directly together with step()/pollFds() when embedding
     /// the engine into an external event loop.
     pub fn prepare(self: *Pinger) RunError!void {
+        // sweep D5: every later `ping_q` push is infallible (`pushPing`). Each
+        // target has at most one scheduling event in `ping_q` or `subnet_wait`
+        // at any time: this loop seeds one, and an event is only replaced by
+        // its target's next one (`prepareProbe`, or `handleTimeout` for a retry,
+        // after the previous one was popped) or moved between the two
+        // containers. So the heap never holds more than `targets.len` events;
+        // reserve that here, where an error is still harmless (nothing changed).
+        try self.ping_q.ensureTotalCapacity(self.gpa, self.targets.items.len);
         if (self.cfg.icmp_timestamp) {
             for (self.targets.items) |*t| {
                 if (t.addr.family() == .v6) return error.IcmpTimestampRequiresIpv4;
@@ -642,6 +681,7 @@ pub const Pinger = struct {
         // (stop(), or answered slots whose events were never purged).
         self.seqmap.clear();
         self.subnet_last.clearRetainingCapacity();
+        self.clearSubnetWait();
         self.stop_requested.store(false, .monotonic);
         for (self.targets.items) |*t| {
             t.stats = .{};
@@ -654,12 +694,14 @@ pub const Pinger = struct {
         const start = self.nowMono();
         const rng = self.prng.random();
         for (self.targets.items, 0..) |_, idx| {
+            // sweep IC-2: bound by what still fits after `start`.
+            const jitter_room: u64 = @intCast(@max(std.math.maxInt(i64) - start, 0));
             const jitter: i64 = if (self.cfg.jitter_ns > 0)
-                @intCast(rng.uintLessThan(u64, self.cfg.jitter_ns))
+                @intCast(rng.uintLessThan(u64, @min(self.cfg.jitter_ns, jitter_room +| 1)))
             else
                 0;
-            try self.ping_q.push(self.gpa, .{
-                .time = start + jitter,
+            self.pushPing(.{
+                .time = start +| jitter,
                 .target = @intCast(idx),
                 .probe = 0,
             });
@@ -796,34 +838,48 @@ pub const Pinger = struct {
     /// sends to the same address family share one sendmmsg syscall.
     fn dispatchDue(self: *Pinger) RunError!void {
         var now = self.nowMono();
-        while (true) {
+        // sweep IC-1: 0 meant "never send" and left run() spinning.
+        const max_inflight = @max(self.cfg.max_inflight, 1);
+        // sweep D3: sends whose kernel call failed never raise `inflight`, so
+        // with all intervals 0 the next probe is due at once, forever. Bound
+        // the sends one call attempts; `step` returns and is called again
+        // (the next due event makes `nextWaitNs` answer 0), so timeouts,
+        // replies and `stop()` get their turn in between.
+        var attempted: usize = 0;
+        while (attempted < max_inflight) {
             // Collect a same-family batch of events allowed to send now.
             var events: [Socket.batch_max]Event = undefined;
             var seqs: [Socket.batch_max]u16 = undefined;
             var family: echo.Family = undefined;
             var n: usize = 0;
-            collect: while (n < Socket.batch_max) {
-                const ev = self.ping_q.peek() orelse break :collect;
-                if (ev.time > now) break :collect;
-                if (self.inflight + n >= self.cfg.max_inflight) break :collect;
-                if (n == 0) {
-                    if (now - self.last_send_ns < @as(i64, @intCast(self.cfg.interval_ns)))
-                        break :collect;
-                } else if (self.cfg.interval_ns != 0) break :collect;
-                const fam = self.targets.items[ev.target].addr.family();
-                if (n == 0) family = fam else if (fam != family) break :collect;
-                if (self.subnetReadyAt(ev, now)) |ready_at| {
-                    // Subnet busy: push the event back to when its bucket
-                    // frees up, then keep collecting other targets.
-                    var deferred = self.ping_q.pop().?;
-                    deferred.time = ready_at;
-                    try self.ping_q.push(self.gpa, deferred);
-                    continue :collect;
+            // sweep D4: a `prepareProbe` error mid-batch must not leave the
+            // earlier events' seqmap entries behind (never committed, never
+            // timed out; a reply for one would unbalance the counters).
+            {
+                errdefer for (seqs[0..n]) |s| self.seqmap.release(s);
+                collect: while (n < Socket.batch_max) {
+                    const ev = self.ping_q.peek() orelse break :collect;
+                    if (ev.time > now) break :collect;
+                    if (self.inflight + n >= max_inflight) break :collect;
+                    if (n == 0) {
+                        if (now - self.last_send_ns < nsI64(self.cfg.interval_ns))
+                            break :collect;
+                    } else if (self.cfg.interval_ns != 0) break :collect;
+                    const fam = self.targets.items[ev.target].addr.family();
+                    if (n == 0) family = fam else if (fam != family) break :collect;
+                    if (self.subnetReadyAt(ev, now)) |ready_at| {
+                        // Subnet busy: push the event back to when its bucket
+                        // frees up, then keep collecting other targets.
+                        const deferred = self.ping_q.pop().?;
+                        try self.deferToSubnet(deferred, ready_at);
+                        continue :collect;
+                    }
+                    _ = self.ping_q.pop();
+                    if (ev.reserved) self.promoteSubnetWaiter(ev, now);
+                    seqs[n] = try self.prepareProbe(ev, now, self.sendSlot(n));
+                    events[n] = ev;
+                    n += 1;
                 }
-                _ = self.ping_q.pop();
-                seqs[n] = try self.prepareProbe(ev, now, self.sendSlot(n));
-                events[n] = ev;
-                n += 1;
             }
             if (n == 0) return;
 
@@ -852,6 +908,7 @@ pub const Pinger = struct {
                     self.failProbe(ev, seq, err);
                 }
             }
+            attempted += n;
             now = self.nowMono();
         }
     }
@@ -866,18 +923,87 @@ pub const Pinger = struct {
         if (self.cfg.subnet_gap_ns == 0) return null;
         const key = self.targets.items[ev.target].addr.subnetKey();
         const last = self.subnet_last.get(key) orelse return null;
-        const ready = last + @as(i64, @intCast(self.cfg.subnet_gap_ns));
+        var ready = last +| nsI64(self.cfg.subnet_gap_ns);
+        // Events already waiting in the bucket go first.
+        if (!ev.reserved and self.subnet_wait.contains(key)) ready = @max(ready, now +| 1);
         return if (ready > now) ready else null;
+    }
+
+    fn clearSubnetWait(self: *Pinger) void {
+        var it = self.subnet_wait.valueIterator();
+        while (it.next()) |w| w.items.deinit(self.gpa);
+        self.subnet_wait.clearRetainingCapacity();
+    }
+
+    /// `ev` may not send before `ready_at`: it becomes its bucket's head (back
+    /// into `ping_q`) if the bucket has none, an early head waits for its
+    /// time again, anything else queues behind the head.
+    fn deferToSubnet(self: *Pinger, ev: Event, ready_at: i64) !void {
+        const key = self.targets.items[ev.target].addr.subnetKey();
+        var e = ev;
+        e.time = ready_at;
+        // sweep D5: `pushPing` cannot fail. The only allocations are the waiter list and the bucket table; if one fails
+        // the event goes back as it was (the next step retries) instead of
+        // being lost with its target, and the table is only changed after
+        // every step that can fail.
+        if (ev.reserved) {
+            self.pushPing(e);
+            return;
+        }
+        if (self.subnet_wait.getPtr(key)) |w| {
+            w.items.append(self.gpa, ev) catch |err| {
+                self.pushPing(ev);
+                return err;
+            };
+            return;
+        }
+        self.subnet_wait.ensureUnusedCapacity(self.gpa, 1) catch |err| {
+            self.pushPing(ev);
+            return err;
+        };
+        e.reserved = true;
+        self.pushPing(e);
+        self.subnet_wait.putAssumeCapacity(key, .{});
+    }
+
+    /// The head `ev` of its bucket is about to send at `now`: hand the head
+    /// role to the next waiter, one gap later, or close the bucket.
+    fn promoteSubnetWaiter(self: *Pinger, ev: Event, now: i64) void {
+        const key = self.targets.items[ev.target].addr.subnetKey();
+        const w = self.subnet_wait.getPtr(key) orelse return;
+        if (w.head < w.items.items.len) {
+            var next = w.items.items[w.head];
+            next.reserved = true;
+            next.time = now +| nsI64(self.cfg.subnet_gap_ns);
+            self.pushPing(next);
+            w.head += 1;
+            // sweep D1: drop the consumed prefix, or a saturated bucket (it
+            // never drains) keeps one dead event per send forever. Compacting
+            // when the dead part is at least half costs amortised O(1).
+            if (w.head >= 64 and w.head * 2 >= w.items.items.len) {
+                const live = w.items.items.len - w.head;
+                @memmove(w.items.items[0..live], w.items.items[w.head..]);
+                w.items.shrinkRetainingCapacity(live);
+                w.head = 0;
+            }
+        } else {
+            w.items.deinit(self.gpa);
+            _ = self.subnet_wait.remove(key);
+        }
     }
 
     fn nextWaitNs(self: *Pinger, now: i64) ?i64 {
         var wait: ?i64 = null;
-        if (self.ping_q.peek()) |ev| {
+        // sweep D2: at the in-flight cap `dispatchDue` cannot send, so a due
+        // head must not make the caller spin; only a reply or a timeout
+        // (which frees a slot) can change that.
+        const capped = self.inflight >= @max(self.cfg.max_inflight, 1);
+        if (self.ping_q.peek()) |ev| if (!capped) {
             var t = ev.time;
-            const pace = self.last_send_ns + @as(i64, @intCast(self.cfg.interval_ns));
+            const pace = self.last_send_ns +| nsI64(self.cfg.interval_ns);
             if (pace > t) t = pace;
             wait = t - now;
-        }
+        };
         if (self.timeout_q.peek()) |ev| {
             const t = ev.time - now;
             if (wait == null or t < wait.?) wait = t;
@@ -896,6 +1022,8 @@ pub const Pinger = struct {
 
         const seq = self.seqmap.add(ev.target, ev.probe, now) catch
             return error.SequenceSpaceExhausted;
+        // sweep D4: an error below must not leave the entry occupied.
+        errdefer self.seqmap.release(seq);
 
         if (self.cfg.icmp_timestamp) {
             // `init` sizes `pkt_len` to exactly `timestamp_msg_len` on this
@@ -914,11 +1042,11 @@ pub const Pinger = struct {
                 return error.SendBufferTooSmall;
         }
 
-        t.attempts +%= 1;
+        t.attempts +|= 1;
         self.last_send_ns = now;
         if (self.cfg.subnet_gap_ns > 0)
             try self.subnet_last.put(self.gpa, t.addr.subnetKey(), now);
-        t.stats.sent += 1;
+        t.stats.sent +|= 1; // sweep IC-5: saturate (loop mode runs forever)
 
         const more = switch (self.cfg.mode) {
             .count => ev.probe + 1 < self.cfg.count,
@@ -926,8 +1054,8 @@ pub const Pinger = struct {
             .alive => false,
         };
         if (more) {
-            try self.ping_q.push(self.gpa, .{
-                .time = ev.time + @as(i64, @intCast(self.cfg.perhost_interval_ns)),
+            self.pushPing(.{
+                .time = ev.time +| nsI64(self.cfg.perhost_interval_ns),
                 .target = ev.target,
                 .probe = ev.probe +% 1,
             });
@@ -941,7 +1069,7 @@ pub const Pinger = struct {
         t.pending += 1;
         self.inflight += 1;
         try self.timeout_q.push(self.gpa, .{
-            .time = now + @as(i64, @intCast(t.timeout_ns)),
+            .time = now +| nsI64(t.timeout_ns),
             .target = ev.target,
             .probe = ev.probe,
             .seq = seq,
@@ -950,11 +1078,11 @@ pub const Pinger = struct {
 
     /// Bookkeeping for a probe the kernel rejected.
     fn failProbe(self: *Pinger, ev: Event, seq: u16, err: Socket.SendError) void {
-        const t = &self.targets.items[ev.target];
         self.seqmap.release(seq);
-        t.stats.send_errors += 1;
+        self.targets.items[ev.target].stats.send_errors +|= 1;
         self.emit(ev.target, ev.probe, .{ .send_error = err });
-        self.checkDone(t);
+        // sweep IC-4: a callback may `addTarget` (reallocating `targets`).
+        self.checkDone(&self.targets.items[ev.target]);
     }
 
     fn handleTimeout(self: *Pinger, ev: Event, now: i64) RunError!void {
@@ -968,10 +1096,12 @@ pub const Pinger = struct {
         // duplicate detection.
         if (entry.answered) return;
 
-        const t = &self.targets.items[ev.target];
-        t.pending -= 1;
-        self.inflight -= 1;
+        const tp = &self.targets.items[ev.target];
+        tp.pending -|= 1; // sweep D4: never below 0
+        self.inflight -|= 1;
         self.emit(ev.target, ev.probe, .timeout);
+        // sweep IC-4: re-fetch, the callback may have grown `targets`.
+        const t = &self.targets.items[ev.target];
 
         // A1 F4: was `t.attempts < 1 + self.cfg.retries`. `1 + retries` is
         // u16 arithmetic that overflows when `retries == 65535`: a panic in
@@ -982,10 +1112,10 @@ pub const Pinger = struct {
         // that does not overflow, and adds no operation that can.
         if (self.cfg.mode == .alive and !t.done and t.attempts <= self.cfg.retries) {
             t.timeout_ns = backoff(t.timeout_ns, self.cfg.backoff_factor);
-            try self.ping_q.push(self.gpa, .{
+            self.pushPing(.{
                 .time = now,
                 .target = ev.target,
-                .probe = ev.probe + 1,
+                .probe = ev.probe +% 1, // sweep IC-7: retries == 65535 reaches probe 65535
             });
         } else {
             self.checkDone(t);
@@ -1008,7 +1138,7 @@ pub const Pinger = struct {
                 if (t.addr.family() != fam) return;
 
                 if (self.cfg.check_source and !sourceMatches(info.src, t.addr)) {
-                    t.stats.source_mismatches += 1;
+                    t.stats.source_mismatches +|= 1;
                     return;
                 }
 
@@ -1027,25 +1157,32 @@ pub const Pinger = struct {
                 };
 
                 if (entry.answered) {
-                    t.stats.duplicates += 1;
+                    t.stats.duplicates +|= 1;
                     self.emit(entry.target, entry.probe, .{ .duplicate = reply_info });
                     return;
                 }
+                // sweep D4: an entry with nothing in flight was never
+                // committed (or belongs to a probe already resolved): not a
+                // reply to anything the counters know of.
+                if (t.pending == 0 or self.inflight == 0) return;
                 entry.answered = true;
 
                 t.pending -= 1;
                 self.inflight -= 1;
 
                 const s = &t.stats;
-                s.recv += 1;
+                s.recv +|= 1;
                 s.last_ns = rtt;
                 s.total_ns += rtt;
                 if (s.min_ns == 0 or rtt < s.min_ns) s.min_ns = rtt;
                 if (rtt > s.max_ns) s.max_ns = rtt;
 
-                self.emit(entry.target, entry.probe, .{ .reply = reply_info });
+                const tid = entry.target;
+                self.emit(tid, entry.probe, .{ .reply = reply_info });
 
-                if (self.cfg.mode == .alive) t.done = true else self.checkDone(t);
+                // sweep IC-4: `t` and `entry` may dangle after the callback.
+                const t2 = &self.targets.items[tid];
+                if (self.cfg.mode == .alive) t2.done = true else self.checkDone(t2);
             },
             .icmp_error => |e| {
                 if (e.orig_ident != sock.ident()) return;
@@ -1071,7 +1208,7 @@ pub const Pinger = struct {
                 }
                 // Informational only; the probe is resolved by its timeout
                 // (fping semantics).
-                t.stats.icmp_errors += 1;
+                t.stats.icmp_errors +|= 1;
             },
             .ignored => {},
         }
@@ -1179,7 +1316,7 @@ pub const Pinger = struct {
             const t = &self.targets.items[entry.target];
             if (t.addr.family() != fam) continue;
             if (self.cfg.check_source and !sourceMatches(info.src, t.addr)) continue;
-            t.stats.icmp_errors += 1;
+            t.stats.icmp_errors +|= 1;
         }
     }
 };
@@ -1203,6 +1340,13 @@ fn sourceMatches(src: Socket.RecvInfo.SrcAddr, target: Addr) bool {
             .v4 => false,
         },
     };
+}
+
+/// sweep IC-2: a `Config` duration (u64 ns) as a signed timestamp delta.
+/// `@intCast` of a value above maxInt(i64) is UB; saturate instead (292
+/// years -- "never").
+fn nsI64(ns: u64) i64 {
+    return std.math.cast(i64, ns) orelse std.math.maxInt(i64);
 }
 
 fn backoff(timeout_ns: u64, factor: f32) u64 {
@@ -1416,6 +1560,23 @@ test "A1 F4: retries = 65535 does not overflow the retry-count comparison" {
     try p.handleTimeout(ev, monoNow());
     try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len);
     try std.testing.expect(!p.targets.items[0].done);
+}
+
+test "retries = 65535 ends after the 65536th attempt (sweep D6)" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .alive, .retries = 65535, .interval_ns = 0 });
+    defer p.deinit();
+    _ = try p.addTarget("192.0.2.1");
+    p.sock4 = .{ .os = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 } };
+    const t = &p.targets.items[0];
+    t.attempts = 65535;
+    const now = monoNow();
+    const seq = try p.prepareProbe(.{ .time = now, .target = 0, .probe = 65535 }, now, p.sendSlot(0));
+    t.pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = now, .target = 0, .probe = 65535, .seq = seq }, now);
+    // Unfixed: `attempts` wrapped to 0 and another retry was scheduled.
+    try std.testing.expectEqual(@as(usize, 0), p.ping_q.items.len);
+    try std.testing.expect(p.targets.items[0].done);
 }
 
 test "A1 F4: backoff() never produces UB for non-finite, negative, or overflowing factors" {

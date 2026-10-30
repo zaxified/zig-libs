@@ -85,4 +85,5 @@ pub const monoNow = pinger.monoNow;
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("sweep_test.zig");
 }
