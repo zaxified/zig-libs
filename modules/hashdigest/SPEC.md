@@ -126,6 +126,7 @@ run their AVX2/BMI2 SHA-2 assembly against std's portable code. Worst row 1.40×
 - (survey 2026-09-30) **`sha256sum`-style checksum-file parse/verify** (`<hex>  <name>` lines, BSD `SHA256 (f) = hex`): every release-verification tool needs it; ~150 lines, pure Zig, fits CONVENTIONS section 2.
 - ~~(survey 2026-09-30) **`std.Io.Writer` adapter**~~ — not needed: Zig 0.16's `std.Io.Writer.Hashed` (pass-through) and `Hashing` (sink) already give the `io.Copy(h, r)` idiom over any `std.crypto` hasher (checked in `lib/std/Io/Writer.zig`).
 - (survey 2026-09-30) **XOF/keyed modes** (SHAKE, BLAKE3 keyed/derive): only if a consumer asks; `std` has the engines; small, fits.
+- (no-panic sweep GS, 2026-10-30, HD-3) **Bounded file hashing**: `sha256File`/`hashFile` read to EOF with no size or time limit, so a path that never ends (`/dev/zero`, a FIFO with an open writer) blocks forever; this is documented on both functions, not enforced. A `max_bytes` option (error or `null` past it) would close it; it is a new option/signature, so it waits for a consumer that hashes untrusted paths (axp-core hashes paths it chose itself).
 
 ## Status
 `extract · any · util · reentrant` · deps: none (`std.crypto` only) — canonical source is `pub

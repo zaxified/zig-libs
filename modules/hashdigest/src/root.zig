@@ -58,7 +58,8 @@ pub fn sha256HexBuf(data: []const u8) [hex_len]u8 {
 }
 
 /// True iff the lowercase-hex SHA-256 of `data` equals `announced`. A
-/// content-address check (verify bytes against an announced digest).
+/// content-address check (verify bytes against an announced digest). NOT
+/// constant-time: do not use it to compare MACs or other secrets.
 pub fn matches(data: []const u8, announced: []const u8) bool {
     if (announced.len != hex_len) return false;
     var hx: [hex_len]u8 = undefined;
@@ -81,10 +82,14 @@ pub const Hasher = struct {
         self.inner.update(bytes);
     }
 
-    /// Finalize into `out` (consumes the hasher's state).
+    /// Finalize into `out`: the digest of everything fed so far. Finalizes a
+    /// COPY of the state, so the hasher stays usable: `update` may continue and
+    /// `finalHex` may be called again.
     pub fn finalHex(self: *Hasher, out: *[hex_len]u8) void {
         var raw: [Sha256.digest_length]u8 = undefined;
-        self.inner.final(&raw);
+        var copy = self.inner;
+        copy.final(&raw);
+        std.crypto.secureZero(u8, std.mem.asBytes(&copy));
         out.* = std.fmt.bytesToHex(raw, .lower);
     }
 };
@@ -94,6 +99,12 @@ pub const Hasher = struct {
 /// Hash the file at `path` by streaming to EOF; write lowercase hex into `out`,
 /// return the byte count, or `null` on open/read error. Correct on size-0 virtual
 /// files (reads until EOF, does not trust `stat().size`).
+///
+/// Memory is constant (two 64 KiB stack buffers), but the TIME is the file's:
+/// a path that never reaches EOF (`/dev/zero`, a FIFO whose writer stays open)
+/// blocks forever, and there is no size or time limit. Call it only on paths
+/// you trust to be regular files or finite virtual files. The stack use is
+/// about 128 KiB (two 64 KiB buffers).
 pub fn sha256File(io: std.Io, path: []const u8, out: *[hex_len]u8) ?u64 {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer file.close(io);
@@ -206,6 +217,7 @@ pub fn hexAlloc(gpa: std.mem.Allocator, algo: Algorithm, data: []const u8) std.m
 
 /// True iff the lowercase-hex digest of `data` under `algo` equals `announced`.
 /// Generalizes `matches` (which is fixed to SHA-256). Never panics on bad input.
+/// NOT constant-time: do not use it to compare MACs or other secrets.
 pub fn matchesAlgo(algo: Algorithm, data: []const u8, announced: []const u8) bool {
     if (announced.len != hexLength(algo)) return false;
     var buf: [max_hex_len]u8 = undefined;
@@ -252,7 +264,10 @@ pub const MultiHasher = struct {
 
     /// Finalize to lowercase hex in `out` (>= `hexLength(algorithm())` bytes;
     /// a `max_hex_len` buffer always fits). Returns the written subslice, or
-    /// `error.ShortBuffer` — never panics. Consumes the hasher's state.
+    /// `error.ShortBuffer` — never panics. Finalizes a COPY of the state (the
+    /// digest of everything fed so far), so the hasher stays usable: `update`
+    /// may continue and `finalHex` may be called again. (Finalizing in place
+    /// would make SHA-3 panic on a later `update`.)
     pub fn finalHex(self: *MultiHasher, out: []u8) error{ShortBuffer}![]u8 {
         switch (self.state) {
             inline else => |*st, tag| {
@@ -260,7 +275,9 @@ pub const MultiHasher = struct {
                 const hl = T.digest_length * 2;
                 if (out.len < hl) return error.ShortBuffer;
                 var raw: [T.digest_length]u8 = undefined;
-                st.final(&raw);
+                var copy = st.*;
+                copy.final(&raw);
+                std.crypto.secureZero(u8, std.mem.asBytes(&copy));
                 const hx = std.fmt.bytesToHex(raw, .lower);
                 @memcpy(out[0..hl], &hx);
                 return out[0..hl];
@@ -280,7 +297,8 @@ pub const MultiHasher = struct {
 /// Hash the file at `path` under `algo` by streaming to EOF (same size-0
 /// virtual-file semantics as `sha256File`). Writes lowercase hex into `out`
 /// (>= `hexLength(algo)` bytes, checked — `error.ShortBuffer`, never panics).
-/// Returns the byte count, or `null` on open/read error.
+/// Returns the byte count, or `null` on open/read error. Like `sha256File`, it
+/// has no size or time limit: a path that never reaches EOF blocks forever.
 pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{ShortBuffer}!?u64 {
     if (out.len < hexLength(algo)) return error.ShortBuffer;
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
@@ -301,6 +319,10 @@ pub fn hashFile(algo: Algorithm, io: std.Io, path: []const u8, out: []u8) error{
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+test {
+    _ = @import("sweep_test.zig");
+}
 
 const empty_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const abc_hex = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
