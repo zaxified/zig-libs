@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (11/12 killed; the explicit identity reject in `ecdsaVerifyDigest` is equivalent — `mulDoubleBasePublic` rejects an identity Q first). New test: incremental `Signer.finalize` equals `sign` and verifies (r/s order).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GP). `EcdsaP256Sha256.Signature` is p256's own struct (was an alias of std's `Ecdsa(...).Signature`) with the same fields and method names: std's `toDer` indexes an empty slice for r = 0 or s = 0, which its own `fromDer`/`fromBytes` accept, so attacker bytes that parsed crashed a re-encode; p256's `toDer` is total. Parsing and verification are unchanged. `Signature.fromStd`/`toStd` and `StdSignature` convert; `sign`/`signer` return the p256 type. `ecdsaVerify`/`ecdsaVerifyDigest` reject an identity public key explicitly (it was already rejected inside the group op). Docs: `derToRaw` is strict (rejects zero and non-minimal INTEGERs), `Signature.fromDer` is std's lenient parser; `Fe`/point limbs are an implementation detail. Tests: `src/sweep_test.zig`.
 - **2026-10-21** — **Added:** `Ecdsa(Hash).signWithSecretKey(out, secret_key, msg, noise)`: a
   signature from the secret scalar alone, byte-identical to `KeyPair.sign`'s (tested over

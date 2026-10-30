@@ -124,3 +124,15 @@ test "derToRaw is strict where Signature.fromDer is lenient (sweep REV-P2-2)" {
     // std's parser is lenient (documented on fromDer).
     _ = try E.Signature.fromDer(&padded);
 }
+
+test "incremental Signer.finalize equals sign and verifies (sweep audit GP-P2a)" {
+    const E = sign.EcdsaP256Sha256;
+    const kp = try E.KeyPair.generateDeterministic(@as([32]u8, @splat(7)));
+    var sg = try kp.signer(null);
+    sg.update("hello ");
+    sg.update("world");
+    const sig = try sg.finalize();
+    const want = try kp.sign("hello world", null);
+    try std.testing.expectEqualSlices(u8, &want.toBytes(), &sig.toBytes());
+    try sig.verify("hello world", kp.public_key);
+}
