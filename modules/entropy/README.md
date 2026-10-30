@@ -73,12 +73,11 @@ The price is that `io` must implement `swapCancelProtection`: every real
 Repo-wide this is a rule, not a suggestion: see `CONVENTIONS.md` §2.2, which
 also names the deliberate exceptions.
 
-There is **no** error-returning twin here, on purpose. One carrying the full
-`std.Io.RandomSecureError` is `io.randomSecure` with a different name and an
-extra import; one narrowed to `error{EntropyUnavailable}` would be truthful
-(cancellation is blocked inside `fill`) but would impose this module's
-cancellation policy on a caller who has an error channel and can decide for
-itself.
+`entropy.tryFill(io, buf) error{EntropyUnavailable}!void` is the twin for callers
+that do have an error channel: same source and fast path, cancellation blocked as
+in `fill` (so it never returns `error.Canceled`), an unavailable source is an
+error instead of an abort. A `SecureSource` must outlive the `std.Random` its
+`interface()` returned.
 
 ## Notes
 

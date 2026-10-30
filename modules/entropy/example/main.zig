@@ -5,10 +5,9 @@
 //! check the properties the module actually documents — NOT specific byte
 //! values, since every byte comes straight from the OS RNG.
 //!
-//! `fill`'s only failure mode is `@panic` (there is no error channel by
-//! design — see the module doc comment on why a `fillOrError` twin was
-//! rejected), so there is no named error to catch on `fill` itself without
-//! crashing this whole example, which would defeat the "exit non-zero on
+//! `fill`'s only failure mode is `@panic` (callers with an error channel use
+//! `tryFill`; see the module doc comment), so there is no named error to
+//! catch on `fill` itself without crashing this whole example, which would defeat the "exit non-zero on
 //! failure, not abort" contract every other example here follows. What CAN
 //! be named is the exact fault `fill` exists to turn into that panic:
 //! `std.Io.failing` is std's own most extreme statement of "no entropy here",
@@ -52,6 +51,16 @@ pub fn main() !void {
         entropy.fill(io, &b);
         must(!std.mem.eql(u8, &a, &b), @src());
         std.debug.print("fill: two 32-byte draws differ\n", .{});
+    }
+
+    // ── tryFill: the same draw for a caller with an error channel ──────────
+    {
+        var a: [32]u8 = undefined;
+        var b: [32]u8 = undefined;
+        try entropy.tryFill(io, &a);
+        try entropy.tryFill(io, &b);
+        must(!std.mem.eql(u8, &a, &b), @src());
+        std.debug.print("tryFill: two 32-byte draws differ\n", .{});
     }
 
     // ── property 2: the WHOLE buffer is written, not a prefix/suffix ───────

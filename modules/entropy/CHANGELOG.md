@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GU). New `tryFill(io, buf) error{EntropyUnavailable}!void` with the same fast path as `fill`, for callers with an error channel; `fill` keeps its fail-closed abort (now `tryFill` + the same panic message). Docs: a `SecureSource` must outlive the `Random` it returns.
 - **2026-10-18** — Ported to Zig 0.17.0. `std.elf.AT.SYSINFO_EHDR`, `elf.ElfN.Phdr` (fields `type/offset/vaddr`, `elf.PT` enum); `wait4` status is `i32` (tests only).
 - **2026-10-17** — vDSO lookup reads the symbol count from DT_GNU_HASH when DT_HASH is absent: the arm64 vDSO of the GitHub runner carries only DT_GNU_HASH (the diagnostic from the previous entry showed it), so `__kernel_getrandom` was never found and every draw fell back to the syscall. Same gap in std's `os/linux/vdso.zig`. New test cross-checks the GNU count against DT_HASH where a vDSO has both.
 

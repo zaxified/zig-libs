@@ -64,8 +64,8 @@
 //! from a pid and a clock is not recoverable at all, and nothing downstream
 //! will ever notice.
 //!
-//! **So: if your signature can return an error, do not use this module.**
-//! Call `try io.randomSecure(buf)` directly and let the caller decide. `fill`
+//! **So: if your signature can return an error, use `tryFill`** (or call
+//! `try io.randomSecure(buf)` directly) and let the caller decide. `fill`
 //! exists for the call sites that genuinely have no error channel —
 //! `std.Random` adapters, constructors, `keyGen`-shaped APIs that return a
 //! value. It is the floor, not the recommendation.
@@ -129,17 +129,20 @@
 //! backend does changes: `std.Io.Threaded`, `Evented`, `Uring` and `Dispatch`
 //! all implement the slot themselves.
 //!
-//! ## Why there is no `fillOrError`
+//! ## `fill` and `tryFill`
 //!
-//! A `try`-shaped twin was considered and rejected. The honest signature — one
-//! returning the full `std.Io.RandomSecureError` — is `io.randomSecure` with a
-//! different name and an extra import. A narrowed
-//! `fillOrError(io, buf) error{EntropyUnavailable}!void` would now be
-//! *truthful* (cancellation is blocked, so `error.Canceled` cannot come out),
-//! but it would be imposing this module's cancellation policy on a caller who
-//! by construction has an error channel and can make that choice itself.
-//! Callers that can return an error already have the right function and it is
-//! in std. Nothing here improves on it.
+//! Two entry points, one source. `fill` is the fail-closed abort for call
+//! sites with no error channel. `tryFill(io, buf) error{EntropyUnavailable}!void`
+//! is for callers that have one: the same fast path and the same cancellation
+//! block (so, unlike `io.randomSecure`, it cannot return `error.Canceled`),
+//! but an unavailable source is an error the caller handles. `fill` is
+//! `tryFill(...) catch @panic(unavailable_message)`.
+//!
+//! ## Lifetime of `SecureSource`
+//!
+//! `SecureSource.interface` stores a pointer to the `SecureSource` in the
+//! returned `std.Random`; the source must outlive every use of that `Random`.
+//! Do not return the `Random` from a function whose `SecureSource` is a local.
 
 const std = @import("std");
 const vgetrandom = @import("vgetrandom.zig");
@@ -225,11 +228,10 @@ pub const unsupported_io_message =
 /// Fail-closed entropy for secret-bearing material. Fills `buf` from
 /// `std.Io.randomSecure`, or aborts the process.
 ///
-/// Use this **only** where the signature cannot return an error. Anywhere that
-/// can, `try io.randomSecure(buf)` is better in every way: same source, and the
-/// caller gets to decide what an entropy failure means for them. See this
-/// module's doc comment for why there is deliberately no error-returning twin
-/// here.
+/// `fill` is the fail-closed abort for call sites with no error channel.
+/// Where the signature can return an error, use `tryFill` (or
+/// `try io.randomSecure(buf)`): same source, and the caller decides what an
+/// entropy failure means for them. See this module's doc comment.
 ///
 /// Never call this for anything that is not a secret. Jitter, a retry delay, a
 /// load-balancing tiebreak, a test fixture, a hash-table seed: those are what
@@ -254,6 +256,20 @@ pub const unsupported_io_message =
 /// with `unsupported_io_message`. See the module doc comment for both halves of
 /// that trade.
 pub fn fill(io: std.Io, buf: []u8) void {
+    tryFill(io, buf) catch @panic(unavailable_message);
+}
+
+/// `fill` for a caller that has an error channel: the same source, the same
+/// vDSO fast path and the same cancellation block, but entropy being
+/// unavailable is `error.EntropyUnavailable` instead of an abort. On that error
+/// `buf` holds no usable randomness (it may be partly written): do not use it.
+/// Cancellation is blocked across the draw exactly as in `fill`, so
+/// `error.Canceled` never comes out; an `Io` that violates that contract, or
+/// that cannot swap cancel protection at all (`std.Io.failing`), is still the
+/// checked abort `fill` documents (`canceled_contract_violation_message`,
+/// `unsupported_io_message`): those are bugs in the `Io`, not an entropy
+/// condition a caller can handle.
+pub fn tryFill(io: std.Io, buf: []u8) error{EntropyUnavailable}!void {
     // A half-drawn secret is not a thing we can hand back, and `fill` has no
     // error channel to report a cancellation on. Blocking cancellation for the
     // length of one draw is what std does at the same site
@@ -280,7 +296,7 @@ pub fn fill(io: std.Io, buf: []u8) void {
     defer _ = io.swapCancelProtection(prev);
 
     io.randomSecure(buf) catch |err| switch (err) {
-        error.EntropyUnavailable => @panic(unavailable_message),
+        error.EntropyUnavailable => return error.EntropyUnavailable,
         // A real `@panic`, not `unreachable` (F3, 2026-09-10): the two lines
         // above make this not expected to fire against a conforming `Io`, but
         // "not expected" is not "cannot happen", and `unreachable` is a
@@ -358,6 +374,9 @@ pub fn fill(io: std.Io, buf: []u8) void {
 /// so this is a documentation requirement, not an outstanding defect. A
 /// thirteenth consumer that follows the paragraph above without adding the
 /// guard has widened a `std.Random`-shaped hole into a secret-key path.
+///
+/// Lifetime: `interface` stores a pointer to this struct (const-cast) in the
+/// returned `std.Random`, so the `SecureSource` must outlive that `Random`.
 ///
 /// Not a general-purpose `std.Random`: every draw is a syscall, including the
 /// single bytes `std.Random.int`/`uintLessThan` take. That is correct for key
@@ -1127,4 +1146,44 @@ test "fill under std's Threaded Io takes the vDSO path where the kernel offers i
     var buf: [64]u8 = @splat(0);
     fill(io, &buf);
     try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
+}
+
+test "tryFill fills the whole buffer from a normal Io (sweep REV-entropy-1)" {
+    var a: [64]u8 = @splat(0);
+    var b: [64]u8 = @splat(0);
+    try tryFill(testing.io, &a);
+    try tryFill(testing.io, &b);
+    try testing.expect(!std.mem.eql(u8, &a, &b));
+    // Every 16-byte window of the buffer was written (2^-128 chance otherwise).
+    var w: usize = 0;
+    while (w + 16 <= a.len) : (w += 16) {
+        try testing.expect(!std.mem.allEqual(u8, a[w..][0..16], 0));
+    }
+    var none: [0]u8 = undefined;
+    try tryFill(testing.io, &none);
+}
+
+const UnavailableIo = struct {
+    inner: std.Io,
+    vtable: std.Io.VTable = undefined,
+    calls: usize = 0,
+
+    fn io(self: *UnavailableIo) std.Io {
+        self.vtable = self.inner.vtable.*;
+        self.vtable.randomSecure = onRandomSecure;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn onRandomSecure(userdata: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+        const self: *UnavailableIo = @ptrCast(@alignCast(userdata.?));
+        self.calls += 1;
+        return error.EntropyUnavailable;
+    }
+};
+
+test "tryFill returns EntropyUnavailable instead of aborting (sweep REV-entropy-1)" {
+    var u: UnavailableIo = .{ .inner = testing.io };
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.EntropyUnavailable, tryFill(u.io(), &buf));
+    try testing.expectEqual(@as(usize, 1), u.calls);
 }
