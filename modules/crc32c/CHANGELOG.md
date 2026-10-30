@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GP) found nothing; `src/sweep_test.zig` pins the edge cases the sweep argued (`combine` with length 0 and the largest length; every backend on empty and 1-byte input at any alignment).
 - **2026-10-20** — **Changed (performance):** on x86-64 with LLVM the three-stream SSE4.2 loop is one inline-asm block behind `.p2align 5` (end-of-block bases, negative index, `add`+`jnz`), so Intel's JCC-erratum microcode no longer turns it into a code-layout lottery: bench-crc32c 0.45–1.38× → 0.38–0.98× Go `hash/crc32`. Same results (every-length test against std and the table path, `CRC32C_FUZZ=20000` ReleaseSafe clean); the self-hosted backend keeps the plain loop.
 
 - **2026-10-19** — **NO CONSUMER-VISIBLE CHANGE:** the ARMv8 run-time detection reads `std.elf.AT.HWCAP` (Zig 0.17 made `std.elf.AT` a per-OS namespace; `AT_HWCAP` is gone). Cross-built and run for aarch64-linux-musl under qemu.

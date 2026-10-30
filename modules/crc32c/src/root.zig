@@ -650,4 +650,5 @@ test "the shift tables are the zero-byte operator they claim to be" {
 
 test {
     _ = @import("count.zig");
+    _ = @import("sweep_test.zig");
 }
