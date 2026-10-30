@@ -166,12 +166,16 @@ pub const EvictReason = enum {
 /// moment of removal (see the dirty-set / write-behind seam on `Cache`) so
 /// the hook doubles as a last-chance flush point before the memory goes
 /// away. `ctx` is `Options.on_evict_ctx` verbatim. Called synchronously from
-/// inside `get`/`put`/`clear` — keep it cheap (or hand off) and do not call
-/// back into this `Cache` from it (reentrant mutation mid-removal, e.g.
-/// during `clear`'s iteration, is unsupported).
+/// inside `get`/`put`/`clear` — keep it cheap (or hand off). Calling back into
+/// this `Cache` from it: read-only calls (`get` hit/miss, `isDirty`,
+/// `markClean`) are fine; any call that adds or removes an entry (`put`,
+/// `reserve`, `remove`, `clear`, the first `pin` of an entry, the last
+/// `release`, `discard`, or a `get` that drops a stale entry) panics with
+/// "ramcache: mutating call from inside an on_evict/DirtyFn callback".
 pub const OnEvictFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void;
 
-/// `drainDirty` sweep callback — see `Cache.drainDirty`.
+/// `drainDirty` sweep callback — see `Cache.drainDirty`. The same re-entrancy
+/// rule as `OnEvictFn` applies.
 pub const DirtyFn = *const fn (ctx: ?*anyopaque, key: []const u8, value: []const u8) void;
 
 /// Tunables, fixed at `init`.
@@ -179,8 +183,28 @@ pub const Options = struct {
     /// Cap on the sum of stored value bytes. An item larger than this is
     /// never stored at all.
     max_bytes: usize,
-    /// Cap on the number of entries.
+    /// Cap on the number of entries. ⚠ The frequency sketch is allocated and
+    /// zeroed on first access: about 24 bytes x `ceilPowerOfTwo(max_entries)`
+    /// (2^31 entries = 48 GiB). Size this for the memory you mean to spend.
     max_entries: usize,
+    /// Longest key (bytes) the cache will store. A longer key is refused like
+    /// an oversized value: `put`/`putKey`/`putDefault` are no-ops, `reserve`
+    /// returns null, `getOrLoad` loads but does not store (lookups of such a
+    /// key simply miss). Keys are copied into the cache but are not part of
+    /// `max_bytes`, so without this cap a client choosing key lengths could
+    /// make the footprint unbounded; with it the memory bound is
+    /// `max_entries * max_key_len + max_bytes` plus the per-entry node
+    /// overhead (~150 bytes). Raise it for legitimately long keys, e.g. URLs.
+    max_key_len: usize = 4096,
+    /// Cap on the value bytes held by borrows: entries with a live `pin` /
+    /// `reserve`, including *parked* ones (overwritten, removed or cleared while
+    /// borrowed). Those sit outside `max_bytes` eviction, so without a cap a
+    /// caller holding borrows while the key is overwritten keeps every old copy
+    /// alive. `pin` returns null (use the copying path) and `reserve` returns
+    /// null when the borrow would push the total past the cap. `null` (the
+    /// default) = `max_bytes`; raise it if more than `max_bytes` must be
+    /// borrowable at once.
+    max_pinned_bytes: ?usize = null,
     /// TTL applied by `putDefault`. `<= 0` = never expire by time.
     default_ttl_ns: i64 = 0,
     /// Optional write-behind hook; see `OnEvictFn`. Null (default) = no-op —
@@ -211,6 +235,10 @@ pub const Options = struct {
     /// per-instance seed (see `Sharded.seed`); a standalone `Cache` keeps this
     /// fixed default, so its behaviour is reproducible run to run. Until
     /// 2026-10-25 the map hashed with std's unseeded `hashString`.
+    /// ⚠ The default is a public constant: a standalone `Cache` whose keys a
+    /// remote party chooses should be given a random per-process seed here, or
+    /// that party can precompute keys that share a map slot (up to `max_entries`
+    /// of them, so lookups degrade to a linear probe). `Sharded` does this itself.
     hash_seed: u64 = 0x2545F4914F6CDD1D,
 };
 
@@ -226,9 +254,10 @@ pub const Loader = struct {
     /// Produce the value for `key` into a `gpa`-owned slice (the allocator
     /// `getOrLoad` was given; the cache or the caller frees it). `Sharded`
     /// calls it at most once per key at a time and WITHOUT holding the shard
-    /// lock, but a loader must not re-enter `getOrLoad` for the same key from
-    /// the same thread: it would wait for itself, forever. (Like `on_evict`'s
-    /// "must not suspend": a documented contract, not a detected error.)
+    /// lock. A loader that re-enters `Sharded.getOrLoad` for its own key on the
+    /// same thread is detected and gets `error.LoadFailed` (it would otherwise
+    /// wait for itself). A cycle across threads (loader A waits on key B whose
+    /// loader waits on key A) is NOT detected: a documented contract.
     load: *const fn (ctx: ?*anyopaque, gpa: std.mem.Allocator, key: []const u8) LoadError![]u8,
 };
 
@@ -265,12 +294,15 @@ const FrequencySketch = struct {
         // per-counter collision noise stays ~1, so a cold key cannot
         // impersonate a hot one even in a tiny cache. 2 bytes per column.
         const base = try std.math.ceilPowerOfTwo(usize, @max(capacity, 16));
-        const width = base * 8;
-        const words = depth * width / 16;
+        // Checked: a `max_entries` near the top of `usize` (the "unlimited"
+        // idiom) must degrade to the plain-LRU fallback like any other sketch
+        // that cannot be allocated, not wrap in `base * 8` (sweep RC-1).
+        const width = std.math.mul(usize, base, 8) catch return error.OutOfMemory;
+        const words = (std.math.mul(usize, depth, width) catch return error.OutOfMemory) / 16;
         const counters = try alloc.alignedAlloc(u64, .@"64", words);
         errdefer alloc.free(counters);
         @memset(counters, 0);
-        const dk_bits = width * 8; // 8 doorkeeper bits per counter column
+        const dk_bits = std.math.mul(usize, width, 8) catch return error.OutOfMemory; // 8 doorkeeper bits per counter column
         const doorkeeper = try alloc.alloc(u64, dk_bits / 64);
         @memset(doorkeeper, 0);
         return .{
@@ -582,6 +614,9 @@ pub const Cache = struct {
     /// Entries with `node.pins > 0`, live-in-map plus doomed. Mirrored into
     /// `Stats.pinned`; also the reservation target for `doomed`'s capacity.
     pinned_entries: usize = 0,
+    /// Value bytes of every entry with `pins > 0`, live or doomed (added on the
+    /// 0 -> 1 pin / at `reserve`, subtracted on the last release / `discard`).
+    pinned_bytes: usize = 0,
     /// Instrumentation: entries examined by `regionLruKey` + `findExpiredKey`,
     /// the two functions that used to walk the whole map on every insert.
     /// After this fix each call examines exactly one, so the count per `put`
@@ -589,6 +624,10 @@ pub const Cache = struct {
     /// with capacity. That is the acceptance criterion the audit set, and the
     /// regression test reads this counter rather than a clock.
     maintenance_visits: u64 = 0,
+    /// Instrumentation: entries `removeMatching` examined (queue nodes in pass
+    /// 1, the map's slot count per scan in pass 2). Linear in the cache size per call; the sweep
+    /// RC-6 regression test reads this counter rather than a clock.
+    match_visits: u64 = 0,
     /// Entries removed from `map` since its last rebuild. ⛔ std's open-addressing
     /// map leaves a TOMBSTONE per removal and hands the slot back to `available`
     /// (`removeByIndex`: `available += 1`), so a remove-then-insert workload --
@@ -616,6 +655,16 @@ pub const Cache = struct {
     /// Instrumentation: completed climber samples. Tests read it to prove a
     /// run reached the climber at all.
     climbs: u64 = 0,
+    /// True while a caller callback (`on_evict`, a `drainDirty` `DirtyFn`) is
+    /// running. The structural entry points (`put`, `reserve`, `clear`, `remove`,
+    /// the first `pin`, the last `release`, `discard`, lazy drops) panic when they
+    /// see it, instead of mutating the maps the interrupted operation is walking
+    /// (sweep RC-3). Read only on those slow paths, never on a `get` hit.
+    in_hook: bool = false,
+
+    fn pinCap(self: *const Cache) usize {
+        return self.options.max_pinned_bytes orelse self.options.max_bytes;
+    }
 
     /// ~1% of `max_entries` (min 1) — the fixed admission window.
     fn baseWindow(max_entries: usize) usize {
@@ -677,7 +726,9 @@ pub const Cache = struct {
             self.stats.expired += 1;
             self.stats.misses += 1;
             self.noteOutcome(false);
-            _ = self.dropKey(k);
+            // Inside a callback the stale entry stays (a normal call drops it
+            // later): dropping would be a structural mutation (sweep REV-RC-2).
+            if (!self.in_hook) _ = self.dropKey(k);
             return null;
         }
         self.noteAccess(k.hash);
@@ -716,6 +767,8 @@ pub const Cache = struct {
     /// `put` for a key already hashed (`keyFor`).
     pub fn putKey(self: *Cache, k: Key, value: []const u8, now_ns: i64, ttl_ns: i64, gen: u64) void {
         const key = k.bytes;
+        self.noHook();
+        if (key.len > self.options.max_key_len) return; // sweep RC-4: keys are not in max_bytes
         self.noteAccess(k.hash);
         if (self.entryOf(k)) |e| replace: {
             if (value.len > self.options.max_bytes) {
@@ -869,10 +922,20 @@ pub const Cache = struct {
     /// cumulative hit/miss/eviction counters, and the frequency sketch (the
     /// popularity history stays useful across a flush).
     pub fn clear(self: *Cache) void {
+        self.noHook();
+        // Every hook runs BEFORE the first node is freed, so a hook that
+        // reads the cache (`get` hit, `isDirty`, ...) never walks the map into a
+        // freed node (sweep RC-3). Skipped entirely without a hook.
+        if (self.options.on_evict != null) {
+            var hit = self.map.keyIterator();
+            while (hit.next()) |np| {
+                const n = np.*;
+                self.fireOnEvict(n, n.key, n.entry.value, n.entry.dirty, .cleared);
+            }
+        }
         var it = self.map.keyIterator();
         while (it.next()) |np| {
             const n = np.*;
-            self.fireOnEvict(n, n.key, n.entry.value, n.entry.dirty, .cleared);
             if (n.pins > 0) {
                 // Borrowed: unlink it like every other entry (a `clear` must
                 // really leave nothing findable — that is what pagecache's
@@ -929,18 +992,39 @@ pub const Cache = struct {
     /// to decouple RAM from; this walks the resident set instead, which is
     /// bounded by `max_pages` by construction.
     ///
-    /// Allocation-free, and therefore infallible: removing invalidates the
-    /// map iterator, so one scan collects up to `remove_batch` matches into a
-    /// stack buffer, then removes them, and scans again only while a scan
-    /// filled the buffer. Until 2026-10-23 it re-scanned after EVERY removal:
-    /// quadratic in the matches, ~10^10 steps for one file close over a
-    /// 1 GiB fully resident `pagecache`; now `ceil(matches / remove_batch)`
-    /// scans.
+    /// Cost: O(resident entries) per call, whatever the number of matches (it
+    /// walks every entry once); do not call it per request with a
+    /// client-chosen prefix on a large cache.
+    ///
+    /// Allocation-free, and therefore infallible, and linear: one walk of the
+    /// region queues removes every unborrowed match; borrowed entries (in no
+    /// queue) need one map scan batched through a stack buffer, run only when
+    /// something is borrowed or an `on_evict` hook is set. Until 2026-10-23 it
+    /// re-scanned the map after EVERY removal (~10^10 steps for one file close
+    /// over a 1 GiB resident `pagecache`), until 2026-10-30 after every 512.
     pub fn removeMatching(self: *Cache, prefix: []const u8) usize {
         var removed: usize = 0;
+        // Pass 1: the three region queues hold every unborrowed resident node,
+        // and unlinking one does not disturb the walk (`next` is read first;
+        // `dropKey` frees only `n`). One O(n) pass (sweep RC-6).
+        for (0..3) |r| {
+            var cur = self.lru[r].head;
+            while (cur) |n| {
+                cur = n.next;
+                self.match_visits += 1;
+                if (n.key.len < prefix.len or !std.mem.eql(u8, n.key[0..prefix.len], prefix)) continue;
+                if (self.dropKey(keyOf(n))) removed += 1;
+            }
+        }
+        // Pass 2: borrowed (and unfilled) nodes are in no queue, and an
+        // `on_evict` hook may have reordered the queues under pass 1 (a `get`
+        // hit moves its node). Only then is the map scanned, batch by batch:
+        // removing invalidates the map iterator.
+        if (self.pinned_entries == self.doomed.items.len and self.options.on_evict == null) return removed;
         var batch: [remove_batch]Key = undefined;
         while (true) {
             var n: usize = 0;
+            self.match_visits += self.map.capacity(); // a scan walks every slot
             var it = self.map.keyIterator();
             while (it.next()) |np| {
                 const k = np.*.key;
@@ -1023,7 +1107,9 @@ pub const Cache = struct {
             self.stats.expired += 1;
             self.stats.misses += 1;
             self.noteOutcome(false);
-            _ = self.dropKey(k);
+            // Inside a callback the stale entry stays (a normal call drops it
+            // later): dropping would be a structural mutation (sweep REV-RC-2).
+            if (!self.in_hook) _ = self.dropKey(k);
             return null;
         }
         const value = e.value;
@@ -1067,8 +1153,11 @@ pub const Cache = struct {
     /// and has no way to learn that its previous value went with the refusal.
     pub fn reserve(self: *Cache, key: []const u8, len: usize, now_ns: i64, ttl_ns: i64, gen: u64) ?Fill {
         const k = self.keyFor(key);
+        self.noHook();
+        if (key.len > self.options.max_key_len) return null; // sweep RC-4
         self.noteAccess(k.hash);
         if (len > self.options.max_bytes) return null;
+        if (self.pinned_bytes +| len > self.pinCap()) return null; // sweep REV-RC-3
         // Every fallible step runs FIRST, before anything is mutated: the
         // parking slot, the map slot, and the three allocations. That is what
         // makes the promise above true, and it is also what makes the
@@ -1107,6 +1196,7 @@ pub const Cache = struct {
         // `pins == 1`, and a pinned node is out of the index (see `Node.pins`).
         // `release` files it in the moment the borrow ends.
         self.pinned_entries += 1;
+        self.pinned_bytes += len;
         self.window_count += 1;
         self.bytes += len;
         self.maintain(now_ns); // makes room by evicting *other* entries
@@ -1128,8 +1218,9 @@ pub const Cache = struct {
     /// by construction and is the caller's rule to keep.
     pub fn commit(self: *Cache, f: Fill) Borrow {
         _ = self;
-        std.debug.assert(f.node.pins > 0);
-        std.debug.assert(!f.node.filled); // consumed already, or never a reservation
+        // Checked (not `assert`: a second commit would silently skew the pin
+        // count in a release build -- sweep RC-2).
+        if (f.node.pins == 0 or f.node.filled) @panic("ramcache: commit of a Fill that is not an outstanding reservation");
         f.node.filled = true;
         return .{ .bytes = f.bytes, .node = f.node };
     }
@@ -1142,13 +1233,14 @@ pub const Cache = struct {
     /// catch.
     pub fn discard(self: *Cache, f: Fill) void {
         const n = f.node;
-        std.debug.assert(n.pins > 0);
-        std.debug.assert(!n.filled); // already committed, or already discarded
+        self.noHook();
+        if (n.pins == 0 or n.filled) @panic("ramcache: discard of a Fill that is not an outstanding reservation");
         if (n.doom_idx != Node.not_queued) {
             // Something already unlinked it (a put/remove/clear/TTL drop on
             // the same key between `reserve` and here). It is out of the map
             // already and its bytes are parked, so an ordinary release — which
             // frees them if ours is the last — is exactly right.
+            n.filled = true; // no longer a reservation: `release` refuses unfilled nodes
             self.release(.{ .bytes = f.bytes, .node = n });
             return;
         }
@@ -1168,9 +1260,15 @@ pub const Cache = struct {
             // `n.key`, but the bytes live in the node, which outlives the
             // call, so the slice passed here stays readable throughout.)
             self.doomEntry(keyOf(n), null);
+            n.filled = true;
             self.release(.{ .bytes = f.bytes, .node = n });
             return;
         }
+        // Invariant: a node that is not doomed and has `pins > 0` is in the map
+        // (`dropKeyReason`, `put`, `reserve` and `clear` doom or park every
+        // borrowed node they unlink), and `n.key` is still the map's key
+        // (`parkNode` empties it only for doomed nodes; a legitimate key may
+        // itself be empty).
         const removed = self.map.removeAdapted(keyOf(n), KeyAdapter{});
         std.debug.assert(removed);
         self.removals +|= 1;
@@ -1180,6 +1278,7 @@ pub const Cache = struct {
             .protected => self.protected_count -= 1,
         }
         self.bytes -= n.entry.value.len;
+        self.pinned_bytes -= n.entry.value.len;
         self.alloc.free(n.entry.value);
         self.destroyNode(n);
         self.pinned_entries -= 1;
@@ -1196,9 +1295,23 @@ pub const Cache = struct {
     /// releasing one borrow able to invalidate an unrelated `get` slice.
     pub fn release(self: *Cache, b: Borrow) void {
         const n = b.node;
-        std.debug.assert(n.pins > 0);
+        // A second release of a borrow whose entry is still alive finds
+        // `pins == 0`: ignored (total), instead of wrapping the count (sweep
+        // RC-2). Once the entry has been freed there is nothing left to ask --
+        // that stale copy stays the caller's rule (see `commit`).
+        if (n.pins == 0) return;
+        if (n.pins == 1) {
+            self.noHook();
+            // `pins > 0` yet this cache has no borrowed entry: `b` came from
+            // another `Cache` (or was released twice behind a re-pin).
+            if (self.pinned_entries == 0) @panic("ramcache: release of a Borrow that does not belong to this Cache");
+        }
         n.pins -= 1;
         if (n.pins != 0) return;
+        // A Borrow forged from a `Fill` (`.bytes`/`.node` copied before `commit`)
+        // would serve uninitialized bytes after the entry is re-filed.
+        if (!n.filled) @panic("ramcache: release of a Borrow forged from a Fill");
+        self.pinned_bytes -= if (n.doom_idx != Node.not_queued) n.owned.len else n.entry.value.len;
         self.pinned_entries -= 1;
         if (n.doom_idx != Node.not_queued) {
             self.freeDoomed(n);
@@ -1277,6 +1390,9 @@ pub const Cache = struct {
     /// touch map structure) but must not call `put`/`clear`/`get` — those
     /// can insert, evict, or resize mid-iteration, which is unsupported.
     pub fn drainDirty(self: *Cache, cb: DirtyFn, ctx: ?*anyopaque) void {
+        const prev = self.in_hook;
+        self.in_hook = true;
+        defer self.in_hook = prev;
         var it = self.map.keyIterator();
         while (it.next()) |np| {
             const n = np.*;
@@ -1333,7 +1449,8 @@ pub const Cache = struct {
     /// 80% of the main (non-window) region — the protected SLRU segment.
     fn protectedCap(self: *const Cache) usize {
         const main = self.options.max_entries -| self.windowCap();
-        return main * 4 / 5;
+        // Widened: `main * 4` wraps for `max_entries` near maxInt(usize) (sweep RC-1).
+        return @intCast(@as(u128, main) * 4 / 5);
     }
 
     /// Lazily create the frequency sketch, then record one access of the key
@@ -1358,6 +1475,7 @@ pub const Cache = struct {
     }
 
     fn dropKeyReason(self: *Cache, k: Key, reason: EvictReason) bool {
+        self.noHook();
         if (self.entryOf(k)) |e| {
             if (e.node.pins > 0) {
                 // Borrowed: unlink it (no stale hit can follow) but leave the
@@ -1400,10 +1518,18 @@ pub const Cache = struct {
     fn pinEntry(self: *Cache, e: *Entry) bool {
         const n = e.node;
         if (n.pins == 0) {
+            self.noHook();
+            if (self.pinned_bytes +| e.value.len > self.pinCap()) return false;
             self.doomed.ensureTotalCapacity(self.alloc, self.pinned_entries + 1) catch return false;
             self.lruRemove(e.node.region, n);
             self.expRemove(n);
             self.pinned_entries += 1;
+            self.pinned_bytes += e.value.len;
+        } else if (n.pins == std.math.maxInt(u32)) {
+            // 2^32 - 1 live borrows of one entry (a leaking caller): refuse the
+            // next one like a failed bookkeeping allocation -- the caller
+            // falls back to the copying path (sweep RC-2).
+            return false;
         }
         n.pins += 1;
         return true;
@@ -1473,7 +1599,20 @@ pub const Cache = struct {
     /// there is nothing to write behind — the value never existed.
     fn fireOnEvict(self: *Cache, node: *const Node, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
         if (!node.filled) return;
-        if (self.options.on_evict) |cb| cb(self.options.on_evict_ctx, key, value, dirty, reason);
+        if (self.options.on_evict) |cb| {
+            const prev = self.in_hook;
+            self.in_hook = true;
+            defer self.in_hook = prev;
+            cb(self.options.on_evict_ctx, key, value, dirty, reason);
+        }
+    }
+
+    /// A structural mutation reached from inside a caller callback: the
+    /// interrupted operation holds node pointers / a map iterator that this call
+    /// would free or invalidate (use-after-free in a release build). Documented
+    /// on `OnEvictFn` / `DirtyFn`; checked here so it is a defined panic.
+    inline fn noHook(self: *const Cache) void {
+        if (self.in_hook) @panic("ramcache: mutating call from inside an on_evict/DirtyFn callback");
     }
 
     // ── the region queues ───────────────────────────────────────────────────
@@ -1711,6 +1850,9 @@ pub const Cache = struct {
     /// to run before the lookup it precedes.
     fn climbIfDue(self: *Cache) void {
         if (!self.options.adaptive_window) return;
+        // The climber moves nodes between regions; a hook's `get` reaches here
+        // in the middle of `evictOne`, which holds a window candidate (sweep REV-RC-1).
+        if (self.in_hook) return;
         const period = self.options.max_entries *| hill_sample_factor;
         const requests = self.hc_hits + self.hc_misses;
         if (period == 0 or requests < period) return;
@@ -1880,11 +2022,18 @@ pub const Cache = struct {
         };
         if (self.admit(cand, victim)) {
             _ = self.dropKey(victim);
+            // Invariant: `cand` is the window head, a resident unborrowed node
+            // distinct from `victim`; dropping `victim` runs `on_evict`, which
+            // cannot remove it (`in_hook` makes every structural call panic).
             const e = self.entryOf(cand).?;
-            self.lruMove(e.node, .window, .probation);
-            e.node.region = .probation;
-            self.window_count -= 1;
-            self.probation_count += 1;
+            // Defensive (sweep REV-RC-1): only move a node still in the window
+            // queue; `in_hook` already keeps the climber from relocating it.
+            if (e.node.region == .window and e.node.queued) {
+                self.lruMove(e.node, .window, .probation);
+                e.node.region = .probation;
+                self.window_count -= 1;
+                self.probation_count += 1;
+            }
             self.stats.admissions += 1;
         } else {
             _ = self.dropKey(cand);
@@ -1902,6 +2051,8 @@ pub const Cache = struct {
 test {
     _ = @import("sharded.zig");
     _ = @import("audit_test.zig");
+    _ = @import("sweep_test.zig");
+    _ = @import("sweep_sharded_test.zig");
 }
 
 const testing = std.testing;

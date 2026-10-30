@@ -165,9 +165,12 @@
 //!   * must be thread-safe and re-entrant across threads — several shards can
 //!     fire it simultaneously;
 //!   * **must not call any method on this `Sharded`.** Re-entering the same
-//!     shard on a non-reentrant spinlock is a hard hang, not a detected error.
-//!     (`Cache` documents the same restriction as "unsupported"; here the
-//!     failure mode is a deadlock, which is why it is repeated in bold.)
+//!     shard on a non-reentrant spinlock would be a hard hang; a call that
+//!     reaches the held lock is caught once it has to wait for it and panics
+//!     with a message naming the cause (`cb_lock`). Methods reaching a
+//!     *different*, uncontended shard are not caught and still break the
+//!     "one lock at a time" argument, so the rule stands.
+//!     (`Cache` documents the same restriction as "unsupported".)
 //!   * must stay cheap: it runs inside a critical section shared by every key
 //!     that hashes to that shard.
 //!   * **must not suspend in a `std.Io`** (file or socket I/O, a sleep) when
@@ -265,10 +268,55 @@ fn lockAcquire(m: *std.atomic.Mutex) void {
             spins += 1;
             std.atomic.spinLoopHint();
         } else {
+            // A contended lock that THIS thread already holds (it is inside
+            // that shard's `on_evict` / `drainDirty` callback) can never be
+            // acquired: a self-deadlock. Checked only here, past the spin
+            // budget, so the uncontended path pays nothing for it.
+            if (cb_lock == m) @panic("ramcache.Sharded: a method was called from inside an on_evict/drainDirty callback of the same shard (self-deadlock)");
             if (builtin.is_test) _ = yields_observed.fetchAdd(1, .monotonic);
             std.Thread.yield() catch std.atomic.spinLoopHint();
         }
     }
+}
+
+/// The shard lock whose `on_evict` / `drainDirty` callback this thread is
+/// running right now (set by the trampolines below, which only exist to set
+/// it). `lockAcquire` reads it on its contended path to turn a re-entrant call
+/// from such a callback into a diagnosed panic instead of a silent hang.
+threadlocal var cb_lock: ?*std.atomic.Mutex = null;
+
+/// Per-shard `on_evict` forwarding record: the shard's `Cache` gets
+/// `evictTrampoline` with this as its ctx, which marks the thread as inside a
+/// callback of `lock` and calls the caller's hook with the caller's ctx.
+const EvictHook = struct {
+    func: OnEvictFn,
+    ctx: ?*anyopaque,
+    lock: *std.atomic.Mutex,
+};
+
+fn evictTrampoline(ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: root.EvictReason) void {
+    // `ctx` is the `&shard.hook` that `Sharded.init` installed, never null.
+    const h: *EvictHook = @ptrCast(@alignCast(ctx.?));
+    const prev = cb_lock;
+    cb_lock = h.lock;
+    defer cb_lock = prev;
+    h.func(h.ctx, key, value, dirty, reason);
+}
+
+/// `drainDirty` forwarding record, on the caller's stack for one sweep.
+const DirtyHook = struct {
+    func: DirtyFn,
+    ctx: ?*anyopaque,
+    lock: *std.atomic.Mutex,
+};
+
+fn dirtyTrampoline(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+    // `ctx` is the `&hook` `Sharded.drainDirty` passed, never null.
+    const h: *DirtyHook = @ptrCast(@alignCast(ctx.?));
+    const prev = cb_lock;
+    cb_lock = h.lock;
+    defer cb_lock = prev;
+    h.func(h.ctx, key, value);
 }
 
 /// Wait for a flag with the shard lock's discipline: a bounded spin, then
@@ -299,8 +347,9 @@ pub const Sharded = struct {
         /// Aggregate cap on entry count; each shard enforces
         /// `max_entries / shard_count` of it independently.
         max_entries: usize,
-        /// Requested shard count. Rounded **up** to a power of two, then
-        /// clamped down so every shard keeps a non-zero byte and entry cap.
+        /// Requested shard count. Rounded **up** to a power of two, clamped
+        /// down to `max_shards` (65536), then clamped down so every shard
+        /// keeps a non-zero byte and entry cap.
         /// The useful range is "a few times the number of writer threads";
         /// more shards buy less contention and cost admission quality.
         shards: usize = 16,
@@ -311,6 +360,10 @@ pub const Sharded = struct {
         /// CSPRNG of its own); a hard-coded literal here is a public constant
         /// again, with the funnelling property `deriveSeed` exists to remove.
         shard_seed: ?u64 = null,
+        /// Longest key a shard stores, per `Cache.Options.max_key_len`: a
+        /// longer key is refused by `put` and misses on `get`. Key bytes are
+        /// not counted in `max_bytes`, so this bounds the memory keys can take.
+        max_key_len: usize = 4096,
         /// TTL applied by `putDefault`. `<= 0` = never expire by time.
         default_ttl_ns: i64 = 0,
         /// Optional write-behind hook. **Fires from any thread, with a shard
@@ -359,6 +412,9 @@ pub const Sharded = struct {
     const Shard = struct {
         lock: std.atomic.Mutex align(std.atomic.cache_line) = .unlocked,
         cache: Cache,
+        /// Forwarding record for `Options.on_evict` (see `evictTrampoline`);
+        /// undefined-equivalent (never read) when no hook was given.
+        hook: EvictHook = undefined,
         /// Loads in progress, by key (`getOrLoad`). Guarded by `lock`. The
         /// `Flight` lives on its leader's stack; the leader removes it from
         /// here before it can go out of scope.
@@ -381,7 +437,14 @@ pub const Sharded = struct {
         waiters: std.atomic.Value(u32) = .init(0),
         err: ?LoadError = null,
         value: []const u8 = &.{},
+        /// The leader's thread, so a loader that re-enters `getOrLoad` for
+        /// this key on its own thread is told so instead of waiting for itself.
+        leader: std.Thread.Id,
     };
+
+    /// Ceiling on the shard count (`Options.shards`), applied after the
+    /// power-of-two rounding.
+    pub const max_shards: usize = 65536;
 
     /// Base seed, distinct from a standalone `Cache`'s default
     /// (`Options.hash_seed`, `0x2545F4914F6CDD1D`). This is only the *base* —
@@ -444,6 +507,7 @@ pub const Sharded = struct {
         const requested = @max(@as(usize, 1), options.shards);
         var n: usize = std.math.ceilPowerOfTwo(usize, requested) catch
             std.math.floorPowerOfTwo(usize, requested); // absurd request: round down instead
+        n = @min(n, max_shards);
         if (options.max_entries < n) n = std.math.floorPowerOfTwo(usize, @max(@as(usize, 1), options.max_entries));
         if (options.max_bytes < n) n = std.math.floorPowerOfTwo(usize, @max(@as(usize, 1), options.max_bytes));
         n = @max(@as(usize, 1), n);
@@ -453,16 +517,22 @@ pub const Sharded = struct {
 
         const shards = try alloc.alloc(Shard, n);
         const seed = options.shard_seed orelse deriveSeed(@intFromPtr(shards.ptr));
-        for (shards) |*s| s.* = .{ .cache = Cache.init(alloc, .{
-            .max_bytes = per_bytes,
-            .max_entries = per_entries,
-            .default_ttl_ns = options.default_ttl_ns,
-            .on_evict = options.on_evict,
-            .on_evict_ctx = options.on_evict_ctx,
-            .idle_ttl_ns = options.idle_ttl_ns,
-            .adaptive_window = options.adaptive_window,
-            .hash_seed = seed,
-        }) };
+        for (shards) |*s| {
+            s.* = .{
+                .cache = Cache.init(alloc, .{
+                    .max_bytes = per_bytes,
+                    .max_entries = per_entries,
+                    .default_ttl_ns = options.default_ttl_ns,
+                    .on_evict = if (options.on_evict != null) evictTrampoline else null,
+                    .on_evict_ctx = &s.hook,
+                    .idle_ttl_ns = options.idle_ttl_ns,
+                    .adaptive_window = options.adaptive_window,
+                    .hash_seed = seed,
+                    .max_key_len = options.max_key_len,
+                }),
+            };
+            if (options.on_evict) |f| s.hook = .{ .func = f, .ctx = options.on_evict_ctx, .lock = &s.lock };
+        }
         return .{
             .alloc = alloc,
             .shards = shards,
@@ -579,15 +649,24 @@ pub const Sharded = struct {
     /// `Thread.yield`), never an `Io`; a waiter is therefore stuck for as long
     /// as the loader runs, and the loader must not suspend an `Io` task that
     /// shares a thread with a waiter (see `Options.io` in the SPEC backlog,
-    /// which this does not close). The loader must **not re-enter `getOrLoad`
-    /// for the same key from the same thread** (it would wait for itself). It
-    /// runs with no lock held, so using this `Sharded` for other keys is fine.
+    /// which this does not close). A loader that re-enters `getOrLoad` for
+    /// the key it is loading, on its own thread, gets `error.LoadFailed` back
+    /// at once (it would otherwise wait for itself, forever). Cycles across
+    /// threads (A's loader waits on B's key while B's loader waits on A's) are
+    /// not detected: a loader must not wait on another key's load. It runs with
+    /// no lock held, so using this `Sharded` for other keys is fine.
     ///
     /// Behaviour anchored on Go singleflight as otter uses it: first caller
     /// loads (otter `singleflight.go:98-112`), the result and error are shared
     /// with everyone waiting on that call (`:114-132`, `cache_impl.go:766-791`).
     /// Not taken: otter forgets a call when the key is invalidated mid-load; here
     /// a `clear` during a load does not cancel it, its result is stored after.
+    ///
+    /// The same-thread check identifies OS threads. Under a cooperative `Io`
+    /// that runs several tasks on one thread, a different task on the
+    /// leader's thread asking for the key also gets `error.LoadFailed`
+    /// instead of waiting (which could not succeed there anyway: the waiter
+    /// never lets the leader's task resume).
     ///
     /// `gpa` must be thread-safe if several threads pass the same one.
     pub fn getOrLoad(
@@ -608,6 +687,13 @@ pub const Sharded = struct {
             return gpa.dupe(u8, hit);
         }
         if (s.inflight.get(key)) |f| {
+            if (f.leader == std.Thread.getCurrentId()) {
+                // This thread is the leader: the caller is the loader (or
+                // something it called) asking for the key it is loading.
+                // Waiting would be waiting for itself, forever.
+                s.lock.unlock();
+                return error.LoadFailed;
+            }
             _ = f.waiters.fetchAdd(1, .monotonic);
             s.lock.unlock();
             waitFor(&f.done);
@@ -618,7 +704,7 @@ pub const Sharded = struct {
             return gpa.dupe(u8, f.value);
         }
         // Leader. Reserve the table slot before running anything.
-        var flight: Flight = .{ .key = key };
+        var flight: Flight = .{ .key = key, .leader = std.Thread.getCurrentId() };
         s.inflight.put(self.alloc, key, &flight) catch {
             s.lock.unlock();
             return error.OutOfMemory;
@@ -717,7 +803,10 @@ pub const Sharded = struct {
     /// One shard's counters, read under that shard's lock — exact for that
     /// shard at the moment of the read. Use it to check key-distribution skew
     /// (`shardCount` + `shardIndex` are public for the same reason).
+    ///
+    /// An `index >= shardCount()` names no shard and yields all-zero `Stats`.
     pub fn shardStats(self: *Sharded, index: usize) Stats {
+        if (index >= self.shards.len) return .{};
         const s = &self.shards[index];
         lockAcquire(&s.lock);
         defer s.lock.unlock();
@@ -778,7 +867,8 @@ pub const Sharded = struct {
         for (self.shards) |*s| {
             lockAcquire(&s.lock);
             defer s.lock.unlock();
-            s.cache.drainDirty(cb, ctx);
+            var hook: DirtyHook = .{ .func = cb, .ctx = ctx, .lock = &s.lock };
+            s.cache.drainDirty(dirtyTrampoline, &hook);
         }
     }
 };

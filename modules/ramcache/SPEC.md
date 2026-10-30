@@ -363,6 +363,12 @@ every field, `rehashes` included, non-zero.
 
 ## Backlog / deferred
 
+- **(GQ review) sketch size clamp:** the frequency sketch is allocated and zeroed on first access, ~24 B x ceilPowerOfTwo(`max_entries`) (2^31 entries = 48 GiB). Documented on `Options.max_entries`; clamping would change admission for big caches, so left to the operator.
+- (GQ review) REV-SH-2: optional `getOrLoad` wait bound. It needs a clock, and the module takes none.
+- (GQ review) REV-SH-3: `drainDirty`/`on_evict` hold the shard lock across the callback; the lock is an unfair test-and-set. Candidates: `drainDirtyMax`/copy-out, a ticket lock.
+- (GQ review) REV-SH-5: AB/BA deadlock across shards from callbacks goes undetected. A "panic on any contended acquire inside a callback" guard was rejected: false positives on harmless contention.
+
+- **No-panic sweep GQ (`Cache`, 2026-10-30, `~/CML/20261029-panic-sweep/ramcache-sweep.report.md`)** -- RC-4 (`Options.max_key_len`, default 4096) and RC-6 (`removeMatching` linear) DONE; RC-5 (standalone `Cache` uses the public default `hash_seed`; doc warning, `Sharded` seeds itself) accepted as is.
 - **Audit 2026-10-25 leftovers** *(`~/CML/20261025-wave12/ramcache-audit.report.md`)*: MED — `Sharded.getOrLoad` waiters take the leader's value whatever their own `cur_gen`, so a caller that bumped the generation can receive a value loaded under the previous one (fix: keep `cur_gen` in `Flight` and let a waiter with another generation load for itself, or document). LOW — `reserve` reserves no expiry-heap slot and `release` ignores `expPush` OOM (the entry then loses expired-first priority); an expired-first eviction counts in `evictions`, not `expired`, against the `idle_ttl_ns` doc; `getOrLoad` stamps the entry with the call's `now_ns`, not the load's completion. Fixed in the same wave: `isDirty`/`markClean`/`markCleanIf` reached an uncommitted reservation (MED), `timeExpired` subtracted without saturating (LOW).
 - **P1: the fastest in the field is quick_cache, 1.31–1.95× faster on every row** *(measured 2026-10-25, `zig build bench-ramcache`)*. Closing it is a design change of the hot paths, not a tuning pass: a hit that takes no exclusive lock and does no queue move (Caffeine's lossy read buffer drained under the lock, or a CLOCK/S3-FIFO reference bit as quick_cache does), and an eviction that does not run the full W-TinyLFU contest per insert. Owner's call which; a session of its own (like `sort`).
 
