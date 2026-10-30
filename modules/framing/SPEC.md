@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (22/24, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-04 (2000-stream deterministic driver) · ct n/a — length-prefix framing (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-04 (2000-stream deterministic driver) · ct n/a — length-prefix framing (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: readFrameAlloc no longer allocates the announced length up front, EnvelopeCodec strings no longer alias the frame buffer (alloc_always); delta audit 9/10 + 1 eq)
 
 **Performance:** not measured
 

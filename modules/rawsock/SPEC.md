@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (39/41, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAWSOCK_FUZZ) · ct n/a — raw sockets (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, RAWSOCK_FUZZ) · ct n/a — raw sockets (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: filter compile stack overflow on long and/or chains (leaf cap + gen depth 512), run jump saturation, cmsg/pcap totality, ifname NUL; delta audit 32/36 + 4 eq)
 
 **Performance:** not measured
 

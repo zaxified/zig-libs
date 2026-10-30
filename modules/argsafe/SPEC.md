@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-04 (40/40) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — argv quoting only (keyword review, 2026-10-07)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — argv quoting only (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: Argv poisoned on OOM, isSafeCidrList separator bounds, empty base64 refused, unparsed Template.fill checked panic; no injection found; delta audit 13/14 + 1 eq)
 
 **Performance:** not measured
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-04 (9/11, 2 eq) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file digests, no keys (keyword review, 2026-10-07)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — file digests, no keys (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: finalHex on a zeroed copy (SHA-3 update-after-final panic, SHA-2 wrong digest); file hashing unbounded documented; delta audit 2/4 + 2 eq)
 
 **Performance:** ref 0.85–1.41× Go 1.26.8 crypto + encoding/hex · fastest 1.60× OpenSSL 3.5.5 (measured 2026-10-20)
 
