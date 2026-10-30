@@ -36,7 +36,7 @@ modules/jwt/src/root.zig	1	35
 modules/mcp/src/root.zig	1	37
 modules/megolm/src/cipher.zig	1	1
 modules/megolm/src/pickle.zig	1	3
-modules/minisign/src/root.zig	1	22
+modules/minisign/src/root.zig	2	22
 modules/mls/src/keyschedule.zig	2	14
 # mqtt 2026-10-17: acl.zig Passwords.verify compares the derived PBKDF2 hash with timing_safe.eql; the 15 plain compares are rule keywords, topics and usernames (public).
 modules/mqtt/src/acl.zig	1	15
