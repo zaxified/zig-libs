@@ -181,3 +181,100 @@ test "Options.shards is clamped to max_shards, not honoured and not refused (swe
     defer sc2.deinit();
     try testing.expectEqual(Sharded.max_shards, sc2.shardCount());
 }
+
+// ── GQ audit: the callback marker names the right lock and is restored ──────
+
+var audit_inside = std.atomic.Value(bool).init(false);
+var audit_waiting = std.atomic.Value(bool).init(false);
+
+fn auditNoopDrain(_: ?*anyopaque, _: []const u8, _: []const u8) void {}
+
+fn auditHoldDrain(_: ?*anyopaque, _: []const u8, _: []const u8) void {
+    // Hold this shard's lock until the main thread is queued on it, then a
+    // while longer so its spin budget is certainly spent.
+    audit_inside.store(true, .release);
+    while (!audit_waiting.load(.acquire)) std.Thread.yield() catch {};
+    var i: usize = 0;
+    while (i < 20000) : (i += 1) std.Thread.yield() catch {};
+}
+
+fn auditHolder(sc: *Sharded) void {
+    sc.drainDirty(auditHoldDrain, null);
+}
+
+fn staleMarkerBody() bool {
+    var sc = newCache(null, null) catch return false;
+    defer sc.deinit();
+    sc.put("a", "1", 0, 0, 0);
+    sc.drainDirty(auditNoopDrain, null); // this thread ran a callback, now returned
+    const t = std.Thread.spawn(.{}, auditHolder, .{&sc}) catch return false;
+    while (!audit_inside.load(.acquire)) std.Thread.yield() catch {};
+    audit_waiting.store(true, .release);
+    // Contended on a lock another thread holds: waiting, not self-deadlock.
+    var buf: [4]u8 = undefined;
+    const r = sc.getBuf("a", 0, 0, &buf);
+    t.join();
+    return r == .ok;
+}
+
+test "a finished drainDirty callback leaves no marker: waiting on another thread's lock is not a self-deadlock (sweep audit GQ-SH-1)" {
+    try testing.expectEqual(Outcome.exited_ok, try runChild(staleMarkerBody));
+}
+
+/// Two distinct keys of shard 1 in a 2-shard cache, plus one key per shard.
+var audit_keys: [2][]const u8 = undefined;
+var audit_key_bufs: [2][8]u8 = undefined;
+
+fn auditPickKeys(sc: *const Sharded) bool {
+    var found: usize = 0;
+    var i: usize = 0;
+    while (i < 1000 and found < 2) : (i += 1) {
+        const k = std.fmt.bufPrint(&audit_key_bufs[found], "k{d}", .{i}) catch return false;
+        if (sc.shardIndex(k) == 1) {
+            audit_keys[found] = k;
+            found += 1;
+        }
+    }
+    return found == 2;
+}
+
+fn auditEvictReenters(_: ?*anyopaque, _: []const u8, _: []const u8, _: bool, _: @import("root.zig").EvictReason) void {
+    var buf: [8]u8 = undefined;
+    _ = cb_sc.getBuf(audit_keys[1], 0, 0, &buf);
+}
+
+fn auditEvictShard1Body() bool {
+    var sc = Sharded.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 64, .shards = 2, .on_evict = auditEvictReenters }) catch return false;
+    defer sc.deinit();
+    cb_sc = &sc;
+    if (!auditPickKeys(&sc)) return false;
+    sc.put(audit_keys[0], "1", 0, 0, 0);
+    sc.put(audit_keys[0], "2", 0, 0, 0); // on_evict under shard 1's lock re-enters shard 1
+    return true;
+}
+
+test "on_evict re-entry is diagnosed for a shard other than the first: the marker names its own shard's lock (sweep audit GQ-SH-2)" {
+    try testing.expectEqual(Outcome.signaled, try runChild(auditEvictShard1Body));
+}
+
+fn auditDrainReenters(_: ?*anyopaque, _: []const u8, _: []const u8) void {
+    _ = cb_sc.markClean(audit_keys[1]);
+}
+
+fn auditDrainShard1Body() bool {
+    var sc = Sharded.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 64, .shards = 2 }) catch return false;
+    defer sc.deinit();
+    cb_sc = &sc;
+    if (!auditPickKeys(&sc)) return false;
+    sc.put(audit_keys[0], "1", 0, 0, 0); // only shard 1 holds a dirty entry
+    sc.drainDirty(auditDrainReenters, null);
+    return true;
+}
+
+test "drainDirty re-entry is diagnosed for a shard other than the first (sweep audit GQ-SH-3)" {
+    try testing.expectEqual(Outcome.signaled, try runChild(auditDrainShard1Body));
+}
+
+test "Sharded.max_shards is the documented 65536 (sweep audit GQ-SH-4)" {
+    try testing.expectEqual(@as(usize, 65536), Sharded.max_shards);
+}

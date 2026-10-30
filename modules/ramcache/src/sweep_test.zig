@@ -396,3 +396,97 @@ test "discard of a doomed or single reservation keeps pinned_bytes exact (sweep 
     try testing.expectEqual(@as(usize, 0), c.pinned_bytes);
     try testing.expectEqual(@as(usize, 0), c.stats.pinned);
 }
+
+// ── delta mutation audit (GQ-B) ─────────────────────────────────────────────
+
+const ReorderProbe = struct {
+    cache: *Cache,
+    fn onEvict(ctx: ?*anyopaque, key: []const u8, value: []const u8, dirty: bool, reason: EvictReason) void {
+        _ = value;
+        _ = dirty;
+        _ = reason;
+        const p: *ReorderProbe = @ptrCast(@alignCast(ctx.?));
+        if (key[0] != 'p') return;
+        // Read-only hook; every hit moves its node in / between the region
+        // queues, under the pass-1 walk. The walk's next node ("p<i+1>", queued
+        // in insertion order) is touched last, so it ends up at a tail and the
+        // saved `next` link no longer leads to the remaining matches.
+        const next = key[1] + 1;
+        for ("012345") |d| {
+            if (d == next) continue;
+            _ = p.cache.get(&[_]u8{ 'p', d }, 0, 0);
+        }
+        _ = p.cache.get(&[_]u8{ 'p', next }, 0, 0);
+    }
+};
+
+test "removeMatching with an on_evict hook that reorders the queues still removes every match (sweep audit GQ-B1)" {
+    var probe = ReorderProbe{ .cache = undefined };
+    var c = Cache.init(testing.allocator, .{
+        .max_bytes = 1 << 20,
+        .max_entries = 64,
+        .on_evict = ReorderProbe.onEvict,
+        .on_evict_ctx = &probe,
+    });
+    defer c.deinit();
+    probe.cache = &c;
+    for ([_][]const u8{ "p0", "p1", "p2", "p3", "p4", "p5", "q0" }) |k| c.put(k, "v", 0, 0, 0);
+    try testing.expectEqual(@as(usize, 6), c.removeMatching("p"));
+    try testing.expectEqual(@as(usize, 1), c.stats.entries);
+    try testing.expect(c.get("q0", 0, 0) != null);
+    try expectStructure(&c);
+}
+
+test "discard of a reservation that gained a second pin parks it and the last release frees it (sweep audit GQ-B2)" {
+    // The `pins != 1` branch is unreachable through the public API (an unfilled
+    // entry is a miss for `pin`); forge the second pin to pin the bookkeeping.
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1000, .max_entries = 16 });
+    defer c.deinit();
+    const f = c.reserve("r", 30, 0, 0, 0).?;
+    f.node.pins = 2;
+    c.discard(f); // dooms the node, releases one pin
+    try testing.expectEqual(@as(u32, 1), f.node.pins);
+    try testing.expect(c.get("r", 0, 0) == null);
+    try testing.expectEqual(@as(usize, 30), c.pinned_bytes);
+    c.release(.{ .bytes = f.bytes, .node = f.node }); // last pin: must not trip the forged-Borrow check
+    try testing.expectEqual(@as(usize, 0), c.pinned_bytes);
+    try testing.expectEqual(@as(usize, 0), c.stats.pinned);
+    try testing.expectEqual(@as(usize, 0), c.doomed.items.len);
+}
+
+test "pin accepts a borrow that lands exactly on max_pinned_bytes (sweep audit GQ-B3)" {
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1000, .max_entries = 16, .max_pinned_bytes = 80 });
+    defer c.deinit();
+    c.put("p1", &@as([40]u8, @splat('x')), 0, 0, 0);
+    c.put("p2", &@as([40]u8, @splat('y')), 0, 0, 0);
+    const b1 = c.pin("p1", 0, 0).?;
+    const b2 = c.pin("p2", 0, 0) orelse return error.TestUnexpectedResult; // 80 == cap
+    try testing.expectEqual(@as(usize, 80), c.pinned_bytes);
+    c.release(b1);
+    c.release(b2);
+}
+
+test "drainDirty: a callback's get on a stale entry misses without dropping it, and the flag is restored (sweep audit GQ-B4)" {
+    var c = Cache.init(testing.allocator, .{ .max_bytes = 1 << 20, .max_entries = 16 });
+    defer c.deinit();
+    c.put("ttl", "v", 0, 10, 0); // expired at t=100
+    c.put("other", "v", 0, 0, 0);
+    const Drain = struct {
+        cache: *Cache,
+        nulls: usize = 0,
+        fn cb(ctx: ?*anyopaque, key: []const u8, value: []const u8) void {
+            _ = key;
+            _ = value;
+            const d: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (d.cache.get("ttl", 100, 0) == null) d.nulls += 1;
+        }
+    };
+    var d = Drain{ .cache = &c };
+    c.drainDirty(Drain.cb, &d);
+    try testing.expect(d.nulls >= 1);
+    try testing.expectEqual(@as(usize, 2), c.stats.entries); // nothing dropped mid-sweep
+    try testing.expect(!c.in_hook);
+    c.put("later", "v", 0, 0, 0); // structural calls work again (a stuck flag would panic)
+    try testing.expect(c.get("ttl", 100, 0) == null); // a normal call drops the stale entry
+    try testing.expectEqual(@as(usize, 2), c.stats.entries);
+}
