@@ -194,3 +194,90 @@ test "StreamWriter.fail never casts an error outside its set into err (sweep REV
     try testing.expectError(error.WriteFailed, sw.writer.writeAll("more bytes than the 16-byte buffer holds"));
     try testing.expectEqual(@as(?std.mem.Allocator.Error, null), sw.err);
 }
+
+test "Decoder.init keeps the 256 MiB default max_output (sweep audit GU-B1)" {
+    const gpa = testing.allocator;
+    var in: std.Io.Reader = .fixed("");
+    var d = try bz.Decoder.init(gpa, &in, .{});
+    defer d.deinit();
+    try testing.expectEqual(@as(?u64, bz.decoder_default_max_output), d.opts.max_output);
+    var e = try bz.Decoder.init(gpa, &in, .{ .max_output = null });
+    defer e.deinit();
+    try testing.expectEqual(@as(?u64, null), e.opts.max_output);
+}
+
+/// An unbuffered reader that answers `gap` empty reads before each single
+/// byte of `data`, then ends the stream.
+const GapReader = struct {
+    r: std.Io.Reader = .{ .vtable = &vtable, .buffer = &.{}, .seek = 0, .end = 0 },
+    data: []const u8,
+    pos: usize = 0,
+    gap: usize,
+    zeros_left: usize,
+    calls: usize = 0,
+
+    const vtable: std.Io.Reader.VTable = .{ .stream = zeroStream, .readVec = readVec };
+
+    fn readVec(r: *std.Io.Reader, vec: [][]u8) std.Io.Reader.Error!usize {
+        const s: *GapReader = @alignCast(@fieldParentPtr("r", r));
+        s.calls += 1;
+        if (s.pos >= s.data.len) return error.EndOfStream;
+        if (s.zeros_left > 0) {
+            s.zeros_left -= 1;
+            return 0;
+        }
+        s.zeros_left = s.gap;
+        vec[0][0] = s.data[s.pos];
+        s.pos += 1;
+        return 1;
+    }
+};
+
+test "refillUnbuffered gives up after exactly 64 consecutive empty reads (sweep audit GU-B2)" {
+    const gpa = testing.allocator;
+    var g: GapReader = .{ .data = "x", .gap = std.math.maxInt(usize), .zeros_left = std.math.maxInt(usize) };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try testing.expectError(error.ReadFailed, bz.decompressStream(gpa, &g.r, &out.writer, .{}));
+    try testing.expectEqual(@as(usize, 64), g.calls);
+}
+
+test "refillUnbuffered counts empty reads per run, not per stream (sweep audit GU-B3)" {
+    const gpa = testing.allocator;
+    const z = try bz.compress(gpa, plain, .{ .level = 1 });
+    defer gpa.free(z);
+    // 63 empty reads before every byte: each run is below the bound, the sum
+    // over the stream is far above it.
+    var g: GapReader = .{ .data = z, .gap = 63, .zeros_left = 63 };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    _ = try bz.decompressStream(gpa, &g.r, &out.writer, .{});
+    try testing.expectEqualSlices(u8, plain, out.written());
+}
+
+test "StreamWriter.finish after a failed finish fails again, it does not pretend (sweep audit GU-B4)" {
+    const gpa = testing.allocator;
+    var fw: FlakyWriter = .{};
+    var buf: [64]u8 = undefined;
+    var sw = try bz.StreamWriter.init(gpa, &fw.w, &buf, .{ .level = 1 });
+    defer sw.deinit();
+    try sw.writer.writeAll(plain);
+    try testing.expectError(error.WriteFailed, sw.finish());
+    try testing.expectError(error.WriteFailed, sw.finish());
+    try testing.expectEqual(@as(usize, 1), fw.calls);
+}
+
+test "StreamWriter records an allocation failure in err (sweep audit GU-B5)" {
+    const gpa = testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // Allocation 0 is the encoder's coding tables; the first block buffer fails.
+    var fa = testing.FailingAllocator.init(gpa, .{ .fail_index = 1 });
+    var buf: [16]u8 = undefined;
+    var sw = try bz.StreamWriter.init(fa.allocator(), &out.writer, &buf, .{ .level = 1 });
+    defer sw.deinit();
+    if (sw.writer.writeAll(plain)) |_| {
+        try testing.expectError(error.WriteFailed, sw.finish());
+    } else |e| try testing.expectEqual(error.WriteFailed, e);
+    try testing.expectEqual(@as(?std.mem.Allocator.Error, error.OutOfMemory), sw.err);
+}

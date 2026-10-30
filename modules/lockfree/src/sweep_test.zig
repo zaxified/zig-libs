@@ -326,6 +326,16 @@ test "stealBatch with a limit of 1 still works (sweep LF-5)" {
     try testing.expectEqual(@as(usize, 1), b.len());
 }
 
+test "injector stealBatchWithLimit with a limit of 1 still works (sweep audit GU-L1)" {
+    var inj = try deque.Injector(u64).init(testing.allocator);
+    defer inj.deinit();
+    var b = try D.init(testing.allocator, 4);
+    defer b.deinit();
+    try inj.push(1);
+    try inj.push(2);
+    try testing.expect((try inj.stealBatchWithLimit(&b, 1)).isSuccess());
+}
+
 test "the wrong needle fails (the helper can fail)" {
     var buf: [16384]u8 = undefined;
     const c = try runChild(enterTwice, &buf);
