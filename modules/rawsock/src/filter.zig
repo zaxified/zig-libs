@@ -1037,3 +1037,53 @@ test "gen: a 1000-term chain is cut off by the depth bound before any code is em
     try testing.expectEqual(@as(usize, 0), g.code.items.len);
     try testing.expectError(error.FilterTooComplex, compile(testing.allocator, src));
 }
+
+test "gen: the depth cap sits exactly at max_gen_depth on every edge kind (sweep audit GS-A1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var p: Parser = .{ .a = a, .lex = .{ .src = "arp" } };
+    const leaf = try p.parseExpr();
+    // and[0], and[1], or[0], or[1], not: a chain of n wrappers puts the leaf at depth n.
+    inline for (.{ 0, 1, 2, 3, 4 }) |kind| {
+        for ([_]usize{ Gen.max_gen_depth, Gen.max_gen_depth + 1 }) |n| {
+            var cur = leaf;
+            for (0..n) |_| {
+                const nd = try a.create(Node);
+                nd.* = switch (kind) {
+                    0 => .{ .@"and" = .{ cur, leaf } },
+                    1 => .{ .@"and" = .{ leaf, cur } },
+                    2 => .{ .@"or" = .{ cur, leaf } },
+                    3 => .{ .@"or" = .{ leaf, cur } },
+                    else => .{ .not = cur },
+                };
+                cur = nd;
+            }
+            var g: Gen = .{ .a = a };
+            const t_label = try g.newLabel();
+            const f_label = try g.newLabel();
+            if (n == Gen.max_gen_depth) {
+                try g.gen(cur, t_label, f_label, 0);
+            } else {
+                try testing.expectError(error.FilterTooComplex, g.gen(cur, t_label, f_label, 0));
+            }
+        }
+    }
+}
+
+test "Parser: the leaf cap sits exactly at max_insns terms (sweep audit GS-A2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ max_insns, max_insns + 1 }) |n| {
+        const src = try a.alloc(u8, 2 + 7 * (n - 1));
+        @memcpy(src[0..2], "ip");
+        for (0..n - 1) |i| @memcpy(src[2 + i * 7 ..][0..7], " and ip");
+        var p: Parser = .{ .a = a, .lex = .{ .src = src } };
+        if (n == max_insns) {
+            _ = try p.parseExpr();
+        } else {
+            try testing.expectError(error.FilterTooComplex, p.parseExpr());
+        }
+    }
+}

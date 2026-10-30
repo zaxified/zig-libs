@@ -158,3 +158,18 @@ test "EnvelopeCodec.parse: the result does not alias the input buffer (sweep REV
     @memset(&frame, 'X'); // the frame buffer is reused / freed by the caller
     try testing.expectEqualStrings("hello world", parsed.value.note.text);
 }
+
+test "readFrameAlloc: a frame of exactly 16 KiB is one exact allocation, never resized (sweep audit GS-FR-1)" {
+    const n = 16 * 1024;
+    var wire: [4 + n]u8 = undefined;
+    std.mem.writeInt(u32, wire[0..4], n, .little);
+    @memset(wire[4..], 0x5a);
+    var fa = testing.FailingAllocator.init(testing.allocator, .{});
+    var r: std.Io.Reader = .fixed(&wire);
+    const got = try framing.readFrameAlloc(&r, fa.allocator(), .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, n), got.len);
+    try testing.expectEqual(@as(usize, 1), fa.alloc_index);
+    try testing.expectEqual(@as(usize, 0), fa.resize_index);
+    try testing.expectEqual(@as(usize, n), fa.allocated_bytes);
+}

@@ -2896,3 +2896,14 @@ test "ifaceByName: a name with an embedded NUL is refused, not truncated by the 
     try testing.expectError(error.NoSuchInterface, ifaceByName("lo\x00"));
     try testing.expectError(error.NoSuchInterface, ifaceIndexOn(-1, "\x00"));
 }
+
+test "parseAuxdataVlan: a record that exactly fills the buffer is still read (sweep audit GS-A3)" {
+    var control: [Socket.aux_cmsg_space]u8 = undefined;
+    @memset(&control, 0);
+    const total = cmsgAlign(@sizeOf(linux.cmsghdr)) + @sizeOf(TpacketAuxdata);
+    const hdr: *align(1) linux.cmsghdr = @ptrCast(&control);
+    hdr.* = .{ .len = total, .level = linux.SOL.PACKET, .type = linux.PACKET.AUXDATA };
+    const aux: *align(1) TpacketAuxdata = @ptrCast(control[cmsgAlign(@sizeOf(linux.cmsghdr))..].ptr);
+    aux.* = .{ .tp_status = TP_STATUS_VLAN_VALID, .tp_len = 39, .tp_snaplen = 39, .tp_mac = 0, .tp_net = 14, .tp_vlan_tci = 7, .tp_vlan_tpid = 0 };
+    try testing.expectEqual(@as(?u16, 7), parseAuxdataVlan(control[0..total]));
+}

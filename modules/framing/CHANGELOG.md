@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GS sweep: 9/10 + 1 eq (Decoder `+|` eq on 64-bit); new test: a 16 KiB frame is one exact allocation (sweep audit GS-FR-1).
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GS). `readFrameAlloc` grows its buffer by the bytes actually read above 16 KiB instead of allocating the announced length up front (a stalling peer cost the whole announced frame); `EnvelopeCodec.parse` now copies every string (`alloc_always`) — escape-free strings used to alias the input bytes and dangled once the frame buffer was reused or freed; `Decoder.feed` limit arithmetic saturates (32-bit). Docs: EnvelopeCodec memory scales with element count × element size; EndOfStream covers a clean close and a truncated frame; a failed write leaves a partial frame. Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
