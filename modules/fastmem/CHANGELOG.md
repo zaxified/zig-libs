@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GQ). The exported C `memcpy`/`memset` unwrapped caller pointers with `.?` (undefined in ReleaseFast); a null pointer with a non-zero length now traps (SIGILL) in every build mode, a null pointer with length 0 stays a no-op as in C. The traps keep both functions frameless (`orelse @trap()` in memcpy, an inline-asm `ud2` in memset on x86-64; objdump-checked). Tests: `src/sweep_test.zig`.
 - **2026-10-26** — Audit of the `memcpy` source (independent review + 46-mutant
   schemata run: 40 killed, 6 equivalent, no defect). `copy`'s 32–256 B arm no
   longer keeps its vectors in an `undefined` array (safe builds could fill it

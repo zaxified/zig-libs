@@ -60,7 +60,10 @@ pub const meta = .{
 
 // ── public API ──────────────────────────────────────────────────────────────
 
-/// Store `c` into `dest[0..len]`.
+/// Store `c` into `dest[0..len]`. `dest[0..len]` must be memory the caller may
+/// write (so `dest + len` does not wrap the address space); any `len` that
+/// describes such memory is handled, with no allocation and no loop bound but
+/// `len` itself.
 pub fn set(dest: [*]u8, c: u8, len: usize) void {
     if (len < 32) return setSmall(dest, c, len);
     const v: V = @splat(c);
@@ -95,10 +98,23 @@ pub fn set(dest: [*]u8, c: u8, len: usize) void {
     while (p < end) : (p += 32) storeAligned(@ptrFromInt(p), v);
 }
 
-/// The C `memset`, over `set`.
+/// The C `memset`, over `set`. `dest` may be null only with `len == 0`; a null
+/// `dest` with a non-zero `len` is undefined in C; here it traps (SIGILL) in
+/// every build mode. On x86-64 the trap is an inline-asm `ud2`, not `@trap()`
+/// or `orelse @panic`: with either of those LLVM gave `memset` a stack frame
+/// (push rbp/rbx) on every call, the asm form keeps it frameless with one
+/// test-and-branch (objdump of ReleaseFast, 2026-10-30). Other targets use
+/// `@trap()`.
 pub fn memset(dest: ?[*]u8, c: c_int, len: usize) callconv(.c) ?[*]u8 {
-    if (len != 0) set(dest.?, @truncate(@as(c_uint, @bitCast(c))), len);
+    if (len == 0) return dest;
+    if (@intFromPtr(dest) == 0) nullTrap();
+    set(@ptrCast(dest), @truncate(@as(c_uint, @bitCast(c))), len);
     return dest;
+}
+
+/// The null-`dest` trap of `memset`; see there for why x86-64 uses asm.
+inline fn nullTrap() void {
+    if (builtin.cpu.arch == .x86_64) asm volatile ("ud2") else @trap();
 }
 
 /// Copy `src[0..len]` to `dest[0..len]`; the ranges must not overlap.
@@ -142,9 +158,17 @@ pub fn copy(noalias dest: [*]u8, noalias src: [*]const u8, len: usize) void {
     store(V, dest + end, tail);
 }
 
-/// The C `memcpy`, over `copy`.
+/// The C `memcpy`, over `copy`. A null `dest` or `src` is allowed only with
+/// `len == 0`; with a non-zero `len` it traps (SIGILL) in every build mode
+/// (undefined in C). `@trap`, not `@panic`: a call would give `memcpy` a stack
+/// frame on every call; the trap is a bare `ud2` (objdump, 2026-10-30). Overlapping ranges are undefined too, as in C: unchecked, but no
+/// byte outside `dest[0..len]` is ever written.
 pub fn memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, len: usize) callconv(.c) ?[*]u8 {
-    if (len != 0) copy(dest.?, src.?, len);
+    if (len != 0) copy(
+        dest orelse @trap(),
+        src orelse @trap(),
+        len,
+    );
     return dest;
 }
 
@@ -290,6 +314,10 @@ fn setSmall(d: [*]u8, c: u8, n: usize) void {
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = @import("sweep_test.zig");
+}
 
 test "set: every length 0..300 at every offset 0..63 writes exactly its range" {
     var canvas: [512]u8 align(64) = undefined;
