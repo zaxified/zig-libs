@@ -179,7 +179,11 @@ fn readPrefix(r: *std.Io.Reader, p: Prefix) !u64 {
     }
 }
 
-/// Write one length-prefixed frame to `w`. Rejects `payload` larger than
+/// Write one length-prefixed frame to `w`. If a write fails after the prefix
+/// went out, a partial frame stays on the writer, which is then out of step and
+/// must be dropped; and a writer shared between threads must be locked around
+/// the call, because the prefix and the payload are two separate writes.
+/// Rejects `payload` larger than
 /// `limits.max_frame` — or than the prefix width can announce (255 for
 /// `.u8`, …) — before touching `w` or dereferencing `payload`.
 pub fn writeFrame(w: *std.Io.Writer, payload: []const u8, limits: Limits) !void {
@@ -189,6 +193,11 @@ pub fn writeFrame(w: *std.Io.Writer, payload: []const u8, limits: Limits) !void 
     try w.writeAll(payload);
 }
 
+/// `error.EndOfStream` means both a clean close between frames and a stream
+/// truncated inside a frame (prefix or payload); this function cannot tell them
+/// apart, so a caller that must distinguish them tracks whether any byte of the
+/// current frame was seen.
+///
 /// Read one frame from `r` into `buf`; returns the payload sub-slice of
 /// `buf`. Fails with `error.FrameTooLarge` if the announced length exceeds
 /// either `limits.max_frame` or `buf.len`, and `error.BadLength` on a length
@@ -214,14 +223,40 @@ pub fn readFrame(r: *std.Io.Reader, buf: []u8, limits: Limits) ![]u8 {
 /// The length is still checked against `limits.max_frame` BEFORE allocating,
 /// so an announced 4 GiB is refused rather than attempted. Caller owns the
 /// returned slice.
+///
+/// A frame larger than 16 KiB is not allocated at its announced size: the
+/// buffer grows as the bytes actually arrive, so a peer that announces
+/// `max_frame` and then stalls costs memory in proportion to what it sent.
+/// How long to wait for the rest is the `Reader`'s business (a socket
+/// reader's timeout), not this function's.
 pub fn readFrameAlloc(r: *std.Io.Reader, gpa: std.mem.Allocator, limits: Limits) ![]u8 {
-    const len = try readPrefix(r, limits.prefix);
-    if (len > limits.max_frame) return error.FrameTooLarge;
-    const dst = try gpa.alloc(u8, @intCast(len));
-    errdefer gpa.free(dst);
-    try r.readSliceAll(dst);
-    return dst;
+    const announced = try readPrefix(r, limits.prefix);
+    if (announced > limits.max_frame) return error.FrameTooLarge;
+    const len: usize = @intCast(announced); // <= max_frame, a u32: fits usize on every target
+    if (len <= alloc_chunk) {
+        const dst = try gpa.alloc(u8, len);
+        errdefer gpa.free(dst);
+        try r.readSliceAll(dst);
+        return dst;
+    }
+    // A big announced length is believed only as the bytes arrive: the buffer
+    // grows by what was actually read (doubling, so the copying stays linear),
+    // never to the announced size up front. A peer that announces `max_frame`
+    // and then stalls or hangs up costs one chunk, not `max_frame` per
+    // connection.
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    while (list.items.len < len) {
+        const want = @min(len - list.items.len, @max(alloc_chunk, list.items.len));
+        const dst = try list.addManyAsSlice(gpa, want);
+        try r.readSliceAll(dst);
+    }
+    return list.toOwnedSlice(gpa); // exactly `len` bytes: `gpa.free` of the result is valid
 }
+
+/// First allocation step of `readFrameAlloc` for a frame whose announced
+/// length is larger than this.
+const alloc_chunk = 16 * 1024;
 
 // ── incremental decoder ─────────────────────────────────────────────────────
 
@@ -264,7 +299,9 @@ pub const Decoder = struct {
     }
 
     pub fn feed(d: *Decoder, gpa: std.mem.Allocator, bytes: []const u8) (std.mem.Allocator.Error || error{NotDrained})!void {
-        if (d.buffered() > @as(usize, d.limits.max_frame) + max_prefix_len) return error.NotDrained;
+        // Saturating: on a 32-bit target `max_frame = maxInt(u32)` plus the prefix
+        // would overflow `usize` (a panic in safe builds, a wrapped, tiny limit in ReleaseFast).
+        if (d.buffered() > @as(usize, d.limits.max_frame) +| max_prefix_len) return error.NotDrained;
         if (d.start > 0) {
             // Drop what was consumed; the slices handed out are now invalid.
             const rest = d.pending.items[d.start..];
@@ -367,6 +404,15 @@ pub fn jsonDepthWithin(bytes: []const u8, max_depth: u16) bool {
 /// of bytes; and `Value`'s *stringify* IS recursive, so echoing such a value
 /// back out through `encodeAlloc` would then overflow the native stack.
 ///
+/// ## Memory is not bounded by `max_frame` alone
+///
+/// Allocation follows the number of JSON elements, not only the byte count:
+/// `[{},{},{}…]` costs 3 bytes per element on the wire but `@sizeOf(element)`
+/// in memory (a `std.json.Value` is roughly ten times its text). So a frame of
+/// `max_frame` bytes can allocate `max_frame` times the element-size ratio.
+/// Tighten `max_frame` to what the protocol needs and cap how many parses run
+/// concurrently.
+///
 /// `parse` therefore refuses more than `default_max_json_depth` levels of
 /// nesting before `std.json` ever sees the bytes (`parseLimited` to choose
 /// your own cap). The check costs one allocation-free pass and is a no-op for
@@ -398,7 +444,9 @@ pub fn EnvelopeCodec(comptime T: type) type {
             limits: JsonLimits,
         ) !std.json.Parsed(T) {
             if (!jsonDepthWithin(bytes, limits.max_depth)) return error.JsonNestingTooDeep;
-            return std.json.parseFromSlice(T, gpa, bytes, .{});
+            // `.alloc_always`: the result never aliases `bytes`, so the frame buffer can be
+            // reused or freed while the parsed value lives.
+            return std.json.parseFromSlice(T, gpa, bytes, .{ .allocate = .alloc_always });
         }
 
         /// Encode + frame onto `w` in one step, using `gpa` for the scratch
@@ -412,6 +460,10 @@ pub fn EnvelopeCodec(comptime T: type) type {
 }
 
 // ── tests: writeFrame/readFrame ─────────────────────────────────────────────
+
+test {
+    _ = @import("sweep_test.zig");
+}
 
 test "frame round-trip" {
     const t = std.testing;
