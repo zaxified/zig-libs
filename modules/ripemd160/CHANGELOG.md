@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GT). `final` with 56..63 bytes buffered left `buf_len` = 64, so a second `final` (or `update` then `final`) tripped an assert = out-of-bounds write in ReleaseFast; it now resets to 0 (digest after misuse is garbage, never UB). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0: comptime `strRepeat` branch quota scaled with length. Examples/tools ported to Zig 0.17.0 (bigsweep `bufPrintZ` -> `bufPrintSentinel`).

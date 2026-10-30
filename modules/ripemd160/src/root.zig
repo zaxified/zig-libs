@@ -193,6 +193,10 @@ pub const Ripemd160 = struct {
         if (64 - d.buf_len < 8) {
             d.compress(&d.buf);
             @memset(d.buf[0..], 0);
+            // Keep the `buf_len < 64` invariant that `update` and `final`
+            // rely on even if the caller calls `final` again (or `update`
+            // after `final`): the state is then garbage, but never UB.
+            d.buf_len = 0;
         }
 
         // RIPEMD-160 length suffix is little-endian bit count (unlike SHA-2's BE).
@@ -700,4 +704,8 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+test {
+    _ = @import("sweep_test.zig");
 }
