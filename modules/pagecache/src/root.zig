@@ -238,6 +238,12 @@ pub const PageCache = struct {
             .cache = ramcache.Cache.init(gpa, .{
                 .max_entries = options.max_pages,
                 .max_bytes = max_bytes,
+                // Borrowed pages may sit over the nominal cap by design (sweep
+                // PC-3, `Stats.pinned`): every outstanding `preadRef` is one the
+                // caller holds and must release, so the caller bounds them.
+                // ramcache's own default (borrows capped at `max_bytes`, GQ
+                // REV-RC-3) would turn a fully-borrowed cache into "did not engage".
+                .max_pinned_bytes = std.math.maxInt(usize),
             }),
             .page_size = options.page_size,
             .page_shift = if (std.math.isPowerOfTwo(options.page_size)) std.math.log2_int(u64, options.page_size) else null,
