@@ -103,8 +103,9 @@ test "Bulkhead.acquire ends on a clock that never advances (sweep REV-RS-1)" {
     try b.acquire();
     try testing.expectError(error.BulkheadFull, b.acquire());
     // The budget was spent on requested sleeps alone: ~10 polls, not 100000.
-    try testing.expect(w.sleeps <= 11);
-    try testing.expect(w.total_ns >= 1_000_000);
+    // Exactly the budget: 1 ms of 100 us polls, not one poll more or less.
+    try testing.expectEqual(@as(u32, 10), w.sleeps);
+    try testing.expectEqual(@as(u64, 1_000_000), w.total_ns);
     try testing.expectEqual(@as(u32, 1), b.activeCount());
 }
 
@@ -134,4 +135,35 @@ test "counts() on a bucket_ms 0 literal breaker before any record does not divid
     var cb: resilience.RateCircuitBreaker(4) = .{ .options = .{ .kind = .time, .bucket_ms = 0, .clock = fc.clock() } };
     const c = cb.counts();
     try testing.expectEqual(@as(u32, 0), c.window_calls);
+}
+
+test "RateCircuitBreaker: slow-call rate and window counters stay exact past 2^32 (sweep audit GO-RS-1)" {
+    var fc: FakeClock = .{};
+    var cb = resilience.RateCircuitBreaker(4).init(.{
+        .kind = .time,
+        .bucket_ms = 1000,
+        .failure_rate_pct = 100,
+        .slow_call_rate_pct = 50,
+        .slow_call_duration_ms = 100,
+        .clock = fc.clock(),
+    });
+    // 25 % slow over 2^62 calls: `slow * 100` overflows u64.
+    cb.trip_state.slots[0].calls = 1 << 62;
+    cb.trip_state.calls = 1 << 62;
+    cb.trip_state.slots[0].slow = 1 << 60;
+    cb.trip_state.slow = 1 << 60;
+    cb.trip_state.slots[0].failures = 1 << 40;
+    cb.trip_state.failures = 1 << 40;
+    cb.record(.success, 0);
+    try testing.expectEqual(resilience.BreakerState.closed, cb.state());
+    // The public snapshot saturates every field instead of truncating.
+    const c = cb.counts();
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.window_calls);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.window_failures);
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32)), c.window_slow);
+    // Now over 50 % slow: trips.
+    cb.trip_state.slots[0].slow = 1 << 62;
+    cb.trip_state.slow = 1 << 62;
+    cb.record(.success, 1_000_000_000);
+    try testing.expectEqual(resilience.BreakerState.open, cb.state());
 }

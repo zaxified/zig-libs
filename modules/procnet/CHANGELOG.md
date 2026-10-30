@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GO sweep: 13/15 killed; survivors are `skipped_rows +|=` (needs 4 GiB, equivalent), the `max_total_fds` off-by-one (/proc content not under test control) and the `cpus_allowed` default (undefined bytes are deterministic here; only valgrind/MSan see it). New test: inode 0 never matches; the max_total_fds test also checks the walk stops early.
 - **2026-10-30** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GO): no crash found. ADDED `SocketOwnerOptions.max_total_fds` (default 1 Mi descriptors across all processes, sets `truncated`): the default caps allowed 33.5M `readlinkat` calls when a local user held many non-socket descriptors. `SocketOwnerIndex.find`/`findAll` are O(log n) however many processes share an inode (was a linear walk of the run). `PidStatus.cpus_allowed` past `cpus_allowed_len` is zeroed (was `undefined`); `parseLimits` counts skipped rows saturating. `parseUnix`/`readUnix` document the ~12× memory amplification of forged rows. Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 

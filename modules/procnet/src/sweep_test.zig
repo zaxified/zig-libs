@@ -30,6 +30,11 @@ test "indexSocketOwners: max_total_fds bounds the walk and sets truncated (sweep
     defer full.deinit(testing.allocator);
     if (full.truncated) return error.SkipZigTest;
     try testing.expect(capped.scanned <= full.scanned);
+    // The budget also ends the walk across processes: a sweep that kept
+    // visiting every remaining process would scan as many as the full one.
+    if (full.scanned >= 4) try testing.expect(capped.scanned < full.scanned);
+    // The default budget is large enough not to bite a normal machine.
+    try testing.expect((process.SocketOwnerOptions{}).max_total_fds >= 1 << 16);
 }
 
 fn owner(inode: u64, pid: u32) process.SocketOwner {
@@ -108,4 +113,13 @@ test "PidStatus.cpus_allowed beyond cpus_allowed_len is deterministic (sweep REV
         try testing.expectEqual(@as(u64, 0), r.first);
         try testing.expectEqual(@as(u64, 0), r.last);
     }
+}
+
+test "SocketOwnerIndex: inode 0 never matches even when owners hold inode 0 (sweep audit GO-PN-1)" {
+    var buf: [4]process.SocketOwner = .{ owner(0, 1), owner(0, 2), owner(7, 1), owner(7, 2) };
+    const idx: process.SocketOwnerIndex = .{ .owners = &buf, .scanned = 0, .denied = 0, .vanished = 0, .truncated = false };
+    try testing.expectEqual(@as(usize, 0), idx.findAll(0).len);
+    try testing.expect(idx.find(0) == null);
+    try testing.expectEqual(@as(usize, 2), idx.findAll(7).len);
+    try testing.expectEqual(@as(u32, 1), idx.find(7).?.pid);
 }
