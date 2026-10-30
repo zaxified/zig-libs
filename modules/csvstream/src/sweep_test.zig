@@ -73,3 +73,58 @@ test "offsets, line and record counters saturate instead of overflowing (sweep C
     while (sp.next()) |_| n += 1;
     try t.expectEqual(@as(usize, 3), n);
 }
+
+// ── delta mutation audit (sweep audit GN) ───────────────────────────────────
+
+test "a comment line at the saturated line counter does not overflow (sweep audit GN-CS-3)" {
+    var it = line.LineIterator.init("#c\na\n", '"', 0);
+    it.comment = '#';
+    it.line = std.math.maxInt(u64);
+    const rec = it.next().?;
+    try t.expectEqualStrings("a", rec.bytes);
+    try t.expectEqual(@as(u64, std.math.maxInt(u64)), rec.line_number);
+    try t.expect(it.next() == null);
+}
+
+fn writeAndOpen(tmp: *t.TmpDir, data: []const u8) !std.Io.File {
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = data });
+    return tmp.dir.openFile(t.io, "in.csv", .{});
+}
+
+test "a record longer than max_record_len is RecordTooLong even if the newline is inside the buffer bound (sweep audit GN-CS-4)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [152]u8 = @splat('x');
+    data[149] = '\n';
+    data[151] = '\n';
+    var f = try writeAndOpen(&tmp, &data);
+    defer f.close(t.io);
+    // chunk 64 + max 100: capacityBound is 164, so a read not clipped to the
+    // record cap would reach the newline at 149 and emit a 149-byte record.
+    var cr = try stream.ChunkReader.initMax(t.io, t.allocator, f, 64, 100);
+    defer cr.deinit();
+    try t.expectError(error.RecordTooLong, cr.nextChunk());
+
+    // a record within the cap is still delivered
+    data[89] = '\n';
+    var f2 = try writeAndOpen(&tmp, data[0..90]);
+    defer f2.close(t.io);
+    var cr2 = try stream.ChunkReader.initMax(t.io, t.allocator, f2, 64, 100);
+    defer cr2.deinit();
+    try t.expectEqual(@as(usize, 90), (try cr2.nextChunk()).?.len);
+}
+
+test "refills past the file's stat size do not over-reserve the buffer (sweep audit GN-CS-4)" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [20001]u8 = @splat('x');
+    data[20000] = '\n';
+    var f = try writeAndOpen(&tmp, &data);
+    defer f.close(t.io);
+    var cr = try stream.ChunkReader.initMax(t.io, t.allocator, f, 64, 1 << 20);
+    defer cr.deinit();
+    try t.expectEqual(@as(usize, 20001), (try cr.nextChunk()).?.len);
+    // the last doubled read is trimmed to the 3681 bytes the file has left;
+    // untrimmed it asks for 16384 and reserves ~32 KB
+    try t.expect(cr.buffer.capacity < 30000);
+}
