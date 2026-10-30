@@ -179,6 +179,9 @@ const SpinCounter = struct {
 /// logically deleted node, a version to defeat ABA in a CAS, and so on.
 pub fn TaggedPtr(comptime T: type) type {
     return struct {
+        /// The checked panic of an oversized tag (sweep LF-3).
+        pub const msg_tag_too_wide = "lockfree: TaggedPtr tag does not fit the alignment bits of T";
+
         raw: usize,
 
         const Self = @This();
@@ -187,9 +190,10 @@ pub fn TaggedPtr(comptime T: type) type {
         pub const tag_mask: usize = (1 << tag_bits) - 1;
         pub const null_ptr: Self = .{ .raw = 0 };
 
-        /// `tag` must fit `tag_mask` (asserted).
+        /// `tag` must fit `tag_mask` (checked panic `msg_tag_too_wide`: an
+        /// oversized tag would be OR-ed into the pointer bits).
         pub fn init(p: ?*T, tag_: usize) Self {
-            std.debug.assert(tag_ & ~tag_mask == 0);
+            if (tag_ & ~tag_mask != 0) @panic(msg_tag_too_wide);
             return .{ .raw = @intFromPtr(p) | tag_ };
         }
 
@@ -202,7 +206,7 @@ pub fn TaggedPtr(comptime T: type) type {
         }
 
         pub fn withTag(s: Self, tag_: usize) Self {
-            std.debug.assert(tag_ & ~tag_mask == 0);
+            if (tag_ & ~tag_mask != 0) @panic(msg_tag_too_wide);
             return .{ .raw = (s.raw & ~tag_mask) | tag_ };
         }
 
@@ -257,19 +261,19 @@ pub fn TaggedAtomic(comptime T: type) type {
 
         /// Set tag bits; returns the previous value. The pointer is untouched.
         pub fn fetchOrTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
-            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            if (tag_ & ~Ptr.tag_mask != 0) @panic(Ptr.msg_tag_too_wide);
             return .{ .raw = self.raw.fetchOr(tag_, order) };
         }
 
         /// Keep only the tag bits set in `tag_`; returns the previous value.
         pub fn fetchAndTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
-            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            if (tag_ & ~Ptr.tag_mask != 0) @panic(Ptr.msg_tag_too_wide);
             return .{ .raw = self.raw.fetchAnd(tag_ | ~Ptr.tag_mask, order) };
         }
 
         /// Flip tag bits; returns the previous value.
         pub fn fetchXorTag(self: *Self, tag_: usize, comptime order: std.builtin.AtomicOrder) Ptr {
-            std.debug.assert(tag_ & ~Ptr.tag_mask == 0);
+            if (tag_ & ~Ptr.tag_mask != 0) @panic(Ptr.msg_tag_too_wide);
             return .{ .raw = self.raw.fetchXor(tag_, order) };
         }
     };

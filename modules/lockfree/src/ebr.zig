@@ -148,6 +148,11 @@ pub const Participant = struct {
     /// own `local_epoch`, so the plain pin+unpin pair writes nothing else
     /// (a depth store there cost it 25 %, 2026-10-14). Single-owner.
     nested_pins: u32,
+    /// Owner-private mirror of "inside a critical section" (`local_epoch !=
+    /// unpinned`), so the misuse checks below read a plain field of the
+    /// owner's own line instead of an atomic (sweep LF-1). Written only by
+    /// the owning thread, in `enterCritical` / `exitCritical`.
+    pinned: bool,
     /// This slot's position in the registry, chunk after chunk
     /// (`Domain.slotIndex`). Fixed at the chunk's creation.
     index: usize,
@@ -170,6 +175,7 @@ pub const Participant = struct {
         self.dropped_retires = 0;
         self.since_advance = 0;
         self.nested_pins = 0;
+        self.pinned = false;
         self.index = index;
     }
 
@@ -178,10 +184,25 @@ pub const Participant = struct {
     }
 };
 
+/// Messages of the checked panics on EBR misuse (sweep LF-1); kept as
+/// constants so the tests can look for them.
+pub const msg_enter_pinned = "lockfree: enterCritical on a participant that is already pinned (use enterCriticalNested)";
+pub const msg_exit_unpinned = "lockfree: exitCritical on a participant that is not pinned";
+pub const msg_repin_unpinned = "lockfree: repin on a participant that is not pinned";
+pub const msg_retire_unpinned = "lockfree: retire on a participant that is not pinned (retire runs inside the pin, after the unlink)";
+pub const msg_unregister_unowned = "lockfree: unregister of a participant that is not registered (double unregister, or already handed off as an orphan)";
+pub const msg_unregister_pinned = "lockfree: unregister of a participant that is still pinned";
+
 /// A pin token. Constructed by `enterCritical` (or `Domain.pin`), released
 /// (unpins) by `release`. RAII-ish: hold it exactly as long as you hold
 /// references into EBR-managed memory. Guards nest: an inner one's `release`
 /// leaves the participant pinned until the outermost is released.
+///
+/// Release each guard exactly once. A double `release` of the OUTERMOST guard
+/// is a checked panic (`msg_exit_unpinned`), but while guards are nested a
+/// second release of an inner one just decrements the nesting count again and
+/// unpins the outer section early: a guard carries no per-guard state, so
+/// that is undetectable (sweep REV-lockfree-3).
 pub const Guard = struct {
     domain: *Domain,
     participant: *Participant,
@@ -445,7 +466,7 @@ pub const Domain = struct {
     /// is precisely the case this bound refuses to spin on.
     const max_unregister_advances = num_epochs + 2;
 
-    /// Release a participant slot. Caller must be unpinned (asserted).
+    /// Release a participant slot. Caller must be unpinned (checked panic `msg_unregister_pinned`).
     /// **Non-blocking: never waits on another thread.**
     ///
     /// Two phases. First a BOUNDED self-drain (`max_unregister_advances`
@@ -480,8 +501,11 @@ pub const Domain = struct {
     /// draining thread, only the epoch it observed, and `adoptOrphans` re-reads
     /// the epoch after acquiring the slot (see there).
     pub fn unregister(self: *Domain, p: *Participant) void {
-        std.debug.assert(p.nested_pins == 0);
-        std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
+        if (p.pinned) @panic(msg_unregister_pinned); // nested_pins != 0 implies pinned
+        // Double unregister: a freed slot may already belong to another thread
+        // (clearing its `in_use` would steal it), an orphan would be counted
+        // twice (sweep REV-lockfree-2).
+        if (!p.in_use.load(.monotonic) or p.orphaned.load(.monotonic)) @panic(msg_unregister_unowned);
         var attempts: usize = 0;
         while (remainingGarbage(p) != 0 and attempts < max_unregister_advances) : (attempts += 1) {
             self.tryAdvance(p);
@@ -601,13 +625,15 @@ pub const Domain = struct {
     /// Hence no publish-revalidate loop is needed.
     ///
     ///
-    /// The participant must be unpinned (asserted); `enterCriticalNested`
-    /// (and `pin`) also take an already pinned one. Checking here would put
-    /// a load of the `local_epoch` the previous `exitCritical` just stored —
-    /// store-forwarded, on the path to the `xchg` — into every pin: +25 %
-    /// on a pin+unpin pair (`epoch_pin` 1.00 → 1.25× crossbeam, 2026-10-14).
+    /// The participant must be unpinned (checked panic `msg_enter_pinned`);
+    /// `enterCriticalNested` (and `pin`) also take an already pinned one. The
+    /// check reads the owner-private `pinned` field, not `local_epoch`: a
+    /// load of the `local_epoch` the previous `exitCritical` just stored —
+    /// store-forwarded, on the path to the `xchg` — cost +25 % on a pin+unpin
+    /// pair (`epoch_pin` 1.00 → 1.25× crossbeam, 2026-10-14).
     pub fn enterCritical(self: *Domain, p: *Participant) Guard {
-        std.debug.assert(p.local_epoch.load(.monotonic) == Participant.unpinned);
+        if (p.pinned) @panic(msg_enter_pinned);
+        p.pinned = true;
         const e = self.global_epoch.load(.seq_cst);
         p.local_epoch.store(e, .seq_cst);
         return .{ .domain = self, .participant = p };
@@ -620,8 +646,8 @@ pub const Domain = struct {
     /// reference-holders by their pin store, and the outer one precedes
     /// every load of the inner section. `exitCritical` undoes either.
     pub fn enterCriticalNested(self: *Domain, p: *Participant) Guard {
-        // `.monotonic`: this thread is the only writer of its pin.
-        if (p.local_epoch.load(.monotonic) == Participant.unpinned) return self.enterCritical(p);
+        // Owner-private: this thread is the only writer of its pin.
+        if (!p.pinned) return self.enterCritical(p);
         p.nested_pins += 1;
         return .{ .domain = self, .participant = p };
     }
@@ -633,7 +659,7 @@ pub const Domain = struct {
     /// value" case — the caller has dropped its references, as after an
     /// unpin), and as a seq_cst store it is the new section's pin.
     pub fn repin(self: *Domain, p: *Participant) void {
-        std.debug.assert(p.isPinned());
+        if (!p.pinned) @panic(msg_repin_unpinned);
         if (p.nested_pins != 0) return;
         const e = self.global_epoch.load(.seq_cst);
         if (p.local_epoch.load(.monotonic) == e) return;
@@ -656,11 +682,12 @@ pub const Domain = struct {
     /// briefly), never toward freeing early. Conservative direction = safe.
     pub fn exitCritical(self: *Domain, p: *Participant) void {
         _ = self;
-        std.debug.assert(p.local_epoch.load(.monotonic) != Participant.unpinned);
+        if (!p.pinned) @panic(msg_exit_unpinned);
         if (p.nested_pins != 0) {
             p.nested_pins -= 1;
             return;
         }
+        p.pinned = false;
         p.local_epoch.store(Participant.unpinned, .release);
     }
 
@@ -669,6 +696,12 @@ pub const Domain = struct {
     /// a thread-local handle). Up to `max_thread_domains` domains per thread;
     /// `unregisterCurrentThread` releases the participant (Zig has no
     /// thread-exit hook, so this is explicit).
+    ///
+    /// A thread that exits WITHOUT `unregisterCurrentThread` leaks its slot
+    /// (`in_use` stays set and its garbage is never adopted: it is not
+    /// orphaned). A long-lived thread that pins many short-lived domains
+    /// without ever calling it keeps their entries in its 16-entry table and
+    /// eventually gets `TooManyDomainsPerThread` (sweep REV-lockfree-5).
     pub fn pin(self: *Domain) PinError!Guard {
         return self.enterCriticalNested(try self.currentParticipant());
     }
@@ -746,7 +779,7 @@ pub const Domain = struct {
     /// unchanged, and an empty bag's tag is meaningless (`reclaimExpired`
     /// only looks at non-empty bags).
     pub fn retire(self: *Domain, p: *Participant, r: Retired) void {
-        std.debug.assert(p.local_epoch.load(.monotonic) != Participant.unpinned);
+        if (!p.pinned) @panic(msg_retire_unpinned);
         const e = self.global_epoch.load(.seq_cst);
         const idx: usize = @intCast(e % num_epochs);
         if (p.bags[idx].items.len != 0 and p.bag_epoch[idx] != e) {

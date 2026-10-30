@@ -150,6 +150,10 @@ pub fn Steal(comptime T: type) type {
     };
 }
 
+/// The checked panics of `stealBatch*` misuse (sweep LF-5).
+pub const msg_batch_limit_zero = "lockfree: stealBatchWithLimit limit must be >= 1";
+pub const msg_batch_into_self = "lockfree: stealBatch into the deque it steals from";
+
 /// Which end the owner pops from.
 pub const Flavor = enum {
     /// The owner pops the newest item (crossbeam's `Worker::new_lifo`): the
@@ -514,8 +518,8 @@ fn DequeOf(comptime T: type, comptime flavor: Flavor, comptime fault: Fault) typ
         /// unsound (SPEC §4c backlog): the owner pops from the bottom without
         /// a CAS while it sees more than one item, down into the batch.
         fn batch(d: *Self, dest: anytype, limit: usize, comptime keep_first: bool) error{OutOfMemory}!Steal(T) {
-            std.debug.assert(limit >= 1);
-            std.debug.assert(@intFromPtr(dest) != @intFromPtr(d));
+            if (limit < 1) @panic(msg_batch_limit_zero);
+            if (@intFromPtr(dest) == @intFromPtr(d)) @panic(msg_batch_into_self);
             const t = d.top.load(.seq_cst);
             const b = d.bottom.load(.seq_cst);
             if (t >= b) return .empty;
@@ -664,7 +668,7 @@ pub fn Injector(comptime T: type) type {
         /// Pops one item at a time (each a claim of its own), written past
         /// `dest`'s bottom and published together.
         fn batch(inj: *Self, dest: anytype, limit: usize, comptime keep_first: bool) error{OutOfMemory}!Steal(T) {
-            std.debug.assert(limit >= 1);
+            if (limit < 1) @panic(msg_batch_limit_zero);
             const queued = inj.queue.len();
             if (queued == 0) return .empty;
             const n = @min((queued + 1) / 2, limit);

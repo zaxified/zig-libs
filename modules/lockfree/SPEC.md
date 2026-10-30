@@ -282,14 +282,22 @@ into a one-slot domain) with a use-after-free in `dequeue`, 3 of 3.
 
 **Nested pins.** `enterCriticalNested` (and `pin`) take an already pinned
 participant: they only count (`nested_pins`, owner-only), and only the
-outermost exit unpins. `enterCritical` stays the non-nesting pin (asserted
-unpinned): the nesting check is a load of the `local_epoch` the previous
-unpin just stored, store-forwarded on the way to the `xchg`, and in every pin
-it cost a pin+unpin pair 25 % (`epoch_pin` 1.00 → 1.25× crossbeam, A/B
-against the previous commit, disassembly read). `exitCritical` reads only
-`nested_pins`, which a plain pin never writes. Every load of an inner section
-follows the outer pin store in program order, so the theorem's bound on
-reference-holders already covers it.
+outermost exit unpins. `enterCritical` stays the non-nesting pin. The misuse
+checks (`enterCritical` on a pinned participant, `exitCritical`/`repin`/`retire`
+on an unpinned one, `unregister` while pinned) are checked panics in every mode.
+They read `Participant.pinned`, a plain owner-private bool written only by the
+owning thread in `enterCritical` and the outermost `exitCritical`; reading
+`local_epoch` instead (the atomic the previous unpin just stored, store-forwarded
+on the way to the `xchg`) cost a pin+unpin pair 25 % (`epoch_pin` 1.00 → 1.25×
+crossbeam, A/B against the previous commit, disassembly read). Hand-over of a slot
+between threads goes through the `in_use` release/acquire, so the plain bool needs
+no atomic. `unregister` also panics on a slot that is not `in_use` or is already
+orphaned (double unregister). `exitCritical` reads only `nested_pins`/`pinned`.
+`mpmc.Queue` enqueue/dequeue pin with `enterCriticalNested`, so they compose with a
+caller already pinned on the same participant. Undetectable by design: a double
+`release` of an INNER guard (no per-guard state; it unpins the outer section early).
+Every load of an inner section follows the outer pin store in program order, so the
+theorem's bound on reference-holders already covers it.
 
 **`repin`, `repinAfter`, `flush`, `isPinned`.** `repin` (outermost guard only)
 is the pin's own pair — `.seq_cst` epoch load, `.seq_cst` store — writing the new

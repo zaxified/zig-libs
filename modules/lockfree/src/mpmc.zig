@@ -196,9 +196,12 @@ pub fn Queue(comptime T: type) type {
             // threads could not drain their bags). Unpinning first costs two
             // atomic ops per retry; every pointer read and its dependent CAS
             // still share one pin, which is all the ABA argument needs.
+            // `enterCriticalNested`: a caller already pinned on `p` (reading a
+            // structure it then enqueues into) composes instead of tripping
+            // `msg_enter_pinned` (sweep REV-lockfree-1).
             var backoff: atomic.Backoff = .{};
             while (true) {
-                const guard = self.domain.enterCritical(p);
+                const guard = self.domain.enterCriticalNested(p);
                 const t = self.tail.value.load(.seq_cst);
                 if (t.next.load(.seq_cst)) |n| {
                     // Lagging tail: help swing it, then retry immediately —
@@ -299,7 +302,7 @@ pub fn Queue(comptime T: type) type {
             // unlink CAS, which is `Domain.retire`'s contract.
             var backoff: atomic.Backoff = .{};
             while (true) {
-                const guard = self.domain.enterCritical(p);
+                const guard = self.domain.enterCriticalNested(p);
                 const h = self.head.value.load(.seq_cst);
                 const t = self.tail.value.load(.seq_cst);
                 const n = h.next.load(.seq_cst) orelse {

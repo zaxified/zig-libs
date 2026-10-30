@@ -91,7 +91,11 @@ pub const Verdict = enum {
     reordered,
 };
 
-pub const StressError = error{StressThreadFailed};
+pub const StressError = error{
+    StressThreadFailed,
+    /// `producers * per_producer` does not fit a `usize` (sweep REV-lockfree-6).
+    StressTooLarge,
+};
 
 /// The multiset invariant checker, plus the per-consumer FIFO check.
 /// Adapter-independent and deterministic — this is the piece the "CHECKER
@@ -102,8 +106,8 @@ pub fn verify(
     cfg: StressConfig,
     lists: []const std.ArrayListUnmanaged(u64),
     allocator: std.mem.Allocator,
-) std.mem.Allocator.Error!Verdict {
-    const total = cfg.producers * cfg.per_producer;
+) (std.mem.Allocator.Error || error{StressTooLarge})!Verdict {
+    const total = std.math.mul(usize, cfg.producers, cfg.per_producer) catch return error.StressTooLarge;
     const seen = try allocator.alloc(bool, total);
     defer allocator.free(seen);
     @memset(seen, false);
@@ -223,7 +227,7 @@ fn Runner(comptime Adapter: type) type {
         }
 
         fn run(adapter: *Adapter, cfg: StressConfig, allocator: std.mem.Allocator) !Verdict {
-            const total = cfg.producers * cfg.per_producer;
+            const total = std.math.mul(usize, cfg.producers, cfg.per_producer) catch return error.StressTooLarge;
 
             var sh: Shared = .{
                 .adapter = adapter,
@@ -247,10 +251,29 @@ fn Runner(comptime Adapter: type) type {
             const cons = try allocator.alloc(std.Thread, cfg.consumers);
             defer allocator.free(cons);
 
-            for (prods, 0..) |*t, pid| t.* = try std.Thread.spawn(.{}, producerMain, .{ &sh, pid });
-            for (cons, 0..) |*t, cid| t.* = try std.Thread.spawn(.{}, consumerMain, .{ &sh, &lists[cid] });
-            for (prods) |*t| t.join();
-            for (cons) |*t| t.join();
+            // A failed spawn must not return while the threads already running
+            // still point at `sh` and `lists` (sweep REV-lockfree-6): flag the
+            // run failed (consumers stop, producers are finite), join, then
+            // report the error.
+            var n_prods: usize = 0;
+            var n_cons: usize = 0;
+            var spawn_err: ?std.Thread.SpawnError = null;
+            while (n_prods < prods.len) : (n_prods += 1) {
+                prods[n_prods] = std.Thread.spawn(.{}, producerMain, .{ &sh, n_prods }) catch |e| {
+                    spawn_err = e;
+                    break;
+                };
+            }
+            if (spawn_err == null) while (n_cons < cons.len) : (n_cons += 1) {
+                cons[n_cons] = std.Thread.spawn(.{}, consumerMain, .{ &sh, &lists[n_cons] }) catch |e| {
+                    spawn_err = e;
+                    break;
+                };
+            };
+            if (spawn_err != null) sh.failed.store(true, .release);
+            for (prods[0..n_prods]) |*t| t.join();
+            for (cons[0..n_cons]) |*t| t.join();
+            if (spawn_err) |e| return e;
 
             if (sh.failed.load(.acquire)) return StressError.StressThreadFailed;
             return verify(cfg, lists, allocator);

@@ -116,6 +116,7 @@ test {
     _ = segqueue;
     _ = deque;
     _ = harness;
+    _ = @import("sweep_test.zig");
 }
 
 test "meta is well-formed" {

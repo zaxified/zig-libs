@@ -377,13 +377,21 @@ fn Ring(comptime T: type, comptime fixed: ?usize, comptime opts: Options) type {
         }
 
         /// `.single` only, from the one consumer thread: release the item
-        /// `front` returned. Calling it when `front` returned null is a bug
-        /// (asserted in safe builds).
+        /// `front` returned. A no-op when nothing is published at `head`
+        /// (`front` returned null): releasing an unpublished slot would
+        /// stall every producer behind it (sweep LF-4).
+        ///
+        /// Call it only after a `front` that returned non-null, and once per
+        /// such `front`. The no-op above cannot tell a stale `front` from a
+        /// fresh one: if `front` returned null and a producer published
+        /// before this call, or `advance` is called twice after one `front`
+        /// while the next slot is already published, the unread item is
+        /// released and lost (sweep REV-lockfree-4).
         pub fn advance(q: *Self) void {
             comptime requireSingle("advance");
             const pos = q.head.load(.monotonic);
             const slot = q.slotAt(pos);
-            std.debug.assert(slot.seq.load(.monotonic) == pos +% 1);
+            if (slot.seq.load(.monotonic) != pos +% 1) return;
             // `head` first, with release, for `len`: a reader that sees it
             // sees the `tail` that published this item, and a producer that
             // acquires the freed slot below carries it on to its own `tail`.

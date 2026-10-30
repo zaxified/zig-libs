@@ -45,6 +45,10 @@ const atomic = @import("atomic.zig");
 /// producer id — the harness recognizes it as corruption, not a live value.
 pub const poison_byte: u8 = 0xA5;
 
+/// The checked panic of a node released twice, or one that never came from
+/// `acquire` (sweep LF-2).
+pub const msg_release_not_live = "lockfree: NodePool release of a node that is not live (released twice, or not from this pool)";
+
 pub const Error = error{
     /// A node on the free list no longer holds intact poison — something
     /// wrote to it after it was freed (a use-after-free), or the pool is
@@ -132,9 +136,17 @@ pub fn NodePool(comptime T: type) type {
         /// Retire a node: poison its bytes and push it on the free list.
         /// Mechanical. (The *decision* that it is safe to do this — that no
         /// thread can still reach the node — is EBR's job, not the pool's.)
+        ///
+        /// A release of a node that is not live is a checked panic, but the
+        /// check reads `live` before taking the lock: it is best effort. A
+        /// node released, re-acquired by another thread and then stale-released
+        /// passes it and corrupts the free list, undetectably. After
+        /// `error.CanaryTripped` the pool is unusable (the bad slot stays at
+        /// the free list's head, so every later `acquire` fails): treat it as
+        /// corrupt (sweep REV-lockfree-7).
         pub fn release(self: *Self, node: *T) void {
             const slot = slotOf(node);
-            std.debug.assert(slot.live);
+            if (!slot.live) @panic(msg_release_not_live);
             self.lock.lock();
             defer self.lock.unlock();
             @memset(std.mem.asBytes(&slot.node), poison_byte);
@@ -211,7 +223,7 @@ pub fn NodePool(comptime T: type) type {
         /// list once `c` holds twice that.
         pub fn releaseCached(self: *Self, c: *Cache, node: *T) void {
             const slot = slotOf(node);
-            std.debug.assert(slot.live);
+            if (!slot.live) @panic(msg_release_not_live);
             @memset(std.mem.asBytes(&slot.node), poison_byte);
             slot.live = false;
             slot.next_free = c.head;
