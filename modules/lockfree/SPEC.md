@@ -7,7 +7,7 @@
 **Scope:** parity — crossbeam (epoch 0.9.21 + queue 0.3.14 + deque 0.8.8) (surveyed 2026-10-14, gaps closed 2026-10-14)
 **Audit:** review 2026-08-09 · mutation 2026-10-14 (27/28) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — concurrent queues (keyword review, 2026-10-07)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — concurrent queues (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: EBR order misuse → checked panics via an owner-private `pinned` flag (no extra atomic), mpmc uses nested pins, pool/TaggedPtr/deque misuse → checked panics, SPSC advance no-op; delta audit 31/31)
 
 **Performance:** ref 0.50–1.05× crossbeam 0.8 (queue 0.3.14, deque 0.8.8, epoch 0.9.21) · fastest ? (measured 2026-10-20)
 

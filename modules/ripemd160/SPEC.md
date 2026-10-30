@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean, RIPEMD160_FUZZ) · ct 2026-10-09 (ctgrind: message tainted, `hash` + `hash160`, 0 in-file)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean, RIPEMD160_FUZZ) · ct 2026-10-09 (ctgrind: message tainted, `hash` + `hash160`, 0 in-file) · panic 2026-10-30 (sweep + blind review: `final` with 56..63 buffered bytes resets `buf_len` (second final/update was OOB in ReleaseFast); delta audit 1/1)
 
 **Performance:** ref 1.02–1.05× Bitcoin Core v29.0 CRIPEMD160 · fastest ? (measured 2026-10-20)
 

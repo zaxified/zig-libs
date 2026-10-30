@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-04 (26/29, 3 eq) · src ?
 
-**Hardening:** fuzz 2026-10-07 (100,000 runs clean, HQC_FUZZ, roundtrip and implicit reject) · ct 2026-09-09 (ctgrind)
+**Hardening:** fuzz 2026-10-07 (100,000 runs clean, HQC_FUZZ, roundtrip and implicit reject) · ct 2026-09-09 (ctgrind) · panic 2026-10-30 (sweep + blind review: Ring/sampleVect caller asserts → checked panics, comptime parameter guards, `stack_bytes` documented; delta audit 12/13 + 1 eq)
 
 **Performance:** ref 0.04–0.07× HQC v5.0.0 `ref` lane · fastest 2.46–3.52× HQC v5.0.0 `x86_64/avx256` lane (measured 2026-10-20)
 

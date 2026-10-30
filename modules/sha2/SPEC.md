@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-26 · mutation 2026-10-26 (77/79, 2 eq) · src 392d044c36f8d037
 
-**Hardening:** fuzz 2026-10-25 (100,000 runs per harness clean in ReleaseSafe, SHA2_FUZZ, every reach label hit; 200,000 on 2026-10-10) · ct 2026-10-25 (ctgrind: message through SHA-224/256/384/512 hash/update/peek and HMAC over sha2 with key + message tainted; 0 in-file)
+**Hardening:** fuzz 2026-10-25 (100,000 runs per harness clean in ReleaseSafe, SHA2_FUZZ, every reach label hit; 200,000 on 2026-10-10) · ct 2026-10-25 (ctgrind: message through SHA-224/256/384/512 hash/update/peek and HMAC over sha2 with key + message tainted; 0 in-file) · panic 2026-10-30 (sweep + blind review: nothing to fix (length counters wrap mod 2^64/2^128 by design, no HMAC exposed))
 **Performance:** ref 0.40–0.99× OpenSSL 3.5.5 EVP SHA-2 · fastest ? (measured 2026-10-26)
 
 **Known defects:** none recorded

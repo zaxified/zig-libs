@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-14 · mutation 2026-09-04 · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — no computation on the secret bytes: it copies std.Io.randomSecure output to the caller, so there is nothing to time · panic 2026-10-30 (sweep + blind review: `tryFill` (error instead of abort) added, `fill` keeps the fail-closed abort; delta audit 4/4)
 
 **Performance:** ref 0.92–1.01× Go crypto/rand.Read · fastest ? (measured 2026-10-20)
 

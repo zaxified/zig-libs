@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 (56/65, 9 eq) · src ?
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: nothing to fix (combine bounded at 64+32 steps))
 
 **Performance:** ref 0.07–0.17× zlib 1.3.1 crc32_z · fastest ? (measured 2026-10-20)
 

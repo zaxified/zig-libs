@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-10-05 (11/11) · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind; `prf` 9 in-file since Zig 0.17.0, 2026-10-18, was 8: `xmssPkFromSig`'s auth-path direction test on `idx_leaf` at one more unrolled address -- the index is fixed by R, which the signature publishes)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean; both verify harnesses at scale 10 = 20,000 runs (a run is up to five verifications of a 17 KiB signature), SLHDSA_FUZZ) · ct 2026-09-09 (ctgrind; `prf` 9 in-file since Zig 0.17.0, 2026-10-18, was 8: `xmssPkFromSig`'s auth-path direction test on `idx_leaf` at one more unrolled address -- the index is fixed by R, which the signature publishes) · panic 2026-10-30 (sweep + blind review: nothing to fix (every verify total); pin tests only)
 
 **Performance:** ref 0.57–0.89× OpenSSL 3.5.5 SLH-DSA (sign/verify/keygen, 6 sets; not liboqs, which is foreign) · fastest ? (measured 2026-10-20)
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-03 · mutation 2026-10-03 · src ?
 
-**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind)
+**Hardening:** fuzz 2026-10-10 (200,000-run budget per harness clean, MONTINT_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: caller-contract asserts → checked panics (limbs, asm_core, safegcd nbits, Field.pow, fromElemUncheckedBits), even modulus folded into the safegcd verdict branch-free, `sqrt` work capped (`error.SqrtWorkLimit`), `stack_bytes` documented and probed; delta audit 46/48 + eq/NA)
 
 **Performance:** ref 0.91–1.02× OpenSSL 3.5.5 BN (Montgomery mul, constant-time and public-exponent modexp, 1024–4096 bit) · fastest ? (measured 2026-10-20)
 
