@@ -140,6 +140,12 @@ fn parseRow(line: []const u8, has_inode: bool) ?UnixEntry {
 /// Parse `/proc/net/unix`. The header decides whether rows carry an `Inode`
 /// column (kernels before 2.6 did not; then `inode` is 0). A row that is not
 /// the documented shape is skipped. Caller frees the slice.
+///
+/// ⚠ Memory amplification: forged short rows inside socket names (see above)
+/// are about 17 bytes of text but a 176-byte `UnixEntry`, so hostile text can
+/// grow ~12× — up to ~185 MB live from the 16 MiB `readUnix` read limit.
+/// There is no entry cap (that needs a signature change; see the SPEC
+/// Backlog). Callers parsing text of their own should bound its length.
 pub fn parseUnix(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]UnixEntry {
     var out: std.ArrayList(UnixEntry) = .empty;
     errdefer out.deinit(gpa);

@@ -141,12 +141,12 @@ pub fn parseLimits(text: []const u8) Limits {
                     if (s) |sv| {
                         if (h) |hv| {
                             out.rows[f_value] = .{ .soft = sv, .hard = hv };
-                        } else |_| out.skipped_rows += 1;
-                    } else |_| out.skipped_rows += 1;
-                } else out.skipped_rows += 1;
+                        } else |_| out.skipped_rows +|= 1;
+                    } else |_| out.skipped_rows +|= 1;
+                } else out.skipped_rows +|= 1;
             }
         }
-        if (!matched) out.skipped_rows += 1;
+        if (!matched) out.skipped_rows +|= 1;
     }
     return out;
 }
@@ -256,7 +256,7 @@ pub const PidStatus = struct {
     /// `Cpus_allowed_list` as ranges (kept as ranges because `0-8191` is one
     /// entry, not 8192). Parts beyond 32 are counted in `cpus_allowed_count`
     /// but not stored.
-    cpus_allowed: [max_cpu_ranges]CpuRange = undefined,
+    cpus_allowed: [max_cpu_ranges]CpuRange = @splat(.{ .first = 0, .last = 0 }),
     cpus_allowed_len: u8 = 0,
     /// Total CPUs in the list (saturating).
     cpus_allowed_count: u64 = 0,

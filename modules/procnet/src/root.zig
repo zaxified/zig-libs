@@ -575,6 +575,7 @@ test {
     _ = pairs;
     _ = unix;
     _ = @import("fuzz_proc.zig");
+    _ = @import("sweep_test.zig");
 }
 
 const testing = std.testing;

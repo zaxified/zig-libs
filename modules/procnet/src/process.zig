@@ -161,6 +161,18 @@ pub const SocketOwnerOptions = struct {
     /// because neither walk cap had fired. Roughly 712 KB of allocation per
     /// real socket (W2 re-audit 2026-09-02, `procnet` F7).
     max_owners: usize = 1 << 20,
+    /// Stop once this many descriptors have been examined across ALL
+    /// processes (every examined descriptor costs one `readlinkat`, socket or
+    /// not); `truncated` is set. Neither `max_owners` nor the per-process cap
+    /// bounds this: non-socket descriptors never become owners, so
+    /// `max_processes` × `max_fds_per_process` (33.5M) would otherwise be the
+    /// bound on the walk.
+    ///
+    /// Worst-case work is `min(max_processes × max_fds_per_process,
+    /// max_total_fds)` `readlinkat` calls. Worst-case memory is
+    /// `max_owners` × 88 B (about 92 MB live at the default), up to roughly
+    /// 2.5× that while the list is growing.
+    max_total_fds: usize = 1 << 20,
 };
 
 /// The result of one `/proc/<pid>/fd` sweep: every socket-holding descriptor
@@ -189,8 +201,8 @@ pub const SocketOwnerIndex = struct {
     /// error, and distinct from `denied` because it says nothing about
     /// privilege.
     vanished: u32,
-    /// True if `max_processes`, some `max_fds_per_process`, or `max_owners`
-    /// cut the sweep short, so a caller never mistakes a capped view for a
+    /// True if `max_processes`, some `max_fds_per_process`, `max_total_fds`,
+    /// or `max_owners` cut the sweep short, so a caller never mistakes a capped view for a
     /// complete one.
     truncated: bool,
 
@@ -215,17 +227,29 @@ pub const SocketOwnerIndex = struct {
             const mid = lo + (hi - lo) / 2;
             if (idx.owners[mid].inode < inode) lo = mid + 1 else hi = mid;
         }
-        var end = lo;
-        while (end < idx.owners.len and idx.owners[end].inode == inode) end += 1;
-        return idx.owners[lo..end];
+        // Second binary search for the end of the equal-inode run: O(log n)
+        // however many processes share the socket.
+        var end_lo = lo;
+        var end_hi: usize = idx.owners.len;
+        while (end_lo < end_hi) {
+            const mid = end_lo + (end_hi - end_lo) / 2;
+            if (idx.owners[mid].inode <= inode) end_lo = mid + 1 else end_hi = mid;
+        }
+        return idx.owners[lo..end_lo];
     }
 
     /// The first owner of `inode`, or null. Sugar over `findAll` for the
     /// common single-holder case; a caller rendering an `ss -p`-style column
     /// wants `findAll`.
     pub fn find(idx: SocketOwnerIndex, inode: u64) ?SocketOwner {
-        const all = idx.findAll(inode);
-        return if (all.len == 0) null else all[0];
+        if (inode == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = idx.owners.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (idx.owners[mid].inode < inode) lo = mid + 1 else hi = mid;
+        }
+        return if (lo < idx.owners.len and idx.owners[lo].inode == inode) idx.owners[lo] else null;
     }
 };
 
@@ -285,6 +309,7 @@ pub fn indexSocketOwners(
     var denied: u32 = 0;
     var vanished: u32 = 0;
     var truncated = false;
+    var total_fds: usize = 0;
 
     var proc_dir = std.Io.Dir.cwd().openDir(io, "/proc", .{ .iterate = true }) catch
         return .{ .owners = try out.toOwnedSlice(gpa), .scanned = 0, .denied = 0, .vanished = 0, .truncated = false };
@@ -341,6 +366,11 @@ pub fn indexSocketOwners(
                 truncated = true;
                 break;
             }
+            if (total_fds >= opts.max_total_fds) {
+                truncated = true;
+                break;
+            }
+            total_fds += 1;
             fd_count += 1;
             const fd = std.fmt.parseInt(u32, fd_entry.name, 10) catch continue;
 
@@ -371,6 +401,7 @@ pub fn indexSocketOwners(
             truncated = true;
             break;
         }
+        if (truncated and total_fds >= opts.max_total_fds) break;
     }
 
     const owners = try out.toOwnedSlice(gpa);
