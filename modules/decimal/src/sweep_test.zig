@@ -470,3 +470,65 @@ test "a sum one digit past max_coeff_digits is Overflow (sweep DC-6)" {
     var ok = try BigDecimal.add(a, half, half);
     ok.deinit();
 }
+
+test "toStringAlloc: the exact padding is the limit, not the digit-count bound (sweep audit GN-DA-4)" {
+    const a = testing.allocator;
+    // 64 has 2 digits but 7 bits (bound: at most 3 digits), so the bound alone
+    // would let exactly one zero too many through.
+    var over = try BigDecimal.parse(a, "64e-1000003"); // 1_000_001 padding zeros
+    defer over.deinit();
+    try testing.expectError(error.OutOfMemory, over.toStringAlloc(a));
+    var edge = try BigDecimal.parse(a, "64e-1000002"); // exactly 1_000_000
+    defer edge.deinit();
+    const s = try edge.toStringAlloc(a);
+    defer a.free(s);
+    try testing.expectEqual(@as(usize, 2 + 1_000_000 + 2), s.len);
+}
+
+test "toStringFixed: a zero at a huge positive exponent prints a bare 0 (sweep audit GN-DA-23)" {
+    const a = testing.allocator;
+    var z = try BigDecimal.parse(a, "0");
+    defer z.deinit();
+    const s = try z.toStringFixed(a, -2_000_000, .down);
+    defer a.free(s);
+    try testing.expectEqualStrings("0", s);
+}
+
+test "remainder / divideInteger / remainderNear refuse a too-wide divisor alignment (sweep audit GN-DA-45)" {
+    const a = testing.allocator;
+    var one = try BigDecimal.parse(a, "1");
+    defer one.deinit();
+    var tiny = try BigDecimal.parse(a, "1E-200000");
+    defer tiny.deinit();
+    // The divisor (second operand) is the one scaled up here.
+    try testing.expectError(error.Overflow, BigDecimal.remainder(a, tiny, one));
+    try testing.expectError(error.Overflow, BigDecimal.divideInteger(a, tiny, one));
+    try testing.expectError(error.Overflow, BigDecimal.remainderNear(a, tiny, one));
+}
+
+test "a coefficient of exactly max_coeff_digits digits is accepted by the exact-count path (sweep audit GN-DA-30)" {
+    const a = testing.allocator;
+    const cap: i32 = BigDecimal.max_coeff_digits;
+    var one = try BigDecimal.parse(a, "1");
+    defer one.deinit();
+    var x = try BigDecimal.rescale(a, one, -(cap - 1), .down); // cap digits
+    defer x.deinit();
+    var s = try BigDecimal.add(a, x, x); // 2 * 10^(cap-1): still cap digits
+    s.deinit();
+    var t = try BigDecimal.rescale(a, x, -(cap - 1), .down); // same exponent: no growth
+    t.deinit();
+    var y = try tenPow(a, 9, 199_999, 0); // 9 * 10^199999: cap digits, near the bit-length window
+    defer y.deinit();
+    var zero = try BigDecimal.parse(a, "0");
+    defer zero.deinit();
+    var s2 = try BigDecimal.add(a, y, zero);
+    s2.deinit();
+    var m = try BigDecimal.mul(a, y, one);
+    m.deinit();
+    var r = try BigDecimal.rescale(a, y, 0, .down);
+    r.deinit();
+    var y2 = try tenPow(a, 1, 199_999, 0);
+    defer y2.deinit();
+    var r2 = try BigDecimal.rescale(a, y2, 0, .down);
+    r2.deinit();
+}
