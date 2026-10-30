@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (102/112, 10 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TSDB_FUZZ) · ct n/a — time series store (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TSDB_FUZZ) · ct n/a — time series store (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: on-disk counters/lengths checked at use, chunk options of 0 = default, retention chunk memory bounded, canonical form refused before work, series count valid across own commits; delta audit 39/39)
 
 **Performance:** ref 0.28–0.58× aidlx/tsink 0.10.2 with `WalSyncMode::PerAppend` (`zig build bench-tsdb`: 1000 series × 200 scrapes one commit each, 200k-sample bulk, range and matcher reads; both durable on disk; owner's like-for-like choice) · fastest ? (measured 2026-10-20)
 

@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-11 · mutation 2026-10-04 (97/117, 19 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DECIMAL_FUZZ) · ct n/a — decimal arithmetic (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, DECIMAL_FUZZ) · ct n/a — decimal arithmetic (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: BigDecimal parse width capped at `max_parse_digits`, every produced coefficient at `max_coeff_digits`, plain-output padding at `max_align_shift`; zero stripping by bisection; carry/scale overflows refused; delta audit 44/47 + 3 eq)
 
 **Performance:** ref 0.02–1.04× libmpdec 4.0.1 (built -O2 from source; `zig build bench-decimal`: parse, add/sub chain, mul rounded to 12 and 2 places, divRound to 12, toString on 100k money values; BigDecimal add/mul/divPrec/sqrt at 28 and 200 digits; our BigDecimal results on a bump allocator rewound per batch, as libmpdec reuses its result) · fastest 2.39× worst vs the faster of libmpdec and rust_decimal 1.42.1 (parse; mul/divRound 0.4–1.0×) (measured 2026-10-20)
 

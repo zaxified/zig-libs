@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-04 (42/46, 4 eq) · src ?
 
-**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, CSVSTREAM_FUZZ; dialect harness checks the event-jumping scanner against its bytewise reference — a planted cap mutant fails at seed 48) · ct n/a — CSV parsing (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, CSVSTREAM_FUZZ; dialect harness checks the event-jumping scanner against its bytewise reference — a planted cap mutant fails at seed 48) · ct n/a — CSV parsing (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: capacity sums saturate, scan start clamped, counters saturate, no-cut refills double (O(M log M)), EOF probe ≤ 64 KiB; delta audit 18/20 + 2 eq)
 
 **Performance:** ref 0.43–0.89× Go encoding/csv 1.26.8 (`ReuseRecord`, `LazyQuotes`; `zig build bench-csvstream`: narrow 10×1M, wide 100×100k, every field quoted, multi-line `.span`, in-memory, writer 1M records) · fastest ? (measured 2026-10-20)
 

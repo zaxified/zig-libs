@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-18 · mutation 2026-09-30 (11/13, 2 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TZ_FUZZ) · ct n/a — timezone data (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TZ_FUZZ) · ct n/a — timezone data (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: year arithmetic at the i64 ends in i64, hand-built zones with an out-of-table abbreviation index or julian `minInt(i32)` no longer panic; delta audit 6/8 + 2 eq)
 
 **Performance:** ref 0.08–0.62× glibc 2.43 `localtime_r`/`mktime` over the same pinned tzdata 2026a tree (`zig build bench-tz`: 1M instants in 4 zones, table era and footer era, local → UTC with gaps/folds) · fastest 4.7× vs Go time 1.26.8 on local → UTC (table/footer lookups 0.44–1.05×) (measured 2026-10-20)
 
