@@ -64,7 +64,8 @@ modules/tlock/src/age.zig	1	10
 # tls13 certverify 2026-10-21: the second plain compare is a test's (a hedged ML-DSA signature differs from the deterministic one) -- public.
 modules/tls13/src/certverify.zig	1	2
 modules/tls13/src/keyschedule.zig	2	4
-modules/tlsclient/src/Client.zig	2	6
+# tlsclient Client 2026-10-30: the 7th plain compare is a test's (da5c973a: the key changed after a KeyUpdate) -- public.
+modules/tlsclient/src/Client.zig	2	7
 modules/tlsresume/src/cache.zig	1	0
 modules/tlsresume/src/psk.zig	1	0
 # tlsserver keys 2026-10-21: an ML-DSA `both` key's expanded half against its seed's is timing_safe.eql (secret); the plain compares are PEM labels, OIDs, public keys against the leaf and tests -- all public.
