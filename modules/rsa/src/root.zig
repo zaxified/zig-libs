@@ -184,7 +184,7 @@ const min_modulus_bits = 512;
 
 /// Modulus length in bytes for a modulus of `bit_count` bits.
 fn byteLen(bit_count: usize) usize {
-    return (bit_count + 7) / 8;
+    return bit_count / 8 + @intFromBool(bit_count % 8 != 0); // sweep REV-RS-3: no `+ 7` overflow
 }
 
 /// DER integers and externally supplied big-endian values may carry leading
@@ -770,6 +770,9 @@ fn bigFromBytes(gpa: std.mem.Allocator, bytes: []const u8) !BigInt {
 /// arena and lets the whole arena die together, never calling `.deinit()`
 /// individually — a caller using a real allocator must deinit the result.
 pub fn bigModInverse(gpa: std.mem.Allocator, e: *const BigInt, m: *const BigInt) !BigInt {
+    // Sweep RS-4: a zero modulus reached `divFloor` below with a zero divisor
+    // (std asserts); there is no inverse modulo 0 (`e = 1, m = 0` got that far).
+    if (m.eqlZero()) return error.InvalidPrivateKey;
     // Invariants: t0*e ≡ r0, t1*e ≡ r1 (mod m).
     var r0 = try newBig(gpa);
     try r0.copy(m.toConst());
@@ -812,6 +815,9 @@ fn fromPrimesImpl(p_bytes: []const u8, q_bytes: []const u8, e_bytes: []const u8)
     // public, so are these branches.
     if (eb.len == 0 or eb[eb.len - 1] & 1 == 0) return error.InvalidPrivateKey;
     if (eb.len == 1 and eb[0] < 3) return error.InvalidPrivateKey;
+    // Sweep REV-RS-1: e < 2^32, as `PublicKey.fromBytes` and `generate` require; every
+    // later `publicExponent()` (`toPrimitive(u32) catch unreachable`) relies on it.
+    if (eb.len > 4) return error.InvalidPrivateKey;
 
     // `Modulus.fromBytes` rejects even and < 3 values, covering p, q oddness.
     // ⚠ These two `std.crypto.ff` constructions are the derivation's one
@@ -1293,9 +1299,14 @@ fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Bl
 }
 
 /// RSAEP: c = m^e mod n (RFC 8017 §5.1.1), the encryption primitive.
-/// `modulus_len` must be the modulus length in bytes (`k` = ceil(bits(n)/8)).
+/// `modulus_len` must be the modulus length in bytes (`k` = ceil(bits(n)/8));
+/// a value below `k` (here and in `rsavp1`, `rsadp`, `rsadpCrt`,
+/// `rsadpCrtBlinded`, `rsasp1`) is `error.MessageRepresentativeOutOfRange`,
+/// a larger one left-pads.
 pub fn rsaep(comptime modulus_len: usize, m: [modulus_len]u8, pk: PublicKey) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
+    // Sweep RS-2: a result buffer shorter than the modulus cannot hold the value.
+    if (modulus_len < pk.n_mont.byteLen()) return error.MessageRepresentativeOutOfRange;
     var out: [modulus_len]u8 = undefined;
     try publicOp(pk, &m, &out);
     return out;
@@ -1317,6 +1328,7 @@ pub fn rsadp(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretK
 
 noinline fn rsadpUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
+    if (modulus_len < sk.n_mont.byteLen()) return error.MessageRepresentativeOutOfRange; // sweep RS-2
     var out: [modulus_len]u8 = undefined;
     try privateOpPtr(sk, &c, &out);
     return out;
@@ -1347,6 +1359,7 @@ pub fn rsadpCrtBlinded(comptime modulus_len: usize, c: [modulus_len]u8, sk: *con
 
 noinline fn rsadpCrtBlindedUnburned(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
     comptime std.debug.assert(modulus_len <= max_modulus_len);
+    if (modulus_len < sk.n_mont.byteLen()) return error.MessageRepresentativeOutOfRange; // sweep RS-2
     var out: [modulus_len]u8 = undefined;
     try privateOpCrtPtr(sk, &c, &out, blinding);
     return out;
@@ -2045,6 +2058,8 @@ noinline fn decryptOaepHNoFailUnburned(
 ///   EM = (DB ^ MGF1(H)) || H || 0xbc, DB = PS(0x00…) || 0x01 || salt,
 /// with the leftmost 8·emLen - emBits bits of maskedDB cleared (step 11).
 ///
+/// `em.len != ceil(em_bits/8)` is `error.EncodedMessageTooShort`, like a too-small `em`.
+///
 /// `pub` so a caller needing EMSA-PSS-ENCODE as a standalone step — decoupled
 /// from RSASP1 — can reuse it instead of carrying an independent copy.
 /// `blindrsa`'s RFC 9474 Blind is exactly this: it encodes, then blinds the
@@ -2062,7 +2077,9 @@ pub fn emsaPssEncode(comptime Hash: type, msg: []const u8, salt: []const u8, em_
 fn emsaPssEncodeDigest(comptime Hash: type, comptime MgfHash: type, m_hash: *const [Hash.digest_length]u8, salt: []const u8, em_bits: usize, em: []u8) EmsaEncodeError!void {
     const h_len = Hash.digest_length;
     const em_len = em.len;
-    std.debug.assert(em_len == byteLen(em_bits));
+    // Sweep RS-3: `em.len` must be ceil(em_bits/8) (an assert, i.e. UB in
+    // ReleaseFast, on a value `pub emsaPssEncode` takes from its caller).
+    if (em_len != byteLen(em_bits)) return error.EncodedMessageTooShort;
     // §9.1.1 step 3: emLen >= hLen + sLen + 2.
     if (em_len < h_len + 2 or salt.len > em_len - h_len - 2) return error.EncodedMessageTooShort;
 
@@ -2415,18 +2432,16 @@ fn publicKeyFromDerImpl(bytes: []const u8) !PublicKey {
 /// The modulus and exponent INTEGER contents of a DER `RSAPublicKey`, or of
 /// the one an X.509 `SubjectPublicKeyInfo` wraps — the structure walk shared
 /// by `PublicKey.fromDer` and `VerifyKey.fromDer`.
-fn publicKeyPartsFromDer(bytes: []const u8) !struct { n: []const u8, e: []const u8 } {
+const PublicKeyParts = struct { n: []const u8, e: []const u8 };
+
+fn publicKeyPartsFromDer(bytes: []const u8) !PublicKeyParts {
     const top = try derTopSequence(bytes);
     if (top.slice.start >= top.slice.end) return error.InvalidDer; // empty SEQUENCE
     const first = Asn1.Element.decode(bytes, top.slice.start) catch return error.InvalidDer;
     if (first.slice.end > top.slice.end) return error.InvalidDer;
 
     if (first.tag.class == .universal and !first.tag.constructed and first.tag.number == .integer) {
-        // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
-        const n = first;
-        const e = try derChild(bytes, n.slice.end, top.slice.end, .integer, false);
-        if (e.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
-        return .{ .n = derView(bytes, n), .e = derView(bytes, e) };
+        return pkcs1PublicParts(bytes, top);
     }
 
     if (first.tag.class == .universal and first.tag.constructed and first.tag.number == .sequence) {
@@ -2443,10 +2458,26 @@ fn publicKeyPartsFromDer(bytes: []const u8) !struct { n: []const u8, e: []const 
         const raw = derView(bytes, bit_str);
         // The embedded RSAPublicKey DER must be byte-aligned: zero unused bits.
         if (raw.len < 1 or raw[0] != 0) return error.InvalidDer;
-        return publicKeyPartsFromDer(raw[1..]);
+        // Sweep RS-1: the BIT STRING holds a bare PKCS#1 `RSAPublicKey` and
+        // nothing else. It used to be parsed by this function again, so an SPKI
+        // wrapped in an SPKI wrapped in ... recursed to a depth set by the input
+        // (stack overflow on a large DER).
+        const inner = raw[1..];
+        const inner_top = try derTopSequence(inner);
+        if (inner_top.slice.start >= inner_top.slice.end) return error.InvalidDer;
+        return pkcs1PublicParts(inner, inner_top);
     }
 
     return error.InvalidDer;
+}
+
+/// `RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }`:
+/// `top` is the outer SEQUENCE of `bytes`; exactly two INTEGERs.
+fn pkcs1PublicParts(bytes: []const u8, top: Asn1.Element) !PublicKeyParts {
+    const n = try derChild(bytes, top.slice.start, top.slice.end, .integer, false);
+    const e = try derChild(bytes, n.slice.end, top.slice.end, .integer, false);
+    if (e.slice.end != top.slice.end) return error.InvalidDer; // exactly two fields
+    return .{ .n = derView(bytes, n), .e = derView(bytes, e) };
 }
 
 /// `RSAPrivateKey` (PKCS#1 Appendix A.1.2), two-prime form only (`version`
@@ -3633,6 +3664,7 @@ pub fn selfSignedCert(
 test {
     _ = openssh;
     _ = der_writer;
+    _ = @import("sweep_test.zig");
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("wycheproof_test.zig");

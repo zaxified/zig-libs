@@ -558,6 +558,9 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 - ~~**Prehashed-digest sign/verify (PKCS#1 v1.5 and PSS)**~~ ✅ sign 2026-10-13, verify + run-time `HashId` forms 2026-10-14. Original text *(survey 2026-09-30)*: the hash is a comptime type and the message is hashed inside, so a caller that already holds a digest (TLS transcript signatures, HSM/CMS flows, hashes of huge files) cannot use it. Go and OpenSSL offer it. Effort: small. Fits §2.
 - ~~**PSS verify with automatic salt length**~~ ✅ 2026-10-14 `verifyPssAuto` (+ `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`). Original text *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
 
+- **Caller-lowerable PBKDF2 iteration cap** (sweep GP review, 2026-10-30): `max_pbkdf2_iterations` (2^20, ~0.3-1 s per hostile encrypted key) is fixed; minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
+- **`fromPrimes` has no minimum modulus size** (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). Undecided whether a floor breaks that test; whether `drawBlindingPair` terminates for a < 8-bit half is unverified.
+
 ## Status
 
 `extract · any · util · reentrant` + deps: `montint` (hot-path modexp), `std.crypto.ff` (key
