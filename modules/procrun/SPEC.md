@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-28 (3/3) · src ?
 
-**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — process runner (keyword review, 2026-10-07)
+**Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct n/a — process runner (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: stream_permits 0/huge, rlimit overflow, invalid signal, deadline-bounded stdin writer, `Handle.wait` bounded against descendants holding the pipes; delta audit 32/38 + 6 eq)
 
 **Performance:** ref 0.54–1.04× Go os/exec 1.26.8 (`zig build bench-procrun`: 200 sequential and 8×50 concurrent `/bin/true`, 100 MiB capture, 32 MiB `cat` round trip; capture buffers on a heap that keeps freed memory on both sides) · fastest 1.22× worst vs the faster of Go and Rust std::process 1.93.1 (measured 2026-10-20)
 

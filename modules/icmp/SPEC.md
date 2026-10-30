@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-09-10 · src ?
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean, ICMP_FUZZ) · ct n/a — ICMP ping/codec (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: max_inflight 0, ns saturation, bounded O(N log N) subnet pacing, callback re-entrancy, no spin under the in-flight cap, bounded step(), prepare reserves the queue; delta audit 65/68 + 3 eq)
 
 **Performance:** n/a — a ping run lasts its round trips and the configured interval/timeout, as in fping; the CPU per probe is not what a user picks it for
 

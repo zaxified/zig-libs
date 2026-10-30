@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-19 · mutation 2026-10-04 (33/34, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, RESILIENCE_FUZZ: breaker, retry, run) · ct n/a — circuit breaker (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-17 (200,000-run budget per harness clean, RESILIENCE_FUZZ: breaker, retry, run) · ct n/a — circuit breaker (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: option asserts → checked panics, Bulkhead release at 0 no-op and stuck-clock bound, Retry attempt 0/base 0, u64 rate windows; delta audit 13/13)
 
 **Performance:** ref 0.03–0.67× gobreaker 2.4.0 / failsafe-go 0.9.8 / cenkalti/backoff 5.0.3 (Go 1.26.8) · fastest ? (measured 2026-10-20)
 

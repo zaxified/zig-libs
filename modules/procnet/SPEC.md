@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-18 (60/62, 2 eq) · src 8a01a31feabe3936
 
-**Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-04 (3000-script deterministic driver) · ct n/a — /proc parsers (keyword review, 2026-10-07) · panic 2026-10-30 (sweep of every pub entry point + blind review: no crash found; `max_total_fds` bounds the socket-owner walk, `find`/`findAll` O(log n); delta audit 13/15 + 1 eq)
 
 **Performance:** ref 0.16–0.89× prometheus/procfs v0.21.1 · fastest ? (measured 2026-10-20)
 
