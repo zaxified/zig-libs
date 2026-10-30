@@ -289,3 +289,146 @@ test "runTimeout returns the Output when its kill breaks the stdin pipe (sweep D
     try testing.expect(out.timed_out);
     try testing.expectEqualStrings("partial\n", out.stdout);
 }
+
+/// Collects stdout chunks (single reader thread; read it after `wait`).
+const Collect = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+    delay_first_ms: u64 = 0,
+
+    fn onOut(cx: ?*anyopaque, chunk: []const u8) void {
+        const s: *Collect = @ptrCast(@alignCast(cx.?));
+        if (s.len == 0 and s.delay_first_ms != 0) sleepMs(s.delay_first_ms);
+        const n = @min(chunk.len, s.buf.len - s.len);
+        @memcpy(s.buf[s.len..][0..n], chunk[0..n]);
+        s.len += n;
+    }
+
+    fn text(s: *const Collect) []const u8 {
+        return s.buf[0..s.len];
+    }
+};
+
+fn requestLater(c: *pr.Cancel, io: std.Io, ms: u64) void {
+    sleepMs(ms);
+    c.request(io);
+}
+
+test "Spec.cancel bounds a stdin write held open by a descendant (sweep audit GO-PR-A)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const body = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+
+    // No deadline, only a Cancel: the stdin writer is bounded by the killer's
+    // `stop_ns` alone. A background `sleep` holds a dup of the pipe's read end
+    // and never reads it, so killing the direct child does not wake the write.
+    var cancel: pr.Cancel = .{};
+    const th = try std.Thread.spawn(.{}, requestLater, .{ &cancel, io, 300 });
+    defer th.join();
+    const t0 = nowNs();
+    var out = try pr.run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "exec 3<&0; sleep 3 0<&3 >/dev/null 2>&1 & exec sleep 3 </dev/null" },
+        .stdin = .pipe,
+        .cancel = &cancel,
+    }, body);
+    defer out.deinit(testing.allocator);
+    const elapsed_ms = (nowNs() - t0) / std.time.ns_per_ms;
+    sleepMs(3300 -| elapsed_ms); // the stray sleep must end before the test does
+    try testing.expect(out.canceled);
+    try testing.expect(elapsed_ms < 2000);
+}
+
+test "a child that exits early without reading stdin still gives BrokenPipe (sweep audit GO-PR-B)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const body = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+    // Documented on `run`: only a kill by the call itself turns EPIPE into an Output.
+    try testing.expectError(error.BrokenPipe, pr.runTimeout(testing.allocator, io, .{
+        .argv = &.{"true"},
+        .stdin = .pipe,
+    }, body, 30 * std.time.ns_per_s));
+}
+
+test "a Cancel that kills a non-reading child returns the Output, not BrokenPipe (sweep audit GO-PR-C)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const body = try testing.allocator.alloc(u8, 4 << 20);
+    defer testing.allocator.free(body);
+    @memset(body, 'x');
+
+    var cancel: pr.Cancel = .{};
+    const th = try std.Thread.spawn(.{}, requestLater, .{ &cancel, io, 300 });
+    defer th.join();
+    var out = try pr.run(testing.allocator, io, .{
+        .argv = &.{ "sleep", "5" },
+        .stdin = .pipe,
+        .cancel = &cancel,
+    }, body);
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.canceled);
+}
+
+test "wait keeps a descendant's output that arrives inside the idle grace (sweep audit GO-PR-D)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The first callback takes 150 ms, so the reader is back in its idle
+    // `poll` only after the direct child is long gone; the descendant writes
+    // at ~300 ms, inside the 250 ms grace that starts at ~150 ms.
+    var c: Collect = .{ .delay_first_ms = 150 };
+    const h = try pr.spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo a; (sleep 0.3; echo late) & exit 0" },
+    }, .{ .ctx = &c, .on_stdout = Collect.onOut });
+    _ = h.wait();
+    sleepMs(400); // let the descendant end before the test does
+    try testing.expectEqualStrings("a\nlate\n", c.text());
+}
+
+test "wait does not cut the stream of a child that is still running (sweep audit GO-PR-E)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 600 ms of silence from a LIVE child is longer than the post-exit grace
+    // (250 ms), which must only ever run after the child has exited.
+    var c: Collect = .{};
+    const h = try pr.spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo a; sleep 0.6; echo b" },
+    }, .{ .ctx = &c, .on_stdout = Collect.onOut });
+    _ = h.wait();
+    try testing.expectEqualStrings("a\nb\n", c.text());
+}
+
+test "line mode: wait returns after a grace when a descendant keeps the pipes open (sweep audit GO-PR-F)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var seen: Tail = .{};
+    const t0 = nowNs();
+    const h = try pr.spawnStreaming(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo before; sleep 3 & exit 0" },
+    }, .{ .ctx = &seen, .on_stdout_line = Tail.onLine });
+    _ = h.wait();
+    const elapsed_ms = (nowNs() - t0) / std.time.ns_per_ms;
+    sleepMs(3200 -| elapsed_ms);
+    try testing.expect(elapsed_ms < 2000);
+    try testing.expectEqual(@as(usize, 1), seen.n.load(.monotonic));
+}
