@@ -302,3 +302,129 @@ test "deleteSeries removes a block whose header does not decode (sweep D13)" {
     const left = try c2.next();
     try testing.expect(left == null or left.?.key[0] != codec.tag_block);
 }
+
+// ── delta mutation audit (sweep audit GN) ───────────────────────────────────
+
+test "canonicalize: the early lower bound is exactly 4 bytes per label, out.len included (sweep audit GN-TS-2)" {
+    // 700 identical empty labels: lower bound 4 + 1 + 700 * 4 = 2805 <= 3072,
+    // so the early bound lets it through (which later check reports the
+    // duplicate is not pinned here); 800 of them are over the cap.
+    var labels: [800]codec.Label = undefined;
+    @memset(&labels, .{ .name = "", .value = "" });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    if (codec.canonicalize(testing.allocator, &out, "m", labels[0..700])) |_| {
+        return error.TestUnexpectedResult; // duplicates are never accepted
+    } else |e| try testing.expect(e != error.SeriesTooLong);
+    try testing.expectError(error.SeriesTooLong, codec.canonicalize(testing.allocator, &out, "m", labels[0..800]));
+
+    // `out` already holds 3040 bytes: 10 labels (45 more) cannot fit, refused
+    // before the scratch copy is allocated (failing allocator = no allocation).
+    var pre: std.ArrayList(u8) = .empty;
+    defer pre.deinit(testing.allocator);
+    try pre.appendNTimes(testing.allocator, 0, 3040);
+    var ten: [10]codec.Label = undefined;
+    @memset(&ten, .{ .name = "", .value = "" });
+    try testing.expectError(error.SeriesTooLong, codec.canonicalize(testing.failing_allocator, &pre, "m", &ten));
+}
+
+test "canonicalize stops building the form as soon as it is over the cap (sweep audit GN-TS-3)" {
+    // 700 distinct names x 1000-byte values: the early bound (2805) passes, the
+    // form would be ~700 KB if built whole.
+    var names: [700][4]u8 = undefined;
+    var labels: [700]codec.Label = undefined;
+    const big: [1000]u8 = @splat('v');
+    for (&names, &labels, 0..) |*n, *l, i| {
+        _ = std.fmt.bufPrint(n, "n{d:0>3}", .{i}) catch unreachable;
+        l.* = .{ .name = n, .value = &big };
+    }
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = fa.allocator();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expectError(error.SeriesTooLong, codec.canonicalize(gpa, &out, "m", &labels));
+    try testing.expect(fa.allocated_bytes < 100 * 1024);
+}
+
+test "max_series: the cached count follows batches, appends and a foreign commit exactly (sweep audit GN-D12)" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    fx.db.opts.max_series = 6;
+    const s1 = try fx.db.seriesId("s1", &.{}); // 1, count valid
+    const specs = [_]tsdb.Db.SeriesSpec{
+        .{ .name = "b1", .labels = &.{} }, .{ .name = "b2", .labels = &.{} }, .{ .name = "b3", .labels = &.{} },
+    };
+    var ids: [3]tsdb.SeriesId = undefined;
+    try fx.db.seriesIds(&specs, &ids); // 4
+    try fx.db.append(s1, 1, 1); // adds nothing
+    _ = try fx.db.seriesId("s5", &.{}); // 5
+    _ = try fx.db.seriesId("s6", &.{}); // 6 = full
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("s7", &.{}));
+    try testing.expectEqual(@as(usize, 1), fx.db.series_recounts);
+
+    // a foreign registration, then an own commit: the stale count must not be
+    // re-stamped as current
+    fx.db.opts.max_series = 8;
+    var other = tsdb.Db.initOptions(gpa, fx.tree, .{});
+    defer other.deinit();
+    _ = try other.seriesId("foreign", &.{}); // 7
+    try fx.db.append(s1, 2, 2);
+    _ = try fx.db.seriesId("s8", &.{}); // 8 = full
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("s9", &.{}));
+}
+
+test "deleteSeries over several chunks lowers the cached count once, at the end (sweep audit GN-D12)" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    fx.db.opts.max_series = 3;
+    const a = try fx.db.seriesId("a", &.{});
+    _ = try fx.db.seriesId("b", &.{});
+    for (0..10) |i| try fx.db.append(a, @intCast(i), 1);
+    const d = try fx.db.deleteSeries(a, .{ .chunk_deletes = 2 });
+    try testing.expect(d.chunks >= 4);
+    // count is 1 now: two more fit, the third is refused
+    _ = try fx.db.seriesId("c", &.{});
+    _ = try fx.db.seriesId("d", &.{});
+    try testing.expectError(error.TooManySeries, fx.db.seriesId("e", &.{}));
+    try testing.expectEqual(@as(usize, 1), fx.db.series_recounts);
+}
+
+test "every write path keeps the cached series count valid (no recount) (sweep audit GN-D12)" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    fx.db.opts.max_series = 1000;
+    const s = try fx.db.seriesId("m", &.{});
+    var nm: [8]u8 = undefined;
+    // after each step one more registration must not rescan the index
+    for (0..5) |step| {
+        const base: i64 = @intCast(step * 10000);
+        for (0..300) |i| try fx.db.append(s, base + @as(i64, @intCast(i)), 1);
+        switch (step) {
+            0 => try fx.db.appendBatch(&.{.{ .series = s, .points = &.{.{ .ts = base + 5000, .value = 1 }} }}),
+            1 => _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 }),
+            2 => _ = try fx.db.sweep(base + 50, .{}),
+            3 => _ = try fx.db.sweepToBudget(0, .{}),
+            else => {
+                _ = try fx.db.compact(std.math.maxInt(i64), .{ .min_run = 1 });
+                _ = try fx.db.deleteRange(s, base + 10, base + 20);
+            },
+        }
+        const name = try std.fmt.bufPrint(&nm, "x{d}", .{step});
+        _ = try fx.db.seriesId(name, &.{});
+        try testing.expectEqual(@as(usize, 1), fx.db.series_recounts);
+    }
+}
+
+test "a retention chunk ends exactly when the kept suffixes reach chunk_deletes (sweep audit GN-TS-6)" {
+    const gpa = testing.allocator;
+    var fx = try Fixture.init(gpa);
+    defer fx.deinit();
+    try straddlingStore(&fx, 50); // every block keeps 200 samples
+    const r = try fx.db.sweep(100, .{ .chunk_deletes = 200 });
+    try testing.expect(r.done);
+    // `>=`: one block per chunk (50+ chunks); `>` would take two (about 26)
+    try testing.expect(r.chunks >= 50);
+}
