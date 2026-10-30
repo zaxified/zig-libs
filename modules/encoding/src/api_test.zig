@@ -104,7 +104,7 @@ test "unmappable modes: ?, ignore, &#NNNN;, fatal with the code point" {
     const p = e.encodeInto(text, &buf, true);
     try testing.expectEqual(enc.EncodeStatus.unmappable, p.status);
     try testing.expectEqual(@as(u21, 0x1F600), p.code_point);
-    try testing.expectEqual(@as(usize, 1), p.read);
+    try testing.expectEqual(@as(usize, 5), p.read); // past the 4-byte U+1F600 (sweep REV-EN-3)
     try testing.expectEqualStrings("a", buf[0..p.written]);
 }
 

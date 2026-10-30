@@ -57,8 +57,10 @@ pub fn asciiPrefix(s: []const u8) usize {
 /// Copy the ASCII run at `src[r..]` into `dst[w..]` as far as both allow;
 /// returns how many bytes were copied.
 inline fn copyAscii(src: []const u8, r: usize, dst: []u8, w: usize) usize {
-    const run = asciiPrefix(src[r..]);
-    const n = @min(run, dst.len - w);
+    // Sweep REV-EN-2: scan no further than `dst` can take, or a caller-buffer loop with a small
+    // `dst` over a long ASCII `src` rescans the whole tail on every call (quadratic).
+    const room = @min(src.len - r, dst.len - w);
+    const n = asciiPrefix(src[r..][0..room]);
     @memcpy(dst[w..][0..n], src[r..][0..n]);
     return n;
 }

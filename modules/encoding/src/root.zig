@@ -619,7 +619,9 @@ pub const Encoder = struct {
     /// stream (a cut sequence's bytes then pass through, or become U+FFFD
     /// for UTF-16). On `.output_full`, call again with `src[read..]`; on
     /// `.unmappable` (fatal mode), `code_point` is the character and `read`
-    /// stops before it.
+    /// is PAST it (its bytes may have been carried from an earlier call, so
+    /// they cannot be given back); continue with `src[read..]` after deciding
+    /// what to write, as with `cjk.Encoder`.
     pub fn encodeInto(self: *Encoder, src: []const u8, dst: []u8, last: bool) EncodeProgress {
         var r: usize = 0;
         var w: usize = 0;
@@ -642,37 +644,36 @@ pub const Encoder = struct {
             }
             self.bom_due = false;
         }
-        // Complete a sequence cut by the end of the previous call. Only a
-        // single-byte target leaves one (the UTF-16 target carries it in
-        // its decoder state); its first byte is a valid lead byte.
+        // Complete a sequence cut by the end of the previous call. `pending` is a
+        // prefix of the input stream: after an `.output_full` it can start with bytes
+        // already decided (a lone continuation byte), so it is run through `step`
+        // together with the first bytes of `src` instead of being assumed to start with
+        // a lead byte (sweep REV-EN-1).
         if (self.pending_len != 0) {
             const pl: usize = self.pending_len;
-            var tmp: [4]u8 = undefined;
+            var tmp: [6]u8 = undefined;
             @memcpy(tmp[0..pl], self.pending[0..pl]);
-            const need = (std.unicode.utf8ByteSequenceLength(tmp[0]) catch unreachable) - pl;
-            const take = @min(src.len, need);
+            const take = @min(src.len, 3);
             @memcpy(tmp[pl..][0..take], src[0..take]);
-            const tlast = last and take == src.len;
-            if (take < need and !tlast) {
-                @memcpy(self.pending[pl..][0..take], src[0..take]);
-                self.pending_len += @intCast(take);
-                return .{ .status = .input_empty, .read = take, .written = w };
-            }
-            const p = self.step(tmp[0 .. pl + take], dst[w..], tlast);
+            const total = pl + take;
+            var p = self.step(tmp[0..total], dst[w..], last and take == src.len);
             w += p.written;
             replaced = p.replaced;
-            if (p.read < pl) {
+            // Fatal mode: `read` is PAST the unmappable code point, so a caller that
+            // substitutes and continues with `src[read..]` always makes progress.
+            if (p.status == .unmappable) p.read += std.unicode.utf8CodepointSequenceLength(p.code_point) catch 1;
+            if (p.status != .input_empty and p.read < pl) {
                 // Stopped inside the carried bytes: keep the rest of them.
                 std.mem.copyForwards(u8, self.pending[0..], self.pending[p.read..pl]);
                 self.pending_len = @intCast(pl - p.read);
-                if (p.status == .input_empty) {
-                    // A new sequence starting inside them is cut again; the
-                    // bytes taken from `src` go with it.
-                    @memcpy(self.pending[self.pending_len..][0..take], src[0..take]);
-                    self.pending_len += @intCast(take);
-                    return .{ .status = .input_empty, .read = take, .written = w, .replaced = replaced };
-                }
                 return .{ .status = p.status, .read = 0, .written = w, .replaced = replaced, .code_point = p.code_point };
+            }
+            if (p.status == .input_empty and p.read < pl) {
+                // A sequence starting inside them is cut again; `src` is all in it.
+                const rest = total - p.read;
+                std.mem.copyForwards(u8, self.pending[0..], tmp[p.read..total]);
+                self.pending_len = @intCast(rest);
+                return .{ .status = .input_empty, .read = take, .written = w, .replaced = replaced };
             }
             self.pending_len = 0;
             // Whatever of `tmp` was not read came from `src`: read it again there.
@@ -681,6 +682,7 @@ pub const Encoder = struct {
         }
         const p = self.step(src[r..], dst[w..], last);
         r += p.read;
+        if (p.status == .unmappable) r += std.unicode.utf8CodepointSequenceLength(p.code_point) catch 1;
         w += p.written;
         replaced = replaced or p.replaced;
         if (p.status == .input_empty and r < src.len) {
@@ -1113,6 +1115,7 @@ test "encode: a valid multi-byte lead truncated at buffer end passes through, no
 }
 
 test {
+    _ = @import("sweep_test.zig");
     _ = @import("fuzz_test.zig");
     // Exhaustive cross-check of all five high-tables against vendored
     // normative sources (WHATWG index-*.txt / Unicode.org 8859-1.TXT) — see

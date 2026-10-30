@@ -358,8 +358,9 @@ pub const Decoder = struct {
                         w = f[1];
                     },
                     .euc_jp => if (self.lead == 0) {
-                        const ascii_run = core.asciiPrefix(src[r..]);
-                        const n = @min(ascii_run, dst.len - w);
+                        // Sweep REV-EN-2: bounded by the room in `dst` (no tail rescan per call).
+                        const room = @min(src.len - r, dst.len - w);
+                        const n = core.asciiPrefix(src[r..][0..room]);
                         @memcpy(dst[w..][0..n], src[r..][0..n]);
                         r += n;
                         w += n;

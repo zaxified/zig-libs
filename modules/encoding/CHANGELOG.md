@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). `Encoder.encodeInto` with a small caller `dst` (10–12 bytes, the documented minimum room) could keep a non-lead byte in its carry buffer and hit `unreachable` on the next call; carried bytes now go through the normal step, and output equals the whole-buffer encode for every split and every `dst` ≥ 10. The ASCII fast path (`copyAscii`, the EUC-JP ASCII run) scanned the whole remaining input on every call although at most the `dst` room is copied — quadratic in the caller-buffer loop; the scan is bounded by the room. **Contract change, fatal mode:** when an unmappable code point starts in carried bytes, `read` is now past it (as the CJK encoder documents), so skipping makes progress (it returned `read = 0` and re-hit the same code point forever). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-23** — Fix: `decodeUtf8`/`validPrefix` failed to compile for a target without AVX2 in an optimized mode (x86_64-windows baseline, `ReleaseSmall`: "evaluation exceeded 1000 backwards branches" in the portable lookup tree); `scan` raises its branch quota.
