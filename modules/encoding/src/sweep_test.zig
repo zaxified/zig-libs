@@ -249,3 +249,27 @@ test "caller-buffer ASCII copy scans only the room in dst, not the whole tail (s
     const pe = ec.encodeInto(src, &dst, false);
     try std.testing.expectEqual(@as(usize, 64), pe.written);
 }
+
+test "Encoder: a multi-byte character fed one byte per call reports read = 1 each time and encodes like the whole buffer (sweep audit GP-EN-1)" {
+    const alloc = std.testing.allocator;
+    const inputs = [_][]const u8{
+        "\xF0\x9F\x98\x80", // 4-byte character, still cut after 1, 2 and 3 bytes
+        "a\xE2\x82\xACb", // 3-byte character
+        "\xF0\x9F\x98\x80\xF0\x9F\x98\x80\xE2\x98\x83",
+    };
+    for ([_]enc.Encoding{ .windows_1252, .iso_8859_2 }) |e| {
+        for ([_]enc.Unmappable{ .question_mark, .html_ncr }) |mode| {
+            for (inputs) |input| {
+                const want = try enc.encodeFromUtf8Opts(alloc, input, e, .{ .unmappable = mode });
+                defer alloc.free(want);
+                var chunks: [16][]const u8 = undefined;
+                for (input, 0..) |_, i| chunks[i] = input[i..][0..1];
+                for (core_min_room..33) |dst_len| {
+                    const got = try driveEncode(alloc, e, mode, chunks[0..input.len], dst_len);
+                    defer alloc.free(got);
+                    try std.testing.expectEqualSlices(u8, want, got);
+                }
+            }
+        }
+    }
+}
