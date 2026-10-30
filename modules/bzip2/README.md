@@ -37,7 +37,7 @@ const line = try r.reader.takeDelimiter('\n');
 // On error the reader reports error.ReadFailed and `r.err` holds the bzip2.DecodeError.
 ```
 
-`DecodeOptions`: `max_output` (bomb cap: more output is `error.OutputTooLarge`), `multi_stream`
+`DecodeOptions`: `max_output` (bomb cap, default 256 MiB, `null` = unbounded: more output is `error.OutputTooLarge`), `multi_stream`
 (default on: bzip2, Python's `BZ2File` and libzip read until the input ends),
 `ignore_trailing_garbage` (default off: bytes after the last stream are `error.TrailingData`).
 The decoder reads up to 8 bytes ahead of the end of the last stream.

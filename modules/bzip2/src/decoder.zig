@@ -56,11 +56,17 @@ pub const Error = error{
     ReadFailed,
 };
 
+/// `Options.max_output`'s default: 256 MiB (as brotli's).
+pub const default_max_output: u64 = 256 << 20;
+
 pub const Options = struct {
     /// Decompression-bomb cap: at most this many output bytes in total;
     /// more is `error.OutputTooLarge`. Memory is bounded by the block size
-    /// regardless; this bounds the output.
-    max_output: ?u64 = null,
+    /// regardless; this bounds the output. The default is 256 MiB (a bzip2
+    /// stream expands up to ~45 000:1, so a few MB of hostile input is tens
+    /// of GB); `null` is the explicit opt-out for callers that bound the
+    /// output elsewhere (sweep REV-bzip2-3).
+    max_output: ?u64 = default_max_output,
     /// Read every stream until the input ends (bzip2, Python's `BZ2File` and
     /// libzip do). False stops after the first stream.
     multi_stream: bool = true,
@@ -78,6 +84,9 @@ const Work = struct {
     seq_to_unseq: [256]u8,
     cftab: [257]u32,
 };
+
+/// Consecutive empty `readVec` results `refillUnbuffered` tolerates.
+const max_zero_reads = 64;
 
 const Phase = enum { stream_header, block_header, block_output, done };
 
@@ -119,9 +128,9 @@ pub const Decoder = struct {
     failed: ?Error = null,
 
     pub fn init(gpa: std.mem.Allocator, in: *Reader, opts: Options) error{OutOfMemory}!Decoder {
-        // `in` needs a buffer it can `fill` into (a streaming reader with a
-        // zero-capacity buffer trips std's assertion); `Reader.fixed` of any
-        // slice, the empty one included, is fine — its fill ends the stream.
+        // `in` may have a zero-capacity buffer: `refill` then reads straight
+        // into the bit accumulator (sweep BZ-4) instead of through `fill`,
+        // which std asserts a nonzero buffer for.
         return .{ .gpa = gpa, .in = in, .opts = opts, .work = try gpa.create(Work) };
     }
 
@@ -133,10 +142,48 @@ pub const Decoder = struct {
 
     // ── bit input ───────────────────────────────────────────────────────
 
+    /// `refill` for an `in` with no buffer at all (sweep BZ-4): bytes go from
+    /// `readVec` into the accumulator, at most the room it has, so nothing is
+    /// ever left behind in `in`.
+    ///
+    /// A 0 return is legal for `readVec` only when it wrote into
+    /// `Reader.buffer` (std's contract); `in` has no buffer here, so a 0 is
+    /// "no progress". `max_zero_reads` of them in a row are a broken reader:
+    /// `error.ReadFailed` instead of spinning forever (sweep REV-bzip2-4).
+    /// The buffered `refill` goes through std's `fill`, which owns that loop.
+    fn refillUnbuffered(d: *Decoder) error{ReadFailed}!void {
+        var zero_reads: u32 = 0;
+        while (d.nbits <= 56) {
+            var tmp: [8]u8 = undefined;
+            const room: usize = (64 - @as(usize, d.nbits)) >> 3;
+            var vec = [1][]u8{tmp[0..room]};
+            const n = d.in.readVec(&vec) catch |e| switch (e) {
+                error.ReadFailed => return error.ReadFailed,
+                error.EndOfStream => {
+                    while (d.nbits <= 56) {
+                        d.acc <<= 8;
+                        d.nbits += 8;
+                        d.pad += 8;
+                    }
+                    return;
+                },
+            };
+            if (n == 0) {
+                zero_reads += 1;
+                if (zero_reads >= max_zero_reads) return error.ReadFailed;
+                continue;
+            }
+            zero_reads = 0;
+            for (tmp[0..n]) |b| d.acc = (d.acc << 8) | b;
+            d.nbits += @intCast(8 * n);
+        }
+    }
+
     fn refill(d: *Decoder) error{ReadFailed}!void {
         while (d.nbits <= 56) {
             var buf = d.in.buffered();
             if (buf.len == 0) {
+                if (d.in.buffer.len == 0) return d.refillUnbuffered();
                 d.in.fill(1) catch |e| switch (e) {
                     error.ReadFailed => return error.ReadFailed,
                     error.EndOfStream => {
@@ -210,7 +257,9 @@ pub const Decoder = struct {
         if (b != 'B' or z != 'Z' or h != 'h' or l < '1' or l > '9') return error.BadMagic;
         d.block_size_100k = l - '0';
         d.combined_crc = 0;
-        d.streams += 1;
+        // Saturating (sweep BZ-2): 2^32 concatenated streams are 56 GB of input,
+        // but a wrap to 0 would make the next stream's end an error.
+        d.streams +|= 1;
         return true;
     }
 
@@ -524,9 +573,12 @@ pub const Decoder = struct {
     }
 
     /// Decompressed bytes into `dest`; 0 means the end of the last stream.
-    /// After an error every further call returns the same error.
+    /// After an error every further call returns the same error. An empty
+    /// `dest` returns 0 without progress (it is not the end of the stream;
+    /// sweep BZ-1).
     pub fn read(d: *Decoder, dest: []u8) Error!usize {
         if (d.failed) |e| return e;
+        if (dest.len == 0) return 0;
         return d.readInner(dest) catch |e| {
             d.failed = e;
             return e;
@@ -595,8 +647,7 @@ pub fn decompress(gpa: std.mem.Allocator, input: []const u8, opts: Options) Erro
     return out.toOwnedSlice() catch error.OutOfMemory;
 }
 
-/// Decompress from `in` to `out`; returns the output length. `in` needs a
-/// non-empty buffer. `out` is flushed at the end. The decoder reads up to 8
+/// Decompress from `in` to `out`; returns the output length. `out` is flushed at the end. The decoder reads up to 8
 /// bytes ahead, so it should be given the whole of `in`'s stream(s).
 pub fn decompressStream(gpa: std.mem.Allocator, in: *Reader, out: *Writer, opts: Options) (Error || error{WriteFailed})!u64 {
     var d = try Decoder.init(gpa, in, opts);
@@ -620,7 +671,7 @@ pub const DecompressReader = struct {
     err: ?Error = null,
     dec: Decoder,
 
-    /// `in` must have a non-empty buffer. Allocates the decoder's tables;
+    /// Allocates the decoder's tables;
     /// the block buffer is allocated when a stream header is read.
     pub fn init(gpa: std.mem.Allocator, in: *Reader, buffer: []u8, opts: Options) error{OutOfMemory}!DecompressReader {
         return .{

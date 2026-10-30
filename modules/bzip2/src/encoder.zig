@@ -37,7 +37,8 @@ pub const Error = WriteError || error{InvalidLevel};
 /// The most bytes `compress` can produce for `n` input bytes (libbzip2's
 /// documented bound: 1 % plus 600 bytes, rounded up here).
 pub fn compressBound(n: usize) usize {
-    return n + n / 100 + 700;
+    // Saturating (sweep BZ-3): a bound for a size no slice has must not overflow.
+    return n +| n / 100 +| 700;
 }
 
 const Coding = struct {
@@ -76,6 +77,10 @@ pub const Encoder = struct {
     state_in_len: u32 = 0,
     header_done: bool = false,
     finished: bool = false,
+    /// The first error `write`/`finish` returned (sweep REV-bzip2-2): every
+    /// later `write`/`finish` returns it again instead of re-entering a
+    /// half-written block. Cleared by `reset`.
+    failed: ?WriteError = null,
     /// Test hook: write every block in bzip2 0.9.0's randomised form (the
     /// block bytes XORed with the `randtable` mask, the randomised bit set),
     /// which no encoder since 0.9.5 produces but every decoder must read.
@@ -122,6 +127,7 @@ pub const Encoder = struct {
         e.state_in_len = 0;
         e.header_done = false;
         e.finished = false;
+        e.failed = null;
         e.bs_buff = 0;
         e.bs_live = 0;
         e.olen = 0;
@@ -164,7 +170,15 @@ pub const Encoder = struct {
 
     /// Feed `data` to the compressor; whole blocks go out as they fill.
     pub fn write(e: *Encoder, data: []const u8) WriteError!void {
+        if (e.failed) |f| return f;
         if (e.finished) return error.AlreadyFinished;
+        e.writeInner(data) catch |err| {
+            e.failed = err;
+            return err;
+        };
+    }
+
+    fn writeInner(e: *Encoder, data: []const u8) WriteError!void {
         var i: usize = 0;
         while (i < data.len) {
             if (e.nblock >= e.nblock_max) {
@@ -195,9 +209,17 @@ pub const Encoder = struct {
     /// Ends the stream: the pending run, the last block and the trailer.
     /// `out` is not flushed.
     pub fn finish(e: *Encoder) WriteError!void {
+        if (e.failed) |f| return f;
         // Single-shot: a second call would write a second trailer (the
         // assert this was is a no-op in ReleaseFast).
         if (e.finished) return error.AlreadyFinished;
+        e.finishInner() catch |err| {
+            e.failed = err;
+            return err;
+        };
+    }
+
+    fn finishInner(e: *Encoder) WriteError!void {
         // libbzip2 closes a block that filled up as the last byte of a
         // `BZ_RUN` call went in before `BZ_FINISH` flushes the pending run,
         // which then lands in a block of its own.
@@ -608,8 +630,11 @@ pub const StreamWriter = struct {
     }
 
     /// The buffered bytes, the last block and the trailer; then the writer
-    /// accepts nothing more.
+    /// accepts nothing more. Idempotent: a call after a successful `finish`
+    /// does nothing (sweep REV-bzip2-1); after a failure it returns
+    /// `error.WriteFailed` again.
     pub fn finish(sw: *StreamWriter) Writer.Error!void {
+        if (sw.enc.finished and sw.enc.failed == null) return;
         const w = &sw.writer;
         try sw.feed(w.buffer[0..w.end]);
         w.end = 0;
@@ -618,8 +643,9 @@ pub const StreamWriter = struct {
     }
 
     fn fail(sw: *StreamWriter, e: WriteError) Writer.Error {
-        if (e == error.WriteFailed) return error.WriteFailed;
-        sw.err = @errorCast(e);
+        // Only an allocation failure is recorded in `err`; anything else
+        // (WriteFailed, AlreadyFinished) must not be cast into its type.
+        if (e == error.OutOfMemory) sw.err = error.OutOfMemory;
         return error.WriteFailed;
     }
 

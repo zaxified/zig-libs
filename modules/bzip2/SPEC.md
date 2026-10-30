@@ -104,7 +104,8 @@ None claimed: the data is public. There is no secret in this module.
 - Code lengths 1..20, origin pointer below the block's symbol count, at least one used byte value,
   2..6 tables, at least one selector, selector values below the table count; otherwise
   `error.BadTables` / `BadOrigPtr` / `BadSymbolMap`.
-- `DecodeOptions.max_output`: the total output; one byte over is `error.OutputTooLarge` (the
+- `DecodeOptions.max_output`: the total output, default 256 MiB (`decoder_default_max_output`, a bomb
+  guard: ~45 000:1 expansion; `null` opts out); one byte over is `error.OutputTooLarge` (the
   decoder never produces more than 1 byte past the cap). Pinned by `test "bomb cap"`.
 - The encoder accepts levels 1..9 (`error.InvalidLevel`).
 - Truncated input is `error.TruncatedInput`, never a short success; bytes after a complete stream
@@ -152,6 +153,11 @@ None claimed: the data is public. There is no secret in this module.
   stream. Not now.
 - **B3** Decoder speed: the Huffman walk is a 20-bit window with a per-length loop; a lookup table
   on the first 8-10 bits would take the common symbols in one step (see Performance).
+- **B4** Encoder worst-case time on adversarial input (no-panic sweep BZ-5, 2026-10-30): the
+  fallback sort's pivot choice (`fallbackQSort3`, an LCG seeded 0 per call) is fixed by byte
+  parity with libbzip2, so a hostile input could in principle steer it to quadratic time; the main
+  sort's work budget (`work_factor`) does not bound the fallback. Not reproduced; a bound would
+  need a deliberate departure from libbzip2's tie order. Decision pending.
 
 ## Open
 

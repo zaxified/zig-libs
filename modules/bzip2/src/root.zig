@@ -40,6 +40,8 @@ const encoder = @import("encoder.zig");
 
 pub const DecodeError = decoder.Error;
 pub const DecodeOptions = decoder.Options;
+/// `DecodeOptions.max_output`'s default (256 MiB).
+pub const decoder_default_max_output = decoder.default_max_output;
 /// Every stream of a byte slice. Caller owns the result.
 pub const decompress = decoder.decompress;
 /// From a `std.Io.Reader` to a `std.Io.Writer`, one block in memory.
@@ -80,4 +82,5 @@ test {
     _ = @import("decoder_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
