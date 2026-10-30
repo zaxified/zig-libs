@@ -49,6 +49,12 @@ fn runChild(comptime body: fn () void, buf: []u8) !Child {
     return .{ .died = linux.W.IFSIGNALED(status), .len = if (linux.errno(n) == .SUCCESS) n else 0 };
 }
 
+// Needles live in consts, never inline in the expectPanicMessage call: the forked child's stack trace
+// prints the caller's source line, so an inline needle matches ANY panic (found in wave GS).
+const needle_0 = "wireguard: deriveTransportKeys before";
+const needle_1 = "wireguard: deriveTransportKeys role mismatch";
+const needle_2 = "wireguard: keyedMac";
+
 fn expectPanicMessage(comptime body: fn () void, needle: []const u8) !void {
     var buf: [8192]u8 = undefined;
     const c = try runChild(body, &buf);
@@ -94,13 +100,13 @@ fn keyedMacEmpty() void {
 test "keyedMac: a key outside 1..32 bytes is a checked wireguard panic (sweep WH-1)" {
     const ok: [32]u8 = @splat(7);
     _ = noise.keyedMac(&ok, "x");
-    try expectPanicMessage(keyedMacLong, "wireguard: keyedMac");
-    try expectPanicMessage(keyedMacMid, "wireguard: keyedMac");
-    try expectPanicMessage(keyedMacEmpty, "wireguard: keyedMac");
+    try expectPanicMessage(keyedMacLong, needle_2);
+    try expectPanicMessage(keyedMacMid, needle_2);
+    try expectPanicMessage(keyedMacEmpty, needle_2);
 }
 
 test "keyedMac: the upper bound is exactly 32 bytes (sweep audit GR-B1)" {
-    try expectPanicMessage(keyedMac33, "wireguard: keyedMac");
+    try expectPanicMessage(keyedMac33, needle_2);
 }
 
 // ── WH-2 (r1) / R-WH-1 / R-WH-2 / R-WH-3: state-machine misuse ──────────────
@@ -159,8 +165,8 @@ fn responderWrongRole() void {
 }
 
 test "Handshake: derive before complete is a checked panic (sweep WH-2)" {
-    try expectPanicMessage(deriveIdle, "wireguard: deriveTransportKeys before");
-    try expectPanicMessage(sessionIdle, "wireguard: deriveTransportKeys before");
+    try expectPanicMessage(deriveIdle, needle_0);
+    try expectPanicMessage(sessionIdle, needle_0);
 }
 
 test "Handshake: a replayed initiation at a used handshake is AlreadyStarted, not a panic (sweep WH-2)" {
@@ -176,8 +182,8 @@ test "Handshake: a replayed initiation at a used handshake is AlreadyStarted, no
 }
 
 test "Handshake: a second derive/transportSession is a checked panic; a finished handshake restarts nothing (sweep R-WH-1)" {
-    try expectPanicMessage(deriveTwice, "wireguard: deriveTransportKeys before");
-    try expectPanicMessage(sessionTwice, "wireguard: deriveTransportKeys before");
+    try expectPanicMessage(deriveTwice, needle_0);
+    try expectPanicMessage(sessionTwice, needle_0);
     var ini: hs.Handshake = undefined;
     var rsp: hs.Handshake = undefined;
     try completed(&ini, &rsp);
@@ -189,8 +195,8 @@ test "Handshake: a second derive/transportSession is a checked panic; a finished
 }
 
 test "Handshake: deriving with the wrong role is a checked panic (sweep R-WH-3)" {
-    try expectPanicMessage(initiatorWrongRole, "wireguard: deriveTransportKeys role mismatch");
-    try expectPanicMessage(responderWrongRole, "wireguard: deriveTransportKeys role mismatch");
+    try expectPanicMessage(initiatorWrongRole, needle_1);
+    try expectPanicMessage(responderWrongRole, needle_1);
 }
 
 // ── R-WH-4: CookieChecker.wipe must not leave a zero-key secret in force ────
