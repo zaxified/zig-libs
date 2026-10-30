@@ -147,8 +147,8 @@ bn254	ReleaseFast	field	1	1	e6846e4ec6c4207e	831aa25b5c3d2f05
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
 bn254	ReleaseFast	scalarmul	1	2	0e0d8a21c6f2f388	1bba83824af4d763
-chachapoly	ReleaseFast	poly1305	1	0	a26f90c435558fa3	ff3ba8f00b851bdf
-chachapoly	ReleaseSafe	poly1305	1	>=1	a26f90c435558fa3	ff3ba8f00b851bdf
+chachapoly	ReleaseFast	poly1305	1	0	e72f31eeecfc9930	ff3ba8f00b851bdf
+chachapoly	ReleaseSafe	poly1305	1	>=1	e72f31eeecfc9930	ff3ba8f00b851bdf
 # The AEAD's own claim (added 2026-09-02). SPEC.md and root.zig state that the
 # tag is compared in constant time, and until this row existed the module was
 # measured with the `poly1305` target ALONE -- the harness never touched
@@ -191,10 +191,10 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	a26f90c435558fa3	ff3ba8f00b851bdf
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
 # `scripts/checks/ctgrind.sh` § MODES.
-chachapoly	ReleaseFast	aead	1	4	04e4fef7217ae846	870a36cbebbc4588
-chachapoly	ReleaseFast	xaead	1	4	04e4fef7217ae846	4caee5e0b86063e7
-chachapoly	ReleaseSafe	aead	1	>=1	04e4fef7217ae846	870a36cbebbc4588
-chachapoly	ReleaseSafe	xaead	1	>=1	04e4fef7217ae846	4caee5e0b86063e7
+chachapoly	ReleaseFast	aead	1	4	d1d1f5a60f866643	870a36cbebbc4588
+chachapoly	ReleaseFast	xaead	1	4	d1d1f5a60f866643	4caee5e0b86063e7
+chachapoly	ReleaseSafe	aead	1	>=1	d1d1f5a60f866643	870a36cbebbc4588
+chachapoly	ReleaseSafe	xaead	1	>=1	d1d1f5a60f866643	4caee5e0b86063e7
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key
 # material is routed ONLY through std's constant-time HMAC/AES-CCM, with no
 # comparison or branch on key bytes in this module's own code; until today that
@@ -469,8 +469,8 @@ montint	ReleaseFast	ffcontrol	1	>=1	NO-OWN-SRC	e5fa1af501069bfb
 montint	ReleaseFast	dyn	1	2	94880a83bb6a5346	880a04f6d911e62c
 # 2026-10-13: p256 `rejectIdentity` launders its verdict (one `je`, was two) -> every row whose count included the p256 comb/windowed identity check drops by 1 (--stacks diff vs the base: the second jump of `rejectIdentity` gone, no other context moved).
 # 2026-10-14: p256 point formulas as generated asm (point_asm.zig; pattern gains it). Counts unchanged (comb 1 = rejectIdentity group.zig:690 per --stacks, sign <=12); comb output re-pinned because the harness prints raw projective coordinates and the CT mixed addition is now madd-2004-hmv (another representative of the same point; sign pk+sig digest unchanged). ctap2 digests re-pinned too: stale since 9fc3c70d (root.zig fuzz test only), counts 0/0.
-p256	ReleaseFast	comb	1	1	dafe6cbd62820782	e3c458c38b8cf4a8
-p256	ReleaseFast	sign	1	<=12	dedec99b1fbbb20e	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	2abc3a382c76c041	e3c458c38b8cf4a8
+p256	ReleaseFast	sign	1	<=12	32b07f33ea5a0a7d	af4baed5c5134f3f
 # rsa 2026-10-02 — the private path moved onto montint.DynModint (reduce of c
 # mod p/q, Garner, unblinding, F3). crt 213 -> 1: the 212 were std.crypto.ff's
 # reduce (shiftIn, compare-and-subtract) and montgomeryMul over the secret
@@ -483,8 +483,8 @@ p256	ReleaseFast	sign	1	<=12	dedec99b1fbbb20e	af4baed5c5134f3f
 # 2026-10-14: crt 2 -> 1: the doubled FaultDetected verdict context is gone
 # (privateOpCrtPtr restructured for CRT-domain blinding); the 1 left is the
 # F3 verdict, root.zig:985 (--stacks).
-rsa	ReleaseFast	crt	1	1	d9d4ca764e8d6b3f	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	0	d9d4ca764e8d6b3f	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	1	271442a5a904d587	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	0	271442a5a904d587	d4057b00f9df7b56
 # rsa crtbl / crtcache (2026-10-18) — the CRT op with base blinding: `.csprng`
 # (2 = the F3 verdict root.zig `MontParams.eql(&chk, &c)` + drawBlindingPair's
 # one redraw verdict `ok == 0`, a decision about the random r) and `.cached`
@@ -495,8 +495,8 @@ rsa	ReleaseFast	noncrt	1	0	d9d4ca764e8d6b3f	d4057b00f9df7b56
 # `if (self.serves(sk))` in `BlindingCache.next` (root.zig:1128) is now tainted
 # on the second op, where `n`/`e` already match. Stacks re-read: the other three
 # are the documented ones (root.zig:1200 draw, 1290 F3 twice).
-rsa	ReleaseFast	crtbl	1	2	d9d4ca764e8d6b3f	d4057b00f9df7b56
-rsa	ReleaseFast	crtcache	1	4	d9d4ca764e8d6b3f	d4057b00f9df7b56
+rsa	ReleaseFast	crtbl	1	2	271442a5a904d587	d4057b00f9df7b56
+rsa	ReleaseFast	crtcache	1	4	271442a5a904d587	d4057b00f9df7b56
 # rsa keygen (2026-10-03) — SecretKey.fromPrimes on the 2048-bit KAT, p and q
 # tainted. λ = montint.nt.lcm, d/dP/dQ = inverseOfModulus (even moduli), qInv by
 # Fermat on montint: 0 contexts in nt.zig and in the inversion/ladder code. Left,
@@ -508,7 +508,7 @@ rsa	ReleaseFast	crtcache	1	4	d9d4ca764e8d6b3f	d4057b00f9df7b56
 # stripLeadingZeros on p, q (2, their length); fromLimbsBits/build of p_mont,
 # q_mont (length verdicts); the verdicts p == q, gcd(e, λ) = 1, d/dP/dQ ≠ 0 and
 # the qInv self-check.
-rsa	ReleaseFast	keygen	1	<=173	d9d4ca764e8d6b3f	2cb28867b78d48a6
+rsa	ReleaseFast	keygen	1	<=173	271442a5a904d587	2cb28867b78d48a6
 slhdsa	ReleaseFast	seed	1	4	960caaf9efdcbd42	e0fdde7f5c62a2d6
 # Zig 0.17.0 (2026-10-18): prf 8 -> 9, BENIGN (public by the scheme). The +1 is xmssPkFromSig's
 # auth-path direction test `(idx >> k) & 1` (engine.zig:432) at a fourth address (loop unrolled).
@@ -1099,10 +1099,10 @@ aescbc	ReleaseFast	zero	1	0	1a3b50fc45e7e9c5	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	620bc5f5202e5336	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	620bc5f5202e5336	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	620bc5f5202e5336	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	620bc5f5202e5336	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	8f846c943ad4c603	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	8f846c943ad4c603	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	8f846c943ad4c603	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	8f846c943ad4c603	1c8749621d19a09b
 # ── sealedbox: the XSalsa20-Poly1305 core of seal/open (2026-10-07) ─────────
 # Module code since the multi-block rewrite (`xsalsa20poly1305.zig`,
 # `poly1305.zig`); before it, std's and not a target. 1100-byte message so every
@@ -1228,9 +1228,9 @@ btcaddr	ReleaseFast	wif	1	0	444c7820fd321227	3724f47a31d201ab
 # 2026-10-10: AES-192 added to the harness (Aes192Gcm; generic over the aes192
 # module, kernel with Nr = 12) -- 4 -> 6 per row, the same tag-check line for
 # the third key size, nothing else.
-aesgcm	ReleaseFast	ctx	1	6	55808fc49d506536	b60805fea700d105
-aesgcm	ReleaseFast	stateless	1	6	55808fc49d506536	b60805fea700d105
-aesgcm	ReleaseFast	generic	1	6	55808fc49d506536	b60805fea700d105
+aesgcm	ReleaseFast	ctx	1	6	45851863cdf8e109	b60805fea700d105
+aesgcm	ReleaseFast	stateless	1	6	45851863cdf8e109	b60805fea700d105
+aesgcm	ReleaseFast	generic	1	6	45851863cdf8e109	b60805fea700d105
 # groth16 (2026-10-09): the zkey prover's `.constant_time` MSM choice
 # (`zkprove.proveWith`). zkprove_ct pins 6 in-file, all at the public end:
 # `toAffine` on the three proof points (zkprove.zig, the return) -- the identity
@@ -1765,13 +1765,17 @@ jwt	ReleaseFast	rsa	1	3	9e7afaa8f4490f28	f2bee89c3c58cdaf
 #    EdDSA row carries; probability of the branch going the other way 2^-252.
 #  seal 2 — std scrypt smix `blockXor`: ROMix reads V at an index taken from
 #    the password-derived state (RFC 7914 by design; libsodium's too).
-#  open 4 — the same scrypt 2; openSecretKeyBody's `timing_safe.eql` verdict
-#    (WrongPassword or not, public by design); std `Ed25519.KeyPair.
-#    fromSecretKey` comparing the recomputed public key with the stored one
-#    (a public value derived from the secret).
-minisign	ReleaseFast	sign	1	2	bfd5f68eeaf3f6ec	812c5ebd56623021
-minisign	ReleaseFast	seal	1	2	bfd5f68eeaf3f6ec	d241260799cd24a3
-minisign	ReleaseFast	open	1	4	bfd5f68eeaf3f6ec	1876f3ea9f53cddd
+#  open 6 (was 4 until 2026-10-30) — the same scrypt 2; openSecretKeyBody's
+#    `timing_safe.eql` WrongPassword verdict (public by design); and three on the
+#    PUBLIC key derived from the seed, since sweep REV-MS-1 (§ GP) derives it in
+#    every build mode (std's own `fromSecretKey` check runs only with runtime
+#    safety, which is why ReleaseFast saw 1 before): std `generateDeterministic`
+#    → pcMul16 `rejectIdentity` and → `PublicKey.fromBytes`, and the
+#    `timing_safe.eql` verdict "derived public half == stored public half"
+#    (NonCanonical or not). `fromSecretKey` is no longer called.
+minisign	ReleaseFast	sign	1	2	81a53e65bb74db69	812c5ebd56623021
+minisign	ReleaseFast	seal	1	2	81a53e65bb74db69	d241260799cd24a3
+minisign	ReleaseFast	open	1	6	81a53e65bb74db69	1876f3ea9f53cddd
 # aaa-gate (2026-10-17) — the secrets are the gate's stored SHA-256 fingerprints
 # (tokens, API keys, Basic user:password), tainted in place; the presented value
 # is the client's own and the verdict is public. Each target verifies a good and
