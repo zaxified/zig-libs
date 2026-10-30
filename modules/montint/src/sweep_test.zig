@@ -322,3 +322,174 @@ test "sqrt: a composite with no small non-residue is error.SqrtWorkLimit, not fa
     try testing.expectError(error.SqrtWorkLimit, m.sqrt(&four, &r));
     try testing.expect(D.isZero(&r));
 }
+
+// ── delta audit additions (gtua-a) ──────────────────────────────────────────
+// Each length contract is checked per operand: a LONGER operand would run
+// without any other fault, so only the sweep's guard rejects it.
+
+fn schoolbookLongY() void {
+    var z: [4]u64 = undefined;
+    const x: [3]u64 = @splat(1);
+    runtime_len = 3;
+    limbs.mulSchoolbook(&z, x[0..2], x[0..runtime_len]);
+}
+fn schoolbookLongZ() void {
+    var z: [5]u64 = undefined;
+    const x: [2]u64 = @splat(1);
+    runtime_len = 5;
+    limbs.mulSchoolbook(z[0..runtime_len], &x, &x);
+}
+// n = karatsuba_threshold, so the schoolbook fallback (and its own, identical
+// guard) is NOT taken: only mulKaratsuba's guard can reject these.
+fn karatsubaLongY() void {
+    var z: [32]u64 = undefined;
+    var scratch: [64]u64 = undefined;
+    const x: [17]u64 = @splat(1);
+    runtime_len = 17;
+    limbs.mulKaratsuba(&z, x[0..16], x[0..runtime_len], &scratch);
+}
+fn karatsubaLongZ() void {
+    var z: [33]u64 = undefined;
+    var scratch: [64]u64 = undefined;
+    const x: [16]u64 = @splat(1);
+    runtime_len = 33;
+    limbs.mulKaratsuba(z[0..runtime_len], &x, &x, &scratch);
+}
+
+test "limbs.mulSchoolbook / mulKaratsuba: a longer y or z is a checked panic, not a silent product (sweep audit GT-MA1)" {
+    try expectPanicMessage(schoolbookLongY, needle_product);
+    try expectPanicMessage(schoolbookLongZ, needle_product);
+    try expectPanicMessage(karatsubaLongY, needle_product);
+    try expectPanicMessage(karatsubaLongZ, needle_product);
+}
+
+fn asmEmpty() void {
+    var z: [0]u64 = undefined;
+    const a: [0]u64 = .{};
+    const m: [0]u64 = .{};
+    asm_core.montMul(&z, &a, &a, &m, 1);
+}
+fn asmLongA() void {
+    var z: [4]u64 = undefined;
+    const a: [4]u64 = @splat(1);
+    const b: [5]u64 = @splat(1);
+    const m: [4]u64 = .{ 7, 0, 0, 0 };
+    runtime_len = 5;
+    asm_core.montMul(&z, b[0..runtime_len], &a, &m, 1);
+}
+fn asmLongB() void {
+    var z: [4]u64 = undefined;
+    const a: [4]u64 = @splat(1);
+    const b: [5]u64 = @splat(1);
+    const m: [4]u64 = .{ 7, 0, 0, 0 };
+    runtime_len = 5;
+    asm_core.montMul(&z, &a, b[0..runtime_len], &m, 1);
+}
+fn asmSqrEmpty() void {
+    var z: [0]u64 = undefined;
+    var scratch: [0]u64 = undefined;
+    const a: [0]u64 = .{};
+    const m: [0]u64 = .{};
+    asm_core.montSqr(&z, &a, &m, 1, &scratch);
+}
+fn asmSqrLongZ() void {
+    var z: [5]u64 = undefined;
+    var scratch: [8]u64 = undefined;
+    const a: [4]u64 = @splat(1);
+    const m: [4]u64 = .{ 7, 0, 0, 0 };
+    runtime_len = 5;
+    asm_core.montSqr(z[0..runtime_len], &a, &m, 1, &scratch);
+}
+fn asmSqrLongA() void {
+    var z: [4]u64 = undefined;
+    var scratch: [8]u64 = undefined;
+    const a: [5]u64 = @splat(1);
+    const m: [4]u64 = .{ 7, 0, 0, 0 };
+    runtime_len = 5;
+    asm_core.montSqr(&z, a[0..runtime_len], &m, 1, &scratch);
+}
+
+test "asm_core.montMul / montSqr: n = 0 and a longer operand are checked panics too (sweep audit GT-MA2)" {
+    if (!asm_core.supported) return error.SkipZigTest;
+    try expectPanicMessage(asmEmpty, needle_asm);
+    try expectPanicMessage(asmLongA, needle_asm);
+    try expectPanicMessage(asmLongB, needle_asm);
+    try expectPanicMessage(asmSqrEmpty, needle_asm);
+    try expectPanicMessage(asmSqrLongZ, needle_asm);
+    try expectPanicMessage(asmSqrLongA, needle_asm);
+}
+
+test "safegcd: nbits = 3 (the lower edge) works; an even SECOND modulus of a pair answers false (sweep audit GT-MA3)" {
+    const I = safegcd.Inverter(256);
+    const x: [4]u64 = .{ 3, 0, 0, 0 };
+    const m7: [4]u64 = .{ 7, 0, 0, 0 };
+    var out: [4]u64 = undefined;
+    try testing.expect(I.invert(&x, &m7, 3, &out)); // 3 * 5 = 15 = 1 mod 7
+    try testing.expectEqual(@as(u64, 5), out[0]);
+    var o1: [4]u64 = undefined;
+    var o2: [4]u64 = undefined;
+    const even: [4]u64 = .{ 6, 0, 0, 0 };
+    const v = I.invert2(&x, &m7, &x, &even, 3, &o1, &o2);
+    try testing.expect(v[0]);
+    try testing.expectEqual(@as(u64, 5), o1[0]);
+    try testing.expect(!v[1]);
+    const w = I.invert2(&x, &even, &x, &m7, 3, &o1, &o2);
+    try testing.expect(!w[0] and w[1]);
+}
+
+// A prime p = 1 + 8k·(product of the odd primes up to 251), k = 615 (325 bits),
+// so every prime up to 251 -- and 2, p = 1 mod 8 -- is a quadratic residue
+// (p = 1 mod each, reciprocity) and the least non-residue is the prime 257, the
+// LAST candidate the cap `2 + sqrt_max_candidates` lets through.
+fn bigP(comptime w: []const u64) D.Elem {
+    var v = D.zero;
+    @memcpy(v[0..w.len], w);
+    return v;
+}
+const p_nr257 = bigP(&.{ 0xd919fd1187b4c129, 0x64b2071476a2f31e, 0x8b9d6ca0c7b4ab60, 0xfbd10239a07bb308, 0xda88c7f8e4235b43, 0x10 });
+// Same with every prime up to 257 and k = 6519: the least non-residue is 263,
+// one candidate past the cap.
+const p_nr263 = bigP(&.{ 0x43f4678b80e1daa9, 0xf0dd5728dc038b44, 0x196a8e205993aff5, 0x47f2473b2abc2abc, 0xb657fc5a1c3e31a4, 0xb358 });
+
+test "sqrt: the least non-residue 257 is the last accepted candidate, 263 is error.SqrtWorkLimit (sweep audit GT-MA4)" {
+    var four = D.zero;
+    four[0] = 4;
+    var r: D.Elem = undefined;
+    const ok = try D.fromLimbs(&p_nr257);
+    try testing.expect(try ok.sqrt(&four, &r));
+    try testing.expect(D.eql(&ok.sq(&r), &four));
+    const over = try D.fromLimbs(&p_nr263);
+    r = D.one();
+    try testing.expectError(error.SqrtWorkLimit, over.sqrt(&four, &r));
+    try testing.expect(D.isZero(&r));
+}
+
+test "sqrt: a modulus with every integer below it tried (no non-residue exists) answers false, not SqrtWorkLimit (sweep audit GT-MA5)" {
+    var four = D.zero;
+    four[0] = 4;
+    for ([_]u64{ 9, 25, 49, 121 }) |mv| { // odd squares: = 1 mod 8, no non-residue below
+        var v = D.zero;
+        v[0] = mv;
+        const m = try D.fromLimbs(&v);
+        var r = D.one();
+        try testing.expect(!(try m.sqrt(&four, &r)));
+        try testing.expect(D.isZero(&r));
+    }
+}
+
+test "sqrt: a modulus with no non-residue (q^2) ends in SqrtWorkLimit (sweep audit GT-MA6)" {
+    // q^2 for a prime q: no non-residue exists, so the candidate loop runs to
+    // its cap and refuses. The cap's exact value is pinned by GT-MA4 (least
+    // non-residue 257 accepted, 263 refused); this test only shows the q^2
+    // shape reaches the refusal. Timing was removed: a single-run time ratio
+    // is load-sensitive, and GT-MA4 already kills a raised cap.
+    const q: u128 = (1 << 61) - 1;
+    var v = D.zero;
+    v[0] = @truncate(q * q);
+    v[1] = @truncate((q * q) >> 64);
+    const m = try D.fromLimbs(&v);
+    var four = D.zero;
+    four[0] = 4;
+    var r: D.Elem = undefined;
+    try testing.expectError(error.SqrtWorkLimit, m.sqrt(&four, &r));
+}

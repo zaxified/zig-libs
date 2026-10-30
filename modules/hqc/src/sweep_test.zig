@@ -132,3 +132,22 @@ test "sampleVect: an output shorter than ceil(n/64) words is a checked panic (sw
     try testing.expectEqual(@as(u64, 0), out[R.words - 1] >> @intCast(params.hqc128.n % 64)); // masked
     try expectPanicMessage(sampleShort, needle_vect);
 }
+
+// ── delta audit additions (gtua-a) ──────────────────────────────────────────
+
+fn getBitAtN() void {
+    const v = R.zero;
+    runtime_len = R.bit_len;
+    _ = R.getBit(v, @intCast(runtime_len));
+}
+
+test "Ring.getBit: pos == n is already out of range (sweep audit GT-HA1)" {
+    try expectPanicMessage(getBitAtN, needle_bit);
+}
+
+test "Kem.stack_bytes is the decaps burn buffer: 128 / 256 / 384 KiB as documented (sweep audit GT-HA3)" {
+    const root = @import("root.zig");
+    try testing.expectEqual(@as(usize, 128 * 1024), root.Hqc128.stack_bytes);
+    try testing.expectEqual(@as(usize, 256 * 1024), root.Hqc192.stack_bytes);
+    try testing.expectEqual(@as(usize, 384 * 1024), root.Hqc256.stack_bytes);
+}
