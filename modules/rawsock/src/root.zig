@@ -560,6 +560,12 @@ pub const Socket = struct {
     const aux_cmsg_space = cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(@sizeOf(TpacketAuxdata)) +
         cmsgAlign(@sizeOf(linux.cmsghdr)) + cmsgAlign(@sizeOf(KernelTimespec));
 
+    ///
+    /// There is no retry loop in here: one `recvmsg`, one result. ⚠ `error.RecvFailed`
+    /// can be PERSISTENT (`ENETDOWN` after the interface went down, a closed or
+    /// invalid fd) — a caller that retries it unconditionally in a loop spins
+    /// at 100% CPU. Retry `WouldBlock`/`Interrupted`; treat `RecvFailed` as
+    /// fatal for the socket, or back off.
     pub fn recv(self: Socket, buf: []u8) RecvError!Frame {
         var sll: linux.sockaddr.ll = undefined;
         var iov = [1]std.posix.iovec{.{ .base = buf.ptr, .len = buf.len }};
@@ -799,7 +805,9 @@ fn parseTimestampNs(control: []const u8) ?u64 {
     var off: usize = 0;
     while (off + @sizeOf(linux.cmsghdr) <= control.len) {
         const hdr: linux.cmsghdr = @as(*align(1) const linux.cmsghdr, @ptrCast(control[off..].ptr)).*;
-        if (hdr.len < @sizeOf(linux.cmsghdr)) break;
+        // A record longer than what is left ends the scan; the check also keeps
+        // `off + hdr.len` and `cmsgAlign(hdr.len)` from overflowing. See sweep RS3.
+        if (hdr.len < @sizeOf(linux.cmsghdr) or hdr.len > control.len - off) break;
         const data_off = off + cmsgAlign(@sizeOf(linux.cmsghdr));
         const data_end = off + hdr.len;
         const is_ts = hdr.level == linux.SOL.SOCKET and (hdr.type == linux.SO.TIMESTAMPNS_NEW or
@@ -966,7 +974,9 @@ fn parseAuxdataVlan(control: []const u8) ?u16 {
     var off: usize = 0;
     while (off + @sizeOf(linux.cmsghdr) <= control.len) {
         const hdr: linux.cmsghdr = @as(*align(1) const linux.cmsghdr, @ptrCast(control[off..].ptr)).*;
-        if (hdr.len < @sizeOf(linux.cmsghdr)) break;
+        // A record longer than what is left ends the scan; the check also keeps
+        // `off + hdr.len` and `cmsgAlign(hdr.len)` from overflowing. See sweep RS3.
+        if (hdr.len < @sizeOf(linux.cmsghdr) or hdr.len > control.len - off) break;
         const data_off = off + cmsgAlign(@sizeOf(linux.cmsghdr));
         const data_end = off + hdr.len;
         if (data_end <= control.len and
@@ -1008,7 +1018,9 @@ fn hwaddrFromIfreq(req: ifreq) ?[hwaddr_len]u8 {
 }
 
 fn ifaceIndexOn(fd: i32, name: []const u8) error{NoSuchInterface}!i32 {
-    if (name.len == 0 or name.len > 15) return error.NoSuchInterface;
+    // A NUL inside the name would make the kernel read a shorter one
+    // ("lo\x00junk" -> "lo"): reject it. See sweep REV-RS-4.
+    if (name.len == 0 or name.len > 15 or std.mem.findScalar(u8, name, 0) != null) return error.NoSuchInterface;
     var req: ifreq = .{};
     @memcpy(req.name[0..name.len], name);
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFINDEX, @intFromPtr(&req))) != .SUCCESS)
@@ -2842,6 +2854,7 @@ test "live: a compiled filter attached at open passes only what it names (needs 
 }
 
 test {
+    _ = @import("sweep_test.zig");
     testing.refAllDecls(@This());
 }
 
@@ -2857,4 +2870,29 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+fn cmsgBody() void {
+    var buf: [64]u8 align(8) = @splat(0);
+    var hdr: linux.cmsghdr = undefined;
+    hdr.level = linux.SOL.SOCKET;
+    hdr.type = 0; // not a type either scanner wants: they must step over it
+    for ([_]usize{ std.math.maxInt(usize), std.math.maxInt(usize) - 3, 1 << 63 }) |len| {
+        hdr.len = len;
+        @memcpy(buf[0..@sizeOf(linux.cmsghdr)], std.mem.asBytes(&hdr));
+        if (parseAuxdataVlan(&buf) != null) @panic("vlan from garbage");
+        if (parseTimestampNs(&buf) != null) @panic("time from garbage");
+    }
+}
+
+test "cmsg scanners: a record length near usize max ends the scan (sweep RS3)" {
+    try @import("sweep_test.zig").expectSurvives(cmsgBody);
+}
+
+test "ifaceByName: a name with an embedded NUL is refused, not truncated by the kernel (sweep REV-RS-4)" {
+    // "lo" exists; "lo\x00junk" must not resolve to it.
+    _ = try ifaceByName("lo");
+    try testing.expectError(error.NoSuchInterface, ifaceByName("lo\x00junk"));
+    try testing.expectError(error.NoSuchInterface, ifaceByName("lo\x00"));
+    try testing.expectError(error.NoSuchInterface, ifaceIndexOn(-1, "\x00"));
 }

@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GS). `filter.compile` no longer overflows the stack on a long `a and a and …` chain (parser leaf cap at `max_insns` and a code-generator depth cap of 512 → `FilterTooComplex`; a too-long input with a later syntax error now reports `FilterTooComplex`); `filter.run` jump arithmetic saturates (32-bit); cmsg scanners total on a huge `cmsg_len`; `pcap.Reader.next` total on a hand-set `pos`; an interface name containing NUL is `NoSuchInterface`. Docs: `Reader.next` does not check `orig_len >= incl_len`; a persistent `RecvFailed` must not be retried in a tight loop. Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — Ported to Zig 0.17.0. ifreq union-bytes `@bitCast` of `[N]u8` <-> int replaced by `std.mem.toBytes`/`bytesToValue` (native memory order, as the kernel ABI). Also: comptime `strRepeat` helper quota raised.

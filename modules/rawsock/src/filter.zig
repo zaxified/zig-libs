@@ -174,7 +174,7 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
             op.jmp => {
                 const jop = i.code & 0xf0;
                 if (jop == op.ja) {
-                    pc += i.k;
+                    pc = advance(usize, pc, i.k);
                     continue;
                 }
                 const src = if (i.code & op.x != 0) X else i.k;
@@ -195,6 +195,13 @@ pub fn run(prog: []const BpfInsn, frame: []const u8) u32 {
         }
     }
     return 0;
+}
+
+/// `pc + k` that cannot overflow: on a 32-bit target `usize` is 32 bits and a
+/// `ja` offset is a full `u32`. Saturating lands past the program, which
+/// drops the frame, exactly what any too-large jump does. See sweep RS2.
+fn advance(comptime U: type, pc: U, k: u32) U {
+    return pc +| k;
 }
 
 fn load(frame: []const u8, at: u64, size: u16) ?u32 {
@@ -259,7 +266,7 @@ pub fn compile(gpa: std.mem.Allocator, expr: []const u8) CompileError![]BpfInsn 
     var g: Gen = .{ .a = arena.allocator() };
     const t_label = try g.newLabel();
     const f_label = try g.newLabel();
-    try g.gen(ast, t_label, f_label);
+    try g.gen(ast, t_label, f_label, 0);
     try g.place(t_label);
     try g.emit(.{ .insn = .{ .code = op.ret | op.k, .jt = 0, .jf = 0, .k = accept_len } });
     try g.place(f_label);
@@ -288,21 +295,28 @@ const Gen = struct {
         try g.code.append(g.a, p);
     }
 
-    fn gen(g: *Gen, n: *const Node, t: usize, f: usize) CompileError!void {
+    /// Recursion bound for `gen`: the parser builds `a and b and c ...` as a
+    /// left-deep chain without touching its own depth counter, and a program
+    /// whose chain is this long cannot compile anyway (the first false-jump
+    /// must reach the end within 255 instructions). See sweep REV-RS-1.
+    const max_gen_depth = 512;
+
+    fn gen(g: *Gen, n: *const Node, t: usize, f: usize, depth: usize) CompileError!void {
+        if (depth > max_gen_depth) return error.FilterTooComplex;
         switch (n.*) {
             .@"and" => |ab| {
                 const mid = try g.newLabel();
-                try g.gen(ab[0], mid, f);
+                try g.gen(ab[0], mid, f, depth + 1);
                 try g.place(mid);
-                try g.gen(ab[1], t, f);
+                try g.gen(ab[1], t, f, depth + 1);
             },
             .@"or" => |ab| {
                 const mid = try g.newLabel();
-                try g.gen(ab[0], t, mid);
+                try g.gen(ab[0], t, mid, depth + 1);
                 try g.place(mid);
-                try g.gen(ab[1], t, f);
+                try g.gen(ab[1], t, f, depth + 1);
             },
-            .not => |inner| try g.gen(inner, f, t),
+            .not => |inner| try g.gen(inner, f, t, depth + 1),
             .t => |c| {
                 if (c.ind) try g.emit(.{ .insn = .{ .code = op.ldx | op.b | op.msh, .jt = 0, .jf = 0, .k = 14 } });
                 try g.emit(.{ .insn = .{
@@ -391,6 +405,11 @@ const Parser = struct {
     a: std.mem.Allocator,
     lex: Lexer,
     depth: usize = 0,
+    /// Comparisons built so far. Each one becomes at least one instruction of
+    /// the program, so more than `max_insns` of them can never compile; the
+    /// bound stops `a and a and a ...` (a left-deep chain `gen` recurses down)
+    /// from growing the tree without limit. See sweep RS1.
+    leaves: usize = 0,
 
     /// Parenthesis/`not` nesting bound: recursion is per token, so a hostile
     /// expression cannot exhaust the stack.
@@ -407,6 +426,8 @@ const Parser = struct {
     }
 
     fn t(p: *Parser, c: Test) !*const Node {
+        p.leaves += 1;
+        if (p.leaves > max_insns) return error.FilterTooComplex;
         return p.node(.{ .t = c });
     }
 
@@ -982,4 +1003,37 @@ inline fn strRepeat(comptime s: []const u8, comptime n: usize) *const [s.len * n
         break :blk (flat ++ [_:0]u8{})[0 .. s.len * n :0].*;
     };
     return &rep_result;
+}
+
+fn advanceBody() void {
+    if (advance(u32, 1, std.math.maxInt(u32)) != std.math.maxInt(u32)) @panic("not saturated");
+    if (advance(u32, 7, 3) != 10) @panic("plain add changed");
+    if (advance(usize, 5, 2) != 7) @panic("plain add changed");
+}
+
+test "advance: a jump offset cannot overflow the program counter, even a 32-bit one (sweep RS2)" {
+    try @import("sweep_test.zig").expectSurvives(advanceBody);
+}
+
+test "gen: a 1000-term chain is cut off by the depth bound before any code is emitted (sweep REV-RS-1)" {
+    // 1000 x `arp` = 2000 instructions: under max_insns, so only the depth
+    // bound (or the later jump-distance check in `finish`) can refuse it. The
+    // seam: drive Parser + Gen by hand; the bound fires on the way DOWN the
+    // left spine, so nothing has been emitted, while `finish`'s refusal would
+    // come after all 2000 instructions.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const unit = " and arp";
+    const src = try a.alloc(u8, 3 + unit.len * 999);
+    @memcpy(src[0..3], "arp");
+    for (0..999) |i| @memcpy(src[3 + i * unit.len ..][0..unit.len], unit);
+    var p: Parser = .{ .a = a, .lex = .{ .src = src } };
+    const ast = try p.parseExpr();
+    var g: Gen = .{ .a = a };
+    const t_label = try g.newLabel();
+    const f_label = try g.newLabel();
+    try testing.expectError(error.FilterTooComplex, g.gen(ast, t_label, f_label, 0));
+    try testing.expectEqual(@as(usize, 0), g.code.items.len);
+    try testing.expectError(error.FilterTooComplex, compile(testing.allocator, src));
 }

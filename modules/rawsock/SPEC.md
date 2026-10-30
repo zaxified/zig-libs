@@ -130,6 +130,7 @@ for the full socket path).
 
 ## Backlog / deferred
 
+- **2026-10-30 (no-panic sweep GS):** `pcap.writeRecord` does not know the file's snaplen, so a record longer than `max(snaplen, 262144)` is written but `pcap.Reader` then refuses it (`RecordTooLong`). Not a crash; the writer should take the header's `snaplen` (a signature change) or refuse such a record. Decide with the consumer (axp-core does not use `pcap`). Also: the filter compiler caps a filter at `max_insns` comparisons while parsing (`FilterTooComplex`), so `Syntax` errors after that point are reported as `FilterTooComplex`.
 - **Big-endian: the two seed-corpus tests fail on s390x** (BE sweep 2026-10-18, same on Zig 0.16 and 0.17; re-run 2026-10-19 `-Dtarget=s390x-linux -fqemu -Doptimize=ReleaseSafe`): `corpus: the hwaddr seeds drive both shapes…` expected 7, found 0; `corpus: the ARP seeds…` expected 4, found 0. Test-only: the seeds are `std.testing.Smith` streams written on a little-endian host, so their length/choice words read differently on BE and no seed reaches the accepting arms. The parsers themselves are not involved. Fix: pin the counts per endianness, or encode the seeds through the Smith writer at comptime.
 - **2026-10-04:** survey items (1) pcap savefiles — **done** inside this module (`rawsock.pcap`;
   a separate `pcapfile` module would need a root `build.zig` entry, and the codec is ~150 lines

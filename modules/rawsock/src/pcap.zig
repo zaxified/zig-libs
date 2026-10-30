@@ -150,8 +150,13 @@ pub const Reader = struct {
         return if (r.header.swapped) (if (host == .little) .big else .little) else host;
     }
 
+    /// ⚠ `orig_len` is reported as the file states it: it is NOT checked to be
+    /// `>= data.len` (a corrupt or hostile file can say less than it holds).
+    /// Treat `data.len` as the captured length and `orig_len` as a hint.
     pub fn next(r: *Reader) ReadError!?Record {
-        if (r.pos == r.buf.len) return null;
+        // `>=`, not `==`: `pos` is a public field, and a caller who moved it
+        // past the end must get "no more records", not an underflow below.
+        if (r.pos >= r.buf.len) return null;
         if (r.buf.len - r.pos < record_header_len) return error.Truncated;
         const h = r.buf[r.pos..][0..record_header_len];
         const o = r.byteOrder();
