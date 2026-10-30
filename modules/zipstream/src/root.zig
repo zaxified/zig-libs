@@ -208,7 +208,10 @@ const Bzip2Codec = struct {
     fn openReader(_: ?*anyopaque, gpa: Allocator, input: *std.Io.Reader, _: CodecEntry) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
-        s.r = try bzip2.DecompressReader.init(gpa, input, &s.buf, .{ .multi_stream = false });
+        // The entry's own cap (`max_entry` / `initMax`) is enforced above the
+        // codec, so the bzip2 default bomb guard (256 MiB) must not also apply:
+        // it would refuse legitimate entries between that and `max_entry`.
+        s.r = try bzip2.DecompressReader.init(gpa, input, &s.buf, .{ .multi_stream = false, .max_output = null });
         return .{ .reader = &s.r.reader, .state = s, .close = closeReader };
     }
 
