@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GP) found nothing to fix (every input is a fixed-size array, `mulMulti` already had a checked panic); SPEC Backlog notes the stack a scalar multiplication needs (straus tables ≈ 21.5 KiB + burns).
 - **2026-10-19** — **Fix:** `X25519.KeyPair.generate`/`generateInto` draw the seed with `entropy.fill` (fail-closed: aborts when no entropy is available) instead of `io.random`, which degrades to a guessable seed on `error.EntropyUnavailable` — the seed is the private key (CONVENTIONS.md §2.2). New dependency: `entropy`. Signatures unchanged (audit 2026-10-19).
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests/bench: std `X25519.recoverPublicKey`/`generateDeterministic` no longer return error unions.

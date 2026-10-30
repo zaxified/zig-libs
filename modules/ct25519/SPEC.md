@@ -806,6 +806,8 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at axp's request:
 
 ## Backlog / deferred
 
+- **Document a minimum stack size (review GP, 2026-10-30).** `mulMulti*` reserves 8 x 16 `Edwards25519` (about 21.5 KiB) in `strausChunk` and burns `msm_burn` (32 KiB); `recoverPublicKey` burns 16 KiB. Publish a minimum stack in the README/`meta`; optionally size the Straus tables by `points.len`.
+
 - ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (axp request) — see § Build options.
 - **Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL** *(bench
   2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
