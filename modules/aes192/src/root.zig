@@ -290,8 +290,12 @@ pub const Aes192EncryptCtx = struct {
     ///
     /// Dead stack: as `xorWide` — the keystream is working state (§2.1 Z3);
     /// the caller that owns key and message burns.
+    ///
+    /// `dst.len >= src.len` is the caller's contract; a shorter `dst` is a
+    /// checked `@panic("aes192: ctr dst shorter than src")` in every build mode
+    /// (it would be an out-of-bounds write in ReleaseFast otherwise; sweep A9-1).
     pub fn ctr(ctx: Self, dst: []u8, src: []const u8, iv: [16]u8) void {
-        std.debug.assert(dst.len >= src.len);
+        if (dst.len < src.len) @panic("aes192: ctr dst shorter than src");
         const n = Block.parallel.optimal_parallel_blocks;
         var hi = std.mem.readInt(u64, iv[0..8], .big);
         var lo = std.mem.readInt(u64, iv[8..16], .big);
@@ -443,6 +447,7 @@ test {
     _ = @import("model_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("stackprobe_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 fn fromHex(comptime n: usize, comptime h: []const u8) [n]u8 {
