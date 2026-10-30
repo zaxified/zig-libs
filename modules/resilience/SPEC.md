@@ -41,7 +41,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 - **Independent layers + one composition:** two breakers over ONE state machine
   (`Breaker(Trip)`): `CircuitBreaker` trips on `failure_threshold` **consecutive** failures
   (Polly's classic breaker), `RateCircuitBreaker(n)` on the failure rate / slow-call rate over
-  the last `n` calls or `n` time buckets (resilience4j's default) — `n` slots of 16 bytes inside
+  the last `n` calls or `n` time buckets (resilience4j's default) — `n` slots of 32 bytes inside
   the struct. Both have modes (`forceOpen` latch, `disable`, `reset`), half-open k of n, an
   `ignore` outcome, slow calls, a listener called outside the lock, `counts()`, and a
   type-erased `handle()` for `Policy.breaker`. `Bulkhead` (semaphore-style, ≤ `max_concurrent`
@@ -141,6 +141,7 @@ bulkhead never reads its clock.
 **Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-resilience`, `BENCH_ROUNDS=5`, same host, ReleaseFast): ref 0.03–0.67×, against 0.03–0.60× before. The card carries these figures.
 
 ## Backlog / deferred
+- **User `Clock` called under the breaker's spinlock** *(sweep GO, 2026-10-30)* — `allow()`, `record()`, `counts()` and `trip` call `options.clock.now()` while holding the lock, so a `Clock` that calls back into the same breaker deadlocks. `Clock` is documented as a plain time source; the contract is now stated on `Clock.now` (must not call back into the breaker, block or panic).
 
 - ~~**Failure-rate / sliding-window breaker**~~, ~~**State-change notification**~~, ~~**`Retry-After`-aware delay**~~ *(survey 2026-09-30)* — done 2026-10-17 (`RateCircuitBreaker`, `Options.listener`, `retryAfterMs`), with the rest of the S2 set (see the CHANGELOG).
 - **Fallback** — deliberately a documented idiom, not a type (owner 2026-10-16): `run(&op, policy) catch |e| fallback(e)` is the whole feature in Zig.

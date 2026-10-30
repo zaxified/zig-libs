@@ -15,6 +15,7 @@
 //!   probe calls, of which `half_open_required_successes` (default all) close
 //!   it. `forceOpen`/`disable`/`reset`, a state-change listener, `counts()`.
 //!   Thread-safe (documented spinlock). Time via an injected `Clock`.
+//!   `init` panics (in all build modes) on invalid options; see the option docs.
 //! - `Retry` — pure backoff policy: `max_attempts`, exponential delay
 //!   (`base_delay_ms × factor^(attempt-1)`, capped at `max_delay_ms`),
 //!   jitter (**full jitter** is the recommended flavor — AWS "Exponential
@@ -169,6 +170,9 @@ pub const Clock = struct {
     /// `Delay.blocking`).
     pub const monotonic: Clock = .{ .nowFn = monotonicNowNs };
 
+    /// ⚠ Contract: breakers call `now` with their spinlock held (`allow`,
+    /// `record`, `counts`, `trip`). A clock must not call back into the
+    /// breaker, must not block and must not panic.
     pub fn now(c: Clock) u64 {
         return c.nowFn(c.ctx);
     }
@@ -280,7 +284,7 @@ pub const CircuitBreaker = Breaker(ConsecutiveTrip);
 /// window holds at least `minimum_calls` calls and `failure_rate_pct` of
 /// them failed, or `slow_call_rate_pct` of them were slower than
 /// `slow_call_duration_ms`. The window lives inside the struct (`n` slots of
-/// 16 bytes) — no allocation.
+/// 32 bytes) — no allocation.
 pub fn RateCircuitBreaker(comptime n: u32) type {
     return Breaker(RateTrip(n));
 }
@@ -335,9 +339,14 @@ fn Breaker(comptime Trip: type) type {
         totals: Counts = .{ .state = .closed, .mode = .normal },
 
         pub fn init(options: Options) Self {
-            std.debug.assert(options.half_open_probes >= 1);
-            if (options.half_open_required_successes) |k|
-                std.debug.assert(k >= 1 and k <= options.half_open_probes);
+            // Caller contract, checked in EVERY build mode (a bare `assert`
+            // is undefined behaviour in ReleaseFast): see the option docs.
+            if (options.half_open_probes < 1)
+                @panic("resilience: half_open_probes must be >= 1");
+            if (options.half_open_required_successes) |k| {
+                if (k < 1 or k > options.half_open_probes)
+                    @panic("resilience: half_open_required_successes must be in 1..half_open_probes");
+            }
             Trip.check(options);
             return .{ .options = options };
         }
@@ -690,7 +699,7 @@ const ConsecutiveTrip = struct {
     };
 
     fn check(o: Options) void {
-        std.debug.assert(o.failure_threshold >= 1);
+        if (o.failure_threshold < 1) @panic("resilience: failure_threshold must be >= 1");
     }
 
     /// A slow success is still a success here: the consecutive rule counts
@@ -725,14 +734,15 @@ fn RateTrip(comptime n: u32) type {
     return struct {
         const Self = @This();
         const is_rate = true;
-        const Slot = struct { epoch: u64 = 0, calls: u32 = 0, failures: u32 = 0, slow: u32 = 0 };
+        // u64: a long `.time` bucket can hold more than 2^32 calls (sweep RS-4).
+        const Slot = struct { epoch: u64 = 0, calls: u64 = 0, failures: u64 = 0, slow: u64 = 0 };
 
         slots: [n]Slot = @splat(.{}),
         /// Count mode: the next slot to write; time mode: unused.
         head: u32 = 0,
-        calls: u32 = 0,
-        failures: u32 = 0,
-        slow: u32 = 0,
+        calls: u64 = 0,
+        failures: u64 = 0,
+        slow: u64 = 0,
         /// Time mode: the newest bucket epoch seen (`now / bucket`).
         last_epoch: u64 = 0,
 
@@ -760,13 +770,17 @@ fn RateTrip(comptime n: u32) type {
         };
 
         fn check(o: Options) void {
-            std.debug.assert(o.failure_rate_pct >= 1 and o.failure_rate_pct <= 100);
+            if (o.failure_rate_pct < 1 or o.failure_rate_pct > 100)
+                @panic("resilience: failure_rate_pct must be in 1..100");
             if (o.slow_call_rate_pct) |p| {
-                std.debug.assert(p >= 1 and p <= 100);
-                std.debug.assert(o.slow_call_duration_ms != null);
+                if (p < 1 or p > 100) @panic("resilience: slow_call_rate_pct must be in 1..100");
+                if (o.slow_call_duration_ms == null)
+                    @panic("resilience: slow_call_rate_pct needs slow_call_duration_ms");
             }
-            if (o.kind == .time) std.debug.assert(o.bucket_ms >= 1);
-            if (o.minimum_calls) |m| std.debug.assert(m >= 1);
+            if (o.kind == .time and o.bucket_ms < 1) @panic("resilience: bucket_ms must be >= 1");
+            if (o.minimum_calls) |m| {
+                if (m < 1) @panic("resilience: minimum_calls must be >= 1");
+            }
         }
 
         fn minCalls(o: *const Options) u32 {
@@ -802,7 +816,7 @@ fn RateTrip(comptime n: u32) type {
                     break :blk s;
                 },
                 .time => blk: {
-                    const epoch = o.clock.now() / (o.bucket_ms *| std.time.ns_per_ms);
+                    const epoch = o.clock.now() / @max(1, o.bucket_ms *| std.time.ns_per_ms);
                     t.roll(epoch);
                     break :blk &t.slots[@intCast(epoch % n)];
                 },
@@ -818,11 +832,12 @@ fn RateTrip(comptime n: u32) type {
                 t.slow += 1;
             }
             if (t.calls < minCalls(o)) return false;
-            // Percentages compared in integers: x / calls ≥ p / 100.
-            const calls: u64 = t.calls;
-            if (@as(u64, t.failures) * 100 >= @as(u64, o.failure_rate_pct) * calls) return true;
+            // Percentages compared in integers: x / calls ≥ p / 100 (u128:
+            // the u64 counters times 100 must not overflow).
+            const calls: u128 = t.calls;
+            if (@as(u128, t.failures) * 100 >= @as(u128, o.failure_rate_pct) * calls) return true;
             if (o.slow_call_rate_pct) |p| {
-                if (@as(u64, t.slow) * 100 >= @as(u64, p) * calls) return true;
+                if (@as(u128, t.slow) * 100 >= @as(u128, p) * calls) return true;
             }
             return false;
         }
@@ -832,10 +847,11 @@ fn RateTrip(comptime n: u32) type {
         }
 
         fn fill(t: *Self, o: *const Options, c: *Counts, now_ns: u64) void {
-            if (o.kind == .time) t.roll(now_ns / (o.bucket_ms *| std.time.ns_per_ms));
-            c.window_calls = t.calls;
-            c.window_failures = t.failures;
-            c.window_slow = t.slow;
+            if (o.kind == .time) t.roll(now_ns / @max(1, o.bucket_ms *| std.time.ns_per_ms));
+            const cap = std.math.maxInt(u32);
+            c.window_calls = @intCast(@min(t.calls, cap));
+            c.window_failures = @intCast(@min(t.failures, cap));
+            c.window_slow = @intCast(@min(t.slow, cap));
         }
     };
 }
@@ -908,7 +924,7 @@ pub const Bulkhead = struct {
     };
 
     pub fn init(options: Options) Bulkhead {
-        std.debug.assert(options.max_concurrent >= 1);
+        if (options.max_concurrent < 1) @panic("resilience: Bulkhead max_concurrent must be >= 1");
         return .{ .options = options };
     }
 
@@ -938,23 +954,30 @@ pub const Bulkhead = struct {
 
         const clock = b.options.clock;
         const deadline_ns = clock.now() +| b.options.max_wait_ns;
+        // The requested sleeps are summed too, so the wait ends even when
+        // the clock is stuck (an injected one, or `monotonicNowNs` returning
+        // 0 on a `clock_gettime` error under seccomp).
+        var slept_ns: u64 = 0;
         while (true) {
             const now_ns = clock.now();
-            if (now_ns >= deadline_ns) return error.BulkheadFull;
-            b.options.delay.sleep(@max(1, @min(b.options.poll_ns, deadline_ns - now_ns)));
+            if (now_ns >= deadline_ns or slept_ns >= b.options.max_wait_ns) return error.BulkheadFull;
+            const d = @max(1, @min(b.options.poll_ns, deadline_ns - now_ns));
+            b.options.delay.sleep(d);
+            slept_ns +|= d;
             if (b.tryAcquire()) return;
         }
     }
 
     /// Return a slot taken by a successful `tryAcquire`/`acquire`.
-    /// Releasing more than was acquired is a caller bug: asserts in Debug;
-    /// in release builds the counter saturates at 0 instead of wrapping.
+    /// Releasing more than was acquired is a caller bug, but never a crash:
+    /// at 0 the call is a no-op in every build mode. A surplus release while
+    /// other holders still hold slots cannot be detected (the counter is not
+    /// 0) and under-counts those holders.
     pub fn release(b: *Bulkhead) void {
         var cur = b.in_flight.load(.seq_cst);
         var pause: u32 = 1;
         while (true) {
-            std.debug.assert(cur > 0); // release without a matching acquire
-            if (cur == 0) return; // ReleaseFast: saturate, don't wrap
+            if (cur == 0) return; // release without a matching acquire: no-op
             cur = b.in_flight.cmpxchgWeak(cur, cur - 1, .seq_cst, .seq_cst) orelse
                 return;
             for (0..pause) |_| std.atomic.spinLoopHint();
@@ -1034,7 +1057,8 @@ pub const Retry = struct {
     max_attempts: u32 = 3,
     /// Delay before the first retry (i.e. after attempt 1).
     base_delay_ms: u64 = 100,
-    /// Exponential growth per attempt. Must be ≥ 1.0 and finite.
+    /// Exponential growth per attempt. Must be ≥ 1.0 and finite; anything
+    /// else (NaN, negative, infinite) is a checked panic in every build mode.
     factor: f64 = 2.0,
     /// Upper bound on any single delay (applied before jitter, so it also
     /// bounds every jittered delay).
@@ -1045,7 +1069,8 @@ pub const Retry = struct {
     /// so a caller who hasn't wired up entropy gets today's un-jittered
     /// schedule exactly as before.
     jitter: Jitter = .full,
-    /// `.proportional` only: the relative spread, in `[0, 1]`.
+    /// `.proportional` only: the relative spread, in `[0, 1]` (outside it,
+    /// NaN included, `nextDelay` panics with a message in every build mode).
     jitter_factor: f64 = 0.5,
     /// Total time budget for the attempts and the waits between them, from
     /// the start of `run` (failsafe-go max duration, cenkalti
@@ -1078,16 +1103,20 @@ pub const Retry = struct {
     /// fill, which cost as much as the rest of a jittered delay (bench
     /// 2026-10-16). Same bits, same delay.
     pub fn nextDelayFrom(r: Retry, attempt: u32, bits: ?u64) u64 {
-        std.debug.assert(attempt >= 1);
-        std.debug.assert(r.factor >= 1.0 and std.math.isFinite(r.factor));
-        const d = r.expDelayMs(attempt);
+        // Caller contract, checked in EVERY build mode (a bare `assert` is
+        // undefined behaviour in ReleaseFast; a negative factor would reach
+        // `@intFromFloat` with a negative value). `!(x >= 1)` also catches NaN.
+        if (!(r.factor >= 1.0) or !std.math.isFinite(r.factor))
+            @panic("resilience: Retry.factor must be finite and >= 1");
+        const d = r.expDelayMs(@max(attempt, 1)); // attempt 0 reads as 1
         const x = bits orelse return d;
         return switch (r.jitter) {
             .none => d,
             .full => upTo(x, d),
             .equal => d / 2 + upTo(x, d - d / 2),
             .proportional => blk: {
-                std.debug.assert(r.jitter_factor >= 0 and r.jitter_factor <= 1);
+                if (!(r.jitter_factor >= 0 and r.jitter_factor <= 1))
+                    @panic("resilience: Retry.jitter_factor must be in [0, 1]");
                 const df: f64 = @floatFromInt(d);
                 // Saturating float -> int: with `max_delay_ms` near maxInt(u64)
                 // (a "no cap" spelling) and `jitter_factor = 1`, `df * factor`
@@ -1124,6 +1153,7 @@ pub const Retry = struct {
             return sh[0];
         }
         const max_f: f64 = @floatFromInt(r.max_delay_ms);
+        if (r.base_delay_ms == 0) return 0; // 0 × inf would be NaN below
         const grown = @as(f64, @floatFromInt(r.base_delay_ms)) *
             std.math.pow(f64, r.factor, @floatFromInt(attempt - 1));
         // NaN/inf/≥max all cap (the comparison is written to be false for
@@ -2463,4 +2493,5 @@ test "Retry.nextDelayFrom: proportional jitter with an uncapped (maxInt) ceiling
 
 test {
     _ = @import("model_test.zig");
+    _ = @import("sweep_test.zig");
 }
