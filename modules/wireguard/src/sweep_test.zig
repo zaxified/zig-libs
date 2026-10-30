@@ -394,3 +394,231 @@ test "finish after OOM leaves the parser feedable and finishable (sweep REV-WG-3
         try testing.expectEqual(@as(usize, 2), dev.peers[0].allowed_ips.len);
     }
 }
+
+// ── delta audit (wave GR, gra-a) ────────────────────────────────────────────
+
+/// A scripted transport that answers with the given messages, stamped with
+/// the CURRENT sequence number (so a restarted dump sees fresh replies).
+const Feed = struct {
+    const Step = struct {
+        type: u16,
+        flags: u16 = 0,
+        payload: []const u8 = "",
+        foreign_seq: bool = false,
+        foreign_pid: bool = false,
+    };
+    steps: []const Step,
+    /// Repeat the last step forever once the list is used up.
+    repeat: bool = false,
+    seq: u32 = 100,
+    portid: u32 = 7,
+    sends: usize = 0,
+    idx: usize = 0,
+    buf: [1024]u8 = undefined,
+
+    pub fn portId(s: *const Feed) u32 {
+        return s.portid;
+    }
+    pub fn nextSeq(s: *Feed) u32 {
+        s.seq += 1;
+        return s.seq;
+    }
+    pub fn send(s: *Feed, _: []const u8) error{SendFailed}!void {
+        s.sends += 1;
+    }
+    pub fn recvDatagram(s: *Feed) error{RecvFailed}![]const u8 {
+        if (s.idx >= s.steps.len) {
+            if (!s.repeat) return error.RecvFailed;
+            s.idx = s.steps.len - 1;
+        }
+        const st = s.steps[s.idx];
+        s.idx += 1;
+        const total = 16 + st.payload.len;
+        std.mem.writeInt(u32, s.buf[0..4], @intCast(total), native);
+        std.mem.writeInt(u16, s.buf[4..6], st.type, native);
+        std.mem.writeInt(u16, s.buf[6..8], st.flags, native);
+        std.mem.writeInt(u32, s.buf[8..12], if (st.foreign_seq) s.seq +% 1000 else s.seq, native);
+        std.mem.writeInt(u32, s.buf[12..16], if (st.foreign_pid) s.portid +% 1 else s.portid, native);
+        @memcpy(s.buf[16..total], st.payload);
+        return s.buf[0..total];
+    }
+};
+
+fn errnoPayload(code: i32) [4]u8 {
+    var b: [4]u8 = undefined;
+    std.mem.writeInt(i32, &b, code, native);
+    return b;
+}
+
+test "getDevice: records are assembled; an interrupted round is discarded (sweep audit GR-A1)" {
+    const gpa = testing.allocator;
+    const a = try peerWithIps(gpa, keyBytes(1), 0, 2);
+    defer gpa.free(a);
+    const b = try peerWithIps(gpa, keyBytes(2), 50, 1);
+    defer gpa.free(b);
+    var t: Feed = .{ .steps = &.{
+        .{ .type = 0x1c, .payload = a },
+        .{ .type = 0x1c, .flags = codec.NLM_F_DUMP_INTR },
+        .{ .type = 0x1c, .payload = b },
+        .{ .type = codec.NLMSG_DONE },
+    } };
+    var dev: wg.Device = undefined;
+    try wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "wg0", &dev);
+    defer dev.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), t.sends);
+    try testing.expectEqual(@as(usize, 1), dev.peers.len);
+    try testing.expectEqualSlices(u8, &keyBytes(2), &dev.peers[0].public_key);
+    try testing.expectEqual(@as(usize, 1), dev.peers[0].allowed_ips.len);
+}
+
+test "getDevice: a record of another type is not parsed (sweep audit GR-A2)" {
+    const gpa = testing.allocator;
+    const a = try peerWithIps(gpa, keyBytes(1), 0, 2);
+    defer gpa.free(a);
+    var t: Feed = .{ .steps = &.{
+        .{ .type = 0x99, .payload = a },
+        .{ .type = codec.NLMSG_DONE },
+    } };
+    var dev: wg.Device = undefined;
+    try wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "wg0", &dev);
+    defer dev.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), dev.peers.len);
+}
+
+test "getDevice: ACKs are skipped, errors and overrun are mapped (sweep audit GR-A3)" {
+    const gpa = testing.allocator;
+    var dev: wg.Device = undefined;
+    // A flood of stray ACKs (code 0) never ends the dump.
+    const ack = errnoPayload(0);
+    var t: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_ERROR, .payload = &ack }}, .repeat = true };
+    try testing.expectError(error.TooManyMessages, wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "wg0", &dev));
+    // -ENODEV -> NoSuchDevice.
+    const nodev = errnoPayload(-19);
+    var u: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_ERROR, .payload = &nodev }} };
+    try testing.expectError(error.NoSuchDevice, wg.test_seam.getDeviceOver(&u, gpa, 0x1c, "wg0", &dev));
+    var v: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_OVERRUN }} };
+    try testing.expectError(error.SystemResources, wg.test_seam.getDeviceOver(&v, gpa, 0x1c, "wg0", &dev));
+    // NOOP is skipped, then DONE ends.
+    var w: Feed = .{ .steps = &.{ .{ .type = codec.NLMSG_NOOP }, .{ .type = codec.NLMSG_DONE } } };
+    try wg.test_seam.getDeviceOver(&w, gpa, 0x1c, "wg0", &dev);
+    dev.deinit(gpa);
+}
+
+fn dumpWithAllocator(gpa: std.mem.Allocator, a: []const u8, b: []const u8) !void {
+    var t: Feed = .{ .steps = &.{
+        .{ .type = 0x1c, .payload = a },
+        .{ .type = 0x1c, .payload = b },
+        .{ .type = codec.NLMSG_DONE },
+    } };
+    var dev: wg.Device = undefined;
+    try wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "wg0", &dev);
+    dev.deinit(gpa);
+}
+
+test "getDevice: an allocation failure is OutOfMemory, never MalformedReply (sweep audit GR-A4)" {
+    const gpa = testing.allocator;
+    const a = try peerWithIps(gpa, keyBytes(1), 0, 2);
+    defer gpa.free(a);
+    const b = try peerWithIps(gpa, keyBytes(1), 9, 2);
+    defer gpa.free(b);
+    // Own fail_index loop (checkAllAllocationFailures sees a nondeterministic
+    // allocation count here): every run is a success or OutOfMemory.
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var fa: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = i });
+        dumpWithAllocator(fa.allocator(), a, b) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            continue;
+        };
+        try testing.expect(!fa.has_induced_failure);
+        break;
+    }
+    try testing.expect(i > 4 and i < 200);
+}
+
+test "awaitAck: foreign replies are skipped, ACK ends, errors are mapped (sweep audit GR-A5)" {
+    const nodev = errnoPayload(-22);
+    const ack = errnoPayload(0);
+    var t: Feed = .{ .steps = &.{
+        .{ .type = codec.NLMSG_ERROR, .payload = &nodev, .foreign_pid = true },
+        .{ .type = codec.NLMSG_ERROR, .payload = &nodev, .foreign_seq = true },
+        .{ .type = 0x1c },
+        .{ .type = codec.NLMSG_ERROR, .payload = &ack },
+    } };
+    try wg.test_seam.awaitAckOver(&t, 100);
+    try testing.expectEqual(@as(usize, 4), t.idx);
+    var u: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_ERROR, .payload = &nodev }} };
+    try testing.expectError(error.InvalidRequest, wg.test_seam.awaitAckOver(&u, 100));
+    var v: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_ERROR, .payload = "ab" }} };
+    try testing.expectError(error.MalformedReply, wg.test_seam.awaitAckOver(&v, 100));
+}
+
+test "getDevice: the interface name must be 1..15 bytes (sweep audit GR-A6)" {
+    const gpa = testing.allocator;
+    var dev: wg.Device = undefined;
+    var t: Feed = .{ .steps = &.{.{ .type = codec.NLMSG_DONE }}, .repeat = true };
+    try testing.expectError(error.InvalidRequest, wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "", &dev));
+    try testing.expectError(error.InvalidRequest, wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "0123456789abcdef", &dev));
+    try testing.expectEqual(@as(usize, 0), t.sends);
+    try wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "0123456789abcde", &dev);
+    dev.deinit(gpa);
+    try wg.test_seam.getDeviceOver(&t, gpa, 0x1c, "w", &dev);
+    dev.deinit(gpa);
+}
+
+test "the exchange budgets are the documented ones (sweep audit GR-A7)" {
+    try testing.expectEqual(@as(u32, 65536), wg.test_seam.max_reply_messages);
+    try testing.expectEqual(@as(u32, 3), wg.test_seam.max_dump_restarts);
+}
+
+test "a parser that failed to add a peer still merges a continuation of the last one (sweep audit GR-A8)" {
+    const gpa = testing.allocator;
+    var msgs: [5][]u8 = undefined;
+    for (&msgs, 0..) |*m, i| m.* = try peerWithIps(gpa, keyBytes(@intCast(i + 1)), @intCast(i), 1);
+    defer for (msgs) |m| gpa.free(m);
+    const cont = try peerWithIps(gpa, keyBytes(4), 90, 1); // continuation of peer 4
+    defer gpa.free(cont);
+    var k: usize = 0;
+    while (k < 6) : (k += 1) {
+        var fa: std.testing.FailingAllocator = .init(gpa, .{});
+        const a = fa.allocator();
+        var p: wg.DeviceParser = .init(a);
+        defer p.deinit();
+        for (msgs[0..4]) |m| try p.feed(m);
+        fa.fail_index = fa.alloc_index + k;
+        const failed = if (p.feed(msgs[4])) |_| false else |e| blk: {
+            try testing.expectEqual(error.OutOfMemory, e);
+            break :blk true;
+        };
+        fa.fail_index = std.math.maxInt(usize);
+        if (failed) try p.feed(cont);
+        var dev = try p.finish();
+        defer dev.deinit(a);
+        if (failed) {
+            try testing.expectEqual(@as(usize, 4), dev.peers.len);
+            try testing.expectEqual(@as(usize, 2), dev.peers[3].allowed_ips.len);
+        } else {
+            try testing.expectEqual(@as(usize, 5), dev.peers.len);
+        }
+    }
+}
+
+test "two peers with the same key inside one message are two peers, not a merge (sweep audit GR-A9)" {
+    const gpa = testing.allocator;
+    var l: std.ArrayList(u8) = .empty;
+    defer l.deinit(gpa);
+    try l.appendSlice(gpa, &.{ 0, 1, 0, 0 });
+    const peers = try open(gpa, &l, wg.WGDEVICE_A.PEERS);
+    for (0..2) |_| {
+        const entry = try open(gpa, &l, 0);
+        try put(gpa, &l, wg.WGPEER_A.PUBLIC_KEY, &keyBytes(5));
+        try codec.nestEnd(&l, entry);
+    }
+    try codec.nestEnd(&l, peers);
+    var p: wg.DeviceParser = .init(gpa);
+    defer p.deinit();
+    try p.feed(l.items);
+    var dev = try p.finish();
+    defer dev.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), dev.peers.len);
+}

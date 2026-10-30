@@ -83,6 +83,10 @@ fn keyedMacMid() void {
     const k: [40]u8 = @splat(7);
     _ = noise.keyedMac(&k, "x");
 }
+fn keyedMac33() void {
+    const k: [33]u8 = @splat(7);
+    _ = noise.keyedMac(&k, "x");
+}
 fn keyedMacEmpty() void {
     _ = noise.keyedMac("", "x");
 }
@@ -93,6 +97,10 @@ test "keyedMac: a key outside 1..32 bytes is a checked wireguard panic (sweep WH
     try expectPanicMessage(keyedMacLong, "wireguard: keyedMac");
     try expectPanicMessage(keyedMacMid, "wireguard: keyedMac");
     try expectPanicMessage(keyedMacEmpty, "wireguard: keyedMac");
+}
+
+test "keyedMac: the upper bound is exactly 32 bytes (sweep audit GR-B1)" {
+    try expectPanicMessage(keyedMac33, "wireguard: keyedMac");
 }
 
 // ── WH-2 (r1) / R-WH-1 / R-WH-2 / R-WH-3: state-machine misuse ──────────────
@@ -342,4 +350,43 @@ test "ReplayWindow: committing a stale counter does not mark a newer one seen (s
     try testing.expect(w.accepts(fresh));
     w.commit(fresh);
     try testing.expect(!w.accepts(fresh));
+}
+
+// ── audit GR-B2..B4: failed calls must not record a role / reach `.?` ───────
+
+test "Handshake: a refused createInitiation / consumeInitiation does not record a role (sweep audit GR-B2)" {
+    var ini: hs.Handshake = undefined;
+    var rsp: hs.Handshake = undefined;
+    try consumedResponder(&ini, &rsp);
+    try testing.expect(rsp.role == .responder);
+    try testing.expectError(error.AlreadyStarted, rsp.createInitiation(testing.io, @splat(0)));
+    try testing.expect(rsp.role == .responder); // not flipped by the refused call
+    // a consumeInitiation that fails (bad mac1) leaves the role unset
+    var ini2: hs.Handshake = .{ .static_keypair = kp(1), .remote_static_public = kp(2).public, .local_ephemeral = kp(3) };
+    var m1 = try ini2.createInitiation(testing.io, @splat(0));
+    m1.mac1[0] ^= 1;
+    var fresh: hs.Handshake = .{ .static_keypair = kp(2), .remote_static_public = kp(1).public, .local_ephemeral = kp(4) };
+    try testing.expectError(error.InvalidMac1, fresh.consumeInitiation(m1));
+    try testing.expect(fresh.role == .none);
+    try testing.expect(fresh.state == .idle);
+}
+
+test "consumeResponse: initiation_sent without local_ephemeral on an addressed response is an error (sweep audit GR-B3)" {
+    var h: hs.Handshake = .{ .static_keypair = kp(1), .remote_static_public = kp(2).public, .local_index = 9 };
+    h.state = .initiation_sent; // local_ephemeral still null
+    var msg = std.mem.zeroes(hs.MessageResponse);
+    msg.type = 2;
+    msg.receiver_index = 9;
+    try testing.expectError(error.NoPendingInitiation, h.consumeResponse(msg));
+}
+
+test "ReplayWindow: a counter one past the trailing edge does not mark a future counter seen (sweep audit GR-B4)" {
+    const W = transport.ReplayWindow(transport.default_window_bits);
+    var w: W = .{};
+    w.commit(20031); // last = 20032, a multiple of 64
+    const stale: u64 = 20032 - 8130; // last - n == capacity + 1
+    try testing.expect(!w.accepts(stale));
+    w.commit(stale);
+    w.commit(20100); // moves past 20095 without clearing its block (n=20101 is in the next block)
+    try testing.expect(w.accepts(20094)); // aliases stale's bit; was never seen
 }
