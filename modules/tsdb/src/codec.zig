@@ -212,6 +212,11 @@ pub fn canonicalize(
 ) CanonError!void {
     if (name.len > max_component_len) return error.ComponentTooLong;
     if (labels.len > std.math.maxInt(u16)) return error.SeriesTooLong;
+    // Lower bound of the form: name prefix + count, and at least two empty
+    // length prefixes (4 bytes) per label. Over the cap already -> the same
+    // error the late check gives, before the scratch copy and the sort
+    // (65535 labels sharing a 1 KiB prefix cost ~1 GB of comparisons; sweep D11).
+    if (out.items.len + 4 + name.len + labels.len * 4 > max_canonical_len) return error.SeriesTooLong;
 
     // Sort a scratch copy by label name; the caller's slice is not mutated.
     var sorted: std.ArrayList(Label) = .empty;
@@ -231,6 +236,9 @@ pub fn canonicalize(
     for (sorted.items) |l| {
         try appendLenPrefixed(gpa, out, l.name);
         try appendLenPrefixed(gpa, out, l.value);
+        // Refuse as soon as the form is over the cap: 65535 labels aliasing
+        // one 1 KiB string would otherwise be built to ~134 MB first (sweep TS-7).
+        if (out.items.len > max_canonical_len) return error.SeriesTooLong;
     }
     if (out.items.len > max_canonical_len) return error.SeriesTooLong;
 }
@@ -271,6 +279,10 @@ pub fn parseCanonical(gpa: Allocator, bytes: []const u8) ParseError!Descriptor {
     var r = Cursor{ .b = bytes };
     const name = try r.takeLenPrefixed();
     const count = try r.takeU16();
+    // Each label is at least two empty length prefixes (4 bytes): a count the
+    // rest of the bytes cannot hold is refused before the 2 MiB allocation
+    // it would size (sweep TS-7).
+    if (@as(usize, count) * 4 > bytes.len - r.i) return error.Malformed;
     const labels = try gpa.alloc(Label, count);
     errdefer gpa.free(labels);
     for (labels) |*l| {

@@ -473,6 +473,12 @@ Named as scope decisions, not omissions.
 
 ## Backlog / deferred
 
+- **deleteRange memory (no-panic sweep GN, 2026-10-30).** `deleteRange` holds every affected key and each straddling block's suffix in memory (17 B per raw sample), so a window over a very large series is O(window). Documented; kept because the one-transaction atomicity is the contract and kvtree's transaction holds the deletes anyway. A bounded variant would be a new chunked, non-atomic entry point (cf. `deleteSeries`).
+- **`max_cached_series` worst case (GN).** The default 65536 cached series x a 3 KiB canonical form is ~200 MB if every series is maximal; documented in `Options.max_cached_series`. Lower it for untrusted label sources.
+- **Negative `Policy.retention` (GN).** `now -| keep` with a negative `keep` puts the cutoff in the future and sweeps everything. Not a crash; rejecting it would be a policy change nobody asked for.
+- **`sweepToBudget` memory with a huge `max_deletes` (GN fix review, 2026-10-30).** The picked entries (17 B each) are held until the commits run, so `max_deletes = maxInt` ("until the budget is met") costs memory proportional to the excess (~680 MB for 40M keys); the default 65536 is ~1 MB. Work-proportional like `deleteRange`, documented on the option. A fix would flush a transaction every `chunk_deletes` inside the pop loop (`unitAt` re-probes by successor key, so it is safe against already-committed deletes).
+- **`compact` with `chunk_points` below `min_run` packs nothing (GN fix review).** It returns `done` silently; predates the sweep and is documented behaviour of the two options together.
+
 **S2 plan — survey 2026-10-20** (Sonnet, read-only; reference Prometheus tsdb v3.15.0, Apache-2.0; also
 VictoriaMetrics, InfluxDB 3, QuestDB, TimescaleDB (Apache part only), nakabonne/tstorage). Key finding:
 `compact` (9.2× on ttydesk data) is called by NEITHER consumer — both run on raw 25 B/sample keys; wgs

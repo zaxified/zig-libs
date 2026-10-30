@@ -136,15 +136,13 @@ pub const Writer = struct {
         return w.n;
     }
 
-    /// Timestamp of the first sample; valid when `count() >= 1`.
+    /// Timestamp of the first sample; 0 while `count() == 0`.
     pub fn firstTs(w: *const Writer) i64 {
-        std.debug.assert(w.n >= 1);
         return w.first_ts;
     }
 
-    /// Timestamp of the last sample; valid when `count() >= 1`.
+    /// Timestamp of the last sample; 0 while `count() == 0`.
     pub fn lastTs(w: *const Writer) i64 {
-        std.debug.assert(w.n >= 1);
         return w.last_ts;
     }
 
@@ -262,9 +260,10 @@ pub const Reader = struct {
     /// from, keeping the decode position. For callers that hold the block in a
     /// buffer inside a struct which may be moved between `next` calls. The
     /// bytes at `block` must be identical to the original block (same length
-    /// and content); this is not checked beyond a length assertion.
+    /// and content); this is not checked beyond the length, which panics
+    /// (`tsdb: Reader.rebind: ...`) when it differs.
     pub fn rebind(r: *Reader, block: []const u8) void {
-        std.debug.assert(block.len == header_bytes + r.stream.len);
+        if (block.len != header_bytes + r.stream.len) @panic("tsdb: Reader.rebind: block length differs from the original");
         r.stream = block[header_bytes..];
     }
 

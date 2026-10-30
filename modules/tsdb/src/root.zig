@@ -157,6 +157,9 @@ pub const Db = struct {
     /// the same tree committing moves the version and forces a recount).
     series_count: usize = 0,
     series_count_at: ?u64 = null,
+    /// Reverse-index rescans `countSeries` has done (diagnostic; a witness
+    /// that an own commit does not force one, sweep D12).
+    series_recounts: usize = 0,
 
     pub const Options = struct {
         /// Cardinality limit: `seriesId` returns `error.TooManySeries` when it
@@ -233,7 +236,9 @@ pub const Db = struct {
         var id_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &id_bytes, id, .big);
         var counter: [8]u8 = undefined;
-        std.mem.writeInt(u64, &counter, id + 1, .big);
+        // `id` comes from the persisted counter: a rotted one at maxInt must
+        // not wrap (sweep TS-1).
+        std.mem.writeInt(u64, &counter, std.math.add(u64, id, 1) catch return error.CorruptIndex, .big);
 
         const rev_key = reverseKey(id);
         var txn = try self.tree.begin();
@@ -244,7 +249,7 @@ pub const Db = struct {
             try txn.put(&codec.meta_key_next_series, &counter);
         }
         try txn.commit(); // consumes the txn on both outcomes
-        if (self.opts.max_series != null) self.noteSeriesAdded();
+        self.noteOwnCommit(1);
         self.cacheSeriesId(idx_key.items, id);
         return id;
     }
@@ -259,13 +264,18 @@ pub const Db = struct {
     /// twice in `specs` gets the same id. All or nothing: on an error no new
     /// series exists. `max_series` counts the whole batch.
     pub fn seriesIds(self: *Db, specs: []const SeriesSpec, out: []SeriesId) Error!void {
-        std.debug.assert(out.len >= specs.len);
+        if (out.len < specs.len) @panic("tsdb: seriesIds: out is shorter than specs");
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
         // Index key of every spec, and which ones are new (deduplicated).
         const keys = try arena.alloc([]u8, specs.len);
+        // Which specs are new in this batch. A flag, not `out[i] == 0`: an id
+        // read back from the tree can itself be 0 (rotted counter), and the
+        // sentinel then sent a stored series into `new_ids.get(..).?` (sweep TS-2).
+        const fresh = try arena.alloc(bool, specs.len);
+        @memset(fresh, false);
         var new_ids: std.StringHashMapUnmanaged(SeriesId) = .empty;
         var new_order: std.ArrayList([]const u8) = .empty;
         for (specs, 0..) |s, i| {
@@ -291,6 +301,7 @@ pub const Db = struct {
                 try new_order.append(arena, keys[i]);
             }
             out[i] = 0; // filled below
+            fresh[i] = true;
         }
         if (new_order.items.len == 0) return;
 
@@ -299,7 +310,9 @@ pub const Db = struct {
         }
         const first = try self.nextSeriesId();
         var counter: [8]u8 = undefined;
-        std.mem.writeInt(u64, &counter, first + new_order.items.len, .big);
+        // `first` comes from the persisted counter; see seriesId (sweep TS-1).
+        const after_last = std.math.add(u64, first, new_order.items.len) catch return error.CorruptIndex;
+        std.mem.writeInt(u64, &counter, after_last, .big);
         var txn = try self.tree.begin();
         {
             errdefer txn.rollback();
@@ -315,9 +328,9 @@ pub const Db = struct {
             try txn.put(&codec.meta_key_next_series, &counter);
         }
         try txn.commit(); // consumes the txn on both outcomes
-        self.series_count_at = null; // recounted on the next limited creation
+        self.noteOwnCommit(@intCast(new_order.items.len));
         for (specs, 0..) |_, i| {
-            if (out[i] == 0) out[i] = new_ids.get(keys[i]).?;
+            if (fresh[i]) out[i] = new_ids.get(keys[i]).?; // every fresh key is in new_ids
         }
         for (new_order.items) |k| self.cacheSeriesId(k, new_ids.get(k).?);
     }
@@ -331,6 +344,7 @@ pub const Db = struct {
         var cur = try snap.cursor();
         defer cur.deinit();
         try cur.seek(&[_]u8{codec.tag_series_rev});
+        self.series_recounts += 1;
         var n: usize = 0;
         while (try cur.next()) |e| {
             if (e.key.len != 9 or e.key[0] != codec.tag_series_rev) break;
@@ -341,9 +355,12 @@ pub const Db = struct {
         return n;
     }
 
-    /// Called right after this `Db` committed one new series: if the count
-    /// was valid just before the commit it stays valid, re-stamped.
-    fn noteSeriesAdded(self: *Db) void {
+    /// Called right after this `Db` committed ONE transaction that changed the
+    /// number of registered series by `delta` (0 for appends, sweeps, compaction
+    /// ...): if the count was valid just before the commit it stays valid,
+    /// adjusted and re-stamped. A commit by another handle moves the version
+    /// by more than one and falls back to the recount (sweep D12).
+    fn noteOwnCommit(self: *Db, delta: isize) void {
         const prev = self.series_count_at orelse return;
         var snap = self.tree.snapshot() catch {
             self.series_count_at = null;
@@ -352,7 +369,10 @@ pub const Db = struct {
         defer snap.release();
         // single writer: our commit is exactly the one after `prev`
         if (snap.txn_id == prev + 1) {
-            self.series_count += 1;
+            self.series_count = if (delta >= 0)
+                self.series_count +| @as(usize, @intCast(delta))
+            else
+                self.series_count -| @as(usize, @intCast(-delta));
             self.series_count_at = snap.txn_id;
         } else self.series_count_at = null;
     }
@@ -462,6 +482,7 @@ pub const Db = struct {
         const key = codec.pointKey(series, ts);
         const val = codec.encodeValue(value);
         try self.tree.put(&key, &val);
+        self.noteOwnCommit(0);
     }
 
     /// Append a batch atomically — one transaction, so a crash leaves either
@@ -478,6 +499,7 @@ pub const Db = struct {
             }
         }
         try txn.commit();
+        self.noteOwnCommit(0);
     }
 
     /// Append points for MULTIPLE series in ONE transaction — a crash or an
@@ -513,12 +535,19 @@ pub const Db = struct {
             }
         }
         try txn.commit();
+        self.noteOwnCommit(0);
+    }
+
+    /// A chunk-size option of 0 means "the default" everywhere (sweep D10).
+    fn orDefault(v: usize, d: usize) usize {
+        return if (v == 0) d else v;
     }
 
     // ── series deletion ──────────────────────────────────────────────────────
 
     pub const DeleteSeriesOptions = struct {
         /// Entries (raw points or blocks) deleted per transaction.
+        /// 0 means "the default" (4096), not 1 and not "all".
         chunk_deletes: usize = 4096,
     };
 
@@ -544,8 +573,12 @@ pub const Db = struct {
     /// from before the delete — those samples would have no index entry (no
     /// listing or budget sweep reaches them, though `liveSize` counts them).
     /// Re-resolve with `seriesId`.
+    ///
+    /// A block whose header does not decode is deleted anyway but contributes
+    /// nothing to `DeleteSeriesResult.deleted` (so the count is a lower bound
+    /// on a rotted series; `sweep` still reports such a block as `CorruptPoint`).
     pub fn deleteSeries(self: *Db, id: SeriesId, opts: DeleteSeriesOptions) Error!DeleteSeriesResult {
-        std.debug.assert(opts.chunk_deletes >= 1);
+        const chunk_deletes = orDefault(opts.chunk_deletes, (DeleteSeriesOptions{}).chunk_deletes); // 0 = default (sweep D10)
         const rev_key = reverseKey(id);
         const canon = (try self.tree.get(self.gpa, &rev_key)) orelse return .{};
         defer self.gpa.free(canon);
@@ -563,12 +596,14 @@ pub const Db = struct {
                     while (try cur.next()) |e| {
                         const ref = (if (block) codec.decodeBlockKey(e.key) else codec.decodePointKey(e.key)) orelse break;
                         if (ref.series != id) break;
-                        if (keys.items.len >= opts.chunk_deletes) {
+                        if (keys.items.len >= chunk_deletes) {
                             more = true;
                             break;
                         }
                         try keys.append(self.gpa, e.key[0..codec.point_key_len].*);
-                        res.deleted += if (block) try blockCount(e.val) else 1;
+                        // A block whose header does not decode is deleted all the same (it
+                        // is the remedy for a rotten series) but cannot be counted (sweep D13).
+                        res.deleted += if (block) (blockCount(e.val) catch 0) else 1;
                     }
                     if (more) break;
                 }
@@ -588,7 +623,7 @@ pub const Db = struct {
                 }
             }
             try txn.commit();
-            self.series_count_at = null;
+            self.noteOwnCommit(if (more) 0 else -1);
             res.chunks += 1;
             if (!more) return res;
         }
@@ -613,9 +648,11 @@ pub const Db = struct {
         min_run: usize = 64,
         /// Raw samples absorbed per transaction (bounds the transaction and
         /// the chunk's memory, ~16 bytes each plus the blocks it rewrites).
+        /// 0 means "the default" (4096).
         chunk_points: usize = 4096,
         /// Raw keys read per chunk — bounds a chunk that finds nothing to
         /// pack (every series' raw tail shorter than `min_run`).
+        /// 0 means "the default" (16384).
         chunk_examines: usize = 16384,
         /// Chunks this call may run before returning `done = false`. 0 = all.
         max_chunks: usize = 0,
@@ -644,8 +681,11 @@ pub const Db = struct {
     /// is the short tail per series plus everything at or above `before`.
     /// Choose `before` so recent data — still being written, perhaps out of
     /// order — stays raw (e.g. `now - 1h`).
-    pub fn compact(self: *Db, before: Timestamp, opts: CompactOptions) Error!CompactResult {
-        std.debug.assert(opts.chunk_points >= 1 and opts.chunk_examines >= 1);
+    pub fn compact(self: *Db, before: Timestamp, opts_in: CompactOptions) Error!CompactResult {
+        // A zero chunk size reads as the default (sweep D10; TS-4 progress).
+        var opts = opts_in;
+        opts.chunk_points = orDefault(opts.chunk_points, (CompactOptions{}).chunk_points);
+        opts.chunk_examines = orDefault(opts.chunk_examines, (CompactOptions{}).chunk_examines);
         var pos: ScanPos = .{};
         pos.set(&[_]u8{codec.tag_point});
         var res: CompactResult = .{};
@@ -771,6 +811,7 @@ pub const Db = struct {
             }
         }
         try txn.commit();
+        self.noteOwnCommit(0);
         return .{ .compacted = compacted, .blocks = blocks, .examined = examined, .done = done };
     }
 
@@ -820,13 +861,16 @@ pub const Db = struct {
 
     pub const SweepOptions = struct {
         /// Upper bound on deletions batched into ONE transaction. Caps both the
-        /// transaction's size and the memory the sweep holds (one 17-byte key
-        /// each).
+        /// transaction's size and the memory the sweep holds: one 17-byte key
+        /// per deletion, and 16 bytes per sample of a straddling block's
+        /// surviving suffix -- a chunk ends once those reach this count too,
+        /// so it holds at most this many plus one block's worth
+        /// (`chunk.max_block_samples`). 0 means "the default" (4096), not 1.
         chunk_deletes: usize = 4096,
         /// Upper bound on point keys EXAMINED in one chunk. Needed
         /// independently of `chunk_deletes`: a chunk that finds nothing to
         /// delete must still be bounded, or a store full of live data turns one
-        /// "chunk" into a full-keyspace scan.
+        /// "chunk" into a full-keyspace scan. 0 means "the default" (16384).
         chunk_examines: usize = 16384,
         /// Chunks this call may run before returning with `done = false`.
         /// 0 = run to completion.
@@ -866,7 +910,11 @@ pub const Db = struct {
     ///   the end state an uninterrupted sweep produces: the operation is
     ///   "delete the keys below a bound", deletes of absent keys are no-ops,
     ///   and the position is only ever an optimization on top.
-    pub fn sweep(self: *Db, cutoff: Timestamp, opts: SweepOptions) Error!SweepResult {
+    pub fn sweep(self: *Db, cutoff: Timestamp, opts_in: SweepOptions) Error!SweepResult {
+        var opts = opts_in;
+        // 0 = the default: a literal 0 would commit once per key (sweep D10).
+        opts.chunk_deletes = orDefault(opts.chunk_deletes, (SweepOptions{}).chunk_deletes);
+        opts.chunk_examines = orDefault(opts.chunk_examines, (SweepOptions{}).chunk_examines);
         var pos = try self.resumePosition(cutoff);
         var res: SweepResult = .{};
         while (true) {
@@ -907,6 +955,8 @@ pub const Db = struct {
 
         var examined: usize = 0;
         var deleted: usize = 0; // samples
+        // Samples held in `rewrites` (16 bytes each in the arena).
+        var kept_samples: usize = 0;
         var done = false;
 
         {
@@ -963,6 +1013,7 @@ pub const Db = struct {
                             }
                             try deletes.append(self.gpa, key);
                             try rewrites.append(a, .{ .series = bk.series, .samples = keep.items });
+                            kept_samples += keep.items.len;
                         }
                         // Either way nothing later in this series can expire.
                         if (bk.series == std.math.maxInt(SeriesId)) {
@@ -985,6 +1036,12 @@ pub const Db = struct {
                 }
 
                 if (deletes.items.len >= opts.chunk_deletes) break;
+                // The surviving suffixes are the chunk's memory: stop once they
+                // reach the same budget, so it is `chunk_deletes` plus at most
+                // one block (the check runs after a block is handled, so a chunk
+                // always completes one rewrite and the position advances) --
+                // not `chunk_examines` x a block (sweep TS-6).
+                if (kept_samples >= opts.chunk_deletes) break;
                 if (examined >= opts.chunk_examines) break;
                 if (reseek) try cur.seek(pos.slice());
             }
@@ -1007,6 +1064,7 @@ pub const Db = struct {
             }
         }
         try txn.commit();
+        self.noteOwnCommit(0);
 
         return .{ .deleted = deleted, .examined = examined, .done = done };
     }
@@ -1090,11 +1148,13 @@ pub const Db = struct {
         /// Entries deleted per committed transaction. Bounds one transaction's
         /// size, same role as `SweepOptions.chunk_deletes` — but see the
         /// doc comment on `sweepToBudget` for why chunking here does NOT
-        /// give the same resumability `sweep` has.
+        /// give the same resumability `sweep` has. 0 means "the default" (4096).
         chunk_deletes: usize = 4096,
         /// Upper bound on SAMPLES this call deletes, checked before each
         /// entry — so a block (up to `chunk.max_block_samples` samples) can
-        /// carry the total past it by less than one block.
+        /// carry the total past it by less than one block. The picked entries
+        /// (17 bytes each) are held in memory until they are committed, so a
+        /// huge value costs memory proportional to the work done.
         max_deletes: usize = 65536,
     };
 
@@ -1189,14 +1249,17 @@ pub const Db = struct {
         }
 
         var i: usize = 0;
+        // 0 = the default (sweep D10; TS-3: never an empty-commit loop).
+        const per_txn = orDefault(opts.chunk_deletes, (SweepToBudgetOptions{}).chunk_deletes);
         while (i < deletes.items.len) {
-            const end = @min(i + opts.chunk_deletes, deletes.items.len);
+            const end = i + @min(per_txn, deletes.items.len - i);
             var txn = try self.tree.begin();
             {
                 errdefer txn.rollback();
                 for (deletes.items[i..end]) |*k| try txn.del(k);
             }
             try txn.commit();
+            self.noteOwnCommit(0);
             i = end;
         }
 
@@ -1380,6 +1443,7 @@ pub const Db = struct {
             for (rewrites.items) |rw| _ = try putBlocks(&txn, series, rw.samples);
         }
         try txn.commit();
+        self.noteOwnCommit(0);
         return removed;
     }
 
@@ -1870,6 +1934,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("codec.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
