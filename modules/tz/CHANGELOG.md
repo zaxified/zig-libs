@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GN): `nextTransition`/`prevTransition`/`resolveLocal` panicked on i32 year overflow at instants near the i64 ends; a hand-built zone with an abbreviation index past the table, or a `Rule.julian` of `minInt(i32)`, panicked — now an empty abbreviation and i64 arithmetic.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-20** — R9 (loading the system's TZif files) rejected by the owner: zone data come only from the

@@ -95,7 +95,8 @@ const Located = struct { off: i32, dst: bool, abbr: Abbr };
 
 fn abbrText(a: Abbr) []const u8 {
     return switch (a) {
-        .idx => |i| std.mem.sliceTo(tz_data.abbrevs[i..], 0),
+        // A hand-built state may carry an index past the table: empty, not a bounds panic (sweep TZ-2).
+        .idx => |i| if (i >= tz_data.abbrevs.len) "" else std.mem.sliceTo(tz_data.abbrevs[i..], 0),
         .text => |t| t,
     };
 }
@@ -195,6 +196,11 @@ pub fn formatOffset(buf: []u8, off: i32, style: OffsetStyle) error{NoSpaceLeft}!
 // (`Zone.footer`), per call only for a zone built by hand without one.
 // ---------------------------------------------------------------------------
 
+/// A year as `DateParts` holds it: an i64 year beyond the i32 range saturates.
+fn yearClamp(y: i64) i32 {
+    return @intCast(std.math.clamp(y, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
 /// The UTC instants DST starts and ends in `year` (the year `offsetAt`
 /// evaluates an instant in is its UTC year).
 fn footerTransitionsIn(f: *const Footer, year: i32) ?[2]i64 {
@@ -254,11 +260,13 @@ fn changeAt(zone: *const tz_data.Zone, ts: i64) Change {
 
 /// Footer change instants around `year`, ascending, for years `y0..y1`.
 /// Only real changes (the footer evaluates differently on the two sides).
-fn footerChanges(f: *const Footer, y0: i32, y1: i32, out: *[8]i64) []const i64 {
+fn footerChanges(f: *const Footer, y0: i64, y1: i64, out: *[8]i64) []const i64 {
     var n: usize = 0;
+    // i64 loop variable: `y1` may be `maxInt(i32) + 1` for an instant beyond
+    // the year range `DateParts` holds (sweep TZ-1).
     var y = y0;
     while (y <= y1) : (y += 1) {
-        const t = footerTransitionsIn(f, y) orelse continue;
+        const t = footerTransitionsIn(f, yearClamp(y)) orelse continue;
         for (t) |x| {
             const a = evalFooter(f, x - 1) orelse continue;
             const b = evalFooter(f, x) orelse continue;
@@ -293,7 +301,7 @@ pub fn nextTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
     var storage: Footer = undefined;
     const f = footerOf(zone, &storage) orelse return null;
     const after = if (tr.len > 0) @max(unix, tr[tr.len - 1].ts) else unix;
-    const y = datefmt.unixToParts(after).year;
+    const y: i64 = datefmt.unixToParts(after).year;
     var buf: [8]i64 = undefined;
     for (footerChanges(f, y - 1, y + 1, &buf)) |t| {
         if (t > after) return changeAt(zone, t);
@@ -320,7 +328,7 @@ pub fn prevTransition(zone: *const tz_data.Zone, unix: i64) ?Change {
     const last_ts: i64 = if (tr.len > 0) tr[tr.len - 1].ts else std.math.minInt(i64);
     var storage: Footer = undefined;
     if (footerOf(zone, &storage)) |f| {
-        const y = datefmt.unixToParts(unix).year;
+        const y: i64 = datefmt.unixToParts(unix).year;
         var buf: [8]i64 = undefined;
         const ch = footerChanges(f, y - 2, y, &buf);
         var i = ch.len;
@@ -502,11 +510,12 @@ const Changes = struct {
         var storage: Footer = undefined;
         const f = footerOf(zone, &storage) orelse return;
         if (f.dst == null) return;
-        const y_lo = datefmt.unixToParts(lo).year;
-        const y_hi = datefmt.unixToParts(hi).year;
+        // i64 years: `year - 1` / `year + 1` overflow i32 at the edge (sweep TZ-1).
+        const y_lo: i64 = datefmt.unixToParts(lo).year;
+        const y_hi: i64 = datefmt.unixToParts(hi).year;
         var y = y_lo - 1;
         while (y <= y_hi + 1) : (y += 1) {
-            const t = footerTransitionsIn(f, y) orelse continue;
+            const t = footerTransitionsIn(f, yearClamp(y)) orelse continue;
             for (t) |x| if (x >= lo and x <= hi) c.add(x);
         }
     }
@@ -527,7 +536,7 @@ fn ruleDateUnix(year: i32, r: posix.Rule, time_secs: i32) ?i64 {
             // Jn: 1==Jan 1, 60==March 1 in every year (Feb 29 is never
             // counted) — shift the zero-based day index by one once past
             // Feb 28 in a leap year so day 60 still lands on March 1.
-            var idx: i64 = n - 1;
+            var idx: i64 = @as(i64, n) - 1;
             if (datefmt.isLeapYear(year) and n >= 60) idx += 1;
             const epoch_day = datefmt.ymdToEpochDay(year, 1, 1) + idx;
             return epoch_day * 86400 + time_secs;
@@ -1209,6 +1218,7 @@ test {
     _ = @import("posix_test.zig");
     _ = @import("posix.zig");
     _ = @import("all_kat_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 /// Comptime string repetition; replaces the `**` operator removed in Zig 0.17.

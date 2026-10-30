@@ -100,6 +100,8 @@ wrong within ~2 h of a transition) instead of `localToUtc`.
 | R9 | System TZif loading (`TZ`, `TZDIR`) | – | **REJECTED (owner 2026-10-20):** no loader of the local installation, here or as a separate module — zone data come from the official IANA release (`scripts/gen/tz-gen/fetch-and-build.sh`, SHA-256 pinned in `checksums.txt`); a fresher release = bump the pin and regenerate |
 | R12 | Windows zone mapping | – | not doing (no consumer) |
 
+- **Sweep GN leftovers (2026-10-30, not crashes).** (1) `posix.parse` is lenient: it accepts trailing garbage after the end rule, empty abbreviations and out-of-range `M` rules (`M13.9.9`; harmless, `nthWeekdayOfMonth` returns null and the zone falls back to its table state). A stricter parser would turn some accepted strings into null. (2) `Changes.add` sets `truncated` for a hand-built zone with more than 32 changes in a window, but nothing reads it, so `resolveLocal` is silently incomplete for such a zone; surface it (an error or a documented bound) if a consumer builds zones by hand. (3) A hand-built zone without `footer` re-parses `posix` on every call (O(len) per `offsetAt`).
+
 Evidence (DONE 2026-10-20): Python zoneinfo against the pinned 2026a tree over all 598 zones, every change
 1970–2050 found by scan + bisection (`tools/gen_all_kat.py` → `src/all_kat.bin`, 324 distinct traces):
 offset, dst, abbreviation, next/prev transition, and local→UTC at every gap/fold under all four policies —
