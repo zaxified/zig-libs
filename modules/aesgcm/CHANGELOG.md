@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** delta audit of the § GP sweep (10/11 mutants killed; the 2 call-site survivors only matter above 2^36 − 32 bytes, their helpers are pinned). New test: a length mismatch wins over too-long on the input side too.
 - **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). The length contract of `encrypt`/`decrypt` (stateless and `Context`) was `std.debug.assert` (out-of-bounds write or a wrapped 32-bit GCM counter in ReleaseFast) and is now a checked panic in every build mode for `c.len != m.len` and for encrypting more than 2^36 − 32 bytes; decrypting a ciphertext longer than that zeroes `m` and returns `error.AuthenticationFailed` (no message can be that long). `max_message_len` is public and documented. Tests: `src/sweep_test.zig`.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.
 

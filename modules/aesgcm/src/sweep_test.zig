@@ -22,3 +22,9 @@ test "decrypt refusal: a too-long verdict zeroes m and refuses, ok leaves m alon
     try std.testing.expect(hooks.refuse(&m, .too_long));
     for (m) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
+
+test "length contract: a mismatch wins over too long on the input side too (sweep audit GP-AGa)" {
+    const max = root.max_message_len;
+    try std.testing.expectEqual(hooks.Verdict.mismatch, hooks.verdict(0, max + 1));
+    try std.testing.expectEqual(hooks.Verdict.mismatch, hooks.verdict(max, max + 1));
+}
