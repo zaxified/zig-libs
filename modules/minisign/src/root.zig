@@ -654,13 +654,18 @@ pub const KeyPair = struct {
 /// scrypt-keystream length: `key_number || secret_key || checksum`.
 const encrypted_block_length = key_number_length + secret_key_length + checksum_length; // 104
 
+/// What `sealSecretKey` can fail with: scrypt's errors, and the two cost caps.
+pub const SealSecretKeyError = std.crypto.pwhash.KdfError || error{ OpsLimitTooLarge, MemLimitTooLarge };
+
 /// Encrypt `key_pair` with `password` into `out`, the on-disk `RawSecretKey`
 /// form (zeroed on error). `ops_limit`/`mem_limit` pick the scrypt cost
 /// (`ops_limit_sensitive`/`mem_limit_sensitive` are the CLI's own defaults); the
 /// wire format stores these two limits, not derived `(N, r, p)` — see the module
 /// doc comment. scrypt's working memory goes through `allocator` and is zeroed
 /// before it is freed; the body runs one frame down and the stack it dirtied is
-/// burned.
+/// burned. `ops_limit` above `ops_limit_sensitive` or `mem_limit` above
+/// `mem_limit_sensitive` (the caps `openSecretKey` applies by default) is
+/// `error.OpsLimitTooLarge` / `error.MemLimitTooLarge`.
 pub fn sealSecretKey(
     allocator: std.mem.Allocator,
     out: *RawSecretKey,
@@ -669,8 +674,8 @@ pub fn sealSecretKey(
     salt: [salt_length]u8,
     ops_limit: u64,
     mem_limit: usize,
-) std.crypto.pwhash.KdfError!void {
-    return burn.run(burn.kdf_burn, std.crypto.pwhash.KdfError!void, sealSecretKeyBody, .{ allocator, out, key_pair, password, salt, ops_limit, mem_limit });
+) SealSecretKeyError!void {
+    return burn.run(burn.kdf_burn, SealSecretKeyError!void, sealSecretKeyBody, .{ allocator, out, key_pair, password, salt, ops_limit, mem_limit });
 }
 
 fn sealSecretKeyBody(
@@ -681,8 +686,13 @@ fn sealSecretKeyBody(
     salt: [salt_length]u8,
     ops_limit: u64,
     mem_limit: usize,
-) std.crypto.pwhash.KdfError!void {
+) SealSecretKeyError!void {
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
+    // Sweep REV-MS-2: never write a key `openSecretKey` refuses under its default caps
+    // (and never ask scrypt for the cost of a hostile file: huge ops with small mem
+    // gives p up to 2^27, a ~137 GB allocation).
+    if (ops_limit > ops_limit_sensitive) return error.OpsLimitTooLarge;
+    if (mem_limit > mem_limit_sensitive) return error.MemLimitTooLarge;
     const plain_key_number = key_pair.key_number;
     // CONVENTIONS §2.1 Z1: our own copies of the plaintext secret key, its
     // checksum, and the scrypt keystream that encrypts them. Every `defer` is
@@ -693,6 +703,10 @@ fn sealSecretKeyBody(
     defer std.crypto.secureZero(u8, &plain_chk);
     computeChecksum(&plain_chk, sig_alg_legacy, plain_key_number, plain_sk);
 
+    // sweep MS-2: `fromLimits` asserts `mem_limit >= 1024` (it takes
+    // `log2(mem_limit / 1024)`); a caller-chosen smaller cost is a weak-parameter
+    // error, not a panic.
+    if (mem_limit < scrypt_min_mem_limit) return error.WeakParameters;
     const params = std.crypto.pwhash.scrypt.Params.fromLimits(ops_limit, mem_limit);
     var stream: [encrypted_block_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &stream);
@@ -732,6 +746,9 @@ pub const OpenSecretKeyError = error{
     /// wrong answer, not just an inconvenience. Only reachable on hosts
     /// where `usize` is narrower than 64 bits; the value is a real 64-bit
     /// on-disk quantity with no reason to assume it fits 32 bits.
+    ///
+    /// Also returned when `raw.mem_limit` exceeds `SecretKeyLimits.max_mem_limit`
+    /// (sweep MS-1).
     MemLimitTooLarge,
     /// `raw.mem_limit < scrypt_min_mem_limit` (1024 bytes). This is the end
     /// of the range that is actually reachable on every host this module
@@ -745,6 +762,8 @@ pub const OpenSecretKeyError = error{
     /// could not reach, because that comment's failure mode lives at this
     /// end of the range, not the upper one. A1 audit `minisign` F1/F2.
     MemLimitTooSmall,
+    /// `raw.ops_limit` exceeds `SecretKeyLimits.max_ops_limit` (sweep MS-1).
+    OpsLimitTooLarge,
 };
 
 const OpenError = OpenSecretKeyError || std.crypto.pwhash.KdfError ||
@@ -757,13 +776,43 @@ const OpenError = OpenSecretKeyError || std.crypto.pwhash.KdfError ||
 /// a typed `error.WrongPassword`, never a panic or silently-wrong key. scrypt's
 /// working memory goes through `allocator` and is zeroed before it is freed;
 /// the body runs one frame down and the stack it dirtied is burned.
+///
+/// The scrypt cost is read from the file (`ops_limit`, `mem_limit`), so it is
+/// capped by `SecretKeyLimits{}` before any work is done (sweep MS-1): a hostile
+/// file must not be able to cost hours of CPU or gigabytes of memory. Use
+/// `openSecretKeyLimited` to raise the caps.
 pub fn openSecretKey(
     allocator: std.mem.Allocator,
     out: *KeyPair,
     raw: *const RawSecretKey,
     password: ?[]const u8,
 ) OpenError!void {
-    return burn.run(burn.kdf_burn, OpenError!void, openSecretKeyBody, .{ allocator, out, raw, password });
+    return openSecretKeyLimited(allocator, out, raw, password, .{});
+}
+
+/// Upper bounds on the scrypt cost an on-disk secret key may demand.
+/// The defaults are libsodium's `*_SENSITIVE` limits, which are what the
+/// minisign CLI writes (`ops_limit_sensitive`, `mem_limit_sensitive`), so every
+/// key the reference creates opens; anything above is a file asking for more
+/// than its writer ever would.
+pub const SecretKeyLimits = struct {
+    max_ops_limit: u64 = ops_limit_sensitive,
+    max_mem_limit: u64 = mem_limit_sensitive,
+};
+
+/// `openSecretKey` with explicit cost caps. `raw.ops_limit > limits.max_ops_limit`
+/// is `error.OpsLimitTooLarge`, `raw.mem_limit > limits.max_mem_limit` is
+/// `error.MemLimitTooLarge`; both are checked before the password or any
+/// allocation.
+// secret-api-ok: `limits` holds public cost caps (the type name only says what they limit), not a secret.
+pub fn openSecretKeyLimited(
+    allocator: std.mem.Allocator,
+    out: *KeyPair,
+    raw: *const RawSecretKey,
+    password: ?[]const u8,
+    limits: SecretKeyLimits,
+) OpenError!void {
+    return burn.run(burn.kdf_burn, OpenError!void, openSecretKeyBody, .{ allocator, out, raw, password, limits });
 }
 
 fn openSecretKeyBody(
@@ -771,6 +820,7 @@ fn openSecretKeyBody(
     out: *KeyPair,
     raw: *const RawSecretKey,
     password: ?[]const u8,
+    limits: SecretKeyLimits,
 ) OpenError!void {
     errdefer std.crypto.secureZero(u8, std.mem.asBytes(out));
     if (!std.mem.eql(u8, &raw.sig_alg, &sig_alg_legacy)) return error.UnsupportedSignatureAlgorithm;
@@ -785,6 +835,8 @@ fn openSecretKeyBody(
     if (std.mem.eql(u8, &raw.kdf_alg, &kdf_alg_none)) {
         // Plaintext; chk intentionally unchecked (see module doc comment).
     } else if (std.mem.eql(u8, &raw.kdf_alg, &kdf_alg_scrypt)) {
+        if (raw.ops_limit > limits.max_ops_limit) return error.OpsLimitTooLarge;
+        if (raw.mem_limit > limits.max_mem_limit) return error.MemLimitTooLarge;
         const pw = password orelse return error.PasswordRequired;
         const mem_limit: usize = std.math.cast(usize, raw.mem_limit) orelse return error.MemLimitTooLarge;
         if (mem_limit < scrypt_min_mem_limit) return error.MemLimitTooSmall;
@@ -813,10 +865,14 @@ fn openSecretKeyBody(
         sk_bytes = plain_sk;
     } else return error.UnsupportedKdf;
 
-    var secret_key = try std.crypto.sign.Ed25519.SecretKey.fromBytes(sk_bytes);
-    defer std.crypto.secureZero(u8, &secret_key.bytes);
-    var ed25519 = try std.crypto.sign.Ed25519.KeyPair.fromSecretKey(secret_key);
+    // Sweep REV-MS-1: the public half must be the seed's. std checks this in
+    // `fromSecretKey` only when runtime safety is on, and an unencrypted file has no
+    // checksum, so check here in every build mode (public data, no constant time needed).
+    // The pair derived from the seed IS the key once its public half matches, so it
+    // replaces `fromSecretKey` (one scalar multiplication, not two).
+    var ed25519 = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(sk_bytes[0..32].*);
     defer std.crypto.secureZero(u8, &ed25519.secret_key.bytes);
+    if (!std.crypto.timing_safe.eql([32]u8, ed25519.public_key.bytes, sk_bytes[32..64].*)) return error.NonCanonical;
     out.* = .{ .key_number = key_number, .ed25519 = ed25519 };
 }
 
@@ -1795,6 +1851,7 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("blake2b.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "KeyPair.wipe destroys the long-term secret key, leaving the public half usable" {
