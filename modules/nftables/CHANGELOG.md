@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). `commit` and dumps are bounded: 65536 datagrams per wait/attempt and 4 Mi produced items per dump → new `error.TooManyMessages` in `CommitError` and `DumpError` (a kernel that never answered spun forever). Batch ACKs outside the batch's seq window are skipped (a stale ACK could make a rejected commit look applied); un-acked batches keep reading past datagrams of only foreign messages. DUMP_INTR drains the old dump, then re-sends under a fresh seq; NLMSG_DONE with an errno fails the dump. `addSetElems` > 65535 elements → `AttrTooLong`; `Batch` command after `finish()` is a checked panic; `errorFromErrno(minInt)` fixed.
 - **2026-10-18** — Ported to Zig 0.17.0. enum `@typeInfo` loop uses `field_names`/`field_values`; test sockaddr `addr` built with `std.mem.bytesToValue` (memory order). Also: comptime `strRepeat` helper quota raised.
 - **2026-10-09** — tests: deterministic fuzz driver `NFTABLES_FUZZ` over the existing harnesses (object decoders,
   expression walker).

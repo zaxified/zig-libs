@@ -104,12 +104,21 @@ pub const KernelError = error{
     KernelRejected,
 };
 
-pub const CommitError = KernelError || SendError || RecvError || wire.BuildError;
+/// `TooManyMessages`: the reply loop consumed `max_await_messages` datagrams
+/// without the awaited ACKs (or commit error) arriving. A kernel that stops
+/// answering used to spin `commit` forever (sweep NF-2).
+pub const CommitError = KernelError || SendError || RecvError || wire.BuildError ||
+    error{TooManyMessages};
+/// `TooManyMessages`: one dump attempt consumed `max_dump_messages` datagrams
+/// without `NLMSG_DONE`, or delivered more than `max_dump_records` payload
+/// messages. Ask for a narrower dump (table/chain/family) instead (sweep NF-2).
 pub const DumpError = KernelError || SendError || RecvError || wire.BuildError ||
-    error{ InconsistentDump, OutOfMemory };
+    error{ InconsistentDump, OutOfMemory, TooManyMessages };
 
 fn errorFromErrno(code: i32) KernelError {
-    // The kernel reports `-errno`.
+    // The kernel reports `-errno`. `minInt(i32)` has no positive counterpart
+    // (`-code` overflows) and is no errno: unmapped (sweep NF-1).
+    if (code == std.math.minInt(i32)) return error.KernelRejected;
     const e: u32 = @intCast(if (code < 0) -code else code);
     return switch (e) {
         1 => error.KernelRejected, // EPERM
@@ -145,6 +154,16 @@ pub const Failure = struct {
 };
 
 const max_dump_attempts = 4;
+
+/// Datagram budget of one dump attempt and of the batch-ACK wait — the same
+/// robustness ceilings as the identical constants in `netlink` (65536): a
+/// kernel that never terminates the reply no longer spins the caller forever.
+/// `max_dump_records` (4 Mi, `netlink.max_dump_records`) additionally bounds
+/// how many payload messages — i.e. how much memory — one dump attempt may
+/// collect. Reaching either is `error.TooManyMessages`.
+const max_dump_messages: u32 = 65536;
+const max_await_messages: u32 = 65536;
+const max_dump_records: u32 = netlink.max_dump_records;
 
 // ── socket ──────────────────────────────────────────────────────────────────
 
@@ -220,34 +239,7 @@ pub const Socket = struct {
     }
 
     fn awaitBatch(self: *Socket, batch: *const wire.Batch) CommitError!void {
-        const expected: usize = if (batch.opts.ack) batch.commandCount() else 0;
-        var acks: usize = 0;
-        while (true) {
-            const dgram = self.recvDatagram() catch |err| switch (err) {
-                // No reply at all is how a successful un-acked batch looks.
-                error.WouldBlock => if (expected == 0) return else return err,
-                else => return err,
-            };
-            var it: nl.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                if (m.pid != self.nl.portid) continue;
-                switch (m.type) {
-                    nl.NLMSG_ERROR => {
-                        const code = m.errorCode() catch return error.MalformedReply;
-                        if (code == 0) {
-                            acks += 1;
-                            if (acks >= expected and expected > 0) return;
-                            continue;
-                        }
-                        self.recordFailure(batch, m, code);
-                        return errorFromErrno(code);
-                    },
-                    nl.NLMSG_OVERRUN => return error.Overrun,
-                    else => {}, // NOOP / echo
-                }
-            }
-            if (expected == 0) return; // un-acked batch: nothing more is coming
-        }
+        return awaitBatchOver(self, batch, max_await_messages);
     }
 
     fn recordFailure(self: *Socket, batch: *const wire.Batch, m: nl.Message, code: i32) void {
@@ -454,41 +446,18 @@ pub const Socket = struct {
         arena: std.mem.Allocator,
         items: anytype,
     ) DumpError!void {
-        var attempt: usize = 0;
-        retry: while (true) {
-            attempt += 1;
-            self.failure = null;
-            try self.send(req);
-            items.clearRetainingCapacity();
-            while (true) {
-                const dgram = try self.recvDatagram();
-                var it: nl.MessageIterator = .{ .buf = dgram };
-                while (it.next() catch return error.MalformedReply) |m| {
-                    switch (nl.classifyDumpMessage(m, self.nl.portid, seq)) {
-                        .skip => {},
-                        .restart => {
-                            if (attempt < max_dump_attempts) continue :retry;
-                            return error.InconsistentDump;
-                        },
-                        // NLMSG_DONE, or a bare ACK = an empty dump.
-                        .done => return,
-                        .failed => |code| {
-                            self.nl.captureExtAck(m);
-                            return errorFromErrno(code);
-                        },
-                        .overrun => return error.Overrun,
-                        .malformed => return error.MalformedReply,
-                        .record => |rec| {
-                            if (rec.type == wire.nftMsg(want_type))
-                                append(arena, items, rec.payload) catch |err| switch (err) {
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    else => return error.MalformedReply,
-                                };
-                        },
-                    }
-                }
-            }
-        }
+        self.failure = null;
+        return dumpOver(self, self.nl.gpa, req, want_type, seq, append, arena, items, max_dump_messages, max_dump_records);
+    }
+
+    // `dumpOver`/`awaitBatchOver` call these on their `transport`; the scripted
+    // transport of the sweep tests provides the same shapes.
+    fn portId(self: *const Socket) u32 {
+        return self.nl.portid;
+    }
+
+    fn captureExtAck(self: *Socket, m: nl.Message) void {
+        self.nl.captureExtAck(m);
     }
 
     // ── transport (all of it `netlink.Socket`'s) ───────────────────────────
@@ -507,6 +476,176 @@ pub const Socket = struct {
         return self.nl.recvDatagramStrict();
     }
 };
+
+// ── reply engines (free functions over a `transport`) ───────────────────────
+
+/// The sequence number a failure reply is about: its own `seq`, or — for the
+/// kernels that report a commit failure with seq 0 — the one in the echoed
+/// request header.
+fn replySeq(m: nl.Message) u32 {
+    if (m.seq != 0) return m.seq;
+    return (m.errorRequestSeq() catch null) orelse m.seq;
+}
+
+/// Is `seq` one of this batch's own sequence numbers — BATCH_BEGIN, the
+/// commands, BATCH_END: `[first_seq, next_seq)` modulo 2^32 (`Batch.init`
+/// wraps, so a batch may cross 0)?
+fn inBatchWindow(batch: *const wire.Batch, seq: u32) bool {
+    return seq -% batch.first_seq < batch.next_seq -% batch.first_seq;
+}
+
+/// The body of `Socket.awaitBatch`. `transport` offers `recvDatagram()`,
+/// `portId()` and `recordFailure(batch, msg, code)`. Bounded by
+/// `max_dgrams` datagrams (`error.TooManyMessages`). An `NLMSG_ERROR` whose
+/// sequence number does not belong to this batch (`inBatchWindow`) is
+/// somebody else's — a stale ACK left queued by an earlier exchange — and is
+/// skipped, never counted as an ACK or reported as this batch's failure; the
+/// window test runs before the payload is parsed, so a foreign short message
+/// is skipped too (sweep NF-3, REV-5). In the un-acked mode a datagram whose
+/// messages were ALL skipped does not end the wait: the batch's own error may
+/// be right behind it (`WouldBlock` still means success) (sweep REV-3).
+fn awaitBatchOver(transport: anytype, batch: *const wire.Batch, max_dgrams: u32) CommitError!void {
+    const expected: usize = if (batch.opts.ack) batch.commandCount() else 0;
+    var acks: usize = 0;
+    var dgrams: u32 = 0;
+    while (true) {
+        if (dgrams >= max_dgrams) return error.TooManyMessages;
+        const dgram = transport.recvDatagram() catch |err| switch (err) {
+            // No reply at all is how a successful un-acked batch looks.
+            error.WouldBlock => if (expected == 0) return else return err,
+            else => return err,
+        };
+        dgrams += 1;
+        var own = false;
+        var skipped = false;
+        var it: nl.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            if (m.pid != transport.portId()) {
+                skipped = true;
+                continue;
+            }
+            switch (m.type) {
+                nl.NLMSG_ERROR => {
+                    if (m.seq != 0 and !inBatchWindow(batch, m.seq)) {
+                        skipped = true;
+                        continue;
+                    }
+                    const code = m.errorCode() catch return error.MalformedReply;
+                    if (!inBatchWindow(batch, replySeq(m))) {
+                        skipped = true;
+                        continue;
+                    }
+                    own = true;
+                    if (code == 0) {
+                        acks += 1;
+                        if (acks >= expected and expected > 0) return;
+                        continue;
+                    }
+                    transport.recordFailure(batch, m, code);
+                    return errorFromErrno(code);
+                },
+                nl.NLMSG_OVERRUN => return error.Overrun,
+                else => own = true, // NOOP / echo
+            }
+        }
+        // Un-acked batch: nothing more is coming — unless all we saw was
+        // someone else's traffic.
+        if (expected == 0 and (own or !skipped)) return;
+    }
+}
+
+/// The body of `Socket.dumpInto`. `transport` offers `send`, `recvDatagram`,
+/// `portId`, `captureExtAck` and `nextSeq`. Per attempt: at most `max_dgrams`
+/// datagrams, `max_records` payload messages and `max_records` produced items
+/// (one message may decode to many, e.g. set elements) —
+/// `error.TooManyMessages`.
+///
+/// `NLM_F_DUMP_INTR` does not restart at once: the kernel keeps the
+/// interrupted dump running and answers a new request with `-EBUSY` until it
+/// reached its `NLMSG_DONE`. The attempt is marked interrupted, the rest of
+/// that dump is read and discarded (inside the datagram budget), and only at
+/// its DONE is the request re-sent under a FRESH sequence number, patched into
+/// an owned copy — the old dump's tail must not be taken for the new one's
+/// (sweep NF-4, REV-2). A DONE carrying an errno, or an error, ends the dump
+/// with that error.
+fn dumpOver(
+    transport: anytype,
+    gpa: std.mem.Allocator,
+    req: []const u8,
+    want_type: u8,
+    first_seq: u32,
+    comptime append: anytype,
+    arena: std.mem.Allocator,
+    items: anytype,
+    max_dgrams: u32,
+    max_records: u32,
+) DumpError!void {
+    var seq = first_seq;
+    var fresh: ?[]u8 = null; // owned copy, allocated on the first restart
+    defer if (fresh) |f| gpa.free(f);
+    var cur = req;
+    var attempt: usize = 0;
+    retry: while (true) {
+        attempt += 1;
+        try transport.send(cur);
+        items.clearRetainingCapacity();
+        var dgrams: u32 = 0;
+        var records: u32 = 0;
+        var interrupted = false;
+        while (true) {
+            if (dgrams >= max_dgrams) return error.TooManyMessages;
+            const dgram = try transport.recvDatagram();
+            dgrams += 1;
+            var it: nl.MessageIterator = .{ .buf = dgram };
+            while (it.next() catch return error.MalformedReply) |m| {
+                var step = nl.classifyDumpMessage(m, transport.portId(), seq);
+                if (step == .restart) {
+                    interrupted = true;
+                    // The flag can sit on the terminating message itself.
+                    if (m.type == nl.NLMSG_DONE or m.type == nl.NLMSG_ERROR) {
+                        var plain = m;
+                        plain.flags &= ~nl.NLM_F_DUMP_INTR;
+                        step = nl.classifyDumpMessage(plain, transport.portId(), seq);
+                    }
+                }
+                switch (step) {
+                    .skip => {},
+                    .restart => {}, // still draining the interrupted dump
+                    .done => {
+                        if (!interrupted) return;
+                        if (attempt >= max_dump_attempts) return error.InconsistentDump;
+                        // Invariant: `req` is a request built by `wire` (>= 20 bytes);
+                        // the only callers are `Socket.dumpInto`'s fixed builders.
+                        std.debug.assert(req.len >= nl.header_len);
+                        if (fresh == null) fresh = try gpa.dupe(u8, req);
+                        seq = transport.nextSeq();
+                        std.mem.writeInt(u32, fresh.?[8..12], seq, native_endian);
+                        cur = fresh.?;
+                        continue :retry;
+                    },
+                    .failed => |code| {
+                        transport.captureExtAck(m);
+                        return errorFromErrno(code);
+                    },
+                    .overrun => return error.Overrun,
+                    .malformed => return error.MalformedReply,
+                    .record => |rec| {
+                        if (interrupted) continue; // discarded: the dump is restarted
+                        if (records >= max_records) return error.TooManyMessages;
+                        records += 1;
+                        if (rec.type == wire.nftMsg(want_type)) {
+                            append(arena, items, rec.payload) catch |err| switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => return error.MalformedReply,
+                            };
+                            if (items.items.len > max_records) return error.TooManyMessages;
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
 
 // ── offline tests ───────────────────────────────────────────────────────────
 
@@ -1070,4 +1209,344 @@ test "live: interval set, named counter/quota, verdict map and inet ingress agai
         if (std.mem.eql(u8, o.table, test_table_core))
             try testing.expect(!std.mem.eql(u8, o.name, "hits"));
     }
+}
+
+// ── no-panic sweep wave GV (nftables): tests that need the private engines ──
+// The public-API half lives in sweep_test.zig.
+
+fn cannedHeader(msg_type: u16, flags: u16, seq: u32, pid: u32) [nl.header_len]u8 {
+    var m: [nl.header_len]u8 = @splat(0);
+    std.mem.writeInt(u32, m[0..4], nl.header_len, native_endian);
+    std.mem.writeInt(u16, m[4..6], msg_type, native_endian);
+    std.mem.writeInt(u16, m[6..8], flags, native_endian);
+    std.mem.writeInt(u32, m[8..12], seq, native_endian);
+    std.mem.writeInt(u32, m[12..16], pid, native_endian);
+    return m;
+}
+
+/// NLMSG_ERROR carrying `code`.
+fn cannedError(code: i32, seq: u32, pid: u32) [nl.header_len + 4]u8 {
+    var m: [nl.header_len + 4]u8 = @splat(0);
+    m[0..nl.header_len].* = cannedHeader(nl.NLMSG_ERROR, 0, seq, pid);
+    std.mem.writeInt(u32, m[0..4], m.len, native_endian);
+    std.mem.writeInt(i32, m[nl.header_len..][0..4], code, native_endian);
+    return m;
+}
+
+/// NFT_MSG_NEWTABLE record naming table "t".
+fn cannedTable(seq: u32, pid: u32) [28]u8 {
+    var m: [28]u8 = @splat(0);
+    m[0..nl.header_len].* = cannedHeader(wire.nftMsg(wire.NFT_MSG.NEWTABLE), nl.NLM_F_MULTI, seq, pid);
+    std.mem.writeInt(u32, m[0..4], m.len, native_endian);
+    // nfgenmsg (4 zero bytes), then NFTA_TABLE_NAME = "t\0" (len 6, padded to 8).
+    std.mem.writeInt(u16, m[20..22], 6, native_endian);
+    std.mem.writeInt(u16, m[22..24], wire.NFTA_TABLE.NAME, native_endian);
+    m[24] = 't';
+    return m;
+}
+
+const Scripted = struct {
+    script: []const []const u8 = &.{},
+    filler: ?[]const u8 = null,
+    pos: usize = 0,
+    recvs: usize = 0,
+    sent: [8]u32 = @splat(0),
+    nsent: usize = 0,
+    pid: u32,
+    next: u32,
+    failed_code: i32 = 0,
+
+    fn recvDatagram(self: *Scripted) RecvError![]const u8 {
+        self.recvs += 1;
+        if (self.pos < self.script.len) {
+            defer self.pos += 1;
+            return self.script[self.pos];
+        }
+        return self.filler orelse error.WouldBlock;
+    }
+    fn portId(self: *const Scripted) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *Scripted, _: nl.Message) void {}
+    fn nextSeq(self: *Scripted) u32 {
+        self.next += 1;
+        return self.next;
+    }
+    fn send(self: *Scripted, msg: []const u8) SendError!void {
+        self.sent[self.nsent] = std.mem.readInt(u32, msg[8..12], native_endian);
+        self.nsent += 1;
+    }
+    fn recordFailure(self: *Scripted, _: *const wire.Batch, _: nl.Message, code: i32) void {
+        self.failed_code = code;
+    }
+};
+
+fn newTableAppend(al: std.mem.Allocator, list: *std.ArrayList(wire.TableInfo), payload: []const u8) !void {
+    var t = try wire.decodeTable(payload);
+    t.name = try al.dupe(u8, t.name);
+    try list.append(al, t);
+}
+
+fn oneCommandBatch(ack: bool) !wire.Batch {
+    var b = try wire.Batch.init(testing.allocator, 100, .{ .ack = ack });
+    errdefer b.deinit();
+    try b.addTable(.{ .family = .inet, .name = "t" });
+    _ = try b.finish(); // commands: seq 101, END: 102, next_seq 103
+    return b;
+}
+
+test "the dump/ACK budgets are the delivered magnitudes (sweep NF-2)" {
+    try testing.expectEqual(@as(u32, 65536), max_dump_messages);
+    try testing.expectEqual(@as(u32, 65536), max_await_messages);
+    try testing.expectEqual(@as(u32, 4194304), max_dump_records);
+}
+
+test "errorFromErrno is total: minInt(i32) is no errno (sweep NF-1)" {
+    try testing.expectEqual(error.KernelRejected, errorFromErrno(std.math.minInt(i32)));
+    try testing.expectEqual(error.InvalidRequest, errorFromErrno(-22));
+    try testing.expectEqual(error.Exists, errorFromErrno(17));
+}
+
+test "awaitBatch gives up instead of spinning when the ACKs never arrive (sweep NF-2)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const noop = cannedHeader(nl.NLMSG_NOOP, 0, 101, 7);
+    var t: Scripted = .{ .filler = &noop, .pid = 7, .next = 100 };
+    try testing.expectError(error.TooManyMessages, awaitBatchOver(&t, &b, 50));
+    try testing.expectEqual(@as(usize, 50), t.recvs);
+}
+
+test "awaitBatch ignores an ACK for a foreign sequence number (sweep NF-3)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const stale = cannedError(0, 999, 7);
+    const real = cannedError(-22, 101, 7);
+    var t: Scripted = .{ .script = &.{ &stale, &real }, .pid = 7, .next = 100 };
+    // The stale ACK must not count as the command's ACK: the real error that
+    // follows has to reach the caller.
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+    try testing.expectEqual(@as(i32, -22), t.failed_code);
+
+    // And a genuine ACK after a stale one still completes the batch.
+    const ack = cannedError(0, 101, 7);
+    var t2: Scripted = .{ .script = &.{ &stale, &ack }, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t2, &b, 50);
+    try testing.expectEqual(@as(usize, 2), t2.recvs);
+}
+
+test "dump gives up on an endless stream, and on too many records (sweep NF-2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+
+    const noop = cannedHeader(nl.NLMSG_NOOP, nl.NLM_F_MULTI, 42, 7);
+    var t: Scripted = .{ .filler = &noop, .pid = 7, .next = 42 };
+    try testing.expectError(error.TooManyMessages, dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000));
+    try testing.expectEqual(@as(usize, 50), t.recvs);
+    try testing.expectEqual(@as(usize, 1), t.nsent);
+
+    // A record of another type still counts: 10 pass, the 11th trips the cap.
+    const other = cannedHeader(wire.nftMsg(wire.NFT_MSG.NEWCHAIN), nl.NLM_F_MULTI, 42, 7);
+    var t2: Scripted = .{ .filler = &other, .pid = 7, .next = 42 };
+    try testing.expectError(error.TooManyMessages, dumpOver(&t2, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 1000, 10));
+    try testing.expectEqual(@as(usize, 11), t2.recvs);
+}
+
+test "a dump restart uses a fresh seq, so a stale old-seq DONE cannot end the new attempt (sweep NF-4)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+
+    // Attempt 1: the kernel flags the dump inconsistent and finishes it.
+    const intr = cannedHeader(wire.nftMsg(wire.NFT_MSG.NEWTABLE), nl.NLM_F_DUMP_INTR, 42, 7);
+    const done_old = cannedHeader(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7);
+    // Attempt 2 (seq 43): a stale seq-42 DONE shows up in front of the real
+    // answer and must not end it.
+    const rec = cannedTable(43, 7);
+    var d2: [done_old.len + rec.len]u8 = undefined;
+    @memcpy(d2[0..done_old.len], &done_old);
+    @memcpy(d2[done_old.len..], &rec);
+    const done = cannedHeader(nl.NLMSG_DONE, nl.NLM_F_MULTI, 43, 7);
+    var t: Scripted = .{ .script = &.{ &intr, &done_old, &d2, &done }, .pid = 7, .next = 42 };
+    try dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000);
+    try testing.expectEqual(@as(usize, 1), items.items.len);
+    try testing.expectEqualStrings("t", items.items[0].name);
+    try testing.expectEqual(@as(usize, 2), t.nsent);
+    try testing.expectEqual(@as(u32, 42), t.sent[0]);
+    try testing.expectEqual(@as(u32, 43), t.sent[1]);
+}
+
+// ── fix round (review GV-b) ─────────────────────────────────────────────────
+
+/// 20-byte message: header + i32 payload (`code`, default 0).
+fn cannedWith(msg_type: u16, flags: u16, seq: u32, pid: u32, code: ?i32) [nl.header_len + 4]u8 {
+    var m: [nl.header_len + 4]u8 = @splat(0);
+    m[0..nl.header_len].* = cannedHeader(msg_type, flags, seq, pid);
+    std.mem.writeInt(u32, m[0..4], m.len, native_endian);
+    std.mem.writeInt(i32, m[nl.header_len..][0..4], code orelse 0, native_endian);
+    return m;
+}
+
+/// A kernel that keeps an interrupted dump running: a request sent before the
+/// previous dump's last datagram was delivered is answered with -EBUSY.
+const BusyKernel = struct {
+    dumps: []const []const []const u8,
+    ndump: usize = 0,
+    cur: []const []const u8 = &.{},
+    pos: usize = 0,
+    running: bool = false,
+    cur_is_busy: bool = false,
+    ebusy_hit: bool = false,
+    busy_msg: [nl.header_len + 4]u8 = undefined,
+    busy_script: [1][]const u8 = undefined,
+    pid: u32,
+    next: u32,
+    nsent: usize = 0,
+    sent: [8]u32 = @splat(0),
+
+    fn recvDatagram(self: *BusyKernel) RecvError![]const u8 {
+        if (self.pos >= self.cur.len) return error.WouldBlock;
+        const d = self.cur[self.pos];
+        self.pos += 1;
+        if (self.pos == self.cur.len and !self.cur_is_busy) self.running = false;
+        return d;
+    }
+    fn portId(self: *const BusyKernel) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *BusyKernel, _: nl.Message) void {}
+    fn nextSeq(self: *BusyKernel) u32 {
+        self.next += 1;
+        return self.next;
+    }
+    fn send(self: *BusyKernel, msg: []const u8) SendError!void {
+        const seq = std.mem.readInt(u32, msg[8..12], native_endian);
+        self.sent[self.nsent] = seq;
+        self.nsent += 1;
+        self.pos = 0;
+        if (self.running) {
+            self.ebusy_hit = true;
+            self.cur_is_busy = true;
+            self.busy_msg = cannedWith(nl.NLMSG_ERROR, 0, seq, self.pid, -16);
+            self.busy_script = .{&self.busy_msg};
+            self.cur = &self.busy_script;
+        } else {
+            self.cur_is_busy = false;
+            self.cur = self.dumps[self.ndump];
+            self.ndump += 1;
+            self.running = true;
+        }
+    }
+};
+
+test "a DUMP_INTR restart first drains the interrupted dump, else the kernel answers EBUSY (sweep REV-2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const nt = wire.nftMsg(wire.NFT_MSG.NEWTABLE);
+    const intr = cannedWith(nt, nl.NLM_F_DUMP_INTR, 42, 7, null);
+    const more = cannedWith(nt, nl.NLM_F_MULTI, 42, 7, null); // discarded
+    const done1 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7, 0);
+    const rec = cannedTable(43, 7);
+    const done2 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &more, &done1 };
+    const d2: []const []const u8 = &.{ &rec, &done2 };
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 42 };
+    try dumpOver(&k, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 1), items.items.len);
+    try testing.expectEqual(@as(usize, 2), k.nsent);
+    try testing.expectEqual(@as(u32, 43), k.sent[1]);
+}
+
+test "the interrupted dump's DONE may carry DUMP_INTR itself; a DONE errno ends it with that error (sweep REV-2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const nt = wire.nftMsg(wire.NFT_MSG.NEWTABLE);
+    const intr = cannedWith(nt, nl.NLM_F_DUMP_INTR, 42, 7, null);
+    const done1 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI | nl.NLM_F_DUMP_INTR, 42, 7, 0);
+    const done2 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &done1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 42 };
+    try dumpOver(&k, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 2), k.nsent);
+
+    const bad = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7, -22);
+    const d3: []const []const u8 = &.{ &intr, &bad };
+    var k2: BusyKernel = .{ .dumps = &.{d3}, .pid = 7, .next = 42 };
+    try testing.expectError(error.InvalidRequest, dumpOver(&k2, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000));
+    try testing.expectEqual(@as(usize, 1), k2.nsent);
+}
+
+test "a DONE carrying a negative errno fails the dump instead of returning a partial list (sweep REV-1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const rec = cannedTable(42, 7);
+    const bad = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7, -22);
+    var t: Scripted = .{ .script = &.{ &rec, &bad }, .pid = 7, .next = 42 };
+    try testing.expectError(error.InvalidRequest, dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000));
+}
+
+test "the record cap counts produced items, not only messages (sweep REV-4)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const rec = cannedHeader(wire.nftMsg(wire.NFT_MSG.NEWTABLE), nl.NLM_F_MULTI, 42, 7);
+    var t: Scripted = .{ .filler = &rec, .pid = 7, .next = 42 };
+    const three = struct {
+        fn f(al: std.mem.Allocator, list: *std.ArrayList(wire.TableInfo), _: []const u8) error{ OutOfMemory, Bad }!void {
+            for (0..3) |_| try list.append(al, .{ .family = 0 });
+        }
+    }.f;
+    try testing.expectError(error.TooManyMessages, dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, three, arena.allocator(), &items, 1000, 10));
+    // 3 items per message: the 4th message pushes the count to 12 > 10.
+    try testing.expectEqual(@as(usize, 4), t.recvs);
+}
+
+test "un-acked: a datagram of only foreign traffic does not end the wait (sweep REV-3)" {
+    var b = try oneCommandBatch(false);
+    defer b.deinit();
+    const stale = cannedError(0, 999, 7);
+    const real = cannedError(-22, 101, 7);
+    var t: Scripted = .{ .script = &.{ &stale, &real }, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+    // Only foreign traffic, then silence (WouldBlock) = still success.
+    var t2: Scripted = .{ .script = &.{&stale}, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t2, &b, 50);
+    try testing.expectEqual(@as(usize, 2), t2.recvs);
+}
+
+test "a foreign NLMSG_ERROR too short to carry an errno is skipped, not MalformedReply (sweep REV-5)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const short = cannedHeader(nl.NLMSG_ERROR, 0, 999, 7); // 16 bytes, no payload
+    const real = cannedError(-22, 101, 7);
+    var t: Scripted = .{ .script = &.{ &short, &real }, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+}
+
+test "the batch seq window is modular: a batch crossing seq 0 (sweep REV-8)" {
+    var b = try wire.Batch.init(testing.allocator, 0xfffffffe, .{});
+    defer b.deinit();
+    try b.addTable(.{ .family = .inet, .name = "t" }); // command seq 0xffffffff
+    _ = try b.finish(); // BATCH_END seq 0, next_seq 1
+    try testing.expectEqual(@as(u32, 1), b.next_seq);
+    const stale = cannedError(0, 1, 7); // just outside the window
+    const real = cannedError(-22, 0xffffffff, 7);
+    var t: Scripted = .{ .script = &.{ &stale, &real }, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+    // A commit-stage error reported against BATCH_END's seq 0 is in the window too.
+    const at_end = cannedError(-22, 0, 7);
+    var t2: Scripted = .{ .script = &.{&at_end}, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t2, &b, 50));
 }

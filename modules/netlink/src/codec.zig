@@ -316,9 +316,20 @@ pub fn appendHeader(
 /// Patch the nlmsghdr at `hdr_offset` so its length covers everything
 /// appended since `appendHeader`. Call once per message, before starting the
 /// next one.
+///
+/// `nlmsg_len` is a u32: a message of 4 GiB or more cannot be expressed (the
+/// kernel could not take it either), so that is a checked
+/// `@panic("netlink: message exceeds 4 GiB")` rather than an unchecked cast
+/// (sweep NL-3). `hdr_offset` must be the value `appendHeader` returned.
 pub fn finishHeader(list: *std.ArrayList(u8), hdr_offset: usize) void {
-    const mlen: u32 = @intCast(list.items.len - hdr_offset);
+    const mlen = checkedMessageLen(list.items.len - hdr_offset);
     std.mem.writeInt(u32, list.items[hdr_offset..][0..4], mlen, native_endian);
+}
+
+/// The `nlmsg_len` for a message of `n` bytes; checked panic past `u32`.
+/// Split out of `finishHeader` so the bound is testable without 4 GiB.
+pub fn checkedMessageLen(n: usize) u32 {
+    return std.math.cast(u32, n) orelse @panic("netlink: message exceeds 4 GiB");
 }
 
 /// Append raw payload bytes (e.g. a fixed ifinfomsg/rtmsg header) and pad to
@@ -528,10 +539,12 @@ pub const DumpStep = union(enum) {
     /// collected so far may be inconsistent. Discard it and re-send the
     /// request (with a fresh sequence number).
     restart,
-    /// `NLMSG_DONE`, or an `NLMSG_ERROR` carrying code 0 (a bare ACK, which is
-    /// how an empty dump ends). The collected items are complete.
+    /// `NLMSG_DONE` (with no payload or a 0/positive one), or an `NLMSG_ERROR`
+    /// carrying code 0 (a bare ACK, which is how an empty dump ends). The
+    /// collected items are complete.
     done,
-    /// `NLMSG_ERROR` with a non-zero negative errno. The caller maps it onto
+    /// `NLMSG_ERROR` with a non-zero negative errno, or an `NLMSG_DONE` whose
+    /// payload is a negative errno (the dump failed midway). The caller maps it onto
     /// its own error set (`errorFromCode`, `writeErrorFromCode`, …) and may
     /// first pull the extended-ACK reason out of `msg`.
     failed: i32,
@@ -563,7 +576,17 @@ pub fn classifyDumpMessage(m: Message, portid: u32, seq: u32) DumpStep {
     if (m.pid != portid or m.seq != seq) return .skip;
     if (m.flags & NLM_F_DUMP_INTR != 0) return .restart;
     return switch (m.type) {
-        NLMSG_DONE => .done,
+        // The kernel puts the dump callback's error into the DONE payload
+        // (`netlink_dump()`: a trailing i32). A negative one means the dump
+        // died midway and the list collected so far is PARTIAL (sweep REV-1).
+        // No payload (old kernels) or 0 = a complete dump.
+        NLMSG_DONE => blk: {
+            if (m.payload.len >= 4) {
+                const code = std.mem.readInt(i32, m.payload[0..4], native_endian);
+                if (code < 0) break :blk .{ .failed = code };
+            }
+            break :blk .done;
+        },
         NLMSG_ERROR => blk: {
             const code = m.errorCode() catch break :blk .malformed;
             break :blk if (code == 0) .done else .{ .failed = code };

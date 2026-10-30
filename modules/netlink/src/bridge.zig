@@ -337,7 +337,10 @@ pub const VlanEntry = struct {
     }
 
     /// How many VIDs the entry covers.
+    /// 0 for an inverted entry (`vid_end < vid`, only constructible by hand —
+    /// the parser never produces one).
     pub fn count(v: *const VlanEntry) u32 {
+        if (v.vid_end < v.vid) return 0;
         return @as(u32, v.vid_end - v.vid) + 1;
     }
 

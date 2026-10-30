@@ -572,6 +572,10 @@ fn appendSetElems(
     // a constant `NFTA_LIST_ELEM` — the kernel walks it with
     // `nla_for_each_nested` and ignores the type, and the `nft` binary numbers
     // them (verified in goldens.zig: types 1, 2, 3 for a three-element list).
+    // The 1-based index is the nlattr type, a u16: more than 65535 elements
+    // cannot be numbered (and cannot fit one nest anyway) — `AttrTooLong`,
+    // not an unchecked cast (sweep NF-5). Split the list across commands.
+    if (elems.len > std.math.maxInt(u16)) return error.AttrTooLong;
     for (elems, 1..) |el, i| {
         const eoff = try nl.nestBegin(gpa, list, nl.NLA_F_NESTED | @as(u16, @intCast(i)));
         if (el.flags != 0) try nl.appendAttrBe32(gpa, list, NFTA_SET_ELEM.FLAGS, el.flags);
@@ -669,6 +673,8 @@ pub const BatchOptions = struct {
 ///
 /// The buffer is complete only after `finish()`; `bytes()` before that returns
 /// the commands without their `BATCH_END` and the kernel would apply nothing.
+/// Adding a command after `finish()` (or `Socket.commit`) is a sequencing bug
+/// of the caller and panics: `@panic("nftables: Batch command after finish()")`.
 pub const Batch = struct {
     gpa: std.mem.Allocator,
     buf: std.ArrayList(u8) = .empty,
@@ -708,7 +714,9 @@ pub const Batch = struct {
 
     /// Begin a command message; returns the header offset for `endCommand`.
     fn beginCommand(b: *Batch, cmd: u8, extra_flags: u16, nfproto: u8) BuildError!usize {
-        std.debug.assert(!b.finished);
+        // A command after `finish()` would land behind BATCH_END, in a buffer
+        // the kernel treats as complete: a caller sequencing bug, never input.
+        if (b.finished) @panic("nftables: Batch command after finish()");
         const seq = b.next_seq;
         b.next_seq +%= 1;
         const flags: u16 = nl.NLM_F_REQUEST | extra_flags |

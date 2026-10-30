@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE:** no-panic sweep + blind review (§ GV). NLMSG_DONE carrying a negative errno (the kernel's `dump_done_errno`) is now a dump failure, not a complete (partial) list. NLM_F_DUMP_INTR drains the interrupted dump to its DONE before re-sending under a fresh seq (an immediate re-send got -EBUSY); the request is patched into an owned copy, the caller's buffer is no longer written (`dumpCollect`/`dumpCollectOver` take `[]const u8`). New `max_dump_records` (4 Mi produced items per dump, `error.TooManyMessages`), oversize datagrams (> 16 MiB) are dropped instead of blocking every later receive, `finishHeader` > 4 GiB is a checked panic (`codec.checkedMessageLen`), `VlanEntry.count` total.
 - **2026-10-18** — Ported to Zig 0.17.0. `sockaddr.in` test address via `bytesToValue`; `@typeInfo` struct-of-arrays spellings; `waitpid` status pointer cast.
 - **2026-10-09** — tests: deterministic fuzz driver `NETLINK_FUZZ` over the existing harnesses (codec walkers,
   rtnetlink builders and parsers, bridge builders and parsers).

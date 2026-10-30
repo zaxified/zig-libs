@@ -505,6 +505,11 @@ rule's `rule_del`. Plus: a monitor socket opens unprivileged on the host. Mutati
 mapping, client-side rule family filter, the family reaching the kernel) killed by new tests.
 
 ## Backlog / deferred
+- **32-bit targets: `Message.errorAttrs` (`4 + echoed`, `alignUp`) can wrap `usize`** when the
+  echoed `nlmsg_len` of an extended ACK is near `0xffffffff` (sweep NL-5, 2026-10-31). Harmless on
+  64-bit (the sum cannot overflow, the bounds check follows); a 32-bit fix (compare `echoed`
+  against `payload.len - 4` before adding) has no killing test on the 64-bit CI host, so it is
+  parked here until a 32-bit lane exists.
 ~~Multicast event monitoring~~ — **done 2026-10-04** (`openMonitor`/`recvEvents`, see "Events,
 rules, kind data, statistics").
 

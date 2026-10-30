@@ -1819,9 +1819,10 @@ pub const DumpError = error{
     InconsistentDump,
     AccessDenied,
     InvalidRequest,
-    /// One dump attempt consumed `max_dump_messages` netlink messages without
-    /// ever reaching `NLMSG_DONE`. See that constant: the dump loops used to
-    /// run forever in this case.
+    /// One dump attempt consumed `max_dump_messages` datagrams without ever
+    /// reaching `NLMSG_DONE` (the dump loops used to run forever in this
+    /// case), or delivered more than `max_dump_records` (4 Mi) payload
+    /// messages. Ask the kernel a narrower question (a filter) instead.
     TooManyMessages,
     Unexpected,
 };
@@ -1848,6 +1849,14 @@ const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 /// and a dump that genuinely needs more is better served by a filtered
 /// request than by an unbounded loop.
 const max_dump_messages: u32 = 65536;
+/// Ceiling on the number of netlink messages carrying a payload record (not
+/// NOOP/foreign/control) that one dump attempt may consume before giving up
+/// with `error.TooManyMessages` (sweep NL-1). `max_dump_messages` above counts
+/// datagrams, each up to `max_recv_buf_len` (16 MiB), so by itself it bounds
+/// time but not the memory the collected items take; 4 Mi records is ~4x the
+/// largest tables seen on real routers (a full IPv4 BGP table is ~1 M routes).
+/// Documented on `DumpError.TooManyMessages`.
+pub const max_dump_records: u32 = 1 << 22;
 const max_await_messages: u32 = 65536;
 /// Cap on the kernel's extended-ACK reason string kept per socket; real ones
 /// are short sentences ("Unknown device type"), and a longer one is truncated
@@ -2532,8 +2541,8 @@ pub const Socket = struct {
     /// `sendDumpRequest`'s bare fixed header cannot express. Same reply
     /// discipline as `dump`: match on (portid, seq), assemble multi-part
     /// replies until NLMSG_DONE, restart on NLM_F_DUMP_INTR with a fresh
-    /// sequence number — patched into the caller's buffer, which is why
-    /// `request` is mutable.
+    /// sequence number, patched into an owned copy (the caller's request is
+    /// never written).
     ///
     /// Unlike `dump`, `collectFn` may append any number of items per message,
     /// which is what a VLAN dump needs (one message lists a whole port).
@@ -2541,7 +2550,7 @@ pub const Socket = struct {
         self: *Socket,
         comptime T: type,
         comptime collectFn: fn (std.mem.Allocator, *std.ArrayList(T), []const u8) DumpError!void,
-        request: []u8,
+        request: []const u8,
         reply_type: u16,
     ) DumpError![]T {
         return dumpCollectOver(T, collectFn, self.gpa, self, request, reply_type);
@@ -2596,7 +2605,9 @@ pub const Socket = struct {
     /// MSG_PEEK|MSG_TRUNC probe reports the true datagram size without
     /// consuming it, so nothing is ever lost to truncation. Datagrams not
     /// sent by the kernel (sender pid != 0) are dropped — rtnetlink answers
-    /// only ever come from the kernel, and any user process may address our
+    /// only ever come from the kernel (an unprivileged process cannot unicast
+    /// to a NETLINK_ROUTE/NETFILTER socket: no `NL_CFG_F_NONROOT_SEND`; only a
+    /// CAP_NET_ADMIN sender in the same netns can address our
     /// port id.
     ///
     /// The returned slice borrows this socket's receive buffer and stays valid
@@ -2619,6 +2630,16 @@ pub const Socket = struct {
     /// `setRecvTimeout` expired) reported as themselves. Same buffer-growth
     /// and kernel-sender discipline as `recvDatagram`.
     pub fn recvDatagramStrict(self: *Socket) StrictRecvError![]const u8 {
+        return self.recvDatagramLimit(max_recv_buf_len);
+    }
+
+    /// `recvDatagramStrict` with the buffer-growth ceiling as a parameter (the
+    /// test seam: a datagram above 16 MiB cannot be queued by an unprivileged
+    /// test). A datagram larger than `max_len` is DISCARDED from the queue
+    /// before `MalformedReply` is returned — it was only peeked, and leaving it
+    /// there made every later receive on the socket fail the same way
+    /// (sweep NL-2).
+    fn recvDatagramLimit(self: *Socket, max_len: usize) StrictRecvError![]const u8 {
         while (true) {
             const prc = linux.recvfrom(
                 self.fd,
@@ -2639,7 +2660,11 @@ pub const Socket = struct {
                 else => return error.RecvFailed,
             }
             if (prc > self.buf.len) {
-                if (prc > max_recv_buf_len) return error.MalformedReply;
+                if (prc > max_len) {
+                    // Length 0 + flags 0: consumes and drops the datagram.
+                    _ = linux.recvfrom(self.fd, self.buf.ptr, 0, 0, null, null);
+                    return error.MalformedReply;
+                }
                 const new_len = std.mem.alignForward(usize, prc, initial_recv_buf_len);
                 self.buf = self.gpa.realloc(self.buf, new_len) catch return error.OutOfMemory;
                 continue; // re-probe; the datagram is still queued
@@ -2700,10 +2725,17 @@ fn awaitAckOver(transport: anytype, seq: u32) StrictRequestError!void {
 const DumpPass = enum { done, restart };
 
 /// The receive half shared by `dumpOver` and `dumpCollectOver`: consume
-/// multi-part replies for `seq` until `NLMSG_DONE` (`.done`), `NLM_F_DUMP_INTR`
-/// (`.restart`), an error, or `max_dump_messages` messages
-/// (`error.TooManyMessages`). `transport` must offer `recvDatagram()` and
-/// `portId()`.
+/// multi-part replies for `seq` until `NLMSG_DONE` (`.done`), an error, or
+/// `max_dump_messages` datagrams (`error.TooManyMessages`).
+/// `transport` must offer `recvDatagram()` and `portId()`.
+///
+/// `NLM_F_DUMP_INTR` does NOT end the pass at once: the kernel keeps the
+/// interrupted dump running (`cb_running`) and answers a new request with
+/// `-EBUSY` until it has reached its `NLMSG_DONE`. So the pass marks itself
+/// interrupted, discards the rest of that dump (still inside the datagram
+/// budget) and only at its DONE returns `.restart`; an error ends it as
+/// usual (sweep REV-2). The record cap counts messages AND produced items
+/// (one message may decode to many items, sweep REV-4).
 fn collectDumpPass(
     comptime T: type,
     comptime Ctx: type,
@@ -2714,18 +2746,32 @@ fn collectDumpPass(
     seq: u32,
     reply_type: u16,
     ctx: Ctx,
+    max_records: u32,
 ) DumpError!DumpPass {
     var msgs: u32 = 0;
+    var records: u32 = 0;
+    var interrupted = false;
     while (true) {
         if (msgs >= max_dump_messages) return error.TooManyMessages;
         const dgram = try transport.recvDatagram();
         msgs += 1;
         var it: codec.MessageIterator = .{ .buf = dgram };
         while (it.next() catch return error.MalformedReply) |m| {
-            switch (codec.classifyDumpMessage(m, transport.portId(), seq)) {
+            var step = codec.classifyDumpMessage(m, transport.portId(), seq);
+            if (step == .restart) {
+                interrupted = true;
+                // The flag can sit on the terminating message itself: judge
+                // that one without it, or the drain would never see its end.
+                if (m.type == codec.NLMSG_DONE or m.type == codec.NLMSG_ERROR) {
+                    var plain = m;
+                    plain.flags &= ~codec.NLM_F_DUMP_INTR;
+                    step = codec.classifyDumpMessage(plain, transport.portId(), seq);
+                }
+            }
+            switch (step) {
                 .skip => {},
-                .restart => return .restart,
-                .done => return .done,
+                .restart => {}, // still draining the interrupted dump
+                .done => return if (interrupted) .restart else .done,
                 .failed => |code| {
                     // Same capture as the ACK path: a failed dump carries an
                     // errno and often a reason string too, and without this
@@ -2736,8 +2782,12 @@ fn collectDumpPass(
                 .overrun => return error.SystemResources,
                 .malformed => return error.MalformedReply,
                 .record => |rec| {
+                    if (interrupted) continue; // discarded: the dump is restarted
+                    if (records >= max_records) return error.TooManyMessages;
+                    records += 1;
                     if (rec.type != reply_type) continue;
                     try recordFn(gpa, out, rec.payload, ctx);
+                    if (out.items.len > max_records) return error.TooManyMessages;
                 },
             }
         }
@@ -2779,7 +2829,7 @@ fn dumpOver(
         attempt += 1;
         const seq = try transport.sendDumpRequest(msg_type, fixed_len, filter.family orelse AF.UNSPEC);
         out.clearRetainingCapacity();
-        switch (try collectDumpPass(T, Filter, rec, gpa, transport, &out, seq, reply_type, filter)) {
+        switch (try collectDumpPass(T, Filter, rec, gpa, transport, &out, seq, reply_type, filter, max_dump_records)) {
             .done => return out.toOwnedSlice(gpa),
             .restart => if (attempt >= max_dump_attempts) return error.InconsistentDump,
         }
@@ -2793,7 +2843,7 @@ fn dumpCollectOver(
     comptime collectFn: fn (std.mem.Allocator, *std.ArrayList(T), []const u8) DumpError!void,
     gpa: std.mem.Allocator,
     transport: anytype,
-    request: []u8,
+    request: []const u8,
     reply_type: u16,
 ) DumpError![]T {
     if (request.len < codec.header_len) return error.InvalidRequest;
@@ -2806,17 +2856,24 @@ fn dumpCollectOver(
     var seq = std.mem.readInt(u32, request[8..12], native_endian);
     var out: std.ArrayList(T) = .empty;
     errdefer out.deinit(gpa);
+    // A restart needs a fresh seq in the request; it is patched into an owned
+    // copy — the caller's buffer is never written (sweep REV-6).
+    var fresh: ?[]u8 = null;
+    defer if (fresh) |f| gpa.free(f);
+    var cur = request;
     var attempt: usize = 0;
     while (true) {
         attempt += 1;
-        try transport.send(request);
+        try transport.send(cur);
         out.clearRetainingCapacity();
-        switch (try collectDumpPass(T, void, rec, gpa, transport, &out, seq, reply_type, {})) {
+        switch (try collectDumpPass(T, void, rec, gpa, transport, &out, seq, reply_type, {}, max_dump_records)) {
             .done => return out.toOwnedSlice(gpa),
             .restart => {
                 if (attempt >= max_dump_attempts) return error.InconsistentDump;
+                if (fresh == null) fresh = try gpa.dupe(u8, request);
                 seq = transport.nextSeq();
-                std.mem.writeInt(u32, request[8..12], seq, native_endian);
+                std.mem.writeInt(u32, fresh.?[8..12], seq, native_endian);
+                cur = fresh.?;
             },
         }
     }
@@ -5851,4 +5908,199 @@ test {
     _ = codec;
     _ = bridge;
     _ = fz;
+    _ = @import("sweep_test.zig");
+}
+
+// ── no-panic sweep wave GV (netlink): tests that need the private engines ───
+// The public-API half lives in sweep_test.zig; these reach `collectDumpPass`
+// and `recvDatagramLimit`, which are private.
+
+test "collectDumpPass gives up after max_records payload messages, not after max_dump_messages datagrams (sweep NL-1)" {
+    const rec_msg = cannedMessage(RTM_NEWADDR, codec.NLM_F_MULTI, 42, 7); // a record, but not the reply_type
+    var t: ScriptedTransport = .{ .filler = &rec_msg, .pid = 7, .seq = 42 };
+    const noop = struct {
+        fn f(_: std.mem.Allocator, _: *std.ArrayList(Link), _: []const u8, _: void) DumpError!void {}
+    }.f;
+    var out: std.ArrayList(Link) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.TooManyMessages, collectDumpPass(
+        Link,
+        void,
+        noop,
+        testing.allocator,
+        &t,
+        &out,
+        42,
+        RTM_NEWLINK,
+        {},
+        10,
+    ));
+    // Ten records pass, the eleventh trips the cap: 11 one-message datagrams.
+    try testing.expectEqual(@as(usize, 11), t.recvs);
+}
+
+test "the record cap is the delivered magnitude (sweep NL-1)" {
+    try testing.expectEqual(@as(u32, 4194304), max_dump_records);
+}
+
+test "an oversize datagram is dropped from the queue, not left to poison every later receive (sweep NL-2)" {
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0, &fds)) != .SUCCESS)
+        return error.SkipZigTest;
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{
+        .gpa = testing.allocator,
+        .fd = fds[0],
+        .portid = 0,
+        .seq = 0,
+        .buf = try testing.allocator.alloc(u8, 16),
+    };
+    defer testing.allocator.free(sock.buf);
+    const big: [64]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 64), linux.write(fds[1], &big, big.len));
+    try testing.expectError(error.MalformedReply, sock.recvDatagramLimit(32));
+    // The queue must now be empty.
+    var probe: [8]u8 = undefined;
+    const rc = linux.recvfrom(fds[0], &probe, probe.len, linux.MSG.DONTWAIT, null, null);
+    try testing.expectEqual(linux.E.AGAIN, linux.errno(rc));
+}
+
+// ── fix round (review GV-b): restart drain, item cap, owned request copy ────
+
+/// A header-only message, or one with a 4-byte i32 payload (`code` non-null).
+fn cannedWith(msg_type: u16, flags: u16, seq: u32, pid: u32, code: ?i32) [codec.header_len + 4]u8 {
+    var m: [codec.header_len + 4]u8 = @splat(0);
+    m[0..codec.header_len].* = cannedMessage(msg_type, flags, seq, pid);
+    std.mem.writeInt(u32, m[0..4], m.len, native_endian);
+    std.mem.writeInt(i32, m[codec.header_len..][0..4], code orelse 0, native_endian);
+    return m;
+}
+
+/// A kernel that keeps an interrupted dump running: a request sent before the
+/// previous dump's last datagram was delivered is answered with -EBUSY.
+const BusyKernel = struct {
+    dumps: []const []const []const u8,
+    ndump: usize = 0,
+    cur: []const []const u8 = &.{},
+    pos: usize = 0,
+    running: bool = false,
+    cur_is_busy: bool = false,
+    ebusy_hit: bool = false,
+    busy_msg: [codec.header_len + 4]u8 = undefined,
+    busy_script: [1][]const u8 = undefined,
+    pid: u32,
+    next: u32,
+    requests: usize = 0,
+    sent: [8]u32 = @splat(0),
+
+    fn start(self: *BusyKernel, seq: u32) void {
+        self.sent[self.requests] = seq;
+        self.requests += 1;
+        self.pos = 0;
+        if (self.running) {
+            self.ebusy_hit = true;
+            self.cur_is_busy = true;
+            self.busy_msg = cannedWith(codec.NLMSG_ERROR, 0, seq, self.pid, -16);
+            self.busy_script = .{&self.busy_msg};
+            self.cur = &self.busy_script;
+        } else {
+            self.cur_is_busy = false;
+            self.cur = self.dumps[self.ndump];
+            self.ndump += 1;
+            self.running = true;
+        }
+    }
+    fn nextSeq(self: *BusyKernel) u32 {
+        self.next += 1;
+        return self.next;
+    }
+    fn portId(self: *const BusyKernel) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(_: *BusyKernel, _: codec.Message) void {}
+    fn send(self: *BusyKernel, req: []const u8) SendError!void {
+        self.start(std.mem.readInt(u32, req[8..12], native_endian));
+    }
+    fn sendDumpRequest(self: *BusyKernel, _: u16, _: usize, _: u8) DumpError!u32 {
+        const seq = self.nextSeq();
+        self.start(seq);
+        return seq;
+    }
+    fn recvDatagram(self: *BusyKernel) RecvError![]const u8 {
+        if (self.pos >= self.cur.len) return error.RecvFailed;
+        const d = self.cur[self.pos];
+        self.pos += 1;
+        if (self.pos == self.cur.len and !self.cur_is_busy) self.running = false;
+        return d;
+    }
+};
+
+test "a DUMP_INTR restart first drains the interrupted dump, else the kernel answers EBUSY (sweep REV-2)" {
+    const intr = cannedWith(RTM_NEWLINK, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const more = cannedWith(RTM_NEWLINK, codec.NLM_F_MULTI, 42, 7, null); // discarded
+    const done1 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, 0);
+    const done2 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &more, &done1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 41 };
+    const got = try dumpOver(Link, parseLink, matchLink, testing.allocator, &k, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{});
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 0), got.len);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 2), k.requests);
+    try testing.expectEqual(@as(u32, 43), k.sent[1]);
+}
+
+test "the interrupted dump's terminating message may itself carry DUMP_INTR (sweep REV-2)" {
+    const intr = cannedWith(RTM_NEWLINK, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const done1 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, 42, 7, 0);
+    const done2 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &done1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 41 };
+    const got = try dumpOver(Link, parseLink, matchLink, testing.allocator, &k, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{});
+    defer testing.allocator.free(got);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 2), k.requests);
+}
+
+test "an interrupted dump that ends in a DONE error returns that error (sweep REV-2)" {
+    const intr = cannedWith(RTM_NEWLINK, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const done1 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, -12); // ENOMEM
+    const d1: []const []const u8 = &.{ &intr, &done1 };
+    var k: BusyKernel = .{ .dumps = &.{d1}, .pid = 7, .next = 41 };
+    try testing.expectError(error.SystemResources, dumpOver(Link, parseLink, matchLink, testing.allocator, &k, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{}));
+    try testing.expectEqual(@as(usize, 1), k.requests);
+}
+
+test "dumpCollectOver restarts on an owned copy: the caller's request is never written (sweep REV-6)" {
+    const intr = cannedWith(RTM_NEWNEIGH, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const done1 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, 0);
+    const done2 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &done1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 42 };
+    var request = cannedMessage(RTM_GETNEIGH, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, 42, 0);
+    const original = request;
+    const got = try dumpCollectOver(FdbEntry, collectFdb, testing.allocator, &k, &request, RTM_NEWNEIGH);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &original, &request);
+    try testing.expectEqual(@as(u32, 43), k.sent[1]); // ... yet the re-send carried the fresh seq
+    try testing.expect(!k.ebusy_hit);
+}
+
+test "the record cap counts produced items, not only messages (sweep REV-4)" {
+    const rec_msg = cannedMessage(RTM_NEWLINK, codec.NLM_F_MULTI, 42, 7);
+    var t: ScriptedTransport = .{ .filler = &rec_msg, .pid = 7, .seq = 42 };
+    const three = struct {
+        fn f(a: std.mem.Allocator, out: *std.ArrayList(Link), _: []const u8, _: void) DumpError!void {
+            for (0..3) |_| try out.append(a, std.mem.zeroes(Link));
+        }
+    }.f;
+    var out: std.ArrayList(Link) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.TooManyMessages, collectDumpPass(Link, void, three, testing.allocator, &t, &out, 42, RTM_NEWLINK, {}, 10));
+    // 3 items per message: the 4th message pushes the count to 12 > 10.
+    try testing.expectEqual(@as(usize, 4), t.recvs);
 }
