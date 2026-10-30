@@ -103,6 +103,11 @@ const zl_options = @import("zl_options");
 /// modulus bit-width. `L = ceil(max_bits/64)` full 2^64 limbs; the modulus
 /// occupies exactly `L` limbs (leading zero limbs are allowed as long as the
 /// value is odd and ≥ 3).
+///
+/// **Stack:** `powMont` keeps a 32-entry window table of `L`-limb elements
+/// live (`256·L` bytes) besides a few more; `DynModint(max_bits).stack_bytes`
+/// is the measured, documented peak of the operations built on this type
+/// (`Modint` itself is not probed separately).
 pub fn Modint(comptime max_bits: comptime_int) type {
     comptime std.debug.assert(max_bits >= 8);
     return struct {
@@ -116,7 +121,13 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// (a latent bug: montint's own tests never exercised them).
         pub const Error = @import("montint.zig").Error;
 
-        /// Number of full 2^64 limbs.
+        /// Number of full 2^64 limbs. **Capacity, not `max_bits`:** the
+        /// type holds `64·L` bits, `max_bits` rounded up to a limb, and the
+        /// byte loaders check only the limb count, so a value of up to
+        /// `8·L` bytes is accepted even when `max_bits` is not a multiple of
+        /// 64. Size buffers by `8·L`, not by `encoded_bytes` / `max_bits`.
+        /// (Rejecting wider values would change accepted input; it is
+        /// documented instead.) `DynModint` rounds further, to 4 limbs.
         pub const L: usize = (max_bits + 63) / 64;
         /// Byte width of a serialized element.
         pub const encoded_bytes: usize = (max_bits + 7) / 8;
@@ -186,7 +197,9 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         /// `64·L`, so a full-width modulus (2048 bits in 32 limbs) costs one.
         /// Constant-time in `v`: the work depends on `nbits` and `L` only.
         pub fn fromElemUncheckedBits(v: Elem, nbits: usize) Self {
-            std.debug.assert(nbits >= 2 and nbits <= 64 * L);
+            // nbits is public (a key size); an out-of-range one indexed `acc` out
+            // of bounds (0 wrapped, > 64·L past the end) in ReleaseFast.
+            if (nbits < 2 or nbits > 64 * L) @panic("montint: fromElemUncheckedBits nbits out of range");
             var self: Self = .{
                 .m = v,
                 .n0inv = negInvMod2_64(v[0]),

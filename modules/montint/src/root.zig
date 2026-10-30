@@ -90,6 +90,8 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("bench.zig");
+    _ = @import("sweep_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names the OpenSSL Montgomery technique" {

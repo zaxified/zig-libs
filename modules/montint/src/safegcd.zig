@@ -280,15 +280,25 @@ pub fn Inverter(comptime max_bits: usize) type {
         /// short, which then reads as "not a unit", never as a wrong inverse.
         /// Constant-time in `x` and in `m`'s value.
         pub fn invert(x: *const [N]u64, m_limbs: *const [N]u64, nbits: usize, out: *[N]u64) bool {
-            std.debug.assert(nbits >= 3 and nbits <= max_bits);
-            std.debug.assert(m_limbs[0] & 1 == 1);
+            checkBits(nbits);
             const k: usize = @min(K, (nbits + 2 + 61) / 62 + 1);
             var st = State.init(x, m_limbs, k);
             for (0..batchCount(nbits)) |_| {
                 const ds = divsteps59(st.zeta, @bitCast(st.f[0]), @bitCast(st.g[0]));
                 st.step(ds.zeta, ds.t, k);
             }
-            return st.finish(k, out);
+            return st.finish(k, out, ~m_limbs[0] & 1);
+        }
+
+        /// `nbits` is public (a key size); out of range is a checked panic in
+        /// every mode (`k` is derived from it, and a `nbits` above `max_bits`
+        /// was clamped silently). An EVEN modulus is NOT a panic: the modulus
+        /// may be a secret prime, so its parity must not be branched on. It
+        /// is forced odd for the divsteps (every internal `low62(..) == 0`
+        /// assert below needs `f` odd, which then holds for ANY input) and
+        /// folded into the verdict: an even modulus answers `false`.
+        fn checkBits(nbits: usize) void {
+            if (nbits < 3 or nbits > max_bits) @panic("montint.safegcd: nbits out of range");
         }
 
         /// Two inversions `out1 = x1⁻¹ mod m1`, `out2 = x2⁻¹ mod m2` at once
@@ -304,8 +314,7 @@ pub fn Inverter(comptime max_bits: usize) type {
             out1: *[N]u64,
             out2: *[N]u64,
         ) [2]bool {
-            std.debug.assert(nbits >= 3 and nbits <= max_bits);
-            std.debug.assert(m1[0] & 1 == 1 and m2[0] & 1 == 1);
+            checkBits(nbits);
             const k: usize = @min(K, (nbits + 2 + 61) / 62 + 1);
             var st1 = State.init(x1, m1, k);
             var st2 = State.init(x2, m2, k);
@@ -314,7 +323,7 @@ pub fn Inverter(comptime max_bits: usize) type {
                 st1.step(ds.zeta[0], ds.t[0], k);
                 st2.step(ds.zeta[1], ds.t[1], k);
             }
-            return .{ st1.finish(k, out1), st2.finish(k, out2) };
+            return .{ st1.finish(k, out1, ~m1[0] & 1), st2.finish(k, out2, ~m2[0] & 1) };
         }
 
         /// Batches for `⌊(45907·b + 26313)/19929⌋` hddivsteps, the bound for
@@ -343,9 +352,11 @@ pub fn Inverter(comptime max_bits: usize) type {
 
             fn init(x: *const [N]u64, m_limbs: *const [N]u64, k: usize) State {
                 // m⁻¹ mod 2^64 by Newton (m odd ⇒ m⁻¹ ≡ m mod 8; 3→6→…→96 bits).
-                var minv: u64 = m_limbs[0];
-                for (0..5) |_| minv *%= 2 -% m_limbs[0] *% minv;
-                const m = fromLimbs(m_limbs, k);
+                const m0 = m_limbs[0] | 1; // forced odd, see `checkBits`
+                var minv: u64 = m0;
+                for (0..5) |_| minv *%= 2 -% m0 *% minv;
+                var m = fromLimbs(m_limbs, k);
+                m[0] |= 1;
                 var st: State = .{
                     .m = m,
                     .minv62 = minv & M62,
@@ -370,8 +381,8 @@ pub fn Inverter(comptime max_bits: usize) type {
             /// Verdict: g = 0 and f = ±1 (f's limbs are normalized by
             /// updateFG except the top, which holds the sign: f = 1 ⟺
             /// [1,0,…,0], f = −1 ⟺ [M62, …, M62, −1]). Wipes the state.
-            fn finish(st: *State, k: usize, out: *[N]u64) bool {
-                var acc: u64 = 0;
+            fn finish(st: *State, k: usize, out: *[N]u64, bad_modulus: u64) bool {
+                var acc: u64 = bad_modulus; // 1 iff the modulus was even
                 for (0..k) |i| acc |= @bitCast(st.g[i]);
                 const fs: i64 = st.f[k - 1] >> 63; // 0 or −1
                 var fn_: S62 = undefined;

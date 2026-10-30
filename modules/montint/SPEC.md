@@ -778,6 +778,12 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-18 at wgs's request:
 
 ## Backlog / deferred
 
+- **No-panic sweep GT (2026-10-30), left open on purpose.** (1) `DynModint.powPublic` walks every bit of `e_be`: a caller
+  that hands it an attacker-sized exponent pays linear time; bound the exponent at the call site (rsa/paillier/threshold_ecdsa
+  already do). (2) `asm_core.mulRow` takes raw pointers, so its trip counts cannot be checked; it is internal to the
+  asm squaring and must not be called from outside. (3) The `unreachable`→`@panic` change of the off-x86 `asm_core` wrappers is
+  not testable on an x86 host.
+
 - **Self-hosted Debug does not compile `zeroWords` (found 2026-10-22 from qap's test redesign).** The
   self-hosted backend rejects `asm_core.zig:1185`'s generated store (`unknown size: '0(%%rdi)'`: AT&T
   needs the `q` suffix the generated text leaves out), so a consumer's `-fno-llvm` Debug build fails,

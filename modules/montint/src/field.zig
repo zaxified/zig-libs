@@ -80,9 +80,9 @@ pub fn Field(comptime p: comptime_int) type {
         }
 
         /// Big-endian bytes → limbs with no value-dependent branch (positions
-        /// only). `be.len <= 8·L`.
+        /// only). `be.len <= 8·L` (public length; longer is a checked panic).
         fn loadBE(be: []const u8) Elem {
-            std.debug.assert(be.len <= 8 * L);
+            if (be.len > 8 * L) @panic("montint.Field: exponent longer than 8*L bytes");
             var v = @as([L]u64, @splat(0));
             for (be, 0..) |b, i| {
                 const pos = be.len - 1 - i; // byte position from the LSB

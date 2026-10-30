@@ -16,9 +16,16 @@
 
 const std = @import("std");
 
+// Caller-contract violations (slice lengths are public) are a checked panic in
+// every optimize mode: the `for (x, y)` walks below are unchecked in ReleaseFast.
+pub const len_mismatch_msg = "montint.limbs: operand lengths differ";
+pub const product_len_msg = "montint.limbs: product needs equal operand lengths and z.len == 2n";
+pub const wide_len_msg = "montint.limbs: small operand is longer than big";
+pub const scratch_len_msg = "montint.limbs: mulKaratsuba scratch is too short";
+
 /// Add `y` into `x` (both `n` limbs), returning the outgoing carry (0 or 1).
 pub fn addInto(x: []u64, y: []const u64) u1 {
-    std.debug.assert(x.len == y.len);
+    if (x.len != y.len) @panic(len_mismatch_msg);
     var carry: u1 = 0;
     for (x, y) |*xi, yi| {
         const s = @addWithOverflow(xi.*, yi);
@@ -31,7 +38,7 @@ pub fn addInto(x: []u64, y: []const u64) u1 {
 
 /// Subtract `y` from `x` (both `n` limbs), returning the outgoing borrow (0/1).
 pub fn subInto(x: []u64, y: []const u64) u1 {
-    std.debug.assert(x.len == y.len);
+    if (x.len != y.len) @panic(len_mismatch_msg);
     var borrow: u1 = 0;
     for (x, y) |*xi, yi| {
         const d = @subWithOverflow(xi.*, yi);
@@ -46,7 +53,7 @@ pub fn subInto(x: []u64, y: []const u64) u1 {
 /// Returns `.lt` / `.eq` / `.gt`. No secret-dependent branch or early exit:
 /// every limb is inspected regardless of where the values first differ.
 pub fn cmp(x: []const u64, y: []const u64) std.math.Order {
-    std.debug.assert(x.len == y.len);
+    if (x.len != y.len) @panic(len_mismatch_msg);
     var lt: u1 = 0;
     var gt: u1 = 0;
     for (x, y) |xi, yi| {
@@ -72,7 +79,7 @@ pub inline fn select(on: u1, a: u64, b: u64) u64 {
 /// Schoolbook full product: `z[0..2n] = x[0..n] * y[0..n]`. Reference multiply.
 pub fn mulSchoolbook(z: []u64, x: []const u64, y: []const u64) void {
     const n = x.len;
-    std.debug.assert(y.len == n and z.len == 2 * n);
+    if (y.len != n or z.len != 2 * n) @panic(product_len_msg);
     @memset(z, 0);
     for (0..n) |i| {
         var carry: u64 = 0;
@@ -88,7 +95,7 @@ pub fn mulSchoolbook(z: []u64, x: []const u64, y: []const u64) void {
 /// Add `small` (≤ `big.len` limbs) into `big`, propagating the carry through
 /// `big`'s upper limbs. Returns the final outgoing carry.
 pub fn addWideInto(big: []u64, small: []const u64) u1 {
-    std.debug.assert(small.len <= big.len);
+    if (small.len > big.len) @panic(wide_len_msg);
     var carry: u1 = 0;
     for (big, 0..) |*bi, i| {
         const s = @as(u128, bi.*) + @as(u128, if (i < small.len) small[i] else 0) + carry;
@@ -101,7 +108,7 @@ pub fn addWideInto(big: []u64, small: []const u64) u1 {
 /// Subtract `small` (≤ `big.len` limbs) from `big`, propagating the borrow.
 /// Returns the final outgoing borrow.
 pub fn subWideInto(big: []u64, small: []const u64) u1 {
-    std.debug.assert(small.len <= big.len);
+    if (small.len > big.len) @panic(wide_len_msg);
     var borrow: u1 = 0;
     for (big, 0..) |*bi, i| {
         const s = @as(i128, bi.*) - @as(i128, if (i < small.len) small[i] else 0) - borrow;
@@ -118,10 +125,13 @@ pub const karatsuba_threshold: usize = 16;
 /// Single-level Karatsuba full product `z[0..2n] = x[0..n] * y[0..n]` (falls
 /// back to schoolbook below the threshold; handles odd `n` via unequal halves).
 /// Correctness anchor for `mulSchoolbook`; building block for the deferred
-/// large-size SOS Montgomery path. `scratch` must hold ≥ `4*(n/2+1)` limbs.
+/// large-size SOS Montgomery path. `scratch` must hold ≥ `4*(ceil(n/2)+1)`
+/// limbs when `n >= karatsuba_threshold` (it is not read below that); a
+/// shorter one is a checked panic (the doc used to say `4*(n/2+1)`, one
+/// limb-quad too few for odd `n`).
 pub fn mulKaratsuba(z: []u64, x: []const u64, y: []const u64, scratch: []u64) void {
     const n = x.len;
-    std.debug.assert(y.len == n and z.len == 2 * n);
+    if (y.len != n or z.len != 2 * n) @panic(product_len_msg);
     if (n < karatsuba_threshold or n < 2) {
         mulSchoolbook(z, x, y);
         return;
@@ -129,6 +139,7 @@ pub fn mulKaratsuba(z: []u64, x: []const u64, y: []const u64, scratch: []u64) vo
     const h = n / 2; // low half = h limbs, high half = nh limbs (nh ≥ h)
     const nh = n - h;
     const hs = nh + 1; // sum width (holds the +1 carry limb)
+    if (scratch.len < 4 * hs) @panic(scratch_len_msg);
     const xl = x[0..h];
     const xh = x[h..n];
     const yl = y[0..h];

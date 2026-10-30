@@ -473,7 +473,7 @@ pub fn dynSqrt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     const want = is_zero or D.isOne(&leg);
 
     var r: D.Elem = undefined;
-    const ok = m.sqrt(&x, &r);
+    const ok = try m.sqrt(&x, &r);
     if (ok != want) return error.SqrtVerdictDiffers;
     if (ok) {
         if (!D.eql(&m.sq(&r), &x)) return error.SqrtNotARoot;
@@ -486,7 +486,7 @@ pub fn dynSqrt(comptime S: type, src: *S, _: std.mem.Allocator) anyerror!void {
     // a >= m is refused, whatever its residue class.
     var big = pv;
     big[0] +%= 1; // m + 1 (odd m: no carry out of limb 0 unless all ones; harmless either way)
-    if (m.sqrt(&big, &r) or !D.isZero(&r)) return error.SqrtAcceptedUnreduced;
+    if (try m.sqrt(&big, &r) or !D.isZero(&r)) return error.SqrtAcceptedUnreduced;
     SqrtMark.mark(.refused);
 }
 

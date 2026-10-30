@@ -416,7 +416,8 @@ fn runDyn(comptime nbits: usize, comptime tag: []const u8, tainted: bool) !void 
     var sa = pmod.reduceBytesBE(&sr);
     const sar = taintedCopy(D.Elem, &sa, tainted);
     var root_out: D.Elem = undefined;
-    const sqrt_ok = pmod.sqrt(&sar, &root_out);
+    // p224: v2(p−1) = 96 ≤ sqrt_max_two_adicity, so SqrtWorkLimit cannot occur.
+    const sqrt_ok = try pmod.sqrt(&sar, &root_out);
     pmod.toBytesBE(&root_out, out[0..pmod.byteLen()]);
     std.debug.print("sqrt={} {x}\n", .{ sqrt_ok, out[0..pmod.byteLen()] });
 }

@@ -101,13 +101,44 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         const Self = @This();
 
         pub const Error = montint.Error;
-        /// Limb capacity of an element (the largest slot).
+        /// Limb capacity of an element (the largest slot). **Capacity, not
+        /// `max_bits`:** it is `max_bits` rounded up to a multiple of `step`
+        /// (4) limbs, i.e. to 256 bits, so a modulus of up to
+        /// `64·max_limbs` bits is accepted (`DynModint(2000)` takes 2048-bit
+        /// ones). Size buffers by `byteLen()` or `8·max_limbs`, never by
+        /// `max_bits`. (Rounding further, not rejecting, is deliberate: it
+        /// keeps every previously accepted modulus accepted.)
         pub const max_limbs: usize = top_slot;
         /// The slot sizes in limbs, ascending; the last is `max_limbs`.
         pub const slots: []const usize = slotSizes(top_slot);
         /// A normal-domain element, see the file doc.
         pub const Elem = [max_limbs]u64;
         pub const zero: Elem = @as([max_limbs]u64, @splat(0));
+        /// Peak stack of one slot-dispatched operation (`pow`, `inverse`,
+        /// `sqrt`; `mul`/`sq`/`add` and the rest need less), in bytes: the
+        /// caller's thread needs this plus its own frames. An `Elem` is
+        /// `8·max_limbs` bytes and the operations keep a few dozen of them
+        /// live (`Modint.powMont`'s 32-entry window table alone is 32).
+        /// Measured 2026-10-30, ReleaseFast, x86_64 (`stackprobe_test.zig`,
+        /// the largest of `pow`/`inverse`/`sqrt` is `sqrt`, on a full-width
+        /// modulus), and the bound set at 16 KiB + 128 `Elem`s (about 1.5×
+        /// the measurement, which also covers the Tonelli-Shanks path of
+        /// `sqrt` that the probe's modulus does not take):
+        ///
+        /// | `max_bits` | measured peak | `stack_bytes` |
+        /// |-----------:|--------------:|--------------:|
+        /// | 2048       | 27 KiB        | 48 KiB        |
+        /// | 4096       | 51 KiB        | 80 KiB        |
+        /// | 8192       | 94 KiB        | 144 KiB       |
+        ///
+        /// A thread with the 128 KiB musl default stack can therefore run
+        /// `DynModint(2048)` and `DynModint(4096)` operations but NOT
+        /// `DynModint(8192)` ones (rsa, ssh GEX, paillier at their top size):
+        /// give such a thread `stack_bytes` plus the caller's frames (64 KiB
+        /// is ample). Unoptimized builds use more (not measured: Debug and
+        /// ReleaseSafe cannot be probed, see the probe). `ssh/src/burn.zig`
+        /// records the whole-exchange figure of a group14 handshake.
+        pub const stack_bytes: usize = 16 * 1024 + 128 * @sizeOf(Elem);
 
         /// The active slot (limb count the arithmetic runs at).
         L: usize,
@@ -681,6 +712,25 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
             return true;
         }
 
+        /// `sqrt` refuses a `p ≡ 1 (mod 8)` modulus whose `s = v2(p − 1)` is
+        /// above this (`s(s−1)/2` squarings: 33 000 at 256, 33 million at 8192).
+        pub const sqrt_max_two_adicity: usize = 256;
+        /// `sqrt` tries the integers `2 .. 2 + sqrt_max_candidates` as the
+        /// non-residue (one full `pow` each) before giving up.
+        ///
+        /// **Worst-case time** of `sqrt` on a hostile modulus ≡ 1 (mod 8) with
+        /// no small non-residue (such as `q²`) and `s = v2(m − 1) ≤
+        /// sqrt_max_two_adicity`: `sqrt_max_candidates` full-width `pow`s
+        /// (each a constant-time exponentiation with an `nbits`-bit exponent), and
+        /// then `error.SqrtWorkLimit`; a modulus that does find a non-residue
+        /// adds `s(s−1)/2` squarings (at most 32 640 at `s = 256`) and three
+        /// more `pow`s. So the bound is
+        /// `(sqrt_max_candidates + 3)·t_pow(nbits) + 32 640·t_sq(nbits)`, a
+        /// formula only (no timing is recorded). Only a
+        /// caller that feeds `sqrt` an attacker's modulus meets it; no
+        /// in-repo consumer does.
+        pub const sqrt_max_candidates: usize = 256;
+
         /// Room for `bits + 64` random bits (`bits ≤ 64·max_limbs`).
         const witness_buf_len = 8 * max_limbs + 8;
 
@@ -899,6 +949,16 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// decision is a masked select, the `true`/`false` verdict is the
         /// only output that is branched on.
         ///
+        /// **Work is bounded** (the modulus is caller-chosen and may be hostile):
+        /// the Tonelli-Shanks path needs `s = v2(p − 1) ≤ sqrt_max_two_adicity`
+        /// and a non-residue among the first `sqrt_max_candidates` integers
+        /// from 2 (a field prime has one almost at once). Past either limit
+        /// — a prime like `2^k·c + 1`, or a composite with no small
+        /// non-residue such as `q²` — the result is `error.SqrtWorkLimit`
+        /// (`out` zeroed), NOT `false`: `false` means "no square root". The
+        /// modulus must be a field prime; the `p ≡ 3 (mod 4)` and `p ≡ 5
+        /// (mod 8)` paths are two `pow` calls whatever the modulus.
+        ///
         /// `p ≡ 3 (mod 4)`: `a^((p+1)/4)`. `p ≡ 5 (mod 8)`: Atkin,
         /// `x = a^((p+3)/8)`, times `√−1 = 2^((p−1)/4)` iff `x² ≠ a`.
         /// `p ≡ 1 (mod 8)`: Tonelli-Shanks with `p − 1 = q·2^s`, in the
@@ -909,7 +969,7 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
         /// step. `s·(s−1)/2` squarings in all — fine for field primes
         /// (`s ≤ ~100`), quadratic in `s` for an adversarial prime like
         /// `2^k·c + 1`.
-        pub fn sqrt(self: *const Self, a: *const Elem, out: *Elem) bool {
+        pub fn sqrt(self: *const Self, a: *const Elem, out: *Elem) error{SqrtWorkLimit}!bool {
             var t = a.*;
             const below: u1 = limbs.subInto(&t, &self.m); // 1 ⟺ a < m
             std.crypto.secureZero(u64, &t);
@@ -938,6 +998,10 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 var pm1 = mod;
                 pm1[0] &= ~@as(u64, 1);
                 while (pm1[s / 64] >> @intCast(s % 64) & 1 == 0) s += 1;
+                if (s > sqrt_max_two_adicity) {
+                    out.* = zero;
+                    return error.SqrtWorkLimit;
+                }
                 const q = shrPublic(&pm1, s);
                 const half_q1 = incPublic(&shrPublic(&q, 1)); // (q+1)/2
                 // z: the smallest small non-residue (public search).
@@ -946,9 +1010,13 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 var z = zero;
                 var found = false;
                 var cand: u64 = 2;
-                while (cand < 4096) : (cand += 1) {
+                var exhausted = false; // every integer below m tried: m is no prime
+                while (cand < 2 + sqrt_max_candidates) : (cand += 1) {
                     z[0] = cand;
-                    if (compare(&z, &mod) != .lt) break;
+                    if (compare(&z, &mod) != .lt) {
+                        exhausted = true;
+                        break;
+                    }
                     if (eql(&self.pow(&z, &euler), &minus_one)) {
                         found = true;
                         break;
@@ -956,7 +1024,8 @@ pub fn DynModint(comptime max_bits: comptime_int) type {
                 }
                 if (!found) {
                     out.* = zero;
-                    return false;
+                    if (exhausted) return false; // as before: no non-residue exists below m
+                    return error.SqrtWorkLimit;
                 }
                 var u = self.pow(&z, &q);
                 var tt = self.pow(a, &q);
@@ -1833,7 +1902,7 @@ test "DynModint sqrt: KATs vs CPython Tonelli-Shanks (tools/gen_sqrt_kat.py)" {
         @memcpy(want[0..c.root.len], c.root);
         const m = try D.fromLimbs(&pv);
         var r: D.Elem = undefined;
-        const ok = m.sqrt(&a, &r);
+        const ok = try m.sqrt(&a, &r);
         try testing.expectEqual(c.qr, ok);
         if (c.qr) {
             try testing.expect(D.eql(&r, &want) or D.eql(&r, &m.neg(&want)));
@@ -1850,15 +1919,15 @@ test "DynModint sqrt: a = 0, 1, m - 1 and refusal of a >= m" {
         pv[0] = p;
         const m = try D.fromLimbs(&pv);
         var r: D.Elem = undefined;
-        try testing.expect(m.sqrt(&D.zero, &r) and D.isZero(&r));
-        try testing.expect(m.sqrt(&D.one(), &r) and D.isOne(&m.sq(&r)));
+        try testing.expect((try m.sqrt(&D.zero, &r)) and D.isZero(&r));
+        try testing.expect((try m.sqrt(&D.one(), &r)) and D.isOne(&m.sq(&r)));
         const minus1 = m.neg(&D.one());
-        try testing.expectEqual(p % 4 == 1, m.sqrt(&minus1, &r));
+        try testing.expectEqual(p % 4 == 1, try m.sqrt(&minus1, &r));
         if (p % 4 == 3) try testing.expect(D.isZero(&r));
-        try testing.expect(!m.sqrt(&pv, &r) and D.isZero(&r)); // a = p
+        try testing.expect(!(try m.sqrt(&pv, &r)) and D.isZero(&r)); // a = p
         var hi = D.zero;
         hi[3] = 1; // far above m
-        try testing.expect(!m.sqrt(&hi, &r) and D.isZero(&r));
+        try testing.expect(!(try m.sqrt(&hi, &r)) and D.isZero(&r));
     }
 }
 
@@ -1882,7 +1951,7 @@ test "DynModint sqrt: sqrt(x*x) squares back, every path, several slots" {
             const x = m.reduceBytesBE(&buf);
             const xx = m.sq(&x);
             var r: D.Elem = undefined;
-            try testing.expect(m.sqrt(&xx, &r));
+            try testing.expect(try m.sqrt(&xx, &r));
             try testing.expect(D.eql(&m.sq(&r), &xx));
             try testing.expect(D.eql(&r, &x) or D.eql(&r, &m.neg(&x)));
         }

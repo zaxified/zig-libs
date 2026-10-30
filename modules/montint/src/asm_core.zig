@@ -71,22 +71,25 @@ pub const supported = builtin.cpu.arch == .x86_64 and
     std.Target.x86.featureSetHas(builtin.cpu.features, .adx) and
     std.Target.x86.featureSetHas(builtin.cpu.features, .bmi2);
 
+const len_msg = "montint.asm_core: z, a, b, m (and 2n scratch for montSqr) must be n >= 1 limbs";
+const unsupported_msg = "montint.asm_core: not supported on this target (check asm_core.supported)";
+
 /// `z = a·b·R⁻¹ mod m` over `n = m.len` full 2^64 limbs (see the module doc
 /// for the full contract). Dispatched iff `supported and gate.asm_core_implemented`.
 pub fn montMul(z: []u64, a: []const u64, b: []const u64, m: []const u64, n0inv: u64) void {
     if (comptime supported) {
         montMulAmd64(z, a, b, m, n0inv);
     } else {
-        // Unreachable by construction: the dispatcher in `montint.zig` and the
-        // differential harness both comptime/runtime-guard on `supported`.
-        unreachable;
+        // The dispatcher in `montint.zig` and the differential harness both
+        // guard on `supported`; a direct caller on another target gets a
+        // checked panic, not UB.
+        @panic(unsupported_msg);
     }
 }
 
 fn montMulAmd64(z: []u64, a: []const u64, b: []const u64, m: []const u64, n0inv: u64) void {
     const n = m.len;
-    std.debug.assert(n >= 1);
-    std.debug.assert(z.len == n and a.len == n and b.len == n);
+    if (n < 1 or z.len != n or a.len != n or b.len != n) @panic(len_msg);
 
     // CIOS accumulator: t[0..n-1] lives in z (freshly zeroed); the top two
     // words t[n], t[n+1] only ever carry row tails, so they stay in scalars.
@@ -128,9 +131,7 @@ pub fn montSqr(z: []u64, a: []const u64, m: []const u64, n0inv: u64, scratch: []
     if (comptime supported) {
         montSqrAmd64(z, a, m, n0inv, scratch);
     } else {
-        // Unreachable by construction: the dispatcher in `montint.zig` and the
-        // differential harness both comptime/runtime-guard on `supported`.
-        unreachable;
+        @panic(unsupported_msg);
     }
 }
 
@@ -165,8 +166,7 @@ pub fn montSqr(z: []u64, a: []const u64, m: []const u64, n0inv: u64, scratch: []
 /// secret-dependent branch, index, or store address; final reduce is masked.
 fn montSqrAmd64(z: []u64, a: []const u64, m: []const u64, n0inv: u64, scratch: []u64) void {
     const n = m.len;
-    std.debug.assert(n >= 1);
-    std.debug.assert(z.len == n and a.len == n and scratch.len == 2 * n);
+    if (n < 1 or z.len != n or a.len != n or scratch.len != 2 * n) @panic(len_msg);
     const A = scratch;
     @memset(A, 0);
 
@@ -419,7 +419,7 @@ pub inline fn mulRow(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u6
         // the ReleaseSafe arm64 lane of 2026-08-24 went red on it. Its callers
         // were all guarded; the guard belongs on the function, because the one
         // caller that skipped it was not a caller at all.
-        unreachable;
+        @panic(unsupported_msg);
     }
 }
 
@@ -643,7 +643,7 @@ pub fn montMulFixed(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [
     if (comptime supported) {
         montMulFixedAmd64(L, z, a, b, m, n0inv);
     } else {
-        unreachable; // guarded by every caller; see `mulRow` for why `pub` needs this
+        @panic(unsupported_msg); // guarded by every caller; see `mulRow`
     }
 }
 
@@ -749,7 +749,7 @@ pub fn montSqrFixed(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [
     if (comptime supported) {
         montSqrFixedAmd64(L, z, a, m, n0inv);
     } else {
-        unreachable; // guarded by every caller; see `mulRow`
+        @panic(unsupported_msg); // guarded by every caller; see `mulRow`
     }
 }
 
@@ -1287,7 +1287,7 @@ pub fn montMulBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, b: *const [
         const top = redcBlock(L, &A, m, n0inv);
         condSubInto(L, z, A[L..], top, m);
     } else {
-        unreachable; // guarded by every caller; see `mulRow`
+        @panic(unsupported_msg); // guarded by every caller; see `mulRow`
     }
 }
 
@@ -1305,7 +1305,7 @@ pub fn montSqrBlock(comptime L: usize, z: *[L]u64, a: *const [L]u64, m: *const [
         const top = redcBlock(L, &A, m, n0inv);
         condSubInto(L, z, A[L..], top, m);
     } else {
-        unreachable;
+        @panic(unsupported_msg);
     }
 }
 
