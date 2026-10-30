@@ -215,6 +215,8 @@ pub fn isSafePath(s: []const u8) bool {
 /// not shell-parsed). The scheme guarantees no leading `-`; note that argv
 /// semantics make `?`, `#`, `&`, `=` harmless, so —
 /// unlike a shell-quoting validator — those are intentionally allowed.
+/// Bytes 0x80..0xFF are accepted, and `[` `]` `{` `}` are curl globbing
+/// characters: pass `-g` (`--globoff`) when the callee is curl.
 pub fn isSafeUrl(s: []const u8) bool {
     if (s.len < 8 or s.len > 1024) return false;
     if (!std.mem.startsWith(u8, s, "http://") and !std.mem.startsWith(u8, s, "https://")) return false;
@@ -228,11 +230,12 @@ pub fn isSafeUrl(s: []const u8) bool {
     return true;
 }
 
-/// A base64 token (`[A-Za-z0-9+/=]`). If `exact_len` is given the length must
+/// A base64 token (`[A-Za-z0-9+/=]`); the empty string is refused. If `exact_len` is given the length must
 /// match exactly (`isSafeBase64(k, 44)` is the WireGuard-key shape: 44 accepted,
 /// 43/45 rejected); otherwise 1..512 bytes. The charset excludes `-` and NUL, so
 /// flag-injection and NUL-smuggling are covered by construction.
 pub fn isSafeBase64(s: []const u8, exact_len: ?usize) bool {
+    if (s.len == 0) return false;
     if (exact_len) |n| {
         if (s.len != n) return false;
     } else {
@@ -247,9 +250,13 @@ pub fn isSafeBase64(s: []const u8, exact_len: ?usize) bool {
 
 /// A `sep`-separated CIDR list: hex digits plus `. : /` and the separator only
 /// (IPv4/IPv6 CIDRs), 1..256 bytes. The separator is a parameter (e.g. `,`).
-/// The charset excludes `-` and NUL.
+/// The charset excludes `-` and NUL. `sep` must be printable non-space ASCII
+/// (0x21..0x7e), else the result is false.
 pub fn isSafeCidrList(s: []const u8, sep: u8) bool {
     if (s.len == 0 or s.len > 256) return false;
+    // A separator that is NUL, a control byte, a space or non-ASCII would let
+    // exactly those bytes into the token.
+    if (sep <= ' ' or sep >= 0x7f) return false;
     // Explicit flag-injection guard, independent of `sep`: the charset below
     // excludes '-' only incidentally (when the caller's `sep` isn't '-'). A
     // caller passing `sep = '-'` would otherwise put '-' in the allowed set
@@ -268,6 +275,9 @@ pub fn isSafeCidrList(s: []const u8, sep: u8) bool {
 ///     included).
 ///   * `printable_ascii = false` → the token set `[A-Za-z0-9._:/-]` (no spaces
 ///     / metachars).
+/// Context the callee may care about: a leading `@` (curl `-d @file` reads a
+/// file) and `,` / `=` (sub-option separators in many CLIs) are accepted in the
+/// printable form.
 pub fn isSafeKvValue(s: []const u8, printable_ascii: bool) bool {
     if (s.len == 0 or s.len > 128) return false;
     if (s[0] == '-') return false; // flag-injection guard
@@ -336,7 +346,10 @@ pub const Argv = struct {
     /// subcommand, or an option flag you control. Because `tok` is `comptime`
     /// it can never be an untrusted run-time value.
     pub fn push(self: *Argv, gpa: std.mem.Allocator, comptime tok: []const u8) std.mem.Allocator.Error!void {
-        try self.items.append(gpa, tok);
+        self.items.append(gpa, tok) catch |e| {
+            self.ok = false;
+            return e;
+        };
     }
 
     /// Append a run-time value only if `class.check` passes; otherwise poison
@@ -346,7 +359,10 @@ pub const Argv = struct {
             self.ok = false;
             return Error.Rejected;
         }
-        try self.items.append(gpa, s);
+        self.items.append(gpa, s) catch |e| {
+            self.ok = false;
+            return e;
+        };
     }
 
     /// Append a run-time value only if `pred(s)` is true; otherwise poison the
@@ -357,7 +373,10 @@ pub const Argv = struct {
             self.ok = false;
             return Error.Rejected;
         }
-        try self.items.append(gpa, s);
+        self.items.append(gpa, s) catch |e| {
+            self.ok = false;
+            return e;
+        };
     }
 
     /// The argv slice for `std.process.run` / `std.process.Child.init`, or
@@ -486,6 +505,10 @@ pub const Template = struct {
     /// verbatim, holed tokens with each `{name}` replaced by `values[i]` and
     /// `{{`/`}}` un-escaped to a literal brace.
     ///
+    /// `self` must come from `parse` (the fields are public, but a `Template`
+    /// built by hand and never parsed can make `fill` panic with
+    /// `argsafe: Template.fill on a Template that Template.parse did not accept`).
+    ///
     /// Ownership: the returned `Filled.argv` (on success) lives in
     /// `Filled`'s own arena — call `Filled.deinit` to free it. On a refusal
     /// nothing is allocated.
@@ -575,10 +598,13 @@ fn scanToken(tok: []const u8, holes: []const Hole, forbid_holes: bool) ParseErro
     }
 }
 
+const not_parsed = "argsafe: Template.fill on a Template that Template.parse did not accept";
+
 /// Render one token: `{{`/`}}` un-escaped, `{name}` replaced by its value.
 /// Called only after `Template.parse` has already validated this exact
-/// grammar, so every `{`/`}`/`{name}` here is well-formed by construction —
-/// the `.?` unwraps below can never actually fail.
+/// grammar, so every `{`/`}`/`{name}` here is well-formed by construction.
+/// `Template`'s fields are public, though, so a caller can build one without
+/// `parse`: that contract violation is a checked panic below, not an unwrap.
 fn renderToken(arena: std.mem.Allocator, tok: []const u8, holes: []const Hole, values: []const []const u8) std.mem.Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
@@ -590,8 +616,8 @@ fn renderToken(arena: std.mem.Allocator, tok: []const u8, holes: []const Hole, v
                 i += 2;
                 continue;
             }
-            const close = std.mem.findScalarPos(u8, tok, i, '}').?;
-            const idx = holeIndex(holes, tok[i + 1 .. close]).?;
+            const close = std.mem.findScalarPos(u8, tok, i, '}') orelse @panic(not_parsed);
+            const idx = holeIndex(holes, tok[i + 1 .. close]) orelse @panic(not_parsed);
             try out.appendSlice(arena, values[idx]);
             i = close + 1;
         } else if (c == '}') {
@@ -611,6 +637,10 @@ fn renderToken(arena: std.mem.Allocator, tok: []const u8, holes: []const Hole, v
 // ===========================================================================
 
 const testing = std.testing;
+
+test {
+    _ = @import("sweep_test.zig");
+}
 
 // --- CharClass: golden allow/reject over representative validators ------
 
@@ -746,7 +776,7 @@ test "isSafeBase64: WireGuard key shape (exactly 44)" {
 test "isSafeCidrList" {
     try testing.expect(isSafeCidrList("10.0.0.0/24", ','));
     try testing.expect(isSafeCidrList("10.0.0.0/24,fd00::/8", ','));
-    try testing.expect(isSafeCidrList("10.0.0.0/24 fd00::/8", ' ')); // custom sep
+    try testing.expect(!isSafeCidrList("10.0.0.0/24 fd00::/8", ' ')); // space separator refused (review REV-AS-2)
     try testing.expect(!isSafeCidrList("10.0.0.0/24;rm", ',')); // metachar
     try testing.expect(!isSafeCidrList("", ','));
     try testing.expect(!isSafeCidrList("-10.0.0.0/8", ',')); // '-' not in class
