@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-08-12 · mutation 2026-10-18 (97/107, 10 eq) · src 07bcec7d9ab8850c
 
-**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-26 (ctgrind)
+**Hardening:** fuzz 2026-10-09 (8 x 25,000 seeds per harness clean, RSA_FUZZ) · ct 2026-10-26 (ctgrind) · panic 2026-10-30 (sweep + blind review: e ≥ 2^32 private keys rejected (were catch unreachable on every private op), nested-SPKI recursion removed, short modulus_len primitives → error, PSS/byteLen/modinverse asserts → errors; delta audit 19/20 + 1 eq)
 
 **Performance:** ref 0.84–1.08× OpenSSL 3.5.5 · fastest ? (measured 2026-10-18; `.cached` blinding 1.02–1.03× at 2048)
 
@@ -559,7 +559,7 @@ Consumer build options (CONVENTIONS §4.2), first in zig-libs (2026-10-17):
 - ~~**PSS verify with automatic salt length**~~ ✅ 2026-10-14 `verifyPssAuto` (+ `maxPssSaltLen`, decoupled MGF1 `signPssH`/`verifyPssH`). Original text *(survey 2026-09-30)*: `verifyPss` needs the salt length; JWT PS256 fixes it, but X.509/CMS signatures carry it in parameters and OpenSSL/Go can recover it. Effort: small. Fits §2.
 
 - **Caller-lowerable PBKDF2 iteration cap** (sweep GP review, 2026-10-30): `max_pbkdf2_iterations` (2^20, ~0.3-1 s per hostile encrypted key) is fixed; minisign's `SecretKeyLimits` / `openSecretKeyLimited` is the precedent for letting the caller pass a lower (or higher) cap.
-- **`fromPrimes` has no minimum modulus size** (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). Undecided whether a floor breaks that test; whether `drawBlindingPair` terminates for a < 8-bit half is unverified.
+- **`fromPrimes` has no minimum modulus size** (sweep GP review REV-RS-2, 2026-10-30): `PublicKey`/`VerifyKey` enforce `min_modulus_bits`, `SecretKey.fromPrimes` does not (the textbook test p=61, q=53 relies on it). A floor would break that test, so none was added. Termination was checked in the GP delta audit (2026-10-30): p=3, q=5, e=3, `rsadpCrtBlinded(.csprng)` returns the right value over 300 seeds/ciphertexts; no hang.
 
 ## Status
 

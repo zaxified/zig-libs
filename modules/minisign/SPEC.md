@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-10 · mutation 2026-10-04 (42/43, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-07 (500,000 runs clean per harness, MINISIGN_FUZZ) · ct 2026-10-20 (ctgrind: Ed25519 seed (sign), seed + password (seal), password (open) tainted; sign 2 in-file = std `rejectIdentity` on R, seal 2 = std scrypt ROMix index (RFC 7914 by design), open 6 = scrypt 2 + the `timing_safe.eql` WrongPassword verdict + 3 on the public key derived from the seed (std `rejectIdentity`, `PublicKey.fromBytes`, the NonCanonical verdict; since § GP 2026-10-30); no minisign branch on a secret; itemised in scripts/checks/ctgrind-expected.tsv)
+**Hardening:** fuzz 2026-10-07 (500,000 runs clean per harness, MINISIGN_FUZZ) · ct 2026-10-20 (ctgrind: Ed25519 seed (sign), seed + password (seal), password (open) tainted; sign 2 in-file = std `rejectIdentity` on R, seal 2 = std scrypt ROMix index (RFC 7914 by design), open 6 = scrypt 2 + the `timing_safe.eql` WrongPassword verdict + 3 on the public key derived from the seed (std `rejectIdentity`, `PublicKey.fromBytes`, the NonCanonical verdict; since § GP 2026-10-30); no minisign branch on a secret; itemised in scripts/checks/ctgrind-expected.tsv) · panic 2026-10-30 (sweep + blind review: scrypt cost from the key file capped (SecretKeyLimits, libsodium *_SENSITIVE), seal refuses what open would, mem_limit < 1024 → WeakParameters, public half checked in every mode; delta audit 13/14 + 1 eq)
 
 **Performance:** ref 0.93–1.10× minisign 0.12 CLI (4 runs of `bench-minisign` on a loaded host, load 3–6; the CLI side moved 260–302 ms, ours 280–290 ms; was 1.30× before the row-vectorized BLAKE2b-512 of 2026-10-20) · fastest ? (measured 2026-10-20)
 

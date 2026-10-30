@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-09-28 (31/31) · src ?
 
-**Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192 and eight nonce/tag shapes) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict)
+**Hardening:** fuzz 2026-10-10 (100,000 runs clean, AESGCM_FUZZ, with AES-192 and eight nonce/tag shapes) · ct 2026-10-10 (ctgrind ctx/stateless/generic over AES-128/192/256: 6 in-file each = the tag-check verdict) · panic 2026-10-30 (sweep of every pub entry point + blind review: length contract a checked panic in every mode, over-limit ciphertext → AuthenticationFailed + zeroed m, test seams behind test_hooks; delta audit 10/11 + 2 call sites reachable only above 64 GiB)
 
 **Performance:** ref 0.25–1.01× OpenSSL 3.5.5 EVP AES-GCM · fastest ? (measured 2026-10-20)
 

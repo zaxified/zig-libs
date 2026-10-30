@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-08 · mutation 2026-10-08 (39/39) · src f8f04819d5006549
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, SEALEDBOX_FUZZ) · ct 2026-10-07 (ctgrind)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean per harness, SEALEDBOX_FUZZ) · ct 2026-10-07 (ctgrind) · panic 2026-10-30 (sweep + blind review: sealedLen saturates; delta audit 2/2)
 
 **Performance:** ref 0.78–1.04× libsodium 1.0.18 crypto_box_seal · fastest ? (measured 2026-10-20, worst of 3 runs per workload)
 

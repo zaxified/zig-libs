@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (17/18, 1 eq) · src ?
 
-**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, ENCODING_FUZZ; every page, any cut and output room against the whole-buffer answer, byte-by-byte input against the UTF state machines, `validUtf8` against std) · ct n/a — charset codecs (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-20 (200,000-run budget per harness clean, ENCODING_FUZZ; every page, any cut and output room against the whole-buffer answer, byte-by-byte input against the UTF state machines, `validUtf8` against std) · ct n/a — charset codecs (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: caller-buffer encoder carry fixed (unreachable on a 10–12-byte dst), ASCII scan bounded by the dst room (was quadratic), fatal-mode read past the unmappable code point; delta audit 19/21 + 2 eq)
 
 **Performance:** ref 0.09–1.10× encoding_rs 0.8.42 (`zig build bench-encoding`, 25 rows: windows-1250 decode/encode, UTF-8 ASCII/multilingual/invalid, UTF-16 both ways, streaming, 20-byte cells, Shift_JIS/EUC-KR/gb18030/Big5/ISO-2022-JP decode and encode, streaming Shift_JIS) · Go x/text v0.42.0 0.05–2.2× (its CJK encoders are faster) (measured 2026-10-20)
 

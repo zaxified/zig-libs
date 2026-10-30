@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-09-02 · mutation 2026-10-04 (44/54, 8 eq) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the variants and the u64-lane pass: counts unchanged, new `xaead` target for XChaCha20-Poly1305 and the 64-bit counter, digests updated)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, _A_APOLY_FUZZ) · ct 2026-10-13 (ctgrind, re-checked after the variants and the u64-lane pass: counts unchanged, new `xaead` target for XChaCha20-Poly1305 and the 64-bit counter, digests updated) · panic 2026-10-30 (sweep + blind review: length asserts → checked panics, counterWouldWrap overflow-free, over-limit AEAD ciphertext refused before the MAC, aliasing documented; delta audit 11/12 + 1 call site reachable only above 256 GiB)
 
 **Performance:** ref 0.69–1.02× OpenSSL 3.5.5 EVP ChaCha20-Poly1305 · fastest 1.02× libsodium 1.0.18 (measured 2026-10-20)
 

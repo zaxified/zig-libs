@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (32/33) · src ?
 
-**Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32C_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07)
+**Hardening:** fuzz 2026-10-07 (200,000 runs clean, CRC32C_FUZZ) · ct n/a — checksum only (keyword review, 2026-10-07) · panic 2026-10-30 (sweep + blind review: nothing to fix; edge cases pinned)
 
 **Performance:** ref 0.38–0.98× Go hash/crc32 Castagnoli go1.26 · fastest ? (measured 2026-10-20)
 

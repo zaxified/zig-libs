@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-07-21 · mutation 2026-09-28 · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, P256_FUZZ) · ct 2026-09-28 (ctgrind) · panic 2026-10-30 (sweep + blind review: own Signature type with a total toDer (std's indexes an empty slice for r/s = 0), explicit identity-key reject; delta audit 11/12 + 1 eq)
 
 **Performance:** ref 0.78–1.05× OpenSSL 3.5.5 · fastest ? (measured 2026-10-20)
 
