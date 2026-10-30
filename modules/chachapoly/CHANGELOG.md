@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GP). `assert(out.len == in.len)` in `xor` and in every AEAD encrypt/decrypt (ChaCha, XChaCha, Poly1305 variants) is now a checked panic in every build mode (was UB in ReleaseFast). `counterWouldWrap` no longer overflows on lengths near `maxInt(usize)`. AEAD decrypt of a ciphertext whose block counter would wrap (> 256 GiB) zeroes `m` and returns `error.AuthenticationFailed` before the MAC, instead of panicking after a verified tag. The aliasing rule of encrypt/decrypt is documented (same slice, disjoint, or the output starting before the input). Tests: `src/sweep_test.zig`.
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: SPEC: 0.17.0 performance notes added from the migration reports; the 0.16 tables are labelled as such.

@@ -247,7 +247,15 @@ inline fn delegateLimit(comptime n: usize) usize {
 /// own rule is that the second is worse. The predicate is `pub` so the
 /// arithmetic can be pinned by tests without provoking the panic.
 pub fn counterWouldWrap(len: usize, counter: u32) bool {
-    return @as(u64, (len + 63) / 64) + counter > (@as(u64, 1) << 32);
+    const blocks = len / 64 + @intFromBool(len % 64 != 0); // no `len + 63`: it overflows at the top of usize
+    return @as(u64, blocks) + counter > (@as(u64, 1) << 32);
+}
+
+/// The `out.len == in.len` contract of every cipher/AEAD entry point, checked in
+/// EVERY build mode: a bare `assert` is undefined behaviour in ReleaseFast, and
+/// a short `out` is then an out-of-bounds write.
+inline fn checkSameLen(out_len: usize, in_len: usize) void {
+    if (out_len != in_len) @panic("chachapoly: output length differs from input length");
 }
 
 const counter_wrap_message = "chachapoly: the ChaCha block counter would wrap — keystream reuse (two-time pad). Re-key or advance the nonce.";
@@ -553,7 +561,8 @@ fn ChaChaStream(comptime rounds: comptime_int, comptime layout: Layout) type {
         }
 
         /// XOR the keystream (starting at block `counter`) into `in`,
-        /// writing to `out`. `out.len == in.len`. NOT authenticated on its own.
+        /// writing to `out`. Panics (`chachapoly: ...`, in every build mode)
+        /// unless `out.len == in.len`. NOT authenticated on its own.
         ///
         /// `out` and `in` must be either the **same** slice (in-place, which is what
         /// the AEAD and every network consumer does) or **disjoint**. Partially
@@ -574,7 +583,7 @@ fn ChaChaStream(comptime rounds: comptime_int, comptime layout: Layout) type {
         /// `xor`'s body, one frame down so `burnFor` reaches what it left (see
         /// `burnStack`). The AEAD calls this directly and burns once itself.
         noinline fn xorBody(out: []u8, in: []const u8, counter: Counter, key: *const [key_length]u8, nonce: [nonce_length]u8) void {
-            std.debug.assert(out.len == in.len);
+            checkSameLen(out.len, in.len);
             // In EVERY build — see `counterWouldWrap`.
             if (wouldWrap(in.len, counter)) @panic(counter_wrap_message);
             // Short whole call -> std, before anything else happens. See
@@ -938,7 +947,9 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         const Cipher = ChaChaStream(rounds, .ietf);
         const Std = StdAeadOf(rounds);
 
-        /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
+        /// Encrypt `m` into `c` (panics unless `c.len == m.len`; `c` may be `m`
+        /// itself, or lie before it in one buffer, `c.ptr < m.ptr`; a partial
+        /// overlap with `c` after `m` is not supported) and write the auth tag to `tag`.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
             defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
             encryptBody(c, tag, m, ad, npub, &k);
@@ -952,7 +963,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
 
         /// `encrypt`'s body, one frame down so `burnFor` reaches what it left.
         noinline fn encryptBody(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) void {
-            std.debug.assert(c.len == m.len);
+            checkSameLen(c.len, m.len);
 
             // Short total -> run std's AEAD unchanged. See `aead_delegate_max`.
             // The branch is on the two LENGTHS, both of which are public: a
@@ -983,7 +994,11 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
             mac.final(tag);
         }
 
-        /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
+        /// Verify `tag` and decrypt `c` into `m` (panics unless `c.len == m.len`;
+        /// also `AuthenticationFailed` for a `c` beyond the 32-bit block counter,
+        /// about 256 GiB). `m` may be `c` itself, or lie before it in one buffer
+        /// (`m.ptr < c.ptr`); a partial overlap with `m` after `c` is not supported
+        /// and gives wrong output.
         /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
             defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
@@ -997,7 +1012,7 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
         }
 
         noinline fn decryptBody(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: *const [key_length]u8) AuthenticationError!void {
-            std.debug.assert(c.len == m.len);
+            checkSameLen(c.len, m.len);
 
             // Short total -> std's AEAD. Same public-length branch as `encrypt`;
             // see `aead_delegate_max`.
@@ -1019,6 +1034,11 @@ fn ChaChaPoly(comptime rounds: comptime_int) type {
                 return;
             }
             note(&aead_path, .wide);
+
+            // A ciphertext the 32-bit block counter cannot cover is not
+            // authentic: refuse before the MAC (the keystream pass below would
+            // `@panic` on it even after a valid tag).
+            if (refuseTooLong(m, c.len)) return error.AuthenticationFailed;
 
             var poly_key = @as([32]u8, @splat(0));
             Cipher.xorBody(poly_key[0..], poly_key[0..], 0, k, npub);
@@ -1073,7 +1093,9 @@ fn XChaChaPoly(comptime rounds: comptime_int) type {
 
         const Inner = ChaChaPoly(rounds);
 
-        /// Encrypt `m` into `c` (`c.len == m.len`) and write the auth tag to `tag`.
+        /// Encrypt `m` into `c` (panics unless `c.len == m.len`; `c` may be `m`
+        /// itself, or lie before it in one buffer, `c.ptr < m.ptr`; a partial
+        /// overlap with `c` after `m` is not supported) and write the auth tag to `tag`.
         pub fn encrypt(c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) void {
             defer burnFor(m.len + ad.len <= delegateLimit(aead_delegate_max));
             encryptBody(c, tag, m, ad, npub, &k);
@@ -1091,7 +1113,11 @@ fn XChaChaPoly(comptime rounds: comptime_int) type {
             Inner.encryptBody(c, tag, m, ad, e.nonce, &e.key);
         }
 
-        /// Verify `tag` and decrypt `c` into `m` (`c.len == m.len`).
+        /// Verify `tag` and decrypt `c` into `m` (panics unless `c.len == m.len`;
+        /// also `AuthenticationFailed` for a `c` beyond the 32-bit block counter,
+        /// about 256 GiB). `m` may be `c` itself, or lie before it in one buffer
+        /// (`m.ptr < c.ptr`); a partial overlap with `m` after `c` is not supported
+        /// and gives wrong output.
         /// On failure returns `error.AuthenticationFailed` and `m` is zeroed.
         pub fn decrypt(m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8, k: [key_length]u8) AuthenticationError!void {
             defer burnFor(c.len + ad.len <= delegateLimit(aead_delegate_max));
@@ -1119,6 +1145,20 @@ pub const XChaCha12Poly1305 = XChaChaPoly(12);
 /// XChaCha8-Poly1305 (24-byte nonce, HChaCha8), as `std`'s `XChaCha8Poly1305`.
 pub const XChaCha8Poly1305 = XChaChaPoly(8);
 
+/// True (with `m` zeroed) when a ciphertext of `c_len` bytes is beyond what
+/// the AEAD's block counter (starting at 1) can cover: `decrypt` then returns
+/// `error.AuthenticationFailed` without touching the MAC.
+fn refuseTooLong(m: []u8, c_len: usize) bool {
+    if (!counterWouldWrap(c_len, 1)) return false;
+    std.crypto.secureZero(u8, m);
+    return true;
+}
+
+/// Test-only access to internals (empty outside tests).
+pub const test_hooks = if (builtin.is_test) struct {
+    pub const refuse = refuseTooLong;
+} else struct {};
+
 /// Poly1305 zero-padding to the next 16-byte boundary.
 fn pad16(mac: *Poly1305, len: usize) void {
     if (len % 16 != 0) {
@@ -1137,6 +1177,7 @@ test {
     _ = @import("stackprobe_test.zig");
     _ = @import("stackprobe2_test.zig");
     _ = @import("count.zig");
+    _ = @import("sweep_test.zig");
 }
 
 // RFC 8439 §2.3.2 — ChaCha20 block function (counter = 1).
