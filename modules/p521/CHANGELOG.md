@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **CONSUMER-VISIBLE (fixes only):** no-panic sweep + blind review (§ GT). `Signature.der_encoded_length_max` 139 → 141: `fromBytes` accepts any 132 bytes, and `toDer` on an r/s with top byte ≥ 0x80 wrote 141 bytes into a 139-byte buffer (panic in safe builds, 2-byte stack overflow in ReleaseFast); valid signatures encode byte-identically. Tests: `src/sweep_test.zig` (also pins DER parse, SEC1 and ECDH edge cases).
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC brought up to Zig 0.17.0 (version statements, snippets, measurement labels).
 - **2026-10-18** — Test fix (big-endian only): the `fromBytesReduce(.little)` differential test built its bytes as `@bitCast(nativeToLittle(w))`; Zig 0.17's int -> array `@bitCast` is already little-endian on every target, so the swap reversed them on big-endian. Now `writeInt(.little)`. s390x (qemu) passes.
 - **2026-10-13** — Fix: the variable-time base-table walk indexed the table with a `u64` window digit, which does not compile on 32-bit targets (`check-portable` linux32 via dns → http → tlsclient); now `@intCast` (the digit is < 2^w).

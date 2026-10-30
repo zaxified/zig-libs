@@ -109,9 +109,11 @@ pub fn Ecdsa(comptime Hash: type) type {
         pub const Signature = struct {
             pub const encoded_length = 2 * scalar.encoded_length;
             /// 0x30 0x81 L ‖ (0x02 L r)(0x02 L s): each INTEGER is at most
-            /// 66 content bytes (a 66-byte r has top byte ≤ 0x01, so it never
-            /// needs a sign byte; a 65-byte one may, making 66 again).
-            pub const der_encoded_length_max = 3 + 2 * (2 + 66);
+            /// 67 content bytes. A valid (< n) r has top byte ≤ 0x01 and so
+            /// needs at most 66, but `fromBytes` takes any 66 bytes and
+            /// `toDer` must stay total for them: a top byte ≥ 0x80 adds a
+            /// sign byte (sweep P5-1).
+            pub const der_encoded_length_max = 3 + 2 * (2 + 67);
 
             r: scalar.CompressedScalar,
             s: scalar.CompressedScalar,
