@@ -55,9 +55,11 @@ pub const secret_length = SealedBox.secret_length;
 /// Bytes a sealed message adds over the plaintext (ephemeral pubkey + Poly1305 tag = 48).
 pub const overhead = SealedBox.seal_length;
 
-/// Ciphertext length for a plaintext of `plaintext_len` bytes.
+/// Ciphertext length for a plaintext of `plaintext_len` bytes. Saturates at
+/// `maxInt(usize)` instead of wrapping (sweep SB-1): the result is a size a
+/// caller allocates or compares with, and no real slice is that long.
 pub fn sealedLen(plaintext_len: usize) usize {
-    return plaintext_len + overhead;
+    return plaintext_len +| overhead;
 }
 
 // ── buffer API (no allocation) ────────────────────────────────────────────────
@@ -618,6 +620,7 @@ test {
     _ = @import("xsalsa20poly1305.zig");
     _ = @import("kat_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 // Value-returning shims for the tests below, which compare keys and texts
