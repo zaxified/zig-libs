@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GT) found nothing to fix (every `verify*` is total; argued in the sweep report); pin tests in `src/sweep_test.zig`.
 - **2026-10-18** — **NO CONSUMER-VISIBLE CHANGE:** Docs: README/SPEC statements that `std.crypto.random` is gone / std has no ambient entropy re-checked against the 0.17.0 std (still true).
 
 - **2026-10-18** — Ported to Zig 0.17.0: tests: `EnumSet.empty`, enum iteration via `field_values`.
