@@ -258,6 +258,15 @@ Rust std::process as fastest; spawn+wait ×2000, 8 concurrent spawners, 100 MB c
 - **pidfd signalling** (survey 2026-09-30): already deferred in the SPEC (closes the PID-reuse window). Effort medium. Fits §2.
 - **Pipelines (`a | b`)** (survey 2026-09-30): duct's headline feature; not a common need for the daemon use this module targets, listed as a gap for completeness. Effort large. Fits §2.
 
+**No-panic sweep § GO leftovers (2026-10-30)** — not fixed, with reasons (report: `~/CML/20261029-panic-sweep/procrun-sweep.report.md`):
+- `Handle.writeStdin` blocks the calling thread until the child reads (documented); there is no deadline variant. A caller that needs one writes from its own thread.
+- `run` without `runTimeout`/`Spec.cancel` waits for pipe EOF without bound (documented); a descendant holding the pipe holds `run`.
+- A child that exits on its own without reading all of `stdin_body` makes `run`/`runTimeout` return `error.BrokenPipe` and drop the captured output (documented, bxp relies on it; not a crash). When procrun itself kills the child (deadline/cancel) the EPIPE is swallowed and the `Output` returned with `timed_out`/`canceled` (D9, 2026-10-30).
+- REV-PR-1 (D7, caller contract, documented 2026-10-30): streaming `Handle.wait` does not close stdin or lift backpressure on entry (bxp and ttydesk call it on a waiter thread while another thread acks); a child that reads stdin to EOF needs `closeStdin` first, and the consumer must keep acking while `wait` runs.
+- REV-PR-2 (D8, 2026-10-30): `Handle.wait` observes the child's exit without reaping (`waitid WNOWAIT`, Linux), then readers stop once the pipe has been idle 250 ms (`default_pump_grace_ns`, not configurable; idle = inside `poll` only, never during callbacks or backpressure parking). Join-before-reap and `on_exit`-after-last-chunk unchanged. A descendant that keeps writing keeps the stream alive (remedy: `new_process_group` + `killGroup`). Before the exit the readers wait in 500 ms `poll` slices. Windows: unchanged.
+- **Refcounted `Handle` for watchdog threads** (D10): `Handle.kill`/`cancel`/`signal*`/`terminate` from another thread racing `Handle.wait` is a use-after-free of the context (`wait` frees it); documented as not allowed. A refcounted handle would lift that.
+- NUL bytes inside `argv`/`env` strings truncate the C string silently on the vfork path (`argv` is trusted-by-construction; use `runValidated` for untrusted input).
+
 ## Status
 
 `extract · any (full behavior on POSIX; reap-race handling, new_process_group, and rlimit are

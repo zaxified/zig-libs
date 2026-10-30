@@ -515,7 +515,9 @@ fn deliver(child: *std.process.Child, kind: SigKind, raw: u8) void {
                 .raw => @fromBackingInt(@intCast(raw)),
             };
             if (!stillOurChild(id)) return; // see `stillOurChild`
-            std.posix.kill(id, sig) catch {};
+            // sweep PR-3: not `std.posix.kill` -- it has `.INVAL => unreachable`
+            // and `Handle.signal` takes any u8 (200 is EINVAL, not a bug here).
+            _ = std.posix.system.kill(id, sig);
         },
     }
 }
@@ -572,7 +574,7 @@ fn deliverGroup(child: *std.process.Child, kind: SigKind, raw: u8, grouped: bool
                 .raw => @fromBackingInt(@intCast(raw)),
             };
             if (!stillOurChild(id)) return; // see `stillOurChild`
-            std.posix.kill(-id, sig) catch {};
+            _ = std.posix.system.kill(-id, sig); // sweep PR-3, see `deliver`
         },
     }
 }
@@ -947,7 +949,9 @@ fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) 
 }
 
 fn ceilDiv(numerator: u64, denominator: u64) u64 {
-    return (numerator + denominator - 1) / denominator;
+    // sweep PR-2: `numerator + denominator - 1` overflowed for numerators near
+    // maxInt(u64) (panic in safe modes, a silently tiny limit in ReleaseFast).
+    return numerator / denominator + @intFromBool(numerator % denominator != 0);
 }
 
 /// Builds the `/bin/sh -c '<ulimit ...>; exec "$@"' sh <argv...>` wrapper
@@ -1164,13 +1168,62 @@ const WriteJob = struct {
     file: std.Io.File,
     data: []const u8,
     err: *?anyerror,
+    /// Same meaning as `Drainer.deadline_ns` / `Drainer.stop_ns`. When either
+    /// is set (Linux) the write is bounded: sweep PR-4.
+    deadline_ns: ?u64 = null,
+    stop_ns: ?*const std.atomic.Value(u64) = null,
 };
 
 fn writeLoop(w: WriteJob) void {
     defer w.file.close(w.io);
+    if (builtin.os.tag == .linux and (w.deadline_ns != null or w.stop_ns != null)) {
+        writeLoopBounded(w);
+        return;
+    }
     w.file.writeStreamingAll(w.io, w.data) catch |e| {
         w.err.* = e;
     };
+}
+
+/// sweep PR-4: a blocking `write` to the child's stdin has no deadline, so a
+/// descendant that inherited the pipe's read end and never reads it kept
+/// `runTimeout` waiting for the write (and `pumps.join` with it) long past
+/// its deadline. Here the parent's write end -- its own open file
+/// description, `pipe(2)` makes two -- is made non-blocking and written under
+/// `poll`, honouring the same deadlines as the drain threads. On expiry the
+/// rest of the body is silently dropped: the caller learns of the deadline
+/// through `Output.timed_out` / `Output.canceled`, which the killer sets at
+/// its own (earlier) deadline.
+fn writeLoopBounded(w: WriteJob) void {
+    const L = std.os.linux;
+    const fd = w.file.handle;
+    const fl = L.fcntl(fd, L.F.GETFL, 0);
+    if (L.errno(fl) == .SUCCESS) {
+        var flags: L.O = @bitCast(@as(u32, @truncate(fl)));
+        flags.NONBLOCK = true;
+        _ = L.fcntl(fd, L.F.SETFL, @as(usize, @as(u32, @bitCast(flags))));
+    }
+    var rest = w.data;
+    while (rest.len > 0) {
+        const late: u64 = if (w.stop_ns) |s| s.load(.acquire) else no_deadline;
+        const deadline: u64 = if (w.deadline_ns) |dl| @min(dl, late) else late;
+        const ms = remainingMs(deadline);
+        if (ms == 0) return; // deadline: drop the rest (see above)
+        const rc = L.write(fd, rest.ptr, @min(rest.len, 1 << 20));
+        switch (L.errno(rc)) {
+            .SUCCESS => rest = rest[rc..],
+            .INTR => {},
+            .AGAIN => _ = pollReady(fd, std.posix.POLL.OUT, @min(ms, cancel_poll_slice_ms)),
+            .PIPE => {
+                w.err.* = error.BrokenPipe;
+                return;
+            },
+            else => {
+                w.err.* = error.Unexpected;
+                return;
+            },
+        }
+    }
 }
 
 /// Owns the up-to-three pump threads for a blocking run. Lives on the caller's
@@ -1256,6 +1309,8 @@ const Pumps = struct {
                 .file = f,
                 .data = stdin_body,
                 .err = &p.in_err,
+                .deadline_ns = deadline_ns,
+                .stop_ns = if (p.cancelable) &p.stop_ns else null,
             }}) catch |e| {
                 f.close(p.io);
                 return e;
@@ -1286,6 +1341,12 @@ const Pumps = struct {
 
 /// Spawn `spec`, write `stdin_body` (only if `spec.stdin == .pipe`), capture
 /// stdout/stderr up to `spec.max_output_bytes`, and wait reap-race-tolerantly.
+///
+/// `stdin_body` and a child that stops reading: if the child exits on its own
+/// before taking the whole body, the call returns `error.BrokenPipe` (the
+/// captured output is dropped). If the call itself killed the child
+/// (`runTimeout` deadline, `Spec.cancel`) the resulting EPIPE is not an error:
+/// the `Output` is returned with `timed_out` / `canceled` set.
 /// Caller owns `Output.stdout`/`Output.stderr` (`Output.deinit`).
 pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u8) !Output {
     if (spec.cancel != null) return runKilled(gpa, io, spec, stdin_body, null);
@@ -1354,7 +1415,7 @@ fn runKilled(
     // could race `killerLoop` into skipping the kill entirely (it checks
     // `done` right before delivering the signal), and the child would then
     // never be reaped at all: `waitTolerant` blocks until it actually exits.
-    const pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
+    const pump_grace_ns: u64 = default_pump_grace_ns;
     const pump_deadline_ns: ?u64 = if (timeout_ns) |t| start_ns +| t +| (spec.cancel_grace_ns orelse 0) +| pump_grace_ns else null;
     try pumps.start(spec.max_output_bytes, stdin_body, pump_deadline_ns);
 
@@ -1407,6 +1468,14 @@ fn runKilled(
     killer_wake.set(io);
     killer.join();
 
+    // A stdin writer that hit EPIPE because THIS call killed the child
+    // (deadline or cancel) is not a failure: the caller gets the Output with
+    // `timed_out`/`canceled` set and the captured data (sweep D9; Python's
+    // `communicate` does the same). A child that exits early on its own still
+    // surfaces `error.BrokenPipe` (documented, bxp relies on it).
+    if (pumps.in_err) |e| {
+        if (e == error.BrokenPipe and (timed_out.load(.acquire) or canceled.load(.acquire))) pumps.in_err = null;
+    }
     if (pumps.firstErr()) |e| return e;
     var out = try finish(&pumps, waitTolerantExit(io, &child));
     out.canceled = canceled.load(.acquire);
@@ -1750,7 +1819,42 @@ const StreamCtx = struct {
     grouped: bool,
     t_out: ?std.Thread = null,
     t_err: ?std.Thread = null,
+    /// Set by `Handle.wait` once it has seen the direct child exit (without
+    /// reaping it). From then on a reader that finds the pipe idle for
+    /// `default_pump_grace_ns` stops (sweep D8).
+    exited: std.atomic.Value(bool) = .init(false),
+
+    /// One read for a reader thread. Returns 0 (like EOF) when the child is
+    /// known to be gone (`exited`) and the pipe stayed idle for the grace.
+    /// The idle clock is only ever running inside the `poll` below, i.e. never
+    /// while the reader is parked on backpressure or inside a callback, so a
+    /// slow consumer never loses the tail written before the exit. POSIX only;
+    /// Windows keeps the plain blocking read.
+    ///
+    /// Why a `poll` at all before the exit: a thread blocked in `read` cannot
+    /// be told that the child exited, so it waits in `poll` in slices of
+    /// `stream_poll_slice_ms` (data wakes it at once; an idle long-lived
+    /// stream costs 2 wakeups/s per reader).
+    fn readBounded(ctx: *StreamCtx, f: std.Io.File, buf: []u8) !usize {
+        if (builtin.os.tag != .windows) {
+            while (true) {
+                const gone = ctx.exited.load(.acquire);
+                const ms: i32 = if (gone) @intCast(default_pump_grace_ns / std.time.ns_per_ms) else stream_poll_slice_ms;
+                if (pollReady(f.handle, std.posix.POLL.IN, ms)) break;
+                if (gone) return 0;
+            }
+        }
+        return f.readStreaming(ctx.io, &.{buf});
+    }
 };
+
+/// How long a streaming reader waits in one `poll` before it looks at
+/// `StreamCtx.exited` again.
+const stream_poll_slice_ms: i32 = 500;
+
+/// Idle time after the direct child's exit before `Handle.wait`'s readers
+/// give up on a descendant that holds the pipes open.
+const default_pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
 
 /// Returned by `Handle.writeStdin`/`closeStdin` when there is no writable
 /// stdin pipe left — either `Spec.stdin` was not `.pipe` at spawn time, or
@@ -1849,8 +1953,16 @@ pub const Handle = struct {
     }
 
     /// Release one stdout backpressure permit (call after consuming a chunk).
+    /// Keep acking while `wait` runs (it commonly runs on another thread):
+    /// `wait` does not lift backpressure.
     pub fn ack(h: Handle) void {
-        h.ctx.sema.post(h.ctx.io);
+        // sweep PR-1: `Semaphore.post` is `permits += 1`, which overflows once
+        // `wake` (or a huge `stream_permits`) has saturated the count.
+        const sema = &h.ctx.sema;
+        sema.mutex.lockUncancelable(h.ctx.io);
+        defer sema.mutex.unlock(h.ctx.io);
+        sema.permits +|= 1;
+        sema.cond.signal(h.ctx.io);
     }
 
     /// Write to the child's stdin (requires `Spec.stdin = .pipe`). Safe to
@@ -1877,9 +1989,9 @@ pub const Handle = struct {
     /// a line-based protocol — only respond/exit once stdin closes). Safe to
     /// call at most once; a second call is rejected with
     /// `error.StdinUnavailable` rather than double-closing the fd. `wait`
-    /// also closes stdin if still open, so calling this before `wait` is
-    /// optional — it exists for callers that need EOF delivered BEFORE they
-    /// start waiting (e.g. to make the child produce its final output).
+    /// closes a still-open stdin only AFTER the child has exited, so a child
+    /// that reads stdin to EOF before exiting (`cat`) needs this call first or
+    /// `wait` blocks until the child is killed.
     ///
     /// MUST NOT be called concurrently with `writeStdin` or `wait` — see
     /// `writeStdin`.
@@ -1889,9 +2001,39 @@ pub const Handle = struct {
         h.ctx.child.stdin = null;
     }
 
-    /// Block until the child exits, then reap + fire `on_exit` + free state.
+    /// Block until the child exits, then join the readers, reap + fire
+    /// `on_exit` + free state. `on_exit` fires after the last `on_stdout` /
+    /// `on_stderr` callback.
+    ///
+    /// `wait` does NOT close stdin or lift backpressure on entry. A child that
+    /// reads stdin to EOF needs `closeStdin` first (`wait` closes a still-open
+    /// stdin only after the child has exited). The consumer must keep calling
+    /// `ack` while `wait` runs; `wait` commonly runs on another thread than
+    /// the one acking.
+    ///
+    /// Descendants (sweep D8): once the direct child has exited, the readers
+    /// stop when the pipe has been idle for 250 ms (idle = no data and no
+    /// EOF; time spent in callbacks or parked on backpressure does not count,
+    /// so a slow consumer still receives everything written before the exit).
+    /// A descendant that keeps the pipe open but silent is therefore not
+    /// waited for, and what it writes after the idle period is dropped (same
+    /// idea as `runTimeout`'s grace). A descendant that keeps WRITING keeps
+    /// the stream alive, like a child that never exits: spawn with
+    /// `new_process_group` and `killGroup`. Windows: readers always run to
+    /// EOF.
+    ///
+    /// Not thread-safe against the other methods: once `wait` has started, no
+    /// other method of this handle may be called from another thread (`wait`
+    /// frees the handle). Stop a child from a watchdog thread BEFORE `wait`
+    /// starts, or serialise on the owning thread.
     pub fn wait(h: Handle) Term {
         const ctx = h.ctx;
+        if (builtin.os.tag == .linux) {
+            // Observe the exit without reaping (a reap-race ECHILD counts as
+            // exited), so the idle deadline can be armed for the readers.
+            waitExitNoReap(&ctx.child);
+            ctx.exited.store(true, .release);
+        }
         if (ctx.t_out) |t| t.join();
         if (ctx.t_err) |t| t.join();
         const term = waitTolerant(ctx.io, &ctx.child);
@@ -1905,8 +2047,16 @@ pub const Handle = struct {
 fn wake(ctx: *StreamCtx) void {
     // Unblock a reader parked on the backpressure semaphore so a cancel/kill
     // can't leave it stuck past the child's death.
-    var i: usize = 0;
-    while (i <= ctx.permits) : (i += 1) ctx.sema.post(ctx.io);
+    //
+    // sweep PR-1: this used to be `permits + 1` single `post`s, i.e. O(permits)
+    // (a huge `stream_permits` made cancel/kill spin, and `post`'s `+= 1`
+    // overflowed at maxInt). Same effect in O(1): add `permits + 1`
+    // saturating, under the semaphore's own lock, and wake every waiter.
+    const io = ctx.io;
+    ctx.sema.mutex.lockUncancelable(io);
+    defer ctx.sema.mutex.unlock(io);
+    ctx.sema.permits +|= ctx.permits +| 1;
+    ctx.sema.cond.broadcast(io);
 }
 
 /// Spawn `spec` and stream stdout/stderr to `cb` in real time. stdout chunks
@@ -1917,6 +2067,9 @@ pub fn spawnStreaming(gpa: std.mem.Allocator, io: std.Io, spec: Spec, cb: Callba
     ensureChildReaping();
     const ctx = try gpa.create(StreamCtx);
     errdefer gpa.destroy(ctx);
+    // sweep PR-1: 0 permits parked the reader before the first chunk and
+    // nothing could ever release it (hang).
+    const permits = @max(spec.stream_permits, 1);
 
     // Everything downstream operates on ctx.child (a single owner); the reader
     // threads null its pipe fields as they take them over.
@@ -1925,8 +2078,8 @@ pub fn spawnStreaming(gpa: std.mem.Allocator, io: std.Io, spec: Spec, cb: Callba
         .io = io,
         .child = try spawnChild(gpa, io, spec),
         .cb = cb,
-        .permits = spec.stream_permits,
-        .sema = .{ .permits = spec.stream_permits },
+        .permits = permits,
+        .sema = .{ .permits = permits },
         .grouped = spec.new_process_group,
     };
     errdefer ctx.child.kill(io);
@@ -1961,7 +2114,7 @@ fn streamOutLoop(ctx: *StreamCtx) void {
         defer framer.deinit();
         const sink: StreamLineSink = .{ .ctx = ctx };
         while (true) {
-            const n = f.readStreaming(io, &.{rbuf[0..]}) catch break;
+            const n = ctx.readBounded(f, rbuf[0..]) catch break;
             if (n == 0) break;
             framer.feed(rbuf[0..n], sink);
         }
@@ -1969,7 +2122,7 @@ fn streamOutLoop(ctx: *StreamCtx) void {
         return;
     }
     while (true) {
-        const n = f.readStreaming(io, &.{rbuf[0..]}) catch break;
+        const n = ctx.readBounded(f, rbuf[0..]) catch break;
         if (n == 0) break;
         ctx.sema.waitUncancelable(io);
         if (ctx.cb.on_stdout) |cbf| cbf(ctx.cb.ctx, rbuf[0..n]);
@@ -2040,7 +2193,7 @@ fn streamErrLoop(ctx: *StreamCtx) void {
     defer f.close(io);
     var rbuf: [8192]u8 = undefined;
     while (true) {
-        const n = f.readStreaming(io, &.{rbuf[0..]}) catch break;
+        const n = ctx.readBounded(f, rbuf[0..]) catch break;
         if (n == 0) break;
         if (ctx.cb.on_stderr) |cbf| cbf(ctx.cb.ctx, rbuf[0..n]);
     }
@@ -3906,4 +4059,5 @@ test "Output.core_dumped and Output.rusage" {
 test {
     // External evidence: replay of frozen Python `subprocess` results.
     _ = @import("oracle_test.zig");
+    _ = @import("sweep_test.zig");
 }
