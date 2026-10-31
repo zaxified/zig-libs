@@ -20,6 +20,7 @@ const encoder = @import("encoder.zig");
 
 pub const DecodeError = decoder.Error;
 pub const DecodeOptions = decoder.Options;
+pub const default_max_output = decoder.default_max_output;
 pub const Format = decoder.Format;
 pub const Lzma1Props = decoder.Lzma1Props;
 pub const decompress = decoder.decompress;
@@ -53,4 +54,5 @@ test {
     _ = @import("encoder_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("golden_test.zig");
+    _ = @import("sweep_test.zig");
 }

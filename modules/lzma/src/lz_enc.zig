@@ -269,7 +269,10 @@ pub const Mf = struct {
         const subvalue = must_normalize_pos - mf.cyclic_size;
         for (mf.hash) |*h| h.* = if (h.* <= subvalue) 0 else h.* - subvalue;
         for (mf.son) |*s| s.* = if (s.* <= subvalue) 0 else s.* - subvalue;
-        mf.offset -= subvalue;
+        // Modular on purpose (liblzma's uint32 `offset -= subvalue`): the offset is
+        // normally BELOW subvalue here (read_pos > cyclic_size), and read_pos +% offset
+        // lands on cyclic_size again. A plain `-=` panics at >= 4 GiB of input.
+        mf.offset -%= subvalue;
     }
 
     inline fn movePos(mf: *Mf) void {
@@ -679,3 +682,23 @@ pub const Mf = struct {
         }
     }
 };
+
+test "normalize: the offset wraps like liblzma's, no overflow panic at 4 GiB of input (sweep LZ-2)" {
+    const gpa = std.testing.allocator;
+    var mf = try Mf.init(gpa, .{ .before_size = 4096, .dict_size = 4096, .after_size = 4097, .match_len_max = 273, .nice_len = 64, .match_finder = .hc4, .depth = 4 });
+    defer mf.deinit(gpa);
+    var data: [20000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 7 +% (i >> 5));
+    var pos: usize = 0;
+    _ = mf.fillWindow(&data, &pos, .run);
+    mf.skip(5000); // read_pos is now past cyclic_size (4097)
+    try std.testing.expect(mf.read_pos > mf.cyclic_size);
+    // Pretend ~4 GiB went by: the next movePos reaches the position that must normalise.
+    mf.offset = std.math.maxInt(u32) - mf.read_pos - 1;
+    var matches: [274]Match = undefined;
+    var cnt: u32 = 0;
+    _ = mf.find(&cnt, &matches);
+    // After normalisation positions restart at cyclic_size.
+    try std.testing.expectEqual(mf.cyclic_size, mf.read_pos +% mf.offset);
+    _ = mf.find(&cnt, &matches);
+}

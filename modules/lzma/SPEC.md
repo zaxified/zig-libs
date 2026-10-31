@@ -153,6 +153,7 @@ None claimed: the data is public. There is no secret in this module.
 - **B2** Parallel blocks (`xz -T`), after B1.
 - **B3** BCJ x86 / ARM64 / delta in the decoder (small) and encoder.
 - **B4** Decoder speed: 1.19–1.27× liblzma, target 1.1×. Done: next-node probability preloaded for both outcomes in bit trees, branchless direct bits and prob update, match copy by size class (overlapping fixed-size moves), branchless refill in tree bits, pointer cursor over the input. Measured (perf stat, one decode of text.6): ours ~1.3× the instructions of xz 5.8.3 at about the same mispredict count; x86-64 inline asm in liblzma's schedule gave no gain here and was dropped. Remaining ideas: matched-literal path, per-symbol glue (state/dict.prev/literal setup), a ring with slack so copies can overshoot.
+- **B6** Encoder time is caller-bounded: `LzmaOptions.depth` (and `nice_len`) are not capped, a huge `depth` on repetitive data makes each byte cost up to a dictionary of chain steps (liblzma behaves the same). Not a crash; cap only if a consumer ever takes `depth` from untrusted input.
 - **B5** zipstream convenience: a function that writes / reads the 9-byte ZIP method 14 header.
 
 ## Open

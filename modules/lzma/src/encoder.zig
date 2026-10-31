@@ -20,9 +20,10 @@ pub const MatchFinder = lz.MatchFinder;
 /// `nice_len` and `depth`.
 pub const LzmaOptions = le.Options;
 
-/// `lzma_lzma_preset`: the xz presets 0..9, `-e` as `extreme`.
-pub fn preset(level: u4, extreme: bool) LzmaOptions {
-    std.debug.assert(level <= 9);
+/// `lzma_lzma_preset`: the xz presets 0..9, `-e` as `extreme`. A level above 9
+/// is 9.
+pub fn preset(level_in: u4, extreme: bool) LzmaOptions {
+    const level = @min(level_in, 9);
     const dict_pow2 = [_]u5{ 18, 20, 21, 22, 22, 23, 23, 24, 25, 26 };
     var o: LzmaOptions = .{ .lc = 3, .lp = 0, .pb = 2, .dict_size = @as(u32, 1) << dict_pow2[level] };
     if (level <= 3) {
@@ -493,8 +494,10 @@ pub const StreamWriter = struct {
     writer: Writer,
     enc: Encoder,
     /// Why the last `error.WriteFailed` came from here rather than from the
-    /// output. Null when the output failed.
-    err: ?std.mem.Allocator.Error = null,
+    /// output: `OutOfMemory`, or `AlreadyFinished` for a `finish` after
+    /// `finish` and for a write after a failed `finish`. Null when the output
+    /// failed.
+    err: ?(std.mem.Allocator.Error || error{AlreadyFinished}) = null,
 
     const vtable: Writer.VTable = .{ .drain = drain };
 
@@ -522,7 +525,7 @@ pub const StreamWriter = struct {
 
     fn fail(sw: *StreamWriter, e: WriteError) Writer.Error {
         if (e == error.WriteFailed) return error.WriteFailed;
-        sw.err = @errorCast(e);
+        sw.err = @errorCast(e); // e is never WriteFailed here, and the field type holds the rest
         return error.WriteFailed;
     }
 

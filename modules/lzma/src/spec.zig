@@ -11,6 +11,7 @@ const enc = @import("encoder.zig");
 pub fn parse(spec: []const u8) !enc.LzmaOptions {
     var it = std.mem.splitScalar(u8, spec, ',');
     const first = it.next().?;
+    if (first.len == 0) return error.BadSpec;
     const extreme = first[first.len - 1] == 'e';
     const level = try std.fmt.parseInt(u4, if (extreme) first[0 .. first.len - 1] else first, 10);
     var o = enc.preset(level, extreme);

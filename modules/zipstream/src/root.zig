@@ -282,7 +282,9 @@ const LzmaCodec = struct {
     fn open(gpa: Allocator, input: *std.Io.Reader, format: lzma.Format) anyerror!CodecReader {
         const s = try gpa.create(R);
         errdefer gpa.destroy(s);
-        s.r = try lzma.DecompressReader.init(gpa, input, &s.buf, format, .{ .multi_stream = false });
+        // `.max_output = null`: the entry cap (`max_entry`) is enforced above this codec,
+        // so lzma's own 256 MiB default must not override it (as for bzip2, GT lesson).
+        s.r = try lzma.DecompressReader.init(gpa, input, &s.buf, format, .{ .multi_stream = false, .max_output = null });
         return .{ .reader = &s.r.reader, .state = s, .close = closeReader };
     }
 

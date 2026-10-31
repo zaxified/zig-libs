@@ -40,14 +40,20 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// `Options.max_output`'s default: 256 MiB (as bzip2's and brotli's).
+pub const default_max_output: u64 = 256 << 20;
+
 pub const Options = struct {
     /// The largest dictionary a stream may ask for, in bytes. The decoder
     /// allocates it (rounded up to 16, at most the output the stream can have)
     /// before decoding, so this is the memory guard against a hostile header.
     /// xz's preset 9 uses 64 MiB.
     max_dict: u32 = 64 << 20,
-    /// The most output bytes; one byte over is `error.OutputTooLarge`.
-    max_output: u64 = std.math.maxInt(u64),
+    /// Decompression-bomb cap: the most output bytes in total, for the one-shot
+    /// and the streaming decoders alike; one byte over is `error.OutputTooLarge`.
+    /// The default is 256 MiB; `null` is the explicit opt-out for callers that
+    /// bound the output elsewhere.
+    max_output: ?u64 = default_max_output,
     /// `.xz` only: read concatenated streams (and the zero padding between
     /// them) to the end of the input; if false, stop after the first stream.
     multi_stream: bool = true,
@@ -60,6 +66,9 @@ pub const Options = struct {
 /// The five property bytes of an LZMA1 stream: lc/lp/pb and the dictionary
 /// size. The first bytes of a `.lzma` file, and what ZIP method 14 carries
 /// after its 4-byte header.
+const invalid_props_msg = "lzma: invalid Lzma1Props";
+const empty_buffer_msg = "lzma: input reader needs a non-empty buffer";
+
 pub const Lzma1Props = struct {
     lc: u8,
     lp: u8,
@@ -73,7 +82,10 @@ pub const Lzma1Props = struct {
         return .{ .lc = p.lc, .lp = p.lp, .pb = p.pb, .dict_size = std.mem.readInt(u32, b[1..5], .little) };
     }
 
+    /// The five bytes for `p`. Props that `fromBytes` would refuse (lc + lp > 4,
+    /// pb > 4) are a caller bug: checked panic "lzma: invalid Lzma1Props".
     pub fn toBytes(p: Lzma1Props) [5]u8 {
+        if (@as(u16, p.lc) + p.lp > c.lclp_max or p.pb > c.pb_max) @panic(invalid_props_msg);
         var b: [5]u8 = undefined;
         b[0] = (c.Lclppb{ .lc = p.lc, .lp = p.lp, .pb = p.pb }).encode();
         std.mem.writeInt(u32, b[1..5], p.dict_size, .little);
@@ -134,6 +146,8 @@ pub const Decoder = struct {
     gpa: std.mem.Allocator,
     in: *Reader,
     opts: Options,
+    /// `opts.max_output` with null resolved to maxInt once (the hot paths compare it).
+    max_out: u64,
     format: Format,
     lz: *dec.Lzma,
     dict: dec.Dict = .{ .buf = &.{} },
@@ -166,10 +180,13 @@ pub const Decoder = struct {
     index: xzfmt.IndexHash = .{},
     stream_started: bool = false,
 
-    /// `in` needs a non-empty buffer (an empty one cannot take a byte).
+    /// `in` needs a non-empty buffer (an empty one cannot take a byte): a
+    /// zero-capacity reader that is not `Reader.fixed` is a checked panic
+    /// "lzma: input reader needs a non-empty buffer" (std would assert later).
     pub fn init(gpa: std.mem.Allocator, in: *Reader, format: Format, opts: Options) error{OutOfMemory}!Decoder {
+        if (in.buffer.len == 0 and in.vtable.rebase == Reader.defaultRebase) @panic(empty_buffer_msg);
         const lz = try gpa.create(dec.Lzma);
-        return .{ .gpa = gpa, .in = in, .opts = opts, .format = format, .lz = lz };
+        return .{ .gpa = gpa, .in = in, .opts = opts, .max_out = opts.max_output orelse std.math.maxInt(u64), .format = format, .lz = lz };
     }
 
     pub fn deinit(d: *Decoder) void {
@@ -224,7 +241,7 @@ pub const Decoder = struct {
         size = (size + 15) & ~@as(u64, 15);
         var cap: u64 = std.math.maxInt(u64);
         if (known) |k| cap = @min(cap, k);
-        if (d.opts.max_output != std.math.maxInt(u64)) cap = @min(cap, d.opts.max_output +| 1);
+        if (d.max_out != std.math.maxInt(u64)) cap = @min(cap, d.max_out +| 1);
         // A ring that can wrap is a multiple of 16; one that cannot is only
         // as large as the output.
         if (cap < size) size = @max(cap, 1);
@@ -301,11 +318,11 @@ pub const Decoder = struct {
     fn produce(d: *Decoder, dest: []u8) Error!usize {
         var want: usize = @min(dest.len, d.dict.buf.len - d.dict.pos);
         if (d.seg_known) want = @intCast(@min(@as(u64, want), d.seg_left));
-        if (d.opts.max_output != std.math.maxInt(u64)) {
-            const room = d.opts.max_output +| 1 - d.total_out;
+        if (d.max_out != std.math.maxInt(u64)) {
+            const room = d.max_out +| 1 - d.total_out;
             want = @intCast(@min(@as(u64, want), room));
         }
-        if (want == 0) return if (d.total_out > d.opts.max_output or d.dict.pos < d.dict.buf.len) error.OutputTooLarge else error.CorruptData;
+        if (want == 0) return if (d.total_out > d.max_out or d.dict.pos < d.dict.buf.len) error.OutputTooLarge else error.CorruptData;
         const start = d.dict.pos;
         if (d.seg_copy) {
             const slot = d.dict.buf[start..][0..want];
@@ -328,7 +345,7 @@ pub const Decoder = struct {
             d.total_out += n;
             d.block_out += n;
             if (d.phaseIsXz()) d.check.update(dest[0..n]);
-            if (d.total_out > d.opts.max_output) return error.OutputTooLarge;
+            if (d.total_out > d.max_out) return error.OutputTooLarge;
         }
         return n;
     }
@@ -605,7 +622,8 @@ pub const Decoder = struct {
     }
 };
 
-/// Decompress a whole buffer. Caller owns the result.
+/// Decompress a whole buffer. Caller owns the result. The output is capped by
+/// `opts.max_output` (256 MiB by default, `null` for none).
 pub fn decompress(gpa: std.mem.Allocator, input: []const u8, format: Format, opts: Options) Error![]u8 {
     var in: Reader = .fixed(input);
     var out: Writer.Allocating = .init(gpa);
@@ -692,4 +710,31 @@ fn refillReadVec(r: *std.Io.Reader, data: [][]u8) std.Io.Reader.Error!usize {
     r.seek = 0;
     r.end = live;
     return std.Io.Reader.defaultReadVec(r, data);
+}
+
+test "Options.max_output: the default is 256 MiB, an explicit value and null win (sweep LZ-6)" {
+    const gpa = std.testing.allocator;
+    const f: Format = .{ .lzma2 = .{ .dict_size = 4096 } };
+    const stored = [_]u8{ 1, 0, 9 } ++ ("0123456789".*) ++ [_]u8{0};
+    try std.testing.expectEqual(@as(u64, 256 << 20), default_max_output);
+    try std.testing.expectEqual(@as(?u64, default_max_output), (Options{}).max_output);
+    // The boundary through the public one-shot and the streaming entry points.
+    try std.testing.expectError(error.OutputTooLarge, decompress(gpa, &stored, f, .{ .max_output = 9 }));
+    const exact = try decompress(gpa, &stored, f, .{ .max_output = 10 });
+    gpa.free(exact);
+    const unlimited = try decompress(gpa, &stored, f, .{ .max_output = null });
+    gpa.free(unlimited);
+    var in: Reader = .fixed(&stored);
+    var sink: Writer.Allocating = .init(gpa);
+    defer sink.deinit();
+    try std.testing.expectError(error.OutputTooLarge, decompressStream(gpa, &in, &sink.writer, f, .{ .max_output = 9 }));
+    // A decoder made with the default resolves it to the 256 MiB cap, null to none.
+    var in2: Reader = .fixed(&stored);
+    var d = try Decoder.init(gpa, &in2, f, .{});
+    defer d.deinit();
+    try std.testing.expectEqual(default_max_output, d.max_out);
+    var in3: Reader = .fixed(&stored);
+    var d3 = try Decoder.init(gpa, &in3, f, .{ .max_output = null });
+    defer d3.deinit();
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), d3.max_out);
 }
