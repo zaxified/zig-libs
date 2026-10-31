@@ -377,6 +377,10 @@ pub const Transport = struct {
     /// TTL. Null for a transport that cannot (`traceWith` then refuses
     /// `Method.udp` with `error.InvalidOptions`).
     sendUdpFn: ?*const fn (ctx: *anyopaque, ttl: u8, dst_port: u16, payload: []const u8) TransportError!void = null,
+    /// `MtrSet`: send one echo-request probe to `dest` (not the transport's
+    /// own destination) with the given TTL. Null for a transport that
+    /// cannot (`MtrSet.round` then fails with `error.SendFailed`).
+    sendToFn: ?*const fn (ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, packet: []const u8) TransportError!void = null,
     /// Receive one packet into `buf` within `timeout_ns`; null on timeout.
     recvFn: *const fn (ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet,
     /// Monotonic clock, nanoseconds.
@@ -1119,6 +1123,13 @@ pub const Mtr = struct {
             if (i == n) break;
         }
 
+        m.finishRound(got);
+    }
+
+    /// Folds one round's answers (`got[k]` for TTL index k, `got.len` =
+    /// the TTLs probed) into the statistics and moves the path's end.
+    fn finishRound(m: *Mtr, got: []const Probe) void {
+        const n = got.len;
         m.rounds +%= 1;
         for (got, 0..) |p, k| m.hop_buf[k].record(p);
         @memcpy(m.last_buf[0..n], got);
@@ -1304,6 +1315,7 @@ pub const LinuxTransport = struct {
             .strip_ip_header = lt.sock.family == .v4 and lt.sock.kind == .raw,
             .sendFn = sendImpl,
             .sendUdpFn = if (lt.udp_fd != null) sendUdpImpl else null,
+            .sendToFn = if (lt.udp_fd == null) sendToImpl else null,
             .recvFn = recvImpl,
             .nowFn = nowImpl,
         };
@@ -1348,6 +1360,19 @@ pub const LinuxTransport = struct {
 
     fn sendImpl(ctx: *anyopaque, ttl: u8, packet: []const u8) TransportError!void {
         const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        return lt.sendProbe(lt.dest, ttl, packet);
+    }
+
+    fn sendToImpl(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, packet: []const u8) TransportError!void {
+        const lt: *LinuxTransport = @ptrCast(@alignCast(ctx));
+        const to: DestAddr = switch (dest) {
+            .v4 => |q| if (lt.sock.family == .v4) .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &q) } } else return error.SendFailed,
+            .v6 => |b| if (lt.sock.family == .v6) .{ .v6 = .{ .port = 0, .flowinfo = 0, .addr = b, .scope_id = 0 } } else return error.SendFailed,
+        };
+        return lt.sendProbe(to, ttl, packet);
+    }
+
+    fn sendProbe(lt: *LinuxTransport, dest: DestAddr, ttl: u8, packet: []const u8) TransportError!void {
         const v: u32 = ttl;
         const rc = switch (lt.sock.family) {
             .v4 => linux.setsockopt(lt.sock.fd, linux.SOL.IP, linux.IP.TTL, @ptrCast(&v), @sizeOf(u32)),
@@ -1357,7 +1382,7 @@ pub const LinuxTransport = struct {
 
         var attempts: u8 = 0;
         while (true) {
-            const res = switch (lt.dest) {
+            const res = switch (dest) {
                 .v4 => |*sa| lt.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in), packet),
                 .v6 => |*sa| lt.sock.sendTo(@ptrCast(sa), @sizeOf(linux.sockaddr.in6), packet),
             };
@@ -1594,6 +1619,370 @@ pub const LiveMtr = struct {
 
     pub fn round(l: *LiveMtr) TransportError!void {
         return l.mtr.round(l.lt.transport());
+    }
+};
+
+// ── continuous mode over many destinations (MtrSet) ─────────────────────────
+
+/// Destinations one `MtrSet` traces at once.
+pub const max_set_members = 16;
+
+pub const MtrSetOptions = struct {
+    /// Every member's hop range, timing, payload and live socket settings
+    /// (`MtrOptions.validate` applies). `gap_ms` paces the whole round:
+    /// each probe of any member goes `gap_ms` after the previous one.
+    mtr: MtrOptions = .{},
+    /// A hop is settled after this many answers in a row from one router
+    /// (Time Exceeded; a lost probe neither counts nor breaks the run), and
+    /// no hop is shared before each side probed it this many times.
+    settle_rounds: u8 = 3,
+    /// Every member probes its whole path itself once in this many rounds
+    /// (staggered between members), so a path that left a shared prefix is
+    /// noticed. 0: never (tests).
+    verify_every: u16 = 30,
+
+    pub fn validate(o: MtrSetOptions) error{InvalidOptions}!void {
+        try o.mtr.validate();
+        if (o.settle_rounds == 0) return error.InvalidOptions;
+    }
+};
+
+/// `Mtr` for several destinations of one address family over one transport,
+/// with **shared path prefixes**: when two members' paths run through the
+/// same routers at TTL 1..k, a round sends one probe to each of those hops,
+/// not one per member, and every member records that answer. Routers limit
+/// the ICMP errors they send per source (Linux: about one Time Exceeded a
+/// second); probing a shared router once per round, whatever the number of
+/// traces, keeps those limits from showing up as false loss, and halves the
+/// traffic of two traces that share most of their path.
+///
+/// Two members share the leading TTLs where they do not contradict each
+/// other (each probed there `settle_rounds` times, and never two different
+/// routers answering them at the same TTL), up to the last TTL where both
+/// *settled* on the same router (`settle_rounds` answers in a row from it; a
+/// lost probe neither counts nor breaks the run). So a silent hop between
+/// agreeing routers is shared, a trailing one is not, and a router that
+/// answers one member and never the other (it limits its answers per
+/// source, exactly the case that shows up as false loss) is shared too. The probe goes
+/// from the member with the lowest index among those sharing the hop. Each
+/// member regularly probes its whole path itself (`verify_every`), so one
+/// whose path leaves the shared routers (a route change, a load balancer
+/// hashing on the destination) stops sharing within that many rounds.
+/// Answers are matched to their probe by sequence number, then checked by
+/// the same rules as `Mtr` against that probe's destination. Members are
+/// `Mtr`s: their statistics, path end and `lastRound` read as usual.
+/// Single owner.
+pub const MtrSet = struct {
+    gpa: std.mem.Allocator,
+    family: echo.Family,
+    opts: MtrSetOptions,
+    members: [max_set_members]?*Member = @splat(null),
+    /// TTLs per member (`max_hops - first_ttl + 1`).
+    cap: usize,
+    /// The round's probes in sending order; slot i carries sequence
+    /// `round_base + i`.
+    plan: []Planned,
+    /// Who probes TTL index k for member i this round: `owner[i * cap + k]`.
+    owner: []u8,
+    windows: u64 = 0,
+    last_start: ?u64 = null,
+    rounds: u64 = 0,
+
+    pub const Member = struct {
+        mtr: Mtr,
+        /// Per TTL: the router the hop has settled on (`sig`), and whether
+        /// the last round's answer came from another member's probe.
+        sig: []Sig,
+        shared: []bool,
+
+        /// Per TTL of `mtr.hops()`: the last round's answer was another
+        /// member's probe (the hop is shared).
+        pub fn sharedLastRound(mb: *const Member) []const bool {
+            return mb.shared[0..mb.mtr.hops().len];
+        }
+    };
+
+    const Sig = struct { addr: ?netaddr.Ip = null, n: u8 = 0 };
+    const Planned = struct { member: u8, k: u8, sent_at: ?u64 = null };
+
+    pub const InitError = error{ InvalidOptions, OutOfMemory };
+
+    pub fn init(gpa: std.mem.Allocator, family: echo.Family, opts: MtrSetOptions) InitError!MtrSet {
+        try opts.validate();
+        const cap: usize = @as(usize, opts.mtr.max_hops - opts.mtr.first_ttl) + 1;
+        const plan = try gpa.alloc(Planned, max_set_members * cap);
+        errdefer gpa.free(plan);
+        const owner = try gpa.alloc(u8, max_set_members * cap);
+        return .{ .gpa = gpa, .family = family, .opts = opts, .cap = cap, .plan = plan, .owner = owner };
+    }
+
+    pub fn deinit(s: *MtrSet) void {
+        for (&s.members) |*slot| if (slot.*) |mb| {
+            s.freeMember(mb);
+            slot.* = null;
+        };
+        s.gpa.free(s.plan);
+        s.gpa.free(s.owner);
+        s.* = undefined;
+    }
+
+    pub const AddError = error{ WrongFamily, TooManyMembers, InvalidOptions, OutOfMemory };
+
+    /// Adds a destination; returns its member index (stable until `remove`).
+    /// It probes its whole path itself until its hops settle.
+    pub fn add(s: *MtrSet, dest: netaddr.Ip) AddError!u8 {
+        if (@as(echo.Family, switch (dest) {
+            .v4 => .v4,
+            .v6 => .v6,
+        }) != s.family) return error.WrongFamily;
+        const i = for (s.members, 0..) |slot, i| {
+            if (slot == null) break i;
+        } else return error.TooManyMembers;
+        const mb = try s.gpa.create(Member);
+        errdefer s.gpa.destroy(mb);
+        mb.mtr = try Mtr.init(s.gpa, dest, s.opts.mtr);
+        errdefer mb.mtr.deinit();
+        mb.sig = try s.gpa.alloc(Sig, s.cap);
+        errdefer s.gpa.free(mb.sig);
+        @memset(mb.sig, .{});
+        mb.shared = try s.gpa.alloc(bool, s.cap);
+        @memset(mb.shared, false);
+        s.members[i] = mb;
+        return @intCast(i);
+    }
+
+    /// Removes member `id`; an index that holds none is ignored.
+    pub fn remove(s: *MtrSet, id: u8) void {
+        if (id >= max_set_members) return;
+        const mb = s.members[id] orelse return;
+        s.freeMember(mb);
+        s.members[id] = null;
+    }
+
+    /// Member `id`, or null.
+    pub fn member(s: *const MtrSet, id: u8) ?*const Member {
+        if (id >= max_set_members) return null;
+        return s.members[id];
+    }
+
+    fn freeMember(s: *MtrSet, mb: *Member) void {
+        mb.mtr.deinit();
+        s.gpa.free(mb.sig);
+        s.gpa.free(mb.shared);
+        s.gpa.destroy(mb);
+    }
+
+    /// TTL indices probed for `mb` this round.
+    fn probed(mb: *const Member, cap: usize) usize {
+        return if (mb.mtr.end) |e| e + 1 else cap;
+    }
+
+    fn settledAt(s: *const MtrSet, mb: *const Member, k: usize) ?netaddr.Ip {
+        const a = mb.sig[k].addr orelse return null;
+        return if (mb.sig[k].n >= s.opts.settle_rounds) a else null;
+    }
+
+    /// TTL indices `a` and `b` share this round: the leading run of hops
+    /// where neither contradicts the other (both probed `settle_rounds`
+    /// times, and no two different routers answered them there; one side may
+    /// never have been answered, typically a router limiting its answers per
+    /// source), cut back to the last hop both settled on the same router: a
+    /// silent hop is shared only when the paths agree after it.
+    fn sharedPrefix(s: *const MtrSet, a: *const Member, b: *const Member) usize {
+        const n = @min(probed(a, s.cap), probed(b, s.cap));
+        var shared: usize = 0;
+        for (0..n) |k| {
+            if (a.mtr.hop_buf[k].sent < s.opts.settle_rounds or b.mtr.hop_buf[k].sent < s.opts.settle_rounds) break;
+            if (a.sig[k].addr) |ra| if (b.sig[k].addr) |rb| if (!ra.eql(rb)) break;
+            if (s.settledAt(a, k) != null and s.settledAt(b, k) != null) shared = k + 1;
+        }
+        return shared;
+    }
+
+    fn verifying(s: *const MtrSet, i: usize) bool {
+        if (s.opts.verify_every == 0) return false;
+        return (s.rounds +% i *% 7) % s.opts.verify_every == 0;
+    }
+
+    /// One round for every member over `t` (which must have `sendToFn`).
+    /// Waits out the rest of `interval_ms` since the previous round began,
+    /// sends each planned probe `gap_ms` apart (TTL by TTL across members),
+    /// collects answers until `timeout_ms` after the last, then gives every
+    /// member its answers, the shared ones included. A transport failure
+    /// aborts the round without counting it.
+    pub fn round(s: *MtrSet, t: Transport) TransportError!void {
+        const send_to = t.sendToFn orelse return error.SendFailed;
+        s.opts.validate() catch return error.SendFailed;
+        if (s.cap != @as(usize, s.opts.mtr.max_hops - s.opts.mtr.first_ttl) + 1) return error.SendFailed;
+        var rbuf: [2048]u8 = undefined;
+        if (s.last_start) |start| {
+            const next = start +| @as(u64, s.opts.mtr.interval_ms) * std.time.ns_per_ms;
+            while (true) {
+                const now = t.nowFn(t.ctx);
+                if (now >= next) break;
+                _ = try t.recvFn(t.ctx, &rbuf, next - now);
+            }
+        }
+        s.last_start = t.nowFn(t.ctx);
+
+        // Plan: who probes which TTL. Member i takes TTL k from the lowest
+        // member j < i that shares it and probes it itself (sharing is not
+        // transitive across a silent hop), unless i is verifying.
+        const cap = s.cap;
+        var plan_n: usize = 0;
+        for (s.members, 0..) |slot_i, i| {
+            const mi = slot_i orelse continue;
+            const n = probed(mi, cap);
+            for (0..n) |k| s.owner[i * cap + k] = @intCast(i);
+            if (s.verifying(i)) continue;
+            for (s.members[0..i], 0..) |slot_j, j| {
+                const mj = slot_j orelse continue;
+                const shared = s.sharedPrefix(mi, mj);
+                for (0..shared) |k| {
+                    if (s.owner[i * cap + k] == i and s.owner[j * cap + k] == j) s.owner[i * cap + k] = @intCast(j);
+                }
+            }
+        }
+        for (0..cap) |k| {
+            for (s.members, 0..) |slot, i| {
+                const mb = slot orelse continue;
+                if (k >= probed(mb, cap) or s.owner[i * cap + k] != i) continue;
+                s.plan[plan_n] = .{ .member = @intCast(i), .k = @intCast(k) };
+                plan_n += 1;
+            }
+        }
+        for (s.members) |slot| if (slot) |mb| @memset(mb.mtr.got_buf, .{});
+
+        const window = max_set_members * cap; // <= 4080: windows never overlap
+        const round_base = s.opts.mtr.seq_base +% @as(u16, @truncate(s.windows *% window));
+        s.windows +%= 1;
+        var pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined;
+        const packet = pkt_buf[0 .. echo.echo_header_len + s.opts.mtr.payload_size];
+        const gap_ns = @as(u64, s.opts.mtr.gap_ms) * std.time.ns_per_ms;
+        const timeout_ns = @as(u64, s.opts.mtr.timeout_ms) * std.time.ns_per_ms;
+        const plan = s.plan[0..plan_n];
+        var answered: usize = 0;
+        var i: usize = 0;
+        var wait_until: u64 = 0;
+        while (true) {
+            if (i < plan.len) {
+                const p = &plan[i];
+                const mb = s.members[p.member].?;
+                @memset(packet, 0);
+                echo.writeEchoRequest(s.family, packet, s.opts.mtr.ident, round_base +% @as(u16, @intCast(i))) catch
+                    @panic("traceroute: probe buffer smaller than the ICMP header");
+                try send_to(t.ctx, mb.mtr.dest, s.opts.mtr.first_ttl + p.k, packet);
+                const at = t.nowFn(t.ctx);
+                p.sent_at = at;
+                i += 1;
+                wait_until = if (i < plan.len) at +| gap_ns else at +| timeout_ns;
+            }
+            while (true) {
+                if (i == plan.len and answered == plan.len) break;
+                const now = t.nowFn(t.ctx);
+                if (now >= wait_until) break;
+                const resp = (try t.recvFn(t.ctx, &rbuf, wait_until - now)) orelse break;
+                if (resp.len > rbuf.len) return error.RecvFailed;
+                const rcv_at = t.nowFn(t.ctx);
+                const pkt = rbuf[0..resp.len];
+                const seq = answerSeq(s.family, pkt, t.strip_ip_header) orelse continue;
+                const j = slotOf(seq, round_base, plan.len) orelse continue; // another round's
+                const p = plan[j];
+                const st = p.sent_at orelse continue; // not sent yet: spoof
+                const mb = s.members[p.member].?;
+                const msg = icmpMessage(s.family, pkt, t.strip_ip_header) orelse continue;
+                const a = classifyIcmp(s.family, pkt, t.strip_ip_header, msg, s.opts.mtr.ident, mb.mtr.dest, resp.from) orelse continue;
+                if (a.seq != seq) continue;
+                const got = &mb.mtr.got_buf[p.k];
+                if (got.kind != .timeout) continue; // first answer wins
+                got.* = a.probe;
+                got.rtt_ns = rcv_at -| st;
+                answered += 1;
+            }
+            if (i == plan.len) break;
+        }
+
+        // Everyone's answers: shared TTLs copied from their owner first,
+        // before any member's statistics move its path end.
+        for (s.members, 0..) |slot, mi| {
+            const mb = slot orelse continue;
+            const n = probed(mb, cap);
+            for (0..n) |k| {
+                const o = s.owner[mi * cap + k];
+                mb.shared[k] = o != mi;
+                if (o != mi) mb.mtr.got_buf[k] = s.members[o].?.mtr.got_buf[k];
+            }
+            @memset(mb.shared[n..], false);
+        }
+        for (s.members) |slot| {
+            const mb = slot orelse continue;
+            const got = mb.mtr.got_buf[0..probed(mb, cap)];
+            for (got, 0..) |p, k| {
+                const sig = &mb.sig[k];
+                switch (p.kind) {
+                    .time_exceeded => {
+                        const a = p.address orelse continue;
+                        if (sig.addr != null and sig.addr.?.eql(a)) {
+                            sig.n +|= 1;
+                        } else sig.* = .{ .addr = a, .n = 1 };
+                    },
+                    .reply, .dest_unreachable => sig.* = .{},
+                    .timeout => {},
+                }
+            }
+            mb.mtr.finishRound(got);
+        }
+        s.rounds +%= 1;
+    }
+};
+
+/// The sequence number an answer quotes (its own for an Echo Reply), or
+/// null for anything else; who it belongs to is checked afterwards.
+fn answerSeq(family: echo.Family, pkt: []const u8, strip_ip_header: bool) ?u16 {
+    return switch (switch (family) {
+        .v4 => echo.parseV4(pkt, strip_ip_header),
+        .v6 => echo.parseV6(pkt),
+    }) {
+        .ignored => null,
+        .echo_reply => |er| er.seq,
+        .icmp_error => |ie| ie.orig_seq,
+    };
+}
+
+/// `MtrSet` over its own live socket of one family (raw, or a ping socket
+/// without CAP_NET_RAW; `MtrSetOptions.mtr.socket`). Do not move it while a
+/// round runs.
+pub const LiveMtrSet = struct {
+    lt: LinuxTransport,
+    set: MtrSet,
+
+    pub const OpenError = MtrSet.InitError || LinuxTransport.OpenError;
+
+    pub fn open(gpa: std.mem.Allocator, family: echo.Family, opts: MtrSetOptions) OpenError!LiveMtrSet {
+        try opts.validate();
+        var o = opts;
+        // The transport's own destination is never used: every probe goes
+        // through `sendToFn` to its member's.
+        const any: netaddr.Ip = switch (family) {
+            .v4 => .{ .v4 = @splat(0) },
+            .v6 => .{ .v6 = @splat(0) },
+        };
+        var lt = try LinuxTransport.openWith(any, opts.mtr.traceOptions());
+        errdefer lt.close();
+        const r = randomIdentAndSeq();
+        o.mtr.ident = if (lt.sock.kind == .dgram) lt.ident() else r.ident;
+        o.mtr.seq_base = r.seq_base;
+        return .{ .lt = lt, .set = try MtrSet.init(gpa, family, o) };
+    }
+
+    pub fn close(l: *LiveMtrSet) void {
+        l.set.deinit();
+        l.lt.close();
+        l.* = undefined;
+    }
+
+    pub fn round(l: *LiveMtrSet) TransportError!void {
+        return l.set.round(l.lt.transport());
     }
 };
 
@@ -2875,6 +3264,276 @@ test "live: LiveMtr over a ping socket to 127.0.0.1 (skipped without ping_group_
     try testing.expectEqual(@as(u32, 2), l.mtr.hops()[0].received);
 }
 
+// ── continuous mode, many destinations (MtrSet) ──
+
+const set_dest_1 = ip4(192, 0, 2, 1);
+const set_dest_2 = ip4(192, 0, 2, 2);
+const set_dest_3 = ip4(192, 0, 2, 3);
+const router_x = ip4(10, 0, 9, 1);
+const router_y = ip4(10, 0, 8, 1);
+
+/// The fake network for `MtrSet`: one behavior list per destination, every
+/// probe logged with its destination; optionally one router that answers at
+/// most once a second (as Linux limits Time Exceeded per source).
+const SetFake = struct {
+    inner: FakeTransport = .{ .behaviors = &.{} },
+    routes: []const Route,
+    log: std.ArrayList(Sent) = .empty,
+    limited: ?netaddr.Ip = null,
+    limited_last: ?u64 = null,
+
+    const Route = struct { dest: netaddr.Ip, behaviors: []const Behavior };
+    const Sent = struct { dest: netaddr.Ip, ttl: u8 };
+
+    fn deinit(f: *SetFake) void {
+        f.log.deinit(testing.allocator);
+        f.inner.deinit();
+    }
+
+    fn transport(f: *SetFake) Transport {
+        return .{ .ctx = f, .sendFn = sendNone, .sendToFn = sendTo, .recvFn = recv, .nowFn = now };
+    }
+
+    fn sendNone(_: *anyopaque, _: u8, _: []const u8) TransportError!void {
+        return error.SendFailed;
+    }
+
+    fn sendTo(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, packet: []const u8) TransportError!void {
+        const f: *SetFake = @ptrCast(@alignCast(ctx));
+        f.log.append(testing.allocator, .{ .dest = dest, .ttl = ttl }) catch return error.SendFailed;
+        const route = for (f.routes) |r| {
+            if (r.dest.eql(dest)) break r;
+        } else return; // unknown destination: dropped
+        f.inner.dest = dest;
+        f.inner.behaviors = route.behaviors;
+        const queued = f.inner.queue.items.len;
+        try FakeTransport.sendImpl(&f.inner, ttl, packet);
+        const lim = f.limited orelse return;
+        if (f.inner.queue.items.len == queued) return;
+        const c = f.inner.queue.items[queued];
+        if (c.from == null or !c.from.?.eql(lim)) return;
+        if (f.limited_last) |last| if (f.inner.clock -| last < std.time.ns_per_s) {
+            f.gpa().free(f.inner.queue.pop().?.bytes); // over the limit: no answer
+            return;
+        };
+        f.limited_last = f.inner.clock;
+    }
+
+    fn gpa(f: *SetFake) std.mem.Allocator {
+        return f.inner.gpa;
+    }
+
+    fn recv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+        const f: *SetFake = @ptrCast(@alignCast(ctx));
+        return FakeTransport.recvImpl(&f.inner, buf, timeout_ns);
+    }
+
+    fn now(ctx: *anyopaque) u64 {
+        const f: *SetFake = @ptrCast(@alignCast(ctx));
+        return f.inner.clock;
+    }
+
+    /// Probes sent to `dest` at `ttl` since log entry `from`.
+    fn count(f: *const SetFake, from: usize, dest: netaddr.Ip, ttl: u8) usize {
+        var n: usize = 0;
+        for (f.log.items[from..]) |e| {
+            if (e.dest.eql(dest) and e.ttl == ttl) n += 1;
+        }
+        return n;
+    }
+};
+
+test "MtrSet: two destinations share their common routers, one probe per shared hop a round" {
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_x }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 6, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    const one = try set.add(set_dest_1);
+    const two = try set.add(set_dest_2);
+    // Until the hops settle (3 answers in a row), both probe everything.
+    for (0..3) |_| try set.round(f.transport());
+    try testing.expectEqual(@as(usize, 3), f.count(0, set_dest_2, 1));
+    const mark = f.log.items.len;
+    try set.round(f.transport());
+    try set.round(f.transport());
+    // Settled: TTL 1-2 (routers a, b) go only towards the first member.
+    for ([_]u8{ 1, 2, 3, 4 }) |ttl| try testing.expectEqual(@as(usize, 2), f.count(mark, set_dest_1, ttl));
+    try testing.expectEqual(@as(usize, 0), f.count(mark, set_dest_2, 1));
+    try testing.expectEqual(@as(usize, 0), f.count(mark, set_dest_2, 2));
+    try testing.expectEqual(@as(usize, 2), f.count(mark, set_dest_2, 3)); // c ≠ x: its own
+    try testing.expectEqual(@as(usize, 2), f.count(mark, set_dest_2, 4));
+
+    const m2 = set.member(two).?;
+    try testing.expect(m2.mtr.reached());
+    try testing.expectEqualSlices(bool, &.{ true, true, false, false }, m2.sharedLastRound());
+    try testing.expectEqualSlices(bool, &.{ false, false, false, false }, set.member(one).?.sharedLastRound());
+    // The shared answers count as the member's own: every round, no loss.
+    const h = m2.mtr.hops();
+    try testing.expectEqual(@as(u32, 5), h[0].sent);
+    try testing.expectEqual(@as(u32, 5), h[0].received);
+    try testing.expect(h[1].address.?.eql(router_b));
+    try testing.expect(h[2].address.?.eql(router_x));
+    try testing.expect(h[3].address.?.eql(set_dest_2));
+    try testing.expect(set.member(one).?.mtr.hops()[2].address.?.eql(router_c));
+}
+
+test "MtrSet: a router answering once a second shows loss only while it is probed twice a round" {
+    var f: SetFake = .{ .limited = router_a, .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 4, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    const one = try set.add(set_dest_1);
+    const two = try set.add(set_dest_2);
+    // Both probe router a until the hops settle: the second probe of each
+    // round is refused, so router a looks silent to dest 2, and router b
+    // after it shows the paths agree.
+    var settled_at: ?usize = null;
+    for (0..12) |r| {
+        try set.round(f.transport());
+        if (settled_at == null and set.member(two).?.sharedLastRound()[0]) settled_at = r;
+    }
+    try testing.expect(settled_at != null);
+    const lost_1 = set.member(one).?.mtr.hops()[0];
+    const lost_2 = set.member(two).?.mtr.hops()[0];
+    // Every refusal happened before sharing began; none after.
+    try testing.expect(lost_1.sent - lost_1.received + lost_2.sent - lost_2.received <= settled_at.? + 1);
+    const last_1 = set.member(one).?.mtr.lastRound()[0];
+    const last_2 = set.member(two).?.mtr.lastRound()[0];
+    try testing.expectEqual(Probe.Kind.time_exceeded, last_1.kind);
+    try testing.expectEqual(Probe.Kind.time_exceeded, last_2.kind);
+}
+
+test "MtrSet: a path that leaves the shared routers stops sharing at its next verification" {
+    const via_b = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_x }, .reply };
+    const via_y = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_y }, .{ .time_exceeded = router_x }, .reply };
+    var routes = [_]SetFake.Route{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &via_b },
+    };
+    var f: SetFake = .{ .routes = &routes };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 6, .gap_ms = 1 }, .verify_every = 5 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    const two = try set.add(set_dest_2);
+    for (0..6) |_| try set.round(f.transport());
+    try testing.expect(set.member(two).?.sharedLastRound()[1]);
+    routes[1].behaviors = &via_y; // the route to dest 2 moves off router b
+    var rounds: usize = 0;
+    while (set.member(two).?.sharedLastRound()[1]) : (rounds += 1) {
+        try testing.expect(rounds <= 5); // found within verify_every rounds
+        try set.round(f.transport());
+    }
+    try set.round(f.transport());
+    const m2 = set.member(two).?;
+    try testing.expect(m2.sharedLastRound()[0]); // router a is still common
+    try testing.expect(!m2.sharedLastRound()[1]);
+    try testing.expect(m2.mtr.hops()[1].address.?.eql(router_y));
+}
+
+test "MtrSet: a silent hop between agreeing routers is shared, a trailing one is not" {
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .drop, .{ .time_exceeded = router_c }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_a }, .drop, .{ .time_exceeded = router_c }, .{ .time_exceeded = router_x }, .reply } },
+        .{ .dest = set_dest_3, .behaviors = &.{ .{ .time_exceeded = router_a }, .drop, .{ .time_exceeded = router_y }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 6, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    const two = try set.add(set_dest_2);
+    const three = try set.add(set_dest_3);
+    for (0..4) |_| try set.round(f.transport());
+    const mark = f.log.items.len;
+    try set.round(f.transport());
+    try testing.expectEqualSlices(bool, &.{ true, true, true, false, false }, set.member(two).?.sharedLastRound());
+    // Dest 3 agrees on a and the silent hop, then parts: the silent hop is
+    // not shared (nothing after it shows the paths still agree there).
+    try testing.expectEqualSlices(bool, &.{ true, false, false, false }, set.member(three).?.sharedLastRound());
+    try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_3, 2));
+    try testing.expectEqual(@as(usize, 0), f.count(mark, set_dest_2, 2));
+}
+
+test "MtrSet: removing the probing member hands its hops back; family, capacity, ids" {
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .time_exceeded = router_a }, .reply } },
+        .{ .dest = set_dest_2, .behaviors = &.{ .{ .time_exceeded = router_a }, .reply } },
+    } };
+    defer f.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 3, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    const one = try set.add(set_dest_1);
+    const two = try set.add(set_dest_2);
+    for (0..4) |_| try set.round(f.transport());
+    try testing.expect(set.member(two).?.sharedLastRound()[0]);
+    set.remove(one);
+    try testing.expectEqual(@as(?*const MtrSet.Member, null), set.member(one));
+    const mark = f.log.items.len;
+    try set.round(f.transport());
+    try testing.expectEqual(@as(usize, 1), f.count(mark, set_dest_2, 1));
+    try testing.expect(!set.member(two).?.sharedLastRound()[0]);
+    try testing.expectEqual(@as(u32, 5), set.member(two).?.mtr.hops()[0].received);
+
+    try testing.expectError(error.WrongFamily, set.add(netaddr.parseIp("2001:db8::1").?));
+    set.remove(200); // no such member: ignored
+    set.remove(one);
+    try testing.expectEqual(@as(?*const MtrSet.Member, null), set.member(200));
+    var added: usize = 1;
+    while (added < max_set_members) : (added += 1) _ = try set.add(set_dest_3);
+    try testing.expectError(error.TooManyMembers, set.add(set_dest_3));
+    try testing.expectError(error.InvalidOptions, MtrSet.init(testing.allocator, .v4, .{ .settle_rounds = 0 }));
+    try testing.expectError(error.InvalidOptions, MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .interval_ms = 1 } }));
+}
+
+test "MtrSet: needs sendToFn; garbage and answers for another round never count" {
+    var plain: FakeTransport = .{ .behaviors = &.{.reply} };
+    defer plain.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 3, .gap_ms = 1 }, .verify_every = 0 });
+    defer set.deinit();
+    _ = try set.add(set_dest_1);
+    try testing.expectError(error.SendFailed, set.round(plain.transport()));
+
+    var f: SetFake = .{ .routes = &.{
+        .{ .dest = set_dest_1, .behaviors = &.{ .{ .garbage = &@as([64]u8, @splat(0xff)) }, .{ .time_exceeded_late = router_b }, .reply } },
+    } };
+    defer f.deinit();
+    for (0..3) |_| try set.round(f.transport());
+    const h = set.member(0).?.mtr.hops();
+    try testing.expectEqual(@as(u32, 0), h[0].received);
+    try testing.expectEqual(@as(u32, 0), h[1].received); // 1.5 s late: lost
+    try testing.expectEqual(@as(u32, 3), h[2].received);
+    // An empty set waits out its interval and sends nothing.
+    var empty = try MtrSet.init(testing.allocator, .v4, .{});
+    defer empty.deinit();
+    const before = f.log.items.len;
+    try empty.round(f.transport());
+    try testing.expectEqual(before, f.log.items.len);
+}
+
+test "live: LiveMtrSet over a ping socket to two loopback addresses (skipped without ping_group_range)" {
+    bringLoopbackUp();
+    var l = LiveMtrSet.open(testing.allocator, .v4, .{ .mtr = .{ .max_hops = 3, .interval_ms = 100, .socket = .dgram } }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer l.close();
+    const a = try l.set.add(netaddr.parseIp("127.0.0.1").?);
+    const b = try l.set.add(netaddr.parseIp("127.0.0.2").?);
+    try l.round();
+    try l.round();
+    for ([_]u8{ a, b }) |id| {
+        const m = l.set.member(id).?;
+        try testing.expect(m.mtr.reached());
+        try testing.expectEqual(@as(u32, 2), m.mtr.hops()[0].received);
+    }
+}
+
 // ── 2026-10-04: UDP method, MPLS extensions, live options ───────────────────
 
 // Real kernel replies to UDP probes, captured with tcpdump in the same kind of
@@ -3543,7 +4202,7 @@ test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous
 
 const fuzz_driver = testkit.fuzz.driver;
 
-const FuzzLabel = enum { silent, resolved };
+const FuzzLabel = enum { silent, resolved, set_resolved, set_shared, set_member_changed };
 var fuzz_reach: [@typeInfo(FuzzLabel).@"enum".field_names.len]usize = @splat(0);
 
 fn fuzz_mark(comptime l: FuzzLabel) void {
@@ -3604,18 +4263,133 @@ fn fuzzTracerouteMutated(comptime S: type, src: *S, gpa: std.mem.Allocator) anye
     try fuzzOneRun(pool[0..len]);
 }
 
+/// `MtrSet` on a network the fuzzer draws probe by probe: each answer is the
+/// path's usual router for that TTL (shared by every destination), another
+/// one, the destination, a late or lost answer, or damaged bytes; members
+/// come and go between rounds. Checked after every round: no member ever
+/// has more answers than probes at a hop, a shared hop always has a lower
+/// member to come from, and a round sends at most one probe per member and
+/// TTL.
+fn fuzzMtrSet(comptime S: type, src: *S, gpa: std.mem.Allocator) anyerror!void {
+    _ = gpa;
+    const Net = struct {
+        src: *S,
+        inner: FakeTransport = .{ .behaviors = &.{} },
+        beh: [8]Behavior = @splat(.drop),
+        sent: usize = 0,
+        sent_to: [max_set_members * 8]struct { dest: netaddr.Ip, ttl: u8 } = undefined,
+        garbage: [48]u8 = undefined,
+
+        const Self = @This();
+        const dests = [_]netaddr.Ip{ ip4(192, 0, 2, 11), ip4(192, 0, 2, 12), ip4(192, 0, 2, 13), ip4(192, 0, 2, 14) };
+        const usual = [_]netaddr.Ip{ ip4(10, 1, 0, 1), ip4(10, 1, 1, 1), ip4(10, 1, 2, 1), ip4(10, 1, 3, 1), ip4(10, 1, 4, 1), ip4(10, 1, 5, 1) };
+
+        fn transport(n: *Self) Transport {
+            return .{ .ctx = n, .sendFn = SetFake.sendNone, .sendToFn = sendTo, .recvFn = recv, .nowFn = now };
+        }
+        fn sendTo(ctx: *anyopaque, dest: netaddr.Ip, ttl: u8, packet: []const u8) TransportError!void {
+            const n: *Self = @ptrCast(@alignCast(ctx));
+            if (n.sent < n.sent_to.len) n.sent_to[n.sent] = .{ .dest = dest, .ttl = ttl };
+            n.sent += 1;
+            if (ttl == 0 or ttl > n.beh.len) return;
+            const pick = n.src.value(u8);
+            n.beh[ttl - 1] = switch (pick % 8) {
+                0, 1, 2 => .{ .time_exceeded = usual[(ttl - 1) % usual.len] },
+                3 => .{ .time_exceeded = ip4(10, 2, ttl, pick) },
+                4 => .reply,
+                5 => .{ .time_exceeded_late = usual[(ttl - 1) % usual.len] },
+                6 => .drop,
+                else => blk: {
+                    n.src.bytes(&n.garbage);
+                    break :blk .{ .garbage = &n.garbage };
+                },
+            };
+            n.inner.dest = dest;
+            n.inner.behaviors = &n.beh;
+            try FakeTransport.sendImpl(&n.inner, ttl, packet);
+        }
+        fn recv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+            const n: *Self = @ptrCast(@alignCast(ctx));
+            return FakeTransport.recvImpl(&n.inner, buf, timeout_ns);
+        }
+        fn now(ctx: *anyopaque) u64 {
+            const n: *Self = @ptrCast(@alignCast(ctx));
+            return n.inner.clock;
+        }
+    };
+    var net: Net = .{ .src = src };
+    defer net.inner.deinit();
+    var set = try MtrSet.init(testing.allocator, .v4, .{
+        .mtr = .{ .max_hops = 6, .interval_ms = 100, .timeout_ms = 200, .gap_ms = 0 },
+        .settle_rounds = 1 + src.valueRangeAtMost(u8, 0, 2),
+        .verify_every = src.valueRangeAtMost(u16, 0, 4),
+    });
+    defer set.deinit();
+    var ids: [Net.dests.len]?u8 = @splat(null);
+    for (0..1 + src.valueRangeAtMost(u8, 0, 7)) |_| {
+        // Members come and go.
+        const d = src.index(Net.dests.len);
+        if (ids[d]) |id| {
+            if (src.value(u8) < 40) {
+                set.remove(id);
+                ids[d] = null;
+                fuzz_mark(.set_member_changed);
+            }
+        } else if (src.value(u8) < 200) {
+            ids[d] = try set.add(Net.dests[d]);
+        }
+        const before = net.sent;
+        try set.round(net.transport());
+        // At most one probe per member and TTL this round.
+        const round_sent = net.sent_to[@min(before, net.sent_to.len)..@min(net.sent, net.sent_to.len)];
+        for (round_sent, 0..) |a, x| for (round_sent[x + 1 ..]) |b| {
+            if (a.dest.eql(b.dest) and a.ttl == b.ttl) return error.TwoProbesOneHop;
+        };
+        net.sent = 0;
+        for (set.members, 0..) |slot, i| {
+            const mb = slot orelse continue;
+            const shared = mb.sharedLastRound();
+            for (mb.mtr.hops(), 0..) |h, k| {
+                if (h.received > h.sent) return error.MoreAnswersThanProbes;
+                if (shared[k]) {
+                    const lower = for (set.members[0..i]) |o| {
+                        if (o != null) break true;
+                    } else false;
+                    if (!lower) return error.SharedFromNobody;
+                    fuzz_mark(.set_shared);
+                }
+                if (h.received > 0) fuzz_mark(.set_resolved);
+            }
+        }
+    }
+}
+
+test "fuzz: MtrSet on a fuzzer-drawn network" {
+    try testing.fuzz({}, fuzzScript(fuzzMtrSet), .{});
+}
+
 test "fuzz: hop state machine, damaged corpus packet streams" {
     try testing.fuzz({}, fuzzScript(fuzzTracerouteMutated), .{});
 }
 
 test "fuzz driver: TRACEROUTE_FUZZ" {
-    try fuzz_driver.run(fuzzTraceroute, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute", .scale = 4 });
-    try fuzz_driver.run(fuzzTracerouteMutated, .{ .prefix = "TRACEROUTE_FUZZ", .name = "traceroute-mutated", .scale = 4 });
+    // A harness `_ONLY` leaves out skips itself, not the ones after it.
+    var ran = false;
+    inline for (.{
+        .{ fuzzTraceroute, "traceroute" },
+        .{ fuzzTracerouteMutated, "traceroute-mutated" },
+        .{ fuzzMtrSet, "traceroute-mtrset" },
+    }) |h| {
+        if (fuzz_driver.run(h[0], .{ .prefix = "TRACEROUTE_FUZZ", .name = h[1], .scale = 4 })) {
+            ran = true;
+        } else |err| if (err != error.SkipZigTest) return err;
+    }
+    if (!ran) return error.SkipZigTest;
 }
 
 test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
     fuzz_reach = @splat(0);
-    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated }, 0..) |h, which| {
+    inline for (.{ fuzzTraceroute, fuzzTracerouteMutated, fuzzMtrSet }, 0..) |h, which| {
         for (0..400) |sd| {
             var prng = std.Random.DefaultPrng.init(sd);
             var rng: fuzz_driver.Rng = .{ .r = prng.random() };

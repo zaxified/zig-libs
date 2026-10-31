@@ -30,6 +30,15 @@ paced, and keeps per-hop running statistics (`MtrHop`: sent/received/loss,
 last/avg/best/worst, jitter, responders); rounds are at least `interval_ms`
 apart (enforced, floor 100 ms).
 
+Many destinations at once: `MtrSet` / `LiveMtrSet` — one socket per address
+family, members added and removed between rounds, each an `Mtr`. Hops where
+the members' paths run through the same routers get one probe per round,
+not one per member, and every member records that answer
+(`Member.sharedLastRound()`), so routers that limit their ICMP answers per
+source do not show false loss when several traces cross them; each member
+re-probes its whole path itself every `verify_every` rounds to notice a path
+that left the shared routers.
+
 Result model: `Trace { hops, reached, unreachable_code, transport_err, dest }`;
 `Hop { ttl, probes }` with `stats()` (via latency-stats) and
 `distinctAddresses()` (load-balanced hops answer from more than one

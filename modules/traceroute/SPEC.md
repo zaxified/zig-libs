@@ -8,7 +8,7 @@
 
 **Audit:** review 2026-10-04 · mutation 2026-10-04 (29/29) · src ?
 
-**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TRACEROUTE_FUZZ) · ct n/a — traceroute probes (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: error-queue drain stops the POLLERR busy-spin, `Hop.stats` streaming, saturating deadline; delta audit 13/14 + 1 eq)
+**Hardening:** fuzz 2026-10-09 (200,000-run budget per harness clean, TRACEROUTE_FUZZ); 2026-10-31 `traceroute-mtrset` harness (driver 50k seeds clean) · ct n/a — traceroute probes (keyword review, 2026-10-07) · panic 2026-10-31 (sweep + blind review: error-queue drain stops the POLLERR busy-spin, `Hop.stats` streaming, saturating deadline; delta audit 13/14 + 1 eq)
 
 **Performance:** not measured
 
@@ -181,6 +181,46 @@ Considered and rejected: carrying unanswered probes into the next round (mtr cou
 in some builds) — it makes "which probe was this RTT" ambiguous and the loss figure depend on the
 interval; a separate thread or `std.Io` inside the engine — the caller owns scheduling, a round
 is a bounded blocking call over the same `Transport` seam, offline-testable on a virtual clock.
+
+## Many destinations: `MtrSet` (2026-10-31)
+
+**Why.** A consumer that runs several live traces (zpinger: one per watched host) used to run one
+`LiveMtr` each: every trace probed its own TTL 1, 2, … — the same home gateway and ISP routers —
+once a second. Routers limit the ICMP errors they generate per source (Linux: `icmp_ratelimit`,
+about one Time Exceeded a second, with a small burst; hardware routers police their control plane
+similarly), so N traces across one router made it refuse most of them: false loss at exactly the
+hops every trace shares. `MtrSet` probes such a hop once per round, whatever the number of traces.
+
+**Design.** One transport per family; a probe goes to its member's destination through the new
+`Transport.sendToFn` (a raw or ping socket is unconnected: `sendto` per packet). A round plans who
+probes which TTL, sends TTL by TTL across members `gap_ms` apart, collects until `timeout_ms` after
+the last, copies each shared TTL's answer to its sharers, and hands every member its answers via
+`Mtr.finishRound` — the same bookkeeping `Mtr.round` uses, so path end, reset and statistics behave
+identically. Sequence numbers: slot i of round r is `seq_base + r·(max_set_members·hop_count) + i`
+(≤ 4080 per window, so windows never overlap); an answer's quoted sequence picks the slot, and then
+`classifyIcmp` checks it against *that* probe's destination — the spoof rules (ident, quoted
+destination, Echo Reply only from the destination, first answer wins) are `Mtr`'s.
+
+**Sharing rule.** Per member and TTL the set keeps the router answering there and its run of
+answers (a different router restarts the run; a lost probe does not). Two members share the leading
+TTLs where (1) each probed the TTL `settle_rounds` times and (2) no two different routers answered
+them there, cut back to the last TTL where both *settled* (`settle_rounds` answers in a row) on the
+same router. Hence: a silent hop between agreeing routers is shared, a trailing one is not; and a
+router that answers one member and never the other — the rate-limited router this exists for — is
+shared once the routers after it agree. Member i takes a TTL from the lowest j < i that shares it
+*and probes it itself*: "does not contradict" is not transitive across a silent hop, so the copy
+always comes from a real probe of a member that agrees with i. Every member probes its whole path
+itself once in `verify_every` rounds (staggered by index); a different router there restarts its run
+and ends sharing from that TTL. Considered and rejected: sharing on a single matching answer (an
+ECMP balancer hashing on the destination gives two members different routers at the same TTL only
+some of the time), and requiring an answer on both sides (the rate-limited router never answers the
+second member, so it would never be shared — measured in the test with a once-a-second router: no
+sharing at all).
+
+**What it does not do.** A router that appears in two different branches (different TTL prefixes)
+still gets one probe per branch. The copied answer's RTT is the owner's; it is the same router at
+the same TTL over a path both members agree on up to that TTL. Members of one family only (a
+consumer runs one set per family). Single owner: add/remove between rounds.
 
 ## Threat model / out of scope
 The live trace needs CAP_NET_RAW (raw ICMP socket) or, for the ICMP method, a group inside
