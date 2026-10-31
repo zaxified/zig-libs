@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **Performance:** X25519 shared secret 43.5 → 30.0 µs (0.82× libsodium, 0.92× OpenSSL 3.5.5; was 1.21× OpenSSL): the ladder step's field operations reordered for overlap (OpenSSL's order) and an ADX two-chain squaring ported from OpenSSL `x25519_fe64_sqr` (Apache-2.0, new `NOTICE`). Same bytes; no API change.
 - **2026-10-30** — **NO CONSUMER-VISIBLE CHANGE:** no-panic sweep + blind review (§ GP) found nothing to fix (every input is a fixed-size array, `mulMulti` already had a checked panic); SPEC Backlog notes the stack a scalar multiplication needs (straus tables ≈ 21.5 KiB + burns).
 - **2026-10-19** — **Fix:** `X25519.KeyPair.generate`/`generateInto` draw the seed with `entropy.fill` (fail-closed: aborts when no entropy is available) instead of `io.random`, which degrades to a guessable seed on `error.EntropyUnavailable` — the seed is the private key (CONVENTIONS.md §2.2). New dependency: `entropy`. Signatures unchanged (audit 2026-10-19).
 

@@ -10,7 +10,7 @@
 
 **Hardening:** fuzz n/a — no fuzz obligation under check-fuzz (initial v2 fill, not reviewed) · ct 2026-09-29 (ctgrind) · panic 2026-10-30 (sweep + blind review: nothing to fix (fixed-size inputs, mulMulti already a checked panic); stack minimum in Backlog)
 
-**Performance:** ref 0.56–1.08× libsodium 1.0.18 · fastest 1.20× OpenSSL 3.5.5 (measured 2026-10-20)
+**Performance:** ref 0.56–1.04× libsodium 1.0.18 · fastest 0.92× OpenSSL 3.5.5 (measured 2026-10-31)
 
 **Known defects:** none recorded
 
@@ -746,6 +746,37 @@ for the property the module is named after.** Re-run it after any change to
 original targets; the `comb`, `ladderbase` and `ladder` targets and their
 positive controls are in § "C3 — the base point uses a fixed-base comb".
 
+## P7 — X25519 shared secret: ladder order and ADX squaring (2026-10-31)
+
+**Why.** `tls13`'s bench (vs OpenSSL 3.5.5) had `cli_x25519` at 1.16×, the
+one row keeping it off P2; the cause was this module's shared-secret ladder,
+1.21× OpenSSL's `x25519-x86_64` on the same 4×64 radix.
+
+**Measured first** (standalone ReleaseFast harness, 20,000 shared secrets,
+`perf stat`): ours 152.7 k cycles and 248 k instructions per operation (IPC
+1.62), OpenSSL 133 k cycles and 332 k instructions (IPC 2.5) — more work
+done faster: our ladder was latency-bound, not instruction-bound.
+
+**What changed.**
+1. The ladder step's field operations reordered so independent ones are
+   adjacent (D, B, A, C; DA ∥ CB; BB ∥ AA; ...), OpenSSL's
+   `x25519_scalar_mulx` order (`crypto/ec/curve25519.c`): the out-of-order
+   core overlaps the multiply chains that the dependent order serialised.
+   157 k → 113 k cycles.
+2. On the ADX path the squaring uses two interleaved carry chains
+   (`sq_adx`, ported from OpenSSL's `x25519_fe64_sqr`, Apache-2.0, `NOTICE`)
+   instead of the single-chain `sq_mulx`: 118 k → 113 k cycles.
+3. Tried and dropped: `cswap` as scalar asm (to avoid LLVM's 32-byte vector
+   loads of limbs just stored as 8-byte words) — 5 % SLOWER than the
+   vectorised Zig `cswap` once the order was fixed; JCC-erratum padding
+   (`-Djcc-safe`) — no change in the ratio.
+
+**Result** (`zig build bench-ct25519`, `BENCH_ROUNDS=5`, spread ≤ 4.1 %):
+`x25519` 43.5 → 30.0 µs = 0.82× libsodium, 0.92× OpenSSL; `tls13`
+`cli_x25519` 1.16× → 0.86×. Correctness: RFC 7748 vectors and the field
+differential against std in Debug, ReleaseFast and an `x86_64_v3` (MULX-only)
+build; ctgrind rows unchanged in count (digests re-pinned).
+
 ## Performance — `bench-ct25519` (2026-10-10)
 
 **Re-measured on Zig 0.17.0, 2026-10-20** (`zig build bench-ct25519`, `BENCH_ROUNDS=5`, same host, ReleaseFast; load average 2–4.5 from other sessions, largest spread 17.4 %): ref 0.56–1.08× libsodium 1.0.18, fastest 1.20× (OpenSSL 3.5.5, X25519 rows), against 0.58–1.09× on Zig 0.16.0. The card carries these figures; what follows is the 0.16.0 measurement.
@@ -809,7 +840,7 @@ Consumer build options (CONVENTIONS §4.2), added 2026-10-17 at axp's request:
 - **Document a minimum stack size (review GP, 2026-10-30).** `mulMulti*` reserves 8 x 16 `Edwards25519` (about 21.5 KiB) in `strausChunk` and burns `msm_burn` (32 KiB); `recoverPublicKey` burns 16 KiB. Publish a minimum stack in the README/`meta`; optionally size the Straus tables by `points.len`.
 
 - ~~**Build option: `ct25519-base-comb`**~~ ✅ DONE 2026-10-17 (axp request) — see § Build options.
-- **Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL** *(bench
+- ~~**Performance: the X25519 shared secret, 1.09× libsodium / 1.21× OpenSSL**~~ — DONE 2026-10-31 (P7: 0.82× / 0.92×). *(bench
   2026-10-10, `zig build bench-ct25519`)*: the only row above 1.0 by more than noise, and the
   one between P2 and P1. OpenSSL's `x25519-x86_64` runs the same 4×64 MULX/ADX radix, so the
   gap is in the ladder body or the final inversion, not the representation. Lever (proposal,

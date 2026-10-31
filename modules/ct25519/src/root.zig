@@ -647,24 +647,28 @@ fn ladder(comptime adx: bool, k: *const [32]u8, u: *const [32]u8) [32]u8 {
         fe64.cswap(swap, &st, .x2, .x3);
         fe64.cswap(swap, &st, .z2, .z3);
         swap = bit;
-        F.add(&st, .a, .x2, .z2); // A = x2 + z2
-        F.sq(&st, .aa, .a); // AA = A²
-        F.sub(&st, .b, .x2, .z2); // B = x2 − z2
-        F.sq(&st, .bb, .b); // BB = B²
-        F.sub(&st, .e, .aa, .bb); // E = AA − BB
-        F.add(&st, .c, .x3, .z3); // C = x3 + z3
+        // RFC 7748 §5, the operations ordered so that independent ones sit
+        // next to each other (DA ∥ CB, BB ∥ AA, ...) and the core overlaps
+        // their multiply chains — OpenSSL's `x25519_scalar_mulx` order; the
+        // dependent order kept IPC at 1.6 (2026-10-31).
         F.sub(&st, .d, .x3, .z3); // D = x3 − z3
+        F.sub(&st, .b, .x2, .z2); // B = x2 − z2
+        F.add(&st, .a, .x2, .z2); // A = x2 + z2
+        F.add(&st, .c, .x3, .z3); // C = x3 + z3
         F.fmul(&st, .da, .d, .a); // DA = D·A
         F.fmul(&st, .cb, .c, .b); // CB = C·B
-        F.add(&st, .t, .da, .cb);
-        F.sq(&st, .x3, .t); // x3 = (DA + CB)²
-        F.sub(&st, .t, .da, .cb);
-        F.sq(&st, .t, .t);
-        F.fmul(&st, .z3, .x1, .t); // z3 = x1·(DA − CB)²
+        F.sq(&st, .bb, .b); // BB = B²
+        F.sq(&st, .aa, .a); // AA = A²
+        F.add(&st, .x3, .da, .cb); // DA + CB
+        F.sub(&st, .t, .da, .cb); // DA − CB
         F.fmul(&st, .x2, .aa, .bb); // x2 = AA·BB
-        F.mul121665(&st, .t, .e);
-        F.add(&st, .t, .aa, .t);
-        F.fmul(&st, .z2, .e, .t); // z2 = E·(AA + a24·E)
+        F.sub(&st, .e, .aa, .bb); // E = AA − BB
+        F.sq(&st, .t, .t); // (DA − CB)²
+        F.mul121665(&st, .c, .e); // a24·E
+        F.sq(&st, .x3, .x3); // x3 = (DA + CB)²
+        F.add(&st, .c, .aa, .c); // AA + a24·E
+        F.fmul(&st, .z3, .x1, .t); // z3 = x1·(DA − CB)²
+        F.fmul(&st, .z2, .e, .c); // z2 = E·(AA + a24·E)
     }
     fe64.cswap(swap, &st, .x2, .x3);
     fe64.cswap(swap, &st, .z2, .z3);
@@ -765,6 +769,7 @@ const fe64 = struct {
     const clobbers: std.builtin.assembly.Clobbers = .{
         .rax = true,
         .rbx = true,
+        .rcx = true,
         .rdx = true,
         .r8 = true,
         .r9 = true,
@@ -825,7 +830,7 @@ const fe64 = struct {
 
             /// `o = a²`; `o` may alias `a` (written after the last read).
             inline fn sq(st: *State, comptime o: Slot, comptime a: Slot) void {
-                run(sq_mulx, st, o, a, a);
+                run(if (use_adx) sq_adx else sq_mulx, st, o, a, a);
             }
 
             /// `o = a + b`; `o` may alias either input.
@@ -1092,6 +1097,58 @@ const fe64 = struct {
         \\adcq %%rbx, %%r15
         \\
     ++ reduce_r8_r15;
+
+    /// `a²` with ADX: the cross products, their doubling and the diagonal
+    /// squares on two interleaved carry chains (CF via `adcx`, OF via
+    /// `adox`), rcx the zero register, then the ADX reduction. Ported from
+    /// OpenSSL 3.5.5 `crypto/ec/asm/x25519-x86_64.pl` `x25519_fe64_sqr`
+    /// (Apache-2.0, see NOTICE): the same instruction order, operands read
+    /// from memory instead of rcx/rbp/rsi. The single-chain `sq_mulx` kept
+    /// the ADX build 1.21x OpenSSL's shared secret (2026-10-31).
+    const sq_adx =
+        \\movq 0(%[a]), %%rdx
+        \\mulxq %%rdx, %%r8, %%r15
+        \\mulxq 8(%[a]), %%r9, %%rax
+        \\xorl %%ecx, %%ecx
+        \\mulxq 16(%[a]), %%r10, %%rbx
+        \\adcxq %%rax, %%r10
+        \\mulxq 24(%[a]), %%r11, %%r12
+        \\movq 8(%[a]), %%rdx
+        \\adcxq %%rbx, %%r11
+        \\adcxq %%rcx, %%r12
+        \\mulxq 16(%[a]), %%rax, %%rbx
+        \\adoxq %%rax, %%r11
+        \\adcxq %%rbx, %%r12
+        \\mulxq 24(%[a]), %%rax, %%r13
+        \\movq 16(%[a]), %%rdx
+        \\adoxq %%rax, %%r12
+        \\adcxq %%rcx, %%r13
+        \\mulxq 24(%[a]), %%rax, %%r14
+        \\movq 8(%[a]), %%rdx
+        \\adoxq %%rax, %%r13
+        \\adcxq %%rcx, %%r14
+        \\adoxq %%rcx, %%r14
+        \\adcxq %%r9, %%r9
+        \\adoxq %%r15, %%r9
+        \\adcxq %%r10, %%r10
+        \\mulxq %%rdx, %%rax, %%rbx
+        \\movq 16(%[a]), %%rdx
+        \\adcxq %%r11, %%r11
+        \\adoxq %%rax, %%r10
+        \\adcxq %%r12, %%r12
+        \\adoxq %%rbx, %%r11
+        \\mulxq %%rdx, %%rax, %%rbx
+        \\movq 24(%[a]), %%rdx
+        \\adcxq %%r13, %%r13
+        \\adoxq %%rax, %%r12
+        \\adcxq %%r14, %%r14
+        \\adoxq %%rbx, %%r13
+        \\mulxq %%rdx, %%rax, %%r15
+        \\adoxq %%rax, %%r14
+        \\adcxq %%rcx, %%r15
+        \\adoxq %%rcx, %%r15
+        \\
+    ++ reduce_r8_r15_adx;
 
     /// `a + b`: a 257-bit sum, the carry folded as +38, and a second +38 if
     /// that fold carried (then the low words are < 38, so no third).
