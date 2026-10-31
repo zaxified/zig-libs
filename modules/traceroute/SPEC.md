@@ -25,7 +25,7 @@ Surveyed 2026-09-30 per `SURVEY-PLAYBOOK.md`; stars and activity as of that date
 | Project | Language | Licence | Stars | Last release / push | What a user notices against this module |
 |---|---|---|--:|---|---|
 | traceroute(8) (Linux `traceroute` by D. Butskoy, sourceforge) — **reference** (named by this module's SPEC) | C | GPL-2.0-or-later *(inferred; source not read, not on GitHub)* | — | — | The tool everyone runs. Default method is UDP, with ICMP (`-I`), TCP (`-T`) and others; parallel probes per hop, source/interface options, packet size, ICMP extensions/MPLS labels, `-A` AS lookup *(all inferred)*. Here: ICMP echo and UDP methods (no TCP), one probe in flight, hop addresses + RTT + terminal unreachable code, RFC 4950 MPLS labels, interface/source/TOS/fwmark. |
-| [traviscross/mtr](https://github.com/traviscross/mtr) | C | GPL-2.0 | 3.4k | push 2026-09-24 | Continuous traceroute+ping with per-hop running statistics (its README); ICMP default, other methods *(inferred)*. Here one-shot `Trace` with per-hop `stats()`; running statistics would be the caller looping. |
+| [traviscross/mtr](https://github.com/traviscross/mtr) | C | GPL-2.0 | 3.4k | push 2026-09-24 | Continuous traceroute+ping with per-hop running statistics (its README); ICMP default, other methods *(inferred)*. Here one-shot `Trace` with per-hop `stats()`, and since 2026-10-31 `Mtr`: rounds of one probe per TTL with per-hop sent/received, last/avg/best/worst and jitter, ICMP method only. |
 | [fujiapple852/trippy](https://github.com/fujiapple852/trippy) | Rust | Apache-2.0 | 8.0k | 0.13.0 (2025-05-05); push 2026-09-28 | Its README credits Paris and Dublin traceroute for multipath-aware strategies and uses Team Cymru for ASN mapping; ICMP/UDP/TCP methods *(inferred)*. Application plus library crates. Here: no ECMP-aware strategies (only `distinctAddresses()` reports load-balanced hops after the fact). |
 | [nxtrace/NTrace-core](https://github.com/nxtrace/NTrace-core) | Go | GPL-3.0 | 8.2k | push 2026-09-17 | Go tracer with geo/ASN annotations *(inferred)*; GPL, source not read. |
 | [mehrdadrad/mylg](https://github.com/mehrdadrad/mylg) | Go | MIT | 2.7k | push 2020-02-26 | Network diagnostic CLI with traceroute; stale since 2020 *(inferred)*. |
@@ -155,6 +155,33 @@ topology's router, the same as the raw traces and traceroute(8); the replay test
 rebuilt packets through `traceWith`. A live test traces 127.0.0.1 over a ping socket in the netns
 lane, where `ping_group_range` is open and no capability is held.
 
+## Continuous mode: `Mtr` (2026-10-31)
+
+What mtr shows, as a library: `Mtr.round` sends one ICMP probe to every TTL of the path (`gap_ms`
+apart — a paced round, never a burst), waits `timeout_ms` after the last, and folds the answers
+into `MtrHop` running statistics (sent, received → loss, last/best/worst/avg RTT, jitter = mean
+|ΔRTT| between consecutive answers, the responders seen — several mean a load-balanced hop, the
+last Destination Unreachable code). `LiveMtr` is the same over its own `LinuxTransport`, so it
+works unprivileged on a ping socket.
+
+**Invariants.** (1) *Rate:* `round` itself waits out the rest of `interval_ms` since the previous
+round began, and `validate` floors `interval_ms` at `min_mtr_interval_ms` (100) and caps
+`timeout_ms`, `gap_ms`, `payload_size` — a caller looping on `round` cannot probe faster than one
+round per interval, whatever it does. (2) *One RTT per probe:* round r's probes carry the sequence
+window `seq_base + r·hop_count …`; an answer is taken only inside its own round, so a late answer
+(past `timeout_ms`) quotes a finished window and is dropped — it is a loss, never a sample of a
+later probe. (3) *Same answer rules as `traceWith`* (`classifyIcmp`): ident, quoted destination,
+Echo Reply only from `dest`, first answer per probe wins. (4) *Path end:* the first TTL answered
+by the destination (or a Destination Unreachable) ends the path; later rounds probe up to it
+only. A shorter path forgets the TTLs beyond it; a router answering at the end TTL (the path
+grew) sends probing back to `max_hops`. (5) A transport error aborts the round uncounted. Memory:
+four slices sized `max_hops − first_ttl + 1`, allocated by `init`, nothing per round.
+
+Considered and rejected: carrying unanswered probes into the next round (mtr counts late replies
+in some builds) — it makes "which probe was this RTT" ambiguous and the loss figure depend on the
+interval; a separate thread or `std.Io` inside the engine — the caller owns scheduling, a round
+is a bounded blocking call over the same `Transport` seam, offline-testable on a virtual clock.
+
 ## Threat model / out of scope
 The live trace needs CAP_NET_RAW (raw ICMP socket) or, for the ICMP method, a group inside
 `net.ipv4.ping_group_range` (ping socket). On a ping socket the kernel only delivers answers about
@@ -194,7 +221,7 @@ declared source, destination and protocol (`quoted_src`/`quoted_dst`/`quoted_pro
 checksum is verified before a message is used (`icmpMessage`, as `icmp.echo.parseV4` does); ICMPv6's checksum
 needs the pseudo-header, which only the kernel has. These are `icmp` module findings (`icmp`'s F2/F7 — A1
 audit) shared with `pathmtu` and `icmp`'s own `Pinger`. Out of scope:
-parallel/all-hops-at-once probing, the TCP trace method, non-Linux live path, MTU/PMTU discovery.
+parallel probing in `traceWith` (`Mtr` has a round of probes in flight, paced), the TCP trace method, non-Linux live path, MTU/PMTU discovery.
 
 ## Verification
 Offline-first: the hop state machine runs against a fake transport that builds canned RFC 792-shaped

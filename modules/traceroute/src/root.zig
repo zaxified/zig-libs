@@ -24,6 +24,9 @@
 //!    (`SocketKind`), per-probe TTL via setsockopt IP_TTL /
 //!    IPV6_UNICAST_HOPS, ppoll for the probe timeout.
 //!
+//!  * `Mtr` / `LiveMtr` — continuous mode (mtr): rounds of one probe per
+//!    TTL, paced, with per-hop running statistics.
+//!
 //! Probes are sequential (one in flight), like traceroute(8)'s default —
 //! the state machine stays simple and every RTT is unambiguous. Malformed
 //! or hostile ICMP bytes never panic: `icmp.echo` parsing is bounds-checked
@@ -97,7 +100,7 @@ const linux = std.os.linux;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware",
+    .doc = "ICMP-echo path discovery — TTL-stepped probes, per-hop address + RTT stats, load-balanced-path aware, continuous (mtr) mode, unprivileged via ping sockets",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -804,6 +807,336 @@ fn slotOf(seq: u16, base: u16, total: usize) ?usize {
     return if (idx < total) idx else null;
 }
 
+// ── continuous mode (mtr) ───────────────────────────────────────────────────
+
+/// Floor of `MtrOptions.interval_ms`: no option makes `Mtr` probe the path
+/// more than ten rounds a second.
+pub const min_mtr_interval_ms: u32 = 100;
+/// Ceiling of `MtrOptions.timeout_ms`.
+pub const max_mtr_timeout_ms: u32 = 10_000;
+/// Distinct responders remembered per hop (`MtrHop.addresses`).
+pub const max_mtr_addresses = 4;
+
+pub const MtrOptions = struct {
+    /// Highest TTL probed (inclusive) while the destination has not answered.
+    max_hops: u8 = 30,
+    first_ttl: u8 = 1,
+    /// Least time between the starts of two rounds. `Mtr.round` waits out
+    /// the rest itself, so a caller looping on it cannot probe faster.
+    interval_ms: u32 = 1000,
+    /// How long after a round's last probe its answers are awaited; an
+    /// answer later than that counts as lost.
+    timeout_ms: u32 = 1000,
+    /// Gap between two probes of a round: a round is paced, never a burst.
+    gap_ms: u32 = 20,
+    /// ICMP echo payload bytes after the 8-byte header.
+    payload_size: u16 = 24,
+    /// Echo identifier (`LiveMtr.open` fills it, like `trace`).
+    ident: u16 = 0x7472,
+    /// First sequence number; round r's probe at TTL index i is
+    /// `seq_base +% r * hop_count + i`.
+    seq_base: u16 = 1,
+
+    // Live path only (`LiveMtr`), as in `Options`.
+    iface: ?[]const u8 = null,
+    source: ?netaddr.Ip = null,
+    tos: ?u8 = null,
+    fwmark: ?u32 = null,
+    socket: SocketKind = .auto,
+
+    pub fn validate(o: MtrOptions) error{InvalidOptions}!void {
+        if (o.first_ttl == 0 or o.max_hops < o.first_ttl) return error.InvalidOptions;
+        if (o.interval_ms < min_mtr_interval_ms) return error.InvalidOptions;
+        if (o.timeout_ms == 0 or o.timeout_ms > max_mtr_timeout_ms) return error.InvalidOptions;
+        if (o.gap_ms > 1000) return error.InvalidOptions;
+        if (o.payload_size > max_payload) return error.InvalidOptions;
+    }
+
+    /// The single-trace `Options` with the same live settings.
+    fn traceOptions(o: MtrOptions) Options {
+        return .{
+            .max_hops = o.max_hops,
+            .first_ttl = o.first_ttl,
+            .payload_size = o.payload_size,
+            .ident = o.ident,
+            .seq_base = o.seq_base,
+            .method = .icmp,
+            .iface = o.iface,
+            .source = o.source,
+            .tos = o.tos,
+            .fwmark = o.fwmark,
+            .socket = o.socket,
+        };
+    }
+};
+
+/// Running statistics of one TTL across rounds (mtr's columns).
+pub const MtrHop = struct {
+    ttl: u8,
+    /// Probes sent at this TTL, and answers (Time Exceeded, Echo Reply or
+    /// Destination Unreachable) received within their round.
+    sent: u32 = 0,
+    received: u32 = 0,
+    last_ns: ?u64 = null,
+    best_ns: ?u64 = null,
+    worst_ns: ?u64 = null,
+    /// Sum of the answered RTTs (saturating), for `avgNs`.
+    sum_ns: u64 = 0,
+    /// Sum of |RTT − previous RTT| over consecutive answers, for `jitterNs`.
+    jitter_sum_ns: u64 = 0,
+    jitter_count: u32 = 0,
+    /// The most recent responder.
+    address: ?netaddr.Ip = null,
+    /// Distinct responders in order of first appearance; more than one is a
+    /// load-balanced hop. At most `max_mtr_addresses`.
+    addresses: [max_mtr_addresses]netaddr.Ip = undefined,
+    address_count: u8 = 0,
+    /// The code of the last Destination Unreachable answered at this TTL.
+    unreachable_code: ?u8 = null,
+
+    pub fn avgNs(h: MtrHop) ?u64 {
+        return if (h.received == 0) null else h.sum_ns / h.received;
+    }
+
+    /// Mean variation between consecutive RTTs at this hop; null with fewer
+    /// than two answers.
+    pub fn jitterNs(h: MtrHop) ?u64 {
+        return if (h.jitter_count == 0) null else h.jitter_sum_ns / h.jitter_count;
+    }
+
+    /// Lost probes in permille of the sent ones; 0 before the first probe.
+    pub fn lossPermille(h: MtrHop) u32 {
+        if (h.sent == 0) return 0;
+        const lost: u64 = h.sent -| h.received;
+        return @intCast(lost * 1000 / h.sent);
+    }
+
+    pub fn addressList(h: *const MtrHop) []const netaddr.Ip {
+        return h.addresses[0..h.address_count];
+    }
+
+    fn record(h: *MtrHop, p: Probe) void {
+        h.sent +|= 1;
+        const rtt = p.rtt_ns orelse return;
+        h.received +|= 1;
+        if (h.last_ns) |prev| {
+            h.jitter_sum_ns +|= if (rtt > prev) rtt - prev else prev - rtt;
+            h.jitter_count +|= 1;
+        }
+        h.last_ns = rtt;
+        h.best_ns = if (h.best_ns) |b| @min(b, rtt) else rtt;
+        h.worst_ns = if (h.worst_ns) |w| @max(w, rtt) else rtt;
+        h.sum_ns +|= rtt;
+        if (p.kind == .dest_unreachable) h.unreachable_code = p.code;
+        const a = p.address orelse return;
+        h.address = a;
+        for (h.addressList()) |seen| {
+            if (seen.eql(a)) return;
+        }
+        if (h.address_count < max_mtr_addresses) {
+            h.addresses[h.address_count] = a;
+            h.address_count += 1;
+        }
+    }
+};
+
+/// A continuous trace, mtr style: every `round` sends one probe to each TTL
+/// (paced `gap_ms` apart), waits `timeout_ms` after the last one, and folds
+/// the answers into per-hop running statistics. Once the destination answers
+/// (or a Destination Unreachable ends the path) later rounds stop at that
+/// TTL; if a router answers there instead (the path grew), probing goes back
+/// to `max_hops`. Answers are only taken within their own round: a late one
+/// quotes a sequence number of a finished round and is dropped, so every RTT
+/// belongs to exactly one probe. The answer rules are `traceWith`'s
+/// (`classifyIcmp`: ident, quoted destination, Echo Reply from `dest`, first
+/// answer wins). ICMP method only. Single owner.
+pub const Mtr = struct {
+    gpa: std.mem.Allocator,
+    dest: netaddr.Ip,
+    family: echo.Family,
+    opts: MtrOptions,
+    /// One per TTL from `first_ttl` to `max_hops`.
+    hop_buf: []MtrHop,
+    /// The last round's outcome per TTL (`.timeout` for TTLs it did not probe).
+    last_buf: []Probe,
+    send_times: []?u64,
+    /// The round in progress (scratch, so a failed round leaves `last_buf`).
+    got_buf: []Probe,
+    /// Index of the TTL where the path ends (the destination's Echo Reply, or
+    /// a Destination Unreachable), once known.
+    end: ?usize = null,
+    /// Whether that end is the destination's Echo Reply.
+    end_reply: bool = false,
+    rounds: u64 = 0,
+    last_start: ?u64 = null,
+
+    pub const InitError = error{ InvalidOptions, OutOfMemory };
+
+    pub fn init(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: MtrOptions) InitError!Mtr {
+        try opts.validate();
+        const n: usize = @as(usize, opts.max_hops - opts.first_ttl) + 1;
+        const hop_buf = try gpa.alloc(MtrHop, n);
+        errdefer gpa.free(hop_buf);
+        const last_buf = try gpa.alloc(Probe, n);
+        errdefer gpa.free(last_buf);
+        const send_times = try gpa.alloc(?u64, n);
+        errdefer gpa.free(send_times);
+        const got_buf = try gpa.alloc(Probe, n);
+        for (hop_buf, 0..) |*h, i| h.* = .{ .ttl = opts.first_ttl + @as(u8, @intCast(i)) };
+        @memset(last_buf, .{});
+        return .{
+            .gpa = gpa,
+            .dest = dest,
+            .family = switch (dest) {
+                .v4 => .v4,
+                .v6 => .v6,
+            },
+            .opts = opts,
+            .hop_buf = hop_buf,
+            .last_buf = last_buf,
+            .send_times = send_times,
+            .got_buf = got_buf,
+        };
+    }
+
+    pub fn deinit(m: *Mtr) void {
+        m.gpa.free(m.hop_buf);
+        m.gpa.free(m.last_buf);
+        m.gpa.free(m.send_times);
+        m.gpa.free(m.got_buf);
+        m.* = undefined;
+    }
+
+    /// True once the destination answered in some round (and the path has
+    /// not grown past it since).
+    pub fn reached(m: *const Mtr) bool {
+        return m.end != null and m.end_reply;
+    }
+
+    /// The hops worth showing: up to the end of the path when known, else up
+    /// to the last TTL that ever answered (none before the first answer).
+    pub fn hops(m: *const Mtr) []const MtrHop {
+        return m.hop_buf[0..m.shown()];
+    }
+
+    /// The last round's outcome for each of `hops()`.
+    pub fn lastRound(m: *const Mtr) []const Probe {
+        return m.last_buf[0..m.shown()];
+    }
+
+    fn shown(m: *const Mtr) usize {
+        if (m.end) |e| return e + 1;
+        var n: usize = 0;
+        for (m.hop_buf, 0..) |h, i| {
+            if (h.received > 0) n = i + 1;
+        }
+        return n;
+    }
+
+    /// Forget every statistic (the path, the rounds), keep the options.
+    pub fn reset(m: *Mtr) void {
+        for (m.hop_buf, 0..) |*h, i| h.* = .{ .ttl = m.opts.first_ttl + @as(u8, @intCast(i)) };
+        @memset(m.last_buf, .{});
+        m.end = null;
+        m.end_reply = false;
+    }
+
+    /// One round over `t`. Waits out the rest of `interval_ms` since the
+    /// previous round began (packets arriving meanwhile are stale and
+    /// dropped), then probes TTL `first_ttl` up to the path's end (or
+    /// `max_hops`), collecting answers until `timeout_ms` after the last
+    /// probe or until every probe is answered. A transport failure aborts
+    /// the round without counting it.
+    pub fn round(m: *Mtr, t: Transport) TransportError!void {
+        var rbuf: [2048]u8 = undefined;
+        if (m.last_start) |start| {
+            const next = start +| @as(u64, m.opts.interval_ms) * std.time.ns_per_ms;
+            while (true) {
+                const now = t.nowFn(t.ctx);
+                if (now >= next) break;
+                _ = try t.recvFn(t.ctx, &rbuf, next - now);
+            }
+        }
+        m.last_start = t.nowFn(t.ctx);
+
+        const cap = m.hop_buf.len;
+        const n: usize = if (m.end) |e| e + 1 else cap;
+        // The window of this round's sequence numbers; `cap` <= 255, so the
+        // previous round's window never overlaps it.
+        const round_base = m.opts.seq_base +% @as(u16, @truncate(m.rounds *% cap));
+        const got = m.got_buf[0..n];
+        @memset(got, .{});
+        @memset(m.send_times[0..n], null);
+        var answered: usize = 0;
+
+        var pkt_buf: [echo.echo_header_len + max_payload]u8 = undefined;
+        const packet = pkt_buf[0 .. echo.echo_header_len + m.opts.payload_size];
+        const gap_ns = @as(u64, m.opts.gap_ms) * std.time.ns_per_ms;
+        const timeout_ns = @as(u64, m.opts.timeout_ms) * std.time.ns_per_ms;
+
+        var i: usize = 0;
+        var wait_until: u64 = 0;
+        while (true) {
+            if (i < n) {
+                const seq = round_base +% @as(u16, @intCast(i));
+                @memset(packet, 0);
+                echo.writeEchoRequest(m.family, packet, m.opts.ident, seq) catch
+                    @panic("traceroute: probe buffer smaller than the ICMP header");
+                try t.sendFn(t.ctx, m.opts.first_ttl + @as(u8, @intCast(i)), packet);
+                const at = t.nowFn(t.ctx);
+                m.send_times[i] = at;
+                i += 1;
+                wait_until = if (i < n) at +| gap_ns else at +| timeout_ns;
+            }
+            // Collect until the next send (or the round's end).
+            while (true) {
+                if (i == n and answered == n) break;
+                const now = t.nowFn(t.ctx);
+                if (now >= wait_until) break;
+                const resp = (try t.recvFn(t.ctx, &rbuf, wait_until - now)) orelse break;
+                if (resp.len > rbuf.len) return error.RecvFailed;
+                const rcv_at = t.nowFn(t.ctx);
+                const pkt = rbuf[0..resp.len];
+                const msg = icmpMessage(m.family, pkt, t.strip_ip_header) orelse continue;
+                const a = classifyIcmp(m.family, pkt, t.strip_ip_header, msg, m.opts.ident, m.dest, resp.from) orelse continue;
+                const j = slotOf(a.seq, round_base, n) orelse continue; // another round's
+                const st = m.send_times[j] orelse continue; // not sent yet: spoof
+                if (got[j].kind != .timeout) continue; // first answer wins
+                got[j] = a.probe;
+                got[j].rtt_ns = rcv_at -| st;
+                answered += 1;
+            }
+            if (i == n) break;
+        }
+
+        m.rounds +%= 1;
+        for (got, 0..) |p, k| m.hop_buf[k].record(p);
+        @memcpy(m.last_buf[0..n], got);
+        @memset(m.last_buf[n..], .{});
+
+        // Where does the path end now?
+        var end: ?usize = null;
+        for (got, 0..) |p, k| {
+            if (p.kind == .reply or p.kind == .dest_unreachable) {
+                end = k;
+                break;
+            }
+        }
+        if (end) |e| {
+            // A shorter path: what lay beyond it is gone.
+            if (m.end == null or e < m.end.?) {
+                for (m.hop_buf[e + 1 ..], e + 1..) |*h, k| h.* = .{ .ttl = m.opts.first_ttl + @as(u8, @intCast(k)) };
+                @memset(m.last_buf[e + 1 ..], .{});
+            }
+            m.end = e;
+            m.end_reply = got[e].kind == .reply;
+        } else if (m.end) |e| {
+            // A router answers where the destination was: the path grew.
+            if (got[e].kind == .time_exceeded) m.end = null;
+        }
+    }
+};
+
 // ── live path: raw or ping ICMP socket (Linux) ─────────────────────────────
 
 /// Live transport over `icmp.Socket`: raw (CAP_NET_RAW), or an unprivileged
@@ -1221,6 +1554,38 @@ pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceE
     o.seq_base = r.seq_base;
     return traceWith(gpa, lt.transport(), dest, o);
 }
+
+/// `Mtr` over its own live socket (raw, or a ping socket without CAP_NET_RAW;
+/// `MtrOptions.socket`). Do not move it while a round runs.
+pub const LiveMtr = struct {
+    lt: LinuxTransport,
+    mtr: Mtr,
+
+    pub const OpenError = Mtr.InitError || LinuxTransport.OpenError;
+
+    /// Opens the socket and draws a random ident and starting sequence (the
+    /// kernel's ident on a ping socket), like `trace`.
+    pub fn open(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: MtrOptions) OpenError!LiveMtr {
+        try opts.validate();
+        var lt = try LinuxTransport.openWith(dest, opts.traceOptions());
+        errdefer lt.close();
+        var o = opts;
+        const r = randomIdentAndSeq();
+        o.ident = if (lt.sock.kind == .dgram) lt.ident() else r.ident;
+        o.seq_base = r.seq_base;
+        return .{ .lt = lt, .mtr = try Mtr.init(gpa, dest, o) };
+    }
+
+    pub fn close(l: *LiveMtr) void {
+        l.mtr.deinit();
+        l.lt.close();
+        l.* = undefined;
+    }
+
+    pub fn round(l: *LiveMtr) TransportError!void {
+        return l.mtr.round(l.lt.transport());
+    }
+};
 
 // ── tests: canned-bytes fake transport ──────────────────────────────────────
 
@@ -2328,6 +2693,154 @@ test "errQueuePacket: local errors, short quotes, family mismatches and small bu
     const p = errQueuePacket(.v4, testErrInfo(&big, .v4, 11, 0, test_dest, router_a), out[0..64]).?;
     try testing.expectEqual(@as(usize, 64), p.len);
     try testing.expect(icmpMessage(.v4, out[0..p.len], false) != null);
+}
+
+// ── continuous mode (Mtr) ──
+
+test "Mtr: finds the path, then probes only up to the destination, round after round" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 6 });
+    defer m.deinit();
+    try testing.expectEqual(@as(usize, 0), m.hops().len);
+    try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 6), f.sent.items.len); // the first round goes to max_hops
+    try testing.expect(m.reached());
+    try m.round(f.transport());
+    try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 6 + 3 + 3), f.sent.items.len);
+
+    const hs = m.hops();
+    try testing.expectEqual(@as(usize, 3), hs.len);
+    for (hs, 1..) |h, ttl| {
+        try testing.expectEqual(@as(u8, @intCast(ttl)), h.ttl);
+        try testing.expectEqual(@as(u32, 3), h.sent);
+        try testing.expectEqual(@as(u32, 3), h.received);
+        try testing.expectEqual(@as(u32, 0), h.lossPermille());
+        try testing.expect(h.best_ns.? <= h.avgNs().? and h.avgNs().? <= h.worst_ns.?);
+        try testing.expect(h.jitterNs() != null);
+    }
+    try testing.expect(hs[0].address.?.eql(router_a));
+    try testing.expect(hs[1].address.?.eql(router_b));
+    try testing.expect(hs[2].address.?.eql(test_dest));
+    const last = m.lastRound();
+    try testing.expectEqual(Probe.Kind.time_exceeded, last[0].kind);
+    try testing.expectEqual(Probe.Kind.reply, last[2].kind);
+    // TTLs past the destination were reset when the end was found.
+    try testing.expectEqual(@as(u32, 0), m.hop_buf[3].sent);
+}
+
+test "Mtr: rounds start at least interval_ms apart, the caller cannot go faster" {
+    var f: FakeTransport = .{ .behaviors = &.{.reply} };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 2, .interval_ms = 1000 });
+    defer m.deinit();
+    var starts: [4]u64 = undefined;
+    for (&starts) |*st| {
+        try m.round(f.transport());
+        st.* = m.last_start.?;
+    }
+    for (starts[1..], starts[0..3]) |b, a| try testing.expect(b - a >= 1000 * std.time.ns_per_ms);
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .interval_ms = min_mtr_interval_ms - 1 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .timeout_ms = 0 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .timeout_ms = max_mtr_timeout_ms + 1 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .first_ttl = 0 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .first_ttl = 5, .max_hops = 4 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .gap_ms = 1001 }));
+    try testing.expectError(error.InvalidOptions, Mtr.init(testing.allocator, test_dest, .{ .payload_size = max_payload + 1 }));
+}
+
+test "Mtr: a silent hop is all loss; a late answer belongs to no round" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded_late = router_a }, .drop, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3 });
+    defer m.deinit();
+    for (0..4) |_| try m.round(f.transport());
+    const hs = m.hops();
+    try testing.expectEqual(@as(usize, 3), hs.len);
+    // TTL 1 answers 1.5 s after each probe: past its round (timeout 1 s).
+    try testing.expectEqual(@as(u32, 4), hs[0].sent);
+    try testing.expectEqual(@as(u32, 0), hs[0].received);
+    try testing.expectEqual(@as(u32, 1000), hs[0].lossPermille());
+    try testing.expectEqual(@as(u32, 0), hs[1].received);
+    try testing.expectEqual(@as(u32, 4), hs[2].received);
+    try testing.expectEqual(@as(?u64, null), hs[1].avgNs());
+    try testing.expectEqual(@as(?u64, null), hs[1].jitterNs());
+}
+
+test "Mtr: the path grows and shrinks; Destination Unreachable ends it" {
+    const short = [_]Behavior{ .{ .time_exceeded = router_a }, .reply };
+    const long = [_]Behavior{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .{ .time_exceeded = router_c }, .reply };
+    var f: FakeTransport = .{ .behaviors = &short };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 8 });
+    defer m.deinit();
+    try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 2), m.hops().len);
+    f.behaviors = &long;
+    try m.round(f.transport()); // TTL 2 is a router now: the end is lost
+    try testing.expect(!m.reached());
+    try m.round(f.transport()); // probes to max_hops again, finds TTL 4
+    try testing.expect(m.reached());
+    try testing.expectEqual(@as(usize, 4), m.hops().len);
+    f.behaviors = &short;
+    try m.round(f.transport()); // shorter again: TTL 3 and 4 are forgotten
+    try testing.expectEqual(@as(usize, 2), m.hops().len);
+    try testing.expectEqual(@as(u32, 0), m.hop_buf[2].sent);
+
+    var g: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .unreach = .{ .from = router_b, .code = 13 } } } };
+    defer g.deinit();
+    m.reset();
+    try m.round(g.transport());
+    try testing.expect(!m.reached());
+    try testing.expectEqual(@as(usize, 2), m.hops().len);
+    try testing.expectEqual(@as(?u8, 13), m.hops()[1].unreachable_code);
+}
+
+test "Mtr: a load-balanced hop lists its responders; garbage never counts or panics" {
+    const routers = [_]netaddr.Ip{ router_a, router_b };
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded_multi = &routers }, .reply } };
+    defer f.deinit();
+    // max_hops 3: the fake alternates responders by send count, so TTL 1
+    // lands on both (round 1 sends 3 probes, later rounds 2).
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3, .gap_ms = 0 });
+    defer m.deinit();
+    for (0..4) |_| try m.round(f.transport());
+    try testing.expectEqual(@as(usize, 2), m.hops()[0].addressList().len);
+
+    var g: FakeTransport = .{ .behaviors = &.{ .{ .garbage = "\x0b\x00\x00\x00" }, .{ .garbage = &@as([64]u8, @splat(0xff)) }, .reply } };
+    defer g.deinit();
+    m.reset();
+    for (0..3) |_| try m.round(g.transport());
+    try testing.expectEqual(@as(u32, 0), m.hops()[0].received);
+    try testing.expectEqual(@as(u32, 0), m.hops()[1].received);
+    try testing.expectEqual(@as(u32, 3), m.hops()[2].received);
+}
+
+test "Mtr: a transport failure aborts the round without counting it" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3 });
+    defer m.deinit();
+    try m.round(f.transport());
+    f.fail_send_at_ttl = 2;
+    try testing.expectError(error.SendFailed, m.round(f.transport()));
+    try testing.expectEqual(@as(u32, 1), m.hops()[0].sent);
+    try testing.expectEqual(Probe.Kind.reply, m.lastRound()[1].kind);
+}
+
+test "live: LiveMtr over a ping socket to 127.0.0.1 (skipped without ping_group_range)" {
+    bringLoopbackUp();
+    var l = LiveMtr.open(testing.allocator, netaddr.parseIp("127.0.0.1").?, .{ .max_hops = 3, .interval_ms = 100, .socket = .dgram }) catch |err| switch (err) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return err,
+    };
+    defer l.close();
+    try l.round();
+    try l.round();
+    try testing.expect(l.mtr.reached());
+    try testing.expectEqual(@as(usize, 1), l.mtr.hops().len);
+    try testing.expectEqual(@as(u32, 2), l.mtr.hops()[0].received);
 }
 
 // ── 2026-10-04: UDP method, MPLS extensions, live options ───────────────────

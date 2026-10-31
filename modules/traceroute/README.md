@@ -25,6 +25,11 @@ SPEC.md "Threat model" for exactly what is and is not checked.
 - **Deps:** `icmp` (echo codec + error parsing + raw socket), `netaddr`
   (address type/parse/format), `latency-stats` (per-hop min/avg/max/loss).
 
+Continuous mode (mtr): `Mtr` / `LiveMtr` — `round()` probes every TTL once,
+paced, and keeps per-hop running statistics (`MtrHop`: sent/received/loss,
+last/avg/best/worst, jitter, responders); rounds are at least `interval_ms`
+apart (enforced, floor 100 ms).
+
 Result model: `Trace { hops, reached, unreachable_code, transport_err, dest }`;
 `Hop { ttl, probes }` with `stats()` (via latency-stats) and
 `distinctAddresses()` (load-balanced hops answer from more than one

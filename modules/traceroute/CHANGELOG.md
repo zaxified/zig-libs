@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **CONSUMER-VISIBLE (additive):** continuous mode, mtr style. `Mtr` (`init`/`round`/`hops`/`lastRound`/`reached`/`reset`) over any `Transport`, and `LiveMtr` over its own socket (unprivileged on a ping socket). One probe per TTL per round, `gap_ms` apart; per-hop `MtrHop` running statistics (loss, last/avg/best/worst, jitter, responders, unreachable code); answers only within their own round; rounds at least `interval_ms` apart, enforced by `round` itself (floor `min_mtr_interval_ms` = 100, `timeout_ms` ≤ 10 s). See SPEC "Continuous mode".
+
 - **2026-10-31** — **CONSUMER-VISIBLE (additive):** traceroute without privilege. `Options.socket` (`SocketKind`: `.auto` = raw when the process may, else an unprivileged ping socket; `.raw`; `.dgram`) — the ICMP method now works over a ping socket, whose error queue the transport reads and rebuilds into the RFC 792 message the engine already parses (`errQueuePacket`; MPLS labels are not available there). `trace` uses the ping socket's kernel-assigned ident. `validate` refuses `.udp` with `.dgram`. Kernel oracle: 8 more real-router traces (`icmp-dgram`, v4/v6) agree with the topology and traceroute(8); `Scenario` gained `strip_ip_header`. Internal: the ICMP answer rules moved into `classifyIcmp`, shared with the coming continuous mode.
 
 - **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GX sweep — new tests only (error-queue drain bound, readable-datagram return, the receive loop's wakeup count and CPU time), in a test block at the end of `root.zig`.
