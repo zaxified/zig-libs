@@ -155,3 +155,118 @@ test "wiphy.Parser: at most max_total_channels channels across all radios and ba
     defer gpa.free(f);
     try testing.expectError(error.TooManyEntries, p.feed(f));
 }
+
+// ── delta audit (wave GX, gxa-a) ────────────────────────────────────────────
+
+test "wiphy.Parser: a feed that hit OutOfMemory can be fed again, no stale channel index (sweep audit GX-NL1)" {
+    // `freqFor` puts the index entry BEFORE appending the channel; if the
+    // append fails the entry must go, or the retry resolves the channel to a
+    // position past the end of the list.
+    var i: usize = 0;
+    var failed: usize = 0;
+    while (i < 40) : (i += 1) {
+        var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
+        var p: wiphy.Parser = .init(fa.allocator());
+        defer p.deinit();
+        const f = try fragment(testing.allocator, 0, 1, 0, 3);
+        defer testing.allocator.free(f);
+        p.feed(f) catch |e| {
+            try testing.expectEqual(error.OutOfMemory, e);
+            failed += 1;
+            fa.fail_index = std.math.maxInt(usize);
+            try p.feed(f);
+        };
+        fa.fail_index = std.math.maxInt(usize); // finish() is not under test here
+        const list = try p.finish();
+        defer wiphy.freeAll(fa.allocator(), list);
+        try testing.expectEqual(@as(usize, 3), list[0].bands[0].freqs.len);
+        for (list[0].bands[0].freqs, 0..) |fr, k| try testing.expectEqual(2412 + @as(u32, @intCast(k)), fr.freq_mhz);
+    }
+    try testing.expect(failed >= 3);
+}
+
+test "wiphy.Parser: the aggregate channel count starts again after finish (sweep audit GX-NL2)" {
+    const gpa = testing.allocator;
+    var p: wiphy.Parser = .init(gpa);
+    defer p.deinit();
+    var b: u16 = 0;
+    while (b < wiphy.max_bands) : (b += 1) {
+        const f = try fragment(gpa, 0, b, 0, wiphy.max_channels_per_band);
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    wiphy.freeAll(gpa, try p.finish());
+    // The parser is reusable: a full second parse fits the cap again.
+    const f = try fragment(gpa, 1, 0, 0, 10);
+    defer gpa.free(f);
+    try p.feed(f);
+    const list = try p.finish();
+    defer wiphy.freeAll(gpa, list);
+    try testing.expectEqual(@as(usize, 10), list[0].bands[0].freqs.len);
+}
+
+test "the published ceilings keep their magnitudes (sweep audit GX-NL3)" {
+    try testing.expectEqual(@as(usize, 256), wiphy.max_wiphys);
+    try testing.expectEqual(@as(usize, 16), wiphy.max_bands);
+    try testing.expectEqual(@as(usize, 1024), wiphy.max_channels_per_band);
+    try testing.expectEqual(@as(usize, 1024), reg.max_rules);
+    try testing.expectEqual(@as(usize, 256), reg.max_domains);
+}
+
+test "wiphy.Parser: re-fed channels do not count toward the aggregate cap (sweep audit GX-NL5)" {
+    const gpa = testing.allocator;
+    var p: wiphy.Parser = .init(gpa);
+    defer p.deinit();
+    // 16383 channels: one short of the cap.
+    var b: u16 = 0;
+    while (b < wiphy.max_bands - 1) : (b += 1) {
+        const f = try fragment(gpa, 0, b, 0, wiphy.max_channels_per_band);
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    {
+        const f = try fragment(gpa, 0, b, 0, wiphy.max_channels_per_band - 1);
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    // 2048 re-fed channels add nothing...
+    {
+        const f = try fragment(gpa, 0, 0, 0, wiphy.max_channels_per_band);
+        defer gpa.free(f);
+        try p.feed(f);
+        try p.feed(f);
+    }
+    // ...so exactly one new channel still fits, and the next is refused.
+    {
+        const f = try fragment(gpa, 0, b, wiphy.max_channels_per_band - 1, 1);
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    const f = try fragment(gpa, 1, 0, 0, 1);
+    defer gpa.free(f);
+    try testing.expectError(error.TooManyEntries, p.feed(f));
+}
+
+test "wiphy.Parser: a re-fed channel updates its own entry, not another (sweep audit GX-NL6)" {
+    const gpa = testing.allocator;
+    var p: wiphy.Parser = .init(gpa);
+    defer p.deinit();
+    {
+        const f = try fragment(gpa, 0, 1, 0, 5);
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    {
+        const f = try fragment(gpa, 0, 1, 3, 1); // channel 3 again
+        defer gpa.free(f);
+        try p.feed(f);
+    }
+    const list = try p.finish();
+    defer wiphy.freeAll(gpa, list);
+    const freqs = list[0].bands[0].freqs;
+    try testing.expectEqual(@as(usize, 5), freqs.len);
+    for (freqs, 0..) |fr, k| {
+        try testing.expectEqual(@as(u32, @intCast(k)), fr.index);
+        try testing.expectEqual(2412 + @as(u32, @intCast(k)), fr.freq_mhz);
+    }
+}

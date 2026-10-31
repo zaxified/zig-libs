@@ -1649,3 +1649,41 @@ test "corpus: every event seed reaches both parsers, and the counts are pinned" 
     try testing.expectEqual(@as(usize, 2), ends_scan);
     try testing.expectEqual(@as(usize, 1), groups);
 }
+
+/// An `NLMSG_ERROR` ACK (errno 0), optionally flagged.
+fn ackDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, flags: u16) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    const hdr = try codec.appendHeader(gpa, &list, codec.NLMSG_ERROR, flags, seq, pid);
+    try list.appendNTimes(gpa, 0, 4);
+    codec.finishHeader(&list, hdr);
+    return list.toOwnedSlice(gpa);
+}
+
+test "a flagged ACK ends an interrupted walk with DumpInterrupted; an unflagged one with null (sweep audit GX-NL4)" {
+    const family_id: u16 = 41;
+    const seq: u32 = 5;
+    const pid: u32 = 100;
+    const gpa = testing.allocator;
+    const plain = try dumpIntrDatagram(gpa, pid, seq, family_id, 0);
+    defer gpa.free(plain);
+    const ack_flagged = try ackDatagram(gpa, pid, seq, codec.NLM_F_DUMP_INTR);
+    defer gpa.free(ack_flagged);
+    const ack = try ackDatagram(gpa, pid, seq, 0);
+    defer gpa.free(ack);
+
+    var cl: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ plain, ack_flagged } }, .family_id = family_id };
+    var st: DumpState = .{};
+    try testing.expect((try dumpStep(&cl, seq, &st)) != null);
+    try testing.expectError(error.DumpInterrupted, dumpStep(&cl, seq, &st));
+    try testing.expect(st.finished);
+
+    var cl2: MockScript = .{ .sock = .{ .portid = pid, .script = &.{ plain, ack } }, .family_id = family_id };
+    var st2: DumpState = .{};
+    try testing.expect((try dumpStep(&cl2, seq, &st2)) != null);
+    try testing.expectEqual(@as(?DumpMessage, null), try dumpStep(&cl2, seq, &st2));
+}
+
+test "the per-dump item ceiling keeps its magnitude (sweep audit GX-NL3)" {
+    try testing.expectEqual(@as(u32, 65536), max_dump_items);
+}

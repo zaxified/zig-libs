@@ -1814,3 +1814,124 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere (dump e
 test {
     _ = @import("sweep_test.zig");
 }
+
+// ── delta audit (wave GX, gxa-a) ────────────────────────────────────────────
+
+test "dump engine: only a live attempt's payload messages count toward the cap (sweep audit GX-CT1)" {
+    // Cap 3 and a reply that is far over it in total: the records of an
+    // interrupted tail or behind a bad record are discarded, not counted; the
+    // count restarts with each attempt; a payload message of another type
+    // counts although it yields no flow.
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    const three = &goldens.dump_reply_three_flows;
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    const intr_done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR);
+    var b1: [512]u8 = undefined;
+    const flagged = goldenFirstMessage(&b1, id.pid, id.seq, wire.msg_ct_new);
+    std.mem.writeInt(u16, b1[6..8], codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, native_endian);
+
+    { // interrupted tail of 6 records, then a clean attempt with 3
+        var t: ScriptedTransport = .{ .script = &.{ flagged, three, three, &done, three, &done }, .pid = id.pid, .seq = id.seq };
+        const flows = try dumpOverLimit(testing.allocator, &t, .unspec, 3);
+        defer testing.allocator.free(flows);
+        try testing.expectEqual(@as(usize, 3), flows.len);
+        try testing.expectEqual(@as(usize, 2), t.requests);
+    }
+    { // 3 counted records in attempt 1, flagged DONE, 3 in attempt 2: per-attempt count, stale flows dropped
+        var t: ScriptedTransport = .{ .script = &.{ three, &intr_done, three, &done }, .pid = id.pid, .seq = id.seq };
+        const flows = try dumpOverLimit(testing.allocator, &t, .unspec, 3);
+        defer testing.allocator.free(flows);
+        try testing.expectEqual(@as(usize, 3), flows.len);
+        try testing.expectEqual(@as(usize, 2), t.requests);
+    }
+    { // a bad record, then 6 more: MalformedReply (after the drain), not the cap
+        const bad = badRecordDatagram(id.pid, id.seq);
+        var t: ScriptedTransport = .{ .script = &.{ &bad, three, three, &done }, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.MalformedReply, dumpOverLimit(testing.allocator, &t, .unspec, 3));
+        try testing.expectEqual(@as(usize, 4), t.recvs);
+    }
+    { // one CT_DELETE-typed message + 3 flows against cap 3: the 3rd flow is the 4th payload message
+        var b2: [512]u8 = undefined;
+        const other = goldenFirstMessage(&b2, id.pid, id.seq, wire.msg_ct_delete);
+        var t: ScriptedTransport = .{ .script = &.{ other, three, &done }, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.TooManyMessages, dumpOverLimit(testing.allocator, &t, .unspec, 3));
+    }
+}
+
+/// `n` copies of the golden dump's first message, back to back in one datagram.
+fn manyFlowsDatagram(gpa: std.mem.Allocator, pid: u32, seq: u32, n: usize) ![]u8 {
+    var b: [512]u8 = undefined;
+    const one = goldenFirstMessage(&b, pid, seq, wire.msg_ct_new);
+    const out = try gpa.alloc(u8, one.len * n);
+    for (0..n) |i| @memcpy(out[i * one.len ..][0..one.len], one);
+    return out;
+}
+
+test "dumpOver: exactly 1 Mi flows are collected, one more is TooManyMessages (sweep audit GX-CT2)" {
+    // Reaches the SHIPPED ceiling through `dumpOver` itself (the parameterised
+    // engine test cannot see the wiring). 32768 datagrams of 32 flows stay
+    // inside the 65536-datagram budget, so the record cap is what bites.
+    if (native_endian != .little) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const id = goldenDumpIdentity();
+    const per = 32;
+    const n_dgrams = max_dump_flows / per;
+    const full = try manyFlowsDatagram(gpa, id.pid, id.seq, per);
+    defer gpa.free(full);
+    const one = try manyFlowsDatagram(gpa, id.pid, id.seq, 1);
+    defer gpa.free(one);
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    const script = try gpa.alloc([]const u8, n_dgrams + 2);
+    defer gpa.free(script);
+    @memset(script[0..n_dgrams], full);
+    script[n_dgrams] = &done;
+    script[n_dgrams + 1] = &done;
+    {
+        var t: ScriptedTransport = .{ .script = script[0 .. n_dgrams + 1], .pid = id.pid, .seq = id.seq };
+        const flows = try dumpOver(gpa, &t, .unspec);
+        defer gpa.free(flows);
+        try testing.expectEqual(@as(usize, max_dump_flows), flows.len);
+    }
+    {
+        script[n_dgrams] = one;
+        var t: ScriptedTransport = .{ .script = script, .pid = id.pid, .seq = id.seq };
+        try testing.expectError(error.TooManyMessages, dumpOver(gpa, &t, .unspec));
+    }
+}
+
+/// An `NLMSG_ERROR` message with errno 0 (an ACK), carrying `flags`.
+fn ackDatagram(pid: u32, seq: u32, flags: u16) [codec.header_len + 4]u8 {
+    var b: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, b[0..4], b.len, native_endian);
+    std.mem.writeInt(u16, b[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u16, b[6..8], flags, native_endian);
+    std.mem.writeInt(u32, b[8..12], seq, native_endian);
+    std.mem.writeInt(u32, b[12..16], pid, native_endian);
+    return b;
+}
+
+test "dump engine: a flag on a terminating NLMSG_ERROR is judged without it (sweep audit GX-CT3)" {
+    // `triage` strips NLM_F_DUMP_INTR from the terminator (DONE *or* ERROR) so
+    // the drain sees its end; kept on, the walk would read past it into the
+    // next attempt's reply.
+    if (native_endian != .little) return error.SkipZigTest;
+    const id = goldenDumpIdentity();
+    const done = controlDatagram(id.pid, id.seq, codec.NLM_F_MULTI);
+    const ack = ackDatagram(id.pid, id.seq, codec.NLM_F_DUMP_INTR);
+    {
+        var t: ScriptedTransport = .{ .script = &.{ &ack, &goldens.dump_reply_three_flows, &done }, .pid = id.pid, .seq = id.seq };
+        const flows = try dumpOver(testing.allocator, &t, .unspec);
+        defer testing.allocator.free(flows);
+        try testing.expectEqual(@as(usize, 3), flows.len); // attempt 2 only
+        try testing.expectEqual(@as(usize, 2), t.requests);
+        try testing.expectEqual(@as(usize, 3), t.recvs);
+    }
+    {
+        var t: ScriptedTransport = .{ .script = &.{ &ack, &goldens.dump_reply_three_flows, &done }, .pid = id.pid, .seq = id.seq };
+        var v: CollectingVisitor = .{};
+        defer v.deinit();
+        try testing.expectError(error.InconsistentDump, dumpEachOver(&t, .unspec, &v, CollectingVisitor.visit));
+        try testing.expectEqual(@as(usize, 1), t.recvs); // stops at the ACK
+    }
+}
