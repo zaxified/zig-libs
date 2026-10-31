@@ -6247,3 +6247,19 @@ test "a flood of foreign datagrams ends the call after exactly max_foreign_datag
     for (0..max_foreign_datagrams + 1) |_| _ = linux.write(fds[1], &one, one.len);
     try testing.expectError(error.RecvFailed, sock.recvDatagram());
 }
+
+test "a foreign-datagram flood while waiting for an ACK is ForeignDatagramLimit, folded to RecvFailed by awaitAck (sweep audit GZ-B5)" {
+    // Same socketpair seam as the recvDatagram test above: every datagram the
+    // peer writes is foreign, so the ACK wait never sees a kernel reply.
+    var fds: [2]i32 = undefined;
+    try nonblockingPair(&fds);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{ .gpa = testing.allocator, .fd = fds[0], .portid = 0, .seq = 0, .buf = try testing.allocator.alloc(u8, 64) };
+    defer testing.allocator.free(sock.buf);
+    const one: [8]u8 = @splat(0xab);
+    for (0..max_foreign_datagrams + 1) |_| try testing.expectEqual(@as(usize, 8), linux.write(fds[1], &one, one.len));
+    try testing.expectError(error.ForeignDatagramLimit, sock.awaitAckStrict(1));
+    for (0..max_foreign_datagrams + 1) |_| try testing.expectEqual(@as(usize, 8), linux.write(fds[1], &one, one.len));
+    try testing.expectError(error.RecvFailed, sock.awaitAck(1));
+}

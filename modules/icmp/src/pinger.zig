@@ -2284,3 +2284,56 @@ test "integration: embed API prepare/step/pollFds round against loopback" {
     try std.testing.expect(p.stats(id).alive());
     try std.testing.expectEqual(@as(u32, 1), p.stats(id).sent);
 }
+
+test "step drops a stale event without releasing the answered slot of a newer probe (sweep audit GZ-B2)" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1 });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.ping_q.items.len = 0; // only the hand-placed events matter
+    const sent = monoNow();
+    const seq = try p.seqmap.add(id, 0, sent);
+    p.seqmap.fetchPtr(seq).?.answered = true; // the live probe was answered, its slot is kept for duplicates
+    const due = monoNow() - 1;
+    // Same target, probe number and slot, but the send time of an earlier lap.
+    try p.timeout_q.push(p.gpa, .{ .time = due, .target = id, .probe = 0, .seq = seq, .sent_ns = sent - 7 });
+    _ = try p.step();
+    try std.testing.expect(p.seqmap.fetch(seq) != null);
+    // Positive control: the event that belongs to the probe releases the slot.
+    try p.timeout_q.push(p.gpa, .{ .time = due, .target = id, .probe = 0, .seq = seq, .sent_ns = sent });
+    _ = try p.step();
+    try std.testing.expect(p.seqmap.fetch(seq) == null);
+}
+
+test "handleTimeout ignores an event whose send time is not the live entry's (sweep audit GZ-B3)" {
+    // The second line of defense past `step`'s owner check, now keyed on the
+    // send time as well (same target, probe and slot, different lap).
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1 });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    const sent = monoNow();
+    const seq = try p.seqmap.add(id, 0, sent);
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    try p.handleTimeout(.{ .time = sent, .target = id, .probe = 0, .seq = seq, .sent_ns = sent - 7 }, sent);
+    try std.testing.expectEqual(@as(u32, 1), p.inflight);
+    try std.testing.expectEqual(@as(u16, 1), p.targets.items[id].pending);
+    try std.testing.expect(p.seqmap.fetch(seq) != null);
+    try p.handleTimeout(.{ .time = sent, .target = id, .probe = 0, .seq = seq, .sent_ns = sent }, sent);
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+    try std.testing.expect(p.seqmap.fetch(seq) == null);
+}
+
+test "takeSlot finds the one free id however far the cursor has to walk, and fails only when none is free (sweep audit GZ-B4)" {
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .count, .count = 1 });
+    defer p.deinit();
+    const now = monoNow();
+    var i: usize = 0;
+    while (i < seqmap.capacity) : (i += 1) _ = try p.seqmap.add(0, 0, now); // every id held by a probe in flight
+    // Every id held and unanswered: nothing to recycle, nothing to skip to.
+    try std.testing.expectError(error.SequenceSpaceExhausted, p.takeSlot(0, 1, now));
+    // One id free, the cursor just past it: the walk takes all 65536 tries.
+    const free: u16 = 1234;
+    p.seqmap.release(free);
+    p.seqmap.cursor = free +% 1;
+    try std.testing.expectEqual(free, try p.takeSlot(0, 1, now));
+}

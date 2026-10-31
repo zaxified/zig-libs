@@ -1784,3 +1784,20 @@ test "sweep REV-genetlink-1: a batch that fails mid-reply leaves out all-null" {
     try testing.expectEqual(@as(?u32, null), out[0]);
     try testing.expectEqual(@as(?u32, null), out[1]);
 }
+
+test "a group reply whose family id is exactly GENL_ID_CTRL or GENL_MAX_ID is accepted (sweep audit GZ-B1)" {
+    // Both ends of the valid range are inclusive; the neighbours outside it
+    // are pinned as MalformedReply by the REV-genetlink-1 test above.
+    for ([_]u16{ GENL_ID_CTRL, GENL_MAX_ID }) |id| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(testing.allocator);
+        try groupReply(&list, CTRL_CMD_NEWFAMILY, "nlctrl", id, "notify", 5);
+        try appendBareAck(testing.allocator, &list, 42, 7);
+        var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+        try testing.expectEqual(@as(?u32, 5), try ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "notify" }, 42));
+        var out: [1]?u32 = .{null};
+        t = .{ .script = &.{list.items}, .pid = 7 };
+        _ = try ctrlGetFamilyOver(&t, "nlctrl", .{ .many_groups = .{ .names = &.{"notify"}, .out = &out } }, 42);
+        try testing.expectEqual(@as(?u32, 5), out[0]);
+    }
+}

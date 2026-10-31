@@ -5,6 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **NO CONSUMER-VISIBLE CHANGE:** delta mutation audit of the § GZ sweep (13 mutants, ReleaseSafe schemata): 13 killed after 1 new test (a group reply with family id exactly GENL_ID_CTRL / GENL_MAX_ID). hpke's 27 mutants were all killed by the sweep tests. Not a whole-module mutation score.
 - **2026-10-31** — **Behaviour change (no-panic sweep § GZ):** `.one_group` / `.many_groups` replies must carry the requested family's name and an in-range id, as the F2 doc already said (a reply without a name, with another family's name or an out-of-range id is `MalformedReply`). `resolveMcastGroups` resets `out` to all-null on any error, and a `names`/`out` length mismatch is a documented checked panic (was an assert).
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
 
