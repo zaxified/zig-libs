@@ -1496,6 +1496,9 @@ const UdpStub = struct {
         off_bailiwick_plus_honest,
         /// Header only with the TC bit set: the resolver must go to TCP.
         truncated,
+        /// Like `truncated` but without a question section (a bare header
+        /// with TC set, which `decodeResponse` refuses): still TCP's business.
+        truncated_bare,
         /// A datagram bigger than any resolver rbuf, TC bit NOT set: the kernel
         /// truncates delivery and only `IncomingMessage.flags.trunc` says so
         /// (audit F13).
@@ -1525,6 +1528,7 @@ const UdpStub = struct {
         const resp = switch (st.script) {
             .off_bailiwick_plus_honest => stubResponse(&out, q, 0x8180, question_echo, a_victim ++ a_example, 2),
             .truncated => stubResponse(&out, q, 0x8380, question_echo, "", 0),
+            .truncated_bare => stubResponse(&out, q, 0x8380, "", "", 0),
             .oversized_no_tc => blk: {
                 // TC bit clear (0x8180): a real server that respected the
                 // advertised EDNS size would set TC instead of doing this.
@@ -1637,6 +1641,9 @@ const EchoStub = struct {
         /// Before the honest reply, three datagrams with the RIGHT id from
         /// the right source: QR clear, another question, undecodable.
         bogus_same_id_first,
+        /// Before the honest reply, ONE datagram with the RIGHT id from the
+        /// right source and QR clear (a query, not a response).
+        qr_clear_first,
     };
 
     const a_honest = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
@@ -1682,6 +1689,7 @@ const EchoStub = struct {
                     try st.sock.send(st.io, &incoming.from, resp);
                 },
                 .bogus_same_id_first => {}, // sent below, before the honest reply
+                .qr_clear_first => try st.sock.send(st.io, &incoming.from, stubResponse(&first, q, 0x0180, question, a_lie, 1)),
                 .other_port_first => {
                     const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
                     const other = try addr.bind(st.io, .{ .mode = .dgram });
@@ -1961,10 +1969,13 @@ const SilentTcp = struct {
     io: std.Io,
     server: net.Server,
     stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
 
     fn run(st: *SilentTcp) void {
         const stream = st.server.accept(st.io) catch return;
         defer stream.close(st.io);
+        st.accepted.store(1, .release);
+        st.io.futexWake(u32, &st.accepted.raw, 1);
         // Hold the connection open until told to stop; never write.
         while (st.stop.load(.acquire) == 0) {
             st.io.futexWaitTimeout(u32, &st.stop.raw, 0, .{ .duration = .{ .raw = .fromMilliseconds(50), .clock = .awake } }) catch break;
@@ -2385,4 +2396,179 @@ test "resolve: a search entry that makes a bad name is skipped, not fatal (sweep
 
 test "max_doh_response is the largest DNS message, 65535 bytes (sweep REV-dns-1)" {
     try testing.expectEqual(@as(usize, 65535), max_doh_response);
+}
+
+test "exchange: a datagram with the right id but QR clear is dropped, the genuine reply is returned (sweep audit GV-A1)" {
+    // `query` would reject the QR-clear datagram in `decodeResponse` anyway;
+    // `exchange` (used by dns update) has no question check, so the QR test in
+    // `udpExchange` is its only defence against this forged datagram.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var stub = bindEchoStub(io, .qr_clear_first, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer stub.sock.close(io);
+    var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var qbuf: [message.max_query_len]u8 = undefined;
+    const packet = try r.encodeChecked(&qbuf, "example.com", .a, 0x4242);
+    var fut = try io.concurrent(EchoStub.run, .{&stub});
+    const res = r.exchange(loopback_servers[0], packet);
+    fut.await(io);
+    const raw = try res;
+    defer testing.allocator.free(raw);
+    try testing.expect(raw[2] & 0x80 != 0);
+    var msg = try message.decode(testing.allocator, raw);
+    defer msg.deinit();
+    try expectOnlyHonestA(&msg);
+}
+
+/// A plain-HTTP loopback "DoH server" that answers each request with 200 and
+/// a body of `lens[i]` zero bytes.
+const HttpBody = struct {
+    io: std.Io,
+    server: net.Server,
+    lens: []const usize,
+
+    fn run(st: *HttpBody) void {
+        st.serve() catch |err| std.debug.print("HttpBody: {t}\n", .{err});
+    }
+
+    fn serve(st: *HttpBody) !void {
+        for (st.lens) |len| {
+            const stream = try st.server.accept(st.io);
+            defer stream.close(st.io);
+            var rbuf: [4096]u8 = undefined;
+            var sr = stream.reader(st.io, &rbuf);
+            const in = &sr.interface;
+            var body_len: usize = 0;
+            while (true) {
+                const line = try in.takeDelimiterInclusive('\n');
+                if (std.mem.eql(u8, line, "\r\n")) break;
+                const key = "content-length:";
+                if (std.ascii.startsWithIgnoreCase(line, key))
+                    body_len = try std.fmt.parseInt(usize, std.mem.trim(u8, line[key.len..], " \t\r\n"), 10);
+            }
+            try in.discardAll(body_len);
+            var wbuf: [4096]u8 = undefined;
+            var sw = stream.writer(st.io, &wbuf);
+            try sw.interface.print("HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{len});
+            var zeros: [1024]u8 = @splat(0);
+            var left = len;
+            while (left > 0) {
+                const n = @min(left, zeros.len);
+                try sw.interface.writeAll(zeros[0..n]);
+                left -= n;
+            }
+            try sw.interface.flush();
+        }
+    }
+};
+
+test "DoH: a response body over 65535 bytes is DohFailed on both paths, one of exactly 65535 is read (sweep audit GV-A2)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const lens = [_]usize{ 65_536, 65_536, 65_535, 65_535 };
+    var stub: HttpBody = .{
+        .io = io,
+        .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}),
+        .lens = &lens,
+    };
+    defer stub.server.socket.close(io);
+    var url_buf: [64]u8 = undefined;
+    const url = try std.mem.print(&url_buf, "http://127.0.0.1:{d}/dns-query", .{stub.server.socket.address.getPort()});
+    var r = Resolver.init(io, testing.allocator, .{ .doh_url = url, .timeout_ms = 5000, .use_hosts = false, .use_search = false });
+    defer r.deinit();
+    var fut = try io.concurrent(HttpBody.run, .{&stub});
+    const wire_big = r.query("example.com", .a);
+    const json_big = r.queryJson("example.com", .a);
+    const wire_ok = r.query("example.com", .a);
+    const json_ok = r.queryJson("example.com", .a);
+    fut.await(io);
+    if (wire_big) |m| {
+        var msg = m;
+        msg.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DohFailed, err);
+    if (json_big) |a| {
+        var ans = a;
+        ans.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.DohFailed, err);
+    // Exactly at the cap the body is read, then found to be no DNS message.
+    if (wire_ok) |m| {
+        var msg = m;
+        msg.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.MalformedResponse, err);
+    if (json_ok) |a| {
+        var ans = a;
+        ans.deinit();
+        return error.TestUnexpectedResult;
+    } else |err| try testing.expectEqual(error.MalformedResponse, err);
+}
+
+test "query: a bare TC reply (header only, no question) goes to TCP, it is not dropped as undecodable (sweep audit GV-A7)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch |err| return testkit.loopbackSkip("loopback listen failed ({t})", .{err}) };
+    defer silent.server.socket.close(io);
+    const port = silent.server.socket.address.ip4.port;
+    const udp_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    var stub: UdpStub = .{ .io = io, .sock = udp_sock, .script = .truncated_bare };
+    defer stub.sock.close(io);
+
+    var tcp_fut = try io.concurrent(SilentTcp.run, .{&silent});
+    var udp_fut = try io.concurrent(UdpStub.run, .{&stub});
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = port,
+        .timeout_ms = 300,
+        .attempts = 1,
+        .use_search = false,
+        .use_hosts = false,
+    });
+    defer r.deinit();
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    udp_fut.await(io);
+    // Bounded wait for the accept to be recorded; without a TCP attempt the
+    // acceptor never returns, so it is cancelled rather than awaited.
+    io.futexWaitTimeout(u32, &silent.accepted.raw, 0, .{ .duration = .{ .raw = .fromMilliseconds(2000), .clock = .awake } }) catch {};
+    silent.stop.store(1, .release);
+    io.futexWake(u32, &silent.stop.raw, 1);
+    tcp_fut.cancel(io);
+    // The TCP connection was made: the bare TC reply was not discarded.
+    try testing.expectEqual(@as(u32, 1), silent.accepted.load(.acquire));
+}
+
+test "query: an allocation failure at any point is OutOfMemory, never a swallowed datagram or a Timeout (sweep audit GV-A6)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var succeeded = false;
+    var fail_index: usize = 0;
+    while (fail_index < 300) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var stub = bindEchoStub(io, .a_only, 1) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer stub.sock.close(io);
+        stub.idle_ms = 300;
+        var r = Resolver.init(io, failing.allocator(), .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+        defer r.deinit();
+        var fut = try io.concurrent(EchoStub.run, .{&stub});
+        const res = r.query("example.com", .a);
+        fut.await(io);
+        if (res) |m| {
+            var msg = m;
+            msg.deinit();
+            succeeded = true;
+            break;
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+    }
+    try testing.expect(succeeded);
 }

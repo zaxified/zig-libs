@@ -5,6 +5,8 @@ const std = @import("std");
 const testing = std.testing;
 const sntp = @import("root.zig");
 const Timestamp = sntp.Timestamp;
+const testkit = @import("testkit");
+const net = std.Io.net;
 
 test "fromUnixNanos: the largest i128 does not overflow the offset addition (sweep SN-1)" {
     // maxInt(i128) + the 1900 offset used to be a signed overflow.
@@ -31,4 +33,39 @@ test "fromUnixNanos: instants past the u64 nanosecond range wrap like the era ro
     try testing.expectEqual(Timestamp.fromUnixNanos(x), Timestamp.fromUnixNanos(x + period));
     // Before 1900 stays the zero sentinel, including the most negative value.
     try testing.expectEqual(Timestamp.zero, Timestamp.fromUnixNanos(std.math.minInt(i128)));
+}
+
+/// Loopback "NTP server": reads the request, then sends a forged
+/// Kiss-o'-Death with a wrong nonce, a 47-byte datagram, a truncated-looking
+/// garbage datagram and finally the genuine reply, all from the right address.
+fn forgingServer(io: std.Io, sock: net.Socket) void {
+    var buf: [64]u8 = undefined;
+    const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(3000), .clock = .awake } };
+    const incoming = sock.receiveTimeout(io, &buf, t.toDeadline(io)) catch return;
+    const req = sntp.Packet.decode(incoming.data) catch return;
+    const nonce = req.transmit;
+    const wrong: Timestamp = .{ .seconds = nonce.seconds, .fraction = nonce.fraction +% 1 };
+    const kod: sntp.Packet = .{ .mode = .server, .stratum = 0, .reference_id = "DENY".*, .originate = wrong, .receive = nonce, .transmit = nonce };
+    const kod_wire = kod.encode();
+    sock.send(io, &incoming.from, &kod_wire) catch return;
+    sock.send(io, &incoming.from, kod_wire[0..47]) catch return;
+    const good: sntp.Packet = .{ .mode = .server, .stratum = 2, .originate = nonce, .receive = nonce, .transmit = nonce };
+    const good_wire = good.encode();
+    sock.send(io, &incoming.from, &good_wire) catch return;
+}
+
+test "query: forged replies (wrong-nonce KoD, short datagram) are skipped, the genuine reply after them wins (sweep audit GV-A3)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = addr.bind(io, .{ .mode = .dgram }) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+    defer sock.close(io);
+    const server: net.IpAddress = .{ .ip4 = .loopback(sock.address.getPort()) };
+    var fut = try io.concurrent(forgingServer, .{ io, sock });
+    var kiss: sntp.KissOfDeath = undefined;
+    const res = sntp.query(io, server, .{ .timeout_ms = 3000 }, &kiss);
+    fut.await(io);
+    const result = try res;
+    try testing.expectEqual(@as(u8, 2), result.reply.stratum);
 }
