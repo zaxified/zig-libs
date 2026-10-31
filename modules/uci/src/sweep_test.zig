@@ -283,3 +283,187 @@ test "work counter charges comparisons and hashing by bytes (sweep RV-UC-2)" {
     try ed2.set("a0", "k", "2"); // rebuild of the option index
     try testing.expect(ed2.work - before >= 20 * 100);
 }
+
+// ── delta audit GY-A: gaps found by the mutation run ────────────────────────
+
+fn editorOf(gpa: std.mem.Allocator, pkg: *uci.Package, text: []const u8) !uci.Editor {
+    pkg.* = try uci.parse(gpa, text);
+    return uci.Editor.init(gpa, pkg);
+}
+
+fn keyCount(sec: anytype, key: []const u8) usize {
+    var n: usize = 0;
+    for (sec.options.items) |o| n += @intFromBool(std.mem.eql(u8, o.key, key));
+    return n;
+}
+
+test "section index: an added, renamed or `@type[N]` section is found through a live index (sweep audit GY-A1)" {
+    const gpa = testing.allocator;
+    const text = try namedSections(gpa, 20);
+    defer gpa.free(text);
+    var pkg: uci.Package = undefined;
+    var ed = try editorOf(gpa, &pkg, text);
+    defer ed.deinit();
+    defer pkg.deinit(gpa);
+    try ed.set("s0", "k", "v"); // 20 > 16 sections: the id index is built and live now
+    try ed.setSection("fresh", "t"); // appended with the index live
+    try ed.set("fresh", "k", "w"); // must be found, not NoSuchSection
+    try testing.expectEqual(@as(usize, 1), ed.sections.items[20].options.items.len);
+    try ed.rename("s5", "renamed");
+    try ed.set("renamed", "k", "v");
+    try testing.expectError(error.NoSuchSection, ed.set("s5", "k", "v")); // the old name is gone
+    // `@type[N]` is never an index key: it must still resolve with the index live.
+    try ed.set("@t[3]", "m", "v");
+    try ed.set("@t[-1]", "m", "v");
+    try testing.expectEqual(@as(usize, 1), keyCount(ed.sections.items[3], "m"));
+    try testing.expectEqual(@as(usize, 1), keyCount(ed.sections.items[20], "m"));
+}
+
+test "indexes keep the FIRST of duplicate ids / keys, like the linear scan (sweep audit GY-A2)" {
+    const gpa = testing.allocator;
+    // Hand-built (parse merges duplicates): 18 distinct sections, then two named "dup".
+    var names: [18][8]u8 = undefined;
+    var secs: [20]uci.Section = undefined;
+    for (0..18) |i| {
+        const nm = try std.fmt.bufPrint(&names[i], "s{d}", .{i});
+        secs[i] = .{ .type = "t", .name = nm, .anonymous = false, .options = &.{} };
+    }
+    secs[18] = .{ .type = "A", .name = "dup", .anonymous = false, .options = &.{} };
+    secs[19] = .{ .type = "B", .name = "dup", .anonymous = false, .options = &.{} };
+    const pkg: uci.Package = .{ .sections = &secs };
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    try ed.setSection("dup", "X"); // builds the index: first of the duplicates wins
+    try testing.expectEqualStrings("X", ed.sections.items[18].type);
+    try testing.expectEqualStrings("B", ed.sections.items[19].type);
+    // Append a section whose generated id equals an existing name, index live.
+    var nb: [24]u8 = undefined;
+    const clash = uci.anonymousName(&nb, ed.counter + 2, "T");
+    try ed.setSection(clash, "orig"); // counter + 1
+    const id = try ed.add("T"); // counter + 2: generated id == clash
+    try testing.expectEqualStrings(clash, id);
+    try ed.setSection(clash, "Z");
+    try testing.expectEqualStrings("Z", ed.sections.items[20].type); // the first one
+    try testing.expectEqualStrings("T", ed.sections.items[21].type);
+
+    // Option keys: the same for the per-section index.
+    var opts: [20]uci.Option = undefined;
+    var keys: [18][8]u8 = undefined;
+    for (0..18) |i| opts[i] = .{ .key = try std.fmt.bufPrint(&keys[i], "k{d}", .{i}), .kind = .single, .values = &.{"v"} };
+    opts[18] = .{ .key = "dup", .kind = .single, .values = &.{"first"} };
+    opts[19] = .{ .key = "dup", .kind = .single, .values = &.{"second"} };
+    const secs2 = [_]uci.Section{.{ .type = "t", .name = "s", .anonymous = false, .options = &opts }};
+    const pkg2: uci.Package = .{ .sections = &secs2 };
+    var ed2 = try uci.Editor.init(gpa, &pkg2);
+    defer ed2.deinit();
+    try ed2.set("s", "dup", "X");
+    try testing.expectEqualStrings("X", ed2.sections.items[0].options.items[18].values.items[0]);
+    try testing.expectEqualStrings("second", ed2.sections.items[0].options.items[19].values.items[0]);
+}
+
+test "option index: no stale entries after a delete or a rename (sweep audit GY-A3)" {
+    const gpa = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try text.appendSlice(gpa, "config t 's'\n");
+    for (0..20) |i| try text.print(gpa, "\toption k{d} 'v'\n", .{i});
+    var pkg: uci.Package = undefined;
+    var ed = try editorOf(gpa, &pkg, text.items);
+    defer ed.deinit();
+    defer pkg.deinit(gpa);
+    try ed.set("s", "k19", "a"); // 20 > 16 options: the option index is built and live
+    try ed.deleteOption("s", "k3");
+    try ed.set("s", "k10", "NEW"); // k10 moved from 10 to 9: a stale index would hit k11
+    const sec = &ed.sections.items[0];
+    try testing.expectEqual(@as(usize, 19), sec.options.items.len);
+    try testing.expectEqual(@as(usize, 1), keyCount(sec, "k10"));
+    try testing.expectEqual(@as(usize, 1), keyCount(sec, "k11"));
+    try testing.expectEqual(@as(usize, 0), keyCount(sec, "k3"));
+    try ed.renameOption("s", "k5", "kn");
+    try ed.set("s", "kn", "V"); // a stale index would not know "kn" and append a second one
+    try testing.expectEqual(@as(usize, 1), keyCount(sec, "kn"));
+    try testing.expectEqual(@as(usize, 0), keyCount(sec, "k5"));
+    try testing.expectEqual(@as(usize, 19), sec.options.items.len);
+}
+
+test "work counter: exact charges of the scan / index boundary and of lookups (sweep audit GY-A4)" {
+    const gpa = testing.allocator;
+    // Scan path: n sections cost n + 1 per lookup; 16 is still the scan.
+    for ([_]struct { n: usize, w: u64 }{ .{ .n = 3, .w = 4 + 4 }, .{ .n = 16, .w = 17 + 17 }, .{ .n = 17, .w = 18 + 1 } }) |c| {
+        const text = try namedSections(gpa, c.n);
+        defer gpa.free(text);
+        var pkg: uci.Package = undefined;
+        var ed = try editorOf(gpa, &pkg, text);
+        defer ed.deinit();
+        defer pkg.deinit(gpa);
+        ed.work = 0;
+        try ed.setSection("s0", "t"); // 17 sections: index rebuild n, then a hit of 1
+        try ed.setSection("s0", "t"); // a second lookup
+        try testing.expectEqual(c.w, ed.work);
+    }
+    // Options: (n + 1) per scan up to 16; the 17th option switches to the index.
+    for ([_]struct { n: usize, w: u64 }{ .{ .n = 3, .w = 2 * (2 + 4) }, .{ .n = 16, .w = 2 * (2 + 17) }, .{ .n = 17, .w = (2 + 17 + 1) + (2 + 1) } }) |c| {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        try text.appendSlice(gpa, "config t 's'\n");
+        for (0..c.n) |i| try text.print(gpa, "\toption k{d} 'v'\n", .{i});
+        var pkg: uci.Package = undefined;
+        var ed = try editorOf(gpa, &pkg, text.items);
+        defer ed.deinit();
+        defer pkg.deinit(gpa);
+        ed.work = 0;
+        try ed.delList("s", "k0", "x"); // not a list: lookups only
+        try ed.delList("s", "k0", "x");
+        try testing.expectEqual(c.w, ed.work);
+    }
+}
+
+test "work counter: `@type[N]` scans are charged by sections and by type length (sweep audit GY-A5)" {
+    const gpa = testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    const ty: [6400]u8 = @splat('T');
+    for (0..20) |_| try text.print(gpa, "config {s}\n", .{&ty});
+    var pkg: uci.Package = undefined;
+    var ed = try editorOf(gpa, &pkg, text.items);
+    defer ed.deinit();
+    defer pkg.deinit(gpa);
+    ed.work = 0;
+    const ref = try std.fmt.allocPrint(gpa, "@{s}[0]", .{&ty});
+    defer gpa.free(ref);
+    try ed.set(ref, "k", "v");
+    // At least the 2 scans over 20 sections, each compare costing 1 + len/64.
+    try testing.expect(ed.work >= 2 * 20 * (1 + ty.len / 64));
+}
+
+test "items accounting: a new named section counts; the next growth is refused one item early at the cap (sweep audit GY-A6)" {
+    const gpa = testing.allocator;
+    var pkg: uci.Package = .{};
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    try ed.setSection("a", "t");
+    try testing.expectEqual(@as(usize, 1), ed.items);
+    try ed.addList("a", "l", "x");
+    try testing.expectEqual(@as(usize, 3), ed.items);
+    // One item below the cap: a NEW list option needs 2 items (refused), an entry in
+    // the existing list needs 1 (accepted).
+    ed.items = uci.max_total_items - 1;
+    try testing.expectError(error.MemoryLimitExceeded, ed.addList("a", "other", "x"));
+    try ed.addList("a", "l", "y");
+    try testing.expectEqual(uci.max_total_items, ed.items);
+}
+
+test "applyDelta: the work budget is per call, and a record is never free (sweep audit GY-A7)" {
+    const gpa = testing.allocator;
+    var pkg: uci.Package = .{};
+    var ed = try uci.Editor.init(gpa, &pkg);
+    defer ed.deinit();
+    // Work from earlier calls does not count against this one.
+    ed.work = uci.max_delta_work + 5;
+    try ed.applyDelta("p", "p.a=t\np.a.k='v'\n", null);
+    // Fresh editor: five records for a missing section: lookup 1 + the record's own 1 each.
+    var ed2 = try uci.Editor.init(gpa, &pkg);
+    defer ed2.deinit();
+    try ed2.applyDelta("p", "-p.a\n-p.b\n-p.c\n-p.d\n-p.e\n", null);
+    try testing.expectEqual(@as(u64, 10), ed2.work);
+}

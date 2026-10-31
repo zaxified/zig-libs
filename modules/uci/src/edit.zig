@@ -1142,3 +1142,27 @@ test "show: a long type repeated on every option line is refused by length befor
     // The public cap is the documented constant.
     try testing.expectEqual(@as(usize, 64 << 20), max_show_len);
 }
+
+test "show: the length pre-check is exact for every line shape (sweep audit GY-A8)" {
+    const gpa = testing.allocator;
+    var many: std.ArrayList(u8) = .empty;
+    defer many.deinit(gpa);
+    for (0..11) |_| try many.appendSlice(gpa, "config t\n"); // the last line is `@t[10]`
+    const texts = [_][]const u8{
+        "config t 's'\n\toption a '1'\nconfig u 'e'\n", // the last line is a section line
+        "config t 's'\n\tlist b 'x'\n\tlist b 'y'\n", // the last line is a list of two values
+        many.items,
+    };
+    for (texts) |text| {
+        var pkg = try root.parse(gpa, text);
+        defer pkg.deinit(gpa);
+        var ed = try Editor.init(gpa, &pkg);
+        defer ed.deinit();
+        const full = try ed.show(gpa, "pkg", .{});
+        defer gpa.free(full);
+        const same = try ed.showLimited(gpa, "pkg", .{}, full.len);
+        defer gpa.free(same);
+        try testing.expectEqualStrings(full, same);
+        try testing.expectError(error.OutputTooLarge, ed.showLimited(gpa, "pkg", .{}, full.len - 1));
+    }
+}

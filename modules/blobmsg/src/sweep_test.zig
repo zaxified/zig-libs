@@ -54,11 +54,17 @@ fn runChild(comptime body: fn () u8, buf: []u8) !Child {
 const needle_id = "blobmsg: idLen: attr id above 127";
 const needle_len = "blobmsg: idLen: attr length above 16 MiB - 1";
 
+const panic_prefix = "panic: ";
+
 fn expectPanicMessage(comptime body: fn () u8, needle: []const u8) !void {
     var buf: [8192]u8 = undefined;
     const c = try runChild(body, &buf);
     try testing.expect(c.died);
-    try testing.expect(std.mem.find(u8, buf[0..c.len], needle) != null);
+    // The stack trace echoes the panic's source line, string literals included,
+    // so the needle must follow "panic: " or a swapped message would still match.
+    var want: [128]u8 = undefined;
+    const w = try std.fmt.bufPrint(&want, "{s}{s}", .{ panic_prefix, needle });
+    try testing.expect(std.mem.find(u8, buf[0..c.len], w) != null);
 }
 
 // ── BM-1: iterators are terminal after their first error ────────────────────
@@ -390,4 +396,318 @@ test "a broken Client / EventStream answers from state without touching the sock
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(testing.allocator);
     try testing.expect(try ev.poll(&out));
+}
+
+// ── delta audit GY-A: gaps found by the mutation run ────────────────────────
+
+fn nowNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+fn socketPair() ![2]i32 {
+    var fds: [2]i32 = undefined;
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) != .SUCCESS) return error.SkipZigTest;
+    return fds;
+}
+
+fn noopHandler(_: linux.SIG) callconv(.c) void {}
+
+const IntrCtx = struct { daemon_fd: i32, main_tid: linux.pid_t };
+
+fn slowStatusDaemon(ctx: *IntrCtx) void {
+    var req: [256]u8 = undefined;
+    _ = linux.read(ctx.daemon_fd, &req, req.len);
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 250 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&ts, null);
+    var ch: std.ArrayList(u8) = .empty;
+    defer ch.deinit(std.heap.page_allocator); // global-alloc-ok: test thread
+    codec.appendAttrU32(std.heap.page_allocator, &ch, codec.ATTR.STATUS, 0) catch return; // global-alloc-ok: test thread
+    const fr = codec.encodeMessage(std.heap.page_allocator, codec.MSG.STATUS, 1, 0, ch.items) catch return; // global-alloc-ok: test thread
+    defer std.heap.page_allocator.free(fr); // global-alloc-ok: test thread
+    writeFd(ctx.daemon_fd, fr);
+}
+
+fn signaller(ctx: *IntrCtx) void {
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 80 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&ts, null);
+    _ = linux.tgkill(linux.getpid(), ctx.main_tid, .USR1);
+}
+
+test "Client.list: a signal while waiting for the reply does not fail the call (sweep audit GY-A1)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    // No SA_RESTART needed: poll(2) is never restarted, it returns EINTR.
+    const act: linux.Sigaction = .{ .handler = .{ .handler = noopHandler }, .mask = linux.sigemptyset(), .flags = 0 };
+    var old: linux.Sigaction = undefined;
+    _ = linux.sigaction(.USR1, &act, &old);
+    defer _ = linux.sigaction(.USR1, &old, null);
+    var ctx: IntrCtx = .{ .daemon_fd = fds[1], .main_tid = linux.gettid() };
+    const d = try std.Thread.spawn(.{}, slowStatusDaemon, .{&ctx});
+    const s = try std.Thread.spawn(.{}, signaller, .{&ctx});
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    const objs = try c.list(null);
+    blobmsg.freeObjects(testing.allocator, objs);
+    s.join();
+    d.join();
+    try testing.expect(!c.broken);
+}
+
+test "Client.list: a peer that never reads ends the request in Timeout after the call deadline and breaks the client (sweep audit GY-A2)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]); // open, never read
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    const pattern = try testing.allocator.alloc(u8, 600_000); // far past the socket buffer
+    defer testing.allocator.free(pattern);
+    @memset(pattern, 'p');
+    const t0 = nowNs();
+    try testing.expectError(error.Timeout, c.list(pattern));
+    const el = nowNs() - t0;
+    // The wait lasted (about) the 2 s write deadline: neither none nor unbounded.
+    try testing.expect(el >= 1 * std.time.ns_per_s);
+    try testing.expect(el < 10 * std.time.ns_per_s);
+    try testing.expect(c.broken);
+}
+
+fn sockPathFor(buf: []u8, tag: []const u8) ![:0]const u8 {
+    return std.mem.printSentinel(buf, "/tmp/zl-blobmsg-{d}-{s}.sock", .{ linux.getpid(), tag }, 0);
+}
+
+test "Client.open: a daemon that never sends HELLO ends in Connect within the call deadline (sweep audit GY-A3)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pb: [96]u8 = undefined;
+    const path = try sockPathFor(&pb, "nohello");
+    _ = linux.unlink(path);
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const lfd: i32 = @intCast(rc);
+    defer _ = linux.close(lfd);
+    defer _ = linux.unlink(path);
+    var addr: linux.sockaddr.un = .{ .family = linux.AF.UNIX, .path = @splat(0) };
+    @memcpy(addr.path[0..path.len], path);
+    const alen: linux.socklen_t = @intCast(@offsetOf(linux.sockaddr.un, "path") + path.len + 1);
+    if (linux.errno(linux.bind(lfd, @ptrCast(&addr), alen)) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.listen(lfd, 2)) != .SUCCESS) return error.SkipZigTest;
+    const t0 = nowNs();
+    try testing.expectError(error.Connect, blobmsg.Client.open(testing.allocator, path));
+    try testing.expect(nowNs() - t0 < 4 * std.time.ns_per_s); // 2 s deadline, not the 5 s socket timeout
+}
+
+fn closeAfterRequest(ctx: *IntrCtx) void {
+    var req: [256]u8 = undefined;
+    _ = linux.read(ctx.daemon_fd, &req, req.len);
+    _ = linux.close(ctx.daemon_fd);
+}
+
+test "Client.list: the daemon closing before any reply is ShortRead and breaks the client (sweep audit GY-A4)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    var ctx: IntrCtx = .{ .daemon_fd = fds[1], .main_tid = 0 };
+    const d = try std.Thread.spawn(.{}, closeAfterRequest, .{&ctx});
+    var c: blobmsg.Client = .{ .gpa = testing.allocator, .fd = fds[0], .client_id = 1 };
+    try testing.expectError(error.ShortRead, c.list(null));
+    d.join();
+    try testing.expect(c.broken);
+}
+
+/// Wraps an allocator and sleeps `delay_ms` before each allocation.
+const SlowAlloc = struct {
+    inner: std.mem.Allocator,
+    delay_ms: u64,
+
+    fn allocator(self: *SlowAlloc) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *SlowAlloc = @ptrCast(@alignCast(ctx));
+        if (self.delay_ms > 0) {
+            const ts: linux.timespec = .{ .sec = 0, .nsec = @intCast(self.delay_ms * std.time.ns_per_ms) };
+            _ = linux.nanosleep(&ts, null);
+        }
+        return self.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *SlowAlloc = @ptrCast(@alignCast(ctx));
+        return self.inner.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *SlowAlloc = @ptrCast(@alignCast(ctx));
+        return self.inner.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *SlowAlloc = @ptrCast(@alignCast(ctx));
+        self.inner.rawFree(m, a, ra);
+    }
+};
+
+test "EventStream.poll: the drain deadline between frames is `false`, not a broken stream, and nothing is lost (sweep audit GY-A5)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    var slow: SlowAlloc = .{ .inner = testing.allocator, .delay_ms = 300 };
+    const gpa = slow.allocator();
+    const n_frames = 12;
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(testing.allocator);
+    try codec.appendInt32(testing.allocator, &data, "n", 1);
+    const fr = try eventFrame(testing.allocator, "ev", data.items);
+    defer testing.allocator.free(fr);
+    for (0..n_frames) |_| writeFd(fds[1], fr);
+    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    // Each frame costs >= 300 ms of allocation time: the 2 s drain deadline
+    // expires with frames still queued.
+    try testing.expect(!(try ev.poll(&out)));
+    try testing.expect(!ev.broken);
+    const first = countLines(out.items);
+    try testing.expect(first >= 1 and first < n_frames);
+    slow.delay_ms = 0;
+    var tries: usize = 0;
+    while (countLines(out.items) < n_frames and tries < 100) : (tries += 1) try testing.expect(!(try ev.poll(&out)));
+    try testing.expectEqual(@as(usize, n_frames), countLines(out.items));
+    _ = linux.close(fds[1]);
+    try testing.expect(try ev.poll(&out)); // EOF afterwards
+    try testing.expect(ev.broken);
+}
+
+test "EventStream.poll: EOF and a reset connection both break the stream (sweep audit GY-A6)" {
+    {
+        const fds = try socketPair();
+        defer _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try testing.expect(try ev.poll(&out));
+        try testing.expect(ev.broken);
+    }
+    {
+        // The peer closes with unread data queued: this side sees ECONNRESET.
+        const fds = try socketPair();
+        defer _ = linux.close(fds[0]);
+        writeFd(fds[0], "unread");
+        _ = linux.close(fds[1]);
+        var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try testing.expect(try ev.poll(&out));
+        try testing.expect(ev.broken);
+    }
+}
+
+test "EventStream.poll: an impossible frame length breaks the stream (sweep audit GY-A7)" {
+    // Top attr id_len below 4, and above max_msg (1 MiB): no resynchronisation.
+    const lens = [_][4]u8{ .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 3 }, .{ 0, 0x20, 0, 0 }, .{ 0, 0xff, 0xff, 0xff } };
+    for (lens) |l| {
+        const fds = try socketPair();
+        defer _ = linux.close(fds[0]);
+        defer _ = linux.close(fds[1]);
+        const hdr = [_]u8{ 0, codec.MSG.INVOKE, 0, 1, 0, 0, 0, 0 } ++ l;
+        writeFd(fds[1], &hdr);
+        var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try testing.expect(try ev.poll(&out));
+        try testing.expect(ev.broken);
+    }
+}
+
+test "EventStream.poll: a frame that exactly fills the remaining byte budget is read, the next one is not (sweep audit GY-A8)" {
+    const gpa = testing.allocator;
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    // Frame A (fits the socket buffer) with ~100 kB payload; frame B sized so
+    // that A + B payloads equal the 1 MiB drain budget exactly; C would exceed it.
+    const budget: usize = 1024 * 1024;
+    const fa = try sizedEvent(gpa, "a", 100_000);
+    defer gpa.free(fa);
+    const pa = fa.len - codec.msghdr_len - 4;
+    const fb = try sizedEvent(gpa, "b", budget - pa);
+    defer gpa.free(fb);
+    try testing.expectEqual(budget, pa + fb.len - codec.msghdr_len - 4);
+    var small: std.ArrayList(u8) = .empty;
+    defer small.deinit(gpa);
+    try codec.appendInt32(gpa, &small, "n", 1);
+    const fc = try eventFrame(gpa, "c", small.items);
+    defer gpa.free(fc);
+    var frames = [_][]const u8{ fa, fb, fc };
+    var flood: Flood = .{ .fd = fds[1], .frames = &frames };
+    const th = try std.Thread.spawn(.{}, floodThread, .{&flood});
+    // Start draining only once B's first bytes are queued behind A, so the
+    // drain cannot see an empty socket between the two frames.
+    var tries: usize = 0;
+    while (tries < 2000) : (tries += 1) {
+        var avail: c_int = 0;
+        _ = linux.ioctl(fds[0], 0x541B, @intFromPtr(&avail)); // FIONREAD
+        if (avail > fa.len) break;
+        const ts: linux.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = linux.nanosleep(&ts, null);
+    }
+    var ev: blobmsg.EventStream = .{ .gpa = gpa, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try testing.expect(!(try ev.poll(&out)));
+    try testing.expectEqual(@as(usize, 2), countLines(out.items)); // A and B; C waits for a fresh budget
+    tries = 0;
+    var closed = false;
+    while (!closed and tries < 5000) : (tries += 1) {
+        closed = try ev.poll(&out);
+        const ts: linux.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+        if (!closed) _ = linux.nanosleep(&ts, null);
+    }
+    th.join();
+    try testing.expect(closed);
+    try testing.expectEqual(@as(usize, 3), countLines(out.items));
+}
+
+/// An event frame whose payload (children) is exactly `payload` bytes.
+fn sizedEvent(gpa: std.mem.Allocator, method: []const u8, payload: usize) ![]u8 {
+    var l: usize = payload -| 100;
+    while (l < payload) : (l += 1) {
+        const big = try gpa.alloc(u8, l);
+        defer gpa.free(big);
+        @memset(big, 'x');
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(gpa);
+        try codec.appendString(gpa, &data, "v", big);
+        const f = try eventFrame(gpa, method, data.items);
+        if (f.len - codec.msghdr_len - 4 == payload) return f;
+        gpa.free(f);
+    }
+    return error.NoSuchSize;
+}
+
+test "EventStream.poll: an allocation failure is OutOfMemory, not a closed stream (sweep audit GY-A9)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(testing.allocator);
+    try codec.appendInt32(testing.allocator, &data, "n", 1);
+    const fr = try eventFrame(testing.allocator, "ev", data.items);
+    defer testing.allocator.free(fr);
+    writeFd(fds[1], fr);
+    var fa = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var ev: blobmsg.EventStream = .{ .gpa = fa.allocator(), .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectError(error.OutOfMemory, ev.poll(&out));
+}
+
+test "EventStream.poll: EOF in the middle of a frame breaks the stream (sweep audit GY-A10)" {
+    const fds = try socketPair();
+    defer _ = linux.close(fds[0]);
+    const hdr = [_]u8{ 0, codec.MSG.INVOKE, 0, 1, 0, 0, 0, 0, 0, 0, 0, 100 }; // declares 96 payload bytes
+    writeFd(fds[1], &hdr);
+    _ = linux.close(fds[1]);
+    var ev: blobmsg.EventStream = .{ .gpa = testing.allocator, .fd = fds[0] };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expect(try ev.poll(&out));
+    try testing.expect(ev.broken);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
 }

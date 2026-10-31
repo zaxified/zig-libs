@@ -263,7 +263,8 @@ fn monoNs() u64 {
 const CallBudget = struct {
     deadline_ns: u64,
     bytes_left: usize = max_msg,
-    /// Set when a read failed after consuming part of a frame (stream desynchronised).
+    /// Set when the LAST read failed after consuming part of its frame (stream
+    /// desynchronised); reset at the start of every `read`.
     partial: bool = false,
 
     fn start() Error!CallBudget {
@@ -273,6 +274,9 @@ const CallBudget = struct {
     /// `readMessage`, charged against this call's deadline and byte budget.
     fn read(self: *CallBudget, fd: i32, gpa: std.mem.Allocator) Error!Msg {
         if (monoNs() > self.deadline_ns) return Error.Timeout;
+        // Per message: a frame read whole leaves the stream in sync, so only
+        // the frame that fails may mark it partial (delta audit GY lead).
+        self.partial = false;
         const msg = try readMessageEx(fd, gpa, self.deadline_ns, &self.partial);
         if (msg.payload.len > self.bytes_left) {
             var m = msg;

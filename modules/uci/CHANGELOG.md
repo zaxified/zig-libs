@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-10-31** — **Tests:** delta mutation audit of the § GY no-panic sweep (schemata over the sweep diff; new `(sweep audit GY-…)` tests). No code change.
+
 - **2026-10-31** — **BEHAVIOURAL, small API addition:** no-panic sweep + blind review (§ GY). Editor mutators refuse growth past `max_total_items` (`EditError.MemoryLimitExceeded`, was only refused by `toPackage`). Section-id and option-key lookups are hashed. `applyDelta` charges scans, moves and compared bytes to a work counter and stops at `pub const max_delta_work` (2^26) with the new `DeltaError.WorkLimitExceeded`. `delList` and `show` with `@type[N]` are linear (were O(n²)). `show` refuses output past `pub const max_show_len` (64 MiB) with the new `error.OutputTooLarge` (`ShowError`) and never truncates. `Editor.applyDelta` is documented as not atomic. `serialize` can write lines `parse` would refuse (documented, Backlog).
 
 - **2026-10-24** — **NO CONSUMER-VISIBLE CHANGE:** the `strRepeat` helper (the Zig 0.17 stand-in for `**`) builds its string with one `@splat` + `@bitCast` instead of a comptime loop, which Sema evaluated in O(n²) (http's test binary: 323 s → 13 s). Same bytes, faster compile.
