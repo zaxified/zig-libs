@@ -139,6 +139,10 @@ pub const Error = error{
     /// `Options` is left at its own struct defaults and no explicit
     /// `Options.servers` bypasses resolv.conf) — the "5 s, 2 attempts" above
     /// is the fallback, not a promise resolv.conf can't shorten.
+    /// `lookupIp`/`lookupIpTtl` only: every server answered with a failure
+    /// rcode (SERVFAIL, REFUSED, NOTIMP — `serverFailed`) and nothing else
+    /// answered. Go's "server misbehaving": an outage, not "no such host".
+    ServerFailed,
     Timeout,
     /// Socket-level failure (bind/send/connect/read).
     NetworkFailed,
@@ -245,6 +249,10 @@ pub const IpLookup = struct {
     /// record's TTL and its MINIMUM (RFC 2308 §5). Null when there is none to
     /// go by: an IP literal, an /etc/hosts entry, an empty answer without SOA.
     ttl_s: ?u32,
+    /// One address family's query failed (a timeout, a server failure) while
+    /// the other answered: `ips` holds that family only. A caller keeping an
+    /// address of the missing family should not take this as its replacement.
+    partial: bool = false,
 };
 
 /// `lookupIp`, and how long its answer may be cached (`IpLookup.ttl_s`) —
@@ -286,8 +294,10 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     var last_err: ?Error = null;
     // The winning candidate's TTL, or the smallest negative one so far.
     var ttl: ?u32 = null;
+    var partial = false;
     while (it.next(&candidate_buf)) |candidate| {
         var candidate_ttl: ?u32 = null;
+        partial = false;
         for ([_]message.Type{ .a, .aaaa }) |ty| {
             var msg = r.query(candidate, ty) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
@@ -295,10 +305,18 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
                     // Tolerate one family failing (Go aggregates too), but
                     // remember why: with no address at all it is the answer.
                     last_err = err;
+                    partial = true;
                     continue;
                 },
             };
             defer msg.deinit();
+            // A failure rcode is the server's outage, not an empty answer
+            // (`query` returns it once every server failed that way).
+            if (serverFailed(msg.rcode())) {
+                last_err = error.ServerFailed;
+                partial = true;
+                continue;
+            }
             const before = list.items.len;
             try collectAddresses(r.gpa, &list, &msg, candidate);
             candidate_ttl = minTtl(candidate_ttl, answerTtl(msg.answers, msg.authorities, candidate, list.items.len > before));
@@ -315,7 +333,7 @@ pub fn lookupIpTtl(r: *Resolver, name: []const u8) Error!IpLookup {
     // from a name that has no addresses.
     if (list.items.len == 0) if (last_err) |err| return err;
     sortIps(list.items);
-    return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = ttl };
+    return .{ .ips = try list.toOwnedSlice(r.gpa), .ttl_s = ttl, .partial = partial };
 }
 
 fn minTtl(a: ?u32, b: ?u32) ?u32 {
@@ -1704,6 +1722,7 @@ test "lookupIp: an answer record the question never asked about is ignored (bail
     try testing.expectEqual(@as(usize, 1), ips.len);
     try testing.expect(ips[0].eql(netaddr.parseIp("192.0.2.1").?)); // never 203.0.113.66
     try testing.expectEqual(@as(?u32, 60), found.ttl_s); // the A record's TTL, over the wire
+    try testing.expect(found.partial); // the AAAA query timed out
 }
 
 /// A UDP stub that answers SEVERAL datagrams, each by echoing that query's
@@ -1740,6 +1759,10 @@ const EchoStub = struct {
         /// Before the honest reply, ONE datagram with the RIGHT id from the
         /// right source and QR clear (a query, not a response).
         qr_clear_first,
+        /// Every query: SERVFAIL.
+        servfail,
+        /// A as `a_only`; AAAA: SERVFAIL.
+        aaaa_servfail,
     };
 
     const a_honest = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
@@ -1779,6 +1802,10 @@ const EchoStub = struct {
                     continue;
                 },
                 .drop_first => if (n == 0) continue,
+                .servfail, .aaaa_servfail => if (st.mode == .servfail or !is_a) {
+                    try st.sock.send(st.io, &incoming.from, stubResponse(&first, q, 0x8182, question, "", 0));
+                    continue;
+                },
                 .wrong_id_first => {
                     const resp = stubResponse(&first, q, 0x8180, question, a_lie, 1);
                     resp[0] ^= 0xff;
@@ -1941,6 +1968,36 @@ test "resolve: a NODATA answer for one search candidate moves on to the next" {
     defer msg.deinit();
     try testing.expectEqualStrings("host.s2.test", msg.questions[0].name);
     try expectOnlyHonestA(&msg);
+}
+
+test "lookupIpTtl: a SERVFAIL is an outage, not an empty answer; one family failing is partial" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var stub = bindEchoStub(io, .servfail, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer stub.sock.close(io);
+        var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+        defer r.deinit();
+        var fut = try io.concurrent(EchoStub.run, .{&stub});
+        const res = r.lookupIpTtl("example.com");
+        fut.await(io);
+        try testing.expectError(error.ServerFailed, res);
+    }
+    {
+        var stub = bindEchoStub(io, .aaaa_servfail, 2) catch |err| return testkit.loopbackSkip("loopback bind failed ({t})", .{err});
+        defer stub.sock.close(io);
+        var r = Resolver.init(io, testing.allocator, .{ .servers = &loopback_servers, .port = stub.sock.address.getPort(), .timeout_ms = 1500, .attempts = 1, .use_hosts = false, .use_search = false });
+        defer r.deinit();
+        var fut = try io.concurrent(EchoStub.run, .{&stub});
+        const res = r.lookupIpTtl("example.com");
+        fut.await(io);
+        const found = try res;
+        defer testing.allocator.free(found.ips);
+        try testing.expectEqual(@as(usize, 1), found.ips.len);
+        try testing.expect(found.partial);
+        try testing.expectEqual(@as(?u32, 60), found.ttl_s);
+    }
 }
 
 test "lookupIp: the first search candidate with an address wins, later ones are not asked" {

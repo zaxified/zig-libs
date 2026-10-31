@@ -184,7 +184,7 @@ names over PTR, no DoH):
 
 ## Backlog / deferred
 
-- **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
+- ✅ **Closed 2026-10-31 (`Error.ServerFailed`, for zpinger's serve-stale cache):** **`lookupIp` reads a SERVFAIL / REFUSED reply as "no addresses"** *(found 2026-10-16 by acmedns's
   review)*: `query` returns a server-failure reply as a message once every server failed, and
   `lookupIp` collects addresses from it — an empty list, indistinguishable from NODATA (the
   2026-10-01 fix covered timeouts only). Go returns an error ("server misbehaving"). Fix: record a
