@@ -847,6 +847,7 @@ const CatalogStep = struct {
         // Grade number per module and the modules a project outside this repo
         // imports, for the closure rule after the loop.
         var grade_of = std.StringHashMap(u8).init(b.allocator);
+        var unswept = std.StringHashMap(void).init(b.allocator);
         var consumed: std.ArrayList([]const u8) = .empty;
         const today = todayDay(io);
         for (module_list) |m| {
@@ -908,12 +909,17 @@ const CatalogStep = struct {
             if (!std.mem.eql(u8, fixed, mat.src)) stale_cards.append(b.allocator, .{ .path = mat.path, .data = fixed }) catch @panic("OOM");
             docs.put(m.name, .{ .doc = doc, .note = note, .grade = grade.cell(b) }) catch @panic("OOM");
             grade_of.put(m.name, grade.n) catch @panic("OOM");
+            if (mat.panic == .none or mat.panic == .unknown) unswept.put(m.name, {}) catch @panic("OOM");
             if (mat.consumer) consumed.append(b.allocator, m.name) catch @panic("OOM");
         }
         // The same rule over the dependency closure (owner, 2026-10-10): a
         // consumer builds every module its import pulls in, so a grade-4 `deps`
         // entry under a grade-3 module ships the main-path-only code anyway.
         // `test_deps` are not followed -- they never reach the consumer's binary.
+        // The no-panic sweep follows the closure too (2026-10-31, § GZ): a
+        // dependency's crash reaches the consumer through the consumed module
+        // (zipstream -> lzma, tlsserver -> hpke), so an unswept `deps` entry
+        // fails the gate even though its own card names no consumer.
         if (card_failed) return step.fail("{s}: a module's maturity card is missing, malformed or fails a consumer rule (logged above)", .{verb});
         var closure_failed = false;
         {
@@ -937,11 +943,18 @@ const CatalogStep = struct {
                             );
                             closure_failed = true;
                         }
+                        if (unswept.contains(dep)) {
+                            std.log.err(
+                                "{s}: module '{s}' has no no-panic sweep recorded but consumed module '{s}' depends on it (through `deps`) -- sweep it and add `· panic <date>` to its Hardening line",
+                                .{ verb, dep, root },
+                            );
+                            closure_failed = true;
+                        }
                     }
                 }
             }
         }
-        if (closure_failed) return step.fail("{s}: a consumed module depends on a module graded 4 or worse (logged above)", .{verb});
+        if (closure_failed) return step.fail("{s}: a consumed module depends on a module graded 4 or worse or not swept for panics (logged above)", .{verb});
 
         const readme = b.build_root.handle.readFileAlloc(io, "README.md", b.allocator, .limited(4 * 1024 * 1024)) catch |err| {
             std.log.err("{s}: cannot read README.md: {t}", .{ verb, err });
