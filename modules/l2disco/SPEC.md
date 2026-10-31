@@ -109,6 +109,7 @@ all killed, 4 of them only after new tests (reserved label types with enough byt
 width 33 with enough bytes, the full 4-bit MED priority, RA preference bits).
 
 ## Backlog / deferred
+- **2026-10-31 (no-panic sweep GX):** caller-contract violations in the builders/accessors (`Mac.format` short buffer, `arp.Packet.encode` unequal/oversized address lengths, `dhcp.Builder.addRouters/addDnsServers/addNtpServers` bad list, `Ip4List.at`/`nd.Rdnss.at` out of range) are now checked `@panic`s with an `l2disco:` message in every build mode. Open question: turn the builder ones into `BuildError` members (`InvalidAddressList`, `InvalidAddressLength`) in a signature-changing pass. Not done: RFC 3396 concatenation of repeated long DHCP options (typed fields keep the last occurrence; the raw options stay reachable via `optionIterator`).
 
 None recorded — no deferred-gap note beyond the general Linux-only-members-accepted
 scope note (raw-syscall nature, not a functional gap), and the module README has no Deferred

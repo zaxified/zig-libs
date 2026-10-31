@@ -25,6 +25,12 @@ const netaddr = @import("netaddr");
 const testkit = @import("testkit");
 const Mac = @import("mac.zig").Mac;
 
+pub const EncodeError = error{
+    BufferTooSmall,
+    /// `sha`/`tha` (or `spa`/`tpa`) differ in length, or one exceeds 255.
+    InvalidLength,
+};
+
 pub const ParseError = error{
     /// Buffer shorter than the fixed 8-byte ARP header.
     Truncated,
@@ -96,10 +102,13 @@ pub const Packet = struct {
     }
 
     /// Encodes into `buf`; returns the written slice. `sha`/`tha` must have
-    /// equal length (hlen), likewise `spa`/`tpa` (plen), each <= 255.
-    pub fn encode(p: *const Packet, buf: []u8) error{BufferTooSmall}![]const u8 {
-        std.debug.assert(p.sha.len == p.tha.len and p.sha.len <= 255);
-        std.debug.assert(p.spa.len == p.tpa.len and p.spa.len <= 255);
+    /// equal length (hlen), likewise `spa`/`tpa` (plen), each <= 255;
+    /// anything else is `error.InvalidLength` (a packet edited after
+    /// `parse`, e.g. a responder swapping in its own 6-byte MAC over a
+    /// parsed hlen=0 request, can reach this from captured data).
+    pub fn encode(p: *const Packet, buf: []u8) EncodeError![]const u8 {
+        if (p.sha.len != p.tha.len or p.sha.len > 255) return error.InvalidLength;
+        if (p.spa.len != p.tpa.len or p.spa.len > 255) return error.InvalidLength;
         const need = p.encodedLen();
         if (buf.len < need) return error.BufferTooSmall;
         std.mem.writeInt(u16, buf[0..2], p.htype, .big);

@@ -208,10 +208,13 @@ pub const PercentileSnapshot = struct {
 /// `init` — one u64 counter per sub-bucket slot — and `record` is O(1) with
 /// no allocation.
 ///
-/// Clamp policy: `record`/`recordCount` never fail and never drop a sample —
-/// a value below `lowest` is counted as `lowest`, a value above `highest` is
-/// counted as `highest` (saturating). `min()`/`max()` report the clamped
-/// values.
+/// Clamp policy: `record`/`recordCount` never fail — a value below `lowest`
+/// is counted as `lowest`, a value above `highest` is counted as `highest`
+/// (saturating). `min()`/`max()` report the clamped values. The only samples
+/// ever dropped are those past a total of maxInt(u64): `recordCount` then
+/// counts only what still fits (possibly nothing) and `add` merges slots in
+/// index order until the total is full (low buckets first), so a saturated
+/// merge is skewed toward low values.
 ///
 /// Percentile semantics: `valueAtPercentile` returns the *highest equivalent
 /// value* of the bucket containing the requested rank, so it never
@@ -329,25 +332,39 @@ pub const Histogram = struct {
 
     /// Record `n` occurrences of `value` at once (same clamp policy).
     pub fn recordCount(self: *Histogram, value: u64, n: u64) void {
-        if (n == 0) return;
+        // Saturating total: `sum(counts) == total_count <= maxInt(u64)` is the
+        // invariant `valueAtPercentile` relies on. A huge `n` (or repeated
+        // huge `n`) would overflow; instead only what still fits is counted.
+        const take = @min(n, std.math.maxInt(u64) - self.total_count);
+        if (take == 0) return;
         const v = std.math.clamp(value, self.lowest, self.highest);
-        self.counts[self.countsIndexOf(v)] += n;
-        self.total_count += n;
+        self.counts[self.countsIndexOf(v)] += take;
+        self.total_count += take;
         if (v < self.min_value) self.min_value = v;
         if (v > self.max_value) self.max_value = v;
     }
 
     /// Merge `other` into `self`. Equivalent to having recorded every sample
-    /// of both into one histogram. `error.IncompatibleConfig` unless both
-    /// were created with the same (lowest, highest, sigfigs).
+    /// of both into one histogram (the total saturates at maxInt(u64)).
+    /// `error.IncompatibleConfig` unless both were created with the same
+    /// (lowest, highest, sigfigs).
     pub fn add(self: *Histogram, other: *const Histogram) MergeError!void {
         if (self.lowest != other.lowest or
             self.highest != other.highest or
             self.sigfigs != other.sigfigs)
             return error.IncompatibleConfig;
-        for (self.counts, other.counts) |*dst, src| dst.* += src;
-        self.total_count += other.total_count;
-        if (other.total_count != 0) {
+        // Same saturating rule as `recordCount`: counts that would push the
+        // total past maxInt(u64) are dropped.
+        var room = std.math.maxInt(u64) - self.total_count;
+        const room_before = room;
+        for (self.counts, other.counts) |*dst, src| {
+            const take = @min(src, room);
+            dst.* += take;
+            room -= take;
+        }
+        self.total_count = std.math.maxInt(u64) - room;
+        // min/max only when something of `other` was actually merged.
+        if (other.total_count != 0 and room != room_before) {
             if (other.min_value < self.min_value) self.min_value = other.min_value;
             if (other.max_value > self.max_value) self.max_value = other.max_value;
         }
@@ -412,8 +429,15 @@ pub const Histogram = struct {
     /// percentile, and above it by at most `maxRelativeError`. 0 when empty.
     pub fn valueAtPercentile(self: *const Histogram, p: f64) u64 {
         if (self.total_count == 0) return 0;
-        const pct = std.math.clamp(p, 0.0, 100.0);
-        var target: u64 = @intFromFloat(pct / 100.0 * @as(f64, @floatFromInt(self.total_count)) + 0.5);
+        // NaN counts as 0 (the minimum rank), like any other value below the range.
+        const pct = if (std.math.isNan(p)) 0.0 else std.math.clamp(p, 0.0, 100.0);
+        const rank_f = pct / 100.0 * @as(f64, @floatFromInt(self.total_count)) + 0.5;
+        // total_count near 2^64 rounds up to 2^64 as f64, which `@intFromFloat`
+        // to u64 cannot take.
+        var target: u64 = if (rank_f >= 18446744073709551616.0)
+            self.total_count
+        else
+            @intFromFloat(rank_f);
         if (target == 0) target = 1;
         if (target > self.total_count) target = self.total_count;
 
@@ -531,6 +555,10 @@ pub const Histogram = struct {
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = @import("sweep_test.zig");
+}
 const eps = 1e-6;
 
 test "empty accumulator snapshot is all zero" {

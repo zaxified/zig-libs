@@ -181,6 +181,7 @@ and `iface`/`source`/`tos` are read back off the sockets. Mutation 2026-10-04: 2
 killed.
 
 ## Backlog / deferred
+- **2026-10-31 (no-panic sweep GX, fix round):** `LinuxTransport.recvImpl` used to busy-spin after the first ICMP error (the queued IP_RECVERR entry keeps POLLERR set); it now drains the error queue after each wakeup (`waitForData`) and discards the entries (a raw socket also gets the message as a datagram). A forged Destination Unreachable / Time Exceeded with the right ident/seq/quoted destination is accepted (documented threat model above, unchanged).
 Documented out-of-scope: parallel probing, the TCP method, non-Linux live path,
 MTU/PMTU discovery (the first two also filed below from the survey).
 - **2026-10-04:** UDP method, ICMP extensions/MPLS and source/interface/TOS are **done** (see

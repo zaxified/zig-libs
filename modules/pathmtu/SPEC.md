@@ -444,6 +444,7 @@ against a model of one.
 ## Backlog / deferred
 - **Per-hop MTU (tracepath-style)** (survey 2026-09-30): tracepath reports the MTU at each hop; a user diagnosing *which* link is the bottleneck needs it, `probe` gives only the end-to-end number. Effort: medium (TTL-stepped probes; overlaps with the sibling `traceroute` engine). Fits CONVENTIONS §2.
 - **Packetization-layer PMTUD (RFC 4821 / RFC 8899)** (survey 2026-09-30): the standard answer to ICMP black holes is to probe at the transport layer; `probe` only detects the black hole (`blackhole = true`) and still finds a number via ICMP echo, which itself may be filtered. Effort: large (needs a cooperating transport; UDP/QUIC-style probes). Fits §2 but overlaps with what a transport library would own.
+- **Wall-clock bound of `probe` is the caller's** *(no-panic sweep GX, 2026-10-31)*: the run time is about 17 sizes x (`retries` + 1) x `timeout_ms`; both are caller parameters (any `u8` / `u32` is accepted, `retries = 255` works since sweep PM-1). A caller forwarding remote task parameters should cap them (axp-core passes 2 / 1000). A module-level total deadline is not built; add one only if a consumer forwards the values.
 
 ## Open
 

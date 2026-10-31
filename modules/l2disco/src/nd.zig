@@ -159,8 +159,20 @@ pub const RawOption = struct {
 pub const OptionIterator = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *OptionIterator) ParseError!?RawOption {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *OptionIterator) ParseError!?RawOption {
         if (it.pos == it.buf.len) return null;
         if (it.buf.len - it.pos < 2) return ParseError.BadOption;
         const units: usize = it.buf[it.pos + 1];
@@ -210,7 +222,10 @@ pub const Rdnss = struct {
         return r.addrs.len / 16;
     }
 
+    /// The `i`-th address; `i >= count()` is a caller-contract violation
+    /// (checked `@panic` in every build mode).
     pub fn at(r: Rdnss, i: usize) [16]u8 {
+        if (i >= r.count()) @panic("l2disco: nd.Rdnss.at: index out of range");
         return r.addrs[i * 16 ..][0..16].*;
     }
 };

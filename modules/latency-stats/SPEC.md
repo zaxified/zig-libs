@@ -94,6 +94,7 @@ the general branch of `bucketSubAtIndex` (it yields the same `b = 0, sub = idx`)
 added: `recordCount(v, 0)` leaves the histogram untouched, `max()` included.
 
 ## Backlog / deferred
+- **2026-10-31 (no-panic sweep GX):** `Histogram.init` with the widest legal config (`highest = maxInt(u64)`, `sigfigs = 5`) allocates ~50 MB (48 buckets x 131072 x 8 B). Bounded and documented by the parameters, so not capped; a caller that takes `highest`/`sigfigs` from a remote request must clamp them itself. Open question for the owner: a module-level `max_counts_bytes` limit returning `InvalidConfig`?
 
 - **Provenance citation nit — RESOLVED 2026-07-10:** provenance is stated in the README
   (moment stats are the authors' own original work; HdrHistogram design refs licensed;

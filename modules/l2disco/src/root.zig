@@ -91,6 +91,7 @@ test {
     _ = @import("capture_test.zig");
     _ = @import("tcpdump_oracle_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("sweep_test.zig");
 }
 
 test "meta is well-formed" {

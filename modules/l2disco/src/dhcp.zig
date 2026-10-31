@@ -119,12 +119,24 @@ pub const RawOption = struct {
 pub const OptionIterator = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
     pub fn init(options_region: []const u8) OptionIterator {
         return .{ .buf = options_region };
     }
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *OptionIterator) ParseError!?RawOption {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *OptionIterator) ParseError!?RawOption {
         while (it.pos < it.buf.len) {
             const code = it.buf[it.pos];
             switch (code) {
@@ -155,7 +167,10 @@ pub const Ip4List = struct {
         return l.bytes.len / 4;
     }
 
+    /// The `i`-th address; `i >= count()` is a caller-contract violation
+    /// (checked `@panic` in every build mode).
     pub fn at(l: Ip4List, i: usize) [4]u8 {
+        if (i >= l.count()) @panic("l2disco: dhcp.Ip4List.at: index out of range");
         return l.bytes[i * 4 ..][0..4].*;
     }
 
@@ -356,8 +371,20 @@ pub const RelayAgentSubOption = struct {
 pub const RelayAgentIterator = struct {
     data: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *RelayAgentIterator) ParseError!?RelayAgentSubOption {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *RelayAgentIterator) ParseError!?RelayAgentSubOption {
         if (it.pos == it.data.len) return null;
         if (it.data.len - it.pos < 2) return ParseError.BadOptionLength;
         const len: usize = it.data[it.pos + 1];
@@ -380,8 +407,20 @@ pub const ClasslessRoute = struct {
 pub const ClasslessRouteIterator = struct {
     data: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *ClasslessRouteIterator) ParseError!?ClasslessRoute {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *ClasslessRouteIterator) ParseError!?ClasslessRoute {
         if (it.pos == it.data.len) return null;
         const width = it.data[it.pos];
         if (width > 32) return ParseError.BadOptionLength;
@@ -400,15 +439,30 @@ pub const ClasslessRouteIterator = struct {
 pub const DomainSearchIterator = struct {
     data: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
     /// The longest dotted name `next` can produce (RFC 1035: 255 octets on
     /// the wire, one fewer as text).
     pub const max_name_len = 254;
 
-    /// Decode the next name into `out` (dotted, no trailing dot). A pointer
+    /// Decode the next name into `out` (dotted, no trailing dot; each call
+    /// writes at most `max_name_len` bytes into the caller's `out`, so the
+    /// output a consumer accumulates is its own buffer policy: one 255-byte
+    /// option can yield ~125x its size in names). A pointer
     /// must point strictly before the label that holds it, so a hostile
     /// option cannot loop.
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *DomainSearchIterator, out: *[max_name_len]u8) ParseError!?[]const u8 {
+        if (it.failed) return null;
+        return it.nextRaw(out) catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *DomainSearchIterator, out: *[max_name_len]u8) ParseError!?[]const u8 {
         if (it.pos == it.data.len) return null;
         var len: usize = 0;
         var p = it.pos;
@@ -492,8 +546,13 @@ pub const Builder = struct {
         return out;
     }
 
-    /// Appends a raw option (any code).
+    /// Appends a raw option. Codes 0 (Pad) and 255 (End) are structural, not
+    /// options: passing them is a caller-contract violation (checked
+    /// `@panic` in every build mode) because the parser would read the
+    /// bytes as Pad/End and corrupt the message.
     pub fn addOption(b: *Builder, code: u8, data: []const u8) BuildError!void {
+        if (code == @backingInt(OptionCode.pad) or code == @backingInt(OptionCode.end))
+            @panic("l2disco: dhcp.Builder.addOption: code 0 (Pad) and 255 (End) are not options");
         if (data.len > 255) return BuildError.OptionTooLong;
         if (b.pos + 2 + data.len > b.buf.len) return BuildError.BufferTooSmall;
         b.buf[b.pos] = code;
@@ -504,7 +563,7 @@ pub const Builder = struct {
 
     /// Option 42; `addrs` as for `addRouters`.
     pub fn addNtpServers(b: *Builder, addrs: []const u8) BuildError!void {
-        std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
+        requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.ntp_servers), addrs);
     }
 
@@ -595,15 +654,16 @@ pub const Builder = struct {
         try b.addOption(@backingInt(OptionCode.subnet_mask), &mask);
     }
 
-    /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4).
+    /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4);
+    /// anything else is a caller-contract violation (checked `@panic`).
     pub fn addRouters(b: *Builder, addrs: []const u8) BuildError!void {
-        std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
+        requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.router), addrs);
     }
 
     /// `addrs` is a packed list of 4-byte addresses (len % 4 == 0, >= 4).
     pub fn addDnsServers(b: *Builder, addrs: []const u8) BuildError!void {
-        std.debug.assert(addrs.len >= 4 and addrs.len % 4 == 0);
+        requireAddrList(addrs);
         try b.addOption(@backingInt(OptionCode.dns_server), addrs);
     }
 
@@ -625,6 +685,11 @@ pub const Builder = struct {
         try b.addOption(@backingInt(OptionCode.client_id), &data);
     }
 
+    fn requireAddrList(addrs: []const u8) void {
+        if (addrs.len < 4 or addrs.len % 4 != 0)
+            @panic("l2disco: dhcp.Builder: address list must be a non-empty multiple of 4 bytes");
+    }
+
     pub const FinishOptions = struct {
         /// Zero-pad the message up to this total length (e.g.
         /// `bootp_min_len`); 0 = no padding.
@@ -634,10 +699,12 @@ pub const Builder = struct {
     /// Appends End(255) and returns the finished message bytes.
     pub fn finish(b: *Builder, opts: FinishOptions) BuildError![]const u8 {
         if (b.pos + 1 > b.buf.len) return BuildError.BufferTooSmall;
+        // Check the padding before touching the builder: a failed `finish`
+        // must leave it as it was (no End appended twice on a retry).
+        if (b.pos + 1 < opts.pad_to and opts.pad_to > b.buf.len) return BuildError.BufferTooSmall;
         b.buf[b.pos] = @backingInt(OptionCode.end);
         b.pos += 1;
         if (b.pos < opts.pad_to) {
-            if (opts.pad_to > b.buf.len) return BuildError.BufferTooSmall;
             @memset(b.buf[b.pos..opts.pad_to], 0);
             b.pos = opts.pad_to;
         }

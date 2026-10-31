@@ -176,7 +176,9 @@ pub const Options = struct {
     /// on the network.
     timeout_ms: u32 = 1000,
     /// `probe`: additional attempts at one candidate size before concluding
-    /// no reply arrived at all (vs. ordinary single-packet loss).
+    /// no reply arrived at all (vs. ordinary single-packet loss). Any u8 is
+    /// valid; the worst-case run time is about 17 sizes x (`retries` + 1) x
+    /// `timeout_ms`, so a caller forwarding remote parameters should cap them.
     retries: u8 = 2,
     /// `probe`: upper bound to start the search from. Defaults to
     /// `default_ceiling_mtu` (1500) unless `iface` resolves a different
@@ -623,7 +625,10 @@ const LiveProber = struct {
         };
 
         var any_sent = false;
-        var tries: u8 = 0;
+        // u16, not u8: `retries = 255` (a valid u8) makes `tries <= retries`
+        // true for every u8 value, so a u8 counter wraps (panic in safe modes,
+        // endless loop in ReleaseFast). Sweep PM-1.
+        var tries: u16 = 0;
         while (tries <= self.retries) : (tries += 1) {
             const seq = self.seq;
             self.seq +%= 1;
@@ -673,7 +678,8 @@ const LiveProber = struct {
                     }
                     continue;
                 }
-                pollOnce(self.sock.fd, linux.POLL.IN, deadline - now);
+                var wakeups: usize = 0;
+                waitForData(self.sock, deadline - now, &wakeups);
             }
         }
         // A1 F4: every retry's `sendto` failing for a reason other than
@@ -710,13 +716,27 @@ fn randomStartSeq() u16 {
     }
 }
 
-fn pollOnce(fd: i32, events: i16, wait_ns: u64) void {
-    var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+/// Error-queue entries drained per wakeup (bound; the next wakeup continues).
+const max_errq_drain = 64;
+
+/// Block until `sock` has something to read or `wait_ns` passes, then drain
+/// the socket error queue. `icmp.Socket.open` always sets IP_RECVERR, and a
+/// queued error keeps POLLERR set: without the drain `ppoll` returns at once
+/// forever and the caller busy-spins until its deadline (sweep REV-1; measured
+/// 520k wakeups in 2 s). The drained entries are DISCARDED: on a raw socket
+/// the same ICMP message also arrives as a normal datagram. `wakeups` counts
+/// returns from the poll (used by the killing test below).
+fn waitForData(sock: *const icmp.Socket, wait_ns: u64, wakeups: *usize) void {
+    var pfd = [1]linux.pollfd{.{ .fd = sock.fd, .events = linux.POLL.IN, .revents = 0 }};
     var ts: linux.timespec = .{
         .sec = @intCast(wait_ns / std.time.ns_per_s),
         .nsec = @intCast(wait_ns % std.time.ns_per_s),
     };
     _ = linux.ppoll(&pfd, pfd.len, &ts, null);
+    wakeups.* += 1;
+    var scratch: [512]u8 = undefined;
+    var n: usize = 0;
+    while (n < max_errq_drain and sock.recvErr(&scratch) != null) n += 1;
 }
 
 /// Authoritative Path MTU to `dest`: binary-search wire sizes with the DF
@@ -1665,6 +1685,29 @@ test "live: LiveProber.attempt returns send_failed, not no_reply, when every sen
     try testing.expectEqual(ProbeOutcome.send_failed, lp.attempt(100));
 }
 
+test "live: LiveProber.attempt with retries = 255 terminates (sweep PM-1)" {
+    if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
+    var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    // Invalid fd: every send fails at once (EBADF), so 256 tries cost nothing.
+    _ = linux.close(sock.fd);
+    var lp: LiveProber = .{
+        .sock = &sock,
+        .family = .v4,
+        .ip_header_len = ipv4_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &netaddr.parseIp("127.0.0.1").?.v4) } },
+        .retries = 255,
+        .timeout_ms = 20,
+        .seq = 1,
+    };
+    try testing.expectEqual(ProbeOutcome.send_failed, lp.attempt(100));
+    // 256 tries consumed 256 sequence numbers.
+    try testing.expectEqual(@as(u16, 257), lp.seq);
+}
+
 test "live: query() with Options.iface sets cache_is_exception (A1 F6)" {
     if (!udpSocketsWork()) return testkit.loopbackSkip("loopback UDP sockets unavailable", .{});
 
@@ -1734,4 +1777,54 @@ test "Options.on_attempt sees every attempt, in order, with the outcome searchWi
 // See kernel_oracle_test.zig / tools/interop.zig / tools/kernel_oracle.py.
 test {
     _ = @import("kernel_oracle_test.zig");
+}
+
+// ── REV-1: error-queue POLLERR busy-spin ────────────────────────────────────
+
+/// A UDP socket with IP_RECVERR, connected to a closed loopback port and
+/// holding one queued ICMP port-unreachable error (POLLERR stays set until
+/// the error queue is drained). No privileges needed.
+fn testSocketWithQueuedError() !i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    const one: u32 = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&one), @sizeOf(u32))) != .SUCCESS)
+        return error.SkipZigTest;
+    // A closed port: bind a second socket to port 0, read the port, close it.
+    const probe_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(probe_rc) != .SUCCESS) return error.SkipZigTest;
+    const pfd: i32 = @intCast(probe_rc);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(pfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(pfd);
+        return error.SkipZigTest;
+    }
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(pfd, @ptrCast(&sa), &len);
+    _ = linux.close(pfd);
+    if (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.sendto(fd, "x", 1, 0, null, 0)) != .SUCCESS) return error.SkipZigTest;
+    return fd;
+}
+
+test "waiting with a queued socket error does not busy-spin (sweep REV-1)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try testSocketWithQueuedError();
+    defer _ = linux.close(fd);
+    const sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var wakeups: usize = 0;
+    var buf: [2048]u8 = undefined;
+    const t0: u64 = @intCast(icmp.monoNow());
+    const deadline = t0 + 200 * std.time.ns_per_ms;
+    while (true) {
+        const now: u64 = @intCast(icmp.monoNow());
+        if (now >= deadline) break;
+        if (sock.recvMsg(&buf) != null) continue;
+        waitForData(&sock, deadline - now, &wakeups);
+    }
+    // Counted, not timed: without the drain this is in the hundreds of
+    // thousands; with it the queued entry is consumed on the first wakeup.
+    try testing.expect(wakeups < 20);
 }

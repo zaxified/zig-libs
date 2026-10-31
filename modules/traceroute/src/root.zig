@@ -166,16 +166,21 @@ pub const Hop = struct {
     /// Per-hop RTT statistics (min/avg/max/stddev/loss) over the hop's
     /// probes, via `latency-stats` — timeouts count as losses.
     pub fn stats(hop: Hop) latency.Stats {
-        var samples: [max_probes_per_hop]?u64 = undefined;
-        for (hop.probes, samples[0..hop.probes.len]) |p, *s| s.* = p.rtt_ns;
-        return latency.compute(samples[0..hop.probes.len]);
+        // Streamed through an Accumulator (no fixed scratch array), so a
+        // hand-built `Hop` with more than `max_probes_per_hop` probes is fine.
+        var acc = latency.Accumulator.init();
+        for (hop.probes) |p| {
+            if (p.rtt_ns) |ns| acc.addSample(ns) else acc.addLoss();
+        }
+        return acc.snapshot();
     }
 
     /// The distinct responder addresses seen at this hop, in order of first
-    /// appearance — more than one means a load-balanced path. Asserts
-    /// `buf.len >= probes.len`.
+    /// appearance — more than one means a load-balanced path. A `buf` shorter
+    /// than `probes.len` is allowed: the result is then truncated to
+    /// `buf.len` addresses, so `result.len == buf.len` means "at least that
+    /// many" (`buf.len >= probes.len` always suffices).
     pub fn distinctAddresses(hop: Hop, buf: []netaddr.Ip) []const netaddr.Ip {
-        std.debug.assert(buf.len >= hop.probes.len);
         var n: usize = 0;
         for (hop.probes) |p| {
             const a = p.address orelse continue;
@@ -183,6 +188,7 @@ pub const Hop = struct {
                 if (b.eql(a)) break true;
             } else false;
             if (!seen) {
+                if (n == buf.len) break;
                 buf[n] = a;
                 n += 1;
             }
@@ -355,7 +361,10 @@ pub const Transport = struct {
 /// error. A transport failure mid-trace is different — see `Trace.transport_err`.
 pub const TraceError = error{ InvalidOptions, OutOfMemory };
 
-/// Trace the path to `dest` through an injected transport. Sequential:
+/// Trace the path to `dest` through an injected transport. The receive loop
+/// is bounded by `Transport.nowFn`, which must be a monotonic clock that
+/// advances (a frozen clock with a transport that keeps returning packets
+/// never reaches the probe deadline). Sequential:
 /// one probe in flight; each TTL gets `probes_per_hop` probes; the trace
 /// stops after the hop where the destination replied (`reached`), a
 /// Destination Unreachable arrived (`unreachable_code`), the transport
@@ -445,7 +454,9 @@ pub fn traceWith(
             };
             const sent_at = t.nowFn(t.ctx);
             send_times[slot] = sent_at;
-            const deadline = sent_at + timeout_ns;
+            // Saturating: the clock is the injected transport's, and a value
+            // near maxInt(u64) must not overflow the deadline.
+            const deadline = sent_at +| timeout_ns;
 
             recv: while (true) {
                 const now = t.nowFn(t.ctx);
@@ -995,7 +1006,8 @@ pub const LinuxTransport = struct {
             }
             const now = monoNow();
             if (now >= deadline) return null;
-            pollOnce(lt.sock.fd, linux.POLL.IN, deadline - now);
+            var wakeups: usize = 0;
+            waitForData(&lt.sock, deadline - now, &wakeups);
         }
     }
 
@@ -1003,7 +1015,7 @@ pub const LinuxTransport = struct {
         return monoNow();
     }
 
-    fn pollOnce(fd: i32, events: i16, wait_ns: u64) void {
+    fn pollOnce(fd: i32, events: i16, wait_ns: u64) void { // send path (POLL.OUT) only
         var pfd = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
         var ts: linux.timespec = .{
             .sec = @intCast(wait_ns / std.time.ns_per_s),
@@ -1017,6 +1029,29 @@ pub const LinuxTransport = struct {
         return @intCast(icmp.monoNow());
     }
 };
+
+/// Error-queue entries drained per wakeup (bound; the next wakeup continues).
+const max_errq_drain = 64;
+
+/// Block until `sock` has something to read or `wait_ns` passes, then drain
+/// the socket error queue. `icmp.Socket.open` always sets IP_RECVERR, and a
+/// queued error keeps POLLERR set: without the drain `ppoll` returns at once
+/// forever and the caller busy-spins until its deadline (sweep REV-1; measured
+/// 520k wakeups in 2 s). The drained entries are DISCARDED: on a raw socket
+/// the same ICMP message also arrives as a normal datagram. `wakeups` counts
+/// returns from the poll (used by the killing test below).
+fn waitForData(sock: *const icmp.Socket, wait_ns: u64, wakeups: *usize) void {
+    var pfd = [1]linux.pollfd{.{ .fd = sock.fd, .events = linux.POLL.IN, .revents = 0 }};
+    var ts: linux.timespec = .{
+        .sec = @intCast(wait_ns / std.time.ns_per_s),
+        .nsec = @intCast(wait_ns % std.time.ns_per_s),
+    };
+    _ = linux.ppoll(&pfd, pfd.len, &ts, null);
+    wakeups.* += 1;
+    var scratch: [512]u8 = undefined;
+    var n: usize = 0;
+    while (n < max_errq_drain and sock.recvErr(&scratch) != null) n += 1;
+}
 
 pub const LiveTraceError = TraceError || LinuxTransport.OpenError;
 
@@ -1068,6 +1103,11 @@ pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceE
 // ── tests: canned-bytes fake transport ──────────────────────────────────────
 
 const testing = std.testing;
+
+test {
+    _ = @import("sweep_test.zig");
+}
+
 const testkit = @import("testkit");
 
 fn ip4(a: u8, b: u8, c: u8, d: u8) netaddr.Ip {
@@ -2831,4 +2871,54 @@ test "fuzz harness: 400 seeds in every test run, and they get everywhere" {
 // See kernel_oracle_test.zig / tools/interop.zig / tools/kernel_oracle.py.
 test {
     _ = @import("kernel_oracle_test.zig");
+}
+
+// ── REV-1: error-queue POLLERR busy-spin ────────────────────────────────────
+
+/// A UDP socket with IP_RECVERR, connected to a closed loopback port and
+/// holding one queued ICMP port-unreachable error (POLLERR stays set until
+/// the error queue is drained). No privileges needed.
+fn testSocketWithQueuedError() !i32 {
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest;
+    const fd: i32 = @intCast(rc);
+    errdefer _ = linux.close(fd);
+    const one: u32 = 1;
+    if (linux.errno(linux.setsockopt(fd, linux.SOL.IP, linux.IP.RECVERR, @ptrCast(&one), @sizeOf(u32))) != .SUCCESS)
+        return error.SkipZigTest;
+    // A closed port: bind a second socket to port 0, read the port, close it.
+    const probe_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(probe_rc) != .SUCCESS) return error.SkipZigTest;
+    const pfd: i32 = @intCast(probe_rc);
+    var sa: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.nativeToBig(u32, 0x7f000001) };
+    if (linux.errno(linux.bind(pfd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) {
+        _ = linux.close(pfd);
+        return error.SkipZigTest;
+    }
+    var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
+    _ = linux.getsockname(pfd, @ptrCast(&sa), &len);
+    _ = linux.close(pfd);
+    if (linux.errno(linux.connect(fd, @ptrCast(&sa), @sizeOf(linux.sockaddr.in))) != .SUCCESS) return error.SkipZigTest;
+    if (linux.errno(linux.sendto(fd, "x", 1, 0, null, 0)) != .SUCCESS) return error.SkipZigTest;
+    return fd;
+}
+
+test "waiting with a queued socket error does not busy-spin (sweep REV-1)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const fd = try testSocketWithQueuedError();
+    defer _ = linux.close(fd);
+    const sock: icmp.Socket = .{ .fd = fd, .family = .v4, .kind = .dgram, .ident = 0 };
+    var wakeups: usize = 0;
+    var buf: [2048]u8 = undefined;
+    const t0: u64 = @intCast(icmp.monoNow());
+    const deadline = t0 + 200 * std.time.ns_per_ms;
+    while (true) {
+        const now: u64 = @intCast(icmp.monoNow());
+        if (now >= deadline) break;
+        if (sock.recvMsg(&buf) != null) continue;
+        waitForData(&sock, deadline - now, &wakeups);
+    }
+    // Counted, not timed: without the drain this is in the hundreds of
+    // thousands; with it the queued entry is consumed on the first wakeup.
+    try testing.expect(wakeups < 20);
 }

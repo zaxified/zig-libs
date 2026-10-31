@@ -498,12 +498,24 @@ pub const TlvIterator = struct {
     buf: []const u8,
     pos: usize = 0,
     done: bool = false,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
     pub fn init(bytes: []const u8) TlvIterator {
         return .{ .buf = bytes };
     }
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *TlvIterator) ParseError!?RawTlv {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *TlvIterator) ParseError!?RawTlv {
         if (it.done or it.pos == it.buf.len) return null;
         if (it.pos + 2 > it.buf.len) return ParseError.Truncated;
         const header = std.mem.readInt(u16, it.buf[it.pos..][0..2], .big);

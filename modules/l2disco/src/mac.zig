@@ -40,15 +40,13 @@ pub const Mac = struct {
     /// Formats as lowercase `aa:bb:cc:dd:ee:ff` into `buf` (needs
     /// `text_len` bytes); returns the written slice.
     ///
-    /// ⚠ `std.debug.assert` below is a Debug/ReleaseSafe-only guard --
-    /// ReleaseFast (the profile this suite also builds) compiles it out
-    /// entirely, so a too-small `buf` becomes 17 unconditioned
-    /// out-of-bounds writes with no check left at all. Prefer `formatBuf`,
-    /// whose `*[text_len]u8` parameter makes a too-small buffer a compile
-    /// error in every build mode instead of a runtime one. This
-    /// slice-taking overload is kept for callers that only have a slice.
+    /// A `buf` shorter than `text_len` is a caller-contract violation: a
+    /// checked `@panic` in every build mode (never out-of-bounds writes).
+    /// Prefer `formatBuf`, whose `*[text_len]u8` parameter makes a too-small
+    /// buffer a compile error instead. This slice-taking overload is kept
+    /// for callers that only have a slice.
     pub fn format(m: Mac, buf: []u8) []const u8 {
-        std.debug.assert(buf.len >= text_len);
+        if (buf.len < text_len) @panic("l2disco: Mac.format: buffer shorter than 17 bytes");
         return m.formatBuf(buf[0..text_len]);
     }
 

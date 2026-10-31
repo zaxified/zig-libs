@@ -116,12 +116,24 @@ pub const RawTlv = struct {
 pub const TlvIterator = struct {
     buf: []const u8,
     pos: usize = 0,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
     pub fn init(tlv_region: []const u8) TlvIterator {
         return .{ .buf = tlv_region };
     }
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *TlvIterator) ParseError!?RawTlv {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *TlvIterator) ParseError!?RawTlv {
         if (it.pos == it.buf.len) return null;
         if (it.pos + 4 > it.buf.len) return ParseError.TruncatedTlv;
         const t = std.mem.readInt(u16, it.buf[it.pos..][0..2], .big);
@@ -162,6 +174,8 @@ pub const AddressIterator = struct {
     buf: []const u8,
     pos: usize,
     remaining: u32,
+    /// Set by the first error; see `next`.
+    failed: bool = false,
 
     pub fn init(addresses_tlv_value: []const u8) ParseError!AddressIterator {
         if (addresses_tlv_value.len < 4) return ParseError.TruncatedAddress;
@@ -172,7 +186,17 @@ pub const AddressIterator = struct {
         };
     }
 
+    /// After the first error the iterator is terminal: `next` returns null
+    /// (a consumer loop that does `catch continue` therefore ends).
     pub fn next(it: *AddressIterator) ParseError!?Address {
+        if (it.failed) return null;
+        return it.nextRaw() catch |err| {
+            it.failed = true;
+            return err;
+        };
+    }
+
+    fn nextRaw(it: *AddressIterator) ParseError!?Address {
         if (it.remaining == 0) return null;
         if (it.pos + 2 > it.buf.len) return ParseError.TruncatedAddress;
         const ptype = it.buf[it.pos];
@@ -319,12 +343,13 @@ pub const Frame = struct {
 /// RFC 1071 ones'-complement checksum over `bytes` (odd length padded
 /// with a zero byte). The checksum field must be zeroed by the caller.
 pub fn compute(bytes: []const u8) u16 {
-    var sum: u32 = 0;
+    // u64: a u32 sum overflows past 131072 bytes of 0xff words.
+    var sum: u64 = 0;
     var i: usize = 0;
     while (i + 2 <= bytes.len) : (i += 2) {
         sum += std.mem.readInt(u16, bytes[i..][0..2], .big);
     }
-    if (i < bytes.len) sum += @as(u32, bytes[i]) << 8;
+    if (i < bytes.len) sum += @as(u64, bytes[i]) << 8;
     while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16);
     return @intCast(~sum & 0xffff);
 }
@@ -333,12 +358,12 @@ pub fn compute(bytes: []const u8) u16 {
 /// field included) folds to 0xffff.
 pub fn verify(frame_bytes: []const u8) bool {
     if (frame_bytes.len < header_len) return false;
-    var sum: u32 = 0;
+    var sum: u64 = 0; // u64: see `compute`
     var i: usize = 0;
     while (i + 2 <= frame_bytes.len) : (i += 2) {
         sum += std.mem.readInt(u16, frame_bytes[i..][0..2], .big);
     }
-    if (i < frame_bytes.len) sum += @as(u32, frame_bytes[i]) << 8;
+    if (i < frame_bytes.len) sum += @as(u64, frame_bytes[i]) << 8;
     while (sum > 0xffff) sum = (sum & 0xffff) + (sum >> 16);
     return sum == 0xffff;
 }
