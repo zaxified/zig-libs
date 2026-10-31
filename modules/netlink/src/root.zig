@@ -6104,3 +6104,87 @@ test "the record cap counts produced items, not only messages (sweep REV-4)" {
     // 3 items per message: the 4th message pushes the count to 12 > 10.
     try testing.expectEqual(@as(usize, 4), t.recvs);
 }
+
+// ── delta mutation audit GV-B: tests for the survivors ──────────────────────
+
+fn nonblockingPair(fds: *[2]i32) !void {
+    if (linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0, fds)) != .SUCCESS)
+        return error.SkipZigTest;
+}
+
+test "a datagram of exactly the ceiling is accepted, one past it is dropped (sweep audit GV-B1)" {
+    var fds: [2]i32 = undefined;
+    try nonblockingPair(&fds);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{ .gpa = testing.allocator, .fd = fds[0], .portid = 0, .seq = 0, .buf = try testing.allocator.alloc(u8, 16) };
+    defer testing.allocator.free(sock.buf);
+    const big: [64]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 64), linux.write(fds[1], &big, big.len));
+    // Accepted: the buffer grows and the datagram is read; a socketpair peer is
+    // not a kernel sender, so it is skipped and the empty queue reports
+    // WouldBlock — not MalformedReply.
+    try testing.expectError(error.WouldBlock, sock.recvDatagramLimit(64));
+    try testing.expect(sock.buf.len >= 64);
+}
+
+test "recvDatagramStrict grows its buffer for a datagram above the initial size (sweep audit GV-B2)" {
+    var fds: [2]i32 = undefined;
+    try nonblockingPair(&fds);
+    defer _ = linux.close(fds[0]);
+    defer _ = linux.close(fds[1]);
+    var sock: Socket = .{ .gpa = testing.allocator, .fd = fds[0], .portid = 0, .seq = 0, .buf = try testing.allocator.alloc(u8, 16) };
+    defer testing.allocator.free(sock.buf);
+    const big: [20000]u8 = @splat(0xab);
+    try testing.expectEqual(@as(usize, 20000), linux.write(fds[1], &big, big.len));
+    try testing.expectError(error.WouldBlock, sock.recvDatagramStrict());
+    try testing.expect(sock.buf.len >= 20000);
+}
+
+test "a dump of exactly max_records items is complete, one more trips the cap (sweep audit GV-B3)" {
+    const rec_msg = cannedMessage(RTM_NEWLINK, codec.NLM_F_MULTI, 42, 7);
+    const done = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, 0);
+    var script: [11][]const u8 = undefined;
+    for (script[0..10]) |*s| s.* = &rec_msg;
+    script[10] = &done;
+    var t: ScriptedTransport = .{ .script = &script, .pid = 7, .seq = 42 };
+    const one = struct {
+        fn f(a: std.mem.Allocator, out: *std.ArrayList(Link), _: []const u8, _: void) DumpError!void {
+            try out.append(a, std.mem.zeroes(Link));
+        }
+    }.f;
+    var out: std.ArrayList(Link) = .empty;
+    defer out.deinit(testing.allocator);
+    try testing.expectEqual(DumpPass.done, try collectDumpPass(Link, void, one, testing.allocator, &t, &out, 42, RTM_NEWLINK, {}, 10));
+    try testing.expectEqual(@as(usize, 10), out.items.len);
+}
+
+test "the interrupted dump may end in an NLMSG_ERROR that carries DUMP_INTR (sweep audit GV-B4)" {
+    const intr = cannedWith(RTM_NEWLINK, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const ack1 = cannedWith(codec.NLMSG_ERROR, codec.NLM_F_MULTI | codec.NLM_F_DUMP_INTR, 42, 7, 0);
+    const done2 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &ack1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 41 };
+    const got = try dumpOver(Link, parseLink, matchLink, testing.allocator, &k, RTM_GETLINK, RTM_NEWLINK, ifinfomsg_len, .{});
+    defer testing.allocator.free(got);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 2), k.requests);
+}
+
+test "dumpCollectOver restarts twice on one owned copy, freeing it once (sweep audit GV-B5)" {
+    const intr1 = cannedWith(RTM_NEWNEIGH, codec.NLM_F_DUMP_INTR, 42, 7, null);
+    const done1 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 42, 7, 0);
+    const intr2 = cannedWith(RTM_NEWNEIGH, codec.NLM_F_DUMP_INTR, 43, 7, null);
+    const done2 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 43, 7, 0);
+    const done3 = cannedWith(codec.NLMSG_DONE, codec.NLM_F_MULTI, 44, 7, 0);
+    const d1: []const []const u8 = &.{ &intr1, &done1 };
+    const d2: []const []const u8 = &.{ &intr2, &done2 };
+    const d3: []const []const u8 = &.{&done3};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2, d3 }, .pid = 7, .next = 42 };
+    var request = cannedMessage(RTM_GETNEIGH, codec.NLM_F_REQUEST | codec.NLM_F_DUMP, 42, 0);
+    const got = try dumpCollectOver(FdbEntry, collectFdb, testing.allocator, &k, &request, RTM_NEWNEIGH);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(@as(usize, 3), k.requests);
+    try testing.expectEqual(@as(u32, 44), k.sent[2]);
+}

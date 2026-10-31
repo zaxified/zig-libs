@@ -1550,3 +1550,151 @@ test "the batch seq window is modular: a batch crossing seq 0 (sweep REV-8)" {
     var t2: Scripted = .{ .script = &.{&at_end}, .pid = 7, .next = 100 };
     try testing.expectError(error.InvalidRequest, awaitBatchOver(&t2, &b, 50));
 }
+
+// ── delta mutation audit GV-B: tests for the survivors ──────────────────────
+
+/// An NLMSG_ERROR carrying `code` and, after it, the request header it answers
+/// (`emb_seq` in its seq field), as the kernel echoes it.
+fn cannedErrorEmbedded(code: i32, seq: u32, pid: u32, emb_seq: u32) [nl.header_len + 4 + nl.header_len]u8 {
+    var m: [nl.header_len + 4 + nl.header_len]u8 = @splat(0);
+    m[0..nl.header_len].* = cannedHeader(nl.NLMSG_ERROR, 0, seq, pid);
+    std.mem.writeInt(u32, m[0..4], m.len, native_endian);
+    std.mem.writeInt(i32, m[nl.header_len..][0..4], code, native_endian);
+    m[nl.header_len + 4 ..][0..nl.header_len].* = cannedHeader(0, 0, emb_seq, 0);
+    return m;
+}
+
+test "acked: a seq-0 error echoing a foreign request is skipped, not taken as ours (sweep audit GV-B1)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const foreign = cannedErrorEmbedded(-22, 0, 7, 999);
+    const ack = cannedError(0, 101, 7);
+    var t: Scripted = .{ .script = &.{ &foreign, &ack }, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t, &b, 50);
+    try testing.expectEqual(@as(usize, 2), t.recvs);
+}
+
+test "an in-window nlmsg_seq wins over the echoed request's seq (sweep audit GV-B2)" {
+    var b = try oneCommandBatch(true);
+    defer b.deinit();
+    const ours = cannedErrorEmbedded(-22, 101, 7, 999);
+    var t: Scripted = .{ .script = &.{&ours}, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+}
+
+test "un-acked: a datagram of only foreign traffic keeps waiting, whatever makes it foreign (sweep audit GV-B3)" {
+    var b = try oneCommandBatch(false);
+    defer b.deinit();
+    const real = cannedError(-22, 101, 7);
+    // (a) another port id
+    const other_pid = cannedError(0, 101, 99);
+    var t: Scripted = .{ .script = &.{ &other_pid, &real }, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t, &b, 50));
+    // (b) a seq-0 error echoing a foreign request
+    const echo = cannedErrorEmbedded(0, 0, 7, 999);
+    var t2: Scripted = .{ .script = &.{ &echo, &real }, .pid = 7, .next = 100 };
+    try testing.expectError(error.InvalidRequest, awaitBatchOver(&t2, &b, 50));
+}
+
+test "un-acked: a datagram with one own message ends the wait even beside foreign ones (sweep audit GV-B4)" {
+    var b = try oneCommandBatch(false);
+    defer b.deinit();
+    const real = cannedError(-22, 101, 7);
+    const foreign = cannedError(0, 999, 7);
+    const own_ack = cannedError(0, 101, 7);
+    var mixed: [foreign.len + own_ack.len]u8 = undefined;
+    @memcpy(mixed[0..foreign.len], &foreign);
+    @memcpy(mixed[foreign.len..], &own_ack);
+    var t: Scripted = .{ .script = &.{ &mixed, &real }, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t, &b, 50);
+    try testing.expectEqual(@as(usize, 1), t.recvs);
+
+    // A NOOP/echo of ours counts as own traffic as well.
+    const noop = cannedHeader(nl.NLMSG_NOOP, 0, 101, 7);
+    var mixed2: [foreign.len + noop.len]u8 = undefined;
+    @memcpy(mixed2[0..foreign.len], &foreign);
+    @memcpy(mixed2[foreign.len..], &noop);
+    var t2: Scripted = .{ .script = &.{ &mixed2, &real }, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t2, &b, 50);
+    try testing.expectEqual(@as(usize, 1), t2.recvs);
+}
+
+test "un-acked: an empty datagram carries nothing foreign, so it ends the wait (sweep audit GV-B5)" {
+    var b = try oneCommandBatch(false);
+    defer b.deinit();
+    const real = cannedError(-22, 101, 7);
+    const empty: []const u8 = &.{};
+    var t: Scripted = .{ .script = &.{ empty, &real }, .pid = 7, .next = 100 };
+    try awaitBatchOver(&t, &b, 50);
+    try testing.expectEqual(@as(usize, 1), t.recvs);
+}
+
+test "the interrupted dump may end in an NLMSG_ERROR that carries DUMP_INTR (sweep audit GV-B6)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const nt = wire.nftMsg(wire.NFT_MSG.NEWTABLE);
+    const intr = cannedWith(nt, nl.NLM_F_DUMP_INTR, 42, 7, null);
+    const ack1 = cannedWith(nl.NLMSG_ERROR, nl.NLM_F_MULTI | nl.NLM_F_DUMP_INTR, 42, 7, 0);
+    const done2 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &ack1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 42 };
+    try dumpOver(&k, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000);
+    try testing.expect(!k.ebusy_hit);
+    try testing.expectEqual(@as(usize, 2), k.nsent);
+}
+
+test "a dump interrupted on every attempt gives up after max_dump_attempts sends, one owned copy (sweep audit GV-B7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const nt = wire.nftMsg(wire.NFT_MSG.NEWTABLE);
+    var msgs: [8][nl.header_len + 4]u8 = undefined;
+    var dumps: [4][]const []const u8 = undefined;
+    var parts: [4][2][]const u8 = undefined;
+    for (0..4) |i| {
+        const seq: u32 = 42 + @as(u32, @intCast(i));
+        msgs[2 * i] = cannedWith(nt, nl.NLM_F_DUMP_INTR, seq, 7, null);
+        msgs[2 * i + 1] = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, seq, 7, 0);
+        parts[i] = .{ &msgs[2 * i], &msgs[2 * i + 1] };
+        dumps[i] = &parts[i];
+    }
+    var k: BusyKernel = .{ .dumps = &dumps, .pid = 7, .next = 42 };
+    try testing.expectError(error.InconsistentDump, dumpOver(&k, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000));
+    try testing.expectEqual(@as(usize, 4), k.nsent);
+}
+
+test "records of an interrupted dump are discarded unexamined, even malformed ones (sweep audit GV-B8)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const nt = wire.nftMsg(wire.NFT_MSG.NEWTABLE);
+    const intr = cannedWith(nt, nl.NLM_F_DUMP_INTR, 42, 7, null);
+    const junk = cannedHeader(nt, nl.NLM_F_MULTI, 42, 7); // no nfgenmsg: decodeTable rejects it
+    const done1 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7, 0);
+    const done2 = cannedWith(nl.NLMSG_DONE, nl.NLM_F_MULTI, 43, 7, 0);
+    const d1: []const []const u8 = &.{ &intr, &junk, &done1 };
+    const d2: []const []const u8 = &.{&done2};
+    var k: BusyKernel = .{ .dumps = &.{ d1, d2 }, .pid = 7, .next = 42 };
+    try dumpOver(&k, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 1000);
+    try testing.expectEqual(@as(usize, 2), k.nsent);
+}
+
+test "a dump of exactly max_records items is complete (sweep audit GV-B9)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var items: std.ArrayList(wire.TableInfo) = .empty;
+    const req = wire.buildDumpRequest(42, wire.NFT_MSG.GETTABLE, null);
+    const rec = cannedTable(42, 7);
+    const done = cannedHeader(nl.NLMSG_DONE, nl.NLM_F_MULTI, 42, 7);
+    var script: [11][]const u8 = undefined;
+    for (script[0..10]) |*s| s.* = &rec;
+    script[10] = &done;
+    var t: Scripted = .{ .script = &script, .pid = 7, .next = 42 };
+    try dumpOver(&t, testing.allocator, &req, wire.NFT_MSG.NEWTABLE, 42, newTableAppend, arena.allocator(), &items, 50, 10);
+    try testing.expectEqual(@as(usize, 10), items.items.len);
+}
