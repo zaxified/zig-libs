@@ -967,7 +967,12 @@ pub const Mtr = struct {
     end: ?usize = null,
     /// Whether that end is the destination's Echo Reply.
     end_reply: bool = false,
+    /// Rounds completed (counted in the statistics).
     rounds: u64 = 0,
+    /// Rounds begun, failed ones too: the sequence window of the next one,
+    /// so a retry after a failure never shares a window with the probes the
+    /// failed round already sent.
+    windows: u64 = 0,
     last_start: ?u64 = null,
 
     pub const InitError = error{ InvalidOptions, OutOfMemory };
@@ -1048,6 +1053,10 @@ pub const Mtr = struct {
     /// probe or until every probe is answered. A transport failure aborts
     /// the round without counting it.
     pub fn round(m: *Mtr, t: Transport) TransportError!void {
+        // `opts` is a public field: a caller that changed it after `init`
+        // must not reach an out-of-range slice or TTL below.
+        m.opts.validate() catch return error.SendFailed;
+        if (m.hop_buf.len != @as(usize, m.opts.max_hops - m.opts.first_ttl) + 1) return error.SendFailed;
         var rbuf: [2048]u8 = undefined;
         if (m.last_start) |start| {
             const next = start +| @as(u64, m.opts.interval_ms) * std.time.ns_per_ms;
@@ -1063,7 +1072,8 @@ pub const Mtr = struct {
         const n: usize = if (m.end) |e| e + 1 else cap;
         // The window of this round's sequence numbers; `cap` <= 255, so the
         // previous round's window never overlaps it.
-        const round_base = m.opts.seq_base +% @as(u16, @truncate(m.rounds *% cap));
+        const round_base = m.opts.seq_base +% @as(u16, @truncate(m.windows *% cap));
+        m.windows +%= 1;
         const got = m.got_buf[0..n];
         @memset(got, .{});
         @memset(m.send_times[0..n], null);
@@ -2827,6 +2837,28 @@ test "Mtr: a transport failure aborts the round without counting it" {
     try testing.expectError(error.SendFailed, m.round(f.transport()));
     try testing.expectEqual(@as(u32, 1), m.hops()[0].sent);
     try testing.expectEqual(Probe.Kind.reply, m.lastRound()[1].kind);
+}
+
+test "Mtr: a round retried after a failure gets a fresh sequence window; changed opts fail cleanly" {
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .time_exceeded = router_a }, .{ .time_exceeded = router_b }, .reply } };
+    defer f.deinit();
+    var m = try Mtr.init(testing.allocator, test_dest, .{ .max_hops = 3 });
+    defer m.deinit();
+    f.fail_send_at_ttl = 2;
+    try testing.expectError(error.SendFailed, m.round(f.transport()));
+    f.fail_send_at_ttl = null;
+    try m.round(f.transport());
+    // TTL 1 was sent twice, in two different windows.
+    try testing.expectEqual(@as(usize, 1 + 3), f.sent.items.len);
+    try testing.expect(f.sent.items[0].seq != f.sent.items[1].seq);
+    try testing.expectEqual(@as(u64, 1), m.rounds);
+    try testing.expectEqual(@as(u32, 1), m.hops()[0].sent);
+
+    m.opts.payload_size = max_payload + 1;
+    try testing.expectError(error.SendFailed, m.round(f.transport()));
+    m.opts.payload_size = 24;
+    m.opts.max_hops = 9; // no longer matches the buffers
+    try testing.expectError(error.SendFailed, m.round(f.transport()));
 }
 
 test "live: LiveMtr over a ping socket to 127.0.0.1 (skipped without ping_group_range)" {

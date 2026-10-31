@@ -49,6 +49,11 @@ portable fallback. Modes mirror fping: `.alive` (stop at first reply, retry time
 vs select, plus an in-flight cap, per-subnet spacing and first-probe jitter). Wire formats per
 RFC 792/4443/1071. See this module's own `NOTICE` — a provenance record, not a license obligation.
 
+**A pending ICMP error is not the next send's (2026-10-31).** With IP_RECVERR (A1 F5) the kernel
+stores every ICMP error about any probe in sk_err as well, and the next send — to any target —
+fails with it once. `Socket.sendTo` retries once on the errnos `icmp_err_convert` produces; see
+CHANGELOG 2026-10-31.
+
 ## Threat model / out of scope
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not
 acquire privilege, only uses what it is given. It does **not authenticate replies** — a reply is

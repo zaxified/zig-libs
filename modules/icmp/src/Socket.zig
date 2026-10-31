@@ -274,11 +274,20 @@ fn boundIdent(self: *Socket) OpenError!u16 {
 }
 
 pub fn sendTo(self: *const Socket, addr: *const linux.sockaddr, addr_len: linux.socklen_t, packet: []const u8) SendError!void {
-    const rc = if (self.oiface_index != 0)
-        self.sendmsgPktinfo(addr, addr_len, packet)
-    else
-        linux.sendto(self.fd, packet.ptr, packet.len, linux.MSG.NOSIGNAL, addr, addr_len);
-    switch (linux.errno(rc)) {
+    var e = self.sendOnce(addr, addr_len, packet);
+    // `open` sets IP_RECVERR (A1 F5), and with it the kernel also stores
+    // every ICMP error about ANY earlier probe in the socket's pending error
+    // (sk_err), raw and ping sockets alike: the next send fails with it once
+    // -- EHOSTUNREACH for a Time Exceeded or Host Unreachable, EACCES for
+    // Administratively Prohibited, ... -- though it is not that send's
+    // error, and that probe is lost. Measured 2026-10-31 (ping socket, a
+    // netns, nft rejecting echoes to 127.0.0.2 with host-unreachable): the
+    // next send to 127.0.0.1 failed EHOSTUNREACH, the one after went out;
+    // without IP_RECVERR neither failed. The failed send cleared sk_err (the
+    // error stays on the error queue for `recvErr`), so one retry sends the
+    // probe; a send that fails again has an error of its own.
+    if (icmpReportedErrno(e)) e = self.sendOnce(addr, addr_len, packet);
+    switch (e) {
         .SUCCESS => {},
         .AGAIN, .NOBUFS => return error.WouldBlock,
         .NETUNREACH, .NETDOWN => return error.NetworkUnreachable,
@@ -287,6 +296,24 @@ pub fn sendTo(self: *const Socket, addr: *const linux.sockaddr, addr_len: linux.
         .MSGSIZE => return error.MessageTooLong,
         else => return error.Unexpected,
     }
+}
+
+fn sendOnce(self: *const Socket, addr: *const linux.sockaddr, addr_len: linux.socklen_t, packet: []const u8) linux.E {
+    const rc = if (self.oiface_index != 0)
+        self.sendmsgPktinfo(addr, addr_len, packet)
+    else
+        linux.sendto(self.fd, packet.ptr, packet.len, linux.MSG.NOSIGNAL, addr, addr_len);
+    return linux.errno(rc);
+}
+
+/// The errnos the kernel turns ICMP errors into (`icmp_err_convert`,
+/// `icmpv6_err_convert`): what a pending sk_err from an earlier probe's
+/// ICMP error surfaces as on the next send.
+fn icmpReportedErrno(e: linux.E) bool {
+    return switch (e) {
+        .NETUNREACH, .HOSTUNREACH, .HOSTDOWN, .CONNREFUSED, .ACCES, .MSGSIZE, .NOPROTOOPT, .OPNOTSUPP, .NONET, .PROTO => true,
+        else => false,
+    };
 }
 
 /// Build the IP_PKTINFO / IPV6_PKTINFO control message forcing the
@@ -714,6 +741,67 @@ test "recvErr control: no offender, short and lying cmsgs" {
     // Every prefix of a valid message: never a panic.
     const good = testErrCmsg(&buf, linux.SOL.IP, linux.IP.RECVERR, ee, &unspec);
     for (0..good.len + 1) |n| parseErrControl(good[0..n], &info);
+}
+
+test "sendTo: an earlier probe's ICMP error does not fail the next send (sk_err retry)" {
+    // Needs a ping socket and, to forge the router's error, a raw one
+    // (CAP_NET_RAW, e.g. root in `unshare -rn`); skipped otherwise.
+    var sock = Socket.open(.v4, .dgram, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer sock.close();
+    var injector = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer injector.close();
+    const lo: linux.sockaddr.in = .{ .port = 0, .addr = std.mem.bytesToValue(u32, &[4]u8{ 127, 0, 0, 1 }) };
+    // Loopback must be up (a fresh netns has it down).
+    var probe: [16]u8 = @splat(0);
+    probe[0] = 8; // echo request; the kernel fills ident and checksum
+    sock.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), &probe) catch return error.SkipZigTest;
+
+    // A forged Host Unreachable about one of our probes to 10.9.9.77.
+    var pkt: [8 + 20 + 8]u8 = @splat(0);
+    pkt[0] = 3; // destination unreachable
+    pkt[1] = 1; // host unreachable
+    pkt[8] = 0x45;
+    pkt[8 + 8] = 64;
+    pkt[8 + 9] = 1; // quoted protocol ICMP: routes it to the ping socket
+    pkt[8 + 12 ..][0..4].* = .{ 127, 0, 0, 1 };
+    pkt[8 + 16 ..][0..4].* = .{ 10, 9, 9, 77 };
+    pkt[8 + 20] = 8; // the quoted echo request
+    std.mem.writeInt(u16, pkt[8 + 20 + 4 ..][0..2], sock.ident, .big);
+    std.mem.writeInt(u16, pkt[8 + 20 + 6 ..][0..2], 7, .big);
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i < pkt.len) : (i += 2) sum += std.mem.readInt(u16, pkt[i..][0..2], .big);
+    while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
+    std.mem.writeInt(u16, pkt[2..4], @truncate(~sum), .big);
+    try injector.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), &pkt);
+    const ts: linux.timespec = .{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+    _ = linux.nanosleep(&ts, null);
+
+    // The error is pending: this send used to fail with EHOSTUNREACH.
+    try sock.sendTo(@ptrCast(&lo), @sizeOf(linux.sockaddr.in), &probe);
+    // And it is still on the error queue, about 10.9.9.77.
+    var buf: [64]u8 = undefined;
+    var info: ?ErrInfo = null;
+    for (0..8) |_| {
+        info = sock.recvErr(&buf);
+        if (info) |e| if (e.err_type == 3) break;
+    }
+    try std.testing.expect(info != null);
+    try std.testing.expectEqual(@as(u8, 3), info.?.err_type);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 9, 9, 77 }, std.mem.asBytes(&info.?.src.v4.addr));
+}
+
+test "icmpReportedErrno: the errnos ICMP errors become, nothing else" {
+    for ([_]linux.E{ .NETUNREACH, .HOSTUNREACH, .HOSTDOWN, .CONNREFUSED, .ACCES, .MSGSIZE, .NOPROTOOPT, .OPNOTSUPP, .NONET, .PROTO }) |e|
+        try std.testing.expect(icmpReportedErrno(e));
+    for ([_]linux.E{ .SUCCESS, .AGAIN, .NOBUFS, .PERM, .INVAL, .BADF, .NETDOWN }) |e|
+        try std.testing.expect(!icmpReportedErrno(e));
 }
 
 test "recvBatch rejects an undersized slab instead of letting the kernel write past it" {
